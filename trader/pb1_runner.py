@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, get_final30_scored_paths, repo_root
+from trader.runtime_paths import build_final30_scored_paths, repo_root
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -143,107 +143,84 @@ def load_trade_final30_scored(
 ) -> dict[str, Any]:
     env_n = (env or "").strip().lower()
     as_of_s = str(as_of)
-    checked: list[str] = []
-    attempts: list[tuple[str, list[dict[str, Any]], str, bool]] = []
-
     final30_paths = build_final30_scored_paths(repo_root(), env_n, as_of_s)
-    file_candidates = get_final30_artifact_paths(env_n, as_of_s, include_legacy=True)
-    current_cwd = Path.cwd().resolve()
-    current_repo_root = repo_root().resolve()
-    logger.info("[TRADE][FINAL30][PATHS] %s", {key: str(path) for key, path in final30_paths.items()})
-    logger.info(
-        "[TRADE][FINAL30][CONTRACT] all_files_missing=%s source=%s",
-        all(not path.exists() for path in final30_paths.values()),
-        "files_first_then_db",
-    )
+    file_mirror_stats: dict[str, int] = {}
+    for label, path in final30_paths.items():
+        present = int(path.exists() and path.stat().st_size > 0) if path.exists() else 0
+        file_mirror_stats[label] = present
+        if not present:
+            logger.warning("[TRADE][FINAL30][FILE_OPTIONAL_MISSING] path=%s", path.resolve())
 
-    for source_name, path in file_candidates:
-        abs_path = path.resolve()
-        exists = path.exists()
-        checked.append(str(path))
-        logger.info(
-            "[TRADE][FINAL30][FILE_CHECK] path=%s exists=%s cwd=%s repo_root=%s builder=%s",
-            abs_path,
-            int(exists),
-            current_cwd,
-            current_repo_root,
-            "shared_path_helper" if source_name != "signals_final30" else "legacy_signals_fallback",
-        )
-        rows = _load_json_rows(path)
-        if not rows:
-            continue
-        file_df = pd.DataFrame(rows)
-        file_cols = [str(c) for c in file_df.columns.tolist()]
-        logger.info(
-            "[TRADE][FINAL30][FILE_LOAD] path=%s rows=%s cols=%s",
-            abs_path,
-            len(file_df),
-            file_cols,
-        )
-        attempts.append((source_name, rows, as_of_s, False))
+    logger.info(
+        "[TRADE][FINAL30][FILE_MIRROR] runtime=%s ledger=%s signals=%s warn_only=1",
+        file_mirror_stats.get("runtime", 0),
+        file_mirror_stats.get("ledger", 0),
+        file_mirror_stats.get("signals", 0),
+    )
 
     watchlist_repo = WatchlistRepo(engine)
     as_of_date = datetime.strptime(as_of_s, "%Y-%m-%d").date()
-    scored_rows, used_as_of = watchlist_repo.load_watchlist_scored(
+    scored_contract = watchlist_repo.verify_watchlist_scored_contract(
         env=env_n,
-        strategy="pb1_watchlist_final_scored",
         as_of=as_of_date,
-        allow_latest_fallback=True,
-        ttl_days=int(os.getenv("WATCHLIST_TTL_DAYS", "7")),
-        max_back_days=int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3")),
+        strategy="pb1_watchlist_final_scored",
+        allow_latest_fallback=False,
     )
-    checked.append("db:pb1_watchlist_final_scored")
-    if scored_rows:
-        attempts.append(("db_pb1_watchlist_final_scored", scored_rows, (used_as_of or as_of_date).isoformat(), False))
+    if scored_contract.get("ok"):
+        rows = list(scored_contract.get("rows_data") or [])
+        df = pd.DataFrame(rows)
+        columns = [str(c) for c in df.columns.tolist()]
+        logger.info(
+            "[TRADE][FINAL30][LOAD] source=db_pb1_watchlist_final_scored rows=%s is_scored=1 cols=%s",
+            len(df),
+            columns,
+        )
+        return {
+            "df": df,
+            "source_name": "db_pb1_watchlist_final_scored",
+            "as_of": as_of_date.isoformat(),
+            "columns": columns,
+            "is_scored": True,
+            "used_fallback": False,
+            "file_mirror_present": any(file_mirror_stats.values()),
+        }
 
     allow_plain_fallback = (os.getenv("TRADE_ALLOW_PLAIN_WATCHLIST_FALLBACK", "0") == "1")
-    checked.append("db:pb1_watchlist_final")
     if allow_plain_fallback:
         plain_rows, plain_as_of = watchlist_repo.load_watchlist(
             env=env_n,
             strategy="pb1_watchlist_final",
             as_of=as_of_date,
-            allow_latest_fallback=True,
-            ttl_days=int(os.getenv("WATCHLIST_TTL_DAYS", "7")),
-            max_back_days=int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3")),
+            allow_latest_fallback=False,
         )
-        if plain_rows:
-            attempts.append(("db_pb1_watchlist_final", plain_rows, (plain_as_of or as_of_date).isoformat(), True))
-
-    logger.info("[TRADE][FINAL30][LOAD_ATTEMPT] checked=%s", checked)
-
-    for source_name, rows, used_as_of, used_fallback in attempts:
-        df = pd.DataFrame(rows)
-        columns = [str(c) for c in df.columns.tolist()]
-        missing = _missing_scored_cols(columns)
-        is_scored = len(missing) < 3
-        if not is_scored:
+        if len(plain_rows) == 30 and plain_as_of == as_of_date:
+            df = pd.DataFrame(plain_rows)
+            columns = [str(c) for c in df.columns.tolist()]
             logger.warning(
-                "[TRADE][FINAL30][LOAD_REJECT] source=%s rows=%s cols=%s missing_scored_cols=%s",
-                source_name,
+                "[TRADE][FINAL30][LOAD] source=db_pb1_watchlist_final rows=%s is_scored=0 debug_fallback=1 cols=%s",
                 len(df),
                 columns,
-                missing,
             )
-            if not used_fallback:
-                continue
-        logger.info(
-            "[TRADE][FINAL30][LOAD] source=%s rows=%s is_scored=%s cols=%s",
-            source_name,
-            len(df),
-            int(is_scored),
-            columns,
-        )
-        return {
-            "df": df,
-            "source_name": source_name,
-            "as_of": used_as_of,
-            "columns": columns,
-            "is_scored": bool(is_scored),
-            "used_fallback": bool(used_fallback),
-        }
+            return {
+                "df": df,
+                "source_name": "db_pb1_watchlist_final",
+                "as_of": plain_as_of.isoformat(),
+                "columns": columns,
+                "is_scored": False,
+                "used_fallback": True,
+                "file_mirror_present": any(file_mirror_stats.values()),
+            }
 
-    logger.error("[TRADE][FINAL30][LOAD_FAIL] no usable scored final30 found")
+    logger.error(
+        "[TRADE][FINAL30][LOAD_FAIL] reason=db_contract_invalid env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_fields=%s",
+        env_n,
+        as_of_date.isoformat(),
+        scored_contract.get("rows"),
+        scored_contract.get("uniq_codes"),
+        scored_contract.get("uniq_ranks"),
+        scored_contract.get("null_critical"),
+        scored_contract.get("missing_fields"),
+    )
     return {
         "df": pd.DataFrame(),
         "source_name": "none",
@@ -251,6 +228,7 @@ def load_trade_final30_scored(
         "columns": [],
         "is_scored": False,
         "used_fallback": False,
+        "file_mirror_present": any(file_mirror_stats.values()),
     }
 
 
@@ -913,29 +891,32 @@ def _load_universe_context(
         else:
             df = df.sort_values(by=["code"], ascending=[True], kind="mergesort")
 
+        rank_basis = "rank_final30" if "rank_final30" in df.columns else ("score_final" if "score_final" in df.columns else "code")
+        original_codes = [str(x).zfill(6) for x in pd.DataFrame(result.get("df")).get("code", pd.Series(dtype=str)).tolist() if str(x).strip()]
+        sorted_codes = [str(x).zfill(6) for x in df.get("code", pd.Series(dtype=str)).tolist() if str(x).strip()]
+        canonical_order_match = int(original_codes == sorted_codes)
+
         members = [dict(row) for row in df.to_dict(orient="records") if row.get("code")]
         for member in members:
             member["code"] = str(member.get("code") or "").zfill(6)
 
         top10_codes = [m.get("code") for m in members[:10] if m.get("code")]
         logger.info(
-            "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
+            "[TRADE][FINAL30][DB_LOCK] env=%s as_of=%s rows=%s scored=%s immutable=1",
             (env or "").strip().lower(),
-            result.get("source_name"),
-            as_of,
             result.get("as_of"),
             len(members),
+            int(bool(result.get("is_scored"))),
         )
         logger.info(
-            "[TRADE][WATCHLIST_FINAL][TOP10] source=%s rank_basis=%s codes=%s",
-            result.get("source_name"),
-            "rank_final30" if "rank_final30" in df.columns else ("score_final" if "score_final" in df.columns else "code"),
-            top10_codes,
+            "[TRADE][FINAL30][ORDER] rank_basis=%s canonical_order_match=%s",
+            rank_basis,
+            canonical_order_match,
         )
         logger.info(
             "[TRADE][FINAL30][TOP10] source=%s rank_basis=%s codes=%s",
             result.get("source_name"),
-            "rank_final30" if "rank_final30" in df.columns else ("score_final" if "score_final" in df.columns else "code"),
+            rank_basis,
             top10_codes,
         )
         return UniverseContext(
@@ -948,6 +929,7 @@ def _load_universe_context(
                 "is_scored": bool(result.get("is_scored")),
                 "columns": list(result.get("columns") or []),
                 "used_fallback": bool(result.get("used_fallback")),
+                "file_mirror_present": int(bool(result.get("file_mirror_present"))),
             },
             is_empty=len(members) == 0,
         )
@@ -1581,7 +1563,7 @@ def run_once(
         as_of,
         asof_reason,
     )
-    logger.info("[ASOF][LOCK] trade_date=%s derived_as_of=%s immutable=1", trade_date.isoformat(), as_of)
+    logger.info("[ASOF][LOCK] trade_date=%s derived_as_of=%s immutable=1 source=db_contract", trade_date.isoformat(), as_of)
     
     runtime_root_dir = runtime_dir or runtime_root()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
@@ -2255,10 +2237,11 @@ def run_once(
                     run_ctx["final30_locked"] = True
                     trade_use_precomputed_features = True
                     logger.info(
-                        "[TRADE][FINAL30][LOCK] source=%s as_of=%s rows=%s locked=1",
-                        final30_source_name,
+                        "[TRADE][FINAL30][DB_LOCK] env=%s as_of=%s rows=%s scored=%s immutable=1",
+                        kis_env or "practice",
                         str(run_ctx.get("derived_as_of") or as_of),
                         len(precomputed_final30_df),
+                        int(final30_source_name == "db_pb1_watchlist_final_scored"),
                     )
                     logger.info(
                         "[TRADE][PRECOMPUTED_FEATURES] enabled=1 source=pb1_watchlist_final_scored rows=%s",
@@ -3438,6 +3421,52 @@ def main() -> int:
         
         # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
+        watchlist_repo = WatchlistRepo(engine)
+        watchlist_final_count = watchlist_repo.count_watchlist(
+            env=derived_env,
+            strategy="pb1_watchlist_final",
+            as_of=derived_as_of,
+        )
+        watchlist_scored_count = watchlist_repo.count_watchlist(
+            env=derived_env,
+            strategy="pb1_watchlist_final_scored",
+            as_of=derived_as_of,
+        )
+        scored_contract = watchlist_repo.verify_watchlist_scored_contract(
+            env=derived_env,
+            as_of=derived_as_of,
+            strategy="pb1_watchlist_final_scored",
+            allow_latest_fallback=False,
+        )
+        db_contract_ok = bool(
+            prep_done
+            and derived_count > 0
+            and watchlist_final_count == 30
+            and watchlist_scored_count == 30
+            and scored_contract.get("ok")
+        )
+        logger.info(
+            "[TRADE_TICK][DB_CONTRACT] env=%s as_of=%s prep_done=%s derived_minervini=%s watchlist_final=%s watchlist_final_scored=%s db_contract_ok=%s",
+            derived_env,
+            derived_as_of.isoformat(),
+            int(prep_done),
+            derived_count,
+            watchlist_final_count,
+            watchlist_scored_count,
+            int(db_contract_ok),
+        )
+        if not db_contract_ok:
+            logger.warning(
+                "[TRADE_TICK][SKIP] reason=DB_CONTRACT_INCOMPLETE derived_as_of=%s trade_date=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s",
+                derived_as_of.isoformat(),
+                trade_date.isoformat(),
+                scored_contract.get("rows"),
+                scored_contract.get("uniq_codes"),
+                scored_contract.get("uniq_ranks"),
+                scored_contract.get("null_critical"),
+            )
+            return 0
+
         derived_env = os.getenv("STRATEGY_ENV", "practice").strip().lower()
         derived_count = derived_repo.count_as_of(env=derived_env, as_of=derived_as_of)
         

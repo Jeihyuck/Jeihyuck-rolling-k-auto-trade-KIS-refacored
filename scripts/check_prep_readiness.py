@@ -8,7 +8,7 @@ import sys
 import sqlalchemy as sa
 
 from trader.db.engine import make_engine
-from trader.db.repos import DerivedMinerviniRepo, LedgerEventsRepo
+from trader.db.repos import DerivedMinerviniRepo, LedgerEventsRepo, WatchlistRepo
 from trader.db.schema import schema_for_engine
 from trader.runtime_paths import build_final30_scored_paths, repo_root
 from trader.time_utils import now_kst, resolve_trade_readiness_as_of
@@ -67,13 +67,11 @@ def main() -> int:
 
         ledger_repo = LedgerEventsRepo(engine)
         derived_repo = DerivedMinerviniRepo(engine)
+        watchlist_repo = WatchlistRepo(engine)
 
         prep_done, prep_done_count = ledger_repo.prep_done_status(env=env, as_of=resolved_as_of)
         derived_count = derived_repo.count_as_of(env=env, as_of=resolved_as_of)
-        require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
-        strict_final30_file_contract = os.getenv("STRICT_FINAL30_FILE_CONTRACT", "0") == "1"
         repo_root_path = repo_root().resolve()
-        cwd = os.getcwd()
         final30_paths = build_final30_scored_paths(repo_root_path, env, resolved_as_of.isoformat())
         final30_path_stats = {
             label: {
@@ -88,6 +86,7 @@ def main() -> int:
             for label, stats in final30_path_stats.items()
             if not stats["exists"] or stats["bytes"] <= 0
         ]
+        file_contract_ok = not final30_missing
 
         with engine.connect() as conn:
             watchlist_final_count = _count_watchlist_rows(
@@ -105,42 +104,56 @@ def main() -> int:
                 strategy="pb1_watchlist_final_scored",
             )
 
-        ready = (derived_count > 0) and (watchlist_final_count > 0)
-        if require_scored:
-            ready = ready and (watchlist_final_scored_count > 0)
-
-        final30_rows_ok = watchlist_final_scored_count > 0
-        file_contract_ok = final30_rows_ok and not final30_missing
-        grade = "ok"
-        if ready and not file_contract_ok:
-            grade = "warn"
-            if strict_final30_file_contract:
-                ready = False
-        elif ready and watchlist_final_count < 30:
-            grade = "degraded"
-
-        print(
-            f"[PREP][READINESS][FILES] repo_root={repo_root_path} cwd={cwd} paths={final30_path_stats} missing={final30_missing} strict={int(strict_final30_file_contract)}"
+        scored_contract = watchlist_repo.verify_watchlist_scored_contract(
+            env=env,
+            as_of=resolved_as_of,
+            strategy="pb1_watchlist_final_scored",
+            allow_latest_fallback=False,
+            log_result=False,
         )
 
-        if ready:
+        db_contract_ok = bool(
+            prep_done
+            and derived_count >= 1
+            and watchlist_final_count == 30
+            and watchlist_final_scored_count == 30
+            and scored_contract.get("ok")
+        )
+
+        status = "ready" if db_contract_ok else "not_ready"
+        grade = "ok"
+        reason_code = "DB_CONTRACT_OK"
+        if db_contract_ok and not file_contract_ok:
+            grade = "warn"
+            reason_code = "DB_CONTRACT_OK_FILE_OPTIONAL_MISSING"
+        elif not db_contract_ok:
+            grade = "error"
+            reason_code = "DB_CONTRACT_INCOMPLETE"
+
+        print(
+            f"[PREP][READINESS][DB] env={env} as_of={resolved_as_of.isoformat()} prep_done={int(prep_done)} "
+            f"prep_done_count={prep_done_count} derived_minervini={derived_count} watchlist_final={watchlist_final_count} "
+            f"watchlist_final_scored={watchlist_final_scored_count} db_contract_ok={int(db_contract_ok)}"
+        )
+        print(
+            f"[PREP][READINESS][FILES] runtime={final30_path_stats['runtime']['exists']} "
+            f"ledger={final30_path_stats['ledger']['exists']} signals={final30_path_stats['signals']['exists']} "
+            f"file_contract_ok={int(file_contract_ok)} warn_only=1"
+        )
+
+        if db_contract_ok:
             print(
-                f"[PREP][READINESS] status=ready env={env} run_date={run_date.isoformat()} "
-                f"window={window} requested_as_of={requested_as_of.isoformat()} "
-                f"resolved_as_of={resolved_as_of.isoformat()} calendar_prev={calendar_prev.isoformat()} reason={reason} "
-                f"prep_done={int(prep_done)} prep_done_count={prep_done_count} "
-                f"derived_minervini={derived_count} pb1_watchlist_final={watchlist_final_count} "
-                f"pb1_watchlist_final_scored={watchlist_final_scored_count} final30_file_contract_ok={int(file_contract_ok)} grade={grade}"
+                f"[PREP][READINESS] status={status} grade={grade} reason={reason_code} env={env} "
+                f"run_date={run_date.isoformat()} window={window} requested_as_of={requested_as_of.isoformat()} "
+                f"resolved_as_of={resolved_as_of.isoformat()} calendar_prev={calendar_prev.isoformat()} resolve_reason={reason}"
             )
             return 0
 
         print(
-            f"[PREP][READINESS] status=missing env={env} run_date={run_date.isoformat()} "
-            f"window={window} requested_as_of={requested_as_of.isoformat()} "
-            f"resolved_as_of={resolved_as_of.isoformat()} calendar_prev={calendar_prev.isoformat()} reason={reason} "
-            f"prep_done={int(prep_done)} prep_done_count={prep_done_count} "
-            f"derived_minervini={derived_count} pb1_watchlist_final={watchlist_final_count} "
-            f"pb1_watchlist_final_scored={watchlist_final_scored_count} final30_file_contract_ok={int(file_contract_ok)} missing_paths={final30_missing}"
+            f"[PREP][READINESS] status={status} grade={grade} reason={reason_code} env={env} "
+            f"run_date={run_date.isoformat()} window={window} requested_as_of={requested_as_of.isoformat()} "
+            f"resolved_as_of={resolved_as_of.isoformat()} calendar_prev={calendar_prev.isoformat()} resolve_reason={reason} "
+            f"missing_paths={final30_missing} scored_missing_fields={scored_contract.get('missing_fields')}"
         )
         return 10
     except Exception as exc:

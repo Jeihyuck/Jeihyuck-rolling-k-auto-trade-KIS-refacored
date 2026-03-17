@@ -7,7 +7,7 @@ import pytest
 import sqlalchemy as sa
 
 from trader import pb1_runner
-from trader.db.repos import CRITICAL_SCORED_COLS, WatchlistRepo, save_watchlist
+from trader.db.repos import CRITICAL_SCORED_COLS, WatchlistRepo, save_watchlist, verify_final30_scored_contract
 from trader.db.schema import schema_for_engine
 
 
@@ -88,6 +88,19 @@ def test_scored_watchlist_roundtrip_preserves_critical_columns() -> None:
     assert len(loaded) == 30
     df = pd.DataFrame(loaded)
     assert set(CRITICAL_SCORED_COLS).issubset(set(df.columns))
+
+    summary = verify_final30_scored_contract(
+        engine,
+        env="practice",
+        as_of=as_of,
+        allow_latest_fallback=False,
+        log_result=False,
+    )
+    assert summary["ok"] is True
+    assert summary["rows"] == 30
+    assert summary["uniq_codes"] == 30
+    assert summary["uniq_ranks"] == 30
+    assert summary["null_critical"] == 0
 
 
 def test_universe_scored_roundtrip_preserves_critical_columns() -> None:

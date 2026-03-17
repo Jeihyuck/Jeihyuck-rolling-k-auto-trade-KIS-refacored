@@ -6305,12 +6305,12 @@ class PB1Engine:
                 order_rows.sort(key=lambda x: str(x.get("code") or ""))
             return [str(m.get("code") or "").zfill(6) for m in order_rows if m.get("code")]
 
-        final30_codes = load_final30(self.env, as_of) or []
-        if final30_codes and not require_scored:
-            logger.info("[FINAL30][LOAD] as_of=%s count=%s source=final30_snapshot", as_of, len(final30_codes))
-            return final30_codes
-        
-        # 둘 다 없으면 abort
+        logger.error(
+            "[PB1][ENTRY][GUARD] final30_db_lock_missing -> abort as_of=%s env=%s source=%s",
+            as_of,
+            self.env,
+            getattr(self, "final30_source", "none"),
+        )
         logger.error(
             "[PB1][ENTRY][GUARD] final30_missing -> abort as_of=%s env=%s (no watchlist_final fallback available)",
             as_of,
@@ -6787,6 +6787,14 @@ class PB1Engine:
             getattr(self, "phase", None),
             hasattr(self, "flags"),
             bool(getattr(self, "force_block_live", False)),
+        )
+        logger.info(
+            "[PB1][ENGINE_STATE] final30_source=%s as_of=%s rows=%s immutable=%s file_mirror_present=%s",
+            getattr(self, "final30_source", "none"),
+            getattr(self, "derived_as_of", ""),
+            len(getattr(self, "final30_df", pd.DataFrame()) if getattr(self, "final30_df", None) is not None else pd.DataFrame()),
+            int(bool(getattr(self, "final30_locked", False))),
+            int(bool((((self._universe_context.meta or {}) if getattr(self, "_universe_context", None) else {}).get("file_mirror_present")))),
         )
         
         # ✅ [GATE] calc_allowed, order_allowed 분리

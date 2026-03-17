@@ -59,6 +59,10 @@ __all__ = [
     "load_watchlist_scored",
     "REQUIRED_FINAL30_SCORED_COLS",
     "CRITICAL_SCORED_COLS",
+    "FINAL30_SCORED_DB_CONTRACT_FIELDS",
+    "FINAL30_SCORED_REQUIRED_ROWS",
+    "summarize_final30_scored_contract",
+    "verify_final30_scored_contract",
 ]
 
 
@@ -119,6 +123,29 @@ CRITICAL_SCORED_COLS = [
     "vcp_score",
     "entry_style_selected",
 ]
+
+FINAL30_SCORED_DB_CONTRACT_FIELDS = [
+    "code",
+    "as_of",
+    "rank_final30",
+    "score_final",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "entry_style_selected",
+    "ma20",
+    "ma50",
+    "ma150",
+    "rs_percentile",
+    "vcp_score",
+    "atr_pct",
+    "close",
+    "reasons",
+    "filters_passed",
+    "filters_failed",
+]
+
+FINAL30_SCORED_REQUIRED_ROWS = 30
 
 SCORED_WATCHLIST_STRATEGIES = {
     "pb1_watchlist_final_scored",
@@ -182,6 +209,68 @@ def _norm_env(env: str | None) -> str:
 
 def _norm_strategy(strategy: str | None) -> str:
     return (strategy or "").strip().lower()
+
+
+def _contract_value_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    return False
+
+
+def summarize_final30_scored_contract(
+    rows: List[Dict[str, Any]],
+    *,
+    env: str,
+    as_of: date | str,
+    expected_rows: int = FINAL30_SCORED_REQUIRED_ROWS,
+) -> Dict[str, Any]:
+    expected_as_of = to_date(as_of).isoformat()
+    normalized_rows = [dict(row or {}) for row in (rows or []) if isinstance(row, dict)]
+    all_columns = sorted({str(key) for row in normalized_rows for key in row.keys()})
+    missing_fields = [field for field in FINAL30_SCORED_DB_CONTRACT_FIELDS if field not in all_columns]
+
+    codes = [str((row or {}).get("code") or "").zfill(6) for row in normalized_rows if str((row or {}).get("code") or "").strip()]
+    uniq_codes = len(set(codes))
+
+    rank_values: list[int] = []
+    for row in normalized_rows:
+        try:
+            rank_values.append(int((row or {}).get("rank_final30")))
+        except Exception:
+            continue
+    uniq_ranks = len(set(rank_values))
+
+    as_of_values = sorted({str((row or {}).get("as_of") or "")[:10] for row in normalized_rows if str((row or {}).get("as_of") or "").strip()})
+    null_critical = sum(
+        1
+        for row in normalized_rows
+        for field in FINAL30_SCORED_DB_CONTRACT_FIELDS
+        if _contract_value_missing((row or {}).get(field))
+    )
+
+    ok = (
+        len(normalized_rows) == int(expected_rows)
+        and uniq_codes == int(expected_rows)
+        and uniq_ranks == int(expected_rows)
+        and null_critical == 0
+        and as_of_values == [expected_as_of]
+    )
+    return {
+        "rows": len(normalized_rows),
+        "uniq_codes": uniq_codes,
+        "uniq_ranks": uniq_ranks,
+        "null_critical": null_critical,
+        "as_of_values": as_of_values,
+        "missing_fields": missing_fields,
+        "env": _norm_env(env),
+        "as_of": expected_as_of,
+        "expected_rows": int(expected_rows),
+        "ok": bool(ok),
+        "rows_data": normalized_rows,
+        "columns": all_columns,
+    }
 
 
 def save_pb1_watchlist_rows(
@@ -2976,6 +3065,72 @@ class WatchlistRepo:
         )
         return result, used_as_of
 
+    def count_watchlist(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of: date | str,
+    ) -> int:
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy)
+        as_of_date = to_date(as_of)
+        schema = self._schema
+        with self.engine.connect() as conn:
+            stmt = (
+                select(func.count())
+                .select_from(schema.pb1_watchlist)
+                .where(
+                    and_(
+                        schema.pb1_watchlist.c.env == env_n,
+                        schema.pb1_watchlist.c.strategy == strategy_n,
+                        schema.pb1_watchlist.c.as_of == as_of_date,
+                    )
+                )
+            )
+            return int(conn.execute(stmt).scalar() or 0)
+
+    def verify_watchlist_scored_contract(
+        self,
+        *,
+        env: str,
+        as_of: date | str,
+        strategy: str = "pb1_watchlist_final_scored",
+        allow_latest_fallback: bool = False,
+        ttl_days: int = 7,
+        max_back_days: int = 3,
+        expected_rows: int = FINAL30_SCORED_REQUIRED_ROWS,
+        log_result: bool = True,
+    ) -> Dict[str, Any]:
+        rows, used_as_of = self.load_watchlist_scored(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            allow_latest_fallback=allow_latest_fallback,
+            ttl_days=ttl_days,
+            max_back_days=max_back_days,
+        )
+        summary = summarize_final30_scored_contract(
+            rows,
+            env=env,
+            as_of=as_of,
+            expected_rows=expected_rows,
+        )
+        summary["used_as_of"] = used_as_of.isoformat() if used_as_of is not None else None
+        summary["strategy"] = _norm_strategy(strategy)
+        if log_result:
+            logger.info(
+                "[DB][FINAL30_SCORED][VERIFY] rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s env=%s as_of=%s ok=%s",
+                summary["rows"],
+                summary["uniq_codes"],
+                summary["uniq_ranks"],
+                summary["null_critical"],
+                summary["env"],
+                summary["as_of"],
+                int(summary["ok"]),
+            )
+        return summary
+
     def load_watchlist_scored(
         self,
         *,
@@ -3123,6 +3278,31 @@ def load_watchlist_scored(
         allow_latest_fallback=allow_latest_fallback,
         ttl_days=ttl_days,
         max_back_days=max_back_days,
+    )
+
+
+def verify_final30_scored_contract(
+    engine: Engine,
+    *,
+    env: str,
+    as_of: date | str,
+    strategy: str = "pb1_watchlist_final_scored",
+    allow_latest_fallback: bool = False,
+    ttl_days: int = 7,
+    max_back_days: int = 3,
+    expected_rows: int = FINAL30_SCORED_REQUIRED_ROWS,
+    log_result: bool = True,
+) -> Dict[str, Any]:
+    repo = WatchlistRepo(engine)
+    return repo.verify_watchlist_scored_contract(
+        env=env,
+        as_of=as_of,
+        strategy=strategy,
+        allow_latest_fallback=allow_latest_fallback,
+        ttl_days=ttl_days,
+        max_back_days=max_back_days,
+        expected_rows=expected_rows,
+        log_result=log_result,
     )
 
 

@@ -1363,7 +1363,7 @@ def main() -> int:
         )
         stage_as_of["final30"] = as_of.isoformat()
         
-        # ✅ CRITICAL: Save final30_snapshot for trade tick
+        # final30 snapshot is a compatibility artifact only.
         from trader.final_list_store import save_final30
         final30_codes = [str(m.get("code") or "").zfill(6) for m in watchlist if m.get("code")]
         final30_meta = {
@@ -1372,19 +1372,26 @@ def main() -> int:
             "bundle_source": watchlist_bundle.get("degrade", {}).get("reason", "fresh_build"),
             "final_count": len(watchlist),
         }
-        final30_path = save_final30(
-            env=env,
-            as_of=as_of.isoformat(),
-            symbols=final30_codes,
-            meta=final30_meta,
-            overwrite=True,
-        )
-        logger.info(
-            "[PREP][FINAL30_SNAPSHOT][SAVE] as_of=%s count=%s path=%s",
-            as_of.isoformat(),
-            len(final30_codes),
-            final30_path,
-        )
+        try:
+            final30_path = save_final30(
+                env=env,
+                as_of=as_of.isoformat(),
+                symbols=final30_codes,
+                meta=final30_meta,
+                overwrite=True,
+            )
+            logger.info(
+                "[PREP][FINAL30_SNAPSHOT][SAVE] as_of=%s count=%s path=%s warn_only=1",
+                as_of.isoformat(),
+                len(final30_codes),
+                final30_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[PREP][FINAL30_SNAPSHOT][WARN] as_of=%s err=%s warn_only=1",
+                as_of.isoformat(),
+                exc,
+            )
 
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id
@@ -1453,16 +1460,51 @@ def main() -> int:
             "[WATCHLIST][SAVE_VERIFY][OK] strategy=%s critical_scored_cols_present=1",
             scored_strategy,
         )
-        logger.info(
-            "[PREP][FINAL30_SCORED][DB_ROUNDTRIP_OK] rows=%s has_score_final=1 has_tech_score=1 has_breakout_score=1 has_pullback_score=1 has_momentum_score=1 has_rs_percentile=1 has_vcp_score=1 has_entry_style_selected=1",
-            len(loaded_scored_df),
+        scored_contract = watchlist_repo.verify_watchlist_scored_contract(
+            env=env,
+            as_of=as_of,
+            strategy=scored_strategy,
+            allow_latest_fallback=False,
         )
+        exact_final_rows, _ = watchlist_repo.load_watchlist(
+            env=env,
+            strategy="pb1_watchlist_final",
+            as_of=as_of,
+            allow_latest_fallback=False,
+        )
+        db_commit_ok = len(exact_final_rows) == 30 and bool(scored_contract.get("ok"))
+        logger.info(
+            "[PREP][DB_COMMIT][VERIFY] env=%s as_of=%s final=%s final_scored=%s required=30 ok=%s",
+            env,
+            as_of.isoformat(),
+            len(exact_final_rows),
+            scored_contract.get("rows"),
+            int(db_commit_ok),
+        )
+        if not db_commit_ok:
+            logger.error(
+                "[PREP][COMMIT][FAIL] env=%s as_of=%s final=%s final_scored=%s missing_fields=%s",
+                env,
+                as_of.isoformat(),
+                len(exact_final_rows),
+                scored_contract.get("rows"),
+                scored_contract.get("missing_fields"),
+            )
+            raise RuntimeError("PREP_DB_COMMIT_VERIFY_FAILED")
 
-    final30_file_results = _write_canonical_final30_scored_files(
-        env=env,
-        as_of=as_of.isoformat(),
-        df=final30_scored_df_for_export,
-    )
+    logger.info("[FINAL30][FILE_MIRROR][TRY] targets=3")
+    try:
+        final30_file_results = _write_canonical_final30_scored_files(
+            env=env,
+            as_of=as_of.isoformat(),
+            df=final30_scored_df_for_export,
+        )
+    except Exception as exc:
+        logger.warning("[FINAL30][FILE_MIRROR][WARN] err=%s warn_only=1", exc)
+        final30_file_results = {
+            label: {"exists": False, "bytes": 0, "rows": 0, "json_ok": False}
+            for label in build_final30_scored_paths(repo_root().resolve(), env, as_of.isoformat()).keys()
+        }
     prep_repo_root = repo_root().resolve()
     prep_cwd = Path.cwd().resolve()
     final30_paths = build_final30_scored_paths(prep_repo_root, env, as_of.isoformat())
@@ -1482,6 +1524,11 @@ def main() -> int:
             int(path_info.get("bytes") or 0),
             int(path_info.get("rows") or 0),
         )
+    logger.info(
+        "[FINAL30][FILE_MIRROR][DONE] success=%s failed=%s warn_only=1",
+        sum(1 for info in final30_file_results.values() if bool(info.get("exists")) and int(info.get("bytes") or 0) > 0 and int(info.get("rows") or 0) > 0),
+        sum(1 for info in final30_file_results.values() if not bool(info.get("exists")) or int(info.get("bytes") or 0) <= 0 or int(info.get("rows") or 0) <= 0),
+    )
     logger.info(
         "[PREP][SIGNALS][FINAL30_JSON] path=%s count=%s source=canonical_scored_contract",
         final30_paths["signals"],
@@ -1687,7 +1734,6 @@ def main() -> int:
     prep_status = "DONE"
     flow_coverage = 0.0
     degraded_exclude_flow = False
-    strict_final30_file_contract = _env_true("STRICT_FINAL30_FILE_CONTRACT", "0")
     final30_file_failures = [
         f"final30_file_contract_missing:{label}"
         for label, info in final30_file_results.items()
@@ -1695,9 +1741,8 @@ def main() -> int:
     ]
     final30_file_contract_ok = len(final30_scored_df_for_export) > 0 and not final30_file_failures
     logger.info(
-        "[PREP][FINAL30_FILE][CONTRACT] ok=%s strict=%s failures=%s",
+        "[PREP][FINAL30_FILE][CONTRACT] ok=%s warn_only=1 failures=%s",
         int(final30_file_contract_ok),
-        int(strict_final30_file_contract),
         final30_file_failures,
     )
     if final30_file_failures:
@@ -1707,7 +1752,6 @@ def main() -> int:
             prep_cwd,
             final30_file_failures,
         )
-        contract_failures = list(contract_failures) + final30_file_failures
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:
@@ -1799,12 +1843,6 @@ def main() -> int:
             flow_coverage * 100.0,
             as_of,
         )
-
-    if final30_file_failures:
-        if strict_final30_file_contract:
-            prep_status = "FAIL"
-        elif prep_status != "FAIL":
-            prep_status = "DEGRADED"
 
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
