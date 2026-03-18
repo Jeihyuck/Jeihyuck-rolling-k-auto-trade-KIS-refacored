@@ -14,6 +14,8 @@ from trader.db.engine import get_engine  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+_MIGRATION_GUARD: set[str] = set()
+
 def split_postgres_sql(sql: str) -> list[str]:
     statements: list[str] = []
     buffer: list[str] = []
@@ -212,6 +214,10 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
         return
     if str(engine.url).startswith("sqlite"):
         raise RuntimeError("sqlite is forbidden. Use Postgres (PBCORE_DB_URL).")
+    guard_key = f"{engine.url!s}|{Path(migrations_dir).resolve()}"
+    if guard_key in _MIGRATION_GUARD:
+        return
+    _MIGRATION_GUARD.add(guard_key)
     logger.info("[DB][MIGRATE][RUN] reason=stamp_miss_or_version_change")
     migration_files = sorted(
         [

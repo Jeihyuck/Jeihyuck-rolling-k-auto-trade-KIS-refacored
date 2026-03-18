@@ -4,12 +4,14 @@ import os
 from datetime import date
 from pathlib import Path
 
+from trader.path_contract import build_final30_paths, resolve_repo_root
+
 TRADER_RUNTIME_DIR_ENV = "TRADER_RUNTIME_DIR"
 TRADER_CACHE_ROOT_ENV = "TRADER_CACHE_ROOT"
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return resolve_repo_root()
 
 
 def repo_root() -> Path:
@@ -80,13 +82,7 @@ def _as_of_str(as_of: str | date) -> str:
 
 
 def build_final30_scored_paths(repo_root: Path, env: str, as_of: str | date) -> dict[str, Path]:
-    env_n = (env or "").strip().lower()
-    as_of_s = _as_of_str(as_of)
-    return {
-        "runtime": repo_root / "runtime" / "watchlist" / as_of_s / "final30_scored.json",
-        "ledger": repo_root / "bot_state" / "trader_ledger" / "final30" / env_n / as_of_s / "final30_scored.json",
-        "signals": repo_root / "signals" / "final30.json",
-    }
+    return build_final30_paths(repo_root, env, as_of)
 
 
 def get_final30_scored_paths(env: str, as_of: str | date) -> list[Path]:

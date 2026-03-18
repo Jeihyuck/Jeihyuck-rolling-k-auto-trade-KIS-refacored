@@ -66,30 +66,45 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
     ma50 = _score_or_zero(feats.get("ma50"))
     hi_52w = _score_or_zero(feats.get("hi_52w"))
     pivot = _score_or_zero(feats.get("pivot"))
+    ma50_slope = _score_or_zero(feats.get("ma50_slope"))
+    ma20_slope = _score_or_zero(feats.get("ma20_slope"))
     ret_63 = _score_or_zero((feats.get("ret_63") or 0.0) * 100.0)
     ret_126 = _score_or_zero((feats.get("ret_126") or 0.0) * 100.0)
+    flat_placeholder = bool(close > 0 and ((pivot > 0 and abs(close - pivot) < 1e-9) or (hi_52w > 0 and abs(close - hi_52w) < 1e-9)))
+    if flat_placeholder:
+        logger.warning(
+            "[DERIVED][ENTRY][ANOMALY][FLAT_VALUES] close=%.4f pivot=%.4f hi_52w=%.4f volume=%.4f",
+            close,
+            pivot,
+            hi_52w,
+            volume,
+        )
 
     # Breakout score (0~100)
     breakout = 0.0
+    breakout_distance = 0.0
     if close > 0 and pivot > 0:
-        ratio = close / pivot
-        if ratio >= 1.00:
-            breakout += 55.0
-        elif ratio >= 0.98:
-            breakout += 35.0
-    elif close > 0 and hi_52w > 0:
-        ratio = close / hi_52w
-        if ratio >= 0.98:
-            breakout += 40.0
-        elif ratio >= 0.95:
+        breakout_distance = ((close - pivot) / pivot) * 100.0
+        if breakout_distance >= 0.0:
+            breakout += 45.0
+        elif breakout_distance >= -2.0:
             breakout += 25.0
+    elif close > 0 and hi_52w > 0:
+        breakout_distance = ((close - hi_52w) / hi_52w) * 100.0
+        if breakout_distance >= -1.0:
+            breakout += 30.0
+        elif breakout_distance >= -4.0:
+            breakout += 15.0
 
     if volume > 0 and volume_avg20 > 0:
         vol_ratio = volume / volume_avg20
         if vol_ratio >= 1.50:
-            breakout += 35.0
+            breakout += 30.0
         elif vol_ratio >= 1.20:
-            breakout += 20.0
+            breakout += 18.0
+
+    if breakout_distance > 7.0:
+        breakout -= min(20.0, (breakout_distance - 7.0) * 2.0)
 
     if atr > 0 and close > 0:
         atr_pct = (atr / close) * 100.0
@@ -103,9 +118,9 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
         pullback_depth = max(0.0, ((hi_52w - close) / hi_52w) * 100.0)
 
     if close > 0 and ma20 > 0 and close >= ma20:
-        pullback += 25.0
-    elif close > 0 and ma50 > 0 and close >= ma50:
-        pullback += 15.0
+        pullback += 22.0
+    if close > 0 and ma50 > 0 and close >= ma50:
+        pullback += 20.0
 
     if 3.0 <= pullback_depth <= 18.0:
         pullback += 40.0
@@ -115,20 +130,27 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
     if volume > 0 and volume_avg20 > 0:
         vol_ratio = volume / volume_avg20
         if vol_ratio < 0.80:
-            pullback += 35.0
+            pullback += 28.0
         elif vol_ratio < 1.00:
-            pullback += 20.0
+            pullback += 18.0
+
+    if pullback_depth > 0 and pullback_depth <= 8.0:
+        pullback += 12.0
 
     # Momentum score (0~100)
     momentum = 0.0
     if ret_63 > 0:
-        momentum += 35.0
+        momentum += 28.0
     if ret_126 > 0:
-        momentum += 45.0
+        momentum += 32.0
     if rs_pct >= 80.0:
         momentum += 20.0
     elif rs_pct >= 65.0:
         momentum += 10.0
+    if ma20_slope > 0:
+        momentum += 8.0
+    if ma50_slope > 0:
+        momentum += 12.0
 
     breakout_score = _score_or_zero(breakout)
     pullback_score = _score_or_zero(pullback)
@@ -141,6 +163,7 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
         "volume": volume,
         "atr": atr,
         "pivot": pivot,
+        "breakout_distance": breakout_distance,
         "pullback_depth": pullback_depth,
         "rs_percentile": rs_pct,
     }

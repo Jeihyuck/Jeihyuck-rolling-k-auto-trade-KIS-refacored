@@ -165,6 +165,12 @@ def scan_entry_candidates(
     per_symbol_rejects: dict[str, list[str]] = {}
     rejected_counts: Counter[str] = Counter()
     style_counts: Counter[str] = Counter()
+    epsilon = 1e-6
+    breakout_pass_count = 0
+    pullback_pass_count = 0
+    momentum_pass_count = 0
+    multi_pass_count = 0
+    none_pass_count = 0
 
     precomputed_map: dict[str, dict[str, Any]] = {}
     if precomputed_final30_df is not None and not precomputed_final30_df.empty and "code" in precomputed_final30_df.columns:
@@ -218,9 +224,12 @@ def scan_entry_candidates(
             vol_avg20 = _safe_float(precomputed_row.get("volume_avg20", 0.0))
             vol = _safe_float(precomputed_row.get("volume", 0.0))
 
-            breakout_ok = _safe_float(precomputed_row.get("breakout_score", 0.0)) > 0.0
-            pullback_ok = _safe_float(precomputed_row.get("pullback_score", 0.0)) > 0.0
-            momentum_ok = _safe_float(precomputed_row.get("momentum_score", 0.0)) > 0.0
+            breakout_strength = _safe_float(precomputed_row.get("breakout_score", 0.0)) / 100.0
+            pullback_strength = _safe_float(precomputed_row.get("pullback_score", 0.0)) / 100.0
+            momentum_strength = _safe_float(precomputed_row.get("momentum_score", 0.0)) / 100.0
+            breakout_ok = bool(precomputed_row.get("breakout_pass", breakout_strength > epsilon))
+            pullback_ok = bool(precomputed_row.get("pullback_pass", pullback_strength > epsilon))
+            momentum_ok = bool(precomputed_row.get("momentum_pass", momentum_strength > epsilon))
         else:
             request_days = 260
             if trade_precomputed_only and request_days > 60:
@@ -276,9 +285,19 @@ def scan_entry_candidates(
                 rejected_counts.update(reasons)
                 continue
 
-            breakout_ok = close > high_50 and vol > (vol_avg20 * 1.5 if vol_avg20 > 0 else 0)
-            pullback_ok = close > ma50 and 0.05 <= pullback_pct <= 0.15
-            momentum_ok = rs_percentile >= 80 and close > ma20 and vol > (vol_avg20 if vol_avg20 > 0 else 0)
+            breakout_strength = min(1.0, max(0.0, (close - high_50) / high_50 * 10.0)) if high_50 > 0 else 0.0
+            pullback_strength = max(0.0, 1.0 - abs(pullback_pct - 0.10) / 0.05)
+            momentum_strength = min(1.0, max(0.0, (rs_percentile - 80) / 20.0)) if rs_percentile >= 80 else 0.0
+            breakout_ok = high_50 > 0 and vol_avg20 > 0 and close >= high_50 and vol > (vol_avg20 * 1.2) and breakout_strength > epsilon
+            pullback_ok = ma50 > 0 and close >= ma50 and 0.03 <= pullback_pct <= 0.18 and pullback_strength > epsilon and vol_avg20 > 0
+            momentum_ok = rs_percentile >= 80 and ma20 > 0 and vol_avg20 > 0 and close >= ma20 and vol >= vol_avg20 and momentum_strength > epsilon
+
+        pass_total = int(breakout_ok) + int(pullback_ok) + int(momentum_ok)
+        breakout_pass_count += int(breakout_ok)
+        pullback_pass_count += int(pullback_ok)
+        momentum_pass_count += int(momentum_ok)
+        multi_pass_count += int(pass_total >= 2)
+        none_pass_count += int(pass_total == 0)
 
         if not breakout_ok:
             reasons.append("breakout_condition_fail")
@@ -293,42 +312,44 @@ def scan_entry_candidates(
         if vol_avg20 <= 0:
             reasons.append("volume_condition_fail")
 
-        signal: EntrySignal | None = None
+        signal_candidates: list[EntrySignal] = []
         if breakout_ok:
             signal = EntrySignal(
                 code=code,
                 name=name,
                 strategy="breakout",
                 close=close,
-                signal_strength=min(1.0, max(0.0, (close - high_50) / high_50 * 10.0)) if high_50 > 0 else 0.0,
+                signal_strength=breakout_strength,
                 meta={"high_50": high_50, "volume": vol, "volume_avg20": vol_avg20},
             )
             breakout.append(signal)
-            style_counts["breakout"] += 1
-        elif pullback_ok:
+            signal_candidates.append(signal)
+        if pullback_ok:
             signal = EntrySignal(
                 code=code,
                 name=name,
                 strategy="pullback",
                 close=close,
-                signal_strength=max(0.0, 1.0 - abs(pullback_pct - 0.10) / 0.05),
+                signal_strength=pullback_strength,
                 meta={"ma50": ma50, "high_52w": high_52w, "pullback_pct": pullback_pct * 100.0},
             )
             pullback.append(signal)
-            style_counts["pullback"] += 1
-        elif momentum_ok:
+            signal_candidates.append(signal)
+        if momentum_ok:
             signal = EntrySignal(
                 code=code,
                 name=name,
                 strategy="momentum",
                 close=close,
-                signal_strength=min(1.0, (rs_percentile - 80) / 20),
+                signal_strength=momentum_strength,
                 meta={"rs_percentile": rs_percentile, "ma20": ma20, "volume": vol, "volume_avg20": vol_avg20},
             )
             momentum.append(signal)
-            style_counts["momentum"] += 1
+            signal_candidates.append(signal)
 
-        if signal is not None:
+        if signal_candidates:
+            signal = max(signal_candidates, key=lambda item: item.signal_strength)
+            style_counts[signal.strategy] += 1
             prev = merged.get(signal.code)
             if prev is None or signal.signal_strength > prev.signal_strength:
                 merged[signal.code] = signal
@@ -343,11 +364,19 @@ def scan_entry_candidates(
     total = len([w for w in watchlist if w.get("code")])
 
     logger.info(
-        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s rejected_counts=%s",
+        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s rejected_counts=%s",
         total,
         passed,
+        breakout_pass_count,
+        pullback_pass_count,
+        momentum_pass_count,
+        multi_pass_count,
+        none_pass_count,
         dict(rejected_counts),
     )
+    dominant_style = max(style_counts.values()) / total if total and style_counts else 0.0
+    if dominant_style >= 0.8:
+        logger.warning("[ENTRY_SCAN][STYLE_DISTRIBUTION_WARN] counts=%s total=%s", dict(style_counts), total)
 
     top_rejects_n = int(os.getenv("ENTRY_SCAN_LOG_TOP_REJECTS", "10") or "10")
     if passed == 0 and per_symbol_rejects:

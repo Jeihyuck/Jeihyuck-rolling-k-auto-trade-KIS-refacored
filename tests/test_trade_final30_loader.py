@@ -8,6 +8,7 @@ import pandas as pd
 
 from trader import pb1_runner
 from trader import runtime_paths
+from trader.path_contract import build_final30_paths
 
 
 REQUIRED = {
@@ -164,3 +165,11 @@ def test_build_final30_scored_paths_returns_three_contract_paths(tmp_path):
         "ledger": tmp_path / "bot_state" / "trader_ledger" / "final30" / "practice" / "2026-03-11" / "final30_scored.json",
         "signals": tmp_path / "signals" / "final30.json",
     }
+
+
+def test_path_contract_matches_runtime_paths(tmp_path):
+    assert build_final30_paths(tmp_path, "practice", date(2026, 3, 11)) == runtime_paths.build_final30_scored_paths(
+        tmp_path,
+        "practice",
+        "2026-03-11",
+    )

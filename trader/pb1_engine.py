@@ -17,6 +17,7 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
+from trader.path_contract import resolve_repo_root
 from trader.logging_utils import append_jsonl
 from trader.config import (
     CAP_CAP,
@@ -491,15 +492,21 @@ class CandidateFeature:
 
 
 def _normalize_sizing_failure_reason(raw_reason: str | None) -> str:
+    if raw_reason in {"ORDER_PX_ABOVE_TICK_BUDGET", "ORDER_PX_ABOVE_POSITION_CAP", "ORDER_PX_ABOVE_USABLE_CASH"}:
+        return raw_reason
+    if raw_reason == "MIN_ORDER_KRW_NOT_MET":
+        return raw_reason
+    if raw_reason in {"FORCE_MIN1_APPLIED", "FORCE_MIN1_NOT_ELIGIBLE"}:
+        return raw_reason
     if raw_reason == "BUDGET_INSUFFICIENT_FOR_1_SHARE":
-        return "SIZING_CAP_BELOW_ONE_SHARE"
+        return "ORDER_PX_ABOVE_POSITION_CAP"
     if raw_reason == "MIN_ORDER_NOTIONAL_FAIL":
-        return "SIZING_MIN_ORDER_NOTIONAL_FAIL"
+        return "MIN_ORDER_KRW_NOT_MET"
     if raw_reason == "FORCE_MIN1_TOPN":
-        return "SIZING_FORCE_MIN1_TOPN"
+        return "FORCE_MIN1_APPLIED"
     if raw_reason == "OK":
         return "SIZING_OK"
-    return "SIZING_QTY_ZERO"
+    return "FORCE_MIN1_NOT_ELIGIBLE"
 
 
 @dataclass
@@ -645,6 +652,9 @@ class PB1Engine:
         precomputed_derived_df: pd.DataFrame | None = None,
         precomputed_universe_df: pd.DataFrame | None = None,
         trade_use_precomputed_features: bool = False,
+        as_of: str | None = None,
+        trade_date: str | date | None = None,
+        run_ctx: Any = None,
         derived_as_of: str | None = None,
         final30_df: pd.DataFrame | None = None,
         final30_source: str | None = None,
@@ -656,6 +666,10 @@ class PB1Engine:
         force_block_live: bool = False,
         trading_day: bool | None = None,
     ) -> None:
+        self._as_of = None
+        self._trade_date = None
+        self._as_of_source = None
+        self._run_ctx = None
         self.universe_repo = universe_repo
         self.orders_repo = orders_repo
         self.fills_repo = fills_repo
@@ -747,6 +761,12 @@ class PB1Engine:
         self.selection_as_of = self.derived_as_of
         self.execution_date_kst = self._today
         self.run_ctx_as_of = self.derived_as_of
+        self._init_run_context_state(
+            as_of=as_of,
+            trade_date=trade_date,
+            run_ctx=run_ctx,
+            derived_as_of=self.derived_as_of,
+        )
         self.final30_df = final30_df if final30_df is not None else precomputed_final30_df
         source_default = None
         if universe_context and getattr(universe_context, "meta", None):
@@ -863,6 +883,68 @@ class PB1Engine:
             "[PB1][ASOF][USE] component=engine value=%s source=run_ctx",
             self.derived_as_of,
         )
+
+    def _init_run_context_state(
+        self,
+        *,
+        as_of: str | None,
+        trade_date: str | date | None,
+        run_ctx: Any,
+        derived_as_of: str | None,
+    ) -> None:
+        self._run_ctx = run_ctx
+        run_ctx_as_of = None
+        if isinstance(run_ctx, dict):
+            run_ctx_as_of = run_ctx.get("derived_as_of") or run_ctx.get("as_of")
+        else:
+            run_ctx_as_of = getattr(run_ctx, "derived_as_of", None) or getattr(run_ctx, "as_of", None)
+        resolved_as_of = str(as_of or run_ctx_as_of or derived_as_of or self._today)
+        resolved_trade_date = trade_date
+        if resolved_trade_date is None:
+            if isinstance(run_ctx, dict):
+                resolved_trade_date = run_ctx.get("trade_date")
+            else:
+                resolved_trade_date = getattr(run_ctx, "trade_date", None)
+        self._as_of = resolved_as_of
+        self._trade_date = str(resolved_trade_date or self._today)
+        if as_of:
+            self._as_of_source = "explicit_as_of"
+        elif run_ctx_as_of:
+            self._as_of_source = "run_ctx"
+        elif derived_as_of:
+            self._as_of_source = "derived_as_of"
+        else:
+            self._as_of_source = "fallback_resolver"
+        logger.info(
+            "[PB1][ASOF][INIT] as_of=%s trade_date=%s source=%s",
+            self._as_of,
+            self._trade_date,
+            self._as_of_source,
+        )
+
+    def get_as_of(self) -> str:
+        if self._as_of:
+            return str(self._as_of)
+        run_ctx_as_of = None
+        if isinstance(self._run_ctx, dict):
+            run_ctx_as_of = self._run_ctx.get("derived_as_of") or self._run_ctx.get("as_of")
+        elif self._run_ctx is not None:
+            run_ctx_as_of = getattr(self._run_ctx, "derived_as_of", None) or getattr(self._run_ctx, "as_of", None)
+        backfill_value = str(run_ctx_as_of or getattr(self, "derived_as_of", None) or self._today or "")
+        if backfill_value:
+            self._as_of = backfill_value
+            if not self._trade_date:
+                self._trade_date = str(self._today)
+            if not self._as_of_source:
+                self._as_of_source = "backfill"
+            logger.warning(
+                "[PB1][ASOF][BACKFILL] as_of=%s trade_date=%s source=%s",
+                self._as_of,
+                self._trade_date,
+                self._as_of_source,
+            )
+            return str(self._as_of)
+        raise RuntimeError("engine_as_of_missing")
 
     def _resolve_window_internal(self) -> str:
         internal = compute_window(self._now_kst)
@@ -2089,7 +2171,7 @@ class PB1Engine:
             snapshot.get("cooldown_until"),
             snapshot.get("cooldown_rule_name"),
         )
-        if snapshot.get("today_buy_exists"):
+        if self.debug and snapshot.get("today_buy_exists"):
             for event in snapshot.get("today_buy_events", []):
                 logger.info(
                     "[PB1][BUYABLE_GATE][TODAY_BUY_EVENTS] event_id=%s event_type=%s code=%s side=%s status=%s qty=%s filled_qty=%s created_at=%s event_date_kst=%s trade_date_ref=%s run_id=%s",
@@ -2105,7 +2187,7 @@ class PB1Engine:
                     event.get("trade_date_ref"),
                     event.get("run_id"),
                 )
-        if snapshot.get("cooldown_active"):
+        if self.debug and snapshot.get("cooldown_active"):
             for event in snapshot.get("cooldown_events", []):
                 logger.info(
                     "[PB1][BUYABLE_GATE][COOLDOWN_EVENTS] event_id=%s event_type=%s code=%s created_at=%s cooldown_until=%s cooldown_days=%s source_rule=%s matched_now=%s run_id=%s",
@@ -2184,11 +2266,13 @@ class PB1Engine:
         )
 
     def _log_buyable_gate(self, *, code: str, ok: bool, reasons: list[str]) -> None:
+        snapshot = getattr(self, "_buyable_gate_context", {}).get(str(code).zfill(6), {}) if hasattr(self, "_buyable_gate_context") else {}
         logger.info(
-            "[PB1][BUYABLE_GATE] code=%s ok=%s reasons=%s",
+            "[PB1][BUYABLE_GATE] code=%s ok=%s reasons=%s cooldown_until=%s",
             self._display_code(code),
             int(bool(ok)),
             reasons or ["ok"],
+            snapshot.get("cooldown_until"),
         )
 
     @staticmethod
@@ -2286,7 +2370,7 @@ class PB1Engine:
                 "ma20_at_entry": cf.features.get("ma20"),
                 "ma50_at_entry": cf.features.get("ma50"),
                 "ma150_at_entry": cf.features.get("ma150"),
-                "derived_as_of": cf.features.get("derived_as_of") or self._as_of,
+                "derived_as_of": cf.features.get("derived_as_of") or self.get_as_of(),
                 "trade_date": self._today,
                 "setup_snapshot_json": cf.features.get("setup_snapshot_json") or {},
                 "trigger_snapshot_json": cf.features.get("trigger_snapshot_json") or {},
@@ -3696,6 +3780,7 @@ class PB1Engine:
         self._budget_plan_meta = {"risk_krw": risk_krw, "per_position_budget": per_position_budget}
         force_min1_enabled = bool(self.force_min1_enabled)
         force_min1_topn = max(1, int(self.force_min1_topn))
+        force_min1_override_position_cap = self._bool_env("FORCE_MIN1_OVERRIDE_POSITION_CAP", False)
         order_possible_cash = float(self.order_possible_cash_krw or 0.0)
         allocated_slots = 0
         for cf in ranked:
@@ -3745,13 +3830,31 @@ class PB1Engine:
             reserve_krw = float(self.entry_reserve_krw or 0.0)
             usable_cash = float(self.entry_usable_krw or 0.0)
             sizing_reason: str | None = None
-            sizing_details: dict[str, Any] = {}
+            sizing_details: dict[str, Any] = {
+                "tick_budget": tick_budget,
+                "position_cap": budget_cap,
+                "usable_cash": usable_cash,
+                "order_px": order_px,
+                "binding_constraint": None,
+            }
             
             # rank 계산 (최소 1주 보장용)
             rank = ranked.index(cf) + 1 if cf in ranked else 999
             
             # 1단계: qty=0 여부 체크 (예산 부족)
             if qty <= 0 or (order_px > 0 and qty * order_px < order_px):  # qty=0 또는 부분 삭감
+                if order_px > tick_budget > 0:
+                    sizing_reason = "ORDER_PX_ABOVE_TICK_BUDGET"
+                    sizing_details["binding_constraint"] = "tick_budget"
+                elif order_px > budget_cap > 0:
+                    sizing_reason = "ORDER_PX_ABOVE_POSITION_CAP"
+                    sizing_details["binding_constraint"] = "position_cap"
+                elif order_px > usable_cash > 0:
+                    sizing_reason = "ORDER_PX_ABOVE_USABLE_CASH"
+                    sizing_details["binding_constraint"] = "usable_cash"
+                else:
+                    sizing_reason = "ORDER_PX_ABOVE_POSITION_CAP"
+                    sizing_details["binding_constraint"] = "position_cap"
                 # 최소 1주 보장 옵션 체크
                 remaining_slots = max(0, int(target_new_positions) - int(allocated_slots))
                 min_1_share_allowed = (
@@ -3760,62 +3863,67 @@ class PB1Engine:
                     and qty <= 0
                     and order_px >= min_order_krw
                     and usable_cash >= order_px
+                    and (force_min1_override_position_cap or budget_cap <= 0 or order_px <= budget_cap)
                     and (order_possible_cash <= 0 or order_possible_cash >= order_px)
                     and remaining_slots >= 1
                 )
 
                 if min_1_share_allowed:
                     qty = 1
-                    sizing_reason = "FORCE_MIN1_TOPN"
-                    sizing_details = {
-                        "rank": rank,
-                        "topn": force_min1_topn,
-                        "price": order_px,
-                        "usable_cash": usable_cash,
-                        "tick_budget": tick_budget,
-                        "order_possible_cash": order_possible_cash,
-                        "forced_qty": 1,
-                    }
+                    sizing_reason = "FORCE_MIN1_APPLIED"
+                    sizing_details.update(
+                        {
+                            "rank": rank,
+                            "topn": force_min1_topn,
+                            "price": order_px,
+                            "order_possible_cash": order_possible_cash,
+                            "forced_qty": 1,
+                            "force_min1_override_position_cap": int(force_min1_override_position_cap),
+                        }
+                    )
                     logger.info(
-                        "[PB1][SIZING][FORCE_MIN1] code=%s rank=%s price=%s usable_cash=%s qty=1 reason=FORCE_MIN1_TOPN",
+                        "[PB1][SIZING][FORCE_MIN1] code=%s rank=%s price=%s usable_cash=%s qty=1 reason=FORCE_MIN1_APPLIED override_position_cap=%s",
                         self._display_code(cf.code),
                         rank,
                         order_px,
                         usable_cash,
+                        int(force_min1_override_position_cap),
                     )
                 else:
                     # ❌ 예산 부족: 1주도 못 삼
                     qty = 0
-                    sizing_reason = "BUDGET_INSUFFICIENT_FOR_1_SHARE"
-                    sizing_details = {
-                        "rank": rank,
-                        "buy_budget_after_reserve": tick_budget,
-                        "price": order_px,
-                        "required_for_1_share": order_px,
-                        "shortfall": max(0, order_px - tick_budget),
-                        "usable_cash": usable_cash,
-                        "reserve_applied_at_capital_level": reserve_krw,
-                        "budget_cap": budget_cap,
-                        "tick_budget": tick_budget,
-                        "order_px": order_px,
-                        "order_possible_cash": order_possible_cash,
-                        "force_min1_enabled": int(force_min1_enabled),
-                        "force_min1_topn": force_min1_topn,
-                    }
+                    sizing_details.update(
+                        {
+                            "rank": rank,
+                            "buy_budget_after_reserve": tick_budget,
+                            "price": order_px,
+                            "required_for_1_share": order_px,
+                            "shortfall": max(0, order_px - min(x for x in [tick_budget, budget_cap, usable_cash] if x > 0) if any(x > 0 for x in [tick_budget, budget_cap, usable_cash]) else order_px),
+                            "reserve_applied_at_capital_level": reserve_krw,
+                            "budget_cap": budget_cap,
+                            "order_possible_cash": order_possible_cash,
+                            "force_min1_enabled": int(force_min1_enabled),
+                            "force_min1_topn": force_min1_topn,
+                            "force_min1_override_position_cap": int(force_min1_override_position_cap),
+                        }
+                    )
             else:
                 # 2단계: qty>=1인데 최소주문금액 체크
                 planned_notional = float(qty * order_px)
                 if min_order_krw > 0 and planned_notional < min_order_krw:
                     qty = 0
-                    sizing_reason = "MIN_ORDER_NOTIONAL_FAIL"
-                    sizing_details = {
-                        "rank": rank,
-                        "qty": qty,
-                        "price": order_px,
-                        "planned_notional": planned_notional,
-                        "min_order_krw": min_order_krw,
-                        "shortfall": max(0, min_order_krw - planned_notional),
-                    }
+                    sizing_reason = "MIN_ORDER_KRW_NOT_MET"
+                    sizing_details.update(
+                        {
+                            "rank": rank,
+                            "qty": qty,
+                            "price": order_px,
+                            "planned_notional": planned_notional,
+                            "min_order_krw": min_order_krw,
+                            "shortfall": max(0, min_order_krw - planned_notional),
+                            "binding_constraint": "min_order_krw",
+                        }
+                    )
                 # 3단계: qty>=1이고 최소주문 조건도 충족하면 OK
             
             # 기존 sizing_reasons 로직 (하위호환성)
@@ -3832,7 +3940,7 @@ class PB1Engine:
                 if reserve_krw > 0:
                     sizing_reasons.append("reserve_applied")
                 if not sizing_reasons:
-                    sizing_reasons.append("planned_qty_zero_or_min_order")
+                    sizing_reasons.append(sizing_reason or "FORCE_MIN1_NOT_ELIGIBLE")
             
             logger.info(
                 "[PB1][SIZING] code=%s rank=%s cash_usable=%.0f tick_budget=%.0f reserve=%.0f px=%.0f qty=%s min_order_krw=%.0f ok=%s reason=%s detail=%s",
@@ -4027,15 +4135,40 @@ class PB1Engine:
         if ask and ask > 0:
             return ask, "ask"
         if prpr and prpr > 0:
-            # [NEW] 호가 없을 때 slippage 적용 (매수 시 보수적으로)
-            slippage_bps = float(os.getenv("PB1_ORDER_SLIPPAGE_BPS", "10")) / 10000.0  # 기본 10bps
-            order_price = prpr * (1 + slippage_bps)
-            logger.info("[PB1][PRICE][FALLBACK] code=%s using prpr=%.0f with slippage %.2f%% -> %.0f", code, prpr, slippage_bps * 10000, order_price)
+            raw_slippage = os.getenv("PB1_ORDER_SLIPPAGE_BPS") or str(PRICE_SLIPPAGE_PCT_BUY)
+            fraction, percent_for_log = self._normalize_slippage(raw_slippage)
+            order_price = prpr * (1 + fraction)
+            logger.info(
+                "[PB1][PRICE][FALLBACK] code=%s raw=%s fraction=%.6f percent=%.2f%% base=%.0f final=%.0f",
+                code,
+                raw_slippage,
+                fraction,
+                percent_for_log,
+                prpr,
+                order_price,
+            )
             return order_price, "prpr_slippage"
         if close and close > 0:
             return close, "daily_close"
         logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)
         return None, None
+
+    @staticmethod
+    def _normalize_slippage(raw_value: Any) -> tuple[float, float]:
+        raw_text = str(raw_value).strip() if raw_value is not None else ""
+        try:
+            numeric = float(raw_value)
+        except (TypeError, ValueError):
+            numeric = float(PRICE_SLIPPAGE_PCT_BUY)
+            raw_text = str(numeric)
+        if raw_text and raw_text.replace("-", "", 1).isdigit() and numeric >= 1.0:
+            fraction = numeric / 10000.0
+        elif numeric >= 1.0:
+            fraction = numeric / 100.0
+        else:
+            fraction = numeric
+        fraction = max(0.0, fraction)
+        return fraction, fraction * 100.0
 
     def _build_budget_plan(
         self,
@@ -6771,6 +6904,13 @@ class PB1Engine:
             "kis_daily_fetch_blocked_count_trade": 0,
         }
         self.askbid_fail_count = 0  # [PATCH] 회로차단기용 실패 카운트
+        engine_asof = self.get_as_of()
+        logger.info(
+            "[ENGINE][ASOF][VERIFY] as_of=%s trade_date=%s source=%s",
+            engine_asof,
+            self._trade_date,
+            self._as_of_source,
+        )
         final_status = "OK"
         final_notes: str | None = None
         engine_dry_run = bool(getattr(self, "dry_run", False))
@@ -6791,7 +6931,7 @@ class PB1Engine:
         logger.info(
             "[PB1][ENGINE_STATE] final30_source=%s as_of=%s rows=%s immutable=%s file_mirror_present=%s",
             getattr(self, "final30_source", "none"),
-            getattr(self, "derived_as_of", ""),
+            engine_asof,
             len(getattr(self, "final30_df", pd.DataFrame()) if getattr(self, "final30_df", None) is not None else pd.DataFrame()),
             int(bool(getattr(self, "final30_locked", False))),
             int(bool((((self._universe_context.meta or {}) if getattr(self, "_universe_context", None) else {}).get("file_mirror_present")))),
@@ -7396,9 +7536,9 @@ class PB1Engine:
         
         # ✅ FIX B: actual_as_of를 universe_context에서 추출 (trade 모드에서 watchlist lock된 as_of)
         # 리포트용 today() 날짜가 아니라, 실제 데이터 기반 as_of를 사용
-        if not self.derived_as_of:
+        if not self.get_as_of():
             raise RuntimeError("ASOF_LOCK_MISSING")
-        as_of_final = str(self.derived_as_of)
+        as_of_final = str(engine_asof)
         reason = "run_ctx_lock"
         if self._universe_context and self._universe_context.as_of_date:
             universe_as_of = str(self._universe_context.as_of_date)
@@ -8096,6 +8236,7 @@ class PB1Engine:
                 codes=[cf.code for cf in ok_after_risk if cf.code],
                 positions=positions,
             )
+            self._buyable_gate_context = buyable_gate_context
             today_buy_codes = {
                 code for code, snapshot in buyable_gate_context.items() if bool(snapshot.get("today_buy_exists"))
             }
@@ -8281,7 +8422,7 @@ class PB1Engine:
                     trigger_reason=(trigger_info or {}).get("reason") if isinstance(trigger_info, dict) else None,
                 )
                 cf.features["entry_rule_version"] = "pb1_entry_reason_v1"
-                cf.features["derived_as_of"] = self._as_of
+                cf.features["derived_as_of"] = engine_asof
                 cf.features["trace_id"] = f"{trace_id}:{cf.code}"
                 cf.features["setup_snapshot_json"] = {
                     "setup_filters_ok": setup_filters_ok,

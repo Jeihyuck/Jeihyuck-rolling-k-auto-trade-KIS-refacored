@@ -2222,36 +2222,35 @@ class WatchlistBuilder:
         close = _safe_float(_row_get(row, "close", 0.0))
         high_20d = _safe_float(_row_get(row, "high_20d", _row_get(row, "high20", 0.0)))
         high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
+        pivot = _safe_float(_row_get(row, "pivot", 0.0))
         volume = _safe_float(_row_get(row, "volume", 0.0))
         volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
-        
+        breakout_ref = pivot if pivot > 0 else high_20d if high_20d > 0 else high_55d
+
         score = 0.0
-        
-        # Near 20-day high
-        if close > 0 and high_20d > 0:
-            ratio = close / high_20d
-            if ratio >= 0.98:
-                score += 35.0
-            elif ratio >= 0.95:
-                score += 20.0
-        
-        # Near 55-day high
-        if close > 0 and high_55d > 0:
-            ratio = close / high_55d
-            if ratio >= 0.97:
-                score += 35.0
-            elif ratio >= 0.93:
-                score += 20.0
-        
-        # Volume surge
+
+        if close > 0 and breakout_ref > 0:
+            distance_pct = ((close - breakout_ref) / breakout_ref) * 100.0
+            if distance_pct >= 0.0:
+                score += 42.0
+            elif distance_pct >= -2.0:
+                score += 26.0
+            elif distance_pct >= -5.0:
+                score += 12.0
+            if distance_pct > 7.0:
+                score -= min(18.0, (distance_pct - 7.0) * 2.0)
+
         if volume > 0 and volume_avg20 > 0:
             vol_ratio = volume / volume_avg20
             if vol_ratio >= 1.5:
-                score += 30.0
+                score += 28.0
             elif vol_ratio >= 1.2:
-                score += 15.0
+                score += 16.0
+
+        if close > 0 and high_55d > 0 and close >= high_55d * 0.98:
+            score += 18.0
         
-        return min(score, 100.0)
+        return max(0.0, min(score, 100.0))
 
     def _compute_pullback_score(self, row: Any) -> float:
         """
@@ -2268,33 +2267,31 @@ class WatchlistBuilder:
         high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
         volume = _safe_float(_row_get(row, "volume", 0.0))
         volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
-        
+
         score = 0.0
-        
-        # Staying above MA20
+
         if close > 0 and ma20 > 0 and close >= ma20:
-            score += 25.0
-        # Or at least above MA50
-        elif close > 0 and ma50 > 0 and close >= ma50:
-            score += 15.0
-        
-        # Pullback depth check
+            score += 20.0
+        if close > 0 and ma50 > 0 and close >= ma50:
+            score += 22.0
+
         if close > 0 and high_55d > 0:
             pullback_pct = ((high_55d - close) / high_55d) * 100.0
             if 3.0 <= pullback_pct <= 18.0:
                 score += 40.0
             elif 1.0 <= pullback_pct <= 25.0:
                 score += 25.0
-        
-        # Volume contraction during pullback
+
         if volume > 0 and volume_avg20 > 0:
             vol_ratio = volume / volume_avg20
             if vol_ratio < 0.8:
-                score += 35.0
+                score += 30.0
             elif vol_ratio < 1.0:
-                score += 20.0
-        
-        return min(score, 100.0)
+                score += 18.0
+        if close > 0 and ma20 > 0 and ma50 > 0 and abs(close - ma20) / close <= 0.03:
+            score += 10.0
+
+        return max(0.0, min(score, 100.0))
 
     def _compute_momentum_score(self, row: Any) -> float:
         """
@@ -2307,27 +2304,28 @@ class WatchlistBuilder:
         ret_20d = _safe_float(_row_get(row, "ret_20d", _row_get(row, "ret20", 0.0)))
         ret_60d = _safe_float(_row_get(row, "ret_60d", _row_get(row, "ret60", 0.0)))
         ret_120d = _safe_float(_row_get(row, "ret_120d", _row_get(row, "ret120", 0.0)))
-        rs_score = _safe_float(_row_get(row, "rs_score", 0.0))
+        rs_score = _safe_float(_row_get(row, "rs_score", _row_get(row, "rs_percentile", 0.0)))
+        ma20_slope = _safe_float(_row_get(row, "ma20_slope", 0.0))
+        ma50_slope = _safe_float(_row_get(row, "ma50_slope", 0.0))
         
         score = 0.0
-        
-        # 20-day return
+
         if ret_20d > 0:
-            score += 25.0
-        
-        # 60-day return
+            score += 20.0
         if ret_60d > 0:
-            score += 35.0
-        
-        # 120-day return
+            score += 28.0
         if ret_120d > 0:
-            score += 40.0
-        
-        # Bonus for strong RS
+            score += 30.0
         if rs_score >= 80:
-            score = min(score * 1.1, 100.0)
-        
-        return min(score, 100.0)
+            score += 12.0
+        elif rs_score >= 65:
+            score += 6.0
+        if ma20_slope > 0:
+            score += 5.0
+        if ma50_slope > 0:
+            score += 5.0
+
+        return max(0.0, min(score, 100.0))
 
     def _compute_tech_score(self, row: Any) -> float:
         """
@@ -2416,13 +2414,23 @@ class WatchlistBuilder:
         _row_set(row, "entry_component", entry_component)
         
         # Determine selected entry style
-        if entry_component == breakout_score:
+        if entry_component < 25.0:
+            entry_style_selected = "NEUTRAL"
+        elif breakout_score == pullback_score == momentum_score:
+            if rs_component >= trend_component:
+                entry_style_selected = "MOMENTUM"
+            else:
+                entry_style_selected = "BREAKOUT"
+        elif entry_component == breakout_score:
             entry_style_selected = "BREAKOUT"
         elif entry_component == pullback_score:
             entry_style_selected = "PULLBACK"
         else:
             entry_style_selected = "MOMENTUM"
         _row_set(row, "entry_style_selected", entry_style_selected)
+        _row_set(row, "breakout_pass", breakout_score >= 55.0)
+        _row_set(row, "pullback_pass", pullback_score >= 55.0)
+        _row_set(row, "momentum_pass", momentum_score >= 55.0)
         
         # 5. Liquidity Component
         volume = _safe_float(_row_get(row, "volume", 0.0))

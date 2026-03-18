@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from trader.runtime_paths import build_final30_scored_paths, repo_root
+from trader.path_contract import build_final30_paths, build_watchlist_paths, resolve_repo_root, serialize_path_map
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -143,7 +144,14 @@ def load_trade_final30_scored(
 ) -> dict[str, Any]:
     env_n = (env or "").strip().lower()
     as_of_s = str(as_of)
-    final30_paths = build_final30_scored_paths(repo_root(), env_n, as_of_s)
+    repo_root_path = resolve_repo_root()
+    final30_paths = build_final30_paths(repo_root_path, env_n, as_of_s)
+    logger.info(
+        "[TRADE][FINAL30][PATH_MAP] repo_root=%s cwd=%s paths=%s",
+        repo_root_path,
+        Path.cwd(),
+        serialize_path_map(final30_paths),
+    )
     file_mirror_stats: dict[str, int] = {}
     for label, path in final30_paths.items():
         present = int(path.exists() and path.stat().st_size > 0) if path.exists() else 0
@@ -167,6 +175,13 @@ def load_trade_final30_scored(
         allow_latest_fallback=False,
     )
     if scored_contract.get("ok"):
+        if not any(file_mirror_stats.values()):
+            logger.error(
+                "[TRADE][FINAL30][FILE_CONTRACT_MISMATCH] env=%s as_of=%s paths=%s",
+                env_n,
+                as_of_s,
+                serialize_path_map(final30_paths),
+            )
         rows = list(scored_contract.get("rows_data") or [])
         df = pd.DataFrame(rows)
         columns = [str(c) for c in df.columns.tolist()]
@@ -242,8 +257,9 @@ def check_prep_done() -> bool:
     try:
         env_name = os.getenv("KIS_ENV", "practice")
         as_of = now_kst().date().isoformat()
-        final30_paths = build_final30_scored_paths(repo_root(), env_name, as_of)
-        snapshot_path = repo_root() / "runtime" / "snapshots" / "final30.json"
+        repo_root_path = resolve_repo_root()
+        final30_paths = build_final30_paths(repo_root_path, env_name, as_of)
+        snapshot_path = build_watchlist_paths(repo_root_path, as_of)["snapshot"]
         final30_candidates = [snapshot_path, *final30_paths.values()]
         logger.info("[PREP_CHECK][FINAL30][PATHS] %s", {key: str(path) for key, path in final30_paths.items()})
 
@@ -1564,6 +1580,7 @@ def run_once(
         asof_reason,
     )
     logger.info("[ASOF][LOCK] trade_date=%s derived_as_of=%s immutable=1 source=db_contract", trade_date.isoformat(), as_of)
+    logger.info("[ASOF][LOCK][VERIFY] trade_date=%s derived_as_of=%s run_ctx=%s", trade_date.isoformat(), as_of, run_ctx)
     
     runtime_root_dir = runtime_dir or runtime_root()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
@@ -2562,6 +2579,9 @@ def run_once(
             precomputed_derived_df=precomputed_derived_df,
             precomputed_universe_df=precomputed_universe_df,
             trade_use_precomputed_features=trade_use_precomputed_features,
+            as_of=str(run_ctx.get("derived_as_of") or as_of),
+            trade_date=trade_date.isoformat(),
+            run_ctx=run_ctx,
             derived_as_of=str(run_ctx.get("derived_as_of") or as_of),
             final30_df=precomputed_final30_df,
             final30_source=str(run_ctx.get("final30_source") or "db_pb1_watchlist_final_scored"),
@@ -2582,6 +2602,12 @@ def run_once(
                 phase_override_arg,
                 dry_run,
             )
+        logger.info(
+            "[ENGINE][ASOF][VERIFY] as_of=%s trade_date=%s source=%s",
+            engine_runner.get_as_of(),
+            getattr(engine_runner, "_trade_date", None),
+            getattr(engine_runner, "_as_of_source", None),
+        )
         
         # ✅ ENTRY SCAN: 진입 시그널 스캔 (Phase=entry일 때만)
         entry_signals_result = {}

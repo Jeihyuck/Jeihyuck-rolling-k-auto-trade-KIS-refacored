@@ -11,6 +11,42 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def normalize_rs_percentile(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(numeric):
+        return 0.0
+    if 0.0 <= numeric <= 1.0:
+        numeric *= 100.0
+    return round(max(0.0, min(100.0, numeric)), 2)
+
+
+def normalize_vcp_score(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(numeric):
+        return 0.0
+    if 0.0 <= numeric <= 1.0:
+        numeric *= 100.0
+    return round(max(0.0, min(100.0, numeric)), 2)
+
+
+def normalize_trend_score(value: Any) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite(numeric):
+        return 0.0
+    if 0.0 <= numeric <= 1.0:
+        numeric *= 100.0
+    return round(max(0.0, min(100.0, numeric)), 2)
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -106,9 +142,12 @@ def compute_minervini_signals(kis, as_of: str, symbols: list[str], benchmark: st
                 items.append({"code": symbol, "data_ok": False, "reasons": ["precomputed_missing"]})
                 continue
             rs_percentile = _float_env("MINERVINI_RS_MIN_PCTILE", 80.0)
-            rs_pctile = float(row.get("rs_percentile") or row.get("rs_pctile") or 0.0)
-            vcp_score = float(row.get("vcp_score") or 0.0)
-            trend_score = float(row.get("trend_score") or 0.0)
+            rs_raw = float(row.get("rs_percentile") or row.get("rs_pctile") or 0.0)
+            vcp_raw = float(row.get("vcp_score") or 0.0)
+            trend_raw = float(row.get("trend_score") or 0.0)
+            rs_pctile = normalize_rs_percentile(rs_raw)
+            vcp_score = normalize_vcp_score(vcp_raw)
+            trend_score = normalize_trend_score(trend_raw)
             breakout_score = float(row.get("breakout_score") or 0.0)
             pullback_score = float(row.get("pullback_score") or 0.0)
             momentum_score = float(row.get("momentum_score") or 0.0)
@@ -129,9 +168,13 @@ def compute_minervini_signals(kis, as_of: str, symbols: list[str], benchmark: st
                     "data_ok": True,
                     "trend_pass": bool(trend_ok),
                     "atr_pass": bool(atr_ok),
-                    "rs_raw": float(row.get("rs_score") or rs_pctile),
+                    "rs_raw": float(row.get("rs_score") or rs_raw),
                     "rs_pctile": rs_pctile,
+                    "rs_pctile_normalized": rs_pctile,
+                    "vcp_score_raw": vcp_raw,
                     "vcp_score": vcp_score,
+                    "trend_score_raw": trend_raw,
+                    "trend_score": trend_score,
                     "pivot": float(row.get("pivot") or 0.0),
                     "atr_pct": atr_val,
                     "breakout_score": breakout_score,
@@ -269,7 +312,7 @@ def select_buyable_with_relax(
 ) -> tuple[list[str], dict]:
     items = list(signals.get("items") or [])
     regime_pass = bool(signals.get("regime_pass"))
-    bootstrap_enabled = os.getenv("PB1_BOOTSTRAP_ENABLE", "1") == "1"
+    bootstrap_enabled = os.getenv("PB1_BOOTSTRAP_ENABLE", "0") == "1"
     base_rs = _int_env("MINERVINI_RS_MIN_PCTILE", 80)
     base_vcp = _int_env("MINERVINI_VCP_MIN_SCORE", 70)
     if bootstrap_enabled:
@@ -297,13 +340,12 @@ def select_buyable_with_relax(
     used_level = 0
     used_rs = base_rs
     used_vcp = base_vcp
+    final_gating_mode = "rank_only_fallback"
+    selected_states: dict[str, str] = {}
 
     for p in range(max(0, int(relax_passes)) + 1):
         rs_cut = max(0, base_rs - (rs_step * p))
         vcp_cut = max(0, base_vcp - (vcp_step * p))
-        if allow_rs_only:
-            rs_cut = max(70, rs_cut)
-
         passed: list[str] = []
         for item in items:
             if not item.get("data_ok"):
@@ -312,11 +354,15 @@ def select_buyable_with_relax(
                 continue
             if not bool(item.get("atr_pass")):
                 continue
-            if float(item.get("rs_pctile") or 0.0) < float(rs_cut):
+            rs_pctile = normalize_rs_percentile(item.get("rs_pctile") or item.get("rs_percentile") or 0.0)
+            vcp_score = normalize_vcp_score(item.get("vcp_score") or 0.0)
+            if rs_pctile < float(rs_cut):
                 continue
-            if float(item.get("vcp_score") or 0.0) < float(vcp_cut):
+            if vcp_score < float(vcp_cut):
                 continue
-            passed.append(str(item.get("code") or "").zfill(6))
+            code = str(item.get("code") or "").zfill(6)
+            passed.append(code)
+            selected_states[code] = "hard_pass" if p == 0 else "soft_pass_relaxed"
 
         pass_counts[f"pass{p}"] = len(passed)
         pass_codes[f"pass{p}"] = passed[:]
@@ -332,8 +378,25 @@ def select_buyable_with_relax(
         used_level = p
         used_rs = rs_cut
         used_vcp = vcp_cut
+        final_gating_mode = "hard_pass" if p == 0 else "soft_pass_relaxed"
         if len(passed) >= int(min_buyable):
             break
+
+    if not chosen_codes and items:
+        ranked = sorted(
+            [item for item in items if item.get("data_ok") and (not keep_trend or bool(item.get("trend_pass"))) and bool(item.get("atr_pass"))],
+            key=lambda item: (
+                normalize_rs_percentile(item.get("rs_pctile") or item.get("rs_percentile") or 0.0),
+                normalize_vcp_score(item.get("vcp_score") or 0.0),
+                normalize_trend_score(item.get("trend_score") or 0.0),
+            ),
+            reverse=True,
+        )
+        chosen_codes = [str(item.get("code") or "").zfill(6) for item in ranked[: int(min_buyable)]]
+        for code in chosen_codes:
+            selected_states[code] = "rank_only_fallback"
+        final_gating_mode = "rank_only_fallback"
+        logger.warning("[MINERVINI][DEGRADED][RANK_ONLY] count=%s", len(chosen_codes))
 
     logger.info(
         "[MINERVINI][RELAX][FINAL_CODES] used=%s count=%s codes=%s",
@@ -353,6 +416,22 @@ def select_buyable_with_relax(
         "base_rs": base_rs,
         "base_vcp": base_vcp,
         "regime_pass": True,
+        "final_gating_mode": final_gating_mode,
+        "selected_states": selected_states,
+        "normalized_items": [
+            {
+                "code": str(item.get("code") or "").zfill(6),
+                "raw_rs": item.get("rs_raw", item.get("rs_pctile")),
+                "normalized_rs": normalize_rs_percentile(item.get("rs_pctile") or item.get("rs_percentile") or 0.0),
+                "raw_vcp": item.get("vcp_score_raw", item.get("vcp_score")),
+                "normalized_vcp": normalize_vcp_score(item.get("vcp_score") or 0.0),
+                "raw_trend": item.get("trend_score_raw", item.get("trend_score")),
+                "normalized_trend": normalize_trend_score(item.get("trend_score") or 0.0),
+                "applied_rs_cut": used_rs,
+                "applied_vcp_cut": used_vcp,
+            }
+            for item in items
+        ],
     }
     return chosen_codes, report
 
