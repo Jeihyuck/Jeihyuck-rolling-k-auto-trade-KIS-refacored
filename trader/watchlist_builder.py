@@ -2222,33 +2222,48 @@ class WatchlistBuilder:
         close = _safe_float(_row_get(row, "close", 0.0))
         high_20d = _safe_float(_row_get(row, "high_20d", _row_get(row, "high20", 0.0)))
         high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
-        pivot = _safe_float(_row_get(row, "pivot", 0.0))
+        pivot = _safe_float(_row_get(row, "pivot_price", _row_get(row, "pivot", 0.0)))
         volume = _safe_float(_row_get(row, "volume", 0.0))
-        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
+        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(row, "vol20", 0.0)))
         breakout_ref = pivot if pivot > 0 else high_20d if high_20d > 0 else high_55d
+        anomalies = list(_row_get(row, "score_anomalies", []))
 
         score = 0.0
+        if close <= 0 or breakout_ref <= 0:
+            anomalies.append("breakout_missing_price_context")
+        if volume_avg20 <= 0:
+            anomalies.append("breakout_missing_volume_context")
 
         if close > 0 and breakout_ref > 0:
             distance_pct = ((close - breakout_ref) / breakout_ref) * 100.0
             if distance_pct >= 0.0:
-                score += 42.0
+                score += 44.0
             elif distance_pct >= -2.0:
-                score += 26.0
+                score += 28.0
             elif distance_pct >= -5.0:
                 score += 12.0
             if distance_pct > 7.0:
                 score -= min(18.0, (distance_pct - 7.0) * 2.0)
+            if distance_pct > 0.0 and distance_pct <= 3.0:
+                score += 18.0
+            if distance_pct < -6.0:
+                anomalies.append("breakout_far_from_pivot")
 
         if volume > 0 and volume_avg20 > 0:
             vol_ratio = volume / volume_avg20
-            if vol_ratio >= 1.5:
-                score += 28.0
+            if vol_ratio >= 1.8:
+                score += 30.0
+            elif vol_ratio >= 1.5:
+                score += 24.0
             elif vol_ratio >= 1.2:
                 score += 16.0
+            elif vol_ratio < 0.8:
+                score -= 12.0
 
         if close > 0 and high_55d > 0 and close >= high_55d * 0.98:
             score += 18.0
+        _row_set(row, "breakout_trigger_ok", bool(score >= 60.0 and close > 0 and breakout_ref > 0 and close >= breakout_ref))
+        _row_set(row, "score_anomalies", sorted(set(anomalies)))
         
         return max(0.0, min(score, 100.0))
 
@@ -2266,7 +2281,8 @@ class WatchlistBuilder:
         ma50 = _safe_float(_row_get(row, "ma50", 0.0))
         high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
         volume = _safe_float(_row_get(row, "volume", 0.0))
-        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", 0.0))
+        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(row, "vol20", 0.0)))
+        anomalies = list(_row_get(row, "score_anomalies", []))
 
         score = 0.0
 
@@ -2281,6 +2297,8 @@ class WatchlistBuilder:
                 score += 40.0
             elif 1.0 <= pullback_pct <= 25.0:
                 score += 25.0
+            else:
+                anomalies.append("pullback_depth_outlier")
 
         if volume > 0 and volume_avg20 > 0:
             vol_ratio = volume / volume_avg20
@@ -2288,8 +2306,12 @@ class WatchlistBuilder:
                 score += 30.0
             elif vol_ratio < 1.0:
                 score += 18.0
+            elif vol_ratio > 1.4:
+                score -= 10.0
         if close > 0 and ma20 > 0 and ma50 > 0 and abs(close - ma20) / close <= 0.03:
             score += 10.0
+        _row_set(row, "pullback_trigger_ok", bool(score >= 55.0 and close > 0 and ma20 > 0 and ma50 > 0))
+        _row_set(row, "score_anomalies", sorted(set(anomalies)))
 
         return max(0.0, min(score, 100.0))
 
@@ -2307,6 +2329,8 @@ class WatchlistBuilder:
         rs_score = _safe_float(_row_get(row, "rs_score", _row_get(row, "rs_percentile", 0.0)))
         ma20_slope = _safe_float(_row_get(row, "ma20_slope", 0.0))
         ma50_slope = _safe_float(_row_get(row, "ma50_slope", 0.0))
+        ma150_slope = _safe_float(_row_get(row, "ma150_slope", 0.0))
+        anomalies = list(_row_get(row, "score_anomalies", []))
         
         score = 0.0
 
@@ -2317,13 +2341,19 @@ class WatchlistBuilder:
         if ret_120d > 0:
             score += 30.0
         if rs_score >= 80:
-            score += 12.0
+            score += 16.0
         elif rs_score >= 65:
-            score += 6.0
+            score += 8.0
         if ma20_slope > 0:
             score += 5.0
         if ma50_slope > 0:
             score += 5.0
+        if ma150_slope > 0:
+            score += 6.0
+        if ret_20d <= 0 and ret_60d <= 0 and ret_120d <= 0:
+            anomalies.append("momentum_flat_returns")
+        _row_set(row, "momentum_trigger_ok", bool(score >= 60.0 and rs_score >= 80.0 and ma20_slope > 0))
+        _row_set(row, "score_anomalies", sorted(set(anomalies)))
 
         return max(0.0, min(score, 100.0))
 
@@ -2414,19 +2444,21 @@ class WatchlistBuilder:
         _row_set(row, "entry_component", entry_component)
         
         # Determine selected entry style
+        tie_break = [
+            ("BREAKOUT", breakout_score, _safe_float(_row_get(row, "pivot_price", _row_get(row, "pivot", 0.0))), _safe_float(_row_get(row, "rs_percentile", 0.0))),
+            ("PULLBACK", pullback_score, -abs(_safe_float(_row_get(row, "pullback_pct", 0.0)) - 10.0), _safe_float(_row_get(row, "trend_score", 0.0))),
+            ("MOMENTUM", momentum_score, _safe_float(_row_get(row, "rs_percentile", 0.0)), _safe_float(_row_get(row, "trend_score", 0.0))),
+        ]
+        tie_break.sort(key=lambda item: (item[1], item[2], item[3]), reverse=True)
         if entry_component < 25.0:
             entry_style_selected = "NEUTRAL"
-        elif breakout_score == pullback_score == momentum_score:
-            if rs_component >= trend_component:
+        else:
+            top_style, top_score, _ctx1, _ctx2 = tie_break[0]
+            second_score = tie_break[1][1] if len(tie_break) > 1 else -1.0
+            if abs(top_score - second_score) <= 2.0 and rs_component >= trend_component and top_style != "MOMENTUM":
                 entry_style_selected = "MOMENTUM"
             else:
-                entry_style_selected = "BREAKOUT"
-        elif entry_component == breakout_score:
-            entry_style_selected = "BREAKOUT"
-        elif entry_component == pullback_score:
-            entry_style_selected = "PULLBACK"
-        else:
-            entry_style_selected = "MOMENTUM"
+                entry_style_selected = top_style
         _row_set(row, "entry_style_selected", entry_style_selected)
         _row_set(row, "breakout_pass", breakout_score >= 55.0)
         _row_set(row, "pullback_pass", pullback_score >= 55.0)
@@ -2844,6 +2876,18 @@ def save_bundle(
                 "rs_percentile",
                 "vcp_score",
                 "entry_style_selected",
+                "hi_52w",
+                "lo_52w",
+                "pivot_price",
+                "vol20",
+                "dollar_vol_50",
+                "ma20_slope",
+                "ma50_slope",
+                "ma150_slope",
+                "vcp_ok",
+                "breakout_trigger_ok",
+                "pullback_trigger_ok",
+                "momentum_trigger_ok",
                 "ma20",
                 "ma50",
                 "ma150",
@@ -2883,6 +2927,47 @@ def save_bundle(
 
     final30_scored_rows = _normalize_scored_stage_rows(bundle.final30)
     universe_scored_rows = _normalize_scored_stage_rows(bundle.universe_scored, fallback_rows=final30_scored_rows)
+    if final30_scored_rows:
+        final30_scored_df_for_stats = pd.DataFrame(final30_scored_rows)
+        style_counts = final30_scored_df_for_stats.get("entry_style_selected", pd.Series(dtype=str)).fillna("NEUTRAL").value_counts().to_dict()
+        breakout_stats = final30_scored_df_for_stats.get("breakout_score", pd.Series(dtype=float)).astype(float)
+        pullback_stats = final30_scored_df_for_stats.get("pullback_score", pd.Series(dtype=float)).astype(float)
+        momentum_stats = final30_scored_df_for_stats.get("momentum_score", pd.Series(dtype=float)).astype(float)
+        logger.info(
+            "[WATCHLIST][ENTRY_STYLE][DISTRIBUTION] counts=%s median_by_style=%s",
+            style_counts,
+            {
+                "BREAKOUT": float(final30_scored_df_for_stats.loc[final30_scored_df_for_stats.get("entry_style_selected") == "BREAKOUT", "breakout_score"].median() or 0.0) if "breakout_score" in final30_scored_df_for_stats.columns else 0.0,
+                "PULLBACK": float(final30_scored_df_for_stats.loc[final30_scored_df_for_stats.get("entry_style_selected") == "PULLBACK", "pullback_score"].median() or 0.0) if "pullback_score" in final30_scored_df_for_stats.columns else 0.0,
+                "MOMENTUM": float(final30_scored_df_for_stats.loc[final30_scored_df_for_stats.get("entry_style_selected") == "MOMENTUM", "momentum_score"].median() or 0.0) if "momentum_score" in final30_scored_df_for_stats.columns else 0.0,
+            },
+        )
+        logger.info(
+            "[WATCHLIST][SCORE_DISTRIBUTION] breakout=%s pullback=%s momentum=%s",
+            {
+                "min": float(breakout_stats.min() or 0.0),
+                "p25": float(breakout_stats.quantile(0.25) or 0.0),
+                "median": float(breakout_stats.median() or 0.0),
+                "p75": float(breakout_stats.quantile(0.75) or 0.0),
+                "max": float(breakout_stats.max() or 0.0),
+            },
+            {
+                "min": float(pullback_stats.min() or 0.0),
+                "p25": float(pullback_stats.quantile(0.25) or 0.0),
+                "median": float(pullback_stats.median() or 0.0),
+                "p75": float(pullback_stats.quantile(0.75) or 0.0),
+                "max": float(pullback_stats.max() or 0.0),
+            },
+            {
+                "min": float(momentum_stats.min() or 0.0),
+                "p25": float(momentum_stats.quantile(0.25) or 0.0),
+                "median": float(momentum_stats.median() or 0.0),
+                "p75": float(momentum_stats.quantile(0.75) or 0.0),
+                "max": float(momentum_stats.max() or 0.0),
+            },
+        )
+        if len(style_counts) == 1 and len(final30_scored_rows) > 1:
+            logger.warning("[ENTRY_STYLE][ANOMALY][MONOCULTURE] counts=%s", style_counts)
     final30_cols = set(pd.DataFrame(final30_scored_rows).columns.tolist()) if final30_scored_rows else set()
     universe_cols = set(pd.DataFrame(universe_scored_rows).columns.tolist()) if universe_scored_rows else set()
     logger.info(

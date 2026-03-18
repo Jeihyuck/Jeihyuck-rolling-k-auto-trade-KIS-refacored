@@ -220,6 +220,57 @@ def _digits_only(value: str) -> str:
     return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
+def extract_order_no(response: dict | None) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    output = response.get("output") or response.get("output1") or {}
+    if isinstance(output, list) and output:
+        output = output[0] if isinstance(output[0], dict) else {}
+    if not isinstance(output, dict):
+        output = {}
+    odno = output.get("ODNO") or output.get("odno") or output.get("ord_no") or response.get("ODNO")
+    odno_s = str(odno or "").strip()
+    return odno_s or None
+
+
+def mask_order_response(response: Any) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {"type": type(response).__name__}
+    output = response.get("output") or response.get("output1") or {}
+    if isinstance(output, list) and output:
+        output = output[0] if isinstance(output[0], dict) else {}
+    if not isinstance(output, dict):
+        output = {}
+    return {
+        "rt_cd": str(response.get("rt_cd") or ""),
+        "msg_cd": str(response.get("msg_cd") or ""),
+        "msg1": str(response.get("msg1") or "")[:200],
+        "odno": extract_order_no(response),
+        "blocked": bool(response.get("blocked")),
+        "kis_disabled": bool(response.get("_kis_disabled")),
+        "output_keys": sorted(output.keys()),
+    }
+
+
+def is_order_accepted(response: dict | None, *, kis_env: str | None = None) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if response.get("blocked") or response.get("_kis_disabled"):
+        return False
+    rt_cd = str(response.get("rt_cd") or "").strip()
+    msg_cd = str(response.get("msg_cd") or "").strip().upper()
+    msg1 = str(response.get("msg1") or "").strip().lower()
+    odno = extract_order_no(response)
+    env_name = str(kis_env or os.getenv("KIS_ENV") or "practice").strip().lower()
+    if rt_cd != "0":
+        return False
+    if odno:
+        return True
+    if env_name == "practice":
+        return msg_cd not in {"NO_TRADE", "LIVE_GATE_BLOCKED", "ORDER_BLOCK"} and "blocked" not in msg1
+    return False
+
+
 def _json_dumps(body: dict) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
@@ -3349,6 +3400,7 @@ class KisAPI:
     # 매수/매도 (기본)
     # -------------------------------
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        logger.info("[KIS][ORDER][REQUEST] type=MARKET side=BUY code=%s qty=%s price=0", pdno, qty)
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -3357,7 +3409,17 @@ class KisAPI:
             "ORD_DVSN": "01",  # 시장가
             "ORD_UNPR": "0",
         }
-        return self._order_cash(body, is_sell=False)
+        response = self._order_cash(body, is_sell=False)
+        masked = mask_order_response(response)
+        logger.info(
+            "[KIS][ORDER][RESPONSE] type=MARKET side=BUY code=%s rt_cd=%s msg_cd=%s msg1=%s odno=%s",
+            pdno,
+            masked.get("rt_cd"),
+            masked.get("msg_cd"),
+            masked.get("msg1"),
+            masked.get("odno"),
+        )
+        return response
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         # --- 강화된 사전점검: 보유수량 우선 ---
@@ -3472,11 +3534,21 @@ class KisAPI:
         tr_id = tr_list[0]
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        logger.info("[KIS][ORDER][REQUEST] type=LIMIT side=BUY code=%s qty=%s price=%s", pdno, qty, price)
         # [CHG] 안전요청 사용
         resp = self._safe_request(
             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
         )
         data = resp.json()
+        masked = mask_order_response(data)
+        logger.info(
+            "[KIS][ORDER][RESPONSE] type=LIMIT side=BUY code=%s rt_cd=%s msg_cd=%s msg1=%s odno=%s",
+            pdno,
+            masked.get("rt_cd"),
+            masked.get("msg_cd"),
+            masked.get("msg1"),
+            masked.get("odno"),
+        )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
             try:

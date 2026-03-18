@@ -140,7 +140,7 @@ from trader.config import (
 )
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
-from trader.kis_wrapper import KisAPI, KISBlockedError
+from trader.kis_wrapper import KisAPI, KISBlockedError, extract_order_no, is_order_accepted
 from trader.ledger.store import LedgerStore
 from trader.universe.validation import validate_tradeable
 from trader.factors.liquidity_risk import gap_filter, liquidity_filter, range_filter, spread_proxy_filter
@@ -202,6 +202,7 @@ BUYABLE_GATE_TODAY_BUY_EVENT_TYPES = {"BUY_FILL"}
 BUYABLE_GATE_COOLDOWN_RULE = "filled_trade_required"
 LEDGER_BUY_EXECUTION_EVENT_TYPES = {"BUY_FILLED", "ORDER_FILLED_BUY", "BUY_EXECUTED", "EXECUTED_BUY"}
 LEDGER_BUY_SUBMISSION_EVENT_TYPES = {"ORDER_INTENT", "ORDER_SUBMITTED", "ORDER_ACCEPTED_BUY", "ORDER_ACCEPTED"}
+LEDGER_BUY_SUBMISSION_EVENT_TYPES = {"ORDER_INTENT", "ORDER_SUBMIT_ATTEMPT", "ORDER_SUBMIT_ACCEPTED", "ORDER_SUBMIT_ACCEPTED_CONFIRMED"}
 LEDGER_SKIP_EVENT_TYPES = {"ORDER_SKIP"}
 LEDGER_RECONCILE_EVENT_TYPES = {"RECONCILE"}
 
@@ -2278,11 +2279,11 @@ class PB1Engine:
     @staticmethod
     def _normalize_entry_reason(value: Any) -> str:
         raw = str(value or "").strip().upper()
-        if raw in {"ENTRY_BREAKOUT", "BREAKOUT"}:
+        if raw in {"ENTRY_BREAKOUT", "BREAKOUT", "ENTRY_BREAKOUT_CONFIRMED"}:
             return "ENTRY_BREAKOUT"
-        if raw in {"ENTRY_PULLBACK", "PULLBACK"}:
+        if raw in {"ENTRY_PULLBACK", "PULLBACK", "ENTRY_PULLBACK_OVERRIDE"}:
             return "ENTRY_PULLBACK"
-        if raw in {"ENTRY_MOMENTUM", "MOMENTUM"}:
+        if raw in {"ENTRY_MOMENTUM", "MOMENTUM", "ENTRY_MOMENTUM_CONTINUATION"}:
             return "ENTRY_MOMENTUM"
         return "ENTRY_GENERIC"
 
@@ -2297,17 +2298,19 @@ class PB1Engine:
     ) -> str:
         normalized_reason = cls._normalize_entry_reason(entry_reason)
         trigger_reason_s = str(trigger_reason or "").strip().lower()
-        if normalized_reason == "ENTRY_PULLBACK":
-            return "PULLBACK_RECOVERY"
-        if normalized_reason == "ENTRY_MOMENTUM":
-            return "MOMENTUM_CONTINUATION"
         if breakout_trigger_ok:
-            return "TRIGGER_BREAKOUT"
+            return "ENTRY_BREAKOUT_CONFIRMED"
+        if normalized_reason == "ENTRY_PULLBACK" and setup_filters_ok:
+            return "ENTRY_PULLBACK_OVERRIDE"
+        if normalized_reason == "ENTRY_MOMENTUM" and setup_filters_ok:
+            return "ENTRY_MOMENTUM_CONTINUATION"
         if setup_filters_ok:
-            return "SETUP_OVERRIDE"
+            if "score" in trigger_reason_s:
+                return "ENTRY_SCORE_OVERRIDE"
+            return "ENTRY_SETUP_OVERRIDE"
         if "score" in trigger_reason_s:
-            return "SCORE_OVERRIDE"
-        return "SETUP_OVERRIDE"
+            return "ENTRY_SCORE_OVERRIDE"
+        return "ENTRY_SETUP_OVERRIDE"
 
     @classmethod
     def _resolve_exit_family(cls, entry_reason: Any, entry_style_selected: Any) -> tuple[str, str]:
@@ -2409,6 +2412,13 @@ class PB1Engine:
         stage: str | None,
         payload_json: dict | None = None,
     ) -> None:
+        payload = dict(payload_json or {})
+        payload.setdefault("run_id", self.run_id)
+        payload.setdefault("derived_as_of", self.get_as_of())
+        payload.setdefault("trade_date", self._trade_date)
+        payload.setdefault("code", code)
+        payload.setdefault("qty", qty)
+        payload.setdefault("price", price)
         try:
             self.ledger_repo.append_event(
                 env=self.env,
@@ -2427,7 +2437,7 @@ class PB1Engine:
                 ok=ok,
                 reasons=self._with_name_reason(reasons, code),
                 stage=stage,
-                payload_json=payload_json or {},
+                payload_json=payload,
             )
         except Exception as exc:
             logger.warning(
@@ -2458,6 +2468,44 @@ class PB1Engine:
         msg_cd = resp.get("msg_cd")
         msg1 = resp.get("msg1")
         return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
+
+    @staticmethod
+    def _empty_order_status() -> dict[str, Any]:
+        return {
+            "candidate_built": 1,
+            "submit_attempted": 0,
+            "api_submitted": 0,
+            "accepted": 0,
+            "filled": 0,
+            "failed": 0,
+            "skipped": 0,
+            "rejected": 0,
+            "broker_submit_called": 0,
+            "submit_terminal_status": "NO_API_CALL",
+            "skipped_reason": "",
+            "broker_order_no": None,
+            "broker_response_code": None,
+            "broker_message": None,
+            "submitted": 0,
+        }
+
+    @staticmethod
+    def _classify_submit_terminal_status(
+        *,
+        api_submitted: int,
+        accepted: int,
+        skipped_reason: str | None,
+        response: dict | None,
+    ) -> str:
+        if skipped_reason:
+            return "SKIPPED_BY_POLICY"
+        if api_submitted <= 0:
+            return "NO_API_CALL"
+        if not isinstance(response, dict):
+            return "API_CALLED_NO_RESPONSE"
+        if accepted > 0:
+            return "ACCEPTED_PENDING_FILL"
+        return "BROKER_REJECTED"
 
     def _log_setup(self, cf: CandidateFeature) -> None:
         self.total_candidates += 1
@@ -3988,11 +4036,11 @@ class PB1Engine:
         sized_fail = [
             {
                 "code": c.code,
-                "reason": getattr(c, "sizing_reason", None),
-                "detail": getattr(c, "sizing_details", None),
+                "reason": _normalize_sizing_failure_reason(getattr(c, "sizing_reason", None)),
+                "detail": getattr(c, "sizing_details", None) or {"binding_constraint": "unknown"},
             }
             for c in candidates
-            if not ((c.planned_qty or 0) > 0 and c.setup_ok)
+            if bool(getattr(c, "sizing_reason", None)) and getattr(c, "sizing_reason", None) not in {"SIZING_OK"} and not ((c.planned_qty or 0) > 0 and c.setup_ok)
         ]
         self._debug_sizing_ok_codes = sized_ok
         self._debug_sizing_fail_items = sized_fail
@@ -4361,7 +4409,7 @@ class PB1Engine:
             logger.exception("[FORCE_BUY][ERROR] code=%s error=%s", code, exc)
 
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
-        status: dict[str, int | str] = {"submitted": 0, "accepted": 0, "filled": 0, "skipped_reason": ""}
+        status: dict[str, Any] = self._empty_order_status()
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
         if self.intended_live and self.dry_run:
             raise RuntimeError(
@@ -4413,7 +4461,9 @@ class PB1Engine:
                 except Exception as exc:
                     logger.warning("[SIM_ORDER][DB_FAIL] code=%s err=%s", display_code, exc)
                 # ✅ 계속 실행하지 않고 return (주문 전송 스킵)
+                status["skipped"] = 1
                 status["skipped_reason"] = "diag_no_http"
+                status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
                 return status
             else:
                 logger.info(
@@ -4421,7 +4471,9 @@ class PB1Engine:
                     display_code,
                     cf.planned_qty,
                 )
+                status["skipped"] = 1
                 status["skipped_reason"] = "no_trade_mode"
+                status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
                 return status
         
         reasons = cf.reasons or []
@@ -4531,6 +4583,8 @@ class PB1Engine:
             except Exception:
                 logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", display_code)
             status["skipped_reason"] = "duplicate_order"
+            status["skipped"] = 1
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
         if not hasattr(self, "_intents_created"):
             self._intents_created = []
@@ -4574,8 +4628,11 @@ class PB1Engine:
                 cf.planned_qty,
                 float(limit_price or entry_price or 0.0),
             )
-            status["submitted"] = 1
-            status["accepted"] = 1
+            status["submit_attempted"] = 1
+            status["api_submitted"] = 0
+            status["skipped"] = 1
+            status["accepted"] = 0
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
         
         # ✅ 라이브 주문 직전 최종 확인
@@ -4587,7 +4644,9 @@ class PB1Engine:
         
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
+            status["skipped"] = 1
             status["skipped_reason"] = "kis_missing"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
         if not self._pretrade_check(
             code=cf.code,
@@ -4599,8 +4658,19 @@ class PB1Engine:
             client_order_key=cf.client_order_key,
             stage="PB1-CLOSE",
         ):
+            logger.info("[ORDER][API_CALL][SKIP] code=%s reason=pretrade_check_failed", display_code)
+            status["skipped"] = 1
             status["skipped_reason"] = "pretrade_check_failed"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
+        status["submit_attempted"] = 1
+        logger.info(
+            "[ORDER][API_CALL][START] code=%s qty=%s price=%s order_type=%s",
+            display_code,
+            cf.planned_qty,
+            record_price,
+            order_type,
+        )
         emit_event(
             as_of=self._today,
             event="ORDER_SUBMIT",
@@ -4618,9 +4688,12 @@ class PB1Engine:
                 resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, float(limit_price))
             else:
                 resp = self.kis.buy_stock_market(cf.code, cf.planned_qty)
-            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+            kis_odno = extract_order_no(resp)
+            status["broker_submit_called"] = 1
+            status["api_submitted"] = 1
         except Exception:
             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
+            status["failed"] = 1
         self.orders_repo.mark_submitted(
             self.env,
             cf.client_order_key or "",
@@ -4628,9 +4701,10 @@ class PB1Engine:
             resp if isinstance(resp, dict) else {"resp": resp},
             entry_meta_json=entry_meta,
         )
-        status["submitted"] = 1
+        status["submitted"] = int(status.get("api_submitted", 0) or 0)
+        status["broker_order_no"] = kis_odno
         self._append_ledger_event(
-            event_type="ORDER_SUBMIT",
+            event_type="ORDER_SUBMIT_ATTEMPT",
             code=cf.code,
             market=cf.market,
             mode=cf.mode,
@@ -4638,15 +4712,17 @@ class PB1Engine:
             qty=cf.planned_qty,
             price=record_price,
             client_order_key=cf.client_order_key,
-            ok=bool(kis_odno),
+            ok=bool(status.get("api_submitted")),
             reasons=["submit"],
             stage="PB1-CLOSE",
             payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
         )
-        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        ok = bool(is_order_accepted(resp, kis_env=self.env))
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        status["broker_response_code"] = msg_cd or rt_cd
+        status["broker_message"] = msg1
         emit_event(
             as_of=self._today,
             event="ORDER_RESULT",
@@ -4660,7 +4736,7 @@ class PB1Engine:
         )
         reason_code = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
         self._append_ledger_event(
-            event_type="ORDER_RESULT",
+            event_type="ORDER_SUBMIT_ACCEPTED" if ok else "ORDER_SUBMIT_REJECTED",
             code=cf.code,
             market=cf.market,
             mode=cf.mode,
@@ -4690,9 +4766,10 @@ class PB1Engine:
             float(limit_price or entry_price or 0.0),
             "ACCEPTED" if ok else "REJECTED",
         )
-        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+        if ok:
             self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
             status["accepted"] = 1
+            status["submit_terminal_status"] = "ACCEPTED_PENDING_FILL"
             filled_at = now_kst()
             fill_meta = dict(entry_meta)
             fill_meta["entry_price_filled"] = record_price
@@ -4795,6 +4872,14 @@ class PB1Engine:
             status["filled"] = 1
         else:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+            status["rejected"] = 1
+            status["failed"] = int(status.get("failed", 0) or 0) + 1
+            status["submit_terminal_status"] = self._classify_submit_terminal_status(
+                api_submitted=int(status.get("api_submitted", 0) or 0),
+                accepted=int(status.get("accepted", 0) or 0),
+                skipped_reason=str(status.get("skipped_reason") or ""),
+                response=resp if isinstance(resp, dict) else None,
+            )
         return status
 
     def _place_add_on(self, pos: dict, *, qty: int, price: float) -> None:
@@ -4975,7 +5060,7 @@ class PB1Engine:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def _place_entry_close(self, cf: CandidateFeature) -> dict[str, int | str]:
-        status: dict[str, int | str] = {"submitted": 0, "accepted": 0, "filled": 0, "skipped_reason": ""}
+        status: dict[str, Any] = self._empty_order_status()
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
@@ -5130,12 +5215,15 @@ class PB1Engine:
                 cf.planned_qty,
                 float(cap or 0.0),
             )
-            status["submitted"] = 1
-            status["accepted"] = 1
+            status["skipped"] = 1
+            status["submit_attempted"] = 1
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
         if not self.kis:
             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
+            status["skipped"] = 1
             status["skipped_reason"] = "kis_missing"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
         if not self._pretrade_check(
             code=cf.code,
@@ -5147,7 +5235,10 @@ class PB1Engine:
             client_order_key=cf.client_order_key,
             stage="PB1-CLOSE",
         ):
+            logger.info("[ORDER][API_CALL][SKIP] code=%s reason=pretrade_check_failed", display_code)
+            status["skipped"] = 1
             status["skipped_reason"] = "pretrade_check_failed"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             return status
         self._append_ledger_event(
             event_type="ORDER_INTENT",
@@ -5176,10 +5267,15 @@ class PB1Engine:
         resp = None
         kis_odno = None
         try:
+            status["submit_attempted"] = 1
+            logger.info("[ORDER][API_CALL][START] code=%s qty=%s price=%s order_type=LIMIT", display_code, cf.planned_qty, float(cap or 0.0))
             resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
-            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
+            kis_odno = extract_order_no(resp)
+            status["broker_submit_called"] = 1
+            status["api_submitted"] = 1
         except Exception:
             logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
+            status["failed"] = 1
         self.orders_repo.mark_submitted(
             self.env,
             cf.client_order_key or "",
@@ -5187,9 +5283,10 @@ class PB1Engine:
             resp if isinstance(resp, dict) else {"resp": resp},
             entry_meta_json=entry_meta,
         )
-        status["submitted"] = 1
+        status["submitted"] = int(status.get("api_submitted", 0) or 0)
+        status["broker_order_no"] = kis_odno
         self._append_ledger_event(
-            event_type="ORDER_SUBMIT",
+            event_type="ORDER_SUBMIT_ATTEMPT",
             code=cf.code,
             market=cf.market,
             mode=cf.mode,
@@ -5197,15 +5294,17 @@ class PB1Engine:
             qty=cf.planned_qty,
             price=float(cap or 0.0),
             client_order_key=cf.client_order_key,
-            ok=bool(kis_odno),
+            ok=bool(status.get("api_submitted")),
             reasons=["submit"],
             stage="PB1-CLOSE",
             payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
         )
-        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        ok = bool(is_order_accepted(resp, kis_env=self.env))
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        status["broker_response_code"] = msg_cd or rt_cd
+        status["broker_message"] = msg1
         emit_event(
             as_of=self._today,
             event="ORDER_RESULT",
@@ -5219,7 +5318,7 @@ class PB1Engine:
         )
         reason_code = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
         self._append_ledger_event(
-            event_type="ORDER_RESULT",
+            event_type="ORDER_SUBMIT_ACCEPTED" if ok else "ORDER_SUBMIT_REJECTED",
             code=cf.code,
             market=cf.market,
             mode=cf.mode,
@@ -5249,9 +5348,10 @@ class PB1Engine:
             float(cap or 0.0),
             "ACCEPTED" if ok else "REJECTED",
         )
-        if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
+        if ok:
             self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
             status["accepted"] = 1
+            status["submit_terminal_status"] = "ACCEPTED_PENDING_FILL"
             self._append_close_entry_record(
                 {
                     "order_id": order_id,
@@ -5265,6 +5365,14 @@ class PB1Engine:
             )
         else:
             self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+            status["rejected"] = 1
+            status["failed"] = int(status.get("failed", 0) or 0) + 1
+            status["submit_terminal_status"] = self._classify_submit_terminal_status(
+                api_submitted=int(status.get("api_submitted", 0) or 0),
+                accepted=int(status.get("accepted", 0) or 0),
+                skipped_reason=str(status.get("skipped_reason") or ""),
+                response=resp if isinstance(resp, dict) else None,
+            )
         return status
 
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> None:
@@ -8412,20 +8520,30 @@ class PB1Engine:
                     setup_filters_ok=setup_filters_ok,
                     breakout_trigger_ok=trigger_ok,
                 )
-                cf.features["entry_reason"] = self._normalize_entry_reason(
+                normalized_entry_reason = self._normalize_entry_reason(
                     cf.features.get("entry_signal") or cf.features.get("entry_style_selected")
                 )
-                cf.features["entry_decision_family"] = self._resolve_entry_decision_family(
-                    entry_reason=cf.features.get("entry_reason"),
+                final_entry_reason_code = self._resolve_entry_decision_family(
+                    entry_reason=normalized_entry_reason,
                     setup_filters_ok=setup_filters_ok,
                     breakout_trigger_ok=trigger_ok,
                     trigger_reason=(trigger_info or {}).get("reason") if isinstance(trigger_info, dict) else None,
                 )
+                override_ok = bool(entry_ok and setup_filters_ok and not trigger_ok)
+                if not trigger_ok and normalized_entry_reason == "ENTRY_BREAKOUT":
+                    normalized_entry_reason = "ENTRY_GENERIC"
+                cf.features["entry_reason"] = normalized_entry_reason
+                cf.features["setup_ok"] = bool(setup_filters_ok)
+                cf.features["trigger_ok"] = bool(trigger_ok)
+                cf.features["override_ok"] = override_ok
+                cf.features["final_entry_reason_code"] = final_entry_reason_code
+                cf.features["entry_decision_family"] = final_entry_reason_code
                 cf.features["entry_rule_version"] = "pb1_entry_reason_v1"
                 cf.features["derived_as_of"] = engine_asof
                 cf.features["trace_id"] = f"{trace_id}:{cf.code}"
                 cf.features["setup_snapshot_json"] = {
                     "setup_filters_ok": setup_filters_ok,
+                    "override_ok": override_ok,
                     "entry_cond_mode": entry_mode,
                     "close": cf.features.get("close"),
                     "ma50": cf.features.get("ma50"),
@@ -8438,6 +8556,7 @@ class PB1Engine:
                 }
                 cf.features["trigger_snapshot_json"] = {
                     "breakout_trigger_ok": trigger_ok,
+                    "trigger_ok": trigger_ok,
                     "last_price": last_price,
                     "pivot": trigger_info.get("pivot", cf.features.get("pivot")),
                     "trigger": trigger_info.get("trigger"),
@@ -8889,7 +9008,7 @@ class PB1Engine:
                         [reason for reason, _count in stage_counter.most_common(self.drop_reasons_topn)],
                     )
             logger.info(
-                "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s submitted=%s",
+                "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s api_submitted=%s",
                 len(scan_members),
                 len(setup_ok_codes),
                 len(setup_ok_codes),
@@ -9086,16 +9205,20 @@ class PB1Engine:
                 
                 # [ORDER][SUBMIT] - 주문 제출
                 t_order_submit = time.monotonic()
-                submitted_count = 0
+                attempted_count = 0
+                api_submitted_count = 0
                 accepted_count = 0
                 filled_count = 0
                 failed_count = 0
+                rejected_count = 0
+                skipped_count = 0
                 submit_attempt_count = len(orderable_candidates)
                 if not entry_allowed:
                     logger.info(
                         "[ORDER_SUBMIT][SKIP] reason=LIVE_GATE_BLOCKED count=%s",
                         len(orderable_candidates),
                     )
+                    skipped_count = len(orderable_candidates)
                 else:
                     for cf in orderable_candidates:
                         try:
@@ -9104,9 +9227,13 @@ class PB1Engine:
                                 order_status = self._place_entry_close(cf)
                             else:
                                 order_status = self._place_entry(cf)
-                            submitted_count += int(order_status.get("submitted", 0) or 0)
+                            attempted_count += int(order_status.get("submit_attempted", 0) or 0)
+                            api_submitted_count += int(order_status.get("api_submitted", 0) or 0)
                             accepted_count += int(order_status.get("accepted", 0) or 0)
                             filled_count += int(order_status.get("filled", 0) or 0)
+                            rejected_count += int(order_status.get("rejected", 0) or 0)
+                            skipped_count += int(order_status.get("skipped", 0) or 0)
+                            failed_count += int(order_status.get("failed", 0) or 0)
                         except Exception as e:
                             failed_count += 1
                             logger.exception(
@@ -9116,18 +9243,33 @@ class PB1Engine:
                                 str(e),
                             )
                 dt_order_submit = time.monotonic() - t_order_submit
-                submit_success_count = submitted_count
+                submit_success_count = api_submitted_count
                 
                 logger.info(
-                    "[ORDER][SUBMIT] trace=%s submitted=%s accepted=%s filled=%s failed=%s dt_build=%.2f dt_submit=%.2f",
+                    "[ORDER][SUBMIT] trace=%s attempted=%s api_submitted=%s accepted=%s filled=%s rejected=%s skipped=%s failed=%s dt_build=%.2f dt_submit=%.2f",
                     trace_id,
-                    submitted_count,
+                    attempted_count,
+                    api_submitted_count,
                     accepted_count,
                     filled_count,
+                    rejected_count,
+                    skipped_count,
                     failed_count,
                     dt_order_build,
                     dt_order_submit,
                 )
+                logger.info(
+                    "[RUN_SUMMARY][ORDER] candidates=%s attempted=%s api_submitted=%s accepted=%s filled=%s rejected=%s skipped=%s",
+                    len(orderable_candidates),
+                    attempted_count,
+                    api_submitted_count,
+                    accepted_count,
+                    filled_count,
+                    rejected_count,
+                    skipped_count,
+                )
+                if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
+                    logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s", len(orderable_candidates), attempted_count, accepted_count)
                 if entry_allowed and self.phase == "entry" and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
@@ -9241,10 +9383,11 @@ class PB1Engine:
         intents_created = int(submit_attempt_count) if 'submit_attempt_count' in locals() else 0
         intents_skipped = self._setup_reason_counter.most_common(3)
         logger.info(
-            "[PB1][TICK_SUMMARY] order_candidates=%d priced_ok=%d submitted=%d accepted=%d filled=%d skipped_reason_top3=%s",
+            "[PB1][TICK_SUMMARY] order_candidates=%d priced_ok=%d attempted=%d api_submitted=%d accepted=%d filled=%d skipped_reason_top3=%s",
             candidates_ok,
             priced_ok,
             int(submit_attempt_count) if 'submit_attempt_count' in locals() else 0,
+            int(api_submitted_count) if 'api_submitted_count' in locals() else 0,
             int(submit_success_count) if 'submit_success_count' in locals() else 0,
             int(filled_count) if 'filled_count' in locals() else 0,
             intents_skipped,
@@ -9266,7 +9409,7 @@ class PB1Engine:
             sized_ok=len(self._debug_sizing_ok_codes),
             buyable_ok=len(buyable_ok_codes),
             order_candidates=len(orderable_candidates),
-            submitted=int(submit_success_count),
+            submitted=int(api_submitted_count) if 'api_submitted_count' in locals() else int(submit_success_count),
             blocked_reasons_counter=drop_reason_counter,
             no_trade_reason=(
                 _primary_no_trade_reason(
@@ -9282,8 +9425,11 @@ class PB1Engine:
             {
                 "order_candidate_codes": [c.code for c in orderable_candidates],
                 "submit_attempt_count": int(submit_attempt_count),
+                "api_submitted_count": int(api_submitted_count) if 'api_submitted_count' in locals() else 0,
                 "accepted_count": int(accepted_count) if 'accepted_count' in locals() else 0,
                 "filled_count": int(filled_count) if 'filled_count' in locals() else 0,
+                "rejected_count": int(rejected_count) if 'rejected_count' in locals() else 0,
+                "skipped_count": int(skipped_count) if 'skipped_count' in locals() else 0,
             }
         )
         

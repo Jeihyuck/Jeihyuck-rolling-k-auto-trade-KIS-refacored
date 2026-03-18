@@ -32,6 +32,8 @@ def normalize_vcp_score(value: Any) -> float:
         return 0.0
     if 0.0 <= numeric <= 1.0:
         numeric *= 100.0
+    elif 0.0 < numeric <= 10.0:
+        numeric *= 10.0
     return round(max(0.0, min(100.0, numeric)), 2)
 
 
@@ -341,6 +343,7 @@ def select_buyable_with_relax(
     used_rs = base_rs
     used_vcp = base_vcp
     final_gating_mode = "rank_only_fallback"
+    degraded_reason = "none"
     selected_states: dict[str, str] = {}
 
     for p in range(max(0, int(relax_passes)) + 1):
@@ -383,6 +386,7 @@ def select_buyable_with_relax(
             break
 
     if not chosen_codes and items:
+        degraded_reason = "no_genuine_relax_pass"
         ranked = sorted(
             [item for item in items if item.get("data_ok") and (not keep_trend or bool(item.get("trend_pass"))) and bool(item.get("atr_pass"))],
             key=lambda item: (
@@ -396,7 +400,7 @@ def select_buyable_with_relax(
         for code in chosen_codes:
             selected_states[code] = "rank_only_fallback"
         final_gating_mode = "rank_only_fallback"
-        logger.warning("[MINERVINI][DEGRADED][RANK_ONLY] count=%s", len(chosen_codes))
+        logger.warning("[MINERVINI][DEGRADED][RANK_ONLY] count=%s reason=%s", len(chosen_codes), degraded_reason)
 
     logger.info(
         "[MINERVINI][RELAX][FINAL_CODES] used=%s count=%s codes=%s",
@@ -417,6 +421,7 @@ def select_buyable_with_relax(
         "base_vcp": base_vcp,
         "regime_pass": True,
         "final_gating_mode": final_gating_mode,
+        "degraded_reason": degraded_reason,
         "selected_states": selected_states,
         "normalized_items": [
             {

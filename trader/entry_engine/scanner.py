@@ -13,6 +13,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+BREAKOUT_MIN_SCORE = float(os.getenv("ENTRY_SCAN_BREAKOUT_MIN_SCORE", "60") or "60")
+PULLBACK_MIN_SCORE = float(os.getenv("ENTRY_SCAN_PULLBACK_MIN_SCORE", "55") or "55")
+MOMENTUM_MIN_SCORE = float(os.getenv("ENTRY_SCAN_MOMENTUM_MIN_SCORE", "60") or "60")
+
 
 @dataclass
 class EntrySignal:
@@ -224,12 +228,42 @@ def scan_entry_candidates(
             vol_avg20 = _safe_float(precomputed_row.get("volume_avg20", 0.0))
             vol = _safe_float(precomputed_row.get("volume", 0.0))
 
-            breakout_strength = _safe_float(precomputed_row.get("breakout_score", 0.0)) / 100.0
-            pullback_strength = _safe_float(precomputed_row.get("pullback_score", 0.0)) / 100.0
-            momentum_strength = _safe_float(precomputed_row.get("momentum_score", 0.0)) / 100.0
-            breakout_ok = bool(precomputed_row.get("breakout_pass", breakout_strength > epsilon))
-            pullback_ok = bool(precomputed_row.get("pullback_pass", pullback_strength > epsilon))
-            momentum_ok = bool(precomputed_row.get("momentum_pass", momentum_strength > epsilon))
+            pivot_price = _safe_float(precomputed_row.get("pivot_price", precomputed_row.get("pivot", 0.0)))
+            breakout_score = _safe_float(precomputed_row.get("breakout_score", 0.0))
+            pullback_score = _safe_float(precomputed_row.get("pullback_score", 0.0))
+            momentum_score = _safe_float(precomputed_row.get("momentum_score", 0.0))
+            breakout_strength = breakout_score / 100.0
+            pullback_strength = pullback_score / 100.0
+            momentum_strength = momentum_score / 100.0
+            breakout_context_ok = (
+                breakout_score >= BREAKOUT_MIN_SCORE
+                and breakout_strength > epsilon
+                and close > 0
+                and ((pivot_price > 0 and close >= pivot_price) or (high_50 > 0 and close >= high_50 * 0.995))
+                and vol_avg20 > 0
+                and vol >= (vol_avg20 * 1.1)
+            )
+            pullback_context_ok = (
+                pullback_score >= PULLBACK_MIN_SCORE
+                and pullback_strength > epsilon
+                and close > 0
+                and ma20 > 0
+                and ma50 > 0
+                and close >= min(ma20, ma50)
+                and 0.03 <= pullback_pct <= 0.18
+            )
+            momentum_context_ok = (
+                momentum_score >= MOMENTUM_MIN_SCORE
+                and momentum_strength > epsilon
+                and rs_percentile >= 80
+                and ma20 > 0
+                and close >= ma20
+                and vol_avg20 > 0
+                and vol >= vol_avg20
+            )
+            breakout_ok = breakout_context_ok
+            pullback_ok = pullback_context_ok
+            momentum_ok = momentum_context_ok
         else:
             request_days = 260
             if trade_precomputed_only and request_days > 60:
@@ -288,9 +322,31 @@ def scan_entry_candidates(
             breakout_strength = min(1.0, max(0.0, (close - high_50) / high_50 * 10.0)) if high_50 > 0 else 0.0
             pullback_strength = max(0.0, 1.0 - abs(pullback_pct - 0.10) / 0.05)
             momentum_strength = min(1.0, max(0.0, (rs_percentile - 80) / 20.0)) if rs_percentile >= 80 else 0.0
-            breakout_ok = high_50 > 0 and vol_avg20 > 0 and close >= high_50 and vol > (vol_avg20 * 1.2) and breakout_strength > epsilon
-            pullback_ok = ma50 > 0 and close >= ma50 and 0.03 <= pullback_pct <= 0.18 and pullback_strength > epsilon and vol_avg20 > 0
-            momentum_ok = rs_percentile >= 80 and ma20 > 0 and vol_avg20 > 0 and close >= ma20 and vol >= vol_avg20 and momentum_strength > epsilon
+            breakout_ok = (
+                breakout_strength > epsilon
+                and (breakout_strength * 100.0) >= BREAKOUT_MIN_SCORE
+                and high_50 > 0
+                and vol_avg20 > 0
+                and close >= high_50
+                and vol > (vol_avg20 * 1.2)
+            )
+            pullback_ok = (
+                pullback_strength > epsilon
+                and (pullback_strength * 100.0) >= PULLBACK_MIN_SCORE
+                and ma50 > 0
+                and close >= ma50
+                and 0.03 <= pullback_pct <= 0.18
+                and vol_avg20 > 0
+            )
+            momentum_ok = (
+                momentum_strength > epsilon
+                and (momentum_strength * 100.0) >= MOMENTUM_MIN_SCORE
+                and rs_percentile >= 80
+                and ma20 > 0
+                and vol_avg20 > 0
+                and close >= ma20
+                and vol >= vol_avg20
+            )
 
         pass_total = int(breakout_ok) + int(pullback_ok) + int(momentum_ok)
         breakout_pass_count += int(breakout_ok)
@@ -364,7 +420,7 @@ def scan_entry_candidates(
     total = len([w for w in watchlist if w.get("code")])
 
     logger.info(
-        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s rejected_counts=%s",
+        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
         total,
         passed,
         breakout_pass_count,
@@ -372,11 +428,28 @@ def scan_entry_candidates(
         momentum_pass_count,
         multi_pass_count,
         none_pass_count,
+        {
+            "breakout": BREAKOUT_MIN_SCORE,
+            "pullback": PULLBACK_MIN_SCORE,
+            "momentum": MOMENTUM_MIN_SCORE,
+        },
+        {
+            "precomputed": len(precomputed_map),
+            "watchlist": total,
+            "trade_precomputed_only": int(bool(trade_precomputed_only)),
+        },
         dict(rejected_counts),
     )
+    if total and breakout_pass_count == total and pullback_pass_count == total and momentum_pass_count == total:
+        logger.warning("[ENTRY_SCAN][ANOMALY][ALL_PASS] total=%s", total)
+    if total and multi_pass_count == total:
+        logger.warning("[ENTRY_SCAN][ANOMALY][MULTI_PASS_EXCESS] total=%s", total)
+    if total and none_pass_count == total:
+        logger.warning("[ENTRY_SCAN][ANOMALY][NONE_PASS_EXCESS] total=%s", total)
     dominant_style = max(style_counts.values()) / total if total and style_counts else 0.0
     if dominant_style >= 0.8:
         logger.warning("[ENTRY_SCAN][STYLE_DISTRIBUTION_WARN] counts=%s total=%s", dict(style_counts), total)
+        logger.warning("[ENTRY_SCAN][ANOMALY][STYLE_MONOCULTURE] counts=%s total=%s", dict(style_counts), total)
 
     top_rejects_n = int(os.getenv("ENTRY_SCAN_LOG_TOP_REJECTS", "10") or "10")
     if passed == 0 and per_symbol_rejects:
@@ -405,10 +478,33 @@ def scan_entry_candidates(
             "effective_filters": {
                 "required_scored_cols": sorted(required_scored_cols),
                 "top_rejects_n": top_rejects_n,
+                "thresholds": {
+                    "breakout": BREAKOUT_MIN_SCORE,
+                    "pullback": PULLBACK_MIN_SCORE,
+                    "momentum": MOMENTUM_MIN_SCORE,
+                },
             },
             "per_symbol_rejection_reasons": per_symbol_rejects,
             "aggregate_rejected_counts": dict(rejected_counts),
             "candidate_counts_by_style": dict(style_counts),
+            "summary": {
+                "total": total,
+                "passed": passed,
+                "breakout_pass": breakout_pass_count,
+                "pullback_pass": pullback_pass_count,
+                "momentum_pass": momentum_pass_count,
+                "multi_pass": multi_pass_count,
+                "none_pass": none_pass_count,
+                "thresholds": {
+                    "breakout": BREAKOUT_MIN_SCORE,
+                    "pullback": PULLBACK_MIN_SCORE,
+                    "momentum": MOMENTUM_MIN_SCORE,
+                },
+                "source": {
+                    "precomputed": len(precomputed_map),
+                    "watchlist": total,
+                },
+            },
             "near_miss_candidates": near_miss_candidates,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

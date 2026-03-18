@@ -56,6 +56,7 @@ from trader.time_utils import (
     resolve_derived_as_of,
 )
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
+from trader.path_contract import write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -359,59 +360,42 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
     payload_df["code"] = payload_df["code"].astype(str).str.zfill(6)
     payload = payload_df.to_dict(orient="records")
     critical_cols = [col for col in CRITICAL_SCORED_COLS if col in payload_df.columns]
-    file_results: dict[str, dict[str, Any]] = {}
-
-    def _write_payload(label: str, path: Path) -> None:
-        if label == "signals":
-            file_payload = {
-                "as_of": as_of,
-                "env": env,
-                "count": len(payload),
-                "items": payload,
-                "source": "prep_final30_scored",
-            }
-        else:
-            file_payload = payload
-        tmp_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
-        tmp_path.write_text(json.dumps(file_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp_path, path)
-
-    def _validate_saved_file(label: str, path: Path) -> bool:
-        exists = int(path.exists())
-        bytes_written = 0
-        json_ok = 0
-        rows: list[dict[str, Any]] = []
-        if exists:
-            try:
-                bytes_written = int(path.stat().st_size)
-            except OSError:
-                bytes_written = 0
-            try:
-                parsed = json.loads(path.read_text(encoding="utf-8"))
-                json_ok = 1
-                if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
-                    rows = [dict(item) for item in parsed.get("items") if isinstance(item, dict)]
-                elif isinstance(parsed, list):
-                    rows = [dict(item) for item in parsed if isinstance(item, dict)]
-            except Exception:
-                json_ok = 0
-        detected_critical_cols = sorted([col for col in CRITICAL_SCORED_COLS if rows and col in rows[0]])
-        file_results[label] = {
-            "path": path,
-            "exists": bool(exists == 1),
-            "bytes": bytes_written,
-            "rows": len(rows),
-            "json_ok": bool(json_ok == 1),
-            "critical_cols": detected_critical_cols,
-        }
-        logger.info(
-            "[PREP][FINAL30_FILE][WRITE] label=%s path=%s exists=%s bytes=%s rows=%s",
-            label,
-            str(path),
-            path.exists(),
-            bytes_written,
-            len(rows),
+    logger.info("[PREP][FINAL30][REPAIR][START] as_of=%s env=%s rows=%s", as_of, env, len(payload))
+    file_results = write_final30_mirrors(
+        repo_root=repo_root(),
+        env=env,
+        as_of=as_of,
+        rows=payload,
+        source="prep_final30_scored",
+    )
+    verify_results = verify_final30_mirrors(
+        repo_root=repo_root(),
+        env=env,
+        as_of=as_of,
+        expected_rows=len(payload) or None,
+    )
+    success_count = 0
+    failed_count = 0
+    for label, path in build_final30_scored_paths(repo_root(), env, as_of).items():
+        info = dict(file_results.get(label, {}))
+        verify_info = dict(verify_results.get(label, {}))
+        info.update(verify_info)
+        rows = int(info.get("rows") or 0)
+        exists = int(bool(info.get("exists")))
+        bytes_written = int(info.get("bytes") or 0)
+        json_ok = int(bool(info.get("json_ok")))
+        detected_critical_cols = sorted([col for col in critical_cols if payload and col in payload[0]])
+        info["critical_cols"] = detected_critical_cols
+        info["ok"] = bool(
+            exists == 1
+            and bytes_written > 0
+            and json_ok == 1
+            and rows == len(payload)
+            and set(CRITICAL_SCORED_COLS).issubset(set(detected_critical_cols))
         )
+        file_results[label] = info
+        success_count += int(bool(info.get("ok")))
+        failed_count += int(not bool(info.get("ok")))
         logger.info(
             "[PREP][FINAL30_SCORED][VERIFY] source=%s path=%s exists=%s bytes=%s json_ok=%s rows=%s critical_cols=%s",
             label,
@@ -419,30 +403,19 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
             exists,
             bytes_written,
             json_ok,
-            len(rows),
+            rows,
             detected_critical_cols,
         )
-        return bool(
-            exists == 1
-            and bytes_written > 0
-            and json_ok == 1
-            and len(rows) == 30
-            and set(CRITICAL_SCORED_COLS).issubset(set(detected_critical_cols))
-        )
+        if not info["ok"]:
+            logger.warning(
+                "[PREP][FINAL30_SCORED][VERIFY_FAIL] source=%s path=%s expected_rows=%s required_cols=%s",
+                label,
+                path,
+                len(payload),
+                critical_cols,
+            )
 
-    for label, path in build_final30_scored_paths(repo_root(), env, as_of).items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _write_payload(label, path)
-        if not _validate_saved_file(label, path):
-            logger.warning("[PREP][FINAL30_SCORED][RETRY] source=%s path=%s", label, path)
-            _write_payload(label, path)
-            if not _validate_saved_file(label, path):
-                logger.warning(
-                    "[PREP][FINAL30_SCORED][VERIFY_FAIL] source=%s path=%s expected_rows=30 required_cols=%s",
-                    label,
-                    path,
-                    critical_cols,
-                )
+    logger.info("[PREP][FINAL30][REPAIR][DONE] success=%s failed=%s", success_count, failed_count)
 
     logger.info(
         "[PREP][FINAL30_SCORED][FIELDS] has_score_final=%s has_tech_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",

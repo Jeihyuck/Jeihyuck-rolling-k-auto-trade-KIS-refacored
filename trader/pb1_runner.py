@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from trader.runtime_paths import build_final30_scored_paths, repo_root
-from trader.path_contract import build_final30_paths, build_watchlist_paths, resolve_repo_root, serialize_path_map
+from trader.path_contract import build_final30_paths, build_watchlist_paths, resolve_repo_root, serialize_path_map, write_final30_mirrors
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -175,14 +175,33 @@ def load_trade_final30_scored(
         allow_latest_fallback=False,
     )
     if scored_contract.get("ok"):
-        if not any(file_mirror_stats.values()):
+        rows = list(scored_contract.get("rows_data") or [])
+        missing_labels = [label for label, present in file_mirror_stats.items() if not present]
+        if missing_labels and rows:
+            logger.info(
+                "[TRADE][FINAL30][FILE_REPAIR] env=%s as_of=%s missing=%s source=db_pb1_watchlist_final_scored",
+                env_n,
+                as_of_s,
+                missing_labels,
+            )
+            repair_results = write_final30_mirrors(
+                repo_root=repo_root_path,
+                env=env_n,
+                as_of=as_of_s,
+                rows=rows,
+                source="trade_db_final30_scored_repair",
+            )
+            file_mirror_stats = {
+                label: int(bool((repair_results.get(label) or {}).get("ok")))
+                for label in final30_paths.keys()
+            }
+        if missing_labels and not any(file_mirror_stats.values()):
             logger.error(
                 "[TRADE][FINAL30][FILE_CONTRACT_MISMATCH] env=%s as_of=%s paths=%s",
                 env_n,
                 as_of_s,
                 serialize_path_map(final30_paths),
             )
-        rows = list(scored_contract.get("rows_data") or [])
         df = pd.DataFrame(rows)
         columns = [str(c) for c in df.columns.tolist()]
         logger.info(
@@ -442,6 +461,17 @@ BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
 BALANCE_STATE_UNKNOWN = "UNKNOWN"
 DEFAULT_UNIVERSE_STRATEGY = "best_k_meta"
+_MIGRATIONS_BOOTSTRAPPED = False
+
+
+def _ensure_bootstrap_migrations(engine) -> None:
+    global _MIGRATIONS_BOOTSTRAPPED
+    if _MIGRATIONS_BOOTSTRAPPED:
+        logger.info("[DB][MIGRATE][SKIP] already_bootstrapped=1")
+        return
+    run_migrations(engine)
+    _MIGRATIONS_BOOTSTRAPPED = True
+    logger.info("[DB][MIGRATE][BOOTSTRAP_DONE] once=1")
 
 
 def _run_build_watchlist_job() -> int:
@@ -461,7 +491,7 @@ def _run_build_watchlist_job() -> int:
         # DB 준비
         assert_db_ready()
         engine = make_engine()
-        run_migrations(engine)
+        _ensure_bootstrap_migrations(engine)
         
         # 환경변수
         env = os.getenv("ENV", "live")
@@ -2934,7 +2964,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     )
     
     try:
-        run_migrations(engine)
+        _ensure_bootstrap_migrations(engine)
         _write_change_flag(False, ["init"])
         trade_start_ts = time_mod.monotonic()
         loop_started_ts = trade_start_ts
@@ -3249,7 +3279,7 @@ def main() -> int:
         # DB 준비
         assert_db_ready()
         engine = make_engine()
-        run_migrations(engine)
+        _ensure_bootstrap_migrations(engine)
         
         # 환경변수
         env = resolved_env
@@ -3671,7 +3701,7 @@ def main() -> int:
         logger.warning("[PB1][RUN] run lock unavailable -> exit")
         lock_conn.close()
         return 0
-    run_migrations(engine)
+    _ensure_bootstrap_migrations(engine)
     _write_change_flag(False, ["init"])
     
     # ✅ run_id SSOT: TRADER_RUN_ID를 사용하여 통일
