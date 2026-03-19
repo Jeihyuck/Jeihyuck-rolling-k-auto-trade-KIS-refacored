@@ -1502,6 +1502,25 @@ def run_once(
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     # ✅ Initialize universe_strategy with default value
     universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+    env_strategy = (str(os.getenv("STRATEGY_ENV") or ctx.env or "practice").strip().lower() or "practice")
+    env_kis = (str(os.getenv("KIS_ENV") or "").strip().lower() or env_strategy or "practice")
+    env_derived = env_kis or env_strategy or "practice"
+    env_effective = env_derived
+
+    logger.info(
+        "[RUN_ONCE][CTX_PREFLIGHT] strategy_env=%s kis_env=%s derived_env=%s effective_env=%s",
+        env_strategy,
+        env_kis,
+        env_derived,
+        env_effective,
+    )
+    logger.info(
+        "[PB1][ENV_DERIVE] strategy_env=%s kis_env=%s derived_env=%s effective_env=%s",
+        env_strategy,
+        env_kis,
+        env_derived,
+        env_effective,
+    )
     
     workflow_run_id = None
     for env_var in ["GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "WORKFLOW_RUN_ID"]:
@@ -1609,7 +1628,9 @@ def run_once(
     # 장마감 후/비거래일 검증도 동일한 trade 경로를 사용하며,
     # 달라질 수 있는 것은 주문 제출 허용 여부뿐이다.
     # ✅ CRITICAL: Trade는 장중에 "전일 영업일 derived"를 사용
-    trade_ctx = resolve_trade_context(now=now, env=kis_env or "practice")
+    if not env_effective:
+        raise RuntimeError("[RUN_ONCE][ENV] env_effective is empty before resolve_trade_context")
+    trade_ctx = resolve_trade_context(now=now, env=env_effective)
     trade_date = date.fromisoformat(str(trade_ctx["trade_date"]))
     as_of = str(trade_ctx["as_of"])
     asof_reason = str(trade_ctx["reason"])
@@ -1951,9 +1972,8 @@ def run_once(
     disable_live_flag_value = _env_bool_any(("DISABLE_LIVE_TRADING",), default=False)
     live_trading_flag_value = _env_bool_any(("LIVE_TRADING_ENABLED",), default=False)
     
-    expect_kis_env = os.getenv("EXPECT_KIS_ENV")
-    kis_env_raw = (os.getenv("KIS_ENV") or "").strip()
-    kis_env = kis_env_raw.lower()
+    expect_kis_env = (os.getenv("EXPECT_KIS_ENV") or "").strip().lower() or None
+    env_kis_raw = (os.getenv("KIS_ENV") or "").strip()
     api_base_url = (os.getenv("API_BASE_URL") or "").lower()
     guard_live = expect_live_flag and not diag_enabled and trading_day and not dry_run
     if guard_live:
@@ -1966,11 +1986,11 @@ def run_once(
             guard_failures.append("DISABLE_LIVE_TRADING!=0")
         if mode_resolved != "LIVE":
             guard_failures.append("STRATEGY_MODE!=LIVE")
-        if kis_env != "practice":
+        if env_effective != "practice":
             guard_failures.append("KIS_ENV!=practice")
         if "openapivts" not in api_base_url:
             guard_failures.append("API_BASE_URL missing openapivts")
-        if expect_kis_env and kis_env_raw != expect_kis_env:
+        if expect_kis_env and env_kis != expect_kis_env:
             guard_failures.append("EXPECT_KIS_ENV mismatch")
         if guard_failures:
             raise SystemExit(f"EXPECT_LIVE_TRADING=1 guards failed: {guard_failures}")
@@ -2177,7 +2197,7 @@ def run_once(
             universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             _log_db_only_universe_precheck(
                 repo=UniverseRepo(engine),
-                env=kis_env or "practice",
+                env=env_effective,
                 strategy=universe_strategy,
             )
         universe_members = ensure_universe_built_once(engine=engine, as_of=as_of)
@@ -2283,7 +2303,7 @@ def run_once(
                 universe_ctx = _load_universe_context(
                     engine=engine,
                     as_of=str(run_ctx.get("derived_as_of") or as_of),
-                    env=kis_env or "practice",
+                    env=env_effective,
                     strategy=universe_strategy,
                 )
             except RuntimeError as exc:
@@ -2306,7 +2326,7 @@ def run_once(
                     trade_use_precomputed_features = True
                     logger.info(
                         "[TRADE][FINAL30][DB_LOCK] env=%s as_of=%s rows=%s scored=%s immutable=1",
-                        kis_env or "practice",
+                        env_effective,
                         str(run_ctx.get("derived_as_of") or as_of),
                         len(precomputed_final30_df),
                         int(final30_source_name == "db_pb1_watchlist_final_scored"),
@@ -2319,7 +2339,7 @@ def run_once(
                     try:
                         derived_repo = DerivedMinerviniRepo(engine)
                         derived_rows, _actual_as_of = derived_repo.load_for_as_of_with_fallback(
-                            env=kis_env or "practice",
+                            env=env_effective,
                             as_of=date.fromisoformat(str(run_ctx.get("derived_as_of") or as_of)),
                             symbols=symbols,
                             ttl_days=7,
@@ -2330,7 +2350,7 @@ def run_once(
                     try:
                         watchlist_repo = WatchlistRepo(engine)
                         universe_rows, _used_as_of = watchlist_repo.load_watchlist_scored(
-                            env=kis_env or "practice",
+                            env=env_effective,
                             strategy="pb1_universe_scored",
                             as_of=date.fromisoformat(str(run_ctx.get("derived_as_of") or as_of)),
                             allow_latest_fallback=True,
@@ -2359,8 +2379,14 @@ def run_once(
         )
         try:
             kis = KisAPI()
-            if kis.env != kis_env:
-                logger.warning("[PB1][KIS_ENV_MISMATCH] kis.env=%s != kis_env=%s -> force dry_run + downgrade intended_live", kis.env, kis_env)
+            if kis.env != env_effective:
+                logger.warning(
+                    "[PB1][KIS_ENV_MISMATCH] kis.env=%s != effective_env=%s strategy_env=%s kis_env=%s -> force dry_run + downgrade intended_live",
+                    kis.env,
+                    env_effective,
+                    env_strategy,
+                    env_kis,
+                )
                 dry_run = True
                 intended_live = False  # ✅ CRITICAL: must sync intended_live when forcing dry_run
                 _apply_env_flags_if_needed(dry_run)
@@ -2502,7 +2528,7 @@ def run_once(
             logger.warning("[PB1][SAFE_MODE] order_allowed=0")
             try:
                 ReconcileLogRepo(engine).append_log(
-                    env=kis_env or "practice",
+                    env=env_effective,
                     strategy="pb1_pullback_close",
                     tick_ts=now,
                     action="safe_mode_entry_block",
@@ -2533,7 +2559,7 @@ def run_once(
             )
 
         run_record_id = runs_repo.start_run(
-            env=kis_env or "practice",
+            env=env_effective,
             strategy="pb1_pullback_close",
             run_window=window_label,
             phase=phase_override_arg,
@@ -2558,7 +2584,7 @@ def run_once(
                 reconcile_result = reconcile_kis(
                     engine=engine,
                     kis=kis,
-                    env=kis_env or "practice",
+                    env=env_effective,
                     run_id=run_record_id,
                     strategy="pb1_pullback_close",
                     tick_ts=now,
@@ -2611,7 +2637,7 @@ def run_once(
             window_label=run_ctx.get("window_name") or window_label,
             phase=run_ctx.get("phase_name") or phase_override_arg,
             dry_run=dry_run_for_engine,  # ✅ bool 강제된 값 전달
-            env=kis_env or "practice",
+            env=env_effective,
             run_id=run_record_id,
             intended_live=intended_live,  # ✅ 메인에서 확정한 LIVE 의도 전달
             strategy=universe_strategy,  # [FIX] watchlist 버그 수정 - strategy 전달
@@ -2818,7 +2844,7 @@ def run_once(
             generate_run_summary_json(
                 run_id=str(run_record_id),
                 trace_id=str(trace_id),
-                env=kis_env or "practice",
+                env=env_effective,
                 engine=engine_runner,
                 as_of_requested=None,
                 as_of_used=as_of_used,
@@ -2849,7 +2875,13 @@ def run_once(
         )
         touched_files = engine_runner.get_touched_files() if engine_runner and hasattr(engine_runner, "get_touched_files") else []
     except Exception as exc:
-        logger.exception("[PB1][FAIL] unexpected error")
+        logger.exception(
+            "[PB1][FATAL_GUARD] unexpected error strategy_env=%s kis_env=%s derived_env=%s effective_env=%s",
+            locals().get("env_strategy"),
+            locals().get("env_kis"),
+            locals().get("env_derived"),
+            locals().get("env_effective"),
+        )
         phase_context = phase_for_log or phase_override_arg or "unknown"
         window_context = window_label or "unknown"
         current_code = engine_runner.current_code if engine_runner else None
@@ -3799,7 +3831,13 @@ def main() -> int:
             max_seconds=max_seconds,
         )
     except Exception:
-        logger.error("[PB1][FATAL_GUARD] unexpected error", exc_info=True)
+        logger.error(
+            "[PB1][FATAL_GUARD] unexpected error ctx_env=%s strategy_env=%s kis_env=%s",
+            ctx.env,
+            os.getenv("STRATEGY_ENV"),
+            os.getenv("KIS_ENV"),
+            exc_info=True,
+        )
         result_status = "ERROR"
     finally:
         try:

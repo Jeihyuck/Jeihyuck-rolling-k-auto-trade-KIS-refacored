@@ -248,7 +248,12 @@ def _safe_get_nearest_business_day_in_a_week(date_str: str, *, prev: bool = True
             from pykrx.stock import get_nearest_business_day_in_a_week
 
             resolved = get_nearest_business_day_in_a_week(date_str, prev=prev)
-        return str(resolved), None
+        resolved_text = str(resolved).strip() if resolved is not None else ""
+        if len(resolved_text) < 8:
+            return None, "IndexError"
+        return resolved_text[:8], None
+    except IndexError:
+        return None, "IndexError"
     except Exception as exc:
         return None, type(exc).__name__
     finally:
@@ -270,7 +275,16 @@ def _resolve_pykrx_previous_or_same(d: date) -> date | None:
         )
         resolved_date = None
     else:
-        resolved_date = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+        try:
+            resolved_date = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+        except (IndexError, ValueError) as exc:
+            _log_pykrx_fail_once(
+                scope="resolve_pykrx_previous_or_same",
+                subject=f"date={d.isoformat()}",
+                fallback="weekday_heuristic",
+                err_type=type(exc).__name__,
+            )
+            resolved_date = None
 
     _PYKRX_PREV_OR_SAME_CACHE[cache_key] = resolved_date
     return resolved_date
