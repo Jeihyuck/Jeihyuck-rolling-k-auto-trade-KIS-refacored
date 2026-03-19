@@ -175,6 +175,7 @@ def scan_entry_candidates(
     breakout_pass_count = 0
     pullback_pass_count = 0
     momentum_pass_count = 0
+    usable_count = 0
     setup_ok_count = 0
     multi_pass_count = 0
     none_pass_count = 0
@@ -388,6 +389,7 @@ def scan_entry_candidates(
             features=precomputed_row or item,
         )
         evaluations.append(evaluation)
+        usable_count += 1
         setup_ok_count += int(bool(evaluation.get("setup_ok")))
         breakout_pass_count += int(breakout_ok)
         pullback_pass_count += int(pullback_ok)
@@ -460,8 +462,9 @@ def scan_entry_candidates(
     total = len([w for w in watchlist if w.get("code")])
 
     logger.info(
-        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s setup_ok=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
+        "[ENTRY_SCAN][SUMMARY] total=%s usable=%s passed=%s setup_ok=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
         total,
+        usable_count,
         passed,
         setup_ok_count,
         breakout_pass_count,
@@ -530,6 +533,7 @@ def scan_entry_candidates(
             "candidate_counts_by_style": dict(style_counts),
             "summary": {
                 "total": total,
+                "usable_count": usable_count,
                 "passed": passed,
                 "setup_ok_count": setup_ok_count,
                 "breakout_pass": breakout_pass_count,
@@ -566,6 +570,7 @@ def scan_entry_candidates(
         "evaluations": evaluations,
         "summary": {
             "total": total,
+            "usable_count": usable_count,
             "passed": passed,
             "setup_ok_count": setup_ok_count,
             "breakout_pass": breakout_pass_count,

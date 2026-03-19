@@ -675,6 +675,7 @@ def generate_run_summary_json(
             "entry_decision_reason": run_summary.get("entry_decision_reason"),
             "drop_reasons": reject_reason_counts or {},
             "consistency": {
+                "scanner_usable": int(scanner_summary.get("usable_count", scanner_summary.get("total", 0))),
                 "scanner_setup_ok": int(scanner_summary.get("setup_ok_count", 0)),
                 "engine_setup_ok": counts["setup_ok_count"],
                 "match": int(int(scanner_summary.get("setup_ok_count", 0)) == counts["setup_ok_count"]),
@@ -2818,17 +2819,20 @@ def run_once(
         try:
             scanner_summary = getattr(engine_runner, "_scanner_summary", {}) or {}
             run_summary = getattr(engine_runner, "_run_summary_payload", {}) or {}
+            scanner_usable = int(scanner_summary.get("usable_count", scanner_summary.get("total", 0)))
             scanner_setup_ok = int(scanner_summary.get("setup_ok_count", 0))
             engine_setup_ok = int(run_summary.get("setup_ok", 0))
             if scanner_summary:
                 logger.info(
-                    "[CONSISTENCY][SCAN_ENGINE] scanner_setup_ok=%s engine_setup_ok=%s",
+                    "[CONSISTENCY][SCAN_ENGINE] scanner_usable=%s scanner_setup_ok=%s engine_setup_ok=%s",
+                    scanner_usable,
                     scanner_setup_ok,
                     engine_setup_ok,
                 )
             if scanner_summary and scanner_setup_ok != engine_setup_ok:
                 logger.warning(
-                    "[CONSISTENCY][SCAN_ENGINE_MISMATCH] scanner_setup_ok=%s engine_setup_ok=%s scanner_total=%s engine_scanned=%s",
+                    "[CONSISTENCY][SCAN_ENGINE_MISMATCH] scanner_usable=%s scanner_setup_ok=%s engine_setup_ok=%s scanner_total=%s engine_scanned=%s",
+                    scanner_usable,
                     scanner_setup_ok,
                     engine_setup_ok,
                     scanner_summary.get("total", 0),

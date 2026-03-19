@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-ENTRY_DECISION_FAMILIES = {"ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "SKIP"}
+ENTRY_DECISION_FAMILIES = {"ENTRY_BREAKOUT", "ENTRY_PULLBACK", "ENTRY_MOMENTUM", "ENTRY_GENERIC", "SKIP"}
 EXIT_DECISION_FAMILIES = {"EXIT_STOP", "EXIT_TRAIL", "EXIT_TIME", "EXIT_MA_BREAK", "EXIT_RISK_OFF", "SKIP"}
 ENTRY_TRIGGER_POLICIES = {"BREAKOUT_PIVOT", "PULLBACK_REVERSAL", "MOMENTUM_CONTINUATION", "CLOSE_RECLAIM", "NONE"}
 
@@ -20,6 +20,8 @@ def normalize_entry_setup_family(value: Any) -> str:
         return "ENTRY_PULLBACK"
     if raw in {"ENTRY_MOMENTUM", "MOMENTUM", "ENTRY_MOMENTUM_CONTINUATION"}:
         return "ENTRY_MOMENTUM"
+    if raw in {"ENTRY_GENERIC", "GENERIC"}:
+        return "ENTRY_GENERIC"
     return "SKIP"
 
 
@@ -118,7 +120,7 @@ def build_entry_evaluation(
         "decision": "ORDER_READY" if order_ready else "SKIP",
         "decision_family": normalized_family if normalized_family != "SKIP" else "SKIP",
         "decision_reason": primary_reason,
-        "entry_setup_family": normalized_family if normalized_family != "SKIP" else "ENTRY_BREAKOUT",
+        "entry_setup_family": normalized_family if normalized_family != "SKIP" else "ENTRY_GENERIC",
         "entry_trigger_policy": trigger_policy,
         "reasons": reason_list or ([primary_reason] if primary_reason else []),
     }
@@ -127,6 +129,12 @@ def build_entry_evaluation(
 def normalize_exit_decision(reason: Any) -> tuple[str, str]:
     upper = str(reason or "").strip().upper()
     mapping = {
+        "EXIT_RISK_OFF": ("EXIT_RISK_OFF", "EXIT_RISK_OFF"),
+        "EXIT_STOP_LOSS": ("EXIT_STOP", "EXIT_STOP_LOSS"),
+        "EXIT_TRAILING_STOP": ("EXIT_TRAIL", "EXIT_TRAILING_STOP"),
+        "EXIT_MA50_BREAK": ("EXIT_MA_BREAK", "EXIT_MA50_BREAK"),
+        "EXIT_MA20_BREAK": ("EXIT_MA_BREAK", "EXIT_MA20_BREAK"),
+        "EXIT_TIME_STOP": ("EXIT_TIME", "EXIT_TIME_STOP"),
         "STOP_HIT": ("EXIT_STOP", "EXIT_STOP_LOSS_HIT"),
         "PULLBACK_INVALIDATION": ("EXIT_STOP", "EXIT_STOP_LOSS_HIT"),
         "MOMENTUM_STOP": ("EXIT_STOP", "EXIT_STOP_LOSS_HIT"),

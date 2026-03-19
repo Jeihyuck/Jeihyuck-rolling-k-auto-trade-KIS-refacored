@@ -1913,6 +1913,31 @@ class FillsRepo:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
+    def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
+        normalized_codes = [str(code or "").zfill(6) for code in (codes or []) if str(code or "").strip()]
+        if not normalized_codes:
+            return {}
+        stmt = (
+            select(self._schema.fills)
+            .where(
+                and_(
+                    self._schema.fills.c.env == _norm_env(env),
+                    self._schema.fills.c.side == "BUY",
+                    self._schema.fills.c.code.in_(normalized_codes),
+                )
+            )
+            .order_by(self._window_expr(self._schema.fills.c.filled_at).desc())
+        )
+        latest: dict[str, dict] = {}
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        for row in rows:
+            item = dict(row)
+            code = str(item.get("code") or "").zfill(6)
+            if code and code not in latest:
+                latest[code] = item
+        return latest
+
     def upsert_fill(
         self,
         *,
