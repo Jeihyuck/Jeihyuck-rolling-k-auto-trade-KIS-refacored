@@ -446,6 +446,38 @@ def resolve_derived_as_of(now: datetime | None = None, cli_as_of: date | str | N
     return derived_as_of
 
 
+def resolve_trade_context(
+    now: datetime | None = None,
+    requested_as_of: date | str | None = None,
+    trade_date: date | str | None = None,
+    env: str = "practice",
+) -> dict[str, str | bool]:
+    now = now or now_kst()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=KST)
+    resolved_trade_date = trade_date if isinstance(trade_date, date) else date.fromisoformat(str(trade_date)) if trade_date else now.date()
+    calendar_prev = resolve_prev_trading_day(resolved_trade_date)
+    resolved_as_of = resolve_derived_as_of(now, cli_as_of=requested_as_of)
+    if requested_as_of is not None:
+        source = "requested_as_of"
+        reason = "REQUESTED_AS_OF_LOCKED"
+    elif (os.getenv("AS_OF_OVERRIDE") or "").strip():
+        source = "env_override"
+        reason = "AS_OF_OVERRIDE"
+    else:
+        source = "intraday_prev_close"
+        reason = "INTRADAY_USE_PREV_CLOSE"
+    return {
+        "trade_date": resolved_trade_date.isoformat(),
+        "as_of": resolved_as_of.isoformat(),
+        "calendar_prev": calendar_prev.isoformat(),
+        "reason": reason,
+        "source": source,
+        "env": str(env or "practice").strip().lower(),
+        "is_locked": True,
+    }
+
+
 class AsOfContext:
     """
     Trade 엔진 입력의 as_of 컨텍스트를 단일 구조로 통일.

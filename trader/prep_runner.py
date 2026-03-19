@@ -53,6 +53,7 @@ from trader.time_utils import (
     is_market_open_kst,
     now_kst,
     prev_business_day,
+    resolve_trade_context,
     resolve_derived_as_of,
 )
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
@@ -236,7 +237,8 @@ def _make_flow_provider(engine):
 
 def _pick_as_of_date_always_prev() -> date:
     """PREP as_of 결정: AS_OF_OVERRIDE 우선, 없으면 전 거래일."""
-    return resolve_derived_as_of(now_kst())
+    trade_ctx = resolve_trade_context(now=now_kst())
+    return date.fromisoformat(str(trade_ctx["as_of"]))
 
 
 def get_required_history_days(strategy_name: str) -> int:
@@ -1596,6 +1598,56 @@ def main() -> int:
             pullback_nonzero,
             momentum_nonzero,
         )
+    prep_dir = RUNTIME_DIR / "prep" / as_of.strftime("%Y-%m-%d")
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    final30_locked_rows = final30_scored_df_for_export.to_dict(orient="records") if isinstance(final30_scored_df_for_export, pd.DataFrame) else []
+    final30_locked_count = len(final30_locked_rows)
+    fallbacks_used: list[str] = []
+    degrade_info = dict(watchlist_bundle.get("degrade", {}) or {})
+    degrade_reason = str(degrade_info.get("reason") or "").strip()
+    if bool(degrade_info.get("used")) and degrade_reason:
+        fallbacks_used.append(degrade_reason)
+    if shortage_reason:
+        fallbacks_used.append(str(shortage_reason))
+    for failure in contract_failures or []:
+        failure_s = str(failure).strip()
+        if failure_s:
+            fallbacks_used.append(failure_s)
+    step_payloads = [
+        {"name": "resolve_as_of", "in": 1, "out": 1, "source": "resolve_trade_context", "fallback": 0, "reason": "", "ok": 1, "can_proceed": 1},
+        {"name": "build_universe", "in": len(bundle_universe), "out": len(bundle_universe), "source": "universe_scored", "fallback": int(bool(degrade_info.get("used"))), "reason": degrade_reason or "", "ok": int(len(bundle_universe) > 0), "can_proceed": int(len(bundle_universe) > 0)},
+        {"name": "build_candidate_pool", "in": len(bundle_universe), "out": len(bundle_pool120), "source": "pool120", "fallback": int(bool(degrade_info.get("used"))), "reason": shortage_reason or "", "ok": int(len(bundle_pool120) >= min(pool_min, max(1, len(bundle_pool120)))), "can_proceed": int(len(bundle_pool120) > 0)},
+        {"name": "build_watchlist", "in": len(bundle_pool120), "out": len(watchlist or []), "source": watchlist_final_strategy, "fallback": int(bool(degrade_info.get("used"))), "reason": shortage_reason or "", "ok": int(len(watchlist or []) >= min(finaln, max(1, len(watchlist or [])))), "can_proceed": int(len(watchlist or []) > 0)},
+        {"name": "build_final30_locked", "in": len(watchlist or []), "out": final30_locked_count, "source": final30_source_label, "fallback": int(bool(fallbacks_used)), "reason": ",".join(fallbacks_used), "ok": int(final30_locked_count >= min(finaln, max(1, final30_locked_count))), "can_proceed": int(final30_locked_count > 0)},
+    ]
+    for step_payload in step_payloads:
+        logger.info(
+            "[PREP][STEP] name=%s in=%s out=%s source=%s fallback=%s ok=%s reason=%s can_proceed=%s",
+            step_payload["name"],
+            step_payload["in"],
+            step_payload["out"],
+            step_payload["source"],
+            step_payload["fallback"],
+            step_payload["ok"],
+            step_payload["reason"],
+            step_payload["can_proceed"],
+        )
+    prep_manifest = {
+        "trade_date": now_kst().date().isoformat(),
+        "as_of": as_of.isoformat(),
+        "universe_count": len(bundle_universe),
+        "candidate_pool_count": len(bundle_pool120),
+        "watchlist_count": len(watchlist or []),
+        "final30_count": final30_locked_count,
+        "fallbacks_used": sorted(set(fallbacks_used)),
+        "build_status": "DEGRADED" if fallbacks_used else "OK",
+        "steps": step_payloads,
+    }
+    (prep_dir / "prep_manifest.json").write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+    (prep_dir / "candidate_pool_snapshot.json").write_text(json.dumps(to_jsonable(bundle_pool120), ensure_ascii=False, indent=2), encoding="utf-8")
+    (prep_dir / "watchlist_snapshot.json").write_text(json.dumps(to_jsonable(watchlist or []), ensure_ascii=False, indent=2), encoding="utf-8")
+    (prep_dir / "final30_locked.json").write_text(json.dumps(to_jsonable(final30_locked_rows), ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[PREP][MANIFEST][SAVE] path=%s status=%s fallbacks=%s", prep_dir / "prep_manifest.json", prep_manifest["build_status"], prep_manifest["fallbacks_used"])
     runtime_exported = False
     logger.info("[PREP][HEARTBEAT] stage=export status=start")
     try:

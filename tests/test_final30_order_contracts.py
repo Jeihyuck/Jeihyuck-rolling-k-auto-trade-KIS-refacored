@@ -95,6 +95,7 @@ def test_scanner_precomputed_requires_real_context_not_score_presence() -> None:
 
     all_codes = [signal.code for signal in result["all"]]
     assert all_codes == ["000002"]
+    assert result["summary"]["setup_ok_count"] == 2
     assert not any(signal.code == "000001" for signal in result["breakout"])
     assert not any(signal.code == "000001" for signal in result["pullback"])
     assert any(signal.code == "000002" for signal in result["momentum"])

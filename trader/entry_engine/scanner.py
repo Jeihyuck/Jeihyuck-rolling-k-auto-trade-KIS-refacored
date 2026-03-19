@@ -11,6 +11,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from trader.decision_schema import build_entry_evaluation, normalize_entry_setup_family
+
 logger = logging.getLogger(__name__)
 
 BREAKOUT_MIN_SCORE = float(os.getenv("ENTRY_SCAN_BREAKOUT_MIN_SCORE", "60") or "60")
@@ -173,8 +175,10 @@ def scan_entry_candidates(
     breakout_pass_count = 0
     pullback_pass_count = 0
     momentum_pass_count = 0
+    setup_ok_count = 0
     multi_pass_count = 0
     none_pass_count = 0
+    evaluations: list[dict[str, Any]] = []
 
     precomputed_map: dict[str, dict[str, Any]] = {}
     if precomputed_final30_df is not None and not precomputed_final30_df.empty and "code" in precomputed_final30_df.columns:
@@ -349,6 +353,42 @@ def scan_entry_candidates(
             )
 
         pass_total = int(breakout_ok) + int(pullback_ok) + int(momentum_ok)
+        selected_style = str(
+            item.get("entry_style_selected")
+            or (precomputed_row or {}).get("entry_style_selected")
+            or item.get("entry_signal")
+            or ""
+        ).strip().upper()
+        selected_family = normalize_entry_setup_family(selected_style)
+        family_setup_ok = {
+            "ENTRY_BREAKOUT": breakout_strength * 100.0 >= BREAKOUT_MIN_SCORE,
+            "ENTRY_PULLBACK": pullback_strength * 100.0 >= PULLBACK_MIN_SCORE,
+            "ENTRY_MOMENTUM": momentum_strength * 100.0 >= MOMENTUM_MIN_SCORE,
+        }.get(selected_family, pass_total > 0)
+        family_trigger_ok = {
+            "ENTRY_BREAKOUT": breakout_ok,
+            "ENTRY_PULLBACK": pullback_ok,
+            "ENTRY_MOMENTUM": momentum_ok,
+        }.get(selected_family, pass_total > 0)
+        evaluation = build_entry_evaluation(
+            code=code,
+            as_of=item.get("as_of") or (precomputed_row or {}).get("as_of") or "",
+            trade_date=os.getenv("TRADE_DATE") or "",
+            input_source="final30_locked" if has_precomputed else "watchlist_scan",
+            setup_ok=family_setup_ok,
+            score_ok=family_setup_ok,
+            risk_ok=True,
+            sizing_ok=True,
+            buyable_ok=True,
+            trigger_ok=family_trigger_ok,
+            order_ready=bool(family_setup_ok and family_trigger_ok),
+            reasons=reasons,
+            setup_family=selected_style,
+            decision_reason="ORDER_READY" if family_setup_ok and family_trigger_ok else (reasons[0] if reasons else "ENTRY_CONDITION_NOT_MET"),
+            features=precomputed_row or item,
+        )
+        evaluations.append(evaluation)
+        setup_ok_count += int(bool(evaluation.get("setup_ok")))
         breakout_pass_count += int(breakout_ok)
         pullback_pass_count += int(pullback_ok)
         momentum_pass_count += int(momentum_ok)
@@ -376,7 +416,7 @@ def scan_entry_candidates(
                 strategy="breakout",
                 close=close,
                 signal_strength=breakout_strength,
-                meta={"high_50": high_50, "volume": vol, "volume_avg20": vol_avg20},
+                meta={"high_50": high_50, "volume": vol, "volume_avg20": vol_avg20, "evaluation": evaluation},
             )
             breakout.append(signal)
             signal_candidates.append(signal)
@@ -387,7 +427,7 @@ def scan_entry_candidates(
                 strategy="pullback",
                 close=close,
                 signal_strength=pullback_strength,
-                meta={"ma50": ma50, "high_52w": high_52w, "pullback_pct": pullback_pct * 100.0},
+                meta={"ma50": ma50, "high_52w": high_52w, "pullback_pct": pullback_pct * 100.0, "evaluation": evaluation},
             )
             pullback.append(signal)
             signal_candidates.append(signal)
@@ -398,7 +438,7 @@ def scan_entry_candidates(
                 strategy="momentum",
                 close=close,
                 signal_strength=momentum_strength,
-                meta={"rs_percentile": rs_percentile, "ma20": ma20, "volume": vol, "volume_avg20": vol_avg20},
+                meta={"rs_percentile": rs_percentile, "ma20": ma20, "volume": vol, "volume_avg20": vol_avg20, "evaluation": evaluation},
             )
             momentum.append(signal)
             signal_candidates.append(signal)
@@ -420,9 +460,10 @@ def scan_entry_candidates(
     total = len([w for w in watchlist if w.get("code")])
 
     logger.info(
-        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
+        "[ENTRY_SCAN][SUMMARY] total=%s passed=%s setup_ok=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
         total,
         passed,
+        setup_ok_count,
         breakout_pass_count,
         pullback_pass_count,
         momentum_pass_count,
@@ -490,6 +531,7 @@ def scan_entry_candidates(
             "summary": {
                 "total": total,
                 "passed": passed,
+                "setup_ok_count": setup_ok_count,
                 "breakout_pass": breakout_pass_count,
                 "pullback_pass": pullback_pass_count,
                 "momentum_pass": momentum_pass_count,
@@ -516,4 +558,20 @@ def scan_entry_candidates(
         len(momentum),
         len(all_signals),
     )
-    return {"breakout": breakout, "pullback": pullback, "momentum": momentum, "all": all_signals}
+    return {
+        "breakout": breakout,
+        "pullback": pullback,
+        "momentum": momentum,
+        "all": all_signals,
+        "evaluations": evaluations,
+        "summary": {
+            "total": total,
+            "passed": passed,
+            "setup_ok_count": setup_ok_count,
+            "breakout_pass": breakout_pass_count,
+            "pullback_pass": pullback_pass_count,
+            "momentum_pass": momentum_pass_count,
+            "multi_pass": multi_pass_count,
+            "none_pass": none_pass_count,
+        },
+    }

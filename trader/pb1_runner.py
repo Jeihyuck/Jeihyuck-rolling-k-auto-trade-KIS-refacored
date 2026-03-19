@@ -90,7 +90,7 @@ from trader.reconcile_db import close_stale_positions
 from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
-from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of, prev_business_day
+from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of, resolve_trade_context, prev_business_day
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode, parse_bool_any
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
@@ -626,6 +626,9 @@ def generate_run_summary_json(
         
         run_summary = getattr(engine, "_run_summary_payload", None) or {}
         debug_summary = getattr(engine, "_debug_summary", {}) or {}
+        scanner_summary = getattr(engine, "_scanner_summary", {}) or {}
+        exit_summary = getattr(engine, "_exit_summary_payload", {}) or {}
+        prep_summary = getattr(engine, "_prep_summary_payload", {}) or {}
         reject_reason_counts = getattr(engine, "reject_reason_counts", {})
         counts = {
             "scanned": int(run_summary.get("scanned", debug_summary.get("scanned_count", 0))),
@@ -650,6 +653,18 @@ def generate_run_summary_json(
             "watchlist_as_of": watchlist_as_of,
             "universe_as_of": universe_as_of,
             "fallback_used": bool(fallback_used),
+            "prep": prep_summary,
+            "scanner": scanner_summary,
+            "entry": {
+                "scanned": counts["scanned"],
+                "setup_ok": counts["setup_ok_count"],
+                "score_ok": counts["after_score_cut_count"],
+                "risk_ok": counts["after_risk_count"],
+                "sized_ok": counts["after_sizing_count"],
+                "buyable_ok": counts["buyable_ok_count"],
+                "submitted": counts["submit_success_count"],
+            },
+            "exit": exit_summary,
             "counts": counts,
             "order_candidate_codes": list(debug_summary.get("order_candidate_codes", []) or []),
             "skip_reason_top": run_summary.get("no_trade_reason") or debug_summary.get("skip_reason_top", "none"),
@@ -659,6 +674,11 @@ def generate_run_summary_json(
             "entry_decision_result": run_summary.get("entry_decision_result"),
             "entry_decision_reason": run_summary.get("entry_decision_reason"),
             "drop_reasons": reject_reason_counts or {},
+            "consistency": {
+                "scanner_setup_ok": int(scanner_summary.get("setup_ok_count", 0)),
+                "engine_setup_ok": counts["setup_ok_count"],
+                "match": int(int(scanner_summary.get("setup_ok_count", 0)) == counts["setup_ok_count"]),
+            },
         }
         
         summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1589,13 +1609,14 @@ def run_once(
     # 장마감 후/비거래일 검증도 동일한 trade 경로를 사용하며,
     # 달라질 수 있는 것은 주문 제출 허용 여부뿐이다.
     # ✅ CRITICAL: Trade는 장중에 "전일 영업일 derived"를 사용
-    trade_date = now.date()
-    derived_as_of_date = resolve_derived_as_of(now)
-    as_of = derived_as_of_date.isoformat()
-    asof_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "INTRADAY_USE_PREV_CLOSE"
+    trade_ctx = resolve_trade_context(now=now, env=kis_env or "practice")
+    trade_date = date.fromisoformat(str(trade_ctx["trade_date"]))
+    as_of = str(trade_ctx["as_of"])
+    asof_reason = str(trade_ctx["reason"])
     run_ctx: dict[str, Any] = {
         "trade_date": trade_date.isoformat(),
         "derived_as_of": as_of,
+        "trade_context": dict(trade_ctx),
         "window_name": "day",
         "phase_name": "entry",
         "final30_source": None,
@@ -2638,6 +2659,19 @@ def run_once(
             getattr(engine_runner, "_trade_date", None),
             getattr(engine_runner, "_as_of_source", None),
         )
+        prep_manifest_path = runtime_root_dir / "prep" / str(run_ctx.get("derived_as_of") or as_of) / "prep_manifest.json"
+        if prep_manifest_path.exists():
+            try:
+                prep_manifest = json.loads(prep_manifest_path.read_text(encoding="utf-8"))
+                setattr(engine_runner, "_prep_summary_payload", dict(prep_manifest))
+                logger.info(
+                    "[PREP][MANIFEST][LOAD] path=%s status=%s final30=%s",
+                    prep_manifest_path,
+                    prep_manifest.get("build_status"),
+                    prep_manifest.get("final30_count"),
+                )
+            except Exception as exc:
+                logger.warning("[PREP][MANIFEST][LOAD_FAIL] path=%s err=%s", prep_manifest_path, exc)
         
         # ✅ ENTRY SCAN: 진입 시그널 스캔 (Phase=entry일 때만)
         entry_signals_result = {}
@@ -2696,6 +2730,9 @@ def run_once(
                         trade_precomputed_only=trade_precomputed_only,
                         data_metrics=(engine_runner._data_metrics if engine_runner else None),
                     )
+                    if engine_runner is not None:
+                        setattr(engine_runner, "_scanner_summary", dict(entry_signals_result.get("summary") or {}))
+                        setattr(engine_runner, "_scanner_evaluations", list(entry_signals_result.get("evaluations") or []))
                     
                     logger.info(
                         "[ENTRY_SCAN] completed - breakout=%s pullback=%s momentum=%s unique=%s",
@@ -2752,6 +2789,27 @@ def run_once(
                 result_reason = result.notes or "NO_ORDER_INTENTS"
             logger.info("[RUN_SUMMARY][RESULT] status=%s reason=%s", result.status, result_reason)
             result.notes = result_reason
+        try:
+            scanner_summary = getattr(engine_runner, "_scanner_summary", {}) or {}
+            run_summary = getattr(engine_runner, "_run_summary_payload", {}) or {}
+            scanner_setup_ok = int(scanner_summary.get("setup_ok_count", 0))
+            engine_setup_ok = int(run_summary.get("setup_ok", 0))
+            if scanner_summary:
+                logger.info(
+                    "[CONSISTENCY][SCAN_ENGINE] scanner_setup_ok=%s engine_setup_ok=%s",
+                    scanner_setup_ok,
+                    engine_setup_ok,
+                )
+            if scanner_summary and scanner_setup_ok != engine_setup_ok:
+                logger.warning(
+                    "[CONSISTENCY][SCAN_ENGINE_MISMATCH] scanner_setup_ok=%s engine_setup_ok=%s scanner_total=%s engine_scanned=%s",
+                    scanner_setup_ok,
+                    engine_setup_ok,
+                    scanner_summary.get("total", 0),
+                    run_summary.get("scanned", 0),
+                )
+        except Exception as exc:
+            logger.warning("[CONSISTENCY][SCAN_ENGINE][FAIL] err=%s", exc)
         
         # ✅ RUN 요약 JSON 생성
         try:
