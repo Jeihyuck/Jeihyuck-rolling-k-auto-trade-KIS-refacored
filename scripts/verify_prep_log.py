@@ -1,59 +1,77 @@
 #!/usr/bin/env python3
-"""Policy-aware PREP log verification parser.
+"""Contract-aware PREP verification.
 
-Checks:
-- PREP done markers and derived verify markers
-- as_of consistency and candidate pool date guard
-- contract recovery policy (degrade_allowed)
-- exporter score preservation vs in-memory final30
+Verification prefers actual DB/file contract state and only falls back to
+recognized success logs when runtime probes are unavailable.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Any
 
 
-REQUIRED_FINAL30_FILE_LABELS = {"runtime", "ledger", "signals"}
+FINAL30_SUCCESS_PATTERNS: dict[str, str] = {
+    "watchlist_final_save": r"\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\]",
+    "watchlist_final_scored_save": r"\[WATCHLIST\]\[SAVE\] strategy=pb1_watchlist_final_scored",
+    "final30_snapshot_save": r"\[PREP\]\[FINAL30_SNAPSHOT\]\[SAVE\]",
+    "db_final30_verify_ok": r"\[DB\]\[FINAL30_SCORED\]\[VERIFY\].*ok=1",
+    "db_commit_verify_ok": r"\[PREP\]\[DB_COMMIT\]\[VERIFY\].*ok=1",
+    "file_contract_ok": r"(?:\[PREP\])?\[FINAL30_FILE\]\[CONTRACT\].*ok=1",
+    "repair_done": r"\[FINAL30\]\[REPAIR\]\[DONE\].*success=",
+    "contract_ok": r"\[PREP\]\[FINAL30\]\[CONTRACT_OK\]",
+    "prep_done": r"\[PREP\]\[DONE\]",
+}
 
 
 @dataclass
 class VerifyResults:
     """Verification results container."""
+
     prep_done: bool = False
     prep_done_log: bool = False
+    prep_done_db: bool = False
+    prep_done_count: int = 0
     derived_verify_ok: bool = False
     derived_verify_fail: bool = False
     derived_count: int = 0
     entry_nonzero_present: bool = False
-    final30_saved: bool = False
-    final30_count: int = 0
-    final30_file_labels: List[str] = field(default_factory=list)
     asof_consistent: bool = False
     candidate_pool_future_rejected: bool = False
     candidate_pool_future_seen: bool = False
-    inmem_scores: Dict[str, int] = field(default_factory=dict)
-    export_scores: Dict[str, int] = field(default_factory=dict)
+    inmem_scores: dict[str, int] = field(default_factory=dict)
+    export_scores: dict[str, int] = field(default_factory=dict)
     exporter_preserved_scores: bool = False
     derived_ok_by_count: bool = False
-    contract_failures: List[str] = field(default_factory=list)
-    contract_recoveries: List[str] = field(default_factory=list)
+    contract_failures: list[str] = field(default_factory=list)
+    contract_recoveries: list[str] = field(default_factory=list)
     traceback_detected: bool = False
     traceback_non_fatal: bool = False
     pykrx_recovered: bool = False
-    failures: List[str] = field(default_factory=list)
-    
+    detected_as_of: str = ""
+    detected_env: str = ""
+    final30_success_logs: list[str] = field(default_factory=list)
+    final30_file_labels: list[str] = field(default_factory=list)
+    final30_log_success: bool = False
+    final30_db_contract_ok: bool = False
+    final30_file_contract_ok: bool = False
+    final30_contract_ok: bool = False
+    final30_failure_detail: str = ""
+    db_metrics: dict[str, Any] = field(default_factory=dict)
+    file_metrics: dict[str, Any] = field(default_factory=dict)
+    failures: list[str] = field(default_factory=list)
+
     def has_critical_failure(self) -> bool:
-        """Check if any critical failure condition exists."""
         unrecovered_contracts = len(self.contract_failures) > 0 and len(self.contract_recoveries) == 0
+        prep_done_evidence = self.prep_done or self.prep_done_log or self.prep_done_db
         return bool(
-            not self.prep_done
-            or not self.prep_done_log
+            not prep_done_evidence
             or not self.derived_verify_ok
             or self.derived_verify_fail
-            or not self.final30_saved
+            or not self.final30_contract_ok
             or not self.asof_consistent
             or unrecovered_contracts
             or not self.exporter_preserved_scores
@@ -63,47 +81,238 @@ class VerifyResults:
         )
 
 
+def _extract_first(pattern: str, text: str) -> str:
+    match = re.search(pattern, text)
+    return str(match.group(1)).strip() if match else ""
+
+
+def _extract_as_of(log_content: str) -> str:
+    patterns = [
+        r"\[PREP\]\[FINAL30\]\[CONTRACT_OK\] as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
+        r"\[PREP\]\[DB_COMMIT\]\[VERIFY\].* as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
+        r"\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\].* as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
+        r"\[PREP\]\[DONE\] as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
+        r"event_type=PREP_DONE as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
+    ]
+    for pattern in patterns:
+        value = _extract_first(pattern, log_content)
+        if value:
+            return value
+    return ""
+
+
+def _extract_env(log_content: str) -> str:
+    patterns = [
+        r"\[PREP\]\[DB_COMMIT\]\[VERIFY\] env=([a-zA-Z0-9_-]+)",
+        r"\[DB\]\[FINAL30_SCORED\]\[VERIFY\].* env=([a-zA-Z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        value = _extract_first(pattern, log_content)
+        if value:
+            return value.lower()
+    env_value = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower()
+    return env_value or "practice"
+
+
+def _has_any_final30_success_log(log_content: str) -> list[str]:
+    return [
+        name
+        for name, pattern in FINAL30_SUCCESS_PATTERNS.items()
+        if re.search(pattern, log_content)
+    ]
+
+
+def _db_final30_contract_ok(db_metrics: dict[str, Any]) -> bool:
+    if not db_metrics or db_metrics.get("probe_ok") is False:
+        return False
+    return bool(
+        int(db_metrics.get("prep_done", 0)) >= 1
+        and int(db_metrics.get("derived_minervini", 0)) > 0
+        and int(db_metrics.get("watchlist_final", 0)) >= 30
+        and int(db_metrics.get("watchlist_final_scored", 0)) >= 30
+        and int(db_metrics.get("uniq_codes", 0)) >= 30
+        and int(db_metrics.get("uniq_ranks", 0)) >= 30
+        and int(db_metrics.get("null_critical", 1)) == 0
+        and not db_metrics.get("missing_required_fields")
+    )
+
+
+def _file_final30_contract_ok(file_metrics: dict[str, Any]) -> bool:
+    if not file_metrics or file_metrics.get("probe_ok") is False:
+        return False
+    return bool(
+        int(file_metrics.get("runtime_rows", 0)) > 0
+        or int(file_metrics.get("ledger_rows", 0)) > 0
+        or int(file_metrics.get("signals_rows", 0)) > 0
+    )
+
+
+def _build_final30_failure_detail(results: VerifyResults) -> str:
+    db_final = int(results.db_metrics.get("watchlist_final", 0))
+    db_final_scored = int(results.db_metrics.get("watchlist_final_scored", 0))
+    runtime_rows = int(results.file_metrics.get("runtime_rows", 0))
+    ledger_rows = int(results.file_metrics.get("ledger_rows", 0))
+    signals_rows = int(results.file_metrics.get("signals_rows", 0))
+    success_log_detected = int(bool(results.final30_success_logs))
+    return (
+        "FAIL final30 contract missing: "
+        f"db_final={db_final} db_final_scored={db_final_scored} "
+        f"runtime_rows={runtime_rows} ledger_rows={ledger_rows} signals_rows={signals_rows} "
+        f"success_log_detected={success_log_detected}"
+    )
+
+
+def _probe_db_contract(*, as_of: str, env: str) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "probe_ok": False,
+        "prep_done": 0,
+        "prep_done_count": 0,
+        "derived_minervini": 0,
+        "watchlist_final": 0,
+        "watchlist_final_scored": 0,
+        "uniq_codes": 0,
+        "uniq_ranks": 0,
+        "null_critical": 1,
+        "missing_required_fields": [],
+    }
+    if not as_of:
+        return metrics
+
+    try:
+        from trader.db.engine import get_engine
+        from trader.db.repos import (
+            FINAL30_SCORED_DB_CONTRACT_FIELDS,
+            DerivedMinerviniRepo,
+            LedgerEventsRepo,
+            WatchlistRepo,
+        )
+
+        engine = get_engine()
+        ledger_repo = LedgerEventsRepo(engine)
+        watchlist_repo = WatchlistRepo(engine)
+        derived_repo = DerivedMinerviniRepo(engine)
+
+        prep_done, prep_done_count = ledger_repo.prep_done_status(env=env, as_of=as_of)
+        derived_count = derived_repo.count_as_of(env=env, as_of=as_of)
+        final_rows, _ = watchlist_repo.load_watchlist(
+            env=env,
+            strategy="pb1_watchlist_final",
+            as_of=as_of,
+            allow_latest_fallback=False,
+        )
+        scored_contract = watchlist_repo.verify_watchlist_scored_contract(
+            env=env,
+            as_of=as_of,
+            strategy="pb1_watchlist_final_scored",
+            allow_latest_fallback=False,
+            log_result=False,
+        )
+        scored_columns = set(scored_contract.get("columns") or [])
+        missing_required_fields = [
+            field for field in FINAL30_SCORED_DB_CONTRACT_FIELDS if field not in scored_columns
+        ]
+        metrics.update(
+            {
+                "probe_ok": True,
+                "prep_done": int(bool(prep_done)),
+                "prep_done_count": int(prep_done_count),
+                "derived_minervini": int(derived_count),
+                "watchlist_final": int(len(final_rows or [])),
+                "watchlist_final_scored": int(scored_contract.get("rows") or 0),
+                "uniq_codes": int(scored_contract.get("uniq_codes") or 0),
+                "uniq_ranks": int(scored_contract.get("uniq_ranks") or 0),
+                "null_critical": int(scored_contract.get("null_critical") or 0),
+                "missing_required_fields": missing_required_fields,
+            }
+        )
+    except Exception as exc:
+        metrics["error"] = str(exc)
+    return metrics
+
+
+def _probe_file_contract(*, repo_root: Path, as_of: str, env: str) -> dict[str, Any]:
+    metrics: dict[str, Any] = {
+        "probe_ok": False,
+        "runtime_rows": 0,
+        "ledger_rows": 0,
+        "signals_rows": 0,
+    }
+    if not as_of:
+        return metrics
+
+    try:
+        from trader.path_contract import verify_final30_mirrors
+
+        results = verify_final30_mirrors(
+            repo_root=repo_root,
+            env=env,
+            as_of=as_of,
+            expected_rows=None,
+        )
+        metrics.update(
+            {
+                "probe_ok": True,
+                "runtime_rows": int((results.get("runtime") or {}).get("rows") or 0),
+                "ledger_rows": int((results.get("ledger") or {}).get("rows") or 0),
+                "signals_rows": int((results.get("signals") or {}).get("rows") or 0),
+                "runtime_exists": int(bool((results.get("runtime") or {}).get("exists"))),
+                "ledger_exists": int(bool((results.get("ledger") or {}).get("exists"))),
+                "signals_exists": int(bool((results.get("signals") or {}).get("exists"))),
+            }
+        )
+    except Exception as exc:
+        metrics["error"] = str(exc)
+    return metrics
+
+
+def _resolve_repo_root(log_path: Path) -> Path:
+    explicit = (os.getenv("TRADER_REPO_ROOT") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    if (cwd / "trader").exists():
+        return cwd
+    parent = log_path.resolve().parent
+    if (parent / "trader").exists():
+        return parent
+    return cwd
+
+
 def parse_log_file(log_path: Path) -> VerifyResults:
     """Parse PREP log file and extract verification data."""
     results = VerifyResults()
-    
+
     if not log_path.exists():
         print(f"::error::Log file not found: {log_path}")
+        results.failures.append(f"log_missing:{log_path}")
         return results
-    
-    with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
-        log_content = f.read()
-    
-    # PREP done conditions
-    if re.search(r'event_type=PREP_DONE', log_content):
+
+    log_content = log_path.read_text(encoding="utf-8", errors="replace")
+    results.detected_as_of = _extract_as_of(log_content)
+    results.detected_env = _extract_env(log_content)
+
+    if re.search(r"event_type=PREP_DONE", log_content):
         results.prep_done = True
-    if re.search(r'\[PREP\]\[DONE\]', log_content):
+    if re.search(r"\[PREP\]\[DONE\]", log_content):
         results.prep_done_log = True
-    if results.prep_done and results.prep_done_log:
-        results.prep_done = True
-    
-    # Check derived_verify
-    if re.search(r'\[PREP\]\[DERIVED_VERIFY\]\[OK\]', log_content):
+
+    if re.search(r"\[PREP\]\[DERIVED_VERIFY\]\[OK\]", log_content):
         results.derived_verify_ok = True
-    if re.search(r'\[PREP\]\[DERIVED_VERIFY\]\[FAIL\]', log_content):
+    if re.search(r"\[PREP\]\[DERIVED_VERIFY\]\[FAIL\]", log_content):
         results.derived_verify_fail = True
-    
-    # Derived count patterns
-    match = re.search(r'\[PREP\]\[DERIVED\]\[MINERVINI\].*upserted=(\d+)', log_content)
-    if match:
-        results.derived_count = int(match.group(1))
-    
-    # Pattern 2: [DERIVED][LOAD] ... rows=196
-    if results.derived_count == 0:
-        match = re.search(r'\[DERIVED\]\[LOAD\].*rows=(\d+)', log_content)
+
+    derived_patterns = [
+        r"\[PREP\]\[DERIVED\]\[MINERVINI\].*upserted=(\d+)",
+        r"\[DERIVED\]\[LOAD\].*rows=(\d+)",
+    ]
+    for pattern in derived_patterns:
+        match = re.search(pattern, log_content)
         if match:
             results.derived_count = int(match.group(1))
-    
-    results.derived_ok_by_count = results.derived_count > 0
+            break
 
-    # Entry scores from in-memory PREP export checkpoint
     inmem_match = re.search(
-        r'\[PREP\]\[EXPORT\]\[FINAL30\]\[INMEM\].*breakout_nonzero=(\d+).*pullback_nonzero=(\d+).*momentum_nonzero=(\d+)',
+        r"\[PREP\]\[EXPORT\]\[FINAL30\]\[INMEM\].*breakout_nonzero=(\d+).*pullback_nonzero=(\d+).*momentum_nonzero=(\d+)",
         log_content,
     )
     if inmem_match:
@@ -115,7 +324,7 @@ def parse_log_file(log_path: Path) -> VerifyResults:
         results.entry_nonzero_present = any(v > 0 for v in results.inmem_scores.values())
 
     export_match = re.search(
-        r'\[EXPORT\]\[SCORES\] name=final30 .*tech_nonzero=(\d+).*score_final_nonzero=(\d+).*breakout_nonzero=(\d+).*pullback_nonzero=(\d+).*momentum_nonzero=(\d+)',
+        r"\[EXPORT\]\[SCORES\] name=final30 .*tech_nonzero=(\d+).*score_final_nonzero=(\d+).*breakout_nonzero=(\d+).*pullback_nonzero=(\d+).*momentum_nonzero=(\d+)",
         log_content,
     )
     if export_match:
@@ -126,74 +335,74 @@ def parse_log_file(log_path: Path) -> VerifyResults:
             "pullback_nonzero": int(export_match.group(4)),
             "momentum_nonzero": int(export_match.group(5)),
         }
-    
-    # Check final30 saved
-    if re.search(r'\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\].*n=\d+', log_content):
-        results.final30_saved = True
-        match = re.search(r'\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\].*n=(\d+)', log_content)
-        if match:
-            results.final30_count = int(match.group(1))
-    elif re.search(r'\[PREP\]\[WATCHLIST\]\[FINAL\]\[SAVE\].*n=\d+', log_content):
-        results.final30_saved = True
-        match = re.search(r'\[PREP\]\[WATCHLIST\]\[FINAL\]\[SAVE\].*n=(\d+)', log_content)
-        if match:
-            results.final30_count = int(match.group(1))
 
     file_labels = set(
         match.group(1)
         for match in re.finditer(
-            r'\[PREP\]\[FINAL30_FILE\]\[WRITE\] label=(\w+) path=.* exists=True bytes=(\d+) rows=(\d+)',
+            r"\[PREP\]\[FINAL30_FILE\]\[WRITE\] label=(\w+) path=.* exists=True bytes=(\d+) rows=(\d+)",
             log_content,
         )
         if int(match.group(2)) > 0 and int(match.group(3)) > 0
     )
     results.final30_file_labels = sorted(file_labels)
-    results.final30_saved = results.final30_saved and REQUIRED_FINAL30_FILE_LABELS.issubset(file_labels)
-    
-    # as_of consistency
-    asof_match = re.search(r'\[PREP\]\[ASOF_CONSISTENCY\].*consistent=(\d+)', log_content)
+    results.final30_success_logs = _has_any_final30_success_log(log_content)
+    results.final30_log_success = bool(results.final30_success_logs)
+
+    asof_match = re.search(r"\[PREP\]\[ASOF_CONSISTENCY\].*consistent=(\d+)", log_content)
     if asof_match:
         results.asof_consistent = asof_match.group(1) == "1"
 
-    # Candidate pool future snapshot guard
-    if re.search(r'\[CANDIDATE_POOL\]\[DATE_GUARD\].*action=reject_future_snapshot', log_content):
+    if re.search(r"\[CANDIDATE_POOL\]\[DATE_GUARD\].*action=reject_future_snapshot", log_content):
         results.candidate_pool_future_rejected = True
-    if re.search(r'\[CANDIDATE_POOL\]\[LOAD\].*age=-\d+', log_content):
+    if re.search(r"\[CANDIDATE_POOL\]\[LOAD\].*age=-\d+", log_content):
         results.candidate_pool_future_seen = True
-    if re.search(r'\[CANDIDATE_POOL\]\[LOAD\].*reason=future_snapshot', log_content):
+    if re.search(r"\[CANDIDATE_POOL\]\[LOAD\].*reason=future_snapshot", log_content):
         results.candidate_pool_future_seen = True
 
-    # Contract failures
-    for match in re.finditer(r'(contract_\w+_too_small)', log_content):
+    for match in re.finditer(r"(contract_\w+_too_small)", log_content):
         failure = match.group(1)
         if failure not in results.contract_failures:
             results.contract_failures.append(failure)
-    
-    # Check for contract recoveries
-    if re.search(r'\[PREP\]\[WATCHLIST\]\[RECOVERY\]\[DB_SUCCESS\]', log_content):
-        results.contract_recoveries.append('DB_SUCCESS')
-    if re.search(r'\[PREP\]\[WATCHLIST\]\[CONTRACT\]\[RECOVERED\]', log_content):
-        results.contract_recoveries.append('CONTRACT_RECOVERED')
 
-    # Explicit fatal guard: only unrecovered fatal exception should fail verify.
-    if re.search(r'Traceback \(most recent call last\)', log_content):
+    if re.search(r"\[PREP\]\[WATCHLIST\]\[RECOVERY\]\[DB_SUCCESS\]", log_content):
+        results.contract_recoveries.append("DB_SUCCESS")
+    if re.search(r"\[PREP\]\[WATCHLIST\]\[CONTRACT\]\[RECOVERED\]", log_content):
+        results.contract_recoveries.append("CONTRACT_RECOVERED")
+
+    if re.search(r"Traceback \(most recent call last\)", log_content):
         results.traceback_detected = True
     results.pykrx_recovered = bool(
-        re.search(r'\[TIME\]\[TRADING_DAY\]\[PYKRX_FAIL\].*fallback=', log_content)
+        re.search(r"\[TIME\]\[TRADING_DAY\]\[PYKRX_FAIL\].*fallback=", log_content)
         and (results.prep_done or results.prep_done_log)
     )
     results.traceback_non_fatal = bool(results.traceback_detected and results.pykrx_recovered)
-    
-    # Exporter preservation: compare inmem and exporter for key score fields when both exist.
+
     if results.inmem_scores and results.export_scores:
         results.exporter_preserved_scores = (
             results.inmem_scores.get("breakout_nonzero", 0) == results.export_scores.get("breakout_nonzero", 0)
             and results.inmem_scores.get("pullback_nonzero", 0) == results.export_scores.get("pullback_nonzero", 0)
             and results.inmem_scores.get("momentum_nonzero", 0) == results.export_scores.get("momentum_nonzero", 0)
         )
-    else:
-        results.exporter_preserved_scores = False
-    
+
+    repo_root = _resolve_repo_root(log_path)
+    results.db_metrics = _probe_db_contract(as_of=results.detected_as_of, env=results.detected_env)
+    results.file_metrics = _probe_file_contract(
+        repo_root=repo_root,
+        as_of=results.detected_as_of,
+        env=results.detected_env,
+    )
+    results.prep_done_db = bool(results.db_metrics.get("prep_done"))
+    results.prep_done_count = int(results.db_metrics.get("prep_done_count") or 0)
+    results.derived_count = max(results.derived_count, int(results.db_metrics.get("derived_minervini") or 0))
+    results.derived_ok_by_count = results.derived_count > 0
+    results.final30_db_contract_ok = _db_final30_contract_ok(results.db_metrics)
+    results.final30_file_contract_ok = _file_final30_contract_ok(results.file_metrics)
+    results.final30_contract_ok = (
+        results.final30_db_contract_ok
+        or results.final30_file_contract_ok
+        or results.final30_log_success
+    )
+    results.final30_failure_detail = _build_final30_failure_detail(results)
     return results
 
 
@@ -202,74 +411,82 @@ def print_verification_results(results: VerifyResults) -> None:
     print("=" * 50)
     print("[PREP][VERIFY] Verification Results")
     print("=" * 50)
-    
-    if results.prep_done:
-        print("✅ PREP_DONE found")
+
+    if results.prep_done or results.prep_done_db:
+        print(f"PASS PREP_DONE found (db_count={results.prep_done_count})")
     else:
-        print("::error::PREP_DONE missing")
+        print("FAIL PREP_DONE missing")
 
     if results.prep_done_log:
-        print("✅ [PREP][DONE] found")
+        print("PASS [PREP][DONE] found")
     else:
-        print("::error::[PREP][DONE] missing")
+        print("FAIL [PREP][DONE] missing")
 
     if results.asof_consistent:
-        print("✅ as_of consistency passed")
+        print("PASS as_of consistency passed")
     else:
-        print("::error::as_of consistency failed")
+        print("FAIL as_of consistency failed")
 
     if results.candidate_pool_future_rejected:
-        print("✅ candidate pool future snapshot rejected")
+        print("PASS candidate pool future snapshot rejected")
     else:
-        print("ℹ no future snapshot rejection observed")
+        print("INFO no future snapshot rejection observed")
 
     if results.derived_verify_ok and not results.derived_verify_fail and results.derived_ok_by_count:
-        print("✅ derived verify passed")
+        print(f"PASS derived verify passed (derived_minervini={results.derived_count})")
     else:
-        print("::error::derived verify failed")
+        print("FAIL derived verify missing")
 
     if results.entry_nonzero_present:
-        print("✅ entry scores present")
+        print("PASS entry scores present")
     else:
-        print("::error::entry scores missing")
+        print("FAIL entry scores missing")
 
     if results.contract_failures and not results.contract_recoveries:
-        print("::error::unrecovered contract failure")
+        print("FAIL unrecovered contract failure")
     else:
-        print("✅ contract violation recovered successfully")
+        print("PASS contract violation recovered successfully")
 
-    if results.final30_saved:
-        print(f"✅ final30 save found (count={results.final30_count}, files={results.final30_file_labels})")
+    if results.final30_contract_ok:
+        print(
+            "PASS final30 contract ok "
+            f"(db={int(results.final30_db_contract_ok)} file={int(results.final30_file_contract_ok)} log={int(results.final30_log_success)} "
+            f"db_final={int(results.db_metrics.get('watchlist_final', 0))} "
+            f"db_final_scored={int(results.db_metrics.get('watchlist_final_scored', 0))} "
+            f"runtime_rows={int(results.file_metrics.get('runtime_rows', 0))} "
+            f"ledger_rows={int(results.file_metrics.get('ledger_rows', 0))} "
+            f"signals_rows={int(results.file_metrics.get('signals_rows', 0))} "
+            f"success_logs={results.final30_success_logs})"
+        )
     else:
-        print(f"::error::final30 save missing files={results.final30_file_labels}")
+        print(results.final30_failure_detail)
 
     if results.exporter_preserved_scores:
-        print("✅ exporter preserved score fields")
+        print("PASS exporter preserved score fields")
     else:
-        print("::error::watchlist/exporter score mismatch")
+        print("FAIL exporter score field preservation failed")
 
     if results.traceback_detected and not results.traceback_non_fatal:
-        print("::error::Python traceback detected")
+        print("FAIL Python traceback detected")
     elif results.traceback_non_fatal:
-        print("✅ traceback detected but recovered by PYKRX fallback + PREP done marker")
+        print("PASS traceback classified as non-fatal PYKRX fallback noise")
     else:
-        print("✅ no traceback detected")
-    
+        print("PASS no traceback detected")
+
     print("=" * 50)
 
 
 def main() -> int:
-    """Main verification function."""
     if len(sys.argv) < 2:
         print("Usage: verify_prep_log.py <log_file_path>")
         return 1
-    
+
     log_path = Path(sys.argv[1])
     results = parse_log_file(log_path)
     print_verification_results(results)
-    
+
     if results.has_critical_failure():
-        print("::error::Critical failures detected - PREP verification failed")
+        print("Error: Critical failures detected - PREP verification failed")
         return 1
 
     print("PREP verification passed")

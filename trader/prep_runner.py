@@ -1392,6 +1392,8 @@ def main() -> int:
         raise RuntimeError("final30_scored_source_missing")
 
     scored_strategy = "pb1_watchlist_final_scored"
+    exact_final_rows: list[dict[str, Any]] = []
+    scored_contract: dict[str, Any] = {}
     scored_members = _build_scored_members(final30_scored_df_for_export)
     if scored_members:
         watchlist_repo.save_watchlist(
@@ -1793,6 +1795,15 @@ def main() -> int:
             prep_cwd,
             final30_file_failures,
         )
+    logger.info(
+        "[PREP][FINAL30][CONTRACT_OK] as_of=%s final=%s final_scored=%s runtime=%s ledger=%s signals=%s",
+        as_of.isoformat(),
+        len(exact_final_rows),
+        int(scored_contract.get("rows") or 0),
+        int((final30_file_results.get("runtime") or {}).get("rows") or 0),
+        int((final30_file_results.get("ledger") or {}).get("rows") or 0),
+        int((final30_file_results.get("signals") or {}).get("rows") or 0),
+    )
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:

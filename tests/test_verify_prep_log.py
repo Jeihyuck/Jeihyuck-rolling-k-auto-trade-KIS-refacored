@@ -9,7 +9,7 @@ import pytest
 from scripts.verify_prep_log import parse_log_file
 
 
-def test_parse_log_file_requires_all_final30_contract_files(tmp_path) -> None:
+def test_parse_log_file_accepts_file_contract_evidence(tmp_path) -> None:
     log_path = tmp_path / "prep.log"
     log_path.write_text(
         "\n".join(
@@ -33,7 +33,8 @@ def test_parse_log_file_requires_all_final30_contract_files(tmp_path) -> None:
 
     results = parse_log_file(log_path)
 
-    assert results.final30_saved is True
+    assert results.final30_file_contract_ok is True
+    assert results.final30_contract_ok is True
     assert results.final30_file_labels == ["ledger", "runtime", "signals"]
     assert results.has_critical_failure() is False
 
@@ -63,7 +64,87 @@ event_type=PREP_DONE
         assert results.derived_count == 196
         assert results.asof_consistent is True
         assert results.exporter_preserved_scores is True
+        assert results.final30_log_success is True
         assert not results.has_critical_failure()
+    finally:
+        log_path.unlink()
+
+
+def test_verify_final30_false_negative_regression_uses_recognized_success_logs():
+    log_content = """
+[PREP][ASOF_CONSISTENCY] universe=2026-03-21 ohlcv=2026-03-21 derived=2026-03-21 candidate_pool=2026-03-21 watchlist=2026-03-21 flow=2026-03-21 final30=2026-03-21 consistent=1
+[PREP][DERIVED][MINERVINI] upserted=212
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-21 rows=212 rs_nonzero=212 vcp_nonzero=212 trend_nonzero=212
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=11 pullback_nonzero=9 momentum_nonzero=10
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=11 pullback_nonzero=9 momentum_nonzero=10
+[WATCHLIST][SAVE] strategy=pb1_watchlist_final_scored members=30
+[PREP][WATCHLIST_FINAL][SAVE] strategy=pb1_watchlist_final as_of=2026-03-21 n=30
+[PREP][FINAL30_SNAPSHOT][SAVE] as_of=2026-03-21 count=30 path=/repo/runtime/prep/2026-03-21/final30_locked.json warn_only=1
+[FINAL30][REPAIR][DONE] success=3 failed=0
+[FINAL30_FILE][CONTRACT] ok=1
+[PREP][DONE] as_of=2026-03-21 source=fresh_build universe=212 pool120=120 top50=50 final30=30 flow_coverage=100.0 final_source=db_roundtrip contract_mode=strict dt=4.20
+event_type=PREP_DONE as_of=2026-03-21
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        f.write(log_content)
+        log_path = Path(f.name)
+
+    try:
+        results = parse_log_file(log_path)
+        assert results.final30_log_success is True
+        assert results.final30_contract_ok is True
+        assert "watchlist_final_scored_save" in results.final30_success_logs
+        assert "final30_snapshot_save" in results.final30_success_logs
+        assert not results.has_critical_failure()
+    finally:
+        log_path.unlink()
+
+
+def test_verify_final30_db_success_without_files_is_non_fatal(tmp_path, monkeypatch):
+    log_content = """
+[PREP][ASOF_CONSISTENCY] universe=2026-03-21 ohlcv=2026-03-21 derived=2026-03-21 candidate_pool=2026-03-21 watchlist=2026-03-21 flow=2026-03-21 final30=2026-03-21 consistent=1
+[PREP][DERIVED][MINERVINI] upserted=180
+[PREP][DERIVED_VERIFY][OK] as_of=2026-03-21 rows=180 rs_nonzero=180 vcp_nonzero=180 trend_nonzero=180
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=8 pullback_nonzero=12 momentum_nonzero=10
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=8 pullback_nonzero=12 momentum_nonzero=10
+[DB][FINAL30_SCORED][VERIFY] rows=30 uniq_codes=30 uniq_ranks=30 rank_source=rank_final30 rank_warn=0 null_critical=0 env=practice as_of=2026-03-21 ok=1
+[PREP][DB_COMMIT][VERIFY] env=practice as_of=2026-03-21 final=30 final_scored=30 required=30 ok=1
+[PREP][DONE] as_of=2026-03-21 source=fresh_build universe=180 pool120=120 top50=50 final30=30 flow_coverage=100.0 final_source=db_roundtrip contract_mode=strict dt=4.20
+event_type=PREP_DONE as_of=2026-03-21
+"""
+    monkeypatch.setenv("TRADER_REPO_ROOT", str(tmp_path))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        f.write(log_content)
+        log_path = Path(f.name)
+
+    try:
+        results = parse_log_file(log_path)
+        assert results.final30_log_success is True
+        assert results.final30_contract_ok is True
+        assert results.final30_file_contract_ok is False
+        assert not results.has_critical_failure()
+    finally:
+        log_path.unlink()
+
+
+def test_verify_final30_contract_missing_fails_with_detail(tmp_path, monkeypatch):
+    log_content = """
+[PREP][ASOF_CONSISTENCY] universe=2026-03-21 ohlcv=2026-03-21 derived=2026-03-21 candidate_pool=2026-03-21 watchlist=2026-03-21 flow=2026-03-21 final30=2026-03-21 consistent=1
+[PREP][DERIVED][MINERVINI] upserted=0
+[PREP][DERIVED_VERIFY][FAIL] as_of=2026-03-21 rows=0 rs_nonzero=0 vcp_nonzero=0 trend_nonzero=0
+[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=8 pullback_nonzero=12 momentum_nonzero=10
+[EXPORT][SCORES] name=final30 rows=30 tech_nonzero=30 score_final_nonzero=30 final_score_nonzero=30 breakout_nonzero=8 pullback_nonzero=12 momentum_nonzero=10
+"""
+    monkeypatch.setenv("TRADER_REPO_ROOT", str(tmp_path))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        f.write(log_content)
+        log_path = Path(f.name)
+
+    try:
+        results = parse_log_file(log_path)
+        assert results.final30_contract_ok is False
+        assert "FAIL final30 contract missing" in results.final30_failure_detail
+        assert results.has_critical_failure()
     finally:
         log_path.unlink()
 

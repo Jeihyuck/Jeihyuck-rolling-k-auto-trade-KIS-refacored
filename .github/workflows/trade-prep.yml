@@ -251,7 +251,7 @@ jobs:
             exit 0
           fi
 
-          bash .github/workflows/scripts/verify_prep.sh prep.log
+          python scripts/verify_prep_log.py prep.log
 
       - name: Scan for SQLite artifacts
         if: always()
