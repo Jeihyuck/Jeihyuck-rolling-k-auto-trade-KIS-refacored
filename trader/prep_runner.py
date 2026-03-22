@@ -17,6 +17,7 @@ from trader.db.health import assert_db_ready
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
     CRITICAL_SCORED_COLS,
+    FINAL30_SCORED_REQUIRED_ROWS,
     REQUIRED_FINAL30_SCORED_COLS,
     LedgerEventsRepo,
     UniverseRepo,
@@ -392,14 +393,15 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
             exists == 1
             and bytes_written > 0
             and json_ok == 1
-            and rows == len(payload)
+            and len(payload) == FINAL30_SCORED_REQUIRED_ROWS
+            and rows == FINAL30_SCORED_REQUIRED_ROWS
             and set(CRITICAL_SCORED_COLS).issubset(set(detected_critical_cols))
         )
         file_results[label] = info
         success_count += int(bool(info.get("ok")))
         failed_count += int(not bool(info.get("ok")))
         logger.info(
-            "[PREP][FINAL30_SCORED][VERIFY] source=%s path=%s exists=%s bytes=%s json_ok=%s rows=%s critical_cols=%s",
+            "[PREP][FINAL30_SCORED][FILE_VERIFY] source=%s path=%s exists=%s bytes=%s json_ok=%s rows=%s critical_cols=%s",
             label,
             path,
             exists,
@@ -1459,11 +1461,14 @@ def main() -> int:
             and not critical_missing_fields
         )
         logger.info(
-            "[PREP][DB_COMMIT][VERIFY] env=%s as_of=%s final=%s final_scored=%s required=30 ok=%s",
+            "[PREP][FINAL30_SCORED][DB_VERIFY] env=%s as_of=%s final=%s final_scored=%s uniq_codes=%s uniq_ranks=%s null_critical=%s required=30 ok=%s",
             env,
             as_of.isoformat(),
             len(exact_final_rows),
             scored_contract.get("rows"),
+            scored_contract.get("uniq_codes"),
+            scored_contract.get("uniq_ranks"),
+            scored_contract.get("null_critical"),
             int(db_commit_ok),
         )
         if scored_contract.get("rank_warn"):
@@ -1784,26 +1789,31 @@ def main() -> int:
     ]
     final30_file_contract_ok = len(final30_scored_df_for_export) > 0 and not final30_file_failures
     logger.info(
-        "[PREP][FINAL30_FILE][CONTRACT] ok=%s warn_only=1 failures=%s",
+        "[PREP][FINAL30_SCORED][FILE_VERIFY] ok=%s failures=%s runtime=%s ledger=%s signals=%s",
         int(final30_file_contract_ok),
         final30_file_failures,
-    )
-    if final30_file_failures:
-        logger.warning(
-            "[PREP][FINAL30_FILE][WARN] repo_root=%s cwd=%s failures=%s",
-            prep_repo_root,
-            prep_cwd,
-            final30_file_failures,
-        )
-    logger.info(
-        "[PREP][FINAL30][CONTRACT_OK] as_of=%s final=%s final_scored=%s runtime=%s ledger=%s signals=%s",
-        as_of.isoformat(),
-        len(exact_final_rows),
-        int(scored_contract.get("rows") or 0),
         int((final30_file_results.get("runtime") or {}).get("rows") or 0),
         int((final30_file_results.get("ledger") or {}).get("rows") or 0),
         int((final30_file_results.get("signals") or {}).get("rows") or 0),
     )
+    if final30_file_failures:
+        logger.error(
+            "[PREP][FINAL30_FILE][FAIL] repo_root=%s cwd=%s failures=%s",
+            prep_repo_root,
+            prep_cwd,
+            final30_file_failures,
+        )
+    strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or [])
+    if bool(scored_contract) and final30_file_contract_ok:
+        logger.info(
+            "[PREP][FINAL30_SCORED][CONTRACT_OK] as_of=%s final=%s final_scored=%s runtime=%s ledger=%s signals=%s",
+            as_of.isoformat(),
+            len(exact_final_rows),
+            int(scored_contract.get("rows") or 0),
+            int((final30_file_results.get("runtime") or {}).get("rows") or 0),
+            int((final30_file_results.get("ledger") or {}).get("rows") or 0),
+            int((final30_file_results.get("signals") or {}).get("rows") or 0),
+        )
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:
@@ -1896,6 +1906,14 @@ def main() -> int:
             as_of,
         )
 
+    if strict_contract_failures:
+        prep_status = "FAIL"
+        logger.error(
+            "[PREP][FINAL30_SCORED][CONTRACT_FAIL] as_of=%s failures=%s",
+            as_of.isoformat(),
+            strict_contract_failures,
+        )
+
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
     flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
@@ -1956,7 +1974,7 @@ def main() -> int:
             "final_size": len(watchlist or []),
             "runtime_exported": runtime_exported,
             "flow_coverage": flow_coverage,
-            "contract_failures": contract_failures,
+            "contract_failures": strict_contract_failures,
             "contract_mode": contract_mode,
             "final30_file_contract_ok": final30_file_contract_ok,
             "final30_file_failures": final30_file_failures,
@@ -1982,13 +2000,13 @@ def main() -> int:
             event_type="PREP_FAIL",
             ts=now_kst(),
             ok=False,
-            reasons=contract_failures + ["flow_coverage_too_low" if flow_coverage < 0.5 else ""],
+            reasons=strict_contract_failures + (["flow_coverage_too_low"] if flow_coverage < 0.5 else []),
             payload_json=payload,
         )
         logger.error(
             "[LEDGER_EVENT] event_type=PREP_FAIL as_of=%s contract_failures=%s flow_coverage=%.1f%%",
             as_of.isoformat(),
-            contract_failures,
+            strict_contract_failures,
             flow_coverage * 100.0,
         )
         return 1
@@ -2002,13 +2020,13 @@ def main() -> int:
             event_type="PREP_DEGRADED",
             ts=now_kst(),
             ok=False,
-            reasons=contract_failures + ["flow_coverage_degraded" if flow_coverage < 0.8 else ""],
+            reasons=(strict_contract_failures or []) + (["flow_coverage_degraded"] if flow_coverage < 0.8 else []),
             payload_json=payload,
         )
         logger.warning(
             "[LEDGER_EVENT] event_type=PREP_DEGRADED as_of=%s contract_failures=%s flow_coverage=%.1f%%",
             as_of.isoformat(),
-            contract_failures,
+            strict_contract_failures,
             flow_coverage * 100.0,
         )
         if allow_degraded_prep:

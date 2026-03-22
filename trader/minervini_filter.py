@@ -408,6 +408,14 @@ def select_buyable_with_relax(
         len(chosen_codes),
         chosen_codes,
     )
+    genuine_pass_count = int(pass_counts.get("pass0") or 0)
+    degraded_rank_only_count = sum(1 for state in selected_states.values() if state == "rank_only_fallback")
+    logger.info(
+        "[MINERVINI][RELAX][SUMMARY] genuine_pass=%s degraded_rank_only=%s final_selected=%s",
+        genuine_pass_count,
+        degraded_rank_only_count,
+        len(chosen_codes),
+    )
 
     report = {
         "relax_level_used": used_level,

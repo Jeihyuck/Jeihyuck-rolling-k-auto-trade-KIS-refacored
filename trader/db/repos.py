@@ -122,6 +122,11 @@ CRITICAL_SCORED_COLS = [
     "rs_percentile",
     "vcp_score",
     "entry_style_selected",
+    "ma20",
+    "ma50",
+    "ma150",
+    "close",
+    "atr_pct",
 ]
 
 FINAL30_SCORED_DB_CONTRACT_FIELDS = [
@@ -129,6 +134,7 @@ FINAL30_SCORED_DB_CONTRACT_FIELDS = [
     "as_of",
     "rank_final30",
     "score_final",
+    "tech_score",
     "breakout_score",
     "pullback_score",
     "momentum_score",

@@ -21,6 +21,11 @@ REQUIRED = {
     "rs_percentile",
     "vcp_score",
     "entry_style_selected",
+    "ma20",
+    "ma50",
+    "ma150",
+    "close",
+    "atr_pct",
 }
 
 
@@ -38,16 +43,30 @@ def _scored_row(code: str) -> dict:
         "rs_percentile": 85.0,
         "vcp_score": 75.0,
         "entry_style_selected": "breakout",
+        "ma20": 100.0,
+        "ma50": 95.0,
+        "ma150": 90.0,
+        "close": 101.0,
+        "atr_pct": 0.03,
     }
 
 
-def test_load_trade_final30_scored_prefers_db_contract_over_file(tmp_path, monkeypatch):
+def _scored_rows(n: int = 30) -> list[dict]:
+    return [_scored_row(f"{idx + 1:06d}") | {"rank_final30": idx + 1} for idx in range(n)]
+
+
+def _patch_repo_root(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
     monkeypatch.setattr(pb1_runner, "repo_root", lambda: tmp_path)
+    monkeypatch.setattr(pb1_runner, "resolve_repo_root", lambda: tmp_path)
+
+
+def test_load_trade_final30_scored_prefers_db_contract_over_file(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
     as_of = "2026-03-11"
     path = tmp_path / "runtime" / "watchlist" / as_of / "final30_scored.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [_scored_row("005930")]
+    payload = _scored_rows()
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     class FakeRepo:
@@ -55,15 +74,15 @@ def test_load_trade_final30_scored_prefers_db_contract_over_file(tmp_path, monke
             pass
 
         def verify_watchlist_scored_contract(self, **_kwargs):
-            row = _scored_row("000660")
             return {
                 "ok": True,
-                "rows": 1,
-                "uniq_codes": 1,
-                "uniq_ranks": 1,
+                "rows": 30,
+                "uniq_codes": 30,
+                "uniq_ranks": 30,
                 "null_critical": 0,
                 "missing_fields": [],
-                "rows_data": [row],
+                "columns": list(REQUIRED),
+                "rows_data": _scored_rows(),
             }
 
         def load_watchlist(self, **_kwargs):
@@ -80,23 +99,22 @@ def test_load_trade_final30_scored_prefers_db_contract_over_file(tmp_path, monke
 
 
 def test_load_trade_final30_scored_uses_db_scored_when_file_missing(tmp_path, monkeypatch):
-    monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(pb1_runner, "repo_root", lambda: tmp_path)
+    _patch_repo_root(monkeypatch, tmp_path)
 
     class FakeRepo:
         def __init__(self, *_args, **_kwargs):
             pass
 
         def verify_watchlist_scored_contract(self, **_kwargs):
-            row = _scored_row("000660")
             return {
                 "ok": True,
-                "rows": 1,
-                "uniq_codes": 1,
-                "uniq_ranks": 1,
+                "rows": 30,
+                "uniq_codes": 30,
+                "uniq_ranks": 30,
                 "null_critical": 0,
                 "missing_fields": [],
-                "rows_data": [row],
+                "columns": list(REQUIRED),
+                "rows_data": _scored_rows(),
             }
 
         def load_watchlist(self, *, strategy, **_kwargs):
@@ -113,8 +131,7 @@ def test_load_trade_final30_scored_uses_db_scored_when_file_missing(tmp_path, mo
 
 
 def test_load_trade_final30_scored_blocks_plain_fallback_by_default(tmp_path, monkeypatch):
-    monkeypatch.setattr(runtime_paths, "repo_root", lambda: tmp_path)
-    monkeypatch.setattr(pb1_runner, "repo_root", lambda: tmp_path)
+    _patch_repo_root(monkeypatch, tmp_path)
     monkeypatch.delenv("TRADE_ALLOW_PLAIN_WATCHLIST_FALLBACK", raising=False)
 
     class FakeRepo:
@@ -129,6 +146,7 @@ def test_load_trade_final30_scored_blocks_plain_fallback_by_default(tmp_path, mo
                 "uniq_ranks": 0,
                 "null_critical": 0,
                 "missing_fields": ["score_final"],
+                "columns": ["code"],
                 "rows_data": [],
             }
 
@@ -145,6 +163,63 @@ def test_load_trade_final30_scored_blocks_plain_fallback_by_default(tmp_path, mo
 
     assert result["df"].empty
     assert result["source_name"] == "none"
+
+
+def test_load_trade_final30_scored_rejects_non_exact_contract(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+
+    class FakeRepo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def verify_watchlist_scored_contract(self, **_kwargs):
+            rows = _scored_rows(29)
+            return {
+                "ok": True,
+                "rows": 29,
+                "uniq_codes": 29,
+                "uniq_ranks": 29,
+                "null_critical": 0,
+                "missing_fields": [],
+                "columns": list(REQUIRED),
+                "rows_data": rows,
+            }
+
+    monkeypatch.setattr(pb1_runner, "WatchlistRepo", FakeRepo)
+
+    result = pb1_runner.load_trade_final30_scored(engine=object(), env="practice", as_of="2026-03-11")
+
+    assert result["df"].empty
+    assert result["source_name"] == "none"
+
+
+def test_load_trade_final30_scored_repairs_missing_mirrors_from_db(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+
+    class FakeRepo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def verify_watchlist_scored_contract(self, **_kwargs):
+            return {
+                "ok": True,
+                "rows": 30,
+                "uniq_codes": 30,
+                "uniq_ranks": 30,
+                "null_critical": 0,
+                "missing_fields": [],
+                "columns": list(REQUIRED),
+                "rows_data": _scored_rows(),
+            }
+
+    monkeypatch.setattr(pb1_runner, "WatchlistRepo", FakeRepo)
+
+    result = pb1_runner.load_trade_final30_scored(engine=object(), env="practice", as_of="2026-03-11")
+
+    assert result["source_name"] == "db_pb1_watchlist_final_scored"
+    assert (tmp_path / "runtime" / "watchlist" / "2026-03-11" / "final30_scored.json").exists()
+    assert (tmp_path / "bot_state" / "trader_ledger" / "final30" / "practice" / "2026-03-11" / "final30_scored.json").exists()
+    assert (tmp_path / "signals" / "final30.json").exists()
 
 
 def test_get_final30_artifact_paths_are_repo_root_anchored(tmp_path, monkeypatch):

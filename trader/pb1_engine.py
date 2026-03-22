@@ -69,6 +69,7 @@ from trader.config import (
     PB1_ENTRY_WINDOW_END,
     PB1_EXIT_WINDOW_START,
     PB1_EXIT_WINDOW_END,
+    PB1_TIME_STOP_DAYS,
     PB1_ALLOW_ADD_TO_EXISTING,
     PB1_PREOPEN_ORDER_TYPE,
     PB1_PREOPEN_LIMIT_BUFFER_PCT,
@@ -195,6 +196,11 @@ REQUIRED_SCORED_FINAL30_COLS = [
     "rs_percentile",
     "vcp_score",
     "entry_style_selected",
+    "ma20",
+    "ma50",
+    "ma150",
+    "close",
+    "atr_pct",
 ]
 
 # Minervini feature calc requires MA200 slope + VCP; force long window.
@@ -922,6 +928,12 @@ class PB1Engine:
         self._entry_evaluations: list[dict[str, Any]] = []
         self._exit_evaluations: list[dict[str, Any]] = []
         self._exit_summary_payload: dict[str, Any] = {}
+        self._exit_holdings_meta: dict[str, Any] = {
+            "source": "empty",
+            "snapshot_ts": self._now_kst.isoformat(),
+            "freshness": "empty",
+            "reconstructed": False,
+        }
         self._scanner_summary: dict[str, Any] = {}
         self._prep_summary_payload: dict[str, Any] = {}
         self.current_code: str | None = None
@@ -1818,7 +1830,7 @@ class PB1Engine:
             )
         return positions
 
-    def load_current_holdings_for_exit(
+    def _build_holding_contexts_from_balance_rows(
         self,
         balance_rows: Iterable[dict],
         ledger_positions: Iterable[dict] | None = None,
@@ -1894,6 +1906,331 @@ class PB1Engine:
                     position_meta=pos_meta,
                 )
             )
+        return holdings
+
+    def _build_holding_contexts_from_position_rows(
+        self,
+        ledger_positions: Iterable[dict] | None = None,
+    ) -> list[HoldingContext]:
+        positions = [dict(row or {}) for row in (ledger_positions or [])]
+        codes = [str((row or {}).get("code") or "").zfill(6) for row in positions if str((row or {}).get("code") or "").strip()]
+        latest_buy_fills = {}
+        if codes and hasattr(self.fills_repo, "list_latest_buy_fills_by_codes"):
+            try:
+                latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_codes(self.env, codes)
+            except Exception:
+                latest_buy_fills = {}
+        today_kst = self._now_kst.date()
+        holdings: list[HoldingContext] = []
+        for row in positions:
+            code = str(row.get("code") or "").zfill(6)
+            if not code:
+                continue
+            qty = int(float(row.get("qty") or 0) or 0)
+            if qty <= 0:
+                continue
+            avg_price = float(row.get("avg_buy_price") or row.get("entry_price") or 0.0)
+            last_price = float(row.get("last_price") or self._balance_price_map.get(code) or avg_price or 0.0)
+            latest_buy_fill = latest_buy_fills.get(code) or {}
+            entry_ts_raw = latest_buy_fill.get("filled_at") or row.get("entry_ts") or row.get("last_trade_at")
+            entry_date = None
+            days_held = int(row.get("holding_days") or 0)
+            if entry_ts_raw:
+                try:
+                    entry_dt = pd.Timestamp(entry_ts_raw)
+                    entry_date = entry_dt.date().isoformat()
+                    days_held = max(0, (today_kst - entry_dt.date()).days)
+                except Exception:
+                    entry_date = str(entry_ts_raw)
+            market_value = float(row.get("total_cost") or (last_price * qty))
+            unrealized_pnl = ((last_price - avg_price) * qty) if avg_price > 0 else 0.0
+            unrealized_pct = (((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0
+            holdings.append(
+                HoldingContext(
+                    code=code,
+                    name=str(row.get("name") or self._code_name_map.get(code, "")),
+                    holding_qty=qty,
+                    orderable_qty=qty,
+                    avg_price=avg_price,
+                    last_price=last_price,
+                    market_value=market_value,
+                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pct=unrealized_pct,
+                    source="db_positions",
+                    market=row.get("market"),
+                    mode=int(row.get("mode") or 1),
+                    sid=int(row.get("sid") or 1),
+                    entry_date=entry_date,
+                    days_held=days_held,
+                    last_fill_at=str(entry_ts_raw) if entry_ts_raw else None,
+                    position_meta=dict(row),
+                )
+            )
+        return holdings
+
+    def _build_holding_contexts_from_fill_reconstruction(
+        self,
+        ledger_positions: Iterable[dict] | None = None,
+    ) -> list[HoldingContext]:
+        if not hasattr(self.fills_repo, "list_fills_in_window"):
+            return []
+        lookback_days = max(30, int(os.getenv("PB1_EXIT_LEDGER_LOOKBACK_DAYS", "365") or "365"))
+        start_at = self._now_kst - pd.Timedelta(days=lookback_days)
+        try:
+            fills = self.fills_repo.list_fills_in_window(
+                self.env,
+                start_at=start_at,
+                end_at=self._now_kst + pd.Timedelta(seconds=1),
+            )
+        except Exception:
+            return []
+        if not fills:
+            return []
+        positions_by_code = {
+            str((row or {}).get("code") or "").zfill(6): dict(row or {})
+            for row in (ledger_positions or [])
+            if str((row or {}).get("code") or "").strip()
+        }
+        state_by_code: dict[str, dict[str, Any]] = {}
+        sorted_fills = sorted([dict(fill or {}) for fill in fills], key=lambda item: str(item.get("filled_at") or ""))
+        for fill in sorted_fills:
+            code = str(fill.get("code") or "").zfill(6)
+            if not code:
+                continue
+            side = str(fill.get("side") or "").upper()
+            qty = int(float(fill.get("qty") or 0) or 0)
+            price = float(fill.get("price") or 0.0)
+            if qty <= 0:
+                continue
+            state = state_by_code.setdefault(
+                code,
+                {
+                    "qty": 0,
+                    "total_cost": 0.0,
+                    "avg_price": 0.0,
+                    "last_fill_at": None,
+                    "entry_ts": None,
+                    "market": (positions_by_code.get(code) or {}).get("market"),
+                },
+            )
+            if side == "BUY":
+                state["total_cost"] += float(price) * qty
+                state["qty"] += qty
+                state["avg_price"] = (state["total_cost"] / state["qty"]) if state["qty"] > 0 else 0.0
+                state["entry_ts"] = state.get("entry_ts") or fill.get("filled_at")
+                state["last_fill_at"] = fill.get("filled_at")
+            elif side == "SELL":
+                close_qty = min(state["qty"], qty)
+                avg_price = float(state.get("avg_price") or 0.0)
+                state["qty"] = max(0, int(state["qty"] - close_qty))
+                state["total_cost"] = max(0.0, float(state["total_cost"] or 0.0) - (avg_price * close_qty))
+                state["avg_price"] = (state["total_cost"] / state["qty"]) if state["qty"] > 0 else 0.0
+                state["last_fill_at"] = fill.get("filled_at")
+        holdings: list[HoldingContext] = []
+        today_kst = self._now_kst.date()
+        for code, state in state_by_code.items():
+            qty = int(state.get("qty") or 0)
+            if qty <= 0:
+                continue
+            pos_meta = dict(positions_by_code.get(code) or {})
+            entry_ts_raw = state.get("entry_ts") or pos_meta.get("entry_ts") or state.get("last_fill_at")
+            entry_date = None
+            days_held = int(pos_meta.get("holding_days") or 0)
+            if entry_ts_raw:
+                try:
+                    entry_dt = pd.Timestamp(entry_ts_raw)
+                    entry_date = entry_dt.date().isoformat()
+                    days_held = max(0, (today_kst - entry_dt.date()).days)
+                except Exception:
+                    entry_date = str(entry_ts_raw)
+            avg_price = float(state.get("avg_price") or pos_meta.get("avg_buy_price") or 0.0)
+            last_price = float(pos_meta.get("last_price") or self._balance_price_map.get(code) or avg_price or 0.0)
+            unrealized_pnl = ((last_price - avg_price) * qty) if avg_price > 0 else 0.0
+            unrealized_pct = (((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0
+            holdings.append(
+                HoldingContext(
+                    code=code,
+                    name=str(pos_meta.get("name") or self._code_name_map.get(code, "")),
+                    holding_qty=qty,
+                    orderable_qty=qty,
+                    avg_price=avg_price,
+                    last_price=last_price,
+                    market_value=float(last_price * qty),
+                    unrealized_pnl=unrealized_pnl,
+                    unrealized_pct=unrealized_pct,
+                    source="ledger_reconstruct",
+                    market=pos_meta.get("market") or state.get("market"),
+                    mode=int(pos_meta.get("mode") or 1),
+                    sid=int(pos_meta.get("sid") or 1),
+                    entry_date=entry_date,
+                    days_held=days_held,
+                    last_fill_at=str(state.get("last_fill_at") or "") or None,
+                    position_meta=pos_meta,
+                )
+            )
+        return holdings
+
+    def _load_exit_test_holdings_rows(self) -> tuple[list[dict[str, Any]], str | None]:
+        json_raw = (os.getenv("PB1_EXIT_TEST_HOLDINGS_JSON") or "").strip()
+        path_raw = (os.getenv("PB1_EXIT_TEST_HOLDINGS_PATH") or "").strip()
+        source = None
+        payload: Any = []
+        if json_raw:
+            source = "env_json"
+            try:
+                payload = json.loads(json_raw)
+            except Exception:
+                logger.warning("[EXIT][TEST_HOLDINGS][LOAD_FAIL] source=env_json")
+                return [], None
+        elif path_raw:
+            source = "env_path"
+            try:
+                payload = json.loads(Path(path_raw).read_text(encoding="utf-8"))
+            except Exception:
+                logger.warning("[EXIT][TEST_HOLDINGS][LOAD_FAIL] source=env_path path=%s", path_raw)
+                return [], None
+        if not isinstance(payload, list):
+            return [], None
+        rows = [dict(item or {}) for item in payload if isinstance(item, dict)]
+        if rows:
+            logger.info("[EXIT][TEST_HOLDINGS][LOAD] count=%s source=%s", len(rows), source)
+        return rows, source
+
+    def _build_holding_contexts_from_test_rows(
+        self,
+        test_rows: Iterable[dict[str, Any]],
+        ledger_positions: Iterable[dict] | None = None,
+    ) -> list[HoldingContext]:
+        positions_by_code = {
+            str((row or {}).get("code") or "").zfill(6): dict(row or {})
+            for row in (ledger_positions or [])
+            if str((row or {}).get("code") or "").strip()
+        }
+        today_kst = self._now_kst.date()
+        holdings: list[HoldingContext] = []
+        for row in test_rows or []:
+            code = str(row.get("code") or "").zfill(6)
+            if not code:
+                continue
+            qty = int(float(row.get("qty") or 0) or 0)
+            if qty <= 0:
+                continue
+            avg_price = float(row.get("avg_price") or 0.0)
+            last_price = float(row.get("last_price") or row.get("close") or avg_price or 0.0)
+            bought_at = row.get("bought_at")
+            entry_date = None
+            days_held = 0
+            if bought_at:
+                try:
+                    entry_dt = pd.Timestamp(bought_at)
+                    entry_date = entry_dt.date().isoformat()
+                    days_held = max(0, (today_kst - entry_dt.date()).days)
+                except Exception:
+                    entry_date = str(bought_at)
+            pos_meta = dict(positions_by_code.get(code) or {})
+            holdings.append(
+                HoldingContext(
+                    code=code,
+                    name=str(row.get("name") or self._code_name_map.get(code, "")),
+                    holding_qty=qty,
+                    orderable_qty=qty,
+                    avg_price=avg_price,
+                    last_price=last_price,
+                    market_value=float(last_price * qty),
+                    unrealized_pnl=((last_price - avg_price) * qty) if avg_price > 0 else 0.0,
+                    unrealized_pct=(((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0,
+                    source="injected_test_holdings",
+                    market=pos_meta.get("market") or row.get("market"),
+                    mode=int(pos_meta.get("mode") or 1),
+                    sid=int(pos_meta.get("sid") or 1),
+                    entry_date=entry_date,
+                    days_held=days_held,
+                    last_fill_at=str(bought_at) if bought_at else None,
+                    position_meta=pos_meta,
+                )
+            )
+        return holdings
+
+    def load_effective_holdings_for_exit(
+        self,
+        balance_rows: Iterable[dict],
+        ledger_positions: Iterable[dict] | None = None,
+        *,
+        as_of: str | None = None,
+        env: str | None = None,
+        intended_live: bool | None = None,
+        allow_http: bool | None = None,
+    ) -> tuple[list[HoldingContext], dict[str, Any]]:
+        del as_of, env, intended_live, allow_http
+        balance_holdings = self._build_holding_contexts_from_balance_rows(balance_rows, ledger_positions)
+        if balance_holdings:
+            meta = {
+                "source": "kis_balance",
+                "snapshot_ts": self._now_kst.isoformat(),
+                "freshness": "live",
+                "reconstructed": False,
+            }
+            logger.info("[EXIT][HOLDINGS][SOURCE] source=%s count=%s", meta["source"], len(balance_holdings))
+            return balance_holdings, meta
+
+        position_holdings = self._build_holding_contexts_from_position_rows(ledger_positions)
+        if position_holdings:
+            meta = {
+                "source": "db_positions",
+                "snapshot_ts": self._now_kst.isoformat(),
+                "freshness": "db_snapshot",
+                "reconstructed": False,
+            }
+            logger.info("[EXIT][HOLDINGS][SOURCE] source=%s count=%s", meta["source"], len(position_holdings))
+            return position_holdings, meta
+
+        reconstructed_holdings = self._build_holding_contexts_from_fill_reconstruction(ledger_positions)
+        if reconstructed_holdings:
+            meta = {
+                "source": "ledger_reconstruct",
+                "snapshot_ts": self._now_kst.isoformat(),
+                "freshness": "reconstructed",
+                "reconstructed": True,
+            }
+            logger.info("[EXIT][HOLDINGS][SOURCE] source=%s count=%s", meta["source"], len(reconstructed_holdings))
+            return reconstructed_holdings, meta
+
+        test_rows, test_source = self._load_exit_test_holdings_rows()
+        test_holdings = self._build_holding_contexts_from_test_rows(test_rows, ledger_positions)
+        if test_holdings:
+            meta = {
+                "source": "injected_test_holdings",
+                "snapshot_ts": self._now_kst.isoformat(),
+                "freshness": test_source or "test",
+                "reconstructed": True,
+            }
+            logger.info("[EXIT][TEST_HOLDINGS][APPLIED] count=%s", len(test_holdings))
+            logger.info("[EXIT][HOLDINGS][SOURCE] source=%s count=%s", meta["source"], len(test_holdings))
+            return test_holdings, meta
+
+        meta = {
+            "source": "empty",
+            "snapshot_ts": self._now_kst.isoformat(),
+            "freshness": "empty",
+            "reconstructed": False,
+        }
+        logger.info("[EXIT][HOLDINGS][SOURCE] source=%s count=0", meta["source"])
+        return [], meta
+
+    def load_current_holdings_for_exit(
+        self,
+        balance_rows: Iterable[dict],
+        ledger_positions: Iterable[dict] | None = None,
+    ) -> list[HoldingContext]:
+        holdings, meta = self.load_effective_holdings_for_exit(
+            balance_rows,
+            ledger_positions,
+            as_of=self.get_as_of(),
+            env=self.env,
+            intended_live=self.intended_live,
+            allow_http=bool(self.kis),
+        )
+        self._exit_holdings_meta = meta
         return holdings
 
     @staticmethod
@@ -4135,11 +4472,28 @@ class PB1Engine:
             rank = ranked.index(cf) + 1 if cf in ranked else 999
             
             # 1단계: qty=0 여부 체크 (예산 부족)
+            raw_position_qty = (float(budget_cap) / float(order_px)) if order_px > 0 and budget_cap > 0 else 0.0
+            floor_position_qty = int(raw_position_qty) if raw_position_qty > 0 else 0
+            position_cap_shortfall = float(order_px - budget_cap) if budget_cap > 0 else float("inf")
+            edge_qty_ok = int(order_px > 0 and floor_position_qty >= 1 and position_cap_shortfall <= 0)
+            logger.info(
+                "[SIZING][EDGE_CHECK] code=%s position_cap=%s order_px=%s raw_qty=%.3f floor_qty=%s final_ok=%s shortfall=%s",
+                self._display_code(cf.code),
+                budget_cap,
+                order_px,
+                raw_position_qty,
+                floor_position_qty,
+                edge_qty_ok,
+                position_cap_shortfall,
+            )
+            if qty <= 0 and edge_qty_ok:
+                qty = max(qty, floor_position_qty)
+
             if qty <= 0 or (order_px > 0 and qty * order_px < order_px):  # qty=0 또는 부분 삭감
                 if order_px > tick_budget > 0:
                     sizing_reason = "ORDER_PX_ABOVE_TICK_BUDGET"
                     sizing_details["binding_constraint"] = "tick_budget"
-                elif order_px > budget_cap > 0:
+                elif order_px > budget_cap > 0 and floor_position_qty < 1:
                     sizing_reason = "ORDER_PX_ABOVE_POSITION_CAP"
                     sizing_details["binding_constraint"] = "position_cap"
                 elif order_px > usable_cash > 0:
@@ -5758,6 +6112,8 @@ class PB1Engine:
         ma50_break = bool(ma50 is not None and mark < ma50)
         time_stop_hit = bool(days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
         risk_off_hit = bool(failed_breakout or (heavy_volume and ma50_break))
+        take_profit_threshold = float(TAKE_PROFIT_R1)
+        take_profit_hit = bool((ret_pct / 100.0) >= take_profit_threshold)
 
         triggered = []
         if risk_off_hit:
@@ -5793,6 +6149,51 @@ class PB1Engine:
             int(time_stop_hit),
             int(risk_off_hit),
         )
+        trail_drawdown = None
+        trail_threshold = None
+        if highest_since_entry and highest_since_entry > 0 and mark is not None:
+            trail_drawdown = float((highest_since_entry - float(mark)) / highest_since_entry)
+        if highest_since_entry and highest_since_entry > 0 and trail_stop_price is not None:
+            trail_threshold = float((highest_since_entry - float(trail_stop_price)) / highest_since_entry)
+        conds = {
+            "stop_loss_pct": {
+                "hit": bool(stop_hit),
+                "threshold": float(((float(stop_price) - avg) / avg) if (stop_price is not None and avg) else 0.0),
+                "actual": float(ret_pct / 100.0),
+            },
+            "take_profit_pct": {
+                "hit": bool(take_profit_hit),
+                "threshold": take_profit_threshold,
+                "actual": float(ret_pct / 100.0),
+            },
+            "trail_stop": {
+                "hit": bool(trail_hit),
+                "peak": float(((highest_since_entry - avg) / avg) if (highest_since_entry is not None and avg) else 0.0),
+                "drawdown_from_peak": trail_drawdown,
+                "threshold": trail_threshold,
+            },
+            "ma20_break": {
+                "hit": bool(ma20_break),
+                "close": close_px,
+                "ma20": ma20,
+            },
+            "ma50_break": {
+                "hit": bool(ma50_break),
+                "close": close_px,
+                "ma50": ma50,
+            },
+            "time_stop": {
+                "hit": bool(time_stop_hit),
+                "holding_days": days_held,
+                "threshold": int(PB1_TIME_STOP_DAYS),
+            },
+            "regime_exit": {
+                "hit": bool(risk_off_hit),
+                "heavy_volume": heavy_volume,
+                "failed_breakout": failed_breakout,
+            },
+        }
+        logger.info("[EXIT][COND] code=%s conds=%s", display_code, conds)
 
         exit_eval = ExitEvaluation(
             code=code,
@@ -5865,6 +6266,9 @@ class PB1Engine:
                 "exit_rule_version": "pb1_exit_reason_v2",
                 "submit_attempted": 0,
                 "submitted": 0,
+                "order_skip_reasons": [],
+                "holdings_source": str((self._exit_holdings_meta or {}).get("source") or "unknown"),
+                "condition_details": conds,
             }
         )
         self.positions_repo.update_position_fields(
@@ -5877,12 +6281,21 @@ class PB1Engine:
         )
 
         logger.info(
-            "[EXIT][EVAL] code=%s exit_ok=%s family=%s reason=%s secondary=%s",
+            "[EXIT][EVAL] code=%s qty=%s avg=%s last=%s pnl_pct=%.2f stop_loss_hit=%s take_profit_hit=%s trailing_stop_hit=%s close_below_ma20=%s close_below_ma50=%s time_stop_hit=%s signal_hit=%s orderable=%s reason=%s",
             display_code,
+            qty,
+            avg,
+            mark,
+            ret_pct,
+            int(stop_hit),
+            int(take_profit_hit),
+            int(trail_hit),
+            int(ma20_break),
+            int(ma50_break),
+            int(time_stop_hit),
             int(exit_eval.exit_ok),
-            exit_eval.family,
+            int(int(pos.get("orderable_qty") or qty) > 0),
             exit_eval.primary_reason,
-            exit_eval.secondary_reasons,
         )
 
         emit_event(
@@ -5900,9 +6313,24 @@ class PB1Engine:
             logger.info("[EXIT][SKIP] code=%s reason=%s", display_code, exit_eval.primary_reason)
             return exit_eval_payload
 
+        signal_reason_labels = {
+            "EXIT_STOP_LOSS": "stop_loss",
+            "EXIT_TRAILING_STOP": "trail_stop",
+            "EXIT_MA20_BREAK": "ma20_break",
+            "EXIT_MA50_BREAK": "ma50_break",
+            "EXIT_TIME_STOP": "time_stop",
+            "EXIT_RISK_OFF": "regime_exit",
+        }
+        logger.info(
+            "[EXIT][SIGNAL_HIT] code=%s reasons=%s",
+            display_code,
+            [signal_reason_labels.get(reason, reason.lower()) for reason in ([exit_eval.primary_reason] + list(exit_eval.secondary_reasons))],
+        )
+
         orderable_qty = int(pos.get("orderable_qty") or qty)
         if orderable_qty <= 0:
-            logger.info("[EXIT][ORDER_SKIP] code=%s reason=ORDERABLE_QTY_ZERO", display_code)
+            exit_eval_payload["order_skip_reasons"] = ["orderable_qty_zero"]
+            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
         stage = exit_eval.primary_reason
@@ -5923,7 +6351,8 @@ class PB1Engine:
 
         if self._should_block_order(client_key, code=code, side="SELL", stage="PB1-EXIT")[0]:
             exit_eval_payload["submit_attempted"] = 1
-            logger.info("[EXIT][ORDER_SKIP] code=%s reason=DUPLICATE_ORDER", display_code)
+            exit_eval_payload["order_skip_reasons"] = ["duplicate_order"]
+            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
         try:
@@ -5970,8 +6399,20 @@ class PB1Engine:
             stage,
         )
 
+        submit_block_reasons: list[str] = []
         if self.dry_run:
+            submit_block_reasons.append("dry_run")
+        if not self.trading_day or self.market_window_name == "after":
+            submit_block_reasons.append("window_blocked")
+        if self.force_block_live or not self.intended_live:
+            submit_block_reasons.append("live_gate_blocked")
+        if not self.kis:
+            submit_block_reasons.append("kis_unavailable")
+        if submit_block_reasons:
             exit_eval_payload["submit_attempted"] = 1
+            exit_eval_payload["order_skip_reasons"] = submit_block_reasons
+            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, submit_block_reasons)
+        if self.dry_run:
             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
             return exit_eval_payload
 
@@ -5988,6 +6429,9 @@ class PB1Engine:
             client_order_key=client_key,
             stage=stage,
         ):
+            if not exit_eval_payload.get("order_skip_reasons"):
+                exit_eval_payload["order_skip_reasons"] = ["pretrade_blocked"]
+                logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
         exit_eval_payload["submit_attempted"] = 1
@@ -6149,7 +6593,8 @@ class PB1Engine:
         marks_fallback: dict[str, float],
     ) -> list[dict]:
         holdings_raw = list(holdings_for_exit or [])
-        logger.info("[EXIT][LOAD] holdings_raw=%s codes=%s", len(holdings_raw), [holding.code for holding in holdings_raw])
+        holdings_source = str((self._exit_holdings_meta or {}).get("source") or "unknown")
+        logger.info("[EXIT][LOAD] holdings_raw=%s codes=%s source=%s", len(holdings_raw), [holding.code for holding in holdings_raw], holdings_source)
         holdings_exit_scope = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
         logger.info("[EXIT][SCOPE] holdings_exit_scope=%s codes=%s", len(holdings_exit_scope), [holding.code for holding in holdings_exit_scope])
         existing_positions_count = len([holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0])
@@ -6211,6 +6656,23 @@ class PB1Engine:
         )
         if checked_count > signal_hit_count:
             logger.info("[EXIT][FUNNEL][DROP] stage=signal count=%s reasons=%s", checked_count - signal_hit_count, ["NO_EXIT_SIGNAL"])
+        submit_drop_reasons = sorted(
+            {
+                reason
+                for evaluation in exit_evaluations
+                for reason in (evaluation.get("order_skip_reasons") or [])
+                if evaluation.get("exit_ok") and not int(evaluation.get("submitted") or 0)
+            }
+        )
+        submit_drop_count = len(
+            [evaluation for evaluation in exit_evaluations if evaluation.get("exit_ok") and not int(evaluation.get("submitted") or 0)]
+        )
+        if submit_drop_count > 0:
+            logger.info(
+                "[EXIT][FUNNEL][DROP] stage=submit count=%s reasons=%s",
+                submit_drop_count,
+                submit_drop_reasons or ["ORDER_NOT_SUBMITTED"],
+            )
         return pos_list
 
     def _load_close_entry_orders(self) -> list[dict]:
@@ -7670,7 +8132,15 @@ class PB1Engine:
             for p in positions
             if p.get("cooldown_until")
         }
-        holdings_for_exit = self.load_current_holdings_for_exit(holdings_rows, positions)
+        holdings_for_exit, holdings_meta = self.load_effective_holdings_for_exit(
+            holdings_rows,
+            positions,
+            as_of=self.get_as_of(),
+            env=self.env,
+            intended_live=self.intended_live,
+            allow_http=bool(self.kis),
+        )
+        self._exit_holdings_meta = holdings_meta
         positions_for_exit = [holding.to_position_dict() for holding in holdings_for_exit]
         existing_positions = [p for p in positions_for_exit if int(p.get("qty") or 0) > 0]
         existing_positions_count = len(existing_positions)
@@ -7713,12 +8183,23 @@ class PB1Engine:
         if not holdings and self.kis:
             logger.info("[PB1][HOLDINGS] empty_balance_snapshot -> skip extra fetch")
         marks_fallback: Dict[str, float] = {}
+        exit_order_submit_allowed = bool(self.trading_day and self.intended_live and not self.dry_run and not self.force_block_live)
+        logger.info(
+            "[EXIT][EVAL_ALLOWED] nontrading_day=%s order_submit=%s eval=1",
+            int(not self.trading_day),
+            int(exit_order_submit_allowed),
+        )
         
         # ========== EXIT PASS (완전 독립 실행) ==========
         exit_pass_ok = True
         exit_pass_sells = 0
         exit_pass_skipped = 0
-        logger.info("[PASS][EXIT][START] phase=%s existing_positions=%s", self.phase, existing_positions_count)
+        logger.info(
+            "[PASS][EXIT][START] phase=%s existing_positions=%s holdings_source=%s",
+            self.phase,
+            existing_positions_count,
+            holdings_meta.get("source"),
+        )
         try:
             positions_for_exit = self._run_exit_always(holdings_for_exit=holdings_for_exit, marks_fallback=marks_fallback)
             exit_pass_sells = len([p for p in positions_for_exit if float(p.get("qty", 0)) == 0])

@@ -462,7 +462,7 @@ def scan_entry_candidates(
     total = len([w for w in watchlist if w.get("code")])
 
     logger.info(
-        "[ENTRY_SCAN][SUMMARY] total=%s usable=%s passed=%s setup_ok=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
+        "[ENTRY_SCAN][RAW_SIGNAL_SUMMARY] total=%s usable=%s passed=%s setup_ok=%s breakout_pass=%s pullback_pass=%s momentum_pass=%s multi_pass=%s none_pass=%s thresholds=%s source=%s rejected_counts=%s",
         total,
         usable_count,
         passed,

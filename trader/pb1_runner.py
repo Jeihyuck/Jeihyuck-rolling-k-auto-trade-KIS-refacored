@@ -111,6 +111,11 @@ REQUIRED_SCORED_FINAL30_COLS = [
     "rs_percentile",
     "vcp_score",
     "entry_style_selected",
+    "ma20",
+    "ma50",
+    "ma150",
+    "close",
+    "atr_pct",
 ]
 
 
@@ -174,12 +179,37 @@ def load_trade_final30_scored(
         strategy="pb1_watchlist_final_scored",
         allow_latest_fallback=False,
     )
-    if scored_contract.get("ok"):
-        rows = list(scored_contract.get("rows_data") or [])
+    contract_columns = [str(col) for col in (scored_contract.get("columns") or [])]
+    rows = list(scored_contract.get("rows_data") or [])
+    missing_critical_fields = [col for col in REQUIRED_SCORED_FINAL30_COLS if col not in contract_columns]
+    contract_ok = bool(
+        scored_contract.get("ok")
+        and int(scored_contract.get("rows") or 0) == 30
+        and int(scored_contract.get("uniq_codes") or 0) == 30
+        and int(scored_contract.get("null_critical") or 0) == 0
+        and not missing_critical_fields
+    )
+    logger.info(
+        "[TRADE][FINAL30][DB_EXACT_LOAD] env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s",
+        env_n,
+        as_of_date.isoformat(),
+        scored_contract.get("rows"),
+        scored_contract.get("uniq_codes"),
+        scored_contract.get("uniq_ranks"),
+    )
+    logger.info(
+        "[TRADE][FINAL30][CONTRACT_CHECK] ok=%s rows=%s null_critical=%s missing_fields=%s missing_critical=%s",
+        int(contract_ok),
+        scored_contract.get("rows"),
+        scored_contract.get("null_critical"),
+        scored_contract.get("missing_fields"),
+        missing_critical_fields,
+    )
+    if contract_ok:
         missing_labels = [label for label, present in file_mirror_stats.items() if not present]
         if missing_labels and rows:
             logger.info(
-                "[TRADE][FINAL30][FILE_REPAIR] env=%s as_of=%s missing=%s source=db_pb1_watchlist_final_scored",
+                "[TRADE][FINAL30][FILE_REPAIR][START] env=%s as_of=%s missing=%s source=db_pb1_watchlist_final_scored",
                 env_n,
                 as_of_s,
                 missing_labels,
@@ -195,6 +225,12 @@ def load_trade_final30_scored(
                 label: int(bool((repair_results.get(label) or {}).get("ok")))
                 for label in final30_paths.keys()
             }
+            logger.info(
+                "[TRADE][FINAL30][FILE_REPAIR][DONE] runtime=%s ledger=%s signals=%s",
+                file_mirror_stats.get("runtime", 0),
+                file_mirror_stats.get("ledger", 0),
+                file_mirror_stats.get("signals", 0),
+            )
         if missing_labels and not any(file_mirror_stats.values()):
             logger.error(
                 "[TRADE][FINAL30][FILE_CONTRACT_MISMATCH] env=%s as_of=%s paths=%s",
@@ -209,6 +245,12 @@ def load_trade_final30_scored(
             len(df),
             columns,
         )
+        logger.info(
+            "[TRADE][FINAL30][LOCK][OK] source=%s as_of=%s rows=%s",
+            "db_pb1_watchlist_final_scored",
+            as_of_date.isoformat(),
+            len(df),
+        )
         return {
             "df": df,
             "source_name": "db_pb1_watchlist_final_scored",
@@ -219,34 +261,8 @@ def load_trade_final30_scored(
             "file_mirror_present": any(file_mirror_stats.values()),
         }
 
-    allow_plain_fallback = (os.getenv("TRADE_ALLOW_PLAIN_WATCHLIST_FALLBACK", "0") == "1")
-    if allow_plain_fallback:
-        plain_rows, plain_as_of = watchlist_repo.load_watchlist(
-            env=env_n,
-            strategy="pb1_watchlist_final",
-            as_of=as_of_date,
-            allow_latest_fallback=False,
-        )
-        if len(plain_rows) == 30 and plain_as_of == as_of_date:
-            df = pd.DataFrame(plain_rows)
-            columns = [str(c) for c in df.columns.tolist()]
-            logger.warning(
-                "[TRADE][FINAL30][LOAD] source=db_pb1_watchlist_final rows=%s is_scored=0 debug_fallback=1 cols=%s",
-                len(df),
-                columns,
-            )
-            return {
-                "df": df,
-                "source_name": "db_pb1_watchlist_final",
-                "as_of": plain_as_of.isoformat(),
-                "columns": columns,
-                "is_scored": False,
-                "used_fallback": True,
-                "file_mirror_present": any(file_mirror_stats.values()),
-            }
-
     logger.error(
-        "[TRADE][FINAL30][LOAD_FAIL] reason=db_contract_invalid env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_fields=%s",
+        "[TRADE][FINAL30][LOAD_FAIL] reason=db_contract_invalid env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_fields=%s missing_critical=%s",
         env_n,
         as_of_date.isoformat(),
         scored_contract.get("rows"),
@@ -254,6 +270,7 @@ def load_trade_final30_scored(
         scored_contract.get("uniq_ranks"),
         scored_contract.get("null_critical"),
         scored_contract.get("missing_fields"),
+        missing_critical_fields,
     )
     return {
         "df": pd.DataFrame(),
@@ -2824,19 +2841,37 @@ def run_once(
             engine_setup_ok = int(run_summary.get("setup_ok", 0))
             if scanner_summary:
                 logger.info(
-                    "[CONSISTENCY][SCAN_ENGINE] scanner_usable=%s scanner_setup_ok=%s engine_setup_ok=%s",
+                    "[ENTRY_SCAN][RAW_SIGNAL_SUMMARY] usable=%s raw_signal_setup_ok=%s total=%s",
                     scanner_usable,
                     scanner_setup_ok,
+                    scanner_summary.get("total", 0),
+                )
+                logger.info(
+                    "[ENGINE][ORDERABILITY_SUMMARY] scanned=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s submitted=%s",
+                    run_summary.get("scanned", 0),
                     engine_setup_ok,
+                    run_summary.get("risk_ok", 0),
+                    run_summary.get("sized_ok", 0),
+                    run_summary.get("buyable_ok", 0),
+                    run_summary.get("order_candidates", 0),
+                    run_summary.get("submitted", 0),
                 )
             if scanner_summary and scanner_setup_ok != engine_setup_ok:
+                mismatch_categories = {
+                    "raw_scan_only": max(0, scanner_usable - scanner_setup_ok),
+                    "pb1_filter_drop": max(0, scanner_setup_ok - engine_setup_ok),
+                    "risk_gate_drop": max(0, int(run_summary.get("setup_ok", 0)) - int(run_summary.get("risk_ok", 0))),
+                    "sizing_drop": max(0, int(run_summary.get("risk_ok", 0)) - int(run_summary.get("sized_ok", 0))),
+                    "buyable_drop": max(0, int(run_summary.get("sized_ok", 0)) - int(run_summary.get("buyable_ok", 0))),
+                }
                 logger.warning(
-                    "[CONSISTENCY][SCAN_ENGINE_MISMATCH] scanner_usable=%s scanner_setup_ok=%s engine_setup_ok=%s scanner_total=%s engine_scanned=%s",
+                    "[CONSISTENCY][SCAN_ENGINE] scanner_usable=%s raw_signal_setup_ok=%s orderability_setup_ok=%s scanner_total=%s engine_scanned=%s categories=%s",
                     scanner_usable,
                     scanner_setup_ok,
                     engine_setup_ok,
                     scanner_summary.get("total", 0),
                     run_summary.get("scanned", 0),
+                    mismatch_categories,
                 )
         except Exception as exc:
             logger.warning("[CONSISTENCY][SCAN_ENGINE][FAIL] err=%s", exc)
