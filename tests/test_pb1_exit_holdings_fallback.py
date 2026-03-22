@@ -83,6 +83,9 @@ def test_load_effective_holdings_for_exit_reconstructs_from_fills_when_positions
 
     assert meta["source"] == "ledger_reconstruct"
     assert {holding.code for holding in holdings} == {"005930", "032830"}
+    position_rows = {holding.code: holding.to_position_dict() for holding in holdings}
+    assert position_rows["005930"]["total_cost"] == 603000.0
+    assert position_rows["032830"]["total_cost"] == 458000.0
 
 
 def test_load_effective_holdings_for_exit_uses_injected_test_holdings(monkeypatch):

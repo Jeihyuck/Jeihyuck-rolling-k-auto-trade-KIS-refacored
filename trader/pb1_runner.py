@@ -118,6 +118,8 @@ REQUIRED_SCORED_FINAL30_COLS = [
     "atr_pct",
 ]
 
+_FINAL30_LOAD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
 
 def _missing_scored_cols(columns: list[str]) -> list[str]:
     cols = {str(c) for c in (columns or [])}
@@ -149,6 +151,21 @@ def load_trade_final30_scored(
 ) -> dict[str, Any]:
     env_n = (env or "").strip().lower()
     as_of_s = str(as_of)
+    cache_key = (env_n, as_of_s)
+    cached = _FINAL30_LOAD_CACHE.get(cache_key)
+    if cached is not None:
+        cached_df = cached.get("df")
+        logger.info(
+            "[TRADE][FINAL30][CACHE_HIT] env=%s as_of=%s source=%s rows=%s",
+            env_n,
+            as_of_s,
+            cached.get("source_name"),
+            len(cached_df) if isinstance(cached_df, pd.DataFrame) else 0,
+        )
+        result = dict(cached)
+        if isinstance(cached_df, pd.DataFrame):
+            result["df"] = cached_df.copy(deep=True)
+        return result
     repo_root_path = resolve_repo_root()
     final30_paths = build_final30_paths(repo_root_path, env_n, as_of_s)
     logger.info(
@@ -251,7 +268,7 @@ def load_trade_final30_scored(
             as_of_date.isoformat(),
             len(df),
         )
-        return {
+        result = {
             "df": df,
             "source_name": "db_pb1_watchlist_final_scored",
             "as_of": as_of_date.isoformat(),
@@ -260,6 +277,8 @@ def load_trade_final30_scored(
             "used_fallback": False,
             "file_mirror_present": any(file_mirror_stats.values()),
         }
+        _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": df.copy(deep=True)}
+        return result
 
     logger.error(
         "[TRADE][FINAL30][LOAD_FAIL] reason=db_contract_invalid env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_fields=%s missing_critical=%s",
@@ -272,7 +291,7 @@ def load_trade_final30_scored(
         scored_contract.get("missing_fields"),
         missing_critical_fields,
     )
-    return {
+    result = {
         "df": pd.DataFrame(),
         "source_name": "none",
         "as_of": as_of_s,
@@ -281,6 +300,46 @@ def load_trade_final30_scored(
         "used_fallback": False,
         "file_mirror_present": any(file_mirror_stats.values()),
     }
+    _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
+    return result
+
+
+def _is_nontrading_eval_mode(
+    *,
+    trading_day: bool,
+    strategy_mode: str,
+    force_block_live: bool,
+    order_allowed: bool,
+) -> bool:
+    if _env_bool_any(("NONTRADING_EVAL_MODE",), default=False):
+        return True
+    return (not trading_day) or strategy_mode.upper() == "DIAG" or bool(force_block_live) or not bool(order_allowed)
+
+
+def _write_nontrading_eval_reports(
+    *,
+    engine_runner: object,
+    result_status: str,
+) -> None:
+    entry_path = runtime_path("runtime", "reports", "nontrading_entry_eval.json")
+    exit_path = runtime_path("runtime", "reports", "nontrading_exit_eval.json")
+    entry_path.parent.mkdir(parents=True, exist_ok=True)
+    entry_payload = {
+        "status": result_status,
+        "scanner": getattr(engine_runner, "_scanner_summary", {}) or {},
+        "entry_summary": getattr(engine_runner, "_run_summary_payload", {}) or {},
+        "entry_debug": getattr(engine_runner, "_debug_summary", {}) or {},
+        "order_candidates": list((getattr(engine_runner, "_debug_summary", {}) or {}).get("order_candidate_codes", []) or []),
+    }
+    exit_payload = {
+        "status": result_status,
+        "holdings_meta": getattr(engine_runner, "_exit_holdings_meta", {}) or {},
+        "exit_summary": getattr(engine_runner, "_exit_summary_payload", {}) or {},
+        "exit_evaluations": getattr(engine_runner, "_exit_evaluations", []) or [],
+    }
+    entry_path.write_text(json.dumps(entry_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    exit_path.write_text(json.dumps(exit_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[NONTRADING_EVAL][REPORT] entry=%s exit=%s", entry_path, exit_path)
 
 
 def check_prep_done() -> bool:
@@ -693,8 +752,11 @@ def generate_run_summary_json(
             "drop_reasons": reject_reason_counts or {},
             "consistency": {
                 "scanner_usable": int(scanner_summary.get("usable_count", scanner_summary.get("total", 0))),
-                "scanner_setup_ok": int(scanner_summary.get("setup_ok_count", 0)),
-                "engine_setup_ok": counts["setup_ok_count"],
+                "raw_signal_setup_ok": int(scanner_summary.get("setup_ok_count", 0)),
+                "pb1_filter_setup_ok": counts["setup_ok_count"],
+                "risk_ok": counts["after_risk_count"],
+                "sized_ok": counts["after_sizing_count"],
+                "buyable_ok": counts["buyable_ok_count"],
                 "match": int(int(scanner_summary.get("setup_ok_count", 0)) == counts["setup_ok_count"]),
             },
         }
@@ -2576,6 +2638,22 @@ def run_once(
                 entry_block_reason or "unknown",
             )
 
+        nontrading_eval_mode = _is_nontrading_eval_mode(
+            trading_day=trading_day,
+            strategy_mode=mode,
+            force_block_live=bool(compute_only_flags.get("force_block_live")),
+            order_allowed=order_allowed,
+        )
+        if nontrading_eval_mode:
+            os.environ["NONTRADING_EVAL_MODE"] = "1"
+            logger.info(
+                "[NONTRADING_EVAL][MODE] enabled=1 trading_day=%s strategy_mode=%s force_block_live=%s order_allowed=%s",
+                int(bool(trading_day)),
+                mode,
+                int(bool(compute_only_flags.get("force_block_live"))),
+                int(bool(order_allowed)),
+            )
+
         run_record_id = runs_repo.start_run(
             env=env_effective,
             strategy="pb1_pullback_close",
@@ -2597,7 +2675,7 @@ def run_once(
         )
         db_write_reasons.append("run_start")
         reconcile_result: dict | None = None
-        if kis:
+        if kis and not nontrading_eval_mode:
             try:
                 reconcile_result = reconcile_kis(
                     engine=engine,
@@ -2622,6 +2700,8 @@ def run_once(
                 if not dry_run and mode_resolved == "LIVE":
                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
+        elif nontrading_eval_mode:
+            logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
 
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY and not allow_compute_without_kis:
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
@@ -2833,44 +2913,49 @@ def run_once(
                 result_reason = result.notes or "NO_ORDER_INTENTS"
             logger.info("[RUN_SUMMARY][RESULT] status=%s reason=%s", result.status, result_reason)
             result.notes = result_reason
+            if nontrading_eval_mode:
+                _write_nontrading_eval_reports(
+                    engine_runner=engine_runner,
+                    result_status=result.status,
+                )
         try:
             scanner_summary = getattr(engine_runner, "_scanner_summary", {}) or {}
             run_summary = getattr(engine_runner, "_run_summary_payload", {}) or {}
             scanner_usable = int(scanner_summary.get("usable_count", scanner_summary.get("total", 0)))
-            scanner_setup_ok = int(scanner_summary.get("setup_ok_count", 0))
-            engine_setup_ok = int(run_summary.get("setup_ok", 0))
+            raw_signal_setup_ok = int(scanner_summary.get("setup_ok_count", 0))
+            pb1_filter_setup_ok = int(run_summary.get("setup_ok", 0))
             if scanner_summary:
                 logger.info(
                     "[ENTRY_SCAN][RAW_SIGNAL_SUMMARY] usable=%s raw_signal_setup_ok=%s total=%s",
                     scanner_usable,
-                    scanner_setup_ok,
+                    raw_signal_setup_ok,
                     scanner_summary.get("total", 0),
                 )
                 logger.info(
-                    "[ENGINE][ORDERABILITY_SUMMARY] scanned=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s submitted=%s",
+                    "[ENGINE][ORDERABILITY_SUMMARY] scanned=%s pb1_filter_setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s submitted=%s",
                     run_summary.get("scanned", 0),
-                    engine_setup_ok,
+                    pb1_filter_setup_ok,
                     run_summary.get("risk_ok", 0),
                     run_summary.get("sized_ok", 0),
                     run_summary.get("buyable_ok", 0),
                     run_summary.get("order_candidates", 0),
                     run_summary.get("submitted", 0),
                 )
-            if scanner_summary and scanner_setup_ok != engine_setup_ok:
+            if scanner_summary:
                 mismatch_categories = {
-                    "raw_scan_only": max(0, scanner_usable - scanner_setup_ok),
-                    "pb1_filter_drop": max(0, scanner_setup_ok - engine_setup_ok),
+                    "pb1_filter_drop": max(0, raw_signal_setup_ok - pb1_filter_setup_ok),
                     "risk_gate_drop": max(0, int(run_summary.get("setup_ok", 0)) - int(run_summary.get("risk_ok", 0))),
                     "sizing_drop": max(0, int(run_summary.get("risk_ok", 0)) - int(run_summary.get("sized_ok", 0))),
                     "buyable_drop": max(0, int(run_summary.get("sized_ok", 0)) - int(run_summary.get("buyable_ok", 0))),
                 }
-                logger.warning(
-                    "[CONSISTENCY][SCAN_ENGINE] scanner_usable=%s raw_signal_setup_ok=%s orderability_setup_ok=%s scanner_total=%s engine_scanned=%s categories=%s",
+                logger.info(
+                    "[CONSISTENCY][SCAN_ENGINE] scanner_usable=%s raw_signal_setup_ok=%s pb1_filter_setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s categories=%s",
                     scanner_usable,
-                    scanner_setup_ok,
-                    engine_setup_ok,
-                    scanner_summary.get("total", 0),
-                    run_summary.get("scanned", 0),
+                    raw_signal_setup_ok,
+                    pb1_filter_setup_ok,
+                    int(run_summary.get("risk_ok", 0)),
+                    int(run_summary.get("sized_ok", 0)),
+                    int(run_summary.get("buyable_ok", 0)),
                     mismatch_categories,
                 )
         except Exception as exc:

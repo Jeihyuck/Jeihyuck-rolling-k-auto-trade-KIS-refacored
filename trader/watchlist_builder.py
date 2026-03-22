@@ -117,7 +117,7 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
 
     saved_rows: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows or [], start=1):
-        item = dict(row or {})
+        item = _sanitize_scored_item(dict(row or {}), source="final30_saved_rows")
         for col in REQUIRED_FINAL30_SCORED_COLS:
             item.setdefault(col, None)
         score = item.get("score")
@@ -198,6 +198,127 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+INVALID_ZERO_NUMERIC_FIELDS = ("close", "ma20", "ma50", "ma150", "atr_pct")
+ZERO_INVALID_ALWAYS_FIELDS = {"close", "ma20", "ma50", "ma150"}
+NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile"}
+NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _is_invalid_zero_field(field: str, value: Any, row: Dict[str, Any]) -> bool:
+    if _is_missing_value(value):
+        return False
+    try:
+        numeric = float(value)
+    except Exception:
+        return False
+    if abs(numeric) > 1e-12:
+        return False
+    if field in ZERO_INVALID_ALWAYS_FIELDS:
+        return True
+    if field == "atr_pct":
+        close_value = row.get("close")
+        try:
+            return float(close_value) > 0
+        except Exception:
+            return False
+    return False
+
+
+def _repair_candidate_value(field: str, item: Dict[str, Any], ref: Dict[str, Any]) -> Any:
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    candidate_sources = [
+        item,
+        meta,
+        meta.get("runtime_recompute") if isinstance(meta.get("runtime_recompute"), dict) else {},
+        meta.get("derived") if isinstance(meta.get("derived"), dict) else {},
+        meta.get("minervini") if isinstance(meta.get("minervini"), dict) else {},
+        ref,
+    ]
+    for source in candidate_sources:
+        if not isinstance(source, dict):
+            continue
+        for key in (f"runtime_{field}", f"recomputed_{field}", f"derived_{field}", field):
+            if key not in source:
+                continue
+            candidate = source.get(key)
+            if _is_missing_value(candidate):
+                continue
+            probe_row = dict(item)
+            probe_row[field] = candidate
+            if field != "close" and _is_missing_value(probe_row.get("close")) and not _is_missing_value(ref.get("close")):
+                probe_row["close"] = ref.get("close")
+            if not _is_invalid_zero_field(field, candidate, probe_row):
+                return candidate
+    return None
+
+
+def _sanitize_scored_item(item: Dict[str, Any], ref: Dict[str, Any] | None = None, *, source: str) -> Dict[str, Any]:
+    sanitized = dict(item or {})
+    fallback = dict(ref or {})
+    invalid_zero_fields: List[str] = []
+    repaired_fields: List[str] = []
+    unresolved_fields: List[str] = []
+
+    for field in INVALID_ZERO_NUMERIC_FIELDS:
+        value = sanitized.get(field)
+        if not _is_invalid_zero_field(field, value, sanitized):
+            continue
+        invalid_zero_fields.append(field)
+        repaired = _repair_candidate_value(field, sanitized, fallback)
+        if repaired is not None:
+            sanitized[field] = repaired
+            repaired_fields.append(field)
+        else:
+            sanitized[field] = None
+            unresolved_fields.append(field)
+
+    rs_percentile = sanitized.get("rs_percentile")
+    if _is_missing_value(rs_percentile):
+        logger.warning(
+            "[WATCHLIST][SANITIZE][NULL_WARN] code=%s field=rs_percentile source=%s",
+            str(sanitized.get("code") or "").zfill(6),
+            source,
+        )
+
+    for field in NONNULL_SCORE_FIELDS:
+        if _is_missing_value(sanitized.get(field)):
+            repaired = _repair_candidate_value(field, sanitized, fallback)
+            sanitized[field] = 0.0 if repaired is None else repaired
+            logger.warning(
+                "[WATCHLIST][SANITIZE][NULL_SCORE] code=%s field=%s source=%s repaired=%s",
+                str(sanitized.get("code") or "").zfill(6),
+                field,
+                source,
+                int(repaired is not None),
+            )
+
+    if invalid_zero_fields:
+        logger.info(
+            "[WATCHLIST][SANITIZE][INVALID_ZERO] code=%s fields=%s source=%s repaired=%s unresolved=%s",
+            str(sanitized.get("code") or "").zfill(6),
+            invalid_zero_fields,
+            source,
+            repaired_fields,
+            unresolved_fields,
+        )
+
+    if unresolved_fields:
+        sanitized["invalid_zero_fields"] = unresolved_fields
+
+    return sanitized
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -2922,10 +3043,12 @@ def save_bundle(
                 item.get("score", item.get("score_final", item.get("final_score", item.get("tech_score", 0.0)))),
                 0.0,
             )
-            normalized_rows.append(_sync_item_and_meta_fields(item))
+            normalized_rows.append(_sync_item_and_meta_fields(_sanitize_scored_item(item, ref, source="pre_save_normalize")))
         return normalized_rows
 
     final30_scored_rows = _normalize_scored_stage_rows(bundle.final30)
+    pool120_rows = _normalize_scored_stage_rows(bundle.pool120, fallback_rows=final30_scored_rows)
+    top50_rows = _normalize_scored_stage_rows(bundle.top50, fallback_rows=final30_scored_rows)
     universe_scored_rows = _normalize_scored_stage_rows(bundle.universe_scored, fallback_rows=final30_scored_rows)
     if final30_scored_rows:
         final30_scored_df_for_stats = pd.DataFrame(final30_scored_rows)
@@ -3016,40 +3139,40 @@ def save_bundle(
     
     # 2. pool120 - NOW SAVED (not skipped)
     if bundle.pool120:
-        _log_stage_fields("pool120", bundle.pool120)
+        _log_stage_fields("pool120", pool120_rows)
         repo.save_watchlist(
             env=env,
             strategy="pb1_pool120",
             as_of=as_of,
-            members=bundle.pool120,
+            members=pool120_rows,
         )
-        logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(bundle.pool120))
+        logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(pool120_rows))
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_pool120 empty")
     
     # 3. top50 저장
     if bundle.top50:
-        _log_stage_fields("top50", bundle.top50)
+        _log_stage_fields("top50", top50_rows)
         repo.save_watchlist(
             env=env,
             strategy="pb1_top50",
             as_of=as_of,
-            members=bundle.top50,
+            members=top50_rows,
         )
-        logger.info("[BUNDLE][SAVE] pb1_top50 n=%s", len(bundle.top50))
+        logger.info("[BUNDLE][SAVE] pb1_top50 n=%s", len(top50_rows))
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_top50 empty")
     
     # 4. final30 저장
     if bundle.final30:
-        _log_stage_fields("final30", bundle.final30)
+        _log_stage_fields("final30", final30_scored_rows)
         repo.save_watchlist(
             env=env,
             strategy="pb1_watchlist_final",
             as_of=as_of,
-            members=bundle.final30,
+            members=final30_scored_rows,
         )
-        logger.info("[BUNDLE][SAVE] pb1_watchlist_final n=%s", len(bundle.final30))
+        logger.info("[BUNDLE][SAVE] pb1_watchlist_final n=%s", len(final30_scored_rows))
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_watchlist_final empty")
     

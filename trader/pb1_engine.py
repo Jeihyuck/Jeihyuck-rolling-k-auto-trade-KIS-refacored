@@ -247,6 +247,9 @@ class HoldingContext:
 
     def to_position_dict(self) -> dict[str, Any]:
         payload = dict(self.position_meta)
+        total_cost = self.position_meta.get("total_cost")
+        if total_cost in (None, "", 0, 0.0) and self.avg_price and self.holding_qty:
+            total_cost = float(self.avg_price) * int(self.holding_qty)
         payload.update(
             {
                 "code": self.code,
@@ -259,6 +262,7 @@ class HoldingContext:
                 "market_value": self.market_value,
                 "unrealized_pnl": self.unrealized_pnl,
                 "unrealized_pct": self.unrealized_pct,
+                "total_cost": total_cost or 0.0,
                 "market": self.market,
                 "mode": self.mode,
                 "sid": self.sid,
@@ -865,6 +869,7 @@ class PB1Engine:
         self.compute_only_full_run = bool(compute_only_full_run)
         self.force_block_live = bool(force_block_live)
         self.trading_day = bool(self._now_kst.weekday() < 5) if trading_day is None else bool(trading_day)
+        self.strategy_mode = str(os.getenv("STRATEGY_MODE") or "").strip().upper()
         self.precomputed_final30_df = precomputed_final30_df if precomputed_final30_df is not None else self.final30_df
         self.precomputed_derived_df = precomputed_derived_df if precomputed_derived_df is not None else precomputed_features_df
         self.precomputed_universe_df = precomputed_universe_df
@@ -1942,9 +1947,23 @@ class PB1Engine:
                     days_held = max(0, (today_kst - entry_dt.date()).days)
                 except Exception:
                     entry_date = str(entry_ts_raw)
-            market_value = float(row.get("total_cost") or (last_price * qty))
+            total_cost = float(row.get("total_cost") or (avg_price * qty) or 0.0)
+            market_value = float(last_price * qty)
             unrealized_pnl = ((last_price - avg_price) * qty) if avg_price > 0 else 0.0
             unrealized_pct = (((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0
+            pos_meta = dict(row)
+            pos_meta.update(
+                {
+                    "avg_buy_price": avg_price,
+                    "total_cost": total_cost,
+                    "entry_date": entry_date,
+                    "last_fill_at": str(entry_ts_raw) if entry_ts_raw else None,
+                    "entry_reason": pos_meta.get("entry_reason") or (pos_meta.get("entry_meta_json") or {}).get("entry_reason"),
+                    "entry_style_selected": pos_meta.get("entry_style_selected") or (pos_meta.get("entry_meta_json") or {}).get("entry_style_selected"),
+                    "stop_price_at_entry": pos_meta.get("stop_price_at_entry") or (pos_meta.get("entry_meta_json") or {}).get("stop_price_at_entry"),
+                    "pivot_price_at_entry": pos_meta.get("pivot_price_at_entry") or (pos_meta.get("entry_meta_json") or {}).get("pivot_price_at_entry"),
+                }
+            )
             holdings.append(
                 HoldingContext(
                     code=code,
@@ -1963,7 +1982,7 @@ class PB1Engine:
                     entry_date=entry_date,
                     days_held=days_held,
                     last_fill_at=str(entry_ts_raw) if entry_ts_raw else None,
-                    position_meta=dict(row),
+                    position_meta=pos_meta,
                 )
             )
         return holdings
@@ -2010,6 +2029,10 @@ class PB1Engine:
                     "avg_price": 0.0,
                     "last_fill_at": None,
                     "entry_ts": None,
+                    "entry_reason": None,
+                    "entry_style_selected": None,
+                    "stop_price_at_entry": None,
+                    "pivot_price_at_entry": None,
                     "market": (positions_by_code.get(code) or {}).get("market"),
                 },
             )
@@ -2019,6 +2042,15 @@ class PB1Engine:
                 state["avg_price"] = (state["total_cost"] / state["qty"]) if state["qty"] > 0 else 0.0
                 state["entry_ts"] = state.get("entry_ts") or fill.get("filled_at")
                 state["last_fill_at"] = fill.get("filled_at")
+                fill_meta = dict(fill.get("fill_meta_json") or fill.get("entry_meta_json") or {})
+                if not state.get("entry_reason"):
+                    state["entry_reason"] = fill.get("entry_reason") or fill_meta.get("entry_reason")
+                if not state.get("entry_style_selected"):
+                    state["entry_style_selected"] = fill.get("entry_style_selected") or fill_meta.get("entry_style_selected")
+                if not state.get("stop_price_at_entry"):
+                    state["stop_price_at_entry"] = fill.get("stop_price_at_entry") or fill_meta.get("stop_price_at_entry")
+                if not state.get("pivot_price_at_entry"):
+                    state["pivot_price_at_entry"] = fill.get("pivot_price_at_entry") or fill_meta.get("pivot_price_at_entry")
             elif side == "SELL":
                 close_qty = min(state["qty"], qty)
                 avg_price = float(state.get("avg_price") or 0.0)
@@ -2045,8 +2077,21 @@ class PB1Engine:
                     entry_date = str(entry_ts_raw)
             avg_price = float(state.get("avg_price") or pos_meta.get("avg_buy_price") or 0.0)
             last_price = float(pos_meta.get("last_price") or self._balance_price_map.get(code) or avg_price or 0.0)
+            total_cost = float(state.get("total_cost") or pos_meta.get("total_cost") or (avg_price * qty) or 0.0)
             unrealized_pnl = ((last_price - avg_price) * qty) if avg_price > 0 else 0.0
             unrealized_pct = (((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0
+            pos_meta.update(
+                {
+                    "avg_buy_price": avg_price,
+                    "total_cost": total_cost,
+                    "entry_date": entry_date,
+                    "last_fill_at": str(state.get("last_fill_at") or "") or None,
+                    "entry_reason": pos_meta.get("entry_reason") or state.get("entry_reason") or (pos_meta.get("entry_meta_json") or {}).get("entry_reason"),
+                    "entry_style_selected": pos_meta.get("entry_style_selected") or state.get("entry_style_selected") or (pos_meta.get("entry_meta_json") or {}).get("entry_style_selected"),
+                    "stop_price_at_entry": pos_meta.get("stop_price_at_entry") or state.get("stop_price_at_entry") or (pos_meta.get("entry_meta_json") or {}).get("stop_price_at_entry"),
+                    "pivot_price_at_entry": pos_meta.get("pivot_price_at_entry") or state.get("pivot_price_at_entry") or (pos_meta.get("entry_meta_json") or {}).get("pivot_price_at_entry"),
+                }
+            )
             holdings.append(
                 HoldingContext(
                     code=code,
@@ -4421,22 +4466,15 @@ class PB1Engine:
                 cf.setup_ok = False
                 cf.reasons.append("order_price_missing")
                 continue
-            df, _ = self._fetch_daily(cf.code)
-            if df.empty:
+            stop0, stop_source, stop_degraded, stop_reason = self._build_stop_price(cf, order_px)
+            if stop0 is None:
                 cf.setup_ok = False
                 cf.reasons.append("stop_calc_fail")
+                if stop_reason:
+                    logger.warning("[STOP][BUILD][FAIL] code=%s reason=%s", cf.code, stop_reason)
                 continue
-            pivot_val = cf.features.get("pivot")
-            tight_low = cf.features.get("tight_low")
-            atr_val = cf.features.get("atr14")
-            stop0 = calc_initial_stop(
-                pivot=float(pivot_val) if pivot_val is not None else float("nan"),
-                tight_low=float(tight_low) if tight_low is not None else None,
-                atr=float(atr_val) if atr_val is not None else None,
-                mode=INITIAL_STOP_MODE,
-                entry=order_px,
-                atr_mult=ATR_MULT,
-            )
+            cf.features["stop_source"] = stop_source
+            cf.features["stop_degraded"] = int(stop_degraded)
             per_share_risk = order_px - stop0
             if per_share_risk <= 0:
                 cf.setup_ok = False
@@ -4959,6 +4997,15 @@ class PB1Engine:
         client_order_key: str | None,
         stage: str,
     ) -> bool:
+        gate_reasons = self._order_precheck_gate_reasons(side=side, stage=stage)
+        if gate_reasons:
+            logger.info(
+                "[ORDER_PRECHECK][SKIP] side=%s code=%s reasons=%s",
+                side.upper(),
+                self._display_code(code),
+                gate_reasons,
+            )
+            return False
         if not self.kis:
             return False
         ok, reason = validate_tradeable(self.kis, code)
@@ -4983,6 +5030,120 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][LEDGER][PRETRADE_SKIP_FAIL] code=%s", display_code)
         return False
+
+    def _order_precheck_gate_reasons(self, *, side: str, stage: str) -> list[str]:
+        del stage
+        reasons: list[str] = []
+        if not self.trading_day:
+            reasons.append("nontrading_day")
+        if not bool(self.order_allowed):
+            reasons.append("order_blocked")
+        if self.market_window_name == "after":
+            reasons.append("window_blocked")
+        if self.force_block_live or not self.intended_live or self.strategy_mode == "DIAG":
+            reasons.append("live_gate_blocked")
+        deduped: list[str] = []
+        for reason in reasons:
+            if reason not in deduped:
+                deduped.append(reason)
+        return deduped
+
+    def _resolve_exit_submit_gate_reasons(self, *, code: str) -> list[str]:
+        reasons = self._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT")
+        logger.info(
+            "[EXIT][SUBMIT_GATE] code=%s order_allowed=%s trading_day=%s force_block_live=%s source=%s action=%s",
+            self._display_code(code),
+            int(bool(self.order_allowed)),
+            int(bool(self.trading_day)),
+            int(bool(self.force_block_live)),
+            str((self._exit_holdings_meta or {}).get("source") or "unknown"),
+            "skip_before_precheck" if reasons else "allow",
+        )
+        return reasons
+
+    def _build_stop_price(self, cf: CandidateFeature, order_px: float) -> tuple[float | None, str | None, int, str | None]:
+        features = cf.features or {}
+        close_px = self._to_float(features.get("close") or features.get("last_price") or order_px)
+        atr_val = self._to_float(features.get("atr14") or features.get("atr"))
+        ma20 = self._to_float(features.get("ma20"))
+        ma50 = self._to_float(features.get("ma50"))
+        stop_price_at_entry = self._to_float(features.get("stop_price_at_entry") or features.get("stop_price"))
+        pivot_val = features.get("pivot_price_at_entry")
+        if pivot_val is None:
+            pivot_val = features.get("pivot")
+        tight_low = features.get("tight_low")
+        entry_style_selected = str(features.get("entry_style_selected") or "").strip().upper()
+
+        if stop_price_at_entry is not None and stop_price_at_entry > 0 and stop_price_at_entry < order_px:
+            logger.info(
+                "[STOP][BUILD] code=%s source=entry_metadata close=%s atr=%s stop=%s degraded=0",
+                cf.code,
+                close_px,
+                atr_val,
+                float(stop_price_at_entry),
+            )
+            return float(stop_price_at_entry), "entry_metadata", 0, None
+
+        if pivot_val is not None or tight_low is not None:
+            calc_stop = calc_initial_stop(
+                pivot=float(pivot_val) if pivot_val is not None else float("nan"),
+                tight_low=float(tight_low) if tight_low is not None else None,
+                atr=float(atr_val) if atr_val is not None else None,
+                mode=INITIAL_STOP_MODE,
+                entry=order_px,
+                atr_mult=ATR_MULT,
+            )
+            if calc_stop is not None and pd.notna(calc_stop) and float(calc_stop) > 0 and float(calc_stop) < order_px:
+                logger.info(
+                    "[STOP][BUILD] code=%s source=calc_initial_stop close=%s atr=%s stop=%s degraded=0",
+                    cf.code,
+                    close_px,
+                    atr_val,
+                    float(calc_stop),
+                )
+                return float(calc_stop), "calc_initial_stop", 0, None
+
+        if close_px is not None and atr_val is not None and atr_val > 0:
+            atr_mult = max(ATR_MULT, 2.2) if entry_style_selected == "MOMENTUM" else ATR_MULT
+            stop_price = min(float(close_px - (atr_val * atr_mult)), order_px * 0.99)
+            if stop_price > 0:
+                logger.info(
+                    "[STOP][BUILD] code=%s source=atr_fallback close=%s atr=%s stop=%s degraded=0",
+                    cf.code,
+                    close_px,
+                    atr_val,
+                    stop_price,
+                )
+                return stop_price, "atr_fallback", 0, None
+
+        ma_candidates = [value for value in (ma20, ma50) if value is not None and value > 0]
+        if close_px is not None and close_px > 0 and ma_candidates:
+            stop_price = min(min(ma_candidates), float(close_px) * 0.97, order_px * 0.99)
+            if stop_price > 0:
+                logger.info(
+                    "[STOP][BUILD] code=%s source=ma_fallback close=%s atr=%s stop=%s degraded=0",
+                    cf.code,
+                    close_px,
+                    atr_val,
+                    stop_price,
+                )
+                return stop_price, "ma_fallback", 0, None
+
+        if close_px is not None and close_px > 0:
+            stop_price = min(float(close_px) * 0.90, order_px * 0.99)
+            if stop_price > 0:
+                logger.info(
+                    "[STOP][BUILD] code=%s source=hard_fallback close=%s atr=%s ma20=%s ma50=%s stop=%s degraded=1 reason=missing_all_primary_inputs",
+                    cf.code,
+                    close_px,
+                    atr_val,
+                    ma20,
+                    ma50,
+                    stop_price,
+                )
+                return stop_price, "hard_fallback", 1, "missing_all_primary_inputs"
+
+        return None, None, 1, "missing_all_primary_inputs"
 
     def _submit_force_buy_order(self, code: str, qty: int) -> None:
         """
@@ -6342,6 +6503,15 @@ class PB1Engine:
             exit_eval.primary_reason,
         )
 
+        submit_block_reasons = self._resolve_exit_submit_gate_reasons(code=code)
+        if submit_block_reasons:
+            exit_eval_payload["submit_attempted"] = 0
+            exit_eval_payload["submitted"] = 0
+            exit_eval_payload["api_called"] = 0
+            exit_eval_payload["order_skip_reasons"] = submit_block_reasons
+            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, submit_block_reasons)
+            return exit_eval_payload
+
         cooldown_until: str | None = None
         if exit_eval.primary_reason in {"EXIT_STOP_LOSS", "EXIT_RISK_OFF"}:
             if REENTRY_COOLDOWN_DAYS <= 0:
@@ -6398,20 +6568,6 @@ class PB1Engine:
             days_held,
             stage,
         )
-
-        submit_block_reasons: list[str] = []
-        if self.dry_run:
-            submit_block_reasons.append("dry_run")
-        if not self.trading_day or self.market_window_name == "after":
-            submit_block_reasons.append("window_blocked")
-        if self.force_block_live or not self.intended_live:
-            submit_block_reasons.append("live_gate_blocked")
-        if not self.kis:
-            submit_block_reasons.append("kis_unavailable")
-        if submit_block_reasons:
-            exit_eval_payload["submit_attempted"] = 1
-            exit_eval_payload["order_skip_reasons"] = submit_block_reasons
-            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, submit_block_reasons)
         if self.dry_run:
             logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
             return exit_eval_payload

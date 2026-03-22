@@ -152,6 +152,15 @@ FINAL30_SCORED_DB_CONTRACT_FIELDS = [
 ]
 
 FINAL30_SCORED_REQUIRED_ROWS = 30
+FINAL30_SCORED_NULLABLE_FIELDS = {
+    "close",
+    "ma20",
+    "ma50",
+    "ma150",
+    "atr_pct",
+    "rs_percentile",
+}
+FINAL30_SCORED_ZERO_INVALID_FIELDS = {"ma20", "ma50", "ma150"}
 
 SCORED_WATCHLIST_STRATEGIES = {
     "pb1_watchlist_final_scored",
@@ -270,13 +279,35 @@ def summarize_final30_scored_contract(
         1
         for row in normalized_rows
         for field in FINAL30_SCORED_DB_CONTRACT_FIELDS
+        if field not in FINAL30_SCORED_NULLABLE_FIELDS and _contract_value_missing((row or {}).get(field))
+    )
+    null_warnings = sum(
+        1
+        for row in normalized_rows
+        for field in FINAL30_SCORED_NULLABLE_FIELDS
         if _contract_value_missing((row or {}).get(field))
+    )
+    critical_numeric_zero_invalid = sum(
+        1
+        for row in normalized_rows
+        for field in FINAL30_SCORED_ZERO_INVALID_FIELDS
+        if not _contract_value_missing((row or {}).get(field)) and float((row or {}).get(field) or 0.0) == 0.0
+    )
+    atr_pct_zero_invalid_when_close_positive = sum(
+        1
+        for row in normalized_rows
+        if not _contract_value_missing((row or {}).get("atr_pct"))
+        and float((row or {}).get("atr_pct") or 0.0) == 0.0
+        and not _contract_value_missing((row or {}).get("close"))
+        and float((row or {}).get("close") or 0.0) > 0.0
     )
 
     ok = (
         len(normalized_rows) == int(expected_rows)
         and uniq_codes == int(expected_rows)
         and null_critical == 0
+        and critical_numeric_zero_invalid == 0
+        and atr_pct_zero_invalid_when_close_positive == 0
     )
     return {
         "rows": len(normalized_rows),
@@ -285,6 +316,10 @@ def summarize_final30_scored_contract(
         "rank_source": rank_source,
         "rank_warn": bool(rank_warn),
         "null_critical": null_critical,
+        "null_warnings": null_warnings,
+        "critical_numeric_zero_invalid": sorted(FINAL30_SCORED_ZERO_INVALID_FIELDS),
+        "critical_numeric_zero_invalid_count": critical_numeric_zero_invalid,
+        "atr_pct_zero_invalid_when_close_positive": atr_pct_zero_invalid_when_close_positive,
         "as_of_values": as_of_values,
         "missing_fields": missing_fields,
         "env": _norm_env(env),
@@ -3168,17 +3203,28 @@ class WatchlistRepo:
         summary["strategy"] = _norm_strategy(strategy)
         if log_result:
             logger.info(
-                "[DB][FINAL30_SCORED][VERIFY] rows=%s uniq_codes=%s uniq_ranks=%s rank_source=%s rank_warn=%s null_critical=%s env=%s as_of=%s ok=%s",
+                "[DB][FINAL30_SCORED][VERIFY] rows=%s uniq_codes=%s uniq_ranks=%s rank_source=%s rank_warn=%s null_critical=%s null_warnings=%s zero_invalid=%s atr_zero_invalid=%s env=%s as_of=%s ok=%s",
                 summary["rows"],
                 summary["uniq_codes"],
                 summary["uniq_ranks"],
                 summary["rank_source"],
                 int(summary["rank_warn"]),
                 summary["null_critical"],
+                summary.get("null_warnings", 0),
+                summary.get("critical_numeric_zero_invalid_count", 0),
+                summary.get("atr_pct_zero_invalid_when_close_positive", 0),
                 summary["env"],
                 summary["as_of"],
                 int(summary["ok"]),
             )
+            if summary.get("null_warnings"):
+                logger.warning(
+                    "[DB][FINAL30_SCORED][VERIFY][NULL_WARN] env=%s as_of=%s null_warnings=%s nullable_fields=%s",
+                    summary["env"],
+                    summary["as_of"],
+                    summary.get("null_warnings", 0),
+                    sorted(FINAL30_SCORED_NULLABLE_FIELDS),
+                )
         return summary
 
     def load_watchlist_scored(

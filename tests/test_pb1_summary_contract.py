@@ -9,6 +9,7 @@ from trader.pb1_runner import generate_run_summary_json
 class DummyEngine:
     reject_reason_counts = {}
     _debug_summary = {"order_candidate_codes": ["009150"], "submit_attempt_count": 0}
+    _scanner_summary = {"usable_count": 30, "setup_ok_count": 8, "total": 30}
     _run_summary_payload = {
         "scanned": 30,
         "setup_ok": 6,
@@ -72,3 +73,8 @@ def test_generate_run_summary_json_uses_engine_payload(tmp_path, monkeypatch) ->
     assert payload["counts"]["submit_success_count"] == 0
     assert payload["no_trade_reason"] == "BUYABLE_TODAY_BUY_EXISTS"
     assert payload["entry_decision_result"] == "SKIP"
+    assert payload["consistency"]["raw_signal_setup_ok"] == 8
+    assert payload["consistency"]["pb1_filter_setup_ok"] == 6
+    assert payload["consistency"]["risk_ok"] == 4
+    assert payload["consistency"]["sized_ok"] == 3
+    assert payload["consistency"]["buyable_ok"] == 0
