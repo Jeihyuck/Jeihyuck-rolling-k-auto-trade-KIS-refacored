@@ -1567,6 +1567,9 @@ def main() -> int:
         "momentum_nonzero": 0,
     }
     final30_quality: dict[str, Any] = summarize_final30_quality(pd.DataFrame())
+    final30_quality_ok = False
+    final30_quality_soft_fail = False
+    final30_trade_can_proceed = False
     if final30_df is not None and not final30_df.empty:
         logger.info(
             "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s",
@@ -1598,16 +1601,17 @@ def main() -> int:
             "momentum_nonzero": momentum_nonzero,
         }
         final30_quality = summarize_final30_quality(final30_df, required_rows=FINAL30_SCORED_REQUIRED_ROWS)
+        final30_quality_ok = bool(final30_quality.get("ok", False))
+        final30_quality_soft_fail = bool(final30_quality.get("soft_fail", False))
+        final30_trade_can_proceed = bool(final30_quality_ok and not final30_quality_soft_fail)
         logger.info(
-            "[PREP][FINAL30][QUALITY] rows=%s ma20_valid=%s atr_valid=%s breakout_valid=%s pullback_valid=%s momentum_valid=%s entry_style_monoculture=%s ok=%s",
-            final30_quality["rows"],
-            round(final30_quality["valid_ma20_ratio"], 4),
-            round(final30_quality["valid_atr_ratio"], 4),
-            round(final30_quality["breakout_nonnull_ratio"], 4),
-            round(final30_quality["pullback_nonnull_ratio"], 4),
-            round(final30_quality["momentum_nonnull_ratio"], 4),
-            int(final30_quality["entry_style_monoculture"]),
-            int(final30_quality["ok"]),
+            "[PREP][FINAL30][QUALITY] ok=%s soft_fail=%s rows=%s uniq_codes=%s momentum_monoculture=%s score_monoculture=%s",
+            final30_quality_ok,
+            final30_quality_soft_fail,
+            final30_quality.get("rows"),
+            final30_quality.get("uniq_codes"),
+            final30_quality.get("momentum_monoculture"),
+            final30_quality.get("score_monoculture"),
         )
         logger.info(
             "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
@@ -1661,14 +1665,19 @@ def main() -> int:
         "watchlist_count": len(watchlist or []),
         "final30_count": final30_locked_count,
         "fallbacks_used": sorted(set(fallbacks_used)),
-        "build_status": "DEGRADED" if fallbacks_used else "OK",
+        "build_status": "DEGRADED" if fallbacks_used else ("WARN" if (not final30_quality_ok or final30_quality_soft_fail) else "OK"),
+        "final30_quality": final30_quality,
+        "final30_quality_ok": final30_quality_ok,
+        "final30_quality_soft_fail": final30_quality_soft_fail,
+        "trade_can_proceed": int(final30_trade_can_proceed),
         "steps": step_payloads,
     }
-    (prep_dir / "prep_manifest.json").write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+    prep_manifest_path = prep_dir / "prep_manifest.json"
+    prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     (prep_dir / "candidate_pool_snapshot.json").write_text(json.dumps(to_jsonable(bundle_pool120), ensure_ascii=False, indent=2), encoding="utf-8")
     (prep_dir / "watchlist_snapshot.json").write_text(json.dumps(to_jsonable(watchlist or []), ensure_ascii=False, indent=2), encoding="utf-8")
     (prep_dir / "final30_locked.json").write_text(json.dumps(to_jsonable(final30_locked_rows), ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("[PREP][MANIFEST][SAVE] path=%s status=%s fallbacks=%s", prep_dir / "prep_manifest.json", prep_manifest["build_status"], prep_manifest["fallbacks_used"])
+    logger.info("[PREP][MANIFEST][SAVE] path=%s status=%s fallbacks=%s", prep_manifest_path, prep_manifest["build_status"], prep_manifest["fallbacks_used"])
     runtime_exported = False
     logger.info("[PREP][HEARTBEAT] stage=export status=start")
     try:
@@ -1818,22 +1827,13 @@ def main() -> int:
             final30_file_failures,
         )
     strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or [])
-    if not final30_quality.get("ok", False):
-        strict_contract_failures.extend(
-            [
-                f"final30_quality:{failure}"
-                for failure in (
-                    [
-                        f"ma20_valid_ratio={final30_quality['valid_ma20_ratio']:.3f}",
-                        f"atr_valid_ratio={final30_quality['valid_atr_ratio']:.3f}",
-                        f"breakout_nonnull_ratio={final30_quality['breakout_nonnull_ratio']:.3f}",
-                        f"pullback_nonnull_ratio={final30_quality['pullback_nonnull_ratio']:.3f}",
-                        f"momentum_nonnull_ratio={final30_quality['momentum_nonnull_ratio']:.3f}",
-                    ]
-                    + (["entry_style_monoculture"] if final30_quality.get("entry_style_monoculture") else [])
-                    + (["score_monoculture"] if final30_quality.get("score_monoculture") else [])
-                )
-            ]
+    if (not final30_quality_ok) or final30_quality_soft_fail:
+        logger.warning(
+            "[PREP][FINAL30][QUALITY_WARN] ok=%s soft_fail=%s hard_fail_reasons=%s soft_fail_reasons=%s",
+            final30_quality_ok,
+            final30_quality_soft_fail,
+            final30_quality.get("hard_fail_reasons", []),
+            final30_quality.get("soft_fail_reasons", []),
         )
     if bool(scored_contract) and final30_file_contract_ok:
         logger.info(
@@ -1944,6 +1944,8 @@ def main() -> int:
             as_of.isoformat(),
             strict_contract_failures,
         )
+    elif (not final30_quality_ok) or final30_quality_soft_fail:
+        prep_status = "WARN"
 
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
@@ -2011,6 +2013,10 @@ def main() -> int:
             "final30_file_failures": final30_file_failures,
             "final_source": final30_source_label,
             "prep_status": prep_status,
+            "final30_quality": final30_quality,
+            "final30_quality_ok": final30_quality_ok,
+            "final30_quality_soft_fail": final30_quality_soft_fail,
+            "trade_can_proceed": int(final30_trade_can_proceed),
             "durations_sec": {
                 "ohlcv_delta": round(dt_ohlcv, 2),
                 "derived": round(dt_derived, 2),
@@ -2020,6 +2026,12 @@ def main() -> int:
             },
         }
     )
+    prep_manifest["build_status"] = prep_status
+    prep_manifest["final30_quality"] = final30_quality
+    prep_manifest["final30_quality_ok"] = final30_quality_ok
+    prep_manifest["final30_quality_soft_fail"] = final30_quality_soft_fail
+    prep_manifest["trade_can_proceed"] = int(final30_trade_can_proceed)
+    prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     
     # ✅ FIX: Mutually exclusive PREP event logging
     if prep_status == "FAIL":
@@ -2064,6 +2076,24 @@ def main() -> int:
             logger.warning("[PREP][DEGRADED][ALLOW] -> exit=0")
             return 0
         return 1
+
+    elif prep_status == "WARN":
+        ledger_repo.append_event(
+            env=env,
+            run_id=run_id,
+            strategy="pb1_pullback_close",
+            run_window="prep",
+            event_type="PREP_DONE",
+            ts=now_kst(),
+            payload_json=payload,
+        )
+        logger.warning(
+            "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s status=WARN quality_ok=%s soft_fail=%s trade_can_proceed=%s",
+            as_of.isoformat(),
+            int(final30_quality_ok),
+            int(final30_quality_soft_fail),
+            int(final30_trade_can_proceed),
+        )
     
     else:
         # prep_status == "DONE"
@@ -2131,7 +2161,7 @@ def main() -> int:
         )
 
     logger.info(
-        "[PREP][DONE] as_of=%s source=%s universe=%s pool120=%s top50=%s final30=%s flow_coverage=%.1f final_source=%s contract_mode=%s dt=%.2f",
+        "[PREP][DONE] as_of=%s source=%s universe=%s pool120=%s top50=%s final30=%s flow_coverage=%.1f final_source=%s contract_mode=%s status=%s quality_ok=%s soft_fail=%s trade_can_proceed=%s dt=%.2f",
         as_of.isoformat(),
         bundle_source,
         len(bundle_universe),
@@ -2141,6 +2171,10 @@ def main() -> int:
         flow_coverage * 100.0,
         final30_source_label,
         contract_mode,
+        prep_status,
+        int(final30_quality_ok),
+        int(final30_quality_soft_fail),
+        int(final30_trade_can_proceed),
         time.monotonic() - t0,
     )
     return 0

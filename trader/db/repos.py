@@ -305,21 +305,8 @@ def summarize_final30_scored_contract(
         and float((row or {}).get("close") or 0.0) > 0.0
     )
     quality = summarize_final30_quality(pd.DataFrame(normalized_rows), required_rows=int(expected_rows))
-    quality_failures: list[str] = []
-    if quality["valid_ma20_ratio"] < 0.95:
-        quality_failures.append(f"ma20_valid_ratio:{quality['valid_ma20_ratio']:.3f}")
-    if quality["valid_atr_ratio"] < 0.95:
-        quality_failures.append(f"atr_valid_ratio:{quality['valid_atr_ratio']:.3f}")
-    if quality["breakout_nonnull_ratio"] < 0.95:
-        quality_failures.append(f"breakout_nonnull_ratio:{quality['breakout_nonnull_ratio']:.3f}")
-    if quality["pullback_nonnull_ratio"] < 0.95:
-        quality_failures.append(f"pullback_nonnull_ratio:{quality['pullback_nonnull_ratio']:.3f}")
-    if quality["momentum_nonnull_ratio"] < 0.90:
-        quality_failures.append(f"momentum_nonnull_ratio:{quality['momentum_nonnull_ratio']:.3f}")
-    if quality["entry_style_monoculture"]:
-        quality_failures.append("entry_style_monoculture")
-    if quality["score_monoculture"]:
-        quality_failures.append("score_monoculture")
+    quality_failures: list[str] = list(quality.get("hard_fail_reasons", []))
+    quality_soft_failures: list[str] = list(quality.get("soft_fail_reasons", []))
 
     ok = (
         len(normalized_rows) == int(expected_rows)
@@ -347,6 +334,7 @@ def summarize_final30_scored_contract(
         "expected_rows": int(expected_rows),
         "quality": quality,
         "quality_failures": quality_failures,
+        "quality_soft_failures": quality_soft_failures,
         "ok": bool(ok),
         "rows_data": normalized_rows,
         "columns": all_columns,

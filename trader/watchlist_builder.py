@@ -25,7 +25,7 @@ from trader.db.repos import (
     WatchlistRepo,
 )
 from trader.flow_score import calculate_final_score, calculate_flow_score
-from trader.final30_quality import dominant_value_ratio, score_distribution_is_monoculture, summarize_final30_quality
+from trader.final30_quality import dominant_value_ratio, is_placeholder_entry_value, normalize_entry_input_value, score_distribution_is_monoculture, summarize_final30_quality
 from trader.factors.multifactor import (
     compute_ai_rs_scores,
     compute_liquidity_score,
@@ -204,6 +204,10 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 def _safe_nullable_float(v: Any) -> float | None:
     return safe_nullable_float(v)
+
+
+def _sanitize_entry_input(v: Any) -> float | None:
+    return normalize_entry_input_value(v)
 
 
 def _prefer_valid_numeric(body_value: Any, meta_value: Any, *, zero_invalid: bool = False) -> float | None:
@@ -865,20 +869,29 @@ def _enrich_watchlist_rows(
         row.setdefault("rank_top50", _safe_int(row.get("rank_top50"), 0))
         row.setdefault("rank_pool120", _safe_int(row.get("rank_pool120"), 0))
 
-    quality = summarize_final30_quality(pd.DataFrame(enriched), required_rows=len(enriched) if len(enriched) != 30 else 30)
+    quality = summarize_final30_quality(pd.DataFrame(enriched), required_rows=30)
+    quality_ok = bool(quality.get("ok", False))
+    quality_soft_fail = bool(quality.get("soft_fail", False))
     logger.info(
-        "[PREP][FINAL30][QUALITY] rows=%s ma20_valid=%s atr_valid=%s breakout_valid=%s pullback_valid=%s momentum_valid=%s entry_style_monoculture=%s ok=%s",
-        quality["rows"],
-        round(quality["valid_ma20_ratio"], 4),
-        round(quality["valid_atr_ratio"], 4),
-        round(quality["breakout_nonnull_ratio"], 4),
-        round(quality["pullback_nonnull_ratio"], 4),
-        round(quality["momentum_nonnull_ratio"], 4),
-        int(quality["entry_style_monoculture"]),
-        int(quality["ok"]),
+        "[WATCHLIST][FINAL30][QUALITY] rows=%s uniq_codes=%s valid_ma20_ratio=%.3f valid_atr_ratio=%.3f breakout_nonnull_ratio=%.3f pullback_nonnull_ratio=%.3f momentum_nonnull_ratio=%.3f valid_score_final_ratio=%.3f entry_style_monoculture=%s breakout_monoculture=%s pullback_monoculture=%s momentum_monoculture=%s score_pattern_monoculture=%s score_monoculture=%s ok=%s",
+        quality.get("rows"),
+        quality.get("uniq_codes"),
+        float(quality.get("valid_ma20_ratio", 0.0)),
+        float(quality.get("valid_atr_ratio", 0.0)),
+        float(quality.get("breakout_nonnull_ratio", 0.0)),
+        float(quality.get("pullback_nonnull_ratio", 0.0)),
+        float(quality.get("momentum_nonnull_ratio", 0.0)),
+        float(quality.get("valid_score_final_ratio", 0.0)),
+        quality.get("entry_style_monoculture"),
+        quality.get("breakout_monoculture"),
+        quality.get("pullback_monoculture"),
+        quality.get("momentum_monoculture"),
+        quality.get("score_pattern_monoculture"),
+        quality.get("score_monoculture"),
+        quality_ok,
     )
-    if len(enriched) == 30 and not quality["ok"]:
-        raise RuntimeError(f"FINAL30_QUALITY_FAILED:{quality}")
+    if not quality_ok or quality_soft_fail:
+        logger.warning("[WATCHLIST][FINAL30][QUALITY_FAIL_SOFT] quality=%s", quality)
 
     if flow_rows:
         try:
@@ -2432,21 +2445,41 @@ class WatchlistBuilder:
         
         Returns score in 0-100 range.
         """
-        close = _safe_float(_row_get(row, "close", 0.0))
-        high_20d = _safe_float(_row_get(row, "high_20d", _row_get(row, "high20", 0.0)))
-        high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
-        pivot = _safe_float(_row_get(row, "pivot_price", _row_get(row, "pivot", 0.0)))
-        volume = _safe_float(_row_get(row, "volume", 0.0))
-        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(row, "vol20", 0.0)))
+        close = _sanitize_entry_input(_row_get(row, "close", None))
+        high_20d = _sanitize_entry_input(_row_get(row, "high_20d", _row_get(row, "high20", None)))
+        high_55d = _sanitize_entry_input(_row_get(row, "high_55d", _row_get(row, "high55", None)))
+        pivot = _sanitize_entry_input(_row_get(row, "pivot_price", _row_get(row, "pivot", None)))
+        volume = _sanitize_entry_input(_row_get(row, "volume", None))
+        volume_avg20 = _sanitize_entry_input(_row_get(row, "volume_avg20", _row_get(row, "vol20", None)))
         breakout_ref = pivot if pivot > 0 else high_20d if high_20d > 0 else high_55d
         anomalies = list(_row_get(row, "score_anomalies", []))
 
+        placeholder_fields = [
+            field
+            for field, value in {
+                "close": _row_get(row, "close", None),
+                "pivot_price": _row_get(row, "pivot_price", _row_get(row, "pivot", None)),
+                "high_20d": _row_get(row, "high_20d", _row_get(row, "high20", None)),
+                "high_55d": _row_get(row, "high_55d", _row_get(row, "high55", None)),
+                "volume": _row_get(row, "volume", None),
+                "volume_avg20": _row_get(row, "volume_avg20", _row_get(row, "vol20", None)),
+            }.items()
+            if is_placeholder_entry_value(value)
+        ]
+        if placeholder_fields:
+            anomalies.append("breakout_placeholder_inputs")
+            logger.warning(
+                "[WATCHLIST][ENTRY][PLACEHOLDER] code=%s style=BREAKOUT fields=%s",
+                str(_row_get(row, "code", "") or "").zfill(6),
+                placeholder_fields,
+            )
+
         score = 0.0
-        if close <= 0 or breakout_ref <= 0:
+        if close is None or breakout_ref is None or close <= 0 or breakout_ref <= 0:
             anomalies.append("breakout_missing_price_context")
-        if volume_avg20 <= 0:
+        if volume_avg20 is None or volume_avg20 <= 0:
             anomalies.append("breakout_missing_volume_context")
-        if close <= 0 or breakout_ref <= 0 or volume <= 0 or volume_avg20 <= 0:
+        if close is None or breakout_ref is None or volume is None or volume_avg20 is None or close <= 0 or breakout_ref <= 0 or volume <= 0 or volume_avg20 <= 0:
             _row_set(row, "score_anomalies", sorted(set(anomalies)))
             return None
 
@@ -2492,16 +2525,34 @@ class WatchlistBuilder:
         
         Returns score in 0-100 range.
         """
-        close = _safe_float(_row_get(row, "close", 0.0))
+        close = _sanitize_entry_input(_row_get(row, "close", None))
         ma20 = _safe_float(_row_get(row, "ma20", 0.0))
         ma50 = _safe_float(_row_get(row, "ma50", 0.0))
-        high_55d = _safe_float(_row_get(row, "high_55d", _row_get(row, "high55", 0.0)))
-        volume = _safe_float(_row_get(row, "volume", 0.0))
-        volume_avg20 = _safe_float(_row_get(row, "volume_avg20", _row_get(row, "vol20", 0.0)))
+        high_55d = _sanitize_entry_input(_row_get(row, "high_55d", _row_get(row, "high55", None)))
+        volume = _sanitize_entry_input(_row_get(row, "volume", None))
+        volume_avg20 = _sanitize_entry_input(_row_get(row, "volume_avg20", _row_get(row, "vol20", None)))
         anomalies = list(_row_get(row, "score_anomalies", []))
 
+        placeholder_fields = [
+            field
+            for field, value in {
+                "close": _row_get(row, "close", None),
+                "high_55d": _row_get(row, "high_55d", _row_get(row, "high55", None)),
+                "volume": _row_get(row, "volume", None),
+                "volume_avg20": _row_get(row, "volume_avg20", _row_get(row, "vol20", None)),
+            }.items()
+            if is_placeholder_entry_value(value)
+        ]
+        if placeholder_fields:
+            anomalies.append("pullback_placeholder_inputs")
+            logger.warning(
+                "[WATCHLIST][ENTRY][PLACEHOLDER] code=%s style=PULLBACK fields=%s",
+                str(_row_get(row, "code", "") or "").zfill(6),
+                placeholder_fields,
+            )
+
         score = 0.0
-        if close <= 0 or high_55d <= 0 or (ma20 <= 0 and ma50 <= 0) or volume <= 0 or volume_avg20 <= 0:
+        if close is None or high_55d is None or volume is None or volume_avg20 is None or close <= 0 or high_55d <= 0 or (ma20 <= 0 and ma50 <= 0) or volume <= 0 or volume_avg20 <= 0:
             anomalies.append("pullback_missing_context")
             _row_set(row, "score_anomalies", sorted(set(anomalies)))
             return None
@@ -2543,40 +2594,58 @@ class WatchlistBuilder:
         
         Returns score in 0-100 range.
         """
-        ret_20d = _safe_float(_row_get(row, "ret_20d", _row_get(row, "ret20", 0.0)))
-        ret_60d = _safe_float(_row_get(row, "ret_60d", _row_get(row, "ret60", 0.0)))
-        ret_120d = _safe_float(_row_get(row, "ret_120d", _row_get(row, "ret120", 0.0)))
-        rs_score = _safe_float(_row_get(row, "rs_score", _row_get(row, "rs_percentile", 0.0)))
-        ma20_slope = _safe_float(_row_get(row, "ma20_slope", 0.0))
-        ma50_slope = _safe_float(_row_get(row, "ma50_slope", 0.0))
-        ma150_slope = _safe_float(_row_get(row, "ma150_slope", 0.0))
+        close = _sanitize_entry_input(_row_get(row, "close", None))
+        ma50 = _safe_nullable_float(_row_get(row, "ma50", None))
+        ma150 = _safe_nullable_float(_row_get(row, "ma150", None))
+        hi_52w = _sanitize_entry_input(_row_get(row, "hi_52w", _row_get(row, "high_52w", None)))
+        rs_score = _safe_nullable_float(_row_get(row, "rs_percentile", _row_get(row, "rs_score", None)))
         anomalies = list(_row_get(row, "score_anomalies", []))
-        
-        score = 0.0
-        if rs_score <= 0 and ret_20d <= 0 and ret_60d <= 0 and ret_120d <= 0:
+
+        placeholder_fields = [
+            field
+            for field, value in {
+                "close": _row_get(row, "close", None),
+                "hi_52w": _row_get(row, "hi_52w", _row_get(row, "high_52w", None)),
+            }.items()
+            if is_placeholder_entry_value(value)
+        ]
+        if placeholder_fields:
+            anomalies.append("momentum_placeholder_inputs")
+            logger.warning(
+                "[WATCHLIST][ENTRY][PLACEHOLDER] code=%s style=MOMENTUM fields=%s",
+                str(_row_get(row, "code", "") or "").zfill(6),
+                placeholder_fields,
+            )
+
+        components: list[float] = []
+        price_vs_ma50 = ((close / ma50) - 1.0) if close is not None and ma50 is not None and ma50 > 0 else None
+        price_vs_ma150 = ((close / ma150) - 1.0) if close is not None and ma150 is not None and ma150 > 0 else None
+        dist_to_52w = (close / hi_52w) if close is not None and hi_52w is not None and hi_52w > 0 else None
+
+        if price_vs_ma50 is not None:
+            components.append(min(max(price_vs_ma50 / 0.15, 0.0), 1.0))
+        if price_vs_ma150 is not None:
+            components.append(min(max(price_vs_ma150 / 0.30, 0.0), 1.0))
+        if dist_to_52w is not None:
+            components.append(min(max((dist_to_52w - 0.75) / 0.25, 0.0), 1.0))
+
+        rs_term = 0.0
+        if rs_score is not None:
+            rs_term = float(rs_score)
+            if rs_term > 1.0:
+                rs_term = rs_term / 100.0
+            rs_term = min(max(rs_term, 0.0), 1.0)
+        components.append(rs_term)
+
+        if not any(component > 0 for component in components):
             anomalies.append("momentum_missing_context")
             _row_set(row, "score_anomalies", sorted(set(anomalies)))
-            return None
+            return None if close is None and hi_52w is None and rs_score is None else 0.0
 
-        if ret_20d > 0:
-            score += 20.0
-        if ret_60d > 0:
-            score += 28.0
-        if ret_120d > 0:
-            score += 30.0
-        if rs_score >= 80:
-            score += 16.0
-        elif rs_score >= 65:
-            score += 8.0
-        if ma20_slope > 0:
-            score += 5.0
-        if ma50_slope > 0:
-            score += 5.0
-        if ma150_slope > 0:
-            score += 6.0
-        if ret_20d <= 0 and ret_60d <= 0 and ret_120d <= 0:
-            anomalies.append("momentum_flat_returns")
-        _row_set(row, "momentum_trigger_ok", bool(score >= 60.0 and rs_score >= 80.0 and ma20_slope > 0))
+        score = round(100.0 * sum(components) / len(components), 4) if components else 0.0
+        if len(set(round(component, 4) for component in components)) <= 1:
+            anomalies.append("momentum_low_dispersion")
+        _row_set(row, "momentum_trigger_ok", bool(score >= 55.0 and rs_term >= 0.8))
         _row_set(row, "score_anomalies", sorted(set(anomalies)))
 
         return max(0.0, min(score, 100.0))

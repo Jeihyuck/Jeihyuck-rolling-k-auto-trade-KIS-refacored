@@ -11,7 +11,7 @@ import pandas as pd
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_COMPOSITE_W1, RS_COMPOSITE_W2, RS_MIN_PCTILE
 from trader.db.repos import DerivedMinerviniRepo, load_price_daily
 from trader.factors.rs_rank import rank_rs
-from trader.final30_quality import is_invalid_entry_input
+from trader.final30_quality import is_invalid_entry_input, is_placeholder_entry_value, normalize_entry_input_value
 from trader.indicators import safe_nullable_float
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig, compute_features, compute_pivot, detect_vcp, evaluate_filters, score_setup
 from trader.time_utils import now_kst
@@ -48,6 +48,22 @@ def _resolve_first_available(*candidates: tuple[str, object]) -> tuple[float | N
         if value is not None:
             return value, source_name
     return None, "missing"
+
+
+def _normalize_unit_interval(value: float | None, *, scale: float, offset: float = 0.0) -> float | None:
+    if value is None or scale <= 0:
+        return None
+    normalized = (float(value) - offset) / float(scale)
+    return min(max(normalized, 0.0), 1.0)
+
+
+def _normalize_rs_percentile(rs_pct: float | None) -> float:
+    if rs_pct is None:
+        return 0.0
+    value = float(rs_pct)
+    if value > 1.0:
+        value = value / 100.0
+    return min(max(value, 0.0), 1.0)
 
 
 def _compute_trend_score(feats: dict) -> float:
@@ -94,8 +110,21 @@ def _compute_entry_scores(symbol: str, feats: dict, latest: dict, rs_pct: float)
     ret_63 = safe_nullable_float(feats.get("ret_63"))
     ret_126 = safe_nullable_float(feats.get("ret_126"))
 
+    raw_entry_inputs = {
+        "close": close,
+        "pivot": pivot,
+        "hi_52w": hi_52w,
+        "volume": volume,
+    }
+    placeholder_fields = [field for field, value in raw_entry_inputs.items() if is_placeholder_entry_value(value)]
+    close = normalize_entry_input_value(close)
+    pivot = normalize_entry_input_value(pivot)
+    hi_52w = normalize_entry_input_value(hi_52w)
+    volume = normalize_entry_input_value(volume)
+    volume_avg20 = normalize_entry_input_value(volume_avg20)
+
     logger.info(
-        "[DERIVED][ENTRY][SOURCE_TRACE] symbol=%s close_src=%s pivot_src=%s hi_52w_src=%s volume_src=%s close=%s pivot=%s hi_52w=%s volume=%s",
+        "[DERIVED][ENTRY][SOURCE_TRACE] symbol=%s close_src=%s pivot_src=%s hi_52w_src=%s volume_src=%s close=%s pivot=%s hi_52w=%s volume=%s placeholder_fields=%s",
         symbol,
         close_src,
         pivot_src,
@@ -105,7 +134,15 @@ def _compute_entry_scores(symbol: str, feats: dict, latest: dict, rs_pct: float)
         pivot,
         hi_52w,
         volume,
+        placeholder_fields,
     )
+    if placeholder_fields:
+        logger.warning(
+            "[DERIVED][ENTRY][PLACEHOLDER_INPUTS] symbol=%s fields=%s raw=%s",
+            symbol,
+            placeholder_fields,
+            raw_entry_inputs,
+        )
 
     invalid_reason = None
     if is_invalid_entry_input(close, pivot, hi_52w, volume):
@@ -211,23 +248,32 @@ def _compute_entry_scores(symbol: str, feats: dict, latest: dict, rs_pct: float)
         pullback += 12.0
 
     # Momentum score (0~100)
-    momentum = 0.0
-    if ret_63 is not None and ret_63 > 0:
-        momentum += 28.0
-    if ret_126 is not None and ret_126 > 0:
-        momentum += 32.0
-    if rs_pct >= 80.0:
-        momentum += 20.0
-    elif rs_pct >= 65.0:
-        momentum += 10.0
-    if ma20_slope is not None and ma20_slope > 0:
-        momentum += 8.0
-    if ma50_slope is not None and ma50_slope > 0:
-        momentum += 12.0
+    momentum_components: list[float] = []
+    price_vs_ma50 = ((close / ma50) - 1.0) if close is not None and ma50 is not None and ma50 > 0 else None
+    price_vs_ma150 = ((close / ma150) - 1.0) if close is not None and ma150 is not None and ma150 > 0 else None
+    dist_to_52w = (close / hi_52w) if close is not None and hi_52w is not None and hi_52w > 0 else None
+
+    ma50_component = _normalize_unit_interval(price_vs_ma50, scale=0.15)
+    if ma50_component is not None:
+        momentum_components.append(ma50_component)
+
+    ma150_component = _normalize_unit_interval(price_vs_ma150, scale=0.30)
+    if ma150_component is not None:
+        momentum_components.append(ma150_component)
+
+    hi52_component = _normalize_unit_interval(dist_to_52w, scale=0.25, offset=0.75)
+    if hi52_component is not None:
+        momentum_components.append(hi52_component)
+
+    momentum_components.append(_normalize_rs_percentile(rs_pct))
+
+    momentum = 100.0 * sum(momentum_components) / len(momentum_components) if momentum_components else 0.0
+    if momentum_components and max(momentum_components) == min(momentum_components) == 0.0 and ret_63 is not None and ret_126 is not None:
+        momentum = max(momentum, min(max(((ret_63 + ret_126) / 2.0) * 100.0, 0.0), 100.0))
 
     breakout_score = _score_or_none(breakout)
     pullback_score = _score_or_none(pullback)
-    momentum_score = _score_or_none(momentum)
+    momentum_score = _score_or_none(round(momentum, 4))
     score_map = {
         "BREAKOUT": breakout_score if breakout_score is not None else -1.0,
         "PULLBACK": pullback_score if pullback_score is not None else -1.0,
