@@ -11,6 +11,8 @@ import pandas as pd
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_COMPOSITE_W1, RS_COMPOSITE_W2, RS_MIN_PCTILE
 from trader.db.repos import DerivedMinerviniRepo, load_price_daily
 from trader.factors.rs_rank import rank_rs
+from trader.final30_quality import is_invalid_entry_input
+from trader.indicators import safe_nullable_float
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig, compute_features, compute_pivot, detect_vcp, evaluate_filters, score_setup
 from trader.time_utils import now_kst
 from trader.utils.json_sanitize import to_jsonable
@@ -31,6 +33,21 @@ def _score_or_zero(value: object) -> float:
         return max(0.0, min(100.0, out))
     except Exception:
         return 0.0
+
+
+def _score_or_none(value: object) -> float | None:
+    numeric = safe_nullable_float(value)
+    if numeric is None:
+        return None
+    return max(0.0, min(100.0, float(numeric)))
+
+
+def _resolve_first_available(*candidates: tuple[str, object]) -> tuple[float | None, str]:
+    for source_name, raw_value in candidates:
+        value = safe_nullable_float(raw_value)
+        if value is not None:
+            return value, source_name
+    return None, "missing"
 
 
 def _compute_trend_score(feats: dict) -> float:
@@ -55,48 +72,104 @@ def _compute_trend_score(feats: dict) -> float:
     return max(0.0, min(100.0, score))
 
 
-def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[float, float, float, dict]:
-    close = _score_or_zero(feats.get("close") or latest.get("close"))
-    high = _score_or_zero(latest.get("high"))
-    low = _score_or_zero(latest.get("low"))
-    volume = _score_or_zero(latest.get("volume") or feats.get("last_volume"))
-    volume_avg20 = _score_or_zero(feats.get("vol20"))
-    atr = _score_or_zero(feats.get("atr14"))
-    ma20 = _score_or_zero(feats.get("ma20"))
-    ma50 = _score_or_zero(feats.get("ma50"))
-    hi_52w = _score_or_zero(feats.get("hi_52w"))
-    pivot = _score_or_zero(feats.get("pivot"))
-    ma50_slope = _score_or_zero(feats.get("ma50_slope"))
-    ma20_slope = _score_or_zero(feats.get("ma20_slope"))
-    ret_63 = _score_or_zero((feats.get("ret_63") or 0.0) * 100.0)
-    ret_126 = _score_or_zero((feats.get("ret_126") or 0.0) * 100.0)
-    flat_placeholder = bool(close > 0 and ((pivot > 0 and abs(close - pivot) < 1e-9) or (hi_52w > 0 and abs(close - hi_52w) < 1e-9)))
-    if flat_placeholder:
+def _compute_entry_scores(symbol: str, feats: dict, latest: dict, rs_pct: float) -> tuple[float | None, float | None, float | None, dict]:
+    close, close_src = _resolve_first_available(("feats.close", feats.get("close")), ("latest.close", latest.get("close")))
+    high, _high_src = _resolve_first_available(("latest.high", latest.get("high")))
+    low, _low_src = _resolve_first_available(("latest.low", latest.get("low")))
+    volume, volume_src = _resolve_first_available(
+        ("latest.volume", latest.get("volume")),
+        ("feats.latest_volume", feats.get("latest_volume")),
+        ("feats.last_volume", feats.get("last_volume")),
+    )
+    volume_avg20, _volume_avg20_src = _resolve_first_available(("feats.vol20", feats.get("vol20")))
+    atr, _atr_src = _resolve_first_available(("feats.atr14", feats.get("atr14")))
+    atr_pct, _atr_pct_src = _resolve_first_available(("feats.atr_pct", feats.get("atr_pct")))
+    ma20, _ma20_src = _resolve_first_available(("feats.ma20", feats.get("ma20")))
+    ma50, _ma50_src = _resolve_first_available(("feats.ma50", feats.get("ma50")))
+    ma150, _ma150_src = _resolve_first_available(("feats.ma150", feats.get("ma150")))
+    hi_52w, hi_52w_src = _resolve_first_available(("feats.hi_52w", feats.get("hi_52w")))
+    pivot, pivot_src = _resolve_first_available(("feats.pivot", feats.get("pivot")), ("feats.pivot_price", feats.get("pivot_price")))
+    ma50_slope, _ma50_slope_src = _resolve_first_available(("feats.ma50_slope", feats.get("ma50_slope")))
+    ma20_slope, _ma20_slope_src = _resolve_first_available(("feats.ma20_slope", feats.get("ma20_slope")))
+    ret_63 = safe_nullable_float(feats.get("ret_63"))
+    ret_126 = safe_nullable_float(feats.get("ret_126"))
+
+    logger.info(
+        "[DERIVED][ENTRY][SOURCE_TRACE] symbol=%s close_src=%s pivot_src=%s hi_52w_src=%s volume_src=%s close=%s pivot=%s hi_52w=%s volume=%s",
+        symbol,
+        close_src,
+        pivot_src,
+        hi_52w_src,
+        volume_src,
+        close,
+        pivot,
+        hi_52w,
+        volume,
+    )
+
+    invalid_reason = None
+    if is_invalid_entry_input(close, pivot, hi_52w, volume):
+        invalid_reason = "invalid_entry_inputs"
+    elif atr_pct is not None and atr_pct <= 0:
+        invalid_reason = "atr_pct_invalid"
+    elif ma20 is not None and ma20 <= 0:
+        invalid_reason = "ma20_invalid"
+    elif ma50 is not None and ma50 <= 0:
+        invalid_reason = "ma50_invalid"
+    elif ma150 is not None and ma150 <= 0:
+        invalid_reason = "ma150_invalid"
+
+    if invalid_reason is not None:
         logger.warning(
-            "[DERIVED][ENTRY][ANOMALY][FLAT_VALUES] close=%.4f pivot=%.4f hi_52w=%.4f volume=%.4f",
+            "[DERIVED][ENTRY][INVALID_INPUTS] symbol=%s close=%s pivot=%s hi_52w=%s volume=%s",
+            symbol,
             close,
             pivot,
             hi_52w,
             volume,
         )
+        context = {
+            "close": close,
+            "high": high,
+            "low": low,
+            "volume": volume,
+            "atr": atr,
+            "atr_pct": atr_pct,
+            "pivot": pivot,
+            "hi_52w": hi_52w,
+            "ma20": ma20,
+            "ma50": ma50,
+            "ma150": ma150,
+            "breakout_distance": None,
+            "pullback_depth": None,
+            "rs_percentile": rs_pct,
+            "close_src": close_src,
+            "pivot_src": pivot_src,
+            "hi_52w_src": hi_52w_src,
+            "volume_src": volume_src,
+            "entry_invalid_reason": invalid_reason,
+            "entry_style_selected": None,
+            "entry_component": {"invalid_entry_inputs": True, "reason": invalid_reason},
+        }
+        return None, None, None, context
 
     # Breakout score (0~100)
     breakout = 0.0
     breakout_distance = 0.0
-    if close > 0 and pivot > 0:
+    if close is not None and pivot is not None and close > 0 and pivot > 0:
         breakout_distance = ((close - pivot) / pivot) * 100.0
         if breakout_distance >= 0.0:
             breakout += 45.0
         elif breakout_distance >= -2.0:
             breakout += 25.0
-    elif close > 0 and hi_52w > 0:
+    elif close is not None and hi_52w is not None and close > 0 and hi_52w > 0:
         breakout_distance = ((close - hi_52w) / hi_52w) * 100.0
         if breakout_distance >= -1.0:
             breakout += 30.0
         elif breakout_distance >= -4.0:
             breakout += 15.0
 
-    if volume > 0 and volume_avg20 > 0:
+    if volume is not None and volume_avg20 is not None and volume > 0 and volume_avg20 > 0:
         vol_ratio = volume / volume_avg20
         if vol_ratio >= 1.50:
             breakout += 30.0
@@ -106,7 +179,7 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
     if breakout_distance > 7.0:
         breakout -= min(20.0, (breakout_distance - 7.0) * 2.0)
 
-    if atr > 0 and close > 0:
+    if atr is not None and close is not None and atr > 0 and close > 0:
         atr_pct = (atr / close) * 100.0
         if 1.0 <= atr_pct <= 5.0:
             breakout += 10.0
@@ -114,12 +187,12 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
     # Pullback score (0~100)
     pullback = 0.0
     pullback_depth = 0.0
-    if hi_52w > 0 and close > 0:
+    if hi_52w is not None and close is not None and hi_52w > 0 and close > 0:
         pullback_depth = max(0.0, ((hi_52w - close) / hi_52w) * 100.0)
 
-    if close > 0 and ma20 > 0 and close >= ma20:
+    if close is not None and ma20 is not None and close > 0 and ma20 > 0 and close >= ma20:
         pullback += 22.0
-    if close > 0 and ma50 > 0 and close >= ma50:
+    if close is not None and ma50 is not None and close > 0 and ma50 > 0 and close >= ma50:
         pullback += 20.0
 
     if 3.0 <= pullback_depth <= 18.0:
@@ -127,7 +200,7 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
     elif 1.0 <= pullback_depth <= 25.0:
         pullback += 25.0
 
-    if volume > 0 and volume_avg20 > 0:
+    if volume is not None and volume_avg20 is not None and volume > 0 and volume_avg20 > 0:
         vol_ratio = volume / volume_avg20
         if vol_ratio < 0.80:
             pullback += 28.0
@@ -139,22 +212,28 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
 
     # Momentum score (0~100)
     momentum = 0.0
-    if ret_63 > 0:
+    if ret_63 is not None and ret_63 > 0:
         momentum += 28.0
-    if ret_126 > 0:
+    if ret_126 is not None and ret_126 > 0:
         momentum += 32.0
     if rs_pct >= 80.0:
         momentum += 20.0
     elif rs_pct >= 65.0:
         momentum += 10.0
-    if ma20_slope > 0:
+    if ma20_slope is not None and ma20_slope > 0:
         momentum += 8.0
-    if ma50_slope > 0:
+    if ma50_slope is not None and ma50_slope > 0:
         momentum += 12.0
 
-    breakout_score = _score_or_zero(breakout)
-    pullback_score = _score_or_zero(pullback)
-    momentum_score = _score_or_zero(momentum)
+    breakout_score = _score_or_none(breakout)
+    pullback_score = _score_or_none(pullback)
+    momentum_score = _score_or_none(momentum)
+    score_map = {
+        "BREAKOUT": breakout_score if breakout_score is not None else -1.0,
+        "PULLBACK": pullback_score if pullback_score is not None else -1.0,
+        "MOMENTUM": momentum_score if momentum_score is not None else -1.0,
+    }
+    entry_style_selected = max(score_map, key=score_map.get) if max(score_map.values()) >= 0 else None
 
     context = {
         "close": close,
@@ -162,10 +241,30 @@ def _compute_entry_scores(feats: dict, latest: dict, rs_pct: float) -> tuple[flo
         "low": low,
         "volume": volume,
         "atr": atr,
+        "atr_pct": atr_pct,
         "pivot": pivot,
+        "hi_52w": hi_52w,
+        "ma20": ma20,
+        "ma50": ma50,
+        "ma150": ma150,
         "breakout_distance": breakout_distance,
         "pullback_depth": pullback_depth,
         "rs_percentile": rs_pct,
+        "close_src": close_src,
+        "pivot_src": pivot_src,
+        "hi_52w_src": hi_52w_src,
+        "volume_src": volume_src,
+        "entry_invalid_reason": None,
+        "entry_style_selected": entry_style_selected,
+        "entry_component": {
+            "invalid_entry_inputs": False,
+            "selected": entry_style_selected,
+            "scores": {
+                "breakout_score": breakout_score,
+                "pullback_score": pullback_score,
+                "momentum_score": momentum_score,
+            },
+        },
     }
     return breakout_score, pullback_score, momentum_score, context
 
@@ -265,6 +364,7 @@ def compute_minervini_features_for_asof(
         score = float(score_setup(feats, rs_percentile=rs_pct, vcp_info=vcp_info, cfg=cfg))
         trend_score = _compute_trend_score(feats)
         breakout_score, pullback_score, momentum_score, entry_ctx = _compute_entry_scores(
+            symbol,
             feats,
             {
                 "high": feats.get("latest_high"),
@@ -316,6 +416,9 @@ def compute_minervini_features_for_asof(
                         "momentum_score": momentum_score,
                         "trend_score": trend_score,
                     },
+                    "entry_component": entry_ctx.get("entry_component"),
+                    "entry_style_selected": entry_ctx.get("entry_style_selected"),
+                    "entry_invalid_reason": entry_ctx.get("entry_invalid_reason"),
                     "reasons": reasons,
                 },
             }
@@ -331,6 +434,7 @@ def compute_minervini_features_for_asof(
                     "breakout_score": breakout_score,
                     "pullback_score": pullback_score,
                     "momentum_score": momentum_score,
+                    "entry_style_selected": entry_ctx.get("entry_style_selected"),
                 }
             )
 
@@ -340,9 +444,11 @@ def compute_minervini_features_for_asof(
     has_volume = sum(1 for r in rows if _score_or_zero(((r.get("features_json") or {}).get("last_volume"))) > 0)
     has_atr = sum(1 for r in rows if _score_or_zero(r.get("atr")) > 0)
     has_rs = sum(1 for r in rows if _score_or_zero(r.get("rs_percentile")) > 0)
-    breakout_nonzero = sum(1 for r in rows if _score_or_zero(r.get("breakout_score")) > 0)
-    pullback_nonzero = sum(1 for r in rows if _score_or_zero(r.get("pullback_score")) > 0)
-    momentum_nonzero = sum(1 for r in rows if _score_or_zero(r.get("momentum_score")) > 0)
+    breakout_nonnull = sum(1 for r in rows if r.get("breakout_score") is not None)
+    pullback_nonnull = sum(1 for r in rows if r.get("pullback_score") is not None)
+    momentum_nonnull = sum(1 for r in rows if r.get("momentum_score") is not None)
+    invalid_rows = sum(1 for r in rows if ((r.get("features_json") or {}).get("entry_invalid_reason") is not None))
+    valid_rows = len(rows) - invalid_rows
 
     logger.info(
         "[DERIVED][MINERVINI][ENTRY_INPUTS] rows=%d has_close=%d has_high=%d has_low=%d has_volume=%d has_atr=%d has_rs=%d",
@@ -357,9 +463,18 @@ def compute_minervini_features_for_asof(
     logger.info(
         "[DERIVED][MINERVINI][ENTRY_SCORES] rows=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
         len(rows),
-        breakout_nonzero,
-        pullback_nonzero,
-        momentum_nonzero,
+        breakout_nonnull,
+        pullback_nonnull,
+        momentum_nonnull,
+    )
+    logger.info(
+        "[DERIVED][ENTRY][QUALITY] rows=%s valid=%s invalid=%s breakout_nonnull=%s pullback_nonnull=%s momentum_nonnull=%s",
+        len(rows),
+        valid_rows,
+        invalid_rows,
+        breakout_nonnull,
+        pullback_nonnull,
+        momentum_nonnull,
     )
     logger.info("[DERIVED][MINERVINI][ENTRY_SCORES][SAMPLE] %s", entry_diag_samples)
 

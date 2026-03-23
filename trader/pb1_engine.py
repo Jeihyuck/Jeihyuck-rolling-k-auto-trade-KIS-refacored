@@ -176,6 +176,7 @@ from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.final_list_store import get_as_of_date, load_final30, save_final30
+from trader.final30_quality import validate_trade_ready
 from trader.minervini_filter import compute_minervini_signals, select_buyable_with_relax, minervini_filter
 from trader.entry_signals import breakout_signal, pullback_signal, momentum_signal
 from trader.minervini_store import write_minervini_signals
@@ -7263,6 +7264,13 @@ class PB1Engine:
                     self.final30_source,
                 )
                 raise RuntimeError("FINAL30_LOCK_MISSING")
+            validate_trade_ready(locked_df)
+            logger.info(
+                "[TRADE][READY][OK] source=%s as_of=%s rows=%s",
+                self.final30_source,
+                self.derived_as_of,
+                len(locked_df),
+            )
             order_rows = [dict(x or {}) for x in locked_df.to_dict(orient="records")]
             if "rank_final30" in locked_df.columns:
                 order_rows.sort(key=lambda x: (float(x.get("rank_final30") or 999999), str(x.get("code") or "")))

@@ -12,6 +12,8 @@ from collections import Counter
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
+
+from trader.final30_quality import validate_trade_ready
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -151,7 +153,8 @@ def load_trade_final30_scored(
 ) -> dict[str, Any]:
     env_n = (env or "").strip().lower()
     as_of_s = str(as_of)
-    cache_key = (env_n, as_of_s)
+    repo_root_path = resolve_repo_root()
+    cache_key = (str(repo_root_path), env_n, as_of_s)
     cached = _FINAL30_LOAD_CACHE.get(cache_key)
     if cached is not None:
         cached_df = cached.get("df")
@@ -166,7 +169,6 @@ def load_trade_final30_scored(
         if isinstance(cached_df, pd.DataFrame):
             result["df"] = cached_df.copy(deep=True)
         return result
-    repo_root_path = resolve_repo_root()
     final30_paths = build_final30_paths(repo_root_path, env_n, as_of_s)
     logger.info(
         "[TRADE][FINAL30][PATH_MAP] repo_root=%s cwd=%s paths=%s",
@@ -257,6 +259,22 @@ def load_trade_final30_scored(
             )
         df = pd.DataFrame(rows)
         columns = [str(c) for c in df.columns.tolist()]
+        try:
+            validate_trade_ready(df)
+            logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            result = {
+                "df": pd.DataFrame(),
+                "source_name": "none",
+                "as_of": as_of_s,
+                "columns": [],
+                "is_scored": False,
+                "used_fallback": False,
+                "file_mirror_present": any(file_mirror_stats.values()),
+            }
+            _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
+            return result
         logger.info(
             "[TRADE][FINAL30][LOAD] source=db_pb1_watchlist_final_scored rows=%s is_scored=1 cols=%s",
             len(df),

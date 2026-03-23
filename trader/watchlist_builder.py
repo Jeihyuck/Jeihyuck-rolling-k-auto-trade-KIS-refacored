@@ -25,6 +25,7 @@ from trader.db.repos import (
     WatchlistRepo,
 )
 from trader.flow_score import calculate_final_score, calculate_flow_score
+from trader.final30_quality import dominant_value_ratio, score_distribution_is_monoculture, summarize_final30_quality
 from trader.factors.multifactor import (
     compute_ai_rs_scores,
     compute_liquidity_score,
@@ -32,6 +33,7 @@ from trader.factors.multifactor import (
     compute_volatility_score,
     optimize_meta_k,
 )
+from trader.indicators import compute_atr_pct_from_ohlcv, compute_ma20_from_ohlcv, safe_nullable_float
 from trader.score_columns import resolve_score_column
 from trader.time_coerce import to_date
 
@@ -200,6 +202,20 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _safe_nullable_float(v: Any) -> float | None:
+    return safe_nullable_float(v)
+
+
+def _prefer_valid_numeric(body_value: Any, meta_value: Any, *, zero_invalid: bool = False) -> float | None:
+    body = _safe_nullable_float(body_value)
+    meta = _safe_nullable_float(meta_value)
+    if body is not None and (not zero_invalid or body > 0):
+        return body
+    if meta is not None and (not zero_invalid or meta > 0):
+        return meta
+    return body if body is not None else meta
+
+
 INVALID_ZERO_NUMERIC_FIELDS = ("close", "ma20", "ma50", "ma150", "atr_pct")
 ZERO_INVALID_ALWAYS_FIELDS = {"close", "ma20", "ma50", "ma150"}
 NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile"}
@@ -296,7 +312,7 @@ def _sanitize_scored_item(item: Dict[str, Any], ref: Dict[str, Any] | None = Non
     for field in NONNULL_SCORE_FIELDS:
         if _is_missing_value(sanitized.get(field)):
             repaired = _repair_candidate_value(field, sanitized, fallback)
-            sanitized[field] = 0.0 if repaired is None else repaired
+            sanitized[field] = repaired if repaired is not None else None
             logger.warning(
                 "[WATCHLIST][SANITIZE][NULL_SCORE] code=%s field=%s source=%s repaired=%s",
                 str(sanitized.get("code") or "").zfill(6),
@@ -524,31 +540,36 @@ def _flow_contract_state(
 def _extract_derived_metrics(derived_row: Dict[str, Any]) -> Dict[str, float]:
     features = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
 
-    close = _safe_float(derived_row.get("close"), 0.0)
-    ma50 = _safe_float(derived_row.get("ma50"), 0.0)
-    ma150 = _safe_float(derived_row.get("ma150"), 0.0)
-    ma200 = _safe_float(derived_row.get("ma200"), 0.0)
+    close = _safe_nullable_float(derived_row.get("close"))
+    ma50 = _safe_nullable_float(derived_row.get("ma50"))
+    ma150 = _safe_nullable_float(derived_row.get("ma150"))
+    ma200 = _safe_nullable_float(derived_row.get("ma200"))
     trend_checks = [
-        close > ma50 > 0,
-        ma50 > ma150 > 0,
-        ma150 > ma200 > 0,
-        close > ma200 > 0,
+        bool(close is not None and ma50 is not None and close > ma50 > 0),
+        bool(ma50 is not None and ma150 is not None and ma50 > ma150 > 0),
+        bool(ma150 is not None and ma200 is not None and ma150 > ma200 > 0),
+        bool(close is not None and ma200 is not None and close > ma200 > 0),
     ]
     trend_score = float(sum(1 for check in trend_checks if check) * 25.0)
 
-    hi_52w = _safe_float(derived_row.get("hi_52w"), _safe_float(features.get("hi_52w"), 0.0))
-    pullback_pct = 0.0
-    if hi_52w > 0 and close > 0:
+    hi_52w = _prefer_valid_numeric(derived_row.get("hi_52w"), features.get("hi_52w"), zero_invalid=True)
+    pullback_pct = None
+    if hi_52w is not None and close is not None and hi_52w > 0 and close > 0:
         pullback_pct = max(0.0, (hi_52w - close) / hi_52w)
     else:
-        pullback_pct = _safe_float(features.get("pullback_pct"), 0.0)
+        pullback_pct = _safe_nullable_float(features.get("pullback_pct"))
 
     return {
-        "rs_pctile": _safe_float(derived_row.get("rs_percentile"), _safe_float(features.get("rs_percentile"), 0.0)),
-        "vcp_score": _safe_float(derived_row.get("vcp_score"), _safe_float(features.get("vcp_score"), 0.0)),
-        "atr_pct": _safe_float(derived_row.get("atr_pct"), _safe_float(features.get("atr_pct"), 0.0)),
+        "rs_percentile": _prefer_valid_numeric(derived_row.get("rs_percentile"), features.get("rs_percentile")),
+        "rs_pctile": _prefer_valid_numeric(derived_row.get("rs_percentile"), features.get("rs_percentile")),
+        "vcp_score": _prefer_valid_numeric(derived_row.get("vcp_score"), features.get("vcp_score")),
+        "atr_pct": _prefer_valid_numeric(derived_row.get("atr_pct"), features.get("atr_pct"), zero_invalid=True),
         "trend_score": trend_score,
         "pullback_pct": pullback_pct,
+        "breakout_score": _safe_nullable_float(derived_row.get("breakout_score")),
+        "pullback_score": _safe_nullable_float(derived_row.get("pullback_score")),
+        "momentum_score": _safe_nullable_float(derived_row.get("momentum_score")),
+        "entry_style_selected": derived_row.get("entry_style_selected") or features.get("entry_style_selected"),
     }
 
 
@@ -563,13 +584,23 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     for key in (
         "as_of",
         "rs_pctile",
+        "rs_percentile",
         "vcp_score",
         "atr_pct",
         "trend_score",
         "pullback_pct",
+        "breakout_score",
+        "pullback_score",
+        "momentum_score",
+        "entry_style_selected",
+        "close",
+        "ma20",
+        "ma50",
+        "ma150",
         "flow_score",
         "tech_score",
         "final_score",
+        "score_final",
         "foreign_20_ratio",
         "inst_20_ratio",
     ):
@@ -581,18 +612,32 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     out["rows"] = _safe_int(out.get("rows", meta.get("rows", 0)), 0)
     meta["rows"] = out["rows"]
 
-    out["rs_pctile"] = _safe_float(out.get("rs_pctile", meta.get("rs_pctile", 0.0)), 0.0)
-    out["vcp_score"] = _safe_float(out.get("vcp_score", meta.get("vcp_score", 0.0)), 0.0)
-    out["atr_pct"] = _safe_float(out.get("atr_pct", meta.get("atr_pct", 0.0)), 0.0)
-    out["trend_score"] = _safe_float(out.get("trend_score", meta.get("trend_score", 0.0)), 0.0)
-    out["pullback_pct"] = _safe_float(out.get("pullback_pct", meta.get("pullback_pct", 0.0)), 0.0)
-    out["flow_score"] = _safe_float(out.get("flow_score", meta.get("flow_score", 0.0)), 0.0)
-    out["tech_score"] = _safe_float(out.get("tech_score", meta.get("tech_score", out.get("score", 0.0))), 0.0)
-    out["final_score"] = _safe_float(out.get("final_score", meta.get("final_score", out.get("score", 0.0))), 0.0)
-    out["score_tech"] = _safe_float(out.get("score_tech", meta.get("score_tech", out.get("tech_score", 0.0))), 0.0)
-    out["score_flow"] = _safe_float(out.get("score_flow", meta.get("score_flow", out.get("flow_score", 0.0))), 0.0)
-    out["score_final"] = _safe_float(out.get("score_final", meta.get("score_final", out.get("final_score", out.get("score", 0.0)))), 0.0)
-    out["score"] = _safe_float(out.get("score", out.get("score_final", out.get("final_score", 0.0))), 0.0)
+    out["rs_percentile"] = _prefer_valid_numeric(out.get("rs_percentile"), meta.get("rs_percentile"))
+    out["rs_pctile"] = _prefer_valid_numeric(out.get("rs_pctile"), out.get("rs_percentile"))
+    out["vcp_score"] = _prefer_valid_numeric(out.get("vcp_score"), meta.get("vcp_score"))
+    out["atr_pct"] = _prefer_valid_numeric(out.get("atr_pct"), meta.get("atr_pct"), zero_invalid=True)
+    out["trend_score"] = _prefer_valid_numeric(out.get("trend_score"), meta.get("trend_score"))
+    out["pullback_pct"] = _prefer_valid_numeric(out.get("pullback_pct"), meta.get("pullback_pct"))
+    out["breakout_score"] = _prefer_valid_numeric(out.get("breakout_score"), meta.get("breakout_score"))
+    out["pullback_score"] = _prefer_valid_numeric(out.get("pullback_score"), meta.get("pullback_score"))
+    out["momentum_score"] = _prefer_valid_numeric(out.get("momentum_score"), meta.get("momentum_score"))
+    out["entry_style_selected"] = out.get("entry_style_selected") or meta.get("entry_style_selected")
+    out["close"] = _prefer_valid_numeric(out.get("close"), meta.get("close"), zero_invalid=True)
+    out["ma20"] = _prefer_valid_numeric(out.get("ma20"), meta.get("ma20"), zero_invalid=True)
+    out["ma50"] = _prefer_valid_numeric(out.get("ma50"), meta.get("ma50"), zero_invalid=True)
+    out["ma150"] = _prefer_valid_numeric(out.get("ma150"), meta.get("ma150"), zero_invalid=True)
+    out["flow_score"] = _prefer_valid_numeric(out.get("flow_score"), meta.get("flow_score"))
+    out["tech_score"] = _prefer_valid_numeric(out.get("tech_score"), meta.get("tech_score"))
+    canonical_final = _prefer_valid_numeric(out.get("score_final"), meta.get("score_final"))
+    if canonical_final is None:
+        canonical_final = _prefer_valid_numeric(out.get("final_score"), meta.get("final_score"))
+    if canonical_final is None:
+        canonical_final = _safe_nullable_float(out.get("score"))
+    out["score_final"] = canonical_final
+    out["final_score"] = canonical_final
+    out["score"] = canonical_final
+    out["score_tech"] = _prefer_valid_numeric(out.get("score_tech"), meta.get("score_tech"))
+    out["score_flow"] = _prefer_valid_numeric(out.get("score_flow"), meta.get("score_flow"))
     flow_missing = bool(out.get("flow_missing") or meta.get("flow_missing"))
     if flow_missing:
         out["foreign_20_ratio"] = out.get("foreign_20_ratio", meta.get("foreign_20_ratio"))
@@ -603,10 +648,19 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
 
     for key in (
         "rs_pctile",
+        "rs_percentile",
         "vcp_score",
         "atr_pct",
         "trend_score",
         "pullback_pct",
+        "breakout_score",
+        "pullback_score",
+        "momentum_score",
+        "entry_style_selected",
+        "close",
+        "ma20",
+        "ma50",
+        "ma150",
         "flow_score",
         "tech_score",
         "final_score",
@@ -668,6 +722,12 @@ def _enrich_watchlist_rows(
         code = str(out.get("code") or "").zfill(6)
         meta = dict(out.get("meta") or {})
         reject_reasons = list(out.get("reject_reasons", []) or meta.get("reject_reasons", []) or [])
+        ohlcv_df = pd.DataFrame()
+        try:
+            ohlcv_raw, _ = ohlcv_provider(code, count=max(int(flow_window) + 30, 80))
+            ohlcv_df = _normalize_ohlcv_columns(ohlcv_raw if ohlcv_raw is not None else pd.DataFrame())
+        except Exception:
+            ohlcv_df = pd.DataFrame()
 
         derived_row = derived_map.get(code)
         if derived_row is None:
@@ -687,12 +747,6 @@ def _enrich_watchlist_rows(
             trend_weight_effective = float(trend_weight)
             foreign_df: Optional[pd.DataFrame] = None
             inst_df: Optional[pd.DataFrame] = None
-            ohlcv_df = pd.DataFrame()
-            try:
-                ohlcv_raw, _ = ohlcv_provider(code, count=max(int(flow_window) + 10, 80))
-                ohlcv_df = _normalize_ohlcv_columns(ohlcv_raw if ohlcv_raw is not None else pd.DataFrame())
-            except Exception:
-                ohlcv_df = pd.DataFrame()
 
             try:
                 foreign_df, inst_df = flow_provider(code, as_of, int(flow_window))
@@ -784,6 +838,20 @@ def _enrich_watchlist_rows(
                 + atr_score * 0.05
             )
 
+        repaired_ma20 = _prefer_valid_numeric(out.get("ma20"), meta.get("ma20"), zero_invalid=True)
+        if (repaired_ma20 is None or repaired_ma20 <= 0) and not ohlcv_df.empty:
+            repaired_ma20 = compute_ma20_from_ohlcv(ohlcv_df)
+        out["ma20"] = repaired_ma20
+        if repaired_ma20 is None:
+            reject_reasons.append("ma20_missing")
+
+        repaired_atr_pct = _prefer_valid_numeric(out.get("atr_pct"), meta.get("atr_pct"), zero_invalid=True)
+        if (repaired_atr_pct is None or repaired_atr_pct <= 0) and not ohlcv_df.empty:
+            repaired_atr_pct = compute_atr_pct_from_ohlcv(ohlcv_df)
+        out["atr_pct"] = repaired_atr_pct
+        if repaired_atr_pct is None:
+            reject_reasons.append("atr_pct_invalid")
+
         out["reject_reasons"] = list(dict.fromkeys(reject_reasons))
         meta["reject_reasons"] = out["reject_reasons"]
         out["meta"] = meta
@@ -796,6 +864,21 @@ def _enrich_watchlist_rows(
         row.setdefault("rank_final30", idx)
         row.setdefault("rank_top50", _safe_int(row.get("rank_top50"), 0))
         row.setdefault("rank_pool120", _safe_int(row.get("rank_pool120"), 0))
+
+    quality = summarize_final30_quality(pd.DataFrame(enriched), required_rows=len(enriched) if len(enriched) != 30 else 30)
+    logger.info(
+        "[PREP][FINAL30][QUALITY] rows=%s ma20_valid=%s atr_valid=%s breakout_valid=%s pullback_valid=%s momentum_valid=%s entry_style_monoculture=%s ok=%s",
+        quality["rows"],
+        round(quality["valid_ma20_ratio"], 4),
+        round(quality["valid_atr_ratio"], 4),
+        round(quality["breakout_nonnull_ratio"], 4),
+        round(quality["pullback_nonnull_ratio"], 4),
+        round(quality["momentum_nonnull_ratio"], 4),
+        int(quality["entry_style_monoculture"]),
+        int(quality["ok"]),
+    )
+    if len(enriched) == 30 and not quality["ok"]:
+        raise RuntimeError(f"FINAL30_QUALITY_FAILED:{quality}")
 
     if flow_rows:
         try:
@@ -1115,24 +1198,29 @@ class WatchlistBuilder:
             "rank": None,
             "score": None,
             "liq_avg": 0.0,
-            "last_close": 0.0,
+            "last_close": None,
             "rows": 0,
-            "rs_pctile": 0.0,
-            "vcp_score": 0.0,
-            "pullback_pct": 0.0,
-            "trend_score": 0.0,
-            "atr_pct": 0.0,
+            "rs_pctile": None,
+            "rs_percentile": None,
+            "vcp_score": None,
+            "pullback_pct": None,
+            "trend_score": None,
+            "atr_pct": None,
             "foreign_20_ratio": 0.0,
             "inst_20_ratio": 0.0,
             "flow_score": 0.0,
             "ai_rs_score": 0.0,
             "meta_k": 0.5,
             "breakout_target": 0.0,
-            "breakout_score": 0.0,
+            "breakout_score": None,
+            "pullback_score": None,
+            "momentum_score": None,
+            "entry_style_selected": None,
             "liquidity_score": 0.0,
             "volatility_score": 0.0,
-            "tech_score": 0.0,
-            "final_score": 0.0,
+            "tech_score": None,
+            "score_final": None,
+            "final_score": None,
             "reject_reasons": [],
             "meta": {},
         }
@@ -1357,9 +1445,9 @@ class WatchlistBuilder:
                 continue
 
             close_series = df["close"]
-            ma20 = float(close_series.rolling(20).mean().iloc[-1]) if len(close_series) >= 20 else 0.0
-            ma50 = float(close_series.rolling(50).mean().iloc[-1]) if len(close_series) >= 50 else 0.0
-            ma150 = float(close_series.rolling(150).mean().iloc[-1]) if len(close_series) >= 150 else 0.0
+            ma20 = compute_ma20_from_ohlcv(df)
+            ma50 = float(close_series.rolling(50).mean().iloc[-1]) if len(close_series) >= 50 else None
+            ma150 = float(close_series.rolling(150).mean().iloc[-1]) if len(close_series) >= 150 else None
             volume_last = float(df["volume"].iloc[-1] or 0.0)
             volume_avg20 = float(df["volume"].tail(20).mean() or 0.0)
             trading_value = float(liq_avg or 0.0)
@@ -1376,6 +1464,8 @@ class WatchlistBuilder:
             item["ma20"] = ma20
             item["ma50"] = ma50
             item["ma150"] = ma150
+            if ma20 is None:
+                item.setdefault("reject_reasons", []).append("ma20_missing")
             item["volume"] = volume_last
             item["volume_avg20"] = volume_avg20
             item["trading_value"] = trading_value
@@ -1945,40 +2035,41 @@ class WatchlistBuilder:
             ref = derived_map.get(sym) if sym else None
 
             # Priority: ref source -> current row -> fallback calculation
-            rs_percentile = _safe_float(_row_get(ref, "rs_percentile", _row_get(row, "rs_percentile", 0.0)))
-            rs_score = _safe_float(_row_get(ref, "rs_score", _row_get(row, "rs_score", 0.0)))
-            vcp_score = _safe_float(_row_get(ref, "vcp_score", _row_get(row, "vcp_score", 0.0)))
-            trend_score = _safe_float(_row_get(ref, "trend_score", _row_get(row, "trend_score", 0.0)))
+            rs_percentile = _prefer_valid_numeric(_row_get(ref, "rs_percentile", None), _row_get(row, "rs_percentile", None))
+            rs_score = _prefer_valid_numeric(_row_get(ref, "rs_score", None), _row_get(row, "rs_score", None))
+            vcp_score = _prefer_valid_numeric(_row_get(ref, "vcp_score", None), _row_get(row, "vcp_score", None))
+            trend_score = _prefer_valid_numeric(_row_get(ref, "trend_score", None), _row_get(row, "trend_score", None))
             
             # Also copy MA and price data from ref if available
-            ma20 = _safe_float(_row_get(ref, "ma20", _row_get(row, "ma20", 0.0)))
-            ma50 = _safe_float(_row_get(ref, "ma50", _row_get(row, "ma50", 0.0)))
-            ma150 = _safe_float(_row_get(ref, "ma150", _row_get(row, "ma150", 0.0)))
-            close = _safe_float(_row_get(ref, "close", _row_get(row, "close", 0.0)))
-            volume = _safe_float(_row_get(ref, "volume", _row_get(row, "volume", 0.0)))
-            volume_avg20 = _safe_float(_row_get(ref, "volume_avg20", _row_get(row, "volume_avg20", 0.0)))
+            ma20 = _prefer_valid_numeric(_row_get(ref, "ma20", None), _row_get(row, "ma20", None), zero_invalid=True)
+            ma50 = _prefer_valid_numeric(_row_get(ref, "ma50", None), _row_get(row, "ma50", None), zero_invalid=True)
+            ma150 = _prefer_valid_numeric(_row_get(ref, "ma150", None), _row_get(row, "ma150", None), zero_invalid=True)
+            close = _prefer_valid_numeric(_row_get(ref, "close", None), _row_get(row, "close", None), zero_invalid=True)
+            volume = _prefer_valid_numeric(_row_get(ref, "volume", None), _row_get(row, "volume", None), zero_invalid=True)
+            volume_avg20 = _prefer_valid_numeric(_row_get(ref, "volume_avg20", None), _row_get(row, "volume_avg20", None), zero_invalid=True)
+            atr_pct = _prefer_valid_numeric(_row_get(ref, "atr_pct", None), _row_get(row, "atr_pct", None), zero_invalid=True)
             
             # Copy breakout/pullback/momentum scores if present in ref
-            breakout_score = _safe_float(_row_get(ref, "breakout_score", _row_get(row, "breakout_score", 0.0)))
-            pullback_score = _safe_float(_row_get(ref, "pullback_score", _row_get(row, "pullback_score", 0.0)))
-            momentum_score = _safe_float(_row_get(ref, "momentum_score", _row_get(row, "momentum_score", 0.0)))
-            entry_style = _row_get(ref, "entry_style", _row_get(row, "entry_style", None))
+            breakout_score = _prefer_valid_numeric(_row_get(ref, "breakout_score", None), _row_get(row, "breakout_score", None))
+            pullback_score = _prefer_valid_numeric(_row_get(ref, "pullback_score", None), _row_get(row, "pullback_score", None))
+            momentum_score = _prefer_valid_numeric(_row_get(ref, "momentum_score", None), _row_get(row, "momentum_score", None))
+            entry_style = _row_get(ref, "entry_style_selected", _row_get(row, "entry_style_selected", None))
 
             # Fallback 1: rs_score가 없으면 rs_percentile 사용
-            if rs_score <= 0 and rs_percentile > 0:
+            if (rs_score is None or rs_score <= 0) and rs_percentile is not None and rs_percentile > 0:
                 rs_score = rs_percentile
 
             # Fallback 2: trend_score가 없으면 MA 구조로 즉석 계산
-            if trend_score <= 0:
+            if trend_score is None or trend_score <= 0:
                 tmp = 0.0
-                if close > 0 and ma20 > 0 and close >= ma20:
+                if close is not None and ma20 is not None and close > 0 and ma20 > 0 and close >= ma20:
                     tmp += 25.0
-                if ma20 > 0 and ma50 > 0 and ma20 >= ma50:
+                if ma20 is not None and ma50 is not None and ma20 > 0 and ma50 > 0 and ma20 >= ma50:
                     tmp += 25.0
-                if ma50 > 0 and ma150 > 0 and ma50 >= ma150:
+                if ma50 is not None and ma150 is not None and ma50 > 0 and ma150 > 0 and ma50 >= ma150:
                     tmp += 25.0
                 # MA150 slope check (simplified)
-                if ma150 > 0:
+                if ma150 is not None and ma150 > 0:
                     tmp += 25.0
                 trend_score = tmp
 
@@ -1993,11 +2084,12 @@ class WatchlistBuilder:
             _row_set(row, "close", close)
             _row_set(row, "volume", volume)
             _row_set(row, "volume_avg20", volume_avg20)
+            _row_set(row, "atr_pct", atr_pct)
             _row_set(row, "breakout_score", breakout_score)
             _row_set(row, "pullback_score", pullback_score)
             _row_set(row, "momentum_score", momentum_score)
             if entry_style:
-                _row_set(row, "entry_style", entry_style)
+                _row_set(row, "entry_style_selected", entry_style)
 
             out.append(row)
 
@@ -2010,7 +2102,7 @@ class WatchlistBuilder:
         momentum_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0)
         
         logger.info(
-            "[WATCHLIST][DERIVED_MERGE] rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonzero=%d pullback_nonzero=%d momentum_nonzero=%d",
+            "[WATCHLIST][DERIVED_MERGE] rows=%d rs_nonzero=%d vcp_nonzero=%d trend_nonzero=%d breakout_nonnull=%d pullback_nonnull=%d momentum_nonnull=%d",
             len(out),
             rs_nonzero,
             vcp_nonzero,
@@ -2331,7 +2423,7 @@ class WatchlistBuilder:
         )
         return out
     
-    def _compute_breakout_score(self, row: Any) -> float:
+    def _compute_breakout_score(self, row: Any) -> float | None:
         """
         Calculate breakout score based on:
         - Proximity to 20/55-day highs
@@ -2354,6 +2446,9 @@ class WatchlistBuilder:
             anomalies.append("breakout_missing_price_context")
         if volume_avg20 <= 0:
             anomalies.append("breakout_missing_volume_context")
+        if close <= 0 or breakout_ref <= 0 or volume <= 0 or volume_avg20 <= 0:
+            _row_set(row, "score_anomalies", sorted(set(anomalies)))
+            return None
 
         if close > 0 and breakout_ref > 0:
             distance_pct = ((close - breakout_ref) / breakout_ref) * 100.0
@@ -2388,7 +2483,7 @@ class WatchlistBuilder:
         
         return max(0.0, min(score, 100.0))
 
-    def _compute_pullback_score(self, row: Any) -> float:
+    def _compute_pullback_score(self, row: Any) -> float | None:
         """
         Calculate pullback score based on:
         - Staying above key MAs during pullback
@@ -2406,6 +2501,10 @@ class WatchlistBuilder:
         anomalies = list(_row_get(row, "score_anomalies", []))
 
         score = 0.0
+        if close <= 0 or high_55d <= 0 or (ma20 <= 0 and ma50 <= 0) or volume <= 0 or volume_avg20 <= 0:
+            anomalies.append("pullback_missing_context")
+            _row_set(row, "score_anomalies", sorted(set(anomalies)))
+            return None
 
         if close > 0 and ma20 > 0 and close >= ma20:
             score += 20.0
@@ -2436,7 +2535,7 @@ class WatchlistBuilder:
 
         return max(0.0, min(score, 100.0))
 
-    def _compute_momentum_score(self, row: Any) -> float:
+    def _compute_momentum_score(self, row: Any) -> float | None:
         """
         Calculate momentum score based on:
         - 20/60/120-day returns
@@ -2454,6 +2553,10 @@ class WatchlistBuilder:
         anomalies = list(_row_get(row, "score_anomalies", []))
         
         score = 0.0
+        if rs_score <= 0 and ret_20d <= 0 and ret_60d <= 0 and ret_120d <= 0:
+            anomalies.append("momentum_missing_context")
+            _row_set(row, "score_anomalies", sorted(set(anomalies)))
+            return None
 
         if ret_20d > 0:
             score += 20.0
@@ -2543,25 +2646,31 @@ class WatchlistBuilder:
             trend_component = max(0.0, min(trend_score, 100.0))
         
         # 4. Entry Component - Calculate or retrieve all three entry styles
-        breakout_score = _safe_float(_row_get(row, "breakout_score", 0.0))
-        pullback_score = _safe_float(_row_get(row, "pullback_score", 0.0))
-        momentum_score = _safe_float(_row_get(row, "momentum_score", 0.0))
+        breakout_score = _safe_nullable_float(_row_get(row, "breakout_score", None))
+        pullback_score = _safe_nullable_float(_row_get(row, "pullback_score", None))
+        momentum_score = _safe_nullable_float(_row_get(row, "momentum_score", None))
         
         # Calculate if not present
-        if breakout_score <= 0:
+        if breakout_score is None:
             breakout_score = self._compute_breakout_score(row)
             _row_set(row, "breakout_score", breakout_score)
         
-        if pullback_score <= 0:
+        if pullback_score is None:
             pullback_score = self._compute_pullback_score(row)
             _row_set(row, "pullback_score", pullback_score)
         
-        if momentum_score <= 0:
+        if momentum_score is None:
             momentum_score = self._compute_momentum_score(row)
             _row_set(row, "momentum_score", momentum_score)
         
+        if breakout_score is None and pullback_score is None and momentum_score is None:
+            _row_set(row, "entry_component", {"invalid_entry_inputs": True, "reason": "all_entry_scores_missing"})
+            _row_set(row, "entry_style_selected", None)
+            return round(max(0.0, min((rs_component * 0.30) + (vcp_component * 0.20) + (trend_component * 0.20), 100.0)), 4)
+
         # Entry component = max of the three styles
-        entry_component = max(breakout_score, pullback_score, momentum_score)
+        entry_values = [score for score in (breakout_score, pullback_score, momentum_score) if score is not None]
+        entry_component = max(entry_values) if entry_values else 0.0
         _row_set(row, "entry_component", entry_component)
         
         # Determine selected entry style
@@ -2667,7 +2776,7 @@ class WatchlistBuilder:
         for row in rows:
             tech_score = self._compute_tech_score(row)
             flow_score = self._compute_flow_score(row)
-            final_score = round(tech_score * 0.7 + flow_score * 0.3, 4)
+            final_score = round(tech_score * 0.7 + flow_score * 0.3, 4) if tech_score is not None else None
 
             _row_set(row, "tech_score", tech_score)
             _row_set(row, "flow_score", flow_score)
@@ -2682,6 +2791,12 @@ class WatchlistBuilder:
         breakout_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "breakout_score", 0.0)) > 0)
         pullback_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "pullback_score", 0.0)) > 0)
         momentum_nonzero = sum(1 for r in out if _safe_float(_row_get(r, "momentum_score", 0.0)) > 0)
+        if score_distribution_is_monoculture([_row_get(r, "breakout_score", None) for r in out]):
+            logger.error("[ENTRY_STYLE][MONOCULTURE][BREAKOUT] dominant=%s", dominant_value_ratio([_row_get(r, "breakout_score", None) for r in out]))
+        if score_distribution_is_monoculture([_row_get(r, "pullback_score", None) for r in out]):
+            logger.error("[ENTRY_STYLE][MONOCULTURE][PULLBACK] dominant=%s", dominant_value_ratio([_row_get(r, "pullback_score", None) for r in out]))
+        if score_distribution_is_monoculture([_row_get(r, "entry_style_selected", None) for r in out]):
+            logger.error("[ENTRY_STYLE][MONOCULTURE][STYLE] dominant=%s", dominant_value_ratio([_row_get(r, "entry_style_selected", None) for r in out]))
         
         # Entry style detailed logging
         logger.info(
@@ -2876,31 +2991,8 @@ class WatchlistBuilder:
         ]
         return float(sum(1 for x in checks if x) * 25.0)
 
-    def _compute_atr_pct(self, df: pd.DataFrame, period: int = 14) -> float:
-        if df is None or len(df) < period + 1:
-            return 0.0
-        required = {"high", "low", "close"}
-        if not required.issubset(df.columns):
-            return 0.0
-
-        high = df["high"]
-        low = df["low"]
-        close = df["close"]
-        prev_close = close.shift(1)
-
-        tr = pd.concat(
-            [
-                (high - low).abs(),
-                (high - prev_close).abs(),
-                (low - prev_close).abs(),
-            ],
-            axis=1,
-        ).max(axis=1)
-        atr = tr.rolling(period).mean().iloc[-1]
-        last_close = close.iloc[-1]
-        if pd.isna(atr) or pd.isna(last_close) or float(last_close) == 0.0:
-            return 0.0
-        return float(atr) / float(last_close)
+    def _compute_atr_pct(self, df: pd.DataFrame, period: int = 14) -> float | None:
+        return compute_atr_pct_from_ohlcv(df, period=period)
 
 
 def save_bundle(

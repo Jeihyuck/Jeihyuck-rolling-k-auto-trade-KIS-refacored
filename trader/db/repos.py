@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import UUID, uuid4
 
+import pandas as pd
 import pytz
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
@@ -29,6 +30,8 @@ from .schema import (
 )
 from trader.db.json_safe import json_sanitize
 from trader.db.retry import run_with_db_retry
+from trader.final30_quality import summarize_final30_quality
+from trader.indicators import safe_nullable_float
 from trader.time_utils import now_kst
 from trader.time_coerce import to_date
 from trader.run_context import RunContext
@@ -301,6 +304,22 @@ def summarize_final30_scored_contract(
         and not _contract_value_missing((row or {}).get("close"))
         and float((row or {}).get("close") or 0.0) > 0.0
     )
+    quality = summarize_final30_quality(pd.DataFrame(normalized_rows), required_rows=int(expected_rows))
+    quality_failures: list[str] = []
+    if quality["valid_ma20_ratio"] < 0.95:
+        quality_failures.append(f"ma20_valid_ratio:{quality['valid_ma20_ratio']:.3f}")
+    if quality["valid_atr_ratio"] < 0.95:
+        quality_failures.append(f"atr_valid_ratio:{quality['valid_atr_ratio']:.3f}")
+    if quality["breakout_nonnull_ratio"] < 0.95:
+        quality_failures.append(f"breakout_nonnull_ratio:{quality['breakout_nonnull_ratio']:.3f}")
+    if quality["pullback_nonnull_ratio"] < 0.95:
+        quality_failures.append(f"pullback_nonnull_ratio:{quality['pullback_nonnull_ratio']:.3f}")
+    if quality["momentum_nonnull_ratio"] < 0.90:
+        quality_failures.append(f"momentum_nonnull_ratio:{quality['momentum_nonnull_ratio']:.3f}")
+    if quality["entry_style_monoculture"]:
+        quality_failures.append("entry_style_monoculture")
+    if quality["score_monoculture"]:
+        quality_failures.append("score_monoculture")
 
     ok = (
         len(normalized_rows) == int(expected_rows)
@@ -308,6 +327,7 @@ def summarize_final30_scored_contract(
         and null_critical == 0
         and critical_numeric_zero_invalid == 0
         and atr_pct_zero_invalid_when_close_positive == 0
+        and quality["ok"]
     )
     return {
         "rows": len(normalized_rows),
@@ -325,6 +345,8 @@ def summarize_final30_scored_contract(
         "env": _norm_env(env),
         "as_of": expected_as_of,
         "expected_rows": int(expected_rows),
+        "quality": quality,
+        "quality_failures": quality_failures,
         "ok": bool(ok),
         "rows_data": normalized_rows,
         "columns": all_columns,
@@ -3455,13 +3477,11 @@ class DerivedMinerviniRepo:
         return len(normalized_rows)
 
     @staticmethod
-    def _to_float(value: object, default: float = 0.0) -> float:
-        try:
-            if value is None:
-                return default
-            return float(value)
-        except Exception:
+    def _to_float(value: object, default: float | None = None) -> float | None:
+        out = safe_nullable_float(value)
+        if out is None:
             return default
+        return out
 
     def _normalize_derived_row(self, row: dict) -> dict:
         """Guarantee watchlist-facing score fields exist and are numeric."""
@@ -3470,17 +3490,19 @@ class DerivedMinerviniRepo:
         entry_scores = features.get("entry_scores") if isinstance(features, dict) else {}
         if not isinstance(entry_scores, dict):
             entry_scores = {}
+        entry_component = features.get("entry_component") if isinstance(features.get("entry_component"), dict) else {}
 
-        rs_percentile = self._to_float(out.get("rs_percentile"), 0.0)
+        rs_percentile = self._to_float(out.get("rs_percentile"))
         out["rs_percentile"] = rs_percentile
         out["rs_score"] = self._to_float(out.get("rs_score"), rs_percentile)
 
         # Backward-compat: keep vcp_score/trend_score if only in features_json payload.
-        out["vcp_score"] = self._to_float(out.get("vcp_score"), self._to_float(features.get("vcp_score"), 0.0))
-        out["trend_score"] = self._to_float(out.get("trend_score"), self._to_float(entry_scores.get("trend_score"), 0.0))
-        out["breakout_score"] = self._to_float(out.get("breakout_score"), self._to_float(entry_scores.get("breakout_score"), 0.0))
-        out["pullback_score"] = self._to_float(out.get("pullback_score"), self._to_float(entry_scores.get("pullback_score"), 0.0))
-        out["momentum_score"] = self._to_float(out.get("momentum_score"), self._to_float(entry_scores.get("momentum_score"), 0.0))
+        out["vcp_score"] = self._to_float(out.get("vcp_score"), self._to_float(features.get("vcp_score")))
+        out["trend_score"] = self._to_float(out.get("trend_score"), self._to_float(entry_scores.get("trend_score")))
+        out["breakout_score"] = self._to_float(out.get("breakout_score"), self._to_float(entry_scores.get("breakout_score")))
+        out["pullback_score"] = self._to_float(out.get("pullback_score"), self._to_float(entry_scores.get("pullback_score")))
+        out["momentum_score"] = self._to_float(out.get("momentum_score"), self._to_float(entry_scores.get("momentum_score")))
+        out["entry_style_selected"] = out.get("entry_style_selected") or features.get("entry_style_selected") or entry_component.get("selected")
         return out
 
     def load_for_as_of(self, *, env: str, as_of: date, symbols: list[str] | None = None) -> list[dict]:

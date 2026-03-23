@@ -8,6 +8,7 @@ from typing import Any, Dict, Hashable, Mapping
 import pandas as pd
 
 from trader.score_columns import collect_nonzero_score_stats
+from trader.indicators import safe_nullable_float
 
 logger = logging.getLogger(__name__)
 def _collect_score_nonzero_stats(df: pd.DataFrame) -> tuple[Dict[str, int], Dict[str, str | None]]:
@@ -42,17 +43,7 @@ _REQUIRED_EXPORT_KEYS = [
 
 
 def _safe_float(val: Any) -> float | None:
-    try:
-        if val is None:
-            return None
-        if isinstance(val, str) and not val.strip():
-            return None
-        out = float(val)
-        if pd.isna(out):
-            return None
-        return out
-    except Exception:
-        return None
+    return safe_nullable_float(val)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -94,7 +85,7 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
     normalized: Dict[str, Any] = {str(k): v for k, v in dict(record or {}).items()}
     meta = dict(normalized.get("meta") or {})
 
-    def _pick(*keys: str, default: Any = 0.0) -> Any:
+    def _pick(*keys: str, default: Any = None) -> Any:
         for key in keys:
             if key in normalized:
                 val = normalized.get(key)
@@ -107,8 +98,7 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
                     return val
         return default
 
-    def _pick_score(*keys: str) -> float:
-        # Keep original score values if present; do not overwrite with default 0.
+    def _pick_score(*keys: str) -> float | None:
         for key in keys:
             val = _safe_float(normalized.get(key, None))
             if val is not None:
@@ -117,7 +107,7 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
             val = _safe_float(meta.get(key, None))
             if val is not None:
                 return float(val)
-        return 0.0
+        return None
 
     reject_reasons = _as_list(normalized.get("reject_reasons"))
     reasons = _normalize_reasons(normalized.get("reasons"))
@@ -133,11 +123,12 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
     scores = normalized.get("scores")
     if not isinstance(scores, dict):
         scores = {}
-    scores.setdefault("rs_pctile", float(_pick("rs_pctile") or 0.0))
-    scores.setdefault("vcp_score", float(_pick("vcp_score") or 0.0))
+    scores.setdefault("rs_pctile", _pick("rs_pctile"))
+    scores.setdefault("vcp_score", _pick("vcp_score"))
     scores.setdefault("trend_template", 1 if float(_pick("trend_score") or 0.0) >= 100.0 else 0)
     scores.setdefault("liquidity_rank", int(_pick("rank_pool120", "pool_rank", default=0) or 0))
-    scores.setdefault("pullback_score", max(0.0, min(100.0, 100.0 - float(_pick("pullback_pct") or 0.0) * 400.0)))
+    if scores.get("pullback_score") is None and _pick("pullback_pct") is not None:
+        scores["pullback_score"] = max(0.0, min(100.0, 100.0 - float(_pick("pullback_pct") or 0.0) * 400.0))
     scores.setdefault("foreign_score", max(0.0, min(100.0, float(_pick("foreign_20_ratio") or 0.0) * 100.0)))
     scores.setdefault("inst_score", max(0.0, min(100.0, float(_pick("inst_20_ratio") or 0.0) * 100.0)))
     normalized["scores"] = scores
@@ -158,8 +149,9 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
     normalized["breakout_score"] = _pick_score("breakout_score", "score_breakout")
     normalized["pullback_score"] = _pick_score("pullback_score", "score_pullback")
     normalized["momentum_score"] = _pick_score("momentum_score", "score_momentum")
-    normalized["entry_style_selected"] = str(_pick("entry_style_selected", "entry_style", default="") or "")
-    normalized["entry_component"] = float(_pick("entry_component", default=0.0) or 0.0)
+    entry_style_selected = _pick("entry_style_selected", "entry_style", default=None)
+    normalized["entry_style_selected"] = str(entry_style_selected) if entry_style_selected not in (None, "") else None
+    normalized["entry_component"] = _pick("entry_component", default=None)
 
     normalized["filters_passed"] = _as_list(normalized.get("filters_passed"))
     normalized["filters_failed"] = _as_list(normalized.get("filters_failed") or failed)
@@ -172,23 +164,23 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
 
     # Legacy score_tech/score_flow/score_final for backward compatibility
     score_tech = _pick_score("score_tech", "tech_score")
-    if score_tech <= 0.0:
+    if score_tech is None:
         fallback_tech = _pick_score("tech_score")
-        if fallback_tech > 0.0:
+        if fallback_tech is not None and fallback_tech > 0.0:
             score_tech = fallback_tech
     normalized["score_tech"] = score_tech
 
     score_flow_legacy = _pick_score("score_flow", "flow_score")
-    if score_flow_legacy <= 0.0:
+    if score_flow_legacy is None:
         fallback_flow = _pick_score("flow_score")
-        if fallback_flow > 0.0:
+        if fallback_flow is not None and fallback_flow > 0.0:
             score_flow_legacy = fallback_flow
     normalized["score_flow"] = score_flow_legacy
 
     score_final_legacy = _pick_score("score_final", "final_score", "score")
-    if score_final_legacy <= 0.0:
+    if score_final_legacy is None:
         fallback_final = _pick_score("final_score", "score")
-        if fallback_final > 0.0:
+        if fallback_final is not None and fallback_final > 0.0:
             score_final_legacy = fallback_final
     normalized["score_final"] = score_final_legacy
 
@@ -200,7 +192,7 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
         elif key in {"as_of", "name"}:
             normalized.setdefault(key, "")
         else:
-            normalized.setdefault(key, 0)
+            normalized.setdefault(key, None)
 
     return normalized
 

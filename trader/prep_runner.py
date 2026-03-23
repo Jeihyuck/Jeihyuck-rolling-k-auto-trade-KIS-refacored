@@ -42,6 +42,7 @@ from trader.data.ohlcv_provider import (
     upsert_ohlcv_delta,
 )
 from trader.exporter import export_watchlist_bundle
+from trader.final30_quality import summarize_final30_quality
 from trader.score_columns import (
     collect_nonzero_score_stats,
     has_required_score_fields,
@@ -1565,6 +1566,7 @@ def main() -> int:
         "pullback_nonzero": 0,
         "momentum_nonzero": 0,
     }
+    final30_quality: dict[str, Any] = summarize_final30_quality(pd.DataFrame())
     if final30_df is not None and not final30_df.empty:
         logger.info(
             "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s",
@@ -1595,6 +1597,18 @@ def main() -> int:
             "pullback_nonzero": pullback_nonzero,
             "momentum_nonzero": momentum_nonzero,
         }
+        final30_quality = summarize_final30_quality(final30_df, required_rows=FINAL30_SCORED_REQUIRED_ROWS)
+        logger.info(
+            "[PREP][FINAL30][QUALITY] rows=%s ma20_valid=%s atr_valid=%s breakout_valid=%s pullback_valid=%s momentum_valid=%s entry_style_monoculture=%s ok=%s",
+            final30_quality["rows"],
+            round(final30_quality["valid_ma20_ratio"], 4),
+            round(final30_quality["valid_atr_ratio"], 4),
+            round(final30_quality["breakout_nonnull_ratio"], 4),
+            round(final30_quality["pullback_nonnull_ratio"], 4),
+            round(final30_quality["momentum_nonnull_ratio"], 4),
+            int(final30_quality["entry_style_monoculture"]),
+            int(final30_quality["ok"]),
+        )
         logger.info(
             "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
             int(len(final30_df)),
@@ -1804,6 +1818,23 @@ def main() -> int:
             final30_file_failures,
         )
     strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or [])
+    if not final30_quality.get("ok", False):
+        strict_contract_failures.extend(
+            [
+                f"final30_quality:{failure}"
+                for failure in (
+                    [
+                        f"ma20_valid_ratio={final30_quality['valid_ma20_ratio']:.3f}",
+                        f"atr_valid_ratio={final30_quality['valid_atr_ratio']:.3f}",
+                        f"breakout_nonnull_ratio={final30_quality['breakout_nonnull_ratio']:.3f}",
+                        f"pullback_nonnull_ratio={final30_quality['pullback_nonnull_ratio']:.3f}",
+                        f"momentum_nonnull_ratio={final30_quality['momentum_nonnull_ratio']:.3f}",
+                    ]
+                    + (["entry_style_monoculture"] if final30_quality.get("entry_style_monoculture") else [])
+                    + (["score_monoculture"] if final30_quality.get("score_monoculture") else [])
+                )
+            ]
+        )
     if bool(scored_contract) and final30_file_contract_ok:
         logger.info(
             "[PREP][FINAL30_SCORED][CONTRACT_OK] as_of=%s final=%s final_scored=%s runtime=%s ledger=%s signals=%s",
