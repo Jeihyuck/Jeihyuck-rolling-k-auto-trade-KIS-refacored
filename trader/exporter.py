@@ -8,6 +8,7 @@ from typing import Any, Dict, Hashable, Mapping
 import pandas as pd
 
 from trader.score_columns import collect_nonzero_score_stats
+from trader.final30_quality import normalize_final30_contract_row
 from trader.indicators import safe_nullable_float
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ def _normalize_reasons(value: Any) -> Dict[str, Any]:
 
 def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
     # Pandas records can carry non-str key types; normalize keys to strings for stable schema handling.
-    normalized: Dict[str, Any] = {str(k): v for k, v in dict(record or {}).items()}
+    normalized: Dict[str, Any] = normalize_final30_contract_row({str(k): v for k, v in dict(record or {}).items()})
     meta = dict(normalized.get("meta") or {})
 
     def _pick(*keys: str, default: Any = None) -> Any:
@@ -265,6 +266,14 @@ def export_watchlist_bundle(
         pre_stats, pre_alias_cols = _collect_score_nonzero_stats(pre_df)
         if safe_name == "final30":
             logger.info("[EXPORT][FINAL30][SOURCE_COLUMNS] cols=%s", sorted(pre_df.columns.tolist()))
+            dtype_info = {}
+            for col in ("close", "ma20", "ma50", "ma150", "atr_pct"):
+                if col in pre_df.columns:
+                    dtype_info[col] = {
+                        "dtype": str(pre_df[col].dtype),
+                        "nonnull": int(pre_df[col].notna().sum()),
+                    }
+            logger.info("[EXPORT][FINAL30][DTYPE_CHECK] %s", dtype_info)
             logger.info(
                 "[EXPORT][FINAL30][ALIAS] breakout_col=%s pullback_col=%s momentum_col=%s tech_col=%s final_col=%s",
                 pre_alias_cols.get("breakout") or "",
@@ -377,11 +386,22 @@ def export_watchlist_bundle(
         written[f"{safe_name}_csv"] = csv_path
 
         json_path = out_dir / f"{safe_name}.json"
-        payload = [_normalize_record(rec) for rec in df.to_dict(orient="records")]
+        payload = [normalize_final30_contract_row(_normalize_record(rec)) for rec in df.to_dict(orient="records")]
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
         payload_nonzero = sum(1 for rec in payload if float(rec.get("score_final", 0.0) or 0.0) > 0.0)
         logger.info("[EXPORT] wrote %s rows=%s score_final_nonzero=%s", json_path, len(payload), payload_nonzero)
+        if safe_name == "final30":
+            reloaded = json.loads(json_path.read_text(encoding="utf-8"))
+            reload_rows = [normalize_final30_contract_row(rec) for rec in reloaded if isinstance(rec, dict)]
+            logger.info(
+                "[EXPORT][FINAL30][RELOAD_CHECK] rows=%s ma20_nonnull=%s ma50_nonnull=%s ma150_nonnull=%s atr_pct_nonnull=%s",
+                len(reload_rows),
+                sum(1 for row in reload_rows if row.get("ma20") is not None),
+                sum(1 for row in reload_rows if row.get("ma50") is not None),
+                sum(1 for row in reload_rows if row.get("ma150") is not None),
+                sum(1 for row in reload_rows if row.get("atr_pct") is not None),
+            )
         written[f"{safe_name}_json"] = json_path
 
     meta_path = out_dir / "meta.json"

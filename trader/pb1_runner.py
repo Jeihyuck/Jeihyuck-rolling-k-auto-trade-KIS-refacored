@@ -13,13 +13,13 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
-from trader.final30_quality import validate_trade_ready
+from trader.final30_quality import format_final30_abort_message, validate_trade_ready, verify_final30_scored_rows
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from trader.runtime_paths import build_final30_scored_paths, repo_root
-from trader.path_contract import build_final30_paths, build_watchlist_paths, resolve_repo_root, serialize_path_map, write_final30_mirrors
+from trader.path_contract import build_final30_paths, build_watchlist_paths, read_final30_file_rows, resolve_repo_root, serialize_path_map, write_final30_mirrors
 
 from trader.config import (
     AFTERNOON_WINDOW_END,
@@ -145,6 +145,56 @@ def _load_json_rows(path: Path) -> list[dict[str, Any]]:
     return []
 
 
+def _validate_trade_final30_files(*, repo_root_path: Path, env: str, as_of: str) -> dict[str, Any]:
+    path_results: dict[str, Any] = {}
+    aggregate_ok = True
+    aggregate_errors: list[str] = []
+    for label, path in build_final30_paths(repo_root_path, env, as_of).items():
+        rows, json_ok = read_final30_file_rows(path)
+        result = verify_final30_scored_rows(
+            rows,
+            required_rows=30,
+            required_fields=REQUIRED_SCORED_FINAL30_COLS,
+            source=f"FILE:{label}",
+        ) if json_ok and rows else {
+            "ok": False,
+            "rows": len(rows),
+            "required_cols_ok": False,
+            "errors": ["file_missing_or_unreadable"] if not path.exists() or not json_ok else ["rows_not_exact"],
+        }
+        info = {
+            "exists": bool(path.exists()),
+            "json_ok": bool(json_ok),
+            "rows": int(result.get("rows") or 0),
+            "required_cols_ok": bool(result.get("required_cols_ok")),
+            "strict_quality_ok": bool(result.get("ok")),
+            "errors": list(result.get("errors") or []),
+        }
+        logger.info("[TRADE][FINAL30][FILE_REPAIR][POST_VALIDATE] label=%s result=%s", label, info)
+        path_results[label] = info
+        aggregate_ok = aggregate_ok and bool(info["strict_quality_ok"])
+        aggregate_errors.extend(info["errors"])
+    logger.info(
+        "[TRADE][FINAL30][STRICT_VALIDATE][FILES] ok=%s errors=%s",
+        int(aggregate_ok),
+        list(dict.fromkeys(aggregate_errors)),
+    )
+    return {
+        "ok": aggregate_ok,
+        "errors": list(dict.fromkeys(aggregate_errors)),
+        "paths": path_results,
+    }
+
+
+def _strict_validate_trade_final30_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    return verify_final30_scored_rows(
+        rows,
+        required_rows=30,
+        required_fields=REQUIRED_SCORED_FINAL30_COLS,
+        source=source,
+    )
+
+
 def load_trade_final30_scored(
     *,
     engine,
@@ -201,13 +251,7 @@ def load_trade_final30_scored(
     contract_columns = [str(col) for col in (scored_contract.get("columns") or [])]
     rows = list(scored_contract.get("rows_data") or [])
     missing_critical_fields = [col for col in REQUIRED_SCORED_FINAL30_COLS if col not in contract_columns]
-    contract_ok = bool(
-        scored_contract.get("ok")
-        and int(scored_contract.get("rows") or 0) == 30
-        and int(scored_contract.get("uniq_codes") or 0) == 30
-        and int(scored_contract.get("null_critical") or 0) == 0
-        and not missing_critical_fields
-    )
+    contract_ok = bool(scored_contract.get("ok") and not missing_critical_fields)
     logger.info(
         "[TRADE][FINAL30][DB_EXACT_LOAD] env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s",
         env_n,
@@ -223,6 +267,14 @@ def load_trade_final30_scored(
         scored_contract.get("null_critical"),
         scored_contract.get("missing_fields"),
         missing_critical_fields,
+    )
+    logger.info(
+        "[TRADE][FINAL30][STRICT_VALIDATE][DB] ok=%s rows=%s invalid_rows=%s errors=%s warnings=%s",
+        int(bool(scored_contract.get("ok"))),
+        int(scored_contract.get("rows") or 0),
+        int(scored_contract.get("invalid_row_count") or 0),
+        list(scored_contract.get("errors") or []),
+        list(scored_contract.get("warnings") or []),
     )
     if contract_ok:
         missing_labels = [label for label, present in file_mirror_stats.items() if not present]
@@ -250,6 +302,7 @@ def load_trade_final30_scored(
                 file_mirror_stats.get("ledger", 0),
                 file_mirror_stats.get("signals", 0),
             )
+        _validate_trade_final30_files(repo_root_path=repo_root_path, env=env_n, as_of=as_of_s)
         if missing_labels and not any(file_mirror_stats.values()):
             logger.error(
                 "[TRADE][FINAL30][FILE_CONTRACT_MISMATCH] env=%s as_of=%s paths=%s",
@@ -257,12 +310,15 @@ def load_trade_final30_scored(
                 as_of_s,
                 serialize_path_map(final30_paths),
             )
+        trade_validate = _strict_validate_trade_final30_rows(rows, source="db")
         df = pd.DataFrame(rows)
         columns = [str(c) for c in df.columns.tolist()]
         try:
-            validate_trade_ready(df)
+            if not bool(trade_validate.get("ok")):
+                raise RuntimeError(format_final30_abort_message(trade_validate))
             logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
         except RuntimeError as exc:
+            logger.error("[TRADE][ABORT][FINAL30_INVALID][DETAIL] %s", format_final30_abort_message(trade_validate))
             logger.error("%s", exc)
             result = {
                 "df": pd.DataFrame(),
@@ -299,7 +355,14 @@ def load_trade_final30_scored(
         return result
 
     logger.error(
-        "[TRADE][FINAL30][LOAD_FAIL] reason=db_contract_invalid env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_fields=%s missing_critical=%s",
+        "[TRADE][ABORT][FINAL30_INVALID][DETAIL] source=db rows=%s invalid_rows=%s error_codes=%s details=%s",
+        scored_contract.get("rows"),
+        scored_contract.get("invalid_row_count"),
+        scored_contract.get("invalid_sample_codes"),
+        scored_contract.get("invalid_details"),
+    )
+    logger.error(
+        "[TRADE][FINAL30][LOAD_FAIL] reason=db_contract_invalid env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_fields=%s missing_critical=%s errors=%s",
         env_n,
         as_of_date.isoformat(),
         scored_contract.get("rows"),
@@ -308,6 +371,7 @@ def load_trade_final30_scored(
         scored_contract.get("null_critical"),
         scored_contract.get("missing_fields"),
         missing_critical_fields,
+        scored_contract.get("errors"),
     )
     result = {
         "df": pd.DataFrame(),

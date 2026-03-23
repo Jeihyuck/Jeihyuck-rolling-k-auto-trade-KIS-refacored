@@ -30,7 +30,7 @@ from .schema import (
 )
 from trader.db.json_safe import json_sanitize
 from trader.db.retry import run_with_db_retry
-from trader.final30_quality import summarize_final30_quality
+from trader.final30_quality import normalize_final30_contract_row, summarize_final30_quality, verify_final30_scored_rows
 from trader.indicators import safe_nullable_float
 from trader.time_utils import now_kst
 from trader.time_coerce import to_date
@@ -196,6 +196,26 @@ def _safe_float_or_none(value: Any) -> float | None:
         return None
 
 
+def _log_scored_sample(prefix: str, rows: List[Dict[str, Any]], *, limit: int = 5) -> None:
+    for row in (rows or [])[:limit]:
+        normalized = normalize_final30_contract_row(row)
+        logger.info(
+            "%s code=%s close=%s ma20=%s ma50=%s ma150=%s atr_pct=%s rs_percentile=%s breakout_score=%s pullback_score=%s momentum_score=%s score_final=%s",
+            prefix,
+            normalized.get("code", ""),
+            normalized.get("close"),
+            normalized.get("ma20"),
+            normalized.get("ma50"),
+            normalized.get("ma150"),
+            normalized.get("atr_pct"),
+            normalized.get("rs_percentile"),
+            normalized.get("breakout_score"),
+            normalized.get("pullback_score"),
+            normalized.get("momentum_score"),
+            normalized.get("score_final"),
+        )
+
+
 def _entry_meta_columns(entry_meta: dict[str, Any] | None, *, json_field: str) -> dict[str, Any]:
     payload = json_sanitize(entry_meta or {})
     return {
@@ -266,7 +286,7 @@ def summarize_final30_scored_contract(
     expected_rows: int = FINAL30_SCORED_REQUIRED_ROWS,
 ) -> Dict[str, Any]:
     expected_as_of = to_date(as_of).isoformat()
-    normalized_rows = [dict(row or {}) for row in (rows or []) if isinstance(row, dict)]
+    normalized_rows = [normalize_final30_contract_row(row) for row in (rows or []) if isinstance(row, dict)]
     all_columns = sorted({str(key) for row in normalized_rows for key in row.keys()})
     missing_fields = [field for field in FINAL30_SCORED_DB_CONTRACT_FIELDS if field not in all_columns]
 
@@ -304,19 +324,24 @@ def summarize_final30_scored_contract(
         and not _contract_value_missing((row or {}).get("close"))
         and float((row or {}).get("close") or 0.0) > 0.0
     )
+    verifier = verify_final30_scored_rows(
+        normalized_rows,
+        required_rows=int(expected_rows),
+        required_fields=FINAL30_SCORED_DB_CONTRACT_FIELDS,
+        source="db",
+    )
     quality = summarize_final30_quality(pd.DataFrame(normalized_rows), required_rows=int(expected_rows))
-    quality_failures: list[str] = list(quality.get("hard_fail_reasons", []))
-    quality_soft_failures: list[str] = list(quality.get("soft_fail_reasons", []))
+    quality_failures: list[str] = list(verifier.get("errors", []))
+    quality_soft_failures: list[str] = list(verifier.get("warnings", []))
 
     ok = (
-        len(normalized_rows) == int(expected_rows)
-        and uniq_codes == int(expected_rows)
+        bool(verifier.get("ok"))
         and null_critical == 0
         and critical_numeric_zero_invalid == 0
         and atr_pct_zero_invalid_when_close_positive == 0
-        and quality["ok"]
     )
     return {
+        **verifier,
         "rows": len(normalized_rows),
         "uniq_codes": uniq_codes,
         "uniq_ranks": uniq_ranks,
@@ -423,13 +448,19 @@ def _save_pb1_watchlist_rows_plain(
 
 
 def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int) -> Dict[str, Any]:
-    src = dict(row or {})
+    src = normalize_final30_contract_row(row)
     normalized: Dict[str, Any] = {}
     for col in REQUIRED_FINAL30_SCORED_COLS:
         if col == "as_of":
             normalized[col] = as_of_date.isoformat()
             continue
         normalized[col] = src.get(col)
+
+    normalized["score_final"] = src.get("score_final")
+    normalized["final_score"] = src.get("final_score")
+    normalized["score"] = src.get("score")
+    normalized["rs_percentile"] = src.get("rs_percentile")
+    normalized["rs_pctile"] = src.get("rs_percentile")
 
     code = str(normalized.get("code") or src.get("code") or "").zfill(6)
     if not code:
@@ -454,7 +485,7 @@ def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int
         score = None
 
     # Persist full scored payload in meta and restore as top-level on scored load.
-    payload_meta = json_sanitize(normalized)
+    payload_meta = json_sanitize(normalize_final30_contract_row(normalized))
     return {
         "env": None,
         "strategy": None,
@@ -492,6 +523,7 @@ def _save_pb1_watchlist_rows_scored(
         )
 
     payload: List[Dict[str, Any]] = []
+    normalized_rows_for_log: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows, start=1):
         entry = _build_scored_payload_row(row, as_of_date=as_of_date, idx=idx)
         if not entry:
@@ -499,10 +531,13 @@ def _save_pb1_watchlist_rows_scored(
         entry["env"] = env_n
         entry["strategy"] = strategy_n
         payload.append(entry)
+        normalized_rows_for_log.append(normalize_final30_contract_row(entry.get("meta") or {}))
 
     if not payload:
         logger.warning("[WATCHLIST][SAVE_SCORED] no valid rows after normalization env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
         return
+
+    _log_scored_sample("[WATCHLIST][SAVE_SCORED][PRE_DB_SAMPLE]", normalized_rows_for_log)
 
     sample_meta = payload[0].get("meta") if isinstance(payload[0].get("meta"), dict) else {}
     sample_keys = sorted(sample_meta.keys())
@@ -547,7 +582,7 @@ def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:
     out.setdefault("code", row.code)
     out.setdefault("rank", row.rank)
     out.setdefault("score", float(row.score) if row.score is not None else None)
-    return out
+    return normalize_final30_contract_row(out)
 
 
 def load_pb1_watchlist_codes(
@@ -3336,6 +3371,7 @@ class WatchlistRepo:
             has.get("entry_style_selected", 0),
         )
         if result:
+            _log_scored_sample("[WATCHLIST][LOAD_SCORED][POST_DB_SAMPLE]", result)
             sample_keys = sorted(result[0].keys())
             sample_row = {k: result[0].get(k) for k in CRITICAL_SCORED_COLS + ["code", "rank_final30", "score"] if k in result[0]}
             logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_KEYS] keys=%s", sample_keys)

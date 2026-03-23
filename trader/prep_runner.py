@@ -42,7 +42,7 @@ from trader.data.ohlcv_provider import (
     upsert_ohlcv_delta,
 )
 from trader.exporter import export_watchlist_bundle
-from trader.final30_quality import summarize_final30_quality
+from trader.final30_quality import normalize_final30_contract_row, summarize_final30_quality, verify_final30_scored_rows
 from trader.score_columns import (
     collect_nonzero_score_stats,
     has_required_score_fields,
@@ -59,7 +59,7 @@ from trader.time_utils import (
     resolve_derived_as_of,
 )
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
-from trader.path_contract import write_final30_mirrors, verify_final30_mirrors
+from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
 
@@ -78,7 +78,26 @@ FINAL30_SCORED_EXPORT_COLS = [
     "rs_percentile",
     "vcp_score",
     "atr_pct",
+    "close",
+    "ma20",
+    "ma50",
+    "ma150",
     "pullback_pct",
+    "entry_style_selected",
+]
+FINAL30_STRICT_REQUIRED_FIELDS = [
+    "code",
+    "close",
+    "ma20",
+    "ma50",
+    "ma150",
+    "atr_pct",
+    "rs_percentile",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "tech_score",
+    "score_final",
     "entry_style_selected",
 ]
 
@@ -353,6 +372,73 @@ def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _log_final30_field_trace(rows: list[dict[str, Any]], *, limit: int = 5) -> None:
+    for row in (rows or [])[:limit]:
+        normalized = normalize_final30_contract_row(row)
+        logger.info(
+            "[PREP][FINAL30][FIELD_TRACE] code=%s close=%s ma20=%s ma50=%s ma150=%s atr_pct=%s",
+            normalized.get("code", ""),
+            normalized.get("close"),
+            normalized.get("ma20"),
+            normalized.get("ma50"),
+            normalized.get("ma150"),
+            normalized.get("atr_pct"),
+        )
+
+
+def _strict_validate_final30_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    result = verify_final30_scored_rows(
+        rows,
+        required_rows=FINAL30_SCORED_REQUIRED_ROWS,
+        required_fields=FINAL30_STRICT_REQUIRED_FIELDS,
+        source=source,
+    )
+    logger.info(
+        "[PREP][FINAL30][STRICT_VALIDATE][%s] ok=%s rows=%s invalid_rows=%s errors=%s warnings=%s",
+        source,
+        int(bool(result.get("ok"))),
+        int(result.get("rows") or 0),
+        int(result.get("invalid_row_count") or 0),
+        list(result.get("errors") or []),
+        list(result.get("warnings") or []),
+    )
+    return result
+
+
+def _strict_validate_final30_files(*, env: str, as_of: str) -> dict[str, Any]:
+    path_results: dict[str, Any] = {}
+    aggregate_errors: list[str] = []
+    aggregate_ok = True
+    for label, path in build_final30_scored_paths(repo_root(), env, as_of).items():
+        rows, json_ok = read_final30_file_rows(path)
+        validate = _strict_validate_final30_rows(rows, source=f"FILES:{label}") if json_ok and rows else {
+            "ok": False,
+            "rows": len(rows),
+            "required_cols_ok": False,
+            "errors": ["file_missing_or_unreadable"] if not path.exists() or not json_ok else ["rows_not_exact"],
+        }
+        info = {
+            "path": path,
+            "exists": bool(path.exists()),
+            "json_ok": bool(json_ok),
+            "rows_ok": int(validate.get("rows") or 0) == FINAL30_SCORED_REQUIRED_ROWS,
+            "required_cols_ok": bool(validate.get("required_cols_ok")),
+            "strict_quality_ok": bool(validate.get("ok")),
+            "errors": list(validate.get("errors") or []),
+            "rows": int(validate.get("rows") or 0),
+        }
+        logger.info("[PREP][FINAL30][STRICT_VALIDATE][FILES] label=%s result=%s", label, info)
+        path_results[label] = info
+        aggregate_ok = aggregate_ok and bool(info["strict_quality_ok"])
+        aggregate_errors.extend(info["errors"])
+
+    return {
+        "ok": aggregate_ok,
+        "errors": list(dict.fromkeys(aggregate_errors)),
+        "paths": path_results,
+    }
 
 
 def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFrame) -> dict[str, dict[str, Any]]:
@@ -1454,13 +1540,7 @@ def main() -> int:
         )
         scored_columns = set(scored_contract.get("columns") or [])
         critical_missing_fields = [col for col in CRITICAL_SCORED_COLS if col not in scored_columns]
-        db_commit_ok = bool(
-            len(exact_final_rows) == 30
-            and int(scored_contract.get("rows") or 0) == 30
-            and int(scored_contract.get("uniq_codes") or 0) == 30
-            and int(scored_contract.get("null_critical") or 0) == 0
-            and not critical_missing_fields
-        )
+        db_commit_ok = bool(scored_contract.get("ok") and len(exact_final_rows) == 30 and not critical_missing_fields)
         logger.info(
             "[PREP][FINAL30_SCORED][DB_VERIFY] env=%s as_of=%s final=%s final_scored=%s uniq_codes=%s uniq_ranks=%s null_critical=%s required=30 ok=%s",
             env,
@@ -1471,6 +1551,14 @@ def main() -> int:
             scored_contract.get("uniq_ranks"),
             scored_contract.get("null_critical"),
             int(db_commit_ok),
+        )
+        logger.info(
+            "[PREP][FINAL30][STRICT_VALIDATE][DB] ok=%s rows=%s invalid_rows=%s errors=%s warnings=%s",
+            int(bool(scored_contract.get("ok"))),
+            int(scored_contract.get("rows") or 0),
+            int(scored_contract.get("invalid_row_count") or 0),
+            list(scored_contract.get("errors") or []),
+            list(scored_contract.get("warnings") or []),
         )
         if scored_contract.get("rank_warn"):
             logger.warning(
@@ -1571,6 +1659,7 @@ def main() -> int:
     final30_quality_soft_fail = False
     final30_trade_can_proceed = False
     if final30_df is not None and not final30_df.empty:
+        _log_final30_field_trace(final30_df.to_dict(orient="records"))
         logger.info(
             "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s",
             final30_source_label,
@@ -1600,7 +1689,7 @@ def main() -> int:
             "pullback_nonzero": pullback_nonzero,
             "momentum_nonzero": momentum_nonzero,
         }
-        final30_quality = summarize_final30_quality(final30_df, required_rows=FINAL30_SCORED_REQUIRED_ROWS)
+        final30_quality = _strict_validate_final30_rows(final30_df.to_dict(orient="records"), source="INMEM")
         final30_quality_ok = bool(final30_quality.get("ok", False))
         final30_quality_soft_fail = bool(final30_quality.get("soft_fail", False))
         final30_trade_can_proceed = bool(final30_quality_ok and not final30_quality_soft_fail)
@@ -1805,12 +1894,15 @@ def main() -> int:
     prep_status = "DONE"
     flow_coverage = 0.0
     degraded_exclude_flow = False
+    final30_files_validation = _strict_validate_final30_files(env=env, as_of=as_of.isoformat())
     final30_file_failures = [
         f"final30_file_contract_missing:{label}"
         for label, info in final30_file_results.items()
         if not bool(info.get("exists")) or int(info.get("bytes") or 0) <= 0 or int(info.get("rows") or 0) <= 0
     ]
-    final30_file_contract_ok = len(final30_scored_df_for_export) > 0 and not final30_file_failures
+    final30_file_failures.extend(list(final30_files_validation.get("errors") or []))
+    final30_file_failures = list(dict.fromkeys(final30_file_failures))
+    final30_file_contract_ok = len(final30_scored_df_for_export) > 0 and not final30_file_failures and bool(final30_files_validation.get("ok"))
     logger.info(
         "[PREP][FINAL30_SCORED][FILE_VERIFY] ok=%s failures=%s runtime=%s ledger=%s signals=%s",
         int(final30_file_contract_ok),
@@ -1826,7 +1918,7 @@ def main() -> int:
             prep_cwd,
             final30_file_failures,
         )
-    strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or [])
+    strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or []) + list(scored_contract.get("errors") or []) + list(final30_quality.get("errors") or [])
     if (not final30_quality_ok) or final30_quality_soft_fail:
         logger.warning(
             "[PREP][FINAL30][QUALITY_WARN] ok=%s soft_fail=%s hard_fail_reasons=%s soft_fail_reasons=%s",
@@ -1834,6 +1926,17 @@ def main() -> int:
             final30_quality_soft_fail,
             final30_quality.get("hard_fail_reasons", []),
             final30_quality.get("soft_fail_reasons", []),
+        )
+    if (not final30_quality_ok) or (not bool(scored_contract.get("ok"))) or (not bool(final30_files_validation.get("ok"))):
+        raise RuntimeError(
+            "PREP_FINAL30_STRICT_VALIDATE_FAILED:"
+            + ",".join(
+                list(dict.fromkeys(
+                    list(final30_quality.get("errors") or [])
+                    + list(scored_contract.get("errors") or [])
+                    + list(final30_files_validation.get("errors") or [])
+                ))
+            )
         )
     if bool(scored_contract) and final30_file_contract_ok:
         logger.info(

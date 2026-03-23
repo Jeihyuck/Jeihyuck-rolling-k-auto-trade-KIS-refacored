@@ -25,7 +25,17 @@ from trader.db.repos import (
     WatchlistRepo,
 )
 from trader.flow_score import calculate_final_score, calculate_flow_score
-from trader.final30_quality import dominant_value_ratio, is_placeholder_entry_value, normalize_entry_input_value, score_distribution_is_monoculture, summarize_final30_quality
+from trader.final30_quality import (
+    FINAL30_PRESERVE_FIELDS,
+    dominant_value_ratio,
+    is_placeholder_entry_value,
+    is_valid_positive_numeric,
+    normalize_entry_input_value,
+    normalize_final30_contract_row,
+    score_distribution_is_monoculture,
+    summarize_final30_quality,
+    verify_final30_scored_rows,
+)
 from trader.factors.multifactor import (
     compute_ai_rs_scores,
     compute_liquidity_score,
@@ -224,6 +234,20 @@ INVALID_ZERO_NUMERIC_FIELDS = ("close", "ma20", "ma50", "ma150", "atr_pct")
 ZERO_INVALID_ALWAYS_FIELDS = {"close", "ma20", "ma50", "ma150"}
 NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile"}
 NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
+FINAL30_CONTRACT_REQUIRED_FIELDS = tuple(
+    dict.fromkeys(
+        (
+            "code",
+            *FINAL30_PRESERVE_FIELDS,
+            "breakout_score",
+            "pullback_score",
+            "momentum_score",
+            "tech_score",
+            "score_final",
+            "entry_style_selected",
+        )
+    )
+)
 
 
 def _is_missing_value(value: Any) -> bool:
@@ -235,6 +259,38 @@ def _is_missing_value(value: Any) -> bool:
         return bool(pd.isna(value))
     except Exception:
         return False
+
+
+def _prefer_numeric_candidates(values: List[Any], *, zero_invalid: bool = False) -> float | None:
+    fallback: float | None = None
+    for value in values:
+        numeric = _safe_nullable_float(value)
+        if numeric is None:
+            continue
+        if not zero_invalid or numeric > 0:
+            return numeric
+        if fallback is None:
+            fallback = numeric
+    return fallback
+
+
+def _append_quality_flag(row: Dict[str, Any], flag: str) -> None:
+    flags = list(row.get("quality_flags") or [])
+    if flag not in flags:
+        flags.append(flag)
+    row["quality_flags"] = flags
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    meta["quality_flags"] = flags
+    row["meta"] = meta
+
+
+def evaluate_final30_quality(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return verify_final30_scored_rows(
+        rows,
+        required_rows=30,
+        required_fields=FINAL30_CONTRACT_REQUIRED_FIELDS,
+        source="watchlist_builder",
+    )
 
 
 def _is_invalid_zero_field(field: str, value: Any, row: Dict[str, Any]) -> bool:
@@ -578,7 +634,7 @@ def _extract_derived_metrics(derived_row: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(item)
+    out = normalize_final30_contract_row(item)
     out["code"] = str(out.get("code") or "").zfill(6)
     meta = dict(out.get("meta") or {})
     meta["code"] = out["code"]
@@ -722,7 +778,7 @@ def _enrich_watchlist_rows(
 
     enriched: List[Dict[str, Any]] = []
     for item in normalized_rows:
-        out = dict(item)
+        out = normalize_final30_contract_row(item)
         code = str(out.get("code") or "").zfill(6)
         meta = dict(out.get("meta") or {})
         reject_reasons = list(out.get("reject_reasons", []) or meta.get("reject_reasons", []) or [])
@@ -842,24 +898,48 @@ def _enrich_watchlist_rows(
                 + atr_score * 0.05
             )
 
-        repaired_ma20 = _prefer_valid_numeric(out.get("ma20"), meta.get("ma20"), zero_invalid=True)
-        if (repaired_ma20 is None or repaired_ma20 <= 0) and not ohlcv_df.empty:
+        derived_features = derived_row.get("features_json") if isinstance(derived_row, dict) and isinstance(derived_row.get("features_json"), dict) else {}
+        repaired_ma20 = _prefer_numeric_candidates(
+            [
+                out.get("ma20"),
+                meta.get("ma20"),
+                item.get("ma20"),
+                derived_row.get("ma20") if isinstance(derived_row, dict) else None,
+                derived_features.get("ma20"),
+            ],
+            zero_invalid=True,
+        )
+        if not is_valid_positive_numeric(repaired_ma20) and not ohlcv_df.empty:
             repaired_ma20 = compute_ma20_from_ohlcv(ohlcv_df)
         out["ma20"] = repaired_ma20
-        if repaired_ma20 is None:
+        meta["ma20"] = repaired_ma20
+        if not is_valid_positive_numeric(repaired_ma20):
             reject_reasons.append("ma20_missing")
+            _append_quality_flag(out, "ma20_invalid")
 
-        repaired_atr_pct = _prefer_valid_numeric(out.get("atr_pct"), meta.get("atr_pct"), zero_invalid=True)
-        if (repaired_atr_pct is None or repaired_atr_pct <= 0) and not ohlcv_df.empty:
+        repaired_atr_pct = _prefer_numeric_candidates(
+            [
+                out.get("atr_pct"),
+                meta.get("atr_pct"),
+                item.get("atr_pct"),
+                derived_row.get("atr_pct") if isinstance(derived_row, dict) else None,
+                derived_features.get("atr_pct"),
+            ],
+            zero_invalid=True,
+        )
+        if not is_valid_positive_numeric(repaired_atr_pct) and not ohlcv_df.empty:
             repaired_atr_pct = compute_atr_pct_from_ohlcv(ohlcv_df)
         out["atr_pct"] = repaired_atr_pct
-        if repaired_atr_pct is None:
+        meta["atr_pct"] = repaired_atr_pct
+        if not is_valid_positive_numeric(repaired_atr_pct):
             reject_reasons.append("atr_pct_invalid")
+            _append_quality_flag(out, "atr_pct_invalid")
 
         out["reject_reasons"] = list(dict.fromkeys(reject_reasons))
         meta["reject_reasons"] = out["reject_reasons"]
         out["meta"] = meta
         out = _sync_item_and_meta_fields(out)
+        out = normalize_final30_contract_row(out)
         enriched.append(out)
 
     enriched.sort(key=lambda row: _safe_float(row.get("final_score", row.get("score", 0.0)), 0.0), reverse=True)
@@ -869,7 +949,7 @@ def _enrich_watchlist_rows(
         row.setdefault("rank_top50", _safe_int(row.get("rank_top50"), 0))
         row.setdefault("rank_pool120", _safe_int(row.get("rank_pool120"), 0))
 
-    quality = summarize_final30_quality(pd.DataFrame(enriched), required_rows=30)
+    quality = evaluate_final30_quality(enriched)
     quality_ok = bool(quality.get("ok", False))
     quality_soft_fail = bool(quality.get("soft_fail", False))
     logger.info(
@@ -890,7 +970,15 @@ def _enrich_watchlist_rows(
         quality.get("score_monoculture"),
         quality_ok,
     )
-    if not quality_ok or quality_soft_fail:
+    if not quality_ok:
+        logger.error(
+            "[WATCHLIST][FINAL30][QUALITY_FAIL] errors=%s invalid_rows=%s invalid_codes=%s",
+            quality.get("errors", []),
+            quality.get("invalid_row_count", 0),
+            quality.get("invalid_sample_codes", []),
+        )
+        raise RuntimeError("FINAL30_QUALITY_FAILED:" + ",".join(quality.get("errors", [])))
+    if quality_soft_fail:
         logger.warning("[WATCHLIST][FINAL30][QUALITY_FAIL_SOFT] quality=%s", quality)
 
     if flow_rows:

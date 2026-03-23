@@ -23,9 +23,9 @@ def test_export_validation_empty_universe_scored():
         }
         meta = {}
         
-        result = export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
-        
-        # Export should still happen but with validation failures in meta
+        with pytest.raises(ValueError, match="EXPORT_VALIDATION_FAILED"):
+            export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
+
         assert (out_dir / "meta.json").exists()
         with (out_dir / "meta.json").open() as f:
             saved_meta = json.load(f)
@@ -46,8 +46,9 @@ def test_export_validation_pool120_too_small():
         }
         meta = {}
         
-        result = export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
-        
+        with pytest.raises(ValueError, match="EXPORT_VALIDATION_FAILED"):
+            export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
+
         with (out_dir / "meta.json").open() as f:
             saved_meta = json.load(f)
         
@@ -68,8 +69,9 @@ def test_export_validation_top50_too_small():
         }
         meta = {}
         
-        result = export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
-        
+        with pytest.raises(ValueError, match="EXPORT_VALIDATION_FAILED"):
+            export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
+
         with (out_dir / "meta.json").open() as f:
             saved_meta = json.load(f)
         
@@ -90,8 +92,9 @@ def test_export_validation_final30_too_small():
         }
         meta = {}
         
-        result = export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
-        
+        with pytest.raises(ValueError, match="EXPORT_VALIDATION_FAILED"):
+            export_watchlist_bundle(out_dir=out_dir, frames_dict=frames, meta_dict=meta)
+
         with (out_dir / "meta.json").open() as f:
             saved_meta = json.load(f)
         
@@ -108,7 +111,10 @@ def test_export_validation_all_valid():
             "universe_scored": pd.DataFrame([{"code": f"{i:06d}", "score": i} for i in range(200)]),
             "pool120": pd.DataFrame([{"code": f"{i:06d}", "score": i} for i in range(120)]),
             "top50": pd.DataFrame([{"code": f"{i:06d}", "score": i} for i in range(50)]),
-            "final30": pd.DataFrame([{"code": f"{i:06d}", "score": i} for i in range(30)]),
+            "final30": pd.DataFrame([
+                {"code": f"{i:06d}", "score": i, "score_final": i + 1, "ma20": 100 + i, "ma50": 95 + i, "ma150": 90 + i, "close": 101 + i, "atr_pct": 0.03}
+                for i in range(30)
+            ]),
         }
         meta = {"test": "meta"}
         
@@ -126,6 +132,9 @@ def test_export_validation_all_valid():
             saved_meta = json.load(f)
         
         assert "export_validation_failures" not in saved_meta or len(saved_meta.get("export_validation_failures", [])) == 0
+        with (out_dir / "final30.json").open() as f:
+            final30_json = json.load(f)
+        assert all(row.get("ma20") is not None for row in final30_json)
 
 
 def test_export_csv_rows_match():
