@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import sqlalchemy as sa
 
-from trader import pb1_runner
+from trader import pb1_runner, prep_runner
 from trader.db.repos import CRITICAL_SCORED_COLS, WatchlistRepo, save_watchlist, verify_final30_scored_contract
 from trader.db.schema import schema_for_engine
 
@@ -109,6 +109,15 @@ def test_scored_watchlist_roundtrip_preserves_critical_columns() -> None:
     assert summary["uniq_codes"] == 30
     assert summary["uniq_ranks"] == 30
     assert summary["null_critical"] == 0
+    assert int(df["ma20"].notna().sum()) == 30
+    assert int(df["ma50"].notna().sum()) == 30
+    assert int(df["ma150"].notna().sum()) == 30
+    assert int(df["close"].notna().sum()) == 30
+    assert int(df["atr_pct"].notna().sum()) == 30
+    assert int(df["rs_percentile"].notna().sum()) == 30
+    assert int(df["score_final"].notna().sum()) == 30
+    assert ((pd.to_numeric(df["score"], errors="coerce") - pd.to_numeric(df["score_final"], errors="coerce")).abs().fillna(0.0) < 1e-9).all()
+    assert ((pd.to_numeric(df["final_score"], errors="coerce") - pd.to_numeric(df["score_final"], errors="coerce")).abs().fillna(0.0) < 1e-9).all()
 
 
 def test_universe_scored_roundtrip_preserves_critical_columns() -> None:
@@ -228,6 +237,53 @@ def test_scored_strategy_rejects_plain_serializer_shape() -> None:
             as_of=date(2026, 3, 11),
             members=[{"code": "005930", "rank": 1, "score": 1.0, "meta": {}}],
         )
+
+
+def test_scored_watchlist_roundtrip_normalizes_score_to_score_final() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+    as_of = date(2026, 3, 11)
+    members = [_scored_member(i) for i in range(1, 31)]
+    members[0]["score"] = 6515861196985.0
+    members[0]["final_score"] = members[0]["score_final"]
+    members[1]["score"] = 95087558410.0
+    members[1]["final_score"] = members[1]["score_final"]
+
+    repo.save_watchlist(
+        env="practice",
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        members=members,
+    )
+
+    loaded, _ = repo.load_watchlist_scored(
+        env="practice",
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+
+    df = pd.DataFrame(loaded)
+    assert len(df) == 30
+    assert ((pd.to_numeric(df["score"], errors="coerce") - pd.to_numeric(df["score_final"], errors="coerce")).abs().fillna(0.0) < 1e-9).all()
+    assert ((pd.to_numeric(df["final_score"], errors="coerce") - pd.to_numeric(df["score_final"], errors="coerce")).abs().fillna(0.0) < 1e-9).all()
+    assert float(df.loc[df["code"] == members[0]["code"], "score"].iloc[0]) == float(members[0]["score_final"])
+    assert float(df.loc[df["code"] == members[1]["code"], "score"].iloc[0]) == float(members[1]["score_final"])
+
+
+def test_prep_build_scored_members_prefers_score_final_over_corrupted_score() -> None:
+    df = pd.DataFrame([_scored_member(1)])
+    df.loc[0, "score"] = 6515861196985.0
+
+    members = prep_runner._build_scored_members(df)
+
+    assert len(members) == 1
+    assert members[0]["score"] == members[0]["score_final"] == members[0]["final_score"]
+    assert members[0]["meta"]["score"] == members[0]["score_final"]
+    assert members[0]["meta"]["score_final"] == members[0]["score_final"]
 
 
 def test_trade_loader_uses_db_scored_without_reject(tmp_path, monkeypatch, caplog) -> None:

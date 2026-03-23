@@ -251,6 +251,66 @@ def _field_null_counts(rows: List[Dict[str, Any]], fields: Iterable[str]) -> Dic
     return counts
 
 
+def _normalize_final30_score_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    canonical = safe_nullable_float(row.get("score_final"))
+    if canonical is None:
+        canonical = safe_nullable_float(row.get("final_score"))
+    if canonical is None:
+        canonical = safe_nullable_float(row.get("score"))
+    canonical_value = float(canonical) if canonical is not None else None
+    row["score"] = canonical_value
+    row["score_final"] = canonical_value
+    row["final_score"] = canonical_value
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    meta["score"] = canonical_value
+    meta["score_final"] = canonical_value
+    meta["final_score"] = canonical_value
+    row["meta"] = meta
+    return row
+
+
+def _roundtrip_value_matches(lhs: Any, rhs: Any) -> bool:
+    lhs_num = safe_nullable_float(lhs)
+    rhs_num = safe_nullable_float(rhs)
+    if lhs_num is not None or rhs_num is not None:
+        if lhs_num is None or rhs_num is None:
+            return False
+        return abs(float(lhs_num) - float(rhs_num)) < 1e-9
+    if _contract_value_missing(lhs) and _contract_value_missing(rhs):
+        return True
+    return lhs == rhs
+
+
+def _roundtrip_mismatch_counts(
+    source_rows: List[Dict[str, Any]],
+    loaded_rows: List[Dict[str, Any]],
+    *,
+    fields: Iterable[str],
+) -> Dict[str, int]:
+    source_by_code = {
+        str((row or {}).get("code") or "").zfill(6): normalize_final30_contract_row(row)
+        for row in (source_rows or [])
+        if (row or {}).get("code")
+    }
+    loaded_by_code = {
+        str((row or {}).get("code") or "").zfill(6): normalize_final30_contract_row(row)
+        for row in (loaded_rows or [])
+        if (row or {}).get("code")
+    }
+    codes = sorted(set(source_by_code) | set(loaded_by_code))
+    mismatch_counts: Dict[str, int] = {}
+    for field in fields:
+        mismatch_counts[str(field)] = sum(
+            1
+            for code in codes
+            if not _roundtrip_value_matches(
+                (source_by_code.get(code) or {}).get(str(field)),
+                (loaded_by_code.get(code) or {}).get(str(field)),
+            )
+        )
+    return mismatch_counts
+
+
 def _log_scored_sample(prefix: str, rows: List[Dict[str, Any]], *, limit: int = 5) -> None:
     for row in (rows or [])[:limit]:
         normalized = normalize_final30_contract_row(row)
@@ -503,51 +563,78 @@ def _save_pb1_watchlist_rows_plain(
 
 
 def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int) -> Dict[str, Any]:
-    src = normalize_final30_contract_row(row)
-    normalized: Dict[str, Any] = {}
-    for col in REQUIRED_FINAL30_SCORED_COLS:
-        if col == "as_of":
-            normalized[col] = as_of_date.isoformat()
-            continue
-        normalized[col] = src.get(col)
+    src = _normalize_final30_score_fields(normalize_final30_contract_row(row))
 
-    normalized["score_final"] = src.get("score_final")
-    normalized["final_score"] = src.get("final_score")
-    normalized["score"] = src.get("score")
-    normalized["rs_percentile"] = src.get("rs_percentile")
-    normalized["rs_pctile"] = src.get("rs_percentile")
-
-    code = str(normalized.get("code") or src.get("code") or "").zfill(6)
+    code = str(src.get("code") or "").zfill(6)
     if not code:
         return {}
 
-    rank_val = normalized.get("rank")
+    rank_val = src.get("rank")
     if rank_val is None:
-        rank_val = normalized.get("rank_final30")
+        rank_val = src.get("rank_final30")
     try:
         rank = int(rank_val if rank_val is not None else idx)
     except Exception:
         rank = idx
 
-    score_raw = normalized.get("score")
-    if score_raw is None:
-        score_raw = normalized.get("score_final")
-    if score_raw is None:
-        score_raw = normalized.get("final_score")
-    try:
-        score = float(score_raw) if score_raw is not None else None
-    except Exception:
-        score = None
-
-    # Persist full scored payload in meta and restore as top-level on scored load.
-    payload_meta = json_sanitize(normalize_final30_contract_row(normalized))
+    payload_body = {
+        "as_of": as_of_date.isoformat(),
+        "code": code,
+        "name": src.get("name"),
+        "rank": rank,
+        "rank_pool120": src.get("rank_pool120"),
+        "rank_top50": src.get("rank_top50"),
+        "rank_final30": src.get("rank_final30") if src.get("rank_final30") is not None else rank,
+        "score": src.get("score_final"),
+        "score_final": src.get("score_final"),
+        "final_score": src.get("score_final"),
+        "score_flow": src.get("score_flow"),
+        "score_liq": src.get("score_liq"),
+        "score_tech": src.get("score_tech"),
+        "tech_score": src.get("tech_score"),
+        "flow_score": src.get("flow_score"),
+        "breakout_score": src.get("breakout_score"),
+        "pullback_score": src.get("pullback_score"),
+        "momentum_score": src.get("momentum_score"),
+        "entry_style_selected": src.get("entry_style_selected"),
+        "entry_component": src.get("entry_component"),
+        "rs_pctile": src.get("rs_percentile"),
+        "rs_percentile": src.get("rs_percentile"),
+        "rs_score": src.get("rs_score"),
+        "vcp_score": src.get("vcp_score"),
+        "trend_score": src.get("trend_score"),
+        "atr_pct": src.get("atr_pct"),
+        "pullback_pct": src.get("pullback_pct"),
+        "foreign_20_ratio": src.get("foreign_20_ratio"),
+        "inst_20_ratio": src.get("inst_20_ratio"),
+        "liq_avg": src.get("liq_avg"),
+        "last_close": src.get("last_close") if src.get("last_close") is not None else src.get("close"),
+        "close": src.get("close"),
+        "volume": src.get("volume"),
+        "volume_avg20": src.get("volume_avg20"),
+        "ma20": src.get("ma20"),
+        "ma50": src.get("ma50"),
+        "ma150": src.get("ma150"),
+        "rows": src.get("rows"),
+        "scores": src.get("scores") if isinstance(src.get("scores"), dict) else {},
+        "reasons": src.get("reasons"),
+        "reject_reasons": src.get("reject_reasons"),
+        "filters_passed": src.get("filters_passed"),
+        "filters_failed": src.get("filters_failed"),
+    }
+    payload_with_meta = {
+        **payload_body,
+        "meta": _merge_json_dict(src.get("meta"), payload_body),
+    }
+    payload_meta = json_sanitize(normalize_final30_contract_row(payload_with_meta))
+    payload_meta = _normalize_final30_score_fields(payload_meta)
     return {
         "env": None,
         "strategy": None,
         "as_of": as_of_date,
         "code": code,
         "rank": rank,
-        "score": score,
+        "score": payload_meta.get("score_final"),
         "meta": payload_meta,
     }
 
@@ -577,6 +664,21 @@ def _save_pb1_watchlist_rows_scored(
             f"[WATCHLIST][SAVE_SCORED][FAIL] missing_critical_cols={missing_critical_from_source} strategy={strategy_n}"
         )
 
+    source_rows_for_log = [_normalize_final30_score_fields(normalize_final30_contract_row(dict(row or {}))) for row in rows]
+    source_df = pd.DataFrame(source_rows_for_log)
+    logger.info(
+        "[DEBUG][FINAL30_SCORED][PRE_SAVE_NULLS] rows=%d close_null=%d ma20_null=%d ma50_null=%d ma150_null=%d atr_null=%d rs_null=%d score_null=%d score_final_null=%d",
+        len(source_df),
+        int(source_df["close"].isna().sum()) if "close" in source_df.columns else -1,
+        int(source_df["ma20"].isna().sum()) if "ma20" in source_df.columns else -1,
+        int(source_df["ma50"].isna().sum()) if "ma50" in source_df.columns else -1,
+        int(source_df["ma150"].isna().sum()) if "ma150" in source_df.columns else -1,
+        int(source_df["atr_pct"].isna().sum()) if "atr_pct" in source_df.columns else -1,
+        int(source_df["rs_percentile"].isna().sum()) if "rs_percentile" in source_df.columns else -1,
+        int(source_df["score"].isna().sum()) if "score" in source_df.columns else -1,
+        int(source_df["score_final"].isna().sum()) if "score_final" in source_df.columns else -1,
+    )
+
     payload: List[Dict[str, Any]] = []
     normalized_rows_for_log: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows, start=1):
@@ -591,6 +693,27 @@ def _save_pb1_watchlist_rows_scored(
     if not payload:
         logger.warning("[WATCHLIST][SAVE_SCORED] no valid rows after normalization env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
         return
+
+    payload_rows = [normalize_final30_contract_row(entry.get("meta") or {}) for entry in payload]
+    logger.info("[DEBUG][FINAL30_SCORED][PAYLOAD_SAMPLE] %s", payload_rows[:3])
+    src_cols = sorted(source_df.columns.tolist()) if not source_df.empty else []
+    payload_cols = sorted(payload_rows[0].keys()) if payload_rows else []
+    logger.info(
+        "[DEBUG][FINAL30_SCORED][SCHEMA] src_cols=%s payload_cols=%s",
+        src_cols,
+        payload_cols,
+    )
+    for row in payload_rows[:5]:
+        logger.info(
+            "[DEBUG][FINAL30_SCORED][SCORE_CHECK] code=%s score=%s score_final=%s final_score=%s tech_score=%s",
+            row.get("code"),
+            row.get("score"),
+            row.get("score_final"),
+            row.get("final_score"),
+            row.get("tech_score"),
+        )
+        if row.get("ma20") is None and row.get("close") is not None:
+            logger.warning("[FALLBACK][MA20] code=%s ma20 missing before save", row.get("code"))
 
     payload_key_set = sorted({str(key) for entry in payload for key in (entry.get("meta") or {}).keys()})
     logger.info(
@@ -642,6 +765,17 @@ def _save_pb1_watchlist_rows_scored(
             as_of=as_of_date,
             allow_latest_fallback=False,
         )
+        loaded_df = pd.DataFrame([normalize_final30_contract_row(row) for row in loaded_rows])
+        required_nonnull_fields = ["close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile", "score_final"]
+        nonnull_counts = {
+            field: int(loaded_df[field].notna().sum()) if field in loaded_df.columns else 0
+            for field in required_nonnull_fields
+        }
+        mismatch_counts = _roundtrip_mismatch_counts(
+            payload_rows,
+            loaded_rows,
+            fields=required_nonnull_fields,
+        )
         uniq_codes = len({str((row or {}).get("code") or "").zfill(6) for row in loaded_rows if (row or {}).get("code")})
         ma20_positive_count = sum(
             1
@@ -650,31 +784,58 @@ def _save_pb1_watchlist_rows_scored(
         )
         score_final_nonnull = sum(1 for row in loaded_rows if safe_nullable_float((row or {}).get("score_final")) is not None)
         entry_style_selected_nonnull = sum(1 for row in loaded_rows if str((row or {}).get("entry_style_selected") or "").strip())
+        score_consistent = False
+        if {"score", "score_final"}.issubset(set(loaded_df.columns)):
+            score_delta = (
+                pd.to_numeric(loaded_df["score"], errors="coerce")
+                - pd.to_numeric(loaded_df["score_final"], errors="coerce")
+            ).abs().fillna(0.0)
+            score_consistent = bool((score_delta < 1e-9).all())
+        final_score_consistent = False
+        if {"final_score", "score_final"}.issubset(set(loaded_df.columns)):
+            final_score_delta = (
+                pd.to_numeric(loaded_df["final_score"], errors="coerce")
+                - pd.to_numeric(loaded_df["score_final"], errors="coerce")
+            ).abs().fillna(0.0)
+            final_score_consistent = bool((final_score_delta < 1e-9).all())
         roundtrip_ok = (
             len(loaded_rows) == 30
             and uniq_codes == 30
-            and ma20_positive_count >= max(27, int(len(loaded_rows) * 0.9))
+            and all(count == len(loaded_rows) for count in nonnull_counts.values())
+            and all(count == 0 for count in mismatch_counts.values())
+            and ma20_positive_count == len(loaded_rows)
             and score_final_nonnull == len(loaded_rows)
             and entry_style_selected_nonnull == len(loaded_rows)
+            and score_consistent
+            and final_score_consistent
         )
         logger.info(
-            "[WATCHLIST][ROUNDTRIP][FINAL30_SCORED] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s ok=%s",
+            "[WATCHLIST][ROUNDTRIP][FINAL30_SCORED] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s nonnull_counts=%s mismatch_counts=%s score_consistent=%s final_score_consistent=%s ok=%s",
             len(loaded_rows),
             uniq_codes,
             ma20_positive_count,
             score_final_nonnull,
             entry_style_selected_nonnull,
+            nonnull_counts,
+            mismatch_counts,
+            int(score_consistent),
+            int(final_score_consistent),
             int(roundtrip_ok),
         )
         if not roundtrip_ok:
             logger.warning(
-                "[WATCHLIST][ROUNDTRIP][FAIL_DETAILS] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s",
+                "[WATCHLIST][ROUNDTRIP][FAIL_DETAILS] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s nonnull_counts=%s mismatch_counts=%s score_consistent=%s final_score_consistent=%s",
                 len(loaded_rows),
                 uniq_codes,
                 ma20_positive_count,
                 score_final_nonnull,
                 entry_style_selected_nonnull,
+                nonnull_counts,
+                mismatch_counts,
+                int(score_consistent),
+                int(final_score_consistent),
             )
+            raise ValueError("FINAL30_SCORED_ROUNDTRIP_VERIFY_FAILED")
 
 
 def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:

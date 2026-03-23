@@ -336,6 +336,18 @@ def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
         )
 
     normalized_df = df.copy(deep=True)
+    logger.info(
+        "[DEBUG][FINAL30_SCORED][PRE_SAVE_NULLS] rows=%d close_null=%d ma20_null=%d ma50_null=%d ma150_null=%d atr_null=%d rs_null=%d score_null=%d score_final_null=%d",
+        len(normalized_df),
+        int(normalized_df["close"].isna().sum()) if "close" in normalized_df.columns else -1,
+        int(normalized_df["ma20"].isna().sum()) if "ma20" in normalized_df.columns else -1,
+        int(normalized_df["ma50"].isna().sum()) if "ma50" in normalized_df.columns else -1,
+        int(normalized_df["ma150"].isna().sum()) if "ma150" in normalized_df.columns else -1,
+        int(normalized_df["atr_pct"].isna().sum()) if "atr_pct" in normalized_df.columns else -1,
+        int(normalized_df["rs_percentile"].isna().sum()) if "rs_percentile" in normalized_df.columns else -1,
+        int(normalized_df["score"].isna().sum()) if "score" in normalized_df.columns else -1,
+        int(normalized_df["score_final"].isna().sum()) if "score_final" in normalized_df.columns else -1,
+    )
     for col in REQUIRED_FINAL30_SCORED_COLS:
         if col not in normalized_df.columns:
             normalized_df[col] = None
@@ -349,26 +361,31 @@ def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for idx, row in enumerate(normalized_df.to_dict(orient="records"), start=1):
-        code = str(row.get("code") or "").zfill(6)
+        payload = normalize_final30_contract_row(dict(row or {}))
+        code = str(payload.get("code") or "").zfill(6)
         if not code:
             continue
-        payload = dict(row)
         payload["code"] = code
         payload["rank"] = int(payload.get("rank") or payload.get("rank_final30") or idx)
         payload["as_of"] = payload.get("as_of")
 
-        score_final = payload.get("score")
-        if score_final is None:
-            score_final = payload.get("score_final")
+        score_final = payload.get("score_final")
         if score_final is None:
             score_final = payload.get("final_score")
+        if score_final is None:
+            score_final = payload.get("score")
+        canonical_score = float(score_final) if score_final is not None else None
+        payload["score"] = canonical_score
+        payload["score_final"] = canonical_score
+        payload["final_score"] = canonical_score
+        payload_meta = dict(payload)
         rows.append(
             {
                 "code": code,
                 "rank": int(payload.get("rank") or idx),
-                "score": float(score_final) if score_final is not None else None,
-                "meta": payload,
                 **payload,
+                "score": canonical_score,
+                "meta": payload_meta,
             }
         )
     return rows
