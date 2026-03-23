@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from unittest.mock import MagicMock
 
+import pandas as pd
+
 
 def test_build_and_save_watchlist_returns_final30_scored_bundle(monkeypatch, tmp_path) -> None:
     from trader import watchlist_builder
@@ -39,6 +41,7 @@ def test_build_and_save_watchlist_returns_final30_scored_bundle(monkeypatch, tmp
                 "pool120": list(final30_scored),
                 "top50": list(final30_scored),
                 "final30": list(final30_scored),
+                "final30_scored": pd.DataFrame(final30_scored),
                 "weights": {},
                 "weights_effective": {},
                 "formula": "",
@@ -76,5 +79,45 @@ def test_build_and_save_watchlist_returns_final30_scored_bundle(monkeypatch, tmp
     assert "universe_scored_df" in bundle
     assert "final30_saved" in bundle
     assert "final30_snapshot_df" in bundle
-    assert bundle["final30_scored"][0]["tech_score"] > 0
+    assert isinstance(bundle["final30_scored"], pd.DataFrame)
+    assert bundle["final30_scored"].iloc[0]["tech_score"] > 0
     assert set(bundle["final30_saved"][0].keys()) == {"code", "meta", "rank", "score"}
+
+
+def test_watchlist_builder_rejects_multiple_build_calls() -> None:
+    from trader.watchlist_builder import WatchlistBuilder
+
+    builder = WatchlistBuilder(
+        ohlcv_provider=lambda *_args, **_kwargs: (None, {}),
+        minervini_config={},
+    )
+
+    final30 = [
+        {
+            "code": f"{idx:06d}",
+            "name": f"N{idx:06d}",
+            "tech_score": 10.0,
+            "score_final": 20.0,
+            "ma20": 10.0,
+            "breakout_score": 30.0,
+            "pullback_score": 40.0,
+            "momentum_score": 50.0,
+        }
+        for idx in range(1, 31)
+    ]
+
+    builder._stage_a_liquidity_filter = lambda members, as_of: (list(final30), list(final30))
+    builder._merge_derived_scores = lambda rows, as_of=None: list(rows)
+    builder._attach_scores = lambda rows, stage: list(rows)
+    builder._assert_nonzero_scores = lambda rows, stage, score_key=None: None
+
+    builder.build(members=list(final30), as_of=date(2026, 3, 6))
+
+    try:
+        builder.build(members=list(final30), as_of=date(2026, 3, 6))
+        raised = False
+    except RuntimeError as exc:
+        raised = True
+        assert "WATCHLIST_BUILD_CALLED_MULTIPLE_TIMES" in str(exc)
+
+    assert raised

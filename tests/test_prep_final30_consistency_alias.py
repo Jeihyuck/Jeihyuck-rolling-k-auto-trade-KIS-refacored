@@ -135,6 +135,7 @@ def test_final30_consistency_lhs_prefers_scored_df_not_saved_df():
         [
             {
                 "code": "000001",
+                "ma20": 10,
                 "tech_score": 1,
                 "score_final": 1,
                 "breakout_score": 1,
@@ -158,7 +159,7 @@ def test_final30_consistency_lhs_prefers_scored_df_not_saved_df():
 
 
 def test_final30_consistency_lhs_missing_scored_source_raises():
-    with pytest.raises(RuntimeError, match="final30_scored_source_missing"):
+    with pytest.raises(RuntimeError, match="FINAL30_SCORED_SOURCE_MISSING"):
         _select_final30_scored_df_for_export(
             watchlist_result={"final30": [{"code": "000001", "score": 1}]},
             watchlist_bundle={},
@@ -169,12 +170,36 @@ def test_final30_consistency_lhs_missing_scored_source_raises():
 
 def test_final30_selector_rejects_skinny_bundle_final30():
     skinny_final30 = [{"code": "000001", "meta": {}, "rank": 1, "score": 1.2}]
-    with pytest.raises(RuntimeError, match="final30_scored_source_missing"):
+    with pytest.raises(RuntimeError, match="FINAL30_SCORED_SOURCE_MISSING"):
         _select_final30_scored_df_for_export(
             watchlist_result={},
             watchlist_bundle={"final30": skinny_final30},
             bundle_final30_scored_before_save_df=pd.DataFrame(skinny_final30),
             final30_saved_df=pd.DataFrame(skinny_final30),
+        )
+
+
+def test_final30_selector_rejects_result_source_with_null_ma20():
+    scored_df = pd.DataFrame(
+        [
+            {
+                "code": "000001",
+                "ma20": None,
+                "tech_score": 1,
+                "score_final": 1,
+                "breakout_score": 1,
+                "pullback_score": 1,
+                "momentum_score": 1,
+            }
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="INVALID_FINAL30_SCORED_SOURCE_BEFORE_SAVE"):
+        _select_final30_scored_df_for_export(
+            watchlist_result={"final30_scored": scored_df},
+            watchlist_bundle={},
+            bundle_final30_scored_before_save_df=pd.DataFrame(),
+            final30_saved_df=pd.DataFrame(),
         )
 
 

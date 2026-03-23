@@ -286,6 +286,55 @@ def test_prep_build_scored_members_prefers_score_final_over_corrupted_score() ->
     assert members[0]["meta"]["score_final"] == members[0]["score_final"]
 
 
+def test_scored_watchlist_save_rejects_null_ma20_before_insert() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+    as_of = date(2026, 3, 11)
+    members = [_scored_member(i) for i in range(1, 31)]
+    members[0]["ma20"] = None
+
+    with pytest.raises(ValueError, match="FINAL30_SCORED_INVALID_BEFORE_DB_INSERT"):
+        repo.save_watchlist(
+            env="practice",
+            strategy="pb1_watchlist_final_scored",
+            as_of=as_of,
+            members=members,
+        )
+
+
+def test_scored_watchlist_save_normalizes_meta_score_fields() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+    as_of = date(2026, 3, 11)
+    members = [_scored_member(i) for i in range(1, 31)]
+    members[0]["score"] = 6515861196985.0
+    members[0]["meta"]["score"] = 6515861196985.0
+
+    repo.save_watchlist(
+        env="practice",
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        members=members,
+    )
+
+    loaded, _ = repo.load_watchlist_scored(
+        env="practice",
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+
+    assert loaded[0]["score"] == loaded[0]["score_final"] == loaded[0]["final_score"]
+    assert loaded[0]["meta"]["score"] == loaded[0]["score_final"]
+    assert loaded[0]["score_liq"] == members[0]["score_liq"]
+
+
 def test_trade_loader_uses_db_scored_without_reject(tmp_path, monkeypatch, caplog) -> None:
     monkeypatch.chdir(tmp_path)
 

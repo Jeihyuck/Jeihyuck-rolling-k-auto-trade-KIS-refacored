@@ -1302,8 +1302,19 @@ class WatchlistBuilder:
             "volatility": _env_float("FINAL30_W_VOLATILITY", 0.10),
         }
         self.last_bundle: Dict[str, Any] = {}
+        self._watchlist_build_call_count = 0
 
     def build(self, *, members: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
+        self._watchlist_build_call_count += 1
+        logger.info(
+            "[WATCHLIST][BUILD_CALL] count=%d",
+            self._watchlist_build_call_count,
+        )
+        if self._watchlist_build_call_count > 1:
+            raise RuntimeError(
+                f"WATCHLIST_BUILD_CALLED_MULTIPLE_TIMES count={self._watchlist_build_call_count}"
+            )
+
         logger.info(
             "[WATCHLIST][BUILD][START] as_of=%s members=%s pooln=%s topk=%s finaln=%s",
             as_of,
@@ -1360,6 +1371,14 @@ class WatchlistBuilder:
 
         final30 = self._attach_scores(final30, "C_FINAL30")
         self._assert_nonzero_scores(final30, "FINAL30", score_key="score_final")
+
+        final30_scored = pd.DataFrame(final30).copy(deep=True)
+        logger.info(
+            "[WATCHLIST][FINAL30_SCORED][FROZEN] rows=%d ma20_null=%d cols=%s",
+            len(final30_scored),
+            int(final30_scored["ma20"].isna().sum()) if "ma20" in final30_scored.columns else -1,
+            list(final30_scored.columns),
+        )
 
         logger.info(
             "[WATCHLIST][STAGE_COUNTS] universe=%d pool120=%d top50=%d final30=%d",
@@ -1459,7 +1478,7 @@ class WatchlistBuilder:
             "top50": top50,
             "top50_scored": top50,
             "final30": final30,
-            "final30_scored": final30,
+            "final30_scored": final30_scored.copy(deep=True),
             "reject_summary": dict(reject_counter),
             "final_count": len(final30),
             "requested_finaln": int(self.finaln),
@@ -1662,7 +1681,7 @@ class WatchlistBuilder:
                 filters_passed.append("B_TOP50")
             if float(item.get("final_score", 0.0) or 0.0) > 0.0:
                 filters_passed.append("C_FINAL30")
-        score_liq = float(item.get("liq_avg", 0.0) or 0.0)
+        score_liq = float(item.get("score_liq", 0.0) or 0.0)
         score_tech = float(item.get("tech_score", 0.0) or 0.0)
         score_flow = float(item.get("flow_score", 0.0) or 0.0)
         score_final = float(item.get("final_score", score_val) or 0.0)
@@ -4115,6 +4134,12 @@ def build_and_save_watchlist(
                 if return_bundle:
                     final30_scored_rows = [dict(row) for row in (existing or [])]
                     final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+                    logger.info(
+                        "[WATCHLIST][FINAL30_SCORED][FROZEN] rows=%d ma20_null=%d cols=%s",
+                        len(final30_scored_df),
+                        int(final30_scored_df["ma20"].isna().sum()) if "ma20" in final30_scored_df.columns else -1,
+                        list(final30_scored_df.columns),
+                    )
                     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
                     _log_final30_scored_df_ready(final30_scored_df)
                     final30_saved_rows = _build_final30_saved_rows(existing or [])
@@ -4157,8 +4182,8 @@ def build_and_save_watchlist(
                         "top50": top50,
                         "top50_scored": top50,
                         "final30": existing,
-                        "final30_scored": final30_scored_df,
-                        "bundle_final30_scored_before_save": bundle_final30_scored_before_save,
+                        "final30_scored": final30_scored_df.copy(deep=True),
+                        "bundle_final30_scored_before_save": bundle_final30_scored_before_save.copy(deep=True),
                         "final30_saved": final30_saved_rows,
                         "final30_snapshot_df": final30_snapshot_rows,
                         "reject_summary": {degrade_reason: 1},
@@ -4255,16 +4280,11 @@ def build_and_save_watchlist(
     except Exception as exc:
         logger.warning("[WATCHLIST][SNAPSHOT][SAVE_FAIL] err=%s -> continuing", exc)
 
-    final30_scored_rows = [
-        dict(row)
-        for row in (
-            (builder.last_bundle or {}).get("final30_scored")
-            or (builder.last_bundle or {}).get("final30")
-            or watchlist
-            or []
-        )
-    ]
-    final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+    final30_scored_source = (builder.last_bundle or {}).get("final30_scored")
+    if final30_scored_source is None:
+        raise RuntimeError("FINAL30_SCORED_BUILD_BUNDLE_MISSING")
+    final30_scored_df = _as_dataframe(final30_scored_source).copy(deep=True)
+    final30_scored_rows = final30_scored_df.to_dict(orient="records")
     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
     _log_final30_scored_df_ready(final30_scored_df)
     final30_saved_rows = _build_final30_saved_rows(watchlist or [])
@@ -4276,8 +4296,8 @@ def build_and_save_watchlist(
     final30_saved_df = pd.DataFrame(final30_saved_rows).copy(deep=True)
     final30_snapshot_rows = [dict(row) for row in (watchlist or [])]
     if builder.last_bundle:
-        builder.last_bundle["final30_scored"] = final30_scored_df
-        builder.last_bundle["bundle_final30_scored_before_save"] = bundle_final30_scored_before_save
+        builder.last_bundle["final30_scored"] = final30_scored_df.copy(deep=True)
+        builder.last_bundle["bundle_final30_scored_before_save"] = bundle_final30_scored_before_save.copy(deep=True)
         builder.last_bundle["final30_saved"] = final30_saved_rows
         builder.last_bundle["final30_saved_df"] = final30_saved_df
         builder.last_bundle["final30_snapshot_df"] = final30_snapshot_rows
@@ -4367,8 +4387,8 @@ def build_and_save_watchlist(
     if return_bundle:
         if builder.last_bundle is None:
             builder.last_bundle = {}
-        builder.last_bundle.setdefault("final30_scored", final30_scored_df)
-        builder.last_bundle.setdefault("bundle_final30_scored_before_save", bundle_final30_scored_before_save)
+        builder.last_bundle.setdefault("final30_scored", final30_scored_df.copy(deep=True))
+        builder.last_bundle.setdefault("bundle_final30_scored_before_save", bundle_final30_scored_before_save.copy(deep=True))
         builder.last_bundle.setdefault("final30_saved", final30_saved_rows)
         builder.last_bundle.setdefault("final30_saved_df", final30_saved_df)
         builder.last_bundle.setdefault("final30_snapshot_df", final30_snapshot_rows)

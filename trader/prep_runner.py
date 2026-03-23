@@ -578,58 +578,48 @@ def _select_final30_scored_df_for_export(
     bundle_final30_scored_before_save_df: pd.DataFrame,
     final30_saved_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, str]:
-    candidates: list[tuple[str, Any]] = [
-        ("watchlist_result.final30_scored", _safe_get(watchlist_result, "final30_scored")),
-        ("watchlist_bundle.final30_scored", _safe_get(watchlist_bundle, "final30_scored")),
-        (
-            "watchlist_result.bundle_final30_scored_before_save",
-            _safe_get(watchlist_result, "bundle_final30_scored_before_save"),
-        ),
-        (
-            "watchlist_bundle.bundle_final30_scored_before_save",
-            _safe_get(watchlist_bundle, "bundle_final30_scored_before_save"),
-        ),
-        ("bundle_final30_scored_before_save", bundle_final30_scored_before_save_df),
-    ]
+    _ = bundle_final30_scored_before_save_df
+    _ = final30_saved_df
 
-    details: list[dict[str, Any]] = []
-    for label, candidate in candidates:
-        candidate_df = _as_dataframe(candidate)
-        is_valid = _is_valid_final30_scored_df(candidate_df)
-        if candidate_df is None or candidate_df.empty:
-            details.append({"label": label, "state": "none"})
-            continue
-        details.append(
-            {
-                "label": label,
-                "state": "present",
-                "rows": int(len(candidate_df)) if hasattr(candidate_df, "__len__") else None,
-                "cols": list(candidate_df.columns) if hasattr(candidate_df, "columns") else None,
-                "valid": is_valid,
-            }
-        )
-        if _is_valid_final30_scored_df(candidate_df):
-            logger.info(
-                "[PREP][EXPORT][FINAL30][SOURCE] label=%s rows=%s cols=%s",
-                label,
-                int(len(candidate_df)),
-                list(candidate_df.columns),
-            )
-            return candidate_df.copy(deep=True), label
-    if final30_saved_df is not None and not final30_saved_df.empty:
-        details.append(
-            {
-                "label": "watchlist_bundle.final30_saved",
-                "state": "present",
-                "rows": int(len(final30_saved_df)),
-                "cols": list(final30_saved_df.columns),
-            }
-        )
-    logger.error(
-        "[PREP][EXPORT][FINAL30][SOURCE][FAIL] no_valid_scored_source details=%s",
-        details,
+    final30_scored_for_save = None
+    final30_scored_source = ""
+
+    if _safe_get(watchlist_result, "final30_scored") is not None:
+        final30_scored_for_save = _as_dataframe(_safe_get(watchlist_result, "final30_scored")).copy(deep=True)
+        final30_scored_source = "watchlist_result.final30_scored"
+    elif _safe_get(watchlist_bundle, "final30_scored") is not None:
+        final30_scored_for_save = _as_dataframe(_safe_get(watchlist_bundle, "final30_scored")).copy(deep=True)
+        final30_scored_source = "watchlist_bundle.final30_scored"
+    else:
+        raise RuntimeError("FINAL30_SCORED_SOURCE_MISSING")
+
+    logger.info(
+        "[PREP][FINAL30_SCORED][SOURCE_SELECTED] source=%s rows=%d cols=%s",
+        final30_scored_source,
+        len(final30_scored_for_save),
+        list(final30_scored_for_save.columns),
     )
-    raise RuntimeError("final30_scored_source_missing")
+
+    if "ma20" not in final30_scored_for_save.columns:
+        raise RuntimeError("FINAL30_SCORED_SOURCE_MISSING_MA20_COLUMN")
+
+    ma20_nulls = int(final30_scored_for_save["ma20"].isna().sum())
+    logger.info(
+        "[PREP][FINAL30_SCORED][SOURCE_CHECK] source=%s rows=%d ma20_null=%d",
+        final30_scored_source,
+        len(final30_scored_for_save),
+        ma20_nulls,
+    )
+
+    if ma20_nulls > 0:
+        bad_codes = final30_scored_for_save.loc[
+            final30_scored_for_save["ma20"].isna(), "code"
+        ].head(10).tolist()
+        raise RuntimeError(
+            f"INVALID_FINAL30_SCORED_SOURCE_BEFORE_SAVE ma20_nulls={ma20_nulls} sample_codes={bad_codes}"
+        )
+
+    return final30_scored_for_save, final30_scored_source
 
 
 def _debug_compare_nonzero(
@@ -1135,8 +1125,10 @@ def main() -> int:
         flow_provider=flow_provider,
         return_bundle=True,
     )
+    watchlist_result_payload: Any = None
     if isinstance(watchlist_result, tuple):
         watchlist, watchlist_bundle = watchlist_result
+        watchlist_result_payload = watchlist_bundle
     else:
         watchlist = watchlist_result
         watchlist_bundle = {
@@ -1151,9 +1143,30 @@ def main() -> int:
             "final30": watchlist,
             "reject_summary": {},
         }
+        watchlist_result_payload = watchlist_result if isinstance(watchlist_result, dict) else watchlist_bundle
     dt_watchlist = time.monotonic() - t_watchlist
     logger.info("[PREP][HEARTBEAT] stage=watchlist_scoring status=done")
     logger.info("[STAGE][DONE] name=%s dt=%.2f", "watchlist", dt_watchlist)
+
+    result_final30_scored_obj = _safe_get(watchlist_result_payload, "final30_scored")
+    if result_final30_scored_obj is not None:
+        result_final30_scored_df = _as_dataframe(result_final30_scored_obj)
+        logger.info(
+            "[DEBUG][OBJ][RESULT_FINAL30_SCORED] id=%s rows=%d ma20_null=%d",
+            id(result_final30_scored_obj),
+            len(result_final30_scored_df),
+            int(result_final30_scored_df["ma20"].isna().sum()) if "ma20" in result_final30_scored_df.columns else -1,
+        )
+
+    bundle_final30_scored_obj = _safe_get(watchlist_bundle, "final30_scored")
+    if bundle_final30_scored_obj is not None:
+        bundle_final30_scored_df = _as_dataframe(bundle_final30_scored_obj)
+        logger.info(
+            "[DEBUG][OBJ][BUNDLE_FINAL30_SCORED] id=%s rows=%d ma20_null=%d",
+            id(bundle_final30_scored_obj),
+            len(bundle_final30_scored_df),
+            int(bundle_final30_scored_df["ma20"].isna().sum()) if "ma20" in bundle_final30_scored_df.columns else -1,
+        )
 
     # ✅ FIX: PREP에서는 현재 as_of만 사용, 이전 watchlist cache 재사용 금지
     shortage_reason = ""
@@ -1482,20 +1495,17 @@ def main() -> int:
     final30_saved_df = pd.DataFrame(_safe_get(watchlist_bundle, "final30_saved", []))
     bundle_final30_scored_before_save = _safe_get(watchlist_bundle, "bundle_final30_scored_before_save")
     if bundle_final30_scored_before_save is None:
-        bundle_final30_scored_before_save = _safe_get(watchlist_result, "bundle_final30_scored_before_save")
+        bundle_final30_scored_before_save = _safe_get(watchlist_result_payload, "bundle_final30_scored_before_save")
     if bundle_final30_scored_before_save is None:
         bundle_final30_scored_before_save = _safe_get(watchlist_bundle, "final30_scored")
     bundle_final30_scored_before_save_df = _as_dataframe(bundle_final30_scored_before_save)
 
-    try:
-        final30_scored_df_for_export, final30_source_label = _select_final30_scored_df_for_export(
-            watchlist_result=watchlist_result,
-            watchlist_bundle=watchlist_bundle,
-            bundle_final30_scored_before_save_df=bundle_final30_scored_before_save_df,
-            final30_saved_df=final30_saved_df,
-        )
-    except RuntimeError:
-        raise RuntimeError("final30_scored_source_missing")
+    final30_scored_df_for_export, final30_source_label = _select_final30_scored_df_for_export(
+        watchlist_result=watchlist_result_payload,
+        watchlist_bundle=watchlist_bundle,
+        bundle_final30_scored_before_save_df=bundle_final30_scored_before_save_df,
+        final30_saved_df=final30_saved_df,
+    )
 
     scored_strategy = "pb1_watchlist_final_scored"
     exact_final_rows: list[dict[str, Any]] = []

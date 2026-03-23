@@ -564,6 +564,32 @@ def _save_pb1_watchlist_rows_plain(
 
 def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int) -> Dict[str, Any]:
     src = _normalize_final30_score_fields(normalize_final30_contract_row(row))
+    sf = safe_nullable_float(src.get("score_final"))
+    if sf is None:
+        raise ValueError(f"MISSING_SCORE_FINAL code={src.get('code')}")
+
+    src["score"] = float(sf)
+    src["score_final"] = float(sf)
+    src["final_score"] = float(sf)
+
+    meta = src.get("meta") if isinstance(src.get("meta"), dict) else {}
+    meta["score"] = float(sf)
+    meta["score_final"] = float(sf)
+    meta["final_score"] = float(sf)
+    src["meta"] = meta
+
+    if src.get("score_liq") is not None and float(src["score_liq"]) > 1000:
+        logger.warning(
+            "[SANITY][SCORE_LIQ_ABNORMAL] code=%s score_liq=%s",
+            src.get("code"),
+            src.get("score_liq"),
+        )
+
+    meta_score = (src.get("meta") or {}).get("score")
+    if meta_score is not None and abs(float(meta_score) - float(src["score_final"])) > 1e-9:
+        raise ValueError(
+            f"META_SCORE_CORRUPTED code={src.get('code')} meta_score={meta_score} score_final={src['score_final']}"
+        )
 
     code = str(src.get("code") or "").zfill(6)
     if not code:
@@ -695,6 +721,19 @@ def _save_pb1_watchlist_rows_scored(
         return
 
     payload_rows = [normalize_final30_contract_row(entry.get("meta") or {}) for entry in payload]
+    payload_df = pd.DataFrame(payload_rows)
+    if "ma20" in payload_df.columns:
+        ma20_nulls = int(payload_df["ma20"].isna().sum())
+        logger.info(
+            "[DB][FINAL30_SCORED][PRE_INSERT] rows=%d ma20_null=%d",
+            len(payload_df),
+            ma20_nulls,
+        )
+        if ma20_nulls > 0:
+            bad_codes = payload_df.loc[payload_df["ma20"].isna(), "code"].head(10).tolist()
+            raise ValueError(
+                f"FINAL30_SCORED_INVALID_BEFORE_DB_INSERT ma20_nulls={ma20_nulls} sample_codes={bad_codes}"
+            )
     logger.info("[DEBUG][FINAL30_SCORED][PAYLOAD_SAMPLE] %s", payload_rows[:3])
     src_cols = sorted(source_df.columns.tolist()) if not source_df.empty else []
     payload_cols = sorted(payload_rows[0].keys()) if payload_rows else []

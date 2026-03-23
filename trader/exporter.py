@@ -161,7 +161,7 @@ def _normalize_record(record: Mapping[Hashable, Any]) -> Dict[str, Any]:
     normalized["rank_top50"] = int(_pick("rank_top50", default=0) or 0)
     normalized["rank_final30"] = int(_pick("rank_final30", default=0) or 0)
 
-    normalized["score_liq"] = _pick_score("score_liq", "liq_avg")
+    normalized["score_liq"] = _pick_score("score_liq")
 
     # Legacy score_tech/score_flow/score_final for backward compatibility
     score_tech = _pick_score("score_tech", "tech_score")
