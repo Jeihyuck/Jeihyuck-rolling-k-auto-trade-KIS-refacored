@@ -13,6 +13,14 @@ from trader.db.schema import schema_for_engine
 
 def _scored_member(idx: int) -> dict:
     code = f"{5930 + idx:06d}"
+    breakout_score = 30.0 + (idx % 7)
+    pullback_score = 18.0 + (idx % 5)
+    momentum_score = 42.0 + (idx % 9)
+    entry_style = "MOMENTUM"
+    if idx % 3 == 0:
+        entry_style = "BREAKOUT"
+    elif idx % 3 == 1:
+        entry_style = "PULLBACK"
     return {
         "as_of": "2026-03-11",
         "code": code,
@@ -29,10 +37,10 @@ def _scored_member(idx: int) -> dict:
         "tech_score": 31.0 + idx,
         "flow_score": 10.0,
         "final_score": 30.0 + idx,
-        "breakout_score": 40.0,
-        "pullback_score": 20.0,
-        "momentum_score": 50.0,
-        "entry_style_selected": "MOMENTUM",
+        "breakout_score": breakout_score,
+        "pullback_score": pullback_score,
+        "momentum_score": momentum_score,
+        "entry_style_selected": entry_style,
         "entry_component": "momentum",
         "rs_pctile": 0.9,
         "rs_percentile": 0.9,
@@ -132,6 +140,43 @@ def test_universe_scored_roundtrip_preserves_critical_columns() -> None:
     assert set(CRITICAL_SCORED_COLS).issubset(set(df.columns))
 
 
+def test_scored_watchlist_load_restores_ma20_from_meta_alias() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    as_of = date(2026, 3, 11)
+    payload = _scored_member(1)
+    payload["ma20"] = None
+    payload["meta"] = {**payload.get("meta", {}), "ma_20": "49000.5", "score_final": payload["score_final"]}
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.insert(schema.pb1_watchlist),
+            [{
+                "env": "practice",
+                "strategy": "pb1_watchlist_final_scored",
+                "as_of": as_of,
+                "code": payload["code"],
+                "rank": payload["rank"],
+                "score": payload["score_final"],
+                "meta": payload["meta"],
+            }],
+        )
+
+    repo = WatchlistRepo(engine)
+    loaded, used_as_of = repo.load_watchlist_scored(
+        env="practice",
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+
+    assert used_as_of == as_of
+    assert len(loaded) == 1
+    assert loaded[0]["ma20"] == 49000.5
+
+
 def test_scored_contract_rank_warning_does_not_fail_verification() -> None:
     engine = sa.create_engine("sqlite:///:memory:")
     schema = schema_for_engine(engine)
@@ -193,22 +238,23 @@ def test_trade_loader_uses_db_scored_without_reject(tmp_path, monkeypatch, caplo
             pass
 
         def verify_watchlist_scored_contract(self, **_kwargs):
-            row = _scored_member(1)
+            rows = [_scored_member(idx) for idx in range(1, 31)]
             return {
                 "ok": True,
-                "rows": 1,
-                "uniq_codes": 1,
-                "uniq_ranks": 1,
+                "rows": 30,
+                "uniq_codes": 30,
+                "uniq_ranks": 30,
                 "rank_warn": False,
                 "rank_source": "rank_final30",
                 "null_critical": 0,
                 "missing_fields": [],
-                "rows_data": [row],
+                "columns": list(CRITICAL_SCORED_COLS) + ["code", "rank_final30", "score"],
+                "rows_data": rows,
             }
 
         def load_watchlist_scored(self, *, strategy, **_kwargs):
             if strategy == "pb1_watchlist_final_scored":
-                return [_scored_member(1)], date(2026, 3, 11)
+                return [_scored_member(idx) for idx in range(1, 31)], date(2026, 3, 11)
             return [], None
 
         def load_watchlist(self, **_kwargs):

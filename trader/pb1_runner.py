@@ -13,7 +13,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
-from trader.final30_quality import format_final30_abort_message, validate_trade_ready, verify_final30_scored_rows
+from trader.final30_quality import format_final30_abort_message, normalize_final30_contract_row, validate_trade_ready, verify_final30_scored_rows
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -98,6 +98,7 @@ from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
 from trader.db.repos import WatchlistRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
+from trader.indicators import compute_ma20_from_ohlcv, safe_nullable_float
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,176 @@ def _strict_validate_trade_final30_rows(rows: list[dict[str, Any]], *, source: s
     )
 
 
+def _trade_min_tradeable_candidates() -> int:
+    try:
+        return max(1, int(os.getenv("PB1_MIN_TRADEABLE_CANDIDATES", os.getenv("MIN_TRADEABLE_CANDIDATES", "10"))))
+    except Exception:
+        return 10
+
+
+def _positive_ma20_count(rows: list[dict[str, Any]]) -> int:
+    return sum(
+        1
+        for row in (rows or [])
+        if safe_nullable_float((row or {}).get("ma20")) is not None and float((row or {}).get("ma20") or 0.0) > 0
+    )
+
+
+def _trade_recheck_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    return verify_final30_scored_rows(
+        rows,
+        required_rows=len(rows),
+        required_fields=REQUIRED_SCORED_FINAL30_COLS,
+        source=source,
+    )
+
+
+def _is_trade_repairable_db_contract(summary: dict[str, Any], *, missing_critical_fields: list[str] | None = None) -> bool:
+    errors = set(summary.get("errors") or [])
+    allowed_errors = {"ma20_invalid_rows"}
+    return (
+        int(summary.get("rows") or 0) == 30
+        and int(summary.get("uniq_codes") or 0) == 30
+        and not list(missing_critical_fields or [])
+        and bool(errors)
+        and errors.issubset(allowed_errors)
+    )
+
+
+def _fetch_trade_ohlcv_df(code: str) -> pd.DataFrame:
+    try:
+        result = KRXOHLCVProvider().get_ohlcv(
+            str(code).zfill(6),
+            30,
+            purpose="final30_contract_repair",
+            usage_context="trade",
+        )
+        frame = result.df if hasattr(result, "df") else result
+        return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    except Exception as exc:
+        logger.warning("[TRADE][FINAL30][REPAIR][OHLCV_FAIL] code=%s err=%s", str(code).zfill(6), exc)
+        return pd.DataFrame()
+
+
+def _repair_trade_final30_rows(
+    *,
+    engine,
+    env: str,
+    as_of: str,
+    rows: list[dict[str, Any]],
+    repo_root_path: Path,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    repo = WatchlistRepo(engine)
+    as_of_date = datetime.strptime(str(as_of), "%Y-%m-%d").date()
+    universe_rows, _ = repo.load_watchlist_scored(
+        env=env,
+        strategy="pb1_universe_scored",
+        as_of=as_of_date,
+        allow_latest_fallback=False,
+    )
+    top50_rows, _ = repo.load_watchlist(
+        env=env,
+        strategy="pb1_top50",
+        as_of=as_of_date,
+        allow_latest_fallback=False,
+    )
+    runtime_rows: list[dict[str, Any]] = []
+    for label, path in build_final30_paths(repo_root_path, env, as_of).items():
+        file_rows, json_ok = read_final30_file_rows(path)
+        if json_ok and file_rows:
+            runtime_rows.extend(file_rows)
+    try:
+        derived_rows = DerivedMinerviniRepo(engine).load_for_as_of(
+            env=env,
+            as_of=as_of_date,
+            symbols=[str((row or {}).get("code") or "").zfill(6) for row in rows if (row or {}).get("code")],
+        )
+    except Exception:
+        derived_rows = []
+    reference_maps = []
+    for source_rows in (rows, universe_rows, top50_rows, runtime_rows):
+        reference_maps.append({
+            str((row or {}).get("code") or "").zfill(6): normalize_final30_contract_row(dict(row or {}))
+            for row in (source_rows or [])
+            if (row or {}).get("code")
+        })
+    derived_map = {str((row or {}).get("symbol") or "").zfill(6): dict(row or {}) for row in derived_rows}
+
+    repaired_rows: list[dict[str, Any]] = []
+    repaired = 0
+    unresolved = 0
+    for raw in rows:
+        row = normalize_final30_contract_row(dict(raw or {}))
+        code = str((row or {}).get("code") or "").zfill(6)
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        scores = row.get("scores") if isinstance(row.get("scores"), dict) else {}
+        if safe_nullable_float(row.get("ma20")) is None or float(row.get("ma20") or 0.0) <= 0:
+            candidate_sources: list[dict[str, Any]] = [row, meta, scores]
+            for ref_map in reference_maps:
+                ref = ref_map.get(code)
+                if ref:
+                    candidate_sources.append(ref)
+                    if isinstance(ref.get("meta"), dict):
+                        candidate_sources.append(ref.get("meta"))
+            derived_row = derived_map.get(code, {})
+            if derived_row:
+                candidate_sources.append(derived_row)
+                if isinstance(derived_row.get("features_json"), dict):
+                    candidate_sources.append(derived_row.get("features_json"))
+            repaired_ma20 = None
+            for source in candidate_sources:
+                if not isinstance(source, dict):
+                    continue
+                for key in ("ma20", "ma_20", "sma20", "ma20_price"):
+                    repaired_ma20 = safe_nullable_float(source.get(key))
+                    if repaired_ma20 is not None and float(repaired_ma20) > 0:
+                        break
+                if repaired_ma20 is not None and float(repaired_ma20) > 0:
+                    break
+            if (repaired_ma20 is None or float(repaired_ma20) <= 0) and code:
+                ohlcv_df = _fetch_trade_ohlcv_df(code)
+                if not ohlcv_df.empty:
+                    repaired_ma20 = compute_ma20_from_ohlcv(ohlcv_df)
+            if repaired_ma20 is not None and float(repaired_ma20) > 0:
+                row["ma20"] = float(repaired_ma20)
+                meta["ma20"] = float(repaired_ma20)
+                row["meta"] = meta
+                repaired += 1
+            else:
+                unresolved += 1
+        repaired_rows.append(normalize_final30_contract_row(row))
+    return repaired_rows, {"repaired": repaired, "unresolved": unresolved}
+
+
+def _select_repaired_final30_source(
+    *,
+    repo_root_path: Path,
+    env: str,
+    as_of: str,
+    db_rows: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    for label, path in build_final30_paths(repo_root_path, env, as_of).items():
+        rows, json_ok = read_final30_file_rows(path)
+        if not json_ok or not rows:
+            continue
+        validate = _strict_validate_trade_final30_rows(rows, source=f"FILE:{label}")
+        if bool(validate.get("ok")):
+            logger.info("[TRADE][FINAL30][SOURCE_RESELECT] selected=%s", label)
+            logger.info(
+                "[TRADE][FINAL30][POST_REPAIR_LOAD] rows=%s ma20_positive=%s",
+                len(rows),
+                _positive_ma20_count(rows),
+            )
+            return label, rows
+    logger.info("[TRADE][FINAL30][SOURCE_RESELECT] selected=db")
+    logger.info(
+        "[TRADE][FINAL30][POST_REPAIR_LOAD] rows=%s ma20_positive=%s",
+        len(db_rows),
+        _positive_ma20_count(db_rows),
+    )
+    return "db", db_rows
+
+
 def load_trade_final30_scored(
     *,
     engine,
@@ -248,10 +419,21 @@ def load_trade_final30_scored(
         strategy="pb1_watchlist_final_scored",
         allow_latest_fallback=False,
     )
-    contract_columns = [str(col) for col in (scored_contract.get("columns") or [])]
     rows = list(scored_contract.get("rows_data") or [])
+    contract_columns = [str(col) for col in (scored_contract.get("columns") or sorted({key for row in rows for key in (row or {}).keys()}))]
     missing_critical_fields = [col for col in REQUIRED_SCORED_FINAL30_COLS if col not in contract_columns]
-    contract_ok = bool(scored_contract.get("ok") and not missing_critical_fields)
+    repairable_contract = _is_trade_repairable_db_contract(scored_contract, missing_critical_fields=missing_critical_fields)
+    contract_ok = bool(
+        (
+            (
+                scored_contract.get("ok")
+                and int(scored_contract.get("rows") or 0) == 30
+                and int(scored_contract.get("uniq_codes") or 0) == 30
+            )
+            or repairable_contract
+        )
+        and not missing_critical_fields
+    )
     logger.info(
         "[TRADE][FINAL30][DB_EXACT_LOAD] env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s",
         env_n,
@@ -261,8 +443,9 @@ def load_trade_final30_scored(
         scored_contract.get("uniq_ranks"),
     )
     logger.info(
-        "[TRADE][FINAL30][CONTRACT_CHECK] ok=%s rows=%s null_critical=%s missing_fields=%s missing_critical=%s",
+        "[TRADE][FINAL30][CONTRACT_CHECK][PRE_REPAIR] ok=%s repairable=%s rows=%s null_critical=%s missing_fields=%s missing_critical=%s",
         int(contract_ok),
+        int(repairable_contract),
         scored_contract.get("rows"),
         scored_contract.get("null_critical"),
         scored_contract.get("missing_fields"),
@@ -310,11 +493,70 @@ def load_trade_final30_scored(
                 as_of_s,
                 serialize_path_map(final30_paths),
             )
-        trade_validate = _strict_validate_trade_final30_rows(rows, source="db")
-        df = pd.DataFrame(rows)
+        working_rows = [normalize_final30_contract_row(dict(row or {})) for row in rows]
+        if "ma20_invalid_rows" in set(scored_contract.get("errors") or []):
+            logger.info("[TRADE][FINAL30][REPAIR][START] rows=%s source=db_exact", len(working_rows))
+            working_rows, repair_stats = _repair_trade_final30_rows(
+                engine=engine,
+                env=env_n,
+                as_of=as_of_s,
+                rows=working_rows,
+                repo_root_path=repo_root_path,
+            )
+            logger.info(
+                "[TRADE][FINAL30][REPAIR][MA20] repaired=%s unresolved=%s",
+                repair_stats.get("repaired", 0),
+                repair_stats.get("unresolved", 0),
+            )
+            filtered_rows = [
+                row for row in working_rows
+                if safe_nullable_float((row or {}).get("ma20")) is not None and float((row or {}).get("ma20") or 0.0) > 0
+            ]
+            logger.info(
+                "[TRADE][FINAL30][FILTER_AFTER_REPAIR] before=%s after=%s dropped_ma20=%s",
+                len(working_rows),
+                len(filtered_rows),
+                len(working_rows) - len(filtered_rows),
+            )
+            working_rows = filtered_rows
+        trade_validate = _trade_recheck_rows(working_rows, source="db_recheck") if working_rows else {
+            "ok": False,
+            "rows": 0,
+            "errors": ["rows_not_exact"],
+            "invalid_row_count": 0,
+            "warnings": [],
+            "invalid_details": {},
+            "invalid_sample_codes": [],
+            "source": "db_recheck",
+        }
+        min_tradeable_candidates = _trade_min_tradeable_candidates()
+        trade_recheck_ok = bool(trade_validate.get("ok")) and len(working_rows) >= min_tradeable_candidates
+        logger.info(
+            "[TRADE][FINAL30][RECHECK] ok=%s rows=%s min_tradeable=%s errors=%s",
+            int(trade_recheck_ok),
+            len(working_rows),
+            min_tradeable_candidates,
+            list(trade_validate.get("errors") or []),
+        )
+        logger.info(
+            "[TRADE][FINAL30][CONTRACT_CHECK] ok=%s rows=%s null_critical=%s missing_fields=%s missing_critical=%s",
+            int(trade_recheck_ok),
+            len(working_rows),
+            scored_contract.get("null_critical"),
+            scored_contract.get("missing_fields"),
+            missing_critical_fields,
+        )
+        if missing_labels:
+            _selected_source, working_rows = _select_repaired_final30_source(
+                repo_root_path=repo_root_path,
+                env=env_n,
+                as_of=as_of_s,
+                db_rows=working_rows,
+            )
+        df = pd.DataFrame(working_rows)
         columns = [str(c) for c in df.columns.tolist()]
         try:
-            if not bool(trade_validate.get("ok")):
+            if not trade_recheck_ok:
                 raise RuntimeError(format_final30_abort_message(trade_validate))
             logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
         except RuntimeError as exc:
@@ -2393,6 +2635,12 @@ def run_once(
         os.getenv("STRATEGY_MODE"),
         os.getenv("PB1_ENTRY_ENABLED"),
     )
+    execution_mode_label = "trade_intraday_prevclose" if market_window == "after" else f"trade_{window_label}"
+    logger.info(
+        "[PB1][JOB_CONTEXT] market_window=%s execution_mode=%s",
+        market_window,
+        execution_mode_label,
+    )
     
     # Live Gate 상태 로깅 (시간 기반 자동 정책)
     try:
@@ -3807,21 +4055,30 @@ def main() -> int:
             strategy="pb1_watchlist_final_scored",
             allow_latest_fallback=False,
         )
+        scored_missing_critical = [
+            col for col in REQUIRED_SCORED_FINAL30_COLS
+            if col not in [str(item) for item in (scored_contract.get("columns") or [])]
+        ]
+        scored_contract_repairable = _is_trade_repairable_db_contract(
+            scored_contract,
+            missing_critical_fields=scored_missing_critical,
+        )
         db_contract_ok = bool(
             prep_done
             and derived_count > 0
             and watchlist_final_count == 30
             and watchlist_scored_count == 30
-            and scored_contract.get("ok")
+            and (scored_contract.get("ok") or scored_contract_repairable)
         )
         logger.info(
-            "[TRADE_TICK][DB_CONTRACT] env=%s as_of=%s prep_done=%s derived_minervini=%s watchlist_final=%s watchlist_final_scored=%s db_contract_ok=%s",
+            "[TRADE_TICK][DB_CONTRACT] env=%s as_of=%s prep_done=%s derived_minervini=%s watchlist_final=%s watchlist_final_scored=%s repairable=%s db_contract_ok=%s",
             derived_env,
             derived_as_of.isoformat(),
             int(prep_done),
             derived_count,
             watchlist_final_count,
             watchlist_scored_count,
+            int(scored_contract_repairable),
             int(db_contract_ok),
         )
         if not db_contract_ok:

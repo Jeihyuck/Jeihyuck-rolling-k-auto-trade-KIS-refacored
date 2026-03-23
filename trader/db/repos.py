@@ -132,6 +132,41 @@ CRITICAL_SCORED_COLS = [
     "atr_pct",
 ]
 
+FINAL30_SCORED_SAVE_REQUIRED_FIELDS = [
+    "code",
+    "as_of",
+    "rank",
+    "score",
+    "score_final",
+    "tech_score",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "entry_style_selected",
+    "close",
+    "ma20",
+    "ma50",
+    "ma150",
+    "atr_pct",
+    "rs_percentile",
+    "vcp_score",
+]
+
+FINAL30_NUMERIC_RESTORE_ALIASES: dict[str, tuple[str, ...]] = {
+    "close": ("close", "last_close", "close_price"),
+    "ma20": ("ma20", "ma_20", "sma20", "ma20_price"),
+    "ma50": ("ma50", "ma_50", "sma50", "ma50_price"),
+    "ma150": ("ma150", "ma_150", "sma150", "ma150_price"),
+    "atr_pct": ("atr_pct", "atr", "atrp", "atr_percent"),
+    "rs_percentile": ("rs_percentile", "rs_pctile", "rs_score"),
+    "breakout_score": ("breakout_score", "score_breakout"),
+    "pullback_score": ("pullback_score", "score_pullback"),
+    "momentum_score": ("momentum_score", "score_momentum"),
+    "tech_score": ("tech_score", "score_tech"),
+    "score_final": ("score_final", "final_score", "score"),
+    "vcp_score": ("vcp_score",),
+}
+
 FINAL30_SCORED_DB_CONTRACT_FIELDS = [
     "code",
     "as_of",
@@ -194,6 +229,26 @@ def _safe_float_or_none(value: Any) -> float | None:
         return float(value)
     except Exception:
         return None
+
+
+def _restore_numeric_from_sources(*sources: Any, aliases: tuple[str, ...]) -> float | None:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for alias in aliases:
+            if alias not in source:
+                continue
+            numeric = safe_nullable_float(source.get(alias))
+            if numeric is not None:
+                return float(numeric)
+    return None
+
+
+def _field_null_counts(rows: List[Dict[str, Any]], fields: Iterable[str]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for field in fields:
+        counts[str(field)] = sum(1 for row in (rows or []) if _contract_value_missing((row or {}).get(str(field))))
+    return counts
 
 
 def _log_scored_sample(prefix: str, rows: List[Dict[str, Any]], *, limit: int = 5) -> None:
@@ -537,6 +592,20 @@ def _save_pb1_watchlist_rows_scored(
         logger.warning("[WATCHLIST][SAVE_SCORED] no valid rows after normalization env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
         return
 
+    payload_key_set = sorted({str(key) for entry in payload for key in (entry.get("meta") or {}).keys()})
+    logger.info(
+        "[WATCHLIST][DB_SAVE][FINAL30_SCORED][FIELD_CHECK] keys=%s has_ma20=%s",
+        payload_key_set,
+        int("ma20" in payload_key_set),
+    )
+    missing_save_fields = [
+        field
+        for field in FINAL30_SCORED_SAVE_REQUIRED_FIELDS
+        if field not in payload_key_set and field not in {"code", "rank", "score", "as_of"}
+    ]
+    if missing_save_fields:
+        logger.warning("[WATCHLIST][DB_SAVE][FINAL30_SCORED][MISSING_FIELDS] fields=%s", missing_save_fields)
+
     _log_scored_sample("[WATCHLIST][SAVE_SCORED][PRE_DB_SAMPLE]", normalized_rows_for_log)
 
     sample_meta = payload[0].get("meta") if isinstance(payload[0].get("meta"), dict) else {}
@@ -565,10 +634,54 @@ def _save_pb1_watchlist_rows_scored(
         as_of_date,
         len(payload),
     )
+    if strategy_n == "pb1_watchlist_final_scored":
+        roundtrip_repo = WatchlistRepo(engine)
+        loaded_rows, _ = roundtrip_repo.load_watchlist_scored(
+            env=env_n,
+            strategy=strategy_n,
+            as_of=as_of_date,
+            allow_latest_fallback=False,
+        )
+        uniq_codes = len({str((row or {}).get("code") or "").zfill(6) for row in loaded_rows if (row or {}).get("code")})
+        ma20_positive_count = sum(
+            1
+            for row in loaded_rows
+            if safe_nullable_float((row or {}).get("ma20")) is not None and float((row or {}).get("ma20") or 0.0) > 0
+        )
+        score_final_nonnull = sum(1 for row in loaded_rows if safe_nullable_float((row or {}).get("score_final")) is not None)
+        entry_style_selected_nonnull = sum(1 for row in loaded_rows if str((row or {}).get("entry_style_selected") or "").strip())
+        roundtrip_ok = (
+            len(loaded_rows) == 30
+            and uniq_codes == 30
+            and ma20_positive_count >= max(27, int(len(loaded_rows) * 0.9))
+            and score_final_nonnull == len(loaded_rows)
+            and entry_style_selected_nonnull == len(loaded_rows)
+        )
+        logger.info(
+            "[WATCHLIST][ROUNDTRIP][FINAL30_SCORED] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s ok=%s",
+            len(loaded_rows),
+            uniq_codes,
+            ma20_positive_count,
+            score_final_nonnull,
+            entry_style_selected_nonnull,
+            int(roundtrip_ok),
+        )
+        if not roundtrip_ok:
+            logger.warning(
+                "[WATCHLIST][ROUNDTRIP][FAIL_DETAILS] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s",
+                len(loaded_rows),
+                uniq_codes,
+                ma20_positive_count,
+                score_final_nonnull,
+                entry_style_selected_nonnull,
+            )
 
 
 def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:
     meta = row.meta if isinstance(row.meta, dict) else {}
+    scores = meta.get("scores") if isinstance(meta.get("scores"), dict) else {}
+    derived = meta.get("derived") if isinstance(meta.get("derived"), dict) else {}
+    minervini = meta.get("minervini") if isinstance(meta.get("minervini"), dict) else {}
     out: Dict[str, Any] = {
         "code": row.code,
         "rank": row.rank,
@@ -582,7 +695,18 @@ def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:
     out.setdefault("code", row.code)
     out.setdefault("rank", row.rank)
     out.setdefault("score", float(row.score) if row.score is not None else None)
-    return normalize_final30_contract_row(out)
+    normalized = normalize_final30_contract_row(out)
+    for field, aliases in FINAL30_NUMERIC_RESTORE_ALIASES.items():
+        restored = _restore_numeric_from_sources(normalized, meta, scores, derived, minervini, aliases=aliases)
+        if restored is not None:
+            normalized[field] = restored
+            normalized_meta = normalized.get("meta") if isinstance(normalized.get("meta"), dict) else {}
+            normalized_meta[field] = restored
+            normalized["meta"] = normalized_meta
+    if normalized.get("score_final") is not None:
+        normalized["final_score"] = normalized.get("score_final")
+        normalized["score"] = normalized.get("score_final")
+    return normalized
 
 
 def load_pb1_watchlist_codes(
@@ -3246,6 +3370,7 @@ class WatchlistRepo:
         )
         summary["used_as_of"] = used_as_of.isoformat() if used_as_of is not None else None
         summary["strategy"] = _norm_strategy(strategy)
+        summary["field_null_counts"] = _field_null_counts(summary.get("rows_data") or [], FINAL30_SCORED_DB_CONTRACT_FIELDS)
         if log_result:
             logger.info(
                 "[DB][FINAL30_SCORED][VERIFY] rows=%s uniq_codes=%s uniq_ranks=%s rank_source=%s rank_warn=%s null_critical=%s null_warnings=%s zero_invalid=%s atr_zero_invalid=%s env=%s as_of=%s ok=%s",
@@ -3262,6 +3387,7 @@ class WatchlistRepo:
                 summary["as_of"],
                 int(summary["ok"]),
             )
+            logger.info("[DB][FINAL30_SCORED][VERIFY][FIELD_NULL_COUNTS] %s", summary.get("field_null_counts", {}))
             if summary.get("null_warnings"):
                 logger.warning(
                     "[DB][FINAL30_SCORED][VERIFY][NULL_WARN] env=%s as_of=%s null_warnings=%s nullable_fields=%s",
@@ -3353,11 +3479,27 @@ class WatchlistRepo:
         result = [_normalize_scored_loaded_row(row) for row in raw_rows]
         cols = sorted({k for item in result for k in item.keys()})
         has = {col: int(col in cols) for col in CRITICAL_SCORED_COLS}
+        numeric_restore = {
+            field: sum(1 for row in result if safe_nullable_float((row or {}).get(field)) is not None)
+            for field in FINAL30_NUMERIC_RESTORE_ALIASES
+        }
+        ma20_null_count = sum(1 for row in result if safe_nullable_float((row or {}).get("ma20")) is None)
+        ma20_positive_count = sum(
+            1
+            for row in result
+            if safe_nullable_float((row or {}).get("ma20")) is not None and float((row or {}).get("ma20") or 0.0) > 0
+        )
         logger.info(
             "[WATCHLIST][LOAD_SCORED] strategy=%s rows=%s cols=%s",
             strategy_n,
             len(result),
             cols,
+        )
+        logger.info("[WATCHLIST][LOAD_SCORED][NUMERIC_RESTORE] counts=%s", numeric_restore)
+        logger.info(
+            "[WATCHLIST][LOAD_SCORED][MA20_STATS] ma20_null_count=%s ma20_positive_count=%s",
+            ma20_null_count,
+            ma20_positive_count,
         )
         logger.info(
             "[WATCHLIST][LOAD_SCORED][CHECK] has_score_final=%s has_tech_score=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_percentile=%s has_vcp_score=%s has_entry_style_selected=%s",

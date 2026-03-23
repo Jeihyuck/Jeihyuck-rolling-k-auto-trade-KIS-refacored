@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -144,7 +145,11 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
         normalized = {col: item.get(col) for col in REQUIRED_FINAL30_SCORED_COLS}
         normalized["code"] = str(item.get("code") or "").zfill(6)
         normalized["rank"] = int(item.get("rank") or item.get("rank_final30") or idx)
-        normalized["score"] = score_val
+        for field in FINAL30_CANONICAL_NUMERIC_FIELDS:
+            normalized[field] = _canonicalize_numeric_field(field, item, score_fallback=score_val)
+        normalized["score_final"] = normalized.get("score_final")
+        normalized["final_score"] = normalized.get("score_final")
+        normalized["score"] = normalized.get("score_final") if normalized.get("score_final") is not None else score_val
         normalized["meta"] = item.get("meta", {})
         saved_rows.append({**normalized, "rank": normalized["rank"], "score": normalized["score"]})
     return saved_rows
@@ -234,6 +239,21 @@ INVALID_ZERO_NUMERIC_FIELDS = ("close", "ma20", "ma50", "ma150", "atr_pct")
 ZERO_INVALID_ALWAYS_FIELDS = {"close", "ma20", "ma50", "ma150"}
 NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile"}
 NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
+FINAL30_CANONICAL_NUMERIC_FIELDS = (
+    "close",
+    "ma20",
+    "ma50",
+    "ma150",
+    "atr_pct",
+    "rs_percentile",
+    "breakout_score",
+    "pullback_score",
+    "momentum_score",
+    "tech_score",
+    "score_final",
+)
+FINAL30_SAVE_REQUIRED_POSITIVE_FIELDS = {"close", "ma50", "ma150"}
+MA20_ALIAS_FIELDS = ("ma20", "ma_20", "sma20", "ma20_price")
 FINAL30_CONTRACT_REQUIRED_FIELDS = tuple(
     dict.fromkeys(
         (
@@ -272,6 +292,209 @@ def _prefer_numeric_candidates(values: List[Any], *, zero_invalid: bool = False)
         if fallback is None:
             fallback = numeric
     return fallback
+
+
+def _extract_numeric_from_sources(*sources: Any, aliases: tuple[str, ...], zero_invalid: bool = False) -> float | None:
+    candidates: list[Any] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for alias in aliases:
+            if alias in source:
+                candidates.append(source.get(alias))
+    return _prefer_numeric_candidates(candidates, zero_invalid=zero_invalid)
+
+
+def _fetch_ohlcv_frame(ohlcv_provider: Any, code: str, *, days: int = 30) -> pd.DataFrame:
+    if ohlcv_provider is None:
+        return pd.DataFrame()
+    try:
+        if hasattr(ohlcv_provider, "get_ohlcv"):
+            result = ohlcv_provider.get_ohlcv(
+                str(code).zfill(6),
+                days,
+                purpose="final30_contract_repair",
+                usage_context="watchlist",
+            )
+            frame = result.df if hasattr(result, "df") else result
+        elif hasattr(ohlcv_provider, "fetch_daily"):
+            frame = ohlcv_provider.fetch_daily(str(code).zfill(6), count=days)
+        elif callable(ohlcv_provider):
+            try:
+                result = ohlcv_provider(str(code).zfill(6), count=days)
+            except TypeError:
+                result = ohlcv_provider(str(code).zfill(6), days)
+            frame = result[0] if isinstance(result, tuple) else result
+        else:
+            frame = pd.DataFrame()
+    except Exception as exc:
+        logger.warning("[WATCHLIST][FINAL30][OHLCV_REPAIR_FAIL] code=%s err=%s", str(code).zfill(6), exc)
+        return pd.DataFrame()
+
+    if not isinstance(frame, pd.DataFrame):
+        return pd.DataFrame()
+    normalized = _normalize_ohlcv_columns(frame)
+    return normalized.tail(days).copy() if not normalized.empty else normalized
+
+
+def _canonicalize_numeric_field(field: str, row: Dict[str, Any], *, score_fallback: float | None = None) -> float | None:
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    scores = row.get("scores") if isinstance(row.get("scores"), dict) else {}
+    alias_map: dict[str, tuple[str, ...]] = {
+        "close": ("close", "last_close", "close_price"),
+        "ma20": MA20_ALIAS_FIELDS,
+        "ma50": ("ma50", "ma_50", "sma50", "ma50_price"),
+        "ma150": ("ma150", "ma_150", "sma150", "ma150_price"),
+        "atr_pct": ("atr_pct", "atr", "atrp", "atr_percent"),
+        "rs_percentile": ("rs_percentile", "rs_pctile", "rs_score"),
+        "breakout_score": ("breakout_score", "score_breakout"),
+        "pullback_score": ("pullback_score", "score_pullback"),
+        "momentum_score": ("momentum_score", "score_momentum"),
+        "tech_score": ("tech_score", "score_tech"),
+        "score_final": ("score_final", "final_score", "score"),
+    }
+    value = _extract_numeric_from_sources(
+        row,
+        meta,
+        scores,
+        aliases=alias_map.get(field, (field,)),
+        zero_invalid=field in ZERO_INVALID_ALWAYS_FIELDS,
+    )
+    if field == "score_final" and value is None:
+        value = score_fallback
+    if value is None:
+        return None
+    numeric = _safe_nullable_float(value)
+    if numeric is None or not math.isfinite(float(numeric)):
+        return None
+    return float(numeric)
+
+
+def _summarize_final30_quality_snapshot(rows: List[Dict[str, Any]], *, repaired_ma20_count: int = 0) -> Dict[str, Any]:
+    quality = evaluate_final30_quality(rows)
+    quality["null_ma20_count"] = sum(1 for row in (rows or []) if not is_valid_positive_numeric((row or {}).get("ma20")))
+    quality["repaired_ma20_count"] = int(repaired_ma20_count)
+    return quality
+
+
+def _log_final30_quality_snapshot(prefix: str, rows: List[Dict[str, Any]], *, repaired_ma20_count: int = 0) -> None:
+    quality = _summarize_final30_quality_snapshot(rows, repaired_ma20_count=repaired_ma20_count)
+    logger.info(
+        "%s rows=%s uniq_codes=%s valid_ma20_ratio=%.3f valid_atr_ratio=%.3f breakout_nonnull_ratio=%.3f pullback_nonnull_ratio=%.3f momentum_nonnull_ratio=%.3f valid_score_final_ratio=%.3f null_ma20_count=%s repaired_ma20_count=%s ok=%s",
+        prefix,
+        quality.get("rows", 0),
+        quality.get("uniq_codes", 0),
+        float(quality.get("valid_ma20_ratio", 0.0)),
+        float(quality.get("valid_atr_ratio", 0.0)),
+        float(quality.get("breakout_nonnull_ratio", 0.0)),
+        float(quality.get("pullback_nonnull_ratio", 0.0)),
+        float(quality.get("momentum_nonnull_ratio", 0.0)),
+        float(quality.get("valid_score_final_ratio", 0.0)),
+        quality.get("null_ma20_count", 0),
+        quality.get("repaired_ma20_count", 0),
+        int(bool(quality.get("ok"))),
+    )
+
+
+def _prepare_final30_scored_rows_for_save(
+    rows: List[Dict[str, Any]],
+    *,
+    engine: Engine,
+    env: str,
+    as_of: date,
+    broader_rows: List[Dict[str, Any]] | None,
+    ohlcv_provider: Any,
+    source: str,
+) -> tuple[List[Dict[str, Any]], int, int]:
+    normalized_rows = [_sync_item_and_meta_fields(dict(row or {})) for row in (rows or [])]
+    broader_by_code = {
+        str((row or {}).get("code") or "").zfill(6): _sync_item_and_meta_fields(dict(row or {}))
+        for row in (broader_rows or [])
+        if (row or {}).get("code")
+    }
+    symbols = [str((row or {}).get("code") or "").zfill(6) for row in normalized_rows if (row or {}).get("code")]
+    derived_rows = DerivedMinerviniRepo(engine).load_for_as_of(env=env, as_of=as_of, symbols=symbols) if symbols else []
+    derived_by_code = {str((row or {}).get("symbol") or "").zfill(6): dict(row or {}) for row in derived_rows}
+
+    prepared: List[Dict[str, Any]] = []
+    repaired_ma20_count = 0
+    missing_ma20_count = 0
+    for idx, raw in enumerate(normalized_rows, start=1):
+        code = str((raw or {}).get("code") or "").zfill(6)
+        ref = broader_by_code.get(code, {})
+        item = _sanitize_scored_item(dict(raw or {}), ref, source=source)
+        item["code"] = code
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
+        derived_row = derived_by_code.get(code, {})
+        derived_features = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
+
+        ma20_before = _canonicalize_numeric_field("ma20", item)
+        repaired_ma20 = ma20_before
+        if not is_valid_positive_numeric(repaired_ma20):
+            repaired_ma20 = _extract_numeric_from_sources(
+                item,
+                meta,
+                scores,
+                ref,
+                ref.get("meta") if isinstance(ref.get("meta"), dict) else {},
+                derived_row,
+                derived_features,
+                aliases=MA20_ALIAS_FIELDS,
+                zero_invalid=True,
+            )
+        if not is_valid_positive_numeric(repaired_ma20):
+            ohlcv_df = _fetch_ohlcv_frame(ohlcv_provider, code, days=30)
+            if not ohlcv_df.empty:
+                repaired_ma20 = compute_ma20_from_ohlcv(ohlcv_df)
+        if is_valid_positive_numeric(repaired_ma20):
+            if not is_valid_positive_numeric(ma20_before):
+                repaired_ma20_count += 1
+            item["ma20"] = float(repaired_ma20)
+            meta["ma20"] = float(repaired_ma20)
+        else:
+            missing_ma20_count += 1
+            item["ma20"] = None
+            meta["ma20"] = None
+
+        score_fallback = _prefer_numeric_candidates([
+            item.get("score_final"),
+            item.get("final_score"),
+            item.get("score"),
+            meta.get("score_final"),
+            meta.get("final_score"),
+            meta.get("score"),
+        ])
+        for field in FINAL30_CANONICAL_NUMERIC_FIELDS:
+            canonical = _canonicalize_numeric_field(field, item, score_fallback=score_fallback)
+            if field in FINAL30_SAVE_REQUIRED_POSITIVE_FIELDS and not is_valid_positive_numeric(canonical):
+                canonical = None
+            if field == "ma20" and is_valid_positive_numeric(item.get("ma20")):
+                canonical = float(item.get("ma20"))
+            item[field] = canonical
+            meta[field] = canonical
+
+        item["final_score"] = item.get("score_final")
+        item["score"] = item.get("score_final")
+        meta["final_score"] = item.get("score_final")
+        meta["score"] = item.get("score_final")
+        item["rank"] = _safe_int(item.get("rank") or item.get("rank_final30") or idx, idx)
+        item["meta"] = meta
+        prepared.append(normalize_final30_contract_row(item))
+
+    logger.info(
+        "[WATCHLIST][FINAL30][MA20_REPAIR] rows=%s repaired_ma20_count=%s missing_ma20_count=%s source=%s",
+        len(prepared),
+        repaired_ma20_count,
+        missing_ma20_count,
+        source,
+    )
+    _log_final30_quality_snapshot(
+        "[WATCHLIST][FINAL30][QUALITY][PRE_SAVE]",
+        prepared,
+        repaired_ma20_count=repaired_ma20_count,
+    )
+    return prepared, repaired_ma20_count, missing_ma20_count
 
 
 def _append_quality_flag(row: Dict[str, Any], flag: str) -> None:
@@ -350,6 +573,21 @@ def _sanitize_scored_item(item: Dict[str, Any], ref: Dict[str, Any] | None = Non
 
     for field in INVALID_ZERO_NUMERIC_FIELDS:
         value = sanitized.get(field)
+        if field == "ma20":
+            logger.info(
+                "[WATCHLIST][SANITIZE][MA20_BEFORE] code=%s value=%s source=%s",
+                str(sanitized.get("code") or "").zfill(6),
+                value,
+                source,
+            )
+            if is_valid_positive_numeric(value):
+                logger.info(
+                    "[WATCHLIST][SANITIZE][MA20_AFTER] code=%s value=%s source=%s repaired=0 preserved=1",
+                    str(sanitized.get("code") or "").zfill(6),
+                    value,
+                    source,
+                )
+                continue
         if not _is_invalid_zero_field(field, value, sanitized):
             continue
         invalid_zero_fields.append(field)
@@ -358,8 +596,23 @@ def _sanitize_scored_item(item: Dict[str, Any], ref: Dict[str, Any] | None = Non
             sanitized[field] = repaired
             repaired_fields.append(field)
         else:
+            if field == "ma20":
+                logger.warning(
+                    "[WATCHLIST][SANITIZE][MA20_REPAIR_FAIL] code=%s value=%s source=%s -> null",
+                    str(sanitized.get("code") or "").zfill(6),
+                    value,
+                    source,
+                )
             sanitized[field] = None
             unresolved_fields.append(field)
+        if field == "ma20":
+            logger.info(
+                "[WATCHLIST][SANITIZE][MA20_AFTER] code=%s value=%s source=%s repaired=%s preserved=0",
+                str(sanitized.get("code") or "").zfill(6),
+                sanitized.get("ma20"),
+                source,
+                int(repaired is not None),
+            )
 
     rs_percentile = sanitized.get("rs_percentile")
     if _is_missing_value(rs_percentile):
@@ -3843,6 +4096,15 @@ def build_and_save_watchlist(
                     flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
                     trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
                 )
+                existing, repaired_ma20_count, _ = _prepare_final30_scored_rows_for_save(
+                    existing,
+                    engine=engine,
+                    env=env,
+                    as_of=as_of,
+                    broader_rows=universe_scored,
+                    ohlcv_provider=ohlcv_provider,
+                    source="build_and_save_watchlist_cache",
+                )
                 repo.save_watchlist(
                     env=env,
                     strategy=strategy,
@@ -3856,6 +4118,11 @@ def build_and_save_watchlist(
                     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
                     _log_final30_scored_df_ready(final30_scored_df)
                     final30_saved_rows = _build_final30_saved_rows(existing or [])
+                    _log_final30_quality_snapshot(
+                        "[WATCHLIST][FINAL30][QUALITY][POST_SAVE_PAYLOAD]",
+                        final30_saved_rows,
+                        repaired_ma20_count=repaired_ma20_count,
+                    )
                     final30_snapshot_rows = [dict(row) for row in (existing or [])]
                     logger.info(
                         "[BUNDLE][KEEP][FINAL30_SCORED] rows=%s has_scores=%s",
@@ -3949,6 +4216,15 @@ def build_and_save_watchlist(
         flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
         trend_weight=_env_float("WATCHLIST_TREND_WEIGHT", 0.0),
     )
+    watchlist, repaired_ma20_count, _ = _prepare_final30_scored_rows_for_save(
+        watchlist,
+        engine=engine,
+        env=env,
+        as_of=as_of,
+        broader_rows=(builder.last_bundle or {}).get("universe_scored", []),
+        ohlcv_provider=ohlcv_provider,
+        source="build_and_save_watchlist",
+    )
 
     # Save final30 to DB (main strategy)
     repo.save_watchlist(
@@ -3992,6 +4268,11 @@ def build_and_save_watchlist(
     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
     _log_final30_scored_df_ready(final30_scored_df)
     final30_saved_rows = _build_final30_saved_rows(watchlist or [])
+    _log_final30_quality_snapshot(
+        "[WATCHLIST][FINAL30][QUALITY][POST_SAVE_PAYLOAD]",
+        final30_saved_rows,
+        repaired_ma20_count=repaired_ma20_count,
+    )
     final30_saved_df = pd.DataFrame(final30_saved_rows).copy(deep=True)
     final30_snapshot_rows = [dict(row) for row in (watchlist or [])]
     if builder.last_bundle:

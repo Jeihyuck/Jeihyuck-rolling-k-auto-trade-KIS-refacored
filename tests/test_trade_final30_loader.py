@@ -30,23 +30,24 @@ REQUIRED = {
 
 
 def _scored_row(code: str) -> dict:
+    idx = int(code)
     return {
         "code": code,
         "name": f"N{code}",
         "rank_final30": 1,
-        "score_final": 90.0,
-        "tech_score": 80.0,
+        "score_final": 90.0 + (idx % 11),
+        "tech_score": 80.0 + (idx % 7),
         "flow_score": 70.0,
-        "breakout_score": 60.0,
-        "pullback_score": 50.0,
-        "momentum_score": 40.0,
+        "breakout_score": 55.0 + (idx % 9),
+        "pullback_score": 45.0 + (idx % 7),
+        "momentum_score": 35.0 + (idx % 5),
         "rs_percentile": 85.0,
         "vcp_score": 75.0,
-        "entry_style_selected": "breakout",
+        "entry_style_selected": "breakout" if idx % 3 == 0 else ("pullback" if idx % 3 == 1 else "momentum"),
         "ma20": 100.0,
-        "ma50": 95.0,
-        "ma150": 90.0,
-        "close": 101.0,
+        "ma50": 95.0 + (idx % 4),
+        "ma150": 90.0 + (idx % 3),
+        "close": 101.0 + (idx % 6),
         "atr_pct": 0.03,
     }
 
@@ -220,6 +221,52 @@ def test_load_trade_final30_scored_repairs_missing_mirrors_from_db(tmp_path, mon
     assert (tmp_path / "runtime" / "watchlist" / "2026-03-11" / "final30_scored.json").exists()
     assert (tmp_path / "bot_state" / "trader_ledger" / "final30" / "practice" / "2026-03-11" / "final30_scored.json").exists()
     assert (tmp_path / "signals" / "final30.json").exists()
+
+
+def test_load_trade_final30_scored_repairs_ma20_only_contract_failure(tmp_path, monkeypatch):
+    _patch_repo_root(monkeypatch, tmp_path)
+    rows = _scored_rows()
+    rows[0] = {**rows[0], "ma20": None, "meta": {"ma20": None}}
+    universe_rows = _scored_rows()
+
+    class FakeRepo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def verify_watchlist_scored_contract(self, **_kwargs):
+            return {
+                "ok": False,
+                "rows": 30,
+                "uniq_codes": 30,
+                "uniq_ranks": 30,
+                "null_critical": 0,
+                "missing_fields": [],
+                "columns": list(REQUIRED),
+                "rows_data": rows,
+                "errors": ["ma20_invalid_rows"],
+                "warnings": [],
+                "invalid_row_count": 1,
+                "invalid_details": {rows[0]["code"]: ["ma20"]},
+                "invalid_sample_codes": [rows[0]["code"]],
+            }
+
+        def load_watchlist_scored(self, *, strategy, **_kwargs):
+            if strategy == "pb1_universe_scored":
+                return universe_rows, date(2026, 3, 11)
+            return [], None
+
+        def load_watchlist(self, *, strategy, **_kwargs):
+            if strategy == "pb1_top50":
+                return universe_rows[:30], date(2026, 3, 11)
+            return [], None
+
+    monkeypatch.setattr(pb1_runner, "WatchlistRepo", FakeRepo)
+
+    result = pb1_runner.load_trade_final30_scored(engine=object(), env="practice", as_of="2026-03-11")
+
+    assert result["source_name"] == "db_pb1_watchlist_final_scored"
+    assert not result["df"].empty
+    assert int((result["df"]["ma20"] > 0).sum()) == len(result["df"])
 
 
 def test_get_final30_artifact_paths_are_repo_root_anchored(tmp_path, monkeypatch):
