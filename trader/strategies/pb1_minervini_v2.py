@@ -26,7 +26,7 @@ class MinerviniConfig:
     # Entry (단계 B 완화)
     pivot_buffer_pct: float = 0.0030  # 0.0015 -> 0.0030으로 완화
     breakout_vol_mult_20: float = 1.5
-    max_extension_from_pivot: float = 0.30  # 0.05 -> 0.30으로 완화
+    max_extension_from_pivot: float = 0.05
 
     # Stop / trail
     initial_stop_pct: float = 0.075

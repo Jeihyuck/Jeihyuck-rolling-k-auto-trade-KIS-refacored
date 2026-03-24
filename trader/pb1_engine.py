@@ -158,7 +158,7 @@ from trader.strategies.pb1_minervini_v2 import (
     compute_pivot,
     detect_vcp,
     entry_trigger,
-    evaluate_filters,
+    evaluate_filters as _strategy_evaluate_filters,
     initial_stop,
     risk_position_size,
     score_setup,
@@ -637,6 +637,68 @@ class FilterThresholds:
         return FilterThresholds(**data)
 
 
+def evaluate_filters(
+    features: Dict[str, Any],
+    market: str | MinerviniConfig,
+    thresholds: FilterThresholds | None = None,
+    *,
+    require_volume: bool | None = None,
+):
+    """Backward-compatible PB1 filter adapter."""
+    if isinstance(market, MinerviniConfig):
+        return _strategy_evaluate_filters(features, market)
+
+    reasons: list[str] = []
+    def _num(value: Any) -> float | None:
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    close_value = _num(features.get("close"))
+    ma20_value = _num(features.get("ma20"))
+    ma50_value = _num(features.get("ma50"))
+    ma20_slope = _num(features.get("ma20_slope"))
+    pullback_pct = _num(features.get("pullback_pct"))
+    vol_contraction = _num(features.get("vol_contraction"))
+    volu_contraction = _num(features.get("volu_contraction"))
+    volume_missing = bool(features.get("volume_missing"))
+
+    if close_value is None or ma20_value is None or close_value <= ma20_value:
+        reasons.append("close_below_ma20")
+    if ma20_value is None or ma50_value is None or ma20_value <= ma50_value:
+        reasons.append("ma20_below_ma50")
+    if ma20_slope is None or ma20_slope <= 0:
+        reasons.append("ma20_slope_fail")
+
+    pullback_min = float(thresholds.pullback_min) if thresholds is not None else float(PB1_PULLBACK_MIN)
+    pullback_max = float(thresholds.pullback_max) if thresholds is not None else float(PB1_PULLBACK_MAX)
+    if pullback_pct is not None and pullback_pct > 1.0:
+        pullback_pct = pullback_pct / 100.0
+    if pullback_pct is None or pullback_pct < pullback_min or pullback_pct > pullback_max:
+        reasons.append("pullback_range_fail")
+
+    vol_limit = float(thresholds.vol_contraction_max) if thresholds is not None else float(PB1_VOL_MAX)
+    volu_limit = float(thresholds.volu_contraction_max) if thresholds is not None else float(PB1_VOLU_MAX)
+    if vol_contraction is None or vol_contraction > vol_limit:
+        reasons.append("vol_contraction_fail")
+    if require_volume if require_volume is not None else PB1_REQUIRE_VOLUME:
+        if volume_missing:
+            reasons.append("volume_missing")
+        elif volu_contraction is None or volu_contraction > volu_limit:
+            reasons.append("volu_contraction_fail")
+
+    require_both = bool(thresholds.require_both_contractions) if thresholds is not None else bool(PB1_REQUIRE_BOTH_CONTRACTIONS)
+    if not require_both:
+        contraction_failures = {"vol_contraction_fail", "volu_contraction_fail"}
+        if any(reason not in contraction_failures for reason in reasons):
+            reasons = [reason for reason in reasons if reason not in contraction_failures]
+
+    return len(reasons) == 0, reasons
+
+
 def resolve_pb1_phase(
     now: datetime,
     trading_day: bool,
@@ -725,7 +787,7 @@ class PB1Engine:
         dry_run: bool,
         env: str,
         run_id: str,
-        intended_live: bool,
+        intended_live: bool = False,
         strategy: str | None = None,
         now_kst_value: datetime | None = None,
         balance_snapshot: dict | None = None,
@@ -755,6 +817,7 @@ class PB1Engine:
         compute_only_full_run: bool = False,
         force_block_live: bool = False,
         trading_day: bool | None = None,
+        entry_allowed_this_tick: bool | None = None,
     ) -> None:
         self._as_of = None
         self._trade_date = None
@@ -784,7 +847,7 @@ class PB1Engine:
             self.market_window_name = "intraday"
         elif self.market_window_name not in {"after", "day"}:
             self.market_window_name = "day"
-        self.window = self.window_name
+        self.window = WindowDecision(name=self.window_name, phase=self.phase_name)
         self.window_label = self.window_name
         self.phase = phase
         self.phase_name = (str(phase or "entry").strip().lower() or "entry")
@@ -799,7 +862,7 @@ class PB1Engine:
         self.run_id = run_id
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
-        self.engine = orders_repo.engine  # Use orders_repo.engine for consistency
+        self.engine = getattr(orders_repo, "engine", None)
         
         # ✅ DEFENSIVE GUARD: Auto-correct intended_live vs dry_run mismatch instead of crashing
         if intended_live and self.dry_run:
@@ -1594,8 +1657,7 @@ class PB1Engine:
         selected_key = None
         cash_value = None
         
-        # ✅ 우선순위 fallback: ord_psbl_cash → dnca_tot_amt → nxdy_excc_amt → prvs_rcdl_excc_amt
-        for key in ("ord_psbl_cash", "dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt"):
+        for key in ("ord_psbl_cash", "nxdy_excc_amt", "dnca_tot_amt", "prvs_rcdl_excc_amt"):
             if key in summary:
                 val = self._to_float(summary.get(key))
                 if val is not None and val > 0:
@@ -1679,10 +1741,13 @@ class PB1Engine:
     def _resolve_entry_capital(
         self,
         *,
-        base_cash_krw: int,
+        base_cash_krw: int | None = None,
+        available_cash_krw: int | None = None,
         override_capital: float | None,
         reserve_pct: float,
     ) -> tuple[int, int, dict]:
+        if base_cash_krw is None:
+            base_cash_krw = int(available_cash_krw or 0)
         use_override = override_capital is not None and int(override_capital) > 0
         usable = max(int(base_cash_krw * (1 - reserve_pct)), 0)
         entry_capital = usable
@@ -1690,13 +1755,13 @@ class PB1Engine:
             entry_capital = min(entry_capital, int(override_capital))
         cap_limit = None
         cap_applied = False
-        if CAP_CAP and CAP_CAP > 0:
+        if self.intended_live and CAP_CAP and CAP_CAP > 0:
             cap_limit = int(base_cash_krw * CAP_CAP) if CAP_CAP <= 1 else int(CAP_CAP)
             if cap_limit > 0 and entry_capital > cap_limit:
                 entry_capital = cap_limit
                 cap_applied = True
         clamp_meta = {}
-        if (self.env or "").lower() != "real":
+        if (self.env or "").lower() == "paper":
             cap = min(int(base_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
             if entry_capital > cap:
                 before = entry_capital
@@ -1741,7 +1806,7 @@ class PB1Engine:
     def _build_positions_from_kis(
         self,
         holdings_rows: Iterable[dict],
-        positions_rows: Iterable[dict],
+        positions_rows: Iterable[dict] | None = None,
     ) -> list[dict]:
         kis_holdings = self._parse_kis_holdings(holdings_rows)
         positions_by_code = {
@@ -1763,18 +1828,20 @@ class PB1Engine:
                 code,
                 total_qty,
             )
-            self.ledger_repo.add_event(
-                env=self.env,
-                run_id=self.run_id,
-                strategy=self.STRATEGY_NAME,
-                event_type="POSITION_ORPHANED",
-                code=code,
-                market=state.get("market"),
-                sid=sid,
-                qty=total_qty,
-                ok=True,
-                payload_json={"ledger_total_qty": total_qty},
-            )
+            append_event = getattr(self.ledger_repo, "add_event", None) or getattr(self.ledger_repo, "append_event", None)
+            if append_event is not None:
+                append_event(
+                    env=self.env,
+                    run_id=self.run_id,
+                    strategy=self.STRATEGY_NAME,
+                    event_type="POSITION_ORPHANED",
+                    code=code,
+                    market=state.get("market"),
+                    sid=sid,
+                    qty=total_qty,
+                    ok=True,
+                    payload_json={"ledger_total_qty": total_qty},
+                )
         ledger_by_code: dict[str, dict] = {}
         for (code, sid, mode), state in ledger_positions.items():
             if sid != 1:
@@ -3837,7 +3904,7 @@ class PB1Engine:
                     self._log_setup(clone)
                 evaluated.append(clone)
                 continue
-            ok, reasons = evaluate_filters(clone.features, cfg)
+            ok, reasons = _strategy_evaluate_filters(clone.features, cfg)
             
             # [MINERVINI] 필터 스킵/무력화 감지
             debug_mode = os.getenv("MINERVINI_DEBUG") == "1"

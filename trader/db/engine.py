@@ -59,7 +59,7 @@ def _normalize_db_url(url: str) -> str:
 
 def get_db_url() -> str:
     raw = (os.getenv("PBCORE_DB_URL") or os.getenv("DATABASE_URL") or "").strip()
-    url = _normalize_db_url(raw)
+    url = raw
     if not url:
         raise RuntimeError(
             "Postgres DB URL missing. "
@@ -95,7 +95,7 @@ def _connect_args_for_db_url(db_url: str) -> dict:
 
 
 def make_engine() -> sa.Engine:
-    url = get_db_url()
+    url = _normalize_db_url(get_db_url())
     try:
         # SQLAlchemy 엔진 생성 (psycopg v3 지원)
         connect_args = _connect_args_for_db_url(url)

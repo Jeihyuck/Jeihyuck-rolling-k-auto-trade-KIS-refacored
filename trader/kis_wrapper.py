@@ -2635,6 +2635,11 @@ class KisAPI:
                 selected_key = "dnca_tot_amt_fallback"
         
         clamp_applied = False
+        if cash <= 0 and selected_key is None and "dnca_tot_amt" in row:
+            raw_dnca = str(row.get("dnca_tot_amt") or "")
+            if raw_dnca.strip().startswith("-"):
+                selected_key = "dnca_tot_amt"
+                clamp_applied = True
         if cash < 0:
             cash = 0
             clamp_applied = True

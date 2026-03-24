@@ -423,6 +423,178 @@ def log_final30_ma_diagnostics(df: pd.DataFrame, stage: str) -> None:
     )
 
 
+def _short_feature_sample_rows(df: pd.DataFrame, limit: int = 5) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+
+    sample_columns = [column for column in ("code", "ma20", "volume_avg20", "ma50", "close") if column in df.columns]
+    if not sample_columns:
+        return []
+    return df.loc[:, sample_columns].head(limit).to_dict(orient="records")
+
+
+def _short_feature_null_count(df: pd.DataFrame, column: str) -> int:
+    if df is None or column not in df.columns:
+        return -1
+    return int(_build_numeric_series(df, column).isna().sum())
+
+
+def log_short_horizon_feature_diag(df: pd.DataFrame, stage: str) -> None:
+    if df is None:
+        logger.info(
+            "[DEBUG][SHORT_FEATURE_DIAG] stage=%s rows=0 has_ma20=0 ma20_null=-1 has_volume_avg20=0 volume_avg20_null=-1 has_ma50=0 ma50_null=-1 has_close=0 close_null=-1 sample=[]",
+            stage,
+        )
+        return
+
+    logger.info(
+        "[DEBUG][SHORT_FEATURE_DIAG] stage=%s rows=%s has_ma20=%s ma20_null=%s has_volume_avg20=%s volume_avg20_null=%s has_ma50=%s ma50_null=%s has_close=%s close_null=%s sample=%s",
+        stage,
+        len(df),
+        int("ma20" in df.columns),
+        _short_feature_null_count(df, "ma20"),
+        int("volume_avg20" in df.columns),
+        _short_feature_null_count(df, "volume_avg20"),
+        int("ma50" in df.columns),
+        _short_feature_null_count(df, "ma50"),
+        int("close" in df.columns),
+        _short_feature_null_count(df, "close"),
+        _short_feature_sample_rows(df),
+    )
+
+
+def _should_backfill_short_horizon_features(df: pd.DataFrame, *, require_all_null: bool) -> bool:
+    if df is None or df.empty:
+        return False
+
+    rows = len(df)
+    if rows <= 0:
+        return False
+
+    ma20_missing = "ma20" not in df.columns
+    vol20_missing = "volume_avg20" not in df.columns
+    ma20_null = _short_feature_null_count(df, "ma20")
+    vol20_null = _short_feature_null_count(df, "volume_avg20")
+
+    if require_all_null:
+        return bool(ma20_missing or vol20_missing or ma20_null == rows or vol20_null == rows)
+    return bool(ma20_missing or vol20_missing or ma20_null > 0 or vol20_null > 0)
+
+
+def load_recent_ohlcv_for_codes(
+    codes: List[str],
+    *,
+    as_of: date,
+    ohlcv_provider: Any,
+    min_days: int = 20,
+) -> Dict[str, pd.DataFrame]:
+    history_map: Dict[str, pd.DataFrame] = {}
+    fetch_days = max(int(min_days), 30)
+    for raw_code in codes:
+        code = str(raw_code or "").zfill(6)
+        if not code:
+            continue
+        frame = _fetch_ohlcv_frame(ohlcv_provider, code, days=fetch_days)
+        history_map[code] = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    return history_map
+
+
+def backfill_short_horizon_features(
+    df: pd.DataFrame,
+    as_of: date,
+    *,
+    ohlcv_provider: Any,
+    stage: str,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    result = df.copy()
+    if "ma20" not in result.columns:
+        result["ma20"] = pd.Series(index=result.index, dtype="float64")
+    if "volume_avg20" not in result.columns:
+        result["volume_avg20"] = pd.Series(index=result.index, dtype="float64")
+
+    ma20_series = _build_numeric_series(result, "ma20")
+    vol20_series = _build_numeric_series(result, "volume_avg20")
+    target_mask = ma20_series.isna() | vol20_series.isna()
+    ma20_null = int(ma20_series.isna().sum())
+    vol20_null = int(vol20_series.isna().sum())
+
+    logger.info(
+        "[SHORT_FEATURE][BACKFILL][START] stage=%s rows=%s ma20_null=%s volume_avg20_null=%s",
+        stage,
+        len(result),
+        ma20_null,
+        vol20_null,
+    )
+
+    codes = result.loc[target_mask, "code"].dropna().astype(str).str.zfill(6).unique().tolist() if "code" in result.columns else []
+    if not codes:
+        logger.info(
+            "[SHORT_FEATURE][BACKFILL][DONE] stage=%s filled_ma20=%s filled_volume_avg20=%s remaining_ma20_null=%s remaining_volume_avg20_null=%s",
+            stage,
+            0,
+            0,
+            ma20_null,
+            vol20_null,
+        )
+        return result
+
+    hist_map = load_recent_ohlcv_for_codes(codes, as_of=as_of, ohlcv_provider=ohlcv_provider, min_days=20)
+
+    filled_ma20 = 0
+    filled_vol20 = 0
+    for idx in result.index[target_mask]:
+        code = str(result.at[idx, "code"] if "code" in result.columns else "").zfill(6)
+        hist = hist_map.get(code)
+        if hist is None or hist.empty:
+            logger.warning("[SHORT_FEATURE][BACKFILL][MISS] code=%s reason=history_unavailable", code)
+            continue
+
+        hist = _normalize_ohlcv_columns(hist)
+        if hist.empty or "close" not in hist.columns or "volume" not in hist.columns:
+            logger.warning("[SHORT_FEATURE][BACKFILL][MISS] code=%s reason=missing_close_or_volume", code)
+            continue
+
+        hist = hist.sort_values("date") if "date" in hist.columns else hist
+        close_tail = pd.to_numeric(hist["close"], errors="coerce").tail(20)
+        volume_tail = pd.to_numeric(hist["volume"], errors="coerce").tail(20)
+        if len(close_tail) < 20 or len(volume_tail) < 20 or int(close_tail.notna().sum()) < 20 or int(volume_tail.notna().sum()) < 20:
+            logger.warning("[SHORT_FEATURE][BACKFILL][MISS] code=%s reason=insufficient_history bars=%s", code, len(hist))
+            continue
+
+        ma20_value = float(close_tail.mean())
+        vol20_value = float(volume_tail.mean())
+
+        if pd.isna(result.at[idx, "ma20"]):
+            result.at[idx, "ma20"] = ma20_value
+            filled_ma20 += 1
+        if pd.isna(result.at[idx, "volume_avg20"]):
+            result.at[idx, "volume_avg20"] = vol20_value
+            filled_vol20 += 1
+
+        meta = result.at[idx, "meta"] if "meta" in result.columns else None
+        if isinstance(meta, dict):
+            if meta.get("ma20") is None and pd.notna(result.at[idx, "ma20"]):
+                meta["ma20"] = float(result.at[idx, "ma20"])
+            if meta.get("volume_avg20") is None and pd.notna(result.at[idx, "volume_avg20"]):
+                meta["volume_avg20"] = float(result.at[idx, "volume_avg20"])
+            result.at[idx, "meta"] = meta
+
+    remaining_ma20_null = int(_build_numeric_series(result, "ma20").isna().sum())
+    remaining_vol20_null = int(_build_numeric_series(result, "volume_avg20").isna().sum())
+    logger.info(
+        "[SHORT_FEATURE][BACKFILL][DONE] stage=%s filled_ma20=%s filled_volume_avg20=%s remaining_ma20_null=%s remaining_volume_avg20_null=%s",
+        stage,
+        filled_ma20,
+        filled_vol20,
+        remaining_ma20_null,
+        remaining_vol20_null,
+    )
+    return result
+
+
 def normalize_ma20_column(df: pd.DataFrame, stage: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -1108,6 +1280,7 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
         "momentum_score",
         "entry_style_selected",
         "close",
+        "volume_avg20",
         "ma20",
         "ma50",
         "ma150",
@@ -1137,6 +1310,7 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     out["momentum_score"] = _prefer_valid_numeric(out.get("momentum_score"), meta.get("momentum_score"))
     out["entry_style_selected"] = out.get("entry_style_selected") or meta.get("entry_style_selected")
     out["close"] = _prefer_valid_numeric(out.get("close"), meta.get("close"), zero_invalid=True)
+    out["volume_avg20"] = _prefer_valid_numeric(out.get("volume_avg20"), meta.get("volume_avg20"), zero_invalid=True)
     out["ma20"] = _prefer_valid_numeric(out.get("ma20"), meta.get("ma20"), zero_invalid=True)
     out["ma50"] = _prefer_valid_numeric(out.get("ma50"), meta.get("ma50"), zero_invalid=True)
     out["ma150"] = _prefer_valid_numeric(out.get("ma150"), meta.get("ma150"), zero_invalid=True)
@@ -1172,6 +1346,7 @@ def _sync_item_and_meta_fields(item: Dict[str, Any]) -> Dict[str, Any]:
         "momentum_score",
         "entry_style_selected",
         "close",
+        "volume_avg20",
         "ma20",
         "ma50",
         "ma150",
@@ -1576,8 +1751,19 @@ class WatchlistBuilder:
         final30_scored = pd.DataFrame(final30).copy(deep=True)
         log_df_identity(final30_scored, "BUILD")
         log_final30_ma_diagnostics(final30_scored, "build_raw")
+        log_short_horizon_feature_diag(final30_scored, "build_raw")
+        if _should_backfill_short_horizon_features(final30_scored, require_all_null=True):
+            final30_scored = backfill_short_horizon_features(
+                final30_scored,
+                as_of,
+                ohlcv_provider=self.ohlcv_provider,
+                stage="build_raw",
+            )
+            log_short_horizon_feature_diag(final30_scored, "after_backfill_build_raw")
+            log_final30_ma_diagnostics(final30_scored, "after_backfill_build_raw")
         final30_scored = normalize_ma20_column(final30_scored, "build_raw")
         log_final30_ma_diagnostics(final30_scored, "build_normalized")
+        log_short_horizon_feature_diag(final30_scored, "build_normalized")
         final30 = final30_scored.to_dict(orient="records")
 
         logger.info(
@@ -1641,8 +1827,19 @@ class WatchlistBuilder:
 
         final30_scored = pd.DataFrame(final30).copy(deep=True)
         log_final30_ma_diagnostics(final30_scored, "before_freeze")
+        log_short_horizon_feature_diag(final30_scored, "before_freeze")
+        if _should_backfill_short_horizon_features(final30_scored, require_all_null=False):
+            final30_scored = backfill_short_horizon_features(
+                final30_scored,
+                as_of,
+                ohlcv_provider=self.ohlcv_provider,
+                stage="before_freeze",
+            )
+            log_short_horizon_feature_diag(final30_scored, "after_backfill_before_freeze")
+            log_final30_ma_diagnostics(final30_scored, "after_backfill_before_freeze")
         final30_scored = normalize_ma20_column(final30_scored, "before_freeze")
         log_final30_ma_diagnostics(final30_scored, "after_normalize_before_freeze")
+        log_short_horizon_feature_diag(final30_scored, "after_normalize_before_freeze")
         final30_scored = materialize_final30_price_context(final30_scored)
         log_df_identity(final30_scored, "FROZEN")
         logger.info(
@@ -1652,6 +1849,7 @@ class WatchlistBuilder:
             list(final30_scored.columns),
         )
         log_final30_ma_diagnostics(final30_scored, "pre_contract_frozen")
+        log_short_horizon_feature_diag(final30_scored, "pre_contract_frozen")
         assert_final30_scored_contract(final30_scored, "frozen", str(as_of), hard=True)
         final30 = final30_scored.to_dict(orient="records")
 

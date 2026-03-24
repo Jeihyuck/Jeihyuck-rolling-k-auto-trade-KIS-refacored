@@ -104,6 +104,14 @@ from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 logger = logging.getLogger(__name__)
 log = logger
 
+
+def try_acquire_lock(*args, **kwargs):
+    return acquire_advisory_lock(*args, **kwargs)
+
+
+def is_trading_day(now: datetime) -> bool:
+    return is_trading_weekday(now)
+
 REQUIRED_SCORED_FINAL30_COLS = [
     "code",
     "score_final",
@@ -737,7 +745,10 @@ def resolve_env(cli_env: str | None) -> str:
     strategy_env = os.getenv("STRATEGY_ENV")
     if strategy_env:
         return str(strategy_env).strip().lower()
-    raise RuntimeError("ENV_NOT_DEFINED")
+    kis_env = os.getenv("KIS_ENV")
+    if kis_env:
+        return str(kis_env).strip().lower()
+    return "practice"
 
 
 def _parse_as_of_override(value: str) -> datetime.date:
@@ -3464,7 +3475,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     total_start_ts = time_mod.monotonic()
     engine = make_engine()
     lock_conn = engine.connect()
-    if not acquire_advisory_lock(lock_conn):
+    if not try_acquire_lock(lock_conn):
         logger.warning("[PB1][LOOP] run lock unavailable -> exit")
         lock_conn.close()
         return
@@ -3777,7 +3788,7 @@ def _exit_code_for_status(status: str) -> int:
 
 def main() -> int:
     args = parse_args()
-    resolved_env = resolve_env(args.env)
+    resolved_env = resolve_env(getattr(args, "env", None))
     os.environ["STRATEGY_ENV"] = resolved_env
     if not os.getenv("KIS_ENV"):
         os.environ["KIS_ENV"] = resolved_env
@@ -4249,8 +4260,21 @@ def main() -> int:
             logger.error("[PB1][FATAL_GUARD] loop crashed", exc_info=True)
         return 0
     engine = make_engine()
+    if not hasattr(engine, "connect"):
+        now = now_kst()
+        open_dt, close_dt = _market_session(now)
+        allow_wait = env_bool("PB1_ALLOW_WAIT", PB1_WAIT_FOR_WINDOW)
+        max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
+        action, target_start = _decide_action(now, is_trading_day(now), open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
+        if action == "wait" and target_start is not None:
+            remaining = max(0.0, (target_start - now).total_seconds())
+            sleep_for = remaining if remaining < 30 else min(60, remaining)
+            if sleep_for > 0:
+                time_mod.sleep(sleep_for)
+        logger.warning("[PB1][RUN] engine missing connect() -> exit")
+        return 0
     lock_conn = engine.connect()
-    if not acquire_advisory_lock(lock_conn):
+    if not try_acquire_lock(lock_conn):
         logger.warning("[PB1][RUN] run lock unavailable -> exit")
         lock_conn.close()
         return 0

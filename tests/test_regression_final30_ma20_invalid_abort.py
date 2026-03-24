@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import date
 
 import sqlalchemy as sa
+import pytest
 
 from trader import pb1_runner, prep_runner
-from trader.db.repos import WatchlistRepo, verify_final30_scored_contract
+from trader.db.repos import WatchlistRepo
 from trader.db.schema import schema_for_engine
 
 
@@ -68,22 +69,15 @@ def test_regression_ma20_invalid_abort_uses_same_helper_everywhere() -> None:
     schema = schema_for_engine(engine)
     schema.metadata.create_all(engine)
     repo = WatchlistRepo(engine)
-    repo.save_watchlist(
-        env="practice",
-        strategy="pb1_watchlist_final_scored",
-        as_of=date(2026, 3, 20),
-        members=rows,
-    )
-    db_result = verify_final30_scored_contract(
-        engine,
-        env="practice",
-        as_of=date(2026, 3, 20),
-        allow_latest_fallback=False,
-        log_result=False,
-    )
+    with pytest.raises(ValueError, match="FINAL30_SCORED_INVALID_BEFORE_DB_INSERT"):
+        repo.save_watchlist(
+            env="practice",
+            strategy="pb1_watchlist_final_scored",
+            as_of=date(2026, 3, 20),
+            members=rows,
+        )
 
     assert prep_result["ok"] is False
     assert trade_result["ok"] is False
-    assert db_result["ok"] is False
     assert "ma20_invalid_rows" in prep_result["errors"]
-    assert prep_result["errors"] == trade_result["errors"] == db_result["errors"]
+    assert prep_result["errors"] == trade_result["errors"]

@@ -1,10 +1,42 @@
 from __future__ import annotations
 
+from datetime import date
 import logging
 
 import pandas as pd
 
-from trader.watchlist_builder import assert_final30_scored_contract, normalize_ma20_column
+from trader.watchlist_builder import (
+    assert_final30_scored_contract,
+    backfill_short_horizon_features,
+    normalize_ma20_column,
+)
+
+
+class _StubOHLCVProvider:
+    def __init__(self, history_by_code: dict[str, pd.DataFrame]) -> None:
+        self.history_by_code = {str(code).zfill(6): frame.copy(deep=True) for code, frame in history_by_code.items()}
+
+    def get_ohlcv(self, symbol: str, days: int, **_: object):
+        frame = self.history_by_code.get(str(symbol).zfill(6), pd.DataFrame())
+
+        class _Result:
+            def __init__(self, df: pd.DataFrame) -> None:
+                self.df = df.tail(days).copy(deep=True)
+
+        return _Result(frame)
+
+
+def _history_frame(*, close_start: float, volume_start: float, bars: int = 20) -> pd.DataFrame:
+    rows = []
+    for idx in range(bars):
+        rows.append(
+            {
+                "date": f"202603{idx + 1:02d}",
+                "close": close_start + idx,
+                "volume": volume_start + (idx * 1000.0),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _base_rows() -> list[dict]:
@@ -117,3 +149,99 @@ def test_normalize_ma20_column_preserves_existing_values_and_scores() -> None:
     pd.testing.assert_series_equal(normalized["ma20"], original_ma20, check_names=False)
     pd.testing.assert_series_equal(normalized["score_final"], original_score_final, check_names=False)
     pd.testing.assert_series_equal(normalized["tech_score"], original_tech_score, check_names=False)
+
+
+def test_backfill_short_horizon_features_fills_all_null_build_raw() -> None:
+    df = pd.DataFrame(_base_rows())
+    df["ma20"] = None
+    df["volume_avg20"] = None
+
+    history_by_code = {
+        str(code).zfill(6): _history_frame(close_start=100.0 + idx, volume_start=50_000.0 + idx)
+        for idx, code in enumerate(df["code"].tolist())
+    }
+    provider = _StubOHLCVProvider(history_by_code)
+
+    backfilled = backfill_short_horizon_features(
+        df,
+        date(2026, 3, 24),
+        ohlcv_provider=provider,
+        stage="build_raw",
+    )
+
+    assert int(backfilled["ma20"].isna().sum()) == 0
+    assert int(backfilled["volume_avg20"].isna().sum()) == 0
+    assert backfilled["ma50"].tolist() == df["ma50"].tolist()
+    assert backfilled["ma150"].tolist() == df["ma150"].tolist()
+    assert backfilled["close"].tolist() == df["close"].tolist()
+
+
+def test_backfill_short_horizon_features_only_fills_missing_ma20() -> None:
+    df = pd.DataFrame(_base_rows())
+    original_volume_avg20 = df["volume_avg20"].copy()
+    df["ma20"] = None
+
+    history_by_code = {
+        str(code).zfill(6): _history_frame(close_start=200.0 + idx, volume_start=70_000.0 + idx)
+        for idx, code in enumerate(df["code"].tolist())
+    }
+    provider = _StubOHLCVProvider(history_by_code)
+
+    backfilled = backfill_short_horizon_features(
+        df,
+        date(2026, 3, 24),
+        ohlcv_provider=provider,
+        stage="build_raw",
+    )
+
+    assert int(backfilled["ma20"].isna().sum()) == 0
+    pd.testing.assert_series_equal(backfilled["volume_avg20"], original_volume_avg20, check_names=False)
+
+
+def test_backfill_short_horizon_features_keeps_null_when_history_insufficient(caplog) -> None:
+    df = pd.DataFrame(_base_rows())
+    df["ma20"] = None
+    df["volume_avg20"] = None
+
+    history_by_code = {
+        str(code).zfill(6): _history_frame(close_start=300.0 + idx, volume_start=90_000.0 + idx, bars=10)
+        for idx, code in enumerate(df["code"].tolist())
+    }
+    provider = _StubOHLCVProvider(history_by_code)
+
+    caplog.set_level(logging.INFO)
+    backfilled = backfill_short_horizon_features(
+        df,
+        date(2026, 3, 24),
+        ohlcv_provider=provider,
+        stage="build_raw",
+    )
+    result = assert_final30_scored_contract(backfilled, "insufficient_history", "2026-03-24", hard=False)
+
+    assert int(backfilled["ma20"].isna().sum()) == 30
+    assert int(backfilled["volume_avg20"].isna().sum()) == 30
+    assert result["ok"] is False
+    assert "ma20_null count=30" in result["errors"]
+    assert "[SHORT_FEATURE][BACKFILL][MISS]" in caplog.text
+
+
+def test_backfill_short_horizon_features_preserves_existing_values() -> None:
+    df = pd.DataFrame(_base_rows())
+    original_ma20 = df["ma20"].copy()
+    original_volume_avg20 = df["volume_avg20"].copy()
+
+    history_by_code = {
+        str(code).zfill(6): _history_frame(close_start=400.0 + idx, volume_start=110_000.0 + idx)
+        for idx, code in enumerate(df["code"].tolist())
+    }
+    provider = _StubOHLCVProvider(history_by_code)
+
+    backfilled = backfill_short_horizon_features(
+        df,
+        date(2026, 3, 24),
+        ohlcv_provider=provider,
+        stage="build_raw",
+    )
+
+    pd.testing.assert_series_equal(backfilled["ma20"], original_ma20, check_names=False)
+    pd.testing.assert_series_equal(backfilled["volume_avg20"], original_volume_avg20, check_names=False)

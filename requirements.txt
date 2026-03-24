@@ -8,6 +8,7 @@ pyarrow>=15
 
 scikit-learn>=1.4
 finance-datareader>=0.9
+requests>=2.31
 python-dotenv>=0.21.0
 SQLAlchemy>=2.0,<3.0
 psycopg[binary]>=3.1,<4

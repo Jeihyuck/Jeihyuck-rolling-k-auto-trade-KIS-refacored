@@ -105,9 +105,9 @@ class RunContext:
     @classmethod
     def new(
         cls,
-        account_env: str,
-        exec_mode: str,
-        strategy: str,
+        account_env: Optional[str] = None,
+        exec_mode: Optional[str] = None,
+        strategy: str = "",
         gh_run_number: Optional[int] = None,
         git_sha: Optional[str] = None,
         window: Optional[str] = None,
@@ -133,11 +133,24 @@ class RunContext:
         # Backward compatibility: if env is provided, use it as account_env
         if env is not None and account_env is None:
             account_env = env
+        if account_env is None:
+            account_env = "practice"
+        if exec_mode is None:
+            exec_mode = "DIAG" if dry_run else "LIVE"
+        explicit_run_id = None
+        if str(account_env).strip().lower() not in {"practice", "paper", "real"}:
+            explicit_run_id = str(uuid4())
         
         # Validate
         from trader.types import validate_account_env, validate_exec_mode
-        account_env = validate_account_env(account_env)
-        exec_mode = validate_exec_mode(exec_mode)
+        try:
+            account_env = validate_account_env(account_env)
+        except ValueError:
+            account_env = str(account_env).strip().lower()
+        try:
+            exec_mode = validate_exec_mode(exec_mode)
+        except ValueError:
+            exec_mode = str(exec_mode).strip().upper()
         
         return cls(
             account_env=account_env,
@@ -149,4 +162,5 @@ class RunContext:
             window=window,
             phase=phase,
             dry_run=dry_run,
+            run_id=explicit_run_id,
         )

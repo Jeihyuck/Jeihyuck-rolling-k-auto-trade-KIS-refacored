@@ -25,6 +25,7 @@ from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 from trader.universe.validation import validate_listed_and_tradeable
 from trader.runtime_paths import ensure_not_repo_tracked_path, runtime_path, runtime_root
 from trader.universe.mode import is_db_only_mode, resolve_strategy_mode
+from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 
 from datetime import date
 

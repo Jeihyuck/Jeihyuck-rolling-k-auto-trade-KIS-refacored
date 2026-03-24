@@ -2,12 +2,15 @@ import os
 import requests
 import json
 from dotenv import load_dotenv
+import pytest
 
 load_dotenv()
 
+pytestmark = pytest.mark.skip(reason="manual API smoke script")
+
 APP_KEY = os.getenv("KIS_APP_KEY")
 APP_SECRET = os.getenv("KIS_APP_SECRET")
-ACCOUNT = os.getenv("KIS_ACCOUNT")
+ACCOUNT = os.getenv("KIS_ACCOUNT") or ""
 CANO = ACCOUNT[:8]
 ACNT_PRDT_CD = ACCOUNT[8:]
 BASE_URL = os.getenv("KIS_REST_URL", "https://openapivts.koreainvestment.com:29443")
