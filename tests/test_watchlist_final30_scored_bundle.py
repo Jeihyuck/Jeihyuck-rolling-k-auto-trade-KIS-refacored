@@ -81,7 +81,84 @@ def test_build_and_save_watchlist_returns_final30_scored_bundle(monkeypatch, tmp
     assert "final30_snapshot_df" in bundle
     assert isinstance(bundle["final30_scored"], pd.DataFrame)
     assert bundle["final30_scored"].iloc[0]["tech_score"] > 0
-    assert set(bundle["final30_saved"][0].keys()) == {"code", "meta", "rank", "score"}
+    assert {"code", "meta", "rank", "score"}.issubset(set(bundle["final30_saved"][0].keys()))
+
+
+def test_build_and_save_watchlist_rebuilds_final30_scored_from_repaired_watchlist(monkeypatch, tmp_path) -> None:
+    from trader import watchlist_builder
+
+    class FakeRepo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def load_watchlist(self, **_kwargs):
+            return [], None
+
+        def save_watchlist(self, **_kwargs):
+            return None
+
+    class FakeBuilder:
+        def __init__(self, **_kwargs):
+            self.last_bundle = {}
+
+        def build(self, members, as_of):
+            stale_final30_scored = [
+                {
+                    "code": "000001",
+                    "name": "A",
+                    "tech_score": 10.0,
+                    "score_final": 20.0,
+                    "breakout_score": 30.0,
+                    "pullback_score": 40.0,
+                    "momentum_score": 50.0,
+                    "ma20": None,
+                }
+            ]
+            self.last_bundle = {
+                "as_of": as_of,
+                "universe_scored": list(stale_final30_scored),
+                "pool120": list(stale_final30_scored),
+                "top50": list(stale_final30_scored),
+                "final30": list(stale_final30_scored),
+                "final30_scored": pd.DataFrame(stale_final30_scored),
+                "weights": {},
+                "weights_effective": {},
+                "formula": "",
+                "reject_summary": {},
+                "degrade": {},
+                "final_count": 1,
+                "shortage_reason": "",
+                "contract_failures": [],
+            }
+            return list(stale_final30_scored)
+
+    def _repair_rows(rows, **_kwargs):
+        rows = [dict(row) for row in (rows or [])]
+        rows[0]["ma20"] = 123.45
+        return rows, 1, 0
+
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(watchlist_builder, "WatchlistRepo", FakeRepo)
+    monkeypatch.setattr(watchlist_builder, "WatchlistBuilder", FakeBuilder)
+    monkeypatch.setattr(watchlist_builder, "_enrich_watchlist_rows", lambda **kwargs: kwargs.get("rows", []))
+    monkeypatch.setattr(watchlist_builder, "_prepare_final30_scored_rows_for_save", _repair_rows)
+    monkeypatch.setattr(watchlist_builder, "save_bundle", lambda **_kwargs: None)
+
+    _watchlist, bundle = watchlist_builder.build_and_save_watchlist(
+        engine=MagicMock(),
+        env="practice",
+        strategy="pb1_watchlist",
+        as_of=date(2026, 3, 6),
+        members=[{"code": "000001", "name": "A"}],
+        ohlcv_provider=lambda *_args, **_kwargs: (None, {}),
+        minervini_config={},
+        force_rebuild=True,
+        use_cache=False,
+        return_bundle=True,
+    )
+
+    assert bundle["final30_scored"].iloc[0]["ma20"] == 123.45
+    assert bundle["bundle_final30_scored_before_save"].iloc[0]["ma20"] == 123.45
 
 
 def test_watchlist_builder_rejects_multiple_build_calls() -> None:

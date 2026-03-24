@@ -4300,7 +4300,7 @@ def build_and_save_watchlist(
     final30_scored_source = (builder.last_bundle or {}).get("final30_scored")
     if final30_scored_source is None:
         raise RuntimeError("FINAL30_SCORED_BUILD_BUNDLE_MISSING")
-    final30_scored_df = _as_dataframe(final30_scored_source).copy(deep=True)
+    final30_scored_df = pd.DataFrame(watchlist or []).copy(deep=True)
     final30_scored_rows = final30_scored_df.to_dict(orient="records")
     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
     _log_final30_scored_df_ready(final30_scored_df)
