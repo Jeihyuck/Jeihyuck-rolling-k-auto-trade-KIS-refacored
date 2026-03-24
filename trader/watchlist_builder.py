@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
@@ -270,7 +271,16 @@ FINAL30_CANONICAL_NUMERIC_FIELDS = (
     "score_final",
 )
 FINAL30_SAVE_REQUIRED_POSITIVE_FIELDS = {"close", "ma50", "ma150"}
-MA20_ALIAS_FIELDS = ("ma20", "ma_20", "sma20", "ma20_price")
+MA20_ALIAS_FIELDS = ("ma20", "ma_20", "sma20", "close_ma20", "moving_avg20", "avg20", "ma20_price")
+MA20_NORMALIZE_PRIORITY = (
+    "ma20",
+    "ma_20",
+    "sma20",
+    "close_ma20",
+    "moving_avg20",
+    "avg20",
+    "ma20_price",
+)
 FINAL30_CONTRACT_REQUIRED_FIELDS = tuple(
     dict.fromkeys(
         (
@@ -309,6 +319,180 @@ def _prefer_numeric_candidates(values: List[Any], *, zero_invalid: bool = False)
         if fallback is None:
             fallback = numeric
     return fallback
+
+
+def _normalize_column_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _ma20_candidate_priority(column: Any) -> int:
+    normalized = _normalize_column_token(column)
+    for idx, candidate in enumerate(MA20_NORMALIZE_PRIORITY):
+        candidate_token = _normalize_column_token(candidate)
+        if normalized == candidate_token:
+            return idx
+        if normalized in {f"{candidate_token}x", f"{candidate_token}y"}:
+            return idx + len(MA20_NORMALIZE_PRIORITY)
+    if normalized in {"ma20x", "ma20y"}:
+        return len(MA20_NORMALIZE_PRIORITY)
+    return 10_000
+
+
+def _is_ma20_candidate_column(column: Any) -> bool:
+    normalized = _normalize_column_token(column)
+    candidate_tokens = {_normalize_column_token(name) for name in MA20_NORMALIZE_PRIORITY}
+    if normalized in candidate_tokens:
+        return True
+    if normalized in {f"{token}x" for token in candidate_tokens}:
+        return True
+    if normalized in {f"{token}y" for token in candidate_tokens}:
+        return True
+    if "ma20" in normalized:
+        return True
+    if "ma" in normalized and "20" in normalized:
+        return True
+    return False
+
+
+def _build_numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(index=df.index, dtype="float64")
+    return pd.to_numeric(df[column], errors="coerce")
+
+
+def _ma20_candidate_stats(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+
+    stats: List[Dict[str, Any]] = []
+    for column in df.columns:
+        if not _is_ma20_candidate_column(column):
+            continue
+        numeric_series = _build_numeric_series(df, str(column))
+        stats.append(
+            {
+                "column": str(column),
+                "nonnull": int(numeric_series.notna().sum()),
+                "priority": _ma20_candidate_priority(column),
+            }
+        )
+
+    stats.sort(key=lambda item: (-int(item["nonnull"]), int(item["priority"]), str(item["column"])))
+    return stats
+
+
+def _ma20_sample_rows(df: pd.DataFrame, limit: int = 5) -> List[Dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+
+    sample_columns = [column for column in ("code", "ma20", "ma50", "close") if column in df.columns]
+    if not sample_columns:
+        return []
+    return df.loc[:, sample_columns].head(limit).to_dict(orient="records")
+
+
+def log_final30_ma_diagnostics(df: pd.DataFrame, stage: str) -> None:
+    if df is None:
+        logger.info("[DEBUG][MA20_DIAG] stage=%s rows=0 cols=0 has_ma20=0 ma20_null=-1 ma50_null=-1 ma150_null=-1 close_null=-1 volume_avg20_null=-1", stage)
+        logger.info("[DEBUG][MA20_SOURCE_CANDIDATES] stage=%s candidates=[] sample=[]", stage)
+        return
+
+    candidate_stats = _ma20_candidate_stats(df)
+    ma20_null = int(_build_numeric_series(df, "ma20").isna().sum()) if "ma20" in df.columns else -1
+    ma50_null = int(_build_numeric_series(df, "ma50").isna().sum()) if "ma50" in df.columns else -1
+    ma150_null = int(_build_numeric_series(df, "ma150").isna().sum()) if "ma150" in df.columns else -1
+    close_null = int(_build_numeric_series(df, "close").isna().sum()) if "close" in df.columns else -1
+    volume_avg20_null = int(_build_numeric_series(df, "volume_avg20").isna().sum()) if "volume_avg20" in df.columns else -1
+    logger.info(
+        "[DEBUG][MA20_DIAG] stage=%s rows=%s cols=%s has_ma20=%s ma20_null=%s ma50_null=%s ma150_null=%s close_null=%s volume_avg20_null=%s",
+        stage,
+        len(df),
+        len(df.columns),
+        int("ma20" in df.columns),
+        ma20_null,
+        ma50_null,
+        ma150_null,
+        close_null,
+        volume_avg20_null,
+    )
+    logger.info(
+        "[DEBUG][MA20_SOURCE_CANDIDATES] stage=%s candidates=%s sample=%s",
+        stage,
+        candidate_stats,
+        _ma20_sample_rows(df),
+    )
+
+
+def normalize_ma20_column(df: pd.DataFrame, stage: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    normalized = df.copy()
+    candidate_stats = _ma20_candidate_stats(normalized)
+    existing_series = _build_numeric_series(normalized, "ma20") if "ma20" in normalized.columns else pd.Series(index=normalized.index, dtype="float64")
+    existing_nonnull = int(existing_series.notna().sum())
+    if "ma20" in normalized.columns:
+        normalized["ma20"] = existing_series
+
+    fill_candidates = [item for item in candidate_stats if item["column"] != "ma20" and int(item["nonnull"]) > 0]
+    chosen_column = fill_candidates[0]["column"] if fill_candidates else None
+    chosen_nonnull = int(fill_candidates[0]["nonnull"]) if fill_candidates else 0
+
+    if existing_nonnull == 0 and chosen_column is not None and chosen_nonnull > 0:
+        normalized["ma20"] = _build_numeric_series(normalized, chosen_column)
+        logger.warning(
+            "[MA20][RECOVER] stage=%s chosen=%s nonnull=%s rows=%s reason=ma20_all_null",
+            stage,
+            chosen_column,
+            chosen_nonnull,
+            len(normalized),
+        )
+    elif existing_nonnull > 0:
+        total_filled = 0
+        for candidate in fill_candidates:
+            fill_mask = normalized["ma20"].isna()
+            if not bool(fill_mask.any()):
+                break
+            candidate_series = _build_numeric_series(normalized, str(candidate["column"]))
+            before_null = int(fill_mask.sum())
+            normalized.loc[fill_mask, "ma20"] = candidate_series.loc[fill_mask]
+            after_null = int(normalized["ma20"].isna().sum())
+            filled_count = before_null - after_null
+            if filled_count > 0:
+                total_filled += filled_count
+                logger.warning(
+                    "[MA20][RECOVER_FILL] stage=%s chosen=%s filled=%s remaining_null=%s rows=%s",
+                    stage,
+                    candidate["column"],
+                    filled_count,
+                    after_null,
+                    len(normalized),
+                )
+        if total_filled == 0:
+            logger.info(
+                "[MA20][NO_RECOVER] stage=%s has_ma20=1 ma20_nonnull=%s candidates=%s",
+                stage,
+                existing_nonnull,
+                candidate_stats,
+            )
+    else:
+        logger.info(
+            "[MA20][NO_RECOVER] stage=%s has_ma20=%s ma20_nonnull=%s candidates=%s",
+            stage,
+            int("ma20" in normalized.columns),
+            existing_nonnull,
+            candidate_stats,
+        )
+
+    final_nonnull = int(_build_numeric_series(normalized, "ma20").notna().sum()) if "ma20" in normalized.columns else 0
+    if final_nonnull == 0:
+        logger.warning(
+            "[MA20][ALL_NULL] stage=%s rows=%s candidates=%s",
+            stage,
+            len(normalized),
+            candidate_stats,
+        )
+    return normalized
 
 
 def _extract_numeric_from_sources(*sources: Any, aliases: tuple[str, ...], zero_invalid: bool = False) -> float | None:
@@ -1391,6 +1575,10 @@ class WatchlistBuilder:
 
         final30_scored = pd.DataFrame(final30).copy(deep=True)
         log_df_identity(final30_scored, "BUILD")
+        log_final30_ma_diagnostics(final30_scored, "build_raw")
+        final30_scored = normalize_ma20_column(final30_scored, "build_raw")
+        log_final30_ma_diagnostics(final30_scored, "build_normalized")
+        final30 = final30_scored.to_dict(orient="records")
 
         logger.info(
             "[WATCHLIST][STAGE_COUNTS] universe=%d pool120=%d top50=%d final30=%d",
@@ -1452,6 +1640,9 @@ class WatchlistBuilder:
         }
 
         final30_scored = pd.DataFrame(final30).copy(deep=True)
+        log_final30_ma_diagnostics(final30_scored, "before_freeze")
+        final30_scored = normalize_ma20_column(final30_scored, "before_freeze")
+        log_final30_ma_diagnostics(final30_scored, "after_normalize_before_freeze")
         final30_scored = materialize_final30_price_context(final30_scored)
         log_df_identity(final30_scored, "FROZEN")
         logger.info(
@@ -1460,6 +1651,7 @@ class WatchlistBuilder:
             int(final30_scored["ma20"].isna().sum()) if "ma20" in final30_scored.columns else -1,
             list(final30_scored.columns),
         )
+        log_final30_ma_diagnostics(final30_scored, "pre_contract_frozen")
         assert_final30_scored_contract(final30_scored, "frozen", str(as_of), hard=True)
         final30 = final30_scored.to_dict(orient="records")
 
@@ -3501,6 +3693,8 @@ def assert_final30_scored_contract(
         if hard:
             raise ValueError(f"FINAL30_CONTRACT_INVALID_{label}_empty")
         return result
+
+    log_final30_ma_diagnostics(df, f"contract_{label}")
     
     rows = len(df)
     uniq_codes = len(df["code"].unique()) if "code" in df.columns else 0
@@ -3559,6 +3753,21 @@ def assert_final30_scored_contract(
     if result["errors"]:
         result["ok"] = False
         bad_codes = df["code"].unique()[:5].tolist() if "code" in df.columns else []
+        ma20_exists = "ma20" in df.columns
+        ma20_null = int(_build_numeric_series(df, "ma20").isna().sum()) if ma20_exists else -1
+        candidate_stats = _ma20_candidate_stats(df)
+        sample_rows = _ma20_sample_rows(df)
+        logger.error(
+            "[FINAL30][CONTRACT][FAIL][MA20] label=%s rows=%d uniq_code=%d has_ma20=%s ma20_null=%s candidate_columns=%s sample_rows=%s as_of=%s",
+            label,
+            rows,
+            uniq_codes,
+            int(ma20_exists),
+            ma20_null,
+            candidate_stats,
+            sample_rows,
+            as_of,
+        )
         logger.error(
             "[FINAL30][CONTRACT][FAIL] label=%s rows=%d uniq_code=%d errors=%s sample_codes=%s",
             label,
@@ -3587,6 +3796,8 @@ def materialize_final30_price_context(df: pd.DataFrame) -> pd.DataFrame:
         return df
     
     df = df.copy()
+    log_final30_ma_diagnostics(df, "materialize_input")
+    df = normalize_ma20_column(df, "materialize_input")
     
     # Critical price fields that must be materialized
     price_fields = ["close", "ma20", "ma50", "ma150", "atr_pct"]
@@ -3607,6 +3818,19 @@ def materialize_final30_price_context(df: pd.DataFrame) -> pd.DataFrame:
                                 df.loc[idx, "code"] if "code" in df.columns else "?",
                                 field,
                             )
+                    if field == "ma20" and pd.isna(df.loc[idx, field]) and isinstance(meta, dict):
+                        restored_ma20 = _extract_numeric_from_sources(meta, aliases=MA20_ALIAS_FIELDS, zero_invalid=True)
+                        if restored_ma20 is not None:
+                            df.loc[idx, field] = restored_ma20
+                            logger.warning(
+                                "[MATERIALIZE][RESTORED] code=%s field=%s source=meta_alias",
+                                df.loc[idx, "code"] if "code" in df.columns else "?",
+                                field,
+                            )
+
+    log_final30_ma_diagnostics(df, "before_materialize_normalize")
+    df = normalize_ma20_column(df, "before_materialize_normalize")
+    log_final30_ma_diagnostics(df, "after_materialize_normalize")
     
     # Check restoration success
     for field in price_fields:
