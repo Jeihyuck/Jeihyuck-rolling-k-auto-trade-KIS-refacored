@@ -202,7 +202,11 @@ FINAL30_SCORED_ZERO_INVALID_FIELDS = {"ma20", "ma50", "ma150"}
 
 SCORED_WATCHLIST_STRATEGIES = {
     "pb1_watchlist_final_scored",
+}
+INTERMEDIATE_SCORED_STRATEGIES = {
     "pb1_universe_scored",
+    "pb1_pool120",
+    "pb1_top50",
 }
 
 ENTRY_META_SCALAR_KEYS = (
@@ -490,8 +494,18 @@ def save_pb1_watchlist_rows(
     rows: List[Dict[str, Any]],
 ) -> None:
     strategy_n = _norm_strategy(strategy)
-    if strategy_n in SCORED_WATCHLIST_STRATEGIES:
-        _save_pb1_watchlist_rows_scored(
+    if strategy_n == "pb1_watchlist_final_scored":
+        _save_pb1_final30_rows_scored_strict(
+            engine,
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            rows=rows,
+        )
+        return
+    
+    if strategy_n in INTERMEDIATE_SCORED_STRATEGIES:
+        _save_pb1_scored_stage_rows_relaxed(
             engine,
             env=env,
             strategy=strategy,
@@ -560,6 +574,127 @@ def _save_pb1_watchlist_rows_plain(
         as_of_date,
         len(payload),
     )
+
+
+def _save_pb1_scored_stage_rows_relaxed(
+    engine: Engine,
+    *,
+    env: str,
+    strategy: str,
+    as_of: date,
+    rows: List[Dict[str, Any]],
+) -> None:
+    """Save intermediate stage (universe/pool/top50) with relaxed validation."""
+    env_n = _norm_env(env)
+    strategy_n = _norm_strategy(strategy)
+    as_of_date = to_date(as_of)
+
+    if not rows:
+        logger.info(
+            "[STAGE_SAVE][RELAXED] strategy=%s rows=0 skip",
+            strategy_n,
+        )
+        return
+
+    logger.info(
+        "[STAGE_SAVE][RELAXED] strategy=%s rows=%d",
+        strategy_n,
+        len(rows),
+    )
+
+    # Validate basic contract
+    if not all((row or {}).get("code") for row in rows):
+        logger.warning(
+            "[STAGE_SAVE][RELAXED][WARN] strategy=%s has_code_missing=%d",
+            strategy_n,
+            sum(1 for row in rows if not (row or {}).get("code")),
+        )
+
+    # Build payload - permissive approach
+    payload: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        if not (row or {}).get("code"):
+            continue
+        
+        # Use basic scoring fields if available
+        score_val = None
+        for field in ["score_final", "final_score", "score_tech", "tech_score", "score"]:
+            candidate = (row or {}).get(field)
+            if candidate is not None:
+                try:
+                    score_val = float(candidate)
+                    break
+                except Exception:
+                    pass
+        
+        entry = {
+            "env": env_n,
+            "strategy": strategy_n,
+            "as_of": as_of_date,
+            "code": str((row or {}).get("code") or "").zfill(6),
+            "rank": int((row or {}).get("rank", idx)),
+            "score": score_val,
+            "meta": json_sanitize(normalize_final30_contract_row(row or {})),
+        }
+        payload.append(entry)
+
+    if not payload:
+        logger.warning(
+            "[STAGE_SAVE][RELAXED][NO_VALID] strategy=%s",
+            strategy_n,
+        )
+        return
+
+    # Save to DB
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.delete(schema.pb1_watchlist).where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of == as_of_date,
+                )
+            )
+        )
+        conn.execute(sa.insert(schema.pb1_watchlist), payload)
+
+    logger.info(
+        "[WATCHLIST][SAVE] env=%s strategy=%s as_of=%s members=%s",
+        env_n,
+        strategy_n,
+        as_of_date,
+        len(payload),
+    )
+
+    # Verify row count only
+    schema = schema_for_engine(engine)
+    with engine.connect() as conn:
+        count_stmt = (
+            select(func.count())
+            .select_from(schema.pb1_watchlist)
+            .where(
+                and_(
+                    schema.pb1_watchlist.c.env == env_n,
+                    schema.pb1_watchlist.c.strategy == strategy_n,
+                    schema.pb1_watchlist.c.as_of == as_of_date,
+                )
+            )
+        )
+        saved_count = int(conn.execute(count_stmt).scalar() or 0)
+        if saved_count != len(payload):
+            logger.warning(
+                "[STAGE_SAVE][RELAXED][VERIFY_FAIL] strategy=%s expected=%d actual=%d",
+                strategy_n,
+                len(payload),
+                saved_count,
+            )
+        else:
+            logger.info(
+                "[STAGE_SAVE][RELAXED][VERIFY_OK] strategy=%s rows=%d",
+                strategy_n,
+                saved_count,
+            )
 
 
 def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int) -> Dict[str, Any]:
@@ -665,7 +800,7 @@ def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int
     }
 
 
-def _save_pb1_watchlist_rows_scored(
+def _save_pb1_final30_rows_scored_strict(
     engine: Engine,
     *,
     env: str,
@@ -673,9 +808,22 @@ def _save_pb1_watchlist_rows_scored(
     as_of: date,
     rows: List[Dict[str, Any]],
 ) -> None:
+    """Save final30 with strict contract validation."""
     env_n = _norm_env(env)
     strategy_n = _norm_strategy(strategy)
     as_of_date = to_date(as_of)
+
+    # Developer guard: only final30 strategy should call this
+    if strategy_n != "pb1_watchlist_final_scored":
+        raise ValueError(
+            f"DEVELOPER_ERROR_STRICT_FINAL30_SAVER_CALLED_FOR_NONFINAL_STAGE strategy={strategy_n} rows={len(rows)}"
+        )
+    
+    # final30 must have exactly 30 rows
+    if len(rows) != 30:
+        raise ValueError(
+            f"FINAL30_SCORED_CONTRACT_ROWS_MISMATCH strategy={strategy_n} expected=30 actual={len(rows)}"
+        )
 
     if not rows:
         logger.warning("[WATCHLIST][SAVE_SCORED] empty rows -> skip env=%s strategy=%s as_of=%s", env_n, strategy_n, as_of_date)
@@ -732,7 +880,7 @@ def _save_pb1_watchlist_rows_scored(
         if ma20_nulls > 0:
             bad_codes = payload_df.loc[payload_df["ma20"].isna(), "code"].head(10).tolist()
             raise ValueError(
-                f"FINAL30_SCORED_INVALID_BEFORE_DB_INSERT ma20_nulls={ma20_nulls} sample_codes={bad_codes}"
+                f"FINAL30_SCORED_INVALID_BEFORE_DB_INSERT strategy={strategy_n} rows={len(payload_df)} ma20_nulls={ma20_nulls} sample_codes={bad_codes} source=watchlist_result.final30_scored caller=prep.save_final30"
             )
     logger.info("[DEBUG][FINAL30_SCORED][PAYLOAD_SAMPLE] %s", payload_rows[:3])
     src_cols = sorted(source_df.columns.tolist()) if not source_df.empty else []
@@ -849,17 +997,12 @@ def _save_pb1_watchlist_rows_scored(
             and final_score_consistent
         )
         logger.info(
-            "[WATCHLIST][ROUNDTRIP][FINAL30_SCORED] rows=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s nonnull_counts=%s mismatch_counts=%s score_consistent=%s final_score_consistent=%s ok=%s",
-            len(loaded_rows),
+            "[STAGE_SAVE][STRICT_FINAL30] strategy=pb1_watchlist_final_scored rows=30 roundtrip_ok=%s uniq_codes=%s ma20_positive_count=%s score_final_nonnull=%s entry_style_selected_nonnull=%s",
+            int(roundtrip_ok),
             uniq_codes,
             ma20_positive_count,
             score_final_nonnull,
             entry_style_selected_nonnull,
-            nonnull_counts,
-            mismatch_counts,
-            int(score_consistent),
-            int(final_score_consistent),
-            int(roundtrip_ok),
         )
         if not roundtrip_ok:
             logger.warning(

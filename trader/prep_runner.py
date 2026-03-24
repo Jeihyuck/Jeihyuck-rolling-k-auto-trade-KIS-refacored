@@ -1729,6 +1729,20 @@ def main() -> int:
             final30_quality.get("momentum_monoculture"),
             final30_quality.get("score_monoculture"),
         )
+        # Trade gate decision MUST be based only on final30 strict contract
+        trade_gate_reason = ""
+        if not final30_quality_ok:
+            trade_gate_reason = "final30_contract_fail"
+        elif final30_quality_soft_fail:
+            trade_gate_reason = "final30_soft_fail"
+        else:
+            trade_gate_reason = "final30_contract_ok"
+        
+        logger.info(
+            "[PREP][TRADE_GATE] can_proceed=%s reason=%s",
+            int(final30_trade_can_proceed),
+            trade_gate_reason,
+        )
         logger.info(
             "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
             int(len(final30_df)),
@@ -2253,7 +2267,7 @@ def main() -> int:
     # Verify DB saved counts
     watchlist_repo = WatchlistRepo(engine)
     saved_counts = {}
-    for strategy_key in ["pb1_universe_scored", "pb1_pool120", "pb1_top50", "pb1_watchlist_final"]:
+    for strategy_key in ["pb1_universe_scored", "pb1_pool120", "pb1_top50", "pb1_watchlist_final_scored"]:
         try:
             rows, _ = watchlist_repo.load_watchlist(
                 env=env,
@@ -2278,15 +2292,29 @@ def main() -> int:
         saved_counts.get("pb1_universe_scored", -1),
         saved_counts.get("pb1_pool120", -1),
         saved_counts.get("pb1_top50", -1),
-        saved_counts.get("pb1_watchlist_final", -1),
+        saved_counts.get("pb1_watchlist_final_scored", -1),
     )
     
-    # Alert if any saved counts are 0 (data loss indicator)
-    missing_keys = [k for k, v in saved_counts.items() if v == 0]
-    if missing_keys:
+    # Alert if any intermediate stages not saved (separate from final30)
+    intermediate_missing = [k for k, v in saved_counts.items() if v == 0 and k != "pb1_watchlist_final_scored"]
+    if intermediate_missing:
+        logger.warning(
+            "[PREP][INTERMEDIATE_STAGE_SAVE][FAIL] missing_strategies=%s as_of=%s",
+            intermediate_missing,
+            as_of.isoformat(),
+        )
+    
+    # Check final30 saved (this is what matters for trade)
+    final30_saved = saved_counts.get("pb1_watchlist_final_scored", 0)
+    if final30_saved == 0:
         logger.error(
-            "[PREP][BUNDLE][DATA_LOSS_DETECTED] missing_strategies=%s as_of=%s -> CRITICAL: intermediate stages not saved to DB",
-            missing_keys,
+            "[PREP][FINAL30_CONTRACT][FAIL] not_saved as_of=%s",
+            as_of.isoformat(),
+        )
+    else:
+        logger.info(
+            "[PREP][FINAL30_CONTRACT][OK] rows=%d as_of=%s",
+            final30_saved,
             as_of.isoformat(),
         )
 

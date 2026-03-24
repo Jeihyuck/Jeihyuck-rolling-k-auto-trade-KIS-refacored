@@ -1390,12 +1390,7 @@ class WatchlistBuilder:
         self._assert_nonzero_scores(final30, "FINAL30", score_key="score_final")
 
         final30_scored = pd.DataFrame(final30).copy(deep=True)
-        logger.info(
-            "[WATCHLIST][FINAL30_SCORED][FROZEN] rows=%d ma20_null=%d cols=%s",
-            len(final30_scored),
-            int(final30_scored["ma20"].isna().sum()) if "ma20" in final30_scored.columns else -1,
-            list(final30_scored.columns),
-        )
+        log_df_identity(final30_scored, "BUILD")
 
         logger.info(
             "[WATCHLIST][STAGE_COUNTS] universe=%d pool120=%d top50=%d final30=%d",
@@ -1456,6 +1451,18 @@ class WatchlistBuilder:
             "disabled_features": ["flow"] if any("flow" in reason for reason in contract_failures) else [],
         }
 
+        final30_scored = pd.DataFrame(final30).copy(deep=True)
+        final30_scored = materialize_final30_price_context(final30_scored)
+        log_df_identity(final30_scored, "FROZEN")
+        logger.info(
+            "[WATCHLIST][FINAL30_SCORED][FROZEN] rows=%d ma20_null=%d cols=%s",
+            len(final30_scored),
+            int(final30_scored["ma20"].isna().sum()) if "ma20" in final30_scored.columns else -1,
+            list(final30_scored.columns),
+        )
+        assert_final30_scored_contract(final30_scored, "frozen", str(as_of), hard=True)
+        final30 = final30_scored.to_dict(orient="records")
+
         reject_counter = Counter()
         for item in universe_scored:
             for reason in item.get("reject_reasons", []):
@@ -1505,6 +1512,8 @@ class WatchlistBuilder:
             "contract_mode": contract_mode,
         }
 
+        log_df_identity(final30_scored, "RETURN")
+        assert_final30_scored_contract(final30_scored, "return", str(as_of), hard=True)
         logger.info(
             "[WATCHLIST][BUILD][DONE] as_of=%s pool120=%s top50=%s final30=%s",
             as_of,
@@ -3441,6 +3450,178 @@ class WatchlistBuilder:
         return compute_atr_pct_from_ohlcv(df, period=period)
 
 
+def log_df_identity(df: pd.DataFrame, label: str) -> None:
+    """Log DataFrame object identity and contract info."""
+    if df is None or df.empty:
+        logger.info("[DEBUG][OBJ][FINAL30_SCORED][%s] rows=0", label)
+        return
+    
+    cols_sorted = sorted(df.columns.tolist())
+    cols_hash = hash(tuple(cols_sorted))
+    
+    ma20_null = int(df["ma20"].isna().sum()) if "ma20" in df.columns else -1
+    ma50_null = int(df["ma50"].isna().sum()) if "ma50" in df.columns else -1
+    close_null = int(df["close"].isna().sum()) if "close" in df.columns else -1
+    
+    logger.info(
+        "[DEBUG][OBJ][FINAL30_SCORED][%s] id=%s rows=%d ma20_null=%d ma50_null=%d close_null=%d cols_hash=%d",
+        label,
+        id(df),
+        len(df),
+        ma20_null,
+        ma50_null,
+        close_null,
+        cols_hash,
+    )
+
+
+def assert_final30_scored_contract(
+    df: pd.DataFrame,
+    label: str,
+    as_of: str,
+    hard: bool = True,
+) -> dict[str, Any]:
+    """Validate final30_scored contract. Raises on hard failure, warns on soft."""
+    result = {
+        "label": label,
+        "ok": True,
+        "rows": len(df) if df is not None else 0,
+        "uniq_code": 0,
+        "errors": [],
+        "warnings": [],
+    }
+    
+    if df is None or df.empty:
+        result["ok"] = False
+        result["errors"].append("EMPTY_DATAFRAME")
+        logger.error(
+            "[FINAL30][CONTRACT][FAIL] label=%s rows=0 reason=empty",
+            label,
+        )
+        if hard:
+            raise ValueError(f"FINAL30_CONTRACT_INVALID_{label}_empty")
+        return result
+    
+    rows = len(df)
+    uniq_codes = len(df["code"].unique()) if "code" in df.columns else 0
+    result["rows"] = rows
+    result["uniq_code"] = uniq_codes
+    
+    # Check row count
+    if rows != 30:
+        result["ok"] = False
+        result["errors"].append(f"ROWS_MISMATCH expected=30 actual={rows}")
+    
+    # Check unique codes
+    if uniq_codes != 30:
+        result["ok"] = False
+        result["errors"].append(f"UNIQ_CODE_MISMATCH expected=30 actual={uniq_codes}")
+    
+    # Check critical fields
+    critical_fields = [
+        "code",
+        "close",
+        "ma20",
+        "ma50",
+        "ma150",
+        "atr_pct",
+        "score_final",
+        "tech_score",
+        "breakout_score",
+        "pullback_score",
+        "momentum_score",
+        "rs_percentile",
+        "vcp_score",
+        "entry_style_selected",
+    ]
+    
+    field_nulls = {}
+    for field in critical_fields:
+        if field in df.columns:
+            null_count = int(df[field].isna().sum())
+            field_nulls[field] = null_count
+            if null_count > 0:
+                result["errors"].append(f"{field}_null count={null_count}")
+    
+    result["field_nulls"] = field_nulls
+    
+    # Check entry_style validity
+    if "entry_style_selected" in df.columns:
+        valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+        invalid_count = sum(
+            1 for v in df["entry_style_selected"] 
+            if pd.notna(v) and str(v).upper() not in valid_styles
+        )
+        if invalid_count > 0:
+            result["errors"].append(f"entry_style_invalid count={invalid_count}")
+    
+    # Overall result
+    if result["errors"]:
+        result["ok"] = False
+        bad_codes = df["code"].unique()[:5].tolist() if "code" in df.columns else []
+        logger.error(
+            "[FINAL30][CONTRACT][FAIL] label=%s rows=%d uniq_code=%d errors=%s sample_codes=%s",
+            label,
+            rows,
+            uniq_codes,
+            result["errors"],
+            bad_codes,
+        )
+        if hard:
+            raise ValueError(f"FINAL30_CONTRACT_INVALID_{label} errors={','.join(result['errors'][:3])}")
+    else:
+        logger.info(
+            "[FINAL30][CONTRACT][CHECK] label=%s rows=%d uniq_code=%d ok=1 field_nulls=%s",
+            label,
+            rows,
+            uniq_codes,
+            field_nulls,
+        )
+    
+    return result
+
+
+def materialize_final30_price_context(df: pd.DataFrame) -> pd.DataFrame:
+    """Materialize critical price fields from meta or aliases."""
+    if df is None or df.empty:
+        return df
+    
+    df = df.copy()
+    
+    # Critical price fields that must be materialized
+    price_fields = ["close", "ma20", "ma50", "ma150", "atr_pct"]
+    
+    for field in price_fields:
+        if field in df.columns and df[field].isna().sum() > 0:
+            # Try to restore from meta
+            null_indices = df[df[field].isna()].index
+            for idx in null_indices:
+                if pd.isna(df.loc[idx, field]):
+                    meta = df.loc[idx, "meta"] if "meta" in df.columns else {}
+                    if isinstance(meta, dict) and field in meta:
+                        restored_val = _safe_nullable_float(meta.get(field))
+                        if restored_val is not None:
+                            df.loc[idx, field] = restored_val
+                            logger.debug(
+                                "[MATERIALIZE][RESTORED] code=%s field=%s source=meta",
+                                df.loc[idx, "code"] if "code" in df.columns else "?",
+                                field,
+                            )
+    
+    # Check restoration success
+    for field in price_fields:
+        if field in df.columns:
+            still_null = int(df[field].isna().sum())
+            if still_null > 0:
+                logger.warning(
+                    "[MATERIALIZE][FAIL] field=%s still_null=%d",
+                    field,
+                    still_null,
+                )
+    
+    return df
+
+
 def save_bundle(
     *,
     engine: Engine,
@@ -3629,90 +3810,152 @@ def save_bundle(
         )
         if len(style_counts) == 1 and len(final30_scored_rows) > 1:
             logger.warning("[ENTRY_STYLE][ANOMALY][MONOCULTURE] counts=%s", style_counts)
-    final30_cols = set(pd.DataFrame(final30_scored_rows).columns.tolist()) if final30_scored_rows else set()
-    universe_cols = set(pd.DataFrame(universe_scored_rows).columns.tolist()) if universe_scored_rows else set()
-    logger.info(
-        "[WATCHLIST][SCHEMA_DIFF] lhs=universe_scored rhs=final30_scored missing=%s",
-        sorted(final30_cols - universe_cols),
-    )
-    
     # 1. universe_scored - FULL universe (should be 196, not 120)
     # Note: In current architecture, this is actually candidate_pool-based (120)
     # TODO: Refactor to use broader universe (196+) as true "universe_scored"
+    intermediate_stage_errors = []
     if universe_scored_rows:
         _log_stage_fields("universe_scored", universe_scored_rows)
         logger.info(
             "[WATCHLIST][SAVE_SCOPE] pb1_universe_scored_source=universe_filtered_from_raw120 rows=%s",
             len(universe_scored_rows),
         )
-        repo.save_watchlist(
-            env=env,
-            strategy="pb1_universe_scored",
-            as_of=as_of,
-            members=universe_scored_rows,
-        )
-        verified_result = repo.load_watchlist_scored(
-            env=env,
-            strategy="pb1_universe_scored",
-            as_of=as_of,
-            allow_latest_fallback=False,
-        )
-        if isinstance(verified_result, tuple) and len(verified_result) == 2:
-            verified_rows, _ = verified_result
-        else:
-            verified_rows = []
-        verified_df = pd.DataFrame(verified_rows or [])
-        logger.info("[BUNDLE][SAVE] pb1_universe_scored n=%s", len(universe_scored_rows))
-        logger.info(
-            "[WATCHLIST][SAVE_VERIFY][UNIVERSE_SCORED] rows=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_percentile=%s has_entry_style_selected=%s",
-            len(verified_rows),
-            int("breakout_score" in verified_df.columns),
-            int("pullback_score" in verified_df.columns),
-            int("momentum_score" in verified_df.columns),
-            int("rs_percentile" in verified_df.columns),
-            int("entry_style_selected" in verified_df.columns),
-        )
+        try:
+            repo.save_watchlist(
+                env=env,
+                strategy="pb1_universe_scored",
+                as_of=as_of,
+                members=universe_scored_rows,
+            )
+            verified_result = repo.load_watchlist_scored(
+                env=env,
+                strategy="pb1_universe_scored",
+                as_of=as_of,
+                allow_latest_fallback=False,
+            )
+            if isinstance(verified_result, tuple) and len(verified_result) == 2:
+                verified_rows, _ = verified_result
+            else:
+                verified_rows = []
+            verified_df = pd.DataFrame(verified_rows or [])
+            logger.info("[BUNDLE][SAVE] pb1_universe_scored n=%s", len(universe_scored_rows))
+            logger.info(
+                "[WATCHLIST][SAVE_VERIFY][UNIVERSE_SCORED] rows=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s has_rs_percentile=%s has_entry_style_selected=%s",
+                len(verified_rows),
+                int("breakout_score" in verified_df.columns),
+                int("pullback_score" in verified_df.columns),
+                int("momentum_score" in verified_df.columns),
+                int("rs_percentile" in verified_df.columns),
+                int("entry_style_selected" in verified_df.columns),
+            )
+        except Exception as e:
+            error_msg = f"universe_scored save failed: {str(e)}"
+            intermediate_stage_errors.append(error_msg)
+            logger.warning(
+                "[PREP][INTERMEDIATE_STAGE_SAVE][FAIL] strategy=pb1_universe_scored error=%s",
+                error_msg,
+            )
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_universe_scored empty")
     
     # 2. pool120 - NOW SAVED (not skipped)
     if bundle.pool120:
         _log_stage_fields("pool120", pool120_rows)
-        repo.save_watchlist(
-            env=env,
-            strategy="pb1_pool120",
-            as_of=as_of,
-            members=pool120_rows,
-        )
-        logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(pool120_rows))
+        try:
+            repo.save_watchlist(
+                env=env,
+                strategy="pb1_pool120",
+                as_of=as_of,
+                members=pool120_rows,
+            )
+            logger.info("[BUNDLE][SAVE] pb1_pool120 n=%s", len(pool120_rows))
+        except Exception as e:
+            error_msg = f"pool120 save failed: {str(e)}"
+            intermediate_stage_errors.append(error_msg)
+            logger.warning(
+                "[PREP][INTERMEDIATE_STAGE_SAVE][FAIL] strategy=pb1_pool120 error=%s",
+                error_msg,
+            )
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_pool120 empty")
     
     # 3. top50 저장
     if bundle.top50:
         _log_stage_fields("top50", top50_rows)
-        repo.save_watchlist(
-            env=env,
-            strategy="pb1_top50",
-            as_of=as_of,
-            members=top50_rows,
-        )
-        logger.info("[BUNDLE][SAVE] pb1_top50 n=%s", len(top50_rows))
+        try:
+            repo.save_watchlist(
+                env=env,
+                strategy="pb1_top50",
+                as_of=as_of,
+                members=top50_rows,
+            )
+            logger.info("[BUNDLE][SAVE] pb1_top50 n=%s", len(top50_rows))
+        except Exception as e:
+            error_msg = f"top50 save failed: {str(e)}"
+            intermediate_stage_errors.append(error_msg)
+            logger.warning(
+                "[PREP][INTERMEDIATE_STAGE_SAVE][FAIL] strategy=pb1_top50 error=%s",
+                error_msg,
+            )
     else:
         logger.warning("[BUNDLE][SAVE][SKIP] pb1_top50 empty")
     
-    # 4. final30 저장
+    # 4. final30 저장 with strict contract
     if bundle.final30:
         _log_stage_fields("final30", final30_scored_rows)
-        repo.save_watchlist(
-            env=env,
-            strategy="pb1_watchlist_final",
-            as_of=as_of,
-            members=final30_scored_rows,
-        )
-        logger.info("[BUNDLE][SAVE] pb1_watchlist_final n=%s", len(final30_scored_rows))
+
+        try:
+            repo.save_watchlist(
+                env=env,
+                strategy="pb1_watchlist_final",
+                as_of=as_of,
+                members=final30_scored_rows,
+            )
+            logger.info("[BUNDLE][SAVE] pb1_watchlist_final n=%s", len(final30_scored_rows))
+        except Exception as e:
+            logger.warning(
+                "[PREP][INTERMEDIATE_STAGE_SAVE][FAIL] strategy=pb1_watchlist_final error=%s",
+                str(e),
+            )
+        
+        # Convert to DataFrame for integrity checking
+        final30_df = pd.DataFrame(final30_scored_rows) if final30_scored_rows else pd.DataFrame()
+        
+        # Log object identity before materialization
+        log_df_identity(final30_df, "before_materialize")
+        
+        # Materialize price context from meta if needed
+        if not final30_df.empty:
+            final30_df = materialize_final30_price_context(final30_df)
+            log_df_identity(final30_df, "after_materialize")
+        
+        # Assert contract before save
+        final30_strict_ready = True
+        try:
+            assert_final30_scored_contract(final30_df, "frozen", str(as_of), hard=True)
+            log_df_identity(final30_df, "after_assert")
+        except Exception as e:
+            final30_strict_ready = False
+            logger.error("[PREP][FINAL30_CONTRACT][FAIL] as_of=%s reason=%s", as_of, e)
+        
+        # Convert back to dict list for save
+        final30_scored_rows = final30_df.to_dict(orient="records") if not final30_df.empty else []
+        
+        # Save with strict contract
+        if final30_strict_ready:
+            try:
+                repo.save_watchlist(
+                    env=env,
+                    strategy="pb1_watchlist_final_scored",
+                    as_of=as_of,
+                    members=final30_scored_rows,
+                )
+                logger.info("[STAGE_SAVE][STRICT_FINAL30] strategy=pb1_watchlist_final_scored rows=%d", len(final30_scored_rows))
+                logger.info("[PREP][FINAL30_CONTRACT][OK] as_of=%s rows=%d", as_of, len(final30_scored_rows))
+            except Exception as e:
+                logger.error("[PREP][FINAL30_CONTRACT][FAIL] as_of=%s reason=%s", as_of, e)
     else:
-        logger.warning("[BUNDLE][SAVE][SKIP] pb1_watchlist_final empty")
+        logger.warning("[BUNDLE][SAVE][SKIP] pb1_watchlist_final_scored empty")
     
     logger.info("[BUNDLE][SAVE][DONE] env=%s as_of=%s", env, as_of)
 
@@ -4151,12 +4394,15 @@ def build_and_save_watchlist(
                 if return_bundle:
                     final30_scored_rows = [dict(row) for row in (existing or [])]
                     final30_scored_df = pd.DataFrame(final30_scored_rows).copy(deep=True)
+                    final30_scored_df = materialize_final30_price_context(final30_scored_df)
+                    log_df_identity(final30_scored_df, "FROZEN")
                     logger.info(
                         "[WATCHLIST][FINAL30_SCORED][FROZEN] rows=%d ma20_null=%d cols=%s",
                         len(final30_scored_df),
                         int(final30_scored_df["ma20"].isna().sum()) if "ma20" in final30_scored_df.columns else -1,
                         list(final30_scored_df.columns),
                     )
+                    assert_final30_scored_contract(final30_scored_df, "frozen", str(as_of), hard=True)
                     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
                     _log_final30_scored_df_ready(final30_scored_df)
                     final30_saved_rows = _build_final30_saved_rows(existing or [])
@@ -4171,6 +4417,8 @@ def build_and_save_watchlist(
                         len(final30_scored_rows),
                         int(len(final30_scored_rows) > 0),
                     )
+                    log_df_identity(final30_scored_df, "RETURN")
+                    assert_final30_scored_contract(final30_scored_df, "return", str(as_of), hard=True)
                     _log_final30_scored_rows("[WATCHLIST][RETURN][FINAL30_SCORED]", final30_scored_rows)
                     degrade_reason = "cache_bundle_stage_recovered" if bundle_recovered else "cache_bundle_stage_missing"
                     result = {
@@ -4301,6 +4549,9 @@ def build_and_save_watchlist(
     if final30_scored_source is None:
         raise RuntimeError("FINAL30_SCORED_BUILD_BUNDLE_MISSING")
     final30_scored_df = pd.DataFrame(watchlist or []).copy(deep=True)
+    final30_scored_df = materialize_final30_price_context(final30_scored_df)
+    log_df_identity(final30_scored_df, "SAVE_INPUT")
+    assert_final30_scored_contract(final30_scored_df, "save_input", str(as_of), hard=True)
     final30_scored_rows = final30_scored_df.to_dict(orient="records")
     bundle_final30_scored_before_save = final30_scored_df.copy(deep=True)
     _log_final30_scored_df_ready(final30_scored_df)
@@ -4326,6 +4577,8 @@ def build_and_save_watchlist(
             len(final30_scored_rows),
             int(len(final30_scored_rows) > 0),
         )
+        log_df_identity(final30_scored_df, "RETURN")
+        assert_final30_scored_contract(final30_scored_df, "return", str(as_of), hard=True)
         _log_final30_scored_rows("[WATCHLIST][RETURN][FINAL30_SCORED]", final30_scored_rows)
     
     # CRITICAL: Always save bundle (4 stages) to prevent data loss
