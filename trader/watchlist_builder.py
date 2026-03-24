@@ -182,6 +182,23 @@ def _log_final30_scored_df_ready(final30_scored_df: pd.DataFrame) -> None:
     )
 
 
+def _as_dataframe(value: Any) -> pd.DataFrame:
+    if value is None:
+        return pd.DataFrame()
+    if isinstance(value, pd.DataFrame):
+        return value
+    if isinstance(value, list):
+        return pd.DataFrame(value)
+    if isinstance(value, tuple):
+        return pd.DataFrame(list(value))
+    if isinstance(value, dict):
+        return pd.DataFrame([value])
+    try:
+        return pd.DataFrame(value)
+    except Exception:
+        return pd.DataFrame()
+
+
 def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df
