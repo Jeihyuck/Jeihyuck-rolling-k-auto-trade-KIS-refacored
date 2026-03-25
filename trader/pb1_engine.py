@@ -6020,7 +6020,7 @@ class PB1Engine:
                 "tp2_done": 0,
                 "trail_mode": TRAIL_MODE,
                 "last_trail_stop": cf.features.get("stop_price"),
-                "regime_at_entry": (self._regime or {}).get("regime"),
+                    "regime_at_entry": (getattr(self, "_regime", None) or {}).get("regime"),
                 "risk_mult_at_entry": getattr(self, "_regime_risk_mult", None),
                 **self._entry_meta_position_fields(fill_meta),
             }
