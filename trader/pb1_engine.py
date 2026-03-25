@@ -296,6 +296,14 @@ class ExitEvaluation:
     secondary_reasons: list[str] = field(default_factory=list)
 
 
+@dataclass
+class UnifiedGateDecision:
+    ok: bool
+    reason_codes: list[str]
+    blocking_stage: str
+    context: dict[str, Any]
+
+
 def _minervini_ohlcv_days() -> int:
     base = 200 + MA200_SLOPE_LOOKBACK + 60
     need_days = max(MINERVINI_OHLCV_DAYS_MIN, base)
@@ -2410,6 +2418,206 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", cf.code)
 
+    @staticmethod
+    def _is_retryable_entry_order_status(status: Any) -> bool:
+        return str(status or "").upper() in {"", "CREATED", "INTENT", "ERROR", "REJECTED", "CANCELLED", "SKIP"}
+
+    @staticmethod
+    def _is_open_entry_order_status(status: Any) -> bool:
+        return str(status or "").upper() in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED"}
+
+    def _build_unified_gate_context(
+        self,
+        *,
+        code: str,
+        qty: int,
+        gate_snapshot: dict[str, Any] | None,
+        open_order_exists: bool,
+        duplicate_intent_exists: bool,
+        duplicate_intent_status: str | None,
+        blocking_duplicate_exists: bool,
+    ) -> dict[str, Any]:
+        snapshot = dict(gate_snapshot or {})
+        return {
+            "code": str(code or "").zfill(6),
+            "dry_run": bool(self.dry_run),
+            "intended_live": bool(self.intended_live),
+            "order_allowed": bool(self.order_allowed),
+            "qty": int(qty or 0),
+            "holding_qty": int(snapshot.get("holding_qty") or 0),
+            "today_buy_exists": bool(snapshot.get("today_buy_exists")),
+            "today_submit_exists": bool(snapshot.get("today_submit_exists")),
+            "today_fill_exists": bool(snapshot.get("today_fill_exists")),
+            "open_order_exists": bool(open_order_exists or snapshot.get("open_order_exists")),
+            "cooldown_active": bool(snapshot.get("cooldown_active")),
+            "duplicate_intent_exists": bool(duplicate_intent_exists),
+            "duplicate_intent_status": str(duplicate_intent_status or ""),
+            "blocking_duplicate_exists": bool(blocking_duplicate_exists),
+            "last_buy_event_at": snapshot.get("last_buy_event_at"),
+            "last_fill_event_at": snapshot.get("last_fill_event_at"),
+            "last_order_submit_at": snapshot.get("last_order_submit_at"),
+            "phase": self.phase_name,
+            "window": self.window_internal,
+            "trade_date": self._today,
+        }
+
+    def _evaluate_unified_buyable_gate(
+        self,
+        *,
+        code: str,
+        gate_context: dict[str, Any],
+        allow_add_to_existing: bool,
+    ) -> UnifiedGateDecision:
+        reason_codes: list[str] = []
+        if not allow_add_to_existing and int(gate_context.get("holding_qty") or 0) > 0:
+            reason_codes.append("BUYABLE_EXISTING_HOLDING")
+        if bool(gate_context.get("open_order_exists")):
+            reason_codes.append("BUYABLE_OPEN_ORDER")
+        if bool(gate_context.get("today_buy_exists")):
+            reason_codes.append("BUYABLE_TODAY_BUY_EXISTS")
+        if bool(gate_context.get("cooldown_active")):
+            reason_codes.append("BUYABLE_COOLDOWN")
+        if bool(gate_context.get("blocking_duplicate_exists")):
+            reason_codes.append("BUYABLE_DUPLICATE")
+        ok = not reason_codes
+        return UnifiedGateDecision(
+            ok=ok,
+            reason_codes=reason_codes or ["ok"],
+            blocking_stage="shared",
+            context=gate_context,
+        )
+
+    def _log_buyable_gate_unified(self, *, code: str, decision: UnifiedGateDecision) -> None:
+        display_code = self._display_code(code)
+        logger.info(
+            "[PB1][BUYABLE_GATE][UNIFIED] code=%s ok=%s reasons=%s",
+            display_code,
+            int(bool(decision.ok)),
+            decision.reason_codes,
+        )
+        logger.info(
+            "[PB1][BUYABLE_GATE][CTX] code=%s holding_qty=%s today_submit_exists=%s today_fill_exists=%s open_order_exists=%s cooldown_active=%s duplicate_intent_exists=%s last_order_submit_at=%s",
+            display_code,
+            decision.context.get("holding_qty", 0),
+            int(bool(decision.context.get("today_submit_exists"))),
+            int(bool(decision.context.get("today_fill_exists"))),
+            int(bool(decision.context.get("open_order_exists"))),
+            int(bool(decision.context.get("cooldown_active"))),
+            int(bool(decision.context.get("duplicate_intent_exists"))),
+            decision.context.get("last_order_submit_at"),
+        )
+
+    def _resolve_entry_pre_submit(
+        self,
+        *,
+        cf: CandidateFeature,
+        stage: str,
+        order_price: float,
+        order_type: str,
+        allow_add_to_existing: bool = False,
+    ) -> UnifiedGateDecision:
+        gate_snapshot = getattr(self, "_buyable_gate_context", {}).get(str(cf.code or "").zfill(6), {}) if hasattr(self, "_buyable_gate_context") else {}
+        existing_order = None
+        if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
+            existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
+        existing_status = str((existing_order or {}).get("status") or "").upper()
+        open_order_exists = bool(gate_snapshot.get("open_order_exists")) or self._is_open_entry_order_status(existing_status)
+        duplicate_intent_exists = bool(existing_order)
+        blocking_duplicate_exists = bool(open_order_exists)
+        gate_context = self._build_unified_gate_context(
+            code=cf.code,
+            qty=int(cf.planned_qty or 0),
+            gate_snapshot=gate_snapshot,
+            open_order_exists=open_order_exists,
+            duplicate_intent_exists=duplicate_intent_exists,
+            duplicate_intent_status=existing_status,
+            blocking_duplicate_exists=blocking_duplicate_exists,
+        )
+        shared_decision = self._evaluate_unified_buyable_gate(
+            code=cf.code,
+            gate_context=gate_context,
+            allow_add_to_existing=allow_add_to_existing,
+        )
+        buyable_ok = bool(getattr(cf, "features", {}).get("buyable_ok", False))
+        matched = int((not buyable_ok and not shared_decision.ok) or (buyable_ok == shared_decision.ok))
+        logger.info(
+            "[ORDER][PRE_SUBMIT][UNIFIED_MATCH] code=%s buyable_ok=%s submit_ok=%s matched=%s",
+            self._display_code(cf.code),
+            int(bool(buyable_ok)),
+            int(bool(shared_decision.ok)),
+            matched,
+        )
+        logger.info(
+            "[ORDER][PRE_SUBMIT][CTX] code=%s dry_run=%s intended_live=%s order_allowed=%s qty=%s holding_qty=%s today_submit_exists=%s today_fill_exists=%s open_order_exists=%s cooldown_active=%s duplicate_intent_exists=%s",
+            self._display_code(cf.code),
+            int(bool(gate_context.get("dry_run"))),
+            int(bool(gate_context.get("intended_live"))),
+            int(bool(gate_context.get("order_allowed"))),
+            gate_context.get("qty", 0),
+            gate_context.get("holding_qty", 0),
+            int(bool(gate_context.get("today_submit_exists"))),
+            int(bool(gate_context.get("today_fill_exists"))),
+            int(bool(gate_context.get("open_order_exists"))),
+            int(bool(gate_context.get("cooldown_active"))),
+            int(bool(gate_context.get("duplicate_intent_exists"))),
+        )
+        reason_codes = [] if shared_decision.ok else list(shared_decision.reason_codes)
+        if not reason_codes:
+            if int(cf.planned_qty or 0) <= 0:
+                reason_codes.append("API_PAYLOAD_INVALID_QTY")
+            if order_price <= 0:
+                reason_codes.append("API_PAYLOAD_INVALID_PRICE")
+        gate_reasons = self._order_precheck_gate_reasons(side="BUY", stage=stage)
+        for reason in gate_reasons:
+            mapped = "LIVE_GATE_BLOCKED" if reason == "live_gate_blocked" else f"PRECHECK_{str(reason).upper()}"
+            if mapped not in reason_codes:
+                reason_codes.append(mapped)
+        ok = not reason_codes
+        logger.info(
+            "[ORDER][PRE_SUBMIT][CHECK] code=%s ok=%s reasons=%s",
+            self._display_code(cf.code),
+            int(bool(ok)),
+            reason_codes or ["ok"],
+        )
+        return UnifiedGateDecision(
+            ok=ok,
+            reason_codes=reason_codes or ["ok"],
+            blocking_stage="shared" if not gate_reasons else "submit",
+            context=gate_context,
+        )
+
+    def _log_final_skip(self, *, cf: CandidateFeature, reason_code: str, reason_detail: str, stage: str, price: float) -> None:
+        logger.info(
+            "[ORDER][FINAL_SKIP] code=%s reason_code=%s reason_detail=%s",
+            self._display_code(cf.code),
+            reason_code,
+            reason_detail,
+        )
+        self._append_ledger_event(
+            event_type="ORDER_SKIP",
+            code=cf.code,
+            market=cf.market,
+            mode=cf.mode,
+            side="BUY",
+            qty=cf.planned_qty,
+            price=price,
+            client_order_key=cf.client_order_key,
+            ok=False,
+            reasons=[reason_code],
+            stage=stage,
+            payload_json={"reason_detail": reason_detail, "features": cf.features},
+        )
+
+    def _next_retry_client_order_key(self, client_order_key: str) -> str:
+        if not client_order_key:
+            return client_order_key
+        suffix = 1
+        candidate = client_order_key
+        while hasattr(self.orders_repo, "has_client_order_key") and self.orders_repo.has_client_order_key(self.env, candidate):
+            suffix += 1
+            candidate = f"{client_order_key}:retry{suffix}"
+        return candidate
+
     def _safe_score(self, cf: CandidateFeature) -> float:
         score_val = (
             getattr(cf, "score", None)
@@ -2742,6 +2950,9 @@ class PB1Engine:
             snapshot = {
                 "holding_qty": int(pos.get("qty") or 0),
                 "today_buy_exists": bool(today_buy_events),
+                "today_submit_exists": bool(recent_order_events),
+                "today_fill_exists": bool(recent_fill_events),
+                "open_order_exists": False,
                 "cooldown_active": cooldown_active,
                 "today_buy_events": today_buy_events,
                 "cooldown_events": cooldown_events,
@@ -3373,6 +3584,51 @@ class PB1Engine:
         logger.info("[PB1][OHLCV][WINDOW] code=%s days=%d rows=%d hi_52w_full=%d fallback_120d=%d purpose=%s",
                     code, count, len(df_norm), has_full_52w, has_fallback, purpose or "universe")
         return df_norm, meta
+
+    def _fetch_exit_ohlcv(self, code: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+        result = None
+        try:
+            result = self.ohlcv_provider.get_ohlcv(
+                code,
+                200,
+                purpose="exit",
+                usage_context="trade",
+                allow_long_fetch=True,
+            )
+        except Exception:
+            logger.exception("[EXIT][OHLCV][FAIL] code=%s days=200", self._display_code(code))
+        df = pd.DataFrame()
+        meta: dict[str, Any] = {}
+        if result and result.df is not None and not result.df.empty:
+            df = result.df.sort_values("date")
+            meta = dict(result.meta or {})
+        if len(df) < 50:
+            try:
+                fallback = self.ohlcv_provider.get_ohlcv(
+                    code,
+                    60,
+                    purpose="exit",
+                    usage_context="trade",
+                    allow_long_fetch=True,
+                )
+                if fallback and fallback.df is not None and len(fallback.df) > len(df):
+                    df = fallback.df.sort_values("date")
+                    meta = dict(fallback.meta or {})
+            except Exception:
+                logger.exception("[EXIT][OHLCV][FAIL] code=%s days=60", self._display_code(code))
+        logger.info(
+            "[EXIT][OHLCV][SOURCE] code=%s source=%s rows=%s",
+            self._display_code(code),
+            str(meta.get("source") or "none"),
+            len(df),
+        )
+        if len(df) < 50:
+            logger.info(
+                "[EXIT][MA_CTX][DEGRADED] code=%s reason=insufficient_history rows=%s",
+                self._display_code(code),
+                len(df),
+            )
+        return df, meta
 
     def _compute_candidates(self, members: Iterable[dict]) -> List[CandidateFeature]:
         # ✅ 타이머 및 시간 예산 설정
@@ -5284,11 +5540,18 @@ class PB1Engine:
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
         display_code = self._display_code(cf.code)
+        decision_reason = str(
+            cf.features.get("entry_reason")
+            or cf.features.get("entry_decision_family")
+            or cf.features.get("entry_style_selected")
+            or ReasonCode.ENTRY_BREAKOUT
+        )
         logger.info(
-            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f no_trade=%s",
+            "[TRADE][DECISION][BUY] code=%s name=%s family=%s decision_reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f no_trade=%s",
             display_code,
             self._code_name_map.get(cf.code),
-            ReasonCode.ENTRY_BREAKOUT,
+            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            decision_reason,
             float(cf.features.get("score") or 0.0),
             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
             float(cf.features.get("stop_price") or 0.0),
@@ -5357,8 +5620,10 @@ class PB1Engine:
             ]
         }
         logger.info(
-            "[PB1][ENTRY][WHY] code=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
+            "[PB1][ENTRY][WHY] code=%s selected_family=%s trigger_policy=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
             display_code,
+            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            cf.features.get("entry_trigger_policy") or "NONE",
             reasons,
             ", ".join(reasons),
             features_snapshot,
@@ -5380,8 +5645,41 @@ class PB1Engine:
             limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
             order_type = "LIMIT"
         record_price = float(limit_price or entry_price or 0.0)
+        pre_submit = self._resolve_entry_pre_submit(
+            cf=cf,
+            stage="PB1-CLOSE",
+            order_price=record_price,
+            order_type=order_type,
+            allow_add_to_existing=False,
+        )
+        if not pre_submit.ok:
+            final_reason = next((reason for reason in pre_submit.reason_codes if reason != "ok"), "PRE_SUBMIT_BLOCKED")
+            self._log_final_skip(
+                cf=cf,
+                reason_code=final_reason,
+                reason_detail=",".join(pre_submit.reason_codes),
+                stage="PB1-CLOSE",
+                price=record_price,
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = final_reason
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
+            return status
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=record_price)
         request_payload = {"features": cf.features, "reasons": cf.reasons, "entry_meta": entry_meta}
+        effective_client_order_key = cf.client_order_key or ""
+        existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
+        existing_status = str((existing_order or {}).get("status") or "").upper()
+        if existing_order and self._is_retryable_entry_order_status(existing_status):
+            effective_client_order_key = self._next_retry_client_order_key(effective_client_order_key)
+            logger.info(
+                "[ORDER][PRE_SUBMIT][RETRY_KEY] code=%s old_key=%s new_key=%s prior_status=%s",
+                display_code,
+                cf.client_order_key,
+                effective_client_order_key,
+                existing_status,
+            )
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -5396,7 +5694,7 @@ class PB1Engine:
                 qty=cf.planned_qty,
                 limit_price=limit_price,
                 stage="PB1-CLOSE",
-                client_order_key=cf.client_order_key or "",
+                client_order_key=effective_client_order_key,
                 request_json=request_payload,
                 status="CREATED",
                 entry_meta_json=entry_meta,
@@ -5420,35 +5718,28 @@ class PB1Engine:
                         "qty": cf.planned_qty,
                         "limit_price": limit_price,
                         "stage": "PB1-CLOSE",
-                        "client_order_key": cf.client_order_key,
+                        "client_order_key": effective_client_order_key,
                         "request_json": request_payload,
                     },
                 )
-                order_id = cf.client_order_key or "DB_FAIL"
+                order_id = effective_client_order_key or "DB_FAIL"
                 created = True
             else:
                 raise
         if not created:
-            try:
-                self._append_ledger_event(
-                    event_type="ORDER_SKIP",
-                    code=cf.code,
-                    market=cf.market,
-                    mode=cf.mode,
-                    side="BUY",
-                    qty=cf.planned_qty,
-                    price=record_price,
-                    client_order_key=cf.client_order_key,
-                    ok=False,
-                    reasons=["duplicate_order"],
-                    stage="PB1-CLOSE",
-                )
-            except Exception:
-                logger.exception("[PB1][LEDGER][SKIP_FAIL] code=%s", display_code)
-            status["skipped_reason"] = "duplicate_order"
+            self._log_final_skip(
+                cf=cf,
+                reason_code="DUPLICATE_ORDER_EXISTS",
+                reason_detail=f"client_order_key={effective_client_order_key}",
+                stage="PB1-CLOSE",
+                price=record_price,
+            )
+            status["skipped_reason"] = "DUPLICATE_ORDER_EXISTS"
             status["skipped"] = 1
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
+        cf.client_order_key = effective_client_order_key
         if not hasattr(self, "_intents_created"):
             self._intents_created = []
         self._intents_created.append(cf.code)
@@ -5470,7 +5761,7 @@ class PB1Engine:
                 side="BUY",
                 qty=cf.planned_qty,
                 price=record_price,
-                client_order_key=cf.client_order_key,
+                client_order_key=effective_client_order_key,
                 ok=True,
                 reasons=["entry"] + (cf.reasons or []),
                 stage="PB1-CLOSE",
@@ -5496,6 +5787,7 @@ class PB1Engine:
             status["skipped"] = 1
             status["accepted"] = 0
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         
         # ✅ 라이브 주문 직전 최종 확인
@@ -5507,9 +5799,17 @@ class PB1Engine:
         
         if not self.kis:
             logger.warning("[PB1][ENTRY][SKIP] KIS missing code=%s", display_code)
+            self._log_final_skip(
+                cf=cf,
+                reason_code="KIS_MISSING",
+                reason_detail="kis client unavailable",
+                stage="PB1-CLOSE",
+                price=record_price,
+            )
             status["skipped"] = 1
-            status["skipped_reason"] = "kis_missing"
+            status["skipped_reason"] = "KIS_MISSING"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         if not self._pretrade_check(
             code=cf.code,
@@ -5518,17 +5818,24 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=record_price,
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             stage="PB1-CLOSE",
         ):
-            logger.info("[ORDER][API_CALL][SKIP] code=%s reason=pretrade_check_failed", display_code)
+            self._log_final_skip(
+                cf=cf,
+                reason_code="PRETRADE_CHECK_FAILED",
+                reason_detail="validate_tradeable returned false",
+                stage="PB1-CLOSE",
+                price=record_price,
+            )
             status["skipped"] = 1
-            status["skipped_reason"] = "pretrade_check_failed"
+            status["skipped_reason"] = "PRETRADE_CHECK_FAILED"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         status["submit_attempted"] = 1
         logger.info(
-            "[ORDER][API_CALL][START] code=%s qty=%s price=%s order_type=%s",
+            "[ORDER][API_REQUEST] code=%s qty=%s price=%s order_type=%s",
             display_code,
             cf.planned_qty,
             record_price,
@@ -5542,7 +5849,7 @@ class PB1Engine:
             qty=cf.planned_qty,
             price=float(limit_price or 0.0),
             order_type=order_type,
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
         )
         resp = None
         kis_odno = None
@@ -5559,7 +5866,7 @@ class PB1Engine:
             status["failed"] = 1
         self.orders_repo.mark_submitted(
             self.env,
-            cf.client_order_key or "",
+            effective_client_order_key or "",
             kis_odno,
             resp if isinstance(resp, dict) else {"resp": resp},
             entry_meta_json=entry_meta,
@@ -5574,7 +5881,7 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=record_price,
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             ok=bool(status.get("api_submitted")),
             reasons=["submit"],
             stage="PB1-CLOSE",
@@ -5586,6 +5893,14 @@ class PB1Engine:
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
         status["broker_response_code"] = msg_cd or rt_cd
         status["broker_message"] = msg1
+        logger.info(
+            "[ORDER][API_RESULT] code=%s rt_cd=%s msg_cd=%s accepted=%s rejected=%s",
+            display_code,
+            rt_cd,
+            msg_cd,
+            int(bool(ok)),
+            int(not bool(ok)),
+        )
         emit_event(
             as_of=self._today,
             event="ORDER_RESULT",
@@ -5606,7 +5921,7 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=record_price,
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             ok=ok,
             reasons=[reason_code],
             stage="PB1-CLOSE",
@@ -5662,7 +5977,7 @@ class PB1Engine:
                 side="BUY",
                 qty=cf.planned_qty,
                 price=record_price,
-                client_order_key=cf.client_order_key,
+                client_order_key=effective_client_order_key,
                 ok=True,
                 reasons=["buy_fill"],
                 stage="PB1-CLOSE",
@@ -5733,8 +6048,9 @@ class PB1Engine:
                 float(record_price or 0.0),
             )
             status["filled"] = 1
+            status["terminal_event"] = "API_RESULT"
         else:
-            self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+            self.orders_repo.mark_error(self.env, effective_client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
             status["rejected"] = 1
             status["failed"] = int(status.get("failed", 0) or 0) + 1
             status["submit_terminal_status"] = self._classify_submit_terminal_status(
@@ -5743,6 +6059,7 @@ class PB1Engine:
                 skipped_reason=str(status.get("skipped_reason") or ""),
                 response=resp if isinstance(resp, dict) else None,
             )
+            status["terminal_event"] = "API_RESULT"
         return status
 
     def _place_add_on(self, pos: dict, *, qty: int, price: float) -> None:
@@ -5928,11 +6245,18 @@ class PB1Engine:
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
         display_code = self._display_code(cf.code)
+        decision_reason = str(
+            cf.features.get("entry_reason")
+            or cf.features.get("entry_decision_family")
+            or cf.features.get("entry_style_selected")
+            or ReasonCode.ENTRY_BREAKOUT
+        )
         logger.info(
-            "[TRADE][DECISION][BUY] code=%s name=%s reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s no_trade=%s",
+            "[TRADE][DECISION][BUY] code=%s name=%s family=%s decision_reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s no_trade=%s",
             display_code,
             self._code_name_map.get(cf.code),
-            ReasonCode.ENTRY_BREAKOUT,
+            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            decision_reason,
             float(cf.features.get("score") or 0.0),
             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
             float(cf.features.get("stop_price") or 0.0),
@@ -5967,6 +6291,8 @@ class PB1Engine:
                     logger.warning("[SIM_ORDER][DB_FAIL] code=%s err=%s", display_code, exc)
                 # ✅ 계속 실행하지 않고 return (주문 전송 스킵)
                 status["skipped_reason"] = "diag_no_http"
+                status["skipped"] = 1
+                status["terminal_event"] = "FINAL_SKIP"
                 return status
             else:
                 logger.info(
@@ -5975,6 +6301,8 @@ class PB1Engine:
                     cf.planned_qty,
                 )
                 status["skipped_reason"] = "no_trade_mode"
+                status["skipped"] = 1
+                status["terminal_event"] = "FINAL_SKIP"
                 return status
         
         cap_buffer_pct = self._float_env("PB1_CLOSE_ENTRY_CAP_BUFFER_PCT", 1.0)
@@ -6007,8 +6335,10 @@ class PB1Engine:
             return status
         cap = round_to_tick(base * (1 + cap_buffer_pct / 100.0))
         logger.info(
-            "[PB1][CLOSE_ENTRY][WHY] code=%s base_from=%s base=%.2f cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
+            "[PB1][CLOSE_ENTRY][WHY] code=%s selected_family=%s trigger_policy=%s base_from=%s base=%.2f cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
             display_code,
+            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            cf.features.get("entry_trigger_policy") or "NONE",
             base_from,
             base,
             cap,
@@ -6016,7 +6346,40 @@ class PB1Engine:
             ref_daily_close,
             reasons,
         )
+        pre_submit = self._resolve_entry_pre_submit(
+            cf=cf,
+            stage="PB1-CLOSE",
+            order_price=float(cap or 0.0),
+            order_type="LIMIT",
+            allow_add_to_existing=False,
+        )
+        if not pre_submit.ok:
+            final_reason = next((reason for reason in pre_submit.reason_codes if reason != "ok"), "PRE_SUBMIT_BLOCKED")
+            self._log_final_skip(
+                cf=cf,
+                reason_code=final_reason,
+                reason_detail=",".join(pre_submit.reason_codes),
+                stage="PB1-CLOSE",
+                price=float(cap or 0.0),
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = final_reason
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
+            return status
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=float(cap or 0.0))
+        effective_client_order_key = cf.client_order_key or ""
+        existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
+        existing_status = str((existing_order or {}).get("status") or "").upper()
+        if existing_order and self._is_retryable_entry_order_status(existing_status):
+            effective_client_order_key = self._next_retry_client_order_key(effective_client_order_key)
+            logger.info(
+                "[ORDER][PRE_SUBMIT][RETRY_KEY] code=%s old_key=%s new_key=%s prior_status=%s",
+                display_code,
+                cf.client_order_key,
+                effective_client_order_key,
+                existing_status,
+            )
         try:
             order_id, created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -6031,7 +6394,7 @@ class PB1Engine:
                 qty=cf.planned_qty,
                 limit_price=cap,
                 stage="PB1-CLOSE",
-                client_order_key=cf.client_order_key or "",
+                client_order_key=effective_client_order_key,
                 request_json={
                     "features": cf.features,
                     "reasons": reasons,
@@ -6048,11 +6411,22 @@ class PB1Engine:
             if not self.dry_run:
                 raise
             status["skipped_reason"] = "db_fail"
+            status["skipped"] = 1
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         if not created:
-            logger.info("[PB1][CLOSE_ENTRY][SKIP] code=%s reason=duplicate_order", display_code)
-            status["skipped_reason"] = "duplicate_order"
+            self._log_final_skip(
+                cf=cf,
+                reason_code="DUPLICATE_ORDER_EXISTS",
+                reason_detail=f"client_order_key={effective_client_order_key}",
+                stage="PB1-CLOSE",
+                price=float(cap or 0.0),
+            )
+            status["skipped_reason"] = "DUPLICATE_ORDER_EXISTS"
+            status["skipped"] = 1
+            status["terminal_event"] = "FINAL_SKIP"
             return status
+        cf.client_order_key = effective_client_order_key
         logger.info(
             "[ENTRY][META][SAVE] code=%s entry_reason=%s decision_family=%s stop=%s pivot=%s score=%s",
             display_code,
@@ -6068,7 +6442,7 @@ class PB1Engine:
                 display_code,
                 cf.planned_qty,
                 cap,
-                cf.client_order_key,
+                effective_client_order_key,
                 order_id,
             )
             logger.info(
@@ -6081,12 +6455,21 @@ class PB1Engine:
             status["skipped"] = 1
             status["submit_attempted"] = 1
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         if not self.kis:
             logger.warning("[PB1][CLOSE_ENTRY][SKIP] KIS missing code=%s", display_code)
+            self._log_final_skip(
+                cf=cf,
+                reason_code="KIS_MISSING",
+                reason_detail="kis client unavailable",
+                stage="PB1-CLOSE",
+                price=float(cap or 0.0),
+            )
             status["skipped"] = 1
-            status["skipped_reason"] = "kis_missing"
+            status["skipped_reason"] = "KIS_MISSING"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         if not self._pretrade_check(
             code=cf.code,
@@ -6095,13 +6478,20 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=float(cap or 0.0),
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             stage="PB1-CLOSE",
         ):
-            logger.info("[ORDER][API_CALL][SKIP] code=%s reason=pretrade_check_failed", display_code)
+            self._log_final_skip(
+                cf=cf,
+                reason_code="PRETRADE_CHECK_FAILED",
+                reason_detail="validate_tradeable returned false",
+                stage="PB1-CLOSE",
+                price=float(cap or 0.0),
+            )
             status["skipped"] = 1
-            status["skipped_reason"] = "pretrade_check_failed"
+            status["skipped_reason"] = "PRETRADE_CHECK_FAILED"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
             return status
         self._append_ledger_event(
             event_type="ORDER_INTENT",
@@ -6111,7 +6501,7 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=float(cap or 0.0),
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             ok=True,
             reasons=reasons,
             stage="PB1-CLOSE",
@@ -6125,13 +6515,13 @@ class PB1Engine:
             qty=cf.planned_qty,
             price=float(cap),
             order_type="LIMIT",
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
         )
         resp = None
         kis_odno = None
         try:
             status["submit_attempted"] = 1
-            logger.info("[ORDER][API_CALL][START] code=%s qty=%s price=%s order_type=LIMIT", display_code, cf.planned_qty, float(cap or 0.0))
+            logger.info("[ORDER][API_REQUEST] code=%s qty=%s price=%s order_type=LIMIT", display_code, cf.planned_qty, float(cap or 0.0))
             resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
             kis_odno = extract_order_no(resp)
             status["broker_submit_called"] = 1
@@ -6141,7 +6531,7 @@ class PB1Engine:
             status["failed"] = 1
         self.orders_repo.mark_submitted(
             self.env,
-            cf.client_order_key or "",
+            effective_client_order_key or "",
             kis_odno,
             resp if isinstance(resp, dict) else {"resp": resp},
             entry_meta_json=entry_meta,
@@ -6156,7 +6546,7 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=float(cap or 0.0),
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             ok=bool(status.get("api_submitted")),
             reasons=["submit"],
             stage="PB1-CLOSE",
@@ -6168,6 +6558,14 @@ class PB1Engine:
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
         status["broker_response_code"] = msg_cd or rt_cd
         status["broker_message"] = msg1
+        logger.info(
+            "[ORDER][API_RESULT] code=%s rt_cd=%s msg_cd=%s accepted=%s rejected=%s",
+            display_code,
+            rt_cd,
+            msg_cd,
+            int(bool(ok)),
+            int(not bool(ok)),
+        )
         emit_event(
             as_of=self._today,
             event="ORDER_RESULT",
@@ -6188,7 +6586,7 @@ class PB1Engine:
             side="BUY",
             qty=cf.planned_qty,
             price=float(cap or 0.0),
-            client_order_key=cf.client_order_key,
+            client_order_key=effective_client_order_key,
             ok=ok,
             reasons=[reason_code],
             stage="PB1-CLOSE",
@@ -6221,13 +6619,14 @@ class PB1Engine:
                     "code": cf.code,
                     "qty": cf.planned_qty,
                     "cap_price": cap,
-                    "client_order_key": cf.client_order_key,
+                    "client_order_key": effective_client_order_key,
                     "kis_odno": kis_odno,
                     "created_at": now_kst().isoformat(),
                 }
             )
+            status["terminal_event"] = "API_RESULT"
         else:
-            self.orders_repo.mark_error(self.env, cf.client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
+            self.orders_repo.mark_error(self.env, effective_client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
             status["rejected"] = 1
             status["failed"] = int(status.get("failed", 0) or 0) + 1
             status["submit_terminal_status"] = self._classify_submit_terminal_status(
@@ -6236,6 +6635,7 @@ class PB1Engine:
                 skipped_reason=str(status.get("skipped_reason") or ""),
                 response=resp if isinstance(resp, dict) else None,
             )
+            status["terminal_event"] = "API_RESULT"
         return status
 
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> dict[str, Any] | None:
@@ -6312,6 +6712,10 @@ class PB1Engine:
         close_px = self._to_float(features.get("close") or mark)
         ma20 = self._to_float(features.get("ma20"))
         ma50 = self._to_float(features.get("ma50"))
+        if ma20 is None and not df.empty and "close" in df.columns and len(df) >= 20:
+            ma20 = self._to_float(df["close"].tail(20).mean())
+        if ma50 is None and not df.empty and "close" in df.columns and len(df) >= 50:
+            ma50 = self._to_float(df["close"].tail(50).mean())
         atr_current = self._to_float(features.get("atr14") or features.get("atr"))
         last_volume = self._to_float(features.get("last_volume"))
         vol50 = self._to_float(features.get("vol50"))
@@ -6349,13 +6753,20 @@ class PB1Engine:
             trail_source,
         )
         logger.info(
-            "[EXIT][MA_CTX] code=%s ma20=%s ma50=%s ma_mode=%s last=%s",
+            "[EXIT][MA_CTX] code=%s ma20=%s ma50=%s source=%s ma_mode=%s last=%s",
             display_code,
             ma20,
             ma50,
+            features.get("_exit_ohlcv_source") or "unknown",
             "prev_close_ref",
             mark,
         )
+        if (ma20 is None or ma50 is None) and len(df) < 50:
+            logger.info(
+                "[EXIT][MA_CTX][DEGRADED] code=%s reason=insufficient_history rows=%s",
+                display_code,
+                len(df),
+            )
 
         stop_hit = bool(stop_price is not None and mark <= float(stop_price))
         trail_hit = bool(trail_stop_price is not None and mark <= float(trail_stop_price))
@@ -6854,13 +7265,15 @@ class PB1Engine:
         pos_list = [holding.to_position_dict() for holding in holdings_exit_scope]
         exit_evaluations: list[dict[str, Any]] = []
         for pos in pos_list:
-            df, _ = self._fetch_daily(pos["code"])
+            df, meta = self._fetch_exit_ohlcv(pos["code"])
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
                     features = compute_features(df)
                 except ValueError:
                     features = {}
+            features["_exit_ohlcv_source"] = str((meta or {}).get("source") or "none")
+            features["_exit_ohlcv_rows"] = len(df)
             features["market"] = pos.get("market") or ""
             features["close"] = features.get("close") or pos.get("last_price") or pos.get("avg_buy_price") or 0.0
             marks_fallback[pos["code"]] = features.get("close") or pos.get("avg_buy_price") or 0.0
@@ -9287,82 +9700,17 @@ class PB1Engine:
                     )
                     continue
                 order_value = order_price * float(cf.planned_qty or 0)
-                if not allow_add_to_existing and cf.code in held_codes:
-                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_EXISTING_HOLDING", cf.code)
-                    buyable_stage_counter["BUYABLE_EXISTING_HOLDING"] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_EXISTING_HOLDING"])
-                    self._log_order_skip(cf, ["BUYABLE_EXISTING_HOLDING"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["BUYABLE_EXISTING_HOLDING"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    continue
-                if cf.code in open_buy_codes:
-                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_OPEN_ORDER", cf.code)
-                    buyable_stage_counter["BUYABLE_OPEN_ORDER"] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_OPEN_ORDER"])
-                    self._log_order_skip(cf, ["BUYABLE_OPEN_ORDER"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["BUYABLE_OPEN_ORDER"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    continue
                 gate_snapshot = buyable_gate_context.get(str(cf.code or "").zfill(6), {})
+                gate_snapshot["open_order_exists"] = bool(cf.code in open_buy_codes)
                 self._log_buyable_gate_trace(code=cf.code, entry_allowed=entry_allowed, snapshot=gate_snapshot)
-                if gate_snapshot.get("today_buy_exists"):
-                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_TODAY_BUY_EXISTS", cf.code)
-                    buyable_stage_counter["BUYABLE_TODAY_BUY_EXISTS"] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_TODAY_BUY_EXISTS"])
-                    self._log_order_skip(cf, ["BUYABLE_TODAY_BUY_EXISTS"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["BUYABLE_TODAY_BUY_EXISTS"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    self._store_entry_evaluation(
-                        cf,
-                        setup_ok=bool(cf.setup_ok),
-                        score_ok=cf.code in set(self._debug_score_cut_codes),
-                        risk_ok=cf.code in set(self._debug_risk_ok_codes),
-                        sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
-                        buyable_ok=False,
-                        trigger_ok=False,
-                        order_ready=False,
-                        reasons=["BUYABLE_TODAY_BUY_EXISTS"],
-                    )
-                    continue
-                if gate_snapshot.get("cooldown_active"):
-                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_COOLDOWN", cf.code)
-                    buyable_stage_counter["BUYABLE_COOLDOWN"] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_COOLDOWN"])
-                    self._log_order_skip(cf, ["BUYABLE_COOLDOWN"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["BUYABLE_COOLDOWN"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    self._store_entry_evaluation(
-                        cf,
-                        setup_ok=bool(cf.setup_ok),
-                        score_ok=cf.code in set(self._debug_score_cut_codes),
-                        risk_ok=cf.code in set(self._debug_risk_ok_codes),
-                        sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
-                        buyable_ok=False,
-                        trigger_ok=False,
-                        order_ready=False,
-                        reasons=["BUYABLE_COOLDOWN"],
-                    )
-                    continue
+                duplicate_intent_exists = False
+                duplicate_intent_status = ""
+                if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
+                    existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
+                    duplicate_intent_exists = bool(existing_order)
+                    duplicate_intent_status = str((existing_order or {}).get("status") or "")
+                is_blocked = False
+                prior = None
                 if not allow_add_to_existing:
                     is_blocked, prior = self._should_block_order(
                         cf.client_order_key or "",
@@ -9370,29 +9718,56 @@ class PB1Engine:
                         side="BUY",
                         stage="PB1-CLOSE",
                     )
-                    if is_blocked:
-                        # 중복 차단 상세 로그
-                        if prior:
-                            logger.info(
-                                "[BUYABLE_GATE][DUP] code=%s key=%s|BUY|PB1-CLOSE prior_status=%s prior_created=%s prior_run=%s",
-                                cf.code,
-                                self._today,
-                                prior.get("status"),
-                                prior.get("created_at"),
-                                prior.get("run_id"),
-                            )
-                        self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_DUPLICATE", cf.code)
-                        buyable_stage_counter["BUYABLE_DUPLICATE"] += 1
-                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_DUPLICATE"])
-                        self._log_order_skip(cf, ["BUYABLE_DUPLICATE"], "PB1-CLOSE")
-                        self._emit_buy_decision(
-                            cf,
-                            order_value=order_value,
-                            reasons=["BUYABLE_DUPLICATE"],
-                            entry_allowed=entry_allowed,
-                            entry_reason=entry_reason,
+                    if is_blocked and prior:
+                        logger.info(
+                            "[BUYABLE_GATE][DUP] code=%s key=%s|BUY|PB1-CLOSE prior_status=%s prior_created=%s prior_run=%s",
+                            cf.code,
+                            self._today,
+                            prior.get("status"),
+                            prior.get("created_at"),
+                            prior.get("run_id"),
                         )
-                        continue
+                unified_context = self._build_unified_gate_context(
+                    code=cf.code,
+                    qty=int(cf.planned_qty or 0),
+                    gate_snapshot=gate_snapshot,
+                    open_order_exists=bool(cf.code in open_buy_codes),
+                    duplicate_intent_exists=duplicate_intent_exists,
+                    duplicate_intent_status=duplicate_intent_status,
+                    blocking_duplicate_exists=bool(is_blocked),
+                )
+                unified_decision = self._evaluate_unified_buyable_gate(
+                    code=cf.code,
+                    gate_context=unified_context,
+                    allow_add_to_existing=allow_add_to_existing,
+                )
+                self._log_buyable_gate_unified(code=cf.code, decision=unified_decision)
+                if not unified_decision.ok:
+                    final_reasons = [reason for reason in unified_decision.reason_codes if reason != "ok"] or ["BUYABLE_GATE_BLOCKED"]
+                    for reason in final_reasons:
+                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                        buyable_stage_counter[reason] += 1
+                    self._log_buyable_gate(code=cf.code, ok=False, reasons=final_reasons)
+                    self._log_order_skip(cf, final_reasons, "PB1-CLOSE")
+                    self._emit_buy_decision(
+                        cf,
+                        order_value=order_value,
+                        reasons=final_reasons,
+                        entry_allowed=entry_allowed,
+                        entry_reason=entry_reason,
+                    )
+                    self._store_entry_evaluation(
+                        cf,
+                        setup_ok=bool(cf.setup_ok),
+                        score_ok=cf.code in set(self._debug_score_cut_codes),
+                        risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                        sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
+                        buyable_ok=False,
+                        trigger_ok=False,
+                        order_ready=False,
+                        reasons=final_reasons,
+                    )
+                    continue
                 if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
                     self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
                     buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
@@ -9419,6 +9794,7 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     continue
+                cf.features["buyable_ok"] = True
                 self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
                 buyable_ok_codes.append(cf.code)
                 last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
@@ -10188,6 +10564,11 @@ class PB1Engine:
                                 order_status = self._place_entry_close(cf)
                             else:
                                 order_status = self._place_entry(cf)
+                            terminal_event = str(order_status.get("terminal_event") or "")
+                            if terminal_event not in {"API_RESULT", "FINAL_SKIP"}:
+                                raise RuntimeError(
+                                    f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}"
+                                )
                             attempted_count += int(order_status.get("submit_attempted", 0) or 0)
                             api_submitted_count += int(order_status.get("api_submitted", 0) or 0)
                             accepted_count += int(order_status.get("accepted", 0) or 0)
@@ -10230,7 +10611,11 @@ class PB1Engine:
                     skipped_count,
                 )
                 if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
-                    logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s", len(orderable_candidates), attempted_count, accepted_count)
+                    logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s skipped=%s", len(orderable_candidates), attempted_count, accepted_count, skipped_count)
+                    if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "1") == "1":
+                        raise RuntimeError(
+                            f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
+                        )
                 if entry_allowed and self.phase == "entry" and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:

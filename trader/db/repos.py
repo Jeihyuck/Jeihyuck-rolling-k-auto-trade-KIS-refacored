@@ -2169,6 +2169,14 @@ class OrdersRepo:
         with self.engine.begin() as conn:
             return conn.execute(stmt).scalar() is not None
 
+    def get_order_by_client_order_key(self, env: str, client_order_key: str) -> dict | None:
+        stmt = select(self._schema.orders).where(
+            and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
+
     def has_blocking_order_today(
         self,
         env: str,
