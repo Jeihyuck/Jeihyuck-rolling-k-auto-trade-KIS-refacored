@@ -13,7 +13,13 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
-from trader.final30_quality import format_final30_abort_message, normalize_final30_contract_row, validate_trade_ready, verify_final30_scored_rows
+from trader.final30_quality import (
+    format_final30_abort_message,
+    normalize_final30_contract_row,
+    summarize_entry_style_distribution,
+    validate_trade_ready,
+    verify_final30_scored_rows,
+)
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -160,6 +166,12 @@ def _validate_trade_final30_files(*, repo_root_path: Path, env: str, as_of: str)
     aggregate_errors: list[str] = []
     for label, path in build_final30_paths(repo_root_path, env, as_of).items():
         rows, json_ok = read_final30_file_rows(path)
+        summary = summarize_entry_style_distribution(rows)
+        logger.info(
+            "[TRADE][FINAL30][ENTRY_STYLE_DISTRIBUTION] total=%s counts=%s",
+            int(summary.get("total") or 0),
+            dict(summary.get("counts") or {}),
+        )
         result = verify_final30_scored_rows(
             rows,
             required_rows=30,
@@ -196,6 +208,12 @@ def _validate_trade_final30_files(*, repo_root_path: Path, env: str, as_of: str)
 
 
 def _strict_validate_trade_final30_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    summary = summarize_entry_style_distribution(rows)
+    logger.info(
+        "[TRADE][FINAL30][ENTRY_STYLE_DISTRIBUTION] total=%s counts=%s",
+        int(summary.get("total") or 0),
+        dict(summary.get("counts") or {}),
+    )
     return verify_final30_scored_rows(
         rows,
         required_rows=30,
@@ -466,6 +484,12 @@ def load_trade_final30_scored(
         int(scored_contract.get("invalid_row_count") or 0),
         list(scored_contract.get("errors") or []),
         list(scored_contract.get("warnings") or []),
+    )
+    db_distribution = summarize_entry_style_distribution(rows)
+    logger.info(
+        "[TRADE][FINAL30][ENTRY_STYLE_DISTRIBUTION] total=%s counts=%s",
+        int(db_distribution.get("total") or 0),
+        dict(db_distribution.get("counts") or {}),
     )
     if contract_ok:
         missing_labels = [label for label, present in file_mirror_stats.items() if not present]
@@ -3065,6 +3089,30 @@ def run_once(
             window_label,
         )
 
+        phase_name_for_engine = str(run_ctx.get("phase_name") or phase_override_arg or "entry").strip().lower() or "entry"
+        window_name_for_engine = str(run_ctx.get("window_name") or normalized_window_name or "day").strip().lower() or "day"
+        logger.info(
+            "[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s balance_state=%s gate_order_allowed=%s phase=%s window=%s",
+            int(len(precomputed_final30_df) if isinstance(precomputed_final30_df, pd.DataFrame) else 0),
+            balance_state,
+            int(bool(order_allowed)),
+            phase_name_for_engine,
+            window_name_for_engine,
+        )
+        logger.info(
+            "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
+            phase_name_for_engine,
+            window_name_for_engine,
+            market_window,
+            phase_override_arg,
+            intended_live,
+        )
+        logger.info(
+            "[TRADE][ENGINE_BOOT][START] engine=PB1Engine phase_name=%s window_name=%s",
+            phase_name_for_engine,
+            window_name_for_engine,
+        )
+
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
             orders_repo=orders_repo,
@@ -3072,9 +3120,9 @@ def run_once(
             positions_repo=positions_repo,
             ledger_repo=ledger_repo,
             kis=kis,
-            window=run_ctx.get("window_name") or window_label,
-            window_label=run_ctx.get("window_name") or window_label,
-            phase=run_ctx.get("phase_name") or phase_override_arg,
+            window=window_name_for_engine,
+            window_label=window_name_for_engine,
+            phase=phase_name_for_engine,
             dry_run=dry_run_for_engine,  # ✅ bool 강제된 값 전달
             env=env_effective,
             run_id=run_record_id,
@@ -3104,11 +3152,14 @@ def run_once(
             final30_locked=bool(run_ctx.get("final30_locked")) and (precomputed_final30_df is not None and not precomputed_final30_df.empty),
             watchlist_final_df=precomputed_final30_df,
             precomputed_features_df=precomputed_derived_df,
-            market_window_name=run_ctx.get("window_name") or "day",
+            market_window_name=market_window,
             compute_only_full_run=compute_only_full_run,
             force_block_live=bool(compute_only_flags.get("force_block_live")),
             trading_day=trading_day,
+            phase_name=phase_name_for_engine,
+            window_name=window_name_for_engine,
         )
+        logger.info("[TRADE][ENGINE_BOOT][OK] engine=PB1Engine")
         
         # ✅ DIAG_FULL_EXEC 실행 로그
         if diag_full_exec and mode == "DIAG":

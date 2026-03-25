@@ -42,7 +42,12 @@ from trader.data.ohlcv_provider import (
     upsert_ohlcv_delta,
 )
 from trader.exporter import export_watchlist_bundle
-from trader.final30_quality import normalize_final30_contract_row, summarize_final30_quality, verify_final30_scored_rows
+from trader.final30_quality import (
+    normalize_final30_contract_row,
+    summarize_entry_style_distribution,
+    summarize_final30_quality,
+    verify_final30_scored_rows,
+)
 from trader.score_columns import (
     collect_nonzero_score_stats,
     has_required_score_fields,
@@ -405,7 +410,34 @@ def _log_final30_field_trace(rows: list[dict[str, Any]], *, limit: int = 5) -> N
         )
 
 
+def _log_entry_style_distribution(rows: list[dict[str, Any]] | pd.DataFrame, *, prefix: str) -> None:
+    summary = summarize_entry_style_distribution(rows)
+    logger.info(
+        "[%s][FINAL30][ENTRY_STYLE_DISTRIBUTION] total=%s counts=%s",
+        prefix,
+        int(summary.get("total") or 0),
+        dict(summary.get("counts") or {}),
+    )
+
+
+def decide_prep_trade_gate(hard_fail_reasons: list[str] | None, soft_fail_reasons: list[str] | None) -> dict[str, int | str]:
+    hard_fail_reasons = list(hard_fail_reasons or [])
+    soft_fail_reasons = list(soft_fail_reasons or [])
+    has_hard = bool(hard_fail_reasons)
+    has_soft = bool(soft_fail_reasons)
+    status = "FAIL" if has_hard else ("WARN" if has_soft else "OK")
+    quality_ok = 0 if has_hard else 1
+    trade_can_proceed = 0 if has_hard else 1
+    return {
+        "status": status,
+        "quality_ok": quality_ok,
+        "soft_fail": int(has_soft),
+        "trade_can_proceed": trade_can_proceed,
+    }
+
+
 def _strict_validate_final30_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
+    _log_entry_style_distribution(rows, prefix="PREP")
     result = verify_final30_scored_rows(
         rows,
         required_rows=FINAL30_SCORED_REQUIRED_ROWS,
@@ -534,6 +566,30 @@ def _write_canonical_final30_scored_files(*, env: str, as_of: str, df: pd.DataFr
         int("momentum_score" in payload_df.columns),
     )
     return file_results
+
+
+def sync_prep_final30_file_mirror(*, env: str, as_of: str, df: pd.DataFrame) -> dict[str, Any]:
+    logger.info("[PREP][FINAL30][FILE_MIRROR][SYNC_START] as_of=%s rows=%s", as_of, int(len(df) if df is not None else 0))
+    file_results = _write_canonical_final30_scored_files(env=env, as_of=as_of, df=df)
+    logger.info(
+        "[PREP][FINAL30][FILE_MIRROR][SYNC_DONE] runtime=%s ledger=%s signals=%s",
+        int(bool((file_results.get("runtime") or {}).get("ok"))),
+        int(bool((file_results.get("ledger") or {}).get("ok"))),
+        int(bool((file_results.get("signals") or {}).get("ok"))),
+    )
+    validation = _strict_validate_final30_files(env=env, as_of=as_of)
+    validation_paths = dict(validation.get("paths") or {})
+    logger.info(
+        "[PREP][FINAL30][FILE_MIRROR][POST_VALIDATE] ok=%s runtime=%s ledger=%s signals=%s",
+        int(bool(validation.get("ok"))),
+        int((validation_paths.get("runtime") or {}).get("rows") or 0),
+        int((validation_paths.get("ledger") or {}).get("rows") or 0),
+        int((validation_paths.get("signals") or {}).get("rows") or 0),
+    )
+    return {
+        "file_results": file_results,
+        "validation": validation,
+    }
 
 
 def _is_scored_final30_df(df: pd.DataFrame) -> bool:
@@ -1685,6 +1741,7 @@ def main() -> int:
     final30_quality_ok = False
     final30_quality_soft_fail = False
     final30_trade_can_proceed = False
+    final30_gate_decision = decide_prep_trade_gate(["final30_missing"], [])
     if final30_df is not None and not final30_df.empty:
         _log_final30_field_trace(final30_df.to_dict(orient="records"))
         logger.info(
@@ -1717,9 +1774,13 @@ def main() -> int:
             "momentum_nonzero": momentum_nonzero,
         }
         final30_quality = _strict_validate_final30_rows(final30_df.to_dict(orient="records"), source="INMEM")
-        final30_quality_ok = bool(final30_quality.get("ok", False))
-        final30_quality_soft_fail = bool(final30_quality.get("soft_fail", False))
-        final30_trade_can_proceed = bool(final30_quality_ok and not final30_quality_soft_fail)
+        final30_gate_decision = decide_prep_trade_gate(
+            list(final30_quality.get("hard_fail_reasons") or []),
+            list(final30_quality.get("soft_fail_reasons") or []),
+        )
+        final30_quality_ok = bool(final30_gate_decision["quality_ok"])
+        final30_quality_soft_fail = bool(final30_gate_decision["soft_fail"])
+        final30_trade_can_proceed = bool(final30_gate_decision["trade_can_proceed"])
         logger.info(
             "[PREP][FINAL30][QUALITY] ok=%s soft_fail=%s rows=%s uniq_codes=%s momentum_monoculture=%s score_monoculture=%s",
             final30_quality_ok,
@@ -1729,19 +1790,14 @@ def main() -> int:
             final30_quality.get("momentum_monoculture"),
             final30_quality.get("score_monoculture"),
         )
-        # Trade gate decision MUST be based only on final30 strict contract
-        trade_gate_reason = ""
-        if not final30_quality_ok:
-            trade_gate_reason = "final30_contract_fail"
-        elif final30_quality_soft_fail:
-            trade_gate_reason = "final30_soft_fail"
-        else:
-            trade_gate_reason = "final30_contract_ok"
-        
         logger.info(
-            "[PREP][TRADE_GATE] can_proceed=%s reason=%s",
+            "[PREP][QUALITY_GATE] hard_fail=%s soft_fail=%s status=%s trade_can_proceed=%s hard_fail_reasons=%s soft_fail_reasons=%s",
+            int(bool(final30_quality.get("hard_fail_reasons") or [])),
+            int(bool(final30_quality.get("soft_fail_reasons") or [])),
+            final30_gate_decision["status"],
             int(final30_trade_can_proceed),
-            trade_gate_reason,
+            list(final30_quality.get("hard_fail_reasons") or []),
+            list(final30_quality.get("soft_fail_reasons") or []),
         )
         logger.info(
             "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
@@ -1795,7 +1851,7 @@ def main() -> int:
         "watchlist_count": len(watchlist or []),
         "final30_count": final30_locked_count,
         "fallbacks_used": sorted(set(fallbacks_used)),
-        "build_status": "DEGRADED" if fallbacks_used else ("WARN" if (not final30_quality_ok or final30_quality_soft_fail) else "OK"),
+        "build_status": "DEGRADED" if fallbacks_used else str(final30_gate_decision["status"]),
         "final30_quality": final30_quality,
         "final30_quality_ok": final30_quality_ok,
         "final30_quality_soft_fail": final30_quality_soft_fail,
@@ -1960,14 +2016,6 @@ def main() -> int:
             final30_file_failures,
         )
     strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or []) + list(scored_contract.get("errors") or []) + list(final30_quality.get("errors") or [])
-    if (not final30_quality_ok) or final30_quality_soft_fail:
-        logger.warning(
-            "[PREP][FINAL30][QUALITY_WARN] ok=%s soft_fail=%s hard_fail_reasons=%s soft_fail_reasons=%s",
-            final30_quality_ok,
-            final30_quality_soft_fail,
-            final30_quality.get("hard_fail_reasons", []),
-            final30_quality.get("soft_fail_reasons", []),
-        )
     if (not final30_quality_ok) or (not bool(scored_contract.get("ok"))) or (not bool(final30_files_validation.get("ok"))):
         raise RuntimeError(
             "PREP_FINAL30_STRICT_VALIDATE_FAILED:"
@@ -2088,7 +2136,7 @@ def main() -> int:
             as_of.isoformat(),
             strict_contract_failures,
         )
-    elif (not final30_quality_ok) or final30_quality_soft_fail:
+    elif str(final30_gate_decision["status"]) == "WARN":
         prep_status = "WARN"
 
     # Prepare metric columns for export
@@ -2176,6 +2224,26 @@ def main() -> int:
     prep_manifest["final30_quality_soft_fail"] = final30_quality_soft_fail
     prep_manifest["trade_can_proceed"] = int(final30_trade_can_proceed)
     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+    if prep_status != "FAIL":
+        mirror_sync = sync_prep_final30_file_mirror(
+            env=env,
+            as_of=as_of.isoformat(),
+            df=final30_scored_df_for_export,
+        )
+        final30_file_results = dict(mirror_sync.get("file_results") or {})
+        final30_files_validation = dict(mirror_sync.get("validation") or {})
+        final30_file_failures = list(dict.fromkeys(list(final30_file_failures) + list(final30_files_validation.get("errors") or [])))
+        final30_file_contract_ok = bool(final30_files_validation.get("ok"))
+        if not final30_file_contract_ok:
+            strict_contract_failures = list(dict.fromkeys(list(strict_contract_failures) + list(final30_file_failures)))
+            prep_status = "FAIL"
+    payload["prep_status"] = prep_status
+    payload["final30_file_contract_ok"] = final30_file_contract_ok
+    payload["final30_file_failures"] = list(final30_file_failures)
+    payload["contract_failures"] = list(strict_contract_failures)
+    prep_manifest["build_status"] = prep_status
+    prep_manifest["trade_can_proceed"] = int(final30_gate_decision["trade_can_proceed"])
+    prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     
     # ✅ FIX: Mutually exclusive PREP event logging
     if prep_status == "FAIL":
@@ -2234,9 +2302,9 @@ def main() -> int:
         logger.warning(
             "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s status=WARN quality_ok=%s soft_fail=%s trade_can_proceed=%s",
             as_of.isoformat(),
-            int(final30_quality_ok),
-            int(final30_quality_soft_fail),
-            int(final30_trade_can_proceed),
+            int(final30_gate_decision["quality_ok"]),
+            int(final30_gate_decision["soft_fail"]),
+            int(final30_gate_decision["trade_can_proceed"]),
         )
     
     else:
@@ -2330,9 +2398,9 @@ def main() -> int:
         final30_source_label,
         contract_mode,
         prep_status,
-        int(final30_quality_ok),
-        int(final30_quality_soft_fail),
-        int(final30_trade_can_proceed),
+        int(final30_gate_decision["quality_ok"]),
+        int(final30_gate_decision["soft_fail"]),
+        int(final30_gate_decision["trade_can_proceed"]),
         time.monotonic() - t0,
     )
     return 0

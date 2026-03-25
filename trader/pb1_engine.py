@@ -781,12 +781,12 @@ class PB1Engine:
         positions_repo: PositionsRepo,
         ledger_repo: LedgerEventsRepo,
         kis: KisAPI | None,
-        window: WindowDecision | str | None,
-        window_label: str,
-        phase: str,
         dry_run: bool,
         env: str,
         run_id: str,
+        window: WindowDecision | str | None = None,
+        window_label: str = "",
+        phase: str | None = None,
         intended_live: bool = False,
         strategy: str | None = None,
         now_kst_value: datetime | None = None,
@@ -817,6 +817,8 @@ class PB1Engine:
         compute_only_full_run: bool = False,
         force_block_live: bool = False,
         trading_day: bool | None = None,
+        phase_name: str | None = None,
+        window_name: str | None = None,
         entry_allowed_this_tick: bool | None = None,
     ) -> None:
         self._as_of = None
@@ -835,13 +837,36 @@ class PB1Engine:
         elif window is not None:
             raw_window = str(getattr(window, "name", "") or "")
         raw_window = raw_window or str(window_label or "")
-        normalized_window = raw_window.strip().lower()
-        if normalized_window in {"morning", "preopen", "close", "intraday"}:
-            self.window_name = "intraday"
-        elif normalized_window == "after":
-            self.window_name = "after"
+        raw_phase_name = str(phase_name or "").strip().lower()
+        raw_window_name = str(window_name or raw_window or "").strip().lower()
+        raw_phase = str(phase or "").strip().lower()
+        inferred_phase_name = str(getattr(window, "phase", "") or "").strip().lower()
+        resolved_phase_name = raw_phase_name or inferred_phase_name or "entry"
+        if raw_phase:
+            resolved_phase_name = raw_phase_name or raw_phase or inferred_phase_name or "entry"
+        if resolved_phase_name not in {"entry", "exit", "manage"}:
+            resolved_phase_name = "entry"
+        if raw_window_name in {"morning", "preopen", "close", "intraday"}:
+            resolved_window_name = "intraday"
+        elif raw_window_name == "after":
+            resolved_window_name = "after"
         else:
-            self.window_name = "day"
+            resolved_window_name = "day"
+        self.phase_name = resolved_phase_name
+        self.window_name = resolved_window_name
+        logger.info(
+            "[ENGINE][INIT_CTX] phase_name=%s window_name=%s phase_arg=%s window_arg=%s",
+            self.phase_name,
+            self.window_name,
+            phase_name,
+            window_name,
+        )
+        if phase_name is None and window_name is None and not raw_phase and not raw_window:
+            logger.warning(
+                "[ENGINE][INIT_DEFAULT] missing phase/window -> fallback phase=%s window=%s",
+                self.phase_name,
+                self.window_name,
+            )
         self.market_window_name = (market_window_name or self.window_name or "day").strip().lower()
         if self.market_window_name in {"morning", "preopen", "close", "intraday"}:
             self.market_window_name = "intraday"
@@ -849,10 +874,7 @@ class PB1Engine:
             self.market_window_name = "day"
         self.window = WindowDecision(name=self.window_name, phase=self.phase_name)
         self.window_label = self.window_name
-        self.phase = phase
-        self.phase_name = (str(phase or "entry").strip().lower() or "entry")
-        if self.phase_name not in {"entry", "exit", "manage"}:
-            self.phase_name = "entry"
+        self.phase = self.phase_name
         
         # ✅ CRITICAL: dry_run may come as bool/int/str. Never use bool("0")!
         # parse_bool_any handles all cases: bool(True/False), int(0/1), str("0"/"1"/"yes"/"no"/etc)

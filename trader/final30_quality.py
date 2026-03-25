@@ -68,6 +68,12 @@ FINAL30_NUMERIC_FIELDS = {
     "rank_final30",
 }
 
+ENTRY_STYLE_DISPLAY_ORDER = (
+    "PULLBACK",
+    "BREAKOUT",
+    "MOMENTUM",
+)
+
 
 def _env_bool(key: str, default: bool) -> bool:
     value = str(os.getenv(key, str(int(default)))).strip().lower()
@@ -248,6 +254,26 @@ def _invalid_fields_for_row(row: dict[str, Any], *, include_score_fields: bool =
             if _normalize_numeric(row.get(field)) is None:
                 invalid.append(field)
     return invalid
+
+
+def summarize_entry_style_distribution(rows: list[dict[str, Any]] | pd.DataFrame) -> dict[str, Any]:
+    if isinstance(rows, pd.DataFrame):
+        normalized_rows = [normalize_final30_contract_row(item) for item in rows.to_dict(orient="records")]
+    else:
+        normalized_rows = [normalize_final30_contract_row(item) for item in (rows or []) if isinstance(item, dict)]
+
+    counts: dict[str, int] = {style: 0 for style in ENTRY_STYLE_DISPLAY_ORDER}
+    for row in normalized_rows:
+        style = _normalize_string((row or {}).get("entry_style_selected"))
+        if style is None:
+            continue
+        normalized_style = style.upper()
+        counts[normalized_style] = counts.get(normalized_style, 0) + 1
+
+    return {
+        "total": int(len(normalized_rows)),
+        "counts": counts,
+    }
 
 
 def evaluate_final30_quality(rows: list[dict[str, Any]] | pd.DataFrame, *, required_rows: int = 30) -> dict[str, Any]:
