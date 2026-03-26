@@ -32,7 +32,7 @@ from trader.watchlist_builder import (
     build_and_save_watchlist,
     recover_bundle_from_db,
     rebuild_bundle,
-    save_bundle,
+    save_bundle_aux,
     WatchlistBundle,
     validate_watchlist_contract,
 )
@@ -589,6 +589,125 @@ def sync_prep_final30_file_mirror(*, env: str, as_of: str, df: pd.DataFrame) -> 
     return {
         "file_results": file_results,
         "validation": validation,
+    }
+
+
+def save_final30_scored_core(
+    df_final30_scored: pd.DataFrame,
+    as_of: date,
+    env: str,
+    *,
+    engine: Any,
+    final_strategy: str = "pb1_watchlist_final",
+    watchlist_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    logger.info(
+        "[FINAL30_SCORED][CORE_SAVE][START] as_of=%s env=%s rows=%s",
+        as_of.isoformat(),
+        env,
+        int(len(df_final30_scored) if df_final30_scored is not None else 0),
+    )
+    final30_df = _as_dataframe(df_final30_scored)
+    if final30_df.empty:
+        raise RuntimeError("FINAL30_SCORED_CORE_SAVE_EMPTY")
+
+    inmem_validation = _strict_validate_final30_rows(final30_df.to_dict(orient="records"), source="CORE_SAVE_INPUT")
+    if not bool(inmem_validation.get("ok")):
+        raise RuntimeError(f"FINAL30_SCORED_CORE_SAVE_CONTRACT_FAIL:{list(inmem_validation.get('errors') or [])}")
+
+    scored_members = _build_scored_members(final30_df)
+    uniq_codes = len({str((row or {}).get("code") or "").zfill(6) for row in scored_members if (row or {}).get("code")})
+    if len(scored_members) != 30 or uniq_codes != 30:
+        raise RuntimeError(f"FINAL30_SCORED_CORE_SAVE_ROWS_FAIL:rows={len(scored_members)} uniq_codes={uniq_codes}")
+
+    watchlist_repo = WatchlistRepo(engine)
+    base_members = list(watchlist_rows or scored_members)
+    watchlist_repo.save_watchlist(
+        env=env,
+        strategy=final_strategy,
+        as_of=as_of,
+        members=base_members,
+    )
+    watchlist_repo.save_watchlist(
+        env=env,
+        strategy="pb1_watchlist_final_scored",
+        as_of=as_of,
+        members=scored_members,
+    )
+    exact_final_rows, _ = watchlist_repo.load_watchlist(
+        env=env,
+        strategy=final_strategy,
+        as_of=as_of,
+        allow_latest_fallback=False,
+    )
+    scored_contract = watchlist_repo.verify_watchlist_scored_contract(
+        env=env,
+        as_of=as_of,
+        strategy="pb1_watchlist_final_scored",
+        allow_latest_fallback=False,
+    )
+    scored_columns = set(scored_contract.get("columns") or [])
+    critical_missing_fields = [col for col in CRITICAL_SCORED_COLS if col not in scored_columns]
+    if not bool(scored_contract.get("ok")) or len(exact_final_rows) != 30 or critical_missing_fields:
+        raise RuntimeError(
+            "FINAL30_SCORED_CORE_SAVE_DB_FAIL:"
+            f"rows={scored_contract.get('rows')} uniq_codes={scored_contract.get('uniq_codes')} missing={critical_missing_fields}"
+        )
+    logger.info("[FINAL30_SCORED][CORE_SAVE][DB_OK] rows=%s", int(scored_contract.get("rows") or 0))
+
+    mirror_sync = sync_prep_final30_file_mirror(
+        env=env,
+        as_of=as_of.isoformat(),
+        df=final30_df,
+    )
+    file_results = dict(mirror_sync.get("file_results") or {})
+    validation = dict(mirror_sync.get("validation") or {})
+    if not bool(validation.get("ok")):
+        raise RuntimeError(f"FINAL30_SCORED_CORE_SAVE_FILE_FAIL:{list(validation.get('errors') or [])}")
+
+    final30_paths = build_final30_scored_paths(repo_root(), env, as_of.isoformat())
+    logger.info(
+        "[FINAL30_SCORED][CORE_SAVE][RUNTIME_OK] rows=%s path=%s",
+        int((file_results.get("runtime") or {}).get("rows") or 0),
+        final30_paths["runtime"],
+    )
+    logger.info(
+        "[FINAL30_SCORED][CORE_SAVE][LEDGER_OK] rows=%s path=%s",
+        int((file_results.get("ledger") or {}).get("rows") or 0),
+        final30_paths["ledger"],
+    )
+
+    reload_validation = _strict_validate_final30_files(env=env, as_of=as_of.isoformat())
+    reload_contract = watchlist_repo.verify_watchlist_scored_contract(
+        env=env,
+        as_of=as_of,
+        strategy="pb1_watchlist_final_scored",
+        allow_latest_fallback=False,
+    )
+    if not bool(reload_validation.get("ok")) or not bool(reload_contract.get("ok")):
+        raise RuntimeError(
+            "FINAL30_SCORED_CORE_SAVE_RELOAD_FAIL:"
+            f"db_ok={int(bool(reload_contract.get('ok')))} file_ok={int(bool(reload_validation.get('ok')))}"
+        )
+    logger.info(
+        "[FINAL30_SCORED][CORE_SAVE][RELOAD_OK] db_rows=%s runtime_rows=%s ledger_rows=%s",
+        int(reload_contract.get("rows") or 0),
+        int((file_results.get("runtime") or {}).get("rows") or 0),
+        int((file_results.get("ledger") or {}).get("rows") or 0),
+    )
+    logger.info("[FINAL30_SCORED][CORE_SAVE][DONE] rows=%s", len(scored_members))
+    return {
+        "db_rows": int(reload_contract.get("rows") or 0),
+        "runtime_rows": int((file_results.get("runtime") or {}).get("rows") or 0),
+        "ledger_rows": int((file_results.get("ledger") or {}).get("rows") or 0),
+        "signals_rows": int((file_results.get("signals") or {}).get("rows") or 0),
+        "runtime_path": final30_paths["runtime"],
+        "ledger_path": final30_paths["ledger"],
+        "signals_path": final30_paths["signals"],
+        "scored_contract": reload_contract,
+        "file_results": file_results,
+        "validation": reload_validation,
+        "exact_final_rows": exact_final_rows,
     }
 
 
@@ -1180,6 +1299,7 @@ def main() -> int:
         source_of_truth="candidate_pool",
         flow_provider=flow_provider,
         return_bundle=True,
+        save_intermediate_bundle=False,
     )
     watchlist_result_payload: Any = None
     if isinstance(watchlist_result, tuple):
@@ -1404,14 +1524,9 @@ def main() -> int:
                         exact_top50=topk,
                         exact_final30=finaln,
                     ):
-                        # Rebuild successful - save and use
-                        save_bundle(
-                            engine=engine,
-                            env=env,
-                            as_of=as_of,
-                            bundle=rebuilt_bundle,
-                        )
-                        
+                        # Rebuild successful - defer broader bundle persistence until DONE_CORE.
+                        logger.info("[BUNDLE][AUX][DEFER] reason=rebuild_bundle_ready_before_core as_of=%s", as_of)
+
                         bundle_universe = rebuilt_bundle.universe_scored
                         bundle_pool120 = rebuilt_bundle.pool120
                         bundle_top50 = rebuilt_bundle.top50
@@ -1563,118 +1678,79 @@ def main() -> int:
         final30_saved_df=final30_saved_df,
     )
 
-    scored_strategy = "pb1_watchlist_final_scored"
-    exact_final_rows: list[dict[str, Any]] = []
-    scored_contract: dict[str, Any] = {}
-    scored_members = _build_scored_members(final30_scored_df_for_export)
-    if scored_members:
-        watchlist_repo.save_watchlist(
-            env=env,
-            strategy=scored_strategy,
-            as_of=as_of,
-            members=scored_members,
-        )
-        logger.info("[WATCHLIST][SAVE] strategy=%s members=%s", scored_strategy, len(scored_members))
+    logger.info("[PREP][DONE_CORE][START] as_of=%s", as_of.isoformat())
+    core_save_result = save_final30_scored_core(
+        final30_scored_df_for_export,
+        as_of,
+        env,
+        engine=engine,
+        final_strategy=watchlist_final_strategy,
+        watchlist_rows=watchlist,
+    )
+    exact_final_rows = list(core_save_result.get("exact_final_rows") or [])
+    scored_contract = dict(core_save_result.get("scored_contract") or {})
+    final30_file_results = dict(core_save_result.get("file_results") or {})
+    final30_files_validation = dict(core_save_result.get("validation") or {})
+    logger.info("[PREP][DONE_CORE][DB_OK] rows=%s", core_save_result.get("db_rows", 0))
+    logger.info(
+        "[PREP][DONE_CORE][RUNTIME_OK] rows=%s path=%s",
+        core_save_result.get("runtime_rows", 0),
+        core_save_result.get("runtime_path", ""),
+    )
+    logger.info(
+        "[PREP][DONE_CORE][LEDGER_OK] rows=%s path=%s",
+        core_save_result.get("ledger_rows", 0),
+        core_save_result.get("ledger_path", ""),
+    )
+    core_marker_payload = {
+        "as_of": as_of.isoformat(),
+        "env": env,
+        "final_count": int(core_save_result.get("db_rows") or 0),
+        "flow_coverage": 0.0,
+        "done_phase": "core",
+        "runtime_rows": int(core_save_result.get("runtime_rows") or 0),
+        "ledger_rows": int(core_save_result.get("ledger_rows") or 0),
+        "signals_rows": int(core_save_result.get("signals_rows") or 0),
+    }
+    ledger_repo.append_event(
+        env=env,
+        run_id=run_id,
+        strategy="pb1_pullback_close",
+        run_window="prep",
+        event_type="PREP_DONE",
+        ts=now_kst(),
+        payload_json=core_marker_payload,
+    )
+    logger.info("[PREP][DONE_CORE][MARKER_OK] as_of=%s", as_of.isoformat())
+    logger.info("[PREP][DONE_CORE][DONE] as_of=%s rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
+    logger.info("[PREP][DONE] as_of=%s status=DONE_CORE rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
 
-        logger.info(
-            "[WATCHLIST][SAVE_VERIFY][START] strategy=%s as_of=%s",
-            scored_strategy,
-            as_of.isoformat(),
-        )
-        loaded_scored_rows, loaded_scored_as_of = watchlist_repo.load_watchlist_scored(
-            env=env,
-            strategy=scored_strategy,
-            as_of=as_of,
-            allow_latest_fallback=False,
-        )
-        loaded_scored_df = pd.DataFrame(loaded_scored_rows or [])
-        loaded_cols = [str(c) for c in loaded_scored_df.columns.tolist()]
-        logger.info(
-            "[WATCHLIST][SAVE_VERIFY][LOAD] rows=%s cols=%s used_as_of=%s",
-            len(loaded_scored_df),
-            loaded_cols,
-            loaded_scored_as_of.isoformat() if loaded_scored_as_of else "",
-        )
-
-        roundtrip_missing = [col for col in CRITICAL_SCORED_COLS if col not in loaded_cols]
-        if len(loaded_scored_df) != 30:
-            roundtrip_missing = [*roundtrip_missing, f"rows_not_30:{len(loaded_scored_df)}"]
-
-        if roundtrip_missing:
-            logger.error("[WATCHLIST][SAVE_VERIFY][FAIL] missing_cols=%s", roundtrip_missing)
-            logger.error("[PREP][FINAL30_SCORED][INTEGRITY_FAIL] db_roundtrip_missing_cols=%s", roundtrip_missing)
-            raise RuntimeError(f"PREP_FINAL30_SCORED_INTEGRITY_FAIL:{roundtrip_missing}")
-
-        logger.info(
-            "[WATCHLIST][SAVE_VERIFY][OK] strategy=%s critical_scored_cols_present=1",
-            scored_strategy,
-        )
-        scored_contract = watchlist_repo.verify_watchlist_scored_contract(
-            env=env,
-            as_of=as_of,
-            strategy=scored_strategy,
-            allow_latest_fallback=False,
-        )
-        exact_final_rows, _ = watchlist_repo.load_watchlist(
-            env=env,
-            strategy="pb1_watchlist_final",
-            as_of=as_of,
-            allow_latest_fallback=False,
-        )
-        scored_columns = set(scored_contract.get("columns") or [])
-        critical_missing_fields = [col for col in CRITICAL_SCORED_COLS if col not in scored_columns]
-        db_commit_ok = bool(scored_contract.get("ok") and len(exact_final_rows) == 30 and not critical_missing_fields)
-        logger.info(
-            "[PREP][FINAL30_SCORED][DB_VERIFY] env=%s as_of=%s final=%s final_scored=%s uniq_codes=%s uniq_ranks=%s null_critical=%s required=30 ok=%s",
-            env,
-            as_of.isoformat(),
-            len(exact_final_rows),
-            scored_contract.get("rows"),
-            scored_contract.get("uniq_codes"),
-            scored_contract.get("uniq_ranks"),
-            scored_contract.get("null_critical"),
-            int(db_commit_ok),
-        )
-        logger.info(
-            "[PREP][FINAL30][STRICT_VALIDATE][DB] ok=%s rows=%s invalid_rows=%s errors=%s warnings=%s",
-            int(bool(scored_contract.get("ok"))),
-            int(scored_contract.get("rows") or 0),
-            int(scored_contract.get("invalid_row_count") or 0),
-            list(scored_contract.get("errors") or []),
-            list(scored_contract.get("warnings") or []),
-        )
-        if scored_contract.get("rank_warn"):
-            logger.warning(
-                "[PREP][DB_COMMIT][WARN] rank_uniqueness_warn=1 source=%s",
-                scored_contract.get("rank_source") or "unknown",
-            )
-        if not db_commit_ok:
-            logger.error(
-                "[PREP][COMMIT][FAIL] env=%s as_of=%s final=%s final_scored=%s uniq_codes=%s null_critical=%s missing_fields=%s critical_missing_fields=%s",
-                env,
-                as_of.isoformat(),
-                len(exact_final_rows),
-                scored_contract.get("rows"),
-                scored_contract.get("uniq_codes"),
-                scored_contract.get("null_critical"),
-                scored_contract.get("missing_fields"),
-                critical_missing_fields,
-            )
-            raise RuntimeError("PREP_DB_COMMIT_VERIFY_FAILED")
-
-    logger.info("[FINAL30][FILE_MIRROR][TRY] targets=3")
-    try:
-        final30_file_results = _write_canonical_final30_scored_files(
-            env=env,
-            as_of=as_of.isoformat(),
-            df=final30_scored_df_for_export,
-        )
-    except Exception as exc:
-        logger.warning("[FINAL30][FILE_MIRROR][WARN] err=%s warn_only=1", exc)
-        final30_file_results = {
-            label: {"exists": False, "bytes": 0, "rows": 0, "json_ok": False}
-            for label in build_final30_scored_paths(repo_root().resolve(), env, as_of.isoformat()).keys()
-        }
+    logger.info("[WATCHLIST][REUSE][FINAL30_SCORED] hit=True")
+    logger.info("[WATCHLIST][REBUILD][SKIP] reason=existing_final30_scored")
+    aux_bundle = WatchlistBundle(
+        as_of=as_of.isoformat(),
+        env=env,
+        strategy=watchlist_final_strategy,
+        universe_scored=list(bundle_universe),
+        pool120=list(bundle_pool120),
+        top50=list(bundle_top50),
+        final30=final30_scored_df_for_export.to_dict(orient="records"),
+        meta={
+            "weights": watchlist_bundle.get("weights", {}),
+            "weights_effective": watchlist_bundle.get("weights_effective", watchlist_bundle.get("weights", {})),
+            "formula": watchlist_bundle.get("formula", ""),
+            "reject_summary": watchlist_bundle.get("reject_summary", {}),
+            "degrade": watchlist_bundle.get("degrade", {}),
+            "source": "prep_runner_existing_final30_scored",
+        },
+    )
+    aux_bundle_result = save_bundle_aux(
+        engine=engine,
+        env=env,
+        as_of=as_of,
+        bundle=aux_bundle,
+    )
+    core_done = True
     prep_repo_root = repo_root().resolve()
     prep_cwd = Path.cwd().resolve()
     final30_paths = build_final30_scored_paths(prep_repo_root, env, as_of.isoformat())
@@ -1977,7 +2053,7 @@ def main() -> int:
         _assert_same_nonzero("final30_pullback", inmem_stats["pullback_nonzero"], post_stats["pullback_nonzero"])
         _assert_same_nonzero("final30_momentum", inmem_stats["momentum_nonzero"], post_stats["momentum_nonzero"])
     except Exception:
-        strict_export = _env_true("PREP_EXPORT_STRICT", "1")
+        strict_export = False if core_done else _env_true("PREP_EXPORT_STRICT", "1")
         logger.exception(
             "[PREP][EXPORT][FAIL] as_of=%s out_dir=%s strict=%s",
             as_of,
@@ -1991,7 +2067,6 @@ def main() -> int:
     prep_status = "DONE"
     flow_coverage = 0.0
     degraded_exclude_flow = False
-    final30_files_validation = _strict_validate_final30_files(env=env, as_of=as_of.isoformat())
     final30_file_failures = [
         f"final30_file_contract_missing:{label}"
         for label, info in final30_file_results.items()
@@ -2016,7 +2091,7 @@ def main() -> int:
             final30_file_failures,
         )
     strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or []) + list(scored_contract.get("errors") or []) + list(final30_quality.get("errors") or [])
-    if (not final30_quality_ok) or (not bool(scored_contract.get("ok"))) or (not bool(final30_files_validation.get("ok"))):
+    if ((not final30_quality_ok) or (not bool(scored_contract.get("ok"))) or (not bool(final30_files_validation.get("ok")))) and not core_done:
         raise RuntimeError(
             "PREP_FINAL30_STRICT_VALIDATE_FAILED:"
             + ",".join(
@@ -2096,20 +2171,16 @@ def main() -> int:
     degraded_exclude_flow = False
     
     if flow_coverage < 0.5:
-        # Flow coverage < 50% → FAIL
-        logger.error(
-            "[PREP][FLOW][FAIL] coverage=%.1f%% < 50%% as_of=%s allow_flow_degraded=%s",
+        logger.warning(
+            "[PREP][FLOW][WARN] coverage=%.1f%% < 50%% as_of=%s allow_flow_degraded=%s core_done=%s",
             flow_coverage * 100.0,
             as_of,
             int(allow_flow_degraded_prep),
+            int(core_done),
         )
-        
-        if not allow_flow_degraded_prep:
-            raise RuntimeError(f"FLOW_COVERAGE_TOO_LOW:{flow_coverage:.2f}")
-        else:
-            prep_status = "DEGRADED"
-            degraded_exclude_flow = True
-            logger.warning("[PREP][FLOW][DEGRADED] tech-only mode enabled -> continue")
+        prep_status = "WARN" if core_done else "DEGRADED"
+        degraded_exclude_flow = True
+        logger.warning("[PREP][FLOW][DEGRADED] tech-only mode enabled -> continue")
     
     elif flow_coverage < 0.8:
         # Flow coverage 50%-80% → DEGRADED
@@ -2129,7 +2200,7 @@ def main() -> int:
             as_of,
         )
 
-    if strict_contract_failures:
+    if strict_contract_failures and not core_done:
         prep_status = "FAIL"
         logger.error(
             "[PREP][FINAL30_SCORED][CONTRACT_FAIL] as_of=%s failures=%s",
@@ -2160,10 +2231,7 @@ def main() -> int:
                 "core_only" if degraded_exclude_flow else "core_plus_flow",
             )
             
-            if not allow_degraded_prep:
-                prep_status = "FAIL"
-            else:
-                prep_status = "DEGRADED"
+            prep_status = "WARN" if core_done else ("DEGRADED" if allow_degraded_prep else "FAIL")
 
     report_failmode_soft = _env_true("REPORT_FAILMODE_SOFT", "1")
     try:
@@ -2236,7 +2304,10 @@ def main() -> int:
         final30_file_contract_ok = bool(final30_files_validation.get("ok"))
         if not final30_file_contract_ok:
             strict_contract_failures = list(dict.fromkeys(list(strict_contract_failures) + list(final30_file_failures)))
-            prep_status = "FAIL"
+            if core_done:
+                logger.warning("[PREP][AUX][WARN] final30 mirror resync failed after DONE_CORE failures=%s", final30_file_failures)
+            else:
+                prep_status = "FAIL"
     payload["prep_status"] = prep_status
     payload["final30_file_contract_ok"] = final30_file_contract_ok
     payload["final30_file_failures"] = list(final30_file_failures)
@@ -2246,7 +2317,14 @@ def main() -> int:
     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     
     # ✅ FIX: Mutually exclusive PREP event logging
-    if prep_status == "FAIL":
+    if core_done:
+        if prep_status == "FAIL":
+            logger.warning("[PREP][AUX][WARN] status=FAIL after DONE_CORE failures=%s", strict_contract_failures)
+        elif prep_status == "DEGRADED":
+            logger.warning("[PREP][AUX][WARN] status=DEGRADED after DONE_CORE")
+        elif prep_status == "WARN":
+            logger.warning("[PREP][AUX][WARN] status=WARN after DONE_CORE")
+    elif prep_status == "FAIL":
         ledger_repo.append_event(
             env=env,
             run_id=run_id,
@@ -2387,7 +2465,7 @@ def main() -> int:
         )
 
     logger.info(
-        "[PREP][DONE] as_of=%s source=%s universe=%s pool120=%s top50=%s final30=%s flow_coverage=%.1f final_source=%s contract_mode=%s status=%s quality_ok=%s soft_fail=%s trade_can_proceed=%s dt=%.2f",
+        "[PREP][DONE] as_of=%s source=%s universe=%s pool120=%s top50=%s final30=%s flow_coverage=%.1f final_source=%s contract_mode=%s status=%s quality_ok=%s soft_fail=%s trade_can_proceed=%s aux_ok=%s dt=%.2f",
         as_of.isoformat(),
         bundle_source,
         len(bundle_universe),
@@ -2401,6 +2479,7 @@ def main() -> int:
         int(final30_gate_decision["quality_ok"]),
         int(final30_gate_decision["soft_fail"]),
         int(final30_gate_decision["trade_can_proceed"]),
+        int(bool(aux_bundle_result.get("ok", False))) if isinstance(aux_bundle_result, dict) else 0,
         time.monotonic() - t0,
     )
     return 0

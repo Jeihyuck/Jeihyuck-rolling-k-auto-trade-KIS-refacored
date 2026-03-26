@@ -4382,6 +4382,217 @@ def save_bundle(
     logger.info("[BUNDLE][SAVE][DONE] env=%s as_of=%s", env, as_of)
 
 
+def normalize_final30_for_save(df_final30: pd.DataFrame | List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    logger.info("[NORMALIZE][FINAL30][START]")
+    final30_rows = df_final30.to_dict(orient="records") if isinstance(df_final30, pd.DataFrame) else list(df_final30 or [])
+    normalized_rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(final30_rows, start=1):
+        item = _sync_item_and_meta_fields(dict(row or {}))
+        code = str(item.get("code") or "").zfill(6)
+        if not code:
+            continue
+        item["code"] = code
+        breakout_score = _safe_float(item.get("breakout_score"), 0.0)
+        pullback_score = _safe_float(item.get("pullback_score"), 0.0)
+        momentum_score = _safe_float(item.get("momentum_score"), 0.0)
+        if not item.get("entry_style_selected"):
+            if breakout_score >= pullback_score and breakout_score >= momentum_score:
+                item["entry_style_selected"] = "BREAKOUT"
+            elif pullback_score >= momentum_score:
+                item["entry_style_selected"] = "PULLBACK"
+            else:
+                item["entry_style_selected"] = "MOMENTUM"
+        item["rank"] = _safe_int(item.get("rank") or item.get("rank_final30") or idx, idx)
+        item["score"] = _safe_float(
+            item.get("score", item.get("score_final", item.get("final_score", item.get("tech_score", 0.0)))),
+            0.0,
+        )
+        normalized_rows.append(_sync_item_and_meta_fields(_sanitize_scored_item(item, {}, source="normalize_final30_for_save")))
+
+    validation = verify_final30_scored_rows(
+        normalized_rows,
+        required_rows=30,
+        required_fields=FINAL30_CONTRACT_REQUIRED_FIELDS,
+        source="normalize_final30_for_save",
+    )
+    if not bool(validation.get("ok")):
+        logger.error(
+            "[NORMALIZE][FINAL30][FAIL] rows=%s errors=%s warnings=%s",
+            int(validation.get("rows") or 0),
+            list(validation.get("errors") or []),
+            list(validation.get("warnings") or []),
+        )
+        raise RuntimeError(f"FINAL30_NORMALIZE_FAILED:{list(validation.get('errors') or [])}")
+    logger.info("[NORMALIZE][FINAL30][OK] rows=%s", len(normalized_rows))
+    return normalized_rows
+
+
+def normalize_broader_bundle_for_save(
+    df_broader: pd.DataFrame | List[Dict[str, Any]],
+    *,
+    fallback_rows: List[Dict[str, Any]] | None = None,
+    stage_name: str,
+) -> List[Dict[str, Any]]:
+    logger.info("[NORMALIZE][BROADER][START] stage=%s", stage_name)
+    broader_rows = df_broader.to_dict(orient="records") if isinstance(df_broader, pd.DataFrame) else list(df_broader or [])
+    fallback_by_code = {
+        str((row or {}).get("code") or "").zfill(6): dict(row or {})
+        for row in (fallback_rows or [])
+        if (row or {}).get("code")
+    }
+    normalized_rows: List[Dict[str, Any]] = []
+    skipped = 0
+    for idx, row in enumerate(broader_rows, start=1):
+        item = _sync_item_and_meta_fields(dict(row or {}))
+        code = str(item.get("code") or "").zfill(6)
+        if not code:
+            skipped += 1
+            continue
+        item["code"] = code
+        ref = fallback_by_code.get(code, {})
+        for key in (
+            "breakout_score",
+            "pullback_score",
+            "momentum_score",
+            "rs_percentile",
+            "vcp_score",
+            "entry_style_selected",
+            "hi_52w",
+            "lo_52w",
+            "pivot_price",
+            "vol20",
+            "dollar_vol_50",
+            "ma20_slope",
+            "ma50_slope",
+            "ma150_slope",
+            "vcp_ok",
+            "breakout_trigger_ok",
+            "pullback_trigger_ok",
+            "momentum_trigger_ok",
+            "ma20",
+            "ma50",
+            "ma150",
+            "close",
+            "volume",
+            "volume_avg20",
+            "tech_score",
+            "flow_score",
+            "score_final",
+            "final_score",
+            "score",
+        ):
+            value = item.get(key)
+            if value in (None, "", [], {}):
+                ref_val = ref.get(key)
+                if ref_val not in (None, "", [], {}):
+                    item[key] = ref_val
+
+        breakout_score = _safe_float(item.get("breakout_score"), 0.0)
+        pullback_score = _safe_float(item.get("pullback_score"), 0.0)
+        momentum_score = _safe_float(item.get("momentum_score"), 0.0)
+        if not item.get("entry_style_selected"):
+            if breakout_score >= pullback_score and breakout_score >= momentum_score:
+                item["entry_style_selected"] = "BREAKOUT"
+            elif pullback_score >= momentum_score:
+                item["entry_style_selected"] = "PULLBACK"
+            else:
+                item["entry_style_selected"] = "MOMENTUM"
+
+        item["rank"] = _safe_int(item.get("rank") or item.get("rank_final30") or idx, idx)
+        item["score"] = _safe_float(
+            item.get("score", item.get("score_final", item.get("final_score", item.get("tech_score", 0.0)))),
+            0.0,
+        )
+        normalized = _sync_item_and_meta_fields(_sanitize_scored_item(item, ref, source=f"normalize_broader_bundle_for_save:{stage_name}"))
+        if not is_valid_positive_numeric(normalized.get("ma20")):
+            skipped += 1
+            logger.warning("[BROADER][ROW_SKIP] code=%s reason=ma20_missing", code)
+            continue
+        if not is_valid_positive_numeric(normalized.get("volume_avg20")):
+            skipped += 1
+            logger.warning("[BROADER][ROW_SKIP] code=%s reason=volume_avg20_missing", code)
+            continue
+        normalized_rows.append(normalized)
+
+    logger.info(
+        "[BROADER][SAVE_SUMMARY] input=%s saved=%s skipped=%s",
+        len(broader_rows),
+        len(normalized_rows),
+        skipped,
+    )
+    if normalized_rows:
+        logger.info(
+            "[NORMALIZE][BROADER][OK] stage=%s input=%s normalized=%s skipped=%s",
+            stage_name,
+            len(broader_rows),
+            len(normalized_rows),
+            skipped,
+        )
+    else:
+        logger.warning(
+            "[NORMALIZE][BROADER][SKIP] stage=%s input=%s normalized=0 skipped=%s",
+            stage_name,
+            len(broader_rows),
+            skipped,
+        )
+    return normalized_rows
+
+
+def save_bundle_aux(
+    *,
+    engine: Engine,
+    env: str,
+    as_of: date,
+    bundle: WatchlistBundle,
+) -> dict[str, Any]:
+    repo = WatchlistRepo(engine)
+    logger.info(
+        "[BUNDLE][AUX][START] env=%s as_of=%s universe=%s pool120=%s top50=%s final30=%s",
+        env,
+        as_of,
+        len(bundle.universe_scored),
+        len(bundle.pool120),
+        len(bundle.top50),
+        len(bundle.final30),
+    )
+    saved_counts = {"pb1_universe_scored": 0, "pb1_pool120": 0, "pb1_top50": 0}
+    try:
+        final30_scored_rows = normalize_final30_for_save(bundle.final30)
+        universe_scored_rows = normalize_broader_bundle_for_save(
+            bundle.universe_scored,
+            fallback_rows=final30_scored_rows,
+            stage_name="universe_scored",
+        )
+        pool120_rows = normalize_broader_bundle_for_save(
+            bundle.pool120,
+            fallback_rows=final30_scored_rows,
+            stage_name="pool120",
+        )
+        top50_rows = normalize_broader_bundle_for_save(
+            bundle.top50,
+            fallback_rows=final30_scored_rows,
+            stage_name="top50",
+        )
+
+        if universe_scored_rows:
+            repo.save_watchlist(env=env, strategy="pb1_universe_scored", as_of=as_of, members=universe_scored_rows)
+            saved_counts["pb1_universe_scored"] = len(universe_scored_rows)
+        if pool120_rows:
+            repo.save_watchlist(env=env, strategy="pb1_pool120", as_of=as_of, members=pool120_rows)
+            saved_counts["pb1_pool120"] = len(pool120_rows)
+        if top50_rows:
+            repo.save_watchlist(env=env, strategy="pb1_top50", as_of=as_of, members=top50_rows)
+            saved_counts["pb1_top50"] = len(top50_rows)
+    except Exception as exc:
+        logger.warning("[BUNDLE][AUX][WARN] reason=%s", exc, exc_info=True)
+        logger.warning("[BUNDLE][AUX][SKIP_SOFT_FAIL]")
+        logger.info("[BUNDLE][AUX][DONE] env=%s as_of=%s saved=%s", env, as_of, saved_counts)
+        return {"ok": False, "saved_counts": saved_counts, "reason": str(exc)}
+
+    logger.info("[BUNDLE][AUX][DONE] env=%s as_of=%s saved=%s", env, as_of, saved_counts)
+    return {"ok": True, "saved_counts": saved_counts, "reason": ""}
+
+
 def recover_bundle_from_db(
     *,
     engine: Engine,
@@ -4642,6 +4853,7 @@ def build_and_save_watchlist(
     source_of_truth: str = "candidate_pool",
     flow_provider: Optional[FlowProvider] = None,
     return_bundle: bool = False,
+    save_intermediate_bundle: bool = True,
 ) -> Any:
     """
     Watchlist를 생성하고 DB에 저장한다.
@@ -5005,7 +5217,7 @@ def build_and_save_watchlist(
     
     # CRITICAL: Always save bundle (4 stages) to prevent data loss
     # This ensures intermediate stages are never missing from DB
-    if builder.last_bundle:
+    if save_intermediate_bundle and builder.last_bundle:
         try:
             broader_universe_scored = list(builder.last_bundle.get("universe_scored", []) or [])
             try:
@@ -5075,6 +5287,8 @@ def build_and_save_watchlist(
                 exc_info=True,
             )
             # Don't raise - allow workflow to continue but log as critical
+    elif builder.last_bundle:
+        logger.info("[WATCHLIST][BUNDLE][SAVE_DEFER] as_of=%s reason=save_intermediate_bundle_disabled", as_of)
 
     if return_bundle:
         if builder.last_bundle is None:

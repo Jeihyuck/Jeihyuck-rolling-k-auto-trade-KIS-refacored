@@ -15,6 +15,8 @@ from typing import Any
 
 
 FINAL30_SUCCESS_PATTERNS: dict[str, str] = {
+    "done_core": r"\[PREP\]\[DONE_CORE\]\[DONE\]",
+    "core_save_done": r"\[FINAL30_SCORED\]\[CORE_SAVE\]\[DONE\]",
     "watchlist_final_save": r"\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\]",
     "watchlist_final_scored_save": r"\[WATCHLIST\]\[SAVE\] strategy=pb1_watchlist_final_scored",
     "final30_snapshot_save": r"\[PREP\]\[FINAL30_SNAPSHOT\]\[SAVE\]",
@@ -88,6 +90,7 @@ def _extract_first(pattern: str, text: str) -> str:
 
 def _extract_as_of(log_content: str) -> str:
     patterns = [
+        r"\[PREP\]\[DONE_CORE\]\[DONE\] as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
         r"\[PREP\]\[FINAL30\]\[CONTRACT_OK\] as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
         r"\[PREP\]\[DB_COMMIT\]\[VERIFY\].* as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
         r"\[PREP\]\[WATCHLIST_FINAL\]\[SAVE\].* as_of=([0-9]{4}-[0-9]{2}-[0-9]{2})",
@@ -293,7 +296,7 @@ def parse_log_file(log_path: Path) -> VerifyResults:
 
     if re.search(r"event_type=PREP_DONE", log_content):
         results.prep_done = True
-    if re.search(r"\[PREP\]\[DONE\]", log_content):
+    if re.search(r"\[PREP\]\[DONE\]", log_content) or re.search(r"\[PREP\]\[DONE_CORE\]\[DONE\]", log_content):
         results.prep_done_log = True
 
     if re.search(r"\[PREP\]\[DERIVED_VERIFY\]\[OK\]", log_content):
@@ -418,7 +421,7 @@ def print_verification_results(results: VerifyResults) -> None:
         print("FAIL PREP_DONE missing")
 
     if results.prep_done_log:
-        print("PASS [PREP][DONE] found")
+        print("PASS [PREP][DONE] or [PREP][DONE_CORE][DONE] found")
     else:
         print("FAIL [PREP][DONE] missing")
 
