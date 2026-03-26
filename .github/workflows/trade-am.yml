@@ -1,44 +1,30 @@
-name: Prep Delta (Universe + OHLCV + Derived + Watchlist)
+name: "Trade AM"
 
-on:
+"on":
   schedule:
-    # Mon-Fri 08:40 KST = Sun-Thu 23:40 UTC
-    - cron: "40 23 * * 0-4"
+    # Mon-Fri 10:05 KST = 01:05 UTC
+    - cron: "5 1 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:
-  group: prep-delta
+  group: pb1-practice-serial
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 env:
-  MODE: prep
   STRATEGY_ENV: practice
   KIS_ENV: practice
-  PREFETCH_DAYS: "1"
-  OHLCV_DELTA_DAYS: "1"
-  FORCE_CANDIDATE: "0"
-  DRYRUN: "0"
-  FORCE_BLOCK_LIVE: "1"
-  ALLOW_LIVE_GATE: "0"
-  ANALYSIS_ONLY: "0"
-  ATR_MAX_PCT: "0.10"
-  PB1_RUN_IN_MINERVINI_TEST: "0"
-  FORCE_COMPUTE_ON_CUTOFF: "1"
-  BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
-
-  # Backward-compatible aliases
-  DRY_RUN: "0"
-  DISABLE_LIVE_TRADING: "1"
-  LIVE_TRADING_ENABLED: "0"
-  MINERVINI_ONLY: "0"
-  MINERVINI_TEST_WITH_PB1: "0"
-  FORCE_COMPUTE_WHEN_CUTOFF: "1"
-  BYPASS_ENTRY_CUTOFF_FOR_COMPUTE: "1"
-
-  CANDIDATE_POOL_FORCE_REBUILD: "0"
-  CANDIDATE_POOL_PREFETCH_DAYS: "1"
+  KIS_HTTP_ENABLED: "1"
+  NO_TRADE: "0"
+  FAIL_IF_POOL_MISSING: "1"
+  CANDIDATE_POOL_TTL_DAYS: "7"
   CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
   CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
+  CANDIDATE_POOL_UNIVERSE_ENV: "practice"
+  MINERVINI_USE_FEATURE_CACHE: "1"
+  FEATURE_CACHE_WARMUP_ON_TICK: "0"
   DB_DISABLE_PREPARED_STATEMENTS: "1"
 
 defaults:
@@ -47,9 +33,9 @@ defaults:
     working-directory: repo
 
 jobs:
-  prep_delta:
+  trade_am:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     env:
       TZ: Asia/Seoul
@@ -58,7 +44,6 @@ jobs:
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       SQLITE_DISABLED: "1"
       BOTSTATE_DISABLED: "1"
-
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
@@ -71,13 +56,12 @@ jobs:
         with:
           path: repo
           fetch-depth: 1
-          ref: "nullim"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
@@ -100,17 +84,23 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
-      - name: Run prep delta
+      - name: Verify candidate pool exists in DB
         run: |
           set -euo pipefail
-          echo "======================================"
-          echo "Prep Delta"
-          echo "======================================"
-          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "Env: ${STRATEGY_ENV}"
-          echo "MODE: ${MODE}"
-          echo "======================================"
-          python -m trader.prep_runner
+          python -m trader.verify_candidate_pool
+
+      - name: Run AM trade tick
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python -m trader.trade_tick 2>&1 | tee artifacts/trade-am.log
+
+      - name: Verify AM trade tick logs
+        run: |
+          set -euo pipefail
+          grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-am.log >/dev/null
+          grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null
+          grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -123,3 +113,11 @@ jobs:
             exit 1
           fi
           echo "OK: no sqlite artifacts."
+
+      - name: Upload AM logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-am-logs
+          path: repo/artifacts/
+          if-no-files-found: ignore

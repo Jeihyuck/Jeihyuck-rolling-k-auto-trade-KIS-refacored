@@ -1,413 +1,52 @@
-name: "Trade Tick (Intraday)"
+name: Unified Pipeline Manual Debug
 
 on:
-  # ✅ Trade Tick: Mon-Fri 09:00~15:30 KST every 5 min (UTC 00:00~06:30)
-  # ✅ Prep은 별도 워크플로(trade-prep.yml)에서 KST 08:00에 실행
-  schedule:
-    - cron: "0-30/5 0-6 * * 1-5"
-
   workflow_dispatch:
     inputs:
-      AS_OF_OVERRIDE:
-        description: "Force as_of date (e.g., 2026-02-19). Leave empty to auto."
-        required: false
-        default: ""
-        
-      MODE:
-        description: "prep | candidate | trade | both | minervini_test"
+      mode:
+        description: Manual debug mode
         required: true
-        default: "prep"
+        default: trade
         type: choice
         options:
           - prep
-          - candidate
           - trade
-          - both
-          - minervini_test
-      STRATEGY_ENV:
-        description: "practice | real"
-        required: true
-        default: "practice"
-      PREFETCH_DAYS:
-        description: "OHLCV full prefetch days (e.g., 520). For delta prep keep 5"
-        required: true
-        default: "5"
-      OHLCV_DELTA_DAYS:
-        description: "Delta days for OHLCV (default 5)"
-        required: true
-        default: "5"
-      OHLCV_PREFETCH_MODE:
-        description: "auto | full | delta (auto=history sufficient면 delta만)"
-        required: true
-        default: "auto"
-        type: choice
-        options:
-          - auto
-          - full
-          - delta
-      FORCE_CANDIDATE:
-        description: "1=force rebuild candidate pool"
-        required: true
-        default: "0"
-      DRYRUN:
-        description: "1=dryrun (manual test)"
-        required: true
-        default: "0"
-      ANALYSIS_ONLY:
-        description: "1=analysis only"
-        required: true
-        default: "0"
-      FORCE_BLOCK_LIVE:
-        description: "1=force block live (manual test)"
-        required: true
-        default: "1"
-      ALLOW_LIVE_GATE:
-        description: "1=allow live gate (for real trading windows)"
-        required: true
-        default: "0"
-      ATR_MAX_PCT:
-        description: "ATR max percent (ratio like 0.10)"
-        required: true
-        default: "0.10"
-      PB1_RUN_IN_MINERVINI_TEST:
-        description: "1=run PB1 decision pipeline during minervini_test"
-        required: true
-        default: "0"
-      FORCE_COMPUTE_ON_CUTOFF:
-        description: "1=force compute even when entry cutoff blocks orders"
-        required: true
-        default: "1"
-      BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY:
-        description: "1=bypass entry cutoff for compute only"
-        required: true
-        default: "1"
-      FORCE_HTTP:
-        description: "1=force KIS HTTP calls even in DIAG mode (for quote/balance/token)"
-        required: true
-        default: "0"
-      ORDER_TEST:
-        description: "1=enable order endpoint testing (with safety guards)"
-        required: true
-        default: "0"
-      MAX_ORDER_KRW_TEST:
-        description: "Maximum order amount in KRW for order testing (default 50000)"
-        required: false
-        default: "50000"
-      UNIVERSE_EMERGENCY_BUILD:
-        description: "1=if universe missing, build and save to DB"
-        required: true
-        default: "1"
-      UNIVERSE_FORCE_REBUILD:
-        description: "1=force rebuild universe for as_of"
-        required: true
-        default: "0"
-      UNIVERSE_NO_FALLBACK:
-        description: "1=disable universe fallback and require exact as_of"
-        required: true
-        default: "1"
-      UNIVERSE_BUILD_IF_MISSING:
-        description: "1=auto-build universe when exact as_of is missing"
-        required: true
-        default: "1"
-      UNIVERSE_FORCE_REBUILD_ALWAYS:
-        description: "1=always rebuild universe for as_of even if already exists"
-        required: true
-        default: "0"
-      ALLOW_KIS_DATA_HTTP_IN_DIAG:
-        description: "1=allow KIS data HTTP in DIAG mode (marketcap, quote, etc.)"
-        required: true
-        default: "1"
-      DB_MIGRATE_MODE:
-        description: "auto | always | off (auto=run only when pending migration exists)"
-        required: true
-        default: "auto"
-        type: choice
-        options:
-          - auto
-          - always
-          - off
+          - close
+
+concurrency:
+  group: pb1-practice-serial
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: pb1-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.MODE || 'auto' }}
-  cancel-in-progress: true
-
 env:
-  TZ: Asia/Seoul
-  PYTHONUNBUFFERED: "1"
+  STRATEGY_ENV: practice
+  KIS_ENV: practice
   DB_DISABLE_PREPARED_STATEMENTS: "1"
 
-  # ✅ 기본값(스케줄 실행에서 inputs가 없으니 여기서 안전 기본값을 보장)
-  MODE: "prep"
-  STRATEGY_ENV: "practice"
-  KIS_ENV: "practice"
-
-  # ✅ Delta 기본: 최근 5일 델타 (전일 누락 흡수용)
-  PREFETCH_DAYS: "5"
-  OHLCV_DELTA_DAYS: "5"
-  OHLCV_PREFETCH_MODE: "auto"
-
-  # ✅ RS Benchmark backfill (229200 KOSPI 지수)
-  RS_BENCHMARK: "229200"
-  BENCH_OHLCV_DAYS: "520"
-
-  FORCE_CANDIDATE: "0"
-  DRYRUN: "0"
-  ANALYSIS_ONLY: "0"
-
-  # ✅ 안전 기본: 스케줄은 주문 차단(원하면 trade-tick에서만 해제)
-  FORCE_BLOCK_LIVE: "1"
-  ALLOW_LIVE_GATE: "0"
-
-  ATR_MAX_PCT: "0.10"
-  MINERVINI_VCP_MAX_RECENT_RANGE_PCT: "0.41"
-  MINERVINI_VCP_PIVOT_NEAR_PCT: "0.16"
-  MINERVINI_VCP_VOL_SHRINK_MODE: "median"
-  MINERVINI_VCP_VOL_SHRINK_TOL: "1.65"
-  MINERVINI_VCP_TIGHTNESS_TOL_MULT: "1.30"
-  MINERVINI_RESULT_VERSION: "v2_relaxed_vcp"
-  MINERVINI_INPUT_SOURCE: "final30"
-  PB1_RUN_IN_MINERVINI_TEST: "0"
-  FORCE_COMPUTE_ON_CUTOFF: "1"
-  BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: "1"
-
-  # Backward-compatible aliases
-  DRY_RUN: "0"
-  DISABLE_LIVE_TRADING: "1"
-  LIVE_TRADING_ENABLED: "0"
-  MINERVINI_ONLY: "0"
-  MINERVINI_TEST_WITH_PB1: "0"
-  FORCE_COMPUTE_WHEN_CUTOFF: "1"
-  BYPASS_ENTRY_CUTOFF_FOR_COMPUTE: "1"
-
-  CANDIDATE_POOL_FORCE_REBUILD: "0"
-  CANDIDATE_POOL_PREFETCH_DAYS: "520"
-  CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
-  CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
-  UNIVERSE_NO_FALLBACK: "1"
-  UNIVERSE_BUILD_IF_MISSING: "1"
-  UNIVERSE_FORCE_REBUILD_ALWAYS: "0"
-  DB_MIGRATE_MODE: "auto"
+defaults:
+  run:
+    shell: bash
+    working-directory: repo
 
 jobs:
-  resolve:
+  manual_debug:
     runs-on: ubuntu-latest
-    outputs:
-      run_mode: ${{ steps.set.outputs.run_mode }}
-      strategy_env: ${{ steps.set.outputs.strategy_env }}
-      strategy_mode: ${{ steps.set.outputs.strategy_mode }}
-      allow_live_gate: ${{ steps.set.outputs.allow_live_gate }}
-      force_block_live: ${{ steps.set.outputs.force_block_live }}
-      kill_switch: ${{ steps.set.outputs.kill_switch }}
-      dryrun: ${{ steps.set.outputs.dryrun }}
-      analysis_only: ${{ steps.set.outputs.analysis_only }}
-    steps:
-      - id: set
-        run: |
-          set -euo pipefail
+    timeout-minutes: 40
 
-          # ----- 기본값(스케줄) -----
-          # AUTO LIVE ARMING: compute_live_gate()가 시간 기반으로 자동 결정
-          # - STRATEGY_MODE만 설정하면 거래 시간대 자동 감지
-          # - FORCE_BLOCK_LIVE=0 (긴급 상황에만 1로 설정)
-          # - KILL_SWITCH는 별도 환경변수로 설정 가능 (최우선 차단)
-          RUN_MODE="prep"
-          STRATEGY_ENV="practice"
-          STRATEGY_MODE="DIAG"
-          ALLOW_LIVE_GATE="0"
-          FORCE_BLOCK_LIVE="0"
-          KILL_SWITCH="0"
-          DRYRUN="0"
-          ANALYSIS_ONLY="0"
-
-          # ----- workflow_dispatch면 inputs로 덮어쓰기 -----
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            RUN_MODE="${{ inputs.MODE }}"
-            STRATEGY_ENV="${{ inputs.STRATEGY_ENV }}"
-            DRYRUN="${{ inputs.DRYRUN }}"
-            ANALYSIS_ONLY="${{ inputs.ANALYSIS_ONLY }}"
-            
-            # workflow_dispatch에서는 prep 모드일 때 강제 차단
-            if [[ "${RUN_MODE}" == "prep" ]]; then
-              STRATEGY_MODE="DIAG"
-              ALLOW_LIVE_GATE="0"
-              FORCE_BLOCK_LIVE="1"
-              echo "[RESOLVE] prep mode detected - forcing STRATEGY_MODE=DIAG, FORCE_BLOCK_LIVE=1"
-            else
-              # trade 모드: time-based policy에 맡김
-              STRATEGY_MODE="LIVE"
-              ALLOW_LIVE_GATE="${{ inputs.ALLOW_LIVE_GATE }}"
-              FORCE_BLOCK_LIVE="${{ inputs.FORCE_BLOCK_LIVE }}"
-            fi
-          fi
-
-          # ----- schedule일 때: KST 시간 기반 모드 결정 -----
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            # KST 시간 계산 (UTC+9)
-            KST_HOUR=$(TZ=Asia/Seoul date '+%H')
-            KST_MIN=$(TZ=Asia/Seoul date '+%M')
-            KST_TIME="${KST_HOUR}:${KST_MIN}"
-            KST_DOW=$(TZ=Asia/Seoul date '+%u')  # 1=Mon, 5=Fri
-            
-            echo "[RESOLVE] KST time: ${KST_TIME}, day of week: ${KST_DOW}"
-            
-            # KST 08:40 = prep delta
-            if [[ "${KST_HOUR}" == "08" && "${KST_MIN}" == "40" ]]; then
-              RUN_MODE="prep"
-              STRATEGY_MODE="DIAG"
-              ALLOW_LIVE_GATE="0"
-              FORCE_BLOCK_LIVE="1"
-              echo "[RESOLVE] Detected prep delta window (08:40 KST) - STRATEGY_MODE=DIAG"
-            # KST 09:00~15:30 on weekdays (Mon-Fri) = trade tick  
-            elif [[ "${KST_DOW}" -ge 1 && "${KST_DOW}" -le 5 ]]; then
-              # Convert to minutes for easier comparison
-              KST_MINUTES=$((10#${KST_HOUR} * 60 + 10#${KST_MIN}))
-              START_MIN=$((9 * 60))      # 09:00 = 540
-              END_MIN=$((15 * 60 + 30))  # 15:30 = 930
-              
-              if [[ "${KST_MINUTES}" -ge "${START_MIN}" && "${KST_MINUTES}" -le "${END_MIN}" ]]; then
-                RUN_MODE="trade"
-                STRATEGY_MODE="LIVE"
-                ALLOW_LIVE_GATE="1"
-                FORCE_BLOCK_LIVE="0"
-                echo "[RESOLVE] Detected trade tick window (${KST_TIME} KST) - STRATEGY_MODE=LIVE (auto gate active)"
-              else
-                # Outside market hours - run trade but with DIAG mode
-                RUN_MODE="trade"
-                STRATEGY_MODE="DIAG"
-                ALLOW_LIVE_GATE="0"
-                FORCE_BLOCK_LIVE="0"
-                echo "[RESOLVE] Outside market hours (${KST_TIME} KST) - STRATEGY_MODE=DIAG (auto gate will block)"
-              fi
-            else
-              # Weekend - run trade but DIAG mode
-              RUN_MODE="trade"
-              STRATEGY_MODE="DIAG"
-              ALLOW_LIVE_GATE="0"
-              FORCE_BLOCK_LIVE="0"
-              echo "[RESOLVE] Weekend detected - STRATEGY_MODE=DIAG (auto gate will block)"
-            fi
-          fi
-
-          echo "run_mode=${RUN_MODE}" >> "$GITHUB_OUTPUT"
-          echo "strategy_env=${STRATEGY_ENV}" >> "$GITHUB_OUTPUT"
-          echo "strategy_mode=${STRATEGY_MODE}" >> "$GITHUB_OUTPUT"
-          echo "allow_live_gate=${ALLOW_LIVE_GATE}" >> "$GITHUB_OUTPUT"
-          echo "force_block_live=${FORCE_BLOCK_LIVE}" >> "$GITHUB_OUTPUT"
-          echo "kill_switch=${KILL_SWITCH}" >> "$GITHUB_OUTPUT"
-          echo "dryrun=${DRYRUN}" >> "$GITHUB_OUTPUT"
-          echo "analysis_only=${ANALYSIS_ONLY}" >> "$GITHUB_OUTPUT"
-
-          echo "======================================"
-          echo "[RESOLVE] Effective Configuration"
-          echo "======================================"
-          echo "event: ${GITHUB_EVENT_NAME}"
-          echo "mode: ${RUN_MODE}"
-          echo "env: ${STRATEGY_ENV}"
-          echo "strategy_mode: ${STRATEGY_MODE}"
-          echo "allow_live_gate: ${ALLOW_LIVE_GATE}"
-          echo "force_block_live: ${FORCE_BLOCK_LIVE}"
-          echo "kill_switch: ${KILL_SWITCH}"
-          echo "dryrun: ${DRYRUN}"
-          echo "analysis_only: ${ANALYSIS_ONLY}"
-          echo "======================================"
-
-  run:
-    needs: [resolve]
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    defaults:
-      run:
-        shell: bash
-        working-directory: repo
     env:
-      AS_OF_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.AS_OF_OVERRIDE || '' }}
+      TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-
-      # ✅ secrets
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       SQLITE_DISABLED: "1"
       BOTSTATE_DISABLED: "1"
-
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-
-      # ✅ resolve outputs 반영
-      MODE: ${{ needs.resolve.outputs.run_mode }}
-      STRATEGY_ENV: ${{ needs.resolve.outputs.strategy_env }}
-      KIS_ENV: ${{ needs.resolve.outputs.strategy_env }}
-      STRATEGY_MODE: ${{ needs.resolve.outputs.strategy_mode }}
-      ALLOW_LIVE_GATE: ${{ needs.resolve.outputs.allow_live_gate }}
-      FORCE_BLOCK_LIVE: ${{ needs.resolve.outputs.force_block_live }}
-      KILL_SWITCH: ${{ needs.resolve.outputs.kill_switch }}
-      DRYRUN: ${{ needs.resolve.outputs.dryrun }}
-      ANALYSIS_ONLY: ${{ needs.resolve.outputs.analysis_only }}
-      
-      # ✅ KIS HTTP settings for DIAG mode
-      ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ github.event_name == 'workflow_dispatch' && inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
-      
-      # Optional: 개장 직후 버퍼 (초)
-      OPEN_BUFFER_SEC: "5"
-
-      # ✅ delta 기본(수동입력 있으면 override)
-      PREFETCH_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.PREFETCH_DAYS || '1' }}
-      OHLCV_DELTA_DAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_DELTA_DAYS || '5' }}
-      OHLCV_PREFETCH_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.OHLCV_PREFETCH_MODE || 'auto' }}
-      FORCE_CANDIDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_CANDIDATE || '0' }}
-      ATR_MAX_PCT: ${{ github.event_name == 'workflow_dispatch' && inputs.ATR_MAX_PCT || '0.10' }}
-      MINERVINI_VCP_MAX_RECENT_RANGE_PCT: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_MAX_RECENT_RANGE_PCT || '0.41' }}
-      MINERVINI_VCP_PIVOT_NEAR_PCT: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_PIVOT_NEAR_PCT || '0.16' }}
-      MINERVINI_VCP_VOL_SHRINK_MODE: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_VOL_SHRINK_MODE || 'median' }}
-      MINERVINI_VCP_VOL_SHRINK_TOL: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_VOL_SHRINK_TOL || '1.65' }}
-      MINERVINI_VCP_TIGHTNESS_TOL_MULT: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_VCP_TIGHTNESS_TOL_MULT || '1.30' }}
-      MINERVINI_RESULT_VERSION: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_RESULT_VERSION || 'v2_relaxed_vcp' }}
-      MINERVINI_INPUT_SOURCE: ${{ github.event_name == 'workflow_dispatch' && vars.MINERVINI_INPUT_SOURCE || 'final30' }}
-      TRADE_INPUT: "final30"
-      FORCE_FINAL30_REBUILD: "0"
-      MIN_BUYABLE: "5"
-      RELAX_PASSES: "3"
-      RS_PCTILE_STEP: "5"
-      VCP_SCORE_STEP: "5"
-      KEEP_TREND_TEMPLATE_ALWAYS: "1"
-      PB1_RUN_IN_MINERVINI_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_RUN_IN_MINERVINI_TEST || '0' }}
-      FORCE_COMPUTE_ON_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
-      BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
-      ORDER_TEST_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
-      ORDER_TEST_WHITELIST: ""
-      ORDER_TEST_MAX_KRW: ${{ github.event_name == 'workflow_dispatch' && inputs.MAX_ORDER_KRW_TEST || '50000' }}
-      ORDER_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.ORDER_TEST || '0' }}
-      ORDER_TEST_SYMBOLS: ""
-      MAX_ORDER_KRW_TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.MAX_ORDER_KRW_TEST || '50000' }}
-
-      # ✅ 유니버스 자동 생성 옵션 (수동 실행 시에만 활성화, 스케줄은 0)
-      # universe flags (new)
-      UNIVERSE_EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
-      UNIVERSE_FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
-      UNIVERSE_NO_FALLBACK: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_NO_FALLBACK || '1' }}
-      UNIVERSE_BUILD_IF_MISSING: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_BUILD_IF_MISSING || '1' }}
-      UNIVERSE_FORCE_REBUILD_ALWAYS: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD_ALWAYS || '0' }}
-      DB_MIGRATE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.DB_MIGRATE_MODE || 'auto' }}
-      FLOW_MODE: "PREV_CLOSE_ONLY"
-      FLOW_STRICT: "0"
-      DEGRADED_EXCLUDE_FLOW: "1"
-
-      # universe flags (legacy aliases)
-      EMERGENCY_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_EMERGENCY_BUILD || '0' }}
-      FORCE_REBUILD_UNIVERSE: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
-      FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.UNIVERSE_FORCE_REBUILD || '0' }}
-
-      # aliases
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.DRYRUN || '0' }}
-      DISABLE_LIVE_TRADING: ${{ needs.resolve.outputs.force_block_live == '1' && '1' || '0' }}
-      LIVE_TRADING_ENABLED: ${{ needs.resolve.outputs.force_block_live == '1' && '0' || '1' }}
-      FORCE_COMPUTE_WHEN_CUTOFF: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_COMPUTE_ON_CUTOFF || '1' }}
-      BYPASS_ENTRY_CUTOFF_FOR_COMPUTE: ${{ github.event_name == 'workflow_dispatch' && inputs.BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY || '1' }}
 
     steps:
       - name: Checkout
@@ -415,71 +54,19 @@ jobs:
         with:
           path: repo
           fetch-depth: 1
-          ref: "nullim"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Debug tree (repo sanity)
-        shell: bash
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
-          pwd
-          ls -la
-          echo "---- repo ----"
-          ls -la repo || true
-          echo "---- repo/trader ----"
-          ls -la repo/trader | head -n 80 || true
-          test -f repo/trader/minervini_v2_runner.py && echo "OK: minervini_v2_runner.py exists" || (echo "::error::missing repo/trader/minervini_v2_runner.py" && exit 1)
-
-      - name: Import check (preflight)
-        shell: bash
-        working-directory: repo
-        env:
-          PYTHONPATH: ${{ github.workspace }}/repo
-        run: |
-          set -euo pipefail
-          echo "PWD=$(pwd)"
-          python -c "import sys; print('sys.path[0:5]=', sys.path[0:5])"
-          python -c "import trader; print('✅ trader - OK')"
-          python -c "import trader.db.migrate; print('✅ trader.db.migrate - OK')"
-
-          case "${MODE}" in
-            prep) python -c "import trader.prep_runner; print('✅ trader.prep_runner - OK')" ;;
-            candidate) python -c "import trader.candidate_pool_builder; print('✅ trader.candidate_pool_builder - OK')" ;;
-            trade) python -c "import trader.trade_tick; print('✅ trader.trade_tick - OK')" ;;
-            both)
-              python -c "import trader.prep_runner; print('✅ trader.prep_runner - OK')"
-              python -c "import trader.candidate_pool_builder; print('✅ trader.candidate_pool_builder - OK')"
-              python -c "import trader.trade_tick; print('✅ trader.trade_tick - OK')"
-              ;;
-            minervini_test) python -c "import trader.minervini_v2_runner; print('✅ trader.minervini_v2_runner - OK')" ;;
-            *) echo "::error::Unknown MODE=${MODE}"; exit 1 ;;
-          esac
-
-      - name: Install DB drivers
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install "SQLAlchemy>=2.0" "psycopg[binary]>=3.1"
-          python - <<'PY'
-          import sqlalchemy, psycopg
-          print("SQLAlchemy:", sqlalchemy.__version__)
-          print("psycopg:", psycopg.__version__)
-          PY
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Guard postgres-only
         run: |
@@ -490,356 +77,42 @@ jobs:
             exit 1
           fi
 
-      - name: Print effective config
+      - name: DB migrate
         run: |
           set -euo pipefail
-          echo "======================================"
-          echo "Unified Single YML - Effective Config"
-          echo "======================================"
-          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "event: ${GITHUB_EVENT_NAME}"
-          echo "MODE: ${MODE}"
-          echo "ENV: ${STRATEGY_ENV}"
-          echo "PREFETCH_DAYS: ${PREFETCH_DAYS}"
-          echo "OHLCV_DELTA_DAYS: ${OHLCV_DELTA_DAYS}"
-          echo "OHLCV_PREFETCH_MODE: ${OHLCV_PREFETCH_MODE}"
-          echo "FORCE_CANDIDATE: ${FORCE_CANDIDATE}"
-          echo "UNIVERSE_EMERGENCY_BUILD: ${UNIVERSE_EMERGENCY_BUILD:-}"
-          echo "UNIVERSE_FORCE_REBUILD: ${UNIVERSE_FORCE_REBUILD:-}"
-          echo "UNIVERSE_NO_FALLBACK: ${UNIVERSE_NO_FALLBACK:-}"
-          echo "UNIVERSE_BUILD_IF_MISSING: ${UNIVERSE_BUILD_IF_MISSING:-}"
-          echo "UNIVERSE_FORCE_REBUILD_ALWAYS: ${UNIVERSE_FORCE_REBUILD_ALWAYS:-}"
-          echo "DB_MIGRATE_MODE: ${DB_MIGRATE_MODE:-auto}"
-          echo "ALLOW_LIVE_GATE: ${ALLOW_LIVE_GATE}"
-          echo "FORCE_BLOCK_LIVE: ${FORCE_BLOCK_LIVE}"
-          echo "DRYRUN: ${DRYRUN}"
-          echo "ANALYSIS_ONLY: ${ANALYSIS_ONLY}"
-          echo "======================================"
-
-      - name: Decide DB migrate plan
-        id: db_migrate_plan
-        shell: bash
-        working-directory: repo
-        env:
-          PYTHONPATH: ${{ github.workspace }}/repo
-        run: |
-          set -euo pipefail
-          mode_raw="${DB_MIGRATE_MODE:-auto}"
-          mode="$(echo "${mode_raw}" | tr '[:upper:]' '[:lower:]')"
-
-          if [[ "${mode}" == "always" ]]; then
-            echo "should_migrate=1" >> "$GITHUB_OUTPUT"
-            echo "reason=forced_always" >> "$GITHUB_OUTPUT"
-            echo "pending_count=-1" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [[ "${mode}" == "off" ]]; then
-            echo "should_migrate=0" >> "$GITHUB_OUTPUT"
-            echo "reason=forced_off" >> "$GITHUB_OUTPUT"
-            echo "pending_count=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          python - <<'PY' > /tmp/db_migrate_plan.out
-          import glob
-          import os
-          import sqlalchemy as sa
-          from trader.db.engine import make_engine
-
-          files = sorted(
-              os.path.basename(path)
-              for path in glob.glob("migrations/*.sql")
-              if os.path.isfile(path)
-          )
-          if not files:
-              print("should_migrate=0")
-              print("reason=no_migration_files")
-              print("pending_count=0")
-              raise SystemExit(0)
-
-          engine = make_engine()
-          with engine.begin() as conn:
-              conn.exec_driver_sql(
-                  """
-                  CREATE TABLE IF NOT EXISTS schema_migrations (
-                      version TEXT PRIMARY KEY,
-                      applied_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-                  )
-                  """
-              )
-              applied = {row[0] for row in conn.execute(sa.text("SELECT version FROM schema_migrations"))}
-
-          pending = [version for version in files if version not in applied]
-          print(f"should_migrate={1 if pending else 0}")
-          print(f"reason={'pending_found' if pending else 'no_pending'}")
-          print(f"pending_count={len(pending)}")
-          PY
-
-          cat /tmp/db_migrate_plan.out >> "$GITHUB_OUTPUT"
-          echo "[DB][MIGRATE][PLAN] $(cat /tmp/db_migrate_plan.out | tr '\n' ' ')"
-
-      - name: Keep MIGRATE_MODE=AUTO when no pending
-        if: ${{ steps.db_migrate_plan.outputs.should_migrate != '1' }}
-        run: |
-          set -euo pipefail
-          echo "MIGRATE_MODE=AUTO" >> "$GITHUB_ENV"
-          echo "[DB][MIGRATE][AUTO_NO_PENDING] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
-
-      - name: Dump key env (universe/candidate)
-        run: |
-          set -euo pipefail
-          echo "===== ENV DUMP (filtered) ====="
-          env | sort | egrep -i "UNIVERSE|CANDIDATE|WATCHLIST|PB1|MINERVINI|EMERGENCY|FORCE_REBUILD|NAMESPACE" || true
-          echo "================================"
-
-      - name: Live status check
-        run: |
-          set -euo pipefail
-          echo "======================================"
-          echo "[LIVE] Live Trading Status"
-          echo "======================================"
-          echo "allow_live_gate: ${ALLOW_LIVE_GATE}"
-          echo "force_block_live: ${FORCE_BLOCK_LIVE}"
-          echo "dryrun: ${DRYRUN}"
-          echo "analysis_only: ${ANALYSIS_ONLY}"
-          
-          if [[ "${FORCE_BLOCK_LIVE}" == "1" ]]; then
-            echo ""
-            echo "🔒 ORDERS ARE BLOCKED (force_block_live=1)"
-            echo "   - No real orders will be sent"
-            echo "   - Safe for prep/testing/analysis"
-          elif [[ "${ALLOW_LIVE_GATE}" == "0" ]]; then
-            echo ""
-            echo "🔒 LIVE GATE CLOSED (allow_live_gate=0)"  
-            echo "   - Orders may be blocked by internal logic"
-          else
-            echo ""
-            echo "⚠️  LIVE GATE OPEN (allow_live_gate=1, force_block_live=0)"
-            echo "   - Real orders MAY be sent if env=real"
-            echo "   - Ensure strategy_env is set correctly"
-          fi
-          
-          echo "======================================"
-
-      - name: Safety guards
-        run: |
-          set -euo pipefail
-          echo "======================================"
-          echo "[SAFETY] Applying mode-specific guards"
-          echo "======================================"
-          
-          # ✅ prep mode MUST NEVER send orders
-          if [[ "${MODE}" == "prep" ]]; then
-            echo "Mode: prep - Forcing all order blocks ON"
-            echo "FORCE_BLOCK_LIVE=1" >> $GITHUB_ENV
-            echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
-            echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
-            echo "NO_TRADE=1" >> $GITHUB_ENV
-          fi
-
-          # ✅ minervini_test also blocks orders
-          if [[ "${MODE}" == "minervini_test" ]]; then
-            echo "Mode: minervini_test - Forcing all order blocks ON"
-            echo "FORCE_BLOCK_LIVE=1" >> $GITHUB_ENV
-            echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
-            echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
-            echo "NO_TRADE=1" >> $GITHUB_ENV
-          fi
-          
-          # ✅ candidate mode blocks orders
-          if [[ "${MODE}" == "candidate" ]]; then
-            echo "Mode: candidate - Forcing all order blocks ON"
-            echo "FORCE_BLOCK_LIVE=1" >> $GITHUB_ENV
-            echo "DISABLE_LIVE_TRADING=1" >> $GITHUB_ENV
-            echo "LIVE_TRADING_ENABLED=0" >> $GITHUB_ENV
-            echo "NO_TRADE=1" >> $GITHUB_ENV
-          fi
-          
-          echo "======================================"
-
-      - name: DB migrate (conditional)
-        if: ${{ steps.db_migrate_plan.outputs.should_migrate == '1' }}
-        run: |
-          set -euo pipefail
-          echo "MIGRATE_MODE=AUTO" >> "$GITHUB_ENV"
-          echo "[DB][MIGRATE][RUN] reason=${{ steps.db_migrate_plan.outputs.reason }} pending=${{ steps.db_migrate_plan.outputs.pending_count }}"
           python -m trader.db.migrate
 
-      - name: Diagnose runtime paths (pre-run)
-        if: always()
-        run: |
-          set -euo pipefail
-          pwd
-          ls -al
-          ls -al repo || true
-          find . -maxdepth 3 -type d -name runtime || true
-
-      - name: Ensure PREP ready (fallback for trade)
-        if: ${{ needs.resolve.outputs.run_mode == 'trade' }}
-        shell: bash
-        working-directory: repo
+      - name: Run selected manual pipeline
         env:
-          PYTHONPATH: ${{ github.workspace }}/repo
+          MANUAL_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
-          echo "======================================"
-          echo "[PREP][FALLBACK] Ensure PREP ready before trade"
-          echo "======================================"
-
-          WINDOW="${MARKET_WINDOW:-}"
-          if [ -z "${WINDOW}" ]; then
-            KST_HOUR="$(TZ=Asia/Seoul date '+%H')"
-            KST_MIN="$(TZ=Asia/Seoul date '+%M')"
-            KST_DOW="$(TZ=Asia/Seoul date '+%u')"
-            KST_MINUTES=$((10#${KST_HOUR} * 60 + 10#${KST_MIN}))
-            if [[ "${KST_DOW}" -ge 1 && "${KST_DOW}" -le 5 ]]; then
-              if [[ "${KST_MINUTES}" -lt 540 ]]; then
-                WINDOW="preopen"
-              elif [[ "${KST_MINUTES}" -lt 660 ]]; then
-                WINDOW="morning"
-              elif [[ "${KST_MINUTES}" -le 930 ]]; then
-                WINDOW="intraday"
-              else
-                WINDOW="after"
-              fi
-            else
-              WINDOW="day"
-            fi
-          fi
-
-          DERIVED_ASOF="${DERIVED_ASOF:-${AS_OF_OVERRIDE:-}}"
-          RUN_DATE="$(TZ=Asia/Seoul date +%F)"
-          READINESS_CONTEXT="$(python scripts/resolve_trade_readiness_context.py --run-date "${RUN_DATE}" --window "${WINDOW}" --as-of "${DERIVED_ASOF}" --exchange KRX)"
-          while IFS='=' read -r key value; do
-            export "${key}=${value}"
-          done <<< "${READINESS_CONTEXT}"
-
-          : "${CALENDAR_PREV:?missing CALENDAR_PREV from readiness context}"
-          : "${REQUESTED_AS_OF:?missing REQUESTED_AS_OF from readiness context}"
-          : "${RESOLVED_AS_OF:?missing RESOLVED_AS_OF from readiness context}"
-          : "${READINESS_REASON:?missing READINESS_REASON from readiness context}"
-
-          echo "[PREP][FALLBACK][CHECK] env=${STRATEGY_ENV} run_date=${RUN_DATE} window=${WINDOW} calendar_prev=${CALENDAR_PREV} requested_as_of=${REQUESTED_AS_OF} resolved_as_of=${RESOLVED_AS_OF} reason=${READINESS_REASON} source=db_ledger"
-
-          set +e
-          python scripts/check_prep_readiness.py --env "${STRATEGY_ENV}" --run-date "${RUN_DATE}" --as-of "${REQUESTED_AS_OF}" --window "${WINDOW}"
-          rc=$?
-          set -e
-
-          if [ "$rc" -eq 0 ]; then
-            echo "[PREP][FALLBACK] readiness satisfied -> using resolved_as_of=${RESOLVED_AS_OF}"
-          elif [ "$rc" -eq 10 ]; then
-            case "${WINDOW}" in
-              preopen|morning|intraday|open|session|day)
-                echo "[PREP][FALLBACK] readiness missing in intraday window -> rebuild blocked"
-                exit 1
-                ;;
-              *)
-                echo "[PREP][FALLBACK] readiness missing outside intraday -> attempting rebuild"
-                python -m trader.prep_runner
-                ;;
-            esac
-          else
-            echo "::error::prep readiness check failed unexpectedly"
-            exit 1
-          fi
-          
-          echo "======================================"
-          echo "[PREP][FALLBACK] Completed"
-          echo "======================================"
-
-      - name: Run (mode switch)
-        if: ${{ needs.resolve.outputs.run_mode != 'minervini_test' }}
-        run: |
-          set -euo pipefail
-          
-          echo "======================================"
-          echo "[RUN] Executing MODE=${MODE}"
-          echo "======================================"
-
-          case "${MODE}" in
+          mkdir -p artifacts
+          case "$MANUAL_MODE" in
             prep)
-              python -m trader.prep_runner 2>&1 | tee /tmp/prep.log
-              ;;
-            candidate)
-              # candidate_pool_builder는 인자 없으면 help만 출력하고 종료함
-              python -m trader.candidate_pool_builder --prefetch-only --env "${STRATEGY_ENV}"
-              python -m trader.candidate_pool_builder --build-only --build pool --env "${STRATEGY_ENV}"
+              export KIS_HTTP_ENABLED=0
+              export NO_TRADE=1
+              python -m trader.prep_runner 2>&1 | tee artifacts/unified-manual.log
+              python scripts/verify_prep_log.py artifacts/unified-manual.log
               ;;
             trade)
-              python -m trader.trade_tick
+              export KIS_HTTP_ENABLED=1
+              export NO_TRADE=0
+              python -m trader.trade_tick 2>&1 | tee artifacts/unified-manual.log
               ;;
-            both)
-              python -m trader.prep_runner
-              # candidate_pool_builder는 인자 없으면 help만 출력하고 종료함
-              python -m trader.candidate_pool_builder --prefetch-only --env "${STRATEGY_ENV}"
-              python -m trader.candidate_pool_builder --build-only --build pool --env "${STRATEGY_ENV}"
-              python -m trader.trade_tick
-              ;;
-            minervini_test)
-              echo "minervini_test is executed in dedicated step"
+            close)
+              export KIS_HTTP_ENABLED=1
+              export NO_TRADE=0
+              export PB1_PHASE_DEFAULT=exit
+              export PB1_ENTRY_ENABLED=0
+              python -m trader.trade_tick 2>&1 | tee artifacts/unified-manual.log
               ;;
             *)
-              echo "::error::Unknown MODE=${MODE}"
+              echo "::error::Unsupported mode: $MANUAL_MODE"
               exit 1
               ;;
           esac
-          
-          echo "======================================"
-          echo "[RUN] Execution completed successfully"
-          echo "======================================"
 
-      - name: Run minervini_test
-        if: ${{ needs.resolve.outputs.run_mode == 'minervini_test' }}
-        shell: bash
-        working-directory: repo
-        env:
-          PYTHONPATH: ${{ github.workspace }}/repo
-        run: |
-          set -euo pipefail
-          export MODE="minervini_test"
-          export MINERVINI_INPUT_SOURCE="final30"
-          export UNIVERSE_FORCE_REBUILD="0"
-          export EMERGENCY_BUILD="0"
-          export FORCE_CANDIDATE="0"
-
-          # if AS_OF_OVERRIDE not provided, choose last trading day in KST
-          if [[ -z "${AS_OF_OVERRIDE:-}" ]]; then
-            dow=$(TZ=Asia/Seoul date +%u)  # 1=Mon ... 7=Sun
-            if [[ "$dow" == "1" ]]; then
-              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d '3 days ago' +%F)"  # Fri
-            elif [[ "$dow" == "6" ]]; then
-              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d '1 day ago' +%F)"   # Fri
-            elif [[ "$dow" == "7" ]]; then
-              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d '2 days ago' +%F)"  # Fri
-            else
-              AS_OF_OVERRIDE="$(TZ=Asia/Seoul date -d 'yesterday' +%F)"   # prev day
-            fi
-            echo "AS_OF_OVERRIDE=$AS_OF_OVERRIDE" >> "$GITHUB_ENV"
-          fi
-          echo "[AS_OF_OVERRIDE]=$AS_OF_OVERRIDE"
-          echo "[MINERVINI][RUN] mode=${MODE} input_source=${MINERVINI_INPUT_SOURCE} UNIVERSE_FORCE_REBUILD=${UNIVERSE_FORCE_REBUILD} EMERGENCY_BUILD=${EMERGENCY_BUILD} FORCE_CANDIDATE=${FORCE_CANDIDATE}"
-          python -m trader.minervini_v2_runner
-
-      - name: Fail if as_of universe missing after ensure/build (prep)
-        if: ${{ always() && needs.resolve.outputs.run_mode == 'prep' }}
-        run: |
-          set -euo pipefail
-          if [ ! -f /tmp/prep.log ]; then
-            echo "::warning::prep.log not found - skipping universe as_of check"
-            exit 0
-          fi
-
-          if grep -q "Universe build/save failed: as_of universe is empty after ensure/build" /tmp/prep.log; then
-            echo "::error::Universe as_of is empty after ensure/build. Failing run."
-            exit 1
-          fi
-          if ! grep -Eq "\[UNIVERSE\]\[DB\]\[LOAD\].*members=[1-9][0-9]*" /tmp/prep.log; then
-            echo "::error::Universe as_of successful load (members>0) not found in prep log."
-            exit 1
-          fi
-          echo "OK: universe as_of exists after ensure/build."
       - name: Scan for SQLite artifacts
         if: always()
         run: |
@@ -852,37 +125,10 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Debug runtime tree
-        if: always()
-        run: |
-          ls -la
-          ls -la repo || true
-          ls -R repo/runtime || true
-
-      - name: Check runtime artifacts
-        if: always()
-        id: runtime_check
-        run: |
-          set -euo pipefail
-          count=$(find runtime repo/runtime /home/runner/work/_temp/trader_runtime/runtime -type f 2>/dev/null | wc -l || true)
-          echo "file_count=${count}" >> "$GITHUB_OUTPUT"
-          if [[ "${count}" -gt 0 ]]; then
-            echo "has_runtime=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_runtime=0" >> "$GITHUB_OUTPUT"
-            echo "No runtime artifacts to upload"
-          fi
-
-      - name: Upload runtime outputs
+      - name: Upload manual debug logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-${{ github.run_id }}
-          path: |
-            runtime/**
-            _temp/trader_runtime/runtime/signals/**/*.jsonl
-            _temp/trader_runtime/runtime/events/**/*.jsonl
-            _temp/trader_runtime/runtime/reports/**/*.json
-            _temp/trader_runtime/runtime/summary/**/*.json
-            /home/runner/work/_temp/trader_runtime/runtime/**
-          if-no-files-found: warn
+          name: unified-manual-logs
+          path: repo/artifacts/
+          if-no-files-found: ignore

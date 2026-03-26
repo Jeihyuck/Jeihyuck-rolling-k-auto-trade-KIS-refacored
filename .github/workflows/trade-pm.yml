@@ -1,14 +1,17 @@
-name: Weekday Trade Tick (DB pool only)
+name: Trade PM
 
-on:
+"on":
   schedule:
-    # Mon-Fri 09:00-15:15 KST = Mon-Fri 00:00-06:15 UTC, every 5 min
-    - cron: "*/5 0-6 * * 1-5"
+    # Mon-Fri 13:05 KST = 04:05 UTC
+    - cron: "5 4 * * 1-5"
   workflow_dispatch: {}
 
 concurrency:
-  group: trade-tick
+  group: pb1-practice-serial
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   STRATEGY_ENV: practice
@@ -30,7 +33,7 @@ defaults:
     working-directory: repo
 
 jobs:
-  trade_tick:
+  trade_pm:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -38,11 +41,9 @@ jobs:
       TZ: Asia/Seoul
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
-
       PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
       SQLITE_DISABLED: "1"
       BOTSTATE_DISABLED: "1"
-
       KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
       KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
@@ -55,13 +56,12 @@ jobs:
         with:
           path: repo
           fetch-depth: 1
-          ref: "nullim"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
@@ -70,7 +70,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: "Guard: postgres-only"
+      - name: Guard postgres-only
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -84,39 +84,23 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
-      - name: Verify candidate pool exists (fallback within TTL)
+      - name: Verify candidate pool exists in DB
         run: |
           set -euo pipefail
-          echo "======================================"
-          echo "Trade Tick - Pool Verification"
-          echo "======================================"
-          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "Env: ${STRATEGY_ENV}"
-          echo "Strategy: ${CANDIDATE_POOL_STRATEGY_KEY}"
-          echo "TTL: ${CANDIDATE_POOL_TTL_DAYS} days"
-          echo "======================================"
           python -m trader.verify_candidate_pool
 
-      - name: "Guard: No candidate rebuild on weekdays"
+      - name: Run PM trade tick
         run: |
           set -euo pipefail
-          echo "[POOL][PRECHECK] ✅ trade-tick will load from DB (no rebuild)"
-          echo "[POOL][PRECHECK] FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING}"
-          echo "[POOL][PRECHECK] FORCE_CANDIDATE is NOT set (weekday safety)"
+          mkdir -p artifacts
+          python -m trader.trade_tick 2>&1 | tee artifacts/trade-pm.log
 
-      - name: Run trade tick (LIVE)
+      - name: Verify PM trade tick logs
         run: |
           set -euo pipefail
-          echo "======================================"
-          echo "Trade Tick - LIVE Execution"
-          echo "======================================"
-          echo "Time: $(date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "Env: ${STRATEGY_ENV}"
-          echo "Mode: LIVE"
-          echo "NO_TRADE: ${NO_TRADE}"
-          echo "KIS_HTTP_ENABLED: ${KIS_HTTP_ENABLED}"
-          echo "======================================"
-          python -m trader.pb1_runner
+          grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-pm.log >/dev/null
+          grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-pm.log >/dev/null
+          grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -129,3 +113,11 @@ jobs:
             exit 1
           fi
           echo "OK: no sqlite artifacts."
+
+      - name: Upload PM logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-pm-logs
+          path: repo/artifacts/
+          if-no-files-found: ignore
