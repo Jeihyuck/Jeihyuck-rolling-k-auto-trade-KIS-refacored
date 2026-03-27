@@ -2,8 +2,8 @@ name: "Trade AM"
 
 "on":
   schedule:
-    # Mon-Fri 10:07 KST = 01:07 UTC
-    - cron: "7 1 * * 1-5"
+    # Mon-Fri 09:07 KST = 00:07 UTC (market-open + initial stabilization window)
+    - cron: "7 0 * * 1-5"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -122,20 +122,53 @@ jobs:
       - name: Verify candidate pool exists in DB
         run: |
           set -euo pipefail
-          python -m trader.verify_candidate_pool
+          echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][START]"
+          if python -m trader.verify_candidate_pool; then
+            echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][OK]"
+          else
+            echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][FAIL] reason=verify_candidate_pool_failed"
+            exit 1
+          fi
+
+      - name: Verify final30 readiness in DB
+        run: |
+          set -euo pipefail
+          echo "[TRADE_AM][PRECHECK][FINAL30][START]"
+          if python -c 'from datetime import date; from trader.db.engine import get_engine; from trader.db.repos import WatchlistRepo; repo=WatchlistRepo(get_engine()); rows,used=repo.load_watchlist(env="practice", strategy="pb1_watchlist_final_scored", as_of=date.today(), allow_latest_fallback=True, ttl_days=7); import sys; print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(rows)} used_as_of={used}") if rows else sys.exit(1)'
+          then
+            :
+          else
+            echo "[TRADE_AM][PRECHECK][FINAL30][FAIL] reason=missing_or_empty"
+            exit 1
+          fi
 
       - name: Run AM trade tick
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          echo "[TRADE_AM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
           python -m trader.trade_tick 2>&1 | tee artifacts/trade-am.log
 
       - name: Verify AM trade tick logs
         run: |
           set -euo pipefail
-          grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-am.log >/dev/null
-          grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null
-          grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null
+          missing=0
+          if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-am.log >/dev/null; then
+            echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
+            grep -E "\[TRADE\]\[FINAL30\]\[(DB_FALLBACK_LOAD|FAIL|LOAD_FAIL)\]" artifacts/trade-am.log || true
+            missing=1
+          fi
+          if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null; then
+            echo "::error::missing [TRADE][READY][OK]"
+            grep -E "\[TRADE\]\[READY\]\[FAIL\]|\[TRADE\]\[PRECHECK\]\[(CANDIDATE_POOL|FINAL30|BALANCE)\]" artifacts/trade-am.log || true
+            missing=1
+          fi
+          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null; then
+            echo "::error::missing [RUN_SUMMARY][RESULT]"
+            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-am.log || true
+            missing=1
+          fi
+          test "$missing" -eq 0
 
       - name: Scan for SQLite artifacts
         if: always()

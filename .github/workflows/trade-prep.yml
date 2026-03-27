@@ -123,6 +123,14 @@ jobs:
           set -euo pipefail
           python scripts/verify_prep_log.py artifacts/prep.log
 
+      - name: Verify PREP quality contract
+        run: |
+          set -euo pipefail
+          python scripts/verify_prep_quality.py | tee artifacts/prep-summary.txt
+          latest_manifest="$(ls -1t runtime/prep/*/prep_manifest.json | head -n 1)"
+          echo "final30_scored_snapshot_hint=runtime/prep/*/final30_locked.json" | tee -a artifacts/prep-summary.txt
+          echo "prep_manifest_path=${latest_manifest}" | tee -a artifacts/prep-summary.txt
+
       - name: Scan for SQLite artifacts
         if: always()
         run: |

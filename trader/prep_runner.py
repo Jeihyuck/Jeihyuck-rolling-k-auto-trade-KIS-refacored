@@ -119,11 +119,27 @@ def _resolve_flow_as_of(*, requested_as_of: date, now_ts: datetime | None = None
 
 
 def _make_flow_provider(engine):
-    # ✅ FIX: KIS 우선으로 변경 (pykrx JSONDecodeError 방지)
     providers = ["kis", "pykrx"]
-    flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame | None, pd.DataFrame | None, str | None]] = {}
+    flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]] = {}
+    provider_state: dict[str, dict[str, Any]] = {
+        "kis": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False},
+        "pykrx": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False},
+    }
     kis_api = None
     kis_init_failed = False
+
+    def _empty_df() -> pd.DataFrame:
+        return pd.DataFrame(columns=["date", "net_buy"])
+
+    def _disable_provider(name: str, reason: str) -> None:
+        state = provider_state.get(name) or {}
+        if not state or not state.get("enabled", True):
+            return
+        state["enabled"] = False
+        state["disabled_reason"] = str(reason or "unknown")
+        if not state.get("disable_logged"):
+            logger.warning("[FLOW][PROVIDER_DISABLE] provider=%s reason=%s", name, state["disabled_reason"])
+            state["disable_logged"] = True
 
     def _resolve_code_from_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
         if df is None or df.empty:
@@ -160,106 +176,211 @@ def _make_flow_provider(engine):
                 continue
         return None
 
-    def _provider_pykrx(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    def _provider_pykrx(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+        state = provider_state["pykrx"]
+        if not state.get("enabled", True):
+            return _empty_df(), _empty_df(), {
+                "ok": False,
+                "provider": "pykrx",
+                "reason": state.get("disabled_reason") or "provider_disabled",
+                "detail": "run_level_disabled",
+            }
         try:
             from pykrx import stock
         except Exception as exc:
-            logger.warning("[FLOW][WARN] pykrx import failed err=%s", exc)
-            return None, None
+            state["fail_count"] += 1
+            _disable_provider("pykrx", "import_failed")
+            detail = str(exc).replace("\n", " ")[:200]
+            logger.warning("[FLOW][PYKRX][FAIL] code=%s ymd=%s reason=import_failed detail=%s", code, flow_as_of.strftime("%Y%m%d"), detail)
+            return _empty_df(), _empty_df(), {"ok": False, "provider": "pykrx", "reason": "import_failed", "detail": detail}
 
         ymd = flow_as_of.strftime("%Y%m%d")
+        fail_reason = "unexpected_exception"
+        fail_detail = ""
         try:
             fr_all = stock.get_market_net_purchases_of_equities_by_ticker(ymd, ymd, "ALL", "외국인")
             inst_all = stock.get_market_net_purchases_of_equities_by_ticker(ymd, ymd, "ALL", "기관합계")
+            if fr_all is None or inst_all is None:
+                raise ValueError("provider_return_none")
+            if getattr(fr_all, "empty", True) or getattr(inst_all, "empty", True):
+                raise ValueError("provider_return_empty")
             fr_row = _resolve_code_from_df(fr_all, code)
             inst_row = _resolve_code_from_df(inst_all, code)
+            if fr_row.empty or inst_row.empty:
+                raise ValueError("symbol_row_missing")
             fr_net = _extract_net_buy(fr_row)
             inst_net = _extract_net_buy(inst_row)
             if fr_net is None or inst_net is None:
-                return None, None
+                raise ValueError("numeric_parse_failed")
             foreign_df = pd.DataFrame([{"date": flow_as_of, "net_buy": fr_net}])
             inst_df = pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}])
-            return foreign_df, inst_df
+            state["success_count"] += 1
+            return foreign_df, inst_df, {"ok": True, "provider": "pykrx", "reason": "", "detail": ""}
         except Exception as exc:
-            logger.warning("[FLOW][WARN] pykrx fetch failed code=%s as_of=%s err=%s", code, flow_as_of, exc)
-            return None, None
+            requests_json_err = None
+            try:
+                import requests  # type: ignore
+                requests_json_err = requests.exceptions.JSONDecodeError
+            except Exception:
+                requests_json_err = None
+            if isinstance(exc, json.JSONDecodeError):
+                fail_reason = "JSONDecodeError"
+            elif requests_json_err is not None and isinstance(exc, requests_json_err):
+                fail_reason = "RequestsJSONDecodeError"
+            elif isinstance(exc, ValueError):
+                fail_reason = "ValueError"
+            else:
+                fail_reason = type(exc).__name__
+            fail_detail = str(exc).replace("\n", " ")[:200]
 
-    def _provider_kis(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+        state["fail_count"] += 1
+        logger.warning("[FLOW][PYKRX][FAIL] code=%s ymd=%s reason=%s detail=%s", code, ymd, fail_reason, fail_detail)
+        if int(state.get("fail_count") or 0) >= 5:
+            _disable_provider("pykrx", "repeated_parse_failures")
+        return _empty_df(), _empty_df(), {"ok": False, "provider": "pykrx", "reason": fail_reason, "detail": fail_detail}
+
+    def _provider_kis(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
         nonlocal kis_api, kis_init_failed
+        state = provider_state["kis"]
+        if not state.get("enabled", True):
+            return _empty_df(), _empty_df(), {
+                "ok": False,
+                "provider": "kis",
+                "reason": state.get("disabled_reason") or "provider_disabled",
+                "detail": "run_level_disabled",
+            }
         if kis_init_failed:
-            return None, None
+            _disable_provider("kis", "init_failed")
+            return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "init_failed", "detail": "init_failed"}
         if kis_api is None:
             try:
                 from trader.kis_wrapper import KisAPI
-
                 kis_api = KisAPI(kis_env=os.getenv("KIS_ENV", "practice"))
             except Exception as exc:
                 kis_init_failed = True
-                logger.warning("[FLOW][WARN] KIS init failed err=%s", exc)
-                return None, None
+                state["fail_count"] += 1
+                _disable_provider("kis", "init_failed")
+                detail = str(exc).replace("\n", " ")[:200]
+                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "init_failed", "detail": detail}
 
-        try:
-            resp = kis_api.inquire_investor(code, "KOSDAQ")
-            if not resp.get("ok"):
-                return None, None
-            inv = resp.get("inv") or {}
-            foreign_raw = inv.get("frgn_ntby_qty", inv.get("frgn_ntby_tr_pbmn"))
-            inst_raw = inv.get("orgn_ntby_qty", inv.get("orgn_ntby_tr_pbmn"))
-            foreign_net = float(foreign_raw) if foreign_raw is not None else None
-            inst_net = float(inst_raw) if inst_raw is not None else None
-            if foreign_net is None or inst_net is None:
-                return None, None
-            foreign_df = pd.DataFrame([{"date": flow_as_of, "net_buy": foreign_net}])
-            inst_df = pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}])
-            return foreign_df, inst_df
-        except Exception as exc:
-            logger.warning("[FLOW][WARN] KIS fetch failed code=%s as_of=%s err=%s", code, flow_as_of, exc)
-            return None, None
+        def _response_reason(resp: dict[str, Any]) -> tuple[str, str]:
+            msg = str(resp.get("error") or resp.get("msg1") or "").lower()
+            if "breaker open" in msg or "fast_fail" in msg:
+                return "breaker_open", msg[:200]
+            if "invalid" in msg and "token" in msg:
+                return "invalid_token", msg[:200]
+            if "http" in msg and any(code in msg for code in ("500", "502", "503", "504")):
+                return "http_5xx", msg[:200]
+            return "unexpected_exception", msg[:200]
+
+        attempts = 0
+        refreshed = False
+        retried_5xx = False
+        while attempts < 3:
+            attempts += 1
+            try:
+                resp = kis_api.inquire_investor(code, "KOSDAQ")
+            except Exception as exc:
+                reason = "breaker_open" if "breaker open" in str(exc).lower() else "unexpected_exception"
+                if reason == "breaker_open":
+                    logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
+                    _disable_provider("kis", reason)
+                state["fail_count"] += 1
+                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": str(exc)[:200]}
+
+            if resp.get("ok"):
+                inv = resp.get("inv") or {}
+                foreign_raw = inv.get("frgn_ntby_qty", inv.get("frgn_ntby_tr_pbmn"))
+                inst_raw = inv.get("orgn_ntby_qty", inv.get("orgn_ntby_tr_pbmn"))
+                try:
+                    foreign_net = float(foreign_raw) if foreign_raw is not None else None
+                    inst_net = float(inst_raw) if inst_raw is not None else None
+                except Exception:
+                    foreign_net, inst_net = None, None
+                if foreign_net is None or inst_net is None:
+                    state["fail_count"] += 1
+                    return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "numeric_parse_failed", "detail": "investor_fields_invalid"}
+                state["success_count"] += 1
+                return pd.DataFrame([{"date": flow_as_of, "net_buy": foreign_net}]), pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}]), {"ok": True, "provider": "kis", "reason": "", "detail": ""}
+
+            reason, detail = _response_reason(resp)
+            if reason == "breaker_open":
+                logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
+                _disable_provider("kis", reason)
+                state["fail_count"] += 1
+                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
+            if reason == "invalid_token" and not refreshed:
+                refreshed = True
+                try:
+                    kis_api.refresh_token()
+                except Exception:
+                    pass
+                continue
+            if reason == "http_5xx" and not retried_5xx:
+                retried_5xx = True
+                continue
+            if reason in {"invalid_token", "http_5xx"}:
+                _disable_provider("kis", reason)
+            state["fail_count"] += 1
+            return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
+
+        state["fail_count"] += 1
+        return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "unexpected_exception", "detail": "retry_exhausted"}
 
     provider_map = {
         "pykrx": _provider_pykrx,
         "kis": _provider_kis,
     }
 
-    logger.info("[FLOW][SOURCE] providers=%s priority=KIS→pykrx(fallback)", providers)
+    logger.info("[FLOW][SOURCE] providers=%s priority=kis->pykrx", providers)
 
     def _provider(code: str, as_of: date, window: int):
         flow_as_of = _resolve_flow_as_of(requested_as_of=as_of)
         cache_key = (str(code).zfill(6), flow_as_of.isoformat(), int(window))
         cached = flow_cache.get(cache_key)
         if cached is not None:
-            return cached[0], cached[1]
+            return cached[0], cached[1], cached[2]
 
+        attempted: list[str] = []
+        reasons: list[str] = []
         for provider_name in providers:
+            state = provider_state.get(provider_name) or {}
+            if not state.get("enabled", True):
+                reasons.append(f"{provider_name}:disabled:{state.get('disabled_reason') or 'provider_disabled'}")
+                continue
             provider = provider_map.get(provider_name)
             if provider is None:
                 continue
-            foreign_df, inst_df = provider(str(code).zfill(6), flow_as_of, int(window))
-            has_foreign = foreign_df is not None and not foreign_df.empty
-            has_inst = inst_df is not None and not inst_df.empty
-            if has_foreign and has_inst:
-                logger.info(
-                    "[FLOW][SOURCE] symbol=%s requested_as_of=%s flow_as_of=%s provider=%s",
-                    str(code).zfill(6),
-                    as_of,
-                    flow_as_of,
-                    provider_name,
-                )
-                flow_cache[cache_key] = (foreign_df, inst_df, provider_name)
-                return foreign_df, inst_df
+            attempted.append(provider_name)
+            foreign_df, inst_df, meta = provider(str(code).zfill(6), flow_as_of, int(window))
+            if foreign_df is not None and not foreign_df.empty and inst_df is not None and not inst_df.empty:
+                meta["requested_as_of"] = as_of.isoformat()
+                meta["flow_as_of"] = flow_as_of.isoformat()
+                logger.info("[FLOW][PROVIDER_OK] code=%s as_of=%s provider=%s", str(code).zfill(6), flow_as_of, provider_name)
+                flow_cache[cache_key] = (foreign_df, inst_df, meta)
+                return foreign_df, inst_df, meta
+            reasons.append(f"{provider_name}:{str((meta or {}).get('reason') or 'unknown')}")
 
         logger.warning(
-            "[FLOW][WARN] all providers failed symbol=%s requested_as_of=%s flow_as_of=%s providers=%s",
+            "[FLOW][WARN] all providers failed symbol=%s requested_as_of=%s flow_as_of=%s providers=%s reasons=%s",
             str(code).zfill(6),
             as_of,
             flow_as_of,
-            providers,
+            attempted or providers,
+            reasons,
         )
-        flow_cache[cache_key] = (None, None, None)
-        return None, None
+        fail_meta = {
+            "ok": False,
+            "provider": "none",
+            "reason": ";".join(reasons) if reasons else "all_providers_failed",
+            "detail": "all_providers_failed",
+            "requested_as_of": as_of.isoformat(),
+            "flow_as_of": flow_as_of.isoformat(),
+        }
+        flow_cache[cache_key] = (_empty_df(), _empty_df(), fail_meta)
+        return _empty_df(), _empty_df(), fail_meta
 
     return _provider
-
 
 def _pick_as_of_date_always_prev() -> date:
     """PREP as_of 결정: AS_OF_OVERRIDE 우선, 없으면 전 거래일."""
@@ -2166,6 +2287,40 @@ def main() -> int:
     else:
         flow_missing_count = 0
     
+    flow_total_symbols = len(final30_codes)
+    flow_success_symbols = 0
+    flow_failed_symbols = 0
+    flow_failed_ratio = 0.0
+    flow_provider_usage_kis = 0
+    flow_provider_usage_pykrx = 0
+    flow_provider_usage_none = 0
+    if isinstance(final_df, pd.DataFrame) and not final_df.empty:
+        if "flow_data_available" in final_df.columns:
+            flow_success_symbols = int(pd.to_numeric(final_df["flow_data_available"], errors="coerce").fillna(0).astype(int).sum())
+            flow_failed_symbols = max(flow_total_symbols - flow_success_symbols, 0)
+        if "flow_provider_used" in final_df.columns:
+            usage = final_df["flow_provider_used"].fillna("none").astype(str).str.lower().value_counts().to_dict()
+            flow_provider_usage_kis = int(usage.get("kis", 0))
+            flow_provider_usage_pykrx = int(usage.get("pykrx", 0))
+            flow_provider_usage_none = int(usage.get("none", 0))
+        else:
+            flow_provider_usage_none = flow_total_symbols
+    else:
+        flow_failed_symbols = flow_total_symbols
+        flow_provider_usage_none = flow_total_symbols
+    if flow_total_symbols > 0:
+        flow_failed_ratio = flow_failed_symbols / float(flow_total_symbols)
+    logger.info(
+        "[FLOW][SUMMARY] total=%s success=%s failed=%s failed_ratio=%.3f kis=%s pykrx=%s none=%s",
+        flow_total_symbols,
+        flow_success_symbols,
+        flow_failed_symbols,
+        flow_failed_ratio,
+        flow_provider_usage_kis,
+        flow_provider_usage_pykrx,
+        flow_provider_usage_none,
+    )
+
     # Flow validation policy
     prep_status = "DONE"
     degraded_exclude_flow = False
@@ -2209,6 +2364,19 @@ def main() -> int:
         )
     elif str(final30_gate_decision["status"]) == "WARN":
         prep_status = "WARN"
+    if flow_failed_ratio >= 0.30:
+        reason = "flow_failed_ratio_soft_fail" if flow_failed_ratio < 0.70 else "flow_failed_ratio_hard_fail"
+        logger.warning("[FINAL30][QUALITY_FAIL_FLOW] failed_ratio=%.3f reason=%s", flow_failed_ratio, reason)
+        final30_quality.setdefault("soft_fail_reasons", [])
+        if reason not in final30_quality["soft_fail_reasons"]:
+            final30_quality["soft_fail_reasons"].append(reason)
+    if flow_failed_ratio >= 0.70:
+        final30_quality_ok = False
+        prep_status = "FAIL" if flow_failed_ratio >= 1.0 else "DEGRADED"
+    if flow_failed_ratio == 1.0:
+        final30_quality.setdefault("hard_fail_reasons", [])
+        if "flow_provider_total_failure" not in final30_quality["hard_fail_reasons"]:
+            final30_quality["hard_fail_reasons"].append("flow_provider_total_failure")
 
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
@@ -2267,6 +2435,13 @@ def main() -> int:
             "final_size": len(watchlist or []),
             "runtime_exported": runtime_exported,
             "flow_coverage": flow_coverage,
+            "flow_total_symbols": flow_total_symbols,
+            "flow_success_symbols": flow_success_symbols,
+            "flow_failed_symbols": flow_failed_symbols,
+            "flow_failed_ratio": flow_failed_ratio,
+            "flow_provider_usage_kis": flow_provider_usage_kis,
+            "flow_provider_usage_pykrx": flow_provider_usage_pykrx,
+            "flow_provider_usage_none": flow_provider_usage_none,
             "contract_failures": strict_contract_failures,
             "contract_mode": contract_mode,
             "final30_file_contract_ok": final30_file_contract_ok,
@@ -2291,6 +2466,13 @@ def main() -> int:
     prep_manifest["final30_quality_ok"] = final30_quality_ok
     prep_manifest["final30_quality_soft_fail"] = final30_quality_soft_fail
     prep_manifest["trade_can_proceed"] = int(final30_trade_can_proceed)
+    prep_manifest["flow_total_symbols"] = flow_total_symbols
+    prep_manifest["flow_success_symbols"] = flow_success_symbols
+    prep_manifest["flow_failed_symbols"] = flow_failed_symbols
+    prep_manifest["flow_failed_ratio"] = flow_failed_ratio
+    prep_manifest["flow_provider_usage_kis"] = flow_provider_usage_kis
+    prep_manifest["flow_provider_usage_pykrx"] = flow_provider_usage_pykrx
+    prep_manifest["flow_provider_usage_none"] = flow_provider_usage_none
     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     if prep_status != "FAIL":
         mirror_sync = sync_prep_final30_file_mirror(

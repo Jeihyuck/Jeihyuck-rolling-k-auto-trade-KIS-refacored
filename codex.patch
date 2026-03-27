@@ -1,0 +1,2138 @@
+diff --git a/.github/workflows/trade-am.yml b/.github/workflows/trade-am.yml
+index 5f566561b826726aa9867195eaa7ba83bdbf425a..581bc1cb72657a02eabe32ecd98a6d855d96974e 100644
+--- a/.github/workflows/trade-am.yml
++++ b/.github/workflows/trade-am.yml
+@@ -1,31 +1,31 @@
+ name: "Trade AM"
+ 
+ "on":
+   schedule:
+-    # Mon-Fri 10:07 KST = 01:07 UTC
+-    - cron: "7 1 * * 1-5"
++    # Mon-Fri 09:07 KST = 00:07 UTC (market-open + initial stabilization window)
++    - cron: "7 0 * * 1-5"
+   workflow_dispatch:
+     inputs:
+       STRATEGY_ENV:
+         description: Strategy environment
+         required: false
+         default: practice
+         type: choice
+         options:
+           - practice
+ 
+ concurrency:
+   group: pb1-practice-serial
+   cancel-in-progress: false
+ 
+ permissions:
+   contents: read
+ 
+ env:
+   STRATEGY_ENV: practice
+   KIS_ENV: practice
+   KIS_HTTP_ENABLED: "1"
+   NO_TRADE: "0"
+   FAIL_IF_POOL_MISSING: "1"
+   CANDIDATE_POOL_TTL_DAYS: "7"
+   CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
+@@ -100,59 +100,92 @@ jobs:
+       - name: Verify KIS env contract
+         run: |
+           set -euo pipefail
+ 
+           echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
+           echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
+           echo "[ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
+           echo "[ENV_CHECK] KIS_REST_URL=${KIS_REST_URL:-}"
+ 
+           test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+           test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+           test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+           test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+ 
+           test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+           test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+           test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+ 
+           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
+ 
+           echo "[ENV_CHECK][OK] KIS env contract satisfied"
+ 
+       - name: Verify candidate pool exists in DB
+         run: |
+           set -euo pipefail
+-          python -m trader.verify_candidate_pool
++          echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][START]"
++          if python -m trader.verify_candidate_pool; then
++            echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][OK]"
++          else
++            echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][FAIL] reason=verify_candidate_pool_failed"
++            exit 1
++          fi
++
++      - name: Verify final30 readiness in DB
++        run: |
++          set -euo pipefail
++          echo "[TRADE_AM][PRECHECK][FINAL30][START]"
++          if python -c 'from datetime import date; from trader.db.engine import get_engine; from trader.db.repos import WatchlistRepo; repo=WatchlistRepo(get_engine()); rows,used=repo.load_watchlist(env="practice", strategy="pb1_watchlist_final_scored", as_of=date.today(), allow_latest_fallback=True, ttl_days=7); import sys; print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(rows)} used_as_of={used}") if rows else sys.exit(1)'
++          then
++            :
++          else
++            echo "[TRADE_AM][PRECHECK][FINAL30][FAIL] reason=missing_or_empty"
++            exit 1
++          fi
+ 
+       - name: Run AM trade tick
+         run: |
+           set -euo pipefail
+           mkdir -p artifacts
++          echo "[TRADE_AM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
+           python -m trader.trade_tick 2>&1 | tee artifacts/trade-am.log
+ 
+       - name: Verify AM trade tick logs
+         run: |
+           set -euo pipefail
+-          grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-am.log >/dev/null
+-          grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null
+-          grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null
++          missing=0
++          if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-am.log >/dev/null; then
++            echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
++            grep -E "\[TRADE\]\[FINAL30\]\[(DB_FALLBACK_LOAD|FAIL|LOAD_FAIL)\]" artifacts/trade-am.log || true
++            missing=1
++          fi
++          if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null; then
++            echo "::error::missing [TRADE][READY][OK]"
++            grep -E "\[TRADE\]\[READY\]\[FAIL\]|\[TRADE\]\[PRECHECK\]\[(CANDIDATE_POOL|FINAL30|BALANCE)\]" artifacts/trade-am.log || true
++            missing=1
++          fi
++          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null; then
++            echo "::error::missing [RUN_SUMMARY][RESULT]"
++            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-am.log || true
++            missing=1
++          fi
++          test "$missing" -eq 0
+ 
+       - name: Scan for SQLite artifacts
+         if: always()
+         run: |
+           set -euo pipefail
+           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+           if [ -n "$hits" ]; then
+             echo "::error::SQLite artifacts detected (forbidden):"
+             echo "$hits"
+             exit 1
+           fi
+           echo "OK: no sqlite artifacts."
+ 
+       - name: Upload AM logs
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: trade-am-logs
+           path: repo/artifacts/
+           if-no-files-found: ignore
+diff --git a/.github/workflows/trade-pm.yml b/.github/workflows/trade-pm.yml
+index 4b4f42ae7f9acd01f2957d2bebb8d299d64dd23f..adf4a304e85e0a8a39b98cf764fe4148bbfe9528 100644
+--- a/.github/workflows/trade-pm.yml
++++ b/.github/workflows/trade-pm.yml
+@@ -1,30 +1,30 @@
+ name: Trade PM
+ 
+ "on":
+   schedule:
+-    # Mon-Fri 13:07 KST = 04:07 UTC
++    # Mon-Fri 13:07 KST = 04:07 UTC (post-lunch entry re-check window)
+     - cron: "7 4 * * 1-5"
+   workflow_dispatch:
+     inputs:
+       STRATEGY_ENV:
+         description: Strategy environment
+         required: false
+         default: practice
+         type: choice
+         options:
+           - practice
+ 
+ concurrency:
+   group: pb1-practice-serial
+   cancel-in-progress: false
+ 
+ permissions:
+   contents: read
+ 
+ env:
+   STRATEGY_ENV: practice
+   KIS_ENV: practice
+   KIS_HTTP_ENABLED: "1"
+   NO_TRADE: "0"
+   FAIL_IF_POOL_MISSING: "1"
+   CANDIDATE_POOL_TTL_DAYS: "7"
+@@ -100,59 +100,92 @@ jobs:
+       - name: Verify KIS env contract
+         run: |
+           set -euo pipefail
+ 
+           echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
+           echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
+           echo "[ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
+           echo "[ENV_CHECK] KIS_REST_URL=${KIS_REST_URL:-}"
+ 
+           test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+           test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+           test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+           test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+ 
+           test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+           test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+           test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+ 
+           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
+ 
+           echo "[ENV_CHECK][OK] KIS env contract satisfied"
+ 
+       - name: Verify candidate pool exists in DB
+         run: |
+           set -euo pipefail
+-          python -m trader.verify_candidate_pool
++          echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][START]"
++          if python -m trader.verify_candidate_pool; then
++            echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][OK]"
++          else
++            echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][FAIL] reason=verify_candidate_pool_failed"
++            exit 1
++          fi
++
++      - name: Verify final30 readiness in DB
++        run: |
++          set -euo pipefail
++          echo "[TRADE_PM][PRECHECK][FINAL30][START]"
++          if python -c 'from datetime import date; from trader.db.engine import get_engine; from trader.db.repos import WatchlistRepo; repo=WatchlistRepo(get_engine()); rows,used=repo.load_watchlist(env="practice", strategy="pb1_watchlist_final_scored", as_of=date.today(), allow_latest_fallback=True, ttl_days=7); import sys; print(f"[TRADE_PM][PRECHECK][FINAL30][OK] rows={len(rows)} used_as_of={used}") if rows else sys.exit(1)'
++          then
++            :
++          else
++            echo "[TRADE_PM][PRECHECK][FINAL30][FAIL] reason=missing_or_empty"
++            exit 1
++          fi
+ 
+       - name: Run PM trade tick
+         run: |
+           set -euo pipefail
+           mkdir -p artifacts
++          echo "[TRADE_PM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
+           python -m trader.trade_tick 2>&1 | tee artifacts/trade-pm.log
+ 
+       - name: Verify PM trade tick logs
+         run: |
+           set -euo pipefail
+-          grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-pm.log >/dev/null
+-          grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-pm.log >/dev/null
+-          grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null
++          missing=0
++          if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-pm.log >/dev/null; then
++            echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
++            grep -E "\[TRADE\]\[FINAL30\]\[(DB_FALLBACK_LOAD|FAIL|LOAD_FAIL)\]" artifacts/trade-pm.log || true
++            missing=1
++          fi
++          if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-pm.log >/dev/null; then
++            echo "::error::missing [TRADE][READY][OK]"
++            grep -E "\[TRADE\]\[READY\]\[FAIL\]|\[TRADE\]\[PRECHECK\]\[(CANDIDATE_POOL|FINAL30|BALANCE)\]" artifacts/trade-pm.log || true
++            missing=1
++          fi
++          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
++            echo "::error::missing [RUN_SUMMARY][RESULT]"
++            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true
++            missing=1
++          fi
++          test "$missing" -eq 0
+ 
+       - name: Scan for SQLite artifacts
+         if: always()
+         run: |
+           set -euo pipefail
+           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+           if [ -n "$hits" ]; then
+             echo "::error::SQLite artifacts detected (forbidden):"
+             echo "$hits"
+             exit 1
+           fi
+           echo "OK: no sqlite artifacts."
+ 
+       - name: Upload PM logs
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: trade-pm-logs
+           path: repo/artifacts/
+           if-no-files-found: ignore
+diff --git a/.github/workflows/trade-prep.yml b/.github/workflows/trade-prep.yml
+index 77067d0db4853869d2b6f62303198d31d589cb5d..7be7eb03635187104dc9eea25ce75ee9d54021cb 100644
+--- a/.github/workflows/trade-prep.yml
++++ b/.github/workflows/trade-prep.yml
+@@ -101,44 +101,52 @@ jobs:
+ 
+           test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+           test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+           test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+           test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+ 
+           test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+           test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+           test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+ 
+           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
+ 
+           echo "[ENV_CHECK][OK] KIS env contract satisfied"
+ 
+       - name: Run PREP
+         run: |
+           set -euo pipefail
+           mkdir -p artifacts
+           python -m trader.prep_runner 2>&1 | tee artifacts/prep.log
+ 
+       - name: Verify PREP log contract
+         run: |
+           set -euo pipefail
+           python scripts/verify_prep_log.py artifacts/prep.log
+ 
++      - name: Verify PREP quality contract
++        run: |
++          set -euo pipefail
++          python scripts/verify_prep_quality.py | tee artifacts/prep-summary.txt
++          latest_manifest="$(ls -1t runtime/prep/*/prep_manifest.json | head -n 1)"
++          echo "final30_scored_snapshot_hint=runtime/prep/*/final30_locked.json" | tee -a artifacts/prep-summary.txt
++          echo "prep_manifest_path=${latest_manifest}" | tee -a artifacts/prep-summary.txt
++
+       - name: Scan for SQLite artifacts
+         if: always()
+         run: |
+           set -euo pipefail
+           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+           if [ -n "$hits" ]; then
+             echo "::error::SQLite artifacts detected (forbidden):"
+             echo "$hits"
+             exit 1
+           fi
+           echo "OK: no sqlite artifacts."
+ 
+       - name: Upload prep logs
+         if: always()
+         uses: actions/upload-artifact@v4
+         with:
+           name: trade-prep-logs
+           path: repo/artifacts/
+           if-no-files-found: ignore
+diff --git a/.github/workflows/unified-pipeline.yml b/.github/workflows/unified-pipeline.yml
+index e8385679bbe9004d50063246651adf54e3b9dc61..6e0472dcbf94a508d9c9f4b6c5467034fc6b48bd 100644
+--- a/.github/workflows/unified-pipeline.yml
++++ b/.github/workflows/unified-pipeline.yml
+@@ -1,28 +1,30 @@
+-name: Unified Pipeline Manual Debug
++name: Unified Pipeline Manual Debug (Non-Scheduled)
+ 
+ on:
++  # NOTE: This workflow is manual-debug only.
++  # Production scheduling lives in trade-prep.yml, trade-am.yml, trade-pm.yml, and trade-close.yml.
+   workflow_dispatch:
+     inputs:
+       mode:
+         description: Manual debug mode
+         required: true
+         default: trade
+         type: choice
+         options:
+           - prep
+           - trade
+           - close
+ 
+ concurrency:
+   group: pb1-practice-serial
+   cancel-in-progress: false
+ 
+ permissions:
+   contents: read
+ 
+ env:
+   STRATEGY_ENV: practice
+   KIS_ENV: practice
+   DB_DISABLE_PREPARED_STATEMENTS: "1"
+ 
+ defaults:
+diff --git a/scripts/verify_prep_quality.py b/scripts/verify_prep_quality.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d04c4bb51376722019c934542901a987787dabf6
+--- /dev/null
++++ b/scripts/verify_prep_quality.py
+@@ -0,0 +1,53 @@
++#!/usr/bin/env python3
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++
++def _latest_manifest(repo_root: Path) -> Path:
++    prep_root = repo_root / "runtime" / "prep"
++    if not prep_root.exists():
++        raise SystemExit("[PREP][VERIFY][FAIL] runtime/prep missing")
++    manifests = sorted(prep_root.glob("*/prep_manifest.json"))
++    if not manifests:
++        raise SystemExit("[PREP][VERIFY][FAIL] prep_manifest.json missing")
++    return manifests[-1]
++
++
++def main() -> int:
++    repo_root = Path.cwd()
++    path = _latest_manifest(repo_root)
++    payload = json.loads(path.read_text(encoding="utf-8"))
++
++    quality_ok = bool(payload.get("final30_quality_ok", False))
++    flow_failed_ratio = payload.get("flow_failed_ratio")
++    if flow_failed_ratio is None:
++        raise SystemExit("[PREP][VERIFY][FAIL] flow_failed_ratio missing")
++
++    required = ["final30_quality", "final30_count", "flow_total_symbols", "flow_success_symbols", "flow_failed_symbols"]
++    missing = [k for k in required if k not in payload]
++    if missing:
++        raise SystemExit(f"[PREP][VERIFY][FAIL] missing_required={missing}")
++
++    if int(payload.get("final30_count") or 0) != 30:
++        raise SystemExit(f"[PREP][VERIFY][FAIL] final30_count_invalid={payload.get('final30_count')}")
++
++    print(f"[PREP][VERIFY][SUMMARY] manifest={path}")
++    print(f"[PREP][VERIFY][SUMMARY] quality_ok={int(quality_ok)} flow_failed_ratio={float(flow_failed_ratio):.3f} final30_count={payload.get('final30_count')}")
++
++    soft_reasons = list((payload.get("final30_quality") or {}).get("soft_fail_reasons") or [])
++    if soft_reasons:
++        print(f"[PREP][VERIFY][SOFT_FAIL] reasons={soft_reasons}")
++
++    if float(flow_failed_ratio) >= 1.0:
++        raise SystemExit("[PREP][VERIFY][FAIL] flow_failed_ratio==1.0")
++    if not quality_ok:
++        raise SystemExit("[PREP][VERIFY][FAIL] final30_quality_ok=0")
++
++    print("[PREP][VERIFY][OK] quality contract satisfied")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/trader/pb1_runner.py b/trader/pb1_runner.py
+index 4dd8e016d44f676c65dd4a3c3e9867c20c504a14..db61ad608e68cc627649f01c52ced20dc2b4c9ff 100644
+--- a/trader/pb1_runner.py
++++ b/trader/pb1_runner.py
+@@ -570,50 +570,53 @@ def load_trade_final30_scored(
+             min_tradeable_candidates,
+             list(trade_validate.get("errors") or []),
+         )
+         logger.info(
+             "[TRADE][FINAL30][CONTRACT_CHECK] ok=%s rows=%s null_critical=%s missing_fields=%s missing_critical=%s",
+             int(trade_recheck_ok),
+             len(working_rows),
+             scored_contract.get("null_critical"),
+             scored_contract.get("missing_fields"),
+             missing_critical_fields,
+         )
+         if missing_labels:
+             _selected_source, working_rows = _select_repaired_final30_source(
+                 repo_root_path=repo_root_path,
+                 env=env_n,
+                 as_of=as_of_s,
+                 db_rows=working_rows,
+             )
+         df = pd.DataFrame(working_rows)
+         columns = [str(c) for c in df.columns.tolist()]
+         try:
+             if not trade_recheck_ok:
+                 raise RuntimeError(format_final30_abort_message(trade_validate))
+             logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
+         except RuntimeError as exc:
++            logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=db_contract_invalid")
++            logger.error("[TRADE][FINAL30][FAIL] reason=missing_or_empty")
++            logger.error("[TRADE][READY][FAIL] reason=final30_contract_invalid")
+             logger.error("[TRADE][ABORT][FINAL30_INVALID][DETAIL] %s", format_final30_abort_message(trade_validate))
+             logger.error("%s", exc)
+             result = {
+                 "df": pd.DataFrame(),
+                 "source_name": "none",
+                 "as_of": as_of_s,
+                 "columns": [],
+                 "is_scored": False,
+                 "used_fallback": False,
+                 "file_mirror_present": any(file_mirror_stats.values()),
+             }
+             _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
+             return result
+         logger.info(
+             "[TRADE][FINAL30][LOAD] source=db_pb1_watchlist_final_scored rows=%s is_scored=1 cols=%s",
+             len(df),
+             columns,
+         )
+         logger.info(
+             "[TRADE][FINAL30][LOCK][OK] source=%s as_of=%s rows=%s",
+             "db_pb1_watchlist_final_scored",
+             as_of_date.isoformat(),
+             len(df),
+         )
+         result = {
+@@ -3046,51 +3049,58 @@ def run_once(
+                     engine=engine,
+                     kis=kis,
+                     env=env_effective,
+                     run_id=run_record_id,
+                     strategy="pb1_pullback_close",
+                     tick_ts=now,
+                     balance_snapshot=balance_snapshot_raw,
+                     runtime_dir=str(runtime_root_dir),
+                 )
+                 db_write_reasons.append("reconcile")
+                 if not reconcile_result.get("ok", True):
+                     logger.warning(
+                         "[PB1][RECONCILE][DEGRADED] reason=%s err=%s",
+                         reconcile_result.get("reason"),
+                         reconcile_result.get("err"),
+                     )
+             except KisTemporaryError as exc:
+                 logger.warning("[PB1][RECONCILE][DEGRADED] %s", exc)
+             except Exception as exc:
+                 if not dry_run and mode_resolved == "LIVE":
+                     logger.error("[PB1][RECONCILE][FAIL] %s", exc)
+                 logger.warning("[PB1][RECONCILE][WARN] %s", exc)
+         elif nontrading_eval_mode:
+             logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
+ 
++        logger.info(
++            "[TRADE][PRECHECK][BALANCE] state=%s require_balance=%s allow_compute_without_kis=%s",
++            balance_state,
++            int(bool(PB1_REQUIRE_BALANCE_FOR_ENTRY)),
++            int(bool(allow_compute_without_kis)),
++        )
+         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY and not allow_compute_without_kis:
++            logger.error("[TRADE][READY][FAIL] reason=balance_precheck_failed")
+             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
+             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
+             db_write_reasons.append("balance_degraded")
+             _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
+             return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
+ 
+         # ✅ dry_run은 이미 LIVE_ENV_LOCK에서 파싱 완료 (재파싱 금지)
+         # 엔진에 전달할 값 최종 확인: bool 타입 강제
+         dry_run_for_engine = parse_bool_any(dry_run, default=True)
+         
+         logger.info(
+             "[ENGINE][INIT] dry_run=%s (input_type=%s, parsed_type=%s) intended_live=%s phase=%s window=%s",
+             dry_run_for_engine,
+             type(dry_run).__name__,
+             type(dry_run_for_engine).__name__,
+             intended_live,
+             phase_override_arg,
+             window_label,
+         )
+ 
+         phase_name_for_engine = str(run_ctx.get("phase_name") or phase_override_arg or "entry").strip().lower() or "entry"
+         window_name_for_engine = str(run_ctx.get("window_name") or normalized_window_name or "day").strip().lower() or "day"
+         logger.info(
+             "[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s balance_state=%s gate_order_allowed=%s phase=%s window=%s",
+             int(len(precomputed_final30_df) if isinstance(precomputed_final30_df, pd.DataFrame) else 0),
+@@ -3817,57 +3827,67 @@ def _run_loop(*, args: argparse.Namespace) -> None:
+                 loop_deadline.isoformat() if loop_deadline else "none",
+                 last_phase,
+                 balance_api_calls,
+                 balance_cache_hits,
+                 balance_tick_cache_hits,
+             )
+     finally:
+         try:
+             release_advisory_lock(lock_conn)
+         except Exception as exc:
+             logger.warning("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed (ignoring): %s", exc)
+         try:
+             lock_conn.close()
+         except Exception as exc:
+             logger.warning("[PB1][LOCK][CLOSE_FAIL] lock connection close failed (ignoring): %s", exc)
+ 
+ 
+ def _exit_code_for_status(status: str) -> int:
+     if status in {"FAILED", "ERROR"}:
+         return 1
+     return 0
+ 
+ 
+ def main() -> int:
+     args = parse_args()
++    logger.info("[TRADE][BOOT][START]")
+     resolved_env = resolve_env(getattr(args, "env", None))
+     os.environ["STRATEGY_ENV"] = resolved_env
+     if not os.getenv("KIS_ENV"):
+         os.environ["KIS_ENV"] = resolved_env
+     strategy_env_raw = os.getenv("STRATEGY_ENV")
+     kis_env_raw = os.getenv("KIS_ENV")
+     derived_env = (strategy_env_raw or kis_env_raw or "practice").strip().lower()
++    logger.info(
++        "[TRADE][BOOT][ENV] MODE=%s STRATEGY_ENV=%s KIS_ENV=%s FAIL_IF_POOL_MISSING=%s CANDIDATE_POOL_STRATEGY_KEY=%s PB1_PHASE_DEFAULT=%s",
++        os.getenv("MODE", "trade"),
++        strategy_env_raw or "",
++        kis_env_raw or "",
++        os.getenv("FAIL_IF_POOL_MISSING", ""),
++        os.getenv("CANDIDATE_POOL_STRATEGY_KEY", ""),
++        os.getenv("PB1_PHASE_DEFAULT", ""),
++    )
+ 
+     # ✅ 설계 1: JOB 모드 분리 (BUILD_WATCHLIST vs TRADE_INTRADAY)
+     job_mode = os.getenv("PB1_JOB", "TRADE_INTRADAY").upper()
+     
+     if job_mode == "BUILD_WATCHLIST":
+         logger.info("[PB1][JOB] mode=BUILD_WATCHLIST -> build weekly watchlist and exit")
+         return _run_build_watchlist_job()
+     
+     # else: TRADE_INTRADAY (기존 로직)
+     logger.info("[PB1][JOB] mode=TRADE_INTRADAY -> run entry/exit logic")
+ 
+     mode_input = (os.getenv("MODE") or "").strip().lower()
+     minervini_test = mode_input == "minervini_test"
+     minervini_with_pb1 = env_bool("MINERVINI_TEST_WITH_PB1", default=False)
+     if minervini_test:
+         selection_only = not minervini_with_pb1
+         if selection_only:
+             os.environ["MINERVINI_ONLY"] = "1"
+         else:
+             os.environ["MINERVINI_ONLY"] = "0"
+         logger.info(
+             "[RUN_PLAN] MODE=minervini_test selection_only=%s with_pb1=%s",
+             int(selection_only),
+             int(minervini_with_pb1),
+         )
+@@ -4121,51 +4141,59 @@ def main() -> int:
+             col for col in REQUIRED_SCORED_FINAL30_COLS
+             if col not in [str(item) for item in (scored_contract.get("columns") or [])]
+         ]
+         scored_contract_repairable = _is_trade_repairable_db_contract(
+             scored_contract,
+             missing_critical_fields=scored_missing_critical,
+         )
+         db_contract_ok = bool(
+             prep_done
+             and derived_count > 0
+             and watchlist_final_count == 30
+             and watchlist_scored_count == 30
+             and (scored_contract.get("ok") or scored_contract_repairable)
+         )
+         logger.info(
+             "[TRADE_TICK][DB_CONTRACT] env=%s as_of=%s prep_done=%s derived_minervini=%s watchlist_final=%s watchlist_final_scored=%s repairable=%s db_contract_ok=%s",
+             derived_env,
+             derived_as_of.isoformat(),
+             int(prep_done),
+             derived_count,
+             watchlist_final_count,
+             watchlist_scored_count,
+             int(scored_contract_repairable),
+             int(db_contract_ok),
+         )
++        logger.info(
++            "[TRADE][PRECHECK][CANDIDATE_POOL] status=%s derived_count=%s watchlist_final=%s watchlist_scored=%s",
++            "OK" if db_contract_ok else "FAIL",
++            derived_count,
++            watchlist_final_count,
++            watchlist_scored_count,
++        )
+         if not db_contract_ok:
++            logger.error("[TRADE][READY][FAIL] reason=candidate_pool_or_db_contract_invalid")
+             logger.warning(
+                 "[TRADE_TICK][SKIP] reason=DB_CONTRACT_INCOMPLETE derived_as_of=%s trade_date=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s",
+                 derived_as_of.isoformat(),
+                 trade_date.isoformat(),
+                 scored_contract.get("rows"),
+                 scored_contract.get("uniq_codes"),
+                 scored_contract.get("uniq_ranks"),
+                 scored_contract.get("null_critical"),
+             )
+             return 0
+         
+         # ✅ FALLBACK: 전일 derived 없으면 최근 영업일로 fallback
+         if derived_count <= 0:
+             if allow_wl_only and watchlist_loaded_for_guard:
+                 logger.warning(
+                     "[TRADE_TICK][DERIVED][BYPASS] derived_missing but watchlist_final locked -> continue derived_as_of=%s trade_date=%s",
+                     derived_as_of.isoformat(),
+                     trade_date.isoformat(),
+                 )
+             elif DERIVED_FALLBACK_ENABLED:
+                 logger.info(
+                     "[TRADE_TICK][FALLBACK][START] derived_as_of=%s missing -> trying fallback (max_back=%d ttl=%d)",
+                     derived_as_of.isoformat(),
+                     DERIVED_FALLBACK_MAX_DAYS,
+                     CANDIDATE_POOL_TTL_DAYS,
+@@ -4218,63 +4246,67 @@ def main() -> int:
+                     logger.warning(
+                         "[TRADE_TICK][SKIP] reason=DERIVED_MISSING_FALLBACK_FAILED derived_as_of=%s trade_date=%s (max_back=%d ttl=%d)",
+                         derived_as_of.isoformat(),
+                         trade_date.isoformat(),
+                         DERIVED_FALLBACK_MAX_DAYS,
+                         CANDIDATE_POOL_TTL_DAYS,
+                     )
+                     return 0
+             else:
+                 logger.warning(
+                     "[TRADE_TICK][SKIP] reason=DERIVED_MISSING derived_as_of=%s trade_date=%s count=%d (fallback_disabled)",
+                     derived_as_of.isoformat(),
+                     trade_date.isoformat(),
+                     derived_count,
+                 )
+                 return 0
+         else:
+             # 전일 derived 존재
+             logger.info(
+                 "[TRADE_TICK][DERIVED][OK] derived_as_of=%s count=%d",
+                 derived_as_of.isoformat(),
+                 derived_count,
+             )
+         
+         # ✅ DIAGNOSTIC: canonical scored final30 존재 여부 체크
++        logger.info("[TRADE][PRECHECK][FINAL30] status=START requested_as_of=%s", derived_as_of.isoformat())
+         final30_result = load_trade_final30_scored(
+             engine=engine,
+             env=derived_env,
+             as_of=derived_as_of.isoformat(),
+         )
+         final30_df = final30_result.get("df")
+         if final30_df is not None and not final30_df.empty:
++            logger.info("[TRADE][PRECHECK][FINAL30] status=OK rows=%s", len(final30_df))
+             logger.info(
+                 "[TRADE_TICK][FINAL30_SNAPSHOT][OK] derived_as_of=%s count=%d",
+                 derived_as_of.isoformat(),
+                 len(final30_df),
+             )
+         else:
++            logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=missing_or_empty")
++            logger.error("[TRADE][READY][FAIL] reason=final30_missing_or_empty")
+             logger.error("[TRADE][FINAL30][LOAD_FAIL] no usable scored final30 found")
+             return 0
+         
+         watchlist_repo = WatchlistRepo(engine)
+         watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+         ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
+         max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
+         watchlist_env = resolve_env(args.env)
+ 
+         watchlist_rows, used_as_of = watchlist_repo.load_watchlist(
+             env=watchlist_env,
+             strategy=watchlist_strategy,
+             as_of=derived_as_of,
+             allow_latest_fallback=True,
+             ttl_days=ttl_days,
+             max_back_days=max_back_days,
+         )
+ 
+         if not watchlist_rows or used_as_of is None:
+             raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
+ 
+         age_days = (derived_as_of - used_as_of).days
+         if age_days > ttl_days:
+             raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
+         if len(watchlist_rows) != 30:
+diff --git a/trader/prep_runner.py b/trader/prep_runner.py
+index 228adba89e48f611fd73ec98fc3bb7011b233718..d15ea34785935fe2053793bf5e9ab440f9325ff8 100644
+--- a/trader/prep_runner.py
++++ b/trader/prep_runner.py
+@@ -97,192 +97,313 @@ FINAL30_STRICT_REQUIRED_FIELDS = [
+     "ma50",
+     "ma150",
+     "atr_pct",
+     "rs_percentile",
+     "breakout_score",
+     "pullback_score",
+     "momentum_score",
+     "tech_score",
+     "score_final",
+     "entry_style_selected",
+ ]
+ 
+ def _env_true(name: str, default: str = "0") -> bool:
+     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+ 
+ 
+ def _resolve_flow_as_of(*, requested_as_of: date, now_ts: datetime | None = None) -> date:
+     now_ts = now_ts or now_kst()
+     trade_date = now_ts.date()
+     if is_market_open_kst(now_ts) or requested_as_of == trade_date:
+         return prev_business_day(trade_date)
+     return requested_as_of
+ 
+ 
+ def _make_flow_provider(engine):
+-    # ✅ FIX: KIS 우선으로 변경 (pykrx JSONDecodeError 방지)
+     providers = ["kis", "pykrx"]
+-    flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame | None, pd.DataFrame | None, str | None]] = {}
++    flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]] = {}
++    provider_state: dict[str, dict[str, Any]] = {
++        "kis": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False},
++        "pykrx": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False},
++    }
+     kis_api = None
+     kis_init_failed = False
+ 
++    def _empty_df() -> pd.DataFrame:
++        return pd.DataFrame(columns=["date", "net_buy"])
++
++    def _disable_provider(name: str, reason: str) -> None:
++        state = provider_state.get(name) or {}
++        if not state or not state.get("enabled", True):
++            return
++        state["enabled"] = False
++        state["disabled_reason"] = str(reason or "unknown")
++        if not state.get("disable_logged"):
++            logger.warning("[FLOW][PROVIDER_DISABLE] provider=%s reason=%s", name, state["disabled_reason"])
++            state["disable_logged"] = True
++
+     def _resolve_code_from_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
+         if df is None or df.empty:
+             return pd.DataFrame()
+         code_candidates = {code, f"A{code}", code.lstrip("A")}
+         work = df.copy()
+         work.index = work.index.astype(str)
+         matched_idx = next((idx for idx in work.index if idx in code_candidates), None)
+         if matched_idx is None:
+             return pd.DataFrame()
+         row = work.loc[[matched_idx]]
+         return row
+ 
+     def _extract_net_buy(row_df: pd.DataFrame) -> float | None:
+         if row_df is None or row_df.empty:
+             return None
+         candidate_cols = [
+             "순매수수량",
+             "순매수거래량",
+             "순매수수량(주)",
+             "순매수거래대금",
+             "순매수대금",
+             "net_buy",
+         ]
+         for col in candidate_cols:
+             if col not in row_df.columns:
+                 continue
+             try:
+                 val = row_df.iloc[0][col]
+                 if isinstance(val, str):
+                     val = val.replace(",", "").strip()
+                 return float(val)
+             except Exception:
+                 continue
+         return None
+ 
+-    def _provider_pykrx(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
++    def _provider_pykrx(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
++        state = provider_state["pykrx"]
++        if not state.get("enabled", True):
++            return _empty_df(), _empty_df(), {
++                "ok": False,
++                "provider": "pykrx",
++                "reason": state.get("disabled_reason") or "provider_disabled",
++                "detail": "run_level_disabled",
++            }
+         try:
+             from pykrx import stock
+         except Exception as exc:
+-            logger.warning("[FLOW][WARN] pykrx import failed err=%s", exc)
+-            return None, None
++            state["fail_count"] += 1
++            _disable_provider("pykrx", "import_failed")
++            detail = str(exc).replace("\n", " ")[:200]
++            logger.warning("[FLOW][PYKRX][FAIL] code=%s ymd=%s reason=import_failed detail=%s", code, flow_as_of.strftime("%Y%m%d"), detail)
++            return _empty_df(), _empty_df(), {"ok": False, "provider": "pykrx", "reason": "import_failed", "detail": detail}
+ 
+         ymd = flow_as_of.strftime("%Y%m%d")
++        fail_reason = "unexpected_exception"
++        fail_detail = ""
+         try:
+             fr_all = stock.get_market_net_purchases_of_equities_by_ticker(ymd, ymd, "ALL", "외국인")
+             inst_all = stock.get_market_net_purchases_of_equities_by_ticker(ymd, ymd, "ALL", "기관합계")
++            if fr_all is None or inst_all is None:
++                raise ValueError("provider_return_none")
++            if getattr(fr_all, "empty", True) or getattr(inst_all, "empty", True):
++                raise ValueError("provider_return_empty")
+             fr_row = _resolve_code_from_df(fr_all, code)
+             inst_row = _resolve_code_from_df(inst_all, code)
++            if fr_row.empty or inst_row.empty:
++                raise ValueError("symbol_row_missing")
+             fr_net = _extract_net_buy(fr_row)
+             inst_net = _extract_net_buy(inst_row)
+             if fr_net is None or inst_net is None:
+-                return None, None
++                raise ValueError("numeric_parse_failed")
+             foreign_df = pd.DataFrame([{"date": flow_as_of, "net_buy": fr_net}])
+             inst_df = pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}])
+-            return foreign_df, inst_df
++            state["success_count"] += 1
++            return foreign_df, inst_df, {"ok": True, "provider": "pykrx", "reason": "", "detail": ""}
+         except Exception as exc:
+-            logger.warning("[FLOW][WARN] pykrx fetch failed code=%s as_of=%s err=%s", code, flow_as_of, exc)
+-            return None, None
++            requests_json_err = None
++            try:
++                import requests  # type: ignore
++                requests_json_err = requests.exceptions.JSONDecodeError
++            except Exception:
++                requests_json_err = None
++            if isinstance(exc, json.JSONDecodeError):
++                fail_reason = "JSONDecodeError"
++            elif requests_json_err is not None and isinstance(exc, requests_json_err):
++                fail_reason = "RequestsJSONDecodeError"
++            elif isinstance(exc, ValueError):
++                fail_reason = "ValueError"
++            else:
++                fail_reason = type(exc).__name__
++            fail_detail = str(exc).replace("\n", " ")[:200]
++
++        state["fail_count"] += 1
++        logger.warning("[FLOW][PYKRX][FAIL] code=%s ymd=%s reason=%s detail=%s", code, ymd, fail_reason, fail_detail)
++        if int(state.get("fail_count") or 0) >= 5:
++            _disable_provider("pykrx", "repeated_parse_failures")
++        return _empty_df(), _empty_df(), {"ok": False, "provider": "pykrx", "reason": fail_reason, "detail": fail_detail}
+ 
+-    def _provider_kis(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
++    def _provider_kis(code: str, flow_as_of: date, _window: int) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+         nonlocal kis_api, kis_init_failed
++        state = provider_state["kis"]
++        if not state.get("enabled", True):
++            return _empty_df(), _empty_df(), {
++                "ok": False,
++                "provider": "kis",
++                "reason": state.get("disabled_reason") or "provider_disabled",
++                "detail": "run_level_disabled",
++            }
+         if kis_init_failed:
+-            return None, None
++            _disable_provider("kis", "init_failed")
++            return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "init_failed", "detail": "init_failed"}
+         if kis_api is None:
+             try:
+                 from trader.kis_wrapper import KisAPI
+-
+                 kis_api = KisAPI(kis_env=os.getenv("KIS_ENV", "practice"))
+             except Exception as exc:
+                 kis_init_failed = True
+-                logger.warning("[FLOW][WARN] KIS init failed err=%s", exc)
+-                return None, None
++                state["fail_count"] += 1
++                _disable_provider("kis", "init_failed")
++                detail = str(exc).replace("\n", " ")[:200]
++                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "init_failed", "detail": detail}
++
++        def _response_reason(resp: dict[str, Any]) -> tuple[str, str]:
++            msg = str(resp.get("error") or resp.get("msg1") or "").lower()
++            if "breaker open" in msg or "fast_fail" in msg:
++                return "breaker_open", msg[:200]
++            if "invalid" in msg and "token" in msg:
++                return "invalid_token", msg[:200]
++            if "http" in msg and any(code in msg for code in ("500", "502", "503", "504")):
++                return "http_5xx", msg[:200]
++            return "unexpected_exception", msg[:200]
++
++        attempts = 0
++        refreshed = False
++        retried_5xx = False
++        while attempts < 3:
++            attempts += 1
++            try:
++                resp = kis_api.inquire_investor(code, "KOSDAQ")
++            except Exception as exc:
++                reason = "breaker_open" if "breaker open" in str(exc).lower() else "unexpected_exception"
++                if reason == "breaker_open":
++                    logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
++                    _disable_provider("kis", reason)
++                state["fail_count"] += 1
++                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": str(exc)[:200]}
++
++            if resp.get("ok"):
++                inv = resp.get("inv") or {}
++                foreign_raw = inv.get("frgn_ntby_qty", inv.get("frgn_ntby_tr_pbmn"))
++                inst_raw = inv.get("orgn_ntby_qty", inv.get("orgn_ntby_tr_pbmn"))
++                try:
++                    foreign_net = float(foreign_raw) if foreign_raw is not None else None
++                    inst_net = float(inst_raw) if inst_raw is not None else None
++                except Exception:
++                    foreign_net, inst_net = None, None
++                if foreign_net is None or inst_net is None:
++                    state["fail_count"] += 1
++                    return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "numeric_parse_failed", "detail": "investor_fields_invalid"}
++                state["success_count"] += 1
++                return pd.DataFrame([{"date": flow_as_of, "net_buy": foreign_net}]), pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}]), {"ok": True, "provider": "kis", "reason": "", "detail": ""}
++
++            reason, detail = _response_reason(resp)
++            if reason == "breaker_open":
++                logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
++                _disable_provider("kis", reason)
++                state["fail_count"] += 1
++                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
++            if reason == "invalid_token" and not refreshed:
++                refreshed = True
++                try:
++                    kis_api.refresh_token()
++                except Exception:
++                    pass
++                continue
++            if reason == "http_5xx" and not retried_5xx:
++                retried_5xx = True
++                continue
++            if reason in {"invalid_token", "http_5xx"}:
++                _disable_provider("kis", reason)
++            state["fail_count"] += 1
++            return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
+ 
+-        try:
+-            resp = kis_api.inquire_investor(code, "KOSDAQ")
+-            if not resp.get("ok"):
+-                return None, None
+-            inv = resp.get("inv") or {}
+-            foreign_raw = inv.get("frgn_ntby_qty", inv.get("frgn_ntby_tr_pbmn"))
+-            inst_raw = inv.get("orgn_ntby_qty", inv.get("orgn_ntby_tr_pbmn"))
+-            foreign_net = float(foreign_raw) if foreign_raw is not None else None
+-            inst_net = float(inst_raw) if inst_raw is not None else None
+-            if foreign_net is None or inst_net is None:
+-                return None, None
+-            foreign_df = pd.DataFrame([{"date": flow_as_of, "net_buy": foreign_net}])
+-            inst_df = pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}])
+-            return foreign_df, inst_df
+-        except Exception as exc:
+-            logger.warning("[FLOW][WARN] KIS fetch failed code=%s as_of=%s err=%s", code, flow_as_of, exc)
+-            return None, None
++        state["fail_count"] += 1
++        return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "unexpected_exception", "detail": "retry_exhausted"}
+ 
+     provider_map = {
+         "pykrx": _provider_pykrx,
+         "kis": _provider_kis,
+     }
+ 
+-    logger.info("[FLOW][SOURCE] providers=%s priority=KIS→pykrx(fallback)", providers)
++    logger.info("[FLOW][SOURCE] providers=%s priority=kis->pykrx", providers)
+ 
+     def _provider(code: str, as_of: date, window: int):
+         flow_as_of = _resolve_flow_as_of(requested_as_of=as_of)
+         cache_key = (str(code).zfill(6), flow_as_of.isoformat(), int(window))
+         cached = flow_cache.get(cache_key)
+         if cached is not None:
+-            return cached[0], cached[1]
++            return cached[0], cached[1], cached[2]
+ 
++        attempted: list[str] = []
++        reasons: list[str] = []
+         for provider_name in providers:
++            state = provider_state.get(provider_name) or {}
++            if not state.get("enabled", True):
++                reasons.append(f"{provider_name}:disabled:{state.get('disabled_reason') or 'provider_disabled'}")
++                continue
+             provider = provider_map.get(provider_name)
+             if provider is None:
+                 continue
+-            foreign_df, inst_df = provider(str(code).zfill(6), flow_as_of, int(window))
+-            has_foreign = foreign_df is not None and not foreign_df.empty
+-            has_inst = inst_df is not None and not inst_df.empty
+-            if has_foreign and has_inst:
+-                logger.info(
+-                    "[FLOW][SOURCE] symbol=%s requested_as_of=%s flow_as_of=%s provider=%s",
+-                    str(code).zfill(6),
+-                    as_of,
+-                    flow_as_of,
+-                    provider_name,
+-                )
+-                flow_cache[cache_key] = (foreign_df, inst_df, provider_name)
+-                return foreign_df, inst_df
++            attempted.append(provider_name)
++            foreign_df, inst_df, meta = provider(str(code).zfill(6), flow_as_of, int(window))
++            if foreign_df is not None and not foreign_df.empty and inst_df is not None and not inst_df.empty:
++                meta["requested_as_of"] = as_of.isoformat()
++                meta["flow_as_of"] = flow_as_of.isoformat()
++                logger.info("[FLOW][PROVIDER_OK] code=%s as_of=%s provider=%s", str(code).zfill(6), flow_as_of, provider_name)
++                flow_cache[cache_key] = (foreign_df, inst_df, meta)
++                return foreign_df, inst_df, meta
++            reasons.append(f"{provider_name}:{str((meta or {}).get('reason') or 'unknown')}")
+ 
+         logger.warning(
+-            "[FLOW][WARN] all providers failed symbol=%s requested_as_of=%s flow_as_of=%s providers=%s",
++            "[FLOW][WARN] all providers failed symbol=%s requested_as_of=%s flow_as_of=%s providers=%s reasons=%s",
+             str(code).zfill(6),
+             as_of,
+             flow_as_of,
+-            providers,
++            attempted or providers,
++            reasons,
+         )
+-        flow_cache[cache_key] = (None, None, None)
+-        return None, None
++        fail_meta = {
++            "ok": False,
++            "provider": "none",
++            "reason": ";".join(reasons) if reasons else "all_providers_failed",
++            "detail": "all_providers_failed",
++            "requested_as_of": as_of.isoformat(),
++            "flow_as_of": flow_as_of.isoformat(),
++        }
++        flow_cache[cache_key] = (_empty_df(), _empty_df(), fail_meta)
++        return _empty_df(), _empty_df(), fail_meta
+ 
+     return _provider
+ 
+-
+ def _pick_as_of_date_always_prev() -> date:
+     """PREP as_of 결정: AS_OF_OVERRIDE 우선, 없으면 전 거래일."""
+     trade_ctx = resolve_trade_context(now=now_kst())
+     return date.fromisoformat(str(trade_ctx["as_of"]))
+ 
+ 
+ def get_required_history_days(strategy_name: str) -> int:
+     """Centralized long-lookback requirement for PREP OHLCV readiness."""
+     _ = strategy_name
+     ma150_days = 150
+     rs_lookback_126 = 126
+     vcp_lookback_120 = 120
+     atr_days_20 = 20
+     safety_margin = 30
+     return max(ma150_days, rs_lookback_126, vcp_lookback_120, atr_days_20) + safety_margin
+ 
+ 
+ def _collect_final30_nonzero_stats(df: pd.DataFrame) -> tuple[dict[str, int], dict[str, str | None]]:
+     stats, alias_cols = collect_nonzero_score_stats(df)
+     for key in (
+         "tech_nonzero",
+         "final_nonzero",
+         "score_final_nonzero",
+         "breakout_nonzero",
+         "pullback_nonzero",
+@@ -2144,93 +2265,140 @@ def main() -> int:
+         try:
+             # Load flow data from DB for final30 symbols
+             flow_rows = flow_repo.load_for_as_of(env=env, as_of=as_of, symbols=final30_codes)
+             covered = {str(r.get("symbol", "")).zfill(6) for r in flow_rows if not r.get("flow_missing", True)}
+             flow_coverage = len(covered) / max(len(final30_codes), 1)
+             flow_missing_count = len(final30_codes) - len(covered)
+             
+             logger.info(
+                 "[FLOW][DB][COVERAGE] covered=%s/%s coverage=%.1f%% as_of=%s",
+                 len(covered),
+                 len(final30_codes),
+                 flow_coverage * 100.0,
+                 as_of,
+             )
+         except Exception as exc:
+             logger.warning(
+                 "[FLOW][DB][COVERAGE][FAIL] err=%s -> coverage=0%%",
+                 exc,
+                 exc_info=True,
+             )
+             flow_coverage = 0.0
+             flow_missing_count = len(final30_codes)
+     else:
+         flow_missing_count = 0
+     
++    flow_total_symbols = len(final30_codes)
++    flow_success_symbols = 0
++    flow_failed_symbols = 0
++    flow_failed_ratio = 0.0
++    flow_provider_usage_kis = 0
++    flow_provider_usage_pykrx = 0
++    flow_provider_usage_none = 0
++    if isinstance(final_df, pd.DataFrame) and not final_df.empty:
++        if "flow_data_available" in final_df.columns:
++            flow_success_symbols = int(pd.to_numeric(final_df["flow_data_available"], errors="coerce").fillna(0).astype(int).sum())
++            flow_failed_symbols = max(flow_total_symbols - flow_success_symbols, 0)
++        if "flow_provider_used" in final_df.columns:
++            usage = final_df["flow_provider_used"].fillna("none").astype(str).str.lower().value_counts().to_dict()
++            flow_provider_usage_kis = int(usage.get("kis", 0))
++            flow_provider_usage_pykrx = int(usage.get("pykrx", 0))
++            flow_provider_usage_none = int(usage.get("none", 0))
++        else:
++            flow_provider_usage_none = flow_total_symbols
++    else:
++        flow_failed_symbols = flow_total_symbols
++        flow_provider_usage_none = flow_total_symbols
++    if flow_total_symbols > 0:
++        flow_failed_ratio = flow_failed_symbols / float(flow_total_symbols)
++    logger.info(
++        "[FLOW][SUMMARY] total=%s success=%s failed=%s failed_ratio=%.3f kis=%s pykrx=%s none=%s",
++        flow_total_symbols,
++        flow_success_symbols,
++        flow_failed_symbols,
++        flow_failed_ratio,
++        flow_provider_usage_kis,
++        flow_provider_usage_pykrx,
++        flow_provider_usage_none,
++    )
++
+     # Flow validation policy
+     prep_status = "DONE"
+     degraded_exclude_flow = False
+     
+     if flow_coverage < 0.5:
+         logger.warning(
+             "[PREP][FLOW][WARN] coverage=%.1f%% < 50%% as_of=%s allow_flow_degraded=%s core_done=%s",
+             flow_coverage * 100.0,
+             as_of,
+             int(allow_flow_degraded_prep),
+             int(core_done),
+         )
+         prep_status = "WARN" if core_done else "DEGRADED"
+         degraded_exclude_flow = True
+         logger.warning("[PREP][FLOW][DEGRADED] tech-only mode enabled -> continue")
+     
+     elif flow_coverage < 0.8:
+         # Flow coverage 50%-80% → DEGRADED
+         logger.warning(
+             "[PREP][FLOW][DEGRADED] coverage=%.1f%% between 50%%-80%% as_of=%s",
+             flow_coverage * 100.0,
+             as_of,
+         )
+         prep_status = "DEGRADED"
+         degraded_exclude_flow = False  # Keep flow data but mark as degraded
+     
+     else:
+         # Flow coverage >= 80% → OK
+         logger.info(
+             "[PREP][FLOW][OK] coverage=%.1f%% >= 80%% as_of=%s",
+             flow_coverage * 100.0,
+             as_of,
+         )
+ 
+     if strict_contract_failures and not core_done:
+         prep_status = "FAIL"
+         logger.error(
+             "[PREP][FINAL30_SCORED][CONTRACT_FAIL] as_of=%s failures=%s",
+             as_of.isoformat(),
+             strict_contract_failures,
+         )
+     elif str(final30_gate_decision["status"]) == "WARN":
+         prep_status = "WARN"
++    if flow_failed_ratio >= 0.30:
++        reason = "flow_failed_ratio_soft_fail" if flow_failed_ratio < 0.70 else "flow_failed_ratio_hard_fail"
++        logger.warning("[FINAL30][QUALITY_FAIL_FLOW] failed_ratio=%.3f reason=%s", flow_failed_ratio, reason)
++        final30_quality.setdefault("soft_fail_reasons", [])
++        if reason not in final30_quality["soft_fail_reasons"]:
++            final30_quality["soft_fail_reasons"].append(reason)
++    if flow_failed_ratio >= 0.70:
++        final30_quality_ok = False
++        prep_status = "FAIL" if flow_failed_ratio >= 1.0 else "DEGRADED"
++    if flow_failed_ratio == 1.0:
++        final30_quality.setdefault("hard_fail_reasons", [])
++        if "flow_provider_total_failure" not in final30_quality["hard_fail_reasons"]:
++            final30_quality["hard_fail_reasons"].append("flow_provider_total_failure")
+ 
+     # Prepare metric columns for export
+     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
+     flow_metric_cols = ["foreign_20_ratio", "inst_20_ratio", "flow_score"]
+     
+     metric_cols = [col for col in core_metric_cols if col in final_df.columns]
+     if not degraded_exclude_flow:
+         flow_available_cols = [col for col in flow_metric_cols if col in final_df.columns]
+         metric_cols.extend(flow_available_cols)
+ 
+     available_cols = metric_cols
+     if available_cols:
+         sample = final_df[available_cols].fillna(0.0)
+         zero_ratio = float((sample == 0.0).all(axis=1).mean()) if len(sample) > 0 else 1.0
+         if zero_ratio >= 0.8:
+             logger.error(
+                 "[PREP][METRICS][MOSTLY_ZERO] ratio=%.3f as_of=%s metric_scope=%s",
+                 zero_ratio,
+                 as_of,
+                 "core_only" if degraded_exclude_flow else "core_plus_flow",
+             )
+             
+             prep_status = "WARN" if core_done else ("DEGRADED" if allow_degraded_prep else "FAIL")
+ 
+     report_failmode_soft = _env_true("REPORT_FAILMODE_SOFT", "1")
+@@ -2245,74 +2413,88 @@ def main() -> int:
+             weights=watchlist_bundle.get("weights", {}),
+             formula=watchlist_bundle.get("formula", ""),
+         )
+         logger.info("[PDF] wrote %s", pdf_path)
+     except Exception:
+         if report_failmode_soft:
+             logger.exception("[REPORT][WATCHLIST][PDF][FAIL][SOFT] as_of=%s output_dir=%s", as_of, export_dir)
+         else:
+             logger.exception("[REPORT][WATCHLIST][PDF][FAIL][HARD] as_of=%s output_dir=%s", as_of, export_dir)
+             raise
+     
+     payload = to_jsonable(
+         {
+             "as_of": as_of.isoformat(),
+             "env": env,
+             "symbols": len(symbols),
+             "ohlcv_prefetch_mode": prefetch_mode,
+             "delta": delta_result,
+             "full": full_result,
+             "derived_upserted": derived_upserted,
+             "universe_size": len(members),
+             "pool_size": len(pool_codes or []),
+             "final_size": len(watchlist or []),
+             "runtime_exported": runtime_exported,
+             "flow_coverage": flow_coverage,
++            "flow_total_symbols": flow_total_symbols,
++            "flow_success_symbols": flow_success_symbols,
++            "flow_failed_symbols": flow_failed_symbols,
++            "flow_failed_ratio": flow_failed_ratio,
++            "flow_provider_usage_kis": flow_provider_usage_kis,
++            "flow_provider_usage_pykrx": flow_provider_usage_pykrx,
++            "flow_provider_usage_none": flow_provider_usage_none,
+             "contract_failures": strict_contract_failures,
+             "contract_mode": contract_mode,
+             "final30_file_contract_ok": final30_file_contract_ok,
+             "final30_file_failures": final30_file_failures,
+             "final_source": final30_source_label,
+             "prep_status": prep_status,
+             "final30_quality": final30_quality,
+             "final30_quality_ok": final30_quality_ok,
+             "final30_quality_soft_fail": final30_quality_soft_fail,
+             "trade_can_proceed": int(final30_trade_can_proceed),
+             "durations_sec": {
+                 "ohlcv_delta": round(dt_ohlcv, 2),
+                 "derived": round(dt_derived, 2),
+                 "candidate_pool": round(dt_pool, 2),
+                 "watchlist": round(dt_watchlist, 2),
+                 "total": round(time.monotonic() - t0, 2),
+             },
+         }
+     )
+     prep_manifest["build_status"] = prep_status
+     prep_manifest["final30_quality"] = final30_quality
+     prep_manifest["final30_quality_ok"] = final30_quality_ok
+     prep_manifest["final30_quality_soft_fail"] = final30_quality_soft_fail
+     prep_manifest["trade_can_proceed"] = int(final30_trade_can_proceed)
++    prep_manifest["flow_total_symbols"] = flow_total_symbols
++    prep_manifest["flow_success_symbols"] = flow_success_symbols
++    prep_manifest["flow_failed_symbols"] = flow_failed_symbols
++    prep_manifest["flow_failed_ratio"] = flow_failed_ratio
++    prep_manifest["flow_provider_usage_kis"] = flow_provider_usage_kis
++    prep_manifest["flow_provider_usage_pykrx"] = flow_provider_usage_pykrx
++    prep_manifest["flow_provider_usage_none"] = flow_provider_usage_none
+     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+     if prep_status != "FAIL":
+         mirror_sync = sync_prep_final30_file_mirror(
+             env=env,
+             as_of=as_of.isoformat(),
+             df=final30_scored_df_for_export,
+         )
+         final30_file_results = dict(mirror_sync.get("file_results") or {})
+         final30_files_validation = dict(mirror_sync.get("validation") or {})
+         final30_file_failures = list(dict.fromkeys(list(final30_file_failures) + list(final30_files_validation.get("errors") or [])))
+         final30_file_contract_ok = bool(final30_files_validation.get("ok"))
+         if not final30_file_contract_ok:
+             strict_contract_failures = list(dict.fromkeys(list(strict_contract_failures) + list(final30_file_failures)))
+             if core_done:
+                 logger.warning("[PREP][AUX][WARN] final30 mirror resync failed after DONE_CORE failures=%s", final30_file_failures)
+             else:
+                 prep_status = "FAIL"
+     payload["prep_status"] = prep_status
+     payload["final30_file_contract_ok"] = final30_file_contract_ok
+     payload["final30_file_failures"] = list(final30_file_failures)
+     payload["contract_failures"] = list(strict_contract_failures)
+     prep_manifest["build_status"] = prep_status
+     prep_manifest["trade_can_proceed"] = int(final30_gate_decision["trade_can_proceed"])
+     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+     
+diff --git a/trader/tests/test_flow_provider_stability.py b/trader/tests/test_flow_provider_stability.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5dd23b340276dc9766e62971498177fc054f02c
+--- /dev/null
++++ b/trader/tests/test_flow_provider_stability.py
+@@ -0,0 +1,104 @@
++from __future__ import annotations
++
++import json
++import types
++from datetime import date
++
++import pandas as pd
++
++from trader.prep_runner import _make_flow_provider
++from trader.watchlist_builder import _build_flow_provenance
++
++
++class _DummyKis:
++    def __init__(self, *args, **kwargs):
++        self.calls = 0
++        self.refreshed = 0
++
++    def inquire_investor(self, code: str, market: str = "KOSDAQ"):
++        self.calls += 1
++        return {"ok": False, "error": "FAST_FAIL breaker open for /uapi/domestic-stock/v1/quotations/inquire-investor"}
++
++    def refresh_token(self):
++        self.refreshed += 1
++
++
++class _FailingStock:
++    @staticmethod
++    def get_market_net_purchases_of_equities_by_ticker(*args, **kwargs):
++        raise json.JSONDecodeError("bad", "{}", 0)
++
++
++def test_pykrx_jsondecodeerror_isolated(monkeypatch):
++    fake_pykrx = types.SimpleNamespace(stock=_FailingStock)
++    monkeypatch.setitem(__import__("sys").modules, "pykrx", fake_pykrx)
++    fake_kis_mod = types.SimpleNamespace(KisAPI=_DummyKis)
++    monkeypatch.setitem(__import__("sys").modules, "trader.kis_wrapper", fake_kis_mod)
++
++    provider = _make_flow_provider(engine=None)
++    foreign, inst, meta = provider("005930", date(2026, 3, 27), 20)
++
++    assert isinstance(foreign, pd.DataFrame)
++    assert isinstance(inst, pd.DataFrame)
++    assert meta["ok"] is False
++    assert meta["provider"] == "none"
++
++
++def test_kis_breaker_open_run_level_disable(monkeypatch):
++    fake_kis_mod = types.SimpleNamespace(KisAPI=_DummyKis)
++    monkeypatch.setitem(__import__("sys").modules, "trader.kis_wrapper", fake_kis_mod)
++
++    class _EmptyStock:
++        @staticmethod
++        def get_market_net_purchases_of_equities_by_ticker(*args, **kwargs):
++            return pd.DataFrame()
++
++    monkeypatch.setitem(__import__("sys").modules, "pykrx", types.SimpleNamespace(stock=_EmptyStock))
++
++    provider = _make_flow_provider(engine=None)
++    _, _, meta1 = provider("005930", date(2026, 3, 27), 20)
++    _, _, meta2 = provider("000660", date(2026, 3, 27), 20)
++
++    assert meta1["ok"] is False
++    assert "kis:breaker_open" in meta1["reason"]
++    assert "kis:disabled:breaker_open" in meta2["reason"]
++
++
++def test_flow_provenance_genuine_zero_vs_imputed():
++    genuine = _build_flow_provenance(
++        flow_missing=False,
++        flow_meta={"ok": True, "provider": "kis", "reason": ""},
++        foreign_df=pd.DataFrame([{"date": "2026-03-27", "net_buy": 0.0}]),
++        inst_df=pd.DataFrame([{"date": "2026-03-27", "net_buy": 0.0}]),
++        flow_missing_reason="",
++    )
++    imputed = _build_flow_provenance(
++        flow_missing=True,
++        flow_meta={"ok": False, "provider": "none", "reason": "all_providers_failed"},
++        foreign_df=pd.DataFrame(),
++        inst_df=pd.DataFrame(),
++        flow_missing_reason="provider_missing",
++    )
++
++    assert genuine["flow_score_imputed"] == 0
++    assert genuine["flow_data_available"] == 1
++    assert imputed["flow_score_imputed"] == 1
++    assert imputed["flow_data_available"] == 0
++
++
++def test_all_providers_failed_meta_contract(monkeypatch):
++    fake_kis_mod = types.SimpleNamespace(KisAPI=_DummyKis)
++    monkeypatch.setitem(__import__("sys").modules, "trader.kis_wrapper", fake_kis_mod)
++
++    class _EmptyStock:
++        @staticmethod
++        def get_market_net_purchases_of_equities_by_ticker(*args, **kwargs):
++            return pd.DataFrame()
++
++    monkeypatch.setitem(__import__("sys").modules, "pykrx", types.SimpleNamespace(stock=_EmptyStock))
++    provider = _make_flow_provider(engine=None)
++    _, _, meta = provider("005930", date(2026, 3, 27), 20)
++
++    assert meta["provider"] == "none"
++    assert meta["ok"] is False
++    assert "all_providers_failed" in meta["detail"]
+diff --git a/trader/trade_tick.py b/trader/trade_tick.py
+index 0fc80c0fa9a4b9ed7bf8837b05b083d2713eae36..6c1e1256cbe4e1db29c7d20e5a3c768b700e529b 100644
+--- a/trader/trade_tick.py
++++ b/trader/trade_tick.py
+@@ -1,23 +1,37 @@
+ """
+ Backward-compatibility alias module for trade_tick.
+ 
+ This module exists to prevent "No module named trader.trade_tick" errors.
+ It simply delegates to the actual trade tick implementation in pb1_runner.
+ 
+ Usage:
+     python -m trader.trade_tick
+ """
+ 
+ from __future__ import annotations
+ 
+ import sys
++import os
++import logging
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def main() -> int:
+     """Run the PB1 trade tick pipeline."""
++    logger.info("[TRADE][BOOT][START] module=trade_tick_alias")
++    logger.info(
++        "[TRADE][BOOT][ENV] MODE=%s STRATEGY_ENV=%s KIS_ENV=%s FAIL_IF_POOL_MISSING=%s CANDIDATE_POOL_STRATEGY=%s PB1_PHASE_DEFAULT=%s",
++        os.getenv("MODE", "trade"),
++        os.getenv("STRATEGY_ENV", ""),
++        os.getenv("KIS_ENV", ""),
++        os.getenv("FAIL_IF_POOL_MISSING", ""),
++        os.getenv("CANDIDATE_POOL_STRATEGY_KEY", ""),
++        os.getenv("PB1_PHASE_DEFAULT", ""),
++    )
+     from trader.pb1_runner import main as pb1_main
+     return pb1_main()
+ 
+ 
+ if __name__ == "__main__":
+     sys.exit(main())
+diff --git a/trader/verify_candidate_pool.py b/trader/verify_candidate_pool.py
+index e2e931de9d336b4649123a7703b268e431eee7b8..65214e2b028ee13d49465c79ee9b7f8234750556 100644
+--- a/trader/verify_candidate_pool.py
++++ b/trader/verify_candidate_pool.py
+@@ -18,130 +18,136 @@ if str(project_root) not in sys.path:
+ 
+ from trader.db.repos import WatchlistRepo
+ from trader.db.engine import get_engine
+ 
+ 
+ def verify_candidate_pool():
+     """후보군 DB 검증 (주중 trade-tick 전용)"""
+     
+     # ✅ R1: 환경 키 강제 고정 확인
+     env = os.getenv("STRATEGY_ENV", "practice")
+     kis_env = os.getenv("KIS_ENV", "practice")
+     strategy = os.getenv("CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+     
+     # ✅ 환경 키 일치 확인 (중요!)
+     if kis_env != env:
+         print(f"[VERIFY][WARN] ⚠️  KIS_ENV={kis_env} != STRATEGY_ENV={env}")
+         print(f"[VERIFY][WARN] Candidate pool uses STRATEGY_ENV (not KIS_ENV)")
+         print(f"[VERIFY][WARN] This may cause fallback to old pool!")
+         print()
+     
+     # as_of 날짜 결정 (KST 기준 오늘)
+     from zoneinfo import ZoneInfo
+     kst = ZoneInfo("Asia/Seoul")
+     as_of = datetime.now(kst).date()
+     
++    print("[POOL][PRECHECK][START]")
+     print(f"[VERIFY] Checking candidate pool...")
+     print(f"[VERIFY] env={env} (STRATEGY_ENV)")
+     print(f"[VERIFY] kis_env={kis_env} (KIS_ENV - not used for candidate pool)")
+     print(f"[VERIFY] strategy={strategy}")
+     print(f"[VERIFY] as_of={as_of}")
+     print()
+     
+     # DB에서 후보군 로드 (최신 fallback 허용)
+     engine = get_engine()
+     repo = WatchlistRepo(engine)
+     
+     try:
+         ttl_days = int(os.getenv("CANDIDATE_POOL_TTL_DAYS", "7"))
+         fail_if_missing = os.getenv("FAIL_IF_POOL_MISSING", "1") == "1"
+         
+         rows, used_as_of = repo.load_watchlist(
+             env=env,
+             strategy=strategy,
+             as_of=as_of,
+             allow_latest_fallback=True,
+             ttl_days=ttl_days,
+         )
+         
+         if not rows:
++            print("[POOL][PRECHECK][FAIL] reason=empty")
+             print("[VERIFY][FAIL] ❌ Candidate pool is EMPTY!")
+             print()
+             print("Possible causes:")
+             print("  1. Weekend build did not run or failed")
+             print("  2. env/strategy key mismatch between build and verify")
+             print(f"  3. No pool found within TTL (last {ttl_days} days)")
+             print()
+             print("Expected values:")
+             print(f"  STRATEGY_ENV={env}")
+             print(f"  CANDIDATE_POOL_STRATEGY_KEY={strategy}")
+             print(f"  AS_OF={as_of}")
+             print(f"  TTL_DAYS={ttl_days}")
+             print()
+             print("✅ Solution: Run weekend_build.yml manually to create today's pool")
+             print()
+             
+             if fail_if_missing:
+                 print("[VERIFY][FAIL] FAIL_IF_POOL_MISSING=1 -> exiting")
+                 sys.exit(1)
+             else:
+                 print("[VERIFY][WARN] FAIL_IF_POOL_MISSING=0 -> continuing (risky!)")
+                 return
+         
+         codes = [row["code"] for row in rows]
+         sample = codes[:5]
+         
+         # 최소 크기 확인
+         min_size = int(os.getenv("CANDIDATE_POOL_MIN_SIZE", "40"))
+         if len(codes) < min_size:
+             print(f"[VERIFY][WARN] ⚠️  Pool size {len(codes)} < minimum {min_size}")
+             if fail_if_missing:
++                print("[POOL][PRECHECK][FAIL] reason=too_small")
+                 print("[VERIFY][FAIL] Pool too small -> exiting")
+                 sys.exit(1)
+         
+         # 날짜 확인 (fallback 여부)
+         if used_as_of and used_as_of != as_of:
+             age_days = (as_of - used_as_of).days
+             
+             if age_days > ttl_days:
++                print("[POOL][PRECHECK][FAIL] reason=too_old")
+                 print(f"[VERIFY][FAIL] ❌ Pool too old!")
+                 print(f"[VERIFY][FAIL] requested_as_of={as_of}")
+                 print(f"[VERIFY][FAIL] used_as_of={used_as_of} (age={age_days} days > TTL={ttl_days})")
+                 print()
+                 print("✅ Solution: Run weekend_build.yml to create fresh pool")
+                 print()
+                 
+                 if fail_if_missing:
+                     sys.exit(1)
+                 else:
+                     print("[VERIFY][WARN] Continuing with old pool (risky!)")
+             else:
++                print(f"[POOL][PRECHECK][OK] mode=fallback used_as_of={used_as_of} age_days={age_days} size={len(codes)}")
+                 print(f"[VERIFY][OK] ✅ Candidate pool found (fallback)!")
+                 print(f"[VERIFY][OK] requested_as_of={as_of}")
+                 print(f"[VERIFY][OK] used_as_of={used_as_of} (age={age_days} days)")
+                 print(f"[VERIFY][OK] size={len(codes)}")
+                 print(f"[VERIFY][OK] sample={sample}")
+                 print()
+         else:
++            print(f"[POOL][PRECHECK][OK] mode=exact size={len(codes)} as_of={used_as_of or as_of}")
+             print(f"[VERIFY][OK] ✅ Candidate pool found (exact)!")
+             print(f"[VERIFY][OK] as_of={used_as_of or as_of}")
+             print(f"[VERIFY][OK] size={len(codes)}")
+             print(f"[VERIFY][OK] sample={sample}")
+             print()
+         
+         # 최종 확인
+         print(f"[VERIFY][OK] Pool size {len(codes)} >= minimum {min_size}")
+         print(f"[VERIFY][OK] ✅ All checks passed!")
+         print()
+         print("[POOL][PRECHECK] ✅ Candidate pool verification passed")
+         print("[POOL][PRECHECK] trade-tick will load from DB (no rebuild)")
+         print()
+         
+     except Exception as e:
+         print(f"[VERIFY][ERROR] Failed to load candidate pool: {e}")
+         import traceback
+         traceback.print_exc()
+         sys.exit(1)
+ 
+ 
+ if __name__ == "__main__":
+     verify_candidate_pool()
+diff --git a/trader/watchlist_builder.py b/trader/watchlist_builder.py
+index 1a7398015be1caef33d491c914bd83fd3e0eb95d..a878d7c2e1d9c44909589e337c42b6cd730498a4 100644
+--- a/trader/watchlist_builder.py
++++ b/trader/watchlist_builder.py
+@@ -29,51 +29,51 @@ from trader.db.repos import (
+ from trader.flow_score import calculate_final_score, calculate_flow_score
+ from trader.final30_quality import (
+     FINAL30_PRESERVE_FIELDS,
+     dominant_value_ratio,
+     is_placeholder_entry_value,
+     is_valid_positive_numeric,
+     normalize_entry_input_value,
+     normalize_final30_contract_row,
+     score_distribution_is_monoculture,
+     summarize_final30_quality,
+     verify_final30_scored_rows,
+ )
+ from trader.factors.multifactor import (
+     compute_ai_rs_scores,
+     compute_liquidity_score,
+     compute_rs_features,
+     compute_volatility_score,
+     optimize_meta_k,
+ )
+ from trader.indicators import compute_atr_pct_from_ohlcv, compute_ma20_from_ohlcv, safe_nullable_float
+ from trader.score_columns import resolve_score_column
+ from trader.time_coerce import to_date
+ 
+ logger = logging.getLogger(__name__)
+ 
+-FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]
++FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]]
+ 
+ 
+ @dataclass
+ class WatchlistBundle:
+     """
+     Watchlist pipeline intermediate results bundle.
+     
+     All stages must have valid data (non-empty) for bundle to be considered complete.
+     This ensures cache hit only when all stages are available.
+     """
+     as_of: str
+     env: str
+     strategy: str
+     universe_scored: List[Dict[str, Any]]  # rows > 0 required
+     pool120: List[Dict[str, Any]]          # rows == 120 required
+     top50: List[Dict[str, Any]]            # rows == 50 required
+     final30: List[Dict[str, Any]]          # rows == 30 required
+     meta: Dict[str, Any]
+     
+     def is_complete(self, *, min_pool: int = 40, exact_top50: int = 40, exact_final30: int = 30) -> bool:
+         """
+         Check if bundle meets minimum requirements.
+         
+         Returns:
+             True if all stages have sufficient data
+@@ -129,50 +129,52 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
+         missing = [col for col in CRITICAL_SCORED_COLS if col not in raw_keys]
+         logger.warning("[WATCHLIST][FINAL30_SCORED][MISSING_CRITICAL] missing_cols=%s", missing)
+ 
+     saved_rows: List[Dict[str, Any]] = []
+     for idx, row in enumerate(rows or [], start=1):
+         item = _sanitize_scored_item(dict(row or {}), source="final30_saved_rows")
+         for col in REQUIRED_FINAL30_SCORED_COLS:
+             item.setdefault(col, None)
+         score = item.get("score")
+         if score is None:
+             score = item.get("score_final")
+         if score is None:
+             score = item.get("final_score")
+         try:
+             score_val = float(score or 0.0)
+         except Exception:
+             score_val = 0.0
+         normalized = {col: item.get(col) for col in REQUIRED_FINAL30_SCORED_COLS}
+         normalized["code"] = str(item.get("code") or "").zfill(6)
+         normalized["rank"] = int(item.get("rank") or item.get("rank_final30") or idx)
+         for field in FINAL30_CANONICAL_NUMERIC_FIELDS:
+             normalized[field] = _canonicalize_numeric_field(field, item, score_fallback=score_val)
+         normalized["score_final"] = normalized.get("score_final")
+         normalized["final_score"] = normalized.get("score_final")
+         normalized["score"] = normalized.get("score_final") if normalized.get("score_final") is not None else score_val
++        for field in FLOW_PROVENANCE_FIELDS:
++            normalized[field] = item.get(field)
+         normalized["meta"] = item.get("meta", {})
+         saved_rows.append({**normalized, "rank": normalized["rank"], "score": normalized["score"]})
+     return saved_rows
+ 
+ 
+ def _log_final30_scored_rows(prefix: str, rows: List[Dict[str, Any]]) -> None:
+     df = pd.DataFrame(rows or [])
+     logger.info(
+         "%s rows=%s has_tech_score=%s has_score_final=%s has_breakout_score=%s has_pullback_score=%s has_momentum_score=%s",
+         prefix,
+         int(len(df)),
+         int(resolve_score_column(df, "tech") is not None),
+         int(resolve_score_column(df, "final") is not None),
+         int(resolve_score_column(df, "breakout") is not None),
+         int(resolve_score_column(df, "pullback") is not None),
+         int(resolve_score_column(df, "momentum") is not None),
+     )
+ 
+ 
+ def _log_final30_scored_df_ready(final30_scored_df: pd.DataFrame) -> None:
+     logger.info(
+         "[WATCHLIST][FINAL30_SCORED][READY] rows=%s cols=%s has_tech=%s has_final=%s has_breakout=%s has_pullback=%s has_momentum=%s",
+         len(final30_scored_df),
+         list(final30_scored_df.columns),
+         "tech_score" in final30_scored_df.columns,
+@@ -249,50 +251,56 @@ def _prefer_valid_numeric(body_value: Any, meta_value: Any, *, zero_invalid: boo
+     if body is not None and (not zero_invalid or body > 0):
+         return body
+     if meta is not None and (not zero_invalid or meta > 0):
+         return meta
+     return body if body is not None else meta
+ 
+ 
+ INVALID_ZERO_NUMERIC_FIELDS = ("close", "ma20", "ma50", "ma150", "atr_pct")
+ ZERO_INVALID_ALWAYS_FIELDS = {"close", "ma20", "ma50", "ma150"}
+ NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile"}
+ NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
+ FINAL30_CANONICAL_NUMERIC_FIELDS = (
+     "close",
+     "ma20",
+     "ma50",
+     "ma150",
+     "atr_pct",
+     "rs_percentile",
+     "breakout_score",
+     "pullback_score",
+     "momentum_score",
+     "tech_score",
+     "score_final",
+ )
+ FINAL30_SAVE_REQUIRED_POSITIVE_FIELDS = {"close", "ma50", "ma150"}
++FLOW_PROVENANCE_FIELDS = (
++    "flow_data_available",
++    "flow_provider_used",
++    "flow_fail_reason",
++    "flow_score_imputed",
++)
+ MA20_ALIAS_FIELDS = ("ma20", "ma_20", "sma20", "close_ma20", "moving_avg20", "avg20", "ma20_price")
+ MA20_NORMALIZE_PRIORITY = (
+     "ma20",
+     "ma_20",
+     "sma20",
+     "close_ma20",
+     "moving_avg20",
+     "avg20",
+     "ma20_price",
+ )
+ FINAL30_CONTRACT_REQUIRED_FIELDS = tuple(
+     dict.fromkeys(
+         (
+             "code",
+             *FINAL30_PRESERVE_FIELDS,
+             "breakout_score",
+             "pullback_score",
+             "momentum_score",
+             "tech_score",
+             "score_final",
+             "entry_style_selected",
+         )
+     )
+ )
+ 
+@@ -1201,50 +1209,69 @@ def validate_watchlist_contract(
+     
+     return failures
+ 
+ 
+ def _flow_contract_state(
+     *,
+     foreign_df: Optional[pd.DataFrame],
+     inst_df: Optional[pd.DataFrame],
+     flow_result: Dict[str, Any],
+ ) -> Tuple[bool, Optional[float], Optional[float], str]:
+     foreign_ratio_raw = flow_result.get("foreign_20_ratio")
+     inst_ratio_raw = flow_result.get("inst_20_ratio")
+     has_foreign_ratio = foreign_ratio_raw is not None
+     has_inst_ratio = inst_ratio_raw is not None
+ 
+     if has_foreign_ratio or has_inst_ratio:
+         foreign_ratio = _safe_float(foreign_ratio_raw, 0.0) if has_foreign_ratio else None
+         inst_ratio = _safe_float(inst_ratio_raw, 0.0) if has_inst_ratio else None
+         return False, foreign_ratio, inst_ratio, "ratio_available"
+ 
+     if foreign_df is None or inst_df is None:
+         return True, None, None, "provider_missing"
+     return True, None, None, "ratio_missing"
+ 
+ 
++def _build_flow_provenance(
++    *,
++    flow_missing: bool,
++    flow_meta: Dict[str, Any],
++    foreign_df: Optional[pd.DataFrame],
++    inst_df: Optional[pd.DataFrame],
++    flow_missing_reason: str,
++) -> Dict[str, Any]:
++    data_available = int((not flow_missing) and bool((flow_meta or {}).get("ok")))
++    return {
++        "flow_data_available": data_available,
++        "flow_provider_used": str((flow_meta or {}).get("provider") or "none"),
++        "flow_fail_reason": "" if data_available else str((flow_meta or {}).get("reason") or flow_missing_reason or "unknown"),
++        "flow_score_imputed": int(bool(flow_missing)),
++        "foreign_flow_missing": int(foreign_df is None or getattr(foreign_df, "empty", True)),
++        "inst_flow_missing": int(inst_df is None or getattr(inst_df, "empty", True)),
++    }
++
++
+ def _extract_derived_metrics(derived_row: Dict[str, Any]) -> Dict[str, float]:
+     features = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
+ 
+     close = _safe_nullable_float(derived_row.get("close"))
+     ma50 = _safe_nullable_float(derived_row.get("ma50"))
+     ma150 = _safe_nullable_float(derived_row.get("ma150"))
+     ma200 = _safe_nullable_float(derived_row.get("ma200"))
+     trend_checks = [
+         bool(close is not None and ma50 is not None and close > ma50 > 0),
+         bool(ma50 is not None and ma150 is not None and ma50 > ma150 > 0),
+         bool(ma150 is not None and ma200 is not None and ma150 > ma200 > 0),
+         bool(close is not None and ma200 is not None and close > ma200 > 0),
+     ]
+     trend_score = float(sum(1 for check in trend_checks if check) * 25.0)
+ 
+     hi_52w = _prefer_valid_numeric(derived_row.get("hi_52w"), features.get("hi_52w"), zero_invalid=True)
+     pullback_pct = None
+     if hi_52w is not None and close is not None and hi_52w > 0 and close > 0:
+         pullback_pct = max(0.0, (hi_52w - close) / hi_52w)
+     else:
+         pullback_pct = _safe_nullable_float(features.get("pullback_pct"))
+ 
+     return {
+         "rs_percentile": _prefer_valid_numeric(derived_row.get("rs_percentile"), features.get("rs_percentile")),
+         "rs_pctile": _prefer_valid_numeric(derived_row.get("rs_percentile"), features.get("rs_percentile")),
+@@ -1415,120 +1442,139 @@ def _enrich_watchlist_rows(
+         try:
+             ohlcv_raw, _ = ohlcv_provider(code, count=max(int(flow_window) + 30, 80))
+             ohlcv_df = _normalize_ohlcv_columns(ohlcv_raw if ohlcv_raw is not None else pd.DataFrame())
+         except Exception:
+             ohlcv_df = pd.DataFrame()
+ 
+         derived_row = derived_map.get(code)
+         if derived_row is None:
+             if "derived_missing" not in reject_reasons:
+                 reject_reasons.append("derived_missing")
+             meta["derived_missing"] = True
+         else:
+             metrics = _extract_derived_metrics(derived_row)
+             for key, value in metrics.items():
+                 out[key] = value
+                 meta[key] = value
+             meta["derived_missing"] = False
+ 
+         if flow_provider is not None:
+             flow_weight_effective = float(flow_weight)
+             tech_weight_effective = float(tech_weight)
+             trend_weight_effective = float(trend_weight)
+             foreign_df: Optional[pd.DataFrame] = None
+             inst_df: Optional[pd.DataFrame] = None
+ 
++            flow_meta: Dict[str, Any] = {"ok": False, "provider": "none", "reason": "not_called", "detail": ""}
+             try:
+-                foreign_df, inst_df = flow_provider(code, as_of, int(flow_window))
++                foreign_df, inst_df, flow_meta = flow_provider(code, as_of, int(flow_window))
+             except Exception:
+                 logger.warning("[FLOW][WARN] provider exception code=%s as_of=%s", code, as_of, exc_info=True)
+                 if "flow_provider_error" not in reject_reasons:
+                     reject_reasons.append("flow_provider_error")
++                flow_meta = {"ok": False, "provider": "none", "reason": "provider_exception", "detail": "raised"}
+ 
+             flow_result = calculate_flow_score(
+                 code=code,
+                 ohlcv_df=ohlcv_df if ohlcv_df is not None else pd.DataFrame(),
+                 foreign_df=foreign_df,
+                 inst_df=inst_df,
+                 window=int(flow_window),
+             )
+             flow_score_norm = _safe_float(flow_result.get("flow_score"), 0.0)
+             tech_score_val = _safe_float(out.get("tech_score", 0.0), 0.0)
+ 
+             flow_missing, foreign_ratio, inst_ratio, flow_missing_reason = _flow_contract_state(
+                 foreign_df=foreign_df,
+                 inst_df=inst_df,
+                 flow_result=flow_result,
+             )
+             if flow_missing:
+                 flow_weight_effective = 0.0
+                 tech_weight_effective = 1.0
+                 trend_weight_effective = 0.0
++                logger.warning(
++                    "[FLOW][IMPUTE] code=%s score=%s provider_used=%s reason=%s",
++                    code,
++                    flow_score_norm,
++                    str(flow_meta.get("provider") or "none"),
++                    str(flow_meta.get("reason") or flow_missing_reason or "unknown"),
++                )
+                 logger.warning(
+                     "[FLOW][WARN] flow missing -> non_blocking code=%s as_of=%s reason=%s",
+                     code,
+                     as_of,
+                     flow_missing_reason,
+                 )
+             meta["flow_missing"] = bool(flow_missing)
+             meta["flow_missing_reason"] = flow_missing_reason
+             out["flow_missing"] = bool(flow_missing)
+             out["flow_pass"] = True
++            provenance = _build_flow_provenance(
++                flow_missing=bool(flow_missing),
++                flow_meta=flow_meta,
++                foreign_df=foreign_df,
++                inst_df=inst_df,
++                flow_missing_reason=flow_missing_reason,
++            )
++            out.update(provenance)
++            meta.update(provenance)
+ 
+             out["flow_score"] = flow_score_norm
+             out["foreign_20_ratio"] = foreign_ratio
+             out["inst_20_ratio"] = inst_ratio
+             base_final_score = calculate_final_score(
+                 tech_score=tech_score_val,
+                 flow_score=flow_score_norm * 100.0,
+                 tech_weight=tech_weight_effective,
+                 flow_weight=flow_weight_effective,
+             )
+             out["final_score"] = float(base_final_score + (_safe_float(out.get("trend_score"), 0.0) * trend_weight_effective))
+             meta["weights_effective"] = {
+                 "tech_weight": tech_weight_effective,
+                 "flow_weight": flow_weight_effective,
+                 "trend_weight": trend_weight_effective,
+             }
+             meta["formula"] = (
+                 "score_final = "
+                 f"{tech_weight_effective:.4f}*score_tech + "
+                 f"{flow_weight_effective:.4f}*score_flow + "
+                 f"{trend_weight_effective:.4f}*score_trend"
+             )
+             flow_rows.append(
+                 {
+                     "as_of": to_date(as_of),
+                     "symbol": code,
+                     "flow_score": flow_score_norm,
+                     "foreign_20_ratio": foreign_ratio,
+                     "inst_20_ratio": inst_ratio,
+                     "flow_missing": bool(flow_missing),
+                     "source": "watchlist_flow_provider",
+                     "features_json": {
+                         "flow_missing_reason": flow_missing_reason,
+                         "weights_effective": meta.get("weights_effective", {}),
++                        "flow_meta": flow_meta,
+                     },
+                 }
+             )
+ 
+         if _safe_float(out.get("tech_score"), 0.0) <= 0.0:
+             rs_pctile = _safe_float(out.get("rs_pctile"), 0.0)
+             vcp_score = _safe_float(out.get("vcp_score"), 0.0)
+             trend_score = _safe_float(out.get("trend_score"), 0.0)
+             pullback_pct = _safe_float(out.get("pullback_pct"), 0.0)
+             atr_pct = _safe_float(out.get("atr_pct"), 0.0)
+             pullback_score = max(0.0, min(100.0, 100.0 - (pullback_pct * 400.0)))
+             atr_score = max(0.0, min(100.0, 100.0 - abs(atr_pct - 0.04) * 1000.0))
+             out["tech_score"] = (
+                 rs_pctile * 0.40
+                 + vcp_score * 0.25
+                 + trend_score * 0.20
+                 + pullback_score * 0.10
+                 + atr_score * 0.05
+             )
+ 
+         derived_features = derived_row.get("features_json") if isinstance(derived_row, dict) and isinstance(derived_row.get("features_json"), dict) else {}
+         repaired_ma20 = _prefer_numeric_candidates(
+             [
+                 out.get("ma20"),
+                 meta.get("ma20"),
+@@ -2429,129 +2475,129 @@ class WatchlistBuilder:
+             item["top50_rank"] = idx
+         for item in scored[self.topk :]:
+             item.setdefault("reject_reasons", []).append("not_in_top50")
+ 
+         normalized = [self._normalize_item(item, score_key="tech_score", rank_key="top50_rank") for item in top50]
+ 
+         if len(normalized) < 30:
+             fallback = [self._normalize_item(item, score_key="tech_score", rank_key="top50_rank") for item in pool120[:30]]
+             for idx, item in enumerate(fallback, start=1):
+                 item["top50_rank"] = idx
+                 item["rank"] = idx
+             normalized = fallback
+             logger.warning("[WATCHLIST][PIPELINE][B_TOP50][FALLBACK] top50<30 -> fallback=%s", len(normalized))
+ 
+         logger.info("[WATCHLIST][PIPELINE][B_TOP50] kept=%s from=%s", len(normalized), len(pool120))
+         return normalized
+ 
+     def _stage_c_flow_final(self, top50: List[Dict[str, Any]], as_of: date) -> List[Dict[str, Any]]:
+         if not top50:
+             logger.warning("[WATCHLIST][PIPELINE][C_FINAL30] kept=0 from=0")
+             return []
+ 
+         if self.flow_provider is None:
+             logger.warning("[WATCHLIST][PIPELINE][C_FINAL30][FLOW] provider missing -> flow weight disabled by item")
+ 
+-        flow_map: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
++        flow_map: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]] = {}
+         if self.flow_provider is not None and top50:
+             max_workers = max(1, min(_env_int("FLOW_FETCH_MAX_CONCURRENCY", 3), 5))
+             max_retries = max(1, _env_int("FLOW_FETCH_RETRIES", 3))
+             backoff_base = max(0.1, _env_float("FLOW_FETCH_BACKOFF_BASE_SEC", 0.6))
+             logger.info(
+                 "[FLOW][FETCH][START] symbols=%s concurrency=%s retries=%s",
+                 len(top50),
+                 max_workers,
+                 max_retries,
+             )
+ 
+-            def _fetch_for_code(code: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
++            def _fetch_for_code(code: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]:
+                 last_exc: Exception | None = None
+                 for attempt in range(1, max_retries + 1):
+                     try:
+                         return self.flow_provider(code, as_of, self.flow_window)
+                     except Exception as exc:
+                         last_exc = exc
+                         logger.warning(
+                             "[FLOW][FETCH][RETRY] code=%s attempt=%s/%s err=%s",
+                             code,
+                             attempt,
+                             max_retries,
+                             exc,
+                         )
+                         if attempt < max_retries:
+                             time.sleep(backoff_base * (2 ** (attempt - 1)))
+                 logger.warning("[FLOW][FETCH][FAIL] code=%s err=%s", code, last_exc)
+-                return None, None
++                return None, None, {"ok": False, "provider": "none", "reason": "fetch_failed", "detail": str(last_exc or "")[:120]}
+ 
+             code_list = [str(c.get("code") or "").zfill(6) for c in top50 if c.get("code")]
+             done = 0
+             ts_fetch = time.monotonic()
+             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="flow-fetch") as ex:
+                 futures = {ex.submit(_fetch_for_code, code): code for code in code_list}
+                 for fut in as_completed(futures):
+                     code = futures[fut]
+                     try:
+                         flow_map[code] = fut.result()
+                     except Exception:
+-                        flow_map[code] = (None, None)
++                        flow_map[code] = (None, None, {"ok": False, "provider": "none", "reason": "future_exception", "detail": ""})
+                     done += 1
+                     if done == 1 or done % max(1, len(code_list) // 5) == 0 or done == len(code_list):
+                         logger.info(
+                             "[FLOW][FETCH][HEARTBEAT] done=%s/%s elapsed=%.1fs",
+                             done,
+                             len(code_list),
+                             time.monotonic() - ts_fetch,
+                         )
+             logger.info("[FLOW][FETCH][DONE] symbols=%s", len(code_list))
+ 
+         scored: List[Dict[str, Any]] = []
+         total = len(top50)
+         progress_every = max(1, total // 10)
+         ts0 = time.monotonic()
+         for idx, cand in enumerate(top50, start=1):
+             if idx == 1 or idx % progress_every == 0 or idx == total:
+                 logger.info(
+                     "[WATCHLIST][PIPELINE][C_FINAL30][PROGRESS] processed=%s/%s scored=%s elapsed=%.1fs",
+                     idx,
+                     total,
+                     len(scored),
+                     time.monotonic() - ts0,
+                 )
+             code = cand["code"]
+             item = dict(cand)
+             reject_reasons = list(item.get("reject_reasons", []))
+ 
+             try:
+                 ohlcv_df, _ = self.ohlcv_provider(code, count=max(self.flow_window + 10, 80))
+                 ohlcv_df = _normalize_ohlcv_columns(ohlcv_df if ohlcv_df is not None else pd.DataFrame())
+             except Exception:
+                 ohlcv_df = pd.DataFrame()
+ 
+             foreign_df: Optional[pd.DataFrame] = None
+             inst_df: Optional[pd.DataFrame] = None
+             if self.flow_provider is not None:
+-                foreign_df, inst_df = flow_map.get(code, (None, None))
++                foreign_df, inst_df, _ = flow_map.get(code, (None, None, {"ok": False, "provider": "none"}))
+ 
+             flow_weight_effective = self.flow_weight
+             tech_weight_effective = self.tech_weight
+             trend_weight_effective = self.trend_weight
+ 
+             flow_result = calculate_flow_score(
+                 code=code,
+                 ohlcv_df=ohlcv_df if ohlcv_df is not None else pd.DataFrame(),
+                 foreign_df=foreign_df,
+                 inst_df=inst_df,
+                 window=self.flow_window,
+             )
+ 
+             flow_score_norm = float(flow_result.get("flow_score", 0.0) or 0.0)
+             flow_score_100 = flow_score_norm * 100.0
+             tech_score = float(item.get("tech_score", 0.0) or 0.0)
+             flow_missing, foreign_ratio, inst_ratio, flow_missing_reason = _flow_contract_state(
+                 foreign_df=foreign_df,
+                 inst_df=inst_df,
+                 flow_result=flow_result,
+             )
+             if flow_missing:
+                 flow_weight_effective = 0.0
+                 tech_weight_effective = 1.0
+                 trend_weight_effective = 0.0

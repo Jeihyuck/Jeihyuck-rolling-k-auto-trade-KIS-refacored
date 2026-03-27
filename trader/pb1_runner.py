@@ -592,6 +592,9 @@ def load_trade_final30_scored(
                 raise RuntimeError(format_final30_abort_message(trade_validate))
             logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
         except RuntimeError as exc:
+            logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=db_contract_invalid")
+            logger.error("[TRADE][FINAL30][FAIL] reason=missing_or_empty")
+            logger.error("[TRADE][READY][FAIL] reason=final30_contract_invalid")
             logger.error("[TRADE][ABORT][FINAL30_INVALID][DETAIL] %s", format_final30_abort_message(trade_validate))
             logger.error("%s", exc)
             result = {
@@ -3068,7 +3071,14 @@ def run_once(
         elif nontrading_eval_mode:
             logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
 
+        logger.info(
+            "[TRADE][PRECHECK][BALANCE] state=%s require_balance=%s allow_compute_without_kis=%s",
+            balance_state,
+            int(bool(PB1_REQUIRE_BALANCE_FOR_ENTRY)),
+            int(bool(allow_compute_without_kis)),
+        )
         if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY and not allow_compute_without_kis:
+            logger.error("[TRADE][READY][FAIL] reason=balance_precheck_failed")
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             db_write_reasons.append("balance_degraded")
@@ -3839,6 +3849,7 @@ def _exit_code_for_status(status: str) -> int:
 
 def main() -> int:
     args = parse_args()
+    logger.info("[TRADE][BOOT][START]")
     resolved_env = resolve_env(getattr(args, "env", None))
     os.environ["STRATEGY_ENV"] = resolved_env
     if not os.getenv("KIS_ENV"):
@@ -3846,6 +3857,15 @@ def main() -> int:
     strategy_env_raw = os.getenv("STRATEGY_ENV")
     kis_env_raw = os.getenv("KIS_ENV")
     derived_env = (strategy_env_raw or kis_env_raw or "practice").strip().lower()
+    logger.info(
+        "[TRADE][BOOT][ENV] MODE=%s STRATEGY_ENV=%s KIS_ENV=%s FAIL_IF_POOL_MISSING=%s CANDIDATE_POOL_STRATEGY_KEY=%s PB1_PHASE_DEFAULT=%s",
+        os.getenv("MODE", "trade"),
+        strategy_env_raw or "",
+        kis_env_raw or "",
+        os.getenv("FAIL_IF_POOL_MISSING", ""),
+        os.getenv("CANDIDATE_POOL_STRATEGY_KEY", ""),
+        os.getenv("PB1_PHASE_DEFAULT", ""),
+    )
 
     # ✅ 설계 1: JOB 모드 분리 (BUILD_WATCHLIST vs TRADE_INTRADAY)
     job_mode = os.getenv("PB1_JOB", "TRADE_INTRADAY").upper()
@@ -4143,7 +4163,15 @@ def main() -> int:
             int(scored_contract_repairable),
             int(db_contract_ok),
         )
+        logger.info(
+            "[TRADE][PRECHECK][CANDIDATE_POOL] status=%s derived_count=%s watchlist_final=%s watchlist_scored=%s",
+            "OK" if db_contract_ok else "FAIL",
+            derived_count,
+            watchlist_final_count,
+            watchlist_scored_count,
+        )
         if not db_contract_ok:
+            logger.error("[TRADE][READY][FAIL] reason=candidate_pool_or_db_contract_invalid")
             logger.warning(
                 "[TRADE_TICK][SKIP] reason=DB_CONTRACT_INCOMPLETE derived_as_of=%s trade_date=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s",
                 derived_as_of.isoformat(),
@@ -4240,6 +4268,7 @@ def main() -> int:
             )
         
         # ✅ DIAGNOSTIC: canonical scored final30 존재 여부 체크
+        logger.info("[TRADE][PRECHECK][FINAL30] status=START requested_as_of=%s", derived_as_of.isoformat())
         final30_result = load_trade_final30_scored(
             engine=engine,
             env=derived_env,
@@ -4247,12 +4276,15 @@ def main() -> int:
         )
         final30_df = final30_result.get("df")
         if final30_df is not None and not final30_df.empty:
+            logger.info("[TRADE][PRECHECK][FINAL30] status=OK rows=%s", len(final30_df))
             logger.info(
                 "[TRADE_TICK][FINAL30_SNAPSHOT][OK] derived_as_of=%s count=%d",
                 derived_as_of.isoformat(),
                 len(final30_df),
             )
         else:
+            logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=missing_or_empty")
+            logger.error("[TRADE][READY][FAIL] reason=final30_missing_or_empty")
             logger.error("[TRADE][FINAL30][LOAD_FAIL] no usable scored final30 found")
             return 0
         

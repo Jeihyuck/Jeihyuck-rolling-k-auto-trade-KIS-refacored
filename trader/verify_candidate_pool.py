@@ -40,6 +40,7 @@ def verify_candidate_pool():
     kst = ZoneInfo("Asia/Seoul")
     as_of = datetime.now(kst).date()
     
+    print("[POOL][PRECHECK][START]")
     print(f"[VERIFY] Checking candidate pool...")
     print(f"[VERIFY] env={env} (STRATEGY_ENV)")
     print(f"[VERIFY] kis_env={kis_env} (KIS_ENV - not used for candidate pool)")
@@ -64,6 +65,7 @@ def verify_candidate_pool():
         )
         
         if not rows:
+            print("[POOL][PRECHECK][FAIL] reason=empty")
             print("[VERIFY][FAIL] ❌ Candidate pool is EMPTY!")
             print()
             print("Possible causes:")
@@ -95,6 +97,7 @@ def verify_candidate_pool():
         if len(codes) < min_size:
             print(f"[VERIFY][WARN] ⚠️  Pool size {len(codes)} < minimum {min_size}")
             if fail_if_missing:
+                print("[POOL][PRECHECK][FAIL] reason=too_small")
                 print("[VERIFY][FAIL] Pool too small -> exiting")
                 sys.exit(1)
         
@@ -103,6 +106,7 @@ def verify_candidate_pool():
             age_days = (as_of - used_as_of).days
             
             if age_days > ttl_days:
+                print("[POOL][PRECHECK][FAIL] reason=too_old")
                 print(f"[VERIFY][FAIL] ❌ Pool too old!")
                 print(f"[VERIFY][FAIL] requested_as_of={as_of}")
                 print(f"[VERIFY][FAIL] used_as_of={used_as_of} (age={age_days} days > TTL={ttl_days})")
@@ -115,6 +119,7 @@ def verify_candidate_pool():
                 else:
                     print("[VERIFY][WARN] Continuing with old pool (risky!)")
             else:
+                print(f"[POOL][PRECHECK][OK] mode=fallback used_as_of={used_as_of} age_days={age_days} size={len(codes)}")
                 print(f"[VERIFY][OK] ✅ Candidate pool found (fallback)!")
                 print(f"[VERIFY][OK] requested_as_of={as_of}")
                 print(f"[VERIFY][OK] used_as_of={used_as_of} (age={age_days} days)")
@@ -122,6 +127,7 @@ def verify_candidate_pool():
                 print(f"[VERIFY][OK] sample={sample}")
                 print()
         else:
+            print(f"[POOL][PRECHECK][OK] mode=exact size={len(codes)} as_of={used_as_of or as_of}")
             print(f"[VERIFY][OK] ✅ Candidate pool found (exact)!")
             print(f"[VERIFY][OK] as_of={used_as_of or as_of}")
             print(f"[VERIFY][OK] size={len(codes)}")

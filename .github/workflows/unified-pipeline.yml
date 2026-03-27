@@ -1,6 +1,8 @@
-name: Unified Pipeline Manual Debug
+name: Unified Pipeline Manual Debug (Non-Scheduled)
 
 on:
+  # NOTE: This workflow is manual-debug only.
+  # Production scheduling lives in trade-prep.yml, trade-am.yml, trade-pm.yml, and trade-close.yml.
   workflow_dispatch:
     inputs:
       mode:

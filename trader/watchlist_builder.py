@@ -51,7 +51,7 @@ from trader.time_coerce import to_date
 
 logger = logging.getLogger(__name__)
 
-FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]
+FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]]
 
 
 @dataclass
@@ -151,6 +151,8 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
         normalized["score_final"] = normalized.get("score_final")
         normalized["final_score"] = normalized.get("score_final")
         normalized["score"] = normalized.get("score_final") if normalized.get("score_final") is not None else score_val
+        for field in FLOW_PROVENANCE_FIELDS:
+            normalized[field] = item.get(field)
         normalized["meta"] = item.get("meta", {})
         saved_rows.append({**normalized, "rank": normalized["rank"], "score": normalized["score"]})
     return saved_rows
@@ -271,6 +273,12 @@ FINAL30_CANONICAL_NUMERIC_FIELDS = (
     "score_final",
 )
 FINAL30_SAVE_REQUIRED_POSITIVE_FIELDS = {"close", "ma50", "ma150"}
+FLOW_PROVENANCE_FIELDS = (
+    "flow_data_available",
+    "flow_provider_used",
+    "flow_fail_reason",
+    "flow_score_imputed",
+)
 MA20_ALIAS_FIELDS = ("ma20", "ma_20", "sma20", "close_ma20", "moving_avg20", "avg20", "ma20_price")
 MA20_NORMALIZE_PRIORITY = (
     "ma20",
@@ -1223,6 +1231,25 @@ def _flow_contract_state(
     return True, None, None, "ratio_missing"
 
 
+def _build_flow_provenance(
+    *,
+    flow_missing: bool,
+    flow_meta: Dict[str, Any],
+    foreign_df: Optional[pd.DataFrame],
+    inst_df: Optional[pd.DataFrame],
+    flow_missing_reason: str,
+) -> Dict[str, Any]:
+    data_available = int((not flow_missing) and bool((flow_meta or {}).get("ok")))
+    return {
+        "flow_data_available": data_available,
+        "flow_provider_used": str((flow_meta or {}).get("provider") or "none"),
+        "flow_fail_reason": "" if data_available else str((flow_meta or {}).get("reason") or flow_missing_reason or "unknown"),
+        "flow_score_imputed": int(bool(flow_missing)),
+        "foreign_flow_missing": int(foreign_df is None or getattr(foreign_df, "empty", True)),
+        "inst_flow_missing": int(inst_df is None or getattr(inst_df, "empty", True)),
+    }
+
+
 def _extract_derived_metrics(derived_row: Dict[str, Any]) -> Dict[str, float]:
     features = derived_row.get("features_json") if isinstance(derived_row.get("features_json"), dict) else {}
 
@@ -1437,12 +1464,14 @@ def _enrich_watchlist_rows(
             foreign_df: Optional[pd.DataFrame] = None
             inst_df: Optional[pd.DataFrame] = None
 
+            flow_meta: Dict[str, Any] = {"ok": False, "provider": "none", "reason": "not_called", "detail": ""}
             try:
-                foreign_df, inst_df = flow_provider(code, as_of, int(flow_window))
+                foreign_df, inst_df, flow_meta = flow_provider(code, as_of, int(flow_window))
             except Exception:
                 logger.warning("[FLOW][WARN] provider exception code=%s as_of=%s", code, as_of, exc_info=True)
                 if "flow_provider_error" not in reject_reasons:
                     reject_reasons.append("flow_provider_error")
+                flow_meta = {"ok": False, "provider": "none", "reason": "provider_exception", "detail": "raised"}
 
             flow_result = calculate_flow_score(
                 code=code,
@@ -1464,6 +1493,13 @@ def _enrich_watchlist_rows(
                 tech_weight_effective = 1.0
                 trend_weight_effective = 0.0
                 logger.warning(
+                    "[FLOW][IMPUTE] code=%s score=%s provider_used=%s reason=%s",
+                    code,
+                    flow_score_norm,
+                    str(flow_meta.get("provider") or "none"),
+                    str(flow_meta.get("reason") or flow_missing_reason or "unknown"),
+                )
+                logger.warning(
                     "[FLOW][WARN] flow missing -> non_blocking code=%s as_of=%s reason=%s",
                     code,
                     as_of,
@@ -1473,6 +1509,15 @@ def _enrich_watchlist_rows(
             meta["flow_missing_reason"] = flow_missing_reason
             out["flow_missing"] = bool(flow_missing)
             out["flow_pass"] = True
+            provenance = _build_flow_provenance(
+                flow_missing=bool(flow_missing),
+                flow_meta=flow_meta,
+                foreign_df=foreign_df,
+                inst_df=inst_df,
+                flow_missing_reason=flow_missing_reason,
+            )
+            out.update(provenance)
+            meta.update(provenance)
 
             out["flow_score"] = flow_score_norm
             out["foreign_20_ratio"] = foreign_ratio
@@ -1507,6 +1552,7 @@ def _enrich_watchlist_rows(
                     "features_json": {
                         "flow_missing_reason": flow_missing_reason,
                         "weights_effective": meta.get("weights_effective", {}),
+                        "flow_meta": flow_meta,
                     },
                 }
             )
@@ -2451,7 +2497,7 @@ class WatchlistBuilder:
         if self.flow_provider is None:
             logger.warning("[WATCHLIST][PIPELINE][C_FINAL30][FLOW] provider missing -> flow weight disabled by item")
 
-        flow_map: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
+        flow_map: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]] = {}
         if self.flow_provider is not None and top50:
             max_workers = max(1, min(_env_int("FLOW_FETCH_MAX_CONCURRENCY", 3), 5))
             max_retries = max(1, _env_int("FLOW_FETCH_RETRIES", 3))
@@ -2463,7 +2509,7 @@ class WatchlistBuilder:
                 max_retries,
             )
 
-            def _fetch_for_code(code: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+            def _fetch_for_code(code: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]:
                 last_exc: Exception | None = None
                 for attempt in range(1, max_retries + 1):
                     try:
@@ -2480,7 +2526,7 @@ class WatchlistBuilder:
                         if attempt < max_retries:
                             time.sleep(backoff_base * (2 ** (attempt - 1)))
                 logger.warning("[FLOW][FETCH][FAIL] code=%s err=%s", code, last_exc)
-                return None, None
+                return None, None, {"ok": False, "provider": "none", "reason": "fetch_failed", "detail": str(last_exc or "")[:120]}
 
             code_list = [str(c.get("code") or "").zfill(6) for c in top50 if c.get("code")]
             done = 0
@@ -2492,7 +2538,7 @@ class WatchlistBuilder:
                     try:
                         flow_map[code] = fut.result()
                     except Exception:
-                        flow_map[code] = (None, None)
+                        flow_map[code] = (None, None, {"ok": False, "provider": "none", "reason": "future_exception", "detail": ""})
                     done += 1
                     if done == 1 or done % max(1, len(code_list) // 5) == 0 or done == len(code_list):
                         logger.info(
@@ -2529,7 +2575,7 @@ class WatchlistBuilder:
             foreign_df: Optional[pd.DataFrame] = None
             inst_df: Optional[pd.DataFrame] = None
             if self.flow_provider is not None:
-                foreign_df, inst_df = flow_map.get(code, (None, None))
+                foreign_df, inst_df, _ = flow_map.get(code, (None, None, {"ok": False, "provider": "none"}))
 
             flow_weight_effective = self.flow_weight
             tech_weight_effective = self.tech_weight
