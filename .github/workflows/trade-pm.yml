@@ -2,9 +2,17 @@ name: Trade PM
 
 "on":
   schedule:
-    # Mon-Fri 13:05 KST = 04:05 UTC
-    - cron: "5 4 * * 1-5"
-  workflow_dispatch: {}
+    # Mon-Fri 13:07 KST = 04:07 UTC
+    - cron: "7 4 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      STRATEGY_ENV:
+        description: Strategy environment
+        required: false
+        default: practice
+        type: choice
+        options:
+          - practice
 
 concurrency:
   group: pb1-practice-serial
@@ -49,6 +57,11 @@ jobs:
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
+      KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
       - name: Checkout
@@ -83,6 +96,28 @@ jobs:
         run: |
           set -euo pipefail
           python -m trader.db.migrate
+
+      - name: Verify KIS env contract
+        run: |
+          set -euo pipefail
+
+          echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
+          echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
+          echo "[ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
+          echo "[ENV_CHECK] KIS_REST_URL=${KIS_REST_URL:-}"
+
+          test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+          test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+          test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+          test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+
+          test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+          test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+          test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+
+          [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
+
+          echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Verify candidate pool exists in DB
         run: |

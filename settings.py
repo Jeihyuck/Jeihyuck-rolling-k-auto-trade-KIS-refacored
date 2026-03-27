@@ -3,6 +3,9 @@ import os
 import logging
 from pathlib import Path
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # === 프로젝트 경로 설정 (절대경로 기반) ===
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -20,20 +23,17 @@ def safe_strip(val):
 SLACK_WEBHOOK = safe_strip(os.getenv("SLACK_WEBHOOK", ""))
 
 # === API/계정/실전 환경 ===
-APP_KEY        = safe_strip(os.getenv("KIS_APP_KEY"))
-APP_SECRET     = safe_strip(os.getenv("KIS_APP_SECRET"))
-CANO           = safe_strip(os.getenv("CANO"))
-ACNT_PRDT_CD   = safe_strip(os.getenv("ACNT_PRDT_CD"))
-KIS_ENV        = safe_strip(os.getenv("KIS_ENV", "practice")).lower()
+APP_KEY      = safe_strip(os.getenv("KIS_APP_KEY"))
+APP_SECRET   = safe_strip(os.getenv("KIS_APP_SECRET"))
+CANO         = safe_strip(os.getenv("CANO"))
+ACNT_PRDT_CD = safe_strip(os.getenv("ACNT_PRDT_CD"))
+KIS_ENV      = safe_strip(os.getenv("KIS_ENV", "practice")).lower()
 
-# ✅ Normalize KIS_ENV: convert all synonyms to internal standard (practice/real)
 if KIS_ENV in {"paper", "practice", "vts", "mock", "demo"}:
     KIS_ENV = "practice"
 elif KIS_ENV in {"real", "prod", "live", "production"}:
     KIS_ENV = "real"
 else:
-    # Safety fallback for unknown values
-    logger.warning(f"[KIS_ENV] Unknown value '{KIS_ENV}', falling back to 'practice'")
     KIS_ENV = "practice"
 
 if KIS_ENV == "real":
@@ -89,11 +89,9 @@ HELD_MIN_WEIGHT       = float(os.getenv("HELD_MIN_WEIGHT", "0.01"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-logger.info(f"[환경변수 체크] APP_KEY={repr(APP_KEY)}")
-logger.info(f"[환경변수 체크] CANO={repr(CANO)}")
-logger.info(f"[환경변수 체크] ACNT_PRDT_CD={repr(ACNT_PRDT_CD)}")
+logger.info(f"[환경변수 체크] APP_KEY={'***' if APP_KEY else ''}")
+logger.info(f"[환경변수 체크] CANO={'***' if CANO else ''}")
+logger.info(f"[환경변수 체크] ACNT_PRDT_CD={'***' if ACNT_PRDT_CD else ''}")
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 logger.info(f"[환경변수 체크] 기타 옵션들 정상 적용됨")
