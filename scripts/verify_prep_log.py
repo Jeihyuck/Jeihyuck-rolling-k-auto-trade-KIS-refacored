@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,13 @@ class VerifyResults:
     final30_failure_detail: str = ""
     db_metrics: dict[str, Any] = field(default_factory=dict)
     file_metrics: dict[str, Any] = field(default_factory=dict)
+    canonical_manifest_found: bool = False
+    canonical_manifest_path: str = ""
+    canonical_status: str = ""
+    canonical_quality_ok: int = 0
+    canonical_trade_can_proceed: int = 0
+    canonical_flow_failed_ratio: float = 0.0
+    canonical_flow_fail_reason_counts: dict[str, int] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
 
     def has_critical_failure(self) -> bool:
@@ -79,6 +87,7 @@ class VerifyResults:
             or not self.exporter_preserved_scores
             or not self.derived_ok_by_count
             or (self.traceback_detected and not self.traceback_non_fatal)
+            or not self.canonical_manifest_found
             or bool(self.failures)
         )
 
@@ -281,6 +290,26 @@ def _resolve_repo_root(log_path: Path) -> Path:
     return cwd
 
 
+def _load_canonical_manifest(*, repo_root: Path, as_of: str) -> tuple[dict[str, Any], Path | None]:
+    prep_root = repo_root / "runtime" / "prep"
+    if not prep_root.exists():
+        return {}, None
+    candidates = []
+    if as_of:
+        candidate = prep_root / as_of / "prep_manifest.json"
+        if candidate.exists():
+            candidates.append(candidate)
+    candidates.extend(sorted(prep_root.glob("*/prep_manifest.json"), reverse=True))
+    if not candidates:
+        return {}, None
+    path = candidates[0]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, path
+    return payload, path
+
+
 def parse_log_file(log_path: Path) -> VerifyResults:
     """Parse PREP log file and extract verification data."""
     results = VerifyResults()
@@ -406,6 +435,35 @@ def parse_log_file(log_path: Path) -> VerifyResults:
         or results.final30_log_success
     )
     results.final30_failure_detail = _build_final30_failure_detail(results)
+    require_canonical = str(os.getenv("VERIFY_PREP_REQUIRE_CANONICAL", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    manifest, manifest_path = _load_canonical_manifest(repo_root=repo_root, as_of=results.detected_as_of)
+    if manifest and manifest_path is not None:
+        canonical = dict(manifest.get("canonical_quality") or {})
+        results.canonical_manifest_found = True
+        results.canonical_manifest_path = str(manifest_path)
+        results.canonical_status = str(canonical.get("status") or manifest.get("build_status") or "")
+        results.canonical_quality_ok = int(canonical.get("quality_ok", manifest.get("final30_quality_ok", 0)) or 0)
+        results.canonical_trade_can_proceed = int(canonical.get("trade_can_proceed", manifest.get("trade_can_proceed", 0)) or 0)
+        try:
+            results.canonical_flow_failed_ratio = float(manifest.get("flow_failed_ratio", 0.0) or 0.0)
+        except Exception:
+            results.canonical_flow_failed_ratio = 0.0
+        raw_reason_counts = dict(manifest.get("flow_fail_reason_counts") or {})
+        results.canonical_flow_fail_reason_counts = {
+            str(key): int(value)
+            for key, value in raw_reason_counts.items()
+            if str(key).strip()
+        }
+        if results.canonical_quality_ok == 0:
+            results.failures.append("quality_not_ok")
+        if results.canonical_status.upper() == "FAIL":
+            results.failures.append("status_fail")
+        if results.canonical_flow_failed_ratio >= 1.0:
+            results.failures.append("flow_failed_ratio_hard_fail")
+        if results.canonical_trade_can_proceed == 0:
+            results.failures.append("trade_cannot_proceed")
+    elif require_canonical:
+        results.failures.append("canonical_manifest_missing")
     return results
 
 
@@ -464,6 +522,19 @@ def print_verification_results(results: VerifyResults) -> None:
     else:
         print(results.final30_failure_detail)
 
+    if results.canonical_manifest_found:
+        print(
+            "PASS canonical manifest loaded "
+            f"path={results.canonical_manifest_path} "
+            f"quality_ok={results.canonical_quality_ok} "
+            f"status={results.canonical_status} "
+            f"trade_can_proceed={results.canonical_trade_can_proceed} "
+            f"flow_failed_ratio={results.canonical_flow_failed_ratio:.3f} "
+            f"flow_fail_reason_counts={results.canonical_flow_fail_reason_counts}"
+        )
+    else:
+        print("FAIL canonical manifest missing")
+
     if results.exporter_preserved_scores:
         print("PASS exporter preserved score fields")
     else:
@@ -489,6 +560,8 @@ def main() -> int:
     print_verification_results(results)
 
     if results.has_critical_failure():
+        for reason in dict.fromkeys(results.failures):
+            print(f"[VERIFY_PREP][FAIL] reason={reason}")
         print("Error: Critical failures detected - PREP verification failed")
         return 1
 

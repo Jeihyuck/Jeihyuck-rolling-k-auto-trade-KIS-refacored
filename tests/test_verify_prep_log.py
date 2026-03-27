@@ -344,3 +344,51 @@ event_type=PREP_DONE
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_verify_fails_when_canonical_quality_is_not_ok(tmp_path, monkeypatch):
+    as_of = "2026-03-26"
+    manifest_dir = tmp_path / "runtime" / "prep" / as_of
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / "prep_manifest.json").write_text(
+        """{
+  "as_of": "2026-03-26",
+  "build_status": "FAIL",
+  "final30_quality_ok": false,
+  "trade_can_proceed": 0,
+  "flow_failed_ratio": 1.0,
+  "flow_fail_reason_counts": {"kis:init_failed": 30},
+  "canonical_quality": {
+    "status": "FAIL",
+    "quality_ok": 0,
+    "trade_can_proceed": 0,
+    "hard_fail_reasons": ["flow_failed_ratio_hard_fail"],
+    "soft_fail_reasons": ["entry_style_monoculture"]
+  }
+}""",
+        encoding="utf-8",
+    )
+    log_path = tmp_path / "prep.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                f"[PREP][DONE] as_of={as_of} status=FAIL quality_ok=0 trade_can_proceed=0",
+                "[PREP][DERIVED_VERIFY][OK]",
+                f"[PREP][ASOF_CONSISTENCY] universe={as_of} ohlcv={as_of} derived={as_of} candidate_pool={as_of} watchlist={as_of} flow={as_of} final30={as_of} consistent=1",
+                "[PREP][EXPORT][FINAL30][INMEM] rows=30 tech_nonzero=30 final_nonzero=30 score_final_nonzero=30 breakout_nonzero=10 pullback_nonzero=8 momentum_nonzero=12",
+                "[EXPORT][SCORES] name=final30 tech_nonzero=30 score_final_nonzero=30 breakout_nonzero=10 pullback_nonzero=8 momentum_nonzero=12",
+                "[PREP][WATCHLIST_FINAL][SAVE] strategy=pb1_watchlist_final as_of=2026-03-26 n=30",
+                "event_type=PREP_DONE as_of=2026-03-26",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADER_REPO_ROOT", str(tmp_path))
+    monkeypatch.setenv("VERIFY_PREP_REQUIRE_CANONICAL", "1")
+
+    results = parse_log_file(log_path)
+
+    assert "quality_not_ok" in results.failures
+    assert "flow_failed_ratio_hard_fail" in results.failures
+    assert "trade_cannot_proceed" in results.failures
+    assert results.has_critical_failure() is True

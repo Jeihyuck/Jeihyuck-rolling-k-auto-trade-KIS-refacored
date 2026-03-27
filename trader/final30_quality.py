@@ -527,3 +527,58 @@ def validate_trade_ready(final30_df: pd.DataFrame) -> None:
 
 def summarize_final30_quality(df: pd.DataFrame, *, required_rows: int = 30) -> dict[str, Any]:
     return evaluate_final30_quality(df, required_rows=required_rows)
+
+
+def build_canonical_prep_verdict(
+    *,
+    quality: dict[str, Any] | None,
+    flow_failed_ratio: float,
+    flow_fail_reason_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    quality_payload = dict(quality or {})
+    hard_fail_reasons = list(quality_payload.get("hard_fail_reasons") or [])
+    soft_fail_reasons = list(quality_payload.get("soft_fail_reasons") or [])
+    flow_reason_counts = {
+        str(key): int(value)
+        for key, value in dict(flow_fail_reason_counts or {}).items()
+        if str(key).strip()
+    }
+
+    if 0 < flow_failed_ratio < 0.30:
+        if "flow_failed_ratio_soft_warn" not in soft_fail_reasons:
+            soft_fail_reasons.append("flow_failed_ratio_soft_warn")
+    elif 0.30 <= flow_failed_ratio < 0.70:
+        if "flow_failed_ratio_soft_fail" not in soft_fail_reasons:
+            soft_fail_reasons.append("flow_failed_ratio_soft_fail")
+    elif flow_failed_ratio >= 0.70:
+        if "flow_failed_ratio_hard_fail" not in hard_fail_reasons:
+            hard_fail_reasons.append("flow_failed_ratio_hard_fail")
+
+    if flow_failed_ratio >= 1.0:
+        if "flow_provider_total_failure" not in hard_fail_reasons:
+            hard_fail_reasons.append("flow_provider_total_failure")
+
+    quality_payload["hard_fail_reasons"] = list(dict.fromkeys(hard_fail_reasons))
+    quality_payload["soft_fail_reasons"] = list(dict.fromkeys(soft_fail_reasons))
+
+    quality_ok = int(len(quality_payload["hard_fail_reasons"]) == 0)
+    soft_fail = int(len(quality_payload["soft_fail_reasons"]) > 0)
+    status = "FAIL" if quality_ok == 0 else ("WARN" if soft_fail else "OK")
+    trade_can_proceed = 1 if quality_ok == 1 else 0
+
+    if flow_failed_ratio >= 1.0:
+        status = "FAIL"
+        quality_ok = 0
+        trade_can_proceed = 0
+
+    return {
+        "quality": quality_payload,
+        "quality_ok": quality_ok,
+        "soft_fail": soft_fail,
+        "status": status,
+        "trade_can_proceed": trade_can_proceed,
+        "flow_failed_ratio": float(flow_failed_ratio),
+        "flow_fail_reason_counts": flow_reason_counts,
+        "hard_fail_reasons": list(quality_payload["hard_fail_reasons"]),
+        "soft_fail_reasons": list(quality_payload["soft_fail_reasons"]),
+    }

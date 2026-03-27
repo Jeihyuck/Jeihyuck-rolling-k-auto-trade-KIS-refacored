@@ -121,6 +121,7 @@ jobs:
       - name: Verify PREP log contract
         run: |
           set -euo pipefail
+          export VERIFY_PREP_REQUIRE_CANONICAL=1
           python scripts/verify_prep_log.py artifacts/prep.log
 
       - name: Verify PREP quality contract
@@ -130,6 +131,73 @@ jobs:
           latest_manifest="$(ls -1t runtime/prep/*/prep_manifest.json | head -n 1)"
           echo "final30_scored_snapshot_hint=runtime/prep/*/final30_locked.json" | tee -a artifacts/prep-summary.txt
           echo "prep_manifest_path=${latest_manifest}" | tee -a artifacts/prep-summary.txt
+
+      - name: Verify PREP canonical verdict
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifests = sorted(Path("runtime/prep").glob("*/prep_manifest.json"))
+          if not manifests:
+              raise SystemExit("[PREP][VERIFY][FAIL] canonical prep manifest missing")
+          manifest_path = manifests[-1]
+          payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+          cq = payload.get("canonical_quality") or {}
+
+          quality_ok = int(cq.get("quality_ok", payload.get("final30_quality_ok", 0)) or 0)
+          status = str(cq.get("status", payload.get("build_status", "")) or "")
+          trade_can_proceed = int(cq.get("trade_can_proceed", payload.get("trade_can_proceed", 0)) or 0)
+          flow_failed_ratio = float(payload.get("flow_failed_ratio", 0.0) or 0.0)
+          flow_reason_counts = payload.get("flow_fail_reason_counts") or {}
+          has_final30_contract = int(payload.get("final30_count", 0) or 0) == 30
+
+          print(f"[PREP][VERIFY][CANONICAL] manifest={manifest_path}")
+          print(
+              f"[PREP][VERIFY][CANONICAL] final30_contract_ok={int(has_final30_contract)} "
+              f"quality_ok={quality_ok} status={status} flow_failed_ratio={flow_failed_ratio:.3f} "
+              f"trade_can_proceed={trade_can_proceed} flow_fail_reason_counts={flow_reason_counts}"
+          )
+
+          if not has_final30_contract:
+              raise SystemExit("[PREP][VERIFY][FAIL] final30_scored contract not met")
+          if quality_ok != 1:
+              raise SystemExit("[PREP][VERIFY][FAIL] quality_ok!=1")
+          if status.upper() == "FAIL":
+              raise SystemExit("[PREP][VERIFY][FAIL] status=FAIL")
+          if flow_failed_ratio >= 1.0:
+              raise SystemExit("[PREP][VERIFY][FAIL] flow_failed_ratio>=1.0")
+          if trade_can_proceed != 1:
+              raise SystemExit("[PREP][VERIFY][FAIL] trade_can_proceed!=1")
+          PY
+
+          latest_prep_dir="$(ls -1dt runtime/prep/* | head -n 1)"
+          cp "${latest_prep_dir}/prep_manifest.json" artifacts/prep-manifest.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("artifacts/prep-manifest.json").read_text(encoding="utf-8"))
+          quality_summary = {
+              "canonical_quality": manifest.get("canonical_quality"),
+              "final30_quality": manifest.get("final30_quality"),
+              "final30_quality_ok": manifest.get("final30_quality_ok"),
+          }
+          flow_summary = {
+              "flow_total_symbols": manifest.get("flow_total_symbols"),
+              "flow_success_symbols": manifest.get("flow_success_symbols"),
+              "flow_failed_symbols": manifest.get("flow_failed_symbols"),
+              "flow_failed_ratio": manifest.get("flow_failed_ratio"),
+              "flow_provider_usage_kis": manifest.get("flow_provider_usage_kis"),
+              "flow_provider_usage_pykrx": manifest.get("flow_provider_usage_pykrx"),
+              "flow_provider_usage_none": manifest.get("flow_provider_usage_none"),
+              "flow_fail_reason_counts": manifest.get("flow_fail_reason_counts"),
+              "kis_disabled_reason": manifest.get("kis_disabled_reason"),
+              "pykrx_disabled_reason": manifest.get("pykrx_disabled_reason"),
+          }
+          Path("artifacts/quality-summary.json").write_text(json.dumps(quality_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          Path("artifacts/flow-summary.json").write_text(json.dumps(flow_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
 
       - name: Scan for SQLite artifacts
         if: always()
@@ -148,5 +216,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: trade-prep-logs
-          path: repo/artifacts/
+          path: |
+            repo/artifacts/
+            repo/runtime/prep/*/prep_manifest.json
+            repo/runtime/prep/*/final30_locked.json
           if-no-files-found: ignore

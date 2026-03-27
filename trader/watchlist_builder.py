@@ -278,6 +278,8 @@ FLOW_PROVENANCE_FIELDS = (
     "flow_provider_used",
     "flow_fail_reason",
     "flow_score_imputed",
+    "foreign_flow_missing",
+    "inst_flow_missing",
 )
 MA20_ALIAS_FIELDS = ("ma20", "ma_20", "sma20", "close_ma20", "moving_avg20", "avg20", "ma20_price")
 MA20_NORMALIZE_PRIORITY = (
@@ -1240,11 +1242,14 @@ def _build_flow_provenance(
     flow_missing_reason: str,
 ) -> Dict[str, Any]:
     data_available = int((not flow_missing) and bool((flow_meta or {}).get("ok")))
+    provider_used = str((flow_meta or {}).get("provider") or "none").strip().lower()
+    if data_available != 1:
+        provider_used = "none"
     return {
         "flow_data_available": data_available,
-        "flow_provider_used": str((flow_meta or {}).get("provider") or "none"),
+        "flow_provider_used": provider_used,
         "flow_fail_reason": "" if data_available else str((flow_meta or {}).get("reason") or flow_missing_reason or "unknown"),
-        "flow_score_imputed": int(bool(flow_missing)),
+        "flow_score_imputed": 0 if data_available else 1,
         "foreign_flow_missing": int(foreign_df is None or getattr(foreign_df, "empty", True)),
         "inst_flow_missing": int(inst_df is None or getattr(inst_df, "empty", True)),
     }

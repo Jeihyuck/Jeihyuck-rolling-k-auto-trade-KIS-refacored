@@ -43,6 +43,7 @@ from trader.data.ohlcv_provider import (
 )
 from trader.exporter import export_watchlist_bundle
 from trader.final30_quality import (
+    build_canonical_prep_verdict,
     normalize_final30_contract_row,
     summarize_entry_style_distribution,
     summarize_final30_quality,
@@ -122,8 +123,8 @@ def _make_flow_provider(engine):
     providers = ["kis", "pykrx"]
     flow_cache: dict[tuple[str, str, int], tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]] = {}
     provider_state: dict[str, dict[str, Any]] = {
-        "kis": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False},
-        "pykrx": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False},
+        "kis": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False, "reason_counts": {}},
+        "pykrx": {"enabled": True, "disabled_reason": "", "fail_count": 0, "success_count": 0, "disable_logged": False, "reason_counts": {}},
     }
     kis_api = None
     kis_init_failed = False
@@ -140,6 +141,13 @@ def _make_flow_provider(engine):
         if not state.get("disable_logged"):
             logger.warning("[FLOW][PROVIDER_DISABLE] provider=%s reason=%s", name, state["disabled_reason"])
             state["disable_logged"] = True
+
+    def _record_provider_failure(name: str, reason: str) -> None:
+        state = provider_state.get(name) or {}
+        reasons = dict(state.get("reason_counts") or {})
+        reason_key = str(reason or "unknown")
+        reasons[reason_key] = int(reasons.get(reason_key, 0)) + 1
+        state["reason_counts"] = reasons
 
     def _resolve_code_from_df(df: pd.DataFrame, code: str) -> pd.DataFrame:
         if df is None or df.empty:
@@ -189,6 +197,7 @@ def _make_flow_provider(engine):
             from pykrx import stock
         except Exception as exc:
             state["fail_count"] += 1
+            _record_provider_failure("pykrx", "import_failed")
             _disable_provider("pykrx", "import_failed")
             detail = str(exc).replace("\n", " ")[:200]
             logger.warning("[FLOW][PYKRX][FAIL] code=%s ymd=%s reason=import_failed detail=%s", code, flow_as_of.strftime("%Y%m%d"), detail)
@@ -234,6 +243,7 @@ def _make_flow_provider(engine):
             fail_detail = str(exc).replace("\n", " ")[:200]
 
         state["fail_count"] += 1
+        _record_provider_failure("pykrx", fail_reason)
         logger.warning("[FLOW][PYKRX][FAIL] code=%s ymd=%s reason=%s detail=%s", code, ymd, fail_reason, fail_detail)
         if int(state.get("fail_count") or 0) >= 5:
             _disable_provider("pykrx", "repeated_parse_failures")
@@ -259,6 +269,7 @@ def _make_flow_provider(engine):
             except Exception as exc:
                 kis_init_failed = True
                 state["fail_count"] += 1
+                _record_provider_failure("kis", "init_failed")
                 _disable_provider("kis", "init_failed")
                 detail = str(exc).replace("\n", " ")[:200]
                 return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "init_failed", "detail": detail}
@@ -286,6 +297,7 @@ def _make_flow_provider(engine):
                     logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
                     _disable_provider("kis", reason)
                 state["fail_count"] += 1
+                _record_provider_failure("kis", reason)
                 return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": str(exc)[:200]}
 
             if resp.get("ok"):
@@ -299,6 +311,7 @@ def _make_flow_provider(engine):
                     foreign_net, inst_net = None, None
                 if foreign_net is None or inst_net is None:
                     state["fail_count"] += 1
+                    _record_provider_failure("kis", "numeric_parse_failed")
                     return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "numeric_parse_failed", "detail": "investor_fields_invalid"}
                 state["success_count"] += 1
                 return pd.DataFrame([{"date": flow_as_of, "net_buy": foreign_net}]), pd.DataFrame([{"date": flow_as_of, "net_buy": inst_net}]), {"ok": True, "provider": "kis", "reason": "", "detail": ""}
@@ -308,6 +321,7 @@ def _make_flow_provider(engine):
                 logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
                 _disable_provider("kis", reason)
                 state["fail_count"] += 1
+                _record_provider_failure("kis", reason)
                 return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
             if reason == "invalid_token" and not refreshed:
                 refreshed = True
@@ -325,6 +339,7 @@ def _make_flow_provider(engine):
             return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
 
         state["fail_count"] += 1
+        _record_provider_failure("kis", "unexpected_exception")
         return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "unexpected_exception", "detail": "retry_exhausted"}
 
     provider_map = {
@@ -380,6 +395,7 @@ def _make_flow_provider(engine):
         flow_cache[cache_key] = (_empty_df(), _empty_df(), fail_meta)
         return _empty_df(), _empty_df(), fail_meta
 
+    setattr(_provider, "provider_state", provider_state)
     return _provider
 
 def _pick_as_of_date_always_prev() -> date:
@@ -2310,8 +2326,22 @@ def main() -> int:
         flow_provider_usage_none = flow_total_symbols
     if flow_total_symbols > 0:
         flow_failed_ratio = flow_failed_symbols / float(flow_total_symbols)
+    flow_fail_reason_counts: dict[str, int] = {}
+    if isinstance(final_df, pd.DataFrame) and ("flow_fail_reason" in final_df.columns):
+        reason_series = final_df["flow_fail_reason"].fillna("").astype(str).str.strip()
+        for reason, count in reason_series.value_counts().to_dict().items():
+            if reason:
+                flow_fail_reason_counts[str(reason)] = int(count)
+    provider_state = dict(getattr(flow_provider, "provider_state", {}) or {})
+    for provider_name in ("kis", "pykrx"):
+        reason_counts = dict(((provider_state.get(provider_name) or {}).get("reason_counts")) or {})
+        for reason, count in reason_counts.items():
+            key = f"{provider_name}:{reason}"
+            flow_fail_reason_counts[key] = int(flow_fail_reason_counts.get(key, 0)) + int(count or 0)
+    kis_disabled_reason = str(((provider_state.get("kis") or {}).get("disabled_reason")) or "")
+    pykrx_disabled_reason = str(((provider_state.get("pykrx") or {}).get("disabled_reason")) or "")
     logger.info(
-        "[FLOW][SUMMARY] total=%s success=%s failed=%s failed_ratio=%.3f kis=%s pykrx=%s none=%s",
+        "[FLOW][SUMMARY] total=%s success=%s failed=%s failed_ratio=%.3f kis=%s pykrx=%s none=%s reasons=%s kis_disabled_reason=%s pykrx_disabled_reason=%s",
         flow_total_symbols,
         flow_success_symbols,
         flow_failed_symbols,
@@ -2319,6 +2349,9 @@ def main() -> int:
         flow_provider_usage_kis,
         flow_provider_usage_pykrx,
         flow_provider_usage_none,
+        flow_fail_reason_counts,
+        kis_disabled_reason or "-",
+        pykrx_disabled_reason or "-",
     )
 
     # Flow validation policy
@@ -2355,28 +2388,40 @@ def main() -> int:
             as_of,
         )
 
-    if strict_contract_failures and not core_done:
+    prep_status = str(final30_gate_decision["status"])
+    if strict_contract_failures:
         prep_status = "FAIL"
+        final30_quality.setdefault("hard_fail_reasons", [])
+        if "final30_contract_fail" not in final30_quality["hard_fail_reasons"]:
+            final30_quality["hard_fail_reasons"].append("final30_contract_fail")
+        final30_quality_ok = False
+        final30_trade_can_proceed = False
+        final30_gate_decision["status"] = "FAIL"
+        final30_gate_decision["quality_ok"] = 0
+        final30_gate_decision["trade_can_proceed"] = 0
         logger.error(
             "[PREP][FINAL30_SCORED][CONTRACT_FAIL] as_of=%s failures=%s",
             as_of.isoformat(),
             strict_contract_failures,
         )
-    elif str(final30_gate_decision["status"]) == "WARN":
-        prep_status = "WARN"
+    canonical_verdict = build_canonical_prep_verdict(
+        quality=final30_quality,
+        flow_failed_ratio=flow_failed_ratio,
+        flow_fail_reason_counts=flow_fail_reason_counts,
+    )
+    final30_quality = dict(canonical_verdict["quality"])
+    final30_gate_decision = {
+        "status": canonical_verdict["status"],
+        "quality_ok": canonical_verdict["quality_ok"],
+        "soft_fail": canonical_verdict["soft_fail"],
+        "trade_can_proceed": canonical_verdict["trade_can_proceed"],
+    }
+    final30_quality_ok = bool(canonical_verdict["quality_ok"])
+    final30_quality_soft_fail = bool(canonical_verdict["soft_fail"])
+    final30_trade_can_proceed = bool(canonical_verdict["trade_can_proceed"])
     if flow_failed_ratio >= 0.30:
-        reason = "flow_failed_ratio_soft_fail" if flow_failed_ratio < 0.70 else "flow_failed_ratio_hard_fail"
-        logger.warning("[FINAL30][QUALITY_FAIL_FLOW] failed_ratio=%.3f reason=%s", flow_failed_ratio, reason)
-        final30_quality.setdefault("soft_fail_reasons", [])
-        if reason not in final30_quality["soft_fail_reasons"]:
-            final30_quality["soft_fail_reasons"].append(reason)
-    if flow_failed_ratio >= 0.70:
-        final30_quality_ok = False
-        prep_status = "FAIL" if flow_failed_ratio >= 1.0 else "DEGRADED"
-    if flow_failed_ratio == 1.0:
-        final30_quality.setdefault("hard_fail_reasons", [])
-        if "flow_provider_total_failure" not in final30_quality["hard_fail_reasons"]:
-            final30_quality["hard_fail_reasons"].append("flow_provider_total_failure")
+        flow_fail_reason = "flow_failed_ratio_soft_fail" if flow_failed_ratio < 0.70 else "flow_failed_ratio_hard_fail"
+        logger.warning("[FINAL30][QUALITY_FAIL_FLOW] failed_ratio=%.3f reason=%s", flow_failed_ratio, flow_fail_reason)
 
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
@@ -2398,8 +2443,23 @@ def main() -> int:
                 as_of,
                 "core_only" if degraded_exclude_flow else "core_plus_flow",
             )
-            
-            prep_status = "WARN" if core_done else ("DEGRADED" if allow_degraded_prep else "FAIL")
+            final30_quality.setdefault("soft_fail_reasons", [])
+            if "metrics_mostly_zero" not in final30_quality["soft_fail_reasons"]:
+                final30_quality["soft_fail_reasons"].append("metrics_mostly_zero")
+            canonical_verdict = build_canonical_prep_verdict(
+                quality=final30_quality,
+                flow_failed_ratio=flow_failed_ratio,
+                flow_fail_reason_counts=flow_fail_reason_counts,
+            )
+            final30_quality = dict(canonical_verdict["quality"])
+            final30_gate_decision["status"] = canonical_verdict["status"]
+            final30_gate_decision["quality_ok"] = canonical_verdict["quality_ok"]
+            final30_gate_decision["soft_fail"] = canonical_verdict["soft_fail"]
+            final30_gate_decision["trade_can_proceed"] = canonical_verdict["trade_can_proceed"]
+            final30_quality_ok = bool(canonical_verdict["quality_ok"])
+            final30_quality_soft_fail = bool(canonical_verdict["soft_fail"])
+            final30_trade_can_proceed = bool(canonical_verdict["trade_can_proceed"])
+            prep_status = str(canonical_verdict["status"])
 
     report_failmode_soft = _env_true("REPORT_FAILMODE_SOFT", "1")
     try:
@@ -2442,6 +2502,9 @@ def main() -> int:
             "flow_provider_usage_kis": flow_provider_usage_kis,
             "flow_provider_usage_pykrx": flow_provider_usage_pykrx,
             "flow_provider_usage_none": flow_provider_usage_none,
+            "flow_fail_reason_counts": flow_fail_reason_counts,
+            "kis_disabled_reason": kis_disabled_reason,
+            "pykrx_disabled_reason": pykrx_disabled_reason,
             "contract_failures": strict_contract_failures,
             "contract_mode": contract_mode,
             "final30_file_contract_ok": final30_file_contract_ok,
@@ -2451,7 +2514,15 @@ def main() -> int:
             "final30_quality": final30_quality,
             "final30_quality_ok": final30_quality_ok,
             "final30_quality_soft_fail": final30_quality_soft_fail,
-            "trade_can_proceed": int(final30_trade_can_proceed),
+            "trade_can_proceed": int(final30_gate_decision["trade_can_proceed"]),
+            "canonical_quality": {
+                "status": final30_gate_decision["status"],
+                "quality_ok": int(final30_gate_decision["quality_ok"]),
+                "soft_fail": int(final30_gate_decision["soft_fail"]),
+                "trade_can_proceed": int(final30_gate_decision["trade_can_proceed"]),
+                "hard_fail_reasons": list(final30_quality.get("hard_fail_reasons") or []),
+                "soft_fail_reasons": list(final30_quality.get("soft_fail_reasons") or []),
+            },
             "durations_sec": {
                 "ohlcv_delta": round(dt_ohlcv, 2),
                 "derived": round(dt_derived, 2),
@@ -2473,6 +2544,17 @@ def main() -> int:
     prep_manifest["flow_provider_usage_kis"] = flow_provider_usage_kis
     prep_manifest["flow_provider_usage_pykrx"] = flow_provider_usage_pykrx
     prep_manifest["flow_provider_usage_none"] = flow_provider_usage_none
+    prep_manifest["flow_fail_reason_counts"] = flow_fail_reason_counts
+    prep_manifest["kis_disabled_reason"] = kis_disabled_reason
+    prep_manifest["pykrx_disabled_reason"] = pykrx_disabled_reason
+    prep_manifest["canonical_quality"] = {
+        "status": final30_gate_decision["status"],
+        "quality_ok": int(final30_gate_decision["quality_ok"]),
+        "soft_fail": int(final30_gate_decision["soft_fail"]),
+        "trade_can_proceed": int(final30_gate_decision["trade_can_proceed"]),
+        "hard_fail_reasons": list(final30_quality.get("hard_fail_reasons") or []),
+        "soft_fail_reasons": list(final30_quality.get("soft_fail_reasons") or []),
+    }
     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     if prep_status != "FAIL":
         mirror_sync = sync_prep_final30_file_mirror(
@@ -2486,6 +2568,15 @@ def main() -> int:
         final30_file_contract_ok = bool(final30_files_validation.get("ok"))
         if not final30_file_contract_ok:
             strict_contract_failures = list(dict.fromkeys(list(strict_contract_failures) + list(final30_file_failures)))
+            final30_quality.setdefault("hard_fail_reasons", [])
+            if "final30_file_contract_fail" not in final30_quality["hard_fail_reasons"]:
+                final30_quality["hard_fail_reasons"].append("final30_file_contract_fail")
+            final30_gate_decision["status"] = "FAIL"
+            final30_gate_decision["quality_ok"] = 0
+            final30_gate_decision["trade_can_proceed"] = 0
+            final30_quality_ok = False
+            final30_trade_can_proceed = False
+            prep_status = "FAIL"
             if core_done:
                 logger.warning("[PREP][AUX][WARN] final30 mirror resync failed after DONE_CORE failures=%s", final30_file_failures)
             else:
