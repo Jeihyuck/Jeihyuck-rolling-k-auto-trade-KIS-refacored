@@ -120,6 +120,7 @@ def is_trading_day(now: datetime) -> bool:
 
 REQUIRED_SCORED_FINAL30_COLS = [
     "code",
+    "name",
     "score_final",
     "tech_score",
     "breakout_score",
@@ -131,8 +132,17 @@ REQUIRED_SCORED_FINAL30_COLS = [
     "ma20",
     "ma50",
     "ma150",
-    "close",
     "atr_pct",
+]
+OPTIONAL_SCORING_ALTERNATIVE_COLS = [("close", "last_close")]
+FLOW_OPTIONAL_COLS = [
+    "investor_flow",
+    "foreign_net_buy",
+    "institutional_net_buy",
+    "program_trade",
+    "flow_score",
+    "flow_rank",
+    "flow_reason",
 ]
 
 _FINAL30_LOAD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
@@ -140,7 +150,11 @@ _FINAL30_LOAD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 def _missing_scored_cols(columns: list[str]) -> list[str]:
     cols = {str(c) for c in (columns or [])}
-    return [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in cols]
+    missing = [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in cols]
+    for primary, alternative in OPTIONAL_SCORING_ALTERNATIVE_COLS:
+        if primary in missing and alternative in cols:
+            missing.remove(primary)
+    return missing
 
 
 def _load_json_rows(path: Path) -> list[dict[str, Any]]:
@@ -447,7 +461,8 @@ def load_trade_final30_scored(
     )
     rows = list(scored_contract.get("rows_data") or [])
     contract_columns = [str(col) for col in (scored_contract.get("columns") or sorted({key for row in rows for key in (row or {}).keys()}))]
-    missing_critical_fields = [col for col in REQUIRED_SCORED_FINAL30_COLS if col not in contract_columns]
+    missing_critical_fields = _missing_scored_cols(contract_columns)
+    flow_optional_missing = [col for col in FLOW_OPTIONAL_COLS if col not in contract_columns]
     repairable_contract = _is_trade_repairable_db_contract(scored_contract, missing_critical_fields=missing_critical_fields)
     contract_ok = bool(
         (
@@ -476,6 +491,16 @@ def load_trade_final30_scored(
         scored_contract.get("null_critical"),
         scored_contract.get("missing_fields"),
         missing_critical_fields,
+    )
+    logger.info(
+        "[FINAL30][SOURCE_CHECK] db_rows=%s file_runtime_exists=%s file_ledger_exists=%s file_signals_exists=%s usable=%s required_scored_cols_missing=%s flow_optional_missing=%s",
+        int(scored_contract.get("rows") or 0),
+        file_mirror_stats.get("runtime", 0),
+        file_mirror_stats.get("ledger", 0),
+        file_mirror_stats.get("signals", 0),
+        int(contract_ok),
+        missing_critical_fields,
+        flow_optional_missing,
     )
     logger.info(
         "[TRADE][FINAL30][STRICT_VALIDATE][DB] ok=%s rows=%s invalid_rows=%s errors=%s warnings=%s",
@@ -4282,11 +4307,12 @@ def main() -> int:
                 derived_as_of.isoformat(),
                 len(final30_df),
             )
+            os.environ["PB1_SKIP_NEW_ENTRIES"] = "0"
         else:
             logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=missing_or_empty")
-            logger.error("[TRADE][READY][FAIL] reason=final30_missing_or_empty")
-            logger.error("[TRADE][FINAL30][LOAD_FAIL] no usable scored final30 found")
-            return 0
+            logger.error("[ENTRY][BLOCK] missing scored final30 contract")
+            logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
+            os.environ["PB1_SKIP_NEW_ENTRIES"] = "1"
         
         watchlist_repo = WatchlistRepo(engine)
         watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
@@ -4304,12 +4330,17 @@ def main() -> int:
         )
 
         if not watchlist_rows or used_as_of is None:
-            raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
+            if os.getenv("PB1_SKIP_NEW_ENTRIES", "0") == "1":
+                logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
+                watchlist_rows = []
+                used_as_of = derived_as_of
+            else:
+                raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
 
         age_days = (derived_as_of - used_as_of).days
         if age_days > ttl_days:
             raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
-        if len(watchlist_rows) != 30:
+        if watchlist_rows and len(watchlist_rows) != 30:
             raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(watchlist_rows)}")
 
         top10_codes = [str(item.get("code") or "").zfill(6) for item in watchlist_rows[:10] if item.get("code")]

@@ -544,19 +544,21 @@ def build_canonical_prep_verdict(
         if str(key).strip()
     }
 
-    if 0 < flow_failed_ratio < 0.30:
-        if "flow_failed_ratio_soft_warn" not in soft_fail_reasons:
-            soft_fail_reasons.append("flow_failed_ratio_soft_warn")
-    elif 0.30 <= flow_failed_ratio < 0.70:
-        if "flow_failed_ratio_soft_fail" not in soft_fail_reasons:
-            soft_fail_reasons.append("flow_failed_ratio_soft_fail")
-    elif flow_failed_ratio >= 0.70:
-        if "flow_failed_ratio_hard_fail" not in hard_fail_reasons:
-            hard_fail_reasons.append("flow_failed_ratio_hard_fail")
+    if flow_failed_ratio > 0.0:
+        if "flow_optional_degraded" not in soft_fail_reasons:
+            soft_fail_reasons.append("flow_optional_degraded")
+        if flow_failed_ratio < 0.30:
+            if "flow_failed_ratio_soft_warn" not in soft_fail_reasons:
+                soft_fail_reasons.append("flow_failed_ratio_soft_warn")
+        elif flow_failed_ratio < 0.70:
+            if "flow_failed_ratio_soft_fail" not in soft_fail_reasons:
+                soft_fail_reasons.append("flow_failed_ratio_soft_fail")
+        else:
+            if "flow_failed_ratio_soft_high" not in soft_fail_reasons:
+                soft_fail_reasons.append("flow_failed_ratio_soft_high")
 
-    if flow_failed_ratio >= 1.0:
-        if "flow_provider_total_failure" not in hard_fail_reasons:
-            hard_fail_reasons.append("flow_provider_total_failure")
+    if flow_failed_ratio >= 1.0 and "flow_provider_total_failure" not in soft_fail_reasons:
+        soft_fail_reasons.append("flow_provider_total_failure")
 
     quality_payload["hard_fail_reasons"] = list(dict.fromkeys(hard_fail_reasons))
     quality_payload["soft_fail_reasons"] = list(dict.fromkeys(soft_fail_reasons))
@@ -565,11 +567,6 @@ def build_canonical_prep_verdict(
     soft_fail = int(len(quality_payload["soft_fail_reasons"]) > 0)
     status = "FAIL" if quality_ok == 0 else ("WARN" if soft_fail else "OK")
     trade_can_proceed = 1 if quality_ok == 1 else 0
-
-    if flow_failed_ratio >= 1.0:
-        status = "FAIL"
-        quality_ok = 0
-        trade_can_proceed = 0
 
     return {
         "quality": quality_payload,

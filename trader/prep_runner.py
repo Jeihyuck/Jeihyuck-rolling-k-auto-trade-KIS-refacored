@@ -1814,6 +1814,39 @@ def main() -> int:
         bundle_final30_scored_before_save_df=bundle_final30_scored_before_save_df,
         final30_saved_df=final30_saved_df,
     )
+    if isinstance(final30_scored_df_for_export, pd.DataFrame) and not final30_scored_df_for_export.empty:
+        _flow_total = int(len(final30_scored_df_for_export))
+        _flow_success = int(
+            pd.to_numeric(final30_scored_df_for_export.get("flow_data_available", 0), errors="coerce")
+            .fillna(0)
+            .astype(int)
+            .sum()
+        ) if "flow_data_available" in final30_scored_df_for_export.columns else 0
+        _flow_failed = max(_flow_total - _flow_success, 0)
+        _flow_ratio = (_flow_failed / float(_flow_total)) if _flow_total > 0 else 0.0
+        _flow_usage = (
+            final30_scored_df_for_export["flow_provider_used"].fillna("none").astype(str).str.lower().value_counts().to_dict()
+            if "flow_provider_used" in final30_scored_df_for_export.columns else {}
+        )
+        _flow_reasons = (
+            final30_scored_df_for_export["flow_fail_reason"].fillna("").astype(str).str.strip().value_counts().to_dict()
+            if "flow_fail_reason" in final30_scored_df_for_export.columns else {}
+        )
+        _flow_status = "ok"
+        if _flow_success <= 0:
+            _flow_status = "missing"
+        elif _flow_failed > 0:
+            _flow_status = "partial"
+        if int(_flow_usage.get("none", 0)) > 0 and (int(_flow_usage.get("kis", 0)) == 0 or int(_flow_usage.get("pykrx", 0)) == 0):
+            _flow_status = "degraded"
+        final30_scored_df_for_export["flow_status"] = _flow_status
+        final30_scored_df_for_export["flow_failed_ratio"] = _flow_ratio
+        final30_scored_df_for_export["flow_success_symbols"] = _flow_success
+        final30_scored_df_for_export["flow_failed_symbols"] = _flow_failed
+        final30_scored_df_for_export["flow_provider_usage_kis"] = int(_flow_usage.get("kis", 0))
+        final30_scored_df_for_export["flow_provider_usage_pykrx"] = int(_flow_usage.get("pykrx", 0))
+        final30_scored_df_for_export["flow_provider_usage_none"] = int(_flow_usage.get("none", 0))
+        final30_scored_df_for_export["flow_failure_reasons"] = json.dumps({k: int(v) for k, v in _flow_reasons.items() if k}, ensure_ascii=False)
 
     logger.info("[PREP][DONE_CORE][START] as_of=%s", as_of.isoformat())
     core_save_result = save_final30_scored_core(
@@ -2340,6 +2373,7 @@ def main() -> int:
             flow_fail_reason_counts[key] = int(flow_fail_reason_counts.get(key, 0)) + int(count or 0)
     kis_disabled_reason = str(((provider_state.get("kis") or {}).get("disabled_reason")) or "")
     pykrx_disabled_reason = str(((provider_state.get("pykrx") or {}).get("disabled_reason")) or "")
+    logger.info("[FLOW][OPTIONAL_MODE] enabled=1 blocking=0")
     logger.info(
         "[FLOW][SUMMARY] total=%s success=%s failed=%s failed_ratio=%.3f kis=%s pykrx=%s none=%s reasons=%s kis_disabled_reason=%s pykrx_disabled_reason=%s",
         flow_total_symbols,
@@ -2419,9 +2453,13 @@ def main() -> int:
     final30_quality_ok = bool(canonical_verdict["quality_ok"])
     final30_quality_soft_fail = bool(canonical_verdict["soft_fail"])
     final30_trade_can_proceed = bool(canonical_verdict["trade_can_proceed"])
-    if flow_failed_ratio >= 0.30:
-        flow_fail_reason = "flow_failed_ratio_soft_fail" if flow_failed_ratio < 0.70 else "flow_failed_ratio_hard_fail"
-        logger.warning("[FINAL30][QUALITY_FAIL_FLOW] failed_ratio=%.3f reason=%s", flow_failed_ratio, flow_fail_reason)
+    flow_provider_total_failure = int(flow_failed_ratio >= 1.0)
+    logger.info(
+        "[PREP][FLOW_OPTIONAL] failed_ratio=%.3f provider_total_failure=%s blocking=0 trade_can_proceed_unchanged=%s",
+        flow_failed_ratio,
+        flow_provider_total_failure,
+        int(final30_gate_decision["trade_can_proceed"]),
+    )
 
     # Prepare metric columns for export
     core_metric_cols = ["rs_pctile", "vcp_score", "atr_pct", "trend_score", "pullback_pct"]
@@ -2460,6 +2498,25 @@ def main() -> int:
             final30_quality_soft_fail = bool(canonical_verdict["soft_fail"])
             final30_trade_can_proceed = bool(canonical_verdict["trade_can_proceed"])
             prep_status = str(canonical_verdict["status"])
+    flow_status = "ok"
+    if flow_total_symbols <= 0:
+        flow_status = "missing"
+    elif flow_success_symbols <= 0:
+        flow_status = "missing"
+    elif flow_provider_usage_none > 0 and (flow_provider_usage_kis == 0 or flow_provider_usage_pykrx == 0):
+        flow_status = "degraded"
+    elif flow_failed_symbols > 0:
+        flow_status = "partial"
+
+    logger.info(
+        "[PREP][FINAL_QUALITY] status=%s hard_fail_count=%s soft_fail_count=%s hard_fail_reasons=%s soft_fail_reasons=%s flow_optional=1 trade_can_proceed=%s",
+        final30_gate_decision["status"],
+        len(list(final30_quality.get("hard_fail_reasons") or [])),
+        len(list(final30_quality.get("soft_fail_reasons") or [])),
+        list(final30_quality.get("hard_fail_reasons") or []),
+        list(final30_quality.get("soft_fail_reasons") or []),
+        int(final30_gate_decision["trade_can_proceed"]),
+    )
 
     report_failmode_soft = _env_true("REPORT_FAILMODE_SOFT", "1")
     try:
@@ -2503,6 +2560,10 @@ def main() -> int:
             "flow_provider_usage_pykrx": flow_provider_usage_pykrx,
             "flow_provider_usage_none": flow_provider_usage_none,
             "flow_fail_reason_counts": flow_fail_reason_counts,
+            "flow_failure_reasons": flow_fail_reason_counts,
+            "flow_status": flow_status,
+            "flow_optional": True,
+            "flow_blocking_enabled": False,
             "kis_disabled_reason": kis_disabled_reason,
             "pykrx_disabled_reason": pykrx_disabled_reason,
             "contract_failures": strict_contract_failures,
@@ -2522,6 +2583,7 @@ def main() -> int:
                 "trade_can_proceed": int(final30_gate_decision["trade_can_proceed"]),
                 "hard_fail_reasons": list(final30_quality.get("hard_fail_reasons") or []),
                 "soft_fail_reasons": list(final30_quality.get("soft_fail_reasons") or []),
+                "flow_optional": True,
             },
             "durations_sec": {
                 "ohlcv_delta": round(dt_ohlcv, 2),
@@ -2545,6 +2607,10 @@ def main() -> int:
     prep_manifest["flow_provider_usage_pykrx"] = flow_provider_usage_pykrx
     prep_manifest["flow_provider_usage_none"] = flow_provider_usage_none
     prep_manifest["flow_fail_reason_counts"] = flow_fail_reason_counts
+    prep_manifest["flow_failure_reasons"] = flow_fail_reason_counts
+    prep_manifest["flow_status"] = flow_status
+    prep_manifest["flow_optional"] = True
+    prep_manifest["flow_blocking_enabled"] = False
     prep_manifest["kis_disabled_reason"] = kis_disabled_reason
     prep_manifest["pykrx_disabled_reason"] = pykrx_disabled_reason
     prep_manifest["canonical_quality"] = {
@@ -2554,6 +2620,7 @@ def main() -> int:
         "trade_can_proceed": int(final30_gate_decision["trade_can_proceed"]),
         "hard_fail_reasons": list(final30_quality.get("hard_fail_reasons") or []),
         "soft_fail_reasons": list(final30_quality.get("soft_fail_reasons") or []),
+        "flow_optional": True,
     }
     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
     if prep_status != "FAIL":

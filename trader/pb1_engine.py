@@ -189,6 +189,7 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_SCORED_FINAL30_COLS = [
     "code",
+    "name",
     "score_final",
     "tech_score",
     "breakout_score",
@@ -200,8 +201,17 @@ REQUIRED_SCORED_FINAL30_COLS = [
     "ma20",
     "ma50",
     "ma150",
-    "close",
     "atr_pct",
+]
+ALTERNATIVE_REQUIRED_SCORED_COLS = [("close", "last_close")]
+FLOW_OPTIONAL_COLS = [
+    "investor_flow",
+    "foreign_net_buy",
+    "institutional_net_buy",
+    "program_trade",
+    "flow_score",
+    "flow_rank",
+    "flow_reason",
 ]
 
 # Minervini feature calc requires MA200 slope + VCP; force long window.
@@ -7714,7 +7724,11 @@ class PB1Engine:
     @staticmethod
     def _scored_missing_cols(columns: list[str]) -> list[str]:
         colset = {str(c) for c in (columns or [])}
-        return [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in colset]
+        missing = [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in colset]
+        for primary, alternative in ALTERNATIVE_REQUIRED_SCORED_COLS:
+            if primary in missing and alternative in colset:
+                missing.remove(primary)
+        return missing
 
     def _write_final30_input_reject_debug(
         self,
@@ -7748,6 +7762,9 @@ class PB1Engine:
         """
         require_scored = (os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1")
         allow_missing_scored = (os.getenv("ALLOW_TRADE_WITH_MISSING_SCORED_COLUMNS", "0") == "1")
+        if os.getenv("PB1_SKIP_NEW_ENTRIES", "0") == "1":
+            logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
+            return []
 
         if self.final30_locked:
             locked_df = self.final30_df if self.final30_df is not None else pd.DataFrame()
@@ -7793,8 +7810,17 @@ class PB1Engine:
             source = str((self._universe_context.meta or {}).get("source") or "universe_context")
             cols = sorted({str(k) for r in rows for k in r.keys()})
             missing_cols = self._scored_missing_cols(cols)
+            flow_optional_missing = [c for c in FLOW_OPTIONAL_COLS if c not in set(cols)]
             usable = (not missing_cols) or (not require_scored) or allow_missing_scored
-            logger.info("[FINAL30][INPUT_CHECK] source=%s usable=%s missing=%s", source, int(usable), missing_cols)
+            logger.info(
+                "[FINAL30][INPUT_CHECK] source=%s usable=%s required_scored_cols_missing=%s flow_optional_missing=%s",
+                source,
+                int(usable),
+                missing_cols,
+                flow_optional_missing,
+            )
+            if flow_optional_missing:
+                logger.warning("[ENTRY][FLOW_OPTIONAL_MISSING] missing=%s", flow_optional_missing)
             if not usable:
                 logger.error(
                     "[PB1][ENTRY][INPUT_REJECT] source=%s missing_scored_cols=%s require_scored=1",
@@ -8500,6 +8526,7 @@ class PB1Engine:
         # Philosophy: if candidate pool exists, it IS the universe for DIAG candidate scan.
         pb1_candidate_only = os.getenv("PB1_CANDIDATE_ONLY", "0") == "1"
         watchlist_enabled = os.getenv("PB1_WATCHLIST_ENABLED", "1") == "1"
+        skip_new_entries = os.getenv("PB1_SKIP_NEW_ENTRIES", "0") == "1"
         
         # 유니버스 로드 (호환성 유지, 하지만 스캔에는 안 씀)
         universe_members = self._load_universe()
@@ -8509,7 +8536,12 @@ class PB1Engine:
         scan_source = "universe"
         watchlist_count = 0
         
-        if watchlist_enabled and self.phase in {"prep", "entry"}:
+        if skip_new_entries:
+            logger.error("[ENTRY][BLOCK] missing scored final30 contract")
+            logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
+            scan_codes = []
+            scan_source = "blocked_missing_scored_final30"
+        elif watchlist_enabled and self.phase in {"prep", "entry"}:
             logger.info("[PB1][WATCHLIST] enabled -> load today watchlist")
             # Watchlist로 members 대체
             watchlist_members, watchlist_source = self._load_today_watchlist_members()

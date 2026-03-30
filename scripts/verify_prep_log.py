@@ -458,8 +458,6 @@ def parse_log_file(log_path: Path) -> VerifyResults:
             results.failures.append("quality_not_ok")
         if results.canonical_status.upper() == "FAIL":
             results.failures.append("status_fail")
-        if results.canonical_flow_failed_ratio >= 1.0:
-            results.failures.append("flow_failed_ratio_hard_fail")
         if results.canonical_trade_can_proceed == 0:
             results.failures.append("trade_cannot_proceed")
     elif require_canonical:

@@ -389,6 +389,5 @@ def test_verify_fails_when_canonical_quality_is_not_ok(tmp_path, monkeypatch):
     results = parse_log_file(log_path)
 
     assert "quality_not_ok" in results.failures
-    assert "flow_failed_ratio_hard_fail" in results.failures
     assert "trade_cannot_proceed" in results.failures
     assert results.has_critical_failure() is True

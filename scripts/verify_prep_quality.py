@@ -40,8 +40,6 @@ def main() -> int:
     if soft_reasons:
         print(f"[PREP][VERIFY][SOFT_FAIL] reasons={soft_reasons}")
 
-    if float(flow_failed_ratio) >= 1.0:
-        raise SystemExit("[PREP][VERIFY][FAIL] flow_failed_ratio==1.0")
     if not quality_ok:
         raise SystemExit("[PREP][VERIFY][FAIL] final30_quality_ok=0")
 
