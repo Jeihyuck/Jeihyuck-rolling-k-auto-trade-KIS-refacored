@@ -23,6 +23,15 @@ class _DummyKis:
         self.refreshed += 1
 
 
+class _SuccessfulKis:
+    def __init__(self, *args, **kwargs):
+        self.calls = 0
+
+    def inquire_investor(self, code: str, market: str = "KOSDAQ"):
+        self.calls += 1
+        return {"ok": True, "inv": {"frgn_ntby_qty": "0", "orgn_ntby_qty": "0"}}
+
+
 class _FailingStock:
     @staticmethod
     def get_market_net_purchases_of_equities_by_ticker(*args, **kwargs):
@@ -44,7 +53,7 @@ def test_pykrx_jsondecodeerror_isolated(monkeypatch):
     assert meta["provider"] == "none"
 
 
-def test_kis_breaker_open_run_level_disable(monkeypatch):
+def test_kis_breaker_open_does_not_disable_provider(monkeypatch):
     fake_kis_mod = types.SimpleNamespace(KisAPI=_DummyKis)
     monkeypatch.setitem(__import__("sys").modules, "trader.kis_wrapper", fake_kis_mod)
 
@@ -58,10 +67,34 @@ def test_kis_breaker_open_run_level_disable(monkeypatch):
     provider = _make_flow_provider(engine=None)
     _, _, meta1 = provider("005930", date(2026, 3, 27), 20)
     _, _, meta2 = provider("000660", date(2026, 3, 27), 20)
+    state = getattr(provider, "provider_state", {})
 
     assert meta1["ok"] is False
     assert "kis:breaker_open" in meta1["reason"]
-    assert "kis:disabled:breaker_open" in meta2["reason"]
+    assert "kis:breaker_open" in meta2["reason"]
+    assert state["kis"]["enabled"] is True
+
+
+def test_provider_prefers_kis_and_skips_pykrx_on_success(monkeypatch):
+    fake_kis_mod = types.SimpleNamespace(KisAPI=_SuccessfulKis)
+    monkeypatch.setitem(__import__("sys").modules, "trader.kis_wrapper", fake_kis_mod)
+
+    class _ExplodingStock:
+        @staticmethod
+        def get_market_net_purchases_of_equities_by_ticker(*args, **kwargs):
+            raise AssertionError("pykrx should not be called when KIS succeeds")
+
+    monkeypatch.setitem(__import__("sys").modules, "pykrx", types.SimpleNamespace(stock=_ExplodingStock))
+
+    provider = _make_flow_provider(engine=None)
+    foreign, inst, meta = provider("005930", date(2026, 3, 27), 20)
+
+    assert not foreign.empty
+    assert not inst.empty
+    assert meta["ok"] is True
+    assert meta["provider"] == "kis"
+    assert meta["flow_provider_attempted"] == ["kis"]
+    assert meta["flow_provider_selected"] == "kis"
 
 
 def test_flow_provenance_genuine_zero_vs_imputed():

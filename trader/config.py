@@ -1133,6 +1133,18 @@ logger.info(
     RISK_PER_TRADE_PCT,
 )
 logger.info("[ENV] MINERVINI_ONLY=%s", int(MINERVINI_ONLY))
+ALLOW_KIS_DATA_HTTP_IN_DIAG = env_bool("ALLOW_KIS_DATA_HTTP_IN_DIAG", default=False)
+logger.info(
+    "[CONFIG][KIS_HTTP] strategy_mode=%s allow_kis_data_http_in_diag=%s",
+    (os.getenv("STRATEGY_MODE", "").strip().upper() or "UNKNOWN"),
+    int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
+)
+logger.info(
+    "[CONFIG][HTTP_POLICY] diag_blocks_order=%s diag_allows_data_http=%s token_allowed_in_diag=%s",
+    1,
+    int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
+    int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
+)
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
 STATE_WEEKLY_PATH = Path(__file__).parent / "state_weekly.json"
 

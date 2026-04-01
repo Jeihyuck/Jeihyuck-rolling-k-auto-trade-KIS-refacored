@@ -293,9 +293,6 @@ def _make_flow_provider(engine):
                 resp = kis_api.inquire_investor(code, "KOSDAQ")
             except Exception as exc:
                 reason = "breaker_open" if "breaker open" in str(exc).lower() else "unexpected_exception"
-                if reason == "breaker_open":
-                    logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
-                    _disable_provider("kis", reason)
                 state["fail_count"] += 1
                 _record_provider_failure("kis", reason)
                 return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": str(exc)[:200]}
@@ -318,8 +315,6 @@ def _make_flow_provider(engine):
 
             reason, detail = _response_reason(resp)
             if reason == "breaker_open":
-                logger.warning("[FLOW][KIS][DISABLE] reason=breaker_open")
-                _disable_provider("kis", reason)
                 state["fail_count"] += 1
                 _record_provider_failure("kis", reason)
                 return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
@@ -333,7 +328,7 @@ def _make_flow_provider(engine):
             if reason == "http_5xx" and not retried_5xx:
                 retried_5xx = True
                 continue
-            if reason in {"invalid_token", "http_5xx"}:
+            if reason == "invalid_token":
                 _disable_provider("kis", reason)
             state["fail_count"] += 1
             return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": detail}
@@ -347,7 +342,7 @@ def _make_flow_provider(engine):
         "kis": _provider_kis,
     }
 
-    logger.info("[FLOW][SOURCE] providers=%s priority=kis->pykrx", providers)
+    logger.info("[FLOW][PROVIDER_ORDER] providers=%s", providers)
 
     def _provider(code: str, as_of: date, window: int):
         flow_as_of = _resolve_flow_as_of(requested_as_of=as_of)
@@ -367,13 +362,26 @@ def _make_flow_provider(engine):
             if provider is None:
                 continue
             attempted.append(provider_name)
+            logger.info("[FLOW][TRY] code=%s provider=%s", str(code).zfill(6), provider_name)
             foreign_df, inst_df, meta = provider(str(code).zfill(6), flow_as_of, int(window))
             if foreign_df is not None and not foreign_df.empty and inst_df is not None and not inst_df.empty:
                 meta["requested_as_of"] = as_of.isoformat()
                 meta["flow_as_of"] = flow_as_of.isoformat()
+                meta["flow_provider_attempted"] = list(attempted)
+                meta["flow_provider_selected"] = provider_name
+                meta["flow_provider_failures"] = list(reasons)
+                meta["provider_used"] = provider_name
+                logger.info("[FLOW][SUCCESS] code=%s provider=%s", str(code).zfill(6), provider_name)
+                logger.info("[FLOW][PROVIDER_SELECTED] code=%s provider=%s fallback_used=%s", str(code).zfill(6), provider_name, int(provider_name != providers[0]))
                 logger.info("[FLOW][PROVIDER_OK] code=%s as_of=%s provider=%s", str(code).zfill(6), flow_as_of, provider_name)
                 flow_cache[cache_key] = (foreign_df, inst_df, meta)
                 return foreign_df, inst_df, meta
+            logger.info(
+                "[FLOW][FAIL] code=%s provider=%s reason=%s",
+                str(code).zfill(6),
+                provider_name,
+                str((meta or {}).get("reason") or "unknown"),
+            )
             reasons.append(f"{provider_name}:{str((meta or {}).get('reason') or 'unknown')}")
 
         logger.warning(
@@ -391,6 +399,9 @@ def _make_flow_provider(engine):
             "detail": "all_providers_failed",
             "requested_as_of": as_of.isoformat(),
             "flow_as_of": flow_as_of.isoformat(),
+            "flow_provider_attempted": list(attempted or providers),
+            "flow_provider_selected": "none",
+            "flow_provider_failures": list(reasons),
         }
         flow_cache[cache_key] = (_empty_df(), _empty_df(), fail_meta)
         return _empty_df(), _empty_df(), fail_meta
@@ -1093,6 +1104,8 @@ def main() -> int:
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
     allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
     allow_flow_degraded_prep = _env_true("ALLOW_FLOW_DEGRADED_PREP", "1") or allow_degraded_prep
+    strategy_mode = os.getenv("STRATEGY_MODE", "").strip().upper() or "UNKNOWN"
+    allow_kis_data_http_in_diag = str(os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0")).strip() == "1"
     
     # ✅ FIX: Define pool_min, topk, finaln at the top to avoid NameError
     pool_min = int(os.getenv("PB1_WATCHLIST_POOL_MIN", "40"))
@@ -1117,6 +1130,13 @@ def main() -> int:
     )
     logger.info("[PREP][POLICY] contract_mode=degrade_allowed")
     logger.info("[PREP][POLICY] verify_mode=degrade_allowed")
+    logger.info(
+        "[PREP][HTTP_POLICY] strategy_mode=%s allow_kis_data_http_in_diag=%s order_http_blocked=%s data_http_allowed=%s",
+        strategy_mode,
+        int(allow_kis_data_http_in_diag),
+        int(strategy_mode == "DIAG"),
+        int(strategy_mode != "DIAG" or allow_kis_data_http_in_diag),
+    )
     t0 = time.monotonic()
 
     stage_as_of: dict[str, str] = {

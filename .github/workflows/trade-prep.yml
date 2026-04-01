@@ -24,7 +24,9 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  STRATEGY_MODE: DIAG
   KIS_HTTP_ENABLED: "0"
+  ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"
   NO_TRADE: "1"
   DB_DISABLE_PREPARED_STATEMENTS: "1"
 

@@ -76,16 +76,75 @@ def kis_http_enabled() -> bool:
     return True
 
 
+def _endpoint_path(endpoint: str) -> str:
+    parsed = urlparse(str(endpoint or ""))
+    return (parsed.path or str(endpoint or "")).lower()
+
+
+def _endpoint_name(endpoint: str) -> str:
+    path = _endpoint_path(endpoint).rstrip("/")
+    if not path:
+        return "unknown"
+    return path.split("/")[-1] or "unknown"
+
+
+def is_order_endpoint(endpoint: str) -> bool:
+    path = _endpoint_path(endpoint)
+    return any(
+        token in path
+        for token in (
+            "/trading/order-cash",
+            "/trading/order-rvsecncl",
+            "/trading/order-resv",
+            "/order-cash",
+            "/order-rvsecncl",
+            "/order/",
+        )
+    )
+
+
+def is_data_endpoint(endpoint: str) -> bool:
+    path = _endpoint_path(endpoint)
+    if "/oauth2/token" in path:
+        return True
+    return any(
+        token in path
+        for token in (
+            "/quotations/",
+            "inquire-price",
+            "inquire-daily-itemchartprice",
+            "inquire-asking-price-exp-ccn",
+            "inquire-investor",
+            "program-trade",
+            "market-cap",
+            "search-stock-info",
+            "inquire-daily-ccld",
+            "inquire-balance",
+            "inquire-psbl-order",
+        )
+    )
+
+
+def kis_http_allowed(endpoint: str, strategy_mode: str, allow_data_http_in_diag: bool) -> bool:
+    normalized_mode = str(strategy_mode or "").strip().upper()
+    if normalized_mode == "DIAG":
+        if is_order_endpoint(endpoint):
+            return False
+        if is_data_endpoint(endpoint):
+            return bool(allow_data_http_in_diag)
+    return True
+
+
 def is_trading_endpoint(url: str) -> bool:
-    """
-    주문/거래 엔드포인트 여부 판별.
-    True면 주문 엔드포인트(차단 대상), False면 데이터 엔드포인트(허용 가능).
-    """
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    # 주문 관련 엔드포인트만 True
-    return "/trading/order-cash" in path or "/trading/order-" in path
+    return is_order_endpoint(url)
+
+
+def kis_explicit_offline_mode() -> bool:
+    if os.getenv("KIS_EXPLICIT_OFFLINE", "0").strip() == "1":
+        return True
+    if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
+        return True
+    return False
 
 
 def kis_data_http_allowed_in_diag() -> bool:
@@ -116,7 +175,9 @@ _BALANCE_CACHE_INVALID_LOGGED = False
 _KIS_BREAKER_LOCK = threading.Lock()
 _KIS_BREAKER_STATE: dict | None = None
 _KIS_BREAKER_WINDOW_SEC = int(os.getenv("KIS_BREAKER_WINDOW_SEC", "300") or "300")
-_KIS_BREAKER_THRESHOLD = int(os.getenv("KIS_BREAKER_THRESHOLD", "10") or "10")
+_KIS_BREAKER_THRESHOLD_ORDER = int(os.getenv("KIS_BREAKER_THRESHOLD_ORDER", "2") or "2")
+_KIS_BREAKER_THRESHOLD_AUTH = int(os.getenv("KIS_BREAKER_THRESHOLD_AUTH", "2") or "2")
+_KIS_BREAKER_THRESHOLD_DATA = int(os.getenv("KIS_BREAKER_THRESHOLD_DATA", "10") or "10")
 _KIS_BREAKER_OPEN_SEC = int(os.getenv("KIS_BREAKER_OPEN_SEC", "60") or "60")
 _KIS_TEMP_ERROR_CODES: set[str] = {
     code.strip()
@@ -318,7 +379,40 @@ def _breaker_key(method: str, url: str) -> str:
     return f"{method.upper()} {path}"
 
 
+def _breaker_policy(method: str, url: str) -> dict[str, Any]:
+    _ = method
+    endpoint_name = _endpoint_name(url)
+    if "/oauth2/token" in _endpoint_path(url):
+        category = "auth"
+        threshold = _KIS_BREAKER_THRESHOLD_AUTH
+        applicable = True
+    elif is_order_endpoint(url):
+        category = "order"
+        threshold = _KIS_BREAKER_THRESHOLD_ORDER
+        applicable = True
+    else:
+        category = "data"
+        threshold = _KIS_BREAKER_THRESHOLD_DATA
+        applicable = False
+    logger.info(
+        "[KIS][BREAKER_POLICY] endpoint=%s category=%s global_breaker_applicable=%s threshold=%s",
+        endpoint_name,
+        category,
+        int(applicable),
+        threshold,
+    )
+    return {
+        "endpoint": endpoint_name,
+        "category": category,
+        "global_breaker_applicable": applicable,
+        "threshold": threshold,
+    }
+
+
 def _breaker_check(method: str, url: str) -> tuple[bool, float | None]:
+    policy = _breaker_policy(method, url)
+    if not bool(policy.get("global_breaker_applicable")):
+        return False, None
     key = _breaker_key(method, url)
     now_ts = time.time()
     with _KIS_BREAKER_LOCK:
@@ -331,6 +425,9 @@ def _breaker_check(method: str, url: str) -> tuple[bool, float | None]:
 
 
 def _breaker_record_temp_failure(method: str, url: str) -> None:
+    policy = _breaker_policy(method, url)
+    if not bool(policy.get("global_breaker_applicable")):
+        return
     key = _breaker_key(method, url)
     now_ts = time.time()
     with _KIS_BREAKER_LOCK:
@@ -343,13 +440,16 @@ def _breaker_record_temp_failure(method: str, url: str) -> None:
         failures = [ts for ts in failures if isinstance(ts, (int, float)) and ts >= window_start]
         failures.append(now_ts)
         entry["failures"] = failures
-        if len(failures) >= _KIS_BREAKER_THRESHOLD:
+        if len(failures) >= int(policy.get("threshold") or _KIS_BREAKER_THRESHOLD_DATA):
             entry["open_until"] = now_ts + _KIS_BREAKER_OPEN_SEC
         state["endpoints"][key] = entry
         _save_breaker_state(state)
 
 
 def _breaker_record_success(method: str, url: str) -> None:
+    policy = _breaker_policy(method, url)
+    if not bool(policy.get("global_breaker_applicable")):
+        return
     key = _breaker_key(method, url)
     with _KIS_BREAKER_LOCK:
         state = _load_breaker_state()
@@ -802,6 +902,7 @@ class KisAPI:
         """
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
+        allow_data_http_in_diag = kis_data_http_allowed_in_diag()
         
         # ✅ MINERVINI_ONLY: FORCE_HTTP 없으면 전체 차단
         from trader.config import MINERVINI_ONLY
@@ -817,19 +918,12 @@ class KisAPI:
                     return {"_kis_disabled": True, "rt_cd": "0", "msg1": "KIS_HTTP_DISABLED"}
 
             return _DiagDummyResponse()
-        
-        # ✅ DIAG 모드 세분화: 주문은 차단, 데이터는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
-        kis_http_env = str(os.getenv("KIS_HTTP_ENABLED", "0")).strip()
-        
-        if strategy_mode == "DIAG" and kis_http_env != "1" and not force_http:
-            # 주문 엔드포인트는 무조건 차단
-            if is_trading_endpoint(url):
-                raise KISBlockedError(f"KIS API trading endpoint blocked in DIAG mode: {method} {url}")
-            
-            # 데이터 엔드포인트는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
-            if not kis_data_http_allowed_in_diag():
-                logger.warning("[KIS][DATA_HTTP_DISABLED] mode=DIAG endpoint=%s -> set ALLOW_KIS_DATA_HTTP_IN_DIAG=1 to enable", url)
-                
+        if not force_http and not kis_http_allowed(url, strategy_mode, allow_data_http_in_diag):
+            if is_order_endpoint(url):
+                raise KISBlockedError(f"KIS API order endpoint blocked in DIAG mode: {method} {url}")
+            if kis_explicit_offline_mode():
+                logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=%s explicit_offline=1", strategy_mode, _endpoint_name(url))
+
                 class _DiagDummyResponse:
                     status_code = 200
                     text = ""
@@ -839,6 +933,7 @@ class KisAPI:
                         return {"_kis_disabled": True, "rt_cd": "0", "msg1": "KIS_HTTP_DISABLED"}
 
                 return _DiagDummyResponse()
+            raise KISBlockedError(f"KIS API data endpoint blocked in DIAG mode: {method} {url}")
         
         if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
             logger.warning("[NET][DIAG] KIS calls disabled; skipping request method=%s url=%s", method, url)
@@ -1047,21 +1142,30 @@ class KisAPI:
             return token
 
     def _issue_token_and_expire(self):
-        # ✅ DIAG 모드 세분화: ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 실제 토큰 발급 시도
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
-        if not kis_http_enabled():
-            # DIAG이고 데이터 허용이면 실제 토큰 발급 시도 (아래 로직으로 진행)
-            if strategy_mode == "DIAG" and kis_data_http_allowed_in_diag():
-                logger.info("[KIS][TOKEN] mode=DIAG ALLOW_KIS_DATA_HTTP_IN_DIAG=1 -> issuing real token")
-            else:
-                # 완전 차단 모드: 더미 토큰 반환
-                logger.warning("[KIS][HTTP_DISABLED] mode=%s endpoint=token -> returning dummy token", os.getenv("STRATEGY_MODE"))
-                from datetime import timedelta, timezone
-                exp = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
-                return "DIAG_DUMMY_TOKEN", 21600  # (token, expires_in)
-        
         token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
+        allow_data_http_in_diag = kis_data_http_allowed_in_diag()
+        http_allowed = kis_http_allowed(url, strategy_mode, allow_data_http_in_diag)
+        if not http_allowed:
+            explicit_offline = kis_explicit_offline_mode()
+            logger.info(
+                "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=%s explicit_offline=%s",
+                strategy_mode,
+                int(allow_data_http_in_diag),
+                int(http_allowed),
+                "dummy_token" if explicit_offline else "blocked",
+                int(explicit_offline),
+            )
+            if explicit_offline:
+                return "DIAG_DUMMY_TOKEN", 21600
+            raise KISBlockedError("token endpoint blocked by HTTP policy")
+        logger.info(
+            "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=real_http",
+            strategy_mode,
+            int(allow_data_http_in_diag),
+            int(http_allowed),
+        )
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}
         try:

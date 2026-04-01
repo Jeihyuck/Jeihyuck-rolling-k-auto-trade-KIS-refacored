@@ -6,6 +6,11 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = str(os.getenv(name, str(int(default)))).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 # === 프로젝트 경로 설정 (절대경로 기반) ===
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = PROJECT_ROOT / "runtime"
@@ -44,6 +49,7 @@ else:
 KIS_ACCOUNT    = safe_strip(os.getenv("KIS_ACCOUNT", ""))
 KIS_REST_URL   = safe_strip(os.getenv("KIS_REST_URL", ""))
 KIS_WS_URL     = safe_strip(os.getenv("KIS_WS_URL", ""))
+ALLOW_KIS_DATA_HTTP_IN_DIAG = _env_bool("ALLOW_KIS_DATA_HTTP_IN_DIAG", default=False)
 
 # === 실전 전략/실험 환경 변수 ===
 #REBALANCE_ANCHOR      = os.getenv("REBALANCE_ANCHOR", "first")
@@ -95,3 +101,8 @@ logger.info(f"[환경변수 체크] ACNT_PRDT_CD={'***' if ACNT_PRDT_CD else ''}
 logger.info(f"[환경변수 체크] API_BASE_URL={repr(API_BASE_URL)}")
 logger.info(f"[환경변수 체크] KIS_ENV={repr(KIS_ENV)}")
 logger.info(f"[환경변수 체크] 기타 옵션들 정상 적용됨")
+logger.info(
+    "[CONFIG][KIS_HTTP] strategy_mode=%s allow_kis_data_http_in_diag=%s",
+    safe_strip(os.getenv("STRATEGY_MODE", "")).upper() or "UNKNOWN",
+    int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
+)
