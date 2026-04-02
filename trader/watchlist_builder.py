@@ -21,6 +21,8 @@ from sqlalchemy import Engine
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
 from trader.db.repos import (
     CRITICAL_SCORED_COLS,
+    FINAL30_SCORED_IDENTITY_COLS,
+    FINAL30_SCORED_PERSIST_COLS,
     REQUIRED_FINAL30_SCORED_COLS,
     DerivedFlowRepo,
     DerivedMinerviniRepo,
@@ -132,7 +134,7 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
     saved_rows: List[Dict[str, Any]] = []
     for idx, row in enumerate(rows or [], start=1):
         item = _sanitize_scored_item(dict(row or {}), source="final30_saved_rows")
-        for col in REQUIRED_FINAL30_SCORED_COLS:
+        for col in FINAL30_SCORED_PERSIST_COLS:
             item.setdefault(col, None)
         score = item.get("score")
         if score is None:
@@ -143,7 +145,7 @@ def _build_final30_saved_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]
             score_val = float(score or 0.0)
         except Exception:
             score_val = 0.0
-        normalized = {col: item.get(col) for col in REQUIRED_FINAL30_SCORED_COLS}
+        normalized = {col: item.get(col) for col in FINAL30_SCORED_PERSIST_COLS}
         normalized["code"] = str(item.get("code") or "").zfill(6)
         normalized["rank"] = int(item.get("rank") or item.get("rank_final30") or idx)
         for field in FINAL30_CANONICAL_NUMERIC_FIELDS:
@@ -863,7 +865,11 @@ def _prepare_final30_scored_rows_for_save(
         meta["score"] = item.get("score_final")
         item["rank"] = _safe_int(item.get("rank") or item.get("rank_final30") or idx, idx)
         item["meta"] = meta
-        prepared.append(normalize_final30_contract_row(item))
+        normalized_item = normalize_final30_contract_row(item)
+        for field in FINAL30_SCORED_PERSIST_COLS:
+            if field not in normalized_item:
+                normalized_item[field] = item.get(field)
+        prepared.append(normalized_item)
 
     logger.info(
         "[WATCHLIST][FINAL30][MA20_REPAIR] rows=%s repaired_ma20_count=%s missing_ma20_count=%s source=%s",
@@ -877,6 +883,15 @@ def _prepare_final30_scored_rows_for_save(
         prepared,
         repaired_ma20_count=repaired_ma20_count,
     )
+    first_row_keys = sorted(prepared[0].keys()) if prepared else []
+    missing_required = [
+        field for field in (FINAL30_SCORED_IDENTITY_COLS + REQUIRED_FINAL30_SCORED_COLS)
+        if field not in first_row_keys
+    ]
+    logger.info("[WATCHLIST][SAVE_SCORED][SAMPLE_KEYS] first_row_keys=%s", first_row_keys)
+    logger.info("[WATCHLIST][SAVE_SCORED][CRITICAL_CHECK] missing=%s", missing_required)
+    if missing_required:
+        raise RuntimeError(f"FINAL30_SCORED_PREPARE_MISSING_FIELDS:{missing_required}")
     return prepared, repaired_ma20_count, missing_ma20_count
 
 

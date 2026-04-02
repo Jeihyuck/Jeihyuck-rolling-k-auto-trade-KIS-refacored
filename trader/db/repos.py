@@ -61,7 +61,9 @@ __all__ = [
     "load_pb1_watchlist_codes",
     "load_watchlist_scored",
     "REQUIRED_FINAL30_SCORED_COLS",
+    "FINAL30_SCORED_PERSIST_COLS",
     "CRITICAL_SCORED_COLS",
+    "OPTIONAL_FLOW_COLS",
     "FINAL30_SCORED_DB_CONTRACT_FIELDS",
     "FINAL30_SCORED_REQUIRED_ROWS",
     "summarize_final30_scored_contract",
@@ -70,32 +72,43 @@ __all__ = [
 
 
 REQUIRED_FINAL30_SCORED_COLS = [
-    "as_of",
-    "code",
-    "name",
-    "rank",
-    "rank_pool120",
-    "rank_top50",
-    "rank_final30",
-    "score",
     "score_final",
-    "score_flow",
-    "score_liq",
-    "score_tech",
     "tech_score",
-    "flow_score",
-    "final_score",
     "breakout_score",
     "pullback_score",
     "momentum_score",
     "entry_style_selected",
+    "rs_percentile",
+    "vcp_score",
+    "ma20",
+    "ma50",
+    "ma150",
+    "atr_pct",
+]
+
+FINAL30_SCORED_IDENTITY_COLS = [
+    "as_of",
+    "code",
+    "name",
+    "score",
+]
+
+FINAL30_SCORED_PERSIST_COLS = [
+    *FINAL30_SCORED_IDENTITY_COLS,
+    *REQUIRED_FINAL30_SCORED_COLS,
+    "rank",
+    "rank_pool120",
+    "rank_top50",
+    "rank_final30",
+    "score_flow",
+    "score_liq",
+    "score_tech",
+    "flow_score",
+    "final_score",
     "entry_component",
     "rs_pctile",
-    "rs_percentile",
     "rs_score",
-    "vcp_score",
     "trend_score",
-    "atr_pct",
     "pullback_pct",
     "foreign_20_ratio",
     "inst_20_ratio",
@@ -104,9 +117,6 @@ REQUIRED_FINAL30_SCORED_COLS = [
     "close",
     "volume",
     "volume_avg20",
-    "ma20",
-    "ma50",
-    "ma150",
     "rows",
     "meta",
     "scores",
@@ -130,6 +140,16 @@ CRITICAL_SCORED_COLS = [
     "ma150",
     "close",
     "atr_pct",
+]
+
+OPTIONAL_FLOW_COLS = [
+    "investor_flow",
+    "foreign_net_buy",
+    "institutional_net_buy",
+    "program_trade",
+    "flow_score",
+    "flow_rank",
+    "flow_reason",
 ]
 
 FINAL30_SCORED_SAVE_REQUIRED_FIELDS = [
@@ -738,6 +758,8 @@ def _build_scored_payload_row(row: Dict[str, Any], *, as_of_date: date, idx: int
     except Exception:
         rank = idx
 
+    # Trade AM failures here were caused by persistence schema mismatch, not by flow or scoring.
+    # Keep the scored contract flattened before nesting it into meta so DB round-trip restores the same row schema.
     payload_body = {
         "as_of": as_of_date.isoformat(),
         "code": code,
@@ -902,7 +924,7 @@ def _save_pb1_final30_rows_scored_strict(
         if row.get("ma20") is None and row.get("close") is not None:
             logger.warning("[FALLBACK][MA20] code=%s ma20 missing before save", row.get("code"))
 
-    payload_key_set = sorted({str(key) for entry in payload for key in (entry.get("meta") or {}).keys()})
+    payload_key_set = sorted({str(key) for row in payload_rows for key in row.keys()})
     logger.info(
         "[WATCHLIST][DB_SAVE][FINAL30_SCORED][FIELD_CHECK] keys=%s has_ma20=%s",
         payload_key_set,
@@ -910,18 +932,22 @@ def _save_pb1_final30_rows_scored_strict(
     )
     missing_save_fields = [
         field
-        for field in FINAL30_SCORED_SAVE_REQUIRED_FIELDS
-        if field not in payload_key_set and field not in {"code", "rank", "score", "as_of"}
+        for field in sorted(set(FINAL30_SCORED_IDENTITY_COLS + REQUIRED_FINAL30_SCORED_COLS))
+        if field not in payload_key_set
     ]
+    first_row_keys = sorted(payload_rows[0].keys()) if payload_rows else []
+    logger.info("[WATCHLIST][SAVE_SCORED][SAMPLE_KEYS] first_row_keys=%s", first_row_keys)
+    logger.info("[WATCHLIST][SAVE_SCORED][CRITICAL_CHECK] missing=%s", missing_save_fields)
     if missing_save_fields:
-        logger.warning("[WATCHLIST][DB_SAVE][FINAL30_SCORED][MISSING_FIELDS] fields=%s", missing_save_fields)
+        raise ValueError(f"FINAL30_SCORED_SAVE_MISSING_FIELDS:{missing_save_fields}")
 
     _log_scored_sample("[WATCHLIST][SAVE_SCORED][PRE_DB_SAMPLE]", normalized_rows_for_log)
 
     sample_meta = payload[0].get("meta") if isinstance(payload[0].get("meta"), dict) else {}
     sample_keys = sorted(sample_meta.keys())
     sample_row = {k: sample_meta.get(k) for k in CRITICAL_SCORED_COLS + ["code", "rank_final30", "score"] if k in sample_meta}
-    logger.info("[WATCHLIST][SAVE_SCORED][SAMPLE_KEYS] keys=%s", sample_keys)
+    logger.info("[DB][FINAL30_SCORED][SAVE] rows=%d", len(payload))
+    logger.info("[DB][FINAL30_SCORED][SAVE_SAMPLE_KEYS] keys=%s", first_row_keys)
     logger.info("[WATCHLIST][SAVE_SCORED][SAMPLE_ROW] %s", sample_row)
 
     schema = schema_for_engine(engine)
@@ -1026,6 +1052,7 @@ def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:
     derived = meta.get("derived") if isinstance(meta.get("derived"), dict) else {}
     minervini = meta.get("minervini") if isinstance(meta.get("minervini"), dict) else {}
     out: Dict[str, Any] = {
+        "as_of": row.as_of.isoformat() if getattr(row, "as_of", None) is not None else meta.get("as_of"),
         "code": row.code,
         "rank": row.rank,
         "score": float(row.score) if row.score is not None else None,
@@ -1039,6 +1066,7 @@ def _normalize_scored_loaded_row(row: Any) -> Dict[str, Any]:
     out.setdefault("rank", row.rank)
     out.setdefault("score", float(row.score) if row.score is not None else None)
     normalized = normalize_final30_contract_row(out)
+    normalized.setdefault("as_of", row.as_of.isoformat() if getattr(row, "as_of", None) is not None else meta.get("as_of"))
     for field, aliases in FINAL30_NUMERIC_RESTORE_ALIASES.items():
         restored = _restore_numeric_from_sources(normalized, meta, scores, derived, minervini, aliases=aliases)
         if restored is not None:
@@ -3863,12 +3891,17 @@ class WatchlistRepo:
             has.get("vcp_score", 0),
             has.get("entry_style_selected", 0),
         )
+        logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY] rows=%s cols=%s", len(result), cols)
+        missing_loaded_fields = [field for field in REQUIRED_FINAL30_SCORED_COLS if field not in cols]
+        logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY_MISSING] missing=%s", missing_loaded_fields)
         if result:
             _log_scored_sample("[WATCHLIST][LOAD_SCORED][POST_DB_SAMPLE]", result)
             sample_keys = sorted(result[0].keys())
             sample_row = {k: result[0].get(k) for k in CRITICAL_SCORED_COLS + ["code", "rank_final30", "score"] if k in result[0]}
             logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_KEYS] keys=%s", sample_keys)
             logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_ROW] %s", sample_row)
+        if len(result) == FINAL30_SCORED_REQUIRED_ROWS and not missing_loaded_fields:
+            logger.info("[DB][FINAL30_SCORED][ROUNDTRIP_OK] rows=%s", len(result))
         return result, used_as_of
     
     def get_latest_watchlist_date(

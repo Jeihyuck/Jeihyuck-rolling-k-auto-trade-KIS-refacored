@@ -141,7 +141,7 @@ from trader.config import (
     FORCE_MIN1_OVERRIDE_TOPN,
     resolve_market_window,
 )
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo, OPTIONAL_FLOW_COLS, REQUIRED_FINAL30_SCORED_COLS
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI, KISBlockedError, extract_order_no, is_order_accepted
 from trader.ledger.store import LedgerStore
@@ -187,32 +187,7 @@ from trader.strategies.pb1_pullback_close import (
 
 logger = logging.getLogger(__name__)
 
-REQUIRED_SCORED_FINAL30_COLS = [
-    "code",
-    "name",
-    "score_final",
-    "tech_score",
-    "breakout_score",
-    "pullback_score",
-    "momentum_score",
-    "rs_percentile",
-    "vcp_score",
-    "entry_style_selected",
-    "ma20",
-    "ma50",
-    "ma150",
-    "atr_pct",
-]
 ALTERNATIVE_REQUIRED_SCORED_COLS = [("close", "last_close")]
-FLOW_OPTIONAL_COLS = [
-    "investor_flow",
-    "foreign_net_buy",
-    "institutional_net_buy",
-    "program_trade",
-    "flow_score",
-    "flow_rank",
-    "flow_reason",
-]
 
 # Minervini feature calc requires MA200 slope + VCP; force long window.
 MINERVINI_OHLCV_DAYS_MIN = int(os.getenv("MINERVINI_OHLCV_DAYS", "520"))
@@ -7724,7 +7699,7 @@ class PB1Engine:
     @staticmethod
     def _scored_missing_cols(columns: list[str]) -> list[str]:
         colset = {str(c) for c in (columns or [])}
-        missing = [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in colset]
+        missing = [c for c in REQUIRED_FINAL30_SCORED_COLS if c not in colset]
         for primary, alternative in ALTERNATIVE_REQUIRED_SCORED_COLS:
             if primary in missing and alternative in colset:
                 missing.remove(primary)
@@ -7807,14 +7782,42 @@ class PB1Engine:
 
         if self._universe_context and self._universe_context.members:
             rows = [dict(x or {}) for x in (self._universe_context.members or [])]
-            source = str((self._universe_context.meta or {}).get("source") or "universe_context")
+            source_meta = dict(self._universe_context.meta or {})
+            source = str(source_meta.get("source") or "universe_context")
+            source_label = "db" if source.startswith("db_") else source
             cols = sorted({str(k) for r in rows for k in r.keys()})
             missing_cols = self._scored_missing_cols(cols)
             flow_optional_missing = [c for c in FLOW_OPTIONAL_COLS if c not in set(cols)]
             usable = (not missing_cols) or (not require_scored) or allow_missing_scored
+            logger.info("[FINAL30][SOURCE_SUMMARY] source=%s rows=%s", source_label, len(rows))
+            logger.info("[FINAL30][SOURCE_COLS] source=%s cols=%s", source_label, cols)
+            logger.info(
+                "[FINAL30][SOURCE_SAMPLE_KEYS] source=%s first_row_keys=%s",
+                source_label,
+                sorted(rows[0].keys()) if rows else [],
+            )
+            logger.info("[FINAL30][REQUIRED_CHECK] source=%s missing=%s", source_label, missing_cols)
+            logger.info("[FINAL30][FLOW_CHECK] source=%s flow_optional_missing=%s", source_label, flow_optional_missing)
+            if source_meta.get("path_map"):
+                logger.info(
+                    "[FINAL30][PATH_MAP] runtime=%s ledger=%s signals=%s db=%s",
+                    source_meta.get("path_map", {}).get("runtime"),
+                    source_meta.get("path_map", {}).get("ledger"),
+                    source_meta.get("path_map", {}).get("signals"),
+                    "pb1_watchlist_final_scored",
+                )
+            if source_meta.get("source_compare"):
+                source_compare = dict(source_meta.get("source_compare") or {})
+                logger.info(
+                    "[FINAL30][SOURCE_COMPARE] db_missing=%s runtime_missing=%s ledger_missing=%s signals_missing=%s",
+                    source_compare.get("db", []),
+                    source_compare.get("runtime", []),
+                    source_compare.get("ledger", []),
+                    source_compare.get("signals", []),
+                )
             logger.info(
                 "[FINAL30][INPUT_CHECK] source=%s usable=%s required_scored_cols_missing=%s flow_optional_missing=%s",
-                source,
+                source_label,
                 int(usable),
                 missing_cols,
                 flow_optional_missing,
@@ -7824,11 +7827,11 @@ class PB1Engine:
             if not usable:
                 logger.error(
                     "[PB1][ENTRY][INPUT_REJECT] source=%s missing_scored_cols=%s require_scored=1",
-                    source,
+                    source_label,
                     missing_cols,
                 )
                 self._write_final30_input_reject_debug(
-                    source=source,
+                    source=source_label,
                     as_of=as_of,
                     rows=len(rows),
                     columns=cols,

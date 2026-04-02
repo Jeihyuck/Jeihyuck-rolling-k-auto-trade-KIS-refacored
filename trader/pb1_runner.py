@@ -79,8 +79,10 @@ from trader.db.repos import (
     FillsRepo,
     DerivedMinerviniRepo,
     LedgerEventsRepo,
+    OPTIONAL_FLOW_COLS,
     OrdersRepo,
     PositionsRepo,
+    REQUIRED_FINAL30_SCORED_COLS,
     ReconcileLogRepo,
     RunsRepo,
     UniverseRepo,
@@ -118,39 +120,14 @@ def try_acquire_lock(*args, **kwargs):
 def is_trading_day(now: datetime) -> bool:
     return is_trading_weekday(now)
 
-REQUIRED_SCORED_FINAL30_COLS = [
-    "code",
-    "name",
-    "score_final",
-    "tech_score",
-    "breakout_score",
-    "pullback_score",
-    "momentum_score",
-    "rs_percentile",
-    "vcp_score",
-    "entry_style_selected",
-    "ma20",
-    "ma50",
-    "ma150",
-    "atr_pct",
-]
 OPTIONAL_SCORING_ALTERNATIVE_COLS = [("close", "last_close")]
-FLOW_OPTIONAL_COLS = [
-    "investor_flow",
-    "foreign_net_buy",
-    "institutional_net_buy",
-    "program_trade",
-    "flow_score",
-    "flow_rank",
-    "flow_reason",
-]
 
 _FINAL30_LOAD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _missing_scored_cols(columns: list[str]) -> list[str]:
     cols = {str(c) for c in (columns or [])}
-    missing = [c for c in REQUIRED_SCORED_FINAL30_COLS if c not in cols]
+    missing = [c for c in REQUIRED_FINAL30_SCORED_COLS if c not in cols]
     for primary, alternative in OPTIONAL_SCORING_ALTERNATIVE_COLS:
         if primary in missing and alternative in cols:
             missing.remove(primary)
@@ -189,7 +166,7 @@ def _validate_trade_final30_files(*, repo_root_path: Path, env: str, as_of: str)
         result = verify_final30_scored_rows(
             rows,
             required_rows=30,
-            required_fields=REQUIRED_SCORED_FINAL30_COLS,
+            required_fields=REQUIRED_FINAL30_SCORED_COLS,
             source=f"FILE:{label}",
         ) if json_ok and rows else {
             "ok": False,
@@ -231,7 +208,7 @@ def _strict_validate_trade_final30_rows(rows: list[dict[str, Any]], *, source: s
     return verify_final30_scored_rows(
         rows,
         required_rows=30,
-        required_fields=REQUIRED_SCORED_FINAL30_COLS,
+        required_fields=REQUIRED_FINAL30_SCORED_COLS,
         source=source,
     )
 
@@ -255,7 +232,7 @@ def _trade_recheck_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str,
     return verify_final30_scored_rows(
         rows,
         required_rows=len(rows),
-        required_fields=REQUIRED_SCORED_FINAL30_COLS,
+        required_fields=REQUIRED_FINAL30_SCORED_COLS,
         source=source,
     )
 
@@ -414,6 +391,7 @@ def load_trade_final30_scored(
 ) -> dict[str, Any]:
     env_n = (env or "").strip().lower()
     as_of_s = str(as_of)
+    logger.info("[TRADE][FINAL30][LOAD_START] preferred_source=db")
     repo_root_path = resolve_repo_root()
     cache_key = (str(repo_root_path), env_n, as_of_s)
     cached = _FINAL30_LOAD_CACHE.get(cache_key)
@@ -436,6 +414,13 @@ def load_trade_final30_scored(
         repo_root_path,
         Path.cwd(),
         serialize_path_map(final30_paths),
+    )
+    logger.info(
+        "[FINAL30][PATH_MAP] runtime=%s ledger=%s signals=%s db=%s",
+        final30_paths.get("runtime"),
+        final30_paths.get("ledger"),
+        final30_paths.get("signals"),
+        "pb1_watchlist_final_scored",
     )
     file_mirror_stats: dict[str, int] = {}
     for label, path in final30_paths.items():
@@ -462,7 +447,18 @@ def load_trade_final30_scored(
     rows = list(scored_contract.get("rows_data") or [])
     contract_columns = [str(col) for col in (scored_contract.get("columns") or sorted({key for row in rows for key in (row or {}).keys()}))]
     missing_critical_fields = _missing_scored_cols(contract_columns)
-    flow_optional_missing = [col for col in FLOW_OPTIONAL_COLS if col not in contract_columns]
+    flow_optional_missing = [col for col in OPTIONAL_FLOW_COLS if col not in contract_columns]
+    first_row_keys = sorted(rows[0].keys()) if rows else []
+
+    source_compare: dict[str, list[str]] = {"db": list(missing_critical_fields)}
+    for label, path in final30_paths.items():
+        file_rows, json_ok = read_final30_file_rows(path)
+        if json_ok and file_rows:
+            file_cols = sorted({str(key) for row in file_rows for key in (row or {}).keys()})
+            source_compare[label] = _missing_scored_cols(file_cols)
+        else:
+            source_compare[label] = list(REQUIRED_FINAL30_SCORED_COLS)
+
     repairable_contract = _is_trade_repairable_db_contract(scored_contract, missing_critical_fields=missing_critical_fields)
     contract_ok = bool(
         (
@@ -515,6 +511,18 @@ def load_trade_final30_scored(
         "[TRADE][FINAL30][ENTRY_STYLE_DISTRIBUTION] total=%s counts=%s",
         int(db_distribution.get("total") or 0),
         dict(db_distribution.get("counts") or {}),
+    )
+    logger.info("[FINAL30][SOURCE_SUMMARY] source=db rows=%s", len(rows))
+    logger.info("[FINAL30][SOURCE_COLS] source=db cols=%s", contract_columns)
+    logger.info("[FINAL30][SOURCE_SAMPLE_KEYS] source=db first_row_keys=%s", first_row_keys)
+    logger.info("[FINAL30][REQUIRED_CHECK] source=db missing=%s", missing_critical_fields)
+    logger.info("[FINAL30][FLOW_CHECK] source=db flow_optional_missing=%s", flow_optional_missing)
+    logger.info(
+        "[FINAL30][SOURCE_COMPARE] db_missing=%s runtime_missing=%s ledger_missing=%s signals_missing=%s",
+        source_compare.get("db", []),
+        source_compare.get("runtime", []),
+        source_compare.get("ledger", []),
+        source_compare.get("signals", []),
     )
     if contract_ok:
         missing_labels = [label for label, present in file_mirror_stats.items() if not present]
@@ -615,8 +623,19 @@ def load_trade_final30_scored(
         try:
             if not trade_recheck_ok:
                 raise RuntimeError(format_final30_abort_message(trade_validate))
+            logger.info(
+                "[FINAL30][INPUT_CHECK] source=db usable=%s required_scored_cols_missing=%s",
+                int(trade_recheck_ok),
+                missing_critical_fields,
+            )
+            logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db rows=%s usable=%s", len(df), int(trade_recheck_ok))
+            logger.info("[TRADE][FINAL30][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
             logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
         except RuntimeError as exc:
+            logger.info("[FINAL30][INPUT_CHECK] source=db usable=0 required_scored_cols_missing=%s", missing_critical_fields)
+            logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db rows=%s usable=0", len(working_rows))
+            logger.info("[TRADE][FINAL30][REJECT_REASON] missing_scored_cols=%s", missing_critical_fields)
+            logger.info("[TRADE][FINAL30][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
             logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=db_contract_invalid")
             logger.error("[TRADE][FINAL30][FAIL] reason=missing_or_empty")
             logger.error("[TRADE][READY][FAIL] reason=final30_contract_invalid")
@@ -630,6 +649,11 @@ def load_trade_final30_scored(
                 "is_scored": False,
                 "used_fallback": False,
                 "file_mirror_present": any(file_mirror_stats.values()),
+                "usable": False,
+                "missing_scored_cols": list(missing_critical_fields),
+                "flow_optional_missing": list(flow_optional_missing),
+                "path_map": {key: str(value) for key, value in final30_paths.items()},
+                "source_compare": source_compare,
             }
             _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
             return result
@@ -652,10 +676,19 @@ def load_trade_final30_scored(
             "is_scored": True,
             "used_fallback": False,
             "file_mirror_present": any(file_mirror_stats.values()),
+            "usable": bool(trade_recheck_ok),
+            "missing_scored_cols": list(missing_critical_fields),
+            "flow_optional_missing": list(flow_optional_missing),
+            "path_map": {key: str(value) for key, value in final30_paths.items()},
+            "source_compare": source_compare,
         }
         _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": df.copy(deep=True)}
         return result
 
+    logger.info("[FINAL30][INPUT_CHECK] source=db usable=0 required_scored_cols_missing=%s", missing_critical_fields)
+    logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db rows=%s usable=0", len(rows))
+    logger.info("[TRADE][FINAL30][REJECT_REASON] missing_scored_cols=%s", missing_critical_fields)
+    logger.info("[TRADE][FINAL30][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
     logger.error(
         "[TRADE][ABORT][FINAL30_INVALID][DETAIL] source=db rows=%s invalid_rows=%s error_codes=%s details=%s",
         scored_contract.get("rows"),
@@ -683,6 +716,11 @@ def load_trade_final30_scored(
         "is_scored": False,
         "used_fallback": False,
         "file_mirror_present": any(file_mirror_stats.values()),
+        "usable": False,
+        "missing_scored_cols": list(missing_critical_fields),
+        "flow_optional_missing": list(flow_optional_missing),
+        "path_map": {key: str(value) for key, value in final30_paths.items()},
+        "source_compare": source_compare,
     }
     _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
     return result
@@ -1460,7 +1498,12 @@ def _load_universe_context(
                 "source": result.get("source_name"),
                 "as_of": str(result.get("as_of") or as_of),
                 "is_scored": bool(result.get("is_scored")),
+                "usable": bool(result.get("usable")),
                 "columns": list(result.get("columns") or []),
+                "missing_scored_cols": list(result.get("missing_scored_cols") or []),
+                "flow_optional_missing": list(result.get("flow_optional_missing") or []),
+                "path_map": dict(result.get("path_map") or {}),
+                "source_compare": dict(result.get("source_compare") or {}),
                 "used_fallback": bool(result.get("used_fallback")),
                 "file_mirror_present": int(bool(result.get("file_mirror_present"))),
             },
@@ -4163,7 +4206,7 @@ def main() -> int:
             allow_latest_fallback=False,
         )
         scored_missing_critical = [
-            col for col in REQUIRED_SCORED_FINAL30_COLS
+            col for col in REQUIRED_FINAL30_SCORED_COLS
             if col not in [str(item) for item in (scored_contract.get("columns") or [])]
         ]
         scored_contract_repairable = _is_trade_repairable_db_contract(
