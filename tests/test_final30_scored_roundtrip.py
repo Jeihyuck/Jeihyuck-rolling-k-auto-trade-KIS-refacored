@@ -6,7 +6,8 @@ import pandas as pd
 import sqlalchemy as sa
 
 from trader.pb1_engine import PB1Engine
-from trader.db.repos import REQUIRED_FINAL30_SCORED_COLS, WatchlistRepo
+from trader.constants import REQUIRED_FINAL30_SCORED_COLS
+from trader.db.repos import WatchlistRepo
 from trader.db.schema import schema_for_engine
 from trader.watchlist_builder import _build_final30_saved_rows
 

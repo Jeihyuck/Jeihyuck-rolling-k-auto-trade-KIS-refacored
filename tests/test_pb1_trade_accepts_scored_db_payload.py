@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from trader import pb1_runner
+from trader.constants import FLOW_OPTIONAL_COLS
 
 
 def _scored_row(idx: int) -> dict:
@@ -58,4 +59,4 @@ def test_scored_db_payload_is_accepted_without_flow_fields(tmp_path, monkeypatch
     assert result["source_name"] == "db_pb1_watchlist_final_scored"
     assert result["usable"] is True
     assert result["missing_scored_cols"] == []
-    assert result["flow_optional_missing"]
+    assert result["flow_optional_missing"] == list(FLOW_OPTIONAL_COLS)

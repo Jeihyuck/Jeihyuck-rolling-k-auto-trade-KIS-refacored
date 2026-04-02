@@ -141,7 +141,8 @@ from trader.config import (
     FORCE_MIN1_OVERRIDE_TOPN,
     resolve_market_window,
 )
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo, OPTIONAL_FLOW_COLS, REQUIRED_FINAL30_SCORED_COLS
+from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI, KISBlockedError, extract_order_no, is_order_accepted
 from trader.ledger.store import LedgerStore
@@ -186,6 +187,18 @@ from trader.strategies.pb1_pullback_close import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
+    try:
+        flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
+        return [c for c in flow_optional_cols if c not in set(columns or [])]
+    except Exception as e:
+        logger.warning(
+            "[FINAL30][FLOW_CHECK_GUARD] optional flow check failed err=%s",
+            e,
+        )
+        return []
 
 ALTERNATIVE_REQUIRED_SCORED_COLS = [("close", "last_close")]
 
@@ -7787,7 +7800,7 @@ class PB1Engine:
             source_label = "db" if source.startswith("db_") else source
             cols = sorted({str(k) for r in rows for k in r.keys()})
             missing_cols = self._scored_missing_cols(cols)
-            flow_optional_missing = [c for c in FLOW_OPTIONAL_COLS if c not in set(cols)]
+            flow_optional_missing = _safe_flow_optional_missing(cols)
             usable = (not missing_cols) or (not require_scored) or allow_missing_scored
             logger.info("[FINAL30][SOURCE_SUMMARY] source=%s rows=%s", source_label, len(rows))
             logger.info("[FINAL30][SOURCE_COLS] source=%s cols=%s", source_label, cols)
@@ -7797,7 +7810,7 @@ class PB1Engine:
                 sorted(rows[0].keys()) if rows else [],
             )
             logger.info("[FINAL30][REQUIRED_CHECK] source=%s missing=%s", source_label, missing_cols)
-            logger.info("[FINAL30][FLOW_CHECK] source=%s flow_optional_missing=%s", source_label, flow_optional_missing)
+            logger.info("[FINAL30][FLOW_OPTIONAL_CHECK] source=%s missing=%s", source_label, flow_optional_missing)
             if source_meta.get("path_map"):
                 logger.info(
                     "[FINAL30][PATH_MAP] runtime=%s ledger=%s signals=%s db=%s",

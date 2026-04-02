@@ -30,6 +30,14 @@ from .schema import (
 )
 from trader.db.json_safe import json_sanitize
 from trader.db.retry import run_with_db_retry
+from trader.constants import (
+    CRITICAL_SCORED_COLS,
+    FINAL30_SCORED_IDENTITY_COLS,
+    FINAL30_SCORED_PERSIST_COLS,
+    FLOW_OPTIONAL_COLS,
+    OPTIONAL_FLOW_COLS,
+    REQUIRED_FINAL30_SCORED_COLS,
+)
 from trader.final30_quality import normalize_final30_contract_row, summarize_final30_quality, verify_final30_scored_rows
 from trader.indicators import safe_nullable_float
 from trader.time_utils import now_kst
@@ -60,6 +68,7 @@ __all__ = [
     "save_pb1_watchlist_rows",
     "load_pb1_watchlist_codes",
     "load_watchlist_scored",
+    "FLOW_OPTIONAL_COLS",
     "REQUIRED_FINAL30_SCORED_COLS",
     "FINAL30_SCORED_PERSIST_COLS",
     "CRITICAL_SCORED_COLS",
@@ -68,88 +77,6 @@ __all__ = [
     "FINAL30_SCORED_REQUIRED_ROWS",
     "summarize_final30_scored_contract",
     "verify_final30_scored_contract",
-]
-
-
-REQUIRED_FINAL30_SCORED_COLS = [
-    "score_final",
-    "tech_score",
-    "breakout_score",
-    "pullback_score",
-    "momentum_score",
-    "entry_style_selected",
-    "rs_percentile",
-    "vcp_score",
-    "ma20",
-    "ma50",
-    "ma150",
-    "atr_pct",
-]
-
-FINAL30_SCORED_IDENTITY_COLS = [
-    "as_of",
-    "code",
-    "name",
-    "score",
-]
-
-FINAL30_SCORED_PERSIST_COLS = [
-    *FINAL30_SCORED_IDENTITY_COLS,
-    *REQUIRED_FINAL30_SCORED_COLS,
-    "rank",
-    "rank_pool120",
-    "rank_top50",
-    "rank_final30",
-    "score_flow",
-    "score_liq",
-    "score_tech",
-    "flow_score",
-    "final_score",
-    "entry_component",
-    "rs_pctile",
-    "rs_score",
-    "trend_score",
-    "pullback_pct",
-    "foreign_20_ratio",
-    "inst_20_ratio",
-    "liq_avg",
-    "last_close",
-    "close",
-    "volume",
-    "volume_avg20",
-    "rows",
-    "meta",
-    "scores",
-    "reasons",
-    "reject_reasons",
-    "filters_passed",
-    "filters_failed",
-]
-
-CRITICAL_SCORED_COLS = [
-    "score_final",
-    "tech_score",
-    "breakout_score",
-    "pullback_score",
-    "momentum_score",
-    "rs_percentile",
-    "vcp_score",
-    "entry_style_selected",
-    "ma20",
-    "ma50",
-    "ma150",
-    "close",
-    "atr_pct",
-]
-
-OPTIONAL_FLOW_COLS = [
-    "investor_flow",
-    "foreign_net_buy",
-    "institutional_net_buy",
-    "program_trade",
-    "flow_score",
-    "flow_rank",
-    "flow_reason",
 ]
 
 FINAL30_SCORED_SAVE_REQUIRED_FIELDS = [
@@ -3901,7 +3828,7 @@ class WatchlistRepo:
             logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_KEYS] keys=%s", sample_keys)
             logger.info("[WATCHLIST][LOAD_SCORED][SAMPLE_ROW] %s", sample_row)
         if len(result) == FINAL30_SCORED_REQUIRED_ROWS and not missing_loaded_fields:
-            logger.info("[DB][FINAL30_SCORED][ROUNDTRIP_OK] rows=%s", len(result))
+            logger.info("[DB][FINAL30_SCORED][ROUNDTRIP_OK] rows=%s usable=1", len(result))
         return result, used_as_of
     
     def get_latest_watchlist_date(

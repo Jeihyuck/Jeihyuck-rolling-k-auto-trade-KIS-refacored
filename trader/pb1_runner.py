@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
 from trader.runtime_paths import build_final30_scored_paths, repo_root
 from trader.path_contract import build_final30_paths, build_watchlist_paths, read_final30_file_rows, resolve_repo_root, serialize_path_map, write_final30_mirrors
 
@@ -79,10 +80,8 @@ from trader.db.repos import (
     FillsRepo,
     DerivedMinerviniRepo,
     LedgerEventsRepo,
-    OPTIONAL_FLOW_COLS,
     OrdersRepo,
     PositionsRepo,
-    REQUIRED_FINAL30_SCORED_COLS,
     ReconcileLogRepo,
     RunsRepo,
     UniverseRepo,
@@ -132,6 +131,18 @@ def _missing_scored_cols(columns: list[str]) -> list[str]:
         if primary in missing and alternative in cols:
             missing.remove(primary)
     return missing
+
+
+def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
+    try:
+        flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
+        return [col for col in flow_optional_cols if col not in set(columns or [])]
+    except Exception as exc:
+        logger.warning(
+            "[FINAL30][FLOW_CHECK_GUARD] optional flow check failed err=%s",
+            exc,
+        )
+        return []
 
 
 def _load_json_rows(path: Path) -> list[dict[str, Any]]:
@@ -447,7 +458,7 @@ def load_trade_final30_scored(
     rows = list(scored_contract.get("rows_data") or [])
     contract_columns = [str(col) for col in (scored_contract.get("columns") or sorted({key for row in rows for key in (row or {}).keys()}))]
     missing_critical_fields = _missing_scored_cols(contract_columns)
-    flow_optional_missing = [col for col in OPTIONAL_FLOW_COLS if col not in contract_columns]
+    flow_optional_missing = _safe_flow_optional_missing(contract_columns)
     first_row_keys = sorted(rows[0].keys()) if rows else []
 
     source_compare: dict[str, list[str]] = {"db": list(missing_critical_fields)}
@@ -516,7 +527,7 @@ def load_trade_final30_scored(
     logger.info("[FINAL30][SOURCE_COLS] source=db cols=%s", contract_columns)
     logger.info("[FINAL30][SOURCE_SAMPLE_KEYS] source=db first_row_keys=%s", first_row_keys)
     logger.info("[FINAL30][REQUIRED_CHECK] source=db missing=%s", missing_critical_fields)
-    logger.info("[FINAL30][FLOW_CHECK] source=db flow_optional_missing=%s", flow_optional_missing)
+    logger.info("[FINAL30][FLOW_OPTIONAL_CHECK] source=db missing=%s", flow_optional_missing)
     logger.info(
         "[FINAL30][SOURCE_COMPARE] db_missing=%s runtime_missing=%s ledger_missing=%s signals_missing=%s",
         source_compare.get("db", []),

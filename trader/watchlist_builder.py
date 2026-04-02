@@ -19,11 +19,13 @@ import pandas as pd
 from sqlalchemy import Engine
 
 from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
-from trader.db.repos import (
+from trader.constants import (
     CRITICAL_SCORED_COLS,
     FINAL30_SCORED_IDENTITY_COLS,
     FINAL30_SCORED_PERSIST_COLS,
     REQUIRED_FINAL30_SCORED_COLS,
+)
+from trader.db.repos import (
     DerivedFlowRepo,
     DerivedMinerviniRepo,
     WatchlistRepo,

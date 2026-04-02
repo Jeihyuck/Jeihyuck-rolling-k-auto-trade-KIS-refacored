@@ -12,15 +12,17 @@ from uuid import uuid4
 import pandas as pd
 
 from settings import RUNTIME_DIR
+from trader.constants import (
+    CRITICAL_SCORED_COLS,
+    FINAL30_SCORED_PERSIST_COLS,
+    FLOW_OPTIONAL_COLS,
+    REQUIRED_FINAL30_SCORED_COLS,
+)
 from trader.db.engine import get_engine
 from trader.db.health import assert_db_ready
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
-    CRITICAL_SCORED_COLS,
-    FINAL30_SCORED_PERSIST_COLS,
     FINAL30_SCORED_REQUIRED_ROWS,
-    OPTIONAL_FLOW_COLS,
-    REQUIRED_FINAL30_SCORED_COLS,
     LedgerEventsRepo,
     UniverseRepo,
     WatchlistRepo,
@@ -837,7 +839,15 @@ def save_final30_scored_core(
     reload_rows = list(reload_contract.get("rows_data") or [])
     reload_cols = [str(col) for col in (reload_contract.get("columns") or sorted({key for row in reload_rows for key in (row or {}).keys()}))]
     reload_missing = [col for col in REQUIRED_FINAL30_SCORED_COLS if col not in reload_cols]
-    flow_optional_missing = [col for col in OPTIONAL_FLOW_COLS if col not in reload_cols]
+    try:
+        flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
+        flow_optional_missing = [col for col in flow_optional_cols if col not in reload_cols]
+    except Exception as exc:
+        logger.warning(
+            "[FINAL30][FLOW_CHECK_GUARD] optional flow check failed err=%s",
+            exc,
+        )
+        flow_optional_missing = []
     trade_validator = verify_final30_scored_rows(
         reload_rows,
         required_rows=FINAL30_SCORED_REQUIRED_ROWS,
@@ -847,6 +857,12 @@ def save_final30_scored_core(
     usable_roundtrip = bool(trade_validator.get("ok")) and not reload_missing
     logger.info("[PREP][FINAL30_SCORED][DB_ROUNDTRIP_LOAD] rows=%s cols=%s", len(reload_rows), reload_cols)
     logger.info("[PREP][FINAL30_SCORED][DB_ROUNDTRIP_MISSING] missing=%s", reload_missing)
+    logger.info("[FINAL30][SOURCE_COLS] source=db cols=%s", reload_cols)
+    logger.info(
+        "[FINAL30][SOURCE_SAMPLE_KEYS] source=db first_row_keys=%s",
+        sorted(reload_rows[0].keys()) if reload_rows else [],
+    )
+    logger.info("[FINAL30][FLOW_OPTIONAL_CHECK] source=db missing=%s", flow_optional_missing)
     if flow_optional_missing:
         logger.warning("[PREP][FINAL30_SCORED][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
     if usable_roundtrip:
