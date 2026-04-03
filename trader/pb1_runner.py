@@ -84,6 +84,8 @@ from trader.db.repos import (
     PositionsRepo,
     ReconcileLogRepo,
     RunsRepo,
+    ScoredWatchlistInvalidError,
+    ScoredWatchlistNotFoundError,
     UniverseRepo,
 )
 from trader.diagnostics.nontrading_smoke import (
@@ -394,6 +396,123 @@ def _select_repaired_final30_source(
     return "db", db_rows
 
 
+def _classify_final30_abort_reason(*, rows: int, missing_cols: list[str], errors: list[str] | None = None) -> str:
+    error_set = {str(error) for error in (errors or []) if str(error).strip()}
+    if "strategy_mismatch" in error_set:
+        return "strategy_mismatch"
+    if int(rows) == 0:
+        return "scored_final30_missing"
+    if int(rows) != 30:
+        return "rows_not_30"
+    if list(missing_cols or []):
+        return "required_scored_cols_missing"
+    return "missing_locked_scored_final30"
+
+
+def _empty_final30_load_result(*, final30_paths: dict[str, Path], missing_scored_cols: list[str], reason: str) -> dict[str, Any]:
+    return {
+        "df": pd.DataFrame(),
+        "source_name": "none",
+        "as_of": None,
+        "columns": [],
+        "is_scored": False,
+        "used_fallback": False,
+        "file_mirror_present": False,
+        "usable": False,
+        "missing_scored_cols": list(missing_scored_cols),
+        "flow_optional_missing": [],
+        "path_map": {key: str(value) for key, value in final30_paths.items()},
+        "source_compare": {},
+        "abort_reason": str(reason),
+    }
+
+
+def _log_final30_fallback_blocked() -> None:
+    logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=best_k_meta")
+    logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=candidate_pool")
+    logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=file_mirror")
+
+
+def load_locked_final30_from_db(
+    *,
+    engine,
+    env: str,
+    derived_as_of: str,
+    strategy_key: str = "pb1_watchlist_final_scored",
+) -> dict[str, Any]:
+    env_n = (env or "").strip().lower()
+    logger.info(
+        "[FINAL30][DB_LOCK][START] env=%s as_of=%s strategy=%s",
+        env_n,
+        derived_as_of,
+        strategy_key,
+    )
+    repo = WatchlistRepo(engine)
+    try:
+        repo.load_watchlist_scored(
+            env=env_n,
+            strategy=strategy_key,
+            as_of=datetime.strptime(str(derived_as_of), "%Y-%m-%d").date(),
+            allow_latest_fallback=False,
+            require_exact_rows=30,
+            require_scored=True,
+            fail_if_missing=True,
+        )
+    except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError) as exc:
+        logger.error(
+            "[FINAL30][DB_LOCK][FAIL] rows=%s missing_cols=%s reason=%s",
+            exc.rows,
+            exc.missing_cols,
+            exc.reason,
+        )
+        _log_final30_fallback_blocked()
+        raise RuntimeError(exc.reason) from exc
+
+    result = load_trade_final30_scored(engine=engine, env=env_n, as_of=str(derived_as_of))
+    df = result.get("df") if isinstance(result.get("df"), pd.DataFrame) else pd.DataFrame()
+    rows = len(df)
+    missing_cols = list(result.get("missing_scored_cols") or [])
+    if result.get("source_name") != "db_pb1_watchlist_final_scored" or not bool(result.get("usable")) or rows != 30:
+        reason = _classify_final30_abort_reason(
+            rows=rows,
+            missing_cols=missing_cols,
+            errors=[str(result.get("abort_reason") or "")],
+        )
+        logger.error(
+            "[FINAL30][DB_LOCK][FAIL] rows=%s missing_cols=%s reason=%s",
+            rows,
+            missing_cols,
+            reason,
+        )
+        _log_final30_fallback_blocked()
+        raise RuntimeError(reason)
+
+    codes = [str(code).zfill(6) for code in df.get("code", pd.Series(dtype=str)).tolist() if str(code).strip()]
+    result["locked"] = True
+    result["rows"] = rows
+    result["codes"] = codes
+    logger.info(
+        "[FINAL30][DB_LOCK][OK] rows=%s codes=%s source=%s",
+        rows,
+        len(codes),
+        result.get("source_name"),
+    )
+    return result
+
+
+def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: pd.DataFrame | None) -> None:
+    rows = len(final30_df) if isinstance(final30_df, pd.DataFrame) else 0
+    source = str(run_ctx.get("final30_source") or "none")
+    locked = bool(run_ctx.get("final30_locked"))
+    if source != "db_pb1_watchlist_final_scored" or not locked or rows != 30:
+        reason = "missing_locked_scored_final30"
+        if rows not in (0, 30):
+            reason = "rows_not_30"
+        logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
+        raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
+    logger.info("[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s", rows)
+
+
 def load_trade_final30_scored(
     *,
     engine,
@@ -523,11 +642,17 @@ def load_trade_final30_scored(
         int(db_distribution.get("total") or 0),
         dict(db_distribution.get("counts") or {}),
     )
-    logger.info("[FINAL30][SOURCE_SUMMARY] source=db rows=%s", len(rows))
-    logger.info("[FINAL30][SOURCE_COLS] source=db cols=%s", contract_columns)
-    logger.info("[FINAL30][SOURCE_SAMPLE_KEYS] source=db first_row_keys=%s", first_row_keys)
-    logger.info("[FINAL30][REQUIRED_CHECK] source=db missing=%s", missing_critical_fields)
-    logger.info("[FINAL30][FLOW_OPTIONAL_CHECK] source=db missing=%s", flow_optional_missing)
+    logger.info(
+        "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s as_of=%s locked=%s usable=%s",
+        len(rows),
+        as_of_s,
+        int(contract_ok),
+        int(contract_ok),
+    )
+    logger.info("[FINAL30][SOURCE_COLS] source=db_pb1_watchlist_final_scored cols=%s", contract_columns)
+    logger.info("[FINAL30][SOURCE_SAMPLE_KEYS] source=db_pb1_watchlist_final_scored first_row_keys=%s", first_row_keys)
+    logger.info("[FINAL30][REQUIRED_CHECK] source=db_pb1_watchlist_final_scored missing=%s", missing_critical_fields)
+    logger.info("[FINAL30][FLOW_OPTIONAL_CHECK] source=db_pb1_watchlist_final_scored missing=%s", flow_optional_missing)
     logger.info(
         "[FINAL30][SOURCE_COMPARE] db_missing=%s runtime_missing=%s ledger_missing=%s signals_missing=%s",
         source_compare.get("db", []),
@@ -635,37 +760,49 @@ def load_trade_final30_scored(
             if not trade_recheck_ok:
                 raise RuntimeError(format_final30_abort_message(trade_validate))
             logger.info(
-                "[FINAL30][INPUT_CHECK] source=db usable=%s required_scored_cols_missing=%s",
+                "[FINAL30][INPUT_CHECK] source=db_pb1_watchlist_final_scored usable=%s required_scored_cols_missing=%s",
                 int(trade_recheck_ok),
                 missing_critical_fields,
             )
-            logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db rows=%s usable=%s", len(df), int(trade_recheck_ok))
+            logger.info(
+                "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s as_of=%s locked=1 usable=%s",
+                len(df),
+                as_of_s,
+                int(trade_recheck_ok),
+            )
+            logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db_pb1_watchlist_final_scored rows=%s usable=%s", len(df), int(trade_recheck_ok))
             logger.info("[TRADE][FINAL30][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
             logger.info("[TRADE][READY][OK] source=%s as_of=%s rows=%s", "db_pb1_watchlist_final_scored", as_of_date.isoformat(), len(df))
         except RuntimeError as exc:
-            logger.info("[FINAL30][INPUT_CHECK] source=db usable=0 required_scored_cols_missing=%s", missing_critical_fields)
-            logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db rows=%s usable=0", len(working_rows))
+            failure_reason = _classify_final30_abort_reason(
+                rows=len(working_rows),
+                missing_cols=missing_critical_fields,
+                errors=list(trade_validate.get("errors") or []),
+            )
+            logger.info("[FINAL30][INPUT_CHECK] source=db_pb1_watchlist_final_scored usable=0 required_scored_cols_missing=%s", missing_critical_fields)
+            logger.info(
+                "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s as_of=%s locked=0 usable=0",
+                len(working_rows),
+                as_of_s,
+            )
+            logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db_pb1_watchlist_final_scored rows=%s usable=0", len(working_rows))
             logger.info("[TRADE][FINAL30][REJECT_REASON] missing_scored_cols=%s", missing_critical_fields)
             logger.info("[TRADE][FINAL30][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
             logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=db_contract_invalid")
-            logger.error("[TRADE][FINAL30][FAIL] reason=missing_or_empty")
+            logger.error("[FINAL30][ABORT] reason=%s", failure_reason)
+            logger.error("[TRADE][FINAL30][FAIL] reason=%s", failure_reason)
             logger.error("[TRADE][READY][FAIL] reason=final30_contract_invalid")
             logger.error("[TRADE][ABORT][FINAL30_INVALID][DETAIL] %s", format_final30_abort_message(trade_validate))
             logger.error("%s", exc)
-            result = {
-                "df": pd.DataFrame(),
-                "source_name": "none",
-                "as_of": as_of_s,
-                "columns": [],
-                "is_scored": False,
-                "used_fallback": False,
-                "file_mirror_present": any(file_mirror_stats.values()),
-                "usable": False,
-                "missing_scored_cols": list(missing_critical_fields),
-                "flow_optional_missing": list(flow_optional_missing),
-                "path_map": {key: str(value) for key, value in final30_paths.items()},
-                "source_compare": source_compare,
-            }
+            result = _empty_final30_load_result(
+                final30_paths=final30_paths,
+                missing_scored_cols=list(missing_critical_fields),
+                reason=failure_reason,
+            )
+            result["as_of"] = as_of_s
+            result["file_mirror_present"] = any(file_mirror_stats.values())
+            result["flow_optional_missing"] = list(flow_optional_missing)
+            result["source_compare"] = source_compare
             _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
             return result
         logger.info(
@@ -696,10 +833,21 @@ def load_trade_final30_scored(
         _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": df.copy(deep=True)}
         return result
 
-    logger.info("[FINAL30][INPUT_CHECK] source=db usable=0 required_scored_cols_missing=%s", missing_critical_fields)
-    logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db rows=%s usable=0", len(rows))
+    failure_reason = _classify_final30_abort_reason(
+        rows=len(rows),
+        missing_cols=missing_critical_fields,
+        errors=list(scored_contract.get("errors") or []),
+    )
+    logger.info("[FINAL30][INPUT_CHECK] source=db_pb1_watchlist_final_scored usable=0 required_scored_cols_missing=%s", missing_critical_fields)
+    logger.info(
+        "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s as_of=%s locked=0 usable=0",
+        len(rows),
+        as_of_s,
+    )
+    logger.info("[TRADE][FINAL30][LOAD_RESULT] source=db_pb1_watchlist_final_scored rows=%s usable=0", len(rows))
     logger.info("[TRADE][FINAL30][REJECT_REASON] missing_scored_cols=%s", missing_critical_fields)
     logger.info("[TRADE][FINAL30][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
+    logger.error("[FINAL30][ABORT] reason=%s", failure_reason)
     logger.error(
         "[TRADE][ABORT][FINAL30_INVALID][DETAIL] source=db rows=%s invalid_rows=%s error_codes=%s details=%s",
         scored_contract.get("rows"),
@@ -719,20 +867,15 @@ def load_trade_final30_scored(
         missing_critical_fields,
         scored_contract.get("errors"),
     )
-    result = {
-        "df": pd.DataFrame(),
-        "source_name": "none",
-        "as_of": as_of_s,
-        "columns": [],
-        "is_scored": False,
-        "used_fallback": False,
-        "file_mirror_present": any(file_mirror_stats.values()),
-        "usable": False,
-        "missing_scored_cols": list(missing_critical_fields),
-        "flow_optional_missing": list(flow_optional_missing),
-        "path_map": {key: str(value) for key, value in final30_paths.items()},
-        "source_compare": source_compare,
-    }
+    result = _empty_final30_load_result(
+        final30_paths=final30_paths,
+        missing_scored_cols=list(missing_critical_fields),
+        reason=failure_reason,
+    )
+    result["as_of"] = as_of_s
+    result["file_mirror_present"] = any(file_mirror_stats.values())
+    result["flow_optional_missing"] = list(flow_optional_missing)
+    result["source_compare"] = source_compare
     _FINAL30_LOAD_CACHE[cache_key] = {**result, "df": pd.DataFrame()}
     return result
 
@@ -1457,7 +1600,7 @@ def _load_universe_context(
 ) -> UniverseContext:
     mode_input = (os.getenv("MODE") or "").strip().lower()
     if mode_input == "trade" or os.getenv("PB1_TRADE_WATCHLIST_ONLY", "0") == "1":
-        result = load_trade_final30_scored(engine=engine, env=env, as_of=as_of)
+        result = load_locked_final30_from_db(engine=engine, env=env, derived_as_of=as_of)
         df = result.get("df")
         if df is None or df.empty:
             raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
@@ -1508,6 +1651,7 @@ def _load_universe_context(
             meta={
                 "source": result.get("source_name"),
                 "as_of": str(result.get("as_of") or as_of),
+                "locked": True,
                 "is_scored": bool(result.get("is_scored")),
                 "usable": bool(result.get("usable")),
                 "columns": list(result.get("columns") or []),
@@ -2163,6 +2307,9 @@ def run_once(
         "phase_name": "entry",
         "final30_source": None,
         "final30_locked": False,
+        "final30_rows": 0,
+        "final30_as_of": None,
+        "final30_codes": [],
     }
     os.environ["AS_OF_OVERRIDE"] = as_of
     
@@ -2173,7 +2320,6 @@ def run_once(
         asof_reason,
     )
     logger.info("[ASOF][LOCK] trade_date=%s derived_as_of=%s immutable=1 source=db_contract", trade_date.isoformat(), as_of)
-    logger.info("[ASOF][LOCK][VERIFY] trade_date=%s derived_as_of=%s run_ctx=%s", trade_date.isoformat(), as_of, run_ctx)
     
     runtime_root_dir = runtime_dir or runtime_root()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"
@@ -2850,7 +2996,21 @@ def run_once(
                     final30_source_name = str((universe_ctx.meta or {}).get("source") or "db_pb1_watchlist_final_scored")
                     run_ctx["final30_source"] = final30_source_name
                     run_ctx["final30_locked"] = True
+                    run_ctx["final30_rows"] = int(len(precomputed_final30_df))
+                    run_ctx["final30_as_of"] = str(run_ctx.get("derived_as_of") or as_of)
+                    run_ctx["final30_codes"] = [
+                        str(code).zfill(6)
+                        for code in precomputed_final30_df.get("code", pd.Series(dtype=str)).tolist()
+                        if str(code).strip()
+                    ]
                     trade_use_precomputed_features = True
+                    logger.info(
+                        "[ASOF][LOCK][VERIFY] trade_date=%s derived_as_of=%s final30_source='%s' final30_locked=%s",
+                        trade_date.isoformat(),
+                        str(run_ctx.get("derived_as_of") or as_of),
+                        final30_source_name,
+                        bool(run_ctx.get("final30_locked")),
+                    )
                     logger.info(
                         "[TRADE][FINAL30][DB_LOCK] env=%s as_of=%s rows=%s scored=%s immutable=1",
                         env_effective,
@@ -3202,6 +3362,7 @@ def run_once(
             window_name_for_engine,
         )
 
+        _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
             orders_repo=orders_repo,

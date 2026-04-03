@@ -47,10 +47,19 @@ logger = logging.getLogger(__name__)
 
 
 _LAST_CANDIDATE_POOL_BUILD_REPORT: Dict[str, Any] = {}
+CANDIDATE_POOL_SCAN_ONLY_META: Dict[str, Any] = {
+    "is_final30": False,
+    "is_scored_final_input": False,
+    "scan_universe_only": True,
+}
 
 
 def get_last_candidate_pool_build_report() -> Dict[str, Any]:
     return dict(_LAST_CANDIDATE_POOL_BUILD_REPORT)
+
+
+def candidate_pool_scan_only_meta() -> Dict[str, Any]:
+    return dict(CANDIDATE_POOL_SCAN_ONLY_META)
 
 
 def resolve_env(cli_env: str | None) -> str:

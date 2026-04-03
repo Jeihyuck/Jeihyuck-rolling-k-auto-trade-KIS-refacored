@@ -24,6 +24,10 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  FINAL30_SOURCE_MODE: "db_only"
+  PB1_REQUIRE_SCORED_FINAL30: "1"
+  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
+  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
   KIS_HTTP_ENABLED: "1"
   NO_TRADE: "0"
   FAIL_IF_POOL_MISSING: "1"
@@ -134,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "[TRADE_AM][PRECHECK][FINAL30][START]"
-          if python -c 'from datetime import date; from trader.db.engine import get_engine; from trader.db.repos import WatchlistRepo; repo=WatchlistRepo(get_engine()); rows,used=repo.load_watchlist(env="practice", strategy="pb1_watchlist_final_scored", as_of=date.today(), allow_latest_fallback=True, ttl_days=7); import sys; print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(rows)} used_as_of={used}") if rows else sys.exit(1)'
+          if python -c 'from trader.db.engine import get_engine; from trader.db.repos import WatchlistRepo; from trader.time_utils import now_kst, resolve_trade_context; ctx=resolve_trade_context(now=now_kst(), env="practice"); repo=WatchlistRepo(get_engine()); rows,used=repo.load_watchlist_scored(env="practice", strategy="pb1_watchlist_final_scored", as_of=ctx["as_of"], allow_latest_fallback=False, require_exact_rows=30, require_scored=True, fail_if_missing=True); print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(rows)} used_as_of={used}")'
           then
             :
           else
@@ -146,6 +150,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          echo "[CONFIG][FINAL30_SOURCE_MODE] ${FINAL30_SOURCE_MODE}"
+          echo "[CONFIG][PB1_REQUIRE_SCORED_FINAL30] ${PB1_REQUIRE_SCORED_FINAL30}"
+          echo "[CONFIG][PB1_DISABLE_RAW_FINAL30_FALLBACK] ${PB1_DISABLE_RAW_FINAL30_FALLBACK}"
           echo "[TRADE_AM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
           python -m trader.trade_tick 2>&1 | tee artifacts/trade-am.log
 

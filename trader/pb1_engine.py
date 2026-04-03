@@ -954,8 +954,6 @@ class PB1Engine:
             source_default = str((universe_context.meta or {}).get("source") or "")
         self.final30_source = str(final30_source or source_default or "none")
         self.final30_locked = bool(final30_locked)
-        if self.final30_df is not None and not self.final30_df.empty:
-            self.final30_locked = True
         self.watchlist_final_df = watchlist_final_df
         self.precomputed_features_df = precomputed_features_df
         self.compute_only_full_run = bool(compute_only_full_run)
@@ -7727,7 +7725,7 @@ class PB1Engine:
         columns: list[str],
         missing_scored_cols: list[str],
     ) -> None:
-        diag_dir = Path("runtime") / "diagnostics" / str(self._today)
+        diag_dir = Path("runtime") / "diagnostics" / str(getattr(self, "_today", None) or as_of)
         diag_dir.mkdir(parents=True, exist_ok=True)
         path = diag_dir / "final30_input_reject.json"
         payload = {
@@ -7739,141 +7737,112 @@ class PB1Engine:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _classify_locked_final30_abort_reason(self, df: pd.DataFrame | None) -> tuple[str, list[str]]:
+        frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        rows = len(frame)
+        cols = [str(col) for col in frame.columns.tolist()]
+        missing_cols = self._scored_missing_cols(cols)
+        if str(getattr(self, "final30_source", "none") or "none") != "db_pb1_watchlist_final_scored":
+            return "missing_locked_scored_final30", missing_cols
+        if rows == 0:
+            return "missing_locked_scored_final30", missing_cols
+        if rows != 30:
+            return "rows_not_30", missing_cols
+        if missing_cols:
+            return "required_scored_cols_missing", missing_cols
+        return "missing_locked_scored_final30", missing_cols
+
+    def _abort_locked_final30(self, *, as_of: str, reason: str, rows: int, missing_cols: list[str]) -> None:
+        resolve_fail_reason = "scored_final30_missing" if reason == "missing_locked_scored_final30" else reason
+        logger.info(
+            "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s locked=0 usable=0",
+            rows,
+        )
+        logger.error("[FINAL30][ABORT] reason=scored_final30_not_available")
+        logger.error("[FINAL30][RESOLVE_FAIL] reason=%s", resolve_fail_reason)
+        logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=best_k_meta")
+        logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=candidate_pool")
+        logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=file_mirror")
+        logger.error("[PB1][ENTRY][ABORT] source=none require_scored=1")
+        logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
+        self._write_final30_input_reject_debug(
+            source="db_pb1_watchlist_final_scored",
+            as_of=as_of,
+            rows=rows,
+            columns=[str(col) for col in (self.final30_df.columns.tolist() if isinstance(self.final30_df, pd.DataFrame) else [])],
+            missing_scored_cols=missing_cols,
+        )
+        raise SystemExit(2)
+
     def _load_entry_final30_or_abort(self, as_of: str) -> list[str]:
         """
-        ✅ FIX B-ENTRY: final30 로드 (없으면 watchlist_final_locked로 대체)
-        
-        Returns:
-            codes list
-        Raises:
-            SystemExit(2) if both final30 and watchlist_final unavailable
+        Entry final input은 locked DB final30 scored rows만 허용한다.
         """
         require_scored = (os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1")
-        allow_missing_scored = (os.getenv("ALLOW_TRADE_WITH_MISSING_SCORED_COLUMNS", "0") == "1")
+        locked_as_of = str(getattr(self, "derived_as_of", None) or as_of)
         if os.getenv("PB1_SKIP_NEW_ENTRIES", "0") == "1":
             logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
             return []
 
-        if self.final30_locked:
-            locked_df = self.final30_df if self.final30_df is not None else pd.DataFrame()
-            usable_locked = bool(locked_df is not None and not locked_df.empty)
-            logger.info(
-                "[PB1][ENTRY][INPUT_CHECK] locked=%s source=%s as_of=%s usable=%s",
-                int(self.final30_locked),
-                self.final30_source,
-                self.derived_as_of,
-                int(usable_locked),
-            )
-            if not usable_locked:
-                logger.error(
-                    "[PB1][INVARIANT][VIOLATION] final30_locked=1 but final30_df is empty as_of=%s source=%s",
-                    self.derived_as_of,
-                    self.final30_source,
+        locked_df = self.final30_df if isinstance(self.final30_df, pd.DataFrame) else pd.DataFrame()
+        rows = len(locked_df)
+        reason, missing_cols = self._classify_locked_final30_abort_reason(locked_df)
+        usable_locked = bool(
+            self.final30_locked
+            and self.final30_source == "db_pb1_watchlist_final_scored"
+            and rows == 30
+            and not missing_cols
+        )
+        logger.info(
+            "[PB1][ENTRY][INPUT_CHECK] locked=%s source=%s as_of=%s usable=%s",
+            int(bool(self.final30_locked)),
+            self.final30_source,
+            locked_as_of,
+            int(usable_locked),
+        )
+        if not usable_locked:
+            if self._universe_context and self._universe_context.members:
+                logger.info(
+                    "[SCAN_UNIVERSE][LOCKED_FINAL30_REQUIRED] scan_source=%s rows=%s",
+                    str((self._universe_context.meta or {}).get("source") or "unknown"),
+                    len(self._universe_context.members or []),
                 )
-                raise RuntimeError("FINAL30_LOCK_MISSING")
+            self._abort_locked_final30(as_of=as_of, reason=reason, rows=rows, missing_cols=missing_cols)
+
+        logger.info(
+            "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s as_of=%s locked=1 usable=1",
+            rows,
+            locked_as_of,
+        )
+        try:
             validate_trade_ready(locked_df)
-            logger.info(
-                "[TRADE][READY][OK] source=%s as_of=%s rows=%s",
-                self.final30_source,
-                self.derived_as_of,
-                len(locked_df),
-            )
-            order_rows = [dict(x or {}) for x in locked_df.to_dict(orient="records")]
-            if "rank_final30" in locked_df.columns:
-                order_rows.sort(key=lambda x: (float(x.get("rank_final30") or 999999), str(x.get("code") or "")))
-            elif "score_final" in locked_df.columns:
-                order_rows.sort(key=lambda x: (-float(x.get("score_final") or 0.0), str(x.get("code") or "")))
-            else:
-                order_rows.sort(key=lambda x: str(x.get("code") or ""))
-            logger.info(
-                "[PB1][FINAL30][USE_LOCKED] source=%s as_of=%s rows=%s",
-                self.final30_source,
-                self.derived_as_of,
-                len(order_rows),
-            )
-            return [str(m.get("code") or "").zfill(6) for m in order_rows if m.get("code")]
+        except RuntimeError:
+            reason, missing_cols = self._classify_locked_final30_abort_reason(locked_df)
+            self._abort_locked_final30(as_of=as_of, reason=reason, rows=rows, missing_cols=missing_cols)
 
-        if self._universe_context and self._universe_context.members:
-            rows = [dict(x or {}) for x in (self._universe_context.members or [])]
-            source_meta = dict(self._universe_context.meta or {})
-            source = str(source_meta.get("source") or "universe_context")
-            source_label = "db" if source.startswith("db_") else source
-            cols = sorted({str(k) for r in rows for k in r.keys()})
-            missing_cols = self._scored_missing_cols(cols)
-            flow_optional_missing = _safe_flow_optional_missing(cols)
-            usable = (not missing_cols) or (not require_scored) or allow_missing_scored
-            logger.info("[FINAL30][SOURCE_SUMMARY] source=%s rows=%s", source_label, len(rows))
-            logger.info("[FINAL30][SOURCE_COLS] source=%s cols=%s", source_label, cols)
-            logger.info(
-                "[FINAL30][SOURCE_SAMPLE_KEYS] source=%s first_row_keys=%s",
-                source_label,
-                sorted(rows[0].keys()) if rows else [],
-            )
-            logger.info("[FINAL30][REQUIRED_CHECK] source=%s missing=%s", source_label, missing_cols)
-            logger.info("[FINAL30][FLOW_OPTIONAL_CHECK] source=%s missing=%s", source_label, flow_optional_missing)
-            if source_meta.get("path_map"):
-                logger.info(
-                    "[FINAL30][PATH_MAP] runtime=%s ledger=%s signals=%s db=%s",
-                    source_meta.get("path_map", {}).get("runtime"),
-                    source_meta.get("path_map", {}).get("ledger"),
-                    source_meta.get("path_map", {}).get("signals"),
-                    "pb1_watchlist_final_scored",
-                )
-            if source_meta.get("source_compare"):
-                source_compare = dict(source_meta.get("source_compare") or {})
-                logger.info(
-                    "[FINAL30][SOURCE_COMPARE] db_missing=%s runtime_missing=%s ledger_missing=%s signals_missing=%s",
-                    source_compare.get("db", []),
-                    source_compare.get("runtime", []),
-                    source_compare.get("ledger", []),
-                    source_compare.get("signals", []),
-                )
-            logger.info(
-                "[FINAL30][INPUT_CHECK] source=%s usable=%s required_scored_cols_missing=%s flow_optional_missing=%s",
-                source_label,
-                int(usable),
-                missing_cols,
-                flow_optional_missing,
-            )
-            if flow_optional_missing:
-                logger.warning("[ENTRY][FLOW_OPTIONAL_MISSING] missing=%s", flow_optional_missing)
-            if not usable:
-                logger.error(
-                    "[PB1][ENTRY][INPUT_REJECT] source=%s missing_scored_cols=%s require_scored=1",
-                    source_label,
-                    missing_cols,
-                )
-                self._write_final30_input_reject_debug(
-                    source=source_label,
-                    as_of=as_of,
-                    rows=len(rows),
-                    columns=cols,
-                    missing_scored_cols=missing_cols,
-                )
-                raise SystemExit(2)
+        if require_scored and self.final30_source != "db_pb1_watchlist_final_scored":
+            self._abort_locked_final30(as_of=as_of, reason="missing_locked_scored_final30", rows=rows, missing_cols=missing_cols)
 
-            order_rows = list(rows)
-            has_rank = all("rank_final30" in x for x in order_rows)
-            if has_rank:
-                order_rows.sort(key=lambda x: (float(x.get("rank_final30") or 999999), str(x.get("code") or "")))
-            elif any("score_final" in x for x in order_rows):
-                order_rows.sort(key=lambda x: (-float(x.get("score_final") or 0.0), str(x.get("code") or "")))
-            else:
-                order_rows.sort(key=lambda x: str(x.get("code") or ""))
-            return [str(m.get("code") or "").zfill(6) for m in order_rows if m.get("code")]
-
-        logger.error(
-            "[PB1][ENTRY][GUARD] final30_db_lock_missing -> abort as_of=%s env=%s source=%s",
-            as_of,
-            self.env,
-            getattr(self, "final30_source", "none"),
+        logger.info(
+            "[TRADE][READY][OK] source=%s as_of=%s rows=%s",
+            self.final30_source,
+            locked_as_of,
+            rows,
         )
-        logger.error(
-            "[PB1][ENTRY][GUARD] final30_missing -> abort as_of=%s env=%s (no watchlist_final fallback available)",
-            as_of,
-            self.env
+        order_rows = [dict(x or {}) for x in locked_df.to_dict(orient="records")]
+        if "rank_final30" in locked_df.columns:
+            order_rows.sort(key=lambda x: (float(x.get("rank_final30") or 999999), str(x.get("code") or "")))
+        elif "score_final" in locked_df.columns:
+            order_rows.sort(key=lambda x: (-float(x.get("score_final") or 0.0), str(x.get("code") or "")))
+        else:
+            order_rows.sort(key=lambda x: str(x.get("code") or ""))
+        logger.info(
+            "[PB1][FINAL30][USE_LOCKED] source=%s as_of=%s rows=%s",
+            self.final30_source,
+            locked_as_of,
+            len(order_rows),
         )
-        raise SystemExit(2)
+        return [str(m.get("code") or "").zfill(6) for m in order_rows if m.get("code")]
 
     def _resolve_scan_members_for_entry(self, universe_members: list[dict], watchlist_members: list[dict], watchlist_reason: str) -> tuple[list[dict], str]:
         """
@@ -7903,6 +7872,7 @@ class PB1Engine:
         3. 최종 fallback → 195 유니버스 사용 (EMERGENCY)
         """
         from trader.candidate_pool_builder import (
+            candidate_pool_scan_only_meta,
             load_candidate_pool,
             build_and_save_candidate_pool,
             CandidatePoolBuilder,
@@ -8006,17 +7976,14 @@ class PB1Engine:
             ]
             return members, "watchlist_final"
 
-        # 전체 유니버스 로드 (비-trade 모드 후보군 생성에 필요)
         full_members = self._load_universe()
-        
-        # ✅ STEP 1: 후보군 로드 (TTL 검사 포함)
+
         pool_codes, pool_as_of, pool_reason = load_candidate_pool(
             engine=self.engine,
             env=pool_env,
             today=today,
         )
-        
-        # ✅ STEP 2: 후보군이 유효하면 사용
+
         if pool_reason == "hit" and pool_codes:
             age_info = f" (latest={pool_as_of})" if pool_as_of != today else " (today)"
             logger.info(
@@ -8031,27 +7998,24 @@ class PB1Engine:
                 {
                     "code": code,
                     "name": self._code_name_map.get(code, ""),
+                    **candidate_pool_scan_only_meta(),
                 }
                 for code in pool_codes
             ]
             return members, f"candidate_pool_hit"
-        
-        # ✅ STEP 3: 후보군 없음/만료/작음 → 가벼운 스캔으로 생성
+
         logger.warning(
             "[CANDIDATE_POOL][MISS] reason=%s -> rebuild_light_scan",
             pool_reason
         )
-        
+
         try:
-            # 후보군 생성 (가벼운 스캔)
             force_rebuild = CANDIDATE_POOL_FORCE_REBUILD
-            
-            # ✅ 호환 래퍼: days 파라미터를 count로 변환
+
             def _ohlcv_wrapper(code: str, days: int = 100):
                 df, meta = self._fetch_daily(code, count=days)
                 return df
-            
-            # ✅ FIX: 후보군 빌드 시에도 pool_env 사용
+
             pool_codes = build_and_save_candidate_pool(
                 engine=self.engine,
                 env=pool_env,
@@ -8060,7 +8024,7 @@ class PB1Engine:
                 ohlcv_provider=_ohlcv_wrapper,
                 force_rebuild=force_rebuild,
             )
-            
+
             if pool_codes and len(pool_codes) >= CANDIDATE_POOL_MIN_SIZE:
                 logger.info(
                     "[CANDIDATE_POOL][BUILD][SUCCESS] generated=%s saved to DB",
@@ -8070,16 +8034,16 @@ class PB1Engine:
                     {
                         "code": code,
                         "name": self._code_name_map.get(code, ""),
+                        **candidate_pool_scan_only_meta(),
                     }
                     for code in pool_codes
                 ]
                 return members, f"candidate_pool_autobuilt"
-            else:
-                logger.warning(
-                    "[CANDIDATE_POOL][BUILD][TOO_SMALL] generated=%s min=%s -> fallback to universe",
-                    len(pool_codes) if pool_codes else 0,
-                    CANDIDATE_POOL_MIN_SIZE
-                )
+            logger.warning(
+                "[CANDIDATE_POOL][BUILD][TOO_SMALL] generated=%s min=%s -> fallback to universe",
+                len(pool_codes) if pool_codes else 0,
+                CANDIDATE_POOL_MIN_SIZE
+            )
         except Exception as exc:
             logger.error(
                 "[CANDIDATE_POOL][BUILD][FAIL] err=%s -> fallback to universe",
@@ -8115,6 +8079,7 @@ class PB1Engine:
                     {
                         "code": code,
                         "name": self._code_name_map.get(code, ""),
+                        **candidate_pool_scan_only_meta(),
                     }
                     for code in emergency_codes
                 ]

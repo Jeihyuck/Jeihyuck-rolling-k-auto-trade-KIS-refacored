@@ -75,6 +75,9 @@ __all__ = [
     "OPTIONAL_FLOW_COLS",
     "FINAL30_SCORED_DB_CONTRACT_FIELDS",
     "FINAL30_SCORED_REQUIRED_ROWS",
+    "ScoredWatchlistError",
+    "ScoredWatchlistNotFoundError",
+    "ScoredWatchlistInvalidError",
     "summarize_final30_scored_contract",
     "verify_final30_scored_contract",
 ]
@@ -162,6 +165,35 @@ ENTRY_META_SCALAR_KEYS = (
     "entry_decision_family",
     "entry_rule_version",
 )
+
+
+class ScoredWatchlistError(RuntimeError):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        expected_strategy: str,
+        actual_strategy: str,
+        rows: int,
+        missing_cols: Iterable[str] | None = None,
+    ) -> None:
+        self.reason = str(reason)
+        self.expected_strategy = str(expected_strategy)
+        self.actual_strategy = str(actual_strategy)
+        self.rows = int(rows)
+        self.missing_cols = [str(col) for col in (missing_cols or [])]
+        super().__init__(
+            f"{self.reason}: expected_strategy={self.expected_strategy} actual_strategy={self.actual_strategy} "
+            f"rows={self.rows} missing_cols={self.missing_cols}"
+        )
+
+
+class ScoredWatchlistNotFoundError(ScoredWatchlistError):
+    pass
+
+
+class ScoredWatchlistInvalidError(ScoredWatchlistError):
+    pass
 
 
 def _merge_json_dict(base: Any, incoming: Any) -> dict[str, Any]:
@@ -3713,11 +3745,31 @@ class WatchlistRepo:
         allow_latest_fallback: bool = True,
         ttl_days: int = 7,
         max_back_days: int = 3,
+        require_exact_rows: int | None = None,
+        require_scored: bool = False,
+        fail_if_missing: bool = False,
     ) -> tuple[List[Dict[str, Any]], date | None]:
         as_of_date = to_date(as_of)
         env_n = _norm_env(env)
         strategy_n = _norm_strategy(strategy)
         effective_max_back_days = int(max_back_days) if allow_latest_fallback else 0
+        strict_mode = bool(require_scored or fail_if_missing or require_exact_rows is not None)
+        expected_strategy = "pb1_watchlist_final_scored"
+
+        if strict_mode and require_scored and strategy_n != expected_strategy:
+            logger.error(
+                "[WATCHLIST][LOAD_SCORED][STRICT_FAIL] expected_strategy=%s actual_strategy=%s rows=0 has_required_cols=0 missing_cols=%s exact_rows_ok=0 required_scored_ok=0 reason=strategy_mismatch",
+                expected_strategy,
+                strategy_n,
+                list(REQUIRED_FINAL30_SCORED_COLS),
+            )
+            raise ScoredWatchlistInvalidError(
+                "strategy_mismatch",
+                expected_strategy=expected_strategy,
+                actual_strategy=strategy_n,
+                rows=0,
+                missing_cols=REQUIRED_FINAL30_SCORED_COLS,
+            )
 
         codes = load_pb1_watchlist_codes(
             self.engine,
@@ -3732,6 +3784,19 @@ class WatchlistRepo:
             logger.info(
                 "[WATCHLIST][LOAD_SCORED][CHECK] has_score_final=0 has_tech_score=0 has_breakout_score=0 has_pullback_score=0 has_momentum_score=0 has_rs_percentile=0 has_vcp_score=0 has_entry_style_selected=0"
             )
+            if strict_mode and fail_if_missing:
+                logger.error(
+                    "[WATCHLIST][LOAD_SCORED][STRICT_FAIL] expected_strategy=%s actual_strategy=none rows=0 has_required_cols=0 missing_cols=%s exact_rows_ok=0 required_scored_ok=0 reason=scored_final30_missing",
+                    expected_strategy,
+                    list(REQUIRED_FINAL30_SCORED_COLS),
+                )
+                raise ScoredWatchlistNotFoundError(
+                    "scored_final30_missing",
+                    expected_strategy=expected_strategy,
+                    actual_strategy="none",
+                    rows=0,
+                    missing_cols=REQUIRED_FINAL30_SCORED_COLS,
+                )
             return [], None
 
         schema = self._schema
@@ -3783,6 +3848,19 @@ class WatchlistRepo:
             raw_rows = conn.execute(stmt).fetchall()
 
         result = [_normalize_scored_loaded_row(row) for row in raw_rows]
+        actual_strategy_values = sorted(
+            {
+                _norm_strategy(getattr(row, "strategy", None))
+                for row in raw_rows
+                if str(getattr(row, "strategy", "") or "").strip()
+            }
+        )
+        if not actual_strategy_values:
+            actual_strategy = strategy_n if result else "none"
+        elif len(actual_strategy_values) == 1:
+            actual_strategy = actual_strategy_values[0]
+        else:
+            actual_strategy = ",".join(actual_strategy_values)
         cols = sorted({k for item in result for k in item.keys()})
         has = {col: int(col in cols) for col in CRITICAL_SCORED_COLS}
         numeric_restore = {
@@ -3821,6 +3899,45 @@ class WatchlistRepo:
         logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY] rows=%s cols=%s", len(result), cols)
         missing_loaded_fields = [field for field in REQUIRED_FINAL30_SCORED_COLS if field not in cols]
         logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY_MISSING] missing=%s", missing_loaded_fields)
+        exact_rows_ok = True if require_exact_rows is None else len(result) == int(require_exact_rows)
+        required_scored_ok = len(missing_loaded_fields) == 0
+        strategy_ok = actual_strategy == expected_strategy
+        if strict_mode:
+            if strategy_ok and exact_rows_ok and required_scored_ok:
+                logger.info(
+                    "[WATCHLIST][LOAD_SCORED][STRICT] expected_strategy=%s actual_strategy=%s rows=%s exact_rows_ok=1 required_scored_ok=1 has_required_cols=1 missing_cols=[]",
+                    expected_strategy,
+                    actual_strategy,
+                    len(result),
+                )
+            else:
+                if not strategy_ok:
+                    reason = "strategy_mismatch"
+                elif len(result) == 0:
+                    reason = "scored_final30_missing"
+                elif not exact_rows_ok:
+                    reason = "rows_not_30"
+                else:
+                    reason = "required_scored_cols_missing"
+                logger.error(
+                    "[WATCHLIST][LOAD_SCORED][STRICT_FAIL] expected_strategy=%s actual_strategy=%s rows=%s has_required_cols=%s missing_cols=%s exact_rows_ok=%s required_scored_ok=%s reason=%s",
+                    expected_strategy,
+                    actual_strategy,
+                    len(result),
+                    int(required_scored_ok),
+                    missing_loaded_fields,
+                    int(exact_rows_ok),
+                    int(required_scored_ok),
+                    reason,
+                )
+                error_cls = ScoredWatchlistNotFoundError if reason == "scored_final30_missing" else ScoredWatchlistInvalidError
+                raise error_cls(
+                    reason,
+                    expected_strategy=expected_strategy,
+                    actual_strategy=actual_strategy,
+                    rows=len(result),
+                    missing_cols=missing_loaded_fields,
+                )
         if result:
             _log_scored_sample("[WATCHLIST][LOAD_SCORED][POST_DB_SAMPLE]", result)
             sample_keys = sorted(result[0].keys())
@@ -3864,6 +3981,9 @@ def load_watchlist_scored(
     allow_latest_fallback: bool = True,
     ttl_days: int = 7,
     max_back_days: int = 3,
+    require_exact_rows: int | None = None,
+    require_scored: bool = False,
+    fail_if_missing: bool = False,
 ) -> tuple[List[Dict[str, Any]], date | None]:
     repo = WatchlistRepo(engine)
     return repo.load_watchlist_scored(
@@ -3873,6 +3993,9 @@ def load_watchlist_scored(
         allow_latest_fallback=allow_latest_fallback,
         ttl_days=ttl_days,
         max_back_days=max_back_days,
+        require_exact_rows=require_exact_rows,
+        require_scored=require_scored,
+        fail_if_missing=fail_if_missing,
     )
 
 

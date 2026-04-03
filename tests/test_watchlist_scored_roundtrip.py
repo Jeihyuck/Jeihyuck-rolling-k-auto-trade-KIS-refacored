@@ -7,7 +7,14 @@ import pytest
 import sqlalchemy as sa
 
 from trader import pb1_runner, prep_runner
-from trader.db.repos import CRITICAL_SCORED_COLS, WatchlistRepo, save_watchlist, verify_final30_scored_contract
+from trader.db.repos import (
+    CRITICAL_SCORED_COLS,
+    ScoredWatchlistInvalidError,
+    ScoredWatchlistNotFoundError,
+    WatchlistRepo,
+    save_watchlist,
+    verify_final30_scored_contract,
+)
 from trader.db.schema import schema_for_engine
 
 
@@ -377,3 +384,76 @@ def test_trade_loader_uses_db_scored_without_reject(tmp_path, monkeypatch, caplo
     assert result["source_name"] == "db_pb1_watchlist_final_scored"
     assert result["is_scored"] is True
     assert "[TRADE][FINAL30][LOAD_REJECT]" not in caplog.text
+
+
+def test_load_watchlist_scored_strict_missing_rows_raises() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+
+    with pytest.raises(ScoredWatchlistNotFoundError, match="scored_final30_missing"):
+        repo.load_watchlist_scored(
+            env="practice",
+            strategy="pb1_watchlist_final_scored",
+            as_of=date(2026, 3, 11),
+            allow_latest_fallback=False,
+            require_exact_rows=30,
+            require_scored=True,
+            fail_if_missing=True,
+        )
+
+
+def test_load_watchlist_scored_strict_strategy_mismatch_raises() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    repo = WatchlistRepo(engine)
+
+    with pytest.raises(ScoredWatchlistInvalidError, match="strategy_mismatch"):
+        repo.load_watchlist_scored(
+            env="practice",
+            strategy="best_k_meta",
+            as_of=date(2026, 3, 11),
+            allow_latest_fallback=False,
+            require_exact_rows=30,
+            require_scored=True,
+            fail_if_missing=True,
+        )
+
+
+def test_load_watchlist_scored_strict_missing_cols_raises() -> None:
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+
+    as_of = date(2026, 3, 11)
+    broken_rows = [
+        {
+            "env": "practice",
+            "strategy": "pb1_watchlist_final_scored",
+            "as_of": as_of,
+            "code": f"{7000 + idx:06d}",
+            "rank": idx,
+            "score": float(idx),
+            "meta": {"code": f"{7000 + idx:06d}", "ma20": 100.0 + idx},
+        }
+        for idx in range(1, 31)
+    ]
+    with engine.begin() as conn:
+        conn.execute(schema.pb1_watchlist.insert(), broken_rows)
+
+    repo = WatchlistRepo(engine)
+
+    with pytest.raises(ScoredWatchlistInvalidError, match="required_scored_cols_missing"):
+        repo.load_watchlist_scored(
+            env="practice",
+            strategy="pb1_watchlist_final_scored",
+            as_of=as_of,
+            allow_latest_fallback=False,
+            require_exact_rows=30,
+            require_scored=True,
+            fail_if_missing=True,
+        )

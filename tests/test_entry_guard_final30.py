@@ -4,7 +4,7 @@ import pytest
 import pandas as pd
 
 import trader.pb1_engine as pb1_engine
-from trader.pb1_engine import PB1Engine
+from trader.pb1_engine import PB1Engine, UniverseContext
 
 
 def test_entry_guard_raises_system_exit_2_when_final30_missing(monkeypatch):
@@ -16,6 +16,27 @@ def test_entry_guard_raises_system_exit_2_when_final30_missing(monkeypatch):
     engine._universe_context = None
 
     monkeypatch.setattr(pb1_engine, "load_final30", lambda env, as_of: None)
+
+    with pytest.raises(SystemExit) as exc:
+        PB1Engine._load_entry_final30_or_abort(engine, "2026-02-20")
+
+    assert exc.value.code == 2
+
+
+def test_entry_guard_blocks_candidate_pool_members_as_final30_substitute() -> None:
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.env = "practice"
+    engine.derived_as_of = "2026-02-20"
+    engine.final30_locked = False
+    engine.final30_df = pd.DataFrame()
+    engine.final30_source = "candidate_pool_hit"
+    engine._today = "2026-02-20"
+    engine._universe_context = UniverseContext(
+        as_of_date="2026-02-20",
+        members=[{"code": f"{1000 + idx:06d}", "is_final30": False, "is_scored_final_input": False} for idx in range(30)],
+        selected_path=None,
+        meta={"source": "candidate_pool_hit"},
+    )
 
     with pytest.raises(SystemExit) as exc:
         PB1Engine._load_entry_final30_or_abort(engine, "2026-02-20")
