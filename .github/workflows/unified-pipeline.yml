@@ -87,7 +87,6 @@ env:
 defaults:
   run:
     shell: bash
-    working-directory: repo
 
 jobs:
   resolve:
@@ -107,6 +106,8 @@ jobs:
     steps:
       - name: Resolve manual route
         id: resolve
+        shell: bash
+        working-directory: .
         env:
           MODE_INPUT: ${{ inputs.mode }}
           FORCE_RUN_INPUT: ${{ inputs.FORCE_RUN || '0' }}
@@ -175,6 +176,10 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: repo
 
     env:
       TZ: Asia/Seoul
@@ -218,6 +223,17 @@ jobs:
         with:
           path: repo
           fetch-depth: 1
+
+      - name: Verify repo checkout path
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          pwd
+          ls -la
+          test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
+          test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
 
       - name: Set up Python
         uses: actions/setup-python@v5
