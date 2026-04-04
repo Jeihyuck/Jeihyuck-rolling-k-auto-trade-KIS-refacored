@@ -125,12 +125,32 @@ def is_data_endpoint(endpoint: str) -> bool:
     )
 
 
-def kis_http_allowed(endpoint: str, strategy_mode: str, allow_data_http_in_diag: bool) -> bool:
+def _resolve_kis_http_caller_route(default: str = "live") -> str:
+    raw = (os.getenv("KIS_HTTP_CALLER_ROUTE") or "").strip().lower()
+    if raw:
+        return raw
+    mode = (os.getenv("MODE") or "").strip().lower()
+    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+    if mode == "prep":
+        return "prep"
+    if strategy_mode == "DIAG" and (
+        os.getenv("PB1_DIAG_FULL_EXEC", "0").strip() == "1"
+        or os.getenv("FORCE_RUN", "0").strip() == "1"
+        or os.getenv("WATCHLIST_MODE", "0").strip() == "1"
+    ):
+        return "manual_test"
+    return default
+
+
+def kis_http_allowed(endpoint: str, strategy_mode: str, allow_data_http_in_diag: bool, caller_route: str | None = None) -> bool:
     normalized_mode = str(strategy_mode or "").strip().upper()
+    route = (caller_route or _resolve_kis_http_caller_route(default="live")).strip().lower() or "live"
     if normalized_mode == "DIAG":
         if is_order_endpoint(endpoint):
             return False
         if is_data_endpoint(endpoint):
+            if route == "smoke":
+                return False
             return bool(allow_data_http_in_diag)
     return True
 
@@ -902,7 +922,17 @@ class KisAPI:
         """
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
+        allow_data_http_in_diag_raw = os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip()
         allow_data_http_in_diag = kis_data_http_allowed_in_diag()
+        caller_route = _resolve_kis_http_caller_route(default="live")
+        logger.info(
+            "[KIS][HTTP_POLICY][ENV] strategy_mode=%s allow_data_http_in_diag_raw=%s parsed=%s caller=%s endpoint=%s",
+            strategy_mode,
+            allow_data_http_in_diag_raw or "0",
+            int(allow_data_http_in_diag),
+            caller_route,
+            _endpoint_name(url),
+        )
         
         # ✅ MINERVINI_ONLY: FORCE_HTTP 없으면 전체 차단
         from trader.config import MINERVINI_ONLY
@@ -918,7 +948,7 @@ class KisAPI:
                     return {"_kis_disabled": True, "rt_cd": "0", "msg1": "KIS_HTTP_DISABLED"}
 
             return _DiagDummyResponse()
-        if not force_http and not kis_http_allowed(url, strategy_mode, allow_data_http_in_diag):
+        if not force_http and not kis_http_allowed(url, strategy_mode, allow_data_http_in_diag, caller_route):
             if is_order_endpoint(url):
                 raise KISBlockedError(f"KIS API order endpoint blocked in DIAG mode: {method} {url}")
             if kis_explicit_offline_mode():
@@ -1145,26 +1175,37 @@ class KisAPI:
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
+        allow_data_http_in_diag_raw = os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip()
         allow_data_http_in_diag = kis_data_http_allowed_in_diag()
-        http_allowed = kis_http_allowed(url, strategy_mode, allow_data_http_in_diag)
+        caller_route = _resolve_kis_http_caller_route(default="live")
+        logger.info(
+            "[KIS][TOKEN_POLICY][ENV] STRATEGY_MODE=%s ALLOW_KIS_DATA_HTTP_IN_DIAG_RAW=%s parsed=%s caller=%s",
+            strategy_mode,
+            allow_data_http_in_diag_raw or "0",
+            int(allow_data_http_in_diag),
+            caller_route,
+        )
+        http_allowed = kis_http_allowed(url, strategy_mode, allow_data_http_in_diag, caller_route)
         if not http_allowed:
             explicit_offline = kis_explicit_offline_mode()
             logger.info(
-                "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=%s explicit_offline=%s",
+                "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=%s explicit_offline=%s caller=%s",
                 strategy_mode,
                 int(allow_data_http_in_diag),
                 int(http_allowed),
                 "dummy_token" if explicit_offline else "blocked",
                 int(explicit_offline),
+                caller_route,
             )
             if explicit_offline:
                 return "DIAG_DUMMY_TOKEN", 21600
             raise KISBlockedError("token endpoint blocked by HTTP policy")
         logger.info(
-            "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=real_http",
+            "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=real_http caller=%s",
             strategy_mode,
             int(allow_data_http_in_diag),
             int(http_allowed),
+            caller_route,
         )
         headers = {"content-type": "application/json"}
         data = {"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}

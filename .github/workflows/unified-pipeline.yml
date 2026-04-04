@@ -14,6 +14,63 @@ on:
           - prep
           - trade
           - close
+      FORCE_RUN:
+        description: Force full trade path for manual dry-run validation
+        required: false
+        default: "0"
+        type: string
+      WATCHLIST_MODE:
+        description: Bypass universe and use WATCHLIST symbols directly
+        required: false
+        default: "0"
+        type: string
+      WATCHLIST:
+        description: Comma-separated watchlist for manual validation
+        required: false
+        default: 005930,000660,035420
+        type: string
+      FORCE_MARKET_WINDOW:
+        description: Override market window for manual validation
+        required: false
+        default: after
+        type: choice
+        options:
+          - preopen
+          - morning
+          - day
+          - close
+          - after
+      FORCE_PB1_PHASE:
+        description: Override PB1 phase for manual validation
+        required: false
+        default: entry
+        type: choice
+        options:
+          - entry
+          - exit
+          - manage
+          - prep
+          - verify
+      PB1_DIAG_FULL_EXEC:
+        description: Force DIAG manual route through full engine path
+        required: false
+        default: "0"
+        type: string
+      PB1_UNIVERSE_STRATEGY:
+        description: Trade universe strategy source
+        required: false
+        default: pb1_watchlist_final_scored
+        type: string
+      TRADE_REQUIRE_PREP_FINAL30_SCORED:
+        description: Require exact scored final30 lock before trade
+        required: false
+        default: "1"
+        type: string
+      ALLOW_KIS_DATA_HTTP_IN_DIAG:
+        description: Allow token, balance, and quote HTTP in DIAG manual route
+        required: false
+        default: "1"
+        type: string
 
 concurrency:
   group: pb1-practice-serial
@@ -33,7 +90,89 @@ defaults:
     working-directory: repo
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      run_mode: ${{ steps.resolve.outputs.run_mode }}
+      strategy_mode: ${{ steps.resolve.outputs.strategy_mode }}
+      allow_live_gate: ${{ steps.resolve.outputs.allow_live_gate }}
+      force_block_live: ${{ steps.resolve.outputs.force_block_live }}
+      dryrun: ${{ steps.resolve.outputs.dryrun }}
+      dry_run: ${{ steps.resolve.outputs.dry_run }}
+      disable_live_trading: ${{ steps.resolve.outputs.disable_live_trading }}
+      live_trading_enabled: ${{ steps.resolve.outputs.live_trading_enabled }}
+      kis_http_enabled: ${{ steps.resolve.outputs.kis_http_enabled }}
+      no_trade: ${{ steps.resolve.outputs.no_trade }}
+      allow_kis_data_http_in_diag: ${{ steps.resolve.outputs.allow_kis_data_http_in_diag }}
+    steps:
+      - name: Resolve manual route
+        id: resolve
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+          FORCE_RUN_INPUT: ${{ inputs.FORCE_RUN || '0' }}
+          WATCHLIST_MODE_INPUT: ${{ inputs.WATCHLIST_MODE || '0' }}
+          PB1_DIAG_FULL_EXEC_INPUT: ${{ inputs.PB1_DIAG_FULL_EXEC || '0' }}
+          ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT: ${{ inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
+        run: |
+          set -euo pipefail
+          run_mode="${MODE_INPUT}"
+          strategy_mode="AUTO"
+          allow_live_gate="1"
+          force_block_live="0"
+          dryrun="0"
+          dry_run="0"
+          disable_live_trading="0"
+          live_trading_enabled="1"
+          kis_http_enabled="1"
+          no_trade="0"
+          allow_kis_data_http_in_diag="${ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT}"
+
+          manual_trade_route=0
+          if [[ "${MODE_INPUT}" == "trade" && ( "${FORCE_RUN_INPUT}" == "1" || "${PB1_DIAG_FULL_EXEC_INPUT}" == "1" || "${WATCHLIST_MODE_INPUT}" == "1" ) ]]; then
+            manual_trade_route=1
+          fi
+
+          if [[ "${MODE_INPUT}" == "prep" ]]; then
+            strategy_mode="DIAG"
+            allow_live_gate="0"
+            force_block_live="1"
+            dryrun="1"
+            dry_run="1"
+            disable_live_trading="1"
+            live_trading_enabled="0"
+            kis_http_enabled="0"
+            no_trade="1"
+          elif [[ "${MODE_INPUT}" == "close" ]]; then
+            strategy_mode="AUTO"
+          elif [[ "${manual_trade_route}" == "1" ]]; then
+            strategy_mode="DIAG"
+            allow_live_gate="0"
+            force_block_live="1"
+            dryrun="1"
+            dry_run="1"
+            disable_live_trading="1"
+            live_trading_enabled="0"
+            kis_http_enabled="1"
+            no_trade="0"
+            allow_kis_data_http_in_diag="1"
+          fi
+
+          {
+            echo "run_mode=${run_mode}"
+            echo "strategy_mode=${strategy_mode}"
+            echo "allow_live_gate=${allow_live_gate}"
+            echo "force_block_live=${force_block_live}"
+            echo "dryrun=${dryrun}"
+            echo "dry_run=${dry_run}"
+            echo "disable_live_trading=${disable_live_trading}"
+            echo "live_trading_enabled=${live_trading_enabled}"
+            echo "kis_http_enabled=${kis_http_enabled}"
+            echo "no_trade=${no_trade}"
+            echo "allow_kis_data_http_in_diag=${allow_kis_data_http_in_diag}"
+          } >> "$GITHUB_OUTPUT"
+
   manual_debug:
+    needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -49,6 +188,29 @@ jobs:
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+      MODE: ${{ needs.resolve.outputs.run_mode }}
+      MANUAL_MODE: ${{ inputs.mode }}
+      STRATEGY_MODE: ${{ needs.resolve.outputs.strategy_mode }}
+      ALLOW_LIVE_GATE: ${{ needs.resolve.outputs.allow_live_gate }}
+      FORCE_BLOCK_LIVE: ${{ needs.resolve.outputs.force_block_live }}
+      DRYRUN: ${{ needs.resolve.outputs.dryrun }}
+      DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
+      DISABLE_LIVE_TRADING: ${{ needs.resolve.outputs.disable_live_trading }}
+      LIVE_TRADING_ENABLED: ${{ needs.resolve.outputs.live_trading_enabled }}
+      KIS_HTTP_ENABLED: ${{ needs.resolve.outputs.kis_http_enabled }}
+      NO_TRADE: ${{ needs.resolve.outputs.no_trade }}
+      FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_RUN || '0' }}
+      WATCHLIST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST_MODE || '0' }}
+      WATCHLIST: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST || '' }}
+      FORCE_MARKET_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_MARKET_WINDOW || '' }}
+      FORCE_PB1_PHASE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_PB1_PHASE || '' }}
+      PB1_DIAG_FULL_EXEC: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_DIAG_FULL_EXEC || '0' }}
+      PB1_UNIVERSE_STRATEGY: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_UNIVERSE_STRATEGY || 'pb1_watchlist_final_scored' }}
+      TRADE_REQUIRE_PREP_FINAL30_SCORED: ${{ github.event_name == 'workflow_dispatch' && inputs.TRADE_REQUIRE_PREP_FINAL30_SCORED || '1' }}
+      ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ needs.resolve.outputs.allow_kis_data_http_in_diag }}
 
     steps:
       - name: Checkout
@@ -84,27 +246,36 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
+      - name: Dump runtime env
+        run: |
+          set -euo pipefail
+          echo "MODE=${MODE:-}"
+          echo "STRATEGY_MODE=${STRATEGY_MODE:-}"
+          echo "DRYRUN=${DRYRUN:-}"
+          echo "DRY_RUN=${DRY_RUN:-}"
+          echo "FORCE_RUN=${FORCE_RUN:-}"
+          echo "WATCHLIST_MODE=${WATCHLIST_MODE:-}"
+          echo "WATCHLIST=${WATCHLIST:-}"
+          echo "FORCE_MARKET_WINDOW=${FORCE_MARKET_WINDOW:-}"
+          echo "FORCE_PB1_PHASE=${FORCE_PB1_PHASE:-}"
+          echo "PB1_DIAG_FULL_EXEC=${PB1_DIAG_FULL_EXEC:-}"
+          echo "PB1_UNIVERSE_STRATEGY=${PB1_UNIVERSE_STRATEGY:-}"
+          echo "TRADE_REQUIRE_PREP_FINAL30_SCORED=${TRADE_REQUIRE_PREP_FINAL30_SCORED:-}"
+          echo "ALLOW_KIS_DATA_HTTP_IN_DIAG=${ALLOW_KIS_DATA_HTTP_IN_DIAG:-}"
+
       - name: Run selected manual pipeline
-        env:
-          MANUAL_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           mkdir -p artifacts
           case "$MANUAL_MODE" in
             prep)
-              export KIS_HTTP_ENABLED=0
-              export NO_TRADE=1
               python -m trader.prep_runner 2>&1 | tee artifacts/unified-manual.log
               python scripts/verify_prep_log.py artifacts/unified-manual.log
               ;;
             trade)
-              export KIS_HTTP_ENABLED=1
-              export NO_TRADE=0
               python -m trader.trade_tick 2>&1 | tee artifacts/unified-manual.log
               ;;
             close)
-              export KIS_HTTP_ENABLED=1
-              export NO_TRADE=0
               export PB1_PHASE_DEFAULT=exit
               export PB1_ENTRY_ENABLED=0
               python -m trader.trade_tick 2>&1 | tee artifacts/unified-manual.log

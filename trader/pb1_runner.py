@@ -147,6 +147,19 @@ def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
         return []
 
 
+def _manual_test_route_reasons(*, mode: str) -> list[str]:
+    if (mode or "").strip().upper() != "DIAG":
+        return []
+    reasons: list[str] = []
+    if env_bool("PB1_DIAG_FULL_EXEC", default=False):
+        reasons.append("diag_full_exec")
+    if env_bool("FORCE_RUN", default=False):
+        reasons.append("force_run")
+    if env_bool("WATCHLIST_MODE", default=False):
+        reasons.append("watchlist_mode")
+    return reasons
+
+
 def _load_json_rows(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -1600,14 +1613,68 @@ def _load_universe_context(
 ) -> UniverseContext:
     mode_input = (os.getenv("MODE") or "").strip().lower()
     if mode_input == "trade" or os.getenv("PB1_TRADE_WATCHLIST_ONLY", "0") == "1":
+        requested_strategy = (strategy or "").strip() or os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+        if not os.getenv("PB1_UNIVERSE_STRATEGY"):
+            os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
+        trade_strategy = (os.getenv("PB1_UNIVERSE_STRATEGY") or requested_strategy or "pb1_watchlist_final_scored").strip()
+        logger.info(
+            "[TRADE][FINAL30][LOAD_REQUEST] env=%s as_of=%s strategy=%s mode=trade",
+            (env or "").strip().lower(),
+            as_of,
+            trade_strategy,
+        )
+        if trade_strategy != "pb1_watchlist_final_scored":
+            logger.error(
+                "[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s",
+                trade_strategy,
+            )
+            logger.error("[TRADE][ABORT] final30_scored_lock_required")
+            raise RuntimeError("final30_scored_lock_required")
         result = load_locked_final30_from_db(engine=engine, env=env, derived_as_of=as_of)
         df = result.get("df")
-        if df is None or df.empty:
-            raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
+        df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        rows = len(df)
+        result_source = str(result.get("source_name") or "none")
+        result_columns = [str(col) for col in df.columns.tolist()]
+        missing_scored = _missing_scored_cols(result_columns)
+        logger.info(
+            "[TRADE][FINAL30][LOAD_RESULT] source=%s rows=%s is_scored=%s cols=%s",
+            result_source,
+            rows,
+            int(bool(result.get("is_scored"))),
+            result_columns,
+        )
+        if result_source != "db_pb1_watchlist_final_scored":
+            logger.error(
+                "[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s",
+                result_source,
+            )
+            logger.error("[TRADE][ABORT] final30_scored_lock_required")
+            raise RuntimeError("final30_scored_lock_required")
+        if rows != 30:
+            logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=rows_not_30 rows=%s", rows)
+            logger.error("[TRADE][ABORT] final30_scored_lock_required")
+            raise RuntimeError("final30_scored_lock_required")
+        if missing_scored:
+            logger.error(
+                "[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s",
+                missing_scored,
+            )
+            logger.error("[TRADE][ABORT] final30_scored_lock_required")
+            raise RuntimeError("final30_scored_lock_required")
+        if df.empty:
+            logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30")
+            logger.error("[TRADE][ABORT] final30_scored_lock_required")
+            raise RuntimeError("final30_scored_lock_required")
 
         require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
         if require_scored and not bool(result.get("is_scored")):
-            raise RuntimeError("WATCHLIST_FINAL_SCORED_REQUIRED")
+            logger.error(
+                "[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s",
+                missing_scored,
+            )
+            logger.error("[TRADE][ABORT] final30_scored_lock_required")
+            raise RuntimeError("final30_scored_lock_required")
 
         if "rank_final30" in df.columns:
             df = df.sort_values(by=["rank_final30", "code"], ascending=[True, True], kind="mergesort")
@@ -1913,6 +1980,10 @@ def decide_market_window(now: datetime) -> str:
     if forced_override in {"preopen", "morning", "day", "close", "after"}:
         return forced_override
 
+    alias_override = (os.getenv("PB1_WINDOW_OVERRIDE") or "").strip().lower()
+    if alias_override in {"preopen", "morning", "day", "close", "after"}:
+        return alias_override
+
     trading_day_env = os.getenv("TRADING_DAY")
     if trading_day_env is not None:
         trading_day = _env_bool("TRADING_DAY", default=True)
@@ -2165,6 +2236,9 @@ def run_once(
     runtime_dir: Path | None = None,
     max_seconds: int = 0,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
+    if (os.getenv("MODE") or "").strip().lower() == "trade" and not (os.getenv("PB1_UNIVERSE_STRATEGY") or "").strip():
+        os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
+
     # ✅ Initialize universe_strategy with default value
     universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
     env_strategy = (str(os.getenv("STRATEGY_ENV") or ctx.env or "practice").strip().lower() or "practice")
@@ -2398,17 +2472,20 @@ def run_once(
     run_ctx["phase_name"] = normalized_phase_name
     logger.info("[ASOF][USE] component=runner value=%s source=run_ctx", run_ctx["derived_as_of"])
     
+    manual_test_reasons = _manual_test_route_reasons(mode=mode)
+    manual_test_route = bool(manual_test_reasons)
+
     # ✅ DIAG_FULL_EXEC: DIAG 모드에서 window/phase 강제 우회
     diag_full_exec = env_bool("PB1_DIAG_FULL_EXEC", False)
     if diag_full_exec and mode == "DIAG":
-        # ✅ FORCE_PB1_PHASE가 설정되어 있으면 존중, 없으면 fallback to prep (for entry_scan)
         diag_phase = force_phase_env if force_phase_env else "prep"
-        logger.info("[PB1][DIAG_FULL_EXEC] force window=day, phase=%s (bypass window/phase gates)", diag_phase)
-        market_window = "day"
-        window_label = "day"
+        diag_window = market_window if market_window in {"preopen", "morning", "day", "close", "after"} else "day"
+        logger.info("[PB1][DIAG_FULL_EXEC] force window=%s, phase=%s (bypass window/phase gates)", diag_window, diag_phase)
+        market_window = diag_window
+        window_label = diag_window
         resolved_phase = diag_phase
         phase_reason = "diag_full_exec_override"
-        context_reasons.append("diag_full_exec:forced_day_" + diag_phase)
+        context_reasons.append("diag_full_exec:forced_" + diag_window + "_" + diag_phase)
     
     if window is not None:
         resolved_window = window
@@ -2437,6 +2514,11 @@ def run_once(
     target_start = None
     if not loop_mode:
         action, target_start = _decide_action(now, trading_day, open_dt, close_dt, allow_wait, max_wait_s, smoke_enabled)
+        if manual_test_route and action != "run":
+            for reason in manual_test_reasons:
+                logger.info("[PB1][MANUAL_TEST_ROUTE] reason=%s -> force action=run", reason)
+            action = "run"
+            target_start = None
         if market_window == "after" and compute_only_full_run:
             action = "run"
             target_start = None
@@ -2584,10 +2666,11 @@ def run_once(
 
     # ✅ DIAG + PB1_DIAG_FULL_EXEC=1이면 smoke 건너뛰고 엔진 실행
     diag_full = os.getenv("PB1_DIAG_FULL_EXEC", "0") in ("1", "true", "TRUE", "yes", "YES")
-    if action == "smoke" and mode == "DIAG" and diag_full:
+    if action == "smoke" and mode == "DIAG" and (diag_full or manual_test_route):
         logger.info("[PB1][DIAG_FULL_EXEC] bypass smoke -> run engine once (no KIS HTTP)")
         action = "run"  # smoke 건너뛰고 엔진 실행
     elif action == "smoke" and not compute_only_full_run:
+        os.environ["KIS_HTTP_CALLER_ROUTE"] = "smoke"
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"
     elif action == "smoke" and compute_only_full_run and ((run_ctx.get("window_name") == "after") or market_window == "after"):
@@ -2596,13 +2679,12 @@ def run_once(
 
     # ✅ DIAG_FULL이면 윈도우 게이트 무시하고 계속 진행
     if not window and not close_cancel_only:
-        if mode == "DIAG" and diag_full:
-            # ✅ window 객체를 강제 생성하지 않고 문자열 컨텍스트로 고정
+        if mode == "DIAG" and (diag_full or manual_test_route):
             phase_default = os.getenv("PB1_PHASE_DEFAULT", "entry")
             window = None
-            window_label = "day"
+            window_label = market_window if market_window in {"preopen", "morning", "day", "close", "after"} else "day"
             phase_for_log = phase_default
-            run_ctx["window_name"] = "day"
+            run_ctx["window_name"] = window_label
             run_ctx["phase_name"] = "entry" if phase_default not in {"entry", "exit", "manage"} else phase_default
             logger.info("[PB1][DIAG_FULL_EXEC] override window gate -> proceed (window=%s, phase=%s)", window_label, phase_default)
         elif compute_only_full_run and market_window == "after":
@@ -3065,6 +3147,12 @@ def run_once(
             or bool(compute_only_flags.get("force_block_live"))
         )
         try:
+            if manual_test_route:
+                os.environ["KIS_HTTP_CALLER_ROUTE"] = "manual_test"
+            elif mode == "LIVE":
+                os.environ["KIS_HTTP_CALLER_ROUTE"] = "live"
+            else:
+                os.environ["KIS_HTTP_CALLER_ROUTE"] = "trade"
             kis = KisAPI()
             if kis.env != env_effective:
                 logger.warning(

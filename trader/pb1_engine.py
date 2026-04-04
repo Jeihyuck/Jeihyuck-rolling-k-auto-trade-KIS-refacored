@@ -961,6 +961,7 @@ class PB1Engine:
         self.trading_day = bool(self._now_kst.weekday() < 5) if trading_day is None else bool(trading_day)
         self.strategy_mode = str(os.getenv("STRATEGY_MODE") or "").strip().upper()
         self.precomputed_final30_df = precomputed_final30_df if precomputed_final30_df is not None else self.final30_df
+        self.final30_source = self._normalize_trade_input_source(self.final30_df)
         self.precomputed_derived_df = precomputed_derived_df if precomputed_derived_df is not None else precomputed_features_df
         self.precomputed_universe_df = precomputed_universe_df
         self.trade_use_precomputed_features = bool(trade_use_precomputed_features)
@@ -7737,12 +7738,39 @@ class PB1Engine:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _normalize_trade_input_source(self, df: pd.DataFrame | None = None) -> str:
+        source = str(getattr(self, "final30_source", "none") or "none")
+        frame = df if isinstance(df, pd.DataFrame) else (self.final30_df if isinstance(self.final30_df, pd.DataFrame) else pd.DataFrame())
+        cols = {str(col) for col in frame.columns.tolist()}
+        plain_universe_cols = {
+            "as_of_date",
+            "code",
+            "env",
+            "market",
+            "market_cap",
+            "name",
+            "provider",
+            "rank",
+            "reason",
+            "strategy",
+        }
+        if source in {"db_pb1_watchlist_final_scored", "final30_locked", "watchlist_env", "candidate_pool_only"}:
+            return source
+        if source in {"db", "db_only", "best_k_meta", "universe", "plain_universe", "db_plain_universe"}:
+            return "db_plain_universe"
+        if plain_universe_cols.issubset(cols):
+            return "db_plain_universe"
+        return source
+
     def _classify_locked_final30_abort_reason(self, df: pd.DataFrame | None) -> tuple[str, list[str]]:
         frame = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
         rows = len(frame)
         cols = [str(col) for col in frame.columns.tolist()]
         missing_cols = self._scored_missing_cols(cols)
-        if str(getattr(self, "final30_source", "none") or "none") != "db_pb1_watchlist_final_scored":
+        normalized_source = self._normalize_trade_input_source(frame)
+        if normalized_source == "db_plain_universe":
+            return "plain_universe_contamination", missing_cols
+        if normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
             return "missing_locked_scored_final30", missing_cols
         if rows == 0:
             return "missing_locked_scored_final30", missing_cols
@@ -7754,8 +7782,11 @@ class PB1Engine:
 
     def _abort_locked_final30(self, *, as_of: str, reason: str, rows: int, missing_cols: list[str]) -> None:
         resolve_fail_reason = "scored_final30_missing" if reason == "missing_locked_scored_final30" else reason
+        normalized_source = self._normalize_trade_input_source()
+        columns = [str(col) for col in (self.final30_df.columns.tolist() if isinstance(self.final30_df, pd.DataFrame) else [])]
         logger.info(
-            "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s locked=0 usable=0",
+            "[FINAL30][SOURCE_SUMMARY] source=%s rows=%s locked=0 usable=0",
+            normalized_source,
             rows,
         )
         logger.error("[FINAL30][ABORT] reason=scored_final30_not_available")
@@ -7763,13 +7794,19 @@ class PB1Engine:
         logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=best_k_meta")
         logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=candidate_pool")
         logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=file_mirror")
-        logger.error("[PB1][ENTRY][ABORT] source=none require_scored=1")
+        if reason == "plain_universe_contamination":
+            logger.error(
+                "[PB1][ENTRY][INPUT_REJECT] reason=plain_universe_contamination rows=%s cols=%s",
+                rows,
+                columns,
+            )
+        logger.error("[PB1][ENTRY][ABORT] source=%s require_scored=1", normalized_source)
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         self._write_final30_input_reject_debug(
-            source="db_pb1_watchlist_final_scored",
+            source=normalized_source,
             as_of=as_of,
             rows=rows,
-            columns=[str(col) for col in (self.final30_df.columns.tolist() if isinstance(self.final30_df, pd.DataFrame) else [])],
+            columns=columns,
             missing_scored_cols=missing_cols,
         )
         raise SystemExit(2)
@@ -7787,16 +7824,17 @@ class PB1Engine:
         locked_df = self.final30_df if isinstance(self.final30_df, pd.DataFrame) else pd.DataFrame()
         rows = len(locked_df)
         reason, missing_cols = self._classify_locked_final30_abort_reason(locked_df)
+        normalized_source = self._normalize_trade_input_source(locked_df)
         usable_locked = bool(
             self.final30_locked
-            and self.final30_source == "db_pb1_watchlist_final_scored"
+            and normalized_source in {"db_pb1_watchlist_final_scored", "final30_locked"}
             and rows == 30
             and not missing_cols
         )
         logger.info(
             "[PB1][ENTRY][INPUT_CHECK] locked=%s source=%s as_of=%s usable=%s",
             int(bool(self.final30_locked)),
-            self.final30_source,
+            normalized_source,
             locked_as_of,
             int(usable_locked),
         )
@@ -7820,7 +7858,7 @@ class PB1Engine:
             reason, missing_cols = self._classify_locked_final30_abort_reason(locked_df)
             self._abort_locked_final30(as_of=as_of, reason=reason, rows=rows, missing_cols=missing_cols)
 
-        if require_scored and self.final30_source != "db_pb1_watchlist_final_scored":
+        if require_scored and normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
             self._abort_locked_final30(as_of=as_of, reason="missing_locked_scored_final30", rows=rows, missing_cols=missing_cols)
 
         logger.info(

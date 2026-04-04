@@ -3755,6 +3755,17 @@ class WatchlistRepo:
         effective_max_back_days = int(max_back_days) if allow_latest_fallback else 0
         strict_mode = bool(require_scored or fail_if_missing or require_exact_rows is not None)
         expected_strategy = "pb1_watchlist_final_scored"
+        logger.info(
+            "[DB][FINAL30_SCORED][LOAD_START] env=%s as_of=%s strategy=%s strict=%s allow_latest_fallback=%s require_exact_rows=%s require_scored=%s fail_if_missing=%s",
+            env_n,
+            as_of_date.isoformat(),
+            strategy_n,
+            int(strict_mode),
+            int(bool(allow_latest_fallback)),
+            require_exact_rows,
+            int(bool(require_scored)),
+            int(bool(fail_if_missing)),
+        )
 
         if strict_mode and require_scored and strategy_n != expected_strategy:
             logger.error(
@@ -3813,6 +3824,13 @@ class WatchlistRepo:
                 )
             )
             exact_count = int(conn.execute(exact_count_stmt).scalar() or 0)
+            logger.info(
+                "[DB][FINAL30_SCORED][EXACT_COUNT] env=%s as_of=%s strategy=%s rows=%s",
+                env_n,
+                as_of_date.isoformat(),
+                strategy_n,
+                exact_count,
+            )
 
             used_as_of = as_of_date if exact_count > 0 else None
             if used_as_of is None and allow_latest_fallback:
@@ -3832,6 +3850,10 @@ class WatchlistRepo:
                 used_as_of = conn.execute(latest_stmt).scalar()
 
             if used_as_of is None:
+                logger.info(
+                    "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=none rows=0 is_scored=0 contract_ok=0 missing_critical_fields=%s",
+                    list(REQUIRED_FINAL30_SCORED_COLS),
+                )
                 return [], None
 
             stmt = (
@@ -3846,6 +3868,22 @@ class WatchlistRepo:
                 .order_by(schema.pb1_watchlist.c.rank)
             )
             raw_rows = conn.execute(stmt).fetchall()
+
+        if strict_mode and strategy_n == expected_strategy and used_as_of == as_of_date and exact_count > 0 and not raw_rows:
+            logger.error(
+                "[DB][FINAL30_SCORED][STRICT_FAIL] reason=exact_contract_empty env=%s as_of=%s strategy=%s exact_count=%s",
+                env_n,
+                as_of_date.isoformat(),
+                strategy_n,
+                exact_count,
+            )
+            raise ScoredWatchlistInvalidError(
+                "exact_contract_empty",
+                expected_strategy=expected_strategy,
+                actual_strategy=strategy_n,
+                rows=0,
+                missing_cols=REQUIRED_FINAL30_SCORED_COLS,
+            )
 
         result = [_normalize_scored_loaded_row(row) for row in raw_rows]
         actual_strategy_values = sorted(
@@ -3899,6 +3937,14 @@ class WatchlistRepo:
         logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY] rows=%s cols=%s", len(result), cols)
         missing_loaded_fields = [field for field in REQUIRED_FINAL30_SCORED_COLS if field not in cols]
         logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY_MISSING] missing=%s", missing_loaded_fields)
+        logger.info(
+            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=%s rows=%s is_scored=%s contract_ok=%s missing_critical_fields=%s",
+            "db_pb1_watchlist_final_scored" if result else "none",
+            len(result),
+            int(len(missing_loaded_fields) == 0),
+            int((len(result) == FINAL30_SCORED_REQUIRED_ROWS) and (len(missing_loaded_fields) == 0) and actual_strategy == expected_strategy),
+            missing_loaded_fields,
+        )
         exact_rows_ok = True if require_exact_rows is None else len(result) == int(require_exact_rows)
         required_scored_ok = len(missing_loaded_fields) == 0
         strategy_ok = actual_strategy == expected_strategy

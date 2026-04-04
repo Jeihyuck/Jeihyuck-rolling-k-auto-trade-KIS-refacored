@@ -1134,6 +1134,21 @@ logger.info(
 )
 logger.info("[ENV] MINERVINI_ONLY=%s", int(MINERVINI_ONLY))
 ALLOW_KIS_DATA_HTTP_IN_DIAG = env_bool("ALLOW_KIS_DATA_HTTP_IN_DIAG", default=False)
+_force_run_enabled = env_bool("FORCE_RUN", default=False)
+_force_block_live_env = env_bool("FORCE_BLOCK_LIVE", default=False)
+_disable_live_trading_env = env_bool("DISABLE_LIVE_TRADING", default=False)
+_dry_run_env = env_bool("DRY_RUN", default=False) or env_bool("DRYRUN", default=False)
+_live_trading_enabled_raw = os.getenv("LIVE_TRADING_ENABLED")
+_live_trading_disabled_env = _live_trading_enabled_raw is not None and not env_bool("LIVE_TRADING_ENABLED", default=True)
+if _force_run_enabled:
+    if _dry_run_env or _disable_live_trading_env or _force_block_live_env or _live_trading_disabled_env:
+        FORCE_RUN_ROUTE = "force_run_dry"
+    else:
+        FORCE_RUN_ROUTE = "force_run_live"
+else:
+    FORCE_RUN_ROUTE = "none"
+_force_market_window_raw = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+_pb1_window_override_raw = (os.getenv("PB1_WINDOW_OVERRIDE") or "").strip().lower()
 logger.info(
     "[CONFIG][KIS_HTTP] strategy_mode=%s allow_kis_data_http_in_diag=%s",
     (os.getenv("STRATEGY_MODE", "").strip().upper() or "UNKNOWN"),
@@ -1143,6 +1158,14 @@ logger.info(
     "[CONFIG][HTTP_POLICY] diag_blocks_order=%s diag_allows_data_http=%s token_allowed_in_diag=%s",
     1,
     int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
+    int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
+)
+logger.info(
+    "[CONFIG][FORCE_RUN] force_run=%s route=%s force_market_window=%s pb1_window_override=%s allow_kis_data_http_in_diag=%s",
+    int(_force_run_enabled),
+    FORCE_RUN_ROUTE,
+    _force_market_window_raw or "none",
+    _pb1_window_override_raw or "none",
     int(ALLOW_KIS_DATA_HTTP_IN_DIAG),
 )
 # === [NEW] 주간 리밸런싱 강제 트리거 상태 파일 ===
@@ -1211,12 +1234,24 @@ def resolve_strategy_mode(
     now_kst = now_kst or datetime.now(KST)
     if now_kst.tzinfo is None:
         now_kst = now_kst.replace(tzinfo=KST)
-    
-    # [NEW] FORCE_RUN=1이면 무조건 장중으로 간주
-    force_run = os.getenv("FORCE_RUN", "0") == "1"
+
+    force_run = env_bool("FORCE_RUN", default=False)
+    force_window = (os.getenv("FORCE_MARKET_WINDOW") or os.getenv("PB1_WINDOW_OVERRIDE") or "").strip().lower()
+    force_window = force_window if force_window in {"preopen", "morning", "day", "close", "after"} else "day"
     if force_run:
-        return "LIVE", True, "day", "force_run"
-    
+        live_blocked = any(
+            (
+                env_bool("DRY_RUN", default=False),
+                env_bool("DRYRUN", default=False),
+                env_bool("DISABLE_LIVE_TRADING", default=False),
+                env_bool("FORCE_BLOCK_LIVE", default=False),
+                os.getenv("LIVE_TRADING_ENABLED") is not None and not env_bool("LIVE_TRADING_ENABLED", default=True),
+            )
+        )
+        if live_blocked:
+            return "DIAG", True, force_window, "force_run_dry"
+        return "LIVE", True, force_window, "force_run_live"
+
     trading_day = now_kst.weekday() < 5
     window = resolve_market_window(now_kst, trading_day)
     forced = _normalize_strategy_mode(force_mode_env)
