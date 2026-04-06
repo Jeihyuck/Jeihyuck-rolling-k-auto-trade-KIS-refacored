@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 MARKET_OPEN = time(9, 0)
-MARKET_CLOSE = time(15, 20)
+MARKET_CLOSE = time(15, 30)
 _PYKRX_WARNED_SIGNATURES: set[tuple[str, str, str]] = set()
 _PYKRX_PREV_OR_SAME_CACHE: dict[str, date | None] = {}
 _NOISY_EXTERNAL_LOGGERS = (
@@ -93,7 +93,7 @@ def is_trading_day(ts: datetime | None = None) -> bool:
 
 
 def is_trading_window(ts: datetime | None = None) -> bool:
-    """당일 장중(09:00~15:20) 여부."""
+    """당일 장중(09:00~15:30) 여부."""
 
     ts = ts or now_kst()
 
@@ -118,9 +118,9 @@ def calc_market_window_kst(dt: datetime) -> str:
     t = dt.time()
     if preopen_start <= t < preopen_end:
         return "preopen"
-    if preopen_end <= t < time(10, 0):
+    if preopen_end <= t < time(10, 30):
         return "morning"
-    if time(10, 0) <= t < time(15, 15):
+    if time(10, 30) <= t < time(15, 15):
         return "day"
     if time(15, 15) <= t <= time(15, 30):
         return "close"
@@ -141,22 +141,22 @@ def is_market_open_kst(dt: datetime | None = None) -> bool:
     if not is_trading_weekday(dt):
         return False
     
-    # 장중 시간 확인 (09:00~15:20)
+    # 장중 시간 확인 (09:00~15:30)
     t = dt.time()
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 
 def market_close_dt_kst(dt: datetime) -> datetime:
     """
-    주어진 날짜의 장 마감 시각(15:15) 반환.
+    주어진 날짜의 장 마감 시각(15:30) 반환.
     
     Args:
         dt: KST 기준 datetime
     
     Returns:
-        같은 날 15:15:00 KST
+        같은 날 15:30:00 KST
     """
-    return dt.replace(hour=15, minute=15, second=0, microsecond=0)
+    return dt.replace(hour=15, minute=30, second=0, microsecond=0)
 
 
 def prev_business_day(d: date) -> date:

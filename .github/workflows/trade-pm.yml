@@ -2,8 +2,8 @@ name: Trade PM
 
 "on":
   schedule:
-    # Mon-Fri 13:07 KST = 04:07 UTC (post-lunch entry re-check window)
-    - cron: "7 4 * * 1-5"
+    # Mon-Fri 10:35 KST = 01:35 UTC (day session start + stabilization)
+    - cron: "35 1 * * 1-5"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -15,7 +15,7 @@ name: Trade PM
           - practice
 
 concurrency:
-  group: pb1-practice-serial
+  group: pb1-practice-pm
   cancel-in-progress: false
 
 permissions:
@@ -25,6 +25,18 @@ env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
   WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
+  FINAL30_SOURCE_MODE: "db_only"
+  PB1_REQUIRE_SCORED_FINAL30: "1"
+  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
+  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
+  PB1_LOOP_ENABLED: "1"
+  PB1_RUN_LOOP_MINUTES: "285"
+  PB1_LOOP_INTERVAL_SEC: "60"
+  PB1_ALLOW_WAIT: "0"
+  FORCE_RUN: "1"
+  FORCE_MARKET_WINDOW: "day"
+  FORCE_PB1_PHASE: "entry"
+  FORCE_STRATEGY_MODE: "LIVE"
   KIS_HTTP_ENABLED: "1"
   NO_TRADE: "0"
   FAIL_IF_POOL_MISSING: "1"
@@ -44,7 +56,7 @@ defaults:
 jobs:
   trade_pm:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
 
     env:
       TZ: Asia/Seoul

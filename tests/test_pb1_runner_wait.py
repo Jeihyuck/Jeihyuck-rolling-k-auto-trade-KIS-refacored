@@ -242,3 +242,24 @@ def test_decide_action_smoke_after_close():
 
     assert action == "smoke"
     assert target_start is None
+
+
+def test_decide_action_force_close_exit_run(monkeypatch):
+    monkeypatch.setenv("FORCE_RUN", "1")
+    monkeypatch.setenv("FORCE_MARKET_WINDOW", "close")
+    monkeypatch.setenv("FORCE_PB1_PHASE", "exit")
+    now = datetime(2024, 1, 2, 16, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+    open_dt, close_dt = pb1_runner._market_session(now)
+
+    action, target_start = pb1_runner._decide_action(
+        now=now,
+        trading_day=True,
+        open_dt=open_dt,
+        close_dt=close_dt,
+        allow_wait=True,
+        max_wait_s=3600,
+        smoke_enabled=False,
+    )
+
+    assert action == "run"
+    assert target_start is None

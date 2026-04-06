@@ -7779,15 +7779,26 @@ class PB1Engine:
         cols = [str(col) for col in frame.columns.tolist()]
         missing_cols = self._scored_missing_cols(cols)
         normalized_source = self._normalize_trade_input_source(frame)
+        universe_meta = dict(getattr(getattr(self, "_universe_context", None), "meta", {}) or {})
+        locked_rows = list(universe_meta.get("locked_final30_rows") or [])
+        locked_has_contract = len(locked_rows) == 30
         if normalized_source == "db_plain_universe":
-            return "invalid_db_exact_scored_final30_contract", missing_cols
+            return "stripped_members_contamination", missing_cols
         if normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
+            if locked_has_contract:
+                return "locked_final30_source_mismatch", missing_cols
             return "missing_db_exact_scored_final30", missing_cols
         if rows == 0:
+            if locked_has_contract:
+                return "stripped_members_contamination", missing_cols
             return "missing_db_exact_scored_final30", missing_cols
         if rows != 30:
+            if locked_has_contract:
+                return "stripped_members_contamination", missing_cols
             return "invalid_db_exact_scored_final30_contract", missing_cols
         if missing_cols:
+            if locked_has_contract:
+                return "stripped_members_contamination", missing_cols
             return "invalid_db_exact_scored_final30_contract", missing_cols
         return "missing_db_exact_scored_final30", missing_cols
 
@@ -7800,9 +7811,16 @@ class PB1Engine:
             rows,
         )
         logger.error("[FINAL30][ABORT] reason=%s", reason)
-        if reason == "invalid_db_exact_scored_final30_contract":
+        if reason in {"invalid_db_exact_scored_final30_contract", "stripped_members_contamination"}:
             logger.error(
                 "[PB1][ENTRY][INPUT_REJECT] reason=plain_universe_contamination rows=%s cols=%s",
+                rows,
+                columns,
+            )
+        if reason == "locked_final30_source_mismatch":
+            logger.error(
+                "[PB1][ENTRY][INPUT_REJECT] reason=locked_final30_source_mismatch final30_source=%s rows=%s cols=%s",
+                str(getattr(self, "final30_source", "none") or "none"),
                 rows,
                 columns,
             )

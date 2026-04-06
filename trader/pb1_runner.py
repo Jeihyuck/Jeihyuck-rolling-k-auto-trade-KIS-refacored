@@ -1694,6 +1694,7 @@ def _load_universe_context(
         original_codes = [str(x).zfill(6) for x in pd.DataFrame(result.get("df")).get("code", pd.Series(dtype=str)).tolist() if str(x).strip()]
         sorted_codes = [str(x).zfill(6) for x in df.get("code", pd.Series(dtype=str)).tolist() if str(x).strip()]
         canonical_order_match = int(original_codes == sorted_codes)
+        locked_final30_rows = [dict(row or {}) for row in df.to_dict(orient="records")]
 
         members = [dict(row) for row in df.to_dict(orient="records") if row.get("code")]
         for member in members:
@@ -1731,6 +1732,8 @@ def _load_universe_context(
                 "columns": list(result.get("columns") or []),
                 "missing_scored_cols": list(result.get("missing_scored_cols") or []),
                 "flow_optional_missing": list(result.get("flow_optional_missing") or []),
+                "locked_final30_rows": locked_final30_rows,
+                "locked_final30_is_scored": True,
                 "path_map": dict(result.get("path_map") or {}),
                 "source_compare": dict(result.get("source_compare") or {}),
                 "used_fallback": bool(result.get("used_fallback")),
@@ -2013,6 +2016,11 @@ def detect_window(now_kst_value: datetime, preopen_start: str = "08:45", preopen
 
 
 def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt: datetime, allow_wait: bool, max_wait_s: int, smoke_enabled: bool) -> tuple[str, datetime | None]:
+    force_run = env_bool("FORCE_RUN", default=False)
+    forced_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    forced_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+    if force_run and forced_window == "close" and forced_phase == "exit":
+        return "run", None
     if smoke_enabled:
         return "smoke", None
     if not trading_day:
@@ -3080,7 +3088,8 @@ def run_once(
                 return touched_files, False, {}, phase_for_log, "SKIP_EMPTY_UNIVERSE"
             mode_input = (os.getenv("MODE") or "").strip().lower()
             if mode_input == "trade" and universe_ctx and universe_ctx.members:
-                precomputed_final30_df = pd.DataFrame(list(universe_ctx.members or []))
+                locked_rows = list((universe_ctx.meta or {}).get("locked_final30_rows") or [])
+                precomputed_final30_df = pd.DataFrame(locked_rows)
                 if not precomputed_final30_df.empty:
                     final30_source_name = str((universe_ctx.meta or {}).get("source") or "db_pb1_watchlist_final_scored")
                     run_ctx["final30_source"] = final30_source_name
@@ -3106,6 +3115,20 @@ def run_once(
                         str(run_ctx.get("derived_as_of") or as_of),
                         len(precomputed_final30_df),
                         int(final30_source_name == "db_pb1_watchlist_final_scored"),
+                    )
+                    logger.info(
+                        "[TRADE][FINAL30][DB_EXACT_LOAD] env=%s as_of=%s rows=%s uniq_codes=%s uniq_ranks=%s",
+                        env_effective,
+                        str(run_ctx.get("derived_as_of") or as_of),
+                        len(precomputed_final30_df),
+                        precomputed_final30_df.get("code", pd.Series(dtype=str)).astype(str).str.zfill(6).nunique(),
+                        precomputed_final30_df.get("rank_final30", pd.Series(dtype=float)).nunique() if "rank_final30" in precomputed_final30_df.columns else 0,
+                    )
+                    logger.info(
+                        "[TRADE][FINAL30][LOCKED_DF] rows=%s cols=%s source=%s",
+                        len(precomputed_final30_df),
+                        list(precomputed_final30_df.columns),
+                        run_ctx["final30_source"],
                     )
                     logger.info(
                         "[TRADE][PRECOMPUTED_FEATURES] enabled=1 source=pb1_watchlist_final_scored rows=%s",
@@ -3457,7 +3480,7 @@ def run_once(
             window_name_for_engine,
         )
 
-        if (os.getenv("MODE") or "").strip().lower() == "trade":
+        if (os.getenv("MODE") or "").strip().lower() == "trade" and precomputed_final30_df.empty:
             precomputed_final30_df = _hydrate_locked_final30_from_db_only(
                 engine=engine,
                 env=env_effective,
@@ -3473,6 +3496,17 @@ def run_once(
                 if str(code).strip()
             ]
             setattr(ctx, "precomputed_final30_df", precomputed_final30_df)
+
+        if (os.getenv("MODE") or "").strip().lower() == "trade":
+            if precomputed_final30_df.empty:
+                raise RuntimeError("ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30")
+            missing_locked_cols = [
+                col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS
+                if col not in set(str(c) for c in precomputed_final30_df.columns.tolist())
+            ]
+            if missing_locked_cols:
+                logger.error("[TRADE][FINAL30][LOCKED_DF_INVALID] missing=%s cols=%s", missing_locked_cols, list(precomputed_final30_df.columns))
+                raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
 
         _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
         engine_runner = PB1Engine(
