@@ -77,6 +77,7 @@ from trader.db.health import assert_db_ready
 from trader.db.locks import acquire_advisory_lock, release_advisory_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
+    FINAL30_SCORED_DB_CONTRACT_FIELDS,
     FillsRepo,
     DerivedMinerviniRepo,
     LedgerEventsRepo,
@@ -87,6 +88,7 @@ from trader.db.repos import (
     ScoredWatchlistInvalidError,
     ScoredWatchlistNotFoundError,
     UniverseRepo,
+    load_final30_scored_db_only,
 )
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
@@ -446,6 +448,37 @@ def _log_final30_fallback_blocked() -> None:
     logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=file_mirror")
 
 
+def _db_exact_scored_final30_abort_reason(exc: Exception | None = None) -> str:
+    if isinstance(exc, ScoredWatchlistNotFoundError):
+        return "missing_db_exact_scored_final30"
+    return "invalid_db_exact_scored_final30_contract"
+
+
+def _hydrate_locked_final30_from_db_only(*, engine, env: str, as_of: date | str) -> pd.DataFrame:
+    strategy_key = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+    try:
+        df = load_final30_scored_db_only(
+            engine,
+            env=env,
+            as_of=as_of,
+            strategy=strategy_key,
+            require_exact_rows=30,
+            fail_if_missing=True,
+        )
+    except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError) as exc:
+        reason = _db_exact_scored_final30_abort_reason(exc)
+        logger.error("[TRADE][FINAL30][DB_ONLY_LOCK][FAIL] env=%s as_of=%s reason=%s", env, as_of, reason)
+        raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}") from exc
+
+    logger.info(
+        "[TRADE][FINAL30][DB_ONLY_LOCK] env=%s as_of=%s rows=%s source=db_pb1_watchlist_final_scored",
+        env,
+        as_of,
+        len(df),
+    )
+    return df
+
+
 def load_locked_final30_from_db(
     *,
     engine,
@@ -460,50 +493,26 @@ def load_locked_final30_from_db(
         derived_as_of,
         strategy_key,
     )
-    repo = WatchlistRepo(engine)
-    try:
-        repo.load_watchlist_scored(
-            env=env_n,
-            strategy=strategy_key,
-            as_of=datetime.strptime(str(derived_as_of), "%Y-%m-%d").date(),
-            allow_latest_fallback=False,
-            require_exact_rows=30,
-            require_scored=True,
-            fail_if_missing=True,
-        )
-    except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError) as exc:
-        logger.error(
-            "[FINAL30][DB_LOCK][FAIL] rows=%s missing_cols=%s reason=%s",
-            exc.rows,
-            exc.missing_cols,
-            exc.reason,
-        )
-        _log_final30_fallback_blocked()
-        raise RuntimeError(exc.reason) from exc
-
-    result = load_trade_final30_scored(engine=engine, env=env_n, as_of=str(derived_as_of))
-    df = result.get("df") if isinstance(result.get("df"), pd.DataFrame) else pd.DataFrame()
+    df = _hydrate_locked_final30_from_db_only(engine=engine, env=env_n, as_of=str(derived_as_of))
     rows = len(df)
-    missing_cols = list(result.get("missing_scored_cols") or [])
-    if result.get("source_name") != "db_pb1_watchlist_final_scored" or not bool(result.get("usable")) or rows != 30:
-        reason = _classify_final30_abort_reason(
-            rows=rows,
-            missing_cols=missing_cols,
-            errors=[str(result.get("abort_reason") or "")],
-        )
-        logger.error(
-            "[FINAL30][DB_LOCK][FAIL] rows=%s missing_cols=%s reason=%s",
-            rows,
-            missing_cols,
-            reason,
-        )
-        _log_final30_fallback_blocked()
-        raise RuntimeError(reason)
-
     codes = [str(code).zfill(6) for code in df.get("code", pd.Series(dtype=str)).tolist() if str(code).strip()]
-    result["locked"] = True
-    result["rows"] = rows
-    result["codes"] = codes
+    result = {
+        "df": df,
+        "source_name": "db_pb1_watchlist_final_scored",
+        "as_of": str(derived_as_of),
+        "columns": [str(col) for col in df.columns.tolist()],
+        "is_scored": True,
+        "used_fallback": False,
+        "file_mirror_present": False,
+        "usable": True,
+        "missing_scored_cols": [],
+        "flow_optional_missing": _safe_flow_optional_missing([str(col) for col in df.columns.tolist()]),
+        "path_map": {},
+        "source_compare": {},
+        "locked": True,
+        "rows": rows,
+        "codes": codes,
+    }
     logger.info(
         "[FINAL30][DB_LOCK][OK] rows=%s codes=%s source=%s",
         rows,
@@ -514,13 +523,17 @@ def load_locked_final30_from_db(
 
 
 def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: pd.DataFrame | None) -> None:
-    rows = len(final30_df) if isinstance(final30_df, pd.DataFrame) else 0
+    frame = final30_df if isinstance(final30_df, pd.DataFrame) else pd.DataFrame()
+    rows = len(frame)
     source = str(run_ctx.get("final30_source") or "none")
     locked = bool(run_ctx.get("final30_locked"))
-    if source != "db_pb1_watchlist_final_scored" or not locked or rows != 30:
-        reason = "missing_locked_scored_final30"
-        if rows not in (0, 30):
-            reason = "rows_not_30"
+    missing_cols = [col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS if col not in set(str(c) for c in frame.columns.tolist())]
+    if not locked or source != "db_pb1_watchlist_final_scored" or rows == 0:
+        reason = "missing_db_exact_scored_final30"
+        logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
+        raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
+    if rows != 30 or missing_cols:
+        reason = "invalid_db_exact_scored_final30_contract"
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
     logger.info("[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s", rows)
@@ -1628,8 +1641,7 @@ def _load_universe_context(
                 "[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s",
                 trade_strategy,
             )
-            logger.error("[TRADE][ABORT] final30_scored_lock_required")
-            raise RuntimeError("final30_scored_lock_required")
+            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
         result = load_locked_final30_from_db(engine=engine, env=env, derived_as_of=as_of)
         df = result.get("df")
         df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
@@ -1649,23 +1661,19 @@ def _load_universe_context(
                 "[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s",
                 result_source,
             )
-            logger.error("[TRADE][ABORT] final30_scored_lock_required")
-            raise RuntimeError("final30_scored_lock_required")
+            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
+        if df.empty or rows == 0:
+            logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30")
+            raise RuntimeError("ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30")
         if rows != 30:
             logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=rows_not_30 rows=%s", rows)
-            logger.error("[TRADE][ABORT] final30_scored_lock_required")
-            raise RuntimeError("final30_scored_lock_required")
+            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
         if missing_scored:
             logger.error(
                 "[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s",
                 missing_scored,
             )
-            logger.error("[TRADE][ABORT] final30_scored_lock_required")
-            raise RuntimeError("final30_scored_lock_required")
-        if df.empty:
-            logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30")
-            logger.error("[TRADE][ABORT] final30_scored_lock_required")
-            raise RuntimeError("final30_scored_lock_required")
+            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
 
         require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
         if require_scored and not bool(result.get("is_scored")):
@@ -1673,8 +1681,7 @@ def _load_universe_context(
                 "[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s",
                 missing_scored,
             )
-            logger.error("[TRADE][ABORT] final30_scored_lock_required")
-            raise RuntimeError("final30_scored_lock_required")
+            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
 
         if "rank_final30" in df.columns:
             df = df.sort_values(by=["rank_final30", "code"], ascending=[True, True], kind="mergesort")
@@ -3450,6 +3457,23 @@ def run_once(
             window_name_for_engine,
         )
 
+        if (os.getenv("MODE") or "").strip().lower() == "trade":
+            precomputed_final30_df = _hydrate_locked_final30_from_db_only(
+                engine=engine,
+                env=env_effective,
+                as_of=str(run_ctx.get("derived_as_of") or as_of),
+            )
+            run_ctx["final30_source"] = "db_pb1_watchlist_final_scored"
+            run_ctx["final30_locked"] = True
+            run_ctx["final30_rows"] = int(len(precomputed_final30_df))
+            run_ctx["final30_as_of"] = str(run_ctx.get("derived_as_of") or as_of)
+            run_ctx["final30_codes"] = [
+                str(code).zfill(6)
+                for code in precomputed_final30_df.get("code", pd.Series(dtype=str)).tolist()
+                if str(code).strip()
+            ]
+            setattr(ctx, "precomputed_final30_df", precomputed_final30_df)
+
         _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
@@ -4354,19 +4378,11 @@ def main() -> int:
             nonlocal watchlist_loaded_for_guard
             watchlist_engine = make_engine()
             watchlist_env = resolve_env(args.env)
-            result = load_trade_final30_scored(
+            df = _hydrate_locked_final30_from_db_only(
                 engine=watchlist_engine,
                 env=watchlist_env,
                 as_of=requested_as_of.isoformat(),
             )
-            df = result.get("df")
-            if df is None or df.empty:
-                raise RuntimeError(
-                    f"[TRADE][WATCHLIST_FINAL] missing_or_bad n=0 as_of_try={requested_as_of.isoformat()}"
-                )
-            require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
-            if require_scored and not bool(result.get("is_scored")):
-                raise RuntimeError("[TRADE][WATCHLIST_FINAL] scored_required_but_missing")
 
             watchlist_loaded_for_guard = True
             rows = [dict(x) for x in df.to_dict(orient="records")]
@@ -4374,13 +4390,13 @@ def main() -> int:
             logger.info(
                 "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
                 watchlist_env,
-                result.get("source_name"),
+                os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower(),
                 requested_as_of.isoformat(),
-                str(result.get("as_of") or requested_as_of.isoformat()),
+                requested_as_of.isoformat(),
                 len(rows),
             )
             logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
-            return datetime.strptime(str(result.get("as_of") or requested_as_of.isoformat()), "%Y-%m-%d").date()
+            return requested_as_of
 
         if as_of_override_raw:
             derived_as_of = _parse_as_of_override(as_of_override_raw)
@@ -4597,65 +4613,13 @@ def main() -> int:
         
         # ✅ DIAGNOSTIC: canonical scored final30 존재 여부 체크
         logger.info("[TRADE][PRECHECK][FINAL30] status=START requested_as_of=%s", derived_as_of.isoformat())
-        final30_result = load_trade_final30_scored(
+        final30_df = _hydrate_locked_final30_from_db_only(
             engine=engine,
             env=derived_env,
             as_of=derived_as_of.isoformat(),
         )
-        final30_df = final30_result.get("df")
-        if final30_df is not None and not final30_df.empty:
-            logger.info("[TRADE][PRECHECK][FINAL30] status=OK rows=%s", len(final30_df))
-            logger.info(
-                "[TRADE_TICK][FINAL30_SNAPSHOT][OK] derived_as_of=%s count=%d",
-                derived_as_of.isoformat(),
-                len(final30_df),
-            )
-            os.environ["PB1_SKIP_NEW_ENTRIES"] = "0"
-        else:
-            logger.error("[TRADE][PRECHECK][FINAL30] status=FAIL reason=missing_or_empty")
-            logger.error("[ENTRY][BLOCK] missing scored final30 contract")
-            logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
-            os.environ["PB1_SKIP_NEW_ENTRIES"] = "1"
-        
-        watchlist_repo = WatchlistRepo(engine)
-        watchlist_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
-        ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
-        max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
-        watchlist_env = resolve_env(args.env)
-
-        watchlist_rows, used_as_of = watchlist_repo.load_watchlist(
-            env=watchlist_env,
-            strategy=watchlist_strategy,
-            as_of=derived_as_of,
-            allow_latest_fallback=True,
-            ttl_days=ttl_days,
-            max_back_days=max_back_days,
-        )
-
-        if not watchlist_rows or used_as_of is None:
-            if os.getenv("PB1_SKIP_NEW_ENTRIES", "0") == "1":
-                logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
-                watchlist_rows = []
-                used_as_of = derived_as_of
-            else:
-                raise RuntimeError("WATCHLIST_FINAL_NOT_FOUND")
-
-        age_days = (derived_as_of - used_as_of).days
-        if age_days > ttl_days:
-            raise RuntimeError("WATCHLIST_FINAL_TTL_EXCEEDED")
-        if watchlist_rows and len(watchlist_rows) != 30:
-            raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(watchlist_rows)}")
-
-        top10_codes = [str(item.get("code") or "").zfill(6) for item in watchlist_rows[:10] if item.get("code")]
-        logger.info(
-            "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
-            watchlist_env,
-            watchlist_strategy,
-            derived_as_of.isoformat(),
-            used_as_of.isoformat(),
-            len(watchlist_rows),
-        )
-        logger.info("[TRADE][WATCHLIST_FINAL][TOP10] codes=%s", top10_codes)
+        logger.info("[TRADE][PRECHECK][FINAL30] status=OK rows=%s", len(final30_df))
+        os.environ["PB1_SKIP_NEW_ENTRIES"] = "0"
 
     assert_db_ready()
     smoke_enabled = os.getenv("PB1_SMOKE_RUN") == "1"

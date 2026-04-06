@@ -10,7 +10,7 @@ import logging
 import os
 from datetime import date
 
-from trader.db.repos import WatchlistRepo
+from trader.db.repos import ScoredWatchlistInvalidError, ScoredWatchlistNotFoundError, WatchlistRepo, load_final30_scored_db_only
 from trader.time_coerce import to_date
 from trader.pb1_engine import UniverseContext
 
@@ -51,26 +51,27 @@ def load_watchlist_for_trade(
         30
     """
     as_of_date = to_date(as_of)
-    repo = WatchlistRepo(engine)
     env_n = (env or "").strip().lower()
-    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
     if strategy.strip().lower() != forced_strategy:
         logger.warning(
             "[WATCHLIST][TRADE][FORCE_STRATEGY] requested=%s forced=%s",
             strategy,
             forced_strategy,
         )
-    
-    # Load watchlist (final 30)
-    watchlist_rows = repo.load_watchlist(
-        env=env_n,
-        strategy=forced_strategy,
-        as_of=as_of_date,
-        allow_latest_fallback=True,
-        ttl_days=int(os.getenv("WATCHLIST_TTL_DAYS", "7")),
-        max_back_days=int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3")),
-    )
-    rows, used_as_of = watchlist_rows
+
+    try:
+        df = load_final30_scored_db_only(
+            engine,
+            env=env_n,
+            strategy=forced_strategy,
+            as_of=as_of_date,
+            require_exact_rows=30,
+            fail_if_missing=True,
+        )
+    except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError):
+        df = None
+    rows = [] if df is None else [dict(row or {}) for row in df.to_dict(orient="records")]
     
     if rows:
         # Convert watchlist rows to members format
@@ -87,14 +88,13 @@ def load_watchlist_for_trade(
         
         if len(members) != 30:
             raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(members)}")
-        used_as_of_date = used_as_of or as_of_date
         top10_codes = [m.get("code") for m in members[:10] if m.get("code")]
         logger.info(
             "[TRADE][WATCHLIST_FINAL][LOCK] env=%s strategy=%s requested_as_of=%s actual_as_of=%s n=%s",
             env_n,
             forced_strategy,
             as_of_date.isoformat(),
-            used_as_of_date.isoformat(),
+            as_of_date.isoformat(),
             len(members),
         )
         logger.info(
@@ -162,20 +162,23 @@ def load_today_watchlist_with_fallback(
         UniverseContext with members
     """
     as_of_date = to_date(as_of)
-    repo = WatchlistRepo(engine)
     env_n = (env or "").strip().lower()
-    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip()
-    
-    rows, used_as_of = repo.load_watchlist(
-        env=env_n,
-        strategy=forced_strategy,
-        as_of=as_of_date,
-        allow_latest_fallback=True,
-        ttl_days=ttl_days,
-        max_back_days=max_back_days,
-    )
+    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip()
 
-    if rows and used_as_of is not None:
+    try:
+        df = load_final30_scored_db_only(
+            engine,
+            env=env_n,
+            strategy=forced_strategy,
+            as_of=as_of_date,
+            require_exact_rows=30,
+            fail_if_missing=True,
+        )
+    except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError):
+        df = None
+
+    if df is not None and not df.empty:
+        rows = [dict(row or {}) for row in df.to_dict(orient="records")]
         members = [
             {
                 "code": str(row.get("code") or "").zfill(6),
@@ -186,24 +189,15 @@ def load_today_watchlist_with_fallback(
             for row in rows
             if row.get("code")
         ]
-        days_back = (as_of_date - used_as_of).days
-        if days_back > 0:
-            logger.warning(
-                "[WATCHLIST][FALLBACK][OK] requested=%s actual=%s age=%d members=%s",
-                as_of_date.isoformat(),
-                used_as_of.isoformat(),
-                days_back,
-                len(members),
-            )
         return UniverseContext(
-            as_of_date=used_as_of.isoformat(),
+            as_of_date=as_of_date.isoformat(),
             members=members,
             selected_path=None,
             meta={
                 "source": "watchlist",
                 "requested_as_of": as_of_date.isoformat(),
-                "actual_as_of": used_as_of.isoformat(),
-                "age_days": days_back,
+                "actual_as_of": as_of_date.isoformat(),
+                "age_days": 0,
                 "count": len(members),
             },
             is_empty=len(members) == 0,

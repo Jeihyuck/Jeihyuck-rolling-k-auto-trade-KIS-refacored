@@ -24,6 +24,7 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   STRATEGY_MODE: DIAG
   KIS_HTTP_ENABLED: "0"
   ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"
@@ -120,6 +121,28 @@ jobs:
           mkdir -p artifacts
           python -m trader.prep_runner 2>&1 | tee artifacts/prep.log
 
+      - name: Verify exact scored final30 in DB
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from trader.db.engine import get_engine
+          from trader.db.repos import load_final30_scored_db_only
+          from trader.time_utils import now_kst, resolve_trade_context
+
+          env = os.getenv("STRATEGY_ENV", "practice")
+          ctx = resolve_trade_context(now=now_kst(), env=env)
+          df = load_final30_scored_db_only(
+              get_engine(),
+              env=env,
+              as_of=ctx["as_of"],
+              strategy=os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+              require_exact_rows=30,
+              fail_if_missing=True,
+          )
+          print(f"[PREP][DB_VERIFY][OK] as_of={ctx['as_of']} rows={len(df)}")
+          PY
+
       - name: Verify PREP log contract
         run: |
           set -euo pipefail
@@ -213,13 +236,12 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Upload prep logs
+      - name: Upload debug prep logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trade-prep-logs
+          name: debug-trade-prep-logs
           path: |
             repo/artifacts/
             repo/runtime/prep/*/prep_manifest.json
-            repo/runtime/prep/*/final30_locked.json
           if-no-files-found: ignore

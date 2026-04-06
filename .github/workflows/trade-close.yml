@@ -24,6 +24,7 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   KIS_HTTP_ENABLED: "1"
   NO_TRADE: "0"
   PB1_PHASE_DEFAULT: exit
@@ -126,6 +127,35 @@ jobs:
           set -euo pipefail
           python -m trader.verify_candidate_pool
 
+      - name: Verify final30 readiness in DB
+        run: |
+          set -euo pipefail
+          echo "[TRADE_CLOSE][PRECHECK][FINAL30][START]"
+          if python - <<'PY'
+          import os
+          from trader.db.engine import get_engine
+          from trader.db.repos import load_final30_scored_db_only
+          from trader.time_utils import now_kst, resolve_trade_context
+
+          env = os.getenv("STRATEGY_ENV", "practice")
+          ctx = resolve_trade_context(now=now_kst(), env=env)
+          df = load_final30_scored_db_only(
+              get_engine(),
+              env=env,
+              strategy=os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+              as_of=ctx["as_of"],
+              require_exact_rows=30,
+              fail_if_missing=True,
+          )
+          print(f"[TRADE_CLOSE][PRECHECK][FINAL30][OK] rows={len(df)} as_of={ctx['as_of']}")
+          PY
+          then
+            :
+          else
+            echo "[TRADE_CLOSE][PRECHECK][FINAL30][FAIL] reason=missing_db_exact_scored_final30"
+            exit 1
+          fi
+
       - name: Run close trade tick
         run: |
           set -euo pipefail
@@ -155,10 +185,10 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Upload close logs
+      - name: Upload debug close logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trade-close-logs
+          name: debug-trade-close-logs
           path: repo/artifacts/
           if-no-files-found: ignore

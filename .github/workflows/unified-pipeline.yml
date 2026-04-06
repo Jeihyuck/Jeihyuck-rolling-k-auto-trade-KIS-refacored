@@ -82,6 +82,7 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   DB_DISABLE_PREPARED_STATEMENTS: "1"
 
 defaults:
@@ -279,6 +280,29 @@ jobs:
           echo "TRADE_REQUIRE_PREP_FINAL30_SCORED=${TRADE_REQUIRE_PREP_FINAL30_SCORED:-}"
           echo "ALLOW_KIS_DATA_HTTP_IN_DIAG=${ALLOW_KIS_DATA_HTTP_IN_DIAG:-}"
 
+      - name: Verify exact scored final30 in DB for trade and close
+        if: ${{ inputs.mode == 'trade' || inputs.mode == 'close' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from trader.db.engine import get_engine
+          from trader.db.repos import load_final30_scored_db_only
+          from trader.time_utils import now_kst, resolve_trade_context
+
+          env = os.getenv("STRATEGY_ENV", "practice")
+          ctx = resolve_trade_context(now=now_kst(), env=env)
+          df = load_final30_scored_db_only(
+              get_engine(),
+              env=env,
+              as_of=ctx["as_of"],
+              strategy=os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+              require_exact_rows=30,
+              fail_if_missing=True,
+          )
+          print(f"[UNIFIED][PRECHECK][FINAL30][OK] as_of={ctx['as_of']} rows={len(df)}")
+          PY
+
       - name: Run selected manual pipeline
         run: |
           set -euo pipefail
@@ -318,6 +342,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: unified-manual-logs
+          name: debug-unified-manual-logs
           path: repo/artifacts/
           if-no-files-found: ignore

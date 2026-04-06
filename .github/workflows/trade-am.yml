@@ -24,6 +24,7 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   FINAL30_SOURCE_MODE: "db_only"
   PB1_REQUIRE_SCORED_FINAL30: "1"
   PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
@@ -138,11 +139,28 @@ jobs:
         run: |
           set -euo pipefail
           echo "[TRADE_AM][PRECHECK][FINAL30][START]"
-          if python -c 'from trader.db.engine import get_engine; from trader.db.repos import WatchlistRepo; from trader.time_utils import now_kst, resolve_trade_context; ctx=resolve_trade_context(now=now_kst(), env="practice"); repo=WatchlistRepo(get_engine()); rows,used=repo.load_watchlist_scored(env="practice", strategy="pb1_watchlist_final_scored", as_of=ctx["as_of"], allow_latest_fallback=False, require_exact_rows=30, require_scored=True, fail_if_missing=True); print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(rows)} used_as_of={used}")'
+          if python - <<'PY'
+          import os
+          from trader.db.engine import get_engine
+          from trader.db.repos import load_final30_scored_db_only
+          from trader.time_utils import now_kst, resolve_trade_context
+
+          env = os.getenv("STRATEGY_ENV", "practice")
+          ctx = resolve_trade_context(now=now_kst(), env=env)
+          df = load_final30_scored_db_only(
+              get_engine(),
+              env=env,
+              strategy=os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+              as_of=ctx["as_of"],
+              require_exact_rows=30,
+              fail_if_missing=True,
+          )
+          print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(df)} as_of={ctx['as_of']}")
+          PY
           then
             :
           else
-            echo "[TRADE_AM][PRECHECK][FINAL30][FAIL] reason=missing_or_empty"
+            echo "[TRADE_AM][PRECHECK][FINAL30][FAIL] reason=missing_db_exact_scored_final30"
             exit 1
           fi
 
@@ -189,10 +207,10 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Upload AM logs
+      - name: Upload debug AM logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trade-am-logs
+          name: debug-trade-am-logs
           path: repo/artifacts/
           if-no-files-found: ignore

@@ -19,13 +19,13 @@ def test_trade_am_requires_scored_final30_lock(monkeypatch, caplog) -> None:
         lambda **_kwargs: {
             "df": pd.DataFrame(),
             "source_name": "db_pb1_watchlist_final_scored",
-            "is_scored": False,
+            "is_scored": True,
         },
     )
 
     caplog.set_level(logging.INFO)
 
-    with pytest.raises(RuntimeError, match="final30_scored_lock_required"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30"):
         pb1_runner._load_universe_context(
             engine=object(),
             as_of="2026-04-03",
@@ -33,5 +33,4 @@ def test_trade_am_requires_scored_final30_lock(monkeypatch, caplog) -> None:
             strategy="pb1_watchlist_final_scored",
         )
 
-    assert "[TRADE][FINAL30][LOCK][FAIL] reason=rows_not_30 rows=0" in caplog.text
-    assert "[TRADE][ABORT] final30_scored_lock_required" in caplog.text
+    assert "[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30" in caplog.text

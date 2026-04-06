@@ -15,8 +15,6 @@ def test_entry_guard_raises_system_exit_2_when_final30_missing(monkeypatch):
     engine.final30_source = "none"
     engine._universe_context = None
 
-    monkeypatch.setattr(pb1_engine, "load_final30", lambda env, as_of: None)
-
     with pytest.raises(SystemExit) as exc:
         PB1Engine._load_entry_final30_or_abort(engine, "2026-02-20")
 

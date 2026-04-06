@@ -1806,7 +1806,7 @@ def main() -> int:
             return 1
 
     watchlist_repo = WatchlistRepo(engine)
-    watchlist_final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+    watchlist_final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
     if watchlist:
         watchlist_repo.save_watchlist(
             env=env,
@@ -1822,34 +1822,11 @@ def main() -> int:
         )
         stage_as_of["final30"] = as_of.isoformat()
         
-        # final30 snapshot is a compatibility artifact only.
-        from trader.final_list_store import save_final30
-        final30_codes = [str(m.get("code") or "").zfill(6) for m in watchlist if m.get("code")]
-        final30_meta = {
-            "strategy": watchlist_final_strategy,
-            "source": "prep_runner",
-            "bundle_source": watchlist_bundle.get("degrade", {}).get("reason", "fresh_build"),
-            "final_count": len(watchlist),
-        }
-        try:
-            final30_path = save_final30(
-                env=env,
-                as_of=as_of.isoformat(),
-                symbols=final30_codes,
-                meta=final30_meta,
-                overwrite=True,
-            )
-            logger.info(
-                "[PREP][FINAL30_SNAPSHOT][SAVE] as_of=%s count=%s path=%s warn_only=1",
-                as_of.isoformat(),
-                len(final30_codes),
-                final30_path,
-            )
-        except Exception as exc:
+        if _env_true("DEBUG_EXPORT_RUNTIME", "0"):
             logger.warning(
-                "[PREP][FINAL30_SNAPSHOT][WARN] as_of=%s err=%s warn_only=1",
+                "[PREP][FINAL30_SNAPSHOT][DEBUG_ONLY] as_of=%s count=%s",
                 as_of.isoformat(),
-                exc,
+                len(watchlist),
             )
 
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
@@ -2810,7 +2787,13 @@ def main() -> int:
     # Verify DB saved counts
     watchlist_repo = WatchlistRepo(engine)
     saved_counts = {}
-    for strategy_key in ["pb1_universe_scored", "pb1_pool120", "pb1_top50", "pb1_watchlist_final_scored"]:
+    for strategy_key in [
+        "pb1_universe_scored",
+        "pb1_pool120",
+        "pb1_top50",
+        "pb1_watchlist_final",
+        "pb1_watchlist_final_scored",
+    ]:
         try:
             rows, _ = watchlist_repo.load_watchlist(
                 env=env,

@@ -142,7 +142,18 @@ from trader.config import (
     resolve_market_window,
 )
 from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
-from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, UniverseRepo, WatchlistRepo, DerivedMinerviniRepo
+from trader.db.repos import (
+    DerivedMinerviniRepo,
+    FillsRepo,
+    LedgerEventsRepo,
+    OrdersRepo,
+    PositionsRepo,
+    ScoredWatchlistInvalidError,
+    ScoredWatchlistNotFoundError,
+    UniverseRepo,
+    WatchlistRepo,
+    load_final30_scored_db_only,
+)
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI, KISBlockedError, extract_order_no, is_order_accepted
 from trader.ledger.store import LedgerStore
@@ -176,7 +187,7 @@ from trader.window_router import WindowDecision
 from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
-from trader.final_list_store import get_as_of_date, load_final30, save_final30
+from trader.final_list_store import get_as_of_date
 from trader.final30_quality import validate_trade_ready
 from trader.minervini_filter import compute_minervini_signals, select_buyable_with_relax, minervini_filter
 from trader.entry_signals import breakout_signal, pullback_signal, momentum_signal
@@ -7769,19 +7780,18 @@ class PB1Engine:
         missing_cols = self._scored_missing_cols(cols)
         normalized_source = self._normalize_trade_input_source(frame)
         if normalized_source == "db_plain_universe":
-            return "plain_universe_contamination", missing_cols
+            return "invalid_db_exact_scored_final30_contract", missing_cols
         if normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
-            return "missing_locked_scored_final30", missing_cols
+            return "missing_db_exact_scored_final30", missing_cols
         if rows == 0:
-            return "missing_locked_scored_final30", missing_cols
+            return "missing_db_exact_scored_final30", missing_cols
         if rows != 30:
-            return "rows_not_30", missing_cols
+            return "invalid_db_exact_scored_final30_contract", missing_cols
         if missing_cols:
-            return "required_scored_cols_missing", missing_cols
-        return "missing_locked_scored_final30", missing_cols
+            return "invalid_db_exact_scored_final30_contract", missing_cols
+        return "missing_db_exact_scored_final30", missing_cols
 
     def _abort_locked_final30(self, *, as_of: str, reason: str, rows: int, missing_cols: list[str]) -> None:
-        resolve_fail_reason = "scored_final30_missing" if reason == "missing_locked_scored_final30" else reason
         normalized_source = self._normalize_trade_input_source()
         columns = [str(col) for col in (self.final30_df.columns.tolist() if isinstance(self.final30_df, pd.DataFrame) else [])]
         logger.info(
@@ -7789,17 +7799,14 @@ class PB1Engine:
             normalized_source,
             rows,
         )
-        logger.error("[FINAL30][ABORT] reason=scored_final30_not_available")
-        logger.error("[FINAL30][RESOLVE_FAIL] reason=%s", resolve_fail_reason)
-        logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=best_k_meta")
-        logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=candidate_pool")
-        logger.error("[FINAL30][FALLBACK_BLOCKED] from=pb1_watchlist_final_scored to=file_mirror")
-        if reason == "plain_universe_contamination":
+        logger.error("[FINAL30][ABORT] reason=%s", reason)
+        if reason == "invalid_db_exact_scored_final30_contract":
             logger.error(
                 "[PB1][ENTRY][INPUT_REJECT] reason=plain_universe_contamination rows=%s cols=%s",
                 rows,
                 columns,
             )
+        logger.error("[PB1][ENTRY][GUARD] db_locked_final30_scored_missing -> abort as_of=%s env=%s", as_of, self.env)
         logger.error("[PB1][ENTRY][ABORT] source=%s require_scored=1", normalized_source)
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         self._write_final30_input_reject_debug(
@@ -7859,7 +7866,7 @@ class PB1Engine:
             self._abort_locked_final30(as_of=as_of, reason=reason, rows=rows, missing_cols=missing_cols)
 
         if require_scored and normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
-            self._abort_locked_final30(as_of=as_of, reason="missing_locked_scored_final30", rows=rows, missing_cols=missing_cols)
+            self._abort_locked_final30(as_of=as_of, reason="missing_db_exact_scored_final30", rows=rows, missing_cols=missing_cols)
 
         logger.info(
             "[TRADE][READY][OK] source=%s as_of=%s rows=%s",
@@ -7949,49 +7956,37 @@ class PB1Engine:
         # ✅ trade 모드: watchlist_final only (no universe/candidate fallback)
         trade_mode = (os.getenv("MODE") or "").strip().lower() == "trade"
         if trade_mode:
-            repo = WatchlistRepo(self.engine)
-            pool_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
-            ttl_days = int(os.getenv("WATCHLIST_TTL_DAYS", "7"))
-            max_back_days = int(os.getenv("WATCHLIST_MAX_BACK_DAYS", "3"))
-
+            pool_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
             request_as_of = derived_as_of
-            rows, used_as_of = repo.load_watchlist(
-                env=pool_env,
-                strategy=pool_strategy,
-                as_of=request_as_of,
-                allow_latest_fallback=True,
-                ttl_days=ttl_days,
-                max_back_days=max_back_days,
-            )
-
-            if not rows or used_as_of is None:
+            try:
+                df = load_final30_scored_db_only(
+                    self.engine,
+                    env=pool_env,
+                    strategy=pool_strategy,
+                    as_of=request_as_of,
+                    require_exact_rows=30,
+                    fail_if_missing=True,
+                )
+            except ScoredWatchlistNotFoundError:
                 logger.error(
                     "[WATCHLIST][TRADE][MISS] requested=%s env=%s strategy=%s max_back_days=%d",
                     request_as_of,
                     pool_env,
                     pool_strategy,
-                    max_back_days,
+                    0,
                 )
-                return [], "watchlist_final_missing"
+                return [], "db_exact_scored_final30_missing"
+            except ScoredWatchlistInvalidError as exc:
+                logger.error(
+                    "[WATCHLIST][TRADE][INVALID] requested=%s env=%s strategy=%s reason=%s",
+                    request_as_of,
+                    pool_env,
+                    pool_strategy,
+                    exc.reason,
+                )
+                raise RuntimeError("db_exact_scored_final30_invalid") from exc
 
-            age = (request_as_of - used_as_of).days
-            if age > ttl_days:
-                logger.error(
-                    "[WATCHLIST][TRADE][TTL_EXCEEDED] requested=%s actual=%s age=%d ttl_days=%d",
-                    request_as_of,
-                    used_as_of,
-                    age,
-                    ttl_days,
-                )
-                return [], "watchlist_final_ttl_exceeded"
-            if len(rows) != 30:
-                logger.error(
-                    "[TRADE][WATCHLIST_FINAL][SIZE_INVALID] requested=%s actual=%s n=%d expected=30",
-                    request_as_of,
-                    used_as_of,
-                    len(rows),
-                )
-                raise RuntimeError(f"WATCHLIST_FINAL_SIZE_INVALID expected=30 actual={len(rows)}")
+            rows = [dict(item or {}) for item in df.to_dict(orient="records")]
 
             top10_codes = [str(item.get("code") or "").zfill(6) for item in rows[:10] if item.get("code")]
             logger.info(
@@ -7999,20 +7994,22 @@ class PB1Engine:
                 pool_env,
                 pool_strategy,
                 request_as_of,
-                used_as_of,
+                request_as_of,
                 len(rows),
             )
             logger.info(
-                "[TRADE][WATCHLIST_FINAL][TOP10] source=pb1_watchlist_final rank_basis=stored_rank codes=%s",
+                "[TRADE][WATCHLIST_FINAL][TOP10] source=db_pb1_watchlist_final_scored rank_basis=stored_rank codes=%s",
                 top10_codes,
             )
 
-            pool_codes = [item["code"] for item in rows]
-            members = [
-                {"code": code, "name": self._code_name_map.get(code, "")}
-                for code in pool_codes
-            ]
-            return members, "watchlist_final"
+            members = []
+            for row in rows:
+                member = dict(row)
+                code = str(member.get("code") or "").zfill(6)
+                member["code"] = code
+                member.setdefault("name", self._code_name_map.get(code, ""))
+                members.append(member)
+            return members, "db_exact_scored_final30"
 
         full_members = self._load_universe()
 
@@ -9010,33 +9007,13 @@ class PB1Engine:
             bool(self._universe_context),
         )
         
-        force_final30_rebuild = env_bool("FORCE_FINAL30_REBUILD", False)
         final30_codes: list[str] = []
 
         if self.phase == "prep":
-            existing_final30 = load_final30(self.env, as_of_final)
-            if existing_final30 and not force_final30_rebuild:
-                final30_codes = existing_final30
-                logger.info("[FINAL30][REUSE] as_of=%s count=%s", as_of_final, len(final30_codes))
-            else:
-                prep_members = self._build_universe()
-                prep_codes = [str(m.get("code") or "").zfill(6) for m in prep_members if m.get("code")]
-                prep_candidates = self._compute_candidates_from_codes(prep_codes)
-                final30_codes = self._select_final30_codes(prep_candidates)
-                final30_path = save_final30(
-                    env=self.env,
-                    as_of=as_of_final,
-                    symbols=final30_codes,
-                    meta={
-                        "source": "prep",
-                        "input_count": len(prep_codes),
-                        "setup_ok_count": len([c for c in prep_candidates if c.setup_ok]),
-                        "selected_count": len(final30_codes),
-                    },
-                    overwrite=force_final30_rebuild,
-                )
-                self._touched_files.append(final30_path)
-                logger.info("[FINAL30][SAVE] as_of=%s count=%s path=%s", as_of_final, len(final30_codes), final30_path)
+            if isinstance(self.final30_df, pd.DataFrame) and not self.final30_df.empty:
+                final30_codes = [str(code).zfill(6) for code in self.final30_df.get("code", pd.Series(dtype=str)).tolist() if str(code).strip()]
+            if env_bool("DEBUG_EXPORT_RUNTIME", False) and final30_codes:
+                logger.warning("[FINAL30][DEBUG_EXPORT_ONLY] as_of=%s count=%s", as_of_final, len(final30_codes))
 
         if self.phase == "entry":
             final30_codes = self._load_entry_final30_or_abort(as_of_final)
