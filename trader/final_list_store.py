@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 
 from trader.time_utils import now_kst
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_as_of_date() -> str:
@@ -19,6 +23,12 @@ def _final30_path(env: str, as_of: str) -> Path:
 
 
 def load_final30(env: str, as_of: str) -> list[str] | None:
+    if (os.getenv("MODE") or "").strip().lower() == "trade":
+        logger.warning(
+            "[FINAL30][FILE_SNAPSHOT][DIAG_ONLY] env=%s as_of=%s mode=trade",
+            env,
+            as_of,
+        )
     path = _final30_path(env=env, as_of=as_of)
     if not path.exists():
         return None

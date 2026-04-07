@@ -25,7 +25,7 @@ def test_trade_am_requires_scored_final30_lock(monkeypatch, caplog) -> None:
 
     caplog.set_level(logging.INFO)
 
-    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:db_exact_scored_zero_rows"):
         pb1_runner._load_universe_context(
             engine=object(),
             as_of="2026-04-03",

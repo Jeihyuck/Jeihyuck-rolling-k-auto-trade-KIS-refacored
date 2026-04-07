@@ -263,3 +263,26 @@ def test_decide_action_force_close_exit_run(monkeypatch):
 
     assert action == "run"
     assert target_start is None
+
+
+def test_pm_handoff_to_close_after_close_start(monkeypatch):
+    monkeypatch.setenv("FORCE_MARKET_WINDOW", "day")
+    monkeypatch.setenv("FORCE_PB1_PHASE", "entry")
+
+    now = datetime(2024, 1, 2, 15, 16, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    assert pb1_runner._pm_should_handoff_to_close(now) is True
+
+
+def test_forced_close_live_execution_enabled(monkeypatch):
+    monkeypatch.setenv("FORCE_MARKET_WINDOW", "close")
+    monkeypatch.setenv("PB1_PHASE_DEFAULT", "exit")
+    monkeypatch.setenv("FORCE_PB1_PHASE", "exit")
+    monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+    monkeypatch.setenv("FORCE_STRATEGY_MODE", "LIVE")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("FORCE_BLOCK_LIVE", "0")
+
+    assert pb1_runner._forced_close_live_execution_enabled() is True

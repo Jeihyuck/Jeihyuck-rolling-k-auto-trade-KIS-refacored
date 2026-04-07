@@ -37,7 +37,7 @@ def _rows() -> list[dict]:
 def test_load_locked_final30_from_db_succeeds_with_db_only_rows(monkeypatch) -> None:
     monkeypatch.setattr(
         pb1_runner,
-        "load_final30_scored_db_only",
+        "load_final30_scored_exact",
         lambda *_args, **_kwargs: pd.DataFrame(_rows()),
     )
 
@@ -63,9 +63,9 @@ def test_load_locked_final30_from_db_aborts_when_scored_rows_missing(monkeypatch
             missing_cols=["score_final"],
         )
 
-    monkeypatch.setattr(pb1_runner, "load_final30_scored_db_only", _raise_missing)
+    monkeypatch.setattr(pb1_runner, "load_final30_scored_exact", _raise_missing)
 
-    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:db_exact_scored_zero_rows"):
         pb1_runner.load_locked_final30_from_db(
             engine=object(),
             env="practice",
@@ -83,9 +83,9 @@ def test_hydrate_locked_final30_from_db_only_rejects_invalid_contract(monkeypatc
             missing_cols=["entry_style_selected"],
         )
 
-    monkeypatch.setattr(pb1_runner, "load_final30_scored_db_only", _raise_invalid)
+    monkeypatch.setattr(pb1_runner, "load_final30_scored_exact", _raise_invalid)
 
-    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:db_exact_scored_missing_critical_cols"):
         pb1_runner._hydrate_locked_final30_from_db_only(
             engine=object(),
             env="practice",
@@ -111,7 +111,7 @@ def test_assert_engine_boot_locked_final30_rejects_missing_dataframe() -> None:
         "final30_locked": True,
     }
 
-    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:db_exact_scored_zero_rows"):
         pb1_runner._assert_engine_boot_locked_final30(
             run_ctx=run_ctx,
             final30_df=pd.DataFrame(),
@@ -120,7 +120,7 @@ def test_assert_engine_boot_locked_final30_rejects_missing_dataframe() -> None:
 
 def test_hydrate_locked_final30_from_db_only_succeeds_without_any_files(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(pb1_runner, "resolve_repo_root", lambda: tmp_path)
-    monkeypatch.setattr(pb1_runner, "load_final30_scored_db_only", lambda *_args, **_kwargs: pd.DataFrame(_rows()))
+    monkeypatch.setattr(pb1_runner, "load_final30_scored_exact", lambda *_args, **_kwargs: pd.DataFrame(_rows()))
 
     df = pb1_runner._hydrate_locked_final30_from_db_only(
         engine=object(),
@@ -146,9 +146,9 @@ def test_hydrate_locked_final30_from_db_only_fails_even_if_file_exists(tmp_path,
             missing_cols=["score_final"],
         )
 
-    monkeypatch.setattr(pb1_runner, "load_final30_scored_db_only", _raise_missing)
+    monkeypatch.setattr(pb1_runner, "load_final30_scored_exact", _raise_missing)
 
-    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:db_exact_scored_zero_rows"):
         pb1_runner._hydrate_locked_final30_from_db_only(
             engine=object(),
             env="practice",

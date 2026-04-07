@@ -88,6 +88,7 @@ from trader.db.repos import (
     ScoredWatchlistInvalidError,
     ScoredWatchlistNotFoundError,
     UniverseRepo,
+    load_final30_scored_exact,
     load_final30_scored_db_only,
 )
 from trader.diagnostics.nontrading_smoke import (
@@ -450,19 +451,75 @@ def _log_final30_fallback_blocked() -> None:
 
 def _db_exact_scored_final30_abort_reason(exc: Exception | None = None) -> str:
     if isinstance(exc, ScoredWatchlistNotFoundError):
-        return "missing_db_exact_scored_final30"
-    return "invalid_db_exact_scored_final30_contract"
+        if int(getattr(exc, "rows", 0) or 0) == 0:
+            return "db_exact_scored_zero_rows"
+        return "db_exact_scored_not_loaded"
+    if isinstance(exc, ScoredWatchlistInvalidError):
+        reason = str(getattr(exc, "reason", "") or "")
+        if reason == "rows_not_30":
+            return "db_exact_scored_bad_rowcount"
+        if list(getattr(exc, "missing_cols", []) or []):
+            return "db_exact_scored_missing_critical_cols"
+    return "db_exact_scored_not_loaded"
+
+
+def _raise_entry_abort_precheck(reason: str) -> None:
+    raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
+
+
+def _validate_trade_locked_final30_or_raise(*, final30_df: pd.DataFrame | None, source_name: str) -> None:
+    frame = final30_df if isinstance(final30_df, pd.DataFrame) else pd.DataFrame()
+    if source_name != "db_pb1_watchlist_final_scored":
+        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s", source_name)
+        _raise_entry_abort_precheck("db_exact_scored_not_loaded")
+    if frame.empty:
+        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30")
+        _raise_entry_abort_precheck("db_exact_scored_zero_rows")
+    if len(frame) != 30:
+        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=rows_not_30 rows=%s", len(frame))
+        _raise_entry_abort_precheck("db_exact_scored_bad_rowcount")
+    missing_locked_cols = [
+        col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS
+        if col not in set(str(c) for c in frame.columns.tolist())
+    ]
+    if missing_locked_cols:
+        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s", missing_locked_cols)
+        _raise_entry_abort_precheck("db_exact_scored_missing_critical_cols")
+
+
+def _forced_close_live_execution_enabled() -> bool:
+    forced_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    forced_phase = ((os.getenv("FORCE_PB1_PHASE") or os.getenv("PB1_PHASE_DEFAULT") or "").strip().lower())
+    return bool(
+        forced_window == "close"
+        and forced_phase == "exit"
+        and (os.getenv("STRATEGY_MODE") or "").strip().upper() == "LIVE"
+        and (os.getenv("FORCE_STRATEGY_MODE") or "").strip().upper() == "LIVE"
+        and parse_bool_any(os.getenv("DRY_RUN"), default=True) is False
+        and parse_bool_any(os.getenv("DISABLE_LIVE_TRADING"), default=False) is False
+        and parse_bool_any(os.getenv("LIVE_TRADING_ENABLED"), default=False) is True
+        and parse_bool_any(os.getenv("FORCE_BLOCK_LIVE"), default=False) is False
+    )
+
+
+def _pm_should_handoff_to_close(now: datetime) -> bool:
+    forced_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    forced_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+    if forced_window != "day" or forced_phase != "entry":
+        return False
+    close_start = _parse_hhmm_to_time(CLOSE_AUCTION_START)
+    return now.time() >= close_start
 
 
 def _hydrate_locked_final30_from_db_only(*, engine, env: str, as_of: date | str) -> pd.DataFrame:
-    strategy_key = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+    strategy_key = os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored")).strip().lower()
     try:
-        df = load_final30_scored_db_only(
+        df = load_final30_scored_exact(
             engine,
             env=env,
             as_of=as_of,
             strategy=strategy_key,
-            require_exact_rows=30,
+            require_rows=30,
             fail_if_missing=True,
         )
     except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError) as exc:
@@ -529,13 +586,13 @@ def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: p
     locked = bool(run_ctx.get("final30_locked"))
     missing_cols = [col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS if col not in set(str(c) for c in frame.columns.tolist())]
     if not locked or source != "db_pb1_watchlist_final_scored" or rows == 0:
-        reason = "missing_db_exact_scored_final30"
+        reason = "db_exact_scored_zero_rows" if rows == 0 else "db_exact_scored_not_loaded"
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
-        raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
+        _raise_entry_abort_precheck(reason)
     if rows != 30 or missing_cols:
-        reason = "invalid_db_exact_scored_final30_contract"
+        reason = "db_exact_scored_bad_rowcount" if rows != 30 else "db_exact_scored_missing_critical_cols"
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
-        raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
+        _raise_entry_abort_precheck(reason)
     logger.info("[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s", rows)
 
 
@@ -1641,7 +1698,7 @@ def _load_universe_context(
                 "[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s",
                 trade_strategy,
             )
-            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
+            _raise_entry_abort_precheck("db_exact_scored_not_loaded")
         result = load_locked_final30_from_db(engine=engine, env=env, derived_as_of=as_of)
         df = result.get("df")
         df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
@@ -1656,24 +1713,7 @@ def _load_universe_context(
             int(bool(result.get("is_scored"))),
             result_columns,
         )
-        if result_source != "db_pb1_watchlist_final_scored":
-            logger.error(
-                "[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s",
-                result_source,
-            )
-            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
-        if df.empty or rows == 0:
-            logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30")
-            raise RuntimeError("ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30")
-        if rows != 30:
-            logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=rows_not_30 rows=%s", rows)
-            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
-        if missing_scored:
-            logger.error(
-                "[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s",
-                missing_scored,
-            )
-            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
+        _validate_trade_locked_final30_or_raise(final30_df=df, source_name=result_source)
 
         require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
         if require_scored and not bool(result.get("is_scored")):
@@ -1681,7 +1721,7 @@ def _load_universe_context(
                 "[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s",
                 missing_scored,
             )
-            raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
+            _raise_entry_abort_precheck("db_exact_scored_missing_critical_cols")
 
         if "rank_final30" in df.columns:
             df = df.sort_values(by=["rank_final30", "code"], ascending=[True, True], kind="mergesort")
@@ -2300,7 +2340,7 @@ def run_once(
         )
     
     # ✅ [1] intended_live 결정 (STRATEGY_MODE=LIVE 여부)
-    intended_live = (os.getenv("STRATEGY_MODE") == "LIVE")
+    intended_live = (os.getenv("STRATEGY_MODE") == "LIVE") or _forced_close_live_execution_enabled()
     
     # ✅ [2] LIVE_ENV_LOCK 호출 → dry_run 파싱 (단 한 번만)
     dry_run = _force_live_env_lock_if_needed(intended_live=intended_live)
@@ -2347,7 +2387,7 @@ def run_once(
             violations.append("NONTRADING_SMOKE == '1'")
         
         # ✅ FIX C: LIVE 플래그 충돌 시 DIAG로 강등 (abort 대신)
-        if violations:
+        if violations and not _forced_close_live_execution_enabled():
             logger.error(
                 "="*80
             )
@@ -2421,6 +2461,11 @@ def run_once(
         now_kst=now,
         force_mode_env=os.getenv("FORCE_STRATEGY_MODE"),
     )
+    if _forced_close_live_execution_enabled():
+        mode = "LIVE"
+        mode_source = "forced_close_live"
+        market_window = "close"
+        logger.info("[PB1][FORCED_CLOSE_LIVE] mode=LIVE market_window=close phase=exit")
     trading_day_detected = trading_day
     if os.getenv("TRADING_DAY") is not None:
         trading_day = _env_bool("TRADING_DAY", default=trading_day)
@@ -2435,7 +2480,7 @@ def run_once(
         market_window = auto_window
     
     # ✅ FIX C: LIVE 플래그 충돌 감지 후 mode 강등
-    if mode == "LIVE" and not intended_live:
+    if mode == "LIVE" and not intended_live and not _forced_close_live_execution_enabled():
         logger.error("="*80)
         logger.error("[PB1][LIVE][DOWNGRADE] Downgrading mode from LIVE to DIAG due to LIVE flag conflicts")
         logger.error("="*80)
@@ -2848,6 +2893,10 @@ def run_once(
         context_reasons or ["none"],
     )
 
+    if _pm_should_handoff_to_close(now):
+        logger.info("[PB1][PM][HANDOFF_TO_CLOSE] now_kst=%s close_start=%s", now.isoformat(), CLOSE_AUCTION_START)
+        return [], False, {}, phase_for_log, "HANDOFF_TO_CLOSE"
+
     def _remaining_seconds() -> float:
         if deadline_ts is None:
             return float("inf")
@@ -3169,6 +3218,11 @@ def run_once(
             setattr(ctx, "precomputed_derived_df", precomputed_derived_df)
             setattr(ctx, "precomputed_universe_df", precomputed_universe_df)
             setattr(ctx, "trade_use_precomputed_features", bool(trade_use_precomputed_features))
+        if (os.getenv("MODE") or "").strip().lower() == "trade":
+            _validate_trade_locked_final30_or_raise(
+                final30_df=precomputed_final30_df,
+                source_name=str(run_ctx.get("final30_source") or "none"),
+            )
         kis: KisAPI | None = None
         allow_compute_without_kis = bool(
             compute_only_full_run
@@ -3479,34 +3533,6 @@ def run_once(
             phase_name_for_engine,
             window_name_for_engine,
         )
-
-        if (os.getenv("MODE") or "").strip().lower() == "trade" and precomputed_final30_df.empty:
-            precomputed_final30_df = _hydrate_locked_final30_from_db_only(
-                engine=engine,
-                env=env_effective,
-                as_of=str(run_ctx.get("derived_as_of") or as_of),
-            )
-            run_ctx["final30_source"] = "db_pb1_watchlist_final_scored"
-            run_ctx["final30_locked"] = True
-            run_ctx["final30_rows"] = int(len(precomputed_final30_df))
-            run_ctx["final30_as_of"] = str(run_ctx.get("derived_as_of") or as_of)
-            run_ctx["final30_codes"] = [
-                str(code).zfill(6)
-                for code in precomputed_final30_df.get("code", pd.Series(dtype=str)).tolist()
-                if str(code).strip()
-            ]
-            setattr(ctx, "precomputed_final30_df", precomputed_final30_df)
-
-        if (os.getenv("MODE") or "").strip().lower() == "trade":
-            if precomputed_final30_df.empty:
-                raise RuntimeError("ENTRY_ABORT_PRECHECK:missing_db_exact_scored_final30")
-            missing_locked_cols = [
-                col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS
-                if col not in set(str(c) for c in precomputed_final30_df.columns.tolist())
-            ]
-            if missing_locked_cols:
-                logger.error("[TRADE][FINAL30][LOCKED_DF_INVALID] missing=%s cols=%s", missing_locked_cols, list(precomputed_final30_df.columns))
-                raise RuntimeError("ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract")
 
         _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
         engine_runner = PB1Engine(
@@ -3927,6 +3953,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         lock_conn.close()
         return
     exit_reason = "unknown"
+    sticky_precheck_reason: str | None = None
+    sticky_precheck_count = 0
     balance_api_calls = 0
     balance_cache_hits = 0
     balance_tick_cache_hits = 0
@@ -4000,6 +4028,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             try:
                 watchlist_repo = WatchlistRepo(engine)
                 watchlist_count = watchlist_repo.count_as_of(
+                    env=(os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice"),
+                    strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored")),
                     as_of=now_kst_value.date().isoformat()
                 )
                 if watchlist_count > 0:
@@ -4174,11 +4204,34 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     logger.info("[PB1][LOOP] non-trading-day exit status=%s", result_status)
                     exit_reason = result_status.lower()
                     break
+                if result_status == "HANDOFF_TO_CLOSE":
+                    logger.info("[PB1][LOOP] pm handoff to close -> exit")
+                    exit_reason = "handoff_to_close"
+                    break
                 if result_status == "NO_TRADE":
                     logger.info("[PB1][LOOP] no trade -> exit")
                     exit_reason = "no_candidates"
                     break
+                sticky_precheck_reason = None
+                sticky_precheck_count = 0
             except Exception as exc:
+                message = str(exc)
+                if message.startswith("ENTRY_ABORT_PRECHECK:"):
+                    precheck_reason = message.split(":", 1)[1]
+                    if sticky_precheck_reason == precheck_reason:
+                        sticky_precheck_count += 1
+                    else:
+                        sticky_precheck_reason = precheck_reason
+                        sticky_precheck_count = 1
+                    logger.error(
+                        "[PB1][PRECHECK][FATAL] reason=%s consecutive=%s",
+                        precheck_reason,
+                        sticky_precheck_count,
+                    )
+                    if sticky_precheck_count >= 2:
+                        exit_reason = "PRECHECK_FATAL_STICKY"
+                        logger.error("[PB1][PRECHECK][STICKY] reason=%s -> exit loop", precheck_reason)
+                        break
                 logger.error(
                     "[PB1][TICK][FATAL_GUARD] exception=%s\n%s",
                     exc,

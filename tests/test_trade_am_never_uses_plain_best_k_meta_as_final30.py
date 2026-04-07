@@ -39,7 +39,7 @@ def test_trade_am_never_uses_plain_best_k_meta_as_final30(monkeypatch, caplog) -
 
     caplog.set_level(logging.INFO)
 
-    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:invalid_db_exact_scored_final30_contract"):
+    with pytest.raises(RuntimeError, match="ENTRY_ABORT_PRECHECK:db_exact_scored_not_loaded"):
         pb1_runner._load_universe_context(
             engine=object(),
             as_of="2026-04-03",

@@ -1173,14 +1173,18 @@ class KisAPI:
 
     def _issue_token_and_expire(self):
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+        intended_live = os.getenv("INTENDED_LIVE", "0").strip()
+        dry_run = os.getenv("DRY_RUN", "")
         token_path = TR_MAP[self.env]["TOKEN"]
         url = f"{API_BASE_URL}{token_path}"
         allow_data_http_in_diag_raw = os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip()
         allow_data_http_in_diag = kis_data_http_allowed_in_diag()
         caller_route = _resolve_kis_http_caller_route(default="live")
         logger.info(
-            "[KIS][TOKEN_POLICY][ENV] STRATEGY_MODE=%s ALLOW_KIS_DATA_HTTP_IN_DIAG_RAW=%s parsed=%s caller=%s",
+            "[KIS][TOKEN_POLICY][ENV] STRATEGY_MODE=%s intended_live=%s dry_run=%s ALLOW_KIS_DATA_HTTP_IN_DIAG_RAW=%s parsed=%s caller=%s",
             strategy_mode,
+            intended_live,
+            dry_run or "",
             allow_data_http_in_diag_raw or "0",
             int(allow_data_http_in_diag),
             caller_route,
@@ -1188,21 +1192,27 @@ class KisAPI:
         http_allowed = kis_http_allowed(url, strategy_mode, allow_data_http_in_diag, caller_route)
         if not http_allowed:
             explicit_offline = kis_explicit_offline_mode()
+            block_reason = "explicit_offline" if explicit_offline else "http_policy_blocked"
             logger.info(
-                "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=%s explicit_offline=%s caller=%s",
+                "[KIS][TOKEN_POLICY] strategy_mode=%s intended_live=%s dry_run=%s allow_data_http_in_diag=%s http_allowed=%s source=%s explicit_offline=%s caller=%s block_reason=%s",
                 strategy_mode,
+                intended_live,
+                dry_run or "",
                 int(allow_data_http_in_diag),
                 int(http_allowed),
                 "dummy_token" if explicit_offline else "blocked",
                 int(explicit_offline),
                 caller_route,
+                block_reason,
             )
             if explicit_offline:
                 return "DIAG_DUMMY_TOKEN", 21600
             raise KISBlockedError("token endpoint blocked by HTTP policy")
         logger.info(
-            "[KIS][TOKEN_POLICY] strategy_mode=%s allow_data_http_in_diag=%s http_allowed=%s source=real_http caller=%s",
+            "[KIS][TOKEN_POLICY] strategy_mode=%s intended_live=%s dry_run=%s allow_data_http_in_diag=%s http_allowed=%s source=real_http caller=%s block_reason=none",
             strategy_mode,
+            intended_live,
+            dry_run or "",
             int(allow_data_http_in_diag),
             int(http_allowed),
             caller_route,

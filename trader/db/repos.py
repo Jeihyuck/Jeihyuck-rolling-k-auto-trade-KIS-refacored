@@ -68,6 +68,7 @@ __all__ = [
     "save_pb1_watchlist_rows",
     "load_pb1_watchlist_codes",
     "load_watchlist_scored",
+    "load_final30_scored_exact",
     "load_final30_scored_db_only",
     "FLOW_OPTIONAL_COLS",
     "REQUIRED_FINAL30_SCORED_COLS",
@@ -3681,6 +3682,19 @@ class WatchlistRepo:
             )
             return int(conn.execute(stmt).scalar() or 0)
 
+    def count_as_of(
+        self,
+        *,
+        env: str,
+        as_of: date | str,
+        strategy: str = "pb1_watchlist_final_scored",
+    ) -> int:
+        return self.count_watchlist(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+        )
+
     def verify_watchlist_scored_contract(
         self,
         *,
@@ -3994,6 +4008,97 @@ class WatchlistRepo:
         if len(result) == FINAL30_SCORED_REQUIRED_ROWS and not missing_loaded_fields:
             logger.info("[DB][FINAL30_SCORED][ROUNDTRIP_OK] rows=%s usable=1", len(result))
         return result, used_as_of
+
+    def load_final30_scored_exact(
+        self,
+        *,
+        env: str,
+        as_of: date | str,
+        strategy: str = "pb1_watchlist_final_scored",
+        require_rows: int = FINAL30_SCORED_REQUIRED_ROWS,
+        require_scored: bool = True,
+        fail_if_missing: bool = False,
+    ) -> pd.DataFrame:
+        env_n = _norm_env(env)
+        as_of_date = to_date(as_of)
+        strategy_n = _norm_strategy(strategy) or "pb1_watchlist_final_scored"
+        rows, used_as_of = self.load_watchlist_scored(
+            env=env_n,
+            strategy=strategy_n,
+            as_of=as_of_date,
+            allow_latest_fallback=False,
+            require_exact_rows=require_rows,
+            require_scored=require_scored,
+            fail_if_missing=fail_if_missing,
+        )
+
+        exact_count = len(rows) if used_as_of == as_of_date else 0
+        logger.info(
+            "[DB][FINAL30_SCORED][EXACT_COUNT] env=%s as_of=%s rows=%s",
+            env_n,
+            as_of_date.isoformat(),
+            exact_count,
+        )
+
+        df = pd.DataFrame(list(rows or []))
+        if not df.empty:
+            if "rank_final30" not in df.columns and "rank" in df.columns:
+                df["rank_final30"] = df["rank"]
+            if "as_of" not in df.columns:
+                df["as_of"] = as_of_date.isoformat()
+            else:
+                df["as_of"] = df["as_of"].astype(str)
+            if "code" in df.columns:
+                df["code"] = df["code"].astype(str).str.zfill(6)
+
+        columns = [str(col) for col in df.columns.tolist()]
+        missing_critical_fields = [
+            field
+            for field in CRITICAL_SCORED_COLS
+            if field not in set(columns)
+        ]
+        contract_ok = int(len(df) == int(require_rows) and not missing_critical_fields)
+        usable = int(contract_ok == 1)
+        logger.info(
+            "[DB][FINAL30_SCORED][LOAD_VERIFY] rows=%s cols=%s",
+            len(df),
+            columns,
+        )
+        logger.info(
+            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=%s rows=%s is_scored=%s contract_ok=%s usable=%s missing_critical_fields=%s",
+            "db_pb1_watchlist_final_scored" if not df.empty else "none",
+            len(df),
+            int(not missing_critical_fields),
+            contract_ok,
+            usable,
+            missing_critical_fields,
+        )
+
+        if fail_if_missing and df.empty:
+            raise ScoredWatchlistNotFoundError(
+                "scored_final30_missing",
+                expected_strategy="pb1_watchlist_final_scored",
+                actual_strategy=strategy_n,
+                rows=0,
+                missing_cols=CRITICAL_SCORED_COLS,
+            )
+        if fail_if_missing and len(df) != int(require_rows):
+            raise ScoredWatchlistInvalidError(
+                "rows_not_30",
+                expected_strategy="pb1_watchlist_final_scored",
+                actual_strategy=strategy_n,
+                rows=len(df),
+                missing_cols=missing_critical_fields,
+            )
+        if fail_if_missing and missing_critical_fields:
+            raise ScoredWatchlistInvalidError(
+                "required_scored_cols_missing",
+                expected_strategy="pb1_watchlist_final_scored",
+                actual_strategy=strategy_n,
+                rows=len(df),
+                missing_cols=missing_critical_fields,
+            )
+        return df
     
     def get_latest_watchlist_date(
         self,
@@ -4046,6 +4151,27 @@ def load_watchlist_scored(
     )
 
 
+def load_final30_scored_exact(
+    engine: Engine,
+    *,
+    env: str,
+    as_of: date | str,
+    strategy: str = "pb1_watchlist_final_scored",
+    require_rows: int = FINAL30_SCORED_REQUIRED_ROWS,
+    require_scored: bool = True,
+    fail_if_missing: bool = False,
+) -> pd.DataFrame:
+    repo = WatchlistRepo(engine)
+    return repo.load_final30_scored_exact(
+        env=env,
+        as_of=as_of,
+        strategy=strategy,
+        require_rows=require_rows,
+        require_scored=require_scored,
+        fail_if_missing=fail_if_missing,
+    )
+
+
 def load_final30_scored_db_only(
     engine: Engine,
     *,
@@ -4066,34 +4192,14 @@ def load_final30_scored_db_only(
     )
 
     repo = WatchlistRepo(engine)
-    rows, used_as_of = repo.load_watchlist_scored(
+    df = repo.load_final30_scored_exact(
         env=env_n,
-        strategy=strategy_n,
         as_of=as_of_date,
-        allow_latest_fallback=False,
-        require_exact_rows=require_exact_rows,
+        strategy=strategy_n,
+        require_rows=require_exact_rows,
         require_scored=True,
         fail_if_missing=fail_if_missing,
     )
-
-    exact_count = len(rows) if used_as_of == as_of_date else 0
-    logger.info(
-        "[DB][FINAL30_SCORED][EXACT_COUNT] env=%s as_of=%s rows=%s",
-        env_n,
-        as_of_date.isoformat(),
-        exact_count,
-    )
-
-    df = pd.DataFrame(list(rows or []))
-    if not df.empty:
-        if "rank_final30" not in df.columns and "rank" in df.columns:
-            df["rank_final30"] = df["rank"]
-        if "as_of" not in df.columns:
-            df["as_of"] = as_of_date.isoformat()
-        else:
-            df["as_of"] = df["as_of"].astype(str)
-        if "code" in df.columns:
-            df["code"] = df["code"].astype(str).str.zfill(6)
 
     cols = [str(col) for col in df.columns.tolist()]
     logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY] rows=%s cols=%s", len(df), cols)

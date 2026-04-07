@@ -17,6 +17,14 @@ from trader.pb1_engine import UniverseContext
 logger = logging.getLogger(__name__)
 
 
+def _plain_watchlist_strategy_key() -> str:
+    return os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+
+
+def _scored_watchlist_strategy_key() -> str:
+    return os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+
+
 def load_watchlist_for_trade(
     *,
     engine,
@@ -52,7 +60,7 @@ def load_watchlist_for_trade(
     """
     as_of_date = to_date(as_of)
     env_n = (env or "").strip().lower()
-    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+    forced_strategy = _scored_watchlist_strategy_key()
     if strategy.strip().lower() != forced_strategy:
         logger.warning(
             "[WATCHLIST][TRADE][FORCE_STRATEGY] requested=%s forced=%s",
@@ -107,9 +115,11 @@ def load_watchlist_for_trade(
             members=members,
             selected_path=None,
             meta={
-                "source": "watchlist",
+                "source": "watchlist_scored",
                 "as_of": as_of_date.isoformat(),
                 "count": len(members),
+                "plain_strategy": _plain_watchlist_strategy_key(),
+                "scored_strategy": forced_strategy,
             },
             is_empty=len(members) == 0,
         )
@@ -163,7 +173,7 @@ def load_today_watchlist_with_fallback(
     """
     as_of_date = to_date(as_of)
     env_n = (env or "").strip().lower()
-    forced_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip()
+    forced_strategy = _scored_watchlist_strategy_key()
 
     try:
         df = load_final30_scored_db_only(
@@ -194,11 +204,13 @@ def load_today_watchlist_with_fallback(
             members=members,
             selected_path=None,
             meta={
-                "source": "watchlist",
+                "source": "watchlist_scored",
                 "requested_as_of": as_of_date.isoformat(),
                 "actual_as_of": as_of_date.isoformat(),
                 "age_days": 0,
                 "count": len(members),
+                "plain_strategy": _plain_watchlist_strategy_key(),
+                "scored_strategy": forced_strategy,
             },
             is_empty=len(members) == 0,
         )
