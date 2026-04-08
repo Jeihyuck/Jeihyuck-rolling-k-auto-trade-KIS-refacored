@@ -4576,22 +4576,71 @@ def main() -> int:
             scored_contract,
             missing_critical_fields=scored_missing_critical,
         )
+        plain_final_ok = bool(watchlist_final_count == 30)
+        scored_final_ok = bool(
+            watchlist_scored_count == 30
+            and not scored_missing_critical
+            and (scored_contract.get("ok") or scored_contract_repairable)
+        )
+        repairable_plain_from_scored = bool(
+            (not plain_final_ok)
+            and scored_final_ok
+        )
+        logged_watchlist_final_count = watchlist_final_count
+        logged_watchlist_scored_count = watchlist_scored_count
+        if repairable_plain_from_scored:
+            scored_rows_data = list(scored_contract.get("rows_data") or [])
+            plain_backfill_members = []
+            for idx, row in enumerate(scored_rows_data, start=1):
+                normalized = normalize_final30_contract_row(dict(row or {}))
+                code = str(normalized.get("code") or "").zfill(6)
+                if not code:
+                    continue
+                plain_backfill_members.append(
+                    {
+                        "code": code,
+                        "rank": int(normalized.get("rank") or normalized.get("rank_final30") or idx),
+                        "score": normalized.get("score_final", normalized.get("final_score", normalized.get("score"))),
+                        "meta": dict(normalized.get("meta") or {}),
+                    }
+                )
+
+            if plain_backfill_members:
+                watchlist_repo.save_watchlist(
+                    env=derived_env,
+                    strategy="pb1_watchlist_final",
+                    as_of=derived_as_of,
+                    members=plain_backfill_members,
+                )
+                watchlist_final_count = watchlist_repo.count_watchlist(
+                    env=derived_env,
+                    strategy="pb1_watchlist_final",
+                    as_of=derived_as_of,
+                )
+                plain_final_ok = bool(watchlist_final_count == 30)
+                logger.warning(
+                    "[TRADE_TICK][DB_CONTRACT][BACKFILL_PLAIN_FROM_SCORED] env=%s as_of=%s repaired_rows=%s plain_final_ok=%s",
+                    derived_env,
+                    derived_as_of.isoformat(),
+                    len(plain_backfill_members),
+                    int(plain_final_ok),
+                )
         db_contract_ok = bool(
             prep_done
             and derived_count > 0
-            and watchlist_final_count == 30
-            and watchlist_scored_count == 30
-            and (scored_contract.get("ok") or scored_contract_repairable)
+            and (plain_final_ok or scored_final_ok)
         )
         logger.info(
-            "[TRADE_TICK][DB_CONTRACT] env=%s as_of=%s prep_done=%s derived_minervini=%s watchlist_final=%s watchlist_final_scored=%s repairable=%s db_contract_ok=%s",
+            "[TRADE_TICK][DB_CONTRACT] env=%s as_of=%s prep_done=%s derived_minervini=%s watchlist_final=%s watchlist_final_scored=%s plain_ok=%s scored_ok=%s repairable_plain_from_scored=%s db_contract_ok=%s",
             derived_env,
             derived_as_of.isoformat(),
             int(prep_done),
             derived_count,
-            watchlist_final_count,
-            watchlist_scored_count,
-            int(scored_contract_repairable),
+            logged_watchlist_final_count,
+            logged_watchlist_scored_count,
+            int(logged_watchlist_final_count == 30),
+            int(scored_final_ok),
+            int(repairable_plain_from_scored),
             int(db_contract_ok),
         )
         logger.info(
@@ -4604,13 +4653,15 @@ def main() -> int:
         if not db_contract_ok:
             logger.error("[TRADE][READY][FAIL] reason=candidate_pool_or_db_contract_invalid")
             logger.warning(
-                "[TRADE_TICK][SKIP] reason=DB_CONTRACT_INCOMPLETE derived_as_of=%s trade_date=%s rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s",
+                "[TRADE_TICK][SKIP] reason=DB_CONTRACT_INCOMPLETE derived_as_of=%s trade_date=%s plain_rows=%s scored_rows=%s uniq_codes=%s uniq_ranks=%s null_critical=%s missing_critical=%s",
                 derived_as_of.isoformat(),
                 trade_date.isoformat(),
-                scored_contract.get("rows"),
+                watchlist_final_count,
+                watchlist_scored_count,
                 scored_contract.get("uniq_codes"),
                 scored_contract.get("uniq_ranks"),
                 scored_contract.get("null_critical"),
+                scored_missing_critical,
             )
             return 0
         

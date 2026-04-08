@@ -751,6 +751,7 @@ def save_final30_scored_core(
     *,
     engine: Any,
     final_strategy: str = "pb1_watchlist_final",
+    final_scored_strategy: str = "pb1_watchlist_final_scored",
     watchlist_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     logger.info(
@@ -782,7 +783,7 @@ def save_final30_scored_core(
     )
     watchlist_repo.save_watchlist(
         env=env,
-        strategy="pb1_watchlist_final_scored",
+        strategy=final_scored_strategy,
         as_of=as_of,
         members=scored_members,
     )
@@ -795,7 +796,7 @@ def save_final30_scored_core(
     scored_contract = watchlist_repo.verify_watchlist_scored_contract(
         env=env,
         as_of=as_of,
-        strategy="pb1_watchlist_final_scored",
+        strategy=final_scored_strategy,
         allow_latest_fallback=False,
     )
     scored_columns = set(scored_contract.get("columns") or [])
@@ -833,7 +834,7 @@ def save_final30_scored_core(
     reload_contract = watchlist_repo.verify_watchlist_scored_contract(
         env=env,
         as_of=as_of,
-        strategy="pb1_watchlist_final_scored",
+        strategy=final_scored_strategy,
         allow_latest_fallback=False,
     )
     reload_rows = list(reload_contract.get("rows_data") or [])
@@ -1806,7 +1807,15 @@ def main() -> int:
             return 1
 
     watchlist_repo = WatchlistRepo(engine)
-    watchlist_final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+    watchlist_final_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final").strip().lower()
+    watchlist_final_scored_strategy = os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+    if watchlist_final_strategy == watchlist_final_scored_strategy:
+        logger.warning(
+            "[PREP][WATCHLIST_STRATEGY][FIXUP] final_strategy=%s scored_strategy=%s -> forcing plain final strategy to pb1_watchlist_final",
+            watchlist_final_strategy,
+            watchlist_final_scored_strategy,
+        )
+        watchlist_final_strategy = "pb1_watchlist_final"
     if watchlist:
         watchlist_repo.save_watchlist(
             env=env,
@@ -1889,12 +1898,21 @@ def main() -> int:
         env,
         engine=engine,
         final_strategy=watchlist_final_strategy,
+        final_scored_strategy=watchlist_final_scored_strategy,
         watchlist_rows=watchlist,
     )
     exact_final_rows = list(core_save_result.get("exact_final_rows") or [])
     scored_contract = dict(core_save_result.get("scored_contract") or {})
     final30_file_results = dict(core_save_result.get("file_results") or {})
     final30_files_validation = dict(core_save_result.get("validation") or {})
+    logger.info(
+        "[PREP][FINAL30][DUAL_SAVE_VERIFY] as_of=%s plain_strategy=%s scored_strategy=%s plain_rows=%s scored_rows=%s",
+        as_of.isoformat(),
+        watchlist_final_strategy,
+        watchlist_final_scored_strategy,
+        len(exact_final_rows),
+        int(scored_contract.get("rows") or 0),
+    )
     logger.info("[PREP][DONE_CORE][DB_OK] rows=%s", core_save_result.get("db_rows", 0))
     logger.info(
         "[PREP][DONE_CORE][RUNTIME_OK] rows=%s path=%s",
