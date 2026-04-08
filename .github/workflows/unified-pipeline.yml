@@ -104,6 +104,7 @@ jobs:
       kis_http_enabled: ${{ steps.resolve.outputs.kis_http_enabled }}
       no_trade: ${{ steps.resolve.outputs.no_trade }}
       allow_kis_data_http_in_diag: ${{ steps.resolve.outputs.allow_kis_data_http_in_diag }}
+      allow_after_close_entry_dryrun: ${{ steps.resolve.outputs.allow_after_close_entry_dryrun }}
     steps:
       - name: Resolve manual route
         id: resolve
@@ -114,6 +115,8 @@ jobs:
           FORCE_RUN_INPUT: ${{ inputs.FORCE_RUN || '0' }}
           WATCHLIST_MODE_INPUT: ${{ inputs.WATCHLIST_MODE || '0' }}
           PB1_DIAG_FULL_EXEC_INPUT: ${{ inputs.PB1_DIAG_FULL_EXEC || '0' }}
+          FORCE_MARKET_WINDOW_INPUT: ${{ inputs.FORCE_MARKET_WINDOW || '' }}
+          FORCE_PB1_PHASE_INPUT: ${{ inputs.FORCE_PB1_PHASE || '' }}
           ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT: ${{ inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
         run: |
           set -euo pipefail
@@ -128,10 +131,15 @@ jobs:
           kis_http_enabled="1"
           no_trade="0"
           allow_kis_data_http_in_diag="${ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT}"
+          allow_after_close_entry_dryrun="0"
 
           manual_trade_route=0
           if [[ "${MODE_INPUT}" == "trade" && ( "${FORCE_RUN_INPUT}" == "1" || "${PB1_DIAG_FULL_EXEC_INPUT}" == "1" || "${WATCHLIST_MODE_INPUT}" == "1" ) ]]; then
             manual_trade_route=1
+          fi
+
+          if [[ "${MODE_INPUT}" == "trade" && "${PB1_DIAG_FULL_EXEC_INPUT}" == "1" && "${FORCE_MARKET_WINDOW_INPUT}" == "day" && "${FORCE_PB1_PHASE_INPUT}" == "entry" ]]; then
+            allow_after_close_entry_dryrun="1"
           fi
 
           if [[ "${MODE_INPUT}" == "prep" ]]; then
@@ -171,6 +179,7 @@ jobs:
             echo "kis_http_enabled=${kis_http_enabled}"
             echo "no_trade=${no_trade}"
             echo "allow_kis_data_http_in_diag=${allow_kis_data_http_in_diag}"
+            echo "allow_after_close_entry_dryrun=${allow_after_close_entry_dryrun}"
           } >> "$GITHUB_OUTPUT"
 
   manual_debug:
@@ -217,6 +226,7 @@ jobs:
       PB1_UNIVERSE_STRATEGY: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_UNIVERSE_STRATEGY || 'pb1_watchlist_final_scored' }}
       TRADE_REQUIRE_PREP_FINAL30_SCORED: ${{ github.event_name == 'workflow_dispatch' && inputs.TRADE_REQUIRE_PREP_FINAL30_SCORED || '1' }}
       ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ needs.resolve.outputs.allow_kis_data_http_in_diag }}
+      PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN: ${{ needs.resolve.outputs.allow_after_close_entry_dryrun }}
 
     steps:
       - name: Checkout
@@ -279,6 +289,7 @@ jobs:
           echo "PB1_UNIVERSE_STRATEGY=${PB1_UNIVERSE_STRATEGY:-}"
           echo "TRADE_REQUIRE_PREP_FINAL30_SCORED=${TRADE_REQUIRE_PREP_FINAL30_SCORED:-}"
           echo "ALLOW_KIS_DATA_HTTP_IN_DIAG=${ALLOW_KIS_DATA_HTTP_IN_DIAG:-}"
+          echo "PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN=${PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN:-}"
 
       - name: Verify exact scored final30 in DB for trade and close
         if: ${{ inputs.mode == 'trade' || inputs.mode == 'close' }}

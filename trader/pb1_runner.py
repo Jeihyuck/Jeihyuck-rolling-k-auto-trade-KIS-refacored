@@ -511,6 +511,28 @@ def _pm_should_handoff_to_close(now: datetime) -> bool:
     return now.time() >= close_start
 
 
+def _after_close_entry_dryrun_enabled(now: datetime) -> bool:
+    forced_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    forced_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+    mode_input = (os.getenv("MODE") or "").strip().lower()
+    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
+    allow_flag = parse_bool_any(os.getenv("PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN"), default=False)
+    dry_run = parse_bool_any(os.getenv("DRY_RUN"), default=True)
+    force_block_live = parse_bool_any(os.getenv("FORCE_BLOCK_LIVE"), default=False)
+    close_start = _parse_hhmm_to_time(CLOSE_AUCTION_START)
+
+    return bool(
+        allow_flag
+        and mode_input == "trade"
+        and strategy_mode == "DIAG"
+        and forced_window == "day"
+        and forced_phase == "entry"
+        and dry_run is True
+        and force_block_live is True
+        and now.time() >= close_start
+    )
+
+
 def _hydrate_locked_final30_from_db_only(*, engine, env: str, as_of: date | str) -> pd.DataFrame:
     strategy_key = os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored")).strip().lower()
     try:
@@ -2546,6 +2568,19 @@ def run_once(
         resolved_phase = diag_phase
         phase_reason = "diag_full_exec_override"
         context_reasons.append("diag_full_exec:forced_" + diag_window + "_" + diag_phase)
+
+    after_close_entry_dryrun = _after_close_entry_dryrun_enabled(now)
+
+    if after_close_entry_dryrun:
+        logger.warning(
+            "[PB1][AFTER_CLOSE_ENTRY_DRYRUN][ENABLED] now_kst=%s mode=%s force_window=%s force_phase=%s dry_run=%s force_block_live=%s",
+            now.isoformat(),
+            os.getenv("STRATEGY_MODE"),
+            os.getenv("FORCE_MARKET_WINDOW"),
+            os.getenv("FORCE_PB1_PHASE"),
+            os.getenv("DRY_RUN"),
+            os.getenv("FORCE_BLOCK_LIVE"),
+        )
     
     if window is not None:
         resolved_window = window
@@ -2893,7 +2928,15 @@ def run_once(
         context_reasons or ["none"],
     )
 
-    if _pm_should_handoff_to_close(now):
+    pm_should_handoff = _pm_should_handoff_to_close(now)
+
+    if pm_should_handoff and after_close_entry_dryrun:
+        logger.warning(
+            "[PB1][PM][HANDOFF_TO_CLOSE][BYPASS] now_kst=%s close_start=%s reason=after_close_entry_dryrun",
+            now.isoformat(),
+            CLOSE_AUCTION_START,
+        )
+    elif pm_should_handoff:
         logger.info("[PB1][PM][HANDOFF_TO_CLOSE] now_kst=%s close_start=%s", now.isoformat(), CLOSE_AUCTION_START)
         return [], False, {}, phase_for_log, "HANDOFF_TO_CLOSE"
 
@@ -3415,6 +3458,18 @@ def run_once(
             logger.info(
                 "[PB1][ORDER_BLOCKED] reason=%s order_allowed=0",
                 entry_block_reason or "unknown",
+            )
+
+        if after_close_entry_dryrun:
+            calc_allowed = True
+            order_allowed = False
+            entry_block_reason = "after_close_entry_dryrun"
+            logger.warning(
+                "[PB1][AFTER_CLOSE_ENTRY_DRYRUN][COMPUTE_ONLY] calc_allowed=%s price_allowed=%s order_allowed=%s reason=%s",
+                int(calc_allowed),
+                int(price_allowed),
+                int(order_allowed),
+                entry_block_reason,
             )
 
         nontrading_eval_mode = _is_nontrading_eval_mode(
