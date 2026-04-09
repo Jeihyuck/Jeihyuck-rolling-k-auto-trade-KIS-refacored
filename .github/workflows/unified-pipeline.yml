@@ -227,6 +227,11 @@ jobs:
       TRADE_REQUIRE_PREP_FINAL30_SCORED: ${{ github.event_name == 'workflow_dispatch' && inputs.TRADE_REQUIRE_PREP_FINAL30_SCORED || '1' }}
       ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ needs.resolve.outputs.allow_kis_data_http_in_diag }}
       PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN: ${{ needs.resolve.outputs.allow_after_close_entry_dryrun }}
+      DB_LOCK_TIMEOUT_MS: "5000"
+      DB_STATEMENT_TIMEOUT_MS: "15000"
+      DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+      PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+      PB1_BUYABLE_GATE_MAX_SEC: "20"
 
     steps:
       - name: Checkout

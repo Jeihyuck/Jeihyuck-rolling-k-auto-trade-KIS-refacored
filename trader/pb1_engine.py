@@ -2881,6 +2881,100 @@ class PB1Engine:
             "run_id": fill_row.get("run_id"),
         }
 
+    def _buyable_gate_fail_open_enabled(self) -> bool:
+        if self.strategy_mode == "DIAG":
+            return True
+        if env_bool("NO_TRADE", False):
+            return True
+        if str(os.getenv("MANUAL_MODE") or "").strip():
+            return True
+        if str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() == "workflow_dispatch":
+            return True
+        workflow_name = str(os.getenv("GITHUB_WORKFLOW") or "").strip().lower()
+        return "manual" in workflow_name or "dispatch" in workflow_name
+
+    def _buyable_gate_max_sec(self) -> float:
+        raw = str(os.getenv("PB1_BUYABLE_GATE_MAX_SEC") or "20").strip()
+        try:
+            return max(float(raw), 0.0)
+        except ValueError:
+            return 20.0
+
+    def _buyable_gate_timeout_exceeded(self, *, code: str, started: float, max_sec: float) -> bool:
+        if max_sec <= 0:
+            return False
+        elapsed = time.perf_counter() - started
+        if elapsed <= max_sec:
+            return False
+        logger.warning(
+            "[PB1][BUYABLE_GATE][TIMEOUT] code=%s elapsed=%.2f max_sec=%s -> skip_candidate",
+            self._display_code(code),
+            elapsed,
+            max_sec,
+        )
+        return True
+
+    def _build_candidate_buyable_gate_snapshot(
+        self,
+        *,
+        code: str,
+        position: dict[str, Any] | None,
+        today_fills: list[dict[str, Any]] | None,
+        prior_order: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        code_key = str(code or "").zfill(6)
+        pos = dict(position or {})
+        fill_rows = [dict(row) for row in (today_fills or [])]
+        fill_rows_sorted = sorted(
+            fill_rows,
+            key=lambda row: self._coerce_kst_datetime(row.get("filled_at") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
+            reverse=True,
+        )
+        today_buy_events = [
+            self._normalize_today_buy_event(row)
+            for row in fill_rows_sorted
+            if str(row.get("side") or "BUY").upper() == "BUY"
+        ]
+        last_buy_fill = next(
+            (row for row in fill_rows_sorted if str(row.get("side") or "BUY").upper() == "BUY"),
+            None,
+        )
+        last_fill_event = fill_rows_sorted[0] if fill_rows_sorted else None
+        cooldown_until_raw = str(pos.get("cooldown_until") or "") or None
+        cooldown_until_dt = self._parse_cooldown_until(cooldown_until_raw)
+        cooldown_active = bool(cooldown_until_dt and cooldown_until_dt > self._now_kst)
+        cooldown_until_value = cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw
+        cooldown_events = [
+            self._normalize_cooldown_event(
+                row,
+                cooldown_until=cooldown_until_value,
+                matched_now=cooldown_active,
+            )
+            for row in fill_rows_sorted[:5]
+        ] if cooldown_until_raw else []
+        return {
+            "holding_qty": int(pos.get("qty") or 0),
+            "today_buy_exists": bool(today_buy_events),
+            "today_submit_exists": bool(prior_order),
+            "today_fill_exists": bool(fill_rows_sorted),
+            "open_order_exists": False,
+            "cooldown_active": cooldown_active,
+            "today_buy_events": today_buy_events,
+            "cooldown_events": cooldown_events,
+            "today_buy_source_events_count": len(today_buy_events),
+            "cooldown_source_events_count": len(cooldown_events),
+            "last_buy_event_at": self._format_kst_datetime((last_buy_fill or {}).get("filled_at") if last_buy_fill else None),
+            "last_fill_event_at": self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None),
+            "last_order_submit_at": self._format_kst_datetime(
+                (prior_order or {}).get("submitted_at")
+                or (prior_order or {}).get("acked_at")
+                or (prior_order or {}).get("created_at")
+            ),
+            "cooldown_until": cooldown_until_value,
+            "cooldown_rule_name": BUYABLE_GATE_COOLDOWN_RULE,
+            "code": code_key,
+        }
+
     def _build_buyable_gate_context(self, *, codes: Iterable[str], positions: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         code_list = [str(code).zfill(6) for code in codes if str(code or "").strip()]
         if not code_list:
@@ -9742,251 +9836,374 @@ class PB1Engine:
                     limit_price = (row.get("request_json") or {}).get("features", {}).get("close")
                 today_spent += qty * float(limit_price or 0.0)
             planned_spent = today_spent
-            with self._stage_timer("entry.buyable_gate"):
-                buyable_gate_context = self._build_buyable_gate_context(
-                    codes=[cf.code for cf in ok_after_risk if cf.code],
-                    positions=positions,
-                )
-            self._buyable_gate_context = buyable_gate_context
-            today_buy_codes = {
-                code for code, snapshot in buyable_gate_context.items() if bool(snapshot.get("today_buy_exists"))
+            position_by_code = {
+                str(row.get("code") or "").zfill(6): dict(row)
+                for row in positions
+                if row.get("code")
             }
-            for cf in ok_after_risk:
-                self.current_code = cf.code
-                close_price = float(cf.features.get("close") or 0.0)
-                order_price = float(cf.features.get("order_price") or close_price or 0.0)
-                if self.phase == "entry" and cf.code in buyable_codes:
-                    pivot_val = self._to_float(cf.features.get("pivot"))
-                    if pivot_val and order_price > 0:
-                        if order_price <= pivot_val * 1.003:
-                            self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
-                            buyable_stage_counter["pivot_not_broken"] += 1
-                            self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
-                            self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
-                            self._emit_buy_decision(
-                                cf,
-                                order_value=order_price * float(cf.planned_qty or 0),
-                                reasons=["pivot_not_broken"],
-                                entry_allowed=entry_allowed,
-                                entry_reason=entry_reason,
-                            )
-                            continue
-                        if order_price > pivot_val * 1.03:
-                            self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
-                            buyable_stage_counter["pivot_overshoot"] += 1
-                            self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
-                            self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
-                            self._emit_buy_decision(
-                                cf,
-                                order_value=order_price * float(cf.planned_qty or 0),
-                                reasons=["pivot_overshoot"],
-                                entry_allowed=entry_allowed,
-                                entry_reason=entry_reason,
-                            )
-                            continue
-                if cf.planned_qty <= 0:
-                    sizing_reason = _normalize_sizing_failure_reason(getattr(cf, "sizing_reason", None))
-                    self._record_drop(drop_reason_counter, drop_examples, sizing_reason, cf.code)
-                    order_stage_counter[sizing_reason] += 1
-                    self._log_order_skip(cf, [sizing_reason], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=0.0,
-                        reasons=[sizing_reason],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
+            buyable_gate_context: dict[str, dict[str, Any]] = {}
+            self._buyable_gate_context = buyable_gate_context
+            today_buy_codes: set[str] = set()
+            buyable_gate_max_sec = self._buyable_gate_max_sec()
+            buyable_gate_fail_open = self._buyable_gate_fail_open_enabled()
+            with self._stage_timer("entry.buyable_gate"):
+                for cf in ok_after_risk:
+                    self.current_code = cf.code
+                    code_key = str(cf.code or "").zfill(6)
+                    close_price = float(cf.features.get("close") or 0.0)
+                    order_price = float(cf.features.get("order_price") or close_price or 0.0)
+                    order_value = order_price * float(cf.planned_qty or 0)
+                    candidate_gate_started = time.perf_counter()
+                    gate_snapshot = self._build_candidate_buyable_gate_snapshot(
+                        code=code_key,
+                        position=position_by_code.get(code_key),
+                        today_fills=[],
+                        prior_order=None,
                     )
-                    self._store_entry_evaluation(
-                        cf,
-                        setup_ok=bool(cf.setup_ok),
-                        score_ok=cf.code in set(self._debug_score_cut_codes),
-                        risk_ok=cf.code in set(self._debug_risk_ok_codes),
-                        sizing_ok=False,
-                        buyable_ok=False,
-                        trigger_ok=False,
-                        order_ready=False,
-                        reasons=[sizing_reason],
-                    )
-                    continue
-                order_value = order_price * float(cf.planned_qty or 0)
-                gate_snapshot = buyable_gate_context.get(str(cf.code or "").zfill(6), {})
-                gate_snapshot["open_order_exists"] = bool(cf.code in open_buy_codes)
-                self._log_buyable_gate_trace(code=cf.code, entry_allowed=entry_allowed, snapshot=gate_snapshot)
-                duplicate_intent_exists = False
-                duplicate_intent_status = ""
-                if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
-                    existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
-                    duplicate_intent_exists = bool(existing_order)
-                    duplicate_intent_status = str((existing_order or {}).get("status") or "")
-                is_blocked = False
-                prior = None
-                if not allow_add_to_existing:
-                    with self._stage_timer("entry.blocking_order_lookup"):
-                        is_blocked, prior = self._should_block_order(
-                            cf.client_order_key or "",
-                            code=cf.code,
-                            side="BUY",
-                            stage="PB1-CLOSE",
-                        )
-                    logger.info(
-                        "[PB1][BLOCKING_ORDER][RESULT] code=%s blocked=%s has_prior=%s",
-                        cf.code,
-                        int(bool(is_blocked)),
-                        int(prior is not None),
-                    )
-                    if is_blocked and prior:
+                    gate_snapshot["open_order_exists"] = bool(cf.code in open_buy_codes)
+                    buyable_gate_context[code_key] = gate_snapshot
+
+                    try:
+                        is_blocked = False
+                        prior = None
+                        with self._stage_timer(f"entry.buyable_gate.blocking_order_lookup.{code_key}"):
+                            if not allow_add_to_existing:
+                                is_blocked, prior = self._should_block_order(
+                                    cf.client_order_key or "",
+                                    code=cf.code,
+                                    side="BUY",
+                                    stage="PB1-CLOSE",
+                                )
                         logger.info(
-                            "[BUYABLE_GATE][DUP] code=%s key=%s|BUY|PB1-CLOSE prior_status=%s prior_created=%s prior_run=%s",
-                            cf.code,
-                            self._today,
-                            prior.get("status"),
-                            prior.get("created_at"),
-                            prior.get("run_id"),
+                            "[PB1][BLOCKING_ORDER][RESULT] code=%s blocked=%s has_prior=%s",
+                            code_key,
+                            int(bool(is_blocked)),
+                            int(prior is not None),
                         )
-                unified_context = self._build_unified_gate_context(
-                    code=cf.code,
-                    qty=int(cf.planned_qty or 0),
-                    gate_snapshot=gate_snapshot,
-                    open_order_exists=bool(cf.code in open_buy_codes),
-                    duplicate_intent_exists=duplicate_intent_exists,
-                    duplicate_intent_status=duplicate_intent_status,
-                    blocking_duplicate_exists=bool(is_blocked),
-                )
-                unified_decision = self._evaluate_unified_buyable_gate(
-                    code=cf.code,
-                    gate_context=unified_context,
-                    allow_add_to_existing=allow_add_to_existing,
-                )
-                self._log_buyable_gate_unified(code=cf.code, decision=unified_decision)
-                if not unified_decision.ok:
-                    final_reasons = [reason for reason in unified_decision.reason_codes if reason != "ok"] or ["BUYABLE_GATE_BLOCKED"]
-                    for reason in final_reasons:
-                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
-                        buyable_stage_counter[reason] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=final_reasons)
-                    self._log_order_skip(cf, final_reasons, "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=final_reasons,
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
+                        if is_blocked and prior:
+                            logger.info(
+                                "[BUYABLE_GATE][DUP] code=%s key=%s|BUY|PB1-CLOSE prior_status=%s prior_created=%s prior_run=%s",
+                                code_key,
+                                self._today,
+                                prior.get("status"),
+                                prior.get("created_at"),
+                                prior.get("run_id"),
+                            )
+                        gate_snapshot = self._build_candidate_buyable_gate_snapshot(
+                            code=code_key,
+                            position=position_by_code.get(code_key),
+                            today_fills=[],
+                            prior_order=prior,
+                        )
+                        gate_snapshot["open_order_exists"] = bool(cf.code in open_buy_codes)
+                        buyable_gate_context[code_key] = gate_snapshot
+                        if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):
+                            reject_reason = "BUYABLE_GATE_TIMEOUT"
+                            self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
+                            buyable_stage_counter[reject_reason] += 1
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
+                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_value,
+                                reasons=[reject_reason],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+
+                        with self._stage_timer(f"entry.buyable_gate.today_fills_lookup.{code_key}"):
+                            today_fills = self.fills_repo.list_today_fills(
+                                self.env,
+                                side="BUY",
+                                code=cf.code,
+                            )
+                        logger.info(
+                            "[PB1][TODAY_FILLS][RESULT] code=%s fills=%s",
+                            code_key,
+                            len(today_fills or []),
+                        )
+                        gate_snapshot = self._build_candidate_buyable_gate_snapshot(
+                            code=code_key,
+                            position=position_by_code.get(code_key),
+                            today_fills=today_fills,
+                            prior_order=prior,
+                        )
+                        gate_snapshot["open_order_exists"] = bool(cf.code in open_buy_codes)
+                        buyable_gate_context[code_key] = gate_snapshot
+                        if gate_snapshot.get("today_buy_exists"):
+                            today_buy_codes.add(code_key)
+                        else:
+                            today_buy_codes.discard(code_key)
+                        if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):
+                            reject_reason = "BUYABLE_GATE_TIMEOUT"
+                            self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
+                            buyable_stage_counter[reject_reason] += 1
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
+                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_value,
+                                reasons=[reject_reason],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+
+                        with self._stage_timer(f"entry.buyable_gate.cooldown_check.{code_key}"):
+                            gate_snapshot = self._build_candidate_buyable_gate_snapshot(
+                                code=code_key,
+                                position=position_by_code.get(code_key),
+                                today_fills=today_fills,
+                                prior_order=prior,
+                            )
+                            gate_snapshot["open_order_exists"] = bool(cf.code in open_buy_codes)
+                            buyable_gate_context[code_key] = gate_snapshot
+                        if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):
+                            reject_reason = "BUYABLE_GATE_TIMEOUT"
+                            self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
+                            buyable_stage_counter[reject_reason] += 1
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
+                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_value,
+                                reasons=[reject_reason],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+
+                        with self._stage_timer(f"entry.buyable_gate.pivot_check.{code_key}"):
+                            if self.phase == "entry" and cf.code in buyable_codes:
+                                pivot_val = self._to_float(cf.features.get("pivot"))
+                                if pivot_val and order_price > 0:
+                                    if order_price <= pivot_val * 1.003:
+                                        self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
+                                        buyable_stage_counter["pivot_not_broken"] += 1
+                                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
+                                        self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
+                                        self._emit_buy_decision(
+                                            cf,
+                                            order_value=order_value,
+                                            reasons=["pivot_not_broken"],
+                                            entry_allowed=entry_allowed,
+                                            entry_reason=entry_reason,
+                                        )
+                                        continue
+                                    if order_price > pivot_val * 1.03:
+                                        self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
+                                        buyable_stage_counter["pivot_overshoot"] += 1
+                                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
+                                        self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
+                                        self._emit_buy_decision(
+                                            cf,
+                                            order_value=order_value,
+                                            reasons=["pivot_overshoot"],
+                                            entry_allowed=entry_allowed,
+                                            entry_reason=entry_reason,
+                                        )
+                                        continue
+                        if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):
+                            reject_reason = "BUYABLE_GATE_TIMEOUT"
+                            self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
+                            buyable_stage_counter[reject_reason] += 1
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
+                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_value,
+                                reasons=[reject_reason],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+
+                        with self._stage_timer(f"entry.buyable_gate.finalize.{code_key}"):
+                            if cf.planned_qty <= 0:
+                                sizing_reason = _normalize_sizing_failure_reason(getattr(cf, "sizing_reason", None))
+                                self._record_drop(drop_reason_counter, drop_examples, sizing_reason, cf.code)
+                                order_stage_counter[sizing_reason] += 1
+                                self._log_order_skip(cf, [sizing_reason], "PB1-CLOSE")
+                                self._emit_buy_decision(
+                                    cf,
+                                    order_value=0.0,
+                                    reasons=[sizing_reason],
+                                    entry_allowed=entry_allowed,
+                                    entry_reason=entry_reason,
+                                )
+                                self._store_entry_evaluation(
+                                    cf,
+                                    setup_ok=bool(cf.setup_ok),
+                                    score_ok=cf.code in set(self._debug_score_cut_codes),
+                                    risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                                    sizing_ok=False,
+                                    buyable_ok=False,
+                                    trigger_ok=False,
+                                    order_ready=False,
+                                    reasons=[sizing_reason],
+                                )
+                                continue
+                            self._log_buyable_gate_trace(code=cf.code, entry_allowed=entry_allowed, snapshot=gate_snapshot)
+                            duplicate_intent_exists = False
+                            duplicate_intent_status = ""
+                            if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
+                                existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
+                                duplicate_intent_exists = bool(existing_order)
+                                duplicate_intent_status = str((existing_order or {}).get("status") or "")
+                            unified_context = self._build_unified_gate_context(
+                                code=cf.code,
+                                qty=int(cf.planned_qty or 0),
+                                gate_snapshot=gate_snapshot,
+                                open_order_exists=bool(cf.code in open_buy_codes),
+                                duplicate_intent_exists=duplicate_intent_exists,
+                                duplicate_intent_status=duplicate_intent_status,
+                                blocking_duplicate_exists=bool(is_blocked),
+                            )
+                            unified_decision = self._evaluate_unified_buyable_gate(
+                                code=cf.code,
+                                gate_context=unified_context,
+                                allow_add_to_existing=allow_add_to_existing,
+                            )
+                            self._log_buyable_gate_unified(code=cf.code, decision=unified_decision)
+                            if not unified_decision.ok:
+                                final_reasons = [reason for reason in unified_decision.reason_codes if reason != "ok"] or ["BUYABLE_GATE_BLOCKED"]
+                                for reason in final_reasons:
+                                    self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                                    buyable_stage_counter[reason] += 1
+                                self._log_buyable_gate(code=cf.code, ok=False, reasons=final_reasons)
+                                self._log_order_skip(cf, final_reasons, "PB1-CLOSE")
+                                self._emit_buy_decision(
+                                    cf,
+                                    order_value=order_value,
+                                    reasons=final_reasons,
+                                    entry_allowed=entry_allowed,
+                                    entry_reason=entry_reason,
+                                )
+                                self._store_entry_evaluation(
+                                    cf,
+                                    setup_ok=bool(cf.setup_ok),
+                                    score_ok=cf.code in set(self._debug_score_cut_codes),
+                                    risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                                    sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
+                                    buyable_ok=False,
+                                    trigger_ok=False,
+                                    order_ready=False,
+                                    reasons=final_reasons,
+                                )
+                                continue
+                            if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
+                                self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
+                                buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
+                                self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
+                                self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
+                                self._emit_buy_decision(
+                                    cf,
+                                    order_value=order_value,
+                                    reasons=["BUYABLE_WINDOW_BLOCK"],
+                                    entry_allowed=entry_allowed,
+                                    entry_reason=entry_reason,
+                                )
+                                continue
+                            if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
+                                self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
+                                buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
+                                self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
+                                self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
+                                self._emit_buy_decision(
+                                    cf,
+                                    order_value=order_value,
+                                    reasons=["BUYABLE_WINDOW_BLOCK"],
+                                    entry_allowed=entry_allowed,
+                                    entry_reason=entry_reason,
+                                )
+                                continue
+                            cf.features["buyable_ok"] = True
+                            self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
+                            buyable_ok_codes.append(cf.code)
+                        if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):
+                            reject_reason = "BUYABLE_GATE_TIMEOUT"
+                            self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
+                            buyable_stage_counter[reject_reason] += 1
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
+                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_value,
+                                reasons=[reject_reason],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+                    except Exception as exc:
+                        if buyable_gate_fail_open:
+                            reject_reason = f"BUYABLE_GATE_EXCEPTION:{type(exc).__name__}"
+                            logger.exception(
+                                "[PB1][BUYABLE_GATE][FAIL_OPEN] code=%s err_type=%s err=%s",
+                                code_key,
+                                type(exc).__name__,
+                                exc,
+                            )
+                            self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
+                            buyable_stage_counter[reject_reason] += 1
+                            self._log_buyable_gate(code=cf.code, ok=False, reasons=[reject_reason])
+                            self._log_order_skip(cf, [reject_reason], "PB1-CLOSE")
+                            self._emit_buy_decision(
+                                cf,
+                                order_value=order_value,
+                                reasons=[reject_reason],
+                                entry_allowed=entry_allowed,
+                                entry_reason=entry_reason,
+                            )
+                            continue
+                        raise
+                    last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
+                    last_volume = float(cf.features.get("last_volume") or 0.0)
+                    trigger_ok, trigger_info = entry_trigger(
+                        cf.features,
+                        last_price=last_price,
+                        last_volume=last_volume,
+                        cfg=self.minervini_config,
                     )
-                    self._store_entry_evaluation(
-                        cf,
-                        setup_ok=bool(cf.setup_ok),
-                        score_ok=cf.code in set(self._debug_score_cut_codes),
-                        risk_ok=cf.code in set(self._debug_risk_ok_codes),
-                        sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
-                        buyable_ok=False,
-                        trigger_ok=False,
-                        order_ready=False,
-                        reasons=final_reasons,
+                    setup_filters_ok = bool(cf.features.get("setup_loose_ok", cf.features.get("pullback_ok", cf.setup_ok)))
+                    entry_ok, entry_reasons, entry_mode = self._entry_gate(
+                        setup_filters_ok=setup_filters_ok,
+                        breakout_trigger_ok=trigger_ok,
                     )
-                    continue
-                if ENTRY_MODE == "CLOSE" and self.window_internal != "close":
-                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
-                    buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
-                    self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["BUYABLE_WINDOW_BLOCK"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
+                    normalized_entry_reason = self._resolve_entry_setup_family(cf)
+                    final_entry_reason_code = self._resolve_entry_decision_family(
+                        entry_reason=normalized_entry_reason,
+                        setup_filters_ok=setup_filters_ok,
+                        breakout_trigger_ok=trigger_ok,
+                        trigger_reason=(trigger_info or {}).get("reason") if isinstance(trigger_info, dict) else None,
                     )
-                    continue
-                if ENTRY_MODE == "INTRADAY" and self.window_internal == "close":
-                    self._record_drop(drop_reason_counter, drop_examples, "BUYABLE_WINDOW_BLOCK", cf.code)
-                    buyable_stage_counter["BUYABLE_WINDOW_BLOCK"] += 1
-                    self._log_buyable_gate(code=cf.code, ok=False, reasons=["BUYABLE_WINDOW_BLOCK"])
-                    self._log_order_skip(cf, ["BUYABLE_WINDOW_BLOCK"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["BUYABLE_WINDOW_BLOCK"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    continue
-                cf.features["buyable_ok"] = True
-                self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
-                buyable_ok_codes.append(cf.code)
-                last_price = float(cf.features.get("last_price") or order_price or close_price or 0.0)
-                last_volume = float(cf.features.get("last_volume") or 0.0)
-                trigger_ok, trigger_info = entry_trigger(
-                    cf.features,
-                    last_price=last_price,
-                    last_volume=last_volume,
-                    cfg=self.minervini_config,
-                )
-                setup_filters_ok = bool(cf.features.get("setup_loose_ok", cf.features.get("pullback_ok", cf.setup_ok)))
-                entry_ok, entry_reasons, entry_mode = self._entry_gate(
-                    setup_filters_ok=setup_filters_ok,
-                    breakout_trigger_ok=trigger_ok,
-                )
-                normalized_entry_reason = self._resolve_entry_setup_family(cf)
-                final_entry_reason_code = self._resolve_entry_decision_family(
-                    entry_reason=normalized_entry_reason,
-                    setup_filters_ok=setup_filters_ok,
-                    breakout_trigger_ok=trigger_ok,
-                    trigger_reason=(trigger_info or {}).get("reason") if isinstance(trigger_info, dict) else None,
-                )
-                override_ok = bool(entry_ok and setup_filters_ok and not trigger_ok)
-                cf.features["entry_reason"] = normalized_entry_reason
-                cf.features["entry_setup_family"] = normalized_entry_reason
-                cf.features["setup_ok"] = bool(setup_filters_ok)
-                cf.features["trigger_ok"] = bool(trigger_ok)
-                cf.features["override_ok"] = override_ok
-                cf.features["final_entry_reason_code"] = final_entry_reason_code
-                cf.features["entry_decision_family"] = final_entry_reason_code
-                cf.features["entry_rule_version"] = "pb1_entry_reason_v1"
-                cf.features["derived_as_of"] = engine_asof
-                cf.features["trace_id"] = f"{trace_id}:{cf.code}"
-                cf.features["setup_snapshot_json"] = {
-                    "setup_filters_ok": setup_filters_ok,
-                    "override_ok": override_ok,
-                    "entry_cond_mode": entry_mode,
-                    "close": cf.features.get("close"),
-                    "ma50": cf.features.get("ma50"),
-                    "ma150": cf.features.get("ma150"),
-                    "ma200": cf.features.get("ma200"),
-                    "ma200_slope": cf.features.get("ma200_slope"),
-                    "rs_percentile": cf.features.get("rs_percentile"),
-                    "vcp_ok": cf.features.get("vcp_ok"),
-                    "score": cf.features.get("score"),
-                }
-                cf.features["trigger_snapshot_json"] = {
-                    "breakout_trigger_ok": trigger_ok,
-                    "trigger_ok": trigger_ok,
-                    "last_price": last_price,
-                    "pivot": trigger_info.get("pivot", cf.features.get("pivot")),
-                    "trigger": trigger_info.get("trigger"),
-                    "max_chase": trigger_info.get("max_chase"),
-                    "last_volume": last_volume,
-                    "vol20": trigger_info.get("vol20", cf.features.get("vol20")),
-                    "vol_ok": trigger_info.get("vol_ok"),
-                    "reason": trigger_info.get("reason"),
-                }
-                self._log_entry_gate(
-                    code=cf.code,
-                    setup_filters_ok=setup_filters_ok,
-                    breakout_trigger_ok=trigger_ok,
-                    entry_ok=entry_ok,
-                    entry_mode=entry_mode,
-                    setup_metrics={
+                    override_ok = bool(entry_ok and setup_filters_ok and not trigger_ok)
+                    cf.features["entry_reason"] = normalized_entry_reason
+                    cf.features["entry_setup_family"] = normalized_entry_reason
+                    cf.features["setup_ok"] = bool(setup_filters_ok)
+                    cf.features["trigger_ok"] = bool(trigger_ok)
+                    cf.features["override_ok"] = override_ok
+                    cf.features["final_entry_reason_code"] = final_entry_reason_code
+                    cf.features["entry_decision_family"] = final_entry_reason_code
+                    cf.features["entry_rule_version"] = "pb1_entry_reason_v1"
+                    cf.features["derived_as_of"] = engine_asof
+                    cf.features["trace_id"] = f"{trace_id}:{cf.code}"
+                    cf.features["setup_snapshot_json"] = {
+                        "setup_filters_ok": setup_filters_ok,
+                        "override_ok": override_ok,
+                        "entry_cond_mode": entry_mode,
                         "close": cf.features.get("close"),
                         "ma50": cf.features.get("ma50"),
                         "ma150": cf.features.get("ma150"),
                         "ma200": cf.features.get("ma200"),
                         "ma200_slope": cf.features.get("ma200_slope"),
                         "rs_percentile": cf.features.get("rs_percentile"),
-                        "dollar_vol_50": cf.features.get("dollar_vol_50"),
                         "vcp_ok": cf.features.get("vcp_ok"),
                         "score": cf.features.get("score"),
-                    },
-                    trigger_metrics={
+                    }
+                    cf.features["trigger_snapshot_json"] = {
+                        "breakout_trigger_ok": trigger_ok,
+                        "trigger_ok": trigger_ok,
                         "last_price": last_price,
                         "pivot": trigger_info.get("pivot", cf.features.get("pivot")),
                         "trigger": trigger_info.get("trigger"),
@@ -9995,22 +10212,147 @@ class PB1Engine:
                         "vol20": trigger_info.get("vol20", cf.features.get("vol20")),
                         "vol_ok": trigger_info.get("vol_ok"),
                         "reason": trigger_info.get("reason"),
-                    },
-                )
-                if not entry_ok:
-                    if not trigger_ok:
-                        cf.features["entry_trigger"] = trigger_info
-                    for reason in entry_reasons:
-                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
-                        order_stage_counter[reason] += 1
-                    self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=entry_reasons or ["entry_gate_fail"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
+                    }
+                    self._log_entry_gate(
+                        code=cf.code,
+                        setup_filters_ok=setup_filters_ok,
+                        breakout_trigger_ok=trigger_ok,
+                        entry_ok=entry_ok,
+                        entry_mode=entry_mode,
+                        setup_metrics={
+                            "close": cf.features.get("close"),
+                            "ma50": cf.features.get("ma50"),
+                            "ma150": cf.features.get("ma150"),
+                            "ma200": cf.features.get("ma200"),
+                            "ma200_slope": cf.features.get("ma200_slope"),
+                            "rs_percentile": cf.features.get("rs_percentile"),
+                            "dollar_vol_50": cf.features.get("dollar_vol_50"),
+                            "vcp_ok": cf.features.get("vcp_ok"),
+                            "score": cf.features.get("score"),
+                        },
+                        trigger_metrics={
+                            "last_price": last_price,
+                            "pivot": trigger_info.get("pivot", cf.features.get("pivot")),
+                            "trigger": trigger_info.get("trigger"),
+                            "max_chase": trigger_info.get("max_chase"),
+                            "last_volume": last_volume,
+                            "vol20": trigger_info.get("vol20", cf.features.get("vol20")),
+                            "vol_ok": trigger_info.get("vol_ok"),
+                            "reason": trigger_info.get("reason"),
+                        },
                     )
+                    if not entry_ok:
+                        if not trigger_ok:
+                            cf.features["entry_trigger"] = trigger_info
+                        for reason in entry_reasons:
+                            self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                            order_stage_counter[reason] += 1
+                        self._log_order_skip(cf, entry_reasons or ["entry_gate_fail"], "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=entry_reasons or ["entry_gate_fail"],
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        self._store_entry_evaluation(
+                            cf,
+                            setup_ok=setup_filters_ok,
+                            score_ok=cf.code in set(self._debug_score_cut_codes),
+                            risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                            sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
+                            buyable_ok=True,
+                            trigger_ok=trigger_ok,
+                            order_ready=False,
+                            reasons=entry_reasons or ["entry_gate_fail"],
+                        )
+                        continue
+                    df, _ = self._fetch_daily(cf.code)
+                    if df.empty:
+                        self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
+                        order_stage_counter["stop_calc_fail"] += 1
+                        self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=["stop_calc_fail"],
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        continue
+                    entry_price = last_price
+                    pivot_val = cf.features.get("pivot")
+                    tight_low = cf.features.get("tight_low")
+                    atr_val = cf.features.get("atr14")
+                    stop0 = calc_initial_stop(
+                        pivot=float(pivot_val) if pivot_val is not None else float("nan"),
+                        tight_low=float(tight_low) if tight_low is not None else None,
+                        atr=float(atr_val) if atr_val is not None else None,
+                        mode=INITIAL_STOP_MODE,
+                        entry=entry_price,
+                        atr_mult=ATR_MULT,
+                    )
+                    if stop0 >= entry_price:
+                        self._record_drop(drop_reason_counter, drop_examples, "stop_above_entry", cf.code)
+                        order_stage_counter["stop_above_entry"] += 1
+                        self._log_order_skip(cf, ["stop_above_entry"], "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=["stop_above_entry"],
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        continue
+                    cf.features["entry_price"] = float(entry_price)
+                    cf.features["initial_stop"] = float(stop0)
+                    cf.features["stop_price"] = float(stop0)
+                    if isinstance(trigger_info, dict) and trigger_info.get("pivot") is not None:
+                        cf.features["pivot_triggered"] = float(trigger_info.get("pivot"))
+                    reasons: list[str] = []
+                    if new_position_limit <= 0:
+                        reasons.append("max_positions")
+                    if target_new_positions <= 0:
+                        reasons.append("target_new_positions_zero")
+                    if tick_budget_krw <= 0:
+                        reasons.append("tick_budget_zero")
+                    if available_cash_krw <= 0:
+                        reasons.append("available_cash_zero")
+                    if min_order_krw > 0 and order_value < min_order_krw:
+                        reasons.append("min_order_krw")
+                    if order_value <= 0:
+                        reasons.append("order_value_zero")
+                    if order_value > available_cash_krw:
+                        reasons.append("insufficient_cash")
+                    if planned_spent + order_value > float(tick_budget_krw):
+                        reasons.append("entry_cap_exceeded")
+                    if not reasons and len(orderable_candidates) >= new_position_limit:
+                        reasons.append("target_new_positions_limit")
+                    if reasons:
+                        for reason in reasons:
+                            self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                            order_stage_counter[reason] += 1
+                        self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=reasons,
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        self._store_entry_evaluation(
+                            cf,
+                            setup_ok=setup_filters_ok,
+                            score_ok=cf.code in set(self._debug_score_cut_codes),
+                            risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                            sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
+                            buyable_ok=True,
+                            trigger_ok=trigger_ok,
+                            order_ready=False,
+                            reasons=reasons,
+                        )
+                        continue
+                    orderable_candidates.append(cf)
                     self._store_entry_evaluation(
                         cf,
                         setup_ok=setup_filters_ok,
@@ -10019,118 +10361,20 @@ class PB1Engine:
                         sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
                         buyable_ok=True,
                         trigger_ok=trigger_ok,
-                        order_ready=False,
-                        reasons=entry_reasons or ["entry_gate_fail"],
+                        order_ready=True,
+                        reasons=["ORDER_READY"],
+                        decision_reason="ORDER_READY",
                     )
-                    continue
-                df, _ = self._fetch_daily(cf.code)
-                if df.empty:
-                    self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
-                    order_stage_counter["stop_calc_fail"] += 1
-                    self._log_order_skip(cf, ["stop_calc_fail"], "PB1-CLOSE")
                     self._emit_buy_decision(
                         cf,
                         order_value=order_value,
-                        reasons=["stop_calc_fail"],
+                        reasons=[],
                         entry_allowed=entry_allowed,
                         entry_reason=entry_reason,
                     )
-                    continue
-                entry_price = last_price
-                pivot_val = cf.features.get("pivot")
-                tight_low = cf.features.get("tight_low")
-                atr_val = cf.features.get("atr14")
-                stop0 = calc_initial_stop(
-                    pivot=float(pivot_val) if pivot_val is not None else float("nan"),
-                    tight_low=float(tight_low) if tight_low is not None else None,
-                    atr=float(atr_val) if atr_val is not None else None,
-                    mode=INITIAL_STOP_MODE,
-                    entry=entry_price,
-                    atr_mult=ATR_MULT,
-                )
-                if stop0 >= entry_price:
-                    self._record_drop(drop_reason_counter, drop_examples, "stop_above_entry", cf.code)
-                    order_stage_counter["stop_above_entry"] += 1
-                    self._log_order_skip(cf, ["stop_above_entry"], "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=["stop_above_entry"],
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    continue
-                cf.features["entry_price"] = float(entry_price)
-                cf.features["initial_stop"] = float(stop0)
-                cf.features["stop_price"] = float(stop0)
-                if isinstance(trigger_info, dict) and trigger_info.get("pivot") is not None:
-                    cf.features["pivot_triggered"] = float(trigger_info.get("pivot"))
-                reasons: list[str] = []
-                if new_position_limit <= 0:
-                    reasons.append("max_positions")
-                if target_new_positions <= 0:
-                    reasons.append("target_new_positions_zero")
-                if tick_budget_krw <= 0:
-                    reasons.append("tick_budget_zero")
-                if available_cash_krw <= 0:
-                    reasons.append("available_cash_zero")
-                if min_order_krw > 0 and order_value < min_order_krw:
-                    reasons.append("min_order_krw")
-                if order_value <= 0:
-                    reasons.append("order_value_zero")
-                if order_value > available_cash_krw:
-                    reasons.append("insufficient_cash")
-                if planned_spent + order_value > float(tick_budget_krw):
-                    reasons.append("entry_cap_exceeded")
-                if not reasons and len(orderable_candidates) >= new_position_limit:
-                    reasons.append("target_new_positions_limit")
-                if reasons:
-                    for reason in reasons:
-                        self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
-                        order_stage_counter[reason] += 1
-                    self._log_order_skip(cf, reasons, "PB1-CLOSE")
-                    self._emit_buy_decision(
-                        cf,
-                        order_value=order_value,
-                        reasons=reasons,
-                        entry_allowed=entry_allowed,
-                        entry_reason=entry_reason,
-                    )
-                    self._store_entry_evaluation(
-                        cf,
-                        setup_ok=setup_filters_ok,
-                        score_ok=cf.code in set(self._debug_score_cut_codes),
-                        risk_ok=cf.code in set(self._debug_risk_ok_codes),
-                        sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
-                        buyable_ok=True,
-                        trigger_ok=trigger_ok,
-                        order_ready=False,
-                        reasons=reasons,
-                    )
-                    continue
-                orderable_candidates.append(cf)
-                self._store_entry_evaluation(
-                    cf,
-                    setup_ok=setup_filters_ok,
-                    score_ok=cf.code in set(self._debug_score_cut_codes),
-                    risk_ok=cf.code in set(self._debug_risk_ok_codes),
-                    sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
-                    buyable_ok=True,
-                    trigger_ok=trigger_ok,
-                    order_ready=True,
-                    reasons=["ORDER_READY"],
-                    decision_reason="ORDER_READY",
-                )
-                self._emit_buy_decision(
-                    cf,
-                    order_value=order_value,
-                    reasons=[],
-                    entry_allowed=entry_allowed,
-                    entry_reason=entry_reason,
-                )
-                planned_spent += order_value
-                if len(orderable_candidates) >= new_position_limit:
-                    break
+                    planned_spent += order_value
+                    if len(orderable_candidates) >= new_position_limit:
+                        break
 
             if (
                 self.bootstrap_enabled

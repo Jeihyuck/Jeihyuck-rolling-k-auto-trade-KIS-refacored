@@ -355,6 +355,33 @@ def _practice_env_default_fail_open() -> bool:
     return strategy_env == "practice"
 
 
+def _lookup_fail_open_default() -> bool:
+    if _practice_env_default_fail_open():
+        return True
+    if _norm_strategy(os.getenv("STRATEGY_MODE")) == "diag":
+        return True
+    if _env_flag("NO_TRADE", default=False):
+        return True
+    if str(os.getenv("MANUAL_MODE") or "").strip():
+        return True
+    if _norm_env(os.getenv("GITHUB_EVENT_NAME")) == "workflow_dispatch":
+        return True
+    workflow_name = str(os.getenv("GITHUB_WORKFLOW") or "").strip().lower()
+    if "manual" in workflow_name or "dispatch" in workflow_name:
+        return True
+    return False
+
+
+def _resolve_lookup_fail_open() -> bool:
+    explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
+    if explicit is not None:
+        return _env_flag(
+            "PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT",
+            default=_lookup_fail_open_default(),
+        )
+    return _lookup_fail_open_default()
+
+
 def _norm_strategy(strategy: str | None) -> str:
     return (strategy or "").strip().lower()
 
@@ -1993,8 +2020,7 @@ class OrdersRepo:
         fail_open: bool | None = None,
     ) -> list[dict]:
         if fail_open is None:
-            explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
-            fail_open = _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=_practice_env_default_fail_open()) if explicit is not None else _practice_env_default_fail_open()
+            fail_open = _resolve_lookup_fail_open()
 
         try:
             with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
@@ -2260,8 +2286,13 @@ class OrdersRepo:
             with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 row = conn.execute(stmt).mappings().first()
         except (OperationalError, DBAPIError, SATimeoutError) as exc:
-            fail_open = _practice_env_default_fail_open() if os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT") is None else _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=True)
-            logger.exception("[DB][READ][FAIL] op=orders.has_blocking_order_today fail_open=%s err=%s", int(fail_open), exc)
+            fail_open = _resolve_lookup_fail_open()
+            logger.exception(
+                "[DB][READ][FAIL] op=orders.has_blocking_order_today fail_open=%s err_type=%s err=%s",
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
             if fail_open:
                 logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_blocking_order_today -> returning (False, None)")
                 return False, None
@@ -2481,7 +2512,7 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == code)
         stmt = select(self._schema.fills).where(and_(*conditions))
-        fail_open = _practice_env_default_fail_open() if os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT") is None else _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=True)
+        fail_open = _resolve_lookup_fail_open()
         try:
             with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 rows = conn.execute(stmt).mappings().all()
