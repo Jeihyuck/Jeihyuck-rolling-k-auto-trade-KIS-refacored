@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import pandas as pd
 import pytz
 import sqlalchemy as sa
-from sqlalchemy.exc import OperationalError, StatementError, IntegrityError
+from sqlalchemy.exc import OperationalError, StatementError, IntegrityError, DBAPIError, TimeoutError as SATimeoutError
 from sqlalchemy import Engine, and_, func, or_, select, bindparam
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -343,6 +343,16 @@ def _as_date(value: Any) -> date:
 
 def _norm_env(env: str | None) -> str:
     return (env or "").strip().lower()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _practice_env_default_fail_open() -> bool:
+    strategy_env = _norm_env(os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice")
+    return strategy_env == "practice"
 
 
 def _norm_strategy(strategy: str | None) -> str:
@@ -1975,6 +1985,35 @@ class OrdersRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def _read_mappings_with_guard(
+        self,
+        stmt,
+        *,
+        op_name: str,
+        fail_open: bool | None = None,
+    ) -> list[dict]:
+        if fail_open is None:
+            explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
+            fail_open = _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=_practice_env_default_fail_open()) if explicit is not None else _practice_env_default_fail_open()
+
+        try:
+            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                rows = conn.execute(stmt).mappings().all()
+                logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
+                return [dict(r) for r in rows]
+        except (OperationalError, DBAPIError, SATimeoutError) as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+                op_name,
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if fail_open:
+                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
+                return []
+            raise
+
     def _window_expr(self, column):
         if self.engine.dialect.name == "postgresql":
             return sa.cast(column, sa.DateTime(timezone=True))
@@ -2147,9 +2186,11 @@ class OrdersRepo:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
         )
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-            return [dict(r) for r in rows]
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.get_open_orders",
+            fail_open=None,
+        )
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
         stmt = select(self._schema.orders.c.order_id).where(
@@ -2215,11 +2256,19 @@ class OrdersRepo:
             .limit(1)
         )
         
-        with self.engine.begin() as conn:
-            row = conn.execute(stmt).mappings().first()
-            if row:
-                return True, dict(row)
-            return False, None
+        try:
+            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                row = conn.execute(stmt).mappings().first()
+        except (OperationalError, DBAPIError, SATimeoutError) as exc:
+            fail_open = _practice_env_default_fail_open() if os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT") is None else _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=True)
+            logger.exception("[DB][READ][FAIL] op=orders.has_blocking_order_today fail_open=%s err=%s", int(fail_open), exc)
+            if fail_open:
+                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_blocking_order_today -> returning (False, None)")
+                return False, None
+            raise
+        if row:
+            return True, dict(row)
+        return False, None
 
     def list_today_orders(
         self,
@@ -2242,9 +2291,11 @@ class OrdersRepo:
         if status_exclude:
             conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
         stmt = select(self._schema.orders).where(and_(*conditions))
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-        return [dict(r) for r in rows]
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.list_today_orders",
+            fail_open=None,
+        )
 
     def list_orders_in_window(
         self,
@@ -2430,9 +2481,24 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == code)
         stmt = select(self._schema.fills).where(and_(*conditions))
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-        return [dict(r) for r in rows]
+        fail_open = _practice_env_default_fail_open() if os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT") is None else _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=True)
+        try:
+            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                rows = conn.execute(stmt).mappings().all()
+                logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", "fills.list_today_fills", len(rows), int(bool(fail_open)))
+                return [dict(r) for r in rows]
+        except (OperationalError, DBAPIError, SATimeoutError) as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+                "fills.list_today_fills",
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if fail_open:
+                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", "fills.list_today_fills")
+                return []
+            raise
 
     def list_fills_in_window(
         self,

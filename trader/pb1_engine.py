@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -1087,6 +1088,16 @@ class PB1Engine:
             "[PB1][ASOF][USE] component=engine value=%s source=run_ctx",
             self.derived_as_of,
         )
+
+    @contextlib.contextmanager
+    def _stage_timer(self, stage_name: str):
+        started = time.perf_counter()
+        logger.info("[PB1][STAGE][START] stage=%s", stage_name)
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter() - started
+            logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
 
     def _init_run_context_state(
         self,
@@ -9683,6 +9694,7 @@ class PB1Engine:
                 as_of=self._today,
                 candidates=candidates,
             )
+            logger.info("[PB1][STAGE][CHECKPOINT] stage=minervini_report_saved")
             self.top_candidates = [
                 {
                     "code": cf.code,
@@ -9706,15 +9718,22 @@ class PB1Engine:
             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
-            open_orders = self.orders_repo.get_open_orders(self.env)
+            with self._stage_timer("entry.open_orders_lookup"):
+                open_orders = self.orders_repo.get_open_orders(self.env)
             open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
             try:
-                today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
+                with self._stage_timer("entry.today_buy_orders_lookup"):
+                    today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
             except Exception as e:
                 logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
                 if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
                     raise
                 today_orders = []
+            logger.info(
+                "[PB1][ORDER_LOOKUP][RESULT] open_orders=%s today_buy_orders=%s",
+                len(open_orders or []),
+                len(today_orders or []),
+            )
             today_spent = 0.0
             for row in today_orders:
                 qty = float(row.get("qty") or 0)
@@ -9723,10 +9742,11 @@ class PB1Engine:
                     limit_price = (row.get("request_json") or {}).get("features", {}).get("close")
                 today_spent += qty * float(limit_price or 0.0)
             planned_spent = today_spent
-            buyable_gate_context = self._build_buyable_gate_context(
-                codes=[cf.code for cf in ok_after_risk if cf.code],
-                positions=positions,
-            )
+            with self._stage_timer("entry.buyable_gate"):
+                buyable_gate_context = self._build_buyable_gate_context(
+                    codes=[cf.code for cf in ok_after_risk if cf.code],
+                    positions=positions,
+                )
             self._buyable_gate_context = buyable_gate_context
             today_buy_codes = {
                 code for code, snapshot in buyable_gate_context.items() if bool(snapshot.get("today_buy_exists"))
@@ -9801,11 +9821,18 @@ class PB1Engine:
                 is_blocked = False
                 prior = None
                 if not allow_add_to_existing:
-                    is_blocked, prior = self._should_block_order(
-                        cf.client_order_key or "",
-                        code=cf.code,
-                        side="BUY",
-                        stage="PB1-CLOSE",
+                    with self._stage_timer("entry.blocking_order_lookup"):
+                        is_blocked, prior = self._should_block_order(
+                            cf.client_order_key or "",
+                            code=cf.code,
+                            side="BUY",
+                            stage="PB1-CLOSE",
+                        )
+                    logger.info(
+                        "[PB1][BLOCKING_ORDER][RESULT] code=%s blocked=%s has_prior=%s",
+                        cf.code,
+                        int(bool(is_blocked)),
+                        int(prior is not None),
                     )
                     if is_blocked and prior:
                         logger.info(
