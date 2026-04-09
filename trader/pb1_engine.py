@@ -7974,7 +7974,44 @@ class PB1Engine:
         # ✅ trade 모드: watchlist_final only (no universe/candidate fallback)
         trade_mode = (os.getenv("MODE") or "").strip().lower() == "trade"
         if trade_mode:
-            pool_strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
+            locked_df = self.final30_df if isinstance(self.final30_df, pd.DataFrame) else pd.DataFrame()
+            locked_source = str(getattr(self, "final30_source", "none") or "none")
+            locked_cols = [str(col) for col in locked_df.columns.tolist()]
+            locked_missing_scored = self._scored_missing_cols(locked_cols)
+
+            if (
+                bool(getattr(self, "final30_locked", False))
+                and locked_source in {"db_pb1_watchlist_final_scored", "final30_locked"}
+                and len(locked_df) == 30
+                and not locked_missing_scored
+            ):
+                rows = [dict(item or {}) for item in locked_df.to_dict(orient="records")]
+                top10_codes = [str(item.get("code") or "").zfill(6) for item in rows[:10] if item.get("code")]
+
+                logger.info(
+                    "[PB1][WATCHLIST][LOCK_REUSE] env=%s source=%s as_of=%s rows=%s",
+                    pool_env,
+                    locked_source,
+                    getattr(self, "derived_as_of", None) or self.get_as_of(),
+                    len(rows),
+                )
+                logger.info(
+                    "[TRADE][WATCHLIST_FINAL][TOP10] source=%s rank_basis=locked_final30 codes=%s",
+                    locked_source,
+                    top10_codes,
+                )
+
+                members = []
+                for row in rows:
+                    member = dict(row)
+                    code = str(member.get("code") or "").zfill(6)
+                    member["code"] = code
+                    member.setdefault("name", self._code_name_map.get(code, ""))
+                    members.append(member)
+
+                return members, "locked_final30_reuse"
+
+            pool_strategy = os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()
             request_as_of = derived_as_of
             try:
                 df = load_final30_scored_db_only(
@@ -7996,7 +8033,7 @@ class PB1Engine:
                 return [], "db_exact_scored_final30_missing"
             except ScoredWatchlistInvalidError as exc:
                 logger.error(
-                    "[WATCHLIST][TRADE][INVALID] requested=%s env=%s strategy=%s reason=%s",
+                    "[WATCHLIST][TRADE][INVALID] requested=%s env=%s strategy=%s source=trade_scored_reload reason=%s",
                     request_as_of,
                     pool_env,
                     pool_strategy,
@@ -8579,6 +8616,12 @@ class PB1Engine:
             logger.info("[PB1][WATCHLIST] enabled -> load today watchlist")
             # Watchlist로 members 대체
             watchlist_members, watchlist_source = self._load_today_watchlist_members()
+            logger.info(
+                "[PB1][WATCHLIST][RESULT] phase=%s source=%s rows=%s",
+                self.phase,
+                watchlist_source,
+                len(watchlist_members or []),
+            )
             watchlist_count = len(watchlist_members)
             logger.info(
                 "[PB1][WATCHLIST] loaded=%s source=%s",

@@ -4287,6 +4287,26 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         exit_reason = "PRECHECK_FATAL_STICKY"
                         logger.error("[PB1][PRECHECK][STICKY] reason=%s -> exit loop", precheck_reason)
                         break
+
+                structural_fatal_tokens = (
+                    "db_exact_scored_final30_invalid",
+                    "strategy_mismatch",
+                    "final30_contract_invalid",
+                    "db_only_universe_missing",
+                    "FINAL30_INPUT_ROWS_MISMATCH",
+                    "ASOF_INVARIANT_VIOLATION",
+                    "locked_final30_source_mismatch",
+                    "missing_db_exact_scored_final30",
+                )
+
+                if any(token in message for token in structural_fatal_tokens):
+                    logger.error(
+                        "[PB1][LOOP][STRUCTURAL_FATAL] reason=%s -> exit loop immediately",
+                        message,
+                    )
+                    exit_reason = "STRUCTURAL_FATAL"
+                    break
+
                 logger.error(
                     "[PB1][TICK][FATAL_GUARD] exception=%s\n%s",
                     exc,
