@@ -14,9 +14,9 @@
 ## 스케줄
 
 1. prep: 0 23 * * 0-4 (KST 08:00, 월-금)
-2. am: 5 1 * * 1-5 (KST 10:05, 월-금)
-3. pm: 5 4 * * 1-5 (KST 13:05, 월-금)
-4. close: 20 6 * * 1-5 (KST 15:20, 월-금)
+2. am: 7 0 * * 1-5 (KST 09:07, 월-금, 13:00까지 loop)
+3. pm: 0 4 * * 1-5 (KST 13:00, 월-금, 15:10까지 loop)
+4. close: 15 6 * * 1-5 (KST 15:15, 월-금, 장마감까지 exit loop)
 
 ## 변경 사항
 
@@ -24,10 +24,11 @@
 2. intraday AM/PM workflow는 python -m trader.trade_tick만 실행한다.
 3. close workflow도 python -m trader.trade_tick만 실행하되, PB1_PHASE_DEFAULT=exit와 PB1_ENTRY_ENABLED=0를 강제한다.
 4. unified-pipeline.yml의 schedule은 제거하고 workflow_dispatch 전용 수동 디버그 wrapper로 축소했다.
-5. 모든 active workflow는 동일 concurrency group pb1-practice-serial을 사용한다.
-6. 모든 active workflow는 PBCORE_DB_URL postgres-only guard를 통과해야 한다.
-7. 모든 active workflow는 SQLITE_DISABLED=1, BOTSTATE_DISABLED=1, DB_DISABLE_PREPARED_STATEMENTS=1을 사용한다.
-8. workflow 간 파일/artifact continuity를 가정하지 않고, 필요한 상태는 DB에서 다시 읽는다.
+5. intraday workflow(trade-am, trade-pm, trade-close)는 동일 concurrency group pb1-practice-intraday-serial 을 사용한다.
+6. prep는 독립 group을 사용해도 되지만, intraday 3종은 반드시 직렬 실행된다.
+7. 모든 active workflow는 PBCORE_DB_URL postgres-only guard를 통과해야 한다.
+8. 모든 active workflow는 SQLITE_DISABLED=1, BOTSTATE_DISABLED=1, DB_DISABLE_PREPARED_STATEMENTS=1을 사용한다.
+9. workflow 간 파일/artifact continuity를 가정하지 않고, 필요한 상태는 DB에서 다시 읽는다.
 
 ## SSOT 원칙
 
