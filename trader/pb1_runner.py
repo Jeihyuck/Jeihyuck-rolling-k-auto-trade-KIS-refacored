@@ -4247,15 +4247,20 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 continue
 
             remaining_budget_s = max(0, int((session_end_dt - now).total_seconds()))
+            grace_sec = _resolve_session_exit_grace_sec()
+            base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 45))
+            remaining_to_session_end = max(0, int((session_end_dt - now).total_seconds()))
+            tick_timeout_sec = min(
+                base_tick_timeout,
+                max(5, remaining_to_session_end + grace_sec),
+            )
             try:
-                grace_sec = _resolve_session_exit_grace_sec()
-                base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 45))
-                remaining_to_session_end = max(0, int((session_end_dt - now).total_seconds()))
-                tick_timeout_sec = min(
-                    base_tick_timeout,
-                    max(5, remaining_to_session_end + grace_sec),
+                logger.info(
+                    "[PB1][TICK][CALL_RUN_ONCE] kind=%s now=%s session_end=%s",
+                    session_kind,
+                    now.isoformat(),
+                    session_end_dt.isoformat(),
                 )
-
                 _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
                     timeout_sec=tick_timeout_sec,
                     call=lambda: run_once(
@@ -4266,6 +4271,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         window=window,
                         max_seconds=remaining_budget_s,
                     ),
+                )
+                logger.info(
+                    "[PB1][TICK][DONE] kind=%s now=%s result_status=%s",
+                    session_kind,
+                    _get_now_kst().isoformat(),
+                    result_status,
                 )
                 balance_api_calls += metrics.get("balance_api_calls", 0)
                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
@@ -4334,10 +4345,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 continue
             except TickTimeoutError:
                 logger.error(
-                    "[PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s -> abort current tick",
+                    "[PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s timeout_sec=%s",
                     session_kind,
                     now.isoformat(),
                     session_end_dt.isoformat(),
+                    tick_timeout_sec,
                 )
                 now_after_timeout = _get_now_kst()
                 if now_after_timeout >= session_end_dt:

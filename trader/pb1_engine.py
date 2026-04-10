@@ -201,6 +201,10 @@ from trader.strategies.pb1_pullback_close import (
 logger = logging.getLogger(__name__)
 
 
+class PB1StageTimeout(RuntimeError):
+    pass
+
+
 def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
     try:
         flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
@@ -1098,6 +1102,32 @@ class PB1Engine:
         finally:
             elapsed = time.perf_counter() - started
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
+
+    @contextlib.contextmanager
+    def _stage_timer_with_timeout(self, stage_name: str, max_sec: float):
+        started = time.perf_counter()
+        logger.info("[PB1][STAGE][START] stage=%s max_sec=%.2f", stage_name, max_sec)
+        error: Exception | None = None
+        try:
+            yield
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
+            if error is None and max_sec > 0 and elapsed > max_sec:
+                logger.error("[PB1][STAGE_TIMEOUT] stage=%s elapsed=%.2f max_sec=%.2f", stage_name, elapsed, max_sec)
+                raise PB1StageTimeout(f"{stage_name}:{elapsed:.2f}>{max_sec:.2f}")
+
+    def _stage_timeout_sec(self, env_name: str, default: float) -> float:
+        raw = os.getenv(env_name)
+        if raw is None:
+            return float(default)
+        try:
+            return max(1.0, float(raw))
+        except Exception:
+            return float(default)
 
     def _init_run_context_state(
         self,
@@ -8996,6 +9026,7 @@ class PB1Engine:
             self.entry_tick_budget_krw = 0.0
             self.entry_reserve_krw = 0.0
             tick_budget_krw = 0.0
+        logger.info("[PB1][POST_CAPITAL][START] phase=%s window=%s", self.phase, self.window_internal)
         positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
@@ -9012,13 +9043,24 @@ class PB1Engine:
             for p in positions
             if p.get("cooldown_until")
         }
-        holdings_for_exit, holdings_meta = self.load_effective_holdings_for_exit(
-            holdings_rows,
-            positions,
-            as_of=self.get_as_of(),
-            env=self.env,
-            intended_live=self.intended_live,
-            allow_http=bool(self.kis),
+        logger.info("[PB1][POST_CAPITAL][HOLDINGS_ROWS] rows=%s", len(holdings_rows or []))
+        logger.info("[PB1][POST_CAPITAL][EXIT_HOLDINGS_PREP][START]")
+        with self._stage_timer_with_timeout(
+            "post_capital.exit_holdings_prep",
+            self._stage_timeout_sec("PB1_POST_CAPITAL_TIMEOUT_SEC", 20.0),
+        ):
+            holdings_for_exit, holdings_meta = self.load_effective_holdings_for_exit(
+                holdings_rows,
+                positions,
+                as_of=self.get_as_of(),
+                env=self.env,
+                intended_live=self.intended_live,
+                allow_http=bool(self.kis),
+            )
+        logger.info(
+            "[PB1][POST_CAPITAL][EXIT_HOLDINGS_PREP][DONE] holdings=%s source=%s",
+            len(holdings_for_exit or []),
+            (holdings_meta or {}).get("source"),
         )
         self._exit_holdings_meta = holdings_meta
         positions_for_exit = [holding.to_position_dict() for holding in holdings_for_exit]
@@ -9081,9 +9123,17 @@ class PB1Engine:
             holdings_meta.get("source"),
         )
         try:
-            positions_for_exit = self._run_exit_always(holdings_for_exit=holdings_for_exit, marks_fallback=marks_fallback)
+            logger.info("[PB1][POST_CAPITAL][EXIT_PASS_ENTER]")
+            with self._stage_timer_with_timeout(
+                "post_capital.exit_pass",
+                self._stage_timeout_sec("PB1_EXIT_PASS_TIMEOUT_SEC", 30.0),
+            ):
+                positions_for_exit = self._run_exit_always(holdings_for_exit=holdings_for_exit, marks_fallback=marks_fallback)
+            logger.info("[PB1][POST_CAPITAL][EXIT_PASS_DONE] evals=%s", len(getattr(self, "_exit_evaluations", []) or []))
             exit_pass_sells = len([p for p in positions_for_exit if float(p.get("qty", 0)) == 0])
             logger.info("[PASS][EXIT][END] sells=%s skipped_dup=%s", exit_pass_sells, exit_pass_skipped)
+        except PB1StageTimeout:
+            raise
         except Exception as exit_exc:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)
@@ -9097,6 +9147,7 @@ class PB1Engine:
                 balance_cache_hits=self.balance_cache_hits,
                 balance_tick_cache_hits=self.balance_tick_cache_hits,
             )
+        logger.info("[PB1][POST_CAPITAL][OPEN_ORDERS_LOOKUP]")
         open_orders = self.orders_repo.get_open_orders(self.env)
         if open_orders:
             logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
@@ -9134,6 +9185,7 @@ class PB1Engine:
             )
 
         # ========== ENTRY PASS (EXIT와 완전 독립) ==========
+        logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
         entry_pass_ok = True
         entry_pass_buys = 0
         entry_pass_skipped = 0

@@ -27,6 +27,8 @@ env:
   PB1_PM_SESSION_END: "15:10"
   PB1_TICK_HARD_TIMEOUT_SEC: "45"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
+  PB1_POST_CAPITAL_TIMEOUT_SEC: "20"
+  PB1_EXIT_PASS_TIMEOUT_SEC: "30"
   STRATEGY_MODE: "LIVE"
   STRATEGY_ENV: practice
   KIS_ENV: practice
@@ -227,6 +229,18 @@ jobs:
           if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [RUN_SUMMARY][RESULT]"
             grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true
+            missing=1
+          fi
+          if ! grep -E "\[PB1\]\[POST_CAPITAL\]\[START\]" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::missing [PB1][POST_CAPITAL][START]"
+            missing=1
+          fi
+          if ! grep -E "\[PB1\]\[TICK\]\[DONE\]|\[PB1\]\[TICK_TIMEOUT\]|\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::PM tick appears stuck before terminal tick result"
+            missing=1
+          fi
+          if grep -E "\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_holdings_prep|\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_pass" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::PM hang detected in post-capital stage"
             missing=1
           fi
           if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-pm.log >/dev/null; then
