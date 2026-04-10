@@ -1216,6 +1216,58 @@ def compute_loop_deadline(now: datetime) -> datetime:
     )
     return deadline
 
+
+def _resolve_session_kind() -> str:
+    raw_value = os.getenv("FORCE_MARKET_WINDOW") or os.getenv("PB1_SESSION_KIND") or "day"
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"morning", "am"}:
+        return "am"
+    if normalized in {"day", "pm"}:
+        return "pm"
+    if normalized == "close":
+        return "close"
+    return "day"
+
+
+def _resolve_session_end_dt(now: datetime) -> datetime:
+    session_kind = _resolve_session_kind()
+    am_end = os.getenv("PB1_AM_SESSION_END", "13:00")
+    pm_end = os.getenv("PB1_PM_SESSION_END", "15:10")
+    close_end = os.getenv("PB1_CLOSE_SESSION_END", CLOSE_AUCTION_END or MARKET_CLOSE_HHMM or "15:30")
+
+    if session_kind == "am":
+        end_hhmm = am_end
+    elif session_kind == "close":
+        end_hhmm = close_end
+    else:
+        end_hhmm = pm_end
+
+    try:
+        end_time = _parse_hhmm_to_time(end_hhmm)
+    except Exception:
+        fallback_hhmm = "15:30" if session_kind == "close" else ("13:00" if session_kind == "am" else "15:10")
+        logger.warning(
+            "[PB1][LOOP][SESSION] invalid session end override kind=%s raw=%s fallback=%s",
+            session_kind,
+            end_hhmm,
+            fallback_hhmm,
+        )
+        end_time = _parse_hhmm_to_time(fallback_hhmm)
+
+    return now.replace(
+        hour=end_time.hour,
+        minute=end_time.minute,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _sleep_until_next_tick_or_session_end(now: datetime, session_end_dt: datetime, loop_interval: int) -> float:
+    remaining = (session_end_dt - now).total_seconds()
+    if remaining <= 0:
+        return 0.0
+    return max(1.0, min(float(loop_interval), remaining))
+
 _WINDOW_MISMATCH_LOGGED = False
 BALANCE_STATE_OK = "OK"
 BALANCE_STATE_STALE_OK = "STALE_OK"
@@ -2920,6 +2972,13 @@ def run_once(
     )
 
     logger.info(
+        "[PB1][TICK][SESSION_CTX] force_market_window=%s phase=%s derived_as_of=%s",
+        os.getenv("FORCE_MARKET_WINDOW"),
+        phase_for_log,
+        str(run_ctx.get("derived_as_of") or as_of),
+    )
+
+    logger.info(
         "[PB1][TICK] now_kst=%s market_window=%s window=%s phase=%s reasons=%s",
         now.isoformat(),
         market_window,
@@ -3971,28 +4030,19 @@ def _run_nontrading_smoke_if_needed(
 
 def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
-    run_loop_minutes, loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
-    loop_mode = os.getenv("PB1_LOOP_MODE", "").upper()
+    _run_loop_minutes, _loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
     now = _get_now_kst()
-    
-    # ✅ UNTIL_CLOSE 모드: 장 마감까지 루프
-    if loop_mode == "UNTIL_CLOSE":
-        loop_deadline_dt = compute_loop_deadline(now)
-        logger.info(
-            "[PB1][LOOP] mode=UNTIL_CLOSE interval=%s deadline=%s",
-            loop_interval,
-            loop_deadline_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        )
-    else:
-        # 기존 로직 (max_minutes 기반)
-        _, close_dt = _market_session(now)
-        logger.info(
-            "[PB1][LOOP] enabled interval=%s close=%s max_minutes=%s run_loop_minutes=%s",
-            loop_interval,
-            close_dt.isoformat(),
-            loop_max_minutes,
-            run_loop_minutes,
-        )
+    session_kind = _resolve_session_kind()
+    session_end_dt = _resolve_session_end_dt(now)
+    loop_deadline = session_end_dt
+
+    logger.info(
+        "[PB1][LOOP][SESSION] kind=%s now=%s session_end=%s interval=%s",
+        session_kind,
+        now.isoformat(),
+        session_end_dt.isoformat(),
+        loop_interval,
+    )
     
     logger.info(
         "[PB1][LOOP] start now_kst=%s max_seconds=%s",
@@ -4015,8 +4065,6 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     balance_tick_cache_hits = 0
     last_phase = "none"
     loop_started_ts = total_start_ts
-    loop_deadline = None
-    loop_deadline_ts = None
     runtime_root_dir = runtime_root()
     
     # ✅ run_id SSOT: TRADER_RUN_ID를 사용하여 통일
@@ -4053,11 +4101,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         _write_change_flag(False, ["init"])
         trade_start_ts = time_mod.monotonic()
         loop_started_ts = trade_start_ts
-        loop_deadline_ts = trade_start_ts + max_seconds if max_seconds > 0 else None
-        loop_deadline = None
         now_kst_value = _get_now_kst()
-        if max_seconds > 0:
-            loop_deadline = now_kst_value + timedelta(seconds=max_seconds)
         logger.info(
             "[PB1][CLOCK] total_start=%.3f trade_start=%.3f",
             total_start_ts,
@@ -4066,7 +4110,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         logger.info(
             "[PB1][LOOP] deadline_ready now_kst=%s deadline=%s max_seconds=%s baseline=trade",
             now_kst_value.isoformat(),
-            loop_deadline.isoformat() if loop_deadline else "none",
+            session_end_dt.isoformat(),
             max_seconds,
         )
         # ✅ PB1_CANDIDATE_ONLY=1이면 universe ensure skip (후보군만 사용)
@@ -4140,14 +4184,16 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 exit_reason = "sigterm"
                 break
             now = _get_now_kst()
-            
-            # ✅ UNTIL_CLOSE 모드: deadline 체크
-            if loop_mode == "UNTIL_CLOSE":
-                if now >= loop_deadline_dt:
-                    logger.info("[PB1][LOOP] deadline reached -> exit now=%s deadline=%s",
-                                now.strftime("%H:%M:%S"), loop_deadline_dt.strftime("%H:%M:%S"))
-                    exit_reason = "loop_deadline"
-                    break
+
+            if now >= session_end_dt:
+                logger.info(
+                    "[PB1][LOOP] session end reached -> exit kind=%s now=%s session_end=%s",
+                    session_kind,
+                    now.isoformat(),
+                    session_end_dt.isoformat(),
+                )
+                exit_reason = "session_end"
+                break
             
             if _run_nontrading_smoke_if_needed(
                 runtime_root_dir=runtime_root_dir,
@@ -4157,92 +4203,22 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             ):
                 exit_reason = "nontrading_smoke_done"
                 break
-            
-            # 기존 close_dt 체크 (UNTIL_CLOSE가 아닐 때만)
-            if loop_mode != "UNTIL_CLOSE":
-                _, close_dt = _market_session(now)
-                if now >= close_dt:
-                    logger.info("[PB1][LOOP] market closed -> exit")
-                    exit_reason = "market_closed"
-                    break
-            
-            elapsed_seconds = time_mod.monotonic() - loop_started_ts
-            if max_seconds > 0 and elapsed_seconds >= max_seconds:
-                logger.info("[PB1][LOOP] max_seconds=%s exiting", max_seconds)
-                exit_reason = "loop_timeout"
-                break
-            if loop_max_minutes > 0:
-                elapsed_min = (time_mod.monotonic() - loop_started_ts) / 60
-                if elapsed_min >= loop_max_minutes:
-                    logger.info("[PB1][LOOP] max minutes reached -> exit elapsed_min=%.1f", elapsed_min)
-                    exit_reason = "loop_timeout"
-                    break
+
             window = decide_window(now=now, override=args.window)
             if window is None:
-                if max_seconds > 0 and os.getenv("PB1_LOOP_WAIT_OUTSIDE", "0") != "1":
-                    next_start = _next_window_start(
-                        now,
-                        [
-                            _parse_hhmm_to_time(MORNING_WINDOW_START),
-                            _parse_hhmm_to_time(PB1_MORNING_WINDOW_END),
-                            _parse_hhmm_to_time(PB1_ENTRY_WINDOW_END),
-                        ],
-                    )
-                    logger.info(
-                        "[PB1][LOOP] outside window -> exit (tick mode) next=%s",
-                        next_start.isoformat() if next_start else "unknown",
-                    )
-                    exit_reason = "outside_window"
+                sleep_for = _sleep_until_next_tick_or_session_end(now, session_end_dt, loop_interval)
+                if sleep_for <= 0:
+                    exit_reason = "session_end"
                     break
-
-                next_start = _next_window_start(
-                    now,
-                    [
-                        _parse_hhmm_to_time(MORNING_WINDOW_START),
-                        _parse_hhmm_to_time(PB1_MORNING_WINDOW_END),
-                        _parse_hhmm_to_time(PB1_ENTRY_WINDOW_END),
-                    ],
-                )
-                if next_start:
-                    sleep_for = (next_start - now).total_seconds()
-                else:
-                    sleep_for = loop_interval
-                sleep_for = max(5.0, min(300.0, sleep_for))
-
-                # FIX: RUN_LOOP_MINUTES(=max_seconds) 예산보다 더 오래 sleep 해야 하면
-                # sleep 후 깨어나자마자 loop_timeout으로 끝나 "한 번 돌고 죽는" 것처럼 보인다.
-                # 이 경우에는 sleep하지 않고 종료하여 다음 5분 tick(schedule)에 맡긴다.
-                if max_seconds > 0:
-                    remaining_budget = max_seconds - elapsed_seconds
-                    if remaining_budget <= 0:
-                        logger.info("[PB1][LOOP] budget exhausted before sleep -> exit")
-                        exit_reason = "loop_timeout"
-                        break
-                    if sleep_for >= remaining_budget:
-                        logger.info(
-                            "[PB1][LOOP] outside window but insufficient budget -> exit "
-                            "sleep=%.0fs remaining_budget=%.0fs next=%s",
-                            sleep_for,
-                            remaining_budget,
-                            next_start.isoformat() if next_start else "unknown",
-                        )
-                        exit_reason = "outside_window_budget"
-                        break
                 logger.info(
-                    "[PB1][LOOP] outside window -> sleep %.0fs next=%s",
+                    "[PB1][LOOP] outside active window but session alive -> sleep %.0fs until next tick (session_end=%s)",
                     sleep_for,
-                    next_start.isoformat() if next_start else "unknown",
+                    session_end_dt.isoformat(),
                 )
                 time_mod.sleep(sleep_for)
                 continue
 
-            if loop_deadline_ts and time_mod.monotonic() > loop_deadline_ts:
-                logger.warning("[PB1][LOOP] deadline_exceeded_pre_trade deadline=%s", loop_deadline.isoformat())
-                exit_reason = "deadline_exceeded_pre_trade"
-                break
-            remaining_budget_s = 0
-            if loop_deadline_ts:
-                remaining_budget_s = max(0, int(loop_deadline_ts - time_mod.monotonic()))
+            remaining_budget_s = max(0, int((session_end_dt - now).total_seconds()))
             try:
                 _touched, _did_work, metrics, last_phase, result_status = run_once(
                     args=args,
@@ -4255,20 +4231,58 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 balance_api_calls += metrics.get("balance_api_calls", 0)
                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
-                if result_status in {"NONTRADING_SMOKE_DONE", "NONTRADING_DAY_EXIT"}:
+                if result_status == "NONTRADING_SMOKE_DONE":
                     logger.info("[PB1][LOOP] non-trading-day exit status=%s", result_status)
-                    exit_reason = result_status.lower()
+                    exit_reason = "nontrading_smoke_done"
                     break
                 if result_status == "HANDOFF_TO_CLOSE":
-                    logger.info("[PB1][LOOP] pm handoff to close -> exit")
-                    exit_reason = "handoff_to_close"
-                    break
-                if result_status == "NO_TRADE":
-                    logger.info("[PB1][LOOP] no trade -> exit")
-                    exit_reason = "no_candidates"
-                    break
+                    now_after_tick = _get_now_kst()
+                    if now_after_tick >= session_end_dt:
+                        logger.info(
+                            "[PB1][LOOP] handoff accepted at session boundary kind=%s now=%s session_end=%s",
+                            session_kind,
+                            now_after_tick.isoformat(),
+                            session_end_dt.isoformat(),
+                        )
+                        exit_reason = "session_end"
+                        break
+                    sleep_for = _sleep_until_next_tick_or_session_end(now_after_tick, session_end_dt, loop_interval)
+                    logger.info(
+                        "[PB1][LOOP] handoff requested before session end -> defer continue sleep=%.0fs now=%s session_end=%s",
+                        sleep_for,
+                        now_after_tick.isoformat(),
+                        session_end_dt.isoformat(),
+                    )
+                    if sleep_for <= 0:
+                        exit_reason = "session_end"
+                        break
+                    time_mod.sleep(sleep_for)
+                    sticky_precheck_reason = None
+                    sticky_precheck_count = 0
+                    continue
+                if result_status in {"NO_TRADE", "OK_NO_TRADE", "OK_NO_CANDIDATES"}:
+                    sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, loop_interval)
+                    logger.info(
+                        "[PB1][LOOP] no-trade tick only -> continue result_status=%s sleep=%.0fs session_end=%s",
+                        result_status,
+                        sleep_for,
+                        session_end_dt.isoformat(),
+                    )
+                    if sleep_for <= 0:
+                        exit_reason = "session_end"
+                        break
+                    time_mod.sleep(sleep_for)
+                    sticky_precheck_reason = None
+                    sticky_precheck_count = 0
+                    continue
                 sticky_precheck_reason = None
                 sticky_precheck_count = 0
+                sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, loop_interval)
+                if sleep_for <= 0:
+                    exit_reason = "session_end"
+                    break
+                time_mod.sleep(sleep_for)
+                continue
             except Exception as exc:
                 message = str(exc)
                 if message.startswith("ENTRY_ABORT_PRECHECK:"):
@@ -4312,38 +4326,27 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     exc,
                     traceback.format_exc(),
                 )
-                time_mod.sleep(3)
-            time_mod.sleep(loop_interval)
+                sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, min(loop_interval, 3))
+                if sleep_for <= 0:
+                    exit_reason = "session_end"
+                    break
+                time_mod.sleep(sleep_for)
         elapsed_trade = time_mod.monotonic() - loop_started_ts
         elapsed_total = time_mod.monotonic() - total_start_ts
         if exit_reason == "unknown":
             exit_reason = "shutdown"
-        if max_seconds > 0 and elapsed_trade > max_seconds:
-            logger.warning(
-                "[PB1][EXIT][WARN] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
-                exit_reason,
-                elapsed_trade,
-                elapsed_total,
-                max_seconds,
-                loop_deadline.isoformat() if loop_deadline else "none",
-                last_phase,
-                balance_api_calls,
-                balance_cache_hits,
-                balance_tick_cache_hits,
-            )
-        else:
-            logger.info(
-                "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
-                exit_reason,
-                elapsed_trade,
-                elapsed_total,
-                max_seconds,
-                loop_deadline.isoformat() if loop_deadline else "none",
-                last_phase,
-                balance_api_calls,
-                balance_cache_hits,
-                balance_tick_cache_hits,
-            )
+        logger.info(
+            "[PB1][EXIT] reason=%s elapsed_trade=%.1fs elapsed_total=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+            exit_reason,
+            elapsed_trade,
+            elapsed_total,
+            max_seconds,
+            loop_deadline.isoformat(),
+            last_phase,
+            balance_api_calls,
+            balance_cache_hits,
+            balance_tick_cache_hits,
+        )
     finally:
         try:
             release_advisory_lock(lock_conn)
