@@ -49,7 +49,7 @@ BEGIN
                ) samples;
 
         IF invalid_count > 0 THEN
-            RAISE EXCEPTION '[DB][MIGRATE][FILLS_FILLED_AT][INVALID] count=% sample=%', invalid_count, invalid_sample;
+          RAISE EXCEPTION '[DB][MIGRATE][FILLS_FILLED_AT][INVALID] count=%% sample=%%', invalid_count, invalid_sample;
         END IF;
 
         UPDATE fills
@@ -62,7 +62,7 @@ BEGIN
         ALTER TABLE fills RENAME COLUMN filled_at_ts TO filled_at;
         ALTER TABLE fills ADD CONSTRAINT uq_fills_fallback UNIQUE (env, kis_odno, code, side, qty, price, filled_at);
     ELSE
-        RAISE NOTICE '[DB][MIGRATE][FILLS_FILLED_AT] skip unsupported type data_type=% udt_name=%', filled_at_data_type, filled_at_udt_name;
+      RAISE NOTICE '[DB][MIGRATE][FILLS_FILLED_AT] skip unsupported type data_type=%% udt_name=%%', filled_at_data_type, filled_at_udt_name;
     END IF;
 
     SELECT udt_name
@@ -73,7 +73,7 @@ BEGIN
        AND column_name = 'filled_at';
 
     IF filled_at_udt_name IS DISTINCT FROM 'timestamptz' THEN
-        RAISE EXCEPTION '[DB][MIGRATE][FILLS_FILLED_AT][VERIFY_FAIL] actual_type=% expected=timestamptz', filled_at_udt_name;
+      RAISE EXCEPTION '[DB][MIGRATE][FILLS_FILLED_AT][VERIFY_FAIL] actual_type=%% expected=timestamptz', filled_at_udt_name;
     END IF;
 END;
 $$;

@@ -188,6 +188,19 @@ def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
         raise RuntimeError(
             f"[MIGRATE] Forbidden percent-format token found in SQL (psycopg placeholder trap): {bad}"
         )
+
+    index = 0
+    while index < len(cleaned):
+        if cleaned[index] != "%":
+            index += 1
+            continue
+        next_char = cleaned[index + 1] if index + 1 < len(cleaned) else ""
+        if next_char in {"%", "s", "b", "t"}:
+            index += 2
+            continue
+        raise RuntimeError(
+            "[MIGRATE] Unescaped percent token found in SQL. Use %% inside PL/pgSQL RAISE strings when executing via exec_driver_sql."
+        )
     
     try:
         conn.exec_driver_sql(cleaned)
