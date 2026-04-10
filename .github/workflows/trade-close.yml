@@ -23,6 +23,10 @@ permissions:
 
 env:
   MODE: trade
+  PB1_SESSION_KIND: "close"
+  PB1_CLOSE_SESSION_END: "15:30"
+  PB1_TICK_HARD_TIMEOUT_SEC: "45"
+  PB1_SESSION_EXIT_GRACE_SEC: "15"
   STRATEGY_MODE: "LIVE"
   STRATEGY_ENV: practice
   KIS_ENV: practice
@@ -180,6 +184,16 @@ jobs:
             exit 1
           fi
 
+      - name: Guard Close manual session window
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          if [[ "$now_kst" -ge 1525 ]]; then
+            echo "::error::Close manual run after 15:25 KST is blocked."
+            exit 1
+          fi
+
       - name: Run close trade tick
         run: |
           set -euo pipefail
@@ -190,13 +204,36 @@ jobs:
       - name: Verify close trade tick logs
         run: |
           set -euo pipefail
-          grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-close.log >/dev/null
-          grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-close.log >/dev/null
-          grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-close.log >/dev/null
+          missing=0
+          if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=close" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing [PB1][LOOP][SESSION] kind=close"
+            missing=1
+          fi
+          if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
+            missing=1
+          fi
+          if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing [TRADE][READY][OK]"
+            missing=1
+          fi
+          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing [RUN_SUMMARY][RESULT]"
+            missing=1
+          fi
+          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-close.log >/dev/null; then
+            echo "::error::fills.list_today_fills schema mismatch still present"
+            missing=1
+          fi
+          if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing clean close session release log"
+            missing=1
+          fi
           if grep -E "\[TRADE\]\[ORDER\]\[BUY\]" artifacts/trade-close.log >/dev/null; then
             echo "::error::Close workflow emitted BUY order logs despite PB1_ENTRY_ENABLED=0"
             exit 1
           fi
+          test "$missing" -eq 0
 
       - name: Scan for SQLite artifacts
         if: always()

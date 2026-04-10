@@ -23,6 +23,10 @@ permissions:
 
 env:
   MODE: trade
+  PB1_SESSION_KIND: "pm"
+  PB1_PM_SESSION_END: "15:10"
+  PB1_TICK_HARD_TIMEOUT_SEC: "45"
+  PB1_SESSION_EXIT_GRACE_SEC: "15"
   STRATEGY_MODE: "LIVE"
   STRATEGY_ENV: practice
   KIS_ENV: practice
@@ -184,6 +188,16 @@ jobs:
             exit 1
           fi
 
+      - name: Guard PM manual session window
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          if [[ "$now_kst" -ge 1505 ]]; then
+            echo "::error::PM manual run after 15:05 KST is blocked. Use trade-close instead."
+            exit 1
+          fi
+
       - name: Run PM trade tick
         run: |
           set -euo pipefail
@@ -196,6 +210,10 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
+          if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=pm" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::missing [PB1][LOOP][SESSION] kind=pm"
+            missing=1
+          fi
           if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
             grep -E "\[TRADE\]\[FINAL30\]\[(DB_FALLBACK_LOAD|FAIL|LOAD_FAIL)\]" artifacts/trade-pm.log || true
@@ -209,6 +227,14 @@ jobs:
           if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [RUN_SUMMARY][RESULT]"
             grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true
+            missing=1
+          fi
+          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::fills.list_today_fills schema mismatch still present"
+            missing=1
+          fi
+          if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::missing clean PM session release log"
             missing=1
           fi
           test "$missing" -eq 0

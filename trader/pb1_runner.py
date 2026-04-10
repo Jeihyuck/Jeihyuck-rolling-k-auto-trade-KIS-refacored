@@ -1218,7 +1218,7 @@ def compute_loop_deadline(now: datetime) -> datetime:
 
 
 def _resolve_session_kind() -> str:
-    raw_value = os.getenv("FORCE_MARKET_WINDOW") or os.getenv("PB1_SESSION_KIND") or "day"
+    raw_value = os.getenv("PB1_SESSION_KIND") or os.getenv("FORCE_MARKET_WINDOW") or "day"
     normalized = str(raw_value).strip().lower()
     if normalized in {"morning", "am"}:
         return "am"
@@ -1260,6 +1260,34 @@ def _resolve_session_end_dt(now: datetime) -> datetime:
         second=0,
         microsecond=0,
     )
+
+
+def _resolve_session_exit_grace_sec() -> int:
+    try:
+        return max(0, int(os.getenv("PB1_SESSION_EXIT_GRACE_SEC", "15")))
+    except Exception:
+        return 15
+
+
+class TickTimeoutError(TimeoutError):
+    pass
+
+
+def _run_once_with_hard_timeout(*, timeout_sec: int, call):
+    if timeout_sec <= 0:
+        raise TickTimeoutError("tick_hard_timeout")
+
+    def _alarm_handler(signum, frame):
+        raise TickTimeoutError("tick_hard_timeout")
+
+    prev = signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, float(timeout_sec))
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, prev)
 
 
 def _sleep_until_next_tick_or_session_end(now: datetime, session_end_dt: datetime, loop_interval: int) -> float:
@@ -4220,23 +4248,44 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
             remaining_budget_s = max(0, int((session_end_dt - now).total_seconds()))
             try:
-                _touched, _did_work, metrics, last_phase, result_status = run_once(
-                    args=args,
-                    engine=engine,
-                    ctx=ctx,
-                    loop_mode=True,
-                    window=window,
-                    max_seconds=remaining_budget_s,
+                grace_sec = _resolve_session_exit_grace_sec()
+                base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 45))
+                remaining_to_session_end = max(0, int((session_end_dt - now).total_seconds()))
+                tick_timeout_sec = min(
+                    base_tick_timeout,
+                    max(5, remaining_to_session_end + grace_sec),
+                )
+
+                _touched, _did_work, metrics, last_phase, result_status = _run_once_with_hard_timeout(
+                    timeout_sec=tick_timeout_sec,
+                    call=lambda: run_once(
+                        args=args,
+                        engine=engine,
+                        ctx=ctx,
+                        loop_mode=True,
+                        window=window,
+                        max_seconds=remaining_budget_s,
+                    ),
                 )
                 balance_api_calls += metrics.get("balance_api_calls", 0)
                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
+                now_after_tick = _get_now_kst()
+                if now_after_tick >= session_end_dt:
+                    logger.info(
+                        "[PB1][LOOP][SESSION_END_RELEASE] kind=%s now=%s session_end=%s result_status=%s",
+                        session_kind,
+                        now_after_tick.isoformat(),
+                        session_end_dt.isoformat(),
+                        result_status,
+                    )
+                    exit_reason = "session_end"
+                    break
                 if result_status == "NONTRADING_SMOKE_DONE":
                     logger.info("[PB1][LOOP] non-trading-day exit status=%s", result_status)
                     exit_reason = "nontrading_smoke_done"
                     break
                 if result_status == "HANDOFF_TO_CLOSE":
-                    now_after_tick = _get_now_kst()
                     if now_after_tick >= session_end_dt:
                         logger.info(
                             "[PB1][LOOP] handoff accepted at session boundary kind=%s now=%s session_end=%s",
@@ -4283,6 +4332,27 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     break
                 time_mod.sleep(sleep_for)
                 continue
+            except TickTimeoutError:
+                logger.error(
+                    "[PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s -> abort current tick",
+                    session_kind,
+                    now.isoformat(),
+                    session_end_dt.isoformat(),
+                )
+                now_after_timeout = _get_now_kst()
+                if now_after_timeout >= session_end_dt:
+                    exit_reason = "session_end"
+                    break
+                sleep_for = _sleep_until_next_tick_or_session_end(
+                    now_after_timeout,
+                    session_end_dt,
+                    min(loop_interval, 5),
+                )
+                if sleep_for <= 0:
+                    exit_reason = "session_end"
+                    break
+                time_mod.sleep(sleep_for)
+                continue
             except Exception as exc:
                 message = str(exc)
                 if message.startswith("ENTRY_ABORT_PRECHECK:"):
@@ -4297,6 +4367,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         precheck_reason,
                         sticky_precheck_count,
                     )
+                    if "db_schema_mismatch_fills_filled_at" in precheck_reason and sticky_precheck_count >= 2:
+                        exit_reason = "STRUCTURAL_FATAL"
+                        logger.error("[PB1][LOOP][STRUCTURAL_FATAL] reason=%s -> exit loop immediately", precheck_reason)
+                        break
                     if sticky_precheck_count >= 2:
                         exit_reason = "PRECHECK_FATAL_STICKY"
                         logger.error("[PB1][PRECHECK][STICKY] reason=%s -> exit loop", precheck_reason)

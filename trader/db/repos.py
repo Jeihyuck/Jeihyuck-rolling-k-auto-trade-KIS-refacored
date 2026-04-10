@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import pandas as pd
 import pytz
 import sqlalchemy as sa
-from sqlalchemy.exc import OperationalError, StatementError, IntegrityError, DBAPIError, TimeoutError as SATimeoutError
+from sqlalchemy.exc import OperationalError, StatementError, IntegrityError, DBAPIError, ProgrammingError, TimeoutError as SATimeoutError
 from sqlalchemy import Engine, and_, func, or_, select, bindparam
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -2481,6 +2481,21 @@ class FillsRepo:
             return sa.cast(column, sa.DateTime(timezone=True))
         return column
 
+    def _filled_at_window_conditions(self, *, env: str, start_at: datetime, end_at: datetime) -> list[Any]:
+        filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
+        return [
+            self._schema.fills.c.env == _norm_env(env),
+            filled_at_expr >= bindparam("filled_at_start", start_at, type_=sa.DateTime(timezone=True)),
+            filled_at_expr < bindparam("filled_at_end", end_at, type_=sa.DateTime(timezone=True)),
+        ]
+
+    def _is_filled_at_schema_mismatch(self, exc: Exception) -> bool:
+        message = str(getattr(exc, "orig", exc) or exc).lower()
+        return (
+            "operator does not exist" in message
+            and "text >= timestamp with time zone" in message
+        )
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -2506,18 +2521,38 @@ class FillsRepo:
         now = now_kst()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
-        conditions = [self._schema.fills.c.env == env, self._schema.fills.c.filled_at >= start, self._schema.fills.c.filled_at < end]
+        filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
+        conditions = self._filled_at_window_conditions(env=env, start_at=start, end_at=end)
         if side:
-            conditions.append(self._schema.fills.c.side == side)
+            conditions.append(self._schema.fills.c.side == str(side).upper())
         if code:
-            conditions.append(self._schema.fills.c.code == code)
-        stmt = select(self._schema.fills).where(and_(*conditions))
+            conditions.append(self._schema.fills.c.code == str(code).zfill(6))
+        stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
         fail_open = _resolve_lookup_fail_open()
         try:
             with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 rows = conn.execute(stmt).mappings().all()
                 logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", "fills.list_today_fills", len(rows), int(bool(fail_open)))
                 return [dict(r) for r in rows]
+        except ProgrammingError as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+                "fills.list_today_fills",
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if self._is_filled_at_schema_mismatch(exc):
+                logger.error(
+                    "[DB][READ][FATAL_SCHEMA_MISMATCH] op=fills.list_today_fills column=filled_at expected=timestamptz"
+                )
+                raise RuntimeError(
+                    "ENTRY_ABORT_PRECHECK:db_schema_mismatch_fills_filled_at op=fills.list_today_fills [DB][READ][FATAL_SCHEMA_MISMATCH]"
+                ) from exc
+            if fail_open:
+                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", "fills.list_today_fills")
+                return []
+            raise
         except (OperationalError, DBAPIError, SATimeoutError) as exc:
             logger.exception(
                 "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
@@ -2544,11 +2579,7 @@ class FillsRepo:
         env_n = _norm_env(env)
         code_list = [str(item).zfill(6) for item in (codes or []) if str(item or "").strip()]
         filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
-        conditions = [
-            self._schema.fills.c.env == env_n,
-            filled_at_expr >= start_at,
-            filled_at_expr < end_at,
-        ]
+        conditions = self._filled_at_window_conditions(env=env_n, start_at=start_at, end_at=end_at)
         if side:
             conditions.append(self._schema.fills.c.side == str(side).upper())
         if code:
