@@ -15,7 +15,7 @@ name: "Trade AM"
           - practice
 
 concurrency:
-  group: pb1-practice-intraday-serial
+  group: pb1-practice-am-serial
   cancel-in-progress: false
 
 permissions:
@@ -93,13 +93,34 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
+      - name: Guard AM phase window (all triggers)
+        id: phase_guard
+        working-directory: .
+        run: |
+          set -euo pipefail
+          now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          should_run=1
+          skip_reason=""
+          if [[ "$now_kst" -lt 0900 ]]; then
+            should_run=0
+            skip_reason="early_start"
+          elif [[ "$now_kst" -ge 1255 ]]; then
+            should_run=0
+            skip_reason="stale_start"
+          fi
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+          echo "[TRADE_AM][PHASE_GUARD] now_kst=${now_kst} should_run=${should_run} skip_reason=${skip_reason:-none} valid=0900-1255"
+
       - name: Checkout
+        if: steps.phase_guard.outputs.should_run == '1'
         uses: actions/checkout@v4
         with:
           path: repo
           fetch-depth: 1
 
       - name: Set up Python
+        if: steps.phase_guard.outputs.should_run == '1'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -107,12 +128,14 @@ jobs:
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Guard postgres-only
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -122,11 +145,13 @@ jobs:
           fi
 
       - name: DB migrate
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           python -m trader.db.migrate
 
       - name: Verify KIS env contract
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
 
@@ -149,6 +174,7 @@ jobs:
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Verify candidate pool exists in DB
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][START]"
@@ -160,6 +186,7 @@ jobs:
           fi
 
       - name: Verify final30 readiness in DB
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           echo "[TRADE_AM][PRECHECK][FINAL30][START]"
@@ -188,17 +215,19 @@ jobs:
             exit 1
           fi
 
-      - name: Guard AM manual session window
-        if: github.event_name == 'workflow_dispatch'
+      - name: Emit AM skip summary
+        if: steps.phase_guard.outputs.should_run != '1'
+        working-directory: .
         run: |
           set -euo pipefail
-          now_kst="$(TZ=Asia/Seoul date +%H%M)"
-          if [[ "$now_kst" -ge 1255 ]]; then
-            echo "::error::AM manual run after 12:55 KST is blocked. Use trade-pm instead."
-            exit 1
-          fi
+          mkdir -p repo/artifacts
+          {
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[PB1][EXIT] reason=phase_guard_skip"
+          } | tee repo/artifacts/trade-am.log
 
       - name: Run AM trade tick
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -207,9 +236,12 @@ jobs:
           echo "[CONFIG][PB1_REQUIRE_SCORED_FINAL30] ${PB1_REQUIRE_SCORED_FINAL30}"
           echo "[CONFIG][PB1_DISABLE_RAW_FINAL30_FALLBACK] ${PB1_DISABLE_RAW_FINAL30_FALLBACK}"
           echo "[TRADE_AM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
-          python -m trader.trade_tick 2>&1 | tee artifacts/trade-am.log
+          echo "[PHASE][START] phase=am" | tee artifacts/trade-am.log
+          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-am.log
+          echo "[PHASE][END] phase=am" | tee -a artifacts/trade-am.log
 
       - name: Verify AM trade tick logs
+        if: steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           missing=0
@@ -243,7 +275,7 @@ jobs:
           test "$missing" -eq 0
 
       - name: Scan for SQLite artifacts
-        if: always()
+        if: always() && steps.phase_guard.outputs.should_run == '1'
         run: |
           set -euo pipefail
           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
