@@ -2011,6 +2011,7 @@ class OrdersRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
+        self._last_read_fail_open_op: str | None = None
 
     def _read_mappings_with_guard(
         self,
@@ -2020,8 +2021,13 @@ class OrdersRepo:
         fail_open: bool | None = None,
     ) -> list[dict]:
         if fail_open is None:
-            fail_open = _resolve_lookup_fail_open()
+            explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
+            fail_open = _env_flag(
+                "PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT",
+                default=_practice_env_default_fail_open(),
+            ) if explicit is not None else _practice_env_default_fail_open()
 
+        self._last_read_fail_open_op = None
         try:
             with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 rows = conn.execute(stmt).mappings().all()
@@ -2036,9 +2042,16 @@ class OrdersRepo:
                 exc,
             )
             if fail_open:
+                self._last_read_fail_open_op = op_name
                 logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
                 return []
             raise
+
+    def consume_fail_open_marker(self, op_name: str) -> bool:
+        if self._last_read_fail_open_op != op_name:
+            return False
+        self._last_read_fail_open_op = None
+        return True
 
     def _window_expr(self, column):
         if self.engine.dialect.name == "postgresql":
@@ -2219,19 +2232,26 @@ class OrdersRepo:
         )
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
-        stmt = select(self._schema.orders.c.order_id).where(
+        stmt = select(self._schema.orders.c.order_id.label("order_id")).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
         )
-        with self.engine.begin() as conn:
-            return conn.execute(stmt).scalar() is not None
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.has_client_order_key",
+            fail_open=None,
+        )
+        return bool(rows)
 
     def get_order_by_client_order_key(self, env: str, client_order_key: str) -> dict | None:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
         )
-        with self.engine.begin() as conn:
-            row = conn.execute(stmt).mappings().first()
-        return dict(row) if row else None
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.get_order_by_client_order_key",
+            fail_open=None,
+        )
+        return rows[0] if rows else None
 
     def has_blocking_order_today(
         self,
@@ -2281,24 +2301,13 @@ class OrdersRepo:
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(1)
         )
-        
-        try:
-            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                row = conn.execute(stmt).mappings().first()
-        except (OperationalError, DBAPIError, SATimeoutError) as exc:
-            fail_open = _resolve_lookup_fail_open()
-            logger.exception(
-                "[DB][READ][FAIL] op=orders.has_blocking_order_today fail_open=%s err_type=%s err=%s",
-                int(bool(fail_open)),
-                type(exc).__name__,
-                exc,
-            )
-            if fail_open:
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_blocking_order_today -> returning (False, None)")
-                return False, None
-            raise
-        if row:
-            return True, dict(row)
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.has_blocking_order_today",
+            fail_open=None,
+        )
+        if rows:
+            return True, rows[0]
         return False, None
 
     def list_today_orders(
@@ -2363,9 +2372,11 @@ class OrdersRepo:
             .where(and_(*conditions))
             .order_by(created_at_expr.desc())
         )
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-        return [dict(r) for r in rows]
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.list_orders_in_window",
+            fail_open=None,
+        )
 
     def upsert_reconciled_order(
         self,

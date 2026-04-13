@@ -1045,10 +1045,28 @@ class KisAPI:
                     msg_text = str(body.get("msg1") or "").lower()
                     rt_cd = str(body.get("rt_cd") or "").strip()
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        if "inquire-price" in _endpoint_path(url):
+                            logger.warning(
+                                "[KIS][RATE_LIMIT][EGW00201] endpoint=%s code=%s attempt=%s msg_cd=%s msg1=%s",
+                                _endpoint_name(url),
+                                (kwargs.get("params") or {}).get("fid_input_iscd"),
+                                i,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
                                        method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError(f"BODY_TEMP_ERROR msg_cd={msg_cd}")
                     if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연", "초당")):
+                        if "inquire-price" in _endpoint_path(url):
+                            logger.warning(
+                                "[KIS][RATE_LIMIT][EGW00201] endpoint=%s code=%s attempt=%s msg_cd=%s msg1=%s",
+                                _endpoint_name(url),
+                                (kwargs.get("params") or {}).get("fid_input_iscd"),
+                                i,
+                                msg_cd,
+                                body.get("msg1"),
+                            )
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
                                        method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError("BODY_TEMP_ERROR msg1")
@@ -2286,8 +2304,9 @@ class KisAPI:
         # 2) ttl cache
         cached = _price_cache.get_cached(key)
         if cached is not None:
-            logger.info("[PRICE][CACHE_HIT] code=%s ttl=%ss", code, _PRICE_TTL_SEC)
+            logger.info("[KIS][PRICE_CACHE][HIT] code=%s market=%s ttl=%ss", code, market, _PRICE_TTL_SEC)
             return cached
+        logger.info("[KIS][PRICE_CACHE][MISS] code=%s market=%s", code, market)
 
         # 3) inflight dedup
         ev = _price_cache.begin_inflight(key)

@@ -86,42 +86,37 @@ def _connect_args_for_db_url(db_url: str) -> dict:
         "keepalives_interval": int(os.getenv("DB_KEEPALIVES_INTERVAL", "10")),
         "keepalives_count": int(os.getenv("DB_KEEPALIVES_COUNT", "5")),
     }
-    lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", "5000"))
-    statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
-    idle_in_tx_timeout_ms = int(os.getenv("DB_IDLE_IN_TX_SESSION_TIMEOUT_MS", "15000"))
+    drivername, base_driver = _describe_db_url(db_url)
+    if base_driver == "postgresql" or drivername.startswith("postgres"):
+        lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", "5000"))
+        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
+        idle_in_tx_timeout_ms = int(os.getenv("DB_IDLE_IN_TX_SESSION_TIMEOUT_MS", "15000"))
 
-    pg_options = [
-        f"-c lock_timeout={lock_timeout_ms}",
-        f"-c statement_timeout={statement_timeout_ms}",
-        f"-c idle_in_transaction_session_timeout={idle_in_tx_timeout_ms}",
-    ]
+        pg_options = [
+            f"-c lock_timeout={lock_timeout_ms}",
+            f"-c statement_timeout={statement_timeout_ms}",
+            f"-c idle_in_transaction_session_timeout={idle_in_tx_timeout_ms}",
+        ]
 
-    existing_options = str(connect_args.get("options", "") or "").strip()
-    connect_args["options"] = " ".join([opt for opt in [existing_options, *pg_options] if opt]).strip()
-    # 강제 플래그가 있으면 최우선
-    if os.getenv("DB_DISABLE_PREPARED_STATEMENTS", "0") in {"1", "true", "TRUE"}:
-        connect_args["prepare_threshold"] = None
+        existing_options = str(connect_args.get("options", "") or "").strip()
+        connect_args["options"] = " ".join([opt for opt in [existing_options, *pg_options] if opt]).strip()
         logger.info(
-            "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s prepared_disabled=%s",
+            "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s",
             connect_args.get("connect_timeout"),
             lock_timeout_ms,
             statement_timeout_ms,
             idle_in_tx_timeout_ms,
-            int(connect_args.get("prepare_threshold") is None),
         )
+    # 강제 플래그가 있으면 최우선
+    if os.getenv("DB_DISABLE_PREPARED_STATEMENTS", "0") in {"1", "true", "TRUE"}:
+        connect_args["prepare_threshold"] = None
+        logger.info("[DB][CONNECT_ARGS][PREPARED] prepared_disabled=%s", int(connect_args.get("prepare_threshold") is None))
         return connect_args
 
     # URL 기반 자동 감지
     if "pooler.supabase.com" in (db_url or "") or ":6543" in (db_url or ""):
         connect_args["prepare_threshold"] = None
-    logger.info(
-        "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s prepared_disabled=%s",
-        connect_args.get("connect_timeout"),
-        lock_timeout_ms,
-        statement_timeout_ms,
-        idle_in_tx_timeout_ms,
-        int(connect_args.get("prepare_threshold") is None),
-    )
+    logger.info("[DB][CONNECT_ARGS][PREPARED] prepared_disabled=%s", int(connect_args.get("prepare_threshold") is None))
     return connect_args
 
 

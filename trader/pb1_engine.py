@@ -1087,6 +1087,9 @@ class PB1Engine:
         self._debug_sizing_ok_codes: list[str] = []
         self._debug_sizing_fail_items: list[dict[str, Any]] = []
         self._debug_summary: dict[str, Any] = {}
+        self._tick_price_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._tick_price_cache_hits = 0
+        self._tick_price_api_calls = 0
 
         logger.info(
             "[PB1][ASOF][USE] component=engine value=%s source=run_ctx",
@@ -1128,6 +1131,127 @@ class PB1Engine:
             return max(1.0, float(raw))
         except Exception:
             return float(default)
+
+    def _consume_order_lookup_fail_open(self, op_name: str) -> bool:
+        consume = getattr(self.orders_repo, "consume_fail_open_marker", None)
+        if callable(consume):
+            return bool(consume(op_name))
+        marker = getattr(self.orders_repo, "_last_read_fail_open_op", None)
+        if marker != op_name:
+            return False
+        setattr(self.orders_repo, "_last_read_fail_open_op", None)
+        return True
+
+    def _safe_get_open_orders(self) -> list[dict]:
+        logger.info("[PB1][STAGE][START] stage=orders.lookup_open")
+        rows = self.orders_repo.get_open_orders(self.env)
+        if self._consume_order_lookup_fail_open("orders.get_open_orders"):
+            logger.warning("[PB1][ORDER_LOOKUP][FAIL_OPEN] op=open_orders")
+        logger.info("[PB1][STAGE][END] stage=orders.lookup_open rows=%s", len(rows))
+        return rows
+
+    def _safe_list_today_orders(self, *, code: str | None = None, side: str | None = None) -> list[dict]:
+        logger.info("[PB1][STAGE][START] stage=orders.lookup_today code=%s side=%s", code, side)
+        rows = self.orders_repo.list_today_orders(self.env, code=code, side=side)
+        if self._consume_order_lookup_fail_open("orders.list_today_orders"):
+            logger.warning("[PB1][ORDER_LOOKUP][FAIL_OPEN] op=today_orders")
+        logger.info("[PB1][STAGE][END] stage=orders.lookup_today rows=%s code=%s side=%s", len(rows), code, side)
+        return rows
+
+    def _safe_has_blocking_order_today(
+        self,
+        *,
+        code: str,
+        side: str,
+        stage: str | None = None,
+        trade_date: str | None = None,
+    ) -> tuple[bool, dict | None]:
+        return self.orders_repo.has_blocking_order_today(
+            env=self.env,
+            code=code,
+            side=side,
+            stage=stage,
+            trade_date=trade_date,
+        )
+
+    def _resolve_buy_cooldown_state(
+        self,
+        *,
+        code: str,
+        cooldown_until,
+        today_buy_exists: bool,
+        today_fill_exists: bool,
+        cooldown_source_events_count: int,
+        last_fill_event_at,
+    ) -> dict:
+        cooldown_active = False
+        stale_ignored = False
+
+        cooldown_until_value = str(cooldown_until).strip() if cooldown_until is not None else ""
+        if cooldown_until_value and cooldown_until_value >= self._today:
+            evidence_exists = (
+                bool(today_buy_exists)
+                or bool(today_fill_exists)
+                or int(cooldown_source_events_count or 0) > 0
+                or bool(last_fill_event_at)
+            )
+            if evidence_exists:
+                cooldown_active = True
+            else:
+                stale_ignored = True
+
+        logger.info(
+            "[PB1][BUYABLE_GATE][COOLDOWN_EVIDENCE] code=%s cooldown_until=%s today_buy_exists=%s today_fill_exists=%s cooldown_source_events_count=%s last_fill_event_at=%s active=%s stale_ignored=%s",
+            code,
+            cooldown_until_value or None,
+            int(bool(today_buy_exists)),
+            int(bool(today_fill_exists)),
+            int(cooldown_source_events_count or 0),
+            last_fill_event_at,
+            int(cooldown_active),
+            int(stale_ignored),
+        )
+        if stale_ignored:
+            logger.warning(
+                "[PB1][BUYABLE_GATE][STALE_COOLDOWN] code=%s cooldown_until=%s ignored=1 reason=no_fill_evidence",
+                code,
+                cooldown_until_value or None,
+            )
+
+        return {
+            "cooldown_active": cooldown_active,
+            "stale_ignored": stale_ignored,
+        }
+
+    def _get_price_snapshot_cached(self, code: str, market: str = "J") -> dict:
+        norm_code = str(code).zfill(6)
+        key = (norm_code, market)
+
+        if key in self._tick_price_cache:
+            self._tick_price_cache_hits += 1
+            logger.info("[PB1][PRICE_CACHE][HIT] code=%s market=%s", norm_code, market)
+            return self._tick_price_cache[key]
+
+        logger.info("[PB1][PRICE_CACHE][MISS] code=%s market=%s", norm_code, market)
+
+        snapshot = {}
+        if getattr(self, "kis", None):
+            snapshot = self.kis.get_price_snapshot(norm_code, market=market) or {}
+        elif getattr(self, "kis_api", None):
+            snapshot = self.kis_api.get_price_snapshot(norm_code, market=market) or {}
+
+        self._tick_price_api_calls += 1
+        self._tick_price_cache[key] = snapshot
+        logger.info("[PB1][PRICE_CACHE][STORE] code=%s market=%s ok=%s", norm_code, market, int(bool(snapshot)))
+        return snapshot
+
+    def _log_tick_price_cache_summary(self) -> None:
+        logger.info(
+            "[PB1][PRICE_CACHE][SUMMARY] api_calls=%s cache_hits=%s keys=%s",
+            self._tick_price_api_calls,
+            self._tick_price_cache_hits,
+            len(self._tick_price_cache),
+        )
 
     def _init_run_context_state(
         self,
@@ -2972,16 +3096,27 @@ class PB1Engine:
         last_fill_event = fill_rows_sorted[0] if fill_rows_sorted else None
         cooldown_until_raw = str(pos.get("cooldown_until") or "") or None
         cooldown_until_dt = self._parse_cooldown_until(cooldown_until_raw)
-        cooldown_active = bool(cooldown_until_dt and cooldown_until_dt > self._now_kst)
         cooldown_until_value = cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw
+        last_fill_event_at = self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None)
         cooldown_events = [
             self._normalize_cooldown_event(
                 row,
                 cooldown_until=cooldown_until_value,
-                matched_now=cooldown_active,
+                matched_now=False,
             )
             for row in fill_rows_sorted[:5]
         ] if cooldown_until_raw else []
+        cooldown_state = self._resolve_buy_cooldown_state(
+            code=code_key,
+            cooldown_until=cooldown_until_value,
+            today_buy_exists=bool(today_buy_events),
+            today_fill_exists=bool(fill_rows_sorted),
+            cooldown_source_events_count=len(cooldown_events),
+            last_fill_event_at=last_fill_event_at,
+        )
+        cooldown_active = bool(cooldown_state["cooldown_active"])
+        for event in cooldown_events:
+            event["matched_now"] = cooldown_active
         return {
             "holding_qty": int(pos.get("qty") or 0),
             "today_buy_exists": bool(today_buy_events),
@@ -2989,12 +3124,13 @@ class PB1Engine:
             "today_fill_exists": bool(fill_rows_sorted),
             "open_order_exists": False,
             "cooldown_active": cooldown_active,
+            "stale_cooldown_ignored": bool(cooldown_state["stale_ignored"]),
             "today_buy_events": today_buy_events,
             "cooldown_events": cooldown_events,
             "today_buy_source_events_count": len(today_buy_events),
             "cooldown_source_events_count": len(cooldown_events),
             "last_buy_event_at": self._format_kst_datetime((last_buy_fill or {}).get("filled_at") if last_buy_fill else None),
-            "last_fill_event_at": self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None),
+            "last_fill_event_at": last_fill_event_at,
             "last_order_submit_at": self._format_kst_datetime(
                 (prior_order or {}).get("submitted_at")
                 or (prior_order or {}).get("acked_at")
@@ -3085,11 +3221,22 @@ class PB1Engine:
             last_order_event = recent_order_events[0] if recent_order_events else None
             cooldown_until_raw = str(pos.get("cooldown_until") or "") or None
             cooldown_until_dt = self._parse_cooldown_until(cooldown_until_raw)
-            cooldown_active = bool(cooldown_until_dt and cooldown_until_dt > self._now_kst and recent_fill_events)
+            last_fill_event_at = self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None)
             cooldown_events = [
-                self._normalize_cooldown_event(row, cooldown_until=cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw, matched_now=cooldown_active)
+                self._normalize_cooldown_event(row, cooldown_until=cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw, matched_now=False)
                 for row in recent_fill_events[:5]
             ] if cooldown_until_raw else []
+            cooldown_state = self._resolve_buy_cooldown_state(
+                code=code_key,
+                cooldown_until=cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw,
+                today_buy_exists=bool(today_buy_events),
+                today_fill_exists=bool(recent_fill_events),
+                cooldown_source_events_count=len(cooldown_events),
+                last_fill_event_at=last_fill_event_at,
+            )
+            cooldown_active = bool(cooldown_state["cooldown_active"])
+            for event in cooldown_events:
+                event["matched_now"] = cooldown_active
             snapshot = {
                 "holding_qty": int(pos.get("qty") or 0),
                 "today_buy_exists": bool(today_buy_events),
@@ -3097,12 +3244,13 @@ class PB1Engine:
                 "today_fill_exists": bool(recent_fill_events),
                 "open_order_exists": False,
                 "cooldown_active": cooldown_active,
+                "stale_cooldown_ignored": bool(cooldown_state["stale_ignored"]),
                 "today_buy_events": today_buy_events,
                 "cooldown_events": cooldown_events,
                 "today_buy_source_events_count": len(today_buy_events),
                 "cooldown_source_events_count": len(cooldown_events),
                 "last_buy_event_at": self._format_kst_datetime((last_buy_fill or {}).get("filled_at") if last_buy_fill else None),
-                "last_fill_event_at": self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None),
+                "last_fill_event_at": last_fill_event_at,
                 "last_order_submit_at": self._format_kst_datetime(
                     (last_order_event or {}).get("submitted_at")
                     or (last_order_event or {}).get("acked_at")
@@ -4902,7 +5050,7 @@ class PB1Engine:
         for cf in ranked:
             daily_close = self._to_float(cf.features.get("close"))
             # ✅ 단일 스냅샷 조회 (중복 호출 방지)
-            snapshot = self.kis.get_price_snapshot(cf.code, market="J") if self.kis else {}
+            snapshot = self._get_price_snapshot_cached(cf.code, market="J") if self.kis else {}
             ask, bid, prpr = _extract_px_from_snapshot(snapshot)
             
             # 호가 없으면 prpr로 처리
@@ -5217,7 +5365,7 @@ class PB1Engine:
                 self.price_fetch_count += 1
                 
                 # ✅ 단일 스냅샷 조회 (중복 호출 방지)
-                snapshot = self.kis.get_price_snapshot(code, market="J")
+                snapshot = self._get_price_snapshot_cached(code, market="J")
                 ask, bid, prpr = _extract_px_from_snapshot(snapshot)
                 
                 # ask/bid 없으면 prpr로 처리 (재호출 금지)
@@ -5297,7 +5445,7 @@ class PB1Engine:
         for code in probe_codes:
             try:
                 # ✅ 단일 스냅샷 조회
-                snapshot = self.kis.get_price_snapshot(code, market="J")
+                snapshot = self._get_price_snapshot_cached(code, market="J")
                 ask, bid, prpr = _extract_px_from_snapshot(snapshot)
                 
                 if ask is None or bid is None:
@@ -5464,8 +5612,7 @@ class PB1Engine:
             return False, None
         
         # 오늘 같은 종목/사이드/스테이지에 블록 상태의 주문이 있는지 확인
-        is_blocked, prior = self.orders_repo.has_blocking_order_today(
-            env=self.env,
+        is_blocked, prior = self._safe_has_blocking_order_today(
             code=code,
             side=side,
             stage=stage,
@@ -5641,7 +5788,7 @@ class PB1Engine:
         """
         try:
             # 가격 조회
-            quote = self.kis_api.get_price_snapshot(code, market="J")
+            quote = self._get_price_snapshot_cached(code, market="J")
             ask = quote.get("ask")
             prpr = quote.get("prpr") or quote.get("last")
             
@@ -7494,7 +7641,7 @@ class PB1Engine:
         return orders
 
     def run_close_cancel(self) -> RunResult:
-        open_orders = self.orders_repo.get_open_orders(self.env)
+        open_orders = self._safe_get_open_orders()
         tracked = self._load_close_entry_orders()
         tracked_keys = {row.get("client_order_key") for row in tracked if row.get("client_order_key")}
         target_orders = []
@@ -8508,6 +8655,10 @@ class PB1Engine:
         self._setup_reason_counter.clear()
         self.current_code = None
         self.top_candidates = []
+        self._tick_price_cache = {}
+        self._tick_price_cache_hits = 0
+        self._tick_price_api_calls = 0
+        logger.info("[PB1][PRICE_CACHE][TICK_INIT]")
         self._data_metrics = {
             "precomputed_hits": 0,
             "short_fetch_count": 0,
@@ -9140,6 +9291,7 @@ class PB1Engine:
         
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")
+            self._log_tick_price_cache_summary()
             return RunResult(
                 status=final_status,
                 notes=final_notes or "exit_phase",
@@ -9148,7 +9300,7 @@ class PB1Engine:
                 balance_tick_cache_hits=self.balance_tick_cache_hits,
             )
         logger.info("[PB1][POST_CAPITAL][OPEN_ORDERS_LOOKUP]")
-        open_orders = self.orders_repo.get_open_orders(self.env)
+        open_orders = self._safe_get_open_orders()
         if open_orders:
             logger.info("[PB1][ORDERS][OPEN] count=%s", len(open_orders))
         self._pnl_snapshot(self._positions_with_meta(positions_for_exit))
@@ -9176,6 +9328,7 @@ class PB1Engine:
                 blocked_reasons_counter=Counter({"PHASE_VERIFY": 1}),
                 no_trade_reason="PHASE_VERIFY",
             )
+            self._log_tick_price_cache_summary()
             return RunResult(
                 status=final_status,
                 notes=final_notes,
@@ -9826,6 +9979,7 @@ class PB1Engine:
                     dt_minervini,
                     minervini_pass_count,
                 )
+                self._log_tick_price_cache_summary()
                 return RunResult(
                     status="DONE_ANALYTICS",
                     notes=f"minervini_only_complete_{minervini_pass_count}_candidates",
@@ -9865,11 +10019,11 @@ class PB1Engine:
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
             with self._stage_timer("entry.open_orders_lookup"):
-                open_orders = self.orders_repo.get_open_orders(self.env)
+                open_orders = self._safe_get_open_orders()
             open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
             try:
                 with self._stage_timer("entry.today_buy_orders_lookup"):
-                    today_orders = self.orders_repo.list_today_orders(self.env, side="BUY")
+                    today_orders = self._safe_list_today_orders(side="BUY")
             except Exception as e:
                 logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
                 if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
@@ -9898,6 +10052,7 @@ class PB1Engine:
             today_buy_codes: set[str] = set()
             buyable_gate_max_sec = self._buyable_gate_max_sec()
             buyable_gate_fail_open = self._buyable_gate_fail_open_enabled()
+            logger.info("[PB1][STAGE][START] stage=buyable_gate")
             with self._stage_timer("entry.buyable_gate"):
                 for cf in ok_after_risk:
                     self.current_code = cf.code
@@ -10427,6 +10582,11 @@ class PB1Engine:
                     planned_spent += order_value
                     if len(orderable_candidates) >= new_position_limit:
                         break
+            logger.info(
+                "[PB1][STAGE][END] stage=buyable_gate ok=%s blocked=%s",
+                len(orderable_candidates),
+                sum(buyable_stage_counter.values()),
+            )
 
             if (
                 self.bootstrap_enabled
@@ -11197,6 +11357,7 @@ class PB1Engine:
         # except Exception as e:
         #     logger.warning("[PB1][SCORECARD_WRITE_FAIL] %s", type(e).__name__)
         
+        self._log_tick_price_cache_summary()
         return RunResult(
             status=final_status,
             notes=final_notes,
