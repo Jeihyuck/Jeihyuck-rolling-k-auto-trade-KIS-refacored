@@ -18,6 +18,7 @@ from trader.pb1_engine import (
     _compute_highest_since_entry,
     _normalize_sizing_failure_reason,
     _resolve_exit_policy,
+    _should_allow_single_share_position_cap_override,
 )
 from trader.window_router import WindowDecision
 
@@ -267,3 +268,39 @@ def test_budget_flex_can_enable_one_share_without_override():
     assert details["effective_budget"] == 220000.0
     assert qty == 1
     assert details["buy_mode"] == "budget"
+
+
+def test_single_share_position_cap_override_allowed_for_top_rank() -> None:
+    allowed = _should_allow_single_share_position_cap_override(
+        rank=1,
+        final_qty=1,
+        afford_details={
+            "buy_mode": "single_share_override",
+            "one_share_cost": 1117560.0,
+        },
+        force_min1_topn=3,
+        force_min1_override_position_cap=True,
+        cash_available=1500000.0,
+        min_remaining_cash_krw=10000.0,
+        order_possible_cash=1500000.0,
+    )
+
+    assert allowed is True
+
+
+def test_single_share_position_cap_override_blocked_for_low_rank() -> None:
+    allowed = _should_allow_single_share_position_cap_override(
+        rank=4,
+        final_qty=1,
+        afford_details={
+            "buy_mode": "single_share_override",
+            "one_share_cost": 1117560.0,
+        },
+        force_min1_topn=3,
+        force_min1_override_position_cap=True,
+        cash_available=1500000.0,
+        min_remaining_cash_krw=10000.0,
+        order_possible_cash=1500000.0,
+    )
+
+    assert allowed is False

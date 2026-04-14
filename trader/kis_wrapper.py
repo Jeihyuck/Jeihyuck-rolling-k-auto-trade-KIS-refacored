@@ -545,12 +545,18 @@ class _PriceCache:
         self.inflight_result: Dict[Tuple[str, str], dict] = {}
         self.lock = threading.Lock()
         self.circuit_until = 0.0
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.rate_limit_hits = 0
+        self.retry_waits = 0
 
     def is_circuit_open(self) -> bool:
         return time.time() < self.circuit_until
 
-    def open_circuit(self):
+    def open_circuit(self, *, rate_limited: bool = False):
         self.circuit_until = max(self.circuit_until, time.time() + self.circuit_sec)
+        if rate_limited:
+            self.rate_limit_hits += 1
 
     def get_cached(self, key: Tuple[str, str]) -> Optional[dict]:
         row = self.cache.get(key)
@@ -562,6 +568,29 @@ class _PriceCache:
 
     def set_cached(self, key: Tuple[str, str], data: dict):
         self.cache[key] = _PriceRow(ts=time.time(), data=data)
+
+    def record_cache_hit(self) -> None:
+        self.cache_hits += 1
+
+    def record_cache_miss(self) -> None:
+        self.cache_misses += 1
+
+    def record_retry_wait(self) -> None:
+        self.retry_waits += 1
+
+    def snapshot_stats(self, *, reset: bool = False) -> dict[str, int]:
+        stats = {
+            "cache_hit": int(self.cache_hits),
+            "cache_miss": int(self.cache_misses),
+            "price_http_fail_count": int(self.rate_limit_hits),
+            "retry_count": int(self.retry_waits),
+        }
+        if reset:
+            self.cache_hits = 0
+            self.cache_misses = 0
+            self.rate_limit_hits = 0
+            self.retry_waits = 0
+        return stats
 
     def begin_inflight(self, key: Tuple[str, str]) -> Optional[threading.Event]:
         """
@@ -590,14 +619,19 @@ class _PriceCache:
 
 
 # 환경변수에서 설정 로드
-_PRICE_TTL_SEC = _env_float("PRICE_TTL_SEC", 2)
+_PRICE_TTL_SEC = _env_float("PRICE_TTL_SEC", _env_float("PRICE_SNAPSHOT_TTL_SEC", 15))
 _PRICE_QPS = _env_float("PRICE_QPS", 3)
 _PRICE_BURST = _env_int("PRICE_BURST", 3)
 _PRICE_CIRCUIT_SEC = _env_float("PRICE_CIRCUIT_SEC", 15)
+_PRICE_JITTER_MAX_SEC = _env_float("PRICE_JITTER_MAX_SEC", 0.12)
 
 # 전역 인스턴스 생성
 _price_rl = _TokenBucket(rate=_PRICE_QPS, burst=_PRICE_BURST)
 _price_cache = _PriceCache(ttl_sec=_PRICE_TTL_SEC, circuit_sec=_PRICE_CIRCUIT_SEC)
+
+
+def get_price_runtime_stats(*, reset: bool = False) -> dict[str, int]:
+    return _price_cache.snapshot_stats(reset=reset)
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -2304,8 +2338,10 @@ class KisAPI:
         # 2) ttl cache
         cached = _price_cache.get_cached(key)
         if cached is not None:
+            _price_cache.record_cache_hit()
             logger.info("[KIS][PRICE_CACHE][HIT] code=%s market=%s ttl=%ss", code, market, _PRICE_TTL_SEC)
             return cached
+        _price_cache.record_cache_miss()
         logger.info("[KIS][PRICE_CACHE][MISS] code=%s market=%s", code, market)
 
         # 3) inflight dedup
@@ -2321,8 +2357,11 @@ class KisAPI:
             # 4) global rate limit
             sleep_s = _price_rl.acquire()
             if sleep_s > 0:
+                _price_cache.record_retry_wait()
                 logger.debug("[PRICE][RATE_WAIT] code=%s sleep=%.2fs", code, sleep_s)
                 time.sleep(sleep_s)
+            if _PRICE_JITTER_MAX_SEC > 0:
+                time.sleep(random.uniform(0.0, _PRICE_JITTER_MAX_SEC))
 
             # 5) 기존 get_price_quote 호출
             data = self.get_price_quote(code, diag_mode=False, attempts=2)
@@ -2334,10 +2373,10 @@ class KisAPI:
             
             if rt_cd != "0" and msg_cd.startswith("EGW002"):
                 logger.warning("[PRICE][RATE_LIMITED] code=%s msg_cd=%s -> open circuit %ss", code, msg_cd, _PRICE_CIRCUIT_SEC)
-                _price_cache.open_circuit()
+                _price_cache.open_circuit(rate_limited=True)
             elif "초당 거래건수" in msg1:
                 logger.warning("[PRICE][RATE_LIMITED] code=%s msg1=%s -> open circuit %ss", code, msg1, _PRICE_CIRCUIT_SEC)
-                _price_cache.open_circuit()
+                _price_cache.open_circuit(rate_limited=True)
 
             _price_cache.set_cached(key, data or {})
             return data or {}

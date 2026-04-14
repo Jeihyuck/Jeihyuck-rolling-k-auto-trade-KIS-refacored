@@ -35,7 +35,8 @@ jobs:
               am: {
                 workflow_id: 'trade-am.yml',
                 workflow_name: 'Trade AM',
-                threshold: 915,
+                threshold: 910,
+                dispatchSlots: [910, 915, 920, 925, 930],
               },
               pm: {
                 workflow_id: 'trade-pm.yml',
@@ -99,6 +100,11 @@ jobs:
             for (const [phase, config] of Object.entries(workflows)) {
               if (nowKst < config.threshold) {
                 core.info(`[WATCHDOG][SKIP] phase=${phase} reason=outside_window`);
+                continue;
+              }
+
+              if (Array.isArray(config.dispatchSlots) && !config.dispatchSlots.includes(nowKst)) {
+                core.info(`[WATCHDOG][SKIP] phase=${phase} reason=outside_recovery_slot now_kst=${nowKst}`);
                 continue;
               }
 

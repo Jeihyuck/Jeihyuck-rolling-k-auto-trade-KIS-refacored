@@ -2,8 +2,12 @@ name: "Trade AM"
 
 "on":
   schedule:
-    # Mon-Fri 09:07 KST = 00:07 UTC (AM loop runs through 13:00 KST)
+    # Mon-Fri 09:07/09:12/09:17/09:22/09:27 KST recovery schedule
     - cron: "7 0 * * 1-5"
+    - cron: "12 0 * * 1-5"
+    - cron: "17 0 * * 1-5"
+    - cron: "22 0 * * 1-5"
+    - cron: "27 0 * * 1-5"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -63,6 +67,8 @@ env:
   DB_STATEMENT_TIMEOUT_MS: "15000"
   DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
   PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+  PRICE_TTL_SEC: "15"
+  PRICE_JITTER_MAX_SEC: "0.12"
 
 defaults:
   run:
@@ -99,8 +105,11 @@ jobs:
         run: |
           set -euo pipefail
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          expected_start_window="0907-0915"
           should_run=1
           skip_reason=""
+          late_level=""
+          degraded_session=0
           if [[ "$now_kst" -lt 0900 ]]; then
             should_run=0
             skip_reason="early_start"
@@ -108,9 +117,37 @@ jobs:
             should_run=0
             skip_reason="stale_start"
           fi
+          if [[ "$now_kst" -gt 0920 ]]; then
+            late_level="WARN"
+            degraded_session=1
+          fi
+          if [[ "$now_kst" -gt 0940 ]]; then
+            late_level="ERROR"
+            degraded_session=1
+          fi
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
-          echo "[TRADE_AM][PHASE_GUARD] now_kst=${now_kst} should_run=${should_run} skip_reason=${skip_reason:-none} valid=0900-1255"
+          echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
+          echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
+          echo "late_level=${late_level}" >> "$GITHUB_OUTPUT"
+          echo "degraded_session=${degraded_session}" >> "$GITHUB_OUTPUT"
+
+      - name: Write AM trigger metadata
+        if: steps.phase_guard.outputs.should_run == '1'
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          {
+            echo "[TRADE_AM][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_AM][PHASE_GUARD] now_kst=${{ steps.phase_guard.outputs.now_kst }} should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} valid=0900-1255"
+            if [[ -n "${{ steps.phase_guard.outputs.late_level }}" ]]; then
+              echo "[TRADE_AM][LATE_START][WARN] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
+            fi
+            if [[ "${{ steps.phase_guard.outputs.late_level }}" == "ERROR" ]]; then
+              echo "[TRADE_AM][LATE_START][ERROR] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
+            fi
+          } | tee -a artifacts/trade-am.log
 
       - name: Checkout
         if: steps.phase_guard.outputs.should_run == '1'
@@ -222,6 +259,9 @@ jobs:
           set -euo pipefail
           mkdir -p repo/artifacts
           {
+            echo "[TRADE_AM][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_AM][PHASE_GUARD] now_kst=${{ steps.phase_guard.outputs.now_kst }} should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} valid=0900-1255"
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }}"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-am.log
@@ -231,12 +271,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          export TRADE_AM_LATE_START=$([[ -n "${{ steps.phase_guard.outputs.late_level }}" ]] && echo 1 || echo 0)
+          export TRADE_AM_DEGRADED_SESSION=${{ steps.phase_guard.outputs.degraded_session }}
           echo "[TRADE_AM][WINDOW] target=09:07-13:00 KST loop_minutes=${PB1_RUN_LOOP_MINUTES} interval_sec=${PB1_LOOP_INTERVAL_SEC}"
           echo "[CONFIG][FINAL30_SOURCE_MODE] ${FINAL30_SOURCE_MODE}"
           echo "[CONFIG][PB1_REQUIRE_SCORED_FINAL30] ${PB1_REQUIRE_SCORED_FINAL30}"
           echo "[CONFIG][PB1_DISABLE_RAW_FINAL30_FALLBACK] ${PB1_DISABLE_RAW_FINAL30_FALLBACK}"
           echo "[TRADE_AM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
-          echo "[PHASE][START] phase=am" | tee artifacts/trade-am.log
+          echo "[PHASE][START] phase=am" | tee -a artifacts/trade-am.log
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-am.log
           echo "[PHASE][END] phase=am" | tee -a artifacts/trade-am.log
 

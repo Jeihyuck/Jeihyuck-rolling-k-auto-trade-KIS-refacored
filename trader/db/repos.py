@@ -1298,6 +1298,71 @@ class RunsRepo:
         self.engine = engine
         self._schema = schema_for_engine(engine)
 
+    def find_started_today(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        run_window: str | None = None,
+        phase: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = now_kst()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        conditions = [
+            self._schema.runs.c.env == _norm_env(env),
+            self._schema.runs.c.strategy == strategy,
+            self._schema.runs.c.started_at >= start,
+            self._schema.runs.c.started_at < end,
+        ]
+        if run_window is not None:
+            conditions.append(self._schema.runs.c.run_window == run_window)
+        if phase is not None:
+            conditions.append(self._schema.runs.c.phase == phase)
+        stmt = (
+            select(self._schema.runs)
+            .where(and_(*conditions))
+            .order_by(self._schema.runs.c.started_at.asc())
+            .limit(1)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
+
+    def create_session_guard(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        run_window: str,
+        phase: str,
+        event_name: str,
+        workflow: str | None,
+        workflow_run_id: str | None,
+        workflow_attempt: int | None,
+        git_sha: str | None,
+        config_json: dict | None = None,
+    ) -> str:
+        values = {
+            "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+            "env": env,
+            "strategy": strategy,
+            "run_window": run_window,
+            "phase": phase,
+            "event_name": event_name,
+            "dry_run": False,
+            "git_sha": git_sha,
+            "workflow": workflow,
+            "workflow_run_id": workflow_run_id,
+            "workflow_attempt": workflow_attempt,
+            "config_json": config_json or {},
+            "status": "SESSION_GUARD_STARTED",
+        }
+        stmt = sa.insert(self._schema.runs).values(**values).returning(self._schema.runs.c.run_id)
+        with self.engine.begin() as conn:
+            run_id = conn.execute(stmt).scalar() or values["run_id"]
+        return str(run_id)
+
     def start_run(
         self,
         env: str,

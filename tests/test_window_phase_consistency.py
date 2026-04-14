@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from trader.pb1_engine import PB1Engine
 from trader.window_router import WindowDecision
 
@@ -89,3 +91,31 @@ def test_engine_init_infers_phase_and_window_from_window_object():
     assert engine.phase_name == "entry"
     assert engine.window_name == "intraday"
     assert engine.window.phase == "entry"
+
+
+def test_engine_init_normalizes_am_window_to_morning():
+    previous = os.environ.get("PB1_SESSION_KIND")
+    os.environ["PB1_SESSION_KIND"] = "am"
+    try:
+        engine = PB1Engine(
+            universe_repo=object(),
+            orders_repo=DummyOrdersRepo(),
+            fills_repo=object(),
+            positions_repo=object(),
+            ledger_repo=object(),
+            kis=None,
+            dry_run=True,
+            env="practice",
+            run_id="run-5",
+            intended_live=False,
+            phase_name="entry",
+            window_name="intraday",
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("PB1_SESSION_KIND", None)
+        else:
+            os.environ["PB1_SESSION_KIND"] = previous
+
+    assert engine.window_name == "morning"
+    assert engine.window.name == "morning"

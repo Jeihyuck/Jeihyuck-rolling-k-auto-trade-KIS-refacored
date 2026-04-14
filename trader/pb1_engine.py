@@ -806,6 +806,80 @@ def _compute_affordable_buy_qty(
     }
     return final_qty, details
 
+
+def _should_allow_single_share_position_cap_override(
+    *,
+    rank: int,
+    final_qty: int,
+    afford_details: dict[str, Any],
+    force_min1_topn: int,
+    force_min1_override_position_cap: bool,
+    cash_available: float,
+    min_remaining_cash_krw: float,
+    order_possible_cash: float,
+) -> bool:
+    if not bool(force_min1_override_position_cap):
+        return False
+    if int(final_qty or 0) != 1:
+        return False
+    if int(rank or 0) > max(1, int(force_min1_topn or 1)):
+        return False
+    if str(afford_details.get("buy_mode") or "").strip().lower() != "single_share_override":
+        return False
+
+    one_share_cost = float(afford_details.get("one_share_cost") or 0.0)
+    cash_floor = float(one_share_cost + float(min_remaining_cash_krw or 0.0))
+    if float(cash_available or 0.0) < cash_floor:
+        return False
+    if float(order_possible_cash or 0.0) > 0 and float(order_possible_cash or 0.0) < one_share_cost:
+        return False
+    return True
+
+
+def _resolve_session_window_name(*, session_kind: str | None, raw_window_name: str | None) -> str:
+    normalized_session = str(session_kind or "").strip().lower()
+    normalized_window = str(raw_window_name or "").strip().lower()
+    if normalized_session == "am" and normalized_window in {"am", "morning", "intraday", "day", "preopen", "session", "open"}:
+        return "morning"
+    if normalized_window in {"morning", "preopen", "close", "intraday"}:
+        return "intraday"
+    if normalized_window == "after":
+        return "after"
+    return "day"
+
+
+def _extract_cooldown_source_details(ledger_rows: Iterable[dict[str, Any]] | None) -> dict[str, Any]:
+    risk_off_exit_reasons = {"EXIT_RISK_OFF", "EXIT_SOFT_RISK_OFF", "BUG_RECOVERY_EXIT"}
+    for row in ledger_rows or []:
+        event_type = str((row or {}).get("event_type") or "").strip().upper()
+        side = str((row or {}).get("side") or "").strip().upper()
+        reasons = [str(item).strip().upper() for item in ((row or {}).get("reasons") or []) if str(item).strip()]
+        payload = (row or {}).get("payload_json") if isinstance((row or {}).get("payload_json"), dict) else {}
+        exit_reason = str(payload.get("exit_reason") or payload.get("reason") or (reasons[0] if reasons else "")).strip().upper()
+        if not exit_reason:
+            continue
+        if side != "SELL" and not event_type.startswith("EXIT"):
+            continue
+        if exit_reason in risk_off_exit_reasons:
+            return {
+                "source": "risk_off_same_day_only",
+                "recent_valid_exit_event": False,
+                "recent_exit_reason": exit_reason,
+                "evidence_count": 1,
+            }
+        return {
+            "source": "completed_trade_cooldown",
+            "recent_valid_exit_event": True,
+            "recent_exit_reason": exit_reason,
+            "evidence_count": 1,
+        }
+    return {
+        "source": "none",
+        "recent_valid_exit_event": False,
+        "recent_exit_reason": None,
+        "evidence_count": 0,
+    }
+
 def _fill_reconcile_warn_needed(filled_price: float, avg_price_from_balance: float) -> bool:
     if filled_price <= 0 or avg_price_from_balance <= 0:
         return False
@@ -1053,18 +1127,14 @@ class PB1Engine:
         raw_phase_name = str(phase_name or "").strip().lower()
         raw_window_name = str(window_name or raw_window or "").strip().lower()
         raw_phase = str(phase or "").strip().lower()
+        session_kind = str(os.getenv("PB1_SESSION_KIND") or "").strip().lower()
         inferred_phase_name = str(getattr(window, "phase", "") or "").strip().lower()
         resolved_phase_name = raw_phase_name or inferred_phase_name or "entry"
         if raw_phase:
             resolved_phase_name = raw_phase_name or raw_phase or inferred_phase_name or "entry"
         if resolved_phase_name not in {"entry", "exit", "manage"}:
             resolved_phase_name = "entry"
-        if raw_window_name in {"morning", "preopen", "close", "intraday"}:
-            resolved_window_name = "intraday"
-        elif raw_window_name == "after":
-            resolved_window_name = "after"
-        else:
-            resolved_window_name = "day"
+        resolved_window_name = _resolve_session_window_name(session_kind=session_kind, raw_window_name=raw_window_name)
         self.phase_name = resolved_phase_name
         self.window_name = resolved_window_name
         logger.info(
@@ -1080,11 +1150,10 @@ class PB1Engine:
                 self.phase_name,
                 self.window_name,
             )
-        self.market_window_name = (market_window_name or self.window_name or "day").strip().lower()
-        if self.market_window_name in {"morning", "preopen", "close", "intraday"}:
-            self.market_window_name = "intraday"
-        elif self.market_window_name not in {"after", "day"}:
-            self.market_window_name = "day"
+        self.market_window_name = _resolve_session_window_name(
+            session_kind=session_kind,
+            raw_window_name=(market_window_name or self.window_name or "day").strip().lower(),
+        )
         self.window = WindowDecision(name=self.window_name, phase=self.phase_name)
         self.window_label = self.window_name
         self.phase = self.phase_name
@@ -1370,37 +1439,53 @@ class PB1Engine:
         *,
         code: str,
         cooldown_until,
+        holding_qty: int = 0,
         today_buy_exists: bool,
         today_fill_exists: bool,
         cooldown_source_events_count: int,
         last_fill_event_at,
+        cooldown_source: str | None = None,
+        recent_valid_exit_event: bool = False,
+        recent_exit_reason: str | None = None,
     ) -> dict:
         cooldown_active = False
         stale_ignored = False
+        final_cooldown_policy = "none"
+        resolved_source = str(cooldown_source or "none")
+        risk_off_same_day_only = str(recent_exit_reason or "").strip().upper() in {"EXIT_RISK_OFF", "EXIT_SOFT_RISK_OFF", "BUG_RECOVERY_EXIT"}
 
         cooldown_until_value = str(cooldown_until).strip() if cooldown_until is not None else ""
         if cooldown_until_value and cooldown_until_value >= self._today:
-            evidence_exists = (
-                bool(today_buy_exists)
-                or bool(today_fill_exists)
-                or int(cooldown_source_events_count or 0) > 0
-                or bool(last_fill_event_at)
-            )
-            if evidence_exists:
+            if bool(today_buy_exists):
+                final_cooldown_policy = "same_day_only"
+                resolved_source = "same_day_duplicate_prevention"
+            elif bool(recent_valid_exit_event) and not risk_off_same_day_only:
                 cooldown_active = True
-            else:
+                final_cooldown_policy = "multi_day"
+                if resolved_source == "none":
+                    resolved_source = "completed_trade_cooldown"
+            elif int(holding_qty or 0) <= 0 and not bool(today_fill_exists):
                 stale_ignored = True
+                final_cooldown_policy = "stale_ignored"
+                if resolved_source == "none":
+                    resolved_source = "stale_residue"
+            elif bool(today_fill_exists) or risk_off_same_day_only:
+                final_cooldown_policy = "same_day_only"
+                resolved_source = "same_day_duplicate_prevention"
+            else:
+                cooldown_active = int(cooldown_source_events_count or 0) > 0 or bool(last_fill_event_at)
+                final_cooldown_policy = "multi_day" if cooldown_active else "none"
 
         logger.info(
-            "[PB1][BUYABLE_GATE][COOLDOWN_EVIDENCE] code=%s cooldown_until=%s today_buy_exists=%s today_fill_exists=%s cooldown_source_events_count=%s last_fill_event_at=%s active=%s stale_ignored=%s",
+            "[PB1][BUYABLE_GATE][COOLDOWN_SRC] code=%s source=%s active=%s stale=%s today_buy_exists=%s today_fill_exists=%s last_fill_event_at=%s cooldown_until=%s",
             code,
-            cooldown_until_value or None,
-            int(bool(today_buy_exists)),
-            int(bool(today_fill_exists)),
-            int(cooldown_source_events_count or 0),
-            last_fill_event_at,
+            resolved_source,
             int(cooldown_active),
             int(stale_ignored),
+            int(bool(today_buy_exists)),
+            int(bool(today_fill_exists)),
+            last_fill_event_at,
+            cooldown_until_value or None,
         )
         if stale_ignored:
             logger.warning(
@@ -1412,6 +1497,8 @@ class PB1Engine:
         return {
             "cooldown_active": cooldown_active,
             "stale_ignored": stale_ignored,
+            "cooldown_source": resolved_source,
+            "final_cooldown_policy": final_cooldown_policy,
         }
 
     def _get_price_snapshot_cached(self, code: str, market: str = "J") -> dict:
@@ -3289,6 +3376,7 @@ class PB1Engine:
         cooldown_until_dt = self._parse_cooldown_until(cooldown_until_raw)
         cooldown_until_value = cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw
         last_fill_event_at = self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None)
+        cooldown_source_meta = _extract_cooldown_source_details([])
         cooldown_events = [
             self._normalize_cooldown_event(
                 row,
@@ -3300,10 +3388,14 @@ class PB1Engine:
         cooldown_state = self._resolve_buy_cooldown_state(
             code=code_key,
             cooldown_until=cooldown_until_value,
+            holding_qty=int(pos.get("qty") or 0),
             today_buy_exists=bool(today_buy_events),
             today_fill_exists=bool(fill_rows_sorted),
             cooldown_source_events_count=len(cooldown_events),
             last_fill_event_at=last_fill_event_at,
+            cooldown_source=cooldown_source_meta["source"],
+            recent_valid_exit_event=bool(cooldown_source_meta["recent_valid_exit_event"]),
+            recent_exit_reason=cooldown_source_meta["recent_exit_reason"],
         )
         cooldown_active = bool(cooldown_state["cooldown_active"])
         for event in cooldown_events:
@@ -3329,6 +3421,8 @@ class PB1Engine:
             ),
             "cooldown_until": cooldown_until_value,
             "cooldown_rule_name": BUYABLE_GATE_COOLDOWN_RULE,
+            "cooldown_source": cooldown_state["cooldown_source"],
+            "final_cooldown_policy": cooldown_state["final_cooldown_policy"],
             "code": code_key,
         }
 
@@ -3404,7 +3498,12 @@ class PB1Engine:
                 key=lambda row: self._coerce_kst_datetime(row.get("submitted_at") or row.get("acked_at") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
                 reverse=True,
             )
-            for ledger_event in recent_ledger_by_code.get(code_key, [])[:5]:
+            recent_ledger_events = sorted(
+                recent_ledger_by_code.get(code_key, []),
+                key=lambda row: self._coerce_kst_datetime(row.get("ts") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
+                reverse=True,
+            )
+            for ledger_event in recent_ledger_events[:5]:
                 self._classify_ledger_event(ledger_event)
 
             last_buy_fill = next((row for row in recent_fill_events if str(row.get("side") or "").upper() == "BUY"), None)
@@ -3413,6 +3512,7 @@ class PB1Engine:
             cooldown_until_raw = str(pos.get("cooldown_until") or "") or None
             cooldown_until_dt = self._parse_cooldown_until(cooldown_until_raw)
             last_fill_event_at = self._format_kst_datetime((last_fill_event or {}).get("filled_at") if last_fill_event else None)
+            cooldown_source_meta = _extract_cooldown_source_details(recent_ledger_events[:5])
             cooldown_events = [
                 self._normalize_cooldown_event(row, cooldown_until=cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw, matched_now=False)
                 for row in recent_fill_events[:5]
@@ -3420,10 +3520,14 @@ class PB1Engine:
             cooldown_state = self._resolve_buy_cooldown_state(
                 code=code_key,
                 cooldown_until=cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw,
+                holding_qty=int(pos.get("qty") or 0),
                 today_buy_exists=bool(today_buy_events),
                 today_fill_exists=bool(recent_fill_events),
                 cooldown_source_events_count=len(cooldown_events),
                 last_fill_event_at=last_fill_event_at,
+                cooldown_source=cooldown_source_meta["source"],
+                recent_valid_exit_event=bool(cooldown_source_meta["recent_valid_exit_event"]),
+                recent_exit_reason=cooldown_source_meta["recent_exit_reason"],
             )
             cooldown_active = bool(cooldown_state["cooldown_active"])
             for event in cooldown_events:
@@ -3451,6 +3555,8 @@ class PB1Engine:
                 ),
                 "cooldown_until": cooldown_until_dt.isoformat() if cooldown_until_dt else cooldown_until_raw,
                 "cooldown_rule_name": BUYABLE_GATE_COOLDOWN_RULE,
+                "cooldown_source": cooldown_state["cooldown_source"],
+                "final_cooldown_policy": cooldown_state["final_cooldown_policy"],
             }
             snapshots[code_key] = snapshot
             today_buy_count += int(snapshot["today_buy_exists"])
@@ -3601,6 +3707,13 @@ class PB1Engine:
             int(bool(ok)),
             reasons or ["ok"],
             snapshot.get("cooldown_until"),
+        )
+        logger.info(
+            "[PB1][BUYABLE_GATE][FINAL] code=%s ok=%s reasons=%s final_cooldown_policy=%s",
+            self._display_code(code),
+            int(bool(ok)),
+            reasons or ["ok"],
+            snapshot.get("final_cooldown_policy", "none"),
         )
 
     def _store_entry_evaluation(
@@ -5344,6 +5457,16 @@ class PB1Engine:
                 afford_details["final_qty"],
                 afford_details["skip_reason"] or "none",
             )
+            allow_single_share_position_cap_override = _should_allow_single_share_position_cap_override(
+                rank=ranked.index(cf) + 1 if cf in ranked else 999,
+                final_qty=int(afford_details.get("final_qty") or 0),
+                afford_details=afford_details,
+                force_min1_topn=force_min1_topn,
+                force_min1_override_position_cap=force_min1_override_position_cap,
+                cash_available=cash_available_for_order,
+                min_remaining_cash_krw=MIN_REMAINING_CASH_KRW,
+                order_possible_cash=order_possible_cash,
+            )
             
             # ===== New: 명확한 sizing_reason 계산 =====
             # ⚠️ CRITICAL: reserve는 _resolve_entry_capital()에서 이미 적용됨
@@ -5412,12 +5535,32 @@ class PB1Engine:
                 else:
                     sizing_reason = "ORDER_PX_ABOVE_POSITION_CAP"
                     sizing_details["binding_constraint"] = "position_cap"
+                if allow_single_share_position_cap_override and sizing_reason == "ORDER_PX_ABOVE_POSITION_CAP":
+                    qty = 1
+                    sizing_reason = "OK_SINGLE_SHARE_POSITION_CAP_OVERRIDE"
+                    sizing_details.update(
+                        {
+                            "rank": rank,
+                            "position_cap_override": 1,
+                            "single_share_override": 1,
+                            "cash_ok": 1,
+                            "forced_qty": 1,
+                            "binding_constraint": "position_cap_override",
+                        }
+                    )
+                    logger.info(
+                        "[PB1][SIZING][OVERRIDE] code=%s rank=%s single_share_override=1 position_cap_override=1 cash_ok=1 final_qty=1 reason=OK_SINGLE_SHARE_POSITION_CAP_OVERRIDE",
+                        self._display_code(cf.code),
+                        rank,
+                    )
+
                 # 최소 1주 보장 옵션 체크
                 remaining_slots = max(0, int(target_new_positions) - int(allocated_slots))
                 min_1_share_allowed = (
+                    qty <= 0
+                    and
                     force_min1_enabled
                     and rank <= force_min1_topn
-                    and qty <= 0
                     and order_px >= min_order_krw
                     and usable_cash >= order_px
                     and (force_min1_override_position_cap or budget_cap <= 0 or order_px <= budget_cap)
@@ -5434,7 +5577,7 @@ class PB1Engine:
                     int(min_1_share_allowed),
                 )
 
-                if min_1_share_allowed:
+                if qty <= 0 and min_1_share_allowed:
                     qty = 1
                     sizing_reason = "FORCE_MIN1_APPLIED"
                     sizing_details.update(
@@ -5459,7 +5602,7 @@ class PB1Engine:
                         usable_cash,
                         int(force_min1_override_position_cap),
                     )
-                else:
+                elif qty <= 0:
                     # ❌ 예산 부족: 1주도 못 삼
                     qty = 0
                     sizing_details.update(

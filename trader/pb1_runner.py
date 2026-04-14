@@ -96,7 +96,7 @@ from trader.diagnostics.nontrading_smoke import (
     run_nontrading_smoke_once,
     write_nontrading_smoke_flag,
 )
-from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError
+from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError, get_price_runtime_stats
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.entry_engine import scan_all_strategies, calculate_position_size
 from trader.reconcile_kis import reconcile_kis, reconcile_today
@@ -2016,6 +2016,23 @@ def _resolve_window_label(market_window: str, window: WindowDecision | None) -> 
     return window.name if window else "none"
 
 
+def normalize_window(*, session_kind: str, input_window: Any) -> str:
+    normalized_session = str(session_kind or "").strip().lower()
+    normalized_input = str(input_window or "").strip().lower()
+    if normalized_session == "am" and normalized_input in {"am", "morning", "intraday", "day", "preopen", "session", "open"}:
+        logger.info(
+            "[PB1][WINDOW][NORMALIZE] session_kind=%s input_window=%s normalized_window=morning",
+            normalized_session,
+            normalized_input or "none",
+        )
+        return "morning"
+    if normalized_input in {"preopen", "morning", "intraday", "close"}:
+        return "intraday"
+    if normalized_input == "after":
+        return "after"
+    return "day"
+
+
 def _normalize_window_phase(*, raw_window: Any, market_window: str, phase: str) -> tuple[str, str]:
     raw_name = ""
     raw_type = type(raw_window).__name__ if raw_window is not None else "NoneType"
@@ -2024,12 +2041,8 @@ def _normalize_window_phase(*, raw_window: Any, market_window: str, phase: str) 
     elif raw_window is not None:
         raw_name = str(getattr(raw_window, "name", "") or "")
     seed = (market_window or raw_name or "day").strip().lower()
-    if seed in {"preopen", "morning", "intraday", "close"}:
-        window_name = "intraday"
-    elif seed == "after":
-        window_name = "after"
-    else:
-        window_name = "day"
+    session_kind = _resolve_session_kind()
+    window_name = normalize_window(session_kind=session_kind, input_window=seed)
     phase_seed = (phase or "entry").strip().lower()
     if phase_seed in {"entry", "exit", "manage"}:
         phase_name = phase_seed
@@ -3877,6 +3890,8 @@ def run_once(
         try:
             scanner_summary = getattr(engine_runner, "_scanner_summary", {}) or {}
             run_summary = getattr(engine_runner, "_run_summary_payload", {}) or {}
+            tick_label = os.getenv("PB1_LOOP_TICK_INDEX") or str(run_record_id or "1")
+            price_stats = get_price_runtime_stats(reset=True)
             scanner_usable = int(scanner_summary.get("usable_count", scanner_summary.get("total", 0)))
             raw_signal_setup_ok = int(scanner_summary.get("setup_ok_count", 0))
             pb1_filter_setup_ok = int(run_summary.get("setup_ok", 0))
@@ -3914,6 +3929,34 @@ def run_once(
                     int(run_summary.get("buyable_ok", 0)),
                     mismatch_categories,
                 )
+            state_label = "ORDER_SUBMITTED" if int(run_summary.get("submitted", 0)) > 0 else "NO_ORDERABLE"
+            logger.info(
+                "[TRADE_AM][HEARTBEAT] tick=%s state=%s candidates_scanned=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s submitted=%s top_blockers=%s",
+                tick_label,
+                state_label,
+                int(run_summary.get("scanned", 0)),
+                int(run_summary.get("setup_ok", 0)),
+                int(run_summary.get("risk_ok", 0)),
+                int(run_summary.get("sized_ok", 0)),
+                int(run_summary.get("buyable_ok", 0)),
+                int(run_summary.get("submitted", 0)),
+                run_summary.get("blocked_by", "none") or "none",
+            )
+            logger.info(
+                "[TRADE_AM][HEARTBEAT] tick=%s late_start=%s degraded_session=%s rate_limit_count=%s",
+                tick_label,
+                int(str(os.getenv("TRADE_AM_LATE_START") or "0") == "1"),
+                int(str(os.getenv("TRADE_AM_DEGRADED_SESSION") or "0") == "1"),
+                int(price_stats.get("price_http_fail_count", 0)),
+            )
+            logger.info(
+                "[PB1][RATE_LIMIT][SUMMARY] tick=%s price_http_fail_count=%s retry_count=%s cache_hit=%s cache_miss=%s",
+                tick_label,
+                int(price_stats.get("price_http_fail_count", 0)),
+                int(price_stats.get("retry_count", 0)),
+                int(price_stats.get("cache_hit", 0)),
+                int(price_stats.get("cache_miss", 0)),
+            )
         except Exception as exc:
             logger.warning("[CONSISTENCY][SCAN_ENGINE][FAIL] err=%s", exc)
         
@@ -4123,6 +4166,51 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         ctx.gh_run_number,
         ctx.git_sha,
     )
+    runs_repo = RunsRepo(engine)
+    session_guard_run_id: str | None = None
+    if session_kind == "am":
+        session_guard_strategy = "pb1_am_session_guard"
+        existing_session = runs_repo.find_started_today(
+            env=ctx.env,
+            strategy=session_guard_strategy,
+            run_window="morning",
+            phase="entry",
+        ) or runs_repo.find_started_today(
+            env=ctx.env,
+            strategy="pb1_pullback_close",
+            run_window="morning",
+            phase="entry",
+        )
+        if existing_session:
+            logger.warning(
+                "[TRADE_AM][DUPLICATE_GUARD] session already started today -> skip existing_run_id=%s started_at=%s status=%s workflow_run_id=%s",
+                existing_session.get("run_id"),
+                existing_session.get("started_at"),
+                existing_session.get("status"),
+                existing_session.get("workflow_run_id"),
+            )
+            return
+        session_guard_run_id = runs_repo.create_session_guard(
+            env=ctx.env,
+            strategy=session_guard_strategy,
+            run_window="morning",
+            phase="entry",
+            event_name=str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() or "schedule",
+            workflow=os.getenv("GITHUB_WORKFLOW"),
+            workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
+            workflow_attempt=_parse_optional_int_env("GITHUB_RUN_ATTEMPT"),
+            git_sha=ctx.git_sha,
+            config_json={
+                "session_kind": session_kind,
+                "run_id": run_id,
+                "expected_start_window": "0907-0915",
+            },
+        )
+        logger.info(
+            "[TRADE_AM][DUPLICATE_GUARD] session_guard_started=1 run_id=%s session_kind=%s",
+            session_guard_run_id,
+            session_kind,
+        )
     
     try:
         _ensure_bootstrap_migrations(engine)
@@ -4207,6 +4295,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
         signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
         signal.signal(signal.SIGINT, lambda *_args: _request_stop("SIGINT"))
+        tick_index = 0
         while True:
             if stop_requested["value"]:
                 exit_reason = "sigterm"
@@ -4255,6 +4344,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 max(5, remaining_to_session_end + grace_sec),
             )
             try:
+                tick_index += 1
+                os.environ["PB1_LOOP_TICK_INDEX"] = str(tick_index)
                 logger.info(
                     "[PB1][TICK][CALL_RUN_ONCE] kind=%s now=%s session_end=%s",
                     session_kind,
@@ -4434,6 +4525,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             balance_tick_cache_hits,
         )
     finally:
+        if session_guard_run_id:
+            try:
+                runs_repo.finish_run(session_guard_run_id, status=f"SESSION_{str(exit_reason or 'UNKNOWN').upper()}", notes=last_phase)
+            except Exception as exc:
+                logger.warning("[TRADE_AM][DUPLICATE_GUARD][FINISH_FAIL] run_id=%s err=%s", session_guard_run_id, exc)
         try:
             release_advisory_lock(lock_conn)
         except Exception as exc:
