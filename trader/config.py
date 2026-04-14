@@ -260,6 +260,12 @@ CONFIG = {
     "TRADE_FORCE_MIN1_DIAG": "1",
     "FORCE_MIN1_OVERRIDE_POSITION_CAP": "0",
     "FORCE_MIN1_OVERRIDE_TOPN": "2",
+    "ALLOW_SINGLE_SHARE_OVERRIDE": "1",
+    "MIN_REMAINING_CASH_KRW": "10000",
+    "BUY_PRICE_BUFFER_PCT": "0.002",
+    "BUDGET_FLEX_PCT": "1.10",
+    "MIN_TRAIL_BARS": "2",
+    "MIN_EXIT_BARS": "1",
     # Candidate Pool (주말 후보군 생성/주중 후보군 기반 진입)
     "CANDIDATE_POOL_ENABLED": "1",                    # 후보군 시스템 활성화
     "CANDIDATE_POOL_TTL_DAYS": "7",                   # 후보군 유효기간(일)
@@ -560,13 +566,11 @@ def _resolve_min_order_krw() -> float:
     try:
         value = float(raw)
     except ValueError:
-        logger.warning("[CONFIG] MIN_ORDER_KRW invalid=%s -> fallback=100000", raw)
+        logger.warning("[CONFIG] MIN_ORDER_KRW invalid=%s -> fallback=0", raw)
         value = 0.0
-    if value <= 0:
-        logger.warning("[CONFIG] MIN_ORDER_KRW=%s -> fallback=100000", raw)
-        value = 100000.0
-    if STRATEGY_MODE == "LIVE" and value < 50000:
-        raise RuntimeError(f"MIN_ORDER_KRW too low for LIVE mode: {value}")
+    if value < 0:
+        logger.warning("[CONFIG] MIN_ORDER_KRW=%s -> clamp=0", raw)
+        value = 0.0
     logger.info("[CONFIG] MIN_ORDER_KRW=%s (sizing_floor)", value)
     return value
 
@@ -584,13 +588,22 @@ SIZING_MIN_1_SHARE_TOPN = int(_cfg("SIZING_MIN_1_SHARE_TOPN") or "0")
 # ================================================================
 PRICE_SLIPPAGE_PCT_BUY = float(_cfg("PRICE_SLIPPAGE_PCT_BUY") or "0.005")  # 0.5% 기본
 PRICE_USE_ASK_IF_AVAILABLE = _cfg_bool("PRICE_USE_ASK_IF_AVAILABLE", fallback=False)
+ALLOW_SINGLE_SHARE_OVERRIDE = _cfg_bool("ALLOW_SINGLE_SHARE_OVERRIDE", fallback=True)
+MIN_REMAINING_CASH_KRW = float(_cfg("MIN_REMAINING_CASH_KRW") or "10000")
+BUY_PRICE_BUFFER_PCT = float(_cfg("BUY_PRICE_BUFFER_PCT") or "0.002")
+BUDGET_FLEX_PCT = float(_cfg("BUDGET_FLEX_PCT") or "1.10")
+MIN_TRAIL_BARS = max(1, int(float(_cfg("MIN_TRAIL_BARS") or "2")))
+MIN_EXIT_BARS = max(1, int(float(_cfg("MIN_EXIT_BARS") or "1")))
 
 logger.info(
-    "[CONFIG][SIZING] allow_min_1_share=%s topn=%s slippage_buy=%.3f%% use_ask=%s",
+    "[CONFIG][SIZING] allow_min_1_share=%s topn=%s slippage_buy=%.3f%% use_ask=%s single_share_override=%s budget_flex=%.3f min_remaining_cash=%.0f",
     int(SIZING_ALLOW_MIN_1_SHARE),
     SIZING_MIN_1_SHARE_TOPN,
     PRICE_SLIPPAGE_PCT_BUY * 100,
     int(PRICE_USE_ASK_IF_AVAILABLE),
+    int(ALLOW_SINGLE_SHARE_OVERRIDE),
+    BUDGET_FLEX_PCT,
+    MIN_REMAINING_CASH_KRW,
 )
 
 STRATEGY_INTENTS_PATH = Path(

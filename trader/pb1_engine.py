@@ -92,6 +92,12 @@ from trader.config import (
     PB1_MAX_PRICE_FETCH_PER_TICK,
     PB1_EARLY_STOP_ENABLED,
     MIN_ORDER_KRW,
+    ALLOW_SINGLE_SHARE_OVERRIDE,
+    MIN_REMAINING_CASH_KRW,
+    BUY_PRICE_BUFFER_PCT,
+    BUDGET_FLEX_PCT,
+    MIN_TRAIL_BARS,
+    MIN_EXIT_BARS,
     SIZING_ALLOW_MIN_1_SHARE,
     SIZING_MIN_1_SHARE_TOPN,
     PRICE_SLIPPAGE_PCT_BUY,
@@ -604,7 +610,15 @@ class CandidateFeature:
 
 
 def _normalize_sizing_failure_reason(raw_reason: str | None) -> str:
-    if raw_reason in {"ORDER_PX_ABOVE_TICK_BUDGET", "ORDER_PX_ABOVE_POSITION_CAP", "ORDER_PX_ABOVE_USABLE_CASH"}:
+    if raw_reason in {
+        "ORDER_PX_ABOVE_TICK_BUDGET",
+        "ORDER_PX_ABOVE_POSITION_CAP",
+        "ORDER_PX_ABOVE_USABLE_CASH",
+        "INSUFFICIENT_CASH_FOR_ONE_SHARE",
+        "MIN_REMAINING_CASH_VIOLATION",
+        "INSUFFICIENT_BUDGET_AND_OVERRIDE_DISABLED",
+        "QUANTITY_ZERO_AFTER_BUDGET_CHECK",
+    }:
         return raw_reason
     if raw_reason == "MIN_ORDER_KRW_NOT_MET":
         return raw_reason
@@ -619,6 +633,183 @@ def _normalize_sizing_failure_reason(raw_reason: str | None) -> str:
     if raw_reason == "OK":
         return "SIZING_OK"
     return "FORCE_MIN1_NOT_ELIGIBLE"
+
+
+def _coerce_timestamp(value: Any) -> pd.Timestamp | None:
+    if value in (None, "", 0, 0.0):
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if ts.tzinfo is None:
+        try:
+            return ts.tz_localize(KST)
+        except Exception:
+            return ts
+    try:
+        return ts.tz_convert(KST)
+    except Exception:
+        return ts
+
+
+def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: float) -> tuple[float, int]:
+    safe_entry_price = float(entry_price or 0.0)
+    ts = _coerce_timestamp(entry_ts)
+    if safe_entry_price <= 0:
+        safe_entry_price = 0.0
+    if df is None or df.empty or "high" not in df.columns or ts is None:
+        return safe_entry_price, 0
+
+    timestamp_series: pd.Series | None = None
+    if "ts" in df.columns:
+        timestamp_series = pd.to_datetime(df["ts"], errors="coerce")
+    elif isinstance(df.index, pd.DatetimeIndex):
+        timestamp_series = pd.Series(df.index, index=df.index)
+
+    if timestamp_series is None:
+        return safe_entry_price, 0
+
+    try:
+        if getattr(timestamp_series.dt, "tz", None) is None:
+            timestamp_series = timestamp_series.dt.tz_localize(KST)
+        else:
+            timestamp_series = timestamp_series.dt.tz_convert(KST)
+    except Exception:
+        pass
+
+    post_entry_mask = timestamp_series >= ts
+    post_entry_bars = df.loc[post_entry_mask.fillna(False)]
+    if post_entry_bars.empty:
+        return safe_entry_price, 0
+
+    post_entry_high = pd.to_numeric(post_entry_bars["high"], errors="coerce").max()
+    if pd.isna(post_entry_high):
+        return safe_entry_price, int(len(post_entry_bars))
+    return max(safe_entry_price, float(post_entry_high)), int(len(post_entry_bars))
+
+
+def _resolve_exit_policy(
+    *,
+    days_held: int,
+    holding_bars: int,
+    stop_hit: bool,
+    trail_stop_price: float | None,
+    mark: float,
+    ma20: float | None,
+    ma50: float | None,
+    time_stop_hit: bool,
+    risk_off_signal: bool,
+) -> dict[str, Any]:
+    same_day_entry = int(days_held or 0) == 0
+    trail_eligible = int(days_held or 0) >= 1 and int(holding_bars or 0) >= int(MIN_TRAIL_BARS)
+    soft_exit_eligible = int(days_held or 0) >= 1 and int(holding_bars or 0) >= int(MIN_EXIT_BARS)
+    trail_hit = bool(trail_eligible and trail_stop_price is not None and mark <= float(trail_stop_price))
+    ma20_break = bool(soft_exit_eligible and ma20 is not None and mark < ma20)
+    ma50_break = bool(soft_exit_eligible and ma50 is not None and mark < ma50)
+    soft_exit_hit = bool(soft_exit_eligible and (risk_off_signal or ma50_break or ma20_break))
+
+    triggered: list[str] = []
+    final_reason = "NO_EXIT_SIGNAL"
+    family = "SKIP"
+    exit_ok = False
+    if stop_hit:
+        triggered.append("EXIT_HARD_STOP")
+        final_reason = "EXIT_HARD_STOP"
+        family = "EXIT_STOP"
+        exit_ok = True
+    elif trail_hit:
+        triggered.append("EXIT_TRAIL")
+        final_reason = "EXIT_TRAIL"
+        family = "EXIT_TRAIL"
+        exit_ok = True
+    elif soft_exit_hit:
+        triggered.append("EXIT_SOFT_RISK_OFF")
+        final_reason = "EXIT_SOFT_RISK_OFF"
+        family = "EXIT_RISK_OFF"
+        exit_ok = True
+    elif time_stop_hit:
+        triggered.append("EXIT_TIME_BASED")
+        final_reason = "EXIT_TIME_BASED"
+        family = "EXIT_TIME"
+        exit_ok = True
+
+    return {
+        "same_day_entry": same_day_entry,
+        "trail_eligible": trail_eligible,
+        "soft_exit_eligible": soft_exit_eligible,
+        "trail_hit": trail_hit,
+        "ma20_break": ma20_break,
+        "ma50_break": ma50_break,
+        "risk_off_hit": bool(soft_exit_eligible and risk_off_signal),
+        "soft_exit_hit": soft_exit_hit,
+        "triggered": triggered,
+        "final_reason": final_reason,
+        "family": family,
+        "exit_ok": exit_ok,
+    }
+
+
+def _compute_affordable_buy_qty(
+    *,
+    target_budget: float,
+    buy_ref_price: float,
+    cash_available: float,
+    min_remaining_cash_krw: float,
+    allow_single_share_override: bool,
+    budget_flex_pct: float,
+) -> tuple[int, dict[str, Any]]:
+    budget = float(target_budget or 0.0)
+    price = float(buy_ref_price or 0.0)
+    cash = float(cash_available or 0.0)
+    remaining_cash_floor = float(min_remaining_cash_krw or 0.0)
+    effective_budget = round(budget * max(float(budget_flex_pct or 0.0), 0.0), 4)
+    qty_by_budget = int(effective_budget // price) if price > 0 else 0
+    one_share_cost = round(price * (1.0 + float(BUY_PRICE_BUFFER_PCT)), 4) if price > 0 else 0.0
+    override = bool(allow_single_share_override)
+    skip_reason = ""
+    buy_mode = "budget"
+    final_qty = qty_by_budget
+
+    if price <= 0:
+        final_qty = 0
+        skip_reason = "quantity_zero_after_budget_check"
+        buy_mode = "invalid_price"
+    elif final_qty < 1:
+        if not override:
+            skip_reason = "insufficient_budget_and_override_disabled"
+            buy_mode = "insufficient_budget"
+            final_qty = 0
+        elif cash < one_share_cost:
+            skip_reason = "insufficient_cash_for_one_share"
+            buy_mode = "insufficient_budget"
+            final_qty = 0
+        elif cash < one_share_cost + remaining_cash_floor:
+            skip_reason = "min_remaining_cash_violation"
+            buy_mode = "insufficient_budget"
+            final_qty = 0
+        else:
+            final_qty = 1
+            buy_mode = "single_share_override"
+
+    details = {
+        "cash": cash,
+        "target_budget": budget,
+        "effective_budget": effective_budget,
+        "buy_ref_price": price,
+        "qty_by_budget": qty_by_budget,
+        "one_share_cost": one_share_cost,
+        "single_share_override": override,
+        "buy_mode": buy_mode,
+        "final_qty": final_qty,
+        "skip_reason": skip_reason,
+    }
+    return final_qty, details
+
+def _fill_reconcile_warn_needed(filled_price: float, avg_price_from_balance: float) -> bool:
+    if filled_price <= 0 or avg_price_from_balance <= 0:
+        return False
+    return abs(filled_price - avg_price_from_balance) / avg_price_from_balance > 0.01
 
 
 @dataclass
@@ -5118,15 +5309,41 @@ class PB1Engine:
                 cf.reasons.append("risk_invalid")
                 continue
             budget_cap = min(per_position_budget, max_pos_krw)
-            qty = calc_position_size(
+            raw_risk_qty = calc_position_size(
                 equity=equity_krw,
                 risk_pct=float(RISK_PER_TRADE_PCT),
                 entry=order_px,
                 stop=stop0,
                 risk_mult=risk_mult,
             )
-            if budget_cap > 0:
-                qty = min(qty, int(budget_cap // order_px))
+            qty = raw_risk_qty
+            buy_ref_price = float(order_px) * (1.0 + float(BUY_PRICE_BUFFER_PCT))
+            cash_available_for_order = float(order_possible_cash if order_possible_cash > 0 else usable_cash)
+            affordable_qty, afford_details = _compute_affordable_buy_qty(
+                target_budget=budget_cap,
+                buy_ref_price=buy_ref_price,
+                cash_available=cash_available_for_order,
+                min_remaining_cash_krw=MIN_REMAINING_CASH_KRW,
+                allow_single_share_override=ALLOW_SINGLE_SHARE_OVERRIDE,
+                budget_flex_pct=BUDGET_FLEX_PCT,
+            )
+            if raw_risk_qty <= 0:
+                qty = 0
+            elif budget_cap > 0:
+                qty = min(raw_risk_qty, affordable_qty) if affordable_qty > 0 else 0
+            logger.info(
+                "[BUY][AFFORD] code=%s cash=%.0f target_budget=%.0f effective_budget=%.0f buy_ref_price=%.2f qty_by_budget=%s one_share_cost=%.2f single_share_override=%s final_qty=%s skip_reason=%s",
+                self._display_code(cf.code),
+                cash_available_for_order,
+                afford_details["target_budget"],
+                afford_details["effective_budget"],
+                afford_details["buy_ref_price"],
+                afford_details["qty_by_budget"],
+                afford_details["one_share_cost"],
+                int(bool(afford_details["single_share_override"])),
+                afford_details["final_qty"],
+                afford_details["skip_reason"] or "none",
+            )
             
             # ===== New: 명확한 sizing_reason 계산 =====
             # ⚠️ CRITICAL: reserve는 _resolve_entry_capital()에서 이미 적용됨
@@ -5140,6 +5357,11 @@ class PB1Engine:
                 "position_cap": budget_cap,
                 "usable_cash": usable_cash,
                 "order_px": order_px,
+                "buy_ref_price": buy_ref_price,
+                "effective_budget": afford_details["effective_budget"],
+                "qty_by_budget": afford_details["qty_by_budget"],
+                "one_share_cost": afford_details["one_share_cost"],
+                "buy_mode": afford_details["buy_mode"],
                 "binding_constraint": None,
             }
             
@@ -5147,10 +5369,10 @@ class PB1Engine:
             rank = ranked.index(cf) + 1 if cf in ranked else 999
             
             # 1단계: qty=0 여부 체크 (예산 부족)
-            raw_position_qty = (float(budget_cap) / float(order_px)) if order_px > 0 and budget_cap > 0 else 0.0
+            raw_position_qty = (float(afford_details["effective_budget"]) / float(buy_ref_price)) if buy_ref_price > 0 and budget_cap > 0 else 0.0
             floor_position_qty = int(raw_position_qty) if raw_position_qty > 0 else 0
-            position_cap_shortfall = float(order_px - budget_cap) if budget_cap > 0 else float("inf")
-            edge_qty_ok = int(order_px > 0 and floor_position_qty >= 1 and position_cap_shortfall <= 0)
+            position_cap_shortfall = float(buy_ref_price - float(afford_details["effective_budget"])) if budget_cap > 0 else float("inf")
+            edge_qty_ok = int(buy_ref_price > 0 and floor_position_qty >= 1 and position_cap_shortfall <= 0)
             logger.info(
                 "[SIZING][EDGE_CHECK] code=%s position_cap=%s order_px=%s raw_qty=%.3f floor_qty=%s final_ok=%s shortfall=%s",
                 self._display_code(cf.code),
@@ -5165,7 +5387,20 @@ class PB1Engine:
                 qty = max(qty, floor_position_qty)
 
             if qty <= 0 or (order_px > 0 and qty * order_px < order_px):  # qty=0 또는 부분 삭감
-                if order_px > tick_budget > 0:
+                skip_reason = str(afford_details.get("skip_reason") or "").strip().upper()
+                if skip_reason == "INSUFFICIENT_CASH_FOR_ONE_SHARE":
+                    sizing_reason = "INSUFFICIENT_CASH_FOR_ONE_SHARE"
+                    sizing_details["binding_constraint"] = "cash_available"
+                elif skip_reason == "MIN_REMAINING_CASH_VIOLATION":
+                    sizing_reason = "MIN_REMAINING_CASH_VIOLATION"
+                    sizing_details["binding_constraint"] = "min_remaining_cash"
+                elif skip_reason == "INSUFFICIENT_BUDGET_AND_OVERRIDE_DISABLED":
+                    sizing_reason = "INSUFFICIENT_BUDGET_AND_OVERRIDE_DISABLED"
+                    sizing_details["binding_constraint"] = "override_disabled"
+                elif skip_reason == "QUANTITY_ZERO_AFTER_BUDGET_CHECK":
+                    sizing_reason = "QUANTITY_ZERO_AFTER_BUDGET_CHECK"
+                    sizing_details["binding_constraint"] = "budget_check"
+                elif order_px > tick_budget > 0:
                     sizing_reason = "ORDER_PX_ABOVE_TICK_BUDGET"
                     sizing_details["binding_constraint"] = "tick_budget"
                 elif order_px > budget_cap > 0 and floor_position_qty < 1:
@@ -5231,12 +5466,16 @@ class PB1Engine:
                         {
                             "rank": rank,
                             "buy_budget_after_reserve": tick_budget,
+                            "target_budget": afford_details["target_budget"],
+                            "effective_budget": afford_details["effective_budget"],
                             "price": order_px,
-                            "required_for_1_share": order_px,
+                            "required_for_1_share": afford_details["one_share_cost"],
                             "shortfall": max(0, order_px - min(x for x in [tick_budget, budget_cap, usable_cash] if x > 0) if any(x > 0 for x in [tick_budget, budget_cap, usable_cash]) else order_px),
                             "reserve_applied_at_capital_level": reserve_krw,
                             "budget_cap": budget_cap,
                             "order_possible_cash": order_possible_cash,
+                            "cash_available": cash_available_for_order,
+                            "skip_reason": afford_details["skip_reason"],
                             "force_min1_enabled": int(force_min1_enabled),
                             "force_min1_topn": force_min1_topn,
                             "force_min1_override_position_cap": int(force_min1_override_position_cap),
@@ -6322,6 +6561,13 @@ class PB1Engine:
                 code=cf.code,
                 fields=fields,
             )
+            self._log_fill_reconcile(
+                code=cf.code,
+                sid=1,
+                mode=cf.mode,
+                submitted_price=float(limit_price or entry_price or 0.0),
+                filled_price=float(record_price or 0.0),
+            )
             logger.info(
                 "[POSITION][META][UPSERT] code=%s entry_reason=%s entry_style=%s stop=%s pivot=%s",
                 display_code,
@@ -6513,6 +6759,13 @@ class PB1Engine:
                     "last_stop_update_ts": filled_at.isoformat(),
                 },
             )
+            self._log_fill_reconcile(
+                code=code,
+                sid=1,
+                mode=mode,
+                submitted_price=float(limit_price or price or 0.0),
+                filled_price=float(fill_price or 0.0),
+            )
             logger.info(
                 "[TRADE][FILL][BUY] code=%s oid=%s fill_qty=%s fill_px=%.2f",
                 display_code,
@@ -6528,6 +6781,39 @@ class PB1Engine:
         payload = to_jsonable(payload)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _log_fill_reconcile(
+        self,
+        *,
+        code: str,
+        sid: int,
+        mode: int,
+        submitted_price: float,
+        filled_price: float,
+    ) -> None:
+        pos_state = self.positions_repo.get_position(
+            env=self.env,
+            strategy=self.STRATEGY_NAME,
+            sid=sid,
+            mode=mode,
+            code=code,
+        ) or {}
+        avg_price_from_balance = self._to_float(pos_state.get("avg_buy_price")) or 0.0
+        logger.info(
+            "[TRADE][FILL][RECONCILE] code=%s submitted_price=%.2f filled_price=%.2f avg_price_from_balance=%.2f",
+            self._display_code(code),
+            float(submitted_price or 0.0),
+            float(filled_price or 0.0),
+            float(avg_price_from_balance or 0.0),
+        )
+        if _fill_reconcile_warn_needed(float(filled_price or 0.0), float(avg_price_from_balance or 0.0)):
+            logger.warning(
+                "[FILL_RECONCILE_WARN] code=%s submitted=%.2f filled=%.2f avg_from_balance=%.2f",
+                self._display_code(code),
+                float(submitted_price or 0.0),
+                float(filled_price or 0.0),
+                float(avg_price_from_balance or 0.0),
+            )
 
     def _place_entry_close(self, cf: CandidateFeature) -> dict[str, int | str]:
         status: dict[str, Any] = self._empty_order_status()
@@ -7016,22 +7302,21 @@ class PB1Engine:
         if pivot and close_px is not None and entry_ts is not None:
             failed_breakout = (self._now_kst.date() - entry_ts.date()).days <= FAILED_BREAKOUT_EXIT_DAYS and close_px < pivot
 
-        highest_since_entry = None
+        highest_since_entry = float(avg or 0.0)
         trail_stop_price = None
-        trail_source = "disabled"
+        trail_source = "entry_price"
+        post_entry_rows = 0
         if not df.empty and "high" in df.columns:
-            df_scope = df
-            if entry_ts is not None:
-                try:
-                    df_scope = df.loc[df.index >= entry_ts]
-                except Exception:
-                    df_scope = df
-            if df_scope is None or df_scope.empty:
-                df_scope = df.tail(60)
-                trail_source = "fallback_60d"
-            else:
-                trail_source = "db_ohlcv"
-            highest_since_entry = self._to_float(df_scope["high"].max())
+            highest_since_entry, post_entry_rows = _compute_highest_since_entry(df, entry_ts, float(avg or 0.0))
+            trail_source = "post_entry_bars" if post_entry_rows > 0 else "entry_price_fallback"
+        logger.info(
+            "[EXIT][HIGHEST] code=%s entry_ts=%s entry_price=%s post_entry_rows=%s highest_since_entry=%s",
+            display_code,
+            entry_ts.isoformat() if entry_ts is not None else None,
+            avg,
+            post_entry_rows,
+            highest_since_entry,
+        )
         if highest_since_entry and atr_current and atr_current > 0:
             trail_stop_price = highest_since_entry - (atr_current * ATR_MULT)
         logger.info(
@@ -7059,28 +7344,43 @@ class PB1Engine:
             )
 
         stop_hit = bool(stop_price is not None and mark <= float(stop_price))
-        trail_hit = bool(trail_stop_price is not None and mark <= float(trail_stop_price))
-        ma20_break = bool(ma20 is not None and mark < ma20)
-        ma50_break = bool(ma50 is not None and mark < ma50)
         time_stop_hit = bool(days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
-        risk_off_hit = bool(failed_breakout or (heavy_volume and ma50_break))
+        raw_ma20_break = bool(ma20 is not None and mark < ma20)
+        raw_ma50_break = bool(ma50 is not None and mark < ma50)
+        risk_off_signal = bool(failed_breakout or (heavy_volume and raw_ma50_break))
+        exit_policy = _resolve_exit_policy(
+            days_held=days_held,
+            holding_bars=post_entry_rows,
+            stop_hit=stop_hit,
+            trail_stop_price=trail_stop_price,
+            mark=float(mark or 0.0),
+            ma20=ma20,
+            ma50=ma50,
+            time_stop_hit=time_stop_hit,
+            risk_off_signal=risk_off_signal,
+        )
+        trail_hit = bool(exit_policy["trail_hit"])
+        ma20_break = bool(exit_policy["ma20_break"])
+        ma50_break = bool(exit_policy["ma50_break"])
+        risk_off_hit = bool(exit_policy["risk_off_hit"])
         take_profit_threshold = float(TAKE_PROFIT_R1)
         take_profit_hit = bool((ret_pct / 100.0) >= take_profit_threshold)
 
-        triggered = []
-        if risk_off_hit:
-            triggered.append("EXIT_RISK_OFF")
+        triggered: list[str] = []
         if stop_hit:
-            triggered.append("EXIT_STOP_LOSS")
+            triggered.append("EXIT_HARD_STOP")
         if trail_hit:
-            triggered.append("EXIT_TRAILING_STOP")
+            triggered.append("EXIT_TRAIL")
+        if risk_off_hit:
+            triggered.append("EXIT_SOFT_RISK_OFF")
         if ma50_break:
             triggered.append("EXIT_MA50_BREAK")
         if ma20_break:
             triggered.append("EXIT_MA20_BREAK")
         if time_stop_hit:
-            triggered.append("EXIT_TIME_STOP")
-        ordered_reasons = [reason for reason in EXIT_REASON_PRIORITY if reason in triggered]
+            triggered.append("EXIT_TIME_BASED")
+        final_reason = str(exit_policy["final_reason"])
+        ordered_reasons = [final_reason] + [reason for reason in triggered if reason != final_reason] if final_reason != "NO_EXIT_SIGNAL" else []
 
         logger.info(
             "[EXIT][CHECK] code=%s qty=%s avg=%s last=%s pnl_pct=%.2f days_held=%s",
@@ -7123,16 +7423,22 @@ class PB1Engine:
                 "peak": float(((highest_since_entry - avg) / avg) if (highest_since_entry is not None and avg) else 0.0),
                 "drawdown_from_peak": trail_drawdown,
                 "threshold": trail_threshold,
+                "eligible": bool(exit_policy["trail_eligible"]),
+                "holding_bars": post_entry_rows,
             },
             "ma20_break": {
                 "hit": bool(ma20_break),
                 "close": close_px,
                 "ma20": ma20,
+                "raw_hit": bool(raw_ma20_break),
+                "eligible": bool(exit_policy["soft_exit_eligible"]),
             },
             "ma50_break": {
                 "hit": bool(ma50_break),
                 "close": close_px,
                 "ma50": ma50,
+                "raw_hit": bool(raw_ma50_break),
+                "eligible": bool(exit_policy["soft_exit_eligible"]),
             },
             "time_stop": {
                 "hit": bool(time_stop_hit),
@@ -7143,9 +7449,24 @@ class PB1Engine:
                 "hit": bool(risk_off_hit),
                 "heavy_volume": heavy_volume,
                 "failed_breakout": failed_breakout,
+                "eligible": bool(exit_policy["soft_exit_eligible"]),
+                "same_day_blocked": bool(exit_policy["same_day_entry"] and risk_off_signal),
             },
         }
         logger.info("[EXIT][COND] code=%s conds=%s", display_code, conds)
+        logger.info(
+            "[EXIT][DECISION] code=%s days_held=%s same_day=%s holding_bars=%s hard_stop=%s trail_hit=%s trail_eligible=%s ma50_break=%s regime_exit=%s final_reason=%s",
+            display_code,
+            days_held,
+            int(exit_policy["same_day_entry"]),
+            post_entry_rows,
+            int(stop_hit),
+            int(trail_hit),
+            int(exit_policy["trail_eligible"]),
+            int(ma50_break),
+            int(risk_off_hit),
+            final_reason,
+        )
 
         exit_eval = ExitEvaluation(
             code=code,
@@ -7160,16 +7481,9 @@ class PB1Engine:
             ma50_break=ma50_break,
             time_stop_hit=time_stop_hit,
             risk_off_hit=risk_off_hit,
-            exit_ok=bool(ordered_reasons),
-            family=(
-                "EXIT_RISK_OFF" if ordered_reasons[:1] == ["EXIT_RISK_OFF"]
-                else "EXIT_STOP" if ordered_reasons[:1] == ["EXIT_STOP_LOSS"]
-                else "EXIT_TRAIL" if ordered_reasons[:1] == ["EXIT_TRAILING_STOP"]
-                else "EXIT_MA_BREAK" if ordered_reasons[:1] and ordered_reasons[0] in {"EXIT_MA50_BREAK", "EXIT_MA20_BREAK"}
-                else "EXIT_TIME" if ordered_reasons[:1] == ["EXIT_TIME_STOP"]
-                else "SKIP"
-            ),
-            primary_reason=ordered_reasons[0] if ordered_reasons else "NO_EXIT_SIGNAL",
+            exit_ok=bool(exit_policy["exit_ok"]),
+            family=str(exit_policy["family"]),
+            primary_reason=final_reason,
             secondary_reasons=ordered_reasons[1:],
         )
 
@@ -7212,6 +7526,7 @@ class PB1Engine:
                     "heavy_volume": heavy_volume,
                     "failed_breakout": failed_breakout,
                     "highest_since_entry": highest_since_entry,
+                    "post_entry_rows": post_entry_rows,
                     "atr_current": atr_current,
                     "trail_stop_price": trail_stop_price,
                 },
@@ -7266,12 +7581,12 @@ class PB1Engine:
             return exit_eval_payload
 
         signal_reason_labels = {
-            "EXIT_STOP_LOSS": "stop_loss",
-            "EXIT_TRAILING_STOP": "trail_stop",
+            "EXIT_HARD_STOP": "hard_stop",
+            "EXIT_TRAIL": "trail_stop",
             "EXIT_MA20_BREAK": "ma20_break",
             "EXIT_MA50_BREAK": "ma50_break",
-            "EXIT_TIME_STOP": "time_stop",
-            "EXIT_RISK_OFF": "regime_exit",
+            "EXIT_TIME_BASED": "time_stop",
+            "EXIT_SOFT_RISK_OFF": "regime_exit",
         }
         logger.info(
             "[EXIT][SIGNAL_HIT] code=%s reasons=%s",
@@ -7304,7 +7619,7 @@ class PB1Engine:
             return exit_eval_payload
 
         cooldown_until: str | None = None
-        if exit_eval.primary_reason in {"EXIT_STOP_LOSS", "EXIT_RISK_OFF"}:
+        if exit_eval.primary_reason in {"EXIT_HARD_STOP", "EXIT_SOFT_RISK_OFF"}:
             if REENTRY_COOLDOWN_DAYS <= 0:
                 cooldown_until = self._now_kst.date().isoformat()
             else:
@@ -7555,7 +7870,11 @@ class PB1Engine:
         pos_list = [holding.to_position_dict() for holding in holdings_exit_scope]
         exit_evaluations: list[dict[str, Any]] = []
         for pos in pos_list:
-            df, meta = self._fetch_exit_ohlcv(pos["code"])
+            if int(pos.get("holding_days") or 0) <= 0:
+                df = pd.DataFrame()
+                meta = {"source": "same_day_holdings_skip"}
+            else:
+                df, meta = self._fetch_exit_ohlcv(pos["code"])
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
@@ -9277,7 +9596,7 @@ class PB1Engine:
             logger.info("[PB1][POST_CAPITAL][EXIT_PASS_ENTER]")
             with self._stage_timer_with_timeout(
                 "post_capital.exit_pass",
-                self._stage_timeout_sec("PB1_EXIT_PASS_TIMEOUT_SEC", 30.0),
+                self._stage_timeout_sec("PB1_EXIT_PASS_TIMEOUT_SEC", 60.0),
             ):
                 positions_for_exit = self._run_exit_always(holdings_for_exit=holdings_for_exit, marks_fallback=marks_fallback)
             logger.info("[PB1][POST_CAPITAL][EXIT_PASS_DONE] evals=%s", len(getattr(self, "_exit_evaluations", []) or []))

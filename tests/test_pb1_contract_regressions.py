@@ -12,7 +12,13 @@ from trader.minervini_filter import (
     select_buyable_with_relax,
 )
 from trader.path_contract import build_final30_paths, build_watchlist_paths
-from trader.pb1_engine import PB1Engine, _normalize_sizing_failure_reason
+from trader.pb1_engine import (
+    PB1Engine,
+    _compute_affordable_buy_qty,
+    _compute_highest_since_entry,
+    _normalize_sizing_failure_reason,
+    _resolve_exit_policy,
+)
 from trader.window_router import WindowDecision
 
 
@@ -157,3 +163,107 @@ def test_sizing_reason_normalization_matches_binding_constraint():
     assert _normalize_sizing_failure_reason("ORDER_PX_ABOVE_POSITION_CAP") == "ORDER_PX_ABOVE_POSITION_CAP"
     assert _normalize_sizing_failure_reason("ORDER_PX_ABOVE_USABLE_CASH") == "ORDER_PX_ABOVE_USABLE_CASH"
     assert _normalize_sizing_failure_reason("MIN_ORDER_KRW_NOT_MET") == "MIN_ORDER_KRW_NOT_MET"
+
+
+def test_highest_since_entry_uses_only_post_entry_bars():
+    df = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(
+                [
+                    "2026-04-14 09:01:00+09:00",
+                    "2026-04-14 09:05:00+09:00",
+                    "2026-04-14 09:07:00+09:00",
+                ]
+            ),
+            "high": [260000.0, 214800.0, 214700.0],
+        }
+    )
+
+    highest, rows = _compute_highest_since_entry(df, "2026-04-14 09:05:00+09:00", 214500.0)
+
+    assert rows == 2
+    assert highest == 214800.0
+
+
+def test_same_day_soft_exit_is_blocked_even_when_raw_signals_hit():
+    decision = _resolve_exit_policy(
+        days_held=0,
+        holding_bars=1,
+        stop_hit=False,
+        trail_stop_price=229580.35,
+        mark=213500.0,
+        ma20=214000.0,
+        ma50=214000.0,
+        time_stop_hit=False,
+        risk_off_signal=True,
+    )
+
+    assert decision["same_day_entry"] is True
+    assert decision["trail_eligible"] is False
+    assert decision["soft_exit_eligible"] is False
+    assert decision["trail_hit"] is False
+    assert decision["ma50_break"] is False
+    assert decision["risk_off_hit"] is False
+    assert decision["exit_ok"] is False
+    assert decision["final_reason"] == "NO_EXIT_SIGNAL"
+
+
+def test_same_day_hard_stop_remains_sellable():
+    decision = _resolve_exit_policy(
+        days_held=0,
+        holding_bars=1,
+        stop_hit=True,
+        trail_stop_price=229580.35,
+        mark=213500.0,
+        ma20=214000.0,
+        ma50=214000.0,
+        time_stop_hit=False,
+        risk_off_signal=True,
+    )
+
+    assert decision["exit_ok"] is True
+    assert decision["final_reason"] == "EXIT_HARD_STOP"
+
+
+def test_single_share_override_allows_buy_with_enough_cash():
+    qty, details = _compute_affordable_buy_qty(
+        target_budget=200000.0,
+        buy_ref_price=214500.0,
+        cash_available=500000.0,
+        min_remaining_cash_krw=10000.0,
+        allow_single_share_override=True,
+        budget_flex_pct=1.0,
+    )
+
+    assert details["qty_by_budget"] == 0
+    assert qty == 1
+    assert details["buy_mode"] == "single_share_override"
+
+
+def test_single_share_override_rejects_when_cash_is_insufficient():
+    qty, details = _compute_affordable_buy_qty(
+        target_budget=200000.0,
+        buy_ref_price=214500.0,
+        cash_available=180000.0,
+        min_remaining_cash_krw=10000.0,
+        allow_single_share_override=True,
+        budget_flex_pct=1.0,
+    )
+
+    assert qty == 0
+    assert details["skip_reason"] == "insufficient_cash_for_one_share"
+
+
+def test_budget_flex_can_enable_one_share_without_override():
+    qty, details = _compute_affordable_buy_qty(
+        target_budget=200000.0,
+        buy_ref_price=214500.0,
+        cash_available=500000.0,
+        min_remaining_cash_krw=10000.0,
+        allow_single_share_override=False,
+        budget_flex_pct=1.10,
+    )
+
+    assert details["effective_budget"] == 220000.0
+    assert qty == 1
+    assert details["buy_mode"] == "budget"
