@@ -1297,6 +1297,101 @@ class RunsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
+        self._runs_column_type_cache: dict[str, tuple[str, bool]] = {}
+
+    def _detect_runs_column_type(self, column_name: str) -> tuple[str, bool]:
+        cached = self._runs_column_type_cache.get(column_name)
+        if cached is not None:
+            return cached
+
+        detected = self._schema.runs.c[column_name].type.__class__.__name__.lower()
+        is_textual = isinstance(self._schema.runs.c[column_name].type, (sa.String, sa.Text, sa.Unicode, sa.UnicodeText))
+        try:
+            inspector = sa.inspect(self.engine)
+            reflected_columns = inspector.get_columns(self._schema.runs.name, schema=self._schema.runs.schema)
+            for reflected in reflected_columns:
+                if reflected.get("name") != column_name:
+                    continue
+                reflected_type = reflected.get("type")
+                detected = str(reflected_type or detected).lower()
+                is_textual = isinstance(reflected_type, (sa.String, sa.Text, sa.Unicode, sa.UnicodeText))
+                if not is_textual:
+                    is_textual = any(token in detected for token in ("text", "char", "varchar", "string"))
+                break
+        except Exception as exc:
+            logger.warning("[DB][RUNS][TYPE_REFLECT][WARN] column=%s err=%s", column_name, exc)
+
+        result = (detected, is_textual)
+        self._runs_column_type_cache[column_name] = result
+        return result
+
+    def _normalized_runs_text_expr(self, column_name: str):
+        raw = sa.cast(self._schema.runs.c[column_name], sa.Text)
+        trimmed = func.btrim(raw)
+        return sa.case(
+            (trimmed.is_(None), None),
+            (trimmed == "", None),
+            (func.lower(trimmed) == "none", None),
+            (func.lower(trimmed) == "null", None),
+            else_=trimmed,
+        )
+
+    def _safe_runs_timestamp_expr(self, column_name: str):
+        detected, is_textual = self._detect_runs_column_type(column_name)
+        cast_mode = 1 if is_textual else 0
+        logger.info(
+            "[DB][RUNS][%s_TYPE] detected=%s cast_mode=%s",
+            column_name.upper(),
+            detected,
+            cast_mode,
+        )
+        if not is_textual:
+            return self._schema.runs.c[column_name], detected, cast_mode
+
+        normalized = self._normalized_runs_text_expr(column_name)
+        iso_like_prefix = r"^\d{4}-\d{2}-\d{2}"
+        expr = sa.case(
+            (
+                and_(
+                    normalized.is_not(None),
+                    normalized.op("~")(iso_like_prefix),
+                ),
+                sa.cast(normalized, sa.DateTime(timezone=True)),
+            ),
+            else_=None,
+        )
+        return expr, detected, cast_mode
+
+    def _find_started_today_text_fallback(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        run_window: str | None,
+        phase: str | None,
+        day_prefix: str,
+    ) -> dict[str, Any] | None:
+        started_at_text = self._normalized_runs_text_expr("started_at")
+        conditions = [
+            self._schema.runs.c.env == _norm_env(env),
+            self._schema.runs.c.strategy == strategy,
+            started_at_text.is_not(None),
+            started_at_text.op("~")(r"^\d{4}-\d{2}-\d{2}"),
+            started_at_text.like(f"{day_prefix}%"),
+        ]
+        if run_window is not None:
+            conditions.append(self._schema.runs.c.run_window == run_window)
+        if phase is not None:
+            conditions.append(self._schema.runs.c.phase == phase)
+        stmt = (
+            select(self._schema.runs)
+            .where(and_(*conditions))
+            .order_by(started_at_text.asc())
+            .limit(1)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
 
     def find_started_today(
         self,
@@ -1309,11 +1404,20 @@ class RunsRepo:
         now = now_kst()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
+        logger.info(
+            "[DB][RUNS][FIND_STARTED_TODAY][START] env=%s strategy=%s run_window=%s phase=%s",
+            env,
+            strategy,
+            run_window,
+            phase,
+        )
+        started_at_expr, detected, cast_mode = self._safe_runs_timestamp_expr("started_at")
         conditions = [
             self._schema.runs.c.env == _norm_env(env),
             self._schema.runs.c.strategy == strategy,
-            self._schema.runs.c.started_at >= start,
-            self._schema.runs.c.started_at < end,
+            started_at_expr.is_not(None),
+            started_at_expr >= start,
+            started_at_expr < end,
         ]
         if run_window is not None:
             conditions.append(self._schema.runs.c.run_window == run_window)
@@ -1322,12 +1426,42 @@ class RunsRepo:
         stmt = (
             select(self._schema.runs)
             .where(and_(*conditions))
-            .order_by(self._schema.runs.c.started_at.asc())
+            .order_by(started_at_expr.asc())
             .limit(1)
         )
-        with self.engine.begin() as conn:
-            row = conn.execute(stmt).mappings().first()
-        return dict(row) if row else None
+        try:
+            with self.engine.begin() as conn:
+                row = conn.execute(stmt).mappings().first()
+        except Exception as exc:
+            logger.exception(
+                "[DB][RUNS][FIND_STARTED_TODAY][FAIL] err_type=%s detected=%s cast_mode=%s err=%s",
+                exc.__class__.__name__,
+                detected,
+                cast_mode,
+                exc,
+            )
+            if cast_mode != 1:
+                raise
+            row_dict = self._find_started_today_text_fallback(
+                env=env,
+                strategy=strategy,
+                run_window=run_window,
+                phase=phase,
+                day_prefix=start.date().isoformat(),
+            )
+            logger.info(
+                "[DB][RUNS][FIND_STARTED_TODAY][OK] found=%s run_id=%s fallback=text_prefix",
+                1 if row_dict else 0,
+                (row_dict or {}).get("run_id"),
+            )
+            return row_dict
+        row_dict = dict(row) if row else None
+        logger.info(
+            "[DB][RUNS][FIND_STARTED_TODAY][OK] found=%s run_id=%s",
+            1 if row_dict else 0,
+            (row_dict or {}).get("run_id"),
+        )
+        return row_dict
 
     def create_session_guard(
         self,

@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+from sqlalchemy.dialects import postgresql
 
+from trader.db.repos import RunsRepo
 from trader.entry_engine.scanner import scan_entry_candidates
 from trader.minervini_filter import (
     normalize_rs_percentile,
@@ -20,12 +22,21 @@ from trader.pb1_engine import (
     _resolve_exit_policy,
     _should_allow_single_share_position_cap_override,
 )
+from trader.pb1_runner import _fail_open_on_runs_ledger_error
 from trader.window_router import WindowDecision
 
 
 class DummyOrdersRepo:
     def __init__(self):
         self.engine = object()
+
+
+class _FakeRepoEngine:
+    url = "postgresql+psycopg://"
+    dialect = postgresql.dialect()
+
+    def begin(self):
+        raise RuntimeError("not used")
 
 
 def _make_engine(**kwargs):
@@ -61,6 +72,32 @@ def test_pb1_engine_get_as_of_backfills_from_run_ctx():
 
     assert engine.get_as_of() == "2026-03-17"
     assert engine._as_of == "2026-03-17"
+
+
+def test_runs_repo_started_at_expr_casts_reflected_text_column():
+    repo = RunsRepo(_FakeRepoEngine())
+    repo._runs_column_type_cache["started_at"] = ("text", True)
+
+    expr, detected, cast_mode = repo._safe_runs_timestamp_expr("started_at")
+    compiled = str(expr.compile(dialect=postgresql.dialect()))
+
+    assert detected == "text"
+    assert cast_mode == 1
+    assert "CASE" in compiled
+    assert "CAST" in compiled
+
+
+def test_fail_open_on_runs_ledger_error_defaults_to_practice(monkeypatch):
+    monkeypatch.delenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", raising=False)
+
+    assert _fail_open_on_runs_ledger_error("practice") is True
+    assert _fail_open_on_runs_ledger_error("live") is False
+
+
+def test_fail_open_on_runs_ledger_error_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", "0")
+
+    assert _fail_open_on_runs_ledger_error("practice") is False
 
 
 def test_final30_path_contract_is_repo_root_anchored(tmp_path):

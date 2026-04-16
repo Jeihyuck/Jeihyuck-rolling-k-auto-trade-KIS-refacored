@@ -1100,6 +1100,13 @@ def resolve_env(cli_env: str | None) -> str:
     return "practice"
 
 
+def _fail_open_on_runs_ledger_error(env: str | None) -> bool:
+    env_name = (str(env or os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower() or "practice")
+    raw_flag = str(os.getenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", "1")).strip().lower()
+    flag_enabled = raw_flag not in {"0", "false", "no", "off"}
+    return env_name == "practice" and flag_enabled
+
+
 def _parse_as_of_override(value: str) -> datetime.date:
     raw = (value or "").strip()
     if not raw:
@@ -4170,17 +4177,31 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     session_guard_run_id: str | None = None
     if session_kind == "am":
         session_guard_strategy = "pb1_am_session_guard"
-        existing_session = runs_repo.find_started_today(
-            env=ctx.env,
-            strategy=session_guard_strategy,
-            run_window="morning",
-            phase="entry",
-        ) or runs_repo.find_started_today(
-            env=ctx.env,
-            strategy="pb1_pullback_close",
-            run_window="morning",
-            phase="entry",
-        )
+        try:
+            existing_session = runs_repo.find_started_today(
+                env=ctx.env,
+                strategy=session_guard_strategy,
+                run_window="morning",
+                phase="entry",
+            ) or runs_repo.find_started_today(
+                env=ctx.env,
+                strategy="pb1_pullback_close",
+                run_window="morning",
+                phase="entry",
+            )
+        except Exception as exc:
+            logger.exception("[PB1][SESSION_GUARD][FAIL] continuing_without_existing_session_check err=%s", exc)
+            if _fail_open_on_runs_ledger_error(ctx.env):
+                logger.warning(
+                    "[PB1][SESSION_GUARD][FAIL_OPEN] env=%s strategy=%s run_window=%s phase=%s",
+                    ctx.env,
+                    session_guard_strategy,
+                    "morning",
+                    "entry",
+                )
+                existing_session = None
+            else:
+                raise
         if existing_session:
             logger.warning(
                 "[TRADE_AM][DUPLICATE_GUARD] session already started today -> skip existing_run_id=%s started_at=%s status=%s workflow_run_id=%s",

@@ -292,7 +292,7 @@ jobs:
             missing=1
           fi
           if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-pm.log >/dev/null; then
-            echo "::error::fills.list_today_fills schema mismatch still present"
+            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
             missing=1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-pm.log >/dev/null; then
