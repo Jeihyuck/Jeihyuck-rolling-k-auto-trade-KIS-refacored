@@ -69,7 +69,6 @@ env:
 defaults:
   run:
     shell: bash
-    working-directory: repo
 
 jobs:
   trade_pm:
@@ -121,6 +120,15 @@ jobs:
           path: repo
           fetch-depth: 1
 
+      - name: Verify checkout path
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
+          test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          echo "[CHECKOUT][OK] repo path ready"
+
       - name: Set up Python
         if: steps.phase_guard.outputs.should_run == '1'
         uses: actions/setup-python@v5
@@ -131,6 +139,7 @@ jobs:
 
       - name: Install deps
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
@@ -138,6 +147,7 @@ jobs:
 
       - name: Guard postgres-only
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -148,12 +158,14 @@ jobs:
 
       - name: DB migrate
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.db.migrate
 
       - name: Verify KIS env contract
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
 
@@ -177,6 +189,7 @@ jobs:
 
       - name: Verify candidate pool exists in DB
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][START]"
@@ -189,6 +202,7 @@ jobs:
 
       - name: Verify final30 readiness in DB
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           echo "[TRADE_PM][PRECHECK][FINAL30][START]"
@@ -230,6 +244,7 @@ jobs:
 
       - name: Run PM trade tick
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -241,6 +256,7 @@ jobs:
 
       - name: Verify PM trade tick logs
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           missing=0
@@ -287,6 +303,7 @@ jobs:
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"

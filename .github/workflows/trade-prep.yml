@@ -34,7 +34,6 @@ env:
 defaults:
   run:
     shell: bash
-    working-directory: repo
 
 jobs:
   prep:
@@ -66,6 +65,14 @@ jobs:
           path: repo
           fetch-depth: 1
 
+      - name: Verify checkout path
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
+          test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          echo "[CHECKOUT][OK] repo path ready"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -74,12 +81,14 @@ jobs:
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Guard postgres-only
+        working-directory: repo
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -89,11 +98,13 @@ jobs:
           fi
 
       - name: DB migrate
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.db.migrate
 
       - name: Verify KIS env contract
+        working-directory: repo
         run: |
           set -euo pipefail
 
@@ -116,12 +127,14 @@ jobs:
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Run PREP
+        working-directory: repo
         run: |
           set -euo pipefail
           mkdir -p artifacts
           python -m trader.prep_runner 2>&1 | tee artifacts/prep.log
 
       - name: Verify exact scored final30 in DB
+        working-directory: repo
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -144,12 +157,14 @@ jobs:
           PY
 
       - name: Verify PREP log contract
+        working-directory: repo
         run: |
           set -euo pipefail
           export VERIFY_PREP_REQUIRE_CANONICAL=1
           python scripts/verify_prep_log.py artifacts/prep.log
 
       - name: Verify PREP quality contract
+        working-directory: repo
         run: |
           set -euo pipefail
           python scripts/verify_prep_quality.py | tee artifacts/prep-summary.txt
@@ -158,6 +173,7 @@ jobs:
           echo "prep_manifest_path=${latest_manifest}" | tee -a artifacts/prep-summary.txt
 
       - name: Verify PREP canonical verdict
+        working-directory: repo
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -226,6 +242,7 @@ jobs:
 
       - name: Scan for SQLite artifacts
         if: always()
+        working-directory: repo
         run: |
           set -euo pipefail
           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
