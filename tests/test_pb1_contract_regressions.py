@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 from sqlalchemy.dialects import postgresql
@@ -98,6 +99,20 @@ def test_fail_open_on_runs_ledger_error_can_be_disabled(monkeypatch):
     monkeypatch.setenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", "0")
 
     assert _fail_open_on_runs_ledger_error("practice") is False
+
+
+def test_fail_open_on_runs_ledger_error_can_be_enabled_for_live(monkeypatch):
+    monkeypatch.setenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", "1")
+
+    assert _fail_open_on_runs_ledger_error("live") is True
+
+
+def test_base_migration_uses_timestamptz_for_runs_columns():
+    migration = Path(__file__).resolve().parents[1] / "migrations" / "0001_pbcore.sql"
+    sql = migration.read_text(encoding="utf-8")
+
+    assert "started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP" in sql
+    assert "finished_at TIMESTAMPTZ" in sql
 
 
 def test_final30_path_contract_is_repo_root_anchored(tmp_path):

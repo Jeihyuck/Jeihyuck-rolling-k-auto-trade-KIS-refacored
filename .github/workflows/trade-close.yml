@@ -101,18 +101,36 @@ jobs:
         run: |
           set -euo pipefail
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          event_name="${GITHUB_EVENT_NAME:-unknown}"
+          valid_window="1515-1529"
           should_run=1
           skip_reason=""
-          if [[ "$now_kst" -lt 1515 ]]; then
-            should_run=0
-            skip_reason="early_start"
-          elif [[ "$now_kst" -ge 1525 ]]; then
-            should_run=0
-            skip_reason="stale_start"
+          if [[ "$event_name" != "workflow_dispatch" ]]; then
+            if [[ "$now_kst" -lt 1515 ]]; then
+              should_run=0
+              skip_reason="early_start"
+            elif [[ "$now_kst" -ge 1529 ]]; then
+              should_run=0
+              skip_reason="stale_start"
+            fi
           fi
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
-          echo "[TRADE_CLOSE][PHASE_GUARD] now_kst=${now_kst} should_run=${should_run} skip_reason=${skip_reason:-none} valid=1515-1525"
+          echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
+          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
+
+      - name: Write Close trigger metadata
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+          } | tee -a repo/artifacts/trade-close.log
 
       - name: Checkout
         if: steps.phase_guard.outputs.should_run == '1'
@@ -131,6 +149,7 @@ jobs:
 
       - name: Install deps
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
@@ -138,6 +157,7 @@ jobs:
 
       - name: Guard postgres-only
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
@@ -148,12 +168,14 @@ jobs:
 
       - name: DB migrate
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.db.migrate
 
       - name: Verify KIS env contract
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
 
@@ -177,12 +199,14 @@ jobs:
 
       - name: Verify candidate pool exists in DB
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.verify_candidate_pool
 
       - name: Verify final30 readiness in DB
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           echo "[TRADE_CLOSE][PRECHECK][FINAL30][START]"
@@ -218,12 +242,16 @@ jobs:
           set -euo pipefail
           mkdir -p repo/artifacts
           {
-            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=close event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-close.log
 
       - name: Run close trade tick
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -234,9 +262,28 @@ jobs:
 
       - name: Verify close trade tick logs
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           missing=0
+          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing [RUN_SUMMARY][RESULT]"
+            exit 1
+          fi
+          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-close.log | tail -n 1 | sed 's/.*status=//')"
+          if [[ "$result_status" == "SKIP_PHASE_WINDOW" ]]; then
+            echo "::notice::Close phase window skip recorded"
+            exit 0
+          fi
+          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-close.log >/dev/null; then
+            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
+            exit 1
+          fi
+          if [[ "$result_status" == "FATAL_RUNTIME" ]]; then
+            echo "::error::Close fatal runtime recorded"
+            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FATAL_RUNTIME|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-close.log || true
+            exit 1
+          fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=close" artifacts/trade-close.log >/dev/null; then
             echo "::error::missing [PB1][LOOP][SESSION] kind=close"
             missing=1
@@ -247,14 +294,6 @@ jobs:
           fi
           if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-close.log >/dev/null; then
             echo "::error::missing [TRADE][READY][OK]"
-            missing=1
-          fi
-          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-close.log >/dev/null; then
-            echo "::error::missing [RUN_SUMMARY][RESULT]"
-            missing=1
-          fi
-          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-close.log >/dev/null; then
-            echo "::error::fills.list_today_fills schema mismatch still present"
             missing=1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-close.log >/dev/null; then
@@ -269,6 +308,7 @@ jobs:
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
         run: |
           set -euo pipefail
           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"

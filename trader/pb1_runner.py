@@ -1102,9 +1102,13 @@ def resolve_env(cli_env: str | None) -> str:
 
 def _fail_open_on_runs_ledger_error(env: str | None) -> bool:
     env_name = (str(env or os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower() or "practice")
-    raw_flag = str(os.getenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", "1")).strip().lower()
-    flag_enabled = raw_flag not in {"0", "false", "no", "off"}
-    return env_name == "practice" and flag_enabled
+    raw_flag = os.getenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR")
+    if raw_flag is None:
+        return env_name == "practice"
+    flag_enabled = str(raw_flag).strip().lower() not in {"0", "false", "no", "off"}
+    if env_name == "practice":
+        return flag_enabled
+    return flag_enabled
 
 
 def _parse_as_of_override(value: str) -> datetime.date:
@@ -3875,6 +3879,8 @@ def run_once(
 
         if result is not None:
             result_reason = result.notes or "none"
+            summary_session = str(os.getenv("PB1_SESSION_KIND") or window_label or phase_for_log or "unknown")
+            summary_event = str(os.getenv("GITHUB_EVENT_NAME") or "unknown")
             if not trading_day and (compute_only_full_run or dry_run or bool(compute_only_flags.get("force_block_live"))):
                 result.status = "OK_NONTRADING_COMPUTE"
                 result_reason = "WINDOW_BLOCKED_COMPUTE_ONLY"
@@ -3882,12 +3888,18 @@ def run_once(
                 result.status = "OK_WINDOW_BLOCKED_COMPUTE"
                 result_reason = "WINDOW_BLOCKED_COMPUTE_ONLY"
             elif result.status in {"OK_NO_TRADE", "NO_TRADE"} and result.notes and "no_candidates" in result.notes:
-                result.status = "OK_NO_CANDIDATES"
-                result_reason = "NO_CANDIDATES_AFTER_RELAX"
+                result.status = "OK_NO_TRADE"
+                result_reason = "NO_ORDERABLE_CANDIDATES"
             elif result.status in {"OK_NO_TRADE", "NO_TRADE"}:
                 result.status = "OK_NO_TRADE"
                 result_reason = result.notes or "NO_ORDER_INTENTS"
-            logger.info("[RUN_SUMMARY][RESULT] status=%s reason=%s", result.status, result_reason)
+            logger.info(
+                "[RUN_SUMMARY][RESULT] status=%s reason=%s session=%s event=%s",
+                result.status,
+                result_reason,
+                summary_session,
+                summary_event,
+            )
             result.notes = result_reason
             if nontrading_eval_mode:
                 _write_nontrading_eval_reports(
@@ -4023,8 +4035,16 @@ def run_once(
             current_code,
             top_candidates,
         )
+        fatal_reason = "RUNS_LEDGER_QUERY_FAIL" if str(exc) == "RUNS_LEDGER_QUERY_FAIL" else "UNHANDLED_RUNTIME_EXCEPTION"
+        logger.error(
+            "[RUN_SUMMARY][RESULT] status=FATAL_RUNTIME reason=%s session=%s event=%s",
+            fatal_reason,
+            str(os.getenv("PB1_SESSION_KIND") or window_context or phase_context or "unknown"),
+            str(os.getenv("GITHUB_EVENT_NAME") or "unknown"),
+        )
+        logger.error("[PB1][EXIT] reason=fatal_runtime")
         if run_record_id:
-            runs_repo.finish_run(run_record_id, status="FAILED", notes=str(exc))
+            runs_repo.finish_run(run_record_id, status="FATAL_RUNTIME", notes=fatal_reason)
             _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="failed", now=now)
         raise
     finally:
@@ -4201,7 +4221,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 )
                 existing_session = None
             else:
-                raise
+                raise RuntimeError("RUNS_LEDGER_QUERY_FAIL") from exc
         if existing_session:
             logger.warning(
                 "[TRADE_AM][DUPLICATE_GUARD] session already started today -> skip existing_run_id=%s started_at=%s status=%s workflow_run_id=%s",

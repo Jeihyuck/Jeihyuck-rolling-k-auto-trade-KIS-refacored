@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS runs (
     workflow_attempt INTEGER,
     config_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'STARTED',
-    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    finished_at TEXT,
+    started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMPTZ,
     notes TEXT
 );
 

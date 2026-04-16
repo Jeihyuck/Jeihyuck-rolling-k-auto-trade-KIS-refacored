@@ -100,18 +100,36 @@ jobs:
         run: |
           set -euo pipefail
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          event_name="${GITHUB_EVENT_NAME:-unknown}"
+          valid_window="1300-1510"
           should_run=1
           skip_reason=""
-          if [[ "$now_kst" -lt 1300 ]]; then
-            should_run=0
-            skip_reason="early_start"
-          elif [[ "$now_kst" -ge 1505 ]]; then
-            should_run=0
-            skip_reason="stale_start"
+          if [[ "$event_name" != "workflow_dispatch" ]]; then
+            if [[ "$now_kst" -lt 1300 ]]; then
+              should_run=0
+              skip_reason="early_start"
+            elif [[ "$now_kst" -ge 1510 ]]; then
+              should_run=0
+              skip_reason="stale_start"
+            fi
           fi
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
-          echo "[TRADE_PM][PHASE_GUARD] now_kst=${now_kst} should_run=${should_run} skip_reason=${skip_reason:-none} valid=1300-1505"
+          echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
+          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
+
+      - name: Write PM trigger metadata
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+          } | tee -a repo/artifacts/trade-pm.log
 
       - name: Checkout
         if: steps.phase_guard.outputs.should_run == '1'
@@ -238,7 +256,10 @@ jobs:
           set -euo pipefail
           mkdir -p repo/artifacts
           {
-            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=pm event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-pm.log
 
@@ -260,6 +281,25 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
+          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::missing [RUN_SUMMARY][RESULT]"
+            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true
+            exit 1
+          fi
+          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-pm.log | tail -n 1 | sed 's/.*status=//')"
+          if [[ "$result_status" == "SKIP_PHASE_WINDOW" ]]; then
+            echo "::notice::PM phase window skip recorded"
+            exit 0
+          fi
+          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
+            exit 1
+          fi
+          if [[ "$result_status" == "FATAL_RUNTIME" ]]; then
+            echo "::error::PM fatal runtime recorded"
+            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FATAL_RUNTIME|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-pm.log || true
+            exit 1
+          fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=pm" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [PB1][LOOP][SESSION] kind=pm"
             missing=1
@@ -274,11 +314,6 @@ jobs:
             grep -E "\[TRADE\]\[READY\]\[FAIL\]|\[TRADE\]\[PRECHECK\]\[(CANDIDATE_POOL|FINAL30|BALANCE)\]" artifacts/trade-pm.log || true
             missing=1
           fi
-          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
-            echo "::error::missing [RUN_SUMMARY][RESULT]"
-            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true
-            missing=1
-          fi
           if ! grep -E "\[PB1\]\[POST_CAPITAL\]\[START\]" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [PB1][POST_CAPITAL][START]"
             missing=1
@@ -289,10 +324,6 @@ jobs:
           fi
           if grep -E "\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_holdings_prep|\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_pass" artifacts/trade-pm.log >/dev/null; then
             echo "::error::PM hang detected in post-capital stage"
-            missing=1
-          fi
-          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-pm.log >/dev/null; then
-            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
             missing=1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-pm.log >/dev/null; then

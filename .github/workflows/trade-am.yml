@@ -104,6 +104,8 @@ jobs:
         run: |
           set -euo pipefail
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          event_name="${GITHUB_EVENT_NAME:-unknown}"
+          valid_window="0900-1255"
           expected_start_window="0907-0915"
           should_run=1
           skip_reason=""
@@ -127,6 +129,8 @@ jobs:
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
           echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
+          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
           echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
           echo "late_level=${late_level}" >> "$GITHUB_OUTPUT"
           echo "degraded_session=${degraded_session}" >> "$GITHUB_OUTPUT"
@@ -138,9 +142,9 @@ jobs:
           set -euo pipefail
           mkdir -p repo/artifacts
           {
-            echo "[TRADE_AM][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }}"
-            echo "[TRADE_AM][PHASE_GUARD] now_kst=${{ steps.phase_guard.outputs.now_kst }} should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} valid=0900-1255"
+            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
             if [[ -n "${{ steps.phase_guard.outputs.late_level }}" ]]; then
               echo "[TRADE_AM][LATE_START][WARN] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
             fi
@@ -274,10 +278,10 @@ jobs:
           set -euo pipefail
           mkdir -p repo/artifacts
           {
-            echo "[TRADE_AM][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }}"
-            echo "[TRADE_AM][PHASE_GUARD] now_kst=${{ steps.phase_guard.outputs.now_kst }} should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} valid=0900-1255"
-            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=am event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-am.log
 
@@ -304,6 +308,25 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
+          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null; then
+            echo "::error::missing [RUN_SUMMARY][RESULT]"
+            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-am.log || true
+            exit 1
+          fi
+          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-am.log | tail -n 1 | sed 's/.*status=//')"
+          if [[ "$result_status" == "SKIP_PHASE_WINDOW" ]]; then
+            echo "::notice::AM phase window skip recorded"
+            exit 0
+          fi
+          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-am.log >/dev/null; then
+            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
+            exit 1
+          fi
+          if [[ "$result_status" == "FATAL_RUNTIME" ]]; then
+            echo "::error::AM fatal runtime recorded"
+            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FATAL_RUNTIME|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-am.log || true
+            exit 1
+          fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=am" artifacts/trade-am.log >/dev/null; then
             echo "::error::missing [PB1][LOOP][SESSION] kind=am"
             missing=1
@@ -316,15 +339,6 @@ jobs:
           if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null; then
             echo "::error::missing [TRADE][READY][OK]"
             grep -E "\[TRADE\]\[READY\]\[FAIL\]|\[TRADE\]\[PRECHECK\]\[(CANDIDATE_POOL|FINAL30|BALANCE)\]" artifacts/trade-am.log || true
-            missing=1
-          fi
-          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null; then
-            echo "::error::missing [RUN_SUMMARY][RESULT]"
-            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-am.log || true
-            missing=1
-          fi
-          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-am.log >/dev/null; then
-            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
             missing=1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-am.log >/dev/null; then
