@@ -186,6 +186,15 @@ jobs:
           dur_sec="$((now_epoch - ${LAST_STEP_EPOCH:-$now_epoch}))"
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][QUEUE_VISIBLE] scheduled_slot=0907 now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_AM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }}"
+            echo "[TRADE_AM][PRECHECK][START]"
+          } | tee repo/artifacts/trade-am.log >/dev/null
           echo "[CHECKOUT][OK] repo path ready"
           echo "[TRADE_AM][STEP][checkout] dur_sec=${dur_sec}" | tee -a repo/artifacts/trade-am.log
           echo "LAST_STEP_EPOCH=${now_epoch}" >> "$GITHUB_ENV"

@@ -149,6 +149,12 @@ jobs:
           set -euo pipefail
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+          } | tee repo/artifacts/trade-pm.log >/dev/null
           echo "[CHECKOUT][OK] repo path ready"
 
       - name: Set up Python
