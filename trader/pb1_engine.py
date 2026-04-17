@@ -64,6 +64,7 @@ from trader.config import (
     PB1_CASH_RESERVE_PCT,
     PB1_ENTRY_BUDGET_PCT_PER_TICK,
     PB1_MAX_POS_PCT,
+    PB1_TARGET_NEW_POSITIONS,
     PAPER_MAX_CAPITAL_KRW,
     PB1_ENTRY_WINDOW_START,
     PB1_ENTRY_OPEN_END,
@@ -5393,7 +5394,14 @@ class PB1Engine:
         risk_krw = equity_krw * (float(RISK_PER_TRADE_PCT) / 100.0) * risk_mult
         target_new_positions = max(1, int(self.target_new_positions or len(ranked) or 1))
         per_position_budget = min(max_pos_krw, tick_budget / target_new_positions) if tick_budget > 0 else max_pos_krw
-        self._budget_plan_meta = {"risk_krw": risk_krw, "per_position_budget": per_position_budget}
+        self._budget_plan_meta = {
+            "risk_krw": risk_krw,
+            "per_position_budget": per_position_budget,
+            "tick_budget": tick_budget,
+            "target_new_positions": target_new_positions,
+            "max_pos_krw": max_pos_krw,
+            "entry_capital": float(self.entry_capital_krw or 0.0),
+        }
         force_min1_enabled = bool(self.force_min1_enabled)
         force_min1_topn = max(1, int(self._int_env("FORCE_MIN1_OVERRIDE_TOPN", FORCE_MIN1_OVERRIDE_TOPN or self.force_min1_topn or 2)))
         force_min1_override_position_cap = self._bool_env("FORCE_MIN1_OVERRIDE_POSITION_CAP", FORCE_MIN1_OVERRIDE_POSITION_CAP)
@@ -5679,6 +5687,22 @@ class PB1Engine:
                 cf.reasons.append(cf.sizing_reason)
                 cf.sizing_details = sizing_details
                 continue
+            logger.info(
+                "[PB1][SIZING][QTY] code=%s price=%.0f per_position_budget=%.0f tick_budget_remaining=%.0f qty_raw=%.3f qty_final=%s",
+                self._display_code(cf.code),
+                order_px,
+                per_position_budget,
+                max(0.0, float(tick_budget) - float(getattr(self, "_planned_entry_spent_krw", 0.0) or 0.0)),
+                float(raw_risk_qty or 0.0),
+                qty,
+            )
+            if qty == 1:
+                one_share_reason = "budget_limited" if int(affordable_qty or 0) <= 1 else "risk_limited"
+                logger.info(
+                    "[PB1][SIZING][ONE_SHARE_ONLY] code=%s reason=%s",
+                    self._display_code(cf.code),
+                    one_share_reason,
+                )
             cf.planned_qty = qty
             cf.planned_value = float(qty * order_px)
             cf.features["planned_cap"] = float(budget_cap)
@@ -9217,7 +9241,7 @@ class PB1Engine:
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
         entry_phase = self.phase in {"prep", "entry"}
         max_positions = int(PB1_MAX_POSITIONS)
-        target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", max_positions)
+        target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", PB1_TARGET_NEW_POSITIONS)
         min_order_krw = float(MIN_ORDER_KRW)
         entry_capital_krw = 0.0
         skip_entry_scan = False
@@ -9592,6 +9616,7 @@ class PB1Engine:
             available_cash_krw = order_possible_cash_krw
         self.order_possible_cash_krw = float(order_possible_cash_krw)
         base_cash_krw = min(total_cash_krw, order_possible_cash_krw)
+        self.entry_base_cash_krw = float(base_cash_krw)
         if entry_phase:
             reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
             override_capital = PB1_ENTRY_CAPITAL_KRW
@@ -10998,6 +11023,22 @@ class PB1Engine:
                     if not reasons and len(orderable_candidates) >= new_position_limit:
                         reasons.append("target_new_positions_limit")
                     if reasons:
+                        if "entry_cap_exceeded" in reasons:
+                            budget_meta = dict(getattr(self, "_budget_plan_meta", {}) or {})
+                            logger.info(
+                                "[PB1][ORDER][SKIP_DETAIL] code=%s reason=ENTRY_CAP_EXCEEDED base_cash=%.0f usable_cash=%.0f entry_capital=%.0f tick_budget=%.0f used_entry_budget=%.0f remaining_entry_budget=%.0f per_position_budget=%.0f planned_order_value=%.0f qty_candidate=%s price=%.0f",
+                                cf.code,
+                                float(getattr(self, "entry_base_cash_krw", 0.0) or 0.0),
+                                float(self.entry_usable_krw or 0.0),
+                                float(self.entry_capital_krw or 0.0),
+                                float(tick_budget_krw),
+                                float(planned_spent),
+                                max(0.0, float(tick_budget_krw) - float(planned_spent)),
+                                float(budget_meta.get("per_position_budget") or 0.0),
+                                float(order_value),
+                                int(cf.planned_qty or 0),
+                                float(entry_price or 0.0),
+                            )
                         for reason in reasons:
                             self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                             order_stage_counter[reason] += 1
@@ -11042,6 +11083,7 @@ class PB1Engine:
                         entry_reason=entry_reason,
                     )
                     planned_spent += order_value
+                    self._planned_entry_spent_krw = float(planned_spent)
                     if len(orderable_candidates) >= new_position_limit:
                         break
             logger.info(

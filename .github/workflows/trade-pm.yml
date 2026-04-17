@@ -4,6 +4,8 @@ name: Trade PM
   schedule:
     # Mon-Fri 13:05 KST = 04:05 UTC (PM loop runs through 15:10 KST)
     - cron: "5 4 * * 1-5"
+    - cron: "10 4 * * 1-5"
+    - cron: "15 4 * * 1-5"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -102,6 +104,7 @@ jobs:
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
           valid_window="1300-1510"
+          expected_start_window="1305-1315"
           should_run=1
           skip_reason=""
           if [[ "$event_name" != "workflow_dispatch" ]]; then
@@ -118,6 +121,7 @@ jobs:
           echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
           echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
+          echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
 
       - name: Write PM trigger metadata
         if: steps.phase_guard.outputs.should_run == '1'
@@ -127,7 +131,7 @@ jobs:
           mkdir -p repo/artifacts
           {
             echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
             echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
           } | tee -a repo/artifacts/trade-pm.log
 
@@ -257,7 +261,7 @@ jobs:
           mkdir -p repo/artifacts
           {
             echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
             echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=pm event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[PB1][EXIT] reason=phase_guard_skip"
@@ -281,6 +285,12 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
+          for pattern in "\[TRADE_PM\]\[TRIGGER\]" "\[TRADE_PM\]\[START_META\]" "\[TRADE_PM\]\[PHASE_GUARD\]"; do
+            if ! grep -E "$pattern" artifacts/trade-pm.log >/dev/null; then
+              echo "::error::missing metadata pattern: $pattern"
+              missing=1
+            fi
+          done
           if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [RUN_SUMMARY][RESULT]"
             grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true

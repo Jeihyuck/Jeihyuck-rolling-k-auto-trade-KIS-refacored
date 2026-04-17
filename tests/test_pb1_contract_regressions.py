@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -25,6 +27,15 @@ from trader.pb1_engine import (
 )
 from trader.pb1_runner import _fail_open_on_runs_ledger_error
 from trader.window_router import WindowDecision
+
+
+def _load_script_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class DummyOrdersRepo:
@@ -105,6 +116,37 @@ def test_fail_open_on_runs_ledger_error_can_be_enabled_for_live(monkeypatch):
     monkeypatch.setenv("PB1_FAIL_OPEN_ON_RUNS_LEDGER_ERROR", "1")
 
     assert _fail_open_on_runs_ledger_error("live") is True
+
+
+def test_prep_log_verifier_allows_duplicate_skip(tmp_path):
+    verifier = _load_script_module(
+        "verify_prep_log",
+        Path(__file__).resolve().parents[1] / "scripts" / "verify_prep_log.py",
+    )
+    log_path = tmp_path / "prep.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[PREP][TRIGGER] event=schedule actor=tester run_id=123 attempt=1",
+                "[PREP][START_META] now_kst=2026-04-17 08:00:00 KST ref=nullim sha=deadbeef",
+                "[PREP][DUPLICATE_GUARD][SKIP] as_of=2026-04-17 reason=canonical_prep_already_ready",
+                "[RUN_SUMMARY][RESULT] status=SKIP_DUPLICATE_PREP reason=canonical_prep_already_ready event=schedule",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    results = verifier.parse_log_file(log_path)
+
+    assert results.run_summary_status == "SKIP_DUPLICATE_PREP"
+    assert results.run_summary_reason == "canonical_prep_already_ready"
+    assert results.has_critical_failure() is False
+
+
+def test_config_defaults_include_target_new_positions():
+    from trader.config import PB1_TARGET_NEW_POSITIONS
+
+    assert PB1_TARGET_NEW_POSITIONS == 4
 
 
 def test_base_migration_uses_timestamptz_for_runs_columns():

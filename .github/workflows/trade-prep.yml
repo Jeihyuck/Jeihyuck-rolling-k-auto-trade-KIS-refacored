@@ -15,7 +15,7 @@ name: Trade Prep
           - practice
 
 concurrency:
-  group: pb1-practice-serial
+  group: trade-prep-practice-${{ github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -73,6 +73,17 @@ jobs:
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
           echo "[CHECKOUT][OK] repo path ready"
 
+      - name: Initialize PREP trigger log
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          now_kst="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S %Z')"
+          {
+            echo "[PREP][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[PREP][START_META] now_kst=${now_kst} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
+          } | tee repo/artifacts/prep.log
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -103,6 +114,15 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
+      - name: Check canonical PREP duplicate guard
+        id: duplicate_guard
+        working-directory: repo
+        env:
+          ALLOW_DUPLICATE_PREP: "0"
+        run: |
+          set -euo pipefail
+          python scripts/check_prep_duplicate_guard.py 2>&1 | tee -a artifacts/prep.log
+
       - name: Verify KIS env contract
         working-directory: repo
         run: |
@@ -127,13 +147,14 @@ jobs:
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Run PREP
+        if: steps.duplicate_guard.outputs.should_skip != '1'
         working-directory: repo
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          python -m trader.prep_runner 2>&1 | tee artifacts/prep.log
+          python -m trader.prep_runner 2>&1 | tee -a artifacts/prep.log
 
       - name: Verify exact scored final30 in DB
+        if: steps.duplicate_guard.outputs.should_skip != '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -164,6 +185,7 @@ jobs:
           python scripts/verify_prep_log.py artifacts/prep.log
 
       - name: Verify PREP quality contract
+        if: steps.duplicate_guard.outputs.should_skip != '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -173,6 +195,7 @@ jobs:
           echo "prep_manifest_path=${latest_manifest}" | tee -a artifacts/prep-summary.txt
 
       - name: Verify PREP canonical verdict
+        if: steps.duplicate_guard.outputs.should_skip != '1'
         working-directory: repo
         run: |
           set -euo pipefail

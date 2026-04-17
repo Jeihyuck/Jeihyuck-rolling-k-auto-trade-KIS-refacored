@@ -66,6 +66,11 @@ on:
         required: false
         default: "1"
         type: string
+      ALLOW_DUPLICATE_PREP:
+        description: Allow manual prep rerun even when canonical prep is already ready
+        required: false
+        default: "0"
+        type: string
       ALLOW_KIS_DATA_HTTP_IN_DIAG:
         description: Allow token, balance, and quote HTTP in DIAG manual route
         required: false
@@ -73,7 +78,7 @@ on:
         type: string
 
 concurrency:
-  group: pb1-practice-serial
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'prep' && format('unified-manual-practice-prep-debug-{0}', github.ref_name) || format('unified-manual-practice-{0}', github.ref_name) }}
   cancel-in-progress: false
 
 permissions:
@@ -227,6 +232,7 @@ jobs:
       TRADE_REQUIRE_PREP_FINAL30_SCORED: ${{ github.event_name == 'workflow_dispatch' && inputs.TRADE_REQUIRE_PREP_FINAL30_SCORED || '1' }}
       ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ needs.resolve.outputs.allow_kis_data_http_in_diag }}
       PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN: ${{ needs.resolve.outputs.allow_after_close_entry_dryrun }}
+      ALLOW_DUPLICATE_PREP: ${{ github.event_name == 'workflow_dispatch' && inputs.ALLOW_DUPLICATE_PREP || '0' }}
       DB_LOCK_TIMEOUT_MS: "5000"
       DB_STATEMENT_TIMEOUT_MS: "15000"
       DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
@@ -278,6 +284,25 @@ jobs:
           set -euo pipefail
           python -m trader.db.migrate
 
+      - name: Initialize manual PREP trigger log
+        if: ${{ inputs.mode == 'prep' }}
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          now_kst="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S %Z')"
+          {
+            echo "[PREP][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[PREP][START_META] now_kst=${now_kst} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
+          } | tee repo/artifacts/unified-manual.log
+
+      - name: Check manual PREP duplicate guard
+        if: ${{ inputs.mode == 'prep' }}
+        id: prep_duplicate_guard
+        run: |
+          set -euo pipefail
+          python scripts/check_prep_duplicate_guard.py 2>&1 | tee -a artifacts/unified-manual.log
+
       - name: Dump runtime env
         run: |
           set -euo pipefail
@@ -325,7 +350,9 @@ jobs:
           mkdir -p artifacts
           case "$MANUAL_MODE" in
             prep)
-              python -m trader.prep_runner 2>&1 | tee artifacts/unified-manual.log
+              if [[ "${{ steps.prep_duplicate_guard.outputs.should_skip || '0' }}" != "1" ]]; then
+                python -m trader.prep_runner 2>&1 | tee -a artifacts/unified-manual.log
+              fi
               python scripts/verify_prep_log.py artifacts/unified-manual.log
               ;;
             trade)

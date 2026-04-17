@@ -72,13 +72,27 @@ class VerifyResults:
     canonical_trade_can_proceed: int = 0
     canonical_flow_failed_ratio: float = 0.0
     canonical_flow_fail_reason_counts: dict[str, int] = field(default_factory=dict)
+    trigger_meta_present: bool = False
+    start_meta_present: bool = False
+    duplicate_skip_present: bool = False
+    run_summary_status: str = ""
+    run_summary_reason: str = ""
     failures: list[str] = field(default_factory=list)
 
     def has_critical_failure(self) -> bool:
+        if self.duplicate_skip_present or self.run_summary_status == "SKIP_DUPLICATE_PREP":
+            return not (
+                self.trigger_meta_present
+                and self.start_meta_present
+                and self.run_summary_status == "SKIP_DUPLICATE_PREP"
+                and self.run_summary_reason == "canonical_prep_already_ready"
+            )
         unrecovered_contracts = len(self.contract_failures) > 0 and len(self.contract_recoveries) == 0
         prep_done_evidence = self.prep_done or self.prep_done_log or self.prep_done_db
         return bool(
-            not prep_done_evidence
+            not self.trigger_meta_present
+            or not self.start_meta_present
+            or not prep_done_evidence
             or not self.derived_verify_ok
             or self.derived_verify_fail
             or not self.final30_contract_ok
@@ -322,6 +336,14 @@ def parse_log_file(log_path: Path) -> VerifyResults:
     log_content = log_path.read_text(encoding="utf-8", errors="replace")
     results.detected_as_of = _extract_as_of(log_content)
     results.detected_env = _extract_env(log_content)
+    results.trigger_meta_present = bool(re.search(r"\[PREP\]\[TRIGGER\]", log_content))
+    results.start_meta_present = bool(re.search(r"\[PREP\]\[START_META\]", log_content))
+    results.duplicate_skip_present = bool(re.search(r"\[PREP\]\[DUPLICATE_GUARD\]\[SKIP\]", log_content))
+
+    run_summary_match = re.search(r"\[RUN_SUMMARY\]\[RESULT\] status=([A-Z_]+) reason=([^\s]+)", log_content)
+    if run_summary_match:
+        results.run_summary_status = str(run_summary_match.group(1) or "").strip()
+        results.run_summary_reason = str(run_summary_match.group(2) or "").strip()
 
     if re.search(r"event_type=PREP_DONE", log_content):
         results.prep_done = True
@@ -475,6 +497,26 @@ def print_verification_results(results: VerifyResults) -> None:
         print(f"PASS PREP_DONE found (db_count={results.prep_done_count})")
     else:
         print("FAIL PREP_DONE missing")
+
+    if results.trigger_meta_present:
+        print("PASS PREP trigger metadata found")
+    else:
+        print("FAIL PREP trigger metadata missing")
+
+    if results.start_meta_present:
+        print("PASS PREP start metadata found")
+    else:
+        print("FAIL PREP start metadata missing")
+
+    if results.run_summary_status:
+        print(f"PASS PREP run summary status={results.run_summary_status} reason={results.run_summary_reason or 'none'}")
+    else:
+        print("FAIL PREP run summary missing")
+
+    if results.duplicate_skip_present:
+        print("PASS duplicate PREP skip detected")
+        print("=" * 50)
+        return
 
     if results.prep_done_log:
         print("PASS [PREP][DONE] or [PREP][DONE_CORE][DONE] found")

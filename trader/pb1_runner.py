@@ -3882,17 +3882,23 @@ def run_once(
             summary_session = str(os.getenv("PB1_SESSION_KIND") or window_label or phase_for_log or "unknown")
             summary_event = str(os.getenv("GITHUB_EVENT_NAME") or "unknown")
             if not trading_day and (compute_only_full_run or dry_run or bool(compute_only_flags.get("force_block_live"))):
-                result.status = "OK_NONTRADING_COMPUTE"
+                result.status = "OK"
                 result_reason = "WINDOW_BLOCKED_COMPUTE_ONLY"
             elif market_window == "after" and compute_only_full_run:
-                result.status = "OK_WINDOW_BLOCKED_COMPUTE"
+                result.status = "OK"
                 result_reason = "WINDOW_BLOCKED_COMPUTE_ONLY"
+            elif result.status in {"SKIP", "SKIPPED"}:
+                result.status = "SKIP_PHASE_WINDOW"
+                result_reason = result.notes or "PHASE_WINDOW_BLOCKED"
             elif result.status in {"OK_NO_TRADE", "NO_TRADE"} and result.notes and "no_candidates" in result.notes:
                 result.status = "OK_NO_TRADE"
                 result_reason = "NO_ORDERABLE_CANDIDATES"
             elif result.status in {"OK_NO_TRADE", "NO_TRADE"}:
                 result.status = "OK_NO_TRADE"
                 result_reason = result.notes or "NO_ORDER_INTENTS"
+            if runs_ledger_fail_open and result.status not in {"FATAL_RUNTIME", "SKIP_PHASE_WINDOW"}:
+                result.status = "WARN_FAIL_OPEN"
+                result_reason = "runs_ledger_fail_open"
             logger.info(
                 "[RUN_SUMMARY][RESULT] status=%s reason=%s session=%s event=%s",
                 result.status,
@@ -4195,6 +4201,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     )
     runs_repo = RunsRepo(engine)
     session_guard_run_id: str | None = None
+    runs_ledger_fail_open = False
     if session_kind == "am":
         session_guard_strategy = "pb1_am_session_guard"
         try:
@@ -4212,12 +4219,18 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         except Exception as exc:
             logger.exception("[PB1][SESSION_GUARD][FAIL] continuing_without_existing_session_check err=%s", exc)
             if _fail_open_on_runs_ledger_error(ctx.env):
+                runs_ledger_fail_open = True
                 logger.warning(
                     "[PB1][SESSION_GUARD][FAIL_OPEN] env=%s strategy=%s run_window=%s phase=%s",
                     ctx.env,
                     session_guard_strategy,
                     "morning",
                     "entry",
+                )
+                logger.warning(
+                    "[RUN_SUMMARY][WARN] reason=runs_ledger_fail_open session=%s event=%s",
+                    session_kind,
+                    str(os.getenv("GITHUB_EVENT_NAME") or "unknown"),
                 )
                 existing_session = None
             else:

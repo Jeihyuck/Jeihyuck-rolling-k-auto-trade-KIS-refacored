@@ -37,7 +37,7 @@ CONFIG = {
     "DEFAULT_PROFIT_PCT": "3.0",
     "DEFAULT_LOSS_PCT": "-5.0",
     "DAILY_CAPITAL": "250000000",
-    "CAP_CAP": "0.8",
+    "CAP_CAP": "0.90",
     "SLIPPAGE_LIMIT_PCT": "0.25",
     "SLIPPAGE_ENTER_GUARD_PCT": "2.5",
     "VWAP_TOL": "0.003",  # 🔸 VWAP 허용 오차(기본 0.3%)
@@ -234,8 +234,9 @@ CONFIG = {
     "PB1_EMERGENCY_DIAG_ONLY": "1",
     "PB1_SPREAD_HARD_MAX_PCT": "0",
     "PB1_GAP_HARD_MAX_PCT": "0",
-    "PB1_ENTRY_BUDGET_PCT_PER_TICK": "0.25",
-    "PB1_MAX_POS_PCT": "0.20",
+    "PB1_ENTRY_BUDGET_PCT_PER_TICK": "0.60",
+    "PB1_MAX_POS_PCT": "0.35",
+    "PB1_TARGET_NEW_POSITIONS": "4",
     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
     "PB1_MAX_ATR_PCT": "8.0",           # ATR% 상한 (과변동 종목 제외)
     "PB1_ATR_PCT_MAX": "8.0",
@@ -941,6 +942,7 @@ REENTRY_COOLDOWN_DAYS = int(_cfg("REENTRY_COOLDOWN_DAYS") or "10")
 
 
 PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
+PB1_TARGET_NEW_POSITIONS = max(1, int(_cfg("PB1_TARGET_NEW_POSITIONS") or "4"))
 PB1_MIN_SCORE_BASE = float(_cfg("PB1_MIN_SCORE_BASE") or "70")
 PB1_MIN_SCORE_FLOOR = float(_cfg("PB1_MIN_SCORE_FLOOR") or "55")
 PB1_MIN_SCORE_STEP = float(_cfg("PB1_MIN_SCORE_STEP") or "5")
@@ -973,8 +975,8 @@ PB1_MIN_CANDIDATES = int(_cfg("PB1_MIN_CANDIDATES") or "3")
 PB1_RELAX_MAX_PASSES = int(_cfg("PB1_RELAX_MAX_PASSES") or "3")
 PB1_SPREAD_HARD_MAX_PCT = float(_cfg("PB1_SPREAD_HARD_MAX_PCT") or "0")
 PB1_GAP_HARD_MAX_PCT = float(_cfg("PB1_GAP_HARD_MAX_PCT") or "0")
-PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.25")
-PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.20")
+PB1_ENTRY_BUDGET_PCT_PER_TICK = float(_cfg("PB1_ENTRY_BUDGET_PCT_PER_TICK") or "0.60")
+PB1_MAX_POS_PCT = float(_cfg("PB1_MAX_POS_PCT") or "0.35")
 PB1_USE_RISK_PARITY = _cfg_bool("PB1_USE_RISK_PARITY", fallback=True)
 ATR_MAX_PCT, ATR_MAX_PCT_SOURCE, ATR_MAX_PCT_RAW = _resolve_atr_max_pct(
     "ATR_MAX_PCT",
