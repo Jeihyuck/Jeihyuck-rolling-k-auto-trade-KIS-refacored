@@ -30,7 +30,7 @@ env:
   PB1_TICK_HARD_TIMEOUT_SEC: "45"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
   PB1_POST_CAPITAL_TIMEOUT_SEC: "20"
-  PB1_EXIT_PASS_TIMEOUT_SEC: "30"
+  PB1_EXIT_PASS_TIMEOUT_SEC: "120"
   STRATEGY_MODE: "LIVE"
   STRATEGY_ENV: practice
   KIS_ENV: practice
@@ -202,13 +202,22 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python -m trader.db.migrate
+          echo "[STEP][START] name=db_migrate session=pm" | tee -a artifacts/trade-pm.log
+          if python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-pm.log; then
+            echo "[STEP][OK] name=db_migrate session=pm" | tee -a artifacts/trade-pm.log
+          else
+            echo "[STEP][FAIL] name=db_migrate session=pm" | tee -a artifacts/trade-pm.log
+            exit 1
+          fi
 
       - name: Verify KIS env contract
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
+          trap 'echo "[STEP][FAIL] name=verify_kis_env_contract session=pm" | tee -a artifacts/trade-pm.log' ERR
+
+          echo "[STEP][START] name=verify_kis_env_contract session=pm" | tee -a artifacts/trade-pm.log
 
           echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
           echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
@@ -227,17 +236,22 @@ jobs:
           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
 
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
+          trap - ERR
+          echo "[STEP][OK] name=verify_kis_env_contract session=pm" | tee -a artifacts/trade-pm.log
 
       - name: Verify candidate pool exists in DB
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "[STEP][START] name=verify_candidate_pool session=pm" | tee -a artifacts/trade-pm.log
           echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][START]"
           if python -m trader.verify_candidate_pool; then
             echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][OK]"
+            echo "[STEP][OK] name=verify_candidate_pool session=pm" | tee -a artifacts/trade-pm.log
           else
             echo "[TRADE_PM][PRECHECK][CANDIDATE_POOL][FAIL] reason=verify_candidate_pool_failed"
+            echo "[STEP][FAIL] name=verify_candidate_pool session=pm" | tee -a artifacts/trade-pm.log
             exit 1
           fi
 
@@ -246,6 +260,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "[STEP][START] name=verify_final30_readiness session=pm" | tee -a artifacts/trade-pm.log
           echo "[TRADE_PM][PRECHECK][FINAL30][START]"
           if python - <<'PY'
           import os
@@ -266,9 +281,10 @@ jobs:
           print(f"[TRADE_PM][PRECHECK][FINAL30][OK] rows={len(df)} as_of={ctx['as_of']}")
           PY
           then
-            :
+            echo "[STEP][OK] name=verify_final30_readiness session=pm" | tee -a artifacts/trade-pm.log
           else
             echo "[TRADE_PM][PRECHECK][FINAL30][FAIL] reason=missing_db_exact_scored_final30"
+            echo "[STEP][FAIL] name=verify_final30_readiness session=pm" | tee -a artifacts/trade-pm.log
             exit 1
           fi
 
@@ -292,10 +308,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          echo "[STEP][START] name=run_pm_trade_tick session=pm" | tee -a artifacts/trade-pm.log
           echo "[TRADE_PM][WINDOW] target=13:00-15:10 KST loop_minutes=${PB1_RUN_LOOP_MINUTES} interval_sec=${PB1_LOOP_INTERVAL_SEC}"
           echo "[TRADE_PM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
           echo "[PHASE][START] phase=pm" | tee artifacts/trade-pm.log
-          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-pm.log
+          if python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-pm.log; then
+            echo "[STEP][OK] name=run_pm_trade_tick session=pm" | tee -a artifacts/trade-pm.log
+          else
+            echo "[STEP][FAIL] name=run_pm_trade_tick session=pm" | tee -a artifacts/trade-pm.log
+            exit 1
+          fi
           echo "[PHASE][END] phase=pm" | tee -a artifacts/trade-pm.log
 
       - name: Verify PM trade tick logs
@@ -303,6 +325,8 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
+          trap 'echo "[STEP][FAIL] name=verify_pm_logs session=pm" | tee -a artifacts/trade-pm.log' ERR
+          echo "[STEP][START] name=verify_pm_logs session=pm" | tee -a artifacts/trade-pm.log
           missing=0
           for pattern in "\[TRADE_PM\]\[TRIGGER\]" "\[TRADE_PM\]\[START_META\]" "\[TRADE_PM\]\[PHASE_GUARD\]"; do
             if ! grep -E "$pattern" artifacts/trade-pm.log >/dev/null; then
@@ -324,10 +348,14 @@ jobs:
             echo "::error::runs.started_at text/timestamptz schema mismatch still present"
             exit 1
           fi
-          if [[ "$result_status" == "FATAL_RUNTIME" ]]; then
-            echo "::error::PM fatal runtime recorded"
-            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FATAL_RUNTIME|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-pm.log || true
+          if [[ "$result_status" == "FATAL_RUNTIME" || "$result_status" == "FATAL_POSTPROCESS" ]]; then
+            echo "::error::PM fatal runtime/postprocess recorded"
+            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-pm.log || true
             exit 1
+          fi
+          if ! grep -E "\[PB1\]\[RUN_ONCE\]\[FAIL_OPEN_FLAG\]" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::missing [PB1][RUN_ONCE][FAIL_OPEN_FLAG]"
+            missing=1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=pm" artifacts/trade-pm.log >/dev/null; then
             echo "::error::missing [PB1][LOOP][SESSION] kind=pm"
@@ -351,8 +379,15 @@ jobs:
             echo "::error::PM tick appears stuck before terminal tick result"
             missing=1
           fi
-          if grep -E "\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_holdings_prep|\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_pass" artifacts/trade-pm.log >/dev/null; then
-            echo "::error::PM hang detected in post-capital stage"
+          if grep -E "\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_pass" artifacts/trade-pm.log >/dev/null; then
+            echo "::notice::PM exit pass timeout observed"
+            if ! grep -E "\[PB1\]\[POST_CAPITAL\]\[EXIT_PASS\]\[(TIMEOUT|DEGRADED)\]" artifacts/trade-pm.log >/dev/null; then
+              echo "::error::exit pass timeout missing degraded diagnostics"
+              missing=1
+            fi
+          fi
+          if grep -E "\[PB1\]\[STAGE_TIMEOUT\] stage=post_capital\.exit_holdings_prep" artifacts/trade-pm.log >/dev/null; then
+            echo "::error::PM hang detected in exit_holdings_prep"
             missing=1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-pm.log >/dev/null; then
@@ -360,6 +395,8 @@ jobs:
             missing=1
           fi
           test "$missing" -eq 0
+          trap - ERR
+          echo "[STEP][OK] name=verify_pm_logs session=pm" | tee -a artifacts/trade-pm.log
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'

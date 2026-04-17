@@ -263,6 +263,55 @@ def test_trade_prep_not_done_emits_run_summary(monkeypatch, caplog) -> None:
     assert "[RUN_SUMMARY][RESULT] status=SKIP_PRECHECK reason=PREP_NOT_DONE session=am event=schedule" in caplog.text
 
 
+def test_close_manual_replay_late_start_runs_single_pass(monkeypatch, caplog) -> None:
+    now = datetime(2024, 1, 2, 15, 54, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    class DummyLockConn:
+        def close(self):
+            return None
+
+    class DummyEngine:
+        url = "postgresql+psycopg://localhost/postgres"
+
+        def connect(self):
+            return DummyLockConn()
+
+    calls = {"run_once": 0}
+
+    def fake_run_once(**kwargs):
+        calls["run_once"] += 1
+        assert kwargs["loop_mode"] is False
+        return [], True, {}, "exit", "OK_MANUAL_REPLAY"
+
+    monkeypatch.setattr(pb1_runner, "now_kst", lambda: now)
+    monkeypatch.setattr(pb1_runner, "parse_args", lambda: SimpleNamespace(window="auto", phase="exit", target_branch="bot-state", env="practice"))
+    monkeypatch.setattr(pb1_runner, "assert_db_ready", lambda: None)
+    monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: DummyEngine())
+    monkeypatch.setattr(pb1_runner, "try_acquire_lock", lambda *_, **__: True)
+    monkeypatch.setattr(pb1_runner, "release_advisory_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pb1_runner, "_ensure_bootstrap_migrations", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pb1_runner, "_write_change_flag", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(pb1_runner, "run_once", fake_run_once)
+    monkeypatch.setattr(pb1_runner, "_run_loop", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("manual replay should not enter loop")))
+    monkeypatch.setenv("MODE", "noop")
+    monkeypatch.setenv("PB1_SESSION_KIND", "close")
+    monkeypatch.setenv("PB1_LOOP_ENABLED", "1")
+    monkeypatch.setenv("FORCE_MARKET_WINDOW", "close")
+    monkeypatch.setenv("FORCE_PB1_PHASE", "exit")
+    monkeypatch.setenv("STRATEGY_MODE", "LIVE")
+    monkeypatch.setenv("FORCE_STRATEGY_MODE", "LIVE")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("CLOSE_MANUAL_MODE", "diag_replay")
+
+    with caplog.at_level(logging.INFO, logger="trader.pb1_runner"):
+        exit_code = pb1_runner.main()
+
+    assert exit_code == 0
+    assert calls["run_once"] == 1
+    assert "[TRADE_CLOSE][MANUAL_REPLAY] mode=diag_replay" in caplog.text
+    assert "[TRADE_CLOSE][MANUAL_REPLAY][DONE] mode=diag_replay status=OK_MANUAL_REPLAY phase=exit" in caplog.text
+
+
 def test_decide_action_smoke_after_close():
     now = datetime(2024, 1, 2, 16, 5, tzinfo=ZoneInfo("Asia/Seoul"))
     open_dt, close_dt = pb1_runner._market_session(now)

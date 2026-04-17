@@ -1393,6 +1393,16 @@ class PB1Engine:
         except Exception:
             return float(default)
 
+    def _exit_pass_timeout_sec(self) -> float:
+        default = 120.0 if str(self.env or "").strip().lower() == "practice" else 90.0
+        return self._stage_timeout_sec("PB1_EXIT_PASS_TIMEOUT_SEC", default)
+
+    def _exit_pass_timeout_fail_open_enabled(self) -> bool:
+        raw = os.getenv("PB1_EXIT_PASS_TIMEOUT_FAIL_OPEN")
+        if raw is not None:
+            return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+        return str(self.env or "").strip().lower() == "practice"
+
     def _consume_order_lookup_fail_open(self, op_name: str) -> bool:
         consume = getattr(self.orders_repo, "consume_fail_open_marker", None)
         if callable(consume):
@@ -8037,6 +8047,13 @@ class PB1Engine:
         pos_list = [holding.to_position_dict() for holding in holdings_exit_scope]
         exit_evaluations: list[dict[str, Any]] = []
         for pos in pos_list:
+            display_code = self._display_code(pos.get("code"))
+            logger.info(
+                "[PB1][POST_CAPITAL][EXIT_PASS][HOLDING] code=%s step=start qty=%s holding_days=%s",
+                display_code,
+                int(pos.get("qty") or 0),
+                int(pos.get("holding_days") or 0),
+            )
             if int(pos.get("holding_days") or 0) <= 0:
                 df = pd.DataFrame()
                 meta = {"source": "same_day_holdings_skip"}
@@ -8056,6 +8073,14 @@ class PB1Engine:
             evaluation = self._plan_exit_event(pos, features, df, "close" if self.window_internal == "close" else "manage")
             if isinstance(evaluation, dict):
                 exit_evaluations.append(evaluation)
+                logger.info(
+                    "[PB1][POST_CAPITAL][EXIT_PASS][HOLDING_DONE] code=%s exit_ok=%s orderable_qty=%s submitted=%s primary_reason=%s",
+                    display_code,
+                    int(bool(evaluation.get("exit_ok"))),
+                    int(evaluation.get("orderable_qty") or 0),
+                    int(evaluation.get("submitted") or 0),
+                    evaluation.get("primary_reason") or "none",
+                )
 
         holdings_count = len(holdings_exit_scope)
         checked_count = len(exit_evaluations)
@@ -9754,6 +9779,9 @@ class PB1Engine:
         exit_pass_ok = True
         exit_pass_sells = 0
         exit_pass_skipped = 0
+        exit_pass_timeout_sec = self._exit_pass_timeout_sec()
+        exit_pass_fail_open = self._exit_pass_timeout_fail_open_enabled()
+        exit_pass_started = time.perf_counter()
         logger.info(
             "[PASS][EXIT][START] phase=%s existing_positions=%s holdings_source=%s",
             self.phase,
@@ -9762,16 +9790,49 @@ class PB1Engine:
         )
         try:
             logger.info("[PB1][POST_CAPITAL][EXIT_PASS_ENTER]")
+            logger.info(
+                "[PB1][POST_CAPITAL][EXIT_PASS][START] holdings=%s timeout_sec=%.2f env=%s",
+                len(holdings_for_exit or []),
+                exit_pass_timeout_sec,
+                self.env,
+            )
             with self._stage_timer_with_timeout(
                 "post_capital.exit_pass",
-                self._stage_timeout_sec("PB1_EXIT_PASS_TIMEOUT_SEC", 60.0),
+                exit_pass_timeout_sec,
             ):
                 positions_for_exit = self._run_exit_always(holdings_for_exit=holdings_for_exit, marks_fallback=marks_fallback)
             logger.info("[PB1][POST_CAPITAL][EXIT_PASS_DONE] evals=%s", len(getattr(self, "_exit_evaluations", []) or []))
             exit_pass_sells = len([p for p in positions_for_exit if float(p.get("qty", 0)) == 0])
+            logger.info(
+                "[PB1][POST_CAPITAL][EXIT_PASS][DONE] sells=%s skipped=%s evals=%s elapsed=%.2f",
+                exit_pass_sells,
+                exit_pass_skipped,
+                len(getattr(self, "_exit_evaluations", []) or []),
+                time.perf_counter() - exit_pass_started,
+            )
             logger.info("[PASS][EXIT][END] sells=%s skipped_dup=%s", exit_pass_sells, exit_pass_skipped)
-        except PB1StageTimeout:
-            raise
+        except PB1StageTimeout as exit_timeout:
+            exit_pass_ok = False
+            elapsed = time.perf_counter() - exit_pass_started
+            logger.error(
+                "[PB1][POST_CAPITAL][EXIT_PASS][TIMEOUT] env=%s elapsed=%.2f max_sec=%.2f holdings=%s fail_open=%s reason=%s",
+                self.env,
+                elapsed,
+                exit_pass_timeout_sec,
+                len(holdings_for_exit or []),
+                int(bool(exit_pass_fail_open)),
+                exit_timeout,
+            )
+            if exit_pass_fail_open:
+                final_status = "WARN_FAIL_OPEN"
+                final_notes = "EXIT_PASS_TIMEOUT_DEGRADED"
+                logger.warning(
+                    "[PB1][POST_CAPITAL][EXIT_PASS][DEGRADED] env=%s action=continue phase=%s",
+                    self.env,
+                    self.phase,
+                )
+            else:
+                raise
         except Exception as exit_exc:
             exit_pass_ok = False
             logger.exception("[PASS][EXIT][FAIL] err=%s -> continue to ENTRY", exit_exc)

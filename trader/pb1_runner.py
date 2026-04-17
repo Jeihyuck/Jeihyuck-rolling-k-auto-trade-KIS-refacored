@@ -502,6 +502,52 @@ def _forced_close_live_execution_enabled() -> bool:
     )
 
 
+def _resolve_close_manual_mode() -> str:
+    raw_mode = str(os.getenv("CLOSE_MANUAL_MODE") or "live_close").strip().lower()
+    if raw_mode in {"live_close", "diag_replay", "compute_only"}:
+        return raw_mode
+    logger.warning("[TRADE_CLOSE][MANUAL_MODE][INVALID] raw=%s fallback=live_close", raw_mode)
+    return "live_close"
+
+
+def _is_close_manual_replay_requested() -> bool:
+    return bool(
+        _resolve_session_kind() == "close"
+        and str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() == "workflow_dispatch"
+        and _resolve_close_manual_mode() in {"diag_replay", "compute_only"}
+    )
+
+
+def _is_close_manual_replay_active() -> bool:
+    return os.getenv("PB1_CLOSE_MANUAL_REPLAY_ACTIVE", "0") == "1"
+
+
+def _activate_close_manual_replay_env() -> str | None:
+    if not _is_close_manual_replay_requested():
+        return None
+    mode = _resolve_close_manual_mode()
+    os.environ["PB1_CLOSE_MANUAL_REPLAY_ACTIVE"] = "1"
+    os.environ["PB1_CLOSE_MANUAL_REPLAY_MODE"] = mode
+    os.environ["PB1_ENTRY_ENABLED"] = "0"
+    os.environ["FORCE_MARKET_WINDOW"] = "close"
+    os.environ["FORCE_PB1_PHASE"] = "exit"
+    os.environ["FORCE_BLOCK_LIVE"] = "1"
+    os.environ["DISABLE_LIVE_TRADING"] = "1"
+    os.environ["LIVE_TRADING_ENABLED"] = "0"
+    os.environ["STRATEGY_MODE"] = "DIAG"
+    os.environ["FORCE_STRATEGY_MODE"] = "DIAG"
+    if mode == "compute_only":
+        os.environ["DRY_RUN"] = "1"
+    logger.info(
+        "[TRADE_CLOSE][MANUAL_REPLAY][ARM] mode=%s dry_run=%s force_block_live=%s disable_live=%s",
+        mode,
+        os.getenv("DRY_RUN"),
+        os.getenv("FORCE_BLOCK_LIVE"),
+        os.getenv("DISABLE_LIVE_TRADING"),
+    )
+    return mode
+
+
 def _pm_should_handoff_to_close(now: datetime) -> bool:
     forced_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
     forced_phase = (os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
@@ -2697,6 +2743,7 @@ def run_once(
     window: WindowDecision | None = None,
     runtime_dir: Path | None = None,
     max_seconds: int = 0,
+    runs_ledger_fail_open: bool = False,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
     if (os.getenv("MODE") or "").strip().lower() == "trade" and not (os.getenv("PB1_UNIVERSE_STRATEGY") or "").strip():
         os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
@@ -3487,6 +3534,7 @@ def run_once(
     )
     
     # Live Gate 상태 로깅 (시간 기반 자동 정책)
+    postprocess_stage = "engine_run"
     try:
         from trader.config import LIVE_GATE_STATUS
         logger.info(
@@ -4158,6 +4206,13 @@ def run_once(
             if entry_scan_compat_failed:
                 logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
 
+        postprocess_stage = "result_postprocess"
+        logger.info(
+            "[PB1][RUN_ONCE][FAIL_OPEN_FLAG] runs_ledger_fail_open=%s loop_mode=%s",
+            int(bool(runs_ledger_fail_open)),
+            int(bool(loop_mode)),
+        )
+
         if result is not None:
             result_reason = result.notes or "none"
             summary_session = str(os.getenv("PB1_SESSION_KIND") or window_label or phase_for_log or "unknown")
@@ -4180,6 +4235,10 @@ def run_once(
             if runs_ledger_fail_open and result.status not in {"FATAL_RUNTIME", "SKIP_PHASE_WINDOW"}:
                 result.status = "WARN_FAIL_OPEN"
                 result_reason = "runs_ledger_fail_open"
+            if _is_close_manual_replay_active() and result.status not in {"FATAL_RUNTIME", "FATAL_POSTPROCESS", "SKIP_PHASE_WINDOW"}:
+                replay_reason = f"CLOSE_MANUAL_REPLAY_{_resolve_close_manual_mode().upper()}"
+                result.status = "OK_MANUAL_REPLAY"
+                result_reason = replay_reason if result_reason in {"", "none"} else f"{replay_reason}:{result_reason}"
             logger.info(
                 "[RUN_SUMMARY][RESULT] status=%s reason=%s session=%s event=%s",
                 result.status,
@@ -4305,11 +4364,12 @@ def run_once(
         touched_files = engine_runner.get_touched_files() if engine_runner and hasattr(engine_runner, "get_touched_files") else []
     except Exception as exc:
         logger.exception(
-            "[PB1][FATAL_GUARD] unexpected error strategy_env=%s kis_env=%s derived_env=%s effective_env=%s",
+            "[PB1][FATAL_GUARD] unexpected error strategy_env=%s kis_env=%s derived_env=%s effective_env=%s postprocess_stage=%s",
             locals().get("env_strategy"),
             locals().get("env_kis"),
             locals().get("env_derived"),
             locals().get("env_effective"),
+            postprocess_stage,
         )
         phase_context = phase_for_log or phase_override_arg or "unknown"
         window_context = window_label or "unknown"
@@ -4322,16 +4382,21 @@ def run_once(
             current_code,
             top_candidates,
         )
+        fatal_status = "FATAL_RUNTIME"
         fatal_reason = "RUNS_LEDGER_QUERY_FAIL" if str(exc) == "RUNS_LEDGER_QUERY_FAIL" else "UNHANDLED_RUNTIME_EXCEPTION"
+        if postprocess_stage != "engine_run":
+            fatal_status = "FATAL_POSTPROCESS"
+            fatal_reason = f"RUN_ONCE_POSTPROCESS_{type(exc).__name__.upper()}"
         logger.error(
-            "[RUN_SUMMARY][RESULT] status=FATAL_RUNTIME reason=%s session=%s event=%s",
+            "[RUN_SUMMARY][RESULT] status=%s reason=%s session=%s event=%s",
+            fatal_status,
             fatal_reason,
             str(os.getenv("PB1_SESSION_KIND") or window_context or phase_context or "unknown"),
             str(os.getenv("GITHUB_EVENT_NAME") or "unknown"),
         )
         logger.error("[PB1][EXIT] reason=fatal_runtime")
         if run_record_id:
-            runs_repo.finish_run(run_record_id, status="FATAL_RUNTIME", notes=fatal_reason)
+            runs_repo.finish_run(run_record_id, status=fatal_status, notes=fatal_reason)
             _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="failed", now=now)
         raise
     finally:
@@ -4665,6 +4730,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         loop_mode=True,
                         window=window,
                         max_seconds=remaining_budget_s,
+                        runs_ledger_fail_open=runs_ledger_fail_open,
                     ),
                 )
                 logger.info(
@@ -5009,6 +5075,8 @@ def main() -> int:
             "[MINERVINI_ONLY] force DIAG + KIS_HTTP_ENABLED=0 + PB1_PHASE_DEFAULT=entry"
         )
     
+    close_manual_mode = _activate_close_manual_replay_env()
+
     # ✅ AUTO 모드 결정 및 환경변수 고정
     mode_env = os.getenv("STRATEGY_MODE", "AUTO")
     resolved_mode = resolve_auto_strategy_mode(mode_env)
@@ -5356,6 +5424,18 @@ def main() -> int:
     if resolved_mode == "DIAG":
         logger.info("[PB1][DIAG] mode=DIAG -> disable loop (run once)")
         run_loop = False
+
+    if close_manual_mode is not None:
+        close_now = now_kst()
+        close_session_end = _resolve_session_end_dt(close_now)
+        run_loop = False
+        logger.info(
+            "[TRADE_CLOSE][MANUAL_REPLAY] mode=%s now_kst=%s session_end=%s order_allowed=0 late_start=%s",
+            close_manual_mode,
+            close_now.isoformat(),
+            close_session_end.isoformat(),
+            int(close_now >= close_session_end),
+        )
     
     if run_loop and not smoke_enabled:
         try:
@@ -5421,6 +5501,13 @@ def main() -> int:
             window=None,
             max_seconds=max_seconds,
         )
+        if _is_close_manual_replay_active():
+            logger.info(
+                "[TRADE_CLOSE][MANUAL_REPLAY][DONE] mode=%s status=%s phase=%s",
+                _resolve_close_manual_mode(),
+                result_status,
+                phase_for_log,
+            )
     except Exception:
         logger.error(
             "[PB1][FATAL_GUARD] unexpected error ctx_env=%s strategy_env=%s kis_env=%s",
