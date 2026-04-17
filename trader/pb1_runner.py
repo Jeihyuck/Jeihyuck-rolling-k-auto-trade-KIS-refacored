@@ -1456,7 +1456,7 @@ def _acquire_session_guard_or_takeover(
                 existing_session,
                 stale_sec=stale_sec,
                 reason=takeover_reason,
-                takeover_from_run_id=workflow_run_id,
+                takeover_from_run_id=None,
                 status=takeover_status,
             )
             logger.warning(

@@ -47,6 +47,13 @@ from trader.utils.ids import assert_uuid
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_run_id_text(value: Any | None) -> str | None:
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    return text_value or None
+
 __all__ = [
     "RunsRepo",
     "UniverseRepo",
@@ -1599,6 +1606,7 @@ class RunsRepo:
         takeover_from_run_id: str | None = None,
         status: str = "SESSION_ABORTED",
     ) -> None:
+        takeover_from_run_id = _normalize_run_id_text(takeover_from_run_id)
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.runs)
@@ -1652,6 +1660,7 @@ class RunsRepo:
         config_json: dict | None = None,
         takeover_from_run_id: str | None = None,
     ) -> str:
+        takeover_from_run_id = _normalize_run_id_text(takeover_from_run_id)
         values = {
             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
             "env": env,
@@ -1738,6 +1747,7 @@ class RunsRepo:
         aborted_reason: str | None = None,
         takeover_from_run_id: str | None = None,
     ) -> None:
+        takeover_from_run_id = _normalize_run_id_text(takeover_from_run_id)
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.runs)

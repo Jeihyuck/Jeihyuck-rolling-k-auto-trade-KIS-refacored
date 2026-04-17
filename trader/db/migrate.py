@@ -176,6 +176,44 @@ def _list_applied_versions(conn: sa.Connection) -> set[str]:
     return {row[0] for row in result}
 
 
+def _read_runs_column_types(engine: Engine) -> dict[str, str | None]:
+    query = text(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'runs'
+          AND column_name IN ('run_id', 'takeover_from_run_id')
+        """
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(query).all()
+    return {str(row.column_name): row.data_type for row in rows}
+
+
+def _log_migration_failure_context(engine: Engine, version: str, exc: Exception) -> None:
+    if version != "0036_runs_session_guard_metadata.sql":
+        return
+    try:
+        column_types = _read_runs_column_types(engine)
+        run_id_type = column_types.get("run_id")
+        takeover_type = column_types.get("takeover_from_run_id")
+        action = "alter_to_text" if run_id_type == "text" and takeover_type == "uuid" else "inspect"
+        logger.error(
+            "[DB][MIGRATE][TYPE_MISMATCH] version=0036 run_id_type=%s takeover_from_run_id_type=%s action=%s err=%s",
+            run_id_type,
+            takeover_type,
+            action,
+            exc,
+        )
+    except Exception as lookup_exc:
+        logger.exception(
+            "[DB][MIGRATE][TYPE_MISMATCH][LOOKUP_FAIL] version=0036 err=%s lookup_err=%s",
+            exc,
+            lookup_exc,
+        )
+
+
 def _apply_pg_statement(conn: sa.Connection, statement: str) -> None:
     cleaned = statement.strip()
     if not cleaned:
@@ -274,6 +312,7 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
                     {"version": version},
                 )
             except Exception as exc:
+                _log_migration_failure_context(engine, version, exc)
                 snippet = " ".join(sql.split())[:2000]
                 logger.exception(
                     "[DB][MIGRATE][FAIL] version=%s err=%s sql_snippet=%s",

@@ -13,8 +13,8 @@ from sqlalchemy import Engine
 
 
 def _uuid_type_for_url(database_url: str) -> sa.types.TypeEngine:
-    # Always use a string/text backing type for UUIDs to avoid casting issues across engines.
-    return sa.String()
+    # Always use a text backing type for IDs to match the migrated Postgres schema.
+    return sa.Text()
 
 
 def uuid_value_for_url(database_url: str, value: Any | None = None) -> Any:
@@ -79,7 +79,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.Column("finished_at", sa.DateTime(timezone=True)),
         sa.Column("aborted_reason", sa.Text),
-        sa.Column("takeover_from_run_id", uuid_type, sa.ForeignKey("runs.run_id")),
+        sa.Column("takeover_from_run_id", sa.Text, sa.ForeignKey("runs.run_id")),
         sa.Column("notes", sa.Text),
     )
 

@@ -221,7 +221,17 @@ def test_acquire_session_guard_allows_manual_takeover_for_stale_session(monkeypa
     assert result["session_guard_run_id"] == "new-guard-run"
     assert repo.finish_calls[0]["reason"] == "manual_session_takeover"
     assert repo.finish_calls[0]["status"] == "SESSION_MANUAL_TAKEOVER"
+    assert repo.finish_calls[0]["takeover_from_run_id"] is None
     assert repo.create_calls[0]["takeover_from_run_id"] == "old-run"
+
+
+def test_migration_0036_keeps_takeover_fk_text_compatible():
+    sql = (Path(__file__).resolve().parents[1] / "migrations" / "0036_runs_session_guard_metadata.sql").read_text(encoding="utf-8")
+
+    assert "ADD COLUMN IF NOT EXISTS takeover_from_run_id TEXT" in sql
+    assert "ADD COLUMN IF NOT EXISTS takeover_from_run_id UUID" not in sql
+    assert "ALTER COLUMN takeover_from_run_id TYPE TEXT" in sql
+    assert "skip FK because type mismatch remains" in sql
 
 
 def test_fail_open_on_runs_ledger_error_defaults_to_practice(monkeypatch):
@@ -280,6 +290,24 @@ def test_base_migration_uses_timestamptz_for_runs_columns():
 
     assert "started_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP" in sql
     assert "finished_at TIMESTAMPTZ" in sql
+
+
+def test_session_guard_schema_uses_text_takeover_column():
+    from trader.db.schema import RUNS
+
+    assert isinstance(RUNS.c.run_id.type, type(RUNS.c.takeover_from_run_id.type))
+    assert str(RUNS.c.takeover_from_run_id.type).lower() == "text"
+
+
+def test_0036_migration_converts_takeover_column_to_text_and_skips_non_text_fk():
+    migration = Path(__file__).resolve().parents[1] / "migrations" / "0036_runs_session_guard_metadata.sql"
+    sql = migration.read_text(encoding="utf-8")
+
+    assert "ADD COLUMN IF NOT EXISTS takeover_from_run_id TEXT" in sql
+    assert "ALTER COLUMN takeover_from_run_id TYPE TEXT" in sql
+    assert "USING takeover_from_run_id::text" in sql
+    assert "skip FK because run_id is not text" in sql
+    assert "[DB][MIGRATE][TYPE_MISMATCH] version=0036" in sql
 
 
 def test_final30_path_contract_is_repo_root_anchored(tmp_path):
