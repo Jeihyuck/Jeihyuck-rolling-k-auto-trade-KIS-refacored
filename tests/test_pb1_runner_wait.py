@@ -1,11 +1,15 @@
 import sys
 import types
+import logging
+import importlib.util
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 
 
 def _install_sa_stub() -> None:
+    if importlib.util.find_spec("sqlalchemy") is not None:
+        return
     if "sqlalchemy" in sys.modules:
         return
     sa = types.ModuleType("sqlalchemy")
@@ -81,6 +85,7 @@ def _install_sa_stub() -> None:
 
     sa_engine = types.ModuleType("sqlalchemy.engine")
     sa_engine.url = types.SimpleNamespace(make_url=lambda url: types.SimpleNamespace(database=url))
+    sa_engine.make_url = sa_engine.url.make_url
     sa_engine.Engine = _DummyEngine
     sys.modules["sqlalchemy.engine"] = sa_engine
     sys.modules["sqlalchemy.engine.url"] = sa_engine.url
@@ -224,6 +229,38 @@ def test_schedule_event_does_not_wait(monkeypatch) -> None:
     monkeypatch.setattr(pb1_runner.time_mod, "sleep", sleep_fail)
 
     pb1_runner.main()
+
+
+def test_trade_prep_not_done_emits_run_summary(monkeypatch, caplog) -> None:
+    now = datetime(2024, 1, 2, 9, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+    dummy_engine = SimpleNamespace(url="postgresql+psycopg://localhost/postgres")
+
+    class DummyLedgerEventsRepo:
+        def __init__(self, _engine):
+            pass
+
+        def prep_done_status(self, env, as_of):
+            assert env == "practice"
+            assert as_of.isoformat() == "2024-01-01"
+            return False, 0
+
+    monkeypatch.setattr(pb1_runner, "now_kst", lambda: now)
+    monkeypatch.setattr(pb1_runner, "parse_args", lambda: SimpleNamespace(window="auto", phase="auto", target_branch="bot-state", env="practice"))
+    monkeypatch.setattr(pb1_runner, "make_engine", lambda *_, **__: dummy_engine)
+    monkeypatch.setattr(pb1_runner, "LedgerEventsRepo", DummyLedgerEventsRepo)
+    monkeypatch.setattr(pb1_runner, "resolve_derived_as_of", lambda _now: datetime(2024, 1, 1, tzinfo=ZoneInfo("Asia/Seoul")).date())
+    monkeypatch.setenv("MODE", "trade")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("PB1_SESSION_KIND", "am")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.delenv("ALLOW_TRADE_WITH_WATCHLIST_ONLY", raising=False)
+
+    with caplog.at_level(logging.INFO, logger="trader.pb1_runner"):
+        exit_code = pb1_runner.main()
+
+    assert exit_code == 0
+    assert "[RUN_SUMMARY][RESULT] status=SKIP_PRECHECK reason=PREP_NOT_DONE session=am event=schedule" in caplog.text
 
 
 def test_decide_action_smoke_after_close():

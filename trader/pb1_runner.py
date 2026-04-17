@@ -4857,6 +4857,16 @@ def _exit_code_for_status(status: str) -> int:
     return 0
 
 
+def _log_main_run_summary(status: str, reason: str) -> None:
+    logger.info(
+        "[RUN_SUMMARY][RESULT] status=%s reason=%s session=%s event=%s",
+        status,
+        reason,
+        str(os.getenv("PB1_SESSION_KIND") or os.getenv("FORCE_MARKET_WINDOW") or "unknown"),
+        str(os.getenv("GITHUB_EVENT_NAME") or "unknown"),
+    )
+
+
 def main() -> int:
     args = parse_args()
     logger.info("[TRADE][BOOT][START]")
@@ -5110,6 +5120,7 @@ def main() -> int:
                     trade_date.isoformat(),
                     prep_done_count,
                 )
+                _log_main_run_summary(status="SKIP_PRECHECK", reason="PREP_NOT_DONE")
                 return 0
         
         # DERIVED 체크도 derived_as_of 기준으로
@@ -5234,6 +5245,7 @@ def main() -> int:
                 scored_contract.get("null_critical"),
                 scored_missing_critical,
             )
+            _log_main_run_summary(status="SKIP_PRECHECK", reason="DB_CONTRACT_INCOMPLETE")
             return 0
         
         # ✅ FALLBACK: 전일 derived 없으면 최근 영업일로 fallback
@@ -5303,6 +5315,7 @@ def main() -> int:
                         DERIVED_FALLBACK_MAX_DAYS,
                         CANDIDATE_POOL_TTL_DAYS,
                     )
+                    _log_main_run_summary(status="SKIP_PRECHECK", reason="DERIVED_MISSING_FALLBACK_FAILED")
                     return 0
             else:
                 logger.warning(
@@ -5311,6 +5324,7 @@ def main() -> int:
                     trade_date.isoformat(),
                     derived_count,
                 )
+                _log_main_run_summary(status="SKIP_PRECHECK", reason="DERIVED_MISSING")
                 return 0
         else:
             # 전일 derived 존재
