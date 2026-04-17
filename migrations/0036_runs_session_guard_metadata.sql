@@ -36,12 +36,12 @@ BEGIN
        AND column_name = 'takeover_from_run_id';
 
     IF takeover_type = 'uuid' THEN
-        RAISE NOTICE '[DB][MIGRATE][TYPE_MISMATCH] version=0036 run_id_type=unknown takeover_from_run_id_type=% action=alter_to_text', takeover_type;
+        RAISE NOTICE '[DB][MIGRATE][TYPE_MISMATCH] version=0036 run_id_type=unknown takeover_from_run_id_type=%% action=alter_to_text', takeover_type;
         ALTER TABLE public.runs
             ALTER COLUMN takeover_from_run_id TYPE TEXT
             USING takeover_from_run_id::text;
     ELSIF takeover_type IS NOT NULL AND takeover_type <> 'text' THEN
-        RAISE NOTICE '[DB][MIGRATE][0036] takeover_from_run_id already exists with non-text type=%; forcing TEXT', takeover_type;
+        RAISE NOTICE '[DB][MIGRATE][0036] takeover_from_run_id already exists with non-text type=%%; forcing TEXT', takeover_type;
         ALTER TABLE public.runs
             ALTER COLUMN takeover_from_run_id TYPE TEXT
             USING takeover_from_run_id::text;
