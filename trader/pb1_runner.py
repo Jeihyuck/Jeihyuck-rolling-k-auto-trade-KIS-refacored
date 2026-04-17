@@ -1273,6 +1273,287 @@ def _resolve_session_end_dt(now: datetime) -> datetime:
     )
 
 
+def _session_guard_spec(session_kind: str) -> dict[str, str] | None:
+    normalized = str(session_kind or "").strip().lower()
+    specs = {
+        "am": {
+            "strategy": "pb1_am_session_guard",
+            "run_window": "morning",
+            "phase": "entry",
+            "log_prefix": "TRADE_AM",
+            "expected_start_window": "0907-0915",
+        },
+        "pm": {
+            "strategy": "pb1_pm_session_guard",
+            "run_window": "day",
+            "phase": "entry",
+            "log_prefix": "TRADE_PM",
+            "expected_start_window": "1305-1315",
+        },
+        "close": {
+            "strategy": "pb1_close_session_guard",
+            "run_window": "close",
+            "phase": "exit",
+            "log_prefix": "TRADE_CLOSE",
+            "expected_start_window": "1515-1524",
+        },
+    }
+    return specs.get(normalized)
+
+
+def _is_manual_session_restart(event_name: str | None, workflow_attempt: int | None) -> bool:
+    normalized_event = str(event_name or "").strip().lower()
+    if normalized_event == "workflow_dispatch":
+        return True
+    return int(workflow_attempt or 0) > 1
+
+
+def _resolve_session_guard_stale_sec(*, event_name: str | None, workflow_attempt: int | None) -> tuple[int, bool]:
+    default_stale_sec = max(1, _parse_int_env("PB1_SESSION_GUARD_STALE_SEC", 600))
+    manual_restart = _is_manual_session_restart(event_name, workflow_attempt)
+    allow_manual_takeover = env_bool("PB1_ALLOW_MANUAL_SESSION_TAKEOVER", default=True)
+    if manual_restart and allow_manual_takeover:
+        manual_stale_sec = max(1, _parse_int_env("PB1_MANUAL_SESSION_GUARD_STALE_SEC", 60))
+        return min(default_stale_sec, manual_stale_sec), True
+    return default_stale_sec, False
+
+
+def _touch_session_guard(
+    *,
+    runs_repo: RunsRepo,
+    session_guard_run_id: str | None,
+    session_kind: str,
+    status: str = "SESSION_GUARD_RUNNING",
+) -> None:
+    if not session_guard_run_id:
+        return
+    now = _get_now_kst()
+    try:
+        runs_repo.touch_run(session_guard_run_id, now=now, status=status)
+        logger.info(
+            "[PB1][SESSION_GUARD][HEARTBEAT] run_id=%s kind=%s now=%s status=%s",
+            session_guard_run_id,
+            session_kind,
+            now.isoformat(),
+            status,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[PB1][SESSION_GUARD][HEARTBEAT_FAIL] run_id=%s kind=%s err=%s",
+            session_guard_run_id,
+            session_kind,
+            exc,
+        )
+
+
+def _acquire_session_guard_or_takeover(
+    *,
+    runs_repo: RunsRepo,
+    env: str,
+    session_kind: str,
+    run_id: str,
+    workflow_run_id: str | None,
+    workflow_attempt: int | None,
+    event_name: str | None,
+    workflow: str | None,
+    git_sha: str | None,
+    strategy_env: str | None,
+    kis_env: str | None,
+    ctx_env: str | None,
+) -> dict[str, Any]:
+    spec = _session_guard_spec(session_kind)
+    if spec is None:
+        return {
+            "blocked": False,
+            "fail_open": False,
+            "session_guard_run_id": None,
+        }
+
+    guard_env = resolve_env(env)
+    log_prefix = str(spec["log_prefix"])
+    strategy = str(spec["strategy"])
+    run_window = str(spec["run_window"])
+    phase = str(spec["phase"])
+    stale_sec, manual_takeover_enabled = _resolve_session_guard_stale_sec(
+        event_name=event_name,
+        workflow_attempt=workflow_attempt,
+    )
+    manual_restart = _is_manual_session_restart(event_name, workflow_attempt)
+
+    logger.info(
+        "[PB1][SESSION_GUARD][ENV] strategy_env=%s kis_env=%s ctx_env=%s guard_env=%s",
+        str(strategy_env or "").strip().lower() or "",
+        str(kis_env or "").strip().lower() or "",
+        str(ctx_env or "").strip().lower() or "",
+        guard_env,
+    )
+    if str(ctx_env or "").strip().lower() != guard_env:
+        logger.warning(
+            "[PB1][SESSION_GUARD][ENV_MISMATCH] strategy_env=%s kis_env=%s ctx_env=%s guard_env=%s",
+            str(strategy_env or "").strip().lower() or "",
+            str(kis_env or "").strip().lower() or "",
+            str(ctx_env or "").strip().lower() or "",
+            guard_env,
+        )
+
+    try:
+        existing_session = runs_repo.find_active_session_today(
+            env=guard_env,
+            strategy=strategy,
+            run_window=run_window,
+            phase=phase,
+        )
+        if existing_session is None and session_kind == "am":
+            existing_session = runs_repo.find_active_session_today(
+                env=guard_env,
+                strategy="pb1_pullback_close",
+                run_window=run_window,
+                phase=phase,
+            )
+    except Exception as exc:
+        logger.exception("[PB1][SESSION_GUARD][FAIL] continuing_without_existing_session_check err=%s", exc)
+        if _fail_open_on_runs_ledger_error(guard_env):
+            logger.warning(
+                "[PB1][SESSION_GUARD][FAIL_OPEN] env=%s strategy=%s run_window=%s phase=%s",
+                guard_env,
+                strategy,
+                run_window,
+                phase,
+            )
+            logger.warning(
+                "[RUN_SUMMARY][WARN] reason=runs_ledger_fail_open session=%s event=%s",
+                session_kind,
+                str(event_name or "unknown"),
+            )
+            existing_session = None
+            fail_open = True
+        else:
+            raise RuntimeError("RUNS_LEDGER_QUERY_FAIL") from exc
+    else:
+        fail_open = False
+
+    takeover_from_run_id: str | None = None
+    if existing_session:
+        existing_run_id = str(existing_session.get("run_id") or "") or None
+        existing_workflow_run_id = str(existing_session.get("workflow_run_id") or "") or None
+        stale = runs_repo.is_session_stale(existing_session, stale_sec=stale_sec)
+        if existing_session.get("finished_at") or RunsRepo._is_terminal_status(existing_session.get("status")):
+            logger.info(
+                "[%s][DUPLICATE_GUARD][FINISHED_IGNORE] old_run_id=%s status=%s",
+                log_prefix,
+                existing_run_id,
+                existing_session.get("status"),
+            )
+        elif stale:
+            takeover_reason = "stale_session_takeover"
+            takeover_status = "SESSION_STALE_TAKEOVER"
+            log_action = "STALE_TAKEOVER"
+            if manual_restart and manual_takeover_enabled and existing_workflow_run_id != workflow_run_id:
+                takeover_reason = "manual_session_takeover"
+                takeover_status = "SESSION_MANUAL_TAKEOVER"
+                log_action = "MANUAL_TAKEOVER"
+            runs_repo.finish_stale_session_if_needed(
+                existing_session,
+                stale_sec=stale_sec,
+                reason=takeover_reason,
+                takeover_from_run_id=workflow_run_id,
+                status=takeover_status,
+            )
+            logger.warning(
+                "[%s][DUPLICATE_GUARD][%s] old_run_id=%s stale_sec=%s new_workflow_run_id=%s event=%s",
+                log_prefix,
+                log_action,
+                existing_run_id,
+                stale_sec,
+                workflow_run_id,
+                str(event_name or "unknown"),
+            )
+            takeover_from_run_id = existing_run_id
+        else:
+            logger.warning(
+                "[%s][DUPLICATE_GUARD][ACTIVE_BLOCK] existing_run_id=%s started_at=%s heartbeat_at=%s workflow_run_id=%s",
+                log_prefix,
+                existing_run_id,
+                existing_session.get("started_at"),
+                existing_session.get("heartbeat_at") or existing_session.get("updated_at"),
+                existing_workflow_run_id,
+            )
+            return {
+                "blocked": True,
+                "fail_open": fail_open,
+                "session_guard_run_id": None,
+            }
+
+    session_guard_run_id = runs_repo.create_session_guard(
+        env=guard_env,
+        strategy=strategy,
+        run_window=run_window,
+        phase=phase,
+        event_name=str(event_name or "").strip().lower() or "schedule",
+        workflow=workflow,
+        workflow_run_id=workflow_run_id,
+        workflow_attempt=workflow_attempt,
+        git_sha=git_sha,
+        takeover_from_run_id=takeover_from_run_id,
+        config_json={
+            "session_kind": session_kind,
+            "run_id": run_id,
+            "expected_start_window": spec["expected_start_window"],
+            "manual_restart": manual_restart,
+            "stale_sec": stale_sec,
+        },
+    )
+    logger.info(
+        "[%s][DUPLICATE_GUARD] session_guard_started=1 run_id=%s session_kind=%s",
+        log_prefix,
+        session_guard_run_id,
+        session_kind,
+    )
+    return {
+        "blocked": False,
+        "fail_open": fail_open,
+        "session_guard_run_id": session_guard_run_id,
+    }
+
+
+def _finish_session_guard(
+    *,
+    runs_repo: RunsRepo,
+    session_guard_run_id: str | None,
+    session_kind: str,
+    exit_reason: str | None,
+    last_phase: str,
+) -> None:
+    if not session_guard_run_id:
+        return
+    spec = _session_guard_spec(session_kind) or {}
+    log_prefix = str(spec.get("log_prefix") or "TRADE")
+    status = f"SESSION_{str(exit_reason or 'UNKNOWN').upper()}"
+    aborted_reason = str(exit_reason or "unknown").strip().lower() or None
+    try:
+        runs_repo.finish_run(
+            session_guard_run_id,
+            status=status,
+            notes=last_phase,
+            aborted_reason=aborted_reason,
+        )
+    except Exception as exc:
+        logger.warning("[%s][DUPLICATE_GUARD][FINISH_FAIL] run_id=%s err=%s", log_prefix, session_guard_run_id, exc)
+        try:
+            runs_repo.mark_run_abandoned(
+                session_guard_run_id,
+                reason=f"finish_fallback:{aborted_reason or 'unknown'}",
+                status=status,
+            )
+        except Exception as fallback_exc:
+            logger.warning(
+                "[%s][DUPLICATE_GUARD][FINISH_FALLBACK_FAIL] run_id=%s err=%s",
+                log_prefix,
+                session_guard_run_id,
+                fallback_exc,
+            )
+
+
 def _resolve_session_exit_grace_sec() -> int:
     try:
         return max(0, int(os.getenv("PB1_SESSION_EXIT_GRACE_SEC", "15")))
@@ -4179,9 +4460,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         os.environ["TRADER_RUN_ID"] = run_id
     
     # Create RunContext for loop mode
-    env = os.getenv("ENV", "live")
+    env = resolve_env(getattr(args, "env", None))
     strategy = os.getenv("STRATEGY", "best_k_meta")
+    workflow_run_id = str(os.getenv("GITHUB_RUN_ID") or "").strip() or None
     gh_run_number = _parse_optional_int_env("GITHUB_RUN_ID") or _parse_optional_int_env("GITHUB_RUN_NUMBER")
+    workflow_attempt = _parse_optional_int_env("GITHUB_RUN_ATTEMPT")
+    event_name = str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() or "schedule"
     git_sha = os.getenv("GITHUB_SHA")
     exec_mode = resolve_mode(os.getenv("STRATEGY_MODE", "DIAG"))
     ctx = RunContext.new(
@@ -4202,69 +4486,30 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     runs_repo = RunsRepo(engine)
     session_guard_run_id: str | None = None
     runs_ledger_fail_open = False
-    if session_kind == "am":
-        session_guard_strategy = "pb1_am_session_guard"
-        try:
-            existing_session = runs_repo.find_started_today(
-                env=ctx.env,
-                strategy=session_guard_strategy,
-                run_window="morning",
-                phase="entry",
-            ) or runs_repo.find_started_today(
-                env=ctx.env,
-                strategy="pb1_pullback_close",
-                run_window="morning",
-                phase="entry",
-            )
-        except Exception as exc:
-            logger.exception("[PB1][SESSION_GUARD][FAIL] continuing_without_existing_session_check err=%s", exc)
-            if _fail_open_on_runs_ledger_error(ctx.env):
-                runs_ledger_fail_open = True
-                logger.warning(
-                    "[PB1][SESSION_GUARD][FAIL_OPEN] env=%s strategy=%s run_window=%s phase=%s",
-                    ctx.env,
-                    session_guard_strategy,
-                    "morning",
-                    "entry",
-                )
-                logger.warning(
-                    "[RUN_SUMMARY][WARN] reason=runs_ledger_fail_open session=%s event=%s",
-                    session_kind,
-                    str(os.getenv("GITHUB_EVENT_NAME") or "unknown"),
-                )
-                existing_session = None
-            else:
-                raise RuntimeError("RUNS_LEDGER_QUERY_FAIL") from exc
-        if existing_session:
-            logger.warning(
-                "[TRADE_AM][DUPLICATE_GUARD] session already started today -> skip existing_run_id=%s started_at=%s status=%s workflow_run_id=%s",
-                existing_session.get("run_id"),
-                existing_session.get("started_at"),
-                existing_session.get("status"),
-                existing_session.get("workflow_run_id"),
-            )
-            return
-        session_guard_run_id = runs_repo.create_session_guard(
-            env=ctx.env,
-            strategy=session_guard_strategy,
-            run_window="morning",
-            phase="entry",
-            event_name=str(os.getenv("GITHUB_EVENT_NAME") or "").strip().lower() or "schedule",
-            workflow=os.getenv("GITHUB_WORKFLOW"),
-            workflow_run_id=str(ctx.gh_run_number) if ctx.gh_run_number else None,
-            workflow_attempt=_parse_optional_int_env("GITHUB_RUN_ATTEMPT"),
-            git_sha=ctx.git_sha,
-            config_json={
-                "session_kind": session_kind,
-                "run_id": run_id,
-                "expected_start_window": "0907-0915",
-            },
-        )
-        logger.info(
-            "[TRADE_AM][DUPLICATE_GUARD] session_guard_started=1 run_id=%s session_kind=%s",
-            session_guard_run_id,
-            session_kind,
-        )
+    guard_result = _acquire_session_guard_or_takeover(
+        runs_repo=runs_repo,
+        env=ctx.env,
+        session_kind=session_kind,
+        run_id=run_id,
+        workflow_run_id=workflow_run_id,
+        workflow_attempt=workflow_attempt,
+        event_name=event_name,
+        workflow=os.getenv("GITHUB_WORKFLOW"),
+        git_sha=ctx.git_sha,
+        strategy_env=os.getenv("STRATEGY_ENV"),
+        kis_env=os.getenv("KIS_ENV"),
+        ctx_env=ctx.env,
+    )
+    runs_ledger_fail_open = bool(guard_result.get("fail_open"))
+    session_guard_run_id = guard_result.get("session_guard_run_id")
+    if guard_result.get("blocked"):
+        return
+    _touch_session_guard(
+        runs_repo=runs_repo,
+        session_guard_run_id=session_guard_run_id,
+        session_kind=session_kind,
+        status="SESSION_GUARD_STARTED",
+    )
     
     try:
         _ensure_bootstrap_migrations(engine)
@@ -4355,6 +4600,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 exit_reason = "sigterm"
                 break
             now = _get_now_kst()
+            _touch_session_guard(
+                runs_repo=runs_repo,
+                session_guard_run_id=session_guard_run_id,
+                session_kind=session_kind,
+            )
 
             if now >= session_end_dt:
                 logger.info(
@@ -4422,6 +4672,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     session_kind,
                     _get_now_kst().isoformat(),
                     result_status,
+                )
+                _touch_session_guard(
+                    runs_repo=runs_repo,
+                    session_guard_run_id=session_guard_run_id,
+                    session_kind=session_kind,
                 )
                 balance_api_calls += metrics.get("balance_api_calls", 0)
                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
@@ -4579,11 +4834,13 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             balance_tick_cache_hits,
         )
     finally:
-        if session_guard_run_id:
-            try:
-                runs_repo.finish_run(session_guard_run_id, status=f"SESSION_{str(exit_reason or 'UNKNOWN').upper()}", notes=last_phase)
-            except Exception as exc:
-                logger.warning("[TRADE_AM][DUPLICATE_GUARD][FINISH_FAIL] run_id=%s err=%s", session_guard_run_id, exc)
+        _finish_session_guard(
+            runs_repo=runs_repo,
+            session_guard_run_id=session_guard_run_id,
+            session_kind=session_kind,
+            exit_reason=exit_reason,
+            last_phase=last_phase,
+        )
         try:
             release_advisory_lock(lock_conn)
         except Exception as exc:

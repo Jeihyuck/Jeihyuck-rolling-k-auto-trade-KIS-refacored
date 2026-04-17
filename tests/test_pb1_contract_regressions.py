@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 from sqlalchemy.dialects import postgresql
 
+import trader.db.repos as repos_module
 from trader.db.repos import RunsRepo
 from trader.entry_engine.scanner import scan_entry_candidates
 from trader.minervini_filter import (
@@ -25,7 +26,7 @@ from trader.pb1_engine import (
     _resolve_exit_policy,
     _should_allow_single_share_position_cap_override,
 )
-from trader.pb1_runner import _fail_open_on_runs_ledger_error
+from trader.pb1_runner import _acquire_session_guard_or_takeover, _fail_open_on_runs_ledger_error
 from trader.window_router import WindowDecision
 
 
@@ -49,6 +50,37 @@ class _FakeRepoEngine:
 
     def begin(self):
         raise RuntimeError("not used")
+
+
+class _GuardFakeRunsRepo:
+    def __init__(self, existing_session=None, *, stale=False):
+        self.existing_session = existing_session
+        self.stale = stale
+        self.finish_calls = []
+        self.create_calls = []
+
+    def find_active_session_today(self, **_kwargs):
+        return self.existing_session
+
+    def is_session_stale(self, _row, *, stale_sec):
+        self.last_stale_sec = stale_sec
+        return self.stale
+
+    def finish_stale_session_if_needed(self, run_row, *, stale_sec, reason, takeover_from_run_id=None, status="SESSION_STALE_TAKEOVER"):
+        self.finish_calls.append(
+            {
+                "run_id": run_row.get("run_id"),
+                "stale_sec": stale_sec,
+                "reason": reason,
+                "takeover_from_run_id": takeover_from_run_id,
+                "status": status,
+            }
+        )
+        return True
+
+    def create_session_guard(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return "new-guard-run"
 
 
 def _make_engine(**kwargs):
@@ -97,6 +129,99 @@ def test_runs_repo_started_at_expr_casts_reflected_text_column():
     assert cast_mode == 1
     assert "CASE" in compiled
     assert "CAST" in compiled
+
+
+def test_runs_repo_is_session_stale_uses_recent_heartbeat(monkeypatch):
+    repo = RunsRepo(_FakeRepoEngine())
+    now = pd.Timestamp("2026-04-17T09:10:00+09:00").to_pydatetime()
+    monkeypatch.setattr(repos_module, "now_kst", lambda: now)
+
+    recent_row = {
+        "status": "SESSION_GUARD_STARTED",
+        "started_at": "2026-04-17T09:00:00+09:00",
+        "heartbeat_at": "2026-04-17T09:09:40+09:00",
+        "updated_at": "2026-04-17T09:09:40+09:00",
+        "finished_at": None,
+    }
+    stale_row = {
+        "status": "SESSION_GUARD_STARTED",
+        "started_at": "2026-04-17T08:30:00+09:00",
+        "heartbeat_at": "2026-04-17T08:55:00+09:00",
+        "updated_at": "2026-04-17T08:55:00+09:00",
+        "finished_at": None,
+    }
+
+    assert repo.is_session_stale(recent_row, stale_sec=60) is False
+    assert repo.is_session_stale(stale_row, stale_sec=600) is True
+
+
+def test_acquire_session_guard_blocks_only_active_session(monkeypatch):
+    repo = _GuardFakeRunsRepo(
+        existing_session={
+            "run_id": "old-run",
+            "status": "SESSION_GUARD_STARTED",
+            "started_at": "2026-04-17T09:07:00+09:00",
+            "heartbeat_at": "2026-04-17T09:08:30+09:00",
+            "workflow_run_id": "wf-old",
+        },
+        stale=False,
+    )
+    monkeypatch.setenv("PB1_ALLOW_MANUAL_SESSION_TAKEOVER", "1")
+
+    result = _acquire_session_guard_or_takeover(
+        runs_repo=repo,
+        env="practice",
+        session_kind="am",
+        run_id="new-run",
+        workflow_run_id="wf-new",
+        workflow_attempt=1,
+        event_name="schedule",
+        workflow="Trade AM",
+        git_sha="deadbeef",
+        strategy_env="practice",
+        kis_env="practice",
+        ctx_env="practice",
+    )
+
+    assert result["blocked"] is True
+    assert repo.finish_calls == []
+    assert repo.create_calls == []
+
+
+def test_acquire_session_guard_allows_manual_takeover_for_stale_session(monkeypatch):
+    repo = _GuardFakeRunsRepo(
+        existing_session={
+            "run_id": "old-run",
+            "status": "SESSION_GUARD_STARTED",
+            "started_at": "2026-04-17T09:07:00+09:00",
+            "heartbeat_at": "2026-04-17T09:07:30+09:00",
+            "workflow_run_id": "wf-old",
+        },
+        stale=True,
+    )
+    monkeypatch.setenv("PB1_ALLOW_MANUAL_SESSION_TAKEOVER", "1")
+    monkeypatch.setenv("PB1_MANUAL_SESSION_GUARD_STALE_SEC", "60")
+
+    result = _acquire_session_guard_or_takeover(
+        runs_repo=repo,
+        env="practice",
+        session_kind="am",
+        run_id="new-run",
+        workflow_run_id="wf-new",
+        workflow_attempt=2,
+        event_name="workflow_dispatch",
+        workflow="Trade AM",
+        git_sha="deadbeef",
+        strategy_env="practice",
+        kis_env="practice",
+        ctx_env="practice",
+    )
+
+    assert result["blocked"] is False
+    assert result["session_guard_run_id"] == "new-guard-run"
+    assert repo.finish_calls[0]["reason"] == "manual_session_takeover"
+    assert repo.finish_calls[0]["status"] == "SESSION_MANUAL_TAKEOVER"
+    assert repo.create_calls[0]["takeover_from_run_id"] == "old-run"
 
 
 def test_fail_open_on_runs_ledger_error_defaults_to_practice(monkeypatch):

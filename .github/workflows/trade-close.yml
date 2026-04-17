@@ -42,6 +42,9 @@ env:
   PB1_LOOP_ENABLED: "1"
   PB1_RUN_LOOP_MINUTES: "30"
   PB1_LOOP_INTERVAL_SEC: "60"
+  PB1_SESSION_GUARD_STALE_SEC: "600"
+  PB1_MANUAL_SESSION_GUARD_STALE_SEC: "60"
+  PB1_ALLOW_MANUAL_SESSION_TAKEOVER: "1"
   KIS_HTTP_ENABLED: "1"
   NO_TRADE: "0"
   PB1_PHASE_DEFAULT: exit
@@ -130,8 +133,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p repo/artifacts
+          manual_restart=0
+          if [[ "${{ steps.phase_guard.outputs.event_name }}" == "workflow_dispatch" || "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
+            manual_restart=1
+          fi
           {
             echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_CLOSE][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
             echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
             echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
           } | tee -a repo/artifacts/trade-close.log
@@ -151,8 +159,13 @@ jobs:
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
           mkdir -p repo/artifacts
+          manual_restart=0
+          if [[ "${{ steps.phase_guard.outputs.event_name }}" == "workflow_dispatch" || "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
+            manual_restart=1
+          fi
           {
             echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_CLOSE][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
             echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
             echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
           } | tee repo/artifacts/trade-close.log >/dev/null

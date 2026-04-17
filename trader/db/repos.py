@@ -1294,6 +1294,27 @@ def _is_in_failed_transaction_error(exc: Exception) -> bool:
 
 
 class RunsRepo:
+    _TERMINAL_STATUS_TOKENS = (
+        "FINISH",
+        "FINISHED",
+        "COMPLETE",
+        "COMPLETED",
+        "SUCCESS",
+        "SUCCEEDED",
+        "FAIL",
+        "FAILED",
+        "FATAL",
+        "ERROR",
+        "CANCEL",
+        "ABORT",
+        "STOP",
+        "SIGTERM",
+        "SHUTDOWN",
+        "SESSION_END",
+        "STALE_TAKEOVER",
+        "SKIP",
+    )
+
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
@@ -1463,6 +1484,159 @@ class RunsRepo:
         )
         return row_dict
 
+    @classmethod
+    def _is_terminal_status(cls, status: Any) -> bool:
+        normalized = str(status or "").strip().upper()
+        if not normalized:
+            return False
+        return any(token in normalized for token in cls._TERMINAL_STATUS_TOKENS)
+
+    @staticmethod
+    def _coerce_run_datetime(value: Any) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time(), tzinfo=pytz.timezone("Asia/Seoul"))
+        raw = str(value).strip()
+        if not raw or raw.lower() in {"none", "null"}:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            return pytz.timezone("Asia/Seoul").localize(parsed)
+        return parsed
+
+    @classmethod
+    def _last_activity_at(cls, run_row: dict[str, Any] | None) -> datetime | None:
+        row = run_row or {}
+        for field in ("heartbeat_at", "updated_at", "started_at"):
+            parsed = cls._coerce_run_datetime(row.get(field))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def find_active_session_today(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        run_window: str | None = None,
+        phase: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = now_kst()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        started_at_expr, _, _ = self._safe_runs_timestamp_expr("started_at")
+        heartbeat_expr, _, _ = self._safe_runs_timestamp_expr("heartbeat_at")
+        updated_expr, _, _ = self._safe_runs_timestamp_expr("updated_at")
+        finished_expr, _, _ = self._safe_runs_timestamp_expr("finished_at")
+        status_upper = func.upper(func.coalesce(self._schema.runs.c.status, ""))
+        conditions = [
+            self._schema.runs.c.env == _norm_env(env),
+            self._schema.runs.c.strategy == strategy,
+            started_at_expr.is_not(None),
+            started_at_expr >= start,
+            started_at_expr < end,
+            finished_expr.is_(None),
+        ]
+        for token in self._TERMINAL_STATUS_TOKENS:
+            conditions.append(~status_upper.contains(token))
+        if run_window is not None:
+            conditions.append(self._schema.runs.c.run_window == run_window)
+        if phase is not None:
+            conditions.append(self._schema.runs.c.phase == phase)
+        stmt = (
+            select(self._schema.runs)
+            .where(and_(*conditions))
+            .order_by(func.coalesce(heartbeat_expr, updated_expr, started_at_expr).desc(), started_at_expr.desc())
+            .limit(1)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
+
+    def is_session_stale(self, run_row: dict[str, Any] | None, *, stale_sec: int) -> bool:
+        row = run_row or {}
+        if not row:
+            return False
+        if self._is_terminal_status(row.get("status")):
+            return True
+        if row.get("finished_at") is not None:
+            return True
+        reference_time = self._last_activity_at(row)
+        if reference_time is None:
+            return True
+        now = now_kst()
+        if reference_time.tzinfo is None:
+            reference_time = pytz.timezone("Asia/Seoul").localize(reference_time)
+        age_sec = max(0, int((now - reference_time.astimezone(now.tzinfo)).total_seconds()))
+        return age_sec >= max(0, int(stale_sec))
+
+    def touch_run(self, run_id: str, *, now: datetime | None = None, status: str | None = None) -> None:
+        stamp = now or func.now()
+        values: dict[str, Any] = {
+            "heartbeat_at": stamp,
+            "updated_at": stamp,
+        }
+        if status:
+            values["status"] = status
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.update(self._schema.runs)
+                .where(self._schema.runs.c.run_id == run_id)
+                .values(**values),
+            )
+
+    def mark_run_abandoned(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        takeover_from_run_id: str | None = None,
+        status: str = "SESSION_ABORTED",
+    ) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                sa.update(self._schema.runs)
+                .where(self._schema.runs.c.run_id == run_id)
+                .values(
+                    status=status,
+                    aborted_reason=reason,
+                    takeover_from_run_id=takeover_from_run_id,
+                    finished_at=func.now(),
+                    heartbeat_at=func.now(),
+                    updated_at=func.now(),
+                ),
+            )
+
+    def finish_stale_session_if_needed(
+        self,
+        run_row: dict[str, Any] | None,
+        *,
+        stale_sec: int,
+        reason: str,
+        takeover_from_run_id: str | None = None,
+        status: str = "SESSION_STALE_TAKEOVER",
+    ) -> bool:
+        if not run_row:
+            return False
+        if not self.is_session_stale(run_row, stale_sec=stale_sec):
+            return False
+        run_id = str((run_row or {}).get("run_id") or "").strip()
+        if not run_id:
+            return False
+        self.mark_run_abandoned(
+            run_id,
+            reason=reason,
+            takeover_from_run_id=takeover_from_run_id,
+            status=status,
+        )
+        return True
+
     def create_session_guard(
         self,
         *,
@@ -1476,6 +1650,7 @@ class RunsRepo:
         workflow_attempt: int | None,
         git_sha: str | None,
         config_json: dict | None = None,
+        takeover_from_run_id: str | None = None,
     ) -> str:
         values = {
             "run_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
@@ -1491,6 +1666,9 @@ class RunsRepo:
             "workflow_attempt": workflow_attempt,
             "config_json": config_json or {},
             "status": "SESSION_GUARD_STARTED",
+            "heartbeat_at": func.now(),
+            "updated_at": func.now(),
+            "takeover_from_run_id": takeover_from_run_id,
         }
         stmt = sa.insert(self._schema.runs).values(**values).returning(self._schema.runs.c.run_id)
         with self.engine.begin() as conn:
@@ -1551,12 +1729,28 @@ class RunsRepo:
                         raise
         return str(run_id)
 
-    def finish_run(self, run_id: str, status: str, notes: str | None = None) -> None:
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        notes: str | None = None,
+        *,
+        aborted_reason: str | None = None,
+        takeover_from_run_id: str | None = None,
+    ) -> None:
         with self.engine.begin() as conn:
             conn.execute(
                 sa.update(self._schema.runs)
                 .where(self._schema.runs.c.run_id == run_id)
-                .values(status=status, finished_at=func.now(), notes=notes),
+                .values(
+                    status=status,
+                    finished_at=func.now(),
+                    heartbeat_at=func.now(),
+                    updated_at=func.now(),
+                    notes=notes,
+                    aborted_reason=aborted_reason,
+                    takeover_from_run_id=takeover_from_run_id,
+                ),
             )
 
     def upsert_run(

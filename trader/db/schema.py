@@ -75,7 +75,11 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("config_json", sa.JSON, nullable=False, default=dict),
         sa.Column("status", sa.String, nullable=False, default="STARTED"),
         sa.Column("started_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("heartbeat_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.Column("finished_at", sa.DateTime(timezone=True)),
+        sa.Column("aborted_reason", sa.Text),
+        sa.Column("takeover_from_run_id", uuid_type, sa.ForeignKey("runs.run_id")),
         sa.Column("notes", sa.Text),
     )
 
