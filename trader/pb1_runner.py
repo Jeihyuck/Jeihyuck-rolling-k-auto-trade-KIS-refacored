@@ -1097,6 +1097,117 @@ def check_prep_done() -> bool:
         return False
 
 
+def _resolve_trade_prep_done_status(
+    *,
+    ledger_repo: LedgerEventsRepo,
+    watchlist_repo: WatchlistRepo,
+    env: str,
+    strategy: str,
+    as_of: date,
+    trade_date: date,
+) -> tuple[bool, str, int, dict[str, Any]]:
+    try:
+        prep_done, prep_done_count = ledger_repo.prep_done_status(
+            env=env,
+            as_of=as_of,
+            strategies=[strategy],
+            trade_date=trade_date,
+        )
+    except TypeError:
+        prep_done, prep_done_count = ledger_repo.prep_done_status(
+            env=env,
+            as_of=as_of,
+        )
+    if prep_done:
+        logger.info(
+            "[TRADE_TICK][PREP_DONE_CHECK] source=db_ledger prep_done=1 matched_events_count=%s",
+            prep_done_count,
+        )
+        return True, "db_ledger", prep_done_count, {
+            "final30_count": 0,
+            "contract_ok": True,
+            "usable": True,
+            "missing_critical_fields": [],
+        }
+
+    try:
+        canonical = watchlist_repo.verify_watchlist_scored_contract(
+            env=env,
+            as_of=as_of,
+            strategy="pb1_watchlist_final_scored",
+            allow_latest_fallback=False,
+            log_result=False,
+        )
+    except Exception:
+        canonical = {
+            "rows": 0,
+            "ok": False,
+            "columns": [],
+            "env": env,
+            "strategy": "pb1_watchlist_final_scored",
+            "as_of": as_of.isoformat(),
+        }
+    canonical_columns = [str(item) for item in (canonical.get("columns") or [])]
+    missing_critical_fields = [
+        col for col in REQUIRED_FINAL30_SCORED_COLS
+        if col not in canonical_columns
+    ]
+    final30_count = int(canonical.get("rows") or 0)
+    contract_ok = bool(canonical.get("ok"))
+    usable = bool(final30_count == 30 and contract_ok and not missing_critical_fields)
+    env_match = str(canonical.get("env") or "").strip().lower() == str(env).strip().lower()
+    strategy_match = str(canonical.get("strategy") or "").strip().lower() == "pb1_watchlist_final_scored"
+    as_of_match = str(canonical.get("as_of") or "") == as_of.isoformat()
+    fallback_ok = bool(
+        final30_count == 30
+        and contract_ok
+        and usable
+        and not missing_critical_fields
+        and env_match
+        and strategy_match
+        and as_of_match
+    )
+
+    if fallback_ok:
+        logger.warning(
+            "[TRADE_TICK][PREP_DONE_CHECK][FALLBACK_CANONICAL_OK] ledger_prep_done=0 fallback_prep_done=1 final30_count=%s",
+            final30_count,
+        )
+        ledger_repo.upsert_prep_event(
+            env=env,
+            strategy=strategy,
+            as_of=as_of,
+            trade_date=trade_date,
+            event_type="PREP_DONE",
+            status="READY_FROM_FINAL30_FALLBACK",
+            reason="ledger_missing_but_final30_canonical_ok",
+            final30_count=final30_count,
+            quality_ok=True,
+            trade_can_proceed=True,
+        )
+        logger.info("[TRADE_TICK][PREP_DONE_CHECK] source=final30_canonical_fallback prep_done=1")
+        return True, "final30_canonical_fallback", 0, {
+            "final30_count": final30_count,
+            "contract_ok": contract_ok,
+            "usable": usable,
+            "missing_critical_fields": missing_critical_fields,
+        }
+
+    logger.warning(
+        "[TRADE_TICK][PREP_DONE_CHECK][FAIL] reason=PREP_NOT_DONE ledger_prep_done=0 final30_count=%s contract_ok=%s usable=%s missing=%s",
+        final30_count,
+        int(contract_ok),
+        int(usable),
+        missing_critical_fields,
+    )
+    return False, "none", 0, {
+        "final30_count": final30_count,
+        "contract_ok": contract_ok,
+        "usable": usable,
+        "missing_critical_fields": missing_critical_fields,
+    }
+
+
 def load_snapshot_fallback(snapshot_name: str = "final30") -> list | None:
     """
     Load snapshot from JSON file as fallback when PREP missing.
@@ -5162,39 +5273,23 @@ def main() -> int:
         
         engine = make_engine()
         ledger_repo = LedgerEventsRepo(engine)
-        
-        # PREP_DONE 체크는 derived_as_of 기준으로
-        prep_done, prep_done_count = ledger_repo.prep_done_status(
-            env=os.getenv("STRATEGY_ENV", "practice").lower(),
+        derived_env = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower()
+        watchlist_repo = WatchlistRepo(engine)
+        prep_done, prep_done_source, prep_done_count, prep_done_details = _resolve_trade_prep_done_status(
+            ledger_repo=ledger_repo,
+            watchlist_repo=watchlist_repo,
+            env=derived_env,
+            strategy="pb1",
             as_of=derived_as_of,
-        )
-        logger.info(
-            "[TRADE_TICK][PREP_DONE_CHECK] source=db_ledger prep_done=%s matched_events_count=%s derived_as_of=%s",
-            int(prep_done),
-            prep_done_count,
-            derived_as_of.isoformat(),
+            trade_date=trade_date,
         )
         if not prep_done:
-            if allow_wl_only and watchlist_loaded_for_guard:
-                logger.warning(
-                    "[TRADE_TICK][PREP_BYPASS] prep_not_done but watchlist_final present -> continue derived_as_of=%s trade_date=%s",
-                    derived_as_of.isoformat(),
-                    trade_date.isoformat(),
-                )
-            else:
-                logger.warning(
-                    "[TRADE_TICK][SKIP] reason=PREP_NOT_DONE derived_as_of=%s trade_date=%s prep_done_check_source=db_ledger matched_events_count=%s",
-                    derived_as_of.isoformat(),
-                    trade_date.isoformat(),
-                    prep_done_count,
-                )
-                _log_main_run_summary(status="SKIP_PRECHECK", reason="PREP_NOT_DONE")
-                return 0
+            logger.warning("[TRADE_TICK][SKIP] reason=PREP_NOT_DONE")
+            _log_main_run_summary(status="SKIP_PRECHECK", reason="PREP_NOT_DONE")
+            return 0
         
         # DERIVED 체크도 derived_as_of 기준으로
         derived_repo = DerivedMinerviniRepo(engine)
-        watchlist_repo = WatchlistRepo(engine)
-        derived_env = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or derived_env or "practice").strip().lower()
         derived_count = derived_repo.count_as_of(env=derived_env, as_of=derived_as_of)
         logger.info(
             "[PB1][ENV_DERIVE] strategy_env=%s kis_env=%s derived_env=%s",

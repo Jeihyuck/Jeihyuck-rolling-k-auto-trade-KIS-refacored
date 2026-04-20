@@ -123,3 +123,19 @@ def test_exit_family_dispatch_uses_entry_reason() -> None:
     assert PB1Engine._resolve_exit_family("ENTRY_PULLBACK", None) == ("ENTRY_PULLBACK", "PULLBACK_EXIT")
     assert PB1Engine._resolve_exit_family("ENTRY_MOMENTUM", None) == ("ENTRY_MOMENTUM", "MOMENTUM_EXIT")
     assert PB1Engine._resolve_exit_family(None, None) == ("ENTRY_GENERIC", "GENERIC_EXIT")
+
+
+def test_entry_identity_uses_single_source_when_reason_missing() -> None:
+    engine = PB1Engine.__new__(PB1Engine)
+
+    identity = engine._resolve_entry_identity_from_mapping(
+        {
+            "entry_style_selected": "momentum",
+            "entry_decision_family": "ENTRY_MOMENTUM_CONTINUATION",
+        }
+    )
+
+    assert identity["entry_reason"] == "ENTRY_MOMENTUM"
+    assert identity["entry_style_selected"] == "ENTRY_MOMENTUM"
+    assert identity["entry_decision_family"] == "ENTRY_MOMENTUM_CONTINUATION"
+    assert identity["exit_policy_family"] == "MOMENTUM_EXIT"

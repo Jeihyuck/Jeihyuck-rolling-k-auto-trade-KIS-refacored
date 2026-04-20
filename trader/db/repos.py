@@ -3144,6 +3144,11 @@ class LedgerEventsRepo:
             return self._schema.ledger_events.c.payload_json["as_of"].astext
         return func.json_extract(self._schema.ledger_events.c.payload_json, "$.as_of")
 
+    def _payload_text_expr(self, key: str) -> sa.sql.ClauseElement:
+        if self.engine.dialect.name == "postgresql":
+            return self._schema.ledger_events.c.payload_json[str(key)].astext
+        return func.json_extract(self._schema.ledger_events.c.payload_json, f"$.{key}")
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -3464,17 +3469,156 @@ class LedgerEventsRepo:
         )
         return None
 
+    def upsert_prep_event(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of: date | str,
+        trade_date: date | str,
+        event_type: str,
+        status: str,
+        reason: str,
+        final30_count: int,
+        quality_ok: bool,
+        trade_can_proceed: bool,
+        run_id: str | None = None,
+        run_window: str | None = "prep",
+    ) -> str | None:
+        schema = self._schema
+        db_url = str(self.engine.url)
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy)
+        as_of_date = to_date(as_of)
+        trade_date_date = to_date(trade_date)
+        event_type_n = str(event_type or "").strip().upper()
+        ts = now_kst()
+        if run_id:
+            self.ensure_run_exists(run_id)
+
+        payload_json = json_sanitize(
+            {
+                "env": env_n,
+                "strategy": strategy_n,
+                "as_of": as_of_date.isoformat(),
+                "trade_date": trade_date_date.isoformat(),
+                "event_type": event_type_n,
+                "status": str(status or "").strip(),
+                "reason": str(reason or "").strip(),
+                "final30_count": int(final30_count or 0),
+                "quality_ok": int(bool(quality_ok)),
+                "trade_can_proceed": int(bool(trade_can_proceed)),
+            }
+        )
+        match_stmt = (
+            select(schema.ledger_events.c.ledger_event_id)
+            .where(
+                and_(
+                    schema.ledger_events.c.env == env_n,
+                    schema.ledger_events.c.event_type == event_type_n,
+                    self._payload_text_expr("strategy") == strategy_n,
+                    self._payload_as_of_expr() == as_of_date.isoformat(),
+                    self._payload_text_expr("trade_date") == trade_date_date.isoformat(),
+                )
+            )
+            .order_by(schema.ledger_events.c.created_at.desc())
+            .limit(1)
+        )
+
+        with self.engine.begin() as conn:
+            if run_id is not None:
+                ensure_run(
+                    conn,
+                    schema,
+                    run_id=run_id,
+                    env=env_n,
+                    run_window=run_window,
+                    strategy=strategy_n,
+                    ts=ts,
+                    database_url=db_url,
+                )
+
+            existing_id = conn.execute(match_stmt).scalar()
+            run_id_value = uuid_value_for_url(db_url, run_id) if run_id is not None else None
+            values = {
+                "env": env_n,
+                "run_id": run_id_value,
+                "event_type": event_type_n,
+                "ts": ts,
+                "ok": True,
+                "reasons": [],
+                "stage": run_window,
+                "payload_json": payload_json,
+            }
+            if existing_id is None:
+                values["ledger_event_id"] = _coerce_uuid(None, uses_native_uuid=schema.uses_native_uuid, database_url=db_url)
+                stmt = sa.insert(schema.ledger_events).values(**values).returning(schema.ledger_events.c.ledger_event_id)
+                event_id = str(conn.execute(stmt).scalar())
+            else:
+                update_values = dict(values)
+                if run_id is None:
+                    update_values.pop("run_id", None)
+                conn.execute(
+                    sa.update(schema.ledger_events)
+                    .where(schema.ledger_events.c.ledger_event_id == existing_id)
+                    .values(**update_values)
+                )
+                event_id = str(existing_id)
+
+        logger.info(
+            "[DB][LEDGER][PREP_EVENT][UPSERT_OK] env=%s strategy=%s as_of=%s trade_date=%s event=%s status=%s reason=%s",
+            env_n,
+            strategy_n,
+            as_of_date.isoformat(),
+            trade_date_date.isoformat(),
+            event_type_n,
+            str(status or "").strip(),
+            str(reason or "").strip(),
+        )
+        return event_id
+
+    def get_prep_event(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of: date | str,
+        trade_date: date | str,
+        event_type: str = "PREP_DONE",
+    ) -> dict[str, Any] | None:
+        schema = self._schema
+        stmt = (
+            select(schema.ledger_events)
+            .where(
+                and_(
+                    schema.ledger_events.c.env == _norm_env(env),
+                    schema.ledger_events.c.event_type == str(event_type or "").strip().upper(),
+                    self._payload_text_expr("strategy") == _norm_strategy(strategy),
+                    self._payload_as_of_expr() == to_date(as_of).isoformat(),
+                    self._payload_text_expr("trade_date") == to_date(trade_date).isoformat(),
+                )
+            )
+            .order_by(schema.ledger_events.c.created_at.desc())
+            .limit(1)
+        )
+        with self.engine.connect() as conn:
+            row = conn.execute(stmt).mappings().first()
+        return dict(row) if row is not None else None
+
     def prep_done_status(
         self,
         *,
         env: str,
         as_of: date | str,
         strategies: Iterable[str] | None = None,
+        trade_date: date | str | None = None,
     ) -> tuple[bool, int]:
         schema = self._schema
         as_of_date = to_date(as_of)
         as_of_str = as_of_date.isoformat()
         payload_as_of = self._payload_as_of_expr()
+        payload_strategy = func.lower(self._payload_text_expr("strategy"))
+        payload_trade_date = self._payload_text_expr("trade_date")
         as_of_match = or_(
             func.date(schema.ledger_events.c.ts) == as_of_date,
             payload_as_of == as_of_str,
@@ -3485,16 +3629,32 @@ class LedgerEventsRepo:
             strategies_norm = [s.strip().lower() for s in strategies if s and str(s).strip()]
             if strategies_norm:
                 stmt = stmt.select_from(
-                    schema.ledger_events.join(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
-                ).where(func.lower(schema.runs.c.strategy).in_(strategies_norm))
+                    schema.ledger_events.outerjoin(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
+                ).where(
+                    or_(
+                        func.lower(schema.runs.c.strategy).in_(strategies_norm),
+                        payload_strategy.in_(strategies_norm),
+                    )
+                )
 
-        stmt = stmt.where(
-            and_(
-                schema.ledger_events.c.env == _norm_env(env),
-                schema.ledger_events.c.event_type == "PREP_DONE",
-                as_of_match,
+        trade_date_match = None
+        if trade_date is not None:
+            trade_date_date = to_date(trade_date)
+            trade_date_str = trade_date_date.isoformat()
+            trade_date_match = or_(
+                payload_trade_date == trade_date_str,
+                func.date(schema.ledger_events.c.ts) == trade_date_date,
             )
-        )
+
+        conditions = [
+            schema.ledger_events.c.env == _norm_env(env),
+            schema.ledger_events.c.event_type == "PREP_DONE",
+            as_of_match,
+        ]
+        if trade_date_match is not None:
+            conditions.append(trade_date_match)
+
+        stmt = stmt.where(and_(*conditions))
         with self.engine.connect() as conn:
             count = conn.execute(stmt).scalar() or 0
         return int(count) > 0, int(count)

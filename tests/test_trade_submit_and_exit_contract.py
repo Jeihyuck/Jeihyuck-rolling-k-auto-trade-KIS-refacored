@@ -19,12 +19,24 @@ KST = ZoneInfo("Asia/Seoul")
 
 
 class FakeKis:
+    def __init__(self) -> None:
+        self.sell_calls = 0
+
     def buy_stock_limit(self, code: str, qty: int, price: float) -> dict:
         return {
             "rt_cd": "0",
             "msg_cd": "0",
             "msg1": "accepted",
             "output": {"ODNO": f"ODNO-{code}-{qty}-{int(price)}"},
+        }
+
+    def sell_stock_market(self, code: str, qty: int) -> dict:
+        self.sell_calls += 1
+        return {
+            "rt_cd": "0",
+            "msg_cd": "0",
+            "msg1": "accepted",
+            "output": {"ODNO": f"SELL-{code}-{qty}"},
         }
 
 
@@ -202,3 +214,83 @@ def test_run_exit_always_logs_ma_values_for_holdings(caplog):
     assert "[EXIT][MA_CTX] code=032830 ma20=None" not in caplog.text
     assert "[EXIT][MA_CTX] code=032830" in caplog.text
     assert "source=db" in caplog.text
+
+
+def test_force_exit_simulation_builds_payload_without_sell_api(monkeypatch, caplog):
+    db_engine = _new_db_engine()
+    now_kst = datetime(2026, 3, 25, 15, 15, tzinfo=KST)
+    kis = FakeKis()
+    engine, _orders_repo, _fills_repo, _positions_repo, _ledger_repo = _make_engine(
+        db_engine=db_engine,
+        now_kst=now_kst,
+        dry_run=False,
+        intended_live=False,
+        kis=kis,
+    )
+    engine.order_allowed = False
+
+    monkeypatch.setenv("FORCE_EXIT_SIMULATION", "1")
+    monkeypatch.setenv("FORCE_EXIT_CODE", "032830")
+    monkeypatch.setenv("FORCE_EXIT_REASON", "TP1")
+    monkeypatch.setattr(engine, "_resolve_price_with_fallback", lambda code, ohlcv_close=None: (130.0, "test"))
+
+    dates = pd.date_range(end=now_kst.date(), periods=60, freq="B")
+    closes = pd.Series(range(100, 160), dtype=float)
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": closes - 1,
+            "high": closes + 1,
+            "low": closes - 2,
+            "close": closes,
+            "volume": 100000,
+        }
+    )
+    pos = {
+        "code": "032830",
+        "market": "KOSDAQ",
+        "mode": 1,
+        "sid": 1,
+        "qty": 10,
+        "orderable_qty": 10,
+        "avg_buy_price": 100.0,
+        "last_price": 130.0,
+        "holding_days": 5,
+        "entry_date": "2026-03-20",
+        "last_fill_at": now_kst.isoformat(),
+        "entry_reason": "ENTRY_MOMENTUM",
+        "entry_style_selected": "ENTRY_MOMENTUM",
+        "entry_meta_json": {
+            "entry_reason": "ENTRY_MOMENTUM",
+            "entry_style_selected": "ENTRY_MOMENTUM",
+            "exit_policy_family": "MOMENTUM_EXIT",
+        },
+        "exit_policy_family": "MOMENTUM_EXIT",
+        "stop_price_at_entry": 95.0,
+        "pivot_price_at_entry": 120.0,
+        "stop_price": 95.0,
+        "pivot": 120.0,
+        "total_cost": 1000.0,
+    }
+    features = {
+        "close": 130.0,
+        "ma20": 125.0,
+        "ma50": 120.0,
+        "atr": 3.0,
+        "last_volume": 100000.0,
+        "vol50": 50000.0,
+        "_exit_ohlcv_source": "test",
+    }
+
+    caplog.set_level(logging.INFO)
+    payload = engine._plan_exit_event(pos, features, df, "close")
+
+    assert payload is not None
+    assert payload["force_exit_simulation"] is True
+    assert payload["stage"] == "TP1"
+    assert payload["client_order_key"].endswith(":EXIT:SELL:TP1:close:1")
+    assert payload["simulated_order_payload"]["qty"] >= 1
+    assert payload["simulated_order_payload"]["stage"] == "TP1"
+    assert payload["order_skip_reasons"] == ["force_exit_simulation"]
+    assert kis.sell_calls == 0
+    assert "[EXIT][SIMULATION] code=032830" in caplog.text

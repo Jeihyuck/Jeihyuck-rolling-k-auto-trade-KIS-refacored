@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from trader.db.engine import get_engine
-from trader.db.repos import load_final30_scored_db_only
+from trader.db.repos import LedgerEventsRepo, load_final30_scored_db_only
 from trader.final30_quality import build_canonical_prep_verdict, summarize_final30_quality
 from trader.time_utils import now_kst, resolve_trade_context
 
@@ -50,6 +50,27 @@ def _load_final30_snapshot(env: str, as_of: str, strategy: str) -> tuple[pd.Data
     return df, verdict
 
 
+def _upsert_duplicate_ready_event(
+    *,
+    env: str,
+    as_of: str,
+    trade_date: str,
+    final30_count: int,
+) -> None:
+    LedgerEventsRepo(get_engine()).upsert_prep_event(
+        env=env,
+        strategy="pb1",
+        as_of=as_of,
+        trade_date=trade_date,
+        event_type="PREP_DONE",
+        status="READY_FROM_CANONICAL",
+        reason="canonical_prep_already_ready",
+        final30_count=final30_count,
+        quality_ok=True,
+        trade_can_proceed=True,
+    )
+
+
 def main() -> int:
     env = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower() or "practice"
     strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY") or "pb1_watchlist_final_scored"
@@ -57,6 +78,7 @@ def main() -> int:
     allow_duplicate = _flag_enabled(os.getenv("ALLOW_DUPLICATE_PREP"))
     ctx = resolve_trade_context(now=now_kst(), env=env)
     as_of = str(ctx.get("as_of") or "")
+    trade_date = str(ctx.get("trade_date") or now_kst().date().isoformat())
 
     df, verdict = _load_final30_snapshot(env=env, as_of=as_of, strategy=strategy)
     final30_count = int(len(df.index)) if not df.empty else 0
@@ -67,7 +89,7 @@ def main() -> int:
         final30_count == 30
         and quality_ok == 1
         and trade_can_proceed == 1
-        and canonical_status != "FAIL"
+        and canonical_status == "OK"
     )
     should_skip = int(is_ready and not allow_duplicate)
     skip_reason = "canonical_prep_already_ready" if should_skip else ""
@@ -80,6 +102,17 @@ def main() -> int:
     )
 
     if should_skip:
+        _upsert_duplicate_ready_event(
+            env=env,
+            as_of=as_of,
+            trade_date=trade_date,
+            final30_count=final30_count,
+        )
+        print(
+            "[PREP][DUPLICATE_GUARD][LEDGER_UPSERT] "
+            f"event=PREP_DONE status=READY_FROM_CANONICAL reason={skip_reason} "
+            f"as_of={as_of} trade_date={trade_date} final30_count={final30_count}"
+        )
         print(f"[PREP][DUPLICATE_GUARD][SKIP] as_of={as_of} reason={skip_reason}")
         print(
             "[RUN_SUMMARY][RESULT] "

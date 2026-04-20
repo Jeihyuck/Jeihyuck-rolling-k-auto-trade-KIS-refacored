@@ -14,6 +14,9 @@ DB_URL_KEYS = (
     "PBCORE_DB_URL",
     "DATABASE_URL",
 )
+DB_LOCK_TIMEOUT_MS_DEFAULT = 5000
+DB_STATEMENT_TIMEOUT_MS_DEFAULT = 15000
+DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT = 15000
 
 
 def _redact_url(url: str) -> str:
@@ -88,9 +91,14 @@ def _connect_args_for_db_url(db_url: str) -> dict:
     }
     drivername, base_driver = _describe_db_url(db_url)
     if base_driver == "postgresql" or drivername.startswith("postgres"):
-        lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", "5000"))
-        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
-        idle_in_tx_timeout_ms = int(os.getenv("DB_IDLE_IN_TX_SESSION_TIMEOUT_MS", "15000"))
+        lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", str(DB_LOCK_TIMEOUT_MS_DEFAULT)))
+        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", str(DB_STATEMENT_TIMEOUT_MS_DEFAULT)))
+        idle_in_tx_timeout_ms = int(
+            os.getenv(
+                "DB_IDLE_IN_TX_SESSION_TIMEOUT_MS",
+                str(DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT),
+            )
+        )
 
         pg_options = [
             f"-c lock_timeout={lock_timeout_ms}",

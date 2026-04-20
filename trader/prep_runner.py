@@ -1841,6 +1841,7 @@ def main() -> int:
     run_id = os.getenv("TRADER_RUN_ID") or str(uuid4())
     os.environ["TRADER_RUN_ID"] = run_id
     ledger_repo = LedgerEventsRepo(engine)
+    trade_date = now_kst().date()
 
     export_dir = RUNTIME_DIR / "watchlist" / as_of.strftime("%Y-%m-%d")
     final30_saved_df = pd.DataFrame(_safe_get(watchlist_bundle, "final30_saved", []))
@@ -1927,21 +1928,32 @@ def main() -> int:
     core_marker_payload = {
         "as_of": as_of.isoformat(),
         "env": env,
+        "strategy": "pb1",
+        "trade_date": trade_date.isoformat(),
         "final_count": int(core_save_result.get("db_rows") or 0),
         "flow_coverage": 0.0,
         "done_phase": "core",
         "runtime_rows": int(core_save_result.get("runtime_rows") or 0),
         "ledger_rows": int(core_save_result.get("ledger_rows") or 0),
         "signals_rows": int(core_save_result.get("signals_rows") or 0),
+        "status": "CORE_SAVED",
+        "reason": "final30_scored_core_saved",
+        "final30_count": int(core_save_result.get("db_rows") or 0),
+        "quality_ok": 1,
+        "trade_can_proceed": 1,
     }
-    ledger_repo.append_event(
+    ledger_repo.upsert_prep_event(
         env=env,
-        run_id=run_id,
-        strategy="pb1_pullback_close",
-        run_window="prep",
+        strategy="pb1",
+        as_of=as_of,
+        trade_date=trade_date,
         event_type="PREP_DONE",
-        ts=now_kst(),
-        payload_json=core_marker_payload,
+        status="CORE_SAVED",
+        reason="final30_scored_core_saved",
+        final30_count=int(core_save_result.get("db_rows") or 0),
+        quality_ok=True,
+        trade_can_proceed=True,
+        run_id=run_id,
     )
     logger.info("[PREP][DONE_CORE][MARKER_OK] as_of=%s", as_of.isoformat())
     logger.info("[PREP][DONE_CORE][DONE] as_of=%s rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
@@ -2701,9 +2713,16 @@ def main() -> int:
             else:
                 prep_status = "FAIL"
     payload["prep_status"] = prep_status
+    payload["strategy"] = "pb1"
+    payload["trade_date"] = trade_date.isoformat()
     payload["final30_file_contract_ok"] = final30_file_contract_ok
     payload["final30_file_failures"] = list(final30_file_failures)
     payload["contract_failures"] = list(strict_contract_failures)
+    payload["status"] = prep_status
+    payload["reason"] = "prep_completed_with_soft_fail" if prep_status == "WARN" else "prep_completed"
+    payload["final30_count"] = int(len(symbols))
+    payload["quality_ok"] = int(final30_gate_decision["quality_ok"])
+    payload["trade_can_proceed"] = int(final30_gate_decision["trade_can_proceed"])
     prep_manifest["build_status"] = prep_status
     prep_manifest["trade_can_proceed"] = int(final30_gate_decision["trade_can_proceed"])
     prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2760,14 +2779,18 @@ def main() -> int:
         return 1
 
     elif prep_status == "WARN":
-        ledger_repo.append_event(
+        ledger_repo.upsert_prep_event(
             env=env,
-            run_id=run_id,
-            strategy="pb1_pullback_close",
-            run_window="prep",
+            strategy="pb1",
+            as_of=as_of,
+            trade_date=trade_date,
             event_type="PREP_DONE",
-            ts=now_kst(),
-            payload_json=payload,
+            status="WARN",
+            reason="prep_completed_with_soft_fail",
+            final30_count=len(symbols),
+            quality_ok=bool(final30_gate_decision["quality_ok"]),
+            trade_can_proceed=bool(final30_gate_decision["trade_can_proceed"]),
+            run_id=run_id,
         )
         logger.warning(
             "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s status=WARN quality_ok=%s soft_fail=%s trade_can_proceed=%s",
@@ -2779,14 +2802,18 @@ def main() -> int:
     
     else:
         # prep_status == "DONE"
-        ledger_repo.append_event(
+        ledger_repo.upsert_prep_event(
             env=env,
-            run_id=run_id,
-            strategy="pb1_pullback_close",
-            run_window="prep",
+            strategy="pb1",
+            as_of=as_of,
+            trade_date=trade_date,
             event_type="PREP_DONE",
-            ts=now_kst(),
-            payload_json=payload,
+            status="READY",
+            reason="prep_completed",
+            final30_count=len(symbols),
+            quality_ok=bool(final30_gate_decision["quality_ok"]),
+            trade_can_proceed=bool(final30_gate_decision["trade_can_proceed"]),
+            run_id=run_id,
         )
         logger.info(
             "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s symbols=%s flow_coverage=%.1f%%",
