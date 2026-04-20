@@ -60,6 +60,7 @@ __all__ = [
     "OrdersRepo",
     "FillsRepo",
     "PositionsRepo",
+    "PracticeAccountResetRepo",
     "LedgerEventsRepo",
     "ReconcileLogRepo",
     "PositionRepo",  # Backward compatibility
@@ -2631,7 +2632,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
-            fail_open=None,
+            fail_open=True,
         )
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
@@ -2707,7 +2708,7 @@ class OrdersRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_blocking_order_today",
-            fail_open=None,
+            fail_open=True,
         )
         if rows:
             return True, rows[0]
@@ -2737,7 +2738,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_orders",
-            fail_open=None,
+            fail_open=True,
         )
 
     def list_orders_in_window(
@@ -2889,6 +2890,7 @@ class FillsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
         self._schema = schema_for_engine(engine)
+        self._last_read_fail_open_op: str | None = None
 
     def _window_expr(self, column):
         if self.engine.dialect.name == "postgresql":
@@ -2909,6 +2911,12 @@ class FillsRepo:
             "operator does not exist" in message
             and "text >= timestamp with time zone" in message
         )
+
+    def consume_fail_open_marker(self, op_name: str) -> bool:
+        if self._last_read_fail_open_op != op_name:
+            return False
+        self._last_read_fail_open_op = None
+        return True
 
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
@@ -2943,6 +2951,7 @@ class FillsRepo:
             conditions.append(self._schema.fills.c.code == str(code).zfill(6))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
         fail_open = _resolve_lookup_fail_open()
+        self._last_read_fail_open_op = None
         try:
             with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
                 rows = conn.execute(stmt).mappings().all()
@@ -2964,6 +2973,7 @@ class FillsRepo:
                     "ENTRY_ABORT_PRECHECK:db_schema_mismatch_fills_filled_at op=fills.list_today_fills [DB][READ][FATAL_SCHEMA_MISMATCH]"
                 ) from exc
             if fail_open:
+                self._last_read_fail_open_op = "fills.list_today_fills"
                 logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", "fills.list_today_fills")
                 return []
             raise
@@ -2976,6 +2986,7 @@ class FillsRepo:
                 exc,
             )
             if fail_open:
+                self._last_read_fail_open_op = "fills.list_today_fills"
                 logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", "fills.list_today_fills")
                 return []
             raise
@@ -3143,11 +3154,6 @@ class LedgerEventsRepo:
         if self.engine.dialect.name == "postgresql":
             return self._schema.ledger_events.c.payload_json["as_of"].astext
         return func.json_extract(self._schema.ledger_events.c.payload_json, "$.as_of")
-
-    def _payload_text_expr(self, key: str) -> sa.sql.ClauseElement:
-        if self.engine.dialect.name == "postgresql":
-            return self._schema.ledger_events.c.payload_json[str(key)].astext
-        return func.json_extract(self._schema.ledger_events.c.payload_json, f"$.{key}")
 
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
@@ -3469,156 +3475,17 @@ class LedgerEventsRepo:
         )
         return None
 
-    def upsert_prep_event(
-        self,
-        *,
-        env: str,
-        strategy: str,
-        as_of: date | str,
-        trade_date: date | str,
-        event_type: str,
-        status: str,
-        reason: str,
-        final30_count: int,
-        quality_ok: bool,
-        trade_can_proceed: bool,
-        run_id: str | None = None,
-        run_window: str | None = "prep",
-    ) -> str | None:
-        schema = self._schema
-        db_url = str(self.engine.url)
-        env_n = _norm_env(env)
-        strategy_n = _norm_strategy(strategy)
-        as_of_date = to_date(as_of)
-        trade_date_date = to_date(trade_date)
-        event_type_n = str(event_type or "").strip().upper()
-        ts = now_kst()
-        if run_id:
-            self.ensure_run_exists(run_id)
-
-        payload_json = json_sanitize(
-            {
-                "env": env_n,
-                "strategy": strategy_n,
-                "as_of": as_of_date.isoformat(),
-                "trade_date": trade_date_date.isoformat(),
-                "event_type": event_type_n,
-                "status": str(status or "").strip(),
-                "reason": str(reason or "").strip(),
-                "final30_count": int(final30_count or 0),
-                "quality_ok": int(bool(quality_ok)),
-                "trade_can_proceed": int(bool(trade_can_proceed)),
-            }
-        )
-        match_stmt = (
-            select(schema.ledger_events.c.ledger_event_id)
-            .where(
-                and_(
-                    schema.ledger_events.c.env == env_n,
-                    schema.ledger_events.c.event_type == event_type_n,
-                    self._payload_text_expr("strategy") == strategy_n,
-                    self._payload_as_of_expr() == as_of_date.isoformat(),
-                    self._payload_text_expr("trade_date") == trade_date_date.isoformat(),
-                )
-            )
-            .order_by(schema.ledger_events.c.created_at.desc())
-            .limit(1)
-        )
-
-        with self.engine.begin() as conn:
-            if run_id is not None:
-                ensure_run(
-                    conn,
-                    schema,
-                    run_id=run_id,
-                    env=env_n,
-                    run_window=run_window,
-                    strategy=strategy_n,
-                    ts=ts,
-                    database_url=db_url,
-                )
-
-            existing_id = conn.execute(match_stmt).scalar()
-            run_id_value = uuid_value_for_url(db_url, run_id) if run_id is not None else None
-            values = {
-                "env": env_n,
-                "run_id": run_id_value,
-                "event_type": event_type_n,
-                "ts": ts,
-                "ok": True,
-                "reasons": [],
-                "stage": run_window,
-                "payload_json": payload_json,
-            }
-            if existing_id is None:
-                values["ledger_event_id"] = _coerce_uuid(None, uses_native_uuid=schema.uses_native_uuid, database_url=db_url)
-                stmt = sa.insert(schema.ledger_events).values(**values).returning(schema.ledger_events.c.ledger_event_id)
-                event_id = str(conn.execute(stmt).scalar())
-            else:
-                update_values = dict(values)
-                if run_id is None:
-                    update_values.pop("run_id", None)
-                conn.execute(
-                    sa.update(schema.ledger_events)
-                    .where(schema.ledger_events.c.ledger_event_id == existing_id)
-                    .values(**update_values)
-                )
-                event_id = str(existing_id)
-
-        logger.info(
-            "[DB][LEDGER][PREP_EVENT][UPSERT_OK] env=%s strategy=%s as_of=%s trade_date=%s event=%s status=%s reason=%s",
-            env_n,
-            strategy_n,
-            as_of_date.isoformat(),
-            trade_date_date.isoformat(),
-            event_type_n,
-            str(status or "").strip(),
-            str(reason or "").strip(),
-        )
-        return event_id
-
-    def get_prep_event(
-        self,
-        *,
-        env: str,
-        strategy: str,
-        as_of: date | str,
-        trade_date: date | str,
-        event_type: str = "PREP_DONE",
-    ) -> dict[str, Any] | None:
-        schema = self._schema
-        stmt = (
-            select(schema.ledger_events)
-            .where(
-                and_(
-                    schema.ledger_events.c.env == _norm_env(env),
-                    schema.ledger_events.c.event_type == str(event_type or "").strip().upper(),
-                    self._payload_text_expr("strategy") == _norm_strategy(strategy),
-                    self._payload_as_of_expr() == to_date(as_of).isoformat(),
-                    self._payload_text_expr("trade_date") == to_date(trade_date).isoformat(),
-                )
-            )
-            .order_by(schema.ledger_events.c.created_at.desc())
-            .limit(1)
-        )
-        with self.engine.connect() as conn:
-            row = conn.execute(stmt).mappings().first()
-        return dict(row) if row is not None else None
-
     def prep_done_status(
         self,
         *,
         env: str,
         as_of: date | str,
         strategies: Iterable[str] | None = None,
-        trade_date: date | str | None = None,
     ) -> tuple[bool, int]:
         schema = self._schema
         as_of_date = to_date(as_of)
         as_of_str = as_of_date.isoformat()
         payload_as_of = self._payload_as_of_expr()
-        payload_strategy = func.lower(self._payload_text_expr("strategy"))
-        payload_trade_date = self._payload_text_expr("trade_date")
         as_of_match = or_(
             func.date(schema.ledger_events.c.ts) == as_of_date,
             payload_as_of == as_of_str,
@@ -3629,32 +3496,16 @@ class LedgerEventsRepo:
             strategies_norm = [s.strip().lower() for s in strategies if s and str(s).strip()]
             if strategies_norm:
                 stmt = stmt.select_from(
-                    schema.ledger_events.outerjoin(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
-                ).where(
-                    or_(
-                        func.lower(schema.runs.c.strategy).in_(strategies_norm),
-                        payload_strategy.in_(strategies_norm),
-                    )
-                )
+                    schema.ledger_events.join(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
+                ).where(func.lower(schema.runs.c.strategy).in_(strategies_norm))
 
-        trade_date_match = None
-        if trade_date is not None:
-            trade_date_date = to_date(trade_date)
-            trade_date_str = trade_date_date.isoformat()
-            trade_date_match = or_(
-                payload_trade_date == trade_date_str,
-                func.date(schema.ledger_events.c.ts) == trade_date_date,
+        stmt = stmt.where(
+            and_(
+                schema.ledger_events.c.env == _norm_env(env),
+                schema.ledger_events.c.event_type == "PREP_DONE",
+                as_of_match,
             )
-
-        conditions = [
-            schema.ledger_events.c.env == _norm_env(env),
-            schema.ledger_events.c.event_type == "PREP_DONE",
-            as_of_match,
-        ]
-        if trade_date_match is not None:
-            conditions.append(trade_date_match)
-
-        stmt = stmt.where(and_(*conditions))
+        )
         with self.engine.connect() as conn:
             count = conn.execute(stmt).scalar() or 0
         return int(count) > 0, int(count)
@@ -4052,6 +3903,168 @@ class PositionsRepo:
                 )
                 restored += 1
         return restored
+
+
+class PracticeAccountResetRepo:
+    _CORE_TABLES = (
+        ("positions", "positions"),
+        ("orders", "orders"),
+        ("fills", "fills"),
+    )
+    _OPTIONAL_TABLES = (
+        "cooldowns",
+        "account_snapshot",
+        "holdings_snapshot",
+        "portfolio_state",
+        "open_orders",
+        "trade_state",
+        "entry_state",
+        "exit_state",
+    )
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+        self._optional_table_cache: dict[str, sa.Table | None] = {}
+
+    def _normalize_env(self, env: str) -> str:
+        env_name = str(env or "").strip().lower()
+        if env_name != "practice":
+            raise RuntimeError(f"Practice account reset is only allowed for env=practice, got env={env_name or 'unknown'}")
+        return env_name
+
+    def _reflect_optional_table(self, table_name: str) -> sa.Table | None:
+        cached = self._optional_table_cache.get(table_name)
+        if table_name in self._optional_table_cache:
+            return cached
+        try:
+            inspector = sa.inspect(self.engine)
+            if not inspector.has_table(table_name):
+                logger.warning("[ACCOUNT_RESET][SKIP] table=%s reason=missing", table_name)
+                self._optional_table_cache[table_name] = None
+                return None
+            table = sa.Table(table_name, sa.MetaData(), autoload_with=self.engine)
+        except Exception as exc:
+            logger.warning("[ACCOUNT_RESET][SKIP] table=%s reason=reflect_failed err=%s", table_name, exc)
+            self._optional_table_cache[table_name] = None
+            return None
+        self._optional_table_cache[table_name] = table
+        return table
+
+    def _resolve_table(self, logical_name: str) -> tuple[sa.Table | None, bool]:
+        for alias, attr_name in self._CORE_TABLES:
+            if alias == logical_name:
+                return getattr(self._schema, attr_name), True
+        return self._reflect_optional_table(logical_name), False
+
+    def _scope_conditions(self, table: sa.Table, *, env: str, account_key: str | None) -> list[Any]:
+        conditions: list[Any] = []
+        for column_name in ("env", "account_env", "strategy_env"):
+            if column_name in table.c:
+                conditions.append(func.lower(sa.cast(table.c[column_name], sa.String)) == env)
+        if account_key and "account_key" in table.c:
+            conditions.append(sa.cast(table.c.account_key, sa.String) == str(account_key))
+        return conditions
+
+    def _count_table(
+        self,
+        conn: sa.Connection,
+        table: sa.Table | None,
+        *,
+        table_name: str,
+        env: str,
+        account_key: str | None,
+        required: bool,
+    ) -> int:
+        if table is None:
+            if required:
+                raise RuntimeError(f"Required practice reset table missing: {table_name}")
+            return 0
+        conditions = self._scope_conditions(table, env=env, account_key=account_key)
+        if not conditions:
+            if required:
+                raise RuntimeError(f"Required practice reset table has no safe scope filter: {table_name}")
+            logger.warning("[ACCOUNT_RESET][SKIP] table=%s reason=unsafe_scope", table_name)
+            return 0
+        stmt = select(func.count()).select_from(table).where(and_(*conditions))
+        return int(conn.execute(stmt).scalar() or 0)
+
+    def count_account_state_rows(self, env: str, account_key: str | None = None) -> dict[str, int]:
+        env_name = self._normalize_env(env)
+        table_names = [name for name, _ in self._CORE_TABLES] + list(self._OPTIONAL_TABLES)
+        counts: dict[str, int] = {}
+        with self.engine.begin() as conn:
+            for table_name in table_names:
+                table, required = self._resolve_table(table_name)
+                counts[table_name] = self._count_table(
+                    conn,
+                    table,
+                    table_name=table_name,
+                    env=env_name,
+                    account_key=account_key,
+                    required=required,
+                )
+        return counts
+
+    def clear_account_state(self, env: str, account_key: str | None = None) -> dict[str, int]:
+        env_name = self._normalize_env(env)
+        cleared_counts: dict[str, int] = {}
+        table_names = [name for name, _ in self._CORE_TABLES] + list(self._OPTIONAL_TABLES)
+        with self.engine.begin() as conn:
+            for table_name in table_names:
+                table, required = self._resolve_table(table_name)
+                if table is None:
+                    if required:
+                        raise RuntimeError(f"Required practice reset table missing: {table_name}")
+                    cleared_counts[table_name] = 0
+                    continue
+                conditions = self._scope_conditions(table, env=env_name, account_key=account_key)
+                if not conditions:
+                    if required:
+                        raise RuntimeError(f"Required practice reset table has no safe scope filter: {table_name}")
+                    logger.warning("[ACCOUNT_RESET][SKIP] table=%s reason=unsafe_scope", table_name)
+                    cleared_counts[table_name] = 0
+                    continue
+                before_count = self._count_table(
+                    conn,
+                    table,
+                    table_name=table_name,
+                    env=env_name,
+                    account_key=account_key,
+                    required=required,
+                )
+                if before_count <= 0:
+                    cleared_counts[table_name] = 0
+                    continue
+                result = conn.execute(sa.delete(table).where(and_(*conditions)))
+                cleared_counts[table_name] = int(result.rowcount or before_count)
+        return cleared_counts
+
+    def insert_reset_ledger_event(
+        self,
+        env: str,
+        account_key: str,
+        capital_krw: int,
+        cleared_counts: dict[str, int],
+    ) -> str | None:
+        env_name = self._normalize_env(env)
+        ledger_repo = LedgerEventsRepo(self.engine)
+        return ledger_repo.append_event(
+            env=env_name,
+            run_id=None,
+            strategy="pb1_pullback_close",
+            run_window="reset",
+            event_type="PRACTICE_ACCOUNT_RESET",
+            ts=now_kst(),
+            ok=True,
+            stage="ACCOUNT_RESET",
+            payload_json={
+                "status": "DONE",
+                "account_key": account_key,
+                "capital_krw": int(capital_krw),
+                "cleared_counts": {key: int(value or 0) for key, value in (cleared_counts or {}).items()},
+            },
+        )
 
 
 class ReconcileLogRepo:

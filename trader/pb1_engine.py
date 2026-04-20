@@ -1384,6 +1384,29 @@ class PB1Engine:
                 logger.error("[PB1][STAGE_TIMEOUT] stage=%s elapsed=%.2f max_sec=%.2f", stage_name, elapsed, max_sec)
                 raise PB1StageTimeout(f"{stage_name}:{elapsed:.2f}>{max_sec:.2f}")
 
+    def _resolve_entry_identity_from_mapping(self, source: dict[str, Any] | None) -> dict[str, str]:
+        payload = source if isinstance(source, dict) else {}
+        entry_reason = self._normalize_entry_reason(
+            payload.get("entry_reason")
+            or payload.get("entry_style_selected")
+            or payload.get("entry_signal")
+        )
+        raw_style = payload.get("entry_style_selected") or payload.get("entry_signal") or entry_reason
+        entry_style_selected = self._normalize_entry_reason(raw_style)
+        if entry_style_selected == "ENTRY_GENERIC":
+            entry_style_selected = entry_reason
+        entry_decision_family = str(payload.get("entry_decision_family") or entry_reason).strip().upper() or entry_reason
+        _, exit_policy_family = self._resolve_exit_family(entry_reason, entry_style_selected)
+        return {
+            "entry_reason": entry_reason,
+            "entry_style_selected": entry_style_selected,
+            "entry_decision_family": entry_decision_family,
+            "exit_policy_family": exit_policy_family,
+        }
+
+    def _resolve_entry_identity_for_candidate(self, cf: CandidateFeature) -> dict[str, str]:
+        return self._resolve_entry_identity_from_mapping(getattr(cf, "features", {}) or {})
+
     def _stage_timeout_sec(self, env_name: str, default: float) -> float:
         raw = os.getenv(env_name)
         if raw is None:
@@ -1411,6 +1434,16 @@ class PB1Engine:
         if marker != op_name:
             return False
         setattr(self.orders_repo, "_last_read_fail_open_op", None)
+        return True
+
+    def _consume_fill_lookup_fail_open(self, op_name: str) -> bool:
+        consume = getattr(self.fills_repo, "consume_fail_open_marker", None)
+        if callable(consume):
+            return bool(consume(op_name))
+        marker = getattr(self.fills_repo, "_last_read_fail_open_op", None)
+        if marker != op_name:
+            return False
+        setattr(self.fills_repo, "_last_read_fail_open_op", None)
         return True
 
     def _safe_get_open_orders(self) -> list[dict]:
@@ -1444,6 +1477,14 @@ class PB1Engine:
             stage=stage,
             trade_date=trade_date,
         )
+
+    def _safe_list_today_fills(self, *, code: str | None = None, side: str | None = None) -> list[dict]:
+        logger.info("[PB1][STAGE][START] stage=fills.lookup_today code=%s side=%s", code, side)
+        rows = self.fills_repo.list_today_fills(self.env, code=code, side=side)
+        if self._consume_fill_lookup_fail_open("fills.list_today_fills"):
+            logger.warning("[PB1][ORDER_LOOKUP][FAIL_OPEN] op=today_fills code=%s side=%s", code, side)
+        logger.info("[PB1][STAGE][END] stage=fills.lookup_today rows=%s code=%s side=%s", len(rows), code, side)
+        return rows
 
     def _resolve_buy_cooldown_state(
         self,
@@ -2240,38 +2281,41 @@ class PB1Engine:
     ) -> tuple[int, int, dict]:
         if base_cash_krw is None:
             base_cash_krw = int(available_cash_krw or 0)
+        raw_base_cash_krw = int(base_cash_krw or 0)
+        effective_base_cash_krw = raw_base_cash_krw
+        clamp_meta = {}
+        if (self.env or "").strip().lower() in {"paper", "practice"}:
+            cap = int(PAPER_MAX_CAPITAL_KRW)
+            if cap > 0 and effective_base_cash_krw > cap:
+                before = effective_base_cash_krw
+                effective_base_cash_krw = cap
+                clamp_meta = {"before": before, "cap": cap, "after": effective_base_cash_krw}
+                logger.info(
+                    "[PB1][CAPITAL][CLAMP] before=%s cap=%s after=%s reason=paper_limit",
+                    before,
+                    cap,
+                    effective_base_cash_krw,
+                )
         use_override = override_capital is not None and int(override_capital) > 0
-        usable = max(int(base_cash_krw * (1 - reserve_pct)), 0)
+        usable = max(int(effective_base_cash_krw * (1 - reserve_pct)), 0)
         entry_capital = usable
         if use_override:
             entry_capital = min(entry_capital, int(override_capital))
         cap_limit = None
         cap_applied = False
         if self.intended_live and CAP_CAP and CAP_CAP > 0:
-            cap_limit = int(base_cash_krw * CAP_CAP) if CAP_CAP <= 1 else int(CAP_CAP)
+            cap_limit = int(effective_base_cash_krw * CAP_CAP) if CAP_CAP <= 1 else int(CAP_CAP)
             if cap_limit > 0 and entry_capital > cap_limit:
                 entry_capital = cap_limit
                 cap_applied = True
-        clamp_meta = {}
-        if (self.env or "").lower() == "paper":
-            cap = min(int(base_cash_krw), int(PAPER_MAX_CAPITAL_KRW))
-            if entry_capital > cap:
-                before = entry_capital
-                entry_capital = cap
-                clamp_meta = {"before": before, "cap": cap, "after": entry_capital}
-                logger.info(
-                    "[PB1][CAPITAL][CLAMP] before=%s cap=%s after=%s reason=paper_limit",
-                    before,
-                    cap,
-                    entry_capital,
-                )
         meta = {
             "use_override": use_override,
             "reserve_pct": reserve_pct,
             "cap_limit": cap_limit,
             "cap_applied": cap_applied,
             "clamp": clamp_meta,
-            "base_cash": base_cash_krw,
+            "base_cash": effective_base_cash_krw,
+            "raw_base_cash": raw_base_cash_krw,
         }
         return entry_capital, usable, meta
 
@@ -3858,20 +3902,16 @@ class PB1Engine:
         entry_price_planned: float,
         entry_price_filled: float | None = None,
     ) -> dict[str, Any]:
-        entry_reason = self._normalize_entry_reason(
-            cf.features.get("entry_reason")
-            or cf.features.get("entry_signal")
-            or cf.features.get("entry_style_selected")
-        )
+        identity = self._resolve_entry_identity_for_candidate(cf)
+        entry_reason = identity["entry_reason"]
         score_lookup = {
             "ENTRY_BREAKOUT": cf.features.get("breakout_score"),
             "ENTRY_PULLBACK": cf.features.get("pullback_score"),
             "ENTRY_MOMENTUM": cf.features.get("momentum_score"),
         }
-        normalized_entry_style = str(
-            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or "unknown"
-        ).strip().upper()
-        resolved_entry_reason, exit_family = self._resolve_exit_family(entry_reason, normalized_entry_style)
+        normalized_entry_style = identity["entry_style_selected"]
+        resolved_entry_reason = identity["entry_reason"]
+        exit_family = identity["exit_policy_family"]
         trace_id = str(cf.features.get("trace_id") or f"{self.run_id or 'NORUN'}:{self._today}:{cf.code}:{cf.mode}")
         missing_reference_fields = [
             key
@@ -3883,7 +3923,7 @@ class PB1Engine:
                 "trace_id": trace_id,
                 "entry_reason": resolved_entry_reason,
                 "entry_style_selected": normalized_entry_style,
-                "entry_decision_family": cf.features.get("entry_decision_family") or "SETUP_OVERRIDE",
+                "entry_decision_family": identity["entry_decision_family"],
                 "entry_component": cf.features.get("entry_component") or cf.features.get("entry_signal") or normalized_entry_style,
                 "entry_signal_score": score_lookup.get(resolved_entry_reason),
                 "score_final_at_entry": cf.features.get("score_final") or cf.features.get("final_score") or cf.features.get("score"),
@@ -3907,9 +3947,91 @@ class PB1Engine:
                 "trigger_snapshot_json": cf.features.get("trigger_snapshot_json") or {},
                 "entry_rule_version": cf.features.get("entry_rule_version") or "pb1_entry_reason_v1",
                 "exit_policy_family": exit_family,
+                "entry_reason_source": "candidate_features",
                 "setup_snapshot_missing_fields": missing_reference_fields,
             }
         )
+
+    def _portfolio_risk_diag_settings(self) -> dict[str, Any]:
+        return {
+            "sector_max_positions": self._int_env("PB1_SECTOR_MAX_POSITIONS", 0),
+            "theme_max_weight": self._float_env("PB1_THEME_MAX_WEIGHT", 0.0),
+            "daily_new_entry_limit_by_regime": self._int_env("PB1_DAILY_NEW_ENTRY_LIMIT_BY_REGIME", 0),
+            "account_drawdown_new_entry_block": self._float_env("PB1_ACCOUNT_DRAWDOWN_NEW_ENTRY_BLOCK", 0.0),
+            "weekly_loss_limit": self._float_env("PB1_WEEKLY_LOSS_LIMIT", 0.0),
+        }
+
+    def _log_portfolio_risk_diagnostics(
+        self,
+        *,
+        existing_positions: list[dict[str, Any]],
+        total_cash_krw: float,
+        available_cash_krw: float,
+        target_new_positions: int,
+    ) -> None:
+        settings = self._portfolio_risk_diag_settings()
+        sector_counts: Counter[str] = Counter()
+        theme_weights: Counter[str] = Counter()
+        total_position_cost = 0.0
+        for row in existing_positions or []:
+            meta = row.get("entry_meta_json") if isinstance(row.get("entry_meta_json"), dict) else {}
+            sector = str(meta.get("sector") or row.get("sector") or "").strip()
+            theme = str(meta.get("theme") or row.get("theme") or "").strip()
+            cost = float(row.get("total_cost") or 0.0)
+            total_position_cost += cost
+            if sector:
+                sector_counts[sector] += 1
+            if theme:
+                theme_weights[theme] += cost
+        denominator = max(float(total_cash_krw) + float(total_position_cost), 1.0)
+        normalized_theme_weights = {
+            key: round(float(value) / denominator, 4)
+            for key, value in theme_weights.items()
+        }
+        logger.info(
+            "[RISK][DIAG] sector_max_positions=%s theme_max_weight=%s daily_new_entry_limit_by_regime=%s account_drawdown_new_entry_block=%s weekly_loss_limit=%s enforced=0",
+            settings["sector_max_positions"],
+            settings["theme_max_weight"],
+            settings["daily_new_entry_limit_by_regime"],
+            settings["account_drawdown_new_entry_block"],
+            settings["weekly_loss_limit"],
+        )
+        logger.info(
+            "[RISK][DIAG][PORTFOLIO] positions=%s total_cash_krw=%s available_cash_krw=%s target_new_positions=%s sector_counts=%s theme_weights=%s",
+            len(existing_positions or []),
+            int(total_cash_krw or 0),
+            int(available_cash_krw or 0),
+            int(target_new_positions or 0),
+            dict(sector_counts),
+            normalized_theme_weights,
+        )
+
+    def _resolve_force_exit_simulation(self, *, code: str, orderable_qty: int, exit_policy_family: str) -> dict[str, Any] | None:
+        if not env_bool("FORCE_EXIT_SIMULATION", False):
+            return None
+        requested_code = str(os.getenv("FORCE_EXIT_CODE") or "").strip().zfill(6)
+        if requested_code and requested_code != str(code or "").zfill(6):
+            return None
+        requested_reason = str(os.getenv("FORCE_EXIT_REASON") or "STOP_HIT").strip().upper() or "STOP_HIT"
+        valid_reasons = {"STOP_HIT", "FAILED_BREAKOUT", "TP1", "TP2", "TRAIL_STOP"}
+        if requested_reason not in valid_reasons:
+            requested_reason = "STOP_HIT"
+        qty = int(orderable_qty or 0)
+        if requested_reason == "TP1":
+            qty = max(1, int(np.ceil(float(orderable_qty or 0) * float(TP1_SELL_PCT))))
+        elif requested_reason == "TP2":
+            qty = max(1, int(np.ceil(float(orderable_qty or 0) * float(TP2_SELL_PCT))))
+        family_hint = exit_policy_family or "GENERIC_EXIT"
+        if requested_reason == "FAILED_BREAKOUT":
+            family_hint = "PULLBACK_EXIT"
+        elif requested_reason in {"TP1", "TP2", "TRAIL_STOP"}:
+            family_hint = "MOMENTUM_EXIT"
+        return {
+            "reason": requested_reason,
+            "qty": min(max(1, qty), max(1, int(orderable_qty or 0))),
+            "stage": requested_reason,
+            "exit_policy_family": family_hint,
+        }
 
     @staticmethod
     def _entry_meta_position_fields(entry_meta: dict[str, Any]) -> dict[str, Any]:
@@ -6246,17 +6368,13 @@ class PB1Engine:
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
         display_code = self._display_code(cf.code)
-        decision_reason = str(
-            cf.features.get("entry_reason")
-            or cf.features.get("entry_decision_family")
-            or cf.features.get("entry_style_selected")
-            or ReasonCode.ENTRY_BREAKOUT
-        )
+        identity = self._resolve_entry_identity_for_candidate(cf)
+        decision_reason = identity["entry_reason"]
         logger.info(
             "[TRADE][DECISION][BUY] code=%s name=%s family=%s decision_reason=%s score=%.1f entry=%.2f stop=%.2f risk_pct=%.2f qty=%s budget=%.0f no_trade=%s",
             display_code,
             self._code_name_map.get(cf.code),
-            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            identity["entry_style_selected"],
             decision_reason,
             float(cf.features.get("score") or 0.0),
             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
@@ -6328,7 +6446,7 @@ class PB1Engine:
         logger.info(
             "[PB1][ENTRY][WHY] code=%s selected_family=%s trigger_policy=%s reason_codes=%s reason_text=%s features_snapshot=%s stage=%s",
             display_code,
-            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            identity["entry_style_selected"],
             cf.features.get("entry_trigger_policy") or "NONE",
             reasons,
             ", ".join(reasons),
@@ -6998,17 +7116,13 @@ class PB1Engine:
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
         display_code = self._display_code(cf.code)
-        decision_reason = str(
-            cf.features.get("entry_reason")
-            or cf.features.get("entry_decision_family")
-            or cf.features.get("entry_style_selected")
-            or ReasonCode.ENTRY_BREAKOUT
-        )
+        identity = self._resolve_entry_identity_for_candidate(cf)
+        decision_reason = identity["entry_reason"]
         logger.info(
             "[TRADE][DECISION][BUY] code=%s name=%s family=%s decision_reason=%s score=%.1f entry=%.2f stop=%.2f qty=%s no_trade=%s",
             display_code,
             self._code_name_map.get(cf.code),
-            cf.features.get("entry_style_selected") or cf.features.get("entry_signal") or decision_reason,
+            identity["entry_style_selected"],
             decision_reason,
             float(cf.features.get("score") or 0.0),
             float(cf.features.get("entry_price") or cf.features.get("close") or 0.0),
@@ -7434,7 +7548,12 @@ class PB1Engine:
 
         entry_reason_value = pos.get("entry_reason") or (pos.get("entry_meta_json") or {}).get("entry_reason")
         entry_style_selected = pos.get("entry_style_selected") or (pos.get("entry_meta_json") or {}).get("entry_style_selected")
-        entry_reason_normalized, _exit_family = self._resolve_exit_family(entry_reason_value, entry_style_selected)
+        entry_reason_normalized, resolved_exit_family = self._resolve_exit_family(entry_reason_value, entry_style_selected)
+        exit_policy_family = str(
+            pos.get("exit_policy_family")
+            or (pos.get("entry_meta_json") or {}).get("exit_policy_family")
+            or resolved_exit_family
+        )
         logger.info(
             "[EXIT][POSITION_META] code=%s entry_reason=%s entry_style_selected=%s stop_price_at_entry=%s pivot_price_at_entry=%s meta_ok=%s",
             display_code,
@@ -7444,7 +7563,6 @@ class PB1Engine:
             pos.get("pivot_price_at_entry"),
             int(bool(entry_reason_value or entry_style_selected)),
         )
-
         entry_ts_value = pos.get("last_fill_at") or pos.get("entry_date") or pos.get("entry_ts")
         entry_ts = None
         days_held = int(pos.get("holding_days") or 0)
@@ -7476,6 +7594,15 @@ class PB1Engine:
 
         failed_breakout = False
         pivot = self._to_float(pos.get("pivot") or pos.get("pivot_price_at_entry"))
+        logger.info(
+            "[EXIT][POLICY] code=%s entry_reason=%s entry_style_selected=%s exit_policy_family=%s stop_price_at_entry=%s pivot_price_at_entry=%s",
+            display_code,
+            entry_reason_normalized,
+            entry_style_selected,
+            exit_policy_family,
+            pos.get("stop_price_at_entry") or stop_price,
+            pos.get("pivot_price_at_entry") or pivot,
+        )
         if pivot and close_px is not None and entry_ts is not None:
             failed_breakout = (self._now_kst.date() - entry_ts.date()).days <= FAILED_BREAKOUT_EXIT_DAYS and close_px < pivot
 
@@ -7542,6 +7669,9 @@ class PB1Engine:
         risk_off_hit = bool(exit_policy["risk_off_hit"])
         take_profit_threshold = float(TAKE_PROFIT_R1)
         take_profit_hit = bool((ret_pct / 100.0) >= take_profit_threshold)
+        tp2_threshold = float(TAKE_PROFIT_R2)
+        tp1_hit = bool((ret_pct / 100.0) >= take_profit_threshold)
+        tp2_hit = bool((ret_pct / 100.0) >= tp2_threshold)
 
         triggered: list[str] = []
         if stop_hit:
@@ -7631,6 +7761,35 @@ class PB1Engine:
             },
         }
         logger.info("[EXIT][COND] code=%s conds=%s", display_code, conds)
+        if exit_policy_family == "PULLBACK_EXIT":
+            rule_checks = [
+                ("failed_breakout", failed_breakout, {"days_held": days_held, "pivot": pivot, "close": close_px}),
+                ("time_stop", time_stop_hit, {"days_held": days_held, "threshold": int(PB1_TIME_STOP_DAYS), "pnl_pct": ret_pct}),
+                ("hard_stop", stop_hit, {"mark": mark, "stop_price": stop_price}),
+            ]
+        elif exit_policy_family == "MOMENTUM_EXIT":
+            rule_checks = [
+                ("trail_stop", trail_hit, {"mark": mark, "trail_stop_price": trail_stop_price, "holding_bars": post_entry_rows}),
+                ("TP1", tp1_hit, {"actual_r": float(ret_pct / 100.0), "threshold_r": take_profit_threshold}),
+                ("TP2", tp2_hit, {"actual_r": float(ret_pct / 100.0), "threshold_r": tp2_threshold}),
+                ("hard_stop", stop_hit, {"mark": mark, "stop_price": stop_price}),
+            ]
+        else:
+            rule_checks = [
+                ("hard_stop", stop_hit, {"mark": mark, "stop_price": stop_price}),
+                ("trail_stop", trail_hit, {"mark": mark, "trail_stop_price": trail_stop_price, "holding_bars": post_entry_rows}),
+                ("failed_breakout", failed_breakout, {"days_held": days_held, "pivot": pivot, "close": close_px}),
+                ("time_stop", time_stop_hit, {"days_held": days_held, "threshold": int(PB1_TIME_STOP_DAYS), "pnl_pct": ret_pct}),
+            ]
+        for rule_name, rule_hit, details in rule_checks:
+            logger.info(
+                "[EXIT][RULE_CHECK] code=%s family=%s rule=%s hit=%s details=%s",
+                display_code,
+                exit_policy_family,
+                rule_name,
+                int(bool(rule_hit)),
+                details,
+            )
         logger.info(
             "[EXIT][DECISION] code=%s days_held=%s same_day=%s holding_bars=%s hard_stop=%s trail_hit=%s trail_eligible=%s ma50_break=%s regime_exit=%s final_reason=%s",
             display_code,
@@ -7689,6 +7848,7 @@ class PB1Engine:
                 "entry_reason": entry_reason_normalized,
                 "entry_style_selected": entry_style_selected,
                 "exit_family": exit_eval.family,
+                "exit_policy_family": exit_policy_family,
                 "entry_price": float(pos.get("entry_price") or avg),
                 "current_price": mark,
                 "stop_price_at_entry": pos.get("stop_price_at_entry") or stop_price,
@@ -7721,7 +7881,7 @@ class PB1Engine:
             sid=sid,
             mode=mode,
             code=code,
-            fields={"exit_policy_family": exit_eval.family, "last_exit_eval_json": exit_eval_payload},
+            fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
         )
 
         logger.info(
@@ -7754,8 +7914,20 @@ class PB1Engine:
             reasons=[exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
         )
         if not exit_eval.exit_ok:
-            logger.info("[EXIT][SKIP] code=%s reason=%s", display_code, exit_eval.primary_reason)
-            return exit_eval_payload
+            forced_simulation = self._resolve_force_exit_simulation(
+                code=code,
+                orderable_qty=int(pos.get("orderable_qty") or qty),
+                exit_policy_family=exit_policy_family,
+            )
+            if forced_simulation is None:
+                logger.info("[EXIT][SKIP] code=%s reason=%s", display_code, exit_eval.primary_reason)
+                return exit_eval_payload
+        else:
+            forced_simulation = self._resolve_force_exit_simulation(
+                code=code,
+                orderable_qty=int(pos.get("orderable_qty") or qty),
+                exit_policy_family=exit_policy_family,
+            )
 
         signal_reason_labels = {
             "EXIT_HARD_STOP": "hard_stop",
@@ -7778,12 +7950,55 @@ class PB1Engine:
             return exit_eval_payload
 
         stage = exit_eval.primary_reason
+        simulated_client_key = None
+        if forced_simulation is not None:
+            stage = str(forced_simulation["stage"])
+            orderable_qty = int(forced_simulation["qty"])
+            simulated_client_key = self._client_order_key(code, mode, "SELL", window_tag, stage)
+            simulated_payload = {
+                "code": code,
+                "market": market,
+                "side": "SELL",
+                "ord_type": "MARKET",
+                "qty": orderable_qty,
+                "limit_price": mark,
+                "stage": stage,
+                "client_order_key": simulated_client_key,
+                "reason": forced_simulation["reason"],
+                "exit_policy_family": forced_simulation["exit_policy_family"],
+            }
+            exit_eval_payload.update(
+                {
+                    "exit_ok": True,
+                    "primary_reason": forced_simulation["reason"],
+                    "reasons": [forced_simulation["reason"]],
+                    "decision_reason": forced_simulation["reason"],
+                    "secondary_reasons": [],
+                    "orderable_qty": orderable_qty,
+                    "stage": stage,
+                    "client_order_key": simulated_client_key,
+                    "simulated_order_payload": simulated_payload,
+                    "force_exit_simulation": True,
+                    "order_skip_reasons": ["force_exit_simulation"],
+                }
+            )
+            logger.info(
+                "[EXIT][SIMULATION] code=%s requested_reason=%s qty=%s stage=%s client_order_key=%s order_allowed=%s payload=%s",
+                display_code,
+                forced_simulation["reason"],
+                orderable_qty,
+                stage,
+                simulated_client_key,
+                int(bool(self.order_allowed)),
+                simulated_payload,
+            )
+            return exit_eval_payload
         logger.info(
             "[EXIT][ORDER_READY] code=%s qty=%s family=%s reason=%s",
             display_code,
-            qty,
-            exit_eval.family,
-            exit_eval.primary_reason,
+            orderable_qty,
+            exit_policy_family,
+            stage,
         )
 
         submit_block_reasons = self._resolve_exit_submit_gate_reasons(code=code)
@@ -7819,7 +8034,7 @@ class PB1Engine:
                 market=market,
                 side="SELL",
                 ord_type="MARKET",
-                qty=qty,
+                qty=orderable_qty,
                 limit_price=mark,
                 stage=stage,
                 client_order_key=client_key,
@@ -7835,14 +8050,14 @@ class PB1Engine:
         logger.info(
             "[EXIT][SUBMIT] code=%s qty=%s order_type=market family=%s reason=%s",
             display_code,
-            qty,
-            exit_eval.family,
-            exit_eval.primary_reason,
+            orderable_qty,
+            exit_policy_family,
+            stage,
         )
         logger.info(
             "[PB1][EXIT][WHY] code=%s qty=%s mark=%s avg=%s ret_pct=%.2f exit_reason_codes=%s exit_reason_text=%s holding_days=%s stage=%s",
             display_code,
-            qty,
+            orderable_qty,
             mark,
             avg,
             ret_pct,
@@ -7852,7 +8067,7 @@ class PB1Engine:
             stage,
         )
         if self.dry_run:
-            logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
+            logger.info("[PB1][EXIT-DRY] code=%s qty=%s key=%s order_id=%s", display_code, orderable_qty, client_key, order_id)
             return exit_eval_payload
 
         if not self.kis:
@@ -7863,7 +8078,7 @@ class PB1Engine:
             market=market,
             mode=mode,
             side="SELL",
-            qty=qty,
+            qty=orderable_qty,
             price=float(mark or 0.0),
             client_order_key=client_key,
             stage=stage,
@@ -7879,7 +8094,7 @@ class PB1Engine:
             event="ORDER_SUBMIT",
             side="SELL",
             code=code,
-            qty=qty,
+            qty=orderable_qty,
             price=float(mark),
             order_type="MARKET",
             client_order_key=client_key,
@@ -7887,7 +8102,7 @@ class PB1Engine:
         resp = None
         kis_odno = None
         try:
-            resp = self.kis.sell_stock_market(code, qty)
+            resp = self.kis.sell_stock_market(code, orderable_qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
         except Exception:
             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
@@ -7929,7 +8144,7 @@ class PB1Engine:
                 code=code,
                 market=market,
                 side="SELL",
-                qty=qty,
+                qty=orderable_qty,
                 price=mark,
                 fee=0.0,
                 tax=0.0,
@@ -7944,7 +8159,7 @@ class PB1Engine:
                 code=code,
                 market=market,
                 side="SELL",
-                qty=qty,
+                qty=orderable_qty,
                 price=mark,
                 fee=0.0,
                 tax=0.0,
@@ -8133,6 +8348,16 @@ class PB1Engine:
                 submit_drop_count,
                 submit_drop_reasons or ["ORDER_NOT_SUBMITTED"],
             )
+        family_counter = Counter(
+            str((evaluation.get("exit_policy_family") or evaluation.get("exit_family") or "UNKNOWN"))
+            for evaluation in exit_evaluations
+        )
+        reason_counter = Counter(
+            str(evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
+            for evaluation in exit_evaluations
+        )
+        logger.info("[EXIT][SUMMARY_BY_FAMILY] counts=%s", dict(family_counter))
+        logger.info("[EXIT][SUMMARY_BY_REASON] counts=%s", dict(reason_counter))
         return pos_list
 
     def _load_close_entry_orders(self) -> list[dict]:
@@ -9640,7 +9865,11 @@ class PB1Engine:
         if order_possible_cash_krw > 0:
             available_cash_krw = order_possible_cash_krw
         self.order_possible_cash_krw = float(order_possible_cash_krw)
-        base_cash_krw = min(total_cash_krw, order_possible_cash_krw)
+        if PB1_CAPITAL_MODE == "CASH":
+            base_cash_krw = int(order_possible_cash_krw or total_cash_krw or available_cash_krw)
+        else:
+            positive_cash_values = [value for value in (total_cash_krw, order_possible_cash_krw) if int(value or 0) > 0]
+            base_cash_krw = min(positive_cash_values) if positive_cash_values else int(available_cash_krw)
         self.entry_base_cash_krw = float(base_cash_krw)
         if entry_phase:
             reserve_pct = min(max(float(PB1_CASH_RESERVE_PCT), 0.0), 1.0)
@@ -9657,14 +9886,14 @@ class PB1Engine:
             tick_budget_krw = int(entry_capital_krw * budget_pct)
             self.entry_tick_budget_krw = float(tick_budget_krw)
             logger.info(
-                "[PB1][CAPITAL] mode=%s override=%s total_cash=%s order_possible_cash=%s base_cash=%s reserve=%.2f usable=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
+                "[PB1][CAPITAL] mode=%s total_cash=%s order_possible_cash=%s reserve_pct=%.2f usable=%s base_cash=%s override=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
                 PB1_CAPITAL_MODE,
-                override_capital,
                 total_cash_krw,
                 order_possible_cash_krw,
-                base_cash_krw,
                 reserve_pct,
                 entry_usable_krw,
+                base_cash_krw,
+                override_capital,
                 int(capital_meta.get("use_override") or 0),
                 entry_capital_krw,
                 capital_meta.get("cap_limit"),
@@ -9739,14 +9968,20 @@ class PB1Engine:
             target_new_positions = 0
         self.target_new_positions = target_new_positions
         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
+        self._log_portfolio_risk_diagnostics(
+            existing_positions=existing_positions,
+            total_cash_krw=float(total_cash_krw),
+            available_cash_krw=float(available_cash_krw),
+            target_new_positions=int(target_new_positions),
+        )
         logger.info(
-            "[PB1][RUN-START] PB1_MAX_POSITIONS=%s PB1_TARGET_NEW_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s EXISTING_POSITIONS_COUNT=%s AVAILABLE_CASH_KRW=%s TICK_BUDGET_KRW=%s ADD_TO_EXISTING=%s",
-            max_positions,
+            "[PB1][RUN-START] EXISTING_POSITIONS_COUNT=%s PB1_TARGET_NEW_POSITIONS=%s PB1_MAX_POSITIONS=%s PB1_ENTRY_CAPITAL_KRW=%.0f MIN_ORDER_KRW=%.0f ENTRY_CUTOFF_TIME=%s AVAILABLE_CASH_KRW=%s TICK_BUDGET_KRW=%s ADD_TO_EXISTING=%s",
+            existing_positions_count,
             target_new_positions,
+            max_positions,
             entry_capital_krw,
             min_order_krw,
             entry_cutoff_raw,
-            existing_positions_count,
             available_cash_krw,
             tick_budget_krw,
             allow_add_to_existing,
@@ -10385,6 +10620,20 @@ class PB1Engine:
                         no_signal_count,
                         dt_entry_signals,
                     )
+                    filter_no_signal = os.getenv("ENTRY_SIGNAL_REQUIRED", "0") == "1"
+                    scanner_pass_count = breakout_count + pullback_count + momentum_count
+                    if filter_no_signal:
+                        logger.info(
+                            "[ENTRY][SCANNER][GATE] passed=%s no_signal=%s required=1",
+                            scanner_pass_count,
+                            no_signal_count,
+                        )
+                    else:
+                        logger.info(
+                            "[ENTRY][SCANNER][DIAG_ONLY] passed=%s no_signal=%s required=0 note=scanner_is_not_authoritative_order_gate",
+                            scanner_pass_count,
+                            no_signal_count,
+                        )
                     logger.info("[ENTRY_SCAN] breakout signals=%s", breakout_count)
                     logger.info("[ENTRY_SCAN] pullback signals=%s", pullback_count)
                     logger.info("[ENTRY_SCAN] momentum signals=%s", momentum_count)
@@ -10395,7 +10644,6 @@ class PB1Engine:
                     )
                     
                     # Entry signal이 없는 종목 필터링 (옵션)
-                    filter_no_signal = os.getenv("ENTRY_SIGNAL_REQUIRED", "0") == "1"
                     if filter_no_signal:
                         before_filter = len([c for c in candidates if c.features.get("data_ok")])
                         for cf in candidates:
@@ -10536,12 +10784,13 @@ class PB1Engine:
                     balance_tick_cache_hits=self.balance_tick_cache_hits,
                 )
             
-            minervini_report_path = run_minervini_report(
-                scan_members,
-                self.minervini_config,
-                as_of=self._today,
-                candidates=candidates,
-            )
+            with self._stage_timer("entry.minervini_report"):
+                minervini_report_path = run_minervini_report(
+                    scan_members,
+                    self.minervini_config,
+                    as_of=self._today,
+                    candidates=candidates,
+                )
             logger.info("[PB1][STAGE][CHECKPOINT] stage=minervini_report_saved")
             self.top_candidates = [
                 {
@@ -10566,17 +10815,25 @@ class PB1Engine:
             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
-            with self._stage_timer("entry.open_orders_lookup"):
+            with self._stage_timer("entry.orders_lookup"):
                 open_orders = self._safe_get_open_orders()
-            open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
-            try:
-                with self._stage_timer("entry.today_buy_orders_lookup"):
+                open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+                try:
                     today_orders = self._safe_list_today_orders(side="BUY")
-            except Exception as e:
-                logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
-                if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
-                    raise
-                today_orders = []
+                except Exception as e:
+                    logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
+                    if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
+                        raise
+                    today_orders = []
+            logger.info(
+                "[ENTRY][ENGINE_GATE][AUTHORITATIVE] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates_prebuild=%s scanner_passed=%s",
+                len(setup_ok_codes),
+                len(self._debug_risk_ok_codes),
+                len(self._debug_sizing_ok_codes),
+                len(buyable_ok_codes),
+                len(orderable_candidates),
+                int(locals().get("scanner_pass_count", 0) or 0),
+            )
             logger.info(
                 "[PB1][ORDER_LOOKUP][RESULT] open_orders=%s today_buy_orders=%s",
                 len(open_orders or []),
@@ -10668,11 +10925,7 @@ class PB1Engine:
                             continue
 
                         with self._stage_timer(f"entry.buyable_gate.today_fills_lookup.{code_key}"):
-                            today_fills = self.fills_repo.list_today_fills(
-                                self.env,
-                                side="BUY",
-                                code=cf.code,
-                            )
+                            today_fills = self._safe_list_today_fills(side="BUY", code=cf.code)
                         logger.info(
                             "[PB1][TODAY_FILLS][RESULT] code=%s fills=%s",
                             code_key,
@@ -11308,6 +11561,19 @@ class PB1Engine:
                 len(orderable_codes),
                 orderable_codes,
             )
+            logger.info(
+                "[ENTRY][ENGINE_GATE][AUTHORITATIVE] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s final_orders=%s",
+                len(setup_ok_codes),
+                len(self._debug_risk_ok_codes),
+                len(self._debug_sizing_ok_codes),
+                len(buyable_ok_codes),
+                len(orderable_codes),
+            )
+            if int(locals().get("scanner_pass_count", 0) or 0) == 0 and len(orderable_codes) > 0:
+                logger.info(
+                    "[ENTRY][SCANNER][EXPLAIN] scanner_passed=0 engine_orders=%s reason=scanner_signals_are_diagnostic_but_engine_gate_is_authoritative",
+                    len(orderable_codes),
+                )
             relax_debug_payload["final_orderable_codes"] = orderable_codes
 
             after_buyable_check_count = len(buyable_ok_codes)
@@ -11667,61 +11933,63 @@ class PB1Engine:
                     )
                 
                 # [ORDER][BUILD] - 주문 생성 시작
-                t_order_build = time.monotonic()
-                order_symbols = [cf.code for cf in orderable_candidates]
-                logger.info(
-                    "[ORDER][BUILD] trace=%s count=%s symbols=%s",
-                    trace_id,
-                    len(orderable_candidates),
-                    ",".join(order_symbols[:10]) + ("..." if len(order_symbols) > 10 else ""),
-                )
-                dt_order_build = time.monotonic() - t_order_build
+                with self._stage_timer("entry.order_build"):
+                    t_order_build = time.monotonic()
+                    order_symbols = [cf.code for cf in orderable_candidates]
+                    logger.info(
+                        "[ORDER][BUILD] trace=%s count=%s symbols=%s",
+                        trace_id,
+                        len(orderable_candidates),
+                        ",".join(order_symbols[:10]) + ("..." if len(order_symbols) > 10 else ""),
+                    )
+                    dt_order_build = time.monotonic() - t_order_build
                 
                 # [ORDER][SUBMIT] - 주문 제출
-                t_order_submit = time.monotonic()
-                attempted_count = 0
-                api_submitted_count = 0
-                accepted_count = 0
-                filled_count = 0
-                failed_count = 0
-                rejected_count = 0
-                skipped_count = 0
-                submit_attempt_count = len(orderable_candidates)
-                if not entry_allowed:
-                    logger.info(
-                        "[ORDER_SUBMIT][SKIP] reason=LIVE_GATE_BLOCKED count=%s",
-                        len(orderable_candidates),
-                    )
-                    skipped_count = len(orderable_candidates)
-                else:
-                    for cf in orderable_candidates:
-                        try:
-                            logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
-                            if self.window_internal == "close":
-                                order_status = self._place_entry_close(cf)
-                            else:
-                                order_status = self._place_entry(cf)
-                            terminal_event = str(order_status.get("terminal_event") or "")
-                            if terminal_event not in {"API_RESULT", "FINAL_SKIP"}:
-                                raise RuntimeError(
-                                    f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}"
+                with self._stage_timer("entry.order_submit"):
+                    t_order_submit = time.monotonic()
+                    attempted_count = 0
+                    api_submitted_count = 0
+                    accepted_count = 0
+                    filled_count = 0
+                    failed_count = 0
+                    rejected_count = 0
+                    skipped_count = 0
+                    submit_attempt_count = len(orderable_candidates)
+                    if not entry_allowed:
+                        logger.info(
+                            "[ORDER_SUBMIT][SKIP] reason=LIVE_GATE_BLOCKED count=%s",
+                            len(orderable_candidates),
+                        )
+                        skipped_count = len(orderable_candidates)
+                    else:
+                        for cf in orderable_candidates:
+                            try:
+                                logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
+                                if self.window_internal == "close":
+                                    order_status = self._place_entry_close(cf)
+                                else:
+                                    order_status = self._place_entry(cf)
+                                terminal_event = str(order_status.get("terminal_event") or "")
+                                if terminal_event not in {"API_RESULT", "FINAL_SKIP"}:
+                                    raise RuntimeError(
+                                        f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}"
+                                    )
+                                attempted_count += int(order_status.get("submit_attempted", 0) or 0)
+                                api_submitted_count += int(order_status.get("api_submitted", 0) or 0)
+                                accepted_count += int(order_status.get("accepted", 0) or 0)
+                                filled_count += int(order_status.get("filled", 0) or 0)
+                                rejected_count += int(order_status.get("rejected", 0) or 0)
+                                skipped_count += int(order_status.get("skipped", 0) or 0)
+                                failed_count += int(order_status.get("failed", 0) or 0)
+                            except Exception as e:
+                                failed_count += 1
+                                logger.exception(
+                                    "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
+                                    trace_id,
+                                    cf.code,
+                                    str(e),
                                 )
-                            attempted_count += int(order_status.get("submit_attempted", 0) or 0)
-                            api_submitted_count += int(order_status.get("api_submitted", 0) or 0)
-                            accepted_count += int(order_status.get("accepted", 0) or 0)
-                            filled_count += int(order_status.get("filled", 0) or 0)
-                            rejected_count += int(order_status.get("rejected", 0) or 0)
-                            skipped_count += int(order_status.get("skipped", 0) or 0)
-                            failed_count += int(order_status.get("failed", 0) or 0)
-                        except Exception as e:
-                            failed_count += 1
-                            logger.exception(
-                                "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
-                                trace_id,
-                                cf.code,
-                                str(e),
-                            )
-                dt_order_submit = time.monotonic() - t_order_submit
+                    dt_order_submit = time.monotonic() - t_order_submit
                 submit_success_count = api_submitted_count
                 
                 logger.info(

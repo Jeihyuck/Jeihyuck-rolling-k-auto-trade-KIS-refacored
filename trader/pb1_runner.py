@@ -83,6 +83,7 @@ from trader.db.repos import (
     LedgerEventsRepo,
     OrdersRepo,
     PositionsRepo,
+    PracticeAccountResetRepo,
     ReconcileLogRepo,
     RunsRepo,
     ScoredWatchlistInvalidError,
@@ -2825,6 +2826,113 @@ def _extract_dnca_total(balance_snapshot: dict | None) -> int | None:
         return None
 
 
+def _extract_kis_holdings_count(balance_snapshot: dict | None) -> int | None:
+    if not isinstance(balance_snapshot, dict):
+        return None
+    rows = balance_snapshot.get("output1")
+    if not isinstance(rows, list):
+        return None
+    count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        qty_raw = row.get("hldg_qty") or row.get("qty") or row.get("ord_psbl_qty") or 0
+        try:
+            qty = int(float(str(qty_raw).replace(",", "")))
+        except Exception:
+            qty = 0
+        if qty > 0:
+            count += 1
+    return count
+
+
+def _resolve_practice_account_key(kis: KisAPI | None, env: str) -> str:
+    cano = str(getattr(kis, "CANO", None) or os.getenv("CANO") or "").strip() or "unknown"
+    product_code = str(getattr(kis, "ACNT_PRDT_CD", None) or os.getenv("ACNT_PRDT_CD") or "").strip() or "unknown"
+    env_name = str(env or "practice").strip().lower() or "practice"
+    return f"{env_name}:{cano}:{product_code}"
+
+
+def _maybe_reconcile_practice_account_state(
+    *,
+    engine,
+    env: str,
+    kis: KisAPI | None,
+    balance_state: str,
+    balance_snapshot: dict | None,
+    positions_repo: PositionsRepo,
+) -> dict[str, Any] | None:
+    env_name = str(env or "").strip().lower()
+    if env_name != "practice":
+        return None
+    if balance_state == BALANCE_STATE_UNKNOWN:
+        logger.warning("[ACCOUNT_RECONCILE][SKIP] reason=kis_holdings_unavailable env=%s", env_name)
+        return None
+    kis_holdings_count = _extract_kis_holdings_count(balance_snapshot)
+    if kis_holdings_count is None:
+        logger.warning("[ACCOUNT_RECONCILE][SKIP] reason=balance_snapshot_invalid env=%s", env_name)
+        return None
+
+    db_positions = positions_repo.list_positions(env_name, "pb1_pullback_close")
+    db_positions_count = sum(1 for row in db_positions if int(row.get("qty") or 0) > 0)
+    logger.info(
+        "[ACCOUNT_RECONCILE][COUNTS] kis_holdings=%s db_positions=%s env=%s",
+        kis_holdings_count,
+        db_positions_count,
+        env_name,
+    )
+    if kis_holdings_count != 0 or db_positions_count <= 0:
+        return {
+            "env": env_name,
+            "kis_holdings_count": kis_holdings_count,
+            "db_positions_count": db_positions_count,
+            "reset_performed": False,
+        }
+
+    logger.warning(
+        "[ACCOUNT_RECONCILE][MISMATCH] kis_holdings=%s db_positions=%s env=%s",
+        kis_holdings_count,
+        db_positions_count,
+        env_name,
+    )
+    if os.getenv("AUTO_RECONCILE_PRACTICE_ACCOUNT") != "1":
+        logger.warning("[ACCOUNT_RECONCILE][ACTION_REQUIRED] set RESET_PRACTICE_ACCOUNT=1 and run reset script")
+        return {
+            "env": env_name,
+            "kis_holdings_count": kis_holdings_count,
+            "db_positions_count": db_positions_count,
+            "reset_performed": False,
+        }
+
+    account_key = _resolve_practice_account_key(kis, env_name)
+    try:
+        reset_repo = PracticeAccountResetRepo(engine)
+        cleared_counts = reset_repo.clear_account_state(env=env_name, account_key=account_key)
+        reset_repo.insert_reset_ledger_event(
+            env=env_name,
+            account_key=account_key,
+            capital_krw=PAPER_MAX_CAPITAL_KRW,
+            cleared_counts=cleared_counts,
+        )
+        logger.warning("[ACCOUNT_RECONCILE][RESET_DB_POSITIONS] reason=kis_empty_db_nonempty")
+        return {
+            "env": env_name,
+            "kis_holdings_count": kis_holdings_count,
+            "db_positions_count": db_positions_count,
+            "reset_performed": True,
+            "cleared_counts": cleared_counts,
+        }
+    except Exception as exc:
+        logger.exception("[ACCOUNT_RECONCILE][RESET_FAIL] env=%s err=%s", env_name, exc)
+        return {
+            "env": env_name,
+            "kis_holdings_count": kis_holdings_count,
+            "db_positions_count": db_positions_count,
+            "reset_performed": False,
+            "error": str(exc),
+        }
+
+
 def _is_balance_empty(balance_snapshot: dict | None) -> bool:
     if not balance_snapshot:
         return False
@@ -3864,6 +3972,14 @@ def run_once(
             "[PB1][BALANCE][STATE] state=%s source=%s",
             balance_state,
             balance_source,
+        )
+        _maybe_reconcile_practice_account_state(
+            engine=engine,
+            env=env_effective,
+            kis=kis,
+            balance_state=balance_state,
+            balance_snapshot=balance_snapshot_raw,
+            positions_repo=positions_repo,
         )
         if balance_state == BALANCE_STATE_STALE_OK:
             logger.warning("[PB1][BALANCE][STALE_OK] using recent snapshot for exits")
