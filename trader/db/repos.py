@@ -3906,11 +3906,24 @@ class PositionsRepo:
 
 
 class PracticeAccountResetRepo:
-    _CORE_TABLES = (
-        ("positions", "positions"),
-        ("orders", "orders"),
-        ("fills", "fills"),
+    DELETE_ORDER = (
+        "fills",
+        "orders",
+        "positions",
+        "cooldowns",
+        "account_snapshot",
+        "holdings_snapshot",
+        "portfolio_state",
+        "open_orders",
+        "trade_state",
+        "entry_state",
+        "exit_state",
     )
+    _CORE_TABLES = {
+        "positions": "positions",
+        "orders": "orders",
+        "fills": "fills",
+    }
     _OPTIONAL_TABLES = (
         "cooldowns",
         "account_snapshot",
@@ -3952,19 +3965,27 @@ class PracticeAccountResetRepo:
         return table
 
     def _resolve_table(self, logical_name: str) -> tuple[sa.Table | None, bool]:
-        for alias, attr_name in self._CORE_TABLES:
-            if alias == logical_name:
-                return getattr(self._schema, attr_name), True
+        attr_name = self._CORE_TABLES.get(logical_name)
+        if attr_name is not None:
+            return getattr(self._schema, attr_name), True
         return self._reflect_optional_table(logical_name), False
 
-    def _scope_conditions(self, table: sa.Table, *, env: str, account_key: str | None) -> list[Any]:
+    def _account_state_conditions(self, table: sa.Table, *, env: str, account_key: str | None) -> list[Any]:
         conditions: list[Any] = []
-        for column_name in ("env", "account_env", "strategy_env"):
+        if "env" in table.c:
+            conditions.append(func.lower(sa.cast(table.c.env, sa.String)) == env)
+        for column_name in ("account_env", "strategy_env"):
             if column_name in table.c:
                 conditions.append(func.lower(sa.cast(table.c[column_name], sa.String)) == env)
         if account_key and "account_key" in table.c:
             conditions.append(sa.cast(table.c.account_key, sa.String) == str(account_key))
         return conditions
+
+    def _table_names(self) -> tuple[str, ...]:
+        return self.DELETE_ORDER
+
+    def _resolved_tables(self) -> list[tuple[str, sa.Table | None, bool]]:
+        return [(table_name, *self._resolve_table(table_name)) for table_name in self._table_names()]
 
     def _count_table(
         self,
@@ -3980,7 +4001,7 @@ class PracticeAccountResetRepo:
             if required:
                 raise RuntimeError(f"Required practice reset table missing: {table_name}")
             return 0
-        conditions = self._scope_conditions(table, env=env, account_key=account_key)
+        conditions = self._account_state_conditions(table, env=env, account_key=account_key)
         if not conditions:
             if required:
                 raise RuntimeError(f"Required practice reset table has no safe scope filter: {table_name}")
@@ -3991,11 +4012,10 @@ class PracticeAccountResetRepo:
 
     def count_account_state_rows(self, env: str, account_key: str | None = None) -> dict[str, int]:
         env_name = self._normalize_env(env)
-        table_names = [name for name, _ in self._CORE_TABLES] + list(self._OPTIONAL_TABLES)
+        resolved_tables = self._resolved_tables()
         counts: dict[str, int] = {}
         with self.engine.begin() as conn:
-            for table_name in table_names:
-                table, required = self._resolve_table(table_name)
+            for table_name, table, required in resolved_tables:
                 counts[table_name] = self._count_table(
                     conn,
                     table,
@@ -4008,36 +4028,39 @@ class PracticeAccountResetRepo:
 
     def clear_account_state(self, env: str, account_key: str | None = None) -> dict[str, int]:
         env_name = self._normalize_env(env)
+        resolved_tables = self._resolved_tables()
         cleared_counts: dict[str, int] = {}
-        table_names = [name for name, _ in self._CORE_TABLES] + list(self._OPTIONAL_TABLES)
+        current_table_name = ""
         with self.engine.begin() as conn:
-            for table_name in table_names:
-                table, required = self._resolve_table(table_name)
-                if table is None:
-                    if required:
-                        raise RuntimeError(f"Required practice reset table missing: {table_name}")
-                    cleared_counts[table_name] = 0
-                    continue
-                conditions = self._scope_conditions(table, env=env_name, account_key=account_key)
-                if not conditions:
-                    if required:
-                        raise RuntimeError(f"Required practice reset table has no safe scope filter: {table_name}")
-                    logger.warning("[ACCOUNT_RESET][SKIP] table=%s reason=unsafe_scope", table_name)
-                    cleared_counts[table_name] = 0
-                    continue
-                before_count = self._count_table(
-                    conn,
-                    table,
-                    table_name=table_name,
-                    env=env_name,
-                    account_key=account_key,
-                    required=required,
+            try:
+                for table_name, table, required in resolved_tables:
+                    current_table_name = table_name
+                    if table is None:
+                        if required:
+                            raise RuntimeError(f"Required practice reset table missing: {table_name}")
+                        cleared_counts[table_name] = 0
+                        continue
+                    conditions = self._account_state_conditions(table, env=env_name, account_key=account_key)
+                    if not conditions:
+                        if required:
+                            raise RuntimeError(f"Required practice reset table has no safe scope filter: {table_name}")
+                        logger.warning("[ACCOUNT_RESET][SKIP] table=%s reason=unsafe_scope", table_name)
+                        cleared_counts[table_name] = 0
+                        continue
+                    result = conn.execute(sa.delete(table).where(and_(*conditions)))
+                    cleared_counts[table_name] = int(result.rowcount or 0)
+                    logger.info(
+                        "[ACCOUNT_RESET][CLEAR] table=%s rows=%s",
+                        table_name,
+                        cleared_counts[table_name],
+                    )
+            except IntegrityError as exc:
+                logger.exception(
+                    "[ACCOUNT_RESET][FAIL][FK] table=%s reason=integrity_error err=%s",
+                    current_table_name or "unknown",
+                    exc,
                 )
-                if before_count <= 0:
-                    cleared_counts[table_name] = 0
-                    continue
-                result = conn.execute(sa.delete(table).where(and_(*conditions)))
-                cleared_counts[table_name] = int(result.rowcount or before_count)
+                raise
         return cleared_counts
 
     def insert_reset_ledger_event(

@@ -10,19 +10,7 @@ from trader.db.repos import PracticeAccountResetRepo
 
 logger = logging.getLogger(__name__)
 
-ACCOUNT_STATE_TABLE_ORDER = (
-    "positions",
-    "orders",
-    "fills",
-    "cooldowns",
-    "account_snapshot",
-    "holdings_snapshot",
-    "portfolio_state",
-    "open_orders",
-    "trade_state",
-    "entry_state",
-    "exit_state",
-)
+ACCOUNT_STATE_TABLE_ORDER = PracticeAccountResetRepo.DELETE_ORDER
 
 
 def resolve_reset_env() -> str:
@@ -79,9 +67,11 @@ def execute_practice_account_reset(*, engine=None) -> dict[str, Any]:
             "after_counts": dict(before_counts),
         }
 
-    cleared_counts = repo.clear_account_state(env=env, account_key=account_key)
-    for table_name in ACCOUNT_STATE_TABLE_ORDER:
-        logger.info("[ACCOUNT_RESET][CLEAR] table=%s rows=%s", table_name, int(cleared_counts.get(table_name, 0)))
+    try:
+        cleared_counts = repo.clear_account_state(env=env, account_key=account_key)
+    except Exception as exc:
+        logger.exception("[ACCOUNT_RESET][FAIL] env=%s account_key=%s err=%s", env, account_key, exc)
+        raise
 
     after_counts = repo.count_account_state_rows(env=env, account_key=account_key)
     for table_name in ACCOUNT_STATE_TABLE_ORDER:
@@ -112,7 +102,11 @@ def execute_practice_account_reset(*, engine=None) -> dict[str, Any]:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    execute_practice_account_reset()
+    try:
+        execute_practice_account_reset()
+    except Exception as exc:
+        logger.exception("[ACCOUNT_RESET][EXIT_1] err=%s", exc)
+        return 1
     return 0
 
 
