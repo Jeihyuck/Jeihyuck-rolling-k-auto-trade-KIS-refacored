@@ -13,6 +13,24 @@ from trader.db.repos import PracticeAccountResetRepo
 from trader.db.schema import schema_for_engine
 
 
+class _DummyKis:
+    CANO = "50160136"
+    ACNT_PRDT_CD = "01"
+
+    def __init__(self, *, holdings_qty: str = "0", cash: str = "100000000"):
+        self.holdings_qty = holdings_qty
+        self.cash = cash
+
+    def get_balance_cached(self, force=True):
+        rows = []
+        if int(self.holdings_qty):
+            rows = [{"pdno": "005930", "hldg_qty": self.holdings_qty}]
+        return {
+            "output1": rows,
+            "output2": {"dnca_tot_amt": self.cash, "ord_psbl_cash": self.cash},
+        }
+
+
 def _make_engine(*, create_optional_tables: bool = True, create_strategy_tables: bool = True) -> tuple[sa.Engine, Any]:
     engine = sa.create_engine(
         "sqlite:///:memory:",
@@ -201,7 +219,7 @@ def test_reset_requires_practice_env(monkeypatch):
     monkeypatch.setenv("RESET_PRACTICE_ACCOUNT", "1")
 
     with pytest.raises(RuntimeError, match="env=practice"):
-        execute_practice_account_reset(engine=engine)
+        execute_practice_account_reset(engine=engine, kis=_DummyKis())
 
 
 def test_reset_noop_without_flag(monkeypatch, caplog):
@@ -215,7 +233,7 @@ def test_reset_noop_without_flag(monkeypatch, caplog):
     monkeypatch.setenv("CANO", "50160136")
     monkeypatch.setenv("ACNT_PRDT_CD", "01")
 
-    result = execute_practice_account_reset(engine=engine)
+    result = execute_practice_account_reset(engine=engine, kis=_DummyKis())
 
     assert result["performed"] is False
     assert repo.count_account_state_rows(env="practice", account_key=build_account_key("practice"))["positions"] == 1
@@ -233,7 +251,7 @@ def test_reset_clears_account_state_but_preserves_strategy_data(monkeypatch):
     monkeypatch.setenv("CANO", "50160136")
     monkeypatch.setenv("ACNT_PRDT_CD", "01")
 
-    result = execute_practice_account_reset(engine=engine)
+    result = execute_practice_account_reset(engine=engine, kis=_DummyKis())
 
     assert result["performed"] is True
     counts = repo.count_account_state_rows(env="practice", account_key=build_account_key("practice"))
@@ -361,7 +379,7 @@ def test_reset_preserves_strategy_tables(monkeypatch):
     monkeypatch.setenv("CANO", "50160136")
     monkeypatch.setenv("ACNT_PRDT_CD", "01")
 
-    execute_practice_account_reset(engine=engine)
+    execute_practice_account_reset(engine=engine, kis=_DummyKis())
 
     with engine.begin() as conn:
         final30_rows = conn.execute(sa.text("SELECT COUNT(*) FROM final30")).scalar_one()
@@ -383,7 +401,7 @@ def test_reset_writes_ledger_event(monkeypatch):
     monkeypatch.setenv("CANO", "50160136")
     monkeypatch.setenv("ACNT_PRDT_CD", "01")
 
-    execute_practice_account_reset(engine=engine)
+    execute_practice_account_reset(engine=engine, kis=_DummyKis())
 
     with engine.begin() as conn:
         row = conn.execute(

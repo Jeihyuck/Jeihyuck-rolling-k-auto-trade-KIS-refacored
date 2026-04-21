@@ -3830,37 +3830,51 @@ class PositionsRepo:
         if not fields:
             return
         values = dict(fields)
-        with self.engine.begin() as conn:
-            existing = conn.execute(
-                select(self._schema.positions).where(
-                    and_(
-                        self._schema.positions.c.env == env,
-                        self._schema.positions.c.strategy == strategy,
-                        self._schema.positions.c.sid == sid,
-                        self._schema.positions.c.mode == mode,
-                        self._schema.positions.c.code == code,
+        fail_soft = set(values).isdisjoint({"qty", "avg_buy_price", "total_cost", "realized_pnl"})
+        try:
+            with self.engine.begin() as conn:
+                existing = conn.execute(
+                    select(self._schema.positions).where(
+                        and_(
+                            self._schema.positions.c.env == env,
+                            self._schema.positions.c.strategy == strategy,
+                            self._schema.positions.c.sid == sid,
+                            self._schema.positions.c.mode == mode,
+                            self._schema.positions.c.code == code,
+                        )
                     )
-                )
-            ).mappings().first()
-            existing_row = dict(existing) if existing else {}
-            if "entry_meta_json" in values:
-                values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
-            if "last_exit_eval_json" in values:
-                values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
-            stmt = (
-                sa.update(self._schema.positions)
-                .where(
-                    and_(
-                        self._schema.positions.c.env == env,
-                        self._schema.positions.c.strategy == strategy,
-                        self._schema.positions.c.sid == sid,
-                        self._schema.positions.c.mode == mode,
-                        self._schema.positions.c.code == code,
+                ).mappings().first()
+                existing_row = dict(existing) if existing else {}
+                if "entry_meta_json" in values:
+                    values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
+                if "last_exit_eval_json" in values:
+                    values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
+                stmt = (
+                    sa.update(self._schema.positions)
+                    .where(
+                        and_(
+                            self._schema.positions.c.env == env,
+                            self._schema.positions.c.strategy == strategy,
+                            self._schema.positions.c.sid == sid,
+                            self._schema.positions.c.mode == mode,
+                            self._schema.positions.c.code == code,
+                        )
                     )
+                    .values(**values, updated_at=func.now())
                 )
-                .values(**values, updated_at=func.now())
-            )
-            conn.execute(stmt)
+                conn.execute(stmt)
+        except Exception as exc:
+            if fail_soft:
+                logger.warning(
+                    "[POSITIONS][UPDATE][FAIL_SOFT] env=%s strategy=%s code=%s fields=%s err=%s",
+                    env,
+                    strategy,
+                    code,
+                    sorted(values.keys()),
+                    exc,
+                )
+                return
+            raise
 
     def apply_fill(
         self,

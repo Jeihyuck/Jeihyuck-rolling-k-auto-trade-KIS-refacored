@@ -11826,8 +11826,20 @@ class PB1Engine:
                         no_orders_reasons.append("entry_cutoff")
                     if max_positions - existing_positions_count <= 0:
                         no_orders_reasons.append("max_positions")
+                        logger.warning(
+                            "[ENTRY][BLOCKED_BY_PORTFOLIO_FULL] existing_positions=%s max_positions=%s target_new_positions=%s",
+                            existing_positions_count,
+                            max_positions,
+                            target_new_positions,
+                        )
                     if target_new_positions <= 0:
                         no_orders_reasons.append("target_new_positions_zero")
+                        logger.warning(
+                            "[ENTRY][BLOCKED_BY_TARGET_LIMIT] existing_positions=%s target_new_positions=%s max_positions=%s",
+                            existing_positions_count,
+                            target_new_positions,
+                            max_positions,
+                        )
                     if tick_budget_krw <= 0:
                         no_orders_reasons.append("tick_budget_zero")
                     if available_cash_krw <= 0:
@@ -11855,10 +11867,13 @@ class PB1Engine:
                         drop_reason_counter.most_common(self.drop_reasons_topn),
                     )
                     logger.info(
-                        "[PB1][NO_TRADE] reason=no_orders primary_no_trade_reason=%s blocked_by=%s no_orders_reason=%s",
+                        "[PB1][NO_TRADE] reason=no_orders primary_no_trade_reason=%s blocked_by=%s no_orders_reason=%s existing_positions=%s max_positions=%s target_new_positions=%s",
                         primary_reason,
                         blocked_summary,
                         no_orders_reasons or ["none"],
+                        existing_positions_count,
+                        max_positions,
+                        target_new_positions,
                     )
                     if self.phase in {"prep", "entry"}:
                         if ok_count == 0:

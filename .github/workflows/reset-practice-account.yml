@@ -9,6 +9,9 @@ env:
   KIS_ENV: practice
   STRATEGY_ENV: practice
   RESET_PRACTICE_ACCOUNT: "1"
+  ACCOUNT_RESET_MODE: "1"
+  EXPECTED_PRACTICE_CAPITAL_KRW: "100000000"
+  EXPECTED_INITIAL_HOLDINGS: "0"
   PAPER_MAX_CAPITAL_KRW: "100000000"
   PB1_CAPITAL_MODE: "CASH"
   PB1_ENTRY_CAPITAL_KRW: "0"
@@ -60,4 +63,4 @@ jobs:
       - name: Reset practice account state
         run: |
           set -euo pipefail
-          python -m scripts.reset_practice_account
+          python -m scripts.reset_practice_account_state

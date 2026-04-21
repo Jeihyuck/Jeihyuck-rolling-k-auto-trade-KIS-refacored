@@ -7,6 +7,7 @@ from typing import Any
 from pathlib import Path
 
 from trader.config import MARKET_MAP
+from trader.account_state import account_reset_mode, env_flag, get_account_key, get_masked_account_key
 from trader.runtime_paths import runtime_root
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo, ReconcileLogRepo
 from trader.reconcile_db import evaluate_stale_db_guard
@@ -231,15 +232,36 @@ def reconcile_kis(
         reconcile_result = {"ok": False, "reason": "reconcile_today_failed", "err": str(exc)}
     orders_count = int(reconcile_result.get("orders") or 0)
     fills_count = int(reconcile_result.get("fills") or 0)
+    reset_mode = bool(env == "practice" and account_reset_mode())
+    account_key = get_account_key(env=env, kis=kis)
+    masked_account = get_masked_account_key(env=env, kis=kis)
 
     positions_repo = PositionsRepo(engine)
-    restored = positions_repo.restore_missing_from_holdings(
-        env=env,
-        strategy=strategy,
-        sid=1,
-        mode=1,
-        holdings=holdings_rows,
-    )
+    restored = 0
+    if reset_mode:
+        allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
+        if holdings_rows and not allow_holdings:
+            logger.warning(
+                "[RECONCILE][POSITIONS][RESTORE_BLOCKED] env=%s account=%s reset_mode=1 holdings=%s reason=reset_mode_kis_holdings_present",
+                env,
+                masked_account,
+                len(holdings_rows),
+            )
+        else:
+            logger.info(
+                "[RECONCILE][POSITIONS][RESTORE_SKIP] env=%s account=%s reset_mode=1 holdings=%s",
+                env,
+                masked_account,
+                len(holdings_rows),
+            )
+    else:
+        restored = positions_repo.restore_missing_from_holdings(
+            env=env,
+            strategy=strategy,
+            sid=1,
+            mode=1,
+            holdings=holdings_rows,
+        )
     if restored:
         logger.warning("[RECONCILE][POSITIONS][RESTORE] env=%s restored=%s", env, restored)
 
@@ -285,6 +307,9 @@ def reconcile_kis(
             "fills": fills_count,
             "holdings": len(holdings_rows),
             "restored_positions": restored,
+            "account_key": account_key,
+            "masked_account": masked_account,
+            "reset_mode": reset_mode,
             "holdings_error": holdings_error,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,
@@ -295,6 +320,9 @@ def reconcile_kis(
         {
             "holdings": len(holdings_rows),
             "restored_positions": restored,
+            "account_key": account_key,
+            "masked_account": masked_account,
+            "reset_mode": reset_mode,
             "holdings_error": holdings_error,
             "guard_reason": guard_reason,
             "allow_purge": allow_purge,

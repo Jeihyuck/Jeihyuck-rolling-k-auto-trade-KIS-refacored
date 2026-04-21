@@ -379,6 +379,68 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_first_int(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        raw = str(os.getenv(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except Exception:
+            continue
+    return default
+
+
+def _env_first_float(names: tuple[str, ...], default: float) -> float:
+    for name in names:
+        raw = str(os.getenv(name) or "").strip()
+        if not raw:
+            continue
+        try:
+            return float(raw)
+        except Exception:
+            continue
+    return default
+
+
+def _is_sensitive_log_key(key: str) -> bool:
+    lowered = str(key or "").strip().lower()
+    return any(token in lowered for token in ("authorization", "token", "secret", "appkey", "appsecret", "hashkey", "cano"))
+
+
+def sanitize_headers(headers: dict | None) -> dict[str, Any]:
+    masked: dict[str, Any] = {}
+    for key, value in (headers or {}).items():
+        masked[str(key)] = "***" if _is_sensitive_log_key(str(key)) else value
+    return masked
+
+
+def sanitize_log_mapping(payload: dict | None) -> dict[str, Any]:
+    masked: dict[str, Any] = {}
+    for key, value in (payload or {}).items():
+        lowered = str(key or "").strip().lower()
+        if _is_sensitive_log_key(lowered) or lowered in {"access_token", "refresh_token", "appsecret", "appkey"}:
+            masked[str(key)] = "***"
+        else:
+            masked[str(key)] = value
+    return masked
+
+
+def _load_price_policy_config() -> dict[str, float]:
+    min_interval_ms = _env_first_float(("KIS_PRICE_MIN_INTERVAL_MS",), 0.0)
+    if min_interval_ms > 0:
+        price_qps = 1000.0 / min_interval_ms
+    else:
+        price_qps = _env_first_float(("KIS_PRICE_QPS", "PRICE_QPS"), 3.0)
+    return {
+        "ttl_sec": _env_first_float(("KIS_PRICE_CACHE_TTL_SEC", "PRICE_TTL_SEC", "PRICE_SNAPSHOT_TTL_SEC"), 15.0),
+        "qps": price_qps,
+        "burst": float(_env_first_int(("KIS_PRICE_BURST", "PRICE_BURST"), 3)),
+        "circuit_sec": _env_first_float(("KIS_RATE_LIMIT_COOLDOWN_SEC", "PRICE_CIRCUIT_SEC"), 15.0),
+        "jitter_sec": _env_first_float(("KIS_PRICE_JITTER_MAX_SEC", "PRICE_JITTER_MAX_SEC"), 0.12),
+    }
+
+
 def _load_breaker_state() -> dict:
     global _KIS_BREAKER_STATE
     if _KIS_BREAKER_STATE is not None:
@@ -619,11 +681,12 @@ class _PriceCache:
 
 
 # 환경변수에서 설정 로드
-_PRICE_TTL_SEC = _env_float("PRICE_TTL_SEC", _env_float("PRICE_SNAPSHOT_TTL_SEC", 15))
-_PRICE_QPS = _env_float("PRICE_QPS", 3)
-_PRICE_BURST = _env_int("PRICE_BURST", 3)
-_PRICE_CIRCUIT_SEC = _env_float("PRICE_CIRCUIT_SEC", 15)
-_PRICE_JITTER_MAX_SEC = _env_float("PRICE_JITTER_MAX_SEC", 0.12)
+_PRICE_POLICY = _load_price_policy_config()
+_PRICE_TTL_SEC = float(_PRICE_POLICY["ttl_sec"])
+_PRICE_QPS = float(_PRICE_POLICY["qps"])
+_PRICE_BURST = int(_PRICE_POLICY["burst"])
+_PRICE_CIRCUIT_SEC = float(_PRICE_POLICY["circuit_sec"])
+_PRICE_JITTER_MAX_SEC = float(_PRICE_POLICY["jitter_sec"])
 
 # 전역 인스턴스 생성
 _price_rl = _TokenBucket(rate=_PRICE_QPS, burst=_PRICE_BURST)
@@ -632,6 +695,18 @@ _price_cache = _PriceCache(ttl_sec=_PRICE_TTL_SEC, circuit_sec=_PRICE_CIRCUIT_SE
 
 def get_price_runtime_stats(*, reset: bool = False) -> dict[str, int]:
     return _price_cache.snapshot_stats(reset=reset)
+
+
+def _mark_price_rate_limited(endpoint: str, code: str | None, msg_cd: str, msg1: str | None) -> None:
+    logger.warning(
+        "[KIS][PRICE_RATE_LIMIT][COOLDOWN] endpoint=%s code=%s cooldown=%.2fs msg_cd=%s msg1=%s",
+        endpoint,
+        code,
+        _PRICE_CIRCUIT_SEC,
+        msg_cd,
+        msg1,
+    )
+    _price_cache.open_circuit(rate_limited=True)
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -1054,10 +1129,12 @@ class KisAPI:
                 elapsed_ms = (time.monotonic() - start_ts) * 1000
                 params = kwargs.get("params", {}) or {}
                 json_data = kwargs.get("json", {}) or {}
-                headers_masked = {k: "***" if "auth" in k.lower() or "token" in k.lower() else v for k, v in (kwargs.get("headers", {}) or {}).items()}
+                params_masked = sanitize_log_mapping(params)
+                json_masked = sanitize_log_mapping(json_data)
+                headers_masked = sanitize_headers(kwargs.get("headers", {}) or {})
                 if status in (401, 403):
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
-                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
+                                   method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
                     if not auth_refreshed and "/oauth2/token" not in url:
                         auth_refreshed = True
                         logger.warning("[NET:AUTH] status=%s url=%s -> refresh token", status, url)
@@ -1065,14 +1142,21 @@ class KisAPI:
                         continue
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
+                    if status == 429 and "inquire-price" in _endpoint_path(url):
+                        _mark_price_rate_limited(
+                            _endpoint_name(url),
+                            str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
+                            "HTTP_429",
+                            "too_many_requests",
+                        )
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
-                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
+                                   method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisTemporaryError(f"HTTP {status} for {url}")
                 try:
                     body = resp.json()
                 except Exception as json_err:
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s json_parse_err=%s",
-                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], json_err)
+                                   method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500], json_err)
                     body = None
                 if isinstance(body, dict):
                     msg_cd = str(body.get("msg_cd") or "").strip()
@@ -1080,6 +1164,12 @@ class KisAPI:
                     rt_cd = str(body.get("rt_cd") or "").strip()
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
                         if "inquire-price" in _endpoint_path(url):
+                            _mark_price_rate_limited(
+                                _endpoint_name(url),
+                                str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
+                                msg_cd,
+                                str(body.get("msg1") or ""),
+                            )
                             logger.warning(
                                 "[KIS][RATE_LIMIT][EGW00201] endpoint=%s code=%s attempt=%s msg_cd=%s msg1=%s",
                                 _endpoint_name(url),
@@ -1089,10 +1179,16 @@ class KisAPI:
                                 body.get("msg1"),
                             )
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
-                                       method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
+                                       method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError(f"BODY_TEMP_ERROR msg_cd={msg_cd}")
                     if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연", "초당")):
                         if "inquire-price" in _endpoint_path(url):
+                            _mark_price_rate_limited(
+                                _endpoint_name(url),
+                                str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
+                                msg_cd,
+                                str(body.get("msg1") or ""),
+                            )
                             logger.warning(
                                 "[KIS][RATE_LIMIT][EGW00201] endpoint=%s code=%s attempt=%s msg_cd=%s msg1=%s",
                                 _endpoint_name(url),
@@ -1102,11 +1198,11 @@ class KisAPI:
                                 body.get("msg1"),
                             )
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
-                                       method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
+                                       method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError("BODY_TEMP_ERROR msg1")
                 if 400 <= status < 500:
                     logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s",
-                                   method, url, params, json_data, headers_masked, status, elapsed_ms, resp.text[:500])
+                                   method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500])
                     raise KisPermanentError(f"HTTP {status} for {url}")
                 _breaker_record_success(method, url)
                 consecutive_temp_failures = 0  # Reset on success
@@ -1185,9 +1281,7 @@ class KisAPI:
                             "expires_at": cache["expires_at"],
                             "issued_at": issued_at,
                         })
-                        logger.info(
-                            f"[토큰캐시] 파일캐시 사용: {cache['access_token'][:10]}... 만료:{cache['expires_at']}"
-                        )
+                        logger.info("[토큰캐시] 파일캐시 사용 expires_at=%s", cache["expires_at"])
                         return cache["access_token"]
                 except Exception as e:
                     logger.warning(f"[토큰캐시 읽기 실패] {e}")
@@ -1279,9 +1373,13 @@ class KisAPI:
             logger.error(f"[🔑 토큰발급 예외] {e}")
             raise
         if "access_token" in j:
-            logger.info(f"[🔑 토큰발급] 성공: {j}")
+            logger.info(
+                "[🔑 토큰발급] 성공 expires_in=%s body=%s",
+                j.get("expires_in", 86400),
+                sanitize_log_mapping(j),
+            )
             return j["access_token"], j.get("expires_in", 86400)
-        logger.error(f"[🔑 토큰발급 실패] {j.get('error_description', j)}")
+        logger.error("[🔑 토큰발급 실패] %s", sanitize_log_mapping(j if isinstance(j, dict) else {"error": str(j)}))
         raise Exception(f"토큰 발급 실패: {j.get('error_description', j)}")
 
     def _headers(self, tr_id: str, hashkey: Optional[str] = None):

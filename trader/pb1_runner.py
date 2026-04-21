@@ -25,6 +25,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
+from trader.account_state import (
+    env_flag as account_env_flag,
+    expected_initial_holdings,
+    expected_practice_capital_krw,
+    get_account_key,
+    get_masked_account_key,
+)
 from trader.runtime_paths import build_final30_scored_paths, repo_root
 from trader.path_contract import build_final30_paths, build_watchlist_paths, read_final30_file_rows, resolve_repo_root, serialize_path_map, write_final30_mirrors
 
@@ -2847,10 +2854,55 @@ def _extract_kis_holdings_count(balance_snapshot: dict | None) -> int | None:
 
 
 def _resolve_practice_account_key(kis: KisAPI | None, env: str) -> str:
-    cano = str(getattr(kis, "CANO", None) or os.getenv("CANO") or "").strip() or "unknown"
-    product_code = str(getattr(kis, "ACNT_PRDT_CD", None) or os.getenv("ACNT_PRDT_CD") or "").strip() or "unknown"
-    env_name = str(env or "practice").strip().lower() or "practice"
-    return f"{env_name}:{cano}:{product_code}"
+    return get_account_key(env=env, kis=kis)
+
+
+def _practice_account_sanity_check(
+    *,
+    env: str,
+    kis: KisAPI | None,
+    balance_state: str,
+    balance_snapshot: dict | None,
+) -> dict[str, Any]:
+    env_name = str(env or "").strip().lower()
+    if env_name != "practice":
+        return {"enabled": False, "ok": True, "reason": "non_practice"}
+    if not account_env_flag("ACCOUNT_SANITY_CHECK", default=False):
+        return {"enabled": False, "ok": True, "reason": "disabled"}
+
+    expected_capital = expected_practice_capital_krw()
+    expected_holdings_count = expected_initial_holdings()
+    capital_tolerance = int(str(os.getenv("ACCOUNT_SANITY_CAPITAL_TOLERANCE_KRW") or "0").replace(",", "") or 0)
+    account_key = get_account_key(env=env_name, kis=kis)
+    masked_account = get_masked_account_key(env=env_name, kis=kis)
+    holdings_count = _extract_kis_holdings_count(balance_snapshot)
+    cash_krw = _extract_dnca_total(balance_snapshot)
+    reasons: list[str] = []
+
+    if balance_state == BALANCE_STATE_UNKNOWN:
+        reasons.append("balance_unknown")
+    if holdings_count is None:
+        reasons.append("holdings_unknown")
+    elif expected_holdings_count >= 0 and holdings_count != expected_holdings_count:
+        reasons.append("holdings_mismatch")
+    if cash_krw is None:
+        reasons.append("capital_unknown")
+    elif expected_capital > 0 and abs(cash_krw - expected_capital) > capital_tolerance:
+        reasons.append("capital_mismatch")
+
+    return {
+        "enabled": True,
+        "ok": not reasons,
+        "reason": ",".join(reasons) if reasons else "ok",
+        "account_key": account_key,
+        "masked_account": masked_account,
+        "expected_capital_krw": expected_capital,
+        "expected_holdings": expected_holdings_count,
+        "capital_tolerance_krw": capital_tolerance,
+        "cash_krw": cash_krw,
+        "holdings_count": holdings_count,
+        "balance_state": balance_state,
+    }
 
 
 def _maybe_reconcile_practice_account_state(
@@ -2876,10 +2928,11 @@ def _maybe_reconcile_practice_account_state(
     db_positions = positions_repo.list_positions(env_name, "pb1_pullback_close")
     db_positions_count = sum(1 for row in db_positions if int(row.get("qty") or 0) > 0)
     logger.info(
-        "[ACCOUNT_RECONCILE][COUNTS] kis_holdings=%s db_positions=%s env=%s",
+        "[ACCOUNT_RECONCILE][COUNTS] kis_holdings=%s db_positions=%s env=%s account=%s",
         kis_holdings_count,
         db_positions_count,
         env_name,
+        get_masked_account_key(env=env_name, kis=kis),
     )
     if kis_holdings_count != 0 or db_positions_count <= 0:
         return {
@@ -3973,6 +4026,32 @@ def run_once(
             balance_state,
             balance_source,
         )
+        account_sanity = _practice_account_sanity_check(
+            env=env_effective,
+            kis=kis,
+            balance_state=balance_state,
+            balance_snapshot=balance_snapshot_raw,
+        )
+        account_sanity_block_reason = None
+        if account_sanity.get("enabled"):
+            logger.info(
+                "[ACCOUNT_SANITY][CHECK] account=%s ok=%s holdings=%s expected_holdings=%s cash=%s expected_capital=%s tolerance=%s reason=%s",
+                account_sanity.get("masked_account"),
+                int(bool(account_sanity.get("ok"))),
+                account_sanity.get("holdings_count"),
+                account_sanity.get("expected_holdings"),
+                account_sanity.get("cash_krw"),
+                account_sanity.get("expected_capital_krw"),
+                account_sanity.get("capital_tolerance_krw"),
+                account_sanity.get("reason"),
+            )
+            if not account_sanity.get("ok") and account_env_flag("ACCOUNT_SANITY_FAIL_IF_MISMATCH", default=True):
+                account_sanity_block_reason = f"account_sanity_fail:{account_sanity.get('reason')}"
+                logger.error(
+                    "[ACCOUNT_SANITY][FAIL] account=%s reason=%s",
+                    account_sanity.get("masked_account"),
+                    account_sanity.get("reason"),
+                )
         _maybe_reconcile_practice_account_state(
             engine=engine,
             env=env_effective,
@@ -4031,6 +4110,17 @@ def run_once(
         if not user_entry_enabled and not minervini_only:
             order_allowed = False
             entry_block_reason = "entry_disabled"
+        if account_sanity_block_reason and not minervini_only:
+            dry_run = True
+            intended_live = False
+            _apply_env_flags_if_needed(dry_run)
+            order_allowed = False
+            entry_block_reason = entry_block_reason or account_sanity_block_reason
+            logger.warning(
+                "[RUN_SUMMARY][WARN] reason=account_sanity_fail account=%s detail=%s",
+                account_sanity.get("masked_account"),
+                account_sanity.get("reason"),
+            )
         if balance_state == BALANCE_STATE_UNKNOWN and not minervini_only:
             order_allowed = False
             entry_block_reason = entry_block_reason or "balance_unknown"
