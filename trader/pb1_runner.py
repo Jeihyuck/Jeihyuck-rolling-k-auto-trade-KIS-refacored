@@ -31,6 +31,7 @@ from trader.account_state import (
     expected_practice_capital_krw,
     get_account_key,
     get_masked_account_key,
+    resolve_account_sanity_capital_tolerance_krw,
 )
 from trader.runtime_paths import build_final30_scored_paths, repo_root
 from trader.path_contract import build_final30_paths, build_watchlist_paths, read_final30_file_rows, resolve_repo_root, serialize_path_map, write_final30_mirrors
@@ -2872,7 +2873,7 @@ def _practice_account_sanity_check(
 
     expected_capital = expected_practice_capital_krw()
     expected_holdings_count = expected_initial_holdings()
-    capital_tolerance = int(str(os.getenv("ACCOUNT_SANITY_CAPITAL_TOLERANCE_KRW") or "0").replace(",", "") or 0)
+    capital_tolerance = resolve_account_sanity_capital_tolerance_krw(expected_capital)
     account_key = get_account_key(env=env_name, kis=kis)
     masked_account = get_masked_account_key(env=env_name, kis=kis)
     holdings_count = _extract_kis_holdings_count(balance_snapshot)

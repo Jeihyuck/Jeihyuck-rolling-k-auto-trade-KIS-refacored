@@ -3163,6 +3163,8 @@ class KisAPI:
         """
         # ✅ DIAG 모드에서 KIS HTTP 차단 시 stub 반환 (output2는 list[dict] 형태로 통일)
         if not kis_http_enabled():
+            if os.getenv("RESET_PRACTICE_ACCOUNT") == "1":
+                raise RuntimeError("[BALANCE][HTTP_DISABLED][RESET_ABORT] real KIS balance required for account reset")
             logger.warning("[BALANCE][HTTP_DISABLED] mode=%s → returning stub", os.getenv("STRATEGY_MODE"))
             return {
                 "output1": [],
@@ -3175,6 +3177,8 @@ class KisAPI:
                 "ctx_area_fk100": "",
                 "ctx_area_nk100": "",
                 "_diag_stub": True,
+                "_stub": True,
+                "_source": "http_disabled_stub",
             }
         
         fk = nk = ""
@@ -3312,6 +3316,8 @@ class KisAPI:
                 snap = normalized
         except KisBalanceUnavailable as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)
+            raise
+        except RuntimeError:
             raise
         except KisTemporaryError as e:
             logger.error("[GET_BALANCE_FAIL] %s", e)

@@ -14,6 +14,7 @@ from trader.account_state import (
     expected_practice_capital_krw,
     get_account_key,
     get_masked_account_key,
+    resolve_account_sanity_capital_tolerance_krw,
 )
 from trader.db.engine import make_engine
 from trader.db.repos import PracticeAccountResetRepo
@@ -75,6 +76,12 @@ def _extract_cash_krw(snapshot: dict | None) -> int | None:
     return None
 
 
+def _is_stub_balance_snapshot(snapshot: dict | None) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    return bool(snapshot.get("_stub")) or str(snapshot.get("_source") or "").strip().lower() == "http_disabled_stub"
+
+
 def _archive_reset_snapshot(*, env: str, masked_account: str, payload: dict[str, Any]) -> Path:
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
     safe_account = masked_account.replace(":", "_")
@@ -88,7 +95,7 @@ def execute_practice_account_state_reset(*, engine=None, kis=None) -> dict[str, 
     env = resolve_reset_env()
     capital_krw = resolve_capital_krw()
     expected_holdings = expected_initial_holdings()
-    capital_tolerance = int(str(os.getenv("ACCOUNT_SANITY_CAPITAL_TOLERANCE_KRW") or "0").replace(",", "") or 0)
+    capital_tolerance = resolve_account_sanity_capital_tolerance_krw(capital_krw)
     dry_run = os.getenv("RESET_PRACTICE_ACCOUNT") != "1"
     db_engine = engine or make_engine()
     reset_repo = PracticeAccountResetRepo(db_engine)
@@ -96,6 +103,11 @@ def execute_practice_account_state_reset(*, engine=None, kis=None) -> dict[str, 
     account_key = get_account_key(env=env, kis=kis_client)
     masked_account = get_masked_account_key(env=env, kis=kis_client)
     snapshot = kis_client.get_balance_cached(force=True)
+    if _is_stub_balance_snapshot(snapshot):
+        logger.error("[ACCOUNT_RESET][ABORT] reason=BALANCE_HTTP_DISABLED_OR_STUB account=%s", masked_account)
+        raise RuntimeError(
+            f"Reset aborted: KIS balance HTTP disabled or stub balance returned masked_account={masked_account}"
+        )
     holdings_count = _extract_holdings_count(snapshot)
     cash_krw = _extract_cash_krw(snapshot)
 

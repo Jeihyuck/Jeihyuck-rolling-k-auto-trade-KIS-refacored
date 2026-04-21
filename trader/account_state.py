@@ -60,6 +60,18 @@ def expected_practice_capital_krw() -> int:
     return int(raw.replace(",", "").strip() or PAPER_MAX_CAPITAL_KRW)
 
 
+def resolve_account_sanity_capital_tolerance_krw(expected_capital_krw: int) -> int:
+    raw_absolute = str(os.getenv("ACCOUNT_SANITY_CAPITAL_TOLERANCE_KRW") or "0").replace(",", "").strip()
+    absolute_tolerance = int(raw_absolute or 0)
+    raw_pct = str(os.getenv("ACCOUNT_SANITY_TOLERANCE_PCT") or "0").strip()
+    try:
+        pct_tolerance = max(float(raw_pct or 0), 0.0)
+    except Exception:
+        pct_tolerance = 0.0
+    pct_tolerance_krw = int(expected_capital_krw * pct_tolerance) if expected_capital_krw > 0 and pct_tolerance > 0 else 0
+    return max(absolute_tolerance, pct_tolerance_krw)
+
+
 def expected_initial_holdings() -> int:
     raw = str(os.getenv("EXPECTED_INITIAL_HOLDINGS") or "0").strip()
     return int(raw or "0")

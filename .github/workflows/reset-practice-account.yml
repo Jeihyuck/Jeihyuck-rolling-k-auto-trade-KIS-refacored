@@ -6,16 +6,24 @@ permissions:
   contents: read
 
 env:
-  KIS_ENV: practice
-  STRATEGY_ENV: practice
+  STRATEGY_MODE: "LIVE"
+  FORCE_STRATEGY_MODE: "LIVE"
+  STRATEGY_ENV: "practice"
+  KIS_ENV: "practice"
+  KIS_HTTP_ENABLED: "1"
+  ALLOW_LIVE_GATE: "1"
+  DRY_RUN: "0"
+  DISABLE_LIVE_TRADING: "0"
+  LIVE_TRADING_ENABLED: "1"
   RESET_PRACTICE_ACCOUNT: "1"
+  RESET_CONFIRM: "YES"
   ACCOUNT_RESET_MODE: "1"
   EXPECTED_PRACTICE_CAPITAL_KRW: "100000000"
   EXPECTED_INITIAL_HOLDINGS: "0"
+  ACCOUNT_SANITY_TOLERANCE_PCT: "0.05"
+  ACCOUNT_SANITY_CAPITAL_TOLERANCE_KRW: "5000000"
+  RESET_ALLOW_KIS_HOLDINGS: "0"
   PAPER_MAX_CAPITAL_KRW: "100000000"
-  PB1_CAPITAL_MODE: "CASH"
-  PB1_ENTRY_CAPITAL_KRW: "0"
-  PB1_CASH_RESERVE_PCT: "0.10"
 
 defaults:
   run:
@@ -39,6 +47,9 @@ jobs:
       KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
       CANO: ${{ secrets.CANO }}
       ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
 
     steps:
       - name: Checkout
@@ -63,4 +74,4 @@ jobs:
       - name: Reset practice account state
         run: |
           set -euo pipefail
-          python -m scripts.reset_practice_account_state
+          python scripts/reset_practice_account_state.py
