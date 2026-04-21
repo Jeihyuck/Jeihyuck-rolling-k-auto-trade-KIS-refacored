@@ -3155,6 +3155,11 @@ class LedgerEventsRepo:
             return self._schema.ledger_events.c.payload_json["as_of"].astext
         return func.json_extract(self._schema.ledger_events.c.payload_json, "$.as_of")
 
+    def _payload_text_expr(self, key: str) -> sa.sql.ClauseElement:
+        if self.engine.dialect.name == "postgresql":
+            return self._schema.ledger_events.c.payload_json[str(key)].astext
+        return func.json_extract(self._schema.ledger_events.c.payload_json, f"$.{key}")
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -3475,17 +3480,181 @@ class LedgerEventsRepo:
         )
         return None
 
+    def upsert_prep_event(
+        self,
+        *,
+        env: str,
+        strategy: str = "pb1",
+        as_of=None,
+        trade_date=None,
+        event_type: str = "PREP_DONE",
+        status: str,
+        reason: str,
+        final30_count: int,
+        quality_ok: bool,
+        trade_can_proceed: bool,
+        run_id: str | None = None,
+        run_window: str | None = "prep",
+    ) -> str | None:
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy) or "pb1"
+        as_of_str = str(as_of)
+        trade_date_str = str(trade_date)
+        event_type_n = str(event_type or "PREP_DONE").strip().upper() or "PREP_DONE"
+        status_s = str(status or "").strip()
+        reason_s = str(reason or "").strip()
+        payload = {
+            "env": env_n,
+            "strategy": strategy_n,
+            "as_of": as_of_str,
+            "trade_date": trade_date_str,
+            "event_type": event_type_n,
+            "status": status_s,
+            "reason": reason_s,
+            "final30_count": int(final30_count or 0),
+            "quality_ok": int(bool(quality_ok)),
+            "trade_can_proceed": int(bool(trade_can_proceed)),
+        }
+        stage = "prep_done_check" if reason_s == "ledger_missing_but_final30_canonical_ok" else "prep_duplicate_guard"
+
+        try:
+            stmt = (
+                sa.select(
+                    self._schema.ledger_events.c.ledger_event_id,
+                    self._schema.ledger_events.c.payload_json,
+                )
+                .where(self._schema.ledger_events.c.env == env_n)
+                .where(self._schema.ledger_events.c.event_type == event_type_n)
+                .where(self._payload_as_of_expr() == as_of_str)
+                .order_by(self._schema.ledger_events.c.ts.desc())
+                .limit(20)
+            )
+            with self.engine.connect() as conn:
+                rows = conn.execute(stmt).mappings().all()
+
+            for row in rows:
+                payload_json = dict(row.get("payload_json") or {})
+                if (
+                    str(payload_json.get("as_of")) == as_of_str
+                    and str(payload_json.get("trade_date")) == trade_date_str
+                    and _norm_strategy(payload_json.get("strategy")) == strategy_n
+                    and str(payload_json.get("status") or "").strip() == status_s
+                    and str(payload_json.get("reason") or "").strip() == reason_s
+                ):
+                    event_id = str(row.get("ledger_event_id"))
+                    logger.info(
+                        "[DB][LEDGER][PREP_EVENT][UPSERT_SKIP_EXISTS] env=%s strategy=%s as_of=%s trade_date=%s event=%s status=%s reason=%s event_id=%s",
+                        env_n,
+                        strategy_n,
+                        as_of_str,
+                        trade_date_str,
+                        event_type_n,
+                        status_s,
+                        reason_s,
+                        event_id,
+                    )
+                    return event_id
+        except Exception as exc:
+            logger.warning(
+                "[DB][LEDGER][PREP_EVENT][EXISTS_CHECK_FAIL] env=%s strategy=%s as_of=%s trade_date=%s err_type=%s err=%s",
+                env_n,
+                strategy_n,
+                as_of_str,
+                trade_date_str,
+                type(exc).__name__,
+                exc,
+            )
+
+        try:
+            event_id = self.append_event(
+                env=env_n,
+                run_id=run_id,
+                strategy=strategy_n,
+                run_window=run_window,
+                event_type=event_type_n,
+                ts=now_kst(),
+                ok=bool(quality_ok and trade_can_proceed),
+                reasons=[reason_s] if reason_s else None,
+                stage=stage,
+                payload_json=payload,
+            )
+            logger.info(
+                "[DB][LEDGER][PREP_EVENT][UPSERT_OK] env=%s strategy=%s as_of=%s trade_date=%s event=%s status=%s reason=%s event_id=%s",
+                env_n,
+                strategy_n,
+                as_of_str,
+                trade_date_str,
+                event_type_n,
+                status_s,
+                reason_s,
+                event_id,
+            )
+            return event_id
+        except Exception as exc:
+            db_store_required = str(os.getenv("DB_STORE_REQUIRED", "0")).lower() not in {"0", "false", "no", "off"}
+            logger.exception(
+                "[DB][LEDGER][PREP_EVENT][UPSERT_FAIL] env=%s strategy=%s as_of=%s trade_date=%s event=%s status=%s reason=%s required=%s err_type=%s err=%s",
+                env_n,
+                strategy_n,
+                as_of_str,
+                trade_date_str,
+                event_type_n,
+                status_s,
+                reason_s,
+                int(db_store_required),
+                type(exc).__name__,
+                exc,
+            )
+            if db_store_required:
+                raise
+            return None
+
+    def get_prep_event(
+        self,
+        *,
+        env: str,
+        strategy: str,
+        as_of: date | str,
+        trade_date: date | str,
+        event_type: str = "PREP_DONE",
+    ) -> dict[str, Any] | None:
+        env_n = _norm_env(env)
+        strategy_n = _norm_strategy(strategy)
+        as_of_str = str(as_of)
+        trade_date_str = str(trade_date)
+        stmt = (
+            sa.select(self._schema.ledger_events)
+            .where(self._schema.ledger_events.c.env == env_n)
+            .where(self._schema.ledger_events.c.event_type == str(event_type or "PREP_DONE").strip().upper())
+            .where(self._payload_as_of_expr() == as_of_str)
+            .order_by(self._schema.ledger_events.c.ts.desc())
+            .limit(20)
+        )
+        with self.engine.connect() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        for row in rows:
+            payload_json = dict(row.get("payload_json") or {})
+            if (
+                _norm_strategy(payload_json.get("strategy")) == strategy_n
+                and str(payload_json.get("trade_date")) == trade_date_str
+            ):
+                return dict(row)
+        return None
+
     def prep_done_status(
         self,
         *,
         env: str,
         as_of: date | str,
         strategies: Iterable[str] | None = None,
+        trade_date: date | str | None = None,
     ) -> tuple[bool, int]:
         schema = self._schema
         as_of_date = to_date(as_of)
         as_of_str = as_of_date.isoformat()
         payload_as_of = self._payload_as_of_expr()
+        payload_strategy = func.lower(self._payload_text_expr("strategy"))
+        payload_trade_date = self._payload_text_expr("trade_date")
         as_of_match = or_(
             func.date(schema.ledger_events.c.ts) == as_of_date,
             payload_as_of == as_of_str,
@@ -3496,16 +3665,29 @@ class LedgerEventsRepo:
             strategies_norm = [s.strip().lower() for s in strategies if s and str(s).strip()]
             if strategies_norm:
                 stmt = stmt.select_from(
-                    schema.ledger_events.join(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
-                ).where(func.lower(schema.runs.c.strategy).in_(strategies_norm))
+                    schema.ledger_events.outerjoin(schema.runs, schema.runs.c.run_id == schema.ledger_events.c.run_id)
+                ).where(
+                    or_(
+                        func.lower(schema.runs.c.strategy).in_(strategies_norm),
+                        payload_strategy.in_(strategies_norm),
+                    )
+                )
 
-        stmt = stmt.where(
-            and_(
-                schema.ledger_events.c.env == _norm_env(env),
-                schema.ledger_events.c.event_type == "PREP_DONE",
-                as_of_match,
+        conditions = [
+            schema.ledger_events.c.env == _norm_env(env),
+            schema.ledger_events.c.event_type == "PREP_DONE",
+            as_of_match,
+        ]
+        if trade_date is not None:
+            trade_date_date = to_date(trade_date)
+            conditions.append(
+                or_(
+                    payload_trade_date == trade_date_date.isoformat(),
+                    func.date(schema.ledger_events.c.ts) == trade_date_date,
+                )
             )
-        )
+
+        stmt = stmt.where(and_(*conditions))
         with self.engine.connect() as conn:
             count = conn.execute(stmt).scalar() or 0
         return int(count) > 0, int(count)

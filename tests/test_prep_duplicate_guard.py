@@ -64,4 +64,5 @@ def test_duplicate_prep_upserts_prep_done_event(monkeypatch, capsys) -> None:
     assert event["payload_json"]["reason"] == "canonical_prep_already_ready"
     assert event["payload_json"]["trade_can_proceed"] == 1
     assert "[PREP][DUPLICATE_GUARD][LEDGER_UPSERT] event=PREP_DONE status=READY_FROM_CANONICAL" in stdout
-    assert "[RUN_SUMMARY][RESULT] status=SKIP_DUPLICATE_PREP reason=canonical_prep_already_ready event=schedule" in stdout
+    assert "[PREP][DUPLICATE_GUARD][SKIP] as_of=2026-04-17 reason=canonical_prep_already_ready trade_can_proceed=1" in stdout
+    assert "[RUN_SUMMARY][RESULT] status=SKIP_DUPLICATE_PREP reason=canonical_prep_already_ready trade_can_proceed=1 event=schedule" in stdout

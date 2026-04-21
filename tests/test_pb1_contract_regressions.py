@@ -264,8 +264,8 @@ def test_prep_log_verifier_allows_duplicate_skip(tmp_path):
             [
                 "[PREP][TRIGGER] event=schedule actor=tester run_id=123 attempt=1",
                 "[PREP][START_META] now_kst=2026-04-17 08:00:00 KST ref=nullim sha=deadbeef",
-                "[PREP][DUPLICATE_GUARD][SKIP] as_of=2026-04-17 reason=canonical_prep_already_ready",
-                "[RUN_SUMMARY][RESULT] status=SKIP_DUPLICATE_PREP reason=canonical_prep_already_ready event=schedule",
+                "[PREP][DUPLICATE_GUARD][SKIP] as_of=2026-04-17 reason=canonical_prep_already_ready trade_can_proceed=1",
+                "[RUN_SUMMARY][RESULT] status=SKIP_DUPLICATE_PREP reason=canonical_prep_already_ready trade_can_proceed=1 event=schedule",
             ]
         ),
         encoding="utf-8",
@@ -276,6 +276,7 @@ def test_prep_log_verifier_allows_duplicate_skip(tmp_path):
     assert results.run_summary_status == "SKIP_DUPLICATE_PREP"
     assert results.run_summary_reason == "canonical_prep_already_ready"
     assert results.has_critical_failure() is False
+
 
 
 def test_config_defaults_include_target_new_positions():

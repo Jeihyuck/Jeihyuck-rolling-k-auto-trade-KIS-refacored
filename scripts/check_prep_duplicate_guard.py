@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from typing import Any
@@ -13,6 +14,9 @@ from trader.final30_quality import build_canonical_prep_verdict, summarize_final
 from trader.time_utils import now_kst, resolve_trade_context
 
 
+logger = logging.getLogger(__name__)
+
+
 def _flag_enabled(raw: str | None) -> bool:
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -23,6 +27,10 @@ def _write_output(name: str, value: Any) -> None:
         return
     with open(output_path, "a", encoding="utf-8") as handle:
         handle.write(f"{name}={value}\n")
+
+
+def _db_store_required() -> bool:
+    return str(os.getenv("DB_STORE_REQUIRED", "0")).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _load_final30_snapshot(env: str, as_of: str, strategy: str) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -56,19 +64,41 @@ def _upsert_duplicate_ready_event(
     as_of: str,
     trade_date: str,
     final30_count: int,
-) -> None:
-    LedgerEventsRepo(get_engine()).upsert_prep_event(
-        env=env,
-        strategy="pb1",
-        as_of=as_of,
-        trade_date=trade_date,
-        event_type="PREP_DONE",
-        status="READY_FROM_CANONICAL",
-        reason="canonical_prep_already_ready",
-        final30_count=final30_count,
-        quality_ok=True,
-        trade_can_proceed=True,
-    )
+) -> str | None:
+    repo = LedgerEventsRepo(get_engine())
+    if not hasattr(repo, "upsert_prep_event"):
+        message = "LedgerEventsRepo.upsert_prep_event missing"
+        logger.error("[PREP][DUPLICATE_GUARD][LEDGER_UPSERT][MISSING_METHOD] %s", message)
+        if _db_store_required():
+            raise AttributeError(message)
+        return None
+    try:
+        return repo.upsert_prep_event(
+            env=env,
+            strategy="pb1",
+            as_of=as_of,
+            trade_date=trade_date,
+            event_type="PREP_DONE",
+            status="READY_FROM_CANONICAL",
+            reason="canonical_prep_already_ready",
+            final30_count=final30_count,
+            quality_ok=True,
+            trade_can_proceed=True,
+            run_id=os.getenv("GITHUB_RUN_ID"),
+            run_window="prep",
+        )
+    except Exception as exc:
+        logger.exception(
+            "[PREP][DUPLICATE_GUARD][LEDGER_UPSERT][FAIL] env=%s as_of=%s trade_date=%s err_type=%s err=%s",
+            env,
+            as_of,
+            trade_date,
+            type(exc).__name__,
+            exc,
+        )
+        if _db_store_required():
+            raise
+        return None
 
 
 def main() -> int:
@@ -113,10 +143,13 @@ def main() -> int:
             f"event=PREP_DONE status=READY_FROM_CANONICAL reason={skip_reason} "
             f"as_of={as_of} trade_date={trade_date} final30_count={final30_count}"
         )
-        print(f"[PREP][DUPLICATE_GUARD][SKIP] as_of={as_of} reason={skip_reason}")
+        print(
+            "[PREP][DUPLICATE_GUARD][SKIP] "
+            f"as_of={as_of} reason={skip_reason} trade_can_proceed=1"
+        )
         print(
             "[RUN_SUMMARY][RESULT] "
-            f"status=SKIP_DUPLICATE_PREP reason={skip_reason} event={event_name}"
+            f"status=SKIP_DUPLICATE_PREP reason={skip_reason} trade_can_proceed=1 event={event_name}"
         )
     elif allow_duplicate and is_ready:
         print(
