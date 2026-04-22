@@ -138,10 +138,12 @@ def make_engine() -> sa.Engine:
             connect_args=connect_args,
             execution_options={"compiled_cache": None},
             pool_pre_ping=True,
+            pool_reset_on_return="rollback",
             pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
             max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
             pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+            future=True,
         )
     except ModuleNotFoundError as exc:
         raise RuntimeError(

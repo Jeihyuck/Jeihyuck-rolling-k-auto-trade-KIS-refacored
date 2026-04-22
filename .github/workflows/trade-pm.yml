@@ -26,11 +26,15 @@ permissions:
 env:
   MODE: trade
   PB1_SESSION_KIND: "pm"
+  PB1_PM_START_ALLOW_UNTIL: "1325"
+  PB1_PM_EXPECTED_START_FROM: "1305"
+  PB1_PM_EXPECTED_START_TO: "1315"
   PB1_PM_SESSION_END: "15:10"
-  PB1_TICK_HARD_TIMEOUT_SEC: "45"
+  PB1_TICK_HARD_TIMEOUT_SEC: "90"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
-  PB1_POST_CAPITAL_TIMEOUT_SEC: "20"
-  PB1_EXIT_PASS_TIMEOUT_SEC: "120"
+  PB1_POSTPROCESS_TIMEOUT_SEC: "45"
+  PB1_POST_CAPITAL_TIMEOUT_SEC: "45"
+  PB1_EXIT_PASS_TIMEOUT_SEC: "90"
   STRATEGY_MODE: "LIVE"
   STRATEGY_ENV: practice
   KIS_ENV: practice
@@ -60,7 +64,9 @@ env:
   PAPER_MAX_CAPITAL_KRW: "100000000"
   EXPECTED_PRACTICE_CAPITAL_KRW: "0"
   ACCOUNT_SANITY_CHECK: "1"
-  ACCOUNT_SANITY_FAIL_IF_MISMATCH: "1"
+  ACCOUNT_SANITY_FAIL_IF_MISMATCH: "0"
+  ACCOUNT_SANITY_RECONCILE_FROM_KIS: "1"
+  ACCOUNT_SANITY_WARN_IF_MISMATCH: "1"
   EXPECTED_INITIAL_HOLDINGS: "-1"
   KIS_PRICE_MIN_INTERVAL_MS: "400"
   KIS_PRICE_CACHE_TTL_SEC: "15"
@@ -112,27 +118,84 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
+          run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
+
+          hh="${now_hhmm:0:2}"
+          mm="${now_hhmm:2:2}"
+          now_min=$((10#$hh * 60 + 10#$mm))
+
+          min_1300=$((13 * 60 + 0))
+          min_1305=$((13 * 60 + 5))
+          min_1315=$((13 * 60 + 15))
+          min_1320=$((13 * 60 + 20))
+          min_1325=$((13 * 60 + 25))
+          min_1340=$((13 * 60 + 40))
+          min_1510=$((15 * 60 + 10))
+
           valid_window="1300-1510"
           expected_start_window="1305-1315"
+          new_start_allow_window="1305-1325"
           should_run=1
-          skip_reason=""
+          skip_reason="none"
+          late_level="NONE"
+          degraded_session=0
+          start_classification="STARTED_ON_TIME"
+          trigger_classification="schedule"
+
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            trigger_classification="workflow_dispatch"
+          elif [[ "$run_attempt" -gt 1 ]]; then
+            trigger_classification="rerun_attempt"
+          else
+            trigger_classification="schedule"
+          fi
+
           if [[ "$event_name" != "workflow_dispatch" ]]; then
-            if [[ "$now_kst" -lt 1300 ]]; then
+            if (( now_min < min_1300 )); then
               should_run=0
               skip_reason="early_start"
-            elif [[ "$now_kst" -ge 1510 ]]; then
+            elif (( now_min > min_1325 )); then
               should_run=0
-              skip_reason="stale_start"
+              skip_reason="late_schedule_start_after_1325"
             fi
           fi
+
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            if (( now_min > min_1325 )) && [[ "${FORCE_ALLOW_LATE_MANUAL:-0}" != "1" ]]; then
+              should_run=0
+              skip_reason="late_manual_start_after_1325_requires_force"
+            fi
+          fi
+
+          if (( now_min > min_1320 )); then
+            late_level="WARN"
+            degraded_session=1
+            start_classification="STARTED_LATE_WARN"
+          fi
+
+          if (( now_min > min_1340 )); then
+            late_level="ERROR"
+            degraded_session=1
+            start_classification="STARTED_LATE_ERROR"
+          fi
+
+          if [[ "$should_run" != "1" ]]; then
+            start_classification="SKIP_PHASE_WINDOW"
+          fi
+
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
-          echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
+          echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "trigger_classification=${trigger_classification}" >> "$GITHUB_OUTPUT"
           echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
           echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
+          echo "new_start_allow_window=${new_start_allow_window}" >> "$GITHUB_OUTPUT"
+          echo "late_level=${late_level}" >> "$GITHUB_OUTPUT"
+          echo "degraded_session=${degraded_session}" >> "$GITHUB_OUTPUT"
+          echo "start_classification=${start_classification}" >> "$GITHUB_OUTPUT"
 
       - name: Write PM trigger metadata
         if: steps.phase_guard.outputs.should_run == '1'
@@ -145,10 +208,12 @@ jobs:
             manual_restart=1
           fi
           {
-            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} trigger_classification=${{ steps.phase_guard.outputs.trigger_classification }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
             echo "[TRADE_PM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
-            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_PM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
             echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
           } | tee -a repo/artifacts/trade-pm.log
 
       - name: Checkout
@@ -171,10 +236,12 @@ jobs:
             manual_restart=1
           fi
           {
-            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} trigger_classification=${{ steps.phase_guard.outputs.trigger_classification }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
             echo "[TRADE_PM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
-            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_PM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
             echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
           } | tee repo/artifacts/trade-pm.log >/dev/null
           echo "[CHECKOUT][OK] repo path ready"
 
@@ -303,9 +370,11 @@ jobs:
           set -euo pipefail
           mkdir -p repo/artifacts
           {
-            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
+            echo "[TRADE_PM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} trigger_classification=${{ steps.phase_guard.outputs.trigger_classification }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_PM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
             echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
+            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=pm event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-pm.log
@@ -336,7 +405,7 @@ jobs:
           trap 'echo "[STEP][FAIL] name=verify_pm_logs session=pm" | tee -a artifacts/trade-pm.log' ERR
           echo "[STEP][START] name=verify_pm_logs session=pm" | tee -a artifacts/trade-pm.log
           missing=0
-          for pattern in "\[TRADE_PM\]\[TRIGGER\]" "\[TRADE_PM\]\[START_META\]" "\[TRADE_PM\]\[PHASE_GUARD\]"; do
+          for pattern in "\[TRADE_PM\]\[TRIGGER\]" "\[TRADE_PM\]\[QUEUE_VISIBLE\]" "\[TRADE_PM\]\[START_META\]" "\[TRADE_PM\]\[PHASE_GUARD\]" "\[TRADE_PM\]\[START_CLASSIFICATION\]"; do
             if ! grep -E "$pattern" artifacts/trade-pm.log >/dev/null; then
               echo "::error::missing metadata pattern: $pattern"
               missing=1
@@ -359,6 +428,19 @@ jobs:
           if [[ "$result_status" == "FATAL_RUNTIME" || "$result_status" == "FATAL_POSTPROCESS" ]]; then
             echo "::error::PM fatal runtime/postprocess recorded"
             grep -E "\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-pm.log || true
+            exit 1
+          fi
+          fatal_count="$(grep -Ec '\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)' artifacts/trade-pm.log || true)"
+          timeout_count="$(grep -Ec 'TickTimeoutError|tick_hard_timeout' artifacts/trade-pm.log || true)"
+          db_autocommit_count="$(grep -Ec "can't change 'autocommit' now|connection in transaction status ACTIVE" artifacts/trade-pm.log || true)"
+          degraded_count="$(grep -Ec 'DEGRADED_POSTPROCESS|\[PB1\]\[POSTPROCESS\]\[DEGRADED\]' artifacts/trade-pm.log || true)"
+          echo "[TRADE_PM][VERIFY][COUNTS] fatal_count=${fatal_count} timeout_count=${timeout_count} db_autocommit_count=${db_autocommit_count} degraded_count=${degraded_count}"
+          if [[ "$db_autocommit_count" -gt 0 ]]; then
+            echo "::error::DB autocommit transaction ACTIVE error detected"
+            exit 1
+          fi
+          if [[ "$fatal_count" -gt 0 ]]; then
+            echo "::error::PM internal fatal result detected"
             exit 1
           fi
           if ! grep -E "\[PB1\]\[RUN_ONCE\]\[FAIL_OPEN_FLAG\]" artifacts/trade-pm.log >/dev/null; then

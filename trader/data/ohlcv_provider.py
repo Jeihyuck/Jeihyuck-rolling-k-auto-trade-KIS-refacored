@@ -841,7 +841,7 @@ def upsert_ohlcv_delta(*, symbols: list[str], as_of: date, days: int = 1) -> dic
         updated_local = 0
         for symbol, candles in symbol_candles:
             def _apply_symbol() -> tuple[int, int]:
-                with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                with engine.begin() as conn:
                     existing = load_price_daily_conn(conn, symbol, date_min, date_max)
                     existing_dates = {str(row.get("date"))[:10] for row in existing}
                     new_dates = {c["date"] for c in candles}

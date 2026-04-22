@@ -1733,10 +1733,12 @@ class TickTimeoutError(TimeoutError):
 
 def _run_once_with_hard_timeout(*, timeout_sec: int, call):
     if timeout_sec <= 0:
-        raise TickTimeoutError("tick_hard_timeout")
+        last_stage = str(os.getenv("PB1_LAST_STAGE") or "unknown")
+        raise TickTimeoutError(f"tick_hard_timeout timeout_sec={timeout_sec} last_stage={last_stage}")
 
     def _alarm_handler(signum, frame):
-        raise TickTimeoutError("tick_hard_timeout")
+        last_stage = str(os.getenv("PB1_LAST_STAGE") or "unknown")
+        raise TickTimeoutError(f"tick_hard_timeout timeout_sec={timeout_sec} last_stage={last_stage}")
 
     prev = signal.getsignal(signal.SIGALRM)
     try:
@@ -4723,6 +4725,9 @@ def run_once(
         "balance_api_calls": result.balance_api_calls if result else 0,
         "balance_cache_hits": result.balance_cache_hits if result else 0,
         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
+        "buy_orders": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0)),
+        "sell_orders": int((getattr(engine_runner, "_exit_summary_payload", {}) or {}).get("submitted", 0)),
+        "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
     }
     result_status = result.status if result else "UNKNOWN"
     
@@ -4978,6 +4983,13 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         signal.signal(signal.SIGTERM, lambda *_args: _request_stop("SIGTERM"))
         signal.signal(signal.SIGINT, lambda *_args: _request_stop("SIGINT"))
         tick_index = 0
+        ticks_total = 0
+        ticks_ok = 0
+        ticks_no_trade = 0
+        ticks_fatal = 0
+        ticks_degraded = 0
+        buy_orders = 0
+        sell_orders = 0
         while True:
             if stop_requested["value"]:
                 exit_reason = "sigterm"
@@ -5024,7 +5036,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
             remaining_budget_s = max(0, int((session_end_dt - now).total_seconds()))
             grace_sec = _resolve_session_exit_grace_sec()
-            base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 45))
+            base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 90))
             remaining_to_session_end = max(0, int((session_end_dt - now).total_seconds()))
             tick_timeout_sec = min(
                 base_tick_timeout,
@@ -5032,6 +5044,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             )
             try:
                 tick_index += 1
+                ticks_total += 1
                 os.environ["PB1_LOOP_TICK_INDEX"] = str(tick_index)
                 logger.info(
                     "[PB1][TICK][CALL_RUN_ONCE] kind=%s now=%s session_end=%s",
@@ -5065,6 +5078,16 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 balance_api_calls += metrics.get("balance_api_calls", 0)
                 balance_cache_hits += metrics.get("balance_cache_hits", 0)
                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
+                buy_orders += int(metrics.get("buy_orders", 0) or 0)
+                sell_orders += int(metrics.get("sell_orders", 0) or 0)
+                if bool(metrics.get("degraded", False)) or str(result_status or "").startswith("DEGRADED"):
+                    ticks_degraded += 1
+                elif result_status in {"NO_TRADE", "OK_NO_TRADE", "OK_NO_CANDIDATES", "HANDOFF_TO_CLOSE", "NONTRADING_SMOKE_DONE"}:
+                    ticks_no_trade += 1
+                elif str(result_status or "").startswith("FATAL"):
+                    ticks_fatal += 1
+                else:
+                    ticks_ok += 1
                 now_after_tick = _get_now_kst()
                 if now_after_tick >= session_end_dt:
                     logger.info(
@@ -5127,13 +5150,15 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     break
                 time_mod.sleep(sleep_for)
                 continue
-            except TickTimeoutError:
+            except TickTimeoutError as exc:
+                ticks_fatal += 1
                 logger.error(
-                    "[PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s timeout_sec=%s",
+                    "[PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s timeout_sec=%s err=%s",
                     session_kind,
                     now.isoformat(),
                     session_end_dt.isoformat(),
                     tick_timeout_sec,
+                    exc,
                 )
                 now_after_timeout = _get_now_kst()
                 if now_after_timeout >= session_end_dt:
@@ -5196,6 +5221,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     exc,
                     traceback.format_exc(),
                 )
+                ticks_fatal += 1
                 sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, min(loop_interval, 3))
                 if sleep_for <= 0:
                     exit_reason = "session_end"
@@ -5216,6 +5242,17 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             balance_api_calls,
             balance_cache_hits,
             balance_tick_cache_hits,
+        )
+        logger.info(
+            "[PB1][SESSION_SUMMARY] kind=%s ticks_total=%s ticks_ok=%s ticks_no_trade=%s ticks_fatal=%s ticks_degraded=%s buy_orders=%s sell_orders=%s",
+            session_kind,
+            ticks_total,
+            ticks_ok,
+            ticks_no_trade,
+            ticks_fatal,
+            ticks_degraded,
+            buy_orders,
+            sell_orders,
         )
     finally:
         _finish_session_guard(

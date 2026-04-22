@@ -1351,6 +1351,8 @@ class PB1Engine:
         self._tick_price_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._tick_price_cache_hits = 0
         self._tick_price_api_calls = 0
+        self._last_stage = "engine.init"
+        os.environ["PB1_LAST_STAGE"] = self._last_stage
 
         logger.info(
             "[PB1][ASOF][USE] component=engine value=%s source=run_ctx",
@@ -1360,6 +1362,8 @@ class PB1Engine:
     @contextlib.contextmanager
     def _stage_timer(self, stage_name: str):
         started = time.perf_counter()
+        self._last_stage = stage_name
+        os.environ["PB1_LAST_STAGE"] = stage_name
         logger.info("[PB1][STAGE][START] stage=%s", stage_name)
         try:
             yield
@@ -1370,6 +1374,8 @@ class PB1Engine:
     @contextlib.contextmanager
     def _stage_timer_with_timeout(self, stage_name: str, max_sec: float):
         started = time.perf_counter()
+        self._last_stage = stage_name
+        os.environ["PB1_LAST_STAGE"] = stage_name
         logger.info("[PB1][STAGE][START] stage=%s max_sec=%.2f", stage_name, max_sec)
         error: Exception | None = None
         try:
@@ -3268,6 +3274,73 @@ class PB1Engine:
             return ""
         name = self._name_for_code(code)
         return f"{name}({code})" if name else str(code)
+
+    def _masked_account(self) -> str:
+        account = str(os.getenv("CANO") or "").strip()
+        if len(account) >= 4:
+            return f"***{account[-4:]}"
+        return "unknown"
+
+    def _reconcile_positions_from_kis_balance(self, holdings_rows: list[dict], positions: list[dict]) -> list[dict]:
+        if str(os.getenv("ACCOUNT_SANITY_RECONCILE_FROM_KIS", "0") or "0").strip() != "1":
+            return positions
+        logger.info(
+            "[POSITIONS][RECONCILE][START] source=kis_balance env=%s account=%s",
+            self.env,
+            self._masked_account(),
+        )
+        db_by_code = {str((row or {}).get("code") or "").zfill(6): dict(row or {}) for row in (positions or [])}
+        corrected_count = 0
+        for row in holdings_rows or []:
+            code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+            if not code:
+                continue
+            kis_qty = int(float(row.get("hldg_qty") or row.get("qty") or 0) or 0)
+            db_row = db_by_code.get(code) or {}
+            db_qty = int(db_row.get("qty") or 0)
+            stock_name = str(row.get("prdt_name") or row.get("name") or self._name_for_code(code) or code)
+            if kis_qty != db_qty:
+                logger.warning(
+                    "[POSITIONS][RECONCILE][MISMATCH] code=%s name=%s kis_qty=%s db_qty=%s action=upsert_from_kis",
+                    code,
+                    stock_name,
+                    kis_qty,
+                    db_qty,
+                )
+                avg_price = float(row.get("pchs_avg_pric") or row.get("pchs_avg_price") or row.get("avg_price") or 0.0)
+                total_cost = float(row.get("pchs_amt") or row.get("total_cost") or (avg_price * kis_qty) or 0.0)
+                market = row.get("prdt_type_cd") or row.get("market") or row.get("mket_gb")
+                if db_row:
+                    self.positions_repo.update_position_fields(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=int(db_row.get("sid") or 1),
+                        mode=int(db_row.get("mode") or 1),
+                        code=code,
+                        fields={
+                            "qty": kis_qty,
+                            "avg_buy_price": avg_price or None,
+                            "total_cost": total_cost or 0.0,
+                            "market": market,
+                            "last_reconciled_at": now_kst(),
+                        },
+                    )
+                elif kis_qty > 0:
+                    self.positions_repo.bootstrap_from_kis_holdings(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=1,
+                        mode=1,
+                        holdings=[row],
+                    )
+                corrected_count += 1
+        refreshed = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        logger.info(
+            "[POSITIONS][RECONCILE][OK] holdings=%s corrected=%s",
+            len(holdings_rows or []),
+            corrected_count,
+        )
+        return refreshed
 
     def _with_name_reason(self, reasons: list[str] | None, code: str | None) -> list[str]:
         enriched = list(reasons or [])
@@ -6357,6 +6430,7 @@ class PB1Engine:
 
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
         status: dict[str, Any] = self._empty_order_status()
+        stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
         if self.intended_live and self.dry_run:
             raise RuntimeError(
@@ -6600,8 +6674,9 @@ class PB1Engine:
         if self.dry_run:
             logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", display_code, cf.planned_qty, cf.client_order_key, order_id)
             logger.info(
-                "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                display_code,
+                "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                cf.code,
+                stock_name,
                 order_id,
                 cf.planned_qty,
                 float(limit_price or entry_price or 0.0),
@@ -6659,8 +6734,9 @@ class PB1Engine:
             return status
         status["submit_attempted"] = 1
         logger.info(
-            "[ORDER][API_REQUEST] code=%s qty=%s price=%s order_type=%s",
-            display_code,
+            "[ORDER][API_REQUEST] code=%s name=%s qty=%s price=%s order_type=%s",
+            cf.code,
+            stock_name,
             cf.planned_qty,
             record_price,
             order_type,
@@ -6718,8 +6794,9 @@ class PB1Engine:
         status["broker_response_code"] = msg_cd or rt_cd
         status["broker_message"] = msg1
         logger.info(
-            "[ORDER][API_RESULT] code=%s rt_cd=%s msg_cd=%s accepted=%s rejected=%s",
-            display_code,
+            "[ORDER][API_RESULT] code=%s name=%s rt_cd=%s msg_cd=%s accepted=%s rejected=%s",
+            cf.code,
+            stock_name,
             rt_cd,
             msg_cd,
             int(bool(ok)),
@@ -6761,8 +6838,9 @@ class PB1Engine:
             msg1,
         )
         logger.info(
-            "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
-            display_code,
+            "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
+            cf.code,
+            stock_name,
             kis_odno or order_id,
             cf.planned_qty,
             float(limit_price or entry_price or 0.0),
@@ -6822,6 +6900,14 @@ class PB1Engine:
                 filled_at=filled_at,
                 entry_meta_json=fill_meta,
             )
+            logger.info(
+                "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
+                cf.code,
+                stock_name,
+                "BUY",
+                cf.planned_qty,
+                record_price,
+            )
             entry_price = float(record_price or 0.0)
             base_id = f"{cf.code}:{self._today}:{cf.features.get('pivot')}"
             r_value = entry_price - float(cf.features.get("stop_price") or 0.0)
@@ -6872,8 +6958,9 @@ class PB1Engine:
                 fill_meta.get("pivot_price_at_entry"),
             )
             logger.info(
-                "[TRADE][FILL][BUY] code=%s oid=%s fill_qty=%s fill_px=%.2f",
-                display_code,
+                "[TRADE][FILL][BUY] code=%s name=%s oid=%s fill_qty=%s fill_px=%.2f",
+                cf.code,
+                stock_name,
                 kis_odno or order_id,
                 cf.planned_qty,
                 float(record_price or 0.0),
@@ -6905,6 +6992,7 @@ class PB1Engine:
         if not code or qty <= 0:
             return
         display_code = self._display_code(code)
+        stock_name = str(self._name_for_code(code) or pos.get("name") or code)
         logger.info(
             "[TRADE][DECISION][BUY] code=%s name=%s reason=%s price=%.2f qty=%s",
             display_code,
@@ -6947,8 +7035,9 @@ class PB1Engine:
         if self.dry_run:
             logger.info("[PB1][ADD-DRY] code=%s qty=%s key=%s order_id=%s", display_code, qty, client_key, order_id)
             logger.info(
-                "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                display_code,
+                "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                code,
+                stock_name,
                 order_id,
                 qty,
                 float(limit_price or price or 0.0),
@@ -6996,8 +7085,9 @@ class PB1Engine:
         self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
         logger.info(
-            "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
-            display_code,
+            "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
+            code,
+            stock_name,
             kis_odno or order_id,
             qty,
             float(limit_price or price or 0.0),
@@ -7036,6 +7126,14 @@ class PB1Engine:
                 tax=0.0,
                 filled_at=filled_at,
             )
+            logger.info(
+                "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
+                code,
+                stock_name,
+                "BUY",
+                qty,
+                fill_price,
+            )
             updated_level = pyramid_level + 1
             entry_price = float(pos.get("avg_buy_price") or fill_price)
             stop_price = float(pos.get("stop_price") or pos.get("initial_stop") or 0.0)
@@ -7062,8 +7160,9 @@ class PB1Engine:
                 filled_price=float(fill_price or 0.0),
             )
             logger.info(
-                "[TRADE][FILL][BUY] code=%s oid=%s fill_qty=%s fill_px=%.2f",
-                display_code,
+                "[TRADE][FILL][BUY] code=%s name=%s oid=%s fill_qty=%s fill_px=%.2f",
+                code,
+                stock_name,
                 kis_odno or order_id,
                 qty,
                 float(fill_price or 0.0),
@@ -7313,8 +7412,9 @@ class PB1Engine:
                 order_id,
             )
             logger.info(
-                "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
-                display_code,
+                "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=DRY_RUN",
+                cf.code,
+                str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code),
                 order_id,
                 cf.planned_qty,
                 float(cap or 0.0),
@@ -7388,7 +7488,7 @@ class PB1Engine:
         kis_odno = None
         try:
             status["submit_attempted"] = 1
-            logger.info("[ORDER][API_REQUEST] code=%s qty=%s price=%s order_type=LIMIT", display_code, cf.planned_qty, float(cap or 0.0))
+            logger.info("[ORDER][API_REQUEST] code=%s name=%s qty=%s price=%s order_type=LIMIT", cf.code, str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code), cf.planned_qty, float(cap or 0.0))
             resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
             kis_odno = extract_order_no(resp)
             status["broker_submit_called"] = 1
@@ -7426,8 +7526,9 @@ class PB1Engine:
         status["broker_response_code"] = msg_cd or rt_cd
         status["broker_message"] = msg1
         logger.info(
-            "[ORDER][API_RESULT] code=%s rt_cd=%s msg_cd=%s accepted=%s rejected=%s",
-            display_code,
+            "[ORDER][API_RESULT] code=%s name=%s rt_cd=%s msg_cd=%s accepted=%s rejected=%s",
+            cf.code,
+            str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code),
             rt_cd,
             msg_cd,
             int(bool(ok)),
@@ -7469,8 +7570,9 @@ class PB1Engine:
             msg1,
         )
         logger.info(
-            "[TRADE][ORDER][BUY] code=%s oid=%s qty=%s price=%.2f result=%s",
-            display_code,
+            "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
+            cf.code,
+            str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code),
             kis_odno or order_id,
             cf.planned_qty,
             float(cap or 0.0),
@@ -7791,8 +7893,11 @@ class PB1Engine:
                 details,
             )
         logger.info(
-            "[EXIT][DECISION] code=%s days_held=%s same_day=%s holding_bars=%s hard_stop=%s trail_hit=%s trail_eligible=%s ma50_break=%s regime_exit=%s final_reason=%s",
-            display_code,
+            "[EXIT][DECISION] code=%s name=%s qty=%s pnl_pct=%.2f days_held=%s same_day=%s holding_bars=%s hard_stop=%s trail_hit=%s trail_eligible=%s ma50_break=%s regime_exit=%s final_reason=%s",
+            code,
+            str(pos.get("name") or self._name_for_code(code) or code),
+            qty,
+            ret_pct,
             days_held,
             int(exit_policy["same_day_entry"]),
             post_entry_rows,
@@ -7994,8 +8099,9 @@ class PB1Engine:
             )
             return exit_eval_payload
         logger.info(
-            "[EXIT][ORDER_READY] code=%s qty=%s family=%s reason=%s",
-            display_code,
+            "[EXIT][ORDER_READY] code=%s name=%s qty=%s family=%s reason=%s",
+            code,
+            stock_name,
             orderable_qty,
             exit_policy_family,
             stage,
@@ -8048,8 +8154,9 @@ class PB1Engine:
             return exit_eval_payload
 
         logger.info(
-            "[EXIT][SUBMIT] code=%s qty=%s order_type=market family=%s reason=%s",
-            display_code,
+            "[EXIT][SUBMIT] code=%s name=%s qty=%s order_type=market family=%s reason=%s",
+            code,
+            stock_name,
             orderable_qty,
             exit_policy_family,
             stage,
@@ -8123,13 +8230,23 @@ class PB1Engine:
             kis_odno=kis_odno,
         )
         logger.info(
-            "[PB1][ORDER][RESULT] side=SELL code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
-            display_code,
+            "[PB1][ORDER][RESULT] side=SELL code=%s name=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
+            code,
+            stock_name,
             int(ok),
             self._format_order_result_reason(resp if isinstance(resp, dict) else None),
             rt_cd,
             msg_cd,
             msg1,
+        )
+        logger.info(
+            "[TRADE][ORDER][SELL] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
+            code,
+            stock_name,
+            kis_odno or order_id,
+            orderable_qty,
+            float(mark or 0.0),
+            "ACCEPTED" if ok else "REJECTED",
         )
         if ok:
             exit_eval_payload["submitted"] = 1
@@ -8164,6 +8281,22 @@ class PB1Engine:
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
+            )
+            logger.info(
+                "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
+                code,
+                stock_name,
+                "SELL",
+                orderable_qty,
+                mark,
+            )
+            logger.info(
+                "[TRADE][FILL][SELL] code=%s name=%s oid=%s fill_qty=%s fill_px=%.2f",
+                code,
+                stock_name,
+                kis_odno or order_id,
+                orderable_qty,
+                float(mark or 0.0),
             )
             if cooldown_until:
                 self.positions_repo.update_position_fields(
@@ -9919,7 +10052,9 @@ class PB1Engine:
             self.entry_reserve_krw = 0.0
             tick_budget_krw = 0.0
         logger.info("[PB1][POST_CAPITAL][START] phase=%s window=%s", self.phase, self.window_internal)
-        positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        with self._stage_timer("exit.positions_lookup"):
+            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+        positions = self._reconcile_positions_from_kis_balance(holdings_rows, positions)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
                 env=self.env,
@@ -9929,7 +10064,8 @@ class PB1Engine:
                 holdings=holdings_rows,
             )
             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
-            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+            with self._stage_timer("exit.positions_lookup"):
+                positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
         cooldown_map: dict[str, str] = {
             str(p.get("code") or "").zfill(6): str(p.get("cooldown_until"))
             for p in positions
@@ -10815,16 +10951,17 @@ class PB1Engine:
             if isinstance(self._budget_plan_meta, dict) and self._budget_plan_meta.get("effective_target"):
                 new_position_limit = min(new_position_limit, int(self._budget_plan_meta["effective_target"]))
             held_codes = {p.get("code") for p in existing_positions if p.get("code")}
-            with self._stage_timer("entry.orders_lookup"):
+            with self._stage_timer("entry.open_orders_lookup"):
                 open_orders = self._safe_get_open_orders()
-                open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
-                try:
+            open_buy_codes = {row.get("code") for row in open_orders if str(row.get("side") or "").upper() == "BUY"}
+            try:
+                with self._stage_timer("entry.today_buy_orders_lookup"):
                     today_orders = self._safe_list_today_orders(side="BUY")
-                except Exception as e:
-                    logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
-                    if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
-                        raise
-                    today_orders = []
+            except Exception as e:
+                logger.exception("[PB1][ORDERS_TODAY][FAIL] env=%s side=BUY err=%s", self.env, str(e))
+                if engine_live_trading_enabled and not engine_dry_run and engine_run_mode == "LIVE":
+                    raise
+                today_orders = []
             logger.info(
                 "[ENTRY][ENGINE_GATE][AUTHORITATIVE] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates_prebuild=%s scanner_passed=%s",
                 len(setup_ok_codes),

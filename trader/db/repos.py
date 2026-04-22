@@ -358,6 +358,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _order_lookup_fail_open_default() -> bool:
+    explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
+    if explicit is None:
+        return _practice_env_default_fail_open()
+    return _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=True)
+
+
 def _practice_env_default_fail_open() -> bool:
     strategy_env = _norm_env(os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice")
     return strategy_env == "practice"
@@ -2425,19 +2432,15 @@ class OrdersRepo:
         fail_open: bool | None = None,
     ) -> list[dict]:
         if fail_open is None:
-            explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
-            fail_open = _env_flag(
-                "PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT",
-                default=_practice_env_default_fail_open(),
-            ) if explicit is not None else _practice_env_default_fail_open()
+            fail_open = _order_lookup_fail_open_default()
 
         self._last_read_fail_open_op = None
         try:
-            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            with self.engine.connect() as conn:
                 rows = conn.execute(stmt).mappings().all()
                 logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
                 return [dict(r) for r in rows]
-        except (OperationalError, DBAPIError, SATimeoutError) as exc:
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
             logger.exception(
                 "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
                 op_name,
@@ -2632,7 +2635,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
-            fail_open=True,
+            fail_open=None,
         )
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
@@ -2650,12 +2653,21 @@ class OrdersRepo:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
         )
-        rows = self._read_mappings_with_guard(
-            stmt,
-            op_name="orders.get_order_by_client_order_key",
-            fail_open=None,
-        )
-        return rows[0] if rows else None
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(stmt).mappings().first()
+                return dict(row) if row else None
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=orders.get_order_by_client_order_key err_type=%s err=%s",
+                type(exc).__name__,
+                exc,
+            )
+            if _order_lookup_fail_open_default():
+                self._last_read_fail_open_op = "orders.get_order_by_client_order_key"
+                logger.warning("[DB][READ][FAIL_OPEN] op=orders.get_order_by_client_order_key -> returning None")
+                return None
+            raise
 
     def has_blocking_order_today(
         self,
@@ -2705,14 +2717,26 @@ class OrdersRepo:
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(1)
         )
-        rows = self._read_mappings_with_guard(
-            stmt,
-            op_name="orders.has_blocking_order_today",
-            fail_open=True,
-        )
-        if rows:
-            return True, rows[0]
-        return False, None
+        fail_open = _order_lookup_fail_open_default()
+        self._last_read_fail_open_op = None
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(stmt).mappings().first()
+                if row:
+                    return True, dict(row)
+                return False, None
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=orders.has_blocking_order_today fail_open=%s err_type=%s err=%s",
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if fail_open:
+                self._last_read_fail_open_op = "orders.has_blocking_order_today"
+                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_blocking_order_today -> returning False,None")
+                return False, None
+            raise
 
     def list_today_orders(
         self,
@@ -2738,7 +2762,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_orders",
-            fail_open=True,
+            fail_open=None,
         )
 
     def list_orders_in_window(
@@ -2918,6 +2942,35 @@ class FillsRepo:
         self._last_read_fail_open_op = None
         return True
 
+    def _read_mappings_with_guard(
+        self,
+        stmt,
+        *,
+        op_name: str,
+        fail_open: bool | None = None,
+    ) -> list[dict]:
+        if fail_open is None:
+            fail_open = _order_lookup_fail_open_default()
+        self._last_read_fail_open_op = None
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(stmt).mappings().all()
+                logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
+                return [dict(r) for r in rows]
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+                op_name,
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if fail_open:
+                self._last_read_fail_open_op = op_name
+                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
+                return []
+            raise
+
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
         stmt = sa.select(self._schema.runs.c.run_id).where(self._schema.runs.c.run_id == run_id)
@@ -2950,13 +3003,13 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == str(code).zfill(6))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
-        fail_open = _resolve_lookup_fail_open()
-        self._last_read_fail_open_op = None
+        fail_open = _order_lookup_fail_open_default()
         try:
-            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-                rows = conn.execute(stmt).mappings().all()
-                logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", "fills.list_today_fills", len(rows), int(bool(fail_open)))
-                return [dict(r) for r in rows]
+            return self._read_mappings_with_guard(
+                stmt,
+                op_name="fills.list_today_fills",
+                fail_open=fail_open,
+            )
         except ProgrammingError as exc:
             logger.exception(
                 "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
@@ -2972,23 +3025,6 @@ class FillsRepo:
                 raise RuntimeError(
                     "ENTRY_ABORT_PRECHECK:db_schema_mismatch_fills_filled_at op=fills.list_today_fills [DB][READ][FATAL_SCHEMA_MISMATCH]"
                 ) from exc
-            if fail_open:
-                self._last_read_fail_open_op = "fills.list_today_fills"
-                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", "fills.list_today_fills")
-                return []
-            raise
-        except (OperationalError, DBAPIError, SATimeoutError) as exc:
-            logger.exception(
-                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
-                "fills.list_today_fills",
-                int(bool(fail_open)),
-                type(exc).__name__,
-                exc,
-            )
-            if fail_open:
-                self._last_read_fail_open_op = "fills.list_today_fills"
-                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", "fills.list_today_fills")
-                return []
             raise
 
     def list_fills_in_window(
@@ -3766,9 +3802,20 @@ class PositionsRepo:
         stmt = select(self._schema.positions).where(
             and_(self._schema.positions.c.env == env, self._schema.positions.c.strategy == strategy)
         )
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-            return [dict(r) for r in rows]
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(stmt).mappings().all()
+                return [dict(r) for r in rows]
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+            logger.exception(
+                "[DB][READ][FAIL] op=positions.list_positions err_type=%s err=%s",
+                type(exc).__name__,
+                exc,
+            )
+            if _practice_env_default_fail_open():
+                logger.warning("[DB][READ][FAIL_OPEN] op=positions.list_positions -> returning []")
+                return []
+            raise
 
     def get_position(self, *, env: str, strategy: str, sid: int, mode: int, code: str) -> dict | None:
         stmt = select(self._schema.positions).where(
@@ -4374,7 +4421,7 @@ def load_price_daily_conn(conn: sa.Connection, code: str, start_date: date, end_
 
 def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date) -> List[Dict[str, Any]]:
     def _op() -> List[Dict[str, Any]]:
-        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        with engine.connect() as conn:
             return load_price_daily_conn(conn, code, start_date, end_date)
 
     return run_with_db_retry(
