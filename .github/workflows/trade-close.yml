@@ -36,6 +36,15 @@ permissions:
 env:
   MODE: trade
   PB1_SESSION_KIND: "close"
+  PB1_FORCE_TRADE_SESSION: "auto"
+  PB1_FORCE_TRADE_AM_LATE_START: "0"
+  PB1_FORCE_TRADE_AM_AFTER_1030: "0"
+  PB1_FORCE_TRADE_PM_LATE_START: "0"
+  PB1_FORCE_TRADE_PM_AFTER_1340: "0"
+  PB1_ENABLE_LATE_AM_RECOVERY: "0"
+  PB1_AM_RECOVERY_ALLOW_UNTIL: "10:30"
+  PB1_ENABLE_LATE_PM_RECOVERY: "0"
+  PB1_PM_RECOVERY_ALLOW_UNTIL: "13:40"
   PB1_CLOSE_SESSION_END: "15:30"
   PB1_TICK_HARD_TIMEOUT_SEC: "45"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
@@ -123,6 +132,12 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
+          echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE}"
+          echo "[RESOLVE] force_trade_session=${PB1_FORCE_TRADE_SESSION:-auto}"
+          echo "[RESOLVE] am_recovery=${PB1_ENABLE_LATE_AM_RECOVERY:-0} am_recovery_until=${PB1_AM_RECOVERY_ALLOW_UNTIL:-unset}"
+          echo "[RESOLVE] pm_recovery=${PB1_ENABLE_LATE_PM_RECOVERY:-0} pm_recovery_until=${PB1_PM_RECOVERY_ALLOW_UNTIL:-unset}"
+          echo "[RESOLVE] force_am_late=${PB1_FORCE_TRADE_AM_LATE_START:-0} force_am_after_1030=${PB1_FORCE_TRADE_AM_AFTER_1030:-0}"
+          echo "[RESOLVE] force_pm_late=${PB1_FORCE_TRADE_PM_LATE_START:-0} force_pm_after_1340=${PB1_FORCE_TRADE_PM_AFTER_1340:-0}"
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
           manual_mode="${CLOSE_MANUAL_MODE:-live_close}"

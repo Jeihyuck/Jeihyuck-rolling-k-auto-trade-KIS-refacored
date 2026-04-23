@@ -33,6 +33,14 @@ def main() -> int:
         os.getenv("PB1_TICK_HARD_TIMEOUT_SEC", "90"),
         os.getenv("PB1_LAST_STAGE", "trade_tick.bootstrap"),
     )
+    logger.info(
+        "[TRADE][BOOT][SESSION_POLICY] force_trade_session=%s forced_trade_session=%s force_entry_window_override=%s session_recovery_continue=%s phase_guard_classification=%s",
+        os.getenv("PB1_FORCE_TRADE_SESSION", "auto"),
+        os.getenv("PB1_FORCED_TRADE_SESSION", ""),
+        os.getenv("PB1_FORCE_ENTRY_WINDOW_OVERRIDE", "0"),
+        os.getenv("PB1_SESSION_RECOVERY_CONTINUE", "0"),
+        os.getenv("PB1_PHASE_GUARD_CLASSIFICATION", ""),
+    )
     from trader.pb1_runner import main as pb1_main
     return pb1_main()
 

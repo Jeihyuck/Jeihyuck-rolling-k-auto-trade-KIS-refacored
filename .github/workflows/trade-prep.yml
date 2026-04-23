@@ -24,6 +24,16 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
+  MODE: trade
+  PB1_FORCE_TRADE_SESSION: "auto"
+  PB1_FORCE_TRADE_AM_LATE_START: "0"
+  PB1_FORCE_TRADE_AM_AFTER_1030: "0"
+  PB1_FORCE_TRADE_PM_LATE_START: "0"
+  PB1_FORCE_TRADE_PM_AFTER_1340: "0"
+  PB1_ENABLE_LATE_AM_RECOVERY: "0"
+  PB1_AM_RECOVERY_ALLOW_UNTIL: "10:30"
+  PB1_ENABLE_LATE_PM_RECOVERY: "0"
+  PB1_PM_RECOVERY_ALLOW_UNTIL: "13:40"
   WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   STRATEGY_MODE: DIAG
   KIS_HTTP_ENABLED: "0"
@@ -91,6 +101,12 @@ jobs:
           mkdir -p repo/artifacts
           now_kst="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S %Z')"
           {
+            echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE:-trade}"
+            echo "[RESOLVE] force_trade_session=${PB1_FORCE_TRADE_SESSION:-auto}"
+            echo "[RESOLVE] am_recovery=${PB1_ENABLE_LATE_AM_RECOVERY:-0} am_recovery_until=${PB1_AM_RECOVERY_ALLOW_UNTIL:-unset}"
+            echo "[RESOLVE] pm_recovery=${PB1_ENABLE_LATE_PM_RECOVERY:-0} pm_recovery_until=${PB1_PM_RECOVERY_ALLOW_UNTIL:-unset}"
+            echo "[RESOLVE] force_am_late=${PB1_FORCE_TRADE_AM_LATE_START:-0} force_am_after_1030=${PB1_FORCE_TRADE_AM_AFTER_1030:-0}"
+            echo "[RESOLVE] force_pm_late=${PB1_FORCE_TRADE_PM_LATE_START:-0} force_pm_after_1340=${PB1_FORCE_TRADE_PM_AFTER_1340:-0}"
             echo "[PREP][TRIGGER] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
             echo "[PREP][START_META] now_kst=${now_kst} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/prep.log

@@ -51,6 +51,15 @@ on:
           - manage
           - prep
           - verify
+      FORCE_TRADE_SESSION:
+        description: "Override trade session classification"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - am
+          - pm
       PB1_DIAG_FULL_EXEC:
         description: Force DIAG manual route through full engine path
         required: false
@@ -82,24 +91,34 @@ on:
         default: "1"
         type: string
       FORCE_TRADE_AM_LATE_START:
-        description: "1=allow manual/schedule trade-am start even after normal cutoff"
-        required: true
+        description: "1=allow AM start after normal cutoff"
+        required: false
         default: "0"
         type: string
       FORCE_TRADE_AM_AFTER_1030:
-        description: "1=allow manual trade-am start after 10:30 KST"
-        required: true
+        description: "1=allow manual AM start after 10:30 KST"
+        required: false
         default: "0"
         type: string
       AM_RECOVERY_ALLOW_UNTIL:
         description: Late AM recovery deadline in KST (HH:MM)
-        required: true
+        required: false
         default: "10:30"
         type: string
       ENABLE_LATE_PM_RECOVERY:
         description: Allow late PM recovery run before cutoff
         required: false
         default: "1"
+        type: string
+      FORCE_TRADE_PM_LATE_START:
+        description: "1=allow PM start after normal cutoff"
+        required: false
+        default: "0"
+        type: string
+      FORCE_TRADE_PM_AFTER_1340:
+        description: "1=allow manual PM start after 13:40 KST"
+        required: false
+        default: "0"
         type: string
       PM_RECOVERY_ALLOW_UNTIL:
         description: Late PM recovery cutoff in KST
@@ -156,12 +175,15 @@ jobs:
           PB1_DIAG_FULL_EXEC_INPUT: ${{ inputs.PB1_DIAG_FULL_EXEC || '0' }}
           FORCE_MARKET_WINDOW_INPUT: ${{ inputs.FORCE_MARKET_WINDOW || '' }}
           FORCE_PB1_PHASE_INPUT: ${{ inputs.FORCE_PB1_PHASE || '' }}
+          FORCE_TRADE_SESSION_INPUT: ${{ inputs.FORCE_TRADE_SESSION || 'auto' }}
           ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT: ${{ inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
           ENABLE_LATE_AM_RECOVERY_INPUT: ${{ inputs.ENABLE_LATE_AM_RECOVERY || '1' }}
           FORCE_TRADE_AM_LATE_START_INPUT: ${{ inputs.FORCE_TRADE_AM_LATE_START || '0' }}
           FORCE_TRADE_AM_AFTER_1030_INPUT: ${{ inputs.FORCE_TRADE_AM_AFTER_1030 || '0' }}
           AM_RECOVERY_ALLOW_UNTIL_INPUT: ${{ inputs.AM_RECOVERY_ALLOW_UNTIL || '10:30' }}
           ENABLE_LATE_PM_RECOVERY_INPUT: ${{ inputs.ENABLE_LATE_PM_RECOVERY || '1' }}
+          FORCE_TRADE_PM_LATE_START_INPUT: ${{ inputs.FORCE_TRADE_PM_LATE_START || '0' }}
+          FORCE_TRADE_PM_AFTER_1340_INPUT: ${{ inputs.FORCE_TRADE_PM_AFTER_1340 || '0' }}
           PM_RECOVERY_ALLOW_UNTIL_INPUT: ${{ inputs.PM_RECOVERY_ALLOW_UNTIL || '13:40' }}
         run: |
           set -euo pipefail
@@ -229,11 +251,11 @@ jobs:
           echo "[RESOLVE] event=${GITHUB_EVENT_NAME}"
           echo "[RESOLVE] actor=${GITHUB_ACTOR}"
           echo "[RESOLVE] mode=${run_mode}"
-          echo "[RESOLVE] force_trade_am_late_start=${FORCE_TRADE_AM_LATE_START_INPUT}"
-          echo "[RESOLVE] force_trade_am_after_1030=${FORCE_TRADE_AM_AFTER_1030_INPUT}"
-          echo "[RESOLVE] am_recovery_allow_until=${AM_RECOVERY_ALLOW_UNTIL_INPUT}"
+          echo "[RESOLVE] force_trade_session=${FORCE_TRADE_SESSION_INPUT}"
           echo "[RESOLVE] am_recovery=${ENABLE_LATE_AM_RECOVERY_INPUT} am_recovery_until=${AM_RECOVERY_ALLOW_UNTIL_INPUT}"
           echo "[RESOLVE] pm_recovery=${ENABLE_LATE_PM_RECOVERY_INPUT} pm_recovery_until=${PM_RECOVERY_ALLOW_UNTIL_INPUT}"
+          echo "[RESOLVE] force_am_late=${FORCE_TRADE_AM_LATE_START_INPUT} force_am_after_1030=${FORCE_TRADE_AM_AFTER_1030_INPUT}"
+          echo "[RESOLVE] force_pm_late=${FORCE_TRADE_PM_LATE_START_INPUT} force_pm_after_1340=${FORCE_TRADE_PM_AFTER_1340_INPUT}"
 
   manual_debug:
     needs: resolve
@@ -275,6 +297,7 @@ jobs:
       WATCHLIST: ${{ github.event_name == 'workflow_dispatch' && inputs.WATCHLIST || '' }}
       FORCE_MARKET_WINDOW: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_MARKET_WINDOW || '' }}
       FORCE_PB1_PHASE: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_PB1_PHASE || '' }}
+      PB1_FORCE_TRADE_SESSION: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_SESSION || 'auto' }}
       PB1_DIAG_FULL_EXEC: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_DIAG_FULL_EXEC || '0' }}
       PB1_UNIVERSE_STRATEGY: ${{ github.event_name == 'workflow_dispatch' && inputs.PB1_UNIVERSE_STRATEGY || 'pb1_watchlist_final_scored' }}
       TRADE_REQUIRE_PREP_FINAL30_SCORED: ${{ github.event_name == 'workflow_dispatch' && inputs.TRADE_REQUIRE_PREP_FINAL30_SCORED || '1' }}
@@ -286,12 +309,16 @@ jobs:
       PB1_FORCE_TRADE_AM_AFTER_1030: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_AFTER_1030 || '0' }}
       PB1_AM_RECOVERY_ALLOW_UNTIL: ${{ github.event_name == 'workflow_dispatch' && inputs.AM_RECOVERY_ALLOW_UNTIL || '10:30' }}
       PB1_ENABLE_LATE_PM_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.ENABLE_LATE_PM_RECOVERY || '1' }}
+      PB1_FORCE_TRADE_PM_LATE_START: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_PM_LATE_START || '0' }}
+      PB1_FORCE_TRADE_PM_AFTER_1340: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_PM_AFTER_1340 || '0' }}
       PB1_PM_RECOVERY_ALLOW_UNTIL: ${{ github.event_name == 'workflow_dispatch' && inputs.PM_RECOVERY_ALLOW_UNTIL || '13:40' }}
       PB1_AM_EXPECTED_START: "09:07"
       PB1_AM_EXPECTED_END: "09:15"
       PB1_AM_START_ALLOW_UNTIL: "09:30"
       PB1_AM_EXPECTED_START_FROM: "0907"
       PB1_AM_EXPECTED_START_TO: "0915"
+      PB1_PM_EXPECTED_START: "13:05"
+      PB1_PM_EXPECTED_END: "13:15"
       PB1_PM_EXPECTED_START_FROM: "1305"
       PB1_PM_EXPECTED_START_TO: "1315"
       PB1_PM_START_ALLOW_UNTIL: "1325"

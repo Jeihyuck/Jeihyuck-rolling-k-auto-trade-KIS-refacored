@@ -480,7 +480,7 @@ def test_session_recovery_guard_skips_after_am_cutoff(monkeypatch) -> None:
     )
 
     assert result["skip"] is True
-    assert result["exit_reason"] == "phase_guard_skip_late_schedule_no_recovery"
+    assert result["exit_reason"] == "late_schedule_start_after_recovery_window_am"
 
 
 def test_session_recovery_guard_allows_late_pm_recovery(monkeypatch) -> None:

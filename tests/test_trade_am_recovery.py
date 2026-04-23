@@ -131,6 +131,7 @@ def test_forced_trade_am_override_keeps_live_gate_separate() -> None:
         True,
         None,
         force_entry_window_override=True,
+        forced_trade_session="am",
     )
 
     engine = PB1Engine.__new__(PB1Engine)

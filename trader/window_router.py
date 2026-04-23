@@ -37,6 +37,11 @@ def in_window(now: datetime, start: time, end: time) -> bool:
 
 def decide_window(now: datetime | None = None, override: str = "auto") -> Optional[WindowDecision]:
     now = now or get_kst_now()
+    force_entry_window_override = (os.getenv("PB1_FORCE_ENTRY_WINDOW_OVERRIDE") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    forced_trade_session = (os.getenv("PB1_FORCED_TRADE_SESSION") or "").strip().lower()
+    if force_entry_window_override and forced_trade_session in {"am", "pm"}:
+        forced_window_name = "morning" if forced_trade_session == "am" and override == "morning" else "day"
+        return WindowDecision(name=forced_window_name, phase="trade")
     if override == "morning":
         if in_window(now, MORNING_WINDOW_START, MORNING_WINDOW_END):
             phase = "exit" if in_window(now, MORNING_EXIT_START, MORNING_EXIT_END) else "trade"

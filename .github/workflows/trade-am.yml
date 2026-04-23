@@ -17,6 +17,25 @@ name: "Trade AM"
         type: choice
         options:
           - practice
+      FORCE_TRADE_SESSION:
+        description: "Override trade session classification"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - am
+          - pm
+      FORCE_TRADE_AM_LATE_START:
+        description: "1=allow AM start after normal cutoff"
+        required: false
+        default: "0"
+        type: string
+      FORCE_TRADE_AM_AFTER_1030:
+        description: "1=allow manual AM start after 10:30 KST"
+        required: false
+        default: "0"
+        type: string
 
 concurrency:
   group: pb1-practice-am-serial
@@ -28,11 +47,14 @@ permissions:
 env:
   MODE: trade
   PB1_SESSION_KIND: "am"
+  PB1_FORCE_TRADE_SESSION: "auto"
   PB1_AM_START_ALLOW_UNTIL: "0930"
   PB1_AM_RECOVERY_ALLOW_UNTIL: "1030"
   PB1_AM_EXPECTED_START_FROM: "0907"
   PB1_AM_EXPECTED_START_TO: "0915"
   PB1_ENABLE_LATE_AM_RECOVERY: "1"
+  PB1_FORCE_TRADE_AM_LATE_START: "0"
+  PB1_FORCE_TRADE_AM_AFTER_1030: "0"
   PB1_AM_SESSION_END: "13:00"
   PB1_TICK_HARD_TIMEOUT_SEC: "90"
   PB1_POSTPROCESS_TIMEOUT_SEC: "45"
@@ -117,103 +139,41 @@ jobs:
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
       STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
+      PB1_FORCE_TRADE_SESSION: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_SESSION || 'auto' }}
+      PB1_FORCE_TRADE_AM_LATE_START: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_LATE_START || '0' }}
+      PB1_FORCE_TRADE_AM_AFTER_1030: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_AFTER_1030 || '0' }}
 
     steps:
-      - name: Guard AM phase window (all triggers)
+      - name: Resolve AM session context
         id: phase_guard
         working-directory: .
         run: |
           set -euo pipefail
           now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
-          run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
-
-          hh="${now_hhmm:0:2}"
-          mm="${now_hhmm:2:2}"
-          now_min=$((10#$hh * 60 + 10#$mm))
-
-          min_0900=$((9 * 60 + 0))
-          min_0907=$((9 * 60 + 7))
-          min_0915=$((9 * 60 + 15))
-          min_0920=$((9 * 60 + 20))
-          min_0930=$((9 * 60 + 30))
-          min_1030=$((10 * 60 + 30))
-          min_0940=$((9 * 60 + 40))
-          min_1255=$((12 * 60 + 55))
 
           valid_window="0900-1255"
           expected_start_window="0907-0915"
           new_start_allow_window="0907-0930"
-          recovery_allow_window="0931-1030"
-          should_run=1
-          skip_reason="none"
-          late_level="NONE"
-          degraded_session=0
-          recovery_mode=0
-          start_classification="STARTED_ON_TIME"
-          trigger_classification="schedule"
-
-          if [[ "$event_name" == "workflow_dispatch" ]]; then
-            trigger_classification="workflow_dispatch"
-          elif [[ "$run_attempt" -gt 1 ]]; then
-            trigger_classification="rerun_attempt"
-          else
-            trigger_classification="schedule"
-          fi
-
-          if [[ "$event_name" != "workflow_dispatch" ]]; then
-            if (( now_min < min_0900 )); then
-              should_run=0
-              skip_reason="early_start"
-            elif (( now_min > min_1030 )); then
-              should_run=0
-              skip_reason="late_schedule_start_after_1030"
-            elif (( now_min > min_0930 )); then
-              recovery_mode=1
-            fi
-          fi
-
-          if [[ "$event_name" == "workflow_dispatch" ]]; then
-            if (( now_min > min_1030 )) && [[ "${FORCE_ALLOW_LATE_MANUAL:-0}" != "1" ]]; then
-              should_run=0
-              skip_reason="late_manual_start_after_1030_requires_force"
-            elif (( now_min > min_0930 )); then
-              recovery_mode=1
-            fi
-          fi
-
-          if (( now_min > min_0920 )); then
-            late_level="WARN"
-            degraded_session=1
-            start_classification="STARTED_LATE_WARN"
-          fi
-
-          if (( now_min > min_0940 )); then
-            late_level="ERROR"
-            degraded_session=1
-            start_classification="STARTED_LATE_ERROR"
-          fi
-
-          if (( recovery_mode == 1 )) && [[ "$should_run" == "1" ]]; then
-            start_classification="STARTED_LATE_RECOVERY"
-          fi
-
-          if [[ "$should_run" != "1" ]]; then
-            start_classification="SKIP_PHASE_WINDOW"
-          fi
-          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
-          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+          echo "should_run=1" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=" >> "$GITHUB_OUTPUT"
           echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
-          echo "trigger_classification=${trigger_classification}" >> "$GITHUB_OUTPUT"
+          echo "trigger_classification=${event_name}" >> "$GITHUB_OUTPUT"
           echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
           echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
           echo "new_start_allow_window=${new_start_allow_window}" >> "$GITHUB_OUTPUT"
-          echo "recovery_allow_window=${recovery_allow_window}" >> "$GITHUB_OUTPUT"
-          echo "late_level=${late_level}" >> "$GITHUB_OUTPUT"
-          echo "degraded_session=${degraded_session}" >> "$GITHUB_OUTPUT"
-          echo "recovery_mode=${recovery_mode}" >> "$GITHUB_OUTPUT"
-          echo "start_classification=${start_classification}" >> "$GITHUB_OUTPUT"
+          echo "recovery_allow_window=0931-1030" >> "$GITHUB_OUTPUT"
+          echo "late_level=NONE" >> "$GITHUB_OUTPUT"
+          echo "degraded_session=0" >> "$GITHUB_OUTPUT"
+          echo "recovery_mode=0" >> "$GITHUB_OUTPUT"
+          echo "start_classification=WORKFLOW_DEFER_TO_RUNNER" >> "$GITHUB_OUTPUT"
+          echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE}"
+          echo "[RESOLVE] force_trade_session=${PB1_FORCE_TRADE_SESSION:-auto}"
+          echo "[RESOLVE] am_recovery=${PB1_ENABLE_LATE_AM_RECOVERY:-0} am_recovery_until=${PB1_AM_RECOVERY_ALLOW_UNTIL:-unset}"
+          echo "[RESOLVE] pm_recovery=${PB1_ENABLE_LATE_PM_RECOVERY:-0} pm_recovery_until=${PB1_PM_RECOVERY_ALLOW_UNTIL:-unset}"
+          echo "[RESOLVE] force_am_late=${PB1_FORCE_TRADE_AM_LATE_START:-0} force_am_after_1030=${PB1_FORCE_TRADE_AM_AFTER_1030:-0}"
+          echo "[RESOLVE] force_pm_late=${PB1_FORCE_TRADE_PM_LATE_START:-0} force_pm_after_1340=${PB1_FORCE_TRADE_PM_AFTER_1340:-0}"
 
       - name: Write AM trigger metadata
         if: steps.phase_guard.outputs.should_run == '1'
@@ -231,18 +191,7 @@ jobs:
             echo "[TRADE_AM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
             echo "[TRADE_AM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
-            echo "[TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }} recovery_allow_window=${{ steps.phase_guard.outputs.recovery_allow_window }}"
-            echo "[TRADE_AM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }}"
             echo "[TRADE_AM][PRECHECK][START]"
-            if [[ "${{ steps.phase_guard.outputs.recovery_mode }}" == "1" ]]; then
-              echo "[TRADE_AM][RECOVERY] mode=workflow_guard_continue now_kst=${{ steps.phase_guard.outputs.now_kst }} recovery_allow_window=${{ steps.phase_guard.outputs.recovery_allow_window }}"
-            fi
-            if [[ -n "${{ steps.phase_guard.outputs.late_level }}" ]]; then
-              echo "[TRADE_AM][LATE_START][WARN] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
-            fi
-            if [[ "${{ steps.phase_guard.outputs.late_level }}" == "ERROR" ]]; then
-              echo "[TRADE_AM][LATE_START][ERROR] now_kst=${{ steps.phase_guard.outputs.now_kst }} expected=${{ steps.phase_guard.outputs.expected_start_window }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
-            fi
           } | tee -a repo/artifacts/trade-am.log
           {
             echo "PRECHECK_EPOCH=${precheck_epoch}"
@@ -430,8 +379,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          export TRADE_AM_LATE_START=$([[ -n "${{ steps.phase_guard.outputs.late_level }}" ]] && echo 1 || echo 0)
-          export TRADE_AM_DEGRADED_SESSION=${{ steps.phase_guard.outputs.degraded_session }}
+          export TRADE_AM_LATE_START="${TRADE_AM_LATE_START:-0}"
+          export TRADE_AM_DEGRADED_SESSION="${TRADE_AM_DEGRADED_SESSION:-0}"
           echo "[TRADE_AM][WINDOW] target=09:07-13:00 KST loop_minutes=${PB1_RUN_LOOP_MINUTES} interval_sec=${PB1_LOOP_INTERVAL_SEC}"
           echo "[CONFIG][FINAL30_SOURCE_MODE] ${FINAL30_SOURCE_MODE}"
           echo "[CONFIG][PB1_REQUIRE_SCORED_FINAL30] ${PB1_REQUIRE_SCORED_FINAL30}"

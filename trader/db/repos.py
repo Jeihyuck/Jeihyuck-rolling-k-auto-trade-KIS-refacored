@@ -2817,7 +2817,52 @@ class OrdersRepo:
             )
         )
 
-    def has_today_am_session_marker(self, env: str, trade_date: date | datetime | str | None = None) -> bool:
+    def _session_window_bounds(self, session: str, trade_date: date | datetime | str | None = None) -> tuple[datetime, datetime]:
+        session_key = str(session or "").strip().lower()
+        bounds = {
+            "am": (9, 0, 12, 59),
+            "pm": (13, 0, 15, 39),
+        }
+        start_hour, start_minute, end_hour, end_minute = bounds.get(session_key, bounds["am"])
+        anchor = now_kst()
+        if isinstance(trade_date, datetime):
+            marker_date = trade_date.date()
+        elif isinstance(trade_date, date):
+            marker_date = trade_date
+        elif isinstance(trade_date, str) and trade_date.strip():
+            marker_date = datetime.fromisoformat(trade_date).date()
+        else:
+            marker_date = now_kst().date()
+        anchor = anchor.replace(year=marker_date.year, month=marker_date.month, day=marker_date.day)
+        return (
+            anchor.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0),
+            anchor.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0),
+        )
+
+    def list_today_session_buy_orders(
+        self,
+        env: str,
+        session: str,
+        *,
+        trade_date: date | datetime | str | None = None,
+        code: str | None = None,
+    ) -> list[dict]:
+        start_at, end_at = self._session_window_bounds(session, trade_date)
+        return self.list_today_buy_orders(
+            env,
+            start_at=start_at,
+            end_at=end_at,
+            code=code,
+        )
+
+    def has_today_session_marker(
+        self,
+        env: str,
+        session: str,
+        marker_type: str,
+        trade_date: date | datetime | str | None = None,
+    ) -> bool:
+        marker_key = str(marker_type or "completed").strip().lower() or "completed"
         if isinstance(trade_date, datetime):
             marker_date = trade_date.date()
         elif isinstance(trade_date, date):
@@ -2827,33 +2872,40 @@ class OrdersRepo:
         else:
             marker_date = now_kst().date()
         job_key = f"trade_session:{str(env or '').strip().lower() or 'practice'}:am:{marker_date.isoformat()}"
+        if str(session or "").strip().lower() in {"am", "pm"}:
+            job_key = f"trade_session:{str(env or '').strip().lower() or 'practice'}:{str(session or '').strip().lower()}:{marker_date.isoformat()}"
         schema = schema_for_engine(self.engine)
         stmt = select(schema.job_checkpoints.c.payload).where(schema.job_checkpoints.c.job_key == job_key)
         self._last_read_fail_open_op = None
         try:
             with self.engine.connect() as conn:
                 payload = conn.execute(stmt).scalar()
-            completed = bool((payload or {}).get("completed")) if isinstance(payload, dict) else False
+            completed = bool((payload or {}).get(marker_key)) if isinstance(payload, dict) else False
             logger.info(
-                "[DB][ORDERS][AM_MARKER] env=%s trade_date=%s completed=%s",
+                "[DB][ORDERS][SESSION_MARKER] env=%s session=%s trade_date=%s marker_type=%s completed=%s",
                 env,
+                session,
                 marker_date.isoformat(),
+                marker_key,
                 int(completed),
             )
             return completed
         except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
             fail_open = _order_lookup_fail_open_default()
             logger.exception(
-                "[DB][READ][FAIL] op=orders.has_today_am_session_marker fail_open=%s err_type=%s err=%s",
+                "[DB][READ][FAIL] op=orders.has_today_session_marker fail_open=%s err_type=%s err=%s",
                 int(bool(fail_open)),
                 type(exc).__name__,
                 exc,
             )
             if fail_open:
-                self._last_read_fail_open_op = "orders.has_today_am_session_marker"
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_today_am_session_marker -> returning False")
+                self._last_read_fail_open_op = "orders.has_today_session_marker"
+                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_today_session_marker -> returning False")
                 return False
             raise
+
+    def has_today_am_session_marker(self, env: str, trade_date: date | datetime | str | None = None) -> bool:
+        return self.has_today_session_marker(env, "am", "completed", trade_date)
 
     def list_orders_in_window(
         self,
