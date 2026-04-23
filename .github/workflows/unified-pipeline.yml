@@ -76,6 +76,26 @@ on:
         required: false
         default: "1"
         type: string
+      ENABLE_LATE_AM_RECOVERY:
+        description: Allow late AM recovery run before cutoff
+        required: false
+        default: "1"
+        type: string
+      AM_RECOVERY_ALLOW_UNTIL:
+        description: Late AM recovery cutoff in KST
+        required: false
+        default: "10:30"
+        type: string
+      ENABLE_LATE_PM_RECOVERY:
+        description: Allow late PM recovery run before cutoff
+        required: false
+        default: "1"
+        type: string
+      PM_RECOVERY_ALLOW_UNTIL:
+        description: Late PM recovery cutoff in KST
+        required: false
+        default: "13:40"
+        type: string
 
 concurrency:
   group: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'prep' && format('unified-manual-practice-prep-debug-{0}', github.ref_name) || format('unified-manual-practice-{0}', github.ref_name) }}
@@ -127,6 +147,10 @@ jobs:
           FORCE_MARKET_WINDOW_INPUT: ${{ inputs.FORCE_MARKET_WINDOW || '' }}
           FORCE_PB1_PHASE_INPUT: ${{ inputs.FORCE_PB1_PHASE || '' }}
           ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT: ${{ inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
+          ENABLE_LATE_AM_RECOVERY_INPUT: ${{ inputs.ENABLE_LATE_AM_RECOVERY || '1' }}
+          AM_RECOVERY_ALLOW_UNTIL_INPUT: ${{ inputs.AM_RECOVERY_ALLOW_UNTIL || '10:30' }}
+          ENABLE_LATE_PM_RECOVERY_INPUT: ${{ inputs.ENABLE_LATE_PM_RECOVERY || '1' }}
+          PM_RECOVERY_ALLOW_UNTIL_INPUT: ${{ inputs.PM_RECOVERY_ALLOW_UNTIL || '13:40' }}
         run: |
           set -euo pipefail
           run_mode="${MODE_INPUT}"
@@ -190,6 +214,9 @@ jobs:
             echo "allow_kis_data_http_in_diag=${allow_kis_data_http_in_diag}"
             echo "allow_after_close_entry_dryrun=${allow_after_close_entry_dryrun}"
           } >> "$GITHUB_OUTPUT"
+          echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${run_mode}"
+          echo "[RESOLVE] am_recovery=${ENABLE_LATE_AM_RECOVERY_INPUT} am_recovery_until=${AM_RECOVERY_ALLOW_UNTIL_INPUT}"
+          echo "[RESOLVE] pm_recovery=${ENABLE_LATE_PM_RECOVERY_INPUT} pm_recovery_until=${PM_RECOVERY_ALLOW_UNTIL_INPUT}"
 
   manual_debug:
     needs: resolve
@@ -237,6 +264,16 @@ jobs:
       ALLOW_KIS_DATA_HTTP_IN_DIAG: ${{ needs.resolve.outputs.allow_kis_data_http_in_diag }}
       PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN: ${{ needs.resolve.outputs.allow_after_close_entry_dryrun }}
       ALLOW_DUPLICATE_PREP: ${{ github.event_name == 'workflow_dispatch' && inputs.ALLOW_DUPLICATE_PREP || '0' }}
+      PB1_ENABLE_LATE_AM_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.ENABLE_LATE_AM_RECOVERY || '1' }}
+      PB1_AM_RECOVERY_ALLOW_UNTIL: ${{ github.event_name == 'workflow_dispatch' && inputs.AM_RECOVERY_ALLOW_UNTIL || '10:30' }}
+      PB1_ENABLE_LATE_PM_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.ENABLE_LATE_PM_RECOVERY || '1' }}
+      PB1_PM_RECOVERY_ALLOW_UNTIL: ${{ github.event_name == 'workflow_dispatch' && inputs.PM_RECOVERY_ALLOW_UNTIL || '13:40' }}
+      PB1_AM_EXPECTED_START_FROM: "0907"
+      PB1_AM_EXPECTED_START_TO: "0915"
+      PB1_AM_START_ALLOW_UNTIL: "0930"
+      PB1_PM_EXPECTED_START_FROM: "1305"
+      PB1_PM_EXPECTED_START_TO: "1315"
+      PB1_PM_START_ALLOW_UNTIL: "1325"
       DB_LOCK_TIMEOUT_MS: "5000"
       DB_STATEMENT_TIMEOUT_MS: "15000"
       DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
@@ -324,6 +361,10 @@ jobs:
           echo "TRADE_REQUIRE_PREP_FINAL30_SCORED=${TRADE_REQUIRE_PREP_FINAL30_SCORED:-}"
           echo "ALLOW_KIS_DATA_HTTP_IN_DIAG=${ALLOW_KIS_DATA_HTTP_IN_DIAG:-}"
           echo "PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN=${PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN:-}"
+          echo "PB1_ENABLE_LATE_AM_RECOVERY=${PB1_ENABLE_LATE_AM_RECOVERY:-}"
+          echo "PB1_AM_RECOVERY_ALLOW_UNTIL=${PB1_AM_RECOVERY_ALLOW_UNTIL:-}"
+          echo "PB1_ENABLE_LATE_PM_RECOVERY=${PB1_ENABLE_LATE_PM_RECOVERY:-}"
+          echo "PB1_PM_RECOVERY_ALLOW_UNTIL=${PB1_PM_RECOVERY_ALLOW_UNTIL:-}"
 
       - name: Verify exact scored final30 in DB for trade and close
         if: ${{ inputs.mode == 'trade' || inputs.mode == 'close' }}

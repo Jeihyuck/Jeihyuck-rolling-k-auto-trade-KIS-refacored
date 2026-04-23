@@ -99,6 +99,8 @@ from trader.db.repos import (
     UniverseRepo,
     load_final30_scored_exact,
     load_final30_scored_db_only,
+    load_job_checkpoint,
+    save_job_checkpoint,
 )
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
@@ -1465,6 +1467,262 @@ def _session_guard_spec(session_kind: str) -> dict[str, str] | None:
         },
     }
     return specs.get(normalized)
+
+
+def _normalize_hhmm_compact(raw: str | None, fallback: str) -> str:
+    candidate = str(raw or fallback).strip().replace(":", "")
+    if len(candidate) == 4 and candidate.isdigit():
+        return candidate
+    fallback_compact = str(fallback).strip().replace(":", "")
+    logger.warning(
+        "[PB1][RECOVERY][ENV] invalid_hhmm raw=%s fallback=%s",
+        raw,
+        fallback_compact,
+    )
+    return fallback_compact
+
+
+def _parse_hhmm_kst(raw: str | None, fallback: str) -> int:
+    compact = _normalize_hhmm_compact(raw, fallback)
+    return int(compact[:2]) * 60 + int(compact[2:])
+
+
+def _in_kst_range(now: datetime, start_hhmm: str | None, end_hhmm: str | None, *, end_inclusive: bool = True) -> bool:
+    now_min = now.hour * 60 + now.minute
+    start_min = _parse_hhmm_kst(start_hhmm, "0000")
+    end_min = _parse_hhmm_kst(end_hhmm, "2359")
+    if end_inclusive:
+        return start_min <= now_min <= end_min
+    return start_min <= now_min < end_min
+
+
+def _session_recovery_spec(session_kind: str) -> dict[str, Any] | None:
+    normalized = str(session_kind or "").strip().lower()
+    specs: dict[str, dict[str, Any]] = {
+        "am": {
+            "log_prefix": "TRADE_AM",
+            "session_start": "0900",
+            "expected_from_env": "PB1_AM_EXPECTED_START_FROM",
+            "expected_from_default": "0907",
+            "expected_to_env": "PB1_AM_EXPECTED_START_TO",
+            "expected_to_default": "0915",
+            "start_allow_env": "PB1_AM_START_ALLOW_UNTIL",
+            "start_allow_default": "0930",
+            "recovery_allow_env": "PB1_AM_RECOVERY_ALLOW_UNTIL",
+            "recovery_allow_default": "1030",
+            "enable_env": "PB1_ENABLE_LATE_AM_RECOVERY",
+            "duplicate_reason": "skip_duplicate_am_run",
+        },
+        "pm": {
+            "log_prefix": "TRADE_PM",
+            "session_start": "1300",
+            "expected_from_env": "PB1_PM_EXPECTED_START_FROM",
+            "expected_from_default": "1305",
+            "expected_to_env": "PB1_PM_EXPECTED_START_TO",
+            "expected_to_default": "1315",
+            "start_allow_env": "PB1_PM_START_ALLOW_UNTIL",
+            "start_allow_default": "1325",
+            "recovery_allow_env": "PB1_PM_RECOVERY_ALLOW_UNTIL",
+            "recovery_allow_default": "1340",
+            "enable_env": "PB1_ENABLE_LATE_PM_RECOVERY",
+            "duplicate_reason": "skip_duplicate_pm_run",
+        },
+    }
+    return specs.get(normalized)
+
+
+def _detect_trade_session_recovery_window(*, now: datetime, session_kind: str) -> dict[str, Any]:
+    spec = _session_recovery_spec(session_kind)
+    if spec is None:
+        return {"supported": False, "session_kind": session_kind}
+
+    expected_from = _normalize_hhmm_compact(os.getenv(spec["expected_from_env"]), spec["expected_from_default"])
+    expected_to = _normalize_hhmm_compact(os.getenv(spec["expected_to_env"]), spec["expected_to_default"])
+    start_allow_until = _normalize_hhmm_compact(os.getenv(spec["start_allow_env"]), spec["start_allow_default"])
+    recovery_allow_until = _normalize_hhmm_compact(os.getenv(spec["recovery_allow_env"]), spec["recovery_allow_default"])
+    now_hhmm = now.strftime("%H%M")
+    late_start = not _in_kst_range(now, "0000", start_allow_until)
+    recovery_enabled = parse_bool_any(os.getenv(spec["enable_env"]) or "1", default=True)
+
+    return {
+        "supported": True,
+        "session_kind": session_kind,
+        "log_prefix": spec["log_prefix"],
+        "session_start": spec["session_start"],
+        "expected_start_window": f"{expected_from}-{expected_to}",
+        "start_allow_until": start_allow_until,
+        "recovery_allow_until": recovery_allow_until,
+        "now_hhmm": now_hhmm,
+        "late_start": late_start,
+        "within_recovery_window": _in_kst_range(now, start_allow_until, recovery_allow_until),
+        "too_late_for_recovery": not _in_kst_range(now, "0000", recovery_allow_until),
+        "recovery_enabled": recovery_enabled,
+        "duplicate_reason": spec["duplicate_reason"],
+    }
+
+
+def _session_execution_checkpoint_key(*, env: str, session_kind: str, trade_date: date) -> str:
+    return f"trade_session:{str(env or '').strip().lower() or 'practice'}:{str(session_kind or '').strip().lower()}:{trade_date.isoformat()}"
+
+
+def _record_session_execution_marker(
+    *,
+    engine,
+    env: str,
+    session_kind: str,
+    trade_date: date,
+    status: str,
+    exit_reason: str,
+    recovery_used: bool,
+) -> None:
+    spec = _session_recovery_spec(session_kind)
+    if spec is None:
+        return
+    payload = {
+        "env": str(env or "").strip().lower() or "practice",
+        "session_kind": str(session_kind or "").strip().lower(),
+        "trade_date": trade_date.isoformat(),
+        "status": status,
+        "exit_reason": exit_reason,
+        "recovery_used": bool(recovery_used),
+        "completed": True,
+        "updated_at": _get_now_kst().isoformat(),
+    }
+    try:
+        save_job_checkpoint(
+            engine,
+            _session_execution_checkpoint_key(env=env, session_kind=session_kind, trade_date=trade_date),
+            payload,
+        )
+        logger.info(
+            "[%s][DEDUPE] source=job_checkpoint completed=1 status=%s exit_reason=%s recovery_used=%s",
+            spec["log_prefix"],
+            status,
+            exit_reason,
+            int(bool(recovery_used)),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s][DEDUPE] source=job_checkpoint save_failed=1 err=%s",
+            spec["log_prefix"],
+            exc,
+        )
+
+
+def _evaluate_session_recovery_guard(*, engine, env: str, session_kind: str, now: datetime) -> dict[str, Any]:
+    info = _detect_trade_session_recovery_window(now=now, session_kind=session_kind)
+    if not info.get("supported"):
+        return {"skip": False, "recovery_used": False, "exit_reason": "none"}
+
+    log_prefix = str(info["log_prefix"])
+    os.environ["PB1_SESSION_RECOVERY_USED"] = "0"
+    if session_kind == "am":
+        os.environ.setdefault("TRADE_AM_LATE_START", "0")
+
+    if not info["late_start"]:
+        logger.info(
+            "[%s][PHASE_GUARD] now_kst=%s expected_start_window=%s start_allow_until=%s recovery_allow_until=%s late_start=0 recovery_mode=0 decision=continue",
+            log_prefix,
+            info["now_hhmm"],
+            info["expected_start_window"],
+            info["start_allow_until"],
+            info["recovery_allow_until"],
+        )
+        return {"skip": False, "recovery_used": False, "exit_reason": "none"}
+
+    logger.warning(
+        "[%s][PHASE_GUARD] now_kst=%s expected_start_window=%s start_allow_until=%s recovery_allow_until=%s late_start=1 recovery_enabled=%s",
+        log_prefix,
+        info["now_hhmm"],
+        info["expected_start_window"],
+        info["start_allow_until"],
+        info["recovery_allow_until"],
+        int(bool(info["recovery_enabled"])),
+    )
+
+    if not info["recovery_enabled"] or info["too_late_for_recovery"]:
+        logger.warning(
+            "[%s][RECOVERY] decision=skip reason=late_schedule_no_recovery now_kst=%s recovery_allow_until=%s",
+            log_prefix,
+            info["now_hhmm"],
+            info["recovery_allow_until"],
+        )
+        return {
+            "skip": True,
+            "recovery_used": False,
+            "exit_reason": "phase_guard_skip_late_schedule_no_recovery",
+        }
+
+    checkpoint_key = _session_execution_checkpoint_key(env=env, session_kind=session_kind, trade_date=now.date())
+    checkpoint_payload: dict[str, Any] | None = None
+    try:
+        checkpoint_payload = load_job_checkpoint(engine, checkpoint_key)
+    except Exception as exc:
+        logger.warning(
+            "[%s][DEDUPE] source=job_checkpoint load_failed=1 err=%s decision=continue",
+            log_prefix,
+            exc,
+        )
+
+    if isinstance(checkpoint_payload, dict) and checkpoint_payload.get("completed"):
+        logger.warning(
+            "[%s][DEDUPE] source=job_checkpoint duplicate=1 status=%s exit_reason=%s decision=skip",
+            log_prefix,
+            checkpoint_payload.get("status"),
+            checkpoint_payload.get("exit_reason"),
+        )
+        return {
+            "skip": True,
+            "recovery_used": True,
+            "exit_reason": str(info["duplicate_reason"]),
+        }
+
+    session_start_dt = now.replace(
+        hour=int(str(info["session_start"])[:2]),
+        minute=int(str(info["session_start"])[2:]),
+        second=0,
+        microsecond=0,
+    )
+    orders_repo = OrdersRepo(engine)
+    buy_orders = orders_repo.list_today_buy_orders(
+        env,
+        start_at=session_start_dt,
+        end_at=now + timedelta(minutes=1),
+    )
+    if orders_repo.consume_fail_open_marker("orders.list_today_buy_orders"):
+        logger.warning(
+            "[%s][DEDUPE] source=orders fail_open=1 duplicate=0 decision=continue",
+            log_prefix,
+        )
+    elif buy_orders:
+        latest_order = dict(buy_orders[0])
+        logger.warning(
+            "[%s][DEDUPE] source=orders duplicate=1 count=%s latest_code=%s latest_status=%s decision=skip",
+            log_prefix,
+            len(buy_orders),
+            latest_order.get("code"),
+            latest_order.get("status"),
+        )
+        return {
+            "skip": True,
+            "recovery_used": True,
+            "exit_reason": str(info["duplicate_reason"]),
+        }
+
+    os.environ["PB1_SESSION_RECOVERY_USED"] = "1"
+    if session_kind == "am":
+        os.environ["TRADE_AM_LATE_START"] = "1"
+    logger.warning(
+        "[%s][RECOVERY] decision=continue reason=recovery_continue now_kst=%s recovery_allow_until=%s",
+        log_prefix,
+        info["now_hhmm"],
+        info["recovery_allow_until"],
+    )
+    return {
+        "skip": False,
+        "recovery_used": True,
+        "exit_reason": "recovery_continue",
+    }
 
 
 def _is_manual_session_restart(event_name: str | None, workflow_attempt: int | None) -> bool:
@@ -4837,6 +5095,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     balance_cache_hits = 0
     balance_tick_cache_hits = 0
     last_phase = "none"
+    last_result_status = "UNKNOWN"
     loop_started_ts = total_start_ts
     runtime_root_dir = runtime_root()
     
@@ -5070,6 +5329,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     _get_now_kst().isoformat(),
                     result_status,
                 )
+                last_result_status = result_status
                 _touch_session_guard(
                     runs_repo=runs_repo,
                     session_guard_run_id=session_guard_run_id,
@@ -5253,6 +5513,15 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             ticks_degraded,
             buy_orders,
             sell_orders,
+        )
+        _record_session_execution_marker(
+            engine=engine,
+            env=ctx.env,
+            session_kind=session_kind,
+            trade_date=_get_now_kst().date(),
+            status=last_result_status,
+            exit_reason=exit_reason,
+            recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
         )
     finally:
         _finish_session_guard(
@@ -5827,11 +6096,26 @@ def main() -> int:
     metrics: dict[str, int] = {}
     phase_for_log = "none"
     result_status = "UNKNOWN"
+    main_exit_reason = "single_run"
     start_ts = time_mod.time()
     try:
         if smoke_enabled:
             run_once(args=args, engine=engine, ctx=ctx, loop_mode=False, window=None)
             return 0
+        recovery_guard = _evaluate_session_recovery_guard(
+            engine=engine,
+            env=ctx.env,
+            session_kind=_resolve_session_kind(),
+            now=_get_now_kst(),
+        )
+        if recovery_guard.get("skip"):
+            result_status = "SKIP_PHASE_WINDOW"
+            phase_for_log = str(os.getenv("FORCE_PB1_PHASE") or "entry")
+            main_exit_reason = str(recovery_guard.get("exit_reason") or "phase_guard_skip_late_schedule_no_recovery")
+            _log_main_run_summary(status=result_status, reason=main_exit_reason)
+            return 0
+        if recovery_guard.get("recovery_used"):
+            main_exit_reason = str(recovery_guard.get("exit_reason") or "recovery_continue")
         _touched, _did_work, metrics, phase_for_log, result_status = run_once(
             args=args,
             engine=engine,
@@ -5867,7 +6151,8 @@ def main() -> int:
             logger.warning("[PB1][LOCK][CLOSE_FAIL] lock connection close failed (ignoring): %s", exc)
         elapsed = time_mod.time() - start_ts
         logger.info(
-            "[PB1][EXIT] reason=single_run elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+            "[PB1][EXIT] reason=%s elapsed=%.1fs max_seconds=%s deadline=%s phase=%s balance_api_calls=%s balance_cache_hits=%s balance_tick_cache_hits=%s",
+            main_exit_reason,
             elapsed,
             max_seconds,
             "none",
@@ -5875,6 +6160,15 @@ def main() -> int:
             metrics.get("balance_api_calls", 0),
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
+        )
+        _record_session_execution_marker(
+            engine=engine,
+            env=ctx.env,
+            session_kind=_resolve_session_kind(),
+            trade_date=_get_now_kst().date(),
+            status=result_status,
+            exit_reason=main_exit_reason,
+            recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
         )
     return _exit_code_for_status(result_status)
 

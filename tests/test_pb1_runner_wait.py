@@ -372,3 +372,140 @@ def test_forced_close_live_execution_enabled(monkeypatch):
     monkeypatch.setenv("FORCE_BLOCK_LIVE", "0")
 
     assert pb1_runner._forced_close_live_execution_enabled() is True
+
+
+def test_session_recovery_guard_allows_normal_am_run(monkeypatch) -> None:
+    now = datetime(2024, 1, 2, 9, 12, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    class DummyOrdersRepo:
+        def __init__(self, _engine):
+            pass
+
+        def list_today_buy_orders(self, *_args, **_kwargs):
+            return []
+
+        def consume_fail_open_marker(self, _op_name):
+            return False
+
+    monkeypatch.setattr(pb1_runner, "OrdersRepo", DummyOrdersRepo)
+    monkeypatch.setattr(pb1_runner, "load_job_checkpoint", lambda *_args, **_kwargs: None)
+
+    result = pb1_runner._evaluate_session_recovery_guard(
+        engine=SimpleNamespace(),
+        env="practice",
+        session_kind="am",
+        now=now,
+    )
+
+    assert result["skip"] is False
+    assert result["recovery_used"] is False
+
+
+def test_session_recovery_guard_allows_late_am_recovery(monkeypatch) -> None:
+    now = datetime(2024, 1, 2, 10, 7, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    class DummyOrdersRepo:
+        def __init__(self, _engine):
+            pass
+
+        def list_today_buy_orders(self, *_args, **_kwargs):
+            return []
+
+        def consume_fail_open_marker(self, _op_name):
+            return False
+
+    monkeypatch.setattr(pb1_runner, "OrdersRepo", DummyOrdersRepo)
+    monkeypatch.setattr(pb1_runner, "load_job_checkpoint", lambda *_args, **_kwargs: None)
+
+    result = pb1_runner._evaluate_session_recovery_guard(
+        engine=SimpleNamespace(),
+        env="practice",
+        session_kind="am",
+        now=now,
+    )
+
+    assert result["skip"] is False
+    assert result["recovery_used"] is True
+    assert result["exit_reason"] == "recovery_continue"
+
+
+def test_session_recovery_guard_skips_duplicate_am_run(monkeypatch) -> None:
+    now = datetime(2024, 1, 2, 10, 7, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    class DummyOrdersRepo:
+        def __init__(self, _engine):
+            pass
+
+        def list_today_buy_orders(self, *_args, **_kwargs):
+            return [{"code": "005930", "status": "SUBMITTED"}]
+
+        def consume_fail_open_marker(self, _op_name):
+            return False
+
+    monkeypatch.setattr(pb1_runner, "OrdersRepo", DummyOrdersRepo)
+    monkeypatch.setattr(pb1_runner, "load_job_checkpoint", lambda *_args, **_kwargs: None)
+
+    result = pb1_runner._evaluate_session_recovery_guard(
+        engine=SimpleNamespace(),
+        env="practice",
+        session_kind="am",
+        now=now,
+    )
+
+    assert result["skip"] is True
+    assert result["exit_reason"] == "skip_duplicate_am_run"
+
+
+def test_session_recovery_guard_skips_after_am_cutoff(monkeypatch) -> None:
+    now = datetime(2024, 1, 2, 10, 42, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    class DummyOrdersRepo:
+        def __init__(self, _engine):
+            pass
+
+        def list_today_buy_orders(self, *_args, **_kwargs):
+            return []
+
+        def consume_fail_open_marker(self, _op_name):
+            return False
+
+    monkeypatch.setattr(pb1_runner, "OrdersRepo", DummyOrdersRepo)
+    monkeypatch.setattr(pb1_runner, "load_job_checkpoint", lambda *_args, **_kwargs: None)
+
+    result = pb1_runner._evaluate_session_recovery_guard(
+        engine=SimpleNamespace(),
+        env="practice",
+        session_kind="am",
+        now=now,
+    )
+
+    assert result["skip"] is True
+    assert result["exit_reason"] == "phase_guard_skip_late_schedule_no_recovery"
+
+
+def test_session_recovery_guard_allows_late_pm_recovery(monkeypatch) -> None:
+    now = datetime(2024, 1, 2, 13, 32, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    class DummyOrdersRepo:
+        def __init__(self, _engine):
+            pass
+
+        def list_today_buy_orders(self, *_args, **_kwargs):
+            return []
+
+        def consume_fail_open_marker(self, _op_name):
+            return False
+
+    monkeypatch.setattr(pb1_runner, "OrdersRepo", DummyOrdersRepo)
+    monkeypatch.setattr(pb1_runner, "load_job_checkpoint", lambda *_args, **_kwargs: None)
+
+    result = pb1_runner._evaluate_session_recovery_guard(
+        engine=SimpleNamespace(),
+        env="practice",
+        session_kind="pm",
+        now=now,
+    )
+
+    assert result["skip"] is False
+    assert result["recovery_used"] is True
+    assert result["exit_reason"] == "recovery_continue"

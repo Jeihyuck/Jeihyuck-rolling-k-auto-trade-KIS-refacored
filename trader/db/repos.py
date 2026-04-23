@@ -2765,6 +2765,58 @@ class OrdersRepo:
             fail_open=None,
         )
 
+    def list_today_buy_orders(
+        self,
+        env: str,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        code: str | None = None,
+        status_exclude: Iterable[str] | None = ("ERROR", "CANCELLED", "REJECTED", "FAILED", "SKIP"),
+    ) -> list[dict]:
+        now = now_kst()
+        start = start_at or now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = end_at or (start + timedelta(days=1))
+        conditions = [
+            self._schema.orders.c.env == sa.bindparam("env_buy_1", env),
+            self._schema.orders.c.side == sa.bindparam("side_buy_1", "BUY"),
+            self._schema.orders.c.created_at >= sa.bindparam("created_at_buy_1", start, type_=sa.DateTime(timezone=True)),
+            self._schema.orders.c.created_at < sa.bindparam("created_at_buy_2", end, type_=sa.DateTime(timezone=True)),
+        ]
+        if code:
+            conditions.append(self._schema.orders.c.code == sa.bindparam("code_buy_1", code))
+        if status_exclude:
+            conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(self._schema.orders.c.created_at.desc())
+        )
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.list_today_buy_orders",
+            fail_open=None,
+        )
+
+    def has_today_buy_orders(
+        self,
+        env: str,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        code: str | None = None,
+        status_exclude: Iterable[str] | None = ("ERROR", "CANCELLED", "REJECTED", "FAILED", "SKIP"),
+    ) -> bool:
+        return bool(
+            self.list_today_buy_orders(
+                env,
+                start_at=start_at,
+                end_at=end_at,
+                code=code,
+                status_exclude=status_exclude,
+            )
+        )
+
     def list_orders_in_window(
         self,
         env: str,

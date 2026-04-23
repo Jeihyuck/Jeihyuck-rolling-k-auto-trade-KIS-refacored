@@ -27,8 +27,10 @@ env:
   MODE: trade
   PB1_SESSION_KIND: "pm"
   PB1_PM_START_ALLOW_UNTIL: "1325"
+  PB1_PM_RECOVERY_ALLOW_UNTIL: "1340"
   PB1_PM_EXPECTED_START_FROM: "1305"
   PB1_PM_EXPECTED_START_TO: "1315"
+  PB1_ENABLE_LATE_PM_RECOVERY: "1"
   PB1_PM_SESSION_END: "15:10"
   PB1_TICK_HARD_TIMEOUT_SEC: "90"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
@@ -137,10 +139,12 @@ jobs:
           valid_window="1300-1510"
           expected_start_window="1305-1315"
           new_start_allow_window="1305-1325"
+          recovery_allow_window="1326-1340"
           should_run=1
           skip_reason="none"
           late_level="NONE"
           degraded_session=0
+          recovery_mode=0
           start_classification="STARTED_ON_TIME"
           trigger_classification="schedule"
 
@@ -156,16 +160,20 @@ jobs:
             if (( now_min < min_1300 )); then
               should_run=0
               skip_reason="early_start"
-            elif (( now_min > min_1325 )); then
+            elif (( now_min > min_1340 )); then
               should_run=0
-              skip_reason="late_schedule_start_after_1325"
+              skip_reason="late_schedule_start_after_1340"
+            elif (( now_min > min_1325 )); then
+              recovery_mode=1
             fi
           fi
 
           if [[ "$event_name" == "workflow_dispatch" ]]; then
-            if (( now_min > min_1325 )) && [[ "${FORCE_ALLOW_LATE_MANUAL:-0}" != "1" ]]; then
+            if (( now_min > min_1340 )) && [[ "${FORCE_ALLOW_LATE_MANUAL:-0}" != "1" ]]; then
               should_run=0
-              skip_reason="late_manual_start_after_1325_requires_force"
+              skip_reason="late_manual_start_after_1340_requires_force"
+            elif (( now_min > min_1325 )); then
+              recovery_mode=1
             fi
           fi
 
@@ -181,6 +189,10 @@ jobs:
             start_classification="STARTED_LATE_ERROR"
           fi
 
+          if (( recovery_mode == 1 )) && [[ "$should_run" == "1" ]]; then
+            start_classification="STARTED_LATE_RECOVERY"
+          fi
+
           if [[ "$should_run" != "1" ]]; then
             start_classification="SKIP_PHASE_WINDOW"
           fi
@@ -193,8 +205,10 @@ jobs:
           echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
           echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
           echo "new_start_allow_window=${new_start_allow_window}" >> "$GITHUB_OUTPUT"
+          echo "recovery_allow_window=${recovery_allow_window}" >> "$GITHUB_OUTPUT"
           echo "late_level=${late_level}" >> "$GITHUB_OUTPUT"
           echo "degraded_session=${degraded_session}" >> "$GITHUB_OUTPUT"
+          echo "recovery_mode=${recovery_mode}" >> "$GITHUB_OUTPUT"
           echo "start_classification=${start_classification}" >> "$GITHUB_OUTPUT"
 
       - name: Write PM trigger metadata
@@ -212,8 +226,11 @@ jobs:
             echo "[TRADE_PM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
             echo "[TRADE_PM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
-            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
-            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
+            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }} recovery_allow_window=${{ steps.phase_guard.outputs.recovery_allow_window }}"
+            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }}"
+            if [[ "${{ steps.phase_guard.outputs.recovery_mode }}" == "1" ]]; then
+              echo "[TRADE_PM][RECOVERY] mode=workflow_guard_continue now_kst=${{ steps.phase_guard.outputs.now_kst }} recovery_allow_window=${{ steps.phase_guard.outputs.recovery_allow_window }}"
+            fi
           } | tee -a repo/artifacts/trade-pm.log
 
       - name: Checkout
@@ -240,8 +257,8 @@ jobs:
             echo "[TRADE_PM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
             echo "[TRADE_PM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[TRADE_PM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
-            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
-            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
+            echo "[TRADE_PM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }} recovery_allow_window=${{ steps.phase_guard.outputs.recovery_allow_window }}"
+            echo "[TRADE_PM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }}"
           } | tee repo/artifacts/trade-pm.log >/dev/null
           echo "[CHECKOUT][OK] repo path ready"
 
