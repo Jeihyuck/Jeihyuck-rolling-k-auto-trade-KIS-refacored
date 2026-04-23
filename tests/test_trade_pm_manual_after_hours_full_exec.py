@@ -425,5 +425,5 @@ def test_run_once_logs_fail_open_flag_and_uses_warn_status(monkeypatch, tmp_path
     )
 
     assert did_work is True
-    assert status == "WARN_FAIL_OPEN"
+    assert status == "OK_WITH_WARNINGS"
     assert "[PB1][RUN_ONCE][FAIL_OPEN_FLAG] runs_ledger_fail_open=1 loop_mode=0" in caplog.text

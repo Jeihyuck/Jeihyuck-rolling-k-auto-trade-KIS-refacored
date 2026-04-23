@@ -45,7 +45,8 @@ env:
   PB1_AM_RECOVERY_ALLOW_UNTIL: "10:30"
   PB1_ENABLE_LATE_PM_RECOVERY: "0"
   PB1_PM_RECOVERY_ALLOW_UNTIL: "13:40"
-  PB1_CLOSE_SESSION_END: "15:30"
+  PB1_CLOSE_SESSION_END: "15:45"
+  PB1_CLOSE_RECOVERY_ALLOW_UNTIL: "15:45"
   PB1_TICK_HARD_TIMEOUT_SEC: "45"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
   STRATEGY_MODE: "LIVE"
@@ -141,19 +142,22 @@ jobs:
           now_kst="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
           manual_mode="${CLOSE_MANUAL_MODE:-live_close}"
-          valid_window="1515-1530"
+          valid_window="1515-1545"
           expected_start_window="1515-1524"
           should_run=1
           skip_reason=""
           execution_route="live_close"
+          recovery_mode=0
           if [[ "$event_name" == "workflow_dispatch" ]]; then
             if [[ "$manual_mode" == "live_close" ]]; then
               if [[ "$now_kst" -lt 1515 ]]; then
                 should_run=0
                 skip_reason="manual_live_close_early_start"
-              elif [[ "$now_kst" -ge 1530 ]]; then
+              elif [[ "$now_kst" -gt 1545 ]]; then
                 should_run=0
-                skip_reason="manual_live_close_stale_start"
+                skip_reason="skip_close_stale_start"
+              elif [[ "$now_kst" -ge 1530 ]]; then
+                recovery_mode=1
               fi
             else
               execution_route="manual_replay"
@@ -161,10 +165,12 @@ jobs:
           else
             if [[ "$now_kst" -lt 1515 ]]; then
               should_run=0
-              skip_reason="early_start"
-            elif [[ "$now_kst" -ge 1530 ]]; then
+              skip_reason="close_early_start"
+            elif [[ "$now_kst" -gt 1545 ]]; then
               should_run=0
-              skip_reason="stale_start"
+              skip_reason="skip_close_stale_start"
+            elif [[ "$now_kst" -ge 1530 ]]; then
+              recovery_mode=1
             fi
           fi
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
@@ -175,6 +181,7 @@ jobs:
           echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
           echo "manual_mode=${manual_mode}" >> "$GITHUB_OUTPUT"
           echo "execution_route=${execution_route}" >> "$GITHUB_OUTPUT"
+          echo "recovery_mode=${recovery_mode}" >> "$GITHUB_OUTPUT"
 
       - name: Write Close trigger metadata
         if: steps.phase_guard.outputs.should_run == '1'
@@ -391,20 +398,11 @@ jobs:
             echo "::error::missing [RUN_SUMMARY][RESULT]"
             exit 1
           fi
-          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-close.log | tail -n 1 | sed 's/.*status=//')"
-          if [[ "$result_status" == "SKIP_PHASE_WINDOW" ]]; then
-            echo "::notice::Close phase window skip recorded"
-            exit 0
-          fi
           if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-close.log >/dev/null; then
             echo "::error::runs.started_at text/timestamptz schema mismatch still present"
             exit 1
           fi
-          if [[ "$result_status" == "FATAL_RUNTIME" || "$result_status" == "FATAL_POSTPROCESS" ]]; then
-            echo "::error::Close fatal runtime/postprocess recorded"
-            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-close.log || true
-            exit 1
-          fi
+          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-close.log | tail -n 1 | sed 's/.*status=//')"
           if [[ "$result_status" == "OK_MANUAL_REPLAY" ]]; then
             if ! grep -E "\[TRADE_CLOSE\]\[MANUAL_REPLAY\]|\[TRADE_CLOSE\]\[MANUAL_REPLAY\]\[DONE\]" artifacts/trade-close.log >/dev/null; then
               echo "::error::missing manual replay diagnostics"
@@ -435,6 +433,7 @@ jobs:
             exit 1
           fi
           test "$missing" -eq 0
+          python -m trader.trade_tick verify-log --session close --log artifacts/trade-close.log
           trap - ERR
           echo "[STEP][OK] name=verify_close_logs session=close" | tee -a artifacts/trade-close.log
 

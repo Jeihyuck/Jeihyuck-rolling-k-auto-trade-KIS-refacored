@@ -894,6 +894,8 @@ class RunResult:
     balance_api_calls: int = 0
     balance_cache_hits: int = 0
     balance_tick_cache_hits: int = 0
+    terminal_state: str | None = None
+    warning_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1367,6 +1369,9 @@ class PB1Engine:
         self._tick_price_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._tick_price_cache_hits = 0
         self._tick_price_api_calls = 0
+        self._warning_counts: Counter[str] = Counter()
+        self._tick_warning_counts: Counter[str] = Counter()
+        self._tick_db_cache: dict[str, Any] = {}
         self._last_stage = "engine.init"
         os.environ["PB1_LAST_STAGE"] = self._last_stage
 
@@ -1403,8 +1408,71 @@ class PB1Engine:
             elapsed = time.perf_counter() - started
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
             if error is None and max_sec > 0 and elapsed > max_sec:
-                logger.error("[PB1][STAGE_TIMEOUT] stage=%s elapsed=%.2f max_sec=%.2f", stage_name, elapsed, max_sec)
+                logger.warning("[WARN][PB1][STAGE_TIMEOUT] stage=%s elapsed=%.2f max_sec=%.2f", stage_name, elapsed, max_sec)
                 raise PB1StageTimeout(f"{stage_name}:{elapsed:.2f}>{max_sec:.2f}")
+
+    def _bump_warning(self, name: str, amount: int = 1) -> None:
+        key = str(name or "").strip()
+        if not key or amount <= 0:
+            return
+        self._warning_counts[key] += int(amount)
+        self._tick_warning_counts[key] += int(amount)
+
+    def _warning_counts_dict(self) -> dict[str, int]:
+        return {key: int(value) for key, value in dict(self._warning_counts).items()}
+
+    def _reset_tick_warning_counts(self) -> None:
+        self._tick_warning_counts = Counter()
+        self._tick_db_cache = {}
+
+    def _emit_tick_warning_summary(self, *, code: str | None = None) -> None:
+        counts = {key: int(value) for key, value in dict(self._tick_warning_counts).items()}
+        logger.info(
+            "[PB1][TICK][WARNINGS] code=%s timeout=%s db_fail_open=%s degraded=%s ledger_fail_first=%s duplicate_skip=%s details=%s",
+            str(code or "tick"),
+            counts.get("timeout_count", 0),
+            counts.get("db_read_fail_open_count", 0),
+            counts.get("degraded_stage_count", 0),
+            counts.get("ledger_fail_first_count", 0),
+            counts.get("duplicate_skip_count", 0),
+            counts,
+        )
+
+    def _resolve_terminal_state(self, *, status: str, notes: str | None = None) -> str:
+        normalized_status = str(status or "UNKNOWN").strip().upper()
+        normalized_notes = str(notes or "").strip().lower()
+        warning_counts = self._warning_counts_dict()
+        warnings_total = sum(int(value) for value in warning_counts.values())
+        if normalized_status in {"FATAL_RUNTIME", "FATAL_POSTPROCESS"}:
+            return "SESSION_END_FATAL"
+        if normalized_status.startswith("SKIP"):
+            return "SESSION_END_SKIPPED"
+        if normalized_status in {"OK_DEGRADED", "DEGRADED_POSTPROCESS"} or warning_counts.get("degraded_stage_count", 0) > 0:
+            return "SESSION_END_OK_DEGRADED"
+        if warnings_total > 0 or normalized_status in {"WARN_FAIL_OPEN", "OK_WITH_WARNINGS"} or "degraded" in normalized_notes:
+            return "SESSION_END_OK_WITH_WARNINGS"
+        return "SESSION_END_OK"
+
+    def _finalize_run_result(self, *, status: str, notes: str | None) -> RunResult:
+        self._emit_tick_warning_summary()
+        warning_counts = self._warning_counts_dict()
+        logger.info(
+            "[PB1][SESSION][WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s",
+            warning_counts.get("timeout_count", 0),
+            warning_counts.get("db_read_fail_open_count", 0),
+            warning_counts.get("ledger_fail_first_count", 0),
+            warning_counts.get("degraded_stage_count", 0),
+            warning_counts.get("duplicate_skip_count", 0),
+        )
+        return RunResult(
+            status=status,
+            notes=notes,
+            balance_api_calls=self.balance_api_calls,
+            balance_cache_hits=self.balance_cache_hits,
+            balance_tick_cache_hits=self.balance_tick_cache_hits,
+            terminal_state=self._resolve_terminal_state(status=status, notes=notes),
+            warning_counts=warning_counts,
+        )
 
     def _resolve_entry_identity_from_mapping(self, source: dict[str, Any] | None) -> dict[str, str]:
         payload = source if isinstance(source, dict) else {}
@@ -1469,18 +1537,29 @@ class PB1Engine:
         return True
 
     def _safe_get_open_orders(self) -> list[dict]:
+        cached = self._tick_db_cache.get("open_orders")
+        if cached is not None:
+            return [dict(row) for row in cached]
         logger.info("[PB1][STAGE][START] stage=orders.lookup_open")
         rows = self.orders_repo.get_open_orders(self.env)
         if self._consume_order_lookup_fail_open("orders.get_open_orders"):
-            logger.warning("[PB1][ORDER_LOOKUP][FAIL_OPEN] op=open_orders")
+            self._bump_warning("db_read_fail_open_count")
+            logger.warning("[FAIL_OPEN][PB1][ORDER_LOOKUP] op=open_orders")
+        self._tick_db_cache["open_orders"] = [dict(row) for row in rows]
         logger.info("[PB1][STAGE][END] stage=orders.lookup_open rows=%s", len(rows))
         return rows
 
     def _safe_list_today_orders(self, *, code: str | None = None, side: str | None = None) -> list[dict]:
+        cache_key = ("today_orders", str(code or ""), str(side or ""))
+        cached = self._tick_db_cache.get(cache_key)
+        if cached is not None:
+            return [dict(row) for row in cached]
         logger.info("[PB1][STAGE][START] stage=orders.lookup_today code=%s side=%s", code, side)
         rows = self.orders_repo.list_today_orders(self.env, code=code, side=side)
         if self._consume_order_lookup_fail_open("orders.list_today_orders"):
-            logger.warning("[PB1][ORDER_LOOKUP][FAIL_OPEN] op=today_orders")
+            self._bump_warning("db_read_fail_open_count")
+            logger.warning("[FAIL_OPEN][PB1][ORDER_LOOKUP] op=today_orders")
+        self._tick_db_cache[cache_key] = [dict(row) for row in rows]
         logger.info("[PB1][STAGE][END] stage=orders.lookup_today rows=%s code=%s side=%s", len(rows), code, side)
         return rows
 
@@ -1492,6 +1571,10 @@ class PB1Engine:
         stage: str | None = None,
         trade_date: str | None = None,
     ) -> tuple[bool, dict | None]:
+        cache_key = ("blocking_order", str(code or "").zfill(6), str(side or ""), str(stage or ""), str(trade_date or ""))
+        cached = self._tick_db_cache.get(cache_key)
+        if cached is not None:
+            return cached
         return self.orders_repo.has_blocking_order_today(
             env=self.env,
             code=code,
@@ -1501,10 +1584,16 @@ class PB1Engine:
         )
 
     def _safe_list_today_fills(self, *, code: str | None = None, side: str | None = None) -> list[dict]:
+        cache_key = ("today_fills", str(code or ""), str(side or ""))
+        cached = self._tick_db_cache.get(cache_key)
+        if cached is not None:
+            return [dict(row) for row in cached]
         logger.info("[PB1][STAGE][START] stage=fills.lookup_today code=%s side=%s", code, side)
         rows = self.fills_repo.list_today_fills(self.env, code=code, side=side)
         if self._consume_fill_lookup_fail_open("fills.list_today_fills"):
-            logger.warning("[PB1][ORDER_LOOKUP][FAIL_OPEN] op=today_fills code=%s side=%s", code, side)
+            self._bump_warning("db_read_fail_open_count")
+            logger.warning("[FAIL_OPEN][PB1][ORDER_LOOKUP] op=today_fills code=%s side=%s", code, side)
+        self._tick_db_cache[cache_key] = [dict(row) for row in rows]
         logger.info("[PB1][STAGE][END] stage=fills.lookup_today rows=%s code=%s side=%s", len(rows), code, side)
         return rows
 
@@ -4159,28 +4248,52 @@ class PB1Engine:
         payload.setdefault("qty", qty)
         payload.setdefault("price", price)
         try:
-            self.ledger_repo.append_event(
-                env=self.env,
-                run_id=self.run_id,
-                strategy=self.STRATEGY_NAME,
-                event_type=event_type,
-                ts=now_kst(),
-                code=code,
-                market=market,
-                sid=1,
-                mode=mode,
-                side=side,
-                qty=qty,
-                price=price,
-                client_order_key=client_order_key,
-                ok=ok,
-                reasons=self._with_name_reason(reasons, code),
-                stage=stage,
-                payload_json=payload,
-            )
+            last_exc: Exception | None = None
+            for attempt in range(2):
+                try:
+                    self.ledger_repo.append_event(
+                        env=self.env,
+                        run_id=self.run_id,
+                        strategy=self.STRATEGY_NAME,
+                        event_type=event_type,
+                        ts=now_kst(),
+                        code=code,
+                        market=market,
+                        sid=1,
+                        mode=mode,
+                        side=side,
+                        qty=qty,
+                        price=price,
+                        client_order_key=client_order_key,
+                        ok=ok,
+                        reasons=self._with_name_reason(reasons, code),
+                        stage=stage,
+                        payload_json=payload,
+                    )
+                    if attempt > 0:
+                        self._bump_warning("ledger_fail_first_count")
+                        logger.warning(
+                            "[WARN][PB1][LEDGER][RETRY_OK] event=%s code=%s attempt=%s",
+                            event_type,
+                            self._display_code(code),
+                            attempt + 1,
+                        )
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        logger.warning(
+                            "[WARN][PB1][LEDGER][RETRY] event=%s code=%s err=%s",
+                            event_type,
+                            self._display_code(code),
+                            repr(exc),
+                        )
+                        continue
+                    raise
         except Exception as exc:
+            self._bump_warning("degraded_stage_count")
             logger.warning(
-                "[PB1][LEDGER][FAIL] event=%s code=%s err=%s",
+                "[DEGRADED][PB1][LEDGER][FAIL] event=%s code=%s err=%s",
                 event_type,
                 self._display_code(code),
                 repr(exc),
@@ -8115,6 +8228,7 @@ class PB1Engine:
                 simulated_payload,
             )
             return exit_eval_payload
+        stock_name = str(self._name_for_code(code) or pos.get("name") or code)
         logger.info(
             "[EXIT][ORDER_READY] code=%s name=%s qty=%s family=%s reason=%s",
             code,
@@ -10211,11 +10325,13 @@ class PB1Engine:
                 int(bool(exit_pass_fail_open)),
                 exit_timeout,
             )
+            self._bump_warning("timeout_count")
             if exit_pass_fail_open:
-                final_status = "WARN_FAIL_OPEN"
+                final_status = "OK_WITH_WARNINGS"
                 final_notes = "EXIT_PASS_TIMEOUT_DEGRADED"
+                self._bump_warning("degraded_stage_count")
                 logger.warning(
-                    "[PB1][POST_CAPITAL][EXIT_PASS][DEGRADED] env=%s action=continue phase=%s",
+                    "[DEGRADED][PB1][POST_CAPITAL][EXIT_PASS] env=%s action=continue phase=%s",
                     self.env,
                     self.phase,
                 )
@@ -10228,13 +10344,7 @@ class PB1Engine:
         if self.phase == "exit":
             logger.info("[PB1][EXIT] entry_skipped=1")
             self._log_tick_price_cache_summary()
-            return RunResult(
-                status=final_status,
-                notes=final_notes or "exit_phase",
-                balance_api_calls=self.balance_api_calls,
-                balance_cache_hits=self.balance_cache_hits,
-                balance_tick_cache_hits=self.balance_tick_cache_hits,
-            )
+            return self._finalize_run_result(status=final_status, notes=final_notes or "exit_phase")
         logger.info("[PB1][POST_CAPITAL][OPEN_ORDERS_LOOKUP]")
         open_orders = self._safe_get_open_orders()
         if open_orders:
@@ -10265,13 +10375,7 @@ class PB1Engine:
                 no_trade_reason="PHASE_VERIFY",
             )
             self._log_tick_price_cache_summary()
-            return RunResult(
-                status=final_status,
-                notes=final_notes,
-                balance_api_calls=self.balance_api_calls,
-                balance_cache_hits=self.balance_cache_hits,
-                balance_tick_cache_hits=self.balance_tick_cache_hits,
-            )
+            return self._finalize_run_result(status=final_status, notes=final_notes)
 
         # ========== ENTRY PASS (EXIT와 완전 독립) ==========
         logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
@@ -10436,13 +10540,8 @@ class PB1Engine:
                     ok_setups=0,
                     blocked_by=_normalize_entry_block_reasons([entry_reason]),
                 )
-                return RunResult(
-                    status="SKIPPED",
-                    notes=note,
-                    balance_api_calls=self.balance_api_calls,
-                    balance_cache_hits=self.balance_cache_hits,
-                    balance_tick_cache_hits=self.balance_tick_cache_hits,
-                )
+                self._bump_warning("duplicate_skip_count")
+                return self._finalize_run_result(status="SKIPPED", notes=note)
             skip_entry_scan = True
 
         code_market = {m.get("code"): m.get("market") for m in scan_members}
@@ -10929,12 +11028,9 @@ class PB1Engine:
                     minervini_pass_count,
                 )
                 self._log_tick_price_cache_summary()
-                return RunResult(
+                return self._finalize_run_result(
                     status="DONE_ANALYTICS",
                     notes=f"minervini_only_complete_{minervini_pass_count}_candidates",
-                    balance_api_calls=self.balance_api_calls,
-                    balance_cache_hits=self.balance_cache_hits,
-                    balance_tick_cache_hits=self.balance_tick_cache_hits,
                 )
             
             with self._stage_timer("entry.minervini_report"):
@@ -11006,6 +11102,42 @@ class PB1Engine:
                 for row in positions
                 if row.get("code")
             }
+            ok_after_risk_codes = [str(cf.code or "").zfill(6) for cf in ok_after_risk if str(cf.code or "").strip()]
+            today_start = self._now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+            tomorrow_start = today_start + timedelta(days=1)
+            blocking_statuses = {"SUBMITTED", "ACCEPTED", "FILLED", "PARTIAL_FILLED"}
+            blocking_prior_by_code: dict[str, dict[str, Any]] = {}
+            for row in today_orders:
+                code_key = str((row or {}).get("code") or "").zfill(6)
+                if code_key not in ok_after_risk_codes:
+                    continue
+                if str((row or {}).get("side") or "").upper() != "BUY":
+                    continue
+                if str((row or {}).get("stage") or "") != "PB1-CLOSE":
+                    continue
+                if str((row or {}).get("status") or "").upper() not in blocking_statuses:
+                    continue
+                existing_prior = blocking_prior_by_code.get(code_key)
+                if existing_prior is None or str((row or {}).get("created_at") or "") > str(existing_prior.get("created_at") or ""):
+                    blocking_prior_by_code[code_key] = dict(row)
+            today_buy_fill_rows: list[dict[str, Any]] = []
+            if ok_after_risk_codes:
+                with self._stage_timer("entry.today_buy_fills_bulk_lookup"):
+                    today_buy_fill_rows = self.fills_repo.list_fills_in_window(
+                        self.env,
+                        start_at=today_start,
+                        end_at=tomorrow_start,
+                        side="BUY",
+                        codes=ok_after_risk_codes,
+                    )
+            today_buy_fill_by_code: dict[str, list[dict[str, Any]]] = {}
+            for row in today_buy_fill_rows:
+                code_key = str((row or {}).get("code") or "").zfill(6)
+                today_buy_fill_by_code.setdefault(code_key, []).append(dict(row))
+            for code_key in ok_after_risk_codes:
+                prior = blocking_prior_by_code.get(code_key)
+                self._tick_db_cache[("today_fills", code_key, "BUY")] = list(today_buy_fill_by_code.get(code_key, []))
+                self._tick_db_cache[("blocking_order", code_key, "BUY", "PB1-CLOSE", self._today)] = (prior is not None, prior)
             buyable_gate_context: dict[str, dict[str, Any]] = {}
             self._buyable_gate_context = buyable_gate_context
             today_buy_codes: set[str] = set()
@@ -11962,13 +12094,7 @@ class PB1Engine:
                         blocked_reasons_counter=drop_reason_counter,
                         no_trade_reason="NO_CANDIDATES_AFTER_RELAX",
                     )
-                    return RunResult(
-                        status=final_status,
-                        notes=final_notes,
-                        balance_api_calls=self.balance_api_calls,
-                        balance_cache_hits=self.balance_cache_hits,
-                        balance_tick_cache_hits=self.balance_tick_cache_hits,
-                    )
+                    return self._finalize_run_result(status=final_status, notes=final_notes)
             if self.phase in {"entry"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
@@ -12071,13 +12197,7 @@ class PB1Engine:
                             blocked_reasons_counter=blocked_by,
                             no_trade_reason=primary_reason,
                         )
-                        return RunResult(
-                            status=final_status,
-                            notes=final_notes,
-                            balance_api_calls=self.balance_api_calls,
-                            balance_cache_hits=self.balance_cache_hits,
-                            balance_tick_cache_hits=self.balance_tick_cache_hits,
-                        )
+                        return self._finalize_run_result(status=final_status, notes=final_notes)
                 if entry_allowed and orderable_candidates:
                     planned_total = sum(
                         float(cf.features.get("close") or 0.0) * float(cf.planned_qty or 0)
@@ -12360,10 +12480,4 @@ class PB1Engine:
         #     logger.warning("[PB1][SCORECARD_WRITE_FAIL] %s", type(e).__name__)
         
         self._log_tick_price_cache_summary()
-        return RunResult(
-            status=final_status,
-            notes=final_notes,
-            balance_api_calls=self.balance_api_calls,
-            balance_cache_hits=self.balance_cache_hits,
-            balance_tick_cache_hits=self.balance_tick_cache_hits,
-        )
+        return self._finalize_run_result(status=final_status, notes=final_notes)

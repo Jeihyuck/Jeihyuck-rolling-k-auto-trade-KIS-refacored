@@ -151,8 +151,14 @@ jobs:
           valid_window="1300-1510"
           expected_start_window="1305-1315"
           new_start_allow_window="1305-1325"
-          echo "should_run=1" >> "$GITHUB_OUTPUT"
-          echo "skip_reason=" >> "$GITHUB_OUTPUT"
+          should_run=1
+          skip_reason=""
+          if [[ "$now_hhmm" -ge 1510 ]]; then
+            should_run=0
+            skip_reason="skip_stale_start_pm"
+          fi
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
           echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
           echo "trigger_classification=${event_name}" >> "$GITHUB_OUTPUT"
@@ -388,31 +394,8 @@ jobs:
             grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-pm.log || true
             exit 1
           fi
-          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-pm.log | tail -n 1 | sed 's/.*status=//')"
-          if [[ "$result_status" == "SKIP_PHASE_WINDOW" ]]; then
-            echo "::notice::PM phase window skip recorded"
-            exit 0
-          fi
           if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-pm.log >/dev/null; then
             echo "::error::runs.started_at text/timestamptz schema mismatch still present"
-            exit 1
-          fi
-          if [[ "$result_status" == "FATAL_RUNTIME" || "$result_status" == "FATAL_POSTPROCESS" ]]; then
-            echo "::error::PM fatal runtime/postprocess recorded"
-            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-pm.log || true
-            exit 1
-          fi
-          fatal_count="$(grep -Ec '\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)' artifacts/trade-pm.log || true)"
-          timeout_count="$(grep -Ec 'TickTimeoutError|tick_hard_timeout' artifacts/trade-pm.log || true)"
-          db_autocommit_count="$(grep -Ec "can't change 'autocommit' now|connection in transaction status ACTIVE" artifacts/trade-pm.log || true)"
-          degraded_count="$(grep -Ec 'DEGRADED_POSTPROCESS|\[PB1\]\[POSTPROCESS\]\[DEGRADED\]' artifacts/trade-pm.log || true)"
-          echo "[TRADE_PM][VERIFY][COUNTS] fatal_count=${fatal_count} timeout_count=${timeout_count} db_autocommit_count=${db_autocommit_count} degraded_count=${degraded_count}"
-          if [[ "$db_autocommit_count" -gt 0 ]]; then
-            echo "::error::DB autocommit transaction ACTIVE error detected"
-            exit 1
-          fi
-          if [[ "$fatal_count" -gt 0 ]]; then
-            echo "::error::PM internal fatal result detected"
             exit 1
           fi
           if ! grep -E "\[PB1\]\[RUN_ONCE\]\[FAIL_OPEN_FLAG\]" artifacts/trade-pm.log >/dev/null; then
@@ -457,6 +440,7 @@ jobs:
             missing=1
           fi
           test "$missing" -eq 0
+          python -m trader.trade_tick verify-log --session pm --log artifacts/trade-pm.log
           trap - ERR
           echo "[STEP][OK] name=verify_pm_logs session=pm" | tee -a artifacts/trade-pm.log
 

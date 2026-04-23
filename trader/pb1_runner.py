@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import traceback
 import time as time_mod
@@ -127,6 +128,14 @@ from trader.strategies.pb1_minervini_v2 import MinerviniConfig
 logger = logging.getLogger(__name__)
 log = logger
 
+SESSION_WARNING_KEYS = (
+    "timeout_count",
+    "db_read_fail_open_count",
+    "ledger_fail_first_count",
+    "degraded_stage_count",
+    "duplicate_skip_count",
+)
+
 
 def try_acquire_lock(*args, **kwargs):
     return acquire_advisory_lock(*args, **kwargs)
@@ -172,6 +181,123 @@ def _manual_test_route_reasons(*, mode: str) -> list[str]:
     if env_bool("WATCHLIST_MODE", default=False):
         reasons.append("watchlist_mode")
     return reasons
+
+
+def _normalize_warning_counts(raw: dict[str, Any] | None) -> dict[str, int]:
+    counts = {key: 0 for key in SESSION_WARNING_KEYS}
+    for key, value in dict(raw or {}).items():
+        try:
+            counts[str(key)] = int(value or 0)
+        except Exception:
+            counts[str(key)] = 0
+    return counts
+
+
+def _merge_warning_counts(base: dict[str, int], incoming: dict[str, Any] | None) -> dict[str, int]:
+    merged = dict(base)
+    for key, value in _normalize_warning_counts(incoming).items():
+        merged[key] = int(merged.get(key, 0)) + int(value)
+    return merged
+
+
+def _warning_total(counts: dict[str, Any] | None) -> int:
+    return sum(int(value or 0) for value in dict(counts or {}).values())
+
+
+def _resolve_session_terminal_state(*, result_status: str, exit_reason: str, warning_counts: dict[str, Any] | None) -> str:
+    status = str(result_status or "UNKNOWN").strip().upper()
+    exit_reason_norm = str(exit_reason or "").strip().lower()
+    counts = _normalize_warning_counts(warning_counts)
+    if status in {"FATAL_RUNTIME", "FATAL_POSTPROCESS"}:
+        return "SESSION_END_FATAL"
+    if status.startswith("SKIP") or exit_reason_norm.startswith("phase_guard_skip"):
+        return "SESSION_END_SKIPPED"
+    if status in {"OK_DEGRADED", "DEGRADED_POSTPROCESS"} or counts.get("degraded_stage_count", 0) > 0:
+        return "SESSION_END_OK_DEGRADED"
+    if _warning_total(counts) > 0 or status in {"WARN_FAIL_OPEN", "OK_WITH_WARNINGS"}:
+        return "SESSION_END_OK_WITH_WARNINGS"
+    return "SESSION_END_OK"
+
+
+def evaluate_workflow_log_success(*, session: str, log_text: str) -> dict[str, Any]:
+    text = str(log_text or "")
+    result_matches = re.findall(r"\[RUN_SUMMARY\]\[RESULT\] status=([A-Z_]+) reason=([^\s]+)", text)
+    result_status, result_reason = result_matches[-1] if result_matches else ("", "")
+    terminal_matches = re.findall(r"\[PB1\]\[SESSION_TERMINAL\] terminal_state=([A-Z_]+) result_status=([A-Z_]+) exit_reason=([^\s]+)", text)
+    terminal_state = terminal_matches[-1][0] if terminal_matches else ""
+    session_end_release = bool(re.search(r"\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[EXIT\] reason=session_end", text))
+    tick_seen = bool(re.search(r"\[PB1\]\[TICK\]\[DONE\]|\[PB1\]\[TICK_TIMEOUT\]|\[PB1\]\[SESSION\]\[WARNINGS\]", text))
+    traceback_seen = bool(re.search(r"Traceback \(most recent call last\):", text))
+    fatal_runtime = bool(re.search(r"\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)|\[PB1\]\[EXIT\] reason=fatal_runtime", text))
+    timeout_count = len(re.findall(r"TickTimeoutError|tick_hard_timeout|\[WARN\]\[PB1\]\[STAGE_TIMEOUT\]", text))
+    db_autocommit_count = len(re.findall(r"can't change 'autocommit' now|connection in transaction status ACTIVE", text))
+    degraded_count = len(re.findall(r"DEGRADED_POSTPROCESS|\[PB1\]\[POSTPROCESS\]\[DEGRADED\]|\[DEGRADED\]\[PB1\]", text))
+    exit_pass_timeout_observed = int(bool(re.search(r"\[PB1\]\[POST_CAPITAL\]\[EXIT_PASS\]\[(TIMEOUT|DEGRADED)\]", text)))
+    warnings_present = any(value > 0 for value in (timeout_count, db_autocommit_count, degraded_count, exit_pass_timeout_observed))
+
+    if not result_status:
+        return {
+            "ok": False,
+            "status": "VERIFY_FAIL",
+            "reason": "missing_run_summary",
+            "timeout_count": timeout_count,
+            "db_autocommit_count": db_autocommit_count,
+            "degraded_count": degraded_count,
+            "exit_pass_timeout_observed": exit_pass_timeout_observed,
+        }
+
+    skip_reason = str(result_reason or "").lower()
+    policy_skip_failure = result_status.startswith("SKIP") and any(
+        token in skip_reason for token in ("duplicate", "stale", "invalid_window")
+    )
+    clean_success = result_status in {"OK", "OK_NO_TRADE", "OK_DEGRADED", "OK_WITH_WARNINGS", "OK_MANUAL_REPLAY"}
+    if terminal_state and terminal_state.startswith("SESSION_END_OK"):
+        clean_success = True
+    if fatal_runtime or traceback_seen:
+        return {
+            "ok": False,
+            "status": result_status or "VERIFY_FAIL",
+            "reason": "fatal_detected",
+            "timeout_count": timeout_count,
+            "db_autocommit_count": db_autocommit_count,
+            "degraded_count": degraded_count,
+            "exit_pass_timeout_observed": exit_pass_timeout_observed,
+        }
+    if policy_skip_failure:
+        return {
+            "ok": False,
+            "status": result_status,
+            "reason": result_reason or "policy_skip_failure",
+            "timeout_count": timeout_count,
+            "db_autocommit_count": db_autocommit_count,
+            "degraded_count": degraded_count,
+            "exit_pass_timeout_observed": exit_pass_timeout_observed,
+        }
+    if not clean_success and not (session_end_release and tick_seen):
+        return {
+            "ok": False,
+            "status": result_status,
+            "reason": "session_not_alive",
+            "timeout_count": timeout_count,
+            "db_autocommit_count": db_autocommit_count,
+            "degraded_count": degraded_count,
+            "exit_pass_timeout_observed": exit_pass_timeout_observed,
+        }
+    if result_status == "OK_DEGRADED" or degraded_count > 0:
+        verify_status = "OK_DEGRADED"
+    elif warnings_present:
+        verify_status = "OK_WITH_WARNINGS"
+    else:
+        verify_status = result_status
+    return {
+        "ok": True,
+        "status": verify_status,
+        "reason": result_reason or "session_completed",
+        "timeout_count": timeout_count,
+        "db_autocommit_count": db_autocommit_count,
+        "degraded_count": degraded_count,
+        "exit_pass_timeout_observed": exit_pass_timeout_observed,
+    }
 
 
 def _load_json_rows(path: Path) -> list[dict[str, Any]]:
@@ -1765,6 +1891,51 @@ def _detect_trade_session_policy(
         skip_reason=str(session_cfg["schedule_hard_cutoff_reason"]),
     )
     return policy
+
+
+def _detect_close_start_policy(*, now: datetime, event_name: str, manual_mode: str = "live_close") -> dict[str, Any]:
+    event = str(event_name or "unknown").strip().lower() or "unknown"
+    mode = str(manual_mode or "live_close").strip().lower() or "live_close"
+    now_hhmm = now.strftime("%H%M")
+    if event == "workflow_dispatch" and mode in {"diag_replay", "compute_only"}:
+        return {
+            "should_run": True,
+            "recovery": False,
+            "skip_reason": "",
+            "classification": "CLOSE_MANUAL_REPLAY",
+            "execution_route": "manual_replay",
+        }
+    if now_hhmm < "1515":
+        return {
+            "should_run": False,
+            "recovery": False,
+            "skip_reason": "close_early_start",
+            "classification": "SKIP_CLOSE_EARLY_START",
+            "execution_route": "live_close",
+        }
+    if now_hhmm < "1530":
+        return {
+            "should_run": True,
+            "recovery": False,
+            "skip_reason": "",
+            "classification": "NORMAL_CLOSE_START",
+            "execution_route": "live_close",
+        }
+    if now_hhmm <= "1545":
+        return {
+            "should_run": True,
+            "recovery": True,
+            "skip_reason": "",
+            "classification": "RECOVERY_CLOSE_START",
+            "execution_route": "live_close",
+        }
+    return {
+        "should_run": False,
+        "recovery": False,
+        "skip_reason": "skip_close_stale_start",
+        "classification": "SKIP_CLOSE_STALE_START",
+        "execution_route": "live_close",
+    }
 
 
 def _detect_trade_am_start_policy(
@@ -5179,8 +5350,14 @@ def run_once(
             elif result.status in {"OK_NO_TRADE", "NO_TRADE"}:
                 result.status = "OK_NO_TRADE"
                 result_reason = result.notes or "NO_ORDER_INTENTS"
+            elif result.status == "WARN_FAIL_OPEN":
+                result.status = "OK_WITH_WARNINGS"
+                result_reason = result.notes or "FAIL_OPEN_WARNING"
+            elif result.status == "DEGRADED_POSTPROCESS":
+                result.status = "OK_DEGRADED"
+                result_reason = result.notes or "DEGRADED_POSTPROCESS"
             if runs_ledger_fail_open and result.status not in {"FATAL_RUNTIME", "SKIP_PHASE_WINDOW"}:
-                result.status = "WARN_FAIL_OPEN"
+                result.status = "OK_WITH_WARNINGS"
                 result_reason = "runs_ledger_fail_open"
             if _is_close_manual_replay_active() and result.status not in {"FATAL_RUNTIME", "FATAL_POSTPROCESS", "SKIP_PHASE_WINDOW"}:
                 replay_reason = f"CLOSE_MANUAL_REPLAY_{_resolve_close_manual_mode().upper()}"
@@ -5192,6 +5369,29 @@ def run_once(
                 result_reason,
                 summary_session,
                 summary_event,
+            )
+            result_warning_counts = _normalize_warning_counts(
+                getattr(result, "warning_counts", None) or getattr(engine_runner, "_warning_counts", None)
+            )
+            result_terminal_state = getattr(result, "terminal_state", None) or _resolve_session_terminal_state(
+                result_status=result.status,
+                exit_reason=result_reason,
+                warning_counts=result_warning_counts,
+            )
+            logger.info(
+                "[PB1][SESSION_TERMINAL] terminal_state=%s result_status=%s exit_reason=%s warnings_total=%s",
+                result_terminal_state,
+                result.status,
+                result_reason,
+                _warning_total(result_warning_counts),
+            )
+            logger.info(
+                "[PB1][SESSION_WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s",
+                result_warning_counts.get("timeout_count", 0),
+                result_warning_counts.get("db_read_fail_open_count", 0),
+                result_warning_counts.get("ledger_fail_first_count", 0),
+                result_warning_counts.get("degraded_stage_count", 0),
+                result_warning_counts.get("duplicate_skip_count", 0),
             )
             result.notes = result_reason
             if nontrading_eval_mode:
@@ -5355,6 +5555,8 @@ def run_once(
         "buy_orders": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0)),
         "sell_orders": int((getattr(engine_runner, "_exit_summary_payload", {}) or {}).get("submitted", 0)),
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
+        "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
+        "terminal_state": getattr(result, "terminal_state", None),
     }
     result_status = result.status if result else "UNKNOWN"
     
@@ -5463,6 +5665,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     balance_api_calls = 0
     balance_cache_hits = 0
     balance_tick_cache_hits = 0
+    session_warning_counts = {key: 0 for key in SESSION_WARNING_KEYS}
     last_phase = "none"
     last_result_status = "UNKNOWN"
     loop_started_ts = total_start_ts
@@ -5709,6 +5912,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
                 buy_orders += int(metrics.get("buy_orders", 0) or 0)
                 sell_orders += int(metrics.get("sell_orders", 0) or 0)
+                session_warning_counts = _merge_warning_counts(session_warning_counts, metrics.get("warning_counts"))
                 if bool(metrics.get("degraded", False)) or str(result_status or "").startswith("DEGRADED"):
                     ticks_degraded += 1
                 elif result_status in {"NO_TRADE", "OK_NO_TRADE", "OK_NO_CANDIDATES", "HANDOFF_TO_CLOSE", "NONTRADING_SMOKE_DONE"}:
@@ -5780,9 +5984,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 time_mod.sleep(sleep_for)
                 continue
             except TickTimeoutError as exc:
-                ticks_fatal += 1
-                logger.error(
-                    "[PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s timeout_sec=%s err=%s",
+                ticks_degraded += 1
+                session_warning_counts["timeout_count"] = int(session_warning_counts.get("timeout_count", 0)) + 1
+                logger.warning(
+                    "[WARN][PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s timeout_sec=%s err=%s",
                     session_kind,
                     now.isoformat(),
                     session_end_dt.isoformat(),
@@ -5882,6 +6087,25 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             ticks_degraded,
             buy_orders,
             sell_orders,
+        )
+        logger.info(
+            "[PB1][SESSION_WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s",
+            session_warning_counts.get("timeout_count", 0),
+            session_warning_counts.get("db_read_fail_open_count", 0),
+            session_warning_counts.get("ledger_fail_first_count", 0),
+            session_warning_counts.get("degraded_stage_count", 0),
+            session_warning_counts.get("duplicate_skip_count", 0),
+        )
+        logger.info(
+            "[PB1][SESSION_TERMINAL] terminal_state=%s result_status=%s exit_reason=%s warnings_total=%s",
+            _resolve_session_terminal_state(
+                result_status=last_result_status,
+                exit_reason=exit_reason,
+                warning_counts=session_warning_counts,
+            ),
+            last_result_status,
+            exit_reason,
+            _warning_total(session_warning_counts),
         )
         _record_session_execution_marker(
             engine=engine,

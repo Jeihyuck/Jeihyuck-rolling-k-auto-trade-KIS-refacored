@@ -29,6 +29,7 @@ from .schema import (
     uuid_value_for_url,
 )
 from trader.db.json_safe import json_sanitize
+from trader.db.engine import safe_read_mappings
 from trader.db.retry import run_with_db_retry
 from trader.constants import (
     CRITICAL_SCORED_COLS,
@@ -2435,24 +2436,15 @@ class OrdersRepo:
             fail_open = _order_lookup_fail_open_default()
 
         self._last_read_fail_open_op = None
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(stmt).mappings().all()
-                logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
-                return [dict(r) for r in rows]
-        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            logger.exception(
-                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
-                op_name,
-                int(bool(fail_open)),
-                type(exc).__name__,
-                exc,
-            )
-            if fail_open:
-                self._last_read_fail_open_op = op_name
-                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
-                return []
-            raise
+        rows, fail_open_triggered = safe_read_mappings(
+            self.engine,
+            stmt,
+            op_name=op_name,
+            fail_open=bool(fail_open),
+        )
+        if fail_open_triggered:
+            self._last_read_fail_open_op = op_name
+        return rows
 
     def consume_fail_open_marker(self, op_name: str) -> bool:
         if self._last_read_fail_open_op != op_name:
@@ -3094,24 +3086,15 @@ class FillsRepo:
         if fail_open is None:
             fail_open = _order_lookup_fail_open_default()
         self._last_read_fail_open_op = None
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(stmt).mappings().all()
-                logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
-                return [dict(r) for r in rows]
-        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            logger.exception(
-                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
-                op_name,
-                int(bool(fail_open)),
-                type(exc).__name__,
-                exc,
-            )
-            if fail_open:
-                self._last_read_fail_open_op = op_name
-                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
-                return []
-            raise
+        rows, fail_open_triggered = safe_read_mappings(
+            self.engine,
+            stmt,
+            op_name=op_name,
+            fail_open=bool(fail_open),
+        )
+        if fail_open_triggered:
+            self._last_read_fail_open_op = op_name
+        return rows
 
     def ensure_run_exists(self, run_id: str) -> None:
         # Check if run exists, if not, insert minimal row
@@ -3190,9 +3173,11 @@ class FillsRepo:
         elif code_list:
             conditions.append(self._schema.fills.c.code.in_(code_list))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-        return [dict(r) for r in rows]
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="fills.list_fills_in_window",
+            fail_open=_order_lookup_fail_open_default(),
+        )
 
     def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
         normalized_codes = [str(code or "").zfill(6) for code in (codes or []) if str(code or "").strip()]
@@ -3210,8 +3195,11 @@ class FillsRepo:
             .order_by(self._window_expr(self._schema.fills.c.filled_at).desc())
         )
         latest: dict[str, dict] = {}
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="fills.list_latest_buy_fills_by_codes",
+            fail_open=_order_lookup_fail_open_default(),
+        )
         for row in rows:
             item = dict(row)
             code = str(item.get("code") or "").zfill(6)

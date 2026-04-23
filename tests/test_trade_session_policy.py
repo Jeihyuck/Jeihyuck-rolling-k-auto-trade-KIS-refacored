@@ -202,3 +202,16 @@ def test_pm_manage_only_preserved() -> None:
     policy = pb1_runner._resolve_session_trade_policy(session="pm", phase_name="manage", entry_enabled=False)
     assert policy["no_new_entry"] is True
     assert policy["reason"] == "pm_strategy_manage_only"
+
+def test_close_recovery_window() -> None:
+    now = datetime(2024, 1, 2, 15, 34, tzinfo=ZoneInfo("Asia/Seoul"))
+    policy = pb1_runner._detect_close_start_policy(now=now, event_name="schedule")
+    assert policy["should_run"] is True
+    assert policy["recovery"] is True
+    assert policy["classification"] == "RECOVERY_CLOSE_START"
+
+def test_close_stale_start() -> None:
+    now = datetime(2024, 1, 2, 16, 6, tzinfo=ZoneInfo("Asia/Seoul"))
+    policy = pb1_runner._detect_close_start_policy(now=now, event_name="schedule")
+    assert policy["should_run"] is False
+    assert policy["skip_reason"] == "skip_close_stale_start"

@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError, OperationalError, StatementError, TimeoutError as SATimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,47 @@ def make_engine() -> sa.Engine:
             "Postgres driver missing. Install psycopg[binary]. "
             "Ensure psycopg is installed."
         ) from exc
+
+
+def connection_has_active_transaction(conn) -> bool:
+    try:
+        in_transaction = getattr(conn, "in_transaction", None)
+        if callable(in_transaction):
+            return bool(in_transaction())
+    except Exception:
+        return False
+    return False
+
+
+def safe_read_mappings(
+    engine: sa.Engine,
+    stmt,
+    *,
+    op_name: str,
+    fail_open: bool = False,
+) -> tuple[list[dict], bool]:
+    try:
+        with engine.connect() as conn:
+            logger.info(
+                "[DB][READ][PATH] op=%s active_tx=%s safe_mode=connect_only",
+                op_name,
+                int(connection_has_active_transaction(conn)),
+            )
+            rows = conn.execute(stmt).mappings().all()
+            logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
+            return [dict(row) for row in rows], False
+    except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+        logger.exception(
+            "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+            op_name,
+            int(bool(fail_open)),
+            type(exc).__name__,
+            exc,
+        )
+        if fail_open:
+            logger.warning("[FAIL_OPEN][DB][READ] op=%s -> returning []", op_name)
+            return [], True
+        raise
 
 
 # 싱글톤 엔진 인스턴스

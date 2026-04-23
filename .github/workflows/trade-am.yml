@@ -407,31 +407,8 @@ jobs:
             grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-am.log || true
             exit 1
           fi
-          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-am.log | tail -n 1 | sed 's/.*status=//')"
-          if [[ "$result_status" == "SKIP_PHASE_WINDOW" ]]; then
-            echo "::notice::AM phase window skip recorded"
-            exit 0
-          fi
           if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-am.log >/dev/null; then
             echo "::error::runs.started_at text/timestamptz schema mismatch still present"
-            exit 1
-          fi
-          if [[ "$result_status" == "FATAL_RUNTIME" ]]; then
-            echo "::error::AM fatal runtime recorded"
-            grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FATAL_RUNTIME|\[PB1\]\[EXIT\] reason=fatal_runtime|\[PB1\]\[FATAL_GUARD\]" artifacts/trade-am.log || true
-            exit 1
-          fi
-          fatal_count="$(grep -Ec '\[RUN_SUMMARY\]\[RESULT\] status=(FATAL_RUNTIME|FATAL_POSTPROCESS)' artifacts/trade-am.log || true)"
-          timeout_count="$(grep -Ec 'TickTimeoutError|tick_hard_timeout' artifacts/trade-am.log || true)"
-          db_autocommit_count="$(grep -Ec "can't change 'autocommit' now|connection in transaction status ACTIVE" artifacts/trade-am.log || true)"
-          degraded_count="$(grep -Ec 'DEGRADED_POSTPROCESS|\[PB1\]\[POSTPROCESS\]\[DEGRADED\]' artifacts/trade-am.log || true)"
-          echo "[TRADE_AM][VERIFY][COUNTS] fatal_count=${fatal_count} timeout_count=${timeout_count} db_autocommit_count=${db_autocommit_count} degraded_count=${degraded_count}"
-          if [[ "$db_autocommit_count" -gt 0 ]]; then
-            echo "::error::DB autocommit transaction ACTIVE error detected"
-            exit 1
-          fi
-          if [[ "$fatal_count" -gt 0 ]]; then
-            echo "::error::AM internal fatal result detected"
             exit 1
           fi
           if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=am" artifacts/trade-am.log >/dev/null; then
@@ -453,6 +430,7 @@ jobs:
             missing=1
           fi
           test "$missing" -eq 0
+          python -m trader.trade_tick verify-log --session am --log artifacts/trade-am.log
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'
