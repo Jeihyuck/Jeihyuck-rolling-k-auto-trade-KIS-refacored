@@ -81,9 +81,19 @@ on:
         required: false
         default: "1"
         type: string
+      FORCE_TRADE_AM_LATE_START:
+        description: "1=allow manual/schedule trade-am start even after normal cutoff"
+        required: true
+        default: "0"
+        type: string
+      FORCE_TRADE_AM_AFTER_1030:
+        description: "1=allow manual trade-am start after 10:30 KST"
+        required: true
+        default: "0"
+        type: string
       AM_RECOVERY_ALLOW_UNTIL:
-        description: Late AM recovery cutoff in KST
-        required: false
+        description: Late AM recovery deadline in KST (HH:MM)
+        required: true
         default: "10:30"
         type: string
       ENABLE_LATE_PM_RECOVERY:
@@ -148,6 +158,8 @@ jobs:
           FORCE_PB1_PHASE_INPUT: ${{ inputs.FORCE_PB1_PHASE || '' }}
           ALLOW_KIS_DATA_HTTP_IN_DIAG_INPUT: ${{ inputs.ALLOW_KIS_DATA_HTTP_IN_DIAG || '1' }}
           ENABLE_LATE_AM_RECOVERY_INPUT: ${{ inputs.ENABLE_LATE_AM_RECOVERY || '1' }}
+          FORCE_TRADE_AM_LATE_START_INPUT: ${{ inputs.FORCE_TRADE_AM_LATE_START || '0' }}
+          FORCE_TRADE_AM_AFTER_1030_INPUT: ${{ inputs.FORCE_TRADE_AM_AFTER_1030 || '0' }}
           AM_RECOVERY_ALLOW_UNTIL_INPUT: ${{ inputs.AM_RECOVERY_ALLOW_UNTIL || '10:30' }}
           ENABLE_LATE_PM_RECOVERY_INPUT: ${{ inputs.ENABLE_LATE_PM_RECOVERY || '1' }}
           PM_RECOVERY_ALLOW_UNTIL_INPUT: ${{ inputs.PM_RECOVERY_ALLOW_UNTIL || '13:40' }}
@@ -214,7 +226,12 @@ jobs:
             echo "allow_kis_data_http_in_diag=${allow_kis_data_http_in_diag}"
             echo "allow_after_close_entry_dryrun=${allow_after_close_entry_dryrun}"
           } >> "$GITHUB_OUTPUT"
-          echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${run_mode}"
+          echo "[RESOLVE] event=${GITHUB_EVENT_NAME}"
+          echo "[RESOLVE] actor=${GITHUB_ACTOR}"
+          echo "[RESOLVE] mode=${run_mode}"
+          echo "[RESOLVE] force_trade_am_late_start=${FORCE_TRADE_AM_LATE_START_INPUT}"
+          echo "[RESOLVE] force_trade_am_after_1030=${FORCE_TRADE_AM_AFTER_1030_INPUT}"
+          echo "[RESOLVE] am_recovery_allow_until=${AM_RECOVERY_ALLOW_UNTIL_INPUT}"
           echo "[RESOLVE] am_recovery=${ENABLE_LATE_AM_RECOVERY_INPUT} am_recovery_until=${AM_RECOVERY_ALLOW_UNTIL_INPUT}"
           echo "[RESOLVE] pm_recovery=${ENABLE_LATE_PM_RECOVERY_INPUT} pm_recovery_until=${PM_RECOVERY_ALLOW_UNTIL_INPUT}"
 
@@ -265,12 +282,16 @@ jobs:
       PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN: ${{ needs.resolve.outputs.allow_after_close_entry_dryrun }}
       ALLOW_DUPLICATE_PREP: ${{ github.event_name == 'workflow_dispatch' && inputs.ALLOW_DUPLICATE_PREP || '0' }}
       PB1_ENABLE_LATE_AM_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.ENABLE_LATE_AM_RECOVERY || '1' }}
+      PB1_FORCE_TRADE_AM_LATE_START: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_LATE_START || '0' }}
+      PB1_FORCE_TRADE_AM_AFTER_1030: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_AFTER_1030 || '0' }}
       PB1_AM_RECOVERY_ALLOW_UNTIL: ${{ github.event_name == 'workflow_dispatch' && inputs.AM_RECOVERY_ALLOW_UNTIL || '10:30' }}
       PB1_ENABLE_LATE_PM_RECOVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.ENABLE_LATE_PM_RECOVERY || '1' }}
       PB1_PM_RECOVERY_ALLOW_UNTIL: ${{ github.event_name == 'workflow_dispatch' && inputs.PM_RECOVERY_ALLOW_UNTIL || '13:40' }}
+      PB1_AM_EXPECTED_START: "09:07"
+      PB1_AM_EXPECTED_END: "09:15"
+      PB1_AM_START_ALLOW_UNTIL: "09:30"
       PB1_AM_EXPECTED_START_FROM: "0907"
       PB1_AM_EXPECTED_START_TO: "0915"
-      PB1_AM_START_ALLOW_UNTIL: "0930"
       PB1_PM_EXPECTED_START_FROM: "1305"
       PB1_PM_EXPECTED_START_TO: "1315"
       PB1_PM_START_ALLOW_UNTIL: "1325"

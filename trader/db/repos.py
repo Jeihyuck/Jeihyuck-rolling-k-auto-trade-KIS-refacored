@@ -2817,6 +2817,44 @@ class OrdersRepo:
             )
         )
 
+    def has_today_am_session_marker(self, env: str, trade_date: date | datetime | str | None = None) -> bool:
+        if isinstance(trade_date, datetime):
+            marker_date = trade_date.date()
+        elif isinstance(trade_date, date):
+            marker_date = trade_date
+        elif isinstance(trade_date, str) and trade_date.strip():
+            marker_date = datetime.fromisoformat(trade_date).date()
+        else:
+            marker_date = now_kst().date()
+        job_key = f"trade_session:{str(env or '').strip().lower() or 'practice'}:am:{marker_date.isoformat()}"
+        schema = schema_for_engine(self.engine)
+        stmt = select(schema.job_checkpoints.c.payload).where(schema.job_checkpoints.c.job_key == job_key)
+        self._last_read_fail_open_op = None
+        try:
+            with self.engine.connect() as conn:
+                payload = conn.execute(stmt).scalar()
+            completed = bool((payload or {}).get("completed")) if isinstance(payload, dict) else False
+            logger.info(
+                "[DB][ORDERS][AM_MARKER] env=%s trade_date=%s completed=%s",
+                env,
+                marker_date.isoformat(),
+                int(completed),
+            )
+            return completed
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+            fail_open = _order_lookup_fail_open_default()
+            logger.exception(
+                "[DB][READ][FAIL] op=orders.has_today_am_session_marker fail_open=%s err_type=%s err=%s",
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if fail_open:
+                self._last_read_fail_open_op = "orders.has_today_am_session_marker"
+                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_today_am_session_marker -> returning False")
+                return False
+            raise
+
     def list_orders_in_window(
         self,
         env: str,

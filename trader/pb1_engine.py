@@ -991,6 +991,7 @@ def resolve_pb1_phase(
     now: datetime,
     trading_day: bool,
     force_phase_env: str | None = None,
+    force_entry_window_override: bool = False,
 ) -> tuple[str, str, str]:
     force_raw = (force_phase_env or "").strip().lower()
     if force_raw:
@@ -1001,6 +1002,8 @@ def resolve_pb1_phase(
     window = resolve_market_window(now, trading_day)
     if not trading_day:
         return "idle", "auto_non_trading_day", window
+    if force_entry_window_override:
+        return "entry", "force_entry_window_override", "day"
     entry_start = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_START, "%H:%M").time(), now.tzinfo)
     entry_open_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_OPEN_END, "%H:%M").time(), now.tzinfo)
     entry_end = datetime.combine(now.date(), datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time(), now.tzinfo)
@@ -1108,6 +1111,8 @@ class PB1Engine:
         phase_name: str | None = None,
         window_name: str | None = None,
         entry_allowed_this_tick: bool | None = None,
+        force_entry_window_override: bool = False,
+        am_recovery_continue: bool = False,
     ) -> None:
         self._as_of = None
         self._trade_date = None
@@ -1317,6 +1322,8 @@ class PB1Engine:
         self.minervini_only = bool(minervini_only)  # ✅ MINERVINI_ONLY 모드
         self.entry_enabled = bool(order_allowed)  # 하위호환용
         self.entry_block_reason = entry_block_reason
+        self.force_entry_window_override = bool(force_entry_window_override)
+        self.am_recovery_continue = bool(am_recovery_continue)
         self.preopen_max_new_positions = int(preopen_max_new_positions or 0)
         self.window_internal = self._resolve_window_internal()
         self.bootstrap_enabled = bool(self._bool_env("PB1_BOOTSTRAP_ENABLED", PB1_BOOTSTRAP_ENABLE))
@@ -1325,12 +1332,14 @@ class PB1Engine:
         self.force_min1_topn = max(1, int(self._int_env("PB1_FORCE_MIN1_TOPN", int(self.bootstrap_config["force_min1_topn"]))))
         self.order_candidate_mode = (os.getenv("PB1_ORDER_CANDIDATE_MODE") or "normal").strip().lower() or "normal"
         logger.info(
-            "[PB1][BOOTSTRAP][INIT] enabled=%s force_min1=%s force_min1_topn=%s phase=%s window=%s",
+            "[PB1][BOOTSTRAP][INIT] enabled=%s force_min1=%s force_min1_topn=%s phase=%s window=%s force_entry_window_override=%s am_recovery_continue=%s",
             self.bootstrap_enabled,
             self.force_min1_enabled,
             self.force_min1_topn,
             self.phase_name,
             self.window_name,
+            int(self.force_entry_window_override),
+            int(self.am_recovery_continue),
         )
         self.effective_entry_filters = self._resolve_effective_entry_filters()
         self.filter_thresholds = self._resolve_filter_thresholds()
@@ -6285,7 +6294,7 @@ class PB1Engine:
             reasons.append("nontrading_day")
         if not bool(self.order_allowed):
             reasons.append("order_blocked")
-        if self.market_window_name == "after":
+        if self.market_window_name == "after" and not (self.force_entry_window_override or self.am_recovery_continue):
             reasons.append("window_blocked")
         if self.force_block_live or not self.intended_live or self.strategy_mode == "DIAG":
             reasons.append("live_gate_blocked")

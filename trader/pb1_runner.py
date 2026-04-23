@@ -1482,18 +1482,34 @@ def _normalize_hhmm_compact(raw: str | None, fallback: str) -> str:
     return fallback_compact
 
 
-def _parse_hhmm_kst(raw: str | None, fallback: str) -> int:
+def _parse_hhmm_minutes(raw: str | None, fallback: str) -> int:
     compact = _normalize_hhmm_compact(raw, fallback)
     return int(compact[:2]) * 60 + int(compact[2:])
 
 
+def _parse_hhmm_kst(value: str | None, now: datetime, fallback: str = "0000") -> datetime:
+    compact = _normalize_hhmm_compact(value, fallback)
+    return now.replace(
+        hour=int(compact[:2]),
+        minute=int(compact[2:]),
+        second=0,
+        microsecond=0,
+    )
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return parse_bool_any(raw, default=default)
+
+
 def _in_kst_range(now: datetime, start_hhmm: str | None, end_hhmm: str | None, *, end_inclusive: bool = True) -> bool:
-    now_min = now.hour * 60 + now.minute
-    start_min = _parse_hhmm_kst(start_hhmm, "0000")
-    end_min = _parse_hhmm_kst(end_hhmm, "2359")
+    start_dt = _parse_hhmm_kst(start_hhmm, now, "0000")
+    end_dt = _parse_hhmm_kst(end_hhmm, now, "2359")
     if end_inclusive:
-        return start_min <= now_min <= end_min
-    return start_min <= now_min < end_min
+        return start_dt <= now <= end_dt
+    return start_dt <= now < end_dt
 
 
 def _session_recovery_spec(session_kind: str) -> dict[str, Any] | None:
@@ -1502,9 +1518,11 @@ def _session_recovery_spec(session_kind: str) -> dict[str, Any] | None:
         "am": {
             "log_prefix": "TRADE_AM",
             "session_start": "0900",
-            "expected_from_env": "PB1_AM_EXPECTED_START_FROM",
+            "expected_from_env": "PB1_AM_EXPECTED_START",
+            "expected_from_legacy_env": "PB1_AM_EXPECTED_START_FROM",
             "expected_from_default": "0907",
-            "expected_to_env": "PB1_AM_EXPECTED_START_TO",
+            "expected_to_env": "PB1_AM_EXPECTED_END",
+            "expected_to_legacy_env": "PB1_AM_EXPECTED_START_TO",
             "expected_to_default": "0915",
             "start_allow_env": "PB1_AM_START_ALLOW_UNTIL",
             "start_allow_default": "0930",
@@ -1516,9 +1534,11 @@ def _session_recovery_spec(session_kind: str) -> dict[str, Any] | None:
         "pm": {
             "log_prefix": "TRADE_PM",
             "session_start": "1300",
-            "expected_from_env": "PB1_PM_EXPECTED_START_FROM",
+            "expected_from_env": "PB1_PM_EXPECTED_START",
+            "expected_from_legacy_env": "PB1_PM_EXPECTED_START_FROM",
             "expected_from_default": "1305",
-            "expected_to_env": "PB1_PM_EXPECTED_START_TO",
+            "expected_to_env": "PB1_PM_EXPECTED_END",
+            "expected_to_legacy_env": "PB1_PM_EXPECTED_START_TO",
             "expected_to_default": "1315",
             "start_allow_env": "PB1_PM_START_ALLOW_UNTIL",
             "start_allow_default": "1325",
@@ -1536,8 +1556,14 @@ def _detect_trade_session_recovery_window(*, now: datetime, session_kind: str) -
     if spec is None:
         return {"supported": False, "session_kind": session_kind}
 
-    expected_from = _normalize_hhmm_compact(os.getenv(spec["expected_from_env"]), spec["expected_from_default"])
-    expected_to = _normalize_hhmm_compact(os.getenv(spec["expected_to_env"]), spec["expected_to_default"])
+    expected_from = _normalize_hhmm_compact(
+        os.getenv(spec["expected_from_env"]) or os.getenv(spec.get("expected_from_legacy_env", "")),
+        spec["expected_from_default"],
+    )
+    expected_to = _normalize_hhmm_compact(
+        os.getenv(spec["expected_to_env"]) or os.getenv(spec.get("expected_to_legacy_env", "")),
+        spec["expected_to_default"],
+    )
     start_allow_until = _normalize_hhmm_compact(os.getenv(spec["start_allow_env"]), spec["start_allow_default"])
     recovery_allow_until = _normalize_hhmm_compact(os.getenv(spec["recovery_allow_env"]), spec["recovery_allow_default"])
     now_hhmm = now.strftime("%H%M")
@@ -1559,6 +1585,123 @@ def _detect_trade_session_recovery_window(*, now: datetime, session_kind: str) -
         "recovery_enabled": recovery_enabled,
         "duplicate_reason": spec["duplicate_reason"],
     }
+
+
+def _detect_trade_am_start_policy(
+    *,
+    now: datetime,
+    event_name: str | None,
+    run_mode: str | None,
+    trading_day: bool,
+    force_trade_am_late_start: bool,
+    force_trade_am_after_1030: bool,
+    am_expected_start: str,
+    am_expected_end: str,
+    am_start_allow_until: str,
+    am_recovery_allow_until: str,
+) -> dict[str, Any]:
+    del run_mode, trading_day
+    event_name_normalized = str(event_name or "schedule").strip().lower() or "schedule"
+    valid_from = _parse_hhmm_kst("09:00", now)
+    valid_until = _parse_hhmm_kst("12:55", now)
+    expected_start_dt = _parse_hhmm_kst(am_expected_start, now, "0907")
+    expected_end_dt = _parse_hhmm_kst(am_expected_end, now, "0915")
+    start_allow_until_dt = _parse_hhmm_kst(am_start_allow_until, now, "0930")
+    recovery_allow_until_dt = _parse_hhmm_kst(am_recovery_allow_until, now, "1030")
+
+    late_level = "NONE"
+    degraded_session = False
+    if now > _parse_hhmm_kst("09:40", now):
+        late_level = "ERROR"
+        degraded_session = True
+    elif now > _parse_hhmm_kst("09:20", now):
+        late_level = "WARN"
+        degraded_session = True
+
+    policy: dict[str, Any] = {
+        "should_run": True,
+        "degraded_session": degraded_session,
+        "force_override_used": False,
+        "late_level": late_level,
+        "skip_reason": "",
+        "classification": "ON_TIME_AM_START",
+        "recovery": False,
+        "manual_force_required": False,
+        "valid_window": "0900-1255",
+        "expected_start_window": f"{_normalize_hhmm_compact(am_expected_start, '0907')}-{_normalize_hhmm_compact(am_expected_end, '0915')}",
+        "new_start_allow_window": f"{_normalize_hhmm_compact(am_expected_start, '0907')}-{_normalize_hhmm_compact(am_start_allow_until, '0930')}",
+        "event_name": event_name_normalized,
+    }
+
+    if now < valid_from:
+        policy.update(
+            should_run=False,
+            classification="SKIP_PHASE_WINDOW",
+            skip_reason="early_start",
+        )
+        return policy
+    if now > valid_until:
+        policy.update(
+            should_run=False,
+            classification="SKIP_PHASE_WINDOW",
+            skip_reason="outside_trade_am_valid_window",
+        )
+        return policy
+
+    if event_name_normalized == "workflow_dispatch":
+        if now <= recovery_allow_until_dt:
+            if now > start_allow_until_dt:
+                policy.update(
+                    recovery=True,
+                    degraded_session=True,
+                    classification="LATE_AM_RECOVERY",
+                )
+            elif now > expected_end_dt:
+                policy.update(classification="LATE_AM_MANUAL")
+            return policy
+        policy["manual_force_required"] = True
+        if force_trade_am_after_1030 or force_trade_am_late_start:
+            policy.update(
+                should_run=True,
+                recovery=True,
+                degraded_session=True,
+                force_override_used=True,
+                classification="FORCED_LATE_AM_MANUAL",
+            )
+            return policy
+        policy.update(
+            should_run=False,
+            classification="SKIP_PHASE_WINDOW",
+            skip_reason="late_manual_start_after_1030_requires_force",
+        )
+        return policy
+
+    if now <= start_allow_until_dt:
+        if now > expected_end_dt:
+            policy.update(classification="LATE_AM_SCHEDULE")
+        return policy
+    if now <= recovery_allow_until_dt:
+        policy.update(
+            recovery=True,
+            degraded_session=True,
+            classification="LATE_AM_RECOVERY",
+        )
+        return policy
+    if force_trade_am_late_start:
+        policy.update(
+            should_run=True,
+            recovery=True,
+            degraded_session=True,
+            force_override_used=True,
+            classification="FORCED_LATE_AM_SCHEDULE",
+        )
+        return policy
+    policy.update(
+        should_run=False,
+        classification="SKIP_PHASE_WINDOW",
+        skip_reason="late_schedule_start_after_recovery_window",
+    )
+    return policy
 
 
 def _session_execution_checkpoint_key(*, env: str, session_kind: str, trade_date: date) -> str:
@@ -1609,10 +1752,139 @@ def _record_session_execution_marker(
         )
 
 
+def _has_today_am_buy_activity(orders_repo: OrdersRepo, env: str, now: datetime) -> dict[str, Any]:
+    session_start_dt = _parse_hhmm_kst("09:00", now)
+    buy_orders = orders_repo.list_today_buy_orders(
+        env,
+        start_at=session_start_dt,
+        end_at=now + timedelta(minutes=1),
+    )
+    get_open_orders = getattr(orders_repo, "get_open_orders", None)
+    open_orders = get_open_orders(env) if callable(get_open_orders) else []
+    open_buy_exists = any(str(order.get("side") or "").upper() == "BUY" for order in open_orders)
+    has_today_am_session_marker = getattr(orders_repo, "has_today_am_session_marker", None)
+    am_completed_marker = bool(has_today_am_session_marker(env, now.date())) if callable(has_today_am_session_marker) else False
+    today_buy_exists = bool(buy_orders)
+    duplicate = today_buy_exists or open_buy_exists or am_completed_marker
+    if today_buy_exists:
+        reason = "today_buy_exists"
+    elif open_buy_exists:
+        reason = "open_buy_exists"
+    elif am_completed_marker:
+        reason = "am_completed_marker"
+    else:
+        reason = "no_prior_am_buy"
+    return {
+        "today_buy_exists": today_buy_exists,
+        "open_buy_exists": open_buy_exists,
+        "am_completed_marker": am_completed_marker,
+        "duplicate": duplicate,
+        "reason": reason,
+    }
+
+
+def _apply_trade_am_override_env(*, enabled: bool, degraded_session: bool) -> None:
+    os.environ["PB1_FORCE_ENTRY_WINDOW_OVERRIDE"] = "1" if enabled else "0"
+    os.environ["PB1_AM_RECOVERY_CONTINUE"] = "1" if enabled else "0"
+    os.environ["PB1_SESSION_RECOVERY_USED"] = "1" if enabled else "0"
+    os.environ["TRADE_AM_LATE_START"] = "1" if enabled else "0"
+    os.environ["TRADE_AM_DEGRADED_SESSION"] = "1" if degraded_session else "0"
+
+
+def _evaluate_trade_am_start_guard(*, engine, env: str, now: datetime, info: dict[str, Any]) -> dict[str, Any]:
+    event_name = os.getenv("GITHUB_EVENT_NAME") or "schedule"
+    run_mode = os.getenv("MODE") or os.getenv("MANUAL_MODE") or "trade"
+    policy = _detect_trade_am_start_policy(
+        now=now,
+        event_name=event_name,
+        run_mode=run_mode,
+        trading_day=is_trading_day(now),
+        force_trade_am_late_start=_env_flag("PB1_FORCE_TRADE_AM_LATE_START", default=False),
+        force_trade_am_after_1030=_env_flag("PB1_FORCE_TRADE_AM_AFTER_1030", default=False),
+        am_expected_start=str(info["expected_start_window"]).split("-", 1)[0],
+        am_expected_end=str(info["expected_start_window"]).split("-", 1)[1],
+        am_start_allow_until=str(info["start_allow_until"]),
+        am_recovery_allow_until=str(info["recovery_allow_until"]),
+    )
+    recovery_enabled = bool(policy["recovery"] or policy["force_override_used"])
+    _apply_trade_am_override_env(enabled=recovery_enabled, degraded_session=bool(policy["degraded_session"]))
+
+    phase_guard_parts = [
+        f"[TRADE_AM][PHASE_GUARD] now_kst={now.strftime('%H%M')}",
+        f"should_run={int(bool(policy['should_run']))}",
+        f"recovery={int(bool(policy['recovery']))}",
+        f"force_override_used={int(bool(policy['force_override_used']))}",
+        f"skip_reason={policy['skip_reason']}",
+        f"event={policy['event_name']}",
+        f"valid_window={policy['valid_window']}",
+    ]
+    if policy["should_run"] and policy["classification"]:
+        phase_guard_parts.append(f"classification={policy['classification']}")
+    logger.warning(" ".join(phase_guard_parts))
+
+    if not policy["should_run"]:
+        exit_reason = str(policy["skip_reason"] or "phase_guard_skip")
+        if exit_reason == "late_schedule_start_after_recovery_window":
+            exit_reason = "phase_guard_skip_late_schedule_no_recovery"
+        return {
+            "skip": True,
+            "recovery_used": False,
+            "force_override_used": bool(policy["force_override_used"]),
+            "exit_reason": exit_reason,
+            "policy": policy,
+        }
+
+    if not recovery_enabled:
+        return {
+            "skip": False,
+            "recovery_used": False,
+            "force_override_used": bool(policy["force_override_used"]),
+            "exit_reason": "none",
+            "policy": policy,
+        }
+
+    orders_repo = OrdersRepo(engine)
+    duplicate_activity = _has_today_am_buy_activity(orders_repo, env, now)
+    logger.warning(
+        "[TRADE_AM][DEDUPE] today_buy_exists=%s open_buy_exists=%s am_completed_marker=%s result=%s",
+        int(bool(duplicate_activity["today_buy_exists"])),
+        int(bool(duplicate_activity["open_buy_exists"])),
+        int(bool(duplicate_activity["am_completed_marker"])),
+        "skip_duplicate" if duplicate_activity["duplicate"] else "proceed",
+    )
+    if duplicate_activity["duplicate"]:
+        _apply_trade_am_override_env(enabled=False, degraded_session=bool(policy["degraded_session"]))
+        return {
+            "skip": True,
+            "recovery_used": bool(policy["recovery"]),
+            "force_override_used": bool(policy["force_override_used"]),
+            "exit_reason": str(info["duplicate_reason"]),
+            "policy": policy,
+            "duplicate_activity": duplicate_activity,
+        }
+
+    logger.warning(
+        "[TRADE_AM][RECOVERY] proceed=1 duplicate=0 force_override_used=%s reason=%s",
+        int(bool(policy["force_override_used"])),
+        duplicate_activity["reason"],
+    )
+    return {
+        "skip": False,
+        "recovery_used": bool(policy["recovery"]),
+        "force_override_used": bool(policy["force_override_used"]),
+        "exit_reason": "recovery_continue" if policy["recovery"] else "none",
+        "policy": policy,
+        "duplicate_activity": duplicate_activity,
+    }
+
+
 def _evaluate_session_recovery_guard(*, engine, env: str, session_kind: str, now: datetime) -> dict[str, Any]:
     info = _detect_trade_session_recovery_window(now=now, session_kind=session_kind)
     if not info.get("supported"):
         return {"skip": False, "recovery_used": False, "exit_reason": "none"}
+
+    if str(session_kind or "").strip().lower() == "am":
+        return _evaluate_trade_am_start_guard(engine=engine, env=env, now=now, info=info)
 
     log_prefix = str(info["log_prefix"])
     os.environ["PB1_SESSION_RECOVERY_USED"] = "0"
@@ -2696,13 +2968,27 @@ def _resolve_market_context(
 ) -> tuple[WindowDecision | None, str, str, str, str, list[str]]:
     window = decide_window(now=now, override=window_override)
     window_label = _resolve_window_label(market_window, window)
-    resolved_phase, phase_reason, phase_window = resolve_pb1_phase(now, trading_day, phase_seed)
+    force_entry_window_override = _env_flag("PB1_FORCE_ENTRY_WINDOW_OVERRIDE", default=False)
+    resolved_phase, phase_reason, phase_window = resolve_pb1_phase(
+        now,
+        trading_day,
+        phase_seed,
+        force_entry_window_override=force_entry_window_override,
+    )
     reasons: list[str] = []
     if not resolved_phase:
         fallback = (os.getenv("PB1_PHASE_DEFAULT") or "entry").strip().lower()
         resolved_phase = fallback if fallback else "entry"
         phase_reason = "default_env"
         reasons.append("phase_default_env")
+    if force_entry_window_override and _resolve_session_kind() == "am":
+        if window_label not in {"preopen", "morning", "day"}:
+            window_label = "day"
+            reasons.append("trade_am_window_override")
+        if resolved_phase != "entry":
+            resolved_phase = "entry"
+        phase_reason = "force_entry_window_override"
+        reasons.append("trade_am_phase_override")
     reasons.append(f"market_window:{market_window}")
     reasons.append(f"window:{window_label}")
     reasons.append(f"phase:{resolved_phase}")
@@ -3510,6 +3796,14 @@ def run_once(
         window_override=args.window,
         phase_seed=phase_seed,
     )
+    force_entry_window_override = _env_flag("PB1_FORCE_ENTRY_WINDOW_OVERRIDE", default=False)
+    am_recovery_continue = _env_flag("PB1_AM_RECOVERY_CONTINUE", default=False)
+    if force_entry_window_override and _resolve_session_kind() == "am":
+        market_window = "day"
+        window_label = "day"
+        resolved_phase = "entry"
+        phase_reason = "force_entry_window_override"
+        context_reasons.append("trade_am_entry_override")
     normalized_window_name, normalized_phase_name = _normalize_window_phase(
         raw_window=resolved_window,
         market_window=market_window,
@@ -3517,6 +3811,8 @@ def run_once(
     )
     run_ctx["window_name"] = normalized_window_name
     run_ctx["phase_name"] = normalized_phase_name
+    run_ctx["force_entry_window_override"] = force_entry_window_override
+    run_ctx["am_recovery_continue"] = am_recovery_continue
     logger.info("[ASOF][USE] component=runner value=%s source=run_ctx", run_ctx["derived_as_of"])
     
     manual_test_reasons = _manual_test_route_reasons(mode=mode)
@@ -3638,6 +3934,14 @@ def run_once(
                     window_override=args.window,
                     phase_seed=phase_seed,
                 )
+                force_entry_window_override = _env_flag("PB1_FORCE_ENTRY_WINDOW_OVERRIDE", default=False)
+                am_recovery_continue = _env_flag("PB1_AM_RECOVERY_CONTINUE", default=False)
+                if force_entry_window_override and _resolve_session_kind() == "am":
+                    market_window = "day"
+                    window_label = "day"
+                    resolved_phase = "entry"
+                    phase_reason = "force_entry_window_override"
+                    context_reasons.append("trade_am_entry_override")
                 window = resolved_window
                 phase_for_log = resolved_phase
                 logger.info(
@@ -3847,12 +4151,21 @@ def run_once(
 
     if diag_enabled:
         dry_run = True
-        if args.phase == "auto" and not force_phase_env:
+        if args.phase == "auto" and not force_phase_env and not force_entry_window_override:
             phase_override_arg = "verify"
             phase_reason = "diagnostic"
         window = None
         window_label = "day"
         _apply_env_flags_if_needed(dry_run)
+
+    if force_entry_window_override and _resolve_session_kind() == "am":
+        market_window = "day"
+        window_label = "day"
+        phase_override_arg = "entry"
+        phase_for_log = "entry"
+        phase_reason = "force_entry_window_override"
+        if "trade_am_entry_override" not in context_reasons:
+            context_reasons.append("trade_am_entry_override")
 
     if compute_only_full_run and market_window == "after":
         phase_override_arg = "entry"
@@ -4388,7 +4701,7 @@ def run_once(
         elif PB1_REQUIRE_BALANCE_FOR_ENTRY and balance_state == BALANCE_STATE_STALE_OK and not minervini_only:
             order_allowed = False
             entry_block_reason = entry_block_reason or "balance_stale"
-        if window_label not in {"preopen", "morning", "day"} and not minervini_only:
+        if window_label not in {"preopen", "morning", "day"} and not minervini_only and not force_entry_window_override:
             order_allowed = False
             entry_block_reason = entry_block_reason or "window_blocked"
         entry_cutoff_raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
@@ -4653,6 +4966,8 @@ def run_once(
             trading_day=trading_day,
             phase_name=phase_name_for_engine,
             window_name=window_name_for_engine,
+            force_entry_window_override=force_entry_window_override,
+            am_recovery_continue=am_recovery_continue,
         )
         logger.info("[TRADE][ENGINE_BOOT][OK] engine=PB1Engine")
         
@@ -6112,6 +6427,8 @@ def main() -> int:
             result_status = "SKIP_PHASE_WINDOW"
             phase_for_log = str(os.getenv("FORCE_PB1_PHASE") or "entry")
             main_exit_reason = str(recovery_guard.get("exit_reason") or "phase_guard_skip_late_schedule_no_recovery")
+            if main_exit_reason == "skip_duplicate_am_run" and _resolve_session_kind() == "am":
+                main_exit_reason = "phase_guard_skip_duplicate_am_run"
             _log_main_run_summary(status=result_status, reason=main_exit_reason)
             return 0
         if recovery_guard.get("recovery_used"):
