@@ -5866,6 +5866,18 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 continue
 
             remaining_budget_s = max(0, int((session_end_dt - now).total_seconds()))
+            min_tick_budget_sec = int(os.getenv("PB1_MIN_TICK_BUDGET_SEC", "105"))
+            if remaining_budget_s < min_tick_budget_sec:
+                logger.info(
+                    "[PB1][LOOP] remaining_budget_too_small -> exit without new tick kind=%s remaining=%.0fs min_budget=%s session_end=%s",
+                    session_kind,
+                    remaining_budget_s,
+                    min_tick_budget_sec,
+                    session_end_dt.isoformat(),
+                )
+                logger.info("[PB1][EXIT] reason=session_end")
+                exit_reason = "session_end"
+                break
             grace_sec = _resolve_session_exit_grace_sec()
             base_tick_timeout = max(5, _parse_int_env("PB1_TICK_HARD_TIMEOUT_SEC", 90))
             remaining_to_session_end = max(0, int((session_end_dt - now).total_seconds()))

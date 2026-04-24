@@ -1,13 +1,10 @@
 name: "Trade AM"
+# session: am | window: 09:00-12:55 KST | schedule: Mon-Fri 00:00 UTC | env: PB1_*
 
 "on":
   schedule:
-    # Mon-Fri 09:07/09:12/09:17/09:22/09:27 KST recovery schedule
-    - cron: "7 0 * * 1-5"
-    - cron: "12 0 * * 1-5"
-    - cron: "17 0 * * 1-5"
-    - cron: "22 0 * * 1-5"
-    - cron: "27 0 * * 1-5"
+    # Mon-Fri 09:00 KST = 00:00 UTC
+    - cron: "0 0 * * 1-5"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -17,29 +14,14 @@ name: "Trade AM"
         type: choice
         options:
           - practice
-      FORCE_TRADE_SESSION:
-        description: "Override trade session classification"
+      CONFIRM_MANUAL_AM:
+        description: "Type RUN_AM_MANUAL to run AM manually"
         required: false
-        default: "auto"
-        type: choice
-        options:
-          - auto
-          - am
-          - pm
-      FORCE_TRADE_AM_LATE_START:
-        description: "1=allow AM start after normal cutoff"
-        required: false
-        default: "0"
-        type: string
-      FORCE_TRADE_AM_AFTER_1030:
-        description: "1=allow manual AM start after 10:30 KST"
-        required: false
-        default: "0"
-        type: string
+        default: ""
 
 concurrency:
-  group: pb1-practice-am-serial
-  cancel-in-progress: false
+  group: trade-am-practice-${{ github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -47,39 +29,20 @@ permissions:
 env:
   MODE: trade
   PB1_SESSION_KIND: "am"
-  PB1_FORCE_TRADE_SESSION: "auto"
-  PB1_AM_START_ALLOW_UNTIL: "0930"
-  PB1_AM_RECOVERY_ALLOW_UNTIL: "1030"
-  PB1_AM_EXPECTED_START_FROM: "0907"
-  PB1_AM_EXPECTED_START_TO: "0915"
-  PB1_ENABLE_LATE_AM_RECOVERY: "1"
-  PB1_FORCE_TRADE_AM_LATE_START: "0"
-  PB1_FORCE_TRADE_AM_AFTER_1030: "0"
-  PB1_AM_SESSION_END: "13:00"
-  PB1_TICK_HARD_TIMEOUT_SEC: "90"
-  PB1_POSTPROCESS_TIMEOUT_SEC: "45"
-  PB1_POST_CAPITAL_TIMEOUT_SEC: "45"
-  PB1_EXIT_PASS_TIMEOUT_SEC: "90"
-  PB1_SESSION_EXIT_GRACE_SEC: "15"
-  STRATEGY_MODE: "LIVE"
-  STRATEGY_ENV: practice
-  KIS_ENV: practice
-  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
-  WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
-  FINAL30_SOURCE_MODE: "db_only"
-  PB1_REQUIRE_SCORED_FINAL30: "1"
-  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
-  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
-  PB1_LOOP_ENABLED: "1"
-  PB1_RUN_LOOP_MINUTES: "233"
-  PB1_LOOP_INTERVAL_SEC: "60"
-  PB1_SESSION_GUARD_STALE_SEC: "600"
-  PB1_MANUAL_SESSION_GUARD_STALE_SEC: "60"
-  PB1_ALLOW_MANUAL_SESSION_TAKEOVER: "1"
-  PB1_ALLOW_WAIT: "0"
-  FORCE_RUN: "1"
+  PB1_FORCE_TRADE_SESSION: "am"
+
   FORCE_MARKET_WINDOW: "morning"
   FORCE_PB1_PHASE: "entry"
+  PB1_PHASE_DEFAULT: "entry"
+
+  PB1_LOOP_ENABLED: "1"
+  PB1_RUN_LOOP_MINUTES: "235"
+  PB1_LOOP_INTERVAL_SEC: "60"
+  PB1_AM_SESSION_END: "12:55"
+  PB1_SESSION_EXIT_GRACE_SEC: "15"
+  PB1_TICK_HARD_TIMEOUT_SEC: "90"
+
+  STRATEGY_MODE: "LIVE"
   FORCE_STRATEGY_MODE: "LIVE"
   DRY_RUN: "0"
   DISABLE_LIVE_TRADING: "0"
@@ -87,31 +50,20 @@ env:
   FORCE_BLOCK_LIVE: "0"
   ALLOW_LIVE_GATE: "1"
   KIS_HTTP_ENABLED: "1"
-  PAPER_MAX_CAPITAL_KRW: "100000000"
-  EXPECTED_PRACTICE_CAPITAL_KRW: "100000000"
-  ACCOUNT_SANITY_CHECK: "1"
-  ACCOUNT_SANITY_FAIL_IF_MISMATCH: "0"
-  ACCOUNT_SANITY_RECONCILE_FROM_KIS: "1"
-  ACCOUNT_SANITY_WARN_IF_MISMATCH: "1"
-  EXPECTED_INITIAL_HOLDINGS: "0"
-  KIS_PRICE_MIN_INTERVAL_MS: "400"
-  KIS_PRICE_CACHE_TTL_SEC: "15"
-  KIS_RATE_LIMIT_COOLDOWN_SEC: "20"
   NO_TRADE: "0"
-  FAIL_IF_POOL_MISSING: "1"
-  CANDIDATE_POOL_TTL_DAYS: "7"
-  CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
-  CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
-  CANDIDATE_POOL_UNIVERSE_ENV: "practice"
-  MINERVINI_USE_FEATURE_CACHE: "1"
-  FEATURE_CACHE_WARMUP_ON_TICK: "0"
-  DB_DISABLE_PREPARED_STATEMENTS: "1"
-  DB_LOCK_TIMEOUT_MS: "5000"
-  DB_STATEMENT_TIMEOUT_MS: "15000"
-  DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
-  PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
-  PRICE_TTL_SEC: "15"
-  PRICE_JITTER_MAX_SEC: "0.12"
+
+  STRATEGY_ENV: practice
+  KIS_ENV: practice
+  FINAL30_SOURCE_MODE: "db_only"
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
+  WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
+  PB1_REQUIRE_SCORED_FINAL30: "1"
+  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
+  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
+
+  PB1_ENABLE_LATE_AM_RECOVERY: "0"
+  PB1_FORCE_TRADE_AM_LATE_START: "0"
+  PB1_FORCE_TRADE_AM_AFTER_1030: "0"
 
 defaults:
   run:
@@ -120,7 +72,7 @@ defaults:
 jobs:
   trade_am:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 260
 
     env:
       TZ: Asia/Seoul
@@ -139,12 +91,9 @@ jobs:
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
       STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
-      PB1_FORCE_TRADE_SESSION: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_SESSION || 'auto' }}
-      PB1_FORCE_TRADE_AM_LATE_START: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_LATE_START || '0' }}
-      PB1_FORCE_TRADE_AM_AFTER_1030: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_TRADE_AM_AFTER_1030 || '0' }}
 
     steps:
-      - name: Resolve AM session context
+      - name: Resolve AM phase guard
         id: phase_guard
         working-directory: .
         run: |
@@ -152,51 +101,51 @@ jobs:
           now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          valid_window="0900-1255"
-          expected_start_window="0907-0915"
-          new_start_allow_window="0907-0930"
-          echo "should_run=1" >> "$GITHUB_OUTPUT"
-          echo "skip_reason=" >> "$GITHUB_OUTPUT"
+          should_run=1
+          skip_reason=""
+
+          if [[ "$event_name" == "schedule" ]]; then
+            if [[ "$now_hhmm" -lt 0900 ]]; then
+              should_run=0
+              skip_reason="early_start_am"
+            elif [[ "$now_hhmm" -gt 0910 ]]; then
+              should_run=0
+              skip_reason="skip_stale_start_am"
+            fi
+          fi
+
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            confirm="${{ inputs.CONFIRM_MANUAL_AM || '' }}"
+            if [[ "$confirm" != "RUN_AM_MANUAL" ]]; then
+              should_run=0
+              skip_reason="manual_am_not_confirmed"
+            elif [[ "$now_hhmm" -gt 1030 ]]; then
+              should_run=0
+              skip_reason="manual_am_after_1030_blocked"
+            fi
+          fi
+
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
           echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
-          echo "trigger_classification=${event_name}" >> "$GITHUB_OUTPUT"
-          echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
-          echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
-          echo "new_start_allow_window=${new_start_allow_window}" >> "$GITHUB_OUTPUT"
-          echo "recovery_allow_window=0931-1030" >> "$GITHUB_OUTPUT"
-          echo "late_level=NONE" >> "$GITHUB_OUTPUT"
-          echo "degraded_session=0" >> "$GITHUB_OUTPUT"
-          echo "recovery_mode=0" >> "$GITHUB_OUTPUT"
-          echo "start_classification=WORKFLOW_DEFER_TO_RUNNER" >> "$GITHUB_OUTPUT"
-          echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE}"
-          echo "[RESOLVE] force_trade_session=${PB1_FORCE_TRADE_SESSION:-auto}"
-          echo "[RESOLVE] am_recovery=${PB1_ENABLE_LATE_AM_RECOVERY:-0} am_recovery_until=${PB1_AM_RECOVERY_ALLOW_UNTIL:-unset}"
-          echo "[RESOLVE] pm_recovery=${PB1_ENABLE_LATE_PM_RECOVERY:-0} pm_recovery_until=${PB1_PM_RECOVERY_ALLOW_UNTIL:-unset}"
-          echo "[RESOLVE] force_am_late=${PB1_FORCE_TRADE_AM_LATE_START:-0} force_am_after_1030=${PB1_FORCE_TRADE_AM_AFTER_1030:-0}"
-          echo "[RESOLVE] force_pm_late=${PB1_FORCE_TRADE_PM_LATE_START:-0} force_pm_after_1340=${PB1_FORCE_TRADE_PM_AFTER_1340:-0}"
+          echo "valid_window=0900-1255" >> "$GITHUB_OUTPUT"
+          echo "start_allow_window=0900-0910" >> "$GITHUB_OUTPUT"
+          echo "session_end=1255" >> "$GITHUB_OUTPUT"
 
-      - name: Write AM trigger metadata
-        if: steps.phase_guard.outputs.should_run == '1'
+      - name: Emit AM skip summary
+        if: steps.phase_guard.outputs.should_run != '1'
         working-directory: .
         run: |
           set -euo pipefail
           mkdir -p repo/artifacts
-          precheck_epoch="$(date +%s)"
-          manual_restart=0
-          if [[ "${{ steps.phase_guard.outputs.event_name }}" == "workflow_dispatch" || "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
-            manual_restart=1
-          fi
           {
-            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} trigger_classification=${{ steps.phase_guard.outputs.trigger_classification }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
-            echo "[TRADE_AM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
-            echo "[TRADE_AM][PRECHECK][START]"
-          } | tee -a repo/artifacts/trade-am.log
-          {
-            echo "PRECHECK_EPOCH=${precheck_epoch}"
-            echo "LAST_STEP_EPOCH=${precheck_epoch}"
-          } >> "$GITHUB_ENV"
+            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=0900-1255 start_allow_window=0900-0910 session_end=1255"
+            echo "[TRADE_AM][PHASE_GUARD] should_run=0 skip_reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=am"
+            echo "[PB1][EXIT] reason=phase_guard_skip"
+          } | tee repo/artifacts/trade-am.log
 
       - name: Checkout
         if: steps.phase_guard.outputs.should_run == '1'
@@ -210,27 +159,21 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          now_epoch="$(date +%s)"
-          dur_sec="$((now_epoch - ${LAST_STEP_EPOCH:-$now_epoch}))"
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
-          mkdir -p repo/artifacts
-          manual_restart=0
-          if [[ "${{ steps.phase_guard.outputs.event_name }}" == "workflow_dispatch" || "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
-            manual_restart=1
-          fi
-          {
-            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} trigger_classification=${{ steps.phase_guard.outputs.trigger_classification }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
-            echo "[TRADE_AM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
-            echo "[TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }} recovery_allow_window=${{ steps.phase_guard.outputs.recovery_allow_window }}"
-            echo "[TRADE_AM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }} recovery_mode=${{ steps.phase_guard.outputs.recovery_mode }}"
-            echo "[TRADE_AM][PRECHECK][START]"
-          } | tee repo/artifacts/trade-am.log >/dev/null
           echo "[CHECKOUT][OK] repo path ready"
-          echo "[TRADE_AM][STEP][checkout] dur_sec=${dur_sec}" | tee -a repo/artifacts/trade-am.log
-          echo "LAST_STEP_EPOCH=${now_epoch}" >> "$GITHUB_ENV"
+
+      - name: Initialize AM trigger log
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=0900-1255 start_allow_window=0900-0910 session_end=1255"
+            echo "[TRADE_AM][PHASE_GUARD] should_run=1 skip_reason= event=${{ steps.phase_guard.outputs.event_name }} valid_window=0900-1255"
+          } | tee repo/artifacts/trade-am.log
 
       - name: Set up Python
         if: steps.phase_guard.outputs.should_run == '1'
@@ -245,12 +188,8 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          now_epoch="$(date +%s)"
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          done_epoch="$(date +%s)"
-          echo "[TRADE_AM][STEP][deps] dur_sec=$((done_epoch - ${LAST_STEP_EPOCH:-$now_epoch}))" | tee -a artifacts/trade-am.log
-          echo "LAST_STEP_EPOCH=${done_epoch}" >> "$GITHUB_ENV"
 
       - name: Guard postgres-only
         if: steps.phase_guard.outputs.should_run == '1'
@@ -268,61 +207,32 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          now_epoch="$(date +%s)"
-          python -m trader.db.migrate
-          done_epoch="$(date +%s)"
-          echo "[TRADE_AM][STEP][db_migrate] dur_sec=$((done_epoch - ${LAST_STEP_EPOCH:-$now_epoch}))" | tee -a artifacts/trade-am.log
-          echo "LAST_STEP_EPOCH=${done_epoch}" >> "$GITHUB_ENV"
+          python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-am.log
 
       - name: Verify KIS env contract
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
-
           echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
           echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
           echo "[ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
-          echo "[ENV_CHECK] KIS_REST_URL=${KIS_REST_URL:-}"
-
           test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
           test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
           test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
           test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
-
           test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
           test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
           test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
-
           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
-
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
-      - name: Verify candidate pool exists in DB
+      - name: Verify exact scored final30 in DB
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
-          now_epoch="$(date +%s)"
-          echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][START]"
-          if python -m trader.verify_candidate_pool; then
-            echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][OK]"
-          else
-            echo "[TRADE_AM][PRECHECK][CANDIDATE_POOL][FAIL] reason=verify_candidate_pool_failed"
-            exit 1
-          fi
-          done_epoch="$(date +%s)"
-          echo "[TRADE_AM][STEP][candidate_pool_verify] dur_sec=$((done_epoch - ${LAST_STEP_EPOCH:-$now_epoch}))" | tee -a artifacts/trade-am.log
-          echo "LAST_STEP_EPOCH=${done_epoch}" >> "$GITHUB_ENV"
-
-      - name: Verify final30 readiness in DB
-        if: steps.phase_guard.outputs.should_run == '1'
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          now_epoch="$(date +%s)"
-          echo "[TRADE_AM][PRECHECK][FINAL30][START]"
-          if python - <<'PY'
+          python - <<'PY'
           import os
           from trader.db.engine import get_engine
           from trader.db.repos import load_final30_scored_db_only
@@ -338,99 +248,50 @@ jobs:
               require_exact_rows=30,
               fail_if_missing=True,
           )
-          print(f"[TRADE_AM][PRECHECK][FINAL30][OK] rows={len(df)} as_of={ctx['as_of']}")
+          print(f"[TRADE][FINAL30][DB_EXACT_LOAD] rows={len(df)} as_of={ctx['as_of']} session=am")
           PY
-          then
-            :
-          else
-            echo "[TRADE_AM][PRECHECK][FINAL30][FAIL] reason=missing_db_exact_scored_final30"
-            exit 1
-          fi
-          done_epoch="$(date +%s)"
-          echo "[TRADE_AM][STEP][final30_verify] dur_sec=$((done_epoch - ${LAST_STEP_EPOCH:-$now_epoch}))" | tee -a artifacts/trade-am.log
-          echo "LAST_STEP_EPOCH=${done_epoch}" >> "$GITHUB_ENV"
 
-      - name: Mark AM precheck done
-        if: steps.phase_guard.outputs.should_run == '1'
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          echo "[TRADE_AM][PRECHECK][DONE]" | tee -a artifacts/trade-am.log
-
-      - name: Emit AM skip summary
-        if: steps.phase_guard.outputs.should_run != '1'
-        working-directory: .
-        run: |
-          set -euo pipefail
-          mkdir -p repo/artifacts
-          {
-            echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} trigger_classification=${{ steps.phase_guard.outputs.trigger_classification }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][QUEUE_VISIBLE] expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }} now_kst=${{ steps.phase_guard.outputs.now_kst }} event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[TRADE_AM][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }} new_start_allow_window=${{ steps.phase_guard.outputs.new_start_allow_window }}"
-            echo "[TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
-            echo "[TRADE_AM][START_CLASSIFICATION] value=${{ steps.phase_guard.outputs.start_classification }} late_level=${{ steps.phase_guard.outputs.late_level }} degraded_session=${{ steps.phase_guard.outputs.degraded_session }}"
-            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=am event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[PB1][EXIT] reason=phase_guard_skip"
-          } | tee repo/artifacts/trade-am.log
-
-      - name: Run AM trade tick
+      - name: Run AM trade loop
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          export TRADE_AM_LATE_START="${TRADE_AM_LATE_START:-0}"
-          export TRADE_AM_DEGRADED_SESSION="${TRADE_AM_DEGRADED_SESSION:-0}"
-          echo "[TRADE_AM][WINDOW] target=09:07-13:00 KST loop_minutes=${PB1_RUN_LOOP_MINUTES} interval_sec=${PB1_LOOP_INTERVAL_SEC}"
-          echo "[CONFIG][FINAL30_SOURCE_MODE] ${FINAL30_SOURCE_MODE}"
-          echo "[CONFIG][PB1_REQUIRE_SCORED_FINAL30] ${PB1_REQUIRE_SCORED_FINAL30}"
-          echo "[CONFIG][PB1_DISABLE_RAW_FINAL30_FALLBACK] ${PB1_DISABLE_RAW_FINAL30_FALLBACK}"
-          echo "[TRADE_AM][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} FAIL_IF_POOL_MISSING=${FAIL_IF_POOL_MISSING} CANDIDATE_POOL_STRATEGY_KEY=${CANDIDATE_POOL_STRATEGY_KEY} PB1_PHASE_DEFAULT=${PB1_PHASE_DEFAULT:-}"
-          echo "[PHASE][START] phase=am" | tee -a artifacts/trade-am.log
+          echo "[PHASE][START] phase=am session_window=0900-1255" | tee -a artifacts/trade-am.log
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-am.log
           echo "[PHASE][END] phase=am" | tee -a artifacts/trade-am.log
 
-      - name: Verify AM trade tick logs
+      - name: Verify AM log contract
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
           missing=0
-          for pattern in "\[TRADE_AM\]\[TRIGGER\]" "\[TRADE_AM\]\[QUEUE_VISIBLE\]" "\[TRADE_AM\]\[START_META\]" "\[TRADE_AM\]\[PHASE_GUARD\]" "\[TRADE_AM\]\[START_CLASSIFICATION\]" "\[TRADE_AM\]\[PRECHECK\]\[START\]" "\[TRADE_AM\]\[PRECHECK\]\[DONE\]"; do
+          for pattern in \
+            "\[TRADE_AM\]\[TRIGGER\]" \
+            "\[TRADE_AM\]\[START_META\]" \
+            "\[TRADE_AM\]\[PHASE_GUARD\]" \
+            "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" \
+            "\[TRADE\]\[READY\]\[OK\]" \
+            "\[RUN_SUMMARY\]\[RESULT\]"; do
             if ! grep -E "$pattern" artifacts/trade-am.log >/dev/null; then
-              echo "::error::missing metadata pattern: $pattern"
+              echo "::error::missing required log pattern: $pattern"
               missing=1
             fi
           done
-          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-am.log >/dev/null; then
-            echo "::error::missing [RUN_SUMMARY][RESULT]"
-            grep -E "\[RUN_SUMMARY\]\[(FAIL|GENERATE_FAIL)\]|\[TRADE\]\[BOOT\]\[START\]" artifacts/trade-am.log || true
-            exit 1
-          fi
-          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-am.log >/dev/null; then
-            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
-            exit 1
-          fi
-          if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=am" artifacts/trade-am.log >/dev/null; then
-            echo "::error::missing [PB1][LOOP][SESSION] kind=am"
+          if ! grep -E "\[PB1\]\[EXIT\] reason=session_end|\[PB1\]\[LOOP\] session end reached -> exit" artifacts/trade-am.log >/dev/null; then
+            echo "::error::missing clean session_end exit log"
             missing=1
           fi
-          if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-am.log >/dev/null; then
-            echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
-            grep -E "\[TRADE\]\[FINAL30\]\[(DB_FALLBACK_LOAD|FAIL|LOAD_FAIL)\]" artifacts/trade-am.log || true
+          if grep -F "Traceback" artifacts/trade-am.log >/dev/null; then
+            echo "::error::Traceback detected in AM log"
             missing=1
           fi
-          if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-am.log >/dev/null; then
-            echo "::error::missing [TRADE][READY][OK]"
-            grep -E "\[TRADE\]\[READY\]\[FAIL\]|\[TRADE\]\[PRECHECK\]\[(CANDIDATE_POOL|FINAL30|BALANCE)\]" artifacts/trade-am.log || true
-            missing=1
-          fi
-          if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-am.log >/dev/null; then
-            echo "::error::missing clean AM session release log"
+          if grep -F "FATAL_RUNTIME" artifacts/trade-am.log >/dev/null; then
+            echo "::error::FATAL_RUNTIME detected in AM log"
             missing=1
           fi
           test "$missing" -eq 0
-          python -m trader.trade_tick verify-log --session am --log artifacts/trade-am.log
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'

@@ -690,6 +690,361 @@ def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: f
     return max(safe_entry_price, float(post_entry_high)), int(len(post_entry_bars))
 
 
+# ============================================================
+# Trade Horizon Classification & Exit Policy Router
+# ============================================================
+
+def _classify_trade_horizon(features: dict[str, Any]) -> str:
+    """매수 후보의 특성으로 trade_horizon을 결정한다.
+
+    Returns: "DAY_PROTECT" | "SWING_CARRY" | "CORE_CARRY"
+    """
+    entry_style = str(
+        features.get("entry_style_selected") or features.get("entry_reason") or ""
+    ).upper()
+    score_final = float(features.get("score_final") or features.get("score") or 0)
+    atr_pct = float(features.get("atr_pct") or 0)
+    breakout = bool(features.get("breakout_signal") or features.get("pivot_breakout"))
+    vcp_score = float(features.get("vcp_score") or 0)
+    trend_ok = bool(features.get("trend_template_ok") or features.get("minervini_ok"))
+
+    # 1. 당일 보호형
+    if entry_style in {"ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_OPEN_PUSH"}:
+        return "DAY_PROTECT"
+    if breakout and atr_pct >= 5.0:
+        return "DAY_PROTECT"
+
+    # 2. 핵심 중기형 (스윙보다 먼저 체크)
+    if score_final >= 85 and trend_ok and atr_pct <= 4.0:
+        return "CORE_CARRY"
+
+    # 3. 스윙형
+    if entry_style in {"ENTRY_PULLBACK", "ENTRY_VCP", "ENTRY_MINERVINI"}:
+        return "SWING_CARRY"
+    if trend_ok and vcp_score >= 45:
+        return "SWING_CARRY"
+
+    return "SWING_CARRY"
+
+
+def _horizon_to_exit_family(horizon: str) -> str:
+    return {
+        "DAY_PROTECT": "INTRADAY_PROFIT_PROTECT",
+        "SWING_CARRY": "SWING_STAGED_EXIT",
+        "CORE_CARRY": "CORE_TREND_FOLLOW",
+    }.get(horizon, "SWING_STAGED_EXIT")
+
+
+def _resolve_position_horizon(pos: dict[str, Any], now_kst_date: Any | None = None) -> str:
+    """포지션 dict에서 trade_horizon을 결정한다.
+
+    우선순위:
+    1. position_meta.trade_horizon
+    2. entry_meta_json.trade_horizon
+    3. entry_date == today -> DAY_PROTECT
+    4. SWING_CARRY
+    """
+    meta = pos.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    horizon = str(meta.get("trade_horizon") or "").strip()
+    if horizon in {"DAY_PROTECT", "SWING_CARRY", "CORE_CARRY"}:
+        return horizon
+
+    entry_meta = pos.get("entry_meta_json") or {}
+    if isinstance(entry_meta, str):
+        try:
+            import json as _json
+            entry_meta = _json.loads(entry_meta)
+        except Exception:
+            entry_meta = {}
+    horizon = str(entry_meta.get("trade_horizon") or "").strip()
+    if horizon in {"DAY_PROTECT", "SWING_CARRY", "CORE_CARRY"}:
+        return horizon
+
+    # entry_date 기반 fallback
+    if now_kst_date is not None:
+        entry_date_raw = pos.get("entry_date") or pos.get("last_fill_at") or pos.get("entry_ts")
+        if entry_date_raw:
+            try:
+                entry_d = pd.Timestamp(entry_date_raw).date()
+                if entry_d == now_kst_date:
+                    return "DAY_PROTECT"
+            except Exception:
+                pass
+
+    return "SWING_CARRY"
+
+
+def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | None) -> int:
+    """exit 수량을 계산한다.
+
+    sell_pct=None -> 전량 매도
+    """
+    orderable = max(0, int(orderable_qty or 0))
+    if sell_pct is None:
+        return orderable
+    qty = int(orderable * float(sell_pct))
+    if qty < 1 and orderable > 0:
+        qty = 1
+    return min(qty, orderable)
+
+
+def _resolve_day_protect_exit(
+    pos: dict[str, Any],
+    mark: float,
+    now_hhmm: int,
+    *,
+    ret_pct: float,
+    max_pnl_pct: float,
+    stop_hit: bool,
+) -> dict[str, Any]:
+    """DAY_PROTECT 당일 수익 보호 매도 정책."""
+    import os as _os
+    enabled = _os.getenv("PB1_DAY_PROTECT_ENABLED", "1") == "1"
+    if not enabled:
+        return {"exit_ok": False, "reason": "DAY_PROTECT_DISABLED"}
+
+    stop_loss_pct = float(_os.getenv("PB1_DAY_STOP_LOSS_PCT", "2.0"))
+    profit_arm_pct = float(_os.getenv("PB1_DAY_PROFIT_ARM_PCT", "1.5"))
+    breakeven_pct = float(_os.getenv("PB1_DAY_BREAKEVEN_PROTECT_PCT", "0.2"))
+    trail_arm_pct = float(_os.getenv("PB1_DAY_TRAIL_ARM_PCT", "2.0"))
+    trail_drop_pct = float(_os.getenv("PB1_DAY_TRAIL_DROP_PCT", "1.0"))
+    take_profit_pct = float(_os.getenv("PB1_DAY_TAKE_PROFIT_PCT", "4.0"))
+    take_profit_sell = float(_os.getenv("PB1_DAY_TAKE_PROFIT_SELL_PCT", "0.50"))
+    close_protect_hhmm = int(_os.getenv("PB1_DAY_CLOSE_PROTECT_TIME", "15:05").replace(":", ""))
+    force_exit_hhmm = int(_os.getenv("PB1_DAY_FORCE_EXIT_TIME", "15:20").replace(":", ""))
+
+    meta = pos.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    tp1_done = bool(meta.get("tp1_done", False))
+    orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
+    drawdown_from_high = max_pnl_pct - ret_pct
+
+    # 1. 하드 손절
+    if stop_hit or ret_pct <= -stop_loss_pct:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_DAY_STOP_LOSS", "qty": qty, "sell_pct": None}
+
+    # 2. 15:20 강제 청산
+    if now_hhmm >= force_exit_hhmm:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_DAY_FORCE_CLOSE", "qty": qty, "sell_pct": None}
+
+    # 3. 장마감 손실 축소 (15:05 이후, 손실)
+    if now_hhmm >= close_protect_hhmm and ret_pct <= -1.0:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_DAY_CLOSE_LOSS_CUT", "qty": qty, "sell_pct": None}
+
+    # 4. 장마감 수익 보호 (15:05 이후, 수익)
+    if now_hhmm >= close_protect_hhmm and ret_pct > 0:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_DAY_CLOSE_PROFIT_PROTECT", "qty": qty, "sell_pct": None}
+
+    # 5. 본전 보호 (수익 발생 후 돌아옴)
+    if max_pnl_pct >= profit_arm_pct and ret_pct <= breakeven_pct:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_DAY_BREAKEVEN_PROTECT", "qty": qty, "sell_pct": None}
+
+    # 6. 고점 대비 하락 보호
+    if max_pnl_pct >= trail_arm_pct and drawdown_from_high >= trail_drop_pct:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_DAY_TRAIL_PROTECT", "qty": qty, "sell_pct": None}
+
+    # 7. 당일 목표 수익 부분익절
+    if ret_pct >= take_profit_pct and not tp1_done:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, take_profit_sell)
+        return {
+            "exit_ok": True,
+            "reason": "EXIT_DAY_TAKE_PROFIT_50",
+            "qty": qty,
+            "sell_pct": take_profit_sell,
+            "update_meta": {"tp1_done": True},
+        }
+
+    return {"exit_ok": False, "reason": "DAY_HOLD_PROFIT_OK"}
+
+
+def _resolve_swing_staged_exit(
+    pos: dict[str, Any],
+    mark: float,
+    ma20: float | None,
+    *,
+    ret_pct: float,
+    days_held: int,
+    stop_hit: bool,
+) -> dict[str, Any]:
+    """SWING_CARRY R-multiple 단계별 매도 정책."""
+    import os as _os
+    enabled = _os.getenv("PB1_SWING_STAGED_EXIT_ENABLED", "1") == "1"
+    if not enabled:
+        return {"exit_ok": False, "reason": "SWING_STAGED_EXIT_DISABLED"}
+
+    tp1_r = float(_os.getenv("PB1_SWING_TP1_R", "2.0"))
+    tp1_sell_pct = float(_os.getenv("PB1_SWING_TP1_SELL_PCT", "0.33"))
+    tp2_r = float(_os.getenv("PB1_SWING_TP2_R", "3.0"))
+    tp2_sell_pct = float(_os.getenv("PB1_SWING_TP2_SELL_PCT", "0.33"))
+    breakeven_after_r = float(_os.getenv("PB1_SWING_MOVE_STOP_TO_BREAKEVEN_AFTER_R", "1.5"))
+    time_stop_days = int(_os.getenv("PB1_SWING_TIME_STOP_DAYS", "10"))
+
+    meta = pos.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    tp1_done = bool(meta.get("tp1_done", False))
+    tp2_done = bool(meta.get("tp2_done", False))
+
+    avg = float(pos.get("avg_buy_price") or pos.get("avg") or pos.get("entry_price") or 0.0)
+    initial_stop = float(
+        meta.get("initial_stop_price")
+        or pos.get("stop_price_at_entry")
+        or pos.get("stop_price")
+        or pos.get("initial_stop")
+        or 0.0
+    )
+    orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
+
+    # R 계산
+    risk_per_share = avg - initial_stop if avg > initial_stop > 0 else 0.0
+    current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
+    max_r = float(meta.get("max_r_since_entry") or 0.0)
+
+    # 1. 초기 손절
+    if stop_hit or (initial_stop > 0 and mark <= initial_stop):
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_SWING_INITIAL_STOP", "qty": qty, "sell_pct": None}
+
+    # 2. TP1 (중복 방지)
+    if current_r >= tp1_r and not tp1_done:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp1_sell_pct)
+        new_stop = max(float(meta.get("current_stop_price") or initial_stop or avg), avg)
+        return {
+            "exit_ok": True,
+            "reason": "EXIT_SWING_TP1",
+            "qty": qty,
+            "sell_pct": tp1_sell_pct,
+            "update_meta": {
+                "tp1_done": True,
+                "tp1_price": mark,
+                "tp1_qty": qty,
+                "current_stop_price": new_stop,
+                "runner_qty": orderable_qty - qty,
+            },
+        }
+
+    # 3. TP2 (중복 방지)
+    if current_r >= tp2_r and not tp2_done:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp2_sell_pct)
+        return {
+            "exit_ok": True,
+            "reason": "EXIT_SWING_TP2",
+            "qty": qty,
+            "sell_pct": tp2_sell_pct,
+            "update_meta": {
+                "tp2_done": True,
+                "tp2_price": mark,
+                "tp2_qty": qty,
+                "runner_qty": orderable_qty - qty,
+                "trail_policy": "MA20_RUNNER",
+            },
+        }
+
+    # 4. Runner MA20 이탈 (TP1 이후)
+    if tp1_done and ma20 is not None and mark < ma20:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_SWING_RUNNER_MA20_BREAK", "qty": qty, "sell_pct": None}
+
+    # 5. time stop
+    if days_held >= time_stop_days and current_r < 1.0:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_SWING_TIME_STOP", "qty": qty, "sell_pct": None}
+
+    return {"exit_ok": False, "reason": "SWING_HOLD_TREND_OK"}
+
+
+def _resolve_core_trend_follow_exit(
+    pos: dict[str, Any],
+    mark: float,
+    ma20: float | None,
+    ma50: float | None,
+    *,
+    ret_pct: float,
+    days_held: int,
+    regime: str,
+) -> dict[str, Any]:
+    """CORE_CARRY 중기 추세 보유 정책."""
+    import os as _os
+    enabled = _os.getenv("PB1_CORE_EXIT_ENABLED", "1") == "1"
+    if not enabled:
+        return {"exit_ok": False, "reason": "CORE_EXIT_DISABLED"}
+
+    hard_stop_pct = float(_os.getenv("PB1_CORE_HARD_STOP_PCT", "8.0"))
+    tp1_r = float(_os.getenv("PB1_CORE_TP1_R", "3.0"))
+    tp1_sell_pct = float(_os.getenv("PB1_CORE_TP1_SELL_PCT", "0.25"))
+    time_stop_days = int(_os.getenv("PB1_CORE_TIME_STOP_DAYS", "20"))
+
+    meta = pos.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    core_tp1_done = bool(meta.get("core_tp1_done") or meta.get("tp1_done", False))
+
+    avg = float(pos.get("avg_buy_price") or pos.get("avg") or pos.get("entry_price") or 0.0)
+    initial_stop = float(
+        meta.get("initial_stop_price")
+        or pos.get("stop_price_at_entry")
+        or pos.get("stop_price")
+        or 0.0
+    )
+    orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
+    risk_per_share = avg - initial_stop if avg > initial_stop > 0 else 0.0
+    current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
+
+    # 1. hard stop
+    if ret_pct <= -hard_stop_pct:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_CORE_HARD_STOP", "qty": qty, "sell_pct": None}
+
+    # 2. core TP1 (25% 부분익절)
+    if current_r >= tp1_r and not core_tp1_done:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp1_sell_pct)
+        return {
+            "exit_ok": True,
+            "reason": "EXIT_CORE_TP1",
+            "qty": qty,
+            "sell_pct": tp1_sell_pct,
+            "update_meta": {"core_tp1_done": True, "tp1_done": True, "tp1_price": mark, "tp1_qty": qty},
+        }
+
+    # 3. risk-off: bear + MA20 & MA50 동시 이탈 (MA50 단순 이탈보다 우선)
+    bear_regime = str(regime or "").upper() in {"BEAR", "DOWNTREND", "RISK_OFF"}
+    if bear_regime and ma20 is not None and ma50 is not None and mark < ma20 and mark < ma50:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_CORE_RISK_OFF", "qty": qty, "sell_pct": None}
+
+    # 4. MA50 이탈
+    if ma50 is not None and mark < ma50:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        return {"exit_ok": True, "reason": "EXIT_CORE_MA50_BREAK", "qty": qty, "sell_pct": None}
+
+    return {"exit_ok": False, "reason": "CORE_HOLD_TREND_OK"}
+
+
 def _resolve_exit_policy(
     *,
     days_held: int,
@@ -4124,7 +4479,11 @@ class PB1Engine:
                 "setup_snapshot_json": cf.features.get("setup_snapshot_json") or {},
                 "trigger_snapshot_json": cf.features.get("trigger_snapshot_json") or {},
                 "entry_rule_version": cf.features.get("entry_rule_version") or "pb1_entry_reason_v1",
-                "exit_policy_family": exit_family,
+                "exit_policy_family": _horizon_to_exit_family(
+                    _classify_trade_horizon(dict(cf.features))
+                ),
+                "trade_horizon": _classify_trade_horizon(dict(cf.features)),
+                "initial_stop_price": cf.features.get("stop_price") or cf.features.get("initial_stop"),
                 "entry_reason_source": "candidate_features",
                 "setup_snapshot_missing_fields": missing_reference_fields,
             }
@@ -8039,6 +8398,84 @@ class PB1Engine:
             final_reason,
         )
 
+        # ------------------------------------------------------------------
+        # Horizon-based exit policy routing
+        # INTRADAY_PROFIT_PROTECT / SWING_STAGED_EXIT / CORE_TREND_FOLLOW
+        # ------------------------------------------------------------------
+        trade_horizon = _resolve_position_horizon(pos, now_kst_date=self._now_kst.date())
+        horizon_exit_family = _horizon_to_exit_family(trade_horizon)
+        horizon_result: dict[str, Any] | None = None
+        _now_hhmm = int(self._now_kst.strftime("%H%M"))
+        _max_pnl = float((pos.get("position_meta") or {}).get("max_pnl_pct_since_entry") or 0.0)
+        _max_pnl = max(_max_pnl, ret_pct)
+        regime_str = str(getattr(self, "_regime", None) or "")
+
+        if exit_policy_family in {
+            "INTRADAY_PROFIT_PROTECT",
+            "SWING_STAGED_EXIT",
+            "CORE_TREND_FOLLOW",
+        } or horizon_exit_family in {
+            "INTRADAY_PROFIT_PROTECT",
+            "SWING_STAGED_EXIT",
+            "CORE_TREND_FOLLOW",
+        }:
+            _active_family = exit_policy_family if exit_policy_family in {
+                "INTRADAY_PROFIT_PROTECT", "SWING_STAGED_EXIT", "CORE_TREND_FOLLOW"
+            } else horizon_exit_family
+
+            if _active_family == "INTRADAY_PROFIT_PROTECT":
+                horizon_result = _resolve_day_protect_exit(
+                    pos, float(mark or 0.0), _now_hhmm,
+                    ret_pct=ret_pct,
+                    max_pnl_pct=_max_pnl,
+                    stop_hit=stop_hit,
+                )
+            elif _active_family == "SWING_STAGED_EXIT":
+                horizon_result = _resolve_swing_staged_exit(
+                    pos, float(mark or 0.0), ma20,
+                    ret_pct=ret_pct,
+                    days_held=days_held,
+                    stop_hit=stop_hit,
+                )
+            elif _active_family == "CORE_TREND_FOLLOW":
+                horizon_result = _resolve_core_trend_follow_exit(
+                    pos, float(mark or 0.0), ma20, ma50,
+                    ret_pct=ret_pct,
+                    days_held=days_held,
+                    regime=regime_str,
+                )
+
+            if horizon_result is not None:
+                logger.info(
+                    "[EXIT][HORIZON] code=%s horizon=%s family=%s exit_ok=%s reason=%s qty=%s",
+                    display_code,
+                    trade_horizon,
+                    _active_family,
+                    int(bool(horizon_result.get("exit_ok", False))),
+                    horizon_result.get("reason", ""),
+                    horizon_result.get("qty", 0),
+                )
+                # position_meta 업데이트 (tp1_done 등)
+                _meta_update = horizon_result.get("update_meta") or {}
+                _meta_update["max_pnl_pct_since_entry"] = _max_pnl
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=sid,
+                    mode=mode,
+                    code=code,
+                    fields={"position_meta": {
+                        **(pos.get("position_meta") or {}),
+                        **_meta_update,
+                    }},
+                )
+                # 기존 exit_policy/final_reason 오버라이드
+                if horizon_result.get("exit_ok", False):
+                    stop_hit = stop_hit or (horizon_result.get("reason", "") == "EXIT_DAY_STOP_LOSS")
+                    final_reason = str(horizon_result.get("reason") or final_reason)
+                    ordered_reasons = [final_reason]
+                    exit_policy = {**exit_policy, "exit_ok": True, "final_reason": final_reason}
+
         exit_eval = ExitEvaluation(
             code=code,
             holding_qty=qty,
@@ -10379,6 +10816,38 @@ class PB1Engine:
 
         # ========== ENTRY PASS (EXIT와 완전 독립) ==========
         logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
+
+        # Portfolio full guard: existing_positions >= max_positions이면 신규 매수 scan 불필요
+        if self.phase in {"prep", "entry"} and (existing_positions_count >= max_positions or target_new_positions <= 0):
+            logger.info(
+                "[ENTRY][SKIP_PORTFOLIO_FULL] existing_positions=%s max_positions=%s target_new_positions=%s",
+                existing_positions_count,
+                max_positions,
+                target_new_positions,
+            )
+            _emit_entry_summary([], [], Counter())
+            _emit_entry_decision(
+                "SKIP",
+                reason="PORTFOLIO_FULL",
+                ok_setups=0,
+                blocked_by=_normalize_entry_block_reasons(["portfolio_full"]),
+            )
+            _set_run_summary_payload(
+                scanned=0,
+                setup_ok=0,
+                relax_ok=0,
+                score_ok=0,
+                risk_ok=0,
+                sized_ok=0,
+                buyable_ok=0,
+                order_candidates=0,
+                submitted=0,
+                blocked_reasons_counter=Counter({"PORTFOLIO_FULL": 1}),
+                no_trade_reason="PORTFOLIO_FULL",
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="OK_NO_TRADE", notes="PORTFOLIO_FULL")
+
         entry_pass_ok = True
         entry_pass_buys = 0
         entry_pass_skipped = 0

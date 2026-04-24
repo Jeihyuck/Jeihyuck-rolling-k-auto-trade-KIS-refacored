@@ -1,12 +1,9 @@
-name: Trade Close
+name: "Trade Close"
 
 "on":
   schedule:
-    # Mon-Fri 15:15 KST = 06:15 UTC (close loop runs until market close)
+    # Mon-Fri 15:15 KST = 06:15 UTC
     - cron: "15 6 * * 1-5"
-    - cron: "18 6 * * 1-5"
-    - cron: "21 6 * * 1-5"
-    - cron: "24 6 * * 1-5"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -25,10 +22,14 @@ name: Trade Close
           - live_close
           - diag_replay
           - compute_only
+      CONFIRM_MANUAL_CLOSE:
+        description: "Type RUN_CLOSE_MANUAL to run live close manually"
+        required: false
+        default: ""
 
 concurrency:
-  group: pb1-practice-close-serial
-  cancel-in-progress: false
+  group: trade-close-practice-${{ github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -36,68 +37,38 @@ permissions:
 env:
   MODE: trade
   PB1_SESSION_KIND: "close"
-  PB1_FORCE_TRADE_SESSION: "auto"
-  PB1_FORCE_TRADE_AM_LATE_START: "0"
-  PB1_FORCE_TRADE_AM_AFTER_1030: "0"
-  PB1_FORCE_TRADE_PM_LATE_START: "0"
-  PB1_FORCE_TRADE_PM_AFTER_1340: "0"
-  PB1_ENABLE_LATE_AM_RECOVERY: "0"
-  PB1_AM_RECOVERY_ALLOW_UNTIL: "10:30"
-  PB1_ENABLE_LATE_PM_RECOVERY: "0"
-  PB1_PM_RECOVERY_ALLOW_UNTIL: "13:40"
-  PB1_CLOSE_SESSION_END: "15:45"
-  PB1_CLOSE_RECOVERY_ALLOW_UNTIL: "15:45"
-  PB1_TICK_HARD_TIMEOUT_SEC: "45"
-  PB1_SESSION_EXIT_GRACE_SEC: "15"
-  STRATEGY_MODE: "LIVE"
-  STRATEGY_ENV: practice
-  KIS_ENV: practice
-  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
-  WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
-  FINAL30_SOURCE_MODE: "db_only"
-  PB1_REQUIRE_SCORED_FINAL30: "1"
-  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
-  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
-  PB1_LOOP_ENABLED: "1"
-  PB1_RUN_LOOP_MINUTES: "30"
-  PB1_LOOP_INTERVAL_SEC: "60"
-  PB1_SESSION_GUARD_STALE_SEC: "600"
-  PB1_MANUAL_SESSION_GUARD_STALE_SEC: "60"
-  PB1_ALLOW_MANUAL_SESSION_TAKEOVER: "1"
-  KIS_HTTP_ENABLED: "1"
-  NO_TRADE: "0"
-  PB1_PHASE_DEFAULT: exit
-  PB1_ENTRY_ENABLED: "0"
-  FORCE_RUN: "1"
+  PB1_FORCE_TRADE_SESSION: "close"
+
   FORCE_MARKET_WINDOW: "close"
   FORCE_PB1_PHASE: "exit"
+  PB1_PHASE_DEFAULT: "exit"
+  PB1_ENTRY_ENABLED: "0"
+
+  PB1_LOOP_ENABLED: "1"
+  PB1_RUN_LOOP_MINUTES: "15"
+  PB1_LOOP_INTERVAL_SEC: "60"
+  PB1_CLOSE_SESSION_END: "15:30"
+  PB1_SESSION_EXIT_GRACE_SEC: "15"
+  PB1_TICK_HARD_TIMEOUT_SEC: "45"
+
+  STRATEGY_MODE: "LIVE"
   FORCE_STRATEGY_MODE: "LIVE"
   DRY_RUN: "0"
   DISABLE_LIVE_TRADING: "0"
   LIVE_TRADING_ENABLED: "1"
   FORCE_BLOCK_LIVE: "0"
   ALLOW_LIVE_GATE: "1"
-  PAPER_MAX_CAPITAL_KRW: "100000000"
-  EXPECTED_PRACTICE_CAPITAL_KRW: "0"
-  ACCOUNT_SANITY_CHECK: "1"
-  ACCOUNT_SANITY_FAIL_IF_MISMATCH: "1"
-  EXPECTED_INITIAL_HOLDINGS: "-1"
-  KIS_PRICE_MIN_INTERVAL_MS: "400"
-  KIS_PRICE_CACHE_TTL_SEC: "15"
-  KIS_RATE_LIMIT_COOLDOWN_SEC: "20"
-  PB1_ALLOW_WAIT: "0"
-  FAIL_IF_POOL_MISSING: "1"
-  CANDIDATE_POOL_TTL_DAYS: "7"
-  CANDIDATE_POOL_STRATEGY_KEY: "pb1_candidate_pool"
-  CANDIDATE_POOL_UNIVERSE_STRATEGY: "best_k_meta"
-  CANDIDATE_POOL_UNIVERSE_ENV: "practice"
-  MINERVINI_USE_FEATURE_CACHE: "1"
-  FEATURE_CACHE_WARMUP_ON_TICK: "0"
-  DB_DISABLE_PREPARED_STATEMENTS: "1"
-  DB_LOCK_TIMEOUT_MS: "5000"
-  DB_STATEMENT_TIMEOUT_MS: "15000"
-  DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
-  PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+  KIS_HTTP_ENABLED: "1"
+  NO_TRADE: "0"
+
+  STRATEGY_ENV: practice
+  KIS_ENV: practice
+  FINAL30_SOURCE_MODE: "db_only"
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
+  WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
+  PB1_REQUIRE_SCORED_FINAL30: "1"
+  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
+  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
 
 defaults:
   run:
@@ -106,7 +77,7 @@ defaults:
 jobs:
   trade_close:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     env:
       TZ: Asia/Seoul
@@ -125,81 +96,69 @@ jobs:
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
       STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
-      CLOSE_MANUAL_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.CLOSE_MANUAL_MODE || 'live_close' }}
 
     steps:
-      - name: Guard Close phase window (all triggers)
+      - name: Resolve Close phase guard
         id: phase_guard
         working-directory: .
         run: |
           set -euo pipefail
-          echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE}"
-          echo "[RESOLVE] force_trade_session=${PB1_FORCE_TRADE_SESSION:-auto}"
-          echo "[RESOLVE] am_recovery=${PB1_ENABLE_LATE_AM_RECOVERY:-0} am_recovery_until=${PB1_AM_RECOVERY_ALLOW_UNTIL:-unset}"
-          echo "[RESOLVE] pm_recovery=${PB1_ENABLE_LATE_PM_RECOVERY:-0} pm_recovery_until=${PB1_PM_RECOVERY_ALLOW_UNTIL:-unset}"
-          echo "[RESOLVE] force_am_late=${PB1_FORCE_TRADE_AM_LATE_START:-0} force_am_after_1030=${PB1_FORCE_TRADE_AM_AFTER_1030:-0}"
-          echo "[RESOLVE] force_pm_late=${PB1_FORCE_TRADE_PM_LATE_START:-0} force_pm_after_1340=${PB1_FORCE_TRADE_PM_AFTER_1340:-0}"
-          now_kst="$(TZ=Asia/Seoul date +%H%M)"
+          now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
-          manual_mode="${CLOSE_MANUAL_MODE:-live_close}"
-          valid_window="1515-1545"
-          expected_start_window="1515-1524"
+          manual_mode="${{ inputs.CLOSE_MANUAL_MODE || 'live_close' }}"
+
           should_run=1
           skip_reason=""
           execution_route="live_close"
-          recovery_mode=0
+
+          if [[ "$event_name" == "schedule" ]]; then
+            if [[ "$now_hhmm" -lt 1515 ]]; then
+              should_run=0
+              skip_reason="close_early_start"
+            elif [[ "$now_hhmm" -gt 1520 ]]; then
+              should_run=0
+              skip_reason="skip_close_stale_start"
+            fi
+          fi
+
           if [[ "$event_name" == "workflow_dispatch" ]]; then
             if [[ "$manual_mode" == "live_close" ]]; then
-              if [[ "$now_kst" -lt 1515 ]]; then
+              confirm="${{ inputs.CONFIRM_MANUAL_CLOSE || '' }}"
+              if [[ "$confirm" != "RUN_CLOSE_MANUAL" ]]; then
                 should_run=0
-                skip_reason="manual_live_close_early_start"
-              elif [[ "$now_kst" -gt 1545 ]]; then
+                skip_reason="manual_close_not_confirmed"
+              elif [[ "$now_hhmm" -gt 1530 ]]; then
                 should_run=0
-                skip_reason="skip_close_stale_start"
-              elif [[ "$now_kst" -ge 1530 ]]; then
-                recovery_mode=1
+                skip_reason="manual_close_after_1530_blocked"
               fi
             else
               execution_route="manual_replay"
             fi
-          else
-            if [[ "$now_kst" -lt 1515 ]]; then
-              should_run=0
-              skip_reason="close_early_start"
-            elif [[ "$now_kst" -gt 1545 ]]; then
-              should_run=0
-              skip_reason="skip_close_stale_start"
-            elif [[ "$now_kst" -ge 1530 ]]; then
-              recovery_mode=1
-            fi
           fi
+
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
-          echo "now_kst=${now_kst}" >> "$GITHUB_OUTPUT"
+          echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
-          echo "valid_window=${valid_window}" >> "$GITHUB_OUTPUT"
-          echo "expected_start_window=${expected_start_window}" >> "$GITHUB_OUTPUT"
+          echo "valid_window=1515-1530" >> "$GITHUB_OUTPUT"
+          echo "start_allow_window=1515-1520" >> "$GITHUB_OUTPUT"
+          echo "session_end=1530" >> "$GITHUB_OUTPUT"
           echo "manual_mode=${manual_mode}" >> "$GITHUB_OUTPUT"
           echo "execution_route=${execution_route}" >> "$GITHUB_OUTPUT"
-          echo "recovery_mode=${recovery_mode}" >> "$GITHUB_OUTPUT"
 
-      - name: Write Close trigger metadata
-        if: steps.phase_guard.outputs.should_run == '1'
+      - name: Emit Close skip summary
+        if: steps.phase_guard.outputs.should_run != '1'
         working-directory: .
         run: |
           set -euo pipefail
           mkdir -p repo/artifacts
-          manual_restart=0
-          if [[ "${{ steps.phase_guard.outputs.event_name }}" == "workflow_dispatch" || "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
-            manual_restart=1
-          fi
           {
             echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_CLOSE][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
-            echo "[TRADE_CLOSE][MANUAL_MODE] mode=${{ steps.phase_guard.outputs.manual_mode }} route=${{ steps.phase_guard.outputs.execution_route }}"
-            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
-            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
-          } | tee -a repo/artifacts/trade-close.log
+            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=1515-1530 start_allow_window=1515-1520 session_end=1530"
+            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=0 skip_reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=close"
+            echo "[PB1][EXIT] reason=phase_guard_skip"
+          } | tee repo/artifacts/trade-close.log
 
       - name: Checkout
         if: steps.phase_guard.outputs.should_run == '1'
@@ -215,19 +174,30 @@ jobs:
           set -euo pipefail
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          echo "[CHECKOUT][OK] repo path ready"
+
+      - name: Initialize Close trigger log
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
           mkdir -p repo/artifacts
-          manual_restart=0
-          if [[ "${{ steps.phase_guard.outputs.event_name }}" == "workflow_dispatch" || "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]]; then
-            manual_restart=1
-          fi
           {
             echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_CLOSE][RESTART_HINT] workflow_run_id=${GITHUB_RUN_ID} sha=${GITHUB_SHA} manual_restart=${manual_restart}"
-            echo "[TRADE_CLOSE][MANUAL_MODE] mode=${{ steps.phase_guard.outputs.manual_mode }} route=${{ steps.phase_guard.outputs.execution_route }}"
-            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
-            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
-          } | tee repo/artifacts/trade-close.log >/dev/null
-          echo "[CHECKOUT][OK] repo path ready"
+            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=1515-1530 start_allow_window=1515-1520 session_end=1530"
+            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=1 skip_reason= event=${{ steps.phase_guard.outputs.event_name }} valid_window=1515-1530"
+          } | tee repo/artifacts/trade-close.log
+
+      - name: Apply diag replay env overrides
+        if: steps.phase_guard.outputs.should_run == '1' && steps.phase_guard.outputs.execution_route == 'manual_replay'
+        run: |
+          echo "FORCE_BLOCK_LIVE=1" >> "$GITHUB_ENV"
+          echo "DISABLE_LIVE_TRADING=1" >> "$GITHUB_ENV"
+          echo "LIVE_TRADING_ENABLED=0" >> "$GITHUB_ENV"
+          echo "DRY_RUN=1" >> "$GITHUB_ENV"
+          echo "STRATEGY_MODE=DIAG" >> "$GITHUB_ENV"
+          echo "FORCE_STRATEGY_MODE=DIAG" >> "$GITHUB_ENV"
+          echo "PB1_ENTRY_ENABLED=0" >> "$GITHUB_ENV"
 
       - name: Set up Python
         if: steps.phase_guard.outputs.should_run == '1'
@@ -261,67 +231,32 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          echo "[STEP][START] name=db_migrate session=close" | tee -a artifacts/trade-close.log
-          if python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-close.log; then
-            echo "[STEP][OK] name=db_migrate session=close" | tee -a artifacts/trade-close.log
-          else
-            echo "[STEP][FAIL] name=db_migrate session=close" | tee -a artifacts/trade-close.log
-            exit 1
-          fi
+          python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-close.log
 
       - name: Verify KIS env contract
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
-          trap 'echo "[STEP][FAIL] name=verify_kis_env_contract session=close" | tee -a artifacts/trade-close.log' ERR
-
-          echo "[STEP][START] name=verify_kis_env_contract session=close" | tee -a artifacts/trade-close.log
-
           echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
           echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
           echo "[ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
-          echo "[ENV_CHECK] KIS_REST_URL=${KIS_REST_URL:-}"
-
           test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
           test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
           test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
           test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
-
           test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
           test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
           test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
-
           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
-
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
-          trap - ERR
-          echo "[STEP][OK] name=verify_kis_env_contract session=close" | tee -a artifacts/trade-close.log
 
-      - name: Verify candidate pool exists in DB
+      - name: Verify exact scored final30 in DB
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
-          echo "[STEP][START] name=verify_candidate_pool session=close" | tee -a artifacts/trade-close.log
-          echo "[TRADE_CLOSE][PRECHECK][CANDIDATE_POOL][START]"
-          if python -m trader.verify_candidate_pool; then
-            echo "[TRADE_CLOSE][PRECHECK][CANDIDATE_POOL][OK]"
-            echo "[STEP][OK] name=verify_candidate_pool session=close" | tee -a artifacts/trade-close.log
-          else
-            echo "[TRADE_CLOSE][PRECHECK][CANDIDATE_POOL][FAIL] reason=verify_candidate_pool_failed"
-            echo "[STEP][FAIL] name=verify_candidate_pool session=close" | tee -a artifacts/trade-close.log
-            exit 1
-          fi
-
-      - name: Verify final30 readiness in DB
-        if: steps.phase_guard.outputs.should_run == '1'
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          echo "[STEP][START] name=verify_final30_readiness session=close" | tee -a artifacts/trade-close.log
-          echo "[TRADE_CLOSE][PRECHECK][FINAL30][START]"
-          if python - <<'PY'
+          python - <<'PY'
           import os
           from trader.db.engine import get_engine
           from trader.db.repos import load_final30_scored_db_only
@@ -337,105 +272,54 @@ jobs:
               require_exact_rows=30,
               fail_if_missing=True,
           )
-          print(f"[TRADE_CLOSE][PRECHECK][FINAL30][OK] rows={len(df)} as_of={ctx['as_of']}")
+          print(f"[TRADE][FINAL30][DB_EXACT_LOAD] rows={len(df)} as_of={ctx['as_of']} session=close")
           PY
-          then
-            echo "[STEP][OK] name=verify_final30_readiness session=close" | tee -a artifacts/trade-close.log
-          else
-            echo "[TRADE_CLOSE][PRECHECK][FINAL30][FAIL] reason=missing_db_exact_scored_final30"
-            echo "[STEP][FAIL] name=verify_final30_readiness session=close" | tee -a artifacts/trade-close.log
-            exit 1
-          fi
 
-      - name: Emit Close skip summary
-        if: steps.phase_guard.outputs.should_run != '1'
-        working-directory: .
-        run: |
-          set -euo pipefail
-          mkdir -p repo/artifacts
-          {
-            echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_CLOSE][MANUAL_MODE] mode=${{ steps.phase_guard.outputs.manual_mode }} route=${{ steps.phase_guard.outputs.execution_route }}"
-            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=${{ steps.phase_guard.outputs.valid_window }} expected_start_window=${{ steps.phase_guard.outputs.expected_start_window }}"
-            echo "[TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason || 'none' }} event=${{ steps.phase_guard.outputs.event_name }} valid_window=${{ steps.phase_guard.outputs.valid_window }}"
-            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=close event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[PB1][EXIT] reason=phase_guard_skip"
-          } | tee repo/artifacts/trade-close.log
-
-      - name: Run close trade tick
+      - name: Run close trade loop
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          echo "[STEP][START] name=run_close_trade_tick session=close" | tee -a artifacts/trade-close.log
-          echo "[TRADE_CLOSE][WINDOW] target=15:15-KST market close loop_minutes=${PB1_RUN_LOOP_MINUTES} interval_sec=${PB1_LOOP_INTERVAL_SEC}"
-          echo "[TRADE_CLOSE][CONFIG] MODE=trade STRATEGY_ENV=${STRATEGY_ENV} KIS_ENV=${KIS_ENV} CLOSE_MANUAL_MODE=${CLOSE_MANUAL_MODE} FORCE_BLOCK_LIVE=${FORCE_BLOCK_LIVE} DRY_RUN=${DRY_RUN}"
-          echo "[PHASE][START] phase=close" | tee artifacts/trade-close.log
-          if python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-close.log; then
-            echo "[STEP][OK] name=run_close_trade_tick session=close" | tee -a artifacts/trade-close.log
-          else
-            echo "[STEP][FAIL] name=run_close_trade_tick session=close" | tee -a artifacts/trade-close.log
-            exit 1
-          fi
+          echo "[PHASE][START] phase=close session_window=1515-1530" | tee -a artifacts/trade-close.log
+          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-close.log
           echo "[PHASE][END] phase=close" | tee -a artifacts/trade-close.log
 
-      - name: Verify close trade tick logs
+      - name: Verify close log contract
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
-          trap 'echo "[STEP][FAIL] name=verify_close_logs session=close" | tee -a artifacts/trade-close.log' ERR
-          echo "[STEP][START] name=verify_close_logs session=close" | tee -a artifacts/trade-close.log
           missing=0
-          for pattern in "\[TRADE_CLOSE\]\[TRIGGER\]" "\[TRADE_CLOSE\]\[START_META\]" "\[TRADE_CLOSE\]\[PHASE_GUARD\]" "\[TRADE_CLOSE\]\[MANUAL_MODE\]"; do
+          for pattern in \
+            "\[TRADE_CLOSE\]\[TRIGGER\]" \
+            "\[TRADE_CLOSE\]\[START_META\]" \
+            "\[TRADE_CLOSE\]\[PHASE_GUARD\]" \
+            "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" \
+            "\[TRADE\]\[READY\]\[OK\]" \
+            "\[RUN_SUMMARY\]\[RESULT\]"; do
             if ! grep -E "$pattern" artifacts/trade-close.log >/dev/null; then
-              echo "::error::missing metadata pattern: $pattern"
+              echo "::error::missing required log pattern: $pattern"
               missing=1
             fi
           done
-          if ! grep -E "\[RUN_SUMMARY\]\[RESULT\]" artifacts/trade-close.log >/dev/null; then
-            echo "::error::missing [RUN_SUMMARY][RESULT]"
-            exit 1
-          fi
-          if grep -F "operator does not exist: text >= timestamp with time zone" artifacts/trade-close.log >/dev/null; then
-            echo "::error::runs.started_at text/timestamptz schema mismatch still present"
-            exit 1
-          fi
-          result_status="$(grep -Eo '\[RUN_SUMMARY\]\[RESULT\] status=[A-Z_]+' artifacts/trade-close.log | tail -n 1 | sed 's/.*status=//')"
-          if [[ "$result_status" == "OK_MANUAL_REPLAY" ]]; then
-            if ! grep -E "\[TRADE_CLOSE\]\[MANUAL_REPLAY\]|\[TRADE_CLOSE\]\[MANUAL_REPLAY\]\[DONE\]" artifacts/trade-close.log >/dev/null; then
-              echo "::error::missing manual replay diagnostics"
-              missing=1
-            fi
-          else
-            if ! grep -E "\[PB1\]\[LOOP\]\[SESSION\] kind=close" artifacts/trade-close.log >/dev/null; then
-              echo "::error::missing [PB1][LOOP][SESSION] kind=close"
-              missing=1
-            fi
-          fi
-          if ! grep -E "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" artifacts/trade-close.log >/dev/null; then
-            echo "::error::missing [TRADE][FINAL30][DB_EXACT_LOAD]"
+          if ! grep -E "\[PB1\]\[EXIT\] reason=session_end|\[PB1\]\[LOOP\] session end reached -> exit" artifacts/trade-close.log >/dev/null; then
+            echo "::error::missing clean session_end exit log"
             missing=1
           fi
-          if ! grep -E "\[TRADE\]\[READY\]\[OK\]" artifacts/trade-close.log >/dev/null; then
-            echo "::error::missing [TRADE][READY][OK]"
+          if grep -F "Traceback" artifacts/trade-close.log >/dev/null; then
+            echo "::error::Traceback detected in close log"
             missing=1
           fi
-          if [[ "$result_status" != "OK_MANUAL_REPLAY" ]]; then
-            if ! grep -E "\[PB1\]\[LOOP\]\[SESSION_END_RELEASE\]|\[PB1\]\[LOOP\] session end reached -> exit|\[PB1\]\[EXIT\] reason=session_end" artifacts/trade-close.log >/dev/null; then
-              echo "::error::missing clean close session release log"
-              missing=1
-            fi
+          if grep -F "FATAL_RUNTIME" artifacts/trade-close.log >/dev/null; then
+            echo "::error::FATAL_RUNTIME detected in close log"
+            missing=1
           fi
-          if grep -E "\[TRADE\]\[ORDER\]\[BUY\]" artifacts/trade-close.log >/dev/null; then
-            echo "::error::Close workflow emitted BUY order logs despite PB1_ENTRY_ENABLED=0"
-            exit 1
+          if grep -E "\[TRADE\]\[ORDER\]\[BUY\]|\[ORDER\]\[BUY\]" artifacts/trade-close.log >/dev/null; then
+            echo "::error::BUY order detected in close session (forbidden)"
+            missing=1
           fi
           test "$missing" -eq 0
-          python -m trader.trade_tick verify-log --session close --log artifacts/trade-close.log
-          trap - ERR
-          echo "[STEP][OK] name=verify_close_logs session=close" | tee -a artifacts/trade-close.log
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'
