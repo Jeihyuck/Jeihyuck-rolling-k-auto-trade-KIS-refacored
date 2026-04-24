@@ -2,8 +2,8 @@ name: Trade Prep
 
 "on":
   schedule:
-    # Sun-Thu 23:00 UTC = Mon-Fri 08:00 KST
-    - cron: "0 23 * * 0-4"
+    # Every day 07:00 KST = Every day 22:00 UTC (prev day)
+    - cron: "0 22 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -59,7 +59,7 @@ defaults:
 jobs:
   prep:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
 
     env:
       TZ: Asia/Seoul
@@ -311,4 +311,7 @@ jobs:
           path: |
             repo/artifacts/
             repo/runtime/prep/*/prep_manifest.json
+            repo/runtime/prep/*/final30_locked.json
+            repo/runtime/prep/*/quality-summary.json
+            repo/runtime/prep/*/flow-summary.json
           if-no-files-found: ignore

@@ -4026,6 +4026,8 @@ class PositionsRepo:
                     values["entry_meta_json"] = _merge_json_dict(existing_row.get("entry_meta_json"), values.get("entry_meta_json"))
                 if "last_exit_eval_json" in values:
                     values["last_exit_eval_json"] = _merge_json_dict(existing_row.get("last_exit_eval_json"), values.get("last_exit_eval_json"))
+                if "position_meta" in values:
+                    values["position_meta"] = _merge_json_dict(existing_row.get("position_meta"), values.get("position_meta"))
                 stmt = (
                     sa.update(self._schema.positions)
                     .where(

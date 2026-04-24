@@ -920,16 +920,25 @@ def _resolve_swing_staged_exit(
     risk_per_share = avg - initial_stop if avg > initial_stop > 0 else 0.0
     current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
     max_r = float(meta.get("max_r_since_entry") or 0.0)
+    code_for_log = str(pos.get("code") or pos.get("stock_code") or "UNKNOWN")
+
+    logger.info(
+        "[EXIT][SWING][R_CTX] code=%s avg=%.2f stop=%.2f mark=%.2f risk_per_share=%.2f current_r=%.3f max_r=%.3f days_held=%s tp1_done=%s tp2_done=%s",
+        code_for_log, avg, initial_stop, mark, risk_per_share, current_r, max_r, days_held, tp1_done, tp2_done,
+    )
 
     # 1. 초기 손절
     if stop_hit or (initial_stop > 0 and mark <= initial_stop):
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        logger.info("[EXIT][SWING][TP_CHECK] code=%s check=STOP_HIT result=EXIT reason=INITIAL_STOP mark=%.2f stop=%.2f", code_for_log, mark, initial_stop)
         return {"exit_ok": True, "reason": "EXIT_SWING_INITIAL_STOP", "qty": qty, "sell_pct": None}
 
     # 2. TP1 (중복 방지)
+    logger.info("[EXIT][SWING][TP_CHECK] code=%s check=TP1 current_r=%.3f tp1_r=%.1f tp1_done=%s", code_for_log, current_r, tp1_r, tp1_done)
     if current_r >= tp1_r and not tp1_done:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp1_sell_pct)
         new_stop = max(float(meta.get("current_stop_price") or initial_stop or avg), avg)
+        logger.info("[EXIT][SWING][TP_CHECK] code=%s result=TP1_HIT qty=%s sell_pct=%.2f new_stop=%.2f", code_for_log, qty, tp1_sell_pct, new_stop)
         return {
             "exit_ok": True,
             "reason": "EXIT_SWING_TP1",
@@ -945,8 +954,10 @@ def _resolve_swing_staged_exit(
         }
 
     # 3. TP2 (중복 방지)
+    logger.info("[EXIT][SWING][TP_CHECK] code=%s check=TP2 current_r=%.3f tp2_r=%.1f tp2_done=%s", code_for_log, current_r, tp2_r, tp2_done)
     if current_r >= tp2_r and not tp2_done:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp2_sell_pct)
+        logger.info("[EXIT][SWING][TP_CHECK] code=%s result=TP2_HIT qty=%s sell_pct=%.2f", code_for_log, qty, tp2_sell_pct)
         return {
             "exit_ok": True,
             "reason": "EXIT_SWING_TP2",
@@ -964,13 +975,16 @@ def _resolve_swing_staged_exit(
     # 4. Runner MA20 이탈 (TP1 이후)
     if tp1_done and ma20 is not None and mark < ma20:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        logger.info("[EXIT][SWING][TP_CHECK] code=%s check=MA20_RUNNER result=EXIT mark=%.2f ma20=%.2f", code_for_log, mark, ma20)
         return {"exit_ok": True, "reason": "EXIT_SWING_RUNNER_MA20_BREAK", "qty": qty, "sell_pct": None}
 
     # 5. time stop
     if days_held >= time_stop_days and current_r < 1.0:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
+        logger.info("[EXIT][SWING][TP_CHECK] code=%s check=TIME_STOP result=EXIT days_held=%s time_stop_days=%s current_r=%.3f", code_for_log, days_held, time_stop_days, current_r)
         return {"exit_ok": True, "reason": "EXIT_SWING_TIME_STOP", "qty": qty, "sell_pct": None}
 
+    logger.info("[EXIT][SWING][TP_CHECK] code=%s result=HOLD current_r=%.3f tp1_done=%s tp2_done=%s", code_for_log, current_r, tp1_done, tp2_done)
     return {"exit_ok": False, "reason": "SWING_HOLD_TREND_OK"}
 
 
@@ -7054,6 +7068,36 @@ class PB1Engine:
             status["terminal_event"] = "FINAL_SKIP"
             return status
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=record_price)
+        # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
+        _eh_horizon = entry_meta.get("trade_horizon") or "SWING_CARRY"
+        _eh_book = {"DAY_PROTECT": "DAY_BOOK", "SWING_CARRY": "SWING_BOOK", "CORE_CARRY": "CORE_BOOK"}.get(_eh_horizon, "SWING_BOOK")
+        _eh_exit_fam = entry_meta.get("exit_policy_family") or "SWING_STAGED_EXIT"
+        _eh_entry_px = float(cf.features.get("entry_price") or record_price or 0.0)
+        _eh_stop_px = float(cf.features.get("stop_price") or 0.0)
+        _eh_r = max(_eh_entry_px - _eh_stop_px, _eh_entry_px * 0.02) if (_eh_stop_px > 0 and _eh_entry_px > 0) else 0.0
+        _eh_tp1 = round(_eh_entry_px + _eh_r * 2.0, 2) if _eh_r > 0 else 0.0
+        _eh_tp2 = round(_eh_entry_px + _eh_r * 3.0, 2) if _eh_r > 0 else 0.0
+        logger.info(
+            "[ENTRY][HORIZON] code=%s style=%s horizon=%s book=%s exit_policy=%s",
+            display_code, identity.get("entry_style_selected"), _eh_horizon, _eh_book, _eh_exit_fam,
+        )
+        logger.info(
+            "[ENTRY][RISK_UNIT] code=%s entry=%.2f stop=%.2f r=%.2f tp1=%.2f tp2=%.2f",
+            display_code, _eh_entry_px, _eh_stop_px, _eh_r, _eh_tp1, _eh_tp2,
+        )
+        entry_meta.update({
+            "position_book": _eh_book,
+            "initial_stop_price": _eh_stop_px,
+            "r_value": _eh_r,
+            "planned_tp1_price": _eh_tp1,
+            "planned_tp2_price": _eh_tp2,
+            "tp1_done": False,
+            "tp2_done": False,
+            "max_r_since_entry": 0.0,
+            "max_pnl_pct_since_entry": 0.0,
+            "current_stop_price": _eh_stop_px,
+        })
+        # ─────────────────────────────────────────────────────────────────────
         request_payload = {"features": cf.features, "reasons": cf.reasons, "entry_meta": entry_meta}
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
@@ -7823,6 +7867,36 @@ class PB1Engine:
             status["terminal_event"] = "FINAL_SKIP"
             return status
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=float(cap or 0.0))
+        # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
+        _eh_horizon = entry_meta.get("trade_horizon") or "SWING_CARRY"
+        _eh_book = {"DAY_PROTECT": "DAY_BOOK", "SWING_CARRY": "SWING_BOOK", "CORE_CARRY": "CORE_BOOK"}.get(_eh_horizon, "SWING_BOOK")
+        _eh_exit_fam = entry_meta.get("exit_policy_family") or "SWING_STAGED_EXIT"
+        _eh_entry_px = float(cf.features.get("entry_price") or cap or 0.0)
+        _eh_stop_px = float(cf.features.get("stop_price") or 0.0)
+        _eh_r = max(_eh_entry_px - _eh_stop_px, _eh_entry_px * 0.02) if (_eh_stop_px > 0 and _eh_entry_px > 0) else 0.0
+        _eh_tp1 = round(_eh_entry_px + _eh_r * 2.0, 2) if _eh_r > 0 else 0.0
+        _eh_tp2 = round(_eh_entry_px + _eh_r * 3.0, 2) if _eh_r > 0 else 0.0
+        logger.info(
+            "[ENTRY][HORIZON] code=%s style=%s horizon=%s book=%s exit_policy=%s",
+            display_code, identity.get("entry_style_selected"), _eh_horizon, _eh_book, _eh_exit_fam,
+        )
+        logger.info(
+            "[ENTRY][RISK_UNIT] code=%s entry=%.2f stop=%.2f r=%.2f tp1=%.2f tp2=%.2f",
+            display_code, _eh_entry_px, _eh_stop_px, _eh_r, _eh_tp1, _eh_tp2,
+        )
+        entry_meta.update({
+            "position_book": _eh_book,
+            "initial_stop_price": _eh_stop_px,
+            "r_value": _eh_r,
+            "planned_tp1_price": _eh_tp1,
+            "planned_tp2_price": _eh_tp2,
+            "tp1_done": False,
+            "tp2_done": False,
+            "max_r_since_entry": 0.0,
+            "max_pnl_pct_since_entry": 0.0,
+            "current_stop_price": _eh_stop_px,
+        })
+        # ─────────────────────────────────────────────────────────────────────
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()

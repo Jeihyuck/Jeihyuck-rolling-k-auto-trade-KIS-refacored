@@ -27,6 +27,9 @@ FINAL30_SUCCESS_PATTERNS: dict[str, str] = {
     "repair_done": r"\[FINAL30\]\[REPAIR\]\[DONE\].*success=",
     "contract_ok": r"\[PREP\]\[FINAL30\]\[CONTRACT_OK\]",
     "prep_done": r"\[PREP\]\[DONE\]",
+    "prep_db_verify_ok": r"\[PREP\]\[DB_VERIFY\]\[OK\]",
+    "prep_canonical_quality": r"\[PREP\]\[CANONICAL\]\[QUALITY\].*trade_can_proceed=1",
+    "prep_exit_ok": r"\[PREP\]\[EXIT\] status=OK",
 }
 
 
@@ -574,6 +577,24 @@ def print_verification_results(results: VerifyResults) -> None:
         )
     else:
         print("FAIL canonical manifest missing")
+
+    # ── 새 마커 체크 ──────────────────────────────────────────────────────────
+    _success_logs = set(results.final30_success_logs)
+    if "prep_db_verify_ok" in _success_logs:
+        print("PASS [PREP][DB_VERIFY][OK] detected")
+    else:
+        print("WARN [PREP][DB_VERIFY][OK] not detected (may indicate old runner or skipped DB roundtrip)")
+
+    if "prep_canonical_quality" in _success_logs:
+        print("PASS [PREP][CANONICAL][QUALITY] trade_can_proceed=1 detected")
+    else:
+        print("WARN [PREP][CANONICAL][QUALITY] not detected (trade may not proceed)")
+
+    if "prep_exit_ok" in _success_logs:
+        print("PASS [PREP][EXIT] status=OK detected")
+    else:
+        print("FAIL [PREP][EXIT] status=OK missing — prep runner did not complete cleanly")
+        results.failures.append("prep_exit_ok_missing")
 
     if results.exporter_preserved_scores:
         print("PASS exporter preserved score fields")

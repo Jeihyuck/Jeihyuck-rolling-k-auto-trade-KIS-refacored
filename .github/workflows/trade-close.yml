@@ -2,8 +2,8 @@ name: "Trade Close"
 
 "on":
   schedule:
-    # Mon-Fri 15:15 KST = 06:15 UTC
-    - cron: "15 6 * * 1-5"
+    # Every day 15:15 KST = Every day 06:15 UTC
+    - cron: "15 6 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:

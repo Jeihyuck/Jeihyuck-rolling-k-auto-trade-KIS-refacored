@@ -249,6 +249,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("closed_ts", sa.DateTime(timezone=True)),
         sa.Column("exit_policy_family", sa.String, nullable=True),
         sa.Column("last_exit_eval_json", jsonb_type, nullable=False, default=dict),
+        sa.Column("position_meta", jsonb_type, nullable=False, default=dict),
         sa.Column("last_reconciled_at", sa.DateTime(timezone=True)),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
         sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),

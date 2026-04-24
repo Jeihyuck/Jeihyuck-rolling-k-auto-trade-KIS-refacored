@@ -868,6 +868,7 @@ def save_final30_scored_core(
         logger.warning("[PREP][FINAL30_SCORED][FLOW_OPTIONAL] missing=%s", flow_optional_missing)
     if usable_roundtrip:
         logger.info("[PREP][FINAL30_SCORED][DB_ROUNDTRIP_OK] usable=1")
+        logger.info("[PREP][DB_VERIFY][OK] env=%s as_of=%s rows=%s strategy=pb1", env, as_of.isoformat(), len(reload_rows))
     else:
         logger.error("[PREP][FINAL30_SCORED][DB_ROUNDTRIP_FAIL] missing=%s", reload_missing)
     if not bool(reload_validation.get("ok")) or not bool(reload_contract.get("ok")) or not usable_roundtrip:
@@ -2109,6 +2110,13 @@ def main() -> int:
             list(final30_quality.get("hard_fail_reasons") or []),
             list(final30_quality.get("soft_fail_reasons") or []),
         )
+        if final30_trade_can_proceed:
+            logger.info(
+                "[PREP][CANONICAL][QUALITY] quality_ok=1 trade_can_proceed=1 final30_count=%s env=%s as_of=%s",
+                int(len(final30_df)),
+                env,
+                as_of.isoformat(),
+            )
         logger.info(
             "[PREP][EXPORT][FINAL30][INMEM] rows=%s tech_nonzero=%s final_nonzero=%s score_final_nonzero=%s breakout_nonzero=%s pullback_nonzero=%s momentum_nonzero=%s",
             int(len(final30_df)),
@@ -2907,6 +2915,14 @@ def main() -> int:
         int(bool(aux_bundle_result.get("ok", False))) if isinstance(aux_bundle_result, dict) else 0,
         time.monotonic() - t0,
     )
+    logger.info(
+        "[PREP][DONE] env=%s as_of=%s final30=%s trade_can_proceed=%s status=OK",
+        env,
+        as_of.isoformat(),
+        len(bundle_final30),
+        int(final30_gate_decision["trade_can_proceed"]),
+    )
+    logger.info("[PREP][EXIT] status=OK")
     return 0
 
 

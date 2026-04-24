@@ -4242,6 +4242,22 @@ def run_once(
         logger.info("[PB1][DIAG_FULL_EXEC] bypass smoke -> run engine once (no KIS HTTP)")
         action = "run"  # smoke 건너뛰고 엔진 실행
     elif action == "smoke" and not compute_only_full_run:
+        if not trading_day:
+            session_kind = str(os.getenv("PB1_SESSION_KIND") or "unknown")
+            logger.info(
+                "[TRADE][TRADING_DAY][CHECK] date=%s is_trading_day=0 reason=weekend_or_holiday",
+                now.date().isoformat(),
+            )
+            logger.info(
+                "[TRADE][TRADING_DAY][SKIP] reason=non_trading_day session=%s",
+                session_kind,
+            )
+            logger.info(
+                "[RUN_SUMMARY][RESULT] status=OK_NO_TRADE reason=NON_TRADING_DAY session=%s",
+                session_kind,
+            )
+            logger.info("[PB1][EXIT] reason=non_trading_day")
+            return [], False, {}, phase_for_log, "OK_NO_TRADE"
         os.environ["KIS_HTTP_CALLER_ROUTE"] = "smoke"
         _run_smoke(engine, kis_env=(os.getenv("KIS_ENV") or "practice").lower(), now=now)
         return [], False, {}, phase_for_log, "SMOKE"

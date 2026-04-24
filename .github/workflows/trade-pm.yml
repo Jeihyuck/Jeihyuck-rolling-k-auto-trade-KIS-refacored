@@ -2,8 +2,8 @@ name: "Trade PM"
 
 "on":
   schedule:
-    # Mon-Fri 13:00 KST = 04:00 UTC
-    - cron: "0 4 * * 1-5"
+    # Every day 13:00 KST = Every day 04:00 UTC
+    - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:

@@ -260,7 +260,7 @@ jobs:
   manual_debug:
     needs: resolve
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -449,12 +449,12 @@ jobs:
               python scripts/verify_prep_log.py artifacts/unified-manual.log
               ;;
             trade)
-              python -m trader.trade_tick 2>&1 | tee artifacts/unified-manual.log
+              python -m trader.trade_tick 2>&1 | tee -a artifacts/unified-manual.log
               ;;
             close)
               export PB1_PHASE_DEFAULT=exit
               export PB1_ENTRY_ENABLED=0
-              python -m trader.trade_tick 2>&1 | tee artifacts/unified-manual.log
+              python -m trader.trade_tick 2>&1 | tee -a artifacts/unified-manual.log
               ;;
             *)
               echo "::error::Unsupported mode: $MANUAL_MODE"
@@ -479,5 +479,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-unified-manual-logs
-          path: repo/artifacts/
+          path: |
+            repo/artifacts/
+            repo/runtime/prep/*/prep_manifest.json
+            repo/runtime/prep/*/final30_locked.json
+            repo/runtime/prep/*/quality-summary.json
+            repo/runtime/prep/*/flow-summary.json
           if-no-files-found: ignore

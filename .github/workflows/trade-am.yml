@@ -1,10 +1,10 @@
 name: "Trade AM"
-# session: am | window: 09:00-12:55 KST | schedule: Mon-Fri 00:00 UTC | env: PB1_*
+# session: am | window: 09:00-12:55 KST | schedule: Every day 00:00 UTC | env: PB1_*
 
 "on":
   schedule:
-    # Mon-Fri 09:00 KST = 00:00 UTC
-    - cron: "0 0 * * 1-5"
+    # Every day 09:00 KST = Every day 00:00 UTC
+    - cron: "0 0 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
