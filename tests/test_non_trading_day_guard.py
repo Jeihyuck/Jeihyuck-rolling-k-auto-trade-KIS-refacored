@@ -98,3 +98,75 @@ def test_non_trading_day_guard_is_before_smoke_execution():
     assert guard_pos < smoke_pos, (
         "OK_NO_TRADE guard must appear before _run_smoke() call"
     )
+
+
+# ── workflow YAML: trading-day guard 구조 검증 ───────────────────────────────
+
+from pathlib import Path as _Path
+
+_WORKFLOWS_DIR = _Path(__file__).parent.parent / ".github" / "workflows"
+
+
+def _read_wf(name: str) -> str:
+    return (_WORKFLOWS_DIR / name).read_text()
+
+
+def test_workflow_am_has_trading_day_guard():
+    assert "Resolve trading-day guard" in _read_wf("trade-am.yml")
+
+
+def test_workflow_pm_has_trading_day_guard():
+    assert "Resolve trading-day guard" in _read_wf("trade-pm.yml")
+
+
+def test_workflow_close_has_trading_day_guard():
+    assert "Resolve trading-day guard" in _read_wf("trade-close.yml")
+
+
+def test_workflow_trading_day_guard_uses_dow():
+    """모든 workflow가 date +%u 와 dow>=6 비교를 사용한다."""
+    for wf in ["trade-am.yml", "trade-pm.yml", "trade-close.yml"]:
+        content = _read_wf(wf)
+        assert "date +%u" in content, f"{wf}: trading-day guard must use 'date +%u'"
+        assert '$dow" -ge 6' in content, f"{wf}: trading-day guard must check dow>=6"
+
+
+def test_workflow_trading_day_guard_precedes_wait():
+    """trading-day guard가 Wait until target start보다 앞에 나온다."""
+    for wf in ["trade-am.yml", "trade-pm.yml", "trade-close.yml"]:
+        content = _read_wf(wf)
+        g = content.find("Resolve trading-day guard")
+        w = content.find("Wait until target start")
+        assert 0 < g < w, (
+            f"{wf}: 'Resolve trading-day guard' ({g}) "
+            f"must precede 'Wait until target start' ({w})"
+        )
+
+
+def test_workflow_non_trading_day_emits_ok_no_trade():
+    for wf in ["trade-am.yml", "trade-pm.yml", "trade-close.yml"]:
+        content = _read_wf(wf)
+        assert "OK_NO_TRADE" in content, f"{wf}: must emit OK_NO_TRADE on non-trading day"
+        assert "NON_TRADING_DAY" in content, f"{wf}: must emit NON_TRADING_DAY reason"
+
+
+def test_workflow_checkout_gated_on_trading_day():
+    """Checkout step은 is_trading_day == '1' 조건이 있어야 한다."""
+    for wf in ["trade-am.yml", "trade-pm.yml", "trade-close.yml"]:
+        content = _read_wf(wf)
+        assert "trading_day_guard.outputs.is_trading_day == '1'" in content, (
+            f"{wf}: Checkout must be gated by trading_day_guard.outputs.is_trading_day == '1'"
+        )
+
+
+def test_workflow_wait_step_gated_on_trading_day():
+    """Wait until target start step은 is_trading_day == '1' 조건이 있어야 한다."""
+    for wf in ["trade-am.yml", "trade-pm.yml", "trade-close.yml"]:
+        content = _read_wf(wf)
+        wait_idx = content.find("Wait until target start")
+        assert wait_idx != -1, f"{wf}: missing 'Wait until target start' step"
+        surrounding = content[wait_idx: wait_idx + 600]
+        assert "is_trading_day" in surrounding, (
+            f"{wf}: 'Wait until target start' must be gated by is_trading_day"
+        )
+

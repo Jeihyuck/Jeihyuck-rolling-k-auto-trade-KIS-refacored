@@ -2,6 +2,7 @@
 tests/test_workflow_cron_daily_contract.py
 
 모든 workflow cron이 매일 실행(* * *)이고 prep timeout이 90분인지 계약적 검증.
+AM/PM/CLOSE은 prewarm cron으로 업데이트됨.
 """
 from __future__ import annotations
 
@@ -29,26 +30,27 @@ def test_trade_prep_timeout_90():
     )
 
 
-def test_trade_am_cron_is_daily():
+def test_trade_am_cron_is_prewarm():
+    """trade-am.yml cron은 prewarm 방식으로 08:45 KST (= 23:45 UTC 전날)."""
     content = _read("trade-am.yml")
-    assert re.search(r'cron:\s*"0 0 \* \* \*"', content), (
-        "trade-am.yml cron should be '0 0 * * *' (daily, 09:00 KST)"
+    assert re.search(r'cron:\s*"45 23 \* \* \*"', content), (
+        "trade-am.yml cron should be '45 23 * * *' (08:45 KST prewarm)"
     )
-    # 요일 제한(1-5) 없어야 함
-    assert "1-5" not in content or "Every day" in content or "0 0 * * *" in content
 
 
-def test_trade_pm_cron_is_daily():
+def test_trade_pm_cron_is_prewarm():
+    """trade-pm.yml cron은 prewarm 방식으로 12:45 KST (= 03:45 UTC)."""
     content = _read("trade-pm.yml")
-    assert re.search(r'cron:\s*"0 4 \* \* \*"', content), (
-        "trade-pm.yml cron should be '0 4 * * *' (daily, 13:00 KST)"
+    assert re.search(r'cron:\s*"45 3 \* \* \*"', content), (
+        "trade-pm.yml cron should be '45 3 * * *' (12:45 KST prewarm)"
     )
 
 
-def test_trade_close_cron_is_daily():
+def test_trade_close_cron_is_prewarm():
+    """trade-close.yml cron은 prewarm 방식으로 15:00 KST (= 06:00 UTC)."""
     content = _read("trade-close.yml")
-    assert re.search(r'cron:\s*"15 6 \* \* \*"', content), (
-        "trade-close.yml cron should be '15 6 * * *' (daily, 15:15 KST)"
+    assert re.search(r'cron:\s*"0 6 \* \* \*"', content), (
+        "trade-close.yml cron should be '0 6 * * *' (15:00 KST prewarm)"
     )
 
 
@@ -56,7 +58,6 @@ def test_no_workflow_uses_weekday_only_cron():
     """모든 workflow에 1-5 요일 제한 cron이 없어야 한다."""
     for wf in ["trade-prep.yml", "trade-am.yml", "trade-pm.yml", "trade-close.yml"]:
         content = _read(wf)
-        # cron 줄에 1-5 가 있으면 안 됨
         for line in content.splitlines():
             if "cron:" in line:
                 assert "1-5" not in line, (

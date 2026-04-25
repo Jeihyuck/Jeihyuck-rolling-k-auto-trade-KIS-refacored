@@ -14,9 +14,96 @@ import argparse
 import sys
 import os
 import logging
+import time as _time_mod
+from datetime import datetime, time as _dtime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _apply_prewarm_guard(now_override: datetime | None = None) -> int | None:
+    """Prewarm double-defense guard (section 10).
+
+    Reads env vars set by GitHub Actions workflow:
+      PB1_PREWARM_ENABLED   – "1" to activate
+      PB1_TARGET_START_TIME – "HH:MM"  trade loop target start time
+      PB1_START_ALLOW_UNTIL – "HH:MM"  stale-skip threshold
+      PB1_SESSION_KIND      – "am" / "pm" / "close"  (for logging)
+
+    Returns:
+        None  – proceed normally into trade loop
+        0     – exit clean (OK_NO_TRADE: non-trading day or stale skip)
+    """
+    if os.getenv("PB1_PREWARM_ENABLED", "0") != "1":
+        return None
+
+    now: datetime = now_override if now_override is not None else datetime.now(tz=_KST)
+    session = os.getenv("PB1_SESSION_KIND", "")
+
+    # 비거래일 (주말) guard
+    if now.weekday() >= 5:  # 5=Sat, 6=Sun
+        logger.info(
+            "[PB1][SESSION_GUARD][NONTRADING_DAY_EXIT] session=%s dow=%s",
+            session,
+            now.weekday(),
+        )
+        logger.info(
+            "[RUN_SUMMARY][RESULT] status=OK_NO_TRADE reason=NON_TRADING_DAY session=%s",
+            session,
+        )
+        logger.info("[PB1][EXIT] reason=non_trading_day")
+        return 0
+
+    target_raw = os.getenv("PB1_TARGET_START_TIME", "")
+    allow_until_raw = os.getenv("PB1_START_ALLOW_UNTIL", "")
+    if not target_raw or not allow_until_raw:
+        return None
+
+    try:
+        target_time = _dtime.fromisoformat(target_raw)
+        allow_until_time = _dtime.fromisoformat(allow_until_raw)
+    except ValueError:
+        logger.warning(
+            "[PB1][PREWARM][PARSE_ERROR] target=%s allow_until=%s – skipping guard",
+            target_raw,
+            allow_until_raw,
+        )
+        return None
+
+    # minute-precision comparison (seconds dropped)
+    now_time = now.time().replace(second=0, microsecond=0)
+
+    # stale skip: allow_until 이후 → 이미 늦었으므로 실행 안 함
+    if now_time > allow_until_time:
+        logger.info(
+            "[PB1][PREWARM][STALE_SKIP] now=%s allow_until=%s session=%s",
+            now.strftime("%H:%M"),
+            allow_until_raw,
+            session,
+        )
+        logger.info(
+            "[RUN_SUMMARY][RESULT] status=OK_NO_TRADE reason=SKIP_PHASE_WINDOW session=%s",
+            session,
+        )
+        return 0
+
+    # 목표 시간 전: target까지 대기
+    if now_time < target_time:
+        target_dt = datetime.combine(now.date(), target_time).replace(tzinfo=_KST)
+        wait_sec = (target_dt - now).total_seconds()
+        if wait_sec > 0:
+            logger.info(
+                "[PB1][PREWARM][WAIT] wait_sec=%.0f session=%s now=%s target=%s",
+                wait_sec,
+                session,
+                now.strftime("%H:%M"),
+                target_raw,
+            )
+            _time_mod.sleep(wait_sec)
+
+    return None
 
 
 def _verify_log_cli(argv: list[str]) -> int:
@@ -77,6 +164,10 @@ def main() -> int:
         os.getenv("PB1_SESSION_RECOVERY_CONTINUE", "0"),
         os.getenv("PB1_PHASE_GUARD_CLASSIFICATION", ""),
     )
+    guard_result = _apply_prewarm_guard()
+    if guard_result is not None:
+        return guard_result
+
     from trader.pb1_runner import main as pb1_main
     return pb1_main()
 

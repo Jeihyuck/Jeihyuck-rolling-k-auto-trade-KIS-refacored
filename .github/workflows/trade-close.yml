@@ -2,8 +2,8 @@ name: "Trade Close"
 
 "on":
   schedule:
-    # Every day 15:15 KST = Every day 06:15 UTC
-    - cron: "15 6 * * *"
+    # Every day 15:00 KST = Every day 06:00 UTC
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -44,6 +44,9 @@ env:
   PB1_PHASE_DEFAULT: "exit"
   PB1_ENTRY_ENABLED: "0"
 
+  PB1_PREWARM_ENABLED: "1"
+  PB1_TARGET_START_TIME: "15:15"
+  PB1_START_ALLOW_UNTIL: "15:20"
   PB1_LOOP_ENABLED: "1"
   PB1_RUN_LOOP_MINUTES: "15"
   PB1_LOOP_INTERVAL_SEC: "60"
@@ -77,7 +80,7 @@ defaults:
 jobs:
   trade_close:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
 
     env:
       TZ: Asia/Seoul
@@ -103,21 +106,31 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
+          now_h="$(TZ=Asia/Seoul date +%H)"
+          now_m="$(TZ=Asia/Seoul date +%M)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
           now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
           manual_mode="${{ inputs.CLOSE_MANUAL_MODE || 'live_close' }}"
 
+          prewarm_min=$((15 * 60))
+          target_start_min=$((15 * 60 + 15))
+          allow_until_min=$((15 * 60 + 20))
+          session_end_min=$((15 * 60 + 30))
+
           should_run=1
           skip_reason=""
+          wait_until_target=0
+          wait_seconds=0
           execution_route="live_close"
 
           if [[ "$event_name" == "schedule" ]]; then
-            if [[ "$now_hhmm" -lt 1515 ]]; then
-              should_run=0
-              skip_reason="close_early_start"
-            elif [[ "$now_hhmm" -gt 1520 ]]; then
+            if [[ "$now_min" -gt "$allow_until_min" ]]; then
               should_run=0
               skip_reason="skip_close_stale_start"
+            elif [[ "$now_min" -lt "$target_start_min" ]]; then
+              wait_until_target=1
+              wait_seconds=$(( (target_start_min - now_min) * 60 ))
             fi
           fi
 
@@ -127,7 +140,7 @@ jobs:
               if [[ "$confirm" != "RUN_CLOSE_MANUAL" ]]; then
                 should_run=0
                 skip_reason="manual_close_not_confirmed"
-              elif [[ "$now_hhmm" -gt 1530 ]]; then
+              elif [[ "$now_min" -gt $((15 * 60 + 30)) ]]; then
                 should_run=0
                 skip_reason="manual_close_after_1530_blocked"
               fi
@@ -136,9 +149,16 @@ jobs:
             fi
           fi
 
+          echo "[TRADE_CLOSE][PHASE_GUARD_DEBUG] now_min=${now_min} target_start_min=${target_start_min} allow_until_min=${allow_until_min} wait_seconds=${wait_seconds}"
+
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
           echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
+          echo "now_min=${now_min}" >> "$GITHUB_OUTPUT"
+          echo "target_start_min=${target_start_min}" >> "$GITHUB_OUTPUT"
+          echo "allow_until_min=${allow_until_min}" >> "$GITHUB_OUTPUT"
+          echo "wait_until_target=${wait_until_target}" >> "$GITHUB_OUTPUT"
+          echo "wait_seconds=${wait_seconds}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
           echo "valid_window=1515-1530" >> "$GITHUB_OUTPUT"
           echo "start_allow_window=1515-1520" >> "$GITHUB_OUTPUT"
@@ -154,21 +174,93 @@ jobs:
           mkdir -p repo/artifacts
           {
             echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=1515-1530 start_allow_window=1515-1520 session_end=1530"
+            echo "[TRADE_CLOSE][START_META] prewarm_start=1500 target_start=1515 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=1520 session_end=1530 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
             echo "[TRADE_CLOSE][PHASE_GUARD] should_run=0 skip_reason=${{ steps.phase_guard.outputs.skip_reason }}"
+            echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=close"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-close.log
 
-      - name: Checkout
+      - name: Resolve trading-day guard
+        id: trading_day_guard
         if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          dow="$(TZ=Asia/Seoul date +%u)"  # 1=Mon ... 7=Sun
+          is_trading_day=1
+          reason=""
+
+          if [[ "$dow" -ge 6 ]]; then
+            is_trading_day=0
+            reason="weekend"
+          fi
+
+          echo "is_trading_day=${is_trading_day}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+
+          echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason}"
+
+      - name: Emit non trading day summary
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day != '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_CLOSE][TRADING_DAY_GUARD] is_trading_day=0 reason=${{ steps.trading_day_guard.outputs.reason }}"
+            echo "[RUN_SUMMARY][RESULT] status=OK_NO_TRADE reason=NON_TRADING_DAY session=close"
+            echo "[PB1][EXIT] reason=non_trading_day"
+          } | tee repo/artifacts/trade-close.log
+
+      - name: Wait until target start
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.phase_guard.outputs.wait_until_target == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          wait_seconds="${{ steps.phase_guard.outputs.wait_seconds }}"
+          max_wait_seconds=1800
+
+          if [[ "$wait_seconds" -lt 0 ]]; then
+            wait_seconds=0
+          fi
+
+          if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
+            echo "::error::wait_seconds too large: ${wait_seconds}"
+            exit 1
+          fi
+
+          echo "[WAIT_UNTIL_TARGET][START] session=close wait_seconds=${wait_seconds}"
+          sleep "$wait_seconds"
+          echo "[WAIT_UNTIL_TARGET][DONE] session=close now_kst=$(TZ=Asia/Seoul date +%H%M%S)"
+
+      - name: Verify target time reached
+        id: target_time_check
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          now_h="$(TZ=Asia/Seoul date +%H)"
+          now_m="$(TZ=Asia/Seoul date +%M)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
+          target_min="${{ steps.phase_guard.outputs.target_start_min }}"
+
+          if [[ "$now_min" -lt "$target_min" ]]; then
+            echo "::error::target start time not reached after wait now_min=${now_min} target_min=${target_min}"
+            exit 1
+          fi
+
+          echo "[TARGET_TIME_CHECK][OK] session=close now_min=${now_min} target_min=${target_min}"
+
+      - name: Checkout
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         uses: actions/checkout@v4
         with:
           path: repo
           fetch-depth: 1
 
       - name: Verify checkout path
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: .
         run: |
           set -euo pipefail
@@ -177,19 +269,20 @@ jobs:
           echo "[CHECKOUT][OK] repo path ready"
 
       - name: Initialize Close trigger log
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: .
         run: |
           set -euo pipefail
           mkdir -p repo/artifacts
           {
             echo "[TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_CLOSE][START_META] now_kst=${{ steps.phase_guard.outputs.now_kst }} valid_window=1515-1530 start_allow_window=1515-1520 session_end=1530"
+            echo "[TRADE_CLOSE][START_META] prewarm_start=1500 target_start=1515 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=1520 session_end=1530 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
             echo "[TRADE_CLOSE][PHASE_GUARD] should_run=1 skip_reason= event=${{ steps.phase_guard.outputs.event_name }} valid_window=1515-1530"
+            echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/trade-close.log
 
       - name: Apply diag replay env overrides
-        if: steps.phase_guard.outputs.should_run == '1' && steps.phase_guard.outputs.execution_route == 'manual_replay'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.phase_guard.outputs.execution_route == 'manual_replay'
         run: |
           echo "FORCE_BLOCK_LIVE=1" >> "$GITHUB_ENV"
           echo "DISABLE_LIVE_TRADING=1" >> "$GITHUB_ENV"
@@ -200,7 +293,7 @@ jobs:
           echo "PB1_ENTRY_ENABLED=0" >> "$GITHUB_ENV"
 
       - name: Set up Python
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -208,7 +301,7 @@ jobs:
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -216,7 +309,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Guard postgres-only
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -227,14 +320,14 @@ jobs:
           fi
 
       - name: DB migrate
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-close.log
 
       - name: Verify KIS env contract
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -252,7 +345,7 @@ jobs:
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Verify exact scored final30 in DB
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -276,7 +369,7 @@ jobs:
           PY
 
       - name: Run close trade loop
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -286,7 +379,7 @@ jobs:
           echo "[PHASE][END] phase=close" | tee -a artifacts/trade-close.log
 
       - name: Verify close log contract
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -322,7 +415,7 @@ jobs:
           test "$missing" -eq 0
 
       - name: Scan for SQLite artifacts
-        if: always() && steps.phase_guard.outputs.should_run == '1'
+        if: always() && steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
         working-directory: repo
         run: |
           set -euo pipefail
