@@ -55,6 +55,50 @@ def _normalize_run_id_text(value: Any | None) -> str | None:
     text_value = str(value).strip()
     return text_value or None
 
+
+def _resolve_internal_run_id_or_none(
+    conn: "sa.Connection",
+    schema: "SchemaTables",
+    run_id: Any,
+) -> str | None:
+    """GitHub numeric run_id는 내부 runs.run_id로 사용하지 않는다.
+
+    - GitHub GITHUB_RUN_ID는 순수 숫자 문자열이므로 runs.run_id(UUID)가 아님.
+    - runs.run_id에 없는 값이면 None으로 대체하여 FK 위반 방지.
+    """
+    if run_id is None:
+        return None
+    raw = str(run_id).strip()
+    if not raw or raw.lower() in {"none", "null", ""}:
+        return None
+    # GitHub run id는 순수 숫자 문자열 → 내부 UUID 아님
+    if raw.isdigit():
+        logger.info(
+            "[DB][LEDGER_EVENT][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=github_run_id_not_internal_uuid",
+            raw,
+        )
+        return None
+    # runs 테이블에 존재하는지 확인
+    try:
+        exists = conn.execute(
+            sa.select(schema.runs.c.run_id).where(schema.runs.c.run_id == raw).limit(1)
+        ).scalar_one_or_none()
+        if exists:
+            return raw
+        logger.warning(
+            "[DB][LEDGER_EVENT][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=run_id_not_found_in_runs",
+            raw,
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "[DB][LEDGER_EVENT][RUN_ID_RESOLVE][FAIL] input=%s resolved_run_id=None err_type=%s err=%s",
+            raw,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
 __all__ = [
     "RunsRepo",
     "UniverseRepo",
@@ -3661,6 +3705,10 @@ class LedgerEventsRepo:
         trade_can_proceed: bool,
         run_id: str | None = None,
         run_window: str | None = "prep",
+        workflow_run_id: str | None = None,
+        workflow_attempt: str | None = None,
+        git_sha: str | None = None,
+        source: str | None = None,
     ) -> str | None:
         env_n = _norm_env(env)
         strategy_n = _norm_strategy(strategy) or "pb1"
@@ -3669,6 +3717,20 @@ class LedgerEventsRepo:
         event_type_n = str(event_type or "PREP_DONE").strip().upper() or "PREP_DONE"
         status_s = str(status or "").strip()
         reason_s = str(reason or "").strip()
+        # run_id는 반드시 내부 runs.run_id(UUID)만 허용한다.
+        # GitHub GITHUB_RUN_ID 숫자값은 payload_json.workflow_run_id에만 저장.
+        resolved_run_id: str | None = None
+        raw_run_id = str(run_id).strip() if run_id else None
+        if raw_run_id and not raw_run_id.isdigit():
+            # UUID 형태면 아래 append_event 내부에서 DB 존재 여부 확인
+            resolved_run_id = raw_run_id
+        elif raw_run_id and raw_run_id.isdigit():
+            logger.info(
+                "[DB][LEDGER_EVENT][RUN_ID_RESOLVE] input=%s resolved_run_id=None reason=github_run_id_not_internal_uuid",
+                raw_run_id,
+            )
+            if not workflow_run_id:
+                workflow_run_id = raw_run_id
         payload = {
             "env": env_n,
             "strategy": strategy_n,
@@ -3680,6 +3742,10 @@ class LedgerEventsRepo:
             "final30_count": int(final30_count or 0),
             "quality_ok": int(bool(quality_ok)),
             "trade_can_proceed": int(bool(trade_can_proceed)),
+            "workflow_run_id": workflow_run_id or None,
+            "workflow_attempt": workflow_attempt or None,
+            "git_sha": git_sha or None,
+            "source": source or None,
         }
         stage = "prep_done_check" if reason_s == "ledger_missing_but_final30_canonical_ok" else "prep_duplicate_guard"
 
@@ -3734,7 +3800,7 @@ class LedgerEventsRepo:
         try:
             event_id = self.append_event(
                 env=env_n,
-                run_id=run_id,
+                run_id=resolved_run_id,
                 strategy=strategy_n,
                 run_window=run_window,
                 event_type=event_type_n,
@@ -3743,6 +3809,11 @@ class LedgerEventsRepo:
                 reasons=[reason_s] if reason_s else None,
                 stage=stage,
                 payload_json=payload,
+            )
+            logger.info(
+                "[DB][LEDGER_EVENT][APPEND_OK] event_type=%s run_id=%s",
+                event_type_n,
+                resolved_run_id,
             )
             logger.info(
                 "[DB][LEDGER][PREP_EVENT][UPSERT_OK] env=%s strategy=%s as_of=%s trade_date=%s event=%s status=%s reason=%s event_id=%s",
@@ -3771,6 +3842,31 @@ class LedgerEventsRepo:
                 type(exc).__name__,
                 exc,
             )
+            logger.warning(
+                "[DB][LEDGER_EVENT][APPEND_SOFT_FAIL] event_type=%s fallback=job_checkpoint err=%s",
+                event_type_n,
+                exc,
+            )
+            try:
+                save_job_checkpoint(
+                    self.engine,
+                    f"{event_type_n}:{env_n}:{as_of_str}",
+                    payload,
+                )
+                logger.info(
+                    "[DB][JOB_CHECKPOINT][%s][UPSERT_OK] env=%s strategy=%s as_of=%s",
+                    event_type_n,
+                    env_n,
+                    strategy_n,
+                    as_of_str,
+                )
+            except Exception as cp_exc:
+                logger.warning(
+                    "[DB][JOB_CHECKPOINT][%s][FAIL] env=%s err=%s",
+                    event_type_n,
+                    env_n,
+                    cp_exc,
+                )
             if db_store_required:
                 raise
             return None

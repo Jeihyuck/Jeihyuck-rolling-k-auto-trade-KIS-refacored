@@ -24,8 +24,8 @@ def _read(name: str) -> str:
 
 def test_am_cron_is_prewarm():
     content = _read("trade-am.yml")
-    assert re.search(r'cron:\s*"45 23 \* \* \*"', content), (
-        "trade-am.yml cron should be '45 23 * * *' (08:45 KST prewarm)"
+    assert re.search(r'cron:\s*"30 23 \* \* \*"', content), (
+        "trade-am.yml cron should be '30 23 * * *' (08:30 KST prewarm)"
     )
 
 
@@ -120,8 +120,8 @@ def test_close_has_wait_until_target_start_step():
 
 def test_am_timeout_280():
     content = _read("trade-am.yml")
-    assert re.search(r"timeout-minutes:\s*280", content), (
-        "trade-am.yml timeout-minutes should be 280"
+    assert re.search(r"timeout-minutes:\s*295", content), (
+        "trade-am.yml timeout-minutes should be 295"
     )
 
 

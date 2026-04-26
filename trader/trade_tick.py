@@ -44,6 +44,13 @@ def _apply_prewarm_guard(now_override: datetime | None = None) -> int | None:
 
     # 비거래일 (주말) guard
     if now.weekday() >= 5:  # 5=Sat, 6=Sun
+        compute_only = os.getenv("PB1_COMPUTE_ONLY", "0") in {"1", "true"}
+        if compute_only:
+            logger.info(
+                "[PB1][SESSION_GUARD][NONTRADING_DAY_COMPUTE_ONLY] trading_day=0 order_allowed=0 reason=NON_TRADING_DAY session=%s",
+                session,
+            )
+            return None  # 로직 계속, 주문만 차단
         logger.info(
             "[PB1][SESSION_GUARD][NONTRADING_DAY_EXIT] session=%s dow=%s",
             session,
@@ -144,6 +151,10 @@ def main() -> int:
         return _verify_log_cli(sys.argv[2:])
     os.environ.setdefault("PB1_TICK_HARD_TIMEOUT_SEC", "90")
     os.environ.setdefault("PB1_LAST_STAGE", "trade_tick.bootstrap")
+    compute_only = os.getenv("PB1_COMPUTE_ONLY", "0") in {"1", "true"}
+    order_allowed = os.getenv("ORDER_ALLOWED", "1") in {"1", "true"}
+    order_block_reason = os.getenv("PB1_ORDER_BLOCK_REASON", "")
+    session = os.getenv("PB1_SESSION_KIND", "")
     logger.info("[TRADE][BOOT][START] module=trade_tick_alias")
     logger.info(
         "[TRADE][BOOT][ENV] MODE=%s STRATEGY_ENV=%s KIS_ENV=%s FAIL_IF_POOL_MISSING=%s CANDIDATE_POOL_STRATEGY=%s PB1_PHASE_DEFAULT=%s PB1_TICK_HARD_TIMEOUT_SEC=%s PB1_LAST_STAGE=%s",
@@ -167,9 +178,22 @@ def main() -> int:
     guard_result = _apply_prewarm_guard()
     if guard_result is not None:
         return guard_result
+    if compute_only:
+        logger.info(
+            "[PB1][SESSION_GUARD][COMPUTE_ONLY_MODE] compute_only=1 order_allowed=%d reason=%s session=%s",
+            int(order_allowed),
+            order_block_reason or "NON_TRADING_DAY",
+            session,
+        )
 
     from trader.pb1_runner import main as pb1_main
-    return pb1_main()
+    rc = pb1_main()
+    if compute_only and not order_allowed:
+        logger.info(
+            "[RUN_SUMMARY][RESULT] status=OK_COMPUTE_ONLY reason=NON_TRADING_DAY_COMPUTE_ONLY session=%s",
+            session,
+        )
+    return rc
 
 
 if __name__ == "__main__":

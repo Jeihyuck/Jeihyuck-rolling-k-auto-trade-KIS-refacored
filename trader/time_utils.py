@@ -265,6 +265,13 @@ def _resolve_pykrx_previous_or_same(d: date) -> date | None:
     if cache_key in _PYKRX_PREV_OR_SAME_CACHE:
         return _PYKRX_PREV_OR_SAME_CACHE[cache_key]
 
+    # 토/일은 PyKRX 호출 전에 조기 반환 – IndexError/PYKRX_FAIL 방지
+    if d.weekday() >= 5:
+        logger.info("[TIME][TRADING_DAY][WEEKEND] date=%s is_trading_day=0", d.isoformat())
+        result = _fallback_previous_or_same_weekday(d)
+        _PYKRX_PREV_OR_SAME_CACHE[cache_key] = result
+        return result
+
     resolved, err_type = _safe_get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
     if not resolved:
         _log_pykrx_fail_once(

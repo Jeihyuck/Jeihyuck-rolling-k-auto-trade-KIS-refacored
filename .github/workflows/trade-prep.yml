@@ -24,8 +24,10 @@ permissions:
 env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
-  MODE: trade
-  PB1_FORCE_TRADE_SESSION: "auto"
+  MODE: prep
+  PB1_FORCE_TRADE_SESSION: "prep"
+  PB1_SESSION_KIND: "prep"
+  FORCE_PB1_PHASE: "prep"
   PB1_FORCE_TRADE_AM_LATE_START: "0"
   PB1_FORCE_TRADE_AM_AFTER_1030: "0"
   PB1_FORCE_TRADE_PM_LATE_START: "0"
@@ -101,7 +103,8 @@ jobs:
           mkdir -p repo/artifacts
           now_kst="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M:%S %Z')"
           {
-            echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE:-trade}"
+            echo "[RESOLVE] event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} mode=${MODE:-prep} phase=prep"
+            echo "[PREP][MODE] mode=${MODE:-prep} phase=prep session=prep"
             echo "[RESOLVE] force_trade_session=${PB1_FORCE_TRADE_SESSION:-auto}"
             echo "[RESOLVE] am_recovery=${PB1_ENABLE_LATE_AM_RECOVERY:-0} am_recovery_until=${PB1_AM_RECOVERY_ALLOW_UNTIL:-unset}"
             echo "[RESOLVE] pm_recovery=${PB1_ENABLE_LATE_PM_RECOVERY:-0} pm_recovery_until=${PB1_PM_RECOVERY_ALLOW_UNTIL:-unset}"

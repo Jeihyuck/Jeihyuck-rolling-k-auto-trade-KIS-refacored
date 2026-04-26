@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 
 from trader.db.engine import get_engine
-from trader.db.repos import LedgerEventsRepo, load_final30_scored_db_only
+from trader.db.repos import LedgerEventsRepo, load_final30_scored_db_only, save_job_checkpoint
 from trader.final30_quality import build_canonical_prep_verdict, summarize_final30_quality
 from trader.time_utils import now_kst, resolve_trade_context
 
@@ -84,20 +84,49 @@ def _upsert_duplicate_ready_event(
             final30_count=final30_count,
             quality_ok=True,
             trade_can_proceed=True,
-            run_id=os.getenv("GITHUB_RUN_ID"),
+            run_id=None,
             run_window="prep",
+            workflow_run_id=os.getenv("GITHUB_RUN_ID"),
+            workflow_attempt=os.getenv("GITHUB_RUN_ATTEMPT"),
+            git_sha=os.getenv("GITHUB_SHA"),
+            source="duplicate_guard",
         )
     except Exception as exc:
-        logger.exception(
-            "[PREP][DUPLICATE_GUARD][LEDGER_UPSERT][FAIL] env=%s as_of=%s trade_date=%s err_type=%s err=%s",
-            env,
-            as_of,
-            trade_date,
-            type(exc).__name__,
+        logger.warning(
+            "[DB][LEDGER_EVENT][APPEND_SOFT_FAIL] event_type=PREP_DONE fallback=job_checkpoint err=%s",
             exc,
         )
+        try:
+            save_job_checkpoint(
+                get_engine(),
+                f"PREP_DONE:{env}:{as_of}",
+                {
+                    "env": env,
+                    "as_of": str(as_of),
+                    "trade_date": str(trade_date),
+                    "final30_count": final30_count,
+                    "status": "READY_FROM_CANONICAL",
+                    "reason": "canonical_prep_already_ready",
+                    "workflow_run_id": os.getenv("GITHUB_RUN_ID"),
+                    "workflow_attempt": os.getenv("GITHUB_RUN_ATTEMPT"),
+                    "git_sha": os.getenv("GITHUB_SHA"),
+                    "source": "duplicate_guard",
+                },
+            )
+            logger.info(
+                "[DB][JOB_CHECKPOINT][PREP_DONE][UPSERT_OK] env=%s as_of=%s trade_date=%s",
+                env,
+                as_of,
+                trade_date,
+            )
+        except Exception as cp_exc:
+            logger.warning(
+                "[DB][JOB_CHECKPOINT][PREP_DONE][FAIL] env=%s err=%s",
+                env,
+                cp_exc,
+            )
         if _db_store_required():
-            raise
+            raise exc
         return None
 
 

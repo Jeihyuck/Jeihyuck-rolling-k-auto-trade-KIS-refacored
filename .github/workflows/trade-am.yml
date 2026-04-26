@@ -3,8 +3,8 @@ name: "Trade AM"
 
 "on":
   schedule:
-    # Every day 08:45 KST = Every day 23:45 UTC previous day
-    - cron: "45 23 * * *"
+    # Every day 08:30 KST = Every day 23:30 UTC previous day
+    - cron: "30 23 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -75,7 +75,7 @@ defaults:
 jobs:
   trade_am:
     runs-on: ubuntu-latest
-    timeout-minutes: 280
+    timeout-minutes: 295
 
     env:
       TZ: Asia/Seoul
@@ -107,7 +107,7 @@ jobs:
           now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          prewarm_min=$((8 * 60 + 45))
+          prewarm_min=$((8 * 60 + 30))
           target_start_min=$((9 * 60))
           allow_until_min=$((9 * 60 + 10))
           session_end_min=$((12 * 60 + 55))
@@ -161,7 +161,7 @@ jobs:
           mkdir -p repo/artifacts
           {
             echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][START_META] prewarm_start=0845 target_start=0900 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=0910 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
+            echo "[TRADE_AM][START_META] prewarm_start=0830 target_start=0900 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=0910 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
             echo "[TRADE_AM][PHASE_GUARD] should_run=0 skip_reason=${{ steps.phase_guard.outputs.skip_reason }}"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=am"
@@ -188,20 +188,26 @@ jobs:
 
           echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason}"
 
-      - name: Emit non trading day summary
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day != '1'
+      - name: Resolve order mode guard
+        id: order_mode_guard
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: .
         run: |
           set -euo pipefail
-          mkdir -p repo/artifacts
-          {
-            echo "[TRADE_AM][TRADING_DAY_GUARD] is_trading_day=0 reason=${{ steps.trading_day_guard.outputs.reason }}"
-            echo "[RUN_SUMMARY][RESULT] status=OK_NO_TRADE reason=NON_TRADING_DAY session=am"
-            echo "[PB1][EXIT] reason=non_trading_day"
-          } | tee repo/artifacts/trade-am.log
+          is_trading_day="${{ steps.trading_day_guard.outputs.is_trading_day }}"
+          if [[ "$is_trading_day" == "1" ]]; then
+            order_allowed=1
+            reason=""
+          else
+            order_allowed=0
+            reason="non_trading_day"
+          fi
+          echo "order_allowed=${order_allowed}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "[TRADE_AM][ORDER_MODE] order_allowed=${order_allowed} reason=${reason}"
 
       - name: Wait until target start
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.phase_guard.outputs.wait_until_target == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.phase_guard.outputs.wait_until_target == '1'
         working-directory: .
         run: |
           set -euo pipefail
@@ -223,7 +229,7 @@ jobs:
 
       - name: Verify target time reached
         id: target_time_check
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: .
         run: |
           set -euo pipefail
@@ -240,14 +246,14 @@ jobs:
           echo "[TARGET_TIME_CHECK][OK] session=am now_min=${now_min} target_min=${target_min}"
 
       - name: Checkout
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         uses: actions/checkout@v4
         with:
           path: repo
           fetch-depth: 1
 
       - name: Verify checkout path
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: .
         run: |
           set -euo pipefail
@@ -256,20 +262,32 @@ jobs:
           echo "[CHECKOUT][OK] repo path ready"
 
       - name: Initialize AM trigger log
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: .
         run: |
           set -euo pipefail
           mkdir -p repo/artifacts
           {
             echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][START_META] prewarm_start=0845 target_start=0900 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=0910 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
+            echo "[TRADE_AM][START_META] prewarm_start=0830 target_start=0900 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=0910 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
             echo "[TRADE_AM][PHASE_GUARD] should_run=1 skip_reason= event=${{ steps.phase_guard.outputs.event_name }} valid_window=0900-1255"
+            echo "[TRADE_AM][TRADING_DAY_GUARD] is_trading_day=${{ steps.trading_day_guard.outputs.is_trading_day }} reason=${{ steps.trading_day_guard.outputs.reason }}"
+            echo "[TRADE_AM][ORDER_MODE] order_allowed=${{ steps.order_mode_guard.outputs.order_allowed }} reason=${{ steps.order_mode_guard.outputs.reason }}"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/trade-am.log
 
+      - name: Emit non trading day summary
+        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day != '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          {
+            echo "[RUN_SUMMARY][RESULT] status=OK_COMPUTE_ONLY reason=NON_TRADING_DAY session=am"
+            echo "[PB1][EXIT] reason=non_trading_day_compute_only"
+          } | tee -a repo/artifacts/trade-am.log
+
       - name: Set up Python
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -277,7 +295,7 @@ jobs:
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -285,7 +303,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Guard postgres-only
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -296,14 +314,14 @@ jobs:
           fi
 
       - name: DB migrate
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
           python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-am.log
 
       - name: Verify KIS env contract
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -321,7 +339,7 @@ jobs:
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Verify exact scored final30 in DB
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -345,8 +363,16 @@ jobs:
           PY
 
       - name: Run AM trade loop
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
+        env:
+          ORDER_ALLOWED: ${{ steps.order_mode_guard.outputs.order_allowed }}
+          PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          PB1_ORDER_BLOCK_REASON: ${{ steps.order_mode_guard.outputs.reason }}
+          NO_TRADE: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          DISABLE_LIVE_TRADING: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          LIVE_TRADING_ENABLED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          KIS_HTTP_ENABLED: "1"
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -355,7 +381,7 @@ jobs:
           echo "[PHASE][END] phase=am" | tee -a artifacts/trade-am.log
 
       - name: Verify AM log contract
-        if: steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -387,7 +413,7 @@ jobs:
           test "$missing" -eq 0
 
       - name: Scan for SQLite artifacts
-        if: always() && steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        if: always() && steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
