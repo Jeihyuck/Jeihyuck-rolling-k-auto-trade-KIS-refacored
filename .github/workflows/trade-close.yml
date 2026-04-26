@@ -1,3 +1,7 @@
+# Close Backup Workflow.
+# trade-afternoon.yml handles PM+Close as the primary afternoon workflow.
+# This workflow acts as emergency fallback if trade-afternoon.yml fails mid-run.
+# Exit phase only. New BUY orders are forbidden.
 name: "Trade Close"
 
 "on":
@@ -180,6 +184,61 @@ jobs:
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=close"
             echo "[PB1][EXIT] reason=phase_guard_skip"
           } | tee repo/artifacts/trade-close.log
+
+      - name: Check if trade-afternoon close already completed
+        id: close_done_check
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          already_done=0
+          skip_reason=""
+
+          # Check DB-side close_done marker written by trade-afternoon.yml
+          # If PBCORE_DB_URL is available, query the run_marker table
+          if [[ -n "${PBCORE_DB_URL:-}" ]]; then
+            today_kst="$(TZ=Asia/Seoul date +%Y-%m-%d)"
+            result="$(python3 - <<'PY' 2>/dev/null || echo "check_failed"
+          import os, sys
+          try:
+              import psycopg2
+              conn = psycopg2.connect(os.environ["PBCORE_DB_URL"])
+              cur = conn.cursor()
+              cur.execute(
+                  "SELECT 1 FROM trade_run_markers WHERE marker_key = %s AND trade_date = %s LIMIT 1",
+                  ("afternoon_close_done", os.environ.get("TODAY_KST", ""))
+              )
+              row = cur.fetchone()
+              conn.close()
+              print("found" if row else "not_found")
+          except Exception as e:
+              print(f"check_failed: {e}", file=sys.stderr)
+              print("not_found")
+          PY
+          )" || result="not_found"
+
+              if [[ "$result" == "found" ]]; then
+                already_done=1
+                skip_reason="afternoon_close_already_completed"
+              fi
+          fi
+
+          echo "already_done=${already_done}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+          echo "[TRADE_CLOSE_BACKUP][CLOSE_DONE_CHECK] already_done=${already_done} skip_reason=${skip_reason}"
+        env:
+          TODAY_KST: "$(TZ=Asia/Seoul date +%Y-%m-%d)"
+
+      - name: Emit close-already-done skip
+        if: steps.phase_guard.outputs.should_run == '1' && steps.close_done_check.outputs.already_done == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          {
+            echo "[TRADE_CLOSE_BACKUP][SKIP] reason=afternoon_close_already_completed"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_CLOSE_BACKUP reason=afternoon_close_already_completed session=close"
+            echo "[PB1][EXIT] reason=close_done_by_afternoon"
+          } | tee -a repo/artifacts/trade-close.log
 
       - name: Resolve trading-day guard
         id: trading_day_guard
@@ -387,7 +446,7 @@ jobs:
           PY
 
       - name: Run close trade loop
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.close_done_check.outputs.already_done != '1'
         working-directory: repo
         env:
           ORDER_ALLOWED: ${{ steps.order_mode_guard.outputs.order_allowed }}

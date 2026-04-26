@@ -3,8 +3,8 @@ name: "Trade AM"
 
 "on":
   schedule:
-    # Every day 08:30 KST = Every day 23:30 UTC previous day
-    - cron: "30 23 * * *"
+    # Every day 08:15 KST = Every day 23:15 UTC previous day
+    - cron: "15 23 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -37,7 +37,7 @@ env:
 
   PB1_PREWARM_ENABLED: "1"
   PB1_TARGET_START_TIME: "09:00"
-  PB1_START_ALLOW_UNTIL: "09:10"
+  PB1_START_ALLOW_UNTIL: "09:25"
   PB1_LOOP_ENABLED: "1"
   PB1_RUN_LOOP_MINUTES: "235"
   PB1_LOOP_INTERVAL_SEC: "60"
@@ -103,14 +103,27 @@ jobs:
           set -euo pipefail
           now_h="$(TZ=Asia/Seoul date +%H)"
           now_m="$(TZ=Asia/Seoul date +%M)"
+          now_s="$(TZ=Asia/Seoul date +%S)"
           now_min=$((10#$now_h * 60 + 10#$now_m))
           now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
+          now_hhmmss="$(TZ=Asia/Seoul date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          prewarm_min=$((8 * 60 + 30))
+          prewarm_min=$((8 * 60 + 15))
+          schedule_expected_min=$((8 * 60 + 15))
           target_start_min=$((9 * 60))
-          allow_until_min=$((9 * 60 + 10))
+          allow_until_min=$((9 * 60 + 25))
           session_end_min=$((12 * 60 + 55))
+
+          delay_seconds=$(( (now_min - schedule_expected_min) * 60 + 10#$now_s ))
+          if [[ "$delay_seconds" -lt 0 ]]; then
+            delay_seconds=0
+          fi
+
+          late_start=0
+          if [[ "$now_min" -gt "$target_start_min" ]]; then
+            late_start=1
+          fi
 
           should_run=1
           skip_reason=""
@@ -138,19 +151,24 @@ jobs:
             fi
           fi
 
+          echo "[TRADE_AM][START_META] schedule_expected=0815 actual_start=${now_hhmmss} delay_seconds=${delay_seconds}"
           echo "[TRADE_AM][PHASE_GUARD_DEBUG] now_min=${now_min} target_start_min=${target_start_min} allow_until_min=${allow_until_min} wait_seconds=${wait_seconds}"
+          echo "[TRADE_AM][LATE_START] late_start=${late_start} mode=normal"
 
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
           echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
+          echo "now_hhmmss=${now_hhmmss}" >> "$GITHUB_OUTPUT"
           echo "now_min=${now_min}" >> "$GITHUB_OUTPUT"
+          echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
+          echo "late_start=${late_start}" >> "$GITHUB_OUTPUT"
           echo "target_start_min=${target_start_min}" >> "$GITHUB_OUTPUT"
           echo "allow_until_min=${allow_until_min}" >> "$GITHUB_OUTPUT"
           echo "wait_until_target=${wait_until_target}" >> "$GITHUB_OUTPUT"
           echo "wait_seconds=${wait_seconds}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
           echo "valid_window=0900-1255" >> "$GITHUB_OUTPUT"
-          echo "start_allow_window=0900-0910" >> "$GITHUB_OUTPUT"
+          echo "start_allow_window=0900-0925" >> "$GITHUB_OUTPUT"
           echo "session_end=1255" >> "$GITHUB_OUTPUT"
 
       - name: Emit AM skip summary
@@ -161,7 +179,7 @@ jobs:
           mkdir -p repo/artifacts
           {
             echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][START_META] prewarm_start=0830 target_start=0900 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=0910 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
+            echo "[TRADE_AM][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} prewarm_start=0815 target_start=0900 start_allow_until=0925 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
             echo "[TRADE_AM][PHASE_GUARD] should_run=0 skip_reason=${{ steps.phase_guard.outputs.skip_reason }}"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=am"
@@ -269,7 +287,7 @@ jobs:
           mkdir -p repo/artifacts
           {
             echo "[TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[TRADE_AM][START_META] prewarm_start=0830 target_start=0900 actual_start=${{ steps.phase_guard.outputs.now_kst }} start_allow_until=0910 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
+            echo "[TRADE_AM][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} prewarm_start=0815 target_start=0900 start_allow_until=0925 session_end=1255 wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }}"
             echo "[TRADE_AM][PHASE_GUARD] should_run=1 skip_reason= event=${{ steps.phase_guard.outputs.event_name }} valid_window=0900-1255"
             echo "[TRADE_AM][TRADING_DAY_GUARD] is_trading_day=${{ steps.trading_day_guard.outputs.is_trading_day }} reason=${{ steps.trading_day_guard.outputs.reason }}"
             echo "[TRADE_AM][ORDER_MODE] order_allowed=${{ steps.order_mode_guard.outputs.order_allowed }} reason=${{ steps.order_mode_guard.outputs.reason }}"

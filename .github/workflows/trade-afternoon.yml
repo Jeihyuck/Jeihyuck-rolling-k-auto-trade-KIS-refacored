@@ -1,0 +1,470 @@
+name: "Trade Afternoon"
+
+"on":
+  schedule:
+    # Every day 12:15 KST = 03:15 UTC
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+    inputs:
+      STRATEGY_ENV:
+        description: Strategy environment
+        required: false
+        default: practice
+        type: choice
+        options:
+          - practice
+      CONFIRM_MANUAL_AFTERNOON:
+        description: "Type RUN_AFTERNOON_MANUAL to run afternoon manually"
+        required: false
+        default: ""
+      AFTERNOON_MANUAL_MODE:
+        description: afternoon manual execution mode
+        required: false
+        default: compute_only
+        type: choice
+        options:
+          - live_afternoon
+          - compute_only
+          - diag_replay
+
+concurrency:
+  group: trade-afternoon-practice-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  MODE: trade
+
+  PB1_PREWARM_ENABLED: "1"
+  AFTERNOON_PREWARM_START_TIME: "12:15"
+  PM_TARGET_START_TIME: "13:00"
+  PM_START_ALLOW_UNTIL: "13:30"
+  PM_SESSION_END: "15:10"
+  CLOSE_TARGET_START_TIME: "15:15"
+  CLOSE_START_ALLOW_UNTIL: "15:30"
+  CLOSE_SESSION_END: "15:30"
+
+  PB1_LOOP_ENABLED: "1"
+  PB1_LOOP_INTERVAL_SEC: "60"
+  PB1_SESSION_EXIT_GRACE_SEC: "15"
+
+  STRATEGY_MODE: "LIVE"
+  FORCE_STRATEGY_MODE: "LIVE"
+  DRY_RUN: "0"
+  DISABLE_LIVE_TRADING: "0"
+  LIVE_TRADING_ENABLED: "1"
+  FORCE_BLOCK_LIVE: "0"
+  ALLOW_LIVE_GATE: "1"
+  KIS_HTTP_ENABLED: "1"
+  NO_TRADE: "0"
+
+  STRATEGY_ENV: practice
+  KIS_ENV: practice
+  FINAL30_SOURCE_MODE: "db_only"
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
+  WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
+  PB1_REQUIRE_SCORED_FINAL30: "1"
+  PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
+  TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
+
+  DB_LOCK_TIMEOUT_MS: "5000"
+  DB_STATEMENT_TIMEOUT_MS: "15000"
+  DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+  PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  trade_afternoon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 250
+
+    env:
+      TZ: Asia/Seoul
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+      STRATEGY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
+      KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
+
+    steps:
+      - name: Resolve afternoon boot guard
+        id: boot_guard
+        working-directory: .
+        run: |
+          set -euo pipefail
+
+          now_h="$(TZ=Asia/Seoul date +%H)"
+          now_m="$(TZ=Asia/Seoul date +%M)"
+          now_s="$(TZ=Asia/Seoul date +%S)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
+          now_hhmm="$(TZ=Asia/Seoul date +%H%M)"
+          now_hhmmss="$(TZ=Asia/Seoul date +%H%M%S)"
+          event_name="${GITHUB_EVENT_NAME:-unknown}"
+
+          schedule_expected_min=$((12 * 60 + 15))
+          pm_target_min=$((13 * 60))
+          pm_allow_until_min=$((13 * 60 + 30))
+          pm_end_min=$((15 * 60 + 10))
+          close_target_min=$((15 * 60 + 15))
+          close_allow_until_min=$((15 * 60 + 30))
+          close_end_min=$((15 * 60 + 30))
+
+          delay_seconds=$(( (now_min - schedule_expected_min) * 60 + 10#$now_s ))
+          if [[ "$delay_seconds" -lt 0 ]]; then
+            delay_seconds=0
+          fi
+
+          should_run=1
+          skip_reason=""
+          route="normal"
+
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            confirm="${{ inputs.CONFIRM_MANUAL_AFTERNOON || '' }}"
+            manual_mode="${{ inputs.AFTERNOON_MANUAL_MODE || 'compute_only' }}"
+            if [[ "$confirm" != "RUN_AFTERNOON_MANUAL" ]]; then
+              should_run=0
+              skip_reason="manual_afternoon_not_confirmed"
+            fi
+            route="$manual_mode"
+          fi
+
+          # 전체 close 종료 이후에 시작한 경우만 전체 skip.
+          # PM target보다 늦게 시작했다고 전체 skip하지 말 것.
+          # 늦게 시작해도 Close라도 살리는 것이 목적이다.
+          if [[ "$event_name" == "schedule" && "$now_min" -gt "$close_end_min" ]]; then
+            should_run=0
+            skip_reason="skip_afternoon_after_close_end"
+          fi
+
+          echo "[TRADE_AFTERNOON][BOOT_GUARD] event=${event_name} should_run=${should_run} skip_reason=${skip_reason} now_kst=${now_hhmmss} schedule_expected=1215 delay_seconds=${delay_seconds} route=${route}"
+
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+          echo "now_kst=${now_hhmm}" >> "$GITHUB_OUTPUT"
+          echo "now_hhmmss=${now_hhmmss}" >> "$GITHUB_OUTPUT"
+          echo "now_min=${now_min}" >> "$GITHUB_OUTPUT"
+          echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
+          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "route=${route}" >> "$GITHUB_OUTPUT"
+          echo "pm_target_min=${pm_target_min}" >> "$GITHUB_OUTPUT"
+          echo "pm_allow_until_min=${pm_allow_until_min}" >> "$GITHUB_OUTPUT"
+          echo "pm_end_min=${pm_end_min}" >> "$GITHUB_OUTPUT"
+          echo "close_target_min=${close_target_min}" >> "$GITHUB_OUTPUT"
+          echo "close_allow_until_min=${close_allow_until_min}" >> "$GITHUB_OUTPUT"
+          echo "close_end_min=${close_end_min}" >> "$GITHUB_OUTPUT"
+
+      - name: Emit afternoon skip summary
+        if: steps.boot_guard.outputs.should_run != '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_AFTERNOON][TRIGGER] event=${{ steps.boot_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AFTERNOON][START_META] schedule_expected=1215 actual_start=${{ steps.boot_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.boot_guard.outputs.delay_seconds }}"
+            echo "[TRADE_AFTERNOON][BOOT_GUARD] should_run=0 skip_reason=${{ steps.boot_guard.outputs.skip_reason }}"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_AFTERNOON_WINDOW reason=${{ steps.boot_guard.outputs.skip_reason }}"
+            echo "[PB1][EXIT] reason=afternoon_boot_guard_skip"
+          } | tee repo/artifacts/trade-afternoon.log
+
+      - name: Checkout
+        if: steps.boot_guard.outputs.should_run == '1'
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Verify checkout path and initialize log
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
+          test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          mkdir -p repo/artifacts
+          {
+            echo "[TRADE_AFTERNOON][TRIGGER] event=${{ steps.boot_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRADE_AFTERNOON][START_META] schedule_expected=1215 actual_start=${{ steps.boot_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.boot_guard.outputs.delay_seconds }}"
+            echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
+          } | tee repo/artifacts/trade-afternoon.log
+
+      - name: Resolve trading-day guard
+        id: trading_day_guard
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          dow="$(TZ=Asia/Seoul date +%u)"
+          is_trading_day=1
+          reason=""
+
+          if [[ "$dow" -ge 6 ]]; then
+            is_trading_day=0
+            reason="weekend"
+          fi
+
+          echo "is_trading_day=${is_trading_day}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason}" | tee -a repo/artifacts/trade-afternoon.log
+
+      - name: Set up Python
+        if: steps.boot_guard.outputs.should_run == '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Guard postgres-only
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+          if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+            echo "::error::PBCORE_DB_URL must be postgres-only."
+            exit 1
+          fi
+
+      - name: DB migrate
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m trader.db.migrate 2>&1 | tee -a artifacts/trade-afternoon.log
+
+      - name: Verify KIS env contract
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          echo "[ENV_CHECK] STRATEGY_ENV=${STRATEGY_ENV:-}"
+          echo "[ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
+          echo "[ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
+          test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+          test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+          test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+          test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+          test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+          test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+          test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+          [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
+          echo "[ENV_CHECK][OK] KIS env contract satisfied" | tee -a artifacts/trade-afternoon.log
+
+      - name: Verify exact scored final30 in DB
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY' 2>&1 | tee -a artifacts/trade-afternoon.log
+          import os
+          from trader.db.engine import get_engine
+          from trader.db.repos import load_final30_scored_db_only
+          from trader.time_utils import now_kst, resolve_trade_context
+
+          env = os.getenv("STRATEGY_ENV", "practice")
+          ctx = resolve_trade_context(now=now_kst(), env=env)
+          df = load_final30_scored_db_only(
+              get_engine(),
+              env=env,
+              strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+              as_of=ctx["as_of"],
+              require_exact_rows=30,
+              fail_if_missing=True,
+          )
+          print(f"[TRADE][FINAL30][DB_EXACT_LOAD] rows={len(df)} as_of={ctx['as_of']} session=afternoon")
+          PY
+
+      - name: Wait until PM target start
+        if: steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          now_h="$(TZ=Asia/Seoul date +%H)"
+          now_m="$(TZ=Asia/Seoul date +%M)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
+          pm_target_min=$((13 * 60))
+
+          if [[ "$now_min" -lt "$pm_target_min" ]]; then
+            wait_seconds=$(( (pm_target_min - now_min) * 60 ))
+            echo "[WAIT_UNTIL_PM][START] wait_seconds=${wait_seconds}" | tee -a artifacts/trade-afternoon.log
+            sleep "$wait_seconds"
+            echo "[WAIT_UNTIL_PM][DONE] now_kst=$(TZ=Asia/Seoul date +%H%M%S)" | tee -a artifacts/trade-afternoon.log
+          else
+            echo "[WAIT_UNTIL_PM][SKIP] already_after_pm_target now_min=${now_min}" | tee -a artifacts/trade-afternoon.log
+          fi
+
+      - name: Run PM entry loop
+        id: pm_loop
+        if: steps.boot_guard.outputs.should_run == '1'
+        continue-on-error: true
+        working-directory: repo
+        env:
+          PB1_SESSION_KIND: "pm"
+          PB1_FORCE_TRADE_SESSION: "pm"
+          FORCE_MARKET_WINDOW: "day"
+          FORCE_PB1_PHASE: "entry"
+          PB1_PHASE_DEFAULT: "entry"
+          PB1_ENTRY_ENABLED: "1"
+          PB1_TARGET_START_TIME: "13:00"
+          PB1_START_ALLOW_UNTIL: "13:30"
+          PB1_PM_SESSION_END: "15:10"
+          PB1_RUN_LOOP_MINUTES: "130"
+          PB1_TICK_HARD_TIMEOUT_SEC: "90"
+          ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          PB1_ORDER_BLOCK_REASON: ${{ steps.trading_day_guard.outputs.reason }}
+          NO_TRADE: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          DISABLE_LIVE_TRADING: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          LIVE_TRADING_ENABLED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          KIS_HTTP_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          echo "[PHASE][START] phase=pm session_window=1300-1510 entry_enabled=1" | tee -a artifacts/trade-afternoon.log
+          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][END] phase=pm" | tee -a artifacts/trade-afternoon.log
+
+      - name: Wait until Close target start
+        if: always() && steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          now_h="$(TZ=Asia/Seoul date +%H)"
+          now_m="$(TZ=Asia/Seoul date +%M)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
+          close_target_min=$((15 * 60 + 15))
+
+          if [[ "$now_min" -lt "$close_target_min" ]]; then
+            wait_seconds=$(( (close_target_min - now_min) * 60 ))
+            echo "[WAIT_UNTIL_CLOSE][START] wait_seconds=${wait_seconds}" | tee -a artifacts/trade-afternoon.log
+            sleep "$wait_seconds"
+            echo "[WAIT_UNTIL_CLOSE][DONE] now_kst=$(TZ=Asia/Seoul date +%H%M%S)" | tee -a artifacts/trade-afternoon.log
+          else
+            echo "[WAIT_UNTIL_CLOSE][SKIP] already_after_close_target now_min=${now_min}" | tee -a artifacts/trade-afternoon.log
+          fi
+
+      - name: Run Close exit loop
+        id: close_loop
+        if: always() && steps.boot_guard.outputs.should_run == '1'
+        continue-on-error: true
+        working-directory: repo
+        env:
+          PB1_SESSION_KIND: "close"
+          PB1_FORCE_TRADE_SESSION: "close"
+          FORCE_MARKET_WINDOW: "close"
+          FORCE_PB1_PHASE: "exit"
+          PB1_PHASE_DEFAULT: "exit"
+          PB1_ENTRY_ENABLED: "0"
+          PB1_TARGET_START_TIME: "15:15"
+          PB1_START_ALLOW_UNTIL: "15:30"
+          PB1_CLOSE_SESSION_END: "15:30"
+          PB1_RUN_LOOP_MINUTES: "15"
+          PB1_TICK_HARD_TIMEOUT_SEC: "45"
+          ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          PB1_ORDER_BLOCK_REASON: ${{ steps.trading_day_guard.outputs.reason }}
+          NO_TRADE: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          DISABLE_LIVE_TRADING: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          LIVE_TRADING_ENABLED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          KIS_HTTP_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          echo "[PHASE][START] phase=close session_window=1515-1530 entry_enabled=0" | tee -a artifacts/trade-afternoon.log
+          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][END] phase=close" | tee -a artifacts/trade-afternoon.log
+          echo "[TRADE_CLOSE][DONE] close_done=1 now_kst=$(TZ=Asia/Seoul date +%H%M%S)" | tee -a artifacts/trade-afternoon.log
+
+      - name: Verify afternoon log contract
+        if: always() && steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          missing=0
+
+          for pattern in \
+            "\[TRADE_AFTERNOON\]\[TRIGGER\]" \
+            "\[TRADE_AFTERNOON\]\[START_META\]" \
+            "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" \
+            "\[PHASE\]\[START\] phase=pm" \
+            "\[PHASE\]\[START\] phase=close" \
+            "\[TRADE_CLOSE\]\[DONE\]"; do
+            if ! grep -E "$pattern" artifacts/trade-afternoon.log >/dev/null; then
+              echo "::error::missing required log pattern: $pattern"
+              missing=1
+            fi
+          done
+
+          if grep -E "\[PHASE\]\[START\] phase=close.*entry_enabled=1" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::close phase has entry_enabled=1, forbidden"
+            missing=1
+          fi
+
+          if grep -E "\[TRADE\]\[ORDER\]\[BUY\]|\[ORDER\]\[BUY\]" artifacts/trade-afternoon.log | grep -E "phase=close|session=close" >/dev/null; then
+            echo "::error::BUY order detected in close session, forbidden"
+            missing=1
+          fi
+
+          test "$missing" -eq 0
+
+      - name: Scan for SQLite artifacts
+        if: always() && steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::SQLite artifacts detected forbidden:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "OK: no sqlite artifacts."
+
+      - name: Upload debug afternoon logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-trade-afternoon-logs
+          path: repo/artifacts/
+          if-no-files-found: ignore
+
+      - name: Fail if PM or Close failed
+        if: always() && steps.boot_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          pm_result="${{ steps.pm_loop.outcome }}"
+          close_result="${{ steps.close_loop.outcome }}"
+          echo "[TRADE_AFTERNOON][STEP_OUTCOME] pm=${pm_result} close=${close_result}" | tee -a artifacts/trade-afternoon.log
+
+          if [[ "$close_result" != "success" ]]; then
+            echo "::error::Close loop failed. This is critical."
+            exit 1
+          fi
+
+          if [[ "$pm_result" != "success" ]]; then
+            echo "::error::PM loop failed."
+            exit 1
+          fi

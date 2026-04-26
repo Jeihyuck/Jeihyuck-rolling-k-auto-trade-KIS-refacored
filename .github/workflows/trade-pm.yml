@@ -1,9 +1,9 @@
+# Deprecated as scheduled workflow.
+# Main PM + Close execution is handled by trade-afternoon.yml.
+# This workflow is manual fallback only.
 name: "Trade PM"
 
 "on":
-  schedule:
-    # Every day 12:45 KST = Every day 03:45 UTC
-    - cron: "45 3 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
