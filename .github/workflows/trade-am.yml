@@ -205,6 +205,7 @@ jobs:
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
 
           echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason}"
+          echo "[TRADING_DAY_GUARD][TODO] krx_holiday_detection_not_wired workflow_guard=weekend_only order_allowed=$([[ \"$is_trading_day\" == \"1\" ]] && echo 1 || echo 0) compute_only=$([[ \"$is_trading_day\" == \"1\" ]] && echo 0 || echo 1)"
 
       - name: Resolve order mode guard
         id: order_mode_guard
@@ -230,18 +231,18 @@ jobs:
         run: |
           set -euo pipefail
           wait_seconds="${{ steps.phase_guard.outputs.wait_seconds }}"
-          max_wait_seconds=1800
+          max_wait_seconds=3600
 
           if [[ "$wait_seconds" -lt 0 ]]; then
             wait_seconds=0
           fi
 
           if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
-            echo "::error::wait_seconds too large: ${wait_seconds}"
+            echo "::error::wait_seconds too large: ${wait_seconds} max_wait_seconds=${max_wait_seconds}"
             exit 1
           fi
 
-          echo "[WAIT_UNTIL_TARGET][START] session=am wait_seconds=${wait_seconds}"
+          echo "[WAIT_UNTIL_TARGET][START] session=am wait_seconds=${wait_seconds} max_wait_seconds=${max_wait_seconds}"
           sleep "$wait_seconds"
           echo "[WAIT_UNTIL_TARGET][DONE] session=am now_kst=$(TZ=Asia/Seoul date +%H%M%S)"
 
@@ -277,6 +278,7 @@ jobs:
           set -euo pipefail
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          test -d repo/trader || { echo "::error::repo/trader missing"; ls -la repo || true; exit 1; }
           echo "[CHECKOUT][OK] repo path ready"
 
       - name: Initialize AM trigger log
@@ -432,12 +434,12 @@ jobs:
 
       - name: Scan for SQLite artifacts
         if: always() && steps.phase_guard.outputs.should_run == '1'
-        working-directory: repo
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
           if [ -n "$hits" ]; then
-            echo "::error::SQLite artifacts detected (forbidden):"
+            echo "::error::SQLite artifacts detected forbidden:"
             echo "$hits"
             exit 1
           fi

@@ -1,6 +1,7 @@
 # Deprecated as scheduled workflow.
 # Main PM + Close execution is handled by trade-afternoon.yml.
 # This workflow is manual fallback only.
+# Do not dispatch this workflow from trade-watchdog.yml.
 name: "Trade PM"
 
 "on":

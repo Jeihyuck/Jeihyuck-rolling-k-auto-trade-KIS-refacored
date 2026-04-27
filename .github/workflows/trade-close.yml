@@ -1,13 +1,10 @@
 # Close Backup Workflow.
 # trade-afternoon.yml handles PM+Close as the primary afternoon workflow.
-# This workflow acts as emergency fallback if trade-afternoon.yml fails mid-run.
+# This workflow is watchdog/manual emergency backup only.
 # Exit phase only. New BUY orders are forbidden.
 name: "Trade Close"
 
 "on":
-  schedule:
-    # Every day 15:00 KST = Every day 06:00 UTC
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:

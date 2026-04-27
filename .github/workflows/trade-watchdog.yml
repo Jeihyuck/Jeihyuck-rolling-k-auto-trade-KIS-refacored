@@ -31,22 +31,30 @@ jobs:
                 workflow_id: 'trade-prep.yml',
                 workflow_name: 'Trade Prep',
                 threshold: 810,
+                inputs: {
+                  STRATEGY_ENV: 'practice',
+                },
               },
               am: {
                 workflow_id: 'trade-am.yml',
                 workflow_name: 'Trade AM',
                 threshold: 910,
                 dispatchSlots: [910, 915, 920, 925, 930],
+                inputs: {
+                  STRATEGY_ENV: 'practice',
+                  CONFIRM_MANUAL_AM: 'RUN_AM_MANUAL',
+                },
               },
-              pm: {
-                workflow_id: 'trade-pm.yml',
-                workflow_name: 'Trade PM',
-                threshold: 1310,
-              },
-              close: {
-                workflow_id: 'trade-close.yml',
-                workflow_name: 'Trade Close',
-                threshold: 1518,
+              afternoon: {
+                workflow_id: 'trade-afternoon.yml',
+                workflow_name: 'Trade Afternoon',
+                threshold: 1230,
+                dispatchSlots: [1230, 1235, 1240, 1245, 1250, 1255, 1300, 1305, 1310, 1315, 1320, 1325, 1330],
+                inputs: {
+                  STRATEGY_ENV: 'practice',
+                  CONFIRM_MANUAL_AFTERNOON: 'RUN_AFTERNOON_MANUAL',
+                  AFTERNOON_MANUAL_MODE: 'live_afternoon',
+                },
               },
             };
 
@@ -73,7 +81,7 @@ jobs:
               day: '2-digit',
             }).format(now);
 
-            async function hasRunToday(workflowId) {
+            async function getLatestRunToday(workflowId) {
               const response = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -82,19 +90,108 @@ jobs:
                 per_page: 30,
               });
 
-              return response.data.workflow_runs.some((run) => {
-                if (!['queued', 'in_progress', 'completed'].includes(run.status)) {
-                  return false;
-                }
+              const todaysRuns = response.data.workflow_runs
+                .filter((run) => {
+                  if (!['queued', 'in_progress', 'completed'].includes(run.status)) {
+                    return false;
+                  }
+                  const createdDateKst = new Intl.DateTimeFormat(locale, {
+                    timeZone,
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                  }).format(new Date(run.created_at));
+                  return createdDateKst === todayKst;
+                })
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 
-                const createdDateKst = new Intl.DateTimeFormat(locale, {
-                  timeZone,
-                  year: 'numeric',
-                  month: '2-digit',
-                  day: '2-digit',
-                }).format(new Date(run.created_at));
-                return createdDateKst === todayKst;
+              return todaysRuns[0] || null;
+            }
+
+            function isHealthyRun(run) {
+              if (!run) {
+                return false;
+              }
+
+              if (run.status === 'queued' || run.status === 'in_progress') {
+                return true;
+              }
+
+              if (run.status === 'completed' && run.conclusion === 'success') {
+                return true;
+              }
+
+              return false;
+            }
+
+            function runStatus(run) {
+              return run ? String(run.status || 'none') : 'none';
+            }
+
+            function runConclusion(run) {
+              if (!run) {
+                return 'none';
+              }
+              return run.conclusion == null ? 'null' : String(run.conclusion);
+            }
+
+            async function dispatchWorkflow(phase, config) {
+              const dispatchInputs = config.inputs || {
+                STRATEGY_ENV: 'practice',
+              };
+
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: config.workflow_id,
+                ref: process.env.WATCHDOG_REF,
+                inputs: dispatchInputs,
               });
+
+              core.info(
+                `[WATCHDOG][DISPATCH] phase=${phase} workflow=${config.workflow_name} inputs=${JSON.stringify(dispatchInputs)}`
+              );
+            }
+
+            async function maybeDispatchCloseBackup() {
+              const closeBackupSlots = [1520, 1525, 1530];
+
+              if (!closeBackupSlots.includes(nowKst)) {
+                core.info(`[WATCHDOG][CLOSE_BACKUP][SKIP] reason=outside_backup_slot now_kst=${nowKst}`);
+                return;
+              }
+
+              const afternoonRun = await getLatestRunToday('trade-afternoon.yml');
+              const afternoonHealthy = isHealthyRun(afternoonRun);
+
+              if (afternoonHealthy) {
+                core.info(
+                  `[WATCHDOG][CLOSE_BACKUP][SKIP] reason=afternoon_healthy status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
+                );
+                return;
+              }
+
+              const closeRun = await getLatestRunToday('trade-close.yml');
+              const closeHealthy = isHealthyRun(closeRun);
+
+              if (closeHealthy) {
+                core.info('[WATCHDOG][CLOSE_BACKUP][SKIP] reason=close_backup_already_healthy');
+                return;
+              }
+
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'trade-close.yml',
+                ref: process.env.WATCHDOG_REF,
+                inputs: {
+                  STRATEGY_ENV: 'practice',
+                  CLOSE_MANUAL_MODE: 'live_close',
+                  CONFIRM_MANUAL_CLOSE: 'RUN_CLOSE_MANUAL',
+                },
+              });
+
+              core.info('[WATCHDOG][CLOSE_BACKUP][DISPATCH] workflow=Trade Close reason=afternoon_missing_or_failed');
             }
 
             for (const [phase, config] of Object.entries(workflows)) {
@@ -108,22 +205,18 @@ jobs:
                 continue;
               }
 
-              const found = await hasRunToday(config.workflow_id);
-              core.info(`[WATCHDOG][CHECK] phase=${phase} found=${found ? 1 : 0}`);
+              const latestRun = await getLatestRunToday(config.workflow_id);
+              const healthy = isHealthyRun(latestRun);
+              core.info(
+                `[WATCHDOG][CHECK] phase=${phase} workflow=${config.workflow_id} latest_status=${runStatus(latestRun)} latest_conclusion=${runConclusion(latestRun)} healthy=${healthy ? 1 : 0}`
+              );
 
-              if (found) {
-                core.info(`[WATCHDOG][SKIP] phase=${phase} reason=already_exists`);
+              if (healthy) {
+                core.info(`[WATCHDOG][SKIP] phase=${phase} reason=healthy_run_exists`);
                 continue;
               }
 
-              await github.rest.actions.createWorkflowDispatch({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: config.workflow_id,
-                ref: process.env.WATCHDOG_REF,
-                inputs: {
-                  STRATEGY_ENV: 'practice',
-                },
-              });
-              core.info(`[WATCHDOG][DISPATCH] phase=${phase} workflow=${config.workflow_name}`);
+              await dispatchWorkflow(phase, config);
             }
+
+            await maybeDispatchCloseBackup();

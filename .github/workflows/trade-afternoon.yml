@@ -49,6 +49,7 @@ env:
   PB1_LOOP_ENABLED: "1"
   PB1_LOOP_INTERVAL_SEC: "60"
   PB1_SESSION_EXIT_GRACE_SEC: "15"
+  CLOSE_MAX_WAIT_SECONDS: "9000"
 
   STRATEGY_MODE: "LIVE"
   FORCE_STRATEGY_MODE: "LIVE"
@@ -196,6 +197,7 @@ jobs:
           set -euo pipefail
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; ls -la repo || true; exit 1; }
+          test -d repo/trader || { echo "::error::repo/trader missing"; ls -la repo || true; exit 1; }
           mkdir -p repo/artifacts
           {
             echo "[TRADE_AFTERNOON][TRIGGER] event=${{ steps.boot_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
@@ -221,6 +223,7 @@ jobs:
           echo "is_trading_day=${is_trading_day}" >> "$GITHUB_OUTPUT"
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
           echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason}" | tee -a repo/artifacts/trade-afternoon.log
+          echo "[TRADING_DAY_GUARD][TODO] krx_holiday_detection_not_wired workflow_guard=weekend_only order_allowed=$([[ "$is_trading_day" == "1" ]] && echo 1 || echo 0) compute_only=$([[ "$is_trading_day" == "1" ]] && echo 0 || echo 1)" | tee -a repo/artifacts/trade-afternoon.log
 
       - name: Set up Python
         if: steps.boot_guard.outputs.should_run == '1'
@@ -307,10 +310,17 @@ jobs:
           now_m="$(TZ=Asia/Seoul date +%M)"
           now_min=$((10#$now_h * 60 + 10#$now_m))
           pm_target_min=$((13 * 60))
+          max_wait_seconds=3600
 
           if [[ "$now_min" -lt "$pm_target_min" ]]; then
             wait_seconds=$(( (pm_target_min - now_min) * 60 ))
-            echo "[WAIT_UNTIL_PM][START] wait_seconds=${wait_seconds}" | tee -a artifacts/trade-afternoon.log
+
+            if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
+              echo "::error::pm wait_seconds too large: ${wait_seconds} max_wait_seconds=${max_wait_seconds}" | tee -a artifacts/trade-afternoon.log
+              exit 1
+            fi
+
+            echo "[WAIT_UNTIL_PM][START] wait_seconds=${wait_seconds} max_wait_seconds=${max_wait_seconds}" | tee -a artifacts/trade-afternoon.log
             sleep "$wait_seconds"
             echo "[WAIT_UNTIL_PM][DONE] now_kst=$(TZ=Asia/Seoul date +%H%M%S)" | tee -a artifacts/trade-afternoon.log
           else
@@ -356,10 +366,17 @@ jobs:
           now_m="$(TZ=Asia/Seoul date +%M)"
           now_min=$((10#$now_h * 60 + 10#$now_m))
           close_target_min=$((15 * 60 + 15))
+          close_max_wait_seconds="${CLOSE_MAX_WAIT_SECONDS:-9000}"
 
           if [[ "$now_min" -lt "$close_target_min" ]]; then
             wait_seconds=$(( (close_target_min - now_min) * 60 ))
-            echo "[WAIT_UNTIL_CLOSE][START] wait_seconds=${wait_seconds}" | tee -a artifacts/trade-afternoon.log
+
+            if [[ "$wait_seconds" -gt "$close_max_wait_seconds" ]]; then
+              echo "::error::close wait_seconds too large: ${wait_seconds} max_wait_seconds=${close_max_wait_seconds}" | tee -a artifacts/trade-afternoon.log
+              exit 1
+            fi
+
+            echo "[WAIT_UNTIL_CLOSE][START] wait_seconds=${wait_seconds} max_wait_seconds=${close_max_wait_seconds}" | tee -a artifacts/trade-afternoon.log
             sleep "$wait_seconds"
             echo "[WAIT_UNTIL_CLOSE][DONE] now_kst=$(TZ=Asia/Seoul date +%H%M%S)" | tee -a artifacts/trade-afternoon.log
           else
@@ -431,7 +448,7 @@ jobs:
 
       - name: Scan for SQLite artifacts
         if: always() && steps.boot_guard.outputs.should_run == '1'
-        working-directory: repo
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           hits="$(find "$GITHUB_WORKSPACE" -type f \( -name "*.sqlite3*" -o -name "*.db" \) 2>/dev/null | head -n 50 || true)"
