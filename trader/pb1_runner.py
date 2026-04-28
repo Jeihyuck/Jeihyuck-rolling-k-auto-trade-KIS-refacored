@@ -1522,6 +1522,18 @@ def compute_loop_deadline(now: datetime) -> datetime:
     return deadline
 
 
+def normalize_session_kind(raw: str) -> str:
+    """legacy pm/close 세션명을 afternoon으로 normalize한다."""
+    raw = (raw or "").strip().lower()
+    if raw in {"pm", "close", "trade-pm", "trade-close"}:
+        return "afternoon"
+    if raw in {"am", "morning"}:
+        return "am"
+    if raw in {"afternoon", "trade-afternoon"}:
+        return "afternoon"
+    return raw
+
+
 def _resolve_trade_session(now: datetime) -> str:
     forced_session = str(os.getenv("PB1_FORCE_TRADE_SESSION") or "auto").strip().lower() or "auto"
     if forced_session in {"am", "pm"}:
@@ -1539,10 +1551,23 @@ def _resolve_trade_session(now: datetime) -> str:
 
 def _resolve_session_kind(now: datetime | None = None) -> str:
     raw_value = str(os.getenv("PB1_SESSION_KIND") or "").strip().lower()
+    raw_window = str(os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    normalized = normalize_session_kind(raw_value)
+    normalized_window = normalize_session_kind(raw_window) if raw_window else raw_window
+    if normalized != raw_value or normalized_window != raw_window:
+        logger.info(
+            "[PB1][SESSION_NORMALIZE] raw_session=%s normalized_session=%s raw_window=%s normalized_window=%s",
+            raw_value,
+            normalized,
+            raw_window,
+            normalized_window,
+        )
     if raw_value == "close":
-        return "close"
+        return "afternoon"
     if raw_value in {"morning", "am", "pm"}:
-        return "am" if raw_value in {"morning", "am"} else "pm"
+        return "am" if raw_value in {"morning", "am"} else "afternoon"
+    if raw_value == "afternoon":
+        return "afternoon"
     return _resolve_trade_session(now or _get_now_kst())
 
 

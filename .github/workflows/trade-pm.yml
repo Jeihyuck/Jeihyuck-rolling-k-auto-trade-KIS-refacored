@@ -1,8 +1,9 @@
-# Deprecated as scheduled workflow.
-# Main PM + Close execution is handled by trade-afternoon.yml.
-# This workflow is manual fallback only.
-# Do not dispatch this workflow from trade-watchdog.yml.
-name: "Trade PM"
+# DISABLED: trade-pm은 trade-afternoon으로 통합되었습니다.
+# PM + Close 실행은 trade-afternoon.yml에서 처리합니다.
+# 이 워크플로우는 legacy 호환성만을 위해 보관되며 실행되지 않아야 합니다.
+# session_kind=pm은 내부에서 afternoon으로 normalize됩니다.
+# Do not dispatch this workflow from trade-watchdog.yml or any automation.
+name: "Trade PM (DISABLED - use trade-afternoon)"
 
 "on":
   workflow_dispatch:
@@ -28,10 +29,10 @@ permissions:
 
 env:
   MODE: trade
-  PB1_SESSION_KIND: "pm"
-  PB1_FORCE_TRADE_SESSION: "pm"
+  PB1_SESSION_KIND: "afternoon"  # legacy pm -> afternoon normalize
+  PB1_FORCE_TRADE_SESSION: "afternoon"
 
-  FORCE_MARKET_WINDOW: "day"
+  FORCE_MARKET_WINDOW: "afternoon"
   FORCE_PB1_PHASE: "entry"
   PB1_PHASE_DEFAULT: "entry"
 

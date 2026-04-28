@@ -203,7 +203,7 @@ CONFIG = {
     # OHLCV 로딩 기본 윈도우 (200일로 안정화)
     "PB1_OHLCV_DAYS_BASE": "200",
     # PB1 "최고 눌림목" 랭킹/사이징 튜닝
-    "PB1_MAX_POSITIONS": "8",          # 통과 종목 중 상위 N개만 매수
+    "PB1_MAX_POSITIONS": "30",         # 계좌 전체 최대 보유 종목 수. trade-am/trade-afternoon 공통. 2026-04-28부터 8 -> 30 확대
     "PB1_MIN_SCORE": "70",             # 점수 컷(0~100)
     "PB1_MIN_SCORE_BASE": "70",        # Adaptive score cut 시작값
     "PB1_MIN_SCORE_FLOOR": "55",       # Adaptive score cut 하한
@@ -236,7 +236,7 @@ CONFIG = {
     "PB1_GAP_HARD_MAX_PCT": "0",
     "PB1_ENTRY_BUDGET_PCT_PER_TICK": "0.60",
     "PB1_MAX_POS_PCT": "0.35",
-    "PB1_TARGET_NEW_POSITIONS": "4",
+    "PB1_TARGET_NEW_POSITIONS": "30",
     "PB1_USE_RISK_PARITY": "1",         # 1이면 ATR 기반 리스크패리티 사이징
     "PB1_MAX_ATR_PCT": "8.0",           # ATR% 상한 (과변동 종목 제외)
     "PB1_ATR_PCT_MAX": "8.0",
@@ -942,8 +942,8 @@ FAILED_BREAKOUT_EXIT_DAYS = int(_cfg("FAILED_BREAKOUT_EXIT_DAYS") or "2")
 REENTRY_COOLDOWN_DAYS = int(_cfg("REENTRY_COOLDOWN_DAYS") or "10")
 
 
-PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "8")
-PB1_TARGET_NEW_POSITIONS = max(1, int(_cfg("PB1_TARGET_NEW_POSITIONS") or "4"))
+PB1_MAX_POSITIONS = int(_cfg("PB1_MAX_POSITIONS") or "30")
+PB1_TARGET_NEW_POSITIONS = max(1, int(_cfg("PB1_TARGET_NEW_POSITIONS") or "30"))
 PB1_MIN_SCORE_BASE = float(_cfg("PB1_MIN_SCORE_BASE") or "70")
 PB1_MIN_SCORE_FLOOR = float(_cfg("PB1_MIN_SCORE_FLOOR") or "55")
 PB1_MIN_SCORE_STEP = float(_cfg("PB1_MIN_SCORE_STEP") or "5")

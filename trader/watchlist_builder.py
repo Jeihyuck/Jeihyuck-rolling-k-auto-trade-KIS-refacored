@@ -2692,6 +2692,7 @@ class WatchlistBuilder:
 
         for idx, item in enumerate(final30, start=1):
             item["final_rank"] = idx
+            item["rank_final30"] = idx
 
         normalized_final = [self._normalize_item(item, score_key="final_score", rank_key="final_rank") for item in final30]
 

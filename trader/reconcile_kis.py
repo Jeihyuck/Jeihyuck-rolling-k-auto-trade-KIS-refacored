@@ -262,6 +262,36 @@ def reconcile_kis(
             mode=1,
             holdings=holdings_rows,
         )
+
+        # KIS holdings가 있고 DB positions가 0이면 upsert 복구
+        if holdings_rows and env in {"practice", "live"}:
+            db_positions_count = 0
+            try:
+                import sqlalchemy as _sa
+                with engine.connect() as _conn:
+                    result = _conn.execute(
+                        _sa.text(
+                            "SELECT COUNT(*) FROM positions WHERE env = :env AND status = 'OPEN' AND qty > 0"
+                        ),
+                        {"env": env},
+                    )
+                    db_positions_count = int(result.scalar() or 0)
+            except Exception:
+                pass
+            kis_holdings_count = len([h for h in holdings_rows if int(float(h.get("hldg_qty") or h.get("qty") or 0)) > 0])
+            if kis_holdings_count > 0 and db_positions_count == 0:
+                logger.warning(
+                    "[RECONCILE][POSITIONS_EMPTY_BUT_KIS_HAS_HOLDINGS] env=%s kis_holdings=%s db_positions=%s action=upsert_from_kis",
+                    env,
+                    kis_holdings_count,
+                    db_positions_count,
+                )
+                account_key = get_account_key(env=env, kis=kis)
+                positions_repo.upsert_positions_from_kis_holdings(
+                    env=env,
+                    account_key=account_key,
+                    holdings=holdings_rows,
+                )
     if restored:
         logger.warning("[RECONCILE][POSITIONS][RESTORE] env=%s restored=%s", env, restored)
 

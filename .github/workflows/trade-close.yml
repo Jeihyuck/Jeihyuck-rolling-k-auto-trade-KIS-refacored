@@ -1,8 +1,9 @@
-# Close Backup Workflow.
-# trade-afternoon.yml handles PM+Close as the primary afternoon workflow.
-# This workflow is watchdog/manual emergency backup only.
+# DISABLED: trade-close는 trade-afternoon으로 통합되었습니다.
+# PM + Close 실행은 trade-afternoon.yml에서 처리합니다.
+# 이 워크플로우는 watchdog emergency backup으로만 존재하며 정상 운영 중 실행되지 않아야 합니다.
+# session_kind=close는 내부에서 afternoon으로 normalize됩니다.
 # Exit phase only. New BUY orders are forbidden.
-name: "Trade Close"
+name: "Trade Close (DISABLED - use trade-afternoon)"
 
 "on":
   workflow_dispatch:
@@ -37,10 +38,10 @@ permissions:
 
 env:
   MODE: trade
-  PB1_SESSION_KIND: "close"
-  PB1_FORCE_TRADE_SESSION: "close"
+  PB1_SESSION_KIND: "afternoon"  # legacy close -> afternoon normalize
+  PB1_FORCE_TRADE_SESSION: "afternoon"
 
-  FORCE_MARKET_WINDOW: "close"
+  FORCE_MARKET_WINDOW: "afternoon"
   FORCE_PB1_PHASE: "exit"
   PB1_PHASE_DEFAULT: "exit"
   PB1_ENTRY_ENABLED: "0"

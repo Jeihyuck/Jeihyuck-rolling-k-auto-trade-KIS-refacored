@@ -37,7 +37,13 @@ permissions:
 env:
   MODE: trade
 
+  PB1_MAX_POSITIONS: "30"
+  PB1_TARGET_NEW_POSITIONS: "30"
+
+  PB1_EXIT_PASS_TIMEOUT_SEC: "300"
+
   PB1_PREWARM_ENABLED: "1"
+  PB1_EXIT_PREWARM_ENABLED: "1"
   AFTERNOON_PREWARM_START_TIME: "12:15"
   PM_TARGET_START_TIME: "13:00"
   PM_START_ALLOW_UNTIL: "13:30"
@@ -333,9 +339,9 @@ jobs:
         continue-on-error: true
         working-directory: repo
         env:
-          PB1_SESSION_KIND: "pm"
-          PB1_FORCE_TRADE_SESSION: "pm"
-          FORCE_MARKET_WINDOW: "day"
+          PB1_SESSION_KIND: "afternoon"
+          PB1_FORCE_TRADE_SESSION: "afternoon"
+          FORCE_MARKET_WINDOW: "afternoon"
           FORCE_PB1_PHASE: "entry"
           PB1_PHASE_DEFAULT: "entry"
           PB1_ENTRY_ENABLED: "1"
@@ -389,9 +395,9 @@ jobs:
         continue-on-error: true
         working-directory: repo
         env:
-          PB1_SESSION_KIND: "close"
-          PB1_FORCE_TRADE_SESSION: "close"
-          FORCE_MARKET_WINDOW: "close"
+          PB1_SESSION_KIND: "afternoon"
+          PB1_FORCE_TRADE_SESSION: "afternoon"
+          FORCE_MARKET_WINDOW: "afternoon"
           FORCE_PB1_PHASE: "exit"
           PB1_PHASE_DEFAULT: "exit"
           PB1_ENTRY_ENABLED: "0"

@@ -1876,7 +1876,7 @@ class PB1Engine:
             return float(default)
 
     def _exit_pass_timeout_sec(self) -> float:
-        default = 120.0 if str(self.env or "").strip().lower() == "practice" else 90.0
+        default = 300.0
         return self._stage_timeout_sec("PB1_EXIT_PASS_TIMEOUT_SEC", default)
 
     def _exit_pass_timeout_fail_open_enabled(self) -> bool:
@@ -1884,6 +1884,52 @@ class PB1Engine:
         if raw is not None:
             return str(raw).strip().lower() in {"1", "true", "yes", "on"}
         return str(self.env or "").strip().lower() == "practice"
+
+    def _prewarm_exit_holdings_data(self, holdings: list[dict]) -> None:
+        """exit_pass 직전 보유종목 OHLCV/현재가 캐시를 미리 채운다."""
+        enabled = str(os.getenv("PB1_EXIT_PREWARM_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            logger.info("[PB1][EXIT_PREWARM] skipped reason=disabled")
+            return
+
+        codes = []
+        for h in holdings or []:
+            code = str(h.get("code") or h.get("pdno") or "").zfill(6)
+            if code and code != "000000":
+                codes.append(code)
+        codes = sorted(set(codes))
+
+        if not codes:
+            logger.info("[PB1][EXIT_PREWARM] skipped reason=no_holdings")
+            return
+
+        session_kind = str(os.getenv("PB1_SESSION_KIND") or "").strip().lower()
+        logger.info("[PB1][EXIT_PREWARM][START] session=%s count=%s codes=%s", session_kind, len(codes), codes)
+
+        ok = 0
+        failed = 0
+        for code in codes:
+            try:
+                self._fetch_exit_ohlcv(code)
+                self._get_price_snapshot_cached(code)
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "[PB1][EXIT_PREWARM][FAIL] session=%s code=%s err_type=%s err=%s",
+                    session_kind,
+                    code,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        logger.info(
+            "[PB1][EXIT_PREWARM][DONE] session=%s count=%s ok=%s failed=%s",
+            session_kind,
+            len(codes),
+            ok,
+            failed,
+        )
 
     def _consume_order_lookup_fail_open(self, op_name: str) -> bool:
         consume = getattr(self.orders_repo, "consume_fail_open_marker", None)
@@ -10587,6 +10633,7 @@ class PB1Engine:
             no_trade_reason: str | None,
         ) -> None:
             blocked_counter = _summarize_blocked_reasons(blocked_reasons_counter)
+            entry_skipped = bool(no_trade_reason in {"PORTFOLIO_FULL", "PHASE_VERIFY", "phase_verify"} or submitted == 0 and scanned == 0 and no_trade_reason)
             payload = {
                 "scanned": int(scanned),
                 "setup_ok": int(setup_ok),
@@ -10602,6 +10649,12 @@ class PB1Engine:
                 "no_trade_reason": no_trade_reason,
                 "entry_decision_result": entry_decision_result,
                 "entry_decision_reason": entry_decision_reason,
+                "entry_skipped": entry_skipped,
+                "entry_skip_reason": no_trade_reason if entry_skipped else None,
+                "existing_positions": existing_positions_count,
+                "max_positions": max_positions,
+                "slots_remaining": slots_remaining,
+                "session_kind": session_kind,
             }
             self._run_summary_payload = payload
             self._debug_summary = {
@@ -10746,6 +10799,17 @@ class PB1Engine:
             target_new_positions = 0
         self.target_new_positions = target_new_positions
         allow_add_to_existing = PB1_ALLOW_ADD_TO_EXISTING
+        logger.info(
+            "[PB1][POSITION_LIMIT] session=%s max_positions=%s existing_positions=%s slots_remaining=%s "
+            "target_new_positions_raw=%s target_new_positions=%s allow_add_to_existing=%s",
+            session_kind,
+            max_positions,
+            existing_positions_count,
+            slots_remaining,
+            target_new_positions_raw,
+            target_new_positions,
+            allow_add_to_existing,
+        )
         self._log_portfolio_risk_diagnostics(
             existing_positions=existing_positions,
             total_cash_krw=float(total_cash_krw),
@@ -10795,6 +10859,8 @@ class PB1Engine:
         exit_pass_timeout_sec = self._exit_pass_timeout_sec()
         exit_pass_fail_open = self._exit_pass_timeout_fail_open_enabled()
         exit_pass_started = time.perf_counter()
+        # exit prewarm: exit_pass 직전에 OHLCV/현재가 캐시를 미리 채운다
+        self._prewarm_exit_holdings_data([h.to_dict() if hasattr(h, "to_dict") else (h if isinstance(h, dict) else getattr(h, "__dict__", {})) for h in (holdings_for_exit or [])])
         logger.info(
             "[PASS][EXIT][START] phase=%s existing_positions=%s holdings_source=%s",
             self.phase,
@@ -10894,9 +10960,12 @@ class PB1Engine:
         # Portfolio full guard: existing_positions >= max_positions이면 신규 매수 scan 불필요
         if self.phase in {"prep", "entry"} and (existing_positions_count >= max_positions or target_new_positions <= 0):
             logger.info(
-                "[ENTRY][SKIP_PORTFOLIO_FULL] existing_positions=%s max_positions=%s target_new_positions=%s",
+                "[ENTRY][SKIP_PORTFOLIO_FULL] session=%s existing_positions=%s max_positions=%s "
+                "slots_remaining=%s target_new_positions=%s reason=PORTFOLIO_FULL",
+                session_kind,
                 existing_positions_count,
                 max_positions,
+                slots_remaining,
                 target_new_positions,
             )
             _emit_entry_summary([], [], Counter())
@@ -10925,7 +10994,20 @@ class PB1Engine:
         entry_pass_ok = True
         entry_pass_buys = 0
         entry_pass_skipped = 0
-        
+
+        # Entry capacity 로그 (entry pipeline 직전)
+        logger.info(
+            "[ENTRY][CAPACITY_CHECK] session=%s existing_positions=%s max_positions=%s slots_remaining=%s "
+            "target_new_positions=%s tick_budget=%s available_cash=%s",
+            session_kind,
+            existing_positions_count,
+            max_positions,
+            slots_remaining,
+            target_new_positions,
+            tick_budget_krw,
+            available_cash_krw,
+        )
+
         # 계측 변수 초기화
         trace_id = f"{self.run_id or 'NORUN'}:{self._today}:{int(time.time() * 1000) % 100000}"
         t0_entry = time.monotonic()

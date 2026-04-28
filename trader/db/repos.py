@@ -4375,6 +4375,118 @@ class PositionsRepo:
                 restored += 1
         return restored
 
+    def upsert_positions_from_kis_holdings(
+        self,
+        *,
+        env: str,
+        account_key: str,
+        holdings: list[dict],
+    ) -> dict[str, int]:
+        """
+        KIS 잔고를 기준으로 positions 테이블을 복구한다.
+        기존 position이 있으면 qty/avg_price/total_cost만 update, 없으면 insert.
+        qty=0 종목은 제외한다.
+        """
+        inserted = 0
+        updated = 0
+        skipped = 0
+        env_n = _norm_env(env)
+        with self.engine.begin() as conn:
+            for row in holdings or []:
+                try:
+                    code = str(row.get("pdno") or row.get("code") or "").zfill(6)
+                    qty = int(float(row.get("hldg_qty") or row.get("qty") or 0))
+                    if qty <= 0 or not code or code == "000000":
+                        skipped += 1
+                        continue
+                    avg_price = float(
+                        row.get("pchs_avg_pric") or row.get("pchs_avg_price") or row.get("avg_price") or 0.0
+                    )
+                    total_cost = float(
+                        row.get("pchs_amt") or row.get("total_cost") or avg_price * qty
+                    )
+                    market_price = float(
+                        row.get("prpr") or row.get("market_price") or avg_price
+                    )
+                    market_value = float(
+                        row.get("evlu_amt") or row.get("market_value") or market_price * qty
+                    )
+                    unrealized_pnl = float(
+                        row.get("evlu_pfls_amt") or row.get("unrealized_pnl") or (market_value - total_cost)
+                    )
+                    unrealized_pnl_pct = float(
+                        row.get("evlu_pfls_rt") or row.get("unrealized_pnl_pct") or (
+                            (unrealized_pnl / total_cost * 100) if total_cost else 0.0
+                        )
+                    )
+                    market = row.get("prdt_type_cd") or row.get("market") or row.get("mket_gb")
+                    name = str(row.get("prdt_name") or row.get("name") or code)
+                except Exception:
+                    skipped += 1
+                    continue
+
+                existing = conn.execute(
+                    select(self._schema.positions.c.position_id).where(
+                        and_(
+                            self._schema.positions.c.env == env_n,
+                            self._schema.positions.c.code == code,
+                        )
+                    )
+                ).scalar()
+
+                if existing:
+                    conn.execute(
+                        sa.update(self._schema.positions)
+                        .where(
+                            and_(
+                                self._schema.positions.c.env == env_n,
+                                self._schema.positions.c.code == code,
+                            )
+                        )
+                        .values(
+                            qty=qty,
+                            avg_buy_price=avg_price or None,
+                            total_cost=total_cost or 0.0,
+                            status="OPEN",
+                            last_reconciled_at=func.now(),
+                        )
+                    )
+                    updated += 1
+                else:
+                    conn.execute(
+                        sa.insert(self._schema.positions).values(
+                            position_id=_coerce_uuid(
+                                None,
+                                uses_native_uuid=self._schema.uses_native_uuid,
+                                database_url=str(self.engine.url),
+                            ),
+                            env=env_n,
+                            strategy="pb1",
+                            sid=1,
+                            mode=1,
+                            code=code,
+                            market=market,
+                            qty=qty,
+                            avg_buy_price=avg_price or None,
+                            total_cost=total_cost or 0.0,
+                            realized_pnl=0.0,
+                            last_trade_at=None,
+                            status="OPEN",
+                            last_reconciled_at=func.now(),
+                        )
+                    )
+                    inserted += 1
+
+        logger.info(
+            "[RECONCILE][POSITIONS_UPSERT_FROM_KIS][DONE] env=%s account=%s inserted=%s updated=%s skipped=%s",
+            env_n,
+            account_key,
+            inserted,
+            updated,
+            skipped,
+        )
+        return {"inserted": inserted, "updated": updated, "skipped": skipped}
+
 
 class PracticeAccountResetRepo:
     DELETE_ORDER = (
@@ -5259,6 +5371,38 @@ class WatchlistRepo:
                 df["as_of"] = df["as_of"].astype(str)
             if "code" in df.columns:
                 df["code"] = df["code"].astype(str).str.zfill(6)
+
+            # rank_final30 검증 및 복구
+            rank_col = "rank_final30"
+            rank_invalid = (
+                rank_col not in df.columns
+                or df[rank_col].isna().any()
+                or df[rank_col].nunique(dropna=True) != len(df)
+                or float(df[rank_col].astype(float).min()) <= 0
+            ) if rank_col in df.columns else True
+            if rank_invalid:
+                logger.warning(
+                    "[DB][FINAL30_SCORED][RANK_REPAIR_NEEDED] rows=%s rank_col=%s nunique=%s min=%s action=reassign_1_to_n",
+                    len(df),
+                    rank_col,
+                    df[rank_col].nunique(dropna=True) if rank_col in df.columns else None,
+                    df[rank_col].min() if rank_col in df.columns else None,
+                )
+                if "rank" in df.columns:
+                    df = df.sort_values("rank", ascending=True)
+                elif "score_final" in df.columns:
+                    df = df.sort_values("score_final", ascending=False)
+                elif "score" in df.columns:
+                    df = df.sort_values("score", ascending=False)
+                df = df.reset_index(drop=True)
+                df["rank_final30"] = range(1, len(df) + 1)
+                logger.info(
+                    "[DB][FINAL30_SCORED][RANK_REPAIR_DONE] rows=%s rank_final30_min=%s rank_final30_max=%s unique=%s",
+                    len(df),
+                    df["rank_final30"].min(),
+                    df["rank_final30"].max(),
+                    df["rank_final30"].nunique(),
+                )
 
         columns = [str(col) for col in df.columns.tolist()]
         missing_critical_fields = [
