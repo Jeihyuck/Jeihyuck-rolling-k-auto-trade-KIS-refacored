@@ -1517,6 +1517,7 @@ class PB1Engine:
         resolved_window_name = _resolve_session_window_name(session_kind=session_kind, raw_window_name=raw_window_name)
         self.phase_name = resolved_phase_name
         self.window_name = resolved_window_name
+        self.session_kind = session_kind  # ✅ _safe_session_kind() 첫 번째 fallback용 인스턴스 저장
         logger.info(
             "[ENGINE][INIT_CTX] phase_name=%s window_name=%s phase_arg=%s window_arg=%s",
             self.phase_name,
@@ -10199,6 +10200,33 @@ class PB1Engine:
         totals["return_pct"] = portfolio_return_pct if portfolio_return_pct is not None else 0.0
         return totals
 
+    def _safe_session_kind(self) -> str:
+        """환경변수와 인스턴스 속성에서 session kind를 안전하게 읽는다.
+        어떤 환경에서도 예외를 던지지 않으며, 최소 "unknown"을 반환한다."""
+        raw = (
+            getattr(self, "session_kind", None)
+            or getattr(self, "_session_kind", None)
+            or getattr(getattr(self, "run_ctx", None), "session_kind", None)
+            or os.getenv("PB1_SESSION_KIND")
+            or os.getenv("PB1_FORCE_TRADE_SESSION")
+            or os.getenv("FORCE_MARKET_WINDOW")
+            or getattr(self, "window_name", None)
+            or getattr(self, "window", None)
+            or getattr(self, "market_window", None)
+            or "unknown"
+        )
+
+        raw = str(raw or "unknown").strip().lower()
+
+        if raw in {"pm", "close", "trade-pm", "trade-close", "day", "intraday"}:
+            return "afternoon"
+        if raw in {"afternoon", "trade-afternoon"}:
+            return "afternoon"
+        if raw in {"am", "morning", "trade-am"}:
+            return "am"
+
+        return raw
+
     def run(self) -> RunResult:
         # IMPORTANT:
         # Do NOT create a separate after-hours / weekend / smoke trading engine.
@@ -10208,6 +10236,18 @@ class PB1Engine:
         # 장중 공통 매매 로직을 훼손하지 않는다.
         # 장마감 후/비거래일 검증도 동일한 trade 경로를 사용하며,
         # 달라질 수 있는 것은 주문 제출 허용 여부뿐이다.
+
+        # ✅ [SESSION_KIND] run() 스코프 내 session_kind 안전 정의 — NameError 방지
+        session_kind = self._safe_session_kind()
+        logger.info(
+            "[PB1][SESSION_KIND][ENGINE] session_kind=%s phase=%s window=%s window_name=%s market_window=%s",
+            session_kind,
+            getattr(self, "phase", None),
+            getattr(self, "window", None),
+            getattr(self, "window_name", None),
+            getattr(self, "market_window_name", None),
+        )
+
         self._warned_keys.clear()
         self._setup_reason_counter.clear()
         self.current_code = None
