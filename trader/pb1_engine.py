@@ -161,6 +161,7 @@ from trader.config import (
     PB1_ABS_TP1_SELL_PCT,
 )
 from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
+from trader.db.engine import dispose_engine_safely
 from trader.db.repos import (
     DerivedMinerviniRepo,
     FillsRepo,
@@ -2059,6 +2060,16 @@ class PB1Engine:
         logger.info("[PB1][STAGE][START] stage=%s", stage_name)
         try:
             yield
+        except Exception as exc:
+            elapsed = time.perf_counter() - started
+            logger.warning(
+                "[PB1][STAGE][EXCEPTION] stage=%s elapsed=%.2f err_type=%s err=%s",
+                stage_name,
+                elapsed,
+                type(exc).__name__,
+                exc,
+            )
+            raise
         finally:
             elapsed = time.perf_counter() - started
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
@@ -2095,6 +2106,7 @@ class PB1Engine:
     def _reset_tick_warning_counts(self) -> None:
         self._tick_warning_counts = Counter()
         self._tick_db_cache = {}
+        logger.info("[PB1][TICK][CACHE_RESET] tick_id=%s", getattr(self, "_last_stage", "unknown"))
 
     def _emit_tick_warning_summary(self, *, code: str | None = None) -> None:
         counts = {key: int(value) for key, value in dict(self._tick_warning_counts).items()}
@@ -2128,12 +2140,13 @@ class PB1Engine:
         self._emit_tick_warning_summary()
         warning_counts = self._warning_counts_dict()
         logger.info(
-            "[PB1][SESSION][WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s",
+            "[PB1][SESSION][WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s db_engine_dispose_count=%s",
             warning_counts.get("timeout_count", 0),
             warning_counts.get("db_read_fail_open_count", 0),
             warning_counts.get("ledger_fail_first_count", 0),
             warning_counts.get("degraded_stage_count", 0),
             warning_counts.get("duplicate_skip_count", 0),
+            warning_counts.get("db_engine_dispose_count", 0),
         )
         return RunResult(
             status=status,
@@ -2304,14 +2317,27 @@ class PB1Engine:
         cache_key = ("today_fills", str(code or ""), str(side or ""))
         cached = self._tick_db_cache.get(cache_key)
         if cached is not None:
+            logger.info("[PB1][DB_CACHE][HIT] key=%s", cache_key)
             return [dict(row) for row in cached]
-        logger.info("[PB1][STAGE][START] stage=fills.lookup_today code=%s side=%s", code, side)
-        rows = self.fills_repo.list_today_fills(self.env, code=code, side=side)
-        if self._consume_fill_lookup_fail_open("fills.list_today_fills"):
-            self._bump_warning("db_read_fail_open_count")
-            logger.warning("[FAIL_OPEN][PB1][ORDER_LOOKUP] op=today_fills code=%s side=%s", code, side)
+        with self._stage_timer("entry.today_buy_fills_bulk_lookup"):
+            try:
+                rows = self.fills_repo.list_today_fills(self.env, code=code, side=side)
+                if self._consume_fill_lookup_fail_open("fills.list_today_fills"):
+                    self._bump_warning("db_read_fail_open_count")
+                    logger.warning("[FAIL_OPEN][PB1][ORDER_LOOKUP] op=today_fills code=%s side=%s", code, side)
+            except Exception as exc:
+                self._bump_warning("db_read_fail_open_count")
+                dispose_engine_safely(self.engine, reason=f"fills.list_today_fills:{type(exc).__name__}")
+                self._bump_warning("db_engine_dispose_count")
+                logger.warning(
+                    "[PB1][DB_LOOKUP][FAIL_OPEN] op=fills.list_today_fills code=%s side=%s err_type=%s err=%s",
+                    code,
+                    side,
+                    type(exc).__name__,
+                    exc,
+                )
+                rows = []
         self._tick_db_cache[cache_key] = [dict(row) for row in rows]
-        logger.info("[PB1][STAGE][END] stage=fills.lookup_today rows=%s code=%s side=%s", len(rows), code, side)
         return rows
 
     def _resolve_buy_cooldown_state(
@@ -11099,7 +11125,24 @@ class PB1Engine:
             tick_budget_krw = 0.0
         logger.info("[PB1][POST_CAPITAL][START] phase=%s window=%s", self.phase, self.window_internal)
         with self._stage_timer("exit.positions_lookup"):
-            positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+            try:
+                pos_cache_key = ("positions", self.env, self.STRATEGY_NAME)
+                if pos_cache_key in self._tick_db_cache:
+                    logger.info("[PB1][DB_CACHE][HIT] key=%s", pos_cache_key)
+                    positions = list(self._tick_db_cache[pos_cache_key])
+                else:
+                    positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+                    self._tick_db_cache[pos_cache_key] = list(positions)
+            except Exception as _pos_exc:
+                self._bump_warning("db_read_fail_open_count")
+                dispose_engine_safely(self.engine, reason=f"positions_lookup:{type(_pos_exc).__name__}")
+                self._bump_warning("db_engine_dispose_count")
+                logger.warning(
+                    "[PB1][POSITIONS][FAIL_OPEN] err_type=%s err=%s",
+                    type(_pos_exc).__name__,
+                    _pos_exc,
+                )
+                positions = []
         positions = self._reconcile_positions_from_kis_balance(holdings_rows, positions)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
@@ -11111,7 +11154,15 @@ class PB1Engine:
             )
             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
             with self._stage_timer("exit.positions_lookup"):
-                positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+                try:
+                    positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
+                    self._tick_db_cache[("positions", self.env, self.STRATEGY_NAME)] = list(positions)
+                except Exception as _pos_exc2:
+                    self._bump_warning("db_read_fail_open_count")
+                    dispose_engine_safely(self.engine, reason=f"positions_lookup_bootstrap:{type(_pos_exc2).__name__}")
+                    self._bump_warning("db_engine_dispose_count")
+                    logger.warning("[PB1][POSITIONS][FAIL_OPEN] bootstrap_retry err_type=%s", type(_pos_exc2).__name__)
+                    positions = []
         cooldown_map: dict[str, str] = {
             str(p.get("code") or "").zfill(6): str(p.get("cooldown_until"))
             for p in positions

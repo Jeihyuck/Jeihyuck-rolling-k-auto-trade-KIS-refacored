@@ -29,7 +29,7 @@ from .schema import (
     uuid_value_for_url,
 )
 from trader.db.json_safe import json_sanitize
-from trader.db.engine import safe_read_mappings
+from trader.db.engine import safe_read_mappings, dispose_engine_safely
 from trader.db.retry import run_with_db_retry
 from trader.constants import (
     CRITICAL_SCORED_COLS,
@@ -440,6 +440,29 @@ def _resolve_lookup_fail_open() -> bool:
             default=_lookup_fail_open_default(),
         )
     return _lookup_fail_open_default()
+
+
+def _safe_repo_read(
+    engine: "Engine",
+    stmt,
+    *,
+    op_name: str,
+    fail_open: bool | None = None,
+) -> list[dict]:
+    if fail_open is None:
+        fail_open = _resolve_lookup_fail_open()
+
+    rows, did_fail_open = safe_read_mappings(
+        engine,
+        stmt,
+        op_name=op_name,
+        fail_open=bool(fail_open),
+    )
+
+    if did_fail_open:
+        logger.warning("[DB][REPO_READ][FAIL_OPEN] op=%s rows=0", op_name)
+
+    return rows
 
 
 def _norm_strategy(strategy: str | None) -> str:
@@ -2689,21 +2712,15 @@ class OrdersRepo:
         stmt = select(self._schema.orders).where(
             and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
         )
-        try:
-            with self.engine.connect() as conn:
-                row = conn.execute(stmt).mappings().first()
-                return dict(row) if row else None
-        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            logger.exception(
-                "[DB][READ][FAIL] op=orders.get_order_by_client_order_key err_type=%s err=%s",
-                type(exc).__name__,
-                exc,
-            )
-            if _order_lookup_fail_open_default():
-                self._last_read_fail_open_op = "orders.get_order_by_client_order_key"
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.get_order_by_client_order_key -> returning None")
-                return None
-            raise
+        rows = _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="orders.get_order_by_client_order_key",
+            fail_open=_resolve_lookup_fail_open(),
+        )
+        if not rows:
+            self._last_read_fail_open_op = "orders.get_order_by_client_order_key" if not rows else None
+        return rows[0] if rows else None
 
     def has_blocking_order_today(
         self,
@@ -2753,26 +2770,16 @@ class OrdersRepo:
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(1)
         )
-        fail_open = _order_lookup_fail_open_default()
         self._last_read_fail_open_op = None
-        try:
-            with self.engine.connect() as conn:
-                row = conn.execute(stmt).mappings().first()
-                if row:
-                    return True, dict(row)
-                return False, None
-        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            logger.exception(
-                "[DB][READ][FAIL] op=orders.has_blocking_order_today fail_open=%s err_type=%s err=%s",
-                int(bool(fail_open)),
-                type(exc).__name__,
-                exc,
-            )
-            if fail_open:
-                self._last_read_fail_open_op = "orders.has_blocking_order_today"
-                logger.warning("[DB][READ][FAIL_OPEN] op=orders.has_blocking_order_today -> returning False,None")
-                return False, None
-            raise
+        rows = _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="orders.has_blocking_order_today",
+            fail_open=_resolve_lookup_fail_open(),
+        )
+        if rows:
+            return True, rows[0]
+        return False, None
 
     def list_today_orders(
         self,
@@ -3407,10 +3414,25 @@ class LedgerEventsRepo:
         reasons: list[str] | None = None,
         stage: str | None = None,
         payload_json: dict | None = None,
+        fail_soft: bool | None = None,
+        max_retry: int | None = None,
     ) -> str | None:
+        event_type_n = str(event_type or "").upper()
+        # fail_soft 기본값: 비핵심 이벤트는 실패해도 tick을 죽이지 않음
+        if fail_soft is None:
+            fail_soft_env = os.getenv("PB1_LEDGER_FAIL_SOFT", "0")
+            fail_soft = fail_soft_env in {"1", "true"} or event_type_n in {
+                "ORDER_SKIP",
+                "ORDER_BLOCK",
+                "DECISION_SKIP",
+                "DEBUG",
+                "WARN",
+                "HEARTBEAT",
+            }
+        max_retry = 1 if max_retry is None else int(max_retry)
+
         db_url = str(self.engine.url)
         db_store_required = os.getenv("DB_STORE_REQUIRED", "0") not in {"0", "false", "FALSE"}
-        max_attempts = int(os.getenv("DB_WRITE_MAX_ATTEMPTS", "2"))
         base_backoff = float(os.getenv("DB_WRITE_BACKOFF_SEC", "0.2"))
         safe_payload_json = json_sanitize(payload_json) if payload_json is not None else {}
         safe_reasons = json_sanitize(reasons or [])
@@ -3438,7 +3460,9 @@ class LedgerEventsRepo:
         }
         stmt = sa.insert(self._schema.ledger_events).values(**payload).returning(self._schema.ledger_events.c.ledger_event_id)
         last_exc: Exception | None = None
+        max_attempts = max_retry + 1
         for attempt in range(1, max_attempts + 1):
+            started = time.perf_counter()
             try:
                 with self.engine.begin() as conn:
                     logger.info(
@@ -3461,13 +3485,44 @@ class LedgerEventsRepo:
                             database_url=db_url,
                         )
                     res = conn.execute(stmt)
+                    elapsed = time.perf_counter() - started
+                    logger.info(
+                        "[DB][LEDGER_EVENT][APPEND][OK] event_type=%s attempt=%s elapsed=%.2f",
+                        event_type_n,
+                        attempt,
+                        elapsed,
+                    )
                     return str(res.scalar())
+            except (OperationalError, ProgrammingError, DBAPIError, SATimeoutError, StatementError) as exc:
+                last_exc = exc
+                elapsed = time.perf_counter() - started
+                logger.warning(
+                    "[DB][LEDGER_EVENT][APPEND][FAIL] event_type=%s attempt=%s fail_soft=%s elapsed=%.2f err_type=%s err=%s",
+                    event_type_n,
+                    attempt,
+                    int(fail_soft),
+                    elapsed,
+                    type(exc).__name__,
+                    exc,
+                )
+                dispose_engine_safely(self.engine, reason=f"ledger.append_event:{event_type_n}:{type(exc).__name__}")
+                if attempt <= max_retry:
+                    time.sleep(base_backoff)
+                    continue
+                if fail_soft:
+                    logger.warning(
+                        "[DB][LEDGER_EVENT][APPEND][FAIL_SOFT] event_type=%s -> ignored",
+                        event_type_n,
+                    )
+                    return None
+                break
             except Exception as exc:
                 last_exc = exc
+                elapsed = time.perf_counter() - started
                 # FK 위반 시 runs 테이블 upsert 재시도
                 is_fk_violation = (
-                    isinstance(exc, IntegrityError) and 
-                    "foreign key" in str(exc).lower() and 
+                    isinstance(exc, IntegrityError) and
+                    "foreign key" in str(exc).lower() and
                     "run_id" in str(exc).lower()
                 )
                 if is_fk_violation and attempt == 1:
@@ -3492,7 +3547,7 @@ class LedgerEventsRepo:
                         logger.exception("[DB][LEDGER_EVENT][ENSURE_RUN_FAIL] err=%s", ensure_exc)
                 if attempt == 1:
                     logger.exception(
-                        "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s",
+                        "[DB][LEDGER_EVENT][FAIL-FIRST] attempt=%s env=%s run_id=%s strategy=%s event_type=%s sql=%s payload=%s elapsed=%.2f",
                         attempt,
                         env,
                         run_id,
@@ -3500,61 +3555,38 @@ class LedgerEventsRepo:
                         event_type,
                         stmt,
                         payload,
+                        elapsed,
                     )
                 if _is_in_failed_transaction_error(exc):
-                    if attempt > 1:
-                        logger.warning(
-                            "[DB][LEDGER_EVENT][RETRY-IFT] attempt=%s err_type=%s err=%s",
-                            attempt,
-                            type(exc).__name__,
-                            exc,
-                        )
-                        logger.info(
-                            "[DB][LEDGER_EVENT][RETRY] reason=in_failed_transaction attempt=%s env=%s run_id=%s strategy=%s event_type=%s",
-                            attempt,
-                            env,
-                            run_id,
-                            strategy,
-                            event_type,
-                        )
                     try:
-                        self.engine.dispose()
+                        dispose_engine_safely(self.engine, reason=f"ledger.append_event:in_failed_tx:{event_type_n}")
                     except Exception as dispose_exc:
                         logger.warning(
                             "[DB][LEDGER_EVENT][DISPOSE-FAIL] err_type=%s err=%s",
                             type(dispose_exc).__name__,
                             dispose_exc,
                         )
-                elif attempt > 1:
-                    logger.exception(
-                        "[DB][LEDGER_EVENT][FAIL] attempt=%s env=%s run_id=%s strategy=%s event_type=%s err=%s sql=%s payload=%s",
-                        attempt,
-                        env,
-                        run_id,
-                        strategy,
-                        event_type,
-                        exc,
-                        stmt,
-                        payload,
-                    )
                 if attempt < max_attempts:
                     time.sleep(base_backoff * (2 ** (attempt - 1)))
-        if db_store_required and last_exc is not None:
+        if db_store_required and last_exc is not None and not fail_soft:
             raise last_exc
         if last_exc is not None:
             logger.warning(
-                "[DB][LEDGER_EVENT][LAST_ERROR] err_type=%s err=%s",
+                "[DB][LEDGER_EVENT][LAST_ERROR] event_type=%s fail_soft=%s err_type=%s err=%s",
+                event_type_n,
+                int(fail_soft),
                 type(last_exc).__name__,
                 last_exc,
             )
         logger.warning(
-            "[DB][LEDGER_EVENT][SKIP] env=%s run_id=%s strategy=%s event_type=%s required=%s attempts=%s",
+            "[DB][LEDGER_EVENT][SKIP] env=%s run_id=%s strategy=%s event_type=%s required=%s attempts=%s fail_soft=%s",
             env,
             run_id,
             strategy,
             event_type,
             int(db_store_required),
             max_attempts,
+            int(fail_soft),
         )
         return None
 
@@ -4028,20 +4060,12 @@ class PositionsRepo:
         stmt = select(self._schema.positions).where(
             and_(self._schema.positions.c.env == env, self._schema.positions.c.strategy == strategy)
         )
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(stmt).mappings().all()
-                return [dict(r) for r in rows]
-        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
-            logger.exception(
-                "[DB][READ][FAIL] op=positions.list_positions err_type=%s err=%s",
-                type(exc).__name__,
-                exc,
-            )
-            if _practice_env_default_fail_open():
-                logger.warning("[DB][READ][FAIL_OPEN] op=positions.list_positions -> returning []")
-                return []
-            raise
+        return _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="positions.list_positions",
+            fail_open=_resolve_lookup_fail_open(),
+        )
 
     def get_position(self, *, env: str, strategy: str, sid: int, mode: int, code: str) -> dict | None:
         stmt = select(self._schema.positions).where(
@@ -4053,9 +4077,13 @@ class PositionsRepo:
                 self._schema.positions.c.code == code,
             )
         )
-        with self.engine.begin() as conn:
-            row = conn.execute(stmt).mappings().first()
-            return dict(row) if row else None
+        rows = _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="positions.get_position",
+            fail_open=_resolve_lookup_fail_open(),
+        )
+        return rows[0] if rows else None
 
     def list_positions_by_codes(self, *, env: str, strategy: str, codes: list[str]) -> list[dict]:
         if not codes:
@@ -4067,9 +4095,12 @@ class PositionsRepo:
                 self._schema.positions.c.code.in_(codes),
             )
         )
-        with self.engine.begin() as conn:
-            rows = conn.execute(stmt).mappings().all()
-            return [dict(r) for r in rows]
+        return _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="positions.list_positions_by_codes",
+            fail_open=_resolve_lookup_fail_open(),
+        )
 
     def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:
         if not codes:

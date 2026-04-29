@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import DBAPIError, OperationalError, StatementError, TimeoutError as SATimeoutError
+from sqlalchemy.exc import DBAPIError, OperationalError, ProgrammingError, StatementError, TimeoutError as SATimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ def make_engine() -> sa.Engine:
             pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "1800")),
             pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
             max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
-            pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+            pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "10")),
             future=True,
         )
     except ModuleNotFoundError as exc:
@@ -163,6 +163,47 @@ def connection_has_active_transaction(conn) -> bool:
     return False
 
 
+def _is_connection_poison_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        token in msg
+        for token in (
+            "connection in transaction status active",
+            "can't change 'autocommit'",
+            "can't change autocommit",
+            "server closed the connection",
+            "connection already closed",
+            "terminating connection",
+            "statement timeout",
+            "lock timeout",
+            "pool timeout",
+        )
+    )
+
+
+def dispose_engine_safely(engine: "sa.Engine | None" = None, *, reason: str = "") -> None:
+    target = engine
+    if target is None:
+        try:
+            target = get_engine()
+        except Exception:
+            target = None
+
+    if target is None:
+        return
+
+    try:
+        logger.warning("[DB][ENGINE][DISPOSE] reason=%s", reason or "unknown")
+        target.dispose()
+    except Exception as exc:
+        logger.warning(
+            "[DB][ENGINE][DISPOSE][FAIL] reason=%s err_type=%s err=%s",
+            reason or "unknown",
+            type(exc).__name__,
+            exc,
+        )
+
+
 def safe_read_mappings(
     engine: sa.Engine,
     stmt,
@@ -178,19 +219,43 @@ def safe_read_mappings(
                 int(connection_has_active_transaction(conn)),
             )
             rows = conn.execute(stmt).mappings().all()
-            logger.info("[DB][READ][OK] op=%s rows=%s fail_open=%s", op_name, len(rows), int(bool(fail_open)))
+            logger.info(
+                "[DB][READ][OK] op=%s rows=%s fail_open=%s",
+                op_name,
+                len(rows),
+                int(bool(fail_open)),
+            )
             return [dict(row) for row in rows], False
-    except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+
+    except (
+        OperationalError,
+        ProgrammingError,
+        DBAPIError,
+        SATimeoutError,
+        StatementError,
+    ) as exc:
+        poison = _is_connection_poison_error(exc)
         logger.exception(
-            "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+            "[DB][READ][FAIL] op=%s fail_open=%s poison=%s err_type=%s err=%s",
             op_name,
             int(bool(fail_open)),
+            int(bool(poison)),
             type(exc).__name__,
             exc,
         )
+
+        if poison:
+            logger.warning(
+                "[DB][READ][POISON] op=%s action=dispose_engine err_type=%s",
+                op_name,
+                type(exc).__name__,
+            )
+            dispose_engine_safely(engine, reason=f"safe_read_mappings:{op_name}:{type(exc).__name__}")
+
         if fail_open:
-            logger.warning("[FAIL_OPEN][DB][READ] op=%s -> returning []", op_name)
+            logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning []", op_name)
             return [], True
+
         raise
 
 

@@ -79,7 +79,13 @@ env:
   DB_LOCK_TIMEOUT_MS: "5000"
   DB_STATEMENT_TIMEOUT_MS: "15000"
   DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+  DB_POOL_TIMEOUT: "10"
   PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+  PB1_MIN_TICK_BUDGET_SEC: "75"
+  PB1_DB_RECOVERY_SLEEP_SEC: "2"
+  PB1_DISPOSE_ENGINE_ON_TICK_TIMEOUT: "1"
+  PB1_LEDGER_FAIL_SOFT: "1"
+  PB1_DB_FAIL_OPEN_SCOPE: "orders,fills,positions,ledger"
 
   # [2026-04-29] Paper cap 5천만원 / Effective exit policy
   PAPER_MAX_CAPITAL_KRW: "50000000"
@@ -178,6 +184,12 @@ jobs:
           fi
 
           echo "[TRADE_AFTERNOON][BOOT_GUARD] event=${event_name} should_run=${should_run} skip_reason=${skip_reason} now_kst=${now_hhmmss} schedule_expected=1215 delay_seconds=${delay_seconds} route=${route}"
+          echo "[TRADE_AFTERNOON][QUEUE_META] event=${GITHUB_EVENT_NAME} run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} actor=${GITHUB_ACTOR} workflow=${GITHUB_WORKFLOW} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
+          echo "[TRADE_AFTERNOON][CONCURRENCY_META] group=trade-afternoon-practice-${GITHUB_REF_NAME} cancel_in_progress=false"
+          echo "[TRADE_AFTERNOON][START_META] schedule_expected=1215 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            echo "[TRADE_AFTERNOON][MANUAL_RUN] actor=${GITHUB_ACTOR} route=${route} confirm=${confirm:-}"
+          fi
 
           echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
           echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
@@ -356,6 +368,7 @@ jobs:
         id: pm_loop
         if: steps.boot_guard.outputs.should_run == '1'
         continue-on-error: true
+        timeout-minutes: 135
         working-directory: repo
         env:
           PB1_SESSION_KIND: "afternoon"
@@ -412,6 +425,7 @@ jobs:
         id: close_loop
         if: always() && steps.boot_guard.outputs.should_run == '1'
         continue-on-error: true
+        timeout-minutes: 20
         working-directory: repo
         env:
           PB1_SESSION_KIND: "afternoon"
@@ -425,6 +439,7 @@ jobs:
           PB1_CLOSE_SESSION_END: "15:30"
           PB1_RUN_LOOP_MINUTES: "15"
           PB1_TICK_HARD_TIMEOUT_SEC: "45"
+          PB1_MIN_TICK_BUDGET_SEC: "30"
           ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
           PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           PB1_ORDER_BLOCK_REASON: ${{ steps.trading_day_guard.outputs.reason }}
@@ -466,6 +481,26 @@ jobs:
 
           if grep -E "\[TRADE\]\[ORDER\]\[BUY\]|\[ORDER\]\[BUY\]" artifacts/trade-afternoon.log | grep -E "phase=close|session=close" >/dev/null; then
             echo "::error::BUY order detected in close session, forbidden"
+            missing=1
+          fi
+
+          if grep -E "\[TRADE_AM\]\[HEARTBEAT\]" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::TRADE_AM heartbeat label detected in trade-afternoon log (should be TRADE_AFTERNOON or TRADE_CLOSE)"
+            missing=1
+          fi
+
+          if grep -F "connection in transaction status ACTIVE" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::poisoned DB connection detected: 'connection in transaction status ACTIVE'"
+            missing=1
+          fi
+
+          if grep -F "can't change 'autocommit'" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::autocommit active transaction error detected"
+            missing=1
+          fi
+
+          if grep -F "Traceback" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::Traceback detected in trade-afternoon log"
             missing=1
           fi
 

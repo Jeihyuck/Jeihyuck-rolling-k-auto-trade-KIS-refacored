@@ -81,7 +81,7 @@ from trader.config import (
 )
 from trader.runtime_paths import runtime_root, runtime_path
 from trader.logging_utils import append_jsonl
-from trader.db.engine import make_engine
+from trader.db.engine import make_engine, dispose_engine_safely
 from trader.db.health import assert_db_ready
 from trader.db.locks import acquire_advisory_lock, release_advisory_lock
 from trader.db.migrate import run_migrations
@@ -5427,12 +5427,13 @@ def run_once(
                 _warning_total(result_warning_counts),
             )
             logger.info(
-                "[PB1][SESSION_WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s",
+                "[PB1][SESSION_WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s db_engine_dispose_count=%s",
                 result_warning_counts.get("timeout_count", 0),
                 result_warning_counts.get("db_read_fail_open_count", 0),
                 result_warning_counts.get("ledger_fail_first_count", 0),
                 result_warning_counts.get("degraded_stage_count", 0),
                 result_warning_counts.get("duplicate_skip_count", 0),
+                result_warning_counts.get("db_engine_dispose_count", 0),
             )
             result.notes = result_reason
             if nontrading_eval_mode:
@@ -5483,8 +5484,20 @@ def run_once(
                     mismatch_categories,
                 )
             state_label = "ORDER_SUBMITTED" if int(run_summary.get("submitted", 0)) > 0 else "NO_ORDERABLE"
+            # 세션별 HEARTBEAT prefix 동적 결정
+            _hb_session_kind = os.getenv("PB1_SESSION_KIND") or os.getenv("PB1_FORCE_TRADE_SESSION") or "unknown"
+            if _hb_session_kind == "am":
+                _hb_prefix = "TRADE_AM"
+            elif _hb_session_kind in ("afternoon", "pm"):
+                _hb_phase = (os.getenv("FORCE_PB1_PHASE") or os.getenv("PB1_PHASE_DEFAULT") or "").strip().lower()
+                _hb_prefix = "TRADE_CLOSE" if _hb_phase == "exit" else "TRADE_AFTERNOON"
+            elif _hb_session_kind == "close":
+                _hb_prefix = "TRADE_CLOSE"
+            else:
+                _hb_prefix = f"TRADE_{_hb_session_kind.upper()}"
             logger.info(
-                "[TRADE_AM][HEARTBEAT] tick=%s state=%s candidates_scanned=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s submitted=%s top_blockers=%s",
+                "[%s][HEARTBEAT] tick=%s state=%s candidates_scanned=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s submitted=%s top_blockers=%s",
+                _hb_prefix,
                 tick_label,
                 state_label,
                 int(run_summary.get("scanned", 0)),
@@ -5496,7 +5509,8 @@ def run_once(
                 run_summary.get("blocked_by", "none") or "none",
             )
             logger.info(
-                "[TRADE_AM][HEARTBEAT] tick=%s late_start=%s degraded_session=%s rate_limit_count=%s",
+                "[%s][HEARTBEAT] tick=%s late_start=%s degraded_session=%s rate_limit_count=%s",
+                _hb_prefix,
                 tick_label,
                 int(str(os.getenv("TRADE_AM_LATE_START") or "0") == "1"),
                 int(str(os.getenv("TRADE_AM_DEGRADED_SESSION") or "0") == "1"),
@@ -6047,6 +6061,19 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     tick_timeout_sec,
                     exc,
                 )
+                # tick timeout 후 오염된 DB connection dispose
+                _last_stage_on_timeout = os.getenv("PB1_LAST_STAGE", "unknown")
+                if os.getenv("PB1_DISPOSE_ENGINE_ON_TICK_TIMEOUT", "1") not in {"0", "false"}:
+                    dispose_engine_safely(engine, reason=f"tick_hard_timeout:{_last_stage_on_timeout}")
+                    session_warning_counts["db_engine_dispose_count"] = int(session_warning_counts.get("db_engine_dispose_count", 0)) + 1
+                    logger.warning(
+                        "[PB1][TICK][TIMEOUT][DB_DISPOSE] last_stage=%s",
+                        _last_stage_on_timeout,
+                    )
+                    # recovery sleep
+                    _recovery_sleep_sec = max(1, int(os.getenv("PB1_DB_RECOVERY_SLEEP_SEC", "2")))
+                    logger.info("[PB1][TICK][RECOVERY_SLEEP] sec=%s reason=db_timeout", _recovery_sleep_sec)
+                    time_mod.sleep(_recovery_sleep_sec)
                 now_after_timeout = _get_now_kst()
                 if now_after_timeout >= session_end_dt:
                     exit_reason = "session_end"
@@ -6141,13 +6168,24 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             buy_orders,
             sell_orders,
         )
+        # close phase에서 tick이 0개이면 명시 경고
+        _forced_phase = (os.getenv("FORCE_PB1_PHASE") or os.getenv("PB1_PHASE_DEFAULT") or "").strip().lower()
+        if ticks_total == 0 and _forced_phase == "exit":
+            _close_session_end = os.getenv("PB1_CLOSE_SESSION_END", "15:30")
+            logger.warning(
+                "[TRADE_CLOSE][NO_TICK][WARN] reason=no_ticks_executed now=%s close_session_end=%s exit_reason=%s close_ticks_total=0 close_executed=0",
+                _get_now_kst().strftime("%H%M%S"),
+                _close_session_end.replace(":", ""),
+                exit_reason,
+            )
         logger.info(
-            "[PB1][SESSION_WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s",
+            "[PB1][SESSION_WARNINGS] timeout_count=%s db_read_fail_open_count=%s ledger_fail_first_count=%s degraded_stage_count=%s duplicate_skip_count=%s db_engine_dispose_count=%s",
             session_warning_counts.get("timeout_count", 0),
             session_warning_counts.get("db_read_fail_open_count", 0),
             session_warning_counts.get("ledger_fail_first_count", 0),
             session_warning_counts.get("degraded_stage_count", 0),
             session_warning_counts.get("duplicate_skip_count", 0),
+            session_warning_counts.get("db_engine_dispose_count", 0),
         )
         logger.info(
             "[PB1][SESSION_TERMINAL] terminal_state=%s result_status=%s exit_reason=%s warnings_total=%s",

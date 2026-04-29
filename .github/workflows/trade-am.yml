@@ -43,7 +43,13 @@ env:
   DB_LOCK_TIMEOUT_MS: "5000"
   DB_STATEMENT_TIMEOUT_MS: "15000"
   DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+  DB_POOL_TIMEOUT: "10"
   PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+  PB1_MIN_TICK_BUDGET_SEC: "75"
+  PB1_DB_RECOVERY_SLEEP_SEC: "2"
+  PB1_DISPOSE_ENGINE_ON_TICK_TIMEOUT: "1"
+  PB1_LEDGER_FAIL_SOFT: "1"
+  PB1_DB_FAIL_OPEN_SCOPE: "orders,fills,positions,ledger"
 
   PB1_PREWARM_ENABLED: "1"
   PB1_EXIT_PREWARM_ENABLED: "1"
@@ -414,6 +420,7 @@ jobs:
 
       - name: Run AM trade loop
         if: steps.phase_guard.outputs.should_run == '1'
+        timeout-minutes: 245
         working-directory: repo
         env:
           ORDER_ALLOWED: ${{ steps.order_mode_guard.outputs.order_allowed }}

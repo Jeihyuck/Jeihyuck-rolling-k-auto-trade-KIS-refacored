@@ -78,6 +78,66 @@ def test_safe_read_mappings_fail_open_returns_empty() -> None:
     assert fail_open is True
 
 
+def test_safe_read_mappings_fills_repo_fail_open_returns_empty() -> None:
+    """FillsRepo가 사용하는 safe_read_mappings 경로에서 fail-open이 정상 동작하는지 확인"""
+    class FailingConn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, _stmt):
+            raise sa.exc.OperationalError("stmt", {}, Exception("timeout"))
+
+    class FailingEngine:
+        def connect(self): return FailingConn()
+
+    rows, fail_open = safe_read_mappings(
+        FailingEngine(), sa.text("select 1"),
+        op_name="fills.list_today_fills", fail_open=True
+    )
+    assert rows == []
+    assert fail_open is True
+
+
+def test_safe_read_mappings_positions_repo_fail_open_returns_empty() -> None:
+    """PositionsRepo가 사용하는 safe_read_mappings 경로에서 fail-open이 정상 동작하는지 확인"""
+    class FailingConn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, _stmt):
+            raise sa.exc.ProgrammingError("stmt", {}, Exception("active tx"))
+
+    class FailingEngine:
+        disposed = False
+        def connect(self): return FailingConn()
+        def dispose(self): self.disposed = True
+
+    eng = FailingEngine()
+    rows, fail_open = safe_read_mappings(
+        eng, sa.text("select 1"),
+        op_name="positions.list_positions", fail_open=True
+    )
+    assert rows == []
+    assert fail_open is True
+
+
+def test_safe_read_mappings_order_repo_fail_open_returns_none_like() -> None:
+    """OrdersRepo.get_order_by_client_order_key fail-open — empty list (caller handles None)"""
+    class FailingConn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, _stmt):
+            raise sa.exc.OperationalError("stmt", {}, Exception("pgbouncer timeout"))
+
+    class FailingEngine:
+        def connect(self): return FailingConn()
+
+    rows, fail_open = safe_read_mappings(
+        FailingEngine(), sa.text("select 1"),
+        op_name="orders.get_order_by_client_order_key", fail_open=True
+    )
+    assert rows == []
+    assert fail_open is True
+
+
 def test_tick_scope_cache_prevents_repeated_today_fill_queries() -> None:
     engine = PB1Engine.__new__(PB1Engine)
     engine.env = "practice"
