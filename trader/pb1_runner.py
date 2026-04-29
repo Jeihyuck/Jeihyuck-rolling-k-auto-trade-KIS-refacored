@@ -700,13 +700,16 @@ def _after_close_entry_dryrun_enabled(now: datetime) -> bool:
     mode_input = (os.getenv("MODE") or "").strip().lower()
     strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
     allow_flag = parse_bool_any(os.getenv("PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN"), default=False)
+    force_run = parse_bool_any(os.getenv("FORCE_RUN"), default=False)
+    diag_full_exec = parse_bool_any(os.getenv("PB1_DIAG_FULL_EXEC"), default=False)
     dry_run = parse_bool_any(os.getenv("DRY_RUN"), default=True)
     force_block_live = parse_bool_any(os.getenv("FORCE_BLOCK_LIVE"), default=False)
     close_start = _parse_hhmm_to_time(CLOSE_AUCTION_START)
 
-    return bool(
-        allow_flag
-        and mode_input == "trade"
+    # FORCE_RUN=1 + PB1_DIAG_FULL_EXEC=1 조합도 allow arm으로 인정 (PB1_ALLOW_AFTER_CLOSE_ENTRY_DRYRUN 없이도 동작)
+    arm = allow_flag or (force_run and diag_full_exec)
+    base = bool(
+        mode_input == "trade"
         and strategy_mode == "DIAG"
         and forced_window == "day"
         and forced_phase == "entry"
@@ -714,6 +717,7 @@ def _after_close_entry_dryrun_enabled(now: datetime) -> bool:
         and force_block_live is True
         and now.time() >= close_start
     )
+    return bool(arm and base)
 
 
 def _hydrate_locked_final30_from_db_only(*, engine, env: str, as_of: date | str) -> pd.DataFrame:
@@ -1849,10 +1853,26 @@ def _detect_trade_session_policy(
         )
         return policy
     if now > valid_until:
+        if _after_close_entry_dryrun_enabled(now):
+            # DIAG+FORCE_RUN+DRY_RUN 조합 → 장마감 후에도 1 tick dry-run 허용
+            # 반드시 live gate 강제 차단
+            os.environ["LIVE_TRADING_ENABLED"] = "0"
+            os.environ["FORCE_BLOCK_LIVE"] = "1"
+            policy.update(
+                should_run=True,
+                recovery=False,
+                degraded_session=False,
+                force_override_used=True,
+                classification=f"AFTER_CLOSE_ENTRY_DRYRUN_{session_upper}",
+                skip_reason="after_close_entry_dryrun",
+                reason="after_close_entry_dryrun",
+            )
+            return policy
         policy.update(
             should_run=False,
             classification=f"SKIP_{session_upper}_SESSION_ENDED",
             skip_reason=f"outside_trade_{str(session_cfg['session'])}_valid_window",
+            reason=f"outside_trade_{str(session_cfg['session'])}_valid_window",
         )
         return policy
 
@@ -2132,6 +2152,7 @@ def _evaluate_trade_session_start_guard(*, engine, env: str, now: datetime, sess
         f"should_run={int(bool(policy['should_run']))}",
         f"recovery={int(bool(policy['recovery']))}",
         f"force_override_used={int(bool(policy['force_override_used']))}",
+        f"reason={policy.get('reason') or policy['skip_reason']}",
         f"skip_reason={policy['skip_reason']}",
         f"event={policy['event_name']}",
         f"classification={policy['classification']}",
@@ -4064,6 +4085,16 @@ def run_once(
     after_close_entry_dryrun = _after_close_entry_dryrun_enabled(now)
 
     if after_close_entry_dryrun:
+        # live gate 이중 잠금
+        os.environ["LIVE_TRADING_ENABLED"] = "0"
+        os.environ["FORCE_BLOCK_LIVE"] = "1"
+        logger.warning(
+            "[PB1][DIAG_FULL_EXEC] enabled=1 after_close_entry_dryrun=1 now_kst=%s strategy_mode=%s dry_run=%s force_block_live=%s live_trading_enabled=0",
+            now.strftime("%H%M"),
+            os.getenv("STRATEGY_MODE"),
+            os.getenv("DRY_RUN"),
+            os.getenv("FORCE_BLOCK_LIVE"),
+        )
         logger.warning(
             "[PB1][AFTER_CLOSE_ENTRY_DRYRUN][ENABLED] now_kst=%s mode=%s force_window=%s force_phase=%s dry_run=%s force_block_live=%s",
             now.isoformat(),
