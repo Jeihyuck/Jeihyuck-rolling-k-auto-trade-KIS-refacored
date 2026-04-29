@@ -73,6 +73,7 @@ def _pos(
 def test_tp1_triggers_at_2r(monkeypatch):
     """avg=10000, stop=9500 → R=500, TP1 at 11000 (2R)."""
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 R TP 격리
     monkeypatch.setenv("PB1_SWING_TP1_R", "2.0")
     monkeypatch.setenv("PB1_SWING_TP1_SELL_PCT", "0.33")
     # R-based TP1을 격리 테스트하기 위해 profit_protect/abs_tp1 비활성화
@@ -110,6 +111,7 @@ def test_tp1_not_triggered_below_2r(monkeypatch):
 def test_tp2_triggers_at_3r(monkeypatch):
     """TP1 이미 처리됨, TP2 at 3R."""
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 R TP 격리
     monkeypatch.setenv("PB1_SWING_TP2_R", "3.0")
     monkeypatch.setenv("PB1_SWING_TP2_SELL_PCT", "0.33")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")

@@ -89,6 +89,7 @@ def test_current_r_uses_effective_r_not_raw_r(monkeypatch):
     mark=54600, entry=50500, effective_stop=46965, effective_r=3535
     current_r = (54600 - 50500) / 3535 ≈ 1.16R (raw 기준 0.42R이 아닌)
     """
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 로직으로 R 기준 격리 테스트
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")   # 보호익절 꺼서 R 기준 테스트
     monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
@@ -133,6 +134,7 @@ def test_profit_protect_8pct_triggered(monkeypatch):
     entry=50500, mark=54600 → ret_pct=8.12% >= 8.0% → PROFIT_PROTECT_8PCT
     sell_qty = int(51 * 0.33) = 16
     """
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 PROFIT_PROTECT_8PCT 로직 격리
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_PCT", "8.0")
@@ -154,6 +156,7 @@ def test_profit_protect_8pct_triggered(monkeypatch):
 
 
 def test_profit_protect_below_threshold_no_trigger(monkeypatch):
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 로직
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_PCT", "8.0")
@@ -174,6 +177,7 @@ def test_profit_protect_below_threshold_no_trigger(monkeypatch):
 
 def test_profit_protect_not_retriggered_when_done(monkeypatch):
     """profit_protect_done=True이면 같은 트리거 반복 금지"""
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 로직
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_PCT", "8.0")
@@ -190,6 +194,7 @@ def test_profit_protect_not_retriggered_when_done(monkeypatch):
 
 def test_abs_tp1_not_retriggered_when_done(monkeypatch):
     """abs_tp1_done=True이면 ABS_TP1_10PCT 반복 금지"""
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 로직
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
     monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "1")
@@ -213,6 +218,7 @@ def test_abs_tp1_10pct_triggered(monkeypatch):
     entry=50500, mark=55600 → ret_pct=10.1% >= 10.0% → ABS_TP1_10PCT
     profit_protect는 이미 done
     """
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 ABS_TP1_10PCT 로직
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_PCT", "8.0")
@@ -246,6 +252,7 @@ def test_r_based_tp1_uses_effective_r(monkeypatch):
     """
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 R 기준 격리
     monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
     monkeypatch.setenv("PB1_SWING_TP1_R", "2.0")
     monkeypatch.setenv("PB1_SWING_TP1_SELL_PCT", "0.33")
@@ -271,6 +278,7 @@ def test_r_based_tp1_not_triggered_below_2r_effective(monkeypatch):
     effective_r=3535 기준으로 2R(=7070) 미달이면 TP1 트리거 안 됨
     mark=56000: (56000-50500)/3535 ≈ 1.56R → TP1 미달
     """
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 R 기준 격리
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
     monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
@@ -295,6 +303,7 @@ def test_r_based_tp1_not_triggered_below_2r_effective(monkeypatch):
 # ────────────────────────────────────────────────────────────────
 
 def test_update_meta_contains_effective_fields_on_profit_protect(monkeypatch):
+    monkeypatch.setenv("PB1_EXIT_ROUTER_ENABLED", "0")  # 레거시 PROFIT_PROTECT_8PCT 로직
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "1")
     monkeypatch.setenv("PB1_PROFIT_PROTECT_PCT", "8.0")

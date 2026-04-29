@@ -1005,28 +1005,26 @@ def _resolve_swing_staged_exit(
     ret_pct: float,
     days_held: int,
     stop_hit: bool,
+    highest_ret_pct: float | None = None,
 ) -> dict[str, Any]:
-    """SWING_CARRY R-multiple 단계별 매도 정책.
+    """SWING_CARRY R-multiple 단계별 매도 정책 (Multi-Layer Exit Router 통합).
 
-    우선순위:
-    1. effective hard stop (기존 손절가가 너무 깊으면 7%/8% 캡 기준으로 보정)
-    2. failed breakout (호출자가 판단, stop_hit=True 전달)
-    3. +8% 보호익절 (PROFIT_PROTECT)
-    4. +10% 절대수익률 TP (ABS_TP1)
-    5. R-based TP1/TP2
-    6. MA20 runner / time stop
+    PB1_EXIT_ROUTER_ENABLED=1 (기본값):
+        trader/exit_policy/router.py apply_swing_exit_decision() 사용.
+        R + 수익률% + giveback + 추세 복합 판단.
+        강한 추세에서는 R 도달만으로 전량 매도하지 않는다.
+
+    PB1_EXIT_ROUTER_ENABLED=0 (레거시 fallback):
+        기존 R-based TP + profit_protect(8%) + abs_tp1(10%) 로직 사용.
     """
     import os as _os
     enabled = _os.getenv("PB1_SWING_STAGED_EXIT_ENABLED", "1") == "1"
     if not enabled:
         return {"exit_ok": False, "reason": "SWING_STAGED_EXIT_DISABLED"}
 
-    tp1_r = float(_os.getenv("PB1_SWING_TP1_R", "2.0"))
-    tp1_sell_pct = float(_os.getenv("PB1_SWING_TP1_SELL_PCT", "0.33"))
-    tp2_r = float(_os.getenv("PB1_SWING_TP2_R", "3.0"))
-    tp2_sell_pct = float(_os.getenv("PB1_SWING_TP2_SELL_PCT", "0.33"))
-    time_stop_days = int(_os.getenv("PB1_SWING_TIME_STOP_DAYS", "10"))
-
+    # ──────────────────────────────────────────────────────────────
+    # Effective stop/R 계산: 기존 손절가 캡 기준으로 보정 (공통)
+    # ──────────────────────────────────────────────────────────────
     meta = pos.get("position_meta") or {}
     if isinstance(meta, str):
         try:
@@ -1034,23 +1032,15 @@ def _resolve_swing_staged_exit(
             meta = _json.loads(meta)
         except Exception:
             meta = {}
-    tp1_done = bool(meta.get("tp1_done", False))
-    tp2_done = bool(meta.get("tp2_done", False))
-    profit_protect_done = bool(meta.get("profit_protect_done", False))
-    abs_tp1_done = bool(meta.get("abs_tp1_done", False))
 
     avg = float(pos.get("avg_buy_price") or pos.get("avg") or pos.get("entry_price") or 0.0)
     orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
     code_for_log = str(pos.get("code") or pos.get("stock_code") or "UNKNOWN")
 
-    # ──────────────────────────────────────────────────────────────
-    # Effective stop/R 계산: 기존 손절가가 너무 깊으면 cap 기준으로 보정
-    # ──────────────────────────────────────────────────────────────
     risk_ctx = _resolve_effective_exit_risk_for_pos(pos)
     effective_stop = float(risk_ctx["effective_stop_price"] or 0.0)
     effective_r = risk_ctx["effective_r_value"]
 
-    # effective_r이 유효하지 않으면 avg 기반 fallback
     if effective_r is None or effective_r <= 0:
         raw_stop = float(
             meta.get("initial_stop_price")
@@ -1064,15 +1054,63 @@ def _resolve_swing_staged_exit(
 
     risk_per_share = float(effective_r) if effective_r and effective_r > 0 else 0.0
     current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
-    max_r = float(meta.get("max_r_since_entry") or 0.0)
+    _highest_ret = float(highest_ret_pct) if highest_ret_pct is not None else ret_pct
 
     logger.info(
         "[EXIT][SWING][R_CTX] code=%s avg=%.2f stop=%.2f mark=%.2f risk_per_share=%.2f "
-        "current_r=%.3f max_r=%.3f days_held=%s tp1_done=%s tp2_done=%s "
-        "effective_applied=%s",
-        code_for_log, avg, effective_stop, mark, risk_per_share, current_r, max_r,
-        days_held, tp1_done, tp2_done, int(risk_ctx.get("effective_applied", False)),
+        "current_r=%.3f highest_ret=%.2f days_held=%s effective_applied=%s",
+        code_for_log, avg, effective_stop, mark, risk_per_share, current_r,
+        _highest_ret, days_held, int(risk_ctx.get("effective_applied", False)),
     )
+
+    # ──────────────────────────────────────────────────────────────
+    # Exit Router 분기: PB1_EXIT_ROUTER_ENABLED=1이면 router 사용
+    # ──────────────────────────────────────────────────────────────
+    _router_enabled = _os.getenv("PB1_EXIT_ROUTER_ENABLED", "1") == "1"
+    if _router_enabled:
+        from trader.exit_policy.router import (
+            resolve_exit_policy_for_position,
+            apply_swing_exit_decision,
+        )
+        _policy = resolve_exit_policy_for_position(
+            pos=pos,
+            features={},
+            holding_ctx={
+                "days_held": days_held,
+                "current_return_pct": ret_pct,
+                "current_r": current_r,
+                "highest_return_pct": _highest_ret,
+                "mark": mark,
+            },
+            market_ctx={"ma20": ma20},
+        )
+        return apply_swing_exit_decision(
+            pos, mark, _policy,
+            ret_pct=ret_pct,
+            current_r=current_r,
+            highest_ret_pct=_highest_ret,
+            days_held=days_held,
+            stop_hit=stop_hit,
+            ma20=ma20,
+            effective_stop=effective_stop,
+            effective_r=float(effective_r) if effective_r else 0.0,
+            risk_ctx=risk_ctx,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # 레거시 fallback (PB1_EXIT_ROUTER_ENABLED=0)
+    # ──────────────────────────────────────────────────────────────
+    tp1_r = float(_os.getenv("PB1_SWING_TP1_R", "2.0"))
+    tp1_sell_pct = float(_os.getenv("PB1_SWING_TP1_SELL_PCT", "0.33"))
+    tp2_r = float(_os.getenv("PB1_SWING_TP2_R", "3.0"))
+    tp2_sell_pct = float(_os.getenv("PB1_SWING_TP2_SELL_PCT", "0.33"))
+    time_stop_days = int(_os.getenv("PB1_SWING_TIME_STOP_DAYS", "10"))
+
+    tp1_done = bool(meta.get("tp1_done", False))
+    tp2_done = bool(meta.get("tp2_done", False))
+    profit_protect_done = bool(meta.get("profit_protect_done", False))
+    abs_tp1_done = bool(meta.get("abs_tp1_done", False))
+    max_r = float(meta.get("max_r_since_entry") or 0.0)
 
     # ──────────────────────────────────────────────────────────────
     # 1. effective hard stop (기존 raw stop 대신 effective stop 사용)
@@ -8829,6 +8867,7 @@ class PB1Engine:
                     ret_pct=ret_pct,
                     days_held=days_held,
                     stop_hit=stop_hit,
+                    highest_ret_pct=_max_pnl,
                 )
             elif _active_family == "CORE_TREND_FOLLOW":
                 horizon_result = _resolve_core_trend_follow_exit(

@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 # DISABLED: trade-close는 trade-afternoon으로 통합되었습니다.
 # PM + Close 실행은 trade-afternoon.yml에서 처리합니다.
 # 이 워크플로우는 watchdog emergency backup으로만 존재하며 정상 운영 중 실행되지 않아야 합니다.
@@ -74,6 +75,16 @@ env:
   PB1_REQUIRE_SCORED_FINAL30: "1"
   PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
   TRADE_REQUIRE_PREP_FINAL30_SCORED: "1"
+  # [2026-04-29] Multi-Layer Exit Router (trade-close: exit only, same policy)
+  PB1_EXIT_ROUTER_ENABLED: "1"
+  PB1_PERCENT_EXIT_ENABLED: "1"
+  PB1_EXIT_POLICY_MODE: "HYBRID_BY_ENTRY_STYLE"
+  PB1_EXIT_POLICY_PATH: "trader/exit_policy/optimized_exit_router_policy.json"
+  PAPER_MAX_CAPITAL_KRW: "50000000"
+  PB1_EXISTING_POSITION_EFFECTIVE_EXIT_ENABLED: "1"
+  PB1_EFFECTIVE_STOP_CAP_ENABLED: "1"
+  PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT: "7.0"
+  PB1_EFFECTIVE_STOP_CAP_KOSDAQ_PCT: "8.0"
 
 defaults:
   run:

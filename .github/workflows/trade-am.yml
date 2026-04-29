@@ -92,6 +92,11 @@ env:
   PB1_ABS_TP1_ENABLED: "1"
   PB1_ABS_TP1_PROFIT_PCT: "10.0"
   PB1_ABS_TP1_SELL_PCT: "0.33"
+  # [2026-04-29] Multi-Layer Exit Router
+  PB1_EXIT_ROUTER_ENABLED: "1"
+  PB1_PERCENT_EXIT_ENABLED: "1"
+  PB1_EXIT_POLICY_MODE: "HYBRID_BY_ENTRY_STYLE"
+  PB1_EXIT_POLICY_PATH: "trader/exit_policy/optimized_exit_router_policy.json"
 
 defaults:
   run:
