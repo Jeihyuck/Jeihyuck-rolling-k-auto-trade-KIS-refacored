@@ -148,6 +148,17 @@ from trader.config import (
     FORCE_MIN1_OVERRIDE_POSITION_CAP,
     FORCE_MIN1_OVERRIDE_TOPN,
     resolve_market_window,
+    # [2026-04-29] Effective Exit Policy
+    PB1_EXISTING_POSITION_EFFECTIVE_EXIT_ENABLED,
+    PB1_EFFECTIVE_STOP_CAP_ENABLED,
+    PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT,
+    PB1_EFFECTIVE_STOP_CAP_KOSDAQ_PCT,
+    PB1_PROFIT_PROTECT_ENABLED,
+    PB1_PROFIT_PROTECT_PCT,
+    PB1_PROFIT_PROTECT_SELL_PCT,
+    PB1_ABS_TP1_ENABLED,
+    PB1_ABS_TP1_PROFIT_PCT,
+    PB1_ABS_TP1_SELL_PCT,
 )
 from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
 from trader.db.repos import (
@@ -794,6 +805,118 @@ def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | 
     return min(qty, orderable)
 
 
+def _resolve_effective_exit_risk_for_pos(pos: dict[str, Any]) -> dict[str, Any]:
+    """기존 보유 포지션 포함 모든 포지션의 exit 평가용 effective stop/R을 계산한다.
+
+    DB에 저장된 기존 stop_price_at_entry가 너무 깊어도 최신 정책 기준(7%/8% 캡)으로 보정한다.
+    수정 방향: effective_stop = max(raw_stop, entry_price * (1 - cap_pct))
+    long 기준으로 higher stop = tighter stop이므로 max()를 사용한다.
+
+    Note: os.getenv를 직접 사용하여 테스트 시 monkeypatch가 즉시 반영되도록 한다.
+    """
+    import os as _os
+
+    eff_exit_enabled = _os.getenv("PB1_EXISTING_POSITION_EFFECTIVE_EXIT_ENABLED", "1") != "0"
+    stop_cap_enabled = _os.getenv("PB1_EFFECTIVE_STOP_CAP_ENABLED", "1") != "0"
+
+    meta = pos.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+
+    entry_price = float(
+        pos.get("entry_price")
+        or pos.get("avg_buy_price")
+        or pos.get("avg")
+        or 0.0
+    )
+    raw_stop = float(
+        meta.get("initial_stop_price")
+        or pos.get("stop_price_at_entry")
+        or pos.get("stop_price")
+        or pos.get("initial_stop")
+        or 0.0
+    )
+
+    if entry_price <= 0:
+        return {
+            "entry_price": entry_price,
+            "raw_stop_price": raw_stop,
+            "effective_stop_price": raw_stop,
+            "raw_r_value": None,
+            "effective_r_value": None,
+            "stop_cap_price": None,
+            "stop_cap_pct": None,
+            "effective_applied": False,
+            "market": "",
+            "code": str(pos.get("code") or ""),
+            "reason": "invalid_entry_price",
+        }
+
+    raw_r = entry_price - raw_stop if raw_stop > 0 else None
+
+    market = str(pos.get("market") or pos.get("market_code") or "").upper()
+    code = str(pos.get("code") or pos.get("pdno") or "").zfill(6)
+
+    _kospi_cap = float(_os.getenv("PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT", str(PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT)))
+    _kosdaq_cap = float(_os.getenv("PB1_EFFECTIVE_STOP_CAP_KOSDAQ_PCT", str(PB1_EFFECTIVE_STOP_CAP_KOSDAQ_PCT)))
+
+    stop_cap_pct = _kospi_cap
+    if market in {"KQ", "KOSDAQ", "Q"}:
+        stop_cap_pct = _kosdaq_cap
+
+    stop_cap_price = entry_price * (1.0 - stop_cap_pct / 100.0)
+    effective_stop = raw_stop
+    effective_applied = False
+
+    if eff_exit_enabled and stop_cap_enabled:
+        if raw_stop <= 0:
+            effective_stop = stop_cap_price
+            effective_applied = True
+        else:
+            # long 기준: 높은 stop이 더 타이트 → max()로 캡 적용
+            effective_stop = max(raw_stop, stop_cap_price)
+            effective_applied = effective_stop != raw_stop
+
+    effective_r = entry_price - effective_stop if effective_stop > 0 else None
+    if effective_r is not None and effective_r <= 0:
+        effective_r = raw_r
+
+    logger.info(
+        "[EXIT][EFFECTIVE_RISK] code=%s entry=%.2f raw_stop=%s effective_stop=%s "
+        "raw_r=%s effective_r=%s cap_pct=%s applied=%s",
+        code,
+        entry_price,
+        raw_stop,
+        round(effective_stop, 2) if effective_stop else None,
+        round(raw_r, 2) if raw_r is not None else None,
+        round(effective_r, 2) if effective_r is not None else None,
+        stop_cap_pct,
+        int(effective_applied),
+    )
+
+    return {
+        "entry_price": entry_price,
+        "raw_stop_price": raw_stop,
+        "effective_stop_price": effective_stop,
+        "raw_r_value": raw_r,
+        "effective_r_value": effective_r,
+        "stop_cap_price": stop_cap_price,
+        "stop_cap_pct": stop_cap_pct,
+        "effective_applied": effective_applied,
+        "market": market,
+        "code": code,
+        "reason": "ok",
+    }
+
+
+
+
+
+
 def _resolve_day_protect_exit(
     pos: dict[str, Any],
     mark: float,
@@ -883,7 +1006,16 @@ def _resolve_swing_staged_exit(
     days_held: int,
     stop_hit: bool,
 ) -> dict[str, Any]:
-    """SWING_CARRY R-multiple 단계별 매도 정책."""
+    """SWING_CARRY R-multiple 단계별 매도 정책.
+
+    우선순위:
+    1. effective hard stop (기존 손절가가 너무 깊으면 7%/8% 캡 기준으로 보정)
+    2. failed breakout (호출자가 판단, stop_hit=True 전달)
+    3. +8% 보호익절 (PROFIT_PROTECT)
+    4. +10% 절대수익률 TP (ABS_TP1)
+    5. R-based TP1/TP2
+    6. MA20 runner / time stop
+    """
     import os as _os
     enabled = _os.getenv("PB1_SWING_STAGED_EXIT_ENABLED", "1") == "1"
     if not enabled:
@@ -893,7 +1025,6 @@ def _resolve_swing_staged_exit(
     tp1_sell_pct = float(_os.getenv("PB1_SWING_TP1_SELL_PCT", "0.33"))
     tp2_r = float(_os.getenv("PB1_SWING_TP2_R", "3.0"))
     tp2_sell_pct = float(_os.getenv("PB1_SWING_TP2_SELL_PCT", "0.33"))
-    breakeven_after_r = float(_os.getenv("PB1_SWING_MOVE_STOP_TO_BREAKEVEN_AFTER_R", "1.5"))
     time_stop_days = int(_os.getenv("PB1_SWING_TIME_STOP_DAYS", "10"))
 
     meta = pos.get("position_meta") or {}
@@ -905,40 +1036,144 @@ def _resolve_swing_staged_exit(
             meta = {}
     tp1_done = bool(meta.get("tp1_done", False))
     tp2_done = bool(meta.get("tp2_done", False))
+    profit_protect_done = bool(meta.get("profit_protect_done", False))
+    abs_tp1_done = bool(meta.get("abs_tp1_done", False))
 
     avg = float(pos.get("avg_buy_price") or pos.get("avg") or pos.get("entry_price") or 0.0)
-    initial_stop = float(
-        meta.get("initial_stop_price")
-        or pos.get("stop_price_at_entry")
-        or pos.get("stop_price")
-        or pos.get("initial_stop")
-        or 0.0
-    )
     orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
-
-    # R 계산
-    risk_per_share = avg - initial_stop if avg > initial_stop > 0 else 0.0
-    current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
-    max_r = float(meta.get("max_r_since_entry") or 0.0)
     code_for_log = str(pos.get("code") or pos.get("stock_code") or "UNKNOWN")
 
+    # ──────────────────────────────────────────────────────────────
+    # Effective stop/R 계산: 기존 손절가가 너무 깊으면 cap 기준으로 보정
+    # ──────────────────────────────────────────────────────────────
+    risk_ctx = _resolve_effective_exit_risk_for_pos(pos)
+    effective_stop = float(risk_ctx["effective_stop_price"] or 0.0)
+    effective_r = risk_ctx["effective_r_value"]
+
+    # effective_r이 유효하지 않으면 avg 기반 fallback
+    if effective_r is None or effective_r <= 0:
+        raw_stop = float(
+            meta.get("initial_stop_price")
+            or pos.get("stop_price_at_entry")
+            or pos.get("stop_price")
+            or pos.get("initial_stop")
+            or 0.0
+        )
+        effective_r = avg - raw_stop if avg > raw_stop > 0 else 0.0
+        effective_stop = raw_stop
+
+    risk_per_share = float(effective_r) if effective_r and effective_r > 0 else 0.0
+    current_r = (mark - avg) / risk_per_share if risk_per_share > 0 else 0.0
+    max_r = float(meta.get("max_r_since_entry") or 0.0)
+
     logger.info(
-        "[EXIT][SWING][R_CTX] code=%s avg=%.2f stop=%.2f mark=%.2f risk_per_share=%.2f current_r=%.3f max_r=%.3f days_held=%s tp1_done=%s tp2_done=%s",
-        code_for_log, avg, initial_stop, mark, risk_per_share, current_r, max_r, days_held, tp1_done, tp2_done,
+        "[EXIT][SWING][R_CTX] code=%s avg=%.2f stop=%.2f mark=%.2f risk_per_share=%.2f "
+        "current_r=%.3f max_r=%.3f days_held=%s tp1_done=%s tp2_done=%s "
+        "effective_applied=%s",
+        code_for_log, avg, effective_stop, mark, risk_per_share, current_r, max_r,
+        days_held, tp1_done, tp2_done, int(risk_ctx.get("effective_applied", False)),
     )
 
-    # 1. 초기 손절
-    if stop_hit or (initial_stop > 0 and mark <= initial_stop):
+    # ──────────────────────────────────────────────────────────────
+    # 1. effective hard stop (기존 raw stop 대신 effective stop 사용)
+    # ──────────────────────────────────────────────────────────────
+    if stop_hit or (effective_stop > 0 and mark <= effective_stop):
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
-        logger.info("[EXIT][SWING][TP_CHECK] code=%s check=STOP_HIT result=EXIT reason=INITIAL_STOP mark=%.2f stop=%.2f", code_for_log, mark, initial_stop)
-        return {"exit_ok": True, "reason": "EXIT_SWING_INITIAL_STOP", "qty": qty, "sell_pct": None}
+        logger.info(
+            "[EXIT][SWING][TP_CHECK] code=%s check=STOP_HIT result=EXIT "
+            "reason=STOP_HIT_EFFECTIVE mark=%.2f effective_stop=%.2f",
+            code_for_log, mark, effective_stop,
+        )
+        _effective_meta_update = {
+            "effective_stop_price": effective_stop,
+            "effective_r_value": float(effective_r) if effective_r else None,
+            "raw_stop_price": float(risk_ctx["raw_stop_price"]),
+            "raw_r_value": float(risk_ctx["raw_r_value"]) if risk_ctx["raw_r_value"] else None,
+            "effective_stop_cap_pct": float(risk_ctx["stop_cap_pct"] or 0),
+            "effective_exit_policy_version": "2026-04-29-effective-risk-v1",
+        }
+        return {
+            "exit_ok": True,
+            "reason": "STOP_HIT_EFFECTIVE",
+            "qty": qty,
+            "sell_pct": None,
+            "update_meta": _effective_meta_update,
+        }
 
-    # 2. TP1 (중복 방지)
-    logger.info("[EXIT][SWING][TP_CHECK] code=%s check=TP1 current_r=%.3f tp1_r=%.1f tp1_done=%s", code_for_log, current_r, tp1_r, tp1_done)
+    # ──────────────────────────────────────────────────────────────
+    # 2. +8% 보호익절 (profit_protect, 중복 방지)
+    # ──────────────────────────────────────────────────────────────
+    _profit_protect_pct = float(_os.getenv("PB1_PROFIT_PROTECT_PCT", str(PB1_PROFIT_PROTECT_PCT)))
+    _profit_protect_sell_pct = float(_os.getenv("PB1_PROFIT_PROTECT_SELL_PCT", str(PB1_PROFIT_PROTECT_SELL_PCT)))
+    _profit_protect_enabled = _os.getenv("PB1_PROFIT_PROTECT_ENABLED", "1") == "1" and PB1_PROFIT_PROTECT_ENABLED
+
+    if _profit_protect_enabled and ret_pct >= _profit_protect_pct and not profit_protect_done:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, _profit_protect_sell_pct)
+        logger.info(
+            "[EXIT][PROFIT_PROTECT] code=%s ret_pct=%.2f threshold=%.1f "
+            "qty=%s sell_qty=%s reason=PROFIT_PROTECT_8PCT",
+            code_for_log, ret_pct, _profit_protect_pct, orderable_qty, qty,
+        )
+        return {
+            "exit_ok": True,
+            "reason": "PROFIT_PROTECT_8PCT",
+            "qty": qty,
+            "sell_pct": _profit_protect_sell_pct,
+            "update_meta": {
+                "profit_protect_done": True,
+                "profit_protect_price": mark,
+                "profit_protect_ret_pct": ret_pct,
+                "effective_stop_price": effective_stop,
+                "effective_r_value": float(effective_r) if effective_r else None,
+                "raw_stop_price": float(risk_ctx["raw_stop_price"]),
+                "effective_exit_policy_version": "2026-04-29-effective-risk-v1",
+            },
+        }
+
+    # ──────────────────────────────────────────────────────────────
+    # 3. +10% 절대수익률 TP1 (abs_tp1, 중복 방지)
+    # ──────────────────────────────────────────────────────────────
+    _abs_tp1_pct = float(_os.getenv("PB1_ABS_TP1_PROFIT_PCT", str(PB1_ABS_TP1_PROFIT_PCT)))
+    _abs_tp1_sell_pct = float(_os.getenv("PB1_ABS_TP1_SELL_PCT", str(PB1_ABS_TP1_SELL_PCT)))
+    _abs_tp1_enabled = _os.getenv("PB1_ABS_TP1_ENABLED", "1") == "1" and PB1_ABS_TP1_ENABLED
+
+    if _abs_tp1_enabled and ret_pct >= _abs_tp1_pct and not abs_tp1_done:
+        qty = _calculate_exit_qty(orderable_qty, orderable_qty, _abs_tp1_sell_pct)
+        logger.info(
+            "[EXIT][ABS_TP1] code=%s ret_pct=%.2f threshold=%.1f "
+            "sell_qty=%s reason=ABS_TP1_10PCT",
+            code_for_log, ret_pct, _abs_tp1_pct, qty,
+        )
+        return {
+            "exit_ok": True,
+            "reason": "ABS_TP1_10PCT",
+            "qty": qty,
+            "sell_pct": _abs_tp1_sell_pct,
+            "update_meta": {
+                "abs_tp1_done": True,
+                "abs_tp1_price": mark,
+                "abs_tp1_ret_pct": ret_pct,
+                "effective_stop_price": effective_stop,
+                "effective_r_value": float(effective_r) if effective_r else None,
+                "raw_stop_price": float(risk_ctx["raw_stop_price"]),
+                "effective_exit_policy_version": "2026-04-29-effective-risk-v1",
+            },
+        }
+
+    # ──────────────────────────────────────────────────────────────
+    # 4. R-based TP1 (중복 방지)
+    # ──────────────────────────────────────────────────────────────
+    logger.info(
+        "[EXIT][SWING][TP_CHECK] code=%s check=TP1 current_r=%.3f tp1_r=%.1f tp1_done=%s",
+        code_for_log, current_r, tp1_r, tp1_done,
+    )
     if current_r >= tp1_r and not tp1_done:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp1_sell_pct)
-        new_stop = max(float(meta.get("current_stop_price") or initial_stop or avg), avg)
-        logger.info("[EXIT][SWING][TP_CHECK] code=%s result=TP1_HIT qty=%s sell_pct=%.2f new_stop=%.2f", code_for_log, qty, tp1_sell_pct, new_stop)
+        new_stop = max(float(meta.get("current_stop_price") or effective_stop or avg), avg)
+        logger.info(
+            "[EXIT][SWING][TP_CHECK] code=%s result=TP1_HIT qty=%s sell_pct=%.2f new_stop=%.2f",
+            code_for_log, qty, tp1_sell_pct, new_stop,
+        )
         return {
             "exit_ok": True,
             "reason": "EXIT_SWING_TP1",
@@ -950,14 +1185,25 @@ def _resolve_swing_staged_exit(
                 "tp1_qty": qty,
                 "current_stop_price": new_stop,
                 "runner_qty": orderable_qty - qty,
+                "effective_stop_price": effective_stop,
+                "effective_r_value": float(effective_r) if effective_r else None,
+                "effective_exit_policy_version": "2026-04-29-effective-risk-v1",
             },
         }
 
-    # 3. TP2 (중복 방지)
-    logger.info("[EXIT][SWING][TP_CHECK] code=%s check=TP2 current_r=%.3f tp2_r=%.1f tp2_done=%s", code_for_log, current_r, tp2_r, tp2_done)
+    # ──────────────────────────────────────────────────────────────
+    # 5. R-based TP2 (중복 방지)
+    # ──────────────────────────────────────────────────────────────
+    logger.info(
+        "[EXIT][SWING][TP_CHECK] code=%s check=TP2 current_r=%.3f tp2_r=%.1f tp2_done=%s",
+        code_for_log, current_r, tp2_r, tp2_done,
+    )
     if current_r >= tp2_r and not tp2_done:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, tp2_sell_pct)
-        logger.info("[EXIT][SWING][TP_CHECK] code=%s result=TP2_HIT qty=%s sell_pct=%.2f", code_for_log, qty, tp2_sell_pct)
+        logger.info(
+            "[EXIT][SWING][TP_CHECK] code=%s result=TP2_HIT qty=%s sell_pct=%.2f",
+            code_for_log, qty, tp2_sell_pct,
+        )
         return {
             "exit_ok": True,
             "reason": "EXIT_SWING_TP2",
@@ -969,23 +1215,40 @@ def _resolve_swing_staged_exit(
                 "tp2_qty": qty,
                 "runner_qty": orderable_qty - qty,
                 "trail_policy": "MA20_RUNNER",
+                "effective_exit_policy_version": "2026-04-29-effective-risk-v1",
             },
         }
 
-    # 4. Runner MA20 이탈 (TP1 이후)
+    # ──────────────────────────────────────────────────────────────
+    # 6. Runner MA20 이탈 (TP1 이후)
+    # ──────────────────────────────────────────────────────────────
     if tp1_done and ma20 is not None and mark < ma20:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
-        logger.info("[EXIT][SWING][TP_CHECK] code=%s check=MA20_RUNNER result=EXIT mark=%.2f ma20=%.2f", code_for_log, mark, ma20)
+        logger.info(
+            "[EXIT][SWING][TP_CHECK] code=%s check=MA20_RUNNER result=EXIT mark=%.2f ma20=%.2f",
+            code_for_log, mark, ma20,
+        )
         return {"exit_ok": True, "reason": "EXIT_SWING_RUNNER_MA20_BREAK", "qty": qty, "sell_pct": None}
 
-    # 5. time stop
+    # ──────────────────────────────────────────────────────────────
+    # 7. time stop
+    # ──────────────────────────────────────────────────────────────
     if days_held >= time_stop_days and current_r < 1.0:
         qty = _calculate_exit_qty(orderable_qty, orderable_qty, None)
-        logger.info("[EXIT][SWING][TP_CHECK] code=%s check=TIME_STOP result=EXIT days_held=%s time_stop_days=%s current_r=%.3f", code_for_log, days_held, time_stop_days, current_r)
+        logger.info(
+            "[EXIT][SWING][TP_CHECK] code=%s check=TIME_STOP result=EXIT "
+            "days_held=%s time_stop_days=%s current_r=%.3f",
+            code_for_log, days_held, time_stop_days, current_r,
+        )
         return {"exit_ok": True, "reason": "EXIT_SWING_TIME_STOP", "qty": qty, "sell_pct": None}
 
-    logger.info("[EXIT][SWING][TP_CHECK] code=%s result=HOLD current_r=%.3f tp1_done=%s tp2_done=%s", code_for_log, current_r, tp1_done, tp2_done)
+    logger.info(
+        "[EXIT][SWING][TP_CHECK] code=%s result=HOLD current_r=%.3f tp1_done=%s tp2_done=%s",
+        code_for_log, current_r, tp1_done, tp2_done,
+    )
     return {"exit_ok": False, "reason": "SWING_HOLD_TREND_OK"}
+
+
 
 
 def _resolve_core_trend_follow_exit(
@@ -8242,6 +8505,15 @@ class PB1Engine:
         if stop_price is None:
             stop_price = pos.get("initial_stop")
         stop_price = self._to_float(stop_price)
+
+        # [2026-04-29] effective stop 계산: 기존 손절가가 너무 깊으면 7%/8% 캡으로 보정
+        _eff_risk = _resolve_effective_exit_risk_for_pos({
+            **pos,
+            "avg_buy_price": avg,
+        })
+        _eff_stop = _eff_risk["effective_stop_price"]
+        if _eff_stop and _eff_stop > 0:
+            stop_price = _eff_stop
 
         max_price = self._to_float(pos.get("max_price")) or 0.0
         new_max = max(max_price, float(mark or 0.0))

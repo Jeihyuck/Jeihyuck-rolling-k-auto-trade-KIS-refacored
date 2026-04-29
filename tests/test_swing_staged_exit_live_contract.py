@@ -75,6 +75,9 @@ def test_tp1_triggers_at_2r(monkeypatch):
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_SWING_TP1_R", "2.0")
     monkeypatch.setenv("PB1_SWING_TP1_SELL_PCT", "0.33")
+    # R-based TP1을 격리 테스트하기 위해 profit_protect/abs_tp1 비활성화
+    monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
 
     pos = _pos(avg=10000.0, initial_stop=9500.0)
     # mark = 11000 = entry + 2*R → current_r = (11000 - 10000) / 500 = 2.0
@@ -92,6 +95,8 @@ def test_tp1_triggers_at_2r(monkeypatch):
 def test_tp1_not_triggered_below_2r(monkeypatch):
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_SWING_TP1_R", "2.0")
+    monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
 
     pos = _pos(avg=10000.0, initial_stop=9500.0)
     # mark = 10900 → r = 1.8 < 2.0
@@ -107,6 +112,8 @@ def test_tp2_triggers_at_3r(monkeypatch):
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_SWING_TP2_R", "3.0")
     monkeypatch.setenv("PB1_SWING_TP2_SELL_PCT", "0.33")
+    monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
 
     pos = _pos(avg=10000.0, initial_stop=9500.0, tp1_done=True)
     # mark = 11500 → current_r = (11500 - 10000) / 500 = 3.0
@@ -124,6 +131,8 @@ def test_tp1_not_retriggered_when_done(monkeypatch):
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_SWING_TP1_R", "2.0")
     monkeypatch.setenv("PB1_SWING_TP2_R", "3.0")
+    monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
 
     pos = _pos(avg=10000.0, initial_stop=9500.0, tp1_done=True, tp2_done=True)
     # mark = 11000 (2R) but both done
@@ -138,6 +147,8 @@ def test_tp1_not_retriggered_when_done(monkeypatch):
 def test_ma20_runner_exit_after_tp1(monkeypatch):
     """TP1 완료 후 MA20 이탈 시 청산."""
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
+    monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
 
     pos = _pos(avg=10000.0, initial_stop=9500.0, tp1_done=True)
     result = _resolve_swing_staged_exit(
@@ -152,6 +163,8 @@ def test_time_stop_triggers(monkeypatch):
     """보유일 >= time_stop_days 이고 R < 1.0이면 청산."""
     monkeypatch.setenv("PB1_SWING_STAGED_EXIT_ENABLED", "1")
     monkeypatch.setenv("PB1_SWING_TIME_STOP_DAYS", "10")
+    monkeypatch.setenv("PB1_PROFIT_PROTECT_ENABLED", "0")
+    monkeypatch.setenv("PB1_ABS_TP1_ENABLED", "0")
 
     pos = _pos(avg=10000.0, initial_stop=9500.0)
     result = _resolve_swing_staged_exit(
