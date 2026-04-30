@@ -3146,6 +3146,166 @@ class OrdersRepo:
             ).scalar()
             return str(existing or payload["order_id"])
 
+    # ------------------------------------------------------------------
+    # Guard helpers — exit block / re-entry guard
+    # ------------------------------------------------------------------
+
+    _STOP_EXIT_REASONS: frozenset = frozenset(
+        {
+            "STOP_HIT_EFFECTIVE",
+            "EXIT_HARD_STOP",
+            "STOP_LOSS",
+            "TRAILING_STOP",
+            "EXIT_TRAILING_STOP",
+            "FAILED_BREAKOUT_EXIT",
+            "RISK_OFF_EXIT",
+            "EXIT_RISK_OFF",
+            "MA20_BREAK_EXIT",
+            "MA50_BREAK_EXIT",
+            "EXIT_MA20_BREAK",
+            "EXIT_MA50_BREAK",
+            "TIME_STOP_EXIT",
+            "EXIT_TIME_STOP",
+            "MANUAL_RISK_EXIT",
+            "EXIT_SWING_TIME_STOP",
+            "EXIT_SWING_RUNNER_MA20_BREAK",
+            "EXIT_CORE_HARD_STOP",
+            "EXIT_CORE_RISK_OFF",
+            "EXIT_CORE_MA50_BREAK",
+            "EXIT_DAY_STOP_LOSS",
+        }
+    )
+
+    def get_today_sell_orders(
+        self,
+        env: str,
+        market: str | None,
+        trade_date: str,
+        *,
+        code: str | None = None,
+    ) -> list[dict]:
+        """당일 KST 기준 SELL 주문 목록.
+
+        Parameters
+        ----------
+        env : str
+        market : str | None  — KOSPI / KOSDAQ / None (전체)
+        trade_date : str     — "YYYY-MM-DD" KST 기준 거래일
+        code : str | None    — 특정 종목만 조회 시
+        """
+        kst_tz = pytz.timezone("Asia/Seoul")
+        try:
+            date_obj = datetime.fromisoformat(trade_date).date()
+        except (ValueError, TypeError):
+            date_obj = now_kst().date()
+        start_at = kst_tz.localize(datetime(date_obj.year, date_obj.month, date_obj.day, 0, 0, 0))
+        end_at = kst_tz.localize(datetime(date_obj.year, date_obj.month, date_obj.day, 23, 59, 59))
+        env_n = _norm_env(env)
+        created_at_expr = self._window_expr(self._schema.orders.c.created_at)
+        conditions = [
+            self._schema.orders.c.env == env_n,
+            self._schema.orders.c.side == "SELL",
+            created_at_expr >= start_at,
+            created_at_expr <= end_at,
+        ]
+        if code:
+            conditions.append(self._schema.orders.c.code == str(code).zfill(6))
+        if market:
+            conditions.append(self._schema.orders.c.market == str(market).upper())
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(created_at_expr.desc())
+        )
+        rows = self._read_mappings_with_guard(stmt, op_name="orders.get_today_sell_orders")
+        logger.info(
+            "[DB][ORDERS][TODAY_SELL] env=%s market=%s trade_date=%s code=%s count=%s",
+            env,
+            market,
+            trade_date,
+            code,
+            len(rows),
+        )
+        return rows
+
+    def get_today_exit_events(
+        self,
+        env: str,
+        market: str | None,
+        trade_date: str,
+        *,
+        code: str | None = None,
+        stop_reasons_only: bool = True,
+    ) -> list[dict]:
+        """당일 exit 주문에서 exit_reason 기반 이벤트 목록.
+
+        exit_reason 컬럼 또는 request_json["exit_reason"] 에서 추출.
+        stop_reasons_only=True 이면 STOP_EXIT_REASONS 에 해당하는 것만 반환.
+        """
+        sell_orders = self.get_today_sell_orders(env, market, trade_date, code=code)
+        events = []
+        for row in sell_orders:
+            # exit_reason은 orders 테이블의 컬럼이거나 request_json 안에 있을 수 있음
+            exit_reason = (
+                row.get("exit_reason")
+                or (row.get("request_json") or {}).get("exit_reason")
+                or (row.get("entry_meta_json") or {}).get("exit_reason")
+                or ""
+            )
+            reason_norm = str(exit_reason or "").strip().upper()
+            if stop_reasons_only and reason_norm not in self._STOP_EXIT_REASONS:
+                continue
+            events.append(
+                {
+                    "code": row.get("code"),
+                    "exit_reason": reason_norm,
+                    "status": row.get("status"),
+                    "created_at": row.get("created_at"),
+                    "order_id": str(row.get("order_id") or ""),
+                    "side": row.get("side"),
+                }
+            )
+        logger.info(
+            "[DB][ORDERS][TODAY_EXIT_EVENTS] env=%s market=%s trade_date=%s code=%s stop_only=%s count=%s",
+            env,
+            market,
+            trade_date,
+            code,
+            int(stop_reasons_only),
+            len(events),
+        )
+        return events
+
+    def has_same_day_exit_block(
+        self,
+        env: str,
+        market: str | None,
+        trade_date: str,
+        code: str,
+    ) -> tuple[bool, str | None]:
+        """당일 해당 종목에 STOP 계열 매도 주문이 있으면 (True, reason) 반환.
+
+        PB1_BLOCK_REENTRY_AFTER_EXIT_SAME_DAY=1 일 때 entry guard 로직에서 호출.
+        """
+        events = self.get_today_exit_events(env, market, trade_date, code=code, stop_reasons_only=True)
+        if events:
+            reason = events[0].get("exit_reason")
+            logger.info(
+                "[DB][ORDERS][SAME_DAY_EXIT_BLOCK] env=%s code=%s trade_date=%s blocked=1 reason=%s",
+                env,
+                code,
+                trade_date,
+                reason,
+            )
+            return True, reason
+        logger.debug(
+            "[DB][ORDERS][SAME_DAY_EXIT_BLOCK] env=%s code=%s trade_date=%s blocked=0",
+            env,
+            code,
+            trade_date,
+        )
+        return False, None
+
 
 class FillsRepo:
     def __init__(self, engine: Engine):

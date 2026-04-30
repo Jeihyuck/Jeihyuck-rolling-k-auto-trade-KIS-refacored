@@ -197,6 +197,7 @@ from trader.strategies.pb1_minervini_v2 import (
     update_trailing_stop,
 )
 from trader.time_utils import now_kst, week_monday, prev_business_day
+from trader.position_age import calc_position_age, to_kst_date
 from trader.core_utils import _round_to_tick
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
@@ -3374,15 +3375,9 @@ class PB1Engine:
             pos_meta = dict(positions_by_code.get(code) or {})
             latest_buy_fill = latest_buy_fills.get(code) or {}
             entry_ts_raw = latest_buy_fill.get("filled_at") or pos_meta.get("entry_ts") or pos_meta.get("last_trade_at")
-            entry_date = None
-            days_held = int(pos_meta.get("holding_days") or 0)
-            if entry_ts_raw:
-                try:
-                    entry_dt = pd.Timestamp(entry_ts_raw)
-                    entry_date = entry_dt.date().isoformat()
-                    days_held = max(0, (today_kst - entry_dt.date()).days)
-                except Exception:
-                    entry_date = str(entry_ts_raw)
+            pos_age = calc_position_age(entry_ts_raw, today_kst)
+            entry_date = pos_age.entry_date_kst
+            days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("holding_days") or 0)
             holdings.append(
                 HoldingContext(
                     code=code,
@@ -13386,11 +13381,25 @@ class PB1Engine:
                     skipped_count,
                 )
                 if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
-                    logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s skipped=%s", len(orderable_candidates), attempted_count, accepted_count, skipped_count)
-                    if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "1") == "1":
-                        raise RuntimeError(
-                            f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
+                    if skipped_count >= len(orderable_candidates) and attempted_count == 0:
+                        # 모든 후보가 guard / cooldown / 중복 방지로 skip된 정상 케이스 → not-fatal
+                        logger.warning(
+                            "[ORDER][ALL_SKIPPED_BEFORE_SUBMIT] session=%s candidates=%s skipped=%s reasons=%s",
+                            self.session_kind,
+                            len(orderable_candidates),
+                            skipped_count,
+                            {},
                         )
+                        logger.info(
+                            "[RUN_SUMMARY][RESULT] session=%s status=OK_NO_TRADE reason=ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
+                            self.session_kind,
+                        )
+                    else:
+                        logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s skipped=%s", len(orderable_candidates), attempted_count, accepted_count, skipped_count)
+                        if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "1") == "1":
+                            raise RuntimeError(
+                                f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
+                            )
                 if entry_allowed and self.phase == "entry" and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:

@@ -128,6 +128,19 @@ env:
   PB1_PERCENT_EXIT_ENABLED: "1"
   PB1_EXIT_POLICY_MODE: "HYBRID_BY_ENTRY_STYLE"
   PB1_EXIT_POLICY_PATH: "trader/exit_policy/optimized_exit_router_policy.json"
+  # [2026-04-30] Common AM/PM guard: stop-exit reentry block / fill confirm / price cache
+  PB1_SESSION_KIND: "afternoon"
+  PB1_FORCE_TRADE_SESSION: "afternoon"
+  PB1_PHASE_DEFAULT: "entry"
+  PB1_BLOCK_REENTRY_AFTER_EXIT_SAME_DAY: "1"
+  PB1_EXIT_COOLDOWN_DAYS: "1"
+  PB1_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
+  PB1_REQUIRE_FILL_CONFIRM: "1"
+  PB1_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
+  KIS_PRICE_CACHE_TTL_SEC: "60"
+  KIS_INQUIRE_PRICE_MIN_INTERVAL_SEC: "0.35"
+  KIS_RATE_LIMIT_DEGRADE_ON_EGW00201: "1"
+  PB1_USE_BALANCE_PRICE_FOR_HOLDINGS: "1"
 
 defaults:
   run:
@@ -451,16 +464,18 @@ jobs:
         timeout-minutes: 20
         working-directory: repo
         env:
-          PB1_SESSION_KIND: "afternoon"
-          PB1_FORCE_TRADE_SESSION: "afternoon"
-          FORCE_MARKET_WINDOW: "afternoon"
+          PB1_SESSION_KIND: "close"
+          PB1_FORCE_TRADE_SESSION: "close"
+          FORCE_MARKET_WINDOW: "close"
           FORCE_PB1_PHASE: "exit"
           PB1_PHASE_DEFAULT: "exit"
           PB1_ENTRY_ENABLED: "0"
+          PB1_CLOSE_ONE_SHOT: "1"
+          PB1_CLOSE_SESSION_START: "15:15"
           PB1_TARGET_START_TIME: "15:15"
-          PB1_START_ALLOW_UNTIL: "15:30"
-          PB1_CLOSE_SESSION_END: "15:30"
-          PB1_RUN_LOOP_MINUTES: "15"
+          PB1_START_ALLOW_UNTIL: "15:35"
+          PB1_CLOSE_SESSION_END: "15:35"
+          PB1_RUN_LOOP_MINUTES: "20"
           PB1_TICK_HARD_TIMEOUT_SEC: "45"
           PB1_MIN_TICK_BUDGET_SEC: "30"
           ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
