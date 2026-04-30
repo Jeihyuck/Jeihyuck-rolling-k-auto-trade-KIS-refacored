@@ -233,6 +233,22 @@ class KISOHLCVProvider:
             )
 
         # KIS fallback (LIVE 모드에서만 실행됨)
+        # [2026-04-30] trade 모드에서 KIS daily fallback 차단
+        _mode = (os.getenv("MODE") or "").strip().lower()
+        _is_trade_mode = _mode == "trade"
+        _allow_kis_in_trade = os.getenv("PB1_ALLOW_KIS_DAILY_FALLBACK_IN_TRADE", "0") not in {"0", "false", "False"}
+        _allow_kis_in_diag = os.getenv("PB1_ALLOW_KIS_DAILY_FALLBACK_IN_DIAG", "1") not in {"0", "false", "False"}
+        if _is_trade_mode and not _allow_kis_in_trade:
+            logger.info(
+                "[OHLCV][TRADE][DAILY_FALLBACK_BLOCKED] code=%s days=%d reason=trade_precomputed_only",
+                symbol, days,
+            )
+            if db_ready:
+                result = OHLCVResult(db_df_norm, {**db_meta, "source": "db", "stale_ok": True, "refresh_failed": True, "refresh_fail_reason": "trade_fallback_blocked"})
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                return result
+            return OHLCVResult(pd.DataFrame(), {"provider": self.name, "source": "db_blocked", "error": "trade_daily_fallback_blocked", "volume_missing": True})
+
         # [FIX] D. day window에서 days <= 260이면 fallback 허용 (watchlist 생성/엔트리에 필수)
         fallback_allowed = ALLOW_KIS_DAILY_FALLBACK or (days <= 260)
         if not fallback_allowed:

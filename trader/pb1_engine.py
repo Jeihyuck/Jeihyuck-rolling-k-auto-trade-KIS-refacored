@@ -396,6 +396,7 @@ _ENTRY_BLOCK_REASON_MAP = {
     "BUYABLE_EXISTING_HOLDING": "BUYABLE_EXISTING_HOLDING",
     "BUYABLE_OPEN_ORDER": "BUYABLE_OPEN_ORDER",
     "BUYABLE_TODAY_BUY_EXISTS": "BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_TODAY_SELL_REBUY_BLOCKED": "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
     "BUYABLE_COOLDOWN": "BUYABLE_COOLDOWN",
     "BUYABLE_DUPLICATE": "BUYABLE_DUPLICATE",
     "BUYABLE_WINDOW_BLOCK": "BUYABLE_WINDOW_BLOCK",
@@ -427,6 +428,7 @@ _ORDER_SKIP_REASON_MAP = {
     "BUYABLE_EXISTING_HOLDING": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING",
     "BUYABLE_OPEN_ORDER": "ORDER_SKIP_BUYABLE_OPEN_ORDER",
     "BUYABLE_TODAY_BUY_EXISTS": "ORDER_SKIP_BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_TODAY_SELL_REBUY_BLOCKED": "ORDER_SKIP_BUYABLE_TODAY_SELL_REBUY_BLOCKED",
     "BUYABLE_COOLDOWN": "ORDER_SKIP_BUYABLE_COOLDOWN",
     "BUYABLE_DUPLICATE": "ORDER_SKIP_BUYABLE_DUPLICATE",
     "BUYABLE_WINDOW_BLOCK": "ORDER_SKIP_BUYABLE_WINDOW_BLOCK",
@@ -503,6 +505,7 @@ def _format_reason_counts(counter: Counter[str]) -> str:
 
 NO_TRADE_REASON_PRIORITY = (
     "BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
     "BUYABLE_COOLDOWN",
     "ATR_PCT_TOO_HIGH",
     "atr_pct_too_high",
@@ -1520,6 +1523,29 @@ def _resolve_session_window_name(*, session_kind: str | None, raw_window_name: s
     return "day"
 
 
+def build_stage_label(*, session_kind: str | None, window: str | None = None, phase: str | None = None) -> str:
+    """[2026-04-30] 올바른 stage 레이블 생성 (AM entry ≠ PB1-CLOSE).
+
+    Rules:
+        session_kind=am, phase=entry  → PB1-AM-ENTRY
+        session_kind=afternoon/pm, phase=entry → PB1-AFTERNOON-ENTRY
+        phase=exit or close           → PB1-CLOSE-EXIT
+        fallback                      → PB1-{SESSION}-{PHASE}
+    """
+    sess = str(session_kind or "").strip().lower()
+    ph = str(phase or "").strip().lower()
+    if ph in {"exit", "close"}:
+        return "PB1-CLOSE-EXIT"
+    if ph == "entry":
+        if sess == "am":
+            return "PB1-AM-ENTRY"
+        if sess in {"pm", "afternoon"}:
+            return "PB1-AFTERNOON-ENTRY"
+    sess_label = (sess or "unknown").upper()
+    ph_label = (ph or "unknown").upper()
+    return f"PB1-{sess_label}-{ph_label}"
+
+
 def _extract_cooldown_source_details(ledger_rows: Iterable[dict[str, Any]] | None) -> dict[str, Any]:
     risk_off_exit_reasons = {"EXIT_RISK_OFF", "EXIT_SOFT_RISK_OFF", "BUG_RECOVERY_EXIT"}
     for row in ledger_rows or []:
@@ -2088,6 +2114,15 @@ class PB1Engine:
             raise
         finally:
             elapsed = time.perf_counter() - started
+            # [2026-04-30] tick 잔여 시간 업데이트 (non-critical DB skip 판단용)
+            if max_sec > 0:
+                remaining = max(0.0, max_sec - elapsed)
+                self._tick_remaining_sec = remaining
+                if remaining < int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5")):
+                    logger.info(
+                        "[STAGE_BUDGET][LOW] stage=%s remaining_sec=%.1f action=skip_noncritical_update",
+                        stage_name, remaining,
+                    )
             logger.info("[PB1][STAGE][END] stage=%s elapsed=%.2f", stage_name, elapsed)
             if error is None and max_sec > 0 and elapsed > max_sec:
                 logger.warning("[WARN][PB1][STAGE_TIMEOUT] stage=%s elapsed=%.2f max_sec=%.2f", stage_name, elapsed, max_sec)
@@ -3835,6 +3870,17 @@ class PB1Engine:
             reason_codes.append("BUYABLE_OPEN_ORDER")
         if bool(gate_context.get("today_buy_exists")):
             reason_codes.append("BUYABLE_TODAY_BUY_EXISTS")
+        # [2026-04-30] 당일 매도 후 재매수 차단
+        if bool(gate_context.get("today_sell_exists")):
+            block_rebuy = os.getenv("PB1_BLOCK_REBUY_AFTER_SELL_SAME_DAY", "1") not in {"0", "false", "False"}
+            allow_override = os.getenv("PB1_ALLOW_SAME_DAY_REBUY_AFTER_SELL", "0") in {"1", "true", "True"}
+            if block_rebuy and not allow_override:
+                reason_codes.append("BUYABLE_TODAY_SELL_REBUY_BLOCKED")
+                logger.info(
+                    "[PB1][BUYABLE_GATE][TODAY_SELL_SRC] code=%s today_sell_exists=1 last_sell_at=%s",
+                    self._display_code(code),
+                    gate_context.get("last_sell_event_at"),
+                )
         if bool(gate_context.get("cooldown_active")):
             reason_codes.append("BUYABLE_COOLDOWN")
         if bool(gate_context.get("blocking_duplicate_exists")):
@@ -3927,6 +3973,15 @@ class PB1Engine:
                 reason_codes.append("API_PAYLOAD_INVALID_QTY")
             if order_price <= 0:
                 reason_codes.append("API_PAYLOAD_INVALID_PRICE")
+        # [2026-04-30] tick budget 부족 시 주문 차단
+        _block_order_lt = int(os.getenv("PB1_BLOCK_NEW_ORDER_WHEN_REMAINING_SEC_LT", "8"))
+        _tick_remaining = getattr(self, "_tick_remaining_sec", None)
+        if _tick_remaining is not None and float(_tick_remaining) < _block_order_lt:
+            logger.warning(
+                "[ORDER][BLOCK][LOW_TICK_BUDGET] code=%s remaining_sec=%.1f threshold=%s",
+                self._display_code(cf.code), float(_tick_remaining), _block_order_lt,
+            )
+            reason_codes.append("LOW_TICK_BUDGET")
         gate_reasons = self._order_precheck_gate_reasons(side="BUY", stage=stage)
         for reason in gate_reasons:
             mapped = "LIVE_GATE_BLOCKED" if reason == "live_gate_blocked" else f"PRECHECK_{str(reason).upper()}"
@@ -4061,15 +4116,16 @@ class PB1Engine:
                 "[PB1][BUY][SKIP] code=%s reasons=%s stage=%s",
                 self._display_code(cf.code),
                 reasons_out,
-                stage or "PB1-CLOSE",
+                stage or build_stage_label(session_kind=os.getenv("PB1_SESSION_KIND"), phase="entry"),
             )
         else:
             logger.info(
-                "[PB1][BUY][INTENT] code=%s qty=%s price=%s reason=%s",
+                "[PB1][BUY][INTENT] code=%s qty=%s price=%s reason=%s stage=%s",
                 self._display_code(cf.code),
                 qty,
                 _to_float(price),
                 "entry_ok",
+                stage or build_stage_label(session_kind=os.getenv("PB1_SESSION_KIND"), phase="entry"),
             )
 
     def _fetch_holdings_snapshot(self) -> dict:
@@ -4420,6 +4476,18 @@ class PB1Engine:
             side="BUY",
             codes=code_list,
         )
+        # [2026-04-30] 당일 SELL fills 조회 (same-day sell rebuy block)
+        today_sell_fills = self.fills_repo.list_fills_in_window(
+            self.env,
+            start_at=today_start,
+            end_at=tomorrow_start,
+            side="SELL",
+            codes=code_list,
+        ) if os.getenv("PB1_BLOCK_REBUY_AFTER_SELL_SAME_DAY", "1") not in {"0", "false"} else []
+        today_sell_fills_by_code: dict[str, list[dict]] = {}
+        for row in today_sell_fills:
+            c = str(row.get("code") or "").zfill(6)
+            today_sell_fills_by_code.setdefault(c, []).append(row)
         recent_fill_rows = self.fills_repo.list_fills_in_window(
             self.env,
             start_at=lookback_start,
@@ -4508,11 +4576,19 @@ class PB1Engine:
             cooldown_active = bool(cooldown_state["cooldown_active"])
             for event in cooldown_events:
                 event["matched_now"] = cooldown_active
+            # [2026-04-30] 당일 매도 정보
+            today_sell_rows = today_sell_fills_by_code.get(code_key, [])
+            today_sell_exists = bool(today_sell_rows)
+            last_sell_event_at = self._format_kst_datetime(
+                today_sell_rows[0].get("filled_at") if today_sell_rows else None
+            )
             snapshot = {
                 "holding_qty": int(pos.get("qty") or 0),
                 "today_buy_exists": bool(today_buy_events),
                 "today_submit_exists": bool(recent_order_events),
                 "today_fill_exists": bool(recent_fill_events),
+                "today_sell_exists": today_sell_exists,
+                "last_sell_event_at": last_sell_event_at,
                 "open_order_exists": False,
                 "cooldown_active": cooldown_active,
                 "stale_cooldown_ignored": bool(cooldown_state["stale_ignored"]),
@@ -6895,16 +6971,23 @@ class PB1Engine:
         return None
 
     def _resolve_price_with_fallback(self, code: str, *, ohlcv_close: float | None = None) -> tuple[float | None, str | None]:
+        # [2026-04-30] PB1_USE_BALANCE_PRPR_FIRST=1: balance prpr를 quote보다 먼저 사용
+        use_balance_first = os.getenv("PB1_USE_BALANCE_PRPR_FIRST", "1") not in {"0", "false", "False"}
+        if use_balance_first and code in self._balance_price_map:
+            fallback_price = self._balance_price_map.get(code)
+            if fallback_price:
+                logger.info("[PRICE][SOURCE] code=%s source=kis_balance_prpr price=%s", code, fallback_price)
+                return float(fallback_price), "kis_balance_prpr"
         price = self._mark_price(code)
         if price is not None:
             return price, "quote"
         if code in self._balance_price_map:
             fallback_price = self._balance_price_map.get(code)
             if fallback_price:
-                logger.info("[PB1][PRICE][FALLBACK] code=%s source=balance_prpr", code)
-                return float(fallback_price), "balance_prpr"
+                logger.info("[PRICE][SOURCE] code=%s source=kis_balance_prpr price=%s", code, fallback_price)
+                return float(fallback_price), "kis_balance_prpr"
         if ohlcv_close is not None and ohlcv_close > 0:
-            logger.info("[PB1][PRICE][FALLBACK] code=%s source=ohlcv_close", code)
+            logger.info("[PRICE][SOURCE] code=%s source=ohlcv_close price=%s", code, ohlcv_close)
             return float(ohlcv_close), "ohlcv_close"
         logger.info("[PB1][PRICE][UNAVAILABLE] code=%s", code)
         return None, None
@@ -7732,7 +7815,7 @@ class PB1Engine:
             client_order_key=effective_client_order_key,
             ok=ok,
             reasons=[reason_code],
-            stage="PB1-CLOSE",
+            stage=build_stage_label(session_kind=os.getenv("PB1_SESSION_KIND"), phase="entry"),
             payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1},
         )
         logger.info(
@@ -7757,69 +7840,19 @@ class PB1Engine:
             self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
             status["accepted"] = 1
             status["submit_terminal_status"] = "ACCEPTED_PENDING_FILL"
-            filled_at = now_kst()
-            fill_meta = dict(entry_meta)
-            fill_meta["entry_price_filled"] = record_price
-            fill_meta["filled_at"] = filled_at.isoformat()
-            self.fills_repo.upsert_fill(
-                env=self.env,
-                run_id=self.run_id,
-                order_id=order_id,
-                kis_odno=kis_odno,
-                trade_id=None,
-                code=cf.code,
-                market=cf.market,
-                side="BUY",
-                qty=cf.planned_qty,
-                price=record_price,
-                fee=0.0,
-                tax=0.0,
-                filled_at=filled_at,
-                raw_json=resp,
-                fill_meta_json=fill_meta,
-            )
-            self._append_ledger_event(
-                event_type="BUY_FILL",
-                code=cf.code,
-                market=cf.market,
-                mode=cf.mode,
-                side="BUY",
-                qty=cf.planned_qty,
-                price=record_price,
-                client_order_key=effective_client_order_key,
-                ok=True,
-                reasons=["buy_fill"],
-                stage="PB1-CLOSE",
-                payload_json={"entry_meta": fill_meta, "trace_id": fill_meta.get("trace_id"), "kis_odno": kis_odno},
-            )
-            self.positions_repo.apply_fill(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=1,
-                mode=cf.mode,
-                code=cf.code,
-                market=cf.market,
-                side="BUY",
-                qty=cf.planned_qty,
-                price=record_price,
-                fee=0.0,
-                tax=0.0,
-                filled_at=filled_at,
-                entry_meta_json=fill_meta,
-            )
+            # [2026-04-30] ORDER_SUBMIT_ACCEPTED 직후 BUY_FILL/positions update 금지.
+            # 실제 체결은 reconcile_kis.py에서 KIS balance 확인 후 BUY_FILL_CONFIRMED로 생성한다.
             logger.info(
-                "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
+                "[ORDER][ACCEPTED_ONLY] side=BUY code=%s name=%s odno=%s fill_created=0 position_updated=0",
                 cf.code,
                 stock_name,
-                "BUY",
-                cf.planned_qty,
-                record_price,
+                kis_odno or order_id,
             )
             entry_price = float(record_price or 0.0)
             base_id = f"{cf.code}:{self._today}:{cf.features.get('pivot')}"
             r_value = entry_price - float(cf.features.get("stop_price") or 0.0)
             fields = {
-                "entry_ts": filled_at.isoformat(),
+                "entry_ts": now_kst().isoformat(),
                 "initial_stop": cf.features.get("initial_stop"),
                 "stop_price": cf.features.get("stop_price"),
                 "max_price": entry_price if entry_price > 0 else None,
@@ -7839,7 +7872,7 @@ class PB1Engine:
                 "last_trail_stop": cf.features.get("stop_price"),
                     "regime_at_entry": (getattr(self, "_regime", None) or {}).get("regime"),
                 "risk_mult_at_entry": getattr(self, "_regime_risk_mult", None),
-                **self._entry_meta_position_fields(fill_meta),
+                **self._entry_meta_position_fields(entry_meta),
             }
             self.positions_repo.update_position_fields(
                 env=self.env,
@@ -7849,30 +7882,22 @@ class PB1Engine:
                 code=cf.code,
                 fields=fields,
             )
-            self._log_fill_reconcile(
-                code=cf.code,
-                sid=1,
-                mode=cf.mode,
-                submitted_price=float(limit_price or entry_price or 0.0),
-                filled_price=float(record_price or 0.0),
-            )
             logger.info(
                 "[POSITION][META][UPSERT] code=%s entry_reason=%s entry_style=%s stop=%s pivot=%s",
                 display_code,
-                fill_meta.get("entry_reason"),
-                fill_meta.get("entry_style_selected"),
-                fill_meta.get("stop_price_at_entry"),
-                fill_meta.get("pivot_price_at_entry"),
+                entry_meta.get("entry_reason"),
+                entry_meta.get("entry_style_selected"),
+                entry_meta.get("stop_price_at_entry"),
+                entry_meta.get("pivot_price_at_entry"),
             )
             logger.info(
-                "[TRADE][FILL][BUY] code=%s name=%s oid=%s fill_qty=%s fill_px=%.2f",
+                "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s result=ACCEPTED",
                 cf.code,
                 stock_name,
                 kis_odno or order_id,
                 cf.planned_qty,
-                float(record_price or 0.0),
             )
-            status["filled"] = 1
+            status["filled"] = 0  # fill은 reconcile 후에만 1
             status["terminal_event"] = "API_RESULT"
         else:
             self.orders_repo.mark_error(self.env, effective_client_order_key or "", resp if isinstance(resp, dict) else {"resp": resp})
@@ -9005,14 +9030,41 @@ class PB1Engine:
                 "condition_details": conds,
             }
         )
-        self.positions_repo.update_position_fields(
-            env=self.env,
-            strategy=self.STRATEGY_NAME,
-            sid=sid,
-            mode=mode,
-            code=code,
-            fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
+        # [2026-04-30] last_exit_eval_json은 non-critical: 남은 tick budget이 부족하면 skip
+        _noncritical_timeout = int(os.getenv("PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC", "2"))
+        _skip_threshold = int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"))
+        _tick_remaining = getattr(self, "_tick_remaining_sec", None)
+        _should_skip_noncritical = (
+            _tick_remaining is not None and float(_tick_remaining) < _skip_threshold
         )
+        if _should_skip_noncritical:
+            logger.info(
+                "[POSITIONS][UPDATE][SKIP_NONCRITICAL] code=%s field=last_exit_eval_json reason=low_tick_budget remaining_sec=%.1f",
+                code, float(_tick_remaining or 0),
+            )
+        else:
+            try:
+                import signal as _signal
+                def _timeout_handler(signum, frame):
+                    raise TimeoutError("noncritical_db_update_timeout")
+                _signal.signal(_signal.SIGALRM, _timeout_handler)
+                _signal.alarm(_noncritical_timeout)
+                try:
+                    self.positions_repo.update_position_fields(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=sid,
+                        mode=mode,
+                        code=code,
+                        fields={"exit_policy_family": exit_policy_family, "last_exit_eval_json": exit_eval_payload},
+                    )
+                finally:
+                    _signal.alarm(0)
+            except Exception as _upd_exc:
+                logger.warning(
+                    "[POSITIONS][UPDATE][FAIL_SOFT] code=%s field=last_exit_eval_json err=%s",
+                    code, repr(_upd_exc),
+                )
 
         logger.info(
             "[EXIT][EVAL] code=%s qty=%s avg=%s last=%s pnl_pct=%.2f stop_loss_hit=%s take_profit_hit=%s trailing_stop_hit=%s close_below_ma20=%s close_below_ma50=%s time_stop_hit=%s signal_hit=%s orderable=%s reason=%s",
@@ -10592,6 +10644,8 @@ class PB1Engine:
         self._tick_price_cache = {}
         self._tick_price_cache_hits = 0
         self._tick_price_api_calls = 0
+        self._tick_remaining_sec: float | None = None  # [2026-04-30] non-critical DB skip용
+        self._tick_start_time: float = time.monotonic()
         logger.info("[PB1][PRICE_CACHE][TICK_INIT]")
         self._data_metrics = {
             "precomputed_hits": 0,

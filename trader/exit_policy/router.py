@@ -473,7 +473,6 @@ def apply_swing_exit_decision(
         activate_pct = float(gb_rule.get("activate_pct", 8.0))
         giveback_pct = float(gb_rule.get("giveback_pct", 3.0))
         floor_pct = float(gb_rule.get("floor_pct", 5.0))
-        sell_pct = float(gb_rule.get("sell_pct", 0.33))
 
         giveback_hit = (
             highest_ret_pct >= activate_pct
@@ -489,17 +488,30 @@ def apply_swing_exit_decision(
         )
 
         if giveback_hit:
-            qty = _calculate_exit_qty(orderable_qty, sell_pct)
+            # [2026-04-30] PB1_PROFIT_PROTECT_FULL_EXIT=1 이면 전량매도
+            full_exit = _eb("PB1_PROFIT_PROTECT_FULL_EXIT") or _eb("PB1_GIVEBACK_EXIT_FULL_SELL")
+            if full_exit:
+                sell_pct_used = None  # 전량
+                qty = _calculate_exit_qty(orderable_qty, None)
+                logger.info(
+                    "[EXIT][FULL_SELL_POLICY] code=%s reason=SWING_PROFIT_PROTECT_GIVEBACK "
+                    "full_exit=1 orderable_qty=%s sell_qty=%s sell_pct=1.0",
+                    code_for_log, orderable_qty, qty,
+                )
+            else:
+                sell_pct_used = float(os.getenv("PB1_SWING_GIVEBACK_SELL_PCT", str(gb_rule.get("sell_pct", 0.33))))
+                qty = _calculate_exit_qty(orderable_qty, sell_pct_used)
             logger.info(
                 "[EXIT][ROUTER][DECISION] code=%s exit_ok=1 "
-                "reason=SWING_PROFIT_PROTECT_GIVEBACK qty=%s",
-                code_for_log, qty,
+                "reason=SWING_PROFIT_PROTECT_GIVEBACK qty=%s full_exit=%s",
+                code_for_log, qty, int(full_exit),
             )
             return {
                 "exit_ok": True,
                 "reason": "SWING_PROFIT_PROTECT_GIVEBACK",
                 "qty": qty,
-                "sell_pct": sell_pct,
+                "sell_pct": sell_pct_used,
+                "full_exit": full_exit,
                 "update_meta": {
                     **_eff_meta,
                     "giveback_protect_done": True,

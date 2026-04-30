@@ -98,6 +98,29 @@ env:
   PB1_ABS_TP1_ENABLED: "1"
   PB1_ABS_TP1_PROFIT_PCT: "10.0"
   PB1_ABS_TP1_SELL_PCT: "0.33"
+  # [2026-04-30] Giveback full-exit / same-day rebuy block / EGW002 fix / tick budget / PNL report
+  PB1_PROFIT_PROTECT_FULL_EXIT: "1"
+  PB1_GIVEBACK_EXIT_FULL_SELL: "1"
+  PB1_SWING_GIVEBACK_SELL_PCT: "1.0"
+  PB1_MOMENTUM_GIVEBACK_SELL_PCT: "1.0"
+  PB1_BLOCK_REBUY_AFTER_SELL_SAME_DAY: "1"
+  PB1_ALLOW_SAME_DAY_REBUY_AFTER_SELL: "0"
+  PB1_REBUY_AFTER_SELL_COOLDOWN_MIN: "180"
+  KIS_DATA_MIN_INTERVAL_SEC: "0.35"
+  KIS_PRICE_MIN_INTERVAL_SEC: "0.35"
+  KIS_ORDER_MIN_INTERVAL_SEC: "0.25"
+  KIS_EGW002_BACKOFF_BASE_SEC: "2.0"
+  KIS_EGW002_BACKOFF_MAX_SEC: "10.0"
+  PB1_PRICE_CACHE_SCOPE: "run"
+  PB1_USE_BALANCE_PRPR_FIRST: "1"
+  PB1_MAX_PRICE_FETCH_PER_TICK: "12"
+  PB1_PNL_PRICE_FALLBACK_LIMIT: "3"
+  PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC: "2"
+  PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT: "5"
+  PB1_BLOCK_NEW_ORDER_WHEN_REMAINING_SEC_LT: "8"
+  PB1_ALLOW_KIS_DAILY_FALLBACK_IN_TRADE: "0"
+  PB1_ALLOW_KIS_DAILY_FALLBACK_IN_DIAG: "1"
+  PB1_PNL_REPORT_ENABLED: "1"
   # [2026-04-29] Multi-Layer Exit Router
   PB1_EXIT_ROUTER_ENABLED: "1"
   PB1_PERCENT_EXIT_ENABLED: "1"
@@ -437,6 +460,21 @@ jobs:
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-am.log
           echo "[PHASE][END] phase=am" | tee -a artifacts/trade-am.log
 
+      - name: Generate Portfolio PNL report
+        if: always() && steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        env:
+          PB1_PNL_REPORT_ENABLED: "1"
+          PB1_PNL_REPORT_SESSION: "am"
+          PB1_PNL_PRICE_FALLBACK_LIMIT: "3"
+        run: |
+          set -euo pipefail
+          mkdir -p reports/portfolio_pnl
+          python scripts/generate_portfolio_pnl_report.py 2>&1 | tee -a artifacts/trade-am.log || true
+          if [ -f reports/portfolio_pnl/latest_portfolio_pnl.md ]; then
+            cat reports/portfolio_pnl/latest_portfolio_pnl.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Verify AM log contract
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
@@ -487,5 +525,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: debug-trade-am-logs
-          path: repo/artifacts/
+          path: |
+            repo/artifacts/
+            repo/reports/portfolio_pnl/
           if-no-files-found: ignore

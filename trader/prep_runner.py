@@ -523,7 +523,9 @@ def _build_scored_members(df: pd.DataFrame) -> list[dict[str, Any]]:
         if not code:
             continue
         payload["code"] = code
-        payload["rank"] = int(payload.get("rank") or payload.get("rank_final30") or idx)
+        # [2026-04-30] rank_final30을 1~30으로 강제 부여 (0 저장 방지)
+        payload["rank"] = idx
+        payload["rank_final30"] = idx
         payload["as_of"] = payload.get("as_of")
 
         score_final = payload.get("score_final")
@@ -769,6 +771,25 @@ def save_final30_scored_core(
         raise RuntimeError(f"FINAL30_SCORED_CORE_SAVE_CONTRACT_FAIL:{list(inmem_validation.get('errors') or [])}")
 
     scored_members = _build_scored_members(final30_df)
+    # [2026-04-30] rank_final30 저장 전 검증
+    import numpy as _np
+    _rank_vals = [int(row.get("rank_final30") or 0) for row in scored_members]
+    _rank_min = min(_rank_vals) if _rank_vals else 0
+    _rank_max = max(_rank_vals) if _rank_vals else 0
+    _rank_unique = len(set(_rank_vals))
+    if _rank_min < 1 or _rank_max > 30 or _rank_unique != 30:
+        logger.error(
+            "[WATCHLIST][SAVE_SCORED][RANK_FINAL30_FAIL] rows=%s min=%s max=%s unique=%s -> will repair",
+            len(scored_members), _rank_min, _rank_max, _rank_unique,
+        )
+        for i, row in enumerate(scored_members, start=1):
+            row["rank_final30"] = i
+            row["rank"] = i
+    else:
+        logger.info(
+            "[WATCHLIST][SAVE_SCORED][RANK_FINAL30_OK] rows=%s min=%s max=%s unique=%s",
+            len(scored_members), _rank_min, _rank_max, _rank_unique,
+        )
     uniq_codes = len({str((row or {}).get("code") or "").zfill(6) for row in scored_members if (row or {}).get("code")})
     if len(scored_members) != 30 or uniq_codes != 30:
         raise RuntimeError(f"FINAL30_SCORED_CORE_SAVE_ROWS_FAIL:rows={len(scored_members)} uniq_codes={uniq_codes}")
@@ -856,6 +877,22 @@ def save_final30_scored_core(
         source="PREP_DB_ROUNDTRIP",
     )
     usable_roundtrip = bool(trade_validator.get("ok")) and not reload_missing
+    # [2026-04-30] roundtrip rank_final30 검증
+    if reload_rows:
+        _rt_rank_vals = [int((row.get("rank_final30") or row.get("rank") or 0)) for row in reload_rows]
+        _rt_min = min(_rt_rank_vals) if _rt_rank_vals else 0
+        _rt_max = max(_rt_rank_vals) if _rt_rank_vals else 0
+        _rt_unique = len(set(_rt_rank_vals))
+        if _rt_min >= 1 and _rt_max <= 30 and _rt_unique == len(reload_rows):
+            logger.info(
+                "[DB][FINAL30_SCORED][ROUNDTRIP_OK] rows=%s rank_final30_unique=%s",
+                len(reload_rows), _rt_unique,
+            )
+        else:
+            logger.warning(
+                "[DB][FINAL30_SCORED][ROUNDTRIP_RANK_WARN] rows=%s rank_final30_min=%s max=%s unique=%s",
+                len(reload_rows), _rt_min, _rt_max, _rt_unique,
+            )
     logger.info("[PREP][FINAL30_SCORED][DB_ROUNDTRIP_LOAD] rows=%s cols=%s", len(reload_rows), reload_cols)
     logger.info("[PREP][FINAL30_SCORED][DB_ROUNDTRIP_MISSING] missing=%s", reload_missing)
     logger.info("[FINAL30][SOURCE_COLS] source=db cols=%s", reload_cols)

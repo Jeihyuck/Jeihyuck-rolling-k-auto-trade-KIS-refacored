@@ -486,6 +486,21 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
+      - name: Generate Portfolio PNL report
+        if: always()
+        working-directory: repo
+        env:
+          PB1_PNL_REPORT_ENABLED: "1"
+          PB1_PNL_REPORT_SESSION: "manual"
+          PB1_PNL_PRICE_FALLBACK_LIMIT: "3"
+        run: |
+          set -euo pipefail
+          mkdir -p reports/portfolio_pnl
+          python scripts/generate_portfolio_pnl_report.py 2>&1 | tee -a artifacts/unified-manual.log || true
+          if [ -f reports/portfolio_pnl/latest_portfolio_pnl.md ]; then
+            cat reports/portfolio_pnl/latest_portfolio_pnl.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload manual debug logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -493,6 +508,7 @@ jobs:
           name: debug-unified-manual-logs
           path: |
             repo/artifacts/
+            repo/reports/portfolio_pnl/
             repo/runtime/prep/*/prep_manifest.json
             repo/runtime/prep/*/final30_locked.json
             repo/runtime/prep/*/quality-summary.json

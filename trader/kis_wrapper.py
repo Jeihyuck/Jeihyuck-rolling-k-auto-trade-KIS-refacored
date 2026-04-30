@@ -819,8 +819,39 @@ class _RateLimiter:
             last = self.last_at.get(key, 0.0)
             delta = now - last
             if delta < self.min_interval:
-                time.sleep(self.min_interval - delta + random.uniform(0, 0.03))
+                sleep_sec = self.min_interval - delta + random.uniform(0, 0.03)
+                logger.debug(
+                    "[KIS][RATE_LIMIT][SLEEP] endpoint=%s sleep=%.3f reason=global_qps_guard",
+                    key, sleep_sec,
+                )
+                time.sleep(sleep_sec)
             self.last_at[key] = time.time()
+
+
+def _is_egw002_error(response_data: dict | None, msg_cd: str | None = None) -> bool:
+    """EGW002 (초당 거래건수 초과) 에러 판별."""
+    if msg_cd and str(msg_cd).startswith("EGW002"):
+        return True
+    if response_data:
+        mc = str(response_data.get("msg_cd") or "")
+        if mc.startswith("EGW002"):
+            return True
+        if "초당 거래건수" in str(response_data.get("msg1") or ""):
+            return True
+    return False
+
+
+def _egw002_backoff_sleep(attempt: int = 1) -> float:
+    """EGW002 발생 시 backoff + jitter 계산 후 sleep. 실제 sleep 시간 반환."""
+    base = float(os.getenv("KIS_EGW002_BACKOFF_BASE_SEC", "2.0"))
+    cap = float(os.getenv("KIS_EGW002_BACKOFF_MAX_SEC", "10.0"))
+    delay = min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
+    logger.warning(
+        "[KIS][EGW002][BACKOFF] sleep=%.2f attempt=%s base=%.1f cap=%.1f",
+        delay, attempt, base, cap,
+    )
+    time.sleep(delay)
+    return delay
 
 
 TR_MAP = {
@@ -895,6 +926,16 @@ class KisAPI:
         qps = _env_float("KIS_QPS", 5.0)
         min_interval_sec = 1.0 / qps if qps > 0 else 0.20
         self._limiter = _RateLimiter(min_interval_sec=min_interval_sec)
+        # [2026-04-30] 데이터/가격/주문별 세분화된 rate limiter
+        self._data_limiter = _RateLimiter(
+            min_interval_sec=float(os.getenv("KIS_DATA_MIN_INTERVAL_SEC", "0.35"))
+        )
+        self._price_limiter = _RateLimiter(
+            min_interval_sec=float(os.getenv("KIS_PRICE_MIN_INTERVAL_SEC", "0.35"))
+        )
+        self._order_limiter = _RateLimiter(
+            min_interval_sec=float(os.getenv("KIS_ORDER_MIN_INTERVAL_SEC", "0.25"))
+        )
         self._concurrency_sem = threading.Semaphore(_env_int("KIS_CONCURRENCY", 2))
         self._recent_sells: Dict[str, float] = {}
         self._recent_sells_lock = threading.Lock()
@@ -2468,8 +2509,15 @@ class KisAPI:
             msg_cd = str(data.get("msg_cd", ""))
             rt_cd = str(data.get("rt_cd", ""))
             msg1 = str(data.get("msg1", ""))
-            
-            if rt_cd != "0" and msg_cd.startswith("EGW002"):
+
+            if _is_egw002_error(data, msg_cd):
+                logger.warning(
+                    "[KIS][EGW002][BACKOFF] endpoint=inquire-price code=%s msg_cd=%s msg1=%s attempt=1",
+                    code, msg_cd, msg1[:80],
+                )
+                _price_cache.open_circuit(rate_limited=True)
+                _egw002_backoff_sleep(attempt=1)
+            elif rt_cd != "0" and msg_cd.startswith("EGW002"):
                 logger.warning("[PRICE][RATE_LIMITED] code=%s msg_cd=%s -> open circuit %ss", code, msg_cd, _PRICE_CIRCUIT_SEC)
                 _price_cache.open_circuit(rate_limited=True)
             elif "초당 거래건수" in msg1:

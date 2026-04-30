@@ -2860,6 +2860,58 @@ class OrdersRepo:
             )
         )
 
+    # [2026-04-30] 당일 매도 주문 조회 (same-day sell rebuy block용)
+    def list_today_sell_orders(
+        self,
+        env: str,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        code: str | None = None,
+        status_exclude: Iterable[str] | None = ("ERROR", "CANCELLED", "REJECTED", "FAILED", "SKIP"),
+    ) -> list[dict]:
+        now = now_kst()
+        start = start_at or now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = end_at or (start + timedelta(days=1))
+        conditions = [
+            self._schema.orders.c.env == sa.bindparam("env_sell_1", env),
+            self._schema.orders.c.side == sa.bindparam("side_sell_1", "SELL"),
+            self._schema.orders.c.created_at >= sa.bindparam("created_at_sell_1", start, type_=sa.DateTime(timezone=True)),
+            self._schema.orders.c.created_at < sa.bindparam("created_at_sell_2", end, type_=sa.DateTime(timezone=True)),
+        ]
+        if code:
+            conditions.append(self._schema.orders.c.code == sa.bindparam("code_sell_1", code))
+        if status_exclude:
+            conditions.append(self._schema.orders.c.status.not_in(list(status_exclude)))
+        stmt = (
+            select(self._schema.orders)
+            .where(and_(*conditions))
+            .order_by(self._schema.orders.c.created_at.desc())
+        )
+        return self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.list_today_sell_orders",
+            fail_open=None,
+        )
+
+    def has_today_sell_for_code(
+        self,
+        env: str,
+        code: str,
+        *,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        status_exclude: Iterable[str] | None = ("ERROR", "CANCELLED", "REJECTED", "FAILED", "SKIP"),
+    ) -> tuple[bool, str | None]:
+        """오늘 해당 code에 대한 SELL 주문이 있는지 확인.
+        Returns (exists: bool, last_sell_at: str | None)
+        """
+        rows = self.list_today_sell_orders(env, code=code, start_at=start_at, end_at=end_at, status_exclude=status_exclude)
+        if rows:
+            last_at = str(rows[0].get("created_at") or "")
+            return True, last_at
+        return False, None
+
     def _session_window_bounds(self, session: str, trade_date: date | datetime | str | None = None) -> tuple[datetime, datetime]:
         session_key = str(session or "").strip().lower()
         bounds = {
@@ -3202,6 +3254,25 @@ class FillsRepo:
                     "ENTRY_ABORT_PRECHECK:db_schema_mismatch_fills_filled_at op=fills.list_today_fills [DB][READ][FATAL_SCHEMA_MISMATCH]"
                 ) from exc
             raise
+
+    # [2026-04-30] 당일 SELL fills 조회 (same-day sell rebuy block용)
+    def list_today_sell_fills(
+        self,
+        env: str,
+        code: str | None = None,
+    ) -> list[dict]:
+        return self.list_today_fills(env, side="SELL", code=code)
+
+    def has_today_sell_fill_for_code(
+        self,
+        env: str,
+        code: str,
+    ) -> tuple[bool, str | None]:
+        rows = self.list_today_sell_fills(env, code=code)
+        if rows:
+            last_at = str(rows[0].get("filled_at") or "")
+            return True, last_at
+        return False, None
 
     def list_fills_in_window(
         self,
