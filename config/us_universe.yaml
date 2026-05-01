@@ -1,0 +1,31 @@
+# us_universe.yaml — 미국주식 초기 universe 정의
+# ticker는 문자열 그대로 사용 (6자리 zfill 금지)
+# exchange 정보는 trader/us/symbols.py registry에서 보완
+
+core_etf:
+  - SPY    # S&P 500 ETF
+  - QQQ    # NASDAQ 100 ETF
+  - QQQM   # NASDAQ 100 ETF (저비용)
+  - SMH    # Semiconductor ETF
+  - SOXX   # Semiconductor ETF
+
+mega_ai:
+  - NVDA   # NVIDIA (AI GPU)
+  - MSFT   # Microsoft (AI Platform)
+  - AAPL   # Apple
+  - AMZN   # Amazon (AWS)
+  - META   # Meta (AI Infrastructure)
+  - GOOGL  # Alphabet (AI/Search)
+  - AVGO   # Broadcom (AI ASIC)
+  - TSM    # TSMC (AI Chip Foundry)
+
+ai_infra:
+  - VRT    # Vertiv (데이터센터 전력)
+  - CRDO   # Credo Technology (고속 연결)
+  - CIEN   # Ciena (광통신)
+  - MRVL   # Marvell Technology (AI 네트워킹)
+  - NVTS   # Navitas Semiconductor
+  - VIAVI  # VIAVI Solutions (광통신)
+  - LITE   # Lumentum (광부품)
+  - COHR   # Coherent (광학/레이저)
+  - AAOI   # Applied Optoelectronics

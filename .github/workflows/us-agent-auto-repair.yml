@@ -1,0 +1,114 @@
+name: US Agent Auto-Repair
+
+on:
+  workflow_run:
+    workflows:
+      - "US Agent (Paper Trading)"
+      - "US Harness (Offline QA)"
+    types:
+      - completed
+
+jobs:
+  triage:
+    name: "Failure Triage & Patch Plan"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+
+    env:
+      TRADING_REGION: "US"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      PYTHONPATH: "."
+      # PLAN_ONLY=1 — 실제 파일 수정 없이 plan dict만 출력
+      PLAN_ONLY: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: us-agent
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download failed workflow logs
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: /tmp/failed-logs
+        continue-on-error: true
+
+      - name: Run failure triage
+        id: triage
+        run: |
+          python - << 'EOF'
+          import os, json, pathlib
+          from trader.us.agents.failure_triage_agent import FailureTriageAgent
+          from trader.us.agents.patch_planner_agent import PatchPlannerAgent
+
+          log_dir = pathlib.Path("/tmp/failed-logs")
+          log_texts = []
+          if log_dir.exists():
+              for f in log_dir.rglob("*.log"):
+                  try:
+                      log_texts.append(f.read_text(errors="replace"))
+                  except Exception:
+                      pass
+
+          if not log_texts:
+              log_texts = ["UNKNOWN error — no log artifact found"]
+
+          triage_agent = FailureTriageAgent()
+          planner = PatchPlannerAgent()
+
+          results = triage_agent.triage_bulk(log_texts)
+          plans = planner.plan_bulk(results)
+
+          print("=== TRIAGE RESULTS ===")
+          print(json.dumps(results, indent=2))
+          print()
+          print("=== PATCH PLANS ===")
+          print(json.dumps(plans, indent=2))
+
+          # 안전한 plan만 출력 (PLAN_ONLY 모드에서는 적용 안 함)
+          safe_plans = [p for p in plans if p["safe_to_apply"]]
+          unsafe_plans = [p for p in plans if not p["safe_to_apply"]]
+
+          print()
+          print(f"Safe plans: {len(safe_plans)}, Unsafe plans: {len(unsafe_plans)}")
+          if unsafe_plans:
+              print("[WARNING] 다음 plan은 수동 검토 후 적용 필요:")
+              for p in unsafe_plans:
+                  print(f"  - {p['failure_type']} (patch_id={p['patch_id']})")
+
+          # Summary를 GitHub Output에 저장
+          summary = {
+              "triage_count": len(results),
+              "safe_plan_count": len(safe_plans),
+              "unsafe_plan_count": len(unsafe_plans),
+              "labels": [r["label"] for r in results],
+          }
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"summary={json.dumps(summary)}\n")
+          EOF
+
+      - name: Post triage summary
+        if: always()
+        run: |
+          echo "### US Agent Auto-Repair Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 항목 | 값 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event.workflow_run.name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Conclusion | ${{ github.event.workflow_run.conclusion }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run ID | ${{ github.event.workflow_run.id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Plan only | PLAN_ONLY=1 (자동 적용 없음) |" >> $GITHUB_STEP_SUMMARY

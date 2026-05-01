@@ -1,0 +1,112 @@
+name: US Agent (Paper Trading)
+
+on:
+  schedule:
+    # Prep: KST 22:00 (UTC 13:00) - 사전 watchlist 생성
+    - cron: "0 13 * * 1-5"
+    # Open: KST 22:30 (UTC 13:30) - 개장 직후 매수
+    - cron: "30 13 * * 1-5"
+    # Mid: KST 00:30 (UTC 15:30) - 중간 체크
+    - cron: "30 15 * * 1-5"
+    # Close: KST 05:00 (UTC 20:00) - 마감 reconcile
+    - cron: "0 20 * * 1-5"
+    # Report: KST 06:00 (UTC 21:00) - 일일 리포트
+    - cron: "0 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드 (prep/open/mid/close/report/all)"
+        required: true
+        default: "prep"
+        type: choice
+        options: [prep, open, mid, close, report, all]
+      offline:
+        description: "오프라인 모드 (true=KIS HTTP 차단)"
+        required: false
+        default: "true"
+        type: boolean
+
+jobs:
+  trade:
+    name: "US Paper Trade — ${{ github.event.inputs.mode || 'scheduled' }}"
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'us-agent'
+
+    env:
+      TRADING_REGION: "US"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      KIS_ACCOUNT_TYPE: "1"
+      PYTHONPATH: "."
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: us-agent
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine mode from schedule
+        id: mode
+        run: |
+          INPUT_MODE="${{ github.event.inputs.mode }}"
+          if [ -n "$INPUT_MODE" ]; then
+            echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
+          else
+            HOUR=$(date -u +%H)
+            MIN=$(date -u +%M)
+            if [ "$HOUR" = "13" ] && [ "$MIN" = "00" ]; then
+              echo "mode=prep" >> "$GITHUB_OUTPUT"
+            elif [ "$HOUR" = "13" ] && [ "$MIN" = "30" ]; then
+              echo "mode=open" >> "$GITHUB_OUTPUT"
+            elif [ "$HOUR" = "15" ]; then
+              echo "mode=mid" >> "$GITHUB_OUTPUT"
+            elif [ "$HOUR" = "20" ]; then
+              echo "mode=close" >> "$GITHUB_OUTPUT"
+            else
+              echo "mode=report" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Set offline flag
+        id: offline
+        run: |
+          OFFLINE_INPUT="${{ github.event.inputs.offline }}"
+          if [ "$OFFLINE_INPUT" = "false" ]; then
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=--offline" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run dispatcher
+        env:
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_ACCOUNT_NO: ${{ secrets.KIS_ACCOUNT_NO }}
+          KIS_TOKEN_FILE: "/tmp/kis_token.json"
+        run: |
+          python -m trader.us.runner.dispatcher \
+            --mode ${{ steps.mode.outputs.mode }} \
+            --env practice \
+            ${{ steps.offline.outputs.flag }}
+
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-agent-logs-${{ github.run_id }}
+          path: |
+            /tmp/*.log
+            /tmp/kis_token.json
+          if-no-files-found: ignore
+          retention-days: 7
