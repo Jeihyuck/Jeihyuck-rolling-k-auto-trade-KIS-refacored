@@ -1,24 +1,24 @@
-name: US Trade Close
+name: "US Trade Close"
+# close: EOD fills + reconcile + report | window: 15:45~16:30 ET | schedule: 19:50 / 20:50 UTC Mon-Fri
 
-on:
+"on":
   schedule:
-    # 15:50 ET (EDT=UTC-4): 19:50 UTC / (EST=UTC-5): 20:50 UTC
     - cron: "50 19 * * 1-5"
     - cron: "50 20 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "DRY_RUN. true means no order submission."
+        description: "DRY_RUN (true = no order submission)"
         required: false
         default: true
         type: boolean
       offline:
-        description: "offline mode. true blocks all KIS HTTP."
+        description: "offline mode (blocks all KIS HTTP)"
         required: false
         default: false
         type: boolean
       confirm:
-        description: "Type RUN_US_CLOSE_MANUAL to allow manual dispatch."
+        description: "Type RUN_US_CLOSE_MANUAL to run manually"
         required: false
         default: ""
 
@@ -26,12 +26,37 @@ concurrency:
   group: us-trade-close-${{ github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  trade-close:
+  trade_us_close:
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 60
 
     env:
+      TZ: America/New_York
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
       TRADING_REGION: "US"
       US_AGENT_ENABLED: "1"
       KIS_ENV: "practice"
@@ -40,6 +65,10 @@ jobs:
       DISABLE_REAL_TRADING: "1"
       ALLOW_REAL_ORDER: "0"
 
+      US_STRATEGY_ENGINE: "pb1"
+      US_ENTRY_ENABLED: "1"
+      US_EXIT_ENABLED: "1"
+
       US_PAPER_MAX_CAPITAL_KRW: "50000000"
       US_EXPECTED_PRACTICE_CAPITAL_KRW: "50000000"
       US_BUDGET_FX_KRW_PER_USD: "1450"
@@ -47,89 +76,223 @@ jobs:
 
       US_REQUIRE_FILL_CONFIRM: "1"
       US_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
+      US_BLOCK_REBUY_AFTER_SELL_SAME_DAY: "1"
+      US_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
+      US_BLOCK_NEW_ENTRY_AFTER_ET: "15:45"
+
+      US_MAX_ORDER_USD: "2500"
+      US_MAX_DAILY_NOTIONAL_USD: "10000"
+      US_MAX_POSITION_WEIGHT: "0.10"
+      US_MIN_CASH_BUFFER_USD: "200"
+
+      US_SESSION_INTERVAL_SEC: "300"
 
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
-      PYTHONPATH: "."
+
+      US_LOG_FILE: "us-trade-close.log"
+      US_ARTIFACT_NAME: "us-trade-close"
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: DB migrate
-        run: python -m trader.db.migrate
-
-      - name: "Phase guard (schedule only - manual dispatch allowed with confirm)"
+      - name: Resolve US Close phase guard
         id: phase_guard
+        working-directory: .
         run: |
-          python - <<'EOF'
-          import sys
-          from datetime import datetime, time
-          from zoneinfo import ZoneInfo
-          import os
+          set -euo pipefail
+          now_h="$(TZ=America/New_York date +%H)"
+          now_m="$(TZ=America/New_York date +%M)"
+          now_s="$(TZ=America/New_York date +%S)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
+          now_hhmm="$(TZ=America/New_York date +%H%M)"
+          now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
+          event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          event = os.getenv("GITHUB_EVENT_NAME", "")
-          confirm = os.getenv("CONFIRM_INPUT", "")
+          target_min=$((15 * 60 + 45))
+          stale_min=$((16 * 60 + 30))
 
-          NY_TZ = ZoneInfo("America/New_York")
-          now = datetime.now(tz=NY_TZ)
-          t = now.time()
+          should_run=1
+          skip_reason=""
+          wait_until_target=0
+          wait_seconds=0
 
-          if event == "workflow_dispatch":
-              if confirm and confirm != "RUN_US_CLOSE_MANUAL":
-                  print(f"[US_CLOSE_GUARD] SKIP invalid confirm")
-                  sys.exit(78)
-              print(f"[US_CLOSE_GUARD] PASS manual time={t}")
-          else:
-              start = time(15, 45)
-              end   = time(16, 30)
-              if not (start <= t <= end):
-                  print(f"[US_CLOSE_GUARD] SKIP time={t} window={start}~{end}")
-                  sys.exit(78)
-              print(f"[US_CLOSE_GUARD] PASS schedule time={t}")
-          EOF
-        env:
-          CONFIRM_INPUT: ${{ inputs.confirm }}
-        continue-on-error: true
-
-      - name: Check guard result
-        if: steps.phase_guard.outcome == 'failure'
-        run: |
-          echo "[US_TRADE_CLOSE] phase guard skipped"
-          exit 0
-
-      - name: Run US trade-close dispatcher
-        if: steps.phase_guard.outcome == 'success'
-        env:
-          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-          KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-          CANO: ${{ secrets.CANO }}
-          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-        run: |
-          OFFLINE_FLAG=""
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.offline }}" = "true" ]; then
-            OFFLINE_FLAG="--offline"
+          if [[ "$event_name" == "schedule" ]]; then
+            if [[ "$now_min" -gt "$stale_min" ]]; then
+              should_run=0
+              skip_reason="skip_stale_start_us_close"
+            elif [[ "$now_min" -lt "$target_min" ]]; then
+              wait_until_target=1
+              wait_seconds=$(( (target_min - now_min) * 60 ))
+            fi
           fi
 
-          python -m trader.us.runner.dispatcher \
-            --mode trade-close \
-            --env practice \
-            ${OFFLINE_FLAG}
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            confirm="${{ inputs.confirm || '' }}"
+            if [[ "$confirm" != "RUN_US_CLOSE_MANUAL" ]]; then
+              should_run=0
+              skip_reason="manual_us_close_not_confirmed"
+            fi
+          fi
 
-      - name: Upload Close artifacts
+          echo "should_run=${should_run}" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=${skip_reason}" >> "$GITHUB_OUTPUT"
+          echo "now_et=${now_hhmm}" >> "$GITHUB_OUTPUT"
+          echo "now_hhmmss=${now_hhmmss}" >> "$GITHUB_OUTPUT"
+          echo "wait_until_target=${wait_until_target}" >> "$GITHUB_OUTPUT"
+          echo "wait_seconds=${wait_seconds}" >> "$GITHUB_OUTPUT"
+          echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Verify checkout path
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
+          test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
+          test -d repo/trader || { echo "::error::repo/trader missing"; exit 1; }
+          mkdir -p repo/artifacts repo/reports/us_daily
+          {
+            echo "[US_TRADE_CLOSE][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[US_TRADE_CLOSE][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} phase_window=1545-1630"
+            echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
+          } | tee repo/artifacts/${US_LOG_FILE}
+          echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
+
+      - name: Emit US Close skip summary
+        if: steps.phase_guard.outputs.should_run != '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=us-close"
+            echo "[US_TRADE_CLOSE][EXIT] reason=phase_guard_skip"
+          } | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Set up Python
+        if: steps.phase_guard.outputs.should_run == '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install deps
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Wait until US Close target start
+        if: steps.phase_guard.outputs.should_run == '1' && steps.phase_guard.outputs.wait_until_target == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          wait_seconds="${{ steps.phase_guard.outputs.wait_seconds }}"
+          max_wait_seconds=900
+          if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
+          if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
+            echo "::error::wait_seconds too large: ${wait_seconds}"
+            exit 1
+          fi
+          echo "[US_WAIT_UNTIL_TARGET][START] session=close wait_seconds=${wait_seconds}" | tee -a artifacts/${US_LOG_FILE}
+          sleep "$wait_seconds"
+          echo "[US_WAIT_UNTIL_TARGET][DONE] session=close now_et=$(TZ=America/New_York date +%H%M%S)" | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Guard postgres-only
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_DB_GUARD][START]"
+            : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+            if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+              echo "::error::PBCORE_DB_URL must be postgres-only."
+              exit 1
+            fi
+            echo "[US_DB_GUARD][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: DB migrate
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_DB_MIGRATE][START]"
+            python -m trader.db.migrate
+            echo "[US_DB_MIGRATE][DONE]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Verify KIS env contract
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_ENV_CHECK] TRADING_REGION=${TRADING_REGION:-}"
+            echo "[US_ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
+            echo "[US_ENV_CHECK] DRY_RUN=${DRY_RUN:-}"
+            echo "[US_ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
+            test -n "${PBCORE_DB_URL:-}" || { echo "::error::PBCORE_DB_URL missing"; exit 1; }
+            test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+            test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+            test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+            test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+            test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+            test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+            test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+            [[ "${TRADING_REGION}" == "US" ]] || { echo "::error::TRADING_REGION must be US"; exit 1; }
+            [[ "${KIS_ENV}" == "practice" ]] || { echo "::error::KIS_ENV must be practice"; exit 1; }
+            echo "[US_ENV_CHECK][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Run US close
+        if: steps.phase_guard.outputs.should_run == '1'
+        timeout-minutes: 30
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            OFFLINE_FLAG=""
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+              OFFLINE_FLAG="--offline"
+            fi
+
+            echo "[US_TRADE_CLOSE][START]"
+            echo "[US_TRADE_CLOSE][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+
+            python -m trader.us.runner.dispatcher \
+              --mode trade-close \
+              --env practice \
+              ${OFFLINE_FLAG}
+
+            echo "[US_TRADE_CLOSE][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Verify US Close log contract
+        if: always()
+        working-directory: repo
+        run: |
+          test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
+          grep -E "\[US_TRADE_CLOSE\]\[TRIGGER\]" artifacts/${US_LOG_FILE} >/dev/null || echo "::warning::missing trigger marker"
+          if grep -F "Traceback" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::Traceback detected in US Close log"
+            exit 1
+          fi
+
+      - name: Upload US artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: us-trade-close-${{ github.run_id }}
+          name: ${{ env.US_ARTIFACT_NAME }}-${{ github.run_id }}
           path: |
-            /tmp/*.log
-          if-no-files-found: ignore
-          retention-days: 3
+            repo/artifacts/
+            repo/reports/us_daily/
+          if-no-files-found: warn
+          retention-days: 7

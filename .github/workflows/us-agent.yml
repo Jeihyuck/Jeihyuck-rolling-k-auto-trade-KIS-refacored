@@ -1,10 +1,11 @@
-name: US Agent Manual Wrapper
+name: "US Agent Manual"
+# manual wrapper — dispatches any US mode on demand
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       mode:
-        description: "manual mode"
+        description: "US runner mode"
         required: true
         default: "prep"
         type: choice
@@ -15,12 +16,12 @@ on:
           - trade-close
           - report
       dry_run:
-        description: "DRY_RUN. true means no order submission."
+        description: "DRY_RUN (true = no order submission)"
         required: false
         default: true
         type: boolean
       offline:
-        description: "offline mode. true blocks all KIS HTTP."
+        description: "offline mode (blocks all KIS HTTP)"
         required: false
         default: false
         type: boolean
@@ -29,12 +30,37 @@ concurrency:
   group: us-agent-manual-${{ github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   manual:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     env:
+      TZ: America/New_York
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
       TRADING_REGION: "US"
       US_AGENT_ENABLED: "1"
       KIS_ENV: "practice"
@@ -56,39 +82,142 @@ jobs:
       US_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
       US_BLOCK_REBUY_AFTER_SELL_SAME_DAY: "1"
       US_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
+      US_BLOCK_NEW_ENTRY_AFTER_ET: "15:45"
+
+      US_MAX_ORDER_USD: "2500"
+      US_MAX_DAILY_NOTIONAL_USD: "10000"
+      US_MAX_POSITION_WEIGHT: "0.10"
+      US_MIN_CASH_BUFFER_USD: "200"
+
+      US_SESSION_INTERVAL_SEC: "300"
 
       DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
-      PYTHONPATH: "."
+
+      US_LOG_FILE: "us-agent-manual.log"
+      US_ARTIFACT_NAME: "us-agent-manual"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
 
-      - uses: actions/setup-python@v5
+      - name: Verify checkout path
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
+          test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
+          test -d repo/trader || { echo "::error::repo/trader missing"; exit 1; }
+          mkdir -p repo/artifacts repo/reports/us_daily
+          {
+            echo "[US_AGENT_MANUAL][TRIGGER] mode=${{ inputs.mode }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
+          } | tee repo/artifacts/${US_LOG_FILE}
+          echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
+          cache-dependency-path: repo/requirements.txt
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install deps
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Guard postgres-only
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_DB_GUARD][START]"
+            : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+            if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+              echo "::error::PBCORE_DB_URL must be postgres-only."
+              exit 1
+            fi
+            echo "[US_DB_GUARD][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: DB migrate
-        run: python -m trader.db.migrate
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_DB_MIGRATE][START]"
+            python -m trader.db.migrate
+            echo "[US_DB_MIGRATE][DONE]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Verify KIS env contract
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_ENV_CHECK] TRADING_REGION=${TRADING_REGION:-}"
+            echo "[US_ENV_CHECK] KIS_ENV=${KIS_ENV:-}"
+            echo "[US_ENV_CHECK] DRY_RUN=${DRY_RUN:-}"
+            echo "[US_ENV_CHECK] API_BASE_URL=${API_BASE_URL:-}"
+            test -n "${PBCORE_DB_URL:-}" || { echo "::error::PBCORE_DB_URL missing"; exit 1; }
+            test -n "${KIS_APP_KEY:-}" || { echo "::error::KIS_APP_KEY missing"; exit 1; }
+            test -n "${KIS_APP_SECRET:-}" || { echo "::error::KIS_APP_SECRET missing"; exit 1; }
+            test -n "${CANO:-}" || { echo "::error::CANO missing"; exit 1; }
+            test -n "${ACNT_PRDT_CD:-}" || { echo "::error::ACNT_PRDT_CD missing"; exit 1; }
+            test -n "${APP_KEY:-}" || { echo "::error::APP_KEY alias missing"; exit 1; }
+            test -n "${APP_SECRET:-}" || { echo "::error::APP_SECRET alias missing"; exit 1; }
+            test -n "${API_BASE_URL:-}" || { echo "::error::API_BASE_URL alias missing"; exit 1; }
+            [[ "${TRADING_REGION}" == "US" ]] || { echo "::error::TRADING_REGION must be US"; exit 1; }
+            [[ "${KIS_ENV}" == "practice" ]] || { echo "::error::KIS_ENV must be practice"; exit 1; }
+            echo "[US_ENV_CHECK][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: Run US dispatcher
-        env:
-          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
-          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
-          KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
-          CANO: ${{ secrets.CANO }}
-          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
-          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+        timeout-minutes: 75
+        working-directory: repo
         run: |
-          OFFLINE_FLAG=""
-          if [ "${{ inputs.offline }}" = "true" ]; then
-            OFFLINE_FLAG="--offline"
+          set -euo pipefail
+          {
+            OFFLINE_FLAG=""
+            if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+              OFFLINE_FLAG="--offline"
+            fi
+
+            echo "[US_AGENT_MANUAL][MODE] mode=${{ inputs.mode }}"
+            echo "[US_AGENT_MANUAL][START]"
+            echo "[US_AGENT_MANUAL][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+
+            python -m trader.us.runner.dispatcher \
+              --mode "${{ inputs.mode }}" \
+              --env practice \
+              ${OFFLINE_FLAG}
+
+            echo "[US_AGENT_MANUAL][DONE]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Verify US Agent log contract
+        if: always()
+        working-directory: repo
+        run: |
+          test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
+          grep -E "\[US_AGENT_MANUAL\]\[TRIGGER\]" artifacts/${US_LOG_FILE} >/dev/null || echo "::warning::missing trigger marker"
+          if grep -F "Traceback" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::Traceback detected in US Agent log"
+            exit 1
           fi
 
-          python -m trader.us.runner.dispatcher \
-            --mode "${{ inputs.mode }}" \
-            --env practice \
-            ${OFFLINE_FLAG}
+      - name: Upload US artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.US_ARTIFACT_NAME }}-${{ github.run_id }}
+          path: |
+            repo/artifacts/
+            repo/reports/us_daily/
+          if-no-files-found: warn
+          retention-days: 7
