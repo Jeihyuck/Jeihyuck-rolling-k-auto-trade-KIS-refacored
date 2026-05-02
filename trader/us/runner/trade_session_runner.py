@@ -62,6 +62,7 @@ def run_trade_session(
     max_minutes: int = 180,
     interval_sec: int = 300,
     force_now: str | None = None,
+    max_ticks: int = 0,
 ) -> dict:
     """AM 또는 Afternoon session 실행.
 
@@ -76,12 +77,19 @@ def run_trade_session(
         "[US_SESSION][START] session=%s env=%s offline=%s max_minutes=%d interval_sec=%d",
         session, env, offline, max_minutes, interval_sec,
     )
+    logger.info(
+        "[US_SESSION][FORCE_NOW] enabled=%s force_now=%s max_ticks=%d",
+        1 if force_now else 0,
+        force_now or "",
+        max_ticks,
+    )
 
     from trader.us.market_calendar import is_us_trading_day
     from trader.us.budget import resolve_us_order_budget
 
     # ── 시각 및 거래일 확인 ───────────────────────────────────────────────────
-    now = _now_ny(force_now)
+    base_forced_now = _now_ny(force_now) if force_now else None
+    now = base_forced_now if base_forced_now is not None else _now_ny(None)
     logger.info("[US_SESSION][PHASE_GUARD] session=%s now_et=%s", session, now.strftime("%H:%M:%S"))
 
     if not is_us_trading_day(now.date()):
@@ -111,10 +119,14 @@ def run_trade_session(
     results: list[dict] = []
 
     while True:
-        # force_now는 첫 tick에만 적용 (이후는 실시간)
-        tick_now = _now_ny(force_now if tick_count == 0 else None)
+        if base_forced_now is not None:
+            tick_now_dt = base_forced_now + timedelta(seconds=interval_sec * tick_count)
+            tick_force_now = tick_now_dt.isoformat()
+        else:
+            tick_now_dt = _now_ny(None)
+            tick_force_now = None
 
-        if tick_now >= deadline:
+        if tick_now_dt >= deadline:
             logger.info(
                 "[US_SESSION][END] session=%s reason=session_end ticks=%d",
                 session, tick_count,
@@ -122,14 +134,19 @@ def run_trade_session(
             break
 
         tick_count += 1
-        logger.info("[US_TICK_LOOP][TICK] session=%s tick=%d", session, tick_count)
+        logger.info(
+            "[US_TICK_LOOP][TICK] session=%s tick=%d force_now=%s",
+            session,
+            tick_count,
+            tick_force_now or "",
+        )
 
         try:
             tick_result = run_trade_tick(
                 session=session,
                 env=env,
                 offline=offline,
-                force_now=force_now if tick_count == 1 else None,
+                force_now=tick_force_now,
             )
             results.append(tick_result)
 
@@ -183,13 +200,25 @@ def run_trade_session(
                 "reason": tick_result.get("reason", "market_skip"),
             }
 
-        # 다음 tick까지 대기 (force_now로 smoke test 시 즉시 종료)
-        if force_now:
-            logger.info("[US_TICK_LOOP][BREAK] force_now mode — single tick only")
+        if force_now and max_ticks > 0 and tick_count >= max_ticks:
+            logger.info(
+                "[US_SESSION][END] session=%s reason=max_ticks ticks=%d",
+                session,
+                tick_count,
+            )
             break
 
-        logger.info("[US_TICK_LOOP][SLEEP] seconds=%d", interval_sec)
-        time_mod.sleep(interval_sec)
+        if force_now and max_ticks == 0:
+            logger.info(
+                "[US_SESSION][END] session=%s reason=force_now_single_tick ticks=%d",
+                session,
+                tick_count,
+            )
+            break
+
+        if not force_now:
+            logger.info("[US_TICK_LOOP][SLEEP] seconds=%d", interval_sec)
+            time_mod.sleep(interval_sec)
 
     logger.info(
         "[US_SESSION][END] session=%s reason=session_end ticks=%d warns=%d",
@@ -222,6 +251,7 @@ def main() -> None:
     parser.add_argument("--max-minutes", dest="max_minutes", type=int, default=180)
     parser.add_argument("--interval-sec", dest="interval_sec", type=int, default=300)
     parser.add_argument("--force-now", dest="force_now", default=None)
+    parser.add_argument("--max-ticks", dest="max_ticks", type=int, default=0)
     args = parser.parse_args()
 
     result = run_trade_session(
@@ -231,6 +261,7 @@ def main() -> None:
         max_minutes=args.max_minutes,
         interval_sec=args.interval_sec,
         force_now=args.force_now,
+        max_ticks=args.max_ticks,
     )
     if result["status"] == "ERROR":
         sys.exit(1)

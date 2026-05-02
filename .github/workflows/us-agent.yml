@@ -25,6 +25,22 @@ name: "US Agent Manual"
         required: false
         default: false
         type: boolean
+      force_now:
+        description: "Manual smoke only. Forced NY datetime"
+        required: false
+        default: ""
+      max_ticks:
+        description: "For session modes only. Manual smoke max tick count."
+        required: false
+        default: "0"
+      manual_max_minutes:
+        description: "Manual max minutes override"
+        required: false
+        default: ""
+      manual_interval_sec:
+        description: "Manual interval seconds override"
+        required: false
+        default: ""
 
 concurrency:
   group: us-agent-manual-${{ github.ref_name }}
@@ -177,6 +193,20 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Guard manual force_now safety
+        if: inputs.force_now != ''
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_FORCE_NOW_GUARD][START] force_now=${{ inputs.force_now }} dry_run=${{ inputs.dry_run }} offline=${{ inputs.offline }}"
+            if [ "${{ inputs.dry_run }}" != "true" ] && [ "${{ inputs.offline }}" != "true" ]; then
+              echo "::error::force_now manual smoke requires dry_run=true or offline=true"
+              exit 1
+            fi
+            echo "[US_FORCE_NOW_GUARD][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Run US dispatcher
         timeout-minutes: 75
         working-directory: repo
@@ -184,18 +214,71 @@ jobs:
           set -euo pipefail
           {
             OFFLINE_FLAG=""
+            FORCE_NOW_FLAG=""
+            MAX_TICKS_FLAG=""
+            MAX_MINUTES=""
+            INTERVAL_SEC=""
+
             if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
               OFFLINE_FLAG="--offline"
+            fi
+            if [ -n "${{ inputs.force_now }}" ]; then
+              FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+            fi
+            if [ -n "${{ inputs.max_ticks }}" ] && [ "${{ inputs.max_ticks }}" != "0" ]; then
+              MAX_TICKS_FLAG="--max-ticks ${{ inputs.max_ticks }}"
+            fi
+            if [ -n "${{ inputs.manual_max_minutes }}" ]; then
+              MAX_MINUTES="${{ inputs.manual_max_minutes }}"
+            fi
+            if [ -n "${{ inputs.manual_interval_sec }}" ]; then
+              INTERVAL_SEC="${{ inputs.manual_interval_sec }}"
             fi
 
             echo "[US_AGENT_MANUAL][MODE] mode=${{ inputs.mode }}"
             echo "[US_AGENT_MANUAL][START]"
             echo "[US_AGENT_MANUAL][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+            echo "[US_AGENT_MANUAL][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES:-default} INTERVAL_SEC=${INTERVAL_SEC:-default}"
 
-            python -m trader.us.runner.dispatcher \
-              --mode "${{ inputs.mode }}" \
-              --env practice \
-              ${OFFLINE_FLAG}
+            MODE="${{ inputs.mode }}"
+
+            if [ "$MODE" = "trade-am" ]; then
+              python -m trader.us.runner.trade_session_runner \
+                --session am \
+                --env practice \
+                --max-minutes "${MAX_MINUTES:-180}" \
+                --interval-sec "${INTERVAL_SEC:-300}" \
+                ${FORCE_NOW_FLAG} \
+                ${MAX_TICKS_FLAG} \
+                ${OFFLINE_FLAG}
+            elif [ "$MODE" = "trade-afternoon" ] || [ "$MODE" = "trade-pm" ]; then
+              python -m trader.us.runner.trade_session_runner \
+                --session afternoon \
+                --env practice \
+                --max-minutes "${MAX_MINUTES:-205}" \
+                --interval-sec "${INTERVAL_SEC:-300}" \
+                ${FORCE_NOW_FLAG} \
+                ${MAX_TICKS_FLAG} \
+                ${OFFLINE_FLAG}
+            elif [ "$MODE" = "prep" ]; then
+              python -m trader.us.runner.dispatcher \
+                --mode prep \
+                --env practice \
+                ${FORCE_NOW_FLAG} \
+                ${OFFLINE_FLAG}
+            elif [ "$MODE" = "trade-close" ]; then
+              python -m trader.us.runner.dispatcher \
+                --mode trade-close \
+                --env practice \
+                ${FORCE_NOW_FLAG} \
+                ${OFFLINE_FLAG}
+            else
+              python -m trader.us.runner.dispatcher \
+                --mode "$MODE" \
+                --env practice \
+                ${FORCE_NOW_FLAG} \
+                ${OFFLINE_FLAG}
+            fi
 
             echo "[US_AGENT_MANUAL][DONE]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}

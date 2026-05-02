@@ -21,6 +21,22 @@ name: "US Trade AM"
         description: "Type RUN_US_AM_MANUAL to run manually"
         required: false
         default: ""
+      force_now:
+        description: "Manual smoke only. Forced NY datetime, e.g. 2026-05-01T09:35:00-04:00"
+        required: false
+        default: ""
+      max_ticks:
+        description: "Manual smoke max tick count. 0 means single tick when force_now is set."
+        required: false
+        default: "0"
+      manual_max_minutes:
+        description: "Manual max minutes override. Empty means default."
+        required: false
+        default: ""
+      manual_interval_sec:
+        description: "Manual interval seconds override. Empty means default."
+        required: false
+        default: ""
 
 concurrency:
   group: us-trade-am-${{ github.ref_name }}
@@ -252,6 +268,20 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Guard manual force_now safety
+        if: github.event_name == 'workflow_dispatch' && inputs.force_now != ''
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_FORCE_NOW_GUARD][START] force_now=${{ inputs.force_now }} dry_run=${{ inputs.dry_run }} offline=${{ inputs.offline }}"
+            if [ "${{ inputs.dry_run }}" != "true" ] && [ "${{ inputs.offline }}" != "true" ]; then
+              echo "::error::force_now manual smoke requires dry_run=true or offline=true"
+              exit 1
+            fi
+            echo "[US_FORCE_NOW_GUARD][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Run US AM trade session
         if: steps.phase_guard.outputs.should_run == '1'
         timeout-minutes: 190
@@ -260,18 +290,40 @@ jobs:
           set -euo pipefail
           {
             OFFLINE_FLAG=""
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.offline || 'false' }}" = "true" ]; then
-              OFFLINE_FLAG="--offline"
+            FORCE_NOW_FLAG=""
+            MAX_TICKS_FLAG=""
+            MAX_MINUTES="180"
+            INTERVAL_SEC="${US_SESSION_INTERVAL_SEC:-300}"
+
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+                OFFLINE_FLAG="--offline"
+              fi
+              if [ -n "${{ inputs.force_now }}" ]; then
+                FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+              fi
+              if [ -n "${{ inputs.max_ticks }}" ] && [ "${{ inputs.max_ticks }}" != "0" ]; then
+                MAX_TICKS_FLAG="--max-ticks ${{ inputs.max_ticks }}"
+              fi
+              if [ -n "${{ inputs.manual_max_minutes }}" ]; then
+                MAX_MINUTES="${{ inputs.manual_max_minutes }}"
+              fi
+              if [ -n "${{ inputs.manual_interval_sec }}" ]; then
+                INTERVAL_SEC="${{ inputs.manual_interval_sec }}"
+              fi
             fi
 
             echo "[US_TRADE_AM][START]"
             echo "[US_TRADE_AM][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+            echo "[US_TRADE_AM][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES} INTERVAL_SEC=${INTERVAL_SEC}"
 
             python -m trader.us.runner.trade_session_runner \
               --session am \
               --env practice \
-              --max-minutes 180 \
-              --interval-sec ${US_SESSION_INTERVAL_SEC:-300} \
+              --max-minutes "${MAX_MINUTES}" \
+              --interval-sec "${INTERVAL_SEC}" \
+              ${FORCE_NOW_FLAG} \
+              ${MAX_TICKS_FLAG} \
               ${OFFLINE_FLAG}
 
             echo "[US_TRADE_AM][DONE]"

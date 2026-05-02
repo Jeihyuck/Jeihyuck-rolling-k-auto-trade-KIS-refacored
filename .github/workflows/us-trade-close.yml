@@ -21,6 +21,15 @@ name: "US Trade Close"
         description: "Type RUN_US_CLOSE_MANUAL to run manually"
         required: false
         default: ""
+      force_now:
+        description: "Manual smoke only. Forced NY datetime for close context, e.g. 2026-05-01T15:55:00-04:00"
+        required: false
+        default: ""
+      manual_skip_phase_guard:
+        description: "Manual only. true allows close to run outside close time window."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: us-trade-close-${{ github.ref_name }}
@@ -126,7 +135,14 @@ jobs:
 
           if [[ "$event_name" == "workflow_dispatch" ]]; then
             confirm="${{ inputs.confirm || '' }}"
-            if [[ "$confirm" != "RUN_US_CLOSE_MANUAL" ]]; then
+            skip_phase="${{ inputs.manual_skip_phase_guard || 'false' }}"
+            if [[ "$skip_phase" == "true" ]]; then
+              should_run=1
+              skip_reason=""
+            elif [[ "$confirm" == "RUN_US_CLOSE_MANUAL" ]]; then
+              should_run=1
+              skip_reason=""
+            else
               should_run=0
               skip_reason="manual_us_close_not_confirmed"
             fi
@@ -252,6 +268,20 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Guard manual force_now safety
+        if: github.event_name == 'workflow_dispatch' && inputs.force_now != ''
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_FORCE_NOW_GUARD][START] force_now=${{ inputs.force_now }} dry_run=${{ inputs.dry_run }} offline=${{ inputs.offline }}"
+            if [ "${{ inputs.dry_run }}" != "true" ] && [ "${{ inputs.offline }}" != "true" ]; then
+              echo "::error::force_now manual smoke requires dry_run=true or offline=true"
+              exit 1
+            fi
+            echo "[US_FORCE_NOW_GUARD][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Run US close
         if: steps.phase_guard.outputs.should_run == '1'
         timeout-minutes: 30
@@ -260,16 +290,25 @@ jobs:
           set -euo pipefail
           {
             OFFLINE_FLAG=""
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.offline || 'false' }}" = "true" ]; then
-              OFFLINE_FLAG="--offline"
+            FORCE_NOW_FLAG=""
+
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+                OFFLINE_FLAG="--offline"
+              fi
+              if [ -n "${{ inputs.force_now }}" ]; then
+                FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+              fi
             fi
 
             echo "[US_TRADE_CLOSE][START]"
             echo "[US_TRADE_CLOSE][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+            echo "[US_TRADE_CLOSE][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG}"
 
             python -m trader.us.runner.dispatcher \
               --mode trade-close \
               --env practice \
+              ${FORCE_NOW_FLAG} \
               ${OFFLINE_FLAG}
 
             echo "[US_TRADE_CLOSE][OK]"

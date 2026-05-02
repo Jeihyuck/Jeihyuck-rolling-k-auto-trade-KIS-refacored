@@ -18,13 +18,18 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
-def run_prep(env: str = "practice", offline: bool = False) -> dict:
+def run_prep(env: str = "practice", offline: bool = False, force_now: str | None = None) -> dict:
     """Prep 단계 실행.
 
     Returns:
         {"status": "OK"|"ERROR", "intents": [...], ...}
     """
     logger.info("[US_PREP][START] env=%s offline=%s", env, offline)
+    logger.info(
+        "[US_PREP][FORCE_NOW] enabled=%s force_now=%s",
+        1 if force_now else 0,
+        force_now or "",
+    )
 
     # 1. Universe 로드
     try:
@@ -45,8 +50,14 @@ def run_prep(env: str = "practice", offline: bool = False) -> dict:
     from trader.us.strategy.us_momentum import USMomentumStrategy
     from trader.us.strategy.us_etf_trend import USEtfTrendStrategy
 
-    run_id = f"prep-{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
-    trade_date = datetime.utcnow().strftime("%Y-%m-%d")
+    from zoneinfo import ZoneInfo
+    _NY_TZ = ZoneInfo("America/New_York")
+    if force_now:
+        _now = datetime.fromisoformat(force_now).astimezone(_NY_TZ)
+    else:
+        _now = datetime.now(tz=_NY_TZ)
+    run_id = f"prep-{_now.strftime('%Y%m%dT%H%M%S')}"
+    trade_date = _now.strftime("%Y-%m-%d")
 
     all_intents = []
     watchlist_entries: list[dict] = []
@@ -128,9 +139,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="US Prep Runner")
     parser.add_argument("--env", default="practice")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--force-now", dest="force_now", default=None)
     args = parser.parse_args()
 
-    result = run_prep(env=args.env, offline=args.offline)
+    result = run_prep(env=args.env, offline=args.offline, force_now=args.force_now)
     if result["status"] != "OK":
         sys.exit(1)
 

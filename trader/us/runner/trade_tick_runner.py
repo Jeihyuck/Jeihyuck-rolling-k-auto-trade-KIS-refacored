@@ -77,6 +77,13 @@ def run_trade_tick(
     else:
         now = now_ny()
 
+    logger.info(
+        "[US_TICK][TIME] session=%s force_now=%s resolved_now_et=%s",
+        session,
+        force_now or "",
+        now.isoformat(),
+    )
+
     # ── 거래일 확인 ───────────────────────────────────────────────────────────
     if not is_us_trading_day(now.date()):
         logger.info("[US_TICK][SKIP] not_trading_day date=%s", now.date())

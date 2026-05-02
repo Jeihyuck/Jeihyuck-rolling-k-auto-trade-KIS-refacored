@@ -16,8 +16,13 @@ import sys
 logger = logging.getLogger(__name__)
 
 
-def run_trade_close(env: str = "practice", offline: bool = False) -> dict:
+def run_trade_close(env: str = "practice", offline: bool = False, force_now: str | None = None) -> dict:
     logger.info("[US_TRADE_CLOSE][START] env=%s offline=%s", env, offline)
+    logger.info(
+        "[US_TRADE_CLOSE][FORCE_NOW] enabled=%s force_now=%s",
+        1 if force_now else 0,
+        force_now or "",
+    )
 
     from trader.us.data_provider import USDataProvider
     from trader.us.db.repos import (
@@ -106,8 +111,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="US Trade Close Runner")
     parser.add_argument("--env", default="practice")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--force-now", dest="force_now", default=None)
     args = parser.parse_args()
-    result = run_trade_close(env=args.env, offline=args.offline)
+    result = run_trade_close(env=args.env, offline=args.offline, force_now=args.force_now)
     if result["status"] == "ERROR":
         sys.exit(1)
 

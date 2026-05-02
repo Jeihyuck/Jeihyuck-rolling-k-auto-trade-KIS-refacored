@@ -40,7 +40,7 @@ def normalize_mode(mode: str) -> str:
     return MODE_ALIASES.get(mode, mode)
 
 
-def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now: str | None = None) -> int:
+def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now: str | None = None, max_ticks: int = 0) -> int:
     """모드에 따라 적절한 runner를 호출.
 
     Returns:
@@ -59,7 +59,7 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
 
     if mode == "prep":
         from trader.us.runner.prep_runner import run_prep
-        r = run_prep(env=env, offline=offline)
+        r = run_prep(env=env, offline=offline, force_now=force_now)
         return 0 if r.get("status") == "OK" else 1
 
     if mode == "open":
@@ -74,7 +74,7 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
 
     if mode == "close":
         from trader.us.runner.trade_close_runner import run_trade_close
-        r = run_trade_close(env=env, offline=offline)
+        r = run_trade_close(env=env, offline=offline, force_now=force_now)
         return 0 if r.get("status") == "OK" else 1
 
     if mode == "report":
@@ -84,12 +84,12 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
 
     if mode == "session-am":
         from trader.us.runner.trade_session_runner import run_trade_session
-        r = run_trade_session(session="am", env=env, offline=offline, force_now=force_now)
+        r = run_trade_session(session="am", env=env, offline=offline, force_now=force_now, max_ticks=max_ticks)
         return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS", "SKIP") else 1
 
     if mode == "session-afternoon":
         from trader.us.runner.trade_session_runner import run_trade_session
-        r = run_trade_session(session="afternoon", env=env, offline=offline, force_now=force_now)
+        r = run_trade_session(session="afternoon", env=env, offline=offline, force_now=force_now, max_ticks=max_ticks)
         return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS", "SKIP") else 1
 
     if mode == "tick":
@@ -111,9 +111,10 @@ def main() -> None:
     parser.add_argument("--env", default="practice")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--force-now", dest="force_now", default=None)
+    parser.add_argument("--max-ticks", dest="max_ticks", type=int, default=0)
     args = parser.parse_args()
 
-    rc = dispatch(args.mode, env=args.env, offline=args.offline, force_now=args.force_now)
+    rc = dispatch(args.mode, env=args.env, offline=args.offline, force_now=args.force_now, max_ticks=args.max_ticks)
     sys.exit(rc)
 
 

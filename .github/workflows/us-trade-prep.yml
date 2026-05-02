@@ -17,6 +17,19 @@ name: "US Trade Prep"
         required: false
         default: false
         type: boolean
+      confirm:
+        description: "Type RUN_US_PREP_MANUAL to run manually"
+        required: false
+        default: ""
+      force_now:
+        description: "Manual smoke only. Forced NY datetime for prep context, e.g. 2026-05-01T08:50:00-04:00"
+        required: false
+        default: ""
+      manual_skip_phase_guard:
+        description: "Manual only. true allows prep to run outside prep time window."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: us-trade-prep-${{ github.ref_name }}
@@ -117,6 +130,21 @@ jobs:
             elif [[ "$now_min" -lt "$target_min" ]]; then
               wait_until_target=1
               wait_seconds=$(( (target_min - now_min) * 60 ))
+            fi
+          fi
+
+          if [[ "$event_name" == "workflow_dispatch" ]]; then
+            confirm="${{ inputs.confirm || '' }}"
+            skip_phase="${{ inputs.manual_skip_phase_guard || 'false' }}"
+            if [[ "$skip_phase" == "true" ]]; then
+              should_run=1
+              skip_reason=""
+            elif [[ "$confirm" == "RUN_US_PREP_MANUAL" ]]; then
+              should_run=1
+              skip_reason=""
+            else
+              should_run=0
+              skip_reason="manual_us_prep_not_confirmed"
             fi
           fi
 
@@ -240,6 +268,20 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Guard manual force_now safety
+        if: github.event_name == 'workflow_dispatch' && inputs.force_now != ''
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_FORCE_NOW_GUARD][START] force_now=${{ inputs.force_now }} dry_run=${{ inputs.dry_run }} offline=${{ inputs.offline }}"
+            if [ "${{ inputs.dry_run }}" != "true" ] && [ "${{ inputs.offline }}" != "true" ]; then
+              echo "::error::force_now manual smoke requires dry_run=true or offline=true"
+              exit 1
+            fi
+            echo "[US_FORCE_NOW_GUARD][OK]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Run US prep
         if: steps.phase_guard.outputs.should_run == '1'
         timeout-minutes: 30
@@ -248,16 +290,25 @@ jobs:
           set -euo pipefail
           {
             OFFLINE_FLAG=""
-            if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.offline || 'false' }}" = "true" ]; then
-              OFFLINE_FLAG="--offline"
+            FORCE_NOW_FLAG=""
+
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+                OFFLINE_FLAG="--offline"
+              fi
+              if [ -n "${{ inputs.force_now }}" ]; then
+                FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+              fi
             fi
 
             echo "[US_PREP][START]"
             echo "[US_PREP][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+            echo "[US_PREP][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG}"
 
             python -m trader.us.runner.dispatcher \
               --mode prep \
               --env practice \
+              ${FORCE_NOW_FLAG} \
               ${OFFLINE_FLAG}
 
             echo "[US_PREP][DONE]"
