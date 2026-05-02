@@ -157,6 +157,7 @@ def _make_exit_intent(
         "exchange": exchange,
         "side": "SELL",
         "qty": qty,
+        "available_qty": qty,   # risk gate SELL qty <= available_qty 확인용
         "limit_price": round(current_price * 0.998, 4),  # 0.2% 슬리피지 허용
         "notional_usd": round(current_price * qty, 4),
         "exit_type": exit_type,

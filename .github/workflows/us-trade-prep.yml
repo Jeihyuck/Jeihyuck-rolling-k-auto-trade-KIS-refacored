@@ -43,7 +43,7 @@ jobs:
       US_BUDGET_FX_KRW_PER_USD: "1450"
       US_MAX_CAPITAL_USD_AUTO: "1"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
       PYTHONPATH: "."
 
     steps:

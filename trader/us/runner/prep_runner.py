@@ -49,16 +49,66 @@ def run_prep(env: str = "practice", offline: bool = False) -> dict:
     trade_date = datetime.utcnow().strftime("%Y-%m-%d")
 
     all_intents = []
+    watchlist_entries: list[dict] = []
+
     for StratCls in [USPb1PullbackStrategy, USMomentumStrategy, USEtfTrendStrategy]:
         strat = StratCls(run_id=run_id, trade_date=trade_date)
         try:
             intents = strat.run_on_universe(tickers, provider)
             all_intents.extend(intents)
+            # watchlist 항목 구성
+            for intent in intents:
+                watchlist_entries.append({
+                    "symbol": intent.get("symbol"),
+                    "exchange": intent.get("exchange", "NASDAQ"),
+                    "strategy": strat.name,
+                    "score": float(intent.get("score", 0)),
+                    "meta": {"run_id": run_id},
+                })
             logger.info("[US_STRATEGY][SCORED] strategy=%s intents=%d",
                         strat.name, len(intents))
         except Exception as exc:
             logger.warning("[US_PREP][STRATEGY_ERROR] strategy=%s error=%s",
                            getattr(strat, "name", "?"), exc)
+
+    # US PB1 engine scoring (US_STRATEGY_ENGINE=pb1)
+    engine_name = os.getenv("US_STRATEGY_ENGINE", "").lower()
+    if engine_name == "pb1":
+        try:
+            from trader.us.pb1.us_entry_engine import score_symbol
+            watchlist_size = int(os.getenv("US_PREP_WATCHLIST_SIZE", "30"))
+            scored: list[tuple[float, str]] = []
+            for ticker in tickers:
+                sym = ticker if isinstance(ticker, str) else ticker.get("symbol", "")
+                exch = "NASDAQ" if isinstance(ticker, str) else ticker.get("exchange", "NASDAQ")
+                try:
+                    daily = provider.get_daily_prices(sym, exch)
+                    current = provider.get_current_price(sym, exch)
+                    sc = score_symbol(sym, daily, current)
+                    if sc is not None:
+                        scored.append((sc, sym, exch))
+                except Exception:
+                    pass
+            scored.sort(key=lambda x: -x[0])
+            for sc, sym, exch in scored[:watchlist_size]:
+                watchlist_entries.append({
+                    "symbol": sym,
+                    "exchange": exch,
+                    "strategy": "us_pb1",
+                    "score": float(sc),
+                    "meta": {"run_id": run_id, "source": "pb1_scoring"},
+                })
+        except Exception as exc:
+            logger.warning("[US_PREP][PB1_SCORE_ERROR] %s", exc)
+
+    # watchlist 저장
+    if watchlist_entries:
+        try:
+            from trader.us.db.repos import save_us_watchlist
+            saved = save_us_watchlist(watchlist_entries, trade_date=trade_date)
+            logger.info("[US_PREP][WATCHLIST][SAVE] count=%d", saved)
+        except Exception as exc:
+            logger.warning("[US_PREP][WATCHLIST][WARN] %s", exc)
 
     logger.info("[US_PREP][OK] total_intents=%d", len(all_intents))
     return {

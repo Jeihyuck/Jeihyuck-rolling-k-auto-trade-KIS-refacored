@@ -98,11 +98,25 @@ def run_trade_tick(
         available_cash_usd = 10000.0
     else:
         try:
-            balance = provider.get_balance()
-            available_cash_usd = float(balance.get("total_pvs", 10000.0))
-        except Exception as exc:
-            logger.warning("[US_TICK][WARN] balance fetch failed: %s", exc)
-            available_cash_usd = 0.0
+            available_cash_usd = provider.get_orderable_cash()
+        except Exception:
+            # fallback: balance에서 현금성 필드 탐색
+            try:
+                balance = provider.get_balance()
+                for _k in ("ord_psbl_cash", "ovrs_ord_psbl_amt", "orderable_cash",
+                           "cash", "psbl_amt", "frcr_pchs_amt1"):
+                    _v = balance.get(_k)
+                    if _v is not None:
+                        try:
+                            available_cash_usd = float(_v)
+                            break
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    available_cash_usd = 0.0
+            except Exception as exc2:
+                logger.warning("[US_TICK][WARN] cash fetch failed: %s", exc2)
+                available_cash_usd = 0.0
 
     budget = resolve_us_order_budget(available_cash_usd)
     effective_budget = budget["effective_order_budget_usd"]
@@ -121,7 +135,7 @@ def run_trade_tick(
         logger.warning("[US_RECONCILE][WARN] %s", exc)
         recon = {"status": "WARN", "error": str(exc)}
 
-    # ── 체결 조회 ─────────────────────────────────────────────────────────────
+    # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     fills_today: list[dict] = []
     if not offline:
         try:
@@ -131,10 +145,52 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_TICK][WARN] fills fetch failed: %s", exc)
 
-    sold_today = {f["symbol"] for f in fills_today if f.get("side") == "SELL"}
+    # KIS fills + DB sold_today 합산
+    from trader.us.db.repos import load_today_symbols_sold, save_fills, save_position_snapshot, save_reconcile_log
+    kis_sold = {f["symbol"] for f in fills_today if f.get("side") == "SELL"}
+    try:
+        db_sold = load_today_symbols_sold()
+    except Exception:
+        db_sold = set()
+    sold_today = kis_sold | db_sold
+
+    # fills DB 저장
+    if fills_today:
+        try:
+            save_fills(fills_today)
+        except Exception as exc:
+            logger.warning("[US_TICK][WARN] save_fills failed: %s", exc)
+
+    # reconcile 결과 positions DB 저장
+    recon_positions = recon.get("positions", [])
+    if recon_positions:
+        try:
+            save_position_snapshot(recon_positions)
+        except Exception as exc:
+            logger.warning("[US_TICK][WARN] save_position_snapshot failed: %s", exc)
+
+    # reconcile log DB 저장
+    try:
+        save_reconcile_log({
+            "status": recon.get("status", "OK"),
+            "message": recon.get("error", ""),
+            "position_count": len(recon_positions),
+            "total_pvs": recon.get("total_pvs_usd", 0),
+            "detail": {"session": session},
+        })
+    except Exception as exc:
+        logger.warning("[US_TICK][WARN] save_reconcile_log failed: %s", exc)
 
     # ── 현재 포지션 ───────────────────────────────────────────────────────────
-    current_positions = recon.get("positions", [])
+    # reconcile 결과 우선, 비어 있으면 DB fallback
+    from trader.us.db.repos import load_positions as db_load_positions
+    if recon_positions:
+        current_positions = recon_positions
+    else:
+        try:
+            current_positions = db_load_positions()
+        except Exception:
+            current_positions = []
     position_count = len(current_positions)
 
     # ── EXIT 평가 ─────────────────────────────────────────────────────────────

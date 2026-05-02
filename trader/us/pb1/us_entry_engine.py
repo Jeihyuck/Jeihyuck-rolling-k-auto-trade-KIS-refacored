@@ -159,6 +159,19 @@ def generate_entry_intents(
             logger.debug("[US_ENTRY][BLOCK] reason=sold_today symbol=%s", symbol)
             continue
 
+        # DB: 미체결 주문 차단
+        try:
+            from trader.us.db.repos import has_pending_order, has_position
+            if has_pending_order(symbol):
+                logger.debug("[US_ENTRY][BLOCK] reason=pending_order symbol=%s", symbol)
+                continue
+            # DB: 이미 보유 중이면 차단
+            if has_position(symbol):
+                logger.debug("[US_ENTRY][BLOCK] reason=has_position symbol=%s", symbol)
+                continue
+        except Exception as exc:
+            logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
+
         try:
             exchange = resolve_exchange(symbol)
             daily = provider.get_daily_prices(symbol, exchange, count=120)

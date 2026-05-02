@@ -287,6 +287,17 @@ def assert_order_allowed(
     check_exchange(exchange)
     check_qty(qty)
 
+    # SELL: 보유 수량 초과 차단
+    if side.upper() == "SELL":
+        available_qty = intent.get("available_qty")
+        if available_qty is not None:
+            try:
+                if qty > int(available_qty):
+                    _block("sell_qty_exceeds_position",
+                           symbol=symbol, qty=qty, available_qty=available_qty)
+            except (TypeError, ValueError):
+                pass
+
     # 예산 기반 차단 (US_PAPER_MAX_CAPITAL_KRW 기준 5천만원 환산)
     check_us_capital_budget(notional_usd, available_cash_usd, symbol=symbol)
 

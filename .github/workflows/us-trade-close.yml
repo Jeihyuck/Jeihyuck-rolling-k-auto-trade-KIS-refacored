@@ -48,7 +48,7 @@ jobs:
       US_REQUIRE_FILL_CONFIRM: "1"
       US_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
       PYTHONPATH: "."
 
     steps:

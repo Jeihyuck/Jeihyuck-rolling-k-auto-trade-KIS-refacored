@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def _make_stub_daily(symbol: str, count: int = 60) -> list[dict]:
-    """offline/test 용 stub daily price 데이터."""
+    """offline/test 용 stub daily price 데이터 (xymd 오름차순)."""
     base_price = 100.0
     prices = []
     d = date.today()
@@ -23,7 +23,7 @@ def _make_stub_daily(symbol: str, count: int = 60) -> list[dict]:
         idx = count - i - 1
         price = base_price * (1 + 0.001 * idx)
         prices.append({
-            "xymd": (d - timedelta(days=i)).strftime("%Y%m%d"),
+            "xymd": (d - timedelta(days=idx)).strftime("%Y%m%d"),
             "clos": f"{price:.2f}",
             "open": f"{price * 0.99:.2f}",
             "high": f"{price * 1.01:.2f}",
@@ -31,7 +31,8 @@ def _make_stub_daily(symbol: str, count: int = 60) -> list[dict]:
             "tvol": "1000000",
             "symbol": symbol,
         })
-    return prices
+    # 반드시 오름차순 반환 (전략 코드가 closes[-1]을 최신가로 가정)
+    return sorted(prices, key=lambda r: str(r.get("xymd", "")))
 
 
 def _make_stub_price(symbol: str) -> dict:
@@ -103,12 +104,30 @@ class USDataProvider:
         return raw
 
     def get_orderable_cash(self) -> float:
-        """주문 가능 현금 (USD)."""
+        """주문 가능 현금 (USD).
+
+        후보 필드 (KIS 환경에 따라 다를 수 있음):
+        frcr_ord_psbl_amt1, ord_psbl_cash, ovrs_ord_psbl_amt,
+        orderable_cash, cash, psbl_amt
+        """
         if self._offline:
             return 1000.0
-        raw = self._get_client().get_us_orderable_cash()
-        output = raw.get("output", {})
         try:
-            return float(output.get("frcr_ord_psbl_amt1", 0))
-        except (ValueError, TypeError):
+            raw = self._get_client().get_us_orderable_cash()
+        except Exception as exc:
+            logger.warning("[US_DATA][WARN] get_orderable_cash API failed: %s", exc)
             return 0.0
+        output = raw.get("output", raw)  # output 없으면 raw 자체 시도
+        candidates = (
+            "frcr_ord_psbl_amt1", "ord_psbl_cash", "ovrs_ord_psbl_amt",
+            "orderable_cash", "cash", "psbl_amt",
+        )
+        for key in candidates:
+            val = output.get(key)
+            if val is not None:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    logger.warning("[US_DATA][WARN] orderable_cash field %s not numeric: %s", key, val)
+        logger.warning("[US_DATA][WARN] orderable_cash not found in response, returning 0.0")
+        return 0.0

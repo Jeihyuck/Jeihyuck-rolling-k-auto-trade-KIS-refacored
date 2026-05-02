@@ -56,7 +56,7 @@ jobs:
       US_BLOCK_NEW_ENTRY_AFTER_ET: "15:45"
       US_SESSION_INTERVAL_SEC: "300"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
       PYTHONPATH: "."
 
     steps:
