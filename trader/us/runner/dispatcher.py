@@ -11,7 +11,33 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-MODES = ("prep", "open", "mid", "close", "report", "all")
+MODE_ALIASES: dict[str, str] = {
+    "trade-am": "session-am",
+    "trade-pm": "session-afternoon",
+    "trade-afternoon": "session-afternoon",
+    "trade-close": "close",
+}
+
+MODES = (
+    "prep",
+    "tick",
+    "session-am",
+    "session-afternoon",
+    "open",
+    "mid",
+    "close",
+    "report",
+    "all",
+    "trade-am",
+    "trade-pm",
+    "trade-afternoon",
+    "trade-close",
+)
+
+
+def normalize_mode(mode: str) -> str:
+    """mode alias를 실제 모드로 변환한다."""
+    return MODE_ALIASES.get(mode, mode)
 
 
 def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now: str | None = None) -> int:
@@ -21,6 +47,8 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
         0 (성공) or 1 (실패)
     """
     logger.info("[US_DISPATCHER][START] mode=%s env=%s offline=%s", mode, env, offline)
+
+    mode = normalize_mode(mode)
 
     if mode == "all":
         results = []
@@ -53,6 +81,21 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
         from trader.us.runner.daily_report_runner import run_daily_report
         r = run_daily_report(env=env, offline=offline)
         return 0 if r.get("status") == "OK" else 1
+
+    if mode == "session-am":
+        from trader.us.runner.trade_session_runner import run_trade_session
+        r = run_trade_session(session="am", env=env, offline=offline, force_now=force_now)
+        return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS", "SKIP") else 1
+
+    if mode == "session-afternoon":
+        from trader.us.runner.trade_session_runner import run_trade_session
+        r = run_trade_session(session="afternoon", env=env, offline=offline, force_now=force_now)
+        return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS", "SKIP") else 1
+
+    if mode == "tick":
+        from trader.us.runner.trade_tick_runner import run_trade_tick
+        r = run_trade_tick(session="manual", env=env, offline=offline, force_now=force_now)
+        return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS", "SKIP") else 1
 
     logger.error("[US_DISPATCHER][ERROR] unknown mode=%s", mode)
     return 1

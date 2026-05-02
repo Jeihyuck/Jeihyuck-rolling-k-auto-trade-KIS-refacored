@@ -1,0 +1,150 @@
+name: US Trade AM
+
+on:
+  schedule:
+    # 09:25 ET (EDT=UTC-4): 13:25 UTC / (EST=UTC-5): 14:25 UTC
+    - cron: "25 13 * * 1-5"
+    - cron: "25 14 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "DRY_RUN. true means no order submission."
+        required: false
+        default: true
+        type: boolean
+      offline:
+        description: "offline mode. true blocks all KIS HTTP."
+        required: false
+        default: false
+        type: boolean
+      confirm:
+        description: "Type RUN_US_AM_MANUAL to allow manual dispatch."
+        required: false
+        default: ""
+
+concurrency:
+  group: us-trade-am-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  trade-am:
+    runs-on: ubuntu-latest
+    timeout-minutes: 210
+
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      ALLOW_REAL_ORDER: "0"
+
+      US_STRATEGY_ENGINE: "pb1"
+      US_ENTRY_ENABLED: "1"
+      US_EXIT_ENABLED: "1"
+
+      US_PAPER_MAX_CAPITAL_KRW: "50000000"
+      US_EXPECTED_PRACTICE_CAPITAL_KRW: "50000000"
+      US_BUDGET_FX_KRW_PER_USD: "1450"
+      US_MAX_CAPITAL_USD_AUTO: "1"
+
+      US_REQUIRE_FILL_CONFIRM: "1"
+      US_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
+      US_BLOCK_REBUY_AFTER_SELL_SAME_DAY: "1"
+      US_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
+      US_BLOCK_NEW_ENTRY_AFTER_ET: "15:45"
+      US_SESSION_INTERVAL_SEC: "300"
+
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      PYTHONPATH: "."
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: DB migrate
+        run: python -m trader.db.migrate
+
+      - name: "Phase guard (schedule 09:20-09:45 ET / manual confirm check)"
+        id: phase_guard
+        run: |
+          python - <<'EOF'
+          import sys
+          from datetime import datetime, time
+          from zoneinfo import ZoneInfo
+
+          import os
+
+          event = os.getenv("GITHUB_EVENT_NAME", "")
+          confirm = os.getenv("CONFIRM_INPUT", "")
+
+          NY_TZ = ZoneInfo("America/New_York")
+          now = datetime.now(tz=NY_TZ)
+          t = now.time()
+
+          if event == "workflow_dispatch":
+              if confirm != "RUN_US_AM_MANUAL":
+                  print(f"[US_AM_GUARD] SKIP manual dispatch requires confirm=RUN_US_AM_MANUAL")
+                  sys.exit(78)
+              print(f"[US_AM_GUARD] PASS manual confirmed time={t}")
+          else:
+              # schedule
+              start = time(9, 20)
+              stale = time(10, 15)
+              if t > stale:
+                  print(f"[US_AM_GUARD] SKIP stale_start time={t}")
+                  sys.exit(78)
+              if t < start:
+                  print(f"[US_AM_GUARD] SKIP too early time={t}")
+                  sys.exit(78)
+              print(f"[US_AM_GUARD] PASS schedule time={t}")
+          EOF
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+        continue-on-error: true
+
+      - name: Check guard result
+        if: steps.phase_guard.outcome == 'failure'
+        run: |
+          echo "[US_TRADE_AM] phase guard skipped"
+          exit 0
+
+      - name: Run US trade-am session
+        if: steps.phase_guard.outcome == 'success'
+        env:
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+        run: |
+          OFFLINE_FLAG=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.offline }}" = "true" ]; then
+            OFFLINE_FLAG="--offline"
+          fi
+
+          python -m trader.us.runner.trade_session_runner \
+            --session am \
+            --env practice \
+            --max-minutes 180 \
+            --interval-sec ${US_SESSION_INTERVAL_SEC:-300} \
+            ${OFFLINE_FLAG}
+
+      - name: Upload AM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-trade-am-${{ github.run_id }}
+          path: |
+            /tmp/*.log
+          if-no-files-found: ignore
+          retention-days: 3

@@ -80,11 +80,15 @@ class USDataProvider:
         }
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120) -> list[dict]:
-        """일봉 데이터 조회."""
+        """일봉 데이터 조회 (xymd 기준 오름차순 정렬).
+
+        전략 코드가 closes[-1]을 최신 가격으로 가정하므로 반드시 오름차순 반환.
+        """
         if self._offline:
             logger.debug("[US_DATA][OFFLINE] daily_prices symbol=%s count=%d", symbol, count)
             return _make_stub_daily(symbol, count)
-        return self._get_client().get_us_daily_price(symbol, exchange, count)
+        rows = self._get_client().get_us_daily_price(symbol, exchange, count)
+        return sorted(rows, key=lambda r: str(r.get("xymd", "")))
 
     def get_balance(self) -> dict:
         """잔고 조회."""

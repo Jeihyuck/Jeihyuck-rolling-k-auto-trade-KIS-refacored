@@ -1,0 +1,78 @@
+# -*- coding: utf-8 -*-
+"""US PB1 Engine.
+
+tick runner에서 호출하는 통합 엔진.
+
+환경변수:
+  US_STRATEGY_ENGINE=pb1  → 이 엔진 사용
+  US_ENTRY_ENABLED=1      → 진입 평가
+  US_EXIT_ENABLED=1       → 청산 평가
+"""
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class USPb1Engine:
+    """US PB1 통합 전략 엔진."""
+
+    def __init__(self, env: str = "practice", offline: bool = False) -> None:
+        self.env = env
+        self.offline = offline
+
+    def evaluate_exits(
+        self,
+        positions: list[dict],
+        provider: Any,
+        now: datetime | None = None,
+    ) -> list[dict]:
+        """보유 포지션 청산 조건 평가.
+
+        Returns:
+            청산 order intent 목록
+        """
+        from trader.utils.env import env_bool
+        if not env_bool("US_EXIT_ENABLED", default=True):
+            logger.info("[US_PB1_ENGINE] exit evaluation disabled")
+            return []
+
+        from trader.us.pb1.us_exit_engine import generate_exit_intents
+        return generate_exit_intents(positions=positions, provider=provider, now=now)
+
+    def evaluate_entries(
+        self,
+        tickers: list[str],
+        provider: Any,
+        sold_today: set,
+        available_cash_usd: float,
+        position_count: int,
+        now: datetime | None = None,
+    ) -> list[dict]:
+        """진입 후보 평가.
+
+        Returns:
+            진입 order intent 목록
+        """
+        from trader.utils.env import env_bool
+        if not env_bool("US_ENTRY_ENABLED", default=True):
+            logger.info("[US_PB1_ENGINE] entry evaluation disabled")
+            return []
+
+        from trader.us.budget import get_us_capital_usd_cap
+        capital_usd_cap = get_us_capital_usd_cap()
+
+        from trader.us.pb1.us_entry_engine import generate_entry_intents
+        return generate_entry_intents(
+            tickers=tickers,
+            provider=provider,
+            sold_today=sold_today,
+            available_cash_usd=available_cash_usd,
+            position_count=position_count,
+            capital_usd_cap=capital_usd_cap,
+            now=now,
+        )

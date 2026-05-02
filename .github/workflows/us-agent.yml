@@ -1,44 +1,38 @@
-name: US Agent (Paper Trading)
+name: US Agent Manual Wrapper
 
 on:
-  schedule:
-    # Prep candidates (EDT 09:00): UTC 13:00 / UTC 14:00
-    - cron: "0 13 * * 1-5"
-    - cron: "0 14 * * 1-5"
-    # Trade-AM candidates (EDT 09:30): UTC 13:30 / UTC 14:30
-    - cron: "30 13 * * 1-5"
-    - cron: "30 14 * * 1-5"
-    # Trade-PM candidates (EDT 12:30): UTC 16:30 / UTC 17:30
-    - cron: "30 16 * * 1-5"
-    - cron: "30 17 * * 1-5"
-    # Trade-Close candidates (EDT 15:55): UTC 19:55 / UTC 20:55
-    - cron: "55 19 * * 1-5"
-    - cron: "55 20 * * 1-5"
-    # Report candidates (EDT 17:00): UTC 21:00 / UTC 22:00
-    - cron: "0 21 * * 1-5"
-    - cron: "0 22 * * 1-5"
   workflow_dispatch:
     inputs:
       mode:
-        description: "실행 모드 (prep/trade-am/trade-pm/trade-close/report)"
+        description: "manual mode"
         required: true
         default: "prep"
         type: choice
-        options: [prep, trade-am, trade-pm, trade-close, report, open, mid, close]
-      offline:
-        description: "오프라인 모드 (true=KIS HTTP 차단)"
+        options:
+          - prep
+          - trade-am
+          - trade-afternoon
+          - trade-close
+          - report
+      dry_run:
+        description: "DRY_RUN. true means no order submission."
         required: false
-        default: "true"
+        default: true
+        type: boolean
+      offline:
+        description: "offline mode. true blocks all KIS HTTP."
+        required: false
+        default: false
         type: boolean
 
 concurrency:
-  group: us-agent-paper-trading
+  group: us-agent-manual-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  trade:
-    name: "US Paper Trade — ${{ github.event.inputs.mode || 'scheduled' }}"
+  manual:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     env:
       TRADING_REGION: "US"
@@ -48,15 +42,28 @@ jobs:
       US_LIVE_TRADING_ENABLED: "0"
       DISABLE_REAL_TRADING: "1"
       ALLOW_REAL_ORDER: "0"
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+
+      US_STRATEGY_ENGINE: "pb1"
+      US_ENTRY_ENABLED: "1"
+      US_EXIT_ENABLED: "1"
+
+      US_PAPER_MAX_CAPITAL_KRW: "50000000"
+      US_EXPECTED_PRACTICE_CAPITAL_KRW: "50000000"
+      US_BUDGET_FX_KRW_PER_USD: "1450"
+      US_MAX_CAPITAL_USD_AUTO: "1"
+
+      US_REQUIRE_FILL_CONFIRM: "1"
+      US_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
+      US_BLOCK_REBUY_AFTER_SELL_SAME_DAY: "1"
+      US_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
+
+      DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
       PYTHONPATH: "."
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
@@ -64,28 +71,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Determine mode from schedule
-        id: mode
-        run: |
-          INPUT_MODE="${{ github.event.inputs.mode }}"
-          if [ -n "$INPUT_MODE" ]; then
-            echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
-          else
-            python -m trader.us.runner.mode_resolver >> "$GITHUB_OUTPUT"
-          fi
+      - name: DB migrate
+        run: python -m trader.db.migrate
 
-      - name: Set offline flag
-        id: offline
-        run: |
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "flag=" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.inputs.offline }}" = "false" ]; then
-            echo "flag=" >> "$GITHUB_OUTPUT"
-          else
-            echo "flag=--offline" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run dispatcher
+      - name: Run US dispatcher
         env:
           KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
           KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
@@ -93,20 +82,13 @@ jobs:
           CANO: ${{ secrets.CANO }}
           ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
           PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
-          KIS_TOKEN_FILE: "/tmp/kis_token.json"
         run: |
-          python -m trader.us.runner.dispatcher \
-            --mode ${{ steps.mode.outputs.mode }} \
-            --env practice \
-            ${{ steps.offline.outputs.flag }}
+          OFFLINE_FLAG=""
+          if [ "${{ inputs.offline }}" = "true" ]; then
+            OFFLINE_FLAG="--offline"
+          fi
 
-      - name: Upload run logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: us-agent-paper-logs-${{ github.run_id }}
-          path: |
-            /tmp/*.log
-            /tmp/kis_token.json
-          if-no-files-found: ignore
-          retention-days: 7
+          python -m trader.us.runner.dispatcher \
+            --mode "${{ inputs.mode }}" \
+            --env practice \
+            ${OFFLINE_FLAG}
