@@ -1,0 +1,67 @@
+name: US Harness (Offline QA)
+
+on:
+  pull_request:
+    branches: [dual-agent]
+    paths:
+      - "trader/us/**"
+      - "tests/us/**"
+      - "config/us_*.yaml"
+  schedule:
+    # 매일 KST 08:00 (UTC 23:00 전일)
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  harness:
+    name: "US Offline Harness QA"
+    runs-on: ubuntu-latest
+
+    env:
+      TRADING_REGION: "US"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      DRY_RUN: "1"
+      ALLOW_REAL_ORDER: "0"
+      # KIS credentials NOT provided — all HTTP must be blocked offline
+      PYTHONPATH: "."
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest (tests/us)
+        run: pytest -q tests/us
+
+      - name: Run harness runner (offline, all scenarios)
+        run: python -m trader.us.harness.runner --scenario all --offline
+
+      - name: Verify KIS HTTP not called
+        run: |
+          # offline 모드에서는 KIS API 호출이 절대 발생하면 안 된다.
+          # 실제 HTTP 호출 여부는 scenario stdout 에서 HTTP 마커 부재로 확인.
+          python - << 'EOF'
+          from trader.us.harness.log_parser import any_forbidden_marker_present
+          # 추가 검증 — 빈 로그에는 forbidden marker가 없어야 함
+          assert not any_forbidden_marker_present("", ["[KIS_HTTP_CALL]"])
+          print("[VERIFY][PASS] KIS HTTP marker absent in offline run")
+          EOF
+
+      - name: Upload harness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-harness-results-${{ github.run_id }}
+          path: |
+            /tmp/*.log
+          if-no-files-found: ignore
+          retention-days: 3

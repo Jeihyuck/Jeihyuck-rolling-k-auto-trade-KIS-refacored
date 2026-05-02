@@ -1,0 +1,107 @@
+# trader/us/harness/manifest.yaml
+# Harness 시나리오 목록
+
+scenarios:
+  - name: offline_quote_success
+    description: "offline 모드에서 prep runner 정상 실행 확인"
+    command: "python -m trader.us.runner.prep_runner --env practice --offline"
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+    expected_markers:
+      - "[US_PREP][OK]"
+      - "[US_STRATEGY][SCORED]"
+    forbidden_markers:
+      - "Traceback"
+      - "[US_HARNESS][FAIL]"
+
+  - name: market_closed_skip
+    description: "휴장일/비거래 시간에 trade_open_runner가 SKIP 반환 확인"
+    command: "python -m trader.us.runner.trade_open_runner --env practice --offline --force-now 2026-01-01T10:00:00-05:00"
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+    expected_markers:
+      - "[US_MARKET][CLOSED]"
+      - "[US_TRADE_OPEN][SKIP]"
+    forbidden_markers:
+      - "[US_ORDER][ACK]"
+
+  - name: duplicate_order_block
+    description: "동일 client_order_key 중복 주문 차단 확인"
+    command: "python -m trader.us.harness.scenarios.duplicate_order_block"
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+    expected_markers:
+      - "[US_DUPLICATE][BLOCK]"
+      - "[US_HARNESS][PASS]"
+    forbidden_markers:
+      - "[US_HARNESS][FAIL]"
+
+  - name: insufficient_cash_block
+    description: "현금 부족 시 주문 차단 확인"
+    command: "python -m trader.us.harness.scenarios.insufficient_cash_block"
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+      US_MIN_CASH_BUFFER_USD: "50"
+    expected_markers:
+      - "[US_RISK][BLOCK]"
+      - "[US_HARNESS][PASS]"
+    forbidden_markers:
+      - "[US_ORDER][ACK]"
+
+  - name: partial_fill_reconcile
+    description: "부분 체결 reconcile 처리 확인"
+    command: "python -m trader.us.harness.scenarios.partial_fill_reconcile"
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+    expected_markers:
+      - "[US_RECONCILE][OK]"
+      - "[US_HARNESS][PASS]"
+    forbidden_markers:
+      - "[US_HARNESS][FAIL]"
+
+  - name: kis_rate_limit_retry
+    description: "KIS rate limit 상황에서 retry 동작 확인 (offline)"
+    command: "python -m trader.us.harness.scenarios.kis_rate_limit_retry"
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      DRY_RUN: "1"
+    expected_markers:
+      - "[US_HARNESS][PASS]"
+    forbidden_markers:
+      - "[US_HARNESS][FAIL]"
+      - "Traceback"

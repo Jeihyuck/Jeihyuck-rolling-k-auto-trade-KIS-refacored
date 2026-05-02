@@ -1,0 +1,36 @@
+# us_market_holidays.yaml — 미국 증시 휴장일 정의
+# NYSE/NASDAQ 기준
+# full_close: 완전 휴장
+# early_close: 조기 마감 (13:00 ET)
+
+full_close:
+  # 2026
+  - "2026-01-01"  # New Year's Day
+  - "2026-01-19"  # MLK Day
+  - "2026-02-16"  # Presidents' Day
+  - "2026-04-03"  # Good Friday
+  - "2026-05-25"  # Memorial Day
+  - "2026-06-19"  # Juneteenth
+  - "2026-07-03"  # Independence Day (observed)
+  - "2026-09-07"  # Labor Day
+  - "2026-11-26"  # Thanksgiving Day
+  - "2026-12-25"  # Christmas Day
+  # 2027
+  - "2027-01-01"  # New Year's Day
+  - "2027-01-18"  # MLK Day
+  - "2027-02-15"  # Presidents' Day
+  - "2027-03-26"  # Good Friday
+  - "2027-05-31"  # Memorial Day
+  - "2027-06-19"  # Juneteenth
+  - "2027-07-05"  # Independence Day (observed)
+  - "2027-09-06"  # Labor Day
+  - "2027-11-25"  # Thanksgiving Day
+  - "2027-12-24"  # Christmas Day (observed)
+
+early_close:
+  # 2026
+  - "2026-11-27"  # Day after Thanksgiving
+  - "2026-12-24"  # Christmas Eve
+  # 2027
+  - "2027-11-26"  # Day after Thanksgiving
+  - "2027-12-31"  # New Year's Eve

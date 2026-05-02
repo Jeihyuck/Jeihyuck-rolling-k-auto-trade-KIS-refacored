@@ -1,0 +1,112 @@
+name: US Agent (Paper Trading)
+
+on:
+  schedule:
+    # Prep candidates (EDT 09:00): UTC 13:00 / UTC 14:00
+    - cron: "0 13 * * 1-5"
+    - cron: "0 14 * * 1-5"
+    # Trade-AM candidates (EDT 09:30): UTC 13:30 / UTC 14:30
+    - cron: "30 13 * * 1-5"
+    - cron: "30 14 * * 1-5"
+    # Trade-PM candidates (EDT 12:30): UTC 16:30 / UTC 17:30
+    - cron: "30 16 * * 1-5"
+    - cron: "30 17 * * 1-5"
+    # Trade-Close candidates (EDT 15:55): UTC 19:55 / UTC 20:55
+    - cron: "55 19 * * 1-5"
+    - cron: "55 20 * * 1-5"
+    # Report candidates (EDT 17:00): UTC 21:00 / UTC 22:00
+    - cron: "0 21 * * 1-5"
+    - cron: "0 22 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "실행 모드 (prep/trade-am/trade-pm/trade-close/report)"
+        required: true
+        default: "prep"
+        type: choice
+        options: [prep, trade-am, trade-pm, trade-close, report, open, mid, close]
+      offline:
+        description: "오프라인 모드 (true=KIS HTTP 차단)"
+        required: false
+        default: "true"
+        type: boolean
+
+concurrency:
+  group: us-agent-paper-trading
+  cancel-in-progress: false
+
+jobs:
+  trade:
+    name: "US Paper Trade — ${{ github.event.inputs.mode || 'scheduled' }}"
+    runs-on: ubuntu-latest
+
+    env:
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      ALLOW_REAL_ORDER: "0"
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      PYTHONPATH: "."
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine mode from schedule
+        id: mode
+        run: |
+          INPUT_MODE="${{ github.event.inputs.mode }}"
+          if [ -n "$INPUT_MODE" ]; then
+            echo "mode=$INPUT_MODE" >> "$GITHUB_OUTPUT"
+          else
+            python -m trader.us.runner.mode_resolver >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set offline flag
+        id: offline
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.inputs.offline }}" = "false" ]; then
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=--offline" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run dispatcher
+        env:
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+          CANO: ${{ secrets.CANO }}
+          ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+          PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+          KIS_TOKEN_FILE: "/tmp/kis_token.json"
+        run: |
+          python -m trader.us.runner.dispatcher \
+            --mode ${{ steps.mode.outputs.mode }} \
+            --env practice \
+            ${{ steps.offline.outputs.flag }}
+
+      - name: Upload run logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-agent-paper-logs-${{ github.run_id }}
+          path: |
+            /tmp/*.log
+            /tmp/kis_token.json
+          if-no-files-found: ignore
+          retention-days: 7
