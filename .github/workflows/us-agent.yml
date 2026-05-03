@@ -15,6 +15,7 @@ name: "US Agent Manual"
           - trade-afternoon
           - trade-close
           - report
+          - kis-diag
       dry_run:
         description: "DRY_RUN (true = no order submission)"
         required: false

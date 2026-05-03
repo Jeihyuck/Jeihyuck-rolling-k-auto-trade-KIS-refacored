@@ -212,7 +212,7 @@ def check_pending_order(symbol: str, side: str) -> None:
     try:
         from trader.us.db.repos import has_pending_order
         if has_pending_order(symbol):
-            _block("pending_order_exists", symbol=symbol)
+            _block("pending_order_exists", symbol=symbol, side=side)
     except RiskGateBlocked:
         raise
     except Exception as exc:
@@ -297,22 +297,24 @@ def assert_order_allowed(
                            symbol=symbol, qty=qty, available_qty=available_qty)
             except (TypeError, ValueError):
                 pass
+        # SELL 전용: 미체결 주문 존재 시 매도 차단
+        check_pending_order(symbol, side)
+    else:
+        # BUY 전용 체크
+        # 예산 기반 차단 (US_PAPER_MAX_CAPITAL_KRW 기준 5천만원 환산)
+        check_us_capital_budget(notional_usd, available_cash_usd, symbol=symbol)
 
-    # 예산 기반 차단 (US_PAPER_MAX_CAPITAL_KRW 기준 5천만원 환산)
-    check_us_capital_budget(notional_usd, available_cash_usd, symbol=symbol)
+        check_notional(notional_usd, symbol=symbol)
+        check_daily_notional(notional_usd, current_daily_notional_usd, symbol=symbol)
+        check_position_count(current_position_count, symbol=symbol)
+        check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol)
+        check_cash_buffer(available_cash_usd, notional_usd, symbol=symbol)
 
-    check_notional(notional_usd, symbol=symbol)
-    check_daily_notional(notional_usd, current_daily_notional_usd, symbol=symbol)
-    check_position_count(current_position_count, symbol=symbol)
-    check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol)
-    check_cash_buffer(available_cash_usd, notional_usd, symbol=symbol)
+        if existing_order_keys is not None and client_order_key:
+            check_duplicate(client_order_key, existing_order_keys)
 
-    if existing_order_keys is not None and client_order_key:
-        check_duplicate(client_order_key, existing_order_keys)
-
-    # 미국장 전용 추가 검증
-    check_same_day_rebuy(symbol, side)
-    check_pending_order(symbol, side)
-    check_entry_cutoff(side, now=now)
+        check_same_day_rebuy(symbol, side)
+        check_pending_order(symbol, side)
+        check_entry_cutoff(side, now=now)
 
     _pass(symbol, notional_usd)

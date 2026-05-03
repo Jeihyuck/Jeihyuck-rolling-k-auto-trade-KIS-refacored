@@ -103,8 +103,18 @@ class USDataProvider:
         raw = self._get_client().get_us_balance()
         return raw
 
-    def get_orderable_cash(self) -> float:
+    def get_orderable_cash(
+        self,
+        symbol: str = "AAPL",
+        exchange: str = "NASDAQ",
+        price: float = 100.0,
+    ) -> float:
         """주문 가능 현금 (USD).
+
+        Args:
+            symbol:   종목 코드 (KIS 모의투자 필수 파라미터).
+            exchange: 거래소. KIS API OVRS_EXCG_CD 로 변환.
+            price:    호가 (OVRS_ORD_UNPR). KIS API 필수 파라미터.
 
         후보 필드 (KIS 환경에 따라 다를 수 있음):
         frcr_ord_psbl_amt1, ord_psbl_cash, ovrs_ord_psbl_amt,
@@ -113,7 +123,9 @@ class USDataProvider:
         if self._offline:
             return 1000.0
         try:
-            raw = self._get_client().get_us_orderable_cash()
+            raw = self._get_client().get_us_orderable_cash(
+                symbol=symbol, exchange=exchange, price=price
+            )
         except Exception as exc:
             logger.warning("[US_DATA][WARN] get_orderable_cash API failed: %s", exc)
             return 0.0

@@ -37,6 +37,11 @@ name: "US Trade Afternoon"
         description: "Manual interval seconds override. Empty means default."
         required: false
         default: ""
+      smoke_loop:
+        description: "Quick smoke loop: force --offline, max_ticks=3, interval=1, max_minutes=10. Overrides other flags."
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: us-trade-afternoon-${{ github.ref_name }}
@@ -296,20 +301,29 @@ jobs:
             INTERVAL_SEC="${US_SESSION_INTERVAL_SEC:-300}"
 
             if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+              # smoke_loop は他のフラグより優先
+              if [ "${{ inputs.smoke_loop || 'false' }}" = "true" ]; then
                 OFFLINE_FLAG="--offline"
-              fi
-              if [ -n "${{ inputs.force_now }}" ]; then
-                FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
-              fi
-              if [ -n "${{ inputs.max_ticks }}" ] && [ "${{ inputs.max_ticks }}" != "0" ]; then
-                MAX_TICKS_FLAG="--max-ticks ${{ inputs.max_ticks }}"
-              fi
-              if [ -n "${{ inputs.manual_max_minutes }}" ]; then
-                MAX_MINUTES="${{ inputs.manual_max_minutes }}"
-              fi
-              if [ -n "${{ inputs.manual_interval_sec }}" ]; then
-                INTERVAL_SEC="${{ inputs.manual_interval_sec }}"
+                MAX_TICKS_FLAG="--max-ticks 3"
+                MAX_MINUTES="10"
+                INTERVAL_SEC="1"
+                echo "[US_TRADE_AFTERNOON][SMOKE_LOOP] mode activated: offline max_ticks=3 interval=1 max_minutes=10"
+              else
+                if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+                  OFFLINE_FLAG="--offline"
+                fi
+                if [ -n "${{ inputs.force_now }}" ]; then
+                  FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+                fi
+                if [ -n "${{ inputs.max_ticks }}" ] && [ "${{ inputs.max_ticks }}" != "0" ]; then
+                  MAX_TICKS_FLAG="--max-ticks ${{ inputs.max_ticks }}"
+                fi
+                if [ -n "${{ inputs.manual_max_minutes }}" ]; then
+                  MAX_MINUTES="${{ inputs.manual_max_minutes }}"
+                fi
+                if [ -n "${{ inputs.manual_interval_sec }}" ]; then
+                  INTERVAL_SEC="${{ inputs.manual_interval_sec }}"
+                fi
               fi
             fi
 

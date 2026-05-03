@@ -145,17 +145,29 @@ class KisUSClient:
         }
         return self._get(tr["path"], headers=headers, params=params)
 
-    def get_us_orderable_cash(self) -> dict:
-        """해외주식 주문 가능 현금 조회."""
+    def get_us_orderable_cash(
+        self,
+        symbol: str = "AAPL",
+        exchange: str = "NASDAQ",
+        price: float = 100.0,
+    ) -> dict:
+        """해외주식 주문 가능 현금 조회.
+
+        Args:
+            symbol:   종목 코드 (ITEM_CD). 모의투자에서 필수.
+            exchange: 거래소 코드. get_order_exchange_code_for_api() 로 변환.
+            price:    호가 (OVRS_ORD_UNPR). 소수점 2자리 문자열.
+        """
         self._assert_not_offline("get_us_orderable_cash")
         tr = get_tr_info("us_orderable_cash")
         headers = self._build_headers(tr["tr_id"])
+        excg_code = get_order_exchange_code_for_api(exchange)
         params = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
-            "OVRS_EXCG_CD": "NASD",
-            "OVRS_ORD_UNPR": "0",
-            "ITEM_CD": "",
+            "OVRS_EXCG_CD": excg_code,
+            "OVRS_ORD_UNPR": f"{price:.2f}",
+            "ITEM_CD": symbol,
         }
         return self._get(tr["path"], headers=headers, params=params)
 
@@ -231,7 +243,9 @@ class KisUSClient:
             "ORD_STRT_DT": today,
             "ORD_END_DT": today,
             "SLL_BUY_DVSN": "00",
+            "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "NASD",
+            "SORT_SQN": "DS",
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }

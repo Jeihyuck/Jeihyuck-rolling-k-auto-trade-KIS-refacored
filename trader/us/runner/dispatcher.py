@@ -32,6 +32,7 @@ MODES = (
     "trade-pm",
     "trade-afternoon",
     "trade-close",
+    "kis-diag",
 )
 
 
@@ -96,6 +97,11 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
         from trader.us.runner.trade_tick_runner import run_trade_tick
         r = run_trade_tick(session="manual", env=env, offline=offline, force_now=force_now)
         return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS", "SKIP") else 1
+
+    if mode == "kis-diag":
+        from trader.us.runner.kis_diag_runner import run_kis_diag
+        r = run_kis_diag(env=env, offline=offline)
+        return 0 if r.get("status") in ("OK", "PARTIAL", "SKIP") else 1
 
     logger.error("[US_DISPATCHER][ERROR] unknown mode=%s", mode)
     return 1

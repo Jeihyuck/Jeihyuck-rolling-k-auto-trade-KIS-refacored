@@ -104,26 +104,38 @@ def run_trade_tick(
     if offline:
         available_cash_usd = 10000.0
     else:
+        # DRY_RUN 모드: 환경변수 fallback 먼저 시도
+        dry_run_mode = os.getenv("DRY_RUN", "0") == "1"
         try:
-            available_cash_usd = provider.get_orderable_cash()
-        except Exception:
-            # fallback: balance에서 현금성 필드 탐색
-            try:
-                balance = provider.get_balance()
-                for _k in ("ord_psbl_cash", "ovrs_ord_psbl_amt", "orderable_cash",
-                           "cash", "psbl_amt", "frcr_pchs_amt1"):
-                    _v = balance.get(_k)
-                    if _v is not None:
-                        try:
-                            available_cash_usd = float(_v)
-                            break
-                        except (ValueError, TypeError):
-                            pass
-                else:
+            available_cash_usd = provider.get_orderable_cash(
+                symbol="AAPL", exchange="NASDAQ", price=100.0
+            )
+        except Exception as exc:
+            if dry_run_mode:
+                fallback = float(os.getenv("US_DRY_RUN_CASH_FALLBACK_USD", "10000.0"))
+                logger.warning(
+                    "[US_TICK][WARN] orderable_cash failed in DRY_RUN, using fallback=%.2f: %s",
+                    fallback, exc,
+                )
+                available_cash_usd = fallback
+            else:
+                # fallback: balance에서 현금성 필드 탐색
+                try:
+                    balance = provider.get_balance()
+                    for _k in ("ord_psbl_cash", "ovrs_ord_psbl_amt", "orderable_cash",
+                               "cash", "psbl_amt", "frcr_pchs_amt1"):
+                        _v = balance.get(_k)
+                        if _v is not None:
+                            try:
+                                available_cash_usd = float(_v)
+                                break
+                            except (ValueError, TypeError):
+                                pass
+                    else:
+                        available_cash_usd = 0.0
+                except Exception as exc2:
+                    logger.warning("[US_TICK][WARN] cash fetch failed: %s", exc2)
                     available_cash_usd = 0.0
-            except Exception as exc2:
-                logger.warning("[US_TICK][WARN] cash fetch failed: %s", exc2)
-                available_cash_usd = 0.0
 
     budget = resolve_us_order_budget(available_cash_usd)
     effective_budget = budget["effective_order_budget_usd"]
