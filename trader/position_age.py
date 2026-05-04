@@ -47,7 +47,14 @@ def to_kst_date(value: Any) -> Optional[date]:
             return None
         # ISO format "YYYY-MM-DD" or "YYYY-MM-DDT..."
         try:
-            return datetime.fromisoformat(s).date()
+            dt = datetime.fromisoformat(s)
+            # timezone이 있으면 반드시 KST로 변환 후 date 추출
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(KST)
+            else:
+                # timezone 정보가 없으면 KST로 localize
+                dt = KST.localize(dt)
+            return dt.date()
         except ValueError:
             pass
         # "YYYYMMDD"
