@@ -37,11 +37,12 @@ def route_order(
     total_portfolio_usd: float = 1000.0,
     available_cash_usd: float = 1000.0,
     kis_client: Any | None = None,
+    signal_only: bool = False,
 ) -> dict:
     """Order intent를 라우팅한다.
 
     Returns:
-        {"status": "DRY_RUN"|"ACK"|"BLOCKED"|"REJECT", ...}
+        {"status": "DRY_RUN"|"ACK"|"BLOCKED"|"REJECT"|"SIGNAL_ONLY", ...}
     """
     from trader.us.db.repos import (
         save_order_intent, save_dry_run_order, save_order_ack, save_order_reject,
@@ -61,6 +62,21 @@ def route_order(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
         symbol, side, qty, float(intent.get("notional_usd", 0)), order_key,
     )
+
+    # Signal-only mode: 신호만 생성, KIS 주문 차단
+    if signal_only:
+        logger.info(
+            "[US_ORDER][SIGNAL_ONLY] symbol=%s side=%s qty=%s reason=KIS_ORDER_DISABLED_SIGNAL_ONLY",
+            symbol, side, qty,
+        )
+        return {
+            "status": "SIGNAL_ONLY",
+            "reason": "KIS_ORDER_DISABLED_SIGNAL_ONLY",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "intent": intent,
+        }
 
     # 1. intent DB 저장
     save_order_intent(intent)

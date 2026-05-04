@@ -44,6 +44,9 @@ def run_trade_tick(
     env: str = "practice",
     offline: bool = False,
     force_now: str | None = None,
+    run_mode: str | None = None,
+    signal_only: bool = False,
+    kis_order_allowed: bool = True,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -64,7 +67,10 @@ def run_trade_tick(
     Returns:
         {"status": "OK"|"SKIP"|"ERROR"|"OK_WITH_WARNINGS", ...}
     """
-    logger.info("[US_TICK][START] session=%s env=%s offline=%s", session, env, offline)
+    logger.info(
+        "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s",
+        session, env, offline, run_mode, signal_only,
+    )
 
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
     from trader.us.market_calendar import now_ny, is_us_trading_day, market_phase
@@ -85,9 +91,16 @@ def run_trade_tick(
     )
 
     # ── 거래일 확인 ───────────────────────────────────────────────────────────
+    # signal_only 모드에서는 거래일이 아니어도 계속 진행 (신호만 생성)
     if not is_us_trading_day(now.date()):
-        logger.info("[US_TICK][SKIP] not_trading_day date=%s", now.date())
-        return {"status": "SKIP", "reason": "not_trading_day"}
+        if not signal_only:
+            logger.info("[US_TICK][SKIP] not_trading_day date=%s", now.date())
+            return {"status": "SKIP", "reason": "not_trading_day"}
+        else:
+            logger.info(
+                "[US_TICK][SIGNAL_ONLY] non_trading_day date=%s run_mode=%s",
+                now.date(), run_mode or "NON_TRADING_SIGNAL_ONLY",
+            )
 
     # ── 장 phase 확인 ─────────────────────────────────────────────────────────
     phase = market_phase(now)
@@ -159,7 +172,7 @@ def run_trade_tick(
     if not offline:
         try:
             from trader.us.execution.fills import get_fills_today
-            fills_today = get_fills_today(provider=provider)
+            fills_today = get_fills_today(provider=provider, signal_only=signal_only)
             logger.info("[US_FILLS][OK] count=%d", len(fills_today))
         except Exception as exc:
             logger.warning("[US_TICK][WARN] fills fetch failed: %s", exc)
@@ -270,6 +283,7 @@ def run_trade_tick(
                 current_position_count=position_count,
                 total_portfolio_usd=max(effective_budget, 1000.0),
                 available_cash_usd=max(effective_budget - daily_notional, 0.0),
+                signal_only=signal_only,
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):
@@ -283,14 +297,18 @@ def run_trade_tick(
     ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
     blocked_cnt = sum(1 for o in orders if o["status"] == "BLOCKED")
+    signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
 
     logger.info(
-        "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d error=%d",
-        len(orders), ack_cnt, dry_cnt, blocked_cnt, err_cnt,
+        "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d signal_only=%d error=%d",
+        len(orders), ack_cnt, dry_cnt, blocked_cnt, signal_only_cnt, err_cnt,
     )
 
-    status = "OK_WITH_WARNINGS" if err_cnt > 0 else "OK"
+    if signal_only:
+        status = "OK_WITH_WARNINGS_SIGNAL_ONLY" if err_cnt > 0 else "OK_SIGNAL_ONLY"
+    else:
+        status = "OK_WITH_WARNINGS" if err_cnt > 0 else "OK"
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
     return {
@@ -300,8 +318,12 @@ def run_trade_tick(
         "ack": ack_cnt,
         "dry_run": dry_cnt,
         "blocked": blocked_cnt,
+        "signal_only": signal_only_cnt,
         "errors": err_cnt,
         "budget": budget,
+        "run_mode": run_mode,
+        "signal_only_mode": signal_only,
+        "kis_order_allowed": kis_order_allowed,
     }
 
 
@@ -344,6 +366,8 @@ def main() -> None:
     parser.add_argument("--env", default="practice")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--force-now", dest="force_now", default=None)
+    parser.add_argument("--run-mode", dest="run_mode", default=None)
+    parser.add_argument("--signal-only", dest="signal_only", action="store_true")
     args = parser.parse_args()
 
     result = run_trade_tick(
@@ -351,6 +375,8 @@ def main() -> None:
         env=args.env,
         offline=args.offline,
         force_now=args.force_now,
+        run_mode=args.run_mode,
+        signal_only=args.signal_only,
     )
     if result["status"] == "ERROR":
         sys.exit(1)

@@ -186,6 +186,13 @@ class KisUSClient:
         """해외주식 매수 주문 (모의투자)."""
         us_cfg.assert_us_paper_order_allowed()
         self._assert_not_offline("place_us_buy_order")
+        
+        # Final safety guard: signal-only mode
+        if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
+            raise RuntimeError(
+                "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
+            )
+        
         tr = get_tr_info("us_buy_order")
         return self._place_order(tr, symbol, exchange, qty, price, order_type)
 
@@ -200,6 +207,13 @@ class KisUSClient:
         """해외주식 매도 주문 (모의투자)."""
         us_cfg.assert_us_paper_order_allowed()
         self._assert_not_offline("place_us_sell_order")
+        
+        # Final safety guard: signal-only mode
+        if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
+            raise RuntimeError(
+                "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS order API disabled in signal-only mode"
+            )
+        
         tr = get_tr_info("us_sell_order")
         return self._place_order(tr, symbol, exchange, qty, price, order_type)
 

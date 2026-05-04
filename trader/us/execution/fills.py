@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def get_fills_today(provider: Any | None = None) -> list[dict]:
+def get_fills_today(provider: Any | None = None, signal_only: bool = False) -> list[dict]:
     """당일 체결 내역 반환.
 
     Args:
         provider: USDataProvider 인스턴스 (None이면 offline 기본 provider 사용)
+        signal_only: True이면 KIS API 호출 없이 DB 데이터만 사용
 
     Returns:
         체결 목록 [{"symbol": ..., "qty": ..., "price": ..., ...}]
@@ -23,6 +25,18 @@ def get_fills_today(provider: Any | None = None) -> list[dict]:
     if provider is None:
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
+
+    # signal_only 모드: KIS 호출 차단, DB 데이터만 사용
+    if signal_only or os.getenv("US_SIGNAL_ONLY") == "1":
+        logger.info("[US_FILLS][SIGNAL_ONLY] skipping KIS fill query, using DB-only")
+        try:
+            from trader.us.db.repos import load_today_fills
+            db_fills = load_today_fills()
+            logger.info("[US_FILLS][DB_ONLY] count=%d", len(db_fills))
+            return db_fills
+        except Exception as exc:
+            logger.warning("[US_FILLS][DB_ONLY][WARN] %s", exc)
+            return []
 
     if getattr(provider, "_offline", False):
         logger.debug("[US_FILLS][OFFLINE] returning stub fills")

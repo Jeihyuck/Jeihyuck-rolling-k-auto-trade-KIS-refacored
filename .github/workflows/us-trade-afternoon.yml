@@ -167,6 +167,33 @@ jobs:
           path: repo
           fetch-depth: 1
 
+      - name: Resolve US Afternoon run mode
+        id: run_mode
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          from trader.us.market_calendar import now_ny, is_us_trading_day
+          now = now_ny()
+          is_td = is_us_trading_day(now.date())
+          if is_td:
+              print("run_mode=TRADE")
+              print("signal_only=0")
+              print("order_allowed=1")
+              print("kis_order_allowed=1")
+              print("kis_data_allowed=1")
+              print("non_trading_day=0")
+              print("reason=trading_day")
+          else:
+              print("run_mode=NON_TRADING_SIGNAL_ONLY")
+              print("signal_only=1")
+              print("order_allowed=0")
+              print("kis_order_allowed=0")
+              print("kis_data_allowed=0")
+              print("non_trading_day=1")
+              print("reason=non_trading_day_signal_only")
+          PY
+
       - name: Verify checkout path
         working-directory: .
         run: |
@@ -175,9 +202,9 @@ jobs:
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
           test -d repo/trader || { echo "::error::repo/trader missing"; exit 1; }
           mkdir -p repo/artifacts repo/reports/us_daily
-          {
-            echo "[US_TRADE_AFTERNOON][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
+          {            echo "[US_TRADE_AFTERNOON][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
             echo "[US_TRADE_AFTERNOON][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} session_window=1230-1550"
+            echo "[US_TRADE_AFTERNOON][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -291,6 +318,13 @@ jobs:
         if: steps.phase_guard.outputs.should_run == '1'
         timeout-minutes: 210
         working-directory: repo
+        env:
+          US_RUN_MODE: ${{ steps.run_mode.outputs.run_mode || 'TRADE' }}
+          US_SIGNAL_ONLY: ${{ steps.run_mode.outputs.signal_only || '0' }}
+          US_ORDER_ALLOWED: ${{ steps.run_mode.outputs.order_allowed || '1' }}
+          US_KIS_ORDER_ALLOWED: ${{ steps.run_mode.outputs.kis_order_allowed || '1' }}
+          US_KIS_DATA_ALLOWED: ${{ steps.run_mode.outputs.kis_data_allowed || '1' }}
+          US_NON_TRADING_DAY: ${{ steps.run_mode.outputs.non_trading_day || '0' }}
         run: |
           set -euo pipefail
           {
@@ -329,13 +363,22 @@ jobs:
 
             echo "[US_TRADE_AFTERNOON][START]"
             echo "[US_TRADE_AFTERNOON][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
+            echo "[US_TRADE_AFTERNOON][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
             echo "[US_TRADE_AFTERNOON][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES} INTERVAL_SEC=${INTERVAL_SEC}"
+
+            RUN_MODE_FLAG="--run-mode ${US_RUN_MODE}"
+            SIGNAL_ONLY_FLAG=""
+            if [ "${US_SIGNAL_ONLY}" = "1" ]; then
+              SIGNAL_ONLY_FLAG="--signal-only"
+            fi
 
             python -m trader.us.runner.trade_session_runner \
               --session afternoon \
               --env practice \
               --max-minutes "${MAX_MINUTES}" \
               --interval-sec "${INTERVAL_SEC}" \
+              ${RUN_MODE_FLAG} \
+              ${SIGNAL_ONLY_FLAG} \
               ${FORCE_NOW_FLAG} \
               ${MAX_TICKS_FLAG} \
               ${OFFLINE_FLAG}
