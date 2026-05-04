@@ -32,7 +32,7 @@ def test_force_now_am_max_ticks_3():
 
     tick_calls = []
 
-    def _fake_tick(session, env, offline, force_now):
+    def _fake_tick(session, env, offline, force_now, **kwargs):
         tick_calls.append(force_now)
         return {"status": "OK", "orders": []}
 
@@ -67,7 +67,7 @@ def test_force_now_afternoon_max_ticks_3():
 
     tick_calls = []
 
-    def _fake_tick(session, env, offline, force_now):
+    def _fake_tick(session, env, offline, force_now, **kwargs):
         tick_calls.append((session, force_now))
         return {"status": "OK", "orders": []}
 
@@ -100,7 +100,7 @@ def test_force_now_single_tick_when_max_ticks_zero():
 
     tick_calls = []
 
-    def _fake_tick(session, env, offline, force_now):
+    def _fake_tick(session, env, offline, force_now, **kwargs):
         tick_calls.append(force_now)
         return {"status": "OK", "orders": []}
 
@@ -132,7 +132,7 @@ def test_force_now_friday_no_trading_day_skip():
 
     tick_calls = []
 
-    def _fake_tick(session, env, offline, force_now):
+    def _fake_tick(session, env, offline, force_now, **kwargs):
         tick_calls.append(force_now)
         return {"status": "OK", "orders": []}
 
@@ -179,7 +179,7 @@ def test_force_now_saturday_trading_day_skip():
 
     tick_calls = []
 
-    def _fake_tick(session, env, offline, force_now):
+    def _fake_tick(session, env, offline, force_now, **kwargs):
         tick_calls.append(force_now)
         return {"status": "SKIP", "reason": "not_trading_day"}
 

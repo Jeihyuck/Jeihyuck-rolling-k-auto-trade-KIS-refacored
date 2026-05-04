@@ -59,13 +59,16 @@ class TestFillsOffline:
         """offline 모드에서 fills는 빈 리스트."""
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
-        fills = get_fills_today(provider=provider)
-        assert fills == []
+        result = get_fills_today(provider=provider)
+        assert result["status"] == "OK"
+        assert result["fills"] == []
 
     def test_fills_default_offline(self):
         """provider=None이면 offline stub."""
-        fills = get_fills_today(provider=None)
-        assert isinstance(fills, list)
+        result = get_fills_today(provider=None)
+        assert isinstance(result, dict)
+        assert result["status"] == "OK"
+        assert isinstance(result["fills"], list)
 
 
 class TestReconcileOffline:

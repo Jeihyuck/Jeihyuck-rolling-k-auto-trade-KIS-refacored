@@ -393,10 +393,28 @@ jobs:
         run: |
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
           grep -E "\[US_TRADE_AM\]\[TRIGGER\]" artifacts/${US_LOG_FILE} >/dev/null || echo "::warning::missing trigger marker"
-          if grep -F "Traceback" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
-            echo "::error::Traceback detected in US AM log"
-            exit 1
-          fi
+          
+          # Enhanced error detection for US trade contract
+          ERROR_PATTERNS=(
+            "Traceback"
+            "\[US_KIS\]\[HTTP_FAIL_FINAL\]"
+            "\[US_FILLS\]\[ERROR\]"
+            "\[US_DATA\]\[FALLBACK_DB_EMPTY\]"
+            "\[US_DATA\]\[FALLBACK_STALE_EMPTY\]"
+            "\[US_ENTRY\]\[ERROR\]"
+            "\[US_TICK\]\[ERROR\]"
+            "status.*ERROR"
+            "HTTP 500"
+            "500 Internal Server Error"
+          )
+          
+          for pattern in "${ERROR_PATTERNS[@]}"; do
+            if grep -E "$pattern" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "::error::Error pattern detected in AM trade: $pattern"
+              grep -n -E "$pattern" artifacts/${US_LOG_FILE} | head -5
+              exit 1
+            fi
+          done
 
       - name: Upload US artifacts
         if: always()

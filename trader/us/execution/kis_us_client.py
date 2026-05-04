@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -37,6 +38,10 @@ class KisUSClientError(Exception):
     """KIS US API 오류."""
 
 
+class KisUSTemporaryError(KisUSClientError):
+    """KIS US API 일시적 오류 (재시도 가능)."""
+
+
 class KisUSClient:
     """KIS 해외주식 모의투자 API 전용 클라이언트.
 
@@ -57,6 +62,7 @@ class KisUSClient:
         self._app_secret = us_cfg.KIS_APP_SECRET
         self._cano = us_cfg.CANO
         self._acnt_prdt_cd = us_cfg.ACNT_PRDT_CD
+        self._last_request_time: dict[str, float] = {}  # endpoint별 rate limiting
 
     # ------------------------------------------------------------------
     # Auth
@@ -285,23 +291,148 @@ class KisUSClient:
         from trader.us.symbols import get_quote_exchange_code
         return get_quote_exchange_code(exchange)
 
-    def _get(self, path: str, headers: dict, params: dict) -> dict:
+    def _get_rate_limit_for_path(self, path: str) -> tuple[float, float]:
+        """경로별 rate limit 반환 (min_sec, max_sec)."""
+        if "dailyprice" in path:
+            return (0.4, 0.7)
+        elif "/quotations/price" in path:
+            return (0.3, 0.5)
+        elif "order" in path.lower():
+            return (1.0, 1.0)
+        else:
+            return (0.7, 0.7)  # trading 기본
+
+    def _apply_rate_limit(self, path: str) -> None:
+        """API 호출 전 rate limiting 적용."""
+        endpoint_key = path.split("?")[0]  # query string 제거
+        last_time = self._last_request_time.get(endpoint_key, 0.0)
+        min_sec, max_sec = self._get_rate_limit_for_path(path)
+        interval = random.uniform(min_sec, max_sec)
+        
+        elapsed = time.time() - last_time
+        if elapsed < interval:
+            sleep_time = interval - elapsed
+            logger.debug(f"[US_KIS][RATE_LIMIT] path={path!r} sleep={sleep_time:.3f}s")
+            time.sleep(sleep_time)
+        
+        self._last_request_time[endpoint_key] = time.time()
+
+    def _is_temporary_error(self, err: Exception, data: dict | None = None) -> bool:
+        """일시적 오류인지 판단 (재시도 가능)."""
         import requests
-        url = self._base_url + path
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        self._check_rt_cd(data)
-        return data
+        
+        # HTTP 상태 코드
+        if isinstance(err, requests.exceptions.HTTPError):
+            if err.response is not None and err.response.status_code in (500, 429, 502, 503, 504):
+                return True
+        
+        # Timeout
+        if isinstance(err, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+            return True
+        
+        # KIS 메시지
+        if isinstance(err, KisUSClientError):
+            err_msg = str(err).lower()
+            if any(word in err_msg for word in ["초과", "egw002", "timeout", "temporarily"]):
+                return True
+        
+        # rt_cd 체크
+        if data:
+            msg1 = data.get("msg1", "").lower()
+            if any(word in msg1 for word in ["초과", "egw002", "일시적"]):
+                return True
+        
+        return False
+
+    def _get(self, path: str, headers: dict, params: dict) -> dict:
+        """GET 요청 with retry/backoff."""
+        import requests
+        
+        max_attempts = 5
+        backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._apply_rate_limit(path)
+                
+                url = self._base_url + path
+                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                self._check_rt_cd(data)
+                return data
+            
+            except Exception as err:
+                is_temp = self._is_temporary_error(err, None)
+                
+                if is_temp and attempt < max_attempts:
+                    backoff_sec = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
+                    jitter = random.uniform(0, 0.3 * backoff_sec)
+                    sleep_time = backoff_sec + jitter
+                    
+                    logger.warning(
+                        f"[US_KIS][RETRY] attempt={attempt}/{max_attempts} "
+                        f"path={path!r} error={err!r} backoff={sleep_time:.2f}s"
+                    )
+                    time.sleep(sleep_time)
+                    continue
+                
+                # 최종 실패
+                logger.error(
+                    f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
+                    f"path={path!r} error={err!r} temporary={is_temp}"
+                )
+                if is_temp:
+                    raise KisUSTemporaryError(f"GET {path} failed after {attempt} attempts: {err}") from err
+                else:
+                    raise
+        
+        raise KisUSTemporaryError(f"GET {path} exhausted {max_attempts} attempts")
 
     def _post(self, path: str, headers: dict, body: dict) -> dict:
+        """POST 요청 with retry/backoff."""
         import requests
-        url = self._base_url + path
-        resp = requests.post(url, headers=headers, json=body, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        self._check_rt_cd(data)
-        return data
+        
+        max_attempts = 5
+        backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._apply_rate_limit(path)
+                
+                url = self._base_url + path
+                resp = requests.post(url, headers=headers, json=body, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                self._check_rt_cd(data)
+                return data
+            
+            except Exception as err:
+                is_temp = self._is_temporary_error(err, None)
+                
+                if is_temp and attempt < max_attempts:
+                    backoff_sec = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
+                    jitter = random.uniform(0, 0.3 * backoff_sec)
+                    sleep_time = backoff_sec + jitter
+                    
+                    logger.warning(
+                        f"[US_KIS][RETRY] attempt={attempt}/{max_attempts} "
+                        f"path={path!r} error={err!r} backoff={sleep_time:.2f}s"
+                    )
+                    time.sleep(sleep_time)
+                    continue
+                
+                # 최종 실패
+                logger.error(
+                    f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
+                    f"path={path!r} error={err!r} temporary={is_temp}"
+                )
+                if is_temp:
+                    raise KisUSTemporaryError(f"POST {path} failed after {attempt} attempts: {err}") from err
+                else:
+                    raise
+        
+        raise KisUSTemporaryError(f"POST {path} exhausted {max_attempts} attempts")
 
     def _check_rt_cd(self, data: dict) -> None:
         rt_cd = data.get("rt_cd")

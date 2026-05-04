@@ -9,9 +9,10 @@ import re
 US_CODE_DIR = pathlib.Path("trader/us")
 
 # KR 전용 테이블명 (us_ 접두사 없는)
+# Note: price_daily는 market 컬럼으로 KR/US 구분하는 공유 테이블이므로 제외
 KR_TABLE_PATTERNS = [
-    r"INSERT\s+INTO\s+(?!us_)(orders|positions|fills|signals|runs|ledger_events|price_daily|pb1_watchlist)",
-    r"SELECT\s+.*\s+FROM\s+(?!us_)(orders|positions|fills|signals|runs|ledger_events|price_daily|pb1_watchlist)",
+    r"INSERT\s+INTO\s+(?!us_)(orders|positions|fills|signals|runs|ledger_events|pb1_watchlist)",
+    r"SELECT\s+.*\s+FROM\s+(?!us_)(orders|positions|fills|signals|runs|ledger_events|pb1_watchlist)",
     r"UPDATE\s+(?!us_)(orders|positions|fills|signals|runs|ledger_events)",
     r"DELETE\s+FROM\s+(?!us_)(orders|positions|fills|signals|runs|ledger_events)",
 ]

@@ -265,9 +265,10 @@ def test_fills_signal_only_skips_kis_query():
         # Should not call KIS client
         mock_client.assert_not_called()
         
-        # Should return DB fills
-        assert len(result) == 1
-        assert result[0]["symbol"] == "AAPL"
+        # Should return DB fills with status
+        assert result["status"] == "OK"
+        assert len(result["fills"]) == 1
+        assert result["fills"][0]["symbol"] == "AAPL"
 
 
 def test_fills_signal_only_env_var_skips_kis_query():
@@ -290,8 +291,9 @@ def test_fills_signal_only_env_var_skips_kis_query():
         # Should not call KIS client
         mock_client.assert_not_called()
         
-        # Should return DB fills (empty in this case)
-        assert result == []
+        # Should return DB fills (empty in this case) with status
+        assert result["status"] == "OK"
+        assert result["fills"] == []
 
 
 # ============================================================================

@@ -36,10 +36,16 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     if not offline:
         try:
             from trader.us.execution.fills import get_fills_today
-            fills = get_fills_today(provider=provider)
-            logger.info("[US_TRADE_CLOSE][FILLS] count=%d", len(fills))
+            fills_result = get_fills_today(provider=provider)
+            if fills_result["status"] != "OK":
+                logger.error(
+                    "[US_TRADE_CLOSE][ERROR] fills failed: %s",
+                    fills_result.get("error", "unknown")
+                )
+            fills = fills_result["fills"]
+            logger.info("[US_TRADE_CLOSE][FILLS] count=%d status=%s", len(fills), fills_result["status"])
         except Exception as exc:
-            logger.error("[US_TRADE_CLOSE][ERROR] fills failed: %s", exc)
+            logger.error("[US_TRADE_CLOSE][ERROR] fills exception: %s", exc)
     else:
         logger.info("[US_TRADE_CLOSE][FILLS] offline — skipping KIS fills")
 

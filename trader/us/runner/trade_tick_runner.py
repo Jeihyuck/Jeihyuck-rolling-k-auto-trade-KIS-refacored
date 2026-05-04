@@ -172,10 +172,16 @@ def run_trade_tick(
     if not offline:
         try:
             from trader.us.execution.fills import get_fills_today
-            fills_today = get_fills_today(provider=provider, signal_only=signal_only)
-            logger.info("[US_FILLS][OK] count=%d", len(fills_today))
+            fills_result = get_fills_today(provider=provider, signal_only=signal_only)
+            if fills_result["status"] != "OK":
+                logger.error(
+                    "[US_TICK][ERROR] fills fetch failed: %s",
+                    fills_result.get("error", "unknown")
+                )
+            fills_today = fills_result["fills"]
+            logger.info("[US_FILLS][FETCHED] count=%d status=%s", len(fills_today), fills_result["status"])
         except Exception as exc:
-            logger.warning("[US_TICK][WARN] fills fetch failed: %s", exc)
+            logger.error("[US_TICK][ERROR] fills exception: %s", exc)
 
     # KIS fills + DB sold_today 합산
     from trader.us.db.repos import load_today_symbols_sold, save_fills, save_position_snapshot, save_reconcile_log
@@ -250,20 +256,73 @@ def run_trade_tick(
             now.strftime("%H:%M:%S"),
         )
     else:
-        try:
-            from trader.us.universe import get_all_tickers
-            tickers = get_all_tickers()
-            engine = _get_strategy_engine(env=env, offline=offline)
-            entry_intents = engine.evaluate_entries(
-                tickers=tickers,
-                provider=provider,
-                sold_today=sold_today,
-                available_cash_usd=effective_budget,
-                position_count=position_count,
-                now=now,
+        # prep status 확인 (locked watchlist contract)
+        from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+        
+        trade_date = now.strftime("%Y-%m-%d")
+        prep_status_info = load_latest_us_prep_status(trade_date)
+        prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
+        
+        logger.info(
+            "[US_ENTRY][PREP_STATUS] date=%s status=%s",
+            trade_date, prep_status
+        )
+        
+        # DEGRADED/ERROR 상태이면 new entry 차단
+        if prep_status in ("DEGRADED", "ERROR"):
+            logger.warning(
+                "[US_ENTRY][BLOCK] reason=prep_degraded_or_error status=%s",
+                prep_status
             )
-        except Exception as exc:
-            logger.warning("[US_ENTRY][EVAL][WARN] %s", exc)
+        else:
+            # locked watchlist 로드
+            try:
+                min_watchlist_count = int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10"))
+                allow_degraded = os.getenv("US_ALLOW_DEGRADED_IN_TRADE", "0") == "1"
+                
+                watchlist_rows = load_locked_us_watchlist(
+                    trade_date=trade_date,
+                    min_count=min_watchlist_count,
+                    allow_degraded=allow_degraded,
+                )
+                
+                if watchlist_rows:
+                    tickers = [
+                        {"symbol": row["symbol"], "exchange": row["exchange"]}
+                        for row in watchlist_rows
+                    ]
+                    logger.info(
+                        "[US_ENTRY][LOCKED_WATCHLIST] count=%d prep_status=%s",
+                        len(tickers), prep_status
+                    )
+                else:
+                    # fallback to get_all_tickers() only if allowed
+                    allow_fallback = os.getenv("US_ALLOW_FULL_UNIVERSE_FALLBACK", "0") == "1"
+                    if allow_fallback:
+                        logger.warning(
+                            "[US_ENTRY][FALLBACK] locked_watchlist empty, using get_all_tickers()"
+                        )
+                        from trader.us.universe import get_all_tickers
+                        tickers = get_all_tickers()
+                    else:
+                        logger.error(
+                            "[US_ENTRY][ERROR] locked_watchlist empty and fallback disabled"
+                        )
+                        tickers = []
+                
+                if tickers:
+                    engine = _get_strategy_engine(env=env, offline=offline)
+                    entry_intents = engine.evaluate_entries(
+                        tickers=tickers,
+                        provider=provider,
+                        sold_today=sold_today,
+                        available_cash_usd=effective_budget,
+                        position_count=position_count,
+                        now=now,
+                    )
+            except Exception as exc:
+                logger.warning("[US_ENTRY][EVAL][WARN] %s", exc)
+    
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
     # ── Order routing ─────────────────────────────────────────────────────────

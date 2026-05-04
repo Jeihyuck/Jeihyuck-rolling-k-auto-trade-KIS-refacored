@@ -11,7 +11,19 @@ import os
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import text
+
 logger = logging.getLogger(__name__)
+
+
+def _get_engine():
+    """SQLAlchemy engine 반환."""
+    try:
+        from trader.db.engine import get_engine as _get_engine_impl
+        return _get_engine_impl()
+    except ImportError:
+        # fallback: no DB available
+        return None
 
 
 def _make_stub_daily(symbol: str, count: int = 60) -> list[dict]:
@@ -64,32 +76,160 @@ class USDataProvider:
             self._client = KisUSClient(env="practice")
         return self._client
 
+    def _load_daily_prices_from_db(
+        self, symbol: str, market: str = "US", days: int = 120
+    ) -> list[dict]:
+        """DB price_daily에서 일봉 조회 (fallback 용)."""
+        try:
+            engine = _get_engine()
+            if engine is None:
+                return []
+            
+            with engine.begin() as conn:
+                cutoff_date = date.today() - timedelta(days=days)
+                query = text(
+                    """
+                    SELECT date, open, high, low, close, volume
+                    FROM price_daily
+                    WHERE market = :market AND code = :code AND date >= :cutoff
+                    ORDER BY date ASC
+                    """
+                )
+                rows = conn.execute(
+                    query, {"market": market, "code": symbol, "cutoff": cutoff_date}
+                ).fetchall()
+                
+                result = []
+                for row in rows:
+                    result.append({
+                        "xymd": row[0].strftime("%Y%m%d"),
+                        "clos": str(row[4]) if row[4] else "0",
+                        "open": str(row[1]) if row[1] else "0",
+                        "high": str(row[2]) if row[2] else "0",
+                        "low": str(row[3]) if row[3] else "0",
+                        "tvol": str(row[5]) if row[5] else "0",
+                        "symbol": symbol,
+                    })
+                return result
+        except Exception as exc:
+            logger.warning(
+                "[US_DATA][FALLBACK_DB_FAIL] symbol=%s error=%s", symbol, exc
+            )
+            return []
+
+    def _load_latest_price_from_db(
+        self, symbol: str, market: str = "US", max_age_days: int = 3
+    ) -> dict | None:
+        """DB price_daily에서 최근 가격 조회 (stale fallback 용)."""
+        try:
+            engine = _get_engine()
+            if engine is None:
+                return None
+            
+            with engine.begin() as conn:
+                cutoff_date = date.today() - timedelta(days=max_age_days)
+                query = text(
+                    """
+                    SELECT date, open, high, low, close, volume
+                    FROM price_daily
+                    WHERE market = :market AND code = :code AND date >= :cutoff
+                    ORDER BY date DESC
+                    LIMIT 1
+                    """
+                )
+                row = conn.execute(
+                    query, {"market": market, "code": symbol, "cutoff": cutoff_date}
+                ).fetchone()
+                
+                if not row:
+                    return None
+                
+                return {
+                    "last": str(row[4]) if row[4] else "0",
+                    "open": str(row[1]) if row[1] else "0",
+                    "high": str(row[2]) if row[2] else "0",
+                    "low": str(row[3]) if row[3] else "0",
+                    "tvol": str(row[5]) if row[5] else "0",
+                    "symbol": symbol,
+                    "_stale_date": row[0].strftime("%Y-%m-%d"),
+                }
+        except Exception as exc:
+            logger.warning(
+                "[US_DATA][FALLBACK_STALE_FAIL] symbol=%s error=%s", symbol, exc
+            )
+            return None
+
     def get_current_price(self, symbol: str, exchange: str) -> dict:
-        """현재가 조회."""
+        """현재가 조회 (KIS → DB stale fallback)."""
         if self._offline:
             logger.debug("[US_DATA][OFFLINE] current_price symbol=%s", symbol)
             return _make_stub_price(symbol)
-        result = self._get_client().get_us_price(symbol, exchange)
-        output = result.get("output", {})
-        return {
-            "last": output.get("last", "0"),
-            "open": output.get("open", "0"),
-            "high": output.get("high", "0"),
-            "low": output.get("low", "0"),
-            "tvol": output.get("tvol", "0"),
-            "symbol": symbol,
-        }
+        
+        try:
+            result = self._get_client().get_us_price(symbol, exchange)
+            output = result.get("output", {})
+            return {
+                "last": output.get("last", "0"),
+                "open": output.get("open", "0"),
+                "high": output.get("high", "0"),
+                "low": output.get("low", "0"),
+                "tvol": output.get("tvol", "0"),
+                "symbol": symbol,
+            }
+        except Exception as exc:
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            
+            if isinstance(exc, KisUSTemporaryError):
+                logger.warning(
+                    "[US_DATA][FALLBACK_STALE] symbol=%s KIS failed, trying DB: %s",
+                    symbol, exc
+                )
+                stale_data = self._load_latest_price_from_db(symbol, market="US", max_age_days=3)
+                if stale_data:
+                    logger.info(
+                        "[US_DATA][FALLBACK_STALE_OK] symbol=%s date=%s",
+                        symbol, stale_data.get("_stale_date", "unknown")
+                    )
+                    return stale_data
+                else:
+                    logger.error(
+                        "[US_DATA][FALLBACK_STALE_EMPTY] symbol=%s no DB data", symbol
+                    )
+            # Re-raise original exception if not temporary or no DB fallback
+            raise
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120) -> list[dict]:
-        """일봉 데이터 조회 (xymd 기준 오름차순 정렬).
+        """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).
 
         전략 코드가 closes[-1]을 최신 가격으로 가정하므로 반드시 오름차순 반환.
         """
         if self._offline:
             logger.debug("[US_DATA][OFFLINE] daily_prices symbol=%s count=%d", symbol, count)
             return _make_stub_daily(symbol, count)
-        rows = self._get_client().get_us_daily_price(symbol, exchange, count)
-        return sorted(rows, key=lambda r: str(r.get("xymd", "")))
+        
+        try:
+            rows = self._get_client().get_us_daily_price(symbol, exchange, count)
+            return sorted(rows, key=lambda r: str(r.get("xymd", "")))
+        except Exception as exc:
+            from trader.us.execution.kis_us_client import KisUSTemporaryError
+            
+            if isinstance(exc, KisUSTemporaryError):
+                logger.warning(
+                    "[US_DATA][FALLBACK_DB] symbol=%s KIS failed, trying DB: %s",
+                    symbol, exc
+                )
+                db_rows = self._load_daily_prices_from_db(symbol, market="US", days=count)
+                if db_rows:
+                    logger.info(
+                        "[US_DATA][FALLBACK_DB_OK] symbol=%s count=%d", symbol, len(db_rows)
+                    )
+                    return db_rows
+                else:
+                    logger.error(
+                        "[US_DATA][FALLBACK_DB_EMPTY] symbol=%s no DB data", symbol
+                    )
+            # Re-raise original exception if not temporary or no DB fallback
+            raise
 
     def get_balance(self) -> dict:
         """잔고 조회."""

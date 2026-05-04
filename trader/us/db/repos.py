@@ -603,3 +603,324 @@ def save_reconcile_log(log: dict, trade_date: str | None = None) -> bool:
     except Exception as exc:
         logger.error("[US_RECONCILE_LOG][SAVE][ERROR] %s", exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Prep Run Management (미국장 prep → locked watchlist contract)
+# ---------------------------------------------------------------------------
+
+def save_us_prep_run(
+    trade_date: str,
+    agent_name: str = "us_prep",
+    mode: str = "prep",
+    env: str = "practice",
+    run_id: str | None = None,
+) -> str | None:
+    """
+    us_agent_runs 테이블에 prep run 시작을 기록.
+    
+    Returns:
+        run_id (str): 생성된 또는 전달된 run_id
+        None: DB 접근 실패
+    """
+    import uuid
+    actual_run_id = run_id or str(uuid.uuid4())
+    
+    engine = _get_engine_or_none()
+    if engine is None:
+        logger.warning("[US_PREP_RUN][SAVE] No DB, using in-memory run_id=%s", actual_run_id)
+        return actual_run_id
+    
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO us_agent_runs (run_id, trade_date, agent_name, mode, env, status, started_at)
+                    VALUES (:run_id, :trade_date, :agent_name, :mode, :env, 'STARTED', NOW())
+                """),
+                {
+                    "run_id": actual_run_id,
+                    "trade_date": trade_date,
+                    "agent_name": agent_name,
+                    "mode": mode,
+                    "env": env,
+                },
+            )
+        logger.info("[US_PREP_RUN][SAVE] run_id=%s trade_date=%s", actual_run_id, trade_date)
+        return actual_run_id
+    except Exception as exc:
+        logger.error("[US_PREP_RUN][SAVE][ERROR] %s", exc)
+        return None
+
+
+def finish_us_prep_run(
+    run_id: str,
+    status: str,
+    result: dict | None = None,
+) -> bool:
+    """
+    us_agent_runs 테이블의 prep run을 완료 상태로 업데이트.
+    
+    Args:
+        run_id: prep run ID
+        status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
+        result: {
+            "watchlist_count": int,
+            "data_error_count": int,
+            "critical_etf_errors": list,
+            "status_reason": str,
+            ...
+        }
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        logger.warning("[US_PREP_RUN][FINISH] No DB, run_id=%s status=%s", run_id, status)
+        return True
+    
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE us_agent_runs
+                    SET status = :status,
+                        result = CAST(:result AS jsonb),
+                        finished_at = NOW()
+                    WHERE run_id = :run_id
+                """),
+                {
+                    "run_id": run_id,
+                    "status": status,
+                    "result": _json_param(result or {}),
+                },
+            )
+        logger.info("[US_PREP_RUN][FINISH] run_id=%s status=%s", run_id, status)
+        return True
+    except Exception as exc:
+        logger.error("[US_PREP_RUN][FINISH][ERROR] %s", exc)
+        return False
+
+
+def load_latest_us_prep_status(trade_date: str) -> dict:
+    """
+    당일 최신 prep run 상태 조회.
+    
+    Returns:
+        {
+            "run_id": str,
+            "status": "OK|OK_WITH_WARNINGS|DEGRADED|ERROR|STARTED",
+            "trade_date": str,
+            "result": dict,
+            "started_at": str,
+            "finished_at": str | None
+        }
+        또는 빈 dict {}
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        logger.warning("[US_PREP_STATUS][LOAD] No DB, returning empty")
+        return {}
+    
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT run_id, status, trade_date, result, started_at, finished_at
+                    FROM us_agent_runs
+                    WHERE trade_date = :trade_date
+                      AND agent_name = 'us_prep'
+                      AND mode = 'prep'
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """),
+                {"trade_date": trade_date},
+            ).fetchone()
+            
+            if row is None:
+                return {}
+            
+            result = dict(row._mapping)
+            logger.info(
+                "[US_PREP_STATUS][LOAD] trade_date=%s status=%s run_id=%s",
+                trade_date, result.get("status"), result.get("run_id")
+            )
+            return result
+    except Exception as exc:
+        logger.error("[US_PREP_STATUS][LOAD][ERROR] %s", exc)
+        return {}
+
+
+def clear_and_save_locked_us_watchlist(
+    entries: list[dict],
+    trade_date: str,
+    run_id: str,
+    prep_status: str,
+) -> int:
+    """
+    기존 locked watchlist를 삭제하고 새로운 locked watchlist 저장.
+    
+    Args:
+        entries: watchlist entries, each with symbol, exchange, strategy, score, meta
+        trade_date: 미국장 거래일 (YYYY-MM-DD)
+        run_id: prep run_id
+        prep_status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
+    
+    Returns:
+        저장된 항목 수
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        for e in entries:
+            _MEM_WATCHLIST.append({
+                **e,
+                "trade_date": trade_date,
+                "locked": True,
+                "prep_status": prep_status,
+                "run_id": run_id,
+            })
+        logger.info("[US_WATCHLIST][LOCK_SAVE] count=%d (in-memory)", len(entries))
+        return len(entries)
+    
+    count = 0
+    try:
+        with engine.begin() as conn:
+            # 기존 locked watchlist 삭제
+            conn.execute(
+                text("DELETE FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
+                {"td": trade_date},
+            )
+            
+            # 새 locked watchlist 저장
+            for e in entries:
+                data_source = e.get("meta", {}).get("data_source", "kis") if isinstance(e.get("meta"), dict) else "kis"
+                
+                conn.execute(
+                    text("""
+                        INSERT INTO us_watchlist 
+                        (trade_date, symbol, exchange, strategy, score, meta, 
+                         prep_status, locked, run_id, data_source)
+                        VALUES (:td, :symbol, :exchange, :strategy, :score, CAST(:meta AS jsonb),
+                                :prep_status, TRUE, :run_id, :data_source)
+                        ON CONFLICT (trade_date, symbol, strategy)
+                        DO UPDATE SET
+                            score = EXCLUDED.score,
+                            meta = EXCLUDED.meta,
+                            prep_status = EXCLUDED.prep_status,
+                            locked = EXCLUDED.locked,
+                            run_id = EXCLUDED.run_id,
+                            data_source = EXCLUDED.data_source,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "td": trade_date,
+                        "symbol": e["symbol"],
+                        "exchange": e.get("exchange", "NASDAQ"),
+                        "strategy": e.get("strategy", "unknown"),
+                        "score": e.get("score"),
+                        "meta": _json_param(e.get("meta", {})),
+                        "prep_status": prep_status,
+                        "run_id": run_id,
+                        "data_source": data_source,
+                    },
+                )
+                count += 1
+        
+        logger.info(
+            "[US_WATCHLIST][LOCK_SAVE] trade_date=%s count=%d status=%s run_id=%s",
+            trade_date, count, prep_status, run_id
+        )
+        return count
+    except Exception as exc:
+        logger.error("[US_WATCHLIST][LOCK_SAVE][ERROR] %s", exc)
+        return 0
+
+
+def load_locked_us_watchlist(
+    trade_date: str,
+    min_count: int = 1,
+    allow_degraded: bool = True,
+) -> list[dict]:
+    """
+    당일 locked watchlist 조회.
+    
+    Args:
+        trade_date: 미국장 거래일
+        min_count: 최소 항목 수
+        allow_degraded: DEGRADED 상태 허용 여부
+    
+    Returns:
+        list of dicts with symbol, exchange, strategy, score, meta, prep_status, run_id, data_source
+        빈 리스트 [] if not found or count < min_count
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        mem_locked = [w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date]
+        logger.info("[US_WATCHLIST][LOCK_LOAD] count=%d (in-memory)", len(mem_locked))
+        return mem_locked
+    
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT symbol, exchange, strategy, score, meta, 
+                           prep_status, run_id, data_source, created_at, updated_at
+                    FROM us_watchlist
+                    WHERE trade_date = :td
+                      AND locked = TRUE
+                    ORDER BY score DESC NULLS LAST, symbol ASC
+                """),
+                {"td": trade_date},
+            ).fetchall()
+            
+            result = [dict(r._mapping) for r in rows]
+            
+            if len(result) < min_count:
+                logger.warning(
+                    "[US_WATCHLIST][LOCK_LOAD][INSUFFICIENT] trade_date=%s count=%d min=%d",
+                    trade_date, len(result), min_count
+                )
+                return []
+            
+            # DEGRADED 체크
+            if result and not allow_degraded:
+                first_status = result[0].get("prep_status")
+                if first_status == "DEGRADED":
+                    logger.warning(
+                        "[US_WATCHLIST][LOCK_LOAD][DEGRADED_BLOCKED] trade_date=%s status=%s",
+                        trade_date, first_status
+                    )
+                    return []
+            
+            logger.info(
+                "[US_WATCHLIST][LOCK_LOAD] trade_date=%s count=%d status=%s",
+                trade_date, len(result), result[0].get("prep_status") if result else "N/A"
+            )
+            return result
+    except Exception as exc:
+        logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s", exc)
+        return []
+
+
+def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:
+    """us_watchlist 항목 수 조회."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        if locked_only:
+            return len([w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date])
+        return len([w for w in _MEM_WATCHLIST if w.get("trade_date") == trade_date])
+    
+    try:
+        with engine.connect() as conn:
+            if locked_only:
+                row = conn.execute(
+                    text("SELECT COUNT(*) as cnt FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
+                    {"td": trade_date},
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    text("SELECT COUNT(*) as cnt FROM us_watchlist WHERE trade_date = :td"),
+                    {"td": trade_date},
+                ).fetchone()
+            return row[0] if row else 0
+    except Exception as exc:
+        logger.error("[US_WATCHLIST][COUNT][ERROR] %s", exc)
+        return 0

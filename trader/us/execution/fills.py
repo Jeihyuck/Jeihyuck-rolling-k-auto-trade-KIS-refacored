@@ -12,7 +12,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def get_fills_today(provider: Any | None = None, signal_only: bool = False) -> list[dict]:
+def get_fills_today(provider: Any | None = None, signal_only: bool = False) -> dict:
     """당일 체결 내역 반환.
 
     Args:
@@ -20,7 +20,9 @@ def get_fills_today(provider: Any | None = None, signal_only: bool = False) -> l
         signal_only: True이면 KIS API 호출 없이 DB 데이터만 사용
 
     Returns:
-        체결 목록 [{"symbol": ..., "qty": ..., "price": ..., ...}]
+        {"status": "OK"|"ERROR", "fills": [...], "error": str|None}
+        - status="OK": 성공 (fills는 체결 목록, 빈 리스트도 OK)
+        - status="ERROR": 오류 발생 (error에 오류 메시지)
     """
     if provider is None:
         from trader.us.data_provider import USDataProvider
@@ -33,14 +35,14 @@ def get_fills_today(provider: Any | None = None, signal_only: bool = False) -> l
             from trader.us.db.repos import load_today_fills
             db_fills = load_today_fills()
             logger.info("[US_FILLS][DB_ONLY] count=%d", len(db_fills))
-            return db_fills
+            return {"status": "OK", "fills": db_fills, "error": None}
         except Exception as exc:
             logger.warning("[US_FILLS][DB_ONLY][WARN] %s", exc)
-            return []
+            return {"status": "ERROR", "fills": [], "error": str(exc)}
 
     if getattr(provider, "_offline", False):
         logger.debug("[US_FILLS][OFFLINE] returning stub fills")
-        return []
+        return {"status": "OK", "fills": [], "error": None}
 
     try:
         client = provider._get_client()
@@ -58,7 +60,14 @@ def get_fills_today(provider: Any | None = None, signal_only: bool = False) -> l
                 "raw": row,
             })
         logger.info("[US_FILLS][OK] count=%d", len(fills))
-        return fills
+        return {"status": "OK", "fills": fills, "error": None}
     except Exception as exc:
-        logger.error("[US_FILLS][ERROR] %s", exc)
-        return []
+        from trader.us.execution.kis_us_client import KisUSTemporaryError
+        
+        error_msg = str(exc)
+        if isinstance(exc, KisUSTemporaryError):
+            logger.error("[US_FILLS][ERROR][TEMPORARY] %s", error_msg)
+        else:
+            logger.error("[US_FILLS][ERROR] %s", error_msg)
+        
+        return {"status": "ERROR", "fills": [], "error": error_msg}

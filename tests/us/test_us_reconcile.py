@@ -39,13 +39,17 @@ class TestFills:
     def test_offline_fills_empty_list(self):
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
-        fills = get_fills_today(provider=provider)
-        assert isinstance(fills, list)
-        assert len(fills) == 0
+        result = get_fills_today(provider=provider)
+        assert isinstance(result, dict)
+        assert result["status"] == "OK"
+        assert isinstance(result["fills"], list)
+        assert len(result["fills"]) == 0
 
     def test_fills_default_none_provider(self):
-        fills = get_fills_today(provider=None)
-        assert isinstance(fills, list)
+        result = get_fills_today(provider=None)
+        assert isinstance(result, dict)
+        assert result["status"] == "OK"
+        assert isinstance(result["fills"], list)
 
 
 class TestPartialFillReconcile:
