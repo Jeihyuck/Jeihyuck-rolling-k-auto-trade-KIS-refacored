@@ -86,6 +86,124 @@ def _normalize_code(value: Any) -> str:
     return str(value or "").strip().zfill(6)
 
 
+def _holdings_index(rows: list[dict]) -> tuple[dict[str, int], dict[str, float]]:
+    qty_by_code: dict[str, int] = {}
+    avg_price_by_code: dict[str, float] = {}
+    for row in rows or []:
+        code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
+        if not code:
+            continue
+        qty = _to_int(_first_value(row, ["hldg_qty", "qty", "ord_psbl_qty"])) or 0
+        avg_price = _to_float(_first_value(row, ["pchs_avg_pric", "avg_prvs", "price"])) or 0.0
+        qty_by_code[code] = qty
+        avg_price_by_code[code] = avg_price
+    return qty_by_code, avg_price_by_code
+
+
+def _promote_open_buy_orders_from_holdings(
+    *,
+    env: str,
+    strategy: str,
+    ctx_run_id: str | None,
+    tick_ts: datetime,
+    holdings_rows: list[dict],
+    orders_repo: OrdersRepo,
+    fills_repo: FillsRepo,
+) -> dict[str, int]:
+    qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
+    promoted_orders = 0
+    promoted_fills = 0
+    for order in orders_repo.get_open_orders(env) or []:
+        side = str(order.get("side") or "").upper()
+        status = str(order.get("status") or "").upper()
+        if side != "BUY" or status not in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"}:
+            continue
+        code = _normalize_code(order.get("code"))
+        if not code:
+            continue
+        holding_qty = int(qty_by_code.get(code) or 0)
+        if holding_qty <= 0:
+            continue
+
+        request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
+        response_json = order.get("response_json") if isinstance(order.get("response_json"), dict) else {}
+        order_qty = _to_int(order.get("qty")) or 0
+        fill_qty = min(order_qty, holding_qty) if order_qty > 0 else holding_qty
+        fill_price = (
+            _to_float(order.get("limit_price"))
+            or _to_float(request_json.get("ORD_UNPR"))
+            or _to_float(response_json.get("avg_prvs"))
+            or float(avg_price_by_code.get(code) or 0.0)
+        )
+        kis_odno = str(order.get("kis_odno") or order.get("broker_order_id") or "").strip() or None
+        client_order_key = str(order.get("client_order_key") or f"{env}:{strategy}:{code}:promote").strip()
+        order_time = order.get("acked_at") or order.get("submitted_at") or tick_ts
+
+        orders_repo.upsert_reconciled_order(
+            env=env,
+            run_id=ctx_run_id,
+            strategy=strategy,
+            sid=int(order.get("sid") or 1),
+            mode=int(order.get("mode") or 1),
+            code=code,
+            market=order.get("market"),
+            side="BUY",
+            ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
+            qty=fill_qty,
+            limit_price=fill_price,
+            stage=str(order.get("stage") or "RECONCILE"),
+            client_order_key=client_order_key,
+            kis_odno=kis_odno,
+            status="FILLED",
+            request_json=request_json,
+            response_json={
+                **response_json,
+                "promotion_source": "kis_holdings",
+                "promoted_from_status": status,
+                "holding_qty": holding_qty,
+            },
+            submitted_at=order.get("submitted_at") or order_time,
+            acked_at=order_time,
+        )
+        promoted_orders += 1
+
+        fills_repo.upsert_fill(
+            env=env,
+            run_id=ctx_run_id,
+            order_id=str(order.get("order_id") or "") or None,
+            kis_odno=kis_odno,
+            trade_id=f"PROMOTE:{kis_odno or client_order_key}",
+            code=code,
+            market=order.get("market"),
+            side="BUY",
+            qty=fill_qty,
+            price=float(fill_price or 0.0),
+            fee=0.0,
+            tax=0.0,
+            filled_at=order_time,
+            raw_json={
+                "promotion_source": "kis_holdings",
+                "promoted_from_status": status,
+                "holding_qty": holding_qty,
+            },
+            fill_meta_json={
+                "fill_source": "kis_holdings_promotion",
+                "promoted_from_status": status,
+            },
+        )
+        promoted_fills += 1
+        logger.warning(
+            "[RECONCILE][PROMOTE_FILL] env=%s code=%s kis_odno=%s from=%s to=FILLED qty=%s holding_qty=%s",
+            env,
+            code,
+            kis_odno,
+            status,
+            fill_qty,
+            holding_qty,
+        )
+    return {"orders": promoted_orders, "fills": promoted_fills}
+
+
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     env = ctx.env
     run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
@@ -236,7 +354,20 @@ def reconcile_kis(
     account_key = get_account_key(env=env, kis=kis)
     masked_account = get_masked_account_key(env=env, kis=kis)
 
+    orders_repo = OrdersRepo(engine)
+    fills_repo = FillsRepo(engine)
     positions_repo = PositionsRepo(engine)
+    promoted = _promote_open_buy_orders_from_holdings(
+        env=env,
+        strategy=strategy,
+        ctx_run_id=run_id,
+        tick_ts=tick_ts,
+        holdings_rows=holdings_rows,
+        orders_repo=orders_repo,
+        fills_repo=fills_repo,
+    )
+    orders_count += int(promoted.get("orders") or 0)
+    fills_count += int(promoted.get("fills") or 0)
     restored = 0
     if reset_mode:
         allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
@@ -335,6 +466,8 @@ def reconcile_kis(
         details_json={
             "orders": orders_count,
             "fills": fills_count,
+            "promoted_orders": int(promoted.get("orders") or 0),
+            "promoted_fills": int(promoted.get("fills") or 0),
             "holdings": len(holdings_rows),
             "restored_positions": restored,
             "account_key": account_key,
@@ -349,6 +482,8 @@ def reconcile_kis(
     reconcile_result.update(
         {
             "holdings": len(holdings_rows),
+            "promoted_orders": int(promoted.get("orders") or 0),
+            "promoted_fills": int(promoted.get("fills") or 0),
             "restored_positions": restored,
             "account_key": account_key,
             "masked_account": masked_account,

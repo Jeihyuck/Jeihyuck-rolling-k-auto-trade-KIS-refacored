@@ -936,6 +936,8 @@ class KisAPI:
         self._order_limiter = _RateLimiter(
             min_interval_sec=float(os.getenv("KIS_ORDER_MIN_INTERVAL_SEC", "0.25"))
         )
+        self._last_hashkey_at = 0.0
+        self._order_hashkey_gap_sec = float(os.getenv("KIS_ORDER_HASHKEY_GAP_SEC", "0.35"))
         self._concurrency_sem = threading.Semaphore(_env_int("KIS_CONCURRENCY", 2))
         self._recent_sells: Dict[str, float] = {}
         self._recent_sells_lock = threading.Lock()
@@ -963,6 +965,28 @@ class KisAPI:
         # [NEW] 호가 조회 404 쿨다운 캐시
         self.askbid_unavailable_cache: Dict[str, float] = {}  # code -> unavailable_until_timestamp
         self.askbid_cooldown_sec = int(os.getenv("KIS_ASKBID_COOLDOWN_SEC", "3600"))  # 기본 1시간
+
+    def _rate_limit_safe_enabled(self) -> bool:
+        return str(os.getenv("PB1_KIS_RATE_LIMIT_SAFE") or "0") == "1"
+
+    def _wait_before_hashkey(self) -> None:
+        if self._rate_limit_safe_enabled():
+            self._order_limiter.wait("order-hashkey")
+
+    def _wait_before_order_submit(self) -> None:
+        if self._rate_limit_safe_enabled():
+            self._order_limiter.wait("orders-safe")
+            now = time.time()
+            delta = now - float(self._last_hashkey_at or 0.0)
+            if delta < float(self._order_hashkey_gap_sec or 0.0):
+                sleep_sec = float(self._order_hashkey_gap_sec) - delta + random.uniform(0, 0.03)
+                logger.warning(
+                    "[KIS][RATE_LIMIT][ORDER_GAP] sleep=%.3f gap=%.3f",
+                    sleep_sec,
+                    delta,
+                )
+                time.sleep(sleep_sec)
+        self._limiter.wait("orders")
 
     def _account_param_meta(self) -> dict:
         cano = _digits_only(self.CANO)
@@ -1462,6 +1486,7 @@ class KisAPI:
         }
         body_str = _json_dumps(body_dict)
         try:
+            self._wait_before_hashkey()
             # [CHG] 안전요청 사용
             r = self._safe_request("POST", url, headers=headers, data=body_str.encode("utf-8"))
             j = r.json()
@@ -1472,6 +1497,7 @@ class KisAPI:
         if not hk:
             logger.error(f"[HASHKEY 실패] resp={j}")
             raise Exception(f"HashKey 생성 실패: {j}")
+        self._last_hashkey_at = time.time()
         return hk
 
     # ===== 신규: 예수금/과매수 방지 유틸 =====
@@ -3614,8 +3640,8 @@ class KisAPI:
 
                 headers = self._headers(tr_id, hk)
 
-                # 레이트리밋(주문은 별 키)
-                self._limiter.wait("orders")
+                # 레이트리밋(주문은 hashkey 이후 최소 간격 포함)
+                self._wait_before_order_submit()
 
                 # [NEW] FORCE_RUN 모드에서 주문 직전 로깅 강화
                 log_body_masked = {
@@ -3905,6 +3931,7 @@ class KisAPI:
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         logger.info("[KIS][ORDER][REQUEST] type=LIMIT side=BUY code=%s qty=%s price=%s", pdno, qty, price)
+        self._wait_before_order_submit()
         # [CHG] 안전요청 사용
         resp = self._safe_request(
             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
@@ -4031,6 +4058,7 @@ class KisAPI:
         tr_id = tr_list[0]
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
+        self._wait_before_order_submit()
         # [CHG] 안전요청 사용
         resp = self._safe_request(
             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)

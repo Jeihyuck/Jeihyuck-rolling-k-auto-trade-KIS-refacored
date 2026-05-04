@@ -213,17 +213,17 @@ def calc_position_age(
     if ohlcv_df is not None and not ohlcv_df.empty:
         try:
             df_norm = normalize_ohlcv_dates(ohlcv_df)
-            if isinstance(df_norm.index, pd.Index) and len(df_norm.index) > 0:
-                # 날짜 인덱스인 경우
-                idx_dates = [d for d in df_norm.index if d is not None]
-                post_rows = [d for d in idx_dates if d > entry_date]
-                post_entry_rows = len(post_rows)
-                holding_bars = post_entry_rows
-                quality = "ohlcv"
-            elif "date" in df_norm.columns or "Date" in df_norm.columns:
+            if "date" in df_norm.columns or "Date" in df_norm.columns:
                 col = "date" if "date" in df_norm.columns else "Date"
                 col_dates = df_norm[col].dropna().tolist()
                 post_rows = [d for d in col_dates if d > entry_date]
+                post_entry_rows = len(post_rows)
+                holding_bars = post_entry_rows
+                quality = "ohlcv"
+            elif isinstance(df_norm.index, pd.Index) and len(df_norm.index) > 0:
+                # 날짜 인덱스인 경우
+                idx_dates = [d for d in df_norm.index if d is not None]
+                post_rows = [d for d in idx_dates if d > entry_date]
                 post_entry_rows = len(post_rows)
                 holding_bars = post_entry_rows
                 quality = "ohlcv"

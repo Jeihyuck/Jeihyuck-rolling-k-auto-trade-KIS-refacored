@@ -2689,7 +2689,10 @@ class OrdersRepo:
 
     def get_open_orders(self, env: str) -> list[dict]:
         stmt = select(self._schema.orders).where(
-            and_(self._schema.orders.c.env == env, self._schema.orders.c.status.in_(["INTENT", "SUBMITTED"]))
+            and_(
+                self._schema.orders.c.env == env,
+                self._schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+            )
         )
         return self._read_mappings_with_guard(
             stmt,

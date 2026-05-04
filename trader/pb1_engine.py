@@ -197,7 +197,7 @@ from trader.strategies.pb1_minervini_v2 import (
     update_trailing_stop,
 )
 from trader.time_utils import now_kst, week_monday, prev_business_day
-from trader.position_age import calc_position_age, to_kst_date
+from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst_date
 from trader.core_utils import _round_to_tick
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
@@ -277,6 +277,9 @@ class HoldingContext:
     sid: int = 1
     entry_date: str | None = None
     days_held: int = 0
+    calendar_days_held: int = 0
+    trading_days_held: int = 0
+    holding_bars: int = 0
     last_fill_at: str | None = None
     position_meta: dict[str, Any] = field(default_factory=dict)
 
@@ -303,6 +306,9 @@ class HoldingContext:
                 "sid": self.sid,
                 "entry_date": self.entry_date,
                 "holding_days": self.days_held,
+                "calendar_days_held": self.calendar_days_held,
+                "trading_days_held": self.trading_days_held or self.days_held,
+                "holding_bars": self.holding_bars,
                 "last_fill_at": self.last_fill_at,
                 "holding_source": self.source,
             }
@@ -670,33 +676,33 @@ def _coerce_timestamp(value: Any) -> pd.Timestamp | None:
         return ts
 
 
+def _calendar_days_held(entry_ts: Any, trade_date: date) -> int:
+    entry_date = to_kst_date(entry_ts)
+    if entry_date is None:
+        return 0
+    return max(0, (trade_date - entry_date).days)
+
+
 def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: float) -> tuple[float, int]:
     safe_entry_price = float(entry_price or 0.0)
-    ts = _coerce_timestamp(entry_ts)
+    entry_trade_date = to_kst_date(entry_ts)
     if safe_entry_price <= 0:
         safe_entry_price = 0.0
-    if df is None or df.empty or "high" not in df.columns or ts is None:
+    if df is None or df.empty or "high" not in df.columns or entry_trade_date is None:
         return safe_entry_price, 0
 
-    timestamp_series: pd.Series | None = None
-    if "ts" in df.columns:
-        timestamp_series = pd.to_datetime(df["ts"], errors="coerce")
-    elif isinstance(df.index, pd.DatetimeIndex):
-        timestamp_series = pd.Series(df.index, index=df.index)
+    df_norm = normalize_ohlcv_dates(df)
+    date_series: pd.Series | None = None
+    if "date" in df_norm.columns:
+        date_series = pd.Series(df_norm["date"], index=df_norm.index)
+    elif isinstance(df_norm.index, pd.Index):
+        date_series = pd.Series(df_norm.index, index=df_norm.index)
 
-    if timestamp_series is None:
+    if date_series is None:
         return safe_entry_price, 0
 
-    try:
-        if getattr(timestamp_series.dt, "tz", None) is None:
-            timestamp_series = timestamp_series.dt.tz_localize(KST)
-        else:
-            timestamp_series = timestamp_series.dt.tz_convert(KST)
-    except Exception:
-        pass
-
-    post_entry_mask = timestamp_series >= ts
-    post_entry_bars = df.loc[post_entry_mask.fillna(False)]
+    post_entry_mask = date_series.apply(lambda value: value is not None and value > entry_trade_date)
+    post_entry_bars = df_norm.loc[post_entry_mask.fillna(False)]
     if post_entry_bars.empty:
         return safe_entry_price, 0
 
@@ -1068,6 +1074,11 @@ def _resolve_swing_staged_exit(
         _highest_ret, days_held, int(risk_ctx.get("effective_applied", False)),
     )
 
+    calendar_days_held = int(pos.get("calendar_days_held") or days_held)
+    trading_days_held = int(pos.get("trading_days_held") or days_held)
+    holding_bars = int(pos.get("holding_bars") or days_held)
+    legacy_time_stop_hit = bool(trading_days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
+
     # ──────────────────────────────────────────────────────────────
     # Exit Router 분기: PB1_EXIT_ROUTER_ENABLED=1이면 router 사용
     # ──────────────────────────────────────────────────────────────
@@ -1081,7 +1092,11 @@ def _resolve_swing_staged_exit(
             pos=pos,
             features={},
             holding_ctx={
-                "days_held": days_held,
+                "days_held": trading_days_held,
+                "calendar_days_held": calendar_days_held,
+                "trading_days_held": trading_days_held,
+                "holding_bars": holding_bars,
+                "legacy_time_stop_hit": legacy_time_stop_hit,
                 "current_return_pct": ret_pct,
                 "current_r": current_r,
                 "highest_return_pct": _highest_ret,
@@ -1094,7 +1109,7 @@ def _resolve_swing_staged_exit(
             ret_pct=ret_pct,
             current_r=current_r,
             highest_ret_pct=_highest_ret,
-            days_held=days_held,
+            days_held=trading_days_held,
             stop_hit=stop_hit,
             ma20=ma20,
             effective_stop=effective_stop,
@@ -2315,6 +2330,17 @@ class PB1Engine:
         logger.info("[PB1][STAGE][END] stage=orders.lookup_open rows=%s", len(rows))
         return rows
 
+    def _should_block_entry_after_exit(self) -> tuple[bool, dict[str, int]]:
+        if os.getenv("PB1_BLOCK_ENTRY_AFTER_EXIT", "1") in {"0", "false", "False"}:
+            return False, {"exit_submit_attempt_count": 0, "accepted_sell_count": 0}
+        payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
+        exit_submit_attempt_count = int(payload.get("submit_attempt_count") or payload.get("submitted") or 0)
+        accepted_sell_count = int(payload.get("accepted_sell_count") or payload.get("submitted") or 0)
+        return (exit_submit_attempt_count > 0 or accepted_sell_count > 0), {
+            "exit_submit_attempt_count": exit_submit_attempt_count,
+            "accepted_sell_count": accepted_sell_count,
+        }
+
     def _safe_list_today_orders(self, *, code: str | None = None, side: str | None = None) -> list[dict]:
         cache_key = ("today_orders", str(code or ""), str(side or ""))
         cached = self._tick_db_cache.get(cache_key)
@@ -3377,7 +3403,8 @@ class PB1Engine:
             entry_ts_raw = latest_buy_fill.get("filled_at") or pos_meta.get("entry_ts") or pos_meta.get("last_trade_at")
             pos_age = calc_position_age(entry_ts_raw, today_kst)
             entry_date = pos_age.entry_date_kst
-            days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("holding_days") or 0)
+            trading_days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("trading_days_held") or pos_meta.get("holding_days") or 0)
+            calendar_days_held = _calendar_days_held(entry_ts_raw, today_kst) if entry_ts_raw else int(pos_meta.get("calendar_days_held") or trading_days_held)
             holdings.append(
                 HoldingContext(
                     code=code,
@@ -3394,7 +3421,10 @@ class PB1Engine:
                     mode=int(pos_meta.get("mode") or 1),
                     sid=int(pos_meta.get("sid") or 1),
                     entry_date=entry_date,
-                    days_held=days_held,
+                    days_held=trading_days_held,
+                    calendar_days_held=calendar_days_held,
+                    trading_days_held=trading_days_held,
+                    holding_bars=pos_age.holding_bars,
                     last_fill_at=str(entry_ts_raw) if entry_ts_raw else None,
                     position_meta=pos_meta,
                 )
@@ -3835,9 +3865,11 @@ class PB1Engine:
             "order_allowed": bool(self.order_allowed),
             "qty": int(qty or 0),
             "holding_qty": int(snapshot.get("holding_qty") or 0),
+            "kis_holding_qty": int(snapshot.get("kis_holding_qty") or snapshot.get("holding_qty") or 0),
             "today_buy_exists": bool(snapshot.get("today_buy_exists")),
             "today_submit_exists": bool(snapshot.get("today_submit_exists")),
             "today_fill_exists": bool(snapshot.get("today_fill_exists")),
+            "today_sell_exists": bool(snapshot.get("today_sell_exists")),
             "open_order_exists": bool(open_order_exists or snapshot.get("open_order_exists")),
             "cooldown_active": bool(snapshot.get("cooldown_active")),
             "duplicate_intent_exists": bool(duplicate_intent_exists),
@@ -3859,8 +3891,14 @@ class PB1Engine:
         allow_add_to_existing: bool,
     ) -> UnifiedGateDecision:
         reason_codes: list[str] = []
-        if not allow_add_to_existing and int(gate_context.get("holding_qty") or 0) > 0:
-            reason_codes.append("BUYABLE_EXISTING_HOLDING")
+        kis_holding_qty = int(gate_context.get("kis_holding_qty") or 0)
+        if not allow_add_to_existing and kis_holding_qty > 0:
+            reason_codes.append("BUYABLE_EXISTING_HOLDING_KIS")
+            logger.info(
+                "[BUYABLE_GATE][KIS_HOLDING] code=%s kis_qty=%s ok=0 reason=BUYABLE_EXISTING_HOLDING_KIS",
+                self._display_code(code),
+                kis_holding_qty,
+            )
         if bool(gate_context.get("open_order_exists")):
             reason_codes.append("BUYABLE_OPEN_ORDER")
         if bool(gate_context.get("today_buy_exists")):
@@ -3897,11 +3935,13 @@ class PB1Engine:
             decision.reason_codes,
         )
         logger.info(
-            "[PB1][BUYABLE_GATE][CTX] code=%s holding_qty=%s today_submit_exists=%s today_fill_exists=%s open_order_exists=%s cooldown_active=%s duplicate_intent_exists=%s last_order_submit_at=%s",
+            "[PB1][BUYABLE_GATE][CTX] code=%s holding_qty=%s kis_holding_qty=%s today_submit_exists=%s today_fill_exists=%s today_sell_exists=%s open_order_exists=%s cooldown_active=%s duplicate_intent_exists=%s last_order_submit_at=%s",
             display_code,
             decision.context.get("holding_qty", 0),
+            decision.context.get("kis_holding_qty", 0),
             int(bool(decision.context.get("today_submit_exists"))),
             int(bool(decision.context.get("today_fill_exists"))),
+            int(bool(decision.context.get("today_sell_exists"))),
             int(bool(decision.context.get("open_order_exists"))),
             int(bool(decision.context.get("cooldown_active"))),
             int(bool(decision.context.get("duplicate_intent_exists"))),
@@ -4503,6 +4543,15 @@ class PB1Engine:
         )
 
         position_by_code = {str(row.get("code") or "").zfill(6): dict(row) for row in positions if row.get("code")}
+        kis_holding_qty_by_code: dict[str, int] = {}
+        for row in (self._balance_snapshot.get("output1", []) if isinstance(self._balance_snapshot, dict) else []):
+            code_key = str((row or {}).get("pdno") or (row or {}).get("code") or "").zfill(6)
+            if not code_key:
+                continue
+            try:
+                kis_holding_qty_by_code[code_key] = int(float((row or {}).get("hldg_qty") or (row or {}).get("qty") or 0))
+            except Exception:
+                continue
         today_buy_by_code: dict[str, list[dict[str, Any]]] = {}
         recent_fills_by_code: dict[str, list[dict[str, Any]]] = {}
         recent_orders_by_code: dict[str, list[dict[str, Any]]] = {}
@@ -4579,6 +4628,7 @@ class PB1Engine:
             )
             snapshot = {
                 "holding_qty": int(pos.get("qty") or 0),
+                "kis_holding_qty": int(kis_holding_qty_by_code.get(code_key) or pos.get("qty") or 0),
                 "today_buy_exists": bool(today_buy_events),
                 "today_submit_exists": bool(recent_order_events),
                 "today_fill_exists": bool(recent_fill_events),
@@ -4717,6 +4767,59 @@ class PB1Engine:
                 reasons.append("breakout_trigger_fail")
             reasons.append("require_or_fail")
         return entry_ok, reasons, mode
+
+    @staticmethod
+    def _resolve_entry_trigger_policy(
+        *,
+        trigger_ok: bool,
+        entry_ok: bool,
+        setup_filters_ok: bool,
+        decision_family: str | None,
+    ) -> str:
+        if trigger_ok:
+            return "BREAKOUT_CONFIRMED"
+        if entry_ok and setup_filters_ok:
+            family = str(decision_family or "").strip().upper()
+            if family.endswith("PULLBACK_OVERRIDE"):
+                return "PULLBACK_OVERRIDE"
+            if family.endswith("MOMENTUM_CONTINUATION"):
+                return "MOMENTUM_CONTINUATION"
+            if family.endswith("SCORE_OVERRIDE"):
+                return "SCORE_OVERRIDE"
+            return "SETUP_OVERRIDE"
+        return "NONE"
+
+    @staticmethod
+    def _enforce_explicit_trigger_bypass(
+        *,
+        entry_ok: bool,
+        trigger_ok: bool,
+        trigger_policy: str,
+        reasons: list[str] | None,
+    ) -> tuple[bool, list[str]]:
+        resolved_reasons = list(reasons or [])
+        if os.getenv("PB1_REQUIRE_EXPLICIT_TRIGGER_BYPASS", "0") != "1":
+            return entry_ok, resolved_reasons
+        if trigger_ok or not entry_ok:
+            return entry_ok, resolved_reasons
+        if str(trigger_policy or "NONE").strip().upper() == "NONE":
+            resolved_reasons.append("explicit_trigger_bypass_required")
+            return False, resolved_reasons
+        return entry_ok, resolved_reasons
+
+    @staticmethod
+    def _entry_ohlcv_block_reason(*, df: pd.DataFrame, meta: dict[str, Any] | None) -> str | None:
+        if os.getenv("PB1_BLOCK_INSUFFICIENT_OHLCV", "0") != "1":
+            return None
+        source = str((meta or {}).get("source") or "").strip().lower()
+        required_rows = max(int(PB1_MIN_CANDLES or 0), 120)
+        if df is None or df.empty or len(df) < required_rows:
+            return "insufficient_ohlcv"
+        if bool((meta or {}).get("long_fetch_blocked", 0) or 0):
+            return "insufficient_ohlcv"
+        if source.startswith("db_insufficient") or source in {"db_short_only", "db_blocked"}:
+            return "insufficient_ohlcv"
+        return None
 
     def _log_entry_gate(
         self,
@@ -7838,53 +7941,12 @@ class PB1Engine:
             # [2026-04-30] ORDER_SUBMIT_ACCEPTED 직후 BUY_FILL/positions update 금지.
             # 실제 체결은 reconcile_kis.py에서 KIS balance 확인 후 BUY_FILL_CONFIRMED로 생성한다.
             logger.info(
-                "[ORDER][ACCEPTED_ONLY] side=BUY code=%s name=%s odno=%s fill_created=0 position_updated=0",
+                "[ORDER][ACCEPTED_ONLY] side=BUY code=%s name=%s odno=%s fill_created=0 position_updated=0 meta_updated=0",
                 cf.code,
                 stock_name,
                 kis_odno or order_id,
             )
-            entry_price = float(record_price or 0.0)
-            base_id = f"{cf.code}:{self._today}:{cf.features.get('pivot')}"
-            r_value = entry_price - float(cf.features.get("stop_price") or 0.0)
-            fields = {
-                "entry_ts": now_kst().isoformat(),
-                "initial_stop": cf.features.get("initial_stop"),
-                "stop_price": cf.features.get("stop_price"),
-                "max_price": entry_price if entry_price > 0 else None,
-                "pyramid_level": 0,
-                "pivot": cf.features.get("pivot"),
-                "last_add_price": entry_price if entry_price > 0 else None,
-                "partial_exit_level": 0,
-                "base_id": base_id,
-                "setup_id": base_id,
-                "tight_low": cf.features.get("tight_low"),
-                "base_high": cf.features.get("base_high"),
-                "entry_price": entry_price if entry_price > 0 else None,
-                "r_value": r_value if r_value > 0 else None,
-                "tp1_done": 0,
-                "tp2_done": 0,
-                "trail_mode": TRAIL_MODE,
-                "last_trail_stop": cf.features.get("stop_price"),
-                    "regime_at_entry": (getattr(self, "_regime", None) or {}).get("regime"),
-                "risk_mult_at_entry": getattr(self, "_regime_risk_mult", None),
-                **self._entry_meta_position_fields(entry_meta),
-            }
-            self.positions_repo.update_position_fields(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=1,
-                mode=cf.mode,
-                code=cf.code,
-                fields=fields,
-            )
-            logger.info(
-                "[POSITION][META][UPSERT] code=%s entry_reason=%s entry_style=%s stop=%s pivot=%s",
-                display_code,
-                entry_meta.get("entry_reason"),
-                entry_meta.get("entry_style_selected"),
-                entry_meta.get("stop_price_at_entry"),
-                entry_meta.get("pivot_price_at_entry"),
-            )
+            logger.info("[POSITION][META][SKIP_ACCEPTED_ONLY] code=%s", display_code)
             logger.info(
                 "[TRADE][ORDER][BUY] code=%s name=%s oid=%s qty=%s result=ACCEPTED",
                 cf.code,
@@ -8634,17 +8696,26 @@ class PB1Engine:
         entry_ts_value = pos.get("last_fill_at") or pos.get("entry_date") or pos.get("entry_ts")
         entry_ts = None
         days_held = int(pos.get("holding_days") or 0)
+        calendar_days_held = int(pos.get("calendar_days_held") or days_held)
+        trading_days_held = int(pos.get("trading_days_held") or days_held)
+        holding_bars = int(pos.get("holding_bars") or 0)
         if entry_ts_value:
             try:
                 entry_ts = pd.Timestamp(entry_ts_value)
-                days_held = max(0, (self._now_kst.date() - entry_ts.date()).days)
+                pos_age = calc_position_age(entry_ts, self._now_kst.date(), df)
+                trading_days_held = pos_age.days_held
+                days_held = trading_days_held
+                calendar_days_held = _calendar_days_held(entry_ts, self._now_kst.date())
+                holding_bars = max(holding_bars, int(pos_age.holding_bars or 0))
             except Exception:
                 entry_ts = None
         logger.info(
-            "[EXIT][HOLDING_META] code=%s entry_date=%s days_held=%s last_fill_at=%s",
+            "[EXIT][HOLDING_META] code=%s entry_date=%s calendar_days_held=%s trading_days_held=%s holding_bars=%s last_fill_at=%s",
             display_code,
             entry_ts.date().isoformat() if entry_ts is not None else pos.get("entry_date"),
-            days_held,
+            calendar_days_held,
+            trading_days_held,
+            holding_bars,
             pos.get("last_fill_at"),
         )
 
@@ -8681,6 +8752,7 @@ class PB1Engine:
         if not df.empty and "high" in df.columns:
             highest_since_entry, post_entry_rows = _compute_highest_since_entry(df, entry_ts, float(avg or 0.0))
             trail_source = "post_entry_bars" if post_entry_rows > 0 else "entry_price_fallback"
+        holding_bars = max(int(holding_bars or 0), int(post_entry_rows or 0))
         logger.info(
             "[EXIT][HIGHEST] code=%s entry_ts=%s entry_price=%s post_entry_rows=%s highest_since_entry=%s",
             display_code,
@@ -8689,6 +8761,16 @@ class PB1Engine:
             post_entry_rows,
             highest_since_entry,
         )
+        if entry_ts is not None and calendar_days_held > 0 and post_entry_rows <= 0:
+            logger.warning(
+                "[EXIT][HIGHEST][WARN] code=%s entry_ts=%s calendar_days_held=%s trading_days_held=%s post_entry_rows=%s source=%s",
+                display_code,
+                entry_ts.isoformat(),
+                calendar_days_held,
+                trading_days_held,
+                post_entry_rows,
+                trail_source,
+            )
         if highest_since_entry and atr_current and atr_current > 0:
             trail_stop_price = highest_since_entry - (atr_current * ATR_MULT)
         logger.info(
@@ -8716,13 +8798,21 @@ class PB1Engine:
             )
 
         stop_hit = bool(stop_price is not None and mark <= float(stop_price))
-        time_stop_hit = bool(days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
+        time_stop_hit = bool(trading_days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
+        logger.info(
+            "[EXIT][TIME_STOP][BASIS] code=%s basis=trading_days calendar_days=%s trading_days=%s max_hold=%s hit=%s",
+            display_code,
+            calendar_days_held,
+            trading_days_held,
+            int(PB1_TIME_STOP_DAYS),
+            int(time_stop_hit),
+        )
         raw_ma20_break = bool(ma20 is not None and mark < ma20)
         raw_ma50_break = bool(ma50 is not None and mark < ma50)
         risk_off_signal = bool(failed_breakout or (heavy_volume and raw_ma50_break))
         exit_policy = _resolve_exit_policy(
-            days_held=days_held,
-            holding_bars=post_entry_rows,
+            days_held=trading_days_held,
+            holding_bars=holding_bars,
             stop_hit=stop_hit,
             trail_stop_price=trail_stop_price,
             mark=float(mark or 0.0),
@@ -8799,7 +8889,7 @@ class PB1Engine:
                 "drawdown_from_peak": trail_drawdown,
                 "threshold": trail_threshold,
                 "eligible": bool(exit_policy["trail_eligible"]),
-                "holding_bars": post_entry_rows,
+                "holding_bars": holding_bars,
             },
             "ma20_break": {
                 "hit": bool(ma20_break),
@@ -8817,7 +8907,11 @@ class PB1Engine:
             },
             "time_stop": {
                 "hit": bool(time_stop_hit),
-                "holding_days": days_held,
+                "holding_days": trading_days_held,
+                "calendar_days_held": calendar_days_held,
+                "trading_days_held": trading_days_held,
+                "holding_bars": holding_bars,
+                "time_stop_basis": "trading_days",
                 "threshold": int(PB1_TIME_STOP_DAYS),
             },
             "regime_exit": {
@@ -8831,13 +8925,13 @@ class PB1Engine:
         logger.info("[EXIT][COND] code=%s conds=%s", display_code, conds)
         if exit_policy_family == "PULLBACK_EXIT":
             rule_checks = [
-                ("failed_breakout", failed_breakout, {"days_held": days_held, "pivot": pivot, "close": close_px}),
-                ("time_stop", time_stop_hit, {"days_held": days_held, "threshold": int(PB1_TIME_STOP_DAYS), "pnl_pct": ret_pct}),
+                ("failed_breakout", failed_breakout, {"days_held": trading_days_held, "pivot": pivot, "close": close_px}),
+                ("time_stop", time_stop_hit, {"calendar_days_held": calendar_days_held, "trading_days_held": trading_days_held, "threshold": int(PB1_TIME_STOP_DAYS), "pnl_pct": ret_pct}),
                 ("hard_stop", stop_hit, {"mark": mark, "stop_price": stop_price}),
             ]
         elif exit_policy_family == "MOMENTUM_EXIT":
             rule_checks = [
-                ("trail_stop", trail_hit, {"mark": mark, "trail_stop_price": trail_stop_price, "holding_bars": post_entry_rows}),
+                ("trail_stop", trail_hit, {"mark": mark, "trail_stop_price": trail_stop_price, "holding_bars": holding_bars}),
                 ("TP1", tp1_hit, {"actual_r": float(ret_pct / 100.0), "threshold_r": take_profit_threshold}),
                 ("TP2", tp2_hit, {"actual_r": float(ret_pct / 100.0), "threshold_r": tp2_threshold}),
                 ("hard_stop", stop_hit, {"mark": mark, "stop_price": stop_price}),
@@ -8845,9 +8939,9 @@ class PB1Engine:
         else:
             rule_checks = [
                 ("hard_stop", stop_hit, {"mark": mark, "stop_price": stop_price}),
-                ("trail_stop", trail_hit, {"mark": mark, "trail_stop_price": trail_stop_price, "holding_bars": post_entry_rows}),
-                ("failed_breakout", failed_breakout, {"days_held": days_held, "pivot": pivot, "close": close_px}),
-                ("time_stop", time_stop_hit, {"days_held": days_held, "threshold": int(PB1_TIME_STOP_DAYS), "pnl_pct": ret_pct}),
+                ("trail_stop", trail_hit, {"mark": mark, "trail_stop_price": trail_stop_price, "holding_bars": holding_bars}),
+                ("failed_breakout", failed_breakout, {"days_held": trading_days_held, "pivot": pivot, "close": close_px}),
+                ("time_stop", time_stop_hit, {"calendar_days_held": calendar_days_held, "trading_days_held": trading_days_held, "threshold": int(PB1_TIME_STOP_DAYS), "pnl_pct": ret_pct}),
             ]
         for rule_name, rule_hit, details in rule_checks:
             logger.info(
@@ -8859,14 +8953,20 @@ class PB1Engine:
                 details,
             )
         logger.info(
+            "[EXIT][ROUTER][CONSISTENCY] code=%s legacy_time_stop_hit=%s router_time_stop_hit=%s",
+            display_code,
+            int(time_stop_hit),
+            int(str(final_reason) == "EXIT_SWING_TIME_STOP"),
+        )
+        logger.info(
             "[EXIT][DECISION] code=%s name=%s qty=%s pnl_pct=%.2f days_held=%s same_day=%s holding_bars=%s hard_stop=%s trail_hit=%s trail_eligible=%s ma50_break=%s regime_exit=%s final_reason=%s",
             code,
             str(pos.get("name") or self._name_for_code(code) or code),
             qty,
             ret_pct,
-            days_held,
+            trading_days_held,
             int(exit_policy["same_day_entry"]),
-            post_entry_rows,
+            holding_bars,
             int(stop_hit),
             int(trail_hit),
             int(exit_policy["trail_eligible"]),
@@ -8911,7 +9011,7 @@ class PB1Engine:
                 horizon_result = _resolve_swing_staged_exit(
                     pos, float(mark or 0.0), ma20,
                     ret_pct=ret_pct,
-                    days_held=days_held,
+                    days_held=trading_days_held,
                     stop_hit=stop_hit,
                     highest_ret_pct=_max_pnl,
                 )
@@ -8919,7 +9019,7 @@ class PB1Engine:
                 horizon_result = _resolve_core_trend_follow_exit(
                     pos, float(mark or 0.0), ma20, ma50,
                     ret_pct=ret_pct,
-                    days_held=days_held,
+                    days_held=trading_days_held,
                     regime=regime_str,
                 )
 
@@ -8960,7 +9060,7 @@ class PB1Engine:
             avg_price=float(avg or 0.0),
             last_price=float(mark or 0.0),
             pnl_pct=float(ret_pct),
-            days_held=days_held,
+            days_held=trading_days_held,
             stop_hit=stop_hit,
             trail_hit=trail_hit,
             ma20_break=ma20_break,
@@ -8981,7 +9081,7 @@ class PB1Engine:
             avg_price=float(avg or 0.0),
             last_price=float(mark or 0.0),
             entry_date=entry_ts.isoformat() if entry_ts is not None else pos.get("entry_date"),
-            days_held=days_held,
+            days_held=trading_days_held,
             stop_loss_hit=exit_eval.stop_hit,
             trailing_stop_hit=exit_eval.trail_hit,
             ma20_break=exit_eval.ma20_break,
@@ -9003,7 +9103,13 @@ class PB1Engine:
                 "current_price": mark,
                 "stop_price_at_entry": pos.get("stop_price_at_entry") or stop_price,
                 "pivot_price_at_entry": pos.get("pivot_price_at_entry") or pivot,
-                "holding_days": days_held,
+                "holding_days": trading_days_held,
+                "calendar_days_held": calendar_days_held,
+                "trading_days_held": trading_days_held,
+                "holding_bars": holding_bars,
+                "time_stop_basis": "trading_days",
+                "legacy_time_stop_hit": bool(time_stop_hit),
+                "router_time_stop_hit": bool(str(exit_eval.primary_reason) == "EXIT_SWING_TIME_STOP"),
                 "pnl_pct": ret_pct,
                 "orderable_qty": int(pos.get("orderable_qty") or qty),
                 "trigger_metrics": {
@@ -9511,7 +9617,16 @@ class PB1Engine:
             for evaluation in exit_evaluations
             if bool(evaluation.get("exit_ok")) and int(evaluation.get("orderable_qty") or 0) > 0
         ])
+        submit_attempt_count = len([evaluation for evaluation in exit_evaluations if int(evaluation.get("submit_attempted") or 0) > 0])
         submitted_count = len([evaluation for evaluation in exit_evaluations if int(evaluation.get("submitted") or 0) > 0])
+        accepted_sell_count = submitted_count
+        fill_confirmed_sell_count = submitted_count
+        no_exit_count = len([evaluation for evaluation in exit_evaluations if not bool(evaluation.get("exit_ok"))])
+        blocked_count = len([
+            evaluation
+            for evaluation in exit_evaluations
+            if bool(evaluation.get("exit_ok")) and not int(evaluation.get("submitted") or 0)
+        ])
         if checked_count != len(holdings_exit_scope):
             logger.error(
                 "[CONSISTENCY][EXIT_HOLDINGS] existing_positions=%s holdings_exit_scope=%s checked=%s",
@@ -9525,15 +9640,28 @@ class PB1Engine:
             "checked": checked_count,
             "signal_hit": signal_hit_count,
             "orderable": orderable_count,
+            "evaluated_count": checked_count,
+            "signal_hit_count": signal_hit_count,
+            "orderable_count": orderable_count,
+            "submit_attempt_count": submit_attempt_count,
+            "accepted_sell_count": accepted_sell_count,
+            "fill_confirmed_sell_count": fill_confirmed_sell_count,
+            "no_exit_count": no_exit_count,
+            "blocked_count": blocked_count,
             "submitted": submitted_count,
         }
         logger.info(
-            "[EXIT][FUNNEL] holdings=%s checked=%s signal_hit=%s orderable=%s submitted=%s",
+            "[EXIT][FUNNEL] holdings=%s checked=%s signal_hit=%s orderable=%s submit_attempted=%s submitted=%s accepted_sells=%s fill_confirmed_sells=%s blocked=%s no_exit=%s",
             holdings_count,
             checked_count,
             signal_hit_count,
             orderable_count,
+            submit_attempt_count,
             submitted_count,
+            accepted_sell_count,
+            fill_confirmed_sell_count,
+            blocked_count,
+            no_exit_count,
         )
         if checked_count > signal_hit_count:
             logger.info("[EXIT][FUNNEL][DROP] stage=signal count=%s reasons=%s", checked_count - signal_hit_count, ["NO_EXIT_SIGNAL"])
@@ -9558,12 +9686,31 @@ class PB1Engine:
             str((evaluation.get("exit_policy_family") or evaluation.get("exit_family") or "UNKNOWN"))
             for evaluation in exit_evaluations
         )
-        reason_counter = Counter(
+        eval_reason_counter = Counter(
             str(evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
             for evaluation in exit_evaluations
         )
+        router_reason_counter = Counter(
+            str(evaluation.get("decision_reason") or evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
+            for evaluation in exit_evaluations
+        )
+        order_reason_counter = Counter(
+            str(evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
+            for evaluation in exit_evaluations
+            if int(evaluation.get("submitted") or 0) > 0
+        )
         logger.info("[EXIT][SUMMARY_BY_FAMILY] counts=%s", dict(family_counter))
-        logger.info("[EXIT][SUMMARY_BY_REASON] counts=%s", dict(reason_counter))
+        logger.info("[EXIT][SUMMARY_BY_REASON] counts=%s", dict(eval_reason_counter))
+        logger.info("[EXIT][SUMMARY][EVAL_REASON] counts=%s", dict(eval_reason_counter))
+        logger.info("[EXIT][SUMMARY][ROUTER_REASON] counts=%s", dict(router_reason_counter))
+        logger.info("[EXIT][SUMMARY][ORDER_REASON] counts=%s", dict(order_reason_counter))
+        self._exit_summary_payload.update(
+            {
+                "eval_reason_summary": dict(eval_reason_counter),
+                "router_reason_summary": dict(router_reason_counter),
+                "order_reason_summary": dict(order_reason_counter),
+            }
+        )
         return pos_list
 
     def _load_close_entry_orders(self) -> list[dict]:
@@ -11405,6 +11552,38 @@ class PB1Engine:
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status=final_status, notes=final_notes)
 
+        block_entry_after_exit, exit_block_metrics = self._should_block_entry_after_exit()
+        exit_submit_attempt_count = int(exit_block_metrics.get("exit_submit_attempt_count") or 0)
+        accepted_sell_count = int(exit_block_metrics.get("accepted_sell_count") or 0)
+        if block_entry_after_exit:
+            logger.warning(
+                "[ENTRY][BLOCKED_AFTER_EXIT] exit_submitted=%s accepted_sells=%s reason=avoid_same_run_reentry",
+                exit_submit_attempt_count,
+                accepted_sell_count,
+            )
+            _emit_entry_summary([], [], Counter())
+            _emit_entry_decision(
+                "SKIP",
+                reason="BLOCKED_AFTER_EXIT",
+                ok_setups=0,
+                blocked_by=_normalize_entry_block_reasons(["BLOCKED_AFTER_EXIT"]),
+            )
+            _set_run_summary_payload(
+                scanned=0,
+                setup_ok=0,
+                relax_ok=0,
+                score_ok=0,
+                risk_ok=0,
+                sized_ok=0,
+                buyable_ok=0,
+                order_candidates=0,
+                submitted=0,
+                blocked_reasons_counter=Counter({"BLOCKED_AFTER_EXIT": 1}),
+                no_trade_reason="BLOCKED_AFTER_EXIT",
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="OK_NO_TRADE", notes="BLOCKED_AFTER_EXIT")
+
         # ========== ENTRY PASS (EXIT와 완전 독립) ==========
         logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
 
@@ -12547,9 +12726,22 @@ class PB1Engine:
                         breakout_trigger_ok=trigger_ok,
                         trigger_reason=(trigger_info or {}).get("reason") if isinstance(trigger_info, dict) else None,
                     )
+                    trigger_policy = self._resolve_entry_trigger_policy(
+                        trigger_ok=trigger_ok,
+                        entry_ok=entry_ok,
+                        setup_filters_ok=setup_filters_ok,
+                        decision_family=final_entry_reason_code,
+                    )
+                    entry_ok, entry_reasons = self._enforce_explicit_trigger_bypass(
+                        entry_ok=entry_ok,
+                        trigger_ok=trigger_ok,
+                        trigger_policy=trigger_policy,
+                        reasons=entry_reasons,
+                    )
                     override_ok = bool(entry_ok and setup_filters_ok and not trigger_ok)
                     cf.features["entry_reason"] = normalized_entry_reason
                     cf.features["entry_setup_family"] = normalized_entry_reason
+                    cf.features["entry_trigger_policy"] = trigger_policy
                     cf.features["setup_ok"] = bool(setup_filters_ok)
                     cf.features["trigger_ok"] = bool(trigger_ok)
                     cf.features["override_ok"] = override_ok
@@ -12637,7 +12829,31 @@ class PB1Engine:
                             reasons=entry_reasons or ["entry_gate_fail"],
                         )
                         continue
-                    df, _ = self._fetch_daily(cf.code)
+                    df, meta = self._fetch_daily(cf.code)
+                    ohlcv_block_reason = self._entry_ohlcv_block_reason(df=df, meta=meta)
+                    if ohlcv_block_reason:
+                        self._record_drop(drop_reason_counter, drop_examples, ohlcv_block_reason, cf.code)
+                        order_stage_counter[ohlcv_block_reason] += 1
+                        self._log_order_skip(cf, [ohlcv_block_reason], "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=[ohlcv_block_reason],
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        self._store_entry_evaluation(
+                            cf,
+                            setup_ok=setup_filters_ok,
+                            score_ok=cf.code in set(self._debug_score_cut_codes),
+                            risk_ok=cf.code in set(self._debug_risk_ok_codes),
+                            sizing_ok=cf.code in set(self._debug_sizing_ok_codes),
+                            buyable_ok=True,
+                            trigger_ok=trigger_ok,
+                            order_ready=False,
+                            reasons=[ohlcv_block_reason],
+                        )
+                        continue
                     if df.empty:
                         self._record_drop(drop_reason_counter, drop_examples, "stop_calc_fail", cf.code)
                         order_stage_counter["stop_calc_fail"] += 1

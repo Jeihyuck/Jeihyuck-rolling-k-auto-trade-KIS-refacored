@@ -137,8 +137,12 @@ def resolve_exit_policy_for_position(
             exit_family = "SWING_STAGED_EXIT"
 
     # ── 보유 컨텍스트 ────────────────────────────────────────────────
-    days_held = int(holding_ctx.get("days_held") or 0)
-    same_day = bool(holding_ctx.get("same_day", days_held == 0))
+    calendar_days_held = int(holding_ctx.get("calendar_days_held") or holding_ctx.get("days_held") or 0)
+    trading_days_held = int(holding_ctx.get("trading_days_held") or holding_ctx.get("days_held") or 0)
+    holding_bars = int(holding_ctx.get("holding_bars") or 0)
+    legacy_time_stop_hit = holding_ctx.get("legacy_time_stop_hit")
+    days_held = trading_days_held
+    same_day = bool(holding_ctx.get("same_day", trading_days_held == 0))
     current_return_pct = float(holding_ctx.get("current_return_pct") or 0.0)
     current_r = float(holding_ctx.get("current_r") or 0.0)
     highest_return_pct = float(
@@ -171,10 +175,10 @@ def resolve_exit_policy_for_position(
     logger.info(
         "[EXIT][ROUTER][CTX] code=%s entry_style=%s exit_family=%s trade_horizon=%s "
         "ret_pct=%.2f current_r=%.2f highest_ret=%.2f drawdown=%.2f "
-        "days_held=%d trend_ok=%s trend_strong=%s regime=%s router=%s",
+        "calendar_days_held=%d trading_days_held=%d holding_bars=%d trend_ok=%s trend_strong=%s regime=%s router=%s",
         code_for_log, entry_style, exit_family, trade_horizon,
         current_return_pct, current_r, highest_return_pct, drawdown_from_peak_pct,
-        days_held, int(trend_ok), int(trend_strong), regime, int(enabled),
+        calendar_days_held, trading_days_held, holding_bars, int(trend_ok), int(trend_strong), regime, int(enabled),
     )
 
     # ── router 비활성화 → minimal fallback ──────────────────────────
@@ -227,6 +231,7 @@ def resolve_exit_policy_for_position(
         "trend_ok": trend_ok,
         "trend_strong": trend_strong,
         "router_enabled": True,
+        "time_stop_basis": "trading_days",
     })
 
     logger.info(
@@ -424,6 +429,12 @@ def apply_swing_exit_decision(
     tp1_done = bool(meta.get("tp1_done", False))
     tp2_done = bool(meta.get("tp2_done", False))
     giveback_protect_done = bool(meta.get("giveback_protect_done", False))
+    calendar_days_held = int(pos.get("calendar_days_held") or days_held)
+    trading_days_held = int(pos.get("trading_days_held") or days_held)
+    holding_bars = int(pos.get("holding_bars") or 0)
+    legacy_time_stop_hit = pos.get("legacy_time_stop_hit")
+    if legacy_time_stop_hit is None:
+        legacy_time_stop_hit = trading_days_held >= int(policy.get("max_hold_days") or 10) and current_r < 1.0
 
     orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
     code_for_log = str(pos.get("code") or pos.get("stock_code") or "UNKNOWN")
@@ -489,9 +500,9 @@ def apply_swing_exit_decision(
 
         if giveback_hit:
             # [2026-04-30] PB1_PROFIT_PROTECT_FULL_EXIT=1 이면 전량매도
-            full_exit = _eb("PB1_PROFIT_PROTECT_FULL_EXIT") or _eb("PB1_GIVEBACK_EXIT_FULL_SELL")
+            full_exit = _eb("PB1_PROFIT_PROTECT_FULL_EXIT", default=False) or _eb("PB1_GIVEBACK_EXIT_FULL_SELL", default=False)
             if full_exit:
-                sell_pct_used = None  # 전량
+                sell_pct_used = 1.0
                 qty = _calculate_exit_qty(orderable_qty, None)
                 logger.info(
                     "[EXIT][FULL_SELL_POLICY] code=%s reason=SWING_PROFIT_PROTECT_GIVEBACK "
@@ -695,12 +706,34 @@ def apply_swing_exit_decision(
     # ── 8. Time stop ──────────────────────────────────────────────────
     if policy.get("time_stop_enabled"):
         max_hold = int(policy.get("max_hold_days") or 10)
-        if days_held >= max_hold and current_r < 1.0:
+        router_time_stop_hit = bool(trading_days_held >= max_hold and current_r < 1.0)
+        logger.info(
+            "[EXIT][TIME_STOP][BASIS] basis=trading_days calendar_days=%s trading_days=%s max_hold=%s hit=%s",
+            calendar_days_held,
+            trading_days_held,
+            max_hold,
+            int(router_time_stop_hit),
+        )
+        if router_time_stop_hit and legacy_time_stop_hit is False:
+            logger.info("[EXIT][ROUTER][CONSISTENCY] legacy_time_stop_hit=0 router_time_stop_hit=0")
+            return {"exit_ok": False, "reason": "TIME_STOP_RULE_ROUTER_MISMATCH", "qty": 0, "sell_pct": None}
+        if router_time_stop_hit and trading_days_held <= 0:
+            logger.info("[EXIT][ROUTER][CONSISTENCY] legacy_time_stop_hit=%s router_time_stop_hit=0", int(bool(legacy_time_stop_hit)))
+            return {"exit_ok": False, "reason": "TIME_STOP_NO_TRADING_DAYS", "qty": 0, "sell_pct": None}
+        if router_time_stop_hit and trading_days_held < max_hold:
+            logger.info("[EXIT][ROUTER][CONSISTENCY] legacy_time_stop_hit=%s router_time_stop_hit=0", int(bool(legacy_time_stop_hit)))
+            return {"exit_ok": False, "reason": "TIME_STOP_TRADING_DAYS_NOT_REACHED", "qty": 0, "sell_pct": None}
+        logger.info(
+            "[EXIT][ROUTER][CONSISTENCY] legacy_time_stop_hit=%s router_time_stop_hit=%s",
+            int(bool(legacy_time_stop_hit)) if legacy_time_stop_hit is not None else -1,
+            int(router_time_stop_hit),
+        )
+        if router_time_stop_hit:
             qty = _calculate_exit_qty(orderable_qty, None)
             logger.info(
                 "[EXIT][ROUTER][DECISION] code=%s exit_ok=1 reason=EXIT_SWING_TIME_STOP "
-                "days=%s max=%s r=%.2f",
-                code_for_log, days_held, max_hold, current_r,
+                "calendar_days=%s trading_days=%s max=%s r=%.2f",
+                code_for_log, calendar_days_held, trading_days_held, max_hold, current_r,
             )
             return {
                 "exit_ok": True,

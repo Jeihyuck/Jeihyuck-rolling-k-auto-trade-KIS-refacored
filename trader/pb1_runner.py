@@ -2112,6 +2112,21 @@ def _has_today_session_buy_activity(orders_repo: OrdersRepo, env: str, now: date
     }
 
 
+def _resolve_reconcile_only_followup(
+    *,
+    enabled: bool,
+    pending: bool,
+    buy_orders: int,
+    sell_orders: int,
+    open_orders_count: int,
+) -> tuple[bool, bool]:
+    if not enabled:
+        return False, False
+    if pending:
+        return True, open_orders_count > 0
+    return False, (buy_orders + sell_orders) > 0
+
+
 def _apply_trade_session_override_env(*, enabled: bool, degraded_session: bool, session: str, classification: str) -> None:
     os.environ["PB1_FORCE_ENTRY_WINDOW_OVERRIDE"] = "1" if enabled else "0"
     os.environ["PB1_SESSION_RECOVERY_CONTINUE"] = "1" if enabled else "0"
@@ -5159,6 +5174,36 @@ def run_once(
         elif nontrading_eval_mode:
             logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
 
+        reconcile_only_enabled = str(os.getenv("PB1_RECONCILE_ONLY_AFTER_ORDER_SUBMIT") or "0") == "1"
+        reconcile_only_pending = str(os.getenv("PB1_PENDING_RECONCILE_ONLY") or "0") == "1"
+        if reconcile_only_enabled and reconcile_only_pending:
+            open_orders_count = 0
+            try:
+                open_orders_count = len(orders_repo.get_open_orders(env_effective) or [])
+            except Exception as exc:
+                logger.warning("[PB1][RECONCILE_ONLY][OPEN_ORDERS_READ_FAIL] err=%s", exc)
+            skip_engine, keep_pending = _resolve_reconcile_only_followup(
+                enabled=True,
+                pending=True,
+                buy_orders=0,
+                sell_orders=0,
+                open_orders_count=open_orders_count,
+            )
+            if keep_pending:
+                os.environ["PB1_PENDING_RECONCILE_ONLY"] = "1"
+            else:
+                os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
+            if skip_engine:
+                logger.info(
+                    "[PB1][RECONCILE_ONLY] enabled=1 pending=1 open_orders=%s action=skip_engine keep_pending=%s",
+                    open_orders_count,
+                    int(keep_pending),
+                )
+                runs_repo.finish_run(run_record_id, status="OK_NO_TRADE", notes="reconcile_only_after_submit")
+                db_write_reasons.append("reconcile_only")
+                _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="reconcile_only", now=now)
+                return [], True, {"buy_orders": 0, "sell_orders": 0, "warning_counts": {}}, phase_for_log, "OK_RECONCILE_ONLY"
+
         logger.info(
             "[TRADE][PRECHECK][BALANCE] state=%s require_balance=%s allow_compute_without_kis=%s",
             balance_state,
@@ -5907,6 +5952,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         ticks_degraded = 0
         buy_orders = 0
         sell_orders = 0
+        os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
         while True:
             if stop_requested["value"]:
                 exit_reason = "sigterm"
@@ -6010,6 +6056,18 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 balance_tick_cache_hits += metrics.get("balance_tick_cache_hits", 0)
                 buy_orders += int(metrics.get("buy_orders", 0) or 0)
                 sell_orders += int(metrics.get("sell_orders", 0) or 0)
+                skip_now, keep_pending = _resolve_reconcile_only_followup(
+                    enabled=str(os.getenv("PB1_RECONCILE_ONLY_AFTER_ORDER_SUBMIT") or "0") == "1",
+                    pending=str(os.getenv("PB1_PENDING_RECONCILE_ONLY") or "0") == "1",
+                    buy_orders=int(metrics.get("buy_orders", 0) or 0),
+                    sell_orders=int(metrics.get("sell_orders", 0) or 0),
+                    open_orders_count=0,
+                )
+                if not skip_now:
+                    if keep_pending:
+                        os.environ["PB1_PENDING_RECONCILE_ONLY"] = "1"
+                    else:
+                        os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
                 session_warning_counts = _merge_warning_counts(session_warning_counts, metrics.get("warning_counts"))
                 if bool(metrics.get("degraded", False)) or str(result_status or "").startswith("DEGRADED"):
                     ticks_degraded += 1
