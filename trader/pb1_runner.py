@@ -1527,9 +1527,16 @@ def compute_loop_deadline(now: datetime) -> datetime:
 
 
 def normalize_session_kind(raw: str) -> str:
-    """legacy pm/close 세션명을 afternoon으로 normalize한다."""
+    """Normalize session kind but NEVER convert close to afternoon.
+    
+    close must remain close for proper session_end calculation.
+    """
     raw = (raw or "").strip().lower()
-    if raw in {"pm", "close", "trade-pm", "trade-close"}:
+    # CRITICAL: close must never be converted to afternoon
+    if raw == "close" or raw == "trade-close":
+        return "close"
+    # Only pm (not close) converts to afternoon
+    if raw in {"pm", "trade-pm"}:
         return "afternoon"
     if raw in {"am", "morning"}:
         return "am"
@@ -1556,6 +1563,19 @@ def _resolve_trade_session(now: datetime) -> str:
 def _resolve_session_kind(now: datetime | None = None) -> str:
     raw_value = str(os.getenv("PB1_SESSION_KIND") or "").strip().lower()
     raw_window = str(os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    raw_force_session = str(os.getenv("PB1_FORCE_TRADE_SESSION") or "").strip().lower()
+    
+    # CRITICAL: close must never be converted to afternoon
+    # Check explicit settings first
+    if raw_value == "close" or raw_window == "close" or raw_force_session == "close":
+        logger.info(
+            "[PB1][SESSION_NORMALIZE] raw_session=%s normalized_session=close raw_window=%s raw_force=%s",
+            raw_value,
+            raw_window,
+            raw_force_session,
+        )
+        return "close"
+    
     normalized = normalize_session_kind(raw_value)
     normalized_window = normalize_session_kind(raw_window) if raw_window else raw_window
     if normalized != raw_value or normalized_window != raw_window:
@@ -1566,12 +1586,13 @@ def _resolve_session_kind(now: datetime | None = None) -> str:
             raw_window,
             normalized_window,
         )
-    if raw_value == "close":
+    
+    if raw_value in {"morning", "am"}:
+        return "am"
+    if raw_value in {"pm", "afternoon"}:
         return "afternoon"
-    if raw_value in {"morning", "am", "pm"}:
-        return "am" if raw_value in {"morning", "am"} else "afternoon"
-    if raw_value == "afternoon":
-        return "afternoon"
+    if normalized in {"am", "afternoon", "close"}:
+        return normalized
     return _resolve_trade_session(now or _get_now_kst())
 
 
@@ -3286,6 +3307,15 @@ def _resolve_window_label(market_window: str, window: WindowDecision | None) -> 
 def normalize_window(*, session_kind: str, input_window: Any) -> str:
     normalized_session = str(session_kind or "").strip().lower()
     normalized_input = str(input_window or "").strip().lower()
+    
+    # CRITICAL: close window must stay close
+    if normalized_input == "close":
+        logger.info(
+            "[PB1][WINDOW][NORMALIZE] session_kind=%s input_window=close normalized_window=close",
+            normalized_session,
+        )
+        return "close"
+    
     if normalized_session == "am" and normalized_input in {"am", "morning", "intraday", "day", "preopen", "session", "open"}:
         logger.info(
             "[PB1][WINDOW][NORMALIZE] session_kind=%s input_window=%s normalized_window=morning",
@@ -3293,7 +3323,7 @@ def normalize_window(*, session_kind: str, input_window: Any) -> str:
             normalized_input or "none",
         )
         return "morning"
-    if normalized_input in {"preopen", "morning", "intraday", "close"}:
+    if normalized_input in {"preopen", "morning", "intraday"}:
         return "intraday"
     if normalized_input == "after":
         return "after"
@@ -5560,15 +5590,18 @@ def run_once(
                     mismatch_categories,
                 )
             state_label = "ORDER_SUBMITTED" if int(run_summary.get("submitted", 0)) > 0 else "NO_ORDERABLE"
-            # 세션별 HEARTBEAT prefix 동적 결정
+            # 세션별 HEARTBEAT prefix 동적 결정 - close는 반드시 TRADE_CLOSE
             _hb_session_kind = os.getenv("PB1_SESSION_KIND") or os.getenv("PB1_FORCE_TRADE_SESSION") or "unknown"
-            if _hb_session_kind == "am":
+            _hb_window = os.getenv("FORCE_MARKET_WINDOW") or ""
+            _hb_phase = (os.getenv("FORCE_PB1_PHASE") or os.getenv("PB1_PHASE_DEFAULT") or "").strip().lower()
+            
+            if _hb_session_kind == "close" or _hb_window == "close":
+                _hb_prefix = "TRADE_CLOSE"
+            elif _hb_session_kind == "am":
                 _hb_prefix = "TRADE_AM"
             elif _hb_session_kind in ("afternoon", "pm"):
-                _hb_phase = (os.getenv("FORCE_PB1_PHASE") or os.getenv("PB1_PHASE_DEFAULT") or "").strip().lower()
+                # PM entry phase uses TRADE_AFTERNOON, exit phase uses TRADE_CLOSE
                 _hb_prefix = "TRADE_CLOSE" if _hb_phase == "exit" else "TRADE_AFTERNOON"
-            elif _hb_session_kind == "close":
-                _hb_prefix = "TRADE_CLOSE"
             else:
                 _hb_prefix = f"TRADE_{_hb_session_kind.upper()}"
             logger.info(
@@ -6140,18 +6173,23 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 time_mod.sleep(sleep_for)
                 continue
             except TickTimeoutError as exc:
+                # RECOVERABLE TIMEOUT - not fatal, just degraded
                 ticks_degraded += 1
                 session_warning_counts["timeout_count"] = int(session_warning_counts.get("timeout_count", 0)) + 1
+                session_warning_counts["tick_timeout_recoverable"] = int(session_warning_counts.get("tick_timeout_recoverable", 0)) + 1
+                
+                _last_stage_on_timeout = os.getenv("PB1_LAST_STAGE", "unknown")
                 logger.warning(
-                    "[WARN][PB1][TICK_TIMEOUT] kind=%s now=%s session_end=%s timeout_sec=%s err=%s",
+                    "[PB1][TICK_TIMEOUT][RECOVERABLE] kind=%s tick=%s last_stage=%s timeout_sec=%s now=%s session_end=%s",
                     session_kind,
+                    ticks_total + 1,
+                    _last_stage_on_timeout,
+                    tick_timeout_sec,
                     now.isoformat(),
                     session_end_dt.isoformat(),
-                    tick_timeout_sec,
-                    exc,
                 )
+                
                 # tick timeout 후 오염된 DB connection dispose
-                _last_stage_on_timeout = os.getenv("PB1_LAST_STAGE", "unknown")
                 if os.getenv("PB1_DISPOSE_ENGINE_ON_TICK_TIMEOUT", "1") not in {"0", "false"}:
                     dispose_engine_safely(engine, reason=f"tick_hard_timeout:{_last_stage_on_timeout}")
                     session_warning_counts["db_engine_dispose_count"] = int(session_warning_counts.get("db_engine_dispose_count", 0)) + 1
@@ -6163,8 +6201,10 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     _recovery_sleep_sec = max(1, int(os.getenv("PB1_DB_RECOVERY_SLEEP_SEC", "2")))
                     logger.info("[PB1][TICK][RECOVERY_SLEEP] sec=%s reason=db_timeout", _recovery_sleep_sec)
                     time_mod.sleep(_recovery_sleep_sec)
+                
                 now_after_timeout = _get_now_kst()
                 if now_after_timeout >= session_end_dt:
+                    logger.info("[PB1][LOOP] after timeout recovery, session_end reached -> exit")
                     exit_reason = "session_end"
                     break
                 sleep_for = _sleep_until_next_tick_or_session_end(

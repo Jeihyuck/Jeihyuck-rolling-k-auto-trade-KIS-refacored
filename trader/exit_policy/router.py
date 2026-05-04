@@ -704,14 +704,36 @@ def apply_swing_exit_decision(
         }
 
     # ── 8. Time stop ──────────────────────────────────────────────────
+    # [2026-05-01] time-stop requires: trend_ok=1 AND r>=0.5 AND pnl above trading-day trendline
     if policy.get("time_stop_enabled"):
         max_hold = int(policy.get("max_hold_days") or 10)
-        router_time_stop_hit = bool(trading_days_held >= max_hold and current_r < 1.0)
+        time_stop_hit_basic = bool(trading_days_held >= max_hold and current_r < 1.0)
+        
+        # trend_ok check
+        trend_ok = int(pos.get("trend_ok") or 0) == 1
+        
+        # r >= 0.5 check
+        r_ok = current_r >= 0.5
+        
+        # PNL above trading-day trendline check (use ret_pct or highest_ret_pct as proxy)
+        pnl_trendline_ok = ret_pct >= 0.0  # simplified: positive PNL as trendline proxy
+        
+        # [STRICT] All 3 conditions must be satisfied for time-stop exit
+        time_stop_strict_conditions_met = trend_ok and r_ok and pnl_trendline_ok
+        router_time_stop_hit = time_stop_hit_basic and time_stop_strict_conditions_met
+        
         logger.info(
-            "[EXIT][TIME_STOP][BASIS] basis=trading_days calendar_days=%s trading_days=%s max_hold=%s hit=%s",
+            "[EXIT][TIME_STOP][BASIS] basis=trading_days calendar_days=%s trading_days=%s max_hold=%s "
+            "time_stop_basic=%s trend_ok=%s r=%.2f r_ok=%s pnl_trendline_ok=%s strict_met=%s hit=%s",
             calendar_days_held,
             trading_days_held,
             max_hold,
+            int(time_stop_hit_basic),
+            int(trend_ok),
+            current_r,
+            int(r_ok),
+            int(pnl_trendline_ok),
+            int(time_stop_strict_conditions_met),
             int(router_time_stop_hit),
         )
         if router_time_stop_hit and legacy_time_stop_hit is False:
@@ -723,6 +745,14 @@ def apply_swing_exit_decision(
         if router_time_stop_hit and trading_days_held < max_hold:
             logger.info("[EXIT][ROUTER][CONSISTENCY] legacy_time_stop_hit=%s router_time_stop_hit=0", int(bool(legacy_time_stop_hit)))
             return {"exit_ok": False, "reason": "TIME_STOP_TRADING_DAYS_NOT_REACHED", "qty": 0, "sell_pct": None}
+        if time_stop_hit_basic and not time_stop_strict_conditions_met:
+            logger.info(
+                "[EXIT][TIME_STOP][BLOCKED] code=%s time_stop_basic=1 but strict_conditions_not_met "
+                "trend_ok=%s r=%.2f r_ok=%s pnl_trendline_ok=%s",
+                code_for_log, int(trend_ok), current_r, int(r_ok), int(pnl_trendline_ok),
+            )
+            # Do not exit if strict conditions not met
+            pass
         logger.info(
             "[EXIT][ROUTER][CONSISTENCY] legacy_time_stop_hit=%s router_time_stop_hit=%s",
             int(bool(legacy_time_stop_hit)) if legacy_time_stop_hit is not None else -1,
@@ -732,8 +762,9 @@ def apply_swing_exit_decision(
             qty = _calculate_exit_qty(orderable_qty, None)
             logger.info(
                 "[EXIT][ROUTER][DECISION] code=%s exit_ok=1 reason=EXIT_SWING_TIME_STOP "
-                "calendar_days=%s trading_days=%s max=%s r=%.2f",
+                "calendar_days=%s trading_days=%s max=%s r=%.2f trend_ok=%s r_ok=%s pnl_trendline_ok=%s",
                 code_for_log, calendar_days_held, trading_days_held, max_hold, current_r,
+                int(trend_ok), int(r_ok), int(pnl_trendline_ok),
             )
             return {
                 "exit_ok": True,

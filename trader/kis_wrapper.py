@@ -1086,13 +1086,15 @@ class KisAPI:
         except Exception as e:
             logger.warning("[NET] session reset failed: %s", e)
 
-    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, **kwargs) -> requests.Response:
+    def _safe_request(self, method: str, url: str, *, reset_on_error: bool = True, endpoint: str | None = None, **kwargs) -> requests.Response:
         """
         공통 안전요청 래퍼:
         - DIAG 모드: 주문 차단, 데이터는 ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 허용
         - MINERVINI_ONLY: FORCE_HTTP=1이 아니면 전체 차단
         - SSLError/일시 오류 시 지수형 백오프 + 세션 리셋 후 재시도
         - 기본 시도 self._safe_attempts
+        - [2026-05-01] endpoint별 proactive throttle (inquire_daily_chart 0.7s, order_cash 0.5s, inquire_price 0.4s)
+        - [2026-05-01] EGW002 exponential backoff + circuit breaker
         """
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
         force_http = os.getenv("FORCE_HTTP", "0").strip() == "1"
@@ -1105,8 +1107,30 @@ class KisAPI:
             allow_data_http_in_diag_raw or "0",
             int(allow_data_http_in_diag),
             caller_route,
-            _endpoint_name(url),
+            endpoint or _endpoint_name(url),
         )
+        
+        # ✅ Proactive endpoint-specific throttling
+        if endpoint and self._rate_limit_safe_enabled():
+            endpoint_intervals = {
+                "inquire_daily_chart": 0.7,
+                "order_cash": 0.5,
+                "inquire_price": 0.4,
+            }
+            min_interval = endpoint_intervals.get(endpoint)
+            if min_interval:
+                with self._limiter._lock:
+                    now = time.time()
+                    last = self._limiter.last_at.get(endpoint, 0.0)
+                    delta = now - last
+                    if delta < min_interval:
+                        sleep_sec = min_interval - delta + random.uniform(0, 0.05)
+                        logger.debug(
+                            "[KIS][ENDPOINT_THROTTLE] endpoint=%s sleep=%.3f min_interval=%.3f",
+                            endpoint, sleep_sec, min_interval,
+                        )
+                        time.sleep(sleep_sec)
+                    self._limiter.last_at[endpoint] = time.time()
         
         # ✅ MINERVINI_ONLY: FORCE_HTTP 없으면 전체 차단
         from trader.config import MINERVINI_ONLY
@@ -1227,6 +1251,31 @@ class KisAPI:
                     msg_cd = str(body.get("msg_cd") or "").strip()
                     msg_text = str(body.get("msg1") or "").lower()
                     rt_cd = str(body.get("rt_cd") or "").strip()
+                    
+                    # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
+                    if _is_egw002_error(body, msg_cd):
+                        if "inquire-price" in _endpoint_path(url):
+                            _mark_price_rate_limited(
+                                _endpoint_name(url),
+                                str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
+                                msg_cd,
+                                str(body.get("msg1") or ""),
+                            )
+                        logger.error(
+                            "[KIS][EGW002][DETECTED] endpoint=%s attempt=%s msg_cd=%s msg1=%s",
+                            endpoint or _endpoint_name(url),
+                            i,
+                            msg_cd,
+                            body.get("msg1"),
+                        )
+                        # Circuit breaker pause (15s)
+                        _price_cache.open_circuit(rate_limited=True)
+                        # Exponential backoff
+                        _egw002_backoff_sleep(attempt=i)
+                        if i < attempts:
+                            continue
+                        raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
+                    
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
@@ -1880,7 +1929,7 @@ class KisAPI:
                         for code_fmt in code_variants:
                             params = {"fid_cond_mrkt_div_code": market_div, "fid_input_iscd": code_fmt}
                             try:
-                                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0))
+                                resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 5.0), endpoint="inquire_price")
                                 data = resp.json()
                             except KisTemporaryError as exc:
                                 last_error = exc

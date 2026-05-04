@@ -65,29 +65,57 @@ def _apply_prewarm_guard(now_override: datetime | None = None) -> int | None:
 
     target_raw = os.getenv("PB1_TARGET_START_TIME", "")
     allow_until_raw = os.getenv("PB1_START_ALLOW_UNTIL", "")
-    if not target_raw or not allow_until_raw:
+    
+    # Select correct session_end based on session_kind
+    session = os.getenv("PB1_SESSION_KIND", "").strip().lower()
+    if session == "close":
+        session_end_raw = os.getenv("PB1_CLOSE_SESSION_END", "")
+    elif session in ("afternoon", "pm"):
+        session_end_raw = os.getenv("PB1_PM_SESSION_END", "")
+    elif session == "am":
+        session_end_raw = os.getenv("PB1_AM_SESSION_END", "")
+    else:
+        # Fallback check all
+        session_end_raw = os.getenv("PB1_PM_SESSION_END") or os.getenv("PB1_CLOSE_SESSION_END") or os.getenv("PB1_AM_SESSION_END", "")
+    
+    if not target_raw:
         return None
 
     try:
         target_time = _dtime.fromisoformat(target_raw)
-        allow_until_time = _dtime.fromisoformat(allow_until_raw)
     except ValueError:
         logger.warning(
-            "[PB1][PREWARM][PARSE_ERROR] target=%s allow_until=%s – skipping guard",
+            "[PB1][PREWARM][PARSE_ERROR] target=%s – skipping guard",
             target_raw,
-            allow_until_raw,
         )
         return None
+    
+    # Parse allow_until if provided (used for warnings only, not hard skip)
+    allow_until_time = None
+    if allow_until_raw:
+        try:
+            allow_until_time = _dtime.fromisoformat(allow_until_raw)
+        except ValueError:
+            pass
+    
+    # Parse session_end - this is the real deadline
+    session_end_time = None
+    if session_end_raw:
+        try:
+            session_end_time = _dtime.fromisoformat(session_end_raw)
+        except ValueError:
+            pass
 
     # minute-precision comparison (seconds dropped)
     now_time = now.time().replace(second=0, microsecond=0)
 
-    # stale skip: allow_until 이후 → 이미 늦었으므로 실행 안 함
-    if now_time > allow_until_time:
+    # CRITICAL: Only skip if past actual session end, not START_ALLOW_UNTIL
+    # START_ALLOW_UNTIL is for warnings/degraded marking, not hard skip
+    if session_end_time and now_time >= session_end_time:
         logger.info(
-            "[PB1][PREWARM][STALE_SKIP] now=%s allow_until=%s session=%s",
+            "[PB1][PREWARM][STALE_SKIP] now=%s session_end=%s session=%s reason=past_session_end",
             now.strftime("%H:%M"),
-            allow_until_raw,
+            session_end_raw,
             session,
         )
         logger.info(
@@ -95,6 +123,32 @@ def _apply_prewarm_guard(now_override: datetime | None = None) -> int | None:
             session,
         )
         return 0
+    
+    # Allow late start with warning if past START_ALLOW_UNTIL but before session end
+    if allow_until_time and now_time > allow_until_time:
+        if session_end_time and now_time < session_end_time:
+            logger.warning(
+                "[PB1][PREWARM][LATE_START_ALLOWED] now=%s allow_until=%s session_end=%s session=%s action=run_with_warning",
+                now.strftime("%H:%M"),
+                allow_until_raw,
+                session_end_raw,
+                session,
+            )
+            # Continue to run, just mark as late
+            os.environ["PB1_LATE_START_WARNING"] = "1"
+        else:
+            # Past session end
+            logger.info(
+                "[PB1][PREWARM][STALE_SKIP] now=%s session_end=%s session=%s",
+                now.strftime("%H:%M"),
+                session_end_raw or "unknown",
+                session,
+            )
+            logger.info(
+                "[RUN_SUMMARY][RESULT] status=OK_NO_TRADE reason=SKIP_PHASE_WINDOW session=%s",
+                session,
+            )
+            return 0
 
     # 목표 시간 전: target까지 대기
     if now_time < target_time:
