@@ -938,23 +938,6 @@ def load_locked_us_watchlist(
         return []
 
 
-def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:
-    """us_watchlist 항목 수 조회."""
-    engine = _get_engine_or_none()
-    if engine is None:
-        if locked_only:
-            return len([w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date])
-        return len([w for w in _MEM_WATCHLIST if w.get("trade_date") == trade_date])
-    
-    try:
-        with engine.connect() as conn:
-            if locked_only:
-                row = conn.execute(
-                    text("SELECT COUNT(*) as cnt FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
-                    {"td": trade_date},
-                ).fetchone()
-
-
 def load_locked_us_watchlist_strict(
     trade_date: str,
     expected_run_id: str | None = None,
