@@ -332,28 +332,37 @@ jobs:
         if: always()
         working-directory: repo
         run: |
+          set -euo pipefail
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
-          
-          # Fatal runtime errors (Traceback, HTTP_FAIL_FINAL)
-          if grep -E "Traceback|\[US_KIS\]\[HTTP_FAIL_FINAL\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+
+          # Success: phase guard intentionally skipped the prep run.
+          # Covers stale scheduled starts, duplicate DST crons, and manual runs without confirmation.
+          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_PREP\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_PREP_VERIFY][SKIP_OK] phase guard skipped prep intentionally"
+            grep -n -E "\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -5
+            exit 0
+          fi
+
+          # Fatal runtime errors.
+          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "::error::Fatal runtime error detected"
-            grep -n -E "Traceback|\[US_KIS\]\[HTTP_FAIL_FINAL\]" artifacts/${US_LOG_FILE} | head -10
+            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]" artifacts/${US_LOG_FILE} | head -10
             exit 1
           fi
-          
-          # Success: final status is OK or OK_WITH_WARNINGS
-          if grep -E "\[US_PREP\]\[FINISH\].*status=(OK|OK_WITH_WARNINGS)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+
+          # Success: final status is OK or OK_WITH_WARNINGS.
+          if grep -E "\\[US_PREP\\]\\[FINISH\\].*status=(OK|OK_WITH_WARNINGS)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_PREP_VERIFY][OK] final status accepted"
             exit 0
           fi
-          
-          # Failure: final status is DEGRADED or ERROR
-          if grep -E "\[US_PREP\]\[FINISH\].*status=(DEGRADED|ERROR)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+
+          # Failure: final status is DEGRADED or ERROR.
+          if grep -E "\\[US_PREP\\]\\[FINISH\\].*status=(DEGRADED|ERROR)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "::error::US prep final status failed"
-            grep -n -E "\[US_PREP\]\[FINISH\]" artifacts/${US_LOG_FILE} | tail -5
+            grep -n -E "\\[US_PREP\\]\\[FINISH\\]" artifacts/${US_LOG_FILE} | tail -5
             exit 1
           fi
-          
+
           echo "::error::US prep final status marker missing"
           exit 1
 
