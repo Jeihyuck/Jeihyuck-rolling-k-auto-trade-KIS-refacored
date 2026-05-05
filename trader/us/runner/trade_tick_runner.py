@@ -39,6 +39,59 @@ def _entry_cutoff_passed(now: datetime) -> bool:
     return now_ny.time() >= cutoff
 
 
+def _dedupe_watchlist_best_by_symbol(rows: list[dict]) -> list[dict]:
+    """Locked watchlist rows를 symbol별 최고 score 1개로 축약한다.
+    
+    Args:
+        rows: 중복 symbol이 포함된 watchlist rows
+        
+    Returns:
+        symbol별 최고 score row만 남긴 list
+    """
+    from trader.us.symbols import normalize_symbol
+
+    best: dict[str, dict] = {}
+    raw_count = len(rows)
+
+    for row in rows:
+        try:
+            sym = str(row.get("symbol", "")).upper()
+            if not sym:
+                continue
+            # normalize_symbol로 정규화 (없으면 uppercase만)
+            try:
+                sym = normalize_symbol(sym)
+            except Exception:
+                pass
+            
+            score = float(row.get("score") or 0.0)
+
+            clean = dict(row)
+            clean["symbol"] = sym
+            clean["_dedupe_score"] = score
+
+            prev = best.get(sym)
+            if prev is None or score > float(prev.get("_dedupe_score") or 0.0):
+                best[sym] = clean
+        except Exception as exc:
+            logger.warning(
+                "[US_ENTRY][WATCHLIST_DEDUPE_SKIP] row=%s error=%s",
+                row, exc
+            )
+
+    deduped = sorted(
+        best.values(),
+        key=lambda r: float(r.get("_dedupe_score") or 0.0),
+        reverse=True,
+    )
+
+    logger.info(
+        "[US_ENTRY][WATCHLIST_DEDUPE] raw_rows=%d unique_symbols=%d duplicate_rows=%d",
+        raw_count, len(deduped), raw_count - len(deduped)
+    )
+    return deduped
+
+
 def run_trade_tick(
     session: str = "am",
     env: str = "practice",
@@ -171,6 +224,8 @@ def run_trade_tick(
     fills_today: list[dict] = []
     fills_error_count = 0
     fills_warnings_count = 0
+    fills_contract_error = False
+    fills_temp_error = False
     
     if not offline:
         try:
@@ -182,12 +237,14 @@ def run_trade_tick(
                     fills_result.get("error", "unknown")
                 )
                 fills_error_count += 1
+                fills_contract_error = True
             elif fills_result["status"] == "TEMP_ERROR":
                 logger.warning(
                     "[US_TICK][WARN] fills fetch TEMP_ERROR: %s",
                     fills_result.get("error", "unknown")
                 )
                 fills_warnings_count += 1
+                fills_temp_error = True
             elif fills_result["status"] != "OK":
                 logger.warning(
                     "[US_TICK][WARN] fills fetch failed: %s",
@@ -269,7 +326,12 @@ def run_trade_tick(
     entry_eval_error_count = 0
     after_cutoff = _entry_cutoff_passed(now)
 
-    if after_cutoff:
+    # fills contract error 발생 시 신규 BUY 차단
+    if fills_contract_error and os.getenv("US_REQUIRE_FILL_CONFIRM", "1") == "1":
+        logger.error(
+            "[US_ENTRY][BLOCK] reason=fills_contract_error require_fill_confirm=1"
+        )
+    elif after_cutoff:
         logger.info(
             "[US_ENTRY][BLOCK] reason=after_entry_cutoff time=%s",
             now.strftime("%H:%M:%S"),
@@ -306,11 +368,20 @@ def run_trade_tick(
                 )
                 
                 if watchlist_rows:
-                    # watchlist_rows를 authoritative input으로 그대로 사용
-                    # dict list로 변환하지 않음 (unhashable type: 'dict' 방지)
+                    raw_watchlist_count = len(watchlist_rows)
+                    # symbol별 best row로 dedupe
+                    watchlist_rows = _dedupe_watchlist_best_by_symbol(watchlist_rows)
+                    
+                    # Pipeline contract 로그
                     logger.info(
-                        "[US_ENTRY][LOCKED_WATCHLIST] count=%d prep_status=%s source=db_us_locked_watchlist",
-                        len(watchlist_rows), prep_status
+                        "[US_PIPELINE][CONTRACT] session=%s trade_date=%s prep_status=%s locked_raw=%d locked_deduped=%d fills_status=%s",
+                        session, trade_date, prep_status, raw_watchlist_count, len(watchlist_rows),
+                        "OK" if fills_error_count == 0 else ("CONTRACT_ERROR" if fills_contract_error else "TEMP_ERROR")
+                    )
+                    
+                    logger.info(
+                        "[US_ENTRY][LOCKED_WATCHLIST] raw_count=%d deduped_count=%d prep_status=%s source=db_us_locked_watchlist",
+                        raw_watchlist_count, len(watchlist_rows), prep_status
                     )
                     
                     # INPUT CONTRACT 검증

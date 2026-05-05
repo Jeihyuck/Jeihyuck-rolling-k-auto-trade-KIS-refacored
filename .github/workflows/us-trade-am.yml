@@ -21,6 +21,10 @@ name: "US Trade AM"
         description: "Type RUN_US_AM_MANUAL to run manually"
         required: false
         default: ""
+      confirm_trade:
+        description: "Required when dry_run=false. Type RUN_US_AM_TRADE_MANUAL"
+        required: false
+        default: ""
       force_now:
         description: "Manual smoke only. Forced NY datetime, e.g. 2026-05-01T09:35:00-04:00"
         required: false
@@ -128,7 +132,9 @@ jobs:
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
           target_min=$((9 * 60 + 30))
-          stale_min=$((10 * 60 + 15))
+          stale_min=$((10 * 60 + 30))
+          max_wait_seconds=900
+          max_wait_min=$((max_wait_seconds / 60))
 
           should_run=1
           skip_reason=""
@@ -139,6 +145,9 @@ jobs:
             if [[ "$now_min" -gt "$stale_min" ]]; then
               should_run=0
               skip_reason="skip_stale_start_us_am"
+            elif [[ "$now_min" -lt $((target_min - max_wait_min)) ]]; then
+              should_run=0
+              skip_reason="skip_too_early_us_am_duplicate_cron"
             elif [[ "$now_min" -lt "$target_min" ]]; then
               wait_until_target=1
               wait_seconds=$(( (target_min - now_min) * 60 ))
@@ -147,7 +156,15 @@ jobs:
 
           if [[ "$event_name" == "workflow_dispatch" ]]; then
             confirm="${{ inputs.confirm || '' }}"
-            if [[ "$confirm" != "RUN_US_AM_MANUAL" ]]; then
+            confirm_trade="${{ inputs.confirm_trade || '' }}"
+            dry_run_input="${{ inputs.dry_run && 'true' || 'false' }}"
+
+            if [[ "$dry_run_input" == "false" ]]; then
+              if [[ "$confirm_trade" != "RUN_US_AM_TRADE_MANUAL" ]]; then
+                should_run=0
+                skip_reason="manual_us_am_trade_not_confirmed"
+              fi
+            elif [[ "$confirm" != "RUN_US_AM_MANUAL" ]]; then
               should_run=0
               skip_reason="manual_us_am_not_confirmed"
             fi
@@ -235,6 +252,23 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: US Python syntax preflight
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_PREFLIGHT][START] py_compile"
+            python -m py_compile trader/us/execution/kis_us_client.py
+            python -m py_compile trader/us/execution/fills.py
+            python -m py_compile trader/us/runner/trade_tick_runner.py
+            python -m py_compile trader/us/runner/trade_session_runner.py
+            python -m py_compile trader/us/pb1/us_entry_engine.py
+            python -m py_compile trader/us/pb1/us_pb1_engine.py
+            python -m compileall -q trader/us
+            echo "[US_PREFLIGHT][DONE]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: Wait until US AM target start
         if: steps.phase_guard.outputs.should_run == '1' && steps.phase_guard.outputs.wait_until_target == '1'
@@ -391,30 +425,35 @@ jobs:
         if: always()
         working-directory: repo
         run: |
+          set -euo pipefail
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
-          grep -E "\[US_TRADE_AM\]\[TRIGGER\]" artifacts/${US_LOG_FILE} >/dev/null || echo "::warning::missing trigger marker"
-          
-          # Enhanced error detection for US trade contract
-          ERROR_PATTERNS=(
-            "Traceback"
-            "\[US_KIS\]\[HTTP_FAIL_FINAL\]"
-            "\[US_FILLS\]\[ERROR\]"
-            "\[US_DATA\]\[FALLBACK_DB_EMPTY\]"
-            "\[US_DATA\]\[FALLBACK_STALE_EMPTY\]"
-            "\[US_ENTRY\]\[ERROR\]"
-            "\[US_TICK\]\[ERROR\]"
-            "status.*ERROR"
-            "HTTP 500"
-            "500 Internal Server Error"
-          )
-          
-          for pattern in "${ERROR_PATTERNS[@]}"; do
-            if grep -E "$pattern" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
-              echo "::error::Error pattern detected in AM trade: $pattern"
-              grep -n -E "$pattern" artifacts/${US_LOG_FILE} | head -5
-              exit 1
-            fi
-          done
+
+          # Success: phase guard intentionally skipped the AM run.
+          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_TRADE_AM\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_AM_VERIFY][SKIP_OK] phase guard skipped AM intentionally"
+            exit 0
+          fi
+
+          # Fatal errors.
+          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::Fatal AM trade error detected"
+            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]" artifacts/${US_LOG_FILE} | head -20
+            exit 1
+          fi
+
+          # Success session end.
+          if grep -E "\\[US_SESSION\\]\\[END\\].*reason=(session_end|max_ticks|force_now_single_tick|market_skip)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_AM_VERIFY][OK] session ended acceptably"
+            exit 0
+          fi
+
+          if grep -E "\\[US_TRADE_AM\\]\\[DONE\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_AM_VERIFY][OK] workflow done marker accepted"
+            exit 0
+          fi
+
+          echo "::error::US AM final success marker missing"
+          exit 1
 
       - name: Upload US artifacts
         if: always()

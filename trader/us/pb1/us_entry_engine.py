@@ -250,6 +250,7 @@ def generate_entry_intents(
     entries_map = {e["symbol"]: e for e in entries} if entries else {}
 
     scored: list[tuple[float, str, str, float, list[dict], dict]] = []
+    seen_symbols: set[str] = set()  # 중복 symbol 차단용
 
     for symbol in symbols:
         # symbol이 str인지 확인
@@ -258,6 +259,15 @@ def generate_entry_intents(
                 "[US_ENTRY][CONTRACT_FAIL] symbol must be str, got %s", type(symbol).__name__
             )
             raise TypeError(f"[US_ENTRY][INPUT_CONTRACT_FAIL] symbol must be str, got {type(symbol).__name__}")
+        
+        # 동일 tick 내 중복 symbol 차단
+        if symbol in seen_symbols:
+            logger.debug(
+                "[US_ENTRY][DEDUP_SKIP] symbol=%s reason=already_selected_this_tick",
+                symbol
+            )
+            continue
+        seen_symbols.add(symbol)
         
         # 당일 매도 차단
         if symbol in sold_today:
@@ -335,6 +345,15 @@ def generate_entry_intents(
 
     # rank 기반 정렬 (점수 내림차순)
     scored.sort(key=lambda x: x[0], reverse=True)
+    
+    # Entry engine 내부 dedupe 요약
+    input_symbols_count = len(symbols)
+    unique_symbols_count = len(seen_symbols)
+    skipped_duplicates = input_symbols_count - unique_symbols_count
+    logger.info(
+        "[US_ENTRY][DEDUP] input_rows=%d unique_symbols=%d skipped_duplicates=%d scored=%d",
+        input_symbols_count, unique_symbols_count, skipped_duplicates, len(scored)
+    )
 
     intents: list[dict] = []
     added_count = 0

@@ -84,6 +84,10 @@ def run_trade_session(
         session, env, offline, max_minutes, interval_sec,
     )
     logger.info(
+        "[US_SESSION][PIPELINE] session=%s requires_prep=1 requires_locked_watchlist=1 raw_universe_fallback=0",
+        session
+    )
+    logger.info(
         "[US_SESSION][FORCE_NOW] enabled=%s force_now=%s max_ticks=%d",
         1 if force_now else 0,
         force_now or "",

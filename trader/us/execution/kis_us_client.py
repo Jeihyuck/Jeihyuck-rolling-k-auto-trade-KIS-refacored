@@ -278,13 +278,17 @@ class KisUSClient:
             ny_tz = ZoneInfo("America/New_York")
             ord_dt = dt.now(tz=ny_tz).strftime("%Y%m%d")
         
-        logger.info("[US_FILLS][REQUEST] ord_dt=%s endpoint=inquire-ccnl", ord_dt)
+        logger.info(
+            "[US_FILLS][REQUEST] ord_start_dt=%s ord_end_dt=%s endpoint=inquire-ccnl",
+            ord_dt, ord_dt
+        )
         
         params = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
             "PDNO": "",
-            "ORD_DT": ord_dt,
+            "ORD_STRT_DT": ord_dt,
+            "ORD_END_DT": ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "NASD",
@@ -301,9 +305,9 @@ class KisUSClient:
         except Exception as exc:
             error_msg = str(exc)
             # INPUT_FIELD_NAME → contract error (non-temporary)
-            if "INPUT_FIELD_NAME" in error_msg or "ORD_DT" in error_msg:
+            if "INPUT_FIELD_NAME" in error_msg or "ORD_STRT_DT" in error_msg or "ORD_END_DT" in error_msg:
                 logger.error(
-                    "[US_FILLS][ERROR][CONTRACT] field=ORD_DT msg=%s", error_msg
+                    "[US_FILLS][ERROR][CONTRACT] field=ORD_STRT_DT/ORD_END_DT msg=%s", error_msg
                 )
                 raise KisUSClientError(f"KIS contract error: {error_msg}") from exc
             # EGW002 또는 rate limit → temporary
