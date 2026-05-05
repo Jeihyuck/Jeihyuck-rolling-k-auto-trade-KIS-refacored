@@ -64,11 +64,26 @@ class USDataProvider:
 
     Args:
         offline: True이면 stub 데이터만 반환 (HTTP 호출 없음)
+        cache_enabled: True이면 prep run 내에서 daily/price 캐시 사용
     """
 
-    def __init__(self, offline: bool = False) -> None:
+    def __init__(self, offline: bool = False, cache_enabled: bool = False) -> None:
         self._offline = offline
+        self._cache_enabled = cache_enabled
         self._client = None
+        self._daily_cache: dict = {}
+        self._price_cache: dict = {}
+        self.stats = {
+            "daily_hit": 0,
+            "daily_miss": 0,
+            "daily_ok_symbols": set(),
+            "daily_fail_symbols": set(),
+            "price_hit": 0,
+            "price_miss": 0,
+            "price_ok_symbols": set(),
+            "price_fail_symbols": set(),
+            "fail_reasons": {},
+        }
 
     def _get_client(self):
         if self._client is None:
@@ -161,14 +176,31 @@ class USDataProvider:
 
     def get_current_price(self, symbol: str, exchange: str) -> dict:
         """현재가 조회 (KIS → DB stale fallback)."""
+        cache_key = (symbol.upper(), exchange.upper())
+        
+        # Cache hit
+        if self._cache_enabled and cache_key in self._price_cache:
+            self.stats["price_hit"] += 1
+            logger.debug("[US_DATA][CACHE_HIT] type=price symbol=%s", symbol)
+            return self._price_cache[cache_key]
+        
+        # Cache miss
+        if self._cache_enabled:
+            self.stats["price_miss"] += 1
+            logger.debug("[US_DATA][CACHE_MISS] type=price symbol=%s", symbol)
+        
         if self._offline:
             logger.debug("[US_DATA][OFFLINE] current_price symbol=%s", symbol)
-            return _make_stub_price(symbol)
+            result = _make_stub_price(symbol)
+            if self._cache_enabled:
+                self._price_cache[cache_key] = result
+                self.stats["price_ok_symbols"].add(symbol.upper())
+            return result
         
         try:
             result = self._get_client().get_us_price(symbol, exchange)
             output = result.get("output", {})
-            return {
+            data = {
                 "last": output.get("last", "0"),
                 "open": output.get("open", "0"),
                 "high": output.get("high", "0"),
@@ -176,6 +208,10 @@ class USDataProvider:
                 "tvol": output.get("tvol", "0"),
                 "symbol": symbol,
             }
+            if self._cache_enabled:
+                self._price_cache[cache_key] = data
+                self.stats["price_ok_symbols"].add(symbol.upper())
+            return data
         except Exception as exc:
             from trader.us.execution.kis_us_client import KisUSTemporaryError
             
@@ -190,11 +226,22 @@ class USDataProvider:
                         "[US_DATA][FALLBACK_STALE_OK] symbol=%s date=%s",
                         symbol, stale_data.get("_stale_date", "unknown")
                     )
+                    if self._cache_enabled:
+                        self._price_cache[cache_key] = stale_data
+                        self.stats["price_ok_symbols"].add(symbol.upper())
                     return stale_data
                 else:
                     logger.error(
                         "[US_DATA][FALLBACK_STALE_EMPTY] symbol=%s no DB data", symbol
                     )
+                    if self._cache_enabled:
+                        self.stats["price_fail_symbols"].add(symbol.upper())
+                        self.stats["fail_reasons"][symbol.upper()] = "KIS_TEMP_ERROR_NO_DB_FALLBACK"
+            else:
+                # Non-temporary error
+                if self._cache_enabled:
+                    self.stats["price_fail_symbols"].add(symbol.upper())
+                    self.stats["fail_reasons"][symbol.upper()] = str(type(exc).__name__)
             # Re-raise original exception if not temporary or no DB fallback
             raise
 
@@ -203,13 +250,34 @@ class USDataProvider:
 
         전략 코드가 closes[-1]을 최신 가격으로 가정하므로 반드시 오름차순 반환.
         """
+        cache_key = (symbol.upper(), exchange.upper(), int(count))
+        
+        # Cache hit
+        if self._cache_enabled and cache_key in self._daily_cache:
+            self.stats["daily_hit"] += 1
+            logger.debug("[US_DATA][CACHE_HIT] type=daily symbol=%s count=%d", symbol, count)
+            return self._daily_cache[cache_key]
+        
+        # Cache miss
+        if self._cache_enabled:
+            self.stats["daily_miss"] += 1
+            logger.debug("[US_DATA][CACHE_MISS] type=daily symbol=%s count=%d", symbol, count)
+        
         if self._offline:
             logger.debug("[US_DATA][OFFLINE] daily_prices symbol=%s count=%d", symbol, count)
-            return _make_stub_daily(symbol, count)
+            result = _make_stub_daily(symbol, count)
+            if self._cache_enabled:
+                self._daily_cache[cache_key] = result
+                self.stats["daily_ok_symbols"].add(symbol.upper())
+            return result
         
         try:
             rows = self._get_client().get_us_daily_price(symbol, exchange, count)
-            return sorted(rows, key=lambda r: str(r.get("xymd", "")))
+            result = sorted(rows, key=lambda r: str(r.get("xymd", "")))
+            if self._cache_enabled:
+                self._daily_cache[cache_key] = result
+                self.stats["daily_ok_symbols"].add(symbol.upper())
+            return result
         except Exception as exc:
             from trader.us.execution.kis_us_client import KisUSTemporaryError
             
@@ -223,11 +291,22 @@ class USDataProvider:
                     logger.info(
                         "[US_DATA][FALLBACK_DB_OK] symbol=%s count=%d", symbol, len(db_rows)
                     )
+                    if self._cache_enabled:
+                        self._daily_cache[cache_key] = db_rows
+                        self.stats["daily_ok_symbols"].add(symbol.upper())
                     return db_rows
                 else:
                     logger.error(
                         "[US_DATA][FALLBACK_DB_EMPTY] symbol=%s no DB data", symbol
                     )
+                    if self._cache_enabled:
+                        self.stats["daily_fail_symbols"].add(symbol.upper())
+                        self.stats["fail_reasons"][symbol.upper()] = "KIS_TEMP_ERROR_NO_DB_FALLBACK"
+            else:
+                # Non-temporary error
+                if self._cache_enabled:
+                    self.stats["daily_fail_symbols"].add(symbol.upper())
+                    self.stats["fail_reasons"][symbol.upper()] = str(type(exc).__name__)
             # Re-raise original exception if not temporary or no DB fallback
             raise
 
@@ -283,3 +362,9 @@ class USDataProvider:
                     logger.warning("[US_DATA][WARN] orderable_cash field %s not numeric: %s", key, val)
         logger.warning("[US_DATA][WARN] orderable_cash not found in response, returning 0.0")
         return 0.0
+    
+    def get_client_stats(self) -> dict:
+        """KIS client stats 반환 (retry count 등)."""
+        if self._client is None:
+            return {}
+        return getattr(self._client, "stats", {})

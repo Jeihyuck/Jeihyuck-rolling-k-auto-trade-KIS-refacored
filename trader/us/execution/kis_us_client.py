@@ -63,6 +63,11 @@ class KisUSClient:
         self._cano = us_cfg.CANO
         self._acnt_prdt_cd = us_cfg.ACNT_PRDT_CD
         self._last_request_time: dict[str, float] = {}  # endpoint별 rate limiting
+        self.stats = {
+            "get_retry_count": 0,
+            "post_retry_count": 0,
+            "http_fail_final_count": 0,
+        }
 
     # ------------------------------------------------------------------
     # Auth
@@ -405,6 +410,7 @@ class KisUSClient:
                 is_temp = self._is_temporary_error(err, None)
                 
                 if is_temp and attempt < max_attempts:
+                    self.stats["get_retry_count"] += 1
                     backoff_sec = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
                     jitter = random.uniform(0, 0.3 * backoff_sec)
                     sleep_time = backoff_sec + jitter
@@ -417,6 +423,7 @@ class KisUSClient:
                     continue
                 
                 # 최종 실패
+                self.stats["http_fail_final_count"] += 1
                 logger.error(
                     f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
                     f"path={path!r} error={err!r} temporary={is_temp}"
@@ -450,6 +457,7 @@ class KisUSClient:
                 is_temp = self._is_temporary_error(err, None)
                 
                 if is_temp and attempt < max_attempts:
+                    self.stats["post_retry_count"] += 1
                     backoff_sec = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
                     jitter = random.uniform(0, 0.3 * backoff_sec)
                     sleep_time = backoff_sec + jitter
@@ -462,6 +470,7 @@ class KisUSClient:
                     continue
                 
                 # 최종 실패
+                self.stats["http_fail_final_count"] += 1
                 logger.error(
                     f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
                     f"path={path!r} error={err!r} temporary={is_temp}"

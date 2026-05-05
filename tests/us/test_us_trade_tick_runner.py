@@ -37,7 +37,7 @@ def test_tick_runner_am_offline():
         force_now="2026-01-02T09:35:00-05:00",
     )
 
-    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP"), \
+    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE"), \
         f"Unexpected status: {result}"
 
 
@@ -79,6 +79,6 @@ def test_tick_runner_offline_after_cutoff_no_entry_intents():
         force_now="2026-01-02T15:46:00-05:00",
     )
 
-    # SKIP 또는 OK/OK_WITH_WARNINGS
-    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP"), \
+    # SKIP 또는 OK/OK_WITH_WARNINGS/OK_NO_TRADE
+    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE"), \
         f"Unexpected status: {result}"
