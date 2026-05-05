@@ -61,7 +61,7 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
     if mode == "prep":
         from trader.us.runner.prep_runner import run_prep
         r = run_prep(env=env, offline=offline, force_now=force_now)
-        return 0 if r.get("status") == "OK" else 1
+        return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS") else 1
 
     if mode == "open":
         from trader.us.runner.trade_open_runner import run_trade_open

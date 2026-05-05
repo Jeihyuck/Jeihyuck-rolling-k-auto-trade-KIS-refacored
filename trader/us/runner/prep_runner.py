@@ -122,7 +122,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
 
     all_intents = []
     watchlist_entries: list[dict] = []
-    success_count = 0
+    scored_symbols: set[str] = set()  # unique symbols scored
+    event_success_count = 0  # total scoring events
     skip_count = 0
     error_count = 0
     critical_etf_failures: set[str] = set()
@@ -136,6 +137,15 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             # watchlist 항목 구성
             for intent in intents:
                 symbol = intent.get("symbol")
+                if symbol:
+                    norm_symbol = str(symbol).upper()
+                    scored_symbols.add(norm_symbol)
+                    event_success_count += 1
+                    
+                    # Critical ETF 검사
+                    if norm_symbol in CRITICAL_ETFS:
+                        logger.info("[US_PREP][CRITICAL_ETF_OK] symbol=%s", norm_symbol)
+                
                 watchlist_entries.append({
                     "symbol": symbol,
                     "exchange": intent.get("exchange", "NASDAQ"),
@@ -143,11 +153,6 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                     "score": float(intent.get("score", 0)),
                     "meta": {"run_id": run_id},
                 })
-                success_count += 1
-                
-                # Critical ETF 검사
-                if symbol in CRITICAL_ETFS:
-                    logger.info("[US_PREP][CRITICAL_ETF_OK] symbol=%s", symbol)
             
             logger.info("[US_STRATEGY][SCORED] strategy=%s intents=%d",
                         strat.name, len(intents))
@@ -163,26 +168,49 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     if engine_name == "pb1":
         try:
             from trader.us.pb1.us_entry_engine import score_symbol
+            from trader.us.symbols import normalize_symbol, resolve_exchange
             watchlist_size = int(os.getenv("US_PREP_WATCHLIST_SIZE", "30"))
             scored: list[tuple[float, str, str]] = []
+            
             for ticker in tickers:
-                sym = ticker if isinstance(ticker, str) else ticker.get("symbol", "")
-                exch = "NASDAQ" if isinstance(ticker, str) else ticker.get("exchange", "NASDAQ")
+                if isinstance(ticker, str):
+                    raw_sym = ticker
+                    raw_exch = None
+                else:
+                    raw_sym = ticker.get("symbol", "")
+                    raw_exch = ticker.get("exchange")
+                
+                critical_sym = str(raw_sym).upper()
+                
                 try:
+                    sym = normalize_symbol(raw_sym)
+                    critical_sym = sym
+                    exch = resolve_exchange(sym)
+                    
+                    if raw_exch and raw_exch.upper() != exch:
+                        logger.warning(
+                            "[US_PREP][PB1_EXCHANGE_OVERRIDE] symbol=%s input_exchange=%s registry_exchange=%s",
+                            sym, raw_exch, exch
+                        )
+                    
                     daily = provider.get_daily_prices(sym, exch)
                     current = provider.get_current_price(sym, exch)
                     sc = score_symbol(sym, daily, current)
+                    
                     if sc is not None:
                         scored.append((sc, sym, exch))
-                        success_count += 1
+                        scored_symbols.add(sym)
+                        event_success_count += 1
                     else:
                         skip_count += 1
+                        
                 except Exception as symbol_exc:
-                    logger.debug("[US_PREP][PB1_SKIP] symbol=%s error=%s", sym, symbol_exc)
+                    logger.debug("[US_PREP][PB1_SKIP] symbol=%s error=%s", raw_sym, symbol_exc)
                     skip_count += 1
-                    if sym in CRITICAL_ETFS:
-                        logger.error("[US_PREP][CRITICAL_ETF_FAIL] symbol=%s", sym)
-                        critical_etf_failures.add(sym)
+                    if critical_sym in CRITICAL_ETFS:
+                        logger.error("[US_PREP][CRITICAL_ETF_FAIL] symbol=%s", critical_sym)
+                        critical_etf_failures.add(critical_sym)
+                        
             scored.sort(key=lambda x: -x[0])
             for sc, sym, exch in scored[:watchlist_size]:
                 watchlist_entries.append({
@@ -198,16 +226,17 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
 
     # 상태 판정
     total_symbols = len(tickers)
+    unique_success_count = len(scored_symbols)
     prep_status = _determine_prep_status(
         total_symbols=total_symbols,
-        success_count=success_count,
+        success_count=unique_success_count,
         critical_etf_failures=critical_etf_failures,
         has_fatal_error=has_fatal_error,
     )
     
     logger.info(
-        "[US_PREP][STATUS] %s total=%d success=%d skip=%d error=%d critical_fail=%s",
-        prep_status, total_symbols, success_count, skip_count, error_count,
+        "[US_PREP][STATUS] %s total=%d unique_success=%d event_success=%d skip=%d error=%d critical_fail=%s",
+        prep_status, total_symbols, unique_success_count, event_success_count, skip_count, error_count,
         ", ".join(critical_etf_failures) if critical_etf_failures else "none"
     )
 
@@ -232,7 +261,11 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             prep_status = "OK_WITH_WARNINGS"
 
     # us_agent_runs 완료 기록
-    result_msg = f"status={prep_status} watchlist={saved_count} success={success_count}/{total_symbols}"
+    result_msg = (
+        f"status={prep_status} watchlist={saved_count} "
+        f"unique_success={unique_success_count}/{total_symbols} "
+        f"event_success={event_success_count}"
+    )
     finish_us_prep_run(run_id=run_id, status=prep_status, result=result_msg)
     
     logger.info("[US_PREP][FINISH] %s", result_msg)
@@ -242,7 +275,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "trade_date": trade_date,
         "tickers_loaded": total_symbols,
         "watchlist_saved": saved_count,
-        "success_count": success_count,
+        "unique_success_count": unique_success_count,
+        "event_success_count": event_success_count,
         "skip_count": skip_count,
         "error_count": error_count,
         "critical_etf_failures": list(critical_etf_failures),
@@ -262,7 +296,7 @@ def main() -> None:
     args = parser.parse_args()
 
     result = run_prep(env=args.env, offline=args.offline, force_now=args.force_now)
-    if result["status"] != "OK":
+    if result["status"] not in ("OK", "OK_WITH_WARNINGS"):
         sys.exit(1)
 
 
