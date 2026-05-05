@@ -326,11 +326,32 @@ def run_trade_tick(
     entry_eval_error_count = 0
     after_cutoff = _entry_cutoff_passed(now)
 
-    # fills contract error 발생 시 신규 BUY 차단
+    # fills contract error 발생 시 신규 BUY 차단 및 즉시 ERROR 반환
     if fills_contract_error and os.getenv("US_REQUIRE_FILL_CONFIRM", "1") == "1":
         logger.error(
             "[US_ENTRY][BLOCK] reason=fills_contract_error require_fill_confirm=1"
         )
+        logger.error(
+            "[US_ORDER][ROUTE][SKIP] reason=fills_contract_error"
+        )
+        logger.error(
+            "[US_TICK][DONE] session=%s status=ERROR reason=fills_contract_error", session
+        )
+        return {
+            "status": "ERROR",
+            "reason": "fills_contract_error",
+            "session": session,
+            "orders": [],
+            "ack": 0,
+            "dry_run": 0,
+            "blocked": 0,
+            "signal_only": 0,
+            "errors": 1,
+            "budget": budget,
+            "run_mode": run_mode,
+            "signal_only_mode": signal_only,
+            "kis_order_allowed": kis_order_allowed,
+        }
     elif after_cutoff:
         logger.info(
             "[US_ENTRY][BLOCK] reason=after_entry_cutoff time=%s",

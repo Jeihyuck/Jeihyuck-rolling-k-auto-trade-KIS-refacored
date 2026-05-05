@@ -71,7 +71,7 @@ def test_get_us_fills_today_has_ccld_nccs_dvsn(monkeypatch):
 
     captured = {}
 
-    def fake_get(self, path, headers, params):
+    def fake_get(self, path, headers, params, suppress_final_log=False):
         captured["params"] = params
         return {"output": []}
 
@@ -93,7 +93,7 @@ def test_get_us_fills_today_has_sort_sqn(monkeypatch):
 
     captured = {}
 
-    def fake_get(self, path, headers, params):
+    def fake_get(self, path, headers, params, suppress_final_log=False):
         captured["params"] = params
         return {"output": []}
 

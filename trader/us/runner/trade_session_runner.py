@@ -255,7 +255,23 @@ def run_trade_session(
                 "reason": tick_result.get("reason", "market_skip"),
             }
 
-        if force_now and max_ticks > 0 and tick_count >= max_ticks:
+        # fills_contract_error 발생 시 세션 즉시 종료
+        if tick_result.get("reason") == "fills_contract_error":
+            logger.error(
+                "[US_SESSION][END] session=%s reason=fills_contract_error tick=%d",
+                session,
+                tick_count,
+            )
+            return {
+                "status": "ERROR",
+                "session": session,
+                "reason": "fills_contract_error",
+                "tick_count": tick_count,
+                "results": results,
+            }
+
+        # max_ticks는 force_now와 무관하게 적용
+        if max_ticks > 0 and tick_count >= max_ticks:
             logger.info(
                 "[US_SESSION][END] session=%s reason=max_ticks ticks=%d",
                 session,
@@ -263,6 +279,7 @@ def run_trade_session(
             )
             break
 
+        # force_now + max_ticks=0이면 single tick
         if force_now and max_ticks == 0:
             logger.info(
                 "[US_SESSION][END] session=%s reason=force_now_single_tick ticks=%d",

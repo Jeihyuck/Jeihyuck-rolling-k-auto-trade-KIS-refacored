@@ -435,9 +435,9 @@ jobs:
           fi
 
           # Fatal errors.
-          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "::error::Fatal AM trade error detected"
-            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]" artifacts/${US_LOG_FILE} | head -20
+            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error" artifacts/${US_LOG_FILE} | head -20
             exit 1
           fi
 

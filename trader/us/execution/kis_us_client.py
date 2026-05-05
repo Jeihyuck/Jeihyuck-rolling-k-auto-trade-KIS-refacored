@@ -278,17 +278,82 @@ class KisUSClient:
             ny_tz = ZoneInfo("America/New_York")
             ord_dt = dt.now(tz=ny_tz).strftime("%Y%m%d")
         
-        logger.info(
-            "[US_FILLS][REQUEST] ord_start_dt=%s ord_end_dt=%s endpoint=inquire-ccnl",
-            ord_dt, ord_dt
+        # Schema fallback: ORD_DT first, then ORD_RANGE
+        schemas = ["ORD_DT", "ORD_RANGE"]
+        errors = []
+
+        for schema in schemas:
+            params = self._build_us_fills_params(ord_dt, schema)
+            logger.info(
+                "[US_FILLS][REQUEST] schema=%s ord_dt=%s endpoint=inquire-ccnl",
+                schema,
+                ord_dt,
+            )
+
+            try:
+                result = self._get(
+                    tr["path"],
+                    headers=headers,
+                    params=params,
+                    suppress_final_log=True,
+                )
+                fills = result.get("output") or []
+                logger.info(
+                    "[US_FILLS][FETCHED] count=%d status=OK schema=%s",
+                    len(fills),
+                    schema,
+                )
+                return fills
+
+            except Exception as exc:
+                error_msg = str(exc)
+                errors.append({"schema": schema, "error": error_msg})
+
+                if "INPUT_FIELD_NAME" in error_msg:
+                    logger.warning(
+                        "[US_FILLS][SCHEMA_RETRY] failed_schema=%s msg=%s",
+                        schema,
+                        error_msg,
+                    )
+                    continue
+
+                if "EGW002" in error_msg or "RATE" in error_msg.upper():
+                    logger.warning(
+                        "[US_FILLS][ERROR][TEMP] schema=%s msg=%s",
+                        schema,
+                        error_msg,
+                    )
+                    raise KisUSTemporaryError(f"KIS temporary error: {error_msg}") from exc
+
+                logger.warning(
+                    "[US_FILLS][SCHEMA_RETRY] failed_schema=%s msg=%s",
+                    schema,
+                    error_msg,
+                )
+                continue
+
+        logger.error(
+            "[US_FILLS][ERROR][CONTRACT] all_schemas_failed errors=%s",
+            errors,
         )
+        raise KisUSClientError(
+            f"KIS fills contract error: all schemas failed: {errors}"
+        )
+
+    def _build_us_fills_params(self, ord_dt: str, schema: str) -> dict:
+        """US fills inquiry params를 schema에 따라 생성.
         
-        params = {
+        Args:
+            ord_dt: YYYYMMDD 형식 날짜
+            schema: "ORD_DT" 또는 "ORD_RANGE"
+            
+        Returns:
+            KIS fills inquiry params dict
+        """
+        base = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
             "PDNO": "",
-            "ORD_STRT_DT": ord_dt,
-            "ORD_END_DT": ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "NASD",
@@ -296,29 +361,16 @@ class KisUSClient:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        
-        try:
-            result = self._get(tr["path"], headers=headers, params=params)
-            fills = result.get("output") or []
-            logger.info("[US_FILLS][FETCHED] count=%d status=OK", len(fills))
-            return fills
-        except Exception as exc:
-            error_msg = str(exc)
-            # INPUT_FIELD_NAME → contract error (non-temporary)
-            if "INPUT_FIELD_NAME" in error_msg or "ORD_STRT_DT" in error_msg or "ORD_END_DT" in error_msg:
-                logger.error(
-                    "[US_FILLS][ERROR][CONTRACT] field=ORD_STRT_DT/ORD_END_DT msg=%s", error_msg
-                )
-                raise KisUSClientError(f"KIS contract error: {error_msg}") from exc
-            # EGW002 또는 rate limit → temporary
-            elif "EGW002" in error_msg or "RATE" in error_msg.upper():
-                logger.warning(
-                    "[US_FILLS][ERROR][TEMP] type=RATE_LIMIT msg=%s", error_msg
-                )
-                raise KisUSTemporaryError(f"KIS temporary error: {error_msg}") from exc
-            else:
-                logger.error("[US_FILLS][ERROR] msg=%s", error_msg)
-                raise
+
+        if schema == "ORD_DT":
+            base["ORD_DT"] = ord_dt
+        elif schema == "ORD_RANGE":
+            base["ORD_STRT_DT"] = ord_dt
+            base["ORD_END_DT"] = ord_dt
+        else:
+            raise ValueError(f"unknown fills schema: {schema}")
+
+        return base
 
     # ------------------------------------------------------------------
     # HTTP helpers
@@ -392,8 +444,15 @@ class KisUSClient:
         
         return False
 
-    def _get(self, path: str, headers: dict, params: dict) -> dict:
-        """GET 요청 with retry/backoff."""
+    def _get(self, path: str, headers: dict, params: dict, *, suppress_final_log: bool = False) -> dict:
+        """GET 요청 with retry/backoff.
+        
+        Args:
+            path: API path
+            headers: HTTP headers
+            params: Query parameters
+            suppress_final_log: True이면 최종 실패 시 HTTP_FAIL_FINAL 로그 생략
+        """
         import requests
         
         max_attempts = 5
@@ -427,11 +486,12 @@ class KisUSClient:
                     continue
                 
                 # 최종 실패
-                self.stats["http_fail_final_count"] += 1
-                logger.error(
-                    f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
-                    f"path={path!r} error={err!r} temporary={is_temp}"
-                )
+                if not suppress_final_log:
+                    self.stats["http_fail_final_count"] += 1
+                    logger.error(
+                        f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
+                        f"path={path!r} error={err!r} temporary={is_temp}"
+                    )
                 if is_temp:
                     raise KisUSTemporaryError(f"GET {path} failed after {attempt} attempts: {err}") from err
                 else:
