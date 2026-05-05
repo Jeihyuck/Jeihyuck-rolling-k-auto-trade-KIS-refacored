@@ -250,18 +250,36 @@ class KisUSClient:
     # Fills
     # ------------------------------------------------------------------
 
-    def get_us_fills_today(self) -> list[dict]:
-        """당일 체결 내역 조회."""
+    def get_us_fills_today(self, trade_date: str | None = None) -> list[dict]:
+        """당일 체결 내역 조회.
+        
+        Args:
+            trade_date: YYYY-MM-DD 형식. None이면 NY 기준 오늘.
+            
+        Returns:
+            체결 내역 list
+        """
         self._assert_not_offline("get_us_fills_today")
         tr = get_tr_info("us_fills_today")
         headers = self._build_headers(tr["tr_id"])
-        today = datetime.now().strftime("%Y%m%d")
+        
+        # trade_date 처리: YYYY-MM-DD → YYYYMMDD
+        if trade_date:
+            ord_dt = trade_date.replace("-", "")
+        else:
+            # NY 기준 today
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as dt
+            ny_tz = ZoneInfo("America/New_York")
+            ord_dt = dt.now(tz=ny_tz).strftime("%Y%m%d")
+        
+        logger.info("[US_FILLS][REQUEST] ord_dt=%s endpoint=inquire-ccnl", ord_dt)
+        
         params = {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
             "PDNO": "",
-            "ORD_STRT_DT": today,
-            "ORD_END_DT": today,
+            "ORD_DT": ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "NASD",
@@ -269,8 +287,29 @@ class KisUSClient:
             "CTX_AREA_FK200": "",
             "CTX_AREA_NK200": "",
         }
-        result = self._get(tr["path"], headers=headers, params=params)
-        return result.get("output") or []
+        
+        try:
+            result = self._get(tr["path"], headers=headers, params=params)
+            fills = result.get("output") or []
+            logger.info("[US_FILLS][FETCHED] count=%d status=OK", len(fills))
+            return fills
+        except Exception as exc:
+            error_msg = str(exc)
+            # INPUT_FIELD_NAME → contract error (non-temporary)
+            if "INPUT_FIELD_NAME" in error_msg or "ORD_DT" in error_msg:
+                logger.error(
+                    "[US_FILLS][ERROR][CONTRACT] field=ORD_DT msg=%s", error_msg
+                )
+                raise KisUSClientError(f"KIS contract error: {error_msg}") from exc
+            # EGW002 또는 rate limit → temporary
+            elif "EGW002" in error_msg or "RATE" in error_msg.upper():
+                logger.warning(
+                    "[US_FILLS][ERROR][TEMP] type=RATE_LIMIT msg=%s", error_msg
+                )
+                raise KisUSTemporaryError(f"KIS temporary error: {error_msg}") from exc
+            else:
+                logger.error("[US_FILLS][ERROR] msg=%s", error_msg)
+                raise
 
     # ------------------------------------------------------------------
     # HTTP helpers

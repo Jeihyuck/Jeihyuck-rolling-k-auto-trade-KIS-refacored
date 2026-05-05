@@ -26,9 +26,6 @@ logger = logging.getLogger(__name__)
 # Critical ETFs for prep status determination
 CRITICAL_ETFS = {"QQQ", "SPY", "SMH", "SOXX"}
 
-# Critical ETFs for prep status determination
-CRITICAL_ETFS = {"QQQ", "SPY", "SMH", "SOXX"}
-
 
 def _determine_prep_status(
     total_symbols: int,

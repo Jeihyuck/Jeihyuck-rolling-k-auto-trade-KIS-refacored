@@ -759,7 +759,7 @@ def clear_and_save_locked_us_watchlist(
     기존 locked watchlist를 삭제하고 새로운 locked watchlist 저장.
     
     Args:
-        entries: watchlist entries, each with symbol, exchange, strategy, score, meta
+        entries: watchlist entries, each with symbol, exchange, strategy, score, rank, meta
         trade_date: 미국장 거래일 (YYYY-MM-DD)
         run_id: prep run_id
         prep_status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
@@ -783,15 +783,21 @@ def clear_and_save_locked_us_watchlist(
     count = 0
     try:
         with engine.begin() as conn:
-            # 기존 locked watchlist 삭제
+            # 기존 locked watchlist 삭제 (같은 trade_date + locked=true 범위)
             conn.execute(
                 text("DELETE FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
                 {"td": trade_date},
             )
             
             # 새 locked watchlist 저장
-            for e in entries:
+            for rank, e in enumerate(entries, start=1):
                 data_source = e.get("meta", {}).get("data_source", "kis") if isinstance(e.get("meta"), dict) else "kis"
+                
+                # meta에 rank, prep_run_id 추가
+                meta = e.get("meta", {})
+                if isinstance(meta, dict):
+                    meta["prep_run_id"] = run_id
+                    meta["locked_rank"] = rank
                 
                 conn.execute(
                     text("""
@@ -816,17 +822,49 @@ def clear_and_save_locked_us_watchlist(
                         "exchange": e.get("exchange", "NASDAQ"),
                         "strategy": e.get("strategy", "unknown"),
                         "score": e.get("score"),
-                        "meta": _json_param(e.get("meta", {})),
+                        "meta": _json_param(meta),
                         "prep_status": prep_status,
                         "run_id": run_id,
                         "data_source": data_source,
                     },
                 )
                 count += 1
+            
+            # Roundtrip 검증: 저장된 row 수와 입력 entries 수가 일치하는지 확인
+            verify_row = conn.execute(
+                text("""
+                    SELECT COUNT(*) as cnt,
+                           COUNT(DISTINCT symbol) as uniq_symbols
+                    FROM us_watchlist
+                    WHERE trade_date = :td AND locked = TRUE AND run_id = :run_id
+                """),
+                {"td": trade_date, "run_id": run_id},
+            ).fetchone()
+            
+            verify_count = verify_row[0] if verify_row else 0
+            uniq_symbols = verify_row[1] if verify_row else 0
+            
+            if verify_count != len(entries):
+                logger.error(
+                    "[US_WATCHLIST][ROUNDTRIP_FAIL] expected=%d saved=%d",
+                    len(entries), verify_count
+                )
+                raise RuntimeError(
+                    f"[US_WATCHLIST][ROUNDTRIP_FAIL] expected={len(entries)} saved={verify_count}"
+                )
+            
+            logger.info(
+                "[US_WATCHLIST][ROUNDTRIP_OK] rows=%d uniq_symbols=%d",
+                verify_count, uniq_symbols
+            )
         
         logger.info(
             "[US_WATCHLIST][LOCK_SAVE] trade_date=%s count=%d status=%s run_id=%s",
             trade_date, count, prep_status, run_id
+        )
+        logger.info(
+            "[US_WATCHLIST][LOCKED] trade_date=%s run_id=%s count=%d status=%s",
+            trade_date, run_id, count, prep_status
         )
         return count
     except Exception as exc:
@@ -898,6 +936,176 @@ def load_locked_us_watchlist(
     except Exception as exc:
         logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s", exc)
         return []
+
+
+def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:
+    """us_watchlist 항목 수 조회."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        if locked_only:
+            return len([w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date])
+        return len([w for w in _MEM_WATCHLIST if w.get("trade_date") == trade_date])
+    
+    try:
+        with engine.connect() as conn:
+            if locked_only:
+                row = conn.execute(
+                    text("SELECT COUNT(*) as cnt FROM us_watchlist WHERE trade_date = :td AND locked = TRUE"),
+                    {"td": trade_date},
+                ).fetchone()
+
+
+def load_locked_us_watchlist_strict(
+    trade_date: str,
+    expected_run_id: str | None = None,
+    min_count: int = 10,
+    allow_degraded: bool = False,
+    require_status: tuple = ("OK", "OK_WITH_WARNINGS"),
+) -> dict:
+    """Strict locked watchlist 조회 및 contract 검증.
+    
+    한국장 PB1처럼 엄격한 입력 검증을 수행합니다.
+    
+    Args:
+        trade_date: 미국장 거래일
+        expected_run_id: 기대하는 prep run_id (있으면 검증)
+        min_count: 최소 항목 수
+        allow_degraded: DEGRADED 상태 허용 여부
+        require_status: 허용되는 prep_status tuple
+        
+    Returns:
+        {
+            "status": "OK" | "ERROR",
+            "rows": list[dict],
+            "run_id": str,
+            "trade_date": str,
+            "count": int,
+            "source": "db_us_locked_watchlist",
+            "errors": list[str],
+            "warnings": list[str],
+        }
+    """
+    engine = _get_engine_or_none()
+    result = {
+        "status": "ERROR",
+        "rows": [],
+        "run_id": "",
+        "trade_date": trade_date,
+        "count": 0,
+        "source": "db_us_locked_watchlist",
+        "errors": [],
+        "warnings": [],
+    }
+    
+    if engine is None:
+        # in-memory fallback
+        mem_locked = [w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date]
+        if len(mem_locked) < min_count:
+            result["errors"].append(f"in-memory count {len(mem_locked)} < min {min_count}")
+            logger.warning("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] in-memory insufficient")
+            return result
+        result["status"] = "OK"
+        result["rows"] = mem_locked
+        result["count"] = len(mem_locked)
+        return result
+    
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT symbol, exchange, strategy, score, rank, meta, 
+                           prep_status, run_id, data_source, locked, created_at, updated_at
+                    FROM us_watchlist
+                    WHERE trade_date = :td
+                      AND locked = TRUE
+                    ORDER BY rank ASC, score DESC NULLS LAST, symbol ASC
+                """),
+                {"td": trade_date},
+            ).fetchall()
+            
+            rows_list = [dict(r._mapping) for r in rows]
+            
+            # 최소 개수 검증
+            if len(rows_list) < min_count:
+                result["errors"].append(f"count {len(rows_list)} < min {min_count}")
+                logger.error(
+                    "[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] trade_date=%s count=%d min=%d",
+                    trade_date, len(rows_list), min_count
+                )
+                return result
+            
+            # run_id 확인
+            run_ids = {r.get("run_id") for r in rows_list if r.get("run_id")}
+            if not run_ids:
+                result["errors"].append("no run_id found in watchlist rows")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] no_run_id")
+                return result
+            
+            if len(run_ids) > 1:
+                result["warnings"].append(f"multiple run_ids: {run_ids}")
+                logger.warning("[US_WATCHLIST][LOCK_LOAD][STRICT][WARN] multiple_run_ids=%s", run_ids)
+            
+            common_run_id = rows_list[0].get("run_id", "")
+            
+            # expected_run_id 검증
+            if expected_run_id and common_run_id != expected_run_id:
+                result["errors"].append(f"run_id mismatch: expected={expected_run_id} actual={common_run_id}")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] run_id_mismatch")
+                return result
+            
+            # prep_status 검증
+            prep_statuses = {r.get("prep_status") for r in rows_list if r.get("prep_status")}
+            if prep_statuses:
+                common_status = rows_list[0].get("prep_status", "")
+                if common_status not in require_status:
+                    if not allow_degraded or common_status != "DEGRADED":
+                        result["errors"].append(f"prep_status={common_status} not in {require_status}")
+                        logger.error(
+                            "[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] prep_status=%s not_allowed",
+                            common_status
+                        )
+                        return result
+            
+            # schema 검증
+            required_fields = ["symbol", "exchange", "score", "rank", "locked"]
+            for idx, row in enumerate(rows_list):
+                for field in required_fields:
+                    if field not in row or row[field] is None:
+                        result["errors"].append(f"row {idx} missing field: {field}")
+                        logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] missing_field=%s row=%d", field, idx)
+                        return result
+            
+            # symbol 중복 검증
+            symbols = [r["symbol"] for r in rows_list]
+            if len(symbols) != len(set(symbols)):
+                result["errors"].append("duplicate symbols found")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] duplicate_symbols")
+                return result
+            
+            # rank 중복 검증
+            ranks = [r.get("rank") for r in rows_list if r.get("rank") is not None]
+            if len(ranks) != len(set(ranks)):
+                result["errors"].append("duplicate ranks found")
+                logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][FAIL] duplicate_ranks")
+                return result
+            
+            # 성공
+            result["status"] = "OK"
+            result["rows"] = rows_list
+            result["run_id"] = common_run_id
+            result["count"] = len(rows_list)
+            
+            logger.info(
+                "[US_WATCHLIST][LOCK_LOAD][STRICT][OK] trade_date=%s run_id=%s count=%d status=%s",
+                trade_date, common_run_id, len(rows_list), rows_list[0].get("prep_status") if rows_list else "N/A"
+            )
+            
+            return result
+            
+    except Exception as exc:
+        result["errors"].append(f"exception: {exc}")
+        logger.error("[US_WATCHLIST][LOCK_LOAD][STRICT][ERROR] %s", exc)
+        return result
 
 
 def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:

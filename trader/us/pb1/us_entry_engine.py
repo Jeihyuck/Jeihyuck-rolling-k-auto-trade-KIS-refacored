@@ -22,6 +22,86 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def normalize_us_entry_input(
+    tickers: list[str] | list[dict] | None,
+    watchlist_entries: list[dict] | None,
+) -> tuple[list[str], list[dict]]:
+    """Entry 입력을 정규화.
+    
+    Args:
+        tickers: symbol list 또는 dict list
+        watchlist_entries: locked watchlist rows (dict list)
+        
+    Returns:
+        (symbols: list[str], entries: list[dict])
+        - symbols: 평가 대상 symbol list
+        - entries: watchlist metadata rows (empty if not provided)
+    """
+    symbols: list[str] = []
+    entries: list[dict] = []
+    
+    # watchlist_entries 우선 사용
+    if watchlist_entries:
+        for row in watchlist_entries:
+            sym = row.get("symbol")
+            if sym and isinstance(sym, str):
+                symbols.append(sym)
+                entries.append(row)
+            else:
+                logger.warning(
+                    "[US_ENTRY][INPUT_NORMALIZE] invalid row, symbol=%s type=%s",
+                    sym, type(sym).__name__
+                )
+        logger.info(
+            "[US_ENTRY][INPUT_NORMALIZE] source=locked_watchlist rows=%d symbols=%d",
+            len(watchlist_entries), len(symbols)
+        )
+        return symbols, entries
+    
+    # tickers가 없으면 empty 반환
+    if not tickers:
+        return [], []
+    
+    # tickers가 list[str]이면 그대로 사용
+    if tickers and isinstance(tickers[0], str):
+        symbols = list(tickers)
+        logger.info(
+            "[US_ENTRY][INPUT_NORMALIZE] source=ticker_list symbols=%d", len(symbols)
+        )
+        return symbols, []
+    
+    # tickers가 list[dict]이면 symbol/exchange 추출
+    for item in tickers:
+        if isinstance(item, dict):
+            sym = item.get("symbol")
+            if sym and isinstance(sym, str):
+                symbols.append(sym)
+                # exchange 정보도 포함하여 entries에 추가
+                entries.append({
+                    "symbol": sym,
+                    "exchange": item.get("exchange", ""),
+                    "score": item.get("score"),
+                    "rank": item.get("rank"),
+                    "meta": item.get("meta", {}),
+                })
+            else:
+                logger.warning(
+                    "[US_ENTRY][INPUT_NORMALIZE] dict but invalid symbol: %s", item
+                )
+        elif isinstance(item, str):
+            symbols.append(item)
+        else:
+            logger.warning(
+                "[US_ENTRY][INPUT_NORMALIZE] unexpected type: %s", type(item).__name__
+            )
+    
+    logger.info(
+        "[US_ENTRY][INPUT_NORMALIZE] source=mixed_input symbols=%d entries=%d",
+        len(symbols), len(entries)
+    )
+    return symbols, entries
+
+
 def _to_float_list(rows: list[dict], key: str = "clos") -> list[float]:
     out = []
     for r in rows:
@@ -121,7 +201,7 @@ def score_symbol(symbol: str, daily_prices: list[dict], current_price: dict) -> 
 
 
 def generate_entry_intents(
-    tickers: list[str],
+    tickers: list[str] | list[dict] | None,
     provider: Any,
     sold_today: set[str],
     available_cash_usd: float,
@@ -129,11 +209,12 @@ def generate_entry_intents(
     capital_usd_cap: float,
     now: datetime | None = None,
     max_new_entries: int | None = None,
+    watchlist_entries: list[dict] | None = None,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
     Args:
-        tickers: 평가 대상 ticker list
+        tickers: 평가 대상 ticker list (list[str] 또는 list[dict])
         provider: USDataProvider 인스턴스
         sold_today: 당일 매도 완료 종목 집합 (재매수 차단)
         available_cash_usd: 실제 주문 가능 잔고
@@ -141,6 +222,7 @@ def generate_entry_intents(
         capital_usd_cap: 미국장 예산 USD cap
         now: 현재 시각 (None이면 실시간)
         max_new_entries: tick당 최대 신규 진입 수
+        watchlist_entries: locked watchlist rows (authoritative input)
 
     Returns:
         list of order intent dict
@@ -151,9 +233,32 @@ def generate_entry_intents(
     if max_new_entries is None:
         max_new_entries = int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3"))
 
+    # 입력 정규화
+    symbols, entries = normalize_us_entry_input(tickers, watchlist_entries)
+    
+    # 입력 contract 검증
+    if not symbols:
+        logger.warning("[US_ENTRY][INPUT_CONTRACT] no symbols to evaluate")
+        return []
+    
+    logger.info(
+        "[US_ENTRY][INPUT_CONTRACT] symbols=%d entries=%d schema_ok=1",
+        len(symbols), len(entries)
+    )
+    
+    # entries를 symbol → entry dict로 변환 (빠른 조회용)
+    entries_map = {e["symbol"]: e for e in entries} if entries else {}
+
     scored: list[tuple[float, str, str, float, list[dict], dict]] = []
 
-    for symbol in tickers:
+    for symbol in symbols:
+        # symbol이 str인지 확인
+        if not isinstance(symbol, str):
+            logger.error(
+                "[US_ENTRY][CONTRACT_FAIL] symbol must be str, got %s", type(symbol).__name__
+            )
+            raise TypeError(f"[US_ENTRY][INPUT_CONTRACT_FAIL] symbol must be str, got {type(symbol).__name__}")
+        
         # 당일 매도 차단
         if symbol in sold_today:
             logger.debug("[US_ENTRY][BLOCK] reason=sold_today symbol=%s", symbol)
@@ -172,26 +277,55 @@ def generate_entry_intents(
         except Exception as exc:
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
 
-        try:
-            exchange = resolve_exchange(symbol)
-            daily = provider.get_daily_prices(symbol, exchange, count=120)
-            current = provider.get_current_price(symbol, exchange)
-        except Exception as exc:
-            logger.debug("[US_ENTRY][SKIP] symbol=%s error=%s", symbol, exc)
-            continue
+        # entries_map에 있으면 precomputed score 사용
+        entry_meta = entries_map.get(symbol)
+        if entry_meta and entry_meta.get("score") is not None:
+            try:
+                s = float(entry_meta["score"])
+                exchange = entry_meta.get("exchange", "")
+                if not exchange:
+                    exchange = resolve_exchange(symbol)
+                logger.debug(
+                    "[US_ENTRY][PRECOMPUTED] symbol=%s score=%.3f exchange=%s",
+                    symbol, s, exchange
+                )
+            except (ValueError, TypeError) as exc:
+                logger.debug(
+                    "[US_ENTRY][SCORE_ERR] symbol=%s precomputed score invalid: %s",
+                    symbol, exc
+                )
+                continue
+            
+            # current price 조회는 여전히 필요
+            try:
+                daily = provider.get_daily_prices(symbol, exchange, count=120)
+                current = provider.get_current_price(symbol, exchange)
+            except Exception as exc:
+                logger.debug("[US_ENTRY][SKIP] symbol=%s data error=%s", symbol, exc)
+                continue
+        else:
+            # precomputed score가 없으면 실시간 계산
+            try:
+                exchange = resolve_exchange(symbol)
+                daily = provider.get_daily_prices(symbol, exchange, count=120)
+                current = provider.get_current_price(symbol, exchange)
+            except Exception as exc:
+                logger.debug("[US_ENTRY][SKIP] symbol=%s error=%s", symbol, exc)
+                continue
 
-        try:
-            s = score_symbol(symbol, daily, current)
-        except Exception as exc:
-            logger.debug("[US_ENTRY][SCORE_ERR] symbol=%s error=%s", symbol, exc)
-            continue
+            try:
+                s = score_symbol(symbol, daily, current)
+            except Exception as exc:
+                logger.debug("[US_ENTRY][SCORE_ERR] symbol=%s error=%s", symbol, exc)
+                continue
 
-        if s is None:
-            continue
+            if s is None:
+                continue
 
         try:
             price = float(current.get("last", 0))
         except (ValueError, TypeError):
+            logger.debug("[US_ENTRY][SKIP] symbol=%s invalid price", symbol)
             continue
 
         if price <= 0:
@@ -256,4 +390,5 @@ def generate_entry_intents(
             symbol, rank + 1, score, qty, notional,
         )
 
+    logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(intents))
     return intents

@@ -169,19 +169,37 @@ def run_trade_tick(
 
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     fills_today: list[dict] = []
+    fills_error_count = 0
+    fills_warnings_count = 0
+    
     if not offline:
         try:
             from trader.us.execution.fills import get_fills_today
             fills_result = get_fills_today(provider=provider, signal_only=signal_only)
-            if fills_result["status"] != "OK":
+            if fills_result["status"] == "CONTRACT_ERROR":
                 logger.error(
-                    "[US_TICK][ERROR] fills fetch failed: %s",
+                    "[US_TICK][ERROR] fills fetch CONTRACT_ERROR: %s",
                     fills_result.get("error", "unknown")
                 )
+                fills_error_count += 1
+            elif fills_result["status"] == "TEMP_ERROR":
+                logger.warning(
+                    "[US_TICK][WARN] fills fetch TEMP_ERROR: %s",
+                    fills_result.get("error", "unknown")
+                )
+                fills_warnings_count += 1
+            elif fills_result["status"] != "OK":
+                logger.warning(
+                    "[US_TICK][WARN] fills fetch failed: %s",
+                    fills_result.get("error", "unknown")
+                )
+                fills_warnings_count += 1
+            
             fills_today = fills_result["fills"]
             logger.info("[US_FILLS][FETCHED] count=%d status=%s", len(fills_today), fills_result["status"])
         except Exception as exc:
             logger.error("[US_TICK][ERROR] fills exception: %s", exc)
+            fills_error_count += 1
 
     # KIS fills + DB sold_today 합산
     from trader.us.db.repos import load_today_symbols_sold, save_fills, save_position_snapshot, save_reconcile_log
@@ -248,6 +266,7 @@ def run_trade_tick(
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
     entry_intents: list[dict] = []
+    entry_eval_error_count = 0
     after_cutoff = _entry_cutoff_passed(now)
 
     if after_cutoff:
@@ -287,41 +306,48 @@ def run_trade_tick(
                 )
                 
                 if watchlist_rows:
-                    tickers = [
-                        {"symbol": row["symbol"], "exchange": row["exchange"]}
-                        for row in watchlist_rows
-                    ]
+                    # watchlist_rows를 authoritative input으로 그대로 사용
+                    # dict list로 변환하지 않음 (unhashable type: 'dict' 방지)
                     logger.info(
-                        "[US_ENTRY][LOCKED_WATCHLIST] count=%d prep_status=%s",
-                        len(tickers), prep_status
+                        "[US_ENTRY][LOCKED_WATCHLIST] count=%d prep_status=%s source=db_us_locked_watchlist",
+                        len(watchlist_rows), prep_status
+                    )
+                    
+                    # INPUT CONTRACT 검증
+                    logger.info(
+                        "[US_ENTRY][INPUT_CONTRACT] rows=%d schema_ok=1",
+                        len(watchlist_rows)
                     )
                 else:
-                    # fallback to get_all_tickers() only if allowed
-                    allow_fallback = os.getenv("US_ALLOW_FULL_UNIVERSE_FALLBACK", "0") == "1"
-                    if allow_fallback:
-                        logger.warning(
-                            "[US_ENTRY][FALLBACK] locked_watchlist empty, using get_all_tickers()"
-                        )
-                        from trader.us.universe import get_all_tickers
-                        tickers = get_all_tickers()
-                    else:
-                        logger.error(
-                            "[US_ENTRY][ERROR] locked_watchlist empty and fallback disabled"
-                        )
-                        tickers = []
-                
-                if tickers:
-                    engine = _get_strategy_engine(env=env, offline=offline)
-                    entry_intents = engine.evaluate_entries(
-                        tickers=tickers,
-                        provider=provider,
-                        sold_today=sold_today,
-                        available_cash_usd=effective_budget,
-                        position_count=position_count,
-                        now=now,
+                    # locked watchlist empty: 기본적으로 entry 차단
+                    # full universe fallback은 기본 금지
+                    logger.error(
+                        "[US_ENTRY][ERROR] locked_watchlist empty, entry blocked (fallback disabled by default)"
                     )
+                    watchlist_rows = []
+                
+                if watchlist_rows:
+                    engine = _get_strategy_engine(env=env, offline=offline)
+                    try:
+                        entry_intents = engine.evaluate_entries(
+                            tickers=None,  # watchlist_entries를 우선 사용
+                            provider=provider,
+                            sold_today=sold_today,
+                            available_cash_usd=effective_budget,
+                            position_count=position_count,
+                            now=now,
+                            watchlist_entries=watchlist_rows,  # authoritative input
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "[US_ENTRY][EVAL][ERROR] type=%s message=%s",
+                            type(exc).__name__, str(exc)
+                        )
+                        entry_eval_error_count += 1
+                        entry_intents = []
             except Exception as exc:
-                logger.warning("[US_ENTRY][EVAL][WARN] %s", exc)
+                logger.error("[US_ENTRY][EVAL][ERROR] %s", exc)
+                entry_eval_error_count += 1
     
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
@@ -364,10 +390,36 @@ def run_trade_tick(
         len(orders), ack_cnt, dry_cnt, blocked_cnt, signal_only_cnt, err_cnt,
     )
 
-    if signal_only:
-        status = "OK_WITH_WARNINGS_SIGNAL_ONLY" if err_cnt > 0 else "OK_SIGNAL_ONLY"
+    # ── 최종 status 판정 ───────────────────────────────
+    total_errors = fills_error_count + entry_eval_error_count + err_cnt
+    total_warnings = fills_warnings_count
+    
+    if total_errors > 0:
+        status = "ERROR" if total_errors > 2 else "OK_WITH_ERRORS"
+        status_reasons = []
+        if fills_error_count > 0:
+            status_reasons.append(f"fills_error={fills_error_count}")
+        if entry_eval_error_count > 0:
+            status_reasons.append(f"entry_eval_error={entry_eval_error_count}")
+        if err_cnt > 0:
+            status_reasons.append(f"order_error={err_cnt}")
+        logger.warning(
+            "[US_TICK][STATUS_DECISION] status=%s errors=%d reasons=[%s]",
+            status, total_errors, ", ".join(status_reasons)
+        )
+    elif total_warnings > 0:
+        status = "OK_WITH_WARNINGS"
+        logger.info(
+            "[US_TICK][STATUS_DECISION] status=%s warnings=%d",
+            status, total_warnings
+        )
+    elif signal_only:
+        status = "OK_SIGNAL_ONLY"
+    elif ack_cnt == 0 and dry_cnt == 0 and len(all_intents) == 0:
+        status = "OK_NO_TRADE"
     else:
-        status = "OK_WITH_WARNINGS" if err_cnt > 0 else "OK"
+        status = "OK"
+    
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
     return {
