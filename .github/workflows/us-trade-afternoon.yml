@@ -41,6 +41,10 @@ name: "US Trade Afternoon"
         description: "Manual interval seconds override. Empty means default."
         required: false
         default: ""
+      manual_max_order_usd:
+        description: "Manual dry-run only. Override US_MAX_ORDER_USD, e.g. 3500"
+        required: false
+        default: ""
       smoke_loop:
         description: "Quick smoke loop: force --offline, max_ticks=3, interval=1, max_minutes=10. Overrides other flags."
         required: false
@@ -367,6 +371,7 @@ jobs:
             MAX_TICKS_FLAG=""
             MAX_MINUTES="205"
             INTERVAL_SEC="${US_SESSION_INTERVAL_SEC:-300}"
+            MANUAL_MAX_ORDER_USD=""
 
             if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
               # smoke_loop は他のフラグより優先
@@ -392,9 +397,29 @@ jobs:
                 if [ -n "${{ inputs.manual_interval_sec }}" ]; then
                   INTERVAL_SEC="${{ inputs.manual_interval_sec }}"
                 fi
+                if [ -n "${{ inputs.manual_max_order_usd }}" ]; then
+                  MANUAL_MAX_ORDER_USD="${{ inputs.manual_max_order_usd }}"
+                fi
               fi
             fi
 
+            # Apply manual_max_order_usd override only when dry_run=true
+            if [ -n "${MANUAL_MAX_ORDER_USD}" ]; then
+              if [ "${DRY_RUN}" = "1" ]; then
+                if [[ "${MANUAL_MAX_ORDER_USD}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                  export US_MAX_ORDER_USD="${MANUAL_MAX_ORDER_USD}"
+                  echo "[US_RISK_CONFIG][MANUAL_OVERRIDE] key=US_MAX_ORDER_USD value=${US_MAX_ORDER_USD} scope=dry_run_only"
+                else
+                  echo "::error::manual_max_order_usd must be numeric: ${MANUAL_MAX_ORDER_USD}"
+                  exit 1
+                fi
+              else
+                echo "::error::manual_max_order_usd is allowed only when dry_run=true"
+                exit 1
+              fi
+            fi
+
+            echo "[US_RISK_CONFIG] US_MAX_ORDER_USD=${US_MAX_ORDER_USD} US_MAX_DAILY_NOTIONAL_USD=${US_MAX_DAILY_NOTIONAL_USD} US_MAX_POSITION_WEIGHT=${US_MAX_POSITION_WEIGHT} US_MIN_CASH_BUFFER_USD=${US_MIN_CASH_BUFFER_USD}"
             echo "[US_TRADE_AFTERNOON][START]"
             echo "[US_TRADE_AFTERNOON][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
             echo "[US_TRADE_AFTERNOON][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
