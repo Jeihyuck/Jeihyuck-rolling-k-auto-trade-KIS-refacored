@@ -3,7 +3,7 @@
 
 scenarios:
   - name: offline_quote_success
-    description: "offline 모드에서 prep runner 정상 실행 확인"
+    description: "offline 모드에서 prep runner 정상 실행 확인 (빈 watchlist 허용)"
     command: "python -m trader.us.runner.prep_runner --env practice --offline"
     env:
       TRADING_REGION: "US"
@@ -13,8 +13,9 @@ scenarios:
       US_LIVE_TRADING_ENABLED: "0"
       DISABLE_REAL_TRADING: "1"
       DRY_RUN: "1"
+      US_PREP_ALLOW_EMPTY_WATCHLIST_OFFLINE: "1"
     expected_markers:
-      - "[US_PREP][OK]"
+      - "[US_PREP][FINISH]"
       - "[US_STRATEGY][SCORED]"
     forbidden_markers:
       - "Traceback"

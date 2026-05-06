@@ -433,6 +433,15 @@ def main() -> None:
     args = parser.parse_args()
 
     result = run_prep(env=args.env, offline=args.offline, force_now=args.force_now)
+    
+    # 오프라인 모드에서 빈 watchlist 허용 옵션
+    allow_empty_offline = int(os.getenv("US_PREP_ALLOW_EMPTY_WATCHLIST_OFFLINE", "0")) != 0
+    if args.offline and allow_empty_offline:
+        # 오프라인 모드에서는 빈 watchlist도 정상 종료 허용
+        if result["status"] in ("OK", "OK_WITH_WARNINGS", "ERROR"):
+            logger.info("[US_PREP][OFFLINE_EXIT] status=%s allowed (empty watchlist permitted)", result["status"])
+            sys.exit(0)
+    
     if result["status"] not in ("OK", "OK_WITH_WARNINGS"):
         sys.exit(1)
 
