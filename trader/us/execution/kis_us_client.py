@@ -25,6 +25,25 @@ from trader.us.execution.kis_us_registry import (
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_input_field_name(error_msg: str) -> str:
+    """Extract missing field name from KIS INPUT_FIELD_NAME error.
+    
+    Args:
+        error_msg: KIS error message
+        
+    Returns:
+        Extracted field name or empty string
+    """
+    marker = "INPUT_FIELD_NAME"
+    if marker not in error_msg:
+        return ""
+    tail = error_msg.split(marker, 1)[-1]
+    cleaned = tail.replace("'", "").replace('"', "").replace(":", "").strip()
+    tokens = cleaned.split()
+    return tokens[0] if tokens else ""
+
+
 # ---------------------------------------------------------------------------
 # Token cache (in-process)
 # ---------------------------------------------------------------------------
@@ -310,9 +329,11 @@ class KisUSClient:
                 errors.append({"schema": schema, "error": error_msg})
 
                 if "INPUT_FIELD_NAME" in error_msg:
+                    missing_field = _extract_input_field_name(error_msg)
                     logger.warning(
-                        "[US_FILLS][SCHEMA_RETRY] failed_schema=%s msg=%s",
+                        "[US_FILLS][SCHEMA_RETRY] failed_schema=%s missing_field=%s msg=%s",
                         schema,
+                        missing_field,
                         error_msg,
                     )
                     continue
@@ -325,9 +346,11 @@ class KisUSClient:
                     )
                     raise KisUSTemporaryError(f"KIS temporary error: {error_msg}") from exc
 
+                missing_field = _extract_input_field_name(error_msg)
                 logger.warning(
-                    "[US_FILLS][SCHEMA_RETRY] failed_schema=%s msg=%s",
+                    "[US_FILLS][SCHEMA_RETRY] failed_schema=%s missing_field=%s msg=%s",
                     schema,
+                    missing_field,
                     error_msg,
                 )
                 continue
@@ -354,6 +377,8 @@ class KisUSClient:
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
             "PDNO": "",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "NASD",

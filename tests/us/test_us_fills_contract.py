@@ -31,6 +31,10 @@ def test_get_us_fills_today_all_dates_success(monkeypatch):
     assert params["ORD_DT"] == "20260505"
     assert params["ORD_STRT_DT"] == "20260505"
     assert params["ORD_END_DT"] == "20260505"
+    assert "ORD_GNO_BRNO" in params
+    assert params["ORD_GNO_BRNO"] == ""
+    assert "ODNO" in params
+    assert params["ODNO"] == ""
     assert result == [{"fill": "data"}]
 
 
@@ -108,4 +112,32 @@ def test_get_us_fills_today_all_schemas_fail(monkeypatch):
 
     # Should try all three schemas
     assert len(captured) == 3
+
+
+def test_get_us_fills_today_base_params_include_order_branch_and_order_no(monkeypatch):
+    """get_us_fills_today should include ORD_GNO_BRNO and ODNO in base params."""
+    from trader.us.execution.kis_us_client import KisUSClient
+    
+    captured = []
+
+    class FakeResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"rt_cd": "0", "output": []}
+
+    def fake_get(url, headers=None, params=None, timeout=None, **kwargs):
+        captured.append(params.copy())
+        return FakeResp()
+
+    monkeypatch.setattr("requests.get", fake_get)
+
+    client = KisUSClient(env="practice")
+    monkeypatch.setattr(client, "get_access_token", lambda: "TOKEN")
+    client.get_us_fills_today("2026-05-06")
+
+    params = captured[0]
+    assert "ORD_GNO_BRNO" in params
+    assert "ODNO" in params
 
