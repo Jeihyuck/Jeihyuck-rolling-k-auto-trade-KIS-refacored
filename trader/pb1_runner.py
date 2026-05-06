@@ -5204,14 +5204,49 @@ def run_once(
         elif nontrading_eval_mode:
             logger.info("[NONTRADING_EVAL][RECONCILE][SKIP] reason=read_only_mode")
 
+        # ========== Stale open order 자동 정리 ==========
+        expire_stale_enabled = str(os.getenv("PB1_EXPIRE_STALE_OPEN_ORDERS") or "1") == "1"
+        stale_max_minutes = int(os.getenv("PB1_STALE_OPEN_ORDER_MAX_MINUTES") or "30")
+        stale_repair_practice = str(os.getenv("PB1_STALE_OPEN_ORDER_REPAIR_PRACTICE") or "1") == "1"
+        
+        if expire_stale_enabled and (env_effective == "practice" and stale_repair_practice or env_effective == "real"):
+            try:
+                cutoff_dt = now - timedelta(minutes=stale_max_minutes)
+                logger.info(
+                    "[ORDERS][STALE_REPAIR][START] env=%s cutoff=%s max_minutes=%s",
+                    env_effective,
+                    cutoff_dt.isoformat(),
+                    stale_max_minutes,
+                )
+                expired_count = orders_repo.expire_stale_open_orders(
+                    env=env_effective,
+                    before_dt=cutoff_dt,
+                    reason="STALE_OPEN_ORDER_EXPIRED",
+                )
+                remaining_open = len(orders_repo.get_open_orders(env_effective, include_stale=False) or [])
+                logger.info(
+                    "[ORDERS][STALE_REPAIR][DONE] env=%s expired=%s remaining_open=%s",
+                    env_effective,
+                    expired_count,
+                    remaining_open,
+                )
+                if expired_count > 0:
+                    db_write_reasons.append("stale_order_cleanup")
+            except Exception as exc:
+                logger.warning("[ORDERS][STALE_REPAIR][FAIL] env=%s err=%s", env_effective, exc)
+
         reconcile_only_enabled = str(os.getenv("PB1_RECONCILE_ONLY_AFTER_ORDER_SUBMIT") or "0") == "1"
         reconcile_only_pending = str(os.getenv("PB1_PENDING_RECONCILE_ONLY") or "0") == "1"
+        reconcile_only_global_skip = str(os.getenv("PB1_RECONCILE_ONLY_GLOBAL_SKIP") or "0") == "1"
+        force_reconcile_only = str(os.getenv("PB1_FORCE_RECONCILE_ONLY") or "0") == "1"
+        
         if reconcile_only_enabled and reconcile_only_pending:
             open_orders_count = 0
             try:
                 open_orders_count = len(orders_repo.get_open_orders(env_effective) or [])
             except Exception as exc:
                 logger.warning("[PB1][RECONCILE_ONLY][OPEN_ORDERS_READ_FAIL] err=%s", exc)
+            
             skip_engine, keep_pending = _resolve_reconcile_only_followup(
                 enabled=True,
                 pending=True,
@@ -5219,20 +5254,38 @@ def run_once(
                 sell_orders=0,
                 open_orders_count=open_orders_count,
             )
+            
             if keep_pending:
                 os.environ["PB1_PENDING_RECONCILE_ONLY"] = "1"
             else:
                 os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
+            
+            # ========== open order 존재 → 전체 엔진 skip 방지 ==========
+            # reconcile_only_global_skip=0 (기본값)이면 open order가 있어도 전체 엔진 계속 실행
+            # 종목별 open order 체크는 entry candidate 평가 시 개별 처리
+            if skip_engine and not reconcile_only_global_skip and not force_reconcile_only:
+                logger.info(
+                    "[PB1][RECONCILE_ONLY][BYPASS] open_orders=%s global_skip=0 action=continue_engine reason=code_scoped_order_guard",
+                    open_orders_count,
+                )
+                skip_engine = False
+            
             if skip_engine:
                 logger.info(
-                    "[PB1][RECONCILE_ONLY] enabled=1 pending=1 open_orders=%s action=skip_engine keep_pending=%s",
+                    "[PB1][RECONCILE_ONLY] enabled=1 pending=1 open_orders=%s global_skip=%s action=skip_engine keep_pending=%s",
                     open_orders_count,
+                    int(reconcile_only_global_skip or force_reconcile_only),
                     int(keep_pending),
                 )
                 runs_repo.finish_run(run_record_id, status="OK_NO_TRADE", notes="reconcile_only_after_submit")
                 db_write_reasons.append("reconcile_only")
                 _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="reconcile_only", now=now)
                 return [], True, {"buy_orders": 0, "sell_orders": 0, "warning_counts": {}}, phase_for_log, "OK_RECONCILE_ONLY"
+            else:
+                logger.info(
+                    "[PB1][RECONCILE_ONLY][CHECK] open_orders=%s global_skip=0 action=continue",
+                    open_orders_count,
+                )
 
         logger.info(
             "[TRADE][PRECHECK][BALANCE] state=%s require_balance=%s allow_compute_without_kis=%s",

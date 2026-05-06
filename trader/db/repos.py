@@ -2687,18 +2687,137 @@ class OrdersRepo:
                 .values(status="CANCELLED", response_json=safe_response_json, updated_at=func.now()),
             )
 
-    def get_open_orders(self, env: str) -> list[dict]:
-        stmt = select(self._schema.orders).where(
-            and_(
-                self._schema.orders.c.env == env,
-                self._schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
-            )
-        )
+    def get_open_orders(
+        self,
+        env: str,
+        *,
+        code: str | None = None,
+        side: str | None = None,
+        trade_date: date | str | None = None,
+        include_stale: bool = False,
+        max_age_minutes: int | None = None,
+    ) -> list[dict]:
+        """
+        Open order 조회 (code/side/trade_date 필터 지원).
+        
+        Args:
+            env: 환경 (practice/real)
+            code: 종목코드 필터 (optional)
+            side: 매수/매도 필터 (BUY/SELL, optional)
+            trade_date: 거래일 필터 (optional)
+            include_stale: 전일 이전 주문 포함 여부 (default: False)
+            max_age_minutes: 최대 생성 시간 (optional)
+        
+        Returns:
+            Open order 리스트
+        """
+        open_statuses = ["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]
+        conditions = [
+            self._schema.orders.c.env == env,
+            self._schema.orders.c.status.in_(open_statuses),
+        ]
+        
+        if code:
+            conditions.append(self._schema.orders.c.code == code)
+        
+        if side:
+            conditions.append(self._schema.orders.c.side == side)
+        
+        # trade_date 필터 또는 stale 제외 로직
+        if trade_date:
+            if isinstance(trade_date, str):
+                from datetime import datetime
+                day = datetime.fromisoformat(trade_date)
+            else:
+                day = datetime.combine(trade_date, dtime.min)
+            start = day.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=pytz.timezone('Asia/Seoul'))
+            end = start + timedelta(days=1)
+            conditions.append(self._schema.orders.c.created_at >= start)
+            conditions.append(self._schema.orders.c.created_at < end)
+        elif not include_stale:
+            # 기본적으로 전일 이전 주문 제외 (오늘 00:00 이후만)
+            now = now_kst()
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            conditions.append(self._schema.orders.c.created_at >= start)
+        
+        if max_age_minutes:
+            now = now_kst()
+            cutoff = now - timedelta(minutes=max_age_minutes)
+            conditions.append(self._schema.orders.c.created_at >= cutoff)
+        
+        stmt = select(self._schema.orders).where(and_(*conditions))
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
             fail_open=None,
         )
+
+    def has_open_order_for_code(
+        self,
+        env: str,
+        code: str,
+        side: str,
+        trade_date: date | None = None,
+    ) -> bool:
+        """
+        특정 종목/사이드의 open order 존재 여부 확인.
+        
+        Args:
+            env: 환경
+            code: 종목코드
+            side: BUY/SELL
+            trade_date: 거래일 (optional, 기본값: 오늘)
+        
+        Returns:
+            Open order 존재 여부
+        """
+        return bool(
+            self.get_open_orders(
+                env,
+                code=code,
+                side=side,
+                trade_date=trade_date,
+                include_stale=False,
+            )
+        )
+
+    def expire_stale_open_orders(
+        self,
+        env: str,
+        *,
+        before_dt: datetime,
+        reason: str = "STALE_OPEN_ORDER_EXPIRED",
+    ) -> int:
+        """
+        오래된 open order를 EXPIRED 상태로 변경.
+        
+        Args:
+            env: 환경
+            before_dt: 이 시각 이전에 생성된 open order를 만료 처리
+            reason: 만료 사유
+        
+        Returns:
+            만료 처리된 주문 수
+        """
+        open_statuses = ["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]
+        
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                sa.update(self._schema.orders)
+                .where(
+                    and_(
+                        self._schema.orders.c.env == env,
+                        self._schema.orders.c.status.in_(open_statuses),
+                        self._schema.orders.c.created_at < before_dt,
+                    )
+                )
+                .values(
+                    status="EXPIRED",
+                    repair_reason=reason,
+                    updated_at=func.now(),
+                )
+            )
+            return result.rowcount
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
         stmt = select(self._schema.orders.c.order_id.label("order_id")).where(

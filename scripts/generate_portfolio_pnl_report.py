@@ -87,14 +87,15 @@ def _days_held(entry_date_str: str | None, trade_date: date) -> int:
 def _load_engine():
     """DB engine 로드. 실패 시 None 반환."""
     try:
-        from trader.db.session import get_engine
+        from trader.db.engine import make_engine
         db_url = os.getenv("PBCORE_DB_URL") or os.getenv("DATABASE_URL")
         if not db_url:
             logger.warning("[PNL_REPORT][DB_SKIP] PBCORE_DB_URL not set")
             return None
-        return get_engine(db_url)
+        return make_engine(db_url)
     except Exception as exc:
         logger.warning("[PNL_REPORT][DB_ENGINE_FAIL] err=%s", exc)
+        traceback.print_exc()
         return None
 
 
@@ -251,6 +252,7 @@ def _build_holdings_pnl(
             for f in today_sell_fills
         )
 
+        # ========== entry_date / days_held (fallback: DB 조회 대신 pos 우선 사용) ==========
         entry_date = str(pos.get("entry_date") or pos.get("entry_ts") or "")
         days_held = _days_held(entry_date, trade_date)
         rank = _safe_int(bal.get("rank") or pos.get("rank_final30") or 0)
@@ -354,11 +356,11 @@ def _build_portfolio_summary(holdings: list[dict], today_fills: list[dict], cash
     market_value = sum(h["market_value"] for h in holdings)
     unrealized_pnl = sum(h["unrealized_pnl"] for h in holdings)
     unrealized_pnl_pct = (unrealized_pnl / total_cost * 100) if total_cost > 0 else 0.0
-    realized_today = sum(h["realized_pnl_today"] for h in holdings) + sum(
-        _safe_float(f.get("price")) * _safe_int(f.get("qty")) - 0
-        for f in today_fills if str(f.get("side") or "").upper() == "SELL"
-    )
-    total_pnl = unrealized_pnl  # realized_today는 아직 별도
+    
+    # ========== realized_pnl_today 계산 수정 (holdings에서 합산) ==========
+    realized_today = sum(h.get("realized_pnl_today", 0.0) for h in holdings)
+    
+    total_pnl = unrealized_pnl + realized_today
     winners = sum(1 for h in holdings if h["pnl_pct"] >= 0)
     losers = sum(1 for h in holdings if h["pnl_pct"] < 0)
     best = max(holdings, key=lambda x: x["pnl_pct"], default=None)
@@ -369,7 +371,7 @@ def _build_portfolio_summary(holdings: list[dict], today_fills: list[dict], cash
         "market_value": market_value,
         "unrealized_pnl": unrealized_pnl,
         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
-        "realized_pnl_today": 0,
+        "realized_pnl_today": realized_today,
         "total_pnl": total_pnl,
         "cash": cash,
         "total_equity_estimate": market_value + cash,

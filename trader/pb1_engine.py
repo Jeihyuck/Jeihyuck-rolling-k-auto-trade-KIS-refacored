@@ -2330,16 +2330,47 @@ class PB1Engine:
         logger.info("[PB1][STAGE][END] stage=orders.lookup_open rows=%s", len(rows))
         return rows
 
-    def _should_block_entry_after_exit(self) -> tuple[bool, dict[str, int]]:
-        if os.getenv("PB1_BLOCK_ENTRY_AFTER_EXIT", "1") in {"0", "false", "False"}:
-            return False, {"exit_submit_attempt_count": 0, "accepted_sell_count": 0}
+    def _get_sold_codes_today(self) -> set[str]:
+        """
+        오늘 매도된 종목 코드 리스트 추출 (일반화).
+        
+        Returns:
+            오늘 매도된 종목 코드 set
+        """
+        sold_codes = set()
+        
+        # 1. 오늘 SELL fill에서 추출
+        try:
+            sell_fills = self._safe_list_today_fills(side="SELL")
+            for row in sell_fills:
+                code = str(row.get("code") or "").zfill(6)
+                if code and code != "000000":
+                    sold_codes.add(code)
+        except Exception as exc:
+            logger.warning("[SOLD_CODES][FILLS_LOOKUP_FAIL] err=%s", exc)
+        
+        # 2. 오늘 SELL accepted/submitted order에서 추출
+        try:
+            sell_orders = self._safe_list_today_orders(side="SELL")
+            for row in sell_orders:
+                status = str(row.get("status") or "").upper()
+                if status in {"SUBMITTED", "ACCEPTED", "FILLED", "PARTIAL_FILLED"}:
+                    code = str(row.get("code") or "").zfill(6)
+                    if code and code != "000000":
+                        sold_codes.add(code)
+        except Exception as exc:
+            logger.warning("[SOLD_CODES][ORDERS_LOOKUP_FAIL] err=%s", exc)
+        
+        # 3. 현재 tick의 exit summary에서 추출
         payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
-        exit_submit_attempt_count = int(payload.get("submit_attempt_count") or payload.get("submitted") or 0)
-        accepted_sell_count = int(payload.get("accepted_sell_count") or payload.get("submitted") or 0)
-        return (exit_submit_attempt_count > 0 or accepted_sell_count > 0), {
-            "exit_submit_attempt_count": exit_submit_attempt_count,
-            "accepted_sell_count": accepted_sell_count,
-        }
+        exit_evaluations = getattr(self, "_exit_evaluations", []) or []
+        for evaluation in exit_evaluations:
+            if int(evaluation.get("submitted") or 0) > 0:
+                code = str(evaluation.get("code") or "").zfill(6)
+                if code and code != "000000":
+                    sold_codes.add(code)
+        
+        return sold_codes
 
     def _safe_list_today_orders(self, *, code: str | None = None, side: str | None = None) -> list[dict]:
         cache_key = ("today_orders", str(code or ""), str(side or ""))
@@ -11479,15 +11510,31 @@ class PB1Engine:
             ):
                 positions_for_exit = self._run_exit_always(holdings_for_exit=holdings_for_exit, marks_fallback=marks_fallback)
             logger.info("[PB1][POST_CAPITAL][EXIT_PASS_DONE] evals=%s", len(getattr(self, "_exit_evaluations", []) or []))
-            exit_pass_sells = len([p for p in positions_for_exit if float(p.get("qty", 0)) == 0])
+            
+            # ========== Exit sells 카운팅 수정 (submitted_count 사용) ==========
+            exit_summary_payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
+            exit_submitted_count = int(exit_summary_payload.get("submitted") or 0)
+            exit_accepted_sells = int(exit_summary_payload.get("accepted_sell_count") or 0)
+            exit_fill_confirmed = int(exit_summary_payload.get("fill_confirmed_sell_count") or 0)
+            sold_codes_count = len(self._get_sold_codes_today())
+            
+            # 우선순위: fill > accepted > submitted
+            exit_reported_sells = exit_fill_confirmed or exit_accepted_sells or exit_submitted_count
+            
             logger.info(
-                "[PB1][POST_CAPITAL][EXIT_PASS][DONE] sells=%s skipped=%s evals=%s elapsed=%.2f",
-                exit_pass_sells,
+                "[PB1][POST_CAPITAL][EXIT_PASS][DONE] sells=%s sold_codes_count=%s skipped=%s evals=%s elapsed=%.2f",
+                exit_reported_sells,
+                sold_codes_count,
                 exit_pass_skipped,
                 len(getattr(self, "_exit_evaluations", []) or []),
                 time.perf_counter() - exit_pass_started,
             )
-            logger.info("[PASS][EXIT][END] sells=%s skipped_dup=%s", exit_pass_sells, exit_pass_skipped)
+            logger.info(
+                "[PASS][EXIT][END] sells=%s sold_codes_count=%s skipped_dup=%s",
+                exit_reported_sells,
+                sold_codes_count,
+                exit_pass_skipped,
+            )
         except PB1StageTimeout as exit_timeout:
             exit_pass_ok = False
             elapsed = time.perf_counter() - exit_pass_started
@@ -11552,37 +11599,31 @@ class PB1Engine:
             self._log_tick_price_cache_summary()
             return self._finalize_run_result(status=final_status, notes=final_notes)
 
-        block_entry_after_exit, exit_block_metrics = self._should_block_entry_after_exit()
-        exit_submit_attempt_count = int(exit_block_metrics.get("exit_submit_attempt_count") or 0)
-        accepted_sell_count = int(exit_block_metrics.get("accepted_sell_count") or 0)
-        if block_entry_after_exit:
-            logger.warning(
-                "[ENTRY][BLOCKED_AFTER_EXIT] exit_submitted=%s accepted_sells=%s reason=avoid_same_run_reentry",
-                exit_submit_attempt_count,
-                accepted_sell_count,
-            )
-            _emit_entry_summary([], [], Counter())
-            _emit_entry_decision(
-                "SKIP",
-                reason="BLOCKED_AFTER_EXIT",
-                ok_setups=0,
-                blocked_by=_normalize_entry_block_reasons(["BLOCKED_AFTER_EXIT"]),
-            )
-            _set_run_summary_payload(
-                scanned=0,
-                setup_ok=0,
-                relax_ok=0,
-                score_ok=0,
-                risk_ok=0,
-                sized_ok=0,
-                buyable_ok=0,
-                order_candidates=0,
-                submitted=0,
-                blocked_reasons_counter=Counter({"BLOCKED_AFTER_EXIT": 1}),
-                no_trade_reason="BLOCKED_AFTER_EXIT",
-            )
-            self._log_tick_price_cache_summary()
-            return self._finalize_run_result(status="OK_NO_TRADE", notes="BLOCKED_AFTER_EXIT")
+        # ========== 당일 매도 종목 추적 (전체 차단이 아닌 종목별 필터링) ==========
+        sold_codes_this_tick = set()
+        payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
+        accepted_sell_count = int(payload.get("accepted_sell_count") or 0)
+        exit_evaluations = getattr(self, "_exit_evaluations", []) or []
+        
+        # 이번 tick에서 매도된 종목 추출
+        for evaluation in exit_evaluations:
+            if int(evaluation.get("submitted") or 0) > 0:
+                code = str(evaluation.get("code") or "").zfill(6)
+                if code and code != "000000":
+                    sold_codes_this_tick.add(code)
+        
+        # 오늘 전체 매도 종목 추출 (당일 재매수 금지)
+        sold_codes_today = self._get_sold_codes_today()
+        
+        logger.info(
+            "[ENTRY][AFTER_EXIT][CODE_BLOCK] sold_this_tick=%s sold_today=%s action=block_sold_codes_only",
+            len(sold_codes_this_tick),
+            len(sold_codes_today),
+        )
+        if sold_codes_this_tick:
+            logger.info("[ENTRY][AFTER_EXIT][THIS_TICK] codes=%s", sorted(sold_codes_this_tick))
+        if sold_codes_today:
+            logger.info("[ENTRY][AFTER_EXIT][TODAY] codes=%s", sorted(sold_codes_today))
 
         # ========== ENTRY PASS (EXIT와 완전 독립) ==========
         logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
@@ -12895,7 +12936,54 @@ class PB1Engine:
                     cf.features["stop_price"] = float(stop0)
                     if isinstance(trigger_info, dict) and trigger_info.get("pivot") is not None:
                         cf.features["pivot_triggered"] = float(trigger_info.get("pivot"))
+                    
+                    # ========== 당일 매도 종목 재매수 금지 (종목별 필터링) ==========
                     reasons: list[str] = []
+                    
+                    # 1. 이번 tick에서 매도된 종목은 즉시 재매수 금지
+                    if cf.code in sold_codes_this_tick:
+                        reasons.append("SAME_TICK_SELL_REENTRY_BLOCK")
+                        logger.info(
+                            "[ENTRY][SKIP][CODE_LEVEL] code=%s reason=SAME_TICK_SELL_REENTRY_BLOCK",
+                            cf.code,
+                        )
+                    
+                    # 2. 오늘 매도된 종목은 당일 재매수 금지
+                    elif cf.code in sold_codes_today:
+                        reasons.append("SAME_DAY_SELL_REENTRY_BLOCK")
+                        logger.info(
+                            "[ENTRY][SKIP][CODE_LEVEL] code=%s reason=SAME_DAY_SELL_REENTRY_BLOCK",
+                            cf.code,
+                        )
+                    
+                    # 3. 동일 종목/동일 방향 open order 존재 시 재주문 금지
+                    elif self.orders_repo.has_open_order_for_code(
+                        env=self.env,
+                        code=cf.code,
+                        side="BUY",
+                        trade_date=None,  # 오늘 기준
+                    ):
+                        reasons.append("OPEN_BUY_ORDER_SAME_CODE")
+                        logger.info(
+                            "[ENTRY][SKIP][CODE_LEVEL] code=%s reason=OPEN_BUY_ORDER_SAME_CODE",
+                            cf.code,
+                        )
+                    
+                    if reasons:
+                        for reason in reasons:
+                            self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
+                            order_stage_counter[reason] += 1
+                        self._log_order_skip(cf, reasons, "PB1-CLOSE")
+                        self._emit_buy_decision(
+                            cf,
+                            order_value=order_value,
+                            reasons=reasons,
+                            entry_allowed=entry_allowed,
+                            entry_reason=entry_reason,
+                        )
+                        continue
+                    
+                    # ========== 기존 capacity/budget 체크 ==========
                     if new_position_limit <= 0:
                         reasons.append("max_positions")
                     if target_new_positions <= 0:
