@@ -268,6 +268,21 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: US Python syntax preflight
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_PREFLIGHT][START] py_compile"
+            python -m py_compile trader/us/execution/kis_us_client.py
+            python -m py_compile trader/us/execution/fills.py
+            python -m py_compile trader/us/runner/trade_close_runner.py
+            python -m py_compile trader/us/execution/reconcile.py
+            python -m compileall -q trader/us
+            echo "[US_PREFLIGHT][DONE]"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Guard manual force_now safety
         if: github.event_name == 'workflow_dispatch' && inputs.force_now != ''
         working-directory: repo
@@ -318,12 +333,30 @@ jobs:
         if: always()
         working-directory: repo
         run: |
+          set -euo pipefail
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
-          grep -E "\[US_TRADE_CLOSE\]\[TRIGGER\]" artifacts/${US_LOG_FILE} >/dev/null || echo "::warning::missing trigger marker"
-          if grep -F "Traceback" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
-            echo "::error::Traceback detected in US Close log"
+
+          # Success: phase guard intentionally skipped the close run.
+          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_TRADE_CLOSE\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_CLOSE_VERIFY][SKIP_OK] phase guard skipped close intentionally"
+            exit 0
+          fi
+
+          # Fatal errors.
+          if grep -E "Traceback|\\[US_TRADE_CLOSE\\]\\[ERROR\\].*final_status=ERROR" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::Fatal close error detected"
+            grep -n -E "Traceback|\\[US_TRADE_CLOSE\\]\\[ERROR\\].*final_status=ERROR" artifacts/${US_LOG_FILE} | head -20
             exit 1
           fi
+
+          # Success: OK or OK_WITH_WARNINGS.
+          if grep -E "\\[US_TRADE_CLOSE\\]\\[OK\\]|\\[US_TRADE_CLOSE\\]\\[WARNINGS\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_CLOSE_VERIFY][OK] close finished acceptably"
+            exit 0
+          fi
+
+          echo "::error::US Close final success marker missing"
+          exit 1
 
       - name: Upload US artifacts
         if: always()
