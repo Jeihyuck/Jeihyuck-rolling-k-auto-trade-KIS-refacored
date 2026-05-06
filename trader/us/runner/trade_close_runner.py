@@ -33,19 +33,28 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
     # 1. Fills 조회
     fills: list[dict] = []
+    fills_status = "SKIP" if offline else "UNKNOWN"
+    fills_error = ""
+    
     if not offline:
         try:
             from trader.us.execution.fills import get_fills_today
             fills_result = get_fills_today(provider=provider)
-            if fills_result["status"] != "OK":
-                logger.error(
-                    "[US_TRADE_CLOSE][ERROR] fills failed: %s",
-                    fills_result.get("error", "unknown")
-                )
+            fills_status = fills_result.get("status", "UNKNOWN")
             fills = fills_result["fills"]
-            logger.info("[US_TRADE_CLOSE][FILLS] count=%d status=%s", len(fills), fills_result["status"])
+            fills_error = fills_result.get("error", "")
+            
+            if fills_status != "OK":
+                logger.error(
+                    "[US_TRADE_CLOSE][ERROR] fills failed: status=%s error=%s",
+                    fills_status,
+                    fills_error,
+                )
+            logger.info("[US_TRADE_CLOSE][FILLS] count=%d status=%s", len(fills), fills_status)
         except Exception as exc:
             logger.error("[US_TRADE_CLOSE][ERROR] fills exception: %s", exc)
+            fills_status = "ERROR"
+            fills_error = str(exc)
     else:
         logger.info("[US_TRADE_CLOSE][FILLS] offline — skipping KIS fills")
 
@@ -102,9 +111,38 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     except Exception as exc:
         logger.warning("[US_TRADE_CLOSE][WARN] daily report failed: %s", exc)
 
-    logger.info("[US_TRADE_CLOSE][OK]")
+    # 8. Status 계산
+    status = "OK"
+    if fills_status == "CONTRACT_ERROR":
+        status = "ERROR"
+    elif reconcile_result.get("status") == "ERROR":
+        status = "ERROR"
+    elif fills_status not in ("OK", "SKIP"):
+        status = "OK_WITH_WARNINGS"
+    elif reconcile_result.get("status") not in ("OK", "SKIP"):
+        status = "OK_WITH_WARNINGS"
+    
+    # 9. Final 로그
+    if status == "OK":
+        logger.info("[US_TRADE_CLOSE][OK]")
+    elif status == "OK_WITH_WARNINGS":
+        logger.warning(
+            "[US_TRADE_CLOSE][WARNINGS] fills_status=%s reconcile_status=%s",
+            fills_status,
+            reconcile_result.get("status"),
+        )
+    else:
+        logger.error(
+            "[US_TRADE_CLOSE][ERROR] final_status=ERROR fills_status=%s reconcile_status=%s fills_error=%s",
+            fills_status,
+            reconcile_result.get("status"),
+            fills_error,
+        )
+    
     return {
-        "status": "OK",
+        "status": status,
+        "fills_status": fills_status,
+        "fills_error": fills_error,
         "fills_count": len(fills),
         "positions_count": len(positions),
         "reconcile_status": reconcile_result.get("status"),

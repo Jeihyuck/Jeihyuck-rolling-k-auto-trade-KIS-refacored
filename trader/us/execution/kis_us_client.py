@@ -278,8 +278,8 @@ class KisUSClient:
             ny_tz = ZoneInfo("America/New_York")
             ord_dt = dt.now(tz=ny_tz).strftime("%Y%m%d")
         
-        # Schema fallback: ORD_DT first, then ORD_RANGE
-        schemas = ["ORD_DT", "ORD_RANGE"]
+        # Schema fallback: ALL_DATES first, then ORD_DT, then ORD_RANGE
+        schemas = ["ALL_DATES", "ORD_DT", "ORD_RANGE"]
         errors = []
 
         for schema in schemas:
@@ -345,7 +345,7 @@ class KisUSClient:
         
         Args:
             ord_dt: YYYYMMDD 형식 날짜
-            schema: "ORD_DT" 또는 "ORD_RANGE"
+            schema: "ALL_DATES", "ORD_DT" 또는 "ORD_RANGE"
             
         Returns:
             KIS fills inquiry params dict
@@ -362,7 +362,11 @@ class KisUSClient:
             "CTX_AREA_NK200": "",
         }
 
-        if schema == "ORD_DT":
+        if schema == "ALL_DATES":
+            base["ORD_DT"] = ord_dt
+            base["ORD_STRT_DT"] = ord_dt
+            base["ORD_END_DT"] = ord_dt
+        elif schema == "ORD_DT":
             base["ORD_DT"] = ord_dt
         elif schema == "ORD_RANGE":
             base["ORD_STRT_DT"] = ord_dt
