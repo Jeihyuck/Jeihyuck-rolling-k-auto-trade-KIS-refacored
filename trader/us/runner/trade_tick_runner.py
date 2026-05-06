@@ -411,12 +411,29 @@ def run_trade_tick(
                         len(watchlist_rows)
                     )
                 else:
-                    # locked watchlist empty: 기본적으로 entry 차단
-                    # full universe fallback은 기본 금지
+                    # locked watchlist empty: pipeline input missing, ERROR 즉시 반환
                     logger.error(
-                        "[US_ENTRY][ERROR] locked_watchlist empty, entry blocked (fallback disabled by default)"
+                        "[US_ENTRY][BLOCK] reason=locked_watchlist_missing trade_date=%s",
+                        trade_date,
                     )
-                    watchlist_rows = []
+                    logger.error(
+                        "[US_TICK][DONE] session=%s status=ERROR reason=locked_watchlist_missing",
+                        session,
+                    )
+                    return {
+                        "status": "ERROR",
+                        "reason": "locked_watchlist_missing",
+                        "session": session,
+                        "orders": [],
+                        "ack": 0,
+                        "dry_run": 0,
+                        "blocked": 0,
+                        "signal_only": 0,
+                        "errors": 1,
+                        "run_mode": run_mode,
+                        "signal_only_mode": signal_only,
+                        "kis_order_allowed": kis_order_allowed,
+                    }
                 
                 if watchlist_rows:
                     engine = _get_strategy_engine(env=env, offline=offline)

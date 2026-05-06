@@ -353,6 +353,19 @@ jobs:
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Guard same-day US prep contract
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        env:
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
+          SESSION: "am"
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_PREP_GUARD][START] session=am"
+            python scripts/guard_us_prep_contract.py
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Run US AM trade session
         if: steps.phase_guard.outputs.should_run == '1'
         timeout-minutes: 190
@@ -460,9 +473,9 @@ jobs:
           fi
 
           # Fatal errors.
-          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_SESSION\\]\\[END\\].*reason=locked_watchlist_missing|\\[US_ENTRY\\]\\[BLOCK\\] reason=locked_watchlist_missing|\\[US_PREP_GUARD\\]\\[FAIL\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "::error::Fatal AM trade error detected"
-            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error" artifacts/${US_LOG_FILE} | head -20
+            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_SESSION\\]\\[END\\].*reason=locked_watchlist_missing|\\[US_ENTRY\\]\\[BLOCK\\] reason=locked_watchlist_missing|\\[US_PREP_GUARD\\]\\[FAIL\\]" artifacts/${US_LOG_FILE} | head -20
             exit 1
           fi
 

@@ -206,7 +206,10 @@ def run_trade_session(
             results.append(tick_result)
 
             tick_status = tick_result.get("status", "ERROR")
-            if tick_status in ("OK", "OK_WITH_WARNINGS", "OK_SIGNAL_ONLY", "SKIP"):
+            # 정상 status 목록
+            acceptable_statuses = {"OK", "OK_SIGNAL_ONLY", "OK_NO_TRADE", "OK_WITH_WARNINGS"}
+            
+            if tick_status in acceptable_statuses:
                 if tick_status in ("OK_WITH_WARNINGS", "OK_SIGNAL_ONLY"):
                     warn_count += 1
                     logger.warning(
@@ -255,17 +258,24 @@ def run_trade_session(
                 "reason": tick_result.get("reason", "market_skip"),
             }
 
-        # fills_contract_error 발생 시 세션 즉시 종료
-        if tick_result.get("reason") == "fills_contract_error":
+        # Hard pipeline error: prep/watchlist missing, fills contract error 등
+        hard_error_reasons = {
+            "fills_contract_error",
+            "locked_watchlist_missing",
+            "prep_degraded_or_error",
+            "locked_watchlist_below_min",
+        }
+        if tick_result.get("reason") in hard_error_reasons:
             logger.error(
-                "[US_SESSION][END] session=%s reason=fills_contract_error tick=%d",
+                "[US_SESSION][END] session=%s reason=%s tick=%d",
                 session,
+                tick_result.get("reason"),
                 tick_count,
             )
             return {
                 "status": "ERROR",
                 "session": session,
-                "reason": "fills_contract_error",
+                "reason": tick_result.get("reason"),
                 "tick_count": tick_count,
                 "results": results,
             }

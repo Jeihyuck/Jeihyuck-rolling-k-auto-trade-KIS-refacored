@@ -1,10 +1,11 @@
 name: "US Trade Prep"
-# prep: universe scoring + watchlist | window: 08:30~09:15 ET | schedule: 12:50 / 13:50 UTC Mon-Fri
+# prep: universe scoring + watchlist | window: 08:15~09:45 ET | schedule: 12:20 / 13:20 / 14:05 UTC Mon-Fri
 
 "on":
   schedule:
-    - cron: "50 12 * * 1-5"
-    - cron: "50 13 * * 1-5"
+    - cron: "20 12 * * 1-5"
+    - cron: "20 13 * * 1-5"
+    - cron: "05 14 * * 1-5"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -115,8 +116,8 @@ jobs:
           now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          target_min=$((8 * 60 + 30))
-          stale_min=$((9 * 60 + 15))
+          target_min=$((8 * 60 + 15))
+          stale_min=$((9 * 60 + 45))
 
           should_run=1
           skip_reason=""
@@ -172,7 +173,7 @@ jobs:
           mkdir -p repo/artifacts repo/reports/us_daily
           {
             echo "[US_PREP][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} phase_window=0830-0915"
+            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} phase_window=0815-0945"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -335,8 +336,15 @@ jobs:
           set -euo pipefail
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
 
+          # Fatal: stale start skip means same-day watchlist is missing.
+          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW reason=skip_stale_start_us_prep" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::US prep skipped due to stale start; same-day watchlist may be missing"
+            grep -n -E "\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -10
+            exit 1
+          fi
+
           # Success: phase guard intentionally skipped the prep run.
-          # Covers stale scheduled starts, duplicate DST crons, and manual runs without confirmation.
+          # Covers duplicate DST crons and manual runs without confirmation.
           if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_PREP\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_PREP_VERIFY][SKIP_OK] phase guard skipped prep intentionally"
             grep -n -E "\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -5
