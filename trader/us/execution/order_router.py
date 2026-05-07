@@ -29,6 +29,45 @@ logger = logging.getLogger(__name__)
 _SENT_ORDER_KEYS: set[str] = set()
 
 
+def resolve_dry_run_for_us_order() -> bool:
+    """US order DRY_RUN 여부를 resolve하고 runtime guard 검증.
+    
+    Rules:
+    - KIS_ENV=practice + DRY_RUN=0: ALLOWED (practice 주문)
+    - KIS_ENV!=practice + DRY_RUN=0: FORBIDDEN (즉시 RuntimeError)
+    - DRY_RUN=1: dry-run mode
+    
+    Returns:
+        True: DRY_RUN mode
+        False: Real order mode (practice orders are allowed)
+        
+    Raises:
+        RuntimeError: KIS_ENV!=practice에서 DRY_RUN=0 시도 시
+    """
+    from trader.utils.env import env_bool
+    
+    kis_env = str(os.getenv("KIS_ENV", "")).strip().lower()
+    dry_run_raw = os.getenv("DRY_RUN", "1").strip()
+    
+    dry_run = env_bool("DRY_RUN", default=True)
+    
+    logger.info(
+        "[US_ORDER][DRY_RUN_RESOLVE] kis_env=%s raw=%s resolved=%d",
+        kis_env, dry_run_raw, int(dry_run)
+    )
+    
+    # Runtime safety: KIS_ENV != practice에서 DRY_RUN=0은 허용하지 않음
+    if kis_env not in ("practice", "vps") and not dry_run:
+        msg = (
+            f"[US_ORDER][DRY_RUN_RESOLVE][FORBIDDEN] "
+            f"DRY_RUN=0 is only allowed when KIS_ENV=practice, got KIS_ENV={kis_env}"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+    
+    return dry_run
+
+
 def route_order(
     intent: dict,
     *,
@@ -38,15 +77,20 @@ def route_order(
     available_cash_usd: float = 1000.0,
     kis_client: Any | None = None,
     signal_only: bool = False,
+    kis_order_allowed: bool = True,
 ) -> dict:
     """Order intent를 라우팅한다.
 
+    Args:
+        kis_order_allowed: If False, return ORDER_DISABLED status
+
     Returns:
-        {"status": "DRY_RUN"|"ACK"|"BLOCKED"|"REJECT"|"SIGNAL_ONLY", ...}
+        {"status": "DRY_RUN"|"ACK"|"BLOCKED"|"REJECT"|"SIGNAL_ONLY"|"ORDER_DISABLED", ...}
     """
     from trader.us.db.repos import (
         save_order_intent, save_dry_run_order, save_order_ack, save_order_reject,
         mark_order_intent_sent, mark_order_intent_blocked, mark_order_intent_rejected,
+        mark_order_intent_dry_run,
         load_today_order_keys,
     )
     from trader.utils.env import env_bool
@@ -62,6 +106,21 @@ def route_order(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
         symbol, side, qty, float(intent.get("notional_usd", 0)), order_key,
     )
+
+    # KIS order disabled
+    if not kis_order_allowed:
+        logger.info(
+            "[US_ORDER][DISABLED] symbol=%s side=%s qty=%s reason=kis_order_allowed_false",
+            symbol, side, qty,
+        )
+        return {
+            "status": "ORDER_DISABLED",
+            "reason": "kis_order_allowed_false",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "intent": intent,
+        }
 
     # Signal-only mode: 신호만 생성, KIS 주문 차단
     if signal_only:
@@ -105,13 +164,16 @@ def route_order(
             mark_order_intent_blocked(order_key, reason=str(exc))
         return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
 
-    # 4. DRY_RUN
-    if env_bool("DRY_RUN", default=True):
+    # 4. DRY_RUN resolve with runtime guard
+    dry_run_resolved = resolve_dry_run_for_us_order()
+    
+    if dry_run_resolved:
         logger.info("[US_ORDER][DRY_RUN] symbol=%s side=%s qty=%s", symbol, side, qty)
         dry_intent = {**intent, "client_order_key": order_key}
         save_dry_run_order(dry_intent)
         if order_key:
-            mark_order_intent_sent(order_key)
+            # Mark as DRY_RUN instead of SENT to distinguish from real orders
+            mark_order_intent_dry_run(order_key)
             _SENT_ORDER_KEYS.add(order_key)
         return {
             "status": "DRY_RUN",

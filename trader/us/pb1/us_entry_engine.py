@@ -249,6 +249,18 @@ def generate_entry_intents(
     # entries를 symbol → entry dict로 변환 (빠른 조회용)
     entries_map = {e["symbol"]: e for e in entries} if entries else {}
 
+    # Skip reason tracking for observability
+    skip_reasons: dict[str, int] = {}
+    skip_details: list[dict] = []  # For diagnostics artifact
+    
+    def track_skip(symbol: str, reason: str, details: dict | None = None):
+        """Track skip reason for summary and diagnostics."""
+        skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+        skip_detail = {"symbol": symbol, "reason": reason}
+        if details:
+            skip_detail.update(details)
+        skip_details.append(skip_detail)
+
     scored: list[tuple[float, str, str, float, list[dict], dict]] = []
     seen_symbols: set[str] = set()  # 중복 symbol 차단용
 
@@ -262,8 +274,9 @@ def generate_entry_intents(
         
         # 동일 tick 내 중복 symbol 차단
         if symbol in seen_symbols:
+            track_skip(symbol, "duplicate_in_tick")
             logger.debug(
-                "[US_ENTRY][DEDUP_SKIP] symbol=%s reason=already_selected_this_tick",
+                "[US_ENTRY][SKIP] symbol=%s reason=duplicate_in_tick",
                 symbol
             )
             continue
@@ -271,18 +284,21 @@ def generate_entry_intents(
         
         # 당일 매도 차단
         if symbol in sold_today:
-            logger.debug("[US_ENTRY][BLOCK] reason=sold_today symbol=%s", symbol)
+            track_skip(symbol, "sold_today")
+            logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
             continue
 
         # DB: 미체결 주문 차단
         try:
             from trader.us.db.repos import has_pending_order, has_position
             if has_pending_order(symbol):
-                logger.debug("[US_ENTRY][BLOCK] reason=pending_order symbol=%s", symbol)
+                track_skip(symbol, "pending_order")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=pending_order", symbol)
                 continue
             # DB: 이미 보유 중이면 차단
             if has_position(symbol):
-                logger.debug("[US_ENTRY][BLOCK] reason=has_position symbol=%s", symbol)
+                track_skip(symbol, "has_position")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_position", symbol)
                 continue
         except Exception as exc:
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
@@ -306,21 +322,49 @@ def generate_entry_intents(
             # Extract score with alias recovery
             s, score_source = extract_us_score(canonical_entry, "final", return_source=True)
             
+            # Log precomputed score BEFORE validation
+            logger.info(
+                "[US_ENTRY][PRECOMPUTED_SCORE] symbol=%s score=%.6f source=%s",
+                symbol, s if s is not None else 0.0, score_source
+            )
+            
             # Score validation
-            if s is None or s <= 0:
+            if s is None:
                 raw_score = entry_meta.get("score")
-                logger.warning(
-                    "[US_ENTRY][SKIP] symbol=%s reason=score_missing_or_zero_after_alias_resolution "
+                track_skip(symbol, "score_missing_after_alias_resolution", {
+                    "raw_score": raw_score,
+                    "score_source": score_source,
+                })
+                logger.info(
+                    "[US_ENTRY][SKIP] symbol=%s reason=score_missing_after_alias_resolution "
+                    "canonical_score=None score_source=%s raw_score=%s",
+                    symbol, score_source, raw_score
+                )
+                continue
+            
+            if s <= 0:
+                raw_score = entry_meta.get("score")
+                track_skip(symbol, "score_zero_after_alias_resolution", {
+                    "canonical_score": s,
+                    "raw_score": raw_score,
+                    "score_source": score_source,
+                })
+                logger.info(
+                    "[US_ENTRY][SKIP] symbol=%s reason=score_zero_after_alias_resolution "
                     "canonical_score=%.6f score_source=%s raw_score=%s",
-                    symbol, s if s is not None else 0.0, score_source, raw_score
+                    symbol, s, score_source, raw_score
                 )
                 continue
             
             # Minimum entry score validation
             min_entry_score = float(os.getenv("US_MIN_ENTRY_SCORE", "0.05"))
             if s < min_entry_score:
-                logger.debug(
-                    "[US_ENTRY][SKIP] symbol=%s reason=below_min_entry_score score=%.6f min=%.6f",
+                track_skip(symbol, "score_below_min", {
+                    "score": s,
+                    "min_entry_score": min_entry_score,
+                })
+                logger.info(
+                    "[US_ENTRY][SKIP] symbol=%s reason=score_below_min score=%.6f min=%.6f",
                     symbol, s, min_entry_score
                 )
                 continue
@@ -329,17 +373,13 @@ def generate_entry_intents(
             if not exchange:
                 exchange = resolve_exchange(symbol)
             
-            logger.debug(
-                "[US_ENTRY][PRECOMPUTED_SCORE] symbol=%s score=%.6f source=%s exchange=%s",
-                symbol, s, score_source, exchange
-            )
-            
             # current price 조회는 여전히 필요
             try:
                 daily = provider.get_daily_prices(symbol, exchange, count=120)
                 current = provider.get_current_price(symbol, exchange)
             except Exception as exc:
-                logger.debug("[US_ENTRY][SKIP] symbol=%s data error=%s", symbol, exc)
+                track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=daily_price_unavailable error=%s", symbol, exc)
                 continue
         else:
             # precomputed score가 없으면 실시간 계산
@@ -348,30 +388,37 @@ def generate_entry_intents(
                 daily = provider.get_daily_prices(symbol, exchange, count=120)
                 current = provider.get_current_price(symbol, exchange)
             except Exception as exc:
-                logger.debug("[US_ENTRY][SKIP] symbol=%s error=%s", symbol, exc)
+                track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=daily_price_unavailable error=%s", symbol, exc)
                 continue
 
             try:
                 s = score_symbol(symbol, daily, current)
             except Exception as exc:
-                logger.debug("[US_ENTRY][SCORE_ERR] symbol=%s error=%s", symbol, exc)
+                track_skip(symbol, "score_calculation_error", {"error": str(exc)})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=score_calculation_error error=%s", symbol, exc)
                 continue
 
             if s is None:
-                logger.debug("[US_ENTRY][SKIP] symbol=%s reason=score_calculation_failed", symbol)
+                track_skip(symbol, "score_calculation_failed")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=score_calculation_failed", symbol)
                 continue
             
             if s <= 0:
-                logger.debug("[US_ENTRY][SKIP] symbol=%s reason=score_zero_or_negative score=%.6f", symbol, s)
+                track_skip(symbol, "score_zero_or_negative", {"score": s})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=score_zero_or_negative score=%.6f", symbol, s)
                 continue
 
         try:
             price = float(current.get("last", 0))
         except (ValueError, TypeError):
-            logger.debug("[US_ENTRY][SKIP] symbol=%s invalid price", symbol)
+            track_skip(symbol, "current_price_unavailable")
+            logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable", symbol)
             continue
 
         if price <= 0:
+            track_skip(symbol, "current_price_invalid", {"price": price})
+            logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_invalid price=%.2f", symbol, price)
             continue
 
         scored.append((s, symbol, exchange, price, daily, current))
@@ -404,8 +451,9 @@ def generate_entry_intents(
         )
 
         if sizing["blocked"]:
-            logger.debug(
-                "[US_ENTRY][BLOCK] symbol=%s reason=%s",
+            track_skip(symbol, "sizing_blocked", {"sizing_reason": sizing["reason"]})
+            logger.info(
+                "[US_ENTRY][SKIP] symbol=%s reason=sizing_blocked sizing_reason=%s",
                 symbol, sizing["reason"],
             )
             continue
@@ -441,6 +489,70 @@ def generate_entry_intents(
             "[US_ENTRY][INTENT] symbol=%s rank=%d score=%.6f qty=%d notional=%.2f",
             symbol, rank + 1, score, qty, notional,
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Skip Summary for Observability
+    # ─────────────────────────────────────────────────────────────────────────
+    total_processed = len(symbols)
+    scored_count = len(scored)
+    
+    summary_parts = [
+        f"total={total_processed}",
+        f"scored={scored_count}",
+    ]
+    
+    for reason in sorted(skip_reasons.keys()):
+        count = skip_reasons[reason]
+        summary_parts.append(f"{reason}={count}")
+    
+    summary_str = " ".join(summary_parts)
+    
+    logger.info("[US_ENTRY][SKIP_SUMMARY] %s", summary_str)
+    
+    # Write score diagnostics artifact if any score issues detected
+    score_issue_reasons = {
+        "score_missing_after_alias_resolution",
+        "score_zero_after_alias_resolution",
+        "score_below_min",
+        "score_calculation_failed",
+        "score_calculation_error",
+        "score_zero_or_negative",
+    }
+    
+    score_issue_details = [d for d in skip_details if d["reason"] in score_issue_reasons]
+    
+    if score_issue_details:
+        try:
+            import json
+            import csv
+            import os
+            
+            os.makedirs("repo/artifacts", exist_ok=True)
+            
+            # JSON artifact
+            json_path = "repo/artifacts/us_score_diagnostics.json"
+            with open(json_path, "w") as f:
+                json.dump(score_issue_details, f, indent=2, default=str)
+            
+            # CSV artifact
+            csv_path = "repo/artifacts/us_score_diagnostics.csv"
+            if score_issue_details:
+                keys = set()
+                for d in score_issue_details:
+                    keys.update(d.keys())
+                fieldnames = sorted(keys)
+                
+                with open(csv_path, "w", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(score_issue_details)
+            
+            logger.info(
+                "[US_SCORE_DIAG][SAVED] rows=%d json=%s csv=%s",
+                len(score_issue_details), json_path, csv_path
+            )
+        except Exception as exc:
+            logger.warning("[US_SCORE_DIAG][SAVE_FAILED] %s", exc)
 
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(intents))
     return intents

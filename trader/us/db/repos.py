@@ -231,6 +231,24 @@ def mark_order_intent_rejected(client_order_key: str, reason: str = "") -> None:
         logger.error("[US_INTENT][MARK_REJECTED][ERROR] %s", exc)
 
 
+def mark_order_intent_dry_run(client_order_key: str) -> None:
+    """Mark order intent as DRY_RUN (not SENT, to distinguish from real orders)."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        for i in _MEM_INTENTS:
+            if i.get("client_order_key") == client_order_key:
+                i["status"] = "DRY_RUN"
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE us_order_intents SET status='DRY_RUN' WHERE client_order_key=:cok"),
+                {"cok": client_order_key},
+            )
+    except Exception as exc:
+        logger.error("[US_INTENT][MARK_DRY_RUN][ERROR] %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Orders — schema: trade_date, client_order_key, symbol, exchange, side,
 #                  qty_requested, qty_filled, avg_price_usd, order_no,
@@ -538,19 +556,26 @@ def load_today_order_keys(trade_date: str | None = None) -> set[str]:
 
 
 def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> list[dict]:
+    """Load open (pending/unfilled) orders for a symbol.
+    
+    EXCLUDES DRY_RUN orders - they are not real pending orders.
+    Only real unfilled orders (ACK, SENT, PARTIALLY_FILLED) are considered open.
+    """
     td = trade_date or _today()
     engine = _get_engine_or_none()
     if engine is None:
         return [o for o in _MEM_ORDERS
                 if o.get("symbol") == symbol and o.get("trade_date") == td
-                and o.get("status") in ("ACK", "SENT", "DRY_RUN")]
+                and o.get("status") in ("ACK", "SENT", "PARTIALLY_FILLED")
+                and not o.get("dry_run", False)]
     try:
         with engine.begin() as conn:
             rows = conn.execute(
                 text("""
                     SELECT * FROM us_orders
                     WHERE symbol=:symbol AND trade_date=:td
-                      AND status IN ('ACK','SENT','DRY_RUN')
+                      AND status IN ('ACK','SENT','PARTIALLY_FILLED')
+                      AND dry_run = FALSE
                 """),
                 {"symbol": symbol, "td": td},
             )

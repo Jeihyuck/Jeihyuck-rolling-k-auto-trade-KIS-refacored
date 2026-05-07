@@ -486,6 +486,7 @@ class KisUSClient:
         
         max_attempts = 5
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
+        last_error: Exception | None = None
         
         for attempt in range(1, max_attempts + 1):
             try:
@@ -496,9 +497,18 @@ class KisUSClient:
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
+                
+                # Success after retry
+                if attempt > 1 and last_error:
+                    logger.info(
+                        f"[US_KIS][TEMP_RECOVERED] attempt={attempt}/{max_attempts} "
+                        f"path={path!r} last_error={last_error!r}"
+                    )
+                
                 return data
             
             except Exception as err:
+                last_error = err
                 is_temp = self._is_temporary_error(err, None)
                 
                 if is_temp and attempt < max_attempts:
@@ -508,8 +518,8 @@ class KisUSClient:
                     sleep_time = backoff_sec + jitter
                     
                     logger.warning(
-                        f"[US_KIS][RETRY] attempt={attempt}/{max_attempts} "
-                        f"path={path!r} error={err!r} backoff={sleep_time:.2f}s"
+                        f"[US_KIS][TEMP_ERROR] endpoint=GET_{path.split('/')[- 1]} "
+                        f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
                     time.sleep(sleep_time)
                     continue
@@ -534,6 +544,7 @@ class KisUSClient:
         
         max_attempts = 5
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
+        last_error: Exception | None = None
         
         for attempt in range(1, max_attempts + 1):
             try:
@@ -544,9 +555,18 @@ class KisUSClient:
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
+                
+                # Success after retry
+                if attempt > 1 and last_error:
+                    logger.info(
+                        f"[US_KIS][TEMP_RECOVERED] attempt={attempt}/{max_attempts} "
+                        f"path={path!r} last_error={last_error!r}"
+                    )
+                
                 return data
             
             except Exception as err:
+                last_error = err
                 is_temp = self._is_temporary_error(err, None)
                 
                 if is_temp and attempt < max_attempts:
@@ -556,8 +576,8 @@ class KisUSClient:
                     sleep_time = backoff_sec + jitter
                     
                     logger.warning(
-                        f"[US_KIS][RETRY] attempt={attempt}/{max_attempts} "
-                        f"path={path!r} error={err!r} backoff={sleep_time:.2f}s"
+                        f"[US_KIS][TEMP_ERROR] endpoint=POST_{path.split('/')[-1]} "
+                        f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
                     time.sleep(sleep_time)
                     continue

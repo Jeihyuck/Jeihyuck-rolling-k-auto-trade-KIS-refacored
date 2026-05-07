@@ -1,0 +1,674 @@
+# -*- coding: utf-8 -*-
+"""US Portfolio PNL Report Runner.
+
+미국장 전용 PNL report 생성.
+
+Features:
+- KIS 해외주식 practice 잔고/평가금액 기반
+- Traditional return formula: (current_price - avg_cost) / avg_cost * 100
+- USD 기준 (KRW는 보조)
+- Markdown/JSON/CSV export
+- Holdings PNL table, today trades, blocked orders
+- Watchlist score contract, order contract
+- Data quality warnings
+
+CRITICAL: 한국장 trader/db/repos.py 사용 금지. trader/us/db/repos.py만 사용.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def get_ny_trade_date(force_now: str | None = None) -> str:
+    """Get NY-based trade date."""
+    if force_now:
+        try:
+            dt = datetime.fromisoformat(force_now).astimezone(NY_TZ)
+            return dt.strftime("%Y-%m-%d")
+        except Exception as exc:
+            logger.warning("[US_PNL][WARN] force_now parse failed: %s", exc)
+    return datetime.now(tz=NY_TZ).strftime("%Y-%m-%d")
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    """Safely convert value to float."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (int, float, Decimal)):
+            return float(value)
+        if isinstance(value, str):
+            return float(value.strip())
+        return default
+    except (ValueError, TypeError):
+        return default
+
+
+def get_fx_krw_per_usd() -> float:
+    """Get KRW/USD exchange rate from env or default."""
+    try:
+        return float(os.getenv("US_BUDGET_FX_KRW_PER_USD", "1450"))
+    except Exception:
+        return 1450.0
+
+
+def fetch_kis_balance(client, env: str) -> dict:
+    """Fetch KIS US balance.
+    
+    Returns:
+        {
+            "status": "OK" | "ERROR",
+            "cash_usd": float,
+            "holdings": list[dict],  # {symbol, exchange, qty, avg_cost_usd, current_price_usd, ...}
+            "error": str | None,
+        }
+    """
+    try:
+        balance_resp = client.get_us_balance()
+        
+        output1 = balance_resp.get("output1") or []
+        output2 = balance_resp.get("output2") or {}
+        
+        # Cash
+        cash_usd = safe_float(output2.get("frcr_dncl_amt_2"))  # USD 현금
+        
+        # Holdings
+        holdings = []
+        for item in output1:
+            try:
+                symbol = str(item.get("pdno", "")).strip().upper()
+                exchange = str(item.get("natn_cd", "NASDAQ")).strip().upper()
+                qty = int(item.get("ccld_qty_smtl", 0) or 0)
+                
+                if not symbol or qty <= 0:
+                    continue
+                
+                avg_cost_usd = safe_float(item.get("avg_unpr"))
+                current_price_usd = safe_float(item.get("ovrs_now_pric1"))
+                
+                market_value_usd = current_price_usd * qty if current_price_usd > 0 else 0.0
+                cost_basis_usd = avg_cost_usd * qty if avg_cost_usd > 0 else 0.0
+                
+                unrealized_pnl_usd = market_value_usd - cost_basis_usd if cost_basis_usd > 0 else 0.0
+                pnl_pct = ((current_price_usd - avg_cost_usd) / avg_cost_usd * 100.0) if avg_cost_usd > 0 else 0.0
+                
+                holdings.append({
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "qty": qty,
+                    "avg_cost_usd": round(avg_cost_usd, 4),
+                    "current_price_usd": round(current_price_usd, 4),
+                    "cost_basis_usd": round(cost_basis_usd, 2),
+                    "market_value_usd": round(market_value_usd, 2),
+                    "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "source": "kis_balance",
+                })
+            except Exception as exc:
+                logger.warning("[US_PNL][WARN] parse KIS position failed: %s", exc)
+        
+        logger.info(
+            "[US_PNL][KIS_BALANCE][OK] cash_usd=%.2f holdings=%d",
+            cash_usd, len(holdings)
+        )
+        
+        return {
+            "status": "OK",
+            "cash_usd": cash_usd,
+            "holdings": holdings,
+            "error": None,
+        }
+    
+    except Exception as exc:
+        logger.error("[US_PNL][KIS_BALANCE][ERROR] %s", exc)
+        return {
+            "status": "ERROR",
+            "cash_usd": 0.0,
+            "holdings": [],
+            "error": str(exc),
+        }
+
+
+def enrich_holdings_with_db(holdings: list[dict], trade_date: str) -> list[dict]:
+    """Enrich KIS holdings with DB metadata (entry_date, score, stop_price, etc.)."""
+    from trader.us.db.repos import load_positions
+    
+    try:
+        db_positions = load_positions(as_of=trade_date)
+    except Exception as exc:
+        logger.warning("[US_PNL][WARN] DB positions load failed: %s", exc)
+        db_positions = []
+    
+    # Build symbol map
+    db_map = {p.get("symbol"): p for p in db_positions if p.get("symbol")}
+    
+    enriched = []
+    for h in holdings:
+        symbol = h["symbol"]
+        db_pos = db_map.get(symbol, {})
+        
+        enriched_h = dict(h)
+        enriched_h["entry_date"] = db_pos.get("entry_date")
+        enriched_h["entry_style"] = db_pos.get("entry_style")
+        enriched_h["score"] = safe_float(db_pos.get("score"))
+        enriched_h["stop_price_usd"] = safe_float(db_pos.get("stop_price"))
+        
+        # Days held
+        if enriched_h["entry_date"]:
+            try:
+                entry_dt = datetime.fromisoformat(str(enriched_h["entry_date"]))
+                now_dt = datetime.now(tz=NY_TZ)
+                days_held = (now_dt - entry_dt).days
+                enriched_h["days_held"] = days_held
+            except Exception:
+                enriched_h["days_held"] = None
+        else:
+            enriched_h["days_held"] = None
+        
+        enriched.append(enriched_h)
+    
+    return enriched
+
+
+def get_today_trades(trade_date: str) -> list[dict]:
+    """Get today's order/fill summary."""
+    # This uses load_us_orders (added in daily_report_runner as temp,  should move to repos.py)
+    try:
+        # Import load_us_orders from daily_report_runner temporarily
+        from trader.us.runner.daily_report_runner import load_us_orders
+        orders = load_us_orders(trade_date)
+    except Exception as exc:
+        logger.warning("[US_PNL][WARN] load orders failed: %s", exc)
+        orders = []
+    
+    trades = []
+    for order in orders:
+        try:
+            trades.append({
+                "time": str(order.get("created_at", "")),
+                "side": order.get("side", ""),
+                "symbol": order.get("symbol", ""),
+                "exchange": order.get("exchange", ""),
+                "qty": int(order.get("qty_requested", 0)),
+                "price_usd": safe_float(order.get("avg_price_usd")),
+                "notional_usd": safe_float(order.get("qty_requested", 0)) * safe_float(order.get("avg_price_usd")),
+                "order_status": order.get("status", ""),
+                "fill_status": "FILLED" if int(order.get("qty_filled", 0)) >= int(order.get("qty_requested", 1)) else "PARTIAL",
+                "order_no": order.get("order_no", ""),
+                "client_order_key": order.get("client_order_key", ""),
+                "reason": order.get("meta", {}).get("reason", "") if isinstance(order.get("meta"), dict) else "",
+            })
+        except Exception as exc:
+            logger.warning("[US_PNL][WARN] parse order failed: %s", exc)
+    
+    return trades
+
+
+def get_blocked_orders(trade_date: str) -> list[dict]:
+    """Get today's blocked/skipped order intents."""
+    from trader.us.db.repos import _get_engine_or_none
+    from sqlalchemy import text
+    
+    engine = _get_engine_or_none()
+    if engine is None:
+        return []
+    
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT * FROM us_order_intents
+                    WHERE trade_date = :td
+                      AND status IN ('BLOCKED', 'REJECTED')
+                    ORDER BY created_at
+                """),
+                {"td": trade_date},
+            )
+            blocked = []
+            for r in rows:
+                blocked.append({
+                    "time": str(r.created_at) if r.created_at else "",
+                    "symbol": r.symbol,
+                    "side": r.side,
+                    "reason": r.status,
+                    "source": "intent",
+                    "client_order_key": r.client_order_key,
+                })
+            return blocked
+    except Exception as exc:
+        logger.warning("[US_PNL][WARN] load blocked orders failed: %s", exc)
+        return []
+
+
+def get_watchlist_score_contract(trade_date: str) -> dict:
+    """Get watchlist score contract summary."""
+    from trader.us.db.repos import load_locked_us_watchlist
+    from trader.us.score_columns import collect_us_score_nonzero_stats
+    
+    try:
+        watchlist = load_locked_us_watchlist(trade_date)
+    except Exception as exc:
+        logger.warning("[US_PNL][WARN] load watchlist failed: %s", exc)
+        return {}
+    
+    if not watchlist:
+        return{}
+    
+    unique_symbols = set(row.get("symbol") for row in watchlist if row.get("symbol"))
+    duplicate_count = len(watchlist) - len(unique_symbols)
+    
+    stats = collect_us_score_nonzero_stats(watchlist)
+    
+    return {
+        "watchlist_raw_count": len(watchlist),
+        "watchlist_unique_count": len(unique_symbols),
+        "watchlist_duplicate_count": duplicate_count,
+        "score_nonzero_count": stats["score_nonzero"],
+        "score_zero_count": stats["score_zero"],
+        "score_missing_count": stats["score_missing"],
+        "score_nonzero_ratio": stats["score_nonzero_ratio"],
+    }
+
+
+def get_order_contract(today_trades: list[dict]) -> dict:
+    """Get order contract summary from today's trades."""
+    orders_ack = sum(1 for t in today_trades if t["order_status"] in ("ACK", "SENT"))
+    orders_rejected = sum(1 for t in today_trades if t["order_status"] == "REJECTED")
+    orders_dry_run = sum(1 for t in today_trades if t["order_status"] == "DRY_RUN")
+    orders_blocked = sum(1 for t in today_trades if t["order_status"] == "BLOCKED")
+    orders_disabled = sum(1 for t in today_trades if t["order_status"] == "ORDER_DISABLED")
+    
+    ack_notional = sum(t["notional_usd"] for t in today_trades if t["order_status"] in ("ACK", "SENT"))
+    dry_run_notional = sum(t["notional_usd"] for t in today_trades if t["order_status"] == "DRY_RUN")
+    
+    return {
+        "orders_ack": orders_ack,
+        "orders_rejected": orders_rejected,
+        "orders_dry_run": orders_dry_run,
+        "orders_blocked": orders_blocked,
+        "orders_disabled": orders_disabled,
+        "ack_notional_usd": round(ack_notional, 2),
+        "dry_run_notional_usd": round(dry_run_notional, 2),
+    }
+
+
+def generate_pnl_report(
+    env: str = "practice",
+    session: str | None = None,
+    trade_date: str | None = None,
+    offline: bool = False,
+    fail_on_missing_report: bool = False,
+) -> dict:
+    """Generate US Portfolio PNL Report.
+    
+    Args:
+        env: Environment
+        session: Trading session
+        trade_date: Trade date (auto if None)
+        offline: Skip KIS queries
+        fail_on_missing_report: If True, return error status on failure
+        
+    Returns:
+        {"status": "OK" | "ERROR", "report": {...}}
+    """
+    force_now = os.getenv("FORCE_NOW", "").strip()
+    
+    if trade_date is None:
+        trade_date = get_ny_trade_date(force_now)
+    
+    logger.info(
+        "[US_PNL][START] env=%s session=%s trade_date=%s offline=%d",
+        env, session or "N/A", trade_date, int(offline)
+    )
+    
+    fx_krw_per_usd = get_fx_krw_per_usd()
+    
+    report = {
+        "runtime": {
+            "workflow": os.getenv("GITHUB_WORKFLOW", ""),
+            "branch": os.getenv("GITHUB_REF_NAME", ""),
+            "commit_sha": os.getenv("GITHUB_SHA", "")[:8] if os.getenv("GITHUB_SHA") else "",
+            "run_id": os.getenv("GITHUB_RUN_ID", ""),
+            "run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", ""),
+            "actor": os.getenv("GITHUB_ACTOR", ""),
+            "session": session,
+            "env": env,
+            "kis_env": os.getenv("KIS_ENV", ""),
+            "dry_run": os.getenv("DRY_RUN", ""),
+            "trade_date_ny": trade_date,
+            "generated_at_ny": datetime.now(tz=NY_TZ).isoformat(),
+            "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+            "account_masked": f"{os.getenv('CANO', '')[:4]}****",
+            "fx_krw_per_usd": fx_krw_per_usd,
+        },
+        "portfolio_summary": {},
+        "holdings": [],
+        "today_trades": [],
+        "blocked_orders": [],
+        "watchlist_score_contract": {},
+        "order_contract": {},
+        "data_quality": {
+            "warnings": [],
+            "errors": [],
+        },
+    }
+    
+    # Fetch KIS balance
+    if offline:
+        logger.info("[US_PNL][OFFLINE] skipping KIS balance")
+        balance_result = {"status": "ERROR", "cash_usd": 0.0, "holdings": [], "error": "offline"}
+    else:
+        from trader.us.execution.kis_us_client import KisUSClient
+        client = KisUSClient(env=env)
+        balance_result = fetch_kis_balance(client, env)
+    
+    if balance_result["status"] == "OK":
+        holdings = balance_result["holdings"]
+        cash_usd = balance_result["cash_usd"]
+    else:
+        # Fallback to DB positions
+        report["data_quality"]["warnings"].append(f"kis_balance_failed: {balance_result['error']}")
+        logger.warning("[US_PNL][WARN] KIS balance failed, using DB fallback")
+        
+        # TODO: Implement DB-only fallback position logic
+        holdings = []
+        cash_usd = 0.0
+    
+    # Enrich holdings with DB metadata
+    enriched_holdings = enrich_holdings_with_db(holdings, trade_date)
+    report["holdings"] = enriched_holdings
+    
+    # Calculate portfolio summary
+    total_positions = len(enriched_holdings)
+    market_value_usd = sum(h["market_value_usd"] for h in enriched_holdings)
+    cost_basis_usd = sum(h["cost_basis_usd"] for h in enriched_holdings)
+    unrealized_pnl_usd = sum(h["unrealized_pnl_usd"] for h in enriched_holdings)
+    unrealized_pnl_pct = (unrealized_pnl_usd / cost_basis_usd * 100.0) if cost_basis_usd > 0 else 0.0
+    
+    # TODO: Calculate realized PNL from fills
+    realized_pnl_today_usd = 0.0
+    
+    total_pnl_usd = realized_pnl_today_usd + unrealized_pnl_usd
+    total_equity_estimate_usd = cash_usd + market_value_usd
+    
+    # Winners/losers
+    winners = sum(1 for h in enriched_holdings if h["pnl_pct"] > 0)
+    losers = sum(1 for h in enriched_holdings if h["pnl_pct"] < 0)
+    
+    # Best/worst
+    sorted_by_pnl = sorted(enriched_holdings, key=lambda h: h["pnl_pct"], reverse=True)
+    best_position = sorted_by_pnl[0]["symbol"] if sorted_by_pnl else "N/A"
+    worst_position = sorted_by_pnl[-1]["symbol"] if sorted_by_pnl else "N/A"
+    
+    report["portfolio_summary"] = {
+        "total_positions": total_positions,
+        "cash_usd": round(cash_usd, 2),
+        "market_value_usd": round(market_value_usd, 2),
+        "cost_basis_usd": round(cost_basis_usd, 2),
+        "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
+        "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+        "realized_pnl_today_usd": round(realized_pnl_today_usd, 2),
+        "total_pnl_usd": round(total_pnl_usd, 2),
+        "total_equity_estimate_usd": round(total_equity_estimate_usd, 2),
+        "market_value_krw": round(market_value_usd * fx_krw_per_usd, 0),
+        "total_pnl_krw": round(total_pnl_usd * fx_krw_per_usd, 0),
+        "winners": winners,
+        "losers": losers,
+        "best_position": best_position,
+        "worst_position": worst_position,
+    }
+    
+    # Today trades
+    report["today_trades"] = get_today_trades(trade_date)
+    
+    # Blocked orders
+    report["blocked_orders"] = get_blocked_orders(trade_date)
+    
+    # Watchlist score contract
+    report["watchlist_score_contract"] = get_watchlist_score_contract(trade_date)
+    
+    # Order contract
+    report["order_contract"] = get_order_contract(report["today_trades"])
+    
+    # Save reports
+    try:
+        os.makedirs("repo/reports/us_portfolio_pnl", exist_ok=True)
+    except Exception:
+        os.makedirs("reports/us_portfolio_pnl", exist_ok=True)
+    
+    report_base = "repo/reports/us_portfolio_pnl" if os.path.exists("repo") else "reports/us_portfolio_pnl"
+    
+    # Latest reports
+    latest_md = f"{report_base}/latest_us_portfolio_pnl.md"
+    latest_json = f"{report_base}/latest_us_portfolio_pnl.json"
+    latest_csv = f"{report_base}/latest_us_portfolio_pnl.csv"
+    
+    # Dated reports
+    dated_dir = f"{report_base}/{trade_date}"
+    if session:
+        dated_dir = f"{dated_dir}/{session}"
+    os.makedirs(dated_dir, exist_ok=True)
+    dated_md = f"{dated_dir}/us_portfolio_pnl.md"
+    dated_json = f"{dated_dir}/us_portfolio_pnl.json"
+    dated_csv = f"{dated_dir}/us_portfolio_pnl.csv"
+    
+    # Generate Markdown
+    md_content = generate_markdown_report(report)
+    
+    # Write reports
+    try:
+        # Markdown
+        with open(latest_md, "w") as f:
+            f.write(md_content)
+        with open(dated_md, "w") as f:
+            f.write(md_content)
+        
+        # JSON
+        with open(latest_json, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+        with open(dated_json, "w") as f:
+            json.dump(report, f, indent=2, default=str)
+        
+        # CSV (holdings only)
+        if enriched_holdings:
+            fieldnames = sorted(enriched_holdings[0].keys())
+            with open(latest_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(enriched_holdings)
+            with open(dated_csv, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(enriched_holdings)
+        
+        logger.info(
+            "[US_PNL][SAVED] latest=%s dated=%s",
+            latest_md, dated_md
+        )
+    except Exception as exc:
+        logger.error("[US_PNL][SAVE_FAILED] %s", exc)
+        report["data_quality"]["errors"].append(f"report_save_failed: {exc}")
+    
+    logger.info(
+        "[US_PNL][OK] date=%s positions=%d total_pnl_usd=%.2f",
+        trade_date, total_positions, total_pnl_usd
+    )
+    
+    status = "OK" if not report["data_quality"]["errors"] else "ERROR"
+    if fail_on_missing_report and status == "ERROR":
+        return {"status": "ERROR", "report": report}
+    
+    return {"status": "OK", "report": report}
+
+
+def generate_markdown_report(report: dict) -> str:
+    """Generate markdown content from report dict."""
+    lines = [
+        "# US Portfolio PNL Report",
+        "",
+        "## Runtime Metadata",
+        "",
+        "| Field | Value |",
+        "|------|------|",
+    ]
+    
+    for key, val in report["runtime"].items():
+        lines.append(f"| {key} | {val} |")
+    
+    lines.extend([
+        "",
+        "## Portfolio Summary",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+    ])
+    
+    for key, val in report["portfolio_summary"].items():
+        lines.append(f"| {key} | {val} |")
+    
+    lines.extend([
+        "",
+        "## Holdings PNL Table",
+        "",
+        "| Rank | Symbol | Exchange | Qty | Avg Cost USD | Current Price USD | Cost Basis USD | Market Value USD | Unrealized PNL USD | PNL % | Entry Date | Days Held | Score |",
+        "|------|--------|----------|-----|--------------|-------------------|----------------|------------------|--------------------| ------|-----------|-----------|-------|",
+    ])
+    
+    holdings = report["holdings"]
+    for rank, h in enumerate(holdings, start=1):
+        lines.append(
+            f"| {rank} | {h['symbol']} | {h.get('exchange', 'N/A')} | {h['qty']} | "
+            f"{h['avg_cost_usd']:.4f} | {h['current_price_usd']:.4f} | {h['cost_basis_usd']:.2f} | "
+            f"{h['market_value_usd']:.2f} | {h['unrealized_pnl_usd']:.2f} | {h['pnl_pct']:.2f}% | "
+            f"{h.get('entry_date', 'N/A')} | {h.get('days_held', 'N/A')} | {h.get('score', 'N/A')} |"
+        )
+    
+    lines.extend([
+        "",
+        "## Today Trade Summary",
+        "",
+        "| Time | Side | Symbol | Qty | Price USD | Notional USD | Order Status | Fill Status | Order No |",
+        "|------|------|--------|-----|-----------|--------------|--------------|------------|----------|",
+    ])
+    
+    for t in report["today_trades"]:
+        lines.append(
+            f"| {t.get('time', 'N/A')[:19]} | {t.get('side', '')} | {t.get('symbol', '')} | "
+            f"{t.get('qty', 0)} | {t.get('price_usd', 0):.2f} | {t.get('notional_usd', 0):.2f} | "
+            f"{t.get('order_status', '')} | {t.get('fill_status', '')} | {t.get('order_no', '')} |"
+        )
+    
+    if report["blocked_orders"]:
+        lines.extend([
+            "",
+            "## Blocked / Skipped Orders",
+            "",
+            "| Time | Symbol | Side | Reason |",
+            "|------|--------|------|--------|",
+        ])
+        
+        for b in report["blocked_orders"]:
+            lines.append(
+                f"| {b.get('time', 'N/A')[:19]} | {b.get('symbol', '')} | {b.get('side', '')} | {b.get('reason', '')} |"
+            )
+    
+    wsc = report["watchlist_score_contract"]
+    if wsc:
+        lines.extend([
+            "",
+            "## Watchlist / Score Contract",
+            "",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| watchlist_raw_count | {wsc.get('watchlist_raw_count', 0)} |",
+            f"| watchlist_unique_count | {wsc.get('watchlist_unique_count', 0)} |",
+            f"| watchlist_duplicate_count | {wsc.get('watchlist_duplicate_count', 0)} |",
+            f"| score_nonzero | {wsc.get('score_nonzero_count', 0)} |",
+            f"| score_zero | {wsc.get('score_zero_count', 0)} |",
+            f"| score_missing | {wsc.get('score_missing_count', 0)} |",
+            f"| score_nonzero_ratio | {wsc.get('score_nonzero_ratio', 0.0):.4f} |",
+            "",
+        ])
+    
+    oc = report["order_contract"]
+    if oc:
+        lines.extend([
+            "",
+            "## Order Contract",
+            "",
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| orders_ack | {oc.get('orders_ack', 0)} |",
+            f"| orders_rejected | {oc.get('orders_rejected', 0)} |",
+            f"| orders_dry_run | {oc.get('orders_dry_run', 0)} |",
+            f"| orders_blocked | {oc.get('orders_blocked', 0)} |",
+            f"| orders_disabled | {oc.get('orders_disabled', 0)} |",
+            f"| ack_notional_usd | {oc.get('ack_notional_usd', 0.0):.2f} |",
+            f"| dry_run_notional_usd | {oc.get('dry_run_notional_usd', 0.0):.2f} |",
+            "",
+        ])
+    
+    dq = report["data_quality"]
+    if dq["warnings"]:
+        lines.extend([
+            "",
+            "## Data Quality Warnings",
+            "",
+        ])
+        for w in dq["warnings"]:
+            lines.append(f"- {w}")
+        lines.append("")
+    
+    if dq["errors"]:
+        lines.extend([
+            "",
+            "## Errors",
+            "",
+        ])
+        for e in dq["errors"]:
+            lines.append(f"- {e}")
+        lines.append("")
+    
+    return "\n".join(lines)
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    
+    parser = argparse.ArgumentParser(description="US Portfolio PNL Report Runner")
+    parser.add_argument("--env", default="practice", help="Environment")
+    parser.add_argument("--session", default=None, help="Session (am|afternoon|close)")
+    parser.add_argument("--trade-date", default=None, help="Trade date YYYY-MM-DD")
+    parser.add_argument("--offline", action="store_true", help="Offline mode")
+    parser.add_argument("--fail-on-missing-report", action="store_true", help="Exit 1 on error")
+    args = parser.parse_args()
+    
+    result = generate_pnl_report(
+        env=args.env,
+        session=args.session,
+        trade_date=args.trade_date,
+        offline=args.offline,
+        fail_on_missing_report=args.fail_on_missing_report,
+    )
+    
+    if result["status"] == "ERROR" and args.fail_on_missing_report:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
