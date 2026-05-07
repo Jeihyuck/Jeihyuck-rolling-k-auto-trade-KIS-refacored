@@ -831,15 +831,20 @@ def clear_and_save_locked_us_watchlist(
             "raw_count": int,
             "unique_count": int,
             "duplicate_count": int,
-            "saved_count": int,  # backward compatible: unique_count와 동일
+            "saved_count": int,
             "score_nonzero": int,
             "score_zero": int,
             "score_missing": int,
             "score_nonzero_ratio": float,
+            "contract_ok": bool,
+            "contract_errors": list[str],
+            "contract_warnings": list[str],
+            "trade_can_proceed": bool,
         }
     """
     from trader.us.score_columns import canonicalize_us_watchlist_row, collect_us_score_nonzero_stats
     from trader.us.symbols import normalize_symbol
+    from trader.us.watchlist_quality import validate_us_locked_watchlist_quality
     
     raw_count = len(entries)
     
@@ -910,11 +915,25 @@ def clear_and_save_locked_us_watchlist(
     score_zero = stats["score_zero"]
     score_missing = stats["score_missing"]
     score_nonzero_ratio = stats["score_nonzero_ratio"]
+
+    contract = validate_us_locked_watchlist_quality(deduped_rows, stage="prep_save")
+    contract_ok = bool(contract.get("ok"))
+    contract_errors = list(contract.get("errors") or [])
+    contract_warnings = list(contract.get("warnings") or [])
+    trade_can_proceed = bool(contract.get("trade_can_proceed"))
     
     logger.info(
         "[US_WATCHLIST][QUALITY] stage=pre_save unique=%d score_nonzero=%d score_zero=%d missing=%d ratio=%.4f",
         unique_count, score_nonzero, score_zero, score_missing, score_nonzero_ratio
     )
+
+    if raw_count > 0 and score_nonzero == 0 and "[prep_save] watchlist_score_zero_mass: nonzero=0 unique=0 ratio=0.0000" not in contract_errors:
+        logger.error(
+            "[US_WATCHLIST][CONTRACT_FAIL] [prep_save] zero_mass_contract_fail: raw=%d unique=%d score_nonzero=%d",
+            raw_count,
+            unique_count,
+            score_nonzero,
+        )
     
     # ── 4. DB 저장 ─────────────────────────────────────────────────────────────
     engine = _get_engine_or_none()
@@ -937,6 +956,10 @@ def clear_and_save_locked_us_watchlist(
             "score_zero": score_zero,
             "score_missing": score_missing,
             "score_nonzero_ratio": score_nonzero_ratio,
+            "contract_ok": contract_ok,
+            "contract_errors": contract_errors,
+            "contract_warnings": contract_warnings,
+            "trade_can_proceed": trade_can_proceed,
         }
     
     count = 0
@@ -1031,6 +1054,10 @@ def clear_and_save_locked_us_watchlist(
             "score_zero": score_zero,
             "score_missing": score_missing,
             "score_nonzero_ratio": score_nonzero_ratio,
+            "contract_ok": contract_ok,
+            "contract_errors": contract_errors,
+            "contract_warnings": contract_warnings,
+            "trade_can_proceed": trade_can_proceed,
         }
     except Exception as exc:
         logger.error("[US_WATCHLIST][LOCK_SAVE][ERROR] %s", exc)
@@ -1043,6 +1070,10 @@ def clear_and_save_locked_us_watchlist(
             "score_zero": 0,
             "score_missing": 0,
             "score_nonzero_ratio": 0.0,
+            "contract_ok": False,
+            "contract_errors": [str(exc)],
+            "contract_warnings": [],
+            "trade_can_proceed": False,
         }
 
 

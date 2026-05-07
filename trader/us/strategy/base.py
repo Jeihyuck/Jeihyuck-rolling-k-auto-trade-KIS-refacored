@@ -15,6 +15,33 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _inject_intent_score_aliases(intent: dict, score: float) -> dict:
+    """Canonical score 필드를 intent 전역에 강제 주입한다."""
+    score_f = float(score)
+
+    intent["score"] = score_f
+    intent["score_final"] = score_f
+    intent["final_score"] = score_f
+
+    reason_json = intent.get("reason_json")
+    if not isinstance(reason_json, dict):
+        reason_json = {}
+    reason_json["score"] = score_f
+    reason_json["score_final"] = score_f
+    reason_json["final_score"] = score_f
+    intent["reason_json"] = reason_json
+
+    scores = intent.get("scores")
+    if not isinstance(scores, dict):
+        scores = {}
+    scores["final"] = score_f
+    scores["score"] = score_f
+    scores["score_final"] = score_f
+    intent["scores"] = scores
+
+    return intent
+
+
 def make_client_order_key(trade_date: str, symbol: str, side: str, strategy: str, seq: int = 0) -> str:
     """결정론적 client_order_key 생성."""
     raw = f"{trade_date}:{symbol}:{side}:{strategy}:{seq}"
@@ -131,6 +158,7 @@ class BaseUSStrategy(ABC):
                     continue
                 intent = self.generate_intent(symbol, exchange, score, daily, current, cash)
                 if intent:
+                    intent = _inject_intent_score_aliases(intent, score)
                     intents.append(intent)
                     logger.info(
                         "[US_STRATEGY][SCORED] strategy=%s symbol=%s score=%.3f",

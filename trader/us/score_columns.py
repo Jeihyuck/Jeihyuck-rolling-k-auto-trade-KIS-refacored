@@ -197,65 +197,50 @@ def extract_us_score(
             return None, "no_alias_candidates"
         return None
     
-    # meta, scores, features를 dict로 coerce
+    # meta, scores, features, reason_json, risk_snapshot_json를 dict로 coerce
     meta_raw = row.get("meta") or {}
     meta = coerce_json_dict(meta_raw)
+
+    reason_json_raw = row.get("reason_json") or meta.get("reason_json") or {}
+    reason_json = coerce_json_dict(reason_json_raw)
     
     scores_raw = row.get("scores") or {}
     scores = coerce_json_dict(scores_raw)
     
     features_raw = row.get("features") or {}
     features = coerce_json_dict(features_raw)
+
+    risk_snapshot_raw = row.get("risk_snapshot_json") or meta.get("risk_snapshot_json") or {}
+    risk_snapshot_json = coerce_json_dict(risk_snapshot_raw)
+
+    containers: list[tuple[str, dict]] = [
+        ("row", row),
+        ("meta", meta),
+        ("reason_json", reason_json),
+        ("scores", scores),
+        ("features", features),
+        ("risk_snapshot_json", risk_snapshot_json),
+    ]
+
+    zero_fallback: tuple[float, str] | None = None
+
+    for container_name, container in containers:
+        for field in candidates:
+            num = safe_float_or_none(container.get(field))
+            if num is None:
+                continue
+            source = f"{container_name}.{field}"
+            if num != 0.0:
+                if return_source:
+                    return num, source
+                return num
+            if zero_fallback is None:
+                zero_fallback = (num, source)
     
-    # 먼저 row 직접 필드 탐색
-    for field in candidates:
-        val = row.get(field)
-        num = safe_float_or_none(val)
-        if num is not None and num > 0:
-            source = f"row.{field}"
-            if return_source:
-                return num, source
-            return num
-    
-    # meta 탐색
-    for field in candidates:
-        val = meta.get(field)
-        num = safe_float_or_none(val)
-        if num is not None and num > 0:
-            source = f"meta.{field}"
-            if return_source:
-                return num, source
-            return num
-    
-    # scores 탐색
-    for field in candidates:
-        val = scores.get(field)
-        num = safe_float_or_none(val)
-        if num is not None and num > 0:
-            source = f"scores.{field}"
-            if return_source:
-                return num, source
-            return num
-    
-    # features 탐색
-    for field in candidates:
-        val = features.get(field)
-        num = safe_float_or_none(val)
-        if num is not None and num > 0:
-            source = f"features.{field}"
-            if return_source:
-                return num, source
-            return num
-    
-    # 0 fallback: row 필드에 0이 있으면 사용
-    for field in candidates:
-        val = row.get(field)
-        num = safe_float_or_none(val)
-        if num is not None:
-            source = f"row.{field}_zero_fallback"
-            if return_source:
-                return num, source
-            return num
+    if zero_fallback is not None:
+        if return_source:
+            return zero_fallback
+        return zero_fallback[0]
     
     # 완전 실패
     if return_source:
@@ -283,6 +268,12 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     src = dict(row)
     meta_raw = src.get("meta") or {}
     meta = coerce_json_dict(meta_raw)
+
+    reason_json_raw = src.get("reason_json") or meta.get("reason_json") or {}
+    reason_json = coerce_json_dict(reason_json_raw)
+
+    risk_snapshot_raw = src.get("risk_snapshot_json") or meta.get("risk_snapshot_json") or {}
+    risk_snapshot_json = coerce_json_dict(risk_snapshot_raw)
     
     scores_raw = src.get("scores") or {}
     scores = coerce_json_dict(scores_raw)
@@ -304,8 +295,12 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
             raw_score_fields[f"row_{key}"] = src[key]
         if key in meta:
             raw_score_fields[f"meta_{key}"] = meta[key]
+        if key in reason_json:
+            raw_score_fields[f"reason_json_{key}"] = reason_json[key]
         if key in scores:
             raw_score_fields[f"scores_{key}"] = scores[key]
+        if key in risk_snapshot_json:
+            raw_score_fields[f"risk_snapshot_json_{key}"] = risk_snapshot_json[key]
     
     # Final score 복구
     final_score, final_source = extract_us_score(src, "final", return_source=True)
@@ -313,6 +308,9 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     out["score_final"] = final_score
     out["final_score"] = final_score
     out["score_source"] = final_source
+    out["reason_json"] = reason_json
+    out["risk_snapshot_json"] = risk_snapshot_json
+    out["scores"] = scores
     
     # Component scores 복구
     momentum_score, momentum_source = extract_us_score(src, "momentum", return_source=True)
@@ -341,6 +339,8 @@ def canonicalize_us_watchlist_row(row: dict) -> dict:
     canonical_meta["final_score"] = final_score
     canonical_meta["score_source"] = final_source
     canonical_meta["raw_score_fields"] = raw_score_fields
+    canonical_meta["reason_json"] = reason_json
+    canonical_meta["risk_snapshot_json"] = risk_snapshot_json
     canonical_meta["momentum_source"] = momentum_source
     canonical_meta["breakout_source"] = breakout_source
     canonical_meta["pullback_source"] = pullback_source

@@ -87,7 +87,6 @@ def test_score_canonicalization():
     
     print("\n" + "=" * 80)
     print("[TEST] All smoke tests passed ✓")
-    return True
 
 
 def test_watchlist_quality():
@@ -124,7 +123,52 @@ def test_watchlist_quality():
     
     print("\n" + "=" * 80)
     print("[TEST] All quality tests passed ✓")
-    return True
+
+
+def test_reason_json_score_recovery_prefers_nonzero_over_zero():
+    from trader.us.score_columns import canonicalize_us_watchlist_row
+
+    row = {"symbol": "QQQ", "score": 0, "reason_json": {"score": 1.0}}
+    canonical = canonicalize_us_watchlist_row(row)
+
+    assert canonical["score"] == 1.0
+    assert canonical["score_source"] == "reason_json.score"
+    assert canonical["meta"]["score"] == 1.0
+    assert canonical["meta"]["score_source"] == "reason_json.score"
+
+
+def test_collect_stats_recovers_reason_json_only_scores():
+    from trader.us.score_columns import canonicalize_us_watchlist_row, collect_us_score_nonzero_stats
+
+    rows = [
+        {"symbol": "AAA", "score": 0, "reason_json": {"score": 0.5}},
+        {"symbol": "BBB", "reason_json": {"score": 0.8}},
+        {"symbol": "CCC", "score": 0, "reason_json": {"score": 1.0}},
+    ]
+
+    canonical_rows = [canonicalize_us_watchlist_row(row) for row in rows]
+    stats = collect_us_score_nonzero_stats(canonical_rows)
+
+    assert stats["total"] == 3
+    assert stats["score_nonzero"] == 3
+    assert stats["score_zero"] == 0
+    assert stats["score_missing"] == 0
+
+
+def test_zero_mass_contract_fails_when_all_scores_zero():
+    from trader.us.score_columns import canonicalize_us_watchlist_row
+    from trader.us.watchlist_quality import validate_us_locked_watchlist_quality
+
+    rows = [
+        canonicalize_us_watchlist_row({"symbol": f"ZERO{i}", "exchange": "NASDAQ", "score": 0})
+        for i in range(10)
+    ]
+
+    contract = validate_us_locked_watchlist_quality(rows, stage="prep_save")
+
+    assert contract["ok"] is False
+    assert contract["trade_can_proceed"] is False
+    assert contract["score_nonzero"] == 0
 
 
 if __name__ == "__main__":

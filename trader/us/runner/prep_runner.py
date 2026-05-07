@@ -27,6 +27,29 @@ logger = logging.getLogger(__name__)
 CRITICAL_ETFS = {"QQQ", "SPY", "SMH", "SOXX"}
 
 
+def _resolve_final_prep_status(
+    provisional_status: str,
+    saved_count: int,
+    score_nonzero_count: int,
+    score_contract_ok: bool,
+    has_fatal_error: bool = False,
+) -> tuple[str, bool]:
+    """Locked watchlist score contract를 반영해 최종 상태를 확정한다."""
+    final_status = provisional_status
+    fatal = has_fatal_error
+
+    if fatal:
+        return "ERROR", True
+
+    if saved_count > 0 and score_nonzero_count == 0:
+        return "ERROR", True
+
+    if saved_count > 0 and not score_contract_ok:
+        return "ERROR", True
+
+    return final_status, fatal
+
+
 def _determine_prep_status(
     total_symbols: int,
     locked_unique_count: int,
@@ -154,6 +177,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     critical_etf_failures: set[str] = set()
     has_fatal_error = False
 
+    from trader.us.score_columns import extract_us_score
+
     for StratCls in [USPb1PullbackStrategy, USMomentumStrategy, USEtfTrendStrategy]:
         strat = StratCls(run_id=run_id, trade_date=trade_date)
         try:
@@ -170,13 +195,43 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                     # Critical ETF 검사
                     if norm_symbol in CRITICAL_ETFS:
                         logger.info("[US_PREP][CRITICAL_ETF_OK] symbol=%s", norm_symbol)
+
+                score_value, score_source = extract_us_score(intent, "final", return_source=True)
+                if score_value is None:
+                    logger.warning(
+                        "[US_PREP][SCORE_MISSING] strategy=%s symbol=%s intent_keys=%s",
+                        strat.name,
+                        symbol,
+                        sorted(intent.keys()),
+                    )
+                    score_value = 0.0
+                    score_source = "missing"
+
+                score_value = float(score_value or 0.0)
+                reason_json = intent.get("reason_json") if isinstance(intent.get("reason_json"), dict) else {}
                 
                 watchlist_entries.append({
                     "symbol": symbol,
                     "exchange": intent.get("exchange", "NASDAQ"),
                     "strategy": strat.name,
-                    "score": float(intent.get("score", 0)),
-                    "meta": {"run_id": run_id},
+                    "score": score_value,
+                    "score_final": score_value,
+                    "final_score": score_value,
+                    "scores": {
+                        "final": score_value,
+                        "score": score_value,
+                        "score_final": score_value,
+                    },
+                    "reason_json": reason_json,
+                    "meta": {
+                        "run_id": run_id,
+                        "score": score_value,
+                        "score_final": score_value,
+                        "final_score": score_value,
+                        "score_source": score_source,
+                        "reason_json": reason_json,
+                        "intent": intent,
+                    },
                 })
             
             logger.info("[US_STRATEGY][SCORED] strategy=%s intents=%d",
@@ -409,9 +464,19 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     
     # score contract ok 판단
     from trader.us.watchlist_quality import US_MIN_WATCHLIST_SCORE_NONZERO_RATIO
-    score_contract_ok = (
-        score_nonzero_ratio >= US_MIN_WATCHLIST_SCORE_NONZERO_RATIO and
-        score_missing_count == 0
+    score_contract_ok = bool(save_result.get("contract_ok")) if isinstance(save_result, dict) else False
+    if not isinstance(save_result, dict):
+        score_contract_ok = (
+            score_nonzero_ratio >= US_MIN_WATCHLIST_SCORE_NONZERO_RATIO and
+            score_missing_count == 0
+        )
+
+    final_status, has_fatal_error = _resolve_final_prep_status(
+        provisional_status=provisional_status,
+        saved_count=saved_count,
+        score_nonzero_count=score_nonzero_count,
+        score_contract_ok=score_contract_ok,
+        has_fatal_error=has_fatal_error,
     )
     
     # trade_can_proceed 판단
@@ -447,6 +512,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "score_missing_count": score_missing_count,
         "score_nonzero_ratio": round(score_nonzero_ratio, 4),
         "score_contract_ok": score_contract_ok,
+        "contract_errors": save_result.get("contract_errors", []) if isinstance(save_result, dict) else [],
+        "contract_warnings": save_result.get("contract_warnings", []) if isinstance(save_result, dict) else [],
         "trade_can_proceed": trade_can_proceed,
     }
     

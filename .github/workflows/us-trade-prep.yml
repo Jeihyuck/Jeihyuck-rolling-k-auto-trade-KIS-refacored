@@ -374,6 +374,57 @@ jobs:
           echo "::error::US prep final status marker missing"
           exit 1
 
+      - name: Mark stale US latest report in artifacts
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          latest_json="reports/us_daily/latest_us_daily_report.json"
+          latest_md="reports/us_daily/latest_us_daily_report.md"
+          stale_marker="artifacts/us-report-stale.txt"
+
+          if [ -n "${{ inputs.force_now || '' }}" ]; then
+            trade_date=$(python - <<'PYEOF'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          raw = "${{ inputs.force_now || '' }}"
+          dt = datetime.fromisoformat(raw).astimezone(ZoneInfo("America/New_York"))
+          print(dt.strftime("%Y-%m-%d"))
+          PYEOF
+          )
+          else
+            trade_date=$(TZ=America/New_York date +%F)
+          fi
+
+          if [ -f "$latest_json" ]; then
+            report_date=$(python - <<'PYEOF'
+          import json
+          from pathlib import Path
+          path = Path("reports/us_daily/latest_us_daily_report.json")
+          try:
+              payload = json.loads(path.read_text())
+          except Exception:
+              payload = {}
+          print(payload.get("trade_date", ""))
+          PYEOF
+          )
+          elif [ -f "$latest_md" ]; then
+            report_date=$(python - <<'PYEOF'
+          from pathlib import Path
+          import re
+          text = Path("reports/us_daily/latest_us_daily_report.md").read_text()
+          match = re.search(r"US Daily Report — (\d{4}-\d{2}-\d{2})", text)
+          print(match.group(1) if match else "")
+          PYEOF
+          )
+          else
+            report_date=""
+          fi
+
+          if [ -n "$report_date" ] && [ "$report_date" != "$trade_date" ]; then
+            echo "[US_REPORT][STALE] report_date=${report_date} trade_date=${trade_date}" | tee -a artifacts/${US_LOG_FILE} "$stale_marker"
+          fi
+
       - name: Upload US artifacts
         if: always()
         uses: actions/upload-artifact@v4
