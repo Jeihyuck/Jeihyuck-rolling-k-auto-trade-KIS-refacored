@@ -106,15 +106,15 @@ env:
   PB1_SWING_GIVEBACK_SELL_PCT: "1.0"
   PB1_MOMENTUM_GIVEBACK_SELL_PCT: "1.0"
   PB1_REBUY_AFTER_SELL_COOLDOWN_MIN: "180"
-  KIS_DATA_MIN_INTERVAL_SEC: "0.35"
-  KIS_PRICE_MIN_INTERVAL_SEC: "0.35"
+  KIS_DATA_MIN_INTERVAL_SEC: "0.50"
+  KIS_PRICE_MIN_INTERVAL_SEC: "0.70"
   KIS_ORDER_MIN_INTERVAL_SEC: "2.0"
   KIS_HASHKEY_ORDER_SLEEP_SEC: "0.5"
-  KIS_EGW002_BACKOFF_BASE_SEC: "3.0"
-  KIS_EGW002_BACKOFF_MAX_SEC: "10.0"
+  KIS_EGW002_BACKOFF_BASE_SEC: "5.0"
+  KIS_EGW002_BACKOFF_MAX_SEC: "20.0"
   PB1_PRICE_CACHE_SCOPE: "run"
   PB1_USE_BALANCE_PRPR_FIRST: "1"
-  PB1_MAX_PRICE_FETCH_PER_TICK: "12"
+  PB1_MAX_PRICE_FETCH_PER_TICK: "8"
   PB1_PNL_PRICE_FALLBACK_LIMIT: "3"
   PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC: "2"
   PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT: "5"
@@ -153,7 +153,7 @@ env:
   PB1_REQUIRE_FILL_CONFIRM: "1"
   PB1_ORDER_ACCEPTED_IS_NOT_FILLED: "1"
   KIS_PRICE_CACHE_TTL_SEC: "60"
-  KIS_INQUIRE_PRICE_MIN_INTERVAL_SEC: "0.35"
+  KIS_INQUIRE_PRICE_MIN_INTERVAL_SEC: "0.70"
   KIS_RATE_LIMIT_DEGRADE_ON_EGW00201: "1"
   PB1_USE_BALANCE_PRICE_FOR_HOLDINGS: "1"
 
@@ -529,19 +529,25 @@ jobs:
           set -euo pipefail
           missing=0
 
+          # Required log patterns
           for pattern in \
             "\[TRADE_AFTERNOON\]\[TRIGGER\]" \
             "\[TRADE_AFTERNOON\]\[START_META\]" \
             "\[TRADE\]\[FINAL30\]\[DB_EXACT_LOAD\]" \
             "\[PHASE\]\[START\] phase=pm" \
             "\[PHASE\]\[START\] phase=close" \
-            "\[TRADE_CLOSE\]\[DONE\]"; do
+            "\[TRADE_CLOSE\]\[DONE\]" \
+            "\[ORDERS\]\[STALE_REPAIR\]\[DONE\]" \
+            "\[PNL_REPORT\]\[DB_ORDERS\]\[OK\]" \
+            "\[PNL_REPORT\]\[DB_FILLS\]\[OK\]" \
+            "\[PNL_REPORT\]\[REALIZED\]\[SUMMARY\]"; do
             if ! grep -E "$pattern" artifacts/trade-afternoon.log >/dev/null; then
               echo "::error::missing required log pattern: $pattern"
               missing=1
             fi
           done
 
+          # Forbidden patterns (existing checks)
           if grep -E "\[PHASE\]\[START\] phase=close.*entry_enabled=1" artifacts/trade-afternoon.log >/dev/null; then
             echo "::error::close phase has entry_enabled=1, forbidden"
             missing=1
@@ -564,6 +570,28 @@ jobs:
 
           if grep -F "can't change 'autocommit'" artifacts/trade-afternoon.log >/dev/null; then
             echo "::error::autocommit active transaction error detected"
+            missing=1
+          fi
+
+          # New forbidden patterns (2026-05-07)
+          if grep -F "[ORDERS][STALE_REPAIR][FAIL]" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::stale repair failure detected"
+            missing=1
+          fi
+          if grep -F "Unconsumed column names: repair_reason" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::repair_reason column error detected"
+            missing=1
+          fi
+          if grep -F "got an unexpected keyword argument 'start_at'" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::PNL report start_at argument error detected"
+            missing=1
+          fi
+          if grep -F "got an unexpected keyword argument 'event_type_filter'" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::PNL report event_type_filter argument error detected"
+            missing=1
+          fi
+          if grep -E "tick_hard_timeout.*timeout_sec=90.*last_stage=entry.buyable_gate.finalize" artifacts/trade-afternoon.log >/dev/null; then
+            echo "::error::tick_hard_timeout at entry.buyable_gate.finalize detected"
             missing=1
           fi
 

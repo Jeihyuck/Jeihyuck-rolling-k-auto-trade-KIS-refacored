@@ -9055,14 +9055,20 @@ class PB1Engine:
                 )
 
             if horizon_result is not None:
+                _router_qty = int(horizon_result.get("qty", 0))
+                _router_full_exit = bool(horizon_result.get("full_exit", False))
+                _router_sell_pct = horizon_result.get("sell_pct")
                 logger.info(
-                    "[EXIT][HORIZON] code=%s horizon=%s family=%s exit_ok=%s reason=%s qty=%s",
+                    "[EXIT][HORIZON] code=%s horizon=%s family=%s exit_ok=%s reason=%s qty=%s full_exit=%s sell_pct=%s holding_qty=%s",
                     display_code,
                     trade_horizon,
                     _active_family,
                     int(bool(horizon_result.get("exit_ok", False))),
                     horizon_result.get("reason", ""),
-                    horizon_result.get("qty", 0),
+                    _router_qty,
+                    int(_router_full_exit),
+                    _router_sell_pct,
+                    qty,
                 )
                 # position_meta 업데이트 (tp1_done 등)
                 _meta_update = horizon_result.get("update_meta") or {}
@@ -9084,6 +9090,11 @@ class PB1Engine:
                     final_reason = str(horizon_result.get("reason") or final_reason)
                     ordered_reasons = [final_reason]
                     exit_policy = {**exit_policy, "exit_ok": True, "final_reason": final_reason}
+            else:
+                # No router result → will use legacy full qty
+                _router_qty = None
+                _router_full_exit = False
+                _router_sell_pct = None
 
         exit_eval = ExitEvaluation(
             code=code,
@@ -9143,6 +9154,9 @@ class PB1Engine:
                 "router_time_stop_hit": bool(str(exit_eval.primary_reason) == "EXIT_SWING_TIME_STOP"),
                 "pnl_pct": ret_pct,
                 "orderable_qty": int(pos.get("orderable_qty") or qty),
+                "router_qty": int(_router_qty) if _router_qty is not None else None,
+                "router_full_exit": bool(_router_full_exit),
+                "router_sell_pct": _router_sell_pct,
                 "trigger_metrics": {
                     "close": close_px,
                     "ma20": ma20,
@@ -9257,7 +9271,33 @@ class PB1Engine:
             [signal_reason_labels.get(reason, reason.lower()) for reason in ([exit_eval.primary_reason] + list(exit_eval.secondary_reasons))],
         )
 
-        orderable_qty = int(pos.get("orderable_qty") or qty)
+        # [2026-05-07] Router qty 우선 사용: partial exit (TP1, TP2, giveback) 수량 존중
+        if _router_qty is not None and _router_qty > 0 and not _router_full_exit:
+            orderable_qty = int(_router_qty)
+            logger.info(
+                "[EXIT][ROUTER][QTY] code=%s source=router_qty router_qty=%s full_exit=0 holding_qty=%s reason=%s",
+                display_code, orderable_qty, qty, exit_eval.primary_reason,
+            )
+        elif _router_full_exit or _router_qty is None:
+            orderable_qty = int(pos.get("orderable_qty") or qty)
+            if _router_full_exit:
+                logger.info(
+                    "[EXIT][ROUTER][QTY] code=%s source=router_full_exit router_qty=%s full_exit=1 holding_qty=%s reason=%s",
+                    display_code, orderable_qty, int(_router_qty or 0), qty, exit_eval.primary_reason,
+                )
+            else:
+                logger.info(
+                    "[EXIT][LEGACY][QTY] code=%s source=legacy_full_qty orderable_qty=%s holding_qty=%s reason=%s",
+                    display_code, orderable_qty, qty, exit_eval.primary_reason,
+                )
+        else:
+            # _router_qty <= 0: skip order
+            orderable_qty = 0
+            logger.warning(
+                "[EXIT][ROUTER][QTY][ZERO] code=%s router_qty=%s holding_qty=%s reason=%s → skip order",
+                display_code, int(_router_qty or 0), qty, exit_eval.primary_reason,
+            )
+
         if orderable_qty <= 0:
             exit_eval_payload["order_skip_reasons"] = ["orderable_qty_zero"]
             logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
@@ -9461,6 +9501,8 @@ class PB1Engine:
         if ok:
             exit_eval_payload["submitted"] = 1
             self.orders_repo.mark_acked(self.env, kis_odno, resp)
+            # [2026-05-07] SELL fill confirmed → order status를 FILLED로 업데이트
+            self.orders_repo.mark_filled(self.env, kis_odno=kis_odno, client_order_key=client_key)
             filled_at = now_kst()
             self.fills_repo.upsert_fill(
                 env=self.env,

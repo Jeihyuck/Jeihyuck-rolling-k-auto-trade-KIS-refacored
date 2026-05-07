@@ -143,8 +143,8 @@ def _get_today_orders_from_db(engine, env: str, trade_date: date) -> list[dict]:
         from trader.db.repos import OrdersRepo
         from trader.utils.time_utils import now_kst
         repo = OrdersRepo(engine)
-        today_start = _now_kst().replace(hour=0, minute=0, second=0, microsecond=0)
-        rows = repo.list_today_orders(env=env, start_at=today_start)
+        rows = repo.list_today_orders(env=env)
+        logger.info("[PNL_REPORT][DB_ORDERS][OK] rows=%s", len(rows or []))
         return [dict(r) for r in (rows or [])]
     except Exception as exc:
         logger.warning("[PNL_REPORT][DB_ORDERS_FAIL] err=%s", exc)
@@ -177,8 +177,9 @@ def _get_blocked_orders_from_db(engine, env: str) -> list[dict]:
             env=env,
             start_at=today_start,
             end_at=tomorrow,
-            event_type_filter={"ORDER_SKIP"},
+            event_types=["ORDER_SKIP"],
         )
+        logger.info("[PNL_REPORT][DB_BLOCKED][OK] rows=%s", len(rows or []))
         return [dict(r) for r in (rows or [])]
     except Exception as exc:
         logger.warning("[PNL_REPORT][DB_BLOCKED_FAIL] err=%s", exc)
@@ -252,8 +253,19 @@ def _build_holdings_pnl(
             for f in today_sell_fills
         )
 
-        # ========== entry_date / days_held (fallback: DB 조회 대신 pos 우선 사용) ==========
-        entry_date = str(pos.get("entry_date") or pos.get("entry_ts") or "")
+        # ========== entry_date / days_held (우선순위: entry_date → entry_ts → last_fill_at → created_at) ==========
+        entry_date = None
+        for key in ("entry_date", "entry_ts", "first_buy_fill_at", "last_fill_at", "created_at"):
+            value = pos.get(key)
+            if value:
+                entry_date = str(value)
+                break
+        
+        # entry_date가 없으면 warning
+        if not entry_date:
+            entry_date = ""
+            warnings.append(f"DAYS_HELD_ENTRY_DATE_MISSING:{code}")
+        
         days_held = _days_held(entry_date, trade_date)
         rank = _safe_int(bal.get("rank") or pos.get("rank_final30") or 0)
 
@@ -351,14 +363,52 @@ def _build_blocked_orders(blocked_events: list[dict], balance_rows: list[dict], 
     return blocked
 
 
-def _build_portfolio_summary(holdings: list[dict], today_fills: list[dict], cash: float) -> dict:
+def _build_portfolio_summary(
+    holdings: list[dict],
+    today_fills: list[dict],
+    db_positions: list[dict],
+    cash: float,
+) -> dict:
+    """
+    Portfolio summary 계산. realized_pnl_today는 today_fills 기준 (전량매도 포함).
+    """
     total_cost = sum(h["cost_basis"] for h in holdings)
     market_value = sum(h["market_value"] for h in holdings)
     unrealized_pnl = sum(h["unrealized_pnl"] for h in holdings)
     unrealized_pnl_pct = (unrealized_pnl / total_cost * 100) if total_cost > 0 else 0.0
     
-    # ========== realized_pnl_today 계산 수정 (holdings에서 합산) ==========
-    realized_today = sum(h.get("realized_pnl_today", 0.0) for h in holdings)
+    # ========== realized_pnl_today 계산: today SELL fills 전체 기준 ==========
+    # 전량매도된 종목도 포함하도록 today_fills에서 직접 계산
+    db_pos_by_code = {str(p.get("code") or "").zfill(6): p for p in db_positions}
+    realized_today = 0.0
+    realized_warnings: list[str] = []
+    
+    for fill in today_fills:
+        if str(fill.get("side") or "").upper() != "SELL":
+            continue
+        
+        code = str(fill.get("code") or "").zfill(6)
+        sell_qty = _safe_int(fill.get("qty"))
+        sell_price = _safe_float(fill.get("price"))
+        
+        # avg_buy 조회: DB position 우선
+        avg_buy = 0.0
+        pos = db_pos_by_code.get(code)
+        if pos:
+            avg_buy = _safe_float(pos.get("avg_buy_price"))
+        
+        # avg_buy 찾기 실패 시 경고
+        if avg_buy <= 0:
+            realized_warnings.append(f"REALIZED_PNL_AVG_BUY_MISSING:{code}")
+            continue
+        
+        pnl = (sell_price - avg_buy) * sell_qty
+        realized_today += pnl
+    
+    logger.info(
+        "[PNL_REPORT][REALIZED][SUMMARY] realized_today=%.2f warnings=%s",
+        realized_today, realized_warnings,
+    )
     
     total_pnl = unrealized_pnl + realized_today
     winners = sum(1 for h in holdings if h["pnl_pct"] >= 0)
@@ -530,7 +580,7 @@ def main() -> int:
         )
 
         # Summary
-        summary = _build_portfolio_summary(holdings, today_fills, cash)
+        summary = _build_portfolio_summary(holdings, today_fills, db_positions, cash)
 
         # Today trades
         today_trades = _build_today_trades(today_orders, today_fills, balance_output1, db_positions)

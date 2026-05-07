@@ -2669,6 +2669,46 @@ class OrdersRepo:
                 .values(**values)
             )
 
+    def mark_filled(
+        self,
+        env: str,
+        kis_odno: str | None = None,
+        client_order_key: str | None = None,
+    ) -> None:
+        """
+        주문을 FILLED 상태로 변경. SELL fill confirmed 후 호출.
+        
+        Args:
+            env: 환경
+            kis_odno: KIS 주문번호 (우선 사용)
+            client_order_key: 클라이언트 주문 키 (fallback)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if not kis_odno and not client_order_key:
+            logger.warning("[ORDERS][MARK_FILLED][SKIP] no identifier provided")
+            return
+        
+        conditions = [self._schema.orders.c.env == env]
+        if kis_odno:
+            conditions.append(self._schema.orders.c.kis_odno == kis_odno)
+        elif client_order_key:
+            conditions.append(self._schema.orders.c.client_order_key == client_order_key)
+        
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                sa.update(self._schema.orders)
+                .where(and_(*conditions))
+                .values(status="FILLED", updated_at=func.now())
+            )
+            updated_count = result.rowcount
+        
+        logger.info(
+            "[ORDERS][STATUS_UPDATE] env=%s kis_odno=%s client_order_key=%s from=ACKED/ACCEPTED to=FILLED updated=%s",
+            env, kis_odno, client_order_key, updated_count,
+        )
+
     def mark_error(self, env: str, client_order_key: str, error_payload: dict | None) -> None:
         safe_error_payload = json_sanitize(error_payload or {})
         with self.engine.begin() as conn:
@@ -2794,12 +2834,17 @@ class OrdersRepo:
         Args:
             env: 환경
             before_dt: 이 시각 이전에 생성된 open order를 만료 처리
-            reason: 만료 사유
+            reason: 만료 사유 (log only, not stored in DB)
         
         Returns:
             만료 처리된 주문 수
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         open_statuses = ["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]
+        
+        logger.info("[ORDERS][STALE_REPAIR][START] env=%s before=%s reason=%s", env, before_dt.isoformat(), reason)
         
         with self.engine.begin() as conn:
             result = conn.execute(
@@ -2813,11 +2858,13 @@ class OrdersRepo:
                 )
                 .values(
                     status="EXPIRED",
-                    repair_reason=reason,
                     updated_at=func.now(),
                 )
             )
-            return result.rowcount
+            expired_count = result.rowcount
+        
+        logger.info("[ORDERS][STALE_REPAIR][DONE] env=%s expired=%s reason=%s", env, expired_count, reason)
+        return expired_count
 
     def has_client_order_key(self, env: str, client_order_key: str) -> bool:
         stmt = select(self._schema.orders.c.order_id.label("order_id")).where(
