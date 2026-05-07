@@ -393,6 +393,48 @@ def run_trade_tick(
                     # symbol별 best row로 dedupe
                     watchlist_rows = _dedupe_watchlist_best_by_symbol(watchlist_rows)
                     
+                    # ── Quality Contract 검증 (hard gate) ──────────────────────
+                    from trader.us.watchlist_quality import validate_us_locked_watchlist_quality, format_us_watchlist_error_message
+                    
+                    quality_contract = validate_us_locked_watchlist_quality(
+                        rows=watchlist_rows,
+                        stage="trade_load",
+                    )
+                    
+                    if not quality_contract["ok"]:
+                        error_msg = format_us_watchlist_error_message(quality_contract)
+                        logger.error(error_msg)
+                        logger.error(
+                            "[US_TICK][DONE] session=%s status=ERROR reason=locked_watchlist_score_contract_fail",
+                            session,
+                        )
+                        return {
+                            "status": "ERROR",
+                            "reason": "locked_watchlist_score_contract_fail",
+                            "session": session,
+                            "orders": [],
+                            "ack": 0,
+                            "dry_run": 0,
+                            "blocked": 0,
+                            "signal_only": 0,
+                            "errors": 1,
+                            "score_contract": quality_contract,
+                            "run_mode": run_mode,
+                            "signal_only_mode": signal_only,
+                            "kis_order_allowed": kis_order_allowed,
+                        }
+                    
+                    # Contract 통과 로그
+                    logger.info(
+                        "[US_ENTRY][SCORE_CONTRACT] stage=trade_load rows=%d unique=%d duplicate=%d "
+                        "nonzero=%d zero=%d missing=%d ratio=%.4f ok=1",
+                        quality_contract["rows"], quality_contract["unique_symbols"], 
+                        quality_contract["duplicate_count"],
+                        quality_contract["score_nonzero"], quality_contract["score_zero"], 
+                        quality_contract["score_missing"],
+                        quality_contract["score_nonzero_ratio"]
+                    )
+                    
                     # Pipeline contract 로그
                     logger.info(
                         "[US_PIPELINE][CONTRACT] session=%s trade_date=%s prep_status=%s locked_raw=%d locked_deduped=%d fills_status=%s",

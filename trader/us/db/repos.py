@@ -661,11 +661,24 @@ def finish_us_prep_run(
     """
     us_agent_runs 테이블의 prep run을 완료 상태로 업데이트.
     
+    한국장 패턴 적용:
+    - prep result에 quality summary 저장
+    
     Args:
         run_id: prep run ID
         status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
         result: {
-            "watchlist_count": int,
+            "watchlist_raw_count": int,
+            "watchlist_unique_count": int,
+            "watchlist_duplicate_count": int,
+            "score_nonzero_count": int,
+            "score_zero_count": int,
+            "score_missing_count": int,
+            "score_nonzero_ratio": float,
+            "score_contract_ok": bool,
+            "score_contract_errors": list,
+            "score_contract_warnings": list,
+            "trade_can_proceed": bool,
             "data_error_count": int,
             "critical_etf_errors": list,
             "status_reason": str,
@@ -693,7 +706,25 @@ def finish_us_prep_run(
                     "result": _json_param(result or {}),
                 },
             )
-        logger.info("[US_PREP_RUN][FINISH] run_id=%s status=%s", run_id, status)
+        
+        # Quality summary 로깅
+        if result:
+            watchlist_count = result.get("watchlist_unique_count") or result.get("watchlist_count") or 0
+            score_nonzero = result.get("score_nonzero_count", 0)
+            score_zero = result.get("score_zero_count", 0)
+            score_missing = result.get("score_missing_count", 0)
+            score_ratio = result.get("score_nonzero_ratio", 0.0)
+            trade_can_proceed = result.get("trade_can_proceed", False)
+            
+            logger.info(
+                "[US_PREP_RUN][FINISH] run_id=%s status=%s watchlist_unique=%d "
+                "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f trade_can_proceed=%d",
+                run_id, status, watchlist_count, score_nonzero, score_zero, score_missing,
+                score_ratio, int(trade_can_proceed)
+            )
+        else:
+            logger.info("[US_PREP_RUN][FINISH] run_id=%s status=%s", run_id, status)
+        
         return True
     except Exception as exc:
         logger.error("[US_PREP_RUN][FINISH][ERROR] %s", exc)
@@ -754,9 +785,15 @@ def clear_and_save_locked_us_watchlist(
     trade_date: str,
     run_id: str,
     prep_status: str,
-) -> int:
+) -> dict:
     """
     기존 locked watchlist를 삭제하고 새로운 locked watchlist 저장.
+    
+    한국장 패턴을 미국장에 적용:
+    1. 저장 전 canonicalization
+    2. duplicate symbol dedupe (최고 score 선택)
+    3. raw/unique/duplicate count 분리
+    4. quality contract 검증
     
     Args:
         entries: watchlist entries, each with symbol, exchange, strategy, score, rank, meta
@@ -765,11 +802,99 @@ def clear_and_save_locked_us_watchlist(
         prep_status: OK | OK_WITH_WARNINGS | DEGRADED | ERROR
     
     Returns:
-        저장된 항목 수
+        {
+            "raw_count": int,
+            "unique_count": int,
+            "duplicate_count": int,
+            "saved_count": int,  # backward compatible: unique_count와 동일
+            "score_nonzero": int,
+            "score_zero": int,
+            "score_missing": int,
+            "score_nonzero_ratio": float,
+        }
     """
+    from trader.us.score_columns import canonicalize_us_watchlist_row, collect_us_score_nonzero_stats
+    from trader.us.symbols import normalize_symbol
+    
+    raw_count = len(entries)
+    
+    # ── 1. Canonicalization ────────────────────────────────────────────────────
+    canonical_rows = []
+    for e in entries:
+        try:
+            canonical = canonicalize_us_watchlist_row(e)
+            canonical_rows.append(canonical)
+        except Exception as exc:
+            logger.warning(
+                "[US_WATCHLIST][CANONICALIZE_FAIL] symbol=%s: %s",
+                e.get("symbol"), exc
+            )
+            # 실패해도 원본 추가 (backward compatible)
+            canonical_rows.append(e)
+    
+    # ── 2. Dedupe by symbol (max canonical score 선택) ─────────────────────────
+    best: dict[str, dict] = {}
+    for row in canonical_rows:
+        try:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if not sym:
+                continue
+            # normalize_symbol
+            try:
+                sym = normalize_symbol(sym)
+            except Exception:
+                pass
+            
+            score = float(row.get("score") or 0.0)
+            
+            prev = best.get(sym)
+            if prev is None or score > float(prev.get("score") or 0.0):
+                # meta에 dedupe 정보 추가
+                meta = row.get("meta", {})
+                if isinstance(meta, dict):
+                    if prev:
+                        meta["duplicate_count"] = meta.get("duplicate_count", 0) + 1
+                        prev_score = prev.get("score")
+                        meta["merged_scores"] = meta.get("merged_scores", []) + [prev_score]
+                    meta["selected_by"] = "max_canonical_score"
+                row["meta"] = meta
+                best[sym] = row
+        except Exception as exc:
+            logger.warning(
+                "[US_WATCHLIST][DEDUPE_FAIL] row=%s: %s",
+                row.get("symbol"), exc
+            )
+    
+    deduped_rows = sorted(
+        best.values(),
+        key=lambda r: float(r.get("score") or 0.0),
+        reverse=True,
+    )
+    
+    unique_count = len(deduped_rows)
+    duplicate_count = raw_count - unique_count
+    
+    logger.info(
+        "[US_WATCHLIST][CANONICALIZE] stage=pre_save raw_count=%d unique_count=%d duplicate_count=%d",
+        raw_count, unique_count, duplicate_count
+    )
+    
+    # ── 3. Score stats 수집 ────────────────────────────────────────────────────
+    stats = collect_us_score_nonzero_stats(deduped_rows)
+    score_nonzero = stats["score_nonzero"]
+    score_zero = stats["score_zero"]
+    score_missing = stats["score_missing"]
+    score_nonzero_ratio = stats["score_nonzero_ratio"]
+    
+    logger.info(
+        "[US_WATCHLIST][QUALITY] stage=pre_save unique=%d score_nonzero=%d score_zero=%d missing=%d ratio=%.4f",
+        unique_count, score_nonzero, score_zero, score_missing, score_nonzero_ratio
+    )
+    
+    # ── 4. DB 저장 ─────────────────────────────────────────────────────────────
     engine = _get_engine_or_none()
     if engine is None:
-        for e in entries:
+        for e in deduped_rows:
             _MEM_WATCHLIST.append({
                 **e,
                 "trade_date": trade_date,
@@ -777,8 +902,17 @@ def clear_and_save_locked_us_watchlist(
                 "prep_status": prep_status,
                 "run_id": run_id,
             })
-        logger.info("[US_WATCHLIST][LOCK_SAVE] count=%d (in-memory)", len(entries))
-        return len(entries)
+        logger.info("[US_WATCHLIST][LOCK_SAVE] count=%d (in-memory)", unique_count)
+        return {
+            "raw_count": raw_count,
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "saved_count": unique_count,
+            "score_nonzero": score_nonzero,
+            "score_zero": score_zero,
+            "score_missing": score_missing,
+            "score_nonzero_ratio": score_nonzero_ratio,
+        }
     
     count = 0
     try:
@@ -790,7 +924,7 @@ def clear_and_save_locked_us_watchlist(
             )
             
             # 새 locked watchlist 저장
-            for rank, e in enumerate(entries, start=1):
+            for rank, e in enumerate(deduped_rows, start=1):
                 data_source = e.get("meta", {}).get("data_source", "kis") if isinstance(e.get("meta"), dict) else "kis"
                 
                 # meta에 rank, prep_run_id 추가
@@ -830,7 +964,7 @@ def clear_and_save_locked_us_watchlist(
                 )
                 count += 1
             
-            # Roundtrip 검증: 저장된 row 수와 입력 entries 수가 일치하는지 확인
+            # Roundtrip 검증: 저장된 row 수와 deduped unique count가 일치하는지 확인
             verify_row = conn.execute(
                 text("""
                     SELECT COUNT(*) as cnt,
@@ -844,13 +978,13 @@ def clear_and_save_locked_us_watchlist(
             verify_count = verify_row[0] if verify_row else 0
             uniq_symbols = verify_row[1] if verify_row else 0
             
-            if verify_count != len(entries):
+            if verify_count != unique_count:
                 logger.error(
                     "[US_WATCHLIST][ROUNDTRIP_FAIL] expected=%d saved=%d",
-                    len(entries), verify_count
+                    unique_count, verify_count
                 )
                 raise RuntimeError(
-                    f"[US_WATCHLIST][ROUNDTRIP_FAIL] expected={len(entries)} saved={verify_count}"
+                    f"[US_WATCHLIST][ROUNDTRIP_FAIL] expected={unique_count} saved={verify_count}"
                 )
             
             logger.info(
@@ -859,17 +993,32 @@ def clear_and_save_locked_us_watchlist(
             )
         
         logger.info(
-            "[US_WATCHLIST][LOCK_SAVE] trade_date=%s count=%d status=%s run_id=%s",
-            trade_date, count, prep_status, run_id
+            "[US_WATCHLIST][LOCK_SAVE] trade_date=%s raw=%d unique=%d duplicate=%d score_nonzero=%d",
+            trade_date, raw_count, unique_count, duplicate_count, score_nonzero
         )
-        logger.info(
-            "[US_WATCHLIST][LOCKED] trade_date=%s run_id=%s count=%d status=%s",
-            trade_date, run_id, count, prep_status
-        )
-        return count
+        
+        return {
+            "raw_count": raw_count,
+            "unique_count": unique_count,
+            "duplicate_count": duplicate_count,
+            "saved_count": unique_count,  # backward compatible
+            "score_nonzero": score_nonzero,
+            "score_zero": score_zero,
+            "score_missing": score_missing,
+            "score_nonzero_ratio": score_nonzero_ratio,
+        }
     except Exception as exc:
         logger.error("[US_WATCHLIST][LOCK_SAVE][ERROR] %s", exc)
-        return 0
+        return {
+            "raw_count": raw_count,
+            "unique_count": 0,
+            "duplicate_count": 0,
+            "saved_count": 0,
+            "score_nonzero": 0,
+            "score_zero": 0,
+            "score_missing": 0,
+            "score_nonzero_ratio": 0.0,
+        }
 
 
 def load_locked_us_watchlist(
@@ -880,6 +1029,11 @@ def load_locked_us_watchlist(
     """
     당일 locked watchlist 조회.
     
+    한국장 패턴 적용:
+    1. DB 로드
+    2. 로드 후 canonicalization (DB에서 Decimal/string으로 온 score를 복구)
+    3. 최소 count 검증
+    
     Args:
         trade_date: 미국장 거래일
         min_count: 최소 항목 수
@@ -889,6 +1043,8 @@ def load_locked_us_watchlist(
         list of dicts with symbol, exchange, strategy, score, meta, prep_status, run_id, data_source
         빈 리스트 [] if not found or count < min_count
     """
+    from trader.us.score_columns import canonicalize_us_watchlist_row
+    
     engine = _get_engine_or_none()
     if engine is None:
         mem_locked = [w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date]
@@ -909,18 +1065,18 @@ def load_locked_us_watchlist(
                 {"td": trade_date},
             ).fetchall()
             
-            result = [dict(r._mapping) for r in rows]
+            raw_result = [dict(r._mapping) for r in rows]
             
-            if len(result) < min_count:
+            if len(raw_result) < min_count:
                 logger.warning(
                     "[US_WATCHLIST][LOCK_LOAD][INSUFFICIENT] trade_date=%s count=%d min=%d",
-                    trade_date, len(result), min_count
+                    trade_date, len(raw_result), min_count
                 )
                 return []
             
             # DEGRADED 체크
-            if result and not allow_degraded:
-                first_status = result[0].get("prep_status")
+            if raw_result and not allow_degraded:
+                first_status = raw_result[0].get("prep_status")
                 if first_status == "DEGRADED":
                     logger.warning(
                         "[US_WATCHLIST][LOCK_LOAD][DEGRADED_BLOCKED] trade_date=%s status=%s",
@@ -928,11 +1084,34 @@ def load_locked_us_watchlist(
                     )
                     return []
             
+            # ── Canonicalization (DB 로드 후 score alias 복구) ──────────────────
+            canonical_result = []
+            for row in raw_result:
+                try:
+                    canonical = canonicalize_us_watchlist_row(row)
+                    canonical_result.append(canonical)
+                except Exception as exc:
+                    logger.warning(
+                        "[US_WATCHLIST][LOAD_CANONICALIZE_FAIL] symbol=%s: %s",
+                        row.get("symbol"), exc
+                    )
+                    # 실패해도 원본 추가 (backward compatible)
+                    canonical_result.append(row)
+            
+            # Score stats 로깅
+            from trader.us.score_columns import collect_us_score_nonzero_stats
+            stats = collect_us_score_nonzero_stats(canonical_result)
+            
             logger.info(
-                "[US_WATCHLIST][LOCK_LOAD] trade_date=%s count=%d status=%s",
-                trade_date, len(result), result[0].get("prep_status") if result else "N/A"
+                "[US_WATCHLIST][LOCK_LOAD] trade_date=%s count=%d status=%s "
+                "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f",
+                trade_date, len(canonical_result), 
+                canonical_result[0].get("prep_status") if canonical_result else "N/A",
+                stats["score_nonzero"], stats["score_zero"], stats["score_missing"],
+                stats["score_nonzero_ratio"]
             )
-            return result
+            
+            return canonical_result
     except Exception as exc:
         logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s", exc)
         return []

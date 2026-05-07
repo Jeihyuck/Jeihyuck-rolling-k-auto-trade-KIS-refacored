@@ -116,7 +116,7 @@ jobs:
 
       US_SESSION_INTERVAL_SEC: "300"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '0' }}
 
       US_LOG_FILE: "us-trade-afternoon.log"
       US_ARTIFACT_NAME: "us-trade-afternoon"
@@ -352,19 +352,6 @@ jobs:
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
-      - name: Guard same-day US prep contract
-        if: steps.phase_guard.outputs.should_run == '1'
-        working-directory: repo
-        env:
-          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
-          SESSION: "afternoon"
-        run: |
-          set -euo pipefail
-          {
-            echo "[US_PREP_GUARD][START] session=afternoon"
-            python scripts/guard_us_prep_contract.py
-          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
-
       - name: Run US Afternoon trade session
         if: steps.phase_guard.outputs.should_run == '1'
         timeout-minutes: 210
@@ -471,10 +458,37 @@ jobs:
             exit 0
           fi
 
+          # ── Schedule Practice Trade Contract (한국장 패턴 적용) ────────────────
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${KIS_ENV}" == "practice" ]]; then
+            # 1. DRY_RUN=1 금지 (schedule practice는 실제 모의투자 주문을 보내야 함)
+            if grep -E "\\[US_ENV_CHECK\\] DRY_RUN=1|\\[US_TRADE_.*\\]\\[ENV\\] DRY_RUN=1" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "::error::Scheduled US practice trade ran with DRY_RUN=1"
+              exit 1
+            fi
+
+            # 2. [US_ORDER][DRY_RUN] 금지
+            if grep -E "\\[US_ORDER\\]\\[DRY_RUN\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "::error::Scheduled US practice trade produced dry-run orders"
+              exit 1
+            fi
+
+            # 3. Watchlist score contract fail 금지
+            if grep -E "locked_watchlist_score_contract_fail|score_alias_resolution_failed|watchlist_score_zero_mass" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "::error::US watchlist score contract failed"
+              exit 1
+            fi
+
+            # 4. Score=0 intent 생성 금지
+            if grep -E "\\[US_ENTRY\\]\\[INTENT\\].*score=0\\.000000" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "::error::US entry intent generated with zero score"
+              exit 1
+            fi
+          fi
+
           # Fatal errors.
-          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_SESSION\\]\\[END\\].*reason=locked_watchlist_missing|\\[US_ENTRY\\]\\[BLOCK\\] reason=locked_watchlist_missing|\\[US_PREP_GUARD\\]\\[FAIL\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_TICK\\]\\[DONE\\].*status=ERROR.*reason=locked_watchlist_score_contract_fail" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "::error::Fatal afternoon trade error detected"
-            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_SESSION\\]\\[END\\].*reason=locked_watchlist_missing|\\[US_ENTRY\\]\\[BLOCK\\] reason=locked_watchlist_missing|\\[US_PREP_GUARD\\]\\[FAIL\\]" artifacts/${US_LOG_FILE} | head -20
+            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_TICK\\]\\[DONE\\].*status=ERROR" artifacts/${US_LOG_FILE} | head -20
             exit 1
           fi
 

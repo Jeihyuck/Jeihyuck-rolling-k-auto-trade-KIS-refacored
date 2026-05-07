@@ -92,9 +92,7 @@ def _load_engine():
         if not db_url:
             logger.warning("[PNL_REPORT][DB_SKIP] PBCORE_DB_URL not set")
             return None
-        engine = make_engine()
-        logger.info("[PNL_REPORT][DB_ENGINE][OK]")
-        return engine
+        return make_engine(db_url)
     except Exception as exc:
         logger.warning("[PNL_REPORT][DB_ENGINE_FAIL] err=%s", exc)
         traceback.print_exc()
@@ -143,6 +141,7 @@ def _get_today_orders_from_db(engine, env: str, trade_date: date) -> list[dict]:
         return []
     try:
         from trader.db.repos import OrdersRepo
+        from trader.utils.time_utils import now_kst
         repo = OrdersRepo(engine)
         today_start = _now_kst().replace(hour=0, minute=0, second=0, microsecond=0)
         rows = repo.list_today_orders(env=env, start_at=today_start)

@@ -370,16 +370,25 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     # ================================================================
     # locked watchlist 저장
     # ================================================================
+    save_result = None
     saved_count = 0
     if watchlist_entries:
         try:
-            saved_count = clear_and_save_locked_us_watchlist(
+            save_result = clear_and_save_locked_us_watchlist(
                 entries=watchlist_entries,
                 trade_date=trade_date,
                 run_id=run_id,
                 prep_status=provisional_status,
             )
-            logger.info("[US_PREP][WATCHLIST][LOCKED] count=%d status=%s", saved_count, provisional_status)
+            # backward compatible: saved_count는 unique_count
+            saved_count = save_result.get("unique_count", 0) if isinstance(save_result, dict) else save_result
+            logger.info(
+                "[US_PREP][WATCHLIST][LOCKED] raw=%d unique=%d duplicate=%d status=%s",
+                save_result.get("raw_count", 0) if isinstance(save_result, dict) else 0,
+                saved_count,
+                save_result.get("duplicate_count", 0) if isinstance(save_result, dict) else 0,
+                provisional_status
+            )
         except Exception as exc:
             logger.error("[US_PREP][WATCHLIST][ERROR] %s", exc)
             provisional_status = "ERROR"
@@ -392,20 +401,62 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     # Final status (saved 후 최종 재판정)
     final_status = provisional_status
     
+    # Quality summary 추출
+    score_nonzero_count = save_result.get("score_nonzero", 0) if isinstance(save_result, dict) else 0
+    score_zero_count = save_result.get("score_zero", 0) if isinstance(save_result, dict) else 0
+    score_missing_count = save_result.get("score_missing", 0) if isinstance(save_result, dict) else 0
+    score_nonzero_ratio = save_result.get("score_nonzero_ratio", 0.0) if isinstance(save_result, dict) else 0.0
+    
+    # score contract ok 판단
+    from trader.us.watchlist_quality import US_MIN_WATCHLIST_SCORE_NONZERO_RATIO
+    score_contract_ok = (
+        score_nonzero_ratio >= US_MIN_WATCHLIST_SCORE_NONZERO_RATIO and
+        score_missing_count == 0
+    )
+    
+    # trade_can_proceed 판단
+    trade_can_proceed = (
+        final_status in ("OK", "OK_WITH_WARNINGS") and
+        score_contract_ok and
+        saved_count >= int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10"))
+    )
+    
     logger.info(
-        "[US_PREP][FINAL_STATUS] provisional=%s final=%s locked_unique=%d",
-        provisional_status, final_status, locked_unique_count
+        "[US_PREP][FINAL_STATUS] provisional=%s final=%s locked_unique=%d "
+        "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f contract_ok=%d trade_can_proceed=%d",
+        provisional_status, final_status, saved_count,
+        score_nonzero_count, score_zero_count, score_missing_count, score_nonzero_ratio,
+        int(score_contract_ok), int(trade_can_proceed)
     )
 
-    # us_agent_runs 완료 기록
-    result_msg = (
-        f"status={final_status} watchlist={saved_count} "
-        f"locked_unique={locked_unique_count}/{total_symbols} "
-        f"event_success={event_success_count}"
-    )
-    finish_us_prep_run(run_id=run_id, status=final_status, result=result_msg)
+    # us_agent_runs 완료 기록 (한국장 패턴: quality summary를 dict로 저장)
+    result_dict = {
+        "status": final_status,
+        "watchlist_raw_count": save_result.get("raw_count", saved_count) if isinstance(save_result, dict) else saved_count,
+        "watchlist_unique_count": saved_count,
+        "watchlist_duplicate_count": save_result.get("duplicate_count", 0) if isinstance(save_result, dict) else 0,
+        "watchlist_count": saved_count,  # backward compatible
+        "locked_unique_count": locked_unique_count,
+        "total_symbols": total_symbols,
+        "event_success_count": event_success_count,
+        "skip_count": skip_count,
+        "error_count": error_count,
+        "critical_etf_failures": list(critical_etf_failures),
+        "score_nonzero_count": score_nonzero_count,
+        "score_zero_count": score_zero_count,
+        "score_missing_count": score_missing_count,
+        "score_nonzero_ratio": round(score_nonzero_ratio, 4),
+        "score_contract_ok": score_contract_ok,
+        "trade_can_proceed": trade_can_proceed,
+    }
     
-    logger.info("[US_PREP][FINISH] %s", result_msg)
+    finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
+    
+    logger.info(
+        "[US_PREP][FINISH] status=%s unique=%d score_nonzero=%d trade_can_proceed=%d",
+        final_status, saved_count, score_nonzero_count, int(trade_can_proceed)
+    )
+    
     return {
         "status": final_status,
         "run_id": run_id,
@@ -418,6 +469,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "error_count": error_count,
         "critical_etf_failures": list(critical_etf_failures),
         "intents": all_intents,
+        "trade_can_proceed": trade_can_proceed,
     }
 
 

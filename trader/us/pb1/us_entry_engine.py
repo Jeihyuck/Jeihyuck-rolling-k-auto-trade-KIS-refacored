@@ -287,24 +287,52 @@ def generate_entry_intents(
         except Exception as exc:
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
 
-        # entries_map에 있으면 precomputed score 사용
+        # entries_map에 있으면 precomputed score 사용 (with alias recovery)
         entry_meta = entries_map.get(symbol)
-        if entry_meta and entry_meta.get("score") is not None:
+        if entry_meta:
+            # Canonicalization import
+            from trader.us.score_columns import extract_us_score, canonicalize_us_watchlist_row
+            
+            # Canonicalize the entry row
             try:
-                s = float(entry_meta["score"])
-                exchange = entry_meta.get("exchange", "")
-                if not exchange:
-                    exchange = resolve_exchange(symbol)
-                logger.debug(
-                    "[US_ENTRY][PRECOMPUTED] symbol=%s score=%.3f exchange=%s",
-                    symbol, s, exchange
-                )
-            except (ValueError, TypeError) as exc:
-                logger.debug(
-                    "[US_ENTRY][SCORE_ERR] symbol=%s precomputed score invalid: %s",
+                canonical_entry = canonicalize_us_watchlist_row(entry_meta)
+            except Exception as exc:
+                logger.warning(
+                    "[US_ENTRY][CANONICALIZE_FAIL] symbol=%s: %s",
                     symbol, exc
                 )
+                canonical_entry = entry_meta
+            
+            # Extract score with alias recovery
+            s, score_source = extract_us_score(canonical_entry, "final", return_source=True)
+            
+            # Score validation
+            if s is None or s <= 0:
+                raw_score = entry_meta.get("score")
+                logger.warning(
+                    "[US_ENTRY][SKIP] symbol=%s reason=score_missing_or_zero_after_alias_resolution "
+                    "canonical_score=%.6f score_source=%s raw_score=%s",
+                    symbol, s if s is not None else 0.0, score_source, raw_score
+                )
                 continue
+            
+            # Minimum entry score validation
+            min_entry_score = float(os.getenv("US_MIN_ENTRY_SCORE", "0.05"))
+            if s < min_entry_score:
+                logger.debug(
+                    "[US_ENTRY][SKIP] symbol=%s reason=below_min_entry_score score=%.6f min=%.6f",
+                    symbol, s, min_entry_score
+                )
+                continue
+            
+            exchange = canonical_entry.get("exchange", "")
+            if not exchange:
+                exchange = resolve_exchange(symbol)
+            
+            logger.debug(
+                "[US_ENTRY][PRECOMPUTED_SCORE] symbol=%s score=%.6f source=%s exchange=%s",
+                symbol, s, score_source, exchange
+            )
             
             # current price 조회는 여전히 필요
             try:
@@ -330,6 +358,11 @@ def generate_entry_intents(
                 continue
 
             if s is None:
+                logger.debug("[US_ENTRY][SKIP] symbol=%s reason=score_calculation_failed", symbol)
+                continue
+            
+            if s <= 0:
+                logger.debug("[US_ENTRY][SKIP] symbol=%s reason=score_zero_or_negative score=%.6f", symbol, s)
                 continue
 
         try:
@@ -405,7 +438,7 @@ def generate_entry_intents(
         added_count += 1
 
         logger.info(
-            "[US_ENTRY][INTENT] symbol=%s rank=%d score=%.3f qty=%d notional=%.2f",
+            "[US_ENTRY][INTENT] symbol=%s rank=%d score=%.6f qty=%d notional=%.2f",
             symbol, rank + 1, score, qty, notional,
         )
 
