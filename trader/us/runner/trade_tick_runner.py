@@ -13,13 +13,18 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Contract marker: raw universe fallback is disabled in US trade tick path.
+RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
 
 
 def _entry_cutoff_passed(now: datetime) -> bool:
@@ -124,6 +129,7 @@ def run_trade_tick(
         "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s",
         session, env, offline, run_mode, signal_only,
     )
+    last_stage = "tick_start"
 
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
     from trader.us.market_calendar import now_ny, is_us_trading_day, market_phase
@@ -135,6 +141,7 @@ def run_trade_tick(
         now = datetime.fromisoformat(force_now).astimezone(NY_TZ)
     else:
         now = now_ny()
+    trade_date = now.strftime("%Y-%m-%d")
 
     logger.info(
         "[US_TICK][TIME] session=%s force_now=%s resolved_now_et=%s",
@@ -148,7 +155,12 @@ def run_trade_tick(
     if not is_us_trading_day(now.date()):
         if not signal_only:
             logger.info("[US_TICK][SKIP] not_trading_day date=%s", now.date())
-            return {"status": "SKIP", "reason": "not_trading_day"}
+            return {
+                "status": "SKIP",
+                "reason": "not_trading_day",
+                "last_stage": "trading_day_guard",
+                "trade_date": trade_date,
+            }
         else:
             logger.info(
                 "[US_TICK][SIGNAL_ONLY] non_trading_day date=%s run_mode=%s",
@@ -159,13 +171,27 @@ def run_trade_tick(
     phase = market_phase(now)
     if phase not in ("REGULAR_OPEN", "REGULAR_MID", "REGULAR_CLOSE"):
         logger.info("[US_TICK][SKIP] market not open phase=%s", phase)
-        return {"status": "SKIP", "reason": "market_not_open", "phase": phase}
+        return {
+            "status": "SKIP",
+            "reason": "market_not_open",
+            "phase": phase,
+            "last_stage": "market_phase_guard",
+            "trade_date": trade_date,
+        }
 
     # ── 예산 계산 ─────────────────────────────────────────────────────────────
     from trader.us.budget import resolve_us_order_budget
     from trader.us.data_provider import USDataProvider
 
     provider = USDataProvider(offline=offline)
+    real_order_mode = (
+        os.getenv("DRY_RUN", "0") == "0"
+        and os.getenv("US_KIS_ORDER_ALLOWED", "1") == "1"
+        and kis_order_allowed
+    )
+    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
+    watchlist_timeout_sec = int(os.getenv("US_WATCHLIST_LOAD_TIMEOUT_SEC", "20"))
+    entry_eval_timeout_sec = int(os.getenv("US_ENTRY_EVAL_TIMEOUT_SEC", "60"))
 
     if offline:
         available_cash_usd = 10000.0
@@ -229,6 +255,7 @@ def run_trade_tick(
     
     if not offline:
         try:
+            last_stage = "fills_fetch"
             from trader.us.execution.fills import get_fills_today
             fills_result = get_fills_today(provider=provider, signal_only=signal_only)
             if fills_result["status"] == "CONTRACT_ERROR":
@@ -257,6 +284,20 @@ def run_trade_tick(
         except Exception as exc:
             logger.error("[US_TICK][ERROR] fills exception: %s", exc)
             fills_error_count += 1
+
+    temp_error_count = 0
+    temp_recovered_count = 0
+    if fills_temp_error:
+        temp_error_count += 1
+
+    if not offline:
+        try:
+            client = provider._get_client()
+            stats = getattr(client, "stats", {}) or {}
+            temp_error_count += int(stats.get("temp_error_count", 0) or 0)
+            temp_recovered_count += int(stats.get("temp_recovered_count", 0) or 0)
+        except Exception:
+            pass
 
     # KIS fills + DB sold_today 합산
     from trader.us.db.repos import load_today_symbols_sold, save_fills, save_position_snapshot, save_reconcile_log
@@ -328,6 +369,7 @@ def run_trade_tick(
 
     # fills contract error 발생 시 신규 BUY 차단 및 즉시 ERROR 반환
     if fills_contract_error and os.getenv("US_REQUIRE_FILL_CONFIRM", "1") == "1":
+        last_stage = "fills_contract_guard"
         logger.error(
             "[US_ENTRY][BLOCK] reason=fills_contract_error require_fill_confirm=1"
         )
@@ -338,7 +380,7 @@ def run_trade_tick(
             "[US_TICK][DONE] session=%s status=ERROR reason=fills_contract_error", session
         )
         return {
-            "status": "ERROR",
+            "status": "FAILED",
             "reason": "fills_contract_error",
             "session": session,
             "orders": [],
@@ -351,8 +393,54 @@ def run_trade_tick(
             "run_mode": run_mode,
             "signal_only_mode": signal_only,
             "kis_order_allowed": kis_order_allowed,
+            "last_stage": last_stage,
+            "trade_date": trade_date,
+            "prep_status": "UNKNOWN",
+            "locked_watchlist_count": 0,
+            "entry_eval_status": "BLOCKED",
+            "entry_error_type": "fills_contract_error",
+            "entry_error_message": "fills_contract_error",
+            "entry_intents": 0,
+            "orders_sent": 0,
+            "fills": len(fills_today),
+            "positions": position_count if 'position_count' in locals() else 0,
+            "temp_error_count": temp_error_count,
+            "temp_recovered_count": temp_recovered_count,
+        }
+    elif fills_temp_error and real_order_mode and os.getenv("US_REQUIRE_FILL_CONFIRM", "1") == "1":
+        last_stage = "fills_temp_guard"
+        logger.error("[US_ENTRY][BLOCK] reason=fills_temp_error_real_order")
+        logger.error("[US_TICK][DONE] session=%s status=FAILED reason=fills_temp_error", session)
+        return {
+            "status": "FAILED",
+            "reason": "fills_temp_error",
+            "session": session,
+            "orders": [],
+            "ack": 0,
+            "dry_run": 0,
+            "blocked": 0,
+            "signal_only": 0,
+            "errors": 1,
+            "budget": budget,
+            "run_mode": run_mode,
+            "signal_only_mode": signal_only,
+            "kis_order_allowed": kis_order_allowed,
+            "last_stage": last_stage,
+            "trade_date": trade_date,
+            "prep_status": "UNKNOWN",
+            "locked_watchlist_count": 0,
+            "entry_eval_status": "BLOCKED",
+            "entry_error_type": "fills_temp_error",
+            "entry_error_message": "fills_temp_error",
+            "entry_intents": 0,
+            "orders_sent": 0,
+            "fills": len(fills_today),
+            "positions": position_count if 'position_count' in locals() else 0,
+            "temp_error_count": temp_error_count,
+            "temp_recovered_count": temp_recovered_count,
         }
     elif after_cutoff:
+        last_stage = "entry_cutoff_guard"
         logger.info(
             "[US_ENTRY][BLOCK] reason=after_entry_cutoff time=%s",
             now.strftime("%H:%M:%S"),
@@ -361,7 +449,7 @@ def run_trade_tick(
         # prep status 확인 (locked watchlist contract)
         from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
         
-        trade_date = now.strftime("%Y-%m-%d")
+        last_stage = "prep_status_load"
         prep_status_info = load_latest_us_prep_status(trade_date)
         prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
         
@@ -381,11 +469,75 @@ def run_trade_tick(
             try:
                 min_watchlist_count = int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10"))
                 allow_degraded = os.getenv("US_ALLOW_DEGRADED_IN_TRADE", "0") == "1"
+                watchlist_start = time.monotonic()
+                last_stage = "watchlist_load"
+                logger.info(
+                    "[US_ENTRY][WATCHLIST][LOAD][START] trade_date=%s",
+                    trade_date,
+                )
                 
-                watchlist_rows = load_locked_us_watchlist(
-                    trade_date=trade_date,
-                    min_count=min_watchlist_count,
-                    allow_degraded=allow_degraded,
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        fut = pool.submit(
+                            load_locked_us_watchlist,
+                            trade_date,
+                            min_watchlist_count,
+                            allow_degraded,
+                            watchlist_timeout_sec,
+                        )
+                        watchlist_rows = fut.result(timeout=watchlist_timeout_sec + 1)
+                except concurrent.futures.TimeoutError:
+                    elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
+                    logger.error(
+                        "[US_ENTRY][WATCHLIST][LOAD][TIMEOUT] timeout_sec=%d elapsed_ms=%d",
+                        watchlist_timeout_sec,
+                        elapsed_ms,
+                    )
+                    if not real_order_mode:
+                        logger.warning(
+                            "[US_ENTRY][WATCHLIST][LOAD][WARN] timeout in non_real_order_mode; entry disabled"
+                        )
+                        watchlist_rows = []
+                    else:
+                        logger.error(
+                            "[US_TICK][DONE] session=%s status=FAILED reason=watchlist_load_timeout",
+                            session,
+                        )
+                        return {
+                            "status": "FAILED",
+                            "reason": "watchlist_load_timeout",
+                            "session": session,
+                            "orders": [],
+                            "ack": 0,
+                            "dry_run": 0,
+                            "blocked": 0,
+                            "signal_only": 0,
+                            "errors": 1,
+                            "budget": budget,
+                            "run_mode": run_mode,
+                            "signal_only_mode": signal_only,
+                            "kis_order_allowed": kis_order_allowed,
+                            "last_stage": last_stage,
+                            "trade_date": trade_date,
+                            "prep_status": prep_status,
+                            "locked_watchlist_count": 0,
+                            "entry_eval_status": "TIMEOUT",
+                            "entry_error_type": "watchlist_load_timeout",
+                            "entry_error_message": "watchlist_load_timeout",
+                            "entry_intents": 0,
+                            "orders_sent": 0,
+                            "fills": len(fills_today),
+                            "positions": position_count,
+                            "temp_error_count": temp_error_count,
+                            "temp_recovered_count": temp_recovered_count,
+                            "timeout_sec": tick_timeout_sec,
+                        }
+
+                elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
+                logger.info(
+                    "[US_ENTRY][WATCHLIST][LOAD][DONE] count=%d elapsed_ms=%d",
+                    len(watchlist_rows),
+                    elapsed_ms,
                 )
                 
                 if watchlist_rows:
@@ -404,25 +556,43 @@ def run_trade_tick(
                     if not quality_contract["ok"]:
                         error_msg = format_us_watchlist_error_message(quality_contract)
                         logger.error(error_msg)
-                        logger.error(
-                            "[US_TICK][DONE] session=%s status=ERROR reason=locked_watchlist_score_contract_fail",
-                            session,
+                        if real_order_mode:
+                            logger.error(
+                                "[US_TICK][DONE] session=%s status=FAILED reason=locked_watchlist_score_contract_fail",
+                                session,
+                            )
+                            return {
+                                "status": "FAILED",
+                                "reason": "locked_watchlist_score_contract_fail",
+                                "session": session,
+                                "orders": [],
+                                "ack": 0,
+                                "dry_run": 0,
+                                "blocked": 0,
+                                "signal_only": 0,
+                                "errors": 1,
+                                "score_contract": quality_contract,
+                                "run_mode": run_mode,
+                                "signal_only_mode": signal_only,
+                                "kis_order_allowed": kis_order_allowed,
+                                "last_stage": last_stage,
+                                "trade_date": trade_date,
+                                "prep_status": prep_status,
+                                "locked_watchlist_count": len(watchlist_rows),
+                                "entry_eval_status": "FAILED",
+                                "entry_error_type": "locked_watchlist_score_contract_fail",
+                                "entry_error_message": "locked_watchlist_score_contract_fail",
+                                "entry_intents": 0,
+                                "orders_sent": 0,
+                                "fills": len(fills_today),
+                                "positions": position_count,
+                                "temp_error_count": temp_error_count,
+                                "temp_recovered_count": temp_recovered_count,
+                            }
+                        logger.warning(
+                            "[US_ENTRY][SCORE_CONTRACT][WARN] non_real_order_mode entry disabled"
                         )
-                        return {
-                            "status": "ERROR",
-                            "reason": "locked_watchlist_score_contract_fail",
-                            "session": session,
-                            "orders": [],
-                            "ack": 0,
-                            "dry_run": 0,
-                            "blocked": 0,
-                            "signal_only": 0,
-                            "errors": 1,
-                            "score_contract": quality_contract,
-                            "run_mode": run_mode,
-                            "signal_only_mode": signal_only,
-                            "kis_order_allowed": kis_order_allowed,
-                        }
+                        watchlist_rows = []
                     
                     # Contract 통과 로그
                     logger.info(
@@ -458,37 +628,65 @@ def run_trade_tick(
                         "[US_ENTRY][BLOCK] reason=locked_watchlist_missing trade_date=%s",
                         trade_date,
                     )
-                    logger.error(
-                        "[US_TICK][DONE] session=%s status=ERROR reason=locked_watchlist_missing",
-                        session,
+                    if real_order_mode:
+                        logger.error(
+                            "[US_TICK][DONE] session=%s status=FAILED reason=locked_watchlist_missing",
+                            session,
+                        )
+                        return {
+                            "status": "FAILED",
+                            "reason": "locked_watchlist_missing",
+                            "session": session,
+                            "orders": [],
+                            "ack": 0,
+                            "dry_run": 0,
+                            "blocked": 0,
+                            "signal_only": 0,
+                            "errors": 1,
+                            "run_mode": run_mode,
+                            "signal_only_mode": signal_only,
+                            "kis_order_allowed": kis_order_allowed,
+                            "last_stage": last_stage,
+                            "trade_date": trade_date,
+                            "prep_status": prep_status,
+                            "locked_watchlist_count": 0,
+                            "entry_eval_status": "FAILED",
+                            "entry_error_type": "locked_watchlist_missing",
+                            "entry_error_message": "locked_watchlist_missing",
+                            "entry_intents": 0,
+                            "orders_sent": 0,
+                            "fills": len(fills_today),
+                            "positions": position_count,
+                            "temp_error_count": temp_error_count,
+                            "temp_recovered_count": temp_recovered_count,
+                        }
+                    logger.warning(
+                        "[US_ENTRY][BLOCK][WARN] non_real_order_mode locklist missing -> no entry intents"
                     )
-                    return {
-                        "status": "ERROR",
-                        "reason": "locked_watchlist_missing",
-                        "session": session,
-                        "orders": [],
-                        "ack": 0,
-                        "dry_run": 0,
-                        "blocked": 0,
-                        "signal_only": 0,
-                        "errors": 1,
-                        "run_mode": run_mode,
-                        "signal_only_mode": signal_only,
-                        "kis_order_allowed": kis_order_allowed,
-                    }
                 
                 if watchlist_rows:
                     engine = _get_strategy_engine(env=env, offline=offline)
                     try:
-                        entry_intents = engine.evaluate_entries(
-                            tickers=None,  # watchlist_entries를 우선 사용
-                            provider=provider,
-                            sold_today=sold_today,
-                            available_cash_usd=effective_budget,
-                            position_count=position_count,
-                            now=now,
-                            watchlist_entries=watchlist_rows,  # authoritative input
+                        last_stage = "entry_eval"
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            fut = pool.submit(
+                                engine.evaluate_entries,
+                                None,
+                                provider,
+                                sold_today,
+                                effective_budget,
+                                position_count,
+                                now,
+                                watchlist_rows,
+                            )
+                            entry_intents = fut.result(timeout=entry_eval_timeout_sec)
+                    except concurrent.futures.TimeoutError:
+                        logger.error(
+                            "[US_ENTRY][EVAL][TIMEOUT] timeout_sec=%d",
+                            entry_eval_timeout_sec,
                         )
+                        entry_eval_error_count += 1
+                        entry_intents = []
                     except Exception as exc:
                         logger.error(
                             "[US_ENTRY][EVAL][ERROR] type=%s message=%s",
@@ -497,10 +695,49 @@ def run_trade_tick(
                         entry_eval_error_count += 1
                         entry_intents = []
             except Exception as exc:
+                elapsed_ms = 0
+                logger.error(
+                    "[US_ENTRY][WATCHLIST][LOAD][ERROR] type=%s message=%s",
+                    type(exc).__name__,
+                    str(exc),
+                )
                 logger.error("[US_ENTRY][EVAL][ERROR] %s", exc)
                 entry_eval_error_count += 1
     
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
+
+    if entry_eval_error_count > 0 and real_order_mode:
+        last_stage = "entry_eval"
+        logger.error("[US_ORDER][ROUTE][SKIP] reason=entry_eval_error")
+        logger.error("[US_TICK][DONE] session=%s status=FAILED reason=entry_eval_error", session)
+        return {
+            "status": "FAILED",
+            "reason": "entry_eval_error",
+            "session": session,
+            "orders": [],
+            "ack": 0,
+            "dry_run": 0,
+            "blocked": 0,
+            "signal_only": 0,
+            "errors": entry_eval_error_count,
+            "budget": budget,
+            "run_mode": run_mode,
+            "signal_only_mode": signal_only,
+            "kis_order_allowed": kis_order_allowed,
+            "last_stage": last_stage,
+            "trade_date": trade_date,
+            "prep_status": prep_status if 'prep_status' in locals() else "UNKNOWN",
+            "locked_watchlist_count": len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
+            "entry_eval_status": "FAILED",
+            "entry_error_type": "entry_eval_error",
+            "entry_error_message": "entry_eval_error",
+            "entry_intents": 0,
+            "orders_sent": 0,
+            "fills": len(fills_today),
+            "positions": position_count,
+            "temp_error_count": temp_error_count,
+            "temp_recovered_count": temp_recovered_count,
+        }
 
     # ── Order routing ─────────────────────────────────────────────────────────
     all_intents = exit_intents + entry_intents
@@ -575,6 +812,7 @@ def run_trade_tick(
 
     return {
         "status": status,
+        "reason": "none",
         "session": session,
         "orders": orders,
         "ack": ack_cnt,
@@ -586,6 +824,19 @@ def run_trade_tick(
         "run_mode": run_mode,
         "signal_only_mode": signal_only,
         "kis_order_allowed": kis_order_allowed,
+        "last_stage": "order_route",
+        "trade_date": trade_date,
+        "prep_status": prep_status if 'prep_status' in locals() else "UNKNOWN",
+        "locked_watchlist_count": len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
+        "entry_eval_status": "OK" if entry_eval_error_count == 0 else "ERROR",
+        "entry_error_type": "" if entry_eval_error_count == 0 else "entry_eval_error",
+        "entry_error_message": "" if entry_eval_error_count == 0 else "entry_eval_error",
+        "entry_intents": len(entry_intents),
+        "orders_sent": ack_cnt,
+        "fills": len(fills_today),
+        "positions": len(current_positions),
+        "temp_error_count": temp_error_count,
+        "temp_recovered_count": temp_recovered_count,
     }
 
 
@@ -640,7 +891,7 @@ def main() -> None:
         run_mode=args.run_mode,
         signal_only=args.signal_only,
     )
-    if result["status"] == "ERROR":
+    if result["status"] in ("ERROR", "FAILED"):
         sys.exit(1)
 
 

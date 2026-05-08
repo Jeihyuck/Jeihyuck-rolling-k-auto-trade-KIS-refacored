@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date
 from typing import Any
 
@@ -1081,6 +1082,7 @@ def load_locked_us_watchlist(
     trade_date: str,
     min_count: int = 1,
     allow_degraded: bool = True,
+    timeout_sec: int = 20,
 ) -> list[dict]:
     """
     당일 locked watchlist 조회.
@@ -1100,15 +1102,28 @@ def load_locked_us_watchlist(
         빈 리스트 [] if not found or count < min_count
     """
     from trader.us.score_columns import canonicalize_us_watchlist_row
+    load_started = time.monotonic()
+    logger.info(
+        "[US_WATCHLIST][LOCK_LOAD][START] trade_date=%s timeout_sec=%d",
+        trade_date,
+        timeout_sec,
+    )
     
     engine = _get_engine_or_none()
     if engine is None:
         mem_locked = [w for w in _MEM_WATCHLIST if w.get("locked") and w.get("trade_date") == trade_date]
-        logger.info("[US_WATCHLIST][LOCK_LOAD] count=%d (in-memory)", len(mem_locked))
+        elapsed_ms = int((time.monotonic() - load_started) * 1000)
+        logger.info(
+            "[US_WATCHLIST][LOCK_LOAD][DONE] count=%d elapsed_ms=%d source=in_memory",
+            len(mem_locked),
+            elapsed_ms,
+        )
         return mem_locked
     
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
+            timeout_ms = max(1000, int(timeout_sec * 1000))
+            conn.execute(text("SET LOCAL statement_timeout = :timeout_ms"), {"timeout_ms": timeout_ms})
             rows = conn.execute(
                 text("""
                     SELECT symbol, exchange, strategy, score, meta, 
@@ -1124,9 +1139,10 @@ def load_locked_us_watchlist(
             raw_result = [dict(r._mapping) for r in rows]
             
             if len(raw_result) < min_count:
+                elapsed_ms = int((time.monotonic() - load_started) * 1000)
                 logger.warning(
-                    "[US_WATCHLIST][LOCK_LOAD][INSUFFICIENT] trade_date=%s count=%d min=%d",
-                    trade_date, len(raw_result), min_count
+                    "[US_WATCHLIST][LOCK_LOAD][INSUFFICIENT] trade_date=%s count=%d min=%d elapsed_ms=%d",
+                    trade_date, len(raw_result), min_count, elapsed_ms
                 )
                 return []
             
@@ -1134,9 +1150,10 @@ def load_locked_us_watchlist(
             if raw_result and not allow_degraded:
                 first_status = raw_result[0].get("prep_status")
                 if first_status == "DEGRADED":
+                    elapsed_ms = int((time.monotonic() - load_started) * 1000)
                     logger.warning(
-                        "[US_WATCHLIST][LOCK_LOAD][DEGRADED_BLOCKED] trade_date=%s status=%s",
-                        trade_date, first_status
+                        "[US_WATCHLIST][LOCK_LOAD][DEGRADED_BLOCKED] trade_date=%s status=%s elapsed_ms=%d",
+                        trade_date, first_status, elapsed_ms
                     )
                     return []
             
@@ -1159,17 +1176,27 @@ def load_locked_us_watchlist(
             stats = collect_us_score_nonzero_stats(canonical_result)
             
             logger.info(
-                "[US_WATCHLIST][LOCK_LOAD] trade_date=%s count=%d status=%s "
-                "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f",
+                "[US_WATCHLIST][LOCK_LOAD][DONE] trade_date=%s count=%d status=%s "
+                "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f elapsed_ms=%d",
                 trade_date, len(canonical_result), 
                 canonical_result[0].get("prep_status") if canonical_result else "N/A",
                 stats["score_nonzero"], stats["score_zero"], stats["score_missing"],
-                stats["score_nonzero_ratio"]
+                stats["score_nonzero_ratio"],
+                int((time.monotonic() - load_started) * 1000),
             )
             
             return canonical_result
     except Exception as exc:
-        logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s", exc)
+        elapsed_ms = int((time.monotonic() - load_started) * 1000)
+        err_msg = str(exc).lower()
+        if "statement timeout" in err_msg:
+            logger.error(
+                "[US_WATCHLIST][LOCK_LOAD][TIMEOUT] timeout_sec=%d elapsed_ms=%d",
+                timeout_sec,
+                elapsed_ms,
+            )
+            return []
+        logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s elapsed_ms=%d", exc, elapsed_ms)
         return []
 
 

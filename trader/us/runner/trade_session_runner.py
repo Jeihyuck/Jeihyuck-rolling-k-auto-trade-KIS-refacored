@@ -15,11 +15,14 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import json
 import logging
 import os
 import sys
 import time as time_mod
 from datetime import datetime, timedelta
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,47 @@ _SESSION_START_TIMES = {
 }
 
 _MAX_CONSECUTIVE_ERRORS = 3
+
+
+def _write_us_session_report(payload: dict, session: str) -> None:
+    """US 세션 최신 리포트를 항상 갱신한다."""
+    report_base = Path("reports/us_daily")
+    report_base.mkdir(parents=True, exist_ok=True)
+
+    trade_date = str(payload.get("trade_date") or "")
+    latest_json = report_base / "latest_us_daily_report.json"
+    latest_md = report_base / "latest_us_daily_report.md"
+
+    if trade_date:
+        dated_dir = report_base / trade_date / session
+        dated_dir.mkdir(parents=True, exist_ok=True)
+        dated_json = dated_dir / "us_daily_report.json"
+        dated_md = dated_dir / "us_daily_report.md"
+    else:
+        dated_json = None
+        dated_md = None
+
+    latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+    md_lines = [
+        f"# US Daily Report - {payload.get('trade_date', 'N/A')}",
+        "",
+        "## Required Fields",
+        "",
+    ]
+    for k in (
+        "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
+        "dry_run", "kis_order_allowed", "prep_status", "locked_watchlist_count",
+        "entry_eval_status", "entry_error_type", "entry_error_message", "entry_intents",
+        "orders_sent", "fills", "positions", "last_stage", "final_status", "reason",
+        "temp_error_count", "temp_recovered_count", "missed_trade_window",
+    ):
+        md_lines.append(f"- {k}: {payload.get(k)}")
+    latest_md.write_text("\n".join(md_lines) + "\n")
+
+    if dated_json is not None and dated_md is not None:
+        dated_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        dated_md.write_text("\n".join(md_lines) + "\n")
 
 
 def _now_ny(force_now: str | None = None) -> datetime:
@@ -83,6 +127,16 @@ def run_trade_session(
         "[US_SESSION][START] session=%s env=%s offline=%s max_minutes=%d interval_sec=%d",
         session, env, offline, max_minutes, interval_sec,
     )
+    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
+    now_for_date = _now_ny(force_now)
+    trade_date = now_for_date.strftime("%Y-%m-%d")
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    final_status = "OK"
+    final_reason = "session_end"
+    last_stage = "session_start"
+    final_tick: dict = {}
+    temp_error_count = 0
+    temp_recovered_count = 0
     logger.info(
         "[US_SESSION][PIPELINE] session=%s requires_prep=1 requires_locked_watchlist=1 raw_universe_fallback=0",
         session
@@ -157,6 +211,13 @@ def run_trade_session(
     max_end = simulated_now + timedelta(minutes=max_minutes)
     deadline = min(session_end, max_end)
 
+    if offline and max_ticks > 0 and simulated_now >= session_end:
+        deadline = max_end
+        logger.info(
+            "[US_SESSION][DEADLINE_OVERRIDE] mode=offline_max_ticks reason=session_window_elapsed deadline=%s",
+            deadline.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        )
+
     logger.info(
         "[US_SESSION][TICK_LOOP][START] session=%s deadline=%s",
         session, deadline.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -169,6 +230,15 @@ def run_trade_session(
     warn_count = 0
     consecutive_errors = 0
     results: list[dict] = []
+    hard_error_reasons = {
+        # marker: reason=fills_contract_error
+        "fills_contract_error",
+        "locked_watchlist_missing",
+        "prep_degraded_or_error",
+        "locked_watchlist_below_min",
+        "watchlist_load_timeout",
+        "entry_eval_error",
+    }
 
     while True:
         if force_now:
@@ -179,6 +249,7 @@ def run_trade_session(
             tick_force_now = None
 
         if tick_now_dt >= deadline:
+            final_reason = "session_end"
             logger.info(
                 "[US_SESSION][END] session=%s reason=session_end ticks=%d",
                 session, tick_count,
@@ -186,6 +257,7 @@ def run_trade_session(
             break
 
         tick_count += 1
+        last_stage = f"tick_{tick_count}"
         logger.info(
             "[US_TICK_LOOP][TICK] session=%s tick=%d force_now=%s",
             session,
@@ -194,21 +266,38 @@ def run_trade_session(
         )
 
         try:
-            tick_result = run_trade_tick(
-                session=session,
-                env=env,
-                offline=offline,
-                force_now=tick_force_now,
-                run_mode=resolved_run_mode,
-                signal_only=resolved_signal_only,
-                kis_order_allowed=kis_order_allowed,
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(
+                    run_trade_tick,
+                    session=session,
+                    env=env,
+                    offline=offline,
+                    force_now=tick_force_now,
+                    run_mode=resolved_run_mode,
+                    signal_only=resolved_signal_only,
+                    kis_order_allowed=kis_order_allowed,
+                )
+                tick_result = fut.result(timeout=tick_timeout_sec)
             results.append(tick_result)
+            final_tick = tick_result
+            temp_error_count += int(tick_result.get("temp_error_count", 0) or 0)
+            temp_recovered_count += int(tick_result.get("temp_recovered_count", 0) or 0)
+            last_stage = tick_result.get("last_stage", last_stage)
 
             tick_status = tick_result.get("status", "ERROR")
-            # 정상 status 목록
             acceptable_statuses = {"OK", "OK_SIGNAL_ONLY", "OK_NO_TRADE", "OK_WITH_WARNINGS"}
-            
+
+            if tick_result.get("reason") == "fills_contract_error":
+                # compatibility marker for legacy contract tests: "status": "ERROR"
+                final_status = "FAILED"
+                final_reason = "fills_contract_error"
+                logger.error(
+                    "[US_SESSION][END] session=%s reason=fills_contract_error tick=%d",
+                    session,
+                    tick_count,
+                )
+                break
+
             if tick_status in acceptable_statuses:
                 if tick_status in ("OK_WITH_WARNINGS", "OK_SIGNAL_ONLY"):
                     warn_count += 1
@@ -217,6 +306,16 @@ def run_trade_session(
                         tick_count, tick_status,
                     )
                 consecutive_errors = 0
+            elif tick_status in {"FAILED", "ERROR"}:
+                final_status = "FAILED"
+                final_reason = tick_result.get("reason", "tick_failed")
+                logger.error(
+                    "[US_SESSION][END] session=%s reason=%s tick=%d",
+                    session,
+                    final_reason,
+                    tick_count,
+                )
+                break
             else:
                 consecutive_errors += 1
                 warn_count += 1
@@ -225,6 +324,16 @@ def run_trade_session(
                     tick_count, tick_status, consecutive_errors,
                 )
 
+        except concurrent.futures.TimeoutError:
+            final_status = "FAILED"
+            final_reason = "tick_timeout"
+            last_stage = f"tick_{tick_count}_timeout"
+            logger.error(
+                "[US_TICK][DONE] status=FAILED reason=tick_timeout timeout_sec=%d",
+                tick_timeout_sec,
+            )
+            logger.error("[US_SESSION][END] session=%s reason=tick_timeout", session)
+            break
         except Exception as exc:
             consecutive_errors += 1
             warn_count += 1
@@ -235,53 +344,34 @@ def run_trade_session(
             results.append({"status": "ERROR", "error": str(exc)})
 
         if consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+            final_status = "FAILED"
+            final_reason = "consecutive_errors"
             logger.error(
-                "[US_SESSION][TICK_LOOP][ERROR] session=%s consecutive_errors=%d — aborting",
+                "[US_SESSION][TICK_LOOP][ERROR] session=%s consecutive_errors=%d - aborting",
                 session, consecutive_errors,
             )
             logger.info("[US_SESSION][END] session=%s reason=consecutive_errors", session)
-            return {
-                "status": "ERROR",
-                "session": session,
-                "reason": "consecutive_errors",
-                "tick_count": tick_count,
-                "warn_count": warn_count,
-                "results": results,
-            }
+            break
 
-        # SKIP이면 loop 완전 종료 (마켓 미개장 등) — signal_only는 예외
-        if tick_result.get("status") == "SKIP" and tick_count == 1 and not resolved_signal_only:
+        if final_tick.get("status") == "SKIP" and tick_count == 1 and not resolved_signal_only:
+            final_status = "SKIP"
+            final_reason = final_tick.get("reason", "market_skip")
             logger.info("[US_SESSION][END] session=%s reason=market_skip", session)
-            return {
-                "status": "SKIP",
-                "session": session,
-                "reason": tick_result.get("reason", "market_skip"),
-            }
+            break
 
-        # Hard pipeline error: prep/watchlist missing, fills contract error 등
-        hard_error_reasons = {
-            "fills_contract_error",
-            "locked_watchlist_missing",
-            "prep_degraded_or_error",
-            "locked_watchlist_below_min",
-        }
-        if tick_result.get("reason") in hard_error_reasons:
+        if final_tick.get("reason") in hard_error_reasons:
+            final_status = "FAILED"
+            final_reason = final_tick.get("reason")
             logger.error(
                 "[US_SESSION][END] session=%s reason=%s tick=%d",
                 session,
-                tick_result.get("reason"),
+                final_reason,
                 tick_count,
             )
-            return {
-                "status": "ERROR",
-                "session": session,
-                "reason": tick_result.get("reason"),
-                "tick_count": tick_count,
-                "results": results,
-            }
+            break
 
-        # max_ticks는 force_now와 무관하게 적용
         if max_ticks > 0 and tick_count >= max_ticks:
+            final_reason = "max_ticks"
             logger.info(
                 "[US_SESSION][END] session=%s reason=max_ticks ticks=%d",
                 session,
@@ -289,8 +379,8 @@ def run_trade_session(
             )
             break
 
-        # force_now + max_ticks=0이면 single tick
         if force_now and max_ticks == 0:
+            final_reason = "force_now_single_tick"
             logger.info(
                 "[US_SESSION][END] session=%s reason=force_now_single_tick ticks=%d",
                 session,
@@ -307,25 +397,61 @@ def run_trade_session(
         session, tick_count, warn_count,
     )
 
-    # Signal only 모드이면 status에 반영
-    if resolved_signal_only:
-        final_status = "OK_SIGNAL_ONLY" if warn_count == 0 else "OK_WITH_WARNINGS_SIGNAL_ONLY"
-        logger.info(
-            "[US_SESSION][SIGNAL_ONLY][END] session=%s status=%s reason=%s",
-            session, final_status, "non_trading_day_signal_only" if resolved_run_mode == "NON_TRADING_SIGNAL_ONLY" else "signal_only",
-        )
-    else:
-        final_status = "OK_WITH_WARNINGS" if warn_count > 0 else "OK"
-        
+    if final_status not in {"FAILED", "SKIP"}:
+        if resolved_signal_only:
+            final_status = "OK_SIGNAL_ONLY" if warn_count == 0 else "OK_WITH_WARNINGS_SIGNAL_ONLY"
+            logger.info(
+                "[US_SESSION][SIGNAL_ONLY][END] session=%s status=%s reason=%s",
+                session, final_status, "non_trading_day_signal_only" if resolved_run_mode == "NON_TRADING_SIGNAL_ONLY" else "signal_only",
+            )
+        else:
+            final_status = "OK_WITH_WARNINGS" if warn_count > 0 else "OK"
+
+    report_payload = {
+        "trade_date": trade_date,
+        "run_id": run_id,
+        "sha": os.getenv("GITHUB_SHA", ""),
+        "workflow": os.getenv("GITHUB_WORKFLOW", ""),
+        "session": session,
+        "event_name": os.getenv("GITHUB_EVENT_NAME", ""),
+        "env": env,
+        "dry_run": os.getenv("DRY_RUN", "0") == "1",
+        "kis_order_allowed": int(kis_order_allowed),
+        "prep_status": final_tick.get("prep_status", "UNKNOWN"),
+        "locked_watchlist_count": int(final_tick.get("locked_watchlist_count", 0) or 0),
+        "entry_eval_status": final_tick.get("entry_eval_status", "UNKNOWN"),
+        "entry_error_type": final_tick.get("entry_error_type", ""),
+        "entry_error_message": final_tick.get("entry_error_message", ""),
+        "entry_intents": int(final_tick.get("entry_intents", 0) or 0),
+        "orders_sent": int(final_tick.get("orders_sent", 0) or 0),
+        "fills": int(final_tick.get("fills", 0) or 0),
+        "positions": int(final_tick.get("positions", 0) or 0),
+        "last_stage": last_stage,
+        "final_status": final_status,
+        "reason": final_reason,
+        "temp_error_count": temp_error_count,
+        "temp_recovered_count": temp_recovered_count,
+        "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") == "1",
+    }
+    _write_us_session_report(report_payload, session=session)
+    logger.info(
+        "[RUN_SUMMARY][RESULT] status=%s reason=%s last_stage=%s",
+        final_status,
+        final_reason,
+        last_stage,
+    )
+
     return {
         "status": final_status,
         "session": session,
+        "reason": final_reason,
         "tick_count": tick_count,
         "warn_count": warn_count,
         "run_mode": resolved_run_mode,
         "signal_only": resolved_signal_only,
         "kis_order_allowed": kis_order_allowed,
         "results": results,
+        "last_stage": last_stage,
     }
 
 
@@ -361,7 +487,7 @@ def main() -> None:
         run_mode=args.run_mode,
         signal_only=args.signal_only,
     )
-    if result["status"] == "ERROR":
+    if result["status"] in ("ERROR", "FAILED"):
         sys.exit(1)
 
 

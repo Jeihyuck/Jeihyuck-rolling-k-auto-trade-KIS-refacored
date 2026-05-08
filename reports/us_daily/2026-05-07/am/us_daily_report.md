@@ -1,8 +1,8 @@
-# US Daily Report - 2026-01-02
+# US Daily Report - 2026-05-07
 
 ## Required Fields
 
-- trade_date: 2026-01-02
+- trade_date: 2026-05-07
 - run_id: local
 - sha: 
 - workflow: 
@@ -13,16 +13,16 @@
 - kis_order_allowed: 1
 - prep_status: UNKNOWN
 - locked_watchlist_count: 0
-- entry_eval_status: OK
+- entry_eval_status: UNKNOWN
 - entry_error_type: 
 - entry_error_message: 
 - entry_intents: 0
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: order_route
+- last_stage: tick_2
 - final_status: OK
-- reason: force_now_single_tick
+- reason: max_ticks
 - temp_error_count: 0
 - temp_recovered_count: 0
 - missed_trade_window: False

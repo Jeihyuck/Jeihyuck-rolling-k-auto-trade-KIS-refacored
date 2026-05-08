@@ -115,6 +115,9 @@ jobs:
       US_MIN_CASH_BUFFER_USD: "200"
 
       US_SESSION_INTERVAL_SEC: "300"
+      US_WATCHLIST_LOAD_TIMEOUT_SEC: "20"
+      US_ENTRY_EVAL_TIMEOUT_SEC: "60"
+      US_TICK_TIMEOUT_SEC: "90"
 
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '0' }}
 
@@ -235,10 +238,59 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
+          trade_date=$(TZ=America/New_York date +%F)
+          missed_window="false"
+          if [[ "${{ steps.phase_guard.outputs.skip_reason }}" == "skip_stale_start_us_afternoon" ]]; then
+            missed_window="true"
+          fi
           {
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=us-afternoon"
             echo "[US_TRADE_AFTERNOON][EXIT] reason=phase_guard_skip"
           } | tee -a artifacts/${US_LOG_FILE}
+          python - <<PY
+          import json
+          from pathlib import Path
+          report = {
+              "trade_date": "${trade_date}",
+              "run_id": "${GITHUB_RUN_ID}",
+              "sha": "${GITHUB_SHA}",
+              "workflow": "${GITHUB_WORKFLOW}",
+              "session": "afternoon",
+              "event_name": "${GITHUB_EVENT_NAME}",
+              "env": "practice",
+              "dry_run": "${DRY_RUN}" == "1",
+              "kis_order_allowed": int("${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"),
+              "prep_status": "SKIP_PHASE_WINDOW",
+              "locked_watchlist_count": 0,
+              "entry_eval_status": "SKIPPED",
+              "entry_error_type": "",
+              "entry_error_message": "",
+              "entry_intents": 0,
+              "orders_sent": 0,
+              "fills": 0,
+              "positions": 0,
+              "last_stage": "phase_guard",
+              "final_status": "SKIP_PHASE_WINDOW",
+              "reason": "${{ steps.phase_guard.outputs.skip_reason }}",
+              "temp_error_count": 0,
+              "temp_recovered_count": 0,
+              "missed_trade_window": "${missed_window}" == "true",
+          }
+          base = Path("reports/us_daily")
+          base.mkdir(parents=True, exist_ok=True)
+          (base / "latest_us_daily_report.json").write_text(json.dumps(report, indent=2))
+          md = "\n".join([
+              f"# US Daily Report - {report['trade_date']}",
+              "",
+              "## Required Fields",
+              "",
+          ] + [f"- {k}: {v}" for k, v in report.items()]) + "\n"
+          (base / "latest_us_daily_report.md").write_text(md)
+          d = base / report["trade_date"] / "afternoon"
+          d.mkdir(parents=True, exist_ok=True)
+          (d / "us_daily_report.json").write_text(json.dumps(report, indent=2))
+          (d / "us_daily_report.md").write_text(md)
+          PY
 
       - name: Set up Python
         if: steps.phase_guard.outputs.should_run == '1'
@@ -338,6 +390,16 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Guard same-day US prep contract
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        env:
+          SESSION: afternoon
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
+        run: |
+          set -euo pipefail
+          python scripts/guard_us_prep_contract.py 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
       - name: Guard manual force_now safety
         if: github.event_name == 'workflow_dispatch' && inputs.force_now != ''
         working-directory: repo
@@ -431,6 +493,7 @@ jobs:
               SIGNAL_ONLY_FLAG="--signal-only"
             fi
 
+            set +e
             python -m trader.us.runner.trade_session_runner \
               --session afternoon \
               --env practice \
@@ -440,10 +503,76 @@ jobs:
               ${SIGNAL_ONLY_FLAG} \
               ${FORCE_NOW_FLAG} \
               ${MAX_TICKS_FLAG} \
-              ${OFFLINE_FLAG}
-
-            echo "[US_TRADE_AFTERNOON][DONE]"
+              ${OFFLINE_FLAG} 2>&1 | tee -a artifacts/${US_LOG_FILE}
+            status=${PIPESTATUS[0]}
+            set -e
+            echo "[US_TRADE_AFTERNOON][PYTHON_EXIT] status=${status}" | tee -a artifacts/${US_LOG_FILE}
+            if [ "${status}" -eq 0 ]; then
+              echo "[US_TRADE_AFTERNOON][DONE]" | tee -a artifacts/${US_LOG_FILE}
+            else
+              echo "[US_TRADE_AFTERNOON][FAILED] python_exit=${status}" | tee -a artifacts/${US_LOG_FILE}
+            fi
+            exit ${status}
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Validate latest US Afternoon report contract
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          latest_json="reports/us_daily/latest_us_daily_report.json"
+          latest_md="reports/us_daily/latest_us_daily_report.md"
+          [ -f "${latest_json}" ] || { echo "::error::missing latest US report json"; exit 1; }
+          [ -f "${latest_md}" ] || { echo "::error::missing latest US report md"; exit 1; }
+
+          trade_date=$(python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          print(datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d"))
+          PY
+          )
+
+          python - <<PY
+          import json, sys
+          from pathlib import Path
+          p = Path("${latest_json}")
+          payload = json.loads(p.read_text())
+          expected = {
+              "trade_date": "${trade_date}",
+              "run_id": "${GITHUB_RUN_ID}",
+              "dry_run": "${DRY_RUN}" == "1",
+          }
+          errs = []
+          if str(payload.get("trade_date")) != expected["trade_date"]:
+              errs.append(f"trade_date mismatch: {payload.get('trade_date')} != {expected['trade_date']}")
+          if str(payload.get("run_id")) != expected["run_id"]:
+              errs.append(f"run_id mismatch: {payload.get('run_id')} != {expected['run_id']}")
+          if bool(payload.get("dry_run")) != expected["dry_run"]:
+              errs.append(f"dry_run mismatch: {payload.get('dry_run')} != {expected['dry_run']}")
+          if errs:
+              print("::error::stale_or_invalid_us_report")
+              for e in errs:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          required = [
+              "trade_date","run_id","sha","workflow","session","event_name","env","dry_run",
+              "kis_order_allowed","prep_status","locked_watchlist_count","entry_eval_status",
+              "entry_error_type","entry_error_message","entry_intents","orders_sent","fills",
+              "positions","last_stage","final_status","reason"
+          ]
+          miss = [k for k in required if k not in payload]
+          if miss:
+              print(f"::error::missing_report_fields {miss}")
+              sys.exit(1)
+          print("[US_REPORT][VALID] latest report contract satisfied")
+          PY
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          payload = json.loads(Path("reports/us_daily/latest_us_daily_report.json").read_text())
+          Path("artifacts/us_last_stage.txt").write_text(str(payload.get("last_stage", "unknown")) + "\n")
+          PY
 
       - name: Verify US Afternoon log contract
         if: always()

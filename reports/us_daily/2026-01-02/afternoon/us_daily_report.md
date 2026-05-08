@@ -6,7 +6,7 @@
 - run_id: local
 - sha: 
 - workflow: 
-- session: am
+- session: afternoon
 - event_name: 
 - env: practice
 - dry_run: True
