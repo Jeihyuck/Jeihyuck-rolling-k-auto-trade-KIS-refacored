@@ -532,6 +532,52 @@ def run_trade_tick(
                             "temp_recovered_count": temp_recovered_count,
                             "timeout_sec": tick_timeout_sec,
                         }
+                except Exception as exc:
+                    elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
+                    logger.error(
+                        "[US_ENTRY][WATCHLIST][LOAD][ERROR] error=%s elapsed_ms=%d",
+                        exc,
+                        elapsed_ms,
+                    )
+                    if not real_order_mode:
+                        logger.warning(
+                            "[US_ENTRY][WATCHLIST][LOAD][WARN] error in non_real_order_mode; entry disabled"
+                        )
+                        watchlist_rows = []
+                    else:
+                        logger.error(
+                            "[US_TICK][DONE] session=%s status=FAILED reason=watchlist_load_error",
+                            session,
+                        )
+                        return {
+                            "status": "FAILED",
+                            "reason": "watchlist_load_error",
+                            "session": session,
+                            "orders": [],
+                            "ack": 0,
+                            "dry_run": 0,
+                            "blocked": 0,
+                            "signal_only": 0,
+                            "errors": 1,
+                            "budget": budget,
+                            "run_mode": run_mode,
+                            "signal_only_mode": signal_only,
+                            "kis_order_allowed": kis_order_allowed,
+                            "last_stage": last_stage,
+                            "trade_date": trade_date,
+                            "prep_status": prep_status,
+                            "locked_watchlist_count": 0,
+                            "entry_eval_status": "ERROR",
+                            "entry_error_type": "watchlist_load_error",
+                            "entry_error_message": str(exc),
+                            "entry_intents": 0,
+                            "orders_sent": 0,
+                            "fills": len(fills_today),
+                            "positions": position_count,
+                            "temp_error_count": temp_error_count,
+                            "temp_recovered_count": temp_recovered_count,
+                            "timeout_sec": tick_timeout_sec,
+                        }
 
                 elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
                 logger.info(

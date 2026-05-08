@@ -1122,8 +1122,12 @@ def load_locked_us_watchlist(
     
     try:
         with engine.begin() as conn:
-            timeout_ms = max(1000, int(timeout_sec * 1000))
-            conn.execute(text("SET LOCAL statement_timeout = :timeout_ms"), {"timeout_ms": timeout_ms})
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 120000))
+            # Use set_config() with true for local scope
+            conn.execute(
+                text("SELECT set_config('statement_timeout', :timeout_value, true)"),
+                {"timeout_value": f"{timeout_ms}ms"},
+            )
             rows = conn.execute(
                 text("""
                     SELECT symbol, exchange, strategy, score, meta, 
@@ -1195,9 +1199,11 @@ def load_locked_us_watchlist(
                 timeout_sec,
                 elapsed_ms,
             )
-            return []
+            # Re-raise timeout errors so guard scripts can detect them
+            raise RuntimeError(f"US watchlist load timeout after {timeout_sec}s") from exc
         logger.error("[US_WATCHLIST][LOCK_LOAD][ERROR] %s elapsed_ms=%d", exc, elapsed_ms)
-        return []
+        # Re-raise DB errors so guard scripts can distinguish from empty results
+        raise RuntimeError(f"US watchlist load DB error: {exc}") from exc
 
 
 def load_locked_us_watchlist_strict(
