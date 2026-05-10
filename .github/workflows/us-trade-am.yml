@@ -393,6 +393,7 @@ jobs:
 
       - name: Guard same-day US prep contract
         if: steps.phase_guard.outputs.should_run == '1'
+        timeout-minutes: 2
         working-directory: repo
         env:
           SESSION: am

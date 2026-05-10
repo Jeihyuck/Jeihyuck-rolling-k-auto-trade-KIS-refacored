@@ -10,6 +10,7 @@ Exits with code 1 if guard fails.
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import json
 import os
 import sys
 
@@ -20,64 +21,168 @@ from trader.us.db.repos import (
     load_latest_us_prep_status,
     load_locked_us_watchlist,
 )
+from trader.us.utils.timeout_guard import run_with_timeout
 
+# ── Parse inputs ──────────────────────────────────────────────────────────────
 session = os.getenv("SESSION", "unknown")
 force_now = os.getenv("FORCE_NOW_INPUT", "").strip()
 
+# Determine timeout (priority: US_PREP_GUARD_TIMEOUT_SEC > US_WATCHLIST_LOAD_TIMEOUT_SEC > 20)
+timeout_sec = int(os.getenv("US_PREP_GUARD_TIMEOUT_SEC") or os.getenv("US_WATCHLIST_LOAD_TIMEOUT_SEC") or "20")
+
+# Determine trade date and source
 if force_now:
     trade_date = datetime.fromisoformat(force_now).date().isoformat()
+    trade_date_source = "force_now"
 else:
     trade_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    trade_date_source = "actual_ny_today"
 
-prep = load_latest_us_prep_status(trade_date) or {}
+# ── Print START immediately ───────────────────────────────────────────────────
+print(
+    f"[US_PREP_GUARD][START] session={session} trade_date={trade_date} "
+    f"force_now={force_now or ''} trade_date_source={trade_date_source} timeout_sec={timeout_sec}",
+    flush=True,
+)
+
+# ── Stage 1: Load prep status with timeout ────────────────────────────────────
+print(
+    f"[US_PREP_GUARD][PREP_STATUS][START] trade_date={trade_date} timeout_sec={timeout_sec}",
+    flush=True,
+)
+
+prep_result = run_with_timeout(
+    fn=lambda: load_latest_us_prep_status(trade_date, timeout_sec=timeout_sec),
+    stage="prep_status",
+    timeout_sec=timeout_sec,
+)
+
+if prep_result["timeout"]:
+    print(
+        f"[US_PREP_GUARD][PREP_STATUS][TIMEOUT] trade_date={trade_date} timeout_sec={timeout_sec}",
+        flush=True,
+    )
+    print(
+        f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} reason=prep_status_timeout",
+        flush=True,
+    )
+    sys.exit(1)
+
+if not prep_result["ok"]:
+    print(
+        f"[US_PREP_GUARD][PREP_STATUS][ERROR] trade_date={trade_date} error={prep_result['error']}",
+        flush=True,
+    )
+    print(
+        f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} reason=prep_status_error",
+        flush=True,
+    )
+    sys.exit(1)
+
+prep = prep_result["value"] or {}
 status = prep.get("status", "UNKNOWN")
+print(
+    f"[US_PREP_GUARD][PREP_STATUS][DONE] status={status} elapsed_sec={prep_result['elapsed_sec']:.2f}",
+    flush=True,
+)
 
-# Load watchlist with explicit error handling
-try:
-    rows = load_locked_us_watchlist(
+# ── Stage 2: Load locked watchlist with timeout ───────────────────────────────
+print(
+    f"[US_PREP_GUARD][WATCHLIST][START] trade_date={trade_date} min_count=10 "
+    f"allow_degraded=1 timeout_sec={timeout_sec}",
+    flush=True,
+)
+
+watchlist_result = run_with_timeout(
+    fn=lambda: load_locked_us_watchlist(
         trade_date=trade_date,
         min_count=10,
         allow_degraded=True,
-    )
-    locked_count = len(rows or [])
-    watchlist_load_error = False
-except Exception as exc:
+        timeout_sec=timeout_sec,
+    ),
+    stage="watchlist_load",
+    timeout_sec=timeout_sec,
+)
+
+if watchlist_result["timeout"]:
     print(
-        f"[US_PREP_GUARD][ERROR] session={session} trade_date={trade_date} "
-        f"watchlist_load_error={exc}"
+        f"[US_PREP_GUARD][WATCHLIST][TIMEOUT] trade_date={trade_date} timeout_sec={timeout_sec}",
+        flush=True,
     )
-    locked_count = 0
-    watchlist_load_error = True
+    print(
+        f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} "
+        f"reason=watchlist_load_timeout prep_status={status}",
+        flush=True,
+    )
+    sys.exit(1)
+
+if not watchlist_result["ok"]:
+    print(
+        f"[US_PREP_GUARD][WATCHLIST][ERROR] trade_date={trade_date} error={watchlist_result['error']}",
+        flush=True,
+    )
+    print(
+        f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} reason=watchlist_load_error",
+        flush=True,
+    )
+    sys.exit(1)
+
+rows = watchlist_result["value"] or []
+locked_count = len(rows)
+print(
+    f"[US_PREP_GUARD][WATCHLIST][DONE] count={locked_count} elapsed_sec={watchlist_result['elapsed_sec']:.2f}",
+    flush=True,
+)
+
+# ── Guard checks ──────────────────────────────────────────────────────────────
+watchlist_load_error = False
 
 print(
     f"[US_PREP_GUARD][CHECK] session={session} trade_date={trade_date} "
     f"prep_status={status} locked_count={locked_count} "
-    f"watchlist_load_error={watchlist_load_error}"
+    f"watchlist_load_error={watchlist_load_error}",
+    flush=True,
 )
-
-# Guard logic: fail if DB error OR insufficient locked watchlist OR bad prep status
-if watchlist_load_error:
-    print(
-        f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} "
-        f"reason=watchlist_load_error prep_status={status}"
-    )
-    sys.exit(1)
 
 if status not in ("OK", "OK_WITH_WARNINGS"):
     print(
         f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} "
-        f"reason=bad_prep_status prep_status={status} locked_count={locked_count}"
+        f"reason=bad_prep_status prep_status={status} locked_count={locked_count}",
+        flush=True,
     )
     sys.exit(1)
 
 if locked_count < 10:
     print(
         f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} "
-        f"reason=no_locked_watchlist prep_status={status} locked_count={locked_count}"
+        f"reason=no_locked_watchlist prep_status={status} locked_count={locked_count}",
+        flush=True,
     )
     sys.exit(1)
 
+# ── Success ───────────────────────────────────────────────────────────────────
 print(
     f"[US_PREP_GUARD][OK] session={session} trade_date={trade_date} "
-    f"prep_status={status} locked_count={locked_count}"
+    f"prep_status={status} locked_count={locked_count}",
+    flush=True,
 )
+
+# ── Write result artifact ─────────────────────────────────────────────────────
+artifact_dir = os.getenv("GITHUB_WORKSPACE") and "artifacts" or "."
+os.makedirs(artifact_dir, exist_ok=True)
+result_path = os.path.join(artifact_dir, "us_prep_guard_result.json")
+with open(result_path, "w") as f:
+    json.dump(
+        {
+            "status": "OK",
+            "trade_date": trade_date,
+            "trade_date_source": trade_date_source,
+            "force_now": force_now or None,
+            "prep_status": status,
+            "locked_count": locked_count,
+            "timeout_sec": timeout_sec,
+        },
+        f,
+        indent=2,
+    )
+print(f"[US_PREP_GUARD][ARTIFACT] {result_path}", flush=True)

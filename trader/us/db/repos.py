@@ -796,9 +796,13 @@ def finish_us_prep_run(
         return False
 
 
-def load_latest_us_prep_status(trade_date: str) -> dict:
+def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
     """
     당일 최신 prep run 상태 조회.
+    
+    Args:
+        trade_date: 미국장 거래일
+        timeout_sec: DB query timeout (default: 20s)
     
     Returns:
         {
@@ -816,8 +820,21 @@ def load_latest_us_prep_status(trade_date: str) -> dict:
         logger.warning("[US_PREP_STATUS][LOAD] No DB, returning empty")
         return {}
     
+    load_started = time.monotonic()
+    
     try:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 120000))
+            # Use set_config() with true for local scope
+            conn.execute(
+                text("SELECT set_config('statement_timeout', :timeout_value, true)"),
+                {"timeout_value": f"{timeout_ms}ms"},
+            )
+            logger.info(
+                "[US_DB][STATEMENT_TIMEOUT] op=load_latest_us_prep_status timeout_ms=%d",
+                timeout_ms,
+            )
+            
             row = conn.execute(
                 text("""
                     SELECT run_id, status, trade_date, result, started_at, finished_at
@@ -835,14 +852,26 @@ def load_latest_us_prep_status(trade_date: str) -> dict:
                 return {}
             
             result = dict(row._mapping)
+            elapsed_ms = int((time.monotonic() - load_started) * 1000)
             logger.info(
-                "[US_PREP_STATUS][LOAD] trade_date=%s status=%s run_id=%s",
-                trade_date, result.get("status"), result.get("run_id")
+                "[US_PREP_STATUS][LOAD] trade_date=%s status=%s run_id=%s elapsed_ms=%d",
+                trade_date, result.get("status"), result.get("run_id"), elapsed_ms
             )
             return result
     except Exception as exc:
-        logger.error("[US_PREP_STATUS][LOAD][ERROR] %s", exc)
-        return {}
+        elapsed_ms = int((time.monotonic() - load_started) * 1000)
+        err_msg = str(exc).lower()
+        if "statement timeout" in err_msg:
+            logger.error(
+                "[US_PREP_STATUS][LOAD][TIMEOUT] timeout_sec=%d elapsed_ms=%d",
+                timeout_sec,
+                elapsed_ms,
+            )
+            # Re-raise timeout errors so guard scripts can detect them
+            raise RuntimeError(f"US prep status load timeout after {timeout_sec}s") from exc
+        logger.error("[US_PREP_STATUS][LOAD][ERROR] %s elapsed_ms=%d", exc, elapsed_ms)
+        # Re-raise DB errors so guard scripts can distinguish from empty results
+        raise RuntimeError(f"US prep status load DB error: {exc}") from exc
 
 
 def clear_and_save_locked_us_watchlist(
@@ -1166,6 +1195,10 @@ def load_locked_us_watchlist(
             conn.execute(
                 text("SELECT set_config('statement_timeout', :timeout_value, true)"),
                 {"timeout_value": f"{timeout_ms}ms"},
+            )
+            logger.info(
+                "[US_DB][STATEMENT_TIMEOUT] op=load_locked_us_watchlist timeout_ms=%d",
+                timeout_ms,
             )
             rows = conn.execute(
                 text("""
