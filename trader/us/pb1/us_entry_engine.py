@@ -373,13 +373,13 @@ def generate_entry_intents(
             if not exchange:
                 exchange = resolve_exchange(symbol)
             
-            # current price 조회는 여전히 필요
+            # precomputed score 사용 시 daily는 불필요, current price만 조회
             try:
-                daily = provider.get_daily_prices(symbol, exchange, count=120)
                 current = provider.get_current_price(symbol, exchange)
+                daily = []  # precomputed score 사용 시 daily 불필요
             except Exception as exc:
-                track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})
-                logger.info("[US_ENTRY][SKIP] symbol=%s reason=daily_price_unavailable error=%s", symbol, exc)
+                track_skip(symbol, "current_price_unavailable", {"error": str(exc)})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable error=%s", symbol, exc)
                 continue
         else:
             # precomputed score가 없으면 실시간 계산

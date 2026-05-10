@@ -116,8 +116,8 @@ jobs:
 
       US_SESSION_INTERVAL_SEC: "300"
       US_WATCHLIST_LOAD_TIMEOUT_SEC: "20"
-      US_ENTRY_EVAL_TIMEOUT_SEC: "60"
-      US_TICK_TIMEOUT_SEC: "90"
+      US_ENTRY_EVAL_TIMEOUT_SEC: "120"
+      US_TICK_TIMEOUT_SEC: "150"
 
       DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '0' }}
 
