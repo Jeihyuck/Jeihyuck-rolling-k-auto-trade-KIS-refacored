@@ -244,7 +244,50 @@ def run_trade_tick(
         )
     except Exception as exc:
         logger.warning("[US_RECONCILE][WARN] %s", exc)
-        recon = {"status": "WARN", "error": str(exc)}
+        recon = {"status": "WARN", "error": str(exc), "block_new_entry": False}
+    
+    # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
+    if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
+        last_stage = "reconcile"
+        logger.error(
+            "[US_RECONCILE][BLOCK_NEW_ENTRY] reason=%s status=%s",
+            recon.get("reason", "balance_position_parse_error"),
+            recon.get("status", "CONTRACT_ERROR"),
+        )
+        logger.error(
+            "[US_TICK][DONE] session=%s status=FAILED reason=balance_position_parse_error", session
+        )
+        return {
+            "status": "FAILED",
+            "reason": recon.get("reason", "balance_position_parse_error"),
+            "session": session,
+            "orders": [],
+            "ack": 0,
+            "dry_run": 0,
+            "blocked": 0,
+            "signal_only": 0,
+            "errors": 1,
+            "budget": budget,
+            "run_mode": run_mode,
+            "signal_only_mode": signal_only,
+            "kis_order_allowed": kis_order_allowed,
+            "last_stage": last_stage,
+            "trade_date": trade_date,
+            "prep_status": "UNKNOWN",
+            "locked_watchlist_count": 0,
+            "entry_eval_status": "BLOCKED",
+            "entry_error_type": "balance_position_parse_error",
+            "entry_error_message": recon.get("balance_parse_error", "balance_position_parse_error"),
+            "entry_intents": 0,
+            "orders_sent": 0,
+            "fills": len(fills_today),
+            "positions": recon.get("position_count", 0),
+            "temp_error_count": temp_error_count,
+            "temp_recovered_count": temp_recovered_count,
+        }
+    
+    # Extract position_symbols from reconcile result
+    current_position_symbols = set(recon.get("position_symbols", []))
 
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     fills_today: list[dict] = []
@@ -724,6 +767,7 @@ def run_trade_tick(
                                 position_count,
                                 now,
                                 watchlist_rows,
+                                current_position_symbols,
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
                     except concurrent.futures.TimeoutError:

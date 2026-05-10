@@ -59,6 +59,252 @@ def _make_stub_price(symbol: str) -> dict:
     }
 
 
+def _safe_int(val: Any, default: int = 0) -> int:
+    """숫자/문자열을 안전하게 int로 변환 (콤마, None, 빈 문자열 처리)."""
+    if val is None or val == "" or val == "-":
+        return default
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        cleaned = val.replace(",", "").strip()
+        if not cleaned or cleaned == "-":
+            return default
+        try:
+            return int(float(cleaned))
+        except (ValueError, TypeError):
+            return default
+    return default
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """숫자/문자열을 안전하게 float로 변환 (콤마, None, 빈 문자열 처리)."""
+    if val is None or val == "" or val == "-":
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        cleaned = val.replace(",", "").strip()
+        if not cleaned or cleaned == "-":
+            return default
+        try:
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return default
+    return default
+
+
+def _get_first_valid(row: dict, keys: tuple[str, ...], default: Any = None) -> Any:
+    """row에서 여러 key 후보 중 첫 번째로 존재하는 값을 반환."""
+    for k in keys:
+        if k in row:
+            val = row[k]
+            if val is not None and val != "":
+                return val
+    return default
+
+
+def normalize_us_balance(raw: dict) -> dict:
+    """KIS 해외잔고 응답을 표준 positions 형태로 정규화.
+    
+    참고: 한국장 kis_wrapper._normalize_balance_snapshot 패턴을 미국장에 이식.
+    
+    Args:
+        raw: KIS get_us_balance() raw response
+    
+    Returns:
+        {
+            "positions": [...],
+            "total_pvs": str,
+            "output1": [...],
+            "output2": {...},
+            "raw_balance": {...},
+            "raw_output1_count": int,
+            "normalized_position_count": int,
+            "position_symbols": list[str],
+            "balance_parse_status": "OK"|"ERROR",
+            "balance_parse_error": str|None,
+            "queried_exchanges": list[str],
+            "exchange_result_counts": dict,
+        }
+    """
+    result = {
+        "positions": [],
+        "total_pvs": "0",
+        "output1": [],
+        "output2": {},
+        "raw_balance": raw,
+        "raw_output1_count": 0,
+        "normalized_position_count": 0,
+        "position_symbols": [],
+        "balance_parse_status": "OK",
+        "balance_parse_error": None,
+        "queried_exchanges": raw.get("queried_exchanges", []),
+        "exchange_result_counts": raw.get("exchange_result_counts", {}),
+    }
+    
+    # raw validation
+    if not isinstance(raw, dict):
+        result["balance_parse_status"] = "ERROR"
+        result["balance_parse_error"] = "raw_not_dict"
+        logger.error("[US_BALANCE][PARSE_ERROR] error=raw_not_dict type=%s", type(raw).__name__)
+        return result
+    
+    # rt_cd check
+    rt_cd = raw.get("rt_cd")
+    if rt_cd is not None and str(rt_cd) != "0":
+        result["balance_parse_status"] = "ERROR"
+        result["balance_parse_error"] = f"rt_cd_not_zero rt_cd={rt_cd}"
+        logger.error("[US_BALANCE][PARSE_ERROR] error=rt_cd_not_zero rt_cd=%s", rt_cd)
+        return result
+    
+    # output1 normalize
+    output1 = raw.get("output1")
+    if output1 is None:
+        output1 = []
+    elif isinstance(output1, dict):
+        output1 = [output1]
+    elif not isinstance(output1, list):
+        output1 = []
+    
+    # output2 normalize
+    output2 = raw.get("output2")
+    if output2 is None:
+        output2 = {}
+    elif isinstance(output2, list):
+        output2 = output2[0] if output2 and isinstance(output2[0], dict) else {}
+    elif not isinstance(output2, dict):
+        output2 = {}
+    
+    result["output1"] = output1
+    result["output2"] = output2
+    result["raw_output1_count"] = len(output1)
+    
+    # Log raw structure
+    logger.info(
+        "[US_BALANCE][RAW] output1_count=%d output2_type=%s keys=%s",
+        len(output1),
+        type(output2).__name__,
+        sorted(output2.keys()) if isinstance(output2, dict) else [],
+    )
+    
+    # output2에서 total_pvs 추출
+    total_pvs_candidates = (
+        "tot_evlu_pfls_amt", "ovrs_tot_pfls", "tot_pfls_amt",
+        "frcr_evlu_amt2", "tot_asst_amt", "total_pvs",
+    )
+    total_pvs_val = _get_first_valid(output2, total_pvs_candidates, "0")
+    result["total_pvs"] = str(total_pvs_val)
+    
+    # output1 → positions 변환
+    positions = []
+    for row in output1:
+        if not isinstance(row, dict):
+            continue
+        
+        # symbol
+        symbol_candidates = ("ovrs_pdno", "pdno", "PDNO", "symbol", "item_cd", "prdt_code")
+        symbol = _get_first_valid(row, symbol_candidates)
+        if not symbol:
+            continue
+        symbol = str(symbol).strip().upper()
+        if not symbol:
+            continue
+        
+        # name
+        name_candidates = ("ovrs_item_name", "prdt_name", "item_name", "hts_kor_isnm", "name")
+        name = _get_first_valid(row, name_candidates, symbol)
+        
+        # exchange
+        exchange_candidates = ("ovrs_excg_cd", "tr_mket_name", "exchange", "excd")
+        exchange = _get_first_valid(row, exchange_candidates, "NASD")
+        
+        # qty
+        qty_candidates = ("ovrs_cblc_qty", "cblc_qty", "hldg_qty", "qty", "ord_psbl_qty")
+        qty_raw = _get_first_valid(row, qty_candidates, "0")
+        qty = _safe_int(qty_raw, 0)
+        
+        # qty <= 0 제외
+        if qty <= 0:
+            continue
+        
+        # orderable_qty
+        orderable_qty_candidates = ("ord_psbl_qty", "sll_psbl_qty", "orderable_qty", "ovrs_cblc_qty")
+        orderable_qty_raw = _get_first_valid(row, orderable_qty_candidates, str(qty))
+        orderable_qty = _safe_int(orderable_qty_raw, qty)
+        
+        # avg_price_usd
+        avg_price_candidates = ("pchs_avg_pric", "pchs_avg_price", "avg_price", "avg_price_usd")
+        avg_price_raw = _get_first_valid(row, avg_price_candidates, "0")
+        avg_price_usd = _safe_float(avg_price_raw, 0.0)
+        
+        # current_price_usd
+        current_price_candidates = ("now_pric2", "ovrs_now_pric", "bass_pric", "last", "current_price")
+        current_price_raw = _get_first_valid(row, current_price_candidates, "0")
+        current_price_usd = _safe_float(current_price_raw, 0.0)
+        
+        # market_value_usd
+        market_value_candidates = ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt", "market_value_usd")
+        market_value_raw = _get_first_valid(row, market_value_candidates, "0")
+        market_value_usd = _safe_float(market_value_raw, 0.0)
+        
+        # buy_amount_usd
+        buy_amount_candidates = ("frcr_pchs_amt1", "pchs_amt", "buy_amount_usd")
+        buy_amount_raw = _get_first_valid(row, buy_amount_candidates, "0")
+        buy_amount_usd = _safe_float(buy_amount_raw, 0.0)
+        
+        # pnl_usd
+        pnl_candidates = ("frcr_evlu_pfls_amt", "evlu_pfls_amt", "ovrs_stck_evlu_pfls_amt", "pnl_usd")
+        pnl_raw = _get_first_valid(row, pnl_candidates, "0")
+        pnl_usd = _safe_float(pnl_raw, 0.0)
+        
+        # pnl_rate
+        pnl_rate_candidates = ("evlu_pfls_rt", "pnl_rate", "prls_rt")
+        pnl_rate_raw = _get_first_valid(row, pnl_rate_candidates, "0")
+        pnl_rate = _safe_float(pnl_rate_raw, 0.0)
+        
+        positions.append({
+            "symbol": symbol,
+            "name": str(name),
+            "exchange": str(exchange),
+            "qty": qty,
+            "orderable_qty": orderable_qty,
+            "avg_price_usd": avg_price_usd,
+            "current_price_usd": current_price_usd,
+            "market_value_usd": market_value_usd,
+            "buy_amount_usd": buy_amount_usd,
+            "pnl_usd": pnl_usd,
+            "pnl_rate": pnl_rate,
+            "raw": row,
+        })
+    
+    result["positions"] = positions
+    result["normalized_position_count"] = len(positions)
+    result["position_symbols"] = [p["symbol"] for p in positions]
+    
+    # Log normalized result
+    if positions:
+        logger.info(
+            "[US_BALANCE][NORMALIZED] positions=%d symbols=%s",
+            len(positions),
+            ",".join(result["position_symbols"]),
+        )
+    else:
+        logger.info("[US_BALANCE][NORMALIZED] positions=0")
+    
+    # Contract error: raw_output1_count > 0 but normalized_position_count == 0
+    if result["raw_output1_count"] > 0 and result["normalized_position_count"] == 0:
+        result["balance_parse_status"] = "CONTRACT_ERROR"
+        result["balance_parse_error"] = "raw_output1_nonzero_positions_zero"
+        logger.error(
+            "[US_BALANCE][CONTRACT_ERROR] raw_output1_count=%d normalized_position_count=0",
+            result["raw_output1_count"],
+        )
+    
+    return result
+
+
 class USDataProvider:
     """미국주식 데이터 제공자.
 
@@ -318,9 +564,19 @@ class USDataProvider:
                 "frcr_pchs_amt1": "5000.00",
                 "ovrs_tot_pfls": "500.00",
                 "positions": [],
+                "output1": [],
+                "output2": {},
+                "raw_balance": {},
+                "raw_output1_count": 0,
+                "normalized_position_count": 0,
+                "position_symbols": [],
+                "balance_parse_status": "OK",
+                "balance_parse_error": None,
+                "queried_exchanges": [],
+                "exchange_result_counts": {},
             }
         raw = self._get_client().get_us_balance()
-        return raw
+        return normalize_us_balance(raw)
 
     def get_orderable_cash(
         self,

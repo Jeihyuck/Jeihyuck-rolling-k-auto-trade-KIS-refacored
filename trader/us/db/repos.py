@@ -440,6 +440,45 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     return count
 
 
+def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> list[dict]:
+    """당일 DB fills 조회 (signal-only / DB-only 모드용).
+    
+    Args:
+        trade_date: YYYY-MM-DD 형식 거래일 (None이면 오늘)
+        market: "US" (호환성 유지용 파라미터)
+    
+    Returns:
+        fills list (DB 없거나 조회 실패 시 빈 리스트)
+    """
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    
+    if engine is None:
+        # In-memory fallback (test/offline 환경)
+        result = [f for f in _MEM_FILLS if f.get("trade_date") == td]
+        logger.info("[US_FILLS][DB_ONLY][OK] count=%d (in-memory) trade_date=%s", len(result), td)
+        return result
+    
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT trade_date, symbol, exchange, side, qty, price_usd,
+                           order_no, client_order_key, filled_at, meta
+                    FROM us_fills
+                    WHERE trade_date=:td
+                    ORDER BY filled_at DESC
+                """),
+                {"td": td},
+            )
+            fills = [dict(r._mapping) for r in rows]
+            logger.info("[US_FILLS][DB_ONLY][OK] count=%d trade_date=%s", len(fills), td)
+            return fills
+    except Exception as exc:
+        logger.warning("[US_FILLS][DB_ONLY][WARN] reason=db_unavailable error=%s returning_empty=1", exc)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Positions — schema: as_of, symbol, exchange, qty, avg_cost, current_px,
 #                      unrealized_pnl_usd, meta

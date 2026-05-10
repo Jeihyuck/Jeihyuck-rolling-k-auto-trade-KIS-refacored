@@ -53,6 +53,7 @@ class USPb1Engine:
         position_count: int,
         now: datetime | None = None,
         watchlist_entries: list[dict] | None = None,
+        current_position_symbols: set[str] | None = None,
     ) -> list[dict]:
         """진입 후보 평가.
 
@@ -64,6 +65,7 @@ class USPb1Engine:
             position_count: 현재 보유 포지션 수
             now: 현재 시각
             watchlist_entries: locked watchlist rows (authoritative input)
+            current_position_symbols: KIS balance 기반 보유 종목 집합
 
         Returns:
             진입 order intent 목록
@@ -100,4 +102,5 @@ class USPb1Engine:
             capital_usd_cap=capital_usd_cap,
             now=now,
             watchlist_entries=watchlist_entries,
+            current_position_symbols=current_position_symbols,
         )

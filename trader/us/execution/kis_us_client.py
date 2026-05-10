@@ -163,19 +163,266 @@ class KisUSClient:
     # ------------------------------------------------------------------
 
     def get_us_balance(self) -> dict:
-        """해외주식 잔고 조회."""
+        """해외주식 잔고 조회 (다중 거래소).
+        
+        기본적으로 NASD, NYSE, AMEX 3개 거래소를 조회하여 병합.
+        환경변수 US_BALANCE_EXCHANGES로 커스터마이징 가능.
+        
+        Returns:
+            {
+                "rt_cd": "0",
+                "output1": merged_output1_list,
+                "output2": merged_summary_dict,
+                "queried_exchanges": ["NASD", "NYSE", "AMEX"],
+                "exchange_result_counts": {"NASD": 4, "NYSE": 1, "AMEX": 0},
+                "raw_by_exchange": {...}
+            }
+        """
         self._assert_not_offline("get_us_balance")
+        
+        exchanges_env = os.getenv("US_BALANCE_EXCHANGES", "NASD,NYSE,AMEX")
+        exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
+        if not exchanges:
+            exchanges = ["NASD", "NYSE", "AMEX"]
+        
+        logger.info("[US_BALANCE] querying exchanges=%s", exchanges)
+        
+        merged_output1: list[dict] = []
+        exchange_result_counts: dict[str, int] = {}
+        raw_by_exchange: dict[str, Any] = {}
+        merged_output2: dict = {}
+        
+        for exchange_code in exchanges:
+            try:
+                exchange_data = self._get_us_balance_single_exchange(exchange_code)
+                raw_by_exchange[exchange_code] = exchange_data
+                
+                # output1 병합
+                ex_output1 = exchange_data.get("output1", [])
+                if isinstance(ex_output1, dict):
+                    ex_output1 = [ex_output1]
+                elif not isinstance(ex_output1, list):
+                    ex_output1 = []
+                
+                # 각 row에 exchange 태깅
+                for row in ex_output1:
+                    if isinstance(row, dict):
+                        if "ovrs_excg_cd" not in row:
+                            row["ovrs_excg_cd"] = exchange_code
+                        merged_output1.append(row)
+                
+                exchange_result_counts[exchange_code] = len(ex_output1)
+                
+                # output2 병합 (첫 번째 유효한 것 사용)
+                if not merged_output2:
+                    ex_output2 = exchange_data.get("output2")
+                    if isinstance(ex_output2, list) and ex_output2:
+                        merged_output2 = ex_output2[0] if isinstance(ex_output2[0], dict) else {}
+                    elif isinstance(ex_output2, dict):
+                        merged_output2 = ex_output2
+                
+                logger.info(
+                    "[US_BALANCE][EXCHANGE][DONE] exchange=%s count=%d",
+                    exchange_code,
+                    len(ex_output1),
+                )
+            
+            except Exception as exc:
+                logger.warning(
+                    "[US_BALANCE][EXCHANGE][ERROR] exchange=%s error=%s",
+                    exchange_code,
+                    exc,
+                )
+                exchange_result_counts[exchange_code] = 0
+                # 일부 거래소 실패 시 계속 진행 (다른 거래소 결과가 있으면 OK)
+                continue
+        
+        # symbol 중복 병합
+        merged_output1 = self._merge_duplicate_symbols(merged_output1)
+        
+        total_count = sum(exchange_result_counts.values())
+        logger.info(
+            "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d symbols=%s",
+            total_count,
+            len(merged_output1),
+            ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
+        )
+        
+        return {
+            "rt_cd": "0",
+            "output1": merged_output1,
+            "output2": merged_output2,
+            "queried_exchanges": exchanges,
+            "exchange_result_counts": exchange_result_counts,
+            "raw_by_exchange": raw_by_exchange,
+        }
+    
+    def _get_us_balance_single_exchange(
+        self,
+        exchange_code: str,
+        max_pages: int = 10,
+    ) -> dict:
+        """단일 거래소에 대한 잔고 조회 (pagination 처리).
+        
+        Args:
+            exchange_code: "NASD", "NYSE", "AMEX" 등
+            max_pages: 최대 페이지네이션 수
+        
+        Returns:
+            KIS raw response (output1 list, output2 dict/list)
+        """
         tr = get_tr_info("us_balance")
         headers = self._build_headers(tr["tr_id"])
-        params = {
-            "CANO": self._cano,
-            "ACNT_PRDT_CD": self._acnt_prdt_cd,
-            "OVRS_EXCG_CD": "NASD",
-            "TR_CRCY_CD": "USD",
-            "CTX_AREA_FK200": "",
-            "CTX_AREA_NK200": "",
+        
+        logger.info("[US_BALANCE][EXCHANGE][START] exchange=%s", exchange_code)
+        
+        all_output1: list[dict] = []
+        output2: Any = None
+        ctx_fk = ""
+        ctx_nk = ""
+        
+        for page in range(1, max_pages + 1):
+            params = {
+                "CANO": self._cano,
+                "ACNT_PRDT_CD": self._acnt_prdt_cd,
+                "OVRS_EXCG_CD": exchange_code,
+                "TR_CRCY_CD": "USD",
+                "CTX_AREA_FK200": ctx_fk,
+                "CTX_AREA_NK200": ctx_nk,
+            }
+            
+            try:
+                result = self._get(tr["path"], headers=headers, params=params)
+            except Exception as exc:
+                logger.warning(
+                    "[US_BALANCE][EXCHANGE][PAGE_ERROR] exchange=%s page=%d error=%s",
+                    exchange_code,
+                    page,
+                    exc,
+                )
+                # 첫 페이지 실패 시 빈 결과 반환
+                if page == 1:
+                    return {"rt_cd": "0", "output1": [], "output2": {}}
+                else:
+                    # 2페이지 이상 실패 시 지금까지 수집한 데이터 반환
+                    break
+            
+            # output1
+            page_output1 = result.get("output1", [])
+            if isinstance(page_output1, dict):
+                page_output1 = [page_output1]
+            elif not isinstance(page_output1, list):
+                page_output1 = []
+            
+            all_output1.extend(page_output1)
+            
+            # output2 (첫 페이지만)
+            if output2 is None:
+                output2 = result.get("output2")
+            
+            # pagination cursor 체크
+            next_fk = result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or ""
+            next_nk = result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or ""
+            
+            # next cursor가 없거나 동일하면 종료
+            if not next_fk and not next_nk:
+                break
+            if next_fk == ctx_fk and next_nk == ctx_nk:
+                break
+            
+            ctx_fk = next_fk
+            ctx_nk = next_nk
+            
+            logger.debug(
+                "[US_BALANCE][EXCHANGE][PAGE] exchange=%s page=%d count=%d next_fk=%s next_nk=%s",
+                exchange_code,
+                page,
+                len(page_output1),
+                bool(next_fk),
+                bool(next_nk),
+            )
+        
+        return {
+            "rt_cd": "0",
+            "output1": all_output1,
+            "output2": output2,
         }
-        return self._get(tr["path"], headers=headers, params=params)
+    
+    def _merge_duplicate_symbols(self, rows: list[dict]) -> list[dict]:
+        """symbol 중복 병합 (qty, market_value, buy_amount 합산).
+        
+        Args:
+            rows: output1 row list
+        
+        Returns:
+            중복 제거된 row list
+        """
+        if not rows:
+            return []
+        
+        symbol_map: dict[str, dict] = {}
+        
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            
+            # symbol 추출
+            symbol = row.get("ovrs_pdno") or row.get("pdno") or row.get("PDNO") or ""
+            symbol = str(symbol).strip().upper()
+            if not symbol:
+                continue
+            
+            if symbol not in symbol_map:
+                symbol_map[symbol] = dict(row)
+            else:
+                # 병합: qty, market_value, buy_amount 합산
+                existing = symbol_map[symbol]
+                
+                # qty 합산
+                qty_keys = ("ovrs_cblc_qty", "cblc_qty", "hldg_qty", "qty")
+                for k in qty_keys:
+                    if k in existing and k in row:
+                        existing[k] = str(int(self._safe_numeric(existing[k], 0)) + int(self._safe_numeric(row[k], 0)))
+                        break
+                
+                # market_value 합산
+                mv_keys = ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt")
+                for k in mv_keys:
+                    if k in existing and k in row:
+                        existing[k] = str(float(self._safe_numeric(existing[k], 0.0)) + float(self._safe_numeric(row[k], 0.0)))
+                        break
+                
+                # buy_amount 합산
+                ba_keys = ("frcr_pchs_amt1", "pchs_amt")
+                for k in ba_keys:
+                    if k in existing and k in row:
+                        existing[k] = str(float(self._safe_numeric(existing[k], 0.0)) + float(self._safe_numeric(row[k], 0.0)))
+                        break
+                
+                # pnl 합산
+                pnl_keys = ("frcr_evlu_pfls_amt", "evlu_pfls_amt", "ovrs_stck_evlu_pfls_amt")
+                for k in pnl_keys:
+                    if k in existing and k in row:
+                        existing[k] = str(float(self._safe_numeric(existing[k], 0.0)) + float(self._safe_numeric(row[k], 0.0)))
+                        break
+        
+        return list(symbol_map.values())
+    
+    def _safe_numeric(self, val: Any, default: float = 0.0) -> float:
+        """숫자 변환 (safe)."""
+        if val is None or val == "" or val == "-":
+            return default
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            cleaned = val.replace(",", "").strip()
+            if not cleaned or cleaned == "-":
+                return default
+            try:
+                return float(cleaned)
+            except (ValueError, TypeError):
+                return default
+        return default
 
     def get_us_orderable_cash(
         self,

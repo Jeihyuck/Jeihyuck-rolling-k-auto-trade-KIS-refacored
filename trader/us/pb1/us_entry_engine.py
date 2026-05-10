@@ -210,6 +210,7 @@ def generate_entry_intents(
     now: datetime | None = None,
     max_new_entries: int | None = None,
     watchlist_entries: list[dict] | None = None,
+    current_position_symbols: set[str] | None = None,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -223,6 +224,7 @@ def generate_entry_intents(
         now: 현재 시각 (None이면 실시간)
         max_new_entries: tick당 최대 신규 진입 수
         watchlist_entries: locked watchlist rows (authoritative input)
+        current_position_symbols: KIS balance에서 얻은 현재 보유 종목 집합
 
     Returns:
         list of order intent dict
@@ -286,6 +288,12 @@ def generate_entry_intents(
         if symbol in sold_today:
             track_skip(symbol, "sold_today")
             logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
+            continue
+        
+        # KIS balance 기반 보유종목 차단 (우선순위 높음)
+        if current_position_symbols and symbol in current_position_symbols:
+            track_skip(symbol, "has_kis_position")
+            logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_kis_position", symbol)
             continue
 
         # DB: 미체결 주문 차단
