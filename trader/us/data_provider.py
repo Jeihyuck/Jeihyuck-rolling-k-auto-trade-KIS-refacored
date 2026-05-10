@@ -189,14 +189,6 @@ def normalize_us_balance(raw: dict) -> dict:
         sorted(output2.keys()) if isinstance(output2, dict) else [],
     )
     
-    # output2에서 total_pvs 추출
-    total_pvs_candidates = (
-        "tot_evlu_pfls_amt", "ovrs_tot_pfls", "tot_pfls_amt",
-        "frcr_evlu_amt2", "tot_asst_amt", "total_pvs",
-    )
-    total_pvs_val = _get_first_valid(output2, total_pvs_candidates, "0")
-    result["total_pvs"] = str(total_pvs_val)
-    
     # output1 → positions 변환
     positions = []
     for row in output1:
@@ -216,9 +208,21 @@ def normalize_us_balance(raw: dict) -> dict:
         name_candidates = ("ovrs_item_name", "prdt_name", "item_name", "hts_kor_isnm", "name")
         name = _get_first_valid(row, name_candidates, symbol)
         
-        # exchange
+        # exchange (raw → normalized)
         exchange_candidates = ("ovrs_excg_cd", "tr_mket_name", "exchange", "excd")
-        exchange = _get_first_valid(row, exchange_candidates, "NASD")
+        raw_exchange = _get_first_valid(row, exchange_candidates, "NASD")
+        raw_exchange_str = str(raw_exchange)
+        
+        # Normalize exchange to standard format (NASD → NASDAQ, etc.)
+        from trader.us.symbols import normalize_us_exchange
+        try:
+            exchange = normalize_us_exchange(raw_exchange_str)
+        except ValueError as exc:
+            logger.warning(
+                "[US_BALANCE][EXCHANGE_NORMALIZE_FAILED] symbol=%s raw_exchange=%s error=%s, defaulting to NASDAQ",
+                symbol, raw_exchange_str, exc
+            )
+            exchange = "NASDAQ"
         
         # qty
         qty_candidates = ("ovrs_cblc_qty", "cblc_qty", "hldg_qty", "qty", "ord_psbl_qty")
@@ -267,7 +271,8 @@ def normalize_us_balance(raw: dict) -> dict:
         positions.append({
             "symbol": symbol,
             "name": str(name),
-            "exchange": str(exchange),
+            "exchange": exchange,  # Normalized (NASDAQ, NYSE, AMEX)
+            "raw_exchange": raw_exchange_str,  # Preserve original KIS code
             "qty": qty,
             "orderable_qty": orderable_qty,
             "avg_price_usd": avg_price_usd,
@@ -278,6 +283,41 @@ def normalize_us_balance(raw: dict) -> dict:
             "pnl_rate": pnl_rate,
             "raw": row,
         })
+
+    # output2에서 total_pvs 및 pnl 추출
+    # total_pvs = 총 평가금액 (evaluation amount, not pnl)
+    # pnl_usd = 손익 (separate field)
+    total_eval_candidates = (
+        "frcr_evlu_amt2",       # 외화평가금액2 (평가금액)
+        "ovrs_tot_pfls",        # 해외총평가 (may be pnl - check)
+        "tot_evlu_pfls_amt",    # 총평가손익금액 (pnl)
+        "tot_asst_amt",         # 총자산금액
+    )
+    total_eval_val = _get_first_valid(output2, total_eval_candidates, None)
+    
+    # total_pvs가 없으면 positions의 market_value_usd 합계로 계산
+    if total_eval_val is None or _safe_float(total_eval_val, 0.0) == 0:
+        if positions:
+            total_pvs_calculated = sum(p["market_value_usd"] for p in positions)
+            logger.info(
+                "[US_BALANCE][TOTAL_PVS_CALCULATED] positions=%d total_pvs=%.2f (from position sum)",
+                len(positions), total_pvs_calculated
+            )
+            result["total_pvs"] = str(total_pvs_calculated)
+        else:
+            result["total_pvs"] = "0"
+    else:
+        total_pvs = _safe_float(total_eval_val, 0.0)
+        result["total_pvs"] = str(total_pvs)
+    
+    # pnl_usd 별도 추출
+    pnl_candidates = (
+        "tot_evlu_pfls_amt",    # 총평가손익금액
+        "frcr_evlu_pfls_amt",   # 외화평가손익금액
+        "tot_pfls_amt",         # 총손익금액
+    )
+    pnl_val = _get_first_valid(output2, pnl_candidates, "0")
+    result["pnl_usd"] = str(_safe_float(pnl_val, 0.0))
     
     result["positions"] = positions
     result["normalized_position_count"] = len(positions)

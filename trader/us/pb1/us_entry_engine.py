@@ -250,6 +250,13 @@ def generate_entry_intents(
     
     # entries를 symbol → entry dict로 변환 (빠른 조회용)
     entries_map = {e["symbol"]: e for e in entries} if entries else {}
+    
+    # Price lookup 최적화 설정
+    price_lookup_buffer = int(os.getenv("US_ENTRY_PRICE_LOOKUP_BUFFER", "5"))
+    lookup_limit = max_new_entries + price_lookup_buffer
+    
+    # Precomputed score가 있는지 확인 (watchlist가 locked되어 있는 경우)
+    has_precomputed_scores = bool(entries_map)
 
     # Skip reason tracking for observability
     skip_reasons: dict[str, int] = {}
@@ -263,8 +270,12 @@ def generate_entry_intents(
             skip_detail.update(details)
         skip_details.append(skip_detail)
 
-    scored: list[tuple[float, str, str, float, list[dict], dict]] = []
+    # =========================================================================
+    # Phase 1: Filter + Score Validation (NO price lookup yet if precomputed)
+    # =========================================================================
+    candidates: list[tuple[float, str, str]] = []  # (score, symbol, exchange)
     seen_symbols: set[str] = set()  # 중복 symbol 차단용
+    held_skipped = 0  # 보유종목으로 스킵된 수
 
     for symbol in symbols:
         # symbol이 str인지 확인
@@ -292,6 +303,7 @@ def generate_entry_intents(
         
         # KIS balance 기반 보유종목 차단 (우선순위 높음)
         if current_position_symbols and symbol in current_position_symbols:
+            held_skipped += 1
             track_skip(symbol, "has_kis_position")
             logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_kis_position", symbol)
             continue
@@ -305,13 +317,14 @@ def generate_entry_intents(
                 continue
             # DB: 이미 보유 중이면 차단
             if has_position(symbol):
+                held_skipped += 1
                 track_skip(symbol, "has_position")
                 logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_position", symbol)
                 continue
         except Exception as exc:
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
 
-        # entries_map에 있으면 precomputed score 사용 (with alias recovery)
+        # entries_map에 있으면 precomputed score 사용
         entry_meta = entries_map.get(symbol)
         if entry_meta:
             # Canonicalization import
@@ -331,7 +344,7 @@ def generate_entry_intents(
             s, score_source = extract_us_score(canonical_entry, "final", return_source=True)
             
             # Log precomputed score BEFORE validation
-            logger.info(
+            logger.debug(
                 "[US_ENTRY][PRECOMPUTED_SCORE] symbol=%s score=%.6f source=%s",
                 symbol, s if s is not None else 0.0, score_source
             )
@@ -381,16 +394,11 @@ def generate_entry_intents(
             if not exchange:
                 exchange = resolve_exchange(symbol)
             
-            # precomputed score 사용 시 daily는 불필요, current price만 조회
-            try:
-                current = provider.get_current_price(symbol, exchange)
-                daily = []  # precomputed score 사용 시 daily 불필요
-            except Exception as exc:
-                track_skip(symbol, "current_price_unavailable", {"error": str(exc)})
-                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable error=%s", symbol, exc)
-                continue
+            # Phase 1: NO price lookup yet (if precomputed score exists)
+            candidates.append((s, symbol, exchange, None))  # price=None
+            
         else:
-            # precomputed score가 없으면 실시간 계산
+            # precomputed score가 없으면 실시간 계산 필요 (기존 로직 유지)
             try:
                 exchange = resolve_exchange(symbol)
                 daily = provider.get_daily_prices(symbol, exchange, count=120)
@@ -417,38 +425,89 @@ def generate_entry_intents(
                 logger.info("[US_ENTRY][SKIP] symbol=%s reason=score_zero_or_negative score=%.6f", symbol, s)
                 continue
 
-        try:
-            price = float(current.get("last", 0))
-        except (ValueError, TypeError):
-            track_skip(symbol, "current_price_unavailable")
-            logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable", symbol)
-            continue
+            try:
+                price = float(current.get("last", 0))
+            except (ValueError, TypeError):
+                track_skip(symbol, "current_price_unavailable")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable", symbol)
+                continue
 
-        if price <= 0:
-            track_skip(symbol, "current_price_invalid", {"price": price})
-            logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_invalid price=%.2f", symbol, price)
-            continue
-
-        scored.append((s, symbol, exchange, price, daily, current))
-
-    # rank 기반 정렬 (점수 내림차순)
-    scored.sort(key=lambda x: x[0], reverse=True)
+            if price <= 0:
+                track_skip(symbol, "current_price_invalid", {"price": price})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_invalid price=%.2f", symbol, price)
+                continue
+            
+            # 실시간 계산된 경우 price를 이미 갖고 있으므로 candidates에 추가
+            candidates.append((s, symbol, exchange, price))
+    
+    # =========================================================================
+    # Phase 2: Sort by score, then price lookup for top N
+    # =========================================================================
+    # Sort candidates by score (descending)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    # Price lookup plan logging
+    total_candidates = len(candidates)
+    candidates_needing_price = sum(1 for c in candidates if c[3] is None)
+    actual_lookup_count = min(candidates_needing_price, lookup_limit) if has_precomputed_scores else candidates_needing_price
+    
+    logger.info(
+        "[US_ENTRY][PRICE_LOOKUP_PLAN] total=%d held_skipped=%d lookup_limit=%d actual_lookup=%d",
+        len(symbols), held_skipped, lookup_limit, actual_lookup_count
+    )
     
     # Entry engine 내부 dedupe 요약
     input_symbols_count = len(symbols)
     unique_symbols_count = len(seen_symbols)
     skipped_duplicates = input_symbols_count - unique_symbols_count
     logger.info(
-        "[US_ENTRY][DEDUP] input_rows=%d unique_symbols=%d skipped_duplicates=%d scored=%d",
-        input_symbols_count, unique_symbols_count, skipped_duplicates, len(scored)
+        "[US_ENTRY][DEDUP] input_rows=%d unique_symbols=%d skipped_duplicates=%d candidates=%d",
+        input_symbols_count, unique_symbols_count, skipped_duplicates, len(candidates)
     )
 
     intents: list[dict] = []
     added_count = 0
-
-    for rank, (score, symbol, exchange, price, daily, current) in enumerate(scored):
+    price_lookup_count = 0  # 실제 price lookup 횟수 추적
+    
+    # Price lookup 및 intent 생성 (상위 lookup_limit개만)
+    for rank, (score, symbol, exchange, existing_price) in enumerate(candidates):
+        # 이미 max_new_entries 만큼 추가했으면 종료
         if added_count >= max_new_entries:
             break
+
+        # Price lookup (필요한 경우)
+        if existing_price is None:
+            # Optimization: 상위 lookup_limit개만 price lookup (precomputed score가 있는 경우)
+            if has_precomputed_scores and price_lookup_count >= lookup_limit:
+                logger.debug(
+                    "[US_ENTRY][SKIP] symbol=%s rank=%d reason=beyond_lookup_limit limit=%d",
+                    symbol, rank + 1, lookup_limit
+                )
+                track_skip(symbol, "beyond_lookup_limit", {"rank": rank + 1, "limit": lookup_limit})
+                continue  # 다음 candidate로 (break 아님 - 이미 price 있는 것은 처리)
+
+            price_lookup_count += 1
+            try:
+                current = provider.get_current_price(symbol, exchange)
+            except Exception as exc:
+                track_skip(symbol, "current_price_unavailable", {"error": str(exc)})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable error=%s", symbol, exc)
+                continue
+
+            try:
+                price = float(current.get("last", 0))
+            except (ValueError, TypeError):
+                track_skip(symbol, "current_price_unavailable")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_unavailable", symbol)
+                continue
+
+            if price <= 0:
+                track_skip(symbol, "current_price_invalid", {"price": price})
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=current_price_invalid price=%.2f", symbol, price)
+                continue
+        else:
+            # 이미 price가 있음 (runtime calculation)
+            price = existing_price
 
         sizing = calc_position_size(
             price=price,
@@ -502,7 +561,7 @@ def generate_entry_intents(
     # Skip Summary for Observability
     # ─────────────────────────────────────────────────────────────────────────
     total_processed = len(symbols)
-    scored_count = len(scored)
+    scored_count = len(candidates)  # candidates = successfully scored symbols
     
     summary_parts = [
         f"total={total_processed}",

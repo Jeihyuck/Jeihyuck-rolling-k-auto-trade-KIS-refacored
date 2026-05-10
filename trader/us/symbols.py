@@ -63,6 +63,57 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
 
 _VALID_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
 
+# 미국장 거래소 정규화 매핑
+# KIS API output에서 반환되는 다양한 변형을 표준 exchange로 변환
+_US_EXCHANGE_NORMALIZE_MAP: dict[str, str] = {
+    # NASDAQ variants
+    "NASD": "NASDAQ",
+    "NAS": "NASDAQ",
+    "NASDAQ": "NASDAQ",
+    # NYSE variants
+    "NYS": "NYSE",
+    "NYSE": "NYSE",
+    # AMEX variants
+    "AMS": "AMEX",
+    "ASE": "AMEX",
+    "AMEX": "AMEX",
+}
+
+
+def normalize_us_exchange(exchange: str) -> str:
+    """미국장 거래소 코드를 표준화.
+    
+    KIS API에서 반환되는 다양한 exchange code를 표준값으로 정규화합니다:
+    - NASD, NAS → NASDAQ
+    - NYS → NYSE
+    - AMS, ASE → AMEX
+    
+    Args:
+        exchange: KIS API에서 반환된 거래소 코드
+        
+    Returns:
+        표준화된 거래소 코드 (NASDAQ, NYSE, AMEX)
+        
+    Raises:
+        ValueError: 인식되지 않는 거래소 코드
+        
+    Examples:
+        >>> normalize_us_exchange("NASD")
+        "NASDAQ"
+        >>> normalize_us_exchange("NYS")
+        "NYSE"
+    """
+    if not exchange or not isinstance(exchange, str):
+        raise ValueError(f"normalize_us_exchange: invalid exchange={exchange!r}")
+    
+    normalized = exchange.strip().upper()
+    
+    result = _US_EXCHANGE_NORMALIZE_MAP.get(normalized)
+    if result is None:
+        raise ValueError(f"normalize_us_exchange: unknown exchange={normalized!r}")
+    
+    return result
+
 
 def normalize_symbol(symbol: str) -> str:
     """ticker를 대문자로 정규화. 빈 값/비정상 입력은 ValueError."""

@@ -184,6 +184,8 @@ def generate_exit_intents(
     Returns:
         청산 intent 목록
     """
+    from trader.us.symbols import normalize_us_exchange
+    
     intents: list[dict] = []
 
     if not positions:
@@ -191,13 +193,23 @@ def generate_exit_intents(
 
     for pos in positions:
         symbol = pos.get("symbol", "")
-        exchange = pos.get("exchange", "NASDAQ")
+        raw_exchange = pos.get("exchange", "NASDAQ")
+        
+        # Normalize exchange for price lookup (NASD → NASDAQ, etc.)
+        try:
+            exchange = normalize_us_exchange(raw_exchange)
+        except ValueError as exc:
+            logger.warning(
+                "[US_EXIT][EXCHANGE_NORMALIZE_FAILED] symbol=%s raw_exchange=%s error=%s, defaulting to NASDAQ",
+                symbol, raw_exchange, exc
+            )
+            exchange = "NASDAQ"
 
         try:
             price_data = provider.get_current_price(symbol, exchange)
             current_price = float(price_data.get("last", 0))
         except Exception as exc:
-            logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s error=%s", symbol, exc)
+            logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
             continue
 
         if current_price <= 0:
