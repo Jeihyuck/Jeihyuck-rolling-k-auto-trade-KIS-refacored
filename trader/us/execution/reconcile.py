@@ -50,6 +50,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
     # Extract fields from normalized balance
     positions = balance.get("positions", [])
     total_pvs = balance.get("total_pvs", "0")
+    total_pvs_source = balance.get("total_pvs_source", "unknown")
     raw_output1_count = balance.get("raw_output1_count", 0)
     normalized_position_count = balance.get("normalized_position_count", 0)
     position_symbols = balance.get("position_symbols", [])
@@ -109,9 +110,10 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         }
     
     logger.info(
-        "[US_RECONCILE][OK] position_count=%d total_pvs=%s",
+        "[US_RECONCILE][OK] position_count=%d total_pvs=%s total_pvs_source=%s",
         len(positions),
         total_pvs,
+        total_pvs_source,
     )
 
     # TODO: DB 기반 포지션과 비교 (US_RECONCILE_MISMATCH 감지)
@@ -119,6 +121,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         "status": "OK",
         "position_count": len(positions),
         "total_pvs": total_pvs,
+        "total_pvs_source": total_pvs_source,
         "positions": positions,
         "position_symbols": position_symbols,
         "raw_output1_count": raw_output1_count,

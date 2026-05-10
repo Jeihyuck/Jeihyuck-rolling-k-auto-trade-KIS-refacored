@@ -1220,6 +1220,10 @@ def load_locked_us_watchlist(
                     "[US_WATCHLIST][LOCK_LOAD][INSUFFICIENT] trade_date=%s count=%d min=%d elapsed_ms=%d",
                     trade_date, len(raw_result), min_count, elapsed_ms
                 )
+                logger.info(
+                    "[US_WATCHLIST][LOCK_LOAD][DONE] trade_date=%s count=%d status=INSUFFICIENT elapsed_ms=%d",
+                    trade_date, len(raw_result), elapsed_ms
+                )
                 return []
             
             # DEGRADED 체크
@@ -1230,6 +1234,10 @@ def load_locked_us_watchlist(
                     logger.warning(
                         "[US_WATCHLIST][LOCK_LOAD][DEGRADED_BLOCKED] trade_date=%s status=%s elapsed_ms=%d",
                         trade_date, first_status, elapsed_ms
+                    )
+                    logger.info(
+                        "[US_WATCHLIST][LOCK_LOAD][DONE] trade_date=%s count=%d status=DEGRADED_BLOCKED elapsed_ms=%d",
+                        trade_date, len(raw_result), elapsed_ms
                     )
                     return []
             

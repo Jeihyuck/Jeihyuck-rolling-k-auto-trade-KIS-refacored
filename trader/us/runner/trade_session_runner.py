@@ -396,6 +396,15 @@ def run_trade_session(
         "[US_SESSION][END] session=%s reason=session_end ticks=%d warns=%d",
         session, tick_count, warn_count,
     )
+    
+    # KIS TEMP_ERROR recovery warning
+    if temp_recovered_count > 0:
+        warn_count += 1
+        logger.warning(
+            "[US_SESSION][WARN] KIS TEMP_ERROR recovered temp_error_count=%d temp_recovered_count=%d",
+            temp_error_count,
+            temp_recovered_count,
+        )
 
     if final_status not in {"FAILED", "SKIP"}:
         if resolved_signal_only:

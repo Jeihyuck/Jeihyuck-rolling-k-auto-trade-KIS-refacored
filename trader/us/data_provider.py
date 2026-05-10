@@ -132,6 +132,7 @@ def normalize_us_balance(raw: dict) -> dict:
     result = {
         "positions": [],
         "total_pvs": "0",
+        "total_pvs_source": "none",
         "output1": [],
         "output2": {},
         "raw_balance": raw,
@@ -284,31 +285,38 @@ def normalize_us_balance(raw: dict) -> dict:
             "raw": row,
         })
 
-    # output2에서 total_pvs 및 pnl 추출
     # total_pvs = 총 평가금액 (evaluation amount, not pnl)
-    # pnl_usd = 손익 (separate field)
-    total_eval_candidates = (
-        "frcr_evlu_amt2",       # 외화평가금액2 (평가금액)
-        "ovrs_tot_pfls",        # 해외총평가 (may be pnl - check)
-        "tot_evlu_pfls_amt",    # 총평가손익금액 (pnl)
-        "tot_asst_amt",         # 총자산금액
-    )
-    total_eval_val = _get_first_valid(output2, total_eval_candidates, None)
-    
-    # total_pvs가 없으면 positions의 market_value_usd 합계로 계산
-    if total_eval_val is None or _safe_float(total_eval_val, 0.0) == 0:
-        if positions:
-            total_pvs_calculated = sum(p["market_value_usd"] for p in positions)
-            logger.info(
-                "[US_BALANCE][TOTAL_PVS_CALCULATED] positions=%d total_pvs=%.2f (from position sum)",
-                len(positions), total_pvs_calculated
+    # output2의 ovrs_tot_pfls, tot_evlu_pfls_amt는 손익(pnl)이므로 사용하지 않음
+    # 항상 positions의 market_value_usd 합계 사용
+    if positions:
+        total_pvs_calculated = sum(p["market_value_usd"] for p in positions)
+        result["total_pvs"] = str(total_pvs_calculated)
+        result["total_pvs_source"] = "positions_market_value_sum"
+        logger.info(
+            "[US_BALANCE][SUMMARY] total_pvs_source=%s total_pvs=%.2f positions=%d",
+            result["total_pvs_source"],
+            total_pvs_calculated,
+            len(positions),
+        )
+    elif output2:
+        # positions가 없으면 buy_amount 합계 fallback (legacy)
+        buy_amount_fallback = _safe_float(output2.get("tot_apl_amt", "0"), 0.0)
+        if buy_amount_fallback > 0:
+            result["total_pvs"] = str(buy_amount_fallback)
+            result["total_pvs_source"] = "output2_buy_amount_fallback"
+            logger.warning(
+                "[US_BALANCE][SUMMARY] total_pvs_source=%s total_pvs=%.2f (no positions)",
+                result["total_pvs_source"],
+                buy_amount_fallback,
             )
-            result["total_pvs"] = str(total_pvs_calculated)
         else:
             result["total_pvs"] = "0"
+            result["total_pvs_source"] = "zero_no_positions"
+            logger.info("[US_BALANCE][SUMMARY] total_pvs_source=zero_no_positions")
     else:
-        total_pvs = _safe_float(total_eval_val, 0.0)
-        result["total_pvs"] = str(total_pvs)
+        result["total_pvs"] = "0"
+        result["total_pvs_source"] = "zero_no_data"
+        logger.info("[US_BALANCE][SUMMARY] total_pvs_source=zero_no_data")
     
     # pnl_usd 별도 추출
     pnl_candidates = (
