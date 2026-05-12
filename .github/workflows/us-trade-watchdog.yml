@@ -1,4 +1,5 @@
 name: "US Trade Watchdog"
+# Auto-recovery: monitors prep/am/afternoon status and dispatches missing runs | schedule: */5 12-20 UTC Mon-Fri
 
 "on":
   schedule:
