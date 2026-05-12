@@ -536,6 +536,56 @@ def generate_entry_intents(
         key_raw = f"{symbol}_{today}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Final order cap enforcement: 최종 방어 로직
+        # US_MAX_ORDER_USD를 초과하는 intent는 절대 append하지 않는다.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        order_cap_usd = float(os.getenv("US_MAX_ORDER_USD", "2500"))
+        
+        if notional > order_cap_usd:
+            # qty를 줄여서 order_cap 이하로 맞춤
+            old_qty = qty
+            old_notional = notional
+            new_qty = int(order_cap_usd // price)
+            
+            if new_qty <= 0:
+                # 가격이 너무 높아서 1주도 못 사는 경우 skip
+                track_skip(symbol, "order_cap_qty_zero", {
+                    "price": price,
+                    "order_cap_usd": order_cap_usd,
+                    "old_qty": old_qty,
+                    "old_notional": old_notional,
+                })
+                logger.warning(
+                    "[US_ENTRY][SKIP] symbol=%s reason=order_cap_qty_zero price=%.2f cap=%.2f old_qty=%d",
+                    symbol, price, order_cap_usd, old_qty,
+                )
+                continue
+            
+            # qty를 축소하고 notional 재계산
+            qty = new_qty
+            notional = qty * price
+            
+            # 축소 후에도 여전히 cap 초과인지 재검증 (안전망)
+            if notional > order_cap_usd:
+                track_skip(symbol, "intent_notional_exceeds_order_cap_after_sizing", {
+                    "price": price,
+                    "order_cap_usd": order_cap_usd,
+                    "new_qty": qty,
+                    "new_notional": notional,
+                })
+                logger.warning(
+                    "[US_ENTRY][SKIP] symbol=%s reason=intent_notional_exceeds_order_cap_after_sizing "
+                    "new_notional=%.2f cap=%.2f",
+                    symbol, notional, order_cap_usd,
+                )
+                continue
+            
+            logger.warning(
+                "[US_ENTRY][RESIZE_TO_ORDER_CAP] symbol=%s old_qty=%d new_qty=%d old_notional=%.2f new_notional=%.2f cap=%.2f",
+                symbol, old_qty, qty, old_notional, notional, order_cap_usd,
+            )
+
         intent = {
             "symbol": symbol,
             "exchange": exchange,

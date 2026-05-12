@@ -160,9 +160,75 @@ def route_order(
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
-        if order_key:
-            mark_order_intent_blocked(order_key, reason=str(exc))
-        return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # A안: notional_exceeds_order_limit이면 qty 축소 후 1회 재시도
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        exc_str = str(exc)
+        if "notional_exceeds_order_limit" in exc_str:
+            logger.warning(
+                "[US_ORDER][RESIZE_RETRY] attempting qty resize symbol=%s old_qty=%d",
+                symbol, qty,
+            )
+            
+            # US_MAX_ORDER_USD 기준으로 새 qty 계산
+            order_cap_usd = float(os.getenv("US_MAX_ORDER_USD", "2500"))
+            new_qty = int(order_cap_usd // price) if price > 0 else 0
+            
+            if new_qty > 0 and new_qty < qty:
+                # 축소된 qty로 재시도
+                resized_intent = {**intent}
+                resized_intent["qty"] = new_qty
+                resized_intent["notional_usd"] = new_qty * price
+                
+                logger.info(
+                    "[US_ORDER][RESIZE_RETRY] symbol=%s old_qty=%d new_qty=%d cap=%.2f",
+                    symbol, qty, new_qty, order_cap_usd,
+                )
+                
+                # risk gate 재시도
+                resized_gate_intent = {**resized_intent, "client_order_key": order_key}
+                try:
+                    assert_order_allowed(
+                        resized_gate_intent,
+                        current_daily_notional_usd=current_daily_notional_usd,
+                        current_position_count=current_position_count,
+                        total_portfolio_usd=total_portfolio_usd,
+                        available_cash_usd=available_cash_usd,
+                        existing_order_keys=existing_keys,
+                    )
+                    
+                    # 재시도 성공: 축소된 intent로 계속 진행
+                    logger.info(
+                        "[US_ORDER][RESIZE_RETRY][SUCCESS] symbol=%s new_qty=%d new_notional=%.2f",
+                        symbol, new_qty, new_qty * price,
+                    )
+                    intent = resized_intent  # 원래 intent를 축소된 것으로 교체
+                    qty = new_qty  # 로컬 변수도 업데이트
+                    
+                except RiskGateBlocked as exc2:
+                    # 재시도도 실패
+                    logger.warning(
+                        "[US_ORDER][RESIZE_RETRY][BLOCKED] symbol=%s new_qty=%d reason=%s",
+                        symbol, new_qty, exc2,
+                    )
+                    if order_key:
+                        mark_order_intent_blocked(order_key, reason=f"resize_retry_blocked: {exc2}")
+                    return {"status": "BLOCKED", "reason": f"resize_retry_blocked: {exc2}", "intent": resized_intent}
+            else:
+                # 축소해도 qty가 0 이하거나 원래 qty와 같음
+                logger.warning(
+                    "[US_ORDER][RESIZE_RETRY][SKIP] symbol=%s new_qty=%d old_qty=%d price=%.2f cap=%.2f",
+                    symbol, new_qty, qty, price, order_cap_usd,
+                )
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason=str(exc))
+                return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
+        else:
+            # notional_exceeds_order_limit가 아닌 다른 block reason
+            if order_key:
+                mark_order_intent_blocked(order_key, reason=str(exc))
+            return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
 
     # 4. DRY_RUN resolve with runtime guard
     dry_run_resolved = resolve_dry_run_for_us_order()

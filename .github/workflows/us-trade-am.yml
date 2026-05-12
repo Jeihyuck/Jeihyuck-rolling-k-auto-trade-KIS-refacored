@@ -139,7 +139,7 @@ jobs:
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
           target_min=$((9 * 60 + 30))
-          stale_min=$((10 * 60 + 30))
+          stale_min=$((11 * 60 + 0))  # 11:00 ET까지는 stale로 간주하지 않음 (기존 10:30은 너무 빡빡)
           max_wait_seconds=900
           max_wait_min=$((max_wait_seconds / 60))
 
@@ -559,7 +559,8 @@ jobs:
           required = [
               "trade_date","run_id","sha","workflow","session","event_name","env","dry_run",
               "kis_order_allowed","prep_status","locked_watchlist_count","entry_eval_status",
-              "entry_error_type","entry_error_message","entry_intents","orders_sent","fills",
+              "entry_error_type","entry_error_message","entry_intents","orders_sent",
+              "orders_blocked","block_reasons","fills",
               "positions","last_stage","final_status","reason"
           ]
           miss = [k for k in required if k not in payload]

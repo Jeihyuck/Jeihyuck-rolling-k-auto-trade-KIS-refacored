@@ -862,15 +862,48 @@ def run_trade_tick(
     blocked_cnt = sum(1 for o in orders if o["status"] == "BLOCKED")
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
+    
+    # Block reasons 통계 수집
+    block_reasons: dict[str, int] = {}
+    for o in orders:
+        if o["status"] == "BLOCKED":
+            reason = o.get("reason", "unknown")
+            # reason에서 실제 차단 사유 추출 (예: "[US_RISK][BLOCK] reason=notional_exceeds_order_limit ..." -> "notional_exceeds_order_limit")
+            if "reason=" in reason:
+                try:
+                    reason = reason.split("reason=")[1].split()[0]
+                except Exception:
+                    pass
+            block_reasons[reason] = block_reasons.get(reason, 0) + 1
 
     logger.info(
         "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d signal_only=%d error=%d",
         len(orders), ack_cnt, dry_cnt, blocked_cnt, signal_only_cnt, err_cnt,
     )
+    
+    if blocked_cnt > 0:
+        logger.warning(
+            "[US_ORDER][ROUTE][BLOCKED_SUMMARY] total_blocked=%d reasons=%s",
+            blocked_cnt, block_reasons,
+        )
 
-    # ── 최종 status 판정 ───────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # 최종 status 판정 (US 전용 status 체계)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
     total_warnings = fills_warnings_count
+    orders_sent = ack_cnt + dry_cnt  # ACK + DRY_RUN = 실제 주문 시도 수
+    entry_intents_count = len(entry_intents)
+    
+    # Status 결정 우선순위:
+    # 1. 심각한 에러가 있으면 ERROR
+    # 2. entry_intents가 0이면 NO_ENTRY_INTENTS
+    # 3. entry_intents > 0이지만 orders_sent=0이고 blocked > 0이면 NO_ORDERS_RISK_BLOCKED
+    # 4. orders_sent > 0이고 blocked > 0이면 PARTIAL_ORDERS_BLOCKED
+    # 5. signal_only mode이면 OK_SIGNAL_ONLY
+    # 6. orders_sent > 0이면 OK_ORDERS_SENT
+    # 7. orders_sent = 0이고 entry_intents = 0이면 OK_NO_TRADE
+    # 8. 기본 OK
     
     if total_errors > 0:
         status = "ERROR" if total_errors > 2 else "OK_WITH_ERRORS"
@@ -885,18 +918,45 @@ def run_trade_tick(
             "[US_TICK][STATUS_DECISION] status=%s errors=%d reasons=[%s]",
             status, total_errors, ", ".join(status_reasons)
         )
-    elif total_warnings > 0:
-        status = "OK_WITH_WARNINGS"
+    elif entry_intents_count == 0 and orders_sent == 0:
+        # 진입 후보가 없음
+        status = "OK_NO_TRADE" if not signal_only else "OK_SIGNAL_ONLY"
+        logger.info(
+            "[US_TICK][STATUS_DECISION] status=%s reason=no_entry_intents signal_only=%s",
+            status, int(signal_only)
+        )
+    elif entry_intents_count > 0 and orders_sent == 0 and blocked_cnt > 0:
+        # 진입 후보는 있었지만 risk gate에서 전부 차단됨
+        status = "NO_ORDERS_RISK_BLOCKED"
+        logger.warning(
+            "[US_TICK][STATUS_DECISION] status=%s entry_intents=%d blocked=%d block_reasons=%s",
+            status, entry_intents_count, blocked_cnt, block_reasons
+        )
+    elif orders_sent > 0 and blocked_cnt > 0:
+        # 일부는 주문 성공, 일부는 차단됨
+        status = "PARTIAL_ORDERS_BLOCKED"
+        logger.warning(
+            "[US_TICK][STATUS_DECISION] status=%s orders_sent=%d blocked=%d block_reasons=%s",
+            status, orders_sent, blocked_cnt, block_reasons
+        )
+    elif signal_only:
+        status = "OK_SIGNAL_ONLY"
+        logger.info(
+            "[US_TICK][STATUS_DECISION] status=%s reason=signal_only_mode",
+            status
+        )
+    elif orders_sent > 0:
+        status = "OK_ORDERS_SENT" if total_warnings == 0 else "OK_WITH_WARNINGS"
+        logger.info(
+            "[US_TICK][STATUS_DECISION] status=%s orders_sent=%d warnings=%d",
+            status, orders_sent, total_warnings
+        )
+    else:
+        status = "OK_WITH_WARNINGS" if total_warnings > 0 else "OK"
         logger.info(
             "[US_TICK][STATUS_DECISION] status=%s warnings=%d",
             status, total_warnings
         )
-    elif signal_only:
-        status = "OK_SIGNAL_ONLY"
-    elif ack_cnt == 0 and dry_cnt == 0 and len(all_intents) == 0:
-        status = "OK_NO_TRADE"
-    else:
-        status = "OK"
     
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
@@ -908,6 +968,8 @@ def run_trade_tick(
         "ack": ack_cnt,
         "dry_run": dry_cnt,
         "blocked": blocked_cnt,
+        "orders_blocked": blocked_cnt,  # 호환성 위해 둘 다 제공
+        "block_reasons": block_reasons,
         "signal_only": signal_only_cnt,
         "errors": err_cnt,
         "budget": budget,
@@ -922,7 +984,7 @@ def run_trade_tick(
         "entry_error_type": "" if entry_eval_error_count == 0 else "entry_eval_error",
         "entry_error_message": "" if entry_eval_error_count == 0 else "entry_eval_error",
         "entry_intents": len(entry_intents),
-        "orders_sent": ack_cnt,
+        "orders_sent": orders_sent,  # ack + dry_run
         "fills": len(fills_today),
         "positions": len(current_positions),
         "temp_error_count": temp_error_count,
