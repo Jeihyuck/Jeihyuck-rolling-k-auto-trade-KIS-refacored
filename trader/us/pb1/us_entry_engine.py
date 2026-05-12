@@ -19,6 +19,13 @@ import os
 from datetime import datetime
 from typing import Any
 
+# US Explanation System
+from trader.us.pb1.us_explain import (
+    build_us_entry_explanation,
+    log_us_entry_decision,
+    validate_explanations_batch,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -261,6 +268,8 @@ def generate_entry_intents(
     # Skip reason tracking for observability
     skip_reasons: dict[str, int] = {}
     skip_details: list[dict] = []  # For diagnostics artifact
+    buy_explanations: list[dict] = []  # BUY decision explanations
+    skip_explanations: list[dict] = []  # SKIP decision explanations
     
     def track_skip(symbol: str, reason: str, details: dict | None = None):
         """Track skip reason for summary and diagnostics."""
@@ -269,11 +278,22 @@ def generate_entry_intents(
         if details:
             skip_detail.update(details)
         skip_details.append(skip_detail)
+        
+        # Build skip explanation for observability
+        entry_data = entries_map.get(symbol, {})
+        if entry_data:
+            skip_explanation = build_us_entry_explanation(
+                symbol=symbol,
+                entry_data=entry_data,
+                decision="SKIP",
+                skip_reason=reason,
+            )
+            skip_explanations.append(skip_explanation)
 
     # =========================================================================
     # Phase 1: Filter + Score Validation (NO price lookup yet if precomputed)
     # =========================================================================
-    candidates: list[tuple[float, str, str]] = []  # (score, symbol, exchange)
+    candidates: list[tuple[float, str, str, float | None, dict | None]] = []  # (score, symbol, exchange, price, entry_meta)
     seen_symbols: set[str] = set()  # 중복 symbol 차단용
     held_skipped = 0  # 보유종목으로 스킵된 수
 
@@ -395,7 +415,7 @@ def generate_entry_intents(
                 exchange = resolve_exchange(symbol)
             
             # Phase 1: NO price lookup yet (if precomputed score exists)
-            candidates.append((s, symbol, exchange, None))  # price=None
+            candidates.append((s, symbol, exchange, None, canonical_entry))  # price=None, entry_meta=canonical_entry
             
         else:
             # precomputed score가 없으면 실시간 계산 필요 (기존 로직 유지)
@@ -438,7 +458,8 @@ def generate_entry_intents(
                 continue
             
             # 실시간 계산된 경우 price를 이미 갖고 있으므로 candidates에 추가
-            candidates.append((s, symbol, exchange, price))
+            # entry_meta는 없으므로 None
+            candidates.append((s, symbol, exchange, price, None))
     
     # =========================================================================
     # Phase 2: Sort by score, then price lookup for top N
@@ -470,7 +491,7 @@ def generate_entry_intents(
     price_lookup_count = 0  # 실제 price lookup 횟수 추적
     
     # Price lookup 및 intent 생성 (상위 lookup_limit개만)
-    for rank, (score, symbol, exchange, existing_price) in enumerate(candidates):
+    for rank, (score, symbol, exchange, existing_price, entry_meta) in enumerate(candidates):
         # 이미 max_new_entries 만큼 추가했으면 종료
         if added_count >= max_new_entries:
             break
@@ -613,6 +634,22 @@ def generate_entry_intents(
                 symbol, old_qty, qty, old_notional, notional, order_cap_usd,
             )
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Build entry explanation
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        entry_explanation = None
+        if entry_meta:
+            entry_explanation = build_us_entry_explanation(
+                symbol=symbol,
+                entry_data=entry_meta,
+                decision="BUY",
+                skip_reason=None,
+            )
+            buy_explanations.append(entry_explanation)
+            
+            # Log WHY_BUY
+            log_us_entry_decision(symbol, "BUY", entry_explanation)
+
         intent = {
             "symbol": symbol,
             "exchange": exchange,
@@ -626,6 +663,16 @@ def generate_entry_intents(
             "strategy": "us_pb1",
             "entry_style": "momentum",
         }
+        
+        # Add explanation fields if available
+        if entry_explanation:
+            intent["entry_style_selected"] = entry_explanation.get("entry_style_selected", "ENTRY_GENERIC")
+            intent["entry_component"] = entry_explanation.get("entry_component", "generic")
+            intent["score_breakdown"] = entry_explanation.get("score_breakdown", {})
+            intent["reasons"] = entry_explanation.get("reasons", [])
+            intent["filters_passed"] = entry_explanation.get("filters_passed", [])
+            intent["explanation_quality"] = entry_explanation.get("explanation_quality", "MINIMAL")
+        
         intents.append(intent)
         added_count += 1
 
@@ -696,6 +743,31 @@ def generate_entry_intents(
             )
         except Exception as exc:
             logger.warning("[US_SCORE_DIAG][SAVE_FAILED] %s", exc)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Explanation Quality Validation
+    # ─────────────────────────────────────────────────────────────────────────
+    all_explanations = buy_explanations + skip_explanations
+    if all_explanations:
+        quality_report = validate_explanations_batch(all_explanations)
+        logger.info(
+            "[US_ENTRY][EXPLANATION_QUALITY] total=%d full=%d partial=%d minimal=%d missing=%d summary=%s warning=%s",
+            quality_report["total_count"],
+            quality_report["full_count"],
+            quality_report["partial_count"],
+            quality_report["minimal_count"],
+            quality_report["missing_count"],
+            quality_report["quality_summary"],
+            quality_report["quality_warning"],
+        )
+        
+        if quality_report["quality_warning"]:
+            logger.warning(
+                "[US_ENTRY][EXPLANATION_QUALITY_WARNING] %s",
+                quality_report["quality_summary"],
+            )
+    else:
+        logger.warning("[US_ENTRY][EXPLANATION_QUALITY] no explanations generated")
 
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(intents))
     return intents

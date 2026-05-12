@@ -1,4 +1,4 @@
-name: US Trade Watchdog
+name: "US Trade Watchdog"
 
 "on":
   schedule:

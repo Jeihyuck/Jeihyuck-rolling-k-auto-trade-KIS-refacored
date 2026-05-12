@@ -73,6 +73,7 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "entry_eval_status", "entry_error_type", "entry_error_message", "entry_intents",
         "orders_sent", "fills", "positions", "last_stage", "final_status", "reason",
         "temp_error_count", "temp_recovered_count", "missed_trade_window",
+        "buy_decisions", "sell_decisions",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
     latest_md.write_text("\n".join(md_lines) + "\n")
@@ -498,6 +499,24 @@ def run_trade_session(
         else:
             final_status = "OK_WITH_WARNINGS" if warn_count > 0 else "OK"
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Aggregate explanation statistics from tick results
+    # ─────────────────────────────────────────────────────────────────────────
+    total_buy_decisions = 0
+    total_sell_decisions = 0
+    
+    for tick_result in results:
+        # buy_decisions = entry_intents count (BUY decision)
+        entry_intents = int(tick_result.get("entry_intents", 0) or 0)
+        total_buy_decisions += entry_intents
+        
+        # sell_decisions = exit_intents count (SELL decision)
+        exit_intents = int(tick_result.get("exit_intents", 0) or 0)
+        total_sell_decisions += exit_intents
+    
+    # buy_skips/no_exit_signals are tracked in logs but not counted in tick results
+    # (추후 필요시 tick_result에 추가 가능)
+
     report_payload = {
         "trade_date": trade_date,
         "run_id": run_id,
@@ -531,6 +550,9 @@ def run_trade_session(
         "force_now": force_now or "",
         "offline": offline,
         "wall_elapsed_sec": round(session_wall_elapsed_sec, 2),
+        # Explanation statistics
+        "buy_decisions": total_buy_decisions,
+        "sell_decisions": total_sell_decisions,
     }
     _write_us_session_report(report_payload, session=session)
     logger.info(

@@ -23,6 +23,13 @@ import os
 from datetime import datetime
 from typing import Any
 
+# US Explanation System
+from trader.us.pb1.us_explain import (
+    build_us_exit_explanation,
+    log_us_exit_decision,
+    validate_explanations_batch,
+)
+
 logger = logging.getLogger(__name__)
 
 # 설정값
@@ -187,6 +194,8 @@ def generate_exit_intents(
     from trader.us.symbols import normalize_us_exchange
     
     intents: list[dict] = []
+    sell_explanations: list[dict] = []
+    hold_explanations: list[dict] = []
 
     if not positions:
         return intents
@@ -216,7 +225,65 @@ def generate_exit_intents(
             continue
 
         intent = evaluate_exit(position=pos, current_price=current_price, now=now)
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Build exit explanation
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if intent is not None:
+            # SELL decision
+            exit_explanation = build_us_exit_explanation(
+                symbol=symbol,
+                position=pos,
+                exit_intent=intent,
+                current_price=current_price,
+            )
+            sell_explanations.append(exit_explanation)
+            
+            # Log WHY_SELL
+            log_us_exit_decision(symbol, "SELL", exit_explanation)
+            
+            # Add explanation fields to intent
+            intent["exit_style"] = exit_explanation.get("exit_style", "unknown")
+            intent["exit_trigger"] = exit_explanation.get("exit_trigger")
+            intent["explanation_quality"] = exit_explanation.get("explanation_quality", "FULL")
+            
             intents.append(intent)
+        else:
+            # HOLD decision (NO_EXIT_SIGNAL)
+            hold_explanation = build_us_exit_explanation(
+                symbol=symbol,
+                position=pos,
+                exit_intent=None,
+                current_price=current_price,
+            )
+            hold_explanations.append(hold_explanation)
+            
+            # Log WHY_HOLD
+            log_us_exit_decision(symbol, "HOLD", hold_explanation)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Explanation Quality Validation
+    # ─────────────────────────────────────────────────────────────────────────
+    all_explanations = sell_explanations + hold_explanations
+    if all_explanations:
+        quality_report = validate_explanations_batch(all_explanations)
+        logger.info(
+            "[US_EXIT][EXPLANATION_QUALITY] total=%d full=%d partial=%d minimal=%d missing=%d summary=%s warning=%s",
+            quality_report["total_count"],
+            quality_report["full_count"],
+            quality_report["partial_count"],
+            quality_report["minimal_count"],
+            quality_report["missing_count"],
+            quality_report["quality_summary"],
+            quality_report["quality_warning"],
+        )
+        
+        if quality_report["quality_warning"]:
+            logger.warning(
+                "[US_EXIT][EXPLANATION_QUALITY_WARNING] %s",
+                quality_report["quality_summary"],
+            )
+    else:
+        logger.warning("[US_EXIT][EXPLANATION_QUALITY] no explanations generated")
 
     return intents
