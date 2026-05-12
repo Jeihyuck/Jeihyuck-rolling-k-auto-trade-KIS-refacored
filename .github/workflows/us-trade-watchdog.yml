@@ -1,10 +1,7 @@
-name: "US Trade Watchdog"
-# Korean pattern: watchdog auto-recovery for missing scheduled runs
+name: US Trade Watchdog
 
-on:
+"on":
   schedule:
-    # Every 5 minutes between 12:00-20:00 UTC Mon-Fri
-    # Covers 08:00-16:00 EDT / 07:00-15:00 EST
     - cron: "*/5 12-20 * * 1-5"
   workflow_dispatch: {}
 
