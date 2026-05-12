@@ -533,6 +533,8 @@ jobs:
       - name: Validate latest US AM report contract
         if: always()
         working-directory: repo
+        env:
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
         run: |
           set -euo pipefail
           latest_json="reports/us_daily/latest_us_daily_report.json"
@@ -540,54 +542,23 @@ jobs:
           [ -f "${latest_json}" ] || { echo "::error::missing latest US report json"; exit 1; }
           [ -f "${latest_md}" ] || { echo "::error::missing latest US report md"; exit 1; }
 
-          trade_date=$(python - <<'PY'
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-          print(datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d"))
-          PY
-          )
+          # Trim force_now input
+          FORCE_NOW_TRIMMED=$(echo "${FORCE_NOW_INPUT}" | xargs)
 
-          python - <<PY
-          import json, sys
-          from pathlib import Path
-          p = Path("${latest_json}")
-          payload = json.loads(p.read_text())
-          expected = {
-              "trade_date": "${trade_date}",
-              "run_id": "${GITHUB_RUN_ID}",
-              "dry_run": "${DRY_RUN}" == "1",
-          }
-          errs = []
-          if str(payload.get("trade_date")) != expected["trade_date"]:
-              errs.append(f"trade_date mismatch: {payload.get('trade_date')} != {expected['trade_date']}")
-          if str(payload.get("run_id")) != expected["run_id"]:
-              errs.append(f"run_id mismatch: {payload.get('run_id')} != {expected['run_id']}")
-          if bool(payload.get("dry_run")) != expected["dry_run"]:
-              errs.append(f"dry_run mismatch: {payload.get('dry_run')} != {expected['dry_run']}")
-          if errs:
-              print("::error::stale_or_invalid_us_report")
-              for e in errs:
-                  print(f"::error::{e}")
-              sys.exit(1)
-          required = [
-              "trade_date","run_id","sha","workflow","session","event_name","env","dry_run",
-              "kis_order_allowed","prep_status","locked_watchlist_count","entry_eval_status",
-              "entry_error_type","entry_error_message","entry_intents","orders_sent",
-              "orders_blocked","block_reasons","fills",
-              "positions","last_stage","final_status","reason"
-          ]
-          miss = [k for k in required if k not in payload]
-          if miss:
-              print(f"::error::missing_report_fields {miss}")
-              sys.exit(1)
-          print("[US_REPORT][VALID] latest report contract satisfied")
-          PY
+          # Determine expected trade_date
+          if [ -n "${FORCE_NOW_TRIMMED}" ]; then
+            # force_now가 있으면 그 날짜를 사용
+            trade_date=$(python3 -c "import sys; from datetime import datetime; dt = datetime.fromisoformat('${FORCE_NOW_TRIMMED}'); print(dt.strftime('%Y-%m-%d')); sys.stderr.write('[US_REPORT_VALIDATE][EXPECTED_DATE] source=force_now trade_date=' + dt.strftime('%Y-%m-%d') + '\n')")
+          else
+            # force_now가 없으면 현재 NY 날짜 사용
+            trade_date=$(python3 -c "from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d'))")
+            echo "[US_REPORT_VALIDATE][EXPECTED_DATE] source=now_ny trade_date=${trade_date}" >&2
+          fi
 
-          python - <<'PY'
-          import json
-          from pathlib import Path
-          payload = json.loads(Path("reports/us_daily/latest_us_daily_report.json").read_text())
-          Path("artifacts/us_last_stage.txt").write_text(str(payload.get("last_stage", "unknown")) + "\n")
+          # Validate report contract
+          python3 -c "import json, sys; from pathlib import Path; p = Path('${latest_json}'); payload = json.loads(p.read_text()); expected = {'trade_date': '${trade_date}', 'run_id': '${GITHUB_RUN_ID}', 'dry_run': '${DRY_RUN}' == '1'}; errs = []; errs.append('trade_date mismatch: {} != {}'.format(payload.get('trade_date'), expected['trade_date'])) if str(payload.get('trade_date')) != expected['trade_date'] else None; errs.append('run_id mismatch: {} != {}'.format(payload.get('run_id'), expected['run_id'])) if str(payload.get('run_id')) != expected['run_id'] else None; errs.append('dry_run mismatch: {} != {}'.format(payload.get('dry_run'), expected['dry_run'])) if bool(payload.get('dry_run')) != expected['dry_run'] else None; errs = [e for e in errs if e]; print('::error::stale_or_invalid_us_report') if errs else None; [print('::error::{}'.format(e)) for e in errs] if errs else None; sys.exit(1) if errs else None; required = ['trade_date','run_id','sha','workflow','session','event_name','env','dry_run','kis_order_allowed','prep_status','locked_watchlist_count','entry_eval_status','entry_error_type','entry_error_message','entry_intents','orders_sent','orders_blocked','block_reasons','fills','positions','last_stage','final_status','reason']; miss = [k for k in required if k not in payload]; print('::error::missing_report_fields {}'.format(miss)) if miss else None; sys.exit(1) if miss else None; print('[US_REPORT][VALID] latest report contract satisfied')"
+
+          python3 -c "import json; from pathlib import Path; payload = json.loads(Path('reports/us_daily/latest_us_daily_report.json').read_text()); Path('artifacts/us_last_stage.txt').write_text(str(payload.get('last_stage', 'unknown')) + '\n')"
           PY
 
       - name: Verify US AM log contract

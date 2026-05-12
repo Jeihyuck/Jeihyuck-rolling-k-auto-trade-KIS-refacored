@@ -213,6 +213,16 @@ def run_trade_session(
 
     # Graceful shutdown buffer: GitHub Actions hard kill 전에 Python이 먼저 종료되도록
     shutdown_buffer_sec = int(os.getenv("US_SESSION_SHUTDOWN_BUFFER_SEC", "600"))  # 10분 기본값
+    
+    # force_now + max_ticks > 0 + offline=True인 smoke run에서는 shutdown_buffer를 낮춰서
+    # 최소 1 tick은 실행될 수 있도록 보장
+    if force_now and max_ticks > 0 and offline:
+        shutdown_buffer_sec = 60
+        logger.info(
+            "[US_SESSION][SHUTDOWN_BUFFER_OVERRIDE] reason=force_now_max_ticks_offline buffer_sec=%d",
+            shutdown_buffer_sec,
+        )
+    
     graceful_deadline = deadline - timedelta(seconds=shutdown_buffer_sec)
     
     logger.info(
@@ -257,6 +267,7 @@ def run_trade_session(
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Try/Finally 구조: 예외/timeout이 발생해도 최종 report를 항상 작성한다
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    session_start_time = time_mod.time()
     try:
         while True:
             if force_now:
@@ -267,13 +278,20 @@ def run_trade_session(
                 tick_force_now = None
 
             # Graceful deadline 검사: GitHub hard kill 전에 Python이 먼저 종료
+            # 단, max_ticks > 0일 때는 최소 1 tick은 실행되도록 보장
             if tick_now_dt >= graceful_deadline:
-                final_reason = "graceful_shutdown"
-                logger.info(
-                    "[US_SESSION][END] session=%s reason=graceful_shutdown ticks=%d",
-                    session, tick_count,
-                )
-                break
+                if max_ticks > 0 and tick_count == 0:
+                    logger.info(
+                        "[US_SESSION][GRACEFUL_DEADLINE] allow_first_tick=1 reason=max_ticks_guarantee tick_count=%d",
+                        tick_count,
+                    )
+                else:
+                    final_reason = "graceful_shutdown"
+                    logger.info(
+                        "[US_SESSION][END] session=%s reason=graceful_shutdown ticks=%d",
+                        session, tick_count,
+                    )
+                    break
 
             tick_count += 1
             last_stage = f"tick_{tick_count}"
@@ -445,10 +463,21 @@ def run_trade_session(
         )
 
     # ── Tick loop 종료 후 최종 처리 ────────────────────────────────────────────
+    session_wall_elapsed_sec = time_mod.time() - session_start_time
+    
     logger.info(
-        "[US_SESSION][END] session=%s reason=%s ticks=%d warns=%d",
-        session, final_reason, tick_count, warn_count,
+        "[US_SESSION][END] session=%s reason=%s ticks=%d warns=%d wall_elapsed_sec=%.2f",
+        session, final_reason, tick_count, warn_count, session_wall_elapsed_sec,
     )
+    
+    # max_ticks > 0일 때 최소 1 tick은 실행되어야 함
+    if max_ticks > 0 and tick_count == 0 and final_status not in {"FAILED", "SKIP"}:
+        final_status = "FAILED"
+        final_reason = "no_tick_executed"
+        logger.error(
+            "[US_SESSION][ERROR] max_ticks=%d but tick_count=0 - setting final_status=FAILED",
+            max_ticks,
+        )
     
     # KIS TEMP_ERROR recovery warning
     if temp_recovered_count > 0:
@@ -496,6 +525,12 @@ def run_trade_session(
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
         "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") == "1",
+        # 추가 필드
+        "tick_count": tick_count,
+        "max_ticks": max_ticks,
+        "force_now": force_now or "",
+        "offline": offline,
+        "wall_elapsed_sec": round(session_wall_elapsed_sec, 2),
     }
     _write_us_session_report(report_payload, session=session)
     logger.info(
