@@ -28,8 +28,19 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     from trader.us.db.repos import (
         save_fills, save_position_snapshot, save_reconcile_log,
     )
+    from trader.us.market_calendar import now_ny
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
 
     provider = USDataProvider(offline=offline)
+
+    # force_now가 있으면 해당 날짜 기준으로 trade_date 설정
+    NY_TZ = ZoneInfo("America/New_York")
+    if force_now:
+        now = datetime.fromisoformat(force_now).astimezone(NY_TZ)
+    else:
+        now = now_ny()
+    trade_date = now.strftime("%Y-%m-%d")
 
     # 1. Fills 조회
     fills: list[dict] = []
@@ -39,7 +50,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     if not offline:
         try:
             from trader.us.execution.fills import get_fills_today
-            fills_result = get_fills_today(provider=provider)
+            fills_result = get_fills_today(provider=provider, trade_date=trade_date)
             fills_status = fills_result.get("status", "UNKNOWN")
             fills = fills_result["fills"]
             fills_error = fills_result.get("error", "")

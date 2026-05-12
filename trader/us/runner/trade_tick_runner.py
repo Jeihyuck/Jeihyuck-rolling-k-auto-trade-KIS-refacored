@@ -300,7 +300,7 @@ def run_trade_tick(
         try:
             last_stage = "fills_fetch"
             from trader.us.execution.fills import get_fills_today
-            fills_result = get_fills_today(provider=provider, signal_only=signal_only)
+            fills_result = get_fills_today(provider=provider, signal_only=signal_only, trade_date=trade_date)
             if fills_result["status"] == "CONTRACT_ERROR":
                 logger.error(
                     "[US_TICK][ERROR] fills fetch CONTRACT_ERROR: %s",

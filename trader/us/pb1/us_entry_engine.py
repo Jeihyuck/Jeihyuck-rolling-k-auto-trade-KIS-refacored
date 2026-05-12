@@ -532,9 +532,36 @@ def generate_entry_intents(
 
         import hashlib
         from datetime import date
-        today = (now.date() if now else date.today()).strftime("%Y%m%d")
-        key_raw = f"{symbol}_{today}_BUY"
+        
+        # force_now가 있으면 그 날짜 사용
+        if now:
+            today_str = now.date().strftime("%Y%m%d")
+            trade_date_for_key = now.date().strftime("%Y-%m-%d")
+        else:
+            today_str = date.today().strftime("%Y%m%d")
+            trade_date_for_key = date.today().strftime("%Y-%m-%d")
+        
+        key_raw = f"{symbol}_{today_str}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # Duplicate pre-entry skip: DB에 이미 존재하는 client_order_key 차단
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        try:
+            from trader.us.db.repos import load_today_order_keys
+            existing_keys = load_today_order_keys(trade_date=trade_date_for_key)
+            if client_order_key in existing_keys:
+                track_skip(symbol, "existing_order_key", {"key": client_order_key})
+                logger.info(
+                    "[US_ENTRY][SKIP] symbol=%s reason=existing_order_key key=%s trade_date=%s",
+                    symbol, client_order_key, trade_date_for_key
+                )
+                continue
+        except Exception as exc:
+            logger.warning(
+                "[US_ENTRY][DUPLICATE_CHECK_WARN] symbol=%s: %s",
+                symbol, exc
+            )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Final order cap enforcement: 최종 방어 로직

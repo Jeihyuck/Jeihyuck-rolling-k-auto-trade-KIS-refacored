@@ -408,10 +408,17 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "[US_FORCE_NOW_GUARD][START] force_now=${{ inputs.force_now }} dry_run=${{ inputs.dry_run }} offline=${{ inputs.offline }}"
+            # Trim force_now input (앞뒤 공백 제거)
+            FORCE_NOW_TRIMMED=$(echo "${{ inputs.force_now }}" | xargs)
+            echo "[US_FORCE_NOW_GUARD][START] force_now=${FORCE_NOW_TRIMMED} dry_run=${{ inputs.dry_run }} offline=${{ inputs.offline }}"
             if [ "${{ inputs.dry_run }}" != "true" ] && [ "${{ inputs.offline }}" != "true" ]; then
               echo "::error::force_now manual smoke requires dry_run=true or offline=true"
               exit 1
+            fi
+            # force_now + dry_run=true인 경우 offline 강제
+            if [ "${{ inputs.dry_run }}" = "true" ] && [ "${{ inputs.offline }}" != "true" ]; then
+              echo "[US_FORCE_NOW_GUARD][OFFLINE_FORCED] reason=force_now_dry_run_smoke"
+              echo "FORCE_OFFLINE_FOR_SMOKE=1" >> "$GITHUB_ENV"
             fi
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
@@ -446,11 +453,17 @@ jobs:
                 INTERVAL_SEC="1"
                 echo "[US_TRADE_AM][SMOKE_LOOP] mode activated: offline max_ticks=3 interval=1 max_minutes=10"
               else
-                if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+                # force_now + dry_run 조합 시 offline 강제
+                if [ "${FORCE_OFFLINE_FOR_SMOKE:-0}" = "1" ]; then
+                  OFFLINE_FLAG="--offline"
+                  echo "[US_TRADE_AM][OFFLINE_FORCED] reason=force_now_dry_run_smoke"
+                elif [ "${{ inputs.offline || 'false' }}" = "true" ]; then
                   OFFLINE_FLAG="--offline"
                 fi
                 if [ -n "${{ inputs.force_now }}" ]; then
-                  FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+                  # Trim force_now input
+                  FORCE_NOW_TRIMMED=$(echo "${{ inputs.force_now }}" | xargs)
+                  FORCE_NOW_FLAG="--force-now ${FORCE_NOW_TRIMMED}"
                 fi
                 if [ -n "${{ inputs.max_ticks }}" ] && [ "${{ inputs.max_ticks }}" != "0" ]; then
                   MAX_TICKS_FLAG="--max-ticks ${{ inputs.max_ticks }}"
