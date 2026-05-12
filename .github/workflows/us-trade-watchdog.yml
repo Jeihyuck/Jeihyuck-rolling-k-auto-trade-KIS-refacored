@@ -1,0 +1,229 @@
+name: "US Trade Watchdog"
+# Korean pattern: watchdog auto-recovery for missing scheduled runs
+
+on:
+  schedule:
+    # Every 5 minutes between 12:00-20:00 UTC Mon-Fri
+    # Covers 08:00-16:00 EDT / 07:00-15:00 EST
+    - cron: "*/5 12-20 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: us-trade-watchdog-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check and dispatch missing US workflows
+        uses: actions/github-script@v7
+        env:
+          WATCHDOG_REF: ${{ github.ref_name }}
+        with:
+          script: |
+            const timeZone = 'America/New_York';
+            const locale = 'en-CA';
+            const workflows = {
+              prep: {
+                workflow_id: 'us-trade-prep.yml',
+                workflow_name: 'US Trade Prep',
+                checkWindow: [820, 945],  // 08:20~09:45 ET
+                inputs: {
+                  dry_run: 'false',
+                  offline: 'false',
+                  confirm: 'RUN_US_PREP_MANUAL',
+                  manual_skip_phase_guard: 'false',
+                },
+              },
+              am: {
+                workflow_id: 'us-trade-am.yml',
+                workflow_name: 'US Trade AM',
+                checkWindow: [935, 1130],  // 09:35~11:30 ET
+                inputs: {
+                  dry_run: 'false',
+                  offline: 'false',
+                  confirm: 'RUN_US_AM_MANUAL',
+                  confirm_trade: 'RUN_US_AM_TRADE_MANUAL',
+                },
+              },
+              afternoon: {
+                workflow_id: 'us-trade-afternoon.yml',
+                workflow_name: 'US Trade Afternoon',
+                checkWindow: [1235, 1520],  // 12:35~15:20 ET
+                inputs: {
+                  dry_run: 'false',
+                  offline: 'false',
+                  confirm: 'RUN_US_AFTERNOON_MANUAL',
+                  confirm_trade: 'RUN_US_AFTERNOON_TRADE_MANUAL',
+                },
+              },
+            };
+
+            const now = new Date();
+            const nowParts = new Intl.DateTimeFormat('en-GB', {
+              timeZone,
+              hour12: false,
+              year: 'numeric',
+              month: '2-digit',
+              day: '2-digit',
+              hour: '2-digit',
+              minute: '2-digit',
+            }).formatToParts(now).reduce((acc, part) => {
+              if (part.type !== 'literal') {
+                acc[part.type] = part.value;
+              }
+              return acc;
+            }, {});
+            const nowEt = Number(`${nowParts.hour}${nowParts.minute}`);
+            const todayEt = new Intl.DateTimeFormat(locale, {
+              timeZone,
+              year: 'numeric',
+              month: '2-digit',
+              day: '2-digit',
+            }).format(now);
+
+            core.info(`[US_WATCHDOG][START] now_et=${nowEt} today=${todayEt}`);
+
+            // Check if today is a US trading day
+            function isUsWeekday() {
+              const day = now.getDay();
+              return day >= 1 && day <= 5;
+            }
+
+            if (!isUsWeekday()) {
+              core.info(`[US_WATCHDOG][SKIP] reason=non_trading_day now_day=${now.getDay()}`);
+              return;
+            }
+
+            async function getLatestRunToday(workflowId) {
+              const response = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowId,
+                branch: process.env.WATCHDOG_REF,
+                per_page: 30,
+              });
+
+              const todaysRuns = response.data.workflow_runs
+                .filter((run) => {
+                  if (!['queued', 'in_progress', 'completed'].includes(run.status)) {
+                    return false;
+                  }
+                  const createdDateEt = new Intl.DateTimeFormat(locale, {
+                    timeZone,
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                  }).format(new Date(run.created_at));
+                  return createdDateEt === todayEt;
+                })
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+              return todaysRuns[0] || null;
+            }
+
+            function isHealthyRun(run) {
+              if (!run) {
+                return false;
+              }
+
+              if (run.status === 'queued' || run.status === 'in_progress') {
+                return true;
+              }
+
+              if (run.status === 'completed' && run.conclusion === 'success') {
+                return true;
+              }
+
+              return false;
+            }
+
+            function runStatus(run) {
+              return run ? String(run.status || 'none') : 'none';
+            }
+
+            function runConclusion(run) {
+              if (!run) {
+                return 'none';
+              }
+              return run.conclusion == null ? 'null' : String(run.conclusion);
+            }
+
+            async function dispatchWorkflow(phase, config) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: config.workflow_id,
+                ref: process.env.WATCHDOG_REF,
+                inputs: config.inputs,
+              });
+
+              core.info(
+                `[US_WATCHDOG][DISPATCH] phase=${phase} workflow=${config.workflow_name} inputs=${JSON.stringify(config.inputs)}`
+              );
+            }
+
+            // Check prep (08:20~09:45 ET)
+            if (nowEt >= workflows.prep.checkWindow[0] && nowEt <= workflows.prep.checkWindow[1]) {
+              const prepRun = await getLatestRunToday('us-trade-prep.yml');
+              const prepHealthy = isHealthyRun(prepRun);
+              
+              if (!prepHealthy) {
+                core.info(
+                  `[US_WATCHDOG][CHECK] phase=prep found=0 status=${runStatus(prepRun)} conclusion=${runConclusion(prepRun)}`
+                );
+                await dispatchWorkflow('prep', workflows.prep);
+              } else {
+                core.info(
+                  `[US_WATCHDOG][SKIP] phase=prep reason=already_ran status=${runStatus(prepRun)} conclusion=${runConclusion(prepRun)}`
+                );
+              }
+            }
+
+            // Check AM (09:35~11:30 ET)
+            if (nowEt >= workflows.am.checkWindow[0] && nowEt <= workflows.am.checkWindow[1]) {
+              const amRun = await getLatestRunToday('us-trade-am.yml');
+              const amHealthy = isHealthyRun(amRun);
+              
+              // AM dispatch requires prep to be OK
+              const prepRun = await getLatestRunToday('us-trade-prep.yml');
+              const prepOk = isHealthyRun(prepRun);
+              
+              if (!amHealthy && prepOk) {
+                core.info(
+                  `[US_WATCHDOG][CHECK] phase=am found=0 prep_ok=1 status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                );
+                await dispatchWorkflow('am', workflows.am);
+              } else {
+                const skipReason = !prepOk ? 'prep_not_ok' : 'already_ran';
+                core.info(
+                  `[US_WATCHDOG][SKIP] phase=am reason=${skipReason} prep_ok=${prepOk} status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                );
+              }
+            }
+
+            // Check afternoon (12:35~15:20 ET)
+            if (nowEt >= workflows.afternoon.checkWindow[0] && nowEt <= workflows.afternoon.checkWindow[1]) {
+              const afternoonRun = await getLatestRunToday('us-trade-afternoon.yml');
+              const afternoonHealthy = isHealthyRun(afternoonRun);
+              
+              if (!afternoonHealthy) {
+                core.info(
+                  `[US_WATCHDOG][CHECK] phase=afternoon found=0 status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
+                );
+                await dispatchWorkflow('afternoon', workflows.afternoon);
+              } else {
+                core.info(
+                  `[US_WATCHDOG][SKIP] phase=afternoon reason=already_ran status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
+                );
+              }
+            }
+
+            core.info('[US_WATCHDOG][DONE]');

@@ -57,6 +57,31 @@ prep_result = run_with_timeout(
     timeout_sec=timeout_sec,
 )
 
+# Helper function to write failure sidecar (defined early for timeout/error cases)
+def write_failure_sidecar(reason: str, prep_status: str = "UNKNOWN", locked_count: int = 0, watchlist_load_error: bool = False):
+    """Write failure result sidecar JSON for downstream report generation."""
+    artifact_dir = os.getenv("GITHUB_WORKSPACE") and "artifacts" or "."
+    os.makedirs(artifact_dir, exist_ok=True)
+    result_path = os.path.join(artifact_dir, "us_prep_guard_result.json")
+    with open(result_path, "w") as f:
+        json.dump(
+            {
+                "ok": False,
+                "session": session,
+                "trade_date": trade_date,
+                "trade_date_source": trade_date_source,
+                "force_now": force_now or None,
+                "prep_status": prep_status,
+                "locked_count": locked_count,
+                "min_count": 10,
+                "watchlist_load_error": watchlist_load_error,
+                "reason": reason,
+            },
+            f,
+            indent=2,
+        )
+    print(f"[US_PREP_GUARD][FAILURE_SIDECAR] {result_path}", flush=True)
+
 if prep_result["timeout"]:
     print(
         f"[US_PREP_GUARD][PREP_STATUS][TIMEOUT] trade_date={trade_date} timeout_sec={timeout_sec}",
@@ -66,6 +91,7 @@ if prep_result["timeout"]:
         f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} reason=prep_status_timeout",
         flush=True,
     )
+    write_failure_sidecar("prep_status_timeout")
     sys.exit(1)
 
 if not prep_result["ok"]:
@@ -77,6 +103,7 @@ if not prep_result["ok"]:
         f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} reason=prep_status_error",
         flush=True,
     )
+    write_failure_sidecar("prep_status_error")
     sys.exit(1)
 
 prep = prep_result["value"] or {}
@@ -114,6 +141,7 @@ if watchlist_result["timeout"]:
         f"reason=watchlist_load_timeout prep_status={status}",
         flush=True,
     )
+    write_failure_sidecar("watchlist_load_timeout", prep_status=status, locked_count=0, watchlist_load_error=True)
     sys.exit(1)
 
 if not watchlist_result["ok"]:
@@ -125,6 +153,7 @@ if not watchlist_result["ok"]:
         f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} reason=watchlist_load_error",
         flush=True,
     )
+    write_failure_sidecar("watchlist_load_error", prep_status=status, locked_count=0, watchlist_load_error=True)
     sys.exit(1)
 
 rows = watchlist_result["value"] or []
@@ -150,6 +179,7 @@ if status not in ("OK", "OK_WITH_WARNINGS"):
         f"reason=bad_prep_status prep_status={status} locked_count={locked_count}",
         flush=True,
     )
+    write_failure_sidecar("bad_prep_status", prep_status=status, locked_count=locked_count, watchlist_load_error=watchlist_load_error)
     sys.exit(1)
 
 if locked_count < 10:
@@ -158,6 +188,7 @@ if locked_count < 10:
         f"reason=no_locked_watchlist prep_status={status} locked_count={locked_count}",
         flush=True,
     )
+    write_failure_sidecar("no_locked_watchlist", prep_status=status, locked_count=locked_count, watchlist_load_error=watchlist_load_error)
     sys.exit(1)
 
 # ── Success ───────────────────────────────────────────────────────────────────

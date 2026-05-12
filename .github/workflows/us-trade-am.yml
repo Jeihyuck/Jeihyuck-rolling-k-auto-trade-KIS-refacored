@@ -1,10 +1,13 @@
 name: "US Trade AM"
-# session: am | window: 09:30~12:30 ET | schedule: 13:25 / 14:25 UTC Mon-Fri
+# session: am | window: 09:30~12:30 ET | schedule: early + wait pattern (한국장 패턴)
 
 "on":
   schedule:
-    - cron: "25 13 * * 1-5"
-    - cron: "25 14 * * 1-5"
+    - cron: "15 13 * * 1-5"  # 09:15 EDT / 08:15 EST - early wait
+    - cron: "25 13 * * 1-5"  # 09:25 EDT / 08:25 EST - on target
+    - cron: "35 13 * * 1-5"  # 09:35 EDT / 08:35 EST - early normal  
+    - cron: "15 14 * * 1-5"  # 10:15 EDT / 09:15 EST - recovery
+    - cron: "25 14 * * 1-5"  # 10:25 EDT / 09:25 EST - late recovery
   workflow_dispatch:
     inputs:
       dry_run:
@@ -26,7 +29,7 @@ name: "US Trade AM"
         required: false
         default: ""
       force_now:
-        description: "Manual smoke only. Forced NY datetime, e.g. 2026-05-01T09:35:00-04:00"
+        description: "Manual smoke only. 반드시 US prep/watchlist가 존재하는 날짜를 사용. Example: 2026-05-11T09:35:00-04:00. 날짜에 prep가 없으면 FAILED_PREP_GUARD로 종료된다."
         required: false
         default: ""
       max_ticks:
@@ -138,26 +141,49 @@ jobs:
           now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          target_min=$((9 * 60 + 30))
-          stale_min=$((11 * 60 + 0))  # 11:00 ET까지는 stale로 간주하지 않음 (기존 10:30은 너무 빡빡)
-          max_wait_seconds=900
-          max_wait_min=$((max_wait_seconds / 60))
+          # 한국장 패턴: early cron + wait + recovery window
+          target_min=$((9 * 60 + 30))           # 09:30 ET - market open
+          start_allow_until=$((10 * 60 + 0))    # 10:00 ET - normal window end
+          recovery_until=$((11 * 60 + 30))      # 11:30 ET - recovery window end
+          session_end=$((12 * 60 + 30))         # 12:30 ET - hard session end
+          schedule_expected_min=$((9 * 60 + 15))
+          max_wait_seconds=3600  # 최대 1시간 wait 허용 (한국장 패턴)
 
           should_run=1
           skip_reason=""
           wait_until_target=0
           wait_seconds=0
+          run_window="normal"
+          recovery_run=0
+          missed_trade_window=false
+          delay_seconds=$(( (now_min - schedule_expected_min) * 60 + 10#$now_s ))
 
           if [[ "$event_name" == "schedule" ]]; then
-            if [[ "$now_min" -gt "$stale_min" ]]; then
+            if [[ "$now_min" -gt "$recovery_until" ]]; then
+              # 11:30 이후는 skip
               should_run=0
               skip_reason="skip_stale_start_us_am"
-            elif [[ "$now_min" -lt $((target_min - max_wait_min)) ]]; then
-              should_run=0
-              skip_reason="skip_duplicate_us_am"
+              run_window="stale"
+              missed_trade_window=true
+            elif [[ "$now_min" -gt "$start_allow_until" ]]; then
+              # 10:00~11:30: recovery window
+              run_window="recovery"
+              recovery_run=1
             elif [[ "$now_min" -lt "$target_min" ]]; then
+              # 09:30 이전: wait until target
               wait_until_target=1
-              wait_seconds=$(( (target_min - now_min) * 60 ))
+              wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
+              if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
+              if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
+                should_run=0
+                skip_reason="skip_too_early_us_am"
+                run_window="too_early"
+              else
+                run_window="early_wait"
+              fi
+            else
+              # 09:30~10:00: normal window
+              run_window="normal"
             fi
           fi
 
@@ -170,10 +196,16 @@ jobs:
               if [[ "$confirm_trade" != "RUN_US_AM_TRADE_MANUAL" ]]; then
                 should_run=0
                 skip_reason="manual_us_am_trade_not_confirmed"
+                run_window="manual_blocked"
+              else
+                run_window="manual_trade"
               fi
             elif [[ "$confirm" != "RUN_US_AM_MANUAL" ]]; then
               should_run=0
               skip_reason="manual_us_am_not_confirmed"
+              run_window="manual_blocked"
+            else
+              run_window="manual"
             fi
           fi
 
@@ -184,6 +216,13 @@ jobs:
           echo "wait_until_target=${wait_until_target}" >> "$GITHUB_OUTPUT"
           echo "wait_seconds=${wait_seconds}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "run_window=${run_window}" >> "$GITHUB_OUTPUT"
+          echo "recovery_run=${recovery_run}" >> "$GITHUB_OUTPUT"
+          echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
+          echo "missed_trade_window=${missed_trade_window}" >> "$GITHUB_OUTPUT"
+          
+          echo "[US_TRADE_AM][START_META] schedule_expected=0915 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_TRADE_AM][PHASE_GUARD] should_run=${should_run} run_window=${run_window} recovery_run=${recovery_run} wait_seconds=${wait_seconds} missed_trade_window=${missed_trade_window}"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -218,17 +257,25 @@ jobs:
               print("reason=non_trading_day_signal_only")
           PY
 
-      - name: Verify checkout path
+      - name: Verify checkout path and initialize log
         working-directory: .
         run: |
           set -euo pipefail
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
           test -d repo/trader || { echo "::error::repo/trader missing"; exit 1; }
+          
+          # Clean stale reports and artifacts to prevent mixing with current run
+          echo "[CLEANUP][START] removing stale reports and artifacts"
+          rm -rf repo/reports/us_daily
           mkdir -p repo/artifacts repo/reports/us_daily
+          rm -f repo/artifacts/us_last_stage.txt
+          echo "[CLEANUP][DONE]"
+          
           {
             echo "[US_TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} session_window=0930-1230"
+            echo "[US_TRADE_AM][START_META] schedule_expected=0915 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=0930-1230"
             echo "[US_TRADE_AM][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
@@ -240,12 +287,9 @@ jobs:
         run: |
           set -euo pipefail
           trade_date=$(TZ=America/New_York date +%F)
-          missed_window="false"
-          if [[ "${{ steps.phase_guard.outputs.skip_reason }}" == "skip_stale_start_us_am" ]]; then
-            missed_window="true"
-          fi
+          missed_window="${{ steps.phase_guard.outputs.missed_trade_window || 'false' }}"
           {
-            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=us-am"
+            echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=us-am missed_trade_window=${missed_window}"
             echo "[US_TRADE_AM][EXIT] reason=phase_guard_skip"
           } | tee -a artifacts/${US_LOG_FILE}
           python - <<PY
@@ -332,7 +376,7 @@ jobs:
         run: |
           set -euo pipefail
           wait_seconds="${{ steps.phase_guard.outputs.wait_seconds }}"
-          max_wait_seconds=900
+          max_wait_seconds=3600
           if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
           if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
             echo "::error::wait_seconds too large: ${wait_seconds}"
@@ -341,6 +385,23 @@ jobs:
           echo "[US_WAIT_UNTIL_TARGET][START] session=am wait_seconds=${wait_seconds}" | tee -a artifacts/${US_LOG_FILE}
           sleep "$wait_seconds"
           echo "[US_WAIT_UNTIL_TARGET][DONE] session=am now_et=$(TZ=America/New_York date +%H%M%S)" | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Verify target time reached
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          now_h="$(TZ=America/New_York date +%H)"
+          now_m="$(TZ=America/New_York date +%M)"
+          now_min=$((10#$now_h * 60 + 10#$now_m))
+          target_min=$((9 * 60 + 30))
+          
+          # 한국장 패턴: target time 이후에만 trade session 시작
+          if [[ "$now_min" -lt "$target_min" ]]; then
+            echo "::error::Target time not reached: now=${now_h}:${now_m}, target=09:30"
+            exit 1
+          fi
+          echo "[US_TARGET_TIME_CHECK][OK] now=$(TZ=America/New_York date +%H:%M:%S) target=09:30" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Guard postgres-only
         if: steps.phase_guard.outputs.should_run == '1'
@@ -391,17 +452,6 @@ jobs:
             echo "[US_ENV_CHECK][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
-      - name: Guard same-day US prep contract
-        if: steps.phase_guard.outputs.should_run == '1'
-        timeout-minutes: 2
-        working-directory: repo
-        env:
-          SESSION: am
-          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
-        run: |
-          set -euo pipefail
-          python scripts/guard_us_prep_contract.py 2>&1 | tee -a artifacts/${US_LOG_FILE}
-
       - name: Guard manual force_now safety
         if: github.event_name == 'workflow_dispatch' && inputs.force_now != ''
         working-directory: repo
@@ -422,6 +472,31 @@ jobs:
             fi
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Guard same-day US prep contract
+        if: steps.phase_guard.outputs.should_run == '1'
+        timeout-minutes: 2
+        working-directory: repo
+        env:
+          SESSION: am
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
+          OFFLINE: ${{ inputs.offline || 'false' }}
+          MAX_TICKS: ${{ inputs.max_ticks || '0' }}
+        run: |
+          set +e
+          python scripts/guard_us_prep_contract.py 2>&1 | tee -a artifacts/${US_LOG_FILE}
+          guard_status=${PIPESTATUS[0]}
+          set -e
+          
+          if [ "${guard_status}" -ne 0 ]; then
+            echo "[US_PREP_GUARD][REPORT_WRITE][START]" | tee -a artifacts/${US_LOG_FILE}
+            python scripts/write_us_guard_failure_report.py \
+              --session am \
+              --guard-result artifacts/us_prep_guard_result.json 2>&1 | tee -a artifacts/${US_LOG_FILE}
+            echo "[US_PREP_GUARD][REPORT_WRITE][DONE]" | tee -a artifacts/${US_LOG_FILE}
+            echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_GUARD reason=bad_prep_status session=us-am" | tee -a artifacts/${US_LOG_FILE}
+            exit "${guard_status}"
+          fi
 
       - name: Run US AM trade session
         if: steps.phase_guard.outputs.should_run == '1'
@@ -556,10 +631,70 @@ jobs:
           fi
 
           # Validate report contract
-          python3 -c "import json, sys; from pathlib import Path; p = Path('${latest_json}'); payload = json.loads(p.read_text()); expected = {'trade_date': '${trade_date}', 'run_id': '${GITHUB_RUN_ID}', 'dry_run': '${DRY_RUN}' == '1'}; errs = []; errs.append('trade_date mismatch: {} != {}'.format(payload.get('trade_date'), expected['trade_date'])) if str(payload.get('trade_date')) != expected['trade_date'] else None; errs.append('run_id mismatch: {} != {}'.format(payload.get('run_id'), expected['run_id'])) if str(payload.get('run_id')) != expected['run_id'] else None; errs.append('dry_run mismatch: {} != {}'.format(payload.get('dry_run'), expected['dry_run'])) if bool(payload.get('dry_run')) != expected['dry_run'] else None; errs = [e for e in errs if e]; print('::error::stale_or_invalid_us_report') if errs else None; [print('::error::{}'.format(e)) for e in errs] if errs else None; sys.exit(1) if errs else None; required = ['trade_date','run_id','sha','workflow','session','event_name','env','dry_run','kis_order_allowed','prep_status','locked_watchlist_count','entry_eval_status','entry_error_type','entry_error_message','entry_intents','orders_sent','orders_blocked','block_reasons','fills','positions','last_stage','final_status','reason']; miss = [k for k in required if k not in payload]; print('::error::missing_report_fields {}'.format(miss)) if miss else None; sys.exit(1) if miss else None; print('[US_REPORT][VALID] latest report contract satisfied')"
-
+          python3 - <<'EOF'
+          import json
+          import sys
+          from pathlib import Path
+          
+          latest_json = Path("reports/us_daily/latest_us_daily_report.json")
+          payload = json.loads(latest_json.read_text())
+          
+          # Expected values
+          expected = {
+              "trade_date": "${trade_date}",
+              "run_id": "${GITHUB_RUN_ID}",
+              "dry_run": "${DRY_RUN}" == "1"
+          }
+          
+          # Validate trade_date, run_id, dry_run
+          errs = []
+          if str(payload.get("trade_date")) != expected["trade_date"]:
+              errs.append(f"trade_date mismatch: {payload.get('trade_date')} != {expected['trade_date']}")
+          if str(payload.get("run_id")) != expected["run_id"]:
+              errs.append(f"run_id mismatch: {payload.get('run_id')} != {expected['run_id']}")
+          if bool(payload.get("dry_run")) != expected["dry_run"]:
+              errs.append(f"dry_run mismatch: {payload.get('dry_run')} != {expected['dry_run']}")
+          
+          if errs:
+              print("::error::stale_or_invalid_us_report")
+              for e in errs:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          
+          # Validate required fields
+          required = [
+              "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
+              "dry_run", "kis_order_allowed", "prep_status", "locked_watchlist_count",
+              "entry_eval_status", "entry_error_type", "entry_error_message",
+              "entry_intents", "orders_sent", "orders_blocked", "block_reasons",
+              "fills", "positions", "last_stage", "final_status", "reason"
+          ]
+          miss = [k for k in required if k not in payload]
+          if miss:
+              print(f"::error::missing_report_fields {miss}")
+              sys.exit(1)
+          
+          # Validate final_status is in allowed list
+          allowed_statuses = [
+              "FAILED_PREP_GUARD",
+              "SKIP_PHASE_WINDOW",
+              "NO_ENTRY_INTENTS",
+              "NO_ORDERS_RISK_BLOCKED",
+              "PARTIAL_ORDERS_BLOCKED",
+              "OK_NO_TRADE",
+              "OK_ORDERS_SENT",
+              "OK_WITH_WARNINGS",
+              "FAILED"
+          ]
+          final_status = payload.get("final_status")
+          if final_status not in allowed_statuses:
+              print(f"::error::invalid_final_status: {final_status}")
+              sys.exit(1)
+          
+          print(f"[US_REPORT][VALID] latest report contract satisfied, final_status={final_status}")
+          EOF
+          
           python3 -c "import json; from pathlib import Path; payload = json.loads(Path('reports/us_daily/latest_us_daily_report.json').read_text()); Path('artifacts/us_last_stage.txt').write_text(str(payload.get('last_stage', 'unknown')) + '\n')"
-          PY
 
       - name: Verify US AM log contract
         if: always()
@@ -571,6 +706,14 @@ jobs:
           # Success: phase guard intentionally skipped the AM run.
           if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_TRADE_AM\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_TRADE_AM_VERIFY][SKIP_OK] phase guard skipped AM intentionally"
+            exit 0
+          fi
+
+          # Success: prep guard failure was properly reported
+          if grep -E "\\[US_PREP_GUARD\\]\\[FAIL\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1 && \
+             grep -E "\\[US_PREP_GUARD\\]\\[REPORT_WRITE\\]\\[DONE\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1 && \
+             grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=FAILED_PREP_GUARD" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_AM_VERIFY][GUARD_FAIL_REPORTED] prep guard failure reported clearly"
             exit 0
           fi
 

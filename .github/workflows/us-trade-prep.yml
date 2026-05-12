@@ -1,11 +1,15 @@
 name: "US Trade Prep"
-# prep: universe scoring + watchlist | window: 08:15~09:45 ET | schedule: 12:20 / 13:20 / 14:05 UTC Mon-Fri
+# prep: universe scoring + watchlist | window: 08:15~10:30 ET | schedule: 12:15 / 12:45 / 13:10 / 13:25 / 13:45 / 14:15 UTC Mon-Fri
+# 한국장 패턴 적용: 장 시작 전 충분히 일찍 workflow 시작 + 내부 wait + recovery window
 
 "on":
   schedule:
-    - cron: "20 12 * * 1-5"
-    - cron: "20 13 * * 1-5"
-    - cron: "05 14 * * 1-5"
+    - cron: "15 12 * * 1-5"  # 08:15 EDT / 07:15 EST - primary
+    - cron: "45 12 * * 1-5"  # 08:45 EDT / 07:45 EST - retry
+    - cron: "10 13 * * 1-5"  # 09:10 EDT / 08:10 EST - pre-open
+    - cron: "25 13 * * 1-5"  # 09:25 EDT / 08:25 EST - latest-before-open
+    - cron: "45 13 * * 1-5"  # 09:45 EDT / 08:45 EST - recovery
+    - cron: "15 14 * * 1-5"  # 10:15 EDT / 09:15 EST - late recovery
   workflow_dispatch:
     inputs:
       dry_run:
@@ -116,21 +120,38 @@ jobs:
           now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          target_min=$((8 * 60 + 15))
-          stale_min=$((9 * 60 + 45))
+          # 한국장 패턴: target_min, normal_until, recovery_until
+          target_min=$((8 * 60 + 15))          # 08:15 ET
+          normal_until_min=$((9 * 60 + 45))    # 09:45 ET
+          recovery_until_min=$((10 * 60 + 30)) # 10:30 ET
+          schedule_expected_min=$((8 * 60 + 15))
 
           should_run=1
           skip_reason=""
           wait_until_target=0
           wait_seconds=0
+          run_window="normal"
+          recovery_run=0
+          delay_seconds=$(( (now_min - schedule_expected_min) * 60 + 10#$now_s ))
 
           if [[ "$event_name" == "schedule" ]]; then
-            if [[ "$now_min" -gt "$stale_min" ]]; then
+            if [[ "$now_min" -gt "$recovery_until_min" ]]; then
               should_run=0
               skip_reason="skip_stale_start_us_prep"
+              run_window="stale"
+            elif [[ "$now_min" -gt "$normal_until_min" ]]; then
+              # 09:45~10:30: recovery window
+              run_window="recovery"
+              recovery_run=1
             elif [[ "$now_min" -lt "$target_min" ]]; then
+              # Before 08:15: wait until target
               wait_until_target=1
-              wait_seconds=$(( (target_min - now_min) * 60 ))
+              wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
+              if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
+              run_window="early_wait"
+            else
+              # 08:15~09:45: normal window
+              run_window="normal"
             fi
           fi
 
@@ -140,12 +161,15 @@ jobs:
             if [[ "$skip_phase" == "true" ]]; then
               should_run=1
               skip_reason=""
+              run_window="manual_skip_guard"
             elif [[ "$confirm" == "RUN_US_PREP_MANUAL" ]]; then
               should_run=1
               skip_reason=""
+              run_window="manual"
             else
               should_run=0
               skip_reason="manual_us_prep_not_confirmed"
+              run_window="manual_blocked"
             fi
           fi
 
@@ -156,6 +180,12 @@ jobs:
           echo "wait_until_target=${wait_until_target}" >> "$GITHUB_OUTPUT"
           echo "wait_seconds=${wait_seconds}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "run_window=${run_window}" >> "$GITHUB_OUTPUT"
+          echo "recovery_run=${recovery_run}" >> "$GITHUB_OUTPUT"
+          echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
+          
+          echo "[US_PREP][START_META] schedule_expected=0815 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_PREP][PHASE_GUARD] should_run=${should_run} run_window=${run_window} recovery_run=${recovery_run} wait_seconds=${wait_seconds}"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -163,17 +193,25 @@ jobs:
           path: repo
           fetch-depth: 1
 
-      - name: Verify checkout path
+      - name: Verify checkout path and initialize log
         working-directory: .
         run: |
           set -euo pipefail
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
           test -d repo/trader || { echo "::error::repo/trader missing"; exit 1; }
+          
+          # Clean stale reports and artifacts to prevent mixing with current run
+          echo "[CLEANUP][START] removing stale reports and artifacts"
+          rm -rf repo/reports/us_daily
           mkdir -p repo/artifacts repo/reports/us_daily
+          rm -f repo/artifacts/us_last_stage.txt
+          echo "[CLEANUP][DONE]"
+          
           {
             echo "[US_PREP][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} phase_window=0815-0945"
+            echo "[US_PREP][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} phase_window=0815-1030"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -297,8 +335,69 @@ jobs:
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
-      - name: Run US prep
+      - name: Check if prep already completed
         if: steps.phase_guard.outputs.should_run == '1'
+        id: prep_check
+        working-directory: repo
+        env:
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_PREP][CHECK_ALREADY_PREPARED][START]"
+            python - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          import sys
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          sys.path.insert(0, ".")
+          from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+          
+          force_now = os.getenv("FORCE_NOW_INPUT", "").strip()
+          if force_now:
+              trade_date = datetime.fromisoformat(force_now).date().isoformat()
+          else:
+              trade_date = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+          
+          # Check prep status
+          try:
+              prep = load_latest_us_prep_status(trade_date, timeout_sec=10)
+              if prep and prep["status"] in ("OK", "OK_WITH_WARNINGS"):
+                  # Check locked watchlist count
+                  try:
+                      locked = load_locked_us_watchlist(trade_date, timeout_sec=10)
+                      locked_count = len(locked) if locked else 0
+                      if locked_count >= 10:
+                          print(f"already_prepared=1")
+                          print(f"prep_status={prep['status']}")
+                          print(f"locked_count={locked_count}")
+                          print(f"[US_PREP][ALREADY_PREPARED] trade_date={trade_date} prep_status={prep['status']} locked_count={locked_count}", file=sys.stderr)
+                          sys.exit(0)
+                  except Exception as e:
+                      print(f"[US_PREP][CHECK_WATCHLIST_ERROR] {e}", file=sys.stderr)
+              print(f"already_prepared=0")
+              print(f"prep_status={prep.get('status', 'UNKNOWN') if prep else 'UNKNOWN'}")
+              print(f"locked_count=0")
+          except Exception as e:
+              print(f"[US_PREP][CHECK_PREP_ERROR] {e}", file=sys.stderr)
+              print(f"already_prepared=0")
+              print(f"prep_status=UNKNOWN")
+              print(f"locked_count=0")
+          PY
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Emit already prepared skip summary
+        if: steps.phase_guard.outputs.should_run == '1' && steps.prep_check.outputs.already_prepared == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[RUN_SUMMARY][RESULT] status=OK reason=already_prepared session=us-prep prep_status=${{ steps.prep_check.outputs.prep_status }} locked_count=${{ steps.prep_check.outputs.locked_count }}"
+            echo "[US_PREP][EXIT] reason=already_prepared"
+          } | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Run US prep
+        if: steps.phase_guard.outputs.should_run == '1' && steps.prep_check.outputs.already_prepared != '1'
         timeout-minutes: 30
         working-directory: repo
         run: |
