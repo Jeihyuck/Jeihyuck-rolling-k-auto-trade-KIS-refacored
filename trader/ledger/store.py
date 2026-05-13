@@ -129,14 +129,35 @@ class LedgerStore:
                 if state["first_buy_ts"] is None:
                     state["first_buy_ts"] = row.get("ts")
             elif side == "SELL":
-                cost_basis = qty * (state.get("avg_buy_price") or 0.0)
-                state["realized_pnl"] += qty * price - cost_basis
-                state["realized_cost_basis"] += cost_basis
-                state["total_qty"] -= qty
-                state["total_cost"] -= cost_basis
-                if state["total_qty"] <= 0:
+                current_qty = int(state.get("total_qty") or 0)
+
+                # 🔥 SELL이 BUY보다 먼저 나오거나 avg_buy_price가 없는 경우 방어
+                if current_qty <= 0:
+                    logger.warning(
+                        "[LEDGER][REBUILD][SELL_WITHOUT_BUY] code=%s sid=%s mode=%s qty=%s price=%s action=ignore_for_position",
+                        code, sid, mode, qty, price
+                    )
+                    state["total_qty"] = 0
+                    state["total_cost"] = 0.0
                     state["avg_buy_price"] = None
-                    state["total_qty"] = max(0, state["total_qty"])
+                    continue
+
+                sell_qty = min(qty, current_qty)
+                avg = float(state.get("avg_buy_price") or 0.0)
+                cost_basis = sell_qty * avg
+
+                state["realized_pnl"] += sell_qty * price - cost_basis
+                state["realized_cost_basis"] += cost_basis
+                state["total_qty"] = current_qty - sell_qty
+                state["total_cost"] = max(0.0, float(state.get("total_cost") or 0.0) - cost_basis)
+
+                if state["total_qty"] <= 0:
+                    state["total_qty"] = 0
+                    state["total_cost"] = 0.0
+                    state["avg_buy_price"] = None
+                else:
+                    state["avg_buy_price"] = state["total_cost"] / state["total_qty"]
+        
         # holding days
         now_date = now_kst().date()
         for state in positions.values():
@@ -148,6 +169,14 @@ class LedgerStore:
                     state["holding_days"] = None
             else:
                 state["holding_days"] = None
+        
+        # 🔥 net qty 0 이하인 종목은 반환하지 않음
+        positions = {
+            key: state
+            for key, state in positions.items()
+            if int(state.get("total_qty") or 0) > 0
+        }
+        
         return positions
 
     def compute_returns_pct(self, positions: Dict[Tuple[str, int, int], Dict], marks: Dict[str, float]) -> Dict[Tuple[str, int, int], Dict[str, float | int | None]]:

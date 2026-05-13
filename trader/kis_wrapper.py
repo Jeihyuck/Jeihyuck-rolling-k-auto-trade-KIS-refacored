@@ -3879,8 +3879,20 @@ class KisAPI:
 
         base_qty = hldg if hldg > 0 else ord_psbl
         if base_qty <= 0:
-            logger.error(f"[SELL_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}")
-            return None
+            logger.error(
+                "[SELL_PRECHECK][NO_KIS_HOLDING] pdno=%s hldg=%s ord_psbl=%s action=block",
+                pdno, hldg, ord_psbl,
+            )
+            return {
+                "rt_cd": "PB1_BLOCKED",
+                "msg_cd": "SELL_BLOCKED_NO_KIS_HOLDING",
+                "msg1": "KIS actual holding qty is zero. Sell blocked before API order.",
+                "blocked": True,
+                "skip_reason": "SELL_BLOCKED_NO_KIS_HOLDING",
+                "pdno": safe_strip(pdno),
+                "hldg_qty": hldg,
+                "ord_psbl_qty": ord_psbl,
+            }
 
         if qty > base_qty:
             logger.warning(

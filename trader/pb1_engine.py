@@ -683,6 +683,59 @@ def _calendar_days_held(entry_ts: Any, trade_date: date) -> int:
     return max(0, (trade_date - entry_date).days)
 
 
+def _is_kr_stock_code(code: str | None) -> bool:
+    """한국장 6자리 숫자 종목 코드 판별"""
+    text = str(code or "").strip()
+    return len(text) == 6 and text.isdigit()
+
+
+def _is_kis_balance_authoritative_empty(balance_snapshot: dict | None) -> bool:
+    """
+    KIS balance가 정상 조회되었고 output1=[]이면 한국장 보유는 0개.
+    이 경우 ledger_reconstruct 등 fallback을 금지한다.
+    """
+    if not isinstance(balance_snapshot, dict):
+        return False
+
+    rt_cd = str(balance_snapshot.get("rt_cd") or "0").strip()
+    if rt_cd not in {"", "0"}:
+        return False
+
+    output1 = balance_snapshot.get("output1")
+    output2 = balance_snapshot.get("output2")
+
+    if isinstance(output1, dict):
+        output1_rows = [output1] if output1 else []
+    elif isinstance(output1, list):
+        output1_rows = output1
+    else:
+        output1_rows = []
+
+    if output1_rows:
+        return False
+
+    def _to_int(v):
+        try:
+            return int(float(str(v or "0").replace(",", "")))
+        except Exception:
+            return 0
+
+    out2 = output2
+    if isinstance(out2, list):
+        out2 = out2[0] if out2 and isinstance(out2[0], dict) else {}
+    if not isinstance(out2, dict):
+        out2 = {}
+
+    scts_evlu_amt = _to_int(out2.get("scts_evlu_amt"))
+    pchs_amt_smtl_amt = _to_int(out2.get("pchs_amt_smtl_amt"))
+    evlu_amt_smtl_amt = _to_int(out2.get("evlu_amt_smtl_amt"))
+
+    if scts_evlu_amt == 0 and pchs_amt_smtl_amt == 0 and evlu_amt_smtl_amt == 0:
+        return True
+
+    return False
+
+
 def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: float) -> tuple[float, int]:
     safe_entry_price = float(entry_price or 0.0)
     entry_trade_date = to_kst_date(entry_ts)
@@ -2143,6 +2196,26 @@ class PB1Engine:
             if error is None and max_sec > 0 and elapsed > max_sec:
                 logger.warning("[WARN][PB1][STAGE_TIMEOUT] stage=%s elapsed=%.2f max_sec=%.2f", stage_name, elapsed, max_sec)
                 raise PB1StageTimeout(f"{stage_name}:{elapsed:.2f}>{max_sec:.2f}")
+
+    def _is_kis_kr_context(self) -> bool:
+        """
+        한국장 KIS context 판별.
+        미국장/해외주식에서는 절대 true가 되면 안 된다.
+        """
+        env = str(getattr(self, "env", "") or "").lower()
+        if env not in {"practice", "real", "live"}:
+            return False
+
+        phase = str(getattr(self, "phase", "") or "").lower()
+        window_label = str(getattr(self, "window_label", "") or "").lower()
+
+        if phase in {"trade", "entry", "exit"}:
+            return True
+
+        if window_label in {"am", "afternoon", "day", "morning"}:
+            return True
+
+        return False
 
     def _bump_warning(self, name: str, amount: int = 1) -> None:
         key = str(name or "").strip()
@@ -3754,8 +3827,65 @@ class PB1Engine:
         env: str | None = None,
         intended_live: bool | None = None,
         allow_http: bool | None = None,
+        balance_snapshot: dict | None = None,
     ) -> tuple[list[HoldingContext], dict[str, Any]]:
         del as_of, env, intended_live, allow_http
+
+        # 🔥 KIS empty guard: KIS balance가 정상 조회되었고 output1=[]이면 ledger_reconstruct 금지
+        authoritative_kis = os.getenv("KR_AUTHORITATIVE_KIS_BALANCE_FOR_EXIT", "1") == "1"
+        block_when_kis_empty = os.getenv("KR_BLOCK_LEDGER_RECONSTRUCT_WHEN_KIS_EMPTY", "1") == "1"
+
+        if (
+            authoritative_kis
+            and block_when_kis_empty
+            and self._is_kis_kr_context()
+            and _is_kis_balance_authoritative_empty(balance_snapshot)
+        ):
+            logger.warning(
+                "[EXIT][HOLDINGS][KIS_AUTHORITATIVE_EMPTY] "
+                "source=kis output1_empty=1 action=skip_db_ledger_reconstruct"
+            )
+
+            # stale ledger positions 기록
+            if ledger_positions:
+                stale_codes = [
+                    str((row or {}).get("code") or "").zfill(6)
+                    for row in ledger_positions
+                    if int((row or {}).get("qty") or 0) > 0
+                ]
+                if stale_codes:
+                    logger.warning(
+                        "[EXIT][STALE_LEDGER_POSITIONS] count=%s codes=%s reason=kis_empty_authoritative",
+                        len(stale_codes),
+                        stale_codes,
+                    )
+                    for code in stale_codes:
+                        self._append_ledger_event(
+                            event_type="STALE_LEDGER_POSITION",
+                            code=code,
+                            market=None,
+                            mode=1,
+                            qty=0,
+                            price=None,
+                            client_order_key=None,
+                            side="NONE",
+                            ok=True,
+                            reasons=["KIS_EMPTY_AUTHORITATIVE", "NO_KIS_HOLDING"],
+                            stage="exit_holdings_prep",
+                            payload_json={
+                                "source": "ledger_positions",
+                                "kis_qty": 0,
+                                "action": "skip_exit_order",
+                            },
+                        )
+
+            return [], {
+                "source": "kis_empty_authoritative",
+                "count": 0,
+                "fallback_blocked": True,
+                "reason": "KIS_BALANCE_EMPTY_NO_LEDGER_RECONSTRUCT",
+            }
+
         balance_holdings = self._build_holding_contexts_from_balance_rows(balance_rows, ledger_positions)
         if balance_holdings:
             meta = {
@@ -3766,6 +3896,24 @@ class PB1Engine:
             }
             logger.info("[EXIT][HOLDINGS][SOURCE] source=%s count=%s", meta["source"], len(balance_holdings))
             return balance_holdings, meta
+
+        # 🔥 ledger_reconstruct 허용 조건 제한
+        allow_ledger_fallback = os.getenv("KR_ALLOW_LEDGER_RECONSTRUCT_WITHOUT_KIS", "0") == "1"
+        if (
+            self._is_kis_kr_context()
+            and not allow_ledger_fallback
+            and balance_snapshot is not None
+        ):
+            logger.warning(
+                "[EXIT][HOLDINGS][BLOCK_LEDGER_RECONSTRUCT] "
+                "kis_context=1 balance_empty=1 allow_fallback=0 action=skip_ledger_reconstruct"
+            )
+            return [], {
+                "source": "empty_blocked_ledger_reconstruct",
+                "count": 0,
+                "fallback_blocked": True,
+                "reason": "KIS_BALANCE_EMPTY_NO_LEDGER_RECONSTRUCT",
+            }
 
         position_holdings = self._build_holding_contexts_from_position_rows(ledger_positions)
         if position_holdings:
@@ -3823,6 +3971,7 @@ class PB1Engine:
             env=self.env,
             intended_live=self.intended_live,
             allow_http=bool(self.kis),
+            balance_snapshot=self._balance_snapshot,
         )
         self._exit_holdings_meta = meta
         return holdings
@@ -11450,6 +11599,7 @@ class PB1Engine:
                 env=self.env,
                 intended_live=self.intended_live,
                 allow_http=bool(self.kis),
+                balance_snapshot=self._balance_snapshot,
             )
         logger.info(
             "[PB1][POST_CAPITAL][EXIT_HOLDINGS_PREP][DONE] holdings=%s source=%s",

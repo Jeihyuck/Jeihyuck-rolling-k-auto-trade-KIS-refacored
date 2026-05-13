@@ -4436,6 +4436,167 @@ class LedgerEventsRepo:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
+    def list_net_positions_from_fills(
+        self,
+        env: str,
+        *,
+        strategy: str | None = None,
+        codes: list[str] | None = None,
+        kr_only: bool = True,
+    ) -> list[dict]:
+        """
+        한국장 DB fills 기준 순보유 수량 계산.
+        BUY 합계 - SELL 합계가 0 이하인 종목은 반환하지 않는다.
+        KIS balance unavailable일 때만 fallback 용도로 사용한다.
+        """
+        env_n = _norm_env(env)
+        
+        # PostgreSQL의 경우 SQL로 처리
+        if self.engine.dialect.name == "postgresql":
+            conditions = [self._schema.fills.c.env == env_n]
+            if strategy:
+                conditions.append(self._schema.fills.c.strategy == strategy)
+            if codes:
+                normalized_codes = [str(code or "").zfill(6) for code in codes if str(code or "").strip()]
+                conditions.append(self._schema.fills.c.code.in_(normalized_codes))
+            if kr_only:
+                # 한국장 6자리 숫자 code만
+                conditions.append(sa.text("code ~ '^[0-9]{6}$'"))
+            
+            # GROUP BY + HAVING
+            stmt = (
+                sa.select(
+                    self._schema.fills.c.code,
+                    sa.func.sum(
+                        sa.case(
+                            (sa.func.upper(self._schema.fills.c.side) == "BUY", self._schema.fills.c.qty),
+                            (sa.func.upper(self._schema.fills.c.side) == "SELL", -self._schema.fills.c.qty),
+                            else_=0
+                        )
+                    ).label("net_qty"),
+                    sa.func.sum(
+                        sa.case(
+                            (sa.func.upper(self._schema.fills.c.side) == "BUY", self._schema.fills.c.qty * self._schema.fills.c.price),
+                            else_=0
+                        )
+                    ).label("buy_notional"),
+                    sa.func.sum(
+                        sa.case(
+                            (sa.func.upper(self._schema.fills.c.side) == "BUY", self._schema.fills.c.qty),
+                            else_=0
+                        )
+                    ).label("buy_qty"),
+                    sa.func.max(self._window_expr(self._schema.fills.c.filled_at)).label("last_fill_at"),
+                )
+                .where(and_(*conditions))
+                .group_by(self._schema.fills.c.code)
+                .having(
+                    sa.func.sum(
+                        sa.case(
+                            (sa.func.upper(self._schema.fills.c.side) == "BUY", self._schema.fills.c.qty),
+                            (sa.func.upper(self._schema.fills.c.side) == "SELL", -self._schema.fills.c.qty),
+                            else_=0
+                        )
+                    ) > 0
+                )
+            )
+            
+            with self.engine.begin() as conn:
+                rows = conn.execute(stmt).mappings().all()
+            
+            result = []
+            for row in rows:
+                net_qty = int(row.get("net_qty") or 0)
+                buy_qty = int(row.get("buy_qty") or 0)
+                buy_notional = float(row.get("buy_notional") or 0.0)
+                avg_buy_price = (buy_notional / buy_qty) if buy_qty > 0 else 0.0
+                
+                result.append({
+                    "code": str(row["code"]),
+                    "qty": net_qty,
+                    "avg_buy_price": avg_buy_price,
+                    "last_fill_at": row.get("last_fill_at"),
+                    "source": "db_fills_net",
+                })
+            
+            logger.info(
+                "[DB][READ][OK] op=fills.list_net_positions_from_fills rows=%s kr_only=%s",
+                len(result),
+                int(kr_only),
+            )
+            return result
+        
+        # SQLite/기타: Python fallback
+        stmt = select(self._schema.fills).where(self._schema.fills.c.env == env_n)
+        if strategy:
+            stmt = stmt.where(self._schema.fills.c.strategy == strategy)
+        if codes:
+            normalized_codes = [str(code or "").zfill(6) for code in codes if str(code or "").strip()]
+            stmt = stmt.where(self._schema.fills.c.code.in_(normalized_codes))
+        
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        
+        # Python 집계
+        positions: dict[str, dict] = {}
+        for row in rows:
+            code = str(row["code"] or "").zfill(6)
+            
+            # 한국장 필터
+            if kr_only and not (len(code) == 6 and code.isdigit()):
+                continue
+            
+            side = str(row.get("side") or "").upper()
+            qty = int(row.get("qty") or 0)
+            price = float(row.get("price") or 0.0)
+            filled_at = row.get("filled_at")
+            
+            if code not in positions:
+                positions[code] = {
+                    "net_qty": 0,
+                    "buy_notional": 0.0,
+                    "buy_qty": 0,
+                    "last_fill_at": filled_at,
+                }
+            
+            state = positions[code]
+            
+            if side == "BUY":
+                state["net_qty"] += qty
+                state["buy_notional"] += qty * price
+                state["buy_qty"] += qty
+            elif side == "SELL":
+                state["net_qty"] -= qty
+            
+            if filled_at and (not state["last_fill_at"] or filled_at > state["last_fill_at"]):
+                state["last_fill_at"] = filled_at
+        
+        # net_qty > 0인 종목만 반환
+        result = []
+        for code, state in positions.items():
+            net_qty = int(state["net_qty"])
+            if net_qty <= 0:
+                continue
+            
+            buy_qty = int(state["buy_qty"])
+            buy_notional = float(state["buy_notional"])
+            avg_buy_price = (buy_notional / buy_qty) if buy_qty > 0 else 0.0
+            
+            result.append({
+                "code": code,
+                "qty": net_qty,
+                "avg_buy_price": avg_buy_price,
+                "last_fill_at": state["last_fill_at"],
+                "source": "db_fills_net",
+            })
+        
+        logger.info(
+            "[DB][READ][OK] op=fills.list_net_positions_from_fills rows=%s kr_only=%s",
+            len(result),
+            int(kr_only),
+        )
+        return result
+
 
 class PositionsRepo:
     def __init__(self, engine: Engine):
