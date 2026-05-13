@@ -114,6 +114,7 @@ jobs:
 
       US_MAX_ORDER_USD: "2500"
       US_MAX_DAILY_NOTIONAL_USD: "10000"
+      US_MAX_POSITIONS: "30"
       US_MAX_POSITION_WEIGHT: "0.10"
       US_MIN_CASH_BUFFER_USD: "200"
 
@@ -571,7 +572,7 @@ jobs:
               fi
             fi
 
-            echo "[US_RISK_CONFIG] US_MAX_ORDER_USD=${US_MAX_ORDER_USD} US_MAX_DAILY_NOTIONAL_USD=${US_MAX_DAILY_NOTIONAL_USD} US_MAX_POSITION_WEIGHT=${US_MAX_POSITION_WEIGHT} US_MIN_CASH_BUFFER_USD=${US_MIN_CASH_BUFFER_USD}"
+            echo "[US_RISK_CONFIG] US_MAX_ORDER_USD=${US_MAX_ORDER_USD} US_MAX_DAILY_NOTIONAL_USD=${US_MAX_DAILY_NOTIONAL_USD} US_MAX_POSITIONS=${US_MAX_POSITIONS} US_MAX_POSITION_WEIGHT=${US_MAX_POSITION_WEIGHT} US_MIN_CASH_BUFFER_USD=${US_MIN_CASH_BUFFER_USD}"
             echo "[US_TRADE_AM][START]"
             echo "[US_TRADE_AM][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
             echo "[US_TRADE_AM][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
@@ -765,6 +766,55 @@ jobs:
           echo "::error::US AM final success marker missing"
           exit 1
 
+      - name: Generate US PnL report
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          echo "[US_PNL][START] session=am env=${KIS_ENV}"
+          
+          # PnL report는 항상 생성 시도 (실패해도 FAILED_PNL_REPORT 상태로 파일 생성)
+          python scripts/generate_us_portfolio_pnl_report.py \
+            --session am \
+            --env "${KIS_ENV}" \
+            --output-dir reports/us_pnl \
+            --latest-daily-report reports/us_daily/latest_us_daily_report.json \
+            2>&1 | tee -a artifacts/${US_LOG_FILE} || {
+              echo "::warning::US PnL report generation failed, but continuing"
+            }
+          
+          echo "[US_PNL][DONE]"
+
+      - name: Validate US PnL report
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          test -f reports/us_pnl/latest_us_pnl_report.json || {
+            echo "::error::missing US PnL report JSON"
+            exit 1
+          }
+          test -f reports/us_pnl/latest_us_pnl_report.md || {
+            echo "::error::missing US PnL report MD"
+            exit 1
+          }
+          test -f reports/us_pnl/latest_us_pnl_report.csv || {
+            echo "::error::missing US PnL report CSV"
+            exit 1
+          }
+          
+          # status가 FAILED_PNL_REPORT여도 파일은 있어야 한다
+          pnl_status=$(python3 -c "import json; from pathlib import Path; print(json.loads(Path('reports/us_pnl/latest_us_pnl_report.json').read_text()).get('status', 'UNKNOWN'))")
+          echo "[US_PNL_REPORT][STATUS] ${pnl_status}"
+          
+          if [[ "${pnl_status}" == "FAILED_PNL_REPORT" ]]; then
+            echo "::warning::US PnL report status is FAILED_PNL_REPORT, but files exist"
+          elif [[ "${pnl_status}" == "PARTIAL" ]]; then
+            echo "::warning::US PnL report status is PARTIAL (incomplete data)"
+          else
+            echo "[US_PNL_REPORT][OK] status=${pnl_status}"
+          fi
+
       - name: Upload US artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -773,5 +823,6 @@ jobs:
           path: |
             repo/artifacts/
             repo/reports/us_daily/
+            repo/reports/us_pnl/
           if-no-files-found: warn
           retention-days: 7

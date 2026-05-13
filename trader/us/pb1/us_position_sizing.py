@@ -43,12 +43,18 @@ def calc_position_size(
             "order_cap_usd": float,
         }
     """
-    max_positions = int(os.getenv("US_MAX_POSITIONS", "10"))
+    # 한국장 PB1 기준 반영: 기본값 30, 0이면 무제한
+    max_positions = int(os.getenv("US_MAX_POSITIONS", "30"))
     max_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10"))
     cash_buffer_usd = float(os.getenv("US_MIN_CASH_BUFFER_USD", "200"))
     order_cap_usd = float(os.getenv("US_MAX_ORDER_USD", "2500"))
 
-    if position_count >= max_positions:
+    # US_MAX_POSITIONS=0이면 포지션 수 제한 비활성화
+    if max_positions > 0 and position_count >= max_positions:
+        logger.info(
+            "[US_SIZING][BLOCK] position_count=%d >= max_positions=%d",
+            position_count, max_positions,
+        )
         return {"qty": 0, "notional_usd": 0.0, "position_weight": 0.0,
                 "blocked": True, "reason": "max_positions_reached", "order_cap_usd": order_cap_usd}
 

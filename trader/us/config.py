@@ -42,7 +42,8 @@ ACNT_PRDT_CD: str = os.getenv("ACNT_PRDT_CD_US") or os.getenv("ACNT_PRDT_CD", "0
 # ---------------------------------------------------------------------------
 US_MAX_ORDER_USD: float = float(os.getenv("US_MAX_ORDER_USD", "100"))
 US_MAX_DAILY_NOTIONAL_USD: float = float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", "500"))
-US_MAX_POSITIONS: int = int(os.getenv("US_MAX_POSITIONS", "10"))
+# 한국장 PB1 기준 반영: 기본값 30 (10에서 변경), 0이면 무제한
+US_MAX_POSITIONS: int = int(os.getenv("US_MAX_POSITIONS", "30"))
 US_MAX_POSITION_WEIGHT: float = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10"))
 US_MIN_CASH_BUFFER_USD: float = float(os.getenv("US_MIN_CASH_BUFFER_USD", "50"))
 US_ALLOW_FRACTIONAL_SHARES: bool = env_bool("US_ALLOW_FRACTIONAL_SHARES", default=False)
