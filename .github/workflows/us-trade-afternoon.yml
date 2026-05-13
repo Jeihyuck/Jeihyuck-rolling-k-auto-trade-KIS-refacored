@@ -1,15 +1,11 @@
 name: "US Trade Afternoon"
-# session: afternoon | window: 12:30~15:50 ET | schedule: flexible start + recovery (한국장 패턴)
+# session: afternoon | window: 12:30~15:50 ET | schedule: early start pattern (한국장 trade-afternoon 패턴)
+# workflow starts 11:30 ET, checks prep, waits until 12:30 ET, then executes afternoon session
 
 "on":
   schedule:
-    - cron: "15 16 * * 1-5"  # 12:15 EDT / 11:15 EST - early wait
-    - cron: "25 16 * * 1-5"  # 12:25 EDT / 11:25 EST - target approach
-    - cron: "45 16 * * 1-5"  # 12:45 EDT / 11:45 EST - normal entry
-    - cron: "15 17 * * 1-5"  # 13:15 EDT / 12:15 EST - recovery entry
-    - cron: "25 17 * * 1-5"  # 13:25 EDT / 12:25 EST - late entry
-    - cron: "15 18 * * 1-5"  # 14:15 EDT / 13:15 EST - exit fallback
-    - cron: "45 18 * * 1-5"  # 14:45 EDT / 13:45 EST - late exit fallback
+    - cron: "30 15 * * 1-5"  # 11:30 EDT / 10:30 EST - primary early start
+    - cron: "30 16 * * 1-5"  # 12:30 EDT / 11:30 EST - DST/EST backup early start
   workflow_dispatch:
     inputs:
       dry_run:
@@ -144,14 +140,15 @@ jobs:
           now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          # 한국장 패턴: target은 늦춰도 exit/reconcile은 살린다
+          # 한국장 trade-afternoon 패턴: workflow가 11:30 ET에 떠서 prep check 후 12:30까지 wait
+          prewarm_start_min=$((11 * 60 + 30))       # 11:30 ET - prewarm/prep check start
           target_min=$((12 * 60 + 30))              # 12:30 ET - afternoon target start
           afternoon_allow_until=$((13 * 60 + 30))   # 13:30 ET - normal afternoon end
           recovery_until=$((15 * 60 + 20))          # 15:20 ET - recovery window end
           no_new_entry_after=$((15 * 60 + 45))      # 15:45 ET - block new entry
           session_end=$((15 * 60 + 50))             # 15:50 ET - hard session end
-          schedule_expected_min=$((12 * 60 + 15))
-          max_wait_seconds=1800  # 최대 30분 wait 허용
+          schedule_expected_min=$((11 * 60 + 30))
+          max_wait_seconds=3600  # 최대 60분 wait 허용 (11:30 ~ 12:30)
 
           should_run=1
           skip_reason=""
@@ -179,7 +176,7 @@ jobs:
               recovery_run=1
               route="recovery_afternoon"
             elif [[ "$now_min" -lt "$target_min" ]]; then
-              # 12:30 이전: wait until target
+              # 12:30 이전: wait until target (prep check는 wait 전에 수행)
               wait_until_target=1
               wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
               if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
@@ -233,8 +230,9 @@ jobs:
           echo "route=${route}" >> "$GITHUB_OUTPUT"
           echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
           
-          echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1215 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
-          echo "[US_TRADE_AFTERNOON][BOOT_GUARD] should_run=${should_run} run_window=${run_window} route=${route} recovery_run=${recovery_run} wait_seconds=${wait_seconds}"
+          echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1130 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_TRADE_AFTERNOON][PHASE_GUARD] should_run=${should_run} run_window=${run_window} route=${route} recovery_run=${recovery_run} wait_seconds=${wait_seconds}"
+          echo "[US_TRADE_AFTERNOON][RUN_PLAN] prep_check=true wait_until_1230=true trade_afternoon=true"
 
       - name: Checkout
         uses: actions/checkout@v4

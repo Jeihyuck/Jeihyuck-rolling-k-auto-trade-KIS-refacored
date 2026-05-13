@@ -1,15 +1,11 @@
 name: "US Trade Prep"
-# prep: universe scoring + watchlist | window: 08:15~10:30 ET | schedule: 12:15 / 12:45 / 13:10 / 13:25 / 13:45 / 14:15 UTC Mon-Fri
-# 한국장 패턴 적용: 장 시작 전 충분히 일찍 workflow 시작 + 내부 wait + recovery window
+# prep: universe scoring + watchlist | window: 08:15~10:30 ET
+# NOTE: Primary prep execution moved to us-trade-am.yml workflow (prep check/run before AM session)
+# This workflow serves as manual/recovery fallback only
 
 "on":
   schedule:
-    - cron: "15 12 * * 1-5"  # 08:15 EDT / 07:15 EST - primary
-    - cron: "45 12 * * 1-5"  # 08:45 EDT / 07:45 EST - retry
-    - cron: "10 13 * * 1-5"  # 09:10 EDT / 08:10 EST - pre-open
-    - cron: "25 13 * * 1-5"  # 09:25 EDT / 08:25 EST - latest-before-open
-    - cron: "45 13 * * 1-5"  # 09:45 EDT / 08:45 EST - recovery
-    - cron: "15 14 * * 1-5"  # 10:15 EDT / 09:15 EST - late recovery
+    - cron: "45 13 * * 1-5"  # 09:45 EDT / 08:45 EST - recovery only (if AM workflow failed to prep)
   workflow_dispatch:
     inputs:
       dry_run:

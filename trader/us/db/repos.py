@@ -1463,3 +1463,73 @@ def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:
     except Exception as exc:
         logger.error("[US_WATCHLIST][COUNT][ERROR] %s", exc)
         return 0
+
+
+def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> bool:
+    """Check if US AM session already ran for the given trade_date.
+    
+    Checks:
+    1. us_agent_runs for mode='session-am' or agent_name='am'
+    2. us_orders for any BUY orders on trade_date
+    
+    Returns:
+        True if AM already ran, False otherwise
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        # In-memory: check if any BUY orders exist
+        return any(
+            o.get("trade_date") == trade_date and o.get("direction") == "BUY"
+            for o in _MEM_ORDERS
+        )
+    
+    try:
+        with engine.connect() as conn:
+            # Set statement timeout
+            conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
+            
+            # Check us_agent_runs for AM session marker
+            agent_row = conn.execute(
+                text("""
+                    SELECT run_id, status, finished_at
+                    FROM us_agent_runs
+                    WHERE trade_date = :td
+                      AND (mode = 'session-am' OR agent_name = 'am')
+                      AND status IN ('OK', 'OK_WITH_WARNINGS')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """),
+                {"td": trade_date},
+            ).fetchone()
+            
+            if agent_row:
+                logger.info(
+                    "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found agent_run run_id=%s status=%s",
+                    trade_date, agent_row[0], agent_row[1]
+                )
+                return True
+            
+            # Fallback: check us_orders for BUY orders
+            order_row = conn.execute(
+                text("""
+                    SELECT COUNT(*) as cnt
+                    FROM us_orders
+                    WHERE trade_date = :td
+                      AND direction = 'BUY'
+                    LIMIT 1
+                """),
+                {"td": trade_date},
+            ).fetchone()
+            
+            if order_row and order_row[0] > 0:
+                logger.info(
+                    "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found buy_orders count=%d",
+                    trade_date, order_row[0]
+                )
+                return True
+            
+            return False
+    except Exception as exc:
+        logger.error("[US_AM_ALREADY_RAN][CHECK][ERROR] %s", exc)
+        return False
+

@@ -168,35 +168,49 @@ jobs:
               );
             }
 
-            // Check prep (08:20~09:45 ET)
+            // Check prep (08:20~09:45 ET) - SKIP: prep is now part of us-trade-am workflow
+            // Primary prep execution moved to us-trade-am.yml (prep check/run before AM session)
+            // Watchdog no longer dispatches standalone prep
             if (nowEt >= workflows.prep.checkWindow[0] && nowEt <= workflows.prep.checkWindow[1]) {
               const prepRun = await getLatestRunToday('us-trade-prep.yml');
               const prepHealthy = isHealthyRun(prepRun);
               
-              if (!prepHealthy) {
-                core.info(
-                  `[US_WATCHDOG][CHECK] phase=prep found=0 status=${runStatus(prepRun)} conclusion=${runConclusion(prepRun)}`
-                );
-                await dispatchWorkflow('prep', workflows.prep);
-              } else {
-                core.info(
-                  `[US_WATCHDOG][SKIP] phase=prep reason=already_ran status=${runStatus(prepRun)} conclusion=${runConclusion(prepRun)}`
-                );
-              }
+              core.info(
+                `[US_WATCHDOG][SKIP] phase=prep reason=prep_integrated_into_am prep_status=${runStatus(prepRun)} prep_conclusion=${runConclusion(prepRun)}`
+              );
+              // Do not dispatch standalone prep - it's handled by AM workflow
             }
 
             // Check AM (09:35~11:30 ET)
+            // AM workflow now includes prep check/run, so no prep requirement here
             if (nowEt >= workflows.am.checkWindow[0] && nowEt <= workflows.am.checkWindow[1]) {
               const amRun = await getLatestRunToday('us-trade-am.yml');
               const amHealthy = isHealthyRun(amRun);
               
-              // AM dispatch requires prep to be OK
-              const prepRun = await getLatestRunToday('us-trade-prep.yml');
-              const prepOk = isHealthyRun(prepRun);
-              
-              if (!amHealthy && prepOk) {
+              if (!amHealthy) {
                 core.info(
-                  `[US_WATCHDOG][CHECK] phase=am found=0 prep_ok=1 status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                  `[US_WATCHDOG][CHECK] phase=am found=0 status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                );
+                await dispatchWorkflow('am', workflows.am);
+              } else {
+                core.info(
+                  `[US_WATCHDOG][SKIP] phase=am reason=already_ran status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                );
+              }
+            }
+
+            // Check Afternoon (12:35~15:20 ET)
+            // Afternoon requires AM to have completed (which includes prep)
+            if (nowEt >= workflows.afternoon.checkWindow[0] && nowEt <= workflows.afternoon.checkWindow[1]) {
+              const afternoonRun = await getLatestRunToday('us-trade-afternoon.yml');
+              const afternoonHealthy = isHealthyRun(afternoonRun);
+              
+              const amRun = await getLatestRunToday('us-trade-am.yml');
+              const amOk = isHealthyRun(amRun);
+              
+              if (!afternoonHealthy && amOk) {
+                core.info(
+                  `[US_WATCHDOG][CHECK] phase=afternoon found=0 am_ok=1 status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
                 );
                 await dispatchWorkflow('am', workflows.am);
               } else {
