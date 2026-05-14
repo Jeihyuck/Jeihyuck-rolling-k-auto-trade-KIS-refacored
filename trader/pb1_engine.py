@@ -216,6 +216,7 @@ from trader.minervini_store import write_minervini_signals
 from trader.strategies.pb1_pullback_close import (
     compute_features as compute_pb1_features,
     evaluate_setup as evaluate_pb1_setup,
+    classify_pb1_near_miss,
 )
 
 logger = logging.getLogger(__name__)
@@ -12110,6 +12111,134 @@ class PB1Engine:
                 )
                 setup_ok_codes = [c.code for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_loose_ok", c.setup_ok))]
                 logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
+
+                # === 한국장 PB1 consistency check: raw signal vs pb1 filter ===
+                pb1_filter_setup_ok_count = len(setup_ok_codes)
+                data_ok_candidates = [c for c in candidates if bool(c.features.get("data_ok"))]
+                
+                # raw_signal_setup_ok는 data_ok인 후보 중에서 setup fail이 아닌 것으로 근사
+                # (prep에서 계산된 setup_ok는 final30에 저장되어 있지만, 여기서는 근사치 사용)
+                raw_signal_setup_ok_count = len([c for c in data_ok_candidates if not any(
+                    r in (c.reasons or []) 
+                    for r in ["missing_ma", "volume_missing", "pullback_missing", "ma20_slope_missing"]
+                )])
+
+                if raw_signal_setup_ok_count > 0 and pb1_filter_setup_ok_count == 0:
+                    mismatch_count = raw_signal_setup_ok_count
+                    logger.warning(
+                        "[CONSISTENCY][RAW_VS_PB1][SUMMARY] raw_ok=%s pb1_ok=%s mismatch=%s",
+                        raw_signal_setup_ok_count,
+                        pb1_filter_setup_ok_count,
+                        mismatch_count,
+                    )
+                    
+                    # 상위 10개 종목에 대해 상세 diff 로그 출력
+                    mismatch_candidates = [c for c in data_ok_candidates if c.code not in setup_ok_codes][:10]
+                    for mc in mismatch_candidates:
+                        feat = mc.features
+                        reasons_str = ", ".join(mc.reasons or [])
+                        logger.warning(
+                            "[CONSISTENCY][RAW_VS_PB1][DETAIL] code=%s raw_ok=1 pb1_ok=0 "
+                            "reasons=[%s] vol=%.2f volu=%.2f close=%.0f ma20=%.0f ma50=%.0f "
+                            "ma20_slope=%.4f rs_pct=%.1f atr_pct=%.3f",
+                            mc.code,
+                            reasons_str,
+                            float(feat.get("vol_contraction") or 0),
+                            float(feat.get("volu_contraction") or 0),
+                            float(feat.get("close") or 0),
+                            float(feat.get("ma20") or 0),
+                            float(feat.get("ma50") or 0),
+                            float(feat.get("ma20_slope") or 0),
+                            float(feat.get("rs_percentile") or 0),
+                            float(feat.get("atr_pct") or 0),
+                        )
+
+                # === PB1 relax pass: near-miss 후보 복구 ===
+                pb1_near_miss_candidates: list[CandidateFeature] = []
+                pb1_relax_passes_executed = 0
+                
+                if pb1_filter_setup_ok_count == 0 and self.bootstrap_enabled:
+                    logger.info(
+                        "[PB1][RELAX_PASS][START] reason=empty_after_pb1_filter input=%s",
+                        len(data_ok_candidates),
+                    )
+                    
+                    # Pass 1: vol_contraction_fail 단독
+                    for c in data_ok_candidates:
+                        if _is_kr_stock_code(c.code):
+                            reasons_set = set(c.reasons or [])
+                            # vol_contraction_fail 단독 (soft 제외)
+                            hard_reasons = [r for r in reasons_set if not str(r).startswith("soft:")]
+                            if hard_reasons == ["vol_contraction_fail"]:
+                                near_ok, near_reasons = classify_pb1_near_miss(
+                                    c.features,
+                                    list(reasons_set),
+                                    market=c.market,
+                                    rs_percentile=c.features.get("rs_percentile"),
+                                    atr_max_pct=0.10,
+                                )
+                                if near_ok:
+                                    pb1_near_miss_candidates.append(c)
+                                    logger.info(
+                                        "[PB1][RELAX_PASS][CANDIDATE] pass=1 code=%s reasons=%s action=near_miss",
+                                        c.code,
+                                        hard_reasons,
+                                    )
+                    
+                    pb1_relax_passes_executed = 1
+                    if len(pb1_near_miss_candidates) > 0:
+                        logger.info(
+                            "[PB1][RELAX_PASS][RESULT] pass=1 selected=%s",
+                            len(pb1_near_miss_candidates),
+                        )
+                    
+                    # Pass 2: vol + volu contraction fail 둘 다
+                    if len(pb1_near_miss_candidates) == 0:
+                        for c in data_ok_candidates:
+                            if _is_kr_stock_code(c.code):
+                                reasons_set = set(c.reasons or [])
+                                hard_reasons = [r for r in reasons_set if not str(r).startswith("soft:")]
+                                contraction_only = all(
+                                    r in {"vol_contraction_fail", "volu_contraction_fail"}
+                                    for r in hard_reasons
+                                )
+                                if contraction_only and len(hard_reasons) > 0:
+                                    near_ok, near_reasons = classify_pb1_near_miss(
+                                        c.features,
+                                        list(reasons_set),
+                                        market=c.market,
+                                        rs_percentile=c.features.get("rs_percentile"),
+                                        atr_max_pct=0.10,
+                                    )
+                                    if near_ok and float(c.features.get("rs_percentile") or 0) >= 80:
+                                        pb1_near_miss_candidates.append(c)
+                                        logger.info(
+                                            "[PB1][RELAX_PASS][CANDIDATE] pass=2 code=%s reasons=%s action=near_miss",
+                                            c.code,
+                                            hard_reasons,
+                                        )
+                        
+                        pb1_relax_passes_executed = 2
+                        if len(pb1_near_miss_candidates) > 0:
+                            logger.info(
+                                "[PB1][RELAX_PASS][RESULT] pass=2 selected=%s",
+                                len(pb1_near_miss_candidates),
+                            )
+                    
+                    # Near-miss 후보를 setup_ok로 복구
+                    for c in pb1_near_miss_candidates:
+                        c.setup_ok = True
+                        c.features["setup_loose_ok"] = True
+                        c.features["pb1_near_miss_recovered"] = True
+                        if c.code not in setup_ok_codes:
+                            setup_ok_codes.append(c.code)
+                    
+                    logger.info(
+                        "[PB1][RELAX_PASS][FINAL] selected=%s relax_passes=%s",
+                        len(pb1_near_miss_candidates),
+                        pb1_relax_passes_executed,
+                    )
+
                 minervini_input_codes = list(setup_ok_codes) or [c.code for c in candidates if bool(c.features.get("data_ok"))]
                 t_minervini_start = time.monotonic()
                 signals = compute_minervini_signals(
@@ -12197,6 +12326,35 @@ class PB1Engine:
                     len(buyable_report.get("final_buyable_codes", [])),
                     buyable_report.get("final_buyable_codes", []),
                 )
+                
+                # === Minervini relax bridge: PB1 setup 0개일 때 Minervini relax 후보 연결 ===
+                minervini_bridge_candidates: list[CandidateFeature] = []
+                pb1_setup_ok_before_bridge = len(setup_ok_codes)
+                
+                if pb1_setup_ok_before_bridge == 0 and len(buyable_codes) > 0:
+                    if minervini_rank_only and not minervini_hard_gate:
+                        logger.info(
+                            "[MINERVINI][BRIDGE][START] pb1_setup_ok=%s minervini_relax_count=%s",
+                            pb1_setup_ok_before_bridge,
+                            len(buyable_codes),
+                        )
+                        
+                        for c in candidates:
+                            if c.code in buyable_codes and _is_kr_stock_code(c.code):
+                                # Minervini relax 후보를 bridge로 표시 (setup_ok는 여전히 False)
+                                c.features["setup_source"] = "minervini_relax_bridge"
+                                c.features["minervini_bridge_candidate"] = True
+                                minervini_bridge_candidates.append(c)
+                                logger.info(
+                                    "[MINERVINI][BRIDGE][CANDIDATE] code=%s source=minervini_relax_bridge",
+                                    c.code,
+                                )
+                        
+                        logger.info(
+                            "[MINERVINI][BRIDGE][DONE] bridged=%s note=bridge_candidates_will_go_through_risk_sizing_buyable_gates",
+                            len(minervini_bridge_candidates),
+                        )
+
                 relax_debug_payload["pass_codes"] = pass_codes
                 relax_debug_payload["final_buyable_codes"] = list(buyable_report.get("final_buyable_codes", []))
                 relax_debug_payload["relax_level_used"] = buyable_report.get("relax_level_used")

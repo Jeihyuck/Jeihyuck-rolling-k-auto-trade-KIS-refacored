@@ -185,6 +185,109 @@ def evaluate_setup(
     return (len(reasons) == 0, merged_reasons)
 
 
+def classify_pb1_near_miss(
+    features: dict,
+    reasons: list[str],
+    *,
+    market: str,
+    rs_percentile: float | None = None,
+    trend_score: float | None = None,
+    atr_max_pct: float = 0.10,
+) -> tuple[bool, list[str]]:
+    """
+    한국장 PB1 setup near-miss 판정.
+
+    목적:
+    - vol_contraction_fail 단독 또는 contraction 계열 단독 실패로 전 종목이 탈락하는 문제 방지
+    - 단, 추세/MA/ATR 핵심 리스크 조건은 유지
+
+    반환:
+    - near_miss_ok: True이면 near-miss 복구 가능
+    - near_miss_reasons: 복구 허용/거부 사유
+    """
+    hard_reasons = set(reasons or [])
+
+    # 절대 차단: 핵심 리스크 조건
+    hard_blockers = {
+        "close_below_ma20",
+        "close_below_ma",
+        "ma20_slope_hard_fail",
+        "ma20_slope_missing",
+        "missing_ma",
+        "pullback_missing",
+        "volume_missing",
+    }
+
+    if hard_reasons & hard_blockers:
+        return False, ["hard_blocker_present"]
+
+    # contraction 계열만 허용
+    allowed_contraction_only = {
+        "vol_contraction_fail",
+        "volu_contraction_fail",
+    }
+
+    # contraction 이외의 hard reason이 있으면 차단
+    non_contraction_reasons = [
+        r for r in hard_reasons
+        if r not in allowed_contraction_only and not str(r).startswith("soft:")
+    ]
+
+    if non_contraction_reasons:
+        return False, ["non_contraction_hard_reason"]
+
+    # 핵심 가격/MA 검증
+    close = features.get("close")
+    ma20 = features.get("ma20")
+    ma50 = features.get("ma50")
+    slope = features.get("ma20_slope")
+    atr_pct = features.get("atr_pct")
+
+    try:
+        close = float(close)
+        ma20 = float(ma20)
+        ma50 = float(ma50) if ma50 is not None else None
+    except Exception:
+        return False, ["missing_price_or_ma"]
+
+    # close > ma20 절대 조건
+    if not (close > ma20):
+        return False, ["close_not_above_ma20"]
+
+    # ma50이 있으면 97% 이상 유지
+    if ma50 is not None and not (close > ma50 * 0.97):
+        return False, ["too_far_below_ma50"]
+
+    # ma20_slope 절대 조건
+    try:
+        slope_value = float(slope)
+    except Exception:
+        return False, ["slope_missing"]
+
+    if slope_value <= PB1_MA20_SLOPE_HARD_FAIL_MIN:
+        return False, ["ma20_slope_hard_fail"]
+
+    # ATR 초과 차단
+    try:
+        atr_value = float(atr_pct or 0)
+    except Exception:
+        atr_value = 999
+
+    if atr_value > atr_max_pct:
+        return False, ["atr_too_high"]
+
+    # RS percentile 최소 조건
+    if rs_percentile is not None:
+        try:
+            if float(rs_percentile) < 75:
+                return False, ["rs_too_low_for_near_miss"]
+        except Exception:
+            pass
+
+    # 모든 조건 통과: contraction 단독 실패만 있음
+    return True, ["contraction_only_near_miss"]
+
+
 def choose_mode(features: Dict[str, float]) -> Tuple[int, List[str]]:
     reasons: List[str] = []
     trend = features.get("trend_strength") or 0
