@@ -86,12 +86,13 @@ def _fmt_pct(v: float) -> str:
 def _load_engine():
     """DB engine 로드. 실패 시 None 반환."""
     try:
-        from trader.db.engine import make_engine
-        db_url = os.getenv("PBCORE_DB_URL") or os.getenv("DATABASE_URL")
-        if not db_url:
+        from trader.db.engine import get_engine
+
+        if not (os.getenv("PBCORE_DB_URL") or os.getenv("DATABASE_URL")):
             logger.warning("[US_PNL][DB_SKIP] PBCORE_DB_URL not set")
             return None
-        return make_engine(db_url)
+
+        return get_engine()
     except Exception as exc:
         logger.warning("[US_PNL][DB_ENGINE_FAIL] err=%s", exc)
         traceback.print_exc()
@@ -102,22 +103,25 @@ def _load_kis_balance(env: str) -> dict | None:
     """KIS  practice 잔고 조회. 실패 시 None."""
     try:
         logger.info("[US_PNL][KIS_BALANCE][TRY] env=%s", env)
-        from trader.kis_client import KISClient
-        from trader import config as kr_config
-        
-        kis = KISClient(
-            app_key=os.getenv("KIS_APP_KEY", ""),
-            app_secret=os.getenv("KIS_APP_SECRET", ""),
-            rest_url=os.getenv("KIS_REST_URL", ""),
-            env=env,
-        )
-        
-        cano = os.getenv("CANO", "")
-        acnt_prdt_cd = os.getenv("ACNT_PRDT_CD", "01")
-        
-        balance = kis.get_us_balance(cano=cano, acnt_prdt_cd=acnt_prdt_cd)
-        logger.info("[US_PNL][KIS_BALANCE][OK] positions=%d", len(balance.get("positions", [])))
-        return balance
+
+        from trader.us.execution.kis_us_client import KisUSClient
+
+        kis = KisUSClient(env=env)
+        raw = kis.get_us_balance()
+
+        positions = raw.get("output1", [])
+        if isinstance(positions, dict):
+            positions = [positions]
+        elif not isinstance(positions, list):
+            positions = []
+
+        logger.info("[US_PNL][KIS_BALANCE][OK] positions=%d", len(positions))
+
+        return {
+            "raw": raw,
+            "positions": positions,
+            "summary": raw.get("output2", {}),
+        }
     except Exception as exc:
         logger.warning("[US_PNL][KIS_BALANCE][FAIL] err=%s", exc)
         traceback.print_exc()
@@ -221,66 +225,90 @@ def generate_us_pnl_report(
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     warnings = []
     status = "OK"
+
+    # ── no-trade final_status 처리 ─────────────────────────────────────
+    NO_TRADE_STATUSES = {
+        "FAILED_PREP_GUARD",
+        "FAILED_PREP_CONTRACT",
+        "SKIP_PHASE_WINDOW",
+        "FAILED_DRY_RUN_CONTRACT",
+        "NO_ENTRY_INTENTS",
+        "OK_NO_TRADE",
+    }
     
     # ── 데이터 소스 확보 ───────────────────────────────────────────────
     daily_report = _load_latest_daily_report(latest_daily_report)
     
-    engine = _load_engine()
-    
-    kis_balance = None
-    if env == "practice":
-        kis_balance = _load_kis_balance(env)
-        if kis_balance is None:
-            warnings.append("kis_balance_unavailable")
-    
-    db_positions = []
-    db_fills = []
-    if engine is not None:
-        db_positions = _load_db_positions(engine, trade_date)
-        db_fills = _load_db_fills(engine, trade_date)
-        if not db_positions:
-            warnings.append("db_positions_empty")
-        if not db_fills:
-            warnings.append("db_fills_empty")
+    # no-trade 상태이면 empty report 생성 후 바로 반환
+    if daily_report and daily_report.get("final_status") in NO_TRADE_STATUSES:
+        final_status = daily_report["final_status"]
+        logger.info("[US_PNL][NO_TRADE] final_status=%s — generating no-trade PnL report", final_status)
+        warnings.append(f"no_trade_{final_status.lower()}")
+        status = "OK"
+        # Skip KIS/DB fetches — report 0 positions/fills
+        positions = []
+        db_fills = []
+        data_source = "no_trade"
+        orders_sent_total = 0
     else:
-        warnings.append("db_engine_unavailable")
-    
-    # ── positions 결정 ────────────────────────────────────────────────
-    positions = []
-    data_source = "unknown"
-    
-    if kis_balance and kis_balance.get("positions"):
-        positions = kis_balance["positions"]
-        data_source = "kis_balance"
-        logger.info("[US_PNL][POSITIONS][SOURCE] kis_balance count=%d", len(positions))
-    elif db_positions:
-        positions = db_positions
-        data_source = "db_snapshot"
-        logger.info("[US_PNL][POSITIONS][SOURCE] db_snapshot count=%d", len(positions))
-    elif daily_report and daily_report.get("positions"):
-        # daily_report의 positions가 단순 개수일 수도 있으므로 주의
-        pos_count = daily_report.get("positions", 0)
-        if isinstance(pos_count, int):
-            warnings.append("daily_report_positions_count_only")
-            logger.warning("[US_PNL][POSITIONS][SOURCE] daily_report_count_only=%d", pos_count)
+        engine = _load_engine()
+        
+        kis_balance = None
+        if env == "practice":
+            kis_balance = _load_kis_balance(env)
+            if kis_balance is None:
+                warnings.append("kis_balance_unavailable")
+        
+        db_positions = []
+        db_fills = []
+        if engine is not None:
+            db_positions = _load_db_positions(engine, trade_date)
+            db_fills = _load_db_fills(engine, trade_date)
+            if not db_positions:
+                warnings.append("db_positions_empty")
+            if not db_fills:
+                warnings.append("db_fills_empty")
         else:
-            positions = daily_report.get("positions", [])
-            data_source = "daily_report"
-            logger.info("[US_PNL][POSITIONS][SOURCE] daily_report count=%d", len(positions))
+            warnings.append("db_engine_unavailable")
+        
+        # ── positions 결정 ────────────────────────────────────────────────
+        positions = []
+        data_source = "unknown"
+        
+        if kis_balance and kis_balance.get("positions"):
+            positions = kis_balance["positions"]
+            data_source = "kis_balance"
+            logger.info("[US_PNL][POSITIONS][SOURCE] kis_balance count=%d", len(positions))
+        elif db_positions:
+            positions = db_positions
+            data_source = "db_snapshot"
+            logger.info("[US_PNL][POSITIONS][SOURCE] db_snapshot count=%d", len(positions))
+        elif daily_report and daily_report.get("positions"):
+            # daily_report의 positions가 단순 개수일 수도 있으므로 주의
+            pos_count = daily_report.get("positions", 0)
+            if isinstance(pos_count, int):
+                warnings.append("daily_report_positions_count_only")
+                logger.warning("[US_PNL][POSITIONS][SOURCE] daily_report_count_only=%d", pos_count)
+            else:
+                positions = daily_report.get("positions", [])
+                data_source = "daily_report"
+                logger.info("[US_PNL][POSITIONS][SOURCE] daily_report count=%d", len(positions))
+        
+        if not positions:
+            status = "PARTIAL"
+            warnings.append("missing_position_source")
+            logger.warning("[US_PNL][POSITIONS][MISSING] no valid source found — generating empty report")
+        elif warnings:
+            status = "PARTIAL"
+
+        orders_sent_total = 0
+        if daily_report:
+            orders_sent_total = daily_report.get("orders_sent_total", 0)
+            if orders_sent_total == 0:
+                orders_sent_total = daily_report.get("orders_sent", 0)
     
-    if not positions:
-        status = "FAILED_PNL_REPORT"
-        warnings.append("missing_position_source")
-        logger.error("[US_PNL][POSITIONS][MISSING] no valid source found")
-    elif warnings:
-        status = "PARTIAL"
-    
-    #  ── orders_sent_total ─────────────────────────────────────────────
-    orders_sent_total = 0
-    if daily_report:
-        orders_sent_total = daily_report.get("orders_sent_total", 0)
-        if orders_sent_total == 0:
-            orders_sent_total = daily_report.get("orders_sent", 0)
+    #  ── orders_sent_total (no-trade 브랜치에서 이미 설정됨) ──────────────────
+    # (already set in the branch above — do not overwrite)
     
     # ── PnL 계산 ──────────────────────────────────────────────────────
     total_market_value_usd = 0.0

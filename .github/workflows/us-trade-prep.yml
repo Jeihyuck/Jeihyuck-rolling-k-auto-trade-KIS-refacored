@@ -1,11 +1,12 @@
 name: "US Trade Prep"
-# prep: universe scoring + watchlist | window: 08:15~10:30 ET
-# NOTE: Primary prep execution moved to us-trade-am.yml workflow (prep check/run before AM session)
-# This workflow serves as manual/recovery fallback only
+# prep: universe scoring + locked watchlist | primary window: 07:00 ET
+# This workflow is the primary US prep workflow.
+# US Trade AM consumes this completed prep result and must not run prep itself.
 
 "on":
   schedule:
-    - cron: "45 13 * * 1-5"  # 09:45 EDT / 08:45 EST - recovery only (if AM workflow failed to prep)
+    - cron: "00 11 * * 1-5"  # 07:00 EDT
+    - cron: "00 12 * * 1-5"  # 07:00 EST
   workflow_dispatch:
     inputs:
       dry_run:
@@ -116,11 +117,11 @@ jobs:
           now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
-          # 한국장 패턴: target_min, normal_until, recovery_until
-          target_min=$((8 * 60 + 15))          # 08:15 ET
-          normal_until_min=$((9 * 60 + 45))    # 09:45 ET
-          recovery_until_min=$((10 * 60 + 30)) # 10:30 ET
-          schedule_expected_min=$((8 * 60 + 15))
+          # US prep primary schedule
+          target_min=$((7 * 60 + 0))            # 07:00 ET
+          normal_until_min=$((7 * 60 + 30))     # 07:30 ET
+          recovery_until_min=$((8 * 60 + 10))   # 08:10 ET
+          schedule_expected_min=$((7 * 60 + 0))
 
           should_run=1
           skip_reason=""
@@ -132,21 +133,22 @@ jobs:
 
           if [[ "$event_name" == "schedule" ]]; then
             if [[ "$now_min" -gt "$recovery_until_min" ]]; then
+              # 08:10 이후: skip
               should_run=0
               skip_reason="skip_stale_start_us_prep"
               run_window="stale"
             elif [[ "$now_min" -gt "$normal_until_min" ]]; then
-              # 09:45~10:30: recovery window
+              # 07:30~08:10: recovery window
               run_window="recovery"
               recovery_run=1
             elif [[ "$now_min" -lt "$target_min" ]]; then
-              # Before 08:15: wait until target
+              # Before 07:00: wait until target
               wait_until_target=1
               wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
               if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
               run_window="early_wait"
             else
-              # 08:15~09:45: normal window
+              # 07:00~07:30: normal window
               run_window="normal"
             fi
           fi
@@ -180,7 +182,7 @@ jobs:
           echo "recovery_run=${recovery_run}" >> "$GITHUB_OUTPUT"
           echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
           
-          echo "[US_PREP][START_META] schedule_expected=0815 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_PREP][START_META] schedule_expected=0700 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
           echo "[US_PREP][PHASE_GUARD] should_run=${should_run} run_window=${run_window} recovery_run=${recovery_run} wait_seconds=${wait_seconds}"
 
       - name: Checkout
@@ -206,8 +208,8 @@ jobs:
           
           {
             echo "[US_PREP][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_PREP][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} phase_window=0815-1030"
+            echo "[US_PREP][START_META] schedule_expected=0700 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} phase_window=0700-0810"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -423,6 +425,96 @@ jobs:
 
             echo "[US_PREP][DONE]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Verify US prep contract
+        if: steps.phase_guard.outputs.should_run == '1' && steps.prep_check.outputs.already_prepared != '1'
+        id: prep_contract
+        timeout-minutes: 3
+        working-directory: repo
+        env:
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${FORCE_NOW_INPUT}" ]; then
+            TRADE_DATE=$(python -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_INPUT}').date().isoformat())")
+          else
+            TRADE_DATE=$(TZ=America/New_York date +%F)
+          fi
+          export TRADE_DATE
+
+          echo "[US_PREP][CONTRACT][VERIFY] trade_date=${TRADE_DATE}" | tee -a artifacts/${US_LOG_FILE}
+
+          TRADE_DATE="${TRADE_DATE}" python - <<'PY' > prep_contract_result.txt 2>&1
+          import os
+          import sys
+          sys.path.insert(0, ".")
+          from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+
+          trade_date = os.getenv("TRADE_DATE")
+          if not trade_date:
+              raise RuntimeError("[US_PREP][BUG] TRADE_DATE env missing")
+
+          prep = load_latest_us_prep_status(trade_date, timeout_sec=10)
+          prep_status = prep.get("status", "UNKNOWN") if prep else "UNKNOWN"
+          prep_run_id = prep.get("run_id", "") if prep else ""
+
+          try:
+              locked = load_locked_us_watchlist(trade_date, min_count=10, allow_degraded=False, timeout_sec=10)
+              locked_count = len(locked) if locked else 0
+          except Exception as e:
+              print(f"[US_PREP][CONTRACT][WATCHLIST_ERROR] {e}", file=sys.stderr)
+              locked_count = 0
+
+          try:
+              score_nonzero = sum(1 for w in (locked or []) if float(w.get("score", 0) or 0) > 0)
+          except Exception:
+              score_nonzero = locked_count  # fallback
+
+          can_proceed = prep_status in ("OK", "OK_WITH_WARNINGS") and locked_count >= 10 and score_nonzero > 0
+
+          print(f"prep_status={prep_status}")
+          print(f"prep_run_id={prep_run_id}")
+          print(f"locked_count={locked_count}")
+          print(f"score_nonzero_count={score_nonzero}")
+          print(f"trade_can_proceed={'1' if can_proceed else '0'}")
+
+          if can_proceed:
+              print(
+                  f"[US_PREP][CONTRACT][OK] trade_date={trade_date} "
+                  f"prep_status={prep_status} locked_count={locked_count} score_nonzero={score_nonzero}",
+                  file=sys.stderr,
+              )
+          else:
+              print(
+                  f"[US_PREP][CONTRACT][FAIL] trade_date={trade_date} "
+                  f"prep_status={prep_status} locked_count={locked_count} score_nonzero={score_nonzero}",
+                  file=sys.stderr,
+              )
+          PY
+
+          cat prep_contract_result.txt | tee -a artifacts/${US_LOG_FILE}
+
+          PREP_STATUS=$(grep "^prep_status=" prep_contract_result.txt | cut -d= -f2 || echo "UNKNOWN")
+          LOCKED_COUNT=$(grep "^locked_count=" prep_contract_result.txt | cut -d= -f2 || echo "0")
+          SCORE_NONZERO=$(grep "^score_nonzero_count=" prep_contract_result.txt | cut -d= -f2 || echo "0")
+          CAN_PROCEED=$(grep "^trade_can_proceed=" prep_contract_result.txt | cut -d= -f2 || echo "0")
+          PREP_RUN_ID=$(grep "^prep_run_id=" prep_contract_result.txt | cut -d= -f2 || echo "")
+
+          echo "prep_status=${PREP_STATUS}" >> "$GITHUB_OUTPUT"
+          echo "locked_count=${LOCKED_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "score_nonzero_count=${SCORE_NONZERO}" >> "$GITHUB_OUTPUT"
+          echo "trade_can_proceed=${CAN_PROCEED}" >> "$GITHUB_OUTPUT"
+          echo "prep_run_id=${PREP_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+          if [ "${CAN_PROCEED}" != "1" ]; then
+            echo "[US_PREP][CONTRACT][FAIL] reason=contract_failed prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
+            echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_CONTRACT reason=contract_failed session=us-prep" | tee -a artifacts/${US_LOG_FILE}
+            exit 1
+          fi
+
+          echo "[US_PREP][CONTRACT][OK] trade_date=${TRADE_DATE} prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT} score_nonzero=${SCORE_NONZERO}" | tee -a artifacts/${US_LOG_FILE}
+          echo "[RUN_SUMMARY][RESULT] status=OK reason=prep_completed session=us-prep" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Verify US Prep log contract
         if: always()

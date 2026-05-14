@@ -1,6 +1,7 @@
 name: "US Trade AM"
-# session: am | window: 09:30~12:30 ET | schedule: early start pattern (한국장 trade-am 패턴)
-# workflow starts 08:15 ET, checks/runs prep, waits until 09:30 ET, then executes AM session
+# session: am | prewarm: 08:15 ET | trade window: 09:30~12:30 ET
+# AM consumes the completed 07:00 ET US prep result.
+# AM must not run prep itself. If prep is missing or invalid, fail with FAILED_PREP_GUARD.
 
 "on":
   schedule:
@@ -224,7 +225,7 @@ jobs:
           
           echo "[US_TRADE_AM][START_META] schedule_expected=0815 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
           echo "[US_TRADE_AM][PHASE_GUARD] should_run=${should_run} run_window=${run_window} recovery_run=${recovery_run} wait_seconds=${wait_seconds} missed_trade_window=${missed_trade_window}"
-          echo "[US_TRADE_AM][RUN_PLAN] prep=check_or_run wait_until_0930=true trade_am=true"
+          echo "[US_TRADE_AM][RUN_PLAN] prep=verify_only wait_until_0930=true trade_am=true"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -276,7 +277,7 @@ jobs:
           
           {
             echo "[US_TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_TRADE_AM][START_META] schedule_expected=0915 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_TRADE_AM][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[US_TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=0930-1230"
             echo "[US_TRADE_AM][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
@@ -442,162 +443,105 @@ jobs:
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
-      - name: Check or run US prep inside AM workflow
+      - name: Verify completed US prep contract
         if: steps.phase_guard.outputs.should_run == '1'
         id: prep_exec
-        timeout-minutes: 15
+        timeout-minutes: 3
         working-directory: repo
         env:
           SESSION: am
           FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
-          OFFLINE: ${{ inputs.offline || 'false' }}
-          MAX_TICKS: ${{ inputs.max_ticks || '0' }}
         run: |
           set -euo pipefail
-          {
-            echo "[US_TRADE_AM][PREP_CHECK][START]"
-            
-            # Determine trade_date
-            if [ -n "${FORCE_NOW_INPUT}" ]; then
-              TRADE_DATE=$(python -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_INPUT}').date().isoformat())")
-            else
-              TRADE_DATE=$(TZ=America/New_York date +%F)
-            fi
-            echo "[US_TRADE_AM][PREP_CHECK] trade_date=${TRADE_DATE}"
-            
-            # Check prep status and locked watchlist
-            python - <<'PY' >> prep_check_result.txt 2>&1
+
+          echo "[US_TRADE_AM][PREP_VERIFY][START]" | tee -a artifacts/${US_LOG_FILE}
+
+          if [ -n "${FORCE_NOW_INPUT}" ]; then
+            TRADE_DATE=$(python -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_INPUT}').date().isoformat())")
+          else
+            TRADE_DATE=$(TZ=America/New_York date +%F)
+          fi
+          export TRADE_DATE
+
+          echo "[US_TRADE_AM][PREP_VERIFY] trade_date=${TRADE_DATE}" | tee -a artifacts/${US_LOG_FILE}
+
+          TRADE_DATE="${TRADE_DATE}" python - <<'PY' > prep_verify_result.txt 2>&1
           import os
           import sys
+
           sys.path.insert(0, ".")
+
           from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
-          
+
           trade_date = os.getenv("TRADE_DATE")
-          
-          # Check prep status
+          if not trade_date:
+              raise RuntimeError("[US_TRADE_AM][BUG] TRADE_DATE env missing")
+
           prep = load_latest_us_prep_status(trade_date, timeout_sec=10)
           prep_status = prep.get("status", "UNKNOWN") if prep else "UNKNOWN"
-          
-          # Check locked watchlist
+          prep_run_id = prep.get("run_id", "") if prep else ""
+
           try:
-              locked = load_locked_us_watchlist(trade_date, timeout_sec=10)
+              locked = load_locked_us_watchlist(
+                  trade_date,
+                  min_count=10,
+                  allow_degraded=False,
+                  timeout_sec=10,
+              )
               locked_count = len(locked) if locked else 0
           except Exception as e:
               print(f"[US_TRADE_AM][WATCHLIST_LOAD_ERROR] {e}", file=sys.stderr)
               locked_count = 0
-          
-          # Determine if prep can be reused
-          can_reuse = prep_status in ("OK", "OK_WITH_WARNINGS") and locked_count >= 10
-          
-          print(f"prep_status={prep_status}")
-          print(f"locked_count={locked_count}")
-          print(f"can_reuse={'1' if can_reuse else '0'}")
-          
-          if can_reuse:
-              print(f"[US_TRADE_AM][PREP_REUSE] trade_date={trade_date} prep_status={prep_status} locked_count={locked_count}", file=sys.stderr)
-          else:
-              print(f"[US_TRADE_AM][PREP_RUN_NEEDED] trade_date={trade_date} prep_status={prep_status} locked_count={locked_count}", file=sys.stderr)
-          PY
-            
-            cat prep_check_result.txt | tee -a artifacts/${US_LOG_FILE}
-            CAN_REUSE=$(grep "^can_reuse=" prep_check_result.txt | cut -d= -f2)
-            PREP_STATUS=$(grep "^prep_status=" prep_check_result.txt | cut -d= -f2)
-            LOCKED_COUNT=$(grep "^locked_count=" prep_check_result.txt | cut -d= -f2)
-            
-            echo "prep_status=${PREP_STATUS}" >> "$GITHUB_OUTPUT"
-            echo "locked_count=${LOCKED_COUNT}" >> "$GITHUB_OUTPUT"
-            
-            if [ "${CAN_REUSE}" = "1" ]; then
-              echo "prep_mode=reused" >> "$GITHUB_OUTPUT"
-              echo "[US_TRADE_AM][PREP_MODE] reused" | tee -a artifacts/${US_LOG_FILE}
-            else
-              # Run prep
-              echo "[US_TRADE_AM][PREP_RUN][START]" | tee -a artifacts/${US_LOG_FILE}
-              
-              # Build prep command
-              PREP_CMD="python -m trader.us.runner.dispatcher --mode prep --env practice"
-              if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-                if [ -n "${FORCE_NOW_INPUT}" ]; then
-                  FORCE_NOW_TRIMMED=$(echo "${FORCE_NOW_INPUT}" | xargs)
-                  PREP_CMD="${PREP_CMD} --force-now ${FORCE_NOW_TRIMMED}"
-                fi
-                if [ "${OFFLINE}" = "true" ] || [ "${FORCE_OFFLINE_FOR_SMOKE:-0}" = "1" ]; then
-                  PREP_CMD="${PREP_CMD} --offline"
-                fi
-              fi
-              
-              echo "[US_TRADE_AM][PREP_CMD] ${PREP_CMD}" | tee -a artifacts/${US_LOG_FILE}
-              ${PREP_CMD} 2>&1 | tee -a artifacts/${US_LOG_FILE}
-              PREP_EXIT=${PIPESTATUS[0]}
-              
-              if [ "${PREP_EXIT}" -ne 0 ]; then
-                echo "[US_TRADE_AM][PREP_RUN][FAILED] exit_code=${PREP_EXIT}" | tee -a artifacts/${US_LOG_FILE}
-                echo "prep_mode=failed" >> "$GITHUB_OUTPUT"
-                echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_GUARD reason=prep_execution_failed session=us-am" | tee -a artifacts/${US_LOG_FILE}
-                exit 1
-              fi
-              
-              echo "[US_TRADE_AM][PREP_RUN][DONE]" | tee -a artifacts/${US_LOG_FILE}
-              echo "prep_mode=executed" >> "$GITHUB_OUTPUT"
-              
-              # Re-check prep status after execution
-              python - <<'PY' >> prep_recheck_result.txt 2>&1
-          import os
-          import sys
-          sys.path.insert(0, ".")
-          from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
-          
-          trade_date = os.getenv("TRADE_DATE")
-          
-          prep = load_latest_us_prep_status(trade_date, timeout_sec=10)
-          prep_status = prep.get("status", "UNKNOWN") if prep else "UNKNOWN"
-          
-          try:
-              locked = load_locked_us_watchlist(trade_date, timeout_sec=10)
-              locked_count = len(locked) if locked else 0
-          except Exception as e:
-              locked_count = 0
-          
-          print(f"prep_status_after={prep_status}")
-          print(f"locked_count_after={locked_count}")
-          PY
-              
-              cat prep_recheck_result.txt | tee -a artifacts/${US_LOG_FILE}
-              PREP_STATUS=$(grep "^prep_status_after=" prep_recheck_result.txt | cut -d= -f2)
-              LOCKED_COUNT=$(grep "^locked_count_after=" prep_recheck_result.txt | cut -d= -f2)
-              
-              echo "prep_status=${PREP_STATUS}" >> "$GITHUB_OUTPUT"
-              echo "locked_count=${LOCKED_COUNT}" >> "$GITHUB_OUTPUT"
-            fi
-            
-            echo "[US_TRADE_AM][PREP_CHECK][DONE] prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
-          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
-      - name: Verify US prep contract
-        if: steps.phase_guard.outputs.should_run == '1'
-        working-directory: repo
-        run: |
-          set -euo pipefail
-          {
-            PREP_STATUS="${{ steps.prep_exec.outputs.prep_status }}"
-            LOCKED_COUNT="${{ steps.prep_exec.outputs.locked_count }}"
-            
-            echo "[US_TRADE_AM][PREP_CONTRACT][CHECK] prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}"
-            
-            if [[ "${PREP_STATUS}" != "OK" && "${PREP_STATUS}" != "OK_WITH_WARNINGS" ]]; then
-              echo "[US_TRADE_AM][PREP_CONTRACT][FAIL] reason=bad_prep_status prep_status=${PREP_STATUS}"
-              echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_GUARD reason=bad_prep_status session=us-am"
-              exit 1
-            fi
-            
-            if [[ "${LOCKED_COUNT}" -lt 10 ]]; then
-              echo "[US_TRADE_AM][PREP_CONTRACT][FAIL] reason=insufficient_locked_count locked_count=${LOCKED_COUNT}"
-              echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_GUARD reason=insufficient_locked_count session=us-am"
-              exit 1
-            fi
-            
-            echo "[US_TRADE_AM][PREP_CONTRACT][OK] prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}"
-          } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+          can_trade = prep_status in ("OK", "OK_WITH_WARNINGS") and locked_count >= 10
+
+          print(f"prep_status={prep_status}")
+          print(f"prep_run_id={prep_run_id}")
+          print(f"locked_count={locked_count}")
+          print(f"can_trade={'1' if can_trade else '0'}")
+
+          if can_trade:
+              print(
+                  f"[US_TRADE_AM][PREP_VERIFY][OK] trade_date={trade_date} "
+                  f"prep_status={prep_status} locked_count={locked_count} run_id={prep_run_id}",
+                  file=sys.stderr,
+              )
+          else:
+              print(
+                  f"[US_TRADE_AM][PREP_VERIFY][FAIL] trade_date={trade_date} "
+                  f"prep_status={prep_status} locked_count={locked_count} run_id={prep_run_id}",
+                  file=sys.stderr,
+              )
+          PY
+
+          cat prep_verify_result.txt | tee -a artifacts/${US_LOG_FILE}
+
+          CAN_TRADE=$(grep "^can_trade=" prep_verify_result.txt | cut -d= -f2 || echo "0")
+          PREP_STATUS=$(grep "^prep_status=" prep_verify_result.txt | cut -d= -f2 || echo "UNKNOWN")
+          PREP_RUN_ID=$(grep "^prep_run_id=" prep_verify_result.txt | cut -d= -f2 || echo "")
+          LOCKED_COUNT=$(grep "^locked_count=" prep_verify_result.txt | cut -d= -f2 || echo "0")
+
+          echo "prep_status=${PREP_STATUS}" >> "$GITHUB_OUTPUT"
+          echo "prep_run_id=${PREP_RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "locked_count=${LOCKED_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "prep_mode=verified" >> "$GITHUB_OUTPUT"
+
+          if [ "${CAN_TRADE}" != "1" ]; then
+            echo "[US_TRADE_AM][PREP_CONTRACT][FAIL] reason=bad_or_missing_prep prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
+
+            python scripts/write_us_guard_failure_report.py \
+              --session am \
+              --trade-date "${TRADE_DATE}" \
+              --reason bad_or_missing_prep \
+              --prep-status "${PREP_STATUS}" \
+              --locked-count "${LOCKED_COUNT}" \
+              --final-status FAILED_PREP_GUARD 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+            echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_GUARD reason=bad_or_missing_prep session=us-am" | tee -a artifacts/${US_LOG_FILE}
+            exit 1
+          fi
+
+          echo "[US_TRADE_AM][PREP_CONTRACT][OK] prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT} prep_run_id=${PREP_RUN_ID}" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Wait until US AM target start
         if: steps.phase_guard.outputs.should_run == '1' && steps.phase_guard.outputs.wait_until_target == '1'
@@ -632,8 +576,8 @@ jobs:
           fi
           echo "[US_TARGET_TIME_CHECK][OK] session=am now=$(TZ=America/New_York date +%H:%M:%S) target=09:30" | tee -a artifacts/${US_LOG_FILE}
 
-      - name: Guard same-day US prep contract
-        if: false  # Replaced by "Check or run US prep inside AM workflow" step above
+      - name: Guard same-day US prep contract (disabled)
+        if: false  # Replaced by "Verify completed US prep contract" step above
         timeout-minutes: 2
         working-directory: repo
         env:
@@ -689,6 +633,7 @@ jobs:
             else
               TRADE_DATE=$(TZ=America/New_York date +%F)
             fi
+            export TRADE_DATE
             
             # Check if AM already ran today
             python - <<'PY' >> already_ran_result.txt 2>&1
@@ -698,6 +643,8 @@ jobs:
           from trader.us.db.repos import check_us_am_already_ran
           
           trade_date = os.getenv("TRADE_DATE")
+          if not trade_date:
+              raise RuntimeError("[US_TRADE_AM][BUG] TRADE_DATE env missing")
           
           # Check AM marker/report
           try:
