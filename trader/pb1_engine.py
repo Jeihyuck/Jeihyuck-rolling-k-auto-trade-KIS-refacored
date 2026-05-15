@@ -4989,18 +4989,100 @@ class PB1Engine:
         return entry_ok, resolved_reasons
 
     @staticmethod
-    def _entry_ohlcv_block_reason(*, df: pd.DataFrame, meta: dict[str, Any] | None) -> str | None:
-        if os.getenv("PB1_BLOCK_INSUFFICIENT_OHLCV", "0") != "1":
+    def _is_precomputed_order_context_usable(cf: Any) -> bool:
+        """precomputed feature + stop 계산이 충분해 trade 판단 가능한지 확인.
+
+        필수: close/last_close/current_price, atr/atr_pct, ma20, ma50, ma150,
+              rs_percentile/rs_pctile, entry_style_selected, qty>0/planned_qty>0
+        """
+        features = getattr(cf, "features", None) or {}
+
+        def _has(key: str) -> bool:
+            v = features.get(key)
+            return v is not None and str(v).strip() not in ("", "None", "nan")
+
+        has_close = _has("close") or _has("last_close") or _has("current_price")
+        has_atr = _has("atr") or _has("atr14") or _has("atr_pct")
+        has_ma = _has("ma20") and _has("ma50") and _has("ma150")
+        has_rs = _has("rs_percentile") or _has("rs_pctile")
+        has_style = _has("entry_style_selected")
+        has_qty = (
+            int(getattr(cf, "planned_qty", 0) or 0) > 0
+            or int(features.get("qty") or 0) > 0
+        )
+        return all([has_close, has_atr, has_ma, has_rs, has_style, has_qty])
+
+    @staticmethod
+    def _entry_ohlcv_block_reason(
+        *,
+        df: "pd.DataFrame",
+        meta: "dict[str, Any] | None",
+        cf: Any = None,
+        stop0: "float | None" = None,
+        order_price: float = 0.0,
+    ) -> "str | None":
+        """OHLCV 부족 시 주문 차단 여부 결정.
+
+        새 정책 (Fix 2/3):
+        - PB1_BLOCK_INSUFFICIENT_OHLCV=0 (기본) → 기존처럼 차단 안함.
+        - PB1_BLOCK_INSUFFICIENT_OHLCV=1 이지만 precomputed_ok=1 + stop_ready=1 이면
+          PB1_BLOCK_INSUFFICIENT_OHLCV_WHEN_PRECOMPUTED_OK=0 (기본) 시 차단 안함.
+        - 신규상장 수준 (rows < PB1_MIN_OHLCV_ROWS_FOR_ENTRY=60) 이면 항상 차단.
+        """
+        block_enabled = os.getenv("PB1_BLOCK_INSUFFICIENT_OHLCV", "0") == "1"
+        if not block_enabled:
             return None
+
         source = str((meta or {}).get("source") or "").strip().lower()
-        required_rows = max(int(PB1_MIN_CANDLES or 0), 120)
-        if df is None or df.empty or len(df) < required_rows:
+        # 신규상장 수준: 절대 최소 rows (기본 60)
+        abs_min_rows = int(os.getenv("PB1_MIN_OHLCV_ROWS_FOR_ENTRY", "60") or "60")
+        actual_rows = len(df) if (df is not None and not df.empty) else 0
+
+        # 신규상장 수준이면 precomputed 여부와 무관하게 차단
+        if actual_rows < abs_min_rows:
             return "insufficient_ohlcv"
-        if bool((meta or {}).get("long_fetch_blocked", 0) or 0):
-            return "insufficient_ohlcv"
+
+        # db source가 명시적 부족/차단 상태이면 차단
         if source.startswith("db_insufficient") or source in {"db_short_only", "db_blocked"}:
             return "insufficient_ohlcv"
-        return None
+
+        # long_fetch_blocked=True 이거나 required_rows 미달인 경우
+        long_blocked = bool((meta or {}).get("long_fetch_blocked", 0) or 0)
+        required_rows = max(int(PB1_MIN_CANDLES or 0), 120)
+        rows_short = (df is None or df.empty or len(df) < required_rows) or long_blocked
+
+        if not rows_short:
+            return None
+
+        # PB1_BLOCK_INSUFFICIENT_OHLCV_WHEN_PRECOMPUTED_OK=1 이면 기존처럼 무조건 차단
+        block_when_precomputed_ok = (
+            os.getenv("PB1_BLOCK_INSUFFICIENT_OHLCV_WHEN_PRECOMPUTED_OK", "0") == "1"
+        )
+        if block_when_precomputed_ok:
+            return "insufficient_ohlcv"
+
+        # precomputed_ok + stop_ready 이면 경고만 하고 차단하지 않음
+        precomputed_ok = False
+        stop_ready = False
+        if cf is not None:
+            from trader.pb1_engine import Pb1Engine  # noqa: F401 – avoid circular ref at call site
+            precomputed_ok = Pb1Engine._is_precomputed_order_context_usable(cf)
+            stop_ready = (
+                stop0 is not None
+                and float(stop0) > 0
+                and order_price > 0
+                and float(stop0) < float(order_price)
+            )
+        if precomputed_ok and stop_ready:
+            logger.warning(
+                "[PB1][ORDER][OHLCV_SHORT_BUT_PRECOMPUTED_OK] code=%s rows=%s full_required=%s action=continue",
+                getattr(cf, "code", "unknown"),
+                actual_rows,
+                required_rows,
+            )
+            return None
+
+        return "insufficient_ohlcv"
 
     def _log_entry_gate(
         self,
@@ -12918,32 +13000,58 @@ class PB1Engine:
                             if self.phase == "entry" and cf.code in buyable_codes:
                                 pivot_val = self._to_float(cf.features.get("pivot"))
                                 if pivot_val and order_price > 0:
-                                    if order_price <= pivot_val * 1.003:
-                                        self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
-                                        buyable_stage_counter["pivot_not_broken"] += 1
-                                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
-                                        self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
-                                        self._emit_buy_decision(
-                                            cf,
-                                            order_value=order_value,
-                                            reasons=["pivot_not_broken"],
-                                            entry_allowed=entry_allowed,
-                                            entry_reason=entry_reason,
+                                    # Fix: PULLBACK 계열은 pivot hard gate 미적용
+                                    _pv_entry_style = str(
+                                        cf.features.get("entry_style_selected")
+                                        or cf.features.get("entry_component")
+                                        or cf.features.get("family")
+                                        or ""
+                                    ).upper()
+                                    _is_pullback_style = "PULLBACK" in _pv_entry_style
+                                    _require_pivot_for_pullback = (
+                                        os.getenv("PB1_REQUIRE_PIVOT_FOR_PULLBACK", "0") == "1"
+                                    )
+                                    _apply_pivot_hard_gate = (
+                                        not _is_pullback_style or _require_pivot_for_pullback
+                                    )
+                                    if not _apply_pivot_hard_gate:
+                                        logger.info(
+                                            "[PB1][PIVOT_GATE][POLICY] code=%s style=%s apply=0 reason=pullback_style_no_pivot_required",
+                                            cf.code,
+                                            _pv_entry_style,
                                         )
-                                        continue
-                                    if order_price > pivot_val * 1.03:
-                                        self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
-                                        buyable_stage_counter["pivot_overshoot"] += 1
-                                        self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
-                                        self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
-                                        self._emit_buy_decision(
-                                            cf,
-                                            order_value=order_value,
-                                            reasons=["pivot_overshoot"],
-                                            entry_allowed=entry_allowed,
-                                            entry_reason=entry_reason,
+                                    else:
+                                        logger.info(
+                                            "[PB1][PIVOT_GATE][POLICY] code=%s style=%s apply=1 reason=breakout_or_momentum",
+                                            cf.code,
+                                            _pv_entry_style,
                                         )
-                                        continue
+                                        if order_price <= pivot_val * 1.003:
+                                            self._record_drop(drop_reason_counter, drop_examples, "pivot_not_broken", cf.code)
+                                            buyable_stage_counter["pivot_not_broken"] += 1
+                                            self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_not_broken"])
+                                            self._log_order_skip(cf, ["pivot_not_broken"], "PB1-CLOSE")
+                                            self._emit_buy_decision(
+                                                cf,
+                                                order_value=order_value,
+                                                reasons=["pivot_not_broken"],
+                                                entry_allowed=entry_allowed,
+                                                entry_reason=entry_reason,
+                                            )
+                                            continue
+                                        if order_price > pivot_val * 1.03:
+                                            self._record_drop(drop_reason_counter, drop_examples, "pivot_overshoot", cf.code)
+                                            buyable_stage_counter["pivot_overshoot"] += 1
+                                            self._log_buyable_gate(code=cf.code, ok=False, reasons=["pivot_overshoot"])
+                                            self._log_order_skip(cf, ["pivot_overshoot"], "PB1-CLOSE")
+                                            self._emit_buy_decision(
+                                                cf,
+                                                order_value=order_value,
+                                                reasons=["pivot_overshoot"],
+                                                entry_allowed=entry_allowed,
+                                                entry_reason=entry_reason,
+                                            )
+                                            continue
                         if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):
                             reject_reason = "BUYABLE_GATE_TIMEOUT"
                             self._record_drop(drop_reason_counter, drop_examples, reject_reason, cf.code)
