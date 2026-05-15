@@ -173,6 +173,7 @@ from trader.db.repos import (
     UniverseRepo,
     WatchlistRepo,
     load_final30_scored_db_only,
+    load_price_daily_bulk,
 )
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.kis_wrapper import KisAPI, KISBlockedError, extract_order_no, is_order_accepted
@@ -5042,6 +5043,32 @@ class PB1Engine:
         if actual_rows < abs_min_rows:
             return "insufficient_ohlcv"
 
+        # ── [KR][PB1] precomputed trade bypass ──────────────────────────────
+        # 한국장 PB1 trade-am/trade-afternoon에서 precomputed 피처가 충분하면
+        # db_short_only / long_fetch_blocked 상태여도 주문 후보 생성 허용.
+        # 해외장/공통 경로에서는 절대 적용되지 않도록 scope guard 적용.
+        if cf is not None and actual_rows >= abs_min_rows:
+            _code_val = str(getattr(cf, "code", "") or "")
+            _session = str(os.getenv("PB1_SESSION_KIND", "")).strip().lower()
+            _mode = str(os.getenv("MODE", "")).strip().lower()
+            _long_blocked = bool((meta or {}).get("long_fetch_blocked", 0) or 0)
+            _is_kr_trade_precomputed = (
+                _mode == "trade"
+                and _is_kr_stock_code(_code_val)
+                and _session in ("am", "afternoon", "pm")
+                and _long_blocked  # precomputed_only 상태 확인
+            )
+            if _is_kr_trade_precomputed:
+                _precomputed_ok = PB1Engine._is_precomputed_order_context_usable(cf)
+                if _precomputed_ok:
+                    logger.info(
+                        "[KR][PB1][ORDER][OHLCV_SHORT_BUT_PRECOMPUTED_OK] code=%s rows=%s requested=%s action=continue reason=kr_pb1_precomputed_trade",
+                        _code_val,
+                        actual_rows,
+                        abs_min_rows,
+                    )
+                    return None
+
         # db source가 명시적 부족/차단 상태이면 차단
         if source.startswith("db_insufficient") or source in {"db_short_only", "db_blocked"}:
             return "insufficient_ohlcv"
@@ -5065,8 +5092,7 @@ class PB1Engine:
         precomputed_ok = False
         stop_ready = False
         if cf is not None:
-            from trader.pb1_engine import Pb1Engine  # noqa: F401 – avoid circular ref at call site
-            precomputed_ok = Pb1Engine._is_precomputed_order_context_usable(cf)
+            precomputed_ok = PB1Engine._is_precomputed_order_context_usable(cf)
             stop_ready = (
                 stop0 is not None
                 and float(stop0) > 0
@@ -10199,7 +10225,112 @@ class PB1Engine:
         trend_strength = float(feats.get("trend_strength") or 0.0)
         return (pullback, vol_c, volu_c, -trend_strength)
 
+    def _kr_pb1_batch_preload_ohlcv(self, codes: list[str], days: int = 60) -> None:
+        """한국장 PB1 전용 OHLCV batch preload.
+
+        final30 30개 종목의 60일 OHLCV를 단일 DB 커넥션으로 한 번에 조회해
+        daily_cache에 저장한다. 이후 _compute_candidates_from_codes에서
+        종목별 DB 연결 반복을 방지해 PB1_FILTER 속도를 개선한다.
+
+        해외장/공통 OHLCV 캐시와 분리된다 – KR 6자리 코드만 처리.
+        """
+        from trader.cache_ttl import daily_cache, DAILY_BAR_TTL_SEC
+        from trader.data.ohlcv_provider import OHLCVResult
+        from trader.utils.ohlcv import normalize_ohlcv
+        from trader.db.engine import make_engine
+        from trader.time_utils import now_kst
+
+        kr_codes = [c for c in (codes or []) if _is_kr_stock_code(c)]
+        if not kr_codes:
+            return
+
+        session_kind = str(os.getenv("PB1_SESSION_KIND", "")).strip().lower()
+        logger.info(
+            "[KR][PB1][OHLCV][BATCH_PRELOAD][START] codes=%s days=%s session=%s",
+            len(kr_codes),
+            days,
+            session_kind,
+        )
+        t_start = time.monotonic()
+
+        end_date = now_kst().date()
+        from datetime import timedelta
+        start_date = end_date - timedelta(days=max(days, 90))
+
+        try:
+            engine = make_engine()
+            bulk_map = load_price_daily_bulk(engine, kr_codes, start_date, end_date)
+        except Exception as exc:
+            logger.warning("[KR][PB1][OHLCV][BATCH_PRELOAD][ERROR] err=%s", exc)
+            return
+
+        hit = 0
+        miss = 0
+        for code in kr_codes:
+            candles = bulk_map.get(code) or []
+            cache_key = ("daily", code, days)
+            if daily_cache.get(cache_key) is not None:
+                # 이미 캐시에 있으면 건너뜀
+                hit += 1
+                continue
+            if not candles:
+                miss += 1
+                continue
+            try:
+                df_raw = pd.DataFrame(candles)
+                df_norm, meta_norm = normalize_ohlcv(df_raw)
+                df_norm = df_norm.sort_values("date").tail(days)
+                meta_norm.update(
+                    {
+                        "provider": "kis",
+                        "source": "db",
+                        "rows": len(df_norm),
+                        "stale_ok": True,
+                        "refresh_failed": False,
+                        "batch_preloaded": True,
+                    }
+                )
+                result = OHLCVResult(df=df_norm, meta=meta_norm)
+                daily_cache.set(cache_key, result, DAILY_BAR_TTL_SEC)
+                logger.debug(
+                    "[KR][PB1][OHLCV][CACHE][HIT] code=%s days=%s source=batch_preload rows=%s",
+                    code,
+                    days,
+                    len(df_norm),
+                )
+                hit += 1
+            except Exception as exc:
+                logger.debug("[KR][PB1][OHLCV][BATCH_PRELOAD][SKIP] code=%s err=%s", code, exc)
+                miss += 1
+
+        elapsed = time.monotonic() - t_start
+        logger.info(
+            "[KR][PB1][OHLCV][BATCH_PRELOAD][DONE] hit=%s miss=%s elapsed=%.2f",
+            hit,
+            miss,
+            elapsed,
+        )
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
+        # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
+        # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
+        # 미리 캐시에 로드해 종목별 반복 커넥션을 방지한다.
+        _session = str(os.getenv("PB1_SESSION_KIND", "")).strip().lower()
+        _mode = str(os.getenv("MODE", "")).strip().lower()
+        _kr_pb1_scope = (
+            _mode == "trade"
+            and _session in ("am", "afternoon", "pm")
+            and bool(self._precomputed_final30_map)
+        )
+        if _kr_pb1_scope:
+            _final30_source = "db_pb1_watchlist_final_scored"
+            logger.info(
+                "[KR][PB1][SCOPE] enabled=1 market=KR source=%s session=%s",
+                _final30_source,
+                _session,
+            )
+            self._kr_pb1_batch_preload_ohlcv(list(codes or []), days=60)
+
         code_market = {
             str(m.get("code") or "").zfill(6): (m.get("market") or "")
             for m in (self._load_universe() or [])
@@ -13329,7 +13460,9 @@ class PB1Engine:
                         )
                         continue
                     df, meta = self._fetch_daily(cf.code)
-                    ohlcv_block_reason = self._entry_ohlcv_block_reason(df=df, meta=meta)
+                    ohlcv_block_reason = self._entry_ohlcv_block_reason(
+                        df=df, meta=meta, cf=cf, order_price=order_price
+                    )
                     if ohlcv_block_reason:
                         self._record_drop(drop_reason_counter, drop_examples, ohlcv_block_reason, cf.code)
                         order_stage_counter[ohlcv_block_reason] += 1

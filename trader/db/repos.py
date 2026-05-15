@@ -5364,6 +5364,58 @@ def load_price_daily(engine: Engine, code: str, start_date: date, end_date: date
     )
 
 
+def load_price_daily_bulk(
+    engine: Engine,
+    codes: List[str],
+    start_date: date,
+    end_date: date,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """한국장 PB1 전용 bulk OHLCV 조회 – 단일 DB 커넥션으로 여러 종목 로드.
+
+    Returns:
+        code -> list[candle] 형태의 dict
+    """
+    if not codes:
+        return {}
+
+    def _op() -> Dict[str, List[Dict[str, Any]]]:
+        schema = schema_for_engine(engine)
+        with engine.connect() as conn:
+            stmt = (
+                sa.select(schema.price_daily)
+                .where(
+                    and_(
+                        schema.price_daily.c.code.in_(codes),
+                        schema.price_daily.c.date >= start_date,
+                        schema.price_daily.c.date <= end_date,
+                    )
+                )
+                .order_by(schema.price_daily.c.code, schema.price_daily.c.date)
+            )
+            rows = conn.execute(stmt).fetchall()
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            code_key = str(row.code)
+            candle = {
+                "date": row.date.strftime("%Y%m%d"),
+                "open": float(row.open) if row.open else None,
+                "high": float(row.high) if row.high else None,
+                "low": float(row.low) if row.low else None,
+                "close": float(row.close) if row.close else None,
+                "volume": float(row.volume) if row.volume else None,
+                "value": float(row.value) if row.value else None,
+            }
+            result.setdefault(code_key, []).append(candle)
+        return result
+
+    return run_with_db_retry(
+        engine,
+        fn=_op,
+        operation="load_price_daily_bulk",
+        max_attempts=3,
+    )
+
+
 def upsert_price_daily_conn(conn: sa.Connection, candles: List[Dict[str, Any]], market: str, code: str) -> None:
     if not candles:
         return
