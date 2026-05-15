@@ -5014,6 +5014,77 @@ class PB1Engine:
         return all([has_close, has_atr, has_ma, has_rs, has_style, has_qty])
 
     @staticmethod
+    def _is_kr_pb1_precomputed_trade_ok(
+        cf: Any,
+        ohlcv_df: "pd.DataFrame | None",
+    ) -> bool:
+        """KR PB1 final30 precomputed 경로 신규 BUY에서 OHLCV 단기 완화 허용 여부.
+
+        조건을 모두 만족해야 True:
+        1. KR 6자리 숫자 종목코드
+        2. mode_reasons에 'pb1_from_final30' 포함 (final30 locked source 경로)
+        3. ohlcv rows >= 60 (신규상장 방어 최솟값)
+        4. 필수 precomputed feature 11개 모두 존재하고 비어있지 않음
+        5. close > 0, atr_pct > 0, ma20/ma50/ma150 > 0
+
+        미국장 / 해외장 / US PB1 / 일반 전략에는 절대 적용하지 않음.
+        risk_gate / sizing_gate / buyable_gate는 이 함수가 우회하지 않음.
+        """
+        if cf is None:
+            return False
+
+        # 1. KR 종목코드 판별 (6자리 숫자)
+        code = str(getattr(cf, "code", "") or "")
+        if not _is_kr_stock_code(code):
+            return False
+
+        # 2. final30 경로 확인 (pb1_from_final30 mode_reason)
+        mode_reasons = list(getattr(cf, "mode_reasons", None) or [])
+        if "pb1_from_final30" not in mode_reasons:
+            return False
+
+        # 3. OHLCV rows >= 60 (신규상장 방어)
+        if ohlcv_df is None or len(ohlcv_df) < 60:
+            return False
+
+        # 4. 필수 precomputed feature 존재 및 비어있지 않음
+        features = getattr(cf, "features", None) or {}
+        _REQUIRED_PRECOMPUTED = (
+            "close",
+            "ma20",
+            "ma50",
+            "ma150",
+            "atr_pct",
+            "rs_percentile",
+            "vcp_score",
+            "breakout_score",
+            "pullback_score",
+            "momentum_score",
+            "entry_style_selected",
+        )
+        for col in _REQUIRED_PRECOMPUTED:
+            v = features.get(col)
+            if v is None or str(v).strip() in ("", "None", "nan"):
+                return False
+
+        # 5. 핵심 수치 유효성 검사
+        try:
+            close_val = float(features.get("close") or 0)
+            atr_pct_val = float(features.get("atr_pct") or 0)
+            ma20_val = float(features.get("ma20") or 0)
+            ma50_val = float(features.get("ma50") or 0)
+            ma150_val = float(features.get("ma150") or 0)
+        except (ValueError, TypeError):
+            return False
+
+        if close_val <= 0 or atr_pct_val <= 0:
+            return False
+        if ma20_val <= 0 or ma50_val <= 0 or ma150_val <= 0:
+            return False
+
+        return True
+
+    @staticmethod
     def _entry_ohlcv_block_reason(
         *,
         df: "pd.DataFrame",
@@ -5029,6 +5100,10 @@ class PB1Engine:
         - PB1_BLOCK_INSUFFICIENT_OHLCV=1 이지만 precomputed_ok=1 + stop_ready=1 이면
           PB1_BLOCK_INSUFFICIENT_OHLCV_WHEN_PRECOMPUTED_OK=0 (기본) 시 차단 안함.
         - 신규상장 수준 (rows < PB1_MIN_OHLCV_ROWS_FOR_ENTRY=60) 이면 항상 차단.
+
+        KR PB1 final30 precomputed 완화:
+        - rows >= 60 + long_fetch_blocked + final30 경로 + 필수 feature 모두 OK →
+          insufficient_ohlcv hard block 제거, warning/degraded 로 완화.
         """
         block_enabled = os.getenv("PB1_BLOCK_INSUFFICIENT_OHLCV", "0") == "1"
         if not block_enabled:
@@ -5039,31 +5114,45 @@ class PB1Engine:
         abs_min_rows = int(os.getenv("PB1_MIN_OHLCV_ROWS_FOR_ENTRY", "60") or "60")
         actual_rows = len(df) if (df is not None and not df.empty) else 0
 
-        # 신규상장 수준이면 precomputed 여부와 무관하게 차단
+        # 신규상장 수준이면 precomputed 여부와 무관하게 차단 (rows < 60)
         if actual_rows < abs_min_rows:
             return "insufficient_ohlcv"
 
-        # ── [KR][PB1] precomputed trade bypass ──────────────────────────────
-        # 한국장 PB1 trade-am/trade-afternoon에서 precomputed 피처가 충분하면
+        # ── [KR][PB1] final30 precomputed trade bypass ──────────────────────
+        # 한국장 PB1 trade-am/trade-afternoon: final30 precomputed 피처가 충분하면
         # db_short_only / long_fetch_blocked 상태여도 주문 후보 생성 허용.
-        # 해외장/공통 경로에서는 절대 적용되지 않도록 scope guard 적용.
-        if cf is not None and actual_rows >= abs_min_rows:
+        # 미국장 / 해외장 / US PB1 / 일반 전략에는 절대 적용하지 않음.
+        # risk_gate / sizing_gate / buyable_gate는 우회하지 않음.
+        _long_blocked_meta = bool((meta or {}).get("long_fetch_blocked", 0) or 0)
+        if _long_blocked_meta and PB1Engine._is_kr_pb1_precomputed_trade_ok(cf=cf, ohlcv_df=df):
             _code_val = str(getattr(cf, "code", "") or "")
+            _requested_days = int(os.getenv("PB1_OHLCV_DAYS_BASE", "200") or "200")
+            logger.info(
+                "[KR][PB1][ORDER][OHLCV_SHORT_BUT_PRECOMPUTED_OK] "
+                "code=%s rows=%s requested=%s action=continue",
+                _code_val,
+                actual_rows,
+                _requested_days,
+            )
+            return None
+
+        # Legacy bypass: MODE + PB1_SESSION_KIND 환경변수 기반 (하위호환)
+        if cf is not None:
+            _code_val_leg = str(getattr(cf, "code", "") or "")
             _session = str(os.getenv("PB1_SESSION_KIND", "")).strip().lower()
             _mode = str(os.getenv("MODE", "")).strip().lower()
-            _long_blocked = bool((meta or {}).get("long_fetch_blocked", 0) or 0)
             _is_kr_trade_precomputed = (
                 _mode == "trade"
-                and _is_kr_stock_code(_code_val)
+                and _is_kr_stock_code(_code_val_leg)
                 and _session in ("am", "afternoon", "pm")
-                and _long_blocked  # precomputed_only 상태 확인
+                and _long_blocked_meta
             )
             if _is_kr_trade_precomputed:
                 _precomputed_ok = PB1Engine._is_precomputed_order_context_usable(cf)
                 if _precomputed_ok:
                     logger.info(
-                        "[KR][PB1][ORDER][OHLCV_SHORT_BUT_PRECOMPUTED_OK] code=%s rows=%s requested=%s action=continue reason=kr_pb1_precomputed_trade",
-                        _code_val,
+                        "[KR][PB1][ORDER][OHLCV_SHORT_BUT_PRECOMPUTED_OK] code=%s rows=%s requested=%s action=continue reason=legacy_env_bypass",
+                        _code_val_leg,
                         actual_rows,
                         abs_min_rows,
                     )
