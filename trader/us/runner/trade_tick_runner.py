@@ -390,6 +390,29 @@ def run_trade_tick(
             current_positions = []
     position_count = len(current_positions)
 
+    # ── EXIT position entry_price 표준화 ──────────────────────────────────────
+    # 모든 보유 종목에 대해 exit 평가 전 entry_price를 resolve한다.
+    # entry_price가 없으면 fail-closed SELL intent 생성 (US_EXIT_FAIL_CLOSED_ON_PNL_MISSING 기본값=1)
+    _exit_trade_date = trade_date if isinstance(trade_date, str) else str(trade_date)
+    try:
+        from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
+        current_positions, exit_position_meta = enrich_us_positions_for_exit(
+            current_positions,
+            trade_date=_exit_trade_date,
+            env=env,
+            provider=provider,
+        )
+        logger.info(
+            "[US_EXIT][POSITION_RESOLVE] total=%d ok=%d missing=%d sources=%s missing_symbols=%s",
+            exit_position_meta.get("total", 0),
+            exit_position_meta.get("ok", 0),
+            exit_position_meta.get("missing", 0),
+            exit_position_meta.get("sources", {}),
+            exit_position_meta.get("missing_symbols", []),
+        )
+    except Exception as _resolve_exc:
+        logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
+
     # ── EXIT 평가 ─────────────────────────────────────────────────────────────
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []

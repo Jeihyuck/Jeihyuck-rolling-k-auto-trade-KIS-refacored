@@ -268,7 +268,17 @@ def normalize_us_balance(raw: dict) -> dict:
         pnl_rate_candidates = ("evlu_pfls_rt", "pnl_rate", "prls_rt")
         pnl_rate_raw = _get_first_valid(row, pnl_rate_candidates, "0")
         pnl_rate = _safe_float(pnl_rate_raw, 0.0)
-        
+
+        # [2026-05-18] exit contract 강화: entry_price alias
+        # avg_price_usd가 0이면 buy_amount_usd / qty로 보완
+        _resolved_avg_price = avg_price_usd
+        _entry_price_source: str | None = None
+        if _resolved_avg_price > 0:
+            _entry_price_source = "kis_avg_price_usd"
+        elif buy_amount_usd > 0 and qty > 0:
+            _resolved_avg_price = buy_amount_usd / qty
+            _entry_price_source = "kis_buy_amount_usd"
+
         positions.append({
             "symbol": symbol,
             "name": str(name),
@@ -282,6 +292,12 @@ def normalize_us_balance(raw: dict) -> dict:
             "buy_amount_usd": buy_amount_usd,
             "pnl_usd": pnl_usd,
             "pnl_rate": pnl_rate,
+            # exit contract aliases
+            "entry_price": _resolved_avg_price if _resolved_avg_price > 0 else None,
+            "avg_cost": _resolved_avg_price if _resolved_avg_price > 0 else None,
+            "current_px": current_price_usd if current_price_usd > 0 else None,
+            "unrealized_pnl_usd": pnl_usd,
+            "entry_price_source": _entry_price_source,
             "raw": row,
         })
 

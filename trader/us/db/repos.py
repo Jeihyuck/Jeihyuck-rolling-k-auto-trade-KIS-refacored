@@ -1580,3 +1580,151 @@ def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> boo
         logger.error("[US_AFTERNOON_ALREADY_RAN][CHECK][ERROR] %s", exc)
         return False
 
+
+# ---------------------------------------------------------------------------
+# US Exit Position Resolver DB helpers
+# ---------------------------------------------------------------------------
+
+def load_us_positions_by_symbols(
+    symbols: list[str],
+    as_of: str | None = None,
+) -> dict[str, dict]:
+    """us_positions에서 심볼별 최신 포지션 조회.
+
+    Parameters
+    ----------
+    symbols : list[str]
+        조회할 심볼 목록 (대문자 정규화)
+    as_of : str | None
+        특정 날짜 기준 (None이면 최신)
+
+    Returns
+    -------
+    dict[symbol, row_dict]
+    """
+    if not symbols:
+        return {}
+
+    normalized = [str(s).strip().upper() for s in symbols if s]
+    engine = _get_engine_or_none()
+
+    if engine is None:
+        # in-memory fallback
+        result: dict[str, dict] = {}
+        for pos in _MEM_POSITIONS:
+            sym = str(pos.get("symbol") or "").strip().upper()
+            if sym in normalized:
+                if sym not in result:
+                    result[sym] = pos
+        return result
+
+    try:
+        with engine.connect() as conn:
+            if as_of:
+                rows = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (symbol)
+                            symbol, exchange, qty, avg_cost,
+                            current_px, unrealized_pnl_usd, meta, as_of
+                        FROM us_positions
+                        WHERE symbol = ANY(:syms)
+                          AND qty > 0
+                          AND as_of <= :as_of
+                        ORDER BY symbol, as_of DESC
+                    """),
+                    {"syms": normalized, "as_of": as_of},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (symbol)
+                            symbol, exchange, qty, avg_cost,
+                            current_px, unrealized_pnl_usd, meta, as_of
+                        FROM us_positions
+                        WHERE symbol = ANY(:syms)
+                          AND qty > 0
+                        ORDER BY symbol, as_of DESC
+                    """),
+                    {"syms": normalized},
+                ).fetchall()
+
+            result = {}
+            for row in rows:
+                cols = ["symbol", "exchange", "qty", "avg_cost",
+                        "current_px", "unrealized_pnl_usd", "meta", "as_of"]
+                d = dict(zip(cols, row))
+                sym = str(d.get("symbol") or "").strip().upper()
+                result[sym] = d
+            return result
+    except Exception as exc:
+        logger.warning("[US_DB][load_us_positions_by_symbols][WARN] %s", exc)
+        return {}
+
+
+def load_latest_us_buy_fills_by_symbols(
+    symbols: list[str],
+    trade_date: str | None = None,
+    lookback_days: int = 30,
+) -> dict[str, dict]:
+    """us_fills에서 심볼별 최신 BUY 체결 조회.
+
+    Parameters
+    ----------
+    symbols : list[str]
+        조회할 심볼 목록
+    trade_date : str | None
+        기준 거래일 (None이면 오늘)
+    lookback_days : int
+        조회 기간 (기준일 기준 N일 이내)
+
+    Returns
+    -------
+    dict[symbol, fill_row_dict]
+    """
+    if not symbols:
+        return {}
+
+    normalized = [str(s).strip().upper() for s in symbols if s]
+    engine = _get_engine_or_none()
+
+    if engine is None:
+        # in-memory fallback
+        result: dict[str, dict] = {}
+        for fill in _MEM_FILLS:
+            if str(fill.get("side") or "").upper() != "BUY":
+                continue
+            sym = str(fill.get("symbol") or "").strip().upper()
+            if sym in normalized and sym not in result:
+                result[sym] = fill
+        return result
+
+    try:
+        td = trade_date or _today()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT DISTINCT ON (symbol)
+                        symbol, exchange, qty, price_usd,
+                        filled_at, trade_date, client_order_key, order_no, meta
+                    FROM us_fills
+                    WHERE symbol = ANY(:syms)
+                      AND side = 'BUY'
+                      AND trade_date >= (:td::date - :lookback * INTERVAL '1 day')
+                      AND trade_date <= :td::date
+                    ORDER BY symbol, filled_at DESC
+                """),
+                {"syms": normalized, "td": td, "lookback": lookback_days},
+            ).fetchall()
+
+            result = {}
+            cols = ["symbol", "exchange", "qty", "price_usd",
+                    "filled_at", "trade_date", "client_order_key", "order_no", "meta"]
+            for row in rows:
+                d = dict(zip(cols, row))
+                sym = str(d.get("symbol") or "").strip().upper()
+                result[sym] = d
+            return result
+    except Exception as exc:
+        logger.warning("[US_DB][load_latest_us_buy_fills_by_symbols][WARN] %s", exc)
+        return {}
+

@@ -71,14 +71,109 @@ def evaluate_exit(
     symbol = position.get("symbol", "")
     exchange = position.get("exchange", "NASDAQ")
     qty = int(position.get("qty", 0))
-    entry_price = float(position.get("entry_price", 0.0))
-    max_price = float(position.get("max_price", current_price))
 
-    if qty <= 0 or entry_price <= 0 or current_price <= 0:
+    # entry_price 방어적 fallback (주된 보강은 resolver에서)
+    entry_price: float = 0.0
+    for field in ("entry_price", "avg_price_usd", "avg_cost", "average_price", "avg_buy_price"):
+        v = position.get(field)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    entry_price = fv
+                    break
+            except (TypeError, ValueError):
+                pass
+    # buy_amount_usd / qty 마지막 방어
+    if entry_price <= 0:
+        buy_amount = position.get("buy_amount_usd")
+        if buy_amount is not None and qty > 0:
+            try:
+                ep = float(buy_amount) / qty
+                if ep > 0:
+                    entry_price = ep
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+
+    # max_price fallback — None이어도 crash 방지
+    _raw_max = position.get("max_price") or position.get("high_watermark")
+    if _raw_max:
+        try:
+            max_price = float(_raw_max)
+        except (TypeError, ValueError):
+            max_price = max(entry_price, current_price) if entry_price > 0 else current_price
+    else:
+        max_price = max(entry_price, current_price) if entry_price > 0 else current_price
+
+    # ── qty guard ────────────────────────────────────────────────────────────
+    if qty <= 0:
+        return None
+
+    # ── current_price guard ──────────────────────────────────────────────────
+    if current_price <= 0:
+        logger.warning(
+            "[US_EXIT][PRICE_MISSING] symbol=%s qty=%s current_price=%s",
+            symbol, qty, current_price,
+        )
+        return None
+
+    # ── entry_price guard: PNL_MISSING fail-closed ────────────────────────────
+    if entry_price <= 0:
+        logger.error(
+            "[US_EXIT][PNL_MISSING] symbol=%s qty=%s current_price=%.4f "
+            "entry_price=%s avg_price_usd=%s avg_cost=%s buy_amount_usd=%s pnl_rate=%s source=%s",
+            symbol,
+            qty,
+            current_price,
+            position.get("entry_price"),
+            position.get("avg_price_usd"),
+            position.get("avg_cost"),
+            position.get("buy_amount_usd"),
+            position.get("pnl_rate"),
+            position.get("entry_price_source"),
+        )
+        fail_closed = os.getenv("US_EXIT_FAIL_CLOSED_ON_PNL_MISSING", "1") not in {
+            "0", "false", "False", "NO", "no",
+        }
+        if fail_closed:
+            return _make_exit_intent(
+                symbol=symbol,
+                exchange=exchange,
+                qty=qty,
+                current_price=current_price,
+                entry_price=current_price,
+                exit_type="pnl_missing_fail_closed",
+                reason="PNL_MISSING_ENTRY_PRICE_FAIL_CLOSED",
+                unrealized_pnl_usd=0.0,
+                pnl_pct=-999.0,
+            )
         return None
 
     pnl_pct = (current_price - entry_price) / entry_price
     unrealized_pnl_usd = (current_price - entry_price) * qty
+
+    # ── POSITION_INPUT 로그 ──────────────────────────────────────────────────
+    logger.info(
+        "[US_EXIT][POSITION_INPUT] symbol=%s qty=%s entry_price=%.4f current_price=%.4f source=%s",
+        symbol,
+        qty,
+        entry_price,
+        current_price,
+        position.get("entry_price_source", "unknown"),
+    )
+
+    # ── PnL CHECK 로그 ────────────────────────────────────────────────────────
+    logger.info(
+        "[US_EXIT][CHECK] symbol=%s qty=%s entry_price=%.4f current_price=%.4f "
+        "pnl_pct=%.4f hard_stop=%.4f trailing_stop=%.4f",
+        symbol,
+        qty,
+        entry_price,
+        current_price,
+        pnl_pct,
+        cfg["hard_stop"],
+        cfg["trailing_stop"],
+    )
 
     # ── hard stop ─────────────────────────────────────────────────────────────
     if pnl_pct <= -cfg["hard_stop"]:

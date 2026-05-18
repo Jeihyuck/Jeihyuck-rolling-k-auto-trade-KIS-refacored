@@ -440,38 +440,46 @@ def build_us_exit_explanation(
     entry_price = _safe_float(position.get("entry_price", 0.0))
     max_price = _safe_float(position.get("max_price", current_price))
     qty = int(position.get("qty", 0))
-    
-    pnl_pct = (current_price - entry_price) / entry_price if entry_price > 0 else 0.0
-    unrealized_pnl_usd = (current_price - entry_price) * qty
-    
+
+    # entry_price missing 처리 — 0.0000으로 위장 금지
+    if entry_price <= 0:
+        pnl_pct: float | None = None
+        unrealized_pnl_usd: float | None = None
+    else:
+        pnl_pct = (current_price - entry_price) / entry_price
+        unrealized_pnl_usd = (current_price - entry_price) * qty
+
     if exit_intent is None:
         # Hold decision
-        why_not_sell = "no_exit_signal"
-        
-        # 보유 근거 상세 분석
-        if pnl_pct < 0:
-            if abs(pnl_pct) < 0.05:
-                why_not_sell = "within_risk_tolerance_under_5%"
-            else:
-                why_not_sell = "stop_not_hit_yet"
+        if entry_price <= 0:
+            why_not_sell = "pnl_missing_entry_price"
         else:
-            if max_price > 0 and current_price < max_price:
-                trail_pct = (max_price - current_price) / max_price
-                if trail_pct < 0.05:
-                    why_not_sell = "price_near_high_no_trail_signal"
+            why_not_sell = "no_exit_signal"
+
+            # 보유 근거 상세 분석
+            if pnl_pct is not None and pnl_pct < 0:
+                if abs(pnl_pct) < 0.05:
+                    why_not_sell = "within_risk_tolerance_under_5%"
                 else:
-                    why_not_sell = "trail_not_breached_yet"
+                    why_not_sell = "stop_not_hit_yet"
             else:
-                why_not_sell = "no_exit_conditions_met"
-        
+                if max_price > 0 and current_price < max_price:
+                    trail_pct = (max_price - current_price) / max_price
+                    if trail_pct < 0.05:
+                        why_not_sell = "price_near_high_no_trail_signal"
+                    else:
+                        why_not_sell = "trail_not_breached_yet"
+                else:
+                    why_not_sell = "no_exit_conditions_met"
+
         return {
             "symbol": symbol,
             "decision": "HOLD",
             "exit_style": "no_exit",
             "exit_trigger": None,
             "why_not_sell": why_not_sell,
-            "pnl_pct": round(pnl_pct, 4),
-            "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
+            "pnl_pct": round(pnl_pct, 4) if pnl_pct is not None else None,
+            "unrealized_pnl_usd": round(unrealized_pnl_usd, 2) if unrealized_pnl_usd is not None else None,
             "reasons": [why_not_sell],
             "explanation_quality": "FULL",
         }
@@ -488,20 +496,29 @@ def build_us_exit_explanation(
         "giveback": "giveback_limit_exceed",
         "time_stop": "time_limit_exceed",
         "risk_off": "risk_off_signal",
+        "pnl_missing_fail_closed": "pnl_missing_fail_closed",
     }
     exit_trigger = exit_trigger_map.get(exit_type, f"{exit_type}_triggered")
-    
+
     # Reasons 생성
     reasons = [exit_reason, exit_trigger]
-    
+
+    # pnl_pct / unrealized_pnl_usd — pnl_missing_fail_closed 시 None/FAIL_CLOSED
+    if exit_type == "pnl_missing_fail_closed" or pnl_pct is None:
+        _pnl_out = None
+        _upnl_out = None
+    else:
+        _pnl_out = round(pnl_pct, 4)
+        _upnl_out = round(unrealized_pnl_usd, 2) if unrealized_pnl_usd is not None else None
+
     return {
         "symbol": symbol,
         "decision": "SELL",
         "exit_style": exit_type,
         "exit_trigger": exit_trigger,
         "why_not_sell": None,
-        "pnl_pct": round(pnl_pct, 4),
-        "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
+        "pnl_pct": _pnl_out,
+        "unrealized_pnl_usd": _upnl_out,
         "reasons": reasons,
         "explanation_quality": "FULL",
     }
@@ -670,23 +687,38 @@ def log_us_exit_decision(
     exit_style = explanation.get("exit_style", "UNKNOWN")
     exit_trigger = explanation.get("exit_trigger")
     why_not_sell = explanation.get("why_not_sell")
-    pnl_pct = explanation.get("pnl_pct", 0.0)
+    pnl_pct = explanation.get("pnl_pct")
     reasons = explanation.get("reasons", [])
-    
+
+    # pnl_pct None → MISSING 표시
+    pnl_display = "MISSING" if pnl_pct is None else f"{pnl_pct:.4f}"
+
     if decision == "SELL":
-        logger.info(
-            "[US_EXIT][WHY_SELL] symbol=%s exit_style=%s pnl_pct=%.4f "
-            "exit_trigger=%s reasons=%s",
-            symbol,
-            exit_style,
-            pnl_pct,
-            exit_trigger,
-            reasons,
-        )
+        _exit_type = explanation.get("exit_style", "unknown")
+        if _exit_type == "pnl_missing_fail_closed":
+            logger.error(
+                "[US_EXIT][WHY_SELL] symbol=%s exit_style=%s pnl_pct=%s "
+                "exit_trigger=%s reasons=%s note=FAIL_CLOSED",
+                symbol,
+                exit_style,
+                pnl_display,
+                exit_trigger,
+                reasons,
+            )
+        else:
+            logger.info(
+                "[US_EXIT][WHY_SELL] symbol=%s exit_style=%s pnl_pct=%s "
+                "exit_trigger=%s reasons=%s",
+                symbol,
+                exit_style,
+                pnl_display,
+                exit_trigger,
+                reasons,
+            )
     else:
         logger.info(
-            "[US_EXIT][WHY_HOLD] symbol=%s why_not_sell=%s pnl_pct=%.4f",
+            "[US_EXIT][WHY_HOLD] symbol=%s why_not_sell=%s pnl_pct=%s",
             symbol,
             why_not_sell,
-            pnl_pct,
+            pnl_display,
         )
