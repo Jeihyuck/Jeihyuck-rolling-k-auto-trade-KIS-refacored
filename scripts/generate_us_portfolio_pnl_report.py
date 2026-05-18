@@ -99,6 +99,66 @@ def _load_engine():
         return None
 
 
+def _get_table_columns(engine, table_name: str) -> set:
+    """DB 테이블 컬럼 목록 조회. 실패 시 빈 set 반환."""
+    try:
+        from sqlalchemy import text
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name = :table_name
+                """),
+                {"table_name": table_name},
+            ).fetchall()
+        return {r[0] for r in rows}
+    except Exception as exc:
+        logger.warning("[US_PNL][TABLE_COLUMNS][FAIL] table=%s err=%s", table_name, exc)
+        return set()
+
+
+def _first_existing(d: dict, candidates: list, default=None):
+    """후보 키 목록 중 dict에 실제로 존재하는 첫 번째 값 반환."""
+    for k in candidates:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+def _normalize_kis_position(pos: dict) -> dict:
+    """KIS 해외잔고 필드를 표준 필드로 정규화.
+
+    표준 필드: symbol, qty, avg_price, last_price
+    """
+    symbol = _first_existing(
+        pos,
+        ["symbol", "ovrs_pdno", "pdno", "code", "ticker"],
+        default="",
+    )
+    qty = _safe_int(_first_existing(
+        pos,
+        ["qty", "quantity", "ovrs_cblc_qty", "hldg_qty"],
+        default=0,
+    ))
+    avg_price = _safe_float(_first_existing(
+        pos,
+        ["avg_price", "average_price", "pchs_avg_pric", "avg_buy_price"],
+        default=0.0,
+    ))
+    last_price = _safe_float(_first_existing(
+        pos,
+        ["last_price", "current_price", "ovrs_now_pric", "now_price"],
+        default=0.0,
+    ))
+    return {
+        "symbol": str(symbol).strip(),
+        "qty": qty,
+        "avg_price": avg_price,
+        "last_price": last_price,
+    }
+
+
 def _load_kis_balance(env: str) -> dict | None:
     """KIS  practice 잔고 조회. 실패 시 None."""
     try:
@@ -115,11 +175,16 @@ def _load_kis_balance(env: str) -> dict | None:
         elif not isinstance(positions, list):
             positions = []
 
-        logger.info("[US_PNL][KIS_BALANCE][OK] positions=%d", len(positions))
+        # KIS 필드 정규화
+        normalized = [_normalize_kis_position(p) for p in positions]
+        # symbol이 비어 있거나 qty=0인 항목 필터링
+        normalized = [p for p in normalized if p["symbol"] and p["qty"] > 0]
+
+        logger.info("[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d", len(positions), len(normalized))
 
         return {
             "raw": raw,
-            "positions": positions,
+            "positions": normalized,
             "summary": raw.get("output2", {}),
         }
     except Exception as exc:
@@ -129,15 +194,48 @@ def _load_kis_balance(env: str) -> dict | None:
 
 
 def _load_db_positions(engine, trade_date: str) -> list[dict]:
-    """DB us_positions에서 당일 포지션 조회."""
+    """DB us_positions에서 당일 포지션 조회. 컬럼 alias 자동 처리."""
     try:
         from sqlalchemy import text
+
+        # 실제 컬럼 목록 조회
+        cols = _get_table_columns(engine, "us_positions")
+
+        # avg_price 후보
+        avg_price_candidates = ["avg_price", "average_price", "avg_buy_price", "entry_price", "pchs_avg_pric"]
+        avg_price_col = next((c for c in avg_price_candidates if c in cols), None)
+
+        # last_price 후보
+        last_price_candidates = ["last_price", "current_price", "market_price", "now_price", "ovrs_now_pric"]
+        last_price_col = next((c for c in last_price_candidates if c in cols), None)
+
+        select_fields = ["symbol", "qty"]
+        alias_map = {}
+        if avg_price_col:
+            select_fields.append(f"{avg_price_col} AS avg_price")
+            alias_map["avg_price"] = avg_price_col
+        else:
+            select_fields.append("0.0 AS avg_price")
+            logger.warning("[US_PNL][DB_POSITIONS][NO_AVG_PRICE_COL] none of %s found", avg_price_candidates)
+
+        if last_price_col:
+            select_fields.append(f"{last_price_col} AS last_price")
+            alias_map["last_price"] = last_price_col
+        else:
+            select_fields.append("0.0 AS last_price")
+            logger.warning("[US_PNL][DB_POSITIONS][NO_LAST_PRICE_COL] none of %s found", last_price_candidates)
+
+        # market_value_usd, cost_usd 등 옵션 컬럼
+        for opt_col in ["market_value_usd", "cost_usd", "unrealized_pnl_usd",
+                        "unrealized_pnl_pct", "entry_date", "updated_at"]:
+            if opt_col in cols:
+                select_fields.append(opt_col)
+
+        fields_sql = ", ".join(select_fields)
         with engine.begin() as conn:
             rows = conn.execute(
-                text("""
-                    SELECT symbol, qty, avg_price, last_price, market_value_usd,
-                           cost_usd, unrealized_pnl_usd, unrealized_pnl_pct, entry_date,
-                           updated_at
+                text(f"""
+                    SELECT {fields_sql}
                     FROM us_positions
                     WHERE trade_date = :td
                     ORDER BY symbol ASC
@@ -145,7 +243,10 @@ def _load_db_positions(engine, trade_date: str) -> list[dict]:
                 {"td": trade_date},
             ).fetchall()
             positions = [dict(r._mapping) for r in rows]
-            logger.info("[US_PNL][DB_POSITIONS] count=%d", len(positions))
+            if alias_map:
+                logger.info("[US_PNL][DB_POSITIONS] count=%d alias=%s", len(positions), alias_map)
+            else:
+                logger.info("[US_PNL][DB_POSITIONS] count=%d", len(positions))
             return positions
     except Exception as exc:
         logger.warning("[US_PNL][DB_POSITIONS][FAIL] err=%s", exc)
@@ -154,17 +255,39 @@ def _load_db_positions(engine, trade_date: str) -> list[dict]:
 
 
 def _load_db_fills(engine, trade_date: str) -> list[dict]:
-    """DB us_fills에서 당일 체결 조회."""
+    """DB us_fills에서 당일 체결 조회. 컬럼 alias 자동 처리."""
     try:
         from sqlalchemy import text
+
+        cols = _get_table_columns(engine, "us_fills")
+
+        # filled_price 후보
+        filled_price_candidates = ["filled_price", "fill_price", "avg_fill_price", "order_price", "ft_ccld_unpr3"]
+        filled_price_col = next((c for c in filled_price_candidates if c in cols), None)
+
+        select_fields = ["symbol", "side", "qty"]
+        if filled_price_col:
+            select_fields.append(f"{filled_price_col} AS filled_price")
+        else:
+            select_fields.append("0.0 AS filled_price")
+            logger.warning("[US_PNL][DB_FILLS][NO_FILLED_PRICE_COL] none of %s found", filled_price_candidates)
+
+        for opt_col in ["filled_amount_usd", "filled_at", "order_id"]:
+            if opt_col in cols:
+                select_fields.append(opt_col)
+
+        fields_sql = ", ".join(select_fields)
         with engine.begin() as conn:
             rows = conn.execute(
-                text("""
-                    SELECT symbol, side, qty, filled_price, filled_amount_usd,
-                           filled_at, order_id
+                text(f"""
+                    SELECT {fields_sql}
                     FROM us_fills
                     WHERE trade_date = :td
                     ORDER BY filled_at ASC
+                """) if "filled_at" in cols else text(f"""
+                    SELECT {fields_sql}
+                    FROM us_fills
+                    WHERE trade_date = :td
                 """),
                 {"td": trade_date},
             ).fetchall()
@@ -319,11 +442,18 @@ def generate_us_pnl_report(
     for pos in positions:
         sym = pos.get("symbol", "")
         qty = _safe_int(pos.get("qty") or pos.get("quantity", 0))
-        avg_price = _safe_float(pos.get("avg_price") or pos.get("average_price", 0.0))
-        last_price = _safe_float(pos.get("last_price") or pos.get("current_price", 0.0))
-        
-        market_value = qty * last_price
-        cost = qty * avg_price
+        avg_price = _safe_float(_first_existing(
+            pos,
+            ["avg_price", "average_price", "pchs_avg_pric", "avg_buy_price"],
+            default=0.0,
+        ))
+        last_price = _safe_float(_first_existing(
+            pos,
+            ["last_price", "current_price", "ovrs_now_pric", "now_price"],
+            default=0.0,
+        ))
+        market_value = _safe_float(pos.get("market_value_usd") or last_price * qty)
+        cost = _safe_float(pos.get("cost_usd") or avg_price * qty)
         pnl = market_value - cost
         pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
         

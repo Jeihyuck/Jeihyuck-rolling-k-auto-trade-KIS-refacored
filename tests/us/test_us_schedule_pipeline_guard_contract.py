@@ -32,15 +32,19 @@ GUARD_SCRIPT = Path("scripts/write_us_guard_failure_report.py")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_prep_has_0700_edt_cron():
-    """us-trade-prep.yml에 07:00 EDT cron 존재."""
+    """us-trade-prep.yml에 07:xx EDT cron이 다수 존재 (다중화 스케줄)."""
     text = PREP_YML.read_text(encoding="utf-8")
-    assert 'cron: "00 11 * * 1-5"' in text, "Missing 07:00 EDT cron in us-trade-prep.yml"
+    import re
+    edt_crons = re.findall(r'cron:.*1[12] \* \* 1-5', text)
+    assert len(edt_crons) >= 4, f"us-trade-prep.yml EDT cron 다중화 부족: {edt_crons}"
 
 
 def test_prep_has_0700_est_cron():
-    """us-trade-prep.yml에 07:00 EST cron 존재."""
+    """us-trade-prep.yml에 07:xx EST cron이 다수 존재 (다중화 스케줄)."""
     text = PREP_YML.read_text(encoding="utf-8")
-    assert 'cron: "00 12 * * 1-5"' in text, "Missing 07:00 EST cron in us-trade-prep.yml"
+    import re
+    est_crons = re.findall(r'cron:.*1[23] \* \* 1-5', text)
+    assert len(est_crons) >= 4, f"us-trade-prep.yml EST cron 다중화 부족: {est_crons}"
 
 
 def test_prep_phase_guard_is_0700_based():
@@ -60,15 +64,19 @@ def test_prep_no_fallback_only_comment():
 
 
 def test_am_has_0815_edt_cron():
-    """us-trade-am.yml에 08:15 EDT cron 존재."""
+    """us-trade-am.yml에 08:xx EDT cron이 다수 존재 (다중화 스케줄)."""
     text = AM_YML.read_text(encoding="utf-8")
-    assert 'cron: "15 12 * * 1-5"' in text, "Missing 08:15 EDT cron in us-trade-am.yml"
+    import re
+    edt_crons = re.findall(r'cron:.*1[23] \* \* 1-5', text)
+    assert len(edt_crons) >= 4, f"us-trade-am.yml EDT cron 다중화 부족: {edt_crons}"
 
 
 def test_am_has_0815_est_cron():
-    """us-trade-am.yml에 08:15 EST cron 존재."""
+    """us-trade-am.yml에 08:xx EST cron이 다수 존재 (다중화 스케줄)."""
     text = AM_YML.read_text(encoding="utf-8")
-    assert 'cron: "15 13 * * 1-5"' in text, "Missing 08:15 EST cron in us-trade-am.yml"
+    import re
+    est_crons = re.findall(r'cron:.*1[34] \* \* 1-5', text)
+    assert len(est_crons) >= 4, f"us-trade-am.yml EST cron 다중화 부족: {est_crons}"
 
 
 def test_am_has_must_not_run_prep_comment():

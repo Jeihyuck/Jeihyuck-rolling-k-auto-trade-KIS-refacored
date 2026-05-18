@@ -5,8 +5,26 @@ name: "US Trade AM"
 
 "on":
   schedule:
-    - cron: "15 12 * * 1-5"  # 08:15 EDT / 07:15 EST - primary early start
-    - cron: "15 13 * * 1-5"  # 09:15 EDT / 08:15 EST - DST/EST backup early start
+    # EDT path: 08:03~09:23 ET
+    - cron: "03 12 * * 1-5"  # 08:03 EDT
+    - cron: "13 12 * * 1-5"  # 08:13 EDT
+    - cron: "23 12 * * 1-5"  # 08:23 EDT
+    - cron: "33 12 * * 1-5"  # 08:33 EDT
+    - cron: "43 12 * * 1-5"  # 08:43 EDT
+    - cron: "53 12 * * 1-5"  # 08:53 EDT
+    - cron: "03 13 * * 1-5"  # 09:03 EDT
+    - cron: "13 13 * * 1-5"  # 09:13 EDT
+    - cron: "23 13 * * 1-5"  # 09:23 EDT
+    # EST path: 08:03~09:23 ET
+    - cron: "03 13 * * 1-5"  # 08:03 EST
+    - cron: "13 13 * * 1-5"  # 08:13 EST
+    - cron: "23 13 * * 1-5"  # 08:23 EST
+    - cron: "33 13 * * 1-5"  # 08:33 EST
+    - cron: "43 13 * * 1-5"  # 08:43 EST
+    - cron: "53 13 * * 1-5"  # 08:53 EST
+    - cron: "03 14 * * 1-5"  # 09:03 EST
+    - cron: "13 14 * * 1-5"  # 09:13 EST
+    - cron: "23 14 * * 1-5"  # 09:23 EST
   workflow_dispatch:
     inputs:
       dry_run:
@@ -28,7 +46,7 @@ name: "US Trade AM"
         required: false
         default: ""
       force_now:
-        description: "Manual smoke only. 반드시 US prep/watchlist가 존재하는 날짜를 사용. Example: 2026-05-11T09:35:00-04:00. 날짜에 prep가 없으면 FAILED_PREP_GUARD로 종료된다."
+        description: "DRY_RUN/OFFLINE smoke only. 실제 모의투자 주문에서는 반드시 비워둘 것. Example: 2026-05-11T09:35:00-04:00"
         required: false
         default: ""
       max_ticks:
@@ -208,6 +226,24 @@ jobs:
               run_window="manual_blocked"
             else
               run_window="manual"
+            fi
+
+            # Manual fallback: schedule이 안 떴을 때 09:30 전 수동 실행도 wait 허용
+            if [[ "$should_run" == "1" ]]; then
+              force_now_input="${{ inputs.force_now || '' }}"
+              # force_now는 smoke 전용이므로 실제 시간 wait 판단에서 제외
+              if [[ -z "$force_now_input" && "$now_min" -lt "$target_min" ]]; then
+                wait_until_target=1
+                wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
+                if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
+                if [[ "$wait_seconds" -gt "$max_wait_seconds" ]]; then
+                  should_run=0
+                  skip_reason="manual_us_am_too_early"
+                  run_window="manual_too_early"
+                else
+                  run_window="${run_window}_early_wait"
+                fi
+              fi
             fi
           fi
 
@@ -601,6 +637,58 @@ jobs:
             exit "${guard_status}"
           fi
 
+      - name: Final AM duplicate guard before trade
+        if: steps.phase_guard.outputs.should_run == '1'
+        id: final_duplicate_guard
+        working-directory: repo
+        env:
+          FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
+        run: |
+          set -euo pipefail
+          echo "[US_TRADE_AM][FINAL_DUPLICATE_GUARD][START]" | tee -a artifacts/${US_LOG_FILE}
+
+          if [ -n "${FORCE_NOW_INPUT}" ]; then
+            TRADE_DATE=$(python -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_INPUT}').date().isoformat())")
+          else
+            TRADE_DATE=$(TZ=America/New_York date +%F)
+          fi
+          export TRADE_DATE
+
+          python - <<'PY' > final_duplicate_guard_result.txt 2>&1
+          import os, sys
+          sys.path.insert(0, ".")
+          from trader.us.db.repos import check_us_am_already_ran
+
+          trade_date = os.getenv("TRADE_DATE")
+          already_ran = False
+          try:
+              already_ran = check_us_am_already_ran(trade_date, timeout_sec=5)
+          except Exception as e:
+              print(f"[US_TRADE_AM][FINAL_DUPLICATE_GUARD][WARN] {e}", file=sys.stderr)
+
+          print(f"already_ran={'1' if already_ran else '0'}")
+          print(
+              f"[US_TRADE_AM][FINAL_DUPLICATE_GUARD][RESULT] trade_date={trade_date} already_ran={already_ran}",
+              file=sys.stderr,
+          )
+          PY
+
+          cat final_duplicate_guard_result.txt | tee -a artifacts/${US_LOG_FILE}
+          ALREADY_RAN=$(grep "^already_ran=" final_duplicate_guard_result.txt | cut -d= -f2 || echo "0")
+          echo "already_ran=${ALREADY_RAN}" >> "$GITHUB_OUTPUT"
+
+      - name: Emit AM final duplicate skip summary
+        if: steps.phase_guard.outputs.should_run == '1' && steps.final_duplicate_guard.outputs.already_ran == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          trade_date=$(TZ=America/New_York date +%F)
+          {
+            echo "[US_TRADE_AM][FINISH] status=OK reason=already_ran_after_wait trade_date=${trade_date}"
+            echo "[RUN_SUMMARY][RESULT] status=OK reason=already_ran_after_wait session=us-am trade_date=${trade_date}"
+            echo "[US_TRADE_AM][EXIT] reason=already_ran_after_wait"
+          } | tee -a artifacts/${US_LOG_FILE}
+
       - name: Check schedule DRY_RUN contract
         if: steps.phase_guard.outputs.should_run == '1' && github.event_name == 'schedule'
         working-directory: repo
@@ -673,12 +761,13 @@ jobs:
           set -euo pipefail
           trade_date=$(TZ=America/New_York date +%F)
           {
+            echo "[US_TRADE_AM][FINISH] status=OK reason=already_ran trade_date=${trade_date}"
             echo "[RUN_SUMMARY][RESULT] status=OK reason=already_ran session=us-am trade_date=${trade_date}"
             echo "[US_TRADE_AM][EXIT] reason=already_ran"
           } | tee -a artifacts/${US_LOG_FILE}
 
       - name: Run US AM trade session
-        if: steps.phase_guard.outputs.should_run == '1' && steps.already_ran.outputs.already_ran != '1'
+        if: steps.phase_guard.outputs.should_run == '1' && steps.already_ran.outputs.already_ran != '1' && steps.final_duplicate_guard.outputs.already_ran != '1'
         timeout-minutes: 190
         working-directory: repo
         env:
@@ -885,15 +974,28 @@ jobs:
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
 
           # Success: phase guard intentionally skipped the AM run.
-          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_TRADE_AM\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "\[RUN_SUMMARY\]\[RESULT\] status=SKIP_PHASE_WINDOW|\[US_TRADE_AM\]\[EXIT\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_TRADE_AM_VERIFY][SKIP_OK] phase guard skipped AM intentionally"
             exit 0
           fi
 
+          # Success: already_ran or already_ran_after_wait
+          if grep -E "\[RUN_SUMMARY\]\[RESULT\] status=OK reason=(already_ran|already_ran_after_wait)|\[US_TRADE_AM\]\[FINISH\].*status=OK.*reason=(already_ran|already_ran_after_wait)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_TRADE_AM_VERIFY][OK] duplicate/already-ran marker accepted"
+            exit 0
+          fi
+
+          # Clear failure: FAILED_PREP_GUARD — 실제 실패 원인 출력
+          if grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FAILED_PREP_GUARD|\[US_TRADE_AM\]\[PREP_CONTRACT\]\[FAIL\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::US AM failed due to missing/bad same-day prep"
+            grep -n -E "\[US_TRADE_AM\]\[PREP_CONTRACT\]|\[RUN_SUMMARY\]\[RESULT\]" artifacts/${US_LOG_FILE} | tail -20
+            exit 1
+          fi
+
           # Success: prep guard failure was properly reported
-          if grep -E "\\[US_PREP_GUARD\\]\\[FAIL\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1 && \
-             grep -E "\\[US_PREP_GUARD\\]\\[REPORT_WRITE\\]\\[DONE\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1 && \
-             grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=FAILED_PREP_GUARD" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "\[US_PREP_GUARD\]\[FAIL\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1 && \
+             grep -E "\[US_PREP_GUARD\]\[REPORT_WRITE\]\[DONE\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1 && \
+             grep -E "\[RUN_SUMMARY\]\[RESULT\] status=FAILED_PREP_GUARD" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_TRADE_AM_VERIFY][GUARD_FAIL_REPORTED] prep guard failure reported clearly"
             exit 0
           fi
@@ -901,13 +1003,13 @@ jobs:
           # ── Schedule Practice Trade Contract (한국장 패턴 적용) ────────────────
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${KIS_ENV}" == "practice" ]]; then
             # 1. DRY_RUN=1 금지 (schedule practice는 실제 모의투자 주문을 보내야 함)
-            if grep -E "\\[US_ENV_CHECK\\] DRY_RUN=1|\\[US_TRADE_.*\\]\\[ENV\\] DRY_RUN=1" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            if grep -E "\[US_ENV_CHECK\] DRY_RUN=1|\[US_TRADE_.*\]\[ENV\] DRY_RUN=1" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
               echo "::error::Scheduled US practice trade ran with DRY_RUN=1"
               exit 1
             fi
 
             # 2. [US_ORDER][DRY_RUN] 금지
-            if grep -E "\\[US_ORDER\\]\\[DRY_RUN\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            if grep -E "\[US_ORDER\]\[DRY_RUN\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
               echo "::error::Scheduled US practice trade produced dry-run orders"
               exit 1
             fi
@@ -919,26 +1021,26 @@ jobs:
             fi
 
             # 4. Score=0 intent 생성 금지
-            if grep -E "\\[US_ENTRY\\]\\[INTENT\\].*score=0\\.000000" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            if grep -E "\[US_ENTRY\]\[INTENT\].*score=0\.000000" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
               echo "::error::US entry intent generated with zero score"
               exit 1
             fi
           fi
 
           # Fatal errors.
-          if grep -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_TICK\\]\\[DONE\\].*status=ERROR.*reason=locked_watchlist_score_contract_fail" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "Traceback|\[US_KIS\]\[HTTP_FAIL_FINAL\]|\[US_FILLS\]\[ERROR\]\[CONTRACT\]|\[US_SESSION\]\[TICK_LOOP\]\[ERROR\]|\[US_SESSION\]\[END\].*reason=fills_contract_error|\[US_TICK\]\[DONE\].*status=ERROR.*reason=locked_watchlist_score_contract_fail" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "::error::Fatal AM trade error detected"
-            grep -n -E "Traceback|\\[US_KIS\\]\\[HTTP_FAIL_FINAL\\]|\\[US_FILLS\\]\\[ERROR\\]\\[CONTRACT\\]|\\[US_SESSION\\]\\[TICK_LOOP\\]\\[ERROR\\]|\\[US_SESSION\\]\\[END\\].*reason=fills_contract_error|\\[US_TICK\\]\\[DONE\\].*status=ERROR" artifacts/${US_LOG_FILE} | head -20
+            grep -n -E "Traceback|\[US_KIS\]\[HTTP_FAIL_FINAL\]|\[US_FILLS\]\[ERROR\]\[CONTRACT\]|\[US_SESSION\]\[TICK_LOOP\]\[ERROR\]|\[US_SESSION\]\[END\].*reason=fills_contract_error|\[US_TICK\]\[DONE\].*status=ERROR" artifacts/${US_LOG_FILE} | head -20
             exit 1
           fi
 
           # Success session end.
-          if grep -E "\\[US_SESSION\\]\\[END\\].*reason=(session_end|max_ticks|force_now_single_tick|market_skip)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "\[US_SESSION\]\[END\].*reason=(session_end|max_ticks|force_now_single_tick|market_skip)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_TRADE_AM_VERIFY][OK] session ended acceptably"
             exit 0
           fi
 
-          if grep -E "\\[US_TRADE_AM\\]\\[DONE\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+          if grep -E "\[US_TRADE_AM\]\[DONE\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_TRADE_AM_VERIFY][OK] workflow done marker accepted"
             exit 0
           fi

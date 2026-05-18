@@ -5,8 +5,24 @@ name: "US Trade Prep"
 
 "on":
   schedule:
-    - cron: "00 11 * * 1-5"  # 07:00 EDT
-    - cron: "00 12 * * 1-5"  # 07:00 EST
+    # EDT path: 06:57~08:17 ET
+    - cron: "57 10 * * 1-5"  # 06:57 EDT
+    - cron: "07 11 * * 1-5"  # 07:07 EDT
+    - cron: "17 11 * * 1-5"  # 07:17 EDT
+    - cron: "27 11 * * 1-5"  # 07:27 EDT
+    - cron: "37 11 * * 1-5"  # 07:37 EDT
+    - cron: "47 11 * * 1-5"  # 07:47 EDT
+    - cron: "07 12 * * 1-5"  # 08:07 EDT
+    - cron: "17 12 * * 1-5"  # 08:17 EDT
+    # EST path: 06:57~08:17 ET
+    - cron: "57 11 * * 1-5"  # 06:57 EST
+    - cron: "07 12 * * 1-5"  # 07:07 EST
+    - cron: "17 12 * * 1-5"  # 07:17 EST
+    - cron: "27 12 * * 1-5"  # 07:27 EST
+    - cron: "37 12 * * 1-5"  # 07:37 EST
+    - cron: "47 12 * * 1-5"  # 07:47 EST
+    - cron: "07 13 * * 1-5"  # 08:07 EST
+    - cron: "17 13 * * 1-5"  # 08:17 EST
   workflow_dispatch:
     inputs:
       dry_run:
@@ -118,10 +134,12 @@ jobs:
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
           # US prep primary schedule
-          target_min=$((7 * 60 + 0))            # 07:00 ET
-          normal_until_min=$((7 * 60 + 30))     # 07:30 ET
-          recovery_until_min=$((8 * 60 + 10))   # 08:10 ET
+          prewarm_earliest_min=$((6 * 60 + 45))  # 06:45 ET
+          target_min=$((7 * 60 + 0))             # 07:00 ET
+          normal_until_min=$((7 * 60 + 45))      # 07:45 ET
+          recovery_until_min=$((9 * 60 + 20))    # 09:20 ET
           schedule_expected_min=$((7 * 60 + 0))
+          max_wait_seconds=5400
 
           should_run=1
           skip_reason=""
@@ -132,24 +150,29 @@ jobs:
           delay_seconds=$(( (now_min - schedule_expected_min) * 60 + 10#$now_s ))
 
           if [[ "$event_name" == "schedule" ]]; then
-            if [[ "$now_min" -gt "$recovery_until_min" ]]; then
-              # 08:10 이후: skip
+            if [[ "$now_min" -lt "$prewarm_earliest_min" ]]; then
+              # 06:45 이전: DST duplicate 너무 이름 — skip
               should_run=0
-              skip_reason="skip_stale_start_us_prep"
-              run_window="stale"
-            elif [[ "$now_min" -gt "$normal_until_min" ]]; then
-              # 07:30~08:10: recovery window
-              run_window="recovery"
-              recovery_run=1
+              skip_reason="skip_dst_duplicate_too_early_us_prep"
+              run_window="too_early_duplicate"
             elif [[ "$now_min" -lt "$target_min" ]]; then
-              # Before 07:00: wait until target
+              # 06:45~07:00: wait until target
               wait_until_target=1
               wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
               if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
               run_window="early_wait"
-            else
-              # 07:00~07:30: normal window
+            elif [[ "$now_min" -le "$normal_until_min" ]]; then
+              # 07:00~07:45: normal window
               run_window="normal"
+            elif [[ "$now_min" -le "$recovery_until_min" ]]; then
+              # 07:45~09:20: recovery window
+              run_window="recovery"
+              recovery_run=1
+            else
+              # 09:20 이후: stale — 하지만 바로 skip하지 않고 already_prepared 확인 후 판단
+              run_window="stale_verify"
+              recovery_run=1
+              should_run=1
             fi
           fi
 
@@ -390,6 +413,7 @@ jobs:
         run: |
           set -euo pipefail
           {
+            echo "[US_PREP][FINISH] status=OK reason=already_prepared prep_status=${{ steps.prep_check.outputs.prep_status }} locked_count=${{ steps.prep_check.outputs.locked_count }}"
             echo "[RUN_SUMMARY][RESULT] status=OK reason=already_prepared session=us-prep prep_status=${{ steps.prep_check.outputs.prep_status }} locked_count=${{ steps.prep_check.outputs.locked_count }}"
             echo "[US_PREP][EXIT] reason=already_prepared"
           } | tee -a artifacts/${US_LOG_FILE}
@@ -509,11 +533,13 @@ jobs:
 
           if [ "${CAN_PROCEED}" != "1" ]; then
             echo "[US_PREP][CONTRACT][FAIL] reason=contract_failed prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
+            echo "[US_PREP][FINISH] status=ERROR reason=contract_failed prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT} score_nonzero=${SCORE_NONZERO}" | tee -a artifacts/${US_LOG_FILE}
             echo "[RUN_SUMMARY][RESULT] status=FAILED_PREP_CONTRACT reason=contract_failed session=us-prep" | tee -a artifacts/${US_LOG_FILE}
             exit 1
           fi
 
           echo "[US_PREP][CONTRACT][OK] trade_date=${TRADE_DATE} prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT} score_nonzero=${SCORE_NONZERO}" | tee -a artifacts/${US_LOG_FILE}
+          echo "[US_PREP][FINISH] status=${PREP_STATUS} reason=prep_completed locked_count=${LOCKED_COUNT} score_nonzero=${SCORE_NONZERO} prep_run_id=${PREP_RUN_ID}" | tee -a artifacts/${US_LOG_FILE}
           echo "[RUN_SUMMARY][RESULT] status=OK reason=prep_completed session=us-prep" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Verify US Prep log contract
@@ -523,19 +549,32 @@ jobs:
           set -euo pipefail
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
 
-          # Fatal: stale start skip means same-day watchlist is missing.
-          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW reason=skip_stale_start_us_prep" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
-            echo "::error::US prep skipped due to stale start; same-day watchlist may be missing"
-            grep -n -E "\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -10
-            exit 1
+          # Success: already_prepared — 이미 당일 prep 완료, CI도 성공 처리
+          if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=OK reason=already_prepared|\\[US_PREP\\]\\[FINISH\\].*status=OK.*reason=already_prepared|\\[US_PREP\\]\\[ALREADY_PREPARED\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "[US_PREP_VERIFY][OK] already prepared"
+            grep -n -E "\\[US_PREP\\]\\[ALREADY_PREPARED\\]|\\[US_PREP\\]\\[FINISH\\]|\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -10
+            exit 0
           fi
 
-          # Success: phase guard intentionally skipped the prep run.
-          # Covers duplicate DST crons and manual runs without confirmation.
+          # Success: phase guard intentionally skipped (DST duplicate too_early, manual unconfirmed)
           if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_PREP\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            # skip_dst_duplicate_too_early_us_prep는 정상 skip
+            if grep -E "reason=skip_dst_duplicate_too_early_us_prep" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "[US_PREP_VERIFY][SKIP_OK] DST duplicate too_early skip"
+              exit 0
+            fi
+            # 나머지 SKIP_PHASE_WINDOW (manual_blocked 등)도 OK
             echo "[US_PREP_VERIFY][SKIP_OK] phase guard skipped prep intentionally"
             grep -n -E "\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -5
             exit 0
+          fi
+
+          # Fatal: stale start(stale_verify)이고 prep이 없는 경우
+          # skip_stale_start_us_prep는 더 이상 정상 skip이 아님 — hard fail
+          if grep -E "reason=skip_stale_start_us_prep" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            echo "::error::US prep skipped due to stale start; same-day watchlist may be missing"
+            grep -n -E "\\[RUN_SUMMARY\\]\\[RESULT\\]|\\[US_PREP\\]\\[EXIT\\]" artifacts/${US_LOG_FILE} | tail -10
+            exit 1
           fi
 
           # Fatal runtime errors.

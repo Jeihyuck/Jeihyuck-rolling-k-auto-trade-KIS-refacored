@@ -1533,3 +1533,50 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> bool:
         logger.error("[US_AM_ALREADY_RAN][CHECK][ERROR] %s", exc)
         return False
 
+
+def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> bool:
+    """Check if US Afternoon session already ran for the given trade_date.
+
+    Checks:
+    1. us_agent_runs for mode='session-afternoon' or agent_name='afternoon'
+    2. us_orders for any BUY orders placed after 12:30 ET on trade_date
+
+    Returns:
+        True if afternoon already ran, False otherwise
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        return any(
+            o.get("trade_date") == trade_date and o.get("direction") == "BUY"
+            for o in _MEM_ORDERS
+        )
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
+
+            agent_row = conn.execute(
+                text("""
+                    SELECT run_id, status, finished_at
+                    FROM us_agent_runs
+                    WHERE trade_date = :td
+                      AND (mode = 'session-afternoon' OR agent_name = 'afternoon')
+                      AND status IN ('OK', 'OK_WITH_WARNINGS')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                """),
+                {"td": trade_date},
+            ).fetchone()
+
+            if agent_row:
+                logger.info(
+                    "[US_AFTERNOON_ALREADY_RAN][CHECK] trade_date=%s found agent_run run_id=%s status=%s",
+                    trade_date, agent_row[0], agent_row[1],
+                )
+                return True
+
+            return False
+    except Exception as exc:
+        logger.error("[US_AFTERNOON_ALREADY_RAN][CHECK][ERROR] %s", exc)
+        return False
+
