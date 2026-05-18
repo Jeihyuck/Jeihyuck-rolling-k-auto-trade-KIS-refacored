@@ -5513,6 +5513,33 @@ def run_once(
                             signal.signal_strength,
                             signal.close,
                         )
+
+                    # [2026-05-18] KR rescue: entry scan 결과로 scanner_context 업데이트
+                    # engine 생성 시점에는 precomputed_final30_df 기반 codes만 있었으나
+                    # 실제 entry scan 후에는 전략별 passed_codes / 집계를 반영한다.
+                    if engine_runner is not None:
+                        _all_scan_codes = list({
+                            str(s.code)
+                            for s in entry_signals_result.get("all", [])
+                            if getattr(s, "code", None)
+                        })
+                        _existing_ctx = getattr(engine_runner, "scanner_context", {}) or {}
+                        engine_runner.scanner_context = {
+                            **_existing_ctx,
+                            "scanner_passed_codes": _all_scan_codes or _existing_ctx.get("scanner_passed_codes", []),
+                            "raw_signal_setup_ok": len(entry_signals_result.get("all", [])),
+                            "scanner_passed": len(entry_signals_result.get("all", [])),
+                            "pullback_pass": len(entry_signals_result.get("pullback", [])),
+                            "breakout_pass": len(entry_signals_result.get("breakout", [])),
+                            "momentum_pass": len(entry_signals_result.get("momentum", [])),
+                        }
+                        logger.info(
+                            "[ENTRY_SCAN][KR_CONTEXT_UPDATED] scanner_passed=%s pullback=%s breakout=%s momentum=%s",
+                            len(_all_scan_codes),
+                            len(entry_signals_result.get("pullback", [])),
+                            len(entry_signals_result.get("breakout", [])),
+                            len(entry_signals_result.get("momentum", [])),
+                        )
                 else:
                     logger.error(
                         "[ENTRY_SCAN][LOCK_MISSING] final30_locked=%s derived_as_of=%s",

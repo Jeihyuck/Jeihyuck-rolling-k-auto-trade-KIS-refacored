@@ -13036,6 +13036,15 @@ class PB1Engine:
                     len(buyable_report.get("final_buyable_codes", [])),
                     buyable_report.get("final_buyable_codes", []),
                 )
+
+                # [2026-05-18] KR rescue source 로그: minervini relax codes를 rescue source로 표기
+                if self._is_kr_equity_context() and PB1_KR_ENABLE_RESCUE_CANDIDATES and buyable_codes:
+                    logger.info(
+                        "[MINERVINI][KR_RESCUE_SOURCE][CODES] count=%s codes=%s"
+                        " note=not_order_candidate_until_risk_sizing_buyable_pass",
+                        len(buyable_codes),
+                        sorted(buyable_codes)[:20],
+                    )
                 
                 # === Minervini relax bridge: PB1 setup 0개일 때 Minervini relax 후보 연결 ===
                 minervini_bridge_candidates: list[CandidateFeature] = []

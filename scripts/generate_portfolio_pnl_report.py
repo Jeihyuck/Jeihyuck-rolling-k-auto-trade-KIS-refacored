@@ -367,7 +367,7 @@ def _build_portfolio_summary(
     holdings: list[dict],
     today_fills: list[dict],
     db_positions: list[dict],
-    cash: float,
+    cash: "float | None",
 ) -> dict:
     """
     Portfolio summary 계산. realized_pnl_today는 today_fills 기준 (전량매도 포함).
@@ -424,7 +424,8 @@ def _build_portfolio_summary(
         "realized_pnl_today": realized_today,
         "total_pnl": total_pnl,
         "cash": cash,
-        "total_equity_estimate": market_value + cash,
+        "cash_unavailable": cash is None,
+        "total_equity_estimate": (market_value + cash) if cash is not None else None,
         "winners": winners,
         "losers": losers,
         "best_position": f"{best['name']} {_fmt_pct(best['pnl_pct'])}" if best else "",
@@ -462,8 +463,13 @@ def _build_markdown(
     lines.append(f"| Unrealized PNL % | {_fmt_pct(summary['unrealized_pnl_pct'])} |")
     lines.append(f"| Realized PNL Today | {_fmt_krw(summary['realized_pnl_today'])} KRW |")
     lines.append(f"| Total PNL | {_fmt_krw(summary['total_pnl'])} KRW |")
-    lines.append(f"| Cash | {_fmt_krw(summary['cash'])} KRW |")
-    lines.append(f"| Total Equity Estimate | {_fmt_krw(summary['total_equity_estimate'])} KRW |")
+    _cash_val = summary["cash"]
+    _cash_src = summary.get("cash_source", "unknown")
+    _cash_disp = "N/A (unavailable)" if _cash_val is None else f"{_fmt_krw(_cash_val)} KRW"
+    lines.append(f"| Cash | {_cash_disp} | source={_cash_src} |")
+    _eq = summary["total_equity_estimate"]
+    _eq_disp = "N/A" if _eq is None else f"{_fmt_krw(_eq)} KRW"
+    lines.append(f"| Total Equity Estimate | {_eq_disp} |")
     lines.append(f"| Winners / Losers | {summary['winners']} / {summary['losers']} |")
     lines.append(f"| Best Position | {summary.get('best_position', '')} |")
     lines.append(f"| Worst Position | {summary.get('worst_position', '')} |")
@@ -562,11 +568,18 @@ def main() -> int:
         balance_output2 = balance.get("output2") or {}
         if isinstance(balance_output2, list):
             balance_output2 = balance_output2[0] if balance_output2 else {}
-        cash = _safe_float(
+        _raw_cash_val = (
             balance_output2.get("nxdy_auto_rdpt_amt")
             or balance_output2.get("dnca_tot_amt")
             or balance_output2.get("tot_evlu_amt")
         )
+        if _raw_cash_val is not None and str(_raw_cash_val).strip() not in ("", "0", "0.0"):
+            cash: "float | None" = _safe_float(_raw_cash_val)
+            cash_source = "kis_balance"
+        else:
+            cash = None
+            cash_source = "unavailable"
+            logger.warning("[PNL_REPORT][CASH_UNAVAILABLE] balance_output2=%s", balance_output2)
 
         # DB 데이터 조회
         db_positions = _get_positions_from_db(engine, env, trade_date)
@@ -581,6 +594,7 @@ def main() -> int:
 
         # Summary
         summary = _build_portfolio_summary(holdings, today_fills, db_positions, cash)
+        summary["cash_source"] = cash_source
 
         # Today trades
         today_trades = _build_today_trades(today_orders, today_fills, balance_output1, db_positions)

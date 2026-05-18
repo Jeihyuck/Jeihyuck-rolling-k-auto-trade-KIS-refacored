@@ -237,3 +237,51 @@ def test_kr_rescue_config_defaults():
     assert PB1_KR_RESCUE_TOPN == 3
     assert PB1_KR_RESCUE_SOURCE == "SCANNER_OR_MINERVINI"
     assert PB1_KR_STRESS_MAX_NEW_POSITIONS == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 12-7: PNL report cash=None when KIS balance unavailable
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pnl_report_cash_none_when_kis_balance_unavailable():
+    """KIS 잔고 조회 실패 시 cash=None, cash_source="unavailable" — cash=0 처리 금지 (섹션 10)"""
+    from scripts.generate_portfolio_pnl_report import _build_portfolio_summary
+
+    # KIS 응답이 비어있을 때 cash=None 전달 → summary에서 None 유지
+    summary = _build_portfolio_summary(
+        holdings=[],
+        today_fills=[],
+        db_positions=[],
+        cash=None,
+    )
+    # cash=None이 summary에 그대로 보존되어야 함 (0으로 대체 금지)
+    assert summary["cash"] is None, f"cash는 None이어야 하지만 실제: {summary['cash']}"
+    # total_equity_estimate도 None (계산 불가)
+    assert summary["total_equity_estimate"] is None, (
+        f"total_equity_estimate는 None이어야 하지만 실제: {summary['total_equity_estimate']}"
+    )
+    # cash_unavailable 플래그
+    assert summary["cash_unavailable"] is True
+
+
+def test_pnl_report_cash_source_set_in_summary():
+    """generate_main에서 cash_source가 summary에 기록되는 계약 검증"""
+    # _build_portfolio_summary는 cash_source를 반환하지 않음 —
+    # generate_main에서 수동으로 summary["cash_source"] = cash_source 로 주입.
+    # 이 테스트는 그 계약을 검증한다.
+    from scripts.generate_portfolio_pnl_report import _build_portfolio_summary
+    import inspect
+
+    src = inspect.getsource(_build_portfolio_summary)
+    # _build_portfolio_summary 자체에는 cash_source가 없어야 함 (외부 주입)
+    assert "cash_source" not in src, (
+        "_build_portfolio_summary 내부에 cash_source가 있으면 안 됩니다. "
+        "generate_main에서 외부 주입 방식을 사용합니다."
+    )
+
+    # 실제로 summary에 cash_source를 주입하는 코드가 스크립트에 있는지 확인
+    import pathlib, re
+    script_src = pathlib.Path("scripts/generate_portfolio_pnl_report.py").read_text(encoding="utf-8")
+    assert re.search(r'summary\["cash_source"\]\s*=\s*cash_source', script_src), (
+        "generate_portfolio_pnl_report.py에 summary[\"cash_source\"] = cash_source 주입 코드가 없습니다."
+    )
