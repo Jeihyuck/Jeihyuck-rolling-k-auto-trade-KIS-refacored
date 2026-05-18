@@ -5389,6 +5389,20 @@ def run_once(
             session_recovery_continue=session_recovery_continue,
             forced_trade_session=forced_trade_session,
             phase_guard_classification=phase_guard_classification,
+            # [2026-05-18] KR adaptive entry filter: scanner_context 빌드
+            scanner_context={
+                "scanner_passed_codes": list(
+                    {
+                        str(x).zfill(6)
+                        for x in (
+                            (precomputed_final30_df.get("code", __import__("pandas").Series(dtype=str)).tolist())
+                            if (precomputed_final30_df is not None and not precomputed_final30_df.empty)
+                            else []
+                        )
+                        if str(x).strip()
+                    }
+                ),
+            },
         )
         logger.info("[TRADE][ENGINE_BOOT][OK] engine=PB1Engine")
         

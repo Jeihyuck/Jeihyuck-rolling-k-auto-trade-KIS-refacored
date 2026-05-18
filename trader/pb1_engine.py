@@ -159,6 +159,29 @@ from trader.config import (
     PB1_ABS_TP1_ENABLED,
     PB1_ABS_TP1_PROFIT_PCT,
     PB1_ABS_TP1_SELL_PCT,
+    # [2026-05-18] PB1 KR-only adaptive entry filter
+    PB1_KR_ADAPTIVE_ENTRY_FILTER,
+    PB1_KR_PULLBACK_VOL_HARD_FAIL,
+    PB1_KR_PULLBACK_VOLU_HARD_FAIL,
+    PB1_KR_PULLBACK_VOL_PENALTY,
+    PB1_KR_PULLBACK_VOLU_PENALTY,
+    PB1_KR_MOMENTUM_ALLOW_VOL_EXPANSION,
+    PB1_KR_BREAKOUT_ALLOW_VOL_EXPANSION,
+    PB1_KR_SCORE_MODE,
+    PB1_KR_ADAPTIVE_RANK_TOPN,
+    PB1_KR_ADAPTIVE_SCORE_MIN_FLOOR,
+    PB1_KR_ENABLE_RESCUE_CANDIDATES,
+    PB1_KR_RESCUE_TOPN,
+    PB1_KR_RESCUE_SOURCE,
+    PB1_KR_MARKET_STRESS_GUARD,
+    PB1_KR_STRESS_VOL_FAIL_RATIO,
+    PB1_KR_STRESS_MA20_FAIL_RATIO,
+    PB1_KR_STRESS_MAX_NEW_POSITIONS,
+    PB1_KR_STRESS_TICK_BUDGET_PCT,
+    PB1_KR_STRESS_REQUIRE_STRONG_RS,
+    PB1_KR_STRESS_MIN_RS_PCTILE,
+    PB1_KR_LOG_FILTER_MATRIX,
+    PB1_KR_LOG_RESCUE_DECISION,
 )
 from trader.constants import FLOW_OPTIONAL_COLS, REQUIRED_FINAL30_SCORED_COLS
 from trader.db.engine import dispose_engine_safely
@@ -1886,6 +1909,7 @@ class PB1Engine:
         session_recovery_continue: bool = False,
         forced_trade_session: str | None = None,
         phase_guard_classification: str | None = None,
+        scanner_context: dict | None = None,
     ) -> None:
         self._as_of = None
         self._trade_date = None
@@ -1944,6 +1968,7 @@ class PB1Engine:
         
         self.env = env
         self.run_id = run_id
+        self.scanner_context: dict = scanner_context or {}  # [2026-05-18] KR adaptive entry filter
         self.strategy = strategy or "best_k_meta"  # [FIX] watchlist 버그 수정
         self.diag_full_exec = diag_full_exec  # ✅ DIAG 풀패스 플래그
         self.engine = getattr(orders_repo, "engine", None)
@@ -2306,6 +2331,326 @@ class PB1Engine:
 
     def _resolve_entry_identity_for_candidate(self, cf: CandidateFeature) -> dict[str, str]:
         return self._resolve_entry_identity_from_mapping(getattr(cf, "features", {}) or {})
+
+    # =========================================================================
+    # [2026-05-18] KR 전용 adaptive entry filter 메서드들
+    # 이 메서드들은 반드시 _is_kr_equity_context() == True일 때만 적용됨
+    # =========================================================================
+
+    def _is_kr_equity_context(self) -> bool:
+        """한국장(KRX/KOSPI/KOSDAQ) PB1 context인지 판정한다.
+        
+        해외장(미국장 포함), crypto, 비국내시장에는 False를 반환하므로
+        이 메서드가 False이면 PB1_KR_* 로직이 절대 적용되지 않는다.
+        """
+        env = str(getattr(self, "env", "") or "").lower()
+        session_kind = str(getattr(self, "session_kind", "") or "").lower()
+        window_name = str(getattr(self, "window_name", "") or "").lower()
+        market_window = str(getattr(self, "market_window_name", "") or "").lower()
+        final30_source = str(getattr(self, "final30_source", "") or "").lower()
+
+        return (
+            env in {"practice", "real", "live"}
+            and session_kind in {"am", "pm", "afternoon", "close", ""}
+            and window_name in {"morning", "afternoon", "close", "am", "pm", "day", ""}
+            and market_window in {"morning", "afternoon", "close", "am", "pm", "day", ""}
+            and (
+                "pb1_watchlist_final_scored" in final30_source
+                or "final30" in final30_source
+                or final30_source in {"none", ""}
+            )
+        )
+
+    @staticmethod
+    def _classify_kr_reason_by_style(reason: str, entry_style: str) -> str:
+        """한국장 전용 reason severity classifier.
+        
+        return: HARD | SOFT | IGNORE
+        한국장에서만 사용. 기존 글로벌 로직에 영향 없음.
+        """
+        r = str(reason).lower()
+        style = str(entry_style or "").upper()
+
+        is_pullback = "PULLBACK" in style
+        is_momentum = "MOMENTUM" in style
+        is_breakout = "BREAKOUT" in style
+        is_vcp = "VCP" in style or "MINERVINI" in style
+
+        # 유동성/MA 필수 데이터 실패: 항상 HARD
+        if r in {"missing_ma", "illiquid", "liquidity_fail", "price_scale_outlier"}:
+            return "HARD"
+        if r in {"spread_fail", "gap_fail", "range_fail"}:
+            return "HARD"
+
+        if r == "vol_contraction_fail":
+            if is_pullback and not PB1_KR_PULLBACK_VOL_HARD_FAIL:
+                return "SOFT"
+            if is_momentum and PB1_KR_MOMENTUM_ALLOW_VOL_EXPANSION:
+                return "IGNORE"
+            if is_breakout and PB1_KR_BREAKOUT_ALLOW_VOL_EXPANSION:
+                return "IGNORE"
+            if is_vcp:
+                return "HARD"
+            return "SOFT"
+
+        if r == "volu_contraction_fail":
+            if is_pullback and not PB1_KR_PULLBACK_VOLU_HARD_FAIL:
+                return "SOFT"
+            if is_momentum and PB1_KR_MOMENTUM_ALLOW_VOL_EXPANSION:
+                return "IGNORE"
+            if is_breakout and PB1_KR_BREAKOUT_ALLOW_VOL_EXPANSION:
+                return "IGNORE"
+            if is_vcp:
+                return "HARD"
+            return "SOFT"
+
+        if r in {"close_below_ma20", "ma20_slope_hard_fail"}:
+            return "HARD"
+
+        if r.startswith("soft:"):
+            return "SOFT"
+
+        return "SOFT"
+
+    def _kr_adaptive_rank_candidates(
+        self,
+        candidates: list,
+        *,
+        topn: int | None = None,
+    ) -> list:
+        """한국장 전용 adaptive rank 후보 선정.
+        
+        PB1_KR_SCORE_MODE=ADAPTIVE_RANK일 때만 적용.
+        글로벌 score 기준을 바꾸지 않음.
+        """
+        if not (self._is_kr_equity_context() and PB1_KR_SCORE_MODE == "ADAPTIVE_RANK"):
+            return []
+
+        usable = []
+        for c in candidates:
+            features = getattr(c, "features", {}) or {}
+            hard_reasons = set(features.get("hard_reasons") or [])
+
+            fatal = {
+                "missing_ma",
+                "illiquid",
+                "liquidity_fail",
+                "price_scale_outlier",
+                "spread_fail",
+                "gap_fail",
+                "range_fail",
+            }
+
+            if hard_reasons & fatal:
+                continue
+
+            score = float(
+                features.get("kr_adjusted_score")
+                or features.get("score")
+                or getattr(c, "score", 0.0)
+                or 0.0
+            )
+            if score < PB1_KR_ADAPTIVE_SCORE_MIN_FLOOR:
+                continue
+
+            usable.append(c)
+
+        ordered = sorted(
+            usable,
+            key=lambda c: (
+                float(
+                    (getattr(c, "features", {}) or {}).get("kr_adjusted_score")
+                    or (getattr(c, "features", {}) or {}).get("score")
+                    or getattr(c, "score", 0.0)
+                    or 0.0
+                ),
+                float((getattr(c, "features", {}) or {}).get("rs_percentile") or 0.0),
+                float((getattr(c, "features", {}) or {}).get("pullback_score") or 0.0),
+                float((getattr(c, "features", {}) or {}).get("momentum_score") or 0.0),
+            ),
+            reverse=True,
+        )
+
+        n = int(topn or PB1_KR_ADAPTIVE_RANK_TOPN)
+        return ordered[: max(1, n)]
+
+    def _detect_kr_market_stress_from_filter_stats(
+        self,
+        *,
+        scanned: int,
+        reason_counts: dict,
+        raw_signal_setup_ok: int = 0,
+        scanner_passed: int = 0,
+    ) -> tuple[bool, dict]:
+        """한국장 급변동(stress) 상태 감지.
+        
+        _is_kr_equity_context() == False이면 항상 (False, {}) 반환.
+        """
+        if not (self._is_kr_equity_context() and PB1_KR_MARKET_STRESS_GUARD):
+            return False, {}
+
+        scanned = max(1, int(scanned or 0))
+
+        vol_fail_ratio = float(reason_counts.get("vol_contraction_fail", 0)) / scanned
+        ma20_fail_ratio = float(reason_counts.get("close_below_ma20", 0)) / scanned
+        ma20_slope_fail_ratio = float(reason_counts.get("ma20_slope_hard_fail", 0)) / scanned
+
+        stress = False
+        reasons = []
+
+        if vol_fail_ratio >= PB1_KR_STRESS_VOL_FAIL_RATIO:
+            stress = True
+            reasons.append("kr_vol_fail_ratio_high")
+
+        if ma20_fail_ratio >= PB1_KR_STRESS_MA20_FAIL_RATIO:
+            stress = True
+            reasons.append("kr_ma20_fail_ratio_high")
+
+        scanner_pb1_divergence = (
+            raw_signal_setup_ok >= 10
+            and scanner_passed >= 5
+            and vol_fail_ratio >= PB1_KR_STRESS_VOL_FAIL_RATIO
+        )
+        if scanner_pb1_divergence:
+            stress = True
+            reasons.append("kr_scanner_pb1_divergence_under_high_vol")
+
+        detail = {
+            "vol_fail_ratio": vol_fail_ratio,
+            "ma20_fail_ratio": ma20_fail_ratio,
+            "ma20_slope_fail_ratio": ma20_slope_fail_ratio,
+            "raw_signal_setup_ok": raw_signal_setup_ok,
+            "scanner_passed": scanner_passed,
+            "reasons": reasons,
+        }
+
+        logger.info(
+            "[PB1][KR_MARKET_STRESS] stress=%s scanned=%s vol_fail_ratio=%.2f ma20_fail_ratio=%.2f raw_setup=%s scanner_passed=%s reasons=%s",
+            int(stress),
+            scanned,
+            vol_fail_ratio,
+            ma20_fail_ratio,
+            raw_signal_setup_ok,
+            scanner_passed,
+            reasons,
+        )
+
+        return stress, detail
+
+    def _build_kr_rescue_candidates(
+        self,
+        candidates: list,
+        *,
+        scanner_passed_codes: "set[str] | None" = None,
+        minervini_buyable_codes: "set[str] | None" = None,
+        market_stress: bool = False,
+    ) -> list:
+        """한국장 setup_ok=0일 때 scanner/minervini 후보를 rescue path로 넘긴다.
+        
+        반드시 기존 risk -> sizing -> buyable -> order_candidates 경로를 통과해야 한다.
+        rescue 후보가 바로 주문되지 않는다.
+        """
+        if not (self._is_kr_equity_context() and PB1_KR_ENABLE_RESCUE_CANDIDATES):
+            return []
+
+        scanner_passed_codes = scanner_passed_codes or set()
+        minervini_buyable_codes = minervini_buyable_codes or set()
+
+        rescued = []
+
+        for cf in candidates:
+            features = getattr(cf, "features", {}) or {}
+            code = getattr(cf, "code", None) or features.get("code")
+
+            if not code:
+                continue
+
+            hard_reasons = set(features.get("hard_reasons") or [])
+
+            fatal = {
+                "missing_ma",
+                "illiquid",
+                "liquidity_fail",
+                "price_scale_outlier",
+                "spread_fail",
+                "gap_fail",
+                "range_fail",
+            }
+
+            if hard_reasons & fatal:
+                continue
+
+            # 한국장 급변동 중 MA20 아래 + 기울기 실패 조합은 rescue 금지
+            if "close_below_ma20" in hard_reasons and "ma20_slope_hard_fail" in hard_reasons:
+                continue
+
+            source_ok = False
+            source_tags = []
+
+            if PB1_KR_RESCUE_SOURCE in {"SCANNER", "SCANNER_OR_MINERVINI"} and code in scanner_passed_codes:
+                source_ok = True
+                source_tags.append("scanner")
+
+            if PB1_KR_RESCUE_SOURCE in {"MINERVINI", "SCANNER_OR_MINERVINI"} and code in minervini_buyable_codes:
+                source_ok = True
+                source_tags.append("minervini_relax")
+
+            if not source_ok:
+                continue
+
+            rs = float(
+                features.get("rs_percentile")
+                or features.get("rs_pctile")
+                or 0.0
+            )
+
+            # stress 모드에서는 강한 RS만 허용
+            if market_stress and PB1_KR_STRESS_REQUIRE_STRONG_RS and rs < PB1_KR_STRESS_MIN_RS_PCTILE * 100:
+                continue
+
+            clone = self._clone_candidate(cf) if hasattr(self, "_clone_candidate") else cf
+            clone.setup_ok = True
+            clone.reasons = []
+
+            clone.features["kr_rescue_candidate"] = True
+            clone.features["kr_rescue_source"] = source_tags
+            clone.features["kr_rescue_reason"] = "kr_setup_zero_but_scanner_or_minervini_positive"
+
+            rescued.append(clone)
+
+        ordered = sorted(
+            rescued,
+            key=lambda c: (
+                float(
+                    (getattr(c, "features", {}) or {}).get("kr_adjusted_score")
+                    or (getattr(c, "features", {}) or {}).get("score")
+                    or getattr(c, "score", 0.0)
+                    or 0.0
+                ),
+                float((getattr(c, "features", {}) or {}).get("rs_percentile") or 0.0),
+                float((getattr(c, "features", {}) or {}).get("pullback_score") or 0.0),
+            ),
+            reverse=True,
+        )
+
+        topn = max(1, int(PB1_KR_RESCUE_TOPN))
+
+        # stress 모드에서는 최대 1개
+        if market_stress and PB1_KR_MARKET_STRESS_GUARD:
+            topn = min(topn, PB1_KR_STRESS_MAX_NEW_POSITIONS)
+
+        selected = ordered[:topn]
+
+        if PB1_KR_LOG_RESCUE_DECISION:
+            logger.info(
+                "[PB1][KR_RESCUE][RESULT] enabled=1 market_stress=%s source=%s selected=%s codes=%s",
+                int(bool(market_stress)),
+                PB1_KR_RESCUE_SOURCE,
+                len(selected),
+                [getattr(c, "code", None) for c in selected],
+            )
+
+        return selected
 
     def _stage_timeout_sec(self, env_name: str, default: float) -> float:
         raw = os.getenv(env_name)
@@ -6498,7 +6843,70 @@ class PB1Engine:
             if not score_ok:
                 soft_reasons.append("score_below_min")
 
-            must_fail = bool(hard_reasons) or not score_ok or (not soft_mode and (not ok or bool(soft_reasons)))
+            # [2026-05-18] KR 전용 adaptive entry filter
+            # _is_kr_equity_context()==False이면 기존 글로벌 로직과 동일
+            if self._is_kr_equity_context() and PB1_KR_ADAPTIVE_ENTRY_FILTER:
+                entry_style = str(
+                    clone.features.get("entry_style_selected")
+                    or clone.features.get("entry_signal")
+                    or clone.features.get("entry_reason")
+                    or ""
+                ).upper()
+
+                # 기존 hard_reasons를 severity로 재분류
+                reclassified_hard: list[str] = []
+                reclassified_soft: list[str] = []
+                kr_penalty = 0.0
+
+                for r in hard_reasons:
+                    sev = self._classify_kr_reason_by_style(r, entry_style)
+                    if sev == "HARD":
+                        reclassified_hard.append(r)
+                    elif sev == "SOFT":
+                        reclassified_soft.append(r)
+                        if r == "vol_contraction_fail":
+                            kr_penalty += PB1_KR_PULLBACK_VOL_PENALTY
+                        elif r == "volu_contraction_fail":
+                            kr_penalty += PB1_KR_PULLBACK_VOLU_PENALTY
+                    # IGNORE: 버림
+
+                kr_adjusted_score = adjusted_score - kr_penalty
+                clone.features["kr_adjusted_score"] = kr_adjusted_score
+                clone.features["kr_reclassified_hard"] = reclassified_hard
+                clone.features["kr_reclassified_soft"] = reclassified_soft
+
+                if PB1_KR_LOG_FILTER_MATRIX:
+                    logger.info(
+                        "[PB1][KR_FILTER_MATRIX] code=%s style=%s score=%.1f kr_adj=%.1f hard=%s→%s soft=%s→%s penalty=%.1f",
+                        getattr(clone, "code", "?"),
+                        entry_style or "?",
+                        adjusted_score,
+                        kr_adjusted_score,
+                        hard_reasons,
+                        reclassified_hard,
+                        soft_reasons,
+                        reclassified_soft,
+                        kr_penalty,
+                    )
+
+                kr_score_ok = kr_adjusted_score >= PB1_KR_ADAPTIVE_SCORE_MIN_FLOOR
+                must_fail = (
+                    bool(reclassified_hard)
+                    or not kr_score_ok
+                    or (not soft_mode and (not ok or bool(reclassified_soft + soft_reasons)))
+                )
+
+                if not must_fail:
+                    clone.features["kr_score_ok"] = True
+                else:
+                    clone.features["kr_score_ok"] = False
+                    if not kr_score_ok:
+                        reclassified_soft.append("kr_score_below_floor")
+                    hard_reasons = reclassified_hard
+                    soft_reasons = reclassified_soft + [r for r in soft_reasons if r != "score_below_min"]
+            else:
+                # 기존 글로벌 로직 그대로
+                must_fail = bool(hard_reasons) or not score_ok or (not soft_mode and (not ok or bool(soft_reasons)))
             if must_fail:
                 clone.setup_ok = False
                 clone.reasons = hard_reasons + soft_reasons if soft_reasons or hard_reasons else ["unspecified_fail"]
@@ -12694,6 +13102,85 @@ class PB1Engine:
                         len(minervini_input_codes),
                         minervini_ranked_count,
                     )
+
+                # === [2026-05-18] KR 전용 adaptive rescue path ===
+                # _is_kr_equity_context()==True이고 setup_ok==0인 경우만 실행
+                kr_rescue_applied = False
+                if self._is_kr_equity_context() and PB1_KR_ENABLE_RESCUE_CANDIDATES:
+                    current_setup_ok = [c for c in candidates if c.setup_ok]
+                    if len(current_setup_ok) == 0:
+                        # filter reason 통계 수집
+                        _reason_counts: dict[str, int] = {}
+                        for _c in candidates:
+                            for _r in (_c.reasons or []):
+                                _reason_counts[_r] = _reason_counts.get(_r, 0) + 1
+
+                        _scanned = len([c for c in candidates if c.features.get("data_ok")])
+
+                        # Market stress 판정
+                        _scanner_ctx = getattr(self, "scanner_context", {}) or {}
+                        _scanner_passed = len(_scanner_ctx.get("scanner_passed_codes", []))
+                        kr_stress, kr_stress_detail = self._detect_kr_market_stress_from_filter_stats(
+                            scanned=_scanned,
+                            reason_counts=_reason_counts,
+                            raw_signal_setup_ok=raw_signal_setup_ok_count,
+                            scanner_passed=_scanner_passed,
+                        )
+
+                        # stress guard: 최대 허용 포지션 수 적용
+                        _rescue_budget = (
+                            PB1_KR_STRESS_MAX_NEW_POSITIONS
+                            if kr_stress and PB1_KR_MARKET_STRESS_GUARD
+                            else PB1_KR_RESCUE_TOPN
+                        )
+
+                        if PB1_KR_LOG_FILTER_MATRIX:
+                            logger.info(
+                                "[PB1][KR_FILTER_MATRIX][SUMMARY] scanned=%s vol_fail=%s ma20_fail=%s stress=%s rescue_budget=%s",
+                                _scanned,
+                                _reason_counts.get("vol_contraction_fail", 0),
+                                _reason_counts.get("close_below_ma20", 0),
+                                int(kr_stress),
+                                _rescue_budget,
+                            )
+
+                        _scanner_passed_codes = set(_scanner_ctx.get("scanner_passed_codes", []))
+                        _minervini_buyable_codes = buyable_codes
+
+                        rescued_candidates = self._build_kr_rescue_candidates(
+                            candidates,
+                            scanner_passed_codes=_scanner_passed_codes,
+                            minervini_buyable_codes=_minervini_buyable_codes,
+                            market_stress=kr_stress,
+                        )
+
+                        if rescued_candidates:
+                            for _rc in rescued_candidates:
+                                if _rc not in candidates:
+                                    candidates = list(candidates) + [_rc]
+                                else:
+                                    # 이미 있으면 setup_ok만 갱신
+                                    _rc.setup_ok = True
+                            kr_rescue_applied = True
+
+                            if PB1_KR_LOG_RESCUE_DECISION:
+                                logger.info(
+                                    "[PB1][KR_RESCUE][APPLIED] count=%s stress=%s codes=%s",
+                                    len(rescued_candidates),
+                                    int(kr_stress),
+                                    [getattr(c, "code", None) for c in rescued_candidates],
+                                )
+                        else:
+                            logger.info(
+                                "[PB1][KR_NO_TRADE_EXPLAIN] setup_ok=0 rescue=0 "
+                                "reason=no_qualified_rescue_candidates "
+                                "scanned=%s vol_fail_ratio=%.2f stress=%s scanner_passed=%s minervini_buyable=%s",
+                                _scanned,
+                                float(_reason_counts.get("vol_contraction_fail", 0)) / max(1, _scanned),
+                                int(kr_stress),
+                                len(_scanner_passed_codes),
+                                len(_minervini_buyable_codes),
+                            )
 
                 candidates = self._size_positions(candidates)
                 relax_debug_payload["score_cut_codes"] = list(self._debug_score_cut_codes)

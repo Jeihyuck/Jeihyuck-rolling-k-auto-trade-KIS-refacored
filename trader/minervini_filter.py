@@ -446,6 +446,19 @@ def select_buyable_with_relax(
             for item in items
         ],
     }
+
+    # [2026-05-18] KR rescue source 로그: setup_ok=0일 때 minervini relax 후보를 KR rescue path로 넘길 수 있도록
+    if chosen_codes and used_level > 0:
+        import logging as _logging
+        _mf_logger = _logging.getLogger(__name__)
+        _mf_logger.info(
+            "[MINERVINI][KR_RESCUE_SOURCE][CODES] relax_level=%s count=%s codes=%s "
+            "note=these_codes_may_be_used_as_kr_rescue_source_if_pb1_setup_ok_zero",
+            used_level,
+            len(chosen_codes),
+            chosen_codes,
+        )
+
     return chosen_codes, report
 
 

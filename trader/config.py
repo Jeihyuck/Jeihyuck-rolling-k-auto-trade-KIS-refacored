@@ -400,6 +400,36 @@ CONFIG = {
     "PB1_CORE_TP1_SELL_PCT": "0.25",
     "PB1_CORE_TP2_PROFIT_PCT": "30.0",
     "PB1_CORE_TP2_SELL_PCT": "0.25",
+    # === PB1 KR-only adaptive entry filter ===
+    # 한국장 전용 필터 (해외장/미국장/비국내시장에 영향 없음)
+    "PB1_KR_ADAPTIVE_ENTRY_FILTER": "1",
+    # 한국장 Pullback에서는 vol contraction을 hard fail이 아니라 penalty로 처리
+    "PB1_KR_PULLBACK_VOL_HARD_FAIL": "0",
+    "PB1_KR_PULLBACK_VOLU_HARD_FAIL": "0",
+    "PB1_KR_PULLBACK_VOL_PENALTY": "8",
+    "PB1_KR_PULLBACK_VOLU_PENALTY": "5",
+    # 한국장 Momentum / Breakout에서는 거래량 증가 허용
+    "PB1_KR_MOMENTUM_ALLOW_VOL_EXPANSION": "1",
+    "PB1_KR_BREAKOUT_ALLOW_VOL_EXPANSION": "1",
+    # 한국장 final30 score_final 분포가 40~42인데 min_score 55라 0개 되는 문제 방지
+    "PB1_KR_SCORE_MODE": "ADAPTIVE_RANK",
+    "PB1_KR_ADAPTIVE_RANK_TOPN": "5",
+    "PB1_KR_ADAPTIVE_SCORE_MIN_FLOOR": "38",
+    # setup 0개일 때 scanner/minervini 후보 rescue
+    "PB1_KR_ENABLE_RESCUE_CANDIDATES": "1",
+    "PB1_KR_RESCUE_TOPN": "3",
+    "PB1_KR_RESCUE_SOURCE": "SCANNER_OR_MINERVINI",
+    # 한국장 급변동 보호 모드
+    "PB1_KR_MARKET_STRESS_GUARD": "1",
+    "PB1_KR_STRESS_VOL_FAIL_RATIO": "0.70",
+    "PB1_KR_STRESS_MA20_FAIL_RATIO": "0.40",
+    "PB1_KR_STRESS_MAX_NEW_POSITIONS": "1",
+    "PB1_KR_STRESS_TICK_BUDGET_PCT": "0.15",
+    "PB1_KR_STRESS_REQUIRE_STRONG_RS": "1",
+    "PB1_KR_STRESS_MIN_RS_PCTILE": "0.85",
+    # 한국장 전용 로그
+    "PB1_KR_LOG_FILTER_MATRIX": "1",
+    "PB1_KR_LOG_RESCUE_DECISION": "1",
 }
 
 
@@ -1203,6 +1233,37 @@ PB1_ALLOW_KIS_DAILY_FALLBACK_IN_DIAG = _cfg_bool("PB1_ALLOW_KIS_DAILY_FALLBACK_I
 # === [2026-04-30] PNL report ===
 PB1_PNL_REPORT_ENABLED = _cfg_bool("PB1_PNL_REPORT_ENABLED", fallback=True)
 PB1_PNL_REPORT_SESSION = _cfg("PB1_PNL_REPORT_SESSION") or "am"
+
+# === [2026-05-18] PB1 KR-only adaptive entry filter ===
+# 한국장 전용: 해외장/미국장/비국내시장에 영향 없음
+PB1_KR_ADAPTIVE_ENTRY_FILTER = env_bool("PB1_KR_ADAPTIVE_ENTRY_FILTER", default=True)
+
+PB1_KR_PULLBACK_VOL_HARD_FAIL = env_bool("PB1_KR_PULLBACK_VOL_HARD_FAIL", default=False)
+PB1_KR_PULLBACK_VOLU_HARD_FAIL = env_bool("PB1_KR_PULLBACK_VOLU_HARD_FAIL", default=False)
+PB1_KR_PULLBACK_VOL_PENALTY = float(_cfg("PB1_KR_PULLBACK_VOL_PENALTY") or "8")
+PB1_KR_PULLBACK_VOLU_PENALTY = float(_cfg("PB1_KR_PULLBACK_VOLU_PENALTY") or "5")
+
+PB1_KR_MOMENTUM_ALLOW_VOL_EXPANSION = env_bool("PB1_KR_MOMENTUM_ALLOW_VOL_EXPANSION", default=True)
+PB1_KR_BREAKOUT_ALLOW_VOL_EXPANSION = env_bool("PB1_KR_BREAKOUT_ALLOW_VOL_EXPANSION", default=True)
+
+PB1_KR_SCORE_MODE = str(_cfg("PB1_KR_SCORE_MODE") or "ADAPTIVE_RANK").upper()
+PB1_KR_ADAPTIVE_RANK_TOPN = int(_cfg("PB1_KR_ADAPTIVE_RANK_TOPN") or "5")
+PB1_KR_ADAPTIVE_SCORE_MIN_FLOOR = float(_cfg("PB1_KR_ADAPTIVE_SCORE_MIN_FLOOR") or "38")
+
+PB1_KR_ENABLE_RESCUE_CANDIDATES = env_bool("PB1_KR_ENABLE_RESCUE_CANDIDATES", default=True)
+PB1_KR_RESCUE_TOPN = int(_cfg("PB1_KR_RESCUE_TOPN") or "3")
+PB1_KR_RESCUE_SOURCE = str(_cfg("PB1_KR_RESCUE_SOURCE") or "SCANNER_OR_MINERVINI").upper()
+
+PB1_KR_MARKET_STRESS_GUARD = env_bool("PB1_KR_MARKET_STRESS_GUARD", default=True)
+PB1_KR_STRESS_VOL_FAIL_RATIO = float(_cfg("PB1_KR_STRESS_VOL_FAIL_RATIO") or "0.70")
+PB1_KR_STRESS_MA20_FAIL_RATIO = float(_cfg("PB1_KR_STRESS_MA20_FAIL_RATIO") or "0.40")
+PB1_KR_STRESS_MAX_NEW_POSITIONS = int(_cfg("PB1_KR_STRESS_MAX_NEW_POSITIONS") or "1")
+PB1_KR_STRESS_TICK_BUDGET_PCT = float(_cfg("PB1_KR_STRESS_TICK_BUDGET_PCT") or "0.15")
+PB1_KR_STRESS_REQUIRE_STRONG_RS = env_bool("PB1_KR_STRESS_REQUIRE_STRONG_RS", default=True)
+PB1_KR_STRESS_MIN_RS_PCTILE = float(_cfg("PB1_KR_STRESS_MIN_RS_PCTILE") or "0.85")
+
+PB1_KR_LOG_FILTER_MATRIX = env_bool("PB1_KR_LOG_FILTER_MATRIX", default=True)
+PB1_KR_LOG_RESCUE_DECISION = env_bool("PB1_KR_LOG_RESCUE_DECISION", default=True)
 
 logger.info(
     "[CONFIG][EFFECTIVE_EXIT] existing_pos_eff=%s stop_cap=%s kospi_pct=%.1f kosdaq_pct=%.1f "

@@ -92,7 +92,7 @@ def _load_engine():
         if not db_url:
             logger.warning("[PNL_REPORT][DB_SKIP] PBCORE_DB_URL not set")
             return None
-        return make_engine(db_url)
+        return make_engine()
     except Exception as exc:
         logger.warning("[PNL_REPORT][DB_ENGINE_FAIL] err=%s", exc)
         traceback.print_exc()
