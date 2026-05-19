@@ -10,19 +10,21 @@
 - event_name: 
 - env: practice
 - dry_run: True
-- kis_order_allowed: 0
+- kis_order_allowed: 1
 - prep_status: UNKNOWN
 - locked_watchlist_count: 0
-- entry_eval_status: OK
+- entry_eval_status: UNKNOWN
 - entry_error_type: 
 - entry_error_message: 
 - entry_intents: 0
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: order_route
-- final_status: OK_WITH_WARNINGS_SIGNAL_ONLY
-- reason: max_ticks
+- last_stage: session_start
+- final_status: OK
+- reason: graceful_shutdown
 - temp_error_count: 0
 - temp_recovered_count: 0
 - missed_trade_window: False
+- buy_decisions: 0
+- sell_decisions: 0
