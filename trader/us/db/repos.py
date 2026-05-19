@@ -485,16 +485,31 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
 # ---------------------------------------------------------------------------
 
 def save_position_snapshot(positions: list[dict], trade_date: str | None = None) -> int:
-    """us_positions 스냅샷 저장 (upsert). qty>0이면 open position."""
+    """us_positions 스냅샷 저장 (upsert). qty>0이면 open position.
+
+    meta에 holding_qty, orderable_qty, sellable_qty, entry_price,
+    entry_price_source, raw_exchange, balance_source를 포함한다.
+    """
     td = trade_date or _today()
     engine = _get_engine_or_none()
     if engine is None:
         _MEM_POSITIONS.clear()
         for p in positions:
+            meta = dict(p.get("meta") or {})
+            meta.update({
+                "holding_qty": p.get("holding_qty") or p.get("qty", 0),
+                "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
+                "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
+                "entry_price": p.get("entry_price") or p.get("avg_price_usd", 0),
+                "entry_price_source": p.get("entry_price_source"),
+                "raw_exchange": p.get("raw_exchange"),
+                "balance_source": p.get("balance_source", "kis_balance_authoritative"),
+            })
             _MEM_POSITIONS.append({
                 **p, "as_of": td,
                 "avg_cost": p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd", 0),
                 "current_px": p.get("current_px") or p.get("current_price") or p.get("current_price_usd", 0),
+                "meta": meta,
             })
         return len(positions)
     count = 0
@@ -503,6 +518,17 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
             for p in positions:
                 avg_cost = float(p.get("avg_cost") or p.get("entry_price") or p.get("avg_price_usd") or 0)
                 current_px = float(p.get("current_px") or p.get("current_price") or p.get("current_price_usd") or 0)
+                # meta에 orderable_qty 등 보존
+                meta = dict(p.get("meta") or {})
+                meta.update({
+                    "holding_qty": p.get("holding_qty") or p.get("qty", 0),
+                    "orderable_qty": p.get("orderable_qty") or p.get("qty", 0),
+                    "sellable_qty": p.get("sellable_qty") or p.get("orderable_qty") or p.get("qty", 0),
+                    "entry_price": p.get("entry_price") or avg_cost,
+                    "entry_price_source": p.get("entry_price_source"),
+                    "raw_exchange": p.get("raw_exchange"),
+                    "balance_source": p.get("balance_source", "kis_balance_authoritative"),
+                })
                 conn.execute(
                     text("""
                         INSERT INTO us_positions
@@ -525,7 +551,7 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
                         "avg_cost": avg_cost,
                         "current_px": current_px,
                         "unrealized_pnl_usd": float(p.get("unrealized_pnl_usd", 0)),
-                        "meta": _json_param(p.get("meta")),
+                        "meta": _json_param(meta),
                     },
                 )
                 count += 1
@@ -536,23 +562,45 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
 
 
 def load_positions(as_of: str | None = None) -> list[dict]:
-    """open 포지션(qty>0) 반환."""
+    """open 포지션(qty>0) 반환. meta의 orderable_qty/sellable_qty를 top-level로 promote."""
     td = as_of or _today()
     engine = _get_engine_or_none()
     if engine is None:
-        return [p for p in _MEM_POSITIONS
+        rows = [p for p in _MEM_POSITIONS
                 if (p.get("as_of") == td or p.get("trade_date") == td)
                 and int(p.get("qty", 0)) > 0]
-    try:
-        with engine.begin() as conn:
-            rows = conn.execute(
-                text("SELECT * FROM us_positions WHERE as_of=:td AND qty>0"),
-                {"td": td},
-            )
-            return [dict(r._mapping) for r in rows]
-    except Exception as exc:
-        logger.error("[US_POSITIONS][LOAD][ERROR] %s", exc)
-        return []
+    else:
+        try:
+            with engine.begin() as conn:
+                raw = conn.execute(
+                    text("SELECT * FROM us_positions WHERE as_of=:td AND qty>0"),
+                    {"td": td},
+                )
+                rows = [dict(r._mapping) for r in raw]
+        except Exception as exc:
+            logger.error("[US_POSITIONS][LOAD][ERROR] %s", exc)
+            return []
+
+    enriched = []
+    for row in rows:
+        r = dict(row)
+        meta = r.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = {}
+        # top-level promote
+        r["orderable_qty"] = meta.get("orderable_qty") or r.get("qty", 0)
+        r["sellable_qty"] = meta.get("sellable_qty") or r.get("orderable_qty", 0)
+        r["holding_qty"] = meta.get("holding_qty") or r.get("qty", 0)
+        r["entry_price"] = r.get("avg_cost") or meta.get("entry_price") or 0
+        r["current_price_usd"] = r.get("current_px") or 0
+        r["entry_price_source"] = meta.get("entry_price_source") or "us_positions_avg_cost"
+        r["balance_source"] = meta.get("balance_source") or "us_positions_db"
+        enriched.append(r)
+    return enriched
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +641,74 @@ def load_today_order_keys(trade_date: str | None = None) -> set[str]:
     except Exception as exc:
         logger.error("[US_ORDERS][KEYS][ERROR] %s", exc)
         return set()
+
+
+def load_us_positions_by_symbols(
+    symbols: list[str],
+    as_of: str | None = None,
+) -> dict[str, dict]:
+    """symbol 목록에 대한 us_positions 최신 row 반환. meta top-level promote.
+
+    Args:
+        symbols: 조회할 symbol 목록
+        as_of: YYYY-MM-DD. None이면 오늘.
+
+    Returns:
+        {symbol: position_dict} — qty>0인 것만 포함
+    """
+    if not symbols:
+        return {}
+    td = as_of or _today()
+    engine = _get_engine_or_none()
+
+    rows: list[dict] = []
+    if engine is None:
+        rows = [
+            p for p in _MEM_POSITIONS
+            if p.get("symbol") in symbols
+            and (p.get("as_of") == td or p.get("trade_date") == td)
+            and int(p.get("qty", 0)) > 0
+        ]
+    else:
+        try:
+            with engine.begin() as conn:
+                raw = conn.execute(
+                    text("""
+                        SELECT DISTINCT ON (symbol)
+                            *
+                        FROM us_positions
+                        WHERE symbol = ANY(:syms)
+                          AND as_of <= :td
+                          AND qty > 0
+                        ORDER BY symbol, as_of DESC
+                    """),
+                    {"syms": list(symbols), "td": td},
+                )
+                rows = [dict(r._mapping) for r in raw]
+        except Exception as exc:
+            logger.error("[US_POSITIONS][BY_SYMBOLS][ERROR] %s", exc)
+            return {}
+
+    result: dict[str, dict] = {}
+    for row in rows:
+        r = dict(row)
+        meta = r.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = {}
+        r["orderable_qty"] = meta.get("orderable_qty") or r.get("qty", 0)
+        r["sellable_qty"] = meta.get("sellable_qty") or r.get("orderable_qty", 0)
+        r["holding_qty"] = meta.get("holding_qty") or r.get("qty", 0)
+        r["entry_price"] = r.get("avg_cost") or meta.get("entry_price") or 0
+        r["current_price_usd"] = r.get("current_px") or 0
+        r["entry_price_source"] = meta.get("entry_price_source") or "us_positions_avg_cost"
+        sym = r.get("symbol")
+        if sym:
+            result[sym] = r
+    return result
 
 
 def load_open_orders_by_symbol(symbol: str, trade_date: str | None = None) -> list[dict]:

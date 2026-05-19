@@ -884,6 +884,7 @@ def run_trade_tick(
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
     blocked_cnt = sum(1 for o in orders if o["status"] == "BLOCKED")
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
+    reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
     
     # Block reasons 통계 수집
@@ -900,8 +901,8 @@ def run_trade_tick(
             block_reasons[reason] = block_reasons.get(reason, 0) + 1
 
     logger.info(
-        "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d signal_only=%d error=%d",
-        len(orders), ack_cnt, dry_cnt, blocked_cnt, signal_only_cnt, err_cnt,
+        "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d signal_only=%d reject=%d error=%d",
+        len(orders), ack_cnt, dry_cnt, blocked_cnt, signal_only_cnt, reject_cnt, err_cnt,
     )
     
     if blocked_cnt > 0:
@@ -916,18 +917,22 @@ def run_trade_tick(
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
     total_warnings = fills_warnings_count
     orders_sent = ack_cnt + dry_cnt  # ACK + DRY_RUN = 실제 주문 시도 수
+    orders_failed = reject_cnt + err_cnt
+    exit_intents_count = len(exit_intents)
     entry_intents_count = len(entry_intents)
-    
+
     # Status 결정 우선순위:
     # 1. 심각한 에러가 있으면 ERROR
-    # 2. entry_intents가 0이면 NO_ENTRY_INTENTS
-    # 3. entry_intents > 0이지만 orders_sent=0이고 blocked > 0이면 NO_ORDERS_RISK_BLOCKED
-    # 4. orders_sent > 0이고 blocked > 0이면 PARTIAL_ORDERS_BLOCKED
-    # 5. signal_only mode이면 OK_SIGNAL_ONLY
-    # 6. orders_sent > 0이면 OK_ORDERS_SENT
-    # 7. orders_sent = 0이고 entry_intents = 0이면 OK_NO_TRADE
-    # 8. 기본 OK
-    
+    # 2. exit_intents > 0 이면 exit 결과를 우선 판단
+    #    - 전체 REJECT → FAILED_ALL_EXIT_ORDERS_REJECTED
+    #    - 일부 REJECT → FAILED_PARTIAL_EXIT_ORDERS_REJECTED
+    #    - 전체 BLOCKED → FAILED_ALL_EXIT_ORDERS_BLOCKED
+    #    - orders_sent > 0 → OK_EXIT_ORDERS_SENT
+    #    - orders_attempted == 0 → FAILED_EXIT_INTENTS_NOT_ROUTED
+    # 3. exit_intents == 0 → entry 기반 status
+    #    - entry_intents == 0 → OK_NO_TRADE
+    #    - ...
+
     if total_errors > 0:
         status = "ERROR" if total_errors > 2 else "OK_WITH_ERRORS"
         status_reasons = []
@@ -941,8 +946,49 @@ def run_trade_tick(
             "[US_TICK][STATUS_DECISION] status=%s errors=%d reasons=[%s]",
             status, total_errors, ", ".join(status_reasons)
         )
+    elif exit_intents_count > 0:
+        # exit intents가 있으면 exit 결과를 기준으로 status 결정
+        # 주의: exit_intents > 0이면 entry_intents == 0이어도 OK_NO_TRADE 금지
+        orders_attempted = len(orders)
+        if reject_cnt == exit_intents_count and orders_sent == 0:
+            status = "FAILED_ALL_EXIT_ORDERS_REJECTED"
+            logger.error(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d rejected=%d",
+                status, exit_intents_count, reject_cnt,
+            )
+        elif reject_cnt > 0:
+            status = "FAILED_PARTIAL_EXIT_ORDERS_REJECTED"
+            logger.error(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d rejected=%d sent=%d",
+                status, exit_intents_count, reject_cnt, orders_sent,
+            )
+        elif blocked_cnt == exit_intents_count and orders_sent == 0:
+            status = "FAILED_ALL_EXIT_ORDERS_BLOCKED"
+            logger.error(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d blocked=%d",
+                status, exit_intents_count, blocked_cnt,
+            )
+        elif orders_sent > 0:
+            status = "OK_EXIT_ORDERS_SENT"
+            logger.info(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d sent=%d",
+                status, exit_intents_count, orders_sent,
+            )
+        elif orders_attempted == 0:
+            status = "FAILED_EXIT_INTENTS_NOT_ROUTED"
+            logger.error(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d not_routed",
+                status, exit_intents_count,
+            )
+        else:
+            # 기타 (signal_only 등)
+            status = "OK_SIGNAL_ONLY" if signal_only else "OK_WITH_WARNINGS"
+            logger.info(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d orders_attempted=%d",
+                status, exit_intents_count, orders_attempted,
+            )
     elif entry_intents_count == 0 and orders_sent == 0:
-        # 진입 후보가 없음
+        # 진입 후보가 없음 + exit 없음
         status = "OK_NO_TRADE" if not signal_only else "OK_SIGNAL_ONLY"
         logger.info(
             "[US_TICK][STATUS_DECISION] status=%s reason=no_entry_intents signal_only=%s",
@@ -995,6 +1041,11 @@ def run_trade_tick(
         "block_reasons": block_reasons,
         "signal_only": signal_only_cnt,
         "errors": err_cnt,
+        "orders_rejected": reject_cnt,
+        "orders_failed": orders_failed,
+        "orders_sent": orders_sent,
+        "exit_intents": exit_intents_count,
+        "entry_intents": entry_intents_count,
         "budget": budget,
         "run_mode": run_mode,
         "signal_only_mode": signal_only,

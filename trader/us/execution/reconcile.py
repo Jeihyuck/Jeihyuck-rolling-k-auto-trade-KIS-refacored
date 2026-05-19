@@ -116,7 +116,23 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         total_pvs_source,
     )
 
-    # TODO: DB 기반 포지션과 비교 (US_RECONCILE_MISMATCH 감지)
+    # KIS balance authoritative: us_positions DB 동기화
+    if positions:
+        logger.info(
+            "[US_RECONCILE][AUTHORITATIVE] source=kis_balance positions=%d symbols=%s",
+            len(positions),
+            ",".join(position_symbols),
+        )
+        try:
+            from trader.us.db.repos import save_position_snapshot
+            saved = save_position_snapshot(positions)
+            logger.info(
+                "[US_RECONCILE][UPSERT_POSITIONS] count=%d source=kis_balance_authoritative",
+                saved,
+            )
+        except Exception as exc:
+            logger.warning("[US_RECONCILE][UPSERT_WARN] failed to upsert positions: %s", exc)
+
     return {
         "status": "OK",
         "position_count": len(positions),
@@ -124,6 +140,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         "total_pvs_source": total_pvs_source,
         "positions": positions,
         "position_symbols": position_symbols,
+        "balance_source": "kis_balance_authoritative",
         "raw_output1_count": raw_output1_count,
         "normalized_position_count": normalized_position_count,
         "balance_parse_status": balance_parse_status,

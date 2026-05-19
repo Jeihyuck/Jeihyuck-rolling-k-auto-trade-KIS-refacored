@@ -97,12 +97,25 @@ def fetch_kis_balance(client, env: str) -> dict:
                 
                 avg_cost_usd = safe_float(item.get("avg_unpr"))
                 current_price_usd = safe_float(item.get("ovrs_now_pric1"))
-                
-                market_value_usd = current_price_usd * qty if current_price_usd > 0 else 0.0
+
+                # current_price_usd가 0이면 avg_cost를 fallback으로 사용 (PRICE_MISSING 표시)
+                price_missing = current_price_usd <= 0
+                effective_price = current_price_usd if not price_missing else avg_cost_usd
+
+                market_value_usd = effective_price * qty if effective_price > 0 else 0.0
                 cost_basis_usd = avg_cost_usd * qty if avg_cost_usd > 0 else 0.0
-                
-                unrealized_pnl_usd = market_value_usd - cost_basis_usd if cost_basis_usd > 0 else 0.0
-                pnl_pct = ((current_price_usd - avg_cost_usd) / avg_cost_usd * 100.0) if avg_cost_usd > 0 else 0.0
+
+                if price_missing:
+                    # 가격 정보 없음: pnl_pct를 0.0으로 표시 (−100% 방지)
+                    unrealized_pnl_usd = 0.0
+                    pnl_pct = 0.0
+                    logger.warning(
+                        "[US_PNL][PRICE_MISSING] symbol=%s qty=%d avg_cost=%.4f",
+                        symbol, qty, avg_cost_usd,
+                    )
+                else:
+                    unrealized_pnl_usd = market_value_usd - cost_basis_usd if cost_basis_usd > 0 else 0.0
+                    pnl_pct = ((current_price_usd - avg_cost_usd) / avg_cost_usd * 100.0) if avg_cost_usd > 0 else 0.0
                 
                 holdings.append({
                     "symbol": symbol,
@@ -110,6 +123,7 @@ def fetch_kis_balance(client, env: str) -> dict:
                     "qty": qty,
                     "avg_cost_usd": round(avg_cost_usd, 4),
                     "current_price_usd": round(current_price_usd, 4),
+                    "price_missing": price_missing,
                     "cost_basis_usd": round(cost_basis_usd, 2),
                     "market_value_usd": round(market_value_usd, 2),
                     "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),

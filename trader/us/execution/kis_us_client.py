@@ -320,19 +320,34 @@ class KisUSClient:
             if output2 is None:
                 output2 = result.get("output2")
             
-            # pagination cursor 체크
-            next_fk = result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or ""
-            next_nk = result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or ""
-            
-            # next cursor가 없거나 동일하면 종료
+            # pagination cursor 체크 — 반드시 strip() 처리 (공백 문자열은 다음 페이지 아님)
+            next_fk_raw = result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or ""
+            next_nk_raw = result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or ""
+
+            next_fk = str(next_fk_raw).strip()
+            next_nk = str(next_nk_raw).strip()
+
             if not next_fk and not next_nk:
+                logger.info(
+                    "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=empty_cursor rows=%d",
+                    exchange_code,
+                    page,
+                    len(page_output1),
+                )
                 break
+
             if next_fk == ctx_fk and next_nk == ctx_nk:
+                logger.warning(
+                    "[US_BALANCE][EXCHANGE][PAGE_END] exchange=%s page=%d reason=same_cursor rows=%d",
+                    exchange_code,
+                    page,
+                    len(page_output1),
+                )
                 break
-            
+
             ctx_fk = next_fk
             ctx_nk = next_nk
-            
+
             logger.debug(
                 "[US_BALANCE][EXCHANGE][PAGE] exchange=%s page=%d count=%d next_fk=%s next_nk=%s",
                 exchange_code,
@@ -349,63 +364,179 @@ class KisUSClient:
         }
     
     def _merge_duplicate_symbols(self, rows: list[dict]) -> list[dict]:
-        """symbol 중복 병합 (qty, market_value, buy_amount 합산).
-        
+        """symbol 중복 처리.
+
+        원칙:
+        1. 완전히 동일한 row (row_key 기준)는 중복 페이지 row → skip.
+        2. 같은 symbol + 같은 exchange는 중복 페이지 → skip (합산 금지).
+        3. 같은 symbol이라도 다른 exchange이면 cross-exchange 실제 보유 → 제한적 합산 허용.
+
         Args:
             rows: output1 row list
-        
+
         Returns:
             중복 제거된 row list
         """
         if not rows:
             return []
-        
-        symbol_map: dict[str, dict] = {}
-        
+
+        seen_exact_rows: set[tuple] = set()
+        symbol_map: dict[str, dict] = {}  # symbol → merged row
+
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            
+
             # symbol 추출
             symbol = row.get("ovrs_pdno") or row.get("pdno") or row.get("PDNO") or ""
             symbol = str(symbol).strip().upper()
             if not symbol:
                 continue
-            
+
+            # exchange 추출
+            exchange = (
+                row.get("ovrs_excg_cd")
+                or row.get("tr_mket_name")
+                or row.get("exchange")
+                or ""
+            )
+            exchange = str(exchange).strip().upper()
+
+            # qty / orderable_qty / avg_price / market_value / buy_amount
+            qty_raw = (
+                row.get("ovrs_cblc_qty")
+                or row.get("cblc_qty")
+                or row.get("hldg_qty")
+                or "0"
+            )
+            orderable_raw = (
+                row.get("ord_psbl_qty")
+                or row.get("sll_psbl_qty")
+                or qty_raw
+            )
+            avg_price_raw = (
+                row.get("pchs_avg_pric")
+                or row.get("pchs_avg_price")
+                or "0"
+            )
+            mv_raw = (
+                row.get("ovrs_stck_evlu_amt")
+                or row.get("frcr_evlu_amt2")
+                or row.get("evlu_amt")
+                or "0"
+            )
+            ba_raw = row.get("frcr_pchs_amt1") or row.get("pchs_amt") or "0"
+
+            row_key = (
+                symbol,
+                exchange,
+                str(qty_raw).strip(),
+                str(orderable_raw).strip(),
+                str(avg_price_raw).strip(),
+                str(mv_raw).strip(),
+                str(ba_raw).strip(),
+            )
+
+            # 1단계: 완전히 동일한 row → 중복 페이지 skip
+            if row_key in seen_exact_rows:
+                logger.warning(
+                    "[US_BALANCE][DUPLICATE_ROW_SKIP] symbol=%s exchange=%s"
+                    " qty=%s orderable_qty=%s avg_price=%s market_value=%s",
+                    symbol,
+                    exchange,
+                    qty_raw,
+                    orderable_raw,
+                    avg_price_raw,
+                    mv_raw,
+                )
+                continue
+            seen_exact_rows.add(row_key)
+
+            # 2단계: 새 symbol → 그냥 추가
             if symbol not in symbol_map:
                 symbol_map[symbol] = dict(row)
-            else:
-                # 병합: qty, market_value, buy_amount 합산
-                existing = symbol_map[symbol]
-                
-                # qty 합산
-                qty_keys = ("ovrs_cblc_qty", "cblc_qty", "hldg_qty", "qty")
-                for k in qty_keys:
-                    if k in existing and k in row:
-                        existing[k] = str(int(self._safe_numeric(existing[k], 0)) + int(self._safe_numeric(row[k], 0)))
-                        break
-                
-                # market_value 합산
-                mv_keys = ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt")
-                for k in mv_keys:
-                    if k in existing and k in row:
-                        existing[k] = str(float(self._safe_numeric(existing[k], 0.0)) + float(self._safe_numeric(row[k], 0.0)))
-                        break
-                
-                # buy_amount 합산
-                ba_keys = ("frcr_pchs_amt1", "pchs_amt")
-                for k in ba_keys:
-                    if k in existing and k in row:
-                        existing[k] = str(float(self._safe_numeric(existing[k], 0.0)) + float(self._safe_numeric(row[k], 0.0)))
-                        break
-                
-                # pnl 합산
-                pnl_keys = ("frcr_evlu_pfls_amt", "evlu_pfls_amt", "ovrs_stck_evlu_pfls_amt")
-                for k in pnl_keys:
-                    if k in existing and k in row:
-                        existing[k] = str(float(self._safe_numeric(existing[k], 0.0)) + float(self._safe_numeric(row[k], 0.0)))
-                        break
-        
+                continue
+
+            # 3단계: 같은 symbol이 이미 있음
+            existing = symbol_map[symbol]
+            existing_exchange = (
+                existing.get("ovrs_excg_cd")
+                or existing.get("tr_mket_name")
+                or existing.get("exchange")
+                or ""
+            )
+            existing_exchange = str(existing_exchange).strip().upper()
+            existing_qty_raw = (
+                existing.get("ovrs_cblc_qty")
+                or existing.get("cblc_qty")
+                or existing.get("hldg_qty")
+                or "0"
+            )
+
+            if existing_exchange == exchange:
+                # 같은 exchange → 중복 페이지 row → skip (합산 금지)
+                logger.warning(
+                    "[US_BALANCE][DUPLICATE_SYMBOL_SAME_EXCHANGE_SKIP]"
+                    " symbol=%s exchange=%s existing_qty=%s duplicate_qty=%s",
+                    symbol,
+                    exchange,
+                    existing_qty_raw,
+                    qty_raw,
+                )
+                continue
+
+            # 다른 exchange → cross-exchange 실제 보유 → 합산 허용
+            logger.warning(
+                "[US_BALANCE][DUPLICATE_SYMBOL_CROSS_EXCHANGE_MERGE]"
+                " symbol=%s existing_exchange=%s new_exchange=%s"
+                " existing_qty=%s new_qty=%s",
+                symbol,
+                existing_exchange,
+                exchange,
+                existing_qty_raw,
+                qty_raw,
+            )
+
+            # qty 합산
+            qty_keys = ("ovrs_cblc_qty", "cblc_qty", "hldg_qty", "qty")
+            for k in qty_keys:
+                if k in existing and k in row:
+                    existing[k] = str(
+                        int(self._safe_numeric(existing[k], 0))
+                        + int(self._safe_numeric(row[k], 0))
+                    )
+                    break
+
+            # market_value 합산
+            mv_keys = ("ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt")
+            for k in mv_keys:
+                if k in existing and k in row:
+                    existing[k] = str(
+                        float(self._safe_numeric(existing[k], 0.0))
+                        + float(self._safe_numeric(row[k], 0.0))
+                    )
+                    break
+
+            # buy_amount 합산
+            ba_keys = ("frcr_pchs_amt1", "pchs_amt")
+            for k in ba_keys:
+                if k in existing and k in row:
+                    existing[k] = str(
+                        float(self._safe_numeric(existing[k], 0.0))
+                        + float(self._safe_numeric(row[k], 0.0))
+                    )
+                    break
+
+            # pnl 합산
+            pnl_keys = ("frcr_evlu_pfls_amt", "evlu_pfls_amt", "ovrs_stck_evlu_pfls_amt")
+            for k in pnl_keys:
+                if k in existing and k in row:
+                    existing[k] = str(
+                        float(self._safe_numeric(existing[k], 0.0))
+                        + float(self._safe_numeric(row[k], 0.0))
+                    )
+                    break
+
         return list(symbol_map.values())
     
     def _safe_numeric(self, val: Any, default: float = 0.0) -> float:
@@ -517,6 +648,20 @@ class KisUSClient:
             "ORD_SVR_DVSN_CD": "0",
             "ORD_DVSN": "00",  # 지정가
         }
+        # Safe log: CANO, token, appkey, appsecret 미포함
+        order_side = "SELL" if "sell" in tr.get("tr_id", "").lower() or "S" in tr.get("order_side", "") else "BUY"
+        logger.info(
+            "[US_ORDER][REQUEST_SAFE] side=%s symbol=%s exchange_input=%s exchange_api=%s"
+            " qty=%s price=%.2f ord_dvsn=%s tr_id=%s",
+            order_side,
+            symbol,
+            exchange,
+            excg_code,
+            qty,
+            price,
+            body.get("ORD_DVSN"),
+            tr.get("tr_id", ""),
+        )
         return self._post(tr["path"], headers=headers, body=body)
 
     # ------------------------------------------------------------------

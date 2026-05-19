@@ -254,6 +254,80 @@ def route_order(
         from trader.us.execution.kis_us_client import KisUSClient
         kis_client = KisUSClient(env="practice")
 
+    # SELL 직전 balance-match guard: orderable_qty 초과 주문 방지
+    if side == "SELL":
+        from trader.us.execution.us_sell_qty_guard import resolve_sell_qty
+
+        # intent 또는 us_positions에서 holding_qty/orderable_qty 확보
+        _pos_for_guard = {
+            "holding_qty": intent.get("holding_qty")
+                           or intent.get("available_qty")
+                           or (intent.get("meta") or {}).get("holding_qty"),
+            "orderable_qty": intent.get("orderable_qty")
+                             or (intent.get("meta") or {}).get("orderable_qty"),
+            "sellable_qty": intent.get("sellable_qty")
+                            or (intent.get("meta") or {}).get("sellable_qty"),
+        }
+        # DB fallback: intent에 orderable_qty가 없으면 us_positions 조회
+        if not _pos_for_guard["orderable_qty"] and symbol:
+            try:
+                from trader.us.db.repos import load_us_positions_by_symbols
+                _db_positions = load_us_positions_by_symbols([symbol])
+                _db_pos = _db_positions.get(symbol, {})
+                if _db_pos:
+                    _pos_for_guard["holding_qty"] = _pos_for_guard["holding_qty"] or _db_pos.get("holding_qty") or _db_pos.get("qty")
+                    _pos_for_guard["orderable_qty"] = _db_pos.get("orderable_qty") or _db_pos.get("qty")
+                    _pos_for_guard["sellable_qty"] = _db_pos.get("sellable_qty") or _pos_for_guard["orderable_qty"]
+            except Exception as _db_exc:
+                logger.warning("[US_ORDER][BALANCE_MATCH][WARN] db fallback failed: %s", _db_exc)
+
+        sell_qty, guard_meta = resolve_sell_qty(intent, _pos_for_guard)
+
+        logger.info(
+            "[US_ORDER][BALANCE_MATCH] symbol=%s intent_qty=%s holding_qty=%s"
+            " orderable_qty=%s sell_qty=%s",
+            symbol,
+            qty,
+            guard_meta.get("holding_qty"),
+            guard_meta.get("orderable_qty"),
+            sell_qty,
+        )
+
+        if sell_qty <= 0:
+            logger.error(
+                "[US_ORDER][SELL_BLOCKED] symbol=%s reason=no_orderable_qty"
+                " holding_qty=%s orderable_qty=%s",
+                symbol,
+                guard_meta.get("holding_qty"),
+                guard_meta.get("orderable_qty"),
+            )
+            if order_key:
+                mark_order_intent_blocked(order_key, reason="no_orderable_qty")
+            return {
+                "status": "BLOCKED",
+                "reason": "no_orderable_qty",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "intent": intent,
+            }
+
+        if sell_qty < qty:
+            logger.warning(
+                "[US_ORDER][SELL_QTY_CLAMP] symbol=%s old_qty=%d new_qty=%d"
+                " holding_qty=%s orderable_qty=%s",
+                symbol,
+                qty,
+                sell_qty,
+                guard_meta.get("holding_qty"),
+                guard_meta.get("orderable_qty"),
+            )
+            qty = sell_qty
+            intent = {**intent, "qty": sell_qty, "notional_usd": sell_qty * price}
+            intent.setdefault("meta", {})
+            if isinstance(intent.get("meta"), dict):
+                intent["meta"]["sell_qty_clamped"] = True
+
     logger.info("[US_ORDER][SEND] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
     try:
         if side == "BUY":

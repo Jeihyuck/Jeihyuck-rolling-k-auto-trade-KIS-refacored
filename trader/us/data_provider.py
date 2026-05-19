@@ -269,7 +269,7 @@ def normalize_us_balance(raw: dict) -> dict:
         pnl_rate_raw = _get_first_valid(row, pnl_rate_candidates, "0")
         pnl_rate = _safe_float(pnl_rate_raw, 0.0)
 
-        # [2026-05-18] exit contract 강화: entry_price alias
+        # exit contract 강화: entry_price alias
         # avg_price_usd가 0이면 buy_amount_usd / qty로 보완
         _resolved_avg_price = avg_price_usd
         _entry_price_source: str | None = None
@@ -279,13 +279,35 @@ def normalize_us_balance(raw: dict) -> dict:
             _resolved_avg_price = buy_amount_usd / qty
             _entry_price_source = "kis_buy_amount_usd"
 
+        # orderable_qty fallback 로그
+        orderable_source = "kis_ord_psbl_qty"
+        if orderable_qty == qty and not _get_first_valid(
+            row,
+            ("ord_psbl_qty", "sll_psbl_qty", "sellable_qty", "orderable_qty"),
+        ):
+            orderable_source = "qty_fallback"
+
+        logger.info(
+            "[US_BALANCE][POSITION] symbol=%s qty=%s orderable_qty=%s"
+            " avg_price=%.4f current=%.4f source=%s",
+            symbol,
+            qty,
+            orderable_qty,
+            avg_price_usd,
+            current_price_usd,
+            orderable_source,
+        )
+
         positions.append({
             "symbol": symbol,
             "name": str(name),
             "exchange": exchange,  # Normalized (NASDAQ, NYSE, AMEX)
             "raw_exchange": raw_exchange_str,  # Preserve original KIS code
             "qty": qty,
+            # KIS 매도가능수량 계열 — SELL qty guard 가 사용
+            "holding_qty": qty,
             "orderable_qty": orderable_qty,
+            "sellable_qty": orderable_qty,
             "avg_price_usd": avg_price_usd,
             "current_price_usd": current_price_usd,
             "market_value_usd": market_value_usd,
@@ -298,6 +320,7 @@ def normalize_us_balance(raw: dict) -> dict:
             "current_px": current_price_usd if current_price_usd > 0 else None,
             "unrealized_pnl_usd": pnl_usd,
             "entry_price_source": _entry_price_source,
+            "balance_source": "kis_balance_authoritative",
             "raw": row,
         })
 

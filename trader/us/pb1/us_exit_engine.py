@@ -109,6 +109,35 @@ def evaluate_exit(
     if qty <= 0:
         return None
 
+    # ── orderable_qty clamp ──────────────────────────────────────────────────
+    # SELL qty는 orderable_qty를 초과할 수 없다. (한국장 qty_to_close 원칙 이식)
+    raw_qty = qty
+    orderable_qty = int(
+        position.get("orderable_qty")
+        or position.get("sellable_qty")
+        or position.get("holding_qty")
+        or qty
+    )
+    exit_qty = min(raw_qty, orderable_qty) if orderable_qty > 0 else raw_qty
+
+    logger.info(
+        "[US_EXIT][SELL_QTY] symbol=%s holding_qty=%d orderable_qty=%d exit_qty=%d",
+        symbol,
+        raw_qty,
+        orderable_qty,
+        exit_qty,
+    )
+
+    if exit_qty <= 0:
+        logger.warning(
+            "[US_EXIT][SELL_QTY][SKIP] symbol=%s exit_qty=%d orderable_qty=%d",
+            symbol, exit_qty, orderable_qty,
+        )
+        return None
+
+    # exit_qty로 교체
+    qty = exit_qty
+
     # ── current_price guard ──────────────────────────────────────────────────
     if current_price <= 0:
         logger.warning(
@@ -146,6 +175,8 @@ def evaluate_exit(
                 reason="PNL_MISSING_ENTRY_PRICE_FAIL_CLOSED",
                 unrealized_pnl_usd=0.0,
                 pnl_pct=-999.0,
+                holding_qty=raw_qty,
+                orderable_qty=orderable_qty,
             )
         return None
 
@@ -184,6 +215,8 @@ def evaluate_exit(
             reason=f"pnl_pct={pnl_pct:.3f} <= -{cfg['hard_stop']}",
             unrealized_pnl_usd=unrealized_pnl_usd,
             pnl_pct=pnl_pct,
+            holding_qty=raw_qty,
+            orderable_qty=orderable_qty,
         )
 
     # ── trailing stop ─────────────────────────────────────────────────────────
@@ -196,6 +229,8 @@ def evaluate_exit(
             reason=f"trail_pct={trail_pct:.3f} > {cfg['trailing_stop']}",
             unrealized_pnl_usd=unrealized_pnl_usd,
             pnl_pct=pnl_pct,
+            holding_qty=raw_qty,
+            orderable_qty=orderable_qty,
         )
 
     # ── profit protect ────────────────────────────────────────────────────────
@@ -210,6 +245,8 @@ def evaluate_exit(
                 reason=f"pnl_pct={pnl_pct:.3f} high but pulling back",
                 unrealized_pnl_usd=unrealized_pnl_usd,
                 pnl_pct=pnl_pct,
+                holding_qty=raw_qty,
+                orderable_qty=orderable_qty,
             )
 
     # ── giveback ──────────────────────────────────────────────────────────────
@@ -226,6 +263,8 @@ def evaluate_exit(
                     reason=f"giveback_ratio={giveback_ratio:.3f} >= {cfg['giveback']}",
                     unrealized_pnl_usd=unrealized_pnl_usd,
                     pnl_pct=pnl_pct,
+                    holding_qty=raw_qty,
+                    orderable_qty=orderable_qty,
                 )
 
     return None
@@ -241,6 +280,8 @@ def _make_exit_intent(
     reason: str,
     unrealized_pnl_usd: float,
     pnl_pct: float,
+    holding_qty: int = 0,
+    orderable_qty: int = 0,
 ) -> dict:
     """Exit order intent 생성."""
     import hashlib
@@ -253,6 +294,9 @@ def _make_exit_intent(
         "[US_EXIT][SIGNAL] symbol=%s exit_type=%s reason=%s pnl_pct=%.3f",
         symbol, exit_type, reason, pnl_pct,
     )
+
+    _holding = holding_qty or qty
+    _orderable = orderable_qty or _holding
 
     return {
         "symbol": symbol,
@@ -268,6 +312,12 @@ def _make_exit_intent(
         "unrealized_pnl_pct": round(pnl_pct, 4),
         "client_order_key": client_order_key,
         "strategy": "us_pb1_exit",
+        "meta": {
+            "holding_qty": _holding,
+            "orderable_qty": _orderable,
+            "sellable_qty": _orderable,
+            "qty_source": "orderable_qty_clamp" if qty < _holding else "holding_qty",
+        },
     }
 
 
