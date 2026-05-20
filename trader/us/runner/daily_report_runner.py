@@ -360,10 +360,8 @@ def load_us_orders(trade_date: str) -> list[dict]:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
+    from trader.us.utils.logging_utils import setup_us_logging
+    setup_us_logging()
     parser = argparse.ArgumentParser(description="US Daily Report Runner")
     parser.add_argument("--env", default="practice", help="Environment (practice|real)")
     parser.add_argument("--session", default=None, help="Session (am|afternoon|close)")

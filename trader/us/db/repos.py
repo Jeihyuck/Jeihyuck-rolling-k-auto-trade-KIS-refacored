@@ -1581,29 +1581,58 @@ def count_us_watchlist(trade_date: str, locked_only: bool = True) -> int:
         return 0
 
 
-def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> bool:
+def _pick_us_orders_side_col(conn: object) -> "str | None":
+    """us_orders 테이블에서 실제 존재하는 side/direction 컬럼을 반환한다.
+
+    후보 우선순위: side > order_side > direction > buy_sell > ord_dvsn
+    없으면 None 반환.
+    """
+    try:
+        rows = conn.execute(
+            text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'us_orders'
+            """)
+        ).fetchall()
+        existing = {r[0] for r in rows}
+    except Exception as exc:
+        logger.warning("[US_AM_ALREADY_RAN][SCHEMA_FETCH_ERROR] %s", exc)
+        return None
+
+    for candidate in ("side", "order_side", "direction", "buy_sell", "ord_dvsn"):
+        if candidate in existing:
+            return candidate
+    return None
+
+
+def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
     """Check if US AM session already ran for the given trade_date.
-    
+
     Checks:
     1. us_agent_runs for mode='session-am' or agent_name='am'
-    2. us_orders for any BUY orders on trade_date
-    
+    2. us_orders for any BUY orders on trade_date (side 컬럼 자동 감지)
+
+    FAIL-CLOSED: guard 조회 실패 시 already_ran=True 반환 (중복 실행 차단).
+
     Returns:
-        True if AM already ran, False otherwise
+        dict with keys: already_ran (bool), guard_status, reason
     """
     engine = _get_engine_or_none()
     if engine is None:
         # In-memory: check if any BUY orders exist
-        return any(
-            o.get("trade_date") == trade_date and o.get("direction") == "BUY"
+        found = any(
+            o.get("trade_date") == trade_date
+            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
             for o in _MEM_ORDERS
         )
-    
+        return {"already_ran": found, "guard_status": "IN_MEMORY", "reason": "in_memory_check"}
+
     try:
         with engine.connect() as conn:
             # Set statement timeout
             conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
-            
+
             # Check us_agent_runs for AM session marker
             agent_row = conn.execute(
                 text("""
@@ -1617,55 +1646,77 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> bool:
                 """),
                 {"td": trade_date},
             ).fetchone()
-            
+
             if agent_row:
                 logger.info(
                     "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found agent_run run_id=%s status=%s",
                     trade_date, agent_row[0], agent_row[1]
                 )
-                return True
-            
-            # Fallback: check us_orders for BUY orders
-            order_row = conn.execute(
-                text("""
-                    SELECT COUNT(*) as cnt
-                    FROM us_orders
-                    WHERE trade_date = :td
-                      AND direction = 'BUY'
-                    LIMIT 1
-                """),
-                {"td": trade_date},
-            ).fetchone()
-            
-            if order_row and order_row[0] > 0:
-                logger.info(
-                    "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found buy_orders count=%d",
-                    trade_date, order_row[0]
+                return {
+                    "already_ran": True,
+                    "guard_status": "FOUND_AGENT_RUN",
+                    "reason": f"agent_run_status={agent_row[1]}",
+                }
+
+            # Fallback: check us_orders — side 컬럼 자동 감지
+            side_col = _pick_us_orders_side_col(conn)
+            if side_col:
+                order_row = conn.execute(
+                    text(f"""
+                        SELECT COUNT(*) as cnt
+                        FROM us_orders
+                        WHERE trade_date = :td
+                          AND {side_col} = 'BUY'
+                    """),
+                    {"td": trade_date},
+                ).fetchone()
+                if order_row and order_row[0] > 0:
+                    logger.info(
+                        "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found buy_orders count=%d (col=%s)",
+                        trade_date, order_row[0], side_col,
+                    )
+                    return {
+                        "already_ran": True,
+                        "guard_status": "FOUND_BUY_ORDERS",
+                        "reason": f"buy_orders_count={order_row[0]}",
+                    }
+            else:
+                logger.warning(
+                    "[US_AM_ALREADY_RAN][SCHEMA_FALLBACK] side/direction column missing in us_orders; "
+                    "checking session markers only"
                 )
-                return True
-            
-            return False
+
+            return {"already_ran": False, "guard_status": "NOT_FOUND", "reason": "no_prior_run"}
+
     except Exception as exc:
-        logger.error("[US_AM_ALREADY_RAN][CHECK][ERROR] %s", exc)
-        return False
+        logger.exception("[US_AM_ALREADY_RAN][FAILED_CLOSED] duplicate guard failed trade_date=%s", trade_date)
+        return {
+            "already_ran": True,
+            "guard_status": "FAILED_CLOSED",
+            "reason": "duplicate_guard_error",
+            "error": str(exc),
+        }
 
 
-def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> bool:
+def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
     """Check if US Afternoon session already ran for the given trade_date.
 
     Checks:
     1. us_agent_runs for mode='session-afternoon' or agent_name='afternoon'
-    2. us_orders for any BUY orders placed after 12:30 ET on trade_date
+
+    FAIL-CLOSED: guard 조회 실패 시 already_ran=True 반환.
 
     Returns:
-        True if afternoon already ran, False otherwise
+        dict with keys: already_ran (bool), guard_status, reason
     """
     engine = _get_engine_or_none()
     if engine is None:
-        return any(
-            o.get("trade_date") == trade_date and o.get("direction") == "BUY"
+        found = any(
+            o.get("trade_date") == trade_date
+            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
             for o in _MEM_ORDERS
         )
+        return {"already_ran": found, "guard_status": "IN_MEMORY", "reason": "in_memory_check"}
 
     try:
         with engine.connect() as conn:
@@ -1689,12 +1740,25 @@ def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> boo
                     "[US_AFTERNOON_ALREADY_RAN][CHECK] trade_date=%s found agent_run run_id=%s status=%s",
                     trade_date, agent_row[0], agent_row[1],
                 )
-                return True
+                return {
+                    "already_ran": True,
+                    "guard_status": "FOUND_AGENT_RUN",
+                    "reason": f"agent_run_status={agent_row[1]}",
+                }
 
-            return False
+            return {"already_ran": False, "guard_status": "NOT_FOUND", "reason": "no_prior_run"}
+
     except Exception as exc:
-        logger.error("[US_AFTERNOON_ALREADY_RAN][CHECK][ERROR] %s", exc)
-        return False
+        logger.exception(
+            "[US_AFTERNOON_ALREADY_RAN][FAILED_CLOSED] duplicate guard failed trade_date=%s",
+            trade_date,
+        )
+        return {
+            "already_ran": True,
+            "guard_status": "FAILED_CLOSED",
+            "reason": "duplicate_guard_error",
+            "error": str(exc),
+        }
 
 
 # ---------------------------------------------------------------------------

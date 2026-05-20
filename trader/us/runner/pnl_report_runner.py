@@ -26,6 +26,14 @@ from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from trader.us.utils.pnl_utils import (
+    first_present,
+    normalize_us_position,
+    pick_column_from_list,
+    safe_float,
+    safe_int,
+)
+
 logger = logging.getLogger(__name__)
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -42,20 +50,6 @@ def get_ny_trade_date(force_now: str | None = None) -> str:
     return datetime.now(tz=NY_TZ).strftime("%Y-%m-%d")
 
 
-def safe_float(value, default: float = 0.0) -> float:
-    """Safely convert value to float."""
-    try:
-        if value is None:
-            return default
-        if isinstance(value, (int, float, Decimal)):
-            return float(value)
-        if isinstance(value, str):
-            return float(value.strip())
-        return default
-    except (ValueError, TypeError):
-        return default
-
-
 def get_fx_krw_per_usd() -> float:
     """Get KRW/USD exchange rate from env or default."""
     try:
@@ -64,87 +58,103 @@ def get_fx_krw_per_usd() -> float:
         return 1450.0
 
 
+def _build_holding_from_kis_item(item: dict) -> dict | None:
+    """KIS balance output1 항목 하나를 표준화된 holding dict로 변환한다.
+
+    normalize_us_position을 사용해 current → last_price 매핑 포함.
+    """
+    # KIS 필드를 normalize_us_position이 인식하는 이름으로 보강한 복사본 생성
+    enriched = dict(item)
+    # KIS 잔고에서 pdno → symbol 매핑 추가 (normalize_us_position은 symbol 우선)
+    if "pdno" in enriched and "symbol" not in enriched:
+        enriched["symbol"] = enriched["pdno"]
+    # ccld_qty_smtl → qty 추가 (KIS US 잔고 수량 필드)
+    if "ccld_qty_smtl" in enriched and "qty" not in enriched:
+        enriched["qty"] = enriched["ccld_qty_smtl"]
+
+    pos = normalize_us_position(enriched)
+
+    if not pos["symbol"] or pos["qty"] <= 0:
+        return None
+
+    exchange = str(item.get("natn_cd", item.get("exchange", "NASDAQ"))).strip().upper()
+    price_missing = pos["last_price"] <= 0
+
+    return {
+        "symbol": pos["symbol"],
+        "exchange": exchange,
+        "qty": pos["qty"],
+        "avg_cost_usd": round(pos["avg_price"], 4),
+        "current_price_usd": round(pos["last_price"], 4),
+        "price_missing": price_missing,
+        "cost_basis_usd": round(pos["cost_basis_usd"], 2),
+        "market_value_usd": round(pos["market_value_usd"], 2),
+        "unrealized_pnl_usd": round(pos["unrealized_pnl_usd"], 2),
+        "pnl_pct": round(pos["unrealized_pnl_pct"], 2),
+        "source": "kis_balance",
+    }
+
+
 def fetch_kis_balance(client, env: str) -> dict:
     """Fetch KIS US balance.
-    
+
     Returns:
         {
-            "status": "OK" | "ERROR",
+            "status": "OK" | "ERROR" | "ERROR_PNL_PRICE_MAPPING",
             "cash_usd": float,
-            "holdings": list[dict],  # {symbol, exchange, qty, avg_cost_usd, current_price_usd, ...}
+            "holdings": list[dict],
             "error": str | None,
+            "pnl_status": "OK" | "ERROR_PNL_PRICE_MAPPING",
         }
     """
     try:
         balance_resp = client.get_us_balance()
-        
+
         output1 = balance_resp.get("output1") or []
         output2 = balance_resp.get("output2") or {}
-        
+
         # Cash
         cash_usd = safe_float(output2.get("frcr_dncl_amt_2"))  # USD 현금
-        
-        # Holdings
+
+        # Holdings — normalize_us_position으로 current → last_price 매핑 포함
         holdings = []
         for item in output1:
             try:
-                symbol = str(item.get("pdno", "")).strip().upper()
-                exchange = str(item.get("natn_cd", "NASDAQ")).strip().upper()
-                qty = int(item.get("ccld_qty_smtl", 0) or 0)
-                
-                if not symbol or qty <= 0:
-                    continue
-                
-                avg_cost_usd = safe_float(item.get("avg_unpr"))
-                current_price_usd = safe_float(item.get("ovrs_now_pric1"))
-
-                # current_price_usd가 0이면 avg_cost를 fallback으로 사용 (PRICE_MISSING 표시)
-                price_missing = current_price_usd <= 0
-                effective_price = current_price_usd if not price_missing else avg_cost_usd
-
-                market_value_usd = effective_price * qty if effective_price > 0 else 0.0
-                cost_basis_usd = avg_cost_usd * qty if avg_cost_usd > 0 else 0.0
-
-                if price_missing:
-                    # 가격 정보 없음: pnl_pct를 0.0으로 표시 (−100% 방지)
-                    unrealized_pnl_usd = 0.0
-                    pnl_pct = 0.0
-                    logger.warning(
-                        "[US_PNL][PRICE_MISSING] symbol=%s qty=%d avg_cost=%.4f",
-                        symbol, qty, avg_cost_usd,
-                    )
-                else:
-                    unrealized_pnl_usd = market_value_usd - cost_basis_usd if cost_basis_usd > 0 else 0.0
-                    pnl_pct = ((current_price_usd - avg_cost_usd) / avg_cost_usd * 100.0) if avg_cost_usd > 0 else 0.0
-                
-                holdings.append({
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "qty": qty,
-                    "avg_cost_usd": round(avg_cost_usd, 4),
-                    "current_price_usd": round(current_price_usd, 4),
-                    "price_missing": price_missing,
-                    "cost_basis_usd": round(cost_basis_usd, 2),
-                    "market_value_usd": round(market_value_usd, 2),
-                    "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
-                    "pnl_pct": round(pnl_pct, 2),
-                    "source": "kis_balance",
-                })
+                holding = _build_holding_from_kis_item(item)
+                if holding is not None:
+                    holdings.append(holding)
             except Exception as exc:
                 logger.warning("[US_PNL][WARN] parse KIS position failed: %s", exc)
-        
+
+        # PnL 품질 검증
+        total_qty = sum(h["qty"] for h in holdings)
+        total_market_value = sum(h["market_value_usd"] for h in holdings)
+        if total_qty > 0 and total_market_value <= 0:
+            pnl_status = "ERROR_PNL_PRICE_MAPPING"
+            logger.error(
+                "[US_PNL][ERROR_PNL_PRICE_MAPPING] holdings=%d total_qty=%d total_market_value=%.2f",
+                len(holdings),
+                total_qty,
+                total_market_value,
+            )
+        else:
+            pnl_status = "OK"
+
         logger.info(
-            "[US_PNL][KIS_BALANCE][OK] cash_usd=%.2f holdings=%d",
-            cash_usd, len(holdings)
+            "[US_PNL][KIS_BALANCE][OK] cash_usd=%.2f holdings=%d pnl_status=%s",
+            cash_usd,
+            len(holdings),
+            pnl_status,
         )
-        
+
         return {
             "status": "OK",
             "cash_usd": cash_usd,
             "holdings": holdings,
             "error": None,
+            "pnl_status": pnl_status,
         }
-    
+
     except Exception as exc:
         logger.error("[US_PNL][KIS_BALANCE][ERROR] %s", exc)
         return {
@@ -152,13 +162,65 @@ def fetch_kis_balance(client, env: str) -> dict:
             "cash_usd": 0.0,
             "holdings": [],
             "error": str(exc),
+            "pnl_status": "ERROR",
         }
+
+
+def _fetch_latest_us_positions_safe(engine: object) -> list[dict]:
+    """us_positions에서 최신 포지션을 조회한다 (trade_date 컬럼 없이 fallback).
+
+    trade_date 컬럼 유무를 자동 감지하여 쿼리를 전환한다.
+    """
+    from sqlalchemy import text as sa_text
+    from trader.us.utils.pnl_utils import get_table_columns_sync
+
+    try:
+        columns = get_table_columns_sync(engine, "us_positions")
+    except Exception:
+        columns = set()
+
+    try:
+        with engine.connect() as conn:
+            if "trade_date" in columns:
+                # trade_date 컬럼이 있으면 최신 trade_date 기준
+                rows = conn.execute(
+                    sa_text("""
+                        SELECT DISTINCT ON (symbol) *
+                        FROM us_positions
+                        WHERE qty > 0
+                        ORDER BY symbol, trade_date DESC
+                    """)
+                ).fetchall()
+            else:
+                # trade_date 컬럼 없음: 최신 as_of 기준으로 fallback
+                logger.warning(
+                    "[US_PNL][SCHEMA_FALLBACK] us_positions.trade_date missing; "
+                    "using latest as_of or all rows"
+                )
+                if "as_of" in columns:
+                    rows = conn.execute(
+                        sa_text("""
+                            SELECT DISTINCT ON (symbol) *
+                            FROM us_positions
+                            WHERE qty > 0
+                            ORDER BY symbol, as_of DESC
+                        """)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        sa_text("SELECT * FROM us_positions WHERE qty > 0")
+                    ).fetchall()
+        keys = list(rows[0]._fields) if rows and hasattr(rows[0], "_fields") else []
+        return [dict(zip(keys, r)) for r in rows] if keys else [dict(r._mapping) for r in rows]
+    except Exception as exc:
+        logger.warning("[US_PNL][DB_POSITIONS_FALLBACK_ERROR] %s", exc)
+        return []
 
 
 def enrich_holdings_with_db(holdings: list[dict], trade_date: str) -> list[dict]:
     """Enrich KIS holdings with DB metadata (entry_date, score, stop_price, etc.)."""
     from trader.us.db.repos import load_positions
-    
+
     try:
         db_positions = load_positions(as_of=trade_date)
     except Exception as exc:
@@ -387,46 +449,77 @@ def generate_pnl_report(
         from trader.us.execution.kis_us_client import KisUSClient
         client = KisUSClient(env=env)
         balance_result = fetch_kis_balance(client, env)
-    
+
+    pnl_source = "unknown"
     if balance_result["status"] == "OK":
         holdings = balance_result["holdings"]
         cash_usd = balance_result["cash_usd"]
+        pnl_source = "kis_balance"
+        balance_pnl_status = balance_result.get("pnl_status", "OK")
+        if balance_pnl_status != "OK":
+            report["data_quality"]["warnings"].append(
+                f"pnl_price_mapping_error: {balance_pnl_status}"
+            )
     else:
         # Fallback to DB positions
         report["data_quality"]["warnings"].append(f"kis_balance_failed: {balance_result['error']}")
         logger.warning("[US_PNL][WARN] KIS balance failed, using DB fallback")
-        
-        # TODO: Implement DB-only fallback position logic
-        holdings = []
+
+        # DB schema-aware fallback
+        from trader.us.db.repos import _get_engine_or_none
+        db_engine = _get_engine_or_none()
+        if db_engine is not None:
+            db_rows = _fetch_latest_us_positions_safe(db_engine)
+            holdings = [normalize_us_position(r) for r in db_rows if r]
+            pnl_source = "db_snapshot"
+        else:
+            holdings = []
+            pnl_source = "none"
         cash_usd = 0.0
-    
+        balance_pnl_status = "UNKNOWN"
+
     # Enrich holdings with DB metadata
     enriched_holdings = enrich_holdings_with_db(holdings, trade_date)
     report["holdings"] = enriched_holdings
-    
+
     # Calculate portfolio summary
     total_positions = len(enriched_holdings)
-    market_value_usd = sum(h["market_value_usd"] for h in enriched_holdings)
-    cost_basis_usd = sum(h["cost_basis_usd"] for h in enriched_holdings)
-    unrealized_pnl_usd = sum(h["unrealized_pnl_usd"] for h in enriched_holdings)
+    market_value_usd = sum(h.get("market_value_usd", 0.0) for h in enriched_holdings)
+    cost_basis_usd = sum(h.get("cost_basis_usd", 0.0) for h in enriched_holdings)
+    unrealized_pnl_usd = sum(h.get("unrealized_pnl_usd", 0.0) for h in enriched_holdings)
     unrealized_pnl_pct = (unrealized_pnl_usd / cost_basis_usd * 100.0) if cost_basis_usd > 0 else 0.0
-    
+
+    # PnL 검증: 포지션이 있는데 market_value가 0이면 ERROR
+    total_qty = sum(h.get("qty", 0) for h in enriched_holdings)
+    if total_qty > 0 and market_value_usd <= 0:
+        pnl_status = "ERROR_PNL_PRICE_MAPPING"
+        report["data_quality"]["errors"].append("total_market_value_zero_with_positions")
+        logger.error(
+            "[US_PNL][ERROR_PNL_PRICE_MAPPING] total_qty=%d total_market_value_usd=%.2f",
+            total_qty,
+            market_value_usd,
+        )
+    else:
+        pnl_status = "OK"
+
     # TODO: Calculate realized PNL from fills
     realized_pnl_today_usd = 0.0
-    
+
     total_pnl_usd = realized_pnl_today_usd + unrealized_pnl_usd
     total_equity_estimate_usd = cash_usd + market_value_usd
-    
+
     # Winners/losers
-    winners = sum(1 for h in enriched_holdings if h["pnl_pct"] > 0)
-    losers = sum(1 for h in enriched_holdings if h["pnl_pct"] < 0)
-    
+    winners = sum(1 for h in enriched_holdings if h.get("pnl_pct", 0) > 0)
+    losers = sum(1 for h in enriched_holdings if h.get("pnl_pct", 0) < 0)
+
     # Best/worst
-    sorted_by_pnl = sorted(enriched_holdings, key=lambda h: h["pnl_pct"], reverse=True)
+    sorted_by_pnl = sorted(enriched_holdings, key=lambda h: h.get("pnl_pct", 0), reverse=True)
     best_position = sorted_by_pnl[0]["symbol"] if sorted_by_pnl else "N/A"
     worst_position = sorted_by_pnl[-1]["symbol"] if sorted_by_pnl else "N/A"
-    
+
     report["portfolio_summary"] = {
+        "source": pnl_source,
+        "pnl_status": pnl_status,
         "total_positions": total_positions,
         "cash_usd": round(cash_usd, 2),
         "market_value_usd": round(market_value_usd, 2),
@@ -443,32 +536,32 @@ def generate_pnl_report(
         "best_position": best_position,
         "worst_position": worst_position,
     }
-    
+
     # Today trades
     report["today_trades"] = get_today_trades(trade_date)
-    
+
     # Blocked orders
     report["blocked_orders"] = get_blocked_orders(trade_date)
-    
+
     # Watchlist score contract
     report["watchlist_score_contract"] = get_watchlist_score_contract(trade_date)
-    
+
     # Order contract
     report["order_contract"] = get_order_contract(report["today_trades"])
-    
+
     # Save reports
     try:
         os.makedirs("repo/reports/us_portfolio_pnl", exist_ok=True)
     except Exception:
         os.makedirs("reports/us_portfolio_pnl", exist_ok=True)
-    
+
     report_base = "repo/reports/us_portfolio_pnl" if os.path.exists("repo") else "reports/us_portfolio_pnl"
-    
+
     # Latest reports
     latest_md = f"{report_base}/latest_us_portfolio_pnl.md"
     latest_json = f"{report_base}/latest_us_portfolio_pnl.json"
     latest_csv = f"{report_base}/latest_us_portfolio_pnl.csv"
-    
+
     # Dated reports
     dated_dir = f"{report_base}/{trade_date}"
     if session:
@@ -477,10 +570,10 @@ def generate_pnl_report(
     dated_md = f"{dated_dir}/us_portfolio_pnl.md"
     dated_json = f"{dated_dir}/us_portfolio_pnl.json"
     dated_csv = f"{dated_dir}/us_portfolio_pnl.csv"
-    
+
     # Generate Markdown
     md_content = generate_markdown_report(report)
-    
+
     # Write reports
     try:
         # Markdown
@@ -659,11 +752,9 @@ def generate_markdown_report(report: dict) -> str:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
-    
+    from trader.us.utils.logging_utils import setup_us_logging
+    setup_us_logging()
+
     parser = argparse.ArgumentParser(description="US Portfolio PNL Report Runner")
     parser.add_argument("--env", default="practice", help="Environment")
     parser.add_argument("--session", default=None, help="Session (am|afternoon|close)")

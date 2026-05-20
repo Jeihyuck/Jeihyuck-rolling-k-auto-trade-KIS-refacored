@@ -330,8 +330,12 @@ def run_trade_tick(
 
     temp_error_count = 0
     temp_recovered_count = 0
+    kis_temp_errors_by_api: dict[str, dict] = {}
+
     if fills_temp_error:
         temp_error_count += 1
+        kis_temp_errors_by_api.setdefault("GET_inquire_balance", {"temp_error": 0, "recovered": 0, "unrecovered": 0})
+        kis_temp_errors_by_api["GET_inquire_balance"]["temp_error"] += 1
 
     if not offline:
         try:
@@ -339,6 +343,29 @@ def run_trade_tick(
             stats = getattr(client, "stats", {}) or {}
             temp_error_count += int(stats.get("temp_error_count", 0) or 0)
             temp_recovered_count += int(stats.get("temp_recovered_count", 0) or 0)
+            # API별 에러 집계 — client.stats에 by_api 구조가 있으면 사용
+            by_api = stats.get("by_api") or {}
+            for api_name, api_stats in by_api.items():
+                t = int(api_stats.get("temp_error", 0) or 0)
+                r = int(api_stats.get("recovered", 0) or 0)
+                u = int(api_stats.get("unrecovered", 0) or 0)
+                if t > 0:
+                    existing = kis_temp_errors_by_api.setdefault(
+                        api_name, {"temp_error": 0, "recovered": 0, "unrecovered": 0}
+                    )
+                    existing["temp_error"] += t
+                    existing["recovered"] += r
+                    existing["unrecovered"] += u
+            # GET_price 에러가 별도 집계된 경우
+            price_temp_errors = int(stats.get("price_temp_error_count", 0) or 0)
+            price_recovered = int(stats.get("price_temp_recovered_count", 0) or 0)
+            if price_temp_errors > 0:
+                e = kis_temp_errors_by_api.setdefault(
+                    "GET_price", {"temp_error": 0, "recovered": 0, "unrecovered": 0}
+                )
+                e["temp_error"] += price_temp_errors
+                e["recovered"] += price_recovered
+                e["unrecovered"] += max(0, price_temp_errors - price_recovered)
         except Exception:
             pass
 
@@ -1035,6 +1062,7 @@ def run_trade_tick(
         "session": session,
         "orders": orders,
         "ack": ack_cnt,
+        "orders_ack": ack_cnt,
         "dry_run": dry_cnt,
         "blocked": blocked_cnt,
         "orders_blocked": blocked_cnt,  # 호환성 위해 둘 다 제공
@@ -1059,10 +1087,17 @@ def run_trade_tick(
         "entry_error_message": "" if entry_eval_error_count == 0 else "entry_eval_error",
         "entry_intents": len(entry_intents),
         "orders_sent": orders_sent,  # ack + dry_run
+        "fills_count": len(fills_today),
         "fills": len(fills_today),
-        "positions": len(current_positions),
+        "sold_today_count": len(sold_today) if 'sold_today' in locals() else 0,
+        "sold_today_symbols": sorted(sold_today) if 'sold_today' in locals() else [],
+        "pending_order_count": max(0, ack_cnt - len(fills_today)),
+        "open_position_count": len(current_positions) if 'current_positions' in locals() else 0,
+        "open_position_symbols": [p.get("symbol", "") for p in (current_positions if 'current_positions' in locals() else [])],
+        "positions": len(current_positions) if 'current_positions' in locals() else 0,
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
+        "kis_temp_errors_by_api": kis_temp_errors_by_api,
     }
 
 
@@ -1096,10 +1131,8 @@ def _get_strategy_engine(env: str = "practice", offline: bool = False) -> Any:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from trader.us.utils.logging_utils import setup_us_logging
+    setup_us_logging()
     parser = argparse.ArgumentParser(description="US Trade Tick Runner")
     parser.add_argument("--session", default="am", choices=["am", "afternoon", "manual"])
     parser.add_argument("--env", default="practice")

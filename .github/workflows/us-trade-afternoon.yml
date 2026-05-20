@@ -66,7 +66,7 @@ name: "US Trade Afternoon"
 
 concurrency:
   group: us-trade-afternoon-${{ github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -547,15 +547,15 @@ jobs:
           from trader.us.db.repos import check_us_afternoon_already_ran
 
           trade_date = os.getenv("TRADE_DATE")
-          already_ran = False
-          try:
-              already_ran = check_us_afternoon_already_ran(trade_date, timeout_sec=5)
-          except Exception as e:
-              print(f"[US_TRADE_AFTERNOON][FINAL_DUPLICATE_GUARD][WARN] {e}", file=sys.stderr)
+          # check_us_afternoon_already_ran returns dict; FAILED_CLOSED on error
+          result = check_us_afternoon_already_ran(trade_date, timeout_sec=5)
+          already_ran = bool(result.get("already_ran", True))
+          guard_status = result.get("guard_status", "UNKNOWN")
+          reason = result.get("reason", "")
 
           print(f"already_ran={'1' if already_ran else '0'}")
           print(
-              f"[US_TRADE_AFTERNOON][FINAL_DUPLICATE_GUARD][RESULT] trade_date={trade_date} already_ran={already_ran}",
+              f"[US_TRADE_AFTERNOON][FINAL_DUPLICATE_GUARD][RESULT] trade_date={trade_date} already_ran={already_ran} guard_status={guard_status} reason={reason}",
               file=sys.stderr,
           )
           PY

@@ -138,6 +138,56 @@ def run_trade_session(
     final_tick: dict = {}
     temp_error_count = 0
     temp_recovered_count = 0
+
+    # ── 파일 기반 session guard 체크 ─────────────────────────────────────────
+    from trader.us.utils.session_guard import (
+        check_us_session_file_guard,
+        now_et_iso,
+        write_us_session_done_file,
+    )
+    session_started_at_et = now_et_iso()
+
+    _file_guard = check_us_session_file_guard(trade_date, session)
+    if _file_guard["already_ran"]:
+        guard_payload = _file_guard["payload"]
+        # P7: stale guard 리포트 — 실제 시작 시각과 예상 시각 차이 계산
+        _schedule_expected_et = _file_guard.get("schedule_expected_et", "")
+        _actual_start_et = session_started_at_et
+        _delay_seconds: int = 0
+        try:
+            if _schedule_expected_et:
+                from datetime import datetime
+                _exp = datetime.fromisoformat(_schedule_expected_et)
+                _act = datetime.fromisoformat(_actual_start_et)
+                _delay_seconds = max(0, int((_act - _exp).total_seconds()))
+        except Exception:
+            pass
+        logger.info(
+            "[US_SESSION][FILE_GUARD_SKIP] session=%s trade_date=%s prior_status=%s prior_ticks=%s"
+            " schedule_expected_et=%s actual_start_et=%s delay_seconds=%d",
+            session,
+            trade_date,
+            guard_payload.get("status"),
+            guard_payload.get("ticks"),
+            _schedule_expected_et,
+            _actual_start_et,
+            _delay_seconds,
+        )
+        return {
+            "status": "SKIP",
+            "skip_reason": "file_guard_already_ran",
+            "session": session,
+            "reason": "file_guard_already_ran",
+            "guard_status": _file_guard["guard_status"],
+            "prior_run": guard_payload,
+            "tick_count": 0,
+            # P7 stale guard 리포트 필드
+            "schedule_expected_et": _schedule_expected_et,
+            "actual_start_et": _actual_start_et,
+            "delay_seconds": _delay_seconds,
+            "missed_trade_window": _delay_seconds > 3600,
+        }
+
     logger.info(
         "[US_SESSION][PIPELINE] session=%s requires_prep=1 requires_locked_watchlist=1 raw_universe_fallback=0",
         session
@@ -504,18 +554,77 @@ def run_trade_session(
     # ─────────────────────────────────────────────────────────────────────────
     total_buy_decisions = 0
     total_sell_decisions = 0
-    
+    total_orders_sent = 0
+    total_orders_ack = 0
+    total_orders_rejected = 0
+    total_orders_error = 0
+    total_fills = 0
+    total_pending_orders = 0
+    total_sold_today = 0
+    total_open_positions = 0
+    all_sold_today_symbols: list[str] = []
+    all_pending_order_symbols: list[str] = []
+    all_open_position_symbols: list[str] = []
+    # entry skip summary 집계 (P3: afternoon)
+    entry_skip_total = 0
+    entry_skip_has_kis_position = 0
+    entry_skip_pending_order = 0
+    entry_skip_sold_today = 0
+    entry_skip_scored = 0
+    entry_skip_by_symbol: list[dict] = []
+
     for tick_result in results:
         # buy_decisions = entry_intents count (BUY decision)
         entry_intents = int(tick_result.get("entry_intents", 0) or 0)
         total_buy_decisions += entry_intents
-        
+
         # sell_decisions = exit_intents count (SELL decision)
         exit_intents = int(tick_result.get("exit_intents", 0) or 0)
         total_sell_decisions += exit_intents
-    
-    # buy_skips/no_exit_signals are tracked in logs but not counted in tick results
-    # (추후 필요시 tick_result에 추가 가능)
+
+        # 주문 상태 집계
+        total_orders_sent += int(tick_result.get("orders_sent", 0) or 0)
+        total_orders_ack += int(tick_result.get("orders_ack", 0) or 0)
+        total_orders_rejected += int(tick_result.get("orders_rejected", 0) or 0)
+        total_orders_error += int(tick_result.get("orders_error", 0) or 0)
+        total_fills += int(tick_result.get("fills_count", tick_result.get("fills", 0)) or 0)
+        total_pending_orders = int(tick_result.get("pending_order_count", 0) or 0)
+        total_sold_today = int(tick_result.get("sold_today_count", 0) or 0)
+        total_open_positions = int(tick_result.get("open_position_count", tick_result.get("positions", 0)) or 0)
+
+        # 심볼 배열 (마지막 tick 기준 덮어쓰기)
+        if tick_result.get("sold_today_symbols"):
+            all_sold_today_symbols = list(tick_result["sold_today_symbols"])
+        if tick_result.get("pending_order_symbols"):
+            all_pending_order_symbols = list(tick_result["pending_order_symbols"])
+        if tick_result.get("open_position_symbols"):
+            all_open_position_symbols = list(tick_result["open_position_symbols"])
+
+        # entry skip summary 집계
+        skip_summary = tick_result.get("entry_skip_summary", {})
+        entry_skip_total = int(skip_summary.get("total", entry_skip_total) or entry_skip_total)
+        entry_skip_scored = int(skip_summary.get("scored", entry_skip_scored) or entry_skip_scored)
+        entry_skip_has_kis_position += int(skip_summary.get("has_kis_position", 0) or 0)
+        entry_skip_pending_order += int(skip_summary.get("pending_order", 0) or 0)
+        entry_skip_sold_today += int(skip_summary.get("sold_today", 0) or 0)
+        by_sym = tick_result.get("entry_skip_by_symbol", [])
+        if by_sym:
+            entry_skip_by_symbol = list(by_sym)
+
+    # KIS temp_errors_by_api 세션 집계
+    kis_temp_errors_by_api: dict[str, dict] = {}
+    for tick_result in results:
+        for api_name, api_stats in (tick_result.get("kis_temp_errors_by_api") or {}).items():
+            e = kis_temp_errors_by_api.setdefault(
+                api_name, {"temp_error": 0, "recovered": 0, "unrecovered": 0}
+            )
+            e["temp_error"] += int(api_stats.get("temp_error", 0) or 0)
+            e["recovered"] += int(api_stats.get("recovered", 0) or 0)
+            e["unrecovered"] += int(api_stats.get("unrecovered", 0) or 0)
+
+    # pending = ack - fills (fallback 계산)
+    if total_orders_ack > 0 and total_pending_orders == 0:
+        total_pending_orders = max(0, total_orders_ack - total_fills)
 
     report_payload = {
         "trade_date": trade_date,
@@ -533,10 +642,20 @@ def run_trade_session(
         "entry_error_type": final_tick.get("entry_error_type", ""),
         "entry_error_message": final_tick.get("entry_error_message", ""),
         "entry_intents": int(final_tick.get("entry_intents", 0) or 0),
-        "orders_sent": int(final_tick.get("orders_sent", 0) or 0),
+        "orders_sent": total_orders_sent if total_orders_sent else int(final_tick.get("orders_sent", 0) or 0),
+        "orders_ack": total_orders_ack,
+        "orders_rejected": total_orders_rejected,
+        "orders_error": total_orders_error,
         "orders_blocked": int(final_tick.get("orders_blocked", 0) or 0),
         "block_reasons": final_tick.get("block_reasons", {}),
-        "fills": int(final_tick.get("fills", 0) or 0),
+        "fills_count": total_fills,
+        "fills": total_fills,
+        "pending_order_count": total_pending_orders,
+        "sold_today_count": total_sold_today,
+        "open_position_count": total_open_positions,
+        "sold_today_symbols": all_sold_today_symbols,
+        "pending_order_symbols": all_pending_order_symbols,
+        "open_position_symbols": all_open_position_symbols,
         "positions": int(final_tick.get("positions", 0) or 0),
         "last_stage": last_stage,
         "final_status": final_status,
@@ -544,8 +663,16 @@ def run_trade_session(
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
         "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") == "1",
+        # P4: KIS temp error API별 집계
+        "kis_temp_errors": {
+            "total": sum(v.get("temp_error", 0) for v in kis_temp_errors_by_api.values()),
+            "recovered": sum(v.get("recovered", 0) for v in kis_temp_errors_by_api.values()),
+            "unrecovered": sum(v.get("unrecovered", 0) for v in kis_temp_errors_by_api.values()),
+            "by_api": kis_temp_errors_by_api,
+        },
         # 추가 필드
         "tick_count": tick_count,
+        "ticks": tick_count,
         "max_ticks": max_ticks,
         "force_now": force_now or "",
         "offline": offline,
@@ -553,8 +680,30 @@ def run_trade_session(
         # Explanation statistics
         "buy_decisions": total_buy_decisions,
         "sell_decisions": total_sell_decisions,
+        # P3: entry skip summary (afternoon에서 신규 매수 0건 이유 분해)
+        "entry_skip_summary": {
+            "total": entry_skip_total,
+            "scored": entry_skip_scored,
+            "has_kis_position": entry_skip_has_kis_position,
+            "pending_order": entry_skip_pending_order,
+            "sold_today": entry_skip_sold_today,
+        },
+        "entry_skip_by_symbol": entry_skip_by_symbol,
     }
     _write_us_session_report(report_payload, session=session)
+
+    # ── 파일 기반 done 마커 기록 (성공/경고 종료 시만) ────────────────────────
+    if final_status not in ("FAILED", "SKIP"):
+        write_us_session_done_file(
+            trade_date=trade_date,
+            session=session,
+            run_id=run_id,
+            started_at_et=session_started_at_et,
+            finished_at_et=now_et_iso(),
+            status=final_status,
+            ticks=tick_count,
+        )
+
     logger.info(
         "[RUN_SUMMARY][RESULT] status=%s reason=%s last_stage=%s",
         final_status,
@@ -581,10 +730,8 @@ def run_trade_session(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from trader.us.utils.logging_utils import setup_us_logging
+    setup_us_logging()
     parser = argparse.ArgumentParser(description="US Trade Session Runner")
     parser.add_argument("--session", required=True, choices=["am", "afternoon"])
     parser.add_argument("--env", default="practice")

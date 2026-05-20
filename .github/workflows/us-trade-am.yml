@@ -73,7 +73,7 @@ name: "US Trade AM"
 
 concurrency:
   group: us-trade-am-${{ github.ref_name }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -660,15 +660,15 @@ jobs:
           from trader.us.db.repos import check_us_am_already_ran
 
           trade_date = os.getenv("TRADE_DATE")
-          already_ran = False
-          try:
-              already_ran = check_us_am_already_ran(trade_date, timeout_sec=5)
-          except Exception as e:
-              print(f"[US_TRADE_AM][FINAL_DUPLICATE_GUARD][WARN] {e}", file=sys.stderr)
+          # check_us_am_already_ran returns dict; FAILED_CLOSED on error
+          result = check_us_am_already_ran(trade_date, timeout_sec=5)
+          already_ran = bool(result.get("already_ran", True))
+          guard_status = result.get("guard_status", "UNKNOWN")
+          reason = result.get("reason", "")
 
           print(f"already_ran={'1' if already_ran else '0'}")
           print(
-              f"[US_TRADE_AM][FINAL_DUPLICATE_GUARD][RESULT] trade_date={trade_date} already_ran={already_ran}",
+              f"[US_TRADE_AM][FINAL_DUPLICATE_GUARD][RESULT] trade_date={trade_date} already_ran={already_ran} guard_status={guard_status} reason={reason}",
               file=sys.stderr,
           )
           PY
@@ -734,17 +734,16 @@ jobs:
           if not trade_date:
               raise RuntimeError("[US_TRADE_AM][BUG] TRADE_DATE env missing")
           
-          # Check AM marker/report
-          try:
-              already_ran = check_us_am_already_ran(trade_date, timeout_sec=5)
-              print(f"already_ran={'1' if already_ran else '0'}")
-              if already_ran:
-                  print(f"[US_TRADE_AM][ALREADY_RAN] trade_date={trade_date} reason=am_completed", file=sys.stderr)
-              else:
-                  print(f"[US_TRADE_AM][NOT_RAN_YET] trade_date={trade_date}", file=sys.stderr)
-          except Exception as e:
-              print(f"[US_TRADE_AM][ALREADY_RAN_CHECK_ERROR] {e}", file=sys.stderr)
-              print(f"already_ran=0")
+          # Check AM marker/report — returns dict (fail-closed)
+          result = check_us_am_already_ran(trade_date, timeout_sec=5)
+          already_ran = bool(result.get("already_ran", True))
+          guard_status = result.get("guard_status", "UNKNOWN")
+          reason = result.get("reason", "")
+          print(f"already_ran={'1' if already_ran else '0'}")
+          if already_ran:
+              print(f"[US_TRADE_AM][ALREADY_RAN] trade_date={trade_date} guard_status={guard_status} reason={reason}", file=sys.stderr)
+          else:
+              print(f"[US_TRADE_AM][NOT_RAN_YET] trade_date={trade_date}", file=sys.stderr)
           PY
             
             cat already_ran_result.txt | tee -a artifacts/${US_LOG_FILE}

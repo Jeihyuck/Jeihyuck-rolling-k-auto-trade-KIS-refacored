@@ -541,10 +541,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    from trader.us.utils.logging_utils import setup_us_logging
+    setup_us_logging()
     parser = argparse.ArgumentParser(description="US Prep Runner")
     parser.add_argument("--env", default="practice")
     parser.add_argument("--offline", action="store_true")
