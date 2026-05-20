@@ -182,8 +182,8 @@ CONFIG = {
     "PB1_RELAX_MA_FILTER": "1",
     "PB1_RELAX_MA20_SLOPE": "1",
     "PB1_MA20_SLOPE_HARD_FAIL_MIN": "-0.05",
-    "PB1_VOL_CONTRACTION_MAX": "1.15",
-    "PB1_VOLU_CONTRACTION_MAX": "1.20",
+    "PB1_VOL_CONTRACTION_MAX": "1.25",
+    "PB1_VOLU_CONTRACTION_MAX": "1.15",
     "PB1_VOL_CONTRACTION_MAX_STRICT": "1.00",
     "PB1_VOLU_CONTRACTION_MAX_STRICT": "0.98",
     "PB1_PULLBACK_MIN": "0.03",
@@ -246,8 +246,8 @@ CONFIG = {
     "PB1_ATR_PCT_MAX": "8.0",
     "ATR_MAX_PCT": "0.10",             # ATR% 상한 공통값 (ratio 기준)
     "PB1_MIN_VALUE20": "3000000000",    # 20일 평균 거래대금(원) 하한 (유동성 컷)
-    "PB1_VOL_MAX": "1.00",
-    "PB1_VOLU_MAX": "0.98",
+    "PB1_VOL_MAX": "1.25",
+    "PB1_VOLU_MAX": "1.15",
     "PB1_VOLU_MAX_INTRADAY": "1.05",
     # 추가 환경변수
     "ALLOW_KIS_DAILY_FALLBACK": "0",
@@ -954,8 +954,8 @@ PB1_PULLBACK_BAND_KOSDAQ_STRICT = tuple(float(x.strip()) for x in (_cfg("PB1_PUL
 PB1_RELAX_MA_FILTER = _cfg_bool("PB1_RELAX_MA_FILTER", fallback=True)
 PB1_RELAX_MA20_SLOPE = _cfg_bool("PB1_RELAX_MA20_SLOPE", fallback=True)
 PB1_MA20_SLOPE_HARD_FAIL_MIN = float(_cfg("PB1_MA20_SLOPE_HARD_FAIL_MIN") or "-0.05")
-PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.00")
-PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "0.98")
+PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.25")
+PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "1.15")
 PB1_VOL_CONTRACTION_MAX_STRICT = float(_cfg("PB1_VOL_CONTRACTION_MAX_STRICT") or "1.00")
 PB1_VOLU_CONTRACTION_MAX_STRICT = float(_cfg("PB1_VOLU_CONTRACTION_MAX_STRICT") or "0.98")
 PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")

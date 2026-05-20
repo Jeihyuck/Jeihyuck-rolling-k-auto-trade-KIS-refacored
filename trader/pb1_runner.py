@@ -5913,8 +5913,21 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     total_start_ts = time_mod.monotonic()
     engine = make_engine()
     lock_conn = engine.connect()
-    if not try_acquire_lock(lock_conn):
-        logger.warning("[PB1][LOOP] run lock unavailable -> exit")
+    lock_context = (
+        f"mode=loop "
+        f"strategy_env={os.getenv('STRATEGY_ENV') or os.getenv('KIS_ENV') or os.getenv('ENV')} "
+        f"session={os.getenv('PB1_SESSION_KIND') or os.getenv('SESSION_KIND') or os.getenv('FORCE_MARKET_WINDOW') or 'unknown'} "
+        f"workflow={os.getenv('GITHUB_WORKFLOW')} "
+        f"job={os.getenv('GITHUB_JOB')} "
+        f"run_id={os.getenv('GITHUB_RUN_ID')} "
+        f"run_attempt={os.getenv('GITHUB_RUN_ATTEMPT')} "
+        f"trader_run_id={os.getenv('TRADER_RUN_ID')}"
+    )
+    if not try_acquire_lock(lock_conn, context=lock_context):
+        logger.warning(
+            "[PB1][LOOP][SKIP_LOCKED] run lock unavailable owner_logged=1 action=safe_skip context=%s",
+            lock_context,
+        )
         lock_conn.close()
         return
     exit_reason = "unknown"
@@ -6973,8 +6986,21 @@ def main() -> int:
         logger.warning("[PB1][RUN] engine missing connect() -> exit")
         return 0
     lock_conn = engine.connect()
-    if not try_acquire_lock(lock_conn):
-        logger.warning("[PB1][RUN] run lock unavailable -> exit")
+    lock_context = (
+        f"mode=single "
+        f"strategy_env={os.getenv('STRATEGY_ENV') or os.getenv('KIS_ENV') or os.getenv('ENV')} "
+        f"session={os.getenv('PB1_SESSION_KIND') or os.getenv('SESSION_KIND') or os.getenv('FORCE_MARKET_WINDOW') or 'unknown'} "
+        f"workflow={os.getenv('GITHUB_WORKFLOW')} "
+        f"job={os.getenv('GITHUB_JOB')} "
+        f"run_id={os.getenv('GITHUB_RUN_ID')} "
+        f"run_attempt={os.getenv('GITHUB_RUN_ATTEMPT')} "
+        f"trader_run_id={os.getenv('TRADER_RUN_ID')}"
+    )
+    if not try_acquire_lock(lock_conn, context=lock_context):
+        logger.warning(
+            "[PB1][RUN][SKIP_LOCKED] run lock unavailable owner_logged=1 action=safe_skip context=%s",
+            lock_context,
+        )
         lock_conn.close()
         return 0
     _ensure_bootstrap_migrations(engine)

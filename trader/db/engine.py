@@ -116,6 +116,18 @@ def _connect_args_for_db_url(db_url: str) -> dict:
             statement_timeout_ms,
             idle_in_tx_timeout_ms,
         )
+
+    app_name = (
+        os.getenv("DB_APPLICATION_NAME")
+        or os.getenv("PGAPPNAME")
+        or f"pb1-{os.getenv('GITHUB_WORKFLOW', 'local')}-{os.getenv('GITHUB_JOB', 'job')}-{os.getenv('GITHUB_RUN_ID', 'no_run')}-{os.getenv('GITHUB_RUN_ATTEMPT', '0')}"
+    )
+    connect_args["application_name"] = app_name
+    logger.info(
+        "[DB][CONNECT_ARGS][APP] application_name=%s",
+        app_name,
+    )
+
     # 강제 플래그가 있으면 최우선
     if os.getenv("DB_DISABLE_PREPARED_STATEMENTS", "0") in {"1", "true", "TRUE"}:
         connect_args["prepare_threshold"] = None
