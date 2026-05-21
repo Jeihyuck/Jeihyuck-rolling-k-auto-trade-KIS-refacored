@@ -1360,6 +1360,8 @@ PB1_RECONCILE_RESTORE_ENTRY_META = env_bool("PB1_RECONCILE_RESTORE_ENTRY_META", 
 PB1_REPORT_AGGREGATE_SKIPS = env_bool("PB1_REPORT_AGGREGATE_SKIPS", default=True)
 PB1_REPORT_REQUIRE_REALIZED_PNL_FROM_FILLS = env_bool("PB1_REPORT_REQUIRE_REALIZED_PNL_FROM_FILLS", default=True)
 PB1_REPORT_SAVE_RAW_SKIP_EVENTS = env_bool("PB1_REPORT_SAVE_RAW_SKIP_EVENTS", default=True)
+
+logger.info(
     "[CONFIG][EFFECTIVE_EXIT] existing_pos_eff=%s stop_cap=%s kospi_pct=%.1f kosdaq_pct=%.1f "
     "profit_protect=%s pct=%.1f abs_tp1=%s pct=%.1f",
     int(PB1_EXISTING_POSITION_EFFECTIVE_EXIT_ENABLED),
