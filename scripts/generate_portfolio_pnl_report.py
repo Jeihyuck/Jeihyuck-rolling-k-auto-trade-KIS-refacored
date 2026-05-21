@@ -342,7 +342,17 @@ def _build_today_trades(today_orders: list[dict], today_fills: list[dict], balan
 
 
 def _build_blocked_orders(blocked_events: list[dict], balance_rows: list[dict], db_positions: list[dict]) -> list[dict]:
-    blocked = []
+    """blocked/skipped orders를 (code, side, reason) 기준으로 집계한다.
+
+    PB1_REPORT_AGGREGATE_SKIPS=1 (기본값)일 때 집계 테이블 반환.
+    원본 이벤트는 PB1_REPORT_SAVE_RAW_SKIP_EVENTS=1일 때 raw 리스트로도 제공.
+    """
+    import os as _os
+    from collections import defaultdict
+
+    aggregate_skips = _os.getenv("PB1_REPORT_AGGREGATE_SKIPS", "1") == "1"
+
+    raw_blocked = []
     for ev in blocked_events:
         payload = ev.get("payload_json") or {}
         if isinstance(payload, str):
@@ -353,14 +363,55 @@ def _build_blocked_orders(blocked_events: list[dict], balance_rows: list[dict], 
         code = str(ev.get("code") or "").zfill(6)
         name = _name_for_code(code, balance_rows, db_positions)
         reasons = payload.get("reasons") or [ev.get("reason") or "SKIP"]
-        blocked.append({
+        reason_str = ", ".join(str(r) for r in reasons)
+        # broker reject(BROKER_REJECT / KIS_*) vs internal skip 구분
+        is_broker_reject = any(
+            str(r).startswith(("BROKER_", "KIS_", "API_FAIL")) for r in reasons
+        )
+        raw_blocked.append({
             "time": str(ev.get("created_at") or "")[:19],
             "code": code,
             "name": name,
             "side": str(ev.get("side") or "BUY").upper(),
-            "reason": ", ".join(str(r) for r in reasons),
+            "reason": reason_str,
+            "is_broker_reject": is_broker_reject,
         })
-    return blocked
+
+    if not aggregate_skips:
+        return raw_blocked
+
+    # 집계: (code, side, reason) → count, first_time, last_time
+    agg: dict = defaultdict(lambda: {
+        "count": 0,
+        "first_time": None,
+        "last_time": None,
+        "is_broker_reject": False,
+    })
+    for b in raw_blocked:
+        key = (b["code"], b["side"], b["reason"])
+        entry = agg[key]
+        entry["count"] += 1
+        if entry["first_time"] is None or b["time"] < entry["first_time"]:
+            entry["first_time"] = b["time"]
+        if entry["last_time"] is None or b["time"] > entry["last_time"]:
+            entry["last_time"] = b["time"]
+        if b["is_broker_reject"]:
+            entry["is_broker_reject"] = True
+        entry["name"] = b["name"]
+
+    aggregated = []
+    for (code, side, reason), v in sorted(agg.items(), key=lambda x: x[1]["count"], reverse=True):
+        aggregated.append({
+            "code": code,
+            "name": v.get("name", ""),
+            "side": side,
+            "reason": reason,
+            "count": v["count"],
+            "first_time": v["first_time"],
+            "last_time": v["last_time"],
+            "is_broker_reject": v["is_broker_reject"],
+        })
+    return aggregated
 
 
 def _build_portfolio_summary(
@@ -382,32 +433,69 @@ def _build_portfolio_summary(
     db_pos_by_code = {str(p.get("code") or "").zfill(6): p for p in db_positions}
     realized_today = 0.0
     realized_warnings: list[str] = []
-    
+    sell_fills_count = 0
+
+    # today BUY fills로 avg_buy 직접 계산 (전량매도 후 DB position 없는 경우 대비)
+    today_buy_by_code: dict[str, list] = {}
+    for f in today_fills:
+        if str(f.get("side") or "").upper() != "BUY":
+            continue
+        c = str(f.get("code") or "").zfill(6)
+        today_buy_by_code.setdefault(c, []).append(f)
+
     for fill in today_fills:
         if str(fill.get("side") or "").upper() != "SELL":
             continue
-        
+        sell_fills_count += 1
         code = str(fill.get("code") or "").zfill(6)
         sell_qty = _safe_int(fill.get("qty"))
         sell_price = _safe_float(fill.get("price"))
-        
-        # avg_buy 조회: DB position 우선
+
+        # avg_buy 조회 우선순위: 1) DB position → 2) 당일 BUY fills 가중평균 → skip
         avg_buy = 0.0
         pos = db_pos_by_code.get(code)
         if pos:
             avg_buy = _safe_float(pos.get("avg_buy_price"))
-        
-        # avg_buy 찾기 실패 시 경고
+
+        if avg_buy <= 0:
+            # 전량매도 후 position이 사라졌을 경우 → 당일 BUY fills에서 계산
+            buy_fills_for_code = today_buy_by_code.get(code) or []
+            if buy_fills_for_code:
+                total_buy_qty = sum(_safe_int(f.get("qty")) for f in buy_fills_for_code)
+                total_buy_cost = sum(
+                    _safe_float(f.get("price")) * _safe_int(f.get("qty"))
+                    for f in buy_fills_for_code
+                )
+                if total_buy_qty > 0:
+                    avg_buy = total_buy_cost / total_buy_qty
+                    logger.info(
+                        "[PNL_REPORT][REALIZED][AVG_BUY_FROM_FILLS] code=%s avg_buy=%.2f "
+                        "buy_fills=%s",
+                        code, avg_buy, len(buy_fills_for_code),
+                    )
+
         if avg_buy <= 0:
             realized_warnings.append(f"REALIZED_PNL_AVG_BUY_MISSING:{code}")
+            logger.warning(
+                "[PNL_REPORT][REALIZED][WARN] code=%s reason=AVG_BUY_MISSING_SKIP_REALIZED",
+                code,
+            )
             continue
-        
+
         pnl = (sell_price - avg_buy) * sell_qty
         realized_today += pnl
-    
+
+    # realized PNL = 0 인데 SELL fills 있으면 경고
+    if sell_fills_count > 0 and abs(realized_today) < 1:
+        logger.warning(
+            "[PNL_REPORT][REALIZED][WARN] reason=REALIZED_PNL_MISSING_DESPITE_SELL_FILLS "
+            "sell_fills_count=%s realized_pnl=%.2f warnings=%s",
+            sell_fills_count, realized_today, realized_warnings,
+        )
+
     logger.info(
-        "[PNL_REPORT][REALIZED][SUMMARY] realized_today=%.2f warnings=%s",
-        realized_today, realized_warnings,
+        "[PNL_REPORT][REALIZED][SUMMARY] realized_today=%.2f sell_fills=%s warnings=%s",
+        realized_today, sell_fills_count, realized_warnings,
     )
     
     total_pnl = unrealized_pnl + realized_today
@@ -504,14 +592,50 @@ def _build_markdown(
             )
         lines.append("")
 
-    # Blocked / Skipped Orders
+    # Blocked / Skipped Orders (집계 테이블)
     if blocked_orders:
-        lines.append("## Blocked / Skipped Orders\n")
-        lines.append("| Time | Code | Name | Side | Reason |")
-        lines.append("|---|---|---|---|---|")
-        for b in blocked_orders:
-            lines.append(f"| {b['time'][:8]} | {b['code']} | {b['name']} | {b['side']} | {b['reason']} |")
-        lines.append("")
+        # 집계 모드 (count 필드 있음) vs 원본 모드 구분
+        is_aggregated = any("count" in b for b in blocked_orders)
+        if is_aggregated:
+            # 브로커 거절 / 내부 스킵 구분 섹션
+            broker_rejects = [b for b in blocked_orders if b.get("is_broker_reject")]
+            internal_skips = [b for b in blocked_orders if not b.get("is_broker_reject")]
+            total_events = sum(b.get("count", 1) for b in blocked_orders)
+            lines.append("## Blocked / Skipped Orders\n")
+            lines.append(f"총 집계 종류: {len(blocked_orders)}, 총 이벤트 수: {total_events}")
+            lines.append("")
+            if broker_rejects:
+                lines.append("### Broker Rejections\n")
+                lines.append("| Count | Code | Name | Side | Reason | First | Last |")
+                lines.append("|---:|---|---|---|---|---|---|")
+                for b in broker_rejects:
+                    lines.append(
+                        f"| {b.get('count', 1)} | {b['code']} | {b.get('name','')} "
+                        f"| {b['side']} | {b['reason']} "
+                        f"| {str(b.get('first_time') or '')[:8]} "
+                        f"| {str(b.get('last_time') or '')[:8]} |"
+                    )
+                lines.append("")
+            if internal_skips:
+                lines.append("### Internal Skips\n")
+                lines.append("| Count | Code | Name | Side | Reason | First | Last |")
+                lines.append("|---:|---|---|---|---|---|---|")
+                for b in internal_skips:
+                    lines.append(
+                        f"| {b.get('count', 1)} | {b['code']} | {b.get('name','')} "
+                        f"| {b['side']} | {b['reason']} "
+                        f"| {str(b.get('first_time') or '')[:8]} "
+                        f"| {str(b.get('last_time') or '')[:8]} |"
+                    )
+                lines.append("")
+        else:
+            # 원본 모드 (PB1_REPORT_AGGREGATE_SKIPS=0)
+            lines.append("## Blocked / Skipped Orders\n")
+            lines.append("| Time | Code | Name | Side | Reason |")
+            lines.append("|---|---|---|---|---|")
+            for b in blocked_orders:
+                lines.append(f"| {str(b.get('time',''))[:8]} | {b['code']} | {b.get('name','')} | {b['side']} | {b['reason']} |")
+            lines.append("")
 
     # Data Quality Warnings
     if data_quality.get("warnings"):

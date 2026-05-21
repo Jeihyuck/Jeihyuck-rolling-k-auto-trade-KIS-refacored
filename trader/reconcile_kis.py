@@ -204,6 +204,173 @@ def _promote_open_buy_orders_from_holdings(
     return {"orders": promoted_orders, "fills": promoted_fills}
 
 
+def _restore_entry_meta_for_promoted_positions(
+    *,
+    env: str,
+    strategy: str,
+    engine,
+    orders_repo: OrdersRepo,
+    positions_repo: PositionsRepo,
+    ledger_repo: LedgerEventsRepo,
+) -> int:
+    """KIS holdings 복구 포지션에 entry_meta를 복원한다 (PB1_RECONCILE_RESTORE_ENTRY_META=1 시).
+
+    복원 우선순위:
+    1. orders.entry_meta_json (BUY order 중 code와 매칭되는 최신)
+    2. ledger ORDER_INTENT payload
+    3. SWING_SAFE fallback
+    """
+    import json as _json
+
+    if os.getenv("PB1_RECONCILE_RESTORE_ENTRY_META", "1") != "1":
+        return 0
+
+    try:
+        import sqlalchemy as _sa
+        with engine.connect() as _conn:
+            rows = _conn.execute(
+                _sa.text(
+                    "SELECT code, position_meta, entry_meta_json FROM positions "
+                    "WHERE env = :env AND status = 'OPEN' AND qty > 0"
+                ),
+                {"env": env},
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("[RECONCILE][META_RESTORE][ERROR] step=load_positions err=%s", exc)
+        return 0
+
+    restored_count = 0
+    for row in rows or []:
+        code = _normalize_code(row[0] if isinstance(row, tuple) else row.get("code"))
+        existing_meta = row[1] if isinstance(row, tuple) else row.get("position_meta")
+        existing_entry_meta = row[2] if isinstance(row, tuple) else row.get("entry_meta_json")
+
+        if isinstance(existing_meta, str):
+            try:
+                existing_meta = _json.loads(existing_meta)
+            except Exception:
+                existing_meta = {}
+        existing_meta = existing_meta or {}
+
+        if isinstance(existing_entry_meta, str):
+            try:
+                existing_entry_meta = _json.loads(existing_entry_meta)
+            except Exception:
+                existing_entry_meta = {}
+        existing_entry_meta = existing_entry_meta or {}
+
+        # 이미 book/trade_horizon이 있으면 스킵
+        if existing_entry_meta.get("book") or existing_entry_meta.get("trade_horizon"):
+            continue
+
+        # 1. orders.entry_meta_json 조회
+        entry_meta_from_order = None
+        try:
+            import sqlalchemy as _sa
+            with engine.connect() as _conn:
+                order_row = _conn.execute(
+                    _sa.text(
+                        "SELECT entry_meta_json FROM orders "
+                        "WHERE env = :env AND code = :code AND side = 'BUY' "
+                        "AND entry_meta_json IS NOT NULL "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"env": env, "code": code},
+                ).fetchone()
+            if order_row:
+                raw = order_row[0]
+                if isinstance(raw, str):
+                    try:
+                        raw = _json.loads(raw)
+                    except Exception:
+                        raw = {}
+                if isinstance(raw, dict) and (raw.get("book") or raw.get("trade_horizon")):
+                    entry_meta_from_order = raw
+        except Exception as exc:
+            logger.warning(
+                "[RECONCILE][META_RESTORE] code=%s step=orders err=%s", code, exc
+            )
+
+        # 2. ledger ORDER_INTENT payload 조회
+        entry_meta_from_ledger = None
+        if entry_meta_from_order is None:
+            try:
+                import sqlalchemy as _sa
+                with engine.connect() as _conn:
+                    ledger_row = _conn.execute(
+                        _sa.text(
+                            "SELECT payload FROM ledger_events "
+                            "WHERE env = :env AND code = :code "
+                            "AND event_type IN ('ORDER_INTENT','ORDER_SUBMIT_ACCEPTED','ORDER_SUBMIT_ATTEMPT') "
+                            "ORDER BY ts DESC LIMIT 1"
+                        ),
+                        {"env": env, "code": code},
+                    ).fetchone()
+                if ledger_row:
+                    raw = ledger_row[0]
+                    if isinstance(raw, str):
+                        try:
+                            raw = _json.loads(raw)
+                        except Exception:
+                            raw = {}
+                    if isinstance(raw, dict):
+                        nested = raw.get("entry_meta") or raw.get("entry_meta_json") or raw
+                        if isinstance(nested, dict) and (nested.get("book") or nested.get("trade_horizon")):
+                            entry_meta_from_ledger = nested
+            except Exception as exc:
+                logger.warning(
+                    "[RECONCILE][META_RESTORE] code=%s step=ledger err=%s", code, exc
+                )
+
+        # 3. SWING_SAFE fallback
+        resolved_meta = entry_meta_from_order or entry_meta_from_ledger or {
+            "book": "SWING_BOOK",
+            "trade_horizon": "SWING_CARRY",
+            "exit_policy_family": "SWING_STAGED_EXIT",
+            "meta_source": "RECONCILE_SWING_SAFE_FALLBACK",
+        }
+
+        try:
+            import sqlalchemy as _sa
+            update_payload = {
+                **existing_meta,
+                "book": resolved_meta.get("book", "SWING_BOOK"),
+                "trade_horizon": resolved_meta.get("trade_horizon", "SWING_CARRY"),
+            }
+            if resolved_meta.get("exit_policy_family"):
+                update_payload["exit_policy_family"] = resolved_meta["exit_policy_family"]
+            source = resolved_meta.get("meta_source", "order_meta")
+            update_payload["meta_source"] = source
+            with engine.begin() as _conn:
+                _conn.execute(
+                    _sa.text(
+                        "UPDATE positions SET position_meta = :meta, entry_meta_json = :emeta "
+                        "WHERE env = :env AND code = :code AND status = 'OPEN'"
+                    ),
+                    {
+                        "meta": _json.dumps(update_payload),
+                        "emeta": _json.dumps(resolved_meta),
+                        "env": env,
+                        "code": code,
+                    },
+                )
+            restored_count += 1
+            logger.info(
+                "[RECONCILE][META_RESTORE][OK] env=%s code=%s book=%s horizon=%s source=%s",
+                env,
+                code,
+                resolved_meta.get("book"),
+                resolved_meta.get("trade_horizon"),
+                source,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[RECONCILE][META_RESTORE][FAIL] code=%s err=%s", code, exc
+            )
+
+    return restored_count
+
+
 def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object]:
     env = ctx.env
     run_id = (os.getenv("TRADER_RUN_ID") or "").strip() or None
@@ -425,6 +592,23 @@ def reconcile_kis(
                 )
     if restored:
         logger.warning("[RECONCILE][POSITIONS][RESTORE] env=%s restored=%s", env, restored)
+
+    # [2026-05-21] entry meta 복원 (KIS holdings 복구 포지션 대상)
+    meta_restored = 0
+    try:
+        ledger_repo = LedgerEventsRepo(engine)
+        meta_restored = _restore_entry_meta_for_promoted_positions(
+            env=env,
+            strategy=strategy,
+            engine=engine,
+            orders_repo=orders_repo,
+            positions_repo=positions_repo,
+            ledger_repo=ledger_repo,
+        )
+        if meta_restored:
+            logger.info("[RECONCILE][META_RESTORE][DONE] env=%s count=%s", env, meta_restored)
+    except Exception as _meta_exc:
+        logger.warning("[RECONCILE][META_RESTORE][SKIP] err=%s", _meta_exc)
 
     guard_result = None
     guard_reason = None

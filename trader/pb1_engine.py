@@ -880,6 +880,245 @@ def _resolve_position_horizon(pos: dict[str, Any], now_kst_date: Any | None = No
     return "SWING_CARRY"
 
 
+def _resolve_position_book(pos: dict[str, Any]) -> str:
+    """포지션 dict에서 book(SWING_BOOK / DAY_BOOK / CORE_BOOK)을 결정한다.
+
+    우선순위:
+    1. entry_meta_json.book
+    2. position_meta.book
+    3. trade_horizon → 매핑
+    4. fallback: SWING_BOOK
+    """
+    import json as _json
+    entry_meta = pos.get("entry_meta_json") or {}
+    if isinstance(entry_meta, str):
+        try:
+            entry_meta = _json.loads(entry_meta)
+        except Exception:
+            entry_meta = {}
+    book = str(entry_meta.get("book") or "").strip()
+    if book in {"SWING_BOOK", "DAY_BOOK", "CORE_BOOK"}:
+        return book
+
+    meta = pos.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = _json.loads(meta)
+        except Exception:
+            meta = {}
+    book = str(meta.get("book") or "").strip()
+    if book in {"SWING_BOOK", "DAY_BOOK", "CORE_BOOK"}:
+        return book
+
+    # trade_horizon 기반 매핑
+    horizon = str(entry_meta.get("trade_horizon") or meta.get("trade_horizon") or "").strip()
+    _horizon_to_book = {
+        "DAY_PROTECT": "DAY_BOOK",
+        "SWING_CARRY": "SWING_BOOK",
+        "CORE_CARRY": "CORE_BOOK",
+    }
+    if horizon in _horizon_to_book:
+        return _horizon_to_book[horizon]
+
+    return "SWING_BOOK"
+
+
+def _apply_swing_same_day_guard(
+    *,
+    code: str,
+    book: str,
+    same_day: bool,
+    holding_minutes: float,
+    pnl_pct: float,
+    hard_stop_hit: bool,
+    emergency_stop_hit: bool,
+    candidate_exit_reason: str,
+    holding_qty: int,
+    sell_pct: float | None,
+) -> dict[str, Any]:
+    """스윙 종목 당일 매도 가드 (Section 7/9 spec).
+
+    Returns:
+        {
+          "allowed": bool,
+          "blocked_reason": str | None,
+          "route": str,   # SWING_EXIT_ROUTER | INTRADAY_EXIT_ROUTER | SWING_SAFE_EXIT_ROUTER
+        }
+    """
+    import os as _os
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    swing_min_hold = int(_os.getenv("PB1_SWING_MIN_HOLD_MINUTES", "60"))
+    swing_exception_pct = float(_os.getenv("PB1_SWING_SAME_DAY_EXCEPTION_PROFIT_PCT", "5.0"))
+
+    # 긴급 손절/하드 스탑은 항상 허용
+    if hard_stop_hit or emergency_stop_hit:
+        _log.info(
+            "[EXIT][SAME_DAY_GUARD] code=%s book=%s same_day=%s holding_minutes=%.1f pnl_pct=%.2f "
+            "hard_stop=%s action=ALLOW reason=HARD_STOP_OVERRIDE",
+            code, book, int(same_day), holding_minutes, pnl_pct, int(hard_stop_hit),
+        )
+        return {"allowed": True, "blocked_reason": None, "route": "SWING_EXIT_ROUTER"}
+
+    if book == "SWING_BOOK":
+        route = "SWING_EXIT_ROUTER"
+        # 1. 최소 보유 시간 미달
+        if same_day and holding_minutes < swing_min_hold:
+            # 급등 예외: pnl >= exception_pct AND holding_minutes >= 30 AND qty >= 2
+            if pnl_pct >= swing_exception_pct and holding_minutes >= 30 and holding_qty >= 2:
+                _log.info(
+                    "[EXIT][SAME_DAY_GUARD] code=%s book=SWING_BOOK same_day=1 holding_minutes=%.1f "
+                    "pnl_pct=%.2f holding_qty=%s action=ALLOW reason=SWING_SAME_DAY_EXCEPTION_PROFIT",
+                    code, holding_minutes, pnl_pct, holding_qty,
+                )
+                return {"allowed": True, "blocked_reason": None, "route": route}
+            _log.info(
+                "[EXIT][SAME_DAY_GUARD] code=%s book=SWING_BOOK same_day=1 holding_minutes=%.1f "
+                "pnl_pct=%.2f hard_stop=0 action=BLOCK reason=SWING_SAME_DAY_MIN_HOLD_BLOCK",
+                code, holding_minutes, pnl_pct,
+            )
+            return {"allowed": False, "blocked_reason": "SWING_SAME_DAY_MIN_HOLD_BLOCK", "route": route}
+
+        # 2. DAY_PROTECT 계열 exit reason 차단
+        _day_protect_reasons = {
+            "EXIT_DAY_TRAIL_PROTECT",
+            "EXIT_DAY_TAKE_PROFIT_50",
+            "INTRADAY_PROFIT_PROTECT",
+            "DAY_PROTECT",
+            "EXIT_DAY_BREAKEVEN_PROTECT",
+            "EXIT_DAY_CLOSE_PROFIT_PROTECT",
+            "EXIT_DAY_CLOSE_LOSS_CUT",
+            "EXIT_DAY_FORCE_CLOSE",
+        }
+        if candidate_exit_reason in _day_protect_reasons:
+            _log.info(
+                "[EXIT][DAY_PROTECT][BLOCK] code=%s book=SWING_BOOK reason=SWING_DAY_PROTECT_DISABLED "
+                "candidate_reason=%s",
+                code, candidate_exit_reason,
+            )
+            return {"allowed": False, "blocked_reason": "SWING_DAY_PROTECT_DISABLED", "route": route}
+
+        # 3. 1주 포지션 partial exit 금지
+        if holding_qty < 2 and sell_pct is not None:
+            _log.info(
+                "[EXIT][PARTIAL][BLOCK] code=%s holding_qty=%s sell_pct=%s reason=PARTIAL_EXIT_QTY_TOO_SMALL",
+                code, holding_qty, sell_pct,
+            )
+            return {"allowed": False, "blocked_reason": "PARTIAL_EXIT_QTY_TOO_SMALL", "route": route}
+
+        return {"allowed": True, "blocked_reason": None, "route": route}
+
+    elif book == "DAY_BOOK":
+        # DAY_BOOK은 당일 익절 허용
+        route = "INTRADAY_EXIT_ROUTER"
+        day_min_hold = int(_os.getenv("PB1_DAY_MIN_HOLD_MINUTES", "5"))
+        if same_day and holding_minutes < day_min_hold:
+            # DAY_BOOK도 최소 보유시간 5분 미만이면 hard_stop만 허용
+            _log.info(
+                "[EXIT][SAME_DAY_GUARD] code=%s book=DAY_BOOK same_day=1 holding_minutes=%.1f "
+                "action=BLOCK reason=DAY_SAME_DAY_MIN_HOLD_BLOCK",
+                code, holding_minutes,
+            )
+            return {"allowed": False, "blocked_reason": "DAY_SAME_DAY_MIN_HOLD_BLOCK", "route": route}
+        # DAY_BOOK 1주 partial exit 차단
+        if holding_qty < 2 and sell_pct is not None:
+            day_allow_single = _os.getenv("PB1_DAY_ALLOW_SINGLE_SHARE_FULL_EXIT", "0") == "1"
+            if not day_allow_single:
+                _log.info(
+                    "[EXIT][PARTIAL][BLOCK] code=%s book=DAY_BOOK holding_qty=%s sell_pct=%s "
+                    "reason=PARTIAL_EXIT_QTY_TOO_SMALL",
+                    code, holding_qty, sell_pct,
+                )
+                return {"allowed": False, "blocked_reason": "PARTIAL_EXIT_QTY_TOO_SMALL", "route": route}
+        return {"allowed": True, "blocked_reason": None, "route": route}
+
+    else:
+        # meta 없거나 알 수 없는 book → SWING_SAFE_EXIT_ROUTER
+        route = "SWING_SAFE_EXIT_ROUTER"
+        # SWING_SAFE: hard_stop/emergency만 허용, 익절성 당일 매도 차단
+        if same_day:
+            _day_protect_reasons = {
+                "EXIT_DAY_TRAIL_PROTECT",
+                "EXIT_DAY_TAKE_PROFIT_50",
+                "INTRADAY_PROFIT_PROTECT",
+                "DAY_PROTECT",
+                "EXIT_DAY_BREAKEVEN_PROTECT",
+                "EXIT_DAY_CLOSE_PROFIT_PROTECT",
+            }
+            if candidate_exit_reason in _day_protect_reasons:
+                _log.info(
+                    "[EXIT][ROUTER][META_MISSING] code=%s route=SWING_SAFE_EXIT_ROUTER "
+                    "candidate_reason=%s action=BLOCK",
+                    code, candidate_exit_reason,
+                )
+                return {"allowed": False, "blocked_reason": "META_MISSING_SWING_SAFE", "route": route}
+        return {"allowed": True, "blocked_reason": None, "route": route}
+
+
+def _compute_kr_per_position_budget(
+    *,
+    tick_budget: float,
+    orderable_count: int,
+    slots_remaining: int,
+    session_kind: str = "am",
+) -> tuple[float, dict[str, Any]]:
+    """KR 전용 per-position budget 계산 (Section 11 spec).
+
+    Returns:
+        (per_position_budget, sizing_debug)
+    """
+    import os as _os
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    if session_kind in {"am", "morning"}:
+        target_key = "PB1_KR_AM_TARGET_POSITIONS"
+        default_target = 6
+    else:
+        target_key = "PB1_KR_PM_TARGET_POSITIONS"
+        default_target = 6
+
+    target_positions_cfg = int(_os.getenv(target_key, str(default_target)))
+    max_per_tick = int(_os.getenv("PB1_KR_MAX_NEW_POSITIONS_PER_TICK", "4"))
+    min_krw = float(_os.getenv("PB1_KR_MIN_POSITION_KRW", "2000000"))
+    max_krw = float(_os.getenv("PB1_KR_MAX_POSITION_KRW", "5000000"))
+
+    actual_target = min(
+        max(orderable_count, 1),
+        max(slots_remaining, 1),
+        target_positions_cfg,
+        max_per_tick,
+    )
+
+    raw_budget = (tick_budget / actual_target) if actual_target > 0 else min_krw
+    per_position_budget = min(max_krw, max(min_krw, raw_budget))
+
+    debug = {
+        "orderable_count": orderable_count,
+        "slots_remaining": slots_remaining,
+        "target_positions_cfg": target_positions_cfg,
+        "max_per_tick": max_per_tick,
+        "actual_target": actual_target,
+        "tick_budget": tick_budget,
+        "raw_budget": raw_budget,
+        "per_position_budget": per_position_budget,
+        "min_krw": min_krw,
+        "max_krw": max_krw,
+    }
+    _log.info(
+        "[SIZING][KR] orderable_count=%s target_positions=%s tick_budget=%.0f "
+        "per_position_budget=%.0f min=%.0f max=%.0f",
+        orderable_count,
+        actual_target,
+        tick_budget,
+        per_position_budget,
+        min_krw,
+        max_krw,
+    )
+    return per_position_budget, debug
+
+
 def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | None) -> int:
     """exit 수량을 계산한다.
 
@@ -8721,9 +8960,23 @@ class PB1Engine:
             "ACCEPTED" if ok else "REJECTED",
         )
         if ok:
-            self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
+            # [2026-05-21] KIS 주문 성공 후 DB ACK 소프트 실패 처리
+            # accepted=1은 먼저 설정 (KIS 주문은 이미 완료)
             status["accepted"] = 1
             status["submit_terminal_status"] = "ACCEPTED_PENDING_FILL"
+            try:
+                self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
+                logger.info("[ORDER][DB_ACK][OK] code=%s kis_odno=%s", cf.code, kis_odno)
+            except Exception as _ack_exc:
+                _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
+                logger.warning(
+                    "[ORDER][DB_ACK][TIMEOUT] code=%s kis_odno=%s err=%s action=ACK_PENDING_RECONCILE",
+                    cf.code, kis_odno, _ack_exc,
+                )
+                status["db_ack_timeout"] = 1
+                status["submit_terminal_status"] = "ACK_PENDING_RECONCILE"
+                if not _soft_ack:
+                    raise
             # [2026-04-30] ORDER_SUBMIT_ACCEPTED 직후 BUY_FILL/positions update 금지.
             # 실제 체결은 reconcile_kis.py에서 KIS balance 확인 후 BUY_FILL_CONFIRMED로 생성한다.
             logger.info(
@@ -8869,7 +9122,17 @@ class PB1Engine:
             "ACCEPTED" if ok else "REJECTED",
         )
         if ok:
-            self.orders_repo.mark_acked(self.env, kis_odno, resp)
+            try:
+                self.orders_repo.mark_acked(self.env, kis_odno, resp)
+                logger.info("[ORDER][DB_ACK][OK][ADD_BUY] code=%s kis_odno=%s", code, kis_odno)
+            except Exception as _add_ack_exc:
+                _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
+                logger.warning(
+                    "[ORDER][DB_ACK][TIMEOUT][ADD_BUY] code=%s kis_odno=%s err=%s",
+                    code, kis_odno, _add_ack_exc,
+                )
+                if not _soft_ack:
+                    raise
             filled_at = now_kst()
             self.fills_repo.upsert_fill(
                 env=self.env,
@@ -8877,21 +9140,6 @@ class PB1Engine:
                 order_id=order_id,
                 kis_odno=kis_odno,
                 trade_id=None,
-                code=code,
-                market=pos.get("market"),
-                side="BUY",
-                qty=qty,
-                price=fill_price,
-                fee=0.0,
-                tax=0.0,
-                filled_at=filled_at,
-                raw_json=resp,
-            )
-            self.positions_repo.apply_fill(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=1,
-                mode=mode,
                 code=code,
                 market=pos.get("market"),
                 side="BUY",
@@ -9384,9 +9632,22 @@ class PB1Engine:
             "ACCEPTED" if ok else "REJECTED",
         )
         if ok:
-            self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
+            # [2026-05-21] KIS 주문 성공 후 DB ACK 소프트 실패 처리
             status["accepted"] = 1
             status["submit_terminal_status"] = "ACCEPTED_PENDING_FILL"
+            try:
+                self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
+                logger.info("[ORDER][DB_ACK][OK][CLOSE_ENTRY] code=%s kis_odno=%s", cf.code, kis_odno)
+            except Exception as _ack_exc:
+                _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
+                logger.warning(
+                    "[ORDER][DB_ACK][TIMEOUT][CLOSE_ENTRY] code=%s kis_odno=%s err=%s",
+                    cf.code, kis_odno, _ack_exc,
+                )
+                status["db_ack_timeout"] = 1
+                status["submit_terminal_status"] = "ACK_PENDING_RECONCILE"
+                if not _soft_ack:
+                    raise
             self._append_close_entry_record(
                 {
                     "order_id": order_id,
@@ -9762,16 +10023,67 @@ class PB1Engine:
         )
 
         # ------------------------------------------------------------------
-        # Horizon-based exit policy routing
-        # INTRADAY_PROFIT_PROTECT / SWING_STAGED_EXIT / CORE_TREND_FOLLOW
+        # [2026-05-21] Book/Horizon 기반 exit router + same-day guard
         # ------------------------------------------------------------------
         trade_horizon = _resolve_position_horizon(pos, now_kst_date=self._now_kst.date())
+        position_book = _resolve_position_book(pos)
         horizon_exit_family = _horizon_to_exit_family(trade_horizon)
         horizon_result: dict[str, Any] | None = None
         _now_hhmm = int(self._now_kst.strftime("%H%M"))
         _max_pnl = float((pos.get("position_meta") or {}).get("max_pnl_pct_since_entry") or 0.0)
         _max_pnl = max(_max_pnl, ret_pct)
         regime_str = str(getattr(self, "_regime", None) or "")
+
+        # holding_minutes 계산 (당일 보유 시간)
+        _holding_minutes: float = 0.0
+        _same_day: bool = bool(exit_policy.get("same_day_entry", False))
+        if entry_ts is not None:
+            try:
+                _holding_minutes = float((self._now_kst - entry_ts).total_seconds() / 60.0)
+            except Exception:
+                _holding_minutes = 0.0
+        if _same_day and _holding_minutes <= 0:
+            _holding_minutes = float(holding_bars * 1.5)  # bar 수 기반 추정
+
+        logger.info(
+            "[EXIT][ROUTER] code=%s book=%s horizon=%s exit_policy_family=%s "
+            "route=%s same_day=%s holding_minutes=%.1f pnl_pct=%.2f",
+            display_code,
+            position_book,
+            trade_horizon,
+            exit_policy_family,
+            "SWING_EXIT_ROUTER" if position_book == "SWING_BOOK" else
+            ("INTRADAY_EXIT_ROUTER" if position_book == "DAY_BOOK" else "SWING_SAFE_EXIT_ROUTER"),
+            int(_same_day),
+            _holding_minutes,
+            ret_pct,
+        )
+
+        # same-day guard: SWING_BOOK / DAY_BOOK / unknown 분기
+        _guard_result = _apply_swing_same_day_guard(
+            code=display_code,
+            book=position_book,
+            same_day=_same_day,
+            holding_minutes=_holding_minutes,
+            pnl_pct=ret_pct,
+            hard_stop_hit=stop_hit,
+            emergency_stop_hit=bool(os.getenv("EMERGENCY_GLOBAL_SELL", "0") not in {"0", "false", "False"}),
+            candidate_exit_reason=final_reason,
+            holding_qty=qty,
+            sell_pct=None,  # 전체 exit 여부 판단용; partial 판단은 아래에서
+        )
+        if not _guard_result["allowed"] and exit_policy.get("exit_ok", False):
+            _blocked_reason = _guard_result["blocked_reason"]
+            logger.info(
+                "[EXIT][SAME_DAY_GUARD] code=%s book=%s same_day=%s holding_minutes=%.1f "
+                "pnl_pct=%.2f hard_stop=%s action=BLOCK reason=%s",
+                display_code, position_book, int(_same_day), _holding_minutes,
+                ret_pct, int(stop_hit), _blocked_reason,
+            )
+            # guard가 block했으면 exit 취소
+            exit_policy = {**exit_policy, "exit_ok": False, "final_reason": _blocked_reason}
+            final_reason = _blocked_reason or "SWING_SAME_DAY_GUARD_BLOCK"
+            ordered_reasons = [final_reason]
 
         if exit_policy_family in {
             "INTRADAY_PROFIT_PROTECT",
@@ -9787,12 +10099,27 @@ class PB1Engine:
             } else horizon_exit_family
 
             if _active_family == "INTRADAY_PROFIT_PROTECT":
-                horizon_result = _resolve_day_protect_exit(
-                    pos, float(mark or 0.0), _now_hhmm,
-                    ret_pct=ret_pct,
-                    max_pnl_pct=_max_pnl,
-                    stop_hit=stop_hit,
-                )
+                # SWING_BOOK인데 INTRADAY_PROFIT_PROTECT family가 배정되면 guard가 block했어도 여기서 재확인
+                if position_book in {"SWING_BOOK", "CORE_BOOK"} and _same_day and not stop_hit:
+                    logger.info(
+                        "[EXIT][ROUTER] code=%s book=%s INTRADAY_PROTECT → SWING_STAGED_EXIT (same_day override)",
+                        display_code, position_book,
+                    )
+                    _active_family = "SWING_STAGED_EXIT"
+                    horizon_result = _resolve_swing_staged_exit(
+                        pos, float(mark or 0.0), ma20,
+                        ret_pct=ret_pct,
+                        days_held=trading_days_held,
+                        stop_hit=stop_hit,
+                        highest_ret_pct=_max_pnl,
+                    )
+                else:
+                    horizon_result = _resolve_day_protect_exit(
+                        pos, float(mark or 0.0), _now_hhmm,
+                        ret_pct=ret_pct,
+                        max_pnl_pct=_max_pnl,
+                        stop_hit=stop_hit,
+                    )
             elif _active_family == "SWING_STAGED_EXIT":
                 horizon_result = _resolve_swing_staged_exit(
                     pos, float(mark or 0.0), ma20,
@@ -10255,8 +10582,17 @@ class PB1Engine:
         )
         if ok:
             exit_eval_payload["submitted"] = 1
-            self.orders_repo.mark_acked(self.env, kis_odno, resp)
-            # [2026-05-07] SELL fill confirmed → order status를 FILLED로 업데이트
+            try:
+                self.orders_repo.mark_acked(self.env, kis_odno, resp)
+                logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
+            except Exception as _sell_ack_exc:
+                _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
+                logger.warning(
+                    "[ORDER][DB_ACK][TIMEOUT][SELL] code=%s kis_odno=%s err=%s",
+                    code, kis_odno, _sell_ack_exc,
+                )
+                if not _soft_ack:
+                    raise
             self.orders_repo.mark_filled(self.env, kis_odno=kis_odno, client_order_key=client_key)
             filled_at = now_kst()
             self.fills_repo.upsert_fill(

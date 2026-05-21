@@ -430,6 +430,42 @@ CONFIG = {
     # 한국장 전용 로그
     "PB1_KR_LOG_FILTER_MATRIX": "1",
     "PB1_KR_LOG_RESCUE_DECISION": "1",
+    # === [2026-05-21] KR vol filter (우선순위: PB1_KR_* > PB1_BOOTSTRAP_* > PB1_*) ===
+    "PB1_KR_VOL_MAX": "1.25",
+    "PB1_KR_VOLU_MAX": "1.25",
+    "PB1_KR_VOLU_MAX_INTRADAY": "1.25",
+    "PB1_BOOTSTRAP_VOL_MAX": "1.25",
+    "PB1_BOOTSTRAP_VOLU_MAX": "1.25",
+    "PB1_BOOTSTRAP_VOLU_MAX_INTRADAY": "1.25",
+    # BOOTSTRAP_PB1_* 기존 값도 1.25로 맞춤
+    "BOOTSTRAP_PB1_VOL_MAX": "1.25",
+    "BOOTSTRAP_PB1_VOLU_MAX": "1.25",
+    # === [2026-05-21] SWING exit guard ===
+    "PB1_SWING_MIN_HOLD_MINUTES": "60",
+    "PB1_SWING_SAME_DAY_EXCEPTION_PROFIT_PCT": "5.0",
+    "PB1_SWING_TRAIL_START_PCT": "8.0",
+    "PB1_SWING_TRAIL_DRAWDOWN_PCT": "3.0",
+    # === [2026-05-21] DAY_BOOK exit policy ===
+    "PB1_DAY_TAKE_PROFIT_PCT": "2.0",
+    "PB1_DAY_PROTECT_TRIGGER_PCT": "3.0",
+    "PB1_DAY_PROTECT_TRAIL_FROM_HIGH_PCT": "1.0",
+    "PB1_DAY_MIN_HOLD_MINUTES": "5",
+    "PB1_DAY_ALLOW_SINGLE_SHARE_FULL_EXIT": "0",
+    # === [2026-05-21] KR sizing ===
+    "PB1_KR_AM_TARGET_POSITIONS": "6",
+    "PB1_KR_PM_TARGET_POSITIONS": "6",
+    "PB1_KR_MAX_TOTAL_POSITIONS": "12",
+    "PB1_KR_MAX_NEW_POSITIONS_PER_TICK": "4",
+    "PB1_KR_MIN_POSITION_KRW": "2000000",
+    "PB1_KR_MAX_POSITION_KRW": "5000000",
+    # === [2026-05-21] DB ACK soft-fail / reconcile restore ===
+    "PB1_ORDER_DB_ACK_FAIL_SOFT": "1",
+    "PB1_ORDER_ACK_PENDING_RECONCILE": "1",
+    "PB1_RECONCILE_RESTORE_ENTRY_META": "1",
+    # === [2026-05-21] Report aggregation ===
+    "PB1_REPORT_AGGREGATE_SKIPS": "1",
+    "PB1_REPORT_REQUIRE_REALIZED_PNL_FROM_FILLS": "1",
+    "PB1_REPORT_SAVE_RAW_SKIP_EVENTS": "1",
 }
 
 
@@ -1265,7 +1301,65 @@ PB1_KR_STRESS_MIN_RS_PCTILE = float(_cfg("PB1_KR_STRESS_MIN_RS_PCTILE") or "0.85
 PB1_KR_LOG_FILTER_MATRIX = env_bool("PB1_KR_LOG_FILTER_MATRIX", default=True)
 PB1_KR_LOG_RESCUE_DECISION = env_bool("PB1_KR_LOG_RESCUE_DECISION", default=True)
 
+# === [2026-05-21] KR vol filter (우선순위: PB1_KR_* > PB1_BOOTSTRAP_* > PB1_*) ===
+def _resolve_kr_vol_filter(key_kr: str, key_bootstrap: str, key_pb1: str, default: str) -> float:
+    """KR 전용 vol 필터 우선순위: PB1_KR_* > PB1_BOOTSTRAP_* > PB1_* > default."""
+    _kr = os.getenv(key_kr)
+    if _kr is not None:
+        return float(_kr)
+    _bs = os.getenv(key_bootstrap) or CONFIG.get(key_bootstrap)
+    if _bs:
+        return float(_bs)
+    _pb1 = os.getenv(key_pb1) or CONFIG.get(key_pb1)
+    if _pb1:
+        return float(_pb1)
+    return float(default)
+
+PB1_KR_VOL_MAX = _resolve_kr_vol_filter("PB1_KR_VOL_MAX", "PB1_BOOTSTRAP_VOL_MAX", "PB1_VOL_MAX", "1.25")
+PB1_KR_VOLU_MAX = _resolve_kr_vol_filter("PB1_KR_VOLU_MAX", "PB1_BOOTSTRAP_VOLU_MAX", "PB1_VOLU_MAX", "1.25")
+PB1_KR_VOLU_MAX_INTRADAY = _resolve_kr_vol_filter("PB1_KR_VOLU_MAX_INTRADAY", "PB1_BOOTSTRAP_VOLU_MAX_INTRADAY", "PB1_VOLU_MAX_INTRADAY", "1.25")
+
 logger.info(
+    "[PB1][EFFECTIVE_FILTERS] vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f "
+    "(sources: kr_vol=%s bootstrap_vol=%s pb1_vol=%s)",
+    PB1_KR_VOL_MAX,
+    PB1_KR_VOLU_MAX,
+    PB1_KR_VOLU_MAX_INTRADAY,
+    os.getenv("PB1_KR_VOL_MAX", CONFIG.get("PB1_KR_VOL_MAX", "")),
+    os.getenv("PB1_BOOTSTRAP_VOL_MAX", CONFIG.get("PB1_BOOTSTRAP_VOL_MAX", "")),
+    os.getenv("PB1_VOL_MAX", CONFIG.get("PB1_VOL_MAX", "")),
+)
+
+# === [2026-05-21] SWING exit guard ===
+PB1_SWING_MIN_HOLD_MINUTES = int(_cfg("PB1_SWING_MIN_HOLD_MINUTES") or "60")
+PB1_SWING_SAME_DAY_EXCEPTION_PROFIT_PCT = float(_cfg("PB1_SWING_SAME_DAY_EXCEPTION_PROFIT_PCT") or "5.0")
+PB1_SWING_TRAIL_START_PCT = float(_cfg("PB1_SWING_TRAIL_START_PCT") or "8.0")
+PB1_SWING_TRAIL_DRAWDOWN_PCT = float(_cfg("PB1_SWING_TRAIL_DRAWDOWN_PCT") or "3.0")
+
+# === [2026-05-21] DAY_BOOK exit policy ===
+PB1_DAY_TAKE_PROFIT_PCT = float(_cfg("PB1_DAY_TAKE_PROFIT_PCT") or "2.0")
+PB1_DAY_PROTECT_TRIGGER_PCT = float(_cfg("PB1_DAY_PROTECT_TRIGGER_PCT") or "3.0")
+PB1_DAY_PROTECT_TRAIL_FROM_HIGH_PCT = float(_cfg("PB1_DAY_PROTECT_TRAIL_FROM_HIGH_PCT") or "1.0")
+PB1_DAY_MIN_HOLD_MINUTES = int(_cfg("PB1_DAY_MIN_HOLD_MINUTES") or "5")
+PB1_DAY_ALLOW_SINGLE_SHARE_FULL_EXIT = env_bool("PB1_DAY_ALLOW_SINGLE_SHARE_FULL_EXIT", default=False)
+
+# === [2026-05-21] KR sizing ===
+PB1_KR_AM_TARGET_POSITIONS = int(_cfg("PB1_KR_AM_TARGET_POSITIONS") or "6")
+PB1_KR_PM_TARGET_POSITIONS = int(_cfg("PB1_KR_PM_TARGET_POSITIONS") or "6")
+PB1_KR_MAX_TOTAL_POSITIONS = int(_cfg("PB1_KR_MAX_TOTAL_POSITIONS") or "12")
+PB1_KR_MAX_NEW_POSITIONS_PER_TICK = int(_cfg("PB1_KR_MAX_NEW_POSITIONS_PER_TICK") or "4")
+PB1_KR_MIN_POSITION_KRW = float(_cfg("PB1_KR_MIN_POSITION_KRW") or "2000000")
+PB1_KR_MAX_POSITION_KRW = float(_cfg("PB1_KR_MAX_POSITION_KRW") or "5000000")
+
+# === [2026-05-21] DB ACK soft-fail / reconcile ===
+PB1_ORDER_DB_ACK_FAIL_SOFT = env_bool("PB1_ORDER_DB_ACK_FAIL_SOFT", default=True)
+PB1_ORDER_ACK_PENDING_RECONCILE = env_bool("PB1_ORDER_ACK_PENDING_RECONCILE", default=True)
+PB1_RECONCILE_RESTORE_ENTRY_META = env_bool("PB1_RECONCILE_RESTORE_ENTRY_META", default=True)
+
+# === [2026-05-21] Report aggregation ===
+PB1_REPORT_AGGREGATE_SKIPS = env_bool("PB1_REPORT_AGGREGATE_SKIPS", default=True)
+PB1_REPORT_REQUIRE_REALIZED_PNL_FROM_FILLS = env_bool("PB1_REPORT_REQUIRE_REALIZED_PNL_FROM_FILLS", default=True)
+PB1_REPORT_SAVE_RAW_SKIP_EVENTS = env_bool("PB1_REPORT_SAVE_RAW_SKIP_EVENTS", default=True)
     "[CONFIG][EFFECTIVE_EXIT] existing_pos_eff=%s stop_cap=%s kospi_pct=%.1f kosdaq_pct=%.1f "
     "profit_protect=%s pct=%.1f abs_tp1=%s pct=%.1f",
     int(PB1_EXISTING_POSITION_EFFECTIVE_EXIT_ENABLED),
