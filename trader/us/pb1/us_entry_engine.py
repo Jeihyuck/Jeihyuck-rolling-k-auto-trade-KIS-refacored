@@ -207,6 +207,37 @@ def score_symbol(symbol: str, daily_prices: list[dict], current_price: dict) -> 
     return round(max(0.0, min(1.0, total)), 3)
 
 
+def _resolve_entry_signal_type(entry_meta: dict | None) -> str:
+    """entry_meta에서 entry_signal_type을 추론한다.
+
+    중요: entry_signal_type (pullback/breakout/momentum)은
+    book/horizon (SWING_BOOK/DAY_BOOK)과 완전히 다른 개념이다.
+    pullback으로 진입해도 SWING_BOOK으로 관리할 수 있다.
+    """
+    if not entry_meta:
+        return "unknown"
+    # 명시적 field 우선
+    sig = entry_meta.get("entry_signal_type") or entry_meta.get("signal_type")
+    if sig:
+        return str(sig).lower()
+    # entry_style_selected 또는 entry_style로 추론
+    style = str(
+        entry_meta.get("entry_style_selected")
+        or entry_meta.get("entry_style")
+        or entry_meta.get("style")
+        or ""
+    ).lower()
+    if "pullback" in style:
+        return "pullback"
+    if "breakout" in style:
+        return "breakout"
+    if "momentum" in style:
+        return "momentum"
+    if "vcp" in style:
+        return "vcp"
+    return "unknown"
+
+
 def generate_entry_intents(
     tickers: list[str] | list[dict] | None,
     provider: Any,
@@ -662,7 +693,40 @@ def generate_entry_intents(
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
             "entry_style": "momentum",
+            # ── entry_meta: book / horizon / exit_policy ─────────────────────
+            # 중요: entry_signal_type (pullback/breakout/momentum)과
+            #        book/horizon/exit_policy (포지션 관리 방식)은 다르다.
+            # PB1 기본값은 SWING_BOOK / SWING_CARRY 이다.
+            "book": os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK"),
+            "horizon": os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY"),
+            "exit_policy": os.getenv("US_DEFAULT_EXIT_POLICY", "US_SWING_DEFAULT"),
+            "entry_strategy": "us_pb1",
+            "entry_signal_type": _resolve_entry_signal_type(entry_meta),
+            "entry_session": now.strftime("%p").lower().replace("am", "am").replace("pm", "afternoon") if now else "am",
+            "trade_date": trade_date if 'trade_date' in locals() else (now.strftime("%Y-%m-%d") if now else ""),
+            "partial_exit_allowed": os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1",
+            "source": "locked_watchlist",
+            "min_hold_minutes": int(os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")),
+            "meta": {
+                "book": os.getenv("US_DEFAULT_ENTRY_BOOK", "SWING_BOOK"),
+                "horizon": os.getenv("US_DEFAULT_ENTRY_HORIZON", "SWING_CARRY"),
+                "exit_policy": os.getenv("US_DEFAULT_EXIT_POLICY", "US_SWING_DEFAULT"),
+                "entry_strategy": "us_pb1",
+                "entry_signal_type": _resolve_entry_signal_type(entry_meta),
+                "partial_exit_allowed": os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1",
+                "source": "locked_watchlist",
+                "schema_version": 1,
+            },
         }
+        logger.info(
+            "[US_ENTRY][META] symbol=%s book=%s horizon=%s exit_policy=%s "
+            "entry_strategy=us_pb1 entry_signal_type=%s min_hold_minutes=%s partial_exit_allowed=%d",
+            symbol,
+            intent["book"], intent["horizon"], intent["exit_policy"],
+            intent["entry_signal_type"],
+            intent["min_hold_minutes"],
+            int(intent["partial_exit_allowed"]),
+        )
         
         # Add explanation fields if available
         if entry_explanation:

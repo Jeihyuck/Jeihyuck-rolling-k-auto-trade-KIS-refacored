@@ -31,6 +31,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     from trader.us.market_calendar import now_ny
     from datetime import datetime
     from zoneinfo import ZoneInfo
+    import os
 
     provider = USDataProvider(offline=offline)
 
@@ -41,6 +42,15 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     else:
         now = now_ny()
     trade_date = now.strftime("%Y-%m-%d")
+
+    # ── close entry 정책 ─────────────────────────────────────────────────
+    # 기본: US_CLOSE_ENTRY_ENABLED=0 (신규 BUY 금지)
+    # close는 reconcile / DAY_BOOK close flatten / SWING hard exit / report 전용
+    close_entry_enabled = os.getenv("US_CLOSE_ENTRY_ENABLED", "0") == "1"
+    if not close_entry_enabled:
+        logger.info(
+            "[US_CLOSE][ENTRY_DISABLED] reason=US_CLOSE_ENTRY_ENABLED=0"
+        )
 
     # 1. Fills 조회
     fills: list[dict] = []
@@ -158,6 +168,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         "positions_count": len(positions),
         "reconcile_status": reconcile_result.get("status"),
         "balance": balance,
+        "close_entry_enabled": close_entry_enabled,
     }
 
 

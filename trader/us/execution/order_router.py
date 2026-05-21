@@ -329,6 +329,12 @@ def route_order(
                 intent["meta"]["sell_qty_clamped"] = True
 
     logger.info("[US_ORDER][SEND] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
+
+    # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────
+    # 중요: KIS ACK과 DB ACK을 반드시 분리한다.
+    # KIS 주문 성공 후 DB 저장 실패는 REJECT가 아니라 ACK_DB_FAILED이다.
+    order_no: str | None = None
+    resp: Any = None
     try:
         if side == "BUY":
             resp = kis_client.place_us_buy_order(symbol, exchange, qty, price)
@@ -337,31 +343,11 @@ def route_order(
 
         from trader.us.execution.kis_us_response_parser import extract_order_no
         order_no = extract_order_no(resp)
-
-        ack_result = {
-            "client_order_key": order_key,
-            "symbol": symbol,
-            "exchange": exchange,
-            "side": side,
-            "qty_requested": qty,
-            "qty_filled": 0,
-            "avg_price_usd": price or None,
-            "order_no": order_no,
-            "status": "ACK",
-            "dry_run": False,
-            "meta": {"raw_response": resp},
-        }
-        save_order_ack(ack_result)
-        if order_key:
-            mark_order_intent_sent(order_key)
-            _SENT_ORDER_KEYS.add(order_key)
-
-        logger.info("[US_ORDER][ACK] symbol=%s order_no=%s", symbol, order_no)
-        return {"status": "ACK", "symbol": symbol, "side": side, "qty": qty,
-                "order_no": order_no, "response": resp, "intent": intent}
+        logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
 
     except Exception as exc:
-        logger.error("[US_ORDER][REJECT] symbol=%s error=%s", symbol, exc)
+        # KIS API 자체 실패 → REJECT
+        logger.error("[US_ORDER][REJECT] symbol=%s side=%s error=%s", symbol, side, exc)
         reject_result = {
             "client_order_key": order_key,
             "symbol": symbol,
@@ -373,7 +359,86 @@ def route_order(
         save_order_reject(reject_result)
         if order_key:
             mark_order_intent_rejected(order_key, reason=str(exc))
-        return {"status": "REJECT", "reason": str(exc), "intent": intent}
+        return {
+            "status": "REJECT",
+            "reason": str(exc),
+            "kis_ack": False,
+            "ack_db_saved": False,
+            "requires_reconcile": False,
+            "intent": intent,
+        }
+
+    # ── DB ACK 저장 (KIS 성공 이후 별도 try) ─────────────────────────────
+    # KIS 주문이 성공했으므로 어떤 경우에도 REJECT로 기록하면 안 된다.
+    ack_result = {
+        "client_order_key": order_key,
+        "symbol": symbol,
+        "exchange": exchange,
+        "side": side,
+        "qty_requested": qty,
+        "qty_filled": 0,
+        "avg_price_usd": price or None,
+        "order_no": order_no,
+        "status": "ACK",
+        "dry_run": False,
+        "meta": {"raw_response": resp},
+    }
+
+    ack_db_saved = False
+    try:
+        save_order_ack(ack_result)
+        ack_db_saved = True
+        logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
+    except Exception as db_exc:
+        logger.error(
+            "[US_ORDER][ACK_DB_FAILED] symbol=%s order_no=%s error=%s",
+            symbol, order_no, db_exc,
+        )
+
+    # ── intent 상태 업데이트 ───────────────────────────────────────────────
+    try:
+        if order_key:
+            mark_order_intent_sent(order_key)
+            _SENT_ORDER_KEYS.add(order_key)
+    except Exception as mark_exc:
+        logger.error(
+            "[US_ORDER][INTENT_MARK_SENT_FAILED] symbol=%s order_no=%s error=%s",
+            symbol, order_no, mark_exc,
+        )
+
+    # ── 최종 반환 ──────────────────────────────────────────────────────────
+    if ack_db_saved:
+        logger.info("[US_ORDER][ACK] symbol=%s order_no=%s", symbol, order_no)
+        return {
+            "status": "ACK",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "order_no": order_no,
+            "response": resp,
+            "intent": intent,
+            "kis_ack": True,
+            "ack_db_saved": True,
+            "requires_reconcile": False,
+        }
+    else:
+        logger.error(
+            "[US_ORDER][RECONCILE_REQUIRED] symbol=%s order_no=%s "
+            "reason=ack_db_failed_after_kis_success",
+            symbol, order_no,
+        )
+        return {
+            "status": "ACK_DB_FAILED",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "order_no": order_no,
+            "response": resp,
+            "intent": intent,
+            "kis_ack": True,
+            "ack_db_saved": False,
+            "requires_reconcile": True,
+        }
 
 
 def clear_sent_order_keys() -> None:

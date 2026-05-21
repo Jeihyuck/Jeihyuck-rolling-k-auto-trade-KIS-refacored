@@ -1609,9 +1609,11 @@ def _pick_us_orders_side_col(conn: object) -> "str | None":
 def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
     """Check if US AM session already ran for the given trade_date.
 
-    Checks:
-    1. us_agent_runs for mode='session-am' or agent_name='am'
-    2. us_orders for any BUY orders on trade_date (side 컬럼 자동 감지)
+    오직 us_agent_runs의 완료 레코드만 확인한다.
+    buy_orders 유무는 already_ran 판단에 사용하지 않는다.
+
+    이유: buy_orders > 0이어도 exit monitoring은 반드시 계속해야 한다.
+    buy_orders 기반 entry 차단은 check_us_am_entry_blocked()를 사용한다.
 
     FAIL-CLOSED: guard 조회 실패 시 already_ran=True 반환 (중복 실행 차단).
 
@@ -1620,20 +1622,15 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
     """
     engine = _get_engine_or_none()
     if engine is None:
-        # In-memory: check if any BUY orders exist
-        found = any(
-            o.get("trade_date") == trade_date
-            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
-            for o in _MEM_ORDERS
-        )
-        return {"already_ran": found, "guard_status": "IN_MEMORY", "reason": "in_memory_check"}
+        # In-memory: 세션 완료 마커가 없으므로 already_ran=False
+        return {"already_ran": False, "guard_status": "IN_MEMORY", "reason": "in_memory_no_session_marker"}
 
     try:
         with engine.connect() as conn:
             # Set statement timeout
             conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
 
-            # Check us_agent_runs for AM session marker
+            # us_agent_runs 완료 레코드만 확인 — buy_orders 체크 제거
             agent_row = conn.execute(
                 text("""
                     SELECT run_id, status, finished_at
@@ -1658,34 +1655,8 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
                     "reason": f"agent_run_status={agent_row[1]}",
                 }
 
-            # Fallback: check us_orders — side 컬럼 자동 감지
-            side_col = _pick_us_orders_side_col(conn)
-            if side_col:
-                order_row = conn.execute(
-                    text(f"""
-                        SELECT COUNT(*) as cnt
-                        FROM us_orders
-                        WHERE trade_date = :td
-                          AND {side_col} = 'BUY'
-                    """),
-                    {"td": trade_date},
-                ).fetchone()
-                if order_row and order_row[0] > 0:
-                    logger.info(
-                        "[US_AM_ALREADY_RAN][CHECK] trade_date=%s found buy_orders count=%d (col=%s)",
-                        trade_date, order_row[0], side_col,
-                    )
-                    return {
-                        "already_ran": True,
-                        "guard_status": "FOUND_BUY_ORDERS",
-                        "reason": f"buy_orders_count={order_row[0]}",
-                    }
-            else:
-                logger.warning(
-                    "[US_AM_ALREADY_RAN][SCHEMA_FALLBACK] side/direction column missing in us_orders; "
-                    "checking session markers only"
-                )
-
+            # buy_orders 체크를 already_ran에서 제거
+            # 당일 BUY 주문 존재 여부는 check_us_am_entry_blocked()로 별도 확인
             return {"already_ran": False, "guard_status": "NOT_FOUND", "reason": "no_prior_run"}
 
     except Exception as exc:
@@ -1695,6 +1666,93 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
             "guard_status": "FAILED_CLOSED",
             "reason": "duplicate_guard_error",
             "error": str(exc),
+        }
+
+
+def check_us_am_entry_blocked(trade_date: str, timeout_sec: int = 5) -> dict:
+    """당일 BUY 주문이 이미 있으면 entry를 차단한다 (세션 전체 종료 금지).
+
+    check_us_am_already_ran()과 다르다:
+    - already_ran → 세션 전체 skip (exit monitoring도 꺼짐)  ← 이걸 막는다
+    - entry_blocked → 신규 BUY만 차단, exit monitoring 계속  ← 이 함수의 역할
+
+    FAIL-OPEN: 조회 실패 시 entry_blocked=False (entry 허용) — exit monitoring 우선.
+
+    Returns:
+        dict with keys:
+          entry_blocked (bool): True이면 신규 BUY intent 생성 금지
+          buy_orders_count (int): 당일 BUY 주문 수
+          guard_status: 상태 문자열
+          reason: 차단 사유
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        # In-memory: 당일 BUY 주문 확인
+        count = sum(
+            1
+            for o in _MEM_ORDERS
+            if o.get("trade_date") == trade_date
+            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
+        )
+        return {
+            "entry_blocked": count > 0,
+            "buy_orders_count": count,
+            "guard_status": "IN_MEMORY",
+            "reason": f"buy_orders_count={count}" if count > 0 else "no_buy_orders",
+        }
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
+
+            side_col = _pick_us_orders_side_col(conn)
+            if side_col:
+                order_row = conn.execute(
+                    text(f"""
+                        SELECT COUNT(*) AS cnt
+                        FROM us_orders
+                        WHERE trade_date = :td
+                          AND {side_col} = 'BUY'
+                    """),
+                    {"td": trade_date},
+                ).fetchone()
+                count = int(order_row[0]) if order_row else 0
+                if count > 0:
+                    logger.info(
+                        "[US_AM_ENTRY_BLOCKED][FOUND] trade_date=%s buy_orders_count=%d (col=%s)",
+                        trade_date, count, side_col,
+                    )
+                    return {
+                        "entry_blocked": True,
+                        "buy_orders_count": count,
+                        "guard_status": "FOUND_BUY_ORDERS",
+                        "reason": f"buy_orders_count={count}",
+                    }
+            else:
+                logger.warning(
+                    "[US_AM_ENTRY_BLOCKED][SCHEMA_FALLBACK] side column missing — "
+                    "entry_blocked=False (fail-open)"
+                )
+
+            return {
+                "entry_blocked": False,
+                "buy_orders_count": 0,
+                "guard_status": "NOT_FOUND",
+                "reason": "no_buy_orders",
+            }
+
+    except Exception as exc:
+        # FAIL-OPEN: entry block 실패 → entry 허용 (exit monitoring 계속이 더 중요)
+        logger.warning(
+            "[US_AM_ENTRY_BLOCKED][WARN] entry block check failed trade_date=%s error=%s "
+            "(fail-open → entry_blocked=False)",
+            trade_date, exc,
+        )
+        return {
+            "entry_blocked": False,
+            "buy_orders_count": 0,
+            "guard_status": "FAILED_OPEN",
+            "reason": f"entry_block_check_error",
         }
 
 

@@ -369,7 +369,10 @@ def generate_exit_intents(
         if current_price <= 0:
             continue
 
-        intent = evaluate_exit(position=pos, current_price=current_price, now=now)
+        # book/horizon 기반 router 사용 — SWING vs DAY 분리
+        # fallback: meta 없으면 SWING_BOOK (기본값)
+        from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
+        intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now)
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build exit explanation

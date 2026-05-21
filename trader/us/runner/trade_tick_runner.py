@@ -539,6 +539,25 @@ def run_trade_tick(
             now.strftime("%H:%M:%S"),
         )
     else:
+        # ── 당일 BUY 중복 체크: entry만 차단, 세션/exit 계속 ─────────────────
+        _entry_already_bought = False
+        _buy_orders_today = 0
+        try:
+            from trader.us.db.repos import check_us_am_entry_blocked
+            _block_result = check_us_am_entry_blocked(trade_date, timeout_sec=5)
+            if _block_result.get("entry_blocked", False):
+                _entry_already_bought = True
+                _buy_orders_today = _block_result.get("buy_orders_count", 0)
+                logger.info(
+                    "[US_ENTRY][BLOCKED] reason=already_bought_today buy_orders_count=%d",
+                    _buy_orders_today,
+                )
+                logger.info(
+                    "[US_EXIT][MONITOR][CONTINUE] reason=entry_blocked_but_exit_monitor_enabled",
+                )
+        except Exception as _ebc_exc:
+            logger.warning("[US_ENTRY][ENTRY_BLOCK_CHECK][WARN] error=%s (fail-open)", _ebc_exc)
+
         # prep status 확인 (locked watchlist contract)
         from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
         
@@ -556,6 +575,12 @@ def run_trade_tick(
             logger.warning(
                 "[US_ENTRY][BLOCK] reason=prep_degraded_or_error status=%s",
                 prep_status
+            )
+        elif _entry_already_bought if '_entry_already_bought' in locals() else False:
+            # 당일 BUY 이미 완료: entry skip (exit monitoring은 이미 위에서 계속됨)
+            logger.info(
+                "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=%d",
+                _buy_orders_today if '_buy_orders_today' in locals() else 0,
             )
         else:
             # locked watchlist 로드
