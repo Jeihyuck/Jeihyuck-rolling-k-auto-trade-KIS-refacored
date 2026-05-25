@@ -114,7 +114,14 @@ env:
   KIS_HASHKEY_ORDER_SLEEP_SEC: "0.5"
   KIS_EGW002_BACKOFF_BASE_SEC: "5.0"
   KIS_EGW002_BACKOFF_MAX_SEC: "20.0"
-  PB1_PRICE_CACHE_SCOPE: "run"
+  # [2026-05-22] KR KIS data endpoint breaker
+  KR_KIS_DATA_BREAKER_ENABLED: "1"
+  KIS_PRICE_QPS: "1.0"
+  KIS_PRICE_BURST: "1"
+  KIS_RATE_LIMIT_COOLDOWN_SEC: "20"
+  KIS_BREAKER_THRESHOLD_PRICE: "3"
+  KIS_BREAKER_THRESHOLD_BALANCE: "2"
+  KIS_BREAKER_THRESHOLD_DATA: "5"
   PB1_USE_BALANCE_PRPR_FIRST: "1"
   PB1_MAX_PRICE_FETCH_PER_TICK: "8"
   PB1_PNL_PRICE_FALLBACK_LIMIT: "3"
@@ -641,7 +648,15 @@ jobs:
             echo "::error::tick_hard_timeout at entry.buyable_gate.finalize detected"
             missing=1
           fi
-          
+          if grep -F "[PNL_REPORT][DB_ORDERS_FAIL]" artifacts/trade-am.log >/dev/null; then
+            echo "::error::PNL report DB orders failed"
+            missing=1
+          fi
+          if grep -F "No module named 'trader.utils.time_utils'" artifacts/trade-am.log >/dev/null; then
+            echo "::error::removed time_utils import path detected"
+            missing=1
+          fi
+
           test "$missing" -eq 0
 
       - name: Scan for SQLite artifacts

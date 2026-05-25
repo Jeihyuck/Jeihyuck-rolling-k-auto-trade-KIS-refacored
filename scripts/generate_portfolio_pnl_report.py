@@ -141,7 +141,7 @@ def _get_today_orders_from_db(engine, env: str, trade_date: date) -> list[dict]:
         return []
     try:
         from trader.db.repos import OrdersRepo
-        from trader.utils.time_utils import now_kst
+
         repo = OrdersRepo(engine)
         rows = repo.list_today_orders(env=env)
         logger.info("[PNL_REPORT][DB_ORDERS][OK] rows=%s", len(rows or []))
@@ -652,6 +652,49 @@ def _build_markdown(
     return "\n".join(lines)
 
 
+def _pick_kr_cash_from_balance_output2(output2: dict) -> tuple["float | None", str]:
+    """한국장 KIS balance output2에서 현금성 금액을 안전하게 선택한다.
+
+    주의:
+    - nxdy_auto_rdpt_amt가 문자열 "0"이면 cash 후보로 쓰면 안 된다.
+    - tot_evlu_amt는 총평가금액일 수 있으므로 cash fallback 최후순위로만 사용한다.
+    """
+    if not isinstance(output2, dict):
+        return None, "unavailable"
+
+    priority_keys = [
+        "ord_psbl_cash",
+        "nrcvb_buy_amt",
+        "nxdy_excc_amt",
+        "prvs_rcdl_excc_amt",
+        "dnca_tot_amt",
+    ]
+
+    for key in priority_keys:
+        raw = output2.get(key)
+        text = str(raw or "").replace(",", "").strip()
+        if text in {"", "0", "0.0"}:
+            continue
+        try:
+            value = float(text)
+        except Exception:
+            continue
+        if value > 0:
+            return value, f"kis_balance.{key}"
+
+    raw = output2.get("tot_evlu_amt")
+    text = str(raw or "").replace(",", "").strip()
+    if text not in {"", "0", "0.0"}:
+        try:
+            value = float(text)
+            if value > 0:
+                return value, "kis_balance.tot_evlu_amt_fallback"
+        except Exception:
+            pass
+
+    return None, "unavailable"
+
+
 def _failure_report(reason: str) -> str:
     return (
         "# PB1 Portfolio PNL Report\n\n"
@@ -692,17 +735,8 @@ def main() -> int:
         balance_output2 = balance.get("output2") or {}
         if isinstance(balance_output2, list):
             balance_output2 = balance_output2[0] if balance_output2 else {}
-        _raw_cash_val = (
-            balance_output2.get("nxdy_auto_rdpt_amt")
-            or balance_output2.get("dnca_tot_amt")
-            or balance_output2.get("tot_evlu_amt")
-        )
-        if _raw_cash_val is not None and str(_raw_cash_val).strip() not in ("", "0", "0.0"):
-            cash: "float | None" = _safe_float(_raw_cash_val)
-            cash_source = "kis_balance"
-        else:
-            cash = None
-            cash_source = "unavailable"
+        cash, cash_source = _pick_kr_cash_from_balance_output2(balance_output2)
+        if cash is None:
             logger.warning("[PNL_REPORT][CASH_UNAVAILABLE] balance_output2=%s", balance_output2)
 
         # DB 데이터 조회

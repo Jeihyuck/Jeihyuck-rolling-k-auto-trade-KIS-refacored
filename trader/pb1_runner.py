@@ -722,6 +722,8 @@ def _after_close_entry_dryrun_enabled(now: datetime) -> bool:
 
 def _hydrate_locked_final30_from_db_only(*, engine, env: str, as_of: date | str) -> pd.DataFrame:
     strategy_key = os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", os.getenv("WATCHLIST_FINAL_STRATEGY_KEY", "pb1_watchlist_final_scored")).strip().lower()
+    os.environ["PB1_LAST_STAGE"] = "final30.db_load.start"
+    logger.info("[PB1][STAGE][START] stage=final30.db_load env=%s as_of=%s strategy=%s", env, as_of, strategy_key)
     try:
         df = load_final30_scored_exact(
             engine,
@@ -733,9 +735,13 @@ def _hydrate_locked_final30_from_db_only(*, engine, env: str, as_of: date | str)
         )
     except (ScoredWatchlistNotFoundError, ScoredWatchlistInvalidError) as exc:
         reason = _db_exact_scored_final30_abort_reason(exc)
+        logger.exception("[FINAL30][DB_LOAD][FAIL] err_type=%s err=%s", type(exc).__name__, exc)
         logger.error("[TRADE][FINAL30][DB_ONLY_LOCK][FAIL] env=%s as_of=%s reason=%s", env, as_of, reason)
+        os.environ["PB1_LAST_STAGE"] = "final30.db_load.fail"
         raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}") from exc
 
+    os.environ["PB1_LAST_STAGE"] = "final30.db_load.done"
+    logger.info("[PB1][STAGE][END] stage=final30.db_load rows=%s", len(df))
     logger.info(
         "[TRADE][FINAL30][DB_ONLY_LOCK] env=%s as_of=%s rows=%s source=db_pb1_watchlist_final_scored",
         env,

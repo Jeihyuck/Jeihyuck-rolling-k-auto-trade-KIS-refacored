@@ -428,8 +428,15 @@ def sanitize_log_mapping(payload: dict | None) -> dict[str, Any]:
 
 def _load_price_policy_config() -> dict[str, float]:
     min_interval_ms = _env_first_float(("KIS_PRICE_MIN_INTERVAL_MS",), 0.0)
+    min_interval_sec = _env_first_float(
+        ("KIS_PRICE_MIN_INTERVAL_SEC", "KIS_INQUIRE_PRICE_MIN_INTERVAL_SEC"),
+        0.0,
+    )
+
     if min_interval_ms > 0:
         price_qps = 1000.0 / min_interval_ms
+    elif min_interval_sec > 0:
+        price_qps = 1.0 / min_interval_sec
     else:
         price_qps = _env_first_float(("KIS_PRICE_QPS", "PRICE_QPS"), 3.0)
     return {
@@ -464,18 +471,38 @@ def _breaker_key(method: str, url: str) -> str:
 def _breaker_policy(method: str, url: str) -> dict[str, Any]:
     _ = method
     endpoint_name = _endpoint_name(url)
+
     if "/oauth2/token" in _endpoint_path(url):
         category = "auth"
         threshold = _KIS_BREAKER_THRESHOLD_AUTH
         applicable = True
+
     elif is_order_endpoint(url):
         category = "order"
         threshold = _KIS_BREAKER_THRESHOLD_ORDER
         applicable = True
+
     else:
         category = "data"
-        threshold = _KIS_BREAKER_THRESHOLD_DATA
-        applicable = False
+        kr_data_breaker_enabled = os.getenv("KR_KIS_DATA_BREAKER_ENABLED", "1").strip() == "1"
+
+        if kr_data_breaker_enabled and endpoint_name in {
+            "inquire-price",
+            "inquire-balance",
+            "inquire-psbl-order",
+            "inquire-daily-ccld",
+        }:
+            applicable = True
+            if endpoint_name == "inquire-price":
+                threshold = int(os.getenv("KIS_BREAKER_THRESHOLD_PRICE", "3") or "3")
+            elif endpoint_name in {"inquire-balance", "inquire-psbl-order"}:
+                threshold = int(os.getenv("KIS_BREAKER_THRESHOLD_BALANCE", "2") or "2")
+            else:
+                threshold = int(os.getenv("KIS_BREAKER_THRESHOLD_DATA", "5") or "5")
+        else:
+            applicable = False
+            threshold = _KIS_BREAKER_THRESHOLD_DATA
+
     logger.info(
         "[KIS][BREAKER_POLICY] endpoint=%s category=%s global_breaker_applicable=%s threshold=%s",
         endpoint_name,
@@ -1254,6 +1281,8 @@ class KisAPI:
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
+                        _breaker_record_temp_failure(method, url)
+
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
                                 _endpoint_name(url),
