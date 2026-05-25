@@ -746,23 +746,56 @@ def generate_entry_intents(
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Skip Summary for Observability
+    # Skip Summary for Observability (표준 필드명)
     # ─────────────────────────────────────────────────────────────────────────
     total_processed = len(symbols)
     scored_count = len(candidates)  # candidates = successfully scored symbols
-    
-    summary_parts = [
-        f"total={total_processed}",
-        f"scored={scored_count}",
-    ]
-    
-    for reason in sorted(skip_reasons.keys()):
-        count = skip_reasons[reason]
-        summary_parts.append(f"{reason}={count}")
-    
-    summary_str = " ".join(summary_parts)
-    
-    logger.info("[US_ENTRY][SKIP_SUMMARY] %s", summary_str)
+
+    # skip_reasons key → 표준 필드명 매핑
+    def _sr(*keys: str) -> int:
+        return sum(skip_reasons.get(k, 0) for k in keys)
+
+    skipped_has_kis_position = _sr("has_kis_position")
+    skipped_has_position = _sr("has_position")
+    skipped_pending_order = _sr("pending_order")
+    skipped_sold_today = _sr("sold_today")
+    skipped_score_missing = _sr(
+        "score_missing_after_alias_resolution",
+        "score_calculation_failed",
+        "score_calculation_error",
+    )
+    skipped_score_below_min = _sr(
+        "score_below_min",
+        "score_zero_after_alias_resolution",
+        "score_zero_or_negative",
+    )
+    skipped_price_unavailable = _sr(
+        "current_price_unavailable",
+        "daily_price_unavailable",
+    )
+    skipped_price_nonpositive = _sr("current_price_invalid")
+    skipped_sizing_blocked = _sr("sizing_blocked")
+    skipped_qty_zero = _sr(
+        "order_cap_qty_zero",
+        "intent_notional_exceeds_order_cap_after_sizing",
+    )
+    skipped_max_positions_reached = _sr("max_positions_reached")
+    skipped_insufficient_cash = _sr("insufficient_cash")
+
+    logger.info(
+        "[US_ENTRY][SKIP_SUMMARY] "
+        "watchlist_total=%d evaluated_count=%d selected_count=%d entry_intents=%d "
+        "skipped_has_kis_position=%d skipped_has_position=%d skipped_pending_order=%d "
+        "skipped_sold_today=%d skipped_score_missing=%d skipped_score_below_min=%d "
+        "skipped_price_unavailable=%d skipped_price_nonpositive=%d skipped_sizing_blocked=%d "
+        "skipped_qty_zero=%d skipped_max_positions_reached=%d skipped_insufficient_cash=%d",
+        total_processed, scored_count, added_count, len(intents),
+        skipped_has_kis_position, skipped_has_position, skipped_pending_order,
+        skipped_sold_today, skipped_score_missing, skipped_score_below_min,
+        skipped_price_unavailable, skipped_price_nonpositive, skipped_sizing_blocked,
+        skipped_qty_zero, skipped_max_positions_reached, skipped_insufficient_cash,
+    )
+    logger.info("[US_ENTRY][INTENTS] count=%d", len(intents))
     
     # Write score diagnostics artifact if any score issues detected
     score_issue_reasons = {

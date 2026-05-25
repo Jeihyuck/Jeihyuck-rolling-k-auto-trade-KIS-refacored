@@ -437,7 +437,9 @@ def generate_us_pnl_report(
     total_market_value_usd = 0.0
     total_cost_usd = 0.0
     unrealized_pnl_usd = 0.0
-    
+    missing_price_count = 0
+    missing_symbols: list[str] = []
+
     position_list = []
     for pos in positions:
         sym = pos.get("symbol", "")
@@ -452,24 +454,41 @@ def generate_us_pnl_report(
             ["last_price", "current_price", "ovrs_now_pric", "now_price"],
             default=0.0,
         ))
-        market_value = _safe_float(pos.get("market_value_usd") or last_price * qty)
-        cost = _safe_float(pos.get("cost_usd") or avg_price * qty)
-        pnl = market_value - cost
-        pnl_pct = (pnl / cost * 100.0) if cost > 0 else 0.0
-        
-        total_market_value_usd += market_value
-        total_cost_usd += cost
-        unrealized_pnl_usd += pnl
-        
+
+        # last_price=0 means price is missing — don't use as normal PNL
+        price_missing = last_price <= 0.0
+        if price_missing:
+            missing_price_count += 1
+            if sym:
+                missing_symbols.append(sym)
+            market_value: float | None = None
+            cost = _safe_float(pos.get("cost_usd") or avg_price * qty)
+            pnl: float | None = None
+            pnl_pct: float | None = None
+            # Still accumulate cost but not market_value / pnl
+            total_cost_usd += cost
+        else:
+            market_value_raw = _safe_float(pos.get("market_value_usd") or last_price * qty)
+            cost = _safe_float(pos.get("cost_usd") or avg_price * qty)
+            pnl_raw = market_value_raw - cost
+            pnl_pct_raw = (pnl_raw / cost * 100.0) if cost > 0 else 0.0
+            market_value = market_value_raw
+            pnl = pnl_raw
+            pnl_pct = pnl_pct_raw
+            total_market_value_usd += market_value_raw
+            total_cost_usd += cost
+            unrealized_pnl_usd += pnl_raw
+
         position_list.append({
             "symbol": sym,
             "qty": qty,
             "avg_price": avg_price,
-            "last_price": last_price,
-            "market_value_usd": round(market_value, 2),
+            "last_price": last_price if not price_missing else None,
+            "market_value_usd": round(market_value, 2) if market_value is not None else None,
             "cost_usd": round(cost, 2),
-            "unrealized_pnl_usd": round(pnl, 2),
-            "unrealized_pnl_pct": round(pnl_pct, 2),
+            "unrealized_pnl_usd": round(pnl, 2) if pnl is not None else None,
+            "unrealized_pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None,
+            "price_missing": price_missing,
         })
     
     unrealized_pnl_pct = (unrealized_pnl_usd / total_cost_usd * 100.0) if total_cost_usd > 0 else 0.0
@@ -481,6 +500,18 @@ def generate_us_pnl_report(
             realized_pnl_usd += _safe_float(fill.get("filled_amount_usd", 0.0))
     
     total_pnl_usd = unrealized_pnl_usd + realized_pnl_usd
+
+    # missing_price_count > 0이면 PARTIAL로 강제
+    block_normal_pnl_display = missing_price_count > 0
+    if missing_price_count > 0:
+        if status == "OK":
+            status = "PARTIAL"
+        warnings.append(f"PRICE_MISSING missing_count={missing_price_count} symbols={','.join(missing_symbols)}")
+        logger.warning(
+            "[US_PNL][PRICE_MISSING] missing_count=%d symbols=%s — status forced to PARTIAL",
+            missing_price_count,
+            missing_symbols,
+        )
     
     # ── report payload ────────────────────────────────────────────────
     payload = {
@@ -492,12 +523,15 @@ def generate_us_pnl_report(
         "source": data_source,
         "status": status,
         "positions_count": len(positions),
+        "missing_price_count": missing_price_count,
+        "missing_symbols": missing_symbols,
+        "block_normal_pnl_display": block_normal_pnl_display,
         "fills_count": len(db_fills),
         "orders_sent_total": orders_sent_total,
         "total_market_value_usd": round(total_market_value_usd, 2),
         "total_cost_usd": round(total_cost_usd, 2),
-        "unrealized_pnl_usd": round(unrealized_pnl_usd, 2),
-        "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
+        "unrealized_pnl_usd": round(unrealized_pnl_usd, 2) if not block_normal_pnl_display else None,
+        "unrealized_pnl_pct": round(unrealized_pnl_pct, 2) if not block_normal_pnl_display else None,
         "realized_pnl_usd": round(realized_pnl_usd, 2),
         "total_pnl_usd": round(total_pnl_usd, 2),
         "positions": position_list,
@@ -544,7 +578,7 @@ def generate_us_pnl_report(
         f"- **Orders Sent Total**: {orders_sent_total}",
         f"- **Total Market Value**: {_fmt_usd(total_market_value_usd)}",
         f"- **Total Cost**: {_fmt_usd(total_cost_usd)}",
-        f"- **Unrealized PnL**: {_fmt_usd(unrealized_pnl_usd)} ({_fmt_pct(unrealized_pnl_pct)})",
+        f"- **Unrealized PnL**: {'N/A (missing prices)' if block_normal_pnl_display else f'{_fmt_usd(unrealized_pnl_usd)} ({_fmt_pct(unrealized_pnl_pct)})'}",
         f"- **Realized PnL**: {_fmt_usd(realized_pnl_usd)}",
         f"- **Total PnL**: {_fmt_usd(total_pnl_usd)}",
         "",
@@ -566,10 +600,14 @@ def generate_us_pnl_report(
             "|--------|-----|-----------|------------|--------------|------|-----|-------|",
         ])
         for p in position_list:
+            lp_str = f"{p['last_price']:.2f}" if p.get('last_price') is not None else 'N/A'
+            mv_str = _fmt_usd(p['market_value_usd']) if p['market_value_usd'] is not None else 'N/A'
+            pnl_str = _fmt_usd(p['unrealized_pnl_usd']) if p['unrealized_pnl_usd'] is not None else 'N/A'
+            pct_str = _fmt_pct(p['unrealized_pnl_pct']) if p['unrealized_pnl_pct'] is not None else 'N/A'
             md_lines.append(
-                f"| {p['symbol']} | {p['qty']} | {p['avg_price']:.2f} | {p['last_price']:.2f} | "
-                f"{_fmt_usd(p['market_value_usd'])} | {_fmt_usd(p['cost_usd'])} | "
-                f"{_fmt_usd(p['unrealized_pnl_usd'])} | {_fmt_pct(p['unrealized_pnl_pct'])} |"
+                f"| {p['symbol']} | {p['qty']} | {p['avg_price']:.2f} | {lp_str} | "
+                f"{mv_str} | {_fmt_usd(p['cost_usd'])} | "
+                f"{pnl_str} | {pct_str} |"
             )
         md_lines.append("")
     

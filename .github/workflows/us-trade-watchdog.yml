@@ -32,7 +32,7 @@ jobs:
               prep: {
                 workflow_id: 'us-trade-prep.yml',
                 workflow_name: 'US Trade Prep',
-                checkWindow: [710, 810],  // 07:10~08:10 ET
+                checkWindow: [710, 810],  // 07:10~08:10 ET recovery window
                 inputs: {
                   dry_run: 'true',
                   offline: 'false',
@@ -43,7 +43,7 @@ jobs:
               am: {
                 workflow_id: 'us-trade-am.yml',
                 workflow_name: 'US Trade AM',
-                checkWindow: [935, 1130],  // 09:35~11:30 ET
+                checkWindow: [935, 1130],  // 09:35~11:30 ET recovery window
                 inputs: {
                   dry_run: 'false',
                   offline: 'false',
@@ -54,7 +54,7 @@ jobs:
               afternoon: {
                 workflow_id: 'us-trade-afternoon.yml',
                 workflow_name: 'US Trade Afternoon',
-                checkWindow: [1235, 1520],  // 12:35~15:20 ET
+                checkWindow: [1235, 1520],  // 12:35~15:20 ET recovery window
                 inputs: {
                   dry_run: 'false',
                   offline: 'false',
@@ -132,12 +132,29 @@ jobs:
                 return false;
               }
 
+              // Actively running — healthy
               if (run.status === 'queued' || run.status === 'in_progress') {
                 return true;
               }
 
+              // Completed success — healthy
               if (run.status === 'completed' && run.conclusion === 'success') {
                 return true;
+              }
+
+              // Completed failure — check if it could be report-only failure.
+              // We cannot read artifacts from this script, but after report-validator
+              // fix, report-only issues now conclude with 'success'.
+              // Only re-dispatch if there's no healthy run AND we're in recovery window.
+              // A completed failure with recent timestamp is treated as "ran today"
+              // to avoid immediate re-dispatch loops (watchdog will check next cycle).
+              if (run.status === 'completed' && run.conclusion === 'failure') {
+                const runAge = (now - new Date(run.updated_at)) / 1000 / 60; // minutes
+                // If failure is very recent (< 5 min), give it a grace period before re-dispatch
+                if (runAge < 5) {
+                  return true;  // treat as "still settling"
+                }
+                return false;  // allow re-dispatch after 5 min
               }
 
               return false;
@@ -173,7 +190,15 @@ jobs:
             // AM workflow only verifies the prep result; it does NOT run prep
             let prepRun = null;
             let prepOk = false;
-            if (nowEt >= workflows.prep.checkWindow[0] && nowEt <= workflows.prep.checkWindow[1]) {
+            const inPrepWindow = nowEt >= workflows.prep.checkWindow[0] && nowEt <= workflows.prep.checkWindow[1];
+            const inAmWindow = nowEt >= workflows.am.checkWindow[0] && nowEt <= workflows.am.checkWindow[1];
+            const inAfternoonWindow = nowEt >= workflows.afternoon.checkWindow[0] && nowEt <= workflows.afternoon.checkWindow[1];
+
+            core.info(
+              `[US_WATCHDOG][CHECK] now_et=${nowEt} in_prep_window=${inPrepWindow} in_am_window=${inAmWindow} in_afternoon_window=${inAfternoonWindow}`
+            );
+
+            if (inPrepWindow) {
               prepRun = await getLatestRunToday('us-trade-prep.yml');
               prepOk = isHealthyRun(prepRun);
 
@@ -184,23 +209,28 @@ jobs:
                 await dispatchWorkflow('prep', workflows.prep);
               } else {
                 core.info(
-                  `[US_WATCHDOG][SKIP] phase=prep reason=already_ran status=${runStatus(prepRun)} conclusion=${runConclusion(prepRun)}`
+                  `[US_WATCHDOG][SKIP] phase=prep reason=healthy_session_exists status=${runStatus(prepRun)} conclusion=${runConclusion(prepRun)}`
                 );
               }
             } else {
               // Outside prep window: just fetch current status for AM gate
               prepRun = await getLatestRunToday('us-trade-prep.yml');
               prepOk = isHealthyRun(prepRun);
+              if (!inAmWindow && !inAfternoonWindow) {
+                core.info(
+                  `[US_WATCHDOG][SKIP] phase=prep reason=outside_recovery_window now_et=${nowEt} window=${workflows.prep.checkWindow[0]}-${workflows.prep.checkWindow[1]}`
+                );
+              }
             }
 
-            // Check AM (08:20~09:20 ET) - only dispatch if prep is healthy
-            if (nowEt >= workflows.am.checkWindow[0] && nowEt <= workflows.am.checkWindow[1]) {
+            // Check AM (09:35~11:30 ET) - only dispatch if prep is healthy
+            if (inAmWindow) {
               const amRun = await getLatestRunToday('us-trade-am.yml');
               const amHealthy = isHealthyRun(amRun);
 
               if (!amHealthy && prepOk) {
                 core.info(
-                  `[US_WATCHDOG][CHECK] phase=am found=0 prep_ok=1 status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                  `[US_WATCHDOG][CHECK] phase=am found=${amRun ? 1 : 0} prep_ok=1 status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
                 );
                 await dispatchWorkflow('am', workflows.am);
               } else if (!prepOk) {
@@ -209,13 +239,17 @@ jobs:
                 );
               } else {
                 core.info(
-                  `[US_WATCHDOG][SKIP] phase=am reason=already_ran status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
+                  `[US_WATCHDOG][SKIP] phase=am reason=healthy_session_exists status=${runStatus(amRun)} conclusion=${runConclusion(amRun)}`
                 );
               }
+            } else if (!inPrepWindow && !inAfternoonWindow) {
+              core.info(
+                `[US_WATCHDOG][SKIP] phase=am reason=outside_recovery_window now_et=${nowEt} window=${workflows.am.checkWindow[0]}-${workflows.am.checkWindow[1]}`
+              );
             }
 
             // Check Afternoon (12:35~15:20 ET)
-            if (nowEt >= workflows.afternoon.checkWindow[0] && nowEt <= workflows.afternoon.checkWindow[1]) {
+            if (inAfternoonWindow) {
               const afternoonRun = await getLatestRunToday('us-trade-afternoon.yml');
               const afternoonHealthy = isHealthyRun(afternoonRun);
 
@@ -224,15 +258,22 @@ jobs:
 
               if (!afternoonHealthy && amOk) {
                 core.info(
-                  `[US_WATCHDOG][CHECK] phase=afternoon found=0 am_ok=1 status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
+                  `[US_WATCHDOG][CHECK] phase=afternoon found=${afternoonRun ? 1 : 0} am_ok=1 status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
                 );
                 await dispatchWorkflow('afternoon', workflows.afternoon);
-              } else {
-                const skipReason = !amOk ? 'am_not_ok' : 'already_ran';
+              } else if (!amOk) {
                 core.info(
-                  `[US_WATCHDOG][SKIP] phase=afternoon reason=${skipReason} am_ok=${amOk ? 1 : 0} status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
+                  `[US_WATCHDOG][SKIP] phase=afternoon reason=am_not_ok am_status=${runStatus(amRun)} am_conclusion=${runConclusion(amRun)}`
+                );
+              } else {
+                core.info(
+                  `[US_WATCHDOG][SKIP] phase=afternoon reason=healthy_session_exists status=${runStatus(afternoonRun)} conclusion=${runConclusion(afternoonRun)}`
                 );
               }
+            } else if (!inPrepWindow && !inAmWindow) {
+              core.info(
+                `[US_WATCHDOG][SKIP] phase=afternoon reason=outside_recovery_window now_et=${nowEt} window=${workflows.afternoon.checkWindow[0]}-${workflows.afternoon.checkWindow[1]}`
+              );
             }
 
             core.info('[US_WATCHDOG][DONE]');

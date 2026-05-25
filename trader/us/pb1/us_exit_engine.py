@@ -343,7 +343,14 @@ def generate_exit_intents(
     hold_explanations: list[dict] = []
 
     if not positions:
+        logger.info("[US_EXIT][NO_SIGNAL] positions=0")
         return intents
+
+    logger.info("[US_EXIT][EVAL][START] positions=%d", len(positions))
+
+    skipped_price_fetch_failed: int = 0
+    skipped_price_nonpositive: int = 0
+    hold_count: int = 0
 
     for pos in positions:
         symbol = pos.get("symbol", "")
@@ -364,9 +371,12 @@ def generate_exit_intents(
             current_price = float(price_data.get("last", 0))
         except Exception as exc:
             logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
+            skipped_price_fetch_failed += 1
             continue
 
         if current_price <= 0:
+            logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
+            skipped_price_nonpositive += 1
             continue
 
         # book/horizon 기반 router 사용 — SWING vs DAY 분리
@@ -408,6 +418,26 @@ def generate_exit_intents(
             
             # Log WHY_HOLD
             log_us_exit_decision(symbol, "HOLD", hold_explanation)
+            hold_count += 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Skip/Hold Summary for Observability
+    # ─────────────────────────────────────────────────────────────────────────
+    exit_intents_count = len(intents)
+    logger.info(
+        "[US_EXIT][SKIP_SUMMARY] "
+        "positions_total=%d evaluated=%d exit_intents=%d hold=%d "
+        "skipped_price_fetch_failed=%d skipped_price_nonpositive=%d",
+        len(positions),
+        len(positions) - skipped_price_fetch_failed - skipped_price_nonpositive,
+        exit_intents_count,
+        hold_count,
+        skipped_price_fetch_failed,
+        skipped_price_nonpositive,
+    )
+    if exit_intents_count == 0:
+        logger.info("[US_EXIT][NO_SIGNAL] no exit intents generated positions=%d", len(positions))
+    logger.info("[US_EXIT][INTENTS] count=%d", exit_intents_count)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Explanation Quality Validation

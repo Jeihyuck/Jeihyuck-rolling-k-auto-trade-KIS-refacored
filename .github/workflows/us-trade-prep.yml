@@ -5,24 +5,10 @@ name: "US Trade Prep"
 
 "on":
   schedule:
-    # EDT path: 06:57~08:17 ET
-    - cron: "57 10 * * 1-5"  # 06:57 EDT
-    - cron: "07 11 * * 1-5"  # 07:07 EDT
-    - cron: "17 11 * * 1-5"  # 07:17 EDT
-    - cron: "27 11 * * 1-5"  # 07:27 EDT
-    - cron: "37 11 * * 1-5"  # 07:37 EDT
-    - cron: "47 11 * * 1-5"  # 07:47 EDT
-    - cron: "07 12 * * 1-5"  # 08:07 EDT
-    - cron: "17 12 * * 1-5"  # 08:17 EDT
-    # EST path: 06:57~08:17 ET
-    - cron: "57 11 * * 1-5"  # 06:57 EST
-    - cron: "07 12 * * 1-5"  # 07:07 EST
-    - cron: "17 12 * * 1-5"  # 07:17 EST
-    - cron: "27 12 * * 1-5"  # 07:27 EST
-    - cron: "37 12 * * 1-5"  # 07:37 EST
-    - cron: "47 12 * * 1-5"  # 07:47 EST
-    - cron: "07 13 * * 1-5"  # 08:07 EST
-    - cron: "17 13 * * 1-5"  # 08:17 EST
+    # EDT 07:00 ET = 11:00 UTC (primary_once)
+    - cron: "0 11 * * 1-5"   # 07:00 EDT
+    # EST 07:00 ET = 12:00 UTC (primary_once)
+    - cron: "0 12 * * 1-5"   # 07:00 EST
   workflow_dispatch:
     inputs:
       dry_run:

@@ -5,26 +5,10 @@ name: "US Trade AM"
 
 "on":
   schedule:
-    # EDT path: 08:03~09:23 ET
-    - cron: "03 12 * * 1-5"  # 08:03 EDT
-    - cron: "13 12 * * 1-5"  # 08:13 EDT
-    - cron: "23 12 * * 1-5"  # 08:23 EDT
-    - cron: "33 12 * * 1-5"  # 08:33 EDT
-    - cron: "43 12 * * 1-5"  # 08:43 EDT
-    - cron: "53 12 * * 1-5"  # 08:53 EDT
-    - cron: "03 13 * * 1-5"  # 09:03 EDT
-    - cron: "13 13 * * 1-5"  # 09:13 EDT
-    - cron: "23 13 * * 1-5"  # 09:23 EDT
-    # EST path: 08:03~09:23 ET
-    - cron: "03 13 * * 1-5"  # 08:03 EST
-    - cron: "13 13 * * 1-5"  # 08:13 EST
-    - cron: "23 13 * * 1-5"  # 08:23 EST
-    - cron: "33 13 * * 1-5"  # 08:33 EST
-    - cron: "43 13 * * 1-5"  # 08:43 EST
-    - cron: "53 13 * * 1-5"  # 08:53 EST
-    - cron: "03 14 * * 1-5"  # 09:03 EST
-    - cron: "13 14 * * 1-5"  # 09:13 EST
-    - cron: "23 14 * * 1-5"  # 09:23 EST
+    # EDT 08:15 ET = 12:15 UTC (primary_once)
+    - cron: "15 12 * * 1-5"  # 08:15 EDT
+    # EST 08:15 ET = 13:15 UTC (primary_once)
+    - cron: "15 13 * * 1-5"  # 08:15 EST
   workflow_dispatch:
     inputs:
       dry_run:
@@ -328,6 +312,8 @@ jobs:
             echo "[US_TRADE_AM][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[US_TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=0930-1230"
             echo "[US_TRADE_AM][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
+            echo "[US_TRADE_AM][CONCURRENCY_META] group=us-trade-am-${GITHUB_REF_NAME} cancel_in_progress=true schedule_mode=primary_once crons=2"
+            echo "[US_TRADE_AM][SCHEDULE_MODE] mode=primary_once crons=2 reason=edt_est_dualcron watchdog_recovery=enabled"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -893,89 +879,39 @@ jobs:
           FORCE_NOW_INPUT: ${{ inputs.force_now || '' }}
         run: |
           set -euo pipefail
-          latest_json="reports/us_daily/latest_us_daily_report.json"
-          latest_md="reports/us_daily/latest_us_daily_report.md"
-          [ -f "${latest_json}" ] || { echo "::error::missing latest US report json"; exit 1; }
-          [ -f "${latest_md}" ] || { echo "::error::missing latest US report md"; exit 1; }
 
           # Trim force_now input
           FORCE_NOW_TRIMMED=$(echo "${FORCE_NOW_INPUT}" | xargs)
 
           # Determine expected trade_date
           if [ -n "${FORCE_NOW_TRIMMED}" ]; then
-            # force_now가 있으면 그 날짜를 사용
-            trade_date=$(python3 -c "import sys; from datetime import datetime; dt = datetime.fromisoformat('${FORCE_NOW_TRIMMED}'); print(dt.strftime('%Y-%m-%d')); sys.stderr.write('[US_REPORT_VALIDATE][EXPECTED_DATE] source=force_now trade_date=' + dt.strftime('%Y-%m-%d') + '\n')")
+            trade_date=$(python3 -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_TRIMMED}').strftime('%Y-%m-%d'))")
+            echo "[US_REPORT_VALIDATE][EXPECTED_DATE] source=force_now trade_date=${trade_date}"
           else
-            # force_now가 없으면 현재 NY 날짜 사용
             trade_date=$(python3 -c "from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo('America/New_York')).strftime('%Y-%m-%d'))")
-            echo "[US_REPORT_VALIDATE][EXPECTED_DATE] source=now_ny trade_date=${trade_date}" >&2
+            echo "[US_REPORT_VALIDATE][EXPECTED_DATE] source=now_ny trade_date=${trade_date}"
           fi
 
-          # Validate report contract
-          python3 - <<'EOF'
-          import json
-          import sys
-          from pathlib import Path
-          
-          latest_json = Path("reports/us_daily/latest_us_daily_report.json")
-          payload = json.loads(latest_json.read_text())
-          
-          # Expected values
-          expected = {
-              "trade_date": "${trade_date}",
-              "run_id": "${GITHUB_RUN_ID}",
-              "dry_run": "${DRY_RUN}" == "1"
-          }
-          
-          # Validate trade_date, run_id, dry_run
-          errs = []
-          if str(payload.get("trade_date")) != expected["trade_date"]:
-              errs.append(f"trade_date mismatch: {payload.get('trade_date')} != {expected['trade_date']}")
-          if str(payload.get("run_id")) != expected["run_id"]:
-              errs.append(f"run_id mismatch: {payload.get('run_id')} != {expected['run_id']}")
-          if bool(payload.get("dry_run")) != expected["dry_run"]:
-              errs.append(f"dry_run mismatch: {payload.get('dry_run')} != {expected['dry_run']}")
-          
-          if errs:
-              print("::error::stale_or_invalid_us_report")
-              for e in errs:
-                  print(f"::error::{e}")
-              sys.exit(1)
-          
-          # Validate required fields
-          required = [
-              "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
-              "dry_run", "kis_order_allowed", "prep_status", "locked_watchlist_count",
-              "entry_eval_status", "entry_error_type", "entry_error_message",
-              "entry_intents", "orders_sent", "orders_blocked", "block_reasons",
-              "fills", "positions", "last_stage", "final_status", "reason"
-          ]
-          miss = [k for k in required if k not in payload]
-          if miss:
-              print(f"::error::missing_report_fields {miss}")
-              sys.exit(1)
-          
-          # Validate final_status is in allowed list
-          allowed_statuses = [
-              "FAILED_PREP_GUARD",
-              "SKIP_PHASE_WINDOW",
-              "NO_ENTRY_INTENTS",
-              "NO_ORDERS_RISK_BLOCKED",
-              "PARTIAL_ORDERS_BLOCKED",
-              "OK_NO_TRADE",
-              "OK_ORDERS_SENT",
-              "OK_WITH_WARNINGS",
-              "FAILED"
-          ]
-          final_status = payload.get("final_status")
-          if final_status not in allowed_statuses:
-              print(f"::error::invalid_final_status: {final_status}")
-              sys.exit(1)
-          
-          print(f"[US_REPORT][VALID] latest report contract satisfied, final_status={final_status}")
-          EOF
-          
-          python3 -c "import json; from pathlib import Path; payload = json.loads(Path('reports/us_daily/latest_us_daily_report.json').read_text()); Path('artifacts/us_last_stage.txt').write_text(str(payload.get('last_stage', 'unknown')) + '\n')"
+          # Ensure report file exists before calling validator
+          if [ ! -f "reports/us_daily/latest_us_daily_report.json" ]; then
+            echo "::error::missing latest US report json — report was never written"
+            echo "[US_REPORT_VALIDATE][FAIL] session=am reason=report_file_missing"
+            exit 1
+          fi
+
+          # Run standalone validator (exits 0 for warnings, 1 for fatal)
+          python3 scripts/validate_us_daily_report.py \
+            --report reports/us_daily/latest_us_daily_report.json \
+            --expected-trade-date "${trade_date}" \
+            --expected-run-id "${GITHUB_RUN_ID}" \
+            --expected-dry-run "${DRY_RUN}" \
+            --session am 2>&1 | tee -a artifacts/${US_LOG_FILE}
+          validator_exit=${PIPESTATUS[0]}
+
+          # Write last_stage artifact (best effort)
+          python3 -c "import json; from pathlib import Path; payload = json.loads(Path('reports/us_daily/latest_us_daily_report.json').read_text()); Path('artifacts/us_last_stage.txt').write_text(str(payload.get('last_stage', 'unknown')) + '\n')" 2>/dev/null || true
+
+          exit "${validator_exit}"
 
       - name: Verify US AM log contract
         if: always()

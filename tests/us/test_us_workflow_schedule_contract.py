@@ -51,29 +51,29 @@ def repos_text():
 # ---------------------------------------------------------------------------
 
 def test_prep_has_multiple_crons(prep_text):
-    """us-trade-prep.yml cron 스케줄이 8개 이상이어야 한다 (EDT + EST 각 8개)."""
+    """us-trade-prep.yml cron 스케줄이 2개 이상이어야 한다 (EDT + EST dual-cron)."""
     cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", prep_text)
-    assert len(cron_matches) >= 8, (
-        f"us-trade-prep.yml cron 수={len(cron_matches)} < 8. "
-        "EDT/EST 다중화 cron이 추가됐는지 확인하세요."
+    assert len(cron_matches) >= 2, (
+        f"us-trade-prep.yml cron 수={len(cron_matches)} < 2. "
+        "EDT/EST dual-cron이 설정됐는지 확인하세요."
     )
 
 
 def test_am_has_multiple_crons(am_text):
-    """us-trade-am.yml cron 스케줄이 9개 이상이어야 한다 (EDT 9개)."""
+    """us-trade-am.yml cron 스케줄이 2개 이상이어야 한다 (EDT + EST dual-cron)."""
     cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", am_text)
-    assert len(cron_matches) >= 9, (
-        f"us-trade-am.yml cron 수={len(cron_matches)} < 9. "
-        "다중화 cron이 추가됐는지 확인하세요."
+    assert len(cron_matches) >= 2, (
+        f"us-trade-am.yml cron 수={len(cron_matches)} < 2. "
+        "EDT/EST dual-cron이 설정됐는지 확인하세요."
     )
 
 
 def test_afternoon_has_multiple_crons(afternoon_text):
-    """us-trade-afternoon.yml cron 스케줄이 6개 이상이어야 한다 (EDT 6개)."""
+    """us-trade-afternoon.yml cron 스케줄이 2개 이상이어야 한다 (EDT + EST dual-cron)."""
     cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", afternoon_text)
-    assert len(cron_matches) >= 6, (
-        f"us-trade-afternoon.yml cron 수={len(cron_matches)} < 6. "
-        "다중화 cron이 추가됐는지 확인하세요."
+    assert len(cron_matches) >= 2, (
+        f"us-trade-afternoon.yml cron 수={len(cron_matches)} < 2. "
+        "EDT/EST dual-cron이 설정됐는지 확인하세요."
     )
 
 
