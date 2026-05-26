@@ -414,9 +414,60 @@ def _make_flow_provider(engine):
     return _provider
 
 def _pick_as_of_date_always_prev() -> date:
-    """PREP as_of 결정: AS_OF_OVERRIDE 우선, 없으면 전 거래일."""
-    trade_ctx = resolve_trade_context(now=now_kst())
-    return date.fromisoformat(str(trade_ctx["as_of"]))
+    """PREP as_of 결정: AS_OF_OVERRIDE 우선, 없으면 KRX 기준 전 실제 거래일.
+
+    AS_OF_OVERRIDE가 지정된 경우:
+      - 해당 날짜가 KRX 실제 거래일인지 검증한다.
+      - 휴장일이면 즉시 실패한다.
+
+    AS_OF_OVERRIDE가 없는 경우:
+      - KRX canonical resolver (time_utils.is_krx_trading_day + resolve_prev_krx_trading_day)를 사용한다.
+      - weekday 단순 계산에 의존하지 않는다.
+    """
+    from trader.time_utils import is_krx_trading_day, resolve_prev_krx_trading_day  # noqa: F401 (avoid circular at module level)
+
+    now_ts = now_kst()
+    as_of_override_raw = (os.getenv("AS_OF_OVERRIDE") or "").strip()
+    strategy_env = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower()
+
+    if as_of_override_raw:
+        try:
+            override_date = date.fromisoformat(as_of_override_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"[PREP][ASOF] invalid AS_OF_OVERRIDE format: {as_of_override_raw}"
+            ) from exc
+
+        if not is_krx_trading_day(override_date):
+            raise ValueError(
+                f"[PREP][AS_OF_OVERRIDE_INVALID] "
+                f"date={override_date.isoformat()} is NOT a KRX trading day (weekend or holiday). "
+                f"Do not set AS_OF_OVERRIDE to a market holiday."
+            )
+
+        logger.info(
+            "[PREP][ASOF_RESOLVED] now_kst=%s run_date=%s actual_as_of=%s "
+            "source=AS_OF_OVERRIDE is_override=1 strategy_env=%s",
+            now_ts.isoformat(),
+            now_ts.date().isoformat(),
+            override_date.isoformat(),
+            strategy_env,
+        )
+        return override_date
+
+    # KRX canonical resolver: 직전 실제 거래일
+    run_date = now_ts.date()
+    actual_as_of = resolve_prev_krx_trading_day(run_date)
+
+    logger.info(
+        "[PREP][ASOF_RESOLVED] now_kst=%s run_date=%s actual_as_of=%s "
+        "source=KRX_CANONICAL is_override=0 strategy_env=%s",
+        now_ts.isoformat(),
+        run_date.isoformat(),
+        actual_as_of.isoformat(),
+        strategy_env,
+    )
+    return actual_as_of
 
 
 def get_required_history_days(strategy_name: str) -> int:

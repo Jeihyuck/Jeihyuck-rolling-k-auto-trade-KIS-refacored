@@ -130,6 +130,146 @@ def _upsert_duplicate_ready_event(
         return None
 
 
+def _print_prep_owner_info(
+    *,
+    env: str,
+    as_of: str,
+    final30_count: int,
+    canonical_status: str,
+) -> None:
+    """Prep duplicate guard blocked 시 owner 정보를 출력한다."""
+    current_workflow = os.getenv("GITHUB_WORKFLOW", "unknown")
+    current_run_id = os.getenv("GITHUB_RUN_ID", "unknown")
+    current_job = os.getenv("GITHUB_JOB", "unknown")
+    current_started_at = os.getenv("GITHUB_RUN_STARTED_AT", "unknown")
+
+    print(
+        "[PREP][DUPLICATE_GUARD][BLOCKED] "
+        f"current_workflow={current_workflow} "
+        f"current_run_id={current_run_id} "
+        f"current_job={current_job} "
+        f"current_started_at={current_started_at} "
+        f"reason=canonical_prep_already_ready"
+    )
+
+    # DB에서 가장 최근 PREP_DONE 이벤트를 owner로 조회한다
+    try:
+        engine = get_engine()
+        from sqlalchemy import text
+
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT
+                        strategy,
+                        as_of,
+                        event_type,
+                        status,
+                        workflow_run_id,
+                        workflow_attempt,
+                        git_sha,
+                        created_at,
+                        updated_at
+                    FROM ledger_events
+                    WHERE env = :env
+                      AND as_of::text = :as_of
+                      AND event_type = 'PREP_DONE'
+                      AND status = 'READY_FROM_CANONICAL'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"env": env, "as_of": as_of},
+            ).fetchone()
+
+        if row:
+            owner_run_id = row[4] or "unknown"
+            owner_attempt = row[5] or "unknown"
+            owner_git_sha = (str(row[6] or "")[:8]) or "unknown"
+            owner_created_at = str(row[7] or "unknown")
+            owner_updated_at = str(row[8] or "unknown")
+            print(
+                "[PREP][DUPLICATE_GUARD][OWNER] "
+                f"lock_name=prep:{env}:{as_of} "
+                f"owner_workflow={current_workflow} "
+                f"owner_run_id={owner_run_id} "
+                f"owner_job=prep "
+                f"owner_attempt={owner_attempt} "
+                f"owner_git_sha={owner_git_sha} "
+                f"owner_created_at={owner_created_at} "
+                f"owner_updated_at={owner_updated_at} "
+                f"current_workflow={current_workflow} "
+                f"current_run_id={current_run_id} "
+                f"current_job={current_job} "
+                f"current_started_at={current_started_at} "
+                f"as_of={as_of} final30_count={final30_count} "
+                f"canonical_status={canonical_status} "
+                f"reason=canonical_prep_already_ready"
+            )
+        else:
+            print(
+                "[PREP][DUPLICATE_GUARD][OWNER] "
+                f"lock_name=prep:{env}:{as_of} "
+                f"owner_run_id=unknown "
+                f"owner_job=unknown "
+                f"current_workflow={current_workflow} "
+                f"current_run_id={current_run_id} "
+                f"current_job={current_job} "
+                f"as_of={as_of} final30_count={final30_count} "
+                f"canonical_status={canonical_status} "
+                f"reason=canonical_prep_already_ready_no_ledger_row"
+            )
+
+        # Stale check: 마지막 prep 이후 경과 시간 확인
+        with engine.connect() as conn:
+            stale_row = conn.execute(
+                text(
+                    """
+                    SELECT
+                        created_at,
+                        EXTRACT(EPOCH FROM (NOW() - created_at))::int AS age_sec
+                    FROM ledger_events
+                    WHERE env = :env
+                      AND as_of::text = :as_of
+                      AND event_type = 'PREP_DONE'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"env": env, "as_of": as_of},
+            ).fetchone()
+
+        stale_threshold_sec = int(os.getenv("PREP_STALE_THRESHOLD_SEC", "7200"))  # 2h default
+        if stale_row and stale_row[1] is not None:
+            lock_age_sec = int(stale_row[1])
+            is_stale = lock_age_sec > stale_threshold_sec
+            print(
+                "[PREP][DUPLICATE_GUARD][STALE_CHECK] "
+                f"lock_age_sec={lock_age_sec} "
+                f"stale_threshold_sec={stale_threshold_sec} "
+                f"is_stale={int(is_stale)}"
+            )
+        else:
+            print(
+                "[PREP][DUPLICATE_GUARD][STALE_CHECK] "
+                f"lock_age_sec=unknown stale_threshold_sec={stale_threshold_sec} is_stale=0"
+            )
+
+    except Exception as exc:
+        logger.warning(
+            "[PREP][DUPLICATE_GUARD][OWNER_LOOKUP_FAIL] err=%s", exc
+        )
+        print(
+            "[PREP][DUPLICATE_GUARD][OWNER] "
+            f"lock_name=prep:{env}:{as_of} "
+            f"owner_run_id=lookup_failed "
+            f"current_workflow={current_workflow} "
+            f"current_run_id={current_run_id} "
+            f"reason=owner_lookup_failed err={exc}"
+        )
+
+
 def main() -> int:
     env = (os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice").strip().lower() or "practice"
     strategy = os.getenv("WATCHLIST_FINAL_STRATEGY_KEY") or "pb1_watchlist_final_scored"
@@ -161,6 +301,13 @@ def main() -> int:
     )
 
     if should_skip:
+        # --- owner 정보 조회 및 출력 ---
+        _print_prep_owner_info(
+            env=env,
+            as_of=as_of,
+            final30_count=final30_count,
+            canonical_status=canonical_status,
+        )
         _upsert_duplicate_ready_event(
             env=env,
             as_of=as_of,

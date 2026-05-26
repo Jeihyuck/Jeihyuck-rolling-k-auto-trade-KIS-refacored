@@ -365,6 +365,7 @@ jobs:
         run: |
           set -euo pipefail
           dow="$(TZ=Asia/Seoul date +%u)"  # 1=Mon ... 7=Sun
+          today_kst="$(TZ=Asia/Seoul date +%Y-%m-%d)"
           is_trading_day=1
           reason=""
 
@@ -373,11 +374,29 @@ jobs:
             reason="weekend"
           fi
 
+          # KRX 휴장일 체크 (config/krx_holidays.json 기반 inline 목록)
+          # 이 목록은 checkout 이전에 실행되므로 bash inline으로 체크한다.
+          # 보다 정확한 체크는 checkout 이후 verify_final30 Python 단계에서 수행한다.
+          if [[ "$is_trading_day" == "1" ]]; then
+            KRX_HOLIDAYS_2025="2025-01-01 2025-01-27 2025-01-28 2025-01-29 2025-01-30 2025-03-03 2025-05-05 2025-05-06 2025-06-06 2025-08-15 2025-10-03 2025-10-06 2025-10-07 2025-10-08 2025-10-09 2025-12-25 2025-12-31"
+            KRX_HOLIDAYS_2026="2026-01-01 2026-02-16 2026-02-17 2026-02-18 2026-03-02 2026-05-05 2026-05-25 2026-08-17 2026-09-24 2026-09-25 2026-10-05 2026-10-09 2026-12-25 2026-12-31"
+            KRX_HOLIDAYS_2027="2027-01-01 2027-02-08 2027-02-09 2027-02-10 2027-03-01 2027-05-05 2027-05-13 2027-06-07 2027-08-16 2027-09-20 2027-09-21 2027-09-22 2027-10-04 2027-12-27 2027-12-31"
+            ALL_HOLIDAYS="${KRX_HOLIDAYS_2025} ${KRX_HOLIDAYS_2026} ${KRX_HOLIDAYS_2027}"
+            for h in $ALL_HOLIDAYS; do
+              if [[ "$today_kst" == "$h" ]]; then
+                is_trading_day=0
+                reason="krx_holiday"
+                echo "[TIME][KRX][HOLIDAY] date=${today_kst} reason=KRX_HOLIDAY source=workflow_inline"
+                break
+              fi
+            done
+          fi
+
           echo "is_trading_day=${is_trading_day}" >> "$GITHUB_OUTPUT"
           echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "today_kst=${today_kst}" >> "$GITHUB_OUTPUT"
 
-          echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason}"
-          echo "[TRADING_DAY_GUARD][TODO] krx_holiday_detection_not_wired workflow_guard=weekend_only order_allowed=$([[ \"$is_trading_day\" == \"1\" ]] && echo 1 || echo 0) compute_only=$([[ \"$is_trading_day\" == \"1\" ]] && echo 0 || echo 1)"
+          echo "[TRADING_DAY_GUARD] is_trading_day=${is_trading_day} reason=${reason} date=${today_kst}"
 
       - name: Resolve order mode guard
         id: order_mode_guard
@@ -531,31 +550,79 @@ jobs:
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
       - name: Verify exact scored final30 in DB
+        id: verify_final30
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
+          set +e  # 실패해도 이 단계에서 종료하지 않음 – outputs로 전달 후 assert 단계에서 실패 처리
+          python - <<'PY' 2>&1 | tee -a artifacts/trade-am.log
+          import os, sys
           from trader.db.engine import get_engine
           from trader.db.repos import load_final30_scored_db_only
-          from trader.time_utils import now_kst, resolve_trade_context
+          from trader.time_utils import now_kst, is_krx_trading_day, resolve_prev_krx_trading_day
 
           env = os.getenv("STRATEGY_ENV", "practice")
-          ctx = resolve_trade_context(now=now_kst(), env=env)
-          df = load_final30_scored_db_only(
-              get_engine(),
-              env=env,
-              strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"),
-              as_of=ctx["as_of"],
-              require_exact_rows=30,
-              fail_if_missing=True,
-          )
-          print(f"[TRADE][FINAL30][DB_EXACT_LOAD] rows={len(df)} as_of={ctx['as_of']} session=am")
+          today = now_kst().date()
+          as_of_override = (os.getenv("AS_OF_OVERRIDE") or "").strip()
+
+          if as_of_override:
+              from datetime import date
+              expected_as_of = date.fromisoformat(as_of_override)
+          else:
+              expected_as_of = resolve_prev_krx_trading_day(today)
+
+          expected_as_of_str = expected_as_of.isoformat()
+          output_path = os.getenv("GITHUB_OUTPUT", "")
+
+          def _write_output(name, value):
+              if output_path:
+                  with open(output_path, "a") as f:
+                      f.write(f"{name}={value}\n")
+
+          # KRX 거래일 재검증
+          if not is_krx_trading_day(today):
+              print(f"[TRADE_AM][PREP_VERIFY][NON_TRADING] today={today} is_krx_trading_day=0")
+              _write_output("prep_ready", "0")
+              _write_output("expected_as_of", expected_as_of_str)
+              _write_output("final30_rows", "0")
+              _write_output("skip_reason", "NON_TRADING_DAY")
+              sys.exit(0)
+
+          try:
+              df = load_final30_scored_db_only(
+                  get_engine(),
+                  env=env,
+                  strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+                  as_of=expected_as_of_str,
+                  require_exact_rows=30,
+                  fail_if_missing=False,
+              )
+              rows = len(df) if df is not None and not df.empty else 0
+          except Exception as exc:
+              print(f"[TRADE_AM][PREP_VERIFY][FAIL] expected_as_of={expected_as_of_str} err={exc}")
+              _write_output("prep_ready", "0")
+              _write_output("expected_as_of", expected_as_of_str)
+              _write_output("final30_rows", "0")
+              _write_output("skip_reason", f"DB_ERROR:{type(exc).__name__}")
+              sys.exit(0)
+
+          if rows == 30:
+              print(f"[TRADE_AM][PREP_VERIFY][OK] expected_as_of={expected_as_of_str} rows={rows}")
+              _write_output("prep_ready", "1")
+              _write_output("expected_as_of", expected_as_of_str)
+              _write_output("final30_rows", str(rows))
+              _write_output("skip_reason", "OK")
+          else:
+              print(f"[TRADE_AM][PREP_VERIFY][FAIL] expected_as_of={expected_as_of_str} rows={rows} (expected 30)")
+              _write_output("prep_ready", "0")
+              _write_output("expected_as_of", expected_as_of_str)
+              _write_output("final30_rows", str(rows))
+              _write_output("skip_reason", f"FINAL30_NOT_FOUND:rows={rows}")
           PY
 
       - name: Run AM trade loop
-        if: steps.phase_guard.outputs.should_run == '1'
+        id: am_engine
+        if: ${{ always() && steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready == '1' }}
         timeout-minutes: 245
         working-directory: repo
         env:
@@ -569,9 +636,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          echo "[TRADE_AM][ENGINE_START] cmd=python -m trader.trade_tick as_of=${{ steps.verify_final30.outputs.expected_as_of }} prep_ready=${{ steps.verify_final30.outputs.prep_ready }}" | tee -a artifacts/trade-am.log
           echo "[PHASE][START] phase=am session_window=0900-1255" | tee -a artifacts/trade-am.log
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-am.log
           echo "[PHASE][END] phase=am" | tee -a artifacts/trade-am.log
+          echo "[TRADE_AM][ENGINE_DONE] exit_code=0" | tee -a artifacts/trade-am.log
 
       - name: Generate Portfolio PNL report
         if: always() && steps.phase_guard.outputs.should_run == '1'
@@ -583,10 +652,43 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p reports/portfolio_pnl
+          engine_outcome="${{ steps.am_engine.outcome }}"
+          prep_ready="${{ steps.verify_final30.outputs.prep_ready }}"
+          skip_reason="${{ steps.verify_final30.outputs.skip_reason }}"
+          expected_as_of="${{ steps.verify_final30.outputs.expected_as_of }}"
+          final30_rows="${{ steps.verify_final30.outputs.final30_rows }}"
+          echo "[TRADE_AM][PNL_ONLY_CHECK] engine_outcome=${engine_outcome} prep_ready=${prep_ready} skip_reason=${skip_reason} expected_as_of=${expected_as_of} final30_rows=${final30_rows}" | tee -a artifacts/trade-am.log
           python scripts/generate_portfolio_pnl_report.py 2>&1 | tee -a artifacts/trade-am.log || true
           if [ -f reports/portfolio_pnl/latest_portfolio_pnl.md ]; then
             cat reports/portfolio_pnl/latest_portfolio_pnl.md >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Assert AM engine execution
+        if: always() && steps.phase_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          prep_ready="${{ steps.verify_final30.outputs.prep_ready }}"
+          engine_outcome="${{ steps.am_engine.outcome }}"
+          expected_as_of="${{ steps.verify_final30.outputs.expected_as_of }}"
+          final30_rows="${{ steps.verify_final30.outputs.final30_rows }}"
+          skip_reason="${{ steps.verify_final30.outputs.skip_reason }}"
+
+          echo "[TRADE_AM][ASSERT] is_trading_day=1 prep_ready=${prep_ready} engine_outcome=${engine_outcome} expected_as_of=${expected_as_of} final30_rows=${final30_rows} skip_reason=${skip_reason}" | tee -a artifacts/trade-am.log
+
+          if [[ "${prep_ready}" != "1" ]]; then
+            echo "[TRADE_AM][ASSERT_FAIL] reason=PREP_NOT_READY prep_ready=${prep_ready} skip_reason=${skip_reason} expected_as_of=${expected_as_of} final30_rows=${final30_rows}" | tee -a artifacts/trade-am.log
+            echo "::error::TRADE_AM ASSERT FAIL: KRX trading day but prep_ready=${prep_ready}. skip_reason=${skip_reason}. final30 rows=${final30_rows} for as_of=${expected_as_of}. AM engine was NOT executed."
+            exit 1
+          fi
+
+          if [[ "${engine_outcome}" != "success" ]]; then
+            echo "[TRADE_AM][ASSERT_FAIL] reason=ENGINE_NOT_RUN engine_outcome=${engine_outcome} prep_ready=${prep_ready} expected_as_of=${expected_as_of}" | tee -a artifacts/trade-am.log
+            echo "::error::TRADE_AM ASSERT FAIL: prep_ready=1 but AM engine outcome=${engine_outcome} (not success). PNL-only execution is NOT acceptable."
+            exit 1
+          fi
+
+          echo "[TRADE_AM][ASSERT_OK] engine_ran=1 engine_outcome=${engine_outcome} prep_ready=${prep_ready} expected_as_of=${expected_as_of}" | tee -a artifacts/trade-am.log
 
       - name: Verify AM log contract
         if: steps.phase_guard.outputs.should_run == '1'

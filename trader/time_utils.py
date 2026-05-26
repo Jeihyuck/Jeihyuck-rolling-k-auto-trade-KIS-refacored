@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import io
+import json
 import logging
 import os
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -24,6 +26,182 @@ _NOISY_EXTERNAL_LOGGERS = (
     "requests",
     "urllib3",
 )
+
+# ---------------------------------------------------------------------------
+# KRX Holiday Calendar (fallback when pykrx is unavailable)
+# ---------------------------------------------------------------------------
+
+_KRX_HOLIDAYS_CACHE: set[date] | None = None
+
+
+def _get_krx_holidays_config_path() -> Path:
+    """config/krx_holidays.json 경로 반환 (repo root 기준)."""
+    # time_utils.py → trader/ → repo root
+    candidates = [
+        Path(__file__).parent.parent / "config" / "krx_holidays.json",
+        Path(os.getcwd()) / "config" / "krx_holidays.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "config/krx_holidays.json not found. "
+        "Check that the file exists in the repository root config/ directory."
+    )
+
+
+def _load_krx_holidays() -> set[date]:
+    """config/krx_holidays.json 에서 KRX 휴장일 Set을 로드한다."""
+    global _KRX_HOLIDAYS_CACHE
+    if _KRX_HOLIDAYS_CACHE is not None:
+        return _KRX_HOLIDAYS_CACHE
+
+    try:
+        config_path = _get_krx_holidays_config_path()
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        holidays: set[date] = set()
+        for year_str, date_list in raw.items():
+            if not isinstance(date_list, list):
+                continue
+            for ds in date_list:
+                try:
+                    holidays.add(date.fromisoformat(str(ds)))
+                except (ValueError, TypeError):
+                    logger.warning("[TIME][KRX][CALENDAR_LOAD] invalid date entry=%s", ds)
+        _KRX_HOLIDAYS_CACHE = holidays
+        logger.debug(
+            "[TIME][KRX][CALENDAR_LOAD] loaded %d holidays from %s",
+            len(holidays),
+            config_path,
+        )
+        return holidays
+    except FileNotFoundError:
+        logger.warning(
+            "[TIME][KRX][CALENDAR_FALLBACK] krx_holidays.json not found; "
+            "using empty holiday set (weekday-only heuristic)"
+        )
+        _KRX_HOLIDAYS_CACHE = set()
+        return set()
+    except Exception as exc:
+        logger.warning(
+            "[TIME][KRX][CALENDAR_FALLBACK] failed to load krx_holidays.json: %s; "
+            "using empty holiday set",
+            exc,
+        )
+        _KRX_HOLIDAYS_CACHE = set()
+        return set()
+
+
+def _reload_krx_holidays() -> set[date]:
+    """캐시를 무효화하고 재로드한다 (주로 테스트용)."""
+    global _KRX_HOLIDAYS_CACHE
+    _KRX_HOLIDAYS_CACHE = None
+    return _load_krx_holidays()
+
+
+def is_krx_trading_day(d: date | str) -> bool:
+    """
+    주어진 날짜가 KRX 거래일인지 판정한다.
+
+    판정 순서:
+      1. 주말 → 거래일 아님
+      2. config/krx_holidays.json 휴장일 → 거래일 아님
+      3. pykrx 결과 우선 (성공 시)
+      4. pykrx 실패 → config fallback 결과 사용 (fail-close)
+
+    Returns:
+        True  → KRX 거래일
+        False → 주말 또는 휴장일
+    """
+    if isinstance(d, str):
+        d = date.fromisoformat(d)
+
+    # 1. 주말 체크
+    if d.weekday() >= 5:
+        logger.debug("[TIME][KRX][TRADING_DAY] date=%s is_trading_day=0 reason=WEEKEND", d.isoformat())
+        return False
+
+    # 2. config fallback 휴장일 체크
+    holidays = _load_krx_holidays()
+    if d in holidays:
+        logger.info(
+            "[TIME][KRX][HOLIDAY] date=%s reason=KRX_HOLIDAY source=config",
+            d.isoformat(),
+        )
+        return False
+
+    # 3. pykrx 시도
+    resolved, err_type = _safe_get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
+    if err_type is None and resolved is not None:
+        try:
+            pykrx_date = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
+            is_trading = pykrx_date == d
+            if not is_trading:
+                logger.info(
+                    "[TIME][KRX][HOLIDAY] date=%s reason=PYKRX_NOT_TRADING pykrx_prev=%s",
+                    d.isoformat(),
+                    pykrx_date.isoformat(),
+                )
+            else:
+                logger.debug(
+                    "[TIME][KRX][TRADING_DAY] date=%s is_trading_day=1 source=pykrx",
+                    d.isoformat(),
+                )
+            return is_trading
+        except (ValueError, IndexError):
+            pass
+
+    # 4. pykrx 실패 → config fallback 결과 사용 (d가 holidays에 없으면 거래일로 판정)
+    # 이미 config 체크를 했으므로 여기까지 오면 config에 없는 평일 → 거래일
+    logger.info(
+        "[TIME][KRX][CALENDAR_FALLBACK] date=%s pykrx_err=%s using_config_fallback=1",
+        d.isoformat(),
+        err_type or "UNKNOWN",
+    )
+    logger.debug("[TIME][KRX][TRADING_DAY] date=%s is_trading_day=1 source=config_fallback", d.isoformat())
+    return True
+
+
+def resolve_prev_krx_trading_day(run_date: date | str, *, max_lookback: int = 14) -> date:
+    """
+    기준일 직전 KRX 실제 거래일을 반환한다.
+
+    - 주말 스킵
+    - config/krx_holidays.json 휴장일 스킵
+    - pykrx 사용 가능 시 pykrx 결과 우선
+
+    Args:
+        run_date: 기준 실행일 (이 날 포함하지 않고 직전 거래일 반환)
+        max_lookback: 최대 역방향 탐색 일수 (기본 14일)
+
+    Returns:
+        직전 KRX 거래일 (date 객체)
+
+    Raises:
+        RuntimeError: max_lookback 이내에 거래일을 찾지 못한 경우
+    """
+    if isinstance(run_date, str):
+        run_date = date.fromisoformat(run_date)
+
+    skipped: list[str] = []
+    candidate = run_date - timedelta(days=1)
+
+    for _ in range(max_lookback):
+        if is_krx_trading_day(candidate):
+            logger.info(
+                "[TIME][KRX][PREV_TRADING_DAY] run_date=%s prev=%s skipped=%s",
+                run_date.isoformat(),
+                candidate.isoformat(),
+                ",".join(skipped) if skipped else "none",
+            )
+            return candidate
+        skipped.append(candidate.isoformat())
+        candidate -= timedelta(days=1)
+
+    raise RuntimeError(
+        f"[TIME][KRX][CALENDAR_FAIL_CLOSE] "
+        f"could not find prev trading day within {max_lookback} days of {run_date}"
+    )
 
 
 def now_kst() -> datetime:
@@ -324,6 +502,11 @@ def is_trading_date(
     if trading_day_resolver is not None:
         return trading_day_resolver(d, exchange) == d
 
+    normalized_exchange = (exchange or "KRX").strip().upper()
+    if normalized_exchange == "KRX":
+        return is_krx_trading_day(d)
+
+    # non-KRX: weekday heuristic
     return d.weekday() < 5
 
 
@@ -333,7 +516,7 @@ def resolve_prev_trading_day(
     exchange: str = "KRX",
     trading_day_resolver: Callable[[date, str], date] | None = None,
 ) -> date:
-    """기준 실행일 직전 거래일을 반환한다."""
+    """기준 실행일 직전 KRX 거래일을 반환한다."""
     candidate = run_date - timedelta(days=1)
     if trading_day_resolver is not None:
         return coerce_to_previous_trading_day(
@@ -344,7 +527,10 @@ def resolve_prev_trading_day(
 
     normalized_exchange = (exchange or "KRX").strip().upper()
     if normalized_exchange == "KRX":
-        _resolve_pykrx_previous_or_same(candidate)
+        # KRX canonical resolver: 휴장일 + 주말 모두 스킵
+        return resolve_prev_krx_trading_day(run_date)
+
+    # non-KRX: weekday heuristic
     return _fallback_last_weekday_scan(run_date)
 
 
