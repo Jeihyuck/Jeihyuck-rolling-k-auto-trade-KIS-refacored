@@ -1,9 +1,10 @@
-name: Trade Prep
+name: Trade Prep (KST 06:50)
 
 "on":
   schedule:
-    # Every day 07:00 KST = Every day 22:00 UTC (prev day)
-    - cron: "0 22 * * *"
+    # KST Mon-Fri 06:50 = UTC Sun-Thu 21:50
+    # Avoid top-of-hour GitHub Actions schedule congestion.
+    - cron: "50 21 * * 0-4"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -22,6 +23,7 @@ permissions:
   contents: read
 
 env:
+  EXPECTED_BRANCH: "dual-agent"
   STRATEGY_ENV: practice
   KIS_ENV: practice
   MODE: prep
@@ -92,6 +94,18 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
+      - name: Branch guard
+        run: |
+          set -euo pipefail
+          echo "[BRANCH_GUARD] event=${GITHUB_EVENT_NAME:-} actor=${GITHUB_ACTOR:-} ref=${GITHUB_REF:-} ref_name=${GITHUB_REF_NAME:-} sha=${GITHUB_SHA:-}"
+          echo "[BRANCH_GUARD] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_BRANCH}" ]; then
+            echo "::error::Wrong branch execution blocked. expected=${EXPECTED_BRANCH}, actual=${GITHUB_REF_NAME}"
+            echo "[BRANCH_GUARD][FAIL] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          echo "[BRANCH_GUARD][OK] branch=${GITHUB_REF_NAME} sha=${GITHUB_SHA:-}"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -368,15 +382,19 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Upload debug prep logs
+      - name: Upload prep diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-trade-prep-logs
+          name: prep-diagnostics-${{ github.run_id }}
           path: |
             repo/artifacts/
             repo/runtime/prep/*/prep_manifest.json
             repo/runtime/prep/*/final30_locked.json
             repo/runtime/prep/*/quality-summary.json
             repo/runtime/prep/*/flow-summary.json
+            repo/runtime/**
+            repo/reports/**
+            repo/logs/**
           if-no-files-found: ignore
+          retention-days: 14

@@ -36,6 +36,10 @@ permissions:
 
 env:
   MODE: trade
+  EXPECTED_BRANCH: "dual-agent"
+  PM_ENTRY_ALLOW_UNTIL: "13:30"
+  PM_LATE_START_ACTION: "EXIT_ONLY_NO_NEW_BUY"
+  PM_ALLOW_LATE_NEW_BUY_OVERRIDE: "0"
 
   PB1_MAX_POSITIONS: "30"
   PB1_TARGET_NEW_POSITIONS: "30"
@@ -273,6 +277,18 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
+      - name: Branch guard
+        run: |
+          set -euo pipefail
+          echo "[BRANCH_GUARD] event=${GITHUB_EVENT_NAME:-} actor=${GITHUB_ACTOR:-} ref=${GITHUB_REF:-} ref_name=${GITHUB_REF_NAME:-} sha=${GITHUB_SHA:-}"
+          echo "[BRANCH_GUARD] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_BRANCH}" ]; then
+            echo "::error::Wrong branch execution blocked. expected=${EXPECTED_BRANCH}, actual=${GITHUB_REF_NAME}"
+            echo "[BRANCH_GUARD][FAIL] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          echo "[BRANCH_GUARD][OK] branch=${GITHUB_REF_NAME} sha=${GITHUB_SHA:-}"
+
       - name: Resolve afternoon boot guard
         id: boot_guard
         working-directory: .
@@ -470,12 +486,12 @@ jobs:
           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
           echo "[ENV_CHECK][OK] KIS env contract satisfied" | tee -a artifacts/trade-afternoon.log
 
-      - name: Verify exact scored final30 in DB
+      - name: Verify exact scored final30 in DB with provenance check
         id: verify_final30
         if: steps.boot_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
-          set +e  # 실패해도 이 단계에서 종료하지 않음 – outputs로 전달 후 assert 단계에서 실패 처리
+          set +e
           python - <<'PY' 2>&1 | tee -a artifacts/trade-afternoon.log
           import os, sys
           from trader.db.engine import get_engine
@@ -483,6 +499,7 @@ jobs:
           from trader.time_utils import now_kst, is_krx_trading_day, resolve_prev_krx_trading_day
 
           env = os.getenv("STRATEGY_ENV", "practice")
+          expected_branch = os.getenv("EXPECTED_BRANCH", "dual-agent")
           today = now_kst().date()
           as_of_override = (os.getenv("AS_OF_OVERRIDE") or "").strip()
 
@@ -500,13 +517,13 @@ jobs:
                   with open(output_path, "a") as f:
                       f.write(f"{name}={value}\n")
 
-          # KRX 거래일 재검증
           if not is_krx_trading_day(today):
               print(f"[TRADE_AFTERNOON][PREP_VERIFY][NON_TRADING] today={today} is_krx_trading_day=0")
               _write_output("prep_ready", "0")
               _write_output("expected_as_of", expected_as_of_str)
               _write_output("final30_rows", "0")
               _write_output("skip_reason", "NON_TRADING_DAY")
+              _write_output("late_start_no_buy", "0")
               sys.exit(0)
 
           try:
@@ -525,10 +542,68 @@ jobs:
               _write_output("expected_as_of", expected_as_of_str)
               _write_output("final30_rows", "0")
               _write_output("skip_reason", f"DB_ERROR:{type(exc).__name__}")
+              _write_output("late_start_no_buy", "0")
+              sys.exit(0)
+
+          # Provenance check
+          prep_branch = ""
+          prep_done = 0
+          try:
+              from trader.db.repos import LedgerEventsRepo
+              repo = LedgerEventsRepo(get_engine())
+              ev = repo.get_prep_done_event(env=env, as_of=expected_as_of_str)
+              if ev:
+                  prep_done = 1
+                  prep_branch = str((ev.get("payload_json") or {}).get("producer_branch", ""))
+          except Exception as exc:
+              print(f"[TRADE_AFTERNOON][PREP_DONE_CHECK][FAIL] err={exc}")
+
+          print(f"[TRADE_AFTERNOON][PREP_PROVENANCE][CHECK] expected_branch={expected_branch} final30_branch={prep_branch} prep_done={prep_done}")
+
+          provenance_ok = True
+          if rows == 30 and prep_done == 1 and prep_branch and prep_branch != expected_branch:
+              print(f"[TRADE_AFTERNOON][PREP_PROVENANCE][FAIL] reason=PREP_PROVENANCE_MISMATCH expected={expected_branch} actual={prep_branch}")
+              print(f"[TRADE_AFTERNOON][ORDER_BLOCKED] reason=PREP_PROVENANCE_MISMATCH")
+              provenance_ok = False
+
+          # Late start check
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          KST = ZoneInfo("Asia/Seoul")
+          now_dt = datetime.now(KST)
+          now_hhmm = now_dt.strftime("%H:%M")
+          entry_allow_until = os.getenv("PM_ENTRY_ALLOW_UNTIL", "13:30")
+          allow_h, allow_m = map(int, entry_allow_until.split(":"))
+          allow_min = allow_h * 60 + allow_m
+          now_min = now_dt.hour * 60 + now_dt.minute
+          late_start = now_min > allow_min
+          late_start_no_buy = 0
+          if late_start:
+              late_start_no_buy = 1
+              pm_late_action = os.getenv("PM_LATE_START_ACTION", "EXIT_ONLY_NO_NEW_BUY")
+              allow_override = os.getenv("PM_ALLOW_LATE_NEW_BUY_OVERRIDE", "0")
+              if allow_override == "1":
+                  late_start_no_buy = 0
+              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1")
+              print(f"[TRADE_AFTERNOON][LATE_START_ACTION] action={pm_late_action} entry_enabled=0 exit_enabled=1")
+          else:
+              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=0")
+
+          if not provenance_ok:
+              if env == "practice":
+                  print(f"[TRADE_AFTERNOON][PREP_NOT_READY][POLICY] env=practice action=PNL_ONLY_EXIT_0")
+              _write_output("prep_ready", "0")
+              _write_output("expected_as_of", expected_as_of_str)
+              _write_output("final30_rows", str(rows))
+              _write_output("skip_reason", "PREP_PROVENANCE_MISMATCH")
+              _write_output("late_start_no_buy", str(late_start_no_buy))
+              if env != "practice":
+                  sys.exit(1)
               sys.exit(0)
 
           if rows == 30:
               print(f"[TRADE_AFTERNOON][PREP_VERIFY][OK] expected_as_of={expected_as_of_str} rows={rows}")
+              print(f"[TRADE_AFTERNOON][PREP_PROVENANCE][OK] branch={expected_branch} as_of={expected_as_of_str}")
               _write_output("prep_ready", "1")
               _write_output("expected_as_of", expected_as_of_str)
               _write_output("final30_rows", str(rows))
@@ -539,6 +614,7 @@ jobs:
               _write_output("expected_as_of", expected_as_of_str)
               _write_output("final30_rows", str(rows))
               _write_output("skip_reason", f"FINAL30_NOT_FOUND:rows={rows}")
+          _write_output("late_start_no_buy", str(late_start_no_buy))
           PY
 
       - name: Wait until PM target start
@@ -592,10 +668,18 @@ jobs:
           DISABLE_LIVE_TRADING: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           LIVE_TRADING_ENABLED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
           KIS_HTTP_ENABLED: "1"
+          # [2026-05-27] Late start guard: block new BUY after PM_ENTRY_ALLOW_UNTIL
+          PB1_LATE_START_NO_NEW_BUY: ${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}
+          PB1_PM_LATE_START_NO_BUY_ENABLED: ${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}
         run: |
           set -euo pipefail
+          late_no_buy="${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}"
+          if [[ "$late_no_buy" == "1" ]]; then
+            echo "[TRADE_AFTERNOON][LATE_START_ACTION] action=EXIT_ONLY_NO_NEW_BUY entry_enabled=0 exit_enabled=1" | tee -a artifacts/trade-afternoon.log
+            echo "[ENTRY][BLOCKED] reason=PM_LATE_START_NO_NEW_BUY" | tee -a artifacts/trade-afternoon.log
+          fi
           echo "[TRADE_AFTERNOON][ENGINE_START] cmd=python -m trader.trade_tick phase=pm as_of=${{ steps.verify_final30.outputs.expected_as_of }} prep_ready=${{ steps.verify_final30.outputs.prep_ready }}" | tee -a artifacts/trade-afternoon.log
-          echo "[PHASE][START] phase=pm session_window=1300-1510 entry_enabled=1" | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][START] phase=pm session_window=1300-1510 entry_enabled=$([ \"$late_no_buy\" == \"1\" ] && echo 0 || echo 1)" | tee -a artifacts/trade-afternoon.log
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
           echo "[PHASE][END] phase=pm" | tee -a artifacts/trade-afternoon.log
           echo "[TRADE_AFTERNOON][ENGINE_DONE] exit_code=0 phase=pm" | tee -a artifacts/trade-afternoon.log
@@ -794,15 +878,18 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Upload debug afternoon logs
+      - name: Upload trade diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-trade-afternoon-logs
+          name: trade-diagnostics-${{ github.run_id }}
           path: |
             repo/artifacts/
-            repo/reports/portfolio_pnl/
+            repo/reports/**
+            repo/runtime/**
+            repo/logs/**
           if-no-files-found: ignore
+          retention-days: 14
 
       - name: Assert Afternoon engine execution
         if: always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1'

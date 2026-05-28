@@ -21,7 +21,7 @@ jobs:
       - name: Check and dispatch missing phases
         uses: actions/github-script@v7
         env:
-          WATCHDOG_REF: nullim
+          WATCHDOG_REF: dual-agent
         with:
           script: |
             const timeZone = 'Asia/Seoul';

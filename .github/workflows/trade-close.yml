@@ -167,6 +167,18 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
+      - name: Branch guard
+        run: |
+          set -euo pipefail
+          EXPECTED_BRANCH="dual-agent"
+          echo "[BRANCH_GUARD] event=${GITHUB_EVENT_NAME:-} actor=${GITHUB_ACTOR:-} ref_name=${GITHUB_REF_NAME:-} expected=${EXPECTED_BRANCH}"
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_BRANCH}" ]; then
+            echo "::error::Wrong branch. expected=${EXPECTED_BRANCH}, actual=${GITHUB_REF_NAME}"
+            echo "[BRANCH_GUARD][FAIL] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          echo "[BRANCH_GUARD][OK] branch=${GITHUB_REF_NAME}"
+
       - name: Resolve Close phase guard
         id: phase_guard
         working-directory: .

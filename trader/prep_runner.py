@@ -2043,6 +2043,10 @@ def main() -> int:
         quality_ok=True,
         trade_can_proceed=True,
         run_id=run_id,
+        git_sha=os.getenv("GITHUB_SHA") or None,
+        workflow_run_id=os.getenv("GITHUB_RUN_ID") or None,
+        workflow_attempt=os.getenv("GITHUB_RUN_ATTEMPT") or None,
+        producer_branch=os.getenv("GITHUB_REF_NAME") or None,
     )
     logger.info("[PREP][DONE_CORE][MARKER_OK] as_of=%s", as_of.isoformat())
     logger.info("[PREP][DONE_CORE][DONE] as_of=%s rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
@@ -2887,6 +2891,10 @@ def main() -> int:
             quality_ok=bool(final30_gate_decision["quality_ok"]),
             trade_can_proceed=bool(final30_gate_decision["trade_can_proceed"]),
             run_id=run_id,
+            git_sha=os.getenv("GITHUB_SHA") or None,
+            workflow_run_id=os.getenv("GITHUB_RUN_ID") or None,
+            workflow_attempt=os.getenv("GITHUB_RUN_ATTEMPT") or None,
+            producer_branch=os.getenv("GITHUB_REF_NAME") or None,
         )
         logger.warning(
             "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s status=WARN quality_ok=%s soft_fail=%s trade_can_proceed=%s",
@@ -2910,6 +2918,10 @@ def main() -> int:
             quality_ok=bool(final30_gate_decision["quality_ok"]),
             trade_can_proceed=bool(final30_gate_decision["trade_can_proceed"]),
             run_id=run_id,
+            git_sha=os.getenv("GITHUB_SHA") or None,
+            workflow_run_id=os.getenv("GITHUB_RUN_ID") or None,
+            workflow_attempt=os.getenv("GITHUB_RUN_ATTEMPT") or None,
+            producer_branch=os.getenv("GITHUB_REF_NAME") or None,
         )
         logger.info(
             "[LEDGER_EVENT] event_type=PREP_DONE as_of=%s symbols=%s flow_coverage=%.1f%%",

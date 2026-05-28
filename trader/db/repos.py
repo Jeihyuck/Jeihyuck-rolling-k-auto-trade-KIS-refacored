@@ -4140,6 +4140,7 @@ class LedgerEventsRepo:
         workflow_run_id: str | None = None,
         workflow_attempt: str | None = None,
         git_sha: str | None = None,
+        producer_branch: str | None = None,
         source: str | None = None,
     ) -> str | None:
         env_n = _norm_env(env)
@@ -4177,6 +4178,7 @@ class LedgerEventsRepo:
             "workflow_run_id": workflow_run_id or None,
             "workflow_attempt": workflow_attempt or None,
             "git_sha": git_sha or None,
+            "producer_branch": producer_branch or None,
             "source": source or None,
         }
         stage = "prep_done_check" if reason_s == "ledger_missing_but_final30_canonical_ok" else "prep_duplicate_guard"
@@ -4301,6 +4303,49 @@ class LedgerEventsRepo:
                 )
             if db_store_required:
                 raise
+            return None
+
+    def get_prep_done_event(
+        self,
+        *,
+        env: str,
+        as_of: str,
+        event_type: str = "PREP_DONE",
+    ) -> dict | None:
+        """Return the most recent PREP_DONE ledger event for env/as_of, or None."""
+        env_n = _norm_env(env)
+        event_type_n = str(event_type or "PREP_DONE").strip().upper()
+        try:
+            stmt = (
+                sa.select(
+                    self._schema.ledger_events.c.ledger_event_id,
+                    self._schema.ledger_events.c.payload_json,
+                    self._schema.ledger_events.c.ts,
+                )
+                .where(self._schema.ledger_events.c.env == env_n)
+                .where(self._schema.ledger_events.c.event_type == event_type_n)
+                .where(self._payload_as_of_expr() == as_of)
+                .order_by(self._schema.ledger_events.c.ts.desc())
+                .limit(1)
+            )
+            with self.engine.connect() as conn:
+                row = conn.execute(stmt).mappings().first()
+            if row is None:
+                return None
+            payload_json = dict(row.get("payload_json") or {})
+            return {
+                "ledger_event_id": str(row.get("ledger_event_id")),
+                "ts": row.get("ts"),
+                "payload_json": payload_json,
+            }
+        except Exception as exc:
+            logger.warning(
+                "[DB][LEDGER][GET_PREP_DONE_EVENT][FAIL] env=%s as_of=%s err_type=%s err=%s",
+                env_n,
+                as_of,
+                type(exc).__name__,
+                exc,
+            )
             return None
 
     def get_prep_event(

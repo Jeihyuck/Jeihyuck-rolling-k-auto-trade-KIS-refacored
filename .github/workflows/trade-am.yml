@@ -28,6 +28,13 @@ permissions:
 
 env:
   MODE: trade
+  EXPECTED_BRANCH: "dual-agent"
+  TRADE_AM_WAIT_FOR_PREP: "1"
+  TRADE_AM_PREP_WAIT_UNTIL: "09:25"
+  TRADE_AM_PREP_POLL_INTERVAL_SEC: "30"
+  TRADE_AM_PREP_REQUIRED_FINAL30_N: "30"
+  TRADE_AM_PREP_NOT_READY_POLICY_PRACTICE: "PNL_ONLY_EXIT_0"
+  TRADE_AM_PREP_NOT_READY_POLICY_LIVE: "FAIL_EXIT_1"
   PB1_SESSION_KIND: "am"
   PB1_FORCE_TRADE_SESSION: "am"
 
@@ -268,6 +275,18 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
+      - name: Branch guard
+        run: |
+          set -euo pipefail
+          echo "[BRANCH_GUARD] event=${GITHUB_EVENT_NAME:-} actor=${GITHUB_ACTOR:-} ref=${GITHUB_REF:-} ref_name=${GITHUB_REF_NAME:-} sha=${GITHUB_SHA:-}"
+          echo "[BRANCH_GUARD] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_NAME}" != "${EXPECTED_BRANCH}" ]; then
+            echo "::error::Wrong branch execution blocked. expected=${EXPECTED_BRANCH}, actual=${GITHUB_REF_NAME}"
+            echo "[BRANCH_GUARD][FAIL] expected=${EXPECTED_BRANCH} actual=${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          echo "[BRANCH_GUARD][OK] branch=${GITHUB_REF_NAME} sha=${GITHUB_SHA:-}"
+
       - name: Resolve AM phase guard
         id: phase_guard
         working-directory: .
@@ -549,19 +568,29 @@ jobs:
           [[ "${API_BASE_URL}" == *"openapi"* ]] || { echo "::error::API_BASE_URL invalid"; exit 1; }
           echo "[ENV_CHECK][OK] KIS env contract satisfied"
 
-      - name: Verify exact scored final30 in DB
+      - name: Wait for PREP readiness (poll until 09:25 KST)
         id: verify_final30
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
-          set +e  # 실패해도 이 단계에서 종료하지 않음 – outputs로 전달 후 assert 단계에서 실패 처리
+          set +e
           python - <<'PY' 2>&1 | tee -a artifacts/trade-am.log
-          import os, sys
+          import os, sys, time
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
           from trader.db.engine import get_engine
           from trader.db.repos import load_final30_scored_db_only
           from trader.time_utils import now_kst, is_krx_trading_day, resolve_prev_krx_trading_day
 
+          KST = ZoneInfo("Asia/Seoul")
           env = os.getenv("STRATEGY_ENV", "practice")
+          expected_branch = os.getenv("EXPECTED_BRANCH", "dual-agent")
+          poll_sec = int(os.getenv("TRADE_AM_PREP_POLL_INTERVAL_SEC", "30"))
+          wait_until_hhmm = os.getenv("TRADE_AM_PREP_WAIT_UNTIL", "09:25")
+          wait_until_h, wait_until_m = map(int, wait_until_hhmm.split(":"))
+          deadline_min = wait_until_h * 60 + wait_until_m
+
           today = now_kst().date()
           as_of_override = (os.getenv("AS_OF_OVERRIDE") or "").strip()
 
@@ -573,13 +602,15 @@ jobs:
 
           expected_as_of_str = expected_as_of.isoformat()
           output_path = os.getenv("GITHUB_OUTPUT", "")
+          run_date_str = today.isoformat()
+
+          print(f"[TRADE_AM][DATE_POLICY] run_date={run_date_str} expected_as_of={expected_as_of_str}")
 
           def _write_output(name, value):
               if output_path:
                   with open(output_path, "a") as f:
                       f.write(f"{name}={value}\n")
 
-          # KRX 거래일 재검증
           if not is_krx_trading_day(today):
               print(f"[TRADE_AM][PREP_VERIFY][NON_TRADING] today={today} is_krx_trading_day=0")
               _write_output("prep_ready", "0")
@@ -588,36 +619,119 @@ jobs:
               _write_output("skip_reason", "NON_TRADING_DAY")
               sys.exit(0)
 
-          try:
-              df = load_final30_scored_db_only(
-                  get_engine(),
-                  env=env,
-                  strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"),
-                  as_of=expected_as_of_str,
-                  require_exact_rows=30,
-                  fail_if_missing=False,
-              )
-              rows = len(df) if df is not None and not df.empty else 0
-          except Exception as exc:
-              print(f"[TRADE_AM][PREP_VERIFY][FAIL] expected_as_of={expected_as_of_str} err={exc}")
-              _write_output("prep_ready", "0")
-              _write_output("expected_as_of", expected_as_of_str)
-              _write_output("final30_rows", "0")
-              _write_output("skip_reason", f"DB_ERROR:{type(exc).__name__}")
-              sys.exit(0)
+          now_dt = datetime.now(KST)
+          now_min = now_dt.hour * 60 + now_dt.minute
+          print(f"[TRADE_AM][PREP_WAIT][START] expected_as_of={expected_as_of_str} deadline={wait_until_hhmm} poll_sec={poll_sec}")
 
-          if rows == 30:
-              print(f"[TRADE_AM][PREP_VERIFY][OK] expected_as_of={expected_as_of_str} rows={rows}")
+          attempt = 0
+          start_ts = time.monotonic()
+          ready = False
+          last_rows = 0
+          last_prep_done = 0
+          last_provenance_ok = 0
+          last_reason = "NOT_CHECKED"
+
+          while True:
+              attempt += 1
+              now_dt = datetime.now(KST)
+              now_min = now_dt.hour * 60 + now_dt.minute
+
+              try:
+                  from trader.db.engine import get_engine
+                  from trader.db.repos import load_final30_scored_db_only, LedgerEventsRepo
+
+                  df = load_final30_scored_db_only(
+                      get_engine(),
+                      env=env,
+                      strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+                      as_of=expected_as_of_str,
+                      require_exact_rows=30,
+                      fail_if_missing=False,
+                  )
+                  rows = len(df) if df is not None and not df.empty else 0
+              except Exception as exc:
+                  rows = 0
+                  print(f"[TRADE_AM][PREP_WAIT][DB_ERROR] attempt={attempt} err={exc}")
+
+              # Check PREP_DONE
+              prep_done = 0
+              prep_branch = ""
+              try:
+                  from trader.db.engine import get_engine as ge2
+                  from trader.db.repos import LedgerEventsRepo
+                  repo = LedgerEventsRepo(ge2())
+                  ev = repo.get_prep_done_event(env=env, as_of=expected_as_of_str)
+                  if ev:
+                      prep_done = 1
+                      prep_branch = str((ev.get("payload_json") or {}).get("producer_branch", ""))
+              except Exception as exc:
+                  prep_done = 0
+                  prep_branch = ""
+
+              # Provenance check
+              provenance_ok = 0
+              if rows == 30 and prep_done == 1:
+                  if prep_branch == expected_branch or prep_branch == "":
+                      # If no producer_branch stored yet, allow (legacy compat)
+                      provenance_ok = 1 if prep_branch == "" else (1 if prep_branch == expected_branch else 0)
+                  else:
+                      provenance_ok = 0
+
+              if rows == 30:
+                  if prep_done == 1 and provenance_ok == 1:
+                      reason = "READY"
+                      ready = True
+                  elif prep_done == 1 and provenance_ok == 0:
+                      reason = f"PROVENANCE_MISMATCH:expected={expected_branch},actual={prep_branch}"
+                  elif prep_done == 0:
+                      reason = "PREP_DONE_MISSING"
+                  else:
+                      reason = "NOT_READY"
+              else:
+                  reason = f"NO_FINAL30:rows={rows}"
+
+              last_rows = rows
+              last_prep_done = prep_done
+              last_provenance_ok = provenance_ok
+              last_reason = reason
+
+              waited_sec = int(time.monotonic() - start_ts)
+              print(f"[TRADE_AM][PREP_WAIT][CHECK] attempt={attempt} rows={rows} prep_done={prep_done} provenance_ok={provenance_ok} ready={int(ready)} reason={reason} now={now_dt.strftime('%H:%M')} waited_sec={waited_sec}")
+
+              if ready:
+                  break
+
+              # Check if provenance mismatch (wrong branch) - fail immediately
+              if rows == 30 and prep_done == 1 and provenance_ok == 0:
+                  print(f"[TRADE_AM][PREP_PROVENANCE][FAIL] reason=PREP_PROVENANCE_MISMATCH expected={expected_branch} actual={prep_branch}")
+                  break
+
+              if now_min >= deadline_min:
+                  print(f"[TRADE_AM][PREP_WAIT][TIMEOUT] expected_as_of={expected_as_of_str} rows={rows} prep_done={prep_done} provenance_ok={provenance_ok} deadline={wait_until_hhmm}")
+                  break
+
+              print(f"[TRADE_AM][PREP_WAIT][SLEEP] poll_sec={poll_sec}")
+              time.sleep(poll_sec)
+
+          waited_sec = int(time.monotonic() - start_ts)
+          print(f"[TRADE_AM][PREP_WAIT][DONE] ready={int(ready)} waited_sec={waited_sec}")
+
+          if ready:
+              print(f"[TRADE_AM][ORDER_MODE] order_allowed=1 rows={last_rows} prep_done={last_prep_done}")
               _write_output("prep_ready", "1")
               _write_output("expected_as_of", expected_as_of_str)
-              _write_output("final30_rows", str(rows))
+              _write_output("final30_rows", str(last_rows))
               _write_output("skip_reason", "OK")
           else:
-              print(f"[TRADE_AM][PREP_VERIFY][FAIL] expected_as_of={expected_as_of_str} rows={rows} (expected 30)")
+              not_ready_policy = os.getenv("TRADE_AM_PREP_NOT_READY_POLICY_PRACTICE", "PNL_ONLY_EXIT_0") if env == "practice" else os.getenv("TRADE_AM_PREP_NOT_READY_POLICY_LIVE", "FAIL_EXIT_1")
+              print(f"[TRADE_AM][PREP_NOT_READY][POLICY] env={env} action={not_ready_policy}")
+              print(f"[TRADE_AM][ORDER_BLOCKED] reason=PREP_NOT_READY rows={last_rows} provenance_ok={last_provenance_ok}")
               _write_output("prep_ready", "0")
               _write_output("expected_as_of", expected_as_of_str)
-              _write_output("final30_rows", str(rows))
-              _write_output("skip_reason", f"FINAL30_NOT_FOUND:rows={rows}")
+              _write_output("final30_rows", str(last_rows))
+              _write_output("skip_reason", f"PREP_NOT_READY:{last_reason}")
+              if env != "practice":
+                  sys.exit(1)
           PY
 
       - name: Run AM trade loop
@@ -774,12 +888,15 @@ jobs:
           fi
           echo "OK: no sqlite artifacts."
 
-      - name: Upload debug AM logs
+      - name: Upload trade diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-trade-am-logs
+          name: trade-diagnostics-${{ github.run_id }}
           path: |
             repo/artifacts/
-            repo/reports/portfolio_pnl/
+            repo/reports/**
+            repo/runtime/**
+            repo/logs/**
           if-no-files-found: ignore
+          retention-days: 14
