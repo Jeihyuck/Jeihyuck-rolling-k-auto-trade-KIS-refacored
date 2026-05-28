@@ -9,7 +9,7 @@
 - session: afternoon
 - event_name: 
 - env: practice
-- dry_run: True
+- dry_run: False
 - kis_order_allowed: 1
 - prep_status: UNKNOWN
 - locked_watchlist_count: 0
@@ -26,3 +26,5 @@
 - temp_error_count: 0
 - temp_recovered_count: 0
 - missed_trade_window: False
+- buy_decisions: 0
+- sell_decisions: 0

@@ -65,12 +65,36 @@ def _build_holding_from_kis_item(item: dict) -> dict | None:
     """
     # KIS 필드를 normalize_us_position이 인식하는 이름으로 보강한 복사본 생성
     enriched = dict(item)
-    # KIS 잔고에서 pdno → symbol 매핑 추가 (normalize_us_position은 symbol 우선)
-    if "pdno" in enriched and "symbol" not in enriched:
+    # KIS 잔고에서 pdno/ovrs_pdno → symbol 매핑 추가 (normalize_us_position은 symbol 우선)
+    if "ovrs_pdno" in enriched and "symbol" not in enriched:
+        enriched["symbol"] = enriched["ovrs_pdno"]
+    elif "pdno" in enriched and "symbol" not in enriched:
         enriched["symbol"] = enriched["pdno"]
-    # ccld_qty_smtl → qty 추가 (KIS US 잔고 수량 필드)
-    if "ccld_qty_smtl" in enriched and "qty" not in enriched:
-        enriched["qty"] = enriched["ccld_qty_smtl"]
+    # qty 매핑: KIS US 잔고에서 사용하는 수량 필드 후보 순서대로 시도
+    if "qty" not in enriched:
+        for qty_key in ("ovrs_cblc_qty", "hldg_qty", "ccld_qty_smtl", "cblc_qty"):
+            if qty_key in enriched and enriched[qty_key] not in (None, "", "0"):
+                enriched["qty"] = enriched[qty_key]
+                break
+    # KIS US 잔고 output1에는 직접 현재가 필드가 없고 평가금액만 있다.
+    # last_price = ovrs_stck_evlu_amt / qty 로 역산한다.
+    if "last_price" not in enriched or safe_float(enriched.get("last_price")) <= 0:
+        mv_raw = (
+            enriched.get("ovrs_stck_evlu_amt")
+            or enriched.get("frcr_evlu_amt2")
+            or enriched.get("evlu_amt")
+        )
+        qty_val = safe_int(enriched.get("qty", 0))
+        mv_val = safe_float(mv_raw)
+        if qty_val > 0 and mv_val > 0:
+            enriched["last_price"] = mv_val / qty_val
+            logger.debug(
+                "[US_PNL][PRICE_DERIVED] symbol=%s mv=%.4f qty=%d last_price=%.4f",
+                enriched.get("symbol", ""),
+                mv_val,
+                qty_val,
+                enriched["last_price"],
+            )
 
     pos = normalize_us_position(enriched)
 
@@ -589,14 +613,18 @@ def generate_pnl_report(
             json.dump(report, f, indent=2, default=str)
         
         # CSV (holdings only)
+        # 모든 행의 키를 합집합으로 구해 누락 필드 KeyError를 방지한다.
         if enriched_holdings:
-            fieldnames = sorted(enriched_holdings[0].keys())
+            all_keys: set[str] = set()
+            for _h in enriched_holdings:
+                all_keys.update(_h.keys())
+            fieldnames = sorted(all_keys)
             with open(latest_csv, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(enriched_holdings)
             with open(dated_csv, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(enriched_holdings)
         

@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: us-trade-watchdog-${{ github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   watchdog:

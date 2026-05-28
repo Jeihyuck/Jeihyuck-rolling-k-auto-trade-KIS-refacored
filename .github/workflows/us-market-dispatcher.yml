@@ -1,0 +1,248 @@
+name: "US Market Dispatcher"
+# 5분마다 실행되며 NY 시간 기반으로 적절한 phase를 선택해 dispatcher를 호출한다.
+# Phase schedule (ET):
+#   06:30~07:00  → prep
+#   09:30~12:30  → session-am
+#   12:30~15:50  → session-afternoon
+#   15:50~16:30  → close
+#   16:30~17:00  → report
+# 이미 실행 중인 phase 세션이 있으면 skip (file_guard / phase_lock으로 보호).
+
+"on":
+  schedule:
+    # EDT: 모든 시각 UTC+4. 5분 간격은 cron으로 표현하기 어려우므로 10분 간격 사용.
+    - cron: "*/10 10-21 * * 1-5"   # UTC 10:00-21:00 (EDT 06:00-17:00 커버)
+    # EST: UTC+5. 동일 범위를 EST로도 커버.
+    - cron: "*/10 11-22 * * 1-5"   # UTC 11:00-22:00 (EST 06:00-17:00 커버)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "강제 실행 mode (비워두면 NY 시간 자동 판정)"
+        required: false
+        default: ""
+      dry_run:
+        description: "DRY_RUN=1 (기본 true)"
+        required: false
+        default: true
+        type: boolean
+      offline:
+        description: "offline mode (KIS API 차단)"
+        required: false
+        default: false
+        type: boolean
+      force_now:
+        description: "시뮬레이션 시각 (smoke 전용). 예: 2026-05-11T09:35:00-04:00"
+        required: false
+        default: ""
+
+concurrency:
+  group: us-market-dispatcher-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      TZ: America/New_York
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: ${{ github.workspace }}/repo
+
+      PBCORE_DB_URL: ${{ secrets.PBCORE_DB_URL }}
+      DATABASE_URL: ${{ secrets.PBCORE_DB_URL }}
+      SQLITE_DISABLED: "1"
+      BOTSTATE_DISABLED: "1"
+
+      KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      KIS_REST_URL: ${{ secrets.KIS_REST_URL }}
+      CANO: ${{ secrets.CANO }}
+      ACNT_PRDT_CD: ${{ secrets.ACNT_PRDT_CD }}
+      APP_KEY: ${{ secrets.KIS_APP_KEY }}
+      APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+      API_BASE_URL: ${{ secrets.KIS_REST_URL }}
+
+      TRADING_REGION: "US"
+      US_AGENT_ENABLED: "1"
+      KIS_ENV: "practice"
+      US_PAPER_TRADING_ENABLED: "1"
+      US_LIVE_TRADING_ENABLED: "0"
+      DISABLE_REAL_TRADING: "1"
+      ALLOW_REAL_ORDER: "0"
+
+      US_STRATEGY_ENGINE: "pb1"
+      US_ENTRY_ENABLED: "1"
+      US_EXIT_ENABLED: "1"
+
+      US_DEFAULT_ENTRY_BOOK: "SWING_BOOK"
+      US_DEFAULT_ENTRY_HORIZON: "SWING_CARRY"
+      US_DEFAULT_EXIT_POLICY: "US_SWING_DEFAULT"
+      US_SWING_MIN_HOLD_MINUTES: "390"
+      US_SWING_BLOCK_SAME_DAY_SOFT_EXIT: "1"
+      US_SELL_PARTIAL_ALLOWED: "0"
+      US_DAY_HARD_STOP_PCT: "0.03"
+      US_DAY_PROFIT_TAKE_PCT: "0.025"
+      US_DAY_TRAILING_STOP_PCT: "0.025"
+      US_DAY_CLOSE_FLATTEN_AFTER_ET: "15:45"
+
+      US_PAPER_MAX_CAPITAL_KRW: "50000000"
+      US_EXPECTED_PRACTICE_CAPITAL_KRW: "50000000"
+      US_BUDGET_FX_KRW_PER_USD: "1450"
+      US_MAX_CAPITAL_USD_AUTO: "1"
+
+      US_MAX_ORDER_USD: "3500"
+      US_MAX_DAILY_NOTIONAL_USD: "15000"
+      US_MAX_POSITIONS: "5"
+      US_MAX_POSITION_WEIGHT: "0.25"
+      US_MIN_CASH_BUFFER_USD: "1000"
+
+      US_BLOCK_REBUY_AFTER_SELL_SAME_DAY: "1"
+      US_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
+
+    steps:
+      - name: Resolve NY-time phase
+        id: phase
+        run: |
+          set -euo pipefail
+          now_min=$(TZ=America/New_York date +"%H%M" | sed 's/^0*//')
+          now_hm=$(TZ=America/New_York date +"%H:%M")
+          echo "now_et=${now_hm}"
+
+          # Phase boundaries (minutes since midnight)
+          prep_start=$((6 * 60 + 30))     # 06:30
+          prep_end=$((7 * 60 + 0))        # 07:00
+          am_start=$((9 * 60 + 30))       # 09:30
+          am_end=$((12 * 60 + 30))        # 12:30
+          pm_start=$((12 * 60 + 30))      # 12:30
+          pm_end=$((15 * 60 + 50))        # 15:50
+          close_start=$((15 * 60 + 50))   # 15:50
+          close_end=$((16 * 60 + 30))     # 16:30
+          report_start=$((16 * 60 + 30))  # 16:30
+          report_end=$((17 * 60 + 0))     # 17:00
+
+          # workflow_dispatch 강제 mode 우선
+          forced_mode="${{ inputs.mode || '' }}"
+          if [[ -n "${forced_mode}" ]]; then
+            mode="${forced_mode}"
+            echo "[US_DISPATCHER][MANUAL_MODE] mode=${mode}"
+          elif [[ "${now_min}" -ge "${prep_start}" && "${now_min}" -lt "${prep_end}" ]]; then
+            mode="prep"
+          elif [[ "${now_min}" -ge "${am_start}" && "${now_min}" -lt "${am_end}" ]]; then
+            mode="session-am"
+          elif [[ "${now_min}" -ge "${pm_start}" && "${now_min}" -lt "${pm_end}" ]]; then
+            mode="session-afternoon"
+          elif [[ "${now_min}" -ge "${close_start}" && "${now_min}" -lt "${close_end}" ]]; then
+            mode="close"
+          elif [[ "${now_min}" -ge "${report_start}" && "${now_min}" -lt "${report_end}" ]]; then
+            mode="report"
+          else
+            mode="skip"
+          fi
+
+          echo "mode=${mode}" >> "$GITHUB_OUTPUT"
+          echo "now_et=${now_hm}" >> "$GITHUB_OUTPUT"
+          echo "[US_DISPATCHER][PHASE_RESOLVED] now_et=${now_hm} now_min=${now_min} mode=${mode}"
+
+      - name: Skip outside trading windows
+        if: steps.phase.outputs.mode == 'skip'
+        run: |
+          echo "[US_DISPATCHER][SKIP] now_et=${{ steps.phase.outputs.now_et }} outside all trading windows"
+
+      - name: Checkout
+        if: steps.phase.outputs.mode != 'skip'
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          fetch-depth: 1
+
+      - name: Set up Python
+        if: steps.phase.outputs.mode != 'skip'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: repo/requirements.txt
+
+      - name: Install dependencies
+        if: steps.phase.outputs.mode != 'skip'
+        working-directory: repo
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup artifacts dir
+        if: steps.phase.outputs.mode != 'skip'
+        working-directory: repo
+        run: mkdir -p artifacts
+
+      - name: Validate environment
+        if: steps.phase.outputs.mode != 'skip'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          echo "[US_ENV_CHECK] KIS_ENV=${KIS_ENV:-} mode=${{ steps.phase.outputs.mode }}"
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            : "${PBCORE_DB_URL:?Missing PBCORE_DB_URL}"
+            if [[ ! "${PBCORE_DB_URL}" =~ ^postgres(ql)?(\+[^:]+)?:// ]]; then
+              echo "::error::PBCORE_DB_URL must be postgres-only. SQLite is forbidden for US dispatcher."
+              exit 1
+            fi
+          fi
+
+      - name: Run dispatcher
+        if: steps.phase.outputs.mode != 'skip'
+        working-directory: repo
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+          US_DISPATCHER_SINGLE_TICK: "1"
+          US_SESSION_SHUTDOWN_BUFFER_SEC: "120"
+        run: |
+          set -euo pipefail
+          MODE="${{ steps.phase.outputs.mode }}"
+          OFFLINE_FLAG=""
+          FORCE_NOW_FLAG=""
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.offline || 'false' }}" = "true" ]; then
+              OFFLINE_FLAG="--offline"
+            fi
+            if [ -n "${{ inputs.force_now || '' }}" ]; then
+              FORCE_NOW_FLAG="--force-now ${{ inputs.force_now }}"
+            fi
+          fi
+
+          echo "[US_DISPATCHER][RUN] mode=${MODE} DRY_RUN=${DRY_RUN} OFFLINE=${OFFLINE_FLAG}"
+
+          set +e
+          python -m trader.us.runner.dispatcher \
+            --mode "${MODE}" \
+            --env practice \
+            ${FORCE_NOW_FLAG} \
+            ${OFFLINE_FLAG} \
+            --max-ticks 1 2>&1 | tee artifacts/us_dispatcher_${MODE}.log
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          echo "[US_DISPATCHER][EXIT] mode=${MODE} rc=${rc}"
+          if [ "${rc}" -ne 0 ]; then
+            echo "::warning::US dispatcher mode=${MODE} exited with rc=${rc} (non-blocking for cron)"
+          fi
+          # 디스패처 실패는 cron 재시도가 있으므로 exit 0으로 워크플로우를 성공으로 기록
+          exit 0
+
+      - name: Upload dispatcher log
+        if: always() && steps.phase.outputs.mode != 'skip'
+        uses: actions/upload-artifact@v4
+        with:
+          name: us-dispatcher-log-${{ github.run_id }}-${{ steps.phase.outputs.mode }}
+          path: repo/artifacts/us_dispatcher_*.log
+          retention-days: 3
+          if-no-files-found: ignore

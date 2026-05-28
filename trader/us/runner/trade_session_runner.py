@@ -41,6 +41,69 @@ _SESSION_START_TIMES = {
 _MAX_CONSECUTIVE_ERRORS = 3
 
 
+def _write_us_schedule_health(payload: dict, session: str) -> None:
+    """reports/us_schedule_health/{trade_date}.json 에 세션 결과를 기록한다.
+
+    파일이 이미 있으면 해당 session 키만 덮어쓴다.
+    이 파일은 schedule_health 모니터링/watchdog의 입력으로 사용된다.
+    """
+    import json
+    from datetime import datetime as _dt
+    from pathlib import Path
+
+    trade_date = str(payload.get("trade_date") or "")
+    if not trade_date:
+        return
+
+    health_dir = Path("reports/us_schedule_health")
+    health_dir.mkdir(parents=True, exist_ok=True)
+    health_file = health_dir / f"{trade_date}.json"
+
+    try:
+        existing: dict = {}
+        if health_file.exists():
+            try:
+                existing = json.loads(health_file.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+
+        now_utc = _dt.utcnow().isoformat() + "Z"
+        session_entry = {
+            "session": session,
+            "trade_date": trade_date,
+            "final_status": payload.get("final_status", "UNKNOWN"),
+            "reason": payload.get("reason", ""),
+            "tick_count": int(payload.get("tick_count", 0) or 0),
+            "fills_count": int(payload.get("fills_count", 0) or 0),
+            "unique_fills_count": int(payload.get("unique_fills_count", 0) or 0),
+            "orders_ack": int(payload.get("orders_ack", 0) or 0),
+            "orders_rejected": int(payload.get("orders_rejected", 0) or 0),
+            "run_id": payload.get("run_id", ""),
+            "workflow": payload.get("workflow", ""),
+            "wall_elapsed_sec": float(payload.get("wall_elapsed_sec", 0) or 0),
+            "missed_trade_window": bool(payload.get("missed_trade_window", False)),
+            "recorded_at_utc": now_utc,
+        }
+
+        existing.setdefault("trade_date", trade_date)
+        existing.setdefault("sessions", {})
+        existing["sessions"][session] = session_entry
+        existing["updated_at_utc"] = now_utc
+
+        health_file.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        logger.info(
+            "[US_SCHEDULE_HEALTH][SAVED] file=%s session=%s status=%s",
+            health_file,
+            session,
+            session_entry["final_status"],
+        )
+    except Exception as exc:
+        logger.warning("[US_SCHEDULE_HEALTH][WARN] write failed: %s", exc)
+
+
 def _write_us_session_report(payload: dict, session: str) -> None:
     """US 세션 최신 리포트를 항상 갱신한다."""
     report_base = Path("reports/us_daily")
@@ -521,14 +584,24 @@ def run_trade_session(
         session, final_reason, tick_count, warn_count, session_wall_elapsed_sec,
     )
     
-    # max_ticks > 0일 때 최소 1 tick은 실행되어야 함
-    if max_ticks > 0 and tick_count == 0 and final_status not in {"FAILED", "SKIP"}:
-        final_status = "FAILED"
-        final_reason = "no_tick_executed"
-        logger.error(
-            "[US_SESSION][ERROR] max_ticks=%d but tick_count=0 - setting final_status=FAILED",
-            max_ticks,
-        )
+    # tick=0 OK 금지: tick이 한 번도 실행되지 않으면 반드시 경고 또는 실패
+    if tick_count == 0 and final_status not in {"FAILED", "SKIP"}:
+        if max_ticks > 0:
+            # 명시적 tick 수 요청인데 0번 실행 → 실패
+            final_status = "FAILED"
+            final_reason = "no_tick_executed"
+            logger.error(
+                "[US_SESSION][ERROR] max_ticks=%d but tick_count=0 - setting final_status=FAILED",
+                max_ticks,
+            )
+        else:
+            # 무제한 모드인데도 tick=0이면 경고 (graceful_shutdown 등)
+            warn_count += 1
+            logger.warning(
+                "[US_SESSION][WARN] tick_count=0 reason=%s session ended without executing any tick"
+                " - status will be OK_WITH_WARNINGS",
+                final_reason,
+            )
     
     # KIS TEMP_ERROR recovery warning
     if temp_recovered_count > 0:
@@ -587,7 +660,10 @@ def run_trade_session(
         total_orders_ack += int(tick_result.get("orders_ack", 0) or 0)
         total_orders_rejected += int(tick_result.get("orders_rejected", 0) or 0)
         total_orders_error += int(tick_result.get("orders_error", 0) or 0)
-        total_fills += int(tick_result.get("fills_count", tick_result.get("fills", 0)) or 0)
+        # fills: KIS가 매 tick마다 당일 누적 체결 snapshot을 반환하므로
+        # 단순 합산이 아닌 max로 중복 집계를 방지한다 (unique_fills_count와 동일).
+        tick_fills = int(tick_result.get("fills_count", tick_result.get("fills", 0)) or 0)
+        total_fills = max(total_fills, tick_fills)
         total_pending_orders = int(tick_result.get("pending_order_count", 0) or 0)
         total_sold_today = int(tick_result.get("sold_today_count", 0) or 0)
         total_open_positions = int(tick_result.get("open_position_count", tick_result.get("positions", 0)) or 0)
@@ -650,6 +726,7 @@ def run_trade_session(
         "block_reasons": final_tick.get("block_reasons", {}),
         "fills_count": total_fills,
         "fills": total_fills,
+        "unique_fills_count": total_fills,  # max-snapshot dedup (KIS fills는 누적 snapshot)
         "pending_order_count": total_pending_orders,
         "sold_today_count": total_sold_today,
         "open_position_count": total_open_positions,
@@ -691,6 +768,7 @@ def run_trade_session(
         "entry_skip_by_symbol": entry_skip_by_symbol,
     }
     _write_us_session_report(report_payload, session=session)
+    _write_us_schedule_health(report_payload, session=session)
 
     # ── 파일 기반 done 마커 기록 (성공/경고 종료 시만) ────────────────────────
     if final_status not in ("FAILED", "SKIP"):

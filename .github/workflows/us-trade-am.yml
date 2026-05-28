@@ -57,7 +57,7 @@ name: "US Trade AM"
 
 concurrency:
   group: us-trade-am-${{ github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
