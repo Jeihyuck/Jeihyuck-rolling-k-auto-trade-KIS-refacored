@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,21 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
         0 (성공) or 1 (실패)
     """
     logger.info("[US_DISPATCHER][START] mode=%s env=%s offline=%s", mode, env, offline)
+
+    # 자동 schedule 트리거 확인 — schedule은 금지됨, 수동 dispatch만 허용
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+    if event_name == "schedule":
+        logger.error(
+            "[US_DISPATCHER][BLOCKED] auto_schedule_not_allowed event=%s mode=%s "
+            "reason=dispatcher_is_manual_only_use_dedicated_workflow",
+            event_name, mode,
+        )
+        return 1
+    if event_name == "workflow_dispatch":
+        logger.info(
+            "[US_DISPATCHER][MANUAL_ONLY] mode=%s trigger=workflow_dispatch",
+            mode,
+        )
 
     mode = normalize_mode(mode)
 

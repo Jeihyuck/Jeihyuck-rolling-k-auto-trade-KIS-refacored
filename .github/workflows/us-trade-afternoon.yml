@@ -4,10 +4,10 @@ name: "US Trade Afternoon"
 
 "on":
   schedule:
-    # EDT 12:15 ET = 16:15 UTC (primary_once)
-    - cron: "15 16 * * 1-5"  # 12:15 EDT
-    # EST 12:15 ET = 17:15 UTC (primary_once)
-    - cron: "15 17 * * 1-5"  # 12:15 EST
+    # NY timezone-aware single cron: 12:35 ET (EDT/EST 자동 적용)
+    - cron: "35 12 * * 1-5"
+      timezone: "America/New_York"
+    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
   workflow_dispatch:
     inputs:
       dry_run:
@@ -55,8 +55,8 @@ name: "US Trade Afternoon"
         type: boolean
 
 concurrency:
-  group: us-trade-afternoon-${{ github.ref_name }}
-  cancel-in-progress: false
+  group: us-trade-afternoon-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -319,8 +319,8 @@ jobs:
             echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1215 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[US_TRADE_AFTERNOON][BOOT_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} route=${{ steps.phase_guard.outputs.route }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=1230-1550"
             echo "[US_TRADE_AFTERNOON][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
-            echo "[US_TRADE_AFTERNOON][CONCURRENCY_META] group=us-trade-afternoon-${GITHUB_REF_NAME} cancel_in_progress=false schedule_mode=primary_once crons=2"
-            echo "[US_TRADE_AFTERNOON][SCHEDULE_MODE] mode=primary_once crons=2 reason=edt_est_dualcron watchdog_recovery=enabled"
+            echo "[US_TRADE_AFTERNOON][CONCURRENCY_META] group=us-trade-afternoon-${GITHUB_REF_NAME} cancel_in_progress=true schedule_mode=timezone_single_cron crons=1"
+            echo "[US_TRADE_AFTERNOON][SCHEDULE_MODE] mode=timezone_single_cron crons=1 timezone=America/New_York"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -339,18 +339,20 @@ jobs:
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=us-afternoon missed_trade_window=${missed_window}"
             echo "[US_TRADE_AFTERNOON][EXIT] reason=phase_guard_skip"
           } | tee -a artifacts/${US_LOG_FILE}
-          python - <<PY
-          import json
+          export _US_AFT_TRADE_DATE="${trade_date}"
+          export _US_AFT_MISSED_WINDOW="${missed_window}"
+          python - <<'PY'
+          import json, os
           from pathlib import Path
           report = {
-              "trade_date": "${trade_date}",
-              "run_id": "${GITHUB_RUN_ID}",
-              "sha": "${GITHUB_SHA}",
-              "workflow": "${GITHUB_WORKFLOW}",
+              "trade_date": os.environ.get("_US_AFT_TRADE_DATE", ""),
+              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+              "sha": os.environ.get("GITHUB_SHA", ""),
+              "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
               "session": "afternoon",
-              "event_name": "${GITHUB_EVENT_NAME}",
+              "event_name": os.environ.get("GITHUB_EVENT_NAME", ""),
               "env": "practice",
-              "dry_run": "${DRY_RUN}" == "1",
+              "dry_run": os.environ.get("DRY_RUN", "0") == "1",
               "kis_order_allowed": int("${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"),
               "prep_status": "SKIP_PHASE_WINDOW",
               "locked_watchlist_count": 0,
@@ -366,7 +368,7 @@ jobs:
               "reason": "${{ steps.phase_guard.outputs.skip_reason }}",
               "temp_error_count": 0,
               "temp_recovered_count": 0,
-              "missed_trade_window": "${missed_window}" == "true",
+              "missed_trade_window": os.environ.get("_US_AFT_MISSED_WINDOW", "false") == "true",
           }
           base = Path("reports/us_daily")
           base.mkdir(parents=True, exist_ok=True)

@@ -717,16 +717,28 @@ def run_trade_session(
         "entry_eval_status": final_tick.get("entry_eval_status", "UNKNOWN"),
         "entry_error_type": final_tick.get("entry_error_type", ""),
         "entry_error_message": final_tick.get("entry_error_message", ""),
-        "entry_intents": int(final_tick.get("entry_intents", 0) or 0),
+        # ── tick별 최종값 vs session 누적 total 분리 ─────────────────────────
+        # last_tick: 마지막 tick의 값 (신호/포지션 상태 파악용)
+        "entry_intents_last_tick": int(final_tick.get("entry_intents", 0) or 0),
+        "exit_intents_last_tick": int(final_tick.get("exit_intents", 0) or 0),
+        # total: 세션 전체 누적 합산 (주문 건수 집계용)
+        "entry_intents_total": total_buy_decisions,
+        "exit_intents_total": total_sell_decisions,
+        # 하위 호환: entry_intents는 total 값으로 유지
+        "entry_intents": total_buy_decisions,
         "orders_sent": total_orders_sent if total_orders_sent else int(final_tick.get("orders_sent", 0) or 0),
+        "orders_sent_total": total_orders_sent if total_orders_sent else int(final_tick.get("orders_sent", 0) or 0),
         "orders_ack": total_orders_ack,
+        "orders_ack_total": total_orders_ack,
         "orders_rejected": total_orders_rejected,
+        "orders_reject_total": total_orders_rejected,
         "orders_error": total_orders_error,
+        "orders_error_total": total_orders_error,
         "orders_blocked": int(final_tick.get("orders_blocked", 0) or 0),
         "block_reasons": final_tick.get("block_reasons", {}),
         "fills_count": total_fills,
         "fills": total_fills,
-        "unique_fills_count": total_fills,  # max-snapshot dedup (KIS fills는 누적 snapshot)
+        "unique_fills_count": total_fills,
         "pending_order_count": total_pending_orders,
         "sold_today_count": total_sold_today,
         "open_position_count": total_open_positions,
@@ -740,7 +752,6 @@ def run_trade_session(
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
         "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") == "1",
-        # P4: KIS temp error API별 집계
         "kis_temp_errors": {
             "total": sum(v.get("temp_error", 0) for v in kis_temp_errors_by_api.values()),
             "recovered": sum(v.get("recovered", 0) for v in kis_temp_errors_by_api.values()),
@@ -748,13 +759,14 @@ def run_trade_session(
             "by_api": kis_temp_errors_by_api,
         },
         # 추가 필드
+        "ticks_total": tick_count,
         "tick_count": tick_count,
         "ticks": tick_count,
         "max_ticks": max_ticks,
         "force_now": force_now or "",
         "offline": offline,
         "wall_elapsed_sec": round(session_wall_elapsed_sec, 2),
-        # Explanation statistics
+        # Explanation statistics (total 기준)
         "buy_decisions": total_buy_decisions,
         "sell_decisions": total_sell_decisions,
         # P3: entry skip summary (afternoon에서 신규 매수 0건 이유 분해)
@@ -769,6 +781,19 @@ def run_trade_session(
     }
     _write_us_session_report(report_payload, session=session)
     _write_us_schedule_health(report_payload, session=session)
+
+    logger.info(
+        "[US_DAILY][AGGREGATE] ticks_total=%d entry_intents_total=%d exit_intents_total=%d"
+        " orders_sent_total=%d orders_ack_total=%d orders_reject_total=%d buy_orders_count=%d sell_orders_count=%d",
+        tick_count,
+        total_buy_decisions,
+        total_sell_decisions,
+        report_payload["orders_sent_total"],
+        total_orders_ack,
+        total_orders_rejected,
+        total_orders_ack,   # buy_orders_count (ACK 기준)
+        sum(1 for r in results if r.get("exit_intents", 0) > 0),
+    )
 
     # ── 파일 기반 done 마커 기록 (성공/경고 종료 시만) ────────────────────────
     if final_status not in ("FAILED", "SKIP"):

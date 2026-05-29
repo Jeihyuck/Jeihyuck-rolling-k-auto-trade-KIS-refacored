@@ -1,19 +1,9 @@
-name: "US Market Dispatcher"
-# 5분마다 실행되며 NY 시간 기반으로 적절한 phase를 선택해 dispatcher를 호출한다.
-# Phase schedule (ET):
-#   06:30~07:00  → prep
-#   09:30~12:30  → session-am
-#   12:30~15:50  → session-afternoon
-#   15:50~16:30  → close
-#   16:30~17:00  → report
-# 이미 실행 중인 phase 세션이 있으면 skip (file_guard / phase_lock으로 보호).
+name: "US Dispatcher Manual"
+# dispatcher는 수동 실행/디버깅용 router 전용.
+# 자동 schedule 금지: 각 세션(prep/am/afternoon/close)은 전용 workflow가 실행한다.
+# [US_DISPATCHER][MANUAL_ONLY] trigger=workflow_dispatch
 
 "on":
-  schedule:
-    # EDT: 모든 시각 UTC+4. 5분 간격은 cron으로 표현하기 어려우므로 10분 간격 사용.
-    - cron: "*/10 10-21 * * 1-5"   # UTC 10:00-21:00 (EDT 06:00-17:00 커버)
-    # EST: UTC+5. 동일 범위를 EST로도 커버.
-    - cron: "*/10 11-22 * * 1-5"   # UTC 11:00-22:00 (EST 06:00-17:00 커버)
   workflow_dispatch:
     inputs:
       mode:
@@ -36,8 +26,8 @@ name: "US Market Dispatcher"
         default: ""
 
 concurrency:
-  group: us-market-dispatcher-${{ github.ref_name }}
-  cancel-in-progress: false
+  group: us-dispatcher-manual-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

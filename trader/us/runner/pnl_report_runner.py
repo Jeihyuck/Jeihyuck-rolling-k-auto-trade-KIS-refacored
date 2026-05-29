@@ -140,6 +140,31 @@ def fetch_kis_balance(client, env: str) -> dict:
         # Cash
         cash_usd = safe_float(output2.get("frcr_dncl_amt_2"))  # USD 현금
 
+        # KIS balance 현재가 매핑 로그 (상세)
+        for item in output1:
+            try:
+                _sym = str(
+                    item.get("symbol") or item.get("ovrs_pdno") or item.get("pdno") or ""
+                ).strip().upper()
+                for _field in ("last_price", "current", "current_price", "market_price",
+                               "ovrs_now_pric", "ovrs_now_pric1", "now_price"):
+                    _val = item.get(_field)
+                    if _val not in (None, "", "0", 0):
+                        try:
+                            _fval = float(str(_val).replace(",", ""))
+                            if _fval > 0:
+                                logger.info(
+                                    "[US_PNL][PRICE_MAP] symbol=%s source=kis_balance field=%s last_price=%.4f",
+                                    _sym, _field, _fval,
+                                )
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        output1_count = len(output1)
+
         # Holdings — normalize_us_position으로 current → last_price 매핑 포함
         holdings = []
         for item in output1:
@@ -153,6 +178,20 @@ def fetch_kis_balance(client, env: str) -> dict:
         # PnL 품질 검증
         total_qty = sum(h["qty"] for h in holdings)
         total_market_value = sum(h["market_value_usd"] for h in holdings)
+        price_missing_count = sum(1 for h in holdings if h.get("price_missing", False))
+
+        logger.info(
+            "[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d cash_usd=%.2f",
+            output1_count, len(holdings), cash_usd,
+        )
+        if price_missing_count > 0:
+            logger.warning(
+                "[US_PNL][PRICE_MISSING] missing_count=%d",
+                price_missing_count,
+            )
+        else:
+            logger.info("[US_PNL][PRICE_MISSING] missing_count=0")
+
         if total_qty > 0 and total_market_value <= 0:
             pnl_status = "ERROR_PNL_PRICE_MAPPING"
             logger.error(
@@ -165,19 +204,11 @@ def fetch_kis_balance(client, env: str) -> dict:
             pnl_status = "OK"
 
         logger.info(
-            "[US_PNL][KIS_BALANCE][OK] cash_usd=%.2f holdings=%d pnl_status=%s",
-            cash_usd,
+            "[US_PNL][KIS_BALANCE_SUMMARY] holdings=%d pnl_status=%s price_missing=%d",
             len(holdings),
             pnl_status,
+            price_missing_count,
         )
-
-        return {
-            "status": "OK",
-            "cash_usd": cash_usd,
-            "holdings": holdings,
-            "error": None,
-            "pnl_status": pnl_status,
-        }
 
     except Exception as exc:
         logger.error("[US_PNL][KIS_BALANCE][ERROR] %s", exc)
@@ -613,12 +644,27 @@ def generate_pnl_report(
             json.dump(report, f, indent=2, default=str)
         
         # CSV (holdings only)
-        # 모든 행의 키를 합집합으로 구해 누락 필드 KeyError를 방지한다.
+        # price_missing 등 추가 필드가 있어도 안전하게 처리.
+        # 방법 A: 모든 row 키 합집합 + extrasaction="ignore" (기본)
+        # 방법 B: 필수 fieldnames에 price_missing 명시 포함
+        _REQUIRED_FIELDNAMES = [
+            "trade_date", "session", "env", "symbol", "qty",
+            "avg_price", "avg_cost_usd", "last_price", "current_price_usd",
+            "market_value", "market_value_usd", "cost_basis", "cost_basis_usd",
+            "unrealized_pnl", "unrealized_pnl_usd", "unrealized_pnl_pct", "pnl_pct",
+            "price_missing", "source", "exchange",
+        ]
         if enriched_holdings:
-            all_keys: set[str] = set()
+            all_keys: set[str] = set(_REQUIRED_FIELDNAMES)
             for _h in enriched_holdings:
                 all_keys.update(_h.keys())
             fieldnames = sorted(all_keys)
+            # trade_date, session, env 필드가 holding dict에 없으면 추가
+            for _h in enriched_holdings:
+                _h.setdefault("trade_date", trade_date)
+                _h.setdefault("session", session or "")
+                _h.setdefault("env", env)
+                _h.setdefault("price_missing", _h.get("current_price_usd", 0) <= 0)
             with open(latest_csv, "w", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                 writer.writeheader()
@@ -636,16 +682,24 @@ def generate_pnl_report(
         logger.error("[US_PNL][SAVE_FAILED] %s", exc)
         report["data_quality"]["errors"].append(f"report_save_failed: {exc}")
     
+    pnl_ok = not report["data_quality"]["errors"]
+    pnl_final_status = "OK" if pnl_ok else "ERROR"
     logger.info(
         "[US_PNL][OK] date=%s positions=%d total_pnl_usd=%.2f",
         trade_date, total_positions, total_pnl_usd
+    )
+    logger.info(
+        "[US_PNL][DONE] status=%s positions=%d price_missing=%d",
+        pnl_final_status,
+        total_positions,
+        sum(1 for h in enriched_holdings if h.get("price_missing", False)),
     )
     
     status = "OK" if not report["data_quality"]["errors"] else "ERROR"
     if fail_on_missing_report and status == "ERROR":
         return {"status": "ERROR", "report": report}
     
-    return {"status": "OK", "report": report}
+    return {"status": pnl_final_status, "report": report}
 
 
 def generate_markdown_report(report: dict) -> str:

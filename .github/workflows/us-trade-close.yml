@@ -3,8 +3,10 @@ name: "US Trade Close"
 
 "on":
   schedule:
-    - cron: "50 19 * * 1-5"
-    - cron: "50 20 * * 1-5"
+    # NY timezone-aware single cron: 15:55 ET (EDT/EST 자동 적용)
+    - cron: "55 15 * * 1-5"
+      timezone: "America/New_York"
+    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
   workflow_dispatch:
     inputs:
       dry_run:
@@ -32,8 +34,8 @@ name: "US Trade Close"
         type: boolean
 
 concurrency:
-  group: us-trade-close-${{ github.ref_name }}
-  cancel-in-progress: false
+  group: us-trade-close-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -135,10 +137,15 @@ jobs:
           skip_reason=""
           wait_until_target=0
           wait_seconds=0
+          order_disabled=0
+          pnl_required=1
 
           if [[ "$event_name" == "schedule" ]]; then
             if [[ "$now_min" -gt "$stale_min" ]]; then
+              # 16:30 이후: 주문 금지, PNL은 계속
               should_run=0
+              order_disabled=1
+              pnl_required=1
               skip_reason="skip_stale_start_us_close"
             elif [[ "$now_min" -lt "$target_min" ]]; then
               wait_until_target=1
@@ -168,6 +175,8 @@ jobs:
           echo "wait_until_target=${wait_until_target}" >> "$GITHUB_OUTPUT"
           echo "wait_seconds=${wait_seconds}" >> "$GITHUB_OUTPUT"
           echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+          echo "order_disabled=${order_disabled}" >> "$GITHUB_OUTPUT"
+          echo "pnl_required=${pnl_required}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -191,7 +200,7 @@ jobs:
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
 
       - name: Emit US Close skip summary
-        if: steps.phase_guard.outputs.should_run != '1'
+        if: steps.phase_guard.outputs.should_run != '1' && steps.phase_guard.outputs.pnl_required != '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -200,8 +209,19 @@ jobs:
             echo "[US_TRADE_CLOSE][EXIT] reason=phase_guard_skip"
           } | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Emit US Close stale order-disabled notice
+        if: steps.phase_guard.outputs.should_run != '1' && steps.phase_guard.outputs.pnl_required == '1'
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_TRADE_CLOSE][PHASE_GUARD] should_run=0 skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} phase_window=1545-1630"
+            echo "[US_TRADE_CLOSE][ORDER_DISABLED] reason=stale_start_after_close_window"
+            echo "[US_TRADE_CLOSE][PNL_CONTINUE] reason=close_report_required_even_if_order_disabled"
+          } | tee -a artifacts/${US_LOG_FILE}
+
       - name: Set up Python
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' || steps.phase_guard.outputs.pnl_required == '1'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -209,7 +229,7 @@ jobs:
           cache-dependency-path: repo/requirements.txt
 
       - name: Install deps
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' || steps.phase_guard.outputs.pnl_required == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -233,7 +253,7 @@ jobs:
           echo "[US_WAIT_UNTIL_TARGET][DONE] session=close now_et=$(TZ=America/New_York date +%H%M%S)" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Guard postgres-only
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' || steps.phase_guard.outputs.pnl_required == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -248,7 +268,7 @@ jobs:
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: DB migrate
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' || steps.phase_guard.outputs.pnl_required == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -259,7 +279,7 @@ jobs:
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: Verify KIS env contract
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' || steps.phase_guard.outputs.pnl_required == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -282,7 +302,7 @@ jobs:
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: US Python syntax preflight
-        if: steps.phase_guard.outputs.should_run == '1'
+        if: steps.phase_guard.outputs.should_run == '1' || steps.phase_guard.outputs.pnl_required == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -309,6 +329,21 @@ jobs:
             fi
             echo "[US_FORCE_NOW_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Run US PNL report (stale close — order disabled)
+        if: steps.phase_guard.outputs.should_run != '1' && steps.phase_guard.outputs.pnl_required == '1'
+        timeout-minutes: 15
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          {
+            echo "[US_TRADE_CLOSE][STALE_PNL_START] reason=close_stale_order_disabled_pnl_required"
+            python -m trader.us.runner.pnl_report_runner \
+              --env practice
+            echo "[US_PNL][DONE] status=OK"
+          } 2>&1 | tee -a artifacts/${US_LOG_FILE} || {
+            echo "[US_PNL][WARN] stale PNL generation failed — non-fatal"
+          } | tee -a artifacts/${US_LOG_FILE}
 
       - name: Run US close
         if: steps.phase_guard.outputs.should_run == '1'
@@ -349,7 +384,18 @@ jobs:
           set -euo pipefail
           test -f artifacts/${US_LOG_FILE} || { echo "::warning::missing US log file"; exit 0; }
 
-          # Success: phase guard intentionally skipped the close run.
+          # Success: stale close order disabled but PNL ran.
+          if grep -E "\\[US_TRADE_CLOSE\\]\\[ORDER_DISABLED\\] reason=stale_start_after_close_window" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            if grep -E "\\[US_PNL\\]\\[DONE\\]" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+              echo "[US_TRADE_CLOSE_VERIFY][STALE_PNL_OK] stale close: order disabled, PNL generated"
+              exit 0
+            else
+              echo "::warning::Stale close: PNL generation may have failed, but not fatal"
+              exit 0
+            fi
+          fi
+
+          # Success: phase guard fully skipped (too early / non-trading).
           if grep -E "\\[RUN_SUMMARY\\]\\[RESULT\\] status=SKIP_PHASE_WINDOW|\\[US_TRADE_CLOSE\\]\\[EXIT\\] reason=phase_guard_skip" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
             echo "[US_TRADE_CLOSE_VERIFY][SKIP_OK] phase guard skipped close intentionally"
             exit 0

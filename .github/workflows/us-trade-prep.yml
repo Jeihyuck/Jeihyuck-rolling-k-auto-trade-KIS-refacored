@@ -5,10 +5,10 @@ name: "US Trade Prep"
 
 "on":
   schedule:
-    # EDT 07:00 ET = 11:00 UTC (primary_once)
-    - cron: "0 11 * * 1-5"   # 07:00 EDT
-    # EST 07:00 ET = 12:00 UTC (primary_once)
-    - cron: "0 12 * * 1-5"   # 07:00 EST
+    # NY timezone-aware single cron: 08:05 ET (EDT/EST 자동 적용)
+    - cron: "05 8 * * 1-5"
+      timezone: "America/New_York"
+    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
   workflow_dispatch:
     inputs:
       dry_run:
@@ -36,8 +36,8 @@ name: "US Trade Prep"
         type: boolean
 
 concurrency:
-  group: us-trade-prep-${{ github.ref_name }}
-  cancel-in-progress: false
+  group: us-trade-prep-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

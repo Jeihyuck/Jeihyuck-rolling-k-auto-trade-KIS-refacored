@@ -51,29 +51,48 @@ def repos_text():
 # ---------------------------------------------------------------------------
 
 def test_prep_has_multiple_crons(prep_text):
-    """us-trade-prep.yml cron 스케줄이 2개 이상이어야 한다 (EDT + EST dual-cron)."""
+    """us-trade-prep.yml cron 스케줄이 1개(timezone-aware single cron)여야 한다.
+
+    EDT/EST dual-cron 방식에서 timezone: America/New_York 방식으로 변경됨.
+    dual-cron은 하루 2번 실행되는 버그가 있으므로 단일 cron + timezone이 올바른 방식.
+    """
     cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", prep_text)
-    assert len(cron_matches) >= 2, (
-        f"us-trade-prep.yml cron 수={len(cron_matches)} < 2. "
-        "EDT/EST dual-cron이 설정됐는지 확인하세요."
+    assert len(cron_matches) == 1, (
+        f"us-trade-prep.yml cron 수={len(cron_matches)} != 1. "
+        "timezone-aware single cron이 설정됐는지 확인하세요."
+    )
+    assert 'timezone: "America/New_York"' in prep_text, (
+        "us-trade-prep.yml에 timezone: America/New_York이 없습니다."
     )
 
 
 def test_am_has_multiple_crons(am_text):
-    """us-trade-am.yml cron 스케줄이 2개 이상이어야 한다 (EDT + EST dual-cron)."""
+    """us-trade-am.yml cron 스케줄이 1개(timezone-aware single cron)여야 한다.
+
+    EDT/EST dual-cron 방식에서 timezone: America/New_York 방식으로 변경됨.
+    """
     cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", am_text)
-    assert len(cron_matches) >= 2, (
-        f"us-trade-am.yml cron 수={len(cron_matches)} < 2. "
-        "EDT/EST dual-cron이 설정됐는지 확인하세요."
+    assert len(cron_matches) == 1, (
+        f"us-trade-am.yml cron 수={len(cron_matches)} != 1. "
+        "timezone-aware single cron이 설정됐는지 확인하세요."
+    )
+    assert 'timezone: "America/New_York"' in am_text, (
+        "us-trade-am.yml에 timezone: America/New_York이 없습니다."
     )
 
 
 def test_afternoon_has_multiple_crons(afternoon_text):
-    """us-trade-afternoon.yml cron 스케줄이 2개 이상이어야 한다 (EDT + EST dual-cron)."""
+    """us-trade-afternoon.yml cron 스케줄이 1개(timezone-aware single cron)여야 한다.
+
+    EDT/EST dual-cron 방식에서 timezone: America/New_York 방식으로 변경됨.
+    """
     cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", afternoon_text)
-    assert len(cron_matches) >= 2, (
-        f"us-trade-afternoon.yml cron 수={len(cron_matches)} < 2. "
-        "EDT/EST dual-cron이 설정됐는지 확인하세요."
+    assert len(cron_matches) == 1, (
+        f"us-trade-afternoon.yml cron 수={len(cron_matches)} != 1. "
+        "timezone-aware single cron이 설정됐는지 확인하세요."
+    )
+    assert 'timezone: "America/New_York"' in afternoon_text, (
+        "us-trade-afternoon.yml에 timezone: America/New_York이 없습니다."
     )
 
 
