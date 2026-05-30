@@ -302,19 +302,59 @@ def _build_holdings_pnl(
 
 
 def _build_today_trades(today_orders: list[dict], today_fills: list[dict], balance_rows: list[dict], db_positions: list[dict]) -> list[dict]:
+    # [2026-05-27] PNL_TODAY_TRADES_USE_ACTUAL_FILL_PRICE=1: KIS balance pchs_avg_pric 우선
+    use_actual_price = str(os.getenv("PNL_TODAY_TRADES_USE_ACTUAL_FILL_PRICE", "1")).strip() in {"1", "true", "yes"}
+    balance_by_code: dict[str, dict] = {}
+    for row in (balance_rows or []):
+        c = str(row.get("pdno") or row.get("code") or "").zfill(6)
+        if c:
+            balance_by_code[c] = row
+
+    def _actual_fill_price(fill: dict) -> float:
+        """실제 체결가 조회: KIS balance pchs_avg_pric → fill.price 순서."""
+        if not use_actual_price:
+            return _safe_float(fill.get("price"))
+        code = str(fill.get("code") or "").zfill(6)
+        side = str(fill.get("side") or "").upper()
+        bal_row = balance_by_code.get(code)
+        if bal_row and side == "BUY":
+            avg_price = _safe_float(bal_row.get("pchs_avg_pric") or bal_row.get("avg_buy_price"))
+            if avg_price > 0:
+                return avg_price
+        # fill_meta_json에 실제 체결가가 있으면 사용
+        meta = fill.get("fill_meta_json") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if meta.get("avg_fill_px"):
+            avg_fill = _safe_float(meta.get("avg_fill_px"))
+            if avg_fill > 0:
+                return avg_fill
+        return _safe_float(fill.get("price"))
+
     trades = []
     for fill in today_fills:
         code = str(fill.get("code") or "").zfill(6)
         name = _name_for_code(code, balance_rows, db_positions)
+        actual_price = _actual_fill_price(fill)
+        meta = fill.get("fill_meta_json") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
         trades.append({
             "time": str(fill.get("filled_at") or "")[:19],
             "side": str(fill.get("side") or "").upper(),
             "code": code,
             "name": name,
             "qty": _safe_int(fill.get("qty")),
-            "price": _safe_float(fill.get("price")),
-            "amount": _safe_float(fill.get("price")) * _safe_int(fill.get("qty")),
-            "reason": str((fill.get("fill_meta_json") or {}).get("entry_reason") or ""),
+            "price": actual_price,
+            "price_source": "kis_avg_buy" if use_actual_price else "db_order_price",
+            "amount": actual_price * _safe_int(fill.get("qty")),
+            "reason": str(meta.get("entry_reason") or ""),
             "order_id": str(fill.get("kis_odno") or fill.get("order_id") or ""),
             "fill_status": "FILL_CONFIRMED",
         })
@@ -419,9 +459,12 @@ def _build_portfolio_summary(
     today_fills: list[dict],
     db_positions: list[dict],
     cash: "float | None",
+    kis_total_equity: "float | None" = None,
 ) -> dict:
     """
     Portfolio summary 계산. realized_pnl_today는 today_fills 기준 (전량매도 포함).
+    kis_total_equity: KIS 공식 순자산금액 (nass_amt 또는 tot_evlu_amt).
+      PNL_USE_KIS_OFFICIAL_TOTAL_EQUITY=1일 때 이 값을 total_equity_estimate로 직접 사용한다.
     """
     total_cost = sum(h["cost_basis"] for h in holdings)
     market_value = sum(h["market_value"] for h in holdings)
@@ -503,6 +546,25 @@ def _build_portfolio_summary(
     losers = sum(1 for h in holdings if h["pnl_pct"] < 0)
     best = max(holdings, key=lambda x: x["pnl_pct"], default=None)
     worst = min(holdings, key=lambda x: x["pnl_pct"], default=None)
+
+    # [2026-05-27] PNL_USE_KIS_OFFICIAL_TOTAL_EQUITY: nass_amt를 total_equity로 직접 사용
+    # nxdy_excc_amt(익일결제예수금)은 당일 매수금을 미차감 → market_value + cash 합산 시 이중계산 발생
+    use_kis_official = str(os.getenv("PNL_USE_KIS_OFFICIAL_TOTAL_EQUITY", "1")).strip() in {"1", "true", "yes"}
+    if use_kis_official and kis_total_equity is not None and kis_total_equity > 0:
+        total_equity_val = kis_total_equity
+        total_equity_source = "kis_official_nass_amt"
+    elif cash is not None:
+        total_equity_val = market_value + cash
+        total_equity_source = "computed_mv_plus_cash"
+    else:
+        total_equity_val = None
+        total_equity_source = "unavailable"
+    if total_equity_val is not None:
+        logger.info(
+            "[PNL_REPORT][TOTAL_EQUITY] total_equity=%.2f source=%s market_value=%.2f cash=%s",
+            total_equity_val, total_equity_source, market_value, cash,
+        )
+
     return {
         "total_positions": len(holdings),
         "total_cost": total_cost,
@@ -513,7 +575,8 @@ def _build_portfolio_summary(
         "total_pnl": total_pnl,
         "cash": cash,
         "cash_unavailable": cash is None,
-        "total_equity_estimate": (market_value + cash) if cash is not None else None,
+        "total_equity_estimate": total_equity_val,
+        "total_equity_source": total_equity_source,
         "winners": winners,
         "losers": losers,
         "best_position": f"{best['name']} {_fmt_pct(best['pnl_pct'])}" if best else "",
@@ -739,6 +802,30 @@ def main() -> int:
         if cash is None:
             logger.warning("[PNL_REPORT][CASH_UNAVAILABLE] balance_output2=%s", balance_output2)
 
+        # [2026-05-27] KIS 공식 순자산금액(nass_amt)으로 total_equity 직접 계산
+        # nass_amt가 없으면 tot_evlu_amt로 fallback
+        def _safe_float_from_balance(d: dict, key: str) -> "float | None":
+            raw = str(d.get(key) or "").replace(",", "").strip()
+            if not raw or raw in {"0", "0.0"}:
+                return None
+            try:
+                v = float(raw)
+                return v if v > 0 else None
+            except Exception:
+                return None
+
+        kis_total_equity = (
+            _safe_float_from_balance(balance_output2, "nass_amt")
+            or _safe_float_from_balance(balance_output2, "tot_evlu_amt")
+        )
+        if kis_total_equity:
+            logger.info(
+                "[PNL_REPORT][KIS_TOTAL_EQUITY] nass_amt=%s tot_evlu_amt=%s selected=%.2f",
+                balance_output2.get("nass_amt"),
+                balance_output2.get("tot_evlu_amt"),
+                kis_total_equity,
+            )
+
         # DB 데이터 조회
         db_positions = _get_positions_from_db(engine, env, trade_date)
         today_orders = _get_today_orders_from_db(engine, env, trade_date)
@@ -751,7 +838,7 @@ def main() -> int:
         )
 
         # Summary
-        summary = _build_portfolio_summary(holdings, today_fills, db_positions, cash)
+        summary = _build_portfolio_summary(holdings, today_fills, db_positions, cash, kis_total_equity=kis_total_equity)
         summary["cash_source"] = cash_source
 
         # Today trades

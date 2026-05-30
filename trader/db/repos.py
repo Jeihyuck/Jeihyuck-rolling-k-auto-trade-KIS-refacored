@@ -442,6 +442,45 @@ def _resolve_lookup_fail_open() -> bool:
     return _lookup_fail_open_default()
 
 
+def _resolve_position_fail_open() -> bool:
+    """PositionsRepo 전용 fail-open 판정.
+    PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT가 명시적으로 설정된 경우 우선 사용하고,
+    없으면 공통 _resolve_lookup_fail_open()으로 fallback한다."""
+    explicit = os.getenv("PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT")
+    if explicit is not None:
+        return _env_flag(
+            "PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT",
+            default=_lookup_fail_open_default(),
+        )
+    return _resolve_lookup_fail_open()
+
+
+def _resolve_fill_fail_open() -> bool:
+    """FillsRepo 전용 fail-open 판정.
+    PB1_FAIL_OPEN_ON_FILL_LOOKUP_TIMEOUT가 명시적으로 설정된 경우 우선 사용하고,
+    없으면 공통 _resolve_lookup_fail_open()으로 fallback한다."""
+    explicit = os.getenv("PB1_FAIL_OPEN_ON_FILL_LOOKUP_TIMEOUT")
+    if explicit is not None:
+        return _env_flag(
+            "PB1_FAIL_OPEN_ON_FILL_LOOKUP_TIMEOUT",
+            default=_lookup_fail_open_default(),
+        )
+    return _resolve_lookup_fail_open()
+
+
+def _resolve_ledger_fail_open() -> bool:
+    """LedgerEventsRepo 전용 fail-open 판정.
+    PB1_FAIL_OPEN_ON_LEDGER_LOOKUP_TIMEOUT가 명시적으로 설정된 경우 우선 사용하고,
+    없으면 공통 _resolve_lookup_fail_open()으로 fallback한다."""
+    explicit = os.getenv("PB1_FAIL_OPEN_ON_LEDGER_LOOKUP_TIMEOUT")
+    if explicit is not None:
+        return _env_flag(
+            "PB1_FAIL_OPEN_ON_LEDGER_LOOKUP_TIMEOUT",
+            default=_lookup_fail_open_default(),
+        )
+    return _resolve_lookup_fail_open()
+
+
 def _safe_repo_read(
     engine: "Engine",
     stmt,
@@ -3516,7 +3555,7 @@ class FillsRepo:
         fail_open: bool | None = None,
     ) -> list[dict]:
         if fail_open is None:
-            fail_open = _order_lookup_fail_open_default()
+            fail_open = _resolve_fill_fail_open()
         self._last_read_fail_open_op = None
         rows, fail_open_triggered = safe_read_mappings(
             self.engine,
@@ -3560,7 +3599,7 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == str(code).zfill(6))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
-        fail_open = _order_lookup_fail_open_default()
+        fail_open = _resolve_fill_fail_open()
         try:
             return self._read_mappings_with_guard(
                 stmt,
@@ -3627,7 +3666,7 @@ class FillsRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="fills.list_fills_in_window",
-            fail_open=_order_lookup_fail_open_default(),
+            fail_open=_resolve_fill_fail_open(),
         )
 
     def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
@@ -3649,7 +3688,7 @@ class FillsRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="fills.list_latest_buy_fills_by_codes",
-            fail_open=_order_lookup_fail_open_default(),
+            fail_open=_resolve_fill_fail_open(),
         )
         for row in rows:
             item = dict(row)
@@ -4670,7 +4709,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.list_positions",
-            fail_open=_resolve_lookup_fail_open(),
+            fail_open=_resolve_position_fail_open(),
         )
 
     def get_position(self, *, env: str, strategy: str, sid: int, mode: int, code: str) -> dict | None:
@@ -4687,7 +4726,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.get_position",
-            fail_open=_resolve_lookup_fail_open(),
+            fail_open=_resolve_position_fail_open(),
         )
         return rows[0] if rows else None
 
@@ -4705,7 +4744,7 @@ class PositionsRepo:
             self.engine,
             stmt,
             op_name="positions.list_positions_by_codes",
-            fail_open=_resolve_lookup_fail_open(),
+            fail_open=_resolve_position_fail_open(),
         )
 
     def close_positions(self, *, env: str, strategy: str, codes: list[str]) -> int:

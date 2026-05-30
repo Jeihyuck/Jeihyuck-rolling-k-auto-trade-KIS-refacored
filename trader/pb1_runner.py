@@ -4728,6 +4728,9 @@ def run_once(
 
     # Ensure defined for all branches (prevents NameError in non-trading-day path)
     dry_run_reason = "unknown"
+    engine_started = False
+    engine_completed = False
+    orders_accepted_count = 0
 
     if non_trading_day:
         dry_run_reason = "nontrading_day"
@@ -5563,7 +5566,10 @@ def run_once(
         if close_cancel_only:
             result = engine_runner.run_close_cancel()
         else:
+            engine_started = True
             result = engine_runner.run()
+            engine_completed = True
+            orders_accepted_count = int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))
             if entry_scan_compat_failed:
                 logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
 
@@ -5795,9 +5801,38 @@ def run_once(
         )
         fatal_status = "FATAL_RUNTIME"
         fatal_reason = "RUNS_LEDGER_QUERY_FAIL" if str(exc) == "RUNS_LEDGER_QUERY_FAIL" else "UNHANDLED_RUNTIME_EXCEPTION"
+        _distinguish_postprocess = str(os.getenv("PB1_ASSERT_DISTINGUISH_POSTPROCESS_FAILURE", "1")).strip() in {"1", "true", "yes"}
         if postprocess_stage != "engine_run":
-            fatal_status = "FATAL_POSTPROCESS"
-            fatal_reason = f"RUN_ONCE_POSTPROCESS_{type(exc).__name__.upper()}"
+            if engine_completed and orders_accepted_count > 0 and _distinguish_postprocess:
+                fatal_status = "PARTIAL_SUCCESS_POSTPROCESS_FAILED"
+                fatal_reason = f"ENGINE_RAN_ORDER_ACCEPTED_POSTPROCESS_FAILED:{type(exc).__name__.upper()}"
+            else:
+                fatal_status = "FATAL_POSTPROCESS"
+                fatal_reason = f"RUN_ONCE_POSTPROCESS_{type(exc).__name__.upper()}"
+        logger.error(
+            "[ASSERT][ENGINE] engine_started=%s engine_completed=%s postprocess_stage=%s",
+            int(engine_started),
+            int(engine_completed),
+            postprocess_stage,
+        )
+        logger.error(
+            "[ASSERT][ORDER] orders_accepted=%s buy_orders_in_payload=%s",
+            orders_accepted_count,
+            int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0)) if engine_runner else 0,
+        )
+        logger.error(
+            "[ASSERT][POSTPROCESS] fatal_status=%s fatal_reason=%s distinguish_enabled=%s",
+            fatal_status,
+            fatal_reason,
+            int(_distinguish_postprocess),
+        )
+        logger.error(
+            "[ASSERT][RESULT] status=%s reason=%s session=%s event=%s",
+            fatal_status,
+            fatal_reason,
+            str(os.getenv("PB1_SESSION_KIND") or window_context or phase_context or "unknown"),
+            str(os.getenv("GITHUB_EVENT_NAME") or "unknown"),
+        )
         logger.error(
             "[RUN_SUMMARY][RESULT] status=%s reason=%s session=%s event=%s",
             fatal_status,
