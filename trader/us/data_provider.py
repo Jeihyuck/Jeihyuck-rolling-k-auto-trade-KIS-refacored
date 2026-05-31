@@ -105,6 +105,68 @@ def _get_first_valid(row: dict, keys: tuple[str, ...], default: Any = None) -> A
     return default
 
 
+# KIS raw 필드 후보 정의
+_CLOSE_KEYS = ("clos", "close", "stck_clpr", "ovrs_nmix_prpr", "prpr", "last", "price")
+_OPEN_KEYS = ("open", "ovrs_nmix_oprc", "stck_oprc")
+_HIGH_KEYS = ("high", "ovrs_nmix_hgpr", "stck_hgpr")
+_LOW_KEYS = ("low", "ovrs_nmix_lwpr", "stck_lwpr")
+_VOLUME_KEYS = ("volume", "acml_vol", "tvol", "stck_sdpr")
+_DATE_KEYS = ("xymd", "date", "stck_bsop_date", "bas_dt", "trad_dvsn")
+
+
+def normalize_daily_row(row: dict) -> dict:
+    """KIS raw 일봉 row를 표준 OHLCV dict로 정규화.
+
+    close/open/high/low/volume/date 표준 필드를 보장한다.
+    KIS raw 필드 후보를 모두 지원하며, 숫자는 comma 제거 후 float/int로 변환한다.
+    """
+    close_raw = _get_first_valid(row, _CLOSE_KEYS)
+    open_raw = _get_first_valid(row, _OPEN_KEYS)
+    high_raw = _get_first_valid(row, _HIGH_KEYS)
+    low_raw = _get_first_valid(row, _LOW_KEYS)
+    volume_raw = _get_first_valid(row, _VOLUME_KEYS)
+    date_raw = _get_first_valid(row, _DATE_KEYS)
+
+    close_val = _safe_float(close_raw) if close_raw is not None else None
+    open_val = _safe_float(open_raw) if open_raw is not None else None
+    high_val = _safe_float(high_raw) if high_raw is not None else None
+    low_val = _safe_float(low_raw) if low_raw is not None else None
+    volume_val = _safe_int(volume_raw) if volume_raw is not None else None
+
+    result = dict(row)  # 원본 필드 보존 (기존 코드 호환)
+    result["close"] = close_val
+    result["open"] = open_val
+    result["high"] = high_val
+    result["low"] = low_val
+    result["volume"] = volume_val
+    result["date"] = str(date_raw) if date_raw is not None else None
+    # 하위 호환: clos / tvol 필드도 정규화 값으로 갱신
+    if close_val is not None:
+        result["clos"] = str(close_val)
+    if volume_val is not None:
+        result["tvol"] = str(volume_val)
+    return result
+
+
+def normalize_daily_rows(symbol: str, rows: list[dict]) -> list[dict]:
+    """일봉 row list를 정규화하고 필수 로그를 남긴다."""
+    rows_raw = len(rows)
+    normalized = [normalize_daily_row(r) for r in rows]
+    rows_norm = len(normalized)
+    close_nonnull = sum(1 for r in normalized if r.get("close") is not None and r["close"] > 0)
+    volume_nonnull = sum(1 for r in normalized if r.get("volume") is not None and r["volume"] > 0)
+    logger.info(
+        "[US_DATA_PROVIDER][DAILY_NORMALIZE] symbol=%s rows_raw=%d rows_norm=%d"
+        " close_nonnull=%d volume_nonnull=%d",
+        symbol,
+        rows_raw,
+        rows_norm,
+        close_nonnull,
+        volume_nonnull,
+    )
+    return normalized
+
+
 def normalize_us_balance(raw: dict) -> dict:
     """KIS 해외잔고 응답을 표준 positions 형태로 정규화.
     
@@ -606,7 +668,8 @@ class USDataProvider:
         
         if self._offline:
             logger.debug("[US_DATA][OFFLINE] daily_prices symbol=%s count=%d", symbol, count)
-            result = _make_stub_daily(symbol, count)
+            raw_stub = _make_stub_daily(symbol, count)
+            result = normalize_daily_rows(symbol, raw_stub)
             if self._cache_enabled:
                 self._daily_cache[cache_key] = result
                 self.stats["daily_ok_symbols"].add(symbol.upper())
@@ -614,7 +677,8 @@ class USDataProvider:
         
         try:
             rows = self._get_client().get_us_daily_price(symbol, exchange, count, as_of_date=as_of_date)
-            result = sorted(rows, key=lambda r: str(r.get("xymd", "")))
+            normalized = normalize_daily_rows(symbol, rows)
+            result = sorted(normalized, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
             if self._cache_enabled:
                 self._daily_cache[cache_key] = result
                 self.stats["daily_ok_symbols"].add(symbol.upper())
@@ -629,13 +693,14 @@ class USDataProvider:
                 )
                 db_rows = self._load_daily_prices_from_db(symbol, market="US", days=count)
                 if db_rows:
+                    normalized_db = normalize_daily_rows(symbol, db_rows)
                     logger.info(
-                        "[US_DATA][FALLBACK_DB_OK] symbol=%s count=%d", symbol, len(db_rows)
+                        "[US_DATA][FALLBACK_DB_OK] symbol=%s count=%d", symbol, len(normalized_db)
                     )
                     if self._cache_enabled:
-                        self._daily_cache[cache_key] = db_rows
+                        self._daily_cache[cache_key] = normalized_db
                         self.stats["daily_ok_symbols"].add(symbol.upper())
-                    return db_rows
+                    return normalized_db
                 else:
                     logger.error(
                         "[US_DATA][FALLBACK_DB_EMPTY] symbol=%s no DB data", symbol

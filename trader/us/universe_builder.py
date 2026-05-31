@@ -82,18 +82,27 @@ def _is_etf(symbol: str) -> bool:
 
 
 def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
-    """최근 14일 ATR% 계산 (offline/test stub 대응)."""
+    """최근 14일 ATR% 계산 (normalize_daily_rows 정규화 이후 데이터 대응)."""
     if len(daily_rows) < 15:
         return None
     try:
         trs = []
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
+        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
         recent = rows[-15:]
         for i in range(1, len(recent)):
-            prev_close = float(recent[i - 1].get("clos", 0) or 0)
-            high = float(recent[i].get("high", 0) or 0)
-            low = float(recent[i].get("low", 0) or 0)
-            c = float(recent[i].get("clos", 0) or 0)
+            # normalize_daily_rows 이후 close/high/low 필드 우선, fallback clos
+            prev_close = recent[i - 1].get("close") or float(str(recent[i - 1].get("clos", 0) or 0).replace(",", ""))
+            high = recent[i].get("high") or float(str(recent[i].get("high", 0) or 0).replace(",", ""))
+            low = recent[i].get("low") or float(str(recent[i].get("low", 0) or 0).replace(",", ""))
+            c = recent[i].get("close") or float(str(recent[i].get("clos", 0) or 0).replace(",", ""))
+            if not isinstance(prev_close, (int, float)):
+                prev_close = float(prev_close or 0)
+            if not isinstance(high, (int, float)):
+                high = float(high or 0)
+            if not isinstance(low, (int, float)):
+                low = float(low or 0)
+            if not isinstance(c, (int, float)):
+                c = float(c or 0)
             if prev_close <= 0:
                 continue
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
@@ -101,7 +110,11 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
         if not trs:
             return None
         atr = sum(trs) / len(trs)
-        last_close = float(rows[-1].get("clos", 0) or 0)
+        # normalize_daily_rows 이후 close 필드 우선
+        last_close_val = rows[-1].get("close")
+        if last_close_val is None:
+            last_close_val = float(str(rows[-1].get("clos", 0) or 0).replace(",", ""))
+        last_close = float(last_close_val or 0)
         if last_close <= 0:
             return None
         return round(atr / last_close, 4)
@@ -109,33 +122,69 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
         return None
 
 
+def _extract_latest_close(daily_rows: list[dict]) -> float | None:
+    """일봉 rows의 마지막 close 값을 반환한다."""
+    if not daily_rows:
+        return None
+    rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
+    last = rows[-1]
+    close_val = last.get("close")
+    if close_val is None:
+        close_val = last.get("clos")
+    if close_val is None:
+        return None
+    try:
+        val = float(str(close_val).replace(",", ""))
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def _compute_avg_volume(daily_rows: list[dict], days: int = 20) -> float:
-    """최근 N일 평균 거래량."""
+    """최근 N일 평균 거래량 (normalize_daily_rows 정규화 대응)."""
     if not daily_rows:
         return 0.0
     try:
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
+        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
         recent = rows[-days:]
-        volumes = [float(str(r.get("tvol", 0) or 0).replace(",", "")) for r in recent]
-        vols = [v for v in volumes if v > 0]
-        return sum(vols) / len(vols) if vols else 0.0
+        volumes = []
+        for r in recent:
+            vol = r.get("volume")
+            if vol is None:
+                vol = r.get("tvol", 0)
+            try:
+                v = float(str(vol or 0).replace(",", ""))
+                if v > 0:
+                    volumes.append(v)
+            except (ValueError, TypeError):
+                pass
+        return sum(volumes) / len(volumes) if volumes else 0.0
     except Exception:
         return 0.0
 
 
 def _compute_avg_dollar_volume(daily_rows: list[dict], days: int = 20) -> float:
-    """최근 N일 평균 거래대금."""
+    """최근 N일 평균 거래대금 (normalize_daily_rows 정규화 대응)."""
     if not daily_rows:
         return 0.0
     try:
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
+        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
         recent = rows[-days:]
         dollar_vols = []
         for r in recent:
-            vol = float(str(r.get("tvol", 0) or 0).replace(",", ""))
-            close = float(str(r.get("clos", 0) or 0).replace(",", ""))
-            if vol > 0 and close > 0:
-                dollar_vols.append(vol * close)
+            vol = r.get("volume")
+            if vol is None:
+                vol = r.get("tvol", 0)
+            close = r.get("close")
+            if close is None:
+                close = r.get("clos", 0)
+            try:
+                v = float(str(vol or 0).replace(",", ""))
+                c = float(str(close or 0).replace(",", ""))
+                if v > 0 and c > 0:
+                    dollar_vols.append(v * c)
+            except (ValueError, TypeError):
+                pass
         return sum(dollar_vols) / len(dollar_vols) if dollar_vols else 0.0
     except Exception:
         return 0.0
@@ -175,10 +224,18 @@ def build_us_dynamic_universe(
     min_price = _env_float("US_MIN_PRICE", 5.0)
     min_avg_volume = _env_float("US_MIN_AVG_VOLUME_20D", 500_000.0)
     min_avg_dollar_volume = _env_float("US_MIN_AVG_DOLLAR_VOLUME_20D", 50_000_000.0)
-    min_history_days = _env_int("US_MIN_HISTORY_DAYS", 120)
+    # 수정 3: 기본값 120 → 60, relaxed=30
+    strict_history_days = _env_int("US_MIN_HISTORY_DAYS", 60)
+    relaxed_history_days = max(30, strict_history_days // 2)
     max_atr_pct = _env_float("US_MAX_ATR_PCT", 0.18)
     universe_min = _env_int("US_DYNAMIC_UNIVERSE_MIN", 80)
     universe_target = _env_int("US_DYNAMIC_UNIVERSE_TARGET", 300)
+
+    # 수정 5: manual seed / core ETF - price만 있으면 fallback 허용
+    _CORE_SEED_SYMBOLS: frozenset[str] = frozenset({
+        "SPY", "QQQ", "QQQM", "SMH", "SOXX",
+        "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO",
+    })
 
     # ── Source 수집 ──────────────────────────────────────────────────────
     dynamic_sources = _load_dynamic_sources()
@@ -252,7 +309,7 @@ def build_us_dynamic_universe(
         unique_count,
     )
 
-    # ── 데이터 조회 + 필터 ────────────────────────────────────────────────
+    # ── 데이터 조회 + 3단계 필터 ────────────────────────────────────────────
     filter_counts = {
         "passed": 0,
         "failed_price": 0,
@@ -262,66 +319,184 @@ def build_us_dynamic_universe(
         "failed_atr": 0,
     }
 
-    filtered_symbols: list[dict] = []
+    # 3단계 버킷
+    strict_pass: list[dict] = []
+    relaxed_pass: list[dict] = []
+    fallback_pass: list[dict] = []
+
+    # 실패 상세 추적 (수정 6)
+    _fail_details: list[dict] = []
+
     warnings: list[str] = []
     errors: list[str] = []
 
     for symbol in all_tickers:
         exchange = _resolve_exchange(symbol)
+        current_price: float | None = None
+        latest_close: float | None = None
+        daily: list[dict] = []
+        history_days: int = 0
+        current_price_raw_val: str = "None"
+
+        # --- current price 조회 ---
         try:
             current = provider.get_current_price(symbol, exchange)
-            price = float(str(current.get("last", 0) or 0).replace(",", ""))
+            _raw_last = current.get("last", 0) or current.get("close", 0) or 0
+            _p = float(str(_raw_last).replace(",", ""))
+            if _p > 0:
+                current_price = _p
+            current_price_raw_val = str(_raw_last)
         except Exception as exc:
-            logger.debug("[US_UNIVERSE_BUILDER][SKIP] symbol=%s reason=price_fetch_error error=%s", symbol, exc)
-            filter_counts["failed_price"] += 1
-            continue
+            logger.debug(
+                "[US_UNIVERSE_BUILDER][SKIP] symbol=%s reason=price_fetch_error error=%s",
+                symbol, exc,
+            )
 
-        if price < min_price:
-            filter_counts["failed_price"] += 1
-            continue
-
+        # --- daily price 조회 ---
         try:
             daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
+            history_days = len(daily)
+            latest_close = _extract_latest_close(daily)
         except Exception as exc:
-            logger.debug("[US_UNIVERSE_BUILDER][SKIP] symbol=%s reason=daily_fetch_error error=%s", symbol, exc)
-            filter_counts["failed_history"] += 1
-            continue
+            logger.debug(
+                "[US_UNIVERSE_BUILDER][SKIP] symbol=%s reason=daily_fetch_error error=%s",
+                symbol, exc,
+            )
 
-        history_days = len(daily)
-        if history_days < min_history_days:
-            filter_counts["failed_history"] += 1
-            continue
+        # --- price fallback (수정 2) ---
+        price: float | None = current_price
+        price_source = "current"
+        if (price is None or price <= 0) and latest_close and latest_close > 0:
+            price = latest_close
+            price_source = "daily_close"
+            logger.info(
+                "[US_UNIVERSE_BUILDER][PRICE_FALLBACK] symbol=%s source=daily_close price=%.4f",
+                symbol, price,
+            )
+
+        price_ok = price is not None and price > 0 and price >= min_price
+
+        if price_ok:
+            logger.debug(
+                "[US_UNIVERSE_BUILDER][PRICE_OK] symbol=%s price=%.4f source=%s",
+                symbol, price, price_source,
+            )
+
+        # --- 각 실패 항목 상세 로그 (수정 6) ---
+        close_nonnull = sum(
+            1 for r in daily
+            if (r.get("close") is not None and r.get("close", 0) > 0)
+            or (r.get("clos") is not None and str(r.get("clos", "0")) not in ("0", "0.0", ""))
+        )
+        volume_nonnull = sum(
+            1 for r in daily
+            if (r.get("volume") is not None and r.get("volume", 0) > 0)
+            or (r.get("tvol") is not None and str(r.get("tvol", "0")) not in ("0", "0.0", ""))
+        )
 
         avg_vol = _compute_avg_volume(daily, 20)
-        if avg_vol < min_avg_volume:
-            filter_counts["failed_volume"] += 1
-            continue
-
         avg_dv = _compute_avg_dollar_volume(daily, 20)
-        if avg_dv < min_avg_dollar_volume:
-            filter_counts["failed_dollar_volume"] += 1
-            continue
-
         atr_pct = _compute_atr_pct(daily)
-        if atr_pct is not None and atr_pct > max_atr_pct:
-            filter_counts["failed_atr"] += 1
-            continue
+
+        # strict 조건 평가
+        strict_ok = (
+            price_ok
+            and history_days >= strict_history_days
+            and avg_vol >= min_avg_volume
+            and avg_dv >= min_avg_dollar_volume
+            and (atr_pct is None or atr_pct <= max_atr_pct)
+        )
+
+        # relaxed 조건 평가
+        relaxed_ok = (
+            price_ok
+            and history_days >= relaxed_history_days
+            and avg_vol > 0
+            and avg_dv > 0
+        )
+
+        # fallback 조건 평가 (수정 5: core seed는 price만 있으면 허용)
+        is_core_seed = symbol in _CORE_SEED_SYMBOLS or "manual_seed" in ticker_tags.get(symbol, [])
+        fallback_ok = price_ok and (latest_close is not None) and is_core_seed
 
         asset_type = "etf" if _is_etf(symbol) else "stock"
-        filter_counts["passed"] += 1
-        filtered_symbols.append({
+        base_entry = {
             "symbol": symbol,
             "exchange": exchange,
             "asset_type": asset_type,
-            "source_tags": ticker_tags.get(symbol, []),
-            "price": round(price, 4),
+            "source_tags": list(ticker_tags.get(symbol, [])),
+            "price": round(price, 4) if price else 0.0,
             "avg_volume_20d": round(avg_vol, 0),
             "avg_dollar_volume_20d": round(avg_dv, 0),
             "history_days": history_days,
             "atr_pct": atr_pct if atr_pct is not None else 0.0,
-        })
+        }
 
-    filtered_count = filter_counts["passed"]
+        if strict_ok:
+            strict_pass.append({**base_entry, "filter_mode": "strict"})
+        elif relaxed_ok:
+            relaxed_pass.append({**base_entry, "filter_mode": "relaxed"})
+        elif fallback_ok:
+            fallback_pass.append({
+                **base_entry,
+                "filter_mode": "fallback_seed_price_only",
+                "warning": "insufficient_history_but_seed_allowed",
+            })
+        else:
+            # 실패 사유 추적
+            fail_reason: str
+            if not price_ok:
+                fail_reason = "failed_price"
+                filter_counts["failed_price"] += 1
+            elif history_days < relaxed_history_days:
+                fail_reason = "failed_history"
+                filter_counts["failed_history"] += 1
+            elif avg_vol < min_avg_volume:
+                fail_reason = "failed_volume"
+                filter_counts["failed_volume"] += 1
+            elif avg_dv < min_avg_dollar_volume:
+                fail_reason = "failed_dollar_volume"
+                filter_counts["failed_dollar_volume"] += 1
+            elif atr_pct is not None and atr_pct > max_atr_pct:
+                fail_reason = "failed_atr"
+                filter_counts["failed_atr"] += 1
+            else:
+                fail_reason = "failed_unknown"
+
+            _fail_details.append({
+                "symbol": symbol,
+                "price": price,
+                "latest_close": latest_close,
+                "current_price": current_price,
+                "daily_rows": history_days,
+                "history_days": history_days,
+                "close_nonnull": close_nonnull,
+                "volume_nonnull": volume_nonnull,
+                "reason": fail_reason,
+            })
+
+    # ── strict/relaxed/fallback 집계 로그 ─────────────────────────────────
+    logger.info("[US_UNIVERSE_BUILDER][FILTER][STRICT] passed=%d", len(strict_pass))
+    logger.info("[US_UNIVERSE_BUILDER][FILTER][RELAXED] passed=%d", len(relaxed_pass))
+    logger.info("[US_UNIVERSE_BUILDER][FILTER][FALLBACK] passed=%d", len(fallback_pass))
+
+    # ── 최종 selected 구성 (strict 우선) ─────────────────────────────────
+    # strict → relaxed → fallback 순으로 누적
+    filtered_symbols: list[dict] = list(strict_pass)
+    selected_set: set[str] = {s["symbol"] for s in filtered_symbols}
+
+    for entry in relaxed_pass:
+        if entry["symbol"] not in selected_set:
+            filtered_symbols.append(entry)
+            selected_set.add(entry["symbol"])
+
+    for entry in fallback_pass:
+        if entry["symbol"] not in selected_set:
+            filtered_symbols.append(entry)
+            selected_set.add(entry["symbol"])
+
+    filtered_count = len(filtered_symbols)
+    filter_counts["passed"] = filtered_count
 
     logger.info(
         "[US_UNIVERSE_BUILDER][FILTER] input=%d passed=%d failed_price=%d"
@@ -335,47 +510,44 @@ def build_us_dynamic_universe(
         filter_counts["failed_atr"],
     )
 
-    # ── filter fail sample 로그 ───────────────────────────────────────────
-    if filter_counts["passed"] == 0 or filter_counts["passed"] < 30:
-        # failed_price / failed_history 샘플 최대 10개씩
-        price_fail_samples: list[str] = []
-        history_fail_samples: list[str] = []
-        _seen_price: set[str] = set()
-        _seen_history: set[str] = set()
-        for _sym in all_tickers:
-            if len(price_fail_samples) >= 10 and len(history_fail_samples) >= 10:
-                break
-            if _sym not in {s["symbol"] for s in filtered_symbols}:
-                # 어느 fail 버킷인지 단순 판단: exchange 조회 오류 시 price fail로 간주
-                if _sym not in _seen_price and len(price_fail_samples) < 10:
-                    price_fail_samples.append(_sym)
-                    _seen_price.add(_sym)
+    # ── 실패 상세 로그 (수정 6) ─────────────────────────────────────────────
+    if _fail_details:
+        price_fail_samples = [d["symbol"] for d in _fail_details if d["reason"] == "failed_price"][:10]
         if price_fail_samples:
             logger.warning(
                 "[US_UNIVERSE_BUILDER][FILTER_FAIL_SAMPLE] reason=failed_price symbols=%s",
                 ",".join(price_fail_samples),
             )
-        logger.warning(
-            "[US_UNIVERSE_BUILDER][FILTER_FAIL_DETAIL] as_of_date=%s bymd=%s",
-            as_of_date,
-            str(as_of_date).replace("-", "")[:8] if as_of_date else "UNKNOWN",
-        )
+        for det in _fail_details[:20]:  # 최대 20개 상세 로그
+            logger.warning(
+                "[US_UNIVERSE_BUILDER][FILTER_FAIL_DETAIL] symbol=%s price=%s latest_close=%s"
+                " current_price=%s daily_rows=%d history_days=%d"
+                " close_nonnull=%d volume_nonnull=%d reason=%s",
+                det["symbol"],
+                det["price"],
+                det["latest_close"],
+                det["current_price"],
+                det["daily_rows"],
+                det["history_days"],
+                det["close_nonnull"],
+                det["volume_nonnull"],
+                det["reason"],
+            )
 
-    # ── 상태 결정 ──────────────────────────────────────────────────────────
-    if filtered_count == 0 or filtered_count < 30:
+    # ── 상태 결정 (수정 7) ────────────────────────────────────────────────
+    if filtered_count < 30:
         status = "ERROR"
         errors.append(f"filtered_count={filtered_count} < hard_min=30")
         logger.error("[US_UNIVERSE_BUILDER][ERROR] filtered_count=%d < 30 → hard fail", filtered_count)
+    elif filtered_count < 80:
+        status = "OK_WITH_WARNINGS"
+        warnings.append(f"filtered_count={filtered_count} < 80 (used_relaxed_or_fallback)")
     elif filtered_count < universe_min:
         status = "OK_WITH_WARNINGS"
-        warnings.append(
-            f"filtered_count={filtered_count} < universe_min={universe_min}"
-        )
+        warnings.append(f"filtered_count={filtered_count} < universe_min={universe_min}")
     elif filtered_count < universe_target:
         status = "OK_WITH_WARNINGS"
-        warnings.append(
-            f"filtered_count={filtered_count} < universe_target={universe_target}"
-        )
+        warnings.append(f"filtered_count={filtered_count} < universe_target={universe_target}")
     else:
         status = "OK"
 
