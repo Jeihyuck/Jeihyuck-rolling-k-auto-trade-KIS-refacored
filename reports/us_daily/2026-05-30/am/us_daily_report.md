@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-02
+# US Daily Report - 2026-05-30
 
 ## Required Fields
 
-- trade_date: 2026-05-02
+- trade_date: 2026-05-30
 - run_id: local
 - sha: 
 - workflow: 
@@ -21,8 +21,8 @@
 - fills: 0
 - positions: 0
 - last_stage: tick_1
-- final_status: OK_WITH_WARNINGS_SIGNAL_ONLY
-- reason: max_ticks
+- final_status: OK_SIGNAL_ONLY
+- reason: graceful_shutdown
 - temp_error_count: 0
 - temp_recovered_count: 0
 - missed_trade_window: False

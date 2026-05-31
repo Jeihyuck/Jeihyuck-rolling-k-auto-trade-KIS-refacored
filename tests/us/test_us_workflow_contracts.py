@@ -79,3 +79,19 @@ def test_us_trade_workflows_have_safety_env():
             f"{filename} missing US_LIVE_TRADING_ENABLED"
         assert "ALLOW_REAL_ORDER" in content, \
             f"{filename} missing ALLOW_REAL_ORDER"
+
+
+def test_no_us_trade_pm_workflow():
+    """us-trade-pm.yml 파일이 있으면 안 된다 (pm session is forbidden)."""
+    forbidden = WORKFLOW_DIR / "us-trade-pm.yml"
+    assert not forbidden.exists(), "FORBIDDEN: us-trade-pm.yml must not exist"
+
+
+def test_no_session_pm_in_workflows():
+    """어떤 US workflow yml에도 session=pm 또는 session-pm이 없어야 한다."""
+    for yml_file in WORKFLOW_DIR.glob("us-*.yml"):
+        content = yml_file.read_text(encoding="utf-8")
+        assert "session-pm" not in content, f"FORBIDDEN: session-pm found in {yml_file.name}"
+        assert 'session: "pm"' not in content, f"FORBIDDEN: session:pm found in {yml_file.name}"
+        assert "session: pm" not in content, f"FORBIDDEN: session: pm found in {yml_file.name}"
+

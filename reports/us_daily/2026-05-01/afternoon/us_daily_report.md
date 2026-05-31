@@ -9,7 +9,7 @@
 - session: afternoon
 - event_name: 
 - env: practice
-- dry_run: False
+- dry_run: True
 - kis_order_allowed: 1
 - prep_status: UNKNOWN
 - locked_watchlist_count: 0

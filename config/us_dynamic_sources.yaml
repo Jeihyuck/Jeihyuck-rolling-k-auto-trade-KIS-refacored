@@ -1,0 +1,112 @@
+manual_seed_note: "config/us_universe.yaml remains the manual seed source."
+
+core_etf:
+  - SPY
+  - QQQ
+  - QQQM
+  - SMH
+  - SOXX
+
+ai_semiconductor_extended:
+  - NVDA
+  - AMD
+  - AVGO
+  - TSM
+  - ARM
+  - MU
+  - ASML
+  - AMAT
+  - LRCX
+  - KLAC
+  - MRVL
+  - MCHP
+  - ON
+  - QCOM
+  - INTC
+  - TXN
+  - ADI
+  - NXPI
+  - MPWR
+  - LSCC
+  - ALAB
+  - CRDO
+  - COHR
+  - LITE
+  - AAOI
+  - VIAVI
+
+ai_platform_software:
+  - MSFT
+  - GOOGL
+  - META
+  - AMZN
+  - AAPL
+  - PLTR
+  - APP
+  - NOW
+  - SNOW
+  - DDOG
+  - NET
+  - MDB
+  - PANW
+  - CRWD
+  - ZS
+  - TEAM
+  - SHOP
+  - U
+  - AI
+  - ORCL
+  - CRM
+  - IBM
+  - ACN
+
+data_center_infra:
+  - VRT
+  - ANET
+  - DELL
+  - HPE
+  - SMCI
+  - ETN
+  - HUBB
+  - PWR
+  - CLS
+  - APH
+  - TEL
+  - FLEX
+  - JBL
+  - GLW
+  - COMM
+
+energy_power_ai:
+  - CEG
+  - VST
+  - NRG
+  - GEV
+  - BE
+  - FLNC
+  - ENPH
+  - FSLR
+  - NEE
+  - SO
+  - DUK
+
+growth_liquidity_watch:
+  - TSLA
+  - NFLX
+  - COST
+  - LLY
+  - NVO
+  - JPM
+  - MA
+  - V
+  - WMT
+  - HD
+  - CAT
+  - UBER
+  - ABNB
+  - RDDT
+  - CRWV
+  - IREN
+  - HOOD
+  - COIN
+  - MSTR

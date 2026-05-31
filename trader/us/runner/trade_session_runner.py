@@ -266,8 +266,6 @@ def run_trade_session(
     from trader.us.budget import resolve_us_order_budget
 
     # ── 시각 및 거래일 확인 ───────────────────────────────────────────────────
-    # actual_now: 실제 현재 시각 (실제 거래일 판정용)
-    # simulated_now: force_now가 있으면 사용하는 시뮬레이션 시각
     actual_now = _now_ny(None)
     simulated_now = _now_ny(force_now) if force_now else actual_now
     
@@ -277,6 +275,86 @@ def run_trade_session(
         "[US_SESSION][PHASE_GUARD] session=%s actual_now_et=%s simulated_now_et=%s actual_is_trading_day=%s",
         session, actual_now.strftime("%H:%M:%S"), simulated_now.strftime("%H:%M:%S"), actual_is_trading_day,
     )
+
+    # ── Prep Guard (am / afternoon session) ──────────────────────────────
+    if session in ("am", "afternoon") and not offline:
+        try:
+            from trader.us.prep_contract import check_us_prep_guard
+            guard = check_us_prep_guard(trade_date)
+            if guard["ok"]:
+                logger.info(
+                    "[US_PREP_GUARD][OK] workflow=us-trade-%s session=%s trade_date=%s"
+                    " final30=%s score_nonzero=%s source=%s",
+                    session, session, trade_date,
+                    guard.get("final30_scored_count", "?"),
+                    guard.get("score_nonzero_count", "?"),
+                    guard.get("source", "runtime"),
+                )
+            else:
+                logger.error(
+                    "[US_PREP_GUARD][BLOCK] workflow=us-trade-%s session=%s"
+                    " reason=final30_missing_or_contract_fail trade_date=%s detail=%s",
+                    session, session, trade_date, guard.get("reason"),
+                )
+                _write_us_schedule_health(
+                    {
+                        "trade_date": trade_date,
+                        "final_status": "FAILED_PREP_GUARD",
+                        "reason": f"prep_guard_block:{guard.get('reason')}",
+                        "tick_count": 0,
+                        "workflow": f"us-trade-{session}",
+                    },
+                    session,
+                )
+                return {
+                    "status": "FAILED_PREP_GUARD",
+                    "reason": f"prep_guard_block:{guard.get('reason')}",
+                    "session": session,
+                    "trade_date": trade_date,
+                }
+        except Exception as _guard_exc:
+            logger.warning(
+                "[US_PREP_GUARD][WARN] session=%s guard check failed: %s — proceeding with caution",
+                session, _guard_exc,
+            )
+    elif session in ("am", "afternoon") and offline:
+        logger.info("[US_PREP_GUARD][BYPASS] session=%s offline=True — skipping prep guard", session)
+
+    # ── Close session: prep contract를 읽어 report에 포함 ─────────────────
+    if session == "close":
+        try:
+            from trader.us.prep_contract import check_us_prep_guard
+            guard = check_us_prep_guard(trade_date)
+            logger.info(
+                "[US_PREP_GUARD][READ] workflow=us-trade-close session=close"
+                " trade_date=%s status=%s",
+                trade_date,
+                guard.get("contract", {}).get("status", "MISSING") if guard.get("contract") else "MISSING",
+            )
+        except Exception:
+            pass
+        logger.info("[US_TRADE_CLOSE][ENTRY_DISABLED] reason=close_session")
+        logger.info("[US_TRADE_CLOSE][PNL_CONTINUE] reason=close_report_required")
+
+    # ── Afternoon session: exit 우선 + 신규 매수 차단 체크 ────────────────
+    if session == "afternoon":
+        try:
+            from trader.us.db.repos import get_today_buy_orders_count
+            buy_count = get_today_buy_orders_count(trade_date=trade_date, env=env)
+        except Exception:
+            buy_count = 0
+        if buy_count > 0:
+            logger.info(
+                "[US_AFTERNOON][MODE] mode=exit_first entry_allowed=false"
+                " reason=already_bought_today buy_orders_count=%d",
+                buy_count,
+            )
+        else:
+            logger.info(
+                "[US_AFTERNOON][MODE] mode=exit_first entry_allowed=true"
+                " reason=no_buy_order_today",
+            )
+
 
     # ── Run mode 결정 ─────────────────────────────────────────────────────────
     env_run_mode = os.getenv("US_RUN_MODE", "")
