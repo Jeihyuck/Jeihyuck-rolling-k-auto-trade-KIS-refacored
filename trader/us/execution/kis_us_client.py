@@ -26,6 +26,26 @@ from trader.us.execution.kis_us_registry import (
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# BYMD helper
+# ---------------------------------------------------------------------------
+
+def resolve_us_dailyprice_bymd(as_of_date: str | None = None) -> str:
+    """KIS dailyprice BYMD 파라미터를 결정한다.
+
+    as_of_date가 있으면 해당 날짜의 YYYYMMDD 문자열을 반환한다.
+    없으면 현재 NY 시간 기준 오늘 날짜를 반환한다.
+
+    Examples:
+        resolve_us_dailyprice_bymd("2026-05-29") == "20260529"
+        resolve_us_dailyprice_bymd(None) == "20260531"  # 오늘 기준
+    """
+    if as_of_date:
+        return str(as_of_date).replace("-", "")[:8]
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+
+
 def _extract_input_field_name(error_msg: str) -> str:
     """Extract missing field name from KIS INPUT_FIELD_NAME error.
     
@@ -140,19 +160,24 @@ class KisUSClient:
         }
         return self._get(tr["path"], headers=headers, params=params)
 
-    def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120) -> list[dict]:
+    def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """해외주식 기간별 시세 (일봉)."""
         self._assert_not_offline("get_us_daily_price")
         tr = get_tr_info("us_daily_price")
         headers = self._build_headers(tr["tr_id"])
-        today = datetime.now().strftime("%Y%m%d")
-        past = (datetime.now() - timedelta(days=count * 2)).strftime("%Y%m%d")
+        bymd = resolve_us_dailyprice_bymd(as_of_date)
+        logger.info(
+            "[US_DATA_PROVIDER][DAILYPRICE] symbol=%s exchange=%s bymd=%s",
+            symbol,
+            exchange,
+            bymd,
+        )
         params = {
             "AUTH": "",
             "EXCD": self._resolve_quote_excd(exchange),
             "SYMB": symbol,
             "GUBN": "0",   # 0: 일, 1: 주, 2: 월
-            "BYMD": today,
+            "BYMD": bymd,
             "MODP": "0",
         }
         result = self._get(tr["path"], headers=headers, params=params)

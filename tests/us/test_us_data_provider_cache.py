@@ -20,7 +20,7 @@ class FakeKisUSClient:
             "http_fail_final_count": 0,
         }
 
-    def get_us_daily_price(self, symbol, exchange, count=120):
+    def get_us_daily_price(self, symbol, exchange, count=120, as_of_date=None):
         self.daily_calls += 1
         return [{"xymd": "20260101", "clos": "100", "open": "99", "high": "101", "low": "98", "tvol": "1000"}]
 

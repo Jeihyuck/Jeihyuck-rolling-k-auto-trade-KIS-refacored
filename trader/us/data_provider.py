@@ -578,11 +578,19 @@ class USDataProvider:
             # Re-raise original exception if not temporary or no DB fallback
             raise
 
-    def get_daily_prices(self, symbol: str, exchange: str, count: int = 120) -> list[dict]:
+    def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).
 
         전략 코드가 closes[-1]을 최신 가격으로 가정하므로 반드시 오름차순 반환.
+        as_of_date가 있으면 KIS BYMD에 해당 날짜를 사용한다 (force_now 지원).
         """
+        logger.info(
+            "[US_DATA_PROVIDER][GET_DAILY_PRICES] symbol=%s exchange=%s count=%s as_of_date=%s",
+            symbol,
+            exchange,
+            count,
+            as_of_date,
+        )
         cache_key = (symbol.upper(), exchange.upper(), int(count))
         
         # Cache hit
@@ -605,7 +613,7 @@ class USDataProvider:
             return result
         
         try:
-            rows = self._get_client().get_us_daily_price(symbol, exchange, count)
+            rows = self._get_client().get_us_daily_price(symbol, exchange, count, as_of_date=as_of_date)
             result = sorted(rows, key=lambda r: str(r.get("xymd", "")))
             if self._cache_enabled:
                 self._daily_cache[cache_key] = result

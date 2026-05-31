@@ -242,6 +242,7 @@ def _percentile_rank(value: float, all_values: list[float]) -> float:
 def build_us_candidate_pool(
     *,
     trade_date: str,
+    as_of_date: str | None = None,
     env: str,
     dynamic_universe: list[dict],
     provider: Any,
@@ -251,6 +252,7 @@ def build_us_candidate_pool(
 
     Args:
         trade_date: YYYY-MM-DD
+        as_of_date: KIS dailyprice BYMD 기준일. None이면 trade_date와 동일.
         env: practice / live
         dynamic_universe: build_us_dynamic_universe()["symbols"] 결과
         provider: USDataProvider 인스턴스
@@ -259,11 +261,17 @@ def build_us_candidate_pool(
     Returns:
         candidate pool result dict
     """
+    as_of_date = as_of_date or trade_date
     pool_min = _env_int("US_CANDIDATE_POOL_MIN", 50)
     pool_target = _env_int("US_CANDIDATE_POOL_TARGET", 120)
     pool_max = _env_int("US_CANDIDATE_POOL_MAX", 200)
 
     logger.info("[US_CANDIDATE_POOL][START] universe=%d", len(dynamic_universe))
+    logger.info(
+        "[US_CANDIDATE_POOL][DATE_POLICY] trade_date=%s as_of_date=%s",
+        trade_date,
+        as_of_date,
+    )
 
     scored_rows: list[dict] = []
     failed_count = 0
@@ -278,7 +286,7 @@ def build_us_candidate_pool(
         symbol = sym_data.get("symbol", "")
         exchange = sym_data.get("exchange", "NASDAQ")
         try:
-            daily = provider.get_daily_prices(symbol, exchange)
+            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
             row = _score_symbol_candidate(sym_data, daily, all_rs20, all_rs60, all_rs120)
             scored_rows.append(row)
             all_rs20.append(row["rs_20d"])

@@ -148,6 +148,13 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     else:
         _now = datetime.now(tz=_NY_TZ)
     trade_date = _now.strftime("%Y-%m-%d")
+    as_of_date = trade_date
+    logger.info(
+        "[US_PREP][DATE_POLICY] trade_date=%s as_of_date=%s source=%s",
+        trade_date,
+        as_of_date,
+        "force_now" if force_now else "now_ny",
+    )
 
     # ── already_prepared guard bypass 체크 ───────────────────────────────
     if force_rebuild_prep:
@@ -210,6 +217,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         from trader.us.universe_builder import build_us_dynamic_universe
         dynamic_universe_result = build_us_dynamic_universe(
             trade_date=trade_date,
+            as_of_date=as_of_date,
             env=env,
             provider=provider,
             manual_seed=manual_seed,
@@ -241,6 +249,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         from trader.us.candidate_pool_builder import build_us_candidate_pool
         candidate_pool_result = build_us_candidate_pool(
             trade_date=trade_date,
+            as_of_date=as_of_date,
             env=env,
             dynamic_universe=dynamic_universe_result["symbols"],
             provider=provider,
@@ -273,6 +282,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         from trader.us.watchlist_builder import build_us_watchlist
         watchlist_result = build_us_watchlist(
             trade_date=trade_date,
+            as_of_date=as_of_date,
             env=env,
             candidate_pool=candidate_pool_result["rows"],
             provider=provider,

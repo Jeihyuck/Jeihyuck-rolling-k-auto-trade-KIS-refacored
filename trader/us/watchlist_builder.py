@@ -248,6 +248,7 @@ def _compute_risk_score(row: dict) -> float:
 def build_us_watchlist(
     *,
     trade_date: str,
+    as_of_date: str | None = None,
     env: str,
     candidate_pool: list[dict],
     provider: Any,
@@ -257,6 +258,7 @@ def build_us_watchlist(
 
     Args:
         trade_date: YYYY-MM-DD
+        as_of_date: KIS dailyprice BYMD 기준일. None이면 trade_date와 동일.
         env: practice / live
         candidate_pool: build_us_candidate_pool()["rows"] 결과
         provider: USDataProvider 인스턴스
@@ -265,10 +267,16 @@ def build_us_watchlist(
     Returns:
         watchlist result dict (broader_scored, top50, final30, final30_scored)
     """
+    as_of_date = as_of_date or trade_date
     topk = _env_int("US_WATCHLIST_TOPK", 50)
     finaln = _env_int("US_WATCHLIST_FINALN", 30)
 
     logger.info("[US_WATCHLIST][START] candidate_pool=%d", len(candidate_pool))
+    logger.info(
+        "[US_WATCHLIST][DATE_POLICY] trade_date=%s as_of_date=%s",
+        trade_date,
+        as_of_date,
+    )
 
     broader_scored: list[dict] = []
 
@@ -276,7 +284,7 @@ def build_us_watchlist(
         symbol = row.get("symbol", "")
         exchange = row.get("exchange", "NASDAQ")
         try:
-            daily = provider.get_daily_prices(symbol, exchange)
+            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
         except Exception:
             daily = []
 

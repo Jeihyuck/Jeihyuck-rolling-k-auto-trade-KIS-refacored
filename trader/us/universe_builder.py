@@ -144,6 +144,7 @@ def _compute_avg_dollar_volume(daily_rows: list[dict], days: int = 20) -> float:
 def build_us_dynamic_universe(
     *,
     trade_date: str,
+    as_of_date: str | None = None,
     env: str,
     provider: Any,
     manual_seed: list[str] | None = None,
@@ -153,6 +154,7 @@ def build_us_dynamic_universe(
 
     Args:
         trade_date: YYYY-MM-DD
+        as_of_date: KIS dailyprice BYMD 기준일. None이면 trade_date와 동일.
         env: practice / live
         provider: USDataProvider 인스턴스
         manual_seed: config/us_universe.yaml에서 로드된 ticker list
@@ -161,7 +163,13 @@ def build_us_dynamic_universe(
     Returns:
         dynamic universe result dict
     """
+    as_of_date = as_of_date or trade_date
     logger.info("[US_UNIVERSE_BUILDER][START] trade_date=%s env=%s", trade_date, env)
+    logger.info(
+        "[US_UNIVERSE_BUILDER][DATE_POLICY] trade_date=%s as_of_date=%s",
+        trade_date,
+        as_of_date,
+    )
 
     # ── 환경변수 ─────────────────────────────────────────────────────────
     min_price = _env_float("US_MIN_PRICE", 5.0)
@@ -273,7 +281,7 @@ def build_us_dynamic_universe(
             continue
 
         try:
-            daily = provider.get_daily_prices(symbol, exchange)
+            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
         except Exception as exc:
             logger.debug("[US_UNIVERSE_BUILDER][SKIP] symbol=%s reason=daily_fetch_error error=%s", symbol, exc)
             filter_counts["failed_history"] += 1
@@ -326,6 +334,32 @@ def build_us_dynamic_universe(
         filter_counts["failed_history"],
         filter_counts["failed_atr"],
     )
+
+    # ── filter fail sample 로그 ───────────────────────────────────────────
+    if filter_counts["passed"] == 0 or filter_counts["passed"] < 30:
+        # failed_price / failed_history 샘플 최대 10개씩
+        price_fail_samples: list[str] = []
+        history_fail_samples: list[str] = []
+        _seen_price: set[str] = set()
+        _seen_history: set[str] = set()
+        for _sym in all_tickers:
+            if len(price_fail_samples) >= 10 and len(history_fail_samples) >= 10:
+                break
+            if _sym not in {s["symbol"] for s in filtered_symbols}:
+                # 어느 fail 버킷인지 단순 판단: exchange 조회 오류 시 price fail로 간주
+                if _sym not in _seen_price and len(price_fail_samples) < 10:
+                    price_fail_samples.append(_sym)
+                    _seen_price.add(_sym)
+        if price_fail_samples:
+            logger.warning(
+                "[US_UNIVERSE_BUILDER][FILTER_FAIL_SAMPLE] reason=failed_price symbols=%s",
+                ",".join(price_fail_samples),
+            )
+        logger.warning(
+            "[US_UNIVERSE_BUILDER][FILTER_FAIL_DETAIL] as_of_date=%s bymd=%s",
+            as_of_date,
+            str(as_of_date).replace("-", "")[:8] if as_of_date else "UNKNOWN",
+        )
 
     # ── 상태 결정 ──────────────────────────────────────────────────────────
     if filtered_count == 0 or filtered_count < 30:

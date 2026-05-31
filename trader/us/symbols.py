@@ -59,6 +59,39 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "LITE": "NASDAQ",
     "COHR": "NYSE",
     "AAOI": "NASDAQ",
+    # Large-cap NYSE
+    "IBM": "NYSE",
+    "ACN": "NYSE",
+    "MA": "NYSE",
+    "V": "NYSE",
+    "WMT": "NYSE",
+    "HD": "NYSE",
+    "CAT": "NYSE",
+    "LLY": "NYSE",
+    "NVO": "NYSE",
+    "UBER": "NYSE",
+    "BE": "NYSE",
+    "GEV": "NYSE",
+    "ETN": "NYSE",
+    "HUBB": "NYSE",
+    "PWR": "NYSE",
+    "VST": "NYSE",
+    "NRG": "NYSE",
+    "DELL": "NYSE",
+    "HPE": "NYSE",
+    "GLW": "NYSE",
+    "TEL": "NYSE",
+    "APH": "NYSE",
+    "JPM": "NYSE",
+    # Large-cap NASDAQ
+    "COST": "NASDAQ",
+    "TSLA": "NASDAQ",
+    "NFLX": "NASDAQ",
+    "ABNB": "NASDAQ",
+    "COIN": "NASDAQ",
+    "HOOD": "NASDAQ",
+    "MSTR": "NASDAQ",
+    "CEG": "NASDAQ",
 }
 
 _VALID_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
@@ -131,6 +164,10 @@ def resolve_exchange(symbol: str) -> str:
     exchange = _SYMBOL_EXCHANGE_MAP.get(sym)
     if exchange is None:
         raise ValueError(f"resolve_exchange: unknown symbol={sym!r}")
+    import logging as _logging
+    _logging.getLogger(__name__).debug(
+        "[US_SYMBOLS][EXCHANGE_RESOLVE] symbol=%s exchange=%s", sym, exchange
+    )
     return exchange
 
 
