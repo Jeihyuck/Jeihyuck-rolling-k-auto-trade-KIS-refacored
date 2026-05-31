@@ -45,6 +45,27 @@ logger = logging.getLogger(__name__)
 CRITICAL_ETFS = {"QQQ", "SPY", "SMH", "SOXX"}
 
 
+# ── Env helper ────────────────────────────────────────────────────────────────
+
+def _env_true(name: str, default: str = "0") -> bool:
+    """환경변수를 boolean으로 읽는다."""
+    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def should_bypass_already_prepared_guard(
+    *,
+    force_rebuild_prep: bool,
+    event_name: str,
+    confirm_ok: bool,
+) -> bool:
+    """already_prepared guard를 우회할지 결정한다.
+
+    workflow_dispatch + confirm_ok + force_rebuild_prep 일 때만 True.
+    schedule 이벤트에서는 반드시 False.
+    """
+    return bool(force_rebuild_prep and event_name == "workflow_dispatch" and confirm_ok)
+
+
 # ── Backward-compat stubs (used by existing tests) ────────────────────────────
 
 def _resolve_final_prep_status(
@@ -111,6 +132,14 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         force_now or "",
     )
 
+    # ── force_rebuild_prep env 읽기 ───────────────────────────────────────
+    force_rebuild_prep = _env_true("US_FORCE_REBUILD_PREP", "0")
+    logger.info(
+        "[US_PREP][FORCE_REBUILD] enabled=%s env=%s",
+        int(force_rebuild_prep),
+        os.getenv("US_FORCE_REBUILD_PREP", "0"),
+    )
+
     # 시간 및 run_id 초기화
     from zoneinfo import ZoneInfo
     _NY_TZ = ZoneInfo("America/New_York")
@@ -119,6 +148,15 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     else:
         _now = datetime.now(tz=_NY_TZ)
     trade_date = _now.strftime("%Y-%m-%d")
+
+    # ── already_prepared guard bypass 체크 ───────────────────────────────
+    if force_rebuild_prep:
+        logger.warning(
+            "[US_PREP][CHECK_ALREADY_PREPARED][BYPASS] reason=force_rebuild_prep trade_date=%s",
+            trade_date,
+        )
+    else:
+        logger.info("[US_PREP][CHECK_ALREADY_PREPARED][START] trade_date=%s", trade_date)
 
     # us_agent_runs에 prep run 시작 기록
     run_id = ""

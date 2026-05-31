@@ -75,6 +75,8 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
         return 0 if all(r == 0 for r in results) else 1
 
     if mode == "prep":
+        force_rebuild_val = os.environ.get("US_FORCE_REBUILD_PREP", "0")
+        logger.info("[US_DISPATCHER][ENV] US_FORCE_REBUILD_PREP=%s", force_rebuild_val)
         from trader.us.runner.prep_runner import run_prep
         r = run_prep(env=env, offline=offline, force_now=force_now)
         return 0 if r.get("status") in ("OK", "OK_WITH_WARNINGS") else 1
