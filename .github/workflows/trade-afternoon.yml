@@ -74,7 +74,7 @@ env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
   FINAL30_SOURCE_MODE: "db_only"
-  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
   PB1_REQUIRE_SCORED_FINAL30: "1"
   PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
@@ -389,6 +389,7 @@ jobs:
         if: steps.boot_guard.outputs.should_run == '1'
         uses: actions/checkout@v4
         with:
+          ref: dual-agent
           path: repo
           fetch-depth: 1
 
@@ -694,6 +695,37 @@ jobs:
           echo "[PHASE][END] phase=pm" | tee -a artifacts/trade-afternoon.log
           echo "[TRADE_AFTERNOON][ENGINE_DONE] exit_code=0 phase=pm" | tee -a artifacts/trade-afternoon.log
 
+      - name: Run PM exit-only loop (PREP not ready - manage existing holdings)
+        id: exit_only_pm
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' }}
+        continue-on-error: true
+        timeout-minutes: 135
+        working-directory: repo
+        env:
+          PB1_SESSION_KIND: "afternoon"
+          PB1_FORCE_TRADE_SESSION: "afternoon"
+          FORCE_MARKET_WINDOW: "afternoon"
+          FORCE_PB1_PHASE: "exit"
+          PB1_PHASE_DEFAULT: "exit"
+          PB1_EXIT_ONLY_MODE: "1"
+          PB1_ENTRY_ENABLED: "0"
+          TRADE_REQUIRE_PREP_FINAL30_SCORED: "0"
+          PB1_TARGET_START_TIME: "13:00"
+          PB1_START_ALLOW_UNTIL: "13:30"
+          PB1_PM_SESSION_END: "15:10"
+          PB1_RUN_LOOP_MINUTES: "130"
+          PB1_TICK_HARD_TIMEOUT_SEC: "90"
+          ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          KIS_HTTP_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          echo "[TRADE_AFTERNOON][EXIT_ONLY_PM][START] prep_ready=0 phase=pm entry_enabled=0 exit_only=1" | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][START] phase=pm_exit_only session_window=1300-1510 entry_enabled=0" | tee -a artifacts/trade-afternoon.log
+          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][END] phase=pm_exit_only" | tee -a artifacts/trade-afternoon.log
+          echo "[TRADE_AFTERNOON][EXIT_ONLY_PM][DONE] exit_code=0" | tee -a artifacts/trade-afternoon.log
+
       - name: Wait until Close target start
         if: always() && steps.boot_guard.outputs.should_run == '1'
         working-directory: repo
@@ -755,6 +787,40 @@ jobs:
           echo "[PHASE][END] phase=close" | tee -a artifacts/trade-afternoon.log
           echo "[TRADE_CLOSE][DONE] close_done=1 now_kst=$(TZ=Asia/Seoul date +%H%M%S)" | tee -a artifacts/trade-afternoon.log
           echo "[TRADE_AFTERNOON][ENGINE_DONE] exit_code=0 phase=close" | tee -a artifacts/trade-afternoon.log
+
+      - name: Run Close exit-only loop (PREP not ready - manage existing holdings)
+        id: exit_only_close
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' }}
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: repo
+        env:
+          PB1_SESSION_KIND: "close"
+          PB1_FORCE_TRADE_SESSION: "close"
+          FORCE_MARKET_WINDOW: "close"
+          FORCE_PB1_PHASE: "exit"
+          PB1_PHASE_DEFAULT: "exit"
+          PB1_EXIT_ONLY_MODE: "1"
+          PB1_ENTRY_ENABLED: "0"
+          TRADE_REQUIRE_PREP_FINAL30_SCORED: "0"
+          PB1_CLOSE_ONE_SHOT: "1"
+          PB1_CLOSE_SESSION_START: "15:15"
+          PB1_TARGET_START_TIME: "15:15"
+          PB1_START_ALLOW_UNTIL: "15:35"
+          PB1_CLOSE_SESSION_END: "15:30"
+          PB1_RUN_LOOP_MINUTES: "20"
+          PB1_TICK_HARD_TIMEOUT_SEC: "45"
+          PB1_MIN_TICK_BUDGET_SEC: "30"
+          ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
+          KIS_HTTP_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          echo "[TRADE_AFTERNOON][EXIT_ONLY_CLOSE][START] prep_ready=0 phase=close entry_enabled=0 exit_only=1" | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][START] phase=close_exit_only session_window=1515-1530 entry_enabled=0" | tee -a artifacts/trade-afternoon.log
+          python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][END] phase=close_exit_only" | tee -a artifacts/trade-afternoon.log
+          echo "[TRADE_AFTERNOON][EXIT_ONLY_CLOSE][DONE] exit_code=0" | tee -a artifacts/trade-afternoon.log
 
       - name: Generate Portfolio PNL report
         if: always() && steps.boot_guard.outputs.should_run == '1'
@@ -909,22 +975,29 @@ jobs:
           prep_ready="${{ steps.verify_final30.outputs.prep_ready }}"
           pm_outcome="${{ steps.pm_loop.outcome }}"
           close_outcome="${{ steps.close_loop.outcome }}"
+          exit_only_pm_outcome="${{ steps.exit_only_pm.outcome }}"
+          exit_only_close_outcome="${{ steps.exit_only_close.outcome }}"
           expected_as_of="${{ steps.verify_final30.outputs.expected_as_of }}"
           final30_rows="${{ steps.verify_final30.outputs.final30_rows }}"
           skip_reason="${{ steps.verify_final30.outputs.skip_reason }}"
 
-          echo "[TRADE_AFTERNOON][ASSERT] is_trading_day=1 prep_ready=${prep_ready} pm_outcome=${pm_outcome} close_outcome=${close_outcome} expected_as_of=${expected_as_of} final30_rows=${final30_rows} skip_reason=${skip_reason}" | tee -a artifacts/trade-afternoon.log
+          echo "[TRADE_AFTERNOON][ASSERT] is_trading_day=1 prep_ready=${prep_ready} pm_outcome=${pm_outcome} close_outcome=${close_outcome} exit_only_pm=${exit_only_pm_outcome} exit_only_close=${exit_only_close_outcome} expected_as_of=${expected_as_of} final30_rows=${final30_rows} skip_reason=${skip_reason}" | tee -a artifacts/trade-afternoon.log
 
-          if [[ "${prep_ready}" != "1" ]]; then
-            echo "[TRADE_AFTERNOON][ASSERT_FAIL] reason=PREP_NOT_READY prep_ready=${prep_ready} skip_reason=${skip_reason} expected_as_of=${expected_as_of} final30_rows=${final30_rows}" | tee -a artifacts/trade-afternoon.log
-            echo "::error::TRADE_AFTERNOON ASSERT FAIL: KRX trading day but prep_ready=${prep_ready}. skip_reason=${skip_reason}. final30 rows=${final30_rows} for as_of=${expected_as_of}. Afternoon engine was NOT executed."
-            exit 1
-          fi
-
-          if [[ "${pm_outcome}" != "success" && "${close_outcome}" != "success" ]]; then
-            echo "[TRADE_AFTERNOON][ASSERT_FAIL] reason=ENGINE_NOT_RUN pm_outcome=${pm_outcome} close_outcome=${close_outcome} prep_ready=${prep_ready}" | tee -a artifacts/trade-afternoon.log
-            echo "::error::TRADE_AFTERNOON ASSERT FAIL: prep_ready=1 but both pm_loop=${pm_outcome} and close_loop=${close_outcome}. PNL/report-only execution is NOT acceptable."
-            exit 1
+          if [[ "${prep_ready}" == "1" ]]; then
+            # Normal path: PREP ready, pm_loop or close_loop must have run
+            if [[ "${pm_outcome}" != "success" && "${close_outcome}" != "success" ]]; then
+              echo "[TRADE_AFTERNOON][ASSERT_FAIL] reason=ENGINE_NOT_RUN pm_outcome=${pm_outcome} close_outcome=${close_outcome} prep_ready=${prep_ready}" | tee -a artifacts/trade-afternoon.log
+              echo "::error::TRADE_AFTERNOON ASSERT FAIL: prep_ready=1 but both pm_loop=${pm_outcome} and close_loop=${close_outcome}. PNL/report-only execution is NOT acceptable."
+              exit 1
+            fi
+          else
+            # EXIT_ONLY path: PREP not ready, exit_only loops must have run or skipped gracefully
+            if [[ "${exit_only_pm_outcome}" == "failure" || "${exit_only_close_outcome}" == "failure" ]]; then
+              echo "[TRADE_AFTERNOON][ASSERT_FAIL] reason=EXIT_ONLY_FAILED exit_only_pm=${exit_only_pm_outcome} exit_only_close=${exit_only_close_outcome}" | tee -a artifacts/trade-afternoon.log
+              echo "::error::TRADE_AFTERNOON ASSERT FAIL: EXIT_ONLY mode but exit_only loops failed. exit_only_pm=${exit_only_pm_outcome} exit_only_close=${exit_only_close_outcome}."
+              exit 1
+            fi
+            echo "[TRADE_AFTERNOON][EXIT_ONLY][ASSERT_OK] prep_ready=0 exit_only_pm=${exit_only_pm_outcome} exit_only_close=${exit_only_close_outcome}" | tee -a artifacts/trade-afternoon.log
           fi
 
           echo "[TRADE_AFTERNOON][ASSERT_OK] engine_ran=1 pm_outcome=${pm_outcome} close_outcome=${close_outcome} prep_ready=${prep_ready} expected_as_of=${expected_as_of}" | tee -a artifacts/trade-afternoon.log
@@ -934,16 +1007,31 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
+          prep_ready="${{ steps.verify_final30.outputs.prep_ready }}"
           pm_result="${{ steps.pm_loop.outcome }}"
           close_result="${{ steps.close_loop.outcome }}"
-          echo "[TRADE_AFTERNOON][STEP_OUTCOME] pm=${pm_result} close=${close_result}" | tee -a artifacts/trade-afternoon.log
+          exit_only_pm_result="${{ steps.exit_only_pm.outcome }}"
+          exit_only_close_result="${{ steps.exit_only_close.outcome }}"
+          echo "[TRADE_AFTERNOON][STEP_OUTCOME] prep_ready=${prep_ready} pm=${pm_result} close=${close_result} exit_only_pm=${exit_only_pm_result} exit_only_close=${exit_only_close_result}" | tee -a artifacts/trade-afternoon.log
 
-          if [[ "$close_result" != "success" ]]; then
-            echo "::error::Close loop failed. This is critical."
-            exit 1
-          fi
-
-          if [[ "$pm_result" != "success" ]]; then
-            echo "::error::PM loop failed."
-            exit 1
+          if [[ "${prep_ready}" == "1" ]]; then
+            # Normal path: check pm/close loops
+            if [[ "$close_result" == "failure" ]]; then
+              echo "::error::Close loop failed. This is critical."
+              exit 1
+            fi
+            if [[ "$pm_result" == "failure" ]]; then
+              echo "::error::PM loop failed."
+              exit 1
+            fi
+          else
+            # EXIT_ONLY path: check exit_only loops
+            if [[ "$exit_only_close_result" == "failure" ]]; then
+              echo "::error::EXIT_ONLY Close loop failed. This is critical."
+              exit 1
+            fi
+            if [[ "$exit_only_pm_result" == "failure" ]]; then
+              echo "::error::EXIT_ONLY PM loop failed."
+              exit 1
+            fi
           fi

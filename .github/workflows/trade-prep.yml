@@ -1,10 +1,10 @@
-name: Trade Prep (KST 06:50)
+name: Trade Prep (KST 06:20)
 
 "on":
   schedule:
-    # KST Mon-Fri 06:50 = UTC Sun-Thu 21:50
-    # Avoid top-of-hour GitHub Actions schedule congestion.
-    - cron: "50 21 * * 0-4"
+    # KST Mon-Fri 06:20 = UTC Sun-Thu 21:20
+    # Run early enough so final30_scored is ready before 09:00 KST market open.
+    - cron: "20 21 * * 0-4"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -39,6 +39,13 @@ env:
   PB1_ENABLE_LATE_PM_RECOVERY: "0"
   PB1_PM_RECOVERY_ALLOW_UNTIL: "13:40"
   WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
+  # [2026-06-01] strict mode: degraded PREP 금지
+  ALLOW_DEGRADED_PREP: "0"
+  PREP_CONTRACT_ALLOW_DEGRADE: "0"
+  PB1_WATCHLIST_ALLOW_DEGRADE: "0"
+  PREP_REQUIRE_FINAL30_SCORED: "1"
+  PREP_REQUIRE_EXACT_FINAL30_ROWS: "30"
+  PREP_REQUIRE_CRITICAL_FIELDS: "1"
   STRATEGY_MODE: DIAG
   KIS_HTTP_ENABLED: "0"
   ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"
@@ -123,6 +130,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: dual-agent
           path: repo
           fetch-depth: 1
 

@@ -1699,7 +1699,7 @@ def main() -> int:
         logger.error(
             "[PREP][WATCHLIST][CONTRACT_FAIL] failures=%s allow_degrade=%s as_of=%s rows_universe=%s rows_pool120=%s rows_top50=%s rows_final30=%s score_nonzero={universe:%s,pool120:%s,top50:%s,final30:%s} source=%s",
             contract_failures,
-            int(_env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep),
+            int(_env_true("PREP_CONTRACT_ALLOW_DEGRADE", "0") or _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep),
             as_of.isoformat(),
             len(bundle_universe),
             len(bundle_pool120),
@@ -1879,7 +1879,7 @@ def main() -> int:
             logger.warning(
                 "[PREP][WATCHLIST][CONTRACT_FAIL][AFTER_RECOVERY] failures=%s allow_degrade=%s",
                 contract_failures_after_recovery,
-                int(_env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep),
+                int(_env_true("PREP_CONTRACT_ALLOW_DEGRADE", "0") or _env_true("PB1_WATCHLIST_ALLOW_DEGRADE", "0") or allow_degraded_prep),
             )
         else:
             logger.info("[PREP][WATCHLIST][CONTRACT][RECOVERED] all contract requirements met after recovery")
@@ -1889,7 +1889,7 @@ def main() -> int:
         if not contract_failures:
             shortage_reason = ""
         
-        allow_contract_degrade = _env_true("PREP_CONTRACT_ALLOW_DEGRADE", "1") or _env_true(
+        allow_contract_degrade = _env_true("PREP_CONTRACT_ALLOW_DEGRADE", "0") or _env_true(
             "PB1_WATCHLIST_ALLOW_DEGRADE", "0"
         ) or allow_degraded_prep
         if contract_failures_after_recovery and not allow_contract_degrade:

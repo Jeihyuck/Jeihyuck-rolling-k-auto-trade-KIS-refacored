@@ -30,10 +30,13 @@ env:
   MODE: trade
   EXPECTED_BRANCH: "dual-agent"
   TRADE_AM_WAIT_FOR_PREP: "1"
-  TRADE_AM_PREP_WAIT_UNTIL: "09:25"
+  TRADE_AM_PREP_WAIT_UNTIL: "09:15"
   TRADE_AM_PREP_POLL_INTERVAL_SEC: "30"
   TRADE_AM_PREP_REQUIRED_FINAL30_N: "30"
-  TRADE_AM_PREP_NOT_READY_POLICY_PRACTICE: "PNL_ONLY_EXIT_0"
+  TRADE_PREP_WAIT_MAX_SEC: "900"
+  TRADE_REQUIRE_PREP_READY: "1"
+  TRADE_FAIL_IF_PREP_NOT_READY: "1"
+  TRADE_AM_PREP_NOT_READY_POLICY_PRACTICE: "FAIL_EXIT_1"
   TRADE_AM_PREP_NOT_READY_POLICY_LIVE: "FAIL_EXIT_1"
   PB1_SESSION_KIND: "am"
   PB1_FORCE_TRADE_SESSION: "am"
@@ -82,7 +85,7 @@ env:
   STRATEGY_ENV: practice
   KIS_ENV: practice
   FINAL30_SOURCE_MODE: "db_only"
-  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final"
+  WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
   WATCHLIST_FINAL_SCORED_STRATEGY_KEY: "pb1_watchlist_final_scored"
   PB1_REQUIRE_SCORED_FINAL30: "1"
   PB1_DISABLE_RAW_FINAL30_FALLBACK: "1"
@@ -488,6 +491,7 @@ jobs:
         if: steps.phase_guard.outputs.should_run == '1'
         uses: actions/checkout@v4
         with:
+          ref: dual-agent
           path: repo
           fetch-depth: 1
 
@@ -714,6 +718,11 @@ jobs:
               # Check if provenance mismatch (wrong branch) - fail immediately
               if rows == 30 and prep_done == 1 and provenance_ok == 0:
                   print(f"[TRADE_AM][PREP_PROVENANCE][FAIL] reason=PREP_PROVENANCE_MISMATCH expected={expected_branch} actual={prep_branch}")
+                  break
+
+              max_wait_sec = int(os.getenv("TRADE_PREP_WAIT_MAX_SEC", "900"))
+              if waited_sec >= max_wait_sec:
+                  print(f"[TRADE_AM][PREP_WAIT][TIMEOUT_SEC] waited_sec={waited_sec} max_wait_sec={max_wait_sec} rows={rows} prep_done={prep_done}")
                   break
 
               if now_min >= deadline_min:

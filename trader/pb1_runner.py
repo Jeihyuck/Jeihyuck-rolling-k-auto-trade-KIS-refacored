@@ -3061,6 +3061,28 @@ def _load_universe_context(
     env: str,
     strategy: str,
 ) -> UniverseContext:
+    # [2026-06-01] PB1_EXIT_ONLY_MODE: PREP 실패 시 final30 없이 KIS balance 기반으로 보유종목 exit 관리
+    if os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1":
+        logger.info(
+            "[PB1][EXIT_ONLY_MODE] bypassing final30 load env=%s as_of=%s -> empty context, entry blocked",
+            (env or "").strip().lower(),
+            as_of,
+        )
+        os.environ["PB1_ENTRY_ENABLED"] = "0"
+        return UniverseContext(
+            as_of_date=str(as_of),
+            members=[],
+            selected_path=None,
+            meta={
+                "source": "exit_only_kis_balance",
+                "exit_only": True,
+                "locked": False,
+                "is_scored": False,
+                "usable": True,
+            },
+            is_empty=True,
+        )
+
     mode_input = (os.getenv("MODE") or "").strip().lower()
     if mode_input == "trade" or os.getenv("PB1_TRADE_WATCHLIST_ONLY", "0") == "1":
         requested_strategy = (strategy or "").strip() or os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
