@@ -50,20 +50,24 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
     """
     logger.info("[US_DISPATCHER][START] mode=%s env=%s offline=%s", mode, env, offline)
 
-    # 자동 schedule 트리거 확인 — schedule은 금지됨, 수동 dispatch만 허용
+    # schedule과 workflow_dispatch는 모두 정상 이벤트. unsupported event만 차단한다.
+    _ALLOWED_EVENTS = {"schedule", "workflow_dispatch", ""}
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    if event_name == "schedule":
+    if event_name and event_name not in _ALLOWED_EVENTS:
         logger.error(
-            "[US_DISPATCHER][BLOCKED] auto_schedule_not_allowed event=%s mode=%s "
-            "reason=dispatcher_is_manual_only_use_dedicated_workflow",
-            event_name, mode,
+            "[US_DISPATCHER][BLOCKED] unsupported_event event=%s mode=%s workflow=%s",
+            event_name,
+            mode,
+            os.environ.get("GITHUB_WORKFLOW", ""),
         )
         return 1
-    if event_name == "workflow_dispatch":
-        logger.info(
-            "[US_DISPATCHER][MANUAL_ONLY] mode=%s trigger=workflow_dispatch",
-            mode,
-        )
+    logger.info(
+        "[US_DISPATCHER][EVENT_ALLOWED] event=%s mode=%s workflow=%s env=%s",
+        event_name,
+        mode,
+        os.environ.get("GITHUB_WORKFLOW", ""),
+        env,
+    )
 
     mode = normalize_mode(mode)
 

@@ -42,7 +42,7 @@ name: "US Trade Prep"
 
 concurrency:
   group: us-trade-prep-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -109,6 +109,7 @@ jobs:
 
       US_LOG_FILE: "us-trade-prep.log"
       US_ARTIFACT_NAME: "us-trade-prep"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Resolve US Prep phase guard
@@ -202,6 +203,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: dual-agent
           path: repo
           fetch-depth: 1
 
@@ -505,9 +507,11 @@ jobs:
           if not trade_date:
               raise RuntimeError("[US_PREP][BUG] TRADE_DATE env missing")
 
+          print(f"[US_PREP][CONTRACT][QUERY] table=us_agent_runs trade_date={trade_date} agent_names=us_prep,us_prep_dual_agent mode=prep", file=sys.stderr)
           prep = load_latest_us_prep_status(trade_date, timeout_sec=10)
           prep_status = prep.get("status", "UNKNOWN") if prep else "UNKNOWN"
           prep_run_id = prep.get("run_id", "") if prep else ""
+          print(f"[US_PREP][CONTRACT][QUERY_RESULT] prep_found={'yes' if prep else 'no'} prep_status={prep_status} prep_run_id={prep_run_id}", file=sys.stderr)
 
           try:
               locked = load_locked_us_watchlist(trade_date, min_count=10, allow_degraded=False, timeout_sec=10)
@@ -521,7 +525,14 @@ jobs:
           except Exception:
               score_nonzero = locked_count  # fallback
 
+          print(f"[US_PREP][CONTRACT][WATCHLIST] locked_count={locked_count} score_nonzero_count={score_nonzero}", file=sys.stderr)
+
           can_proceed = prep_status in ("OK", "OK_WITH_WARNINGS") and locked_count >= 10 and score_nonzero > 0
+
+          # fallback: agent_name 불일치 등으로 UNKNOWN 반환됐지만 watchlist 데이터가 유효하면 진행
+          if not can_proceed and prep_status == "UNKNOWN" and locked_count >= 10 and score_nonzero > 0:
+              print("[US_PREP][CONTRACT][FALLBACK_OK] prep_status=UNKNOWN but watchlist valid — proceeding", file=sys.stderr)
+              can_proceed = True
 
           print(f"prep_status={prep_status}")
           print(f"prep_run_id={prep_run_id}")
@@ -532,7 +543,7 @@ jobs:
           if can_proceed:
               print(
                   f"[US_PREP][CONTRACT][OK] trade_date={trade_date} "
-                  f"prep_status={prep_status} locked_count={locked_count} score_nonzero={score_nonzero}",
+                  f"prep_status={prep_status} locked_count={locked_count} score_nonzero={score_nonzero} fallback={'yes' if prep_status == 'UNKNOWN' else 'no'}",
                   file=sys.stderr,
               )
           else:

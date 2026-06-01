@@ -956,7 +956,7 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
                     SELECT run_id, status, trade_date, result, started_at, finished_at
                     FROM us_agent_runs
                     WHERE trade_date = :trade_date
-                      AND agent_name = 'us_prep'
+                      AND agent_name IN ('us_prep', 'us_prep_dual_agent')
                       AND mode = 'prep'
                     ORDER BY started_at DESC
                     LIMIT 1

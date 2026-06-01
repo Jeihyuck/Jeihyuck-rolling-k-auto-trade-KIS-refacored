@@ -455,6 +455,44 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         final_status, wl_final30, score_nonzero_count, trade_can_proceed,
     )
 
+    # ── 12. prep_status.json 생성 ─────────────────────────────────────────
+    # watchdog, trade-am, trade-afternoon이 prep 성공 여부를 파일로 판단할 수 있도록 저장
+    try:
+        from trader.us.runner_paths import get_us_prep_paths as _gpp
+    except ImportError:
+        _gpp = get_us_prep_paths
+    try:
+        _status_dir = Path(f"runtime/us/prep_status/{trade_date}")
+        _status_dir.mkdir(parents=True, exist_ok=True)
+        _status_file = _status_dir / "prep_status.json"
+        _event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+        _workflow_name = os.environ.get("GITHUB_WORKFLOW", "US Trade Prep")
+        _status_ok = final_status in ("OK", "OK_WITH_WARNINGS", "SUCCESS", "COMPLETED")
+        prep_status_payload = {
+            "market": "US",
+            "as_of": trade_date,
+            "trade_date": trade_date,
+            "status": final_status,
+            "status_ok": _status_ok,
+            "contract_ok": contract_ok,
+            "trade_can_proceed": trade_can_proceed,
+            "final30_rows": wl_final30,
+            "watchlist_rows": saved_count,
+            "score_nonzero_count": score_nonzero_count,
+            "locked_count": saved_count,
+            "run_id": run_id,
+            "env": env,
+            "event": _event_name,
+            "workflow": _workflow_name,
+        }
+        _save_json_file(_status_file, prep_status_payload)
+        logger.info(
+            "[US_PREP][PREP_STATUS_JSON][SAVED] path=%s status=%s trade_can_proceed=%s",
+            _status_file, final_status, trade_can_proceed,
+        )
+    except Exception as exc:
+        logger.warning("[US_PREP][WARN] prep_status.json save failed: %s", exc)
+
     return {
         "status": final_status,
         "run_id": run_id,
