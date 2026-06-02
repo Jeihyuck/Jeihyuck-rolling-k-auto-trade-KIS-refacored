@@ -12599,15 +12599,35 @@ class PB1Engine:
                     positions = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
                     self._tick_db_cache[pos_cache_key] = list(positions)
             except Exception as _pos_exc:
+                _krx_pos = str(os.getenv("PB1_MARKET_SCOPE") or os.getenv("EXCHANGE") or "").upper() in {"KRX", "KR"}
+                _pos_fail_open = _krx_pos and os.getenv("PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT", "0") in {"1", "true", "TRUE", "yes", "on"}
                 self._bump_warning("db_read_fail_open_count")
                 dispose_engine_safely(self.engine, reason=f"positions_lookup:{type(_pos_exc).__name__}")
                 self._bump_warning("db_engine_dispose_count")
-                logger.warning(
-                    "[PB1][POSITIONS][FAIL_OPEN] err_type=%s err=%s",
+                # traceback_seen 방지: logger.exception() 대신 logger.error() 사용
+                logger.error(
+                    "[PB1][EXIT][POSITIONS_LOOKUP][FAIL] env=%s krx=%s fail_open=%s err_type=%s err=%s",
+                    self.env,
+                    int(bool(_krx_pos)),
+                    int(bool(_pos_fail_open)),
                     type(_pos_exc).__name__,
                     _pos_exc,
                 )
-                positions = []
+                if _pos_fail_open:
+                    logger.warning("[PB1][EXIT][POSITIONS_LOOKUP][FAIL_OPEN] positions=[] continue_entry=1")
+                    positions = []
+                else:
+                    logger.warning(
+                        "[PB1][POSITIONS][FAIL_OPEN] err_type=%s err=%s",
+                        type(_pos_exc).__name__,
+                        _pos_exc,
+                    )
+                    positions = []
+            else:
+                logger.info(
+                    "[PB1][EXIT][POSITIONS_LOOKUP][RESULT] rows=%s source=db continue_entry=1",
+                    len(positions),
+                )
         positions = self._reconcile_positions_from_kis_balance(holdings_rows, positions)
         if not positions and holdings_rows:
             bootstrapped = self.positions_repo.bootstrap_from_kis_holdings(
@@ -12626,7 +12646,12 @@ class PB1Engine:
                     self._bump_warning("db_read_fail_open_count")
                     dispose_engine_safely(self.engine, reason=f"positions_lookup_bootstrap:{type(_pos_exc2).__name__}")
                     self._bump_warning("db_engine_dispose_count")
-                    logger.warning("[PB1][POSITIONS][FAIL_OPEN] bootstrap_retry err_type=%s", type(_pos_exc2).__name__)
+                    # traceback_seen 방지: logger.error() 사용
+                    logger.error(
+                        "[PB1][EXIT][POSITIONS_LOOKUP][FAIL_OPEN] bootstrap_retry err_type=%s err=%s",
+                        type(_pos_exc2).__name__,
+                        _pos_exc2,
+                    )
                     positions = []
         cooldown_map: dict[str, str] = {
             str(p.get("code") or "").zfill(6): str(p.get("cooldown_until"))

@@ -403,6 +403,28 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _repo_is_krx_context() -> bool:
+    """한국장(KRX) 컨텍스트인지 판정."""
+    values = [
+        os.getenv("PB1_MARKET_SCOPE"),
+        os.getenv("MARKET"),
+        os.getenv("EXCHANGE"),
+        os.getenv("TRADE_MARKET"),
+    ]
+    joined = " ".join(str(v or "").strip().lower() for v in values)
+    workflow = str(os.getenv("GITHUB_WORKFLOW") or "").strip().lower()
+    return (
+        "krx" in joined
+        or " kr " in f" {joined} "
+        or "korea" in joined
+        or "domestic" in joined
+        or "trade am" in workflow
+        or "trade pm" in workflow
+        or "trade close" in workflow
+        or "afternoon" in workflow
+    )
+
+
 def _order_lookup_fail_open_default() -> bool:
     explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
     if explicit is None:
@@ -416,6 +438,11 @@ def _practice_env_default_fail_open() -> bool:
 
 
 def _lookup_fail_open_default() -> bool:
+    # KRX practice 환경에서는 기본 fail-open True
+    if _repo_is_krx_context() and _norm_env(os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice") == "practice":
+        return True
+    if _env_flag("KRX_DB_READ_FAIL_OPEN", default=False) and _repo_is_krx_context():
+        return True
     if _practice_env_default_fail_open():
         return True
     if _norm_strategy(os.getenv("STRATEGY_MODE")) == "diag":
@@ -445,13 +472,15 @@ def _resolve_lookup_fail_open() -> bool:
 def _resolve_position_fail_open() -> bool:
     """PositionsRepo 전용 fail-open 판정.
     PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT가 명시적으로 설정된 경우 우선 사용하고,
-    없으면 공통 _resolve_lookup_fail_open()으로 fallback한다."""
+    없으면 KRX 컨텍스트 또는 공통 _resolve_lookup_fail_open()으로 fallback한다."""
     explicit = os.getenv("PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT")
     if explicit is not None:
         return _env_flag(
             "PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT",
             default=_lookup_fail_open_default(),
         )
+    if _repo_is_krx_context() and _env_flag("KRX_DB_READ_FAIL_OPEN", default=False):
+        return True
     return _resolve_lookup_fail_open()
 
 
@@ -4697,9 +4726,13 @@ class PositionsRepo:
                 self._schema.positions.c.code == code,
             )
         )
-        with self.engine.begin() as conn:
-            row = conn.execute(stmt).mappings().first()
-            return dict(row) if row else None
+        rows = _safe_repo_read(
+            self.engine,
+            stmt,
+            op_name="positions._get_position_row",
+            fail_open=_resolve_position_fail_open(),
+        )
+        return rows[0] if rows else None
 
     def list_positions(self, env: str, strategy: str) -> list[dict]:
         stmt = select(self._schema.positions).where(

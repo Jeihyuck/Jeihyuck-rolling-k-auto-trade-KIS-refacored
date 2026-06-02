@@ -86,6 +86,20 @@ def _normalize_code(value: Any) -> str:
     return str(value or "").strip().zfill(6)
 
 
+def _as_dict(row: Any) -> dict:
+    """SQLAlchemy Row / RowMapping / tuple / dict을 안전하게 dict로 변환."""
+    if row is None:
+        return {}
+    if isinstance(row, dict):
+        return row
+    if hasattr(row, "_mapping"):
+        return dict(row._mapping)
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
 def _holdings_index(rows: list[dict]) -> tuple[dict[str, int], dict[str, float]]:
     qty_by_code: dict[str, int] = {}
     avg_price_by_code: dict[str, float] = {}
@@ -241,9 +255,10 @@ def _restore_entry_meta_for_promoted_positions(
 
     restored_count = 0
     for row in rows or []:
-        code = _normalize_code(row[0] if isinstance(row, tuple) else row.get("code"))
-        existing_meta = row[1] if isinstance(row, tuple) else row.get("position_meta")
-        existing_entry_meta = row[2] if isinstance(row, tuple) else row.get("entry_meta_json")
+        _row = _as_dict(row) if not isinstance(row, tuple) else None
+        code = _normalize_code(row[0] if isinstance(row, tuple) else _row.get("code"))
+        existing_meta = row[1] if isinstance(row, tuple) else _row.get("position_meta")
+        existing_entry_meta = row[2] if isinstance(row, tuple) else _row.get("entry_meta_json")
 
         if isinstance(existing_meta, str):
             try:

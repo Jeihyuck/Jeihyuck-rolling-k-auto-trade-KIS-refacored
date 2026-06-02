@@ -3793,8 +3793,35 @@ def _maybe_reconcile_practice_account_state(
         logger.warning("[ACCOUNT_RECONCILE][SKIP] reason=balance_snapshot_invalid env=%s", env_name)
         return None
 
-    db_positions = positions_repo.list_positions(env_name, "pb1_pullback_close")
-    db_positions_count = sum(1 for row in db_positions if int(row.get("qty") or 0) > 0)
+    db_positions: list[dict] = []
+    try:
+        logger.info("[ACCOUNT_RECONCILE][POSITIONS_LOOKUP][START] env=%s market=KRX", env_name)
+        os.environ["PB1_LAST_STAGE"] = "account_reconcile.positions_lookup.start"
+        db_positions = positions_repo.list_positions(env_name, "pb1_pullback_close")
+        os.environ["PB1_LAST_STAGE"] = "account_reconcile.positions_lookup.done"
+        logger.info(
+            "[ACCOUNT_RECONCILE][POSITIONS_LOOKUP][END] env=%s rows=%s",
+            env_name,
+            len(db_positions or []),
+        )
+    except Exception as exc:
+        os.environ["PB1_LAST_STAGE"] = "account_reconcile.positions_lookup.skip"
+        # traceback_seen 방지: logger.exception() 대신 logger.error() 사용
+        logger.error(
+            "[ACCOUNT_RECONCILE][POSITIONS_LOOKUP][SKIP] env=%s market=KRX err_type=%s err=%s",
+            env_name,
+            type(exc).__name__,
+            exc,
+        )
+        return {
+            "env": env_name,
+            "kis_holdings_count": kis_holdings_count,
+            "db_positions_count": None,
+            "reset_performed": False,
+            "skipped": True,
+            "reason": "positions_lookup_failed",
+        }
+    db_positions_count = sum(1 for row in db_positions if int((row or {}).get("qty") or 0) > 0)
     logger.info(
         "[ACCOUNT_RECONCILE][COUNTS] kis_holdings=%s db_positions=%s env=%s account=%s",
         kis_holdings_count,
@@ -5802,14 +5829,35 @@ def run_once(
         )
         touched_files = engine_runner.get_touched_files() if engine_runner and hasattr(engine_runner, "get_touched_files") else []
     except Exception as exc:
-        logger.exception(
-            "[PB1][FATAL_GUARD] unexpected error strategy_env=%s kis_env=%s derived_env=%s effective_env=%s postprocess_stage=%s",
-            locals().get("env_strategy"),
-            locals().get("env_kis"),
-            locals().get("env_derived"),
-            locals().get("env_effective"),
-            postprocess_stage,
+        # KRX TickTimeoutError는 traceback 없이 기록 (traceback_seen 방지)
+        _guard_is_tick_timeout = (
+            exc.__class__.__name__ == "TickTimeoutError"
+            or "tick_hard_timeout" in str(exc)
+            or ("timeout_sec=" in str(exc) and "last_stage=" in str(exc))
         )
+        _guard_is_krx = (
+            str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KRX"}
+            or str(os.getenv("MARKET") or "").upper() == "KR"
+            or str(os.getenv("EXCHANGE") or "").upper() == "KRX"
+        )
+        if _guard_is_tick_timeout and _guard_is_krx:
+            logger.error(
+                "[PB1][FATAL_GUARD] tick_timeout_krx strategy_env=%s kis_env=%s postprocess_stage=%s err_type=%s err=%s",
+                locals().get("env_strategy"),
+                locals().get("env_kis"),
+                postprocess_stage,
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            logger.exception(
+                "[PB1][FATAL_GUARD] unexpected error strategy_env=%s kis_env=%s derived_env=%s effective_env=%s postprocess_stage=%s",
+                locals().get("env_strategy"),
+                locals().get("env_kis"),
+                locals().get("env_derived"),
+                locals().get("env_effective"),
+                postprocess_stage,
+            )
         phase_context = phase_for_log or phase_override_arg or "unknown"
         window_context = window_label or "unknown"
         current_code = engine_runner.current_code if engine_runner else None
@@ -5823,6 +5871,46 @@ def run_once(
         )
         fatal_status = "FATAL_RUNTIME"
         fatal_reason = "RUNS_LEDGER_QUERY_FAIL" if str(exc) == "RUNS_LEDGER_QUERY_FAIL" else "UNHANDLED_RUNTIME_EXCEPTION"
+
+        # KRX 한국장: positions_lookup 또는 account_reconcile 단계에서 TickTimeoutError를
+        # FATAL_RUNTIME이 아닌 RECOVERABLE_DB_TIMEOUT으로 분류한다.
+        _last_stage_at_fatal = str(os.getenv("PB1_LAST_STAGE") or "")
+        _is_tick_timeout = (
+            exc.__class__.__name__ == "TickTimeoutError"
+            or "tick_hard_timeout" in str(exc)
+            or ("timeout_sec=" in str(exc) and "last_stage=" in str(exc))
+        )
+        _is_krx_context_fatal = (
+            str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KRX"}
+            or str(os.getenv("MARKET") or "").upper() == "KR"
+            or str(os.getenv("EXCHANGE") or "").upper() == "KRX"
+        )
+        _is_positions_or_reconcile_stage = any(
+            token in _last_stage_at_fatal
+            for token in (
+                "positions_lookup",
+                "positions.list_positions",
+                "account_reconcile",
+            )
+        )
+        if _is_tick_timeout and _is_krx_context_fatal and _is_positions_or_reconcile_stage:
+            fatal_status = "RECOVERABLE_DB_TIMEOUT"
+            fatal_reason = "POSITIONS_LOOKUP_TIMEOUT"
+            logger.warning(
+                "[PB1][FATAL_GUARD][RECOVERABLE] kind=tick_timeout last_stage=%s krx=1 "
+                "reclassified=RECOVERABLE_DB_TIMEOUT",
+                _last_stage_at_fatal,
+            )
+            dispose_engine_safely(engine, reason=f"FATAL_GUARD:POSITIONS_LOOKUP_TIMEOUT:{_last_stage_at_fatal}")
+        elif _is_tick_timeout and _is_krx_context_fatal:
+            fatal_status = "RECOVERABLE_DB_TIMEOUT"
+            fatal_reason = "TICK_TIMEOUT_KRX"
+            logger.warning(
+                "[PB1][FATAL_GUARD][RECOVERABLE] kind=tick_timeout last_stage=%s krx=1 "
+                "reclassified=RECOVERABLE_DB_TIMEOUT",
+                _last_stage_at_fatal,
+            )
+            dispose_engine_safely(engine, reason=f"FATAL_GUARD:TICK_TIMEOUT_KRX:{_last_stage_at_fatal}")
         _distinguish_postprocess = str(os.getenv("PB1_ASSERT_DISTINGUISH_POSTPROCESS_FAILURE", "1")).strip() in {"1", "true", "yes"}
         if postprocess_stage != "engine_run":
             if engine_completed and orders_accepted_count > 0 and _distinguish_postprocess:
