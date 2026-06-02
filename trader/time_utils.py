@@ -76,7 +76,7 @@ def _load_krx_holidays() -> set[date]:
         )
         return holidays
     except FileNotFoundError:
-        logger.warning(
+        logger.info(
             "[TIME][KRX][CALENDAR_FALLBACK] krx_holidays.json not found; "
             "using empty holiday set (weekday-only heuristic)"
         )

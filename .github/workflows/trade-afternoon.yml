@@ -157,7 +157,7 @@ env:
   PB1_EXIT_POLICY_MODE: "HYBRID_BY_ENTRY_STYLE"
   PB1_EXIT_POLICY_PATH: "trader/exit_policy/optimized_exit_router_policy.json"
   # [2026-05-06] Common AM/PM guard: code-level sold-today block / stale order cleanup
-  PB1_SESSION_KIND: "afternoon"
+  PB1_SESSION_KIND: "pm"
   PB1_FORCE_TRADE_SESSION: "afternoon"
   PB1_PHASE_DEFAULT: "entry"
   PB1_BLOCK_REENTRY_AFTER_EXIT_SAME_DAY: "1"
@@ -672,12 +672,14 @@ jobs:
         timeout-minutes: 135
         working-directory: repo
         env:
-          PB1_SESSION_KIND: "afternoon"
+          PB1_SESSION_KIND: "pm"
           PB1_FORCE_TRADE_SESSION: "afternoon"
           FORCE_MARKET_WINDOW: "afternoon"
           FORCE_PB1_PHASE: "entry"
           PB1_PHASE_DEFAULT: "entry"
           PB1_ENTRY_ENABLED: "1"
+          ENTRY_ENABLED: "1"
+          ALLOW_NEW_BUY: "1"
           PB1_TARGET_START_TIME: "13:00"
           PB1_START_ALLOW_UNTIL: "13:30"
           PB1_PM_SESSION_END: "15:10"
@@ -693,11 +695,18 @@ jobs:
           # [2026-05-27] Late start guard: block new BUY after PM_ENTRY_ALLOW_UNTIL
           PB1_LATE_START_NO_NEW_BUY: ${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}
           PB1_PM_LATE_START_NO_BUY_ENABLED: ${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}
+          FORCE_ENTRY_DISABLED_REASON: ${{ steps.verify_final30.outputs.late_start_no_buy == '1' && 'PM_LATE_START_NO_NEW_BUY' || '' }}
         run: |
           set -euo pipefail
           late_no_buy="${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}"
           if [[ "$late_no_buy" == "1" ]]; then
-            echo "[TRADE_AFTERNOON][LATE_START_ACTION] action=EXIT_ONLY_NO_NEW_BUY entry_enabled=0 exit_enabled=1" | tee -a artifacts/trade-afternoon.log
+            export PB1_ENTRY_ENABLED=0
+            export ENTRY_ENABLED=0
+            export ALLOW_NEW_BUY=0
+            export FORCE_ENTRY_DISABLED_REASON=PM_LATE_START_NO_NEW_BUY
+            export PB1_PHASE_DEFAULT=exit
+            export FORCE_PB1_PHASE=exit
+            echo "[TRADE_AFTERNOON][LATE_START_ACTION] action=EXIT_ONLY_NO_NEW_BUY entry_enabled=0 exit_enabled=1 phase=exit" | tee -a artifacts/trade-afternoon.log
             echo "[ENTRY][BLOCKED] reason=PM_LATE_START_NO_NEW_BUY" | tee -a artifacts/trade-afternoon.log
           fi
           echo "[TRADE_AFTERNOON][ENGINE_START] cmd=python -m trader.trade_tick phase=pm as_of=${{ steps.verify_final30.outputs.expected_as_of }} prep_ready=${{ steps.verify_final30.outputs.prep_ready }}" | tee -a artifacts/trade-afternoon.log
@@ -713,7 +722,7 @@ jobs:
         timeout-minutes: 135
         working-directory: repo
         env:
-          PB1_SESSION_KIND: "afternoon"
+          PB1_SESSION_KIND: "pm"
           PB1_FORCE_TRADE_SESSION: "afternoon"
           FORCE_MARKET_WINDOW: "afternoon"
           FORCE_PB1_PHASE: "exit"
@@ -781,7 +790,7 @@ jobs:
           PB1_TARGET_START_TIME: "15:15"
           PB1_START_ALLOW_UNTIL: "15:35"
           PB1_CLOSE_SESSION_END: "15:30"
-          PB1_RUN_LOOP_MINUTES: "20"
+          PB1_RUN_LOOP_MINUTES: "15"
           PB1_TICK_HARD_TIMEOUT_SEC: "45"
           PB1_MIN_TICK_BUDGET_SEC: "30"
           ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
@@ -819,7 +828,7 @@ jobs:
           PB1_TARGET_START_TIME: "15:15"
           PB1_START_ALLOW_UNTIL: "15:35"
           PB1_CLOSE_SESSION_END: "15:30"
-          PB1_RUN_LOOP_MINUTES: "20"
+          PB1_RUN_LOOP_MINUTES: "15"
           PB1_TICK_HARD_TIMEOUT_SEC: "45"
           PB1_MIN_TICK_BUDGET_SEC: "30"
           ORDER_ALLOWED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
