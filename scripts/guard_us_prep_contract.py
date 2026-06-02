@@ -158,8 +158,30 @@ if not watchlist_result["ok"]:
 
 rows = watchlist_result["value"] or []
 locked_count = len(rows)
+
+
+def _score_positive(row: dict) -> bool:
+    for key in ("score_final", "final_score", "score"):
+        try:
+            if float(row.get(key) or 0) > 0:
+                return True
+        except Exception:
+            pass
+    scores = row.get("scores")
+    if isinstance(scores, dict):
+        for key in ("final", "score_final", "final_score"):
+            try:
+                if float(scores.get(key) or 0) > 0:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+score_nonzero_count = sum(1 for r in rows if _score_positive(r))
+
 print(
-    f"[US_PREP_GUARD][WATCHLIST][DONE] count={locked_count} elapsed_sec={watchlist_result['elapsed_sec']:.2f}",
+    f"[US_PREP_GUARD][WATCHLIST][DONE] count={locked_count} score_nonzero={score_nonzero_count} elapsed_sec={watchlist_result['elapsed_sec']:.2f}",
     flush=True,
 )
 
@@ -168,7 +190,7 @@ watchlist_load_error = False
 
 print(
     f"[US_PREP_GUARD][CHECK] session={session} trade_date={trade_date} "
-    f"prep_status={status} locked_count={locked_count} "
+    f"prep_status={status} locked_count={locked_count} score_nonzero_count={score_nonzero_count} "
     f"watchlist_load_error={watchlist_load_error}",
     flush=True,
 )
@@ -191,10 +213,19 @@ if locked_count < 10:
     write_failure_sidecar("no_locked_watchlist", prep_status=status, locked_count=locked_count, watchlist_load_error=watchlist_load_error)
     sys.exit(1)
 
+if score_nonzero_count <= 0:
+    print(
+        f"[US_PREP_GUARD][FAIL] session={session} trade_date={trade_date} "
+        f"reason=locked_watchlist_score_nonzero_zero prep_status={status} locked_count={locked_count} score_nonzero_count={score_nonzero_count}",
+        flush=True,
+    )
+    write_failure_sidecar("locked_watchlist_score_nonzero_zero", prep_status=status, locked_count=locked_count, watchlist_load_error=watchlist_load_error)
+    sys.exit(1)
+
 # ── Success ───────────────────────────────────────────────────────────────────
 print(
     f"[US_PREP_GUARD][OK] session={session} trade_date={trade_date} "
-    f"prep_status={status} locked_count={locked_count}",
+    f"prep_status={status} locked_count={locked_count} score_nonzero_count={score_nonzero_count}",
     flush=True,
 )
 
@@ -211,6 +242,7 @@ with open(result_path, "w") as f:
             "force_now": force_now or None,
             "prep_status": status,
             "locked_count": locked_count,
+            "score_nonzero_count": score_nonzero_count,
             "timeout_sec": timeout_sec,
         },
         f,

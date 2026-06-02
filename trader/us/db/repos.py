@@ -958,19 +958,23 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
                     WHERE trade_date = :trade_date
                       AND agent_name IN ('us_prep', 'us_prep_dual_agent')
                       AND mode = 'prep'
-                    ORDER BY started_at DESC
+                    ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC
                     LIMIT 1
                 """),
                 {"trade_date": trade_date},
             ).fetchone()
             
             if row is None:
+                logger.info(
+                    "[US_PREP_STATUS][LOAD][MISSING] trade_date=%s status=UNKNOWN",
+                    trade_date,
+                )
                 return {}
             
             result = dict(row._mapping)
             elapsed_ms = int((time.monotonic() - load_started) * 1000)
             logger.info(
-                "[US_PREP_STATUS][LOAD] trade_date=%s status=%s run_id=%s elapsed_ms=%d",
+                "[US_PREP_STATUS][LOAD][DONE] trade_date=%s status=%s run_id=%s elapsed_ms=%d",
                 trade_date, result.get("status"), result.get("run_id"), elapsed_ms
             )
             return result

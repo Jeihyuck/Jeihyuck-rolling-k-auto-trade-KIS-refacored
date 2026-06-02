@@ -1,15 +1,15 @@
-# US Daily Report - 2026-01-02
+# US Daily Report - 2026-06-01
 
 ## Required Fields
 
-- trade_date: 2026-01-02
+- trade_date: 2026-06-01
 - run_id: local
 - sha: 
 - workflow: 
-- session: afternoon
+- session: am
 - event_name: 
 - env: practice
-- dry_run: True
+- dry_run: False
 - kis_order_allowed: 1
 - prep_status: UNKNOWN
 - locked_watchlist_count: 0
@@ -20,8 +20,8 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: session_start
-- final_status: OK_WITH_WARNINGS
+- last_stage: tick_1
+- final_status: OK
 - reason: graceful_shutdown
 - temp_error_count: 0
 - temp_recovered_count: 0

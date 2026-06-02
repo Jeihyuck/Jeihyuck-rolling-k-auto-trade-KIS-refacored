@@ -160,7 +160,7 @@ jobs:
           prep_prepare_until=$((9 * 60 + 20))   # 09:20 ET - prep should be done by this time
           target_min=$((9 * 60 + 30))           # 09:30 ET - market open
           start_allow_until=$((10 * 60 + 0))    # 10:00 ET - normal window end
-          recovery_until=$((11 * 60 + 30))      # 11:30 ET - recovery window end
+          recovery_until=$((12 * 60 + 30))      # 12:30 ET - recovery window end (= session_end)
           session_end=$((12 * 60 + 30))         # 12:30 ET - hard session end
           schedule_expected_min=$((8 * 60 + 15))
           max_wait_seconds=5400  # 최대 90분 wait 허용 (08:00 시작 ~ 09:30 target)
@@ -175,14 +175,14 @@ jobs:
           delay_seconds=$(( (now_min - schedule_expected_min) * 60 + 10#$now_s ))
 
           if [[ "$event_name" == "schedule" ]]; then
-            if [[ "$now_min" -gt "$recovery_until" ]]; then
-              # 11:30 이후는 skip
+            if [[ "$now_min" -gt "$session_end" ]]; then
+              # 12:30 이후는 skip (session_end 기준)
               should_run=0
               skip_reason="skip_stale_start_us_am"
               run_window="stale"
               missed_trade_window=true
             elif [[ "$now_min" -gt "$start_allow_until" ]]; then
-              # 10:00~11:30: recovery window
+              # 10:00~12:30: recovery window
               run_window="recovery"
               recovery_run=1
             elif [[ "$now_min" -lt "$target_min" ]]; then

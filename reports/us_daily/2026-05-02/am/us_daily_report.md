@@ -9,8 +9,8 @@
 - session: am
 - event_name: 
 - env: practice
-- dry_run: True
-- kis_order_allowed: 0
+- dry_run: False
+- kis_order_allowed: 1
 - prep_status: UNKNOWN
 - locked_watchlist_count: 0
 - entry_eval_status: UNKNOWN
@@ -21,8 +21,8 @@
 - fills: 0
 - positions: 0
 - last_stage: tick_1
-- final_status: OK_WITH_WARNINGS_SIGNAL_ONLY
-- reason: max_ticks
+- final_status: SKIP
+- reason: not_trading_day
 - temp_error_count: 0
 - temp_recovered_count: 0
 - missed_trade_window: False

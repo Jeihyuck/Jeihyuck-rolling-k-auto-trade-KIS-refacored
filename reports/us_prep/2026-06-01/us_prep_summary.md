@@ -1,4 +1,4 @@
-# US Prep Summary — 2026-06-02
+# US Prep Summary — 2026-06-01
 
 **status**: OK_WITH_WARNINGS
 **trade_can_proceed**: 1

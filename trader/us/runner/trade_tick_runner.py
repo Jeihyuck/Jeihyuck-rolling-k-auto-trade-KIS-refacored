@@ -131,6 +131,16 @@ def run_trade_tick(
     )
     last_stage = "tick_start"
 
+    # ── 변수 사전 초기화 (reconcile 실패 시 UnboundLocalError 방지) ──────────
+    fills_today: list[dict] = []
+    fills_error_count = 0
+    fills_warnings_count = 0
+    fills_contract_error = False
+    fills_temp_error = False
+    temp_error_count = 0
+    temp_recovered_count = 0
+    kis_temp_errors_by_api: dict[str, dict] = {}
+
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
     from trader.us.market_calendar import now_ny, is_us_trading_day, market_phase
     from zoneinfo import ZoneInfo
@@ -290,11 +300,7 @@ def run_trade_tick(
     current_position_symbols = set(recon.get("position_symbols", []))
 
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
-    fills_today: list[dict] = []
-    fills_error_count = 0
-    fills_warnings_count = 0
-    fills_contract_error = False
-    fills_temp_error = False
+    # (fills_today 등은 함수 시작부에서 사전 초기화됨)
     
     if not offline:
         try:
@@ -328,10 +334,7 @@ def run_trade_tick(
             logger.error("[US_TICK][ERROR] fills exception: %s", exc)
             fills_error_count += 1
 
-    temp_error_count = 0
-    temp_recovered_count = 0
-    kis_temp_errors_by_api: dict[str, dict] = {}
-
+    # temp_error_count, temp_recovered_count, kis_temp_errors_by_api는 함수 시작부에서 사전 초기화됨
     if fills_temp_error:
         temp_error_count += 1
         kis_temp_errors_by_api.setdefault("GET_inquire_balance", {"temp_error": 0, "recovered": 0, "unrecovered": 0})
@@ -922,6 +925,7 @@ def run_trade_tick(
                 total_portfolio_usd=max(effective_budget, 1000.0),
                 available_cash_usd=max(effective_budget - daily_notional, 0.0),
                 signal_only=signal_only,
+                kis_order_allowed=kis_order_allowed,
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):

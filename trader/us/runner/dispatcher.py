@@ -50,26 +50,44 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
     """
     logger.info("[US_DISPATCHER][START] mode=%s env=%s offline=%s", mode, env, offline)
 
+    raw_mode = mode
+    mode = normalize_mode(mode)
+
     # schedule과 workflow_dispatch는 모두 정상 이벤트. unsupported event만 차단한다.
     _ALLOWED_EVENTS = {"schedule", "workflow_dispatch", ""}
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
     if event_name and event_name not in _ALLOWED_EVENTS:
         logger.error(
-            "[US_DISPATCHER][BLOCKED] unsupported_event event=%s mode=%s workflow=%s",
+            "[US_DISPATCHER][BLOCKED] unsupported_event event=%s raw_mode=%s mode=%s workflow=%s",
             event_name,
+            raw_mode,
             mode,
             os.environ.get("GITHUB_WORKFLOW", ""),
         )
         return 1
-    logger.info(
-        "[US_DISPATCHER][EVENT_ALLOWED] event=%s mode=%s workflow=%s env=%s",
-        event_name,
-        mode,
-        os.environ.get("GITHUB_WORKFLOW", ""),
-        env,
-    )
 
-    mode = normalize_mode(mode)
+    if event_name == "schedule":
+        logger.info(
+            "[US_DISPATCHER][SCHEDULE_ALLOWED] raw_mode=%s mode=%s trigger=schedule "
+            "reason=dedicated_workflow_phase_guard_already_resolved",
+            raw_mode,
+            mode,
+        )
+    elif event_name == "workflow_dispatch":
+        logger.info(
+            "[US_DISPATCHER][MANUAL_ALLOWED] raw_mode=%s mode=%s trigger=workflow_dispatch",
+            raw_mode,
+            mode,
+        )
+    else:
+        logger.info(
+            "[US_DISPATCHER][EVENT_ALLOWED] event=%s raw_mode=%s mode=%s workflow=%s env=%s",
+            event_name,
+            raw_mode,
+            mode,
+            os.environ.get("GITHUB_WORKFLOW", ""),
+            env,
+        )
 
     if mode == "all":
         results = []

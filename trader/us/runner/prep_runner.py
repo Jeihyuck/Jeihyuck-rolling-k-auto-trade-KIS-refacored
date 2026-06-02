@@ -170,7 +170,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     try:
         run_id = save_us_prep_run(
             trade_date=trade_date,
-            agent_name="us_prep_dual_agent",
+            agent_name="us_prep",
             mode="prep",
             env=env,
         )

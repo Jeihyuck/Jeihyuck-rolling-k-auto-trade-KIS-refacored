@@ -212,6 +212,111 @@ def save_us_prep_summary(contract: dict) -> None:
         logger.warning("[US_PREP_SUMMARY][WARN] md save failed: %s", exc)
 
 
+def _score_positive(row: dict) -> bool:
+    """row dict에서 양수 score가 있는지 확인."""
+    for key in ("score_final", "final_score", "score"):
+        try:
+            if float(row.get(key) or 0) > 0:
+                return True
+        except Exception:
+            pass
+    scores = row.get("scores")
+    if isinstance(scores, dict):
+        for key in ("final", "score_final", "final_score"):
+            try:
+                if float(scores.get(key) or 0) > 0:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def _check_us_prep_guard_from_db(trade_date: str) -> dict:
+    """파일 contract가 없을 때 DB fallback으로 prep guard를 수행."""
+    from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+
+    prep = load_latest_us_prep_status(trade_date, timeout_sec=20) or {}
+    status = prep.get("status", "UNKNOWN")
+    run_id = prep.get("run_id", "")
+
+    if status not in ("OK", "OK_WITH_WARNINGS"):
+        logger.warning(
+            "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_prep_status_not_ok status=%s",
+            trade_date, status,
+        )
+        return {
+            "ok": False,
+            "trade_can_proceed": False,
+            "reason": f"db_prep_status_not_ok:{status}",
+            "contract": None,
+            "source": "db",
+            "prep_status": status,
+            "run_id": run_id,
+        }
+
+    rows = load_locked_us_watchlist(
+        trade_date=trade_date,
+        min_count=10,
+        allow_degraded=False,
+        timeout_sec=20,
+    ) or []
+
+    locked_count = len(rows)
+    score_nonzero_count = sum(1 for r in rows if _score_positive(r))
+
+    if locked_count < 10:
+        logger.warning(
+            "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_locked_watchlist_count=%d<10",
+            trade_date, locked_count,
+        )
+        return {
+            "ok": False,
+            "trade_can_proceed": False,
+            "reason": f"db_locked_watchlist_count={locked_count}<10",
+            "contract": None,
+            "source": "db",
+            "prep_status": status,
+            "run_id": run_id,
+            "locked_count": locked_count,
+            "score_nonzero_count": score_nonzero_count,
+        }
+
+    if score_nonzero_count <= 0:
+        logger.warning(
+            "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_locked_watchlist_score_nonzero=0 locked_count=%d",
+            trade_date, locked_count,
+        )
+        return {
+            "ok": False,
+            "trade_can_proceed": False,
+            "reason": "db_locked_watchlist_score_nonzero=0",
+            "contract": None,
+            "source": "db",
+            "prep_status": status,
+            "run_id": run_id,
+            "locked_count": locked_count,
+            "score_nonzero_count": score_nonzero_count,
+        }
+
+    logger.info(
+        "[US_PREP_GUARD][OK] source=db trade_date=%s prep_status=%s run_id=%s "
+        "final30=%d score_nonzero=%d",
+        trade_date, status, run_id, locked_count, score_nonzero_count,
+    )
+    return {
+        "ok": True,
+        "trade_can_proceed": True,
+        "reason": "ok_db_fallback",
+        "contract": None,
+        "source": "db",
+        "prep_status": status,
+        "run_id": run_id,
+        "final30_scored_count": locked_count,
+        "score_nonzero_count": score_nonzero_count,
+        "locked_count": locked_count,
+    }
+
+
 def check_us_prep_guard(trade_date: str) -> dict:
     """AM/Afternoon session이 사용하는 prep guard 체크.
 
@@ -228,13 +333,8 @@ def check_us_prep_guard(trade_date: str) -> dict:
 
     contract = load_us_prep_contract(trade_date)
     if contract is None:
-        return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": "prep_contract_missing",
-            "contract": None,
-            "source": "none",
-        }
+        logger.warning("[US_PREP_GUARD][CONTRACT_MISSING][DB_FALLBACK] trade_date=%s", trade_date)
+        return _check_us_prep_guard_from_db(trade_date)
 
     # contract trade_date 검증
     if contract.get("trade_date") != trade_date:
