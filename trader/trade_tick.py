@@ -167,6 +167,22 @@ def _apply_prewarm_guard(now_override: datetime | None = None) -> int | None:
     return None
 
 
+def _apply_late_start_exit_only_policy() -> None:
+    """Force PM late-start EXIT_ONLY_NO_NEW_BUY policy through launcher env."""
+    reason = (os.getenv("FORCE_ENTRY_DISABLED_REASON") or "").strip()
+    late_no_buy = os.getenv("PB1_LATE_START_NO_NEW_BUY", "0") in {"1", "true", "TRUE", "yes", "YES"}
+    action = (os.getenv("PM_LATE_START_ACTION") or "").strip().upper()
+    if reason == "PM_LATE_START_NO_NEW_BUY" or (late_no_buy and action == "EXIT_ONLY_NO_NEW_BUY"):
+        os.environ["FORCE_ENTRY_DISABLED_REASON"] = "PM_LATE_START_NO_NEW_BUY"
+        os.environ["PB1_ENTRY_ENABLED"] = "0"
+        os.environ["ENTRY_ENABLED"] = "0"
+        os.environ["ALLOW_NEW_BUY"] = "0"
+        os.environ["PB1_PHASE_DEFAULT"] = "exit"
+        os.environ["FORCE_PB1_PHASE"] = "exit"
+        logger.info("[ENTRY][DISABLED] reason=PM_LATE_START_NO_NEW_BUY action=launcher_force_exit_only")
+        logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
+
+
 def _verify_log_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="python -m trader.trade_tick verify-log")
     parser.add_argument("--session", required=True, choices=["am", "pm", "close"])
@@ -221,6 +237,7 @@ def main() -> int:
         os.getenv("PB1_TICK_HARD_TIMEOUT_SEC", "90"),
         os.getenv("PB1_LAST_STAGE", "trade_tick.bootstrap"),
     )
+    _apply_late_start_exit_only_policy()
     logger.info(
         "[TRADE][BOOT][SESSION_POLICY] force_trade_session=%s forced_trade_session=%s force_entry_window_override=%s session_recovery_continue=%s phase_guard_classification=%s",
         os.getenv("PB1_FORCE_TRADE_SESSION", "auto"),

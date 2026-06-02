@@ -3901,6 +3901,50 @@ def should_degrade(remaining_s: float) -> bool:
     return remaining_s < 60
 
 
+def _late_start_exit_only_forced() -> bool:
+    reason = (os.getenv("FORCE_ENTRY_DISABLED_REASON") or "").strip()
+    action = (os.getenv("PM_LATE_START_ACTION") or "").strip().upper()
+    late_flags = (
+        os.getenv("PB1_LATE_START_NO_NEW_BUY"),
+        os.getenv("PB1_PM_LATE_START_NO_BUY_ENABLED"),
+    )
+    return reason == "PM_LATE_START_NO_NEW_BUY" or (
+        action == "EXIT_ONLY_NO_NEW_BUY"
+        and any(str(v or "").strip().lower() in {"1", "true", "yes", "on"} for v in late_flags)
+    )
+
+
+def _force_late_start_exit_only_env() -> None:
+    os.environ["FORCE_ENTRY_DISABLED_REASON"] = "PM_LATE_START_NO_NEW_BUY"
+    os.environ["PB1_ENTRY_ENABLED"] = "0"
+    os.environ["ENTRY_ENABLED"] = "0"
+    os.environ["ALLOW_NEW_BUY"] = "0"
+    os.environ["PB1_PHASE_DEFAULT"] = "exit"
+    os.environ["FORCE_PB1_PHASE"] = "exit"
+
+
+def _close_reconcile_guard_path(runtime_dir: Path | None) -> Path:
+    root = runtime_dir or runtime_root()
+    return root / "runtime" / "status" / "close_reconcile_done.json"
+
+
+def _close_reconcile_already_done(runtime_dir: Path | None, *, env: str, trade_date: str) -> bool:
+    path = _close_reconcile_guard_path(runtime_dir)
+    try:
+        if not path.exists():
+            return False
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload.get("env") == env and payload.get("trade_date") == trade_date and bool(payload.get("done"))
+    except Exception:
+        return False
+
+
+def _mark_close_reconcile_done(runtime_dir: Path | None, *, env: str, trade_date: str, now: datetime, reason: str) -> None:
+    path = _close_reconcile_guard_path(runtime_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"done": True, "env": env, "trade_date": trade_date, "ts": now.isoformat(), "reason": reason}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def run_once(
     *,
     args: argparse.Namespace,
@@ -3912,6 +3956,11 @@ def run_once(
     max_seconds: int = 0,
     runs_ledger_fail_open: bool = False,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
+    if _late_start_exit_only_forced():
+        _force_late_start_exit_only_env()
+        logger.info("[ENTRY][DISABLED] reason=PM_LATE_START_NO_NEW_BUY action=runner_force_exit_only")
+        logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
+
     if (os.getenv("MODE") or "").strip().lower() == "trade" and not (os.getenv("PB1_UNIVERSE_STRATEGY") or "").strip():
         os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
 
@@ -4135,6 +4184,7 @@ def run_once(
     allow_wait = env_bool("PB1_ALLOW_WAIT", env_bool("PB1_WAIT_FOR_WINDOW", PB1_WAIT_FOR_WINDOW))
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
+    late_start_exit_only = _late_start_exit_only_forced()
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
     phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
     resolved_window, window_label, resolved_phase, phase_reason, phase_window, context_reasons = _resolve_market_context(
@@ -4148,7 +4198,7 @@ def run_once(
     session_recovery_continue = _env_flag("PB1_SESSION_RECOVERY_CONTINUE", default=False)
     forced_trade_session = str(os.getenv("PB1_FORCED_TRADE_SESSION") or "").strip().lower()
     phase_guard_classification = str(os.getenv("PB1_PHASE_GUARD_CLASSIFICATION") or "").strip()
-    if force_entry_window_override and forced_trade_session in {"am", "pm"}:
+    if force_entry_window_override and forced_trade_session in {"am", "pm"} and not late_start_exit_only:
         market_window = "day"
         window_label = "day"
         resolved_phase = "entry"
@@ -4538,7 +4588,7 @@ def run_once(
         window_label = "day"
         _apply_env_flags_if_needed(dry_run)
 
-    if force_entry_window_override and forced_trade_session in {"am", "pm"}:
+    if force_entry_window_override and forced_trade_session in {"am", "pm"} and not late_start_exit_only:
         market_window = "day"
         window_label = "day"
         phase_override_arg = "entry"
@@ -4552,6 +4602,13 @@ def run_once(
         phase_for_log = "entry"
         phase_reason = "after_compute_only_full_run"
         logger.info("[AFTER_COMPUTE_ONLY][ROUTE] reuse existing intraday trade pipeline")
+
+    if late_start_exit_only:
+        phase_override_arg = "exit"
+        resolved_phase = "exit"
+        phase_reason = "late_start_exit_only"
+        run_ctx["phase_name"] = "exit"
+        context_reasons.append("late_start_exit_only")
 
     window_label = window_label or _resolve_window_label(market_window, window)
     phase_for_log = phase_override_arg or "none"
@@ -4613,10 +4670,21 @@ def run_once(
     remaining_s = _remaining_seconds()
     exit_short_circuit = phase_for_log == "exit" or window_label == "close"
     if exit_short_circuit:
+        close_env = (os.getenv("KIS_ENV") or "practice").lower()
+        close_trade_date = now.date().isoformat()
+        if _close_reconcile_already_done(runtime_root_dir, env=close_env, trade_date=close_trade_date):
+            logger.info("[PB1][CLOSE][RECONCILE][SKIP] reason=already_done")
+            return [], True, {}, phase_for_log, "EXIT_SHORTCIRCUIT_ALREADY_DONE"
         logger.info("[PB1][EXIT_SHORTCIRCUIT] start remaining_s=%.1f", remaining_s)
+        logger.info("[PB1][CLOSE][RECONCILE][RUN_ONCE] done=0")
         kis = None
+        kis_balance_snapshot = None
         try:
             kis = KisAPI()
+            try:
+                kis_balance_snapshot = kis.get_balance_cached(force=True)
+            except Exception:
+                logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS balance fetch failed")
         except Exception:
             logger.exception("[PB1][EXIT_SHORTCIRCUIT] KIS init failed")
         run_id = os.getenv("TRADER_RUN_ID", "local")
@@ -4627,7 +4695,7 @@ def run_once(
                 try:
                     ctx = RunContext(
                         run_id=run_id,
-                        env=(os.getenv("KIS_ENV") or "practice").lower(),
+                        env=close_env,
                         strategy="pb1_pullback_close",
                         started_at=now,
                         dry_run=False,
@@ -4643,15 +4711,19 @@ def run_once(
             try:
                 close_stale_positions(
                     engine=engine,
-                    env=(os.getenv("KIS_ENV") or "practice").lower(),
+                    env=close_env,
                     strategy="pb1_pullback_close",
                     reason="exit_phase",
                     ts=now,
+                    kis_balance=kis_balance_snapshot,
+                    stale_confirmed=False,
                 )
                 close_stale_ok = True
             except Exception:
                 logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
             _write_last_db_write(runtime_root_dir, run_id=run_id, reason="exit_shortcircuit", now=now)
+            _mark_close_reconcile_done(runtime_root_dir, env=close_env, trade_date=close_trade_date, now=now, reason="exit_shortcircuit")
+            logger.info("[PB1][CLOSE][RECONCILE][RUN_ONCE] done=1")
             if not reconcile_ok or not close_stale_ok:
                 logger.error(
                     "[PB1][EXIT_SHORTCIRCUIT][PARTIAL_FAIL] reconcile_ok=%s close_stale_ok=%s - continuing with caution",
@@ -4692,12 +4764,20 @@ def run_once(
                 except Exception:
                     logger.exception("[PB1][DEGRADED] reconcile_today failed")
             try:
+                degraded_balance_snapshot = None
+                if kis:
+                    try:
+                        degraded_balance_snapshot = kis.get_balance_cached(force=True)
+                    except Exception:
+                        logger.exception("[PB1][DEGRADED] KIS balance fetch failed")
                 close_stale_positions(
                     engine=engine,
                     env=(os.getenv("KIS_ENV") or "practice").lower(),
                     strategy="pb1_pullback_close",
                     reason="budget_degraded",
                     ts=now,
+                    kis_balance=degraded_balance_snapshot,
+                    stale_confirmed=False,
                 )
                 close_stale_ok = True
             except Exception:
@@ -5037,6 +5117,8 @@ def run_once(
         
         # order_allowed: 주문 생성/제출 가능 여부
         user_entry_enabled = bool(entry_flag.value)
+        if _late_start_exit_only_forced():
+            user_entry_enabled = False
         order_allowed = user_entry_enabled and not minervini_only
         entry_block_reason = None
         os.environ["PB1_PM_POLICY_REASON"] = ""
@@ -5053,6 +5135,14 @@ def run_once(
             order_allowed = False
             entry_block_reason = entry_block_reason or "minervini_test"
             logger.info("[PB1][MINERVINI_TEST] compute_allowed=1 order_allowed=0")
+
+        if _late_start_exit_only_forced() and not minervini_only:
+            calc_allowed = False
+            order_allowed = False
+            entry_block_reason = "PM_LATE_START_NO_NEW_BUY"
+            os.environ["ALLOW_NEW_BUY"] = "0"
+            logger.info("[ENTRY][DISABLED] reason=PM_LATE_START_NO_NEW_BUY action=skip_entry_scan")
+            logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
         
         # [2] 거래시간 체크: LIVE 모드에서 장중 여부 판정
         if mode == "LIVE" and not minervini_only:

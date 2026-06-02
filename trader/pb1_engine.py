@@ -12152,6 +12152,17 @@ class PB1Engine:
         entry_decision_result: str | None = None
         entry_decision_reason: str | None = None
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
+        forced_entry_disabled_reason = (os.getenv("FORCE_ENTRY_DISABLED_REASON") or "").strip()
+        if forced_entry_disabled_reason == "PM_LATE_START_NO_NEW_BUY":
+            calc_allowed = False
+            order_allowed = False
+            entry_reason = forced_entry_disabled_reason
+            self.phase = "exit"
+            self.phase_name = "exit"
+            os.environ["ALLOW_NEW_BUY"] = "0"
+            os.environ["PB1_ENTRY_ENABLED"] = "0"
+            logger.info("[ENTRY][DISABLED] reason=PM_LATE_START_NO_NEW_BUY action=skip_entry_scan")
+            logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
         entry_phase = self.phase in {"prep", "entry"}
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", PB1_TARGET_NEW_POSITIONS)

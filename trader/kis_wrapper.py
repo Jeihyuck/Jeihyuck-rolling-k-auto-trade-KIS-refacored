@@ -426,6 +426,34 @@ def sanitize_log_mapping(payload: dict | None) -> dict[str, Any]:
     return masked
 
 
+def _balance_response_summary(payload: dict | None) -> dict[str, Any]:
+    data = payload if isinstance(payload, dict) else {}
+    output1 = data.get("output1") or []
+    output2 = data.get("output2") or {}
+    if isinstance(output2, list):
+        output2_first = output2[0] if output2 and isinstance(output2[0], dict) else {}
+    else:
+        output2_first = output2 if isinstance(output2, dict) else {}
+
+    def _amount(*keys: str) -> int:
+        for key in keys:
+            raw = output2_first.get(key)
+            try:
+                return int(float(str(raw or "0").replace(",", "")))
+            except Exception:
+                continue
+        return 0
+
+    return {
+        "rt_cd": data.get("rt_cd"),
+        "msg_cd": data.get("msg_cd"),
+        "rows": len(output1) if isinstance(output1, list) else 0,
+        "has_output2": int(bool(output2)),
+        "cash": _amount("dnca_tot_amt", "ord_psbl_cash", "nxdy_excc_amt"),
+        "market_value": _amount("scts_evlu_amt", "tot_evlu_amt", "nass_amt"),
+    }
+
+
 def _load_price_policy_config() -> dict[str, float]:
     min_interval_ms = _env_first_float(("KIS_PRICE_MIN_INTERVAL_MS",), 0.0)
     min_interval_sec = _env_first_float(
@@ -980,7 +1008,8 @@ class KisAPI:
         self._load_safe_mode_state()
 
         self.token = self.get_valid_token()
-        logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
+        meta = self._account_param_meta()
+        logger.info("[생성자 체크] CANO=%s, ACNT_PRDT_CD=%s, ENV=%s", meta.get("cano_masked"), "***", self.env)
 
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
@@ -1023,7 +1052,7 @@ class KisAPI:
             "cano_len": len(cano),
             "acnt_prdt_cd_len": len(acnt),
             "cano_masked": f"***{cano[-4:]}" if len(cano) >= 4 else "***",
-            "acnt_prdt_cd": acnt,
+            "acnt_prdt_cd": "***",
         }
 
     def _validate_account_params(self) -> tuple[bool, str]:
@@ -3289,7 +3318,7 @@ class KisAPI:
             "CTX_AREA_FK100": fk,
             "CTX_AREA_NK100": nk,
         }
-        logger.info(f"[잔고조회 요청파라미터] {params}")
+        logger.info("[잔고조회 요청파라미터] %s", sanitize_log_mapping(params))
         # [CHG] 안전요청 사용
         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
         payload = resp.json()
@@ -3350,7 +3379,16 @@ class KisAPI:
                     continue
                 raise KisBalanceUnavailable(str(e)) from e
 
-            logger.info(f"[잔고조회 응답] {j}")
+            summary = _balance_response_summary(j)
+            logger.info(
+                "[BALANCE][RESP_SUMMARY] rt_cd=%s msg_cd=%s rows=%s has_output2=%s cash=%s market_value=%s",
+                summary.get("rt_cd"),
+                summary.get("msg_cd"),
+                summary.get("rows"),
+                summary.get("has_output2"),
+                summary.get("cash"),
+                summary.get("market_value"),
+            )
 
             rows = j.get("output1") or []
             if not rows:

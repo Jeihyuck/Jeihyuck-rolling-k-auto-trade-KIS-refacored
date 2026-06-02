@@ -454,6 +454,24 @@ def _build_blocked_orders(blocked_events: list[dict], balance_rows: list[dict], 
     return aggregated
 
 
+def _fill_meta(fill: dict) -> dict:
+    meta = fill.get("fill_meta_json") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _first_positive_float(*values) -> float:
+    for value in values:
+        v = _safe_float(value)
+        if v > 0:
+            return v
+    return 0.0
+
+
 def _build_portfolio_summary(
     holdings: list[dict],
     today_fills: list[dict],
@@ -494,52 +512,57 @@ def _build_portfolio_summary(
         sell_qty = _safe_int(fill.get("qty"))
         sell_price = _safe_float(fill.get("price"))
 
-        # avg_buy 조회 우선순위: 1) DB position → 2) 당일 BUY fills 가중평균 → skip
-        avg_buy = 0.0
+        meta = _fill_meta(fill)
+        source = "unknown"
+        fill_realized = fill.get("realized_pnl")
+        if fill_realized is None:
+            fill_realized = meta.get("realized_pnl")
+        if fill_realized is not None and str(fill_realized).strip() != "":
+            pnl = _safe_float(fill_realized)
+            realized_today += pnl
+            source = "fill_realized_pnl"
+            logger.info("[PNL_REPORT][REALIZED][SOURCE] code=%s source=%s pnl=%.2f", code, source, pnl)
+            continue
+
+        avg_buy = _first_positive_float(fill.get("avg_buy_at_sell"), meta.get("avg_buy_at_sell"))
+        if avg_buy > 0:
+            source = "fill_avg_buy_at_sell"
+
         pos = db_pos_by_code.get(code)
-        if pos:
-            avg_buy = _safe_float(pos.get("avg_buy_price"))
+        if avg_buy <= 0 and pos:
+            avg_buy = _first_positive_float(pos.get("avg_buy_price"), pos.get("entry_price"))
+            if avg_buy > 0:
+                source = "position_snapshot"
 
         if avg_buy <= 0:
-            # 전량매도 후 position이 사라졌을 경우 → 당일 BUY fills에서 계산
             buy_fills_for_code = today_buy_by_code.get(code) or []
             if buy_fills_for_code:
                 total_buy_qty = sum(_safe_int(f.get("qty")) for f in buy_fills_for_code)
-                total_buy_cost = sum(
-                    _safe_float(f.get("price")) * _safe_int(f.get("qty"))
-                    for f in buy_fills_for_code
-                )
+                total_buy_cost = sum(_safe_float(f.get("price")) * _safe_int(f.get("qty")) for f in buy_fills_for_code)
                 if total_buy_qty > 0:
                     avg_buy = total_buy_cost / total_buy_qty
-                    logger.info(
-                        "[PNL_REPORT][REALIZED][AVG_BUY_FROM_FILLS] code=%s avg_buy=%.2f "
-                        "buy_fills=%s",
-                        code, avg_buy, len(buy_fills_for_code),
-                    )
+                    source = "today_buy_fills"
+                    logger.info("[PNL_REPORT][REALIZED][AVG_BUY_FROM_FILLS] code=%s avg_buy=%.2f buy_fills=%s", code, avg_buy, len(buy_fills_for_code))
 
         if avg_buy <= 0:
             realized_warnings.append(f"REALIZED_PNL_AVG_BUY_MISSING:{code}")
-            logger.warning(
-                "[PNL_REPORT][REALIZED][WARN] code=%s reason=AVG_BUY_MISSING_SKIP_REALIZED",
-                code,
-            )
+            logger.error("[PNL_REPORT][REALIZED][FAIL] code=%s reason=AVG_BUY_MISSING sell_qty=%s", code, sell_qty)
             continue
 
         pnl = (sell_price - avg_buy) * sell_qty
         realized_today += pnl
+        logger.info("[PNL_REPORT][REALIZED][SOURCE] code=%s source=%s avg_buy=%.2f pnl=%.2f", code, source, avg_buy, pnl)
 
-    # realized PNL = 0 인데 SELL fills 있으면 경고
-    if sell_fills_count > 0 and abs(realized_today) < 1:
-        logger.warning(
-            "[PNL_REPORT][REALIZED][WARN] reason=REALIZED_PNL_MISSING_DESPITE_SELL_FILLS "
+    if sell_fills_count > 0 and abs(realized_today) < 1 and realized_warnings:
+        logger.error(
+            "[PNL_REPORT][REALIZED][FAIL] reason=REALIZED_PNL_MISSING_DESPITE_SELL_FILLS "
             "sell_fills_count=%s realized_pnl=%.2f warnings=%s",
             sell_fills_count, realized_today, realized_warnings,
         )
+    elif sell_fills_count > 0:
+        logger.info("[PNL_REPORT][REALIZED][OK] sell_fills=%s realized_today=%.2f", sell_fills_count, realized_today)
 
-    logger.info(
-        "[PNL_REPORT][REALIZED][SUMMARY] realized_today=%.2f sell_fills=%s warnings=%s",
-        realized_today, sell_fills_count, realized_warnings,
-    )
+    logger.info("[PNL_REPORT][REALIZED][SUMMARY] realized_today=%.2f sell_fills=%s warnings=%s", realized_today, sell_fills_count, realized_warnings)
     
     total_pnl = unrealized_pnl + realized_today
     winners = sum(1 for h in holdings if h["pnl_pct"] >= 0)
@@ -849,10 +872,22 @@ def main() -> int:
 
         # Data quality
         degraded_count = sum(1 for h in holdings if h.get("price_source") == "degraded")
+        db_active_count = sum(1 for p in db_positions if _safe_int(p.get("qty")) > 0)
+        kis_active_count = sum(1 for r in balance_output1 if _safe_int(r.get("hldg_qty")) > 0)
+        mismatch_warning = None
+        if db_active_count != kis_active_count:
+            reason = "DB_SOFT_CLOSED_WHILE_KIS_HOLDS" if db_active_count == 0 and kis_active_count > 0 else "DB_POSITION_KIS_MISMATCH"
+            mismatch_warning = "DB_POSITION_KIS_MISMATCH"
+            logger.error(
+                "[PNL_REPORT][POSITION_MISMATCH] db_positions=%s kis_positions=%s severity=ERROR reason=%s",
+                db_active_count, kis_active_count, reason,
+            )
         data_quality = {
-            "degraded": degraded_count > 0,
+            "degraded": degraded_count > 0 or mismatch_warning is not None,
             "warnings": quality_warnings[:20],
         }
+        if mismatch_warning:
+            data_quality["warnings"].insert(0, mismatch_warning)
         if degraded_count > 0:
             data_quality["warnings"].insert(
                 0,

@@ -3748,6 +3748,43 @@ class FillsRepo:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
         safe_raw_json = json_sanitize(raw_json or {})
+        enriched_fill_meta = dict(fill_meta_json or {})
+        if str(side or "").upper() == "SELL":
+            try:
+                pos_schema = self._schema.positions
+                stmt = (
+                    select(pos_schema)
+                    .where(
+                        and_(
+                            pos_schema.c.env == env,
+                            pos_schema.c.code == str(code).zfill(6),
+                            pos_schema.c.qty > 0,
+                        )
+                    )
+                    .order_by(pos_schema.c.updated_at.desc())
+                    .limit(1)
+                )
+                with self.engine.begin() as conn:
+                    pos = conn.execute(stmt).mappings().first()
+                if pos:
+                    pos_d = dict(pos)
+                    avg_buy_at_sell = _safe_float_or_none(pos_d.get("avg_buy_price"))
+                    position_qty_before_sell = int(pos_d.get("qty") or 0)
+                    sell_qty_for_basis = min(int(qty or 0), position_qty_before_sell)
+                    cost_basis_at_sell = (avg_buy_at_sell or 0.0) * sell_qty_for_basis
+                    proceeds = (float(price) * sell_qty_for_basis) - float(fee or 0.0) - float(tax or 0.0)
+                    realized_pnl = proceeds - cost_basis_at_sell if avg_buy_at_sell else None
+                    enriched_fill_meta.setdefault("avg_buy_at_sell", avg_buy_at_sell)
+                    enriched_fill_meta.setdefault("cost_basis_at_sell", cost_basis_at_sell)
+                    enriched_fill_meta.setdefault("position_qty_before_sell", position_qty_before_sell)
+                    enriched_fill_meta.setdefault("entry_date", pos_d.get("entry_date") or pos_d.get("entry_ts") or pos_d.get("created_at"))
+                    if realized_pnl is not None:
+                        enriched_fill_meta.setdefault("realized_pnl", realized_pnl)
+                        enriched_fill_meta.setdefault("realized_pnl_pct", (realized_pnl / cost_basis_at_sell * 100.0) if cost_basis_at_sell else 0.0)
+                    enriched_fill_meta.setdefault("exit_reason", enriched_fill_meta.get("exit_reason") or (safe_raw_json.get("exit_reason") if isinstance(safe_raw_json, dict) else None))
+            except Exception:
+                logger.warning("[DB][FILLS][SELL_META][FAIL] code=%s", code, exc_info=True)
+        fill_meta_json = enriched_fill_meta
         if run_id:
             self.ensure_run_exists(run_id)
         payload = {

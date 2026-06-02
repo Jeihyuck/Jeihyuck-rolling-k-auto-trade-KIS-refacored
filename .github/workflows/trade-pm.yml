@@ -1,3 +1,4 @@
+# Deprecated as scheduled workflow; trade-pm is retained for legacy/manual compatibility.
 # DISABLED: trade-pm은 trade-afternoon으로 통합되었습니다.
 # PM + Close 실행은 trade-afternoon.yml에서 처리합니다.
 # 이 워크플로우는 legacy 호환성만을 위해 보관되며 실행되지 않아야 합니다.
