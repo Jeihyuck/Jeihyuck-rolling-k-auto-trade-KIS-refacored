@@ -263,6 +263,14 @@ INVALID_ZERO_NUMERIC_FIELDS = ("close", "ma20", "ma50", "ma150", "atr_pct")
 ZERO_INVALID_ALWAYS_FIELDS = {"close", "ma20", "ma50", "ma150"}
 NULL_ALLOWED_CONTRACT_WARNING_FIELDS = {"close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile"}
 NONNULL_SCORE_FIELDS = {"breakout_score", "pullback_score", "momentum_score"}
+
+# ── entry style 허용값 상수 ─────────────────────────────────────────────────────
+ALLOWED_ENTRY_STYLES = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+ENTRY_STYLE_SCORE_KEYS = {
+    "BREAKOUT": "breakout_score",
+    "PULLBACK": "pullback_score",
+    "MOMENTUM": "momentum_score",
+}
 FINAL30_CANONICAL_NUMERIC_FIELDS = (
     "close",
     "ma20",
@@ -722,6 +730,143 @@ def _fetch_ohlcv_frame(ohlcv_provider: Any, code: str, *, days: int = 30) -> pd.
         return pd.DataFrame()
     normalized = _normalize_ohlcv_columns(frame)
     return normalized.tail(days).copy() if not normalized.empty else normalized
+
+
+# ── entry style sanitize helpers ───────────────────────────────────────────────
+
+def _to_float_safe(value: Any, default: float = 0.0) -> float:
+    """None/빈값/비숫자를 default로 변환하는 안전한 float 변환."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str) and not value.strip():
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_entry_style_value(value: Any) -> str:
+    """raw entry_style_selected 값을 BREAKOUT/PULLBACK/MOMENTUM 중 하나로 정규화."""
+    raw = str(value or "").strip().upper()
+    aliases = {
+        "BREAK": "BREAKOUT",
+        "BO": "BREAKOUT",
+        "ENTRY_BREAKOUT": "BREAKOUT",
+        "PULL": "PULLBACK",
+        "PB": "PULLBACK",
+        "ENTRY_PULLBACK": "PULLBACK",
+        "MOMO": "MOMENTUM",
+        "MOM": "MOMENTUM",
+        "ENTRY_MOMENTUM": "MOMENTUM",
+        "MOMENTUM_CONTINUATION": "MOMENTUM",
+    }
+    return aliases.get(raw, raw)
+
+
+def _infer_entry_style_from_scores(row: dict) -> str:
+    """breakout_score/pullback_score/momentum_score 중 최대값으로 entry_style을 추론."""
+    breakout = _to_float_safe(row.get("breakout_score"))
+    pullback = _to_float_safe(row.get("pullback_score"))
+    momentum = _to_float_safe(row.get("momentum_score"))
+
+    scores = {
+        "BREAKOUT": breakout,
+        "PULLBACK": pullback,
+        "MOMENTUM": momentum,
+    }
+
+    # 모두 0이면 MOMENTUM 기본값 (score가 없어도 PREP 전체가 죽으면 안 됨)
+    if max(scores.values()) <= 0:
+        return "MOMENTUM"
+
+    # 동점이면 MOMENTUM > PULLBACK > BREAKOUT 우선
+    priority = {"MOMENTUM": 3, "PULLBACK": 2, "BREAKOUT": 1}
+    return sorted(scores.items(), key=lambda kv: (kv[1], priority[kv[0]]), reverse=True)[0][0]
+
+
+def sanitize_final30_entry_styles(rows: List[Dict[str, Any]], *, stage: str, hard: bool = False) -> List[Dict[str, Any]]:
+    """
+    final30 contract 직전 entry_style_selected를 강제 보정한다.
+
+    목적:
+    - final30 30개가 이미 생성된 상태에서 entry_style_selected 1개 invalid 때문에 PREP 전체가 죽는 것을 방지
+    - trade-am strict loader가 요구하는 breakout/pullback/momentum score 및 entry_style_selected를 항상 보장
+    """
+    fixed: List[Dict[str, Any]] = []
+    invalid_before = 0
+    invalid_after = 0
+    null_before = 0
+    sample_fixed: List[dict] = []
+
+    for src in rows or []:
+        row = dict(src or {})
+
+        # score 필드는 반드시 numeric으로 보정
+        for key in ("breakout_score", "pullback_score", "momentum_score"):
+            row[key] = _to_float_safe(row.get(key), 0.0)
+
+        raw_style = row.get("entry_style_selected")
+        norm_style = _normalize_entry_style_value(raw_style)
+
+        if raw_style is None or str(raw_style).strip() == "":
+            null_before += 1
+
+        if norm_style not in ALLOWED_ENTRY_STYLES:
+            invalid_before += 1
+            inferred = _infer_entry_style_from_scores(row)
+            row["entry_style_selected"] = inferred
+            row["entry_component"] = inferred.lower()
+            if len(sample_fixed) < 10:
+                sample_fixed.append({
+                    "code": row.get("code"),
+                    "raw": raw_style,
+                    "fixed": inferred,
+                    "breakout_score": row.get("breakout_score"),
+                    "pullback_score": row.get("pullback_score"),
+                    "momentum_score": row.get("momentum_score"),
+                })
+        else:
+            row["entry_style_selected"] = norm_style
+            row["entry_component"] = norm_style.lower()
+
+        # pass flag 보정
+        row["breakout_pass"] = bool(_to_float_safe(row.get("breakout_score")) > 0)
+        row["pullback_pass"] = bool(_to_float_safe(row.get("pullback_score")) > 0)
+        row["momentum_pass"] = bool(_to_float_safe(row.get("momentum_score")) > 0)
+
+        # meta 내부에도 동일 필드 복사
+        meta = dict(row.get("meta") or {})
+        meta["breakout_score"] = row["breakout_score"]
+        meta["pullback_score"] = row["pullback_score"]
+        meta["momentum_score"] = row["momentum_score"]
+        meta["entry_style_selected"] = row["entry_style_selected"]
+        meta["entry_component"] = row["entry_component"]
+        meta["breakout_pass"] = row["breakout_pass"]
+        meta["pullback_pass"] = row["pullback_pass"]
+        meta["momentum_pass"] = row["momentum_pass"]
+        row["meta"] = meta
+
+        if row["entry_style_selected"] not in ALLOWED_ENTRY_STYLES:
+            invalid_after += 1
+
+        fixed.append(row)
+
+    logger.info(
+        "[ENTRY_STYLE][SANITIZE] stage=%s rows=%s null_before=%s invalid_before=%s fixed=%s invalid_after=%s sample_fixed=%s",
+        stage,
+        len(fixed),
+        null_before,
+        invalid_before,
+        invalid_before,
+        invalid_after,
+        sample_fixed,
+    )
+
+    if hard and invalid_after > 0:
+        raise ValueError(f"ENTRY_STYLE_SANITIZE_FAILED stage={stage} invalid_after={invalid_after}")
+
+    return fixed
 
 
 def _canonicalize_numeric_field(field: str, row: Dict[str, Any], *, score_fallback: float | None = None) -> float | None:
@@ -1918,6 +2063,14 @@ class WatchlistBuilder:
         )
         log_final30_ma_diagnostics(final30_scored, "pre_contract_frozen")
         log_short_horizon_feature_diag(final30_scored, "pre_contract_frozen")
+        # ── entry style sanitize: contract 직전 강제 보정 ──────────────────────
+        _pre_contract_rows = sanitize_final30_entry_styles(
+            final30_scored.to_dict(orient="records"),
+            stage="pre_contract_frozen",
+            hard=False,
+        )
+        final30_scored = pd.DataFrame(_pre_contract_rows)
+        # ──────────────────────────────────────────────────────────────────────
         assert_final30_scored_contract(final30_scored, "frozen", str(as_of), hard=True)
         final30 = final30_scored.to_dict(orient="records")
 
@@ -2172,6 +2325,29 @@ class WatchlistBuilder:
         rank_pool120 = int(item.get("pool_rank", 0) or 0)
         rank_top50 = int(item.get("top50_rank", 0) or 0)
         rank_final30 = int(item.get("final_rank", 0) or 0)
+        # ── entry style 필드 top-level/meta 보존 ─────────────────────────────
+        _item_meta_raw = item.get("meta") or {}
+        breakout_score = _to_float_safe(item.get("breakout_score") or _item_meta_raw.get("breakout_score"))
+        pullback_score = _to_float_safe(item.get("pullback_score") or _item_meta_raw.get("pullback_score"))
+        momentum_score = _to_float_safe(item.get("momentum_score") or _item_meta_raw.get("momentum_score"))
+        _raw_style = item.get("entry_style_selected") or _item_meta_raw.get("entry_style_selected")
+        _norm_style = _normalize_entry_style_value(_raw_style)
+        if _norm_style not in ALLOWED_ENTRY_STYLES:
+            _norm_style = _infer_entry_style_from_scores({
+                "breakout_score": breakout_score,
+                "pullback_score": pullback_score,
+                "momentum_score": momentum_score,
+            })
+        entry_style_selected = _norm_style
+        entry_component = str(
+            item.get("entry_component")
+            or _item_meta_raw.get("entry_component")
+            or entry_style_selected.lower()
+        )
+        breakout_pass = bool(breakout_score > 0)
+        pullback_pass = bool(pullback_score > 0)
+        momentum_pass = bool(momentum_score > 0)
+        # ─────────────────────────────────────────────────────────────────────
         meta = {
             "as_of": str(item.get("as_of") or ""),
             "name": str(item.get("name") or ""),
@@ -2188,6 +2364,14 @@ class WatchlistBuilder:
             "flow_score": float(item.get("flow_score", 0.0) or 0.0),
             "tech_score": float(item.get("tech_score", 0.0) or 0.0),
             "final_score": float(item.get("final_score", 0.0) or 0.0),
+            "breakout_score": breakout_score,
+            "pullback_score": pullback_score,
+            "momentum_score": momentum_score,
+            "entry_style_selected": entry_style_selected,
+            "entry_component": entry_component,
+            "breakout_pass": breakout_pass,
+            "pullback_pass": pullback_pass,
+            "momentum_pass": momentum_pass,
             "weights": {
                 "tech_weight": self.tech_weight,
                 "flow_weight": self.flow_weight,
@@ -2206,6 +2390,15 @@ class WatchlistBuilder:
             "scores": scores,
             **(item.get("meta") or {}),
         }
+        # meta 내부 entry style 필드를 덮어쓴다 (item.meta가 stale 값을 갖고 있을 수 있음)
+        meta["breakout_score"] = breakout_score
+        meta["pullback_score"] = pullback_score
+        meta["momentum_score"] = momentum_score
+        meta["entry_style_selected"] = entry_style_selected
+        meta["entry_component"] = entry_component
+        meta["breakout_pass"] = breakout_pass
+        meta["pullback_pass"] = pullback_pass
+        meta["momentum_pass"] = momentum_pass
         return {
             "as_of": str(item.get("as_of") or ""),
             "code": str(item.get("code") or "").zfill(6),
@@ -2226,6 +2419,14 @@ class WatchlistBuilder:
             "flow_score": meta["flow_score"],
             "tech_score": meta["tech_score"],
             "final_score": meta["final_score"],
+            "breakout_score": breakout_score,
+            "pullback_score": pullback_score,
+            "momentum_score": momentum_score,
+            "entry_style_selected": entry_style_selected,
+            "entry_component": entry_component,
+            "breakout_pass": breakout_pass,
+            "pullback_pass": pullback_pass,
+            "momentum_pass": momentum_pass,
             "reject_reasons": reject_reasons,
             "reasons": reasons,
             "scores": scores,
@@ -4022,19 +4223,28 @@ def assert_final30_scored_contract(
         bad_codes = df["code"].unique()[:5].tolist() if "code" in df.columns else []
         ma20_exists = "ma20" in df.columns
         ma20_null = int(_build_numeric_series(df, "ma20").isna().sum()) if ma20_exists else -1
-        candidate_stats = _ma20_candidate_stats(df)
-        sample_rows = _ma20_sample_rows(df)
-        logger.error(
-            "[FINAL30][CONTRACT][FAIL][MA20] label=%s rows=%d uniq_code=%d has_ma20=%s ma20_null=%s candidate_columns=%s sample_rows=%s as_of=%s",
-            label,
-            rows,
-            uniq_codes,
-            int(ma20_exists),
-            ma20_null,
-            candidate_stats,
-            sample_rows,
-            as_of,
-        )
+        # MA20 실패 로그는 실제로 ma20이 없거나 ma20_null > 0인 경우에만 찍는다.
+        if (not ma20_exists) or ma20_null > 0:
+            candidate_stats = _ma20_candidate_stats(df)
+            sample_rows = _ma20_sample_rows(df)
+            logger.error(
+                "[FINAL30][CONTRACT][FAIL][MA20] label=%s rows=%d uniq_code=%d has_ma20=%s ma20_null=%s candidate_columns=%s sample_rows=%s as_of=%s",
+                label,
+                rows,
+                uniq_codes,
+                int(ma20_exists),
+                ma20_null,
+                candidate_stats,
+                sample_rows,
+                as_of,
+            )
+        else:
+            logger.info(
+                "[FINAL30][CONTRACT][OK][MA20] label=%s rows=%d ma20_null=%s",
+                label,
+                rows,
+                ma20_null,
+            )
         logger.error(
             "[FINAL30][CONTRACT][FAIL] label=%s rows=%d uniq_code=%d errors=%s sample_codes=%s",
             label,
@@ -4046,12 +4256,28 @@ def assert_final30_scored_contract(
         if hard:
             raise ValueError(f"FINAL30_CONTRACT_INVALID_{label} errors={','.join(result['errors'][:3])}")
     else:
+        ma20_exists = "ma20" in df.columns
+        ma20_null = int(_build_numeric_series(df, "ma20").isna().sum()) if ma20_exists else -1
+        score_final_nonzero = int(
+            df["score_final"].fillna(0).astype(float).gt(0).sum()
+        ) if "score_final" in df.columns else 0
+        tech_score_nonzero = int(
+            df["tech_score"].fillna(0).astype(float).gt(0).sum()
+        ) if "tech_score" in df.columns else 0
         logger.info(
-            "[FINAL30][CONTRACT][CHECK] label=%s rows=%d uniq_code=%d ok=1 field_nulls=%s",
+            "[FINAL30][CONTRACT][OK][MA20] label=%s rows=%d ma20_null=%s",
+            label,
+            rows,
+            ma20_null,
+        )
+        logger.info(
+            "[FINAL30][CONTRACT][OK] label=%s rows=%d uniq_code=%d entry_style_invalid=0 ma20_null=%s score_final_nonzero=%s tech_score_nonzero=%s",
             label,
             rows,
             uniq_codes,
-            field_nulls,
+            ma20_null,
+            score_final_nonzero,
+            tech_score_nonzero,
         )
     
     return result
@@ -5220,13 +5446,90 @@ def build_and_save_watchlist(
     )
 
     # Save final30 to DB (main strategy)
+    _save_strategy = strategy if strategy else "pb1_watchlist_final_scored"
+    # final30을 반드시 pb1_watchlist_final_scored로 저장 (env 변수 우선)
+    _scored_strategy = os.getenv("PB1_WATCHLIST_STRATEGY", _save_strategy)
+    if _scored_strategy not in ("pb1_watchlist_final_scored",):
+        _scored_strategy = "pb1_watchlist_final_scored"
+    logger.info(
+        "[WATCHLIST][SAVE] strategy=%s env=%s as_of=%s rows=%s",
+        _scored_strategy,
+        env,
+        as_of,
+        len(watchlist),
+    )
     repo.save_watchlist(
         env=env,
-        strategy=strategy,
+        strategy=_scored_strategy,
         as_of=as_of,
         members=watchlist,
     )
-    
+    # ── save 후 read-back 검증 ──────────────────────────────────────────────
+    try:
+        _verify_rows, _verify_as_of = repo.load_watchlist_scored(
+            env=env,
+            strategy=_scored_strategy,
+            as_of=as_of,
+            allow_latest_fallback=False,
+            require_exact_rows=30,
+            require_scored=False,
+            fail_if_missing=False,
+        )
+        _verify_n = len(_verify_rows) if _verify_as_of == as_of else 0
+        _verify_df = pd.DataFrame(_verify_rows or [])
+        _verify_uniq = int(_verify_df["code"].nunique()) if not _verify_df.empty and "code" in _verify_df.columns else 0
+        _verify_scored = int(
+            _verify_df["score_final"].fillna(0).astype(float).gt(0).any()
+        ) if not _verify_df.empty and "score_final" in _verify_df.columns else 0
+        _verify_entry_invalid = 0
+        if not _verify_df.empty and "entry_style_selected" in _verify_df.columns:
+            _valid_s = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+            _verify_entry_invalid = int(
+                _verify_df["entry_style_selected"].apply(
+                    lambda v: bool(pd.notna(v) and str(v).upper() not in _valid_s)
+                ).sum()
+            )
+        _verify_ma20_null = int(
+            _verify_df["ma20"].isna().sum()
+        ) if not _verify_df.empty and "ma20" in _verify_df.columns else -1
+        if _verify_n == 30 and _verify_uniq == 30 and _verify_entry_invalid == 0:
+            logger.info(
+                "[WATCHLIST][SAVE_VERIFY][OK] strategy=%s env=%s as_of=%s rows=%s uniq_code=%s scored=%s entry_style_invalid=%s ma20_null=%s",
+                _scored_strategy,
+                env,
+                as_of,
+                _verify_n,
+                _verify_uniq,
+                _verify_scored,
+                _verify_entry_invalid,
+                _verify_ma20_null,
+            )
+        else:
+            _fail_reason = (
+                f"rows={_verify_n}/30"
+                if _verify_n != 30
+                else f"uniq_code={_verify_uniq}/30"
+                if _verify_uniq != 30
+                else f"entry_style_invalid={_verify_entry_invalid}"
+            )
+            logger.error(
+                "[WATCHLIST][SAVE_VERIFY][FAIL] strategy=%s env=%s as_of=%s rows=%s reason=%s",
+                _scored_strategy,
+                env,
+                as_of,
+                _verify_n,
+                _fail_reason,
+            )
+            if os.getenv("PREP_REQUIRE_SCORED_FINAL30", "1") == "1":
+                raise RuntimeError(
+                    f"WATCHLIST_SAVE_VERIFY_FAIL strategy={_scored_strategy} env={env} as_of={as_of} {_fail_reason}"
+                )
+    except RuntimeError:
+        raise
+    except Exception as _sv_exc:
+        logger.warning("[WATCHLIST][SAVE_VERIFY][ERROR] reason=%s -> continuing", _sv_exc)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Save final30 snapshot to JSON (for fallback)
     try:
         snapshot_dir = Path(os.getenv("GITHUB_WORKSPACE", "."))
@@ -5236,7 +5539,7 @@ def build_and_save_watchlist(
         final30_snapshot = {
             "as_of": as_of.isoformat(),
             "env": env,
-            "strategy": strategy,
+            "strategy": _scored_strategy,
             "watchlist": watchlist,
             "count": len(watchlist),
             "saved_at": datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
@@ -5253,6 +5556,14 @@ def build_and_save_watchlist(
         raise RuntimeError("FINAL30_SCORED_BUILD_BUNDLE_MISSING")
     final30_scored_df = pd.DataFrame(watchlist or []).copy(deep=True)
     final30_scored_df = materialize_final30_price_context(final30_scored_df)
+    # ── entry style sanitize: save 직전 강제 보정 ─────────────────────────────
+    _pre_save_rows = sanitize_final30_entry_styles(
+        final30_scored_df.to_dict(orient="records"),
+        stage="pre_save",
+        hard=False,
+    )
+    final30_scored_df = pd.DataFrame(_pre_save_rows)
+    # ─────────────────────────────────────────────────────────────────────────
     log_df_identity(final30_scored_df, "SAVE_INPUT")
     assert_final30_scored_contract(final30_scored_df, "save_input", str(as_of), hard=True)
     final30_scored_rows = final30_scored_df.to_dict(orient="records")

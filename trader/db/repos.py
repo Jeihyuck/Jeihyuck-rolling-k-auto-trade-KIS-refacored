@@ -5613,8 +5613,10 @@ class WatchlistRepo:
         """
         Watchlist를 DB에 upsert.
         members: [{"code": "005930", "rank": 1, "score": 75.5, "meta": {...}}, ...]
+        pb1_watchlist_final_scored 저장 시 pb1_watchlist_final에도 alias 저장.
         """
-        if _norm_strategy(strategy) in SCORED_WATCHLIST_STRATEGIES:
+        norm = _norm_strategy(strategy)
+        if norm in SCORED_WATCHLIST_STRATEGIES:
             save_pb1_watchlist_rows(
                 self.engine,
                 env=env,
@@ -5622,6 +5624,27 @@ class WatchlistRepo:
                 as_of=as_of,
                 rows=members,
             )
+            # pb1_watchlist_final_scored → pb1_watchlist_final compatibility alias
+            if norm == "pb1_watchlist_final_scored" and os.getenv("PB1_WATCHLIST_SAVE_ALIAS_LEGACY", "1") != "0":
+                try:
+                    save_pb1_watchlist_rows(
+                        self.engine,
+                        env=env,
+                        strategy="pb1_watchlist_final",
+                        as_of=as_of,
+                        rows=members,
+                    )
+                    logger.info(
+                        "[WATCHLIST][SAVE] strategy=pb1_watchlist_final env=%s as_of=%s rows=%s (alias_for=pb1_watchlist_final_scored)",
+                        env,
+                        as_of,
+                        len(members),
+                    )
+                except Exception as _alias_exc:
+                    logger.warning(
+                        "[WATCHLIST][SAVE_ALIAS][FAIL] strategy=pb1_watchlist_final reason=%s",
+                        _alias_exc,
+                    )
             return
 
         save_pb1_watchlist_rows(
@@ -6165,6 +6188,88 @@ class WatchlistRepo:
                     df["rank_final30"].nunique(),
                 )
 
+        columns = [str(col) for col in df.columns.tolist()]
+        # ── meta JSON flatten: DB row의 meta 안 필드를 top-level로 승격 ──────────
+        if not df.empty:
+            import json as _json
+
+            def _flatten_wl_row(row: dict) -> dict:
+                """pb1_watchlist row의 meta JSON 필드를 top-level로 flatten."""
+                raw_meta = row.get("meta") or {}
+                if isinstance(raw_meta, str):
+                    try:
+                        raw_meta = _json.loads(raw_meta)
+                    except Exception:
+                        raw_meta = {}
+                meta = raw_meta if isinstance(raw_meta, dict) else {}
+                out = dict(meta)
+                out.update({
+                    "env": row.get("env"),
+                    "strategy": row.get("strategy"),
+                    "as_of": str(row.get("as_of") or ""),
+                    "code": str(row.get("code") or meta.get("code") or "").zfill(6),
+                    "rank": row.get("rank"),
+                    "rank_final30": meta.get("rank_final30") or row.get("rank"),
+                    "score": row.get("score"),
+                    "score_final": float(meta.get("score_final") or meta.get("final_score") or row.get("score") or 0.0),
+                })
+                out["tech_score"] = float(meta.get("tech_score") or meta.get("score_tech") or 0.0)
+                out["rs_percentile"] = float(meta.get("rs_percentile") or meta.get("rs_pctile") or meta.get("rs_score") or 0.0)
+                out["breakout_score"] = float(meta.get("breakout_score") or 0.0)
+                out["pullback_score"] = float(meta.get("pullback_score") or 0.0)
+                out["momentum_score"] = float(meta.get("momentum_score") or 0.0)
+                out["entry_style_selected"] = meta.get("entry_style_selected") or out.get("entry_style_selected")
+                out["ma20"] = meta.get("ma20")
+                out["ma50"] = meta.get("ma50")
+                out["ma150"] = meta.get("ma150")
+                out["close"] = meta.get("close") or meta.get("last_close")
+                out["atr_pct"] = float(meta.get("atr_pct") or 0.0)
+                out["reasons"] = meta.get("reasons") or []
+                out["filters_passed"] = meta.get("filters_passed") or []
+                out["filters_failed"] = meta.get("filters_failed") or []
+                out["meta"] = meta
+                return out
+
+            flattened = [_flatten_wl_row(r) for r in df.to_dict(orient="records")]
+            df = pd.DataFrame(flattened)
+            # entry style loader 방어 보정 (DB 과거 row 대응)
+            _valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+            _invalid_count_before = 0
+            if "entry_style_selected" in df.columns:
+                def _norm_style_val(v: Any) -> str:
+                    raw = str(v or "").strip().upper()
+                    _aliases = {
+                        "BREAK": "BREAKOUT", "BO": "BREAKOUT", "ENTRY_BREAKOUT": "BREAKOUT",
+                        "PULL": "PULLBACK", "PB": "PULLBACK", "ENTRY_PULLBACK": "PULLBACK",
+                        "MOMO": "MOMENTUM", "MOM": "MOMENTUM", "ENTRY_MOMENTUM": "MOMENTUM",
+                        "MOMENTUM_CONTINUATION": "MOMENTUM",
+                    }
+                    return _aliases.get(raw, raw)
+
+                _styles = df["entry_style_selected"].apply(_norm_style_val)
+                _invalid_mask = ~_styles.isin(_valid_styles)
+                _invalid_count_before = int(_invalid_mask.sum())
+                if _invalid_count_before > 0:
+                    # 스코어 기반 추론으로 보정
+                    def _infer_style(row: "pd.Series") -> str:
+                        bs = float(row.get("breakout_score") or 0.0)
+                        ps = float(row.get("pullback_score") or 0.0)
+                        ms = float(row.get("momentum_score") or 0.0)
+                        if max(bs, ps, ms) <= 0:
+                            return "MOMENTUM"
+                        pri = {"MOMENTUM": 3, "PULLBACK": 2, "BREAKOUT": 1}
+                        return sorted({"BREAKOUT": bs, "PULLBACK": ps, "MOMENTUM": ms}.items(),
+                                       key=lambda kv: (kv[1], pri[kv[0]]), reverse=True)[0][0]
+
+                    df.loc[_invalid_mask, "entry_style_selected"] = df[_invalid_mask].apply(_infer_style, axis=1)
+                    logger.warning(
+                        "[DB][FINAL30_SCORED][LOAD_SANITIZE] rows=%s invalid_before=%s invalid_after=0",
+                        len(df),
+                        _invalid_count_before,
+                    )
+            if "code" in df.columns:
+                df["code"] = df["code"].astype(str).str.zfill(6)
+        # ─────────────────────────────────────────────────────────────────────
         columns = [str(col) for col in df.columns.tolist()]
         missing_critical_fields = [
             field

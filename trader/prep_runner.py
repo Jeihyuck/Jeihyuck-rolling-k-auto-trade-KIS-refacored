@@ -1564,7 +1564,28 @@ def main() -> int:
     flow_provider = _make_flow_provider(engine)
 
     minervini_cfg = MinerviniConfig(rs_min_percentile=float(os.getenv("RS_MIN_PCTILE", "80")) / 100.0)
-    
+
+    # ── PREP 시작 시 기존 final30 상태 precheck (오늘 PREP 저장 전 상태 파악용) ──
+    try:
+        from trader.db.repos import WatchlistRepo as _WatchlistRepoPrecheck
+        _precheck_repo = _WatchlistRepoPrecheck(engine)
+        _precheck_rows, _precheck_asof = _precheck_repo.load_watchlist_scored(
+            env=env,
+            strategy="pb1_watchlist_final_scored",
+            as_of=effective_as_of,
+            allow_latest_fallback=False,
+            fail_if_missing=False,
+        )
+        _precheck_n = len(_precheck_rows) if _precheck_asof == effective_as_of else 0
+        logger.info(
+            "[PREP][FINAL30_PRECHECK] rows=%s reason=%s",
+            _precheck_n,
+            "existing" if _precheck_n > 0 else "not_yet_built",
+        )
+    except Exception as _pce:
+        logger.info("[PREP][FINAL30_PRECHECK] rows=0 reason=precheck_error err=%s", _pce)
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ✅ FIX: PREP에서는 절대 캐시를 사용하지 않음 (단일 진실 원천 확립)
     # ✅ FIX: pool_members (120개)만 전달하여 A단계 재필터링 방지
     watchlist_result = build_and_save_watchlist(
@@ -2051,6 +2072,38 @@ def main() -> int:
     logger.info("[PREP][DONE_CORE][MARKER_OK] as_of=%s", as_of.isoformat())
     logger.info("[PREP][DONE_CORE][DONE] as_of=%s rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
     logger.info("[PREP][DONE] as_of=%s status=DONE_CORE rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
+    # ── PREP_FINAL30_READY postcheck: DB strict 재조회로 완료 검증 ────────────
+    try:
+        from trader.db.repos import WatchlistRepo as _WatchlistRepo
+        _postcheck_repo = _WatchlistRepo(engine)
+        _postcheck_df = _postcheck_repo.load_final30_scored_exact(
+            env=env,
+            as_of=as_of,
+            strategy="pb1_watchlist_final_scored",
+            require_rows=30,
+            require_scored=True,
+            fail_if_missing=False,
+        )
+        _postcheck_n = len(_postcheck_df)
+        _postcheck_contract_ok = int(_postcheck_n == 30)
+        _postcheck_usable = int(_postcheck_contract_ok == 1)
+        if _postcheck_usable:
+            logger.info(
+                "[PREP][FINAL30_READY][OK] env=%s as_of=%s strategy=pb1_watchlist_final_scored rows=%s usable=1 contract_ok=1",
+                env,
+                as_of.isoformat(),
+                _postcheck_n,
+            )
+        else:
+            logger.error(
+                "[PREP][FINAL30_READY][FAIL] env=%s as_of=%s reason=postcheck_rows=%s/30",
+                env,
+                as_of.isoformat(),
+                _postcheck_n,
+            )
+    except Exception as _postcheck_exc:
+        logger.warning("[PREP][FINAL30_POSTCHECK][ERROR] reason=%s -> continuing", _postcheck_exc)
+    # ─────────────────────────────────────────────────────────────────────────
 
     logger.info("[WATCHLIST][REUSE][FINAL30_SCORED] hit=True")
     logger.info("[WATCHLIST][REBUILD][SKIP] reason=existing_final30_scored")
