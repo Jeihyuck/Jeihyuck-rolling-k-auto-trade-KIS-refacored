@@ -643,6 +643,94 @@ def load_today_order_keys(trade_date: str | None = None) -> set[str]:
         return set()
 
 
+def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict]:
+    """ACK 상태이면서 qty_filled=0인 주문 목록 반환.
+
+    ACK reconcile에서 미체결 주문의 fill 여부를 재확인하는 데 사용된다.
+    """
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return [
+            o for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and o.get("status") in ("ACK", "SENT")
+            and int(o.get("qty_filled", 0) or 0) == 0
+        ]
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT *
+                    FROM us_orders
+                    WHERE trade_date = :td
+                      AND status IN ('ACK', 'SENT')
+                      AND COALESCE(qty_filled, 0) = 0
+                    ORDER BY created_at ASC
+                """),
+                {"td": td},
+            )
+            return [dict(r._mapping) for r in rows]
+    except Exception as exc:
+        logger.error("[US_ORDERS][PENDING_ACK][ERROR] %s", exc)
+        return []
+
+
+def mark_order_filled_by_reconcile(
+    *,
+    order_no: str,
+    client_order_key: str,
+    filled_qty: int,
+    avg_price_usd: float,
+    source: str = "balance_reconcile",
+) -> None:
+    """ACK 주문을 reconcile 기반으로 filled로 마킹한다.
+
+    us_orders.status = 'FILLED', us_fills에 synthetic fill 저장.
+    """
+    from datetime import datetime, timezone
+
+    now_utc = datetime.now(timezone.utc).isoformat()
+    engine = _get_engine_or_none()
+
+    if engine is None:
+        # in-memory mock 환경
+        for o in _MEM_ORDERS:
+            if o.get("order_no") == order_no or o.get("client_order_key") == client_order_key:
+                o["status"] = "FILLED"
+                o["qty_filled"] = filled_qty
+                o["avg_fill_price"] = avg_price_usd
+                break
+        return
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE us_orders
+                    SET status = 'FILLED',
+                        qty_filled = :qty,
+                        avg_fill_price = :price,
+                        updated_at = :ts
+                    WHERE (order_no = :order_no OR client_order_key = :cok)
+                      AND status IN ('ACK', 'SENT')
+                """),
+                {
+                    "qty": filled_qty,
+                    "price": avg_price_usd,
+                    "ts": now_utc,
+                    "order_no": order_no,
+                    "cok": client_order_key,
+                },
+            )
+            logger.info(
+                "[US_REPOS][MARK_FILLED_BY_RECONCILE] order_no=%s cok=%s qty=%d price=%.4f source=%s",
+                order_no, client_order_key, filled_qty, avg_price_usd, source,
+            )
+    except Exception as exc:
+        logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
+
+
 def load_us_positions_by_symbols(
     symbols: list[str],
     as_of: str | None = None,

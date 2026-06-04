@@ -20,6 +20,7 @@ from trader.us.execution.risk_gate import (
     check_cash_buffer,
     check_duplicate,
     assert_order_allowed,
+    check_symbol_contract,
 )
 
 
@@ -160,3 +161,76 @@ class TestAssertOrderAllowed:
     def test_excessive_notional_blocked(self):
         with pytest.raises(RiskGateBlocked):
             assert_order_allowed(self._make_intent(notional_usd=200.0))
+
+
+class TestCheckSymbolContract:
+    """check_symbol_contract() BUY/SELL 분리 검증."""
+
+    def test_buy_passes_if_symbol_in_allowed_symbols(self):
+        """BUY: allowed_symbols에 있으면 통과해야 한다."""
+        allowed = {"AAAA", "BBBB", "CCCC"}
+        # 하드코딩 없이 — allowed_symbols에서 임의 하나를 선택
+        sym = next(iter(allowed))
+        check_symbol_contract(sym, "BUY", allowed_symbols=allowed)  # no exception
+
+    def test_buy_blocked_if_symbol_not_in_allowed_symbols(self):
+        """BUY: allowed_symbols에 없으면 차단해야 한다."""
+        allowed = {"AAAA", "BBBB"}
+        with pytest.raises(RiskGateBlocked, match="symbol_not_in_universe"):
+            check_symbol_contract("ZZZZ", "BUY", allowed_symbols=allowed)
+
+    def test_sell_passes_if_symbol_in_current_position_symbols(self):
+        """SELL: current_position_symbols에 있으면 통과해야 한다."""
+        positions = {"AAAA", "BBBB", "CCCC"}
+        sym = next(iter(positions))
+        check_symbol_contract(sym, "SELL", current_position_symbols=positions)  # no exception
+
+    def test_sell_blocked_if_not_in_positions_or_watchlist(self):
+        """SELL: 보유 포지션 및 watchlist 모두 없으면 차단해야 한다."""
+        positions = {"AAAA", "BBBB"}
+        with pytest.raises(RiskGateBlocked, match="symbol_not_in_universe"):
+            check_symbol_contract("ZZZZ", "SELL", current_position_symbols=positions)
+
+    def test_buy_uses_locked_watchlist_symbols(self):
+        """assert_order_allowed에 allowed_symbols 전달 시 locked watchlist 기준으로 BUY universe 검증."""
+        # dynamic set — no hardcoded symbol names
+        allowed = {"AAAA", "BBBB", "CCCC"}
+        sym = next(iter(allowed))
+        intent = {
+            "symbol": sym,
+            "exchange": "NASDAQ",
+            "side": "BUY",
+            "qty": 1,
+            "notional_usd": 90.0,
+            "limit_price": 90.0,
+            "client_order_key": f"test-wl-{sym}",
+        }
+        # allowed_symbols에 있으므로 차단되지 않아야 함
+        assert_order_allowed(
+            intent,
+            available_cash_usd=500.0,
+            total_portfolio_usd=1000.0,
+            allowed_symbols=allowed,
+        )
+
+    def test_sell_allows_current_position_even_if_not_locked(self):
+        """SELL: 보유 포지션에 있으면 locked watchlist 무관하게 허용해야 한다."""
+        positions = {"PPPP", "QQQQ"}
+        sym = next(iter(positions))
+        intent = {
+            "symbol": sym,
+            "exchange": "NASDAQ",
+            "side": "SELL",
+            "qty": 1,
+            "notional_usd": 0.0,
+            "limit_price": 0.0,
+            "client_order_key": f"test-sell-{sym}",
+        }
+        # allowed_symbols에는 없지만 current_position_symbols에 있으므로 통과
+        assert_order_allowed(
+            intent,
+            available_cash_usd=500.0,
+            total_portfolio_usd=1000.0,
+            allowed_symbols={"AAAA"},  # sym이 없는 watchlist
+            current_position_symbols=positions,
+        )

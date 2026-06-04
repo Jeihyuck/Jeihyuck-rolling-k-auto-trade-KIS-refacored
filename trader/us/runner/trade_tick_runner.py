@@ -297,7 +297,7 @@ def run_trade_tick(
         }
     
     # Extract position_symbols from reconcile result
-    current_position_symbols = set(recon.get("position_symbols", []))
+    current_position_symbols: set[str] = set(recon.get("position_symbols", []))
 
     # ── 체결 조회 및 DB 저장 ──────────────────────────────────────────────────
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
@@ -376,7 +376,7 @@ def run_trade_tick(
     from trader.us.db.repos import load_today_symbols_sold, save_fills, save_position_snapshot, save_reconcile_log
     kis_sold = {f["symbol"] for f in fills_today if f.get("side") == "SELL"}
     try:
-        db_sold = load_today_symbols_sold()
+        db_sold = load_today_symbols_sold(trade_date=trade_date)
     except Exception:
         db_sold = set()
     sold_today = kis_sold | db_sold
@@ -387,6 +387,26 @@ def run_trade_tick(
             save_fills(fills_today)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] save_fills failed: %s", exc)
+
+    # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
+    if not offline:
+        try:
+            from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+            ack_recon = reconcile_ack_orders_with_balance(
+                provider=provider,
+                trade_date=trade_date,
+                env=env,
+            )
+            logger.info(
+                "[US_RECONCILE][ACK_RECONCILE][TICK] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
+                ack_recon.get("status"),
+                ack_recon.get("pending_count", 0),
+                ack_recon.get("confirmed_count", 0),
+                ack_recon.get("balance_reconcile_count", 0),
+                ack_recon.get("unresolved_count", 0),
+            )
+        except Exception as exc:
+            logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
@@ -914,6 +934,50 @@ def run_trade_tick(
     orders: list[dict] = []
     daily_notional = 0.0
 
+    # locked_watchlist_symbols: BUY universe (watchlist_rows에서 dedupe 후 추출)
+    locked_watchlist_symbols: set[str] = set()
+    if 'watchlist_rows' in locals() and watchlist_rows:
+        locked_watchlist_symbols = {
+            str(row.get("symbol", "")).upper().strip()
+            for row in watchlist_rows
+            if row.get("symbol")
+        }
+
+    # current_position_symbols 보강: reconcile이 비어있으면 current_positions에서 추출
+    if not current_position_symbols and current_positions:
+        current_position_symbols = {
+            str(p.get("symbol", "")).upper().strip()
+            for p in current_positions
+            if p.get("symbol")
+        }
+
+    # entry vs locked_watchlist contract 로그
+    _entry_buy_symbols = {
+        str(i.get("symbol", "")).upper().strip()
+        for i in entry_intents
+        if i.get("side", "BUY").upper() == "BUY" and i.get("symbol")
+    }
+    if _entry_buy_symbols and locked_watchlist_symbols:
+        _ok = _entry_buy_symbols <= locked_watchlist_symbols
+        logger.info(
+            "[US_CONTRACT][ENTRY_RISK_UNIVERSE][%s] entry_count=%d locked_count=%d",
+            "OK" if _ok else "WARN",
+            len(_entry_buy_symbols),
+            len(locked_watchlist_symbols),
+        )
+        if not _ok and real_order_mode:
+            _not_in_wl = _entry_buy_symbols - locked_watchlist_symbols
+            logger.warning(
+                "[US_CONTRACT][ENTRY_RISK_UNIVERSE][FILTER] removing %d BUY intents not in locked watchlist",
+                len(_not_in_wl),
+            )
+            entry_intents = [
+                i for i in entry_intents
+                if not (i.get("side", "BUY").upper() == "BUY"
+                        and str(i.get("symbol", "")).upper().strip() in _not_in_wl)
+            ]
+            all_intents = exit_intents + entry_intents
+
     from trader.us.execution.order_router import route_order
 
     for intent in all_intents:
@@ -926,6 +990,8 @@ def run_trade_tick(
                 available_cash_usd=max(effective_budget - daily_notional, 0.0),
                 signal_only=signal_only,
                 kis_order_allowed=kis_order_allowed,
+                allowed_symbols=locked_watchlist_symbols if locked_watchlist_symbols else None,
+                current_position_symbols=current_position_symbols if current_position_symbols else None,
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):

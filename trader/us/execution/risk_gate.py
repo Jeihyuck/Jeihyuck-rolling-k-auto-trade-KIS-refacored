@@ -260,6 +260,56 @@ def check_entry_cutoff(side: str, now: Any = None) -> None:
         logger.warning("[US_RISK][WARN] entry cutoff check failed: %s", exc)
 
 
+def check_symbol_contract(
+    symbol: str,
+    side: str,
+    *,
+    allowed_symbols: "set[str] | None" = None,
+    current_position_symbols: "set[str] | None" = None,
+) -> None:
+    """BUY/SELL 방향별 universe 검증.
+
+    BUY: locked watchlist (allowed_symbols) 기준. 없으면 정적 레지스트리 fallback.
+    SELL: 보유 포지션 (current_position_symbols) 기준. 없으면 정적 레지스트리 fallback.
+    심볼을 하드코딩하지 않는다. 모든 판단은 전달받은 집합을 기준으로 한다.
+    """
+    sym = str(symbol).strip().upper()
+    side_upper = side.upper()
+
+    if side_upper == "BUY":
+        if allowed_symbols is not None:
+            count = len(allowed_symbols)
+            logger.info(
+                "[US_RISK][UNIVERSE] source=locked_watchlist side=BUY count=%d",
+                count,
+            )
+            if sym not in allowed_symbols:
+                _block("symbol_not_in_universe", symbol=sym)
+        else:
+            # fallback: 정적 레지스트리
+            check_symbol(sym)
+    else:  # SELL
+        if current_position_symbols is not None:
+            if sym in current_position_symbols:
+                logger.info(
+                    "[US_RISK][SELL_UNIVERSE_PASS] symbol=%s source=current_positions",
+                    sym,
+                )
+                return
+            # 보유 포지션에도 없지만 locked watchlist에도 있으면 통과
+            if allowed_symbols is not None and sym in allowed_symbols:
+                logger.info(
+                    "[US_RISK][SELL_UNIVERSE_PASS] symbol=%s source=locked_watchlist",
+                    sym,
+                )
+                return
+            # 둘 다 없으면 차단
+            _block("symbol_not_in_universe", symbol=sym)
+        else:
+            # fallback: 정적 레지스트리
+            check_symbol(sym)
+
+
 def assert_order_allowed(
     intent: dict,
     *,
@@ -267,13 +317,18 @@ def assert_order_allowed(
     current_position_count: int = 0,
     total_portfolio_usd: float = 1000.0,
     available_cash_usd: float = 1000.0,
-    existing_order_keys: set[str] | None = None,
+    existing_order_keys: "set[str] | None" = None,
     now: Any = None,
+    allowed_symbols: "set[str] | None" = None,
+    current_position_symbols: "set[str] | None" = None,
 ) -> None:
     """Order intent의 전체 위험 점검.
 
     모든 체크를 통과하면 [US_RISK][PASS] 로그.
     하나라도 실패하면 RiskGateBlocked 예외.
+
+    allowed_symbols: BUY 허용 심볼 집합 (locked watchlist).
+    current_position_symbols: 현재 보유 심볼 집합 (SELL universe).
     """
     symbol = intent.get("symbol", "")
     exchange = intent.get("exchange", "")
@@ -283,7 +338,12 @@ def assert_order_allowed(
     client_order_key = intent.get("client_order_key", "")
 
     check_env_flags()
-    check_symbol(symbol)
+    check_symbol_contract(
+        symbol,
+        side,
+        allowed_symbols=allowed_symbols,
+        current_position_symbols=current_position_symbols,
+    )
     check_exchange(exchange)
     check_qty(qty)
 

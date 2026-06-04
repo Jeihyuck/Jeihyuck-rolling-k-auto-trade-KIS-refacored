@@ -129,33 +129,77 @@ def _first_existing(d: dict, candidates: list, default=None):
 def _normalize_kis_position(pos: dict) -> dict:
     """KIS 해외잔고 필드를 표준 필드로 정규화.
 
-    표준 필드: symbol, qty, avg_price, last_price
+    trader.us.utils.pnl_utils.normalize_us_position을 재사용한다.
     """
-    symbol = _first_existing(
-        pos,
-        ["symbol", "ovrs_pdno", "pdno", "code", "ticker"],
-        default="",
-    )
-    qty = _safe_int(_first_existing(
-        pos,
-        ["qty", "quantity", "ovrs_cblc_qty", "hldg_qty"],
-        default=0,
-    ))
-    avg_price = _safe_float(_first_existing(
-        pos,
-        ["avg_price", "average_price", "pchs_avg_pric", "avg_buy_price"],
+    try:
+        from trader.us.utils.pnl_utils import normalize_us_position
+    except ImportError:
+        normalize_us_position = None
+
+    # symbol 필드 보강
+    enriched = dict(pos)
+    if "symbol" not in enriched or not enriched["symbol"]:
+        enriched["symbol"] = (
+            enriched.get("ovrs_pdno")
+            or enriched.get("pdno")
+            or enriched.get("ticker")
+            or enriched.get("code")
+            or ""
+        )
+
+    if normalize_us_position is not None:
+        normalized = normalize_us_position(enriched)
+    else:
+        # fallback: 직접 파싱
+        symbol = _first_existing(enriched, ["symbol", "ovrs_pdno", "pdno", "code", "ticker"], default="")
+        qty = _safe_int(_first_existing(enriched, ["qty", "quantity", "ovrs_cblc_qty", "hldg_qty", "cblc_qty", "ord_psbl_qty"], default=0))
+        avg_price = _safe_float(_first_existing(enriched, ["avg_price", "average_price", "pchs_avg_pric", "frcr_pchs_avg_pric", "avg_buy_price", "avg_cost", "entry_price"], default=0.0))
+        last_price = _safe_float(_first_existing(enriched, ["last_price", "current", "current_price", "current_price_usd", "market_price", "now_price", "ovrs_now_pric", "ovrs_now_pric1", "prpr", "stck_prpr", "current_px"], default=0.0))
+        normalized = {
+            "symbol": str(symbol).strip().upper(),
+            "qty": qty,
+            "avg_price": avg_price,
+            "last_price": last_price,
+            "cost_basis_usd": avg_price * qty,
+            "market_value_usd": last_price * qty,
+        }
+
+    # KIS 전용 추가 필드 (market_value_usd, cost_usd)
+    market_value_usd = _safe_float(_first_existing(
+        enriched,
+        ["market_value_usd", "market_value", "ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt"],
         default=0.0,
     ))
-    last_price = _safe_float(_first_existing(
-        pos,
-        ["last_price", "current_price", "ovrs_now_pric", "now_price"],
+    cost_usd = _safe_float(_first_existing(
+        enriched,
+        ["cost_usd", "cost_basis_usd", "cost", "purchase_amount", "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1"],
         default=0.0,
     ))
+
+    lp = normalized.get("last_price", 0.0) or 0.0
+    qty_n = normalized.get("qty", 0) or 0
+    avg_p = normalized.get("avg_price", 0.0) or 0.0
+
+    # last_price를 market_value에서 역산
+    if lp <= 0 and market_value_usd > 0 and qty_n > 0:
+        lp = market_value_usd / qty_n
+
+    if market_value_usd <= 0:
+        market_value_usd = normalized.get("market_value_usd", 0.0) or (lp * qty_n)
+
+    if cost_usd <= 0:
+        cost_usd = normalized.get("cost_basis_usd", 0.0) or (avg_p * qty_n)
+
     return {
-        "symbol": str(symbol).strip(),
-        "qty": qty,
-        "avg_price": avg_price,
-        "last_price": last_price,
+        "symbol": normalized.get("symbol", ""),
+        "qty": qty_n,
+        "avg_price": avg_p,
+        "last_price": lp,
+        "current": lp,
+        "current_price_usd": lp,
+        "market_value_usd": market_value_usd,
+        "cost_usd": cost_usd,
+        "source": "kis_balance",
     }
 
 
@@ -202,12 +246,19 @@ def _load_db_positions(engine, trade_date: str) -> list[dict]:
         cols = _get_table_columns(engine, "us_positions")
 
         # avg_price 후보
-        avg_price_candidates = ["avg_price", "average_price", "avg_buy_price", "entry_price", "pchs_avg_pric"]
+        avg_price_candidates = ["avg_price", "average_price", "avg_buy_price", "entry_price", "pchs_avg_pric", "avg_cost"]
         avg_price_col = next((c for c in avg_price_candidates if c in cols), None)
 
         # last_price 후보
-        last_price_candidates = ["last_price", "current_price", "market_price", "now_price", "ovrs_now_pric"]
+        last_price_candidates = ["last_price", "current", "current_price", "current_price_usd", "market_price", "now_price", "ovrs_now_pric", "current_px"]
         last_price_col = next((c for c in last_price_candidates if c in cols), None)
+
+        # 날짜 컬럼 schema-aware 선택
+        date_col = None
+        for candidate in ["trade_date", "as_of", "as_of_date", "created_at", "updated_at"]:
+            if candidate in cols:
+                date_col = candidate
+                break
 
         select_fields = ["symbol", "qty"]
         alias_map = {}
@@ -232,21 +283,34 @@ def _load_db_positions(engine, trade_date: str) -> list[dict]:
                 select_fields.append(opt_col)
 
         fields_sql = ", ".join(select_fields)
+
+        # 날짜 WHERE 조건 동적 생성
+        if date_col == "trade_date":
+            where_sql = "trade_date = :td"
+        elif date_col == "as_of":
+            where_sql = "as_of = :td"
+        elif date_col == "as_of_date":
+            where_sql = "as_of_date = :td"
+        elif date_col in ("created_at", "updated_at"):
+            where_sql = f"{date_col}::date = :td"
+        else:
+            where_sql = None
+
+        base_sql = f"SELECT {fields_sql} FROM us_positions WHERE qty > 0"
+        if where_sql:
+            base_sql += f" AND {where_sql}"
+        base_sql += " ORDER BY symbol ASC"
+
         with engine.begin() as conn:
             rows = conn.execute(
-                text(f"""
-                    SELECT {fields_sql}
-                    FROM us_positions
-                    WHERE trade_date = :td
-                    ORDER BY symbol ASC
-                """),
+                text(base_sql),
                 {"td": trade_date},
             ).fetchall()
             positions = [dict(r._mapping) for r in rows]
-            if alias_map:
-                logger.info("[US_PNL][DB_POSITIONS] count=%d alias=%s", len(positions), alias_map)
-            else:
-                logger.info("[US_PNL][DB_POSITIONS] count=%d", len(positions))
+            logger.info(
+                "[US_PNL][DB_POSITIONS] count=%d date_col=%s alias=%s",
+                len(positions), date_col or "none", alias_map,
+            )
             return positions
     except Exception as exc:
         logger.warning("[US_PNL][DB_POSITIONS][FAIL] err=%s", exc)
@@ -261,34 +325,53 @@ def _load_db_fills(engine, trade_date: str) -> list[dict]:
 
         cols = _get_table_columns(engine, "us_fills")
 
-        # filled_price 후보
-        filled_price_candidates = ["filled_price", "fill_price", "avg_fill_price", "order_price", "ft_ccld_unpr3"]
+        # filled_price 후보 (price_usd 포함)
+        filled_price_candidates = ["filled_price", "fill_price", "avg_fill_price", "order_price", "price_usd", "price", "ft_ccld_unpr3", "ccld_unpr"]
         filled_price_col = next((c for c in filled_price_candidates if c in cols), None)
 
-        select_fields = ["symbol", "side", "qty"]
+        # qty 후보 (schema-aware)
+        qty_candidates = ["qty", "filled_qty", "fill_qty", "quantity", "ft_ccld_qty", "ccld_qty"]
+        qty_col = next((c for c in qty_candidates if c in cols), None)
+
+        select_fields = ["symbol", "side"]
+        if qty_col:
+            select_fields.append(f"{qty_col} AS qty")
+        else:
+            select_fields.append("0 AS qty")
+            logger.warning("[US_PNL][DB_FILLS][NO_QTY_COL] none of %s found", qty_candidates)
+
         if filled_price_col:
             select_fields.append(f"{filled_price_col} AS filled_price")
         else:
             select_fields.append("0.0 AS filled_price")
             logger.warning("[US_PNL][DB_FILLS][NO_FILLED_PRICE_COL] none of %s found", filled_price_candidates)
 
-        for opt_col in ["filled_amount_usd", "filled_at", "order_id"]:
+        for opt_col in ["filled_amount_usd", "filled_at", "order_id", "order_no", "client_order_key"]:
             if opt_col in cols:
                 select_fields.append(opt_col)
 
         fields_sql = ", ".join(select_fields)
+
+        # date column — schema-aware (us_fills uses trade_date or filled_at::date)
+        fills_date_col = None
+        for _dc in ["trade_date", "as_of", "as_of_date"]:
+            if _dc in cols:
+                fills_date_col = _dc
+                break
+
+        if fills_date_col:
+            fills_where = f"{fills_date_col} = :td"
+        elif "filled_at" in cols:
+            fills_where = "filled_at::date = :td"
+        else:
+            fills_where = "1=1"  # no reliable date filter
+
+        order_clause = " ORDER BY filled_at ASC" if "filled_at" in cols else ""
+        fills_sql = f"SELECT {fields_sql} FROM us_fills WHERE {fills_where}{order_clause}"
+
         with engine.begin() as conn:
             rows = conn.execute(
-                text(f"""
-                    SELECT {fields_sql}
-                    FROM us_fills
-                    WHERE trade_date = :td
-                    ORDER BY filled_at ASC
-                """) if "filled_at" in cols else text(f"""
-                    SELECT {fields_sql}
-                    FROM us_fills
-                    WHERE trade_date = :td
-                """),
+                text(fills_sql),
                 {"td": trade_date},
             ).fetchall()
             fills = [dict(r._mapping) for r in rows]
@@ -348,6 +431,7 @@ def generate_us_pnl_report(
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     warnings = []
     status = "OK"
+    kis_balance = None  # always defined for realized PNL extraction
 
     # ── no-trade final_status 처리 ─────────────────────────────────────
     NO_TRADE_STATUSES = {
@@ -446,14 +530,45 @@ def generate_us_pnl_report(
         qty = _safe_int(pos.get("qty") or pos.get("quantity", 0))
         avg_price = _safe_float(_first_existing(
             pos,
-            ["avg_price", "average_price", "pchs_avg_pric", "avg_buy_price"],
+            ["avg_price", "average_price", "pchs_avg_pric", "frcr_pchs_avg_pric", "avg_buy_price", "avg_cost", "entry_price"],
             default=0.0,
         ))
         last_price = _safe_float(_first_existing(
             pos,
-            ["last_price", "current_price", "ovrs_now_pric", "now_price"],
+            [
+                "last_price",
+                "current",
+                "current_price",
+                "current_price_usd",
+                "market_price",
+                "now_price",
+                "ovrs_now_pric",
+                "ovrs_now_pric1",
+                "current_px",
+            ],
             default=0.0,
         ))
+
+        market_value_raw = _safe_float(_first_existing(
+            pos,
+            ["market_value_usd", "market_value", "ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt"],
+            default=0.0,
+        ))
+        cost_raw = _safe_float(_first_existing(
+            pos,
+            ["cost_usd", "cost_basis_usd", "cost", "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1"],
+            default=0.0,
+        ))
+
+        # last_price를 market_value에서 역산
+        if last_price <= 0 and market_value_raw > 0 and qty > 0:
+            last_price = market_value_raw / qty
+
+        if market_value_raw <= 0 and last_price > 0 and qty > 0:
+            market_value_raw = last_price * qty
+
+        if cost_raw <= 0 and avg_price > 0 and qty > 0:
+            cost_raw = avg_price * qty
 
         # last_price=0 means price is missing — don't use as normal PNL
         price_missing = last_price <= 0.0
@@ -462,28 +577,29 @@ def generate_us_pnl_report(
             if sym:
                 missing_symbols.append(sym)
             market_value: float | None = None
-            cost = _safe_float(pos.get("cost_usd") or avg_price * qty)
+            cost = cost_raw
             pnl: float | None = None
             pnl_pct: float | None = None
             # Still accumulate cost but not market_value / pnl
             total_cost_usd += cost
         else:
-            market_value_raw = _safe_float(pos.get("market_value_usd") or last_price * qty)
-            cost = _safe_float(pos.get("cost_usd") or avg_price * qty)
-            pnl_raw = market_value_raw - cost
-            pnl_pct_raw = (pnl_raw / cost * 100.0) if cost > 0 else 0.0
+            cost = cost_raw
+            pnl_raw_val = market_value_raw - cost
+            pnl_pct_raw = (pnl_raw_val / cost * 100.0) if cost > 0 else 0.0
             market_value = market_value_raw
-            pnl = pnl_raw
+            pnl = pnl_raw_val
             pnl_pct = pnl_pct_raw
             total_market_value_usd += market_value_raw
             total_cost_usd += cost
-            unrealized_pnl_usd += pnl_raw
+            unrealized_pnl_usd += pnl_raw_val
 
         position_list.append({
             "symbol": sym,
             "qty": qty,
             "avg_price": avg_price,
             "last_price": last_price if not price_missing else None,
+            "current": last_price if not price_missing else None,
+            "current_price_usd": last_price if not price_missing else None,
             "market_value_usd": round(market_value, 2) if market_value is not None else None,
             "cost_usd": round(cost, 2),
             "unrealized_pnl_usd": round(pnl, 2) if pnl is not None else None,
@@ -493,11 +609,33 @@ def generate_us_pnl_report(
     
     unrealized_pnl_pct = (unrealized_pnl_usd / total_cost_usd * 100.0) if total_cost_usd > 0 else 0.0
     
-    # realized PnL은 당일 체결 기준 (간략 계산)
+    # realized PnL: KIS summary에서 우선 읽고, 없으면 계산 불가로 처리
+    _realized_candidates = [
+        "ovrs_rlzt_pfls_amt",
+        "ovrs_rlzt_pfls_amt2",
+        "rlzt_pfls",
+        "realized_pnl_usd",
+        "tot_evlu_pfls_amt",
+    ]
     realized_pnl_usd = 0.0
-    for fill in db_fills:
-        if fill.get("side") == "SELL":
-            realized_pnl_usd += _safe_float(fill.get("filled_amount_usd", 0.0))
+    _kis_summary = {}
+    if kis_balance and isinstance(kis_balance.get("summary"), dict):
+        _kis_summary = kis_balance["summary"]
+    elif kis_balance and isinstance(kis_balance.get("summary"), list) and kis_balance["summary"]:
+        _kis_summary = kis_balance["summary"][0] if isinstance(kis_balance["summary"][0], dict) else {}
+
+    _realized_from_kis = None
+    for _rk in _realized_candidates:
+        _rv = _kis_summary.get(_rk)
+        if _rv not in (None, "", 0, 0.0):
+            _realized_from_kis = _safe_float(_rv)
+            break
+
+    if _realized_from_kis is not None:
+        realized_pnl_usd = _realized_from_kis
+    else:
+        # KIS realized PNL 없음 — 매도금액을 손익으로 넣지 않음
+        warnings.append("realized_pnl_unavailable")
     
     total_pnl_usd = unrealized_pnl_usd + realized_pnl_usd
 
@@ -618,15 +756,44 @@ def generate_us_pnl_report(
     logger.info("[US_PNL][REPORT][WRITE] md=%s", dated_md)
     
     # ── CSV ───────────────────────────────────────────────────────────
+    US_PNL_CSV_FIELDNAMES = [
+        "trade_date",
+        "session",
+        "env",
+        "symbol",
+        "qty",
+        "avg_price",
+        "last_price",
+        "current",
+        "current_price_usd",
+        "market_value_usd",
+        "cost_usd",
+        "unrealized_pnl_usd",
+        "unrealized_pnl_pct",
+        "price_missing",
+        "source",
+    ]
+
     def _write_csv(path: Path):
-        with path.open("w", newline="") as f:
+        safe_rows = []
+        for row in position_list:
+            r = dict(row)
+            r.setdefault("trade_date", trade_date)
+            r.setdefault("session", session)
+            r.setdefault("env", env)
+            r.setdefault("source", data_source)
+            r.setdefault("current", r.get("last_price"))
+            r.setdefault("current_price_usd", r.get("last_price"))
+            r.setdefault("price_missing", r.get("last_price") in (None, 0, 0.0))
+            safe_rows.append({k: r.get(k) for k in US_PNL_CSV_FIELDNAMES})
+        with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
                 f,
-                fieldnames=["symbol", "qty", "avg_price", "last_price", "market_value_usd",
-                            "cost_usd", "unrealized_pnl_usd", "unrealized_pnl_pct"],
+                fieldnames=US_PNL_CSV_FIELDNAMES,
+                extrasaction="ignore",
             )
             writer.writeheader()
-            writer.writerows(position_list)
+            writer.writerows(safe_rows)
     
     _write_csv(latest_csv)
     _write_csv(dated_csv)

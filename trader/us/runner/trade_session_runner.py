@@ -446,6 +446,8 @@ def run_trade_session(
     warn_count = 0
     consecutive_errors = 0
     results: list[dict] = []
+    total_orders_blocked = 0
+    block_reasons_total: dict[str, int] = {}
     hard_error_reasons = {
         # marker: reason=fills_contract_error
         "fills_contract_error",
@@ -512,6 +514,12 @@ def run_trade_session(
                 temp_error_count += int(tick_result.get("temp_error_count", 0) or 0)
                 temp_recovered_count += int(tick_result.get("temp_recovered_count", 0) or 0)
                 last_stage = tick_result.get("last_stage", last_stage)
+
+                # orders_blocked 세션 누적
+                tick_blocked = int(tick_result.get("orders_blocked", 0) or 0)
+                total_orders_blocked += tick_blocked
+                for reason, cnt in (tick_result.get("block_reasons") or {}).items():
+                    block_reasons_total[reason] = block_reasons_total.get(reason, 0) + int(cnt or 0)
 
                 tick_status = tick_result.get("status", "ERROR")
                 acceptable_statuses = {
@@ -812,8 +820,12 @@ def run_trade_session(
         "orders_reject_total": total_orders_rejected,
         "orders_error": total_orders_error,
         "orders_error_total": total_orders_error,
-        "orders_blocked": int(final_tick.get("orders_blocked", 0) or 0),
-        "block_reasons": final_tick.get("block_reasons", {}),
+        "orders_blocked": total_orders_blocked,  # backward compat: total across session
+        "orders_blocked_total": total_orders_blocked,
+        "orders_blocked_last_tick": int(final_tick.get("orders_blocked", 0) or 0),
+        "block_reasons": block_reasons_total,  # backward compat: total across session
+        "block_reasons_total": block_reasons_total,
+        "block_reasons_last_tick": final_tick.get("block_reasons", {}),
         "fills_count": total_fills,
         "fills": total_fills,
         "unique_fills_count": total_fills,
@@ -862,13 +874,17 @@ def run_trade_session(
 
     logger.info(
         "[US_DAILY][AGGREGATE] ticks_total=%d entry_intents_total=%d exit_intents_total=%d"
-        " orders_sent_total=%d orders_ack_total=%d orders_reject_total=%d buy_orders_count=%d sell_orders_count=%d",
+        " orders_sent_total=%d orders_ack_total=%d orders_reject_total=%d"
+        " orders_blocked_total=%d block_reasons_total=%s"
+        " buy_orders_count=%d sell_orders_count=%d",
         tick_count,
         total_buy_decisions,
         total_sell_decisions,
         report_payload["orders_sent_total"],
         total_orders_ack,
         total_orders_rejected,
+        total_orders_blocked,
+        block_reasons_total,
         total_orders_ack,   # buy_orders_count (ACK 기준)
         sum(1 for r in results if r.get("exit_intents", 0) > 0),
     )

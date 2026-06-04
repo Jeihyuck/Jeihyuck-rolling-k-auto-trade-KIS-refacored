@@ -78,11 +78,15 @@ def route_order(
     kis_client: Any | None = None,
     signal_only: bool = False,
     kis_order_allowed: bool = True,
+    allowed_symbols: "set[str] | None" = None,
+    current_position_symbols: "set[str] | None" = None,
 ) -> dict:
     """Order intent를 라우팅한다.
 
     Args:
         kis_order_allowed: If False, return ORDER_DISABLED status
+        allowed_symbols: BUY 허용 심볼 집합 (locked watchlist)
+        current_position_symbols: SELL universe (현재 보유 포지션 심볼 집합)
 
     Returns:
         {"status": "DRY_RUN"|"ACK"|"BLOCKED"|"REJECT"|"SIGNAL_ONLY"|"ORDER_DISABLED", ...}
@@ -157,6 +161,8 @@ def route_order(
             total_portfolio_usd=total_portfolio_usd,
             available_cash_usd=available_cash_usd,
             existing_order_keys=existing_keys,
+            allowed_symbols=allowed_symbols,
+            current_position_symbols=current_position_symbols,
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
@@ -196,6 +202,8 @@ def route_order(
                         total_portfolio_usd=total_portfolio_usd,
                         available_cash_usd=available_cash_usd,
                         existing_order_keys=existing_keys,
+                        allowed_symbols=allowed_symbols,
+                        current_position_symbols=current_position_symbols,
                     )
                     
                     # 재시도 성공: 축소된 intent로 계속 진행
