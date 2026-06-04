@@ -32,6 +32,7 @@ _NOISY_EXTERNAL_LOGGERS = (
 # ---------------------------------------------------------------------------
 
 _KRX_HOLIDAYS_CACHE: set[date] | None = None
+_KRX_CALENDAR_FALLBACK_LOGGED = False
 
 
 def _get_krx_holidays_config_path() -> Path:
@@ -53,6 +54,7 @@ def _get_krx_holidays_config_path() -> Path:
 def _load_krx_holidays() -> set[date]:
     """config/krx_holidays.json 에서 KRX 휴장일 Set을 로드한다."""
     global _KRX_HOLIDAYS_CACHE
+    global _KRX_CALENDAR_FALLBACK_LOGGED
     if _KRX_HOLIDAYS_CACHE is not None:
         return _KRX_HOLIDAYS_CACHE
 
@@ -76,18 +78,22 @@ def _load_krx_holidays() -> set[date]:
         )
         return holidays
     except FileNotFoundError:
-        logger.warning(
-            "[TIME][KRX][CALENDAR_FALLBACK] krx_holidays.json not found; "
-            "using empty holiday set (weekday-only heuristic)"
-        )
+        if not _KRX_CALENDAR_FALLBACK_LOGGED:
+            logger.info(
+                "[TIME][KRX][CALENDAR_FALLBACK] krx_holidays.json not found; "
+                "using empty holiday set (weekday-only heuristic)"
+            )
+            _KRX_CALENDAR_FALLBACK_LOGGED = True
         _KRX_HOLIDAYS_CACHE = set()
         return set()
     except Exception as exc:
-        logger.warning(
-            "[TIME][KRX][CALENDAR_FALLBACK] failed to load krx_holidays.json: %s; "
-            "using empty holiday set",
-            exc,
-        )
+        if not _KRX_CALENDAR_FALLBACK_LOGGED:
+            logger.info(
+                "[TIME][KRX][CALENDAR_FALLBACK] failed to load krx_holidays.json: %s; "
+                "using empty holiday set",
+                exc,
+            )
+            _KRX_CALENDAR_FALLBACK_LOGGED = True
         _KRX_HOLIDAYS_CACHE = set()
         return set()
 
@@ -95,7 +101,9 @@ def _load_krx_holidays() -> set[date]:
 def _reload_krx_holidays() -> set[date]:
     """캐시를 무효화하고 재로드한다 (주로 테스트용)."""
     global _KRX_HOLIDAYS_CACHE
+    global _KRX_CALENDAR_FALLBACK_LOGGED
     _KRX_HOLIDAYS_CACHE = None
+    _KRX_CALENDAR_FALLBACK_LOGGED = False
     return _load_krx_holidays()
 
 

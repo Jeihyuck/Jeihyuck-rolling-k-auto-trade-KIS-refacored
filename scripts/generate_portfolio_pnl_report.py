@@ -164,6 +164,38 @@ def _get_today_fills_from_db(engine, env: str) -> list[dict]:
         return []
 
 
+def _get_latest_buy_fill_map(engine, env: str, codes: list[str]) -> dict[str, dict]:
+    if engine is None or not codes:
+        return {}
+    try:
+        from trader.db.repos import FillsRepo
+        repo = FillsRepo(engine)
+        return repo.list_latest_buy_fills_by_codes(env, codes)
+    except Exception as exc:
+        logger.warning("[PNL_REPORT][DB_LATEST_BUY_FAIL] err=%s", exc)
+        return {}
+
+
+def _holdings_count(balance_rows: list[dict]) -> int:
+    count = 0
+    for row in balance_rows or []:
+        qty = _safe_int((row or {}).get("hldg_qty") or (row or {}).get("qty"))
+        ord_psbl_qty = _safe_int((row or {}).get("ord_psbl_qty"))
+        if max(qty, ord_psbl_qty) > 0:
+            count += 1
+    return count
+
+
+def _fill_meta(fill: dict) -> dict:
+    meta = fill.get("fill_meta_json") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    return meta if isinstance(meta, dict) else {}
+
+
 def _get_blocked_orders_from_db(engine, env: str) -> list[dict]:
     """오늘 SKIP된 주문 조회."""
     if engine is None:
@@ -460,6 +492,8 @@ def _build_portfolio_summary(
     db_positions: list[dict],
     cash: "float | None",
     kis_total_equity: "float | None" = None,
+    latest_buy_fill_map: dict[str, dict] | None = None,
+    balance_rows: list[dict] | None = None,
 ) -> dict:
     """
     Portfolio summary 계산. realized_pnl_today는 today_fills 기준 (전량매도 포함).
@@ -474,9 +508,12 @@ def _build_portfolio_summary(
     # ========== realized_pnl_today 계산: today SELL fills 전체 기준 ==========
     # 전량매도된 종목도 포함하도록 today_fills에서 직접 계산
     db_pos_by_code = {str(p.get("code") or "").zfill(6): p for p in db_positions}
+    balance_by_code = {str((row or {}).get("pdno") or (row or {}).get("code") or "").zfill(6): row for row in (balance_rows or [])}
     realized_today = 0.0
     realized_warnings: list[str] = []
     sell_fills_count = 0
+    realized_source_counts: dict[str, int] = {}
+    all_explicit_zero = True
 
     # today BUY fills로 avg_buy 직접 계산 (전량매도 후 DB position 없는 경우 대비)
     today_buy_by_code: dict[str, list] = {}
@@ -493,12 +530,37 @@ def _build_portfolio_summary(
         code = str(fill.get("code") or "").zfill(6)
         sell_qty = _safe_int(fill.get("qty"))
         sell_price = _safe_float(fill.get("price"))
+        meta = _fill_meta(fill)
 
-        # avg_buy 조회 우선순위: 1) DB position → 2) 당일 BUY fills 가중평균 → skip
+        source = ""
+        explicit_realized = _safe_float(meta.get("realized_pnl"))
+        if meta.get("realized_pnl") is not None:
+            realized_today += explicit_realized
+            source = "fill_realized_pnl"
+            if abs(explicit_realized) >= 1:
+                all_explicit_zero = False
+            realized_source_counts[source] = realized_source_counts.get(source, 0) + 1
+            logger.info("[PNL_REPORT][REALIZED][SOURCE] source=%s code=%s realized=%.2f", source, code, explicit_realized)
+            continue
+
+        # avg_buy 조회 우선순위: 1) fill.avg_buy_at_sell → 2) DB position → 3) latest buy fill/meta
+        # 4) 당일 BUY fills 가중평균 → 5) 현재 KIS balance avg (현재 보유 종목만)
         avg_buy = 0.0
+        if _safe_float(meta.get("avg_buy_at_sell")) > 0:
+            avg_buy = _safe_float(meta.get("avg_buy_at_sell"))
+            source = "fill_avg_buy_at_sell"
         pos = db_pos_by_code.get(code)
-        if pos:
+        if avg_buy <= 0 and pos:
             avg_buy = _safe_float(pos.get("avg_buy_price"))
+            if avg_buy > 0:
+                source = "db_position_avg_buy"
+
+        latest_buy_fill = (latest_buy_fill_map or {}).get(code) or {}
+        latest_buy_meta = _fill_meta(latest_buy_fill)
+        if avg_buy <= 0:
+            avg_buy = _safe_float(latest_buy_meta.get("avg_fill_px") or latest_buy_fill.get("price"))
+            if avg_buy > 0:
+                source = "latest_buy_fill_history"
 
         if avg_buy <= 0:
             # 전량매도 후 position이 사라졌을 경우 → 당일 BUY fills에서 계산
@@ -511,6 +573,7 @@ def _build_portfolio_summary(
                 )
                 if total_buy_qty > 0:
                     avg_buy = total_buy_cost / total_buy_qty
+                    source = "today_buy_fills_weighted_avg"
                     logger.info(
                         "[PNL_REPORT][REALIZED][AVG_BUY_FROM_FILLS] code=%s avg_buy=%.2f "
                         "buy_fills=%s",
@@ -518,22 +581,42 @@ def _build_portfolio_summary(
                     )
 
         if avg_buy <= 0:
+            bal_row = balance_by_code.get(code) or {}
+            if _safe_int(bal_row.get("hldg_qty") or bal_row.get("qty")) > 0:
+                avg_buy = _safe_float(bal_row.get("pchs_avg_pric") or bal_row.get("avg_buy_price"))
+                if avg_buy > 0:
+                    source = "kis_current_balance_avg"
+
+        if avg_buy <= 0:
             realized_warnings.append(f"REALIZED_PNL_AVG_BUY_MISSING:{code}")
             logger.warning(
                 "[PNL_REPORT][REALIZED][WARN] code=%s reason=AVG_BUY_MISSING_SKIP_REALIZED",
                 code,
             )
+            all_explicit_zero = False
             continue
 
         pnl = (sell_price - avg_buy) * sell_qty
         realized_today += pnl
+        realized_source_counts[source or "computed_unknown"] = realized_source_counts.get(source or "computed_unknown", 0) + 1
+        if abs(pnl) >= 1:
+            all_explicit_zero = False
+        logger.info("[PNL_REPORT][REALIZED][SOURCE] source=%s code=%s avg_buy=%.2f", source or "computed_unknown", code, avg_buy)
 
     # realized PNL = 0 인데 SELL fills 있으면 경고
-    if sell_fills_count > 0 and abs(realized_today) < 1:
-        logger.warning(
-            "[PNL_REPORT][REALIZED][WARN] reason=REALIZED_PNL_MISSING_DESPITE_SELL_FILLS "
+    if sell_fills_count > 0 and abs(realized_today) < 1 and not all_explicit_zero:
+        logger.error(
+            "[PNL_REPORT][REALIZED][ERROR] reason=REALIZED_PNL_MISSING_DESPITE_SELL_FILLS "
             "sell_fills_count=%s realized_pnl=%.2f warnings=%s",
             sell_fills_count, realized_today, realized_warnings,
+        )
+        realized_warnings.append("REALIZED_PNL_MISSING_DESPITE_SELL_FILLS")
+
+    if sell_fills_count > 0:
+        logger.info(
+            "[PNL_REPORT][REALIZED][OK] sell_fills=%s realized_today=%.2f",
+            sell_fills_count,
+            realized_today,
         )
 
     logger.info(
@@ -572,6 +655,9 @@ def _build_portfolio_summary(
         "unrealized_pnl": unrealized_pnl,
         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2),
         "realized_pnl_today": realized_today,
+        "sell_fills_count": sell_fills_count,
+        "realized_warnings": realized_warnings,
+        "realized_source_counts": realized_source_counts,
         "total_pnl": total_pnl,
         "cash": cash,
         "cash_unavailable": cash is None,
@@ -831,6 +917,11 @@ def main() -> int:
         today_orders = _get_today_orders_from_db(engine, env, trade_date)
         today_fills = _get_today_fills_from_db(engine, env)
         blocked_events = _get_blocked_orders_from_db(engine, env)
+        latest_buy_fill_map = _get_latest_buy_fill_map(
+            engine,
+            env,
+            sorted({str((fill or {}).get("code") or "").zfill(6) for fill in today_fills if str((fill or {}).get("side") or "").upper() == "SELL"}),
+        )
 
         # Holdings PNL
         holdings, quality_warnings = _build_holdings_pnl(
@@ -838,7 +929,15 @@ def main() -> int:
         )
 
         # Summary
-        summary = _build_portfolio_summary(holdings, today_fills, db_positions, cash, kis_total_equity=kis_total_equity)
+        summary = _build_portfolio_summary(
+            holdings,
+            today_fills,
+            db_positions,
+            cash,
+            kis_total_equity=kis_total_equity,
+            latest_buy_fill_map=latest_buy_fill_map,
+            balance_rows=balance_output1,
+        )
         summary["cash_source"] = cash_source
 
         # Today trades
@@ -849,15 +948,25 @@ def main() -> int:
 
         # Data quality
         degraded_count = sum(1 for h in holdings if h.get("price_source") == "degraded")
+        db_position_count = sum(1 for row in db_positions if _safe_int((row or {}).get("qty")) > 0)
+        kis_position_count = _holdings_count(balance_output1)
         data_quality = {
-            "degraded": degraded_count > 0,
-            "warnings": quality_warnings[:20],
+            "degraded": degraded_count > 0 or bool(summary.get("realized_warnings")),
+            "warnings": (quality_warnings + list(summary.get("realized_warnings") or []))[:20],
         }
         if degraded_count > 0:
             data_quality["warnings"].insert(
                 0,
                 f"PRICE_SOURCE_DEGRADED:{degraded_count} positions used DB latest close instead of KIS balance prpr",
             )
+        if db_position_count != kis_position_count:
+            logger.error(
+                "[PNL_REPORT][POSITION_MISMATCH] db_positions=%s kis_positions=%s severity=ERROR reason=DB_SOFT_CLOSED_WHILE_KIS_HOLDS",
+                db_position_count,
+                kis_position_count,
+            )
+            data_quality["degraded"] = True
+            data_quality["warnings"].insert(0, f"DB_POSITION_KIS_MISMATCH:db={db_position_count},kis={kis_position_count}")
 
         # Runtime metadata
         account_no = os.getenv("KIS_ACCOUNT") or os.getenv("KIS_CANO")

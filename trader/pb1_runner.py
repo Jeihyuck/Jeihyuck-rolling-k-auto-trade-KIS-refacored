@@ -2054,6 +2054,10 @@ def _session_execution_checkpoint_key(*, env: str, session_kind: str, trade_date
     return f"trade_session:{str(env or '').strip().lower() or 'practice'}:{str(session_kind or '').strip().lower()}:{trade_date.isoformat()}"
 
 
+def _close_reconcile_checkpoint_key(*, env: str, trade_date: date) -> str:
+    return f"close_reconcile:{str(env or '').strip().lower() or 'practice'}:{trade_date.isoformat()}"
+
+
 def _record_session_execution_marker(
     *,
     engine,
@@ -2271,6 +2275,15 @@ def _resolve_session_trade_policy(*, session: str, phase_name: str, entry_enable
     normalized_phase = str(phase_name or "").strip().lower()
     if normalized_session != "pm":
         return {"no_new_entry": False, "reason": ""}
+    late_start_action = str(os.getenv("PB1_PM_LATE_START_ACTION") or "EXIT_ONLY_NO_NEW_BUY").strip().upper()
+    phase_guard_classification = str(os.getenv("PB1_PHASE_GUARD_CLASSIFICATION") or "").strip().upper()
+    late_start_detected = (
+        _env_flag("TRADE_PM_LATE_START", default=False)
+        or "LATE_PM" in phase_guard_classification
+        or "FORCED_LATE_PM" in phase_guard_classification
+    )
+    if late_start_detected and late_start_action == "EXIT_ONLY_NO_NEW_BUY":
+        return {"no_new_entry": True, "reason": "PM_LATE_START_NO_NEW_BUY"}
     if not entry_enabled or normalized_phase in {"manage", "exit", "idle"}:
         return {"no_new_entry": True, "reason": "pm_strategy_manage_only"}
     return {"no_new_entry": False, "reason": ""}
@@ -4612,6 +4625,82 @@ def run_once(
 
     remaining_s = _remaining_seconds()
     exit_short_circuit = phase_for_log == "exit" or window_label == "close"
+
+    def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
+        checkpoint_key = _close_reconcile_checkpoint_key(
+            env=(os.getenv("KIS_ENV") or "practice").lower(),
+            trade_date=now.date(),
+        )
+        try:
+            checkpoint = load_job_checkpoint(engine, checkpoint_key) or {}
+        except Exception as exc:
+            logger.warning("[PB1][CLOSE][RECONCILE][CHECKPOINT_LOAD_FAIL] err=%s", exc)
+            checkpoint = {}
+        if checkpoint.get("done"):
+            logger.info("[PB1][CLOSE][RECONCILE][SKIP] reason=already_done")
+            return bool(checkpoint.get("reconcile_ok")), bool(checkpoint.get("close_stale_ok"))
+
+        reconcile_ok_local = False
+        close_stale_ok_local = False
+        reconcile_result: dict[str, Any] = {}
+        if kis_obj:
+            try:
+                ctx = RunContext(
+                    run_id=run_id,
+                    env=(os.getenv("KIS_ENV") or "practice").lower(),
+                    strategy="pb1_pullback_close",
+                    started_at=now,
+                    dry_run=False,
+                )
+                reconcile_result = reconcile_today(
+                    engine=engine,
+                    kis=kis_obj,
+                    ctx=ctx,
+                ) or {}
+                reconcile_ok_local = True
+            except Exception:
+                logger.exception("[PB1][%s] reconcile_today failed", reason_label.upper())
+        try:
+            balance_snapshot = kis_obj.get_balance() if kis_obj else {}
+        except Exception as exc:
+            logger.warning("[PB1][CLOSE][BALANCE][FAIL] reason=%s err=%s", reason_label, exc)
+            balance_snapshot = {}
+        try:
+            sell_fill_codes = {
+                str((row or {}).get("code") or "").zfill(6)
+                for row in FillsRepo(engine).list_today_sell_fills((os.getenv("KIS_ENV") or "practice").lower())
+            }
+            close_stale_positions(
+                engine=engine,
+                env=(os.getenv("KIS_ENV") or "practice").lower(),
+                strategy="pb1_pullback_close",
+                reason="exit_phase",
+                ts=now,
+                kis_balance=balance_snapshot,
+                sell_fill_codes=sell_fill_codes,
+                runtime_dir=runtime_root_dir,
+            )
+            close_stale_ok_local = True
+        except Exception:
+            logger.exception("[PB1][%s] close_stale_positions failed", reason_label.upper())
+        try:
+            save_job_checkpoint(
+                engine,
+                checkpoint_key,
+                {
+                    "done": True,
+                    "reconcile_ok": bool(reconcile_ok_local),
+                    "close_stale_ok": bool(close_stale_ok_local),
+                    "reason": reason_label,
+                    "guard_reason": reconcile_result.get("guard_reason"),
+                    "updated_at": now.isoformat(),
+                },
+            )
+        except Exception as exc:
+            logger.warning("[PB1][CLOSE][RECONCILE][CHECKPOINT_SAVE_FAIL] err=%s", exc)
+        logger.info("[PB1][CLOSE][RECONCILE][RUN_ONCE] done=1")
+        return reconcile_ok_local, close_stale_ok_local
+
     if exit_short_circuit:
         logger.info("[PB1][EXIT_SHORTCIRCUIT] start remaining_s=%.1f", remaining_s)
         kis = None
@@ -4623,34 +4712,7 @@ def run_once(
         reconcile_ok = False
         close_stale_ok = False
         try:
-            if kis:
-                try:
-                    ctx = RunContext(
-                        run_id=run_id,
-                        env=(os.getenv("KIS_ENV") or "practice").lower(),
-                        strategy="pb1_pullback_close",
-                        started_at=now,
-                        dry_run=False,
-                    )
-                    reconcile_today(
-                        engine=engine,
-                        kis=kis,
-                        ctx=ctx,
-                    )
-                    reconcile_ok = True
-                except Exception:
-                    logger.exception("[PB1][EXIT_SHORTCIRCUIT] reconcile_today failed")
-            try:
-                close_stale_positions(
-                    engine=engine,
-                    env=(os.getenv("KIS_ENV") or "practice").lower(),
-                    strategy="pb1_pullback_close",
-                    reason="exit_phase",
-                    ts=now,
-                )
-                close_stale_ok = True
-            except Exception:
-                logger.exception("[PB1][EXIT_SHORTCIRCUIT] close_stale_positions failed")
+            reconcile_ok, close_stale_ok = _run_close_reconcile_once(reason_label="exit_shortcircuit", kis_obj=kis)
             _write_last_db_write(runtime_root_dir, run_id=run_id, reason="exit_shortcircuit", now=now)
             if not reconcile_ok or not close_stale_ok:
                 logger.error(
@@ -4674,34 +4736,7 @@ def run_once(
         reconcile_ok = False
         close_stale_ok = False
         try:
-            if kis:
-                try:
-                    ctx = RunContext(
-                        run_id=run_id,
-                        env=(os.getenv("KIS_ENV") or "practice").lower(),
-                        strategy="pb1_pullback_close",
-                        started_at=now,
-                        dry_run=False,
-                    )
-                    reconcile_today(
-                        engine=engine,
-                        kis=kis,
-                        ctx=ctx,
-                    )
-                    reconcile_ok = True
-                except Exception:
-                    logger.exception("[PB1][DEGRADED] reconcile_today failed")
-            try:
-                close_stale_positions(
-                    engine=engine,
-                    env=(os.getenv("KIS_ENV") or "practice").lower(),
-                    strategy="pb1_pullback_close",
-                    reason="budget_degraded",
-                    ts=now,
-                )
-                close_stale_ok = True
-            except Exception:
-                logger.exception("[PB1][DEGRADED] close_stale_positions failed")
+            reconcile_ok, close_stale_ok = _run_close_reconcile_once(reason_label="budget_degraded", kis_obj=kis)
             _write_last_db_write(runtime_root_dir, run_id=run_id, reason="budget_degraded", now=now)
             if not reconcile_ok or not close_stale_ok:
                 logger.error(
@@ -5078,6 +5113,19 @@ def run_once(
             os.environ["PB1_PM_POLICY_REASON"] = str(session_policy["reason"])
             order_allowed = False
             entry_block_reason = entry_block_reason or str(session_policy["reason"])
+            if str(session_policy["reason"] or "") == "PM_LATE_START_NO_NEW_BUY":
+                os.environ["PB1_ENTRY_ENABLED"] = "0"
+                os.environ["ALLOW_NEW_BUY"] = "0"
+                os.environ["ENTRY_ENABLED"] = "0"
+                os.environ["FORCE_ENTRY_DISABLED_REASON"] = "PM_LATE_START_NO_NEW_BUY"
+                os.environ["PB1_PHASE_DEFAULT"] = "exit"
+                phase_override_arg = "exit"
+                phase_for_log = "exit"
+                run_ctx["phase_name"] = "exit"
+                logger.info(
+                    "[ENTRY][DISABLED] reason=PM_LATE_START_NO_NEW_BUY action=skip_entry_scan phase=exit order_allowed=0"
+                )
+                logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
         if account_sanity_block_reason and not minervini_only:
             dry_run = True
             intended_live = False

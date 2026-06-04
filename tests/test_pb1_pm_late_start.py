@@ -12,6 +12,7 @@ import os
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 import pytest
+from unittest.mock import patch
 
 
 def test_pm_late_start_before_session_end_runs():
@@ -32,6 +33,24 @@ def test_pm_late_start_before_session_end_runs():
     # Should return None (proceed) or set warning flag, not 0 (skip)
     assert result is None, f"PM at 13:31 should run with late warning, got {result}"
     assert os.environ.get("PB1_LATE_START_WARNING") == "1", "Should set late start warning flag"
+
+
+def test_pm_late_start_policy_forces_exit_only():
+    from trader.pb1_runner import _resolve_session_trade_policy
+
+    with patch.dict(
+        os.environ,
+        {
+            "TRADE_PM_LATE_START": "1",
+            "PB1_PM_LATE_START_ACTION": "EXIT_ONLY_NO_NEW_BUY",
+            "PB1_PHASE_GUARD_CLASSIFICATION": "LATE_PM_RECOVERY",
+        },
+        clear=False,
+    ):
+        policy = _resolve_session_trade_policy(session="pm", phase_name="entry", entry_enabled=True)
+
+    assert policy["no_new_entry"] is True
+    assert policy["reason"] == "PM_LATE_START_NO_NEW_BUY"
 
 
 def test_pm_after_session_end_skips():

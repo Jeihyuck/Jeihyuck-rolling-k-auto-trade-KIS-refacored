@@ -980,7 +980,13 @@ class KisAPI:
         self._load_safe_mode_state()
 
         self.token = self.get_valid_token()
-        logger.info(f"[생성자 체크] CANO={repr(self.CANO)}, ACNT_PRDT_CD={repr(self.ACNT_PRDT_CD)}, ENV={self.env}")
+        meta = self._account_param_meta()
+        logger.info(
+            "[생성자 체크] CANO=%s ACNT_PRDT_CD=%s ENV=%s",
+            meta.get("cano_masked"),
+            meta.get("acnt_prdt_cd_masked"),
+            self.env,
+        )
 
         self._today_open_cache: Dict[str, Tuple[float, float]] = {}  # code -> (open_price, ts)
         self._today_open_ttl = 60 * 60 * 9  # 9시간 TTL (당일만 유효)
@@ -1023,7 +1029,7 @@ class KisAPI:
             "cano_len": len(cano),
             "acnt_prdt_cd_len": len(acnt),
             "cano_masked": f"***{cano[-4:]}" if len(cano) >= 4 else "***",
-            "acnt_prdt_cd": acnt,
+            "acnt_prdt_cd_masked": f"**{acnt[-1:]}" if len(acnt) >= 1 else "**",
         }
 
     def _validate_account_params(self) -> tuple[bool, str]:
@@ -3267,7 +3273,7 @@ class KisAPI:
                 meta.get("cano_len"),
                 meta.get("acnt_prdt_cd_len"),
                 meta.get("cano_masked"),
-                meta.get("acnt_prdt_cd"),
+                meta.get("acnt_prdt_cd_masked"),
             )
             raise KisPermanentError(f"BALANCE_ACCOUNT_PARAM_INVALID:{reason}")
         if os.getenv("KIS_FORCE_500_BALANCE", "0") == "1":
@@ -3289,7 +3295,15 @@ class KisAPI:
             "CTX_AREA_FK100": fk,
             "CTX_AREA_NK100": nk,
         }
-        logger.info(f"[잔고조회 요청파라미터] {params}")
+        logger.info(
+            "[BALANCE][REQ_SUMMARY] env=%s cano=%s acnt_prdt_cd=%s ctx_fk=%s ctx_nk=%s inqr_dvsn=%s",
+            self.env,
+            meta.get("cano_masked"),
+            meta.get("acnt_prdt_cd_masked"),
+            str(params.get("CTX_AREA_FK100") or "")[:4],
+            str(params.get("CTX_AREA_NK100") or "")[:4],
+            params.get("INQR_DVSN"),
+        )
         # [CHG] 안전요청 사용
         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
         payload = resp.json()
@@ -3304,7 +3318,7 @@ class KisAPI:
                 meta.get("cano_len"),
                 meta.get("acnt_prdt_cd_len"),
                 meta.get("cano_masked"),
-                meta.get("acnt_prdt_cd"),
+                meta.get("acnt_prdt_cd_masked"),
             )
         return payload
 
@@ -3350,7 +3364,16 @@ class KisAPI:
                     continue
                 raise KisBalanceUnavailable(str(e)) from e
 
-            logger.info(f"[잔고조회 응답] {j}")
+            output2_summary = _as_first_dict(j.get("output2")) if "_as_first_dict" in globals() else (j.get("output2") if isinstance(j.get("output2"), dict) else {})
+            logger.info(
+                "[BALANCE][RESP_SUMMARY] rt_cd=%s msg_cd=%s rows=%s has_output2=%s cash=%s market_value=%s",
+                j.get("rt_cd"),
+                j.get("msg_cd"),
+                len(j.get("output1") or []),
+                int(bool(j.get("output2"))),
+                (output2_summary or {}).get("ord_psbl_cash") or (output2_summary or {}).get("dnca_tot_amt") or 0,
+                (output2_summary or {}).get("scts_evlu_amt") or (output2_summary or {}).get("tot_evlu_amt") or 0,
+            )
 
             rows = j.get("output1") or []
             if not rows:

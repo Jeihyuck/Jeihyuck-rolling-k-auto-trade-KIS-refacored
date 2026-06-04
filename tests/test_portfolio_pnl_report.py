@@ -182,5 +182,51 @@ class TestPNLReportScript(unittest.TestCase):
                 os.environ["PB1_PNL_REPORT_ENABLED"] = orig_report
 
 
+class TestRealizedPnlFallbacks(unittest.TestCase):
+
+    def test_realized_uses_fill_meta_realized_pnl_first(self):
+        summary = _build_portfolio_summary(
+            holdings=[],
+            today_fills=[
+                {
+                    "code": "005930",
+                    "side": "SELL",
+                    "qty": 3,
+                    "price": 11000,
+                    "fill_meta_json": {"realized_pnl": 12345.0},
+                }
+            ],
+            db_positions=[],
+            cash=0,
+        )
+        self.assertEqual(summary["realized_pnl_today"], 12345.0)
+        self.assertEqual(summary["sell_fills_count"], 1)
+        self.assertEqual(summary["realized_source_counts"].get("fill_realized_pnl"), 1)
+
+    def test_realized_falls_back_to_latest_buy_fill(self):
+        summary = _build_portfolio_summary(
+            holdings=[],
+            today_fills=[
+                {
+                    "code": "005930",
+                    "side": "SELL",
+                    "qty": 5,
+                    "price": 110.0,
+                    "fill_meta_json": {},
+                }
+            ],
+            db_positions=[],
+            cash=0,
+            latest_buy_fill_map={
+                "005930": {
+                    "price": 100.0,
+                    "fill_meta_json": {},
+                }
+            },
+        )
+        self.assertEqual(summary["realized_pnl_today"], 50.0)
+        self.assertEqual(summary["realized_source_counts"].get("latest_buy_fill_history"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

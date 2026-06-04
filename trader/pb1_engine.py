@@ -10595,6 +10595,12 @@ class PB1Engine:
                     raise
             self.orders_repo.mark_filled(self.env, kis_odno=kis_odno, client_order_key=client_key)
             filled_at = now_kst()
+            avg_buy_at_sell = float(pos.get("avg_buy_price") or avg or 0.0)
+            position_qty_before_sell = int(pos.get("qty") or 0)
+            sold_qty = int(orderable_qty or 0)
+            cost_basis_at_sell = avg_buy_at_sell * sold_qty if avg_buy_at_sell > 0 else 0.0
+            realized_pnl_at_sell = ((float(mark or 0.0) - avg_buy_at_sell) * sold_qty) if avg_buy_at_sell > 0 else 0.0
+            realized_pnl_pct_at_sell = ((float(mark or 0.0) - avg_buy_at_sell) / avg_buy_at_sell * 100.0) if avg_buy_at_sell > 0 else 0.0
             self.fills_repo.upsert_fill(
                 env=self.env,
                 run_id=self.run_id,
@@ -10610,6 +10616,15 @@ class PB1Engine:
                 tax=0.0,
                 filled_at=filled_at,
                 raw_json=resp,
+                fill_meta_json={
+                    "avg_buy_at_sell": avg_buy_at_sell,
+                    "cost_basis_at_sell": cost_basis_at_sell,
+                    "position_qty_before_sell": position_qty_before_sell,
+                    "entry_date": pos.get("entry_date") or pos.get("entry_ts") or pos.get("last_fill_at"),
+                    "realized_pnl": realized_pnl_at_sell,
+                    "realized_pnl_pct": realized_pnl_pct_at_sell,
+                    "exit_reason": exit_eval.primary_reason,
+                },
             )
             self.positions_repo.apply_fill(
                 env=self.env,
@@ -12158,6 +12173,15 @@ class PB1Engine:
         min_order_krw = float(MIN_ORDER_KRW)
         entry_capital_krw = 0.0
         skip_entry_scan = False
+        forced_entry_disabled_reason = str(os.getenv("FORCE_ENTRY_DISABLED_REASON") or "").strip()
+        if forced_entry_disabled_reason == "PM_LATE_START_NO_NEW_BUY":
+            calc_allowed = False
+            order_allowed = False
+            entry_allowed = False
+            entry_reason = forced_entry_disabled_reason
+            skip_entry_scan = True
+            logger.info("[ENTRY][DISABLED] reason=%s action=skip_entry_scan", forced_entry_disabled_reason)
+            logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
         if self.preopen_max_new_positions > 0 and (self.window_label or "").lower() == "preopen":
             target_new_positions_raw = min(target_new_positions_raw, self.preopen_max_new_positions)
         if not order_allowed and not minervini_only:
