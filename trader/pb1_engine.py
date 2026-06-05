@@ -3426,6 +3426,29 @@ class PB1Engine:
         cutoff = datetime.combine(self._now_kst.date(), cutoff_time, tzinfo=self._now_kst.tzinfo)
         return cutoff, raw
 
+    def _resolve_market_close(self) -> tuple[datetime, str]:
+        raw = (os.getenv("MARKET_CLOSE_TIME") or CLOSE_AUCTION_END or "").strip()
+        if not raw:
+            raw = "15:30"
+        try:
+            close_time = datetime.strptime(raw, "%H:%M").time()
+        except ValueError:
+            logger.warning("[PB1][ENV] invalid MARKET_CLOSE_TIME=%s fallback=%s", raw, CLOSE_AUCTION_END)
+            close_time = datetime.strptime(CLOSE_AUCTION_END, "%H:%M").time()
+            raw = CLOSE_AUCTION_END
+        close_dt = datetime.combine(self._now_kst.date(), close_time, tzinfo=self._now_kst.tzinfo)
+        return close_dt, raw
+
+    def _is_buy_allowed_now(self, now: datetime | None = None) -> tuple[bool, str, datetime, datetime]:
+        current_now = now or now_kst()
+        entry_cutoff_dt, _ = self._resolve_entry_cutoff()
+        market_close_dt, _ = self._resolve_market_close()
+        if current_now >= market_close_dt:
+            return False, "MARKET_CLOSED", entry_cutoff_dt, market_close_dt
+        if current_now >= entry_cutoff_dt:
+            return False, "ENTRY_CUTOFF_PASSED", entry_cutoff_dt, market_close_dt
+        return True, "TIME_WINDOW_OK", entry_cutoff_dt, market_close_dt
+
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
             return
@@ -4942,7 +4965,7 @@ class PB1Engine:
         if self._balance_snapshot is not None:
             self.balance_tick_cache_hits += 1
             source = self._balance_snapshot_source or "tick_cache"
-            logger.info("[BALANCE][CACHE] hit=True source=%s", source)
+            logger.info("[ENGINE][BALANCE_CACHE] hit=True source=%s", source)
             self._balance_snapshot_source = "tick_cache"
             return self._balance_snapshot
         if not self.kis:
@@ -4952,7 +4975,7 @@ class PB1Engine:
             self.balance_api_calls += 1
         else:
             self.balance_cache_hits += 1
-        logger.info("[BALANCE][CACHE] hit=%s source=%s", source != "api", source)
+        logger.info("[ENGINE][BALANCE_CACHE] hit=%s source=%s", source != "api", source)
         self._balance_snapshot = snap
         return self._balance_snapshot
 
@@ -8980,7 +9003,7 @@ class PB1Engine:
             # [2026-04-30] ORDER_SUBMIT_ACCEPTED 직후 BUY_FILL/positions update 금지.
             # 실제 체결은 reconcile_kis.py에서 KIS balance 확인 후 BUY_FILL_CONFIRMED로 생성한다.
             logger.info(
-                "[ORDER][ACCEPTED_ONLY] side=BUY code=%s name=%s odno=%s fill_created=0 position_updated=0 meta_updated=0",
+                "[ORDER][ACCEPTED] side=BUY code=%s name=%s odno=%s fill_status=pending",
                 cf.code,
                 stock_name,
                 kis_odno or order_id,
@@ -12175,13 +12198,15 @@ class PB1Engine:
         skip_entry_scan = False
         forced_entry_disabled_reason = str(os.getenv("FORCE_ENTRY_DISABLED_REASON") or "").strip()
         if forced_entry_disabled_reason == "PM_LATE_START_NO_NEW_BUY":
+            logger.warning("[ENTRY][LEGACY_POLICY_IGNORED] reason=%s action=allow_before_cutoff", forced_entry_disabled_reason)
+        elif forced_entry_disabled_reason in {"ENTRY_CUTOFF_PASSED"}:
             calc_allowed = False
             order_allowed = False
             entry_allowed = False
-            entry_reason = forced_entry_disabled_reason
+            entry_reason = "ENTRY_CUTOFF_PASSED"
             skip_entry_scan = True
             logger.info("[ENTRY][DISABLED] reason=%s action=skip_entry_scan", forced_entry_disabled_reason)
-            logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
+            logger.info("[EXIT][ENABLED] reason=%s", "entry_cutoff_exit_only")
         if self.preopen_max_new_positions > 0 and (self.window_label or "").lower() == "preopen":
             target_new_positions_raw = min(target_new_positions_raw, self.preopen_max_new_positions)
         if not order_allowed and not minervini_only:
@@ -12375,7 +12400,7 @@ class PB1Engine:
             watchlist_count,
         )
         
-        if self.phase in {"prep", "entry"} and self._now_kst > entry_cutoff_dt:
+        if self.phase in {"prep", "entry"} and self._now_kst >= entry_cutoff_dt:
             force_compute_when_cutoff = (
                 env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
                 or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
@@ -12384,9 +12409,9 @@ class PB1Engine:
             )
             entry_allowed = False
             order_allowed = False
-            entry_reason = "entry_cutoff"
+            entry_reason = "ENTRY_CUTOFF_PASSED"
             logger.info(
-                "[PB1][SKIP_ENTRY] reason=entry_cutoff now=%s cutoff=%s",
+                "[PB1][SKIP_ENTRY] reason=ENTRY_CUTOFF_PASSED now=%s cutoff=%s",
                 self._now_kst.isoformat(),
                 entry_cutoff_dt.isoformat(),
             )
@@ -12396,7 +12421,7 @@ class PB1Engine:
             if not calc_allowed and self.phase in {"prep", "entry"}:
                 skip_entry_scan = True
                 final_status = "SKIPPED"
-                final_notes = "entry_cutoff"
+                final_notes = "ENTRY_CUTOFF_PASSED"
 
         logger.info(
             "[GATE] compute_allowed=%s order_allowed=%s reason=%s",
@@ -13083,14 +13108,46 @@ class PB1Engine:
             [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")],
         )
         
+        buy_allowed_now, buy_allowed_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(self._now_kst)
+        if self.phase in {"prep", "entry"} and not buy_allowed_now:
+            logger.warning(
+                "[ENTRY][PIPE][SKIP] reason=%s now=%s cutoff=%s",
+                buy_allowed_reason,
+                self._now_kst.isoformat(),
+                runtime_cutoff_dt.isoformat(),
+            )
+            _emit_entry_summary([], [], Counter({buy_allowed_reason: 1}))
+            _emit_entry_decision(
+                "SKIP",
+                reason=buy_allowed_reason,
+                ok_setups=0,
+                blocked_by=Counter({buy_allowed_reason: 1}),
+            )
+            _set_run_summary_payload(
+                scanned=len(scan_members),
+                setup_ok=0,
+                relax_ok=0,
+                score_ok=0,
+                risk_ok=0,
+                sized_ok=0,
+                buyable_ok=0,
+                order_candidates=0,
+                submitted=0,
+                blocked_reasons_counter=Counter({buy_allowed_reason: 1}),
+                no_trade_reason=buy_allowed_reason,
+            )
+            self._log_tick_price_cache_summary()
+            return self._finalize_run_result(status="OK_EXIT_ONLY_AFTER_CUTOFF", notes=buy_allowed_reason)
+
         logger.info(
-            "[ENTRY][PIPE][START] trace=%s scan_count=%d source=%s slots=%d tick_budget=%.0f entry_allowed=%s",
+            "[ENTRY][PIPE][START] trace=%s scan_count=%d source=%s slots=%d tick_budget=%.0f entry_allowed=%s reason=%s",
             trace_id,
             len(scan_members),
             scan_source,
             slots_remaining,
             tick_budget_krw,
             entry_allowed,
+            buy_allowed_reason if buy_allowed_now else entry_reason,
         )
         logger.info("[PASS][ENTRY][START] phase=%s entry_allowed=%s slots_remaining=%s", self.phase, entry_allowed, slots_remaining)
         
@@ -14670,6 +14727,9 @@ class PB1Engine:
                         )
 
             if self.bootstrap_enabled and len(orderable_candidates) > 3:
+                for dropped_cf in orderable_candidates[3:]:
+                    self._record_drop(drop_reason_counter, drop_examples, "score_keep_topn_limit", dropped_cf.code)
+                    order_stage_counter["score_keep_topn_limit"] += 1
                 orderable_candidates = orderable_candidates[:3]
                 logger.warning("[PB1][BOOTSTRAP] orderable capped to top3")
 
@@ -14936,7 +14996,7 @@ class PB1Engine:
                 elif cf.code in risk_ok_set and cf.code not in sizing_ok_set:
                     sizing_stage_counter[_normalize_sizing_failure_reason(getattr(cf, "sizing_reason", None))] += 1
             logger.info(
-                "[ENTRY][FUNNEL] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s submitted=%s",
+                "[ENTRY][FUNNEL][PRE_SUBMIT] setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s api_submitted_pending=%s",
                 len(setup_ok_codes),
                 len(self._debug_risk_ok_codes),
                 len(self._debug_sizing_ok_codes),
@@ -14953,13 +15013,18 @@ class PB1Engine:
                 drop_count = max(0, before_count - after_count)
                 if drop_count > 0:
                     logger.info(
-                        "[ENTRY][FUNNEL][DROP] stage=%s count=%s reasons=%s",
+                        "[ENTRY][FUNNEL][DROP] stage=%s count=%s reasons=%s examples=%s",
                         stage_name,
                         drop_count,
                         [reason for reason, _count in stage_counter.most_common(self.drop_reasons_topn)],
+                        {
+                            codes[0]: reason
+                            for reason, codes in drop_examples.items()
+                            if codes and reason in {name for name, _count in stage_counter.most_common(self.drop_reasons_topn)}
+                        },
                     )
             logger.info(
-                "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s api_submitted=%s",
+                "[RUN_SUMMARY][ENTRY] scanned=%s setup_ok=%s relax_ok=%s score_ok=%s risk_ok=%s sized_ok=%s order_candidates=%s api_submitted=%s accepted=%s filled=%s",
                 len(scan_members),
                 len(setup_ok_codes),
                 len(setup_ok_codes),
@@ -14968,6 +15033,8 @@ class PB1Engine:
                 len(self._debug_sizing_ok_codes),
                 len(orderable_candidates),
                 submit_success_count,
+                int(accepted_count) if 'accepted_count' in locals() else 0,
+                int(filled_count) if 'filled_count' in locals() else 0,
             )
             orderable_code_set = {candidate.code for candidate in orderable_candidates}
             buyable_ok_set = set(buyable_ok_codes)
@@ -15194,6 +15261,17 @@ class PB1Engine:
                     else:
                         for cf in orderable_candidates:
                             try:
+                                buy_allowed, buy_block_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(now_kst())
+                                if not buy_allowed:
+                                    logger.warning(
+                                        "[ORDER][PRE_SUBMIT][BLOCK] side=BUY code=%s reason=%s now=%s cutoff=%s",
+                                        cf.code,
+                                        buy_block_reason,
+                                        now_kst().isoformat(),
+                                        runtime_cutoff_dt.isoformat(),
+                                    )
+                                    skipped_count += 1
+                                    continue
                                 logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
                                 if self.window_internal == "close":
                                     order_status = self._place_entry_close(cf)
@@ -15221,6 +15299,15 @@ class PB1Engine:
                                 )
                     dt_order_submit = time.monotonic() - t_order_submit
                 submit_success_count = api_submitted_count
+                logger.info(
+                    "[ENTRY][FUNNEL][POST_SUBMIT] order_candidates=%s attempted=%s accepted=%s rejected=%s failed=%s filled_by_reconcile=%s",
+                    len(orderable_candidates),
+                    attempted_count,
+                    accepted_count,
+                    rejected_count,
+                    failed_count,
+                    filled_count,
+                )
                 
                 logger.info(
                     "[ORDER][SUBMIT] trace=%s attempted=%s api_submitted=%s accepted=%s filled=%s rejected=%s skipped=%s failed=%s dt_build=%.2f dt_submit=%.2f",
@@ -15244,6 +15331,21 @@ class PB1Engine:
                     filled_count,
                     rejected_count,
                     skipped_count,
+                )
+                exit_summary_payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
+                sell_accepted = int(exit_summary_payload.get("accepted_sell_count") or 0)
+                sell_filled = int(exit_summary_payload.get("fill_confirmed_sell_count") or 0)
+                try:
+                    open_orders_count = len(self.orders_repo.get_open_orders(self.env) or [])
+                except Exception:
+                    open_orders_count = 0
+                logger.info(
+                    "[RUN_SUMMARY][ORDERS] buy_accepted=%s buy_filled=%s sell_accepted=%s sell_filled=%s open_orders=%s",
+                    accepted_count,
+                    filled_count,
+                    sell_accepted,
+                    sell_filled,
+                    open_orders_count,
                 )
                 if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
                     if skipped_count >= len(orderable_candidates) and attempted_count == 0:

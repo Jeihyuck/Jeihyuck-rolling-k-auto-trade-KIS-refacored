@@ -35,22 +35,57 @@ def test_pm_late_start_before_session_end_runs():
     assert os.environ.get("PB1_LATE_START_WARNING") == "1", "Should set late start warning flag"
 
 
-def test_pm_late_start_policy_forces_exit_only():
+def test_pm_late_start_policy_allows_entry_before_cutoff():
     from trader.pb1_runner import _resolve_session_trade_policy
 
     with patch.dict(
         os.environ,
         {
             "TRADE_PM_LATE_START": "1",
-            "PB1_PM_LATE_START_ACTION": "EXIT_ONLY_NO_NEW_BUY",
+            "PB1_PM_LATE_START_ACTION": "ALLOW_BEFORE_CUTOFF",
             "PB1_PHASE_GUARD_CLASSIFICATION": "LATE_PM_RECOVERY",
+            "ENTRY_CUTOFF_TIME": "15:15",
+            "MARKET_CLOSE_TIME": "15:30",
         },
         clear=False,
     ):
-        policy = _resolve_session_trade_policy(session="pm", phase_name="entry", entry_enabled=True)
+        KST = ZoneInfo("Asia/Seoul")
+        policy = _resolve_session_trade_policy(
+            session="pm",
+            phase_name="entry",
+            entry_enabled=True,
+            now=datetime(2026, 6, 5, 14, 11, 0, tzinfo=KST),
+        )
+
+    assert policy["no_new_entry"] is False
+    assert policy["reason"] == "LATE_START_BEFORE_CUTOFF"
+
+
+def test_pm_after_cutoff_blocks_new_entry():
+    from trader.pb1_runner import _resolve_session_trade_policy
+
+    with patch.dict(
+        os.environ,
+        {
+            "TRADE_PM_LATE_START": "1",
+            "PB1_PM_LATE_START_ACTION": "ALLOW_BEFORE_CUTOFF",
+            "PB1_PHASE_GUARD_CLASSIFICATION": "LATE_PM_RECOVERY",
+            "ENTRY_CUTOFF_TIME": "15:15",
+            "MARKET_CLOSE_TIME": "15:30",
+            "PB1_BLOCK_ENTRY_AFTER_CUTOFF": "1",
+        },
+        clear=False,
+    ):
+        KST = ZoneInfo("Asia/Seoul")
+        policy = _resolve_session_trade_policy(
+            session="pm",
+            phase_name="entry",
+            entry_enabled=True,
+            now=datetime(2026, 6, 5, 15, 16, 0, tzinfo=KST),
+        )
 
     assert policy["no_new_entry"] is True
-    assert policy["reason"] == "PM_LATE_START_NO_NEW_BUY"
+    assert policy["reason"] == "ENTRY_CUTOFF_PASSED"
 
 
 def test_pm_after_session_end_skips():

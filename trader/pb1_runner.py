@@ -2270,20 +2270,35 @@ def _evaluate_session_recovery_guard(*, engine, env: str, session_kind: str, now
     )
 
 
-def _resolve_session_trade_policy(*, session: str, phase_name: str, entry_enabled: bool) -> dict[str, Any]:
+def _resolve_session_trade_policy(*, session: str, phase_name: str, entry_enabled: bool, now: datetime | None = None) -> dict[str, Any]:
     normalized_session = str(session or "").strip().lower()
     normalized_phase = str(phase_name or "").strip().lower()
     if normalized_session != "pm":
         return {"no_new_entry": False, "reason": ""}
-    late_start_action = str(os.getenv("PB1_PM_LATE_START_ACTION") or "EXIT_ONLY_NO_NEW_BUY").strip().upper()
+    late_start_action = str(os.getenv("PB1_PM_LATE_START_ACTION") or "ALLOW_BEFORE_CUTOFF").strip().upper()
     phase_guard_classification = str(os.getenv("PB1_PHASE_GUARD_CLASSIFICATION") or "").strip().upper()
+    current_now = now or _get_now_kst()
+    entry_cutoff_raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "15:15").strip()
+    market_close_raw = (os.getenv("MARKET_CLOSE_TIME") or CLOSE_AUCTION_END or "15:30").strip()
+    try:
+        entry_cutoff_time = datetime.strptime(entry_cutoff_raw, "%H:%M").time()
+    except ValueError:
+        entry_cutoff_time = datetime.strptime("15:15", "%H:%M").time()
+    try:
+        market_close_time = datetime.strptime(market_close_raw, "%H:%M").time()
+    except ValueError:
+        market_close_time = datetime.strptime("15:30", "%H:%M").time()
     late_start_detected = (
         _env_flag("TRADE_PM_LATE_START", default=False)
         or "LATE_PM" in phase_guard_classification
         or "FORCED_LATE_PM" in phase_guard_classification
     )
-    if late_start_detected and late_start_action == "EXIT_ONLY_NO_NEW_BUY":
-        return {"no_new_entry": True, "reason": "PM_LATE_START_NO_NEW_BUY"}
+    if current_now.time() >= market_close_time:
+        return {"no_new_entry": True, "reason": "MARKET_CLOSED"}
+    if _env_flag("PB1_BLOCK_ENTRY_AFTER_CUTOFF", default=True) and current_now.time() >= entry_cutoff_time:
+        return {"no_new_entry": True, "reason": "ENTRY_CUTOFF_PASSED"}
+    if late_start_detected and late_start_action == "ALLOW_BEFORE_CUTOFF":
+        return {"no_new_entry": False, "reason": "LATE_START_BEFORE_CUTOFF", "warning_only": True}
     if not entry_enabled or normalized_phase in {"manage", "exit", "idle"}:
         return {"no_new_entry": True, "reason": "pm_strategy_manage_only"}
     return {"no_new_entry": False, "reason": ""}
@@ -3529,7 +3544,7 @@ def _decide_action(now: datetime, trading_day: bool, open_dt: datetime, close_dt
 
 
 def _log_balance_cache(force: bool) -> None:
-    logger.info("[BALANCE][CACHE] hit=%s", not force)
+    logger.info("[RUNNER][BALANCE_CACHE] hit=%s", not force)
 
 
 def _run_smoke(engine, kis_env: str, now: datetime) -> None:
@@ -4953,8 +4968,29 @@ def run_once(
                             max_back_days=3,
                         )
                         precomputed_universe_df = pd.DataFrame(list(universe_rows or []))
+                        actual_source = "pb1_universe_scored" if not precomputed_universe_df.empty else "none"
+                        fallback_used = int(
+                            bool(
+                                not precomputed_universe_df.empty
+                                and str(_used_as_of or "") != str(run_ctx.get("derived_as_of") or as_of)
+                            )
+                        )
+                        contract_ok = int(not precomputed_universe_df.empty)
+                        log_fn = logger.info if contract_ok else logger.warning
+                        log_fn(
+                            "[DB][PRECOMPUTED_FEATURES][LOAD_RESULT] requested_strategy=%s actual_source=%s fallback_used=%s rows=%s contract_ok=%s critical=0",
+                            "pb1_universe_scored",
+                            actual_source,
+                            fallback_used,
+                            len(precomputed_universe_df),
+                            contract_ok,
+                        )
                     except Exception:
                         precomputed_universe_df = pd.DataFrame()
+                        logger.warning(
+                            "[DB][PRECOMPUTED_FEATURES][LOAD_RESULT] requested_strategy=%s actual_source=none fallback_used=0 rows=0 contract_ok=0 critical=0",
+                            "pb1_universe_scored",
+                        )
                     logger.info(
                         "[ENTRY_SOURCE][LOCK] final30_rows=%s watchlist_rows=%s precomputed_rows=%s",
                         len(precomputed_final30_df),
@@ -5107,25 +5143,29 @@ def run_once(
             session=_resolve_session_kind(now),
             phase_name=resolved_phase,
             entry_enabled=user_entry_enabled,
+            now=now,
         )
+        session_warning_reason = str(session_policy.get("reason") or "")
+        if session_warning_reason == "LATE_START_BEFORE_CUTOFF":
+            logger.info("[TRADE_PM][POLICY] warning_only=1 reason=%s", session_warning_reason)
         if session_policy["no_new_entry"] and not minervini_only:
             logger.info("[TRADE_PM][POLICY] no_new_entry=1 reason=%s", session_policy["reason"])
             os.environ["PB1_PM_POLICY_REASON"] = str(session_policy["reason"])
             order_allowed = False
             entry_block_reason = entry_block_reason or str(session_policy["reason"])
-            if str(session_policy["reason"] or "") == "PM_LATE_START_NO_NEW_BUY":
+            if str(session_policy["reason"] or "") == "ENTRY_CUTOFF_PASSED":
                 os.environ["PB1_ENTRY_ENABLED"] = "0"
                 os.environ["ALLOW_NEW_BUY"] = "0"
                 os.environ["ENTRY_ENABLED"] = "0"
-                os.environ["FORCE_ENTRY_DISABLED_REASON"] = "PM_LATE_START_NO_NEW_BUY"
+                os.environ["FORCE_ENTRY_DISABLED_REASON"] = "ENTRY_CUTOFF_PASSED"
                 os.environ["PB1_PHASE_DEFAULT"] = "exit"
                 phase_override_arg = "exit"
                 phase_for_log = "exit"
                 run_ctx["phase_name"] = "exit"
                 logger.info(
-                    "[ENTRY][DISABLED] reason=PM_LATE_START_NO_NEW_BUY action=skip_entry_scan phase=exit order_allowed=0"
+                    "[ENTRY][DISABLED] reason=ENTRY_CUTOFF_PASSED action=skip_entry_scan phase=exit order_allowed=0"
                 )
-                logger.info("[EXIT][ENABLED] reason=late_start_exit_only")
+                logger.info("[EXIT][ENABLED] reason=entry_cutoff_exit_only")
         if account_sanity_block_reason and not minervini_only:
             dry_run = True
             intended_live = False
@@ -5158,7 +5198,7 @@ def run_once(
                     close_dt.isoformat(),
                     resolved_phase,
                 )
-                if now.time() > cutoff_time:
+                if now.time() >= cutoff_time:
                     force_compute_when_cutoff = (
                         env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
                         or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
@@ -5167,7 +5207,7 @@ def run_once(
                         or PB1_DIAG_IGNORE_ENTRY_CUTOFF
                     )
                     order_allowed = False
-                    entry_block_reason = entry_block_reason or "entry_cutoff"
+                    entry_block_reason = entry_block_reason or "ENTRY_CUTOFF_PASSED"
                     if force_compute_when_cutoff:
                         calc_allowed = True
                         logger.info(

@@ -79,7 +79,9 @@ def test_promote_order_creates_fill_and_position() -> None:
     )
 
     # 1개 order 승격, 1개 fill 생성 확인
-    assert promoted == {"orders": 1, "fills": 1}
+    assert promoted["orders"] == 1
+    assert promoted["fills"] == 1
+    assert promoted["codes"] == ["067310"]
     
     # order가 FILLED로 승격되었는지 확인
     orders_repo.upsert_reconciled_order.assert_called_once()
@@ -204,7 +206,9 @@ def test_promote_skips_when_no_holdings() -> None:
     )
 
     # 승격 없음
-    assert promoted == {"orders": 0, "fills": 0}
+    assert promoted["orders"] == 0
+    assert promoted["fills"] == 0
+    assert promoted["codes"] == []
     orders_repo.upsert_reconciled_order.assert_not_called()
     fills_repo.upsert_fill.assert_not_called()
 
@@ -245,7 +249,9 @@ def test_promote_partial_filled_order() -> None:
         fills_repo=fills_repo,
     )
 
-    assert promoted == {"orders": 1, "fills": 1}
+    assert promoted["orders"] == 1
+    assert promoted["fills"] == 1
+    assert promoted["codes"] == ["000660"]
     order_kwargs = orders_repo.upsert_reconciled_order.call_args.kwargs
     assert order_kwargs["status"] == "FILLED"
 

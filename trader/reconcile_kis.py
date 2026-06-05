@@ -127,6 +127,7 @@ def _promote_open_buy_orders_from_holdings(
     qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
     promoted_orders = 0
     promoted_fills = 0
+    promoted_codes: list[str] = []
     for order in orders_repo.get_open_orders(env) or []:
         side = str(order.get("side") or "").upper()
         status = str(order.get("status") or "").upper()
@@ -196,18 +197,23 @@ def _promote_open_buy_orders_from_holdings(
             tax=0.0,
             filled_at=order_time,
             raw_json={
-                "promotion_source": "kis_holdings",
+                "promotion_source": "kis_holdings_fallback",
                 "promoted_from_status": status,
                 "holding_qty": holding_qty,
+                "ccld_status": "timeout",
+                "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
             },
             fill_meta_json={
-                "fill_source": "kis_holdings_promotion",
+                "fill_source": "kis_holdings_fallback",
                 "promoted_from_status": status,
+                "ccld_status": "timeout",
+                "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
             },
         )
         promoted_fills += 1
+        promoted_codes.append(code)
         logger.warning(
-            "[RECONCILE][PROMOTE_FILL] env=%s code=%s kis_odno=%s from=%s to=FILLED qty=%s holding_qty=%s",
+            "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=FILLED qty=%s holding_qty=%s",
             env,
             code,
             kis_odno,
@@ -215,7 +221,12 @@ def _promote_open_buy_orders_from_holdings(
             fill_qty,
             holding_qty,
         )
-    return {"orders": promoted_orders, "fills": promoted_fills}
+        logger.info(
+            "[POSITION_AGE][ENTRY_TS] code=%s source=promote_fill.detected_time entry_ts=%s",
+            code,
+            order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+        )
+    return {"orders": promoted_orders, "fills": promoted_fills, "codes": promoted_codes}
 
 
 def _restore_entry_meta_for_promoted_positions(
@@ -402,6 +413,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         degraded_reason = degraded_reason or "invalid_response"
         resp = {"output1": [], "output2": []}
     rows = resp.get("output1") or resp.get("output2") or resp.get("output") or []
+    ccld_status = str(resp.get("_ccld_status") or ("ok" if isinstance(resp, dict) else "unknown"))
     if isinstance(rows, dict):
         rows = [rows]
     orders_repo = OrdersRepo(engine)
@@ -411,6 +423,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
 
     order_count = 0
     fill_count = 0
+    filled_codes: list[str] = []
     for row in rows or []:
         code = _normalize_code(_first_value(row, ["pdno", "stck_shrn_iscd", "code"]))
         if not code:
@@ -465,8 +478,14 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 tax=0.0,
                 filled_at=order_time,
                 raw_json=row,
+                fill_meta_json={
+                    "fill_source": "daily_ccld",
+                    "ccld_status": ccld_status,
+                    "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                },
             )
             fill_count += 1
+            filled_codes.append(code)
 
     reasons = [f"orders:{order_count}", f"fills:{fill_count}"]
     if degraded_reason:
@@ -481,7 +500,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         reasons=reasons,
         payload_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
     )
-    logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s", env, order_count, fill_count)
+    logger.info("[RECONCILE][DONE] env=%s orders=%s fills=%s source=%s", env, order_count, fill_count, "daily_ccld")
     reconcile_repo.append_log(
         env=env,
         strategy=strategy,
@@ -489,7 +508,15 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         action="reconcile_today",
         details_json={"orders": order_count, "fills": fill_count, "degraded": degraded_reason},
     )
-    return {"ok": True, "orders": order_count, "fills": fill_count, "degraded": degraded_reason}
+    return {
+        "ok": True,
+        "orders": order_count,
+        "fills": fill_count,
+        "degraded": degraded_reason,
+        "ccld_status": ccld_status,
+        "filled_codes": filled_codes,
+        "fill_source": "daily_ccld",
+    }
 
 
 def reconcile_kis(
@@ -550,6 +577,30 @@ def reconcile_kis(
     )
     orders_count += int(promoted.get("orders") or 0)
     fills_count += int(promoted.get("fills") or 0)
+    refresh_codes = sorted(
+        {
+            str(code).zfill(6)
+            for code in (list(reconcile_result.get("filled_codes") or []) + list(promoted.get("codes") or []))
+            if str(code).strip()
+        }
+    )
+    if refresh_codes:
+        try:
+            kis.invalidate_balance_cache(reason="reconcile_fill", codes=refresh_codes)
+            refreshed_snapshot = kis.get_balance_cached(force=True)
+            refreshed_holdings = refreshed_snapshot.get("output1") or []
+            logger.info("[POSITIONS][REFRESH_AFTER_FILL] source=kis_balance holdings=%s", len(refreshed_holdings))
+            logger.info("[PNL][SNAPSHOT] source=refreshed_holdings after_fills=1")
+            holdings_rows = refreshed_holdings
+        except Exception as exc:
+            logger.warning("[POSITIONS][REFRESH_AFTER_FILL][FAIL] err=%s", exc)
+    if int(promoted.get("fills") or 0) > 0:
+        logger.info(
+            "[RECONCILE][DONE] env=%s orders=%s fills=%s source=holdings_fallback",
+            env,
+            orders_count,
+            fills_count,
+        )
     restored = 0
     if reset_mode:
         allow_holdings = env_flag("RESET_ALLOW_KIS_HOLDINGS", default=False)
@@ -667,6 +718,7 @@ def reconcile_kis(
             "fills": fills_count,
             "promoted_orders": int(promoted.get("orders") or 0),
             "promoted_fills": int(promoted.get("fills") or 0),
+            "filled_codes": refresh_codes,
             "holdings": len(holdings_rows),
             "restored_positions": restored,
             "account_key": account_key,
@@ -683,6 +735,7 @@ def reconcile_kis(
             "holdings": len(holdings_rows),
             "promoted_orders": int(promoted.get("orders") or 0),
             "promoted_fills": int(promoted.get("fills") or 0),
+            "filled_codes": refresh_codes,
             "restored_positions": restored,
             "account_key": account_key,
             "masked_account": masked_account,

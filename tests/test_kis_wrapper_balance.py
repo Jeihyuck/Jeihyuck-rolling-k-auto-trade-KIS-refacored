@@ -49,3 +49,46 @@ def test_inquire_balance_all_logs_stacktrace_on_page_exception(monkeypatch):
     assert calls
     assert calls[0][0] == "[BALANCE][PAGE_EXCEPTION] ctx_fk=%s ctx_nk=%s retry=%s/%s"
     assert calls[0][1] == ("", "", 0, 0)
+
+
+def test_summarize_balance_output2_prefers_orderable_cash_fields():
+    summary = kis_wrapper._summarize_balance_output2(
+        {
+            "dnca_tot_amt": "1000000",
+            "ord_psbl_cash": "750000",
+            "scts_evlu_amt": "250000",
+            "tot_evlu_amt": "1250000",
+        }
+    )
+
+    assert summary["cash_total"] == 1000000
+    assert summary["order_possible_cash"] == 750000
+    assert summary["market_value"] == 250000
+    assert summary["total_asset"] == 1250000
+    assert summary["parser"] == "output2_dict"
+
+
+def test_inquire_daily_ccld_timeout_fail_open(monkeypatch):
+    api = KisAPI.__new__(KisAPI)
+    api.env = "practice"
+    api.CANO = "12345678"
+    api.ACNT_PRDT_CD = "01"
+    api._headers = lambda tr: {"tr_id": tr}
+    api.refresh_token = lambda: None
+    api._reset_session = lambda: None
+    api.session = SimpleNamespace(
+        request=lambda *args, **kwargs: (_ for _ in ()).throw(kis_wrapper.requests.exceptions.Timeout("boom"))
+    )
+
+    monkeypatch.setattr(kis_wrapper, "_pick_tr", lambda env, name: ["VTTC8001R"])
+    monkeypatch.setattr(kis_wrapper, "kis_http_enabled", lambda: True)
+    monkeypatch.setattr(kis_wrapper.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("KIS_CCLD_RETRY_MAX", "2")
+    monkeypatch.setenv("KIS_CCLD_READ_TIMEOUT_SEC", "7")
+    monkeypatch.setenv("KIS_CCLD_FAIL_OPEN", "1")
+
+    payload = api.inquire_daily_ccld(start_date="20260605", end_date="20260605")
+
+    assert payload["output1"] == []
+    assert payload["_ccld_status"] == "TIMEOUT"
+    assert payload["_fill_source"] == "daily_ccld_fail_open"

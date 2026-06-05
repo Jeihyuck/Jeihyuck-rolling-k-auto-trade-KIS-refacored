@@ -44,7 +44,9 @@ def test_promote_open_buy_order_from_kis_holdings() -> None:
         fills_repo=fills_repo,
     )
 
-    assert promoted == {"orders": 1, "fills": 1}
+    assert promoted["orders"] == 1
+    assert promoted["fills"] == 1
+    assert promoted["codes"] == ["067310"]
     orders_repo.upsert_reconciled_order.assert_called_once()
     fills_repo.upsert_fill.assert_called_once()
     order_kwargs = orders_repo.upsert_reconciled_order.call_args.kwargs
@@ -77,6 +79,8 @@ def test_promote_open_buy_order_skips_when_holdings_absent() -> None:
         fills_repo=fills_repo,
     )
 
-    assert promoted == {"orders": 0, "fills": 0}
+    assert promoted["orders"] == 0
+    assert promoted["fills"] == 0
+    assert promoted["codes"] == []
     orders_repo.upsert_reconciled_order.assert_not_called()
     fills_repo.upsert_fill.assert_not_called()

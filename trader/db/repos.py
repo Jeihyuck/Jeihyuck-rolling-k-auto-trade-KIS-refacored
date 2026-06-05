@@ -5971,7 +5971,8 @@ class WatchlistRepo:
 
             if used_as_of is None:
                 logger.info(
-                    "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=none rows=0 is_scored=0 contract_ok=0 missing_critical_fields=%s",
+                    "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=none source_name=none rows=0 is_scored=0 contract_ok=0 missing_critical_fields=%s fallback_used=0 critical=1",
+                    expected_strategy,
                     list(REQUIRED_FINAL30_SCORED_COLS),
                 )
                 return [], None
@@ -6058,12 +6059,16 @@ class WatchlistRepo:
         missing_loaded_fields = [field for field in REQUIRED_FINAL30_SCORED_COLS if field not in cols]
         logger.info("[DB][FINAL30_SCORED][LOAD_VERIFY_MISSING] missing=%s", missing_loaded_fields)
         logger.info(
-            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=%s rows=%s is_scored=%s contract_ok=%s missing_critical_fields=%s",
+            "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=%s source_name=%s rows=%s is_scored=%s contract_ok=%s missing_critical_fields=%s fallback_used=%s critical=%s",
+            expected_strategy,
+            actual_strategy,
             "db_pb1_watchlist_final_scored" if result else "none",
             len(result),
             int(len(missing_loaded_fields) == 0),
             int((len(result) == FINAL30_SCORED_REQUIRED_ROWS) and (len(missing_loaded_fields) == 0) and actual_strategy == expected_strategy),
             missing_loaded_fields,
+            int(actual_strategy != expected_strategy and bool(result)),
+            1,
         )
         exact_rows_ok = True if require_exact_rows is None else len(result) == int(require_exact_rows)
         required_scored_ok = len(missing_loaded_fields) == 0
@@ -6284,13 +6289,17 @@ class WatchlistRepo:
             columns,
         )
         logger.info(
-            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=%s rows=%s is_scored=%s contract_ok=%s usable=%s missing_critical_fields=%s",
+            "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=%s source_name=%s rows=%s is_scored=%s contract_ok=%s usable=%s missing_critical_fields=%s fallback_used=%s critical=%s",
+            strategy_n,
+            strategy_n if not df.empty else "none",
             "db_pb1_watchlist_final_scored" if not df.empty else "none",
             len(df),
             int(not missing_critical_fields),
             contract_ok,
             usable,
             missing_critical_fields,
+            0,
+            1,
         )
 
         if fail_if_missing and df.empty:
@@ -6429,7 +6438,8 @@ def load_final30_scored_db_only(
 
     if df.empty:
         logger.error(
-            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=none rows=0 contract_ok=0 reason=scored_final30_missing"
+            "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=none source_name=none rows=0 contract_ok=0 fallback_used=0 critical=1 reason=scored_final30_missing",
+            strategy_n,
         )
         if fail_if_missing:
             raise ScoredWatchlistNotFoundError(
@@ -6443,7 +6453,9 @@ def load_final30_scored_db_only(
 
     if len(df) != int(require_exact_rows):
         logger.error(
-            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=db_pb1_watchlist_final_scored rows=%s contract_ok=0 reason=rows_not_30",
+            "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=%s source_name=db_pb1_watchlist_final_scored rows=%s contract_ok=0 fallback_used=0 critical=1 reason=rows_not_30",
+            strategy_n,
+            strategy_n,
             len(df),
         )
         raise ScoredWatchlistInvalidError(
@@ -6456,7 +6468,9 @@ def load_final30_scored_db_only(
 
     if missing_cols:
         logger.error(
-            "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=db_pb1_watchlist_final_scored rows=%s contract_ok=0 reason=required_scored_cols_missing",
+            "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=%s source_name=db_pb1_watchlist_final_scored rows=%s contract_ok=0 fallback_used=0 critical=1 reason=required_scored_cols_missing",
+            strategy_n,
+            strategy_n,
             len(df),
         )
         raise ScoredWatchlistInvalidError(
@@ -6468,7 +6482,9 @@ def load_final30_scored_db_only(
         )
 
     logger.info(
-        "[DB][FINAL30_SCORED][LOAD_RESULT] source_name=db_pb1_watchlist_final_scored rows=%s contract_ok=1",
+        "[DB][FINAL30_SCORED][LOAD_RESULT] requested_strategy=%s actual_source=%s source_name=db_pb1_watchlist_final_scored rows=%s contract_ok=1 fallback_used=0 critical=1",
+        strategy_n,
+        strategy_n,
         len(df),
     )
     return df

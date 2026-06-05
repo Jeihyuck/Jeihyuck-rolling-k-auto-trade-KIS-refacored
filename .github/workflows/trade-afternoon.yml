@@ -38,8 +38,12 @@ env:
   MODE: trade
   EXPECTED_BRANCH: "dual-agent"
   PM_ENTRY_ALLOW_UNTIL: "13:30"
-  PM_LATE_START_ACTION: "EXIT_ONLY_NO_NEW_BUY"
+  PM_LATE_START_ACTION: "RUN_WITH_WARNING"
   PM_ALLOW_LATE_NEW_BUY_OVERRIDE: "0"
+  ENTRY_CUTOFF_TIME: "15:15"
+  MARKET_CLOSE_TIME: "15:30"
+  PB1_LATE_START_POLICY: "ALLOW_BEFORE_CUTOFF"
+  PB1_BLOCK_ENTRY_AFTER_CUTOFF: "1"
 
   PB1_MAX_POSITIONS: "30"
   PB1_TARGET_NEW_POSITIONS: "30"
@@ -94,12 +98,22 @@ env:
 
   KRX_DB_READ_FAIL_OPEN: "1"
   KRX_RECONCILE_FAIL_OPEN: "1"
+  KIS_ORDER_MIN_GAP_SEC: "1.10"
+  KIS_DATA_MIN_GAP_SEC: "0.35"
+  KIS_RATE_LIMIT_BACKOFF_BASE_SEC: "2.0"
+  KIS_RATE_LIMIT_BACKOFF_MAX_SEC: "8.0"
+  KIS_ORDER_RETRY_MAX: "5"
+  KIS_DATA_RETRY_MAX: "5"
+  KIS_CCLD_READ_TIMEOUT_SEC: "7"
+  KIS_CCLD_RETRY_MAX: "2"
+  KIS_CCLD_FAIL_OPEN: "1"
+  PB1_KIS_RATE_LIMIT_SAFE: "1"
 
   PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
   PB1_FAIL_OPEN_ON_POSITION_LOOKUP_TIMEOUT: "1"
   PB1_FAIL_OPEN_ON_FILL_LOOKUP_TIMEOUT: "1"
   PB1_FAIL_OPEN_ON_LEDGER_LOOKUP_TIMEOUT: "1"
-  PB1_PM_LATE_START_ACTION: "EXIT_ONLY_NO_NEW_BUY"
+  PB1_PM_LATE_START_ACTION: "ALLOW_BEFORE_CUTOFF"
   PB1_MIN_TICK_BUDGET_SEC: "75"
   PB1_DB_RECOVERY_SLEEP_SEC: "2"
   PB1_DISPOSE_ENGINE_ON_TICK_TIMEOUT: "1"
@@ -177,7 +191,6 @@ env:
   PB1_TIME_STOP_BASIS: "trading_days"
   PB1_BLOCK_INSUFFICIENT_OHLCV: "1"
   PB1_REQUIRE_EXPLICIT_TRIGGER_BYPASS: "1"
-  PB1_KIS_RATE_LIMIT_SAFE: "1"
   PB1_EXIT_COOLDOWN_DAYS: "1"
   PB1_ALLOW_INTRADAY_REENTRY_AFTER_STOP: "0"
   PB1_REQUIRE_FILL_CONFIRM: "1"
@@ -595,22 +608,41 @@ jobs:
           KST = ZoneInfo("Asia/Seoul")
           now_dt = datetime.now(KST)
           now_hhmm = now_dt.strftime("%H:%M")
-          entry_allow_until = os.getenv("PM_ENTRY_ALLOW_UNTIL", "13:30")
-          allow_h, allow_m = map(int, entry_allow_until.split(":"))
-          allow_min = allow_h * 60 + allow_m
+            entry_allow_until = os.getenv("PM_ENTRY_ALLOW_UNTIL", "13:30")
+            entry_cutoff = os.getenv("ENTRY_CUTOFF_TIME", "15:15")
+            market_close = os.getenv("MARKET_CLOSE_TIME", "15:30")
+            allow_h, allow_m = map(int, entry_allow_until.split(":"))
+            cutoff_h, cutoff_m = map(int, entry_cutoff.split(":"))
+            close_h, close_m = map(int, market_close.split(":"))
+            allow_min = allow_h * 60 + allow_m
+            cutoff_min = cutoff_h * 60 + cutoff_m
+            close_min = close_h * 60 + close_m
           now_min = now_dt.hour * 60 + now_dt.minute
           late_start = now_min > allow_min
+            before_cutoff = now_min < cutoff_min
+            after_close = now_min >= close_min
           late_start_no_buy = 0
+            late_start_reason = "TIME_WINDOW_OK"
           if late_start:
-              late_start_no_buy = 1
-              pm_late_action = os.getenv("PM_LATE_START_ACTION", "EXIT_ONLY_NO_NEW_BUY")
+              pm_late_action = os.getenv("PM_LATE_START_ACTION", "RUN_WITH_WARNING")
               allow_override = os.getenv("PM_ALLOW_LATE_NEW_BUY_OVERRIDE", "0")
-              if allow_override == "1":
+              if before_cutoff or allow_override == "1":
                   late_start_no_buy = 0
-              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1")
-              print(f"[TRADE_AFTERNOON][LATE_START_ACTION] action={pm_late_action} entry_enabled=0 exit_enabled=1")
+                late_start_reason = "LATE_START_BEFORE_CUTOFF"
+                print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1 cutoff={entry_cutoff} market_close={market_close}")
+                print(f"[TRADE_AFTERNOON][LATE_START_ACTION] action=RUN_WITH_WARNING entry_enabled=1 exit_enabled=1 reason={late_start_reason} now={now_hhmm} cutoff={entry_cutoff}")
+              elif after_close:
+                late_start_no_buy = 1
+                late_start_reason = "MARKET_CLOSED"
+                print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1 cutoff={entry_cutoff} market_close={market_close}")
+                print(f"[TRADE_AFTERNOON][CUTOFF_ACTION] action=MARKET_CLOSED entry_enabled=0 exit_enabled=0 reason={late_start_reason} now={now_hhmm} cutoff={entry_cutoff}")
+              else:
+                late_start_no_buy = 1
+                late_start_reason = "ENTRY_CUTOFF_PASSED"
+                print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1 cutoff={entry_cutoff} market_close={market_close}")
+                print(f"[TRADE_AFTERNOON][CUTOFF_ACTION] action=EXIT_ONLY_AFTER_ENTRY_CUTOFF entry_enabled=0 exit_enabled=1 reason={late_start_reason} now={now_hhmm} cutoff={entry_cutoff}")
           else:
-              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=0")
+              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=0 cutoff={entry_cutoff} market_close={market_close}")
 
           if not provenance_ok:
               if env == "practice":
@@ -638,6 +670,7 @@ jobs:
               _write_output("final30_rows", str(rows))
               _write_output("skip_reason", f"FINAL30_NOT_FOUND:rows={rows}")
           _write_output("late_start_no_buy", str(late_start_no_buy))
+          _write_output("late_start_reason", late_start_reason)
           PY
 
       - name: Wait until PM target start
@@ -697,9 +730,13 @@ jobs:
         run: |
           set -euo pipefail
           late_no_buy="${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}"
+          late_reason="${{ steps.verify_final30.outputs.late_start_reason || 'TIME_WINDOW_OK' }}"
           if [[ "$late_no_buy" == "1" ]]; then
-            echo "[TRADE_AFTERNOON][LATE_START_ACTION] action=EXIT_ONLY_NO_NEW_BUY entry_enabled=0 exit_enabled=1" | tee -a artifacts/trade-afternoon.log
-            echo "[ENTRY][BLOCKED] reason=PM_LATE_START_NO_NEW_BUY" | tee -a artifacts/trade-afternoon.log
+            echo "[TRADE_AFTERNOON][CUTOFF_ACTION] action=EXIT_ONLY_AFTER_ENTRY_CUTOFF entry_enabled=0 exit_enabled=1 reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
+            echo "[ENTRY][BLOCKED] reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
+          elif [[ "$late_reason" == "LATE_START_BEFORE_CUTOFF" ]]; then
+            echo "[TRADE_AFTERNOON][LATE_START_ACTION] action=RUN_WITH_WARNING entry_enabled=1 exit_enabled=1 reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
+            echo "[ENTRY][ALLOWED] reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
           fi
           echo "[TRADE_AFTERNOON][ENGINE_START] cmd=python -m trader.trade_tick phase=pm as_of=${{ steps.verify_final30.outputs.expected_as_of }} prep_ready=${{ steps.verify_final30.outputs.prep_ready }}" | tee -a artifacts/trade-afternoon.log
           echo "[PHASE][START] phase=pm session_window=1300-1510 entry_enabled=$([ \"$late_no_buy\" == \"1\" ] && echo 0 || echo 1)" | tee -a artifacts/trade-afternoon.log

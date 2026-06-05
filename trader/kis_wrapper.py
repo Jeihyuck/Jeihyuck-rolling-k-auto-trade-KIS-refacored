@@ -766,6 +766,37 @@ def _normalize_balance_snapshot(snapshot: Any) -> dict | None:
     return normalized
 
 
+def _summarize_balance_output2(output2: Any) -> dict[str, Any]:
+    summary = output2
+    if isinstance(summary, list):
+        summary = summary[0] if summary and isinstance(summary[0], dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+
+    cash_total = safe_int(
+        summary.get("dnca_tot_amt")
+        or summary.get("nxdy_excc_amt")
+        or summary.get("prvs_rcdl_excc_amt")
+        or 0
+    )
+    order_possible_cash = safe_int(summary.get("ord_psbl_cash") or 0)
+    total_asset = safe_int(summary.get("tot_evlu_amt") or summary.get("nass_amt") or 0)
+    market_value = safe_int(summary.get("scts_evlu_amt") or summary.get("evlu_amt_smtl_amt") or 0)
+    if market_value <= 0 and total_asset > 0 and cash_total >= 0:
+        market_value = max(total_asset - cash_total, 0)
+    unrealized = safe_int(summary.get("evlu_pfls_smtl_amt") or 0)
+    return_pct = safe_float(summary.get("asst_icdc_erng_rt"), 0.0)
+    return {
+        "cash_total": int(cash_total or 0),
+        "order_possible_cash": int(order_possible_cash or 0),
+        "market_value": int(market_value or 0),
+        "total_asset": int(total_asset or 0),
+        "unrealized": int(unrealized or 0),
+        "return_pct": float(return_pct or 0.0),
+        "parser": "output2_dict" if summary else "fallback_empty",
+    }
+
+
 def _is_raw_balance_snapshot(snapshot: Any) -> bool:
     if not isinstance(snapshot, dict):
         return False
@@ -870,12 +901,15 @@ def _is_egw002_error(response_data: dict | None, msg_cd: str | None = None) -> b
 
 def _egw002_backoff_sleep(attempt: int = 1) -> float:
     """EGW002 발생 시 backoff + jitter 계산 후 sleep. 실제 sleep 시간 반환."""
-    base = float(os.getenv("KIS_EGW002_BACKOFF_BASE_SEC", "2.0"))
-    cap = float(os.getenv("KIS_EGW002_BACKOFF_MAX_SEC", "10.0"))
+    base = float(os.getenv("KIS_RATE_LIMIT_BACKOFF_BASE_SEC", os.getenv("KIS_EGW002_BACKOFF_BASE_SEC", "2.0")))
+    cap = float(os.getenv("KIS_RATE_LIMIT_BACKOFF_MAX_SEC", os.getenv("KIS_EGW002_BACKOFF_MAX_SEC", "10.0")))
     delay = min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
     logger.warning(
-        "[KIS][EGW002][BACKOFF] sleep=%.2f attempt=%s base=%.1f cap=%.1f",
-        delay, attempt, base, cap,
+        "[KIS][HTTP][RETRY] reason=EGW002 rate_limit attempt=%s sleep=%.2f base=%.1f cap=%.1f",
+        attempt,
+        delay,
+        base,
+        cap,
     )
     time.sleep(delay)
     return delay
@@ -998,9 +1032,11 @@ class KisAPI:
         # [NEW] 호가 조회 404 쿨다운 캐시
         self.askbid_unavailable_cache: Dict[str, float] = {}  # code -> unavailable_until_timestamp
         self.askbid_cooldown_sec = int(os.getenv("KIS_ASKBID_COOLDOWN_SEC", "3600"))  # 기본 1시간
+        self._last_order_submit_at = 0.0
+        self._last_data_request_at = 0.0
 
     def _rate_limit_safe_enabled(self) -> bool:
-        return str(os.getenv("PB1_KIS_RATE_LIMIT_SAFE") or "0") == "1"
+        return str(os.getenv("PB1_KIS_RATE_LIMIT_SAFE") or "1") == "1"
 
     def _wait_before_hashkey(self) -> None:
         if self._rate_limit_safe_enabled():
@@ -1010,16 +1046,48 @@ class KisAPI:
         if self._rate_limit_safe_enabled():
             self._order_limiter.wait("orders-safe")
             now = time.time()
-            delta = now - float(self._last_hashkey_at or 0.0)
-            if delta < float(self._order_hashkey_gap_sec or 0.0):
-                sleep_sec = float(self._order_hashkey_gap_sec) - delta + random.uniform(0, 0.03)
+            required_gap = float(os.getenv("KIS_ORDER_MIN_GAP_SEC", str(self._order_hashkey_gap_sec or 1.10)) or "1.10")
+            last_order_anchor = max(float(self._last_hashkey_at or 0.0), float(self._last_order_submit_at or 0.0))
+            delta = now - last_order_anchor
+            if delta < required_gap:
+                sleep_sec = required_gap - delta + random.uniform(0, 0.03)
                 logger.warning(
-                    "[KIS][RATE_LIMIT][ORDER_GAP] sleep=%.3f gap=%.3f",
-                    sleep_sec,
+                    "[KIS][RATE_LIMIT][ORDER_GAP] required=%.2f actual=%.2f sleep=%.2f",
+                    required_gap,
                     delta,
+                    sleep_sec,
                 )
                 time.sleep(sleep_sec)
+            self._last_order_submit_at = time.time()
         self._limiter.wait("orders")
+
+    def _wait_before_data_request(self, endpoint_name: str) -> None:
+        if not self._rate_limit_safe_enabled():
+            return
+        self._data_limiter.wait(endpoint_name)
+        required_gap = float(os.getenv("KIS_DATA_MIN_GAP_SEC", "0.35") or "0.35")
+        now = time.time()
+        delta = now - float(self._last_data_request_at or 0.0)
+        if delta < required_gap:
+            sleep_sec = required_gap - delta + random.uniform(0, 0.03)
+            logger.warning(
+                "[KIS][RATE_LIMIT][DATA_GAP] endpoint=%s required=%.2f actual=%.2f sleep=%.2f",
+                endpoint_name,
+                required_gap,
+                delta,
+                sleep_sec,
+            )
+            time.sleep(sleep_sec)
+        self._last_data_request_at = time.time()
+
+    def invalidate_balance_cache(self, *, reason: str, codes: list[str] | None = None) -> None:
+        self._balance_cache = None
+        self._balance_cache_at = None
+        logger.info(
+            "[BALANCE][CACHE][INVALIDATE] reason=%s codes=%s",
+            reason,
+            list(codes or []),
+        )
 
     def _account_param_meta(self) -> dict:
         cano = _digits_only(self.CANO)
@@ -1041,6 +1109,55 @@ class KisAPI:
         if acnt_len != 2:
             return False, f"invalid_acnt_prdt_cd_len:{acnt_len}"
         return True, "ok"
+
+    def _extract_balance_output2_summary(self, output2: Any) -> dict[str, int | str]:
+        row = _as_first_dict(output2) if "_as_first_dict" in globals() else (output2 if isinstance(output2, dict) else {})
+        row = row if isinstance(row, dict) else {}
+        cash = 0
+        cash_key = "none"
+        for key in ("dnca_tot_amt", "nxdy_excc_amt", "prvs_rcdl_excc_amt"):
+            value = self._cash_to_int(row.get(key))
+            if value > 0:
+                cash = value
+                cash_key = key
+                break
+        order_possible_cash = 0
+        for key in ("ord_psbl_cash", "ord_psbl_amt", "dnca_tot_amt"):
+            value = self._cash_to_int(row.get(key))
+            if value > 0:
+                order_possible_cash = value
+                break
+        market_value = 0
+        market_value_key = "none"
+        for key in ("scts_evlu_amt", "evlu_amt_smtl_amt"):
+            value = self._cash_to_int(row.get(key))
+            if value > 0:
+                market_value = value
+                market_value_key = key
+                break
+        total_asset = 0
+        total_asset_key = "none"
+        for key in ("tot_evlu_amt", "nass_amt"):
+            value = self._cash_to_int(row.get(key))
+            if value > 0:
+                total_asset = value
+                total_asset_key = key
+                break
+        if market_value <= 0 and total_asset > 0 and cash > 0 and total_asset >= cash:
+            market_value = max(0, total_asset - cash)
+            market_value_key = "tot_evlu_amt_minus_dnca_tot_amt"
+        return {
+            "cash": cash,
+            "order_possible_cash": order_possible_cash,
+            "market_value": market_value,
+            "total_asset": total_asset,
+            "unrealized": self._cash_to_int(row.get("evlu_pfls_smtl_amt")),
+            "return_pct": safe_float(row.get("asst_icdc_erng_rt"), 0.0),
+            "parser": "output2_dict" if row else "output2_missing",
+            "cash_key": cash_key,
+            "market_value_key": market_value_key,
+            "total_asset_key": total_asset_key,
+        }
 
     def _safe_mode_path(self) -> Path:
         path = botstate_path("runtime", "status", "kis_safe_mode.json")
@@ -1209,7 +1326,23 @@ class KisAPI:
 
             return _DiagDummyResponse()
 
-        attempts = max(self._safe_attempts, 1)
+        endpoint_name = endpoint or _endpoint_name(url)
+        path_lower = _endpoint_path(url)
+        data_gap_paths = (
+            "inquire-price",
+            "inquire-balance",
+            "inquire-psbl-order",
+            "inquire-daily-ccld",
+        )
+        if method.upper() == "GET" and any(token in path_lower for token in data_gap_paths):
+            self._wait_before_data_request(endpoint_name)
+
+        if is_order_endpoint(url):
+            attempts = max(int(os.getenv("KIS_ORDER_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
+        elif any(token in path_lower for token in data_gap_paths):
+            attempts = max(int(os.getenv("KIS_DATA_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
+        else:
+            attempts = max(self._safe_attempts, 1)
         start_ts = time.monotonic()
         auth_refreshed = False
         reset_done = False
@@ -3375,15 +3508,18 @@ class KisAPI:
                     continue
                 raise KisBalanceUnavailable(str(e)) from e
 
-            output2_summary = _as_first_dict(j.get("output2")) if "_as_first_dict" in globals() else (j.get("output2") if isinstance(j.get("output2"), dict) else {})
+            output2_summary = _summarize_balance_output2(j.get("output2"))
             logger.info(
-                "[BALANCE][RESP_SUMMARY] rt_cd=%s msg_cd=%s rows=%s has_output2=%s cash=%s market_value=%s",
+                "[BALANCE][RESP_SUMMARY] rt_cd=%s msg_cd=%s rows=%s has_output2=%s cash=%s order_possible_cash=%s market_value=%s total_asset=%s parser=%s",
                 j.get("rt_cd"),
                 j.get("msg_cd"),
                 len(j.get("output1") or []),
                 int(bool(j.get("output2"))),
-                (output2_summary or {}).get("ord_psbl_cash") or (output2_summary or {}).get("dnca_tot_amt") or 0,
-                (output2_summary or {}).get("scts_evlu_amt") or (output2_summary or {}).get("tot_evlu_amt") or 0,
+                output2_summary.get("cash_total") or 0,
+                output2_summary.get("order_possible_cash") or 0,
+                output2_summary.get("market_value") or 0,
+                output2_summary.get("total_asset") or 0,
+                output2_summary.get("parser") or "unknown",
             )
 
             rows = j.get("output1") or []
@@ -3466,7 +3602,7 @@ class KisAPI:
             cached = _deepcopy_json(self._balance_cache)
             normalized = _normalize_balance_snapshot(cached)
             if normalized:
-                logger.info("[BALANCE][CACHE] hit=True age_s=%.1f", age_s)
+                logger.info("[KIS][BALANCE_CACHE] hit=True age_s=%.1f", age_s)
                 self._balance_cache = _deepcopy_json(normalized)
                 source = "wrapper_cache"
                 if return_source and return_raw:
@@ -3480,10 +3616,10 @@ class KisAPI:
                     reason = f"rt_cd_{cached.get('rt_cd')}"
                 else:
                     reason = "normalize_failed"
-                logger.warning("[BALANCE][CACHE][INVALID] reason=%s -> refetching raw", reason)
+                logger.warning("[KIS][BALANCE_CACHE][INVALID] reason=%s -> refetching raw", reason)
                 _BALANCE_CACHE_INVALID_LOGGED = True
             force = True
-        logger.info("[BALANCE][CACHE] hit=False force=%s", force)
+        logger.info("[KIS][BALANCE_CACHE] hit=False force=%s", force)
         snap: dict = {}
         try:
             snap = self.inquire_balance_all()
@@ -3494,7 +3630,7 @@ class KisAPI:
                     reason = f"rt_cd_{snap.get('rt_cd')}"
                 else:
                     reason = "normalize_failed"
-                logger.warning("[BALANCE][CACHE][INVALID] reason=%s source=api", reason)
+                logger.warning("[KIS][BALANCE_CACHE][INVALID] reason=%s source=api", reason)
             else:
                 cache_value = _deepcopy_json(normalized)
                 self._balance_cache = cache_value
@@ -3566,23 +3702,11 @@ class KisAPI:
         if not isinstance(summary, dict):
             summary = raw
 
-        def _to_int(value):
-            try:
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return int(value)
-                text = str(value).replace(",", "").strip()
-                return int(float(text))
-            except Exception:
-                return None
-
-        snap["cash_total_krw"] = _to_int(
-            summary.get("dnca_tot_amt") or summary.get("cash_total") or summary.get("cash")
-        )
-        snap["orderable_cash_krw"] = _to_int(summary.get("ord_psbl_cash") or summary.get("orderable_cash"))
-        snap["total_eval_krw"] = _to_int(summary.get("tot_evlu_amt") or summary.get("total_eval"))
-        snap["total_asset_krw"] = _to_int(summary.get("tot_asst_amt") or summary.get("total_asset"))
+        parsed = _summarize_balance_output2(summary)
+        snap["cash_total_krw"] = parsed.get("cash_total")
+        snap["orderable_cash_krw"] = parsed.get("order_possible_cash")
+        snap["total_eval_krw"] = parsed.get("market_value")
+        snap["total_asset_krw"] = parsed.get("total_asset")
         snap["deposit_like_krw"] = snap["cash_total_krw"]
 
         return snap
@@ -3601,7 +3725,14 @@ class KisAPI:
             }
         
         def _empty_daily_ccld(reason: str) -> dict:
-            return {"rt_cd": "-1", "msg": reason, "output1": [], "output2": []}
+            return {
+                "rt_cd": "-1",
+                "msg": reason,
+                "output1": [],
+                "output2": [],
+                "_ccld_status": reason,
+                "_fill_source": "daily_ccld_fail_open",
+            }
 
         tr_ids = _pick_tr(self.env, "DAILY_CCLD")
         if not tr_ids:
@@ -3622,9 +3753,12 @@ class KisAPI:
             "SORT_SQN": "00",
         }
         retryable_statuses = {500, 502, 503, 504}
+        retry_max = max(1, int(os.getenv("KIS_CCLD_RETRY_MAX", "2") or "2"))
+        read_timeout = float(os.getenv("KIS_CCLD_READ_TIMEOUT_SEC", "7") or "7")
+        fail_open = str(os.getenv("KIS_CCLD_FAIL_OPEN", "1") or "1") == "1"
         backoff_seq = [0.5, 1.0, 2.0]
         last_err: Exception | None = None
-        for attempt in range(1, len(backoff_seq) + 1):
+        for attempt in range(1, retry_max + 1):
             for tr_id in tr_ids:
                 try:
                     headers = self._headers(tr_id)
@@ -3633,7 +3767,7 @@ class KisAPI:
                         url,
                         headers=headers,
                         params=params,
-                        timeout=(3.0, 7.0),
+                        timeout=(3.0, read_timeout),
                     )
                     status = resp.status_code
                     if status in (401, 403):
@@ -3648,8 +3782,11 @@ class KisAPI:
                 except requests.exceptions.Timeout as exc:
                     last_err = exc
                     logger.warning(
-                        "[RECONCILE][TEMP] attempt=%s tr_id=%s err=timeout",
+                        "[RECONCILE][CCLD][TIMEOUT] retry=%s/%s timeout=%.1f fail_open=%s tr_id=%s",
                         attempt,
+                        retry_max,
+                        read_timeout,
+                        int(fail_open),
                         tr_id,
                     )
                 except KisTemporaryError as exc:
@@ -3676,14 +3813,14 @@ class KisAPI:
                     last_err = exc
                     logger.warning("[RECONCILE][FAIL] tr_id=%s err=%s", tr_id, exc)
                     return _empty_daily_ccld("TEMP_FAIL")
-            if attempt < len(backoff_seq):
-                backoff = backoff_seq[attempt - 1]
+            if attempt < retry_max:
+                backoff = backoff_seq[min(attempt - 1, len(backoff_seq) - 1)]
                 jitter = random.uniform(0.0, min(0.2, backoff * 0.2))
                 time.sleep(backoff + jitter)
         if last_err:
-            logger.warning("[RECONCILE][DEGRADED] daily_ccld_failed err=%s", last_err)
+            logger.warning("[RECONCILE][DEGRADED] daily_ccld_failed err=%s fail_open=%s", last_err, int(fail_open))
         self._reset_session()
-        return _empty_daily_ccld("TEMP_FAIL")
+        return _empty_daily_ccld("TIMEOUT" if fail_open else "TEMP_FAIL")
 
     # -------------------------------
     # 주문 공통, 시장가/지정가, 매수/매도
