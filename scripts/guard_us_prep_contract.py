@@ -83,6 +83,7 @@ def write_failure_sidecar(reason: str, prep_status: str = "UNKNOWN", locked_coun
     print(f"[US_PREP_GUARD][FAILURE_SIDECAR] {result_path}", flush=True)
 
 if prep_result["timeout"]:
+    print(f"[US_TIMEOUT_GUARD][TIMEOUT] stage=prep_status timeout_sec={timeout_sec}", flush=True)
     print(
         f"[US_PREP_GUARD][PREP_STATUS][TIMEOUT] trade_date={trade_date} timeout_sec={timeout_sec}",
         flush=True,
@@ -95,6 +96,7 @@ if prep_result["timeout"]:
     sys.exit(1)
 
 if not prep_result["ok"]:
+    print(f"[US_TIMEOUT_GUARD][TIMEOUT] stage=prep_status timeout_sec={timeout_sec}", flush=True)
     print(
         f"[US_PREP_GUARD][PREP_STATUS][ERROR] trade_date={trade_date} error={prep_result['error']}",
         flush=True,
@@ -132,6 +134,7 @@ watchlist_result = run_with_timeout(
 )
 
 if watchlist_result["timeout"]:
+    print(f"[US_TIMEOUT_GUARD][TIMEOUT] stage=watchlist_load timeout_sec={timeout_sec}", flush=True)
     print(
         f"[US_PREP_GUARD][WATCHLIST][TIMEOUT] trade_date={trade_date} timeout_sec={timeout_sec}",
         flush=True,
@@ -145,6 +148,7 @@ if watchlist_result["timeout"]:
     sys.exit(1)
 
 if not watchlist_result["ok"]:
+    print(f"[US_TIMEOUT_GUARD][TIMEOUT] stage=watchlist_load timeout_sec={timeout_sec}", flush=True)
     print(
         f"[US_PREP_GUARD][WATCHLIST][ERROR] trade_date={trade_date} error={watchlist_result['error']}",
         flush=True,

@@ -105,6 +105,8 @@ def run_trade_tick(
     run_mode: str | None = None,
     signal_only: bool = False,
     kis_order_allowed: bool = True,
+    session_entry_allowed: bool | None = None,
+    session_buy_orders_count: int | None = None,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -566,13 +568,29 @@ def run_trade_tick(
         _entry_already_bought = False
         _buy_orders_today = 0
         try:
-            from trader.us.db.repos import check_us_am_entry_blocked
-            _block_result = check_us_am_entry_blocked(trade_date, timeout_sec=5)
-            if _block_result.get("entry_blocked", False):
+            from trader.us.db.repos import get_today_buy_orders_count
+
+            _buy_orders_today = get_today_buy_orders_count(trade_date=trade_date, env=env)
+            local_entry_allowed = _buy_orders_today <= 0
+            resolved_entry_allowed = local_entry_allowed
+
+            if session_entry_allowed is not None and bool(session_entry_allowed) != local_entry_allowed:
+                logger.warning(
+                    "[US_ENTRY][CONSISTENCY_WARN] session_entry_allowed=%s local_entry_allowed=%s buy_orders_count=%d",
+                    int(bool(session_entry_allowed)),
+                    int(local_entry_allowed),
+                    _buy_orders_today,
+                )
+                resolved_entry_allowed = bool(session_entry_allowed) and local_entry_allowed
+            elif session_entry_allowed is not None:
+                resolved_entry_allowed = bool(session_entry_allowed)
+
+            if not resolved_entry_allowed:
                 _entry_already_bought = True
-                _buy_orders_today = _block_result.get("buy_orders_count", 0)
+                if session_buy_orders_count is not None:
+                    _buy_orders_today = max(_buy_orders_today, int(session_buy_orders_count or 0))
                 logger.info(
-                    "[US_ENTRY][BLOCKED] reason=already_bought_today buy_orders_count=%d",
+                    "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=%d",
                     _buy_orders_today,
                 )
                 logger.info(

@@ -5,10 +5,54 @@ KIS 잔고와 로컬 DB 잔고를 비교 검증.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _normalize_meta(meta: Any) -> dict:
+    if isinstance(meta, dict):
+        return meta
+    if isinstance(meta, str) and meta:
+        try:
+            loaded = json.loads(meta)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _resolve_order_fill_price(order: dict) -> tuple[float, str | None]:
+    avg_price = _safe_float(order.get("avg_price_usd"))
+    if avg_price > 0:
+        return avg_price, "order_avg_price_usd"
+
+    meta = _normalize_meta(order.get("meta"))
+    for key in ("limit_price_usd", "submitted_price_usd", "order_price_usd"):
+        price = _safe_float(meta.get(key))
+        if price > 0:
+            return price, f"order_meta_{key}"
+
+    for key in ("submitted_price_usd", "order_price_usd"):
+        price = _safe_float(order.get(key))
+        if price > 0:
+            return price, key
+
+    intent_meta = _normalize_meta(order.get("intent_meta"))
+    price = _safe_float(intent_meta.get("limit_price_usd"))
+    if price > 0:
+        return price, "intent_limit_price_usd"
+
+    return 0.0, None
 
 
 def reconcile_positions(provider: Any | None = None) -> dict:
@@ -217,11 +261,19 @@ def reconcile_ack_orders_with_balance(
         side = str(order.get("side", "")).upper()
         order_no = str(order.get("order_no") or order.get("ack_no") or "")
         client_order_key = str(order.get("client_order_key") or "")
-        qty = int(order.get("qty", 0) or 0)
+        qty = int(
+            order.get("qty_requested")
+            or order.get("qty")
+            or order.get("filled_qty")
+            or order.get("qty_filled")
+            or 0
+        )
+        fallback_fill_price, fallback_price_source = _resolve_order_fill_price(order)
 
         # KIS 체결조회 시도
         fill_confirmed = False
-        fill_price = 0.0
+        fill_price = fallback_fill_price
+        fill_price_source = fallback_price_source or "unavailable"
         fill_qty = qty
 
         try:
@@ -229,6 +281,7 @@ def reconcile_ack_orders_with_balance(
             if fills_resp and isinstance(fills_resp, dict):
                 if fills_resp.get("filled_qty", 0) > 0:
                     fill_price = float(fills_resp.get("avg_price", 0) or 0)
+                    fill_price_source = "fills_by_order_no"
                     fill_qty = int(fills_resp.get("filled_qty", qty))
                     fill_confirmed = True
         except AttributeError:
@@ -263,16 +316,42 @@ def reconcile_ack_orders_with_balance(
 
         # fill 미확인: SELL이면 KIS 잔고에 포지션 없으면 balance reconcile
         if side == "SELL" and symbol not in kis_position_symbols:
+            if qty <= 0:
+                logger.warning(
+                    "[US_RECONCILE][ACK_RECONCILE][INVALID_QTY] symbol=%s order_no=%s side=SELL qty=%d reason=missing_qty_requested",
+                    symbol,
+                    order_no,
+                    qty,
+                )
+                unresolved_count += 1
+                continue
+
+            if fallback_fill_price > 0:
+                logger.info(
+                    "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=SELL qty=%d price_source=%s price=%.4f source=balance_reconcile",
+                    symbol,
+                    qty,
+                    fill_price_source,
+                    fallback_fill_price,
+                )
+            else:
+                logger.warning(
+                    "[US_RECONCILE][BALANCE_RECONCILE_FILL_PRICE_MISSING] symbol=%s side=SELL qty=%d source=balance_reconcile",
+                    symbol,
+                    qty,
+                )
+
             logger.info(
-                "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=SELL qty=%d source=balance_reconcile",
-                symbol, qty,
+                "[US_RECONCILE][BALANCE_RECONCILE_TRIGGER] symbol=%s side=SELL qty=%d",
+                symbol,
+                qty,
             )
             try:
                 mark_order_filled_by_reconcile(
                     order_no=order_no,
                     client_order_key=client_order_key,
                     filled_qty=qty,
-                    avg_price_usd=0.0,  # 가격 미확인 — realized PNL 계산 제외
+                    avg_price_usd=fallback_fill_price,
                     source="balance_reconcile",
                 )
                 balance_reconcile_count += 1

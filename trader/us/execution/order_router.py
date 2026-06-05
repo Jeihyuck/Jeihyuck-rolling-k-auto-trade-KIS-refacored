@@ -22,6 +22,13 @@ from typing import Any
 
 from trader.us import config as us_cfg
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
+from trader.us.db.repos import (  # test patch surface
+    load_today_order_keys,
+    mark_order_intent_blocked,
+    mark_order_intent_dry_run,
+    save_dry_run_order,
+    save_order_intent,
+)
 
 logger = logging.getLogger(__name__)
 

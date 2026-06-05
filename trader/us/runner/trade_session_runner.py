@@ -41,6 +41,13 @@ _SESSION_START_TIMES = {
 _MAX_CONSECUTIVE_ERRORS = 3
 
 
+def _safe_int_env(name: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except Exception:
+        return default
+
+
 def _write_us_schedule_health(payload: dict, session: str) -> None:
     """reports/us_schedule_health/{trade_date}.json 에 세션 결과를 기록한다.
 
@@ -132,10 +139,12 @@ def _write_us_session_report(payload: dict, session: str) -> None:
     ]
     for k in (
         "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
-        "dry_run", "kis_order_allowed", "prep_status", "locked_watchlist_count",
+        "dry_run", "kis_order_allowed", "prep_status", "prep_run_id", "score_nonzero_count",
+        "locked_watchlist_count", "locked_watchlist_count_source",
         "entry_eval_status", "entry_error_type", "entry_error_message", "entry_intents",
         "orders_sent", "fills", "positions", "last_stage", "final_status", "reason",
-        "temp_error_count", "temp_recovered_count", "missed_trade_window",
+        "temp_error_count", "temp_recovered_count", "schedule_expected_et", "actual_start_et",
+        "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
         "buy_decisions", "sell_decisions",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
@@ -211,7 +220,14 @@ def run_trade_session(
     session_started_at_et = now_et_iso()
 
     _file_guard = check_us_session_file_guard(trade_date, session)
-    if _file_guard["already_ran"]:
+    if (force_now or offline) and _file_guard["already_ran"]:
+        logger.info(
+            "[US_SESSION][FILE_GUARD_BYPASS] session=%s trade_date=%s reason=%s",
+            session,
+            trade_date,
+            "force_now" if force_now else "offline",
+        )
+    elif _file_guard["already_ran"]:
         guard_payload = _file_guard["payload"]
         # P7: stale guard 리포트 — 실제 시작 시각과 예상 시각 차이 계산
         _schedule_expected_et = _file_guard.get("schedule_expected_et", "")
@@ -277,10 +293,12 @@ def run_trade_session(
     )
 
     # ── Prep Guard (am / afternoon session) ──────────────────────────────
+    prep_guard_result: dict = {}
     if session in ("am", "afternoon") and not offline:
         try:
             from trader.us.prep_contract import check_us_prep_guard
             guard = check_us_prep_guard(trade_date)
+            prep_guard_result = guard or {}
             if guard["ok"]:
                 logger.info(
                     "[US_PREP_GUARD][OK] workflow=us-trade-%s session=%s trade_date=%s"
@@ -343,6 +361,7 @@ def run_trade_session(
             buy_count = get_today_buy_orders_count(trade_date=trade_date, env=env)
         except Exception:
             buy_count = 0
+        session_entry_allowed = buy_count <= 0
         if buy_count > 0:
             logger.info(
                 "[US_AFTERNOON][MODE] mode=exit_first entry_allowed=false"
@@ -354,6 +373,9 @@ def run_trade_session(
                 "[US_AFTERNOON][MODE] mode=exit_first entry_allowed=true"
                 " reason=no_buy_order_today",
             )
+    else:
+        buy_count = 0
+        session_entry_allowed = True
 
 
     # ── Run mode 결정 ─────────────────────────────────────────────────────────
@@ -474,10 +496,17 @@ def run_trade_session(
             # Graceful deadline 검사: GitHub hard kill 전에 Python이 먼저 종료
             # 단, max_ticks > 0일 때는 최소 1 tick은 실행되도록 보장
             if tick_now_dt >= graceful_deadline:
-                if max_ticks > 0 and tick_count == 0:
+                if (max_ticks > 0 and tick_count == 0) or (force_now and tick_count == 0):
                     logger.info(
-                        "[US_SESSION][GRACEFUL_DEADLINE] allow_first_tick=1 reason=max_ticks_guarantee tick_count=%d",
+                        "[US_SESSION][GRACEFUL_DEADLINE] allow_first_tick=1 reason=%s tick_count=%d",
+                        "max_ticks_guarantee" if max_ticks > 0 else "force_now_single_tick_guarantee",
                         tick_count,
+                    )
+                elif offline and max_ticks > 0 and tick_count < max_ticks:
+                    logger.info(
+                        "[US_SESSION][GRACEFUL_DEADLINE] bypass_for_offline_max_ticks=1 tick_count=%d max_ticks=%d",
+                        tick_count,
+                        max_ticks,
                     )
                 else:
                     final_reason = "graceful_shutdown"
@@ -507,6 +536,8 @@ def run_trade_session(
                         run_mode=resolved_run_mode,
                         signal_only=resolved_signal_only,
                         kis_order_allowed=kis_order_allowed,
+                        session_entry_allowed=session_entry_allowed,
+                        session_buy_orders_count=buy_count,
                     )
                     tick_result = fut.result(timeout=tick_timeout_sec)
                 results.append(tick_result)
@@ -788,6 +819,36 @@ def run_trade_session(
     if total_orders_ack > 0 and total_pending_orders == 0:
         total_pending_orders = max(0, total_orders_ack - total_fills)
 
+    prep_contract = prep_guard_result.get("contract") or {}
+    prep_status_fallback = prep_contract.get("status") or prep_guard_result.get("status") or "UNKNOWN"
+    prep_run_id = (
+        prep_contract.get("run_id")
+        or prep_guard_result.get("run_id")
+        or prep_guard_result.get("prep_run_id")
+        or ""
+    )
+    score_nonzero_count = int(
+        prep_contract.get("score_nonzero_count")
+        or prep_guard_result.get("score_nonzero_count")
+        or 0
+    )
+    locked_watchlist_count = 0
+    locked_watchlist_count_source = "default_zero"
+    for key, source in (
+        (final_tick.get("locked_watchlist_count"), "final_tick.locked_watchlist_count"),
+        (final_tick.get("locked_count"), "final_tick.locked_count"),
+        (prep_guard_result.get("final30_scored_count"), "prep_guard_result.final30_scored_count"),
+        (prep_guard_result.get("locked_count"), "prep_guard_result.locked_count"),
+    ):
+        if key not in (None, "") and int(key or 0) > 0:
+            locked_watchlist_count = int(key or 0)
+            locked_watchlist_count_source = source
+            break
+
+    prep_status_value = final_tick.get("prep_status", "UNKNOWN")
+    if prep_status_value == "UNKNOWN":
+        prep_status_value = prep_status_fallback
+
     report_payload = {
         "trade_date": trade_date,
         "run_id": run_id,
@@ -798,8 +859,11 @@ def run_trade_session(
         "env": env,
         "dry_run": os.getenv("DRY_RUN", "0") == "1",
         "kis_order_allowed": int(kis_order_allowed),
-        "prep_status": final_tick.get("prep_status", "UNKNOWN"),
-        "locked_watchlist_count": int(final_tick.get("locked_watchlist_count", 0) or 0),
+        "prep_status": prep_status_value,
+        "prep_run_id": prep_run_id,
+        "score_nonzero_count": score_nonzero_count,
+        "locked_watchlist_count": locked_watchlist_count,
+        "locked_watchlist_count_source": locked_watchlist_count_source,
         "entry_eval_status": final_tick.get("entry_eval_status", "UNKNOWN"),
         "entry_error_type": final_tick.get("entry_error_type", ""),
         "entry_error_message": final_tick.get("entry_error_message", ""),
@@ -841,7 +905,12 @@ def run_trade_session(
         "reason": final_reason,
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
-        "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") == "1",
+        "schedule_expected_et": os.getenv("US_SCHEDULE_EXPECTED_ET", ""),
+        "actual_start_et": os.getenv("US_ACTUAL_START_ET", ""),
+        "delay_seconds": _safe_int_env("US_DELAY_SECONDS", 0),
+        "run_window": os.getenv("US_RUN_WINDOW", "normal"),
+        "recovery_run": _safe_int_env("US_RECOVERY_RUN", 0),
+        "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") in {"1", "true", "True"},
         "kis_temp_errors": {
             "total": sum(v.get("temp_error", 0) for v in kis_temp_errors_by_api.values()),
             "recovered": sum(v.get("recovered", 0) for v in kis_temp_errors_by_api.values()),
@@ -869,6 +938,13 @@ def run_trade_session(
         },
         "entry_skip_by_symbol": entry_skip_by_symbol,
     }
+    if (
+        report_payload["prep_status"] == "OK"
+        and report_payload["locked_watchlist_count"] == 0
+        and report_payload["final_status"] not in {"NO_TRADE", "OK_NO_TRADE", "SKIP"}
+    ):
+        report_payload["final_status"] = "FAILED"
+        report_payload["reason"] = "locked_watchlist_count_zero_under_prep_ok"
     _write_us_session_report(report_payload, session=session)
     _write_us_schedule_health(report_payload, session=session)
 

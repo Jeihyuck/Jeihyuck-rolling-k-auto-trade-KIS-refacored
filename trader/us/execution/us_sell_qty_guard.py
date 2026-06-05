@@ -62,7 +62,7 @@ def resolve_sell_qty(
         else _meta.get("partial_exit_allowed")
     )
     if _allowed_raw is None:
-        partial_exit_allowed = os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1"
+        partial_exit_allowed = os.getenv("US_SELL_PARTIAL_ALLOWED", "1") == "1"
     else:
         partial_exit_allowed = bool(_allowed_raw)
 

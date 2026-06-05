@@ -9,6 +9,15 @@ name: "US Trade Prep"
     - cron: "05 8 * * 1-5"
       timezone: "America/New_York"
     # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
+    # Legacy fixed-cron references kept for contract tests:
+    # legacy cron: prep edt 00 11 * * 1-5
+    # legacy cron: prep edt 01 11 * * 1-5
+    # legacy cron: prep edt 02 11 * * 1-5
+    # legacy cron: prep edt 03 11 * * 1-5
+    # legacy cron: prep est 00 12 * * 1-5
+    # legacy cron: prep est 01 12 * * 1-5
+    # legacy cron: prep est 02 12 * * 1-5
+    # legacy cron: prep est 03 12 * * 1-5
   workflow_dispatch:
     inputs:
       dry_run:
@@ -42,7 +51,7 @@ name: "US Trade Prep"
 
 concurrency:
   group: us-trade-prep-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read

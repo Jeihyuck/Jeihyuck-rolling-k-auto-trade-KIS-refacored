@@ -290,6 +290,11 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         )
         wl_final30 = watchlist_result.get("final30_scored_count", 0)
         logger.info("[US_PREP][HEARTBEAT] stage=watchlist_scoring status=done final30=%d", wl_final30)
+        logger.info(
+            "[US_STRATEGY][SCORED] top50=%d final30=%d",
+            watchlist_result.get("top50_count", 0),
+            wl_final30,
+        )
 
         if wl_final30 < 30:
             logger.error("[US_PREP][ERROR] final30_scored hard fail count=%d", wl_final30)

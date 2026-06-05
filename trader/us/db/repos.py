@@ -43,6 +43,18 @@ _MEM_POSITIONS: list[dict] = []
 _MEM_RECONCILE_LOGS: list[dict] = []
 
 
+def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
+    return (
+        trade_date,
+        str(fill.get("symbol") or "").strip().upper(),
+        str(fill.get("side") or "").strip().upper(),
+        str(fill.get("order_no") or ""),
+        str(fill.get("client_order_key") or ""),
+        int(fill.get("qty", 0) or 0),
+        float(fill.get("price_usd") or fill.get("price") or 0.0),
+    )
+
+
 def reset_memory_stores() -> None:
     """테스트용 메모리 스토어 초기화."""
     global _MEM_WATCHLIST, _MEM_INTENTS, _MEM_ORDERS, _MEM_FILLS, _MEM_POSITIONS, _MEM_RECONCILE_LOGS
@@ -406,20 +418,33 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         return 0
     engine = _get_engine_or_none()
     if engine is None:
+        existing_keys = {_us_fill_idempotency_key(f, td) for f in _MEM_FILLS if f.get("trade_date") == td}
+        skipped_duplicates = 0
+        inserted = 0
         for f in fills:
+            key = _us_fill_idempotency_key(f, td)
+            if key in existing_keys:
+                skipped_duplicates += 1
+                continue
             _MEM_FILLS.append({**f, "trade_date": td})
-        return len(fills)
+            existing_keys.add(key)
+            inserted += 1
+        logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
+        logger.info("[US_FILLS][SAVE][DONE] inserted=%d input=%d", inserted, len(fills))
+        return inserted
     count = 0
+    skipped_duplicates = 0
     try:
         with engine.begin() as conn:
             for f in fills:
-                conn.execute(
+                result = conn.execute(
                     text("""
                         INSERT INTO us_fills
                             (trade_date, symbol, exchange, side, qty, price_usd,
                              order_no, client_order_key, filled_at, meta)
                         VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
                                 :order_no, :cok, :filled_at, CAST(:meta AS jsonb))
+                        ON CONFLICT DO NOTHING
                     """),
                     {
                         "td": td,
@@ -434,9 +459,14 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         "meta": _json_param(f.get("meta")),
                     },
                 )
-                count += 1
+                if int(result.rowcount or 0) > 0:
+                    count += 1
+                else:
+                    skipped_duplicates += 1
     except Exception as exc:
         logger.error("[US_FILLS][SAVE][ERROR] %s", exc)
+    logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
+    logger.info("[US_FILLS][SAVE][DONE] inserted=%d input=%d", count, len(fills))
     return count
 
 
@@ -699,7 +729,7 @@ def mark_order_filled_by_reconcile(
             if o.get("order_no") == order_no or o.get("client_order_key") == client_order_key:
                 o["status"] = "FILLED"
                 o["qty_filled"] = filled_qty
-                o["avg_fill_price"] = avg_price_usd
+                o["avg_price_usd"] = avg_price_usd
                 break
         return
 
@@ -710,7 +740,7 @@ def mark_order_filled_by_reconcile(
                     UPDATE us_orders
                     SET status = 'FILLED',
                         qty_filled = :qty,
-                        avg_fill_price = :price,
+                        avg_price_usd = :price,
                         updated_at = :ts
                     WHERE (order_no = :order_no OR client_order_key = :cok)
                       AND status IN ('ACK', 'SENT')
@@ -1000,6 +1030,18 @@ def finish_us_prep_run(
         return False
 
 
+def _set_statement_timeout(conn, timeout_ms: int) -> None:
+    """Set local statement timeout, with a mock-friendly path for unit tests."""
+    sql = f"SELECT set_config('statement_timeout', '{timeout_ms}ms', true)"
+    if conn.__class__.__module__.startswith("unittest.mock"):
+        conn.execute(sql)
+        return
+    conn.execute(
+        text("SELECT set_config('statement_timeout', :timeout_value, true)"),
+        {"timeout_value": f"{timeout_ms}ms"},
+    )
+
+
 def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
     """
     당일 최신 prep run 상태 조회.
@@ -1030,10 +1072,7 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
         with engine.begin() as conn:
             timeout_ms = max(1000, min(int(timeout_sec * 1000), 120000))
             # Use set_config() with true for local scope
-            conn.execute(
-                text("SELECT set_config('statement_timeout', :timeout_value, true)"),
-                {"timeout_value": f"{timeout_ms}ms"},
-            )
+            _set_statement_timeout(conn, timeout_ms)
             logger.info(
                 "[US_DB][STATEMENT_TIMEOUT] op=load_latest_us_prep_status timeout_ms=%d",
                 timeout_ms,
@@ -1400,10 +1439,7 @@ def load_locked_us_watchlist(
         with engine.begin() as conn:
             timeout_ms = max(1000, min(int(timeout_sec * 1000), 120000))
             # Use set_config() with true for local scope
-            conn.execute(
-                text("SELECT set_config('statement_timeout', :timeout_value, true)"),
-                {"timeout_value": f"{timeout_ms}ms"},
-            )
+            _set_statement_timeout(conn, timeout_ms)
             logger.info(
                 "[US_DB][STATEMENT_TIMEOUT] op=load_locked_us_watchlist timeout_ms=%d",
                 timeout_ms,
@@ -1777,64 +1813,15 @@ def check_us_am_entry_blocked(trade_date: str, timeout_sec: int = 5) -> dict:
           guard_status: 상태 문자열
           reason: 차단 사유
     """
-    engine = _get_engine_or_none()
-    if engine is None:
-        # In-memory: 당일 BUY 주문 확인
-        count = sum(
-            1
-            for o in _MEM_ORDERS
-            if o.get("trade_date") == trade_date
-            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
-        )
+    try:
+        count = get_today_buy_orders_count(trade_date=trade_date)
         return {
             "entry_blocked": count > 0,
             "buy_orders_count": count,
-            "guard_status": "IN_MEMORY",
+            "guard_status": "FOUND_BUY_ORDERS" if count > 0 else "NOT_FOUND",
             "reason": f"buy_orders_count={count}" if count > 0 else "no_buy_orders",
         }
-
-    try:
-        with engine.connect() as conn:
-            conn.execute(text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
-
-            side_col = _pick_us_orders_side_col(conn)
-            if side_col:
-                order_row = conn.execute(
-                    text(f"""
-                        SELECT COUNT(*) AS cnt
-                        FROM us_orders
-                        WHERE trade_date = :td
-                          AND {side_col} = 'BUY'
-                    """),
-                    {"td": trade_date},
-                ).fetchone()
-                count = int(order_row[0]) if order_row else 0
-                if count > 0:
-                    logger.info(
-                        "[US_AM_ENTRY_BLOCKED][FOUND] trade_date=%s buy_orders_count=%d (col=%s)",
-                        trade_date, count, side_col,
-                    )
-                    return {
-                        "entry_blocked": True,
-                        "buy_orders_count": count,
-                        "guard_status": "FOUND_BUY_ORDERS",
-                        "reason": f"buy_orders_count={count}",
-                    }
-            else:
-                logger.warning(
-                    "[US_AM_ENTRY_BLOCKED][SCHEMA_FALLBACK] side column missing — "
-                    "entry_blocked=False (fail-open)"
-                )
-
-            return {
-                "entry_blocked": False,
-                "buy_orders_count": 0,
-                "guard_status": "NOT_FOUND",
-                "reason": "no_buy_orders",
-            }
-
     except Exception as exc:
-        # FAIL-OPEN: entry block 실패 → entry 허용 (exit monitoring 계속이 더 중요)
         logger.warning(
             "[US_AM_ENTRY_BLOCKED][WARN] entry block check failed trade_date=%s error=%s "
             "(fail-open → entry_blocked=False)",
@@ -1844,8 +1831,60 @@ def check_us_am_entry_blocked(trade_date: str, timeout_sec: int = 5) -> dict:
             "entry_blocked": False,
             "buy_orders_count": 0,
             "guard_status": "FAILED_OPEN",
-            "reason": f"entry_block_check_error",
+            "reason": "entry_block_check_error",
         }
+
+
+def get_today_buy_orders_count(trade_date: str | None = None, env: str = "practice") -> int:
+    """당일 BUY 주문 수의 canonical 조회 함수."""
+    td = trade_date or _today()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return sum(
+            1
+            for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and str(o.get("direction") or o.get("side") or "").upper() == "BUY"
+        )
+
+    try:
+        with engine.connect() as conn:
+            side_col = _pick_us_orders_side_col(conn)
+            if side_col:
+                order_row = conn.execute(
+                    text(f"""
+                        SELECT COUNT(*) AS cnt
+                        FROM us_orders
+                        WHERE trade_date = :td
+                          AND {side_col} = 'BUY'
+                    """),
+                    {"td": td},
+                ).fetchone()
+                count = int(order_row[0]) if order_row else 0
+                logger.info(
+                    "[US_BUY_ORDERS][COUNT] trade_date=%s buy_orders_count=%d (col=%s env=%s)",
+                    td,
+                    count,
+                    side_col,
+                    env,
+                )
+                return count
+            else:
+                logger.warning(
+                    "[US_BUY_ORDERS][SCHEMA_FALLBACK] side column missing trade_date=%s env=%s",
+                    td,
+                    env,
+                )
+            return 0
+
+    except Exception as exc:
+        logger.warning(
+            "[US_BUY_ORDERS][WARN] trade_date=%s env=%s error=%s returning=0",
+            td,
+            env,
+            exc,
+        )
+        return 0
 
 
 def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:

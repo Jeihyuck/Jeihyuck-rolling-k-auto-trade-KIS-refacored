@@ -66,115 +66,119 @@ def test_prep_guard_sidecar_generation():
 def test_guard_failure_report_writer():
     """Test that guard failure report writer creates proper reports."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        os.chdir(tmpdir)
-        
-        # Create sidecar
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir()
-        sidecar = {
-            "ok": False,
-            "session": "am",
-            "trade_date": "2026-05-01",
-            "trade_date_source": "force_now",
-            "force_now": "2026-05-01T09:35:00-04:00",
-            "prep_status": "UNKNOWN",
-            "locked_count": 0,
-            "min_count": 10,
-            "watchlist_load_error": False,
-            "reason": "bad_prep_status",
-        }
-        sidecar_path = artifacts_dir / "us_prep_guard_result.json"
-        sidecar_path.write_text(json.dumps(sidecar, indent=2))
-        
-        # Set environment
-        os.environ["GITHUB_RUN_ID"] = "25718405741"
-        os.environ["GITHUB_SHA"] = "test-sha"
-        os.environ["GITHUB_WORKFLOW"] = "US Trade AM"
-        os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
-        os.environ["DRY_RUN"] = "1"
-        os.environ["US_KIS_ORDER_ALLOWED"] = "0"
-        os.environ["OFFLINE"] = "true"
-        os.environ["MAX_TICKS"] = "0"
-        
-        # Simulate report writer logic (without importing the script)
-        with open(sidecar_path, "r") as f:
-            guard_result = json.load(f)
-        
-        trade_date = guard_result.get("trade_date", "unknown")
-        prep_status = guard_result.get("prep_status", "UNKNOWN")
-        locked_count = guard_result.get("locked_count", 0)
-        reason = guard_result.get("reason", "unknown")
-        force_now = guard_result.get("force_now")
-        
-        run_id = os.getenv("GITHUB_RUN_ID", "local")
-        sha = os.getenv("GITHUB_SHA", "unknown")
-        workflow = os.getenv("GITHUB_WORKFLOW", "unknown")
-        event_name = os.getenv("GITHUB_EVENT_NAME", "unknown")
-        dry_run = os.getenv("DRY_RUN", "0") == "1"
-        kis_order_allowed = int(os.getenv("US_KIS_ORDER_ALLOWED", "0"))
-        offline = os.getenv("OFFLINE", "false").lower() in ("true", "1")
-        max_ticks = int(os.getenv("MAX_TICKS", "0"))
-        
-        report = {
-            "trade_date": trade_date,
-            "run_id": run_id,
-            "sha": sha,
-            "workflow": workflow,
-            "session": "am",
-            "event_name": event_name,
-            "env": "practice",
-            "dry_run": dry_run,
-            "kis_order_allowed": kis_order_allowed,
-            "prep_status": prep_status,
-            "locked_watchlist_count": locked_count,
-            "entry_eval_status": "SKIPPED",
-            "entry_error_type": "FAILED_PREP_GUARD",
-            "entry_error_message": reason,
-            "entry_intents": 0,
-            "orders_sent": 0,
-            "orders_blocked": 0,
-            "block_reasons": {},
-            "fills": 0,
-            "positions": 0,
-            "last_stage": "prep_guard",
-            "final_status": "FAILED_PREP_GUARD",
-            "reason": reason,
-            "temp_error_count": 0,
-            "temp_recovered_count": 0,
-            "missed_trade_window": False,
-            "force_now": force_now,
-            "offline": offline,
-            "tick_count": 0,
-            "max_ticks": max_ticks,
-            "wall_elapsed_sec": 0,
-        }
-        
-        # Write reports
-        base_dir = Path("reports/us_daily")
-        base_dir.mkdir(parents=True, exist_ok=True)
-        
-        latest_json = base_dir / "latest_us_daily_report.json"
-        latest_json.write_text(json.dumps(report, indent=2))
-        
-        # Validate
-        loaded = json.loads(latest_json.read_text())
-        assert loaded["final_status"] == "FAILED_PREP_GUARD"
-        assert loaded["reason"] == "bad_prep_status"
-        assert loaded["run_id"] == "25718405741"
-        assert loaded["trade_date"] == "2026-05-01"
-        assert loaded["prep_status"] == "UNKNOWN"
-        assert loaded["locked_watchlist_count"] == 0
-        
-        # Check required fields
-        required = [
-            "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
-            "dry_run", "kis_order_allowed", "prep_status", "locked_watchlist_count",
-            "entry_eval_status", "entry_error_type", "entry_error_message",
-            "entry_intents", "orders_sent", "orders_blocked", "block_reasons",
-            "fills", "positions", "last_stage", "final_status", "reason"
-        ]
-        for field in required:
-            assert field in loaded, f"Missing field: {field}"
+        orig_dir = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+            
+            # Create sidecar
+            artifacts_dir = Path("artifacts")
+            artifacts_dir.mkdir()
+            sidecar = {
+                "ok": False,
+                "session": "am",
+                "trade_date": "2026-05-01",
+                "trade_date_source": "force_now",
+                "force_now": "2026-05-01T09:35:00-04:00",
+                "prep_status": "UNKNOWN",
+                "locked_count": 0,
+                "min_count": 10,
+                "watchlist_load_error": False,
+                "reason": "bad_prep_status",
+            }
+            sidecar_path = artifacts_dir / "us_prep_guard_result.json"
+            sidecar_path.write_text(json.dumps(sidecar, indent=2))
+            
+            # Set environment
+            os.environ["GITHUB_RUN_ID"] = "25718405741"
+            os.environ["GITHUB_SHA"] = "test-sha"
+            os.environ["GITHUB_WORKFLOW"] = "US Trade AM"
+            os.environ["GITHUB_EVENT_NAME"] = "workflow_dispatch"
+            os.environ["DRY_RUN"] = "1"
+            os.environ["US_KIS_ORDER_ALLOWED"] = "0"
+            os.environ["OFFLINE"] = "true"
+            os.environ["MAX_TICKS"] = "0"
+            
+            # Simulate report writer logic (without importing the script)
+            with open(sidecar_path, "r") as f:
+                guard_result = json.load(f)
+            
+            trade_date = guard_result.get("trade_date", "unknown")
+            prep_status = guard_result.get("prep_status", "UNKNOWN")
+            locked_count = guard_result.get("locked_count", 0)
+            reason = guard_result.get("reason", "unknown")
+            force_now = guard_result.get("force_now")
+            
+            run_id = os.getenv("GITHUB_RUN_ID", "local")
+            sha = os.getenv("GITHUB_SHA", "unknown")
+            workflow = os.getenv("GITHUB_WORKFLOW", "unknown")
+            event_name = os.getenv("GITHUB_EVENT_NAME", "unknown")
+            dry_run = os.getenv("DRY_RUN", "0") == "1"
+            kis_order_allowed = int(os.getenv("US_KIS_ORDER_ALLOWED", "0"))
+            offline = os.getenv("OFFLINE", "false").lower() in ("true", "1")
+            max_ticks = int(os.getenv("MAX_TICKS", "0"))
+            
+            report = {
+                "trade_date": trade_date,
+                "run_id": run_id,
+                "sha": sha,
+                "workflow": workflow,
+                "session": "am",
+                "event_name": event_name,
+                "env": "practice",
+                "dry_run": dry_run,
+                "kis_order_allowed": kis_order_allowed,
+                "prep_status": prep_status,
+                "locked_watchlist_count": locked_count,
+                "entry_eval_status": "SKIPPED",
+                "entry_error_type": "FAILED_PREP_GUARD",
+                "entry_error_message": reason,
+                "entry_intents": 0,
+                "orders_sent": 0,
+                "orders_blocked": 0,
+                "block_reasons": {},
+                "fills": 0,
+                "positions": 0,
+                "last_stage": "prep_guard",
+                "final_status": "FAILED_PREP_GUARD",
+                "reason": reason,
+                "temp_error_count": 0,
+                "temp_recovered_count": 0,
+                "missed_trade_window": False,
+                "force_now": force_now,
+                "offline": offline,
+                "tick_count": 0,
+                "max_ticks": max_ticks,
+                "wall_elapsed_sec": 0,
+            }
+            
+            # Write reports
+            base_dir = Path("reports/us_daily")
+            base_dir.mkdir(parents=True, exist_ok=True)
+            
+            latest_json = base_dir / "latest_us_daily_report.json"
+            latest_json.write_text(json.dumps(report, indent=2))
+            
+            # Validate
+            loaded = json.loads(latest_json.read_text())
+            assert loaded["final_status"] == "FAILED_PREP_GUARD"
+            assert loaded["reason"] == "bad_prep_status"
+            assert loaded["run_id"] == "25718405741"
+            assert loaded["trade_date"] == "2026-05-01"
+            assert loaded["prep_status"] == "UNKNOWN"
+            assert loaded["locked_watchlist_count"] == 0
+            
+            # Check required fields
+            required = [
+                "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
+                "dry_run", "kis_order_allowed", "prep_status", "locked_watchlist_count",
+                "entry_eval_status", "entry_error_type", "entry_error_message",
+                "entry_intents", "orders_sent", "orders_blocked", "block_reasons",
+                "fills", "positions", "last_stage", "final_status", "reason"
+            ]
+            for field in required:
+                assert field in loaded, f"Missing field: {field}"
+        finally:
+            os.chdir(orig_dir)
 
 
 def test_stale_report_rejection():

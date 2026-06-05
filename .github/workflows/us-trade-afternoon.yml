@@ -1,12 +1,13 @@
 name: "US Trade Afternoon"
-# session: afternoon | window: 12:30~15:50 ET | schedule: early start pattern (한국장 trade-afternoon 패턴)
+# session: afternoon | prewarm: 11:30 ET | window: 12:30~15:50 ET
 # workflow starts 11:30 ET, checks prep, waits until 12:30 ET, then executes afternoon session
 
 "on":
   schedule:
-    # NY timezone-aware single cron: 12:35 ET (EDT/EST 자동 적용)
-    - cron: "35 12 * * 1-5"
+    # NY timezone-aware prewarm cron: 11:30 ET (EDT/EST 자동 적용)
+    - cron: "30 11 * * 1-5"
       timezone: "America/New_York"
+    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_prewarm_wait crons=1 timezone=America/New_York
     # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
   workflow_dispatch:
     inputs:
@@ -316,11 +317,11 @@ jobs:
           
           {
             echo "[US_TRADE_AFTERNOON][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1215 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1130 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
             echo "[US_TRADE_AFTERNOON][BOOT_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} route=${{ steps.phase_guard.outputs.route }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=1230-1550"
             echo "[US_TRADE_AFTERNOON][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
-            echo "[US_TRADE_AFTERNOON][CONCURRENCY_META] group=us-trade-afternoon-${GITHUB_REF_NAME} cancel_in_progress=true schedule_mode=timezone_single_cron crons=1"
-            echo "[US_TRADE_AFTERNOON][SCHEDULE_MODE] mode=timezone_single_cron crons=1 timezone=America/New_York"
+            echo "[US_TRADE_AFTERNOON][CONCURRENCY_META] group=us-trade-afternoon-${GITHUB_REF_NAME} cancel_in_progress=true schedule_mode=timezone_prewarm_wait crons=1"
+            echo "[US_TRADE_AFTERNOON][SCHEDULE_MODE] mode=timezone_prewarm_wait crons=1 timezone=America/New_York"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -662,6 +663,13 @@ jobs:
             echo "[US_TRADE_AFTERNOON][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
             echo "[US_TRADE_AFTERNOON][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES} INTERVAL_SEC=${INTERVAL_SEC}"
 
+            export US_SCHEDULE_EXPECTED_ET="1130"
+            export US_ACTUAL_START_ET="${{ steps.phase_guard.outputs.now_hhmmss }}"
+            export US_DELAY_SECONDS="${{ steps.phase_guard.outputs.delay_seconds }}"
+            export US_RUN_WINDOW="${{ steps.phase_guard.outputs.run_window }}"
+            export US_RECOVERY_RUN="${{ steps.phase_guard.outputs.recovery_run }}"
+            export US_MISSED_TRADE_WINDOW="0"
+
             RUN_MODE_FLAG="--run-mode ${US_RUN_MODE}"
             SIGNAL_ONLY_FLAG=""
             if [ "${US_SIGNAL_ONLY}" = "1" ]; then
@@ -812,7 +820,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          echo "[US_PNL][START] session=afternoon env=${KIS_ENV}"
+          echo "[US_PNL][START] session=afternoon env=${KIS_ENV}" | tee -a artifacts/${US_LOG_FILE}
           
           # PnL report는 항상 생성 시도 (실패해도 FAILED_PNL_REPORT 상태로 파일 생성)
           python scripts/generate_us_portfolio_pnl_report.py \
@@ -824,37 +832,97 @@ jobs:
               echo "::warning::US PnL report generation failed, but continuing"
             }
           
-          echo "[US_PNL][DONE]"
+          echo "[US_PNL][DONE]" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Validate US PnL report
         if: always()
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "[US_PNL_REPORT][VALIDATE][START] session=afternoon" | tee -a artifacts/${US_LOG_FILE}
           test -f reports/us_pnl/latest_us_pnl_report.json || {
-            echo "::error::missing US PnL report JSON"
+            echo "::error::missing US PnL report JSON" | tee -a artifacts/${US_LOG_FILE}
             exit 1
           }
           test -f reports/us_pnl/latest_us_pnl_report.md || {
-            echo "::error::missing US PnL report MD"
+            echo "::error::missing US PnL report MD" | tee -a artifacts/${US_LOG_FILE}
             exit 1
           }
           test -f reports/us_pnl/latest_us_pnl_report.csv || {
-            echo "::error::missing US PnL report CSV"
+            echo "::error::missing US PnL report CSV" | tee -a artifacts/${US_LOG_FILE}
+            exit 1
+          }
+          test -s reports/us_pnl/latest_us_pnl_report.md || {
+            echo "::error::empty US PnL report MD" | tee -a artifacts/${US_LOG_FILE}
             exit 1
           }
           
           # status가 FAILED_PNL_REPORT여도 파일은 있어야 한다
           pnl_status=$(python3 -c "import json; from pathlib import Path; print(json.loads(Path('reports/us_pnl/latest_us_pnl_report.json').read_text()).get('status', 'UNKNOWN'))")
-          echo "[US_PNL_REPORT][STATUS] ${pnl_status}"
+          echo "[US_PNL_REPORT][STATUS] ${pnl_status}" | tee -a artifacts/${US_LOG_FILE}
           
           if [[ "${pnl_status}" == "FAILED_PNL_REPORT" ]]; then
-            echo "::warning::US PnL report status is FAILED_PNL_REPORT, but files exist"
+            echo "::warning::US PnL report status is FAILED_PNL_REPORT, but files exist" | tee -a artifacts/${US_LOG_FILE}
           elif [[ "${pnl_status}" == "PARTIAL" ]]; then
-            echo "::warning::US PnL report status is PARTIAL (incomplete data)"
+            echo "::warning::US PnL report status is PARTIAL (incomplete data)" | tee -a artifacts/${US_LOG_FILE}
           else
-            echo "[US_PNL_REPORT][OK] status=${pnl_status}"
+            echo "[US_PNL_REPORT][OK] status=${pnl_status}" | tee -a artifacts/${US_LOG_FILE}
           fi
+          echo "[US_PNL_REPORT][VALIDATE][DONE] session=afternoon" | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Print US PnL report to console and summary
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+
+          PNL_MD="reports/us_pnl/latest_us_pnl_report.md"
+          PNL_JSON="reports/us_pnl/latest_us_pnl_report.json"
+          PNL_CSV="reports/us_pnl/latest_us_pnl_report.csv"
+
+          {
+            echo ""
+            echo "============================================================"
+            echo "[US_PNL_REPORT_MD][BEGIN]"
+            echo "workflow=${GITHUB_WORKFLOW}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "file=${PNL_MD}"
+            echo "============================================================"
+          } | tee -a "artifacts/${US_LOG_FILE}"
+
+          if [ -f "${PNL_MD}" ]; then
+            cat reports/us_pnl/latest_us_pnl_report.md | tee -a "artifacts/${US_LOG_FILE}"
+            {
+              echo ""
+              echo "## US PnL Report"
+              echo ""
+              echo "- workflow: ${GITHUB_WORKFLOW}"
+              echo "- run_id: ${GITHUB_RUN_ID}"
+              echo "- attempt: ${GITHUB_RUN_ATTEMPT}"
+              echo ""
+              cat "${PNL_MD}"
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "::warning::US PnL markdown not found: ${PNL_MD}" | tee -a "artifacts/${US_LOG_FILE}"
+            {
+              echo ""
+              echo "## US PnL Report"
+              echo ""
+              echo "PNL markdown missing: ${PNL_MD}"
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          {
+            echo "============================================================"
+            echo "[US_PNL_REPORT_MD][END]"
+            echo "json_exists=$([ -f "${PNL_JSON}" ] && echo 1 || echo 0)"
+            echo "csv_exists=$([ -f "${PNL_CSV}" ] && echo 1 || echo 0)"
+            echo "============================================================"
+            echo ""
+          } | tee -a "artifacts/${US_LOG_FILE}"
 
       - name: Upload US artifacts
         if: always()

@@ -174,6 +174,44 @@ def validate_report(
         fatals.append(f"final_status={final_status} is a fatal failure")
         return 1, fatals, warnings
 
+    pnl_dir = Path("reports/us_pnl")
+    pnl_json = pnl_dir / "latest_us_pnl_report.json"
+    pnl_md = pnl_dir / "latest_us_pnl_report.md"
+    pnl_csv = pnl_dir / "latest_us_pnl_report.csv"
+    for required_pnl in (pnl_json, pnl_md, pnl_csv):
+        if not required_pnl.exists():
+            fatals.append(f"pnl_file_missing path={required_pnl}")
+    if pnl_md.exists() and not pnl_md.read_text(encoding="utf-8").strip():
+        fatals.append(f"pnl_markdown_empty path={pnl_md}")
+
+    if payload.get("prep_status") == "OK" and int(payload.get("locked_watchlist_count", 0) or 0) == 0:
+        fatals.append("locked_watchlist_count_zero_under_prep_ok")
+
+    log_name = f"us-trade-{session}.log"
+    log_path = Path("artifacts") / log_name
+    if log_path.exists():
+        log_text = log_path.read_text(encoding="utf-8", errors="ignore")
+        for marker in ("[US_PNL_REPORT_MD][BEGIN]", "[US_PNL_REPORT_MD][END]"):
+            if marker not in log_text:
+                fatals.append(f"pnl_console_marker_missing marker={marker}")
+        if "avg_fill_price" in log_text:
+            fatals.append("runtime_sql_contains_avg_fill_price")
+        if "[US_RECONCILE][ACK_RECONCILE][INVALID_QTY]" in log_text:
+            fatals.append("balance_reconcile_invalid_qty_detected")
+
+    if pnl_json.exists():
+        try:
+            pnl_payload = json.loads(pnl_json.read_text())
+            pnl_status = str(pnl_payload.get("status", "UNKNOWN"))
+            if pnl_status not in {"OK", "PARTIAL", "FAILED_PNL_REPORT"}:
+                fatals.append(f"invalid_pnl_status={pnl_status}")
+            if pnl_payload.get("realized_pnl_source") not in {"db_fills_daily", "unavailable"}:
+                fatals.append("invalid_realized_pnl_source")
+            if pnl_payload.get("realized_pnl_source") != "unavailable" and pnl_payload.get("kis_account_realized_pnl_raw") == pnl_payload.get("realized_pnl_usd"):
+                fatals.append("realized_pnl_direct_from_kis_raw")
+        except Exception as exc:
+            fatals.append(f"pnl_json_parse_error err={exc}")
+
     if final_status in NO_TRADE_STATUSES:
         warnings.append(f"no_trade_day final_status={final_status}")
     elif final_status in WARNING_STATUSES:

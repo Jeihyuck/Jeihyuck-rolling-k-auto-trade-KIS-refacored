@@ -37,12 +37,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-# ── stdlib 로깅 설정 ────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    stream=sys.stdout,
-)
+from trader.us.utils.logging_utils import setup_us_logging_once
+
+setup_us_logging_once()
 logger = logging.getLogger("generate_us_pnl_report")
 
 # ── 경로 설정 ────────────────────────────────────────────────────────
@@ -154,7 +151,7 @@ def _normalize_kis_position(pos: dict) -> dict:
         symbol = _first_existing(enriched, ["symbol", "ovrs_pdno", "pdno", "code", "ticker"], default="")
         qty = _safe_int(_first_existing(enriched, ["qty", "quantity", "ovrs_cblc_qty", "hldg_qty", "cblc_qty", "ord_psbl_qty"], default=0))
         avg_price = _safe_float(_first_existing(enriched, ["avg_price", "average_price", "pchs_avg_pric", "frcr_pchs_avg_pric", "avg_buy_price", "avg_cost", "entry_price"], default=0.0))
-        last_price = _safe_float(_first_existing(enriched, ["last_price", "current", "current_price", "current_price_usd", "market_price", "now_price", "ovrs_now_pric", "ovrs_now_pric1", "prpr", "stck_prpr", "current_px"], default=0.0))
+        last_price = _safe_float(_first_existing(enriched, ["last_price", "current", "current_price", "current_price_usd", "market_price", "now_price", "now_price2", "now_pric2", "ovrs_now_pric", "ovrs_now_pric1", "ovrs_now_pric2", "ovrs_prpr", "prpr", "stck_prpr", "current_px"], default=0.0))
         normalized = {
             "symbol": str(symbol).strip().upper(),
             "qty": qty,
@@ -167,12 +164,12 @@ def _normalize_kis_position(pos: dict) -> dict:
     # KIS 전용 추가 필드 (market_value_usd, cost_usd)
     market_value_usd = _safe_float(_first_existing(
         enriched,
-        ["market_value_usd", "market_value", "ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt"],
+        ["market_value_usd", "market_value", "ovrs_stck_evlu_amt", "frcr_evlu_amt2", "ovrs_evlu_amt", "evlu_amt"],
         default=0.0,
     ))
     cost_usd = _safe_float(_first_existing(
         enriched,
-        ["cost_usd", "cost_basis_usd", "cost", "purchase_amount", "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1"],
+        ["cost_usd", "cost_basis_usd", "cost", "purchase_amount", "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1", "pchs_amt_smtl_amt", "ovrs_stck_pchs_amt"],
         default=0.0,
     ))
 
@@ -326,7 +323,7 @@ def _load_db_fills(engine, trade_date: str) -> list[dict]:
         cols = _get_table_columns(engine, "us_fills")
 
         # filled_price 후보 (price_usd 포함)
-        filled_price_candidates = ["filled_price", "fill_price", "avg_fill_price", "order_price", "price_usd", "price", "ft_ccld_unpr3", "ccld_unpr"]
+        filled_price_candidates = ["filled_price", "fill_price", "order_price", "price_usd", "price", "ft_ccld_unpr3", "ccld_unpr"]
         filled_price_col = next((c for c in filled_price_candidates if c in cols), None)
 
         # qty 후보 (schema-aware)
@@ -502,7 +499,7 @@ def generate_us_pnl_report(
                 logger.info("[US_PNL][POSITIONS][SOURCE] daily_report count=%d", len(positions))
         
         if not positions:
-            status = "PARTIAL"
+            status = "FAILED_PNL_REPORT"
             warnings.append("missing_position_source")
             logger.warning("[US_PNL][POSITIONS][MISSING] no valid source found — generating empty report")
         elif warnings:
@@ -542,8 +539,12 @@ def generate_us_pnl_report(
                 "current_price_usd",
                 "market_price",
                 "now_price",
+                "now_price2",
+                "now_pric2",
                 "ovrs_now_pric",
                 "ovrs_now_pric1",
+                "ovrs_now_pric2",
+                "ovrs_prpr",
                 "current_px",
             ],
             default=0.0,
@@ -551,12 +552,12 @@ def generate_us_pnl_report(
 
         market_value_raw = _safe_float(_first_existing(
             pos,
-            ["market_value_usd", "market_value", "ovrs_stck_evlu_amt", "frcr_evlu_amt2", "evlu_amt"],
+            ["market_value_usd", "market_value", "ovrs_stck_evlu_amt", "frcr_evlu_amt2", "ovrs_evlu_amt", "evlu_amt"],
             default=0.0,
         ))
         cost_raw = _safe_float(_first_existing(
             pos,
-            ["cost_usd", "cost_basis_usd", "cost", "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1"],
+            ["cost_usd", "cost_basis_usd", "cost", "pchs_amt", "frcr_pchs_amt", "frcr_pchs_amt1", "pchs_amt_smtl_amt", "ovrs_stck_pchs_amt"],
             default=0.0,
         ))
 
@@ -609,37 +610,6 @@ def generate_us_pnl_report(
     
     unrealized_pnl_pct = (unrealized_pnl_usd / total_cost_usd * 100.0) if total_cost_usd > 0 else 0.0
     
-    # realized PnL: KIS summary에서 우선 읽고, 없으면 계산 불가로 처리
-    _realized_candidates = [
-        "ovrs_rlzt_pfls_amt",
-        "ovrs_rlzt_pfls_amt2",
-        "rlzt_pfls",
-        "realized_pnl_usd",
-        "tot_evlu_pfls_amt",
-    ]
-    realized_pnl_usd = 0.0
-    _kis_summary = {}
-    if kis_balance and isinstance(kis_balance.get("summary"), dict):
-        _kis_summary = kis_balance["summary"]
-    elif kis_balance and isinstance(kis_balance.get("summary"), list) and kis_balance["summary"]:
-        _kis_summary = kis_balance["summary"][0] if isinstance(kis_balance["summary"][0], dict) else {}
-
-    _realized_from_kis = None
-    for _rk in _realized_candidates:
-        _rv = _kis_summary.get(_rk)
-        if _rv not in (None, "", 0, 0.0):
-            _realized_from_kis = _safe_float(_rv)
-            break
-
-    if _realized_from_kis is not None:
-        realized_pnl_usd = _realized_from_kis
-    else:
-        # KIS realized PNL 없음 — 매도금액을 손익으로 넣지 않음
-        warnings.append("realized_pnl_unavailable")
-    
-    total_pnl_usd = unrealized_pnl_usd + realized_pnl_usd
-
-    # missing_price_count > 0이면 PARTIAL로 강제
     block_normal_pnl_display = missing_price_count > 0
     if missing_price_count > 0:
         if status == "OK":
@@ -650,7 +620,80 @@ def generate_us_pnl_report(
             missing_price_count,
             missing_symbols,
         )
-    
+
+    # realized PnL: 전략 당일 DB fills 기준으로만 계산한다.
+    _realized_candidates = [
+        "ovrs_rlzt_pfls_amt",
+        "ovrs_rlzt_pfls_amt2",
+        "rlzt_pfls",
+        "realized_pnl_usd",
+        "tot_evlu_pfls_amt",
+    ]
+    realized_pnl_usd: float | None = None
+    realized_pnl_available = False
+    realized_pnl_source = "unavailable"
+    _kis_summary = {}
+    if kis_balance and isinstance(kis_balance.get("summary"), dict):
+        _kis_summary = kis_balance["summary"]
+    elif kis_balance and isinstance(kis_balance.get("summary"), list) and kis_balance["summary"]:
+        _kis_summary = kis_balance["summary"][0] if isinstance(kis_balance["summary"][0], dict) else {}
+
+    _realized_from_kis = None
+    _realized_from_kis_field = ""
+    for _rk in _realized_candidates:
+        _rv = _kis_summary.get(_rk)
+        if _rv not in (None, "", 0, 0.0):
+            _realized_from_kis = _safe_float(_rv)
+            _realized_from_kis_field = _rk
+            break
+
+    daily_buy_tracker: dict[str, dict[str, float]] = {}
+    daily_sell_tracker: dict[str, float] = {}
+    realized_total = 0.0
+    missing_realized_basis = False
+    has_sell_fill = False
+    for fill in db_fills:
+        symbol = str(fill.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        side = str(fill.get("side") or "").upper()
+        qty = _safe_int(fill.get("qty"))
+        price = _safe_float(_first_existing(fill, ["price_usd", "filled_price", "price"], default=0.0))
+        if qty <= 0 or price <= 0:
+            continue
+        if side == "BUY":
+            buy_row = daily_buy_tracker.setdefault(symbol, {"qty": 0.0, "cost": 0.0})
+            buy_row["qty"] += qty
+            buy_row["cost"] += qty * price
+            continue
+        if side != "SELL":
+            continue
+        has_sell_fill = True
+        buy_row = daily_buy_tracker.get(symbol, {"qty": 0.0, "cost": 0.0})
+        used_qty = daily_sell_tracker.get(symbol, 0.0)
+        available_qty = max(0.0, buy_row.get("qty", 0.0) - used_qty)
+        matched_qty = min(float(qty), available_qty)
+        if matched_qty <= 0 or buy_row.get("qty", 0.0) <= 0:
+            missing_realized_basis = True
+            continue
+        avg_cost = buy_row["cost"] / buy_row["qty"] if buy_row["qty"] > 0 else 0.0
+        realized_total += matched_qty * (price - avg_cost)
+        daily_sell_tracker[symbol] = used_qty + matched_qty
+
+    if has_sell_fill and not missing_realized_basis:
+        realized_pnl_available = True
+        realized_pnl_source = "db_fills_daily"
+        realized_pnl_usd = realized_total
+    else:
+        warnings.append("realized_pnl_unavailable")
+
+    total_pnl_display_policy = "unrealized_plus_daily_realized"
+    if realized_pnl_available:
+        total_pnl_usd = unrealized_pnl_usd + (realized_pnl_usd or 0.0)
+    else:
+        total_pnl_usd = unrealized_pnl_usd if not block_normal_pnl_display else None
+        total_pnl_display_policy = "unrealized_only_due_to_realized_unavailable"
+
     # ── report payload ────────────────────────────────────────────────
     payload = {
         "trade_date": trade_date,
@@ -666,12 +709,23 @@ def generate_us_pnl_report(
         "block_normal_pnl_display": block_normal_pnl_display,
         "fills_count": len(db_fills),
         "orders_sent_total": orders_sent_total,
+        "schedule_expected_et": (daily_report or {}).get("schedule_expected_et", ""),
+        "actual_start_et": (daily_report or {}).get("actual_start_et", ""),
+        "delay_seconds": (daily_report or {}).get("delay_seconds", 0),
+        "run_window": (daily_report or {}).get("run_window", ""),
+        "recovery_run": (daily_report or {}).get("recovery_run", 0),
+        "missed_trade_window": (daily_report or {}).get("missed_trade_window", False),
         "total_market_value_usd": round(total_market_value_usd, 2),
         "total_cost_usd": round(total_cost_usd, 2),
         "unrealized_pnl_usd": round(unrealized_pnl_usd, 2) if not block_normal_pnl_display else None,
         "unrealized_pnl_pct": round(unrealized_pnl_pct, 2) if not block_normal_pnl_display else None,
-        "realized_pnl_usd": round(realized_pnl_usd, 2),
-        "total_pnl_usd": round(total_pnl_usd, 2),
+        "realized_pnl_usd": round(realized_pnl_usd, 2) if realized_pnl_available and realized_pnl_usd is not None else None,
+        "realized_pnl_available": realized_pnl_available,
+        "realized_pnl_source": realized_pnl_source,
+        "kis_account_realized_pnl_raw": _realized_from_kis,
+        "kis_account_realized_pnl_raw_field": _realized_from_kis_field,
+        "total_pnl_usd": round(total_pnl_usd, 2) if total_pnl_usd is not None else None,
+        "total_pnl_display_policy": total_pnl_display_policy,
         "positions": position_list,
         "warnings": warnings,
         "generated_at": _now_ny().isoformat(),
@@ -717,8 +771,15 @@ def generate_us_pnl_report(
         f"- **Total Market Value**: {_fmt_usd(total_market_value_usd)}",
         f"- **Total Cost**: {_fmt_usd(total_cost_usd)}",
         f"- **Unrealized PnL**: {'N/A (missing prices)' if block_normal_pnl_display else f'{_fmt_usd(unrealized_pnl_usd)} ({_fmt_pct(unrealized_pnl_pct)})'}",
-        f"- **Realized PnL**: {_fmt_usd(realized_pnl_usd)}",
-        f"- **Total PnL**: {_fmt_usd(total_pnl_usd)}",
+        f"- **Daily Realized PnL**: {_fmt_usd(realized_pnl_usd) if realized_pnl_available and realized_pnl_usd is not None else 'N/A (daily sell fill cost basis unavailable)'}",
+        f"- **Total Strategy PnL**: {_fmt_usd(total_pnl_usd) if total_pnl_usd is not None else 'N/A'}",
+        f"- **KIS Account Realized Raw**: {(_fmt_usd(_realized_from_kis) if _realized_from_kis is not None else 'N/A')} (raw account field, not used in strategy PnL)",
+        f"- **Schedule Expected ET**: {(daily_report or {}).get('schedule_expected_et', '')}",
+        f"- **Actual Start ET**: {(daily_report or {}).get('actual_start_et', '')}",
+        f"- **Delay Seconds**: {(daily_report or {}).get('delay_seconds', 0)}",
+        f"- **Run Window**: {(daily_report or {}).get('run_window', '')}",
+        f"- **Recovery Run**: {(daily_report or {}).get('recovery_run', 0)}",
+        f"- **Missed Trade Window**: {(daily_report or {}).get('missed_trade_window', False)}",
         "",
     ]
     

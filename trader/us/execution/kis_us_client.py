@@ -498,8 +498,7 @@ class KisUSClient:
                 or "0"
             )
 
-            if existing_exchange == exchange:
-                # 같은 exchange → 중복 페이지 row → skip (합산 금지)
+            if existing_exchange == exchange and exchange:
                 logger.warning(
                     "[US_BALANCE][DUPLICATE_SYMBOL_SAME_EXCHANGE_SKIP]"
                     " symbol=%s exchange=%s existing_qty=%s duplicate_qty=%s",
@@ -509,18 +508,26 @@ class KisUSClient:
                     qty_raw,
                 )
                 continue
-
-            # 다른 exchange → cross-exchange 실제 보유 → 합산 허용
-            logger.warning(
-                "[US_BALANCE][DUPLICATE_SYMBOL_CROSS_EXCHANGE_MERGE]"
-                " symbol=%s existing_exchange=%s new_exchange=%s"
-                " existing_qty=%s new_qty=%s",
-                symbol,
-                existing_exchange,
-                exchange,
-                existing_qty_raw,
-                qty_raw,
-            )
+            if existing_exchange == exchange:
+                logger.warning(
+                    "[US_BALANCE][DUPLICATE_SYMBOL_NO_EXCHANGE_MERGE]"
+                    " symbol=%s existing_qty=%s duplicate_qty=%s",
+                    symbol,
+                    existing_qty_raw,
+                    qty_raw,
+                )
+            else:
+                # 다른 exchange → cross-exchange 실제 보유 → 합산 허용
+                logger.warning(
+                    "[US_BALANCE][DUPLICATE_SYMBOL_CROSS_EXCHANGE_MERGE]"
+                    " symbol=%s existing_exchange=%s new_exchange=%s"
+                    " existing_qty=%s new_qty=%s",
+                    symbol,
+                    existing_exchange,
+                    exchange,
+                    existing_qty_raw,
+                    qty_raw,
+                )
 
             # qty 합산
             qty_keys = ("ovrs_cblc_qty", "cblc_qty", "hldg_qty", "qty")

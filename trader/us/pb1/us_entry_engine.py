@@ -19,6 +19,8 @@ import os
 from datetime import datetime
 from typing import Any
 
+from trader.us.data_provider import USDataProvider  # test patch surface
+
 # US Explanation System
 from trader.us.pb1.us_explain import (
     build_us_entry_explanation,
