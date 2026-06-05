@@ -3259,13 +3259,19 @@ class KisAPI:
     def _inquire_balance_page(self, fk: str, nk: str) -> dict:
         """잔고 1페이지 호출(예외는 상위에서 처리)."""
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
+        meta = self._account_param_meta()
         tr_list = _pick_tr(self.env, "BALANCE")
         if not tr_list:
+            logger.error(
+                "[BALANCE][TR_MISSING] env=%s cano_len=%s acnt_prdt_cd_len=%s",
+                meta.get("env"),
+                meta.get("cano_len"),
+                meta.get("acnt_prdt_cd_len"),
+            )
             raise RuntimeError("BALANCE TR 미구성")
         tr = tr_list[0]
         ok, reason = self._validate_account_params()
         if not ok:
-            meta = self._account_param_meta()
             logger.error(
                 "[BALANCE][PARAM_INVALID] reason=%s env=%s cano_len=%s acnt_prdt_cd_len=%s cano=%s acnt_prdt_cd=%s",
                 reason,
@@ -3308,7 +3314,6 @@ class KisAPI:
         resp = self._safe_request("GET", url, headers=headers, params=params, timeout=(3.0, 7.0))
         payload = resp.json()
         if str(payload.get("rt_cd") or "") != "0":
-            meta = self._account_param_meta()
             logger.error(
                 "[BALANCE][API_FAIL] rt_cd=%s msg_cd=%s msg1=%s env=%s cano_len=%s acnt_prdt_cd_len=%s cano=%s acnt_prdt_cd=%s",
                 payload.get("rt_cd"),
@@ -3356,7 +3361,13 @@ class KisAPI:
             try:
                 j = self._inquire_balance_page(fk, nk)
             except Exception as e:
-                logger.error("[잔고조회 예외] %s", e)
+                logger.exception(
+                    "[BALANCE][PAGE_EXCEPTION] ctx_fk=%s ctx_nk=%s retry=%s/%s",
+                    str(fk or "")[:4],
+                    str(nk or "")[:4],
+                    empty_cnt,
+                    max_empty_retry,
+                )
                 last_error = e
                 if empty_cnt < max_empty_retry:
                     empty_cnt += 1
