@@ -564,7 +564,7 @@ jobs:
             echo "US_TRADE_STATUS=READY" >> "$GITHUB_ENV"
             echo "US_TRADE_RUNNER_BLOCK_REASON=" >> "$GITHUB_ENV"
           else
-            echo "[US_TRADE_AM][MIGRATION][FAIL] version=0043_us_fills_idempotency_and_order_reconcile_fix.sql reason=duplicate_us_fills" | tee -a artifacts/${US_LOG_FILE}
+            echo "[US_TRADE_AM][MIGRATION][FAIL] reason=db_migration_failed version=0043_us_fills_idempotency_and_order_reconcile_fix.sql" | tee -a artifacts/${US_LOG_FILE}
             echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
             echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
             echo "US_TRADE_RUNNER_BLOCK_REASON=db_migration_failed" >> "$GITHUB_ENV"

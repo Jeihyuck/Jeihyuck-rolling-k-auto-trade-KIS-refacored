@@ -1,14 +1,20 @@
 DO $$
 DECLARE
-    duplicate_count integer := 0;
-    deleted_count integer := 0;
+    v_dup_count integer := 0;
+    v_deleted_count integer := 0;
 BEGIN
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][START] table=us_fills index=uq_us_fills_idempotent';
-
     SELECT COUNT(*)
-    INTO duplicate_count
+    INTO v_dup_count
     FROM (
-        SELECT 1
+        SELECT
+            trade_date,
+            symbol,
+            side,
+            COALESCE(order_no, '') AS order_no_norm,
+            COALESCE(client_order_key, '') AS client_order_key_norm,
+            qty,
+            price_usd,
+            COUNT(*) AS cnt
         FROM us_fills
         GROUP BY
             trade_date,
@@ -19,9 +25,9 @@ BEGIN
             qty,
             price_usd
         HAVING COUNT(*) > 1
-    ) dup_keys;
+    ) d;
 
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][DUPLICATES] count=%', duplicate_count;
+    RAISE NOTICE '[DB][MIGRATE][DEDUP][START] table=us_fills index=uq_us_fills_idempotent duplicates=%', v_dup_count;
 
     WITH ranked AS (
         SELECT
@@ -49,10 +55,10 @@ BEGIN
         RETURNING 1
     )
     SELECT COUNT(*)
-    INTO deleted_count
+    INTO v_deleted_count
     FROM deleted;
 
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][DELETE] deleted=%', deleted_count;
+    RAISE NOTICE '[DB][MIGRATE][DEDUP][DELETE] deleted=%', v_deleted_count;
     RAISE NOTICE '[DB][MIGRATE][DEDUP][DONE] status=OK';
 
     ALTER TABLE us_fills

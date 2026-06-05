@@ -339,6 +339,11 @@ def _statement_mentions_index(statement: str, index_name: str) -> bool:
     return index_name.lower() in statement.lower()
 
 
+def _is_us_fills_index_create_failure(message: str) -> bool:
+    lowered = message.lower()
+    return "uniqueviolation" in lowered or "could not create unique index" in lowered
+
+
 def _is_unique_violation(exc: Exception) -> bool:
     if isinstance(exc, sa.exc.IntegrityError):
         return True
@@ -398,7 +403,7 @@ def _try_recover_us_fills_unique_violation(
     message = str(exc)
     if version != _US_FILLS_FIX_VERSION:
         return False
-    if not _is_unique_violation(exc):
+    if not _is_unique_violation(exc) and not _is_us_fills_index_create_failure(message):
         return False
     if _US_FILLS_IDEMPOTENT_INDEX not in message and not _statement_mentions_index(statement, _US_FILLS_IDEMPOTENT_INDEX):
         return False
