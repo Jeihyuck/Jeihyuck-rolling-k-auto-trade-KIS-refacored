@@ -2,6 +2,7 @@ import glob
 import re
 import logging
 import os
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy import Engine, text
@@ -15,6 +16,80 @@ from trader.db.engine import get_engine  # noqa: F401
 logger = logging.getLogger(__name__)
 
 _MIGRATION_GUARD: set[str] = set()
+
+_US_FILLS_FIX_VERSION = "0043_us_fills_idempotency_and_order_reconcile_fix.sql"
+_US_FILLS_IDEMPOTENT_INDEX = "uq_us_fills_idempotent"
+
+_US_FILLS_DUPLICATE_COUNT_SQL = text(
+    """
+    SELECT COUNT(*)
+    FROM (
+        SELECT 1
+        FROM us_fills
+        GROUP BY
+            trade_date,
+            symbol,
+            side,
+            COALESCE(order_no, ''),
+            COALESCE(client_order_key, ''),
+            qty,
+            price_usd
+        HAVING COUNT(*) > 1
+    ) dup_keys
+    """
+)
+
+_US_FILLS_DUPLICATE_KEYS_SQL = text(
+    """
+    SELECT
+        trade_date,
+        symbol,
+        side,
+        COALESCE(order_no, '') AS order_no,
+        COALESCE(client_order_key, '') AS client_order_key,
+        qty,
+        price_usd,
+        COUNT(*) AS duplicate_rows
+    FROM us_fills
+    GROUP BY
+        trade_date,
+        symbol,
+        side,
+        COALESCE(order_no, ''),
+        COALESCE(client_order_key, ''),
+        qty,
+        price_usd
+    HAVING COUNT(*) > 1
+    ORDER BY trade_date, symbol, side, order_no, client_order_key
+    """
+)
+
+_US_FILLS_DEDUP_SQL = text(
+    """
+    WITH ranked AS (
+        SELECT
+            ctid,
+            ROW_NUMBER() OVER (
+                PARTITION BY
+                    trade_date,
+                    symbol,
+                    side,
+                    COALESCE(order_no, ''),
+                    COALESCE(client_order_key, ''),
+                    qty,
+                    price_usd
+                ORDER BY
+                    COALESCE(updated_at, created_at, NOW()) DESC,
+                    ctid DESC
+            ) AS rn
+        FROM us_fills
+    )
+    DELETE FROM us_fills f
+    USING ranked r
+    WHERE f.ctid = r.ctid
+      AND r.rn > 1
+    """
+)
 
 def split_postgres_sql(sql: str) -> list[str]:
     statements: list[str] = []
@@ -260,6 +335,98 @@ def _should_ignore_pg_error(exc: Exception) -> bool:
     return False
 
 
+def _statement_mentions_index(statement: str, index_name: str) -> bool:
+    return index_name.lower() in statement.lower()
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    if isinstance(exc, sa.exc.IntegrityError):
+        return True
+
+    current: Any = exc
+    while current is not None:
+        class_name = current.__class__.__name__
+        if class_name == "UniqueViolation":
+            return True
+        current = getattr(current, "orig", None) or getattr(current, "__cause__", None)
+    return False
+
+
+def _log_us_fills_duplicate_keys(conn: sa.Connection) -> None:
+    rows = conn.execute(_US_FILLS_DUPLICATE_KEYS_SQL).fetchall()
+    for row in rows:
+        data = dict(row._mapping)
+        logger.warning(
+            "[DB][MIGRATE][DEDUP][DUPLICATE_KEY] trade_date=%s symbol=%s side=%s order_no=%s client_order_key=%s qty=%s price_usd=%s",
+            data.get("trade_date"),
+            data.get("symbol"),
+            data.get("side"),
+            data.get("order_no", ""),
+            data.get("client_order_key", ""),
+            data.get("qty"),
+            data.get("price_usd"),
+        )
+
+
+def _dedup_us_fills_for_idempotent_index(conn: sa.Connection, *, log_keys: bool = False) -> tuple[int, int]:
+    logger.info(
+        "[DB][MIGRATE][DEDUP][START] table=us_fills index=%s",
+        _US_FILLS_IDEMPOTENT_INDEX,
+    )
+    duplicate_count = int(conn.execute(_US_FILLS_DUPLICATE_COUNT_SQL).scalar() or 0)
+    logger.info("[DB][MIGRATE][DEDUP][DUPLICATES] count=%d", duplicate_count)
+    if log_keys and duplicate_count > 0:
+        _log_us_fills_duplicate_keys(conn)
+    deleted_count = int(conn.execute(_US_FILLS_DEDUP_SQL).rowcount or 0)
+    logger.info("[DB][MIGRATE][DEDUP][DELETE] deleted=%d", deleted_count)
+    logger.info("[DB][MIGRATE][DEDUP][DONE] status=OK")
+    return duplicate_count, deleted_count
+
+
+def _preflight_version(conn: sa.Connection, version: str) -> None:
+    if version == _US_FILLS_FIX_VERSION:
+        _dedup_us_fills_for_idempotent_index(conn)
+
+
+def _try_recover_us_fills_unique_violation(
+    conn: sa.Connection,
+    *,
+    version: str,
+    statement: str,
+    exc: Exception,
+) -> bool:
+    message = str(exc)
+    if version != _US_FILLS_FIX_VERSION:
+        return False
+    if not _is_unique_violation(exc):
+        return False
+    if _US_FILLS_IDEMPOTENT_INDEX not in message and not _statement_mentions_index(statement, _US_FILLS_IDEMPOTENT_INDEX):
+        return False
+
+    logger.warning(
+        "[DB][MIGRATE][FAIL_RECOVERABLE] version=%s index=%s reason=duplicate_us_fills",
+        version,
+        _US_FILLS_IDEMPOTENT_INDEX,
+    )
+    _dedup_us_fills_for_idempotent_index(conn, log_keys=True)
+    logger.info(
+        "[DB][MIGRATE][DEDUP][RETRY_INDEX] index=%s",
+        _US_FILLS_IDEMPOTENT_INDEX,
+    )
+    logger.info(
+        "[DB][MIGRATE][INDEX][CREATE] index=%s",
+        _US_FILLS_IDEMPOTENT_INDEX,
+    )
+    with conn.begin_nested():
+        _apply_pg_statement(conn, statement)
+    logger.info(
+        "[DB][MIGRATE][INDEX][OK] index=%s",
+        _US_FILLS_IDEMPOTENT_INDEX,
+    )
+    logger.info("[DB][MIGRATE][RECOVERED] version=%s", version)
+    return True
+
+
 def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
     if _should_skip_migrations(engine, migrations_dir):
         return
@@ -290,22 +457,36 @@ def run_migrations(engine: Engine, migrations_dir: str = "migrations") -> None:
             sql = path.read_text(encoding="utf-8")
             logger.info("[DB][MIGRATE][APPLY] version=%s", version)
             try:
+                _preflight_version(conn, version)
                 statements = split_postgres_sql(sql)
                 for statement in statements:
                     try:
-                        _apply_pg_statement(conn, statement)
+                        if _statement_mentions_index(statement, _US_FILLS_IDEMPOTENT_INDEX):
+                            logger.info(
+                                "[DB][MIGRATE][INDEX][CREATE] index=%s",
+                                _US_FILLS_IDEMPOTENT_INDEX,
+                            )
+                        with conn.begin_nested():
+                            _apply_pg_statement(conn, statement)
+                        if _statement_mentions_index(statement, _US_FILLS_IDEMPOTENT_INDEX):
+                            logger.info(
+                                "[DB][MIGRATE][INDEX][OK] index=%s",
+                                _US_FILLS_IDEMPOTENT_INDEX,
+                            )
                     except Exception as exc:
+                        if _try_recover_us_fills_unique_violation(
+                            conn,
+                            version=version,
+                            statement=statement,
+                            exc=exc,
+                        ):
+                            continue
                         logger.exception(
                             "[DB][MIGRATE][FAIL] version=%s statement=%s err=%s",
                             version,
                             statement,
                             exc,
                         )
-                        try:
-                            conn.rollback()
-                            logger.info("[DB][MIGRATE][ROLLBACK] version=%s", version)
-                        except Exception:
-                            logger.exception("[DB][MIGRATE][ROLLBACK_FAIL] version=%s", version)
                         raise
                 conn.execute(
                     text("INSERT INTO schema_migrations(version) VALUES (:version)"),

@@ -31,6 +31,16 @@ def has_success_end(log: str) -> bool:
     )
 
 
+def has_trigger_event(log: str, event_name: str) -> bool:
+    return bool(re.search(rf"\[US_TRADE_AM\]\[TRIGGER\] event={event_name}\b", log))
+
+
+def has_final_status(log: str, status: str, reason: str | None = None) -> bool:
+    if reason:
+        return bool(re.search(rf"\[US_TRADE_AM\]\[FINAL_STATUS\] status={status} .*reason={reason}\b", log))
+    return bool(re.search(rf"\[US_TRADE_AM\]\[FINAL_STATUS\] status={status}\b", log))
+
+
 def test_am_phase_guard_skip_success():
     """Phase guard skip should be recognized as success."""
     log = """
@@ -105,3 +115,40 @@ def test_am_max_ticks_success():
     """
     assert has_success_end(log) is True
     assert has_fatal_am_error(log) is False
+
+
+def test_am_manual_trigger_contract():
+    log = """
+    [US_TRADE_AM][TRIGGER] event=workflow_dispatch actor=tester run_id=10 attempt=1
+    [US_TRADE_AM][PHASE_GUARD] should_run=1 run_window=manual_trade recovery_run=0 session_window=0930-1230
+    [US_TRADE_AM][RUN_MODE] run_mode=TRADE signal_only=0 order_allowed=1 kis_order_allowed=1
+    [US_TRADE_AM][MIGRATION][OK]
+    [US_TRADE_AM][TRADE_RUNNER][START]
+    """
+    assert has_trigger_event(log, "workflow_dispatch") is True
+    assert "run_window=manual_trade" in log
+    assert "[US_TRADE_AM][TRADE_RUNNER][START]" in log
+
+
+def test_am_schedule_trigger_contract():
+    log = """
+    [US_TRADE_AM][TRIGGER] event=schedule actor=github-actions run_id=11 attempt=2
+    [US_TRADE_AM][START_META] schedule_expected=0815 actual_start=081531 delay_seconds=31 event=schedule
+    [US_TRADE_AM][PHASE_GUARD] should_run=1 run_window=scheduled_trade recovery_run=0 session_window=0930-1230
+    [US_SESSION_LOCK][ACQUIRE] trade_date=2026-06-05 session=am env=practice status=OK
+    """
+    assert has_trigger_event(log, "schedule") is True
+    assert "schedule_expected=0815" in log
+    assert "run_window=scheduled_trade" in log
+
+
+def test_am_migration_failure_and_pnl_do_not_mix():
+    log = """
+    [US_TRADE_AM][MIGRATION][FAIL] version=0043_us_fills_idempotency_and_order_reconcile_fix.sql reason=duplicate_us_fills
+    [US_TRADE_AM][TRADE_RUNNER][SKIP] reason=db_migration_failed
+    [US_TRADE_AM][FINAL_STATUS] status=FAILED trade_runner_started=0 orders_sent=0 reason=db_migration_failed
+    [US_PNL][FINAL_STATUS] status=OK_WITH_WARNINGS source=db_snapshot
+    [US_WORKFLOW][FINAL_STATUS] status=FAILED_AM_TRADE_PNL_ONLY
+    """
+    assert has_final_status(log, "FAILED", "db_migration_failed") is True
+    assert "[US_WORKFLOW][FINAL_STATUS] status=FAILED_AM_TRADE_PNL_ONLY" in log

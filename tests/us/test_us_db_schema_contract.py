@@ -7,6 +7,7 @@ import pathlib
 
 REPOS_PATH = pathlib.Path("trader/us/db/repos.py")
 MIGRATION_PATH = pathlib.Path("migrations/0038_us_agent_tables.sql")
+MIGRATION_0043_PATH = pathlib.Path("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql")
 
 
 def _read(path):
@@ -15,6 +16,7 @@ def _read(path):
 
 def test_migration_exists():
     assert MIGRATION_PATH.exists()
+    assert MIGRATION_0043_PATH.exists()
 
 
 def test_repos_uses_qty_requested():
@@ -106,3 +108,17 @@ def test_migration_has_us_prefix_tables_only():
     tables = re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", sql)
     for t in tables:
         assert t.startswith("us_"), f"migration에 us_* 아닌 테이블 {t!r}이 있다"
+
+
+def test_0043_has_us_fills_dedup_before_unique_index():
+    sql = _read(MIGRATION_0043_PATH)
+    assert "WITH ranked AS" in sql
+    assert "DELETE FROM us_fills" in sql
+    assert "[DB][MIGRATE][DEDUP][DONE] status=OK" in sql
+    assert sql.index("WITH ranked AS") < sql.index("CREATE UNIQUE INDEX IF NOT EXISTS uq_us_fills_idempotent")
+
+
+def test_0043_adds_fill_idempotency_key_unique_index():
+    sql = _read(MIGRATION_0043_PATH)
+    assert "ADD COLUMN IF NOT EXISTS fill_idempotency_key TEXT" in sql
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_us_fills_idempotency_key" in sql

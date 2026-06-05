@@ -26,13 +26,16 @@ GitHub concurrency는 보조 장치일 뿐이다. 이 DB lock이 주요 중복 �
         raise
 
 상태값:
-    RUNNING         — 실행 중
-    DONE            — 정상 완료
+    RUNNING           — 실행 중
+    DONE              — 정상 완료
+    FAILED_RETRYABLE  — 재시도 가능한 실패
+    FAILED_FINAL      — 재시도 불가 실패
+    CANCELLED         — 취소됨
     DONE_WITH_WARNINGS — 경고 포함 완료
     SKIP_PHASE_WINDOW  — phase window 밖이어서 skip
     SKIP_STALE         — 늦게 시작해서 주문 금지
     SKIP_MARKET_CLOSED — 시장 닫힘
-    FAILED          — 오류 종료
+    FAILED             — 구버전 호환용 실패
 """
 from __future__ import annotations
 
@@ -50,6 +53,9 @@ _STALE_RUNNING_THRESHOLD_HOURS = 6
 _VALID_STATUSES = frozenset({
     "RUNNING",
     "DONE",
+    "FAILED_RETRYABLE",
+    "FAILED_FINAL",
+    "CANCELLED",
     "DONE_WITH_WARNINGS",
     "SKIP_PHASE_WINDOW",
     "SKIP_STALE",
@@ -97,6 +103,10 @@ def claim_us_session_lock(
         )
         return True, None
 
+    lock_metadata = metadata or {}
+    event_name = str(lock_metadata.get("event_name") or "")
+    manual_confirm_ok = bool(lock_metadata.get("manual_confirm_ok", False))
+
     try:
         with engine.begin() as conn:
             result = conn.execute(
@@ -127,6 +137,12 @@ def claim_us_session_lock(
 
         if row is not None:
             # INSERT 성공 — lock 획득
+            logger.info(
+                "[US_SESSION_LOCK][ACQUIRE] trade_date=%s session=%s env=%s status=OK",
+                trade_date_str,
+                session,
+                env,
+            )
             logger.info(
                 "[US_SESSION_LOCK][CLAIM_OK] market=US env=%s trade_date=%s session=%s run_id=%s",
                 env, trade_date_str, session, github_run_id or "local",
@@ -164,6 +180,39 @@ def claim_us_session_lock(
                 )
                 return False, existing
 
+        if (
+            existing_status in {"FAILED_RETRYABLE", "CANCELLED", "FAILED"}
+            and event_name == "workflow_dispatch"
+            and manual_confirm_ok
+        ):
+            logger.info(
+                "[US_SESSION_LOCK][ALLOW_MANUAL_RETRY] previous_status=%s",
+                existing_status,
+            )
+            if _take_over_existing_lock(
+                env=env,
+                trade_date_str=trade_date_str,
+                session=session,
+                github_run_id=github_run_id,
+                github_workflow=github_workflow,
+                github_run_attempt=github_run_attempt,
+                metadata=lock_metadata,
+            ):
+                logger.info(
+                    "[US_SESSION_LOCK][ACQUIRE] trade_date=%s session=%s env=%s status=OK",
+                    trade_date_str,
+                    session,
+                    env,
+                )
+                return True, existing
+
+        logger.info(
+            "[US_SESSION_LOCK][SKIP_DUPLICATE] trade_date=%s session=%s env=%s existing_status=%s",
+            trade_date_str,
+            session,
+            env,
+            existing_status,
+        )
         logger.info(
             "[US_SESSION_LOCK][DUPLICATE_SKIP] market=US env=%s trade_date=%s "
             "session=%s existing_status=%s existing_run_id=%s",
@@ -194,7 +243,8 @@ def finish_us_session_lock(
 
     Args:
         status: "DONE" | "DONE_WITH_WARNINGS" | "SKIP_PHASE_WINDOW" |
-                "SKIP_STALE" | "SKIP_MARKET_CLOSED" | "FAILED"
+            "SKIP_STALE" | "SKIP_MARKET_CLOSED" | "FAILED_RETRYABLE" |
+            "FAILED_FINAL" | "CANCELLED" | "FAILED"
     """
     from sqlalchemy import text as sa_text
 
@@ -249,11 +299,70 @@ def finish_us_session_lock(
             "[US_SESSION_LOCK][FINISH_OK] env=%s trade_date=%s session=%s status=%s reason=%s",
             env, trade_date_str, session, status, reason,
         )
+        logger.info("[US_SESSION_LOCK][RELEASE] status=%s", status)
     except Exception as exc:
         logger.warning(
             "[US_SESSION_LOCK][FINISH_ERROR] env=%s session=%s error=%s",
             env, session, exc,
         )
+
+
+def _take_over_existing_lock(
+    *,
+    env: str,
+    trade_date_str: str,
+    session: str,
+    github_run_id: str | None,
+    github_workflow: str | None,
+    github_run_attempt: str | None,
+    metadata: dict | None,
+) -> bool:
+    from sqlalchemy import text as sa_text
+
+    meta_json = json.dumps(metadata or {}, default=str)
+    try:
+        engine = _get_engine()
+        with engine.begin() as conn:
+            result = conn.execute(
+                sa_text("""
+                    UPDATE us_session_locks
+                    SET
+                        status = 'RUNNING',
+                        result_status = 'RUNNING',
+                        reason = '',
+                        github_run_id = :run_id,
+                        github_workflow = :workflow,
+                        github_run_attempt = :attempt,
+                        started_at = NOW(),
+                        finished_at = NULL,
+                        updated_at = NOW(),
+                        metadata = COALESCE(metadata, '{}'::jsonb) || :metadata::jsonb
+                    WHERE market = 'US'
+                      AND env = :env
+                      AND trade_date = :trade_date
+                      AND session = :session
+                      AND status IN ('FAILED_RETRYABLE', 'CANCELLED', 'FAILED')
+                """),
+                {
+                    "run_id": github_run_id or "",
+                    "workflow": github_workflow or "",
+                    "attempt": github_run_attempt or "1",
+                    "metadata": meta_json,
+                    "env": env,
+                    "trade_date": trade_date_str,
+                    "session": session,
+                },
+            )
+        return int(result.rowcount or 0) > 0
+    except Exception as exc:
+        logger.warning(
+            "[US_SESSION_LOCK][TAKEOVER_FAIL] env=%s trade_date=%s session=%s error=%s",
+            env,
+            trade_date_str,
+            session,
+            exc,
+        )
+        return False
 
 
 def _fetch_existing_lock(env: str, trade_date_str: str, session: str) -> dict | None:
@@ -265,7 +374,7 @@ def _fetch_existing_lock(env: str, trade_date_str: str, session: str) -> dict | 
         with engine.connect() as conn:
             row = conn.execute(
                 sa_text("""
-                    SELECT id, status, github_run_id, started_at, finished_at, reason
+                                        SELECT id, status, github_run_id, started_at, finished_at, reason, metadata
                     FROM us_session_locks
                     WHERE market = 'US' AND env = :env
                       AND trade_date = :trade_date AND session = :session

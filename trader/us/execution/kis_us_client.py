@@ -215,6 +215,7 @@ class KisUSClient:
         merged_output1: list[dict] = []
         exchange_result_counts: dict[str, int] = {}
         raw_by_exchange: dict[str, Any] = {}
+        failed_exchanges: dict[str, str] = {}
         merged_output2: dict = {}
         
         for exchange_code in exchanges:
@@ -259,17 +260,20 @@ class KisUSClient:
                     exc,
                 )
                 exchange_result_counts[exchange_code] = 0
+                failed_exchanges[exchange_code] = str(exc)
                 # 일부 거래소 실패 시 계속 진행 (다른 거래소 결과가 있으면 OK)
                 continue
         
         # symbol 중복 병합
+        raw_count = sum(exchange_result_counts.values())
         merged_output1 = self._merge_duplicate_symbols(merged_output1)
+        duplicate_skipped = max(0, raw_count - len(merged_output1))
         
-        total_count = sum(exchange_result_counts.values())
         logger.info(
-            "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d symbols=%s",
-            total_count,
+            "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
+            raw_count,
             len(merged_output1),
+            duplicate_skipped,
             ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
         )
         
@@ -280,6 +284,9 @@ class KisUSClient:
             "queried_exchanges": exchanges,
             "exchange_result_counts": exchange_result_counts,
             "raw_by_exchange": raw_by_exchange,
+            "failed_exchanges": failed_exchanges,
+            "raw_count": raw_count,
+            "duplicate_skipped": duplicate_skipped,
         }
     
     def _get_us_balance_single_exchange(

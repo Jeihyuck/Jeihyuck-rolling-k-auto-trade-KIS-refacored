@@ -55,6 +55,18 @@ def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
     )
 
 
+def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
+    price_usd = float(fill.get("price_usd") or fill.get("price") or 0.0)
+    qty = int(fill.get("qty", 0) or 0)
+    order_no = str(fill.get("order_no") or "")
+    client_order_key = str(fill.get("client_order_key") or "")
+    symbol = str(fill.get("symbol") or "").strip().upper()
+    side = str(fill.get("side") or "").strip().upper()
+    return (
+        f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{qty}|{price_usd}"
+    )
+
+
 def reset_memory_stores() -> None:
     """테스트용 메모리 스토어 초기화."""
     global _MEM_WATCHLIST, _MEM_INTENTS, _MEM_ORDERS, _MEM_FILLS, _MEM_POSITIONS, _MEM_RECONCILE_LOGS
@@ -425,8 +437,18 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
             key = _us_fill_idempotency_key(f, td)
             if key in existing_keys:
                 skipped_duplicates += 1
+                for existing_fill in _MEM_FILLS:
+                    if _us_fill_idempotency_key(existing_fill, td) == key:
+                        existing_fill["updated_at"] = time.time()
+                        existing_fill["fill_idempotency_key"] = _us_fill_idempotency_key_text(existing_fill, td)
+                        break
                 continue
-            _MEM_FILLS.append({**f, "trade_date": td})
+            _MEM_FILLS.append({
+                **f,
+                "trade_date": td,
+                "fill_idempotency_key": _us_fill_idempotency_key_text(f, td),
+                "updated_at": time.time(),
+            })
             existing_keys.add(key)
             inserted += 1
         logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
@@ -441,10 +463,12 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                     text("""
                         INSERT INTO us_fills
                             (trade_date, symbol, exchange, side, qty, price_usd,
-                             order_no, client_order_key, filled_at, meta)
+                             order_no, client_order_key, filled_at, meta, fill_idempotency_key)
                         VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
-                                :order_no, :cok, :filled_at, CAST(:meta AS jsonb))
-                        ON CONFLICT DO NOTHING
+                                :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
+                        ON CONFLICT (fill_idempotency_key)
+                        DO UPDATE SET
+                            updated_at = NOW()
                     """),
                     {
                         "td": td,
@@ -457,6 +481,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         "cok": f.get("client_order_key", ""),
                         "filled_at": f.get("filled_at"),
                         "meta": _json_param(f.get("meta")),
+                        "fill_idempotency_key": _us_fill_idempotency_key_text(f, td),
                     },
                 )
                 if int(result.rowcount or 0) > 0:

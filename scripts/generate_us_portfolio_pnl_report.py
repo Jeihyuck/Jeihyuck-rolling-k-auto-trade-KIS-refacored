@@ -68,6 +68,13 @@ def _safe_int(v: Any) -> int:
         return 0
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 def _fmt_usd(v: float) -> str:
     """USD 포맷: +1,234.56"""
     sign = "+" if v >= 0 else ""
@@ -216,10 +223,42 @@ def _load_kis_balance(env: str) -> dict | None:
         elif not isinstance(positions, list):
             positions = []
 
+        queried_exchanges = list(raw.get("queried_exchanges") or [])
+        raw_by_exchange = raw.get("raw_by_exchange") or {}
+        failed_exchanges = raw.get("failed_exchanges") or {}
+        success_exchanges = [exchange for exchange in queried_exchanges if exchange in raw_by_exchange]
+        failed_exchange_list = [exchange for exchange in queried_exchanges if exchange in failed_exchanges]
+        raw_count = _safe_int(raw.get("raw_count") or sum((raw.get("exchange_result_counts") or {}).values()))
+        duplicate_skipped = _safe_int(raw.get("duplicate_skipped") or max(0, raw_count - len(positions)))
+
         # KIS 필드 정규화
         normalized = [_normalize_kis_position(p) for p in positions]
         # symbol이 비어 있거나 qty=0인 항목 필터링
         normalized = [p for p in normalized if p["symbol"] and p["qty"] > 0]
+
+        if not success_exchanges:
+            kis_balance_status = "FAILED_ALL_EXCHANGES"
+            logger.warning(
+                "[US_BALANCE][FAILED_ALL_EXCHANGES] exchanges=%s reason=%s",
+                ",".join(queried_exchanges),
+                ",".join(f"{exchange}:{failed_exchanges.get(exchange, 'api_error')}" for exchange in queried_exchanges) or "api_error",
+            )
+        elif failed_exchange_list:
+            kis_balance_status = "PARTIAL"
+            logger.warning(
+                "[US_BALANCE][PARTIAL] success=%s failed=%s",
+                ",".join(success_exchanges),
+                ",".join(failed_exchange_list),
+            )
+        else:
+            kis_balance_status = "OK"
+
+        logger.info(
+            "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d",
+            raw_count,
+            len(normalized),
+            duplicate_skipped,
+        )
 
         logger.info("[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d", len(positions), len(normalized))
 
@@ -227,6 +266,13 @@ def _load_kis_balance(env: str) -> dict | None:
             "raw": raw,
             "positions": normalized,
             "summary": raw.get("output2", {}),
+            "queried_exchanges": queried_exchanges,
+            "success_exchanges": success_exchanges,
+            "failed_exchanges": failed_exchanges,
+            "kis_balance_status": kis_balance_status,
+            "raw_count": raw_count,
+            "unique_symbols": len(normalized),
+            "duplicate_skipped": duplicate_skipped,
         }
     except Exception as exc:
         logger.warning("[US_PNL][KIS_BALANCE][FAIL] err=%s", exc)
@@ -429,6 +475,27 @@ def generate_us_pnl_report(
     warnings = []
     status = "OK"
     kis_balance = None  # always defined for realized PNL extraction
+    event_name = os.getenv("US_EVENT_NAME") or os.getenv("GITHUB_EVENT_NAME", "")
+    run_attempt = os.getenv("US_RUN_ATTEMPT") or os.getenv("GITHUB_RUN_ATTEMPT", "")
+    actor = os.getenv("US_ACTOR") or os.getenv("GITHUB_ACTOR", "")
+    schedule_expected_et = os.getenv("US_SCHEDULE_EXPECTED_ET", "")
+    actual_start_et = os.getenv("US_ACTUAL_START_ET", "")
+    delay_seconds = _safe_int(os.getenv("US_DELAY_SECONDS", "0"))
+    run_window = os.getenv("US_RUN_WINDOW", "")
+    recovery_run = _safe_int(os.getenv("US_RECOVERY_RUN", "0"))
+    trade_status_env = os.getenv("US_TRADE_STATUS", "")
+    trade_runner_started_env = _safe_int(os.getenv("US_TRADE_RUNNER_STARTED", "0"))
+    trade_runner_block_reason_env = os.getenv("US_TRADE_RUNNER_BLOCK_REASON", "")
+    order_allowed_env = _safe_int(os.getenv("US_ORDER_ALLOWED", "0"))
+    kis_order_allowed_env = _safe_int(os.getenv("US_KIS_ORDER_ALLOWED", "0"))
+    orders_sent_env = _safe_int(os.getenv("US_ORDERS_SENT", "0"))
+    dry_run_env = _env_bool("US_DRY_RUN", _env_bool("DRY_RUN", True))
+    offline_mode_env = _env_bool("US_OFFLINE_MODE", False)
+    kis_balance_status = "UNKNOWN"
+    pnl_position_source = "unknown"
+    kis_balance_raw_rows = 0
+    kis_balance_unique_symbols = 0
+    kis_balance_duplicate_rows_skipped = 0
 
     # ── no-trade final_status 처리 ─────────────────────────────────────
     NO_TRADE_STATUSES = {
@@ -462,6 +529,12 @@ def generate_us_pnl_report(
             kis_balance = _load_kis_balance(env)
             if kis_balance is None:
                 warnings.append("kis_balance_unavailable")
+                kis_balance_status = "FAILED_ALL_EXCHANGES"
+            else:
+                kis_balance_status = str(kis_balance.get("kis_balance_status") or "UNKNOWN")
+                kis_balance_raw_rows = _safe_int(kis_balance.get("raw_count"))
+                kis_balance_unique_symbols = _safe_int(kis_balance.get("unique_symbols"))
+                kis_balance_duplicate_rows_skipped = _safe_int(kis_balance.get("duplicate_skipped"))
         
         db_positions = []
         db_fills = []
@@ -482,11 +555,14 @@ def generate_us_pnl_report(
         if kis_balance and kis_balance.get("positions"):
             positions = kis_balance["positions"]
             data_source = "kis_balance"
+            pnl_position_source = "kis_balance"
             logger.info("[US_PNL][POSITIONS][SOURCE] kis_balance count=%d", len(positions))
         elif db_positions:
             positions = db_positions
             data_source = "db_snapshot"
-            logger.info("[US_PNL][POSITIONS][SOURCE] db_snapshot count=%d", len(positions))
+            pnl_position_source = "db_snapshot"
+            fallback_reason = "kis_balance_unavailable" if "kis_balance_unavailable" in warnings else "kis_balance_partial"
+            logger.warning("[US_PNL][POSITIONS][SOURCE] db_snapshot fallback_reason=%s", fallback_reason)
         elif daily_report and daily_report.get("positions"):
             # daily_report의 positions가 단순 개수일 수도 있으므로 주의
             pos_count = daily_report.get("positions", 0)
@@ -496,6 +572,7 @@ def generate_us_pnl_report(
             else:
                 positions = daily_report.get("positions", [])
                 data_source = "daily_report"
+                pnl_position_source = "daily_report"
                 logger.info("[US_PNL][POSITIONS][SOURCE] daily_report count=%d", len(positions))
         
         if not positions:
@@ -503,13 +580,15 @@ def generate_us_pnl_report(
             warnings.append("missing_position_source")
             logger.warning("[US_PNL][POSITIONS][MISSING] no valid source found — generating empty report")
         elif warnings:
-            status = "PARTIAL"
+            status = "OK_WITH_WARNINGS"
 
         orders_sent_total = 0
         if daily_report:
             orders_sent_total = daily_report.get("orders_sent_total", 0)
             if orders_sent_total == 0:
                 orders_sent_total = daily_report.get("orders_sent", 0)
+    if orders_sent_env > 0:
+        orders_sent_total = orders_sent_env
     
     #  ── orders_sent_total (no-trade 브랜치에서 이미 설정됨) ──────────────────
     # (already set in the branch above — do not overwrite)
@@ -613,7 +692,7 @@ def generate_us_pnl_report(
     block_normal_pnl_display = missing_price_count > 0
     if missing_price_count > 0:
         if status == "OK":
-            status = "PARTIAL"
+            status = "OK_WITH_WARNINGS"
         warnings.append(f"PRICE_MISSING missing_count={missing_price_count} symbols={','.join(missing_symbols)}")
         logger.warning(
             "[US_PNL][PRICE_MISSING] missing_count=%d symbols=%s — status forced to PARTIAL",
@@ -694,26 +773,68 @@ def generate_us_pnl_report(
         total_pnl_usd = unrealized_pnl_usd if not block_normal_pnl_display else None
         total_pnl_display_policy = "unrealized_only_due_to_realized_unavailable"
 
+    if kis_balance_status == "FAILED_ALL_EXCHANGES" and pnl_position_source == "db_snapshot":
+        if status == "OK":
+            status = "OK_WITH_WARNINGS"
+        warnings.extend(["kis_balance_unavailable", "pnl_generated_from_db_snapshot"])
+    elif kis_balance_status == "PARTIAL":
+        if status == "OK":
+            status = "OK_WITH_WARNINGS"
+        warnings.append("kis_balance_partial")
+
+    trade_status = trade_status_env or (daily_report or {}).get("trade_status") or (daily_report or {}).get("final_status") or "UNKNOWN"
+    trade_runner_started = (
+        trade_runner_started_env
+        if os.getenv("US_TRADE_RUNNER_STARTED") is not None
+        else _safe_int((daily_report or {}).get("trade_runner_started", 0))
+    )
+    trade_runner_block_reason = trade_runner_block_reason_env or (daily_report or {}).get("trade_block_reason") or (daily_report or {}).get("reason") or ""
+    if not schedule_expected_et:
+        schedule_expected_et = str((daily_report or {}).get("schedule_expected_et", ""))
+    if not actual_start_et:
+        actual_start_et = str((daily_report or {}).get("actual_start_et", ""))
+    if delay_seconds == 0:
+        delay_seconds = _safe_int((daily_report or {}).get("delay_seconds", 0))
+    if not run_window:
+        run_window = str((daily_report or {}).get("run_window", ""))
+    if recovery_run == 0:
+        recovery_run = _safe_int((daily_report or {}).get("recovery_run", 0))
+
     # ── report payload ────────────────────────────────────────────────
     payload = {
         "trade_date": trade_date,
         "session": session,
         "run_id": run_id,
+        "run_attempt": run_attempt,
+        "actor": actor,
+        "event_name": event_name,
         "env": env,
-        "dry_run": os.getenv("DRY_RUN", "1") == "1",
+        "dry_run": dry_run_env,
+        "offline_mode": offline_mode_env,
         "source": data_source,
         "status": status,
+        "pnl_status": status,
+        "trade_status": trade_status,
+        "trade_runner_started": trade_runner_started,
+        "trade_runner_block_reason": trade_runner_block_reason,
+        "order_allowed": order_allowed_env,
+        "kis_order_allowed": kis_order_allowed_env,
+        "pnl_position_source": pnl_position_source,
+        "kis_balance_status": kis_balance_status,
+        "kis_balance_raw_rows": kis_balance_raw_rows,
+        "kis_balance_unique_symbols": kis_balance_unique_symbols,
+        "kis_balance_duplicate_rows_skipped": kis_balance_duplicate_rows_skipped,
         "positions_count": len(positions),
         "missing_price_count": missing_price_count,
         "missing_symbols": missing_symbols,
         "block_normal_pnl_display": block_normal_pnl_display,
         "fills_count": len(db_fills),
         "orders_sent_total": orders_sent_total,
-        "schedule_expected_et": (daily_report or {}).get("schedule_expected_et", ""),
-        "actual_start_et": (daily_report or {}).get("actual_start_et", ""),
-        "delay_seconds": (daily_report or {}).get("delay_seconds", 0),
-        "run_window": (daily_report or {}).get("run_window", ""),
-        "recovery_run": (daily_report or {}).get("recovery_run", 0),
+        "schedule_expected_et": schedule_expected_et,
+        "actual_start_et": actual_start_et,
+        "delay_seconds": delay_seconds,
+        "run_window": run_window,
+        "recovery_run": recovery_run,
         "missed_trade_window": (daily_report or {}).get("missed_trade_window", False),
         "total_market_value_usd": round(total_market_value_usd, 2),
         "total_cost_usd": round(total_cost_usd, 2),
@@ -759,29 +880,44 @@ def generate_us_pnl_report(
         "",
         f"**Session**: {session}  ",
         f"**Env**: {env}  ",
+        f"**Event**: {event_name}  ",
         f"**Run ID**: {run_id}  ",
+        f"**Run Attempt**: {run_attempt}  ",
         f"**Status**: {status}  ",
-        f"**Data Source**: {data_source}  ",
+        f"**Trade Status**: {trade_status}  ",
+        f"**Trade Runner Started**: {trade_runner_started}  ",
+        f"**Trade Runner Block Reason**: {trade_runner_block_reason or '-'}  ",
+        f"**PNL Data Source**: {pnl_position_source}  ",
+        f"**KIS Balance Status**: {kis_balance_status}  ",
         "",
         "## Summary",
         "",
         f"- **Positions**: {len(positions)}",
         f"- **Fills**: {len(db_fills)}",
         f"- **Orders Sent Total**: {orders_sent_total}",
+        f"- **KIS Balance Raw Rows**: {kis_balance_raw_rows}",
+        f"- **KIS Balance Unique Symbols**: {kis_balance_unique_symbols}",
+        f"- **KIS Balance Duplicate Rows Skipped**: {kis_balance_duplicate_rows_skipped}",
         f"- **Total Market Value**: {_fmt_usd(total_market_value_usd)}",
         f"- **Total Cost**: {_fmt_usd(total_cost_usd)}",
         f"- **Unrealized PnL**: {'N/A (missing prices)' if block_normal_pnl_display else f'{_fmt_usd(unrealized_pnl_usd)} ({_fmt_pct(unrealized_pnl_pct)})'}",
         f"- **Daily Realized PnL**: {_fmt_usd(realized_pnl_usd) if realized_pnl_available and realized_pnl_usd is not None else 'N/A (daily sell fill cost basis unavailable)'}",
         f"- **Total Strategy PnL**: {_fmt_usd(total_pnl_usd) if total_pnl_usd is not None else 'N/A'}",
         f"- **KIS Account Realized Raw**: {(_fmt_usd(_realized_from_kis) if _realized_from_kis is not None else 'N/A')} (raw account field, not used in strategy PnL)",
-        f"- **Schedule Expected ET**: {(daily_report or {}).get('schedule_expected_et', '')}",
-        f"- **Actual Start ET**: {(daily_report or {}).get('actual_start_et', '')}",
-        f"- **Delay Seconds**: {(daily_report or {}).get('delay_seconds', 0)}",
-        f"- **Run Window**: {(daily_report or {}).get('run_window', '')}",
-        f"- **Recovery Run**: {(daily_report or {}).get('recovery_run', 0)}",
+        f"- **Schedule Expected ET**: {schedule_expected_et}",
+        f"- **Actual Start ET**: {actual_start_et}",
+        f"- **Delay Seconds**: {delay_seconds}",
+        f"- **Run Window**: {run_window}",
+        f"- **Recovery Run**: {recovery_run}",
         f"- **Missed Trade Window**: {(daily_report or {}).get('missed_trade_window', False)}",
         "",
     ]
+
+    if kis_balance_status == "FAILED_ALL_EXCHANGES" and pnl_position_source == "db_snapshot":
+        md_lines.extend([
+            "주의: 이 PNL은 KIS 실계좌 잔고 조회 실패로 DB snapshot 기준으로 생성되었습니다. 실계좌 기준 확정 PNL이 아닙니다.",
+            "",
+        ])
     
     if warnings:
         md_lines.extend([
@@ -861,7 +997,8 @@ def generate_us_pnl_report(
     logger.info("[US_PNL][REPORT][WRITE] csv=%s", latest_csv)
     logger.info("[US_PNL][REPORT][WRITE] csv=%s", dated_csv)
     
-    logger.info("[US_PNL][DONE] status=%s warnings=%d", status, len(warnings))
+    logger.info("[US_PNL][FINAL_STATUS] status=%s source=%s", status, pnl_position_source)
+    logger.info("[US_PNL][DONE] status=%s warnings=%s", status, ",".join(warnings))
     return payload
 
 

@@ -259,3 +259,35 @@ class TestGenerateUsPnlScript:
             # price_usd가 filled_price로 매핑되었는지 확인 (SQL 쿼리 미실행 시 빈 리스트)
         finally:
             mod._get_table_columns = _orig_cols
+
+    def test_report_uses_env_trade_metadata(self, monkeypatch, tmp_path):
+        from scripts.generate_us_portfolio_pnl_report import generate_us_pnl_report
+
+        monkeypatch.setenv("PBCORE_DB_URL", "")
+        monkeypatch.setenv("US_EVENT_NAME", "workflow_dispatch")
+        monkeypatch.setenv("US_RUN_ID", "12345")
+        monkeypatch.setenv("US_RUN_ATTEMPT", "3")
+        monkeypatch.setenv("US_ACTOR", "tester")
+        monkeypatch.setenv("US_SCHEDULE_EXPECTED_ET", "0815")
+        monkeypatch.setenv("US_ACTUAL_START_ET", "094002")
+        monkeypatch.setenv("US_DELAY_SECONDS", "5102")
+        monkeypatch.setenv("US_RUN_WINDOW", "manual_trade")
+        monkeypatch.setenv("US_RECOVERY_RUN", "0")
+        monkeypatch.setenv("US_TRADE_STATUS", "FAILED")
+        monkeypatch.setenv("US_TRADE_RUNNER_STARTED", "0")
+        monkeypatch.setenv("US_TRADE_RUNNER_BLOCK_REASON", "db_migration_failed")
+
+        result = generate_us_pnl_report(
+            session="am",
+            env="practice",
+            trade_date="2026-05-12",
+            output_dir=str(tmp_path / "us_pnl"),
+            latest_daily_report=None,
+        )
+
+        assert result["event_name"] == "workflow_dispatch"
+        assert result["trade_status"] == "FAILED"
+        assert result["trade_runner_started"] == 0
+        assert result["trade_runner_block_reason"] == "db_migration_failed"
+        assert result["schedule_expected_et"] == "0815"
+        assert result["run_window"] == "manual_trade"

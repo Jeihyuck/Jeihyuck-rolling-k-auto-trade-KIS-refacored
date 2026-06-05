@@ -141,3 +141,24 @@ def test_get_us_fills_today_base_params_include_order_branch_and_order_no(monkey
     assert "ORD_GNO_BRNO" in params
     assert "ODNO" in params
 
+
+def test_save_fills_sets_fill_idempotency_key_in_memory(monkeypatch):
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos._MEM_FILLS.clear()
+    fills = [{
+        "symbol": "AMZN",
+        "exchange": "NASDAQ",
+        "side": "BUY",
+        "qty": 7,
+        "price_usd": 261.7450,
+        "order_no": "34770",
+        "client_order_key": "",
+    }]
+
+    inserted = repos.save_fills(fills, trade_date="2026-05-20")
+
+    assert inserted == 1
+    assert repos._MEM_FILLS[0]["fill_idempotency_key"] == "2026-05-20|AMZN|BUY|34770||7|261.745"
+
