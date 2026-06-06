@@ -24,8 +24,8 @@
 - fills: 0
 - positions: 0
 - last_stage: tick_1
-- final_status: OK
-- reason: force_now_single_tick
+- final_status: OK_SIGNAL_ONLY
+- reason: max_ticks
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 
