@@ -79,7 +79,8 @@ _US_FILLS_DEDUP_SQL = text(
                     qty,
                     price_usd
                 ORDER BY
-                    COALESCE(updated_at, created_at, NOW()) DESC,
+                    updated_at DESC NULLS LAST,
+                    created_at DESC NULLS LAST,
                     ctid DESC
             ) AS rn
         FROM us_fills
@@ -390,6 +391,22 @@ def _dedup_us_fills_for_idempotent_index(conn: sa.Connection, *, log_keys: bool 
 
 def _preflight_version(conn: sa.Connection, version: str) -> None:
     if version == _US_FILLS_FIX_VERSION:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE us_fills
+                ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                ALTER TABLE us_fills
+                ADD COLUMN IF NOT EXISTS fill_idempotency_key TEXT
+                """
+            )
+        )
         _dedup_us_fills_for_idempotent_index(conn)
 
 

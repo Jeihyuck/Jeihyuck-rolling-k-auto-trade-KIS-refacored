@@ -58,3 +58,23 @@ def test_migration_recovers_unique_violation_for_0043(monkeypatch) -> None:
     assert recovered is True
     assert "dedup:1" in calls
     assert any(call.startswith("apply:CREATE UNIQUE INDEX") for call in calls)
+
+
+def test_0043_sql_adds_updated_at_and_escaped_notice_tokens() -> None:
+    from pathlib import Path
+
+    sql = Path("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql").read_text(encoding="utf-8")
+
+    assert "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()" in sql
+    assert "duplicates=%%" in sql
+    assert "deleted=%%" in sql
+    assert "updated_at DESC NULLS LAST" in sql
+
+
+def test_migrate_dedup_sql_orders_by_updated_at_then_created_at() -> None:
+    import trader.db.migrate as mod
+
+    sql = str(mod._US_FILLS_DEDUP_SQL)
+
+    assert "updated_at DESC NULLS LAST" in sql
+    assert "created_at DESC NULLS LAST" in sql

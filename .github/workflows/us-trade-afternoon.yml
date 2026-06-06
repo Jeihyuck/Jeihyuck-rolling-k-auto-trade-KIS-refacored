@@ -481,6 +481,51 @@ jobs:
             echo "[US_DB_GUARD][OK]"
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
+      - name: Resolve US Afternoon trade intent expectation
+        if: steps.phase_guard.outputs.should_run == '1'
+        id: trade_intent_expectation
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          event_name="${{ steps.phase_guard.outputs.event_name }}"
+          phase_should_run="${{ steps.phase_guard.outputs.should_run }}"
+          run_mode="${{ steps.run_mode.outputs.run_mode || 'SKIP' }}"
+          signal_only="${{ steps.run_mode.outputs.signal_only || '0' }}"
+          order_allowed="${{ steps.run_mode.outputs.order_allowed || '0' }}"
+          kis_order_allowed="${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"
+          dry_run_flag="${{ inputs.dry_run && 'true' || 'false' }}"
+          offline_flag="${{ inputs.offline && 'true' || 'false' }}"
+          smoke_loop_flag="${{ inputs.smoke_loop && 'true' || 'false' }}"
+          force_now_value="$(echo "${{ inputs.force_now || '' }}" | xargs)"
+          force_now_set=0
+          if [ -n "${force_now_value}" ]; then
+            force_now_set=1
+          fi
+
+          trade_intent_expected=0
+          reason="trade_pipeline_gate_failed"
+          if [ "${phase_should_run}" = "1" ] && [ "${run_mode}" = "TRADE" ] && [ "${signal_only}" = "0" ] && [ "${order_allowed}" = "1" ] && [ "${kis_order_allowed}" = "1" ] && [ "${dry_run_flag}" != "true" ] && [ "${offline_flag}" != "true" ] && [ "${smoke_loop_flag}" != "true" ] && [ "${force_now_set}" != "1" ]; then
+            trade_intent_expected=1
+            reason="trade_allowed"
+          elif [ "${run_mode}" != "TRADE" ] || [ "${signal_only}" != "0" ]; then
+            reason="signal_only"
+            if [ "${order_allowed}" = "0" ] && [ "${kis_order_allowed}" = "0" ]; then
+              reason="market_closed"
+            fi
+          elif [ "${dry_run_flag}" = "true" ]; then
+            reason="dry_run"
+          elif [ "${offline_flag}" = "true" ]; then
+            reason="offline_mode"
+          elif [ "${smoke_loop_flag}" = "true" ]; then
+            reason="smoke_loop"
+          elif [ "${force_now_set}" = "1" ]; then
+            reason="force_now_smoke"
+          fi
+
+          echo "trade_intent_expected=${trade_intent_expected}" >> "$GITHUB_OUTPUT"
+          echo "US_TRADE_INTENT_EXPECTED=${trade_intent_expected}" >> "$GITHUB_ENV"
+          echo "[US_TRADE_AFTERNOON][INTENT_EXPECTATION] trade_intent_expected=${trade_intent_expected} event=${event_name} phase_should_run=${phase_should_run} run_mode=${run_mode} order_allowed=${order_allowed} kis_order_allowed=${kis_order_allowed} dry_run=${dry_run_flag} offline_mode=${offline_flag} signal_only=${signal_only} smoke_loop=${smoke_loop_flag} force_now_set=${force_now_set} reason=${reason}" | tee -a artifacts/${US_LOG_FILE}
+
       - name: DB migrate
         if: steps.phase_guard.outputs.should_run == '1'
         id: db_migrate
@@ -494,11 +539,13 @@ jobs:
           if [ "${status}" -eq 0 ]; then
             echo "[US_TRADE_AFTERNOON][MIGRATION][OK]" | tee -a artifacts/${US_LOG_FILE}
             echo "[US_DB_MIGRATE][DONE]" | tee -a artifacts/${US_LOG_FILE}
+            echo "US_EXPECTED_TO_TRADE=${US_TRADE_INTENT_EXPECTED:-0}" >> "$GITHUB_ENV"
           else
             echo "[US_TRADE_AFTERNOON][MIGRATION][FAIL] reason=db_migration_failed" | tee -a artifacts/${US_LOG_FILE}
             echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
             echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
             echo "US_TRADE_RUNNER_BLOCK_REASON=db_migration_failed" >> "$GITHUB_ENV"
+            echo "US_EXPECTED_TO_TRADE=${US_TRADE_INTENT_EXPECTED:-0}" >> "$GITHUB_ENV"
           fi
           exit ${status}
 

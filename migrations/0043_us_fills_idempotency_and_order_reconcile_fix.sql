@@ -3,6 +3,12 @@ DECLARE
     v_dup_count integer := 0;
     v_deleted_count integer := 0;
 BEGIN
+    ALTER TABLE us_fills
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+    ALTER TABLE us_fills
+    ADD COLUMN IF NOT EXISTS fill_idempotency_key TEXT;
+
     SELECT COUNT(*)
     INTO v_dup_count
     FROM (
@@ -27,7 +33,7 @@ BEGIN
         HAVING COUNT(*) > 1
     ) d;
 
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][START] table=us_fills index=uq_us_fills_idempotent duplicates=%', v_dup_count;
+    RAISE NOTICE '[DB][MIGRATE][DEDUP][START] table=us_fills index=uq_us_fills_idempotent duplicates=%%', v_dup_count;
 
     WITH ranked AS (
         SELECT
@@ -42,7 +48,8 @@ BEGIN
                     qty,
                     price_usd
                 ORDER BY
-                    COALESCE(updated_at, created_at, NOW()) DESC,
+                    updated_at DESC NULLS LAST,
+                    created_at DESC NULLS LAST,
                     ctid DESC
             ) AS rn
         FROM us_fills
@@ -58,11 +65,8 @@ BEGIN
     INTO v_deleted_count
     FROM deleted;
 
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][DELETE] deleted=%', v_deleted_count;
+    RAISE NOTICE '[DB][MIGRATE][DEDUP][DELETE] deleted=%%', v_deleted_count;
     RAISE NOTICE '[DB][MIGRATE][DEDUP][DONE] status=OK';
-
-    ALTER TABLE us_fills
-    ADD COLUMN IF NOT EXISTS fill_idempotency_key TEXT;
 
     UPDATE us_fills
     SET fill_idempotency_key =
