@@ -138,7 +138,7 @@ def claim_us_session_lock(
         if row is not None:
             # INSERT 성공 — lock 획득
             logger.info(
-                "[US_SESSION_LOCK][ACQUIRE] trade_date=%s session=%s env=%s status=OK",
+                "[US_SESSION_LOCK][ACQUIRE] trade_date=%s session=%s env=%s claimed=1",
                 trade_date_str,
                 session,
                 env,
@@ -199,7 +199,7 @@ def claim_us_session_lock(
                 metadata=lock_metadata,
             ):
                 logger.info(
-                    "[US_SESSION_LOCK][ACQUIRE] trade_date=%s session=%s env=%s status=OK",
+                    "[US_SESSION_LOCK][ACQUIRE] trade_date=%s session=%s env=%s claimed=1",
                     trade_date_str,
                     session,
                     env,
@@ -207,7 +207,7 @@ def claim_us_session_lock(
                 return True, existing
 
         logger.info(
-            "[US_SESSION_LOCK][SKIP_DUPLICATE] trade_date=%s session=%s env=%s existing_status=%s",
+            "[US_SESSION_LOCK][SKIP_DUPLICATE] trade_date=%s session=%s env=%s claimed=0 existing_status=%s",
             trade_date_str,
             session,
             env,

@@ -5,6 +5,9 @@ US 세션 리포트 집계 검증.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 
@@ -81,3 +84,45 @@ class TestSessionReportBlockedAccumulation:
         # last_tick 키는 마지막 tick 값
         assert report_payload["orders_blocked_last_tick"] == 2
         assert report_payload["block_reasons_last_tick"].get("symbol_not_in_universe") == 1
+
+
+def test_validator_fails_when_expected_trade_runner_missing(tmp_path, monkeypatch):
+    from scripts.validate_us_daily_report import validate_report
+
+    monkeypatch.chdir(tmp_path)
+    reports = Path("reports/us_pnl")
+    reports.mkdir(parents=True, exist_ok=True)
+    for name in ("latest_us_pnl_report.json", "latest_us_pnl_report.md", "latest_us_pnl_report.csv"):
+        path = reports / name
+        if path.suffix == ".json":
+            path.write_text(json.dumps({"status": "OK", "realized_pnl_source": "unavailable"}))
+        else:
+            path.write_text("ok\n")
+
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "us-trade-am.log").write_text("[US_PNL_REPORT_MD][BEGIN]\n[US_PNL_REPORT_MD][END]\n")
+
+    report = tmp_path / "latest_us_daily_report.json"
+    report.write_text(json.dumps({
+        "trade_date": "2026-06-06",
+        "run_id": "123",
+        "session": "am",
+        "env": "practice",
+        "dry_run": False,
+        "final_status": "OK_ORDERS_SENT",
+        "last_stage": "trade",
+        "expected_to_trade": 1,
+        "trade_runner_started": 0,
+    }))
+
+    exit_code, fatals, warnings = validate_report(
+        report_path=str(report),
+        expected_trade_date="2026-06-06",
+        expected_run_id="123",
+        expected_dry_run=False,
+        session="am",
+    )
+
+    assert exit_code == 1
+    assert "expected_to_trade_without_runner_started" in fatals

@@ -39,6 +39,9 @@ NO_TRADE_STATUSES = {
     "NO_TRADE",
     "OK_NO_TRADE",
     "NO_ENTRY_INTENTS",
+    "SKIP_PHASE_WINDOW",
+    "SKIPPED_DUPLICATE_SESSION",
+    "OK_ALREADY_RAN",
 }
 
 # These final_statuses are "ran with warnings but OK"
@@ -60,6 +63,7 @@ FATAL_STATUSES = {
     "FAILED_PREP_GUARD",
     "FAILED_PREP_CONTRACT",
     "FAILED_DRY_RUN_CONTRACT",
+    "FAILED_TRADE_NOT_STARTED",
     "FAILED",
 }
 
@@ -79,6 +83,7 @@ OPTIONAL_FIELDS_WARN = [
     "sha",
     "workflow",
     "event_name",
+    "expected_to_trade",
     "kis_order_allowed",
     "prep_status",
     "locked_watchlist_count",
@@ -172,6 +177,12 @@ def validate_report(
 
     if final_status in FATAL_STATUSES:
         fatals.append(f"final_status={final_status} is a fatal failure")
+        return 1, fatals, warnings
+
+    expected_to_trade = int(payload.get("expected_to_trade", 0) or 0)
+    trade_runner_started = int(payload.get("trade_runner_started", 0) or 0)
+    if expected_to_trade == 1 and trade_runner_started != 1:
+        fatals.append("expected_to_trade_without_runner_started")
         return 1, fatals, warnings
 
     pnl_dir = Path("reports/us_pnl")

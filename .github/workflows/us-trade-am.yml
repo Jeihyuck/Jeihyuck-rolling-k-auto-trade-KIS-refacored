@@ -170,9 +170,10 @@ jobs:
       US_RUN_ATTEMPT: ${{ github.run_attempt }}
       US_ACTOR: ${{ github.actor }}
       US_SESSION: am
-      US_TRADE_STATUS: "SKIPPED"
+      US_TRADE_STATUS: "INIT"
       US_TRADE_RUNNER_STARTED: "0"
-      US_TRADE_RUNNER_BLOCK_REASON: "phase_guard_skip"
+      US_TRADE_RUNNER_BLOCK_REASON: "not_started"
+      US_EXPECTED_TO_TRADE: "0"
       US_ORDERS_SENT: "0"
       US_ORDER_ALLOWED: "0"
       US_KIS_ORDER_ALLOWED: "0"
@@ -386,6 +387,9 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
+          echo "US_TRADE_STATUS=SKIPPED" >> "$GITHUB_ENV"
+          echo "US_TRADE_RUNNER_BLOCK_REASON=phase_guard_skip" >> "$GITHUB_ENV"
           trade_date=$(TZ=America/New_York date +%F)
           missed_window="${{ steps.phase_guard.outputs.missed_trade_window || 'false' }}"
           {
@@ -493,6 +497,7 @@ jobs:
         working-directory: repo
         env:
           FORCE_NOW_INPUT: ${{ inputs.force_ny_datetime || inputs.force_now || '' }}
+          INPUT_CONFIRM: ${{ inputs.confirm || '' }}
         run: |
           set -euo pipefail
           if [ -n "${FORCE_NOW_INPUT}" ]; then
@@ -530,16 +535,89 @@ jobs:
             print(f"existing_status={(existing or {}).get('status', '')}")
             PY
             cat us_session_lock_result.txt | tee -a artifacts/${US_LOG_FILE}
-            CLAIMED=$(grep '^claimed=' us_session_lock_result.txt | cut -d= -f2)
-            EXISTING_STATUS=$(grep '^existing_status=' us_session_lock_result.txt | cut -d= -f2)
+            CLAIMED=$(grep '^claimed=' us_session_lock_result.txt | cut -d= -f2 || true)
+            EXISTING_STATUS=$(grep '^existing_status=' us_session_lock_result.txt | cut -d= -f2 || true)
+            if [ -z "${CLAIMED}" ]; then
+              echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
+              echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
+              echo "US_TRADE_RUNNER_BLOCK_REASON=session_lock_output_missing" >> "$GITHUB_ENV"
+              echo "::error::AM session lock output missing"
+              exit 1
+            fi
             echo "claimed=${CLAIMED}" >> "$GITHUB_OUTPUT"
             echo "existing_status=${EXISTING_STATUS}" >> "$GITHUB_OUTPUT"
             if [ "${CLAIMED}" != "1" ]; then
-              echo "US_TRADE_STATUS=SKIPPED" >> "$GITHUB_ENV"
+              echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
+              echo "US_TRADE_STATUS=SKIPPED_DUPLICATE_SESSION" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_BLOCK_REASON=duplicate_session_lock" >> "$GITHUB_ENV"
             fi
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
+
+      - name: Resolve US AM trade expectation
+        if: steps.phase_guard.outputs.should_run == '1'
+        id: expectation
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          event_name="${{ steps.phase_guard.outputs.event_name }}"
+          phase_should_run="${{ steps.phase_guard.outputs.should_run }}"
+          run_mode="${{ steps.run_mode.outputs.run_mode || 'SKIP' }}"
+          signal_only="${{ steps.run_mode.outputs.signal_only || '0' }}"
+          order_allowed="${{ steps.run_mode.outputs.order_allowed || '0' }}"
+          kis_order_allowed="${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"
+          claimed="${{ steps.session_lock.outputs.claimed || '' }}"
+          dry_run_flag="${{ inputs.dry_run && 'true' || 'false' }}"
+          offline_flag="${{ (inputs.offline || inputs.offline_mode) && 'true' || 'false' }}"
+          smoke_loop_flag="${{ inputs.smoke_loop && 'true' || 'false' }}"
+          force_now_value="$(echo "${{ inputs.force_ny_datetime || inputs.force_now || '' }}" | xargs)"
+          force_now_set=0
+          if [ -n "${force_now_value}" ]; then
+            force_now_set=1
+          fi
+
+          expected_to_trade=0
+          reason="trade_pipeline_gate_failed"
+          trade_status="SKIPPED"
+          block_reason="trade_pipeline_gate_failed"
+
+          if [ "${claimed}" != "1" ]; then
+            reason="duplicate_session_lock"
+            trade_status="SKIPPED_DUPLICATE_SESSION"
+            block_reason="duplicate_session_lock"
+          elif [ "${run_mode}" != "TRADE" ] || [ "${signal_only}" != "0" ]; then
+            reason="signal_only"
+            if [ "${order_allowed}" = "0" ] && [ "${kis_order_allowed}" = "0" ]; then
+              reason="market_closed"
+            fi
+            block_reason="${reason}"
+          elif [ "${dry_run_flag}" = "true" ]; then
+            reason="dry_run"
+            block_reason="dry_run"
+          elif [ "${offline_flag}" = "true" ]; then
+            reason="offline_mode"
+            block_reason="offline_mode"
+          elif [ "${smoke_loop_flag}" = "true" ]; then
+            reason="smoke_loop"
+            block_reason="smoke_loop"
+          elif [ "${force_now_set}" = "1" ]; then
+            reason="force_now_smoke"
+            block_reason="force_now_smoke"
+          elif [ "${phase_should_run}" = "1" ] && [ "${run_mode}" = "TRADE" ] && [ "${signal_only}" = "0" ] && [ "${order_allowed}" = "1" ] && [ "${kis_order_allowed}" = "1" ]; then
+            expected_to_trade=1
+            reason="trade_allowed"
+            trade_status="READY"
+            block_reason=""
+          fi
+
+          echo "expected_to_trade=${expected_to_trade}" >> "$GITHUB_OUTPUT"
+          echo "reason=${reason}" >> "$GITHUB_OUTPUT"
+          echo "US_EXPECTED_TO_TRADE=${expected_to_trade}" >> "$GITHUB_ENV"
+          echo "US_ORDER_ALLOWED=${order_allowed}" >> "$GITHUB_ENV"
+          echo "US_KIS_ORDER_ALLOWED=${kis_order_allowed}" >> "$GITHUB_ENV"
+          echo "US_TRADE_STATUS=${trade_status}" >> "$GITHUB_ENV"
+          echo "US_TRADE_RUNNER_BLOCK_REASON=${block_reason}" >> "$GITHUB_ENV"
+          echo "[US_TRADE_AM][EXPECTATION] expected_to_trade=${expected_to_trade} event=${event_name} phase_should_run=${phase_should_run} run_mode=${run_mode} order_allowed=${order_allowed} kis_order_allowed=${kis_order_allowed} dry_run=${dry_run_flag} offline_mode=${offline_flag} signal_only=${signal_only} smoke_loop=${smoke_loop_flag} force_now_set=${force_now_set} reason=${reason}" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Emit AM session lock skip summary
         if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed != '1'
@@ -549,7 +627,7 @@ jobs:
           echo "[US_TRADE_AM][TRADE_RUNNER][SKIP] reason=duplicate_session_lock" | tee -a artifacts/${US_LOG_FILE}
 
       - name: DB migrate
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1'
+        if: steps.expectation.outputs.expected_to_trade == '1'
         id: db_migrate
         continue-on-error: true
         working-directory: repo
@@ -572,7 +650,7 @@ jobs:
           exit ${status}
 
       - name: Emit AM migration failure skip summary
-        if: always() && steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome != 'success'
+        if: always() && steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome != 'success'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -626,7 +704,7 @@ jobs:
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: Verify completed US prep contract
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success'
         id: prep_exec
         timeout-minutes: 3
         working-directory: repo
@@ -728,7 +806,7 @@ jobs:
           echo "[US_TRADE_AM][WATCHLIST_LOAD][OK] rows=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Wait until US AM target start
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success' && steps.phase_guard.outputs.wait_until_target == '1'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.phase_guard.outputs.wait_until_target == '1'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -744,7 +822,7 @@ jobs:
           echo "[US_WAIT_UNTIL_TARGET][DONE] session=am now_et=$(TZ=America/New_York date +%H%M%S)" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Verify target time reached
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -786,7 +864,7 @@ jobs:
           fi
 
       - name: Final AM duplicate guard before trade
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success'
         id: final_duplicate_guard
         working-directory: repo
         env:
@@ -826,10 +904,13 @@ jobs:
           echo "already_ran=${ALREADY_RAN}" >> "$GITHUB_OUTPUT"
 
       - name: Emit AM final duplicate skip summary
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success' && steps.final_duplicate_guard.outputs.already_ran == '1'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.final_duplicate_guard.outputs.already_ran == '1'
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
+          echo "US_TRADE_STATUS=OK_ALREADY_RAN" >> "$GITHUB_ENV"
+          echo "US_TRADE_RUNNER_BLOCK_REASON=already_ran_after_wait" >> "$GITHUB_ENV"
           trade_date=$(TZ=America/New_York date +%F)
           {
             echo "[US_TRADE_AM][FINISH] status=OK reason=already_ran_after_wait trade_date=${trade_date}"
@@ -838,7 +919,7 @@ jobs:
           } | tee -a artifacts/${US_LOG_FILE}
 
       - name: Check schedule DRY_RUN contract
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success' && github.event_name == 'schedule'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && github.event_name == 'schedule'
         working-directory: repo
         run: |
           set -euo pipefail
@@ -853,7 +934,7 @@ jobs:
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: Check AM already ran
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success'
         id: already_ran
         working-directory: repo
         env:
@@ -902,10 +983,13 @@ jobs:
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
       - name: Emit AM already ran skip summary
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success' && steps.already_ran.outputs.already_ran == '1'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.already_ran.outputs.already_ran == '1'
         working-directory: repo
         run: |
           set -euo pipefail
+          echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
+          echo "US_TRADE_STATUS=OK_ALREADY_RAN" >> "$GITHUB_ENV"
+          echo "US_TRADE_RUNNER_BLOCK_REASON=already_ran" >> "$GITHUB_ENV"
           trade_date=$(TZ=America/New_York date +%F)
           {
             echo "[US_TRADE_AM][FINISH] status=OK reason=already_ran trade_date=${trade_date}"
@@ -914,7 +998,7 @@ jobs:
           } | tee -a artifacts/${US_LOG_FILE}
 
       - name: Run US AM trade session
-        if: steps.phase_guard.outputs.should_run == '1' && steps.session_lock.outputs.claimed == '1' && steps.db_migrate.outcome == 'success' && steps.already_ran.outputs.already_ran != '1' && steps.final_duplicate_guard.outputs.already_ran != '1'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.already_ran.outputs.already_ran != '1' && steps.final_duplicate_guard.outputs.already_ran != '1'
         id: trade_session
         continue-on-error: true
         timeout-minutes: 190
@@ -992,7 +1076,7 @@ jobs:
 
             echo "[US_RISK_CONFIG] US_MAX_ORDER_USD=${US_MAX_ORDER_USD} US_MAX_DAILY_NOTIONAL_USD=${US_MAX_DAILY_NOTIONAL_USD} US_MAX_POSITIONS=${US_MAX_POSITIONS} US_MAX_POSITION_WEIGHT=${US_MAX_POSITION_WEIGHT} US_MIN_CASH_BUFFER_USD=${US_MIN_CASH_BUFFER_USD}"
             echo "[US_TRADE_AM][START]"
-            echo "[US_TRADE_AM][TRADE_RUNNER][START]"
+            echo "[US_TRADE_AM][TRADE_RUNNER][START] session=am"
             echo "[US_TRADE_AM][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
             echo "[US_TRADE_AM][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
             echo "[US_TRADE_AM][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES} INTERVAL_SEC=${INTERVAL_SEC}"
@@ -1063,16 +1147,18 @@ jobs:
             )
             echo "US_ORDERS_SENT=${orders_sent}" >> "$GITHUB_ENV"
             echo "[US_TRADE_AM][PYTHON_EXIT] status=${status}" | tee -a artifacts/${US_LOG_FILE}
+            final_trade_status="FAILED"
             if [ "${status}" -eq 0 ]; then
               echo "US_TRADE_STATUS=OK" >> "$GITHUB_ENV"
               echo "[US_TRADE_AM][DONE]" | tee -a artifacts/${US_LOG_FILE}
+              final_trade_status="OK"
             else
               echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_BLOCK_REASON=${report_reason}" >> "$GITHUB_ENV"
               echo "[US_TRADE_AM][FAILED] python_exit=${status}" | tee -a artifacts/${US_LOG_FILE}
             fi
             echo "[US_TRADE_AM][ORDERS][SUMMARY] sent=${orders_sent} skipped=0 blocked=0" | tee -a artifacts/${US_LOG_FILE}
-            echo "[US_TRADE_AM][FINAL_STATUS] status=${report_status} trade_runner_started=1 orders_sent=${orders_sent} reason=${report_reason}" | tee -a artifacts/${US_LOG_FILE}
+            echo "[US_TRADE_AM][FINAL_STATUS] status=${final_trade_status} trade_runner_started=1 orders_sent=${orders_sent} reason=${report_reason}" | tee -a artifacts/${US_LOG_FILE}
             exit ${status}
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
 
@@ -1266,21 +1352,32 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          trade_status="${US_TRADE_STATUS:-SKIPPED}"
+          trade_status="${US_TRADE_STATUS:-INIT}"
+          expected_to_trade="${US_EXPECTED_TO_TRADE:-0}"
+          trade_runner_started="${US_TRADE_RUNNER_STARTED:-0}"
+          block_reason="${US_TRADE_RUNNER_BLOCK_REASON:-trade_pipeline_gate_failed}"
           pnl_status="${US_PNL_STATUS:-UNKNOWN}"
           workflow_status="OK"
 
-          if [ "${trade_status}" = "FAILED" ] && [[ "${pnl_status}" == OK* ]]; then
+          if [ "${expected_to_trade}" = "1" ] && [ "${trade_runner_started}" != "1" ]; then
+            workflow_status="FAILED_TRADE_NOT_STARTED"
+            echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
+            echo "[US_WORKFLOW][FINAL_REASON] reason=${block_reason}" | tee -a artifacts/${US_LOG_FILE}
+          elif [ "${trade_status}" = "FAILED" ] && [[ "${pnl_status}" == OK* ]]; then
             workflow_status="FAILED_AM_TRADE_PNL_ONLY"
           elif [ "${trade_status}" = "FAILED" ]; then
             workflow_status="FAILED_FINAL"
           elif [ "${trade_status}" = "SKIPPED" ]; then
             workflow_status="SKIPPED"
+          elif [ "${trade_status}" = "SKIPPED_DUPLICATE_SESSION" ]; then
+            workflow_status="SKIPPED_DUPLICATE_SESSION"
+          elif [ "${trade_status}" = "OK_ALREADY_RAN" ]; then
+            workflow_status="OK_ALREADY_RAN"
           fi
 
           echo "[US_WORKFLOW][FINAL_STATUS] status=${workflow_status}" | tee -a artifacts/${US_LOG_FILE}
 
-          if [ "${workflow_status}" = "FAILED_AM_TRADE_PNL_ONLY" ] || [ "${workflow_status}" = "FAILED_FINAL" ]; then
+          if [ "${workflow_status}" = "FAILED_AM_TRADE_PNL_ONLY" ] || [ "${workflow_status}" = "FAILED_FINAL" ] || [ "${workflow_status}" = "FAILED_TRADE_NOT_STARTED" ]; then
             exit 1
           fi
 

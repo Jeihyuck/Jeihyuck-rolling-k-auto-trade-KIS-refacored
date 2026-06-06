@@ -152,3 +152,22 @@ def test_am_migration_failure_and_pnl_do_not_mix():
     """
     assert has_final_status(log, "FAILED", "db_migration_failed") is True
     assert "[US_WORKFLOW][FINAL_STATUS] status=FAILED_AM_TRADE_PNL_ONLY" in log
+
+
+def test_am_expected_to_trade_requires_trade_runner_start():
+    log = """
+    [US_TRADE_AM][EXPECTATION] expected_to_trade=1 event=workflow_dispatch phase_should_run=1 run_mode=TRADE order_allowed=1 kis_order_allowed=1 dry_run=false offline_mode=false signal_only=0 smoke_loop=false force_now_set=0 reason=trade_allowed
+    [US_WORKFLOW][FINAL_STATUS] status=FAILED_TRADE_NOT_STARTED trade_status=READY expected_to_trade=1 trade_runner_started=0 reason=trade_pipeline_gate_failed
+    """
+    assert "status=FAILED_TRADE_NOT_STARTED" in log
+    assert "status=SKIPPED" not in log
+
+
+def test_am_duplicate_session_is_not_failed_trade_not_started():
+    log = """
+    [US_SESSION_LOCK][SKIP_DUPLICATE] trade_date=2026-06-06 session=am env=practice claimed=0 existing_status=DONE
+    [US_TRADE_AM][EXPECTATION] expected_to_trade=0 event=schedule phase_should_run=1 run_mode=TRADE order_allowed=1 kis_order_allowed=1 dry_run=false offline_mode=false signal_only=0 smoke_loop=false force_now_set=0 reason=duplicate_session_lock
+    [US_WORKFLOW][FINAL_STATUS] status=SKIPPED_DUPLICATE_SESSION trade_status=SKIPPED_DUPLICATE_SESSION expected_to_trade=0 trade_runner_started=0 reason=duplicate_session_lock
+    """
+    assert "status=SKIPPED_DUPLICATE_SESSION" in log
+    assert "FAILED_TRADE_NOT_STARTED" not in log

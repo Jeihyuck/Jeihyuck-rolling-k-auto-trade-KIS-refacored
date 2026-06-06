@@ -484,6 +484,7 @@ def generate_us_pnl_report(
     run_window = os.getenv("US_RUN_WINDOW", "")
     recovery_run = _safe_int(os.getenv("US_RECOVERY_RUN", "0"))
     trade_status_env = os.getenv("US_TRADE_STATUS", "")
+    expected_to_trade_env = _safe_int(os.getenv("US_EXPECTED_TO_TRADE", "0"))
     trade_runner_started_env = _safe_int(os.getenv("US_TRADE_RUNNER_STARTED", "0"))
     trade_runner_block_reason_env = os.getenv("US_TRADE_RUNNER_BLOCK_REASON", "")
     order_allowed_env = _safe_int(os.getenv("US_ORDER_ALLOWED", "0"))
@@ -814,6 +815,7 @@ def generate_us_pnl_report(
         "source": data_source,
         "status": status,
         "pnl_status": status,
+        "expected_to_trade": expected_to_trade_env,
         "trade_status": trade_status,
         "trade_runner_started": trade_runner_started,
         "trade_runner_block_reason": trade_runner_block_reason,
@@ -882,11 +884,19 @@ def generate_us_pnl_report(
         f"**Env**: {env}  ",
         f"**Event**: {event_name}  ",
         f"**Run ID**: {run_id}  ",
+        f"**Session**: {session}  ",
+        f"**Expected To Trade**: {expected_to_trade_env}  ",
         f"**Run Attempt**: {run_attempt}  ",
         f"**Status**: {status}  ",
         f"**Trade Status**: {trade_status}  ",
         f"**Trade Runner Started**: {trade_runner_started}  ",
         f"**Trade Runner Block Reason**: {trade_runner_block_reason or '-'}  ",
+        f"**Order Allowed**: {order_allowed_env}  ",
+        f"**KIS Order Allowed**: {kis_order_allowed_env}  ",
+        f"**Schedule Expected ET**: {schedule_expected_et}  ",
+        f"**Actual Start ET**: {actual_start_et}  ",
+        f"**Delay Seconds**: {delay_seconds}  ",
+        f"**Run Window**: {run_window}  ",
         f"**PNL Data Source**: {pnl_position_source}  ",
         f"**KIS Balance Status**: {kis_balance_status}  ",
         "",

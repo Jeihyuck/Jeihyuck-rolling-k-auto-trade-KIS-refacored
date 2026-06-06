@@ -31,6 +31,10 @@ def has_success_end(log: str) -> bool:
     )
 
 
+def has_trade_runner_start(log: str) -> bool:
+    return bool(re.search(r"\[US_TRADE_AFTERNOON\]\[TRADE_RUNNER\]\[START\] session=afternoon", log))
+
+
 def test_afternoon_phase_guard_skip_success():
     """Phase guard skip should be recognized as success."""
     log = """
@@ -105,3 +109,44 @@ def test_afternoon_max_ticks_success():
     """
     assert has_success_end(log) is True
     assert has_fatal_afternoon_error(log) is False
+
+
+def test_afternoon_manual_actual_trade_contract():
+    log = """
+    [US_TRADE_AFTERNOON][EXPECTATION] expected_to_trade=1 event=workflow_dispatch phase_should_run=1 run_mode=TRADE order_allowed=1 kis_order_allowed=1 dry_run=false offline_mode=false signal_only=0 smoke_loop=false force_now_set=0 reason=trade_allowed
+    [US_TRADE_AFTERNOON][TRADE_RUNNER][START] session=afternoon
+    [US_TRADE_AFTERNOON][DONE]
+    """
+    assert has_trade_runner_start(log) is True
+    assert has_fatal_afternoon_error(log) is False
+
+
+def test_afternoon_schedule_early_wait_contract():
+    log = """
+    [US_TRADE_AFTERNOON][PHASE_GUARD] should_run=1 run_window=early_wait route=normal_afternoon recovery_run=0 wait_seconds=1800
+    [US_WAIT_UNTIL_TARGET][START] session=afternoon wait_seconds=1800
+    [US_WAIT_UNTIL_TARGET][DONE] session=afternoon now_et=123000
+    [US_TRADE_AFTERNOON][EXPECTATION] expected_to_trade=1 event=schedule phase_should_run=1 run_mode=TRADE order_allowed=1 kis_order_allowed=1 dry_run=false offline_mode=false signal_only=0 smoke_loop=false force_now_set=0 reason=trade_allowed
+    [US_TRADE_AFTERNOON][TRADE_RUNNER][START] session=afternoon
+    """
+    assert "run_window=early_wait" in log
+    assert has_trade_runner_start(log) is True
+
+
+def test_afternoon_already_ran_after_wait_not_failed():
+    log = """
+    [US_TRADE_AFTERNOON][FINAL_DUPLICATE_GUARD][RESULT] trade_date=2026-06-06 already_ran=True guard_status=DONE reason=already_ran_after_wait
+    [US_TRADE_AFTERNOON][EXPECTATION] expected_to_trade=0 event=schedule phase_should_run=1 run_mode=TRADE order_allowed=1 kis_order_allowed=1 dry_run=false offline_mode=false signal_only=0 smoke_loop=false force_now_set=0 reason=already_ran_after_wait
+    [US_WORKFLOW][FINAL_STATUS] status=SKIPPED_DUPLICATE_SESSION trade_status=SKIPPED_DUPLICATE_SESSION expected_to_trade=0 trade_runner_started=0 reason=already_ran_after_wait
+    """
+    assert "SKIPPED_DUPLICATE_SESSION" in log
+    assert "FAILED_TRADE_NOT_STARTED" not in log
+
+
+def test_afternoon_expected_to_trade_requires_runner_start():
+    log = """
+    [US_TRADE_AFTERNOON][EXPECTATION] expected_to_trade=1 event=workflow_dispatch phase_should_run=1 run_mode=TRADE order_allowed=1 kis_order_allowed=1 dry_run=false offline_mode=false signal_only=0 smoke_loop=false force_now_set=0 reason=trade_allowed
+    [US_WORKFLOW][FINAL_STATUS] status=FAILED_TRADE_NOT_STARTED trade_status=READY expected_to_trade=1 trade_runner_started=0 reason=trade_pipeline_gate_failed
+    """
+    assert "FAILED_TRADE_NOT_STARTED" in log
+    assert "status=SKIPPED" not in log

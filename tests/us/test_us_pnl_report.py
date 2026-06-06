@@ -119,3 +119,40 @@ def test_us_pnl_report_json_has_required_fields(monkeypatch, tmp_path):
     
     for field in required_fields:
         assert field in json_data, f"JSON missing required field: {field}"
+
+
+def test_us_pnl_report_includes_trade_expectation_metadata(monkeypatch, tmp_path):
+    monkeypatch.setenv("PBCORE_DB_URL", "")
+    monkeypatch.setenv("US_EXPECTED_TO_TRADE", "1")
+    monkeypatch.setenv("US_TRADE_STATUS", "FAILED")
+    monkeypatch.setenv("US_TRADE_RUNNER_STARTED", "0")
+    monkeypatch.setenv("US_TRADE_RUNNER_BLOCK_REASON", "db_migration_failed")
+    monkeypatch.setenv("US_ORDER_ALLOWED", "1")
+    monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
+    monkeypatch.setenv("US_SCHEDULE_EXPECTED_ET", "1130")
+    monkeypatch.setenv("US_ACTUAL_START_ET", "123000")
+    monkeypatch.setenv("US_DELAY_SECONDS", "0")
+    monkeypatch.setenv("US_RUN_WINDOW", "manual_trade")
+
+    output_dir = tmp_path / "us_pnl"
+
+    from scripts.generate_us_portfolio_pnl_report import generate_us_pnl_report
+
+    result = generate_us_pnl_report(
+        session="afternoon",
+        env="practice",
+        trade_date="2026-06-06",
+        output_dir=str(output_dir),
+        latest_daily_report=None,
+    )
+
+    assert result["expected_to_trade"] == 1
+    assert result["trade_runner_started"] == 0
+    assert result["trade_runner_block_reason"] == "db_migration_failed"
+
+    markdown = (output_dir / "latest_us_pnl_report.md").read_text()
+    assert "**Expected To Trade**: 1" in markdown
+    assert "**Trade Runner Started**: 0" in markdown
+    assert "**Trade Runner Block Reason**: db_migration_failed" in markdown
+    assert "**Order Allowed**: 1" in markdown
+    assert "**KIS Order Allowed**: 1" in markdown
