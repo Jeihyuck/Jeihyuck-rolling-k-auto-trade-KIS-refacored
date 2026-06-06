@@ -1391,9 +1391,6 @@ jobs:
         working-directory: repo
         env:
           TRADE_DATE: ${{ steps.session_lock.outputs.trade_date }}
-          FINAL_TRADE_STATUS: ${{ env.US_TRADE_STATUS }}
-          FINAL_BLOCK_REASON: ${{ env.US_TRADE_RUNNER_BLOCK_REASON }}
-          TRADE_RUNNER_STARTED: ${{ env.US_TRADE_RUNNER_STARTED }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -1403,9 +1400,9 @@ jobs:
           from trader.us.db.session_locks import finish_us_session_lock
 
           trade_date = os.environ.get("TRADE_DATE") or ""
-          trade_status = os.environ.get("FINAL_TRADE_STATUS", "FAILED")
-          reason = os.environ.get("FINAL_BLOCK_REASON", "")
-          runner_started = os.environ.get("TRADE_RUNNER_STARTED", "0")
+          trade_status = os.environ.get("US_TRADE_STATUS", "FAILED")
+          reason = os.environ.get("US_TRADE_RUNNER_BLOCK_REASON", "")
+          runner_started = os.environ.get("US_TRADE_RUNNER_STARTED", "0")
 
           if not trade_date:
               print("[US_SESSION_LOCK][FINISH_SKIP] reason=missing_trade_date")
