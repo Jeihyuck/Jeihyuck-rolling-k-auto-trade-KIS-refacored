@@ -507,6 +507,7 @@ jobs:
           fi
           export TRADE_DATE
           {
+            echo "[US_SESSION_LOCK][START] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} event=${GITHUB_EVENT_NAME}" | tee -a artifacts/${US_LOG_FILE}
             python - <<'PY' > us_session_lock_result.txt
             import os
             import sys
@@ -546,7 +547,11 @@ jobs:
             fi
             echo "claimed=${CLAIMED}" >> "$GITHUB_OUTPUT"
             echo "existing_status=${EXISTING_STATUS}" >> "$GITHUB_OUTPUT"
-            if [ "${CLAIMED}" != "1" ]; then
+            echo "trade_date=${TRADE_DATE}" >> "$GITHUB_OUTPUT"
+            if [ "${CLAIMED}" = "1" ]; then
+              echo "[US_SESSION_LOCK][ACQUIRE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED}" | tee -a artifacts/${US_LOG_FILE}
+            else
+              echo "[US_SESSION_LOCK][SKIP_DUPLICATE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED} existing_status=${EXISTING_STATUS}" | tee -a artifacts/${US_LOG_FILE}
               echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
               echo "US_TRADE_STATUS=SKIPPED_DUPLICATE_SESSION" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
@@ -1380,6 +1385,56 @@ jobs:
           if [ "${workflow_status}" = "FAILED_AM_TRADE_PNL_ONLY" ] || [ "${workflow_status}" = "FAILED_FINAL" ] || [ "${workflow_status}" = "FAILED_TRADE_NOT_STARTED" ]; then
             exit 1
           fi
+
+      - name: Finish AM session lock
+        if: always() && steps.session_lock.outputs.claimed == '1'
+        working-directory: repo
+        env:
+          TRADE_DATE: ${{ steps.session_lock.outputs.trade_date }}
+          FINAL_TRADE_STATUS: ${{ env.US_TRADE_STATUS }}
+          FINAL_BLOCK_REASON: ${{ env.US_TRADE_RUNNER_BLOCK_REASON }}
+          TRADE_RUNNER_STARTED: ${{ env.US_TRADE_RUNNER_STARTED }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          from datetime import date
+          sys.path.insert(0, ".")
+          from trader.us.db.session_locks import finish_us_session_lock
+
+          trade_date = os.environ.get("TRADE_DATE") or ""
+          trade_status = os.environ.get("FINAL_TRADE_STATUS", "FAILED")
+          reason = os.environ.get("FINAL_BLOCK_REASON", "")
+          runner_started = os.environ.get("TRADE_RUNNER_STARTED", "0")
+
+          if not trade_date:
+              print("[US_SESSION_LOCK][FINISH_SKIP] reason=missing_trade_date")
+              raise SystemExit(0)
+
+          if trade_status == "OK":
+              lock_status = "DONE"
+          elif trade_status in {"SKIPPED_DUPLICATE_SESSION", "OK_ALREADY_RAN"}:
+              lock_status = "DONE_WITH_WARNINGS"
+          elif reason in {"db_migration_failed", "bad_or_missing_prep", "prep_contract_failed", "trade_pipeline_gate_failed"}:
+              lock_status = "FAILED_RETRYABLE"
+          else:
+              lock_status = "FAILED_RETRYABLE"
+
+          finish_us_session_lock(
+              env=os.environ.get("KIS_ENV", "practice"),
+              trade_date=date.fromisoformat(trade_date),
+              session="am",
+              github_run_id=os.environ.get("GITHUB_RUN_ID"),
+              status=lock_status,
+              reason=reason or trade_status,
+              metadata={
+                  "trade_status": trade_status,
+                  "trade_runner_started": runner_started,
+                  "reason": reason,
+              },
+          )
+          print(f"[US_SESSION_LOCK][FINISH] session=am trade_date={trade_date} status={lock_status} reason={reason or trade_status}")
+          PY
 
       - name: Print US PnL report to console and summary
         if: always()

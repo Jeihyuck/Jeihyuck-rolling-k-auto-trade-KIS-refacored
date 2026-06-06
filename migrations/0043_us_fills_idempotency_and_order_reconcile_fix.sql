@@ -33,7 +33,8 @@ BEGIN
         HAVING COUNT(*) > 1
     ) d;
 
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][START] table=us_fills index=uq_us_fills_idempotent duplicates=%%', v_dup_count;
+    RAISE NOTICE USING MESSAGE =
+        '[DB][MIGRATE][DEDUP][START] table=us_fills index=uq_us_fills_idempotent duplicates=' || v_dup_count::text;
 
     WITH ranked AS (
         SELECT
@@ -65,8 +66,10 @@ BEGIN
     INTO v_deleted_count
     FROM deleted;
 
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][DELETE] deleted=%%', v_deleted_count;
-    RAISE NOTICE '[DB][MIGRATE][DEDUP][DONE] status=OK';
+    RAISE NOTICE USING MESSAGE =
+        '[DB][MIGRATE][DEDUP][DELETE] deleted=' || v_deleted_count::text;
+    RAISE NOTICE USING MESSAGE =
+        '[DB][MIGRATE][DEDUP][DONE] status=OK';
 
     UPDATE us_fills
     SET fill_idempotency_key =
@@ -80,7 +83,8 @@ BEGIN
     WHERE fill_idempotency_key IS NULL
        OR fill_idempotency_key = '';
 
-    RAISE NOTICE '[DB][MIGRATE][INDEX][CREATE] index=uq_us_fills_idempotent';
+    RAISE NOTICE USING MESSAGE =
+        '[DB][MIGRATE][INDEX][CREATE] index=uq_us_fills_idempotent';
 END
 $$;
 
@@ -97,7 +101,8 @@ ON us_fills (
 
 DO $$
 BEGIN
-    RAISE NOTICE '[DB][MIGRATE][INDEX][OK] index=uq_us_fills_idempotent';
+    RAISE NOTICE USING MESSAGE =
+        '[DB][MIGRATE][INDEX][OK] index=uq_us_fills_idempotent';
 END
 $$;
 

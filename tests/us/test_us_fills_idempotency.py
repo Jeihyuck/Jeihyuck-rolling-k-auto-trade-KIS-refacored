@@ -66,9 +66,14 @@ def test_0043_sql_adds_updated_at_and_escaped_notice_tokens() -> None:
     sql = Path("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql").read_text(encoding="utf-8")
 
     assert "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()" in sql
-    assert "duplicates=%%" in sql
-    assert "deleted=%%" in sql
+    # RAISE NOTICE must use USING MESSAGE syntax — no bare % or %% placeholders with arguments
+    assert "RAISE NOTICE USING MESSAGE" in sql
+    assert "duplicates=' || v_dup_count::text" in sql
+    assert "deleted=' || v_deleted_count::text" in sql
     assert "updated_at DESC NULLS LAST" in sql
+    # No standalone RAISE NOTICE with format-string arguments allowed
+    assert "duplicates=%%" not in sql
+    assert "deleted=%%" not in sql
 
 
 def test_migrate_dedup_sql_orders_by_updated_at_then_created_at() -> None:
