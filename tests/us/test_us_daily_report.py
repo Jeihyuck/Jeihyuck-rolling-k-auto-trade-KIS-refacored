@@ -125,4 +125,4 @@ def test_validator_fails_when_expected_trade_runner_missing(tmp_path, monkeypatc
     )
 
     assert exit_code == 1
-    assert "expected_to_trade_without_runner_started" in fatals
+    assert any("trade_runner_not_started" in fatal for fatal in fatals)
