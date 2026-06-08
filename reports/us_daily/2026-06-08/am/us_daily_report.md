@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-01
+# US Daily Report - 2026-06-08
 
 ## Required Fields
 
-- trade_date: 2026-05-01
+- trade_date: 2026-06-08
 - run_id: 25718405741
 - sha: test-sha
 - workflow: US Trade AM
@@ -23,9 +23,9 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_1
+- last_stage: tick_2
 - final_status: OK
-- reason: force_now_single_tick
+- reason: max_ticks
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 

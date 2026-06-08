@@ -32,27 +32,28 @@ GUARD_SCRIPT = Path("scripts/write_us_guard_failure_report.py")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_prep_has_0700_edt_cron():
-    """us-trade-prep.yml에 07:xx EDT cron이 다수 존재 (다중화 스케줄)."""
+    """us-trade-prep.yml에 06:xx EDT cron이 다수 존재 (UTC 09:xx / 10:xx 다중화 스케줄)."""
     text = PREP_YML.read_text(encoding="utf-8")
     import re
-    edt_crons = re.findall(r'cron:.*1[12] \* \* 1-5', text)
-    assert len(edt_crons) >= 4, f"us-trade-prep.yml EDT cron 다중화 부족: {edt_crons}"
+    # EDT 06:00 ET = UTC 10:xx; prewarm at UTC 09:50 also included
+    edt_crons = re.findall(r'cron:.*["\']\d+ (?:9|10) \* \* 1-5["\']', text)
+    assert len(edt_crons) >= 4, f"us-trade-prep.yml EDT cron 다중화 부족 (UTC 09-10 hour): {edt_crons}"
 
 
 def test_prep_has_0700_est_cron():
-    """us-trade-prep.yml에 07:xx EST cron이 다수 존재 (다중화 스케줄)."""
+    """us-trade-prep.yml에 06:xx EST cron이 다수 존재 (UTC 10:xx / 11:xx 다중화 스케줄)."""
     text = PREP_YML.read_text(encoding="utf-8")
     import re
-    est_crons = re.findall(r'cron:.*1[23] \* \* 1-5', text)
-    assert len(est_crons) >= 4, f"us-trade-prep.yml EST cron 다중화 부족: {est_crons}"
+    # EST 06:00 ET = UTC 11:xx; prewarm at UTC 10:50 also included
+    est_crons = re.findall(r'cron:.*["\']\d+ (?:10|11) \* \* 1-5["\']', text)
+    assert len(est_crons) >= 4, f"us-trade-prep.yml EST cron 다중화 부족 (UTC 10-11 hour): {est_crons}"
 
 
 def test_prep_phase_guard_is_0700_based():
-    """us-trade-prep.yml phase guard가 07:00 ET 기준."""
+    """us-trade-prep.yml phase guard가 06:00 ET 기준 (0600 ET window)."""
     text = PREP_YML.read_text(encoding="utf-8")
-    assert "target_min=$((7 * 60 + 0))" in text or "target_min=$(( 7 * 60 + 0 ))" in text or \
-           "7 * 60 + 0" in text, "prep phase guard must use 07:00 ET target"
-    assert "phase_window=0700-0810" in text, "prep log must show phase_window=0700-0810"
+    assert "6 * 60 + 0" in text, "prep phase guard must use 06:00 ET target"
+    assert "phase_window=0600-0810" in text, "prep log must show phase_window=0600-0810"
 
 
 def test_prep_no_fallback_only_comment():

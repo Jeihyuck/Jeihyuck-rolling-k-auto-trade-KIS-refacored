@@ -795,6 +795,9 @@ def generate_us_pnl_report(
         else _safe_int((daily_report or {}).get("trade_runner_started", 0))
     )
     trade_runner_block_reason = trade_runner_block_reason_env or (daily_report or {}).get("trade_block_reason") or (daily_report or {}).get("reason") or ""
+    # "none" is a sentinel set by workflow when trade runner starts (prevents stale DB fallback)
+    if trade_runner_block_reason == "none":
+        trade_runner_block_reason = ""
     if not schedule_expected_et:
         schedule_expected_et = str((daily_report or {}).get("schedule_expected_et", ""))
     if not actual_start_et:
