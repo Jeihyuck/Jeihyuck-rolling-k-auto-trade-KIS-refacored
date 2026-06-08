@@ -17,6 +17,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 from datetime import datetime
 
+from trader.kis_wrapper import KisAPI, _breaker_check, _breaker_record_temp_failure, get_breaker_runtime_stats
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -240,8 +242,38 @@ class TestKisRateLimiterIntegration(unittest.TestCase):
             can_enter_new_position = False
         else:
             can_enter_new_position = True
-        
+
         self.assertFalse(can_enter_new_position)
+
+    def test_breaker_open_and_block_stats_are_separated(self):
+        before = get_breaker_runtime_stats(reset=True)
+        self.assertEqual(before["open_count"], 0)
+        self.assertEqual(before["blocked_count"], 0)
+
+        target_url = "https://example.test/uapi/domestic-stock/v1/trading/order-cash"
+        for _ in range(2):
+            _breaker_record_temp_failure("POST", target_url)
+
+        opened = get_breaker_runtime_stats(reset=False)
+        self.assertGreaterEqual(opened["open_count"], 1)
+
+        blocked, _until = _breaker_check("POST", target_url)
+        self.assertTrue(blocked)
+
+        blocked_stats = get_breaker_runtime_stats(reset=True)
+        self.assertGreaterEqual(blocked_stats["blocked_count"], 1)
+
+    def test_global_http_gap_uses_order_cash_interval(self):
+        api = object.__new__(KisAPI)
+        api._last_http_request_at = 100.0
+        api._rate_limit_safe_enabled = lambda: True
+
+        with patch("trader.kis_wrapper.time.time", side_effect=[100.2, 101.15, 101.15]), patch("trader.kis_wrapper.time.sleep") as mock_sleep:
+            api._wait_for_http_gap("order-cash", "https://example.test/uapi/domestic-stock/v1/trading/order-cash")
+
+        mock_sleep.assert_called_once()
+        slept = mock_sleep.call_args[0][0]
+        self.assertGreaterEqual(slept, 0.65)
 
     def test_kis_order_min_interval_enforced_globally(self):
         """KIS_ORDER_MIN_INTERVAL_SEC는 모든 order 호출에 적용되어야 한다."""

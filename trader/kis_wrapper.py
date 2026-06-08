@@ -199,6 +199,7 @@ _KIS_BREAKER_THRESHOLD_ORDER = int(os.getenv("KIS_BREAKER_THRESHOLD_ORDER", "2")
 _KIS_BREAKER_THRESHOLD_AUTH = int(os.getenv("KIS_BREAKER_THRESHOLD_AUTH", "2") or "2")
 _KIS_BREAKER_THRESHOLD_DATA = int(os.getenv("KIS_BREAKER_THRESHOLD_DATA", "10") or "10")
 _KIS_BREAKER_OPEN_SEC = int(os.getenv("KIS_BREAKER_OPEN_SEC", "60") or "60")
+_KIS_BREAKER_STATS: dict[str, int] = {"open_count": 0, "blocked_count": 0, "policy_count": 0}
 _KIS_TEMP_ERROR_CODES: set[str] = {
     code.strip()
     for code in (os.getenv("KIS_TEMP_ERROR_CODES") or "EGW00201").split(",")
@@ -503,6 +504,7 @@ def _breaker_policy(method: str, url: str) -> dict[str, Any]:
             applicable = False
             threshold = _KIS_BREAKER_THRESHOLD_DATA
 
+    _KIS_BREAKER_STATS["policy_count"] = int(_KIS_BREAKER_STATS.get("policy_count", 0)) + 1
     logger.info(
         "[KIS][BREAKER_POLICY] endpoint=%s category=%s global_breaker_applicable=%s threshold=%s",
         endpoint_name,
@@ -529,6 +531,12 @@ def _breaker_check(method: str, url: str) -> tuple[bool, float | None]:
         entry = state.get("endpoints", {}).get(key, {})
         open_until = entry.get("open_until")
         if isinstance(open_until, (int, float)) and now_ts < open_until:
+            _KIS_BREAKER_STATS["blocked_count"] = int(_KIS_BREAKER_STATS.get("blocked_count", 0)) + 1
+            logger.warning(
+                "[KIS][BREAKER_BLOCK] endpoint=%s reason=CIRCUIT_OPEN until=%.0f",
+                policy.get("endpoint"),
+                float(open_until),
+            )
             return True, float(open_until)
     return False, None
 
@@ -549,8 +557,18 @@ def _breaker_record_temp_failure(method: str, url: str) -> None:
         failures = [ts for ts in failures if isinstance(ts, (int, float)) and ts >= window_start]
         failures.append(now_ts)
         entry["failures"] = failures
+        previous_open_until = entry.get("open_until")
         if len(failures) >= int(policy.get("threshold") or _KIS_BREAKER_THRESHOLD_DATA):
             entry["open_until"] = now_ts + _KIS_BREAKER_OPEN_SEC
+            if not isinstance(previous_open_until, (int, float)) or previous_open_until < now_ts:
+                _KIS_BREAKER_STATS["open_count"] = int(_KIS_BREAKER_STATS.get("open_count", 0)) + 1
+                logger.warning(
+                    "[KIS][BREAKER_OPEN] endpoint=%s category=%s fail_count=%s until=%.0f",
+                    policy.get("endpoint"),
+                    policy.get("category"),
+                    len(failures),
+                    float(entry["open_until"]),
+                )
         state["endpoints"][key] = entry
         _save_breaker_state(state)
 
@@ -722,6 +740,17 @@ _price_cache = _PriceCache(ttl_sec=_PRICE_TTL_SEC, circuit_sec=_PRICE_CIRCUIT_SE
 
 def get_price_runtime_stats(*, reset: bool = False) -> dict[str, int]:
     return _price_cache.snapshot_stats(reset=reset)
+
+
+def get_breaker_runtime_stats(*, reset: bool = False) -> dict[str, int]:
+    stats = {
+        "open_count": int(_KIS_BREAKER_STATS.get("open_count", 0)),
+        "blocked_count": int(_KIS_BREAKER_STATS.get("blocked_count", 0)),
+        "policy_count": int(_KIS_BREAKER_STATS.get("policy_count", 0)),
+    }
+    if reset:
+        _KIS_BREAKER_STATS.update({"open_count": 0, "blocked_count": 0, "policy_count": 0})
+    return stats
 
 
 def _mark_price_rate_limited(endpoint: str, code: str | None, msg_cd: str, msg1: str | None) -> None:
@@ -998,6 +1027,7 @@ class KisAPI:
             min_interval_sec=float(os.getenv("KIS_ORDER_MIN_INTERVAL_SEC", "0.25"))
         )
         self._last_hashkey_at = 0.0
+        self._last_http_request_at = 0.0
         self._order_hashkey_gap_sec = float(os.getenv("KIS_ORDER_HASHKEY_GAP_SEC", "0.35"))
         self._concurrency_sem = threading.Semaphore(_env_int("KIS_CONCURRENCY", 2))
         self._recent_sells: Dict[str, float] = {}
@@ -1079,6 +1109,39 @@ class KisAPI:
             )
             time.sleep(sleep_sec)
         self._last_data_request_at = time.time()
+
+    def _endpoint_min_gap_sec(self, endpoint_name: str, url: str = "") -> float:
+        endpoint = str(endpoint_name or "").strip().lower().replace("_", "-")
+        path = _endpoint_path(url).lower()
+        if endpoint == "hashkey" or "/uapi/hashkey" in path:
+            return float(os.getenv("KIS_HASHKEY_MIN_GAP_SEC", "0.50") or "0.50")
+        if endpoint in {"order-cash", "order-cash-safe", "orders-safe"} or "order-cash" in path:
+            return float(os.getenv("KIS_ORDER_CASH_MIN_GAP_SEC", "0.90") or "0.90")
+        if endpoint in {"inquire-balance", "inquire-psbl-order", "psbl-order"} or any(token in path for token in ("inquire-balance", "inquire-psbl-order")):
+            return float(os.getenv("KIS_BALANCE_MIN_GAP_SEC", "0.50") or "0.50")
+        if endpoint.startswith("inquire") or any(token in path for token in ("inquire-price", "inquire-daily-ccld", "inquire-daily-itemchartprice")):
+            return float(os.getenv("KIS_DATA_GLOBAL_MIN_GAP_SEC", "0.30") or "0.30")
+        return float(os.getenv("KIS_HTTP_GLOBAL_MIN_GAP_SEC", "0.30") or "0.30")
+
+    def _wait_for_http_gap(self, endpoint_name: str, url: str = "") -> None:
+        if not self._rate_limit_safe_enabled():
+            return
+        required_gap = self._endpoint_min_gap_sec(endpoint_name, url)
+        now = time.time()
+        delta = now - float(self._last_http_request_at or 0.0)
+        if delta < required_gap:
+            sleep_sec = required_gap - delta + random.uniform(0, 0.03)
+            log_tag = "ORDER_GAP" if ("order-cash" in str(endpoint_name) or "order-cash" in _endpoint_path(url)) else "GLOBAL_GAP"
+            logger.warning(
+                "[KIS][RATE_LIMIT][%s] endpoint=%s required=%.2f actual=%.2f sleep=%.2f",
+                log_tag,
+                endpoint_name,
+                required_gap,
+                delta,
+                sleep_sec,
+            )
+            time.sleep(sleep_sec)
+        self._last_http_request_at = time.time()
 
     def invalidate_balance_cache(self, *, reason: str, codes: list[str] | None = None) -> None:
         self._balance_cache = None
@@ -1328,6 +1391,7 @@ class KisAPI:
 
         endpoint_name = endpoint or _endpoint_name(url)
         path_lower = _endpoint_path(url)
+        self._wait_for_http_gap(endpoint_name, url)
         data_gap_paths = (
             "inquire-price",
             "inquire-balance",
@@ -4031,11 +4095,19 @@ class KisAPI:
                         last_err = data
                         continue
 
-                    logger.error(f"[ORDER_FAIL_BIZ] tr_id={tr_id} ord_dvsn={ord_dvsn} resp={data}")
+                    logger.error(
+                        "[ORDER_FAIL_BIZ] code=%s tr_id=%s ord_dvsn=%s msg_cd=%s msg1=%s resp=%s",
+                        body.get("PDNO"),
+                        tr_id,
+                        ord_dvsn,
+                        msg_cd,
+                        msg1,
+                        data,
+                    )
                     blocked = _is_order_disallowed(data)
                     if blocked:
                         _mark_order_blocked(blocked, now)
-                    return None
+                    return data
 
                 logger.warning(f"[ORDER_FALLBACK] tr_id={tr_id} ord_dvsn={ord_dvsn} 실패 → 다음 방식 시도")
 
@@ -4077,28 +4149,33 @@ class KisAPI:
                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
                 break
 
-        base_qty = hldg if hldg > 0 else ord_psbl
-        if base_qty <= 0:
-            logger.error(
-                "[SELL_PRECHECK][NO_KIS_HOLDING] pdno=%s hldg=%s ord_psbl=%s action=block",
-                pdno, hldg, ord_psbl,
-            )
+        sell_qty = min(max(0, int(qty or 0)), max(0, hldg), max(0, ord_psbl))
+        logger.info(
+            "[SELLABLE][CHECK] code=%s holding_qty=%s orderable_qty=%s strategy_qty=%s sell_qty=%s",
+            safe_strip(pdno),
+            hldg,
+            ord_psbl,
+            int(qty or 0),
+            sell_qty,
+        )
+        if sell_qty <= 0:
             return {
-                "rt_cd": "PB1_BLOCKED",
-                "msg_cd": "SELL_BLOCKED_NO_KIS_HOLDING",
-                "msg1": "KIS actual holding qty is zero. Sell blocked before API order.",
+                "status": "SKIPPED",
+                "rt_cd": "1",
+                "msg_cd": "NO_SELLABLE_QTY",
+                "msg1": "sellable quantity is zero",
                 "blocked": True,
-                "skip_reason": "SELL_BLOCKED_NO_KIS_HOLDING",
+                "skip_reason": "NO_SELLABLE_QTY",
                 "pdno": safe_strip(pdno),
                 "hldg_qty": hldg,
                 "ord_psbl_qty": ord_psbl,
             }
 
-        if qty > base_qty:
+        if qty > sell_qty:
             logger.warning(
-                f"[SELL_PRECHECK] 수량 보정: req={qty} -> base={base_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
+                f"[SELL_PRECHECK] 수량 보정: req={qty} -> sellable={sell_qty} (hldg={hldg}, ord_psbl={ord_psbl})"
             )
-            qty = base_qty
+            qty = sell_qty
 
         # --- 중복 매도 방지(메모리 기반) ---
         now_ts = time.time()
@@ -4277,19 +4354,34 @@ class KisAPI:
                 ord_psbl = int(float(r.get("ord_psbl_qty", "0")))
                 break
 
-        base_qty = hldg if hldg > 0 else ord_psbl
-        if base_qty <= 0:
-            logger.error(
-                f"[SELL_LIMIT_PRECHECK] 보유 없음/수량 0 pdno={pdno} hldg={hldg} ord_psbl={ord_psbl}"
-            )
-            return None
+        sell_qty = min(max(0, int(qty or 0)), max(0, hldg), max(0, ord_psbl))
+        logger.info(
+            "[SELLABLE][CHECK] code=%s holding_qty=%s orderable_qty=%s strategy_qty=%s sell_qty=%s",
+            safe_strip(pdno),
+            hldg,
+            ord_psbl,
+            int(qty or 0),
+            sell_qty,
+        )
+        if sell_qty <= 0:
+            return {
+                "status": "SKIPPED",
+                "rt_cd": "1",
+                "msg_cd": "NO_SELLABLE_QTY",
+                "msg1": "sellable quantity is zero",
+                "blocked": True,
+                "skip_reason": "NO_SELLABLE_QTY",
+                "pdno": safe_strip(pdno),
+                "hldg_qty": hldg,
+                "ord_psbl_qty": ord_psbl,
+            }
 
-        if qty > base_qty:
+        if qty > sell_qty:
             logger.warning(
-                f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> base={base_qty} "
+                f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> sellable={sell_qty} "
                 f"(hldg={hldg}, ord_psbl={ord_psbl})"
             )
-            qty = base_qty
+            qty = sell_qty
 
         # 중복 매도 방지(메모리 기반)
         now_ts = time.time()

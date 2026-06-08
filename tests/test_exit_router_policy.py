@@ -202,6 +202,46 @@ def test_r_tp1_fires_when_trend_weak(monkeypatch):
     assert result["reason"] == "EXIT_SWING_TP1"
 
 
+def test_trail_stop_hit_exits_with_non_zero_qty(monkeypatch):
+    _policy_swing_default(monkeypatch)
+    monkeypatch.setenv("PB1_SWING_MIN_TRAIL_BARS", "2")
+
+    pos = _swing_pos(avg=10000.0, qty=9, initial_stop=9500.0)
+    pos["holding_bars"] = 5
+    policy = resolve_exit_policy_for_position(
+        pos,
+        features={},
+        holding_ctx={
+            "days_held": 5,
+            "current_return_pct": 9.0,
+            "current_r": 1.8,
+            "highest_return_pct": 14.0,
+            "mark": 10850.0,
+        },
+        market_ctx={"ma20": 10300.0, "ma50": 10100.0},
+    )
+
+    result = apply_swing_exit_decision(
+        pos,
+        10850.0,
+        policy,
+        ret_pct=8.5,
+        current_r=1.8,
+        highest_ret_pct=14.0,
+        days_held=5,
+        stop_hit=False,
+        trail_hit=True,
+        trail_stop_price=10900.0,
+        effective_stop=9500.0,
+        effective_r=500.0,
+    )
+
+    assert result["exit_ok"] is True
+    assert result["reason"] == "TRAIL_STOP_HIT"
+    assert int(result["qty"]) > 0
+
+
+
 # ────────────────────────────────────────────────────────────────
 # TC3: 삼성E&A +7.13% 하드코딩 매도 금지
 # ────────────────────────────────────────────────────────────────

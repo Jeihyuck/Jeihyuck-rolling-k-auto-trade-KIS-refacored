@@ -294,3 +294,31 @@ def test_force_exit_simulation_builds_payload_without_sell_api(monkeypatch, capl
     assert payload["order_skip_reasons"] == ["force_exit_simulation"]
     assert kis.sell_calls == 0
     assert "[EXIT][SIMULATION] code=032830" in caplog.text
+
+
+def test_resolve_market_close_falls_back_to_default(monkeypatch):
+    db_engine = _new_db_engine()
+    now_kst = datetime(2026, 6, 8, 9, 5, tzinfo=KST)
+    engine, *_ = _make_engine(
+        db_engine=db_engine,
+        now_kst=now_kst,
+        dry_run=True,
+        intended_live=False,
+        kis=None,
+    )
+    monkeypatch.delenv("MARKET_CLOSE_TIME", raising=False)
+    monkeypatch.delenv("CLOSE_AUCTION_END", raising=False)
+
+    close_dt, raw = engine._resolve_market_close()
+
+    assert raw == "15:30"
+    assert close_dt.hour == 15
+    assert close_dt.minute == 30
+
+
+def test_format_order_result_reason_preserves_business_code():
+    reason = PB1Engine._format_order_result_reason(
+        {"rt_cd": "1", "msg_cd": "40240000", "msg1": "모의투자 주문처리가 안되었습니다(매매불가 종목)"}
+    )
+
+    assert reason == "ORDER_FAIL_BIZ_40240000"

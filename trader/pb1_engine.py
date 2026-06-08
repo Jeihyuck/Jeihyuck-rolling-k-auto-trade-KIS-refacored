@@ -1333,6 +1333,8 @@ def _resolve_swing_staged_exit(
     ret_pct: float,
     days_held: int,
     stop_hit: bool,
+    trail_hit: bool = False,
+    trail_stop_price: float | None = None,
     highest_ret_pct: float | None = None,
 ) -> dict[str, Any]:
     """SWING_CARRY R-multiple 단계별 매도 정책 (Multi-Layer Exit Router 통합).
@@ -1428,6 +1430,8 @@ def _resolve_swing_staged_exit(
             highest_ret_pct=_highest_ret,
             days_held=trading_days_held,
             stop_hit=stop_hit,
+            trail_hit=trail_hit,
+            trail_stop_price=trail_stop_price,
             ma20=ma20,
             effective_stop=effective_stop,
             effective_r=float(effective_r) if effective_r else 0.0,
@@ -3427,17 +3431,57 @@ class PB1Engine:
         return cutoff, raw
 
     def _resolve_market_close(self) -> tuple[datetime, str]:
-        raw = (os.getenv("MARKET_CLOSE_TIME") or CLOSE_AUCTION_END or "").strip()
-        if not raw:
-            raw = "15:30"
+        fallback_raw = "15:30"
+        source = "default"
+        raw = ""
         try:
-            close_time = datetime.strptime(raw, "%H:%M").time()
-        except ValueError:
-            logger.warning("[PB1][ENV] invalid MARKET_CLOSE_TIME=%s fallback=%s", raw, CLOSE_AUCTION_END)
-            close_time = datetime.strptime(CLOSE_AUCTION_END, "%H:%M").time()
-            raw = CLOSE_AUCTION_END
-        close_dt = datetime.combine(self._now_kst.date(), close_time, tzinfo=self._now_kst.tzinfo)
-        return close_dt, raw
+            market_close_env = str(os.getenv("MARKET_CLOSE_TIME") or "").strip()
+            close_auction_env = str(os.getenv("CLOSE_AUCTION_END") or "").strip()
+            if market_close_env:
+                raw = market_close_env
+                source = "MARKET_CLOSE_TIME"
+            elif close_auction_env:
+                raw = close_auction_env
+                source = "CLOSE_AUCTION_END"
+            else:
+                raw = fallback_raw
+            try:
+                close_time = datetime.strptime(raw, "%H:%M").time()
+            except ValueError:
+                logger.warning(
+                    "[PB1][MARKET_CLOSE][INVALID] raw=%s source=%s fallback=%s",
+                    raw,
+                    source,
+                    fallback_raw,
+                )
+                raw = fallback_raw
+                source = "default"
+                close_time = datetime.strptime(fallback_raw, "%H:%M").time()
+            close_dt = datetime.combine(self._now_kst.date(), close_time, tzinfo=self._now_kst.tzinfo)
+            logger.info(
+                "[PB1][MARKET_CLOSE][RESOLVE] raw=%s source=%s close=%s",
+                raw,
+                source,
+                close_dt.isoformat(),
+            )
+            return close_dt, raw
+        except Exception as exc:
+            close_time = datetime.strptime(fallback_raw, "%H:%M").time()
+            close_dt = datetime.combine(self._now_kst.date(), close_time, tzinfo=self._now_kst.tzinfo)
+            logger.warning(
+                "[PB1][MARKET_CLOSE][RESOLVE_FAIL] raw=%s source=%s err=%s fallback=%s",
+                raw,
+                source,
+                exc,
+                fallback_raw,
+            )
+            logger.info(
+                "[PB1][MARKET_CLOSE][RESOLVE] raw=%s source=%s close=%s",
+                fallback_raw,
+                "default",
+                close_dt.isoformat(),
+            )
+            return close_dt, fallback_raw
 
     def _is_buy_allowed_now(self, now: datetime | None = None) -> tuple[bool, str, datetime, datetime]:
         current_now = now or now_kst()
@@ -6225,6 +6269,8 @@ class PB1Engine:
             return "ORDER_OK"
         msg_cd = resp.get("msg_cd")
         msg1 = resp.get("msg1")
+        if msg_cd:
+            return f"ORDER_FAIL_BIZ_{msg_cd}"
         return f"ORDER_FAIL_API(rt_cd={rt_cd},msg_cd={msg_cd},msg1={msg1})"
 
     @staticmethod
@@ -10108,6 +10154,7 @@ class PB1Engine:
             final_reason = _blocked_reason or "SWING_SAME_DAY_GUARD_BLOCK"
             ordered_reasons = [final_reason]
 
+        _router_reason = final_reason
         if exit_policy_family in {
             "INTRADAY_PROFIT_PROTECT",
             "SWING_STAGED_EXIT",
@@ -10134,6 +10181,8 @@ class PB1Engine:
                         ret_pct=ret_pct,
                         days_held=trading_days_held,
                         stop_hit=stop_hit,
+                        trail_hit=trail_hit,
+                        trail_stop_price=trail_stop_price,
                         highest_ret_pct=_max_pnl,
                     )
                 else:
@@ -10149,6 +10198,8 @@ class PB1Engine:
                     ret_pct=ret_pct,
                     days_held=trading_days_held,
                     stop_hit=stop_hit,
+                    trail_hit=trail_hit,
+                    trail_stop_price=trail_stop_price,
                     highest_ret_pct=_max_pnl,
                 )
             elif _active_family == "CORE_TREND_FOLLOW":
@@ -10163,6 +10214,7 @@ class PB1Engine:
                 _router_qty = int(horizon_result.get("qty", 0))
                 _router_full_exit = bool(horizon_result.get("full_exit", False))
                 _router_sell_pct = horizon_result.get("sell_pct")
+                _router_reason = str(horizon_result.get("reason") or final_reason)
                 logger.info(
                     "[EXIT][HORIZON] code=%s horizon=%s family=%s exit_ok=%s reason=%s qty=%s full_exit=%s sell_pct=%s holding_qty=%s",
                     display_code,
@@ -10201,6 +10253,9 @@ class PB1Engine:
                 _router_full_exit = False
                 _router_sell_pct = None
 
+        signal_hit = bool(stop_hit or trail_hit or ma20_break or ma50_break or time_stop_hit or risk_off_hit)
+        eval_reason = final_reason if signal_hit else "NO_EXIT_SIGNAL"
+
         exit_eval = ExitEvaluation(
             code=code,
             holding_qty=qty,
@@ -10236,12 +10291,15 @@ class PB1Engine:
             time_stop_hit=exit_eval.time_stop_hit,
             risk_off_hit=exit_eval.risk_off_hit,
             exit_ok=exit_eval.exit_ok,
-            reasons=[exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
-            decision_reason=exit_eval.primary_reason,
+            reasons=[eval_reason] + list(exit_eval.secondary_reasons),
+            decision_reason=eval_reason,
             secondary_reasons=exit_eval.secondary_reasons,
         )
         exit_eval_payload.update(
             {
+                "signal_hit": signal_hit,
+                "eval_reason": eval_reason,
+                "router_reason": _router_reason,
                 "entry_reason": entry_reason_normalized,
                 "entry_style_selected": entry_style_selected,
                 "exit_family": exit_eval.family,
@@ -10276,6 +10334,7 @@ class PB1Engine:
                 "exit_rule_version": "pb1_exit_reason_v2",
                 "submit_attempted": 0,
                 "submitted": 0,
+                "order_result": "ORDER_SKIPPED_NO_SIGNAL" if not signal_hit else "ORDER_SIGNAL_ONLY",
                 "order_skip_reasons": [],
                 "holdings_source": str((self._exit_holdings_meta or {}).get("source") or "unknown"),
                 "condition_details": conds,
@@ -10405,8 +10464,28 @@ class PB1Engine:
 
         if orderable_qty <= 0:
             exit_eval_payload["order_skip_reasons"] = ["orderable_qty_zero"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_ROUTER_QTY_ZERO"
             logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
+
+        holding_qty = max(0, int(qty or 0))
+        orderable_balance_qty = max(0, int(pos.get("orderable_qty") or 0))
+        strategy_qty = max(0, int(orderable_qty or 0))
+        sell_qty = min(strategy_qty, holding_qty, orderable_balance_qty)
+        logger.info(
+            "[SELLABLE][CHECK] code=%s holding_qty=%s orderable_qty=%s strategy_qty=%s sell_qty=%s",
+            display_code,
+            holding_qty,
+            orderable_balance_qty,
+            strategy_qty,
+            sell_qty,
+        )
+        if sell_qty <= 0:
+            exit_eval_payload["order_skip_reasons"] = ["NO_SELLABLE_QTY"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY"
+            logger.info("[EXIT][ORDER_SKIP] code=%s reason=NO_SELLABLE_QTY", display_code)
+            return exit_eval_payload
+        orderable_qty = sell_qty
 
         stage = exit_eval.primary_reason
         simulated_client_key = None
@@ -10594,6 +10673,7 @@ class PB1Engine:
             msg_cd,
             msg1,
         )
+        exit_eval_payload["order_result"] = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
         logger.info(
             "[TRADE][ORDER][SELL] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
             code,
@@ -10889,28 +10969,27 @@ class PB1Engine:
             for evaluation in exit_evaluations
         )
         eval_reason_counter = Counter(
-            str(evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
+            str(evaluation.get("eval_reason") or (evaluation.get("primary_reason") if evaluation.get("signal_hit") else "NO_EXIT_SIGNAL") or "NO_EXIT_SIGNAL")
             for evaluation in exit_evaluations
         )
         router_reason_counter = Counter(
-            str(evaluation.get("decision_reason") or evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
+            str(evaluation.get("router_reason") or evaluation.get("decision_reason") or evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
             for evaluation in exit_evaluations
         )
         order_reason_counter = Counter(
-            str(evaluation.get("primary_reason") or "NO_EXIT_SIGNAL")
+            str(evaluation.get("order_result") or ("ORDER_ACCEPTED" if int(evaluation.get("submitted") or 0) > 0 else "ORDER_SKIPPED_NO_SIGNAL"))
             for evaluation in exit_evaluations
-            if int(evaluation.get("submitted") or 0) > 0
         )
         logger.info("[EXIT][SUMMARY_BY_FAMILY] counts=%s", dict(family_counter))
         logger.info("[EXIT][SUMMARY_BY_REASON] counts=%s", dict(eval_reason_counter))
         logger.info("[EXIT][SUMMARY][EVAL_REASON] counts=%s", dict(eval_reason_counter))
         logger.info("[EXIT][SUMMARY][ROUTER_REASON] counts=%s", dict(router_reason_counter))
-        logger.info("[EXIT][SUMMARY][ORDER_REASON] counts=%s", dict(order_reason_counter))
+        logger.info("[EXIT][SUMMARY][ORDER_RESULT] counts=%s", dict(order_reason_counter))
         self._exit_summary_payload.update(
             {
                 "eval_reason_summary": dict(eval_reason_counter),
                 "router_reason_summary": dict(router_reason_counter),
-                "order_reason_summary": dict(order_reason_counter),
+                "order_result_summary": dict(order_reason_counter),
             }
         )
         return pos_list

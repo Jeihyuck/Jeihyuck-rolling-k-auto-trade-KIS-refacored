@@ -411,6 +411,8 @@ def apply_swing_exit_decision(
     highest_ret_pct: float,
     days_held: int,
     stop_hit: bool,
+    trail_hit: bool = False,
+    trail_stop_price: float | None = None,
     ma20: float | None = None,
     effective_stop: float = 0.0,
     effective_r: float = 0.0,
@@ -469,6 +471,42 @@ def apply_swing_exit_decision(
             "qty": qty,
             "sell_pct": None,
             "update_meta": _eff_meta,
+        }
+
+    min_trail_bars = max(0, int(os.getenv("PB1_SWING_MIN_TRAIL_BARS", os.getenv("MIN_TRAIL_BARS", "2")) or "2"))
+    raw_trail_sell_pct = str(os.getenv("PB1_SWING_TRAIL_SELL_PCT", "")).strip()
+    try:
+        trail_sell_pct = float(raw_trail_sell_pct) if raw_trail_sell_pct else None
+    except (TypeError, ValueError):
+        trail_sell_pct = None
+    resolved_trail_stop = float(
+        trail_stop_price
+        or meta.get("trail_stop_price")
+        or meta.get("last_trail_stop")
+        or pos.get("last_trail_stop")
+        or 0.0
+    )
+    trail_price_hit = bool(trail_hit or (resolved_trail_stop > 0 and mark < resolved_trail_stop))
+    if trail_price_hit and holding_bars >= min_trail_bars:
+        qty = _calculate_exit_qty(orderable_qty, trail_sell_pct)
+        logger.info(
+            "[EXIT][ROUTER][DECISION] code=%s exit_ok=1 reason=TRAIL_STOP_HIT mark=%.2f trail_stop=%.2f holding_bars=%s qty=%s",
+            code_for_log,
+            mark,
+            resolved_trail_stop,
+            holding_bars,
+            qty,
+        )
+        return {
+            "exit_ok": True,
+            "reason": "TRAIL_STOP_HIT",
+            "qty": qty,
+            "sell_pct": trail_sell_pct,
+            "full_exit": trail_sell_pct is None,
+            "update_meta": {
+                **_eff_meta,
+                "trail_stop_price": resolved_trail_stop,
+            },
         }
 
     # ── 2. Giveback protection (peak 대비 반납) ───────────────────────

@@ -108,7 +108,7 @@ from trader.diagnostics.nontrading_smoke import (
     run_nontrading_smoke_once,
     write_nontrading_smoke_flag,
 )
-from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError, get_price_runtime_stats
+from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, KisTemporaryError, get_breaker_runtime_stats, get_price_runtime_stats
 from trader.pb1_engine import PB1Engine, UniverseContext, resolve_pb1_phase
 from trader.entry_engine import scan_all_strategies, calculate_position_size
 from trader.reconcile_kis import reconcile_kis, reconcile_today
@@ -217,6 +217,22 @@ def _resolve_session_terminal_state(*, result_status: str, exit_reason: str, war
     if _warning_total(counts) > 0 or status in {"WARN_FAIL_OPEN", "OK_WITH_WARNINGS"}:
         return "SESSION_END_OK_WITH_WARNINGS"
     return "SESSION_END_OK"
+
+
+def _runtime_fatal_signature(exc: Exception) -> tuple[str, str]:
+    return type(exc).__name__, str(exc).strip() or "<empty>"
+
+
+def _update_runtime_fatal_guard(
+    *,
+    previous_signature: tuple[str, str] | None,
+    previous_count: int,
+    exc: Exception,
+    repeat_threshold: int,
+) -> tuple[tuple[str, str], int, bool]:
+    signature = _runtime_fatal_signature(exc)
+    count = previous_count + 1 if previous_signature == signature else 1
+    return signature, count, count >= max(2, int(repeat_threshold or 2))
 
 
 def evaluate_workflow_log_success(*, session: str, log_text: str) -> dict[str, Any]:
@@ -5795,6 +5811,7 @@ def run_once(
             run_summary = getattr(engine_runner, "_run_summary_payload", {}) or {}
             tick_label = os.getenv("PB1_LOOP_TICK_INDEX") or str(run_record_id or "1")
             price_stats = get_price_runtime_stats(reset=True)
+            breaker_stats = get_breaker_runtime_stats(reset=True)
             scanner_usable = int(scanner_summary.get("usable_count", scanner_summary.get("total", 0)))
             raw_signal_setup_ok = int(scanner_summary.get("setup_ok_count", 0))
             pb1_filter_setup_ok = int(run_summary.get("setup_ok", 0))
@@ -5861,20 +5878,24 @@ def run_once(
                 run_summary.get("blocked_by", "none") or "none",
             )
             logger.info(
-                "[%s][HEARTBEAT] tick=%s late_start=%s degraded_session=%s rate_limit_count=%s",
+                "[%s][HEARTBEAT] tick=%s late_start=%s degraded_session=%s rate_limit_count=%s breaker_open_count=%s breaker_block_count=%s",
                 _hb_prefix,
                 tick_label,
                 int(str(os.getenv("TRADE_AM_LATE_START") or "0") == "1"),
                 int(str(os.getenv("TRADE_AM_DEGRADED_SESSION") or "0") == "1"),
                 int(price_stats.get("price_http_fail_count", 0)),
+                int(breaker_stats.get("open_count", 0)),
+                int(breaker_stats.get("blocked_count", 0)),
             )
             logger.info(
-                "[PB1][RATE_LIMIT][SUMMARY] tick=%s price_http_fail_count=%s retry_count=%s cache_hit=%s cache_miss=%s",
+                "[PB1][RATE_LIMIT][SUMMARY] tick=%s price_http_fail_count=%s retry_count=%s cache_hit=%s cache_miss=%s breaker_open_count=%s breaker_block_count=%s",
                 tick_label,
                 int(price_stats.get("price_http_fail_count", 0)),
                 int(price_stats.get("retry_count", 0)),
                 int(price_stats.get("cache_hit", 0)),
                 int(price_stats.get("cache_miss", 0)),
+                int(breaker_stats.get("open_count", 0)),
+                int(breaker_stats.get("blocked_count", 0)),
             )
         except Exception as exc:
             logger.warning("[CONSISTENCY][SCAN_ENGINE][FAIL] err=%s", exc)
@@ -6172,6 +6193,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     exit_reason = "unknown"
     sticky_precheck_reason: str | None = None
     sticky_precheck_count = 0
+    sticky_runtime_signature: tuple[str, str] | None = None
+    sticky_runtime_count = 0
     balance_api_calls = 0
     balance_cache_hits = 0
     balance_tick_cache_hits = 0
@@ -6494,6 +6517,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     time_mod.sleep(sleep_for)
                     sticky_precheck_reason = None
                     sticky_precheck_count = 0
+                    sticky_runtime_signature = None
+                    sticky_runtime_count = 0
                     continue
                 if result_status in {"NO_TRADE", "OK_NO_TRADE", "OK_NO_CANDIDATES"}:
                     sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, loop_interval)
@@ -6509,9 +6534,13 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     time_mod.sleep(sleep_for)
                     sticky_precheck_reason = None
                     sticky_precheck_count = 0
+                    sticky_runtime_signature = None
+                    sticky_runtime_count = 0
                     continue
                 sticky_precheck_reason = None
                 sticky_precheck_count = 0
+                sticky_runtime_signature = None
+                sticky_runtime_count = 0
                 sleep_for = _sleep_until_next_tick_or_session_end(_get_now_kst(), session_end_dt, loop_interval)
                 if sleep_for <= 0:
                     exit_reason = "session_end"
@@ -6603,6 +6632,28 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         message,
                     )
                     exit_reason = "STRUCTURAL_FATAL"
+                    break
+
+                repeat_threshold = max(2, _parse_int_env("PB1_RUNTIME_FATAL_REPEAT_THRESHOLD", 2))
+                sticky_runtime_signature, sticky_runtime_count, should_stop_for_repeat = _update_runtime_fatal_guard(
+                    previous_signature=sticky_runtime_signature,
+                    previous_count=sticky_runtime_count,
+                    exc=exc,
+                    repeat_threshold=repeat_threshold,
+                )
+                logger.error(
+                    "[PB1][FATAL_SIGNATURE] name=%s message=%s repeat=%s",
+                    sticky_runtime_signature[0],
+                    sticky_runtime_signature[1],
+                    sticky_runtime_count,
+                )
+                if should_stop_for_repeat:
+                    exit_reason = "FATAL_RUNTIME_REPEAT"
+                    logger.error(
+                        "[PB1][LOOP][FATAL_REPEAT] action=stop_entry_only name=%s repeat=%s -> exit loop",
+                        sticky_runtime_signature[0],
+                        sticky_runtime_count,
+                    )
                     break
 
                 logger.error(
