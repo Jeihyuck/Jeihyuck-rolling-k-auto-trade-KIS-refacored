@@ -260,7 +260,12 @@ def _load_kis_balance(env: str) -> dict | None:
             duplicate_skipped,
         )
 
-        logger.info("[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d", len(positions), len(normalized))
+        if kis_balance_status == "FAILED_ALL_EXCHANGES":
+            logger.warning("[US_PNL][KIS_BALANCE][FAILED] status=FAILED_ALL_EXCHANGES positions_raw=%d positions_valid=%d", len(positions), len(normalized))
+        elif kis_balance_status == "PARTIAL":
+            logger.warning("[US_PNL][KIS_BALANCE][PARTIAL] positions_raw=%d positions_valid=%d", len(positions), len(normalized))
+        else:
+            logger.info("[US_PNL][KIS_BALANCE][OK] positions_raw=%d positions_valid=%d", len(positions), len(normalized))
 
         return {
             "raw": raw,

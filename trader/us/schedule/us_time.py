@@ -31,14 +31,14 @@ UTC_TZ = ZoneInfo("UTC")
 
 # ── 각 세션별 phase guard 시간 윈도우 (ET) ──────────────────────────────────
 _PHASE_WINDOWS: dict[str, tuple[str, str]] = {
-    "prep":      ("0700", "0820"),   # scheduled 08:05
+    "prep":      ("0600", "0810"),   # scheduled 06:00  (EDT 10:00 UTC / EST 11:00 UTC)
     "am":        ("0930", "1230"),   # scheduled 09:35
     "afternoon": ("1230", "1550"),   # scheduled 12:35
     "close":     ("1545", "1630"),   # scheduled 15:55
 }
 
 _PHASE_SCHEDULED: dict[str, str] = {
-    "prep":      "0805",
+    "prep":      "0600",
     "am":        "0935",
     "afternoon": "1235",
     "close":     "1555",

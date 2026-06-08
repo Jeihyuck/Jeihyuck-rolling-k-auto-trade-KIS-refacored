@@ -380,6 +380,7 @@ jobs:
             echo "US_RECOVERY_RUN=${{ steps.phase_guard.outputs.recovery_run }}"
             echo "US_EVENT_NAME=${{ steps.phase_guard.outputs.event_name }}"
             echo "US_OFFLINE_MODE=${{ (github.event_name == 'workflow_dispatch' && ((inputs.offline && 'true') || (inputs.offline_mode && 'true') || 'false')) || 'false' }}"
+            echo "US_TRADE_SHOULD_RUN=${{ steps.phase_guard.outputs.should_run }}"
           } >> "$GITHUB_ENV"
 
       - name: Emit US AM skip summary
@@ -645,7 +646,9 @@ jobs:
             echo "[US_TRADE_AM][MIGRATION][OK]" | tee -a artifacts/${US_LOG_FILE}
             echo "[US_DB_MIGRATE][DONE]" | tee -a artifacts/${US_LOG_FILE}
             echo "US_TRADE_STATUS=READY" >> "$GITHUB_ENV"
-            echo "US_TRADE_RUNNER_BLOCK_REASON=" >> "$GITHUB_ENV"
+            # 빈 문자열로 초기화하면 stale DB daily_report 값이 fallback으로 쓰임.
+            # "trade_blocked_pre_runner"로 명시 — 이후 trade runner 시작 시 다시 지워짐.
+            echo "US_TRADE_RUNNER_BLOCK_REASON=trade_blocked_pre_runner" >> "$GITHUB_ENV"
           else
             echo "[US_TRADE_AM][MIGRATION][FAIL] reason=db_migration_failed version=0043_us_fills_idempotency_and_order_reconcile_fix.sql" | tee -a artifacts/${US_LOG_FILE}
             echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
@@ -794,6 +797,8 @@ jobs:
           if [ "${CAN_TRADE}" != "1" ]; then
             echo "[US_TRADE_AM][PREP_CONTRACT][FAIL] reason=bad_or_missing_prep prep_status=${PREP_STATUS} locked_count=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
             echo "[US_TRADE_AM][WATCHLIST_LOAD][FAIL] reason=bad_or_missing_prep" | tee -a artifacts/${US_LOG_FILE}
+            echo "US_TRADE_RUNNER_BLOCK_REASON=prep_contract_failed" >> "$GITHUB_ENV"
+            echo "US_TRADE_STATUS=FAILED_PREP_GUARD" >> "$GITHUB_ENV"
 
             python scripts/write_us_guard_failure_report.py \
               --session am \

@@ -1,23 +1,22 @@
 name: "US Trade Prep"
-# prep: universe scoring + locked watchlist | primary window: 07:00 ET
+# prep: universe scoring + locked watchlist | primary window: 06:00 ET
 # This workflow is the primary US prep workflow.
 # US Trade AM consumes this completed prep result and must not run prep itself.
+# Multi-prewarm crons (UTC) cover EDT=10:00 UTC and EST=11:00 UTC.
 
 "on":
   schedule:
-    # NY timezone-aware single cron: 08:05 ET (EDT/EST 자동 적용)
-    - cron: "05 8 * * 1-5"
-      timezone: "America/New_York"
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
-    # Legacy fixed-cron references kept for contract tests:
-    # legacy cron: prep edt 00 11 * * 1-5
-    # legacy cron: prep edt 01 11 * * 1-5
-    # legacy cron: prep edt 02 11 * * 1-5
-    # legacy cron: prep edt 03 11 * * 1-5
-    # legacy cron: prep est 00 12 * * 1-5
-    # legacy cron: prep est 01 12 * * 1-5
-    # legacy cron: prep est 02 12 * * 1-5
-    # legacy cron: prep est 03 12 * * 1-5
+    # UTC multi-prewarm: EDT 05:50-06:20 ET (09:50-10:20 UTC)
+    - cron: "50 9 * * 1-5"    # EDT 05:50 ET prewarm
+    - cron: "0 10 * * 1-5"    # EDT 06:00 ET primary
+    - cron: "10 10 * * 1-5"   # EDT 06:10 ET recovery
+    - cron: "20 10 * * 1-5"   # EDT 06:20 ET recovery
+    # UTC multi-prewarm: EST 05:50-06:20 ET (10:50-11:20 UTC)
+    - cron: "50 10 * * 1-5"   # EST 05:50 ET prewarm
+    - cron: "0 11 * * 1-5"    # EST 06:00 ET primary
+    - cron: "10 11 * * 1-5"   # EST 06:10 ET recovery
+    - cron: "20 11 * * 1-5"   # EST 06:20 ET recovery
+    # [US_SCHEDULE][CONFIG] schedule_mode=utc_multi_cron crons=8 primary_et=0600
   workflow_dispatch:
     inputs:
       dry_run:
@@ -51,7 +50,7 @@ name: "US Trade Prep"
 
 concurrency:
   group: us-trade-prep-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -135,11 +134,11 @@ jobs:
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
           # US prep primary schedule
-          prewarm_earliest_min=$((6 * 60 + 45))  # 06:45 ET
-          target_min=$((7 * 60 + 0))             # 07:00 ET
-          normal_until_min=$((7 * 60 + 45))      # 07:45 ET
-          recovery_until_min=$((9 * 60 + 20))    # 09:20 ET
-          schedule_expected_min=$((7 * 60 + 0))
+          prewarm_earliest_min=$((5 * 60 + 50))  # 05:50 ET
+          target_min=$((6 * 60 + 0))             # 06:00 ET
+          normal_until_min=$((8 * 60 + 10))      # 08:10 ET
+          recovery_until_min=$((9 * 60 + 25))    # 09:25 ET
+          schedule_expected_min=$((6 * 60 + 0))
           max_wait_seconds=5400
 
           should_run=1
@@ -152,25 +151,25 @@ jobs:
 
           if [[ "$event_name" == "schedule" ]]; then
             if [[ "$now_min" -lt "$prewarm_earliest_min" ]]; then
-              # 06:45 이전: DST duplicate 너무 이름 — skip
+              # 05:50 이전: DST duplicate 너무 이름 — skip
               should_run=0
               skip_reason="skip_dst_duplicate_too_early_us_prep"
               run_window="too_early_duplicate"
             elif [[ "$now_min" -lt "$target_min" ]]; then
-              # 06:45~07:00: wait until target
+              # 05:50~06:00: wait until target
               wait_until_target=1
               wait_seconds=$(( (target_min - now_min) * 60 - 10#$now_s ))
               if [[ "$wait_seconds" -lt 0 ]]; then wait_seconds=0; fi
               run_window="early_wait"
             elif [[ "$now_min" -le "$normal_until_min" ]]; then
-              # 07:00~07:45: normal window
+              # 06:00~08:10: normal window
               run_window="normal"
             elif [[ "$now_min" -le "$recovery_until_min" ]]; then
-              # 07:45~09:20: recovery window
+              # 08:10~09:25: recovery window
               run_window="recovery"
               recovery_run=1
             else
-              # 09:20 이후: stale — 하지만 바로 skip하지 않고 already_prepared 확인 후 판단
+              # 09:25 이후: stale — 하지만 바로 skip하지 않고 already_prepared 확인 후 판단
               run_window="stale_verify"
               recovery_run=1
               should_run=1
@@ -206,7 +205,7 @@ jobs:
           echo "recovery_run=${recovery_run}" >> "$GITHUB_OUTPUT"
           echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
           
-          echo "[US_PREP][START_META] schedule_expected=0700 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_PREP][START_META] schedule_expected=0600 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
           echo "[US_PREP][PHASE_GUARD] should_run=${should_run} run_window=${run_window} recovery_run=${recovery_run} wait_seconds=${wait_seconds}"
 
       - name: Checkout
@@ -233,8 +232,8 @@ jobs:
           
           {
             echo "[US_PREP][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_PREP][START_META] schedule_expected=0700 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} phase_window=0700-0810"
+            echo "[US_PREP][START_META] schedule_expected=0600 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_PREP][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} phase_window=0600-0810"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}

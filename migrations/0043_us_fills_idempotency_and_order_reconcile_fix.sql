@@ -1,13 +1,18 @@
+-- Add columns outside DO block so they are visible to subsequent DML in the same transaction
+ALTER TABLE us_fills ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+ALTER TABLE us_fills ADD COLUMN IF NOT EXISTS fill_idempotency_key TEXT;
+
+-- Back-fill updated_at from created_at for rows that don't have it yet
+UPDATE us_fills SET updated_at = COALESCE(created_at, NOW()) WHERE updated_at IS NULL;
+
+-- Set DEFAULT for future rows (alter after back-fill so NOT NULL constraint is safe)
+ALTER TABLE us_fills ALTER COLUMN updated_at SET DEFAULT NOW();
+
 DO $$
 DECLARE
     v_dup_count integer := 0;
     v_deleted_count integer := 0;
 BEGIN
-    ALTER TABLE us_fills
-    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
-
-    ALTER TABLE us_fills
-    ADD COLUMN IF NOT EXISTS fill_idempotency_key TEXT;
 
     SELECT COUNT(*)
     INTO v_dup_count
