@@ -51,18 +51,21 @@ def repos_text():
 # ---------------------------------------------------------------------------
 
 def test_prep_has_multiple_crons(prep_text):
-    """us-trade-prep.yml cron 스케줄이 1개(timezone-aware single cron)여야 한다.
+    """us-trade-prep.yml cron 스케줄이 8개(UTC multi-prewarm)여야 한다.
 
-    EDT/EST dual-cron 방식에서 timezone: America/New_York 방식으로 변경됨.
-    dual-cron은 하루 2번 실행되는 버그가 있으므로 단일 cron + timezone이 올바른 방식.
+    GitHub Actions schedule 지연 대비 EDT+EST 각 4개씩 총 8개 UTC cron.
+    cancel-in-progress: false로 기존 prep 실행을 kill하지 않는다.
     """
-    cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", prep_text)
-    assert len(cron_matches) == 1, (
-        f"us-trade-prep.yml cron 수={len(cron_matches)} != 1. "
-        "timezone-aware single cron이 설정됐는지 확인하세요."
+    cron_matches = re.findall(r"""cron:\s*['"][\d\s*\-/,]+['"]""", prep_text)
+    assert len(cron_matches) == 8, (
+        f"us-trade-prep.yml cron 수={len(cron_matches)} != 8. "
+        "UTC multi-prewarm cron 8개가 설정됐는지 확인하세요."
     )
-    assert 'timezone: "America/New_York"' in prep_text, (
-        "us-trade-prep.yml에 timezone: America/New_York이 없습니다."
+    assert "cancel-in-progress: false" in prep_text, (
+        "us-trade-prep.yml cancel-in-progress must be false (do not kill running prep)"
+    )
+    assert "utc_multi_cron" in prep_text, (
+        "us-trade-prep.yml에 utc_multi_cron schedule_mode 주석이 없습니다."
     )
 
 
