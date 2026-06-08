@@ -56,6 +56,11 @@ def run_scenario(scenario: dict, offline: bool = True) -> dict:
         env[k] = str(v)
     if offline:
         env["DRY_RUN"] = "1"
+        env["OFFLINE_MODE"] = "1"
+        env["US_OFFLINE_MODE"] = "true"
+        env["ALLOW_REAL_ORDER"] = "0"
+        env["KIS_HTTP_BLOCK"] = "1"
+        env.setdefault("KIS_HTTP_AUDIT_FILE", "/tmp/us_harness_kis_http_calls.log")
 
     try:
         result = subprocess.run(
