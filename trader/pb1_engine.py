@@ -3119,6 +3119,7 @@ class PB1Engine:
         cooldown_until_value = str(cooldown_until).strip() if cooldown_until is not None else ""
         if cooldown_until_value and cooldown_until_value >= self._today:
             if bool(today_buy_exists):
+                cooldown_active = True
                 final_cooldown_policy = "same_day_only"
                 resolved_source = "same_day_duplicate_prevention"
             elif bool(recent_valid_exit_event) and not risk_off_same_day_only:
@@ -3492,6 +3493,24 @@ class PB1Engine:
         if current_now >= entry_cutoff_dt:
             return False, "ENTRY_CUTOFF_PASSED", entry_cutoff_dt, market_close_dt
         return True, "TIME_WINDOW_OK", entry_cutoff_dt, market_close_dt
+
+    def _should_block_entry_after_exit(self) -> tuple[bool, dict]:
+        """SELL 제출 이후 신규 BUY를 차단할지 판단한다.
+
+        PB1_BLOCK_ENTRY_AFTER_EXIT=1 (default 0)이고 이번 tick에 SELL 제출이 있었을 때만 True.
+        """
+        enabled = str(os.getenv("PB1_BLOCK_ENTRY_AFTER_EXIT", "0")).strip() == "1"
+        if not enabled:
+            return False, {"exit_submit_attempt_count": 0, "accepted_sell_count": 0}
+        payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
+        submit_attempt_count = int(payload.get("submit_attempt_count") or 0)
+        accepted_sell_count = int(payload.get("accepted_sell_count") or 0)
+        metrics = {
+            "exit_submit_attempt_count": submit_attempt_count,
+            "accepted_sell_count": accepted_sell_count,
+        }
+        blocked = submit_attempt_count > 0 or accepted_sell_count > 0
+        return blocked, metrics
 
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
@@ -14763,6 +14782,31 @@ class PB1Engine:
                     self._planned_entry_spent_krw = float(planned_spent)
                     if len(orderable_candidates) >= new_position_limit:
                         break
+            # position limit으로 break한 경우 나머지 buyable 후보를 명시적으로 추적
+            orderable_code_set_after_loop = {c.code for c in orderable_candidates}
+            explicitly_dropped_codes = {
+                code
+                for code, reason in drop_reason_counter.items()
+                if code  # drop_reason_counter key is reason not code, see _record_drop
+            }
+            # _record_drop(drop_reason_counter, drop_examples, reason, code) - reason이 key
+            # 실제로 drop된 buyable codes = buyable_ok_set - orderable_code_set_after_loop
+            # order_stage_counter에 없는 드랍 = limit break 로 처리
+            limit_dropped_count = max(0, len(buyable_ok_codes) - len(orderable_code_set_after_loop) - sum(order_stage_counter.values()))
+            if limit_dropped_count > 0:
+                order_stage_counter["target_new_positions_limit"] += limit_dropped_count
+                limit_dropped_examples = [
+                    code for code in buyable_ok_codes
+                    if code not in orderable_code_set_after_loop
+                ]
+                for code in limit_dropped_examples[:limit_dropped_count]:
+                    self._record_drop(drop_reason_counter, drop_examples, "target_new_positions_limit", code)
+                logger.info(
+                    "[PB1][ORDER_CANDIDATES][LIMIT_DROP] reason=target_new_positions_limit count=%s limit=%s buyable=%s",
+                    limit_dropped_count,
+                    new_position_limit,
+                    len(buyable_ok_codes),
+                )
             logger.info(
                 "[PB1][STAGE][END] stage=buyable_gate ok=%s blocked=%s",
                 len(orderable_candidates),

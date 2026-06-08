@@ -3572,18 +3572,12 @@ class KisAPI:
                     continue
                 raise KisBalanceUnavailable(str(e)) from e
 
-            output2_summary = _summarize_balance_output2(j.get("output2"))
             logger.info(
-                "[BALANCE][RESP_SUMMARY] rt_cd=%s msg_cd=%s rows=%s has_output2=%s cash=%s order_possible_cash=%s market_value=%s total_asset=%s parser=%s",
+                "[BALANCE][PAGE_RECV] rt_cd=%s msg_cd=%s rows=%s has_output2=%s",
                 j.get("rt_cd"),
                 j.get("msg_cd"),
                 len(j.get("output1") or []),
                 int(bool(j.get("output2"))),
-                output2_summary.get("cash_total") or 0,
-                output2_summary.get("order_possible_cash") or 0,
-                output2_summary.get("market_value") or 0,
-                output2_summary.get("total_asset") or 0,
-                output2_summary.get("parser") or "unknown",
             )
 
             rows = j.get("output1") or []
@@ -3618,6 +3612,17 @@ class KisAPI:
             if not fk and not nk:
                 break
 
+        out2_summary = _summarize_balance_output2(out2_last or {})
+        logger.info(
+            "[BALANCE][RESP_SUMMARY] rows=%s has_output2=%s cash=%s order_possible_cash=%s market_value=%s total_asset=%s parser=%s",
+            len(all_rows),
+            int(bool(out2_last)),
+            out2_summary.get("cash_total") or 0,
+            out2_summary.get("order_possible_cash") or 0,
+            out2_summary.get("market_value") or 0,
+            out2_summary.get("total_asset") or 0,
+            out2_summary.get("parser") or "unknown",
+        )
         return {"output1": all_rows, "output2": out2_last, "ctx_area_fk100": fk, "ctx_area_nk100": nk}
 
     def get_cash_balance(self) -> int:

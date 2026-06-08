@@ -9,7 +9,7 @@ from datetime import datetime
 
 from trader.ledger.store import LedgerStore
 from trader.db.repos import FillsRepo
-from trader.db.schema import PBCoreSchema
+from trader.db.schema import schema_for_engine as _schema_for_engine_top
 
 
 def test_ledger_rebuild_positions_removes_net_zero():
@@ -111,7 +111,7 @@ def test_fills_net_positions_from_fills_kr_only(test_db_engine):
     """FillsRepo.list_net_positions_from_fills는 한국장 6자리만 반환"""
     from sqlalchemy import MetaData
     
-    schema = PBCoreSchema.for_engine(test_db_engine)
+    schema = _schema_for_engine_top(test_db_engine)
     metadata = MetaData()
     metadata.reflect(bind=test_db_engine)
     
@@ -183,10 +183,10 @@ def test_fills_net_positions_from_fills_kr_only(test_db_engine):
 def test_db_engine():
     """테스트용 in-memory SQLite DB"""
     import sqlalchemy as sa
-    from trader.db.schema import PBCoreSchema
+    from trader.db.schema import schema_for_engine as _schema_for_engine
     
     engine = sa.create_engine("sqlite:///:memory:")
-    schema = PBCoreSchema.for_engine(engine)
+    schema = _schema_for_engine(engine)
     
     # 테이블 생성
     with engine.begin() as conn:
