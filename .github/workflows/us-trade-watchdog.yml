@@ -1,5 +1,5 @@
 name: "US Trade Watchdog"
-# Auto-recovery: monitors prep/am/afternoon status and dispatches missing runs | schedule: */5 12-20 UTC Mon-Fri
+# Monitor-only: prep/am/afternoon status checker. It never dispatches trade workflows.
 
 "on":
   schedule:
@@ -8,7 +8,7 @@ name: "US Trade Watchdog"
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 concurrency:
   group: us-trade-watchdog-${{ github.ref_name }}
@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Check and dispatch missing US workflows
+      - name: Check US workflow status without dispatch
         uses: actions/github-script@v7
         env:
           WATCHDOG_REF: ${{ github.ref_name }}
@@ -172,16 +172,8 @@ jobs:
             }
 
             async function dispatchWorkflow(phase, config) {
-              await github.rest.actions.createWorkflowDispatch({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: config.workflow_id,
-                ref: process.env.WATCHDOG_REF,
-                inputs: config.inputs,
-              });
-
               core.info(
-                `[US_WATCHDOG][DISPATCH] phase=${phase} workflow=${config.workflow_name} inputs=${JSON.stringify(config.inputs)}`
+                `[US_WATCHDOG][DISPATCH_DISABLED] phase=${phase} workflow=${config.workflow_name} reason=schedule_only_policy`
               );
             }
 
