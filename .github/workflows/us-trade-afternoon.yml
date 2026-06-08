@@ -1,13 +1,13 @@
 name: "US Trade Afternoon"
-# session: afternoon | scheduled start: 13:00 ET | window: 13:00~15:50 ET
+# session: afternoon | scheduled trigger: 13:03 ET | window: 13:00~15:50 ET
 # workflow starts on schedule, checks prep, and executes the afternoon session before PnL
 
 "on":
   schedule:
-    # 13:00 ET during US daylight saving time. ET phase guard enforces 13:00~15:50.
-    - cron: "00 17 * * 1-5"
-    # [US_SCHEDULE][CONFIG] schedule_mode=schedule_guard crons=1 timezone=America/New_York
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
+    # Scheduled trigger: 13:03 ET (offset from the hour to reduce GitHub Actions delay risk). Trade session window: 13:00~15:50 ET.
+    - cron: "03 13 * * 1-5"
+      timezone: "America/New_York"
+    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York trigger_et=1303 session_window=1300-1550
   workflow_dispatch:
     inputs:
       dry_run:
@@ -191,7 +191,7 @@ jobs:
           recovery_until=$((15 * 60 + 20))          # 15:20 ET - recovery window end
           no_new_entry_after=$((15 * 60 + 45))      # 15:45 ET - block new entry
           session_end=$((15 * 60 + 50))             # 15:50 ET - hard session end
-          schedule_expected_min=$((13 * 60 + 0))
+          schedule_expected_min=$((13 * 60 + 3))
           max_wait_seconds=3600  # schedule jitter/recovery wait guard
 
           should_run=1
@@ -292,8 +292,8 @@ jobs:
           echo "route=${route}" >> "$GITHUB_OUTPUT"
           echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
 
-          echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1300 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
-          echo "[US_TRADE_AFTERNOON][SCHEDULE_GUARD] event=${event_name} now_et=${now_hhmmss} session_window=1300-1550 should_run=${should_run}"
+          echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1303 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_TRADE_AFTERNOON][SCHEDULE_GUARD] event=${event_name} scheduled_trigger_et=1303 now_et=${now_hhmmss} session_window=1300-1550 should_run=${should_run}"
           echo "[US_TRADE_AFTERNOON][PHASE_GUARD] should_run=${should_run} run_window=${run_window} route=${route} recovery_run=${recovery_run} wait_seconds=${wait_seconds}"
           echo "[US_TRADE_AFTERNOON][RUN_PLAN] prep_check=true wait_until_1300=true trade_afternoon=true"
 
@@ -347,8 +347,8 @@ jobs:
 
           {
             echo "[US_TRADE_AFTERNOON][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1300 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
-            echo "[US_TRADE_AFTERNOON][SCHEDULE_GUARD] event=${{ steps.phase_guard.outputs.event_name }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} session_window=1300-1550 should_run=${{ steps.phase_guard.outputs.should_run }}"
+            echo "[US_TRADE_AFTERNOON][START_META] schedule_expected=1303 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_TRADE_AFTERNOON][SCHEDULE_GUARD] event=${{ steps.phase_guard.outputs.event_name }} scheduled_trigger_et=1303 now_et=${{ steps.phase_guard.outputs.now_hhmmss }} session_window=1300-1550 should_run=${{ steps.phase_guard.outputs.should_run }}"
             echo "[US_TRADE_AFTERNOON][BOOT_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} route=${{ steps.phase_guard.outputs.route }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=1300-1550"
             echo "[US_TRADE_AFTERNOON][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
             echo "[US_TRADE_AFTERNOON][CONCURRENCY_META] group=us-trade-afternoon-${GITHUB_REF_NAME} cancel_in_progress=false schedule_mode=schedule_guard crons=1"
@@ -362,7 +362,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "US_SCHEDULE_EXPECTED_ET=1300"
+            echo "US_SCHEDULE_EXPECTED_ET=1303"
             echo "US_ACTUAL_START_ET=${{ steps.phase_guard.outputs.now_hhmmss }}"
             echo "US_DELAY_SECONDS=${{ steps.phase_guard.outputs.delay_seconds }}"
             echo "US_RUN_WINDOW=${{ steps.phase_guard.outputs.run_window }}"
@@ -946,7 +946,7 @@ jobs:
             echo "TRADE_SESSION=afternoon" >> "$GITHUB_ENV"
             export EXPECTED_TO_TRADE="${US_EXPECTED_TO_TRADE:-1}" ORDER_ALLOWED="${US_ORDER_ALLOWED}" KIS_ORDER_ALLOWED="${US_KIS_ORDER_ALLOWED}" SIGNAL_ONLY="${US_SIGNAL_ONLY}" RUN_MODE="${US_RUN_MODE}" TRADE_SESSION="afternoon"
 
-            export US_SCHEDULE_EXPECTED_ET="1300"
+            export US_SCHEDULE_EXPECTED_ET="1303"
             export US_ACTUAL_START_ET="${{ steps.phase_guard.outputs.now_hhmmss }}"
             export US_DELAY_SECONDS="${{ steps.phase_guard.outputs.delay_seconds }}"
             export US_RUN_WINDOW="${{ steps.phase_guard.outputs.run_window }}"
