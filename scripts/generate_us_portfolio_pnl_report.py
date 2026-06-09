@@ -434,8 +434,9 @@ def _load_db_fills(engine, trade_date: str) -> list[dict]:
 def _load_latest_daily_report(report_path: str | None) -> dict | None:
     """latest_us_daily_report.json 로드."""
     if not report_path:
-        report_path = "reports/us_daily/latest_us_daily_report.json"
-    
+        logger.info("[US_PNL][DAILY_REPORT][SKIP] path_not_provided")
+        return None
+
     path = Path(report_path)
     if not path.exists():
         logger.warning("[US_PNL][DAILY_REPORT][MISSING] path=%s", path)

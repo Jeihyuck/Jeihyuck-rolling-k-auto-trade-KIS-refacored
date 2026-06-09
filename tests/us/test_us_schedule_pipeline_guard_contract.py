@@ -64,20 +64,17 @@ def test_prep_no_fallback_only_comment():
         "us-trade-prep.yml must not say prep moved to am workflow"
 
 
-def test_am_has_0815_edt_cron():
-    """us-trade-am.yml에 08:xx EDT cron이 다수 존재 (다중화 스케줄)."""
+def test_am_has_timezone_aware_0930_cron():
+    """us-trade-am.yml에는 09:30 ET timezone-aware cron이 있어야 한다."""
     text = AM_YML.read_text(encoding="utf-8")
-    import re
-    edt_crons = re.findall(r'cron:.*1[23] \* \* 1-5', text)
-    assert len(edt_crons) >= 4, f"us-trade-am.yml EDT cron 다중화 부족: {edt_crons}"
+    assert 'cron: "30 9 * * 1-5"' in text
+    assert 'timezone: "America/New_York"' in text
 
 
-def test_am_has_0815_est_cron():
-    """us-trade-am.yml에 08:xx EST cron이 다수 존재 (다중화 스케줄)."""
+def test_am_has_single_timezone_cron_comment():
+    """us-trade-am.yml에는 timezone-aware single cron 설명이 있어야 한다."""
     text = AM_YML.read_text(encoding="utf-8")
-    import re
-    est_crons = re.findall(r'cron:.*1[34] \* \* 1-5', text)
-    assert len(est_crons) >= 4, f"us-trade-am.yml EST cron 다중화 부족: {est_crons}"
+    assert "timezone_single_cron" in text
 
 
 def test_am_has_must_not_run_prep_comment():
@@ -132,13 +129,10 @@ def test_am_exports_trade_date():
         "us-trade-am.yml must ensure TRADE_DATE is exported before Python heredoc"
 
 
-def test_am_has_trade_date_guard_in_python():
-    """us-trade-am.yml Python heredoc에 TRADE_DATE None 방어 코드 존재."""
+def test_am_uses_prep_contract_helper_after_exporting_trade_date():
+    """us-trade-am.yml은 TRADE_DATE export 후 helper script로 prep contract를 검증해야 한다."""
     text = AM_YML.read_text(encoding="utf-8")
-    assert "if not trade_date:" in text, \
-        "us-trade-am.yml Python blocks must have 'if not trade_date:' guard"
-    assert "TRADE_DATE env missing" in text, \
-        "us-trade-am.yml must raise error when TRADE_DATE env is missing"
+    assert 'python scripts/us_verify_am_prep_contract.py --trade-date "${TRADE_DATE}"' in text
 
 
 def test_am_no_trade_date_none_log():
