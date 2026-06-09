@@ -2286,6 +2286,23 @@ def _evaluate_session_recovery_guard(*, engine, env: str, session_kind: str, now
     )
 
 
+def _apply_afternoon_mode_decision(*, run_ctx: dict[str, Any], entry_enabled: bool, exit_only: bool) -> dict[str, Any]:
+    if entry_enabled:
+        os.environ["PB1_ENTRY_ENABLED"] = "1"
+        os.environ["PB1_EXIT_ONLY_MODE"] = "0"
+        os.environ["PB1_PHASE_DEFAULT"] = "pm_entry"
+        os.environ["FORCE_PB1_PHASE"] = "pm_entry"
+        os.environ.pop("FORCE_ENTRY_DISABLED_REASON", None)
+        run_ctx["phase_name"] = "pm_entry"
+        run_ctx["exit_only"] = False
+        run_ctx["entry_enabled"] = True
+        logger.info("[TRADE_AFTERNOON][MODE_APPLIED] entry_enabled=1 exit_only=0 phase=pm_entry source=db_prep_final30")
+        return {"phase": "pm_entry", "entry_enabled": True, "exit_only": False}
+    run_ctx["exit_only"] = bool(exit_only)
+    run_ctx["entry_enabled"] = False
+    return {"phase": str(run_ctx.get("phase_name") or ""), "entry_enabled": False, "exit_only": bool(exit_only)}
+
+
 def _resolve_session_trade_policy(*, session: str, phase_name: str, entry_enabled: bool, now: datetime | None = None) -> dict[str, Any]:
     normalized_session = str(session or "").strip().lower()
     normalized_phase = str(phase_name or "").strip().lower()
@@ -5078,25 +5095,14 @@ def run_once(
                 mode_reason,
             )
             if mode_entry_enabled:
-                os.environ["PB1_ENTRY_ENABLED"] = "1"
-                os.environ["PB1_EXIT_ONLY_MODE"] = "0"
-                os.environ["PB1_PHASE_DEFAULT"] = "pm_entry"
-                os.environ["FORCE_PB1_PHASE"] = "pm_entry"
-                os.environ.pop("FORCE_ENTRY_DISABLED_REASON", None)
+                _applied_mode = _apply_afternoon_mode_decision(run_ctx=run_ctx, entry_enabled=True, exit_only=False)
                 entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
-                resolved_phase = "pm_entry"
-                phase_override_arg = "pm_entry"
-                phase_for_log = "pm_entry"
+                resolved_phase = str(_applied_mode["phase"])
+                phase_override_arg = str(_applied_mode["phase"])
+                phase_for_log = str(_applied_mode["phase"])
                 phase_reason = "db_prep_final30"
-                run_ctx["phase_name"] = "pm_entry"
-                run_ctx["exit_only"] = False
-                run_ctx["entry_enabled"] = True
-                logger.info(
-                    "[TRADE_AFTERNOON][MODE_APPLIED] entry_enabled=1 exit_only=0 phase=pm_entry source=db_prep_final30"
-                )
             elif mode_exit_only:
-                run_ctx["exit_only"] = True
-                run_ctx["entry_enabled"] = False
+                _apply_afternoon_mode_decision(run_ctx=run_ctx, entry_enabled=False, exit_only=True)
         kis: KisAPI | None = None
         allow_compute_without_kis = bool(
             compute_only_full_run
@@ -5990,6 +5996,41 @@ def run_once(
                 universe_as_of=None,
                 fallback_used=False,
             )
+            try:
+                from trader.diagnostics.run_validator import validate_run_pipeline
+
+                run_summary_payload = getattr(engine_runner, "_run_summary_payload", {}) or {}
+                top_blockers_raw = run_summary_payload.get("blocked_by", "") or ""
+                top_blockers: dict[str, int] = {}
+                if isinstance(top_blockers_raw, str):
+                    for part in top_blockers_raw.split(","):
+                        if ":" not in part:
+                            continue
+                        key, value = part.split(":", 1)
+                        try:
+                            top_blockers[key.strip().upper()] = int(float(value.strip()))
+                        except Exception:
+                            continue
+                validate_run_pipeline(
+                    session_kind=str(os.getenv("PB1_SESSION_KIND") or summary_session),
+                    phase=str(run_ctx.get("phase_name") or phase_for_log),
+                    final30_rows=int(run_ctx.get("final30_rows") or (len(precomputed_final30_df) if isinstance(precomputed_final30_df, pd.DataFrame) else 0) or 0),
+                    entry_enabled=bool(run_ctx.get("entry_enabled", os.getenv("PB1_ENTRY_ENABLED") == "1")),
+                    exit_only=bool(run_ctx.get("exit_only", os.getenv("PB1_EXIT_ONLY_MODE") == "1")),
+                    mode_applied=bool(run_ctx.get("entry_enabled") is True and str(run_ctx.get("phase_name") or "") == "pm_entry"),
+                    entry_decision_seen=bool(run_summary_payload),
+                    setup_ok_seen="setup_ok" in run_summary_payload,
+                    order_candidates_seen="order_candidates" in run_summary_payload,
+                    buyable_gate_seen="buyable_ok" in run_summary_payload,
+                    order_submit_seen=int(run_summary_payload.get("submitted", 0) or 0) > 0,
+                    no_buy_reason=str(run_summary_payload.get("no_trade_reason") or result_reason or ""),
+                    top_blockers=top_blockers,
+                    order_candidates_count=int(run_summary_payload.get("order_candidates", 0) or 0),
+                    now=now,
+                    artifact_dir="artifacts",
+                )
+            except Exception as validator_exc:
+                logger.warning("[RUN_VALIDATOR][FAIL] err=%s", validator_exc)
         except Exception as e:
             logger.warning("[RUN_SUMMARY][GENERATE_FAIL] %s", type(e).__name__, exc_info=False)
         

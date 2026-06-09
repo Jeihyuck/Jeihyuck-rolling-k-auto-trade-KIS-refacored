@@ -4394,10 +4394,15 @@ class LedgerEventsRepo:
                 .order_by(self._schema.ledger_events.c.ts.desc())
                 .limit(1)
             )
-            with self.engine.connect() as conn:
-                row = conn.execute(stmt).mappings().first()
-            if row is None:
+            rows = _safe_repo_read(
+                self.engine,
+                stmt,
+                op_name="ledger.get_prep_done_event",
+                fail_open=_resolve_ledger_fail_open(),
+            )
+            if not rows:
                 return None
+            row = rows[0]
             payload_json = dict(row.get("payload_json") or {})
             return {
                 "ledger_event_id": str(row.get("ledger_event_id")),
