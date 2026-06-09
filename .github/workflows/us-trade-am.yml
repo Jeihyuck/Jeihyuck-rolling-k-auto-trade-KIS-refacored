@@ -75,7 +75,7 @@ name: "US Trade AM"
 
 concurrency:
   group: us-trade-am-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -328,27 +328,7 @@ jobs:
         working-directory: repo
         run: |
           set -euo pipefail
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          from trader.us.market_calendar import now_ny, is_us_trading_day
-          now = now_ny()
-          is_td = is_us_trading_day(now.date())
-          if is_td:
-              print("run_mode=TRADE")
-              print("signal_only=0")
-              print("order_allowed=1")
-              print("kis_order_allowed=1")
-              print("kis_data_allowed=1")
-              print("non_trading_day=0")
-              print("reason=trading_day")
-          else:
-              print("run_mode=NON_TRADING_SIGNAL_ONLY")
-              print("signal_only=1")
-              print("order_allowed=0")
-              print("kis_order_allowed=0")
-              print("kis_data_allowed=0")
-              print("non_trading_day=1")
-              print("reason=non_trading_day_signal_only")
-          PY
+          python scripts/us_resolve_run_mode.py >> "$GITHUB_OUTPUT"
 
       - name: Verify checkout path and initialize log
         working-directory: .
@@ -406,52 +386,12 @@ jobs:
             echo "[RUN_SUMMARY][RESULT] status=SKIP_PHASE_WINDOW reason=${{ steps.phase_guard.outputs.skip_reason }} session=us-am missed_trade_window=${missed_window}"
             echo "[US_TRADE_AM][EXIT] reason=phase_guard_skip"
           } | tee -a artifacts/${US_LOG_FILE}
-          export _US_AM_TRADE_DATE="${trade_date}"
-          export _US_AM_MISSED_WINDOW="${missed_window}"
-          python - <<'PY'
-          import json, os
-          from pathlib import Path
-          report = {
-              "trade_date": os.environ.get("_US_AM_TRADE_DATE", ""),
-              "run_id": os.environ.get("GITHUB_RUN_ID", ""),
-              "sha": os.environ.get("GITHUB_SHA", ""),
-              "workflow": os.environ.get("GITHUB_WORKFLOW", ""),
-              "session": "am",
-              "event_name": os.environ.get("GITHUB_EVENT_NAME", ""),
-              "env": "practice",
-              "dry_run": os.environ.get("DRY_RUN", "0") == "1",
-              "kis_order_allowed": int("${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"),
-              "prep_status": "SKIP_PHASE_WINDOW",
-              "locked_watchlist_count": 0,
-              "entry_eval_status": "SKIPPED",
-              "entry_error_type": "",
-              "entry_error_message": "",
-              "entry_intents": 0,
-              "orders_sent": 0,
-              "fills": 0,
-              "positions": 0,
-              "last_stage": "phase_guard",
-              "final_status": "SKIP_PHASE_WINDOW",
-              "reason": "${{ steps.phase_guard.outputs.skip_reason }}",
-              "temp_error_count": 0,
-              "temp_recovered_count": 0,
-              "missed_trade_window": os.environ.get("_US_AM_MISSED_WINDOW", "false") == "true",
-          }
-          base = Path("reports/us_daily")
-          base.mkdir(parents=True, exist_ok=True)
-          (base / "latest_us_daily_report.json").write_text(json.dumps(report, indent=2))
-          md = "\n".join([
-              f"# US Daily Report - {report['trade_date']}",
-              "",
-              "## Required Fields",
-              "",
-          ] + [f"- {k}: {v}" for k, v in report.items()]) + "\n"
-          (base / "latest_us_daily_report.md").write_text(md)
-          d = base / report["trade_date"] / "am"
-          d.mkdir(parents=True, exist_ok=True)
-          (d / "us_daily_report.json").write_text(json.dumps(report, indent=2))
-          (d / "us_daily_report.md").write_text(md)
-          PY
+          python scripts/us_write_phase_skip_report.py \
+            --session am \
+            --trade-date "${trade_date}" \
+            --reason "${{ steps.phase_guard.outputs.skip_reason }}" \
+            --missed-trade-window "${missed_window}" \
+            --kis-order-allowed "${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"
 
       - name: Set up Python
         if: steps.phase_guard.outputs.should_run == '1'
@@ -510,44 +450,34 @@ jobs:
           INPUT_CONFIRM: ${{ inputs.confirm || '' }}
         run: |
           set -euo pipefail
+
           if [ -n "${FORCE_NOW_INPUT}" ]; then
             TRADE_DATE=$(python -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_INPUT}').date().isoformat())")
           else
             TRADE_DATE=$(TZ=America/New_York date +%F)
           fi
           export TRADE_DATE
+
           {
-            echo "[US_TRADE_SESSION_LOCK][START] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} event=${GITHUB_EVENT_NAME}" | tee -a artifacts/${US_LOG_FILE}
-            python - <<'PY' > us_session_lock_result.txt
-            import os
-            import sys
-            from datetime import date
+            echo "[US_TRADE_SESSION_LOCK][START] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} event=${GITHUB_EVENT_NAME}"
 
-            sys.path.insert(0, ".")
-            from trader.us.db.session_locks import claim_us_session_lock
+            python scripts/us_claim_session_lock.py \
+              --session am \
+              --trade-date "${TRADE_DATE}" \
+              --env "${KIS_ENV}" \
+              --github-run-id "${GITHUB_RUN_ID}" \
+              --github-workflow "${GITHUB_WORKFLOW}" \
+              --github-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+              --event-name "${GITHUB_EVENT_NAME}" \
+              --manual-confirm-ok "$([ "${INPUT_CONFIRM}" = "RUN_US_AM_MANUAL" ] && echo 1 || echo 0)" \
+              --run-window "${US_RUN_WINDOW:-}" \
+              --output us_session_lock_result.txt
 
-            trade_date = os.environ["TRADE_DATE"]
-            event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-            confirm = os.environ.get("INPUT_CONFIRM", "")
-            claimed, existing = claim_us_session_lock(
-                env=os.environ.get("KIS_ENV", "practice"),
-                trade_date=date.fromisoformat(trade_date),
-                session="am",
-                github_run_id=os.environ.get("GITHUB_RUN_ID"),
-                github_workflow=os.environ.get("GITHUB_WORKFLOW"),
-                github_run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"),
-                metadata={
-                    "event_name": event_name,
-                    "manual_confirm_ok": confirm == "RUN_US_AM_MANUAL",
-                    "run_window": os.environ.get("US_RUN_WINDOW", ""),
-                },
-            )
-            print(f"claimed={'1' if claimed else '0'}")
-            print(f"existing_status={(existing or {}).get('status', '')}")
-            PY
-            cat us_session_lock_result.txt | tee -a artifacts/${US_LOG_FILE}
+            cat us_session_lock_result.txt
+
             CLAIMED=$(grep '^claimed=' us_session_lock_result.txt | cut -d= -f2 || true)
             EXISTING_STATUS=$(grep '^existing_status=' us_session_lock_result.txt | cut -d= -f2 || true)
+
             if [ -z "${CLAIMED}" ]; then
               echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
@@ -555,13 +485,15 @@ jobs:
               echo "::error::AM session lock output missing"
               exit 1
             fi
+
             echo "claimed=${CLAIMED}" >> "$GITHUB_OUTPUT"
             echo "existing_status=${EXISTING_STATUS}" >> "$GITHUB_OUTPUT"
             echo "trade_date=${TRADE_DATE}" >> "$GITHUB_OUTPUT"
+
             if [ "${CLAIMED}" = "1" ]; then
-              echo "[US_TRADE_SESSION_LOCK][ACQUIRE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED}" | tee -a artifacts/${US_LOG_FILE}
+              echo "[US_TRADE_SESSION_LOCK][ACQUIRE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED}"
             else
-              echo "[US_TRADE_SESSION_LOCK][SKIP] reason=session_already_running_or_completed trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED} existing_status=${EXISTING_STATUS}" | tee -a artifacts/${US_LOG_FILE}
+              echo "[US_TRADE_SESSION_LOCK][SKIP] reason=session_already_running_or_completed trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED} existing_status=${EXISTING_STATUS}"
               echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
               echo "US_TRADE_STATUS=SKIPPED_DUPLICATE_SESSION" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
@@ -742,54 +674,7 @@ jobs:
 
           echo "[US_TRADE_AM][PREP_VERIFY] trade_date=${TRADE_DATE}" | tee -a artifacts/${US_LOG_FILE}
 
-          TRADE_DATE="${TRADE_DATE}" python - <<'PY' > prep_verify_result.txt 2>&1
-          import os
-          import sys
-
-          sys.path.insert(0, ".")
-
-          from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
-
-          trade_date = os.getenv("TRADE_DATE")
-          if not trade_date:
-              raise RuntimeError("[US_TRADE_AM][BUG] TRADE_DATE env missing")
-
-          prep = load_latest_us_prep_status(trade_date, timeout_sec=10)
-          prep_status = prep.get("status", "UNKNOWN") if prep else "UNKNOWN"
-          prep_run_id = prep.get("run_id", "") if prep else ""
-
-          try:
-              locked = load_locked_us_watchlist(
-                  trade_date,
-                  min_count=10,
-                  allow_degraded=False,
-                  timeout_sec=10,
-              )
-              locked_count = len(locked) if locked else 0
-          except Exception as e:
-              print(f"[US_TRADE_AM][WATCHLIST_LOAD_ERROR] {e}", file=sys.stderr)
-              locked_count = 0
-
-          can_trade = prep_status in ("OK", "OK_WITH_WARNINGS") and locked_count >= 10
-
-          print(f"prep_status={prep_status}")
-          print(f"prep_run_id={prep_run_id}")
-          print(f"locked_count={locked_count}")
-          print(f"can_trade={'1' if can_trade else '0'}")
-
-          if can_trade:
-              print(
-                  f"[US_TRADE_AM][PREP_VERIFY][OK] trade_date={trade_date} "
-                  f"prep_status={prep_status} locked_count={locked_count} run_id={prep_run_id}",
-                  file=sys.stderr,
-              )
-          else:
-              print(
-                  f"[US_TRADE_AM][PREP_VERIFY][FAIL] trade_date={trade_date} "
-                  f"prep_status={prep_status} locked_count={locked_count} run_id={prep_run_id}",
-                  file=sys.stderr,
-              )
-          PY
+          python scripts/us_verify_am_prep_contract.py --trade-date "${TRADE_DATE}" > prep_verify_result.txt 2>&1
 
           cat prep_verify_result.txt | tee -a artifacts/${US_LOG_FILE}
 
@@ -900,24 +785,7 @@ jobs:
           fi
           export TRADE_DATE
 
-          python - <<'PY' > final_duplicate_guard_result.txt 2>&1
-          import os, sys
-          sys.path.insert(0, ".")
-          from trader.us.db.repos import check_us_am_already_ran
-
-          trade_date = os.getenv("TRADE_DATE")
-          # check_us_am_already_ran returns dict; FAILED_CLOSED on error
-          result = check_us_am_already_ran(trade_date, timeout_sec=5)
-          already_ran = bool(result.get("already_ran", True))
-          guard_status = result.get("guard_status", "UNKNOWN")
-          reason = result.get("reason", "")
-
-          print(f"already_ran={'1' if already_ran else '0'}")
-          print(
-              f"[US_TRADE_AM][FINAL_DUPLICATE_GUARD][RESULT] trade_date={trade_date} already_ran={already_ran} guard_status={guard_status} reason={reason}",
-              file=sys.stderr,
-          )
-          PY
+          python scripts/us_check_already_ran.py --session am --trade-date "${TRADE_DATE}" --mode final-duplicate > final_duplicate_guard_result.txt 2>&1
 
           cat final_duplicate_guard_result.txt | tee -a artifacts/${US_LOG_FILE}
           ALREADY_RAN=$(grep "^already_ran=" final_duplicate_guard_result.txt | cut -d= -f2 || echo "0")
@@ -973,27 +841,7 @@ jobs:
             export TRADE_DATE
 
             # Check if AM already ran today
-            python - <<'PY' >> already_ran_result.txt 2>&1
-          import os
-          import sys
-          sys.path.insert(0, ".")
-          from trader.us.db.repos import check_us_am_already_ran
-
-          trade_date = os.getenv("TRADE_DATE")
-          if not trade_date:
-              raise RuntimeError("[US_TRADE_AM][BUG] TRADE_DATE env missing")
-
-          # Check AM marker/report — returns dict (fail-closed)
-          result = check_us_am_already_ran(trade_date, timeout_sec=5)
-          already_ran = bool(result.get("already_ran", True))
-          guard_status = result.get("guard_status", "UNKNOWN")
-          reason = result.get("reason", "")
-          print(f"already_ran={'1' if already_ran else '0'}")
-          if already_ran:
-              print(f"[US_TRADE_AM][ALREADY_RAN] trade_date={trade_date} guard_status={guard_status} reason={reason}", file=sys.stderr)
-          else:
-              print(f"[US_TRADE_AM][NOT_RAN_YET] trade_date={trade_date}", file=sys.stderr)
-          PY
+            python scripts/us_check_already_ran.py --session am --trade-date "${TRADE_DATE}" --mode check >> already_ran_result.txt 2>&1
 
             cat already_ran_result.txt | tee -a artifacts/${US_LOG_FILE}
             ALREADY_RAN=$(grep "^already_ran=" already_ran_result.txt | cut -d= -f2 || echo "0")
@@ -1139,39 +987,9 @@ jobs:
               ${OFFLINE_FLAG} 2>&1 | tee -a artifacts/${US_LOG_FILE}
             status=${PIPESTATUS[0]}
             set -e
-            orders_sent=$(python3 - <<'PY'
-              import json
-              from pathlib import Path
-              path = Path('reports/us_daily/latest_us_daily_report.json')
-              if not path.exists():
-                print(0)
-              else:
-                payload = json.loads(path.read_text())
-                print(int(payload.get('orders_sent_total', payload.get('orders_sent', 0)) or 0))
-            PY
-            )
-            report_status=$(python3 - <<'PY'
-              import json
-              from pathlib import Path
-              path = Path('reports/us_daily/latest_us_daily_report.json')
-              if not path.exists():
-                print('FAILED')
-              else:
-                payload = json.loads(path.read_text())
-                print(payload.get('final_status', 'UNKNOWN'))
-            PY
-            )
-            report_reason=$(python3 - <<'PY'
-              import json
-              from pathlib import Path
-              path = Path('reports/us_daily/latest_us_daily_report.json')
-              if not path.exists():
-                print('trade_report_missing')
-              else:
-                payload = json.loads(path.read_text())
-                print(payload.get('reason', ''))
-            PY
-            )
+            orders_sent=$(python scripts/us_extract_json_value.py --file reports/us_daily/latest_us_daily_report.json --key orders_sent_total --fallback-key orders_sent --default 0)
+            report_status=$(python scripts/us_extract_json_value.py --file reports/us_daily/latest_us_daily_report.json --key final_status --default FAILED)
+            report_reason=$(python scripts/us_extract_json_value.py --file reports/us_daily/latest_us_daily_report.json --key reason --default trade_report_missing)
             echo "US_ORDERS_SENT=${orders_sent}" >> "$GITHUB_ENV"
             echo "[US_TRADE_AM][PYTHON_EXIT] status=${status}" | tee -a artifacts/${US_LOG_FILE}
             final_trade_status="FAILED"
@@ -1318,6 +1136,22 @@ jobs:
           echo "::error::US AM final success marker missing"
           exit 1
 
+      - name: Assert US AM trade runner started or explicitly skipped
+        if: always()
+        working-directory: repo
+        run: |
+          set -euo pipefail
+          python scripts/us_assert_trade_runner_started.py \
+            --session am \
+            --log "artifacts/${US_LOG_FILE}" \
+            --event-name "${GITHUB_EVENT_NAME}" \
+            --kis-env "${KIS_ENV}" \
+            --phase-should-run "${{ steps.phase_guard.outputs.should_run || '0' }}" \
+            --run-mode "${{ steps.run_mode.outputs.run_mode || '' }}" \
+            --order-allowed "${{ steps.run_mode.outputs.order_allowed || '0' }}" \
+            --kis-order-allowed "${{ steps.run_mode.outputs.kis_order_allowed || '0' }}" \
+            --runner-started "${US_TRADE_RUNNER_STARTED:-0}"
+
       - name: Generate US PnL report
         if: always()
         working-directory: repo
@@ -1387,8 +1221,22 @@ jobs:
           block_reason="${US_TRADE_RUNNER_BLOCK_REASON:-trade_pipeline_gate_failed}"
           pnl_status="${US_PNL_STATUS:-UNKNOWN}"
           workflow_status="OK"
+          accepted_skip=0
+          if grep -E "\[RUN_SUMMARY\]\[RESULT\] status=SKIP_PHASE_WINDOW|\[US_TRADE_AM\]\[EXIT\] reason=phase_guard_skip|\[US_TRADE_SESSION_LOCK\]\[SKIP\] reason=session_already_running_or_completed|\[RUN_SUMMARY\]\[RESULT\] status=OK reason=(already_ran|already_ran_after_wait)" artifacts/${US_LOG_FILE} >/dev/null 2>&1; then
+            accepted_skip=1
+          fi
+          phase_should_run="${{ steps.phase_guard.outputs.should_run || '0' }}"
+          run_mode="${{ steps.run_mode.outputs.run_mode || '' }}"
+          order_allowed="${{ steps.run_mode.outputs.order_allowed || '0' }}"
+          kis_order_allowed="${{ steps.run_mode.outputs.kis_order_allowed || '0' }}"
 
-          if [ "${expected_to_trade}" = "1" ] && [ "${trade_runner_started}" != "1" ]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" && "${KIS_ENV}" == "practice" && "${phase_should_run}" == "1" && "${run_mode}" == "TRADE" && "${order_allowed}" == "1" && "${kis_order_allowed}" == "1" && "${accepted_skip}" != "1" && "${trade_runner_started}" != "1" ]]; then
+            workflow_status="FAILED_TRADE_NOT_STARTED"
+            echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
+            echo "US_EXPECTED_TO_TRADE=1" >> "$GITHUB_ENV"
+            echo "US_TRADE_RUNNER_BLOCK_REASON=trade_runner_not_started_after_guards" >> "$GITHUB_ENV"
+            echo "[US_WORKFLOW][FINAL_REASON] reason=trade_runner_not_started_after_guards" | tee -a artifacts/${US_LOG_FILE}
+          elif [ "${expected_to_trade}" = "1" ] && [ "${trade_runner_started}" != "1" ]; then
             workflow_status="FAILED_TRADE_NOT_STARTED"
             echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
             echo "[US_WORKFLOW][FINAL_REASON] reason=${block_reason}" | tee -a artifacts/${US_LOG_FILE}
@@ -1417,45 +1265,7 @@ jobs:
           TRADE_DATE: ${{ steps.session_lock.outputs.trade_date }}
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os, sys
-          from datetime import date
-          sys.path.insert(0, ".")
-          from trader.us.db.session_locks import finish_us_session_lock
-
-          trade_date = os.environ.get("TRADE_DATE") or ""
-          trade_status = os.environ.get("US_TRADE_STATUS", "FAILED")
-          reason = os.environ.get("US_TRADE_RUNNER_BLOCK_REASON", "")
-          runner_started = os.environ.get("US_TRADE_RUNNER_STARTED", "0")
-
-          if not trade_date:
-              print("[US_SESSION_LOCK][FINISH_SKIP] reason=missing_trade_date")
-              raise SystemExit(0)
-
-          if trade_status == "OK":
-              lock_status = "DONE"
-          elif trade_status in {"SKIPPED_DUPLICATE_SESSION", "OK_ALREADY_RAN"}:
-              lock_status = "DONE_WITH_WARNINGS"
-          elif reason in {"db_migration_failed", "bad_or_missing_prep", "prep_contract_failed", "trade_pipeline_gate_failed"}:
-              lock_status = "FAILED_RETRYABLE"
-          else:
-              lock_status = "FAILED_RETRYABLE"
-
-          finish_us_session_lock(
-              env=os.environ.get("KIS_ENV", "practice"),
-              trade_date=date.fromisoformat(trade_date),
-              session="am",
-              github_run_id=os.environ.get("GITHUB_RUN_ID"),
-              status=lock_status,
-              reason=reason or trade_status,
-              metadata={
-                  "trade_status": trade_status,
-                  "trade_runner_started": runner_started,
-                  "reason": reason,
-              },
-          )
-          print(f"[US_TRADE_SESSION_LOCK][RELEASE] session=am trade_date={trade_date} status={lock_status} reason={reason or trade_status}")
-          PY
+          python scripts/us_finish_session_lock.py --session am --trade-date "${TRADE_DATE}"
 
       - name: Print US PnL report to console and summary
         if: always()

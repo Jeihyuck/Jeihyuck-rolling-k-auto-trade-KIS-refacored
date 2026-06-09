@@ -190,6 +190,7 @@ def validate_report(
         or ""
     )
     if expected_to_trade == 1 and trade_runner_started != 1:
+        fatals.append("expected_to_trade_without_runner_started")
         fatals.append(
             f"trade_runner_not_started status={trade_status} block_reason={block_reason or 'not_started'}"
         )
