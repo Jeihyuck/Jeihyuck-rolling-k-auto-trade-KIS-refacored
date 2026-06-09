@@ -3427,7 +3427,7 @@ def _normalize_window_phase(*, raw_window: Any, market_window: str, phase: str) 
     window_name = normalize_window(session_kind=session_kind, input_window=seed)
     phase_seed = (phase or "entry").strip().lower()
     if phase_seed in {"entry", "pm_entry"}:
-        phase_name = "entry"
+        phase_name = phase_seed
     elif phase_seed in {"exit", "close"}:
         phase_name = "exit"
     elif phase_seed == "manage":
@@ -5077,6 +5077,26 @@ def run_once(
                 int(mode_exit_only),
                 mode_reason,
             )
+            if mode_entry_enabled:
+                os.environ["PB1_ENTRY_ENABLED"] = "1"
+                os.environ["PB1_EXIT_ONLY_MODE"] = "0"
+                os.environ["PB1_PHASE_DEFAULT"] = "pm_entry"
+                os.environ["FORCE_PB1_PHASE"] = "pm_entry"
+                os.environ.pop("FORCE_ENTRY_DISABLED_REASON", None)
+                entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=True)
+                resolved_phase = "pm_entry"
+                phase_override_arg = "pm_entry"
+                phase_for_log = "pm_entry"
+                phase_reason = "db_prep_final30"
+                run_ctx["phase_name"] = "pm_entry"
+                run_ctx["exit_only"] = False
+                run_ctx["entry_enabled"] = True
+                logger.info(
+                    "[TRADE_AFTERNOON][MODE_APPLIED] entry_enabled=1 exit_only=0 phase=pm_entry source=db_prep_final30"
+                )
+            elif mode_exit_only:
+                run_ctx["exit_only"] = True
+                run_ctx["entry_enabled"] = False
         kis: KisAPI | None = None
         allow_compute_without_kis = bool(
             compute_only_full_run

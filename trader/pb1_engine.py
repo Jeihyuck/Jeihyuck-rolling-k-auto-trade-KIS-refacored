@@ -2335,6 +2335,7 @@ class PB1Engine:
         self._setup_reason_counter: Counter[str] = Counter()
         self.reject_reason_counts: dict[str, int] = {}
         self.reject_reason_samples: dict[str, list[str]] = {}
+        self._reject_summary_candidates: list[CandidateFeature] = []
         self.total_candidates = 0
         self.ok_count = 0
         self.daily_fetch_count = 0
@@ -3571,7 +3572,7 @@ class PB1Engine:
         logger.warning(message, *args)
 
     def _is_intraday_threshold_window(self) -> bool:
-        if self.phase not in {"prep", "entry"}:
+        if self.phase not in {"prep", "entry", "pm_entry"}:
             return False
         if self.window_internal not in {"morning", "day"}:
             return False
@@ -3622,7 +3623,8 @@ class PB1Engine:
 
     def _log_reason_summary(self, note: str | None = None) -> None:
         total_rejected = sum(self.reject_reason_counts.values())
-        total_candidates = total_rejected + (self._setup_reason_counter.total() - total_rejected)  # wait, better to track total
+        setup_counter_total = getattr(getattr(self, "_setup_reason_counter", None), "total", lambda: 0)()
+        total_candidates = total_rejected + (setup_counter_total - total_rejected)  # legacy diagnostic only
         # Actually, track total candidates separately
         # For now, assume we have total from somewhere
         # Wait, in the code, we need to count total
@@ -3638,8 +3640,44 @@ class PB1Engine:
         # Add self.ok_count = 0
         # In _log_setup, if cf.setup_ok: self.ok_count += 1
 
+        if not self.reject_reason_counts and self.total_candidates > 0 and self.ok_count == 0:
+            fallback_counter: Counter[str] = Counter()
+            fallback_samples: dict[str, list[str]] = {}
+            for cf in list(getattr(self, "_reject_summary_candidates", []) or []):
+                features = getattr(cf, "features", {}) or {}
+                collected: list[str] = []
+                for key in ("setup_loose_reasons", "setup_strict_reasons", "filters_failed", "quality_flags"):
+                    raw_items = features.get(key)
+                    if raw_items is None:
+                        continue
+                    if isinstance(raw_items, str):
+                        raw_iter = [x.strip() for x in raw_items.replace(";", ",").split(",") if x.strip()]
+                    elif isinstance(raw_items, (list, tuple, set)):
+                        raw_iter = list(raw_items)
+                    else:
+                        raw_iter = [raw_items]
+                    collected.extend(str(item).strip() for item in raw_iter if str(item).strip())
+                if not collected:
+                    collected.extend(str(item).strip() for item in (getattr(cf, "reasons", None) or []) if str(item).strip())
+                for reason in collected or ["unspecified_fail"]:
+                    fallback_counter[str(reason)] += 1
+                    sample_list = fallback_samples.setdefault(str(reason), [])
+                    if getattr(cf, "code", None) and len(sample_list) < 5:
+                        sample_list.append(str(cf.code))
+            if fallback_counter:
+                self.reject_reason_counts.update(dict(fallback_counter))
+                for reason, samples in fallback_samples.items():
+                    self.reject_reason_samples.setdefault(reason, samples)
+                logger.info(
+                    "[ENTRY][REJECT_SUMMARY][FALLBACK] total=%s source=candidate_features reasons=%s",
+                    self.total_candidates,
+                    fallback_counter.most_common(10),
+                )
         if not self.reject_reason_counts:
-            logger.info("[ENTRY][REJECT_SUMMARY] total=%s top_blockers=none", self.total_candidates)
+            fallback_text = "UNKNOWN:1" if self.total_candidates > 0 and self.ok_count == 0 else "none"
+            logger.info("[ENTRY][REJECT_SUMMARY] total=%s top_blockers=%s", self.total_candidates, fallback_text)
+            if fallback_text != "none":
+                logger.info("[RUN_SUMMARY][NO_BUY] reason=NO_FINAL_SETUPS top_blockers=%s", fallback_text)
             return
         sorted_reasons = sorted(self.reject_reason_counts.items(), key=lambda x: x[1], reverse=True)
         top_blockers = ",".join(f"{str(reason).upper()}:{count}" for reason, count in sorted_reasons[:10])
@@ -6494,7 +6532,7 @@ class PB1Engine:
 
         trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
         trade_precomputed_only = bool(
-            self.phase == "entry"
+            self.phase in {"entry", "pm_entry"}
             and self.trade_use_precomputed_features
             and bool(self._precomputed_final30_map)
             and (self.window_internal in {"morning", "day", "intraday", "after"})
@@ -11339,6 +11377,42 @@ class PB1Engine:
             elapsed,
         )
 
+    def _resolve_intraday_current_price_for_reclaim(
+        self,
+        code: str,
+        *,
+        current_price: float | None,
+        last_close: float | None,
+        ma20_value: float | None,
+    ) -> float | None:
+        if current_price is not None and current_price > 0:
+            return current_price
+        if not (self.phase in {"entry", "pm_entry"} and last_close is not None and ma20_value is not None and last_close < ma20_value):
+            return current_price
+        balance_price = self._to_float(getattr(self, "_balance_price_map", {}).get(str(code).zfill(6)))
+        if balance_price is not None and balance_price > 0:
+            logger.info("[ENTRY][INTRADAY_PRICE] code=%s source=kis_balance_prpr current_price=%s", code, balance_price)
+            return balance_price
+        if not bool(getattr(self, "price_allowed", True)):
+            logger.info(
+                "[ENTRY][INTRADAY_RECLAIM][SKIP] code=%s reason=current_price_missing last_close=%s ma20=%s",
+                code,
+                last_close,
+                ma20_value,
+            )
+            return None
+        quote_price = self._mark_price(str(code).zfill(6))
+        if quote_price is not None and quote_price > 0:
+            logger.info("[ENTRY][INTRADAY_PRICE] code=%s source=kis_quote current_price=%s", code, quote_price)
+            return quote_price
+        logger.info(
+            "[ENTRY][INTRADAY_RECLAIM][SKIP] code=%s reason=current_price_missing last_close=%s ma20=%s",
+            code,
+            last_close,
+            ma20_value,
+        )
+        return None
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -11492,7 +11566,14 @@ class PB1Engine:
                 features["data_ok"] = bool(precomputed_data_ok or not df.empty)
 
                 last_close = self._to_float(features.get("close"))
-                current_price = self._to_float(features.get("current_price"))
+                current_price = self._resolve_intraday_current_price_for_reclaim(
+                    code,
+                    current_price=self._to_float(features.get("current_price")),
+                    last_close=last_close,
+                    ma20_value=self._to_float(features.get("ma20")),
+                )
+                if current_price is not None and current_price > 0:
+                    features["current_price"] = current_price
                 ma20_value = self._to_float(features.get("ma20"))
                 if (
                     self.phase in {"entry", "pm_entry"}
@@ -12373,7 +12454,7 @@ class PB1Engine:
         entry_decision_result: str | None = None
         entry_decision_reason: str | None = None
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
-        entry_phase = self.phase in {"prep", "entry"}
+        entry_phase = self.phase in {"prep", "entry", "pm_entry"}
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", PB1_TARGET_NEW_POSITIONS)
         min_order_krw = float(MIN_ORDER_KRW)
@@ -12452,7 +12533,7 @@ class PB1Engine:
         if force_precomputed_mode:
             precomputed_mode_reason = "locked_final30_compute_only"
         self.trade_precomputed_only = bool(
-            self.phase_name == "entry"
+            self.phase_name in {"entry", "pm_entry"}
             and self.final30_locked
             and bool(self._precomputed_final30_map)
             and self.trade_use_precomputed_features
@@ -12507,7 +12588,7 @@ class PB1Engine:
         )
 
         # Price probe hook for LIVE mode diagnostics
-        if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry"} and not self.dry_run:
+        if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry", "pm_entry"} and not self.dry_run:
             self._run_price_probe()
 
         # ✅ NEW: decide scan universe
@@ -12529,7 +12610,7 @@ class PB1Engine:
             logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
             scan_codes = []
             scan_source = "blocked_missing_scored_final30"
-        elif watchlist_enabled and self.phase in {"prep", "entry"}:
+        elif watchlist_enabled and self.phase in {"prep", "entry", "pm_entry"}:
             logger.info("[PB1][WATCHLIST] enabled -> load today watchlist")
             # Watchlist로 members 대체
             watchlist_members, watchlist_source = self._load_today_watchlist_members()
@@ -12583,7 +12664,7 @@ class PB1Engine:
             watchlist_count,
         )
         
-        if self.phase in {"prep", "entry"} and self._now_kst >= entry_cutoff_dt:
+        if self.phase in {"prep", "entry", "pm_entry"} and self._now_kst >= entry_cutoff_dt:
             force_compute_when_cutoff = (
                 env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
                 or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
@@ -12601,7 +12682,7 @@ class PB1Engine:
             if force_compute_when_cutoff:
                 calc_allowed = True
                 logger.info("[PB1][CUTOFF_OVERRIDE] compute_only=1 order_allowed=0")
-            if not calc_allowed and self.phase in {"prep", "entry"}:
+            if not calc_allowed and self.phase in {"prep", "entry", "pm_entry"}:
                 skip_entry_scan = True
                 final_status = "SKIPPED"
                 final_notes = "ENTRY_CUTOFF_PASSED"
@@ -12612,8 +12693,8 @@ class PB1Engine:
             int(order_allowed),
             entry_reason or "ok",
         )
-        candidate_allowed = bool(calc_allowed and self.phase in {"prep", "entry"} and not skip_entry_scan)
-        rank_allowed = bool(calc_allowed and self.phase in {"prep", "entry"})
+        candidate_allowed = bool(calc_allowed and self.phase in {"prep", "entry", "pm_entry"} and not skip_entry_scan)
+        rank_allowed = bool(calc_allowed and self.phase in {"prep", "entry", "pm_entry"})
         logger.info(
             "[PB1][GATE] calc_allowed=%s candidate_allowed=%s rank_allowed=%s order_allowed=%s",
             int(calc_allowed),
@@ -13125,7 +13206,7 @@ class PB1Engine:
         logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
 
         # Portfolio full guard: existing_positions >= max_positions이면 신규 매수 scan 불필요
-        if self.phase in {"prep", "entry"} and (existing_positions_count >= max_positions or target_new_positions <= 0):
+        if self.phase in {"prep", "entry", "pm_entry"} and (existing_positions_count >= max_positions or target_new_positions <= 0):
             logger.info(
                 "[ENTRY][SKIP_PORTFOLIO_FULL] session=%s existing_positions=%s max_positions=%s "
                 "slots_remaining=%s target_new_positions=%s reason=PORTFOLIO_FULL",
@@ -13218,7 +13299,7 @@ class PB1Engine:
             if env_bool("DEBUG_EXPORT_RUNTIME", False) and final30_codes:
                 logger.warning("[FINAL30][DEBUG_EXPORT_ONLY] as_of=%s count=%s", as_of_final, len(final30_codes))
 
-        if self.phase == "entry":
+        if self.phase in {"entry", "pm_entry"}:
             final30_codes = self._load_entry_final30_or_abort(as_of_final)
             trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
             logger.info("[PB1][ENTRY][INPUT] TRADE_INPUT=%s FINAL_LIST_NAME=%s", trade_input, os.getenv("FINAL_LIST_NAME", "final30"))
@@ -13231,7 +13312,7 @@ class PB1Engine:
             watchlist_members, watchlist_reason = self._load_today_watchlist_members()
         
         # ✅ CRITICAL: entry는 final30만 입력으로 사용 (유니버스/후보 재생성 금지)
-        if self.phase == "entry":
+        if self.phase in {"entry", "pm_entry"}:
             code_market = {
                 str(m.get("code") or "").zfill(6): (m.get("market") or "")
                 for m in universe_members
@@ -13292,7 +13373,7 @@ class PB1Engine:
         )
         
         buy_allowed_now, buy_allowed_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(self._now_kst)
-        if self.phase in {"prep", "entry"} and not buy_allowed_now:
+        if self.phase in {"prep", "entry", "pm_entry"} and not buy_allowed_now:
             logger.warning(
                 "[ENTRY][PIPE][SKIP] reason=%s now=%s cutoff=%s",
                 buy_allowed_reason,
@@ -13356,7 +13437,7 @@ class PB1Engine:
             entry_reason = "scan_members_empty"
             entry_allowed = False
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
-            if self.phase in {"prep", "entry"}:
+            if self.phase in {"prep", "entry", "pm_entry"}:
                 _emit_entry_summary([], [], Counter())
                 _emit_entry_decision(
                     "SKIP",
@@ -13412,11 +13493,12 @@ class PB1Engine:
         minervini_hard_gate = bool(self._bool_env("PB1_MINERVINI_HARD_GATE", PB1_MINERVINI_HARD_GATE))
         emergency_order_enabled = bool(self._bool_env("PB1_EMERGENCY_ORDER_ENABLED", PB1_EMERGENCY_ORDER_ENABLED))
         emergency_diag_only = bool(self._bool_env("PB1_EMERGENCY_DIAG_ONLY", PB1_EMERGENCY_DIAG_ONLY))
-        if self.phase in {"prep", "entry"} and not skip_entry_scan:
-            if self.phase == "entry":
+        if self.phase in {"prep", "entry", "pm_entry"} and not skip_entry_scan:
+            if self.phase in {"entry", "pm_entry"}:
                 t_pb1_start = time.monotonic()
                 scan_input_codes = [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")]
                 candidates = self._compute_candidates_from_codes(scan_input_codes)
+                self._reject_summary_candidates = list(candidates or [])
                 dt_pb1_filter = time.monotonic() - t_pb1_start
                 dt_minervini = 0.0
                 data_ok_count = len([c for c in candidates if bool(c.features.get("data_ok"))])
@@ -14339,7 +14421,7 @@ class PB1Engine:
                             continue
 
                         with self._stage_timer(f"entry.buyable_gate.pivot_check.{code_key}"):
-                            if self.phase == "entry" and cf.code in buyable_codes:
+                            if self.phase in {"entry", "pm_entry"} and cf.code in buyable_codes:
                                 pivot_val = self._to_float(cf.features.get("pivot"))
                                 if pivot_val and order_price > 0:
                                     # Fix: PULLBACK 계열은 pivot hard gate 미적용
@@ -14901,7 +14983,7 @@ class PB1Engine:
 
             if (
                 self.bootstrap_enabled
-                and self.phase == "entry"
+                and self.phase in {"entry", "pm_entry"}
                 and entry_allowed
                 and bool(self.order_allowed)
                 and existing_positions_count == 0
@@ -15282,7 +15364,7 @@ class PB1Engine:
                     final_status,
                     final_reason,
                 )
-                if self.phase in {"prep", "entry"}:
+                if self.phase in {"prep", "entry", "pm_entry"}:
                     logger.info(
                         "[TRADE][SKIP] reason=%s pool=%s final=%s report=%s",
                         ReasonCode.SKIP_NO_CANDIDATES,
@@ -15312,7 +15394,7 @@ class PB1Engine:
                         no_trade_reason="NO_CANDIDATES_AFTER_RELAX",
                     )
                     return self._finalize_run_result(status=final_status, notes=final_notes)
-            if self.phase in {"entry"}:
+            if self.phase in {"entry", "pm_entry"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
                 if ok_count > 0 and not orderable_candidates:
@@ -15372,7 +15454,7 @@ class PB1Engine:
                         max_positions,
                         target_new_positions,
                     )
-                    if self.phase in {"prep", "entry"}:
+                    if self.phase in {"prep", "entry", "pm_entry"}:
                         if ok_count == 0:
                             logger.info(
                                 "[TRADE][SKIP] reason=%s pool=%s final=%s report=%s",
@@ -15576,7 +15658,7 @@ class PB1Engine:
                             raise RuntimeError(
                                 f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
                             )
-                if entry_allowed and self.phase == "entry" and allow_add_to_existing:
+                if entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
                         code = pos.get("code")

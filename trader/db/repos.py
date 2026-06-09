@@ -2568,7 +2568,7 @@ class OrdersRepo:
         fail_open: bool | None = None,
     ) -> list[dict]:
         if fail_open is None:
-            fail_open = _order_lookup_fail_open_default()
+            fail_open = _resolve_lookup_fail_open()
 
         self._last_read_fail_open_op = None
         rows, fail_open_triggered = safe_read_mappings(
@@ -3007,9 +3007,7 @@ class OrdersRepo:
             .order_by(self._schema.orders.c.created_at.desc())
             .limit(1)
         )
-        self._last_read_fail_open_op = None
-        rows = _safe_repo_read(
-            self.engine,
+        rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_blocking_order_today",
             fail_open=_resolve_lookup_fail_open(),
