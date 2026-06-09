@@ -3566,9 +3566,18 @@ class KisAPI:
                     max_empty_retry,
                 )
                 last_error = e
+                err_text = str(e)
+                is_rate_limited = "EGW00201" in err_text or "초당" in err_text or "rate" in err_text.lower()
                 if empty_cnt < max_empty_retry:
                     empty_cnt += 1
-                    time.sleep(0.7)
+                    sleep_s = [0.5, 1.0, 2.0][min(empty_cnt - 1, 2)] if is_rate_limited else 0.7
+                    if is_rate_limited:
+                        logger.warning(
+                            "[KIS][RATE_LIMIT][BACKOFF] api=balance err=EGW00201 retry=%s sleep=%.1f",
+                            empty_cnt,
+                            sleep_s,
+                        )
+                    time.sleep(sleep_s)
                     continue
                 raise KisBalanceUnavailable(str(e)) from e
 
@@ -3579,6 +3588,8 @@ class KisAPI:
                 len(j.get("output1") or []),
                 int(bool(j.get("output2"))),
             )
+            if empty_cnt > 0:
+                logger.info("[KIS][RATE_LIMIT][RECOVERED] api=balance retry=%s", empty_cnt)
 
             rows = j.get("output1") or []
             if not rows:

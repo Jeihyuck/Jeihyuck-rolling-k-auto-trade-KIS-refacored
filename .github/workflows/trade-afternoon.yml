@@ -92,6 +92,16 @@ env:
   DB_LOCK_TIMEOUT_MS: "5000"
   DB_STATEMENT_TIMEOUT_MS: "15000"
   DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+  DB_CONNECT_TIMEOUT_SEC: "5"
+  PB1_CURRENT_PRICE_CACHE_TTL_SEC: "30"
+  PB1_CURRENT_PRICE_MAX_AGE_SEC: "180"
+  PB1_FETCH_CURRENT_PRICE_MAX_PER_TICK: "30"
+  PB1_ENABLE_RELAX_BRIDGE: "1"
+  PB1_RELAX_BRIDGE_MAX_CANDIDATES: "3"
+  PB1_RELAX_BRIDGE_MIN_RS: "70"
+  PB1_RELAX_BRIDGE_MIN_SCORE: "70"
+  PB1_RELAX_BRIDGE_REQUIRE_CURRENT_PRICE: "1"
+  PB1_RELAX_BRIDGE_REQUIRE_MA20_RECLAIM: "1"
   DB_POOL_TIMEOUT: "10"
   DB_READ_LOCK_TIMEOUT_MS: "5000"
   DB_READ_STATEMENT_TIMEOUT_MS: "12000"
@@ -174,7 +184,12 @@ env:
   # [2026-05-06] Common AM/PM guard: code-level sold-today block / stale order cleanup
   PB1_SESSION_KIND: "afternoon"
   PB1_FORCE_TRADE_SESSION: "afternoon"
-  PB1_PHASE_DEFAULT: "entry"
+  FORCE_MARKET_WINDOW: "afternoon"
+  FORCE_PB1_PHASE: "pm_entry"
+  PB1_PHASE_DEFAULT: "pm_entry"
+  PB1_ENTRY_ENABLED: "1"
+  PB1_EXIT_ONLY_MODE: "0"
+  PM_ENTRY_ALLOW_UNTIL_WARN_ONLY: "1"
   PB1_BLOCK_REENTRY_AFTER_EXIT_SAME_DAY: "1"
   PB1_BLOCK_ENTRY_AFTER_EXIT: "0"
   PB1_RECONCILE_ONLY_AFTER_ORDER_SUBMIT: "0"
@@ -209,8 +224,11 @@ env:
   KR_PB1_CONTRACTION_NEAR_MISS_RS_MIN_BOTH_FAIL: "80"
   # [2026-05-20] 가격 변동성 수축 기준 1.25로 완화 / 거래량 수축 기준 1.25로 정정
   PB1_VOL_MAX: "1.25"
+  PB1_ENTRY_VOL_MAX: "1.25"
   PB1_VOL_CONTRACTION_MAX: "1.25"
   PB1_VOLU_MAX: "1.25"
+  PB1_VOLU_MAX_INTRADAY: "1.25"
+  PB1_ENTRY_VOLU_MAX: "1.25"
   PB1_VOLU_CONTRACTION_MAX: "1.25"
   PB1_REQUIRE_BOTH_CONTRACTIONS: "0"
   # [2026-05-21] KR vol filter (bootstrap/KR 우선순위 명시)
@@ -602,47 +620,33 @@ jobs:
               print(f"[TRADE_AFTERNOON][ORDER_BLOCKED] reason=PREP_PROVENANCE_MISMATCH")
               provenance_ok = False
 
-          # Late start check
+          # Late start check (warn-only): late starts must never disable PM entry before close window.
           from datetime import datetime
           from zoneinfo import ZoneInfo
           KST = ZoneInfo("Asia/Seoul")
           now_dt = datetime.now(KST)
           now_hhmm = now_dt.strftime("%H:%M")
-            entry_allow_until = os.getenv("PM_ENTRY_ALLOW_UNTIL", "13:30")
-            entry_cutoff = os.getenv("ENTRY_CUTOFF_TIME", "15:15")
-            market_close = os.getenv("MARKET_CLOSE_TIME", "15:30")
-            allow_h, allow_m = map(int, entry_allow_until.split(":"))
-            cutoff_h, cutoff_m = map(int, entry_cutoff.split(":"))
-            close_h, close_m = map(int, market_close.split(":"))
-            allow_min = allow_h * 60 + allow_m
-            cutoff_min = cutoff_h * 60 + cutoff_m
-            close_min = close_h * 60 + close_m
+          entry_allow_until = os.getenv("PM_ENTRY_ALLOW_UNTIL", "13:30")
+          schedule_expected = os.getenv("AFTERNOON_PREWARM_START_TIME", "12:15")
           now_min = now_dt.hour * 60 + now_dt.minute
+          exp_h, exp_m = map(int, schedule_expected.split(":"))
+          expected_min = exp_h * 60 + exp_m
+          delay_seconds = max(0, (now_min - expected_min) * 60)
+          allow_h, allow_m = map(int, entry_allow_until.split(":"))
+          allow_min = allow_h * 60 + allow_m
           late_start = now_min > allow_min
-            before_cutoff = now_min < cutoff_min
-            after_close = now_min >= close_min
+          close_window = now_hhmm >= "15:10"
           late_start_no_buy = 0
-            late_start_reason = "TIME_WINDOW_OK"
+          late_start_reason = "TIME_WINDOW_OK"
           if late_start:
-              pm_late_action = os.getenv("PM_LATE_START_ACTION", "RUN_WITH_WARNING")
-              allow_override = os.getenv("PM_ALLOW_LATE_NEW_BUY_OVERRIDE", "0")
-              if before_cutoff or allow_override == "1":
-                  late_start_no_buy = 0
-                late_start_reason = "LATE_START_BEFORE_CUTOFF"
-                print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1 cutoff={entry_cutoff} market_close={market_close}")
-                print(f"[TRADE_AFTERNOON][LATE_START_ACTION] action=RUN_WITH_WARNING entry_enabled=1 exit_enabled=1 reason={late_start_reason} now={now_hhmm} cutoff={entry_cutoff}")
-              elif after_close:
-                late_start_no_buy = 1
-                late_start_reason = "MARKET_CLOSED"
-                print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1 cutoff={entry_cutoff} market_close={market_close}")
-                print(f"[TRADE_AFTERNOON][CUTOFF_ACTION] action=MARKET_CLOSED entry_enabled=0 exit_enabled=0 reason={late_start_reason} now={now_hhmm} cutoff={entry_cutoff}")
-              else:
-                late_start_no_buy = 1
-                late_start_reason = "ENTRY_CUTOFF_PASSED"
-                print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=1 cutoff={entry_cutoff} market_close={market_close}")
-                print(f"[TRADE_AFTERNOON][CUTOFF_ACTION] action=EXIT_ONLY_AFTER_ENTRY_CUTOFF entry_enabled=0 exit_enabled=1 reason={late_start_reason} now={now_hhmm} cutoff={entry_cutoff}")
+              late_start_reason = "LATE_START_WARN_ONLY"
+              print(f"[TRADE_AFTERNOON][LATE_START_ALLOWED] schedule_expected={schedule_expected} actual_start={now_hhmm} delay_seconds={delay_seconds} action=warn_only entry_enabled={0 if close_window else 1}")
+              print(f"[TRADE_AFTERNOON][ENTRY_ALLOW_UNTIL_PASSED][WARN_ONLY] now={now_hhmm} allow_until={entry_allow_until} entry_still_enabled={0 if close_window else 1}")
           else:
-              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=0 cutoff={entry_cutoff} market_close={market_close}")
+              print(f"[TRADE_AFTERNOON][LATE_START_CHECK] now={now_hhmm} allow_until={entry_allow_until} late=0 action=entry_allowed")
+          if close_window:
+              late_start_no_buy = 1
+              late_start_reason = "close_window"
 
           if not provenance_ok:
               if env == "practice":
@@ -701,7 +705,7 @@ jobs:
 
       - name: Run PM entry loop
         id: pm_loop
-        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready == '1' }}
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && (steps.verify_final30.outputs.prep_ready == '1' || steps.verify_final30.outputs.final30_rows == '30') }}
         continue-on-error: true
         timeout-minutes: 135
         working-directory: repo
@@ -709,8 +713,8 @@ jobs:
           PB1_SESSION_KIND: "afternoon"
           PB1_FORCE_TRADE_SESSION: "afternoon"
           FORCE_MARKET_WINDOW: "afternoon"
-          FORCE_PB1_PHASE: "entry"
-          PB1_PHASE_DEFAULT: "entry"
+          FORCE_PB1_PHASE: "pm_entry"
+          PB1_PHASE_DEFAULT: "pm_entry"
           PB1_ENTRY_ENABLED: "1"
           PB1_TARGET_START_TIME: "13:00"
           PB1_START_ALLOW_UNTIL: "13:30"
@@ -724,29 +728,27 @@ jobs:
           DISABLE_LIVE_TRADING: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           LIVE_TRADING_ENABLED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
           KIS_HTTP_ENABLED: "1"
-          # [2026-05-27] Late start guard: block new BUY after PM_ENTRY_ALLOW_UNTIL
-          PB1_LATE_START_NO_NEW_BUY: ${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}
-          PB1_PM_LATE_START_NO_BUY_ENABLED: ${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}
+          # [2026-06-09] Late start is warn-only before close window.
+          PB1_LATE_START_NO_NEW_BUY: "0"
+          PB1_PM_LATE_START_NO_BUY_ENABLED: "0"
+          PM_ENTRY_ALLOW_UNTIL_WARN_ONLY: "1"
         run: |
           set -euo pipefail
           late_no_buy="${{ steps.verify_final30.outputs.late_start_no_buy || '0' }}"
           late_reason="${{ steps.verify_final30.outputs.late_start_reason || 'TIME_WINDOW_OK' }}"
-          if [[ "$late_no_buy" == "1" ]]; then
-            echo "[TRADE_AFTERNOON][CUTOFF_ACTION] action=EXIT_ONLY_AFTER_ENTRY_CUTOFF entry_enabled=0 exit_enabled=1 reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
-            echo "[ENTRY][BLOCKED] reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
-          elif [[ "$late_reason" == "LATE_START_BEFORE_CUTOFF" ]]; then
+          if [[ "$late_reason" == "LATE_START_WARN_ONLY" ]]; then
             echo "[TRADE_AFTERNOON][LATE_START_ACTION] action=RUN_WITH_WARNING entry_enabled=1 exit_enabled=1 reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
             echo "[ENTRY][ALLOWED] reason=${late_reason}" | tee -a artifacts/trade-afternoon.log
           fi
           echo "[TRADE_AFTERNOON][ENGINE_START] cmd=python -m trader.trade_tick phase=pm as_of=${{ steps.verify_final30.outputs.expected_as_of }} prep_ready=${{ steps.verify_final30.outputs.prep_ready }}" | tee -a artifacts/trade-afternoon.log
-          echo "[PHASE][START] phase=pm session_window=1300-1510 entry_enabled=$([ \"$late_no_buy\" == \"1\" ] && echo 0 || echo 1)" | tee -a artifacts/trade-afternoon.log
+          echo "[PHASE][START] phase=pm session_window=1300-1510 entry_enabled=1" | tee -a artifacts/trade-afternoon.log
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
           echo "[PHASE][END] phase=pm" | tee -a artifacts/trade-afternoon.log
           echo "[TRADE_AFTERNOON][ENGINE_DONE] exit_code=0 phase=pm" | tee -a artifacts/trade-afternoon.log
 
       - name: Run PM exit-only loop (PREP not ready - manage existing holdings)
         id: exit_only_pm
-        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' }}
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' && steps.verify_final30.outputs.final30_rows != '30' }}
         continue-on-error: true
         timeout-minutes: 135
         working-directory: repo
@@ -769,11 +771,11 @@ jobs:
           KIS_HTTP_ENABLED: "1"
         run: |
           set -euo pipefail
-          echo "[TRADE_AFTERNOON][EXIT_ONLY_PM][START] prep_ready=0 phase=pm entry_enabled=0 exit_only=1" | tee -a artifacts/trade-afternoon.log
+          echo "[TRADE_AFTERNOON][EXIT_ONLY_PM_DB_MISSING][START] prep_ready=0 final30_rows=0 phase=pm entry_enabled=0 exit_only=1" | tee -a artifacts/trade-afternoon.log
           echo "[PHASE][START] phase=pm_exit_only session_window=1300-1510 entry_enabled=0" | tee -a artifacts/trade-afternoon.log
           python -m trader.trade_tick 2>&1 | tee -a artifacts/trade-afternoon.log
           echo "[PHASE][END] phase=pm_exit_only" | tee -a artifacts/trade-afternoon.log
-          echo "[TRADE_AFTERNOON][EXIT_ONLY_PM][DONE] exit_code=0" | tee -a artifacts/trade-afternoon.log
+          echo "[TRADE_AFTERNOON][EXIT_ONLY_PM_DB_MISSING][DONE] exit_code=0" | tee -a artifacts/trade-afternoon.log
 
       - name: Wait until Close target start
         if: always() && steps.boot_guard.outputs.should_run == '1'
@@ -803,7 +805,7 @@ jobs:
 
       - name: Run Close exit loop
         id: close_loop
-        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready == '1' }}
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && (steps.verify_final30.outputs.prep_ready == '1' || steps.verify_final30.outputs.final30_rows == '30') }}
         continue-on-error: true
         timeout-minutes: 20
         working-directory: repo
@@ -839,7 +841,7 @@ jobs:
 
       - name: Run Close exit-only loop (PREP not ready - manage existing holdings)
         id: exit_only_close
-        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' }}
+        if: ${{ always() && steps.boot_guard.outputs.should_run == '1' && steps.trading_day_guard.outputs.is_trading_day == '1' && steps.verify_final30.outputs.prep_ready != '1' && steps.verify_final30.outputs.final30_rows != '30' }}
         continue-on-error: true
         timeout-minutes: 20
         working-directory: repo

@@ -15,6 +15,7 @@ DB_URL_KEYS = (
     "PBCORE_DB_URL",
     "DATABASE_URL",
 )
+DB_CONNECT_TIMEOUT_SEC_DEFAULT = 5
 DB_LOCK_TIMEOUT_MS_DEFAULT = 5000
 DB_STATEMENT_TIMEOUT_MS_DEFAULT = 15000
 DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT = 15000
@@ -77,45 +78,53 @@ def get_db_url() -> str:
     return url
 
 
+def _is_postgres_url(db_url: str) -> bool:
+    drivername, base_driver = _describe_db_url(db_url)
+    return bool(base_driver == "postgresql" or drivername.startswith("postgres"))
+
+
+def _apply_postgres_timeout_options(connect_args: dict) -> dict:
+    lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", str(DB_LOCK_TIMEOUT_MS_DEFAULT)))
+    statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", str(DB_STATEMENT_TIMEOUT_MS_DEFAULT)))
+    idle_in_tx_timeout_ms = int(
+        os.getenv(
+            "DB_IDLE_IN_TX_SESSION_TIMEOUT_MS",
+            str(DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT),
+        )
+    )
+    pg_options = [
+        f"-c lock_timeout={lock_timeout_ms}",
+        f"-c statement_timeout={statement_timeout_ms}",
+        f"-c idle_in_transaction_session_timeout={idle_in_tx_timeout_ms}",
+    ]
+    existing_options = str(connect_args.get("options", "") or "").strip()
+    connect_args["options"] = " ".join([opt for opt in [existing_options, *pg_options] if opt]).strip()
+    logger.info(
+        "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_ms=%s",
+        connect_args.get("connect_timeout"),
+        lock_timeout_ms,
+        statement_timeout_ms,
+        idle_in_tx_timeout_ms,
+    )
+    return connect_args
+
+
 def _connect_args_for_db_url(db_url: str) -> dict:
     """
     Supabase pooler(6543, PgBouncer) 환경에서 psycopg3 prepared statement 충돌 방지.
     - psycopg3 문서: PgBouncer/풀러 사용 시 prepared statements 비활성화 권고
       -> prepare_threshold=None
     """
+    connect_timeout = os.getenv("DB_CONNECT_TIMEOUT_SEC") or os.getenv("DB_CONNECT_TIMEOUT") or str(DB_CONNECT_TIMEOUT_SEC_DEFAULT)
     connect_args: dict = {
-        "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "15")),
+        "connect_timeout": int(connect_timeout),
         "keepalives": int(os.getenv("DB_KEEPALIVES", "1")),
         "keepalives_idle": int(os.getenv("DB_KEEPALIVES_IDLE", "30")),
         "keepalives_interval": int(os.getenv("DB_KEEPALIVES_INTERVAL", "10")),
         "keepalives_count": int(os.getenv("DB_KEEPALIVES_COUNT", "5")),
     }
-    drivername, base_driver = _describe_db_url(db_url)
-    if base_driver == "postgresql" or drivername.startswith("postgres"):
-        lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", str(DB_LOCK_TIMEOUT_MS_DEFAULT)))
-        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", str(DB_STATEMENT_TIMEOUT_MS_DEFAULT)))
-        idle_in_tx_timeout_ms = int(
-            os.getenv(
-                "DB_IDLE_IN_TX_SESSION_TIMEOUT_MS",
-                str(DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT),
-            )
-        )
-
-        pg_options = [
-            f"-c lock_timeout={lock_timeout_ms}",
-            f"-c statement_timeout={statement_timeout_ms}",
-            f"-c idle_in_transaction_session_timeout={idle_in_tx_timeout_ms}",
-        ]
-
-        existing_options = str(connect_args.get("options", "") or "").strip()
-        connect_args["options"] = " ".join([opt for opt in [existing_options, *pg_options] if opt]).strip()
-        logger.info(
-            "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s",
-            connect_args.get("connect_timeout"),
-            lock_timeout_ms,
-            statement_timeout_ms,
-            idle_in_tx_timeout_ms,
-        )
+    if _is_postgres_url(db_url):
+        connect_args = _apply_postgres_timeout_options(connect_args)
 
     app_name = (
         os.getenv("DB_APPLICATION_NAME")
@@ -269,7 +278,11 @@ def safe_read_mappings(
     fail_open: bool = False,
 ) -> tuple[list[dict], bool]:
     try:
-        with engine.connect() as conn:
+        conn_cm = engine.connect()
+        execution_options = getattr(conn_cm, "execution_options", None)
+        if callable(execution_options):
+            conn_cm = execution_options(isolation_level="AUTOCOMMIT")
+        with conn_cm as conn:
             logger.info(
                 "[DB][READ][PATH] op=%s active_tx=%s safe_mode=connect_only",
                 op_name,
@@ -283,32 +296,37 @@ def safe_read_mappings(
             lock_timeout_ms = int(
                 os.getenv("DB_READ_LOCK_TIMEOUT_MS", os.getenv("DB_LOCK_TIMEOUT_MS", "5000"))
             )
-            try:
-                conn.exec_driver_sql(f"SET statement_timeout = {read_timeout_ms}")
-                conn.exec_driver_sql(f"SET lock_timeout = {lock_timeout_ms}")
-                logger.info(
-                    "[DB][READ][TIMEOUT_SET] op=%s statement_timeout_ms=%s lock_timeout_ms=%s krx=%s",
-                    op_name,
-                    read_timeout_ms,
-                    lock_timeout_ms,
-                    int(_is_krx_context()),
-                )
-            except Exception as _tset_exc:
-                logger.warning(
-                    "[DB][READ][TIMEOUT_SET][SKIP] op=%s err_type=%s err=%s",
-                    op_name,
-                    type(_tset_exc).__name__,
-                    _tset_exc,
-                )
+            dialect_name = str(getattr(getattr(conn, "dialect", None), "name", "") or getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+            is_pg = dialect_name.startswith("postgres") or str(getattr(engine, "url", "")).startswith(("postgres://", "postgresql://", "postgresql+"))
+            timeouts_applied = False
+            if is_pg:
+                try:
+                    conn.exec_driver_sql(f"SET statement_timeout = {read_timeout_ms}")
+                    conn.exec_driver_sql(f"SET lock_timeout = {lock_timeout_ms}")
+                    timeouts_applied = True
+                    logger.info(
+                        "[DB][READ][TIMEOUTS_APPLIED] op=%s lock_timeout_ms=%s statement_timeout_ms=%s",
+                        op_name,
+                        lock_timeout_ms,
+                        read_timeout_ms,
+                    )
+                except Exception as _tset_exc:
+                    logger.warning(
+                        "[DB][READ][TIMEOUT_SET][SKIP] op=%s err_type=%s err=%s",
+                        op_name,
+                        type(_tset_exc).__name__,
+                        _tset_exc,
+                    )
 
             try:
                 rows = conn.execute(stmt).mappings().all()
             finally:
-                try:
-                    conn.exec_driver_sql("RESET statement_timeout")
-                    conn.exec_driver_sql("RESET lock_timeout")
-                except Exception:
-                    pass
+                if timeouts_applied:
+                    try:
+                        conn.exec_driver_sql("RESET statement_timeout")
+                        conn.exec_driver_sql("RESET lock_timeout")
+                    except Exception:
+                        pass
 
             logger.info(
                 "[DB][READ][OK] op=%s rows=%s fail_open=%s",

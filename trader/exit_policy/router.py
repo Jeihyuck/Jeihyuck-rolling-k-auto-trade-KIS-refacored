@@ -489,6 +489,19 @@ def apply_swing_exit_decision(
     trail_price_hit = bool(trail_hit or (resolved_trail_stop > 0 and mark < resolved_trail_stop))
     if trail_price_hit and holding_bars >= min_trail_bars:
         qty = _calculate_exit_qty(orderable_qty, trail_sell_pct)
+        avg_price = float(pos.get("avg_buy_price") or pos.get("avg_price") or pos.get("pchs_avg_pric") or 0.0)
+        high_since_entry = float(meta.get("high_since_entry") or meta.get("highest_price") or pos.get("high_since_entry") or max(mark, resolved_trail_stop, avg_price))
+        drawdown_pct = ((mark / high_since_entry) - 1.0) * 100.0 if high_since_entry > 0 else 0.0
+        logger.info(
+            "[EXIT][TRAIL_STOP] code=%s avg=%s last=%s pnl_pct=%.2f high_since_entry=%s trail_stop_px=%s drawdown_from_high=%.2f action=sell",
+            code_for_log,
+            avg_price,
+            mark,
+            ret_pct,
+            high_since_entry,
+            resolved_trail_stop,
+            drawdown_pct,
+        )
         logger.info(
             "[EXIT][ROUTER][DECISION] code=%s exit_ok=1 reason=TRAIL_STOP_HIT mark=%.2f trail_stop=%.2f holding_bars=%s qty=%s",
             code_for_log,

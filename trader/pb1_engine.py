@@ -2031,12 +2031,28 @@ def resolve_pb1_phase(
     forced_trade_session: str | None = None,
 ) -> tuple[str, str, str]:
     force_raw = (force_phase_env or "").strip().lower()
+    window = resolve_market_window(now, trading_day)
+    force_market_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    close_cutoff_raw = (os.getenv("PB1_PM_SESSION_END") or os.getenv("PM_SESSION_END") or "15:10").strip()
+    try:
+        close_cutoff = datetime.strptime(close_cutoff_raw, "%H:%M").time()
+    except ValueError:
+        close_cutoff = datetime.strptime("15:10", "%H:%M").time()
+    if force_market_window == "afternoon" and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1":
+        return "exit", "exit_only_mode", window
+    if force_market_window == "afternoon":
+        if trading_day and now.time() < close_cutoff:
+            logger.info(
+                "[PB1][PHASE] force_market_window=afternoon phase=pm_entry entry_enabled=True reason=afternoon_entry_allowed"
+            )
+            return "pm_entry", "afternoon_entry_allowed", window
+        return "close", "close_window", window
     if force_raw:
-        if force_raw in {"entry", "exit", "verify", "manage", "idle"}:
-            window = resolve_market_window(now, trading_day)
+        if force_raw in {"entry", "pm_entry", "exit", "close", "verify", "manage", "idle"}:
+            if force_raw == "close":
+                return "close", "force", window
             return force_raw, "force", window
         logger.warning("[PB1][PHASE] invalid force phase=%s -> auto", force_raw)
-    window = resolve_market_window(now, trading_day)
     if not trading_day:
         return "idle", "auto_non_trading_day", window
     if force_entry_window_override and str(forced_trade_session or "").strip().lower() in {"am", "pm"}:
@@ -2319,10 +2335,15 @@ class PB1Engine:
         self._setup_reason_counter: Counter[str] = Counter()
         self.reject_reason_counts: dict[str, int] = {}
         self.reject_reason_samples: dict[str, list[str]] = {}
+        self._reject_summary_candidates: list[CandidateFeature] = []
         self.total_candidates = 0
         self.ok_count = 0
         self.daily_fetch_count = 0
         self.price_fetch_count = 0
+        self._current_price_cache: dict[str, tuple[float, datetime]] = {}
+        self._current_price_cache_at: dict[str, datetime] = {}
+        self._current_price_fetch_count = 0
+        self._relax_bridge_summary: dict[str, Any] = {"enabled": False, "activated": False, "reason": "not_checked"}
         self.entry_mode = PB1_ENTRY_MODE
         self.entry_require_both = bool(PB1_REQUIRE_BOTH)
         self.entry_cond_mode = ENTRY_COND_MODE
@@ -3324,6 +3345,18 @@ class PB1Engine:
         }
 
     def _resolve_effective_entry_filters(self) -> dict[str, Any]:
+        def _first_float(names: Iterable[str], default: float) -> tuple[float, str]:
+            for name in names:
+                raw = os.getenv(name)
+                if raw is None or str(raw).strip() == "":
+                    continue
+                try:
+                    return float(str(raw).strip()), name
+                except Exception:
+                    logger.warning("[PB1][THRESHOLDS][ENV_INVALID] name=%s value=%s default=%s", name, raw, default)
+                    break
+            return float(default), "default"
+
         defaults = {
             "rs_min_pctile": float(RS_MIN_PCTILE),
             "vcp_min_score": float(VCP_MIN_SCORE),
@@ -3340,28 +3373,10 @@ class PB1Engine:
             "min_buyable": max(1, int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", PB1_MIN_BUYABLE)))),
             "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN)))),
         }
-        env_overrides = {
-            "rs_min_pctile": float(self._float_env("PB1_BOOTSTRAP_RS_MIN", defaults["rs_min_pctile"])),
-            "vcp_min_score": float(self._float_env("PB1_BOOTSTRAP_VCP_MIN", defaults["vcp_min_score"])),
-            "vol_max": float(self._float_env("PB1_BOOTSTRAP_VOL_MAX", defaults["vol_max"])),
-            "volu_max": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", defaults["volu_max"])),
-            "volu_max_intraday": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", defaults["volu_max_intraday"])),
-            "pullback_min": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MIN", defaults["pullback_min"])),
-            "pullback_max": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MAX", defaults["pullback_max"])),
-            "require_both_contractions": bool(self._bool_env("PB1_BOOTSTRAP_REQUIRE_BOTH", defaults["require_both_contractions"])),
-            "min_score_base": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_BASE", defaults["min_score_base"])),
-            "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", defaults["min_score_floor"])),
-            "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", defaults["min_score_step"])),
-            "relax_passes": max(1, int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", defaults["relax_passes"]))),
-            "min_buyable": max(
-                1,
-                int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", defaults["min_buyable"]))),
-            ),
-            "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", defaults["score_keep_topn"]))),
-        }
         effective = dict(defaults)
-        effective.update(env_overrides)
-        if self.bootstrap_enabled and self.phase == "entry":
+        if self.bootstrap_enabled and self.phase in {"entry", "pm_entry"}:
+            # Profile defaults are deliberately applied before explicit env overrides.
+            # A profile must never silently replace PB1_VOL_MAX/PB1_VOLU_MAX=1.25 with 1.15.
             effective.update(
                 {
                     "rs_min_pctile": 60.0,
@@ -3380,6 +3395,48 @@ class PB1Engine:
                     "score_keep_topn": 3,
                 }
             )
+
+        vol_max, vol_src = _first_float(
+            ("PB1_ENTRY_VOL_MAX", "PB1_VOL_MAX", "PB1_KR_VOL_MAX", "PB1_BOOTSTRAP_VOL_MAX", "BOOTSTRAP_PB1_VOL_MAX"),
+            effective["vol_max"],
+        )
+        volu_max, volu_src = _first_float(
+            ("PB1_ENTRY_VOLU_MAX", "PB1_VOLU_MAX", "PB1_KR_VOLU_MAX", "PB1_BOOTSTRAP_VOLU_MAX", "BOOTSTRAP_PB1_VOLU_MAX"),
+            effective["volu_max"],
+        )
+        volu_intraday, volu_intraday_src = _first_float(
+            ("PB1_VOLU_MAX_INTRADAY", "PB1_ENTRY_VOLU_MAX", "PB1_VOLU_MAX", "PB1_KR_VOLU_MAX_INTRADAY", "PB1_BOOTSTRAP_VOLU_MAX_INTRADAY", "PB1_BOOTSTRAP_VOLU_MAX"),
+            effective["volu_max_intraday"],
+        )
+        effective.update(
+            {
+                "rs_min_pctile": float(self._float_env("PB1_BOOTSTRAP_RS_MIN", effective["rs_min_pctile"])),
+                "vcp_min_score": float(self._float_env("PB1_BOOTSTRAP_VCP_MIN", effective["vcp_min_score"])),
+                "vol_max": vol_max,
+                "volu_max": volu_max,
+                "volu_max_intraday": volu_intraday,
+                "pullback_min": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MIN", effective["pullback_min"])),
+                "pullback_max": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MAX", effective["pullback_max"])),
+                "require_both_contractions": bool(self._bool_env("PB1_BOOTSTRAP_REQUIRE_BOTH", effective["require_both_contractions"])),
+                "min_score_base": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_BASE", effective["min_score_base"])),
+                "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", effective["min_score_floor"])),
+                "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", effective["min_score_step"])),
+                "relax_passes": max(1, int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", effective["relax_passes"]))),
+                "min_buyable": max(1, int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", effective["min_buyable"])))),
+                "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", effective["score_keep_topn"]))),
+            }
+        )
+        logger.info(
+            "[PB1][THRESHOLDS][FINAL] phase=%s window=%s vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f source=env_overrides_applied vol_src=%s volu_src=%s volu_intraday_src=%s",
+            self.phase_name,
+            self.window_name,
+            effective["vol_max"],
+            effective["volu_max"],
+            effective["volu_max_intraday"],
+            vol_src,
+            volu_src,
+            volu_intraday_src,
+        )
         logger.info(
             "[PB1][EFFECTIVE_FILTERS] phase=%s window=%s filters=%s",
             self.phase_name,
@@ -3519,7 +3576,7 @@ class PB1Engine:
         logger.warning(message, *args)
 
     def _is_intraday_threshold_window(self) -> bool:
-        if self.phase not in {"prep", "entry"}:
+        if self.phase not in {"prep", "entry", "pm_entry"}:
             return False
         if self.window_internal not in {"morning", "day"}:
             return False
@@ -3570,7 +3627,8 @@ class PB1Engine:
 
     def _log_reason_summary(self, note: str | None = None) -> None:
         total_rejected = sum(self.reject_reason_counts.values())
-        total_candidates = total_rejected + (self._setup_reason_counter.total() - total_rejected)  # wait, better to track total
+        setup_counter_total = getattr(getattr(self, "_setup_reason_counter", None), "total", lambda: 0)()
+        total_candidates = total_rejected + (setup_counter_total - total_rejected)  # legacy diagnostic only
         # Actually, track total candidates separately
         # For now, assume we have total from somewhere
         # Wait, in the code, we need to count total
@@ -3586,14 +3644,107 @@ class PB1Engine:
         # Add self.ok_count = 0
         # In _log_setup, if cf.setup_ok: self.ok_count += 1
 
+        if not self.reject_reason_counts and self.total_candidates > 0 and self.ok_count == 0:
+            fallback_counter: Counter[str] = Counter()
+            fallback_samples: dict[str, list[str]] = {}
+            for cf in list(getattr(self, "_reject_summary_candidates", []) or []):
+                features = getattr(cf, "features", {}) or {}
+                collected: list[str] = []
+                for key in ("setup_loose_reasons", "setup_strict_reasons", "filters_failed", "quality_flags"):
+                    raw_items = features.get(key)
+                    if raw_items is None:
+                        continue
+                    if isinstance(raw_items, str):
+                        raw_iter = [x.strip() for x in raw_items.replace(";", ",").split(",") if x.strip()]
+                    elif isinstance(raw_items, (list, tuple, set)):
+                        raw_iter = list(raw_items)
+                    else:
+                        raw_iter = [raw_items]
+                    collected.extend(str(item).strip() for item in raw_iter if str(item).strip())
+                if not collected:
+                    collected.extend(str(item).strip() for item in (getattr(cf, "reasons", None) or []) if str(item).strip())
+                for reason in collected or ["unspecified_fail"]:
+                    fallback_counter[str(reason)] += 1
+                    sample_list = fallback_samples.setdefault(str(reason), [])
+                    if getattr(cf, "code", None) and len(sample_list) < 5:
+                        sample_list.append(str(cf.code))
+            if fallback_counter:
+                self.reject_reason_counts.update(dict(fallback_counter))
+                for reason, samples in fallback_samples.items():
+                    self.reject_reason_samples.setdefault(reason, samples)
+                logger.info(
+                    "[ENTRY][REJECT_SUMMARY][FALLBACK] total=%s source=candidate_features reasons=%s",
+                    self.total_candidates,
+                    fallback_counter.most_common(10),
+                )
         if not self.reject_reason_counts:
+            fallback_text = "UNKNOWN:1" if self.total_candidates > 0 and self.ok_count == 0 else "none"
+            logger.info("[ENTRY][REJECT_SUMMARY] total=%s top_blockers=%s", self.total_candidates, fallback_text)
+            if fallback_text != "none":
+                logger.info("[RUN_SUMMARY][NO_BUY] reason=NO_FINAL_SETUPS top_blockers=%s", fallback_text)
+            try:
+                artifact_dir = Path("artifacts")
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                path = artifact_dir / "entry_reject_summary.json"
+                path.write_text(json.dumps({
+                    "total_candidates": int(getattr(self, "total_candidates", 0) or 0),
+                    "setup_ok": int(getattr(self, "ok_count", 0) or 0),
+                    "top_blockers": [] if fallback_text == "none" else [{"reason": "UNKNOWN", "count": 1, "samples": []}],
+                    "thresholds": {},
+                    "source_policy": {"authoritative": "pb1_engine", "scanner": "diagnostic_only", "minervini": "diagnostic_only"},
+                    "bridge": {"enabled": False, "activated": False, "reason": "not_checked"},
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                logger.info("[ENTRY][REJECT_SUMMARY][JSON] path=%s", path)
+            except Exception as exc:
+                logger.warning("[ENTRY][REJECT_SUMMARY][JSON][FAIL] err=%s", exc)
             return
         sorted_reasons = sorted(self.reject_reason_counts.items(), key=lambda x: x[1], reverse=True)
+        top_blockers = ",".join(f"{str(reason).upper()}:{count}" for reason, count in sorted_reasons[:10])
         logger.info("[PB1][REJECT_SUMMARY] total=%s ok=%s rejected=%s", self.total_candidates, self.ok_count, total_rejected)
+        logger.info("[ENTRY][REJECT_SUMMARY] total=%s top_blockers=%s", self.total_candidates, top_blockers or "none")
+        if self.ok_count == 0 and (top_blockers or self.reject_reason_counts):
+            logger.info("[RUN_SUMMARY][NO_BUY] reason=NO_FINAL_SETUPS top_blockers=%s", top_blockers or "unknown")
         for reason, count in sorted_reasons:
             samples = self.reject_reason_samples.get(reason, [])
             sample_str = f" sample={samples}" if samples else ""
             logger.info("[PB1][REJECT_REASON] %s=%s%s", reason, count, sample_str)
+        try:
+            artifact_dir = Path("artifacts")
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            filters = getattr(self, "effective_entry_filters", {}) or {}
+            bridge_summary = getattr(self, "_relax_bridge_summary", {}) or {}
+            payload = {
+                "total_candidates": int(getattr(self, "total_candidates", 0) or 0),
+                "setup_ok": int(getattr(self, "ok_count", 0) or 0),
+                "top_blockers": [
+                    {
+                        "reason": str(reason).upper(),
+                        "count": int(count),
+                        "samples": list((getattr(self, "reject_reason_samples", {}) or {}).get(reason, []) or []),
+                    }
+                    for reason, count in sorted_reasons[:10]
+                ],
+                "thresholds": {
+                    "vol_max": filters.get("vol_max"),
+                    "volu_max": filters.get("volu_max"),
+                    "volu_max_intraday": filters.get("volu_max_intraday"),
+                },
+                "source_policy": {
+                    "authoritative": "pb1_engine",
+                    "scanner": "diagnostic_only",
+                    "minervini": "diagnostic_only",
+                },
+                "bridge": {
+                    "enabled": bool(bridge_summary.get("enabled", False)),
+                    "activated": bool(bridge_summary.get("activated", False)),
+                    "reason": str(bridge_summary.get("reason") or "not_checked"),
+                },
+            }
+            path = artifact_dir / "entry_reject_summary.json"
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+            logger.info("[ENTRY][REJECT_SUMMARY][JSON] path=%s", path)
+        except Exception as exc:
+            logger.warning("[ENTRY][REJECT_SUMMARY][JSON][FAIL] err=%s", exc)
 
     @staticmethod
     def _to_float(value: Any) -> float | None:
@@ -3701,6 +3852,7 @@ class PB1Engine:
 
         mapped: dict[str, Any] = {
             "close": self._pick_first_float(pre_row, "close", "last_close"),
+            "current_price": self._pick_first_float(pre_row, "current_price", "intraday_last", "last", "stck_prpr"),
             "ma20": self._pick_first_float(pre_row, "ma20"),
             "ma50": self._pick_first_float(pre_row, "ma50"),
             "ma150": self._pick_first_float(pre_row, "ma150"),
@@ -3722,6 +3874,7 @@ class PB1Engine:
             mapped,
             {
                 "close": self._pick_first_float(derived_row, "close", "last_close"),
+                "current_price": self._pick_first_float(derived_row, "current_price", "intraday_last", "last", "stck_prpr"),
                 "ma20": self._pick_first_float(derived_row, "ma20"),
                 "ma50": self._pick_first_float(derived_row, "ma50"),
                 "ma150": self._pick_first_float(derived_row, "ma150"),
@@ -6435,7 +6588,7 @@ class PB1Engine:
 
         trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
         trade_precomputed_only = bool(
-            self.phase == "entry"
+            self.phase in {"entry", "pm_entry"}
             and self.trade_use_precomputed_features
             and bool(self._precomputed_final30_map)
             and (self.window_internal in {"morning", "day", "intraday", "after"})
@@ -11280,6 +11433,280 @@ class PB1Engine:
             elapsed,
         )
 
+    def _parse_price_ts(self, value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            _tz = getattr(getattr(self, "_now_kst", None), "tzinfo", ZoneInfo("Asia/Seoul"))
+            return value if value.tzinfo is not None else value.replace(tzinfo=_tz)
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            _tz = getattr(getattr(self, "_now_kst", None), "tzinfo", ZoneInfo("Asia/Seoul"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=_tz)
+        except Exception:
+            return None
+
+    def _fresh_current_price_from_features(self, code: str, features: dict[str, Any]) -> float | None:
+        max_age = int(os.getenv("PB1_CURRENT_PRICE_MAX_AGE_SEC", "180") or "180")
+        for key in ("current_price", "intraday_last", "last", "stck_prpr"):
+            price = self._to_float(features.get(key))
+            if price is None or price <= 0:
+                continue
+            ts = PB1Engine._parse_price_ts(
+                self,
+                features.get(f"{key}_ts")
+                or features.get(f"{key}_at")
+                or features.get("current_price_ts")
+                or features.get("intraday_ts")
+            )
+            age_sec = 0.0
+            if ts is not None:
+                _now = getattr(self, "_now_kst", now_kst())
+                age_sec = max(0.0, (_now - ts.astimezone(_now.tzinfo)).total_seconds())
+                if age_sec > max_age:
+                    logger.info(
+                        "[ENTRY][CURRENT_PRICE][STALE] code=%s price=%s age_sec=%.1f max_age=%s",
+                        code,
+                        price,
+                        age_sec,
+                        max_age,
+                    )
+                    continue
+            logger.info(
+                "[ENTRY][CURRENT_PRICE][SOURCE] code=%s source=%s price=%s age_sec=%.1f",
+                code,
+                key,
+                price,
+                age_sec,
+            )
+            return price
+        return None
+
+    def _get_current_price_for_entry(self, code: str, features: dict[str, Any] | None = None) -> float | None:
+        norm_code = str(code).zfill(6)
+        features = features or {}
+        try:
+            feature_price = self._fresh_current_price_from_features(norm_code, features)
+        except (TypeError, AttributeError):
+            feature_price = PB1Engine._fresh_current_price_from_features(self, norm_code, features)
+        if feature_price is not None:
+            if hasattr(self, "_current_price_cache"):
+                self._current_price_cache[norm_code] = (feature_price, getattr(self, "_now_kst", now_kst()))
+            return feature_price
+
+        ttl = int(os.getenv("PB1_CURRENT_PRICE_CACHE_TTL_SEC", "30") or "30")
+        cache = getattr(self, "_current_price_cache", {})
+        cached = cache.get(norm_code)
+        if cached:
+            price, cached_at = cached
+            age_sec = max(0.0, (getattr(self, "_now_kst", now_kst()) - cached_at).total_seconds())
+            if age_sec <= ttl:
+                logger.info(
+                    "[ENTRY][CURRENT_PRICE][SOURCE] code=%s source=tick_cache price=%s age_sec=%.1f",
+                    norm_code,
+                    price,
+                    age_sec,
+                )
+                return price
+
+        balance_price = self._to_float(getattr(self, "_balance_price_map", {}).get(norm_code))
+        if balance_price is not None and balance_price > 0:
+            logger.info(
+                "[ENTRY][CURRENT_PRICE][SOURCE] code=%s source=kis_balance_prpr price=%s age_sec=0.0",
+                norm_code,
+                balance_price,
+            )
+            if hasattr(self, "_current_price_cache"):
+                self._current_price_cache[norm_code] = (balance_price, getattr(self, "_now_kst", now_kst()))
+            return balance_price
+
+        max_fetch = int(os.getenv("PB1_FETCH_CURRENT_PRICE_MAX_PER_TICK", "30") or "30")
+        if int(getattr(self, "_current_price_fetch_count", 0)) >= max_fetch:
+            logger.info("[ENTRY][CURRENT_PRICE][MISSING] code=%s reason=fetch_limit_reached", norm_code)
+            return None
+        if not bool(getattr(self, "price_allowed", True)):
+            logger.info("[ENTRY][CURRENT_PRICE][MISSING] code=%s reason=price_not_allowed", norm_code)
+            return None
+        self._current_price_fetch_count = int(getattr(self, "_current_price_fetch_count", 0)) + 1
+        quote_price = self._mark_price(norm_code)
+        if quote_price is not None and quote_price > 0:
+            logger.info(
+                "[ENTRY][CURRENT_PRICE][SOURCE] code=%s source=kis_quote price=%s age_sec=0.0",
+                norm_code,
+                quote_price,
+            )
+            if hasattr(self, "_current_price_cache"):
+                self._current_price_cache[norm_code] = (quote_price, getattr(self, "_now_kst", now_kst()))
+            return quote_price
+        logger.info("[ENTRY][CURRENT_PRICE][MISSING] code=%s reason=no_intraday_price_available", norm_code)
+        return None
+
+    def _resolve_intraday_current_price_for_reclaim(
+        self,
+        code: str,
+        *,
+        current_price: float | None,
+        last_close: float | None,
+        ma20_value: float | None,
+        features: dict[str, Any] | None = None,
+    ) -> float | None:
+        if current_price is not None and current_price > 0:
+            return current_price
+        if not (self.phase in {"entry", "pm_entry"} and last_close is not None and ma20_value is not None and last_close < ma20_value):
+            return current_price
+        get_price = getattr(self, "_get_current_price_for_entry", None)
+        if callable(get_price):
+            resolved = get_price(code, features or {})
+        else:
+            resolved = PB1Engine._get_current_price_for_entry(self, code, features or {})
+        if resolved is None:
+            logger.info(
+                "[ENTRY][INTRADAY_RECLAIM][SKIP] code=%s reason=current_price_missing last_close=%s ma20=%s",
+                code,
+                last_close,
+                ma20_value,
+            )
+        return resolved
+
+    def _relax_bridge_enabled(self) -> tuple[bool, str]:
+        raw = os.getenv("PB1_ENABLE_RELAX_BRIDGE")
+        env_name = str(self.env or os.getenv("STRATEGY_ENV") or "practice").strip().lower()
+        default_enabled = env_name == "practice"
+        enabled = parse_bool_any(raw, default=default_enabled)
+        if not enabled:
+            return False, "disabled"
+        if env_name == "real" and parse_bool_any(os.getenv("PB1_REAL_ALLOW_RELAX_BRIDGE"), default=False) is not True:
+            logger.info("[ENTRY][RELAX_BRIDGE][DISABLED] reason=real_requires_explicit_opt_in")
+            return False, "real_requires_explicit_opt_in"
+        allowed = {x.strip() for x in str(os.getenv("PB1_RELAX_BRIDGE_ALLOWED_PHASES") or "entry,pm_entry").split(",") if x.strip()}
+        if self.phase not in allowed:
+            return False, "phase_not_allowed"
+        return True, "enabled"
+
+    def _activate_relax_bridge_candidates(
+        self,
+        candidates: list[CandidateFeature],
+        *,
+        setup_ok_count: int,
+        scanner_passed_codes: set[str],
+        minervini_passed_codes: set[str],
+        order_allowed: bool,
+    ) -> list[CandidateFeature]:
+        enabled, disabled_reason = self._relax_bridge_enabled()
+        scanner_count = len(scanner_passed_codes or set())
+        minervini_count = len(minervini_passed_codes or set())
+        logger.info(
+            "[ENTRY][RELAX_BRIDGE][CHECK] enabled=%s pb1_setup_ok=%s scanner_pass=%s minervini_pass=%s",
+            int(enabled),
+            setup_ok_count,
+            scanner_count,
+            minervini_count,
+        )
+        self._relax_bridge_summary = {
+            "enabled": bool(enabled),
+            "activated": False,
+            "reason": disabled_reason,
+            "scanner_pass": scanner_count,
+            "minervini_pass": minervini_count,
+        }
+        if not enabled:
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=%s", disabled_reason)
+            return []
+        if self.phase not in {"entry", "pm_entry"}:
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=phase_not_entry")
+            self._relax_bridge_summary["reason"] = "phase_not_entry"
+            return []
+        if setup_ok_count > 0:
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=pb1_setup_exists")
+            self._relax_bridge_summary["reason"] = "pb1_setup_exists"
+            return []
+        if not order_allowed:
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=order_not_allowed")
+            self._relax_bridge_summary["reason"] = "order_not_allowed"
+            return []
+        if not bool(self.final30_locked or self._precomputed_final30_map):
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=final30_missing")
+            self._relax_bridge_summary["reason"] = "final30_missing"
+            return []
+        source_codes = set(scanner_passed_codes or set()) | set(minervini_passed_codes or set())
+        if not source_codes:
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=no_scanner_or_minervini_candidates")
+            self._relax_bridge_summary["reason"] = "no_scanner_or_minervini_candidates"
+            return []
+
+        max_candidates = max(1, int(os.getenv("PB1_RELAX_BRIDGE_MAX_CANDIDATES", "3") or "3"))
+        min_rs = float(os.getenv("PB1_RELAX_BRIDGE_MIN_RS", "70") or "70")
+        min_score = float(os.getenv("PB1_RELAX_BRIDGE_MIN_SCORE", "70") or "70")
+        require_price = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_CURRENT_PRICE"), default=True)
+        require_reclaim = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_MA20_RECLAIM"), default=True)
+        require_liquidity = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_LIQUIDITY"), default=True)
+        selected: list[CandidateFeature] = []
+        for cf in sorted(candidates or [], key=lambda c: float((c.features or {}).get("score_final") or (c.features or {}).get("score") or 0), reverse=True):
+            if cf.code not in source_codes or len(selected) >= max_candidates:
+                continue
+            features = cf.features or {}
+            price = self._get_current_price_for_entry(cf.code, features)
+            ma20 = self._to_float(features.get("ma20"))
+            rs = self._to_float(features.get("rs_percentile") or features.get("rs_pctile")) or 0.0
+            score = self._to_float(features.get("score_final") or features.get("score") or features.get("final_score")) or 0.0
+            atr_pct = self._to_float(features.get("atr_pct")) or 0.0
+            value20 = self._to_float(features.get("value20"))
+            if require_price and (price is None or price <= 0):
+                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=current_price_missing", cf.code)
+                continue
+            reclaim_ok = bool(price is not None and ma20 is not None and price >= ma20 * 1.001)
+            if require_reclaim and not reclaim_ok:
+                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=ma20_reclaim_missing", cf.code)
+                continue
+            if require_liquidity and value20 is not None and value20 < float(PB1_MIN_VALUE20):
+                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=liquidity_fail", cf.code)
+                continue
+            if atr_pct > float(PB1_MAX_ATR_PCT_RAW):
+                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=atr_too_high atr_pct=%s", cf.code, atr_pct)
+                continue
+            if rs < min_rs and score < min_score:
+                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=score_rs_below_min score=%s rs=%s", cf.code, score, rs)
+                continue
+            cf.setup_ok = True
+            cf.reasons = [r for r in (cf.reasons or []) if r not in {"close_below_ma20", "close_below_ma"}]
+            features["setup_loose_ok"] = True
+            features["entry_reason"] = "ENTRY_RELAX_BRIDGE"
+            features["decision_family"] = "ENTRY_RELAX_BRIDGE_INTRADAY_RECLAIM"
+            flags = set(list(features.get("quality_flags") or []))
+            flags.add("RELAX_BRIDGE")
+            if reclaim_ok:
+                flags.add("INTRADAY_RECLAIM_MA20")
+            features["quality_flags"] = sorted(flags)
+            features["current_price"] = price
+            logger.info(
+                "[ENTRY][RELAX_BRIDGE][CANDIDATE] code=%s score=%s rs=%s current_price=%s ma20=%s reason=ENTRY_RELAX_BRIDGE",
+                cf.code,
+                score,
+                rs,
+                price,
+                ma20,
+            )
+            selected.append(cf)
+        if not selected:
+            logger.info("[ENTRY][RELAX_BRIDGE][SKIP] reason=no_bridge_candidates")
+            self._relax_bridge_summary.update({"reason": "no_bridge_candidates", "count": 0})
+            return []
+        if scanner_passed_codes and minervini_passed_codes:
+            source = "combined"
+        elif scanner_passed_codes:
+            source = "scanner"
+        else:
+            source = "minervini"
+        logger.info(
+            "[ENTRY][RELAX_BRIDGE][ACTIVATED] source=%s count=%s max=%s",
+            source,
+            len(selected),
+            max_candidates,
+        )
+        logger.info("[ENTRY][RELAX_BRIDGE][TO_RISK] count=%s", len(selected))
+        self._relax_bridge_summary.update({"activated": True, "reason": "activated", "count": len(selected), "source": source, "max_candidates": max_candidates})
+        return selected
+
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
         # 한국장 PB1 trade 모드일 때 final30 코드 전체를 단일 DB 커넥션으로
@@ -11397,6 +11824,7 @@ class PB1Engine:
 
                 features = {
                     "close": float(merged_features.get("close") or (float(df["close"].iloc[-1]) if not df.empty else 0.0)),
+                    "current_price": self._to_float(merged_features.get("current_price") or merged_features.get("intraday_last")),
                     "ma20": float(merged_features.get("ma20") or 0.0),
                     "ma50": float(merged_features.get("ma50") or 0.0),
                     "ma10": float(merged_features.get("ma10") or 0.0),
@@ -11426,8 +11854,55 @@ class PB1Engine:
                     "precomputed_usable_reasons": list(usable_reasons),
                 }
                 features["market"] = market
+                features["_pb1_vol_max"] = float(self.filter_thresholds.vol_contraction_max)
+                features["_pb1_volu_max"] = float(self.filter_thresholds.volu_contraction_max)
                 features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else bool(merged_features.get("volume_missing", False))
                 features["data_ok"] = bool(precomputed_data_ok or not df.empty)
+
+                last_close = self._to_float(features.get("close"))
+                current_price = self._resolve_intraday_current_price_for_reclaim(
+                    code,
+                    current_price=self._to_float(features.get("current_price")),
+                    last_close=last_close,
+                    ma20_value=self._to_float(features.get("ma20")),
+                    features=features,
+                )
+                if current_price is not None and current_price > 0:
+                    features["current_price"] = current_price
+                ma20_value = self._to_float(features.get("ma20"))
+                if (
+                    self.phase in {"entry", "pm_entry"}
+                    and last_close is not None
+                    and current_price is not None
+                    and ma20_value is not None
+                    and last_close < ma20_value
+                    and current_price >= ma20_value * 1.001
+                ):
+                    features["last_close"] = last_close
+                    features["close"] = current_price
+                    features["intraday_reclaim_ma20"] = True
+                    features["quality_flags"] = list(set(list(features.get("quality_flags") or []) + ["INTRADAY_RECLAIM_MA20"]))
+                    logger.info(
+                        "[ENTRY][INTRADAY_RECLAIM] code=%s last_close=%s current_price=%s ma20=%s action=soften_close_below_ma20",
+                        code,
+                        last_close,
+                        current_price,
+                        ma20_value,
+                    )
+                elif (
+                    self.phase in {"entry", "pm_entry"}
+                    and last_close is not None
+                    and current_price is not None
+                    and ma20_value is not None
+                    and last_close < ma20_value
+                ):
+                    logger.info(
+                        "[ENTRY][INTRADAY_RECLAIM][NO] code=%s current_price=%s ma20=%s required=%s",
+                        code,
+                        current_price,
+                        ma20_value,
+                        ma20_value * 1.001,
+                    )
                 loose_ok, loose_reasons = evaluate_pb1_setup(
                     features,
                     market=market,
@@ -12288,7 +12763,7 @@ class PB1Engine:
         entry_decision_result: str | None = None
         entry_decision_reason: str | None = None
         entry_cutoff_dt, entry_cutoff_raw = self._resolve_entry_cutoff()
-        entry_phase = self.phase in {"prep", "entry"}
+        entry_phase = self.phase in {"prep", "entry", "pm_entry"}
         max_positions = int(PB1_MAX_POSITIONS)
         target_new_positions_raw = self._int_env("PB1_TARGET_NEW_POSITIONS", PB1_TARGET_NEW_POSITIONS)
         min_order_krw = float(MIN_ORDER_KRW)
@@ -12367,7 +12842,7 @@ class PB1Engine:
         if force_precomputed_mode:
             precomputed_mode_reason = "locked_final30_compute_only"
         self.trade_precomputed_only = bool(
-            self.phase_name == "entry"
+            self.phase_name in {"entry", "pm_entry"}
             and self.final30_locked
             and bool(self._precomputed_final30_map)
             and self.trade_use_precomputed_features
@@ -12422,7 +12897,7 @@ class PB1Engine:
         )
 
         # Price probe hook for LIVE mode diagnostics
-        if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry"} and not self.dry_run:
+        if os.getenv("PB1_PRICE_PROBE", "0") == "1" and self.phase in {"prep", "entry", "pm_entry"} and not self.dry_run:
             self._run_price_probe()
 
         # ✅ NEW: decide scan universe
@@ -12444,7 +12919,7 @@ class PB1Engine:
             logger.warning("[ENTRY][SKIP_NEW] reason=missing_scored_final30")
             scan_codes = []
             scan_source = "blocked_missing_scored_final30"
-        elif watchlist_enabled and self.phase in {"prep", "entry"}:
+        elif watchlist_enabled and self.phase in {"prep", "entry", "pm_entry"}:
             logger.info("[PB1][WATCHLIST] enabled -> load today watchlist")
             # Watchlist로 members 대체
             watchlist_members, watchlist_source = self._load_today_watchlist_members()
@@ -12498,7 +12973,7 @@ class PB1Engine:
             watchlist_count,
         )
         
-        if self.phase in {"prep", "entry"} and self._now_kst >= entry_cutoff_dt:
+        if self.phase in {"prep", "entry", "pm_entry"} and self._now_kst >= entry_cutoff_dt:
             force_compute_when_cutoff = (
                 env_bool("FORCE_COMPUTE_ON_CUTOFF", False)
                 or env_bool("BYPASS_ENTRY_CUTOFF_COMPUTE_ONLY", False)
@@ -12516,7 +12991,7 @@ class PB1Engine:
             if force_compute_when_cutoff:
                 calc_allowed = True
                 logger.info("[PB1][CUTOFF_OVERRIDE] compute_only=1 order_allowed=0")
-            if not calc_allowed and self.phase in {"prep", "entry"}:
+            if not calc_allowed and self.phase in {"prep", "entry", "pm_entry"}:
                 skip_entry_scan = True
                 final_status = "SKIPPED"
                 final_notes = "ENTRY_CUTOFF_PASSED"
@@ -12527,8 +13002,8 @@ class PB1Engine:
             int(order_allowed),
             entry_reason or "ok",
         )
-        candidate_allowed = bool(calc_allowed and self.phase in {"prep", "entry"} and not skip_entry_scan)
-        rank_allowed = bool(calc_allowed and self.phase in {"prep", "entry"})
+        candidate_allowed = bool(calc_allowed and self.phase in {"prep", "entry", "pm_entry"} and not skip_entry_scan)
+        rank_allowed = bool(calc_allowed and self.phase in {"prep", "entry", "pm_entry"})
         logger.info(
             "[PB1][GATE] calc_allowed=%s candidate_allowed=%s rank_allowed=%s order_allowed=%s",
             int(calc_allowed),
@@ -13040,7 +13515,7 @@ class PB1Engine:
         logger.info("[PB1][POST_CAPITAL][ENTRY_PIPE_ENTER]")
 
         # Portfolio full guard: existing_positions >= max_positions이면 신규 매수 scan 불필요
-        if self.phase in {"prep", "entry"} and (existing_positions_count >= max_positions or target_new_positions <= 0):
+        if self.phase in {"prep", "entry", "pm_entry"} and (existing_positions_count >= max_positions or target_new_positions <= 0):
             logger.info(
                 "[ENTRY][SKIP_PORTFOLIO_FULL] session=%s existing_positions=%s max_positions=%s "
                 "slots_remaining=%s target_new_positions=%s reason=PORTFOLIO_FULL",
@@ -13133,7 +13608,7 @@ class PB1Engine:
             if env_bool("DEBUG_EXPORT_RUNTIME", False) and final30_codes:
                 logger.warning("[FINAL30][DEBUG_EXPORT_ONLY] as_of=%s count=%s", as_of_final, len(final30_codes))
 
-        if self.phase == "entry":
+        if self.phase in {"entry", "pm_entry"}:
             final30_codes = self._load_entry_final30_or_abort(as_of_final)
             trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
             logger.info("[PB1][ENTRY][INPUT] TRADE_INPUT=%s FINAL_LIST_NAME=%s", trade_input, os.getenv("FINAL_LIST_NAME", "final30"))
@@ -13146,7 +13621,7 @@ class PB1Engine:
             watchlist_members, watchlist_reason = self._load_today_watchlist_members()
         
         # ✅ CRITICAL: entry는 final30만 입력으로 사용 (유니버스/후보 재생성 금지)
-        if self.phase == "entry":
+        if self.phase in {"entry", "pm_entry"}:
             code_market = {
                 str(m.get("code") or "").zfill(6): (m.get("market") or "")
                 for m in universe_members
@@ -13207,7 +13682,7 @@ class PB1Engine:
         )
         
         buy_allowed_now, buy_allowed_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(self._now_kst)
-        if self.phase in {"prep", "entry"} and not buy_allowed_now:
+        if self.phase in {"prep", "entry", "pm_entry"} and not buy_allowed_now:
             logger.warning(
                 "[ENTRY][PIPE][SKIP] reason=%s now=%s cutoff=%s",
                 buy_allowed_reason,
@@ -13271,7 +13746,7 @@ class PB1Engine:
             entry_reason = "scan_members_empty"
             entry_allowed = False
             logger.info("[PB1][ENTRY_BLOCKED] reason=%s entry_allowed=0", entry_reason)
-            if self.phase in {"prep", "entry"}:
+            if self.phase in {"prep", "entry", "pm_entry"}:
                 _emit_entry_summary([], [], Counter())
                 _emit_entry_decision(
                     "SKIP",
@@ -13327,11 +13802,12 @@ class PB1Engine:
         minervini_hard_gate = bool(self._bool_env("PB1_MINERVINI_HARD_GATE", PB1_MINERVINI_HARD_GATE))
         emergency_order_enabled = bool(self._bool_env("PB1_EMERGENCY_ORDER_ENABLED", PB1_EMERGENCY_ORDER_ENABLED))
         emergency_diag_only = bool(self._bool_env("PB1_EMERGENCY_DIAG_ONLY", PB1_EMERGENCY_DIAG_ONLY))
-        if self.phase in {"prep", "entry"} and not skip_entry_scan:
-            if self.phase == "entry":
+        if self.phase in {"prep", "entry", "pm_entry"} and not skip_entry_scan:
+            if self.phase in {"entry", "pm_entry"}:
                 t_pb1_start = time.monotonic()
                 scan_input_codes = [str(m.get("code") or "").zfill(6) for m in scan_members if m.get("code")]
                 candidates = self._compute_candidates_from_codes(scan_input_codes)
+                self._reject_summary_candidates = list(candidates or [])
                 dt_pb1_filter = time.monotonic() - t_pb1_start
                 dt_minervini = 0.0
                 data_ok_count = len([c for c in candidates if bool(c.features.get("data_ok"))])
@@ -13361,6 +13837,7 @@ class PB1Engine:
                 )
                 setup_ok_codes = [c.code for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_loose_ok", c.setup_ok))]
                 logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
+                logger.info("[ENTRY][SOURCE_POLICY] authoritative=pb1_engine scanner=diagnostic_only minervini=diagnostic_only")
 
                 # === 한국장 PB1 consistency check: raw signal vs pb1 filter ===
                 pb1_filter_setup_ok_count = len(setup_ok_codes)
@@ -13621,6 +14098,24 @@ class PB1Engine:
                 relax_debug_payload["vcp_cut_used"] = buyable_report.get("vcp_cut_used")
                 relax_debug_payload["base_rs"] = buyable_report.get("base_rs")
                 relax_debug_payload["base_vcp"] = buyable_report.get("base_vcp")
+
+                _scanner_ctx_for_bridge = getattr(self, "scanner_context", {}) or {}
+                bridge_candidates = self._activate_relax_bridge_candidates(
+                    candidates,
+                    setup_ok_count=len([c for c in candidates if c.setup_ok]),
+                    scanner_passed_codes={str(x).zfill(6) for x in (_scanner_ctx_for_bridge.get("scanner_passed_codes", []) or [])},
+                    minervini_passed_codes={str(x).zfill(6) for x in (buyable_codes or set())},
+                    order_allowed=bool(order_allowed),
+                )
+                if bridge_candidates:
+                    for _bc in bridge_candidates:
+                        if _bc.code not in setup_ok_codes:
+                            setup_ok_codes.append(_bc.code)
+                    logger.info(
+                        "[ENTRY][RELAX_BRIDGE][ORDERABLE] count=%s codes=%s note=pre_risk_sizing_buyable",
+                        0,
+                        [],
+                    )
 
                 minervini_path = write_minervini_signals(
                     base_dir=Path("bot_state"),
@@ -14253,7 +14748,7 @@ class PB1Engine:
                             continue
 
                         with self._stage_timer(f"entry.buyable_gate.pivot_check.{code_key}"):
-                            if self.phase == "entry" and cf.code in buyable_codes:
+                            if self.phase in {"entry", "pm_entry"} and cf.code in buyable_codes:
                                 pivot_val = self._to_float(cf.features.get("pivot"))
                                 if pivot_val and order_price > 0:
                                     # Fix: PULLBACK 계열은 pivot hard gate 미적용
@@ -14815,7 +15310,7 @@ class PB1Engine:
 
             if (
                 self.bootstrap_enabled
-                and self.phase == "entry"
+                and self.phase in {"entry", "pm_entry"}
                 and entry_allowed
                 and bool(self.order_allowed)
                 and existing_positions_count == 0
@@ -14966,6 +15461,9 @@ class PB1Engine:
             orderable_codes = [c.code for c in orderable_candidates]
             logger.info("[ORDER_CANDIDATES] count=%s codes=%s", len(orderable_codes), orderable_codes)
             logger.info("[ORDER_CANDIDATES][READY] count=%s codes=%s", len(orderable_codes), orderable_codes)
+            if (getattr(self, "_relax_bridge_summary", {}) or {}).get("activated"):
+                bridge_orderable_codes = [c.code for c in orderable_candidates if "RELAX_BRIDGE" in set((c.features or {}).get("quality_flags") or [])]
+                logger.info("[ENTRY][RELAX_BRIDGE][ORDERABLE] count=%s codes=%s", len(bridge_orderable_codes), bridge_orderable_codes)
             logger.info(
                 "[TRADE][ORDERABLE][CODES] count=%s codes=%s",
                 len(orderable_codes),
@@ -15196,7 +15694,7 @@ class PB1Engine:
                     final_status,
                     final_reason,
                 )
-                if self.phase in {"prep", "entry"}:
+                if self.phase in {"prep", "entry", "pm_entry"}:
                     logger.info(
                         "[TRADE][SKIP] reason=%s pool=%s final=%s report=%s",
                         ReasonCode.SKIP_NO_CANDIDATES,
@@ -15226,7 +15724,7 @@ class PB1Engine:
                         no_trade_reason="NO_CANDIDATES_AFTER_RELAX",
                     )
                     return self._finalize_run_result(status=final_status, notes=final_notes)
-            if self.phase in {"entry"}:
+            if self.phase in {"entry", "pm_entry"}:
                 if not entry_allowed:
                     logger.info("[PB1][ENTRY][SKIP] entry_allowed=False")
                 if ok_count > 0 and not orderable_candidates:
@@ -15286,7 +15784,7 @@ class PB1Engine:
                         max_positions,
                         target_new_positions,
                     )
-                    if self.phase in {"prep", "entry"}:
+                    if self.phase in {"prep", "entry", "pm_entry"}:
                         if ok_count == 0:
                             logger.info(
                                 "[TRADE][SKIP] reason=%s pool=%s final=%s report=%s",
@@ -15490,7 +15988,7 @@ class PB1Engine:
                             raise RuntimeError(
                                 f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
                             )
-                if entry_allowed and self.phase == "entry" and allow_add_to_existing:
+                if entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:
                         code = pos.get("code")
