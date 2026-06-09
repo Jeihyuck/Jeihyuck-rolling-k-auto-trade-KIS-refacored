@@ -1,24 +1,14 @@
 name: "US Trade AM"
-# session: am | prewarm: 08:15 ET | trade window: 09:30~12:30 ET
+# session: am | scheduled start: 09:30 ET | trade window: 09:30~12:30 ET
 # AM consumes the completed 07:00 ET US prep result.
 # AM must not run prep itself. If prep is missing or invalid, fail with FAILED_PREP_GUARD.
 
 "on":
   schedule:
-    # NY timezone-aware prewarm cron: 08:15 ET (EDT/EST 자동 적용)
-    - cron: "15 8 * * 1-5"
+    # Scheduled trigger: 09:30 ET. Trade session window: 09:30~12:30 ET.
+    - cron: "30 9 * * 1-5"
       timezone: "America/New_York"
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_prewarm_wait crons=1 timezone=America/New_York
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
-    # Legacy fixed-cron references kept for contract tests:
-    # legacy cron: am edt 15 12 * * 1-5
-    # legacy cron: am edt 16 12 * * 1-5
-    # legacy cron: am edt 17 12 * * 1-5
-    # legacy cron: am edt 18 12 * * 1-5
-    # legacy cron: am est 15 13 * * 1-5
-    # legacy cron: am est 16 13 * * 1-5
-    # legacy cron: am est 17 13 * * 1-5
-    # legacy cron: am est 18 13 * * 1-5
+    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York trigger_et=0930 session_window=0930-1230
   workflow_dispatch:
     inputs:
       dry_run:
@@ -85,7 +75,7 @@ name: "US Trade AM"
 
 concurrency:
   group: us-trade-am-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -197,6 +187,23 @@ jobs:
           now_hhmmss="$(TZ=America/New_York date +%H%M%S)"
           event_name="${GITHUB_EVENT_NAME:-unknown}"
 
+          if [[ "$event_name" == "workflow_dispatch" && "${GITHUB_ACTOR:-}" == "github-actions[bot]" ]]; then
+            echo "should_run=0" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=auto_dispatch_disabled" >> "$GITHUB_OUTPUT"
+            echo "now_et=${now_hhmm}" >> "$GITHUB_OUTPUT"
+            echo "now_hhmmss=${now_hhmmss}" >> "$GITHUB_OUTPUT"
+            echo "wait_until_target=0" >> "$GITHUB_OUTPUT"
+            echo "wait_seconds=0" >> "$GITHUB_OUTPUT"
+            echo "event_name=${event_name}" >> "$GITHUB_OUTPUT"
+            echo "run_window=auto_dispatch_blocked" >> "$GITHUB_OUTPUT"
+            echo "recovery_run=0" >> "$GITHUB_OUTPUT"
+
+            echo "delay_seconds=0" >> "$GITHUB_OUTPUT"
+            echo "missed_trade_window=false" >> "$GITHUB_OUTPUT"
+            echo "[US_TRADE_AM][DISPATCH_GUARD][SKIP] reason=auto_dispatch_disabled actor=${GITHUB_ACTOR:-}"
+            exit 0
+          fi
+
           # 한국장 trade-am 패턴: workflow가 08:15 ET에 떠서 prep check/run 후 09:30까지 wait
           prewarm_start_min=$((8 * 60 + 15))    # 08:15 ET - prewarm/prep window start
           prep_prepare_until=$((9 * 60 + 20))   # 09:20 ET - prep should be done by this time
@@ -204,7 +211,7 @@ jobs:
           start_allow_until=$((10 * 60 + 0))    # 10:00 ET - normal window end
           recovery_until=$((12 * 60 + 30))      # 12:30 ET - recovery window end (= session_end)
           session_end=$((12 * 60 + 30))         # 12:30 ET - hard session end
-          schedule_expected_min=$((8 * 60 + 15))
+          schedule_expected_min=$((9 * 60 + 30))
           max_wait_seconds=5400  # 최대 90분 wait 허용 (08:00 시작 ~ 09:30 target)
 
           should_run=1
@@ -304,8 +311,9 @@ jobs:
           echo "recovery_run=${recovery_run}" >> "$GITHUB_OUTPUT"
           echo "delay_seconds=${delay_seconds}" >> "$GITHUB_OUTPUT"
           echo "missed_trade_window=${missed_trade_window}" >> "$GITHUB_OUTPUT"
-          
-          echo "[US_TRADE_AM][START_META] schedule_expected=0815 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+
+          echo "[US_TRADE_AM][START_META] schedule_expected=0930 actual_start=${now_hhmmss} delay_seconds=${delay_seconds} event=${event_name}"
+          echo "[US_TRADE_AM][SCHEDULE_GUARD] event=${event_name} scheduled_trigger_et=0930 now_et=${now_hhmmss} session_window=0930-1230 should_run=${should_run}"
           echo "[US_TRADE_AM][PHASE_GUARD] should_run=${should_run} run_window=${run_window} recovery_run=${recovery_run} wait_seconds=${wait_seconds} missed_trade_window=${missed_trade_window} session_window=0930-1230"
           echo "[US_TRADE_AM][RUN_PLAN] prep=verify_only wait_until_0930=true trade_am=true"
 
@@ -349,21 +357,22 @@ jobs:
           test -d repo || { echo "::error::repo directory missing after checkout"; exit 1; }
           test -f repo/requirements.txt || { echo "::error::repo/requirements.txt missing"; exit 1; }
           test -d repo/trader || { echo "::error::repo/trader missing"; exit 1; }
-          
+
           # Clean stale reports and artifacts to prevent mixing with current run
           echo "[CLEANUP][START] removing stale reports and artifacts"
           rm -rf repo/reports/us_daily
           mkdir -p repo/artifacts repo/reports/us_daily
           rm -f repo/artifacts/us_last_stage.txt
           echo "[CLEANUP][DONE]"
-          
+
           {
             echo "[US_TRADE_AM][TRIGGER] event=${{ steps.phase_guard.outputs.event_name }} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} attempt=${GITHUB_RUN_ATTEMPT}"
-            echo "[US_TRADE_AM][START_META] schedule_expected=0815 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_TRADE_AM][START_META] schedule_expected=0930 actual_start=${{ steps.phase_guard.outputs.now_hhmmss }} delay_seconds=${{ steps.phase_guard.outputs.delay_seconds }} event=${{ steps.phase_guard.outputs.event_name }}"
+            echo "[US_TRADE_AM][SCHEDULE_GUARD] event=${{ steps.phase_guard.outputs.event_name }} scheduled_trigger_et=0930 now_et=${{ steps.phase_guard.outputs.now_hhmmss }} session_window=0930-1230 should_run=${{ steps.phase_guard.outputs.should_run }}"
             echo "[US_TRADE_AM][PHASE_GUARD] should_run=${{ steps.phase_guard.outputs.should_run }} skip_reason=${{ steps.phase_guard.outputs.skip_reason }} now_et=${{ steps.phase_guard.outputs.now_hhmmss }} wait_seconds=${{ steps.phase_guard.outputs.wait_seconds }} run_window=${{ steps.phase_guard.outputs.run_window }} recovery_run=${{ steps.phase_guard.outputs.recovery_run }} session_window=0930-1230"
             echo "[US_TRADE_AM][RUN_MODE] run_mode=${{ steps.run_mode.outputs.run_mode }} signal_only=${{ steps.run_mode.outputs.signal_only }} order_allowed=${{ steps.run_mode.outputs.order_allowed }} kis_order_allowed=${{ steps.run_mode.outputs.kis_order_allowed }}"
-            echo "[US_TRADE_AM][CONCURRENCY_META] group=us-trade-am-${GITHUB_REF_NAME} cancel_in_progress=true schedule_mode=timezone_prewarm_wait crons=1"
-            echo "[US_TRADE_AM][SCHEDULE_MODE] mode=timezone_prewarm_wait crons=1 timezone=America/New_York"
+            echo "[US_TRADE_AM][CONCURRENCY_META] group=us-trade-am-${GITHUB_REF_NAME} cancel_in_progress=false schedule_mode=schedule_guard crons=1"
+            echo "[US_TRADE_AM][SCHEDULE_MODE] mode=scheduled_trade crons=1 timezone=America/New_York"
             echo "[TRIGGER_META] workflow=${GITHUB_WORKFLOW} event=${GITHUB_EVENT_NAME} actor=${GITHUB_ACTOR} run_id=${GITHUB_RUN_ID} ref=${GITHUB_REF_NAME} sha=${GITHUB_SHA}"
           } | tee repo/artifacts/${US_LOG_FILE}
           echo "[CHECKOUT][OK] repo path ready" | tee -a repo/artifacts/${US_LOG_FILE}
@@ -373,7 +382,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "US_SCHEDULE_EXPECTED_ET=0815"
+            echo "US_SCHEDULE_EXPECTED_ET=0930"
             echo "US_ACTUAL_START_ET=${{ steps.phase_guard.outputs.now_hhmmss }}"
             echo "US_DELAY_SECONDS=${{ steps.phase_guard.outputs.delay_seconds }}"
             echo "US_RUN_WINDOW=${{ steps.phase_guard.outputs.run_window }}"
@@ -508,7 +517,7 @@ jobs:
           fi
           export TRADE_DATE
           {
-            echo "[US_SESSION_LOCK][START] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} event=${GITHUB_EVENT_NAME}" | tee -a artifacts/${US_LOG_FILE}
+            echo "[US_TRADE_SESSION_LOCK][START] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} event=${GITHUB_EVENT_NAME}" | tee -a artifacts/${US_LOG_FILE}
             python - <<'PY' > us_session_lock_result.txt
             import os
             import sys
@@ -550,9 +559,9 @@ jobs:
             echo "existing_status=${EXISTING_STATUS}" >> "$GITHUB_OUTPUT"
             echo "trade_date=${TRADE_DATE}" >> "$GITHUB_OUTPUT"
             if [ "${CLAIMED}" = "1" ]; then
-              echo "[US_SESSION_LOCK][ACQUIRE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED}" | tee -a artifacts/${US_LOG_FILE}
+              echo "[US_TRADE_SESSION_LOCK][ACQUIRE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED}" | tee -a artifacts/${US_LOG_FILE}
             else
-              echo "[US_SESSION_LOCK][SKIP_DUPLICATE] trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED} existing_status=${EXISTING_STATUS}" | tee -a artifacts/${US_LOG_FILE}
+              echo "[US_TRADE_SESSION_LOCK][SKIP] reason=session_already_running_or_completed trade_date=${TRADE_DATE} session=am env=${KIS_ENV} claimed=${CLAIMED} existing_status=${EXISTING_STATUS}" | tee -a artifacts/${US_LOG_FILE}
               echo "US_EXPECTED_TO_TRADE=0" >> "$GITHUB_ENV"
               echo "US_TRADE_STATUS=SKIPPED_DUPLICATE_SESSION" >> "$GITHUB_ENV"
               echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
@@ -814,6 +823,7 @@ jobs:
 
           echo "[US_TRADE_AM][PREP_CONTRACT][OK] trade_date=${TRADE_DATE} locked_count=${LOCKED_COUNT} score_nonzero=${LOCKED_COUNT} contract_ok=1 trade_can_proceed=1 prep_status=${PREP_STATUS} prep_run_id=${PREP_RUN_ID}" | tee -a artifacts/${US_LOG_FILE}
           echo "[US_TRADE_AM][WATCHLIST_LOAD][OK] rows=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
+          echo "[US_TRADE_AM][WATCHLIST][LOAD] rows=${LOCKED_COUNT}" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Wait until US AM target start
         if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.phase_guard.outputs.wait_until_target == '1'
@@ -840,7 +850,7 @@ jobs:
           now_m="$(TZ=America/New_York date +%M)"
           now_min=$((10#$now_h * 60 + 10#$now_m))
           target_min=$((9 * 60 + 30))
-          
+
           # 한국장 패턴: target time 이후에만 trade session 시작
           if [[ "$now_min" -lt "$target_min" ]]; then
             echo "::error::Target time not reached: now=${now_h}:${now_m}, target=09:30"
@@ -862,7 +872,7 @@ jobs:
           python scripts/guard_us_prep_contract.py 2>&1 | tee -a artifacts/${US_LOG_FILE}
           guard_status=${PIPESTATUS[0]}
           set -e
-          
+
           if [ "${guard_status}" -ne 0 ]; then
             echo "[US_PREP_GUARD][REPORT_WRITE][START]" | tee -a artifacts/${US_LOG_FILE}
             python scripts/write_us_guard_failure_report.py \
@@ -953,7 +963,7 @@ jobs:
           set -euo pipefail
           {
             echo "[US_TRADE_AM][ALREADY_RAN_CHECK][START]"
-            
+
             # Determine trade_date
             if [ -n "${FORCE_NOW_INPUT}" ]; then
               TRADE_DATE=$(python -c "from datetime import datetime; print(datetime.fromisoformat('${FORCE_NOW_INPUT}').date().isoformat())")
@@ -961,18 +971,18 @@ jobs:
               TRADE_DATE=$(TZ=America/New_York date +%F)
             fi
             export TRADE_DATE
-            
+
             # Check if AM already ran today
             python - <<'PY' >> already_ran_result.txt 2>&1
           import os
           import sys
           sys.path.insert(0, ".")
           from trader.us.db.repos import check_us_am_already_ran
-          
+
           trade_date = os.getenv("TRADE_DATE")
           if not trade_date:
               raise RuntimeError("[US_TRADE_AM][BUG] TRADE_DATE env missing")
-          
+
           # Check AM marker/report — returns dict (fail-closed)
           result = check_us_am_already_ran(trade_date, timeout_sec=5)
           already_ran = bool(result.get("already_ran", True))
@@ -984,10 +994,10 @@ jobs:
           else:
               print(f"[US_TRADE_AM][NOT_RAN_YET] trade_date={trade_date}", file=sys.stderr)
           PY
-            
+
             cat already_ran_result.txt | tee -a artifacts/${US_LOG_FILE}
             ALREADY_RAN=$(grep "^already_ran=" already_ran_result.txt | cut -d= -f2 || echo "0")
-            
+
             echo "already_ran=${ALREADY_RAN}" >> "$GITHUB_OUTPUT"
             echo "[US_TRADE_AM][ALREADY_RAN_CHECK][DONE] already_ran=${ALREADY_RAN}" | tee -a artifacts/${US_LOG_FILE}
           } 2>&1 | tee -a artifacts/${US_LOG_FILE}
@@ -1024,7 +1034,7 @@ jobs:
           set -euo pipefail
           {
             echo "[US_TRADE_AM][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG="
-            
+
             OFFLINE_FLAG=""
             FORCE_NOW_FLAG=""
             MAX_TICKS_FLAG=""
@@ -1086,7 +1096,7 @@ jobs:
 
             echo "[US_RISK_CONFIG] US_MAX_ORDER_USD=${US_MAX_ORDER_USD} US_MAX_DAILY_NOTIONAL_USD=${US_MAX_DAILY_NOTIONAL_USD} US_MAX_POSITIONS=${US_MAX_POSITIONS} US_MAX_POSITION_WEIGHT=${US_MAX_POSITION_WEIGHT} US_MIN_CASH_BUFFER_USD=${US_MIN_CASH_BUFFER_USD}"
             echo "[US_TRADE_AM][START]"
-            echo "[US_TRADE_AM][TRADE_RUNNER][START] session=am"
+            echo "[US_TRADE_RUNNER][START] session=am"
             echo "[US_TRADE_AM][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
             echo "[US_TRADE_AM][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
             echo "[US_TRADE_AM][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES} INTERVAL_SEC=${INTERVAL_SEC}"
@@ -1095,8 +1105,15 @@ jobs:
             echo "US_ORDER_ALLOWED=${US_ORDER_ALLOWED}" >> "$GITHUB_ENV"
             echo "US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}" >> "$GITHUB_ENV"
             echo "US_OFFLINE_MODE=$([ -n "${OFFLINE_FLAG}" ] && echo true || echo false)" >> "$GITHUB_ENV"
+            echo "EXPECTED_TO_TRADE=${US_EXPECTED_TO_TRADE:-1}" >> "$GITHUB_ENV"
+            echo "ORDER_ALLOWED=${US_ORDER_ALLOWED}" >> "$GITHUB_ENV"
+            echo "KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}" >> "$GITHUB_ENV"
+            echo "SIGNAL_ONLY=${US_SIGNAL_ONLY}" >> "$GITHUB_ENV"
+            echo "RUN_MODE=${US_RUN_MODE}" >> "$GITHUB_ENV"
+            echo "TRADE_SESSION=am" >> "$GITHUB_ENV"
+            export EXPECTED_TO_TRADE="${US_EXPECTED_TO_TRADE:-1}" ORDER_ALLOWED="${US_ORDER_ALLOWED}" KIS_ORDER_ALLOWED="${US_KIS_ORDER_ALLOWED}" SIGNAL_ONLY="${US_SIGNAL_ONLY}" RUN_MODE="${US_RUN_MODE}" TRADE_SESSION="am"
 
-            export US_SCHEDULE_EXPECTED_ET="0815"
+            export US_SCHEDULE_EXPECTED_ET="0930"
             export US_ACTUAL_START_ET="${{ steps.phase_guard.outputs.now_hhmmss }}"
             export US_DELAY_SECONDS="${{ steps.phase_guard.outputs.delay_seconds }}"
             export US_RUN_WINDOW="${{ steps.phase_guard.outputs.run_window }}"
@@ -1160,6 +1177,7 @@ jobs:
             final_trade_status="FAILED"
             if [ "${status}" -eq 0 ]; then
               echo "US_TRADE_STATUS=OK" >> "$GITHUB_ENV"
+              echo "[US_TRADE_RUNNER][DONE] session=am" | tee -a artifacts/${US_LOG_FILE}
               echo "[US_TRADE_AM][DONE]" | tee -a artifacts/${US_LOG_FILE}
               final_trade_status="OK"
             else
@@ -1194,13 +1212,14 @@ jobs:
 
           # Ensure report file exists before calling validator
           if [ ! -f "reports/us_daily/latest_us_daily_report.json" ]; then
-            if [ "${US_TRADE_RUNNER_STARTED:-0}" = "0" ]; then
-              echo "[US_REPORT_VALIDATE][SKIP] session=am reason=trade_runner_not_started"
-              exit 0
+            if [ "${US_EXPECTED_TO_TRADE:-0}" = "1" ]; then
+              echo "::error::missing latest US report json — trade runner did not write a report"
+              echo "[US_TRADE_AM][FATAL] trade_daily_report_missing trade_runner_not_started" | tee -a artifacts/${US_LOG_FILE}
+              echo "[US_WORKFLOW][FINAL_STATUS] status=FAILED reason=trade_runner_not_started" | tee -a artifacts/${US_LOG_FILE}
+              exit 2
             fi
-            echo "::error::missing latest US report json — report was never written"
-            echo "[US_REPORT_VALIDATE][FAIL] session=am reason=report_file_missing"
-            exit 1
+            echo "[US_REPORT_VALIDATE][SKIP] session=am reason=trade_not_expected"
+            exit 0
           fi
 
           # Run standalone validator (exits 0 for warnings, 1 for fatal)
@@ -1305,7 +1324,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "[US_PNL][START] session=am env=${KIS_ENV}" | tee -a artifacts/${US_LOG_FILE}
-          
+
           # PnL report는 항상 생성 시도 (실패해도 FAILED_PNL_REPORT 상태로 파일 생성)
           python scripts/generate_us_portfolio_pnl_report.py \
             --session am \
@@ -1315,7 +1334,7 @@ jobs:
             2>&1 | tee -a artifacts/${US_LOG_FILE} || {
               echo "::warning::US PnL report generation failed, but continuing"
             }
-          
+
           echo "[US_PNL][DONE]" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Validate US PnL report
@@ -1340,14 +1359,14 @@ jobs:
             echo "::error::empty US PnL report MD" | tee -a artifacts/${US_LOG_FILE}
             exit 1
           }
-          
+
           # status가 FAILED_PNL_REPORT여도 파일은 있어야 한다
           pnl_status=$(python3 -c "import json; from pathlib import Path; print(json.loads(Path('reports/us_pnl/latest_us_pnl_report.json').read_text()).get('status', 'UNKNOWN'))")
           pnl_source=$(python3 -c "import json; from pathlib import Path; print(json.loads(Path('reports/us_pnl/latest_us_pnl_report.json').read_text()).get('pnl_position_source', 'unknown'))")
           echo "US_PNL_STATUS=${pnl_status}" >> "$GITHUB_ENV"
           echo "[US_PNL_REPORT][STATUS] ${pnl_status}" | tee -a artifacts/${US_LOG_FILE}
           echo "[US_PNL][FINAL_STATUS] status=${pnl_status} source=${pnl_source}" | tee -a artifacts/${US_LOG_FILE}
-          
+
           if [[ "${pnl_status}" == "FAILED_PNL_REPORT" ]]; then
             echo "::warning::US PnL report status is FAILED_PNL_REPORT, but files exist" | tee -a artifacts/${US_LOG_FILE}
           elif [[ "${pnl_status}" == "PARTIAL" ]]; then
@@ -1435,7 +1454,7 @@ jobs:
                   "reason": reason,
               },
           )
-          print(f"[US_SESSION_LOCK][FINISH] session=am trade_date={trade_date} status={lock_status} reason={reason or trade_status}")
+          print(f"[US_TRADE_SESSION_LOCK][RELEASE] session=am trade_date={trade_date} status={lock_status} reason={reason or trade_status}")
           PY
 
       - name: Print US PnL report to console and summary

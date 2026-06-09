@@ -463,6 +463,11 @@ class USDataProvider:
     """
 
     def __init__(self, offline: bool = False, cache_enabled: bool = False) -> None:
+        try:
+            from trader.us.execution.kis_us_client import kis_http_block_enabled
+            offline = bool(offline or kis_http_block_enabled())
+        except Exception:
+            offline = bool(offline)
         self._offline = offline
         self._cache_enabled = cache_enabled
         self._client = None
@@ -483,7 +488,7 @@ class USDataProvider:
     def _get_client(self):
         if self._client is None:
             from trader.us.execution.kis_us_client import KisUSClient
-            self._client = KisUSClient(env="practice")
+            self._client = KisUSClient(env="practice", offline=self._offline)
         return self._client
 
     def _load_daily_prices_from_db(
