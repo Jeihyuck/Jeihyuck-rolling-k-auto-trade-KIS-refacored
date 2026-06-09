@@ -282,7 +282,7 @@ class TestGenerateUsPnlScript:
             env="practice",
             trade_date="2026-05-12",
             output_dir=str(tmp_path / "us_pnl"),
-            latest_daily_report=None,
+            latest_daily_report=str(tmp_path / "missing_daily_report.json"),
         )
 
         assert result["event_name"] == "workflow_dispatch"
