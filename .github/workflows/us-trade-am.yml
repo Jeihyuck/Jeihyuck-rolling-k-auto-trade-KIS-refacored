@@ -75,7 +75,7 @@ name: "US Trade AM"
 
 concurrency:
   group: us-trade-am-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -477,6 +477,14 @@ jobs:
 
             CLAIMED=$(grep '^claimed=' us_session_lock_result.txt | cut -d= -f2 || true)
             EXISTING_STATUS=$(grep '^existing_status=' us_session_lock_result.txt | cut -d= -f2 || true)
+
+            if [ "${EXISTING_STATUS}" = "session_lock_exception" ]; then
+              echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"
+              echo "US_TRADE_RUNNER_STARTED=0" >> "$GITHUB_ENV"
+              echo "US_TRADE_RUNNER_BLOCK_REASON=session_lock_exception" >> "$GITHUB_ENV"
+              echo "::error::AM session lock exception"
+              exit 1
+            fi
 
             if [ -z "${CLAIMED}" ]; then
               echo "US_TRADE_STATUS=FAILED" >> "$GITHUB_ENV"

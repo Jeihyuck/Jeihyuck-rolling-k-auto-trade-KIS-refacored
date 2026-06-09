@@ -5,7 +5,7 @@ US workflow schedule 검증:
 - dual cron 제거 확인
 - timezone=America/New_York 적용 확인
 - dispatcher schedule 제거 확인
-- cancel-in-progress: true 확인
+- trade session/prep cancel-in-progress 설정 확인
 """
 from __future__ import annotations
 
@@ -84,25 +84,22 @@ class TestScheduleTimezone:
         # schedule: 라인이 있으면 안 된다 (workflow_dispatch는 허용)
         assert "schedule:" not in content, "dispatcher must not have schedule trigger"
 
-    def test_cancel_in_progress_true(self):
-        """am/afternoon/close workflow의 cancel-in-progress가 true여야 한다.
-
-        prep은 기존 실행을 죽이면 안 되므로 cancel-in-progress: false여야 한다.
-        """
-        cancel_true_workflows = [
+    def test_cancel_in_progress_contract(self):
+        """AM/Afternoon/prep은 기존 실행을 죽이지 않도록 false, close만 true여야 한다."""
+        cancel_false_workflows = [
+            "us-trade-prep.yml",
             "us-trade-am.yml",
             "us-trade-afternoon.yml",
-            "us-trade-close.yml",
         ]
-        for name in cancel_true_workflows:
+        for name in cancel_false_workflows:
             content = _read(name)
-            assert "cancel-in-progress: true" in content, (
-                f"{name} cancel-in-progress must be true"
+            assert "cancel-in-progress: false" in content, (
+                f"{name} cancel-in-progress must be false (do not kill running session/prep)"
             )
-        # prep은 반드시 false
-        prep_content = _read("us-trade-prep.yml")
-        assert "cancel-in-progress: false" in prep_content, (
-            "us-trade-prep.yml cancel-in-progress must be false (do not kill running prep)"
+
+        close_content = _read("us-trade-close.yml")
+        assert "cancel-in-progress: true" in close_content, (
+            "us-trade-close.yml cancel-in-progress must be true"
         )
 
 
