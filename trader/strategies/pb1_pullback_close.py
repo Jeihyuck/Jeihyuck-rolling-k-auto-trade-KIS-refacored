@@ -174,8 +174,8 @@ def evaluate_setup(
         if not (low <= pullback <= high):
             reasons.append("pullback_out_of_band")
 
-    vol_max = PB1_VOL_CONTRACTION_MAX if use_relaxed_mode else PB1_VOL_CONTRACTION_MAX_STRICT
-    volu_max = PB1_VOLU_CONTRACTION_MAX if use_relaxed_mode else PB1_VOLU_CONTRACTION_MAX_STRICT
+    vol_max = float(features.get("_pb1_vol_max") or (PB1_VOL_CONTRACTION_MAX if use_relaxed_mode else PB1_VOL_CONTRACTION_MAX_STRICT))
+    volu_max = float(features.get("_pb1_volu_max") or (PB1_VOLU_CONTRACTION_MAX if use_relaxed_mode else PB1_VOLU_CONTRACTION_MAX_STRICT))
     if _is_missing(vol_c) or vol_c > vol_max:
         reasons.append("vol_contraction_fail")
     if not volume_missing and (_is_missing(volu_c) or volu_c > volu_max):

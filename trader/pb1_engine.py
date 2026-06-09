@@ -2031,12 +2031,28 @@ def resolve_pb1_phase(
     forced_trade_session: str | None = None,
 ) -> tuple[str, str, str]:
     force_raw = (force_phase_env or "").strip().lower()
+    window = resolve_market_window(now, trading_day)
+    force_market_window = (os.getenv("FORCE_MARKET_WINDOW") or "").strip().lower()
+    close_cutoff_raw = (os.getenv("PB1_PM_SESSION_END") or os.getenv("PM_SESSION_END") or "15:10").strip()
+    try:
+        close_cutoff = datetime.strptime(close_cutoff_raw, "%H:%M").time()
+    except ValueError:
+        close_cutoff = datetime.strptime("15:10", "%H:%M").time()
+    if force_market_window == "afternoon" and os.getenv("PB1_EXIT_ONLY_MODE", "0") == "1":
+        return "exit", "exit_only_mode", window
+    if force_market_window == "afternoon":
+        if trading_day and now.time() < close_cutoff:
+            logger.info(
+                "[PB1][PHASE] force_market_window=afternoon phase=pm_entry entry_enabled=True reason=afternoon_entry_allowed"
+            )
+            return "pm_entry", "afternoon_entry_allowed", window
+        return "close", "close_window", window
     if force_raw:
-        if force_raw in {"entry", "exit", "verify", "manage", "idle"}:
-            window = resolve_market_window(now, trading_day)
+        if force_raw in {"entry", "pm_entry", "exit", "close", "verify", "manage", "idle"}:
+            if force_raw == "close":
+                return "close", "force", window
             return force_raw, "force", window
         logger.warning("[PB1][PHASE] invalid force phase=%s -> auto", force_raw)
-    window = resolve_market_window(now, trading_day)
     if not trading_day:
         return "idle", "auto_non_trading_day", window
     if force_entry_window_override and str(forced_trade_session or "").strip().lower() in {"am", "pm"}:
@@ -3324,6 +3340,18 @@ class PB1Engine:
         }
 
     def _resolve_effective_entry_filters(self) -> dict[str, Any]:
+        def _first_float(names: Iterable[str], default: float) -> tuple[float, str]:
+            for name in names:
+                raw = os.getenv(name)
+                if raw is None or str(raw).strip() == "":
+                    continue
+                try:
+                    return float(str(raw).strip()), name
+                except Exception:
+                    logger.warning("[PB1][THRESHOLDS][ENV_INVALID] name=%s value=%s default=%s", name, raw, default)
+                    break
+            return float(default), "default"
+
         defaults = {
             "rs_min_pctile": float(RS_MIN_PCTILE),
             "vcp_min_score": float(VCP_MIN_SCORE),
@@ -3340,28 +3368,10 @@ class PB1Engine:
             "min_buyable": max(1, int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", PB1_MIN_BUYABLE)))),
             "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", int(BOOTSTRAP_SCORE_CUT_KEEP_TOPN)))),
         }
-        env_overrides = {
-            "rs_min_pctile": float(self._float_env("PB1_BOOTSTRAP_RS_MIN", defaults["rs_min_pctile"])),
-            "vcp_min_score": float(self._float_env("PB1_BOOTSTRAP_VCP_MIN", defaults["vcp_min_score"])),
-            "vol_max": float(self._float_env("PB1_BOOTSTRAP_VOL_MAX", defaults["vol_max"])),
-            "volu_max": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", defaults["volu_max"])),
-            "volu_max_intraday": float(self._float_env("PB1_BOOTSTRAP_VOLU_MAX", defaults["volu_max_intraday"])),
-            "pullback_min": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MIN", defaults["pullback_min"])),
-            "pullback_max": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MAX", defaults["pullback_max"])),
-            "require_both_contractions": bool(self._bool_env("PB1_BOOTSTRAP_REQUIRE_BOTH", defaults["require_both_contractions"])),
-            "min_score_base": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_BASE", defaults["min_score_base"])),
-            "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", defaults["min_score_floor"])),
-            "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", defaults["min_score_step"])),
-            "relax_passes": max(1, int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", defaults["relax_passes"]))),
-            "min_buyable": max(
-                1,
-                int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", defaults["min_buyable"]))),
-            ),
-            "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", defaults["score_keep_topn"]))),
-        }
         effective = dict(defaults)
-        effective.update(env_overrides)
-        if self.bootstrap_enabled and self.phase == "entry":
+        if self.bootstrap_enabled and self.phase in {"entry", "pm_entry"}:
+            # Profile defaults are deliberately applied before explicit env overrides.
+            # A profile must never silently replace PB1_VOL_MAX/PB1_VOLU_MAX=1.25 with 1.15.
             effective.update(
                 {
                     "rs_min_pctile": 60.0,
@@ -3380,6 +3390,48 @@ class PB1Engine:
                     "score_keep_topn": 3,
                 }
             )
+
+        vol_max, vol_src = _first_float(
+            ("PB1_ENTRY_VOL_MAX", "PB1_VOL_MAX", "PB1_KR_VOL_MAX", "PB1_BOOTSTRAP_VOL_MAX", "BOOTSTRAP_PB1_VOL_MAX"),
+            effective["vol_max"],
+        )
+        volu_max, volu_src = _first_float(
+            ("PB1_ENTRY_VOLU_MAX", "PB1_VOLU_MAX", "PB1_KR_VOLU_MAX", "PB1_BOOTSTRAP_VOLU_MAX", "BOOTSTRAP_PB1_VOLU_MAX"),
+            effective["volu_max"],
+        )
+        volu_intraday, volu_intraday_src = _first_float(
+            ("PB1_VOLU_MAX_INTRADAY", "PB1_ENTRY_VOLU_MAX", "PB1_VOLU_MAX", "PB1_KR_VOLU_MAX_INTRADAY", "PB1_BOOTSTRAP_VOLU_MAX_INTRADAY", "PB1_BOOTSTRAP_VOLU_MAX"),
+            effective["volu_max_intraday"],
+        )
+        effective.update(
+            {
+                "rs_min_pctile": float(self._float_env("PB1_BOOTSTRAP_RS_MIN", effective["rs_min_pctile"])),
+                "vcp_min_score": float(self._float_env("PB1_BOOTSTRAP_VCP_MIN", effective["vcp_min_score"])),
+                "vol_max": vol_max,
+                "volu_max": volu_max,
+                "volu_max_intraday": volu_intraday,
+                "pullback_min": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MIN", effective["pullback_min"])),
+                "pullback_max": float(self._float_env("PB1_BOOTSTRAP_PULLBACK_MAX", effective["pullback_max"])),
+                "require_both_contractions": bool(self._bool_env("PB1_BOOTSTRAP_REQUIRE_BOTH", effective["require_both_contractions"])),
+                "min_score_base": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_BASE", effective["min_score_base"])),
+                "min_score_floor": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_FLOOR", effective["min_score_floor"])),
+                "min_score_step": float(self._float_env("PB1_BOOTSTRAP_MIN_SCORE_STEP", effective["min_score_step"])),
+                "relax_passes": max(1, int(self._int_env("PB1_BOOTSTRAP_RELAX_PASSES", effective["relax_passes"]))),
+                "min_buyable": max(1, int(self._int_env("PB1_MIN_BUYABLE", self._int_env("MIN_BUYABLE", effective["min_buyable"])))),
+                "score_keep_topn": max(1, int(self._int_env("PB1_SCORE_KEEP_TOPN", effective["score_keep_topn"]))),
+            }
+        )
+        logger.info(
+            "[PB1][THRESHOLDS][FINAL] phase=%s window=%s vol_max=%.2f volu_max=%.2f volu_max_intraday=%.2f source=env_overrides_applied vol_src=%s volu_src=%s volu_intraday_src=%s",
+            self.phase_name,
+            self.window_name,
+            effective["vol_max"],
+            effective["volu_max"],
+            effective["volu_max_intraday"],
+            vol_src,
+            volu_src,
+            volu_intraday_src,
+        )
         logger.info(
             "[PB1][EFFECTIVE_FILTERS] phase=%s window=%s filters=%s",
             self.phase_name,
@@ -3587,9 +3639,14 @@ class PB1Engine:
         # In _log_setup, if cf.setup_ok: self.ok_count += 1
 
         if not self.reject_reason_counts:
+            logger.info("[ENTRY][REJECT_SUMMARY] total=%s top_blockers=none", self.total_candidates)
             return
         sorted_reasons = sorted(self.reject_reason_counts.items(), key=lambda x: x[1], reverse=True)
+        top_blockers = ",".join(f"{str(reason).upper()}:{count}" for reason, count in sorted_reasons[:10])
         logger.info("[PB1][REJECT_SUMMARY] total=%s ok=%s rejected=%s", self.total_candidates, self.ok_count, total_rejected)
+        logger.info("[ENTRY][REJECT_SUMMARY] total=%s top_blockers=%s", self.total_candidates, top_blockers or "none")
+        if self.ok_count == 0 and (top_blockers or self.reject_reason_counts):
+            logger.info("[RUN_SUMMARY][NO_BUY] reason=NO_FINAL_SETUPS top_blockers=%s", top_blockers or "unknown")
         for reason, count in sorted_reasons:
             samples = self.reject_reason_samples.get(reason, [])
             sample_str = f" sample={samples}" if samples else ""
@@ -3701,6 +3758,7 @@ class PB1Engine:
 
         mapped: dict[str, Any] = {
             "close": self._pick_first_float(pre_row, "close", "last_close"),
+            "current_price": self._pick_first_float(pre_row, "current_price", "intraday_last", "last", "stck_prpr"),
             "ma20": self._pick_first_float(pre_row, "ma20"),
             "ma50": self._pick_first_float(pre_row, "ma50"),
             "ma150": self._pick_first_float(pre_row, "ma150"),
@@ -3722,6 +3780,7 @@ class PB1Engine:
             mapped,
             {
                 "close": self._pick_first_float(derived_row, "close", "last_close"),
+                "current_price": self._pick_first_float(derived_row, "current_price", "intraday_last", "last", "stck_prpr"),
                 "ma20": self._pick_first_float(derived_row, "ma20"),
                 "ma50": self._pick_first_float(derived_row, "ma50"),
                 "ma150": self._pick_first_float(derived_row, "ma150"),
@@ -11397,6 +11456,7 @@ class PB1Engine:
 
                 features = {
                     "close": float(merged_features.get("close") or (float(df["close"].iloc[-1]) if not df.empty else 0.0)),
+                    "current_price": self._to_float(merged_features.get("current_price") or merged_features.get("intraday_last")),
                     "ma20": float(merged_features.get("ma20") or 0.0),
                     "ma50": float(merged_features.get("ma50") or 0.0),
                     "ma10": float(merged_features.get("ma10") or 0.0),
@@ -11426,8 +11486,33 @@ class PB1Engine:
                     "precomputed_usable_reasons": list(usable_reasons),
                 }
                 features["market"] = market
+                features["_pb1_vol_max"] = float(self.filter_thresholds.vol_contraction_max)
+                features["_pb1_volu_max"] = float(self.filter_thresholds.volu_contraction_max)
                 features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else bool(merged_features.get("volume_missing", False))
                 features["data_ok"] = bool(precomputed_data_ok or not df.empty)
+
+                last_close = self._to_float(features.get("close"))
+                current_price = self._to_float(features.get("current_price"))
+                ma20_value = self._to_float(features.get("ma20"))
+                if (
+                    self.phase in {"entry", "pm_entry"}
+                    and last_close is not None
+                    and current_price is not None
+                    and ma20_value is not None
+                    and last_close < ma20_value
+                    and current_price >= ma20_value * 1.001
+                ):
+                    features["last_close"] = last_close
+                    features["close"] = current_price
+                    features["intraday_reclaim_ma20"] = True
+                    features["quality_flags"] = list(set(list(features.get("quality_flags") or []) + ["INTRADAY_RECLAIM_MA20"]))
+                    logger.info(
+                        "[ENTRY][INTRADAY_RECLAIM] code=%s last_close=%s current_price=%s ma20=%s action=soften_close_below_ma20",
+                        code,
+                        last_close,
+                        current_price,
+                        ma20_value,
+                    )
                 loose_ok, loose_reasons = evaluate_pb1_setup(
                     features,
                     market=market,
@@ -13361,6 +13446,7 @@ class PB1Engine:
                 )
                 setup_ok_codes = [c.code for c in candidates if bool(c.features.get("data_ok")) and bool(c.features.get("setup_loose_ok", c.setup_ok))]
                 logger.info("[ENTRY][SETUP_OK] count=%s codes=%s", len(setup_ok_codes), setup_ok_codes)
+                logger.info("[ENTRY][SOURCE_POLICY] authoritative=pb1_engine scanner=diagnostic_only minervini=diagnostic_only")
 
                 # === 한국장 PB1 consistency check: raw signal vs pb1 filter ===
                 pb1_filter_setup_ok_count = len(setup_ok_codes)

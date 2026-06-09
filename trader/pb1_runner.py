@@ -2289,7 +2289,7 @@ def _evaluate_session_recovery_guard(*, engine, env: str, session_kind: str, now
 def _resolve_session_trade_policy(*, session: str, phase_name: str, entry_enabled: bool, now: datetime | None = None) -> dict[str, Any]:
     normalized_session = str(session or "").strip().lower()
     normalized_phase = str(phase_name or "").strip().lower()
-    if normalized_session != "pm":
+    if normalized_session not in {"pm", "afternoon"}:
         return {"no_new_entry": False, "reason": ""}
     late_start_action = str(os.getenv("PB1_PM_LATE_START_ACTION") or "ALLOW_BEFORE_CUTOFF").strip().upper()
     phase_guard_classification = str(os.getenv("PB1_PHASE_GUARD_CLASSIFICATION") or "").strip().upper()
@@ -2309,14 +2309,27 @@ def _resolve_session_trade_policy(*, session: str, phase_name: str, entry_enable
         or "LATE_PM" in phase_guard_classification
         or "FORCED_LATE_PM" in phase_guard_classification
     )
-    if current_now.time() >= market_close_time:
-        return {"no_new_entry": True, "reason": "MARKET_CLOSED"}
-    if _env_flag("PB1_BLOCK_ENTRY_AFTER_CUTOFF", default=True) and current_now.time() >= entry_cutoff_time:
-        return {"no_new_entry": True, "reason": "ENTRY_CUTOFF_PASSED"}
-    if late_start_detected and late_start_action == "ALLOW_BEFORE_CUTOFF":
-        return {"no_new_entry": False, "reason": "LATE_START_BEFORE_CUTOFF", "warning_only": True}
     if not entry_enabled or normalized_phase in {"manage", "exit", "idle"}:
         return {"no_new_entry": True, "reason": "pm_strategy_manage_only"}
+    if current_now.time() >= market_close_time:
+        return {"no_new_entry": True, "reason": "MARKET_CLOSED"}
+    pm_close_raw = (os.getenv("PB1_PM_SESSION_END") or os.getenv("PM_SESSION_END") or "15:10").strip()
+    try:
+        pm_close_time = datetime.strptime(pm_close_raw, "%H:%M").time()
+    except ValueError:
+        pm_close_time = datetime.strptime("15:10", "%H:%M").time()
+    if current_now.time() >= pm_close_time:
+        return {"no_new_entry": True, "reason": "close_window"}
+    if _env_flag("PB1_BLOCK_ENTRY_AFTER_CUTOFF", default=False) and current_now.time() >= entry_cutoff_time:
+        logger.warning(
+            "[TRADE_AFTERNOON][ENTRY_ALLOW_UNTIL_PASSED][WARN_ONLY] now=%s allow_until=%s entry_still_enabled=%s",
+            current_now.strftime("%H:%M"),
+            entry_cutoff_raw,
+            int(bool(entry_enabled)),
+        )
+        return {"no_new_entry": False, "reason": "ENTRY_CUTOFF_PASSED_WARN_ONLY", "warning_only": True}
+    if late_start_detected and late_start_action == "ALLOW_BEFORE_CUTOFF":
+        return {"no_new_entry": False, "reason": "LATE_START_BEFORE_CUTOFF", "warning_only": True}
     return {"no_new_entry": False, "reason": ""}
 
 
@@ -3413,7 +3426,11 @@ def _normalize_window_phase(*, raw_window: Any, market_window: str, phase: str) 
     session_kind = _resolve_session_kind()
     window_name = normalize_window(session_kind=session_kind, input_window=seed)
     phase_seed = (phase or "entry").strip().lower()
-    if phase_seed in {"entry", "exit", "manage"}:
+    if phase_seed in {"entry", "pm_entry"}:
+        phase_name = "entry"
+    elif phase_seed in {"exit", "close"}:
+        phase_name = "exit"
+    elif phase_seed == "manage":
         phase_name = phase_seed
     else:
         phase_name = "entry"
@@ -5021,6 +5038,44 @@ def run_once(
             _validate_trade_locked_final30_or_raise(
                 final30_df=precomputed_final30_df,
                 source_name=str(run_ctx.get("final30_source") or "none"),
+            )
+        if _resolve_session_kind(now) == "afternoon":
+            final30_rows_for_mode = int(len(precomputed_final30_df) if isinstance(precomputed_final30_df, pd.DataFrame) else 0)
+            db_prep_done_for_mode = 0
+            try:
+                db_prep_done_for_mode = int(bool(ledger_repo.get_prep_done_event(env=env_effective, as_of=str(run_ctx.get("derived_as_of") or as_of))))
+            except Exception as exc:
+                logger.warning("[TRADE_AFTERNOON][PREP_DONE_CHECK][WARN] err=%s", exc)
+            shell_prep_ready = str(os.getenv("SHELL_PREP_READY") or os.getenv("PREP_READY") or "").strip()
+            contract_ok_for_mode = int(final30_rows_for_mode > 0 and bool(run_ctx.get("final30_locked")))
+            now_hhmm = now.strftime("%H:%M")
+            is_market_open = "09:00" <= now_hhmm < "15:20"
+            is_entry_window = "09:00" <= now_hhmm < "15:10"
+            is_close_window = now_hhmm >= "15:10"
+            if shell_prep_ready == "0" and db_prep_done_for_mode == 1 and final30_rows_for_mode > 0 and contract_ok_for_mode:
+                logger.warning(
+                    "[TRADE_AFTERNOON][PREP_READY_OVERRIDE] shell_prep_ready=0 db_prep_done=1 final30_rows=%s contract_ok=1 action=enable_entry",
+                    final30_rows_for_mode,
+                )
+            elif db_prep_done_for_mode == 1 and final30_rows_for_mode > 0 and contract_ok_for_mode:
+                logger.info(
+                    "[TRADE_AFTERNOON][PREP_READY_DB_OK] db_prep_done=1 final30_rows=%s contract_ok=1 action=enable_entry",
+                    final30_rows_for_mode,
+                )
+            mode_entry_enabled = bool(is_market_open and is_entry_window and db_prep_done_for_mode == 1 and final30_rows_for_mode > 0)
+            mode_exit_only = bool((not mode_entry_enabled) and (is_close_window or not is_market_open or final30_rows_for_mode == 0))
+            mode_reason = "entry_window" if mode_entry_enabled else ("close_window" if is_close_window else "market_closed_or_prep_missing")
+            logger.info(
+                "[TRADE_AFTERNOON][MODE_DECISION] now=%s market_open=%s entry_window=%s close_window=%s db_prep_done=%s final30_rows=%s entry_enabled=%s exit_only=%s reason=%s",
+                now.isoformat(),
+                int(is_market_open),
+                int(is_entry_window),
+                int(is_close_window),
+                db_prep_done_for_mode,
+                final30_rows_for_mode,
+                int(mode_entry_enabled),
+                int(mode_exit_only),
+                mode_reason,
             )
         kis: KisAPI | None = None
         allow_compute_without_kis = bool(

@@ -269,7 +269,7 @@ def safe_read_mappings(
     fail_open: bool = False,
 ) -> tuple[list[dict], bool]:
     try:
-        with engine.connect() as conn:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             logger.info(
                 "[DB][READ][PATH] op=%s active_tx=%s safe_mode=connect_only",
                 op_name,
