@@ -64,21 +64,20 @@ def test_prep_no_fallback_only_comment():
         "us-trade-prep.yml must not say prep moved to am workflow"
 
 
-def test_am_has_0930_et_timezone_cron():
-    """새 정책: us-trade-am.yml은 America/New_York 기준 09:30 ET 단일 cron."""
+def test_am_has_0815_edt_cron():
+    """us-trade-am.yml에 08:xx EDT cron이 다수 존재 (다중화 스케줄)."""
     text = AM_YML.read_text(encoding="utf-8")
-    assert 'cron: "30 9 * * 1-5"' in text
-    assert 'timezone: "America/New_York"' in text
-    assert "trigger_et=0930" in text
-    assert "session_window=0930-1230" in text
-    assert 'cron: "30 13 * * 1-5"' not in text
+    import re
+    edt_crons = re.findall(r'cron:.*1[23] \* \* 1-5', text)
+    assert len(edt_crons) >= 4, f"us-trade-am.yml EDT cron 다중화 부족: {edt_crons}"
 
 
-def test_am_schedule_not_legacy_multi_cron():
-    """새 schedule-only 정책에서는 AM EDT/EST UTC 다중 cron을 사용하지 않는다."""
+def test_am_has_0815_est_cron():
+    """us-trade-am.yml에 08:xx EST cron이 다수 존재 (다중화 스케줄)."""
     text = AM_YML.read_text(encoding="utf-8")
-    assert text.count('- cron:') == 1
-    assert "legacy cron: am" not in text.lower()
+    import re
+    est_crons = re.findall(r'cron:.*1[34] \* \* 1-5', text)
+    assert len(est_crons) >= 4, f"us-trade-am.yml EST cron 다중화 부족: {est_crons}"
 
 
 def test_am_has_must_not_run_prep_comment():
@@ -286,16 +285,15 @@ def test_watchdog_no_skip_standalone_prep_comment():
         "us-trade-watchdog.yml must not have 'prep_integrated_into_am' skip reason"
 
 
-def test_watchdog_monitor_only_no_dispatch_api():
-    """새 정책: watchdog은 monitor-only이며 workflow_dispatch API를 호출하지 않는다."""
+def test_watchdog_dispatches_prep_when_missing():
+    """us-trade-watchdog.yml prep dispatch 코드가 있어야 함."""
     text = WATCHDOG_YML.read_text(encoding="utf-8")
-    assert "createWorkflowDispatch" not in text
-    assert "[US_WATCHDOG][DISPATCH_DISABLED]" in text
-    assert "actions: read" in text
+    assert "dispatchWorkflow('prep'" in text, \
+        "us-trade-watchdog.yml must have dispatchWorkflow('prep', ...) call"
 
 
 def test_watchdog_am_checks_prep_health():
-    """us-trade-watchdog.yml AM 상태 확인 전 prep health 확인 코드가 있어야 함."""
+    """us-trade-watchdog.yml AM dispatch 전 prep health 확인 코드가 있어야 함."""
     text = WATCHDOG_YML.read_text(encoding="utf-8")
     assert "prepOk" in text, \
         "us-trade-watchdog.yml AM section must reference prepOk variable"

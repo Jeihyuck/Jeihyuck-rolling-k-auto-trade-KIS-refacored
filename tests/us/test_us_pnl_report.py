@@ -143,7 +143,7 @@ def test_us_pnl_report_includes_trade_expectation_metadata(monkeypatch, tmp_path
         env="practice",
         trade_date="2026-06-06",
         output_dir=str(output_dir),
-        latest_daily_report=str(tmp_path / "missing_daily_report.json"),
+        latest_daily_report=None,
     )
 
     assert result["expected_to_trade"] == 1

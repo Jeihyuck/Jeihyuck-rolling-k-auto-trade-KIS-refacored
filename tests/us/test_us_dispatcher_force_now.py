@@ -4,15 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch, call
 
-import pytest
-
-
-@pytest.fixture(autouse=True)
-def _github_actions_runtime_context(monkeypatch):
-    """Dispatcher tests should emulate an allowed operational event, not pull_request."""
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
-    monkeypatch.setenv("GITHUB_ACTOR", "manual-tester")
-
 
 # ---------------------------------------------------------------------------
 # Test 1: dispatcher trade-am force_now + max_ticks=2

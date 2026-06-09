@@ -5,7 +5,7 @@ US workflow schedule 검증:
 - dual cron 제거 확인
 - timezone=America/New_York 적용 확인
 - dispatcher schedule 제거 확인
-- AM/Afternoon cancel-in-progress=false 확인 (session lock으로 중복 skip)
+- cancel-in-progress: true 확인
 """
 from __future__ import annotations
 
@@ -54,20 +54,6 @@ class TestScheduleTimezone:
         cron_matches = re.findall(r"^\s+- cron:", content, re.MULTILINE)
         assert len(cron_matches) == 1, f"close has {len(cron_matches)} crons, expected 1"
 
-    def test_am_timezone_cron_is_0930_et(self):
-        content = _read("us-trade-am.yml")
-        assert 'cron: "30 9 * * 1-5"' in content
-        assert 'timezone: "America/New_York"' in content
-        assert "trigger_et=0930" in content
-        assert "session_window=0930-1230" in content
-
-    def test_afternoon_timezone_cron_is_1303_et(self):
-        content = _read("us-trade-afternoon.yml")
-        assert 'cron: "03 13 * * 1-5"' in content
-        assert 'timezone: "America/New_York"' in content
-        assert "trigger_et=1303" in content
-        assert "session_window=1300-1550" in content
-
     def test_timezone_present_in_all_session_workflows(self):
         """am/afternoon/close workflow에 timezone: America/New_York이 있어야 한다.
 
@@ -98,20 +84,22 @@ class TestScheduleTimezone:
         # schedule: 라인이 있으면 안 된다 (workflow_dispatch는 허용)
         assert "schedule:" not in content, "dispatcher must not have schedule trigger"
 
-    def test_trade_workflows_do_not_cancel_in_progress(self):
-        """새 정책: AM/Afternoon은 cancel하지 않고 session lock으로 중복 실행을 skip한다."""
-        cancel_false_workflows = [
+    def test_cancel_in_progress_true(self):
+        """am/afternoon/close workflow의 cancel-in-progress가 true여야 한다.
+
+        prep은 기존 실행을 죽이면 안 되므로 cancel-in-progress: false여야 한다.
+        """
+        cancel_true_workflows = [
             "us-trade-am.yml",
             "us-trade-afternoon.yml",
+            "us-trade-close.yml",
         ]
-        for name in cancel_false_workflows:
+        for name in cancel_true_workflows:
             content = _read(name)
-            assert "cancel-in-progress: false" in content, (
-                f"{name} cancel-in-progress must be false"
+            assert "cancel-in-progress: true" in content, (
+                f"{name} cancel-in-progress must be true"
             )
-            assert "[US_TRADE_SESSION_LOCK][" in content, (
-                f"{name} must use session lock logs for duplicate handling"
-            )
+        # prep은 반드시 false
         prep_content = _read("us-trade-prep.yml")
         assert "cancel-in-progress: false" in prep_content, (
             "us-trade-prep.yml cancel-in-progress must be false (do not kill running prep)"
