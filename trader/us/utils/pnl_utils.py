@@ -118,8 +118,10 @@ def normalize_us_position(row: dict) -> dict:
         )
     )
 
+    price_missing = bool(qty > 0 and last_price <= 0)
+
     # ── 경고: 수량이 있는데 가격이 없으면 로그 기록 ──
-    if qty > 0 and last_price <= 0:
+    if price_missing:
         logger.warning(
             "[US_PNL][PRICE_MISSING] symbol=%s qty=%s row_keys=%s",
             symbol,
@@ -150,6 +152,7 @@ def normalize_us_position(row: dict) -> dict:
         "market_value_usd": market_value,
         "unrealized_pnl_usd": pnl,
         "unrealized_pnl_pct": pnl_pct,
+        "price_missing": price_missing,
         "currency": "USD",
     }
 

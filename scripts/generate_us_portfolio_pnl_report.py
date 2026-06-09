@@ -489,11 +489,11 @@ def generate_us_pnl_report(
     run_window = os.getenv("US_RUN_WINDOW", "")
     recovery_run = _safe_int(os.getenv("US_RECOVERY_RUN", "0"))
     trade_status_env = os.getenv("US_TRADE_STATUS", "")
-    expected_to_trade_env = _safe_int(os.getenv("US_EXPECTED_TO_TRADE", "0"))
+    expected_to_trade_env = _safe_int(os.getenv("US_EXPECTED_TO_TRADE", os.getenv("EXPECTED_TO_TRADE", "0")))
     trade_runner_started_env = _safe_int(os.getenv("US_TRADE_RUNNER_STARTED", "0"))
     trade_runner_block_reason_env = os.getenv("US_TRADE_RUNNER_BLOCK_REASON", "")
-    order_allowed_env = _safe_int(os.getenv("US_ORDER_ALLOWED", "0"))
-    kis_order_allowed_env = _safe_int(os.getenv("US_KIS_ORDER_ALLOWED", "0"))
+    order_allowed_env = _safe_int(os.getenv("US_ORDER_ALLOWED", os.getenv("ORDER_ALLOWED", "0")))
+    kis_order_allowed_env = _safe_int(os.getenv("US_KIS_ORDER_ALLOWED", os.getenv("KIS_ORDER_ALLOWED", "0")))
     orders_sent_env = _safe_int(os.getenv("US_ORDERS_SENT", "0"))
     dry_run_env = _env_bool("US_DRY_RUN", _env_bool("DRY_RUN", True))
     offline_mode_env = _env_bool("US_OFFLINE_MODE", False)
@@ -515,6 +515,7 @@ def generate_us_pnl_report(
     
     # ── 데이터 소스 확보 ───────────────────────────────────────────────
     daily_report = _load_latest_daily_report(latest_daily_report)
+    daily_report_exists = 1 if daily_report else 0
     
     # no-trade 상태이면 empty report 생성 후 바로 반환
     if daily_report and daily_report.get("final_status") in NO_TRADE_STATUSES:
@@ -788,16 +789,38 @@ def generate_us_pnl_report(
             status = "OK_WITH_WARNINGS"
         warnings.append("kis_balance_partial")
 
-    trade_status = trade_status_env or (daily_report or {}).get("trade_status") or (daily_report or {}).get("final_status") or "UNKNOWN"
-    trade_runner_started = (
-        trade_runner_started_env
-        if os.getenv("US_TRADE_RUNNER_STARTED") is not None
-        else _safe_int((daily_report or {}).get("trade_runner_started", 0))
+    # daily trade report is authoritative; runner/workflow env is only a fallback.
+    trade_status = (daily_report or {}).get("trade_status") or (daily_report or {}).get("final_status") or trade_status_env or "INIT"
+    trade_runner_started = _safe_int((daily_report or {}).get("trade_runner_started", 0))
+    if trade_runner_started != 1 and os.getenv("US_TRADE_RUNNER_STARTED") is not None:
+        trade_runner_started = trade_runner_started_env
+    trade_runner_block_reason = (
+        (daily_report or {}).get("trade_runner_block_reason")
+        or (daily_report or {}).get("trade_block_reason")
+        or (daily_report or {}).get("reason")
+        or trade_runner_block_reason_env
+        or ("not_started" if not daily_report else "")
     )
-    trade_runner_block_reason = trade_runner_block_reason_env or (daily_report or {}).get("trade_block_reason") or (daily_report or {}).get("reason") or ""
     # "none" is a sentinel set by workflow when trade runner starts (prevents stale DB fallback)
     if trade_runner_block_reason == "none":
         trade_runner_block_reason = ""
+
+    if expected_to_trade_env == 1:
+        if daily_report_exists != 1:
+            status = "FAILED_PNL_REPORT"
+            warnings.append("daily_report_missing")
+            trade_status = trade_status or "INIT"
+            trade_runner_started = 0
+            trade_runner_block_reason = trade_runner_block_reason or "not_started"
+        elif trade_runner_started != 1:
+            status = "FAILED_PNL_REPORT"
+            warnings.append("trade_runner_not_started")
+        elif str(trade_status) == "INIT":
+            status = "FAILED_PNL_REPORT"
+            warnings.append("trade_status_init")
+        elif trade_runner_block_reason == "not_started":
+            status = "FAILED_PNL_REPORT"
+            warnings.append("trade_runner_block_reason_not_started")
     if not schedule_expected_et:
         schedule_expected_et = str((daily_report or {}).get("schedule_expected_et", ""))
     if not actual_start_et:
@@ -840,6 +863,7 @@ def generate_us_pnl_report(
         "block_normal_pnl_display": block_normal_pnl_display,
         "fills_count": len(db_fills),
         "orders_sent_total": orders_sent_total,
+        "daily_report_exists": daily_report_exists,
         "schedule_expected_et": schedule_expected_et,
         "actual_start_et": actual_start_et,
         "delay_seconds": delay_seconds,
@@ -901,6 +925,7 @@ def generate_us_pnl_report(
         f"**Trade Runner Block Reason**: {trade_runner_block_reason or '-'}  ",
         f"**Order Allowed**: {order_allowed_env}  ",
         f"**KIS Order Allowed**: {kis_order_allowed_env}  ",
+        f"**Daily Report Exists**: {daily_report_exists}  ",
         f"**Schedule Expected ET**: {schedule_expected_et}  ",
         f"**Actual Start ET**: {actual_start_et}  ",
         f"**Delay Seconds**: {delay_seconds}  ",

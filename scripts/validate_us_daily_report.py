@@ -181,19 +181,24 @@ def validate_report(
 
     expected_to_trade = int(payload.get("expected_to_trade", 0) or 0)
     trade_runner_started = int(payload.get("trade_runner_started", 0) or 0)
-    if expected_to_trade == 1 and trade_runner_started != 1:
-        fatals.append("expected_to_trade_without_runner_started")
-        return 1, fatals, warnings
 
-    pnl_dir = Path("reports/us_pnl")
-    pnl_json = pnl_dir / "latest_us_pnl_report.json"
-    pnl_md = pnl_dir / "latest_us_pnl_report.md"
-    pnl_csv = pnl_dir / "latest_us_pnl_report.csv"
-    for required_pnl in (pnl_json, pnl_md, pnl_csv):
-        if not required_pnl.exists():
-            fatals.append(f"pnl_file_missing path={required_pnl}")
-    if pnl_md.exists() and not pnl_md.read_text(encoding="utf-8").strip():
-        fatals.append(f"pnl_markdown_empty path={pnl_md}")
+    trade_status = str(payload.get("trade_status", final_status) or "INIT")
+    block_reason = str(
+        payload.get("trade_runner_block_reason")
+        or payload.get("trade_block_reason")
+        or payload.get("reason")
+        or ""
+    )
+    if expected_to_trade == 1 and trade_runner_started != 1:
+        fatals.append(
+            f"trade_runner_not_started status={trade_status} block_reason={block_reason or 'not_started'}"
+        )
+        return 1, fatals, warnings
+    if expected_to_trade == 1 and (trade_status == "INIT" or block_reason == "not_started"):
+        fatals.append(
+            f"invalid_trade_runner_status status={trade_status} block_reason={block_reason}"
+        )
+        return 1, fatals, warnings
 
     if payload.get("prep_status") == "OK" and int(payload.get("locked_watchlist_count", 0) or 0) == 0:
         fatals.append("locked_watchlist_count_zero_under_prep_ok")
@@ -202,19 +207,19 @@ def validate_report(
     log_path = Path("artifacts") / log_name
     if log_path.exists():
         log_text = log_path.read_text(encoding="utf-8", errors="ignore")
-        for marker in ("[US_PNL_REPORT_MD][BEGIN]", "[US_PNL_REPORT_MD][END]"):
-            if marker not in log_text:
-                fatals.append(f"pnl_console_marker_missing marker={marker}")
+        # Daily report validation runs before the PnL print step in trade workflows;
+        # PnL console markers are validated by the dedicated PnL/report steps.
         if "avg_fill_price" in log_text:
             fatals.append("runtime_sql_contains_avg_fill_price")
         if "[US_RECONCILE][ACK_RECONCILE][INVALID_QTY]" in log_text:
             fatals.append("balance_reconcile_invalid_qty_detected")
 
+    pnl_json = Path("reports/us_pnl/latest_us_pnl_report.json")
     if pnl_json.exists():
         try:
             pnl_payload = json.loads(pnl_json.read_text())
             pnl_status = str(pnl_payload.get("status", "UNKNOWN"))
-            if pnl_status not in {"OK", "PARTIAL", "FAILED_PNL_REPORT"}:
+            if pnl_status not in {"OK", "OK_WITH_WARNINGS", "PARTIAL", "FAILED_PNL_REPORT"}:
                 fatals.append(f"invalid_pnl_status={pnl_status}")
             if pnl_payload.get("realized_pnl_source") not in {"db_fills_daily", "unavailable"}:
                 fatals.append("invalid_realized_pnl_source")

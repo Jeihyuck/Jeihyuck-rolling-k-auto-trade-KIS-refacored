@@ -26,6 +26,40 @@ from trader.us.execution.kis_us_registry import (
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def kis_http_block_enabled() -> bool:
+    """Return True when offline QA policy forbids all KIS HTTP.
+
+    This is intentionally stricter than order gating: OFFLINE_MODE/KIS_HTTP_BLOCK
+    must stop token, quote, balance, order, and fills HTTP before requests is used.
+    """
+    if _env_flag("KIS_HTTP_BLOCK"):
+        return True
+    if _env_flag("OFFLINE_MODE") or _env_flag("US_OFFLINE_MODE"):
+        return True
+    return False
+
+
+def record_kis_http_call(method: str, path: str) -> None:
+    """Best-effort audit marker for actual KIS HTTP attempts."""
+    marker = f"[KIS_HTTP_CALL] method={method} path={path}"
+    logger.error(marker)
+    audit_file = os.getenv("KIS_HTTP_AUDIT_FILE")
+    if audit_file:
+        try:
+            with open(audit_file, "a", encoding="utf-8") as fh:
+                fh.write(marker + "\n")
+        except Exception:
+            logger.exception("[US_CLIENT][KIS_HTTP_AUDIT_WRITE_FAIL] path=%s", audit_file)
+
+
+
 # ---------------------------------------------------------------------------
 # BYMD helper
 # ---------------------------------------------------------------------------
@@ -95,7 +129,7 @@ class KisUSClient:
                 f"[US_CLIENT][BLOCKED] reason=env_not_practice env={env!r}"
             )
         self._env = env
-        self._offline = offline
+        self._offline = bool(offline or kis_http_block_enabled())
         self._base_url = KIS_VTS_BASE_URL
         self._app_key = us_cfg.KIS_APP_KEY
         self._app_secret = us_cfg.KIS_APP_SECRET
@@ -128,8 +162,10 @@ class KisUSClient:
         return token
 
     def _request_new_token(self) -> str:
+        self._assert_not_offline("_request_new_token")
         import requests  # lazy import
         url = self._base_url + TOKEN_PATH
+        record_kis_http_call("POST", TOKEN_PATH)
         payload = {
             "grant_type": "client_credentials",
             "appkey": self._app_key,
@@ -633,8 +669,8 @@ class KisUSClient:
         order_type: str = "LIMIT",
     ) -> dict:
         """해외주식 매수 주문 (모의투자)."""
-        us_cfg.assert_us_paper_order_allowed()
         self._assert_not_offline("place_us_buy_order")
+        us_cfg.assert_us_paper_order_allowed()
         
         # Final safety guard: signal-only mode
         if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
@@ -654,8 +690,8 @@ class KisUSClient:
         order_type: str = "LIMIT",
     ) -> dict:
         """해외주식 매도 주문 (모의투자)."""
-        us_cfg.assert_us_paper_order_allowed()
         self._assert_not_offline("place_us_sell_order")
+        us_cfg.assert_us_paper_order_allowed()
         
         # Final safety guard: signal-only mode
         if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
@@ -907,6 +943,7 @@ class KisUSClient:
         return False
 
     def _get(self, path: str, headers: dict, params: dict, *, suppress_final_log: bool = False) -> dict:
+        self._assert_not_offline(f"GET {path}")
         """GET 요청 with retry/backoff.
         
         Args:
@@ -926,6 +963,7 @@ class KisUSClient:
                 self._apply_rate_limit(path)
                 
                 url = self._base_url + path
+                record_kis_http_call("GET", path)
                 resp = requests.get(url, headers=headers, params=params, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
@@ -974,6 +1012,7 @@ class KisUSClient:
         raise KisUSTemporaryError(f"GET {path} exhausted {max_attempts} attempts")
 
     def _post(self, path: str, headers: dict, body: dict) -> dict:
+        self._assert_not_offline(f"POST {path}")
         """POST 요청 with retry/backoff."""
         import requests
         
@@ -986,6 +1025,7 @@ class KisUSClient:
                 self._apply_rate_limit(path)
                 
                 url = self._base_url + path
+                record_kis_http_call("POST", path)
                 resp = requests.post(url, headers=headers, json=body, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
@@ -1039,7 +1079,8 @@ class KisUSClient:
             raise KisUSClientError(f"[US_KIS][FAIL] rt_cd={rt_cd} msg={msg!r}")
 
     def _assert_not_offline(self, method_name: str) -> None:
-        if self._offline:
+        if self._offline or kis_http_block_enabled():
+            self._offline = True
             raise RuntimeError(
                 f"[US_CLIENT][OFFLINE_BLOCK] method={method_name!r} "
                 "HTTP calls not allowed in offline mode"
