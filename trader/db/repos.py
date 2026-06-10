@@ -29,6 +29,7 @@ from .schema import (
     uuid_value_for_url,
 )
 from trader.db.json_safe import json_sanitize
+from trader.trade_plan import parse_plan_bool
 from trader.db.engine import safe_read_mappings, dispose_engine_safely
 from trader.db.retry import run_with_db_retry
 from trader.constants import (
@@ -3542,6 +3543,37 @@ class OrdersRepo:
         return False, None
 
 
+    def find_latest_buy_entry_exit_plan(self, env: str, strategy: str, code: str, *, lookback: int | None = None) -> dict | None:
+        lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
+        stmt = (
+            select(self._schema.orders.c.request_json)
+            .where(
+                and_(
+                    self._schema.orders.c.env == env,
+                    self._schema.orders.c.strategy == strategy,
+                    self._schema.orders.c.code == str(code).zfill(6),
+                    self._schema.orders.c.side == "BUY",
+                    ~self._schema.orders.c.status.in_(["ERROR", "CANCELED", "CANCELLED", "REJECTED"]),
+                )
+            )
+            .order_by(self._schema.orders.c.created_at.desc())
+            .limit(lookback_n)
+        )
+        rows = self._read_mappings_with_guard(stmt, op_name="orders_latest_buy_entry_exit_plan", fail_open=True)
+        for row in rows or []:
+            request_json = (row or {}).get("request_json") or {}
+            if isinstance(request_json, str):
+                try:
+                    import json as _json
+                    request_json = _json.loads(request_json)
+                except Exception:
+                    request_json = {}
+            request_json = dict(request_json or {})
+            plan = request_json.get("entry_exit_plan")
+            if isinstance(plan, dict) and plan:
+                return {"entry_exit_plan": plan, "entry_meta": request_json.get("entry_meta") or {}}
+        return None
+
 class FillsRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -3821,6 +3853,36 @@ class FillsRepo:
                     )
                 ).scalar()
             return str(existing or payload["fill_id"])
+
+
+    def find_latest_buy_entry_exit_plan(self, env: str, code: str, *, lookback: int | None = None) -> dict | None:
+        lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
+        stmt = (
+            select(self._schema.fills.c.raw_json)
+            .where(
+                and_(
+                    self._schema.fills.c.env == env,
+                    self._schema.fills.c.code == str(code).zfill(6),
+                    self._schema.fills.c.side == "BUY",
+                )
+            )
+            .order_by(self._schema.fills.c.filled_at.desc(), self._schema.fills.c.created_at.desc())
+            .limit(lookback_n)
+        )
+        rows, _ = safe_read_mappings(self.engine, stmt, op_name="fills_latest_buy_entry_exit_plan", fail_open=True)
+        for row in rows or []:
+            raw_json = (row or {}).get("raw_json") or {}
+            if isinstance(raw_json, str):
+                try:
+                    import json as _json
+                    raw_json = _json.loads(raw_json)
+                except Exception:
+                    raw_json = {}
+            raw_json = dict(raw_json or {})
+            plan = raw_json.get("entry_exit_plan")
+            if isinstance(plan, dict) and plan:
+                return {"entry_exit_plan": plan, "entry_meta": raw_json.get("entry_meta") or {}}
+        return None
 
 
 class LedgerEventsRepo:
@@ -4713,6 +4775,37 @@ class LedgerEventsRepo:
         )
         return result
 
+def _plan_position_values(plan_record: dict | None, *, missing: bool = False) -> dict[str, Any]:
+    if missing or not plan_record:
+        return {
+            "entry_thesis": "POLICY_MISSING",
+            "trade_horizon": None,
+            "exit_policy_family": "POLICY_MISSING",
+            "eod_action": None,
+            "force_eod_close": False,
+            "entry_exit_plan_json": {},
+            "policy_source": "missing",
+            "policy_version": None,
+        }
+    plan = dict(plan_record.get("entry_exit_plan") or plan_record or {})
+    meta = dict(plan_record.get("entry_meta") or {}) if isinstance(plan_record, dict) else {}
+    risk = plan.get("risk_plan") or {}
+    time_plan = plan.get("time_plan") or {}
+    return {
+        "entry_thesis": plan.get("entry_thesis") or meta.get("entry_thesis"),
+        "entry_style_selected": plan.get("entry_style_selected") or meta.get("entry_style_selected"),
+        "entry_reason": plan.get("entry_reason") or meta.get("entry_reason"),
+        "trade_horizon": plan.get("trade_horizon") or meta.get("trade_horizon"),
+        "exit_policy_family": plan.get("exit_policy_family") or meta.get("exit_policy_family"),
+        "eod_action": plan.get("eod_action") or meta.get("eod_action"),
+        "force_eod_close": parse_plan_bool(plan.get("force_eod_close"), default=parse_plan_bool(meta.get("force_eod_close"), default=False)),
+        "max_trading_days": time_plan.get("max_trading_days") or meta.get("max_trading_days"),
+        "initial_stop_price": risk.get("initial_stop") or meta.get("initial_stop_price"),
+        "initial_risk_r": risk.get("risk_R") or meta.get("initial_risk_r"),
+        "entry_exit_plan_json": json_sanitize(plan),
+        "policy_source": plan.get("policy_source") or meta.get("policy_source"),
+        "policy_version": plan.get("policy_version") or meta.get("policy_version"),
+    }
 
 class PositionsRepo:
     def __init__(self, engine: Engine):
@@ -4879,7 +4972,28 @@ class PositionsRepo:
         tax: float,
         filled_at: datetime,
         entry_meta_json: dict | None = None,
+        entry_exit_plan: dict | None = None,
+        entry_meta: dict | None = None,
     ) -> None:
+        if entry_meta and not entry_meta_json:
+            entry_meta_json = entry_meta
+        entry_exit_plan = json_sanitize(entry_exit_plan or {})
+        if entry_exit_plan:
+            plan_meta = {
+                "entry_thesis": entry_exit_plan.get("entry_thesis"),
+                "entry_style_selected": entry_exit_plan.get("entry_style_selected"),
+                "entry_reason": entry_exit_plan.get("entry_reason"),
+                "trade_horizon": entry_exit_plan.get("trade_horizon"),
+                "exit_policy_family": entry_exit_plan.get("exit_policy_family"),
+                "eod_action": entry_exit_plan.get("eod_action"),
+                "force_eod_close": entry_exit_plan.get("force_eod_close"),
+                "initial_stop_price": (entry_exit_plan.get("risk_plan") or {}).get("initial_stop"),
+                "initial_risk_r": (entry_exit_plan.get("risk_plan") or {}).get("risk_R"),
+                "max_trading_days": (entry_exit_plan.get("time_plan") or {}).get("max_trading_days"),
+                "policy_source": entry_exit_plan.get("policy_source"),
+                "policy_version": entry_exit_plan.get("policy_version"),
+            }
+            entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
         with self.engine.begin() as conn:
             stmt = select(self._schema.positions).where(
                 and_(
@@ -4930,6 +5044,16 @@ class PositionsRepo:
                             "stop_price_at_entry": _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")) or row.get("stop_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("stop_price_at_entry")),
                             "pivot_price_at_entry": _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")) or row.get("pivot_price_at_entry") if row else _safe_float_or_none(merged_entry_meta.get("pivot_price_at_entry")),
                             "exit_policy_family": merged_entry_meta.get("exit_policy_family") or row.get("exit_policy_family") if row else merged_entry_meta.get("exit_policy_family"),
+                            "entry_thesis": merged_entry_meta.get("entry_thesis") or row.get("entry_thesis") if row else merged_entry_meta.get("entry_thesis"),
+                            "trade_horizon": merged_entry_meta.get("trade_horizon") or row.get("trade_horizon") if row else merged_entry_meta.get("trade_horizon"),
+                            "eod_action": merged_entry_meta.get("eod_action") or row.get("eod_action") if row else merged_entry_meta.get("eod_action"),
+                            "force_eod_close": parse_plan_bool(merged_entry_meta.get("force_eod_close"), default=parse_plan_bool(row.get("force_eod_close") if row else False, default=False)),
+                            "max_trading_days": merged_entry_meta.get("max_trading_days") or row.get("max_trading_days") if row else merged_entry_meta.get("max_trading_days"),
+                            "initial_stop_price": _safe_float_or_none(merged_entry_meta.get("initial_stop_price")) or row.get("initial_stop_price") if row else _safe_float_or_none(merged_entry_meta.get("initial_stop_price")),
+                            "initial_risk_r": _safe_float_or_none(merged_entry_meta.get("initial_risk_r")) or row.get("initial_risk_r") if row else _safe_float_or_none(merged_entry_meta.get("initial_risk_r")),
+                            "entry_exit_plan_json": entry_exit_plan or (row.get("entry_exit_plan_json") if row else {}),
+                            "policy_source": merged_entry_meta.get("policy_source") or row.get("policy_source") if row else merged_entry_meta.get("policy_source"),
+                            "policy_version": merged_entry_meta.get("policy_version") or row.get("policy_version") if row else merged_entry_meta.get("policy_version"),
                         }
                     )
             else:
@@ -4948,6 +5072,11 @@ class PositionsRepo:
                     "market": market,
                     "last_trade_at": filled_at,
                 }
+                if entry_meta_json:
+                    values["last_exit_plan_eval_json"] = json_sanitize(entry_meta_json)
+                    if remaining_qty <= 0:
+                        values["closed_reason"] = entry_meta_json.get("exit_reason") or entry_meta_json.get("close_reason")
+                        values["closed_ts"] = filled_at
 
             if row:
                 conn.execute(
@@ -4977,7 +5106,17 @@ class PositionsRepo:
                         entry_meta_json=values.get("entry_meta_json", {}),
                         stop_price_at_entry=values.get("stop_price_at_entry"),
                         pivot_price_at_entry=values.get("pivot_price_at_entry"),
+                        entry_thesis=values.get("entry_thesis"),
+                        trade_horizon=values.get("trade_horizon"),
+                        eod_action=values.get("eod_action"),
+                        force_eod_close=values.get("force_eod_close", False),
+                        max_trading_days=values.get("max_trading_days"),
+                        initial_stop_price=values.get("initial_stop_price"),
+                        initial_risk_r=values.get("initial_risk_r"),
                         exit_policy_family=values.get("exit_policy_family"),
+                        entry_exit_plan_json=values.get("entry_exit_plan_json", {}),
+                        policy_source=values.get("policy_source"),
+                        policy_version=values.get("policy_version"),
                     )
                 )
 
@@ -5039,6 +5178,8 @@ class PositionsRepo:
         sid: int,
         mode: int,
         holdings: Iterable[dict],
+        fills_repo: Any | None = None,
+        orders_repo: Any | None = None,
     ) -> int:
         restored = 0
         with self.engine.begin() as conn:
@@ -5066,6 +5207,27 @@ class PositionsRepo:
                 ).scalar()
                 if existing:
                     continue
+                plan_record = None
+                source = "missing"
+                if fills_repo is not None and hasattr(fills_repo, "find_latest_buy_entry_exit_plan"):
+                    plan_record = fills_repo.find_latest_buy_entry_exit_plan(env, code)
+                    if plan_record:
+                        source = "restored_from_fill"
+                if not plan_record and orders_repo is not None and hasattr(orders_repo, "find_latest_buy_entry_exit_plan"):
+                    plan_record = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code)
+                    if plan_record:
+                        source = "restored_from_order"
+                plan_values = _plan_position_values(plan_record, missing=not bool(plan_record))
+                if plan_record:
+                    logger.info(
+                        "[RECONCILE][ENTRY_EXIT_PLAN_RESTORE] code=%s source=%s thesis=%s horizon=%s exit_family=%s eod_action=%s",
+                        code, source, plan_values.get("entry_thesis"), plan_values.get("trade_horizon"), plan_values.get("exit_policy_family"), plan_values.get("eod_action"),
+                    )
+                else:
+                    logger.warning(
+                        "[RECONCILE][ENTRY_EXIT_PLAN_MISSING] code=%s action=restore_position_as_policy_missing_no_force_sell",
+                        code,
+                    )
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
@@ -5082,6 +5244,7 @@ class PositionsRepo:
                         last_trade_at=None,
                         status="OPEN",
                         last_reconciled_at=func.now(),
+                        **plan_values,
                     )
                 )
                 restored += 1
@@ -5185,6 +5348,7 @@ class PositionsRepo:
                             last_trade_at=None,
                             status="OPEN",
                             last_reconciled_at=func.now(),
+                            **_plan_position_values(None, missing=True),
                         )
                     )
                     inserted += 1

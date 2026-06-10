@@ -202,6 +202,8 @@ def _promote_open_buy_orders_from_holdings(
                 "holding_qty": holding_qty,
                 "ccld_status": "timeout",
                 "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                "entry_meta": (request_json or {}).get("entry_meta") or {},
+                "entry_exit_plan": (request_json or {}).get("entry_exit_plan") or {},
             },
             fill_meta_json={
                 "fill_source": "kis_holdings_fallback",
@@ -243,7 +245,7 @@ def _restore_entry_meta_for_promoted_positions(
     복원 우선순위:
     1. orders.entry_meta_json (BUY order 중 code와 매칭되는 최신)
     2. ledger ORDER_INTENT payload
-    3. SWING_SAFE fallback
+    3. 없으면 POLICY_MISSING 유지 (SWING_SAFE fallback 금지)
     """
     import json as _json
 
@@ -348,20 +350,34 @@ def _restore_entry_meta_for_promoted_positions(
                     "[RECONCILE][META_RESTORE] code=%s step=ledger err=%s", code, exc
                 )
 
-        # 3. SWING_SAFE fallback
-        resolved_meta = entry_meta_from_order or entry_meta_from_ledger or {
-            "book": "SWING_BOOK",
-            "trade_horizon": "SWING_CARRY",
-            "exit_policy_family": "SWING_STAGED_EXIT",
-            "meta_source": "RECONCILE_SWING_SAFE_FALLBACK",
-        }
+        resolved_meta = entry_meta_from_order or entry_meta_from_ledger
+        if not resolved_meta:
+            logger.warning(
+                "[RECONCILE][META_RESTORE][POLICY_MISSING] code=%s action=keep_policy_missing_no_swing_safe_fallback",
+                code,
+            )
+            try:
+                import sqlalchemy as _sa
+                with engine.begin() as _conn:
+                    _conn.execute(
+                        _sa.text(
+                            "UPDATE positions SET entry_thesis = COALESCE(entry_thesis, 'POLICY_MISSING'), "
+                            "exit_policy_family = COALESCE(exit_policy_family, 'POLICY_MISSING'), "
+                            "force_eod_close = FALSE, policy_source = COALESCE(policy_source, 'missing') "
+                            "WHERE env = :env AND code = :code AND status = 'OPEN' AND qty > 0"
+                        ),
+                        {"env": env, "code": code},
+                    )
+            except Exception as exc:
+                logger.warning("[RECONCILE][META_RESTORE][POLICY_MISSING_UPDATE_FAIL] code=%s err=%s", code, exc)
+            continue
 
         try:
             import sqlalchemy as _sa
             update_payload = {
                 **existing_meta,
-                "book": resolved_meta.get("book", "SWING_BOOK"),
-                "trade_horizon": resolved_meta.get("trade_horizon", "SWING_CARRY"),
+                "book": resolved_meta.get("book"),
+                "trade_horizon": resolved_meta.get("trade_horizon"),
             }
             if resolved_meta.get("exit_policy_family"):
                 update_payload["exit_policy_family"] = resolved_meta["exit_policy_family"]
@@ -436,6 +452,24 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         market = MARKET_MAP.get(code) or str(_first_value(row, ["excg_dvsn_cd", "market"]) or "").strip() or None
         order_time = _parse_date_time(row)
         client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
+        plan_record = None
+        request_json = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        if side == "BUY":
+            try:
+                plan_record = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code)
+            except Exception as exc:
+                logger.warning("[RECONCILE][DAILY_CCLD][ENTRY_EXIT_PLAN_LOOKUP_FAIL] code=%s err=%s", code, exc)
+                plan_record = None
+            if plan_record:
+                request_json.update({
+                    "entry_meta": plan_record.get("entry_meta") or {},
+                    "entry_exit_plan": plan_record.get("entry_exit_plan") or {},
+                    "entry_exit_plan_source": "latest_buy_order_request_json",
+                })
+                logger.info(
+                    "[RECONCILE][DAILY_CCLD][ENTRY_EXIT_PLAN_MERGE] code=%s source=latest_buy_order_request_json",
+                    code,
+                )
 
         orders_repo.upsert_reconciled_order(
             env=env,
@@ -453,7 +487,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             client_order_key=client_order_key,
             kis_odno=kis_odno,
             status=status,
-            request_json=row,
+            request_json=request_json,
             response_json=row,
             submitted_at=order_time,
             acked_at=order_time,
@@ -477,7 +511,12 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 fee=0.0,
                 tax=0.0,
                 filled_at=order_time,
-                raw_json=row,
+                raw_json={
+                    "kis_response": row,
+                    "entry_meta": (request_json.get("entry_meta") if isinstance(request_json, dict) else {}) or {},
+                    "entry_exit_plan": (request_json.get("entry_exit_plan") if isinstance(request_json, dict) else {}) or {},
+                    "entry_exit_plan_source": request_json.get("entry_exit_plan_source") if isinstance(request_json, dict) else None,
+                },
                 fill_meta_json={
                     "fill_source": "daily_ccld",
                     "ccld_status": ccld_status,
@@ -625,6 +664,8 @@ def reconcile_kis(
             sid=1,
             mode=1,
             holdings=holdings_rows,
+            fills_repo=fills_repo,
+            orders_repo=orders_repo,
         )
 
         # KIS holdings가 있고 DB positions가 0이면 upsert 복구

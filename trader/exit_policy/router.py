@@ -125,14 +125,40 @@ def resolve_exit_policy_for_position(
     ).strip()
 
     if not exit_family:
-        if entry_style in {"ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_OPEN_PUSH"}:
+        if entry_style in {"ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_OPEN_PUSH", "ENTRY_MOMENTUM_CONTINUATION"}:
             exit_family = "INTRADAY_PROFIT_PROTECT"
-        elif entry_style in {"ENTRY_PULLBACK", "ENTRY_VCP", "ENTRY_MINERVINI"}:
+        elif entry_style in {"ENTRY_PULLBACK", "ENTRY_PULLBACK_OVERRIDE", "ENTRY_VCP", "ENTRY_MINERVINI"}:
             exit_family = "SWING_STAGED_EXIT"
-        elif trade_horizon == "DAY_PROTECT":
-            exit_family = "INTRADAY_PROFIT_PROTECT"
-        elif trade_horizon == "CORE_CARRY":
+        elif entry_style in {"ENTRY_CORE", "CORE_TREND"}:
             exit_family = "CORE_TREND_FOLLOW"
+        elif trade_horizon in {"DAY_TRADE", "DAY_PROTECT"}:
+            exit_family = "INTRADAY_PROFIT_PROTECT"
+        elif trade_horizon == "SWING":
+            exit_family = "SWING_STAGED_EXIT"
+        elif trade_horizon in {"CORE", "CORE_CARRY"}:
+            exit_family = "CORE_TREND_FOLLOW"
+        elif _eb("PB1_REQUIRE_ENTRY_EXIT_PLAN", default=True):
+            code_for_log = str(pos.get("code") or pos.get("pdno") or "UNKNOWN")
+            logger.warning(
+                "[EXIT][ROUTER][POLICY_MISSING] code=%s entry_style=%s trade_horizon=%s action=skip_exit_family",
+                code_for_log, entry_style, trade_horizon,
+            )
+            return {
+                "exit_family": "POLICY_MISSING",
+                "policy_missing": True,
+                "entry_style": entry_style,
+                "trade_horizon": trade_horizon,
+                "hard_stop_enabled": True,
+                "r_take_profit_enabled": False,
+                "percent_take_profit_enabled": False,
+                "profit_protect_enabled": False,
+                "trend_follow_enabled": False,
+                "time_stop_enabled": False,
+                "max_hold_days": 0,
+                "partial_sell_rules": [],
+                "full_exit_rules": [],
+                "router_enabled": enabled,
+            }
         else:
             exit_family = "SWING_STAGED_EXIT"
 

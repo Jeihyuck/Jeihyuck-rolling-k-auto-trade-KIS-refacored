@@ -31,6 +31,8 @@ logger = logging.getLogger("generate_portfolio_pnl_report")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from trader.trade_plan import classify_close_action_from_plan, parse_plan_bool
+
 KST = timezone(timedelta(hours=9))
 REPORT_DIR = REPO_ROOT / "reports" / "portfolio_pnl"
 
@@ -300,6 +302,18 @@ def _build_holdings_pnl(
         
         days_held = _days_held(entry_date, trade_date)
         rank = _safe_int(bal.get("rank") or pos.get("rank_final30") or 0)
+        plan = pos.get("entry_exit_plan_json") or {}
+        if isinstance(plan, str):
+            try:
+                plan = json.loads(plan)
+            except Exception:
+                plan = {}
+        if not isinstance(plan, dict):
+            plan = {}
+        close_action, close_reason = classify_close_action_from_plan(plan)
+        entry_exit_plan_status = "OK" if plan else "POLICY_MISSING"
+        if entry_exit_plan_status == "POLICY_MISSING":
+            warnings.append(f"POLICY_MISSING:{code}:this position will not be force-sold in close phase because no EntryExitPlan was found")
 
         holdings.append({
             "rank": rank,
@@ -319,7 +333,22 @@ def _build_holdings_pnl(
             "stop_price": _safe_float(pos.get("stop_price")),
             "pivot_price": _safe_float(pos.get("pivot") or pos.get("pivot_price_at_entry")),
             "entry_style": str(pos.get("entry_style_selected") or pos.get("entry_reason") or ""),
-            "exit_policy": str(pos.get("exit_policy_family") or ""),
+            "entry_thesis": str(pos.get("entry_thesis") or plan.get("entry_thesis") or ""),
+            "entry_style_selected": str(pos.get("entry_style_selected") or plan.get("entry_style_selected") or ""),
+            "entry_reason": str(pos.get("entry_reason") or plan.get("entry_reason") or ""),
+            "trade_horizon": str(pos.get("trade_horizon") or plan.get("trade_horizon") or ""),
+            "exit_policy": str(pos.get("exit_policy_family") or plan.get("exit_policy_family") or ""),
+            "exit_policy_family": str(pos.get("exit_policy_family") or plan.get("exit_policy_family") or ""),
+            "eod_action": str(pos.get("eod_action") or plan.get("eod_action") or ""),
+            "force_eod_close": parse_plan_bool(pos.get("force_eod_close"), default=parse_plan_bool(plan.get("force_eod_close"), default=False)),
+            "initial_stop_price": _safe_float(pos.get("initial_stop_price") or (plan.get("risk_plan") or {}).get("initial_stop")),
+            "initial_risk_r": _safe_float(pos.get("initial_risk_r") or (plan.get("risk_plan") or {}).get("risk_R")),
+            "max_trading_days": _safe_int(pos.get("max_trading_days") or (plan.get("time_plan") or {}).get("max_trading_days")),
+            "policy_source": str(pos.get("policy_source") or plan.get("policy_source") or ""),
+            "policy_version": str(pos.get("policy_version") or plan.get("policy_version") or ""),
+            "close_action": close_action,
+            "close_reason": close_reason,
+            "entry_exit_plan_status": entry_exit_plan_status,
             "last_fill": str(pos.get("last_fill_at") or "")[:8],
             "price_source": price_source,
         })
@@ -714,8 +743,8 @@ def _build_markdown(
 
     # Holdings PNL Table
     lines.append("## Holdings PNL Table\n")
-    lines.append("| Rank | Code | Name | Qty | Entry Date | Days Held | Avg Buy | Final Price | Cost | Market Value | Unrealized PNL | PNL % | Stop | Pivot | Entry Style | Exit Policy | Last Fill |")
-    lines.append("|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|")
+    lines.append("| Rank | Code | Name | Qty | Entry Date | Days Held | Avg Buy | Final Price | Cost | Market Value | Unrealized PNL | PNL % | Entry Thesis | Entry Style | Entry Reason | Horizon | Exit Policy | EOD Action | Force EOD | Initial Stop | Initial R | Max Days | Policy Source | Policy Version | Close Action | Close Reason | Plan Status | Last Fill |")
+    lines.append("|---:|---|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|---|---|---:|---:|---:|---:|---|---|---|---|---|---|")
     for h in holdings:
         lines.append(
             f"| {h['rank']} | {h['code']} | {h['name']} | {h['qty']} "
@@ -723,9 +752,13 @@ def _build_markdown(
             f"| {int(h['avg_buy']):,} | {int(h['current_price']):,} "
             f"| {int(h['cost_basis']):,} | {int(h['market_value']):,} "
             f"| {_fmt_krw(h['unrealized_pnl'])} | {_fmt_pct(h['pnl_pct'])} "
-            f"| {int(h['stop_price']):,} | {int(h['pivot_price']):,} "
-            f"| {h['entry_style']} | {h['exit_policy']} | {h['last_fill']} |"
+            f"| {h['entry_thesis']} | {h['entry_style_selected']} | {h['entry_reason']} "
+            f"| {h['trade_horizon']} | {h['exit_policy_family']} | {h['eod_action']} | {int(bool(h['force_eod_close']))} "
+            f"| {int(h['initial_stop_price']):,} | {int(h['initial_risk_r']):,} | {h['max_trading_days']} "
+            f"| {h['policy_source']} | {h['policy_version']} | {h['close_action']} | {h['close_reason']} | {h['entry_exit_plan_status']} | {h['last_fill']} |"
         )
+    if any(str(h.get("entry_exit_plan_status")) == "POLICY_MISSING" for h in holdings):
+        lines.append("\n> POLICY_MISSING: this position will not be force-sold in close phase because no EntryExitPlan was found.")
     lines.append("")
 
     # Today Trade Summary
