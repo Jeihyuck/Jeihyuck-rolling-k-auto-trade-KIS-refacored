@@ -114,6 +114,23 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+
+
+def parse_plan_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse booleans from DB/JSON/env-ish values without bool("False") mistakes."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off", "", "none", "null"}:
+        return False
+    return default
+
 def seed_plan_fields_for_entry_style(entry_style_selected: Any) -> dict[str, Any]:
     style = str(entry_style_selected or "").strip().upper()
     mapped = STYLE_PLAN_MAPPING.get(style)
@@ -142,7 +159,7 @@ def build_entry_exit_plan(*, code: str, market: str | None = None, entry_style_s
     base["trade_horizon"] = str(_feature(features, "trade_horizon") or base["trade_horizon"]).strip().upper()
     base["exit_policy_family"] = str(_feature(features, "exit_policy_family") or base["exit_policy_family"]).strip().upper()
     base["eod_action"] = str(_feature(features, "eod_action") or base["eod_action"]).strip().upper()
-    base["force_eod_close"] = bool(_feature(features, "force_eod_close", base["force_eod_close"]))
+    base["force_eod_close"] = parse_plan_bool(_feature(features, "force_eod_close", base["force_eod_close"]), default=bool(base["force_eod_close"]))
 
     stop = None
     stop_source = ""
@@ -226,7 +243,7 @@ def validate_entry_exit_plan(plan: EntryExitPlan | Mapping[str, Any]) -> bool:
         raise ValueError(f"missing required plan fields: {missing}")
     horizon = str(data.get("trade_horizon") or "").upper()
     eod = str(data.get("eod_action") or "").upper()
-    force = bool(data.get("force_eod_close"))
+    force = parse_plan_bool(data.get("force_eod_close"), default=False)
     if horizon == "DAY_TRADE" and (eod != "FORCE_EXIT" or not force):
         raise ValueError("DAY_TRADE must FORCE_EXIT with force_eod_close=true")
     if horizon in {"SWING", "CORE"} and (eod != "CARRY_IF_NO_EXIT_SIGNAL" or force):
@@ -247,7 +264,7 @@ def classify_close_action_from_plan(plan: Any) -> tuple[str, str]:
         return "SKIP", "POLICY_MISSING"
     horizon = str(plan.get("trade_horizon") or "").upper()
     eod = str(plan.get("eod_action") or "").upper()
-    force = bool(plan.get("force_eod_close"))
+    force = parse_plan_bool(plan.get("force_eod_close"), default=False)
     if horizon == "DAY_TRADE" and eod == "FORCE_EXIT" and force:
         return "FORCE_SELL", "EOD_FORCE_EXIT"
     if horizon == "SWING":

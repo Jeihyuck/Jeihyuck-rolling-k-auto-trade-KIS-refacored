@@ -31,6 +31,8 @@ logger = logging.getLogger("generate_portfolio_pnl_report")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from trader.trade_plan import classify_close_action_from_plan, parse_plan_bool
+
 KST = timezone(timedelta(hours=9))
 REPORT_DIR = REPO_ROOT / "reports" / "portfolio_pnl"
 
@@ -338,7 +340,7 @@ def _build_holdings_pnl(
             "exit_policy": str(pos.get("exit_policy_family") or plan.get("exit_policy_family") or ""),
             "exit_policy_family": str(pos.get("exit_policy_family") or plan.get("exit_policy_family") or ""),
             "eod_action": str(pos.get("eod_action") or plan.get("eod_action") or ""),
-            "force_eod_close": bool(pos.get("force_eod_close") or plan.get("force_eod_close")),
+            "force_eod_close": parse_plan_bool(pos.get("force_eod_close"), default=parse_plan_bool(plan.get("force_eod_close"), default=False)),
             "initial_stop_price": _safe_float(pos.get("initial_stop_price") or (plan.get("risk_plan") or {}).get("initial_stop")),
             "initial_risk_r": _safe_float(pos.get("initial_risk_r") or (plan.get("risk_plan") or {}).get("risk_R")),
             "max_trading_days": _safe_int(pos.get("max_trading_days") or (plan.get("time_plan") or {}).get("max_trading_days")),

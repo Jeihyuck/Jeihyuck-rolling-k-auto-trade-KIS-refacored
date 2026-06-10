@@ -29,6 +29,7 @@ from .schema import (
     uuid_value_for_url,
 )
 from trader.db.json_safe import json_sanitize
+from trader.trade_plan import parse_plan_bool
 from trader.db.engine import safe_read_mappings, dispose_engine_safely
 from trader.db.retry import run_with_db_retry
 from trader.constants import (
@@ -3542,7 +3543,8 @@ class OrdersRepo:
         return False, None
 
 
-    def find_latest_buy_entry_exit_plan(self, env: str, strategy: str, code: str) -> dict | None:
+    def find_latest_buy_entry_exit_plan(self, env: str, strategy: str, code: str, *, lookback: int | None = None) -> dict | None:
+        lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
         stmt = (
             select(self._schema.orders.c.request_json)
             .where(
@@ -3555,16 +3557,22 @@ class OrdersRepo:
                 )
             )
             .order_by(self._schema.orders.c.created_at.desc())
-            .limit(1)
+            .limit(lookback_n)
         )
         rows = self._read_mappings_with_guard(stmt, op_name="orders_latest_buy_entry_exit_plan", fail_open=True)
-        if not rows:
-            return None
-        request_json = dict((rows[0] or {}).get("request_json") or {})
-        plan = request_json.get("entry_exit_plan")
-        if not isinstance(plan, dict) or not plan:
-            return None
-        return {"entry_exit_plan": plan, "entry_meta": request_json.get("entry_meta") or {}}
+        for row in rows or []:
+            request_json = (row or {}).get("request_json") or {}
+            if isinstance(request_json, str):
+                try:
+                    import json as _json
+                    request_json = _json.loads(request_json)
+                except Exception:
+                    request_json = {}
+            request_json = dict(request_json or {})
+            plan = request_json.get("entry_exit_plan")
+            if isinstance(plan, dict) and plan:
+                return {"entry_exit_plan": plan, "entry_meta": request_json.get("entry_meta") or {}}
+        return None
 
 class FillsRepo:
     def __init__(self, engine: Engine):
@@ -3847,7 +3855,8 @@ class FillsRepo:
             return str(existing or payload["fill_id"])
 
 
-    def find_latest_buy_entry_exit_plan(self, env: str, code: str) -> dict | None:
+    def find_latest_buy_entry_exit_plan(self, env: str, code: str, *, lookback: int | None = None) -> dict | None:
+        lookback_n = max(1, int(lookback or os.getenv("PB1_ENTRY_EXIT_PLAN_LOOKBACK_N", "20") or 20))
         stmt = (
             select(self._schema.fills.c.raw_json)
             .where(
@@ -3858,16 +3867,22 @@ class FillsRepo:
                 )
             )
             .order_by(self._schema.fills.c.filled_at.desc(), self._schema.fills.c.created_at.desc())
-            .limit(1)
+            .limit(lookback_n)
         )
         rows, _ = safe_read_mappings(self.engine, stmt, op_name="fills_latest_buy_entry_exit_plan", fail_open=True)
-        if not rows:
-            return None
-        raw_json = dict((rows[0] or {}).get("raw_json") or {})
-        plan = raw_json.get("entry_exit_plan")
-        if not isinstance(plan, dict) or not plan:
-            return None
-        return {"entry_exit_plan": plan, "entry_meta": raw_json.get("entry_meta") or {}}
+        for row in rows or []:
+            raw_json = (row or {}).get("raw_json") or {}
+            if isinstance(raw_json, str):
+                try:
+                    import json as _json
+                    raw_json = _json.loads(raw_json)
+                except Exception:
+                    raw_json = {}
+            raw_json = dict(raw_json or {})
+            plan = raw_json.get("entry_exit_plan")
+            if isinstance(plan, dict) and plan:
+                return {"entry_exit_plan": plan, "entry_meta": raw_json.get("entry_meta") or {}}
+        return None
 
 
 class LedgerEventsRepo:
@@ -4783,7 +4798,7 @@ def _plan_position_values(plan_record: dict | None, *, missing: bool = False) ->
         "trade_horizon": plan.get("trade_horizon") or meta.get("trade_horizon"),
         "exit_policy_family": plan.get("exit_policy_family") or meta.get("exit_policy_family"),
         "eod_action": plan.get("eod_action") or meta.get("eod_action"),
-        "force_eod_close": bool(plan.get("force_eod_close") if plan.get("force_eod_close") is not None else meta.get("force_eod_close", False)),
+        "force_eod_close": parse_plan_bool(plan.get("force_eod_close"), default=parse_plan_bool(meta.get("force_eod_close"), default=False)),
         "max_trading_days": time_plan.get("max_trading_days") or meta.get("max_trading_days"),
         "initial_stop_price": risk.get("initial_stop") or meta.get("initial_stop_price"),
         "initial_risk_r": risk.get("risk_R") or meta.get("initial_risk_r"),
@@ -5032,7 +5047,7 @@ class PositionsRepo:
                             "entry_thesis": merged_entry_meta.get("entry_thesis") or row.get("entry_thesis") if row else merged_entry_meta.get("entry_thesis"),
                             "trade_horizon": merged_entry_meta.get("trade_horizon") or row.get("trade_horizon") if row else merged_entry_meta.get("trade_horizon"),
                             "eod_action": merged_entry_meta.get("eod_action") or row.get("eod_action") if row else merged_entry_meta.get("eod_action"),
-                            "force_eod_close": bool(merged_entry_meta.get("force_eod_close") if merged_entry_meta.get("force_eod_close") is not None else (row.get("force_eod_close") if row else False)),
+                            "force_eod_close": parse_plan_bool(merged_entry_meta.get("force_eod_close"), default=parse_plan_bool(row.get("force_eod_close") if row else False, default=False)),
                             "max_trading_days": merged_entry_meta.get("max_trading_days") or row.get("max_trading_days") if row else merged_entry_meta.get("max_trading_days"),
                             "initial_stop_price": _safe_float_or_none(merged_entry_meta.get("initial_stop_price")) or row.get("initial_stop_price") if row else _safe_float_or_none(merged_entry_meta.get("initial_stop_price")),
                             "initial_risk_r": _safe_float_or_none(merged_entry_meta.get("initial_risk_r")) or row.get("initial_risk_r") if row else _safe_float_or_none(merged_entry_meta.get("initial_risk_r")),

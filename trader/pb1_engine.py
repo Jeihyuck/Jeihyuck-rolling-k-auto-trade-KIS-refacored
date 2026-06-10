@@ -231,7 +231,7 @@ from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
-from trader.trade_plan import build_entry_exit_plan, classify_close_action_from_plan
+from trader.trade_plan import build_entry_exit_plan, classify_close_action_from_plan, parse_plan_bool
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.final_list_store import get_as_of_date
 from trader.final30_quality import validate_trade_ready
@@ -10549,15 +10549,18 @@ class PB1Engine:
             (entry_exit_plan or {}).get("trade_horizon") or pos.get("trade_horizon"),
             (entry_exit_plan or {}).get("exit_policy_family") or pos.get("exit_policy_family"),
             (entry_exit_plan or {}).get("eod_action") or pos.get("eod_action"),
-            int(bool((entry_exit_plan or {}).get("force_eod_close") or pos.get("force_eod_close"))),
+            int(parse_plan_bool((entry_exit_plan or {}).get("force_eod_close"), default=parse_plan_bool(pos.get("force_eod_close"), default=False))),
         )
         if str(window_tag).lower() == "close":
-            if close_action == "FORCE_SELL" and not signal_hit:
+            if close_action == "FORCE_SELL":
                 final_reason = close_reason
                 ordered_reasons = [final_reason]
                 signal_hit = True
                 eval_reason = final_reason
                 exit_policy = {**exit_policy, "exit_ok": True, "final_reason": final_reason}
+                _router_qty = int(pos.get("orderable_qty") or qty)
+                _router_full_exit = True
+                _router_sell_pct = None
             elif close_action == "CARRY" and not signal_hit:
                 logger.info("[PB1][CLOSE_PLAN][CARRY] code=%s reason=%s no_exit_signal=1", code, close_reason)
                 exit_policy = {**exit_policy, "exit_ok": False, "final_reason": close_reason}
@@ -10625,7 +10628,7 @@ class PB1Engine:
                 "entry_thesis": (entry_exit_plan or {}).get("entry_thesis") or pos.get("entry_thesis"),
                 "trade_horizon": (entry_exit_plan or {}).get("trade_horizon") or pos.get("trade_horizon"),
                 "eod_action": (entry_exit_plan or {}).get("eod_action") or pos.get("eod_action"),
-                "force_eod_close": bool((entry_exit_plan or {}).get("force_eod_close") or pos.get("force_eod_close")),
+                "force_eod_close": parse_plan_bool((entry_exit_plan or {}).get("force_eod_close"), default=parse_plan_bool(pos.get("force_eod_close"), default=False)),
                 "entry_exit_plan_status": "OK" if isinstance(entry_exit_plan, dict) and entry_exit_plan else "POLICY_MISSING",
                 "entry_price": float(pos.get("entry_price") or avg),
                 "current_price": mark,

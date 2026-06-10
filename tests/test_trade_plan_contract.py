@@ -1,6 +1,6 @@
 import pytest
 
-from trader.trade_plan import build_entry_exit_plan, classify_close_action_from_plan
+from trader.trade_plan import build_entry_exit_plan, classify_close_action_from_plan, parse_plan_bool
 
 
 def _plan(style):
@@ -51,3 +51,14 @@ def test_swing_close_carry():
 
 def test_empty_plan_policy_missing():
     assert classify_close_action_from_plan({}) == ("SKIP", "POLICY_MISSING")
+
+
+def test_force_eod_close_string_false_is_false():
+    assert parse_plan_bool("False") is False
+    assert parse_plan_bool("0") is False
+    assert parse_plan_bool("true") is True
+    plan = build_entry_exit_plan(
+        code="005930", market="KOSPI", entry_style_selected="ENTRY_PULLBACK", entry_reason="ENTRY_PULLBACK", entry_price=10000,
+        features={"stop_price": 9500, "force_eod_close": "False"},
+    ).to_dict()
+    assert plan["force_eod_close"] is False
