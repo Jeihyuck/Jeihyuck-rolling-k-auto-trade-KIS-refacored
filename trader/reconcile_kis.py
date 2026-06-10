@@ -202,6 +202,8 @@ def _promote_open_buy_orders_from_holdings(
                 "holding_qty": holding_qty,
                 "ccld_status": "timeout",
                 "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                "entry_meta": (request_json or {}).get("entry_meta") or {},
+                "entry_exit_plan": (request_json or {}).get("entry_exit_plan") or {},
             },
             fill_meta_json={
                 "fill_source": "kis_holdings_fallback",
@@ -477,7 +479,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                 fee=0.0,
                 tax=0.0,
                 filled_at=order_time,
-                raw_json=row,
+                raw_json={"kis_response": row, "entry_meta": (row.get("entry_meta") if isinstance(row, dict) else {}) or {}, "entry_exit_plan": (row.get("entry_exit_plan") if isinstance(row, dict) else {}) or {}},
                 fill_meta_json={
                     "fill_source": "daily_ccld",
                     "ccld_status": ccld_status,
@@ -625,6 +627,8 @@ def reconcile_kis(
             sid=1,
             mode=1,
             holdings=holdings_rows,
+            fills_repo=fills_repo,
+            orders_repo=orders_repo,
         )
 
         # KIS holdings가 있고 DB positions가 0이면 upsert 복구

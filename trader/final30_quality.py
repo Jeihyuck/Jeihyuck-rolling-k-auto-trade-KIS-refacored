@@ -6,6 +6,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from trader.trade_plan import seed_plan_fields_for_entry_style
+
 from trader.indicators import safe_nullable_float
 
 
@@ -210,6 +212,11 @@ def normalize_final30_contract_row(row: dict[str, Any] | None) -> dict[str, Any]
         if field in out and out.get(field) is not None:
             meta[field] = out.get(field)
 
+    seed_fields = seed_plan_fields_for_entry_style(out.get("entry_style_selected"))
+    for field, value in seed_fields.items():
+        if out.get(field) is None:
+            out[field] = value
+        meta[field] = out.get(field)
     if out.get("entry_style_selected") is not None:
         meta["entry_style_selected"] = out.get("entry_style_selected")
     if out.get("entry_component") is not None:

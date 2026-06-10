@@ -231,6 +231,7 @@ from trader.utils.json_sanitize import to_jsonable
 from trader.window_router import WindowDecision
 from trader.diagnostics.spool import spool_event
 from trader.watchlist_builder import load_today_watchlist_with_fallback
+from trader.trade_plan import build_entry_exit_plan, classify_close_action_from_plan
 from rolling_k_auto_trade_api.best_k_meta_strategy import run_rebalance
 from trader.final_list_store import get_as_of_date
 from trader.final30_quality import validate_trade_ready
@@ -6252,6 +6253,82 @@ class PB1Engine:
             }
         )
 
+
+    def _prepare_entry_exit_plan(self, cf: CandidateFeature, *, entry_price_for_plan: float) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        identity = self._resolve_entry_identity_for_candidate(cf)
+        entry_style_selected = (
+            cf.features.get("entry_style_selected")
+            or cf.features.get("entry_setup_family")
+            or cf.features.get("decision_family")
+            or identity.get("entry_style_selected")
+            or identity.get("entry_reason")
+        )
+        entry_reason = (
+            cf.features.get("entry_reason")
+            or cf.features.get("decision_reason")
+            or identity.get("entry_reason")
+            or entry_style_selected
+        )
+        try:
+            plan = build_entry_exit_plan(
+                code=cf.code,
+                market=cf.market,
+                entry_style_selected=str(entry_style_selected or ""),
+                entry_reason=str(entry_reason or entry_style_selected or ""),
+                entry_price=float(entry_price_for_plan or 0.0),
+                features=cf.features,
+            )
+            plan_dict = plan.to_dict()
+        except Exception as exc:
+            logger.warning(
+                "[PB1][ENTRY_PLAN][MISSING_OR_INVALID] code=%s entry_style=%s entry_reason=%s err=%s action=skip_buy",
+                cf.code, entry_style_selected, entry_reason, exc,
+            )
+            self._append_ledger_event(
+                event_type="ORDER_SKIP",
+                code=cf.code,
+                market=cf.market,
+                mode=cf.mode,
+                side="BUY",
+                qty=cf.planned_qty,
+                price=float(entry_price_for_plan or 0.0),
+                client_order_key=cf.client_order_key,
+                ok=False,
+                reasons=["ENTRY_EXIT_PLAN_MISSING_OR_INVALID"],
+                stage="ENTRY_PLAN_VALIDATE",
+                payload_json={
+                    "features": cf.features,
+                    "entry_style_selected": entry_style_selected,
+                    "entry_reason": entry_reason,
+                    "error": str(exc),
+                },
+            )
+            return None
+        risk = plan_dict.get("risk_plan") or {}
+        time_plan = plan_dict.get("time_plan") or {}
+        entry_meta = {
+            "entry_thesis": plan_dict.get("entry_thesis"),
+            "entry_style_selected": plan_dict.get("entry_style_selected"),
+            "entry_reason": plan_dict.get("entry_reason"),
+            "trade_horizon": plan_dict.get("trade_horizon"),
+            "exit_policy_family": plan_dict.get("exit_policy_family"),
+            "eod_action": plan_dict.get("eod_action"),
+            "force_eod_close": plan_dict.get("force_eod_close"),
+            "initial_stop_price": risk.get("initial_stop"),
+            "initial_risk_r": risk.get("risk_R"),
+            "max_trading_days": time_plan.get("max_trading_days"),
+            "policy_source": plan_dict.get("policy_source"),
+            "policy_version": plan_dict.get("policy_version"),
+        }
+        logger.info(
+            "[PB1][ENTRY_PLAN][READY] code=%s thesis=%s style=%s horizon=%s exit_family=%s eod_action=%s force_eod=%s stop=%.2f risk_R=%.2f max_days=%s version=%s",
+            cf.code, plan_dict.get("entry_thesis"), plan_dict.get("entry_style_selected"),
+            plan_dict.get("trade_horizon"), plan_dict.get("exit_policy_family"), plan_dict.get("eod_action"),
+            int(bool(plan_dict.get("force_eod_close"))), float(risk.get("initial_stop") or 0.0),
+            float(risk.get("risk_R") or 0.0), time_plan.get("max_trading_days"), plan_dict.get("policy_version"),
+        )
+        return plan_dict, entry_meta
+
     def _portfolio_risk_diag_settings(self) -> dict[str, Any]:
         return {
             "sector_max_positions": self._int_env("PB1_SECTOR_MAX_POSITIONS", 0),
@@ -7960,7 +8037,10 @@ class PB1Engine:
             )
             qty = raw_risk_qty
             buy_ref_price = float(order_px) * (1.0 + float(BUY_PRICE_BUFFER_PCT))
+            usable_cash = float(locals().get("usable_cash", getattr(self, "entry_usable_krw", 0.0)) or 0.0)
+            order_possible_cash = float(locals().get("order_possible_cash", getattr(self, "_order_possible_cash", 0.0)) or 0.0)
             cash_available_for_order = float(order_possible_cash if order_possible_cash > 0 else usable_cash)
+            logger.info("[PB1][CASH][ORDERABLE] usable_cash=%.0f order_possible_cash=%.0f cash_available_for_order=%.0f", usable_cash, order_possible_cash, cash_available_for_order)
             affordable_qty, afford_details = _compute_affordable_buy_qty(
                 target_budget=budget_cap,
                 buy_ref_price=buy_ref_price,
@@ -8888,7 +8968,16 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        plan_prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=float(cf.features.get("entry_price") or limit_price or cf.features.get("close") or record_price or 0.0))
+        if plan_prepared is None:
+            status["skipped"] = 1
+            status["skipped_reason"] = "ENTRY_EXIT_PLAN_MISSING_OR_INVALID"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
+            return status
+        entry_exit_plan_dict, plan_entry_meta = plan_prepared
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=record_price)
+        entry_meta.update(plan_entry_meta)
         # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
         _eh_horizon = entry_meta.get("trade_horizon") or "SWING_CARRY"
         _eh_book = {"DAY_PROTECT": "DAY_BOOK", "SWING_CARRY": "SWING_BOOK", "CORE_CARRY": "CORE_BOOK"}.get(_eh_horizon, "SWING_BOOK")
@@ -8919,7 +9008,7 @@ class PB1Engine:
             "current_stop_price": _eh_stop_px,
         })
         # ─────────────────────────────────────────────────────────────────────
-        request_payload = {"features": cf.features, "reasons": cf.reasons, "entry_meta": entry_meta}
+        request_payload = {"features": cf.features, "reasons": cf.reasons, "entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict}
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()
@@ -9017,7 +9106,7 @@ class PB1Engine:
                 ok=True,
                 reasons=["entry"] + (cf.reasons or []),
                 stage="PB1-CLOSE",
-                payload_json={"features": cf.features, "entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id")},
+                payload_json={"features": cf.features, "entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict, "trace_id": entry_meta.get("trace_id")},
             )
         except Exception:
             logger.exception("[PB1][LEDGER][INTENT_FAIL] code=%s", display_code)
@@ -9139,7 +9228,7 @@ class PB1Engine:
             ok=bool(status.get("api_submitted")),
             reasons=["submit"],
             stage="PB1-CLOSE",
-            payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
+            payload_json={"entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
         )
         ok = bool(is_order_accepted(resp, kis_env=self.env))
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
@@ -9180,7 +9269,7 @@ class PB1Engine:
             ok=ok,
             reasons=[reason_code],
             stage=build_stage_label(session_kind=os.getenv("PB1_SESSION_KIND"), phase="entry"),
-            payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1},
+            payload_json={"entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict, "trace_id": entry_meta.get("trace_id"), "rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1},
         )
         logger.info(
             "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
@@ -9597,7 +9686,16 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
+        plan_prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=float(cf.features.get("entry_price") or cap or cf.features.get("close") or 0.0))
+        if plan_prepared is None:
+            status["skipped"] = 1
+            status["skipped_reason"] = "ENTRY_EXIT_PLAN_MISSING_OR_INVALID"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
+            return status
+        entry_exit_plan_dict, plan_entry_meta = plan_prepared
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=float(cap or 0.0))
+        entry_meta.update(plan_entry_meta)
         # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
         _eh_horizon = entry_meta.get("trade_horizon") or "SWING_CARRY"
         _eh_book = {"DAY_PROTECT": "DAY_BOOK", "SWING_CARRY": "SWING_BOOK", "CORE_CARRY": "CORE_BOOK"}.get(_eh_horizon, "SWING_BOOK")
@@ -9662,6 +9760,7 @@ class PB1Engine:
                     "base": base,
                     "cap_buffer_pct": cap_buffer_pct,
                     "entry_meta": entry_meta,
+                    "entry_exit_plan": entry_exit_plan_dict,
                 },
                 status="CREATED",
                 entry_meta_json=entry_meta,
@@ -9811,7 +9910,7 @@ class PB1Engine:
             ok=bool(status.get("api_submitted")),
             reasons=["submit"],
             stage="PB1-CLOSE",
-            payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
+            payload_json={"entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict, "trace_id": entry_meta.get("trace_id"), "kis_odno": kis_odno},
         )
         ok = bool(is_order_accepted(resp, kis_env=self.env))
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
@@ -9852,7 +9951,7 @@ class PB1Engine:
             ok=ok,
             reasons=[reason_code],
             stage="PB1-CLOSE",
-            payload_json={"entry_meta": entry_meta, "trace_id": entry_meta.get("trace_id"), "rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1},
+            payload_json={"entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict, "trace_id": entry_meta.get("trace_id"), "rt_cd": rt_cd, "msg_cd": msg_cd, "msg1": msg1},
         )
         logger.info(
             "[PB1][ORDER][RESULT] side=BUY code=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
@@ -10428,6 +10527,50 @@ class PB1Engine:
         signal_hit = bool(stop_hit or trail_hit or ma20_break or ma50_break or time_stop_hit or risk_off_hit)
         eval_reason = final_reason if signal_hit else "NO_EXIT_SIGNAL"
 
+        entry_exit_plan = pos.get("entry_exit_plan_json")
+        if isinstance(entry_exit_plan, str):
+            try:
+                entry_exit_plan = json.loads(entry_exit_plan)
+            except Exception:
+                entry_exit_plan = {}
+        if not isinstance(entry_exit_plan, dict) or not entry_exit_plan:
+            meta = pos.get("position_meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            entry_exit_plan = (meta or {}).get("entry_exit_plan") or {}
+        close_action, close_reason = classify_close_action_from_plan(entry_exit_plan if isinstance(entry_exit_plan, dict) else {})
+        logger.info(
+            "[PB1][CLOSE_PLAN] code=%s qty=%s close_action=%s reason=%s thesis=%s horizon=%s exit_family=%s eod_action=%s force_eod=%s",
+            code, qty, close_action, close_reason,
+            (entry_exit_plan or {}).get("entry_thesis") or pos.get("entry_thesis"),
+            (entry_exit_plan or {}).get("trade_horizon") or pos.get("trade_horizon"),
+            (entry_exit_plan or {}).get("exit_policy_family") or pos.get("exit_policy_family"),
+            (entry_exit_plan or {}).get("eod_action") or pos.get("eod_action"),
+            int(bool((entry_exit_plan or {}).get("force_eod_close") or pos.get("force_eod_close"))),
+        )
+        if str(window_tag).lower() == "close":
+            if close_action == "FORCE_SELL" and not signal_hit:
+                final_reason = close_reason
+                ordered_reasons = [final_reason]
+                signal_hit = True
+                eval_reason = final_reason
+                exit_policy = {**exit_policy, "exit_ok": True, "final_reason": final_reason}
+            elif close_action == "CARRY" and not signal_hit:
+                logger.info("[PB1][CLOSE_PLAN][CARRY] code=%s reason=%s no_exit_signal=1", code, close_reason)
+                exit_policy = {**exit_policy, "exit_ok": False, "final_reason": close_reason}
+                final_reason = close_reason
+                ordered_reasons = [close_reason]
+                eval_reason = "NO_EXIT_SIGNAL"
+            elif close_action == "SKIP":
+                logger.info("[PB1][CLOSE_PLAN][SKIP] code=%s reason=%s action=no_force_sell", code, close_reason)
+                exit_policy = {**exit_policy, "exit_ok": False, "final_reason": close_reason}
+                final_reason = close_reason
+                ordered_reasons = [close_reason]
+                eval_reason = "NO_EXIT_SIGNAL"
+
         exit_eval = ExitEvaluation(
             code=code,
             holding_qty=qty,
@@ -10476,6 +10619,14 @@ class PB1Engine:
                 "entry_style_selected": entry_style_selected,
                 "exit_family": exit_eval.family,
                 "exit_policy_family": exit_policy_family,
+                "entry_exit_plan": entry_exit_plan if isinstance(entry_exit_plan, dict) else {},
+                "close_action": close_action,
+                "close_reason": close_reason,
+                "entry_thesis": (entry_exit_plan or {}).get("entry_thesis") or pos.get("entry_thesis"),
+                "trade_horizon": (entry_exit_plan or {}).get("trade_horizon") or pos.get("trade_horizon"),
+                "eod_action": (entry_exit_plan or {}).get("eod_action") or pos.get("eod_action"),
+                "force_eod_close": bool((entry_exit_plan or {}).get("force_eod_close") or pos.get("force_eod_close")),
+                "entry_exit_plan_status": "OK" if isinstance(entry_exit_plan, dict) and entry_exit_plan else "POLICY_MISSING",
                 "entry_price": float(pos.get("entry_price") or avg),
                 "current_price": mark,
                 "stop_price_at_entry": pos.get("stop_price_at_entry") or stop_price,
@@ -10585,6 +10736,13 @@ class PB1Engine:
             )
             if forced_simulation is None:
                 logger.info("[EXIT][SKIP] code=%s reason=%s", display_code, exit_eval.primary_reason)
+                if str(close_action) == "SKIP":
+                    self._append_ledger_event(
+                        event_type="EXIT_SKIP", code=code, market=market, mode=mode, side="SELL", qty=qty,
+                        price=float(mark or 0.0), client_order_key=client_key, ok=False,
+                        reasons=[close_reason], stage="CLOSE_PLAN",
+                        payload_json={"entry_exit_plan": entry_exit_plan if isinstance(entry_exit_plan, dict) else {}, "close_action": close_action, "close_reason": close_reason},
+                    )
                 return exit_eval_payload
         else:
             forced_simulation = self._resolve_force_exit_simulation(
@@ -10735,6 +10893,17 @@ class PB1Engine:
             logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
+        exit_meta = {
+            "exit_reason": exit_eval.primary_reason,
+            "exit_stage": stage,
+            "close_action": exit_eval_payload.get("close_action"),
+            "close_reason": exit_eval_payload.get("close_reason"),
+            "entry_exit_plan": exit_eval_payload.get("entry_exit_plan") or {},
+            "position_trade_horizon": pos.get("trade_horizon") or exit_eval_payload.get("trade_horizon"),
+            "position_exit_policy_family": pos.get("exit_policy_family") or exit_policy_family,
+            "position_eod_action": pos.get("eod_action") or exit_eval_payload.get("eod_action"),
+            "policy_version": pos.get("policy_version") or (exit_eval_payload.get("entry_exit_plan") or {}).get("policy_version"),
+        }
         try:
             order_id, _created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -10750,7 +10919,7 @@ class PB1Engine:
                 limit_price=mark,
                 stage=stage,
                 client_order_key=client_key,
-                request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons), "ret_pct": ret_pct},
+                request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons), "ret_pct": ret_pct, "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
                 status="CREATED",
             )
         except Exception:
@@ -10890,7 +11059,7 @@ class PB1Engine:
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
-                raw_json=resp,
+                raw_json={"kis_response": resp, "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
                 fill_meta_json={
                     "avg_buy_at_sell": avg_buy_at_sell,
                     "cost_basis_at_sell": cost_basis_at_sell,
@@ -10899,6 +11068,7 @@ class PB1Engine:
                     "realized_pnl": realized_pnl_at_sell,
                     "realized_pnl_pct": realized_pnl_pct_at_sell,
                     "exit_reason": exit_eval.primary_reason,
+                    "exit_meta": exit_meta,
                 },
             )
             self.positions_repo.apply_fill(
@@ -10914,6 +11084,7 @@ class PB1Engine:
                 fee=0.0,
                 tax=0.0,
                 filled_at=filled_at,
+                entry_meta_json=exit_meta,
             )
             logger.info(
                 "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
@@ -10948,7 +11119,7 @@ class PB1Engine:
             sid=sid,
             mode=mode,
             code=code,
-            fields={"last_exit_eval_json": exit_eval_payload},
+            fields={"last_exit_eval_json": exit_eval_payload, "last_exit_plan_eval_json": exit_meta if 'exit_meta' in locals() else exit_eval_payload},
         )
         return exit_eval_payload
 
@@ -11000,7 +11171,18 @@ class PB1Engine:
                     "cooldown_until": state.get("cooldown_until"),
                     "regime_at_entry": state.get("regime_at_entry"),
                     "risk_mult_at_entry": state.get("risk_mult_at_entry"),
+                    "entry_thesis": state.get("entry_thesis"),
+                    "trade_horizon": state.get("trade_horizon"),
                     "exit_policy_family": state.get("exit_policy_family"),
+                    "eod_action": state.get("eod_action"),
+                    "force_eod_close": state.get("force_eod_close"),
+                    "max_trading_days": state.get("max_trading_days"),
+                    "initial_stop_price": state.get("initial_stop_price"),
+                    "initial_risk_r": state.get("initial_risk_r"),
+                    "entry_exit_plan_json": state.get("entry_exit_plan_json") or {},
+                    "last_exit_plan_eval_json": state.get("last_exit_plan_eval_json") or {},
+                    "policy_source": state.get("policy_source"),
+                    "policy_version": state.get("policy_version"),
                     "last_exit_eval_json": state.get("last_exit_eval_json") or {},
                 }
             )
