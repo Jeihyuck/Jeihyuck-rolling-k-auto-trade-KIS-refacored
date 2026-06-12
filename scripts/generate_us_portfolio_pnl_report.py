@@ -394,7 +394,7 @@ def _load_db_fills(engine, trade_date: str) -> list[dict]:
             select_fields.append("0.0 AS filled_price")
             logger.warning("[US_PNL][DB_FILLS][NO_FILLED_PRICE_COL] none of %s found", filled_price_candidates)
 
-        for opt_col in ["filled_amount_usd", "filled_at", "order_id", "order_no", "client_order_key"]:
+        for opt_col in ["filled_amount_usd", "filled_at", "order_id", "order_no", "client_order_key", "meta"]:
             if opt_col in cols:
                 select_fields.append(opt_col)
 
@@ -734,11 +734,36 @@ def generate_us_pnl_report(
             _realized_from_kis_field = _rk
             break
 
+    def _fill_meta(fill: dict) -> dict:
+        meta = fill.get("meta") or {}
+        if isinstance(meta, dict):
+            return meta
+        if isinstance(meta, str) and meta.strip():
+            try:
+                parsed = json.loads(meta)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _meta_float(meta: dict, *keys: str) -> float | None:
+        for key in keys:
+            value = meta.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     daily_buy_tracker: dict[str, dict[str, float]] = {}
     daily_sell_tracker: dict[str, float] = {}
     realized_total = 0.0
     missing_realized_basis = False
     has_sell_fill = False
+    used_fill_cost_basis = False
+    used_meta_realized = False
     for fill in db_fills:
         symbol = str(fill.get("symbol") or "").strip().upper()
         if not symbol:
@@ -756,6 +781,19 @@ def generate_us_pnl_report(
         if side != "SELL":
             continue
         has_sell_fill = True
+        meta = _fill_meta(fill)
+        meta_realized = _meta_float(meta, "realized_pnl_usd")
+        if meta_realized is not None:
+            realized_total += meta_realized
+            used_meta_realized = True
+            continue
+        cost_basis = _meta_float(meta, "cost_basis_price_usd", "pre_sell_avg_cost", "pre_sell_cost_basis_price_usd")
+        if cost_basis is not None and cost_basis > 0:
+            realized_total += qty * (price - cost_basis)
+            used_fill_cost_basis = True
+            continue
+
+        # Fallback only: same-day BUY/SELL matching when no pre-sell basis is stored.
         buy_row = daily_buy_tracker.get(symbol, {"qty": 0.0, "cost": 0.0})
         used_qty = daily_sell_tracker.get(symbol, 0.0)
         available_qty = max(0.0, buy_row.get("qty", 0.0) - used_qty)
@@ -769,7 +807,10 @@ def generate_us_pnl_report(
 
     if has_sell_fill and not missing_realized_basis:
         realized_pnl_available = True
-        realized_pnl_source = "db_fills_daily"
+        if used_meta_realized or used_fill_cost_basis:
+            realized_pnl_source = "sell_fill_cost_basis"
+        else:
+            realized_pnl_source = "db_fills_daily"
         realized_pnl_usd = realized_total
     else:
         warnings.append("realized_pnl_unavailable")

@@ -293,6 +293,8 @@ def route_order(
                     _pos_for_guard["holding_qty"] = _pos_for_guard["holding_qty"] or _db_pos.get("holding_qty") or _db_pos.get("qty")
                     _pos_for_guard["orderable_qty"] = _db_pos.get("orderable_qty") or _db_pos.get("qty")
                     _pos_for_guard["sellable_qty"] = _db_pos.get("sellable_qty") or _pos_for_guard["orderable_qty"]
+                    _pos_for_guard["avg_cost"] = _db_pos.get("avg_cost") or _db_pos.get("entry_price") or _db_pos.get("avg_price")
+                    _pos_for_guard["position_source"] = _db_pos.get("entry_price_source") or _db_pos.get("balance_source") or "us_positions"
             except Exception as _db_exc:
                 logger.warning("[US_ORDER][BALANCE_MATCH][WARN] db fallback failed: %s", _db_exc)
 
@@ -342,6 +344,40 @@ def route_order(
             intent.setdefault("meta", {})
             if isinstance(intent.get("meta"), dict):
                 intent["meta"]["sell_qty_clamped"] = True
+
+    if side == "SELL":
+        intent.setdefault("meta", {})
+        if isinstance(intent.get("meta"), dict):
+            meta = intent["meta"]
+            cost_basis = (
+                intent.get("avg_cost")
+                or intent.get("entry_price")
+                or intent.get("avg_price")
+                or meta.get("entry_price")
+                or meta.get("avg_cost")
+                or meta.get("avg_price")
+                or (_pos_for_guard.get("avg_cost") if "_pos_for_guard" in locals() else None)
+            )
+            try:
+                cost_basis_float = float(cost_basis) if cost_basis not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                cost_basis_float = 0.0
+            if cost_basis_float > 0:
+                meta.setdefault("cost_basis_price_usd", cost_basis_float)
+                meta.setdefault("cost_basis_source", "pre_sell_position_snapshot")
+                meta.setdefault("pre_sell_avg_cost", cost_basis_float)
+                pre_sell_qty = (
+                    intent.get("holding_qty")
+                    or intent.get("available_qty")
+                    or meta.get("holding_qty")
+                    or (_pos_for_guard.get("holding_qty") if "_pos_for_guard" in locals() else None)
+                )
+                if pre_sell_qty not in (None, ""):
+                    meta.setdefault("pre_sell_qty", pre_sell_qty)
+                meta.setdefault(
+                    "pre_sell_position_source",
+                    (_pos_for_guard.get("position_source") if "_pos_for_guard" in locals() else None) or "pre_sell_position_snapshot",
+                )
 
     logger.info("[US_ORDER][SEND] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
@@ -396,7 +432,7 @@ def route_order(
         "order_no": order_no,
         "status": "ACK",
         "dry_run": False,
-        "meta": {"raw_response": resp},
+        "meta": {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp},
     }
 
     ack_db_saved = False
