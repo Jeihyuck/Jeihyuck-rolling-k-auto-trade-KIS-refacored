@@ -272,8 +272,6 @@ def route_order(
         if isinstance(intent.get("meta"), dict):
             meta = intent["meta"]
             if "pre_order_position_qty" not in meta:
-                pre_qty = 0
-                pre_source = "assumed_new_position"
                 try:
                     from trader.us.db.repos import load_us_positions_by_symbols
 
@@ -282,16 +280,24 @@ def route_order(
                     if db_pos:
                         pre_qty = int(db_pos.get("qty") or db_pos.get("holding_qty") or 0)
                         pre_source = db_pos.get("balance_source") or db_pos.get("entry_price_source") or "us_positions"
+                    else:
+                        # Only a successful DB lookup proving the symbol is absent may mark
+                        # the order as a new-position BUY with pre_order_position_qty=0.
+                        pre_qty = 0
+                        pre_source = "db_position_absent"
+                    meta["pre_order_position_qty"] = pre_qty
+                    meta["pre_order_position_source"] = pre_source
+                    meta["was_new_position_before_order"] = pre_qty == 0
                 except Exception as db_exc:
-                    pre_source = "pre_order_position_lookup_failed"
+                    # Lookup failure is not proof of no existing position. Do not write
+                    # pre_order_position_qty/was_new_position_before_order, otherwise
+                    # BUY balance reconcile could convert existing holdings into a false fill.
+                    meta["pre_order_position_source"] = "lookup_failed"
                     logger.warning(
                         "[US_ORDER][BUY_PRE_POSITION][WARN] symbol=%s error=%s",
                         symbol,
                         db_exc,
                     )
-                meta["pre_order_position_qty"] = pre_qty
-                meta["pre_order_position_source"] = pre_source
-                meta["was_new_position_before_order"] = pre_qty == 0
 
     # 5. Paper order via KIS
     if kis_client is None:

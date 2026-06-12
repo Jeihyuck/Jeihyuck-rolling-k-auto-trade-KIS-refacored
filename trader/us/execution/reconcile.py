@@ -301,11 +301,8 @@ def _buy_balance_reconcile_allowed(order: dict, *, current_qty: int, order_qty: 
             return True, f"position_delta source={source} pre_qty={pre_qty} current_qty={current_qty} delta={delta}", pre_qty
         return False, f"position_delta_insufficient source={source} pre_qty={pre_qty} current_qty={current_qty} delta={delta}", pre_qty
 
-    # Legacy ACK rows may not have a pre-order snapshot. To avoid converting existing
-    # holdings into false BUY fills, only accept the narrow new-position case where
-    # the current KIS quantity exactly equals the order quantity.
-    if current_qty == order_qty:
-        return True, "legacy_new_position_qty_equals_order", None
+    # Without an explicit pre-order snapshot (or explicit was_new_position metadata
+    # handled above), total current quantity is not safe evidence of a BUY fill.
     return False, "missing_pre_order_qty_snapshot", None
 
 def reconcile_ack_orders_with_balance(
