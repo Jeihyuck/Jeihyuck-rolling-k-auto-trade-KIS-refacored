@@ -66,7 +66,7 @@ _VALID_STATUSES = frozenset({
 
 def _get_engine():
     """SQLAlchemy engine을 가져온다."""
-    from trader.us.db.repos import get_engine
+    from trader.db.engine import get_engine
     return get_engine()
 
 

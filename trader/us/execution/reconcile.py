@@ -236,6 +236,78 @@ def _build_kis_position_by_symbol(positions: list[dict]) -> dict[str, dict]:
         }
     return by_symbol
 
+
+def _order_meta(order: dict) -> dict:
+    import json as _json
+
+    meta = order.get("meta") or {}
+    if isinstance(meta, dict):
+        return meta
+    if isinstance(meta, str) and meta.strip():
+        try:
+            parsed = _json.loads(meta)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _nested_get(row: dict, dotted_key: str):
+    cur = row
+    for part in dotted_key.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _extract_pre_order_position_qty(order: dict) -> tuple[int | None, str]:
+    meta = _order_meta(order)
+    candidates = [
+        (order, "pre_order_position_qty", "order_pre_order_position_qty"),
+        (order, "pre_order_qty", "order_pre_order_qty"),
+        (order, "pre_buy_position_qty", "order_pre_buy_position_qty"),
+        (order, "position_qty_before_order", "order_position_qty_before_order"),
+        (order, "position_qty_before", "order_position_qty_before"),
+        (order, "existing_position_qty", "order_existing_position_qty"),
+        (meta, "pre_order_position_qty", "meta_pre_order_position_qty"),
+        (meta, "pre_order_qty", "meta_pre_order_qty"),
+        (meta, "pre_buy_position_qty", "meta_pre_buy_position_qty"),
+        (meta, "position_qty_before_order", "meta_position_qty_before_order"),
+        (meta, "position_qty_before", "meta_position_qty_before"),
+        (meta, "existing_position_qty", "meta_existing_position_qty"),
+        (meta, "pre_order_position_snapshot.qty", "meta_pre_order_position_snapshot_qty"),
+    ]
+    for row, key, source in candidates:
+        value = _nested_get(row, key) if "." in key else row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return int(float(value)), source
+        except (TypeError, ValueError):
+            continue
+    if meta.get("was_new_position_before_order") is True or meta.get("pre_order_was_new_position") is True:
+        return 0, "meta_was_new_position"
+    return None, "missing"
+
+
+def _buy_balance_reconcile_allowed(order: dict, *, current_qty: int, order_qty: int) -> tuple[bool, str, int | None]:
+    pre_qty, source = _extract_pre_order_position_qty(order)
+    if order_qty <= 0:
+        return False, "invalid_order_qty", pre_qty
+    if pre_qty is not None:
+        delta = current_qty - pre_qty
+        if delta >= order_qty:
+            return True, f"position_delta source={source} pre_qty={pre_qty} current_qty={current_qty} delta={delta}", pre_qty
+        return False, f"position_delta_insufficient source={source} pre_qty={pre_qty} current_qty={current_qty} delta={delta}", pre_qty
+
+    # Legacy ACK rows may not have a pre-order snapshot. To avoid converting existing
+    # holdings into false BUY fills, only accept the narrow new-position case where
+    # the current KIS quantity exactly equals the order quantity.
+    if current_qty == order_qty:
+        return True, "legacy_new_position_qty_equals_order", None
+    return False, "missing_pre_order_qty_snapshot", None
+
 def reconcile_ack_orders_with_balance(
     *,
     provider: Any | None = None,
@@ -351,7 +423,7 @@ def reconcile_ack_orders_with_balance(
                     avg_price_usd=fill_price,
                     source="fills_reconcile",
                     trade_date=trade_date,
-                    meta=order.get("meta") if isinstance(order.get("meta"), dict) else None,
+                    meta=_order_meta(order),
                 )
                 confirmed_count += 1
             except Exception as exc:
@@ -361,20 +433,26 @@ def reconcile_ack_orders_with_balance(
                 )
             continue
 
-        # fill 미확인: BUY이면 KIS 잔고에 요청 수량 이상 생겼으면 balance reconcile
+        # fill 미확인: BUY이면 KIS 잔고 증가분으로만 balance reconcile
         if side == "BUY" and symbol in kis_position_by_symbol:
             position = kis_position_by_symbol[symbol]
             position_qty = int(position.get("qty") or 0)
             position_avg_price = float(position.get("avg_price") or 0.0)
             fill_price_candidate = position_avg_price if position_avg_price > 0 else fallback_fill_price
             price_source = "kis_balance_avg_price" if position_avg_price > 0 else fill_price_source
-            if qty > 0 and position_qty >= qty and fill_price_candidate > 0:
+            buy_allowed, buy_reason, pre_qty = _buy_balance_reconcile_allowed(
+                order,
+                current_qty=position_qty,
+                order_qty=qty,
+            )
+            if buy_allowed and fill_price_candidate > 0:
                 logger.info(
-                    "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=BUY qty=%d price_source=%s price=%.4f source=balance_reconcile_buy",
+                    "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=BUY qty=%d price_source=%s price=%.4f source=balance_reconcile_buy reason=%s",
                     symbol,
                     qty,
                     price_source,
                     fill_price_candidate,
+                    buy_reason,
                 )
                 try:
                     mark_order_filled_by_reconcile(
@@ -386,7 +464,7 @@ def reconcile_ack_orders_with_balance(
                         avg_price_usd=fill_price_candidate,
                         source="balance_reconcile_buy",
                         trade_date=trade_date,
-                        meta=order.get("meta") if isinstance(order.get("meta"), dict) else None,
+                        meta=_order_meta(order),
                     )
                     balance_reconcile_count += 1
                 except Exception as exc:
@@ -395,6 +473,15 @@ def reconcile_ack_orders_with_balance(
                         symbol, exc,
                     )
                 continue
+            logger.warning(
+                "[US_RECONCILE][BUY_BALANCE_RECONCILE][SKIP] symbol=%s order_no=%s qty=%d current_qty=%d pre_qty=%s reason=%s",
+                symbol,
+                order_no,
+                qty,
+                position_qty,
+                pre_qty,
+                buy_reason if fill_price_candidate > 0 else "missing_fill_price",
+            )
 
         # fill 미확인: SELL이면 KIS 잔고에 포지션 없으면 balance reconcile
         if side == "SELL" and symbol not in kis_position_symbols:
@@ -438,7 +525,7 @@ def reconcile_ack_orders_with_balance(
                     avg_price_usd=fallback_fill_price,
                     source="balance_reconcile_sell",
                     trade_date=trade_date,
-                    meta=order.get("meta") if isinstance(order.get("meta"), dict) else None,
+                    meta=_order_meta(order),
                 )
                 balance_reconcile_count += 1
             except Exception as exc:

@@ -536,7 +536,11 @@ jobs:
           trade_status="SKIPPED"
           block_reason="trade_pipeline_gate_failed"
 
-          if [ "${run_mode}" != "TRADE" ] || [ "${signal_only}" != "0" ]; then
+          if [ "${claimed}" != "1" ]; then
+            reason="duplicate_session_lock"
+            trade_status="SKIPPED_DUPLICATE_SESSION"
+            block_reason="duplicate_session_lock"
+          elif [ "${run_mode}" != "TRADE" ] || [ "${signal_only}" != "0" ]; then
             reason="signal_only"
             if [ "${order_allowed}" = "0" ] && [ "${kis_order_allowed}" = "0" ]; then
               reason="market_closed"

@@ -264,6 +264,35 @@ def route_order(
             "intent": intent,
         }
 
+    # Capture BUY pre-order position qty before KIS ACK so balance reconciliation
+    # can verify a same-symbol position delta instead of treating existing holdings
+    # as proof of fill.
+    if side == "BUY":
+        intent.setdefault("meta", {})
+        if isinstance(intent.get("meta"), dict):
+            meta = intent["meta"]
+            if "pre_order_position_qty" not in meta:
+                pre_qty = 0
+                pre_source = "assumed_new_position"
+                try:
+                    from trader.us.db.repos import load_us_positions_by_symbols
+
+                    db_positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                    db_pos = db_positions.get(symbol, {})
+                    if db_pos:
+                        pre_qty = int(db_pos.get("qty") or db_pos.get("holding_qty") or 0)
+                        pre_source = db_pos.get("balance_source") or db_pos.get("entry_price_source") or "us_positions"
+                except Exception as db_exc:
+                    pre_source = "pre_order_position_lookup_failed"
+                    logger.warning(
+                        "[US_ORDER][BUY_PRE_POSITION][WARN] symbol=%s error=%s",
+                        symbol,
+                        db_exc,
+                    )
+                meta["pre_order_position_qty"] = pre_qty
+                meta["pre_order_position_source"] = pre_source
+                meta["was_new_position_before_order"] = pre_qty == 0
+
     # 5. Paper order via KIS
     if kis_client is None:
         from trader.us.execution.kis_us_client import KisUSClient

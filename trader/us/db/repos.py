@@ -2121,11 +2121,12 @@ def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dic
 
             agent_row = conn.execute(
                 text("""
-                    SELECT run_id, status, finished_at
+                    SELECT run_id, status, finished_at, result
                     FROM us_agent_runs
                     WHERE trade_date = :td
                       AND (mode = 'session-afternoon' OR agent_name = 'afternoon')
                       AND status IN ('OK', 'OK_WITH_WARNINGS')
+                      AND COALESCE(result->>'trade_runner_started', '0') IN ('1', 'true', 'True')
                     ORDER BY started_at DESC
                     LIMIT 1
                 """),
