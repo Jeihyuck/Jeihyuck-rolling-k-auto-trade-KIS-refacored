@@ -731,35 +731,168 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
         return []
 
 
+def _parse_json_meta(value: Any) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _synthetic_reconcile_fill_meta(
+    *,
+    source: str,
+    order_no: str,
+    client_order_key: str,
+    side: str,
+    qty: int,
+    avg_price_usd: float,
+    base_meta: dict | None,
+) -> dict:
+    fill_meta = _parse_json_meta(base_meta)
+    fill_meta.update({
+        "source": source,
+        "synthetic_fill": True,
+        "reconcile_source": source,
+        "order_no": order_no,
+        "client_order_key": client_order_key,
+    })
+    cost_basis = _safe_float_meta(fill_meta, [
+        "cost_basis_price_usd",
+        "pre_sell_avg_cost",
+        "pre_sell_cost_basis_price_usd",
+    ])
+    if side.upper() == "SELL" and cost_basis and cost_basis > 0 and avg_price_usd > 0 and qty > 0:
+        realized = (float(avg_price_usd) - float(cost_basis)) * int(qty)
+        fill_meta.setdefault("cost_basis_price_usd", float(cost_basis))
+        fill_meta.setdefault("cost_basis_source", "pre_sell_position_snapshot")
+        fill_meta["realized_pnl_usd"] = round(realized, 4)
+        fill_meta["realized_pnl_pct"] = round(((float(avg_price_usd) - float(cost_basis)) / float(cost_basis)) * 100.0, 4)
+    return fill_meta
+
+
+def _safe_float_meta(meta: dict, keys: list[str]) -> float | None:
+    for key in keys:
+        value = meta.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    nested = meta.get("meta")
+    if isinstance(nested, dict):
+        for key in keys:
+            value = nested.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def mark_order_filled_by_reconcile(
     *,
     order_no: str,
     client_order_key: str,
+    symbol: str | None = None,
+    side: str | None = None,
     filled_qty: int,
     avg_price_usd: float,
     source: str = "balance_reconcile",
+    trade_date: str | None = None,
+    meta: dict | None = None,
 ) -> None:
-    """ACK 주문을 reconcile 기반으로 filled로 마킹한다.
+    """ACK 주문을 reconcile 기반으로 FILLED 마킹하고 us_fills synthetic fill을 저장한다.
 
-    us_orders.status = 'FILLED', us_fills에 synthetic fill 저장.
+    Reconcile은 KIS 체결조회가 일시 실패하더라도 잔고로 체결을 확정할 수 있으므로,
+    us_orders만 업데이트하면 sold_today_symbols / realized PnL 회계가 깨진다. 따라서
+    order update와 idempotent us_fills insert를 항상 같은 함수에서 수행한다.
     """
     from datetime import datetime, timezone
 
     now_utc = datetime.now(timezone.utc).isoformat()
+    td = trade_date or _today()
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_side = str(side or "").strip().upper()
+    qty = int(filled_qty or 0)
+    price = float(avg_price_usd or 0.0)
     engine = _get_engine_or_none()
 
+    def _enrich_from_order(order: dict) -> tuple[str, str, str, dict]:
+        order_symbol = normalized_symbol or str(order.get("symbol") or "").strip().upper()
+        order_side = normalized_side or str(order.get("side") or "").strip().upper()
+        exchange = str(order.get("exchange") or "NASDAQ")
+        order_meta = _parse_json_meta(order.get("meta"))
+        merged_meta = {**order_meta, **(meta or {})}
+        return order_symbol, order_side, exchange, merged_meta
+
     if engine is None:
-        # in-memory mock 환경
+        matched_order: dict | None = None
         for o in _MEM_ORDERS:
             if o.get("order_no") == order_no or o.get("client_order_key") == client_order_key:
                 o["status"] = "FILLED"
-                o["qty_filled"] = filled_qty
-                o["avg_price_usd"] = avg_price_usd
+                o["qty_filled"] = qty
+                o["avg_price_usd"] = price
+                o["updated_at"] = now_utc
+                matched_order = o
                 break
+        fill_symbol, fill_side, exchange, merged_meta = _enrich_from_order(matched_order or {})
+        if fill_symbol and fill_side and qty > 0:
+            fill = {
+                "trade_date": td,
+                "symbol": fill_symbol,
+                "exchange": exchange,
+                "side": fill_side,
+                "qty": qty,
+                "price_usd": price,
+                "order_no": order_no,
+                "client_order_key": client_order_key,
+                "filled_at": now_utc,
+                "meta": _synthetic_reconcile_fill_meta(
+                    source=source,
+                    order_no=order_no,
+                    client_order_key=client_order_key,
+                    side=fill_side,
+                    qty=qty,
+                    avg_price_usd=price,
+                    base_meta=merged_meta,
+                ),
+            }
+            save_fills([fill], trade_date=td)
+            logger.info(
+                "[US_FILLS][SYNTHETIC_RECONCILE_FILL][SAVE] symbol=%s side=%s qty=%d price=%.4f source=%s",
+                fill_symbol, fill_side, qty, price, source,
+            )
+        logger.info(
+            "[US_REPOS][MARK_FILLED_BY_RECONCILE] order_no=%s symbol=%s side=%s qty=%d price=%.4f source=%s",
+            order_no, fill_symbol, fill_side, qty, price, source,
+        )
         return
 
     try:
         with engine.begin() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT trade_date, symbol, exchange, side, meta
+                    FROM us_orders
+                    WHERE (order_no = :order_no OR client_order_key = :cok)
+                    ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                    LIMIT 1
+                """),
+                {"order_no": order_no, "cok": client_order_key},
+            ).fetchone()
+            order_row = dict(row._mapping) if row is not None else {}
+            fill_symbol, fill_side, exchange, merged_meta = _enrich_from_order(order_row)
+            if not trade_date and order_row.get("trade_date"):
+                td = str(order_row.get("trade_date"))
+
             conn.execute(
                 text("""
                     UPDATE us_orders
@@ -768,23 +901,71 @@ def mark_order_filled_by_reconcile(
                         avg_price_usd = :price,
                         updated_at = :ts
                     WHERE (order_no = :order_no OR client_order_key = :cok)
-                      AND status IN ('ACK', 'SENT')
+                      AND status IN ('ACK', 'SENT', 'FILLED')
                 """),
                 {
-                    "qty": filled_qty,
-                    "price": avg_price_usd,
+                    "qty": qty,
+                    "price": price,
                     "ts": now_utc,
                     "order_no": order_no,
                     "cok": client_order_key,
                 },
             )
+
+            if fill_symbol and fill_side and qty > 0:
+                fill_meta = _synthetic_reconcile_fill_meta(
+                    source=source,
+                    order_no=order_no,
+                    client_order_key=client_order_key,
+                    side=fill_side,
+                    qty=qty,
+                    avg_price_usd=price,
+                    base_meta=merged_meta,
+                )
+                fill = {
+                    "symbol": fill_symbol,
+                    "exchange": exchange,
+                    "side": fill_side,
+                    "qty": qty,
+                    "price_usd": price,
+                    "order_no": order_no,
+                    "client_order_key": client_order_key,
+                }
+                idempotency_key = _us_fill_idempotency_key_text(fill, td)
+                conn.execute(
+                    text("""
+                        INSERT INTO us_fills
+                            (trade_date, symbol, exchange, side, qty, price_usd,
+                             order_no, client_order_key, filled_at, meta, fill_idempotency_key)
+                        VALUES (:td, :symbol, :exchange, :side, :qty, :price,
+                                :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
+                        ON CONFLICT (fill_idempotency_key)
+                        DO UPDATE SET updated_at = NOW()
+                    """),
+                    {
+                        "td": td,
+                        "symbol": fill_symbol,
+                        "exchange": exchange,
+                        "side": fill_side,
+                        "qty": qty,
+                        "price": price,
+                        "order_no": order_no,
+                        "cok": client_order_key,
+                        "filled_at": now_utc,
+                        "meta": _json_param(fill_meta),
+                        "fill_idempotency_key": idempotency_key,
+                    },
+                )
+                logger.info(
+                    "[US_FILLS][SYNTHETIC_RECONCILE_FILL][SAVE] symbol=%s side=%s qty=%d price=%.4f source=%s",
+                    fill_symbol, fill_side, qty, price, source,
+                )
             logger.info(
-                "[US_REPOS][MARK_FILLED_BY_RECONCILE] order_no=%s cok=%s qty=%d price=%.4f source=%s",
-                order_no, client_order_key, filled_qty, avg_price_usd, source,
+                "[US_REPOS][MARK_FILLED_BY_RECONCILE] order_no=%s symbol=%s side=%s qty=%d price=%.4f source=%s",
+                order_no, fill_symbol, fill_side, qty, price, source,
             )
     except Exception as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
-
 
 def load_us_positions_by_symbols(
     symbols: list[str],
@@ -1786,11 +1967,13 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
             # us_agent_runs 완료 레코드만 확인 — buy_orders 체크 제거
             agent_row = conn.execute(
                 text("""
-                    SELECT run_id, status, finished_at
+                    SELECT run_id, status, finished_at, result
                     FROM us_agent_runs
                     WHERE trade_date = :td
                       AND (mode = 'session-am' OR agent_name = 'am')
-                      AND status IN ('OK', 'OK_WITH_WARNINGS')
+                      AND status = 'OK'
+                      AND COALESCE(result->>'trade_runner_started', '0') IN ('1', 'true', 'True')
+                      AND COALESCE(result->>'trade_status', status) = 'OK'
                     ORDER BY started_at DESC
                     LIMIT 1
                 """),
@@ -1805,7 +1988,7 @@ def check_us_am_already_ran(trade_date: str, timeout_sec: int = 5) -> dict:
                 return {
                     "already_ran": True,
                     "guard_status": "FOUND_AGENT_RUN",
-                    "reason": f"agent_run_status={agent_row[1]}",
+                    "reason": f"agent_run_status={agent_row[1]} runner_started=1",
                 }
 
             # buy_orders 체크를 already_ran에서 제거
@@ -1938,11 +2121,12 @@ def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dic
 
             agent_row = conn.execute(
                 text("""
-                    SELECT run_id, status, finished_at
+                    SELECT run_id, status, finished_at, result
                     FROM us_agent_runs
                     WHERE trade_date = :td
                       AND (mode = 'session-afternoon' OR agent_name = 'afternoon')
                       AND status IN ('OK', 'OK_WITH_WARNINGS')
+                      AND COALESCE(result->>'trade_runner_started', '0') IN ('1', 'true', 'True')
                     ORDER BY started_at DESC
                     LIMIT 1
                 """),
@@ -1957,7 +2141,7 @@ def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dic
                 return {
                     "already_ran": True,
                     "guard_status": "FOUND_AGENT_RUN",
-                    "reason": f"agent_run_status={agent_row[1]}",
+                    "reason": f"agent_run_status={agent_row[1]} runner_started=1",
                 }
 
             return {"already_ran": False, "guard_status": "NOT_FOUND", "reason": "no_prior_run"}

@@ -264,6 +264,41 @@ def route_order(
             "intent": intent,
         }
 
+    # Capture BUY pre-order position qty before KIS ACK so balance reconciliation
+    # can verify a same-symbol position delta instead of treating existing holdings
+    # as proof of fill.
+    if side == "BUY":
+        intent.setdefault("meta", {})
+        if isinstance(intent.get("meta"), dict):
+            meta = intent["meta"]
+            if "pre_order_position_qty" not in meta:
+                try:
+                    from trader.us.db.repos import load_us_positions_by_symbols
+
+                    db_positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                    db_pos = db_positions.get(symbol, {})
+                    if db_pos:
+                        pre_qty = int(db_pos.get("qty") or db_pos.get("holding_qty") or 0)
+                        pre_source = db_pos.get("balance_source") or db_pos.get("entry_price_source") or "us_positions"
+                    else:
+                        # Only a successful DB lookup proving the symbol is absent may mark
+                        # the order as a new-position BUY with pre_order_position_qty=0.
+                        pre_qty = 0
+                        pre_source = "db_position_absent"
+                    meta["pre_order_position_qty"] = pre_qty
+                    meta["pre_order_position_source"] = pre_source
+                    meta["was_new_position_before_order"] = pre_qty == 0
+                except Exception as db_exc:
+                    # Lookup failure is not proof of no existing position. Do not write
+                    # pre_order_position_qty/was_new_position_before_order, otherwise
+                    # BUY balance reconcile could convert existing holdings into a false fill.
+                    meta["pre_order_position_source"] = "lookup_failed"
+                    logger.warning(
+                        "[US_ORDER][BUY_PRE_POSITION][WARN] symbol=%s error=%s",
+                        symbol,
+                        db_exc,
+                    )
+
     # 5. Paper order via KIS
     if kis_client is None:
         from trader.us.execution.kis_us_client import KisUSClient
@@ -293,6 +328,8 @@ def route_order(
                     _pos_for_guard["holding_qty"] = _pos_for_guard["holding_qty"] or _db_pos.get("holding_qty") or _db_pos.get("qty")
                     _pos_for_guard["orderable_qty"] = _db_pos.get("orderable_qty") or _db_pos.get("qty")
                     _pos_for_guard["sellable_qty"] = _db_pos.get("sellable_qty") or _pos_for_guard["orderable_qty"]
+                    _pos_for_guard["avg_cost"] = _db_pos.get("avg_cost") or _db_pos.get("entry_price") or _db_pos.get("avg_price")
+                    _pos_for_guard["position_source"] = _db_pos.get("entry_price_source") or _db_pos.get("balance_source") or "us_positions"
             except Exception as _db_exc:
                 logger.warning("[US_ORDER][BALANCE_MATCH][WARN] db fallback failed: %s", _db_exc)
 
@@ -342,6 +379,40 @@ def route_order(
             intent.setdefault("meta", {})
             if isinstance(intent.get("meta"), dict):
                 intent["meta"]["sell_qty_clamped"] = True
+
+    if side == "SELL":
+        intent.setdefault("meta", {})
+        if isinstance(intent.get("meta"), dict):
+            meta = intent["meta"]
+            cost_basis = (
+                intent.get("avg_cost")
+                or intent.get("entry_price")
+                or intent.get("avg_price")
+                or meta.get("entry_price")
+                or meta.get("avg_cost")
+                or meta.get("avg_price")
+                or (_pos_for_guard.get("avg_cost") if "_pos_for_guard" in locals() else None)
+            )
+            try:
+                cost_basis_float = float(cost_basis) if cost_basis not in (None, "") else 0.0
+            except (TypeError, ValueError):
+                cost_basis_float = 0.0
+            if cost_basis_float > 0:
+                meta.setdefault("cost_basis_price_usd", cost_basis_float)
+                meta.setdefault("cost_basis_source", "pre_sell_position_snapshot")
+                meta.setdefault("pre_sell_avg_cost", cost_basis_float)
+                pre_sell_qty = (
+                    intent.get("holding_qty")
+                    or intent.get("available_qty")
+                    or meta.get("holding_qty")
+                    or (_pos_for_guard.get("holding_qty") if "_pos_for_guard" in locals() else None)
+                )
+                if pre_sell_qty not in (None, ""):
+                    meta.setdefault("pre_sell_qty", pre_sell_qty)
+                meta.setdefault(
+                    "pre_sell_position_source",
+                    (_pos_for_guard.get("position_source") if "_pos_for_guard" in locals() else None) or "pre_sell_position_snapshot",
+                )
 
     logger.info("[US_ORDER][SEND] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
@@ -396,7 +467,7 @@ def route_order(
         "order_no": order_no,
         "status": "ACK",
         "dry_run": False,
-        "meta": {"raw_response": resp},
+        "meta": {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp},
     }
 
     ack_db_saved = False

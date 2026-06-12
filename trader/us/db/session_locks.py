@@ -66,9 +66,25 @@ _VALID_STATUSES = frozenset({
 
 def _get_engine():
     """SQLAlchemy engine을 가져온다."""
-    from trader.us.db.repos import get_engine
+    from trader.db.engine import get_engine
     return get_engine()
 
+
+
+def _metadata_runner_started(existing: dict | None) -> str:
+    metadata = (existing or {}).get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if "trade_runner_started" in metadata:
+        return str(metadata.get("trade_runner_started"))
+    if "runner_started" in metadata:
+        return str(metadata.get("runner_started"))
+    return "unknown"
 
 def claim_us_session_lock(
     env: str,
@@ -181,9 +197,10 @@ def claim_us_session_lock(
                 return False, existing
 
         if (
-            existing_status in {"FAILED_RETRYABLE", "CANCELLED", "FAILED"}
-            and event_name == "workflow_dispatch"
-            and manual_confirm_ok
+            (existing_status in {"FAILED_RETRYABLE", "CANCELLED", "FAILED"}
+             and event_name == "workflow_dispatch" and manual_confirm_ok)
+            or (existing_status in {"DONE_WITH_WARNINGS", "DONE"}
+                and _metadata_runner_started(existing) in {"0", "false", "False"})
         ):
             logger.info(
                 "[US_SESSION_LOCK][ALLOW_MANUAL_RETRY] previous_status=%s",
@@ -341,7 +358,7 @@ def _take_over_existing_lock(
                       AND env = :env
                       AND trade_date = :trade_date
                       AND session = :session
-                      AND status IN ('FAILED_RETRYABLE', 'CANCELLED', 'FAILED')
+                      AND status IN ('FAILED_RETRYABLE', 'CANCELLED', 'FAILED', 'DONE_WITH_WARNINGS', 'DONE')
                 """),
                 {
                     "run_id": github_run_id or "",

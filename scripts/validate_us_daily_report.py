@@ -222,7 +222,7 @@ def validate_report(
             pnl_status = str(pnl_payload.get("status", "UNKNOWN"))
             if pnl_status not in {"OK", "OK_WITH_WARNINGS", "PARTIAL", "FAILED_PNL_REPORT"}:
                 fatals.append(f"invalid_pnl_status={pnl_status}")
-            if pnl_payload.get("realized_pnl_source") not in {"db_fills_daily", "unavailable"}:
+            if pnl_payload.get("realized_pnl_source") not in {"db_fills_daily", "sell_fill_cost_basis", "unavailable"}:
                 fatals.append("invalid_realized_pnl_source")
             if pnl_payload.get("realized_pnl_source") != "unavailable" and pnl_payload.get("kis_account_realized_pnl_raw") == pnl_payload.get("realized_pnl_usd"):
                 fatals.append("realized_pnl_direct_from_kis_raw")

@@ -558,7 +558,7 @@ jobs:
           elif [ "${force_now_set}" = "1" ]; then
             reason="force_now_smoke"
             block_reason="force_now_smoke"
-          elif [ "${phase_should_run}" = "1" ] && [ "${run_mode}" = "TRADE" ] && [ "${signal_only}" = "0" ] && [ "${order_allowed}" = "1" ] && [ "${kis_order_allowed}" = "1" ]; then
+          elif [ "${phase_should_run}" = "1" ] && [ "${run_mode}" = "TRADE" ] && [ "${signal_only}" = "0" ] && [ "${order_allowed}" = "1" ] && [ "${kis_order_allowed}" = "1" ] && [ "${dry_run_flag}" = "false" ] && [ "${offline_flag}" = "false" ] && [ "${smoke_loop_flag}" = "false" ] && [ "${force_now_set}" = "0" ]; then
             expected_to_trade=1
             reason="trade_allowed"
             trade_status="READY"
@@ -572,6 +572,7 @@ jobs:
           echo "US_KIS_ORDER_ALLOWED=${kis_order_allowed}" >> "$GITHUB_ENV"
           echo "US_TRADE_STATUS=${trade_status}" >> "$GITHUB_ENV"
           echo "US_TRADE_RUNNER_BLOCK_REASON=${block_reason}" >> "$GITHUB_ENV"
+          echo "[US_TRADE_AM][INTENT_EXPECTATION] trade_intent_expected=${expected_to_trade}" | tee -a artifacts/${US_LOG_FILE}
           echo "[US_TRADE_AM][EXPECTATION] expected_to_trade=${expected_to_trade} event=${event_name} phase_should_run=${phase_should_run} run_mode=${run_mode} order_allowed=${order_allowed} kis_order_allowed=${kis_order_allowed} dry_run=${dry_run_flag} offline_mode=${offline_flag} signal_only=${signal_only} smoke_loop=${smoke_loop_flag} force_now_set=${force_now_set} reason=${reason}" | tee -a artifacts/${US_LOG_FILE}
 
       - name: Emit AM session lock skip summary
@@ -874,7 +875,7 @@ jobs:
           } | tee -a artifacts/${US_LOG_FILE}
 
       - name: Run US AM trade session
-        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.already_ran.outputs.already_ran != '1' && steps.final_duplicate_guard.outputs.already_ran != '1'
+        if: steps.expectation.outputs.expected_to_trade == '1' && steps.db_migrate.outcome == 'success' && steps.session_lock.outputs.claimed == '1' && steps.already_ran.outputs.already_ran != '1' && steps.final_duplicate_guard.outputs.already_ran != '1'
         id: trade_session
         continue-on-error: true
         timeout-minutes: 190
@@ -952,7 +953,7 @@ jobs:
 
             echo "[US_RISK_CONFIG] US_MAX_ORDER_USD=${US_MAX_ORDER_USD} US_MAX_DAILY_NOTIONAL_USD=${US_MAX_DAILY_NOTIONAL_USD} US_MAX_POSITIONS=${US_MAX_POSITIONS} US_MAX_POSITION_WEIGHT=${US_MAX_POSITION_WEIGHT} US_MIN_CASH_BUFFER_USD=${US_MIN_CASH_BUFFER_USD}"
             echo "[US_TRADE_AM][START]"
-            echo "[US_TRADE_RUNNER][START] session=am"
+            echo "[US_TRADE_AM][TRADE_RUNNER][START] session=am"
             echo "[US_TRADE_AM][ENV] DRY_RUN=${DRY_RUN} OFFLINE_FLAG=${OFFLINE_FLAG}"
             echo "[US_TRADE_AM][RUN_MODE] US_RUN_MODE=${US_RUN_MODE} US_SIGNAL_ONLY=${US_SIGNAL_ONLY} US_KIS_ORDER_ALLOWED=${US_KIS_ORDER_ALLOWED}"
             echo "[US_TRADE_AM][MANUAL_FLAGS] FORCE_NOW_FLAG=${FORCE_NOW_FLAG} MAX_TICKS_FLAG=${MAX_TICKS_FLAG} MAX_MINUTES=${MAX_MINUTES} INTERVAL_SEC=${INTERVAL_SEC}"
