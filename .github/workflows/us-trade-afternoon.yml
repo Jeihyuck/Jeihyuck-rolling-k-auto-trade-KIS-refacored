@@ -3,11 +3,6 @@ name: "US Trade Afternoon"
 # workflow starts on schedule, checks prep, and executes the afternoon session before PnL
 
 "on":
-  schedule:
-    # Scheduled trigger: 13:03 ET (offset from the hour to reduce GitHub Actions delay risk). Trade session window: 13:00~15:50 ET.
-    - cron: "03 13 * * 1-5"
-      timezone: "America/New_York"
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York trigger_et=1303 session_window=1300-1550
   workflow_dispatch:
     inputs:
       dry_run:
@@ -71,6 +66,10 @@ jobs:
     timeout-minutes: 235
 
     env:
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      STRATEGY_MODE: "INTENT_ONLY"
+      FORCE_STRATEGY_MODE: "INTENT_ONLY"
       TZ: America/New_York
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
@@ -135,7 +134,7 @@ jobs:
       US_ENTRY_EVAL_TIMEOUT_SEC: "120"
       US_TICK_TIMEOUT_SEC: "150"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '0' }}
+      DRY_RUN: "1"
       US_EVENT_NAME: ${{ github.event_name }}
       US_RUN_ID: ${{ github.run_id }}
       US_RUN_ATTEMPT: ${{ github.run_attempt }}

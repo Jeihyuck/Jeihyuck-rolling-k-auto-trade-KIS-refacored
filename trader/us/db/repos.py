@@ -16,6 +16,7 @@ import logging
 import os
 import time
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -1325,6 +1326,64 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
         logger.error("[US_PREP_STATUS][LOAD][ERROR] %s elapsed_ms=%d", exc, elapsed_ms)
         # Re-raise DB errors so guard scripts can distinguish from empty results
         raise RuntimeError(f"US prep status load DB error: {exc}") from exc
+
+
+def _load_us_prep_status_runtime_fallback(trade_date: str) -> dict | None:
+    """Load prep status sidecar written by the US prep runner, if present."""
+    status_file = Path("runtime") / "us" / "prep_status" / str(trade_date) / "prep_status.json"
+    if not status_file.exists():
+        return None
+
+    payload = json.loads(status_file.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return None
+
+    status = payload.get("status") or payload.get("prep_status") or "UNKNOWN"
+    return {
+        "run_id": payload.get("run_id"),
+        "status": status,
+        "trade_date": payload.get("trade_date") or payload.get("as_of") or str(trade_date),
+        "result": {
+            "trade_can_proceed": payload.get("trade_can_proceed"),
+            "score_contract_ok": payload.get("score_contract_ok", payload.get("contract_ok")),
+            "status_ok": payload.get("status_ok"),
+            "locked_count": payload.get("locked_count"),
+            "watchlist_rows": payload.get("watchlist_rows"),
+            "final30_rows": payload.get("final30_rows"),
+            "score_nonzero_count": payload.get("score_nonzero_count"),
+        },
+        "source": "runtime_prep_status_json",
+    }
+
+
+def load_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict | None:
+    """Load US prep status for daily reports.
+
+    This non-fatal loader keeps the daily report path resilient: it first tries
+    the DB-backed latest prep status, then falls back to the runtime sidecar
+    written by ``prep_runner``. DB errors are logged as warnings and do not
+    prevent the runtime fallback from being used.
+    """
+    try:
+        result = load_latest_us_prep_status(trade_date, timeout_sec=timeout_sec)
+        if result:
+            return result
+    except Exception as exc:
+        logger.warning(
+            "[US_PREP_STATUS][LOAD][FALLBACK] db_load_failed trade_date=%s error=%s",
+            trade_date,
+            exc,
+        )
+
+    try:
+        return _load_us_prep_status_runtime_fallback(trade_date)
+    except Exception as exc:
+        logger.warning(
+            "[US_PREP_STATUS][LOAD][FALLBACK][WARN] runtime_load_failed trade_date=%s error=%s",
+            trade_date,
+            exc,
+        )
+        return None
 
 
 def clear_and_save_locked_us_watchlist(

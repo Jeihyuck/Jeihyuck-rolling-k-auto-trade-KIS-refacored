@@ -57,11 +57,11 @@ env:
   PB1_SESSION_EXIT_GRACE_SEC: "15"
   PB1_TICK_HARD_TIMEOUT_SEC: "45"
 
-  STRATEGY_MODE: "LIVE"
-  FORCE_STRATEGY_MODE: "LIVE"
-  DRY_RUN: "0"
-  DISABLE_LIVE_TRADING: "0"
-  LIVE_TRADING_ENABLED: "1"
+  STRATEGY_MODE: "INTENT_ONLY"
+  FORCE_STRATEGY_MODE: "INTENT_ONLY"
+  DRY_RUN: "1"
+  DISABLE_LIVE_TRADING: "1"
+  LIVE_TRADING_ENABLED: "0"
   FORCE_BLOCK_LIVE: "0"
   ALLOW_LIVE_GATE: "1"
   KIS_HTTP_ENABLED: "1"
@@ -578,8 +578,8 @@ jobs:
           PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           PB1_ORDER_BLOCK_REASON: ${{ steps.order_mode_guard.outputs.reason }}
           NO_TRADE: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
-          DISABLE_LIVE_TRADING: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
-          LIVE_TRADING_ENABLED: ${{ steps.trading_day_guard.outputs.is_trading_day }}
+          DISABLE_LIVE_TRADING: "1"
+          LIVE_TRADING_ENABLED: "0"
           KIS_HTTP_ENABLED: "1"
         run: |
           set -euo pipefail

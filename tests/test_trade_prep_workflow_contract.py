@@ -41,10 +41,7 @@ def test_prep_timeout_is_90():
     )
 
 
-def test_prep_cron_starts_at_22_utc():
-    """07:00 KST = 22:00 UTC"""
-    import re
+def test_prep_has_no_schedule_and_keeps_dispatch():
     content = _content()
-    assert re.search(r'cron:\s*"0 22 \* \* \*"', content), (
-        "trade-prep.yml should run at 22:00 UTC (= 07:00 KST)"
-    )
+    assert "schedule:" not in content, "trade-prep.yml must not have schedule trigger"
+    assert "workflow_dispatch:" in content, "trade-prep.yml must keep workflow_dispatch"

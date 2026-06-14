@@ -29,46 +29,26 @@ def _read(name: str) -> str:
 
 
 class TestScheduleTimezone:
-    def test_prep_single_cron(self):
-        """prep: GitHub 지연 대비 다중 prewarm cron(8개)이어야 한다.
-
-        UTC multi-cron 방식: EDT(10 UTC)와 EST(11 UTC) 각 4개씩 총 8개.
-        cancel-in-progress=false로 기존 prep을 kill하지 않는다.
-        """
-        content = _read("us-trade-prep.yml")
-        cron_matches = re.findall(r"^\s+- cron:", content, re.MULTILINE)
-        assert len(cron_matches) == 8, f"prep has {len(cron_matches)} crons, expected 8 (multi prewarm UTC)"
-
-    def test_am_single_cron(self):
-        content = _read("us-trade-am.yml")
-        cron_matches = re.findall(r"^\s+- cron:", content, re.MULTILINE)
-        assert len(cron_matches) == 1, f"am has {len(cron_matches)} crons, expected 1"
-
-    def test_afternoon_single_cron(self):
-        content = _read("us-trade-afternoon.yml")
-        cron_matches = re.findall(r"^\s+- cron:", content, re.MULTILINE)
-        assert len(cron_matches) == 1, f"afternoon has {len(cron_matches)} crons, expected 1"
-
-    def test_close_single_cron(self):
-        content = _read("us-trade-close.yml")
-        cron_matches = re.findall(r"^\s+- cron:", content, re.MULTILINE)
-        assert len(cron_matches) == 1, f"close has {len(cron_matches)} crons, expected 1"
-
-    def test_timezone_present_in_all_session_workflows(self):
-        """am/afternoon/close workflow에 timezone: America/New_York이 있어야 한다.
-
-        prep은 UTC 다중 cron 방식을 사용하므로 timezone 필드가 없어도 된다.
-        """
-        timezone_workflows = [
-            "us-trade-am.yml",
-            "us-trade-afternoon.yml",
-            "us-trade-close.yml",
-        ]
-        for name in timezone_workflows:
+    def test_order_capable_us_workflows_have_no_schedule(self):
+        """WSL 이전 후 US 주문 가능 workflow에는 GitHub schedule이 없어야 한다."""
+        for name in _US_SESSION_WORKFLOWS:
             content = _read(name)
-            assert 'timezone: "America/New_York"' in content, (
-                f"{name} missing timezone: America/New_York"
-            )
+            assert "schedule:" not in content, f"{name} must not have schedule trigger"
+            assert "workflow_dispatch:" in content, f"{name} must keep workflow_dispatch"
+
+    def test_us_workflows_default_to_safe_manual_mode(self):
+        """수동 실행은 기본 DRY_RUN/INTENT_ONLY 안전모드여야 한다."""
+        expected = (
+            'DRY_RUN: "1"',
+            'DISABLE_LIVE_TRADING: "1"',
+            'LIVE_TRADING_ENABLED: "0"',
+            'STRATEGY_MODE: "INTENT_ONLY"',
+            'FORCE_STRATEGY_MODE: "INTENT_ONLY"',
+        )
+        for name in _US_SESSION_WORKFLOWS:
+            content = _read(name)
+            for marker in expected:
+                assert marker in content, f"{name} missing {marker}"
 
     def test_no_dual_cron_strings(self):
         """dualcron, crons=2, edt_est_dualcron 문자열이 없어야 한다."""
@@ -81,7 +61,6 @@ class TestScheduleTimezone:
     def test_dispatcher_has_no_schedule(self):
         """dispatcher에 schedule 트리거가 없어야 한다."""
         content = _read(_DISPATCHER_WORKFLOW)
-        # schedule: 라인이 있으면 안 된다 (workflow_dispatch는 허용)
         assert "schedule:" not in content, "dispatcher must not have schedule trigger"
 
     def test_cancel_in_progress_contract(self):
@@ -104,23 +83,9 @@ class TestScheduleTimezone:
 
 
 class TestScheduleConfigLog:
-    def test_schedule_config_comment_present(self):
-        """각 workflow에 schedule_mode 주석이 있어야 한다.
-
-        - prep: schedule_mode=utc_multi_cron (8 UTC crons, EDT+EST prewarm)
-        - am/afternoon/close: schedule_mode=timezone_single_cron (America/New_York)
-        """
-        prep_content = _read("us-trade-prep.yml")
-        assert "utc_multi_cron" in prep_content, (
-            "us-trade-prep.yml missing utc_multi_cron comment/log"
-        )
-        timezone_workflows = [
-            "us-trade-am.yml",
-            "us-trade-afternoon.yml",
-            "us-trade-close.yml",
-        ]
-        for name in timezone_workflows:
-            content = _read(name)
-            assert "timezone_single_cron" in content, (
-                f"{name} missing timezone_single_cron comment/log"
-            )
+    def test_schedule_removed_runbook_exists(self):
+        """스케줄 제거 후 WSL runbook이 운영 기준을 문서화해야 한다."""
+        runbook = Path("docs/WSL_KR_US_SCHEDULE_RUNBOOK.md").read_text(encoding="utf-8")
+        assert "GitHub Actions schedule" in runbook
+        assert "run-us-trader.sh" in runbook
+        assert "run-kr-trader.sh" in runbook
