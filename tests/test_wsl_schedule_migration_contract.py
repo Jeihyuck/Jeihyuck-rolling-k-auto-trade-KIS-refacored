@@ -88,3 +88,8 @@ def test_us_wsl_scripts_preserve_workflow_entrypoints_and_env_defaults():
     ):
         assert key in am, f"run-us-am.sh missing {key}"
         assert key in afternoon, f"run-us-afternoon.sh missing {key}"
+
+
+def test_us_dryrun_forwards_session_argument_to_dispatcher():
+    text = Path("scripts/wsl/run-us-dryrun.sh").read_text(encoding="utf-8")
+    assert 'run-us-trader.sh "$@"' in text
