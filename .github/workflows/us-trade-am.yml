@@ -4,11 +4,6 @@ name: "US Trade AM"
 # AM must not run prep itself. If prep is missing or invalid, fail with FAILED_PREP_GUARD.
 
 "on":
-  schedule:
-    # Scheduled trigger: 09:30 ET. Trade session window: 09:30~12:30 ET.
-    - cron: "30 9 * * 1-5"
-      timezone: "America/New_York"
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York trigger_et=0930 session_window=0930-1230
   workflow_dispatch:
     inputs:
       dry_run:
@@ -90,6 +85,10 @@ jobs:
     timeout-minutes: 220
 
     env:
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      STRATEGY_MODE: "INTENT_ONLY"
+      FORCE_STRATEGY_MODE: "INTENT_ONLY"
       TZ: America/New_York
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
@@ -154,7 +153,7 @@ jobs:
       US_ENTRY_EVAL_TIMEOUT_SEC: "120"
       US_TICK_TIMEOUT_SEC: "150"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '0' }}
+      DRY_RUN: "1"
       US_EVENT_NAME: ${{ github.event_name }}
       US_RUN_ID: ${{ github.run_id }}
       US_RUN_ATTEMPT: ${{ github.run_attempt }}

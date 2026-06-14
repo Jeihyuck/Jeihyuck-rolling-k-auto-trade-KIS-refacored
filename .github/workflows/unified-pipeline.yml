@@ -134,6 +134,7 @@ permissions:
   contents: read
 
 env:
+  FORCE_STRATEGY_MODE: "INTENT_ONLY"
   STRATEGY_ENV: practice
   KIS_ENV: practice
   WATCHLIST_FINAL_STRATEGY_KEY: "pb1_watchlist_final_scored"
@@ -310,13 +311,13 @@ jobs:
       API_BASE_URL: ${{ secrets.KIS_REST_URL }}
       MODE: ${{ needs.resolve.outputs.run_mode }}
       MANUAL_MODE: ${{ inputs.mode }}
-      STRATEGY_MODE: ${{ needs.resolve.outputs.strategy_mode }}
+      STRATEGY_MODE: "INTENT_ONLY"
       ALLOW_LIVE_GATE: ${{ needs.resolve.outputs.allow_live_gate }}
       FORCE_BLOCK_LIVE: ${{ needs.resolve.outputs.force_block_live }}
       DRYRUN: ${{ needs.resolve.outputs.dryrun }}
-      DRY_RUN: ${{ needs.resolve.outputs.dry_run }}
-      DISABLE_LIVE_TRADING: ${{ needs.resolve.outputs.disable_live_trading }}
-      LIVE_TRADING_ENABLED: ${{ needs.resolve.outputs.live_trading_enabled }}
+      DRY_RUN: "1"
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
       KIS_HTTP_ENABLED: ${{ needs.resolve.outputs.kis_http_enabled }}
       NO_TRADE: ${{ needs.resolve.outputs.no_trade }}
       FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.FORCE_RUN || '0' }}

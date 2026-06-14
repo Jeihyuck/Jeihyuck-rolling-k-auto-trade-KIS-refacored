@@ -5,18 +5,6 @@ name: "US Trade Prep"
 # Multi-prewarm crons (UTC) cover EDT=10:00 UTC and EST=11:00 UTC.
 
 "on":
-  schedule:
-    # UTC multi-prewarm: EDT 05:50-06:20 ET (09:50-10:20 UTC)
-    - cron: "50 9 * * 1-5"    # EDT 05:50 ET prewarm
-    - cron: "0 10 * * 1-5"    # EDT 06:00 ET primary
-    - cron: "10 10 * * 1-5"   # EDT 06:10 ET recovery
-    - cron: "20 10 * * 1-5"   # EDT 06:20 ET recovery
-    # UTC multi-prewarm: EST 05:50-06:20 ET (10:50-11:20 UTC)
-    - cron: "50 10 * * 1-5"   # EST 05:50 ET prewarm
-    - cron: "0 11 * * 1-5"    # EST 06:00 ET primary
-    - cron: "10 11 * * 1-5"   # EST 06:10 ET recovery
-    - cron: "20 11 * * 1-5"   # EST 06:20 ET recovery
-    # [US_SCHEDULE][CONFIG] schedule_mode=utc_multi_cron crons=8 primary_et=0600
   workflow_dispatch:
     inputs:
       dry_run:
@@ -65,6 +53,10 @@ jobs:
     timeout-minutes: 60
 
     env:
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      STRATEGY_MODE: "INTENT_ONLY"
+      FORCE_STRATEGY_MODE: "INTENT_ONLY"
       TZ: America/New_York
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
@@ -113,7 +105,7 @@ jobs:
 
       US_SESSION_INTERVAL_SEC: "300"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      DRY_RUN: "1"
 
       US_LOG_FILE: "us-trade-prep.log"
       US_ARTIFACT_NAME: "us-trade-prep"

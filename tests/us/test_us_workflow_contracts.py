@@ -50,7 +50,7 @@ def test_us_agent_yml_no_schedule():
         assert "schedule" not in trigger, "us-agent.yml must not have schedule trigger"
 
 
-def test_us_trade_am_has_schedule():
+def test_us_trade_am_has_no_schedule_and_has_dispatch():
     try:
         import yaml
     except ImportError:
@@ -61,7 +61,8 @@ def test_us_trade_am_has_schedule():
         data = yaml.safe_load(f)
 
     trigger = data.get("on", data.get(True, {}))
-    assert "schedule" in trigger, "us-trade-am.yml must have schedule trigger"
+    assert "schedule" not in trigger, "us-trade-am.yml must not have schedule trigger"
+    assert "workflow_dispatch" in trigger, "us-trade-am.yml must keep workflow_dispatch trigger"
 
 
 def test_us_trade_workflows_have_safety_env():

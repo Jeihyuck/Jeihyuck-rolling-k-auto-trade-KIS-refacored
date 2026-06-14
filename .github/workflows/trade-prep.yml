@@ -1,10 +1,6 @@
 name: Trade Prep (KST 06:20)
 
 "on":
-  schedule:
-    # KST Mon-Fri 06:20 = UTC Sun-Thu 21:20
-    # Run early enough so final30_scored is ready before 09:00 KST market open.
-    - cron: "20 21 * * 0-4"
   workflow_dispatch:
     inputs:
       STRATEGY_ENV:
@@ -23,6 +19,10 @@ permissions:
   contents: read
 
 env:
+  DRY_RUN: "1"
+  DISABLE_LIVE_TRADING: "1"
+  LIVE_TRADING_ENABLED: "0"
+  FORCE_STRATEGY_MODE: "INTENT_ONLY"
   EXPECTED_BRANCH: "dual-agent"
   STRATEGY_ENV: practice
   KIS_ENV: practice
@@ -51,7 +51,7 @@ env:
   PB1_WATCHLIST_SAVE_ALIAS_LEGACY: "1"
   PREP_REQUIRE_SCORED_FINAL30: "1"
   PREP_FINAL30_EXACT_ROWS: "30"
-  STRATEGY_MODE: DIAG
+  STRATEGY_MODE: "INTENT_ONLY"
   KIS_HTTP_ENABLED: "0"
   ALLOW_KIS_DATA_HTTP_IN_DIAG: "1"
   NO_TRADE: "1"

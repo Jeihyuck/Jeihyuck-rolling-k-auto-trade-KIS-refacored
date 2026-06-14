@@ -50,53 +50,32 @@ def repos_text():
 # 1. 다중화 cron 수 확인
 # ---------------------------------------------------------------------------
 
-def test_prep_has_multiple_crons(prep_text):
-    """us-trade-prep.yml cron 스케줄이 8개(UTC multi-prewarm)여야 한다.
-
-    GitHub Actions schedule 지연 대비 EDT+EST 각 4개씩 총 8개 UTC cron.
-    cancel-in-progress: false로 기존 prep 실행을 kill하지 않는다.
-    """
-    cron_matches = re.findall(r"""cron:\s*['"][\d\s*\-/,]+['"]""", prep_text)
-    assert len(cron_matches) == 8, (
-        f"us-trade-prep.yml cron 수={len(cron_matches)} != 8. "
-        "UTC multi-prewarm cron 8개가 설정됐는지 확인하세요."
-    )
-    assert "cancel-in-progress: false" in prep_text, (
-        "us-trade-prep.yml cancel-in-progress must be false (do not kill running prep)"
-    )
-    assert "utc_multi_cron" in prep_text, (
-        "us-trade-prep.yml에 utc_multi_cron schedule_mode 주석이 없습니다."
-    )
+def test_us_trade_workflows_have_no_crons(prep_text, am_text, afternoon_text):
+    """주문 가능 US workflow는 GitHub Actions schedule을 가지면 안 된다."""
+    for name, text in {
+        "us-trade-prep.yml": prep_text,
+        "us-trade-am.yml": am_text,
+        "us-trade-afternoon.yml": afternoon_text,
+    }.items():
+        assert "schedule:" not in text, f"{name} must not have schedule trigger"
+        assert "workflow_dispatch:" in text, f"{name} must keep workflow_dispatch"
 
 
-def test_am_has_multiple_crons(am_text):
-    """us-trade-am.yml cron 스케줄이 1개(timezone-aware single cron)여야 한다.
-
-    EDT/EST dual-cron 방식에서 timezone: America/New_York 방식으로 변경됨.
-    """
-    cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", am_text)
-    assert len(cron_matches) == 1, (
-        f"us-trade-am.yml cron 수={len(cron_matches)} != 1. "
-        "timezone-aware single cron이 설정됐는지 확인하세요."
-    )
-    assert 'timezone: "America/New_York"' in am_text, (
-        "us-trade-am.yml에 timezone: America/New_York이 없습니다."
-    )
-
-
-def test_afternoon_has_multiple_crons(afternoon_text):
-    """us-trade-afternoon.yml cron 스케줄이 1개(timezone-aware single cron)여야 한다.
-
-    EDT/EST dual-cron 방식에서 timezone: America/New_York 방식으로 변경됨.
-    """
-    cron_matches = re.findall(r"cron:\s*['\"][\d\s\*\-/,]+['\"]", afternoon_text)
-    assert len(cron_matches) == 1, (
-        f"us-trade-afternoon.yml cron 수={len(cron_matches)} != 1. "
-        "timezone-aware single cron이 설정됐는지 확인하세요."
-    )
-    assert 'timezone: "America/New_York"' in afternoon_text, (
-        "us-trade-afternoon.yml에 timezone: America/New_York이 없습니다."
-    )
+def test_us_trade_workflows_default_to_safe_mode(prep_text, am_text, afternoon_text):
+    """GitHub 수동 실행 기본값은 주문 불가 안전모드여야 한다."""
+    for name, text in {
+        "us-trade-prep.yml": prep_text,
+        "us-trade-am.yml": am_text,
+        "us-trade-afternoon.yml": afternoon_text,
+    }.items():
+        for expected in (
+            'DRY_RUN: "1"',
+            'DISABLE_LIVE_TRADING: "1"',
+            'LIVE_TRADING_ENABLED: "0"',
+            'STRATEGY_MODE: "INTENT_ONLY"',
+            'FORCE_STRATEGY_MODE: "INTENT_ONLY"',
+        ):
+            assert expected in text, f"{name} missing safe env {expected}"
 
 
 # ---------------------------------------------------------------------------
