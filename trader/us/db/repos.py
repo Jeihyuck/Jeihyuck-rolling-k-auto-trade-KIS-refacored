@@ -1327,6 +1327,11 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
         raise RuntimeError(f"US prep status load DB error: {exc}") from exc
 
 
+def load_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
+    """Backward-compatible alias for daily report prep status loading."""
+    return load_latest_us_prep_status(trade_date=trade_date, timeout_sec=timeout_sec)
+
+
 def clear_and_save_locked_us_watchlist(
     entries: list[dict],
     trade_date: str,
@@ -2305,4 +2310,3 @@ def load_latest_us_buy_fills_by_symbols(
     except Exception as exc:
         logger.warning("[US_DB][load_latest_us_buy_fills_by_symbols][WARN] %s", exc)
         return {}
-
