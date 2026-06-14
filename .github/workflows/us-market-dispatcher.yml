@@ -42,6 +42,10 @@ jobs:
     timeout-minutes: 30
 
     env:
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      STRATEGY_MODE: "INTENT_ONLY"
+      FORCE_STRATEGY_MODE: "INTENT_ONLY"
       TZ: America/New_York
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
@@ -191,7 +195,7 @@ jobs:
         if: steps.phase.outputs.mode != 'skip'
         working-directory: repo
         env:
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+          DRY_RUN: "1"
           US_DISPATCHER_SINGLE_TICK: "1"
           US_SESSION_SHUTDOWN_BUFFER_SEC: "120"
         run: |

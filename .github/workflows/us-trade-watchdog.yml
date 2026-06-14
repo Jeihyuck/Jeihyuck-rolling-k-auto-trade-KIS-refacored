@@ -2,8 +2,6 @@ name: "US Trade Watchdog"
 # Monitor-only: prep/am/afternoon status checker. It never dispatches trade workflows.
 
 "on":
-  schedule:
-    - cron: "*/5 12-20 * * 1-5"
   workflow_dispatch: {}
 
 permissions:

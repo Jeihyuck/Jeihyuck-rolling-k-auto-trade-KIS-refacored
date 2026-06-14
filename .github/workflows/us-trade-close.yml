@@ -1,12 +1,7 @@
 name: "US Trade Close"
-# close: EOD fills + reconcile + report | window: 15:45~16:30 ET | schedule: 19:50 / 20:50 UTC Mon-Fri
+# close: EOD fills + reconcile + report | window: 15:45~16:30 ET | GitHub scheduled trigger removed
 
 "on":
-  schedule:
-    # NY timezone-aware single cron: 15:55 ET (EDT/EST 자동 적용)
-    - cron: "55 15 * * 1-5"
-      timezone: "America/New_York"
-    # [US_SCHEDULE][CONFIG] schedule_mode=timezone_single_cron crons=1 timezone=America/New_York
   workflow_dispatch:
     inputs:
       dry_run:
@@ -50,6 +45,10 @@ jobs:
     timeout-minutes: 60
 
     env:
+      DISABLE_LIVE_TRADING: "1"
+      LIVE_TRADING_ENABLED: "0"
+      STRATEGY_MODE: "INTENT_ONLY"
+      FORCE_STRATEGY_MODE: "INTENT_ONLY"
       TZ: America/New_York
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: ${{ github.workspace }}/repo
@@ -111,7 +110,7 @@ jobs:
 
       US_SESSION_INTERVAL_SEC: "300"
 
-      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || vars.US_AGENT_SCHEDULE_DRY_RUN || '1' }}
+      DRY_RUN: "1"
 
       US_LOG_FILE: "us-trade-close.log"
       US_ARTIFACT_NAME: "us-trade-close"

@@ -31,22 +31,18 @@ GUARD_SCRIPT = Path("scripts/write_us_guard_failure_report.py")
 # 1. Schedule contract tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_prep_has_0700_edt_cron():
-    """us-trade-prep.yml에 06:xx EDT cron이 다수 존재 (UTC 09:xx / 10:xx 다중화 스케줄)."""
+def test_prep_has_no_github_schedule():
+    """us-trade-prep.yml은 WSL 이전 후 GitHub schedule이 없어야 한다."""
     text = PREP_YML.read_text(encoding="utf-8")
-    import re
-    # EDT 06:00 ET = UTC 10:xx; prewarm at UTC 09:50 also included
-    edt_crons = re.findall(r'cron:.*["\']\d+ (?:9|10) \* \* 1-5["\']', text)
-    assert len(edt_crons) >= 4, f"us-trade-prep.yml EDT cron 다중화 부족 (UTC 09-10 hour): {edt_crons}"
+    assert "schedule:" not in text
+    assert "workflow_dispatch:" in text
 
 
-def test_prep_has_0700_est_cron():
-    """us-trade-prep.yml에 06:xx EST cron이 다수 존재 (UTC 10:xx / 11:xx 다중화 스케줄)."""
-    text = PREP_YML.read_text(encoding="utf-8")
-    import re
-    # EST 06:00 ET = UTC 11:xx; prewarm at UTC 10:50 also included
-    est_crons = re.findall(r'cron:.*["\']\d+ (?:10|11) \* \* 1-5["\']', text)
-    assert len(est_crons) >= 4, f"us-trade-prep.yml EST cron 다중화 부족 (UTC 10-11 hour): {est_crons}"
+def test_am_has_no_github_schedule():
+    """us-trade-am.yml은 WSL 이전 후 GitHub schedule이 없어야 한다."""
+    text = AM_YML.read_text(encoding="utf-8")
+    assert "schedule:" not in text
+    assert "workflow_dispatch:" in text
 
 
 def test_prep_phase_guard_is_0700_based():
@@ -64,17 +60,17 @@ def test_prep_no_fallback_only_comment():
         "us-trade-prep.yml must not say prep moved to am workflow"
 
 
-def test_am_has_timezone_aware_0930_cron():
-    """us-trade-am.yml에는 09:30 ET timezone-aware cron이 있어야 한다."""
+def test_am_default_manual_run_is_safe_mode():
+    """us-trade-am.yml 수동 실행 기본값은 주문 불가 안전모드여야 한다."""
     text = AM_YML.read_text(encoding="utf-8")
-    assert 'cron: "30 9 * * 1-5"' in text
-    assert 'timezone: "America/New_York"' in text
-
-
-def test_am_has_single_timezone_cron_comment():
-    """us-trade-am.yml에는 timezone-aware single cron 설명이 있어야 한다."""
-    text = AM_YML.read_text(encoding="utf-8")
-    assert "timezone_single_cron" in text
+    for marker in (
+        'DRY_RUN: "1"',
+        'DISABLE_LIVE_TRADING: "1"',
+        'LIVE_TRADING_ENABLED: "0"',
+        'STRATEGY_MODE: "INTENT_ONLY"',
+        'FORCE_STRATEGY_MODE: "INTENT_ONLY"',
+    ):
+        assert marker in text
 
 
 def test_am_has_must_not_run_prep_comment():
