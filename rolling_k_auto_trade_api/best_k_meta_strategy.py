@@ -102,16 +102,35 @@ def _get_listing_df(markets: Iterable[str]) -> pd.DataFrame:
     normalized_markets = tuple(dict.fromkeys(markets))
     return _get_listing_df_cached(normalized_markets).copy()
 
+
+def _resolve_kr_market_date(date_str: Optional[str]) -> str:
+    requested_dt = datetime.today() if date_str is None else datetime.strptime(date_str, "%Y-%m-%d")
+    requested = requested_dt.strftime("%Y%m%d")
+    req_iso = requested_dt.strftime("%Y-%m-%d")
+    try:
+        adjusted = get_nearest_business_day_in_a_week(requested)
+    except Exception as exc:
+        logger.warning("[KRX][INDEX_OHLCV][INVALID_JSON] ticker=1001 date_from=%s date_to=%s err=%s", requested, requested, exc)
+        adjusted_dt = requested_dt
+        while adjusted_dt.weekday() >= 5:
+            adjusted_dt -= timedelta(days=1)
+        adjusted = adjusted_dt.strftime("%Y%m%d")
+    adj_iso = datetime.strptime(adjusted, "%Y%m%d").strftime("%Y-%m-%d")
+    if adjusted != requested:
+        logger.info("[MARKET_DATE][ADJUST] market=KR requested=%s adjusted=%s reason=non_trading_day", req_iso, adj_iso)
+    else:
+        logger.info("[MARKET_DATE][USE] market=KR trade_date=%s reason=trading_day_intraday", adj_iso)
+    return adjusted
+
 def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.DataFrame:
     """주어진 시장의 시가총액 상위 n개 종목 반환."""
     try:
-        target_dt = datetime.today() if date_str is None else datetime.strptime(date_str, "%Y-%m-%d")
-        from_date = get_nearest_business_day_in_a_week(target_dt.strftime("%Y%m%d"))
-        logger.info(f"📅 pykrx 시총 조회일({market}) → {from_date}")
+        from_date = _resolve_kr_market_date(date_str)
+        logger.info("📅 pykrx 시총 조회일(%s) → %s", market, from_date)
 
         mktcap_df = safe_get_market_cap_by_ticker(from_date, market=market)
         if mktcap_df is None or len(mktcap_df) == 0:
-            logger.warning("⚠️  pykrx 시총 DF(%s)가 비었습니다 → 빈 DF 반환", market)
+            logger.warning("[UNIVERSE][EMPTY] market=%s reason=KRX_DATA_UNAVAILABLE", market)
             return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
         mktcap_df = mktcap_df.reset_index()
@@ -148,7 +167,9 @@ def _get_top_n_for_market(date_str: Optional[str], n: int, market: str) -> pd.Da
         return topn[["Code", "Name", "Marcap"]]
 
     except Exception as exc:
-        logger.warning("⚠️  get_top_n_for_market(%s) 실패: %s → 빈 DF 반환", market, repr(exc))
+        if type(exc).__name__ == "JSONDecodeError":
+            logger.warning("[KRX][INDEX_OHLCV][INVALID_JSON] ticker=%s date_from=%s date_to=%s", "market_cap", date_str, date_str)
+        logger.warning("[UNIVERSE][EMPTY] market=%s reason=KRX_DATA_UNAVAILABLE err=%s", market, repr(exc))
         return pd.DataFrame(columns=["Code", "Name", "Marcap"])
 
 def get_kosdaq_top_n(date_str: Optional[str] = None, n: int = TOP_N) -> pd.DataFrame:

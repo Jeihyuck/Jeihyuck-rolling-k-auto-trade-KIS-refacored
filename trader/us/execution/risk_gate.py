@@ -23,9 +23,10 @@ class RiskGateBlocked(Exception):
 
 
 def _block(reason: str, symbol: str = "", **kw: Any) -> None:
-    parts = [f"[US_RISK][BLOCK] reason={reason}"]
+    parts = ["[US_RISK][BLOCK]"]
     if symbol:
         parts.append(f"symbol={symbol}")
+    parts.append(f"reason={reason}")
     for k, v in kw.items():
         parts.append(f"{k}={v}")
     msg = " ".join(parts)
@@ -34,24 +35,60 @@ def _block(reason: str, symbol: str = "", **kw: Any) -> None:
 
 
 def _pass(symbol: str, notional_usd: float) -> None:
-    logger.info(f"[US_RISK][PASS] symbol={symbol} notional_usd={notional_usd:.2f}")
+    logger.info("[US_RISK][ALLOW] symbol=%s reason=ALL_GATES_PASSED notional_usd=%.2f", symbol, notional_usd)
 
 
-def check_env_flags() -> None:
+def check_env_flags(symbol: str = "", *, session_ok: bool = True, prep_ok: bool = True, balance_ok: bool = True) -> None:
     """환경변수 guard (매 호출마다 os.getenv로 직접 읽는다)."""
     from trader.utils.env import env_bool
+    strategy_env = os.getenv("STRATEGY_ENV", "practice").lower()
+    kis_env = os.getenv("KIS_ENV", "practice").lower()
+    allow_real_order_raw = os.getenv("ALLOW_REAL_ORDER", "0")
+    allow_real_order = env_bool("ALLOW_REAL_ORDER", default=False)
+    paper_order = kis_env == "practice" and strategy_env == "practice"
+    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
+    dry_run = env_bool("DRY_RUN", default=True)
+    disable_live = env_bool("DISABLE_LIVE_TRADING", default=True)
+    live_enabled = env_bool("LIVE_TRADING_ENABLED", default=False)
+    us_live_enabled = env_bool("US_LIVE_TRADING_ENABLED", default=False)
+    order_arm_raw = os.getenv("US_ORDER_ARMED")
+    order_arm = env_bool("US_ORDER_ARMED", default=False)
+    logger.info(
+        "[US_ORDER_ENV][CHECK] kis_env=%s strategy_env=%s allow_real_order=%d paper_order=%d",
+        kis_env, strategy_env, int(allow_real_order), int(paper_order),
+    )
+    logger.info(
+        "[US_RISK][CHECK] env=%s strategy_mode=%s dry_run=%d disable_live=%d live_enabled=%d us_live_enabled=%d order_arm=%d session_ok=%d prep_ok=%d balance_ok=%d",
+        strategy_env, strategy_mode, int(dry_run), int(disable_live), int(live_enabled), int(us_live_enabled), int(order_arm), int(session_ok), int(prep_ok), int(balance_ok),
+    )
     if not env_bool("US_AGENT_ENABLED", default=False):
-        _block("us_agent_not_enabled")
+        _block("us_agent_not_enabled", symbol=symbol, required="US_AGENT_ENABLED=1", current=os.getenv("US_AGENT_ENABLED", "<unset>"))
     if os.getenv("TRADING_REGION", "").upper() != "US":
-        _block("trading_region_not_us")
-    if os.getenv("KIS_ENV", "practice").lower() != "practice":
-        _block("kis_env_not_practice")
-    if not env_bool("US_PAPER_TRADING_ENABLED", default=False):
-        _block("paper_trading_not_enabled")
-    if env_bool("US_LIVE_TRADING_ENABLED", default=False):
-        _block("live_trading_flag_enabled")
-    if not env_bool("DISABLE_REAL_TRADING", default=True):
-        _block("real_trading_not_disabled")
+        _block("trading_region_not_us", symbol=symbol, required="TRADING_REGION=US", current=os.getenv("TRADING_REGION", "<unset>"))
+    if kis_env != "practice":
+        if not allow_real_order:
+            _block("real_order_not_armed", symbol=symbol, required="ALLOW_REAL_ORDER=1", current=allow_real_order_raw)
+        _block("kis_env_not_practice", symbol=symbol, required="KIS_ENV=practice", current=os.getenv("KIS_ENV", "<unset>"))
+    if strategy_env != "practice":
+        _block("strategy_env_not_practice", symbol=symbol, required="STRATEGY_ENV=practice", current=os.getenv("STRATEGY_ENV", "<unset>"))
+    if strategy_mode != "LIVE":
+        _block("strategy_mode_not_live", symbol=symbol, required="STRATEGY_MODE=LIVE", current=os.getenv("STRATEGY_MODE", "<unset>"))
+    if dry_run:
+        _block("dry_run_enabled", symbol=symbol, required="DRY_RUN=0", current=os.getenv("DRY_RUN", "<unset>"))
+    if disable_live:
+        _block("disable_live_trading_enabled", symbol=symbol, required="DISABLE_LIVE_TRADING=0", current=os.getenv("DISABLE_LIVE_TRADING", "<unset>"))
+    if not live_enabled:
+        _block("live_trading_flag_disabled", symbol=symbol, required="LIVE_TRADING_ENABLED=1", current=os.getenv("LIVE_TRADING_ENABLED", "<unset>"))
+    if not us_live_enabled:
+        _block("us_live_trading_disabled", symbol=symbol, required="US_LIVE_TRADING_ENABLED=1", current=os.getenv("US_LIVE_TRADING_ENABLED", "<unset>"))
+    if not order_arm:
+        _block("US_ORDER_ARMED_MISSING", symbol=symbol, required="US_ORDER_ARMED=1", current=order_arm_raw if order_arm_raw is not None else "<unset>")
+    if not session_ok:
+        _block("session_window_invalid", symbol=symbol, required="session_window_valid=1", current="0")
+    if not prep_ok:
+        _block("prep_contract_not_ok", symbol=symbol, required="prep_contract_ok=1", current="0")
+    if not balance_ok:
+        _block("balance_unavailable", symbol=symbol, required="balance_available=1", current="0")
 
 
 def check_symbol(symbol: str) -> None:
@@ -337,7 +374,7 @@ def assert_order_allowed(
     notional_usd = float(intent.get("notional_usd", 0.0))
     client_order_key = intent.get("client_order_key", "")
 
-    check_env_flags()
+    check_env_flags(symbol=symbol)
     check_symbol_contract(
         symbol,
         side,

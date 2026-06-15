@@ -70,9 +70,16 @@ class PerformanceTracker:
             cash = float(inquire_cash_balance())
             cash_reason = "kis_api"
         except Exception as e:
-            logger.warning("[PERF] cash_balance failed -> fallback 0.0 (%s)", e)
-            cash = 0.0
-            cash_reason = "fallback"
+            logger.warning("[PERF][DEGRADED] cash_reason=KIS_BALANCE_UNAVAILABLE err=%s", e)
+            return {
+                "status": "DEGRADED",
+                "cash": None,
+                "cash_reason": "KIS_BALANCE_UNAVAILABLE",
+                "equity_value": None,
+                "pnl": None,
+                "pnl_reliable": 0,
+                "engines": {},
+            }
         positions = self._mark_positions()
         equity_value = sum(p.market_value for p in positions)
         unrealized = sum(p.unrealized_pnl for p in positions)
