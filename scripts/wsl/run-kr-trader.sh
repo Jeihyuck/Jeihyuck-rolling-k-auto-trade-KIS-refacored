@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "[KR_TRADER][DEPRECATED] this script is not valid for PB1 prep/am/afternoon/close scheduler"
+if [ "${ALLOW_LEGACY_KR_TRADER:-0}" != "1" ]; then
+  echo "[KR_TRADER][BLOCKED] reason=LEGACY_SCRIPT_NOT_ALLOWED_FOR_SCHEDULER"
+  exit 2
+fi
+
 cd /home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
 
 mkdir -p runtime

@@ -3717,14 +3717,17 @@ class KisAPI:
                 self._balance_cache_at = now_kst()
                 snap = normalized
         except KisBalanceUnavailable as e:
+            logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise
         except RuntimeError:
             raise
         except KisTemporaryError as e:
+            logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise KisBalanceUnavailable(str(e)) from e
         except Exception as e:
+            logger.error("[BALANCE][UNAVAILABLE] endpoint=inquire-balance err_type=%s err=%s", type(e).__name__, e)
             logger.error("[GET_BALANCE_FAIL] %s", e)
             raise KisBalanceUnavailable(str(e)) from e
         snap_copy = _deepcopy_json(snap)

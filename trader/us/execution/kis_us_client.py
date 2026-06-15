@@ -973,8 +973,8 @@ class KisUSClient:
                 if attempt > 1 and last_error:
                     self.stats["temp_recovered_count"] += 1
                     logger.info(
-                        f"[US_KIS][TEMP_RECOVERED] attempt={attempt}/{max_attempts} "
-                        f"path={path!r} last_error={last_error!r}"
+                        f"[US_KIS][TEMP_RECOVERED] endpoint={path.split('/')[-1]} attempt={attempt}/{max_attempts} "
+                        f"last_error={last_error!r}"
                     )
                 
                 return data
@@ -991,7 +991,7 @@ class KisUSClient:
                     sleep_time = backoff_sec + jitter
                     
                     logger.warning(
-                        f"[US_KIS][TEMP_ERROR] endpoint=GET_{path.split('/')[- 1]} "
+                        f"[US_KIS][TEMP_ERROR] endpoint=GET_{path.split('/')[-1]} "
                         f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
                     time.sleep(sleep_time)
@@ -1001,8 +1001,8 @@ class KisUSClient:
                 if not suppress_final_log:
                     self.stats["http_fail_final_count"] += 1
                     logger.error(
-                        f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
-                        f"path={path!r} error={err!r} temporary={is_temp}"
+                        f"[US_KIS][FINAL_ERROR] attempt={attempt}/{max_attempts} "
+                        f"endpoint={path.split('/')[-1]} attempts={max_attempts} error={err!r} temporary={is_temp}"
                     )
                 if is_temp:
                     raise KisUSTemporaryError(f"GET {path} failed after {attempt} attempts: {err}") from err
@@ -1035,8 +1035,8 @@ class KisUSClient:
                 if attempt > 1 and last_error:
                     self.stats["temp_recovered_count"] += 1
                     logger.info(
-                        f"[US_KIS][TEMP_RECOVERED] attempt={attempt}/{max_attempts} "
-                        f"path={path!r} last_error={last_error!r}"
+                        f"[US_KIS][TEMP_RECOVERED] endpoint={path.split('/')[-1]} attempt={attempt}/{max_attempts} "
+                        f"last_error={last_error!r}"
                     )
                 
                 return data
@@ -1062,8 +1062,8 @@ class KisUSClient:
                 # 최종 실패
                 self.stats["http_fail_final_count"] += 1
                 logger.error(
-                    f"[US_KIS][HTTP_FAIL_FINAL] attempt={attempt}/{max_attempts} "
-                    f"path={path!r} error={err!r} temporary={is_temp}"
+                    f"[US_KIS][FINAL_ERROR] attempt={attempt}/{max_attempts} "
+                    f"endpoint={path.split('/')[-1]} attempts={max_attempts} error={err!r} temporary={is_temp}"
                 )
                 if is_temp:
                     raise KisUSTemporaryError(f"POST {path} failed after {attempt} attempts: {err}") from err

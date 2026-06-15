@@ -64,8 +64,9 @@ def is_paper_order_allowed() -> bool:
         TRADING_REGION == "US"
         and KIS_ENV == "practice"
         and US_PAPER_TRADING_ENABLED
-        and not US_LIVE_TRADING_ENABLED
-        and DISABLE_REAL_TRADING
+        and US_LIVE_TRADING_ENABLED
+        and not DISABLE_REAL_TRADING
+        and not DRY_RUN
     )
 
 
@@ -77,12 +78,12 @@ def assert_us_paper_order_allowed() -> None:
         raise RuntimeError("[US_ORDER][BLOCKED] reason=kis_env_not_practice")
     if not US_PAPER_TRADING_ENABLED:
         raise RuntimeError("[US_ORDER][BLOCKED] reason=paper_trading_not_enabled")
-    if US_LIVE_TRADING_ENABLED:
-        raise RuntimeError("[US_ORDER][BLOCKED] reason=live_trading_flag_enabled")
-    if not DISABLE_REAL_TRADING:
-        raise RuntimeError("[US_ORDER][BLOCKED] reason=real_trading_not_disabled")
+    if not US_LIVE_TRADING_ENABLED:
+        raise RuntimeError("[US_ORDER][BLOCKED] reason=us_live_trading_disabled required=US_LIVE_TRADING_ENABLED=1")
+    if DISABLE_REAL_TRADING:
+        raise RuntimeError("[US_ORDER][BLOCKED] reason=disable_real_trading_enabled required=DISABLE_REAL_TRADING=0")
     if DRY_RUN:
-        raise RuntimeError("[US_ORDER][BLOCKED] reason=dry_run_active")
+        raise RuntimeError("[US_ORDER][BLOCKED] reason=dry_run_enabled required=DRY_RUN=0")
 
 
 def get_summary() -> dict[str, Any]:

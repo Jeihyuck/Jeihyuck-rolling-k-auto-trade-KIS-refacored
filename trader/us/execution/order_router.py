@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 # in-process 중복 키 (DB fallback 없을 때도 동일 process 내 중복 차단)
 _SENT_ORDER_KEYS: set[str] = set()
+_BLOCKED_INTENT_KEYS: set[tuple[str, str, str]] = set()
 
 
 def resolve_dry_run_for_us_order() -> bool:
@@ -241,9 +242,20 @@ def route_order(
                 return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
         else:
             # notional_exceeds_order_limit가 아닌 다른 block reason
-            if order_key:
-                mark_order_intent_blocked(order_key, reason=str(exc))
-            return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
+            reason_text = str(exc)
+            reason_code = reason_text.split("reason=", 1)[1].split()[0] if "reason=" in reason_text else reason_text
+            dedup_key = (str(symbol).upper(), str(side).upper(), reason_code)
+            duplicate_blocked = dedup_key in _BLOCKED_INTENT_KEYS
+            if duplicate_blocked:
+                logger.info(
+                    "[US_ORDER][DEDUP] symbol=%s side=%s action=skip_duplicate_blocked_intent reason=%s",
+                    symbol, side, reason_code,
+                )
+            else:
+                _BLOCKED_INTENT_KEYS.add(dedup_key)
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason=reason_text)
+            return {"status": "BLOCKED", "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent}
 
     # 4. DRY_RUN resolve with runtime guard
     dry_run_resolved = resolve_dry_run_for_us_order()
@@ -414,7 +426,7 @@ def route_order(
                     (_pos_for_guard.get("position_source") if "_pos_for_guard" in locals() else None) or "pre_sell_position_snapshot",
                 )
 
-    logger.info("[US_ORDER][SEND] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
+    logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
     # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────
     # 중요: KIS ACK과 DB ACK을 반드시 분리한다.

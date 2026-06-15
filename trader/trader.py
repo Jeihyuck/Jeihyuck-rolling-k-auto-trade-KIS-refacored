@@ -6,7 +6,7 @@ import logging
 import os
 
 from portfolio.portfolio_manager import PortfolioManager
-from trader.kis_wrapper import KisAPI
+from trader.kis_wrapper import KisAPI, KisBalanceUnavailable
 from trader import state_store as runtime_state_store
 from trader.time_utils import is_trading_day, now_kst
 from trader.subject_flow import get_subject_flow_with_fallback  # noqa: F401 - exported for engines
@@ -194,6 +194,21 @@ def main() -> None:
         )
         runtime_state_store.save_state(runtime_state)
         logger.info("[TRADER] runtime state reconciled")
+    except KisBalanceUnavailable as exc:
+        logger.error("[TRADER][SAFE_STOP] reason=KIS_BALANCE_UNAVAILABLE err=%s", exc, exc_info=True)
+        result = {
+            "status": "SAFE_STOP",
+            "reason": "KIS_BALANCE_UNAVAILABLE",
+            "order_allowed": 0,
+            "entry_allowed": 0,
+            "exit_allowed": 0,
+            "performance_reliable": 0,
+        }
+        logger.info(
+            "[RUN_SUMMARY][RESULT] status=%s reason=%s order_allowed=%s entry_allowed=%s exit_allowed=%s performance_reliable=%s",
+            result["status"], result["reason"], result["order_allowed"], result["entry_allowed"], result["exit_allowed"], result["performance_reliable"],
+        )
+        return
     except Exception:
         logger.exception("[TRADER] runtime state reconcile failed")
         runtime_state = runtime_state or runtime_state_store.load_state()

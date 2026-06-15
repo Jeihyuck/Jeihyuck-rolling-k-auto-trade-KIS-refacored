@@ -203,6 +203,17 @@ def run_trade_session(
     tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
     now_for_date = _now_ny(force_now)
     trade_date = now_for_date.strftime("%Y-%m-%d")
+    try:
+        from zoneinfo import ZoneInfo
+        now_kst = now_for_date.astimezone(ZoneInfo("Asia/Seoul"))
+        from trader.us.market_calendar import is_us_trading_day
+        is_td = int(is_us_trading_day(now_for_date.date()))
+        logger.info(
+            "[US_SESSION][TIME] now_kst=%s now_et=%s trade_date_et=%s session=%s is_trading_day=%d",
+            now_kst.isoformat(), now_for_date.isoformat(), trade_date, session, is_td,
+        )
+    except Exception as exc:
+        logger.warning("[US_SESSION][TIME][WARN] err=%s", exc)
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     final_status = "OK"
     final_reason = "session_end"

@@ -1040,9 +1040,10 @@ def run_trade_tick(
                     pass
             block_reasons[reason] = block_reasons.get(reason, 0) + 1
 
+    duplicate_blocked_cnt = sum(1 for o in orders if o.get("duplicate_blocked"))
     logger.info(
-        "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d signal_only=%d reject=%d error=%d",
-        len(orders), ack_cnt, dry_cnt, blocked_cnt, signal_only_cnt, reject_cnt, err_cnt,
+        "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d duplicate_blocked=%d signal_only=%d reject=%d error=%d",
+        len(orders), ack_cnt, dry_cnt, blocked_cnt, duplicate_blocked_cnt, signal_only_cnt, reject_cnt, err_cnt,
     )
     
     if blocked_cnt > 0:
@@ -1167,6 +1168,13 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    logger.info(
+        "[US_TICK][SUMMARY] session=%s trade_date_et=%s final30=%d holdings=%d held_skip=%d buy_intents=%d risk_allowed=%d risk_blocked=%d submitted=%d ack=%d rejected=%d temp_recovered=%d final_errors=%d status=%s",
+        session, trade_date, len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
+        len(current_positions) if 'current_positions' in locals() else 0,
+        max(0, (len(current_positions) if 'current_positions' in locals() else 0) - entry_intents_count),
+        entry_intents_count, orders_sent, blocked_cnt, orders_sent, ack_cnt, reject_cnt, temp_recovered_count, total_errors, status,
+    )
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
     return {
