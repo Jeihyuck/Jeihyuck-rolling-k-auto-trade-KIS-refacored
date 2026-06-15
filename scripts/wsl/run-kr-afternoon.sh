@@ -14,35 +14,11 @@ export PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT="${PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TI
 export PB1_SESSION=afternoon WSL_RUN_SESSION=afternoon STRATEGY_MODE=LIVE DRY_RUN=0 DISABLE_LIVE_TRADING=0 LIVE_TRADING_ENABLED=1 KR_LIVE_TRADING_ENABLED=1 KR_ORDER_ARMED=1
 LOG=runtime/wsl-kr-afternoon.log
 {
-  echo "[KR_AFTERNOON][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV dry_run=$DRY_RUN live_enabled=$LIVE_TRADING_ENABLED kr_order_armed=$KR_ORDER_ARMED"
+  echo "[KR_AFTERNOON][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
   set +e
-  python - <<'PYGUARD'
-from pathlib import Path
-from datetime import datetime
-import json, sys
-try:
-    from zoneinfo import ZoneInfo; now=datetime.now(ZoneInfo('Asia/Seoul'))
-except Exception: now=datetime.now()
-if 'afternoon' == 'am' and now.hour < 9:
-    print('[KR_AFTERNOON][SKIP] reason=PREOPEN_NO_ORDER'); print('[RUN_SUMMARY][RESULT] status=SKIP reason=PREOPEN_NO_ORDER'); sys.exit(10)
-cands=[Path('signals/kr/final30_scored.json'), Path('runtime/kr/watchlist')/now.strftime('%Y-%m-%d')/'final30_scored.json']
-for p in cands:
-    if p.exists():
-        try:
-            data=json.loads(p.read_text(encoding='utf-8')); rows=data if isinstance(data,list) else data.get('rows') or data.get('data') or []; n=len(rows) if isinstance(rows,list) else 0
-        except Exception: n=0
-        if n>0:
-            print('[KR_AFTERNOON][PREP_GUARD][OK] final30=%s source=%s' % (n,p)); sys.exit(0)
-print('[KR_AFTERNOON][SKIP] reason=KR_PREP_ARTIFACT_MISSING'); print('[RUN_SUMMARY][RESULT] status=SKIP reason=KR_PREP_ARTIFACT_MISSING'); sys.exit(11)
-PYGUARD
-  guard=$?
-  set -e
-  if [[ $guard -eq 10 || $guard -eq 11 ]]; then echo "[KR_AFTERNOON][EXIT] ts=$(date -Is) exit_code=0 guard=$guard"; exit 0; fi
-  echo "[KR_AFTERNOON][GATE] order_allowed=1"
-  python -m trader.trader --window pm --phase auto
+  python -m trader.kr.runner.trade_session_runner --session afternoon --env "$STRATEGY_ENV"
   rc=$?
-  echo "[KR_AFTERNOON][DONE] status=$([[ $rc -eq 0 ]] && echo OK || echo FAIL)"
-  echo "[RUN_SUMMARY][RESULT] session=afternoon status=$([[ $rc -eq 0 ]] && echo OK || echo FAIL)"
+  set -e
   echo "[KR_AFTERNOON][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG" 2>&1

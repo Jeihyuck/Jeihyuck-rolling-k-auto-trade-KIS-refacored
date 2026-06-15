@@ -1168,11 +1168,13 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    held_skip = locals().get("held_skip_count")
+    held_skip_unknown = 0 if isinstance(held_skip, int) else 1
     logger.info(
-        "[US_TICK][SUMMARY] session=%s trade_date_et=%s final30=%d holdings=%d held_skip=%d buy_intents=%d risk_allowed=%d risk_blocked=%d submitted=%d ack=%d rejected=%d temp_recovered=%d final_errors=%d status=%s",
+        "[US_TICK][SUMMARY] session=%s trade_date_et=%s final30=%d holdings=%d held_skip=%s held_skip_unknown=%d buy_intents=%d risk_allowed=%d risk_blocked=%d submitted=%d ack=%d rejected=%d temp_recovered=%d final_errors=%d status=%s",
         session, trade_date, len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
         len(current_positions) if 'current_positions' in locals() else 0,
-        max(0, (len(current_positions) if 'current_positions' in locals() else 0) - entry_intents_count),
+        held_skip if held_skip is not None else "None", held_skip_unknown,
         entry_intents_count, orders_sent, blocked_cnt, orders_sent, ack_cnt, reject_cnt, temp_recovered_count, total_errors, status,
     )
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)

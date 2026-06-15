@@ -29,4 +29,6 @@ export DB_STATEMENT_TIMEOUT_MS="${DB_STATEMENT_TIMEOUT_MS:-15000}"
 export DB_IDLE_IN_TX_SESSION_TIMEOUT_MS="${DB_IDLE_IN_TX_SESSION_TIMEOUT_MS:-15000}"
 export PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT="${PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT:-1}"
 
-.venv/bin/python -m trader.trader --window auto --phase auto >> runtime/wsl-kr-trader.log 2>&1
+legacy_module="trader.trader"
+cmd=(.venv/bin/python -m "$legacy_module" --window auto --phase auto)
+"${cmd[@]}" >> runtime/wsl-kr-trader.log 2>&1

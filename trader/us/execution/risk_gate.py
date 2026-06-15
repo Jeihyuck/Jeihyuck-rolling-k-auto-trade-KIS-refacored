@@ -42,6 +42,10 @@ def check_env_flags(symbol: str = "", *, session_ok: bool = True, prep_ok: bool 
     """환경변수 guard (매 호출마다 os.getenv로 직접 읽는다)."""
     from trader.utils.env import env_bool
     strategy_env = os.getenv("STRATEGY_ENV", "practice").lower()
+    kis_env = os.getenv("KIS_ENV", "practice").lower()
+    allow_real_order_raw = os.getenv("ALLOW_REAL_ORDER", "0")
+    allow_real_order = env_bool("ALLOW_REAL_ORDER", default=False)
+    paper_order = kis_env == "practice" and strategy_env == "practice"
     strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
     dry_run = env_bool("DRY_RUN", default=True)
     disable_live = env_bool("DISABLE_LIVE_TRADING", default=True)
@@ -50,6 +54,10 @@ def check_env_flags(symbol: str = "", *, session_ok: bool = True, prep_ok: bool 
     order_arm_raw = os.getenv("US_ORDER_ARMED")
     order_arm = env_bool("US_ORDER_ARMED", default=False)
     logger.info(
+        "[US_ORDER_ENV][CHECK] kis_env=%s strategy_env=%s allow_real_order=%d paper_order=%d",
+        kis_env, strategy_env, int(allow_real_order), int(paper_order),
+    )
+    logger.info(
         "[US_RISK][CHECK] env=%s strategy_mode=%s dry_run=%d disable_live=%d live_enabled=%d us_live_enabled=%d order_arm=%d session_ok=%d prep_ok=%d balance_ok=%d",
         strategy_env, strategy_mode, int(dry_run), int(disable_live), int(live_enabled), int(us_live_enabled), int(order_arm), int(session_ok), int(prep_ok), int(balance_ok),
     )
@@ -57,7 +65,9 @@ def check_env_flags(symbol: str = "", *, session_ok: bool = True, prep_ok: bool 
         _block("us_agent_not_enabled", symbol=symbol, required="US_AGENT_ENABLED=1", current=os.getenv("US_AGENT_ENABLED", "<unset>"))
     if os.getenv("TRADING_REGION", "").upper() != "US":
         _block("trading_region_not_us", symbol=symbol, required="TRADING_REGION=US", current=os.getenv("TRADING_REGION", "<unset>"))
-    if os.getenv("KIS_ENV", "practice").lower() != "practice":
+    if kis_env != "practice":
+        if not allow_real_order:
+            _block("real_order_not_armed", symbol=symbol, required="ALLOW_REAL_ORDER=1", current=allow_real_order_raw)
         _block("kis_env_not_practice", symbol=symbol, required="KIS_ENV=practice", current=os.getenv("KIS_ENV", "<unset>"))
     if strategy_env != "practice":
         _block("strategy_env_not_practice", symbol=symbol, required="STRATEGY_ENV=practice", current=os.getenv("STRATEGY_ENV", "<unset>"))
