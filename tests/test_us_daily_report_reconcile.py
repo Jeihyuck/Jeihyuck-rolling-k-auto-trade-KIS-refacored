@@ -22,3 +22,33 @@ def test_daily_report_uses_real_sources_without_env(monkeypatch, tmp_path):
     assert report['fill_api_count']==4
     assert report['balance_confirmed_count']==7
     assert 'FILL_API_LESS_THAN_ACK' in report['warnings']
+
+def test_load_us_orders_uses_timestamp_fallback(monkeypatch):
+    from trader.us.db import repos
+    calls=[]
+    class Conn:
+        def execution_options(self, **kwargs): return self
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql, params):
+            text=str(sql)
+            calls.append((text, params))
+            if 'created_at >=' in text and 'us_orders' in text:
+                return [{'status':'ACK','symbol':'AAPL'}]
+            return []
+    class Engine:
+        def connect(self): return Conn()
+    monkeypatch.setattr(repos, '_get_engine_or_none', lambda: Engine())
+    rows=drr.load_us_orders('2026-06-16')
+    assert len(rows)==1
+    assert any('created_at >=' in sql for sql,_ in calls)
+    assert any('start_ts' in params and 'end_ts' in params for _,params in calls)
+
+def test_daily_report_order_source_empty_warning(monkeypatch, tmp_path):
+    monkeypatch.setattr(drr, 'load_us_orders', lambda td: [])
+    monkeypatch.setattr(drr, 'load_us_fills_count', lambda td: 0)
+    monkeypatch.setattr(drr, 'load_balance_confirmed_count', lambda td: 0)
+    monkeypatch.setattr(drr, 'load_router_summary_ack_count', lambda td, session=None: 0)
+    monkeypatch.chdir(tmp_path)
+    result=drr.run_daily_report(env='practice', session='close', trade_date='2026-06-16', offline=False)
+    assert 'ORDER_SOURCE_EMPTY' in result['report']['warnings']

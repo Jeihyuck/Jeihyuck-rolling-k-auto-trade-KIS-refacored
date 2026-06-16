@@ -234,6 +234,8 @@ def run_daily_report(
             report["fill_api_count"] = reconciled["fill_api_count"]
             report["balance_confirmed_count"] = reconciled["balance_confirmed_count"]
             logger.info("[US_DAILY_REPORT][ORDER_SOURCES] db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", db_ack, fill_count, balance_confirmed, router_summary)
+            if reconciled["orders_ack"] == 0 and fill_count == 0 and balance_confirmed == 0 and router_summary == 0:
+                reconciled["warnings"].append("ORDER_SOURCE_EMPTY")
             for warn in reconciled["warnings"]:
                 report["warnings"].append(warn)
                 logger.warning("[US_DAILY_REPORT][RECONCILE_WARN] reason=%s db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", warn, db_ack, fill_count, balance_confirmed, router_summary)
@@ -380,23 +382,45 @@ def _read_autocommit(engine, sql: str, params: dict) -> list[dict]:
         return _dict_rows(conn.execute(text(sql), params))
 
 
+def _ny_date_bounds_utc(trade_date: str) -> tuple[str, str]:
+    from datetime import date, datetime, time, timedelta
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    utc = ZoneInfo("UTC")
+    d = date.fromisoformat(trade_date)
+    start = datetime.combine(d, time.min, tzinfo=ny).astimezone(utc).isoformat()
+    end = datetime.combine(d + timedelta(days=1), time.min, tzinfo=ny).astimezone(utc).isoformat()
+    return start, end
+
+
 def load_us_orders(trade_date: str) -> list[dict]:
-    """Load US orders from the US order table, with a generic orders fallback."""
+    """Load US orders by trade_date, then NY date-range timestamp fallbacks."""
     from trader.us.db.repos import _get_engine_or_none
     engine = _get_engine_or_none()
     if engine is None:
         return []
+    start_utc, end_utc = _ny_date_bounds_utc(trade_date)
     queries = [
-        "SELECT * FROM us_orders WHERE trade_date = :td",
-        "SELECT * FROM orders WHERE market = 'US' AND trade_date = :td",
+        ("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}),
+        ("SELECT * FROM orders WHERE market = 'US' AND trade_date = :td", {"td": trade_date}),
+        ("SELECT * FROM us_orders WHERE created_at >= :start_ts AND created_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
+        ("SELECT * FROM us_orders WHERE submitted_at >= :start_ts AND submitted_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
+        ("SELECT * FROM us_orders WHERE acked_at >= :start_ts AND acked_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
+        ("SELECT * FROM orders WHERE market = 'US' AND created_at >= :start_ts AND created_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
+        ("SELECT * FROM orders WHERE market = 'US' AND submitted_at >= :start_ts AND submitted_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
+        ("SELECT * FROM orders WHERE market = 'US' AND acked_at >= :start_ts AND acked_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
     ]
-    for sql in queries:
+    errors: list[str] = []
+    for sql, params in queries:
         try:
-            rows = _read_autocommit(engine, sql, {"td": trade_date})
+            rows = _read_autocommit(engine, sql, params)
             if rows:
                 return rows
         except Exception as exc:
-            logger.debug("[US_ORDERS][LOAD][FALLBACK] sql=%s err=%s", sql, exc)
+            errors.append(str(exc))
+            logger.warning("[US_ORDERS][LOAD][FALLBACK_FAIL] sql=%s err=%s", sql, exc)
+    if errors:
+        logger.warning("[US_ORDERS][LOAD][EMPTY] reason=ORDER_SOURCE_EMPTY attempted=%d", len(queries))
     return []
 
 
