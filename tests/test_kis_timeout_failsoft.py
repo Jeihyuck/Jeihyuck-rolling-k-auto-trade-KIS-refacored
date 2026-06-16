@@ -31,6 +31,7 @@ def test_run_pb1_session_continues_after_balance_failsoft(monkeypatch, tmp_path)
         def get_balance_cached(self):
             raise KisBalanceUnavailable('timeout')
     monkeypatch.setattr(runner, 'KisAPI', lambda: DummyKis())
+    monkeypatch.setattr(runner, 'resolve_kr_balance_fail_soft', lambda exc, env='practice': {'status':'WARN','reason':'BALANCE_TIMEOUT_FAIL_SOFT','entry_allowed':False,'exit_allowed':True,'order_allowed':0})
     calls={'n':0}
     mod=types.SimpleNamespace(main=lambda: calls.__setitem__('n', calls['n']+1) or 0)
     monkeypatch.setitem(sys.modules, 'trader.pb1_runner', mod)
@@ -40,3 +41,22 @@ def test_run_pb1_session_continues_after_balance_failsoft(monkeypatch, tmp_path)
     assert result['balance_fail_soft']['reason']=='BALANCE_TIMEOUT_FAIL_SOFT'
     assert __import__('os').environ['ENTRY_ALLOWED']=='0'
     assert __import__('os').environ['EXIT_ALLOWED']=='1'
+
+
+def test_pb1_engine_balance_failsoft_env_gates(monkeypatch):
+    from trader.pb1_engine import PB1Engine
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.trading_day = True
+    engine.order_allowed = True
+    engine.force_block_live = False
+    engine.intended_live = True
+    engine.strategy_mode = "LIVE"
+    engine.market_window_name = "day"
+    engine.force_entry_window_override = False
+    engine.session_recovery_continue = False
+    engine.am_recovery_continue = False
+    engine.balance_fail_soft_active = True
+    engine.balance_fail_soft_entry_allowed = False
+    engine.balance_fail_soft_exit_allowed = True
+    assert "balance_fail_soft_entry_disabled" in engine._order_precheck_gate_reasons(side="BUY", stage="PB1-ENTRY")
+    assert engine._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT") == []

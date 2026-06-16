@@ -2383,8 +2383,17 @@ class PB1Engine:
         self.calc_allowed = bool(calc_allowed)  # ✅ 계산 게이트
         self.price_allowed = bool(price_allowed)  # ✅ 가격 게이트
         self.order_allowed = bool(order_allowed)  # ✅ 주문 게이트
+        self.balance_fail_soft_active = env_bool("KR_BALANCE_FAIL_SOFT_ACTIVE", False)
+        self.balance_fail_soft_entry_allowed = env_bool("ENTRY_ALLOWED", True)
+        self.balance_fail_soft_exit_allowed = env_bool("EXIT_ALLOWED", True)
+        self.balance_fail_soft_order_allowed = env_bool("ORDER_ALLOWED", True)
         self.minervini_only = bool(minervini_only)  # ✅ MINERVINI_ONLY 모드
         self.entry_enabled = bool(order_allowed)  # 하위호환용
+        if self.balance_fail_soft_active:
+            self.entry_enabled = bool(self.balance_fail_soft_entry_allowed)
+            logger.warning("[PB1][ENTRY][BLOCKED] reason=BALANCE_FAIL_SOFT_ENTRY_DISABLED")
+            if self.balance_fail_soft_exit_allowed:
+                logger.info("[PB1][EXIT][ALLOW] reason=BALANCE_FAIL_SOFT_EXIT_ALLOWED")
         self.entry_block_reason = entry_block_reason
         self.force_entry_window_override = bool(force_entry_window_override)
         self.session_recovery_continue = bool(session_recovery_continue)
@@ -8686,7 +8695,13 @@ class PB1Engine:
         reasons: list[str] = []
         if not self.trading_day:
             reasons.append("nontrading_day")
-        if not bool(self.order_allowed):
+        fail_soft_active = bool(getattr(self, "balance_fail_soft_active", False))
+        if side.upper() == "BUY" and fail_soft_active and not bool(getattr(self, "balance_fail_soft_entry_allowed", False)):
+            logger.info("[PB1][ENTRY][BLOCKED] reason=BALANCE_FAIL_SOFT_ENTRY_DISABLED")
+            reasons.append("balance_fail_soft_entry_disabled")
+        elif side.upper() == "SELL" and fail_soft_active and bool(getattr(self, "balance_fail_soft_exit_allowed", False)):
+            logger.info("[PB1][EXIT][ALLOW] reason=BALANCE_FAIL_SOFT_EXIT_ALLOWED")
+        elif not bool(self.order_allowed):
             reasons.append("order_blocked")
         session_recovery_continue = bool(getattr(self, "session_recovery_continue", False) or getattr(self, "am_recovery_continue", False))
         if self.market_window_name == "after" and not (self.force_entry_window_override or session_recovery_continue):
@@ -12903,6 +12918,13 @@ class PB1Engine:
         minervini_only = self.minervini_only  # MINERVINI_ONLY 모드
         entry_allowed = bool(self.entry_enabled and order_allowed)  # 하위호환용
         entry_reason = self.entry_block_reason or ("entry_disabled" if not entry_allowed else "ok")
+        if bool(getattr(self, "balance_fail_soft_active", False)) and not bool(getattr(self, "balance_fail_soft_entry_allowed", False)):
+            order_allowed = False
+            entry_allowed = False
+            entry_reason = "BALANCE_FAIL_SOFT_ENTRY_DISABLED"
+            logger.info("[PB1][ENTRY][BLOCKED] reason=BALANCE_FAIL_SOFT_ENTRY_DISABLED")
+            if bool(getattr(self, "balance_fail_soft_exit_allowed", False)):
+                logger.info("[PB1][EXIT][ALLOW] reason=BALANCE_FAIL_SOFT_EXIT_ALLOWED")
         
         # ✅ MINERVINI_ONLY 모드에서는 계산만 허용, 주문은 금지
         if minervini_only:
