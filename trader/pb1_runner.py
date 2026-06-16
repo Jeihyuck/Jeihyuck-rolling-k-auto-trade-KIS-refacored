@@ -3979,6 +3979,33 @@ def should_degrade(remaining_s: float) -> bool:
     return remaining_s < 60
 
 
+
+def _handle_balance_unknown_precheck(
+    *,
+    balance_state: str,
+    require_balance_for_entry: bool,
+    allow_compute_without_kis: bool,
+    order_allowed: bool,
+    entry_block_reason: str | None,
+) -> tuple[bool, bool, str | None, str | None]:
+    """Resolve balance-unknown precheck without blocking fail-soft exits.
+
+    Returns (continue_to_engine, order_allowed, entry_block_reason, return_reason).
+    """
+    if not (balance_state == BALANCE_STATE_UNKNOWN and require_balance_for_entry and not allow_compute_without_kis):
+        return True, order_allowed, entry_block_reason, None
+    fail_soft_active = env_bool("KR_BALANCE_FAIL_SOFT_ACTIVE", False)
+    fail_soft_exit_allowed = env_bool("EXIT_ALLOWED", False)
+    fail_soft_entry_allowed = env_bool("ENTRY_ALLOWED", False)
+    if fail_soft_active and fail_soft_exit_allowed:
+        logger.warning(
+            "[PB1][BALANCE_FAIL_SOFT][CONTINUE] reason=balance_unknown entry_allowed=%d exit_allowed=%d",
+            int(bool(fail_soft_entry_allowed)),
+            int(bool(fail_soft_exit_allowed)),
+        )
+        return True, False, entry_block_reason or "BALANCE_FAIL_SOFT_ENTRY_DISABLED", None
+    return False, order_allowed, entry_block_reason, "DEGRADED_BALANCE_UNKNOWN"
+
 def run_once(
     *,
     args: argparse.Namespace,
@@ -5536,13 +5563,20 @@ def run_once(
             int(bool(PB1_REQUIRE_BALANCE_FOR_ENTRY)),
             int(bool(allow_compute_without_kis)),
         )
-        if balance_state == BALANCE_STATE_UNKNOWN and PB1_REQUIRE_BALANCE_FOR_ENTRY and not allow_compute_without_kis:
+        continue_after_balance_precheck, order_allowed, entry_block_reason, balance_precheck_return_reason = _handle_balance_unknown_precheck(
+            balance_state=balance_state,
+            require_balance_for_entry=PB1_REQUIRE_BALANCE_FOR_ENTRY,
+            allow_compute_without_kis=allow_compute_without_kis,
+            order_allowed=order_allowed,
+            entry_block_reason=entry_block_reason,
+        )
+        if not continue_after_balance_precheck:
             logger.error("[TRADE][READY][FAIL] reason=balance_precheck_failed")
             logger.warning("[PB1][DEGRADED] reason=balance_unknown -> skip trading")
             runs_repo.finish_run(run_record_id, status="DEGRADED", notes="balance_unknown")
             db_write_reasons.append("balance_degraded")
             _write_last_db_write(runtime_root_dir, run_id=str(run_record_id), reason="balance_degraded", now=now)
-            return [], False, {}, phase_for_log, "DEGRADED_BALANCE_UNKNOWN"
+            return [], False, {}, phase_for_log, balance_precheck_return_reason or "DEGRADED_BALANCE_UNKNOWN"
 
         # ✅ dry_run은 이미 LIVE_ENV_LOCK에서 파싱 완료 (재파싱 금지)
         # 엔진에 전달할 값 최종 확인: bool 타입 강제

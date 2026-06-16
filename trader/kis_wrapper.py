@@ -4608,3 +4608,23 @@ class KisAPI:
         except Exception as e:
             logger.error("[SMOKE][ASKBID] Failed: %s", repr(e))
             return False
+
+
+def resolve_kr_balance_fail_soft(exc: BaseException, *, env: str = "practice", stale_cache: dict | None = None) -> dict:
+    """Return fail-soft balance policy for KR domestic balance timeout."""
+    import logging as _logging, os as _os, time as _time
+    _logger = _logging.getLogger(__name__)
+    _logger.warning("[KIS][BALANCE][TIMEOUT] endpoint=inquire-balance attempt=%s err=%s", 1, exc)
+    allow = (env or "practice").lower() == "practice" and _os.getenv("KR_BALANCE_FAIL_SOFT_IN_PRACTICE", "1") == "1"
+    if (env or "").lower() in {"real", "live"}:
+        allow = _os.getenv("KR_BALANCE_FAIL_SOFT_IN_REAL", "0") == "1"
+    if stale_cache:
+        age = int(_time.time() - float(stale_cache.get("cached_at", _time.time()))) if isinstance(stale_cache, dict) else 0
+        positions = len(stale_cache.get("positions", [])) if isinstance(stale_cache, dict) else 0
+        _logger.warning("[KIS][BALANCE][STALE_CACHE] age_sec=%s positions=%s", age, positions)
+        return {"status": "WARN", "reason": "BALANCE_TIMEOUT_STALE_CACHE", "balance": stale_cache, "entry_allowed": False, "exit_allowed": True}
+    if allow:
+        _logger.warning("[KIS][BALANCE][FAIL_SOFT] env=%s action=entry_block_exit_continue", env)
+        _logger.info("[RUN_SUMMARY][RESULT] status=WARN reason=BALANCE_TIMEOUT_FAIL_SOFT")
+        return {"status": "WARN", "reason": "BALANCE_TIMEOUT_FAIL_SOFT", "balance": None, "entry_allowed": False, "exit_allowed": True}
+    raise exc

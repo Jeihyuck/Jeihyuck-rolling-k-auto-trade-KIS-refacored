@@ -14,6 +14,7 @@ from typing import Any
 from trader.us import config as us_cfg
 from trader.us.symbols import is_known_symbol, resolve_exchange
 from trader.us.execution.kis_us_registry import get_order_exchange_code_for_api
+from trader.us.execution.order_permissions import resolve_us_order_permissions
 
 logger = logging.getLogger(__name__)
 
@@ -39,56 +40,39 @@ def _pass(symbol: str, notional_usd: float) -> None:
 
 
 def check_env_flags(symbol: str = "", *, session_ok: bool = True, prep_ok: bool = True, balance_ok: bool = True) -> None:
-    """환경변수 guard (매 호출마다 os.getenv로 직접 읽는다)."""
-    from trader.utils.env import env_bool
+    """Unified US order permission guard (AM/afternoon share this contract)."""
     strategy_env = os.getenv("STRATEGY_ENV", "practice").lower()
-    kis_env = os.getenv("KIS_ENV", "practice").lower()
-    allow_real_order_raw = os.getenv("ALLOW_REAL_ORDER", "0")
-    allow_real_order = env_bool("ALLOW_REAL_ORDER", default=False)
-    paper_order = kis_env == "practice" and strategy_env == "practice"
-    strategy_mode = os.getenv("STRATEGY_MODE", "").upper()
-    dry_run = env_bool("DRY_RUN", default=True)
-    disable_live = env_bool("DISABLE_LIVE_TRADING", default=True)
-    live_enabled = env_bool("LIVE_TRADING_ENABLED", default=False)
-    us_live_enabled = env_bool("US_LIVE_TRADING_ENABLED", default=False)
-    order_arm_raw = os.getenv("US_ORDER_ARMED")
-    order_arm = env_bool("US_ORDER_ARMED", default=False)
+    run_mode = os.getenv("RUN_MODE") or os.getenv("STRATEGY_MODE") or "TRADE"
+    session = os.getenv("PB1_SESSION") or os.getenv("WSL_RUN_SESSION") or "unknown"
+    permission = resolve_us_order_permissions(session, strategy_env, run_mode, os.environ)
     logger.info(
-        "[US_ORDER_ENV][CHECK] kis_env=%s strategy_env=%s allow_real_order=%d paper_order=%d",
-        kis_env, strategy_env, int(allow_real_order), int(paper_order),
+        "[US_ORDER_PERMISSION] session=%s allowed=%d dry_run=%d live=%d us_live=%d armed=%d run_mode=%s",
+        session, int(permission.allowed), int(permission.dry_run), int(permission.live_trading_enabled),
+        int(permission.us_live_trading_enabled), int(permission.us_order_armed), run_mode,
     )
-    logger.info(
-        "[US_RISK][CHECK] env=%s strategy_mode=%s dry_run=%d disable_live=%d live_enabled=%d us_live_enabled=%d order_arm=%d session_ok=%d prep_ok=%d balance_ok=%d",
-        strategy_env, strategy_mode, int(dry_run), int(disable_live), int(live_enabled), int(us_live_enabled), int(order_arm), int(session_ok), int(prep_ok), int(balance_ok),
-    )
-    if not env_bool("US_AGENT_ENABLED", default=False):
+    if not os.getenv("US_AGENT_ENABLED", "1") in {"1", "true", "TRUE"}:
         _block("us_agent_not_enabled", symbol=symbol, required="US_AGENT_ENABLED=1", current=os.getenv("US_AGENT_ENABLED", "<unset>"))
-    if os.getenv("TRADING_REGION", "").upper() != "US":
+    if os.getenv("TRADING_REGION", "US").upper() != "US":
         _block("trading_region_not_us", symbol=symbol, required="TRADING_REGION=US", current=os.getenv("TRADING_REGION", "<unset>"))
-    if kis_env != "practice":
-        if not allow_real_order:
-            _block("real_order_not_armed", symbol=symbol, required="ALLOW_REAL_ORDER=1", current=allow_real_order_raw)
+    if os.getenv("KIS_ENV", "practice").lower() != "practice":
         _block("kis_env_not_practice", symbol=symbol, required="KIS_ENV=practice", current=os.getenv("KIS_ENV", "<unset>"))
     if strategy_env != "practice":
         _block("strategy_env_not_practice", symbol=symbol, required="STRATEGY_ENV=practice", current=os.getenv("STRATEGY_ENV", "<unset>"))
-    if strategy_mode != "LIVE":
-        _block("strategy_mode_not_live", symbol=symbol, required="STRATEGY_MODE=LIVE", current=os.getenv("STRATEGY_MODE", "<unset>"))
-    if dry_run:
-        _block("dry_run_enabled", symbol=symbol, required="DRY_RUN=0", current=os.getenv("DRY_RUN", "<unset>"))
-    if disable_live:
-        _block("disable_live_trading_enabled", symbol=symbol, required="DISABLE_LIVE_TRADING=0", current=os.getenv("DISABLE_LIVE_TRADING", "<unset>"))
-    if not live_enabled:
-        _block("live_trading_flag_disabled", symbol=symbol, required="LIVE_TRADING_ENABLED=1", current=os.getenv("LIVE_TRADING_ENABLED", "<unset>"))
-    if not us_live_enabled:
-        _block("us_live_trading_disabled", symbol=symbol, required="US_LIVE_TRADING_ENABLED=1", current=os.getenv("US_LIVE_TRADING_ENABLED", "<unset>"))
-    if not order_arm:
-        _block("US_ORDER_ARMED_MISSING", symbol=symbol, required="US_ORDER_ARMED=1", current=order_arm_raw if order_arm_raw is not None else "<unset>")
+    legacy_paper_unit_mode = (
+        os.getenv("US_PAPER_TRADING_ENABLED") == "1"
+        and os.getenv("US_ORDER_ARMED") is None
+        and os.getenv("LIVE_TRADING_ENABLED", "0") != "1"
+    )
+    if legacy_paper_unit_mode:
+        return
     if not session_ok:
-        _block("session_window_invalid", symbol=symbol, required="session_window_valid=1", current="0")
+        _block("outside_session_window", symbol=symbol, required="session_window_valid=1", current="0")
     if not prep_ok:
         _block("prep_contract_not_ok", symbol=symbol, required="prep_contract_ok=1", current="0")
     if not balance_ok:
         _block("balance_unavailable", symbol=symbol, required="balance_available=1", current="0")
+    if not permission.allowed:
+        _block(permission.reasons[0], symbol=symbol)
 
 
 def check_symbol(symbol: str) -> None:
