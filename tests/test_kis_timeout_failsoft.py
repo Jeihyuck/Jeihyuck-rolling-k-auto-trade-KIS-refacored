@@ -60,3 +60,53 @@ def test_pb1_engine_balance_failsoft_env_gates(monkeypatch):
     engine.balance_fail_soft_exit_allowed = True
     assert "balance_fail_soft_entry_disabled" in engine._order_precheck_gate_reasons(side="BUY", stage="PB1-ENTRY")
     assert engine._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT") == []
+
+
+def test_pb1_runner_balance_unknown_failsoft_precheck_continues_to_engine(monkeypatch):
+    from trader import pb1_runner
+    from trader.pb1_engine import PB1Engine
+    monkeypatch.setenv('KR_BALANCE_FAIL_SOFT_ACTIVE','1')
+    monkeypatch.setenv('ENTRY_ALLOWED','0')
+    monkeypatch.setenv('EXIT_ALLOWED','1')
+    cont, order_allowed, entry_reason, return_reason = pb1_runner._handle_balance_unknown_precheck(
+        balance_state=pb1_runner.BALANCE_STATE_UNKNOWN,
+        require_balance_for_entry=True,
+        allow_compute_without_kis=False,
+        order_allowed=True,
+        entry_block_reason=None,
+    )
+    assert cont is True
+    assert order_allowed is False
+    assert entry_reason == 'BALANCE_FAIL_SOFT_ENTRY_DISABLED'
+    assert return_reason is None
+    engine = PB1Engine.__new__(PB1Engine)
+    engine.trading_day = True
+    engine.order_allowed = order_allowed
+    engine.force_block_live = False
+    engine.intended_live = True
+    engine.strategy_mode = 'LIVE'
+    engine.market_window_name = 'day'
+    engine.force_entry_window_override = False
+    engine.session_recovery_continue = False
+    engine.am_recovery_continue = False
+    engine.balance_fail_soft_active = True
+    engine.balance_fail_soft_entry_allowed = False
+    engine.balance_fail_soft_exit_allowed = True
+    assert 'balance_fail_soft_entry_disabled' in engine._order_precheck_gate_reasons(side='BUY', stage='PB1-ENTRY')
+    assert engine._order_precheck_gate_reasons(side='SELL', stage='PB1-EXIT') == []
+
+
+def test_pb1_runner_balance_unknown_without_failsoft_degrades(monkeypatch):
+    from trader import pb1_runner
+    monkeypatch.delenv('KR_BALANCE_FAIL_SOFT_ACTIVE', raising=False)
+    monkeypatch.delenv('ENTRY_ALLOWED', raising=False)
+    monkeypatch.delenv('EXIT_ALLOWED', raising=False)
+    cont, order_allowed, entry_reason, return_reason = pb1_runner._handle_balance_unknown_precheck(
+        balance_state=pb1_runner.BALANCE_STATE_UNKNOWN,
+        require_balance_for_entry=True,
+        allow_compute_without_kis=False,
+        order_allowed=True,
+        entry_block_reason=None,
+    )
+    assert cont is False
+    assert return_reason == 'DEGRADED_BALANCE_UNKNOWN'
