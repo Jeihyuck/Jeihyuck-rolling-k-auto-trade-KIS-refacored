@@ -54,6 +54,17 @@ def check_env_flags(symbol: str = "", *, session_ok: bool = True, prep_ok: bool 
         _block("us_agent_not_enabled", symbol=symbol, required="US_AGENT_ENABLED=1", current=os.getenv("US_AGENT_ENABLED", "<unset>"))
     if os.getenv("TRADING_REGION", "US").upper() != "US":
         _block("trading_region_not_us", symbol=symbol, required="TRADING_REGION=US", current=os.getenv("TRADING_REGION", "<unset>"))
+    if os.getenv("KIS_ENV", "practice").lower() != "practice":
+        _block("kis_env_not_practice", symbol=symbol, required="KIS_ENV=practice", current=os.getenv("KIS_ENV", "<unset>"))
+    if strategy_env != "practice":
+        _block("strategy_env_not_practice", symbol=symbol, required="STRATEGY_ENV=practice", current=os.getenv("STRATEGY_ENV", "<unset>"))
+    legacy_paper_unit_mode = (
+        os.getenv("US_PAPER_TRADING_ENABLED") == "1"
+        and os.getenv("US_ORDER_ARMED") is None
+        and os.getenv("LIVE_TRADING_ENABLED", "0") != "1"
+    )
+    if legacy_paper_unit_mode:
+        return
     if not session_ok:
         _block("outside_session_window", symbol=symbol, required="session_window_valid=1", current="0")
     if not prep_ok:

@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from trader.kis_wrapper import KisAPI, KisBalanceUnavailable
+from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, resolve_kr_balance_fail_soft
 from trader.kr.runner.session_policy import exit_code_for_result, kr_am_policy, kr_prep_schedule_guard, now_kst
 from trader.kr.runner.prep_artifacts import find_and_repair_kr_prep_artifact, mirror_kr_prep_artifacts
 
@@ -94,11 +94,21 @@ def _run_prep(env: str) -> dict[str, Any]:
     if guard.action == "BLOCK":
         logger.error("[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW")
         return {"status": "FAIL", "reason": "OUTSIDE_PREP_WINDOW", "exit_code": 2}
+    run_started_ts = _now_kst().timestamp()
     exit_code = int(prep_runner.main() or 0)
-    source, rows = _find_final30_source()
-    if source and rows:
-        today = _now_kst().strftime("%Y-%m-%d")
-        mirror_kr_prep_artifacts(final30_path=source, env=env, as_of=os.getenv("KR_PREP_AS_OF", today), trade_date=os.getenv("KR_TRADE_DATE", today))
+    today = _now_kst().strftime("%Y-%m-%d")
+    trade_date = os.getenv("KR_TRADE_DATE", today)
+    artifact = find_and_repair_kr_prep_artifact(env=env, trade_date=trade_date, as_of=os.getenv("KR_PREP_AS_OF") or None, allow_stale_canonical_fallback=True)
+    source, rows = artifact.final30_path or artifact.source, artifact.rows
+    fresh_artifact = bool(source and Path(source).exists() and Path(source).stat().st_mtime >= run_started_ts)
+    if exit_code != 0 and not (artifact.ok and fresh_artifact):
+        logger.error("[KR_PREP][FAIL] reason=PREP_RUNNER_FAILED exit_code=%s fresh_artifact=%d artifact_ok=%d", exit_code, int(fresh_artifact), int(artifact.ok))
+        logger.info("[RUN_SUMMARY][RESULT] session=prep status=FAIL reason=PREP_RUNNER_FAILED")
+        return {"status": "FAIL", "reason": "PREP_RUNNER_FAILED", "rows": rows, "exit_code": 1}
+    if not artifact.ok:
+        logger.error("[KR_PREP][FAIL] reason=%s rows=%s", artifact.reason, rows)
+        logger.info("[RUN_SUMMARY][RESULT] session=prep status=FAIL reason=%s", artifact.reason)
+        return {"status": "FAIL", "reason": artifact.reason, "rows": rows, "exit_code": 2}
     _write_prep_contract(rows)
     if rows != 30:
         _write_prep_summary(rows, "FAIL", "FINAL30_ROW_COUNT")
@@ -110,24 +120,35 @@ def _run_prep(env: str) -> dict[str, Any]:
     logger.info("[KR_PREP][ARTIFACT] trade_date=%s as_of=%s rows=%s path=%s", os.getenv("KR_TRADE_DATE", today), os.getenv("KR_PREP_AS_OF", today), rows, source)
     logger.info("[KR_PREP][CONTRACT] contract_ok=1 trade_can_proceed=1 final30_rows=%s", rows)
     logger.info("[KR_PREP][DONE] status=OK")
-    logger.info("[RUN_SUMMARY][RESULT] session=prep status=OK reason=KR_PREP_DONE")
-    return {"status": "OK", "reason": "KR_PREP_DONE", "rows": rows, "exit_code": exit_code}
+    reason = "RECOVERED_WITH_ARTIFACT" if exit_code != 0 else "KR_PREP_DONE"
+    logger.info("[RUN_SUMMARY][RESULT] session=prep status=OK reason=%s", reason)
+    return {"status": "OK", "reason": reason, "rows": rows, "exit_code": 0}
 
 
 def _guard_trade_session(session: str) -> dict[str, Any] | None:
     now = _now_kst()
     tag = f"KR_{session.upper()}" if session != "afternoon" else "KR_AFTERNOON"
     if session == "am":
-        decision = kr_am_policy(now, max_wait_seconds=int(os.getenv("KR_AM_MAX_WAIT_SECONDS", os.getenv("MAX_WAIT_SECONDS", "999999"))))
-        if decision.reason == "TOO_EARLY":
-            logger.warning("[KR_AM][TOO_EARLY] now=%s target=%s wait_seconds=%s", now.isoformat(), decision.target.isoformat() if decision.target else "", decision.wait_seconds)
+        max_wait = int(os.getenv("KR_AM_MAX_WAIT_SECONDS", os.getenv("MAX_WAIT_SECONDS", "999999")))
+        decision = kr_am_policy(now, max_wait_seconds=max_wait)
+        if decision.reason == "TOO_EARLY_FAIL":
+            logger.warning("[KR_AM][TOO_EARLY] now=%s reason=TOO_EARLY_FAIL", now.isoformat())
+        if decision.action == "FAIL":
+            logger.error("[KR_AM][FAIL] reason=%s now=%s target=%s wait_seconds=%s", decision.reason, now.isoformat(), decision.target.isoformat() if decision.target else "", decision.wait_seconds)
+            logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=FAIL reason=%s orders_intent=0 orders_ack=0 blocked=0", session, decision.reason)
+            return {"status": "FAIL", "reason": decision.reason, "exit_code": decision.exit_code}
         if decision.action == "WAIT":
             import time as _time
             logger.info("[KR_AM][WAIT_UNTIL_TARGET] now=%s target=%s wait_seconds=%s", now.isoformat(), decision.target.isoformat() if decision.target else "", decision.wait_seconds)
             if decision.wait_seconds > 0 and not os.getenv("FORCE_NOW"):
                 _time.sleep(decision.wait_seconds)
             logger.info("[KR_AM][WAIT_DONE] now=%s", _now_kst().isoformat())
-    result = find_and_repair_kr_prep_artifact(env=os.getenv("STRATEGY_ENV", "practice"))
+            decision = kr_am_policy(_now_kst(), max_wait_seconds=0)
+            if decision.action != "PROCEED":
+                logger.error("[KR_AM][FAIL] reason=WAIT_TRUNCATED_BEFORE_TARGET now=%s target=%s", _now_kst().isoformat(), decision.target.isoformat() if decision.target else "")
+                return {"status": "FAIL", "reason": "WAIT_TRUNCATED_BEFORE_TARGET", "exit_code": 2}
+    trade_date = os.getenv("KR_TRADE_DATE") or _now_kst().strftime("%Y-%m-%d")
+    result = find_and_repair_kr_prep_artifact(env=os.getenv("STRATEGY_ENV", "practice"), trade_date=trade_date)
     if result.source:
         logger.info("[KR_PREP_ARTIFACT][FOUND] source=%s path=%s", "legacy" if result.repaired else "canonical", result.source)
     if result.repaired:
@@ -146,16 +167,29 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
         KisAPI().get_balance_cached()
         return None
     except KisBalanceUnavailable as exc:
-        logger.error("[KR_SESSION][SAFE_STOP] session=%s reason=KIS_BALANCE_UNAVAILABLE err=%s", session, exc, exc_info=True)
-        logger.info("[RUN_SUMMARY][RESULT] session=%s status=SAFE_STOP reason=KIS_BALANCE_UNAVAILABLE", session)
-        return {
-            "status": "SAFE_STOP",
-            "reason": "KIS_BALANCE_UNAVAILABLE",
-            "order_allowed": 0,
-            "entry_allowed": 0,
-            "exit_allowed": 0,
-            "performance_reliable": 0,
-        }
+        env = os.getenv("STRATEGY_ENV", os.getenv("KIS_ENV", "practice"))
+        try:
+            fail_soft = resolve_kr_balance_fail_soft(exc, env=env)
+            logger.warning("[KR_SESSION][BALANCE_FAIL_SOFT] session=%s reason=%s", session, fail_soft.get("reason"))
+            return {
+                "status": "WARN",
+                "reason": fail_soft.get("reason", "BALANCE_TIMEOUT_FAIL_SOFT"),
+                "order_allowed": 0,
+                "entry_allowed": int(bool(fail_soft.get("entry_allowed"))),
+                "exit_allowed": int(bool(fail_soft.get("exit_allowed"))),
+                "performance_reliable": 0,
+            }
+        except Exception:
+            logger.error("[KR_SESSION][SAFE_STOP] session=%s reason=KIS_BALANCE_UNAVAILABLE err=%s", session, exc, exc_info=True)
+            logger.info("[RUN_SUMMARY][RESULT] session=%s status=SAFE_STOP reason=KIS_BALANCE_UNAVAILABLE", session)
+            return {
+                "status": "SAFE_STOP",
+                "reason": "KIS_BALANCE_UNAVAILABLE",
+                "order_allowed": 0,
+                "entry_allowed": 0,
+                "exit_allowed": 0,
+                "performance_reliable": 0,
+            }
 
 
 def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
