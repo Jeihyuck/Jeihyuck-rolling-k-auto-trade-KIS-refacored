@@ -44,6 +44,29 @@ def get_ny_trade_date(force_now: str | None = None) -> str:
     return datetime.now(tz=NY_TZ).strftime("%Y-%m-%d")
 
 
+def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int) -> dict:
+    sources = {
+        "db_orders": int(db_orders or 0),
+        "fills": int(fills or 0),
+        "balance_confirmed": int(balance_confirmed or 0),
+        "router_summary": int(router_summary or 0),
+    }
+    orders_ack = max(sources.values())
+    warnings = []
+    nonzero = [v for v in sources.values() if v > 0]
+    if nonzero and len(set(sources.values())) > 1:
+        warnings.append("SOURCE_MISMATCH")
+    if sources["fills"] < orders_ack:
+        warnings.append("FILL_API_LESS_THAN_ACK")
+    return {
+        **sources,
+        "orders_ack": orders_ack,
+        "fill_api_count": sources["fills"],
+        "balance_confirmed_count": sources["balance_confirmed"],
+        "warnings": warnings,
+    }
+
+
 def run_daily_report(
     env: str = "practice",
     session: str | None = None,
@@ -84,6 +107,8 @@ def run_daily_report(
         "orders_disabled": 0,
         "orders_signal_only": 0,
         "fills": 0,
+        "fill_api_count": 0,
+        "balance_confirmed_count": 0,
         "positions": 0,
         "watchlist_raw_count": 0,
         "watchlist_unique_count": 0,
@@ -204,6 +229,19 @@ def run_daily_report(
             except Exception as exc:
                 report["warnings"].append(f"positions_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] positions load failed: %s", exc)
+
+            db_ack = int(report.get("orders_ack", 0) or 0)
+            fill_count = int(report.get("fills", 0) or 0)
+            balance_confirmed = int(os.getenv("US_DAILY_BALANCE_CONFIRMED_COUNT", "0") or 0)
+            router_summary = int(os.getenv("US_DAILY_ROUTER_ACK_COUNT", "0") or 0)
+            reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)
+            report["orders_ack"] = reconciled["orders_ack"]
+            report["fill_api_count"] = reconciled["fill_api_count"]
+            report["balance_confirmed_count"] = reconciled["balance_confirmed_count"]
+            logger.info("[US_DAILY_REPORT][ORDER_SOURCES] db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", db_ack, fill_count, balance_confirmed, router_summary)
+            for warn in reconciled["warnings"]:
+                report["warnings"].append(warn)
+                logger.warning("[US_DAILY_REPORT][RECONCILE_WARN] reason=%s db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", warn, db_ack, fill_count, balance_confirmed, router_summary)
         
         except Exception as exc:
             report["errors"].append(f"DB_query_failed: {exc}")
@@ -268,6 +306,8 @@ def run_daily_report(
         f"| orders_disabled | {report['orders_disabled']} |",
         f"| orders_signal_only | {report['orders_signal_only']} |",
         f"| fills | {report['fills']} |",
+        f"| fill_api_count | {report['fill_api_count']} |",
+        f"| balance_confirmed_count | {report['balance_confirmed_count']} |",
         f"| positions | {report['positions']} |",
         "",
         "## Watchlist & Score Contract",

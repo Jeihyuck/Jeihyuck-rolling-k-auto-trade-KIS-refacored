@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable
+from trader.kr.runner.session_policy import exit_code_for_result, kr_am_policy, kr_prep_schedule_guard, now_kst
+from trader.kr.runner.prep_artifacts import find_and_repair_kr_prep_artifact, mirror_kr_prep_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +32,7 @@ def _setup_logging() -> None:
 
 
 def _now_kst() -> datetime:
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("Asia/Seoul"))
-    except Exception:
-        return datetime.now()
+    return now_kst()
 
 
 def _load_json(path: Path) -> Any:
@@ -51,22 +49,9 @@ def _rows_from_payload(payload: Any) -> list[Any]:
 
 
 def _find_final30_source() -> tuple[Path | None, int]:
-    today = _now_kst().strftime("%Y-%m-%d")
-    candidates = [
-        ROOT / "signals/kr/final30_scored.json",
-        ROOT / "signals/kr/latest_final30_scored.json",
-        ROOT / "runtime/kr/watchlist" / today / "final30_scored.json",
-    ]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            rows = _rows_from_payload(_load_json(path))
-        except Exception as exc:
-            logger.warning("[KR_PREP_GUARD][WARN] source=%s err=%s", path, exc)
-            continue
-        if rows:
-            return path, len(rows)
+    result = find_and_repair_kr_prep_artifact(env=os.getenv("STRATEGY_ENV", "practice"))
+    if result.source:
+        return result.final30_path or result.source, result.rows
     return None, 0
 
 
@@ -104,8 +89,16 @@ def _run_prep(env: str) -> dict[str, Any]:
     logger.info("[KR_SESSION][START] session=prep env=%s", env)
     import trader.prep_runner as prep_runner
 
+    guard = kr_prep_schedule_guard()
+    logger.info("[KR_PREP][SCHEDULE_GUARD] now=%s allowed=%d reason=%s", _now_kst().strftime("%H:%M"), int(guard.action != "BLOCK"), guard.reason)
+    if guard.action == "BLOCK":
+        logger.error("[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW")
+        return {"status": "FAIL", "reason": "OUTSIDE_PREP_WINDOW", "exit_code": 2}
     exit_code = int(prep_runner.main() or 0)
     source, rows = _find_final30_source()
+    if source and rows:
+        today = _now_kst().strftime("%Y-%m-%d")
+        mirror_kr_prep_artifacts(final30_path=source, env=env, as_of=os.getenv("KR_PREP_AS_OF", today), trade_date=os.getenv("KR_TRADE_DATE", today))
     _write_prep_contract(rows)
     if rows != 30:
         _write_prep_summary(rows, "FAIL", "FINAL30_ROW_COUNT")
@@ -113,8 +106,9 @@ def _run_prep(env: str) -> dict[str, Any]:
         logger.info("[RUN_SUMMARY][RESULT] session=prep status=FAIL reason=FINAL30_ROW_COUNT")
         return {"status": "FAIL", "reason": "FINAL30_ROW_COUNT", "rows": rows, "exit_code": exit_code}
     _write_prep_summary(rows, "OK", "KR_PREP_DONE")
-    logger.info("[KR_PREP][ARTIFACT] path=%s rows=%s", source, rows)
-    logger.info("[KR_PREP][CONTRACT] contract_ok=1 trade_can_proceed=1")
+    today = _now_kst().strftime("%Y-%m-%d")
+    logger.info("[KR_PREP][ARTIFACT] trade_date=%s as_of=%s rows=%s path=%s", os.getenv("KR_TRADE_DATE", today), os.getenv("KR_PREP_AS_OF", today), rows, source)
+    logger.info("[KR_PREP][CONTRACT] contract_ok=1 trade_can_proceed=1 final30_rows=%s", rows)
     logger.info("[KR_PREP][DONE] status=OK")
     logger.info("[RUN_SUMMARY][RESULT] session=prep status=OK reason=KR_PREP_DONE")
     return {"status": "OK", "reason": "KR_PREP_DONE", "rows": rows, "exit_code": exit_code}
@@ -123,16 +117,27 @@ def _run_prep(env: str) -> dict[str, Any]:
 def _guard_trade_session(session: str) -> dict[str, Any] | None:
     now = _now_kst()
     tag = f"KR_{session.upper()}" if session != "afternoon" else "KR_AFTERNOON"
-    if session == "am" and now.hour < 9:
-        logger.info("[%s][SKIP] reason=PREOPEN_NO_ORDER", tag)
-        logger.info("[RUN_SUMMARY][RESULT] session=%s status=SKIP reason=PREOPEN_NO_ORDER", session)
-        return {"status": "SKIP", "reason": "PREOPEN_NO_ORDER"}
-    source, rows = _find_final30_source()
-    if not source:
-        logger.info("[%s][SKIP] reason=KR_PREP_ARTIFACT_MISSING", tag)
-        logger.info("[RUN_SUMMARY][RESULT] session=%s status=SKIP reason=KR_PREP_ARTIFACT_MISSING", session)
-        return {"status": "SKIP", "reason": "KR_PREP_ARTIFACT_MISSING"}
-    logger.info("[KR_PREP_GUARD][OK] final30=%s source=%s", rows, source)
+    if session == "am":
+        decision = kr_am_policy(now, max_wait_seconds=int(os.getenv("KR_AM_MAX_WAIT_SECONDS", os.getenv("MAX_WAIT_SECONDS", "999999"))))
+        if decision.reason == "TOO_EARLY":
+            logger.warning("[KR_AM][TOO_EARLY] now=%s target=%s wait_seconds=%s", now.isoformat(), decision.target.isoformat() if decision.target else "", decision.wait_seconds)
+        if decision.action == "WAIT":
+            import time as _time
+            logger.info("[KR_AM][WAIT_UNTIL_TARGET] now=%s target=%s wait_seconds=%s", now.isoformat(), decision.target.isoformat() if decision.target else "", decision.wait_seconds)
+            if decision.wait_seconds > 0 and not os.getenv("FORCE_NOW"):
+                _time.sleep(decision.wait_seconds)
+            logger.info("[KR_AM][WAIT_DONE] now=%s", _now_kst().isoformat())
+    result = find_and_repair_kr_prep_artifact(env=os.getenv("STRATEGY_ENV", "practice"))
+    if result.source:
+        logger.info("[KR_PREP_ARTIFACT][FOUND] source=%s path=%s", "legacy" if result.repaired else "canonical", result.source)
+    if result.repaired:
+        logger.info("[KR_PREP_ARTIFACT][REPAIRED] from=%s to=%s", result.source, result.final30_path)
+    if not result.ok:
+        logger.error("[%s][FAIL] reason=%s", tag, result.reason)
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=FAIL reason=%s orders_intent=0 orders_ack=0 blocked=0", session, result.reason)
+        return {"status": "FAIL", "reason": result.reason}
+    logger.info("[KR_PREP_ARTIFACT][VALID] trade_date=%s as_of=%s rows=%s trade_can_proceed=%d", (result.contract or {}).get("trade_date"), (result.contract or {}).get("as_of"), result.rows, int(bool((result.contract or {}).get("trade_can_proceed"))))
+    logger.info("[KR_SESSION][PROCEED] session=%s", session)
     return None
 
 
@@ -184,7 +189,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         sys.argv = old_argv
     status = "OK" if exit_code == 0 else "FAIL"
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s", session, status, exit_code)
-    logger.info("[RUN_SUMMARY][RESULT] session=%s status=%s", session, status)
+    logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=PB1_SESSION_DONE orders_intent=0 orders_ack=0 blocked=0", session, status)
     return {"status": status, "reason": "PB1_SESSION_DONE", "exit_code": exit_code}
 
 
@@ -202,9 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="KR PB1 session runner")
     parser.add_argument("--session", required=True, choices=["prep", "am", "afternoon", "close"])
     parser.add_argument("--env", default="practice")
+    parser.add_argument("--max-wait-seconds", type=int, default=None)
     args = parser.parse_args(argv)
+    if args.max_wait_seconds is not None:
+        os.environ["MAX_WAIT_SECONDS"] = str(args.max_wait_seconds)
     result = run_session(args.session, args.env)
-    return 0 if result.get("status") in {"OK", "SKIP", "SAFE_STOP"} else 1
+    return exit_code_for_result(result)
 
 
 if __name__ == "__main__":

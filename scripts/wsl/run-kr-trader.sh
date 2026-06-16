@@ -7,7 +7,10 @@ if [ "${ALLOW_LEGACY_KR_TRADER:-0}" != "1" ]; then
   exit 2
 fi
 
-cd /home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
+echo "[KR_TRADER][WARNING] PB1 scheduler forbidden; legacy execution manually allowed"
+REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
+if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
+cd "$REPO"
 
 mkdir -p runtime
 
