@@ -289,6 +289,26 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         os.environ["PB1_CLOSE_ENABLED"] = "1"
         os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] = "1"
         os.environ["KR_CLOSE_SESSION"] = "1"
+        phase_marker = ROOT / "runtime/kr/session" / ctx.trade_date.isoformat() / "close" / "phase.json"
+        phase_marker.parent.mkdir(parents=True, exist_ok=True)
+        phase_marker.write_text(
+            json.dumps(
+                {
+                    "phase": "close",
+                    "phase_executed": True,
+                    "force_phase": True,
+                    "skip_phase_window": False,
+                    "entry_enabled": False,
+                    "exit_enabled": True,
+                    "close_enabled": True,
+                    "close_liquidation_enabled": True,
+                    "created_at_kst": _now_kst().isoformat(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         logger.info("[KR_CLOSE][PHASE] phase=close entry_enabled=0 exit_enabled=1 close_enabled=1 close_liquidation_enabled=1")
     guarded = _guard_trade_session(session, ctx)
     if guarded is not None:
@@ -314,9 +334,24 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     finally:
         sys.argv = old_argv
     status = "OK" if exit_code == 0 else "FAIL"
+    if session == "close" and status == "OK" and str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper() == "SKIP_PHASE_WINDOW":
+        status = "FAIL"
+        exit_code = 2
+        logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s", session, status, exit_code)
     logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=PB1_SESSION_DONE orders_intent=0 orders_ack=0 blocked=0", session, status)
     result = {"status": status, "reason": "PB1_SESSION_DONE", "exit_code": exit_code}
+    if session == "close":
+        result.update({
+            "phase": "close",
+            "phase_executed": status != "FAIL",
+            "force_phase": True,
+            "skip_phase_window": status == "FAIL" and exit_code == 2,
+            "entry_enabled": False,
+            "exit_enabled": True,
+            "close_enabled": True,
+            "close_liquidation_enabled": True,
+        })
     if balance_state is not None and balance_state.get("status") == "WARN":
         result["balance_fail_soft"] = balance_state
     return result

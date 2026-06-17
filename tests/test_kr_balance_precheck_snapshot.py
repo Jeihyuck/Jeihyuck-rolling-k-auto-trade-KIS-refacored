@@ -40,3 +40,29 @@ def test_pb1_precheck_ok_without_snapshot_becomes_unknown(monkeypatch, tmp_path,
     assert state == pb1_runner.BALANCE_STATE_UNKNOWN
     assert snapshot is None
     assert source == "KIS"
+
+
+def test_diagnostics_manifest_reads_balance_warning(monkeypatch, tmp_path):
+    from trader.kr import diagnostics, artifacts
+
+    monkeypatch.setattr(diagnostics, "ROOT", tmp_path)
+    monkeypatch.setattr(artifacts, "ROOT", tmp_path)
+    trade_date = datetime(2026, 6, 17, tzinfo=ZoneInfo("Asia/Seoul")).date()
+    expected_as_of = datetime(2026, 6, 16, tzinfo=ZoneInfo("Asia/Seoul")).date()
+    balance_dir = tmp_path / "runtime/kr/session/2026-06-17/am"
+    balance_dir.mkdir(parents=True)
+    (balance_dir / "balance_precheck.json").write_text(
+        json.dumps({"state": "OK", "source": "KIS", "raw_snapshot_available": False, "cash": 0, "holdings_count": 0, "positions_summary": {}}),
+        encoding="utf-8",
+    )
+
+    path = diagnostics.write_kr_diagnostics_manifest(
+        trade_date=trade_date,
+        expected_as_of=expected_as_of,
+        session="am",
+        result={"status": "OK"},
+        env="practice",
+    )
+    manifest = json.loads(path.read_text())
+    assert manifest["balance"]["precheck_state"] == "UNKNOWN_WITHOUT_SNAPSHOT"
+    assert manifest["balance"]["warning"] == "OK state without snapshot was downgraded"

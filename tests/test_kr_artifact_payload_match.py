@@ -28,6 +28,30 @@ def test_payload_mismatch_rejected(tmp_path, monkeypatch):
     assert res.reason == "CODE_LIST_MISMATCH"
 
 
+def test_rank_and_hash_mismatch_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "ROOT", tmp_path)
+    trade_date = datetime.now(KST).date()
+    while trade_date.weekday() >= 5:
+        trade_date += timedelta(days=1)
+    expected = resolve_kr_expected_as_of(trade_date)
+    artifacts.publish_kr_prep_artifacts_atomic(trade_date=trade_date, expected_as_of=expected, actual_as_of=expected, env="practice", final30_rows=_rows(expected), db_exact_rows=30, metadata={})
+    runtime = tmp_path / "runtime/kr/watchlist" / trade_date.isoformat() / "final30_scored.json"
+    payload = json.loads(runtime.read_text())
+    payload["rows"][0]["rank_final30"] = 30
+    runtime.write_text(json.dumps(payload), encoding="utf-8")
+    res = artifacts.validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected, env="practice", allow_legacy=True)
+    assert res.ok is False
+    assert res.reason == "PAYLOAD_MISMATCH"
+
+    artifacts.publish_kr_prep_artifacts_atomic(trade_date=trade_date, expected_as_of=expected, actual_as_of=expected, env="practice", final30_rows=_rows(expected), db_exact_rows=30, metadata={})
+    payload = json.loads(runtime.read_text())
+    payload["rows"][0]["extra_hash_field"] = "changed"
+    runtime.write_text(json.dumps(payload), encoding="utf-8")
+    res = artifacts.validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected, env="practice", allow_legacy=True)
+    assert res.ok is False
+    assert res.reason == "PAYLOAD_MISMATCH"
+
+
 def test_valid_canonical_contracts_are_kept_and_legacy_quarantined(tmp_path, monkeypatch):
     monkeypatch.setattr(artifacts, "ROOT", tmp_path)
     trade_date = datetime.now(KST).date()

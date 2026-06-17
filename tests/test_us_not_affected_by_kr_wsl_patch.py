@@ -4,6 +4,8 @@ import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from trader.kr.market_scope import is_kr_market
 
 
@@ -18,6 +20,35 @@ def _set_us(monkeypatch):
 def test_us_market_scope_is_not_kr(monkeypatch):
     _set_us(monkeypatch)
     assert is_kr_market() is False
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("MARKET", "US"),
+        ("REGION", "US"),
+        ("TRADING_REGION", "US"),
+        ("PB1_MARKET_SCOPE", "US"),
+        ("EXCHANGE", "NYSE"),
+        ("EXCHANGE", "NASDAQ"),
+    ],
+)
+def test_us_scope_individual_values_are_not_kr(monkeypatch, key, value):
+    for env_key in ("MARKET", "REGION", "TRADING_REGION", "PB1_MARKET_SCOPE", "WSL_RUN_MARKET", "EXCHANGE"):
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv(key, value)
+    assert is_kr_market() is False
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("MARKET", "KR"), ("EXCHANGE", "KRX"), ("PB1_MARKET_SCOPE", "KRX")],
+)
+def test_kr_scope_values_are_kr(monkeypatch, key, value):
+    for env_key in ("MARKET", "REGION", "TRADING_REGION", "PB1_MARKET_SCOPE", "WSL_RUN_MARKET", "EXCHANGE"):
+        monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv(key, value)
+    assert is_kr_market() is True
 
 
 def test_us_prep_date_context_does_not_call_kr_calendar_or_artifacts(monkeypatch):
