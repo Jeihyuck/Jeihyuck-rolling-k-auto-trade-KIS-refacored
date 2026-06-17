@@ -117,6 +117,8 @@ from trader.run_context import RunContext
 from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
 from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of, resolve_trade_context, prev_business_day
+from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
+from trader.kr.market_scope import is_kr_market
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode, parse_bool_any
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
@@ -618,6 +620,12 @@ def _db_exact_scored_final30_abort_reason(exc: Exception | None = None) -> str:
 
 def _raise_entry_abort_precheck(reason: str) -> None:
     raise RuntimeError(f"ENTRY_ABORT_PRECHECK:{reason}")
+
+
+def _structured_entry_abort(reason: str, *, expected_as_of: str | None = None, db_rows: int | None = None) -> tuple[list[Path], bool, dict[str, int], str, str]:
+    logger.error("[PB1][ENTRY][ABORT] reason=%s expected_as_of=%s db_rows=%s", reason, expected_as_of or "", "" if db_rows is None else db_rows)
+    logger.info("[RUN_SUMMARY][RESULT] status=FAIL_PRECHECK reason=DB_EXACT_FINAL30_ZERO orders_intent=0 orders_ack=0")
+    return [], False, {}, "entry", "FAIL_PRECHECK"
 
 
 def _validate_trade_locked_final30_or_raise(*, final30_df: pd.DataFrame | None, source_name: str) -> None:
@@ -2189,6 +2197,9 @@ def _apply_trade_session_override_env(*, enabled: bool, degraded_session: bool, 
 
 
 def _evaluate_trade_session_start_guard(*, engine, env: str, now: datetime, session: str) -> dict[str, Any]:
+    if session == "close" or (os.getenv("FORCE_PB1_PHASE") or "").strip().lower() == "close":
+        logger.info("[PB1][PHASE] phase=close reason=forced_close_session entry_enabled=0 exit_enabled=1 close_enabled=1")
+        return {"skip": False, "recovery_used": False, "force_override_used": True, "exit_reason": "forced_close_session", "policy": {"should_run": True}}
     session_cfg = _session_cfg(session)
     if session_cfg is None:
         return {"skip": False, "recovery_used": False, "exit_reason": "none"}
@@ -2933,6 +2944,22 @@ def get_balance_state(
     except Exception:
         logger.exception("[PB1][BALANCE][FAIL] initial snapshot")
     return BALANCE_STATE_UNKNOWN, None, None
+
+
+def resolve_kr_balance_precheck_for_test(path: Path) -> tuple[str, dict | None, str | None]:
+    """Small testable adapter for KR session-level balance precheck restoration."""
+    pre = json.loads(Path(path).read_text(encoding="utf-8"))
+    state = str(pre.get("state") or "UNKNOWN").upper()
+    snapshot = pre.get("raw_snapshot") if isinstance(pre.get("raw_snapshot"), dict) else None
+    source = str(pre.get("source") or "NONE")
+    if state == "OK" and snapshot:
+        logger.info("[PB1][BALANCE_PRECHECK_USE] state=OK source=%s requery=0 snapshot=1", source)
+        return BALANCE_STATE_OK, snapshot, source
+    if state == "OK":
+        logger.info("[PB1][BALANCE_PRECHECK_USE] state=UNKNOWN_WITHOUT_SNAPSHOT source=%s requery=0 snapshot=0", source)
+        return BALANCE_STATE_UNKNOWN, None, source
+    logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=0", state, source)
+    return BALANCE_STATE_UNKNOWN, None, source
 
 
 def _diag_balance_probe_once_safe(*, logger, runtime_root_dir: Path, kis_factory):
@@ -4150,8 +4177,13 @@ def run_once(
     # ✅ CRITICAL: Trade는 장중에 "전일 영업일 derived"를 사용
     if not env_effective:
         raise RuntimeError("[RUN_ONCE][ENV] env_effective is empty before resolve_trade_context")
-    trade_ctx = resolve_trade_context(now=now, env=env_effective)
-    trade_date = date.fromisoformat(str(trade_ctx["trade_date"]))
+    if is_kr_market():
+        trade_date = resolve_kr_trade_date(now)
+        as_of_date = resolve_kr_expected_as_of(trade_date)
+        trade_ctx = {"trade_date": trade_date.isoformat(), "as_of": as_of_date.isoformat(), "reason": "KR_CALENDAR"}
+    else:
+        trade_ctx = resolve_trade_context(now=now, env=env_effective)
+        trade_date = date.fromisoformat(str(trade_ctx["trade_date"]))
     as_of = str(trade_ctx["as_of"])
     asof_reason = str(trade_ctx["reason"])
     run_ctx: dict[str, Any] = {
@@ -4241,6 +4273,12 @@ def run_once(
     max_wait_s = int(PB1_MAX_WAIT_FOR_WINDOW_MIN) * 60
     entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=PB1_ENTRY_ENABLED)
     force_phase_env = os.getenv("FORCE_PB1_PHASE") or ""
+    if _resolve_session_kind() == "close" or force_phase_env.strip().lower() == "close":
+        os.environ["FORCE_MARKET_WINDOW"] = "close"
+        force_phase_env = "close"
+        market_window = "close"
+        entry_flag = parse_env_flag("PB1_ENTRY_ENABLED", default=False)
+        logger.info("[PB1][PHASE] phase=close reason=forced_close_session entry_enabled=0 exit_enabled=1 close_enabled=1")
     phase_seed = force_phase_env if force_phase_env else (None if args.phase == "auto" else args.phase)
     resolved_window, window_label, resolved_phase, phase_reason, phase_window, context_reasons = _resolve_market_context(
         now=now,
@@ -5167,7 +5205,31 @@ def run_once(
         balance_snapshot_raw: dict | None = None
         balance_source: str | None = None
         balance_state = BALANCE_STATE_UNKNOWN
-        if kis:
+        precheck_path = os.getenv("KR_BALANCE_PRECHECK_PATH", "").strip()
+        if precheck_path and Path(precheck_path).exists():
+            try:
+                pre = json.loads(Path(precheck_path).read_text(encoding="utf-8"))
+                state = str(pre.get("state") or "UNKNOWN").upper()
+                snapshot = pre.get("raw_snapshot") if isinstance(pre.get("raw_snapshot"), dict) else None
+                if state == "OK" and snapshot:
+                    balance_state = BALANCE_STATE_OK
+                    balance_snapshot_raw = snapshot
+                elif state == "OK":
+                    state = "UNKNOWN_WITHOUT_SNAPSHOT"
+                    balance_state = BALANCE_STATE_UNKNOWN
+                else:
+                    balance_state = BALANCE_STATE_UNKNOWN
+                balance_source = str(pre.get("source") or "NONE")
+                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=%d", state, balance_source, int(bool(balance_snapshot_raw)))
+                if state != "OK":
+                    logger.warning("[PB1][ENTRY_BLOCKED] reason=balance_unknown")
+                    if bool(pre.get("exit_allowed")):
+                        logger.warning("[PB1][EXIT_CONTINUE] reason=balance_unknown_exit_allowed")
+                    if bool(pre.get("close_allowed")):
+                        logger.warning("[PB1][CLOSE_CONTINUE] reason=balance_unknown_close_allowed")
+            except Exception as exc:
+                logger.warning("[PB1][BALANCE_PRECHECK_USE][FAIL] err=%s", exc)
+        elif kis:
             _log_balance_cache(force=False)
             balance_state, balance_snapshot_raw, balance_source = get_balance_state(
                 kis=kis,
@@ -7506,6 +7568,23 @@ def main() -> int:
                 result_status,
                 phase_for_log,
             )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if msg.startswith("ENTRY_ABORT_PRECHECK:"):
+            reason = msg.split(":", 1)[1]
+            logger.error("[PB1][ENTRY][ABORT] reason=%s expected_as_of=%s db_rows=", reason, os.getenv("KR_EXPECTED_AS_OF") or os.getenv("AS_OF_OVERRIDE") or "")
+            logger.info("[RUN_SUMMARY][RESULT] status=FAIL_PRECHECK reason=DB_EXACT_FINAL30_ZERO orders_intent=0 orders_ack=0")
+            result_status = "FAIL_PRECHECK"
+            main_exit_reason = "DB_EXACT_FINAL30_ZERO"
+        else:
+            logger.error(
+                "[PB1][FATAL_GUARD] unexpected runtime error ctx_env=%s strategy_env=%s kis_env=%s",
+                ctx.env,
+                os.getenv("STRATEGY_ENV"),
+                os.getenv("KIS_ENV"),
+                exc_info=True,
+            )
+            result_status = "ERROR"
     except Exception:
         logger.error(
             "[PB1][FATAL_GUARD] unexpected error ctx_env=%s strategy_env=%s kis_env=%s",
