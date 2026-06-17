@@ -190,7 +190,22 @@ def _guard_trade_session(session: str, ctx: KrSessionContext) -> dict[str, Any] 
         target_raw = os.getenv("KR_AM_ENTRY_START_TIME", "09:00:05")
         hh, mm, ss = [int(x) for x in target_raw.split(":")]
         logger.info("[KR_AM][PREOPEN_WAIT] trade_date=%s target_time=%s", ctx.trade_date, target_raw)
-        wait_until_kr_am_target(trade_date=ctx.trade_date, target_time=time(hh, mm, ss), max_wait_sec=int(os.getenv("KR_AM_MAX_WAIT_SEC", os.getenv("KR_AM_MAX_WAIT_SECONDS", "900"))))
+        try:
+            wait_until_kr_am_target(
+                trade_date=ctx.trade_date,
+                target_time=time(hh, mm, ss),
+                max_wait_sec=int(os.getenv("KR_AM_MAX_WAIT_SEC", os.getenv("KR_AM_MAX_WAIT_SECONDS", "900"))),
+            )
+        except RuntimeError as exc:
+            if str(exc) == "KR_AM_WAIT_TOO_LONG":
+                logger.error(
+                    "[KR_AM][FAIL] reason=KR_AM_WAIT_TOO_LONG trade_date=%s target_time=%s",
+                    ctx.trade_date,
+                    target_raw,
+                )
+                logger.info("[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=KR_AM_WAIT_TOO_LONG orders_intent=0 orders_ack=0 blocked=0")
+                return {"status": "FAIL", "reason": "KR_AM_WAIT_TOO_LONG", "exit_code": 2}
+            raise
         logger.info("[KR_AM][RUN_AFTER_TARGET] trade_date=%s", ctx.trade_date)
     if session == "close":
         logger.info("[KR_SESSION][CLOSE_CONTINUE] reason=EXIT_ONLY_DOES_NOT_REQUIRE_ENTRY_ARTIFACT")
