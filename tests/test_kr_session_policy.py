@@ -25,4 +25,4 @@ def test_kr_am_0800_too_early_fail():
 
 def test_kr_am_wait_truncated_before_target():
     d=kr_am_policy(datetime(2026,6,16,8,55,1,tzinfo=KST), max_wait_seconds=10)
-    assert d.action=='FAIL' and d.reason=='WAIT_TRUNCATED_BEFORE_TARGET' and d.exit_code==2
+    assert d.action=='FAIL' and d.reason=='KR_AM_WAIT_TOO_LONG' and d.exit_code==2

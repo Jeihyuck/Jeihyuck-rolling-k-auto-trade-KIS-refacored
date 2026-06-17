@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, time
+import time as time_mod
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -45,11 +46,40 @@ def kr_am_policy(now: datetime | None = None, *, max_wait_seconds: int | None = 
     if now < target:
         required_wait = max(0, int((target - now).total_seconds()))
         if max_wait_seconds is not None and int(max_wait_seconds) < required_wait:
-            return SessionDecision("FAIL", "WAIT_TRUNCATED_BEFORE_TARGET", int(max_wait_seconds), 2, target)
+            return SessionDecision("FAIL", "KR_AM_WAIT_TOO_LONG", int(max_wait_seconds), 2, target)
         return SessionDecision("WAIT", "WAIT_UNTIL_TARGET", required_wait, 0, target)
     if now <= allow_until:
         return SessionDecision("PROCEED", "ON_TIME", 0, 0, target)
     return SessionDecision("PROCEED", "LATE_START_RISK_MANAGEMENT_ALLOWED", 0, 0, target)
+
+
+def combine_kst(trade_date: date, target_time: time) -> datetime:
+    return datetime.combine(trade_date, target_time, tzinfo=KST)
+
+
+def wait_until_kr_am_target(
+    *,
+    trade_date: date,
+    target_time: time,
+    now_fn=now_kst,
+    max_wait_sec: int = 900,
+) -> None:
+    target_dt = combine_kst(trade_date, target_time)
+    now = now_fn().astimezone(KST)
+    if now >= target_dt:
+        logger = __import__("logging").getLogger(__name__)
+        logger.info("[KR_AM][WAIT_SKIP] reason=ALREADY_AFTER_TARGET now=%s target=%s", now, target_dt)
+        return
+    wait_sec = (target_dt - now).total_seconds()
+    logger = __import__("logging").getLogger(__name__)
+    if wait_sec > max_wait_sec:
+        logger.error("[KR_AM][WAIT_FAIL] reason=AM_WAIT_TOO_LONG wait_sec=%s max_wait_sec=%s", wait_sec, max_wait_sec)
+        raise RuntimeError("KR_AM_WAIT_TOO_LONG")
+    logger.info("[KR_AM][WAIT_UNTIL_TARGET] target=%s wait_seconds=%.1f", target_dt, wait_sec)
+    while now_fn().astimezone(KST) < target_dt:
+        remaining = (target_dt - now_fn().astimezone(KST)).total_seconds()
+        time_mod.sleep(max(0.1, min(1.0, remaining)))
+    logger.info("[KR_AM][WAIT_DONE] reached=1 now=%s target=%s", now_fn().astimezone(KST), target_dt)
 
 
 def kr_prep_schedule_guard(now: datetime | None = None, *, allow_outside: bool | None = None) -> SessionDecision:
@@ -71,7 +101,7 @@ EXIT_CODE_BY_REASON = {
     "INTENTIONAL_NOOP": 0,
     "PREOPEN_NO_ORDER": 2,
     "TOO_EARLY_FAIL": 2,
-    "WAIT_TRUNCATED_BEFORE_TARGET": 2,
+    "KR_AM_WAIT_TOO_LONG": 2,
     "KR_PREP_ARTIFACT_MISSING": 2,
     "REQUIRED_PREP_NOT_READY": 2,
     "STALE_PREP_ARTIFACT": 2,
