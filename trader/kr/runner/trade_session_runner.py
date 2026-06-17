@@ -55,6 +55,42 @@ class BalancePrecheck:
     exit_allowed: bool
     close_allowed: bool
     reason: str | None
+    cash: int | None = None
+    holdings_count: int | None = None
+    positions_summary: dict[str, Any] | None = None
+    raw_snapshot_available: bool = False
+    raw_snapshot: dict[str, Any] | None = None
+
+
+def _balance_cash(snapshot: Any) -> int | None:
+    if not isinstance(snapshot, dict):
+        return None
+    out2 = snapshot.get("output2")
+    summary = out2[0] if isinstance(out2, list) and out2 else out2 if isinstance(out2, dict) else {}
+    for key in ("dnca_tot_amt", "tot_evlu_amt", "cash", "cash_krw"):
+        try:
+            if key in summary:
+                return int(float(str(summary.get(key)).replace(",", "")))
+        except Exception:
+            continue
+    return None
+
+
+def _balance_holdings_count(snapshot: Any) -> int | None:
+    if not isinstance(snapshot, dict):
+        return None
+    rows = snapshot.get("output1")
+    if not isinstance(rows, list):
+        return None
+    count = 0
+    for row in rows:
+        try:
+            qty = int(float(str((row or {}).get("hldg_qty") or (row or {}).get("qty") or "0").replace(",", "")))
+        except Exception:
+            qty = 0
+        if qty > 0:
+            count += 1
+    return count
 
 
 def _setup_logging() -> None:
@@ -175,12 +211,27 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
     td = os.getenv("KR_TRADE_DATE") or _now_kst().strftime("%Y-%m-%d")
     out = ROOT / "runtime/kr/session" / td / session / "balance_precheck.json"
     try:
-        KisAPI().get_balance_cached()
-        pre = BalancePrecheck("OK", "KIS", _now_kst(), True, True, True, None)
+        raw = KisAPI().get_balance_cached()
+        snapshot = raw[0] if isinstance(raw, tuple) else raw
+        snapshot = snapshot if isinstance(snapshot, dict) else None
+        pre = BalancePrecheck(
+            "OK",
+            "KIS",
+            _now_kst(),
+            True,
+            True,
+            True,
+            None,
+            cash=_balance_cash(snapshot),
+            holdings_count=_balance_holdings_count(snapshot),
+            positions_summary={"holdings_count": _balance_holdings_count(snapshot)},
+            raw_snapshot_available=bool(snapshot),
+            raw_snapshot=snapshot,
+        )
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(asdict(pre), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
         os.environ["KR_BALANCE_PRECHECK_PATH"] = str(out)
-        logger.info("[KR_SESSION][BALANCE_PRECHECK] state=OK source=KIS entry_allowed=1 exit_allowed=1 close_allowed=1")
+        logger.info("[KR_SESSION][BALANCE_PRECHECK] state=OK source=KIS entry_allowed=1 exit_allowed=1 close_allowed=1 snapshot=%d", int(bool(snapshot)))
         return None
     except KisBalanceUnavailable as exc:
         env = os.getenv("STRATEGY_ENV", os.getenv("KIS_ENV", "practice"))
@@ -190,11 +241,11 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
             entry_allowed = False
             exit_allowed = bool(fail_soft.get("exit_allowed")) or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_EXIT", "1") == "1"
             close_allowed = session == "close" or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_CLOSE", "1") == "1"
-            pre = BalancePrecheck("TIMEOUT", "CACHE" if (exit_allowed or close_allowed) else "NONE", _now_kst(), entry_allowed, exit_allowed, close_allowed, fail_soft.get("reason", "BALANCE_TIMEOUT_FAIL_SOFT"))
+            pre = BalancePrecheck("TIMEOUT", "CACHE" if (exit_allowed or close_allowed) else "NONE", _now_kst(), entry_allowed, exit_allowed, close_allowed, fail_soft.get("reason", "BALANCE_TIMEOUT_FAIL_SOFT"), raw_snapshot_available=False)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(asdict(pre), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
             os.environ["KR_BALANCE_PRECHECK_PATH"] = str(out)
-            logger.info("[KR_SESSION][BALANCE_PRECHECK] state=%s source=%s entry_allowed=%d exit_allowed=%d close_allowed=%d", pre.state, pre.source, int(pre.entry_allowed), int(pre.exit_allowed), int(pre.close_allowed))
+            logger.info("[KR_SESSION][BALANCE_PRECHECK] state=%s source=%s entry_allowed=%d exit_allowed=%d close_allowed=%d snapshot=0", pre.state, pre.source, int(pre.entry_allowed), int(pre.exit_allowed), int(pre.close_allowed))
             return {
                 "status": "WARN",
                 "reason": fail_soft.get("reason", "BALANCE_TIMEOUT_FAIL_SOFT"),
@@ -234,7 +285,11 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         os.environ["FORCE_MARKET_WINDOW"] = "close"
         os.environ["FORCE_PB1_PHASE"] = "close"
         os.environ["PB1_ENTRY_ENABLED"] = "0"
-        logger.info("[KR_CLOSE][PHASE] phase=close entry_enabled=0 exit_enabled=1 close_enabled=1")
+        os.environ["PB1_EXIT_ENABLED"] = "1"
+        os.environ["PB1_CLOSE_ENABLED"] = "1"
+        os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] = "1"
+        os.environ["KR_CLOSE_SESSION"] = "1"
+        logger.info("[KR_CLOSE][PHASE] phase=close entry_enabled=0 exit_enabled=1 close_enabled=1 close_liquidation_enabled=1")
     guarded = _guard_trade_session(session, ctx)
     if guarded is not None:
         return guarded

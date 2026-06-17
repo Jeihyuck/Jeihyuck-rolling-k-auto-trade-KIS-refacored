@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import hashlib
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
@@ -74,6 +75,27 @@ def _payload_asof(payload: Any) -> str | None:
     return None
 
 
+def _payload_hash(payload: Any) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _code_list(rows: list[Any]) -> list[str]:
+    return [str((row or {}).get("code") or (row or {}).get("symbol") or "").zfill(6) for row in rows if isinstance(row, dict)]
+
+
+def _rank_list(rows: list[Any]) -> list[Any] | None:
+    ranks = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        val = row.get("rank_final30", row.get("rank"))
+        if val is None:
+            return None
+        ranks.append(val)
+    return ranks
+
+
 def _reject(reason: str, *, trade_date: date, expected_as_of: date, path: Path | None = None, **details: Any) -> KrArtifactValidationResult:
     if path:
         logger.error("[KR_ARTIFACT][REJECT] reason=%s path=%s", reason, _rel(path))
@@ -117,8 +139,15 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
     lr, rr = _rows(lf), _rows(rf)
     if len(lr) != 30 or len(rr) != 30: return _reject("ROWS_NOT_30", trade_date=trade_date, expected_as_of=expected_as_of, rows={"latest":len(lr),"runtime":len(rr)})
     if (_payload_asof(lf) or exp)[:10] != exp or (_payload_asof(rf) or exp)[:10] != exp: return _reject("ASOF_MISMATCH", trade_date=trade_date, expected_as_of=expected_as_of)
+    if _code_list(lr) != _code_list(rr):
+        return _reject("CODE_LIST_MISMATCH", trade_date=trade_date, expected_as_of=expected_as_of)
+    latest_ranks, runtime_ranks = _rank_list(lr), _rank_list(rr)
+    if latest_ranks is not None and runtime_ranks is not None and latest_ranks != runtime_ranks:
+        return _reject("PAYLOAD_MISMATCH", trade_date=trade_date, expected_as_of=expected_as_of, detail="rank_list_mismatch")
+    if _payload_hash(lf) != _payload_hash(rf):
+        return _reject("PAYLOAD_MISMATCH", trade_date=trade_date, expected_as_of=expected_as_of)
     logger.info("[KR_ARTIFACT][VALIDATE_OK] trade_date=%s expected_as_of=%s rows=30 db_exact_rows=30 source=canonical", tds, exp)
-    return KrArtifactValidationResult(True, trade_date, expected_as_of, expected_as_of, 30, 30, None, {"latest_final30":_rel(latest_f),"runtime_final30":_rel(runtime_f)})
+    return KrArtifactValidationResult(True, trade_date, expected_as_of, expected_as_of, 30, 30, None, {"latest_final30":_rel(latest_f),"runtime_final30":_rel(runtime_f),"latest_contract":_rel(latest_c),"runtime_contract":_rel(runtime_c),"payload_match": True})
 
 
 def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, actual_as_of: date, env: str, final30_rows: list[dict], db_exact_rows: int, metadata: dict) -> None:
@@ -129,7 +158,8 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
     tds, exp = trade_date.isoformat(), expected_as_of.isoformat()
     runtime_f = ROOT/"runtime/kr/watchlist"/tds/"final30_scored.json"; runtime_c = runtime_f.with_name("prep_contract.json")
     latest_f = ROOT/"signals/kr/latest_final30_scored.json"; latest_c = ROOT/"signals/kr/latest_prep_contract.json"
-    payload = {"schema_version":"kr_final30_scored_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"as_of":exp,"rows":final30_rows,"created_at_kst":datetime.now(KST).isoformat()}
+    created_at = datetime.now(KST).isoformat()
+    payload = {"schema_version":"kr_final30_scored_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"as_of":exp,"rows":final30_rows,"created_at_kst":created_at}
     contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"prep_runner","source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True, **(metadata or {})}
     tmps = [( _write_tmp(p, payload if "final30_scored" in p.name else contract), p) for p in (runtime_f, runtime_c, latest_f, latest_c)]
     for tmp, final in tmps: os.replace(tmp, final)
@@ -143,7 +173,7 @@ def quarantine_stale_kr_artifacts(*, trade_date: date, expected_as_of: date, env
     tds = trade_date.isoformat(); ts = datetime.now(KST).strftime("%Y%m%dT%H%M%S%z")
     targets = list(LEGACY_PATHS) + [Path("signals/kr/latest_final30_scored.json"), Path("signals/kr/latest_prep_contract.json"), Path("runtime/kr/watchlist")/tds/"final30_scored.json", Path("runtime/kr/watchlist")/tds/"prep_contract.json"]
     valid = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, allow_legacy=True)
-    keep = {Path(p) for p in (valid.details.values() if valid.ok else [])}
+    keep = {str(p) for p in (valid.details.values() if valid.ok else []) if isinstance(p, str)}
     moved=[]; kept=0
     qdir = ROOT/"runtime/quarantine/kr"/tds/ts
     for rel in targets:

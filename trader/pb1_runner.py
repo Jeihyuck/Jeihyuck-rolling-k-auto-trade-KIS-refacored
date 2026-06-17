@@ -118,6 +118,7 @@ from trader.universe.build import build_universe
 from trader.universe.mode import is_db_only_mode
 from trader.time_utils import calc_market_window_kst, is_trading_weekday, now_kst, week_monday, is_market_open_kst, market_close_dt_kst, resolve_derived_as_of, resolve_trade_context, prev_business_day
 from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
+from trader.kr.market_scope import is_kr_market
 from trader.utils.env import env_bool, parse_env_flag, resolve_mode, parse_bool_any
 from trader.window_router import WindowDecision, decide_window
 from trader.watchlist_builder import build_and_save_watchlist
@@ -2945,6 +2946,22 @@ def get_balance_state(
     return BALANCE_STATE_UNKNOWN, None, None
 
 
+def resolve_kr_balance_precheck_for_test(path: Path) -> tuple[str, dict | None, str | None]:
+    """Small testable adapter for KR session-level balance precheck restoration."""
+    pre = json.loads(Path(path).read_text(encoding="utf-8"))
+    state = str(pre.get("state") or "UNKNOWN").upper()
+    snapshot = pre.get("raw_snapshot") if isinstance(pre.get("raw_snapshot"), dict) else None
+    source = str(pre.get("source") or "NONE")
+    if state == "OK" and snapshot:
+        logger.info("[PB1][BALANCE_PRECHECK_USE] state=OK source=%s requery=0 snapshot=1", source)
+        return BALANCE_STATE_OK, snapshot, source
+    if state == "OK":
+        logger.info("[PB1][BALANCE_PRECHECK_USE] state=UNKNOWN_WITHOUT_SNAPSHOT source=%s requery=0 snapshot=0", source)
+        return BALANCE_STATE_UNKNOWN, None, source
+    logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=0", state, source)
+    return BALANCE_STATE_UNKNOWN, None, source
+
+
 def _diag_balance_probe_once_safe(*, logger, runtime_root_dir: Path, kis_factory):
     """
     DIAG에서 잔고/예수금/주문가능을 1회만 조회하고, flag 파일로 중복 실행 방지.
@@ -4160,7 +4177,7 @@ def run_once(
     # ✅ CRITICAL: Trade는 장중에 "전일 영업일 derived"를 사용
     if not env_effective:
         raise RuntimeError("[RUN_ONCE][ENV] env_effective is empty before resolve_trade_context")
-    if (os.getenv("MARKET") or os.getenv("REGION") or os.getenv("TRADING_REGION") or "").upper() in {"KR", "KRX"} or os.getenv("PB1_MARKET_SCOPE", "").upper() == "KRX":
+    if is_kr_market():
         trade_date = resolve_kr_trade_date(now)
         as_of_date = resolve_kr_expected_as_of(trade_date)
         trade_ctx = {"trade_date": trade_date.isoformat(), "as_of": as_of_date.isoformat(), "reason": "KR_CALENDAR"}
@@ -5193,9 +5210,17 @@ def run_once(
             try:
                 pre = json.loads(Path(precheck_path).read_text(encoding="utf-8"))
                 state = str(pre.get("state") or "UNKNOWN").upper()
-                balance_state = BALANCE_STATE_OK if state == "OK" else BALANCE_STATE_UNKNOWN
+                snapshot = pre.get("raw_snapshot") if isinstance(pre.get("raw_snapshot"), dict) else None
+                if state == "OK" and snapshot:
+                    balance_state = BALANCE_STATE_OK
+                    balance_snapshot_raw = snapshot
+                elif state == "OK":
+                    state = "UNKNOWN_WITHOUT_SNAPSHOT"
+                    balance_state = BALANCE_STATE_UNKNOWN
+                else:
+                    balance_state = BALANCE_STATE_UNKNOWN
                 balance_source = str(pre.get("source") or "NONE")
-                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s requery=0", state)
+                logger.info("[PB1][BALANCE_PRECHECK_USE] state=%s source=%s requery=0 snapshot=%d", state, balance_source, int(bool(balance_snapshot_raw)))
                 if state != "OK":
                     logger.warning("[PB1][ENTRY_BLOCKED] reason=balance_unknown")
                     if bool(pre.get("exit_allowed")):

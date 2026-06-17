@@ -70,6 +70,7 @@ from trader.time_utils import (
 )
 from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
 from trader.kr.artifacts import publish_kr_prep_artifacts_atomic, quarantine_stale_kr_artifacts
+from trader.kr.market_scope import is_kr_market
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
@@ -115,6 +116,21 @@ FINAL30_STRICT_REQUIRED_FIELDS = [
 
 def _env_true(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_prep_date_context(run_ts: datetime | None = None) -> dict[str, Any]:
+    """Resolve prep dates without leaking KR-only behavior into US/common runs."""
+    run_ts = run_ts or now_kst()
+    kr_market = is_kr_market()
+    if kr_market:
+        run_date = resolve_kr_trade_date(run_ts)
+        effective_as_of = resolve_kr_expected_as_of(run_date)
+        os.environ["KR_TRADE_DATE"] = run_date.isoformat()
+        os.environ["KR_EXPECTED_AS_OF"] = effective_as_of.isoformat()
+    else:
+        run_date = run_ts.date()
+        effective_as_of = _pick_as_of_date_always_prev()
+    return {"kr_market": kr_market, "run_date": run_date, "as_of": effective_as_of}
 
 
 def _resolve_flow_as_of(*, requested_as_of: date, now_ts: datetime | None = None) -> date:
@@ -1226,13 +1242,14 @@ def main() -> int:
     mode = os.getenv("MODE", "prep").strip().lower()
     universe_strategy = os.getenv("CANDIDATE_POOL_UNIVERSE_STRATEGY", "best_k_meta")
     run_ts = now_kst()
-    run_date = resolve_kr_trade_date(run_ts)
+    prep_date_ctx = resolve_prep_date_context(run_ts)
+    kr_market = bool(prep_date_ctx["kr_market"])
+    run_date = prep_date_ctx["run_date"]
     market_window = calc_market_window_kst(run_ts)
-    effective_as_of = resolve_kr_expected_as_of(run_date)
+    effective_as_of = prep_date_ctx["as_of"]
     as_of = effective_as_of
-    os.environ["KR_TRADE_DATE"] = run_date.isoformat()
-    os.environ["KR_EXPECTED_AS_OF"] = as_of.isoformat()
-    quarantine_stale_kr_artifacts(trade_date=run_date, expected_as_of=as_of, env=env)
+    if kr_market:
+        quarantine_stale_kr_artifacts(trade_date=run_date, expected_as_of=as_of, env=env)
     degraded_exclude_flow = _env_true("DEGRADED_EXCLUDE_FLOW", "1")
     allow_degraded_prep = _env_true("ALLOW_DEGRADED_PREP", "0")
     allow_flow_degraded_prep = _env_true("ALLOW_FLOW_DEGRADED_PREP", "1") or allow_degraded_prep
@@ -1245,7 +1262,8 @@ def main() -> int:
     finaln = int(os.getenv("PB1_WATCHLIST_FINALN", "30"))
 
     as_of_reason = "AS_OF_OVERRIDE" if (os.getenv("AS_OF_OVERRIDE") or "").strip() else "PREV_TRADING_DAY"
-    logger.info("[KR_SESSION][CONTEXT] session=prep trade_date=%s expected_as_of=%s env=%s market=KR", run_date, as_of, env)
+    if kr_market:
+        logger.info("[KR_SESSION][CONTEXT] session=prep trade_date=%s expected_as_of=%s env=%s market=KR", run_date, as_of, env)
     logger.info("[PREP][START] env=%s as_of=%s (%s)", env, effective_as_of, as_of_reason)
     logger.info(
         "[PREP][DATE_POLICY] run_date=%s window=%s as_of=%s reason=%s",
@@ -2033,22 +2051,24 @@ def main() -> int:
     logger.info("[PREP][DONE_CORE][DB_OK] rows=%s", core_save_result.get("db_rows", 0))
     logger.info("[DB][FINAL30_SCORED][EXACT_COUNT] rows=%s", core_save_result.get("db_rows", 0))
     logger.info("[WATCHLIST][BUILD][DONE] final30=%s", len(final30_scored_df_for_export))
-    try:
-        final30_payload_rows = to_jsonable(final30_scored_df_for_export.to_dict(orient="records"))
-        publish_kr_prep_artifacts_atomic(
-            trade_date=trade_date,
-            expected_as_of=as_of,
-            actual_as_of=as_of,
-            env=env,
-            final30_rows=final30_payload_rows,
-            db_exact_rows=int(core_save_result.get("db_rows") or 0),
-            metadata={"run_id": run_id},
-        )
-    except Exception as exc:
-        logger.exception("[KR_ARTIFACT][PUBLISH_FAIL] reason=%s", exc)
-        logger.error("[KR_PREP][FAIL] reason=ARTIFACT_PUBLISH_FAILED")
-        logger.info("[KR_PREP][EXIT] exit_code=nonzero")
-        raise
+    if kr_market:
+        try:
+            final30_payload_rows = to_jsonable(final30_scored_df_for_export.to_dict(orient="records"))
+            publish_kr_prep_artifacts_atomic(
+                trade_date=trade_date,
+                expected_as_of=as_of,
+                actual_as_of=as_of,
+                env=env,
+                final30_rows=final30_payload_rows,
+                db_exact_rows=int(core_save_result.get("db_rows") or 0),
+                metadata={"run_id": run_id},
+            )
+            logger.info("[KR_PREP][SUCCESS] trade_date=%s expected_as_of=%s rows=30", trade_date, as_of)
+        except Exception as exc:
+            logger.exception("[KR_ARTIFACT][PUBLISH_FAIL] reason=%s", exc)
+            logger.error("[KR_PREP][FAIL] reason=ARTIFACT_PUBLISH_FAILED")
+            logger.info("[KR_PREP][EXIT] exit_code=nonzero")
+            raise
     logger.info(
         "[PREP][DONE_CORE][RUNTIME_OK] rows=%s path=%s",
         core_save_result.get("runtime_rows", 0),
@@ -2096,7 +2116,6 @@ def main() -> int:
     logger.info("[PREP][DONE_CORE][MARKER_OK] as_of=%s", as_of.isoformat())
     logger.info("[PREP][DONE_CORE][DONE] as_of=%s rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
     logger.info("[PREP][DONE] as_of=%s status=DONE_CORE rows=%s", as_of.isoformat(), core_save_result.get("db_rows", 0))
-    logger.info("[KR_PREP][SUCCESS] trade_date=%s expected_as_of=%s rows=30", trade_date, as_of)
     # ── PREP_FINAL30_READY postcheck: DB strict 재조회로 완료 검증 ────────────
     try:
         from trader.db.repos import WatchlistRepo as _WatchlistRepo
