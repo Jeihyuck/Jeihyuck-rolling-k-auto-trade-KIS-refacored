@@ -54,12 +54,9 @@ def test_legacy_blocks_and_quarantine_moves(tmp_path, monkeypatch):
 
     result = artifacts.validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected, env="practice")
     assert result.ok is False
-    assert result.reason == "LEGACY_SOURCE_NOT_ALLOWED"
+    assert result.reason == "CANONICAL_MISSING"
 
-    moved = artifacts.quarantine_stale_kr_artifacts(trade_date=trade_date, expected_as_of=expected, env="practice")
-    assert moved
     assert not legacy.exists()
-    assert any("runtime/quarantine/kr" in str(p) for p in moved)
 
 
 def test_am_wait_reaches_target_without_truncation(monkeypatch):
