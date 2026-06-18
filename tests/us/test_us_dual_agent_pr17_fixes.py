@@ -76,6 +76,15 @@ def test_held_at_max_weight_skips_full_weight(monkeypatch, caplog):
     assert "SKIP_FULL_WEIGHT" in caplog.text
 
 
+def test_held_max_add_count_reached_skips(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setenv("US_MAX_ADD_COUNT_PER_SYMBOL", "2")
+    pos = {"AMD": {"symbol": "AMD", "qty": 10, "avg_price": 100, "current_price": 110, "market_value": 5000, "current_weight": 0.05, "add_count": 2}}
+    intents = _run_entry(monkeypatch, pos, price=110)
+    assert intents == []
+    assert "SKIP_MAX_ADD_COUNT" in caplog.text
+
+
 def test_no_balance_reject_without_recent_ack_remains_fatal():
     from trader.us.runner.status_contract import classify_tick_status
     result = {

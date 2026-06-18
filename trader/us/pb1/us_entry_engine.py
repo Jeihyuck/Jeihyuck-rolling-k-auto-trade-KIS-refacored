@@ -281,6 +281,20 @@ def _load_held_position_snapshot(symbol: str, provider: Any = None) -> dict:
                 if str(pos.get("symbol") or "").strip().upper() == sym:
                     snapshot.update(pos)
                     break
+        if not balance_positions:
+            for method_name in ("get_balance_positions", "get_positions", "get_holdings"):
+                method = getattr(provider, method_name, None)
+                if callable(method):
+                    rows = method()
+                    if isinstance(rows, dict):
+                        rows = rows.get("positions") or rows.get("holdings") or []
+                    if isinstance(rows, list):
+                        for pos in rows:
+                            if str(pos.get("symbol") or "").strip().upper() == sym:
+                                snapshot.update(pos)
+                                raise StopIteration
+    except StopIteration:
+        pass
     except Exception as exc:
         logger.debug("[US_ENTRY][HELD_SNAPSHOT][PROVIDER_WARN] symbol=%s error=%s", sym, exc)
     return snapshot
@@ -673,6 +687,20 @@ def generate_entry_intents(
             if pnl_pct < min_add_pnl:
                 track_skip(symbol, "add_min_pnl_not_met")
                 logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_MIN_PNL pnl_pct=%.4f", symbol, pnl_pct)
+                continue
+            max_add_count = int(os.getenv("US_MAX_ADD_COUNT_PER_SYMBOL", "2") or 2)
+            add_count = int(
+                held_snapshot.get("add_count_today")
+                or held_snapshot.get("add_count")
+                or held_snapshot.get("pyramid_add_count")
+                or 0
+            )
+            if add_count >= max_add_count:
+                track_skip(symbol, "max_add_count_reached")
+                logger.info(
+                    "[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_MAX_ADD_COUNT add_count=%d max_add_count=%d",
+                    symbol, add_count, max_add_count,
+                )
                 continue
             sizing = _calc_add_position_size(
                 symbol=symbol,
