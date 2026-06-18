@@ -567,14 +567,32 @@ def route_order(
 
     ack_db_saved = False
     try:
-        save_order_ack(ack_result)
-        ack_db_saved = True
-        logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
-    except Exception as db_exc:
-        logger.error(
-            "[US_ORDER][ACK_DB_FAILED] symbol=%s order_no=%s error=%s",
-            symbol, order_no, db_exc,
+        ack_db_saved = bool(save_order_ack(ack_result))
+        if ack_db_saved:
+            logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
+    except Exception:
+        logger.exception(
+            "[US_ORDER][ACK_DB_SAVE][FAILED] symbol=%s side=%s order_no=%s",
+            symbol, side, ack_result.get("order_no"),
         )
+        ack_db_saved = False
+
+    if not ack_db_saved:
+        logger.error(
+            "[US_ORDER][ACK_DB_SAVE][FAILED_RETURN] symbol=%s side=%s order_no=%s",
+            symbol, side, ack_result.get("order_no"),
+        )
+        return {
+            "status": "ACK_DB_FAILED",
+            "reason": "ack_db_save_failed",
+            "symbol": symbol,
+            "side": side,
+            "ack": ack_result,
+            "requires_reconcile": True,
+            "intent": intent,
+            "kis_ack": True,
+            "ack_db_saved": False,
+        }
 
     # ── intent 상태 업데이트 ───────────────────────────────────────────────
     try:

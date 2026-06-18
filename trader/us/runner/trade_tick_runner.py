@@ -1006,18 +1006,28 @@ def run_trade_tick(
     
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
+    blocked_sell_symbols: set[str] = set()
+    duplicate_exit_blocked = False
     for o in orders:
-        if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
-            reason = o.get("reason", "unknown")
-            # reason에서 실제 차단 사유 추출 (예: "[US_RISK][BLOCK] reason=notional_exceeds_order_limit ..." -> "notional_exceeds_order_limit")
-            if "reason=" in reason:
-                try:
-                    reason = reason.split("reason=")[1].split()[0]
-                except Exception:
-                    pass
-            block_reasons[reason] = block_reasons.get(reason, 0) + 1
+        status_o = str(o.get("status") or "")
+        reason = str(o.get("reason") or "unknown")
+        side_o = str(o.get("side") or (o.get("intent") or {}).get("side") or "").upper()
+        symbol_o = str(o.get("symbol") or (o.get("intent") or {}).get("symbol") or "").upper()
+        reason_key = reason
+        if "reason=" in reason_key:
+            try:
+                reason_key = reason_key.split("reason=")[1].split()[0]
+            except Exception:
+                pass
+        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
+            block_reasons[reason_key] = block_reasons.get(reason_key, 0) + 1
+            if side_o == "SELL" and symbol_o:
+                blocked_sell_symbols.add(symbol_o)
+        if status_o == "WARN_DUPLICATE_EXIT_BLOCKED" or reason_key in {"pending_sell_order_exists", "duplicate_sell_client_order_key"}:
+            duplicate_exit_blocked = True
 
     duplicate_blocked_cnt = sum(1 for o in orders if o.get("duplicate_blocked"))
+    duplicate_exit_blocked = duplicate_exit_blocked or duplicate_blocked_cnt > 0
     reject_reasons = [str(o.get("reason") or o.get("error") or "") for o in orders if o.get("status") == "REJECT"]
     primary_reject_reason = next((r for r in reject_reasons if r), "")
     from trader.us.runner.status_contract import is_no_balance_sell_reject
@@ -1215,7 +1225,6 @@ def run_trade_tick(
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
-    duplicate_exit_blocked = duplicate_blocked_cnt
     for f in (fills_today if 'fills_today' in locals() else []):
         side_f = str(f.get("side") or "").upper()
         meta_f = f.get("meta") or {}
@@ -1264,6 +1273,7 @@ def run_trade_tick(
         "blocked": blocked_cnt,
         "orders_blocked": blocked_cnt,  # 호환성 위해 둘 다 제공
         "block_reasons": block_reasons,
+        "blocked_sell_symbols": sorted(blocked_sell_symbols),
         "signal_only": signal_only_cnt,
         "errors": err_cnt,
         "orders_rejected": reject_cnt,

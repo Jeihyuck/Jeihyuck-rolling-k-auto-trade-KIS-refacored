@@ -746,15 +746,8 @@ def generate_entry_intents(
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
 
         import hashlib
-        from datetime import date
-        
-        # force_now가 있으면 그 날짜 사용
-        if now:
-            today_str = now.date().strftime("%Y%m%d")
-            trade_date_for_key = now.date().strftime("%Y-%m-%d")
-        else:
-            today_str = date.today().strftime("%Y%m%d")
-            trade_date_for_key = date.today().strftime("%Y-%m-%d")
+        trade_date_for_key = _resolve_us_trade_date(now)
+        today_str = trade_date_for_key.replace("-", "")
         
         key_raw = f"{symbol}_{today_str}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
@@ -866,7 +859,7 @@ def generate_entry_intents(
             "entry_strategy": "us_pb1",
             "entry_signal_type": _resolve_entry_signal_type(entry_meta),
             "entry_session": now.strftime("%p").lower().replace("am", "am").replace("pm", "afternoon") if now else "am",
-            "trade_date": trade_date if 'trade_date' in locals() else (now.strftime("%Y-%m-%d") if now else ""),
+            "trade_date": trade_date_for_key,
             "partial_exit_allowed": os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1",
             "source": "locked_watchlist",
             "min_hold_minutes": int(os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")),

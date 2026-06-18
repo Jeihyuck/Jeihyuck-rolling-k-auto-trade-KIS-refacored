@@ -653,30 +653,30 @@ def run_trade_session(
                     )
                     break
 
-                classify_symbol = ""
-                for key in ("no_balance_sell_symbols", "recent_sell_ack_symbols", "sell_reject_symbols"):
+                classify_symbols = []
+                for key in ("no_balance_sell_symbols", "recent_sell_ack_symbols", "sell_reject_symbols", "blocked_sell_symbols"):
                     vals = tick_result.get(key) or []
                     if vals:
-                        classify_symbol = str(vals[0])
-                        break
+                        classify_symbols.extend([str(v) for v in vals])
+                classify_symbol_text = ",".join(sorted(set(classify_symbols)))
                 if classification == "success":
                     consecutive_errors = 0
                     logger.info(
-                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbol=%s consecutive_errors=%d",
-                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol, consecutive_errors,
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbols=%s consecutive_errors=%d warn_count=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol_text, consecutive_errors, warn_count,
                     )
                 elif classification == "warning":
                     warn_count += 1
                     consecutive_errors = 0
                     logger.warning(
-                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbol=%s consecutive_errors=%d",
-                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol, consecutive_errors,
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbols=%s consecutive_errors=%d warn_count=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol_text, consecutive_errors, warn_count,
                     )
                 else:
                     consecutive_errors += 1
                     logger.error(
-                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbol=%s consecutive_errors=%d",
-                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol, consecutive_errors,
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbols=%s consecutive_errors=%d warn_count=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol_text, consecutive_errors, warn_count,
                     )
                     if tick_status in {"FAILED", "ERROR"}:
                         final_status = "FAILED"

@@ -147,7 +147,7 @@ jobs:
       US_ORDER_ALLOWED: "0"
       US_KIS_ORDER_ALLOWED: "0"
       US_OFFLINE_MODE: ${{ (github.event_name == 'workflow_dispatch' && (inputs.offline && 'true' || 'false')) || 'false' }}
-      US_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || ((vars.US_AGENT_SCHEDULE_DRY_RUN || '0') == '1' && 'true' || 'false') }}
+      US_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || ((vars.US_AGENT_SCHEDULE_DRY_RUN || '0') == '1' && 'true' || 'false') }}
 
       US_LOG_FILE: "us-trade-afternoon.log"
       US_ARTIFACT_NAME: "us-trade-afternoon"

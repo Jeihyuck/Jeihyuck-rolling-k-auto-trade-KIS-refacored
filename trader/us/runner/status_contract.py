@@ -11,7 +11,7 @@ SUCCESS_STATUSES = {
 WARNING_STATUSES = {
     "WARN_RECONCILE_PENDING", "WARN_NO_FILL_YET", "WARN_KIS_TEMPORARY_ERROR",
     "WARN_SELL_REJECT_RECONCILE_PENDING", "WARN_DUPLICATE_EXIT_BLOCKED",
-    "FAILED_PARTIAL_EXIT_ORDERS_REJECTED", "FAILED_ALL_EXIT_ORDERS_BLOCKED",
+    "FAILED_PARTIAL_EXIT_ORDERS_REJECTED",
 }
 
 FATAL_STATUSES = {
@@ -34,6 +34,30 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
     """Return success/warning/fatal for a tick result payload or raw status."""
     if isinstance(tick_result, dict):
         status = str(tick_result.get("status") or "")
+        if status == "FAILED_ALL_EXIT_ORDERS_BLOCKED":
+            duplicate_exit_blocked = bool(tick_result.get("duplicate_exit_blocked"))
+            block_reasons = tick_result.get("block_reasons") or {}
+            if isinstance(block_reasons, list):
+                block_reason_set = {str(r) for r in block_reasons}
+            elif isinstance(block_reasons, dict):
+                block_reason_set = {str(r) for r in block_reasons.keys()}
+            else:
+                block_reason_set = {str(block_reasons)} if block_reasons else set()
+            recent_ack_symbols = {str(s).upper() for s in (tick_result.get("recent_sell_ack_symbols") or [])}
+            qty_zero_symbols = {str(s).upper() for s in (tick_result.get("balance_qty_zero_symbols") or [])}
+            orderable_zero_symbols = {str(s).upper() for s in (tick_result.get("orderable_qty_zero_symbols") or [])}
+            absent_symbols = {str(s).upper() for s in (tick_result.get("position_absent_symbols") or [])}
+            closed_symbols = qty_zero_symbols | orderable_zero_symbols | absent_symbols
+            if duplicate_exit_blocked:
+                return "warning"
+            if "pending_sell_order_exists" in block_reason_set:
+                return "warning"
+            if "duplicate_sell_client_order_key" in block_reason_set:
+                return "warning"
+            if "no_orderable_qty" in block_reason_set:
+                return "warning" if (recent_ack_symbols & closed_symbols) else "fatal"
+            return "fatal"
+
         if status == "FAILED_ALL_EXIT_ORDERS_REJECTED":
             no_balance_symbols = {str(s).upper() for s in (tick_result.get("no_balance_sell_symbols") or [])}
             recent_ack_symbols = {str(s).upper() for s in (tick_result.get("recent_sell_ack_symbols") or [])}

@@ -314,3 +314,119 @@ def test_session_warning_does_not_increment_consecutive_errors(monkeypatch, capl
     assert out["status"] in {"OK", "OK_WITH_WARNINGS"}
     assert "reason=consecutive_errors" not in caplog.text
     assert "class=warning" in caplog.text
+
+
+def test_all_exit_blocked_no_orderable_without_recent_ack_is_fatal():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_BLOCKED",
+        "block_reasons": {"no_orderable_qty": 1},
+        "recent_sell_ack_symbols": [],
+        "balance_qty_zero_symbols": ["AAOI"],
+        "orderable_qty_zero_symbols": ["AAOI"],
+        "position_absent_symbols": [],
+    }
+    assert classify_tick_status(result) == "fatal"
+
+
+def test_all_exit_blocked_duplicate_exit_is_warning():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_BLOCKED",
+        "duplicate_exit_blocked": True,
+        "block_reasons": {"duplicate_sell_client_order_key": 1},
+    }
+    assert classify_tick_status(result) == "warning"
+
+
+def test_all_exit_blocked_pending_sell_is_warning():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {"status": "FAILED_ALL_EXIT_ORDERS_BLOCKED", "block_reasons": {"pending_sell_order_exists": 1}}
+    assert classify_tick_status(result) == "warning"
+
+
+def test_all_exit_blocked_no_orderable_recent_ack_same_symbol_closed_is_warning():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_BLOCKED",
+        "block_reasons": {"no_orderable_qty": 1},
+        "recent_sell_ack_symbols": ["AAOI"],
+        "orderable_qty_zero_symbols": ["AAOI"],
+    }
+    assert classify_tick_status(result) == "warning"
+
+
+def test_no_balance_reject_requires_same_symbol_closed_final():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_REJECTED",
+        "no_balance_sell_symbols": ["AAOI"],
+        "recent_sell_ack_symbols": ["AAOI"],
+        "balance_qty_zero_symbols": ["TSLA"],
+    }
+    assert classify_tick_status(result) == "fatal"
+
+
+def test_route_order_ack_db_failed_when_save_order_ack_returns_false(monkeypatch):
+    from trader.us.execution.order_router import route_order, clear_sent_order_keys
+    clear_sent_order_keys()
+    _risk_env(monkeypatch)
+    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
+    monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda trade_date=None: set())
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr("trader.us.db.repos.save_order_ack", lambda _ack: False)
+
+    class _Kis:
+        def place_us_sell_order(self, *args, **kwargs):
+            return {"output": {"ODNO": "ACK1"}}
+
+    result = route_order(
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 1, "limit_price": 10, "notional_usd": 10, "client_order_key": "ack-false", "trade_date": "2026-06-18"},
+        allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=_Kis(),
+    )
+    assert result["status"] == "ACK_DB_FAILED"
+    assert result["requires_reconcile"] is True
+
+
+def test_buy_client_order_key_uses_new_york_trade_date_when_now_none(monkeypatch):
+    import hashlib
+    import trader.us.pb1.us_entry_engine as entry_engine
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    class _FakeDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            return datetime(2026, 6, 17, 23, 30, tzinfo=ZoneInfo("America/New_York")).astimezone(tz) if tz else datetime(2026, 6, 18, 12, 30)
+
+    monkeypatch.setattr(entry_engine, "datetime", _FakeDateTime)
+    monkeypatch.setenv("US_MIN_ENTRY_SCORE", "0.01")
+    monkeypatch.setenv("US_MAX_NEW_ENTRIES_PER_TICK", "1")
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr("trader.us.db.repos.has_position", lambda symbol: False)
+    monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda trade_date=None: set())
+    intents = generate_entry_intents(
+        tickers=None,
+        provider=_Provider(110),
+        sold_today=set(),
+        available_cash_usd=10000,
+        position_count=0,
+        capital_usd_cap=100000,
+        watchlist_entries=[{"symbol": "AMD", "exchange": "NASDAQ", "score": 0.9}],
+        current_position_symbols=set(),
+    )
+    expected = hashlib.sha256("AMD_20260617_BUY".encode()).hexdigest()[:24]
+    assert intents[0]["client_order_key"] == expected
+    assert intents[0]["trade_date"] == "2026-06-17"
+
+
+def test_warning_classification_does_not_increment_consecutive_errors():
+    from trader.us.runner.status_contract import classify_tick_status
+    consecutive_errors = 0
+    result = {"status": "FAILED_ALL_EXIT_ORDERS_BLOCKED", "duplicate_exit_blocked": True, "block_reasons": {"duplicate_sell_client_order_key": 1}}
+    if classify_tick_status(result) == "warning":
+        consecutive_errors = 0
+    else:
+        consecutive_errors += 1
+    assert consecutive_errors == 0
