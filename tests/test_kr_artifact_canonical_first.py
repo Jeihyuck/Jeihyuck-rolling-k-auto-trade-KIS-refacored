@@ -123,3 +123,77 @@ def test_am_duplicate_lock_skips_second_process(tmp_path):
 
     assert proc.returncode == 0
     assert "[KR_AM][SKIP] reason=LOCK_HELD" in proc.stdout
+
+
+def test_publish_validation_does_not_fallback_to_legacy_when_canonical_corrupt(tmp_path, monkeypatch):
+    import os
+    import pytest
+
+    monkeypatch.setattr(artifacts, "ROOT", tmp_path)
+    monkeypatch.setenv("KR_QUARANTINE_STALE_ARTIFACT", "0")
+    trade_date = date(2026, 6, 18)
+    expected = date(2026, 6, 17)
+    legacy = tmp_path / "signals/final30.json"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({"as_of": expected.isoformat(), "rows": _rows(expected)}), encoding="utf-8")
+    real_replace = os.replace
+
+    def corrupt_after_replace(src, dst):
+        real_replace(src, dst)
+        if str(dst).endswith("latest_prep_contract.json"):
+            runtime_final = tmp_path / "runtime/kr/watchlist" / trade_date.isoformat() / "final30_scored.json"
+            payload = json.loads(runtime_final.read_text(encoding="utf-8"))
+            payload["rows"] = payload["rows"][:29]
+            runtime_final.write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(artifacts.os, "replace", corrupt_after_replace)
+
+    with pytest.raises(RuntimeError):
+        artifacts.publish_kr_prep_artifacts_atomic(
+            trade_date=trade_date,
+            expected_as_of=expected,
+            actual_as_of=expected,
+            env="practice",
+            final30_rows=_rows(expected),
+            db_exact_rows=30,
+            metadata={},
+        )
+
+
+def test_kr_signal_legacy_paths_ignored_when_canonical_valid(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "ROOT", tmp_path)
+    monkeypatch.setenv("KR_QUARANTINE_STALE_ARTIFACT", "0")
+    trade_date = date(2026, 6, 18)
+    expected = date(2026, 6, 17)
+    artifacts.publish_kr_prep_artifacts_atomic(trade_date=trade_date, expected_as_of=expected, actual_as_of=expected, env="practice", final30_rows=_rows(expected), db_exact_rows=30, metadata={})
+    legacy_final = tmp_path / "signals/kr/final30_scored.json"
+    legacy_contract = tmp_path / "signals/kr/prep_contract.json"
+    legacy_final.parent.mkdir(parents=True, exist_ok=True)
+    legacy_final.write_text(json.dumps({"as_of": expected.isoformat(), "rows": _rows(expected)}), encoding="utf-8")
+    legacy_contract.write_text(json.dumps({"trade_date": trade_date.isoformat(), "as_of": expected.isoformat(), "rows": 30}), encoding="utf-8")
+
+    result = artifacts.validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected, env="practice", strict=True, allow_legacy_fallback=False)
+
+    assert result.ok is True
+    assert result.source == "canonical"
+    assert result.legacy_blocked is True
+    assert "signals/kr/final30_scored.json" in result.legacy_paths
+    assert "signals/kr/prep_contract.json" in result.legacy_paths
+
+
+def test_canonical_missing_kr_signal_legacy_only_strict_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "ROOT", tmp_path)
+    monkeypatch.setenv("KR_QUARANTINE_STALE_ARTIFACT", "0")
+    trade_date = date(2026, 6, 18)
+    expected = date(2026, 6, 17)
+    legacy_final = tmp_path / "signals/kr/final30_scored.json"
+    legacy_final.parent.mkdir(parents=True, exist_ok=True)
+    legacy_final.write_text(json.dumps({"as_of": expected.isoformat(), "rows": _rows(expected)}), encoding="utf-8")
+
+    result = artifacts.validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected, env="practice", strict=True, allow_legacy_fallback=False)
+
+    assert result.ok is False
+    assert result.fatal is True
+    assert result.reason == "CANONICAL_MISSING"
+    assert result.legacy_blocked is True
+    assert result.legacy_paths == ["signals/kr/final30_scored.json"]

@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 LEGACY_PATHS = (
     Path("signals/final30.json"),
+    Path("signals/watchlist.json"),
+    Path("signals/latest.json"),
+    Path("signals/kr/final30_scored.json"),
+    Path("signals/kr/prep_contract.json"),
 )
 
 @dataclass
@@ -123,6 +127,10 @@ def _reject(reason: str, *, trade_date: date, expected_as_of: date, path: Path |
 def _find_legacy_artifacts(expected_as_of: date | None = None) -> list[Path]:
     rels = [
         Path("signals/final30.json"),
+        Path("signals/watchlist.json"),
+        Path("signals/latest.json"),
+        Path("signals/kr/final30_scored.json"),
+        Path("signals/kr/prep_contract.json"),
     ]
     if expected_as_of is not None:
         rels.extend([
@@ -286,7 +294,7 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
     contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"fresh_build","canonical":True,"rows":30,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True, **(metadata or {})}
     tmps = [( _write_tmp(p, payload if "final30_scored" in p.name else contract), p) for p in (runtime_f, runtime_c, latest_f, latest_c)]
     for tmp, final in tmps: os.replace(tmp, final)
-    res = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=True, allow_legacy=True)
+    res = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=True, strict=True, allow_legacy_fallback=False)
     if not res.ok: raise RuntimeError(res.reason or "ARTIFACT_VALIDATE_FAILED")
     logger.info("[KR_ARTIFACT][PUBLISH_OK] trade_date=%s expected_as_of=%s rows=30 latest=1 runtime=1", tds, exp)
 
