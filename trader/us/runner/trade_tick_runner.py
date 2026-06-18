@@ -1021,34 +1021,56 @@ def run_trade_tick(
     reject_reasons = [str(o.get("reason") or o.get("error") or "") for o in orders if o.get("status") == "REJECT"]
     primary_reject_reason = next((r for r in reject_reasons if r), "")
     from trader.us.runner.status_contract import is_no_balance_sell_reject
-    no_balance_sell_reject_count = sum(1 for r in reject_reasons if is_no_balance_sell_reject(r))
-    recent_sell_ack_exists = False
-    if no_balance_sell_reject_count > 0:
+    sell_reject_symbols: set[str] = set()
+    no_balance_sell_symbols: set[str] = set()
+    for o in orders:
+        side_o = str((o.get("intent") or {}).get("side") or o.get("side") or "").upper()
+        symbol_o = str((o.get("intent") or {}).get("symbol") or o.get("symbol") or "").upper()
+        reason_o = str(o.get("reason") or o.get("error") or "")
+        if o.get("status") == "REJECT" and side_o == "SELL" and symbol_o:
+            sell_reject_symbols.add(symbol_o)
+            if is_no_balance_sell_reject(reason_o):
+                no_balance_sell_symbols.add(symbol_o)
+    no_balance_sell_reject_count = len(no_balance_sell_symbols)
+    recent_sell_ack_symbols: set[str] = set()
+    balance_qty_zero_symbols: set[str] = set()
+    orderable_qty_zero_symbols: set[str] = set()
+    position_absent_symbols: set[str] = set()
+    positions_by_symbol = {
+        str(p.get("symbol", "")).upper(): p
+        for p in (current_positions if 'current_positions' in locals() else [])
+        if p.get("symbol")
+    }
+    for symbol_nb in no_balance_sell_symbols:
         try:
             from trader.us.db.repos import find_recent_sell_ack
-            recent_sell_ack_exists = any(
-                bool(find_recent_sell_ack(symbol=str((o.get("intent") or {}).get("symbol") or o.get("symbol") or ""), trade_date=trade_date))
-                for o in orders
-                if o.get("status") == "REJECT" and str((o.get("intent") or {}).get("side") or o.get("side") or "").upper() == "SELL"
-            )
+            recent_ack = find_recent_sell_ack(symbol=symbol_nb, trade_date=trade_date)
         except Exception as exc:
-            logger.warning("[US_TICK][RECENT_SELL_ACK][WARN] %s", exc)
-    balance_qty_zero = False
-    orderable_qty_zero = False
-    if no_balance_sell_reject_count > 0:
+            logger.warning("[US_TICK][RECENT_SELL_ACK][WARN] symbol=%s err=%s", symbol_nb, exc)
+            recent_ack = None
+        if recent_ack:
+            recent_sell_ack_symbols.add(symbol_nb)
+        pos = positions_by_symbol.get(symbol_nb)
+        if pos is None:
+            position_absent_symbols.add(symbol_nb)
+            balance_qty_zero_symbols.add(symbol_nb)
+            orderable_qty_zero_symbols.add(symbol_nb)
+            continue
         try:
-            for p in (current_positions if 'current_positions' in locals() else []):
-                qty_val = int(p.get("qty") or p.get("holding_qty") or 0)
-                orderable_val = int(p.get("orderable_qty") or p.get("sellable_qty") or qty_val or 0)
-                if qty_val == 0:
-                    balance_qty_zero = True
-                if orderable_val == 0:
-                    orderable_qty_zero = True
-            if not (current_positions if 'current_positions' in locals() else []):
-                balance_qty_zero = True
-                orderable_qty_zero = True
+            qty_val = int(pos.get("qty") or pos.get("holding_qty") or 0)
         except Exception:
-            pass
+            qty_val = 0
+        try:
+            orderable_val = int(pos.get("orderable_qty") or pos.get("sellable_qty") or 0)
+        except Exception:
+            orderable_val = 0
+        if qty_val <= 0:
+            balance_qty_zero_symbols.add(symbol_nb)
+        if orderable_val <= 0:
+            orderable_qty_zero_symbols.add(symbol_nb)
+    recent_sell_ack_exists = bool(recent_sell_ack_symbols)
+    balance_qty_zero = bool(balance_qty_zero_symbols)
+    orderable_qty_zero = bool(orderable_qty_zero_symbols)
     logger.info(
         "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d duplicate_blocked=%d signal_only=%d reject=%d error=%d",
         len(orders), ack_cnt, dry_cnt, blocked_cnt, duplicate_blocked_cnt, signal_only_cnt, reject_cnt, err_cnt,
@@ -1099,10 +1121,14 @@ def run_trade_tick(
         # exit intents가 있으면 exit 결과를 기준으로 status 결정
         # 주의: exit_intents > 0이면 entry_intents == 0이어도 OK_NO_TRADE 금지
         orders_attempted = len(orders)
-        if exit_closed_cnt == exit_intents_count and exit_intents_count > 0:
+        if exit_closed_cnt > 0 and exit_closed_cnt == exit_intents_count:
             status = "OK_EXIT_POSITION_CLOSED"
-        elif sell_reconcile_pending_cnt > 0 and reject_cnt == 0:
+        elif duplicate_blocked_cnt > 0 and duplicate_blocked_cnt == exit_intents_count:
+            status = "WARN_DUPLICATE_EXIT_BLOCKED"
+        elif sell_reconcile_pending_cnt > 0 and (sell_reconcile_pending_cnt + duplicate_blocked_cnt + exit_closed_cnt) == exit_intents_count:
             status = "WARN_SELL_REJECT_RECONCILE_PENDING"
+        elif no_balance_sell_symbols:
+            status = "FAILED_ALL_EXIT_ORDERS_REJECTED"
         elif reject_cnt == exit_intents_count and orders_sent == 0:
             status = "FAILED_ALL_EXIT_ORDERS_REJECTED"
             logger.error(
@@ -1224,6 +1250,12 @@ def run_trade_tick(
         "recent_sell_ack_exists": recent_sell_ack_exists,
         "balance_qty_zero": balance_qty_zero,
         "orderable_qty_zero": orderable_qty_zero,
+        "sell_reject_symbols": sorted(sell_reject_symbols),
+        "no_balance_sell_symbols": sorted(no_balance_sell_symbols),
+        "recent_sell_ack_symbols": sorted(recent_sell_ack_symbols),
+        "position_absent_symbols": sorted(position_absent_symbols),
+        "balance_qty_zero_symbols": sorted(balance_qty_zero_symbols),
+        "orderable_qty_zero_symbols": sorted(orderable_qty_zero_symbols),
         "session": session,
         "orders": orders,
         "ack": ack_cnt,

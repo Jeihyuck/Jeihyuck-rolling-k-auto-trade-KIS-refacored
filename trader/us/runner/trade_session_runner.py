@@ -653,14 +653,31 @@ def run_trade_session(
                     )
                     break
 
+                classify_symbol = ""
+                for key in ("no_balance_sell_symbols", "recent_sell_ack_symbols", "sell_reject_symbols"):
+                    vals = tick_result.get(key) or []
+                    if vals:
+                        classify_symbol = str(vals[0])
+                        break
                 if classification == "success":
                     consecutive_errors = 0
+                    logger.info(
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbol=%s consecutive_errors=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol, consecutive_errors,
+                    )
                 elif classification == "warning":
                     warn_count += 1
                     consecutive_errors = 0
-                    logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s", tick_count, tick_status)
+                    logger.warning(
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbol=%s consecutive_errors=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol, consecutive_errors,
+                    )
                 else:
                     consecutive_errors += 1
+                    logger.error(
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbol=%s consecutive_errors=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol, consecutive_errors,
+                    )
                     if tick_status in {"FAILED", "ERROR"}:
                         final_status = "FAILED"
                         final_reason = tick_result.get("reason", "tick_failed")

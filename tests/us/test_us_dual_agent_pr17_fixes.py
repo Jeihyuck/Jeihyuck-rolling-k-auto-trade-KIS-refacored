@@ -150,6 +150,7 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
     monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1")
     monkeypatch.delenv("US_ORDER_ARMED", raising=False)
     monkeypatch.setattr("trader.us.db.repos.load_us_positions_by_symbols", lambda symbols: {"AAOI": {"symbol": "AAOI", "qty": 0, "orderable_qty": 0}})
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
 
     class _Kis:
         def place_us_sell_order(self, *args, **kwargs):
@@ -166,3 +167,150 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
         current_position_symbols={"AAOI"},
     )
     assert result["status"] == "OK_EXIT_POSITION_CLOSED"
+
+
+def _risk_env(monkeypatch):
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "0")
+    monkeypatch.delenv("US_ORDER_ARMED", raising=False)
+
+
+def test_sell_pending_hard_gate_ignores_us_order_accepted_env(monkeypatch):
+    from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
+    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
+    _risk_env(monkeypatch)
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: kwargs.get("side") == "SELL")
+    with pytest.raises(RiskGateBlocked, match="pending_sell_order_exists"):
+        assert_order_allowed(
+            {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "notional_usd": 10, "client_order_key": "s1"},
+            allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, trade_date="2026-06-18",
+        )
+
+
+def test_buy_pending_can_follow_existing_env_policy(monkeypatch):
+    from trader.us.execution.risk_gate import assert_order_allowed
+    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
+    _risk_env(monkeypatch)
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: True)
+    assert_order_allowed(
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "BUY", "qty": 1, "notional_usd": 10, "client_order_key": "b1"},
+        allowed_symbols={"AAOI"}, current_position_symbols=set(), trade_date="2026-06-18",
+    )
+
+
+def test_no_balance_warning_requires_same_symbol_qty_zero():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_REJECTED",
+        "no_balance_sell_symbols": ["AAOI"],
+        "recent_sell_ack_symbols": ["AAOI"],
+        "balance_qty_zero_symbols": ["TSLA"],
+        "orderable_qty_zero_symbols": [],
+        "position_absent_symbols": [],
+    }
+    assert classify_tick_status(result) == "fatal"
+
+
+def test_no_balance_same_symbol_recent_ack_qty_zero_is_warning():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_REJECTED",
+        "no_balance_sell_symbols": ["AAOI"],
+        "recent_sell_ack_symbols": ["AAOI"],
+        "balance_qty_zero_symbols": ["AAOI"],
+    }
+    assert classify_tick_status(result) == "warning"
+
+
+def test_no_balance_without_recent_ack_is_fatal_symbol_level():
+    from trader.us.runner.status_contract import classify_tick_status
+    result = {
+        "status": "FAILED_ALL_EXIT_ORDERS_REJECTED",
+        "no_balance_sell_symbols": ["AAOI"],
+        "recent_sell_ack_symbols": [],
+        "balance_qty_zero_symbols": ["AAOI"],
+    }
+    assert classify_tick_status(result) == "fatal"
+
+
+def test_sell_no_orderable_qty_after_recent_ack_returns_position_closed(monkeypatch):
+    from trader.us.execution.order_router import route_order, clear_sent_order_keys
+    clear_sent_order_keys()
+    _risk_env(monkeypatch)
+    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
+    monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda trade_date=None: set())
+    monkeypatch.setattr("trader.us.db.repos.find_recent_sell_ack", lambda symbol, trade_date=None: {"order_no": "S1", "symbol": symbol, "side": "SELL"})
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr("trader.us.execution.us_sell_qty_guard.resolve_sell_qty", lambda intent, pos: (0, {"holding_qty": 1, "orderable_qty": 0}))
+    called = {"save": 0}
+    monkeypatch.setattr("trader.us.db.repos.save_order_intent", lambda intent: called.__setitem__("save", called["save"] + 1) or True)
+    result = route_order(
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 0, "limit_price": 10, "notional_usd": 10, "client_order_key": "no-orderable", "trade_date": "2026-06-18"},
+        allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=object(),
+    )
+    assert result["status"] == "OK_EXIT_POSITION_CLOSED"
+
+
+def test_sell_no_orderable_qty_without_recent_ack_remains_blocked(monkeypatch):
+    from trader.us.execution.order_router import route_order, clear_sent_order_keys
+    clear_sent_order_keys()
+    _risk_env(monkeypatch)
+    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
+    monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda trade_date=None: set())
+    monkeypatch.setattr("trader.us.db.repos.find_recent_sell_ack", lambda symbol, trade_date=None: None)
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr("trader.us.execution.us_sell_qty_guard.resolve_sell_qty", lambda intent, pos: (0, {"holding_qty": 1, "orderable_qty": 0}))
+    result = route_order(
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 0, "limit_price": 10, "notional_usd": 10, "client_order_key": "no-orderable-2", "trade_date": "2026-06-18"},
+        allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=object(),
+    )
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "no_orderable_qty"
+
+
+def test_duplicate_sell_precheck_skips_before_save_intent(monkeypatch):
+    from trader.us.execution.order_router import route_order, clear_sent_order_keys
+    clear_sent_order_keys()
+    _risk_env(monkeypatch)
+    monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda trade_date=None: {"dup-sell"})
+    def _save(_intent):
+        raise AssertionError("save_order_intent should not be called")
+    monkeypatch.setattr("trader.us.db.repos.save_order_intent", _save)
+    result = route_order(
+        {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "limit_price": 10, "notional_usd": 10, "client_order_key": "dup-sell", "trade_date": "2026-06-18"},
+        allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=object(),
+    )
+    assert result["status"] == "WARN_DUPLICATE_EXIT_BLOCKED"
+    assert result["duplicate_blocked"] is True
+
+
+def test_exit_engine_skips_intent_when_pending_sell_exists(monkeypatch, caplog):
+    from trader.us.pb1.us_exit_engine import evaluate_exit
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr("trader.us.db.repos.find_recent_sell_ack", lambda symbol, trade_date=None: {"order_no": "S1", "symbol": symbol, "side": "SELL"})
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: True)
+    pos = {"symbol": "AAOI", "exchange": "NASDAQ", "qty": 1, "entry_price": 100, "max_price": 100}
+    intent = evaluate_exit(pos, current_price=80.0)
+    assert intent is None
+    assert "[US_EXIT][SKIP_PENDING_SELL]" in caplog.text
+
+
+def test_session_warning_does_not_increment_consecutive_errors(monkeypatch, caplog):
+    from trader.us.runner.trade_session_runner import run_trade_session
+    caplog.set_level(logging.INFO)
+    results = iter([
+        {"status": "OK_EXIT_ORDERS_SENT", "last_stage": "order_route"},
+        {"status": "WARN_DUPLICATE_EXIT_BLOCKED", "reason": "duplicate_exit_blocked", "last_stage": "order_route"},
+        {"status": "WARN_SELL_REJECT_RECONCILE_PENDING", "reason": "no_balance_after_recent_sell_ack", "last_stage": "order_route"},
+    ])
+    monkeypatch.setattr("trader.us.runner.trade_tick_runner.run_trade_tick", lambda **kwargs: next(results))
+    monkeypatch.setattr("trader.us.utils.session_guard.check_us_session_file_guard", lambda trade_date, session: {"already_ran": False, "guard_status": "OK", "payload": {}})
+    monkeypatch.setattr("trader.us.utils.session_guard.write_us_session_done_file", lambda **kwargs: None)
+    monkeypatch.setattr("trader.us.runner.trade_session_runner._write_us_session_report", lambda payload, session: None)
+    monkeypatch.setattr("trader.us.runner.trade_session_runner._write_us_schedule_health", lambda payload, session: None)
+    out = run_trade_session(session="afternoon", offline=True, force_now="2026-06-18T13:00:00-04:00", max_ticks=3, interval_sec=1)
+    assert out["status"] in {"OK", "OK_WITH_WARNINGS"}
+    assert "reason=consecutive_errors" not in caplog.text
+    assert "class=warning" in caplog.text

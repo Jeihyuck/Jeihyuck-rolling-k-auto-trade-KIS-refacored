@@ -34,13 +34,24 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
     """Return success/warning/fatal for a tick result payload or raw status."""
     if isinstance(tick_result, dict):
         status = str(tick_result.get("status") or "")
-        reason = str(tick_result.get("primary_reject_reason") or tick_result.get("reason") or tick_result.get("error") or "")
-        if status == "FAILED_ALL_EXIT_ORDERS_REJECTED" and is_no_balance_sell_reject(reason):
-            recent_ack = bool(tick_result.get("recent_sell_ack_exists"))
-            no_balance_count = int(tick_result.get("no_balance_sell_reject_count") or 0)
-            qty_zero = bool(tick_result.get("balance_qty_zero") or tick_result.get("orderable_qty_zero"))
-            if recent_ack and no_balance_count > 0 and qty_zero:
+        if status == "FAILED_ALL_EXIT_ORDERS_REJECTED":
+            no_balance_symbols = {str(s).upper() for s in (tick_result.get("no_balance_sell_symbols") or [])}
+            recent_ack_symbols = {str(s).upper() for s in (tick_result.get("recent_sell_ack_symbols") or [])}
+            qty_zero_symbols = {str(s).upper() for s in (tick_result.get("balance_qty_zero_symbols") or [])}
+            orderable_zero_symbols = {str(s).upper() for s in (tick_result.get("orderable_qty_zero_symbols") or [])}
+            absent_symbols = {str(s).upper() for s in (tick_result.get("position_absent_symbols") or [])}
+            closed_symbols = qty_zero_symbols | orderable_zero_symbols | absent_symbols
+            reconciliatory_symbols = no_balance_symbols & recent_ack_symbols & closed_symbols
+            if no_balance_symbols and no_balance_symbols <= reconciliatory_symbols:
                 return "warning"
+            if not no_balance_symbols:
+                reason = str(tick_result.get("primary_reject_reason") or tick_result.get("reason") or tick_result.get("error") or "")
+                if is_no_balance_sell_reject(reason):
+                    recent_ack = bool(tick_result.get("recent_sell_ack_exists"))
+                    no_balance_count = int(tick_result.get("no_balance_sell_reject_count") or 0)
+                    qty_zero = bool(tick_result.get("balance_qty_zero") or tick_result.get("orderable_qty_zero"))
+                    if recent_ack and no_balance_count > 0 and qty_zero:
+                        return "warning"
     else:
         status = str(tick_result or "")
     if status in SUCCESS_STATUSES:

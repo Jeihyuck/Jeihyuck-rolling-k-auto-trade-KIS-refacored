@@ -240,6 +240,26 @@ def check_pending_order(symbol: str, side: str, trade_date: str | None = None) -
         logger.warning("[US_RISK][WARN] pending_order check failed: %s", exc)
 
 
+def check_pending_sell_order_hard(symbol: str, trade_date: str | None = None) -> None:
+    """SELL idempotency hard gate independent of US_ORDER_ACCEPTED_IS_NOT_FILLED."""
+    try:
+        from trader.us.db.repos import has_pending_order_for_symbol_side
+        if has_pending_order_for_symbol_side(
+            symbol=symbol,
+            side="SELL",
+            trade_date=trade_date,
+            include_statuses={
+                "SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED",
+                "RECONCILE_PENDING", "ACK_DB_FAILED",
+            },
+        ):
+            _block("pending_sell_order_exists", symbol=symbol, side="SELL")
+    except RiskGateBlocked:
+        raise
+    except Exception as exc:
+        logger.warning("[US_RISK][WARN] pending_sell_order_hard check failed: %s", exc)
+
+
 def check_entry_cutoff(side: str, now: Any = None) -> None:
     """15:45 ET 이후 신규 매수 차단.
 
@@ -383,7 +403,7 @@ def assert_order_allowed(
             except (TypeError, ValueError):
                 pass
         # SELL 전용: 미체결 주문 존재 시 매도 차단
-        check_pending_order(symbol, side, trade_date=trade_date)
+        check_pending_sell_order_hard(symbol, trade_date=trade_date)
     else:
         # BUY 전용 체크
         # 예산 기반 차단 (US_PAPER_MAX_CAPITAL_KRW 기준 5천만원 환산)
