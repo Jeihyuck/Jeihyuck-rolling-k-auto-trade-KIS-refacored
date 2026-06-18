@@ -139,26 +139,22 @@ def _schedule_section(content: str) -> str:
 
 
 def test_schedule_does_not_hardcode_force_now_am():
-    """schedule trigger는 --force-now 를 직접 넘기지 않는다."""
+    """WSL trigger 전환 후 AM workflow에는 GitHub schedule이 없다."""
     content = _read_wf("us-trade-am.yml")
-    # schedule path에는 force_now 하드코딩된 ISO datetime 문자열이 없어야 함
-    # (inputs.force_now 참조는 workflow_dispatch 조건으로 감싸져 있음)
-    cron_lines = [l for l in content.splitlines() if "cron:" in l]
-    assert len(cron_lines) >= 1  # schedule 존재
-    # force_now를 schedule에 하드코딩하지 않음을 확인
-    # runner command에서 --force-now가 조건부 블록 안에만 있어야 함
+    assert "schedule:" not in content
+    assert "cron:" not in content
     assert "force_now manual smoke" in content or "US_FORCE_NOW_GUARD" in content
 
 
 def test_schedule_does_not_hardcode_force_now_prep():
     content = _read_wf("us-trade-prep.yml")
-    cron_lines = [l for l in content.splitlines() if "cron:" in l]
-    assert len(cron_lines) >= 1
+    assert "schedule:" not in content
+    assert "cron:" not in content
     assert "US_FORCE_NOW_GUARD" in content
 
 
 def test_schedule_does_not_hardcode_force_now_close():
     content = _read_wf("us-trade-close.yml")
-    cron_lines = [l for l in content.splitlines() if "cron:" in l]
-    assert len(cron_lines) >= 1
+    assert "schedule:" not in content
+    assert "cron:" not in content
     assert "US_FORCE_NOW_GUARD" in content

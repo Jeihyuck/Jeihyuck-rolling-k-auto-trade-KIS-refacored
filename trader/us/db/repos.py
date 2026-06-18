@@ -2310,3 +2310,68 @@ def load_latest_us_buy_fills_by_symbols(
     except Exception as exc:
         logger.warning("[US_DB][load_latest_us_buy_fills_by_symbols][WARN] %s", exc)
         return {}
+
+
+def has_pending_order_for_symbol_side(
+    symbol: str,
+    side: str,
+    trade_date: str | None = None,
+    include_statuses: set[str] | None = None,
+) -> bool:
+    """Return True when same symbol/side/date has an unfilled real order."""
+    statuses = include_statuses or {
+        "ACK", "SUBMITTED", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED",
+    }
+    td = trade_date or _today()
+    sym = str(symbol or "").strip().upper()
+    side_u = str(side or "").strip().upper()
+    engine = _get_engine_or_none()
+    if engine is None:
+        return any(
+            str(o.get("symbol") or "").strip().upper() == sym
+            and str(o.get("side") or "").strip().upper() == side_u
+            and str(o.get("trade_date") or "") == td
+            and str(o.get("status") or "").upper() in statuses
+            and not o.get("dry_run", False)
+            for o in _MEM_ORDERS
+        )
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT 1 FROM us_orders
+                    WHERE symbol=:symbol AND side=:side AND trade_date=:td
+                      AND status = ANY(:statuses)
+                      AND dry_run = FALSE
+                    LIMIT 1
+                """),
+                {"symbol": sym, "side": side_u, "td": td, "statuses": list(statuses)},
+            ).first()
+            return row is not None
+    except Exception as exc:
+        logger.error("[US_ORDERS][PENDING_SYMBOL_SIDE][ERROR] %s", exc)
+        return False
+
+
+def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | None:
+    """Find the most recent same-day SELL ACK-like order for no-balance reconciliation."""
+    statuses = {"ACK", "SUBMITTED", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    td = trade_date or _today()
+    sym = str(symbol or "").strip().upper()
+    matches = [o for o in _MEM_ORDERS if str(o.get("symbol") or "").strip().upper() == sym and str(o.get("side") or "").upper() == "SELL" and str(o.get("trade_date") or "") == td and str(o.get("status") or "").upper() in statuses]
+    if matches:
+        return matches[-1]
+    engine = _get_engine_or_none()
+    if engine is None:
+        return None
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT * FROM us_orders WHERE symbol=:symbol AND side='SELL' AND trade_date=:td
+                  AND status = ANY(:statuses) AND dry_run = FALSE
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST LIMIT 1
+            """), {"symbol": sym, "td": td, "statuses": list(statuses)}).first()
+            return dict(row._mapping) if row else None
+    except Exception as exc:
+        logger.error("[US_ORDERS][RECENT_SELL_ACK][ERROR] %s", exc)
+        return None

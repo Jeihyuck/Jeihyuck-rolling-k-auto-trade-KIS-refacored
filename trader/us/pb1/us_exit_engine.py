@@ -177,6 +177,7 @@ def evaluate_exit(
                 pnl_pct=-999.0,
                 holding_qty=raw_qty,
                 orderable_qty=orderable_qty,
+                now=now,
             )
         return None
 
@@ -247,6 +248,7 @@ def evaluate_exit(
                 pnl_pct=pnl_pct,
                 holding_qty=raw_qty,
                 orderable_qty=orderable_qty,
+                now=now,
             )
 
     # ── giveback ──────────────────────────────────────────────────────────────
@@ -270,6 +272,32 @@ def evaluate_exit(
     return None
 
 
+def resolve_us_trade_date_key(now: datetime | None = None) -> str:
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    dt = (now or datetime.now(tz=ny)).astimezone(ny)
+    return dt.strftime("%Y%m%d")
+
+
+def _trade_date_from_key(trade_date_key: str) -> str:
+    return f"{trade_date_key[:4]}-{trade_date_key[4:6]}-{trade_date_key[6:]}"
+
+
+def should_skip_exit_due_to_pending_sell(symbol: str, trade_date: str) -> tuple[bool, str | None, dict | None]:
+    """Return true when a same-symbol SELL is already pending/ACK-like."""
+    statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    try:
+        from trader.us.db.repos import has_pending_order_for_symbol_side, find_recent_sell_ack
+        recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=trade_date)
+        if recent_ack:
+            return True, "recent_sell_ack_exists", recent_ack
+        if has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses):
+            return True, "pending_sell_order_exists", None
+    except Exception as exc:
+        logger.warning("[US_EXIT][PENDING_SELL_CHECK_WARN] symbol=%s trade_date=%s err=%s", symbol, trade_date, exc)
+    return False, None, None
+
+
 def _make_exit_intent(
     symbol: str,
     exchange: str,
@@ -282,12 +310,20 @@ def _make_exit_intent(
     pnl_pct: float,
     holding_qty: int = 0,
     orderable_qty: int = 0,
-) -> dict:
+    now: datetime | None = None,
+) -> dict | None:
     """Exit order intent 생성."""
     import hashlib
-    from datetime import date
-    today = date.today().strftime("%Y%m%d")
-    key_raw = f"{symbol}_{today}_SELL_{exit_type}"
+    trade_date_key = resolve_us_trade_date_key(now)
+    trade_date = _trade_date_from_key(trade_date_key)
+    skip, skip_reason, recent_ack = should_skip_exit_due_to_pending_sell(symbol, trade_date)
+    if skip:
+        logger.info(
+            "[US_EXIT][SKIP_PENDING_SELL] symbol=%s trade_date=%s reason=%s order_no=%s action=RECONCILE_ONLY",
+            symbol, trade_date, skip_reason, (recent_ack or {}).get("order_no", ""),
+        )
+        return None
+    key_raw = f"{symbol}_{trade_date_key}_SELL_{exit_type}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
     logger.info(
@@ -312,6 +348,7 @@ def _make_exit_intent(
         "unrealized_pnl_pct": round(pnl_pct, 4),
         "client_order_key": client_order_key,
         "strategy": "us_pb1_exit",
+        "trade_date": trade_date,
         "meta": {
             "holding_qty": _holding,
             "orderable_qty": _orderable,

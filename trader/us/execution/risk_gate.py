@@ -221,7 +221,7 @@ def check_same_day_rebuy(symbol: str, side: str) -> None:
         logger.warning("[US_RISK][WARN] same_day_rebuy check failed: %s", exc)
 
 
-def check_pending_order(symbol: str, side: str) -> None:
+def check_pending_order(symbol: str, side: str, trade_date: str | None = None) -> None:
     """미체결 주문 존재 시 추가 주문 차단.
 
     US_ORDER_ACCEPTED_IS_NOT_FILLED=1 일 때만 활성화.
@@ -231,13 +231,33 @@ def check_pending_order(symbol: str, side: str) -> None:
         return
 
     try:
-        from trader.us.db.repos import has_pending_order
-        if has_pending_order(symbol):
+        from trader.us.db.repos import has_pending_order_for_symbol_side
+        if has_pending_order_for_symbol_side(symbol=symbol, side=side, trade_date=trade_date):
             _block("pending_order_exists", symbol=symbol, side=side)
     except RiskGateBlocked:
         raise
     except Exception as exc:
         logger.warning("[US_RISK][WARN] pending_order check failed: %s", exc)
+
+
+def check_pending_sell_order_hard(symbol: str, trade_date: str | None = None) -> None:
+    """SELL idempotency hard gate independent of US_ORDER_ACCEPTED_IS_NOT_FILLED."""
+    try:
+        from trader.us.db.repos import has_pending_order_for_symbol_side
+        if has_pending_order_for_symbol_side(
+            symbol=symbol,
+            side="SELL",
+            trade_date=trade_date,
+            include_statuses={
+                "SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED",
+                "RECONCILE_PENDING", "ACK_DB_FAILED",
+            },
+        ):
+            _block("pending_sell_order_exists", symbol=symbol, side="SELL")
+    except RiskGateBlocked:
+        raise
+    except Exception as exc:
+        logger.warning("[US_RISK][WARN] pending_sell_order_hard check failed: %s", exc)
 
 
 def check_entry_cutoff(side: str, now: Any = None) -> None:
@@ -342,6 +362,7 @@ def assert_order_allowed(
     now: Any = None,
     allowed_symbols: "set[str] | None" = None,
     current_position_symbols: "set[str] | None" = None,
+    trade_date: str | None = None,
 ) -> None:
     """Order intent의 전체 위험 점검.
 
@@ -368,6 +389,9 @@ def assert_order_allowed(
     check_exchange(exchange)
     check_qty(qty)
 
+    if existing_order_keys is not None and client_order_key:
+        check_duplicate(client_order_key, existing_order_keys)
+
     # SELL: 보유 수량 초과 차단
     if side.upper() == "SELL":
         available_qty = intent.get("available_qty")
@@ -379,7 +403,7 @@ def assert_order_allowed(
             except (TypeError, ValueError):
                 pass
         # SELL 전용: 미체결 주문 존재 시 매도 차단
-        check_pending_order(symbol, side)
+        check_pending_sell_order_hard(symbol, trade_date=trade_date)
     else:
         # BUY 전용 체크
         # 예산 기반 차단 (US_PAPER_MAX_CAPITAL_KRW 기준 5천만원 환산)
@@ -391,11 +415,8 @@ def assert_order_allowed(
         check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol)
         check_cash_buffer(available_cash_usd, notional_usd, symbol=symbol)
 
-        if existing_order_keys is not None and client_order_key:
-            check_duplicate(client_order_key, existing_order_keys)
-
         check_same_day_rebuy(symbol, side)
-        check_pending_order(symbol, side)
+        check_pending_order(symbol, side, trade_date=trade_date)
         check_entry_cutoff(side, now=now)
 
     _pass(symbol, notional_usd)

@@ -55,7 +55,7 @@ def test_afternoon_session_passes_conservative_entry_guard_to_tick(monkeypatch, 
             force_now="2026-06-05T12:35:00-04:00",
         )
 
-        assert seen["session_entry_allowed"] is False
+        assert seen["session_entry_allowed"] is True
         assert seen["session_buy_orders_count"] == 3
     finally:
         os.chdir(orig_cwd)
@@ -105,4 +105,4 @@ def test_tick_runner_logs_already_bought_today_skip(monkeypatch, caplog) -> None
             session_buy_orders_count=3,
         )
 
-    assert "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=3" in caplog.text
+    assert "[US_ENTRY][DIAGNOSTIC] already_bought_today=1 buy_orders_count=3 entry_global_block=0" in caplog.text

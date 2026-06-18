@@ -21,10 +21,14 @@ import logging
 import os
 import sys
 import time as time_mod
+import signal
 from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+_received_signal: int | None = None
+_last_liveness_event = ""
+_exit_code: int | None = None
 
 # 세션별 종료 시각 (ET)
 _SESSION_END_TIMES = {
@@ -39,6 +43,47 @@ _SESSION_START_TIMES = {
 }
 
 _MAX_CONSECUTIVE_ERRORS = 3
+
+
+def write_heartbeat_file(session: str, run_id: str, tick: int, phase: str, **extra) -> None:
+    global _last_liveness_event
+    _last_liveness_event = str(phase or "")
+    try:
+        hb_dir = Path("reports/us_liveness")
+        hb_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"session": session, "run_id": run_id, "tick": tick, "phase": phase, "ts": datetime.utcnow().isoformat() + "Z", **extra}
+        (hb_dir / f"{session}_{run_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[US_SESSION][LIVENESS_CHECK][WARN] heartbeat write failed: %s", exc)
+
+
+def sleep_with_heartbeat(session: str, run_id: str, tick: int, total_sec: int, heartbeat_sec: int = 30) -> None:
+    slept = 0
+    logger.info("[US_TICK_LOOP][SLEEP_START] session=%s tick=%d seconds=%d", session, tick, total_sec)
+    write_heartbeat_file(session, run_id, tick, phase="SLEEP_START", slept=slept)
+    while slept < total_sec:
+        step = min(heartbeat_sec, total_sec - slept)
+        time_mod.sleep(step)
+        slept += step
+        logger.info("[US_TICK_LOOP][SLEEP_HEARTBEAT] session=%s run_id=%s tick=%d slept=%d/%d", session, run_id, tick, slept, total_sec)
+        write_heartbeat_file(session, run_id, tick, phase="SLEEP_HEARTBEAT", slept=slept)
+    logger.info("[US_TICK_LOOP][SLEEP_DONE] session=%s tick=%d slept=%d", session, tick, slept)
+    write_heartbeat_file(session, run_id, tick, phase="SLEEP_DONE", slept=slept)
+
+
+def calc_expected_min_ticks(*, session: str, start_dt: datetime, graceful_deadline: datetime, interval_sec: int) -> int:
+    if interval_sec <= 0 or graceful_deadline <= start_dt:
+        return 0
+    return max(1, int((graceful_deadline - start_dt).total_seconds() // interval_sec))
+
+
+def _signal_name(signum: int | None) -> str:
+    if signum is None:
+        return ""
+    try:
+        return signal.Signals(signum).name
+    except Exception:
+        return str(signum)
 
 
 def _safe_int_env(name: str, default: int = 0) -> int:
@@ -145,9 +190,19 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "orders_sent", "fills", "positions", "last_stage", "final_status", "reason",
         "temp_error_count", "temp_recovered_count", "schedule_expected_et", "actual_start_et",
         "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
-        "buy_decisions", "sell_decisions",
+        "buy_decisions", "sell_decisions", "real_broker_buys", "real_broker_sells",
+        "synthetic_reconcile_buys", "synthetic_reconcile_sells", "broker_ack_only",
+        "broker_rejects", "duplicate_exit_blocked",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
+    md_lines.extend([
+        "",
+        "## Broker/Reconcile Classification",
+        f"- 실제 MTS 신규 매수: {payload.get('real_broker_buys', 0)}건",
+        f"- 실제 MTS 매도: {payload.get('real_broker_sells', 0)}건",
+        f"- 내부 잔고 보정: {payload.get('synthetic_reconcile_buys', 0) + payload.get('synthetic_reconcile_sells', 0)}건",
+        "- 내부 잔고 보정은 실제 MTS 신규 매수 체결이 아님",
+    ])
     latest_md.write_text("\n".join(md_lines) + "\n")
 
     if dated_json is not None and dated_md is not None:
@@ -196,6 +251,23 @@ def run_trade_session(
     Returns:
         {"status": "OK"|"OK_WITH_WARNINGS"|"OK_SIGNAL_ONLY"|"SKIP"|"ERROR", ...}
     """
+    global _received_signal, _exit_code
+    _received_signal = None
+    _exit_code = None
+
+    def _handle_signal(signum, frame):
+        global _received_signal, _exit_code
+        _received_signal = signum
+        _exit_code = 128 + int(signum)
+        logger.error("[US_SESSION][SIGNAL] signal=%s", signum)
+        try:
+            write_heartbeat_file(session, os.getenv("GITHUB_RUN_ID", "local"), 0, phase="signal", signal=signum)
+        finally:
+            raise SystemExit(_exit_code)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     logger.info(
         "[US_SESSION][START] session=%s env=%s offline=%s max_minutes=%d interval_sec=%d",
         session, env, offline, max_minutes, interval_sec,
@@ -372,11 +444,11 @@ def run_trade_session(
             buy_count = get_today_buy_orders_count(trade_date=trade_date, env=env)
         except Exception:
             buy_count = 0
-        session_entry_allowed = buy_count <= 0
+        session_entry_allowed = True
         if buy_count > 0:
             logger.info(
-                "[US_AFTERNOON][MODE] mode=exit_first entry_allowed=false"
-                " reason=already_bought_today buy_orders_count=%d",
+                "[US_AFTERNOON][MODE] mode=exit_first entry_allowed=true"
+                " reason=buy_orders_count_diagnostic_only buy_orders_count=%d",
                 buy_count,
             )
         else:
@@ -466,6 +538,9 @@ def run_trade_session(
             graceful_deadline.strftime("%Y-%m-%dT%H:%M:%S%z"),
             deadline.strftime("%Y-%m-%dT%H:%M:%S%z"),
         )
+
+    expected_min_ticks = 0 if (force_now or max_ticks > 0 or offline) else calc_expected_min_ticks(session=session, start_dt=simulated_now, graceful_deadline=graceful_deadline, interval_sec=interval_sec)
+    logger.info("[US_SESSION][LIVENESS_CHECK] session=%s expected_min_ticks=%d", session, expected_min_ticks)
 
     logger.info(
         "[US_SESSION][TICK_LOOP][START] session=%s graceful_deadline=%s",
@@ -564,16 +639,8 @@ def run_trade_session(
                     block_reasons_total[reason] = block_reasons_total.get(reason, 0) + int(cnt or 0)
 
                 tick_status = tick_result.get("status", "ERROR")
-                acceptable_statuses = {
-                    "OK",
-                    "OK_SIGNAL_ONLY",
-                    "OK_NO_TRADE",
-                    "OK_WITH_WARNINGS",
-                    "OK_ORDERS_SENT",
-                    "NO_ENTRY_INTENTS",
-                    "NO_ORDERS_RISK_BLOCKED",
-                    "PARTIAL_ORDERS_BLOCKED",
-                }
+                from trader.us.runner.status_contract import classify_tick_status
+                classification = classify_tick_status(tick_result)
 
                 if tick_result.get("reason") == "fills_contract_error":
                     # compatibility marker for legacy contract tests: "status": "ERROR"
@@ -586,31 +653,38 @@ def run_trade_session(
                     )
                     break
 
-                if tick_status in acceptable_statuses:
-                    if tick_status in ("OK_WITH_WARNINGS", "OK_SIGNAL_ONLY"):
-                        warn_count += 1
-                        logger.warning(
-                            "[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s",
-                            tick_count, tick_status,
-                        )
+                classify_symbols = []
+                for key in ("no_balance_sell_symbols", "recent_sell_ack_symbols", "sell_reject_symbols", "blocked_sell_symbols"):
+                    vals = tick_result.get(key) or []
+                    if vals:
+                        classify_symbols.extend([str(v) for v in vals])
+                classify_symbol_text = ",".join(sorted(set(classify_symbols)))
+                if classification == "success":
                     consecutive_errors = 0
-                elif tick_status in {"FAILED", "ERROR"}:
-                    final_status = "FAILED"
-                    final_reason = tick_result.get("reason", "tick_failed")
-                    logger.error(
-                        "[US_SESSION][END] session=%s reason=%s tick=%d",
-                        session,
-                        final_reason,
-                        tick_count,
+                    logger.info(
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbols=%s consecutive_errors=%d warn_count=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol_text, consecutive_errors, warn_count,
                     )
-                    break
+                elif classification == "warning":
+                    warn_count += 1
+                    consecutive_errors = 0
+                    logger.warning(
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbols=%s consecutive_errors=%d warn_count=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol_text, consecutive_errors, warn_count,
+                    )
                 else:
                     consecutive_errors += 1
-                    warn_count += 1
-                    logger.warning(
-                        "[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d",
-                        tick_count, tick_status, consecutive_errors,
+                    logger.error(
+                        "[US_SESSION][STATUS_CLASSIFY] session=%s tick=%d status=%s class=%s reason=%s symbols=%s consecutive_errors=%d warn_count=%d",
+                        session, tick_count, tick_status, classification, tick_result.get("reason", ""), classify_symbol_text, consecutive_errors, warn_count,
                     )
+                    if tick_status in {"FAILED", "ERROR"}:
+                        final_status = "FAILED"
+                        final_reason = tick_result.get("reason", "tick_failed")
+                        logger.error("[US_SESSION][END] session=%s reason=%s tick=%d", session, final_reason, tick_count)
+                        break
+                    warn_count += 1
+                    logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d", tick_count, tick_status, consecutive_errors)
 
             except concurrent.futures.TimeoutError:
                 final_status = "FAILED"
@@ -677,17 +751,17 @@ def run_trade_session(
                 break
 
             if not force_now:
-                logger.info("[US_TICK_LOOP][SLEEP] seconds=%d", interval_sec)
-                time_mod.sleep(interval_sec)
+                sleep_with_heartbeat(session, run_id, tick_count, interval_sec)
 
     except KeyboardInterrupt:
         final_status = "FAILED"
         final_reason = "keyboard_interrupt"
         logger.error("[US_SESSION][INTERRUPT] session=%s reason=keyboard_interrupt", session)
-    except SystemExit:
+    except SystemExit as se:
         final_status = "FAILED"
         final_reason = "system_exit"
-        logger.error("[US_SESSION][EXIT] session=%s reason=system_exit", session)
+        _exit_code = int(se.code) if isinstance(se.code, int) else _exit_code
+        logger.error("[US_SESSION][EXIT] session=%s reason=system_exit exit_code=%s", session, _exit_code)
     except Exception as loop_exc:
         final_status = "FAILED"
         final_reason = f"loop_exception: {loop_exc}"
@@ -731,6 +805,11 @@ def run_trade_session(
                 final_reason,
             )
     
+    expected_to_trade = not (force_now or max_ticks > 0 or offline or resolved_signal_only)
+    if expected_to_trade and tick_count < expected_min_ticks and final_reason not in {"market_skip", "max_ticks", "force_now_single_tick"}:
+        final_status = "FAILED"
+        final_reason = "early_termination_min_ticks_not_met"
+
     # KIS TEMP_ERROR recovery warning
     if temp_recovered_count > 0:
         warn_count += 1
@@ -763,6 +842,9 @@ def run_trade_session(
     total_pending_orders = 0
     total_sold_today = 0
     total_open_positions = 0
+    real_broker_buys = real_broker_sells = 0
+    synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
     all_sold_today_symbols: list[str] = []
     all_pending_order_symbols: list[str] = []
     all_open_position_symbols: list[str] = []
@@ -795,6 +877,13 @@ def run_trade_session(
         total_pending_orders = int(tick_result.get("pending_order_count", 0) or 0)
         total_sold_today = int(tick_result.get("sold_today_count", 0) or 0)
         total_open_positions = int(tick_result.get("open_position_count", tick_result.get("positions", 0)) or 0)
+        real_broker_buys += int(tick_result.get("real_broker_buys", 0) or 0)
+        real_broker_sells += int(tick_result.get("real_broker_sells", 0) or 0)
+        synthetic_reconcile_buys += int(tick_result.get("synthetic_reconcile_buys", 0) or 0)
+        synthetic_reconcile_sells += int(tick_result.get("synthetic_reconcile_sells", 0) or 0)
+        broker_ack_only += int(tick_result.get("broker_ack_only", 0) or 0)
+        broker_rejects += int(tick_result.get("broker_rejects", 0) or 0)
+        duplicate_exit_blocked += int(tick_result.get("duplicate_exit_blocked", 0) or 0)
 
         # 심볼 배열 (마지막 tick 기준 덮어쓰기)
         if tick_result.get("sold_today_symbols"):
@@ -869,6 +958,7 @@ def run_trade_session(
         "event_name": os.getenv("GITHUB_EVENT_NAME", ""),
         "env": env,
         "dry_run": os.getenv("DRY_RUN", "0") == "1",
+        "expected_to_trade": int(expected_to_trade),
         "kis_order_allowed": int(kis_order_allowed),
         "prep_status": prep_status_value,
         "prep_run_id": prep_run_id,
@@ -911,6 +1001,13 @@ def run_trade_session(
         "pending_order_symbols": all_pending_order_symbols,
         "open_position_symbols": all_open_position_symbols,
         "positions": int(final_tick.get("positions", 0) or 0),
+        "real_broker_buys": real_broker_buys,
+        "real_broker_sells": real_broker_sells,
+        "synthetic_reconcile_buys": synthetic_reconcile_buys,
+        "synthetic_reconcile_sells": synthetic_reconcile_sells,
+        "broker_ack_only": broker_ack_only,
+        "broker_rejects": broker_rejects,
+        "duplicate_exit_blocked": duplicate_exit_blocked,
         "last_stage": last_stage,
         "trade_status": final_status,
         "trade_runner_started": 1,
@@ -932,6 +1029,13 @@ def run_trade_session(
             "by_api": kis_temp_errors_by_api,
         },
         # 추가 필드
+        "expected_min_ticks": expected_min_ticks,
+        "liveness_status": "FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK",
+        "last_liveness_event": _last_liveness_event,
+        "has_session_finally": True,
+        "probable_liveness_cause": "early_end_or_external_kill" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "",
+        "received_signal": _signal_name(_received_signal),
+        "exit_code": _exit_code,
         "ticks_total": tick_count,
         "tick_count": tick_count,
         "ticks": tick_count,

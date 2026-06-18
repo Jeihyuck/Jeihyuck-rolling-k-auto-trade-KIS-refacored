@@ -402,13 +402,9 @@ def load_us_orders(trade_date: str) -> list[dict]:
     start_utc, end_utc = _ny_date_bounds_utc(trade_date)
     queries = [
         ("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}),
-        ("SELECT * FROM orders WHERE market = 'US' AND trade_date = :td", {"td": trade_date}),
         ("SELECT * FROM us_orders WHERE created_at >= :start_ts AND created_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
         ("SELECT * FROM us_orders WHERE submitted_at >= :start_ts AND submitted_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
         ("SELECT * FROM us_orders WHERE acked_at >= :start_ts AND acked_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
-        ("SELECT * FROM orders WHERE market = 'US' AND created_at >= :start_ts AND created_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
-        ("SELECT * FROM orders WHERE market = 'US' AND submitted_at >= :start_ts AND submitted_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
-        ("SELECT * FROM orders WHERE market = 'US' AND acked_at >= :start_ts AND acked_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
     ]
     errors: list[str] = []
     for sql, params in queries:
@@ -432,7 +428,6 @@ def load_us_fills_count(trade_date: str) -> int:
         return 0
     queries = [
         "SELECT COUNT(*) AS n FROM us_fills WHERE trade_date = :td",
-        "SELECT COUNT(*) AS n FROM fills WHERE market = 'US' AND trade_date = :td",
     ]
     for sql in queries:
         try:
@@ -453,7 +448,6 @@ def load_balance_confirmed_count(trade_date: str) -> int:
     queries = [
         "SELECT COUNT(*) AS n FROM us_orders WHERE trade_date = :td AND UPPER(COALESCE(state, status, '')) = 'BALANCE_CONFIRMED'",
         "SELECT COUNT(*) AS n FROM us_positions WHERE as_of = :td AND COALESCE(qty, quantity, 0) > 0",
-        "SELECT COUNT(*) AS n FROM positions WHERE market = 'US' AND as_of = :td AND COALESCE(qty, quantity, 0) > 0",
     ]
     for sql in queries:
         try:

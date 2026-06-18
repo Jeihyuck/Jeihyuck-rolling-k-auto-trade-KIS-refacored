@@ -106,6 +106,7 @@ jobs:
       US_SESSION_INTERVAL_SEC: "300"
 
       DRY_RUN: "1"
+      US_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && '1' || '0') || ((vars.US_AGENT_SCHEDULE_DRY_RUN || '0') == '1' && '1' || '0') }}
 
       US_LOG_FILE: "us-trade-prep.log"
       US_ARTIFACT_NAME: "us-trade-prep"

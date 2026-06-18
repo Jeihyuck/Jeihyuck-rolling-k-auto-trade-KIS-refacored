@@ -564,40 +564,21 @@ def run_trade_tick(
             now.strftime("%H:%M:%S"),
         )
     else:
-        # ── 당일 BUY 중복 체크: entry만 차단, 세션/exit 계속 ─────────────────
+        # ── 당일 BUY count는 전체 entry 차단이 아닌 진단 전용 ─────────────────
         _entry_already_bought = False
         _buy_orders_today = 0
         try:
             from trader.us.db.repos import get_today_buy_orders_count
-
             _buy_orders_today = get_today_buy_orders_count(trade_date=trade_date, env=env)
-            local_entry_allowed = _buy_orders_today <= 0
-            resolved_entry_allowed = local_entry_allowed
-
-            if session_entry_allowed is not None and bool(session_entry_allowed) != local_entry_allowed:
-                logger.warning(
-                    "[US_ENTRY][CONSISTENCY_WARN] session_entry_allowed=%s local_entry_allowed=%s buy_orders_count=%d",
-                    int(bool(session_entry_allowed)),
-                    int(local_entry_allowed),
-                    _buy_orders_today,
-                )
-                resolved_entry_allowed = bool(session_entry_allowed) and local_entry_allowed
-            elif session_entry_allowed is not None:
-                resolved_entry_allowed = bool(session_entry_allowed)
-
-            if not resolved_entry_allowed:
-                _entry_already_bought = True
-                if session_buy_orders_count is not None:
-                    _buy_orders_today = max(_buy_orders_today, int(session_buy_orders_count or 0))
-                logger.info(
-                    "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=%d",
-                    _buy_orders_today,
-                )
-                logger.info(
-                    "[US_EXIT][MONITOR][CONTINUE] reason=entry_blocked_but_exit_monitor_enabled",
-                )
+            if session_buy_orders_count is not None:
+                _buy_orders_today = max(_buy_orders_today, int(session_buy_orders_count or 0))
+            logger.info(
+                "[US_ENTRY][DIAGNOSTIC] already_bought_today=%d buy_orders_count=%d entry_global_block=0",
+                int(_buy_orders_today > 0),
+                _buy_orders_today,
+            )
         except Exception as _ebc_exc:
-            logger.warning("[US_ENTRY][ENTRY_BLOCK_CHECK][WARN] error=%s (fail-open)", _ebc_exc)
+            logger.warning("[US_ENTRY][ENTRY_DIAGNOSTIC][WARN] error=%s (fail-open)", _ebc_exc)
 
         # prep status 확인 (locked watchlist contract)
         from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
@@ -616,12 +597,6 @@ def run_trade_tick(
             logger.warning(
                 "[US_ENTRY][BLOCK] reason=prep_degraded_or_error status=%s",
                 prep_status
-            )
-        elif _entry_already_bought if '_entry_already_bought' in locals() else False:
-            # 당일 BUY 이미 완료: entry skip (exit monitoring은 이미 위에서 계속됨)
-            logger.info(
-                "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=%d",
-                _buy_orders_today if '_buy_orders_today' in locals() else 0,
             )
         else:
             # locked watchlist 로드
@@ -1022,25 +997,90 @@ def run_trade_tick(
 
     ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
-    blocked_cnt = sum(1 for o in orders if o["status"] == "BLOCKED")
+    exit_closed_cnt = sum(1 for o in orders if o["status"] == "OK_EXIT_POSITION_CLOSED")
+    sell_reconcile_pending_cnt = sum(1 for o in orders if o["status"] == "WARN_SELL_REJECT_RECONCILE_PENDING")
+    blocked_cnt = sum(1 for o in orders if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
     
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
+    blocked_sell_symbols: set[str] = set()
+    duplicate_exit_blocked = False
     for o in orders:
-        if o["status"] == "BLOCKED":
-            reason = o.get("reason", "unknown")
-            # reason에서 실제 차단 사유 추출 (예: "[US_RISK][BLOCK] reason=notional_exceeds_order_limit ..." -> "notional_exceeds_order_limit")
-            if "reason=" in reason:
-                try:
-                    reason = reason.split("reason=")[1].split()[0]
-                except Exception:
-                    pass
-            block_reasons[reason] = block_reasons.get(reason, 0) + 1
+        status_o = str(o.get("status") or "")
+        reason = str(o.get("reason") or "unknown")
+        side_o = str(o.get("side") or (o.get("intent") or {}).get("side") or "").upper()
+        symbol_o = str(o.get("symbol") or (o.get("intent") or {}).get("symbol") or "").upper()
+        reason_key = reason
+        if "reason=" in reason_key:
+            try:
+                reason_key = reason_key.split("reason=")[1].split()[0]
+            except Exception:
+                pass
+        if status_o in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
+            block_reasons[reason_key] = block_reasons.get(reason_key, 0) + 1
+            if side_o == "SELL" and symbol_o:
+                blocked_sell_symbols.add(symbol_o)
+        if status_o == "WARN_DUPLICATE_EXIT_BLOCKED" or reason_key in {"pending_sell_order_exists", "duplicate_sell_client_order_key"}:
+            duplicate_exit_blocked = True
 
     duplicate_blocked_cnt = sum(1 for o in orders if o.get("duplicate_blocked"))
+    duplicate_exit_blocked = duplicate_exit_blocked or duplicate_blocked_cnt > 0
+    reject_reasons = [str(o.get("reason") or o.get("error") or "") for o in orders if o.get("status") == "REJECT"]
+    primary_reject_reason = next((r for r in reject_reasons if r), "")
+    from trader.us.runner.status_contract import is_no_balance_sell_reject
+    sell_reject_symbols: set[str] = set()
+    no_balance_sell_symbols: set[str] = set()
+    for o in orders:
+        side_o = str((o.get("intent") or {}).get("side") or o.get("side") or "").upper()
+        symbol_o = str((o.get("intent") or {}).get("symbol") or o.get("symbol") or "").upper()
+        reason_o = str(o.get("reason") or o.get("error") or "")
+        if o.get("status") == "REJECT" and side_o == "SELL" and symbol_o:
+            sell_reject_symbols.add(symbol_o)
+            if is_no_balance_sell_reject(reason_o):
+                no_balance_sell_symbols.add(symbol_o)
+    no_balance_sell_reject_count = len(no_balance_sell_symbols)
+    recent_sell_ack_symbols: set[str] = set()
+    balance_qty_zero_symbols: set[str] = set()
+    orderable_qty_zero_symbols: set[str] = set()
+    position_absent_symbols: set[str] = set()
+    positions_by_symbol = {
+        str(p.get("symbol", "")).upper(): p
+        for p in (current_positions if 'current_positions' in locals() else [])
+        if p.get("symbol")
+    }
+    for symbol_nb in no_balance_sell_symbols:
+        try:
+            from trader.us.db.repos import find_recent_sell_ack
+            recent_ack = find_recent_sell_ack(symbol=symbol_nb, trade_date=trade_date)
+        except Exception as exc:
+            logger.warning("[US_TICK][RECENT_SELL_ACK][WARN] symbol=%s err=%s", symbol_nb, exc)
+            recent_ack = None
+        if recent_ack:
+            recent_sell_ack_symbols.add(symbol_nb)
+        pos = positions_by_symbol.get(symbol_nb)
+        if pos is None:
+            position_absent_symbols.add(symbol_nb)
+            balance_qty_zero_symbols.add(symbol_nb)
+            orderable_qty_zero_symbols.add(symbol_nb)
+            continue
+        try:
+            qty_val = int(pos.get("qty") or pos.get("holding_qty") or 0)
+        except Exception:
+            qty_val = 0
+        try:
+            orderable_val = int(pos.get("orderable_qty") or pos.get("sellable_qty") or 0)
+        except Exception:
+            orderable_val = 0
+        if qty_val <= 0:
+            balance_qty_zero_symbols.add(symbol_nb)
+        if orderable_val <= 0:
+            orderable_qty_zero_symbols.add(symbol_nb)
+    recent_sell_ack_exists = bool(recent_sell_ack_symbols)
+    balance_qty_zero = bool(balance_qty_zero_symbols)
+    orderable_qty_zero = bool(orderable_qty_zero_symbols)
     logger.info(
         "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d duplicate_blocked=%d signal_only=%d reject=%d error=%d",
         len(orders), ack_cnt, dry_cnt, blocked_cnt, duplicate_blocked_cnt, signal_only_cnt, reject_cnt, err_cnt,
@@ -1091,7 +1131,15 @@ def run_trade_tick(
         # exit intents가 있으면 exit 결과를 기준으로 status 결정
         # 주의: exit_intents > 0이면 entry_intents == 0이어도 OK_NO_TRADE 금지
         orders_attempted = len(orders)
-        if reject_cnt == exit_intents_count and orders_sent == 0:
+        if exit_closed_cnt > 0 and exit_closed_cnt == exit_intents_count:
+            status = "OK_EXIT_POSITION_CLOSED"
+        elif duplicate_blocked_cnt > 0 and duplicate_blocked_cnt == exit_intents_count:
+            status = "WARN_DUPLICATE_EXIT_BLOCKED"
+        elif sell_reconcile_pending_cnt > 0 and (sell_reconcile_pending_cnt + duplicate_blocked_cnt + exit_closed_cnt) == exit_intents_count:
+            status = "WARN_SELL_REJECT_RECONCILE_PENDING"
+        elif no_balance_sell_symbols:
+            status = "FAILED_ALL_EXIT_ORDERS_REJECTED"
+        elif reject_cnt == exit_intents_count and orders_sent == 0:
             status = "FAILED_ALL_EXIT_ORDERS_REJECTED"
             logger.error(
                 "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d rejected=%d",
@@ -1102,6 +1150,12 @@ def run_trade_tick(
             logger.error(
                 "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d rejected=%d sent=%d",
                 status, exit_intents_count, reject_cnt, orders_sent,
+            )
+        elif duplicate_blocked_cnt > 0 and blocked_cnt == exit_intents_count and orders_sent == 0:
+            status = "WARN_DUPLICATE_EXIT_BLOCKED"
+            logger.warning(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d duplicate_blocked=%d",
+                status, exit_intents_count, duplicate_blocked_cnt,
             )
         elif blocked_cnt == exit_intents_count and orders_sent == 0:
             status = "FAILED_ALL_EXIT_ORDERS_BLOCKED"
@@ -1168,6 +1222,23 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    broker_ack_only = ack_cnt + dry_cnt
+    broker_rejects = reject_cnt
+    for f in (fills_today if 'fills_today' in locals() else []):
+        side_f = str(f.get("side") or "").upper()
+        meta_f = f.get("meta") or {}
+        source_f = str(f.get("source") or f.get("reconcile_source") or (meta_f.get("source") if isinstance(meta_f, dict) else "") or "").lower()
+        is_synth = "balance_reconcile" in source_f or "synthetic" in source_f
+        if is_synth and side_f == "BUY":
+            synthetic_reconcile_buys += 1
+        elif is_synth and side_f == "SELL":
+            synthetic_reconcile_sells += 1
+        elif side_f == "BUY":
+            real_broker_buys += 1
+        elif side_f == "SELL":
+            real_broker_sells += 1
+
     held_skip = locals().get("held_skip_count")
     held_skip_unknown = 0 if isinstance(held_skip, int) else 1
     logger.info(
@@ -1181,7 +1252,19 @@ def run_trade_tick(
 
     return {
         "status": status,
-        "reason": "none",
+        "reason": primary_reject_reason or ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none"),
+        "primary_reject_reason": primary_reject_reason,
+        "reject_reasons": reject_reasons,
+        "no_balance_sell_reject_count": no_balance_sell_reject_count,
+        "recent_sell_ack_exists": recent_sell_ack_exists,
+        "balance_qty_zero": balance_qty_zero,
+        "orderable_qty_zero": orderable_qty_zero,
+        "sell_reject_symbols": sorted(sell_reject_symbols),
+        "no_balance_sell_symbols": sorted(no_balance_sell_symbols),
+        "recent_sell_ack_symbols": sorted(recent_sell_ack_symbols),
+        "position_absent_symbols": sorted(position_absent_symbols),
+        "balance_qty_zero_symbols": sorted(balance_qty_zero_symbols),
+        "orderable_qty_zero_symbols": sorted(orderable_qty_zero_symbols),
         "session": session,
         "orders": orders,
         "ack": ack_cnt,
@@ -1190,6 +1273,7 @@ def run_trade_tick(
         "blocked": blocked_cnt,
         "orders_blocked": blocked_cnt,  # 호환성 위해 둘 다 제공
         "block_reasons": block_reasons,
+        "blocked_sell_symbols": sorted(blocked_sell_symbols),
         "signal_only": signal_only_cnt,
         "errors": err_cnt,
         "orders_rejected": reject_cnt,
@@ -1221,6 +1305,13 @@ def run_trade_tick(
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
+        "real_broker_buys": real_broker_buys,
+        "real_broker_sells": real_broker_sells,
+        "synthetic_reconcile_buys": synthetic_reconcile_buys,
+        "synthetic_reconcile_sells": synthetic_reconcile_sells,
+        "broker_ack_only": broker_ack_only,
+        "broker_rejects": broker_rejects,
+        "duplicate_exit_blocked": duplicate_exit_blocked,
     }
 
 

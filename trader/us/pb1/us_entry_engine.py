@@ -240,6 +240,110 @@ def _resolve_entry_signal_type(entry_meta: dict | None) -> str:
     return "unknown"
 
 
+def _as_float_or_none(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_us_trade_date(now: datetime | None = None) -> str:
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    dt = (now or datetime.now(tz=ny)).astimezone(ny)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _load_held_position_snapshot(symbol: str, provider: Any = None) -> dict:
+    """Load held-position facts for add-buy decisions from DB/KIS-like snapshots."""
+    sym = str(symbol or "").strip().upper()
+    snapshot: dict = {}
+    try:
+        from trader.us.db.repos import load_us_positions_by_symbols
+        rows = load_us_positions_by_symbols([sym])
+        if isinstance(rows, dict):
+            snapshot.update(rows.get(sym) or rows.get(symbol) or {})
+    except Exception as exc:
+        logger.debug("[US_ENTRY][HELD_SNAPSHOT][DB_WARN] symbol=%s error=%s", sym, exc)
+
+    # Optional provider balance snapshot fallback for tests/live adapters.
+    try:
+        balance_positions = None
+        for attr in ("positions", "balance_positions", "holdings"):
+            value = getattr(provider, attr, None)
+            if isinstance(value, list):
+                balance_positions = value
+                break
+        if balance_positions:
+            for pos in balance_positions:
+                if str(pos.get("symbol") or "").strip().upper() == sym:
+                    snapshot.update(pos)
+                    break
+        if not balance_positions:
+            for method_name in ("get_balance_positions", "get_positions", "get_holdings"):
+                method = getattr(provider, method_name, None)
+                if callable(method):
+                    rows = method()
+                    if isinstance(rows, dict):
+                        rows = rows.get("positions") or rows.get("holdings") or []
+                    if isinstance(rows, list):
+                        for pos in rows:
+                            if str(pos.get("symbol") or "").strip().upper() == sym:
+                                snapshot.update(pos)
+                                raise StopIteration
+    except StopIteration:
+        pass
+    except Exception as exc:
+        logger.debug("[US_ENTRY][HELD_SNAPSHOT][PROVIDER_WARN] symbol=%s error=%s", sym, exc)
+    return snapshot
+
+
+def _held_pnl_pct(snapshot: dict, current_price: float | None = None) -> float | None:
+    for key in ("unrealized_pnl_pct", "pnl_pct", "pnl_rate", "profit_rate"):
+        val = _as_float_or_none(snapshot.get(key))
+        if val is not None:
+            return val / 100.0 if abs(val) > 1.0 else val
+    avg = _as_float_or_none(snapshot.get("avg_price") or snapshot.get("avg_cost") or snapshot.get("entry_price") or snapshot.get("avg_price_usd"))
+    cur = _as_float_or_none(current_price) or _as_float_or_none(snapshot.get("current_price") or snapshot.get("current_price_usd") or snapshot.get("current_px"))
+    if avg and avg > 0 and cur and cur > 0:
+        return (cur - avg) / avg
+    return None
+
+
+def _held_current_weight(snapshot: dict, capital_usd_cap: float) -> float | None:
+    for key in ("current_weight", "weight", "portfolio_weight"):
+        val = _as_float_or_none(snapshot.get(key))
+        if val is not None:
+            return val / 100.0 if val > 1.0 else val
+    mv = _as_float_or_none(snapshot.get("market_value") or snapshot.get("market_value_usd") or snapshot.get("eval_amount_usd"))
+    if mv is None:
+        qty = _as_float_or_none(snapshot.get("qty") or snapshot.get("holding_qty"))
+        price = _as_float_or_none(snapshot.get("current_price") or snapshot.get("current_price_usd") or snapshot.get("current_px"))
+        if qty is not None and price is not None:
+            mv = qty * price
+    if mv is not None and capital_usd_cap > 0:
+        return mv / capital_usd_cap
+    return None
+
+
+def _calc_add_position_size(*, symbol: str, price: float, available_cash_usd: float, capital_usd_cap: float, snapshot: dict) -> dict:
+    target_weight = float(os.getenv("US_TARGET_POSITION_WEIGHT", os.getenv("US_MAX_POSITION_WEIGHT", "0.10")) or 0.10)
+    max_symbol_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10") or 0.10)
+    current_weight = _held_current_weight(snapshot, capital_usd_cap)
+    if current_weight is None:
+        return {"blocked": True, "reason": "weight_unknown"}
+    if current_weight >= target_weight or current_weight >= max_symbol_weight:
+        return {"blocked": True, "reason": "full_weight", "current_weight": current_weight}
+    allowed_weight = max(0.0, min(target_weight - current_weight, max_symbol_weight - current_weight))
+    budget_usd = min(available_cash_usd, capital_usd_cap * allowed_weight)
+    qty = int(budget_usd // price) if price > 0 else 0
+    if qty <= 0:
+        return {"blocked": True, "reason": "add_qty_zero", "current_weight": current_weight}
+    return {"blocked": False, "qty": qty, "notional_usd": qty * price, "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
+
+
 def generate_entry_intents(
     tickers: list[str] | list[dict] | None,
     provider: Any,
@@ -354,27 +458,25 @@ def generate_entry_intents(
             logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
             continue
         
-        # KIS balance 기반 보유종목 차단 (우선순위 높음)
-        if current_position_symbols and symbol in current_position_symbols:
-            held_skipped += 1
-            track_skip(symbol, "has_kis_position")
-            logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_kis_position", symbol)
-            continue
+        position_state = "HELD" if (current_position_symbols and symbol in current_position_symbols) else "NOT_HELD"
 
-        # DB: 미체결 주문 차단
+        # DB: 미체결 주문은 차단하되, 보유는 HELD로 분리해 추가매수 평가로 진행
         try:
-            from trader.us.db.repos import has_pending_order, has_position
-            if has_pending_order(symbol):
+            from trader.us.db.repos import has_pending_order_for_symbol_side, has_position
+            if has_pending_order_for_symbol_side(symbol=symbol, side="BUY", trade_date=_resolve_us_trade_date(now)):
+                position_state = "PENDING_BUY"
                 track_skip(symbol, "pending_order")
-                logger.info("[US_ENTRY][SKIP] symbol=%s reason=pending_order", symbol)
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=%s action=SKIP_PENDING_BUY", symbol, position_state)
                 continue
-            # DB: 이미 보유 중이면 차단
-            if has_position(symbol):
-                held_skipped += 1
-                track_skip(symbol, "has_position")
-                logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_position", symbol)
+            if has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=_resolve_us_trade_date(now)):
+                position_state = "PENDING_SELL"
+                track_skip(symbol, "pending_order")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=%s action=SKIP_PENDING_SELL", symbol, position_state)
                 continue
+            if position_state == "NOT_HELD" and has_position(symbol):
+                position_state = "HELD"
         except Exception as exc:
+            position_state = "UNKNOWN_POSITION_STATE" if position_state == "NOT_HELD" else position_state
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
 
         # entries_map에 있으면 precomputed score 사용
@@ -447,6 +549,7 @@ def generate_entry_intents(
             if not exchange:
                 exchange = resolve_exchange(symbol)
             
+            canonical_entry["position_state"] = position_state
             # Phase 1: NO price lookup yet (if precomputed score exists)
             candidates.append((s, symbol, exchange, None, canonical_entry))  # price=None, entry_meta=canonical_entry
             
@@ -491,8 +594,7 @@ def generate_entry_intents(
                 continue
             
             # 실시간 계산된 경우 price를 이미 갖고 있으므로 candidates에 추가
-            # entry_meta는 없으므로 None
-            candidates.append((s, symbol, exchange, price, None))
+            candidates.append((s, symbol, exchange, price, {"position_state": position_state}))
     
     # =========================================================================
     # Phase 2: Sort by score, then price lookup for top N
@@ -563,37 +665,89 @@ def generate_entry_intents(
             # 이미 price가 있음 (runtime calculation)
             price = existing_price
 
-        sizing = calc_position_size(
-            price=price,
-            available_cash_usd=available_cash_usd,
-            capital_usd_cap=capital_usd_cap,
-            position_count=position_count + added_count,
-            score=score,
-        )
-
-        if sizing["blocked"]:
-            track_skip(symbol, "sizing_blocked", {"sizing_reason": sizing["reason"]})
-            logger.info(
-                "[US_ENTRY][SKIP] symbol=%s reason=sizing_blocked sizing_reason=%s",
-                symbol, sizing["reason"],
+        position_state_for_order = (entry_meta or {}).get("position_state", "NOT_HELD")
+        if position_state_for_order == "HELD":
+            allow_add = os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
+            allow_avg_down = os.getenv("US_ALLOW_AVERAGING_DOWN", "0") in {"1", "true", "TRUE", "yes", "YES"}
+            min_add_pnl = float(os.getenv("US_ADD_MIN_PNL_PCT", "0.0") or 0.0)
+            if not allow_add:
+                track_skip(symbol, "add_to_existing_disabled")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_DISABLED", symbol)
+                continue
+            held_snapshot = _load_held_position_snapshot(symbol, provider=provider)
+            pnl_pct = _held_pnl_pct(held_snapshot, current_price=price)
+            if pnl_pct is None:
+                track_skip(symbol, "add_pnl_unknown")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_PNL_UNKNOWN", symbol)
+                continue
+            if pnl_pct < 0 and not allow_avg_down:
+                track_skip(symbol, "no_averaging_down")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_NO_AVERAGING_DOWN", symbol)
+                continue
+            if pnl_pct < min_add_pnl:
+                track_skip(symbol, "add_min_pnl_not_met")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_MIN_PNL pnl_pct=%.4f", symbol, pnl_pct)
+                continue
+            max_add_count = int(os.getenv("US_MAX_ADD_COUNT_PER_SYMBOL", "2") or 2)
+            add_count = int(
+                held_snapshot.get("add_count_today")
+                or held_snapshot.get("add_count")
+                or held_snapshot.get("pyramid_add_count")
+                or 0
             )
-            continue
+            if add_count >= max_add_count:
+                track_skip(symbol, "max_add_count_reached")
+                logger.info(
+                    "[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_MAX_ADD_COUNT add_count=%d max_add_count=%d",
+                    symbol, add_count, max_add_count,
+                )
+                continue
+            sizing = _calc_add_position_size(
+                symbol=symbol,
+                price=price,
+                available_cash_usd=available_cash_usd,
+                capital_usd_cap=capital_usd_cap,
+                snapshot=held_snapshot,
+            )
+            if sizing["blocked"]:
+                reason = sizing.get("reason", "add_sizing_blocked")
+                if reason in {"full_weight", "weight_unknown"}:
+                    action = "SKIP_FULL_WEIGHT" if reason == "full_weight" else "SKIP_ADD_WEIGHT_UNKNOWN"
+                    track_skip(symbol, reason)
+                    logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=%s current_weight=%s", symbol, action, sizing.get("current_weight"))
+                    continue
+                track_skip(symbol, reason)
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_SIZING reason=%s", symbol, reason)
+                continue
+            qty = sizing["qty"]
+            notional = sizing["notional_usd"]
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed pnl_pct=%.4f current_weight=%.4f", symbol, pnl_pct, sizing.get("current_weight", 0.0))
+        else:
+            sizing = calc_position_size(
+                price=price,
+                available_cash_usd=available_cash_usd,
+                capital_usd_cap=capital_usd_cap,
+                position_count=position_count + added_count,
+                score=score,
+            )
 
-        qty = sizing["qty"]
-        notional = sizing["notional_usd"]
+            if sizing["blocked"]:
+                track_skip(symbol, "sizing_blocked", {"sizing_reason": sizing["reason"]})
+                logger.info(
+                    "[US_ENTRY][SKIP] symbol=%s reason=sizing_blocked sizing_reason=%s",
+                    symbol, sizing["reason"],
+                )
+                continue
+
+            qty = sizing["qty"]
+            notional = sizing["notional_usd"]
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=NOT_HELD action=NEW_BUY", symbol)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
 
         import hashlib
-        from datetime import date
-        
-        # force_now가 있으면 그 날짜 사용
-        if now:
-            today_str = now.date().strftime("%Y%m%d")
-            trade_date_for_key = now.date().strftime("%Y-%m-%d")
-        else:
-            today_str = date.today().strftime("%Y%m%d")
-            trade_date_for_key = date.today().strftime("%Y-%m-%d")
+        trade_date_for_key = _resolve_us_trade_date(now)
+        today_str = trade_date_for_key.replace("-", "")
         
         key_raw = f"{symbol}_{today_str}_BUY"
         client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
@@ -705,7 +859,7 @@ def generate_entry_intents(
             "entry_strategy": "us_pb1",
             "entry_signal_type": _resolve_entry_signal_type(entry_meta),
             "entry_session": now.strftime("%p").lower().replace("am", "am").replace("pm", "afternoon") if now else "am",
-            "trade_date": trade_date if 'trade_date' in locals() else (now.strftime("%Y-%m-%d") if now else ""),
+            "trade_date": trade_date_for_key,
             "partial_exit_allowed": os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1",
             "source": "locked_watchlist",
             "min_hold_minutes": int(os.getenv("US_SWING_MIN_HOLD_MINUTES", "390")),

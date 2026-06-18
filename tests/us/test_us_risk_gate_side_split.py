@@ -13,9 +13,20 @@ _SAFE_ENV = {
     "US_AGENT_ENABLED": "true",
     "TRADING_REGION": "US",
     "KIS_ENV": "practice",
-    "US_PAPER_TRADING_ENABLED": "true",
-    "US_LIVE_TRADING_ENABLED": "false",
-    "DISABLE_REAL_TRADING": "true",
+    "STRATEGY_ENV": "practice",
+    "RUN_MODE": "TRADE",
+    "STRATEGY_MODE": "TRADE",
+    "SIGNAL_ONLY": "0",
+    # Keep these side-split unit tests focused on BUY/SELL risk branch
+    # behavior instead of CI-level order-permission guards.
+    "DRY_RUN": "0",
+    "DISABLE_LIVE_TRADING": "0",
+    "DISABLE_REAL_TRADING": "0",
+    "LIVE_TRADING_ENABLED": "1",
+    "US_LIVE_TRADING_ENABLED": "1",
+    "US_ORDER_ARMED": "1",
+    "US_PAPER_TRADING_ENABLED": "1",
+    "ALLOW_REAL_ORDER": "1",
     "US_MAX_ORDER_USD": "9999",
     "US_MAX_DAILY_NOTIONAL_USD": "99999",
     "US_MAX_POSITIONS": "100",
@@ -52,12 +63,14 @@ def test_sell_skips_budget_check():
     def mock_budget_check(*args, **kwargs):
         called.append("budget_check")
 
-    with patch.dict(os.environ, _SAFE_ENV, clear=False):
+    with patch.dict(os.environ, _SAFE_ENV, clear=True):
         with patch.object(risk_gate, "check_us_capital_budget", mock_budget_check):
             risk_gate.assert_order_allowed(
                 _make_sell_intent(),
                 available_cash_usd=10000.0,
                 total_portfolio_usd=10000.0,
+                allowed_symbols={"AAPL"},
+                current_position_symbols={"AAPL"},
             )
 
     assert "budget_check" not in called, (
@@ -71,7 +84,7 @@ def test_sell_skips_entry_cutoff():
     from datetime import datetime
     import zoneinfo
 
-    with patch.dict(os.environ, {**_SAFE_ENV, "US_BLOCK_NEW_ENTRY_AFTER_ET": "15:45"}, clear=False):
+    with patch.dict(os.environ, {**_SAFE_ENV, "US_BLOCK_NEW_ENTRY_AFTER_ET": "15:45"}, clear=True):
         # 15:50 ET — cutoff 이후여도 SELL은 통과해야 한다
         ny_tz = zoneinfo.ZoneInfo("America/New_York")
         now = datetime(2026, 5, 1, 15, 50, 0, tzinfo=ny_tz)
@@ -80,6 +93,8 @@ def test_sell_skips_entry_cutoff():
             _make_sell_intent(),
             available_cash_usd=10000.0,
             total_portfolio_usd=10000.0,
+            allowed_symbols={"AAPL"},
+            current_position_symbols={"AAPL"},
             now=now,
         )
         # 예외 없이 통과 = pass
@@ -92,7 +107,7 @@ def test_buy_fails_after_cutoff():
     from datetime import datetime
     import zoneinfo
 
-    with patch.dict(os.environ, {**_SAFE_ENV, "US_BLOCK_NEW_ENTRY_AFTER_ET": "15:45"}, clear=False):
+    with patch.dict(os.environ, {**_SAFE_ENV, "US_BLOCK_NEW_ENTRY_AFTER_ET": "15:45"}, clear=True):
         ny_tz = zoneinfo.ZoneInfo("America/New_York")
         now = datetime(2026, 5, 1, 15, 50, 0, tzinfo=ny_tz)
         with pytest.raises(RiskGateBlocked, match="after_entry_cutoff"):
@@ -100,6 +115,8 @@ def test_buy_fails_after_cutoff():
                 _make_buy_intent(),
                 available_cash_usd=10000.0,
                 total_portfolio_usd=10000.0,
+                allowed_symbols={"AAPL"},
+                current_position_symbols=set(),
                 now=now,
             )
 
@@ -113,12 +130,14 @@ def test_sell_skips_cash_buffer_check():
     def mock_cash_buffer(*args, **kwargs):
         called.append("cash_buffer")
 
-    with patch.dict(os.environ, _SAFE_ENV, clear=False):
+    with patch.dict(os.environ, _SAFE_ENV, clear=True):
         with patch.object(risk_gate, "check_cash_buffer", mock_cash_buffer):
             risk_gate.assert_order_allowed(
                 _make_sell_intent(),
                 available_cash_usd=10000.0,
                 total_portfolio_usd=10000.0,
+                allowed_symbols={"AAPL"},
+                current_position_symbols={"AAPL"},
             )
 
     assert "cash_buffer" not in called, (
@@ -135,12 +154,14 @@ def test_sell_skips_daily_notional():
     def mock_daily(*args, **kwargs):
         called.append("daily_notional")
 
-    with patch.dict(os.environ, _SAFE_ENV, clear=False):
+    with patch.dict(os.environ, _SAFE_ENV, clear=True):
         with patch.object(risk_gate, "check_daily_notional", mock_daily):
             risk_gate.assert_order_allowed(
                 _make_sell_intent(),
                 available_cash_usd=10000.0,
                 total_portfolio_usd=10000.0,
+                allowed_symbols={"AAPL"},
+                current_position_symbols={"AAPL"},
             )
 
     assert "daily_notional" not in called, (
@@ -152,13 +173,15 @@ def test_sell_blocks_qty_exceeds_position():
     """SELL qty > available_qty일 때 차단되어야 한다."""
     from trader.us.execution.risk_gate import RiskGateBlocked
 
-    with patch.dict(os.environ, _SAFE_ENV, clear=False):
+    with patch.dict(os.environ, _SAFE_ENV, clear=True):
         from trader.us.execution import risk_gate
         with pytest.raises(RiskGateBlocked, match="sell_qty_exceeds_position"):
             risk_gate.assert_order_allowed(
                 _make_sell_intent(qty=20, available_qty=10),
                 available_cash_usd=10000.0,
                 total_portfolio_usd=10000.0,
+                allowed_symbols={"AAPL"},
+                current_position_symbols={"AAPL"},
             )
 
 
@@ -171,12 +194,14 @@ def test_buy_calls_budget_check():
     def mock_budget_check(*args, **kwargs):
         called.append("budget_check")
 
-    with patch.dict(os.environ, _SAFE_ENV, clear=False):
+    with patch.dict(os.environ, _SAFE_ENV, clear=True):
         with patch.object(risk_gate, "check_us_capital_budget", mock_budget_check):
             risk_gate.assert_order_allowed(
                 _make_buy_intent(),
                 available_cash_usd=10000.0,
                 total_portfolio_usd=10000.0,
+                allowed_symbols={"AAPL"},
+                current_position_symbols=set(),
             )
 
     assert "budget_check" in called, (

@@ -22,6 +22,7 @@ from typing import Any
 
 from trader.us import config as us_cfg
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
+from trader.us.runner.status_contract import is_no_balance_sell_reject
 from trader.us.db.repos import (  # test patch surface
     load_today_order_keys,
     mark_order_intent_blocked,
@@ -108,11 +109,12 @@ def route_order(
     from trader.utils.env import env_bool
 
     symbol = intent.get("symbol", "")
-    side = intent.get("side", "BUY")
+    side = str(intent.get("side", "BUY")).upper()
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
     exchange = intent.get("exchange", "NASDAQ")
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
+    trade_date = intent.get("trade_date")
 
     logger.info(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
@@ -149,15 +151,32 @@ def route_order(
             "intent": intent,
         }
 
-    # 1. intent DB 저장
-    save_order_intent(intent)
-
-    # 2. 중복 key: DB + in-memory 합산
+    # 1. SELL duplicate precheck before saving intent: never grow blocked duplicate intents.
     try:
+        db_keys = load_today_order_keys(trade_date=trade_date)
+    except TypeError:
         db_keys = load_today_order_keys()
     except Exception:
         db_keys = set()
     existing_keys = _SENT_ORDER_KEYS | db_keys
+    if side == "SELL" and order_key and order_key in existing_keys:
+        logger.info(
+            "[US_ORDER][DEDUP_PRECHECK] symbol=%s side=SELL key=%s action=skip_before_save_intent",
+            symbol, order_key,
+        )
+        return {
+            "status": "WARN_DUPLICATE_EXIT_BLOCKED",
+            "reason": "duplicate_sell_client_order_key",
+            "symbol": symbol,
+            "side": side,
+            "duplicate_blocked": True,
+            "intent": intent,
+        }
+
+    # 2. intent DB 저장
+    save_order_intent(intent)
+
+    # 3. 중복 key: DB + in-memory 합산
 
     # 3. Risk Gate
     gate_intent = {**intent, "client_order_key": order_key}
@@ -171,6 +190,7 @@ def route_order(
             existing_order_keys=existing_keys,
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
+            trade_date=trade_date,
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
@@ -212,6 +232,7 @@ def route_order(
                         existing_order_keys=existing_keys,
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,
+                        trade_date=trade_date,
                     )
                     
                     # 재시도 성공: 축소된 intent로 계속 진행
@@ -244,8 +265,32 @@ def route_order(
             # notional_exceeds_order_limit가 아닌 다른 block reason
             reason_text = str(exc)
             reason_code = reason_text.split("reason=", 1)[1].split()[0] if "reason=" in reason_text else reason_text
+            if side == "SELL" and reason_code == "pending_sell_order_exists":
+                try:
+                    from trader.us.db.repos import find_recent_sell_ack, load_us_positions_by_symbols
+                    recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=trade_date)
+                    positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                    pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
+                    qty_now = int(pos.get("qty") or pos.get("holding_qty") or pos.get("orderable_qty") or 0) if pos else 0
+                    if recent_ack and qty_now <= 0:
+                        logger.warning(
+                            "[US_ORDER][SELL_PENDING][RECENT_ACK_CLOSED] symbol=%s order_no=%s reason=%s",
+                            symbol, recent_ack.get("order_no"), reason_code,
+                        )
+                        return {
+                            "status": "OK_EXIT_POSITION_CLOSED",
+                            "reason": "pending_sell_order_after_recent_ack_position_closed",
+                            "symbol": symbol,
+                            "side": side,
+                            "requires_reconcile": False,
+                            "reconciled": True,
+                            "intent": intent,
+                            "recent_sell_ack": recent_ack,
+                        }
+                except Exception as pending_exc:
+                    logger.warning("[US_ORDER][SELL_PENDING][RECENT_ACK_WARN] symbol=%s err=%s", symbol, pending_exc)
             dedup_key = (str(symbol).upper(), str(side).upper(), reason_code)
-            duplicate_blocked = dedup_key in _BLOCKED_INTENT_KEYS
+            duplicate_blocked = dedup_key in _BLOCKED_INTENT_KEYS or (side == "SELL" and ("duplicate" in reason_code or "pending_order_exists" in reason_code or "pending_sell_order_exists" in reason_code))
             if duplicate_blocked:
                 logger.info(
                     "[US_ORDER][DEDUP] symbol=%s side=%s action=skip_duplicate_blocked_intent reason=%s",
@@ -255,7 +300,8 @@ def route_order(
                 _BLOCKED_INTENT_KEYS.add(dedup_key)
                 if order_key:
                     mark_order_intent_blocked(order_key, reason=reason_text)
-            return {"status": "BLOCKED", "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent}
+            blocked_status = "WARN_DUPLICATE_EXIT_BLOCKED" if (side == "SELL" and duplicate_blocked) else "BLOCKED"
+            return {"status": blocked_status, "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent}
 
     # 4. DRY_RUN resolve with runtime guard
     dry_run_resolved = resolve_dry_run_for_us_order()
@@ -358,6 +404,27 @@ def route_order(
         )
 
         if sell_qty <= 0:
+            try:
+                from trader.us.db.repos import find_recent_sell_ack
+                recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=trade_date)
+            except Exception as ack_exc:
+                logger.warning("[US_ORDER][SELL_NO_ORDERABLE][RECENT_ACK_WARN] symbol=%s err=%s", symbol, ack_exc)
+                recent_ack = None
+            if recent_ack:
+                logger.warning(
+                    "[US_ORDER][SELL_NO_ORDERABLE][RECENT_ACK_CLOSED] symbol=%s order_no=%s reason=no_orderable_qty",
+                    symbol, recent_ack.get("order_no"),
+                )
+                return {
+                    "status": "OK_EXIT_POSITION_CLOSED",
+                    "reason": "no_orderable_qty_after_recent_sell_ack",
+                    "symbol": symbol,
+                    "side": side,
+                    "requires_reconcile": False,
+                    "reconciled": True,
+                    "intent": intent,
+                    "recent_sell_ack": recent_ack,
+                }
             logger.error(
                 "[US_ORDER][SELL_BLOCKED] symbol=%s reason=no_orderable_qty"
                 " holding_qty=%s orderable_qty=%s",
@@ -444,7 +511,23 @@ def route_order(
         logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
 
     except Exception as exc:
-        # KIS API 자체 실패 → REJECT
+        # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
+        msg = str(exc)
+        if side == "SELL" and is_no_balance_sell_reject(msg):
+            try:
+                from trader.us.db.repos import find_recent_sell_ack, load_us_positions_by_symbols
+                recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=trade_date)
+                positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
+                qty_now = int(pos.get("qty") or pos.get("holding_qty") or pos.get("orderable_qty") or 0) if pos else 0
+                if recent_ack and qty_now <= 0:
+                    logger.warning("[US_ORDER][SELL_NO_BALANCE][CLOSED] symbol=%s reason=%s", symbol, msg)
+                    return {"status": "OK_EXIT_POSITION_CLOSED", "reason": "no_balance_after_recent_sell_ack", "symbol": symbol, "side": side, "requires_reconcile": False, "reconciled": True, "intent": intent}
+                if recent_ack:
+                    logger.warning("[US_ORDER][SELL_NO_BALANCE][RECONCILE_PENDING] symbol=%s reason=%s", symbol, msg)
+                    return {"status": "WARN_SELL_REJECT_RECONCILE_PENDING", "reason": msg, "symbol": symbol, "side": side, "requires_reconcile": True, "intent": intent}
+            except Exception as nb_exc:
+                logger.warning("[US_ORDER][SELL_NO_BALANCE][WARN] reconcile probe failed: %s", nb_exc)
         logger.error("[US_ORDER][REJECT] symbol=%s side=%s error=%s", symbol, side, exc)
         reject_result = {
             "client_order_key": order_key,
@@ -452,14 +535,14 @@ def route_order(
             "exchange": exchange,
             "side": side,
             "qty": qty,
-            "reason": str(exc),
+            "reason": msg,
         }
         save_order_reject(reject_result)
         if order_key:
-            mark_order_intent_rejected(order_key, reason=str(exc))
+            mark_order_intent_rejected(order_key, reason=msg)
         return {
             "status": "REJECT",
-            "reason": str(exc),
+            "reason": msg,
             "kis_ack": False,
             "ack_db_saved": False,
             "requires_reconcile": False,
@@ -484,14 +567,32 @@ def route_order(
 
     ack_db_saved = False
     try:
-        save_order_ack(ack_result)
-        ack_db_saved = True
-        logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
-    except Exception as db_exc:
-        logger.error(
-            "[US_ORDER][ACK_DB_FAILED] symbol=%s order_no=%s error=%s",
-            symbol, order_no, db_exc,
+        ack_db_saved = bool(save_order_ack(ack_result))
+        if ack_db_saved:
+            logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
+    except Exception:
+        logger.exception(
+            "[US_ORDER][ACK_DB_SAVE][FAILED] symbol=%s side=%s order_no=%s",
+            symbol, side, ack_result.get("order_no"),
         )
+        ack_db_saved = False
+
+    if not ack_db_saved:
+        logger.error(
+            "[US_ORDER][ACK_DB_SAVE][FAILED_RETURN] symbol=%s side=%s order_no=%s",
+            symbol, side, ack_result.get("order_no"),
+        )
+        return {
+            "status": "ACK_DB_FAILED",
+            "reason": "ack_db_save_failed",
+            "symbol": symbol,
+            "side": side,
+            "ack": ack_result,
+            "requires_reconcile": True,
+            "intent": intent,
+            "kis_ack": True,
+            "ack_db_saved": False,
+        }
 
     # ── intent 상태 업데이트 ───────────────────────────────────────────────
     try:
