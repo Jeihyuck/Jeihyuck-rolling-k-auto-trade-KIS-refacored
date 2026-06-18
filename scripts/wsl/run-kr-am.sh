@@ -3,6 +3,14 @@ set -euo pipefail
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
+LOCK_DIR="runtime/locks"
+mkdir -p "$LOCK_DIR"
+LOCK_FILE="$LOCK_DIR/kr-am.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "[KR_AM][SKIP] reason=LOCK_HELD lock=$LOCK_FILE ts=$(date -Is)"
+  exit 0
+fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul

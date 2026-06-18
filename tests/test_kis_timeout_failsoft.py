@@ -22,10 +22,12 @@ def test_run_pb1_session_continues_after_balance_failsoft(monkeypatch, tmp_path)
     import json, sys, types
     monkeypatch.setattr(runner, 'ROOT', tmp_path)
     monkeypatch.setattr(pa, 'ROOT', tmp_path)
+    from trader.kr import artifacts
+    monkeypatch.setattr(artifacts, 'ROOT', tmp_path)
     final=tmp_path/'signals/kr/latest_final30_scored.json'
     final.parent.mkdir(parents=True, exist_ok=True)
     final.write_text(json.dumps([{'code':str(i)} for i in range(30)]), encoding='utf-8')
-    (tmp_path/'signals/kr/latest_prep_contract.json').write_text(json.dumps({'market':'KR','env':'practice','as_of':'2026-06-15','trade_date':'2026-06-16','final30_rows':30,'final30_scored_rows':30,'contract_ok':True,'trade_can_proceed':True}), encoding='utf-8')
+    (tmp_path/'signals/kr/latest_prep_contract.json').write_text(json.dumps({'market':'KR','env':'practice','as_of':'2026-06-15','trade_date':'2026-06-16','final30_rows':30,'final30_scored_rows':30,'db_exact_rows':30,'contract_ok':True,'trade_can_proceed':True}), encoding='utf-8')
     monkeypatch.setenv('KR_TRADE_DATE','2026-06-16')
     class DummyKis:
         def get_balance_cached(self):
