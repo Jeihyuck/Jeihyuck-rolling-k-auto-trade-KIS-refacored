@@ -23,9 +23,12 @@ def test_ok_exit_orders_sent_is_success():
 def test_no_balance_exit_rejected_is_warning_not_fatal():
     result = {
         "status": "FAILED_ALL_EXIT_ORDERS_REJECTED",
-        "reason": "모의투자 잔고내역이 없습니다",
+        "primary_reject_reason": "모의투자 잔고내역이 없습니다",
+        "no_balance_sell_reject_count": 1,
+        "recent_sell_ack_exists": True,
+        "balance_qty_zero": True,
     }
-    assert is_no_balance_sell_reject(result["reason"])
+    assert is_no_balance_sell_reject(result["primary_reject_reason"])
     assert classify_tick_status(result) == "warning"
 
 

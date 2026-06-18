@@ -261,7 +261,7 @@ def validate_report(
     if report_status == "PARTIAL":
         warnings.append("report_status=PARTIAL")
 
-    return 0, fatals, warnings
+    return (1 if fatals else 0), fatals, warnings
 
 
 def main() -> None:

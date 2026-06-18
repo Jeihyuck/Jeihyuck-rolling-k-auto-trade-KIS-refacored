@@ -997,6 +997,8 @@ def run_trade_tick(
 
     ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
+    exit_closed_cnt = sum(1 for o in orders if o["status"] == "OK_EXIT_POSITION_CLOSED")
+    sell_reconcile_pending_cnt = sum(1 for o in orders if o["status"] == "WARN_SELL_REJECT_RECONCILE_PENDING")
     blocked_cnt = sum(1 for o in orders if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
@@ -1016,6 +1018,37 @@ def run_trade_tick(
             block_reasons[reason] = block_reasons.get(reason, 0) + 1
 
     duplicate_blocked_cnt = sum(1 for o in orders if o.get("duplicate_blocked"))
+    reject_reasons = [str(o.get("reason") or o.get("error") or "") for o in orders if o.get("status") == "REJECT"]
+    primary_reject_reason = next((r for r in reject_reasons if r), "")
+    from trader.us.runner.status_contract import is_no_balance_sell_reject
+    no_balance_sell_reject_count = sum(1 for r in reject_reasons if is_no_balance_sell_reject(r))
+    recent_sell_ack_exists = False
+    if no_balance_sell_reject_count > 0:
+        try:
+            from trader.us.db.repos import find_recent_sell_ack
+            recent_sell_ack_exists = any(
+                bool(find_recent_sell_ack(symbol=str((o.get("intent") or {}).get("symbol") or o.get("symbol") or ""), trade_date=trade_date))
+                for o in orders
+                if o.get("status") == "REJECT" and str((o.get("intent") or {}).get("side") or o.get("side") or "").upper() == "SELL"
+            )
+        except Exception as exc:
+            logger.warning("[US_TICK][RECENT_SELL_ACK][WARN] %s", exc)
+    balance_qty_zero = False
+    orderable_qty_zero = False
+    if no_balance_sell_reject_count > 0:
+        try:
+            for p in (current_positions if 'current_positions' in locals() else []):
+                qty_val = int(p.get("qty") or p.get("holding_qty") or 0)
+                orderable_val = int(p.get("orderable_qty") or p.get("sellable_qty") or qty_val or 0)
+                if qty_val == 0:
+                    balance_qty_zero = True
+                if orderable_val == 0:
+                    orderable_qty_zero = True
+            if not (current_positions if 'current_positions' in locals() else []):
+                balance_qty_zero = True
+                orderable_qty_zero = True
+        except Exception:
+            pass
     logger.info(
         "[US_ORDER][ROUTE][DONE] total=%d ack=%d dry_run=%d blocked=%d duplicate_blocked=%d signal_only=%d reject=%d error=%d",
         len(orders), ack_cnt, dry_cnt, blocked_cnt, duplicate_blocked_cnt, signal_only_cnt, reject_cnt, err_cnt,
@@ -1066,7 +1099,11 @@ def run_trade_tick(
         # exit intents가 있으면 exit 결과를 기준으로 status 결정
         # 주의: exit_intents > 0이면 entry_intents == 0이어도 OK_NO_TRADE 금지
         orders_attempted = len(orders)
-        if reject_cnt == exit_intents_count and orders_sent == 0:
+        if exit_closed_cnt == exit_intents_count and exit_intents_count > 0:
+            status = "OK_EXIT_POSITION_CLOSED"
+        elif sell_reconcile_pending_cnt > 0 and reject_cnt == 0:
+            status = "WARN_SELL_REJECT_RECONCILE_PENDING"
+        elif reject_cnt == exit_intents_count and orders_sent == 0:
             status = "FAILED_ALL_EXIT_ORDERS_REJECTED"
             logger.error(
                 "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d rejected=%d",
@@ -1149,6 +1186,24 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    broker_ack_only = ack_cnt + dry_cnt
+    broker_rejects = reject_cnt
+    duplicate_exit_blocked = duplicate_blocked_cnt
+    for f in (fills_today if 'fills_today' in locals() else []):
+        side_f = str(f.get("side") or "").upper()
+        meta_f = f.get("meta") or {}
+        source_f = str(f.get("source") or f.get("reconcile_source") or (meta_f.get("source") if isinstance(meta_f, dict) else "") or "").lower()
+        is_synth = "balance_reconcile" in source_f or "synthetic" in source_f
+        if is_synth and side_f == "BUY":
+            synthetic_reconcile_buys += 1
+        elif is_synth and side_f == "SELL":
+            synthetic_reconcile_sells += 1
+        elif side_f == "BUY":
+            real_broker_buys += 1
+        elif side_f == "SELL":
+            real_broker_sells += 1
+
     held_skip = locals().get("held_skip_count")
     held_skip_unknown = 0 if isinstance(held_skip, int) else 1
     logger.info(
@@ -1162,7 +1217,13 @@ def run_trade_tick(
 
     return {
         "status": status,
-        "reason": "none",
+        "reason": primary_reject_reason or ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none"),
+        "primary_reject_reason": primary_reject_reason,
+        "reject_reasons": reject_reasons,
+        "no_balance_sell_reject_count": no_balance_sell_reject_count,
+        "recent_sell_ack_exists": recent_sell_ack_exists,
+        "balance_qty_zero": balance_qty_zero,
+        "orderable_qty_zero": orderable_qty_zero,
         "session": session,
         "orders": orders,
         "ack": ack_cnt,
@@ -1202,6 +1263,13 @@ def run_trade_tick(
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
+        "real_broker_buys": real_broker_buys,
+        "real_broker_sells": real_broker_sells,
+        "synthetic_reconcile_buys": synthetic_reconcile_buys,
+        "synthetic_reconcile_sells": synthetic_reconcile_sells,
+        "broker_ack_only": broker_ack_only,
+        "broker_rejects": broker_rejects,
+        "duplicate_exit_blocked": duplicate_exit_blocked,
     }
 
 

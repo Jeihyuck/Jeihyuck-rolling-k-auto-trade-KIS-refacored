@@ -190,9 +190,19 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "orders_sent", "fills", "positions", "last_stage", "final_status", "reason",
         "temp_error_count", "temp_recovered_count", "schedule_expected_et", "actual_start_et",
         "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
-        "buy_decisions", "sell_decisions",
+        "buy_decisions", "sell_decisions", "real_broker_buys", "real_broker_sells",
+        "synthetic_reconcile_buys", "synthetic_reconcile_sells", "broker_ack_only",
+        "broker_rejects", "duplicate_exit_blocked",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
+    md_lines.extend([
+        "",
+        "## Broker/Reconcile Classification",
+        f"- 실제 MTS 신규 매수: {payload.get('real_broker_buys', 0)}건",
+        f"- 실제 MTS 매도: {payload.get('real_broker_sells', 0)}건",
+        f"- 내부 잔고 보정: {payload.get('synthetic_reconcile_buys', 0) + payload.get('synthetic_reconcile_sells', 0)}건",
+        "- 내부 잔고 보정은 실제 MTS 신규 매수 체결이 아님",
+    ])
     latest_md.write_text("\n".join(md_lines) + "\n")
 
     if dated_json is not None and dated_md is not None:
@@ -815,6 +825,9 @@ def run_trade_session(
     total_pending_orders = 0
     total_sold_today = 0
     total_open_positions = 0
+    real_broker_buys = real_broker_sells = 0
+    synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
     all_sold_today_symbols: list[str] = []
     all_pending_order_symbols: list[str] = []
     all_open_position_symbols: list[str] = []
@@ -847,6 +860,13 @@ def run_trade_session(
         total_pending_orders = int(tick_result.get("pending_order_count", 0) or 0)
         total_sold_today = int(tick_result.get("sold_today_count", 0) or 0)
         total_open_positions = int(tick_result.get("open_position_count", tick_result.get("positions", 0)) or 0)
+        real_broker_buys += int(tick_result.get("real_broker_buys", 0) or 0)
+        real_broker_sells += int(tick_result.get("real_broker_sells", 0) or 0)
+        synthetic_reconcile_buys += int(tick_result.get("synthetic_reconcile_buys", 0) or 0)
+        synthetic_reconcile_sells += int(tick_result.get("synthetic_reconcile_sells", 0) or 0)
+        broker_ack_only += int(tick_result.get("broker_ack_only", 0) or 0)
+        broker_rejects += int(tick_result.get("broker_rejects", 0) or 0)
+        duplicate_exit_blocked += int(tick_result.get("duplicate_exit_blocked", 0) or 0)
 
         # 심볼 배열 (마지막 tick 기준 덮어쓰기)
         if tick_result.get("sold_today_symbols"):
@@ -964,6 +984,13 @@ def run_trade_session(
         "pending_order_symbols": all_pending_order_symbols,
         "open_position_symbols": all_open_position_symbols,
         "positions": int(final_tick.get("positions", 0) or 0),
+        "real_broker_buys": real_broker_buys,
+        "real_broker_sells": real_broker_sells,
+        "synthetic_reconcile_buys": synthetic_reconcile_buys,
+        "synthetic_reconcile_sells": synthetic_reconcile_sells,
+        "broker_ack_only": broker_ack_only,
+        "broker_rejects": broker_rejects,
+        "duplicate_exit_blocked": duplicate_exit_blocked,
         "last_stage": last_stage,
         "trade_status": final_status,
         "trade_runner_started": 1,

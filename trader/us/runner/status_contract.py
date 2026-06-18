@@ -34,9 +34,13 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
     """Return success/warning/fatal for a tick result payload or raw status."""
     if isinstance(tick_result, dict):
         status = str(tick_result.get("status") or "")
-        reason = str(tick_result.get("reason") or tick_result.get("error") or "")
+        reason = str(tick_result.get("primary_reject_reason") or tick_result.get("reason") or tick_result.get("error") or "")
         if status == "FAILED_ALL_EXIT_ORDERS_REJECTED" and is_no_balance_sell_reject(reason):
-            return "warning"
+            recent_ack = bool(tick_result.get("recent_sell_ack_exists"))
+            no_balance_count = int(tick_result.get("no_balance_sell_reject_count") or 0)
+            qty_zero = bool(tick_result.get("balance_qty_zero") or tick_result.get("orderable_qty_zero"))
+            if recent_ack and no_balance_count > 0 and qty_zero:
+                return "warning"
     else:
         status = str(tick_result or "")
     if status in SUCCESS_STATUSES:

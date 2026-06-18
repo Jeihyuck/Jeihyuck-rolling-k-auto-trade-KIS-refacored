@@ -114,6 +114,7 @@ def route_order(
     price = float(intent.get("limit_price", 0.0))
     exchange = intent.get("exchange", "NASDAQ")
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
+    trade_date = intent.get("trade_date")
 
     logger.info(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
@@ -172,6 +173,7 @@ def route_order(
             existing_order_keys=existing_keys,
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
+            trade_date=trade_date,
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
@@ -213,6 +215,7 @@ def route_order(
                         existing_order_keys=existing_keys,
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,
+                        trade_date=trade_date,
                     )
                     
                     # 재시도 성공: 축소된 intent로 계속 진행
@@ -451,7 +454,7 @@ def route_order(
         if side == "SELL" and is_no_balance_sell_reject(msg):
             try:
                 from trader.us.db.repos import find_recent_sell_ack, load_us_positions_by_symbols
-                recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=None)
+                recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=trade_date)
                 positions = load_us_positions_by_symbols([symbol]) if symbol else {}
                 pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
                 qty_now = int(pos.get("qty") or pos.get("holding_qty") or pos.get("orderable_qty") or 0) if pos else 0

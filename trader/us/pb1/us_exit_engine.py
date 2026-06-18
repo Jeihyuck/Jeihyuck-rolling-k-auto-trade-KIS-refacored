@@ -177,6 +177,7 @@ def evaluate_exit(
                 pnl_pct=-999.0,
                 holding_qty=raw_qty,
                 orderable_qty=orderable_qty,
+                now=now,
             )
         return None
 
@@ -247,6 +248,7 @@ def evaluate_exit(
                 pnl_pct=pnl_pct,
                 holding_qty=raw_qty,
                 orderable_qty=orderable_qty,
+                now=now,
             )
 
     # ── giveback ──────────────────────────────────────────────────────────────
@@ -289,10 +291,11 @@ def _make_exit_intent(
     pnl_pct: float,
     holding_qty: int = 0,
     orderable_qty: int = 0,
+    now: datetime | None = None,
 ) -> dict:
     """Exit order intent 생성."""
     import hashlib
-    trade_date_key = resolve_us_trade_date_key(None)
+    trade_date_key = resolve_us_trade_date_key(now)
     key_raw = f"{symbol}_{trade_date_key}_SELL_{exit_type}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
@@ -318,6 +321,7 @@ def _make_exit_intent(
         "unrealized_pnl_pct": round(pnl_pct, 4),
         "client_order_key": client_order_key,
         "strategy": "us_pb1_exit",
+        "trade_date": f"{trade_date_key[:4]}-{trade_date_key[4:6]}-{trade_date_key[6:]}",
         "meta": {
             "holding_qty": _holding,
             "orderable_qty": _orderable,
