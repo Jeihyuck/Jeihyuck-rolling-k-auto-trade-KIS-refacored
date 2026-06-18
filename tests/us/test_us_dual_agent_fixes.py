@@ -16,6 +16,32 @@ def _base_intent(**kw):
     return d
 
 
+def _allow_order_env(monkeypatch):
+    monkeypatch.setenv("US_AGENT_ENABLED", "1")
+    monkeypatch.setenv("TRADING_REGION", "US")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("RUN_MODE", "TRADE")
+    monkeypatch.setenv("STRATEGY_MODE", "TRADE")
+    monkeypatch.setenv("SIGNAL_ONLY", "0")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("DISABLE_REAL_TRADING", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
+    monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1")
+    monkeypatch.setenv("ALLOW_REAL_ORDER", "1")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "9999")
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "99999")
+    monkeypatch.setenv("US_MAX_POSITIONS", "100")
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "1.0")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("US_BLOCK_NEW_ENTRY_AFTER_ET", "")
+    monkeypatch.setenv("US_BLOCK_REBUY_AFTER_SELL_SAME_DAY", "false")
+    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
+
+
 def test_ok_exit_orders_sent_is_success():
     assert classify_tick_status({"status": "OK_EXIT_ORDERS_SENT"}) == "success"
 
@@ -33,11 +59,7 @@ def test_no_balance_exit_rejected_is_warning_not_fatal():
 
 
 def test_sell_duplicate_client_order_key_blocked(monkeypatch):
-    monkeypatch.setenv("US_ORDER_ACCEPTED_IS_NOT_FILLED", "0")
-    monkeypatch.setenv("DRY_RUN", "0")
-    monkeypatch.setenv("KIS_ENV", "practice")
-    monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1")
-    monkeypatch.delenv("US_ORDER_ARMED", raising=False)
+    _allow_order_env(monkeypatch)
     with pytest_raises_risk_duplicate():
         assert_order_allowed(
             _base_intent(),
