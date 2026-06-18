@@ -201,6 +201,11 @@ def validate_report(
         )
         return 1, fatals, warnings
 
+    expected_min_ticks = int(payload.get("expected_min_ticks", 0) or 0)
+    ticks_total = int(payload.get("ticks_total", payload.get("tick_count", 0)) or 0)
+    if expected_to_trade == 1 and expected_min_ticks > 0 and ticks_total < expected_min_ticks:
+        fatals.append(f"early_termination_min_ticks_not_met ticks_total={ticks_total} expected_min_ticks={expected_min_ticks}")
+
     if payload.get("prep_status") == "OK" and int(payload.get("locked_watchlist_count", 0) or 0) == 0:
         fatals.append("locked_watchlist_count_zero_under_prep_ok")
 
@@ -214,6 +219,12 @@ def validate_report(
             fatals.append("runtime_sql_contains_avg_fill_price")
         if "[US_RECONCILE][ACK_RECONCILE][INVALID_QTY]" in log_text:
             fatals.append("balance_reconcile_invalid_qty_detected")
+        if "[US_TICK_LOOP][SLEEP_START]" in log_text and "[US_TICK_LOOP][SLEEP_DONE]" not in log_text and expected_to_trade == 1:
+            fatals.append("sleep_start_without_sleep_done")
+        if "[US_SESSION][SIGNAL]" in log_text:
+            fatals.append("session_received_signal")
+        if "[US_SESSION][TICK_LOOP][ERROR]" in log_text:
+            fatals.append("tick_loop_error")
 
     pnl_json = Path("reports/us_pnl/latest_us_pnl_report.json")
     if pnl_json.exists():

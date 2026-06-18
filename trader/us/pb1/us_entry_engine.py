@@ -354,27 +354,25 @@ def generate_entry_intents(
             logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
             continue
         
-        # KIS balance 기반 보유종목 차단 (우선순위 높음)
-        if current_position_symbols and symbol in current_position_symbols:
-            held_skipped += 1
-            track_skip(symbol, "has_kis_position")
-            logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_kis_position", symbol)
-            continue
+        position_state = "HELD" if (current_position_symbols and symbol in current_position_symbols) else "NOT_HELD"
 
-        # DB: 미체결 주문 차단
+        # DB: 미체결 주문은 차단하되, 보유는 HELD로 분리해 추가매수 평가로 진행
         try:
-            from trader.us.db.repos import has_pending_order, has_position
-            if has_pending_order(symbol):
+            from trader.us.db.repos import has_pending_order_for_symbol_side, has_position
+            if has_pending_order_for_symbol_side(symbol=symbol, side="BUY", trade_date=None):
+                position_state = "PENDING_BUY"
                 track_skip(symbol, "pending_order")
-                logger.info("[US_ENTRY][SKIP] symbol=%s reason=pending_order", symbol)
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=%s action=SKIP_PENDING_BUY", symbol, position_state)
                 continue
-            # DB: 이미 보유 중이면 차단
-            if has_position(symbol):
-                held_skipped += 1
-                track_skip(symbol, "has_position")
-                logger.info("[US_ENTRY][SKIP] symbol=%s reason=has_position", symbol)
+            if has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=None):
+                position_state = "PENDING_SELL"
+                track_skip(symbol, "pending_order")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=%s action=SKIP_PENDING_SELL", symbol, position_state)
                 continue
+            if position_state == "NOT_HELD" and has_position(symbol):
+                position_state = "HELD"
         except Exception as exc:
+            position_state = "UNKNOWN_POSITION_STATE" if position_state == "NOT_HELD" else position_state
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
 
         # entries_map에 있으면 precomputed score 사용
@@ -447,6 +445,7 @@ def generate_entry_intents(
             if not exchange:
                 exchange = resolve_exchange(symbol)
             
+            canonical_entry["position_state"] = position_state
             # Phase 1: NO price lookup yet (if precomputed score exists)
             candidates.append((s, symbol, exchange, None, canonical_entry))  # price=None, entry_meta=canonical_entry
             
@@ -491,8 +490,7 @@ def generate_entry_intents(
                 continue
             
             # 실시간 계산된 경우 price를 이미 갖고 있으므로 candidates에 추가
-            # entry_meta는 없으므로 None
-            candidates.append((s, symbol, exchange, price, None))
+            candidates.append((s, symbol, exchange, price, {"position_state": position_state}))
     
     # =========================================================================
     # Phase 2: Sort by score, then price lookup for top N
@@ -581,6 +579,31 @@ def generate_entry_intents(
 
         qty = sizing["qty"]
         notional = sizing["notional_usd"]
+
+        position_state_for_order = (entry_meta or {}).get("position_state", "NOT_HELD")
+        if position_state_for_order == "HELD":
+            allow_add = os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
+            allow_avg_down = os.getenv("US_ALLOW_AVERAGING_DOWN", "0") in {"1", "true", "TRUE", "yes", "YES"}
+            min_add_pnl = float(os.getenv("US_ADD_MIN_PNL_PCT", "0.0") or 0.0)
+            try:
+                pnl_pct = float((entry_meta or {}).get("pnl_pct") or (entry_meta or {}).get("unrealized_pnl_pct") or 0.0)
+            except Exception:
+                pnl_pct = 0.0
+            if not allow_add:
+                track_skip(symbol, "add_to_existing_disabled")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_DISABLED", symbol)
+                continue
+            if pnl_pct < 0 and not allow_avg_down:
+                track_skip(symbol, "no_averaging_down")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_NO_AVERAGING_DOWN", symbol)
+                continue
+            if pnl_pct < min_add_pnl:
+                track_skip(symbol, "add_min_pnl_not_met")
+                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_MIN_PNL pnl_pct=%.4f", symbol, pnl_pct)
+                continue
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed", symbol)
+        else:
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=NOT_HELD action=NEW_BUY", symbol)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
 

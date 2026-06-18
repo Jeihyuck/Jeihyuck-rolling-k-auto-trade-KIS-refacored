@@ -22,6 +22,7 @@ from typing import Any
 
 from trader.us import config as us_cfg
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
+from trader.us.runner.status_contract import is_no_balance_sell_reject
 from trader.us.db.repos import (  # test patch surface
     load_today_order_keys,
     mark_order_intent_blocked,
@@ -245,7 +246,7 @@ def route_order(
             reason_text = str(exc)
             reason_code = reason_text.split("reason=", 1)[1].split()[0] if "reason=" in reason_text else reason_text
             dedup_key = (str(symbol).upper(), str(side).upper(), reason_code)
-            duplicate_blocked = dedup_key in _BLOCKED_INTENT_KEYS
+            duplicate_blocked = dedup_key in _BLOCKED_INTENT_KEYS or (side == "SELL" and ("duplicate" in reason_code or "pending_order_exists" in reason_code))
             if duplicate_blocked:
                 logger.info(
                     "[US_ORDER][DEDUP] symbol=%s side=%s action=skip_duplicate_blocked_intent reason=%s",
@@ -255,7 +256,8 @@ def route_order(
                 _BLOCKED_INTENT_KEYS.add(dedup_key)
                 if order_key:
                     mark_order_intent_blocked(order_key, reason=reason_text)
-            return {"status": "BLOCKED", "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent}
+            blocked_status = "WARN_DUPLICATE_EXIT_BLOCKED" if (side == "SELL" and duplicate_blocked) else "BLOCKED"
+            return {"status": blocked_status, "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent}
 
     # 4. DRY_RUN resolve with runtime guard
     dry_run_resolved = resolve_dry_run_for_us_order()
@@ -444,7 +446,23 @@ def route_order(
         logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
 
     except Exception as exc:
-        # KIS API 자체 실패 → REJECT
+        # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
+        msg = str(exc)
+        if side == "SELL" and is_no_balance_sell_reject(msg):
+            try:
+                from trader.us.db.repos import find_recent_sell_ack, load_us_positions_by_symbols
+                recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=None)
+                positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                pos = positions.get(symbol, {}) if isinstance(positions, dict) else {}
+                qty_now = int(pos.get("qty") or pos.get("holding_qty") or pos.get("orderable_qty") or 0) if pos else 0
+                if recent_ack and qty_now <= 0:
+                    logger.warning("[US_ORDER][SELL_NO_BALANCE][CLOSED] symbol=%s reason=%s", symbol, msg)
+                    return {"status": "OK_EXIT_POSITION_CLOSED", "reason": "no_balance_after_recent_sell_ack", "symbol": symbol, "side": side, "requires_reconcile": False, "reconciled": True, "intent": intent}
+                if recent_ack:
+                    logger.warning("[US_ORDER][SELL_NO_BALANCE][RECONCILE_PENDING] symbol=%s reason=%s", symbol, msg)
+                    return {"status": "WARN_SELL_REJECT_RECONCILE_PENDING", "reason": msg, "symbol": symbol, "side": side, "requires_reconcile": True, "intent": intent}
+            except Exception as nb_exc:
+                logger.warning("[US_ORDER][SELL_NO_BALANCE][WARN] reconcile probe failed: %s", nb_exc)
         logger.error("[US_ORDER][REJECT] symbol=%s side=%s error=%s", symbol, side, exc)
         reject_result = {
             "client_order_key": order_key,
@@ -452,14 +470,14 @@ def route_order(
             "exchange": exchange,
             "side": side,
             "qty": qty,
-            "reason": str(exc),
+            "reason": msg,
         }
         save_order_reject(reject_result)
         if order_key:
-            mark_order_intent_rejected(order_key, reason=str(exc))
+            mark_order_intent_rejected(order_key, reason=msg)
         return {
             "status": "REJECT",
-            "reason": str(exc),
+            "reason": msg,
             "kis_ack": False,
             "ack_db_saved": False,
             "requires_reconcile": False,

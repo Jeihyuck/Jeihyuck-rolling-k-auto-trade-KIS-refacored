@@ -564,40 +564,21 @@ def run_trade_tick(
             now.strftime("%H:%M:%S"),
         )
     else:
-        # ── 당일 BUY 중복 체크: entry만 차단, 세션/exit 계속 ─────────────────
+        # ── 당일 BUY count는 전체 entry 차단이 아닌 진단 전용 ─────────────────
         _entry_already_bought = False
         _buy_orders_today = 0
         try:
             from trader.us.db.repos import get_today_buy_orders_count
-
             _buy_orders_today = get_today_buy_orders_count(trade_date=trade_date, env=env)
-            local_entry_allowed = _buy_orders_today <= 0
-            resolved_entry_allowed = local_entry_allowed
-
-            if session_entry_allowed is not None and bool(session_entry_allowed) != local_entry_allowed:
-                logger.warning(
-                    "[US_ENTRY][CONSISTENCY_WARN] session_entry_allowed=%s local_entry_allowed=%s buy_orders_count=%d",
-                    int(bool(session_entry_allowed)),
-                    int(local_entry_allowed),
-                    _buy_orders_today,
-                )
-                resolved_entry_allowed = bool(session_entry_allowed) and local_entry_allowed
-            elif session_entry_allowed is not None:
-                resolved_entry_allowed = bool(session_entry_allowed)
-
-            if not resolved_entry_allowed:
-                _entry_already_bought = True
-                if session_buy_orders_count is not None:
-                    _buy_orders_today = max(_buy_orders_today, int(session_buy_orders_count or 0))
-                logger.info(
-                    "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=%d",
-                    _buy_orders_today,
-                )
-                logger.info(
-                    "[US_EXIT][MONITOR][CONTINUE] reason=entry_blocked_but_exit_monitor_enabled",
-                )
+            if session_buy_orders_count is not None:
+                _buy_orders_today = max(_buy_orders_today, int(session_buy_orders_count or 0))
+            logger.info(
+                "[US_ENTRY][DIAGNOSTIC] already_bought_today=%d buy_orders_count=%d entry_global_block=0",
+                int(_buy_orders_today > 0),
+                _buy_orders_today,
+            )
         except Exception as _ebc_exc:
-            logger.warning("[US_ENTRY][ENTRY_BLOCK_CHECK][WARN] error=%s (fail-open)", _ebc_exc)
+            logger.warning("[US_ENTRY][ENTRY_DIAGNOSTIC][WARN] error=%s (fail-open)", _ebc_exc)
 
         # prep status 확인 (locked watchlist contract)
         from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
@@ -616,12 +597,6 @@ def run_trade_tick(
             logger.warning(
                 "[US_ENTRY][BLOCK] reason=prep_degraded_or_error status=%s",
                 prep_status
-            )
-        elif _entry_already_bought if '_entry_already_bought' in locals() else False:
-            # 당일 BUY 이미 완료: entry skip (exit monitoring은 이미 위에서 계속됨)
-            logger.info(
-                "[US_ENTRY][SKIP] reason=already_bought_today buy_orders_count=%d",
-                _buy_orders_today if '_buy_orders_today' in locals() else 0,
             )
         else:
             # locked watchlist 로드
@@ -1022,7 +997,7 @@ def run_trade_tick(
 
     ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
-    blocked_cnt = sum(1 for o in orders if o["status"] == "BLOCKED")
+    blocked_cnt = sum(1 for o in orders if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
@@ -1030,7 +1005,7 @@ def run_trade_tick(
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
     for o in orders:
-        if o["status"] == "BLOCKED":
+        if o["status"] in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
             reason = o.get("reason", "unknown")
             # reason에서 실제 차단 사유 추출 (예: "[US_RISK][BLOCK] reason=notional_exceeds_order_limit ..." -> "notional_exceeds_order_limit")
             if "reason=" in reason:
@@ -1102,6 +1077,12 @@ def run_trade_tick(
             logger.error(
                 "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d rejected=%d sent=%d",
                 status, exit_intents_count, reject_cnt, orders_sent,
+            )
+        elif duplicate_blocked_cnt > 0 and blocked_cnt == exit_intents_count and orders_sent == 0:
+            status = "WARN_DUPLICATE_EXIT_BLOCKED"
+            logger.warning(
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d duplicate_blocked=%d",
+                status, exit_intents_count, duplicate_blocked_cnt,
             )
         elif blocked_cnt == exit_intents_count and orders_sent == 0:
             status = "FAILED_ALL_EXIT_ORDERS_BLOCKED"

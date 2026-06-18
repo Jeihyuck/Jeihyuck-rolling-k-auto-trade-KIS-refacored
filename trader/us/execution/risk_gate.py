@@ -231,8 +231,8 @@ def check_pending_order(symbol: str, side: str) -> None:
         return
 
     try:
-        from trader.us.db.repos import has_pending_order
-        if has_pending_order(symbol):
+        from trader.us.db.repos import has_pending_order_for_symbol_side
+        if has_pending_order_for_symbol_side(symbol=symbol, side=side, trade_date=None):
             _block("pending_order_exists", symbol=symbol, side=side)
     except RiskGateBlocked:
         raise
@@ -368,6 +368,9 @@ def assert_order_allowed(
     check_exchange(exchange)
     check_qty(qty)
 
+    if existing_order_keys is not None and client_order_key:
+        check_duplicate(client_order_key, existing_order_keys)
+
     # SELL: 보유 수량 초과 차단
     if side.upper() == "SELL":
         available_qty = intent.get("available_qty")
@@ -390,9 +393,6 @@ def assert_order_allowed(
         check_position_count(current_position_count, symbol=symbol)
         check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol)
         check_cash_buffer(available_cash_usd, notional_usd, symbol=symbol)
-
-        if existing_order_keys is not None and client_order_key:
-            check_duplicate(client_order_key, existing_order_keys)
 
         check_same_day_rebuy(symbol, side)
         check_pending_order(symbol, side)

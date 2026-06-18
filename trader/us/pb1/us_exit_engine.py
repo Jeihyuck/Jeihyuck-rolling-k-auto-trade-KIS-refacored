@@ -270,6 +270,13 @@ def evaluate_exit(
     return None
 
 
+def resolve_us_trade_date_key(now: datetime | None = None) -> str:
+    from zoneinfo import ZoneInfo
+    ny = ZoneInfo("America/New_York")
+    dt = (now or datetime.now(tz=ny)).astimezone(ny)
+    return dt.strftime("%Y%m%d")
+
+
 def _make_exit_intent(
     symbol: str,
     exchange: str,
@@ -285,9 +292,8 @@ def _make_exit_intent(
 ) -> dict:
     """Exit order intent 생성."""
     import hashlib
-    from datetime import date
-    today = date.today().strftime("%Y%m%d")
-    key_raw = f"{symbol}_{today}_SELL_{exit_type}"
+    trade_date_key = resolve_us_trade_date_key(None)
+    key_raw = f"{symbol}_{trade_date_key}_SELL_{exit_type}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
     logger.info(
