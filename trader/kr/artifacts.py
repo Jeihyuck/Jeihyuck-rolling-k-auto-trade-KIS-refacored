@@ -291,7 +291,30 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
     latest_f = ROOT/"signals/kr/latest_final30_scored.json"; latest_c = ROOT/"signals/kr/latest_prep_contract.json"
     created_at = datetime.now(KST).isoformat()
     payload = {"schema_version":"kr_final30_scored_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"as_of":exp,"rows":final30_rows,"created_at_kst":created_at}
-    contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"fresh_build","canonical":True,"rows":30,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True, **(metadata or {})}
+    _RESERVED_CONTRACT_KEYS = {
+        "schema_version",
+        "market",
+        "env",
+        "trade_date",
+        "expected_as_of",
+        "actual_as_of",
+        "final30_rows",
+        "final30_scored_rows",
+        "db_exact_rows",
+        "artifact_rows",
+        "created_at_kst",
+        "source",
+        "canonical",
+        "rows",
+        "trade_can_proceed",
+        "source_paths",
+        "contract_ok",
+    }
+    safe_metadata = {k: v for k, v in (metadata or {}).items() if k not in _RESERVED_CONTRACT_KEYS}
+    dropped_metadata_keys = sorted(set((metadata or {}).keys()) - set(safe_metadata.keys()))
+    if dropped_metadata_keys:
+        logger.warning("[KR_ARTIFACT][METADATA_RESERVED_KEYS_DROPPED] keys=%s", dropped_metadata_keys)
+    contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"fresh_build","canonical":True,"rows":30,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True, **safe_metadata}
     tmps = [( _write_tmp(p, payload if "final30_scored" in p.name else contract), p) for p in (runtime_f, runtime_c, latest_f, latest_c)]
     for tmp, final in tmps: os.replace(tmp, final)
     res = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=True, strict=True, allow_legacy_fallback=False)

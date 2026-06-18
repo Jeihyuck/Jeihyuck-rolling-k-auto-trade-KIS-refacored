@@ -197,3 +197,60 @@ def test_canonical_missing_kr_signal_legacy_only_strict_fails(tmp_path, monkeypa
     assert result.reason == "CANONICAL_MISSING"
     assert result.legacy_blocked is True
     assert result.legacy_paths == ["signals/kr/final30_scored.json"]
+
+
+def test_publish_metadata_cannot_override_canonical_contract_keys(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "ROOT", tmp_path)
+    monkeypatch.setenv("KR_QUARANTINE_STALE_ARTIFACT", "0")
+
+    trade_date = date(2026, 6, 18)
+    expected = date(2026, 6, 17)
+
+    artifacts.publish_kr_prep_artifacts_atomic(
+        trade_date=trade_date,
+        expected_as_of=expected,
+        actual_as_of=expected,
+        env="practice",
+        final30_rows=_rows(expected),
+        db_exact_rows=30,
+        metadata={
+            "source": "legacy",
+            "canonical": False,
+            "rows": 29,
+            "trade_can_proceed": 0,
+            "db_exact_rows": 0,
+            "contract_ok": False,
+            "market": "US",
+            "env": "real",
+            "trade_date": "1999-01-01",
+            "expected_as_of": "1999-01-01",
+            "extra_note": "this_should_remain",
+        },
+    )
+
+    contract_path = tmp_path / "runtime/kr/watchlist" / trade_date.isoformat() / "prep_contract.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+
+    assert contract["source"] == "fresh_build"
+    assert contract["canonical"] is True
+    assert contract["rows"] == 30
+    assert contract["trade_can_proceed"] == 1
+    assert contract["db_exact_rows"] == 30
+    assert contract["contract_ok"] is True
+    assert contract["market"] == "KR"
+    assert contract["env"] == "practice"
+    assert contract["trade_date"] == trade_date.isoformat()
+    assert contract["expected_as_of"] == expected.isoformat()
+    assert contract["extra_note"] == "this_should_remain"
+
+    result = artifacts.validate_kr_prep_artifact(
+        trade_date=trade_date,
+        expected_as_of=expected,
+        env="practice",
+        strict=True,
+        allow_legacy_fallback=False,
+    )
+
+    assert result.ok is True
+    assert result.source == "canonical"
+    assert result.reason == "CANONICAL_OK"
