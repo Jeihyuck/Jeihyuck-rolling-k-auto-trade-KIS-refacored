@@ -145,10 +145,7 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
         "client_order_key": "old-sell-ack", "symbol": "AAOI", "exchange": "NASDAQ",
         "side": "SELL", "qty": 1, "order_no": "S1", "status": "ACK",
     }, trade_date="2026-06-18")
-    monkeypatch.setenv("DRY_RUN", "0")
-    monkeypatch.setenv("KIS_ENV", "practice")
-    monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1")
-    monkeypatch.delenv("US_ORDER_ARMED", raising=False)
+    _risk_env(monkeypatch)
     monkeypatch.setattr("trader.us.db.repos.load_us_positions_by_symbols", lambda symbols: {"AAOI": {"symbol": "AAOI", "qty": 0, "orderable_qty": 0}})
     monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
 
@@ -170,11 +167,28 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
 
 
 def _risk_env(monkeypatch):
-    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("US_AGENT_ENABLED", "1")
+    monkeypatch.setenv("TRADING_REGION", "US")
     monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("RUN_MODE", "TRADE")
+    monkeypatch.setenv("STRATEGY_MODE", "TRADE")
+    monkeypatch.setenv("SIGNAL_ONLY", "0")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("DISABLE_REAL_TRADING", "0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
     monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1")
-    monkeypatch.setenv("LIVE_TRADING_ENABLED", "0")
-    monkeypatch.delenv("US_ORDER_ARMED", raising=False)
+    monkeypatch.setenv("ALLOW_REAL_ORDER", "1")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "10000")
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "999999")
+    monkeypatch.setenv("US_MAX_POSITIONS", "100")
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "1.0")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("US_BLOCK_NEW_ENTRY_AFTER_ET", "")
+    monkeypatch.setenv("US_BLOCK_REBUY_AFTER_SELL_SAME_DAY", "false")
 
 
 def test_sell_pending_hard_gate_ignores_us_order_accepted_env(monkeypatch):
