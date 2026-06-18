@@ -34,10 +34,10 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
       - name: Run pytest (tests/us)
-        run: pytest -q tests/us
+        run: python -m pytest tests/us -q
 
       - name: Run harness runner (offline, all scenarios)
         run: python -m trader.us.harness.runner --scenario all --offline
