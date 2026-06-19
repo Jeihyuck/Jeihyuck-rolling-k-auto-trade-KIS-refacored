@@ -400,16 +400,21 @@ def load_us_orders(trade_date: str) -> list[dict]:
     if engine is None:
         return []
     start_utc, end_utc = _ny_date_bounds_utc(trade_date)
-    queries = [
-        ("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}),
-        ("SELECT * FROM us_orders WHERE created_at >= :start_ts AND created_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
-        ("SELECT * FROM us_orders WHERE submitted_at >= :start_ts AND submitted_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
-        ("SELECT * FROM us_orders WHERE acked_at >= :start_ts AND acked_at < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}),
-    ]
+    available_cols: set[str] = set()
+    try:
+        rows = _read_autocommit(engine, "SELECT column_name FROM information_schema.columns WHERE table_name = :table", {"table": "us_orders"})
+        available_cols = {str(r.get("column_name")) for r in rows}
+    except Exception as exc:
+        logger.warning("[US_ORDERS][SCHEMA][WARN] err=%s", exc)
+    ts_candidates = [c for c in ("created_at", "updated_at", "ts", "ordered_at", "submitted_at", "acked_at") if c in available_cols]
+    logger.info("[US_ORDERS][SCHEMA] available_ts_columns=%s", ts_candidates)
+    queries = [("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}, "trade_date")]
+    queries.extend((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}, col) for col in ts_candidates)
     errors: list[str] = []
-    for sql, params in queries:
+    for sql, params, ts_column in queries:
         try:
             rows = _read_autocommit(engine, sql, params)
+            logger.info("[US_ORDERS][LOAD] ts_column=%s rows=%s", ts_column, len(rows))
             if rows:
                 return rows
         except Exception as exc:

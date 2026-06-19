@@ -40,6 +40,7 @@ class KrArtifactValidationResult:
     expected_as_of: date | None = None
     artifact_as_of: date | None = None
     details: dict = field(default_factory=dict)
+    final30_rows_payload: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def final30_rows(self) -> int:
@@ -243,6 +244,18 @@ def _validate_canonical_prep_artifact(*, trade_date: date, expected_as_of: date,
     return _CandidateValidation(True, "CANONICAL_OK", first_path or finals[0], rows=30, db_exact_rows=db_exact or 30, details=keep)
 
 
+
+def load_kr_canonical_final30_rows(path: Path | str | None) -> list[dict[str, Any]]:
+    """Load validated canonical final30 rows for direct PB1 injection."""
+    if not path:
+        return []
+    try:
+        payload = _load(Path(path))
+        return [dict(r) for r in _rows(payload) if isinstance(r, dict)]
+    except Exception as exc:
+        logger.warning("[KR_ARTIFACT][FINAL30_LOAD_FAIL] path=%s err=%s", path, exc)
+        return []
+
 def _validate_legacy_artifact(paths: list[Path], *, expected_as_of: date, env: str) -> _CandidateValidation:
     for p in paths:
         try:
@@ -265,7 +278,7 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
             _quarantine_or_warn_legacy(legacy_paths, trade_date=trade_date, reason="LEGACY_IGNORED_CANONICAL_OK")
             logger.warning("[KR_ARTIFACT][LEGACY_IGNORED] canonical_ok=1 paths=%s", [_rel(p) for p in legacy_paths])
         logger.info("[KR_ARTIFACT][VALIDATE_OK] trade_date=%s expected_as_of=%s rows=%s db_exact_rows=%s source=canonical", trade_date, expected_as_of, canonical.rows, canonical.db_exact_rows)
-        return KrArtifactValidationResult(True, False, "CANONICAL_OK", source="canonical", rows=canonical.rows, db_exact_rows=canonical.db_exact_rows, legacy_blocked=bool(legacy_paths), legacy_paths=[_rel(p) for p in legacy_paths], canonical_path=_rel(canonical.path) if canonical.path else None, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details=canonical.details)
+        return KrArtifactValidationResult(True, False, "CANONICAL_OK", source="canonical", rows=canonical.rows, db_exact_rows=canonical.db_exact_rows, legacy_blocked=bool(legacy_paths), legacy_paths=[_rel(p) for p in legacy_paths], canonical_path=_rel(canonical.path) if canonical.path else None, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details=canonical.details, final30_rows_payload=load_kr_canonical_final30_rows(canonical.path))
 
     legacy_paths = _find_legacy_artifacts(expected_as_of)
     if legacy_paths and strict and not allow_legacy_fallback:

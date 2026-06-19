@@ -349,13 +349,22 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = int(pb1_runner.main() or 0)
     finally:
         sys.argv = old_argv
-    status = "OK" if exit_code == 0 else "FAIL"
+    pb1_last = str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper()
+    pb1_reason = str(os.getenv("PB1_LAST_EXIT_REASON") or "")
+    failed_precheck = exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "FAILED", "ERROR", "FATAL_RUNTIME", "FINAL30_ZERO"}
+    if pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason:
+        status = "FAILED"
+        exit_code = 2
+    else:
+        status = "OK" if exit_code == 0 else "FAIL"
     if session == "close" and status == "OK" and str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper() == "SKIP_PHASE_WINDOW":
         status = "FAIL"
         exit_code = 2
         logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
-    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s", session, status, exit_code)
-    summary_reason = "PB1_SESSION_DONE"
+    summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
+    completed = int(status == "OK" and summary_reason == "PB1_SESSION_DONE")
+    retryable = int(status in {"FAILED", "FAIL", "WARN"})
+    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s", session, status, exit_code, summary_reason, completed, retryable)
     blocked = 0
     if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":
         status = "WARN"
@@ -366,7 +375,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
     else:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s", session, status, summary_reason, blocked)
-    result = {"status": status, "reason": summary_reason, "exit_code": exit_code}
+    result = {"status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable)}
     if session == "close":
         result.update({
             "phase": "close",

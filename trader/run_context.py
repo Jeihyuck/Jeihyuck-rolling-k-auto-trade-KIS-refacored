@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
+from datetime import date, datetime
+from typing import Any, Optional
 from uuid import uuid4
 
 
@@ -57,6 +57,16 @@ class RunContext:
         phase = kwargs.pop("phase", None)
         dry_run = kwargs.pop("dry_run", False)
         run_id = kwargs.pop("run_id", None)
+        self.market = kwargs.pop("market", None)
+        self.session = kwargs.pop("session", None)
+        self.trade_date = kwargs.pop("trade_date", None)
+        self.as_of = kwargs.pop("as_of", None)
+        self.canonical_source = kwargs.pop("canonical_source", None)
+        self.canonical_final30_rows = int(kwargs.pop("canonical_final30_rows", 0) or 0)
+        self.final30_df = kwargs.pop("final30_df", None)
+        self.balance_snapshot = kwargs.pop("balance_snapshot", None)
+        self.balance_state = kwargs.pop("balance_state", "UNKNOWN")
+        self.live_gate_evaluated_at = kwargs.pop("live_gate_evaluated_at", None)
 
         if account_env is None and env is not None:
             account_env = env
@@ -74,6 +84,7 @@ class RunContext:
         self.phase = phase
         self.dry_run = dry_run
         self.run_id = run_id
+        self.strategy_key = self.strategy
 
         for key, value in kwargs.items():
             setattr(self, key, value)
