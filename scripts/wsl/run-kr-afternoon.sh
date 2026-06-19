@@ -3,14 +3,13 @@ set -euo pipefail
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
-LOCK_DIR="runtime/locks"
-mkdir -p "$LOCK_DIR"
-LOCK_FILE="$LOCK_DIR/kr-afternoon.lock"
-exec 9>"$LOCK_FILE"
+lock_file="/tmp/nullim-kr-afternoon.lock"
+exec 9>"$lock_file"
 if ! flock -n 9; then
-  echo "[KR_AFTERNOON][SKIP] reason=LOCK_HELD lock=$LOCK_FILE ts=$(date -Is)"
+  echo "[KR_AFTERNOON][LOCK_SKIP] another instance is already running lock=$lock_file"
   exit 0
 fi
+echo "[KR_AFTERNOON][LOCK_ACQUIRED] lock=$lock_file"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul
