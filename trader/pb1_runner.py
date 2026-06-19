@@ -824,7 +824,8 @@ def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: p
     source = str(run_ctx.get("final30_source") or "none")
     locked = bool(run_ctx.get("final30_locked"))
     missing_cols = [col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS if col not in set(str(c) for c in frame.columns.tolist())]
-    if not locked or source != "db_pb1_watchlist_final_scored" or rows == 0:
+    canonical_injected = source in {"kr_canonical_artifact", "canonical", "injected_canonical"}
+    if not locked or (source != "db_pb1_watchlist_final_scored" and not canonical_injected) or rows == 0:
         reason = "db_exact_scored_zero_rows" if rows == 0 else "db_exact_scored_not_loaded"
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         _raise_entry_abort_precheck(reason)
@@ -833,6 +834,28 @@ def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: p
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         _raise_entry_abort_precheck(reason)
     logger.info("[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s", rows)
+
+
+def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: str) -> pd.DataFrame:
+    if str(os.getenv("KR_INJECT_CANONICAL_FINAL30", "1")).strip().lower() in {"0", "false", "no"}:
+        return pd.DataFrame()
+    try:
+        from trader.kr.artifacts import validate_kr_prep_artifact
+        art = validate_kr_prep_artifact(
+            trade_date=date.fromisoformat(str(trade_date)[:10]),
+            expected_as_of=date.fromisoformat(str(expected_as_of)[:10]),
+            env=env,
+            strict=True,
+            allow_legacy_fallback=False,
+        )
+        rows = list(getattr(art, "final30_rows_payload", []) or [])
+        if art.ok and rows:
+            df = pd.DataFrame(rows)
+            logger.info("[KR_FINAL30][INJECT] source=canonical rows=%s as_of=%s", len(df), expected_as_of)
+            return df
+    except Exception as exc:
+        logger.warning("[KR_FINAL30][INJECT][SKIP] err=%s", exc)
+    return pd.DataFrame()
 
 
 def load_trade_final30_scored(
@@ -4880,7 +4903,7 @@ def run_once(
 
     if not loop_mode:
         if is_db_only_mode():
-            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY_KEY") or os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             _log_db_only_universe_precheck(
                 repo=UniverseRepo(engine),
                 env=env_effective,
@@ -4980,6 +5003,23 @@ def run_once(
     precomputed_universe_df = pd.DataFrame()
     trade_use_precomputed_features = False
     try:
+        injected_final30_df = pd.DataFrame()
+        if str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}:
+            injected_final30_df = _load_kr_injected_final30_df(trade_date=trade_date.isoformat(), expected_as_of=str(run_ctx.get("derived_as_of") or as_of), env=env_effective)
+            if not injected_final30_df.empty:
+                precomputed_final30_df = injected_final30_df.copy()
+                run_ctx["final30_source"] = "kr_canonical_artifact"
+                run_ctx["final30_locked"] = True
+                run_ctx["final30_rows"] = int(len(precomputed_final30_df))
+                run_ctx["final30_as_of"] = str(run_ctx.get("derived_as_of") or as_of)
+                setattr(ctx, "final30_df", precomputed_final30_df.copy())
+                setattr(ctx, "canonical_source", "kr_canonical_artifact")
+                setattr(ctx, "canonical_final30_rows", int(len(precomputed_final30_df)))
+                logger.info("[RUN_ONCE][FINAL30_INJECTED] rows=%s source=kr_canonical_artifact", len(precomputed_final30_df))
+        final30_strategy_key = os.getenv("PB1_FINAL30_STRATEGY_KEY", "pb1_watchlist_final_scored")
+        universe_strategy_key = os.getenv("PB1_UNIVERSE_STRATEGY_KEY", os.getenv("PB1_UNIVERSE_STRATEGY", DEFAULT_UNIVERSE_STRATEGY))
+        candidate_pool_strategy_key = os.getenv("PB1_CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
+        logger.info("[STRATEGY_KEY][LOCK] final30=%s universe=%s candidate_pool=%s", final30_strategy_key, universe_strategy_key, candidate_pool_strategy_key)
         should_lock_entry_sources = (
             not close_cancel_only
             and (
@@ -4994,7 +5034,7 @@ def run_once(
             )
         )
         if should_lock_entry_sources:
-            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
+            universe_strategy = os.getenv("PB1_UNIVERSE_STRATEGY_KEY") or os.getenv("PB1_UNIVERSE_STRATEGY") or DEFAULT_UNIVERSE_STRATEGY
             try:
                 universe_ctx = _load_universe_context(
                     engine=engine,
@@ -5015,9 +5055,10 @@ def run_once(
             mode_input = (os.getenv("MODE") or "").strip().lower()
             if mode_input == "trade" and universe_ctx and universe_ctx.members:
                 locked_rows = list((universe_ctx.meta or {}).get("locked_final30_rows") or [])
-                precomputed_final30_df = pd.DataFrame(locked_rows)
+                if precomputed_final30_df.empty:
+                    precomputed_final30_df = pd.DataFrame(locked_rows)
                 if not precomputed_final30_df.empty:
-                    final30_source_name = str((universe_ctx.meta or {}).get("source") or "db_pb1_watchlist_final_scored")
+                    final30_source_name = str(run_ctx.get("final30_source") or (universe_ctx.meta or {}).get("source") or "db_pb1_watchlist_final_scored")
                     run_ctx["final30_source"] = final30_source_name
                     run_ctx["final30_locked"] = True
                     run_ctx["final30_rows"] = int(len(precomputed_final30_df))
@@ -6936,6 +6977,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             exit_reason,
             _warning_total(session_warning_counts),
         )
+        os.environ["PB1_LAST_RESULT_STATUS"] = str(last_result_status)
+        os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
         _record_session_execution_marker(
             engine=engine,
             env=ctx.env,
@@ -6964,7 +7007,9 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
 
 def _exit_code_for_status(status: str) -> int:
-    if status in {"FAILED", "ERROR"}:
+    if status in {"FAIL_PRECHECK", "DB_EXACT_FINAL30_ZERO", "FINAL30_ZERO"}:
+        return 2
+    if status in {"FAILED", "ERROR", "FATAL_RUNTIME"}:
         return 1
     return 0
 
@@ -7615,6 +7660,8 @@ def main() -> int:
             metrics.get("balance_cache_hits", 0),
             metrics.get("balance_tick_cache_hits", 0),
         )
+        os.environ["PB1_LAST_RESULT_STATUS"] = str(result_status)
+        os.environ["PB1_LAST_EXIT_REASON"] = str(main_exit_reason)
         _record_session_execution_marker(
             engine=engine,
             env=ctx.env,
