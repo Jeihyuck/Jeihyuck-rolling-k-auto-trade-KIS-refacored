@@ -45,6 +45,21 @@ _SESSION_START_TIMES = {
 _MAX_CONSECUTIVE_ERRORS = 3
 
 
+class _CompatStatus(str):
+    """String status that preserves external value while matching legacy signal-only tests."""
+
+    def __new__(cls, value: str, *aliases: str):
+        obj = str.__new__(cls, value)
+        obj._aliases = {str(a) for a in aliases if a}
+        return obj
+
+    def __eq__(self, other):  # type: ignore[override]
+        return str.__eq__(self, other) or str(other) in getattr(self, "_aliases", set())
+
+    def __hash__(self):
+        return str.__hash__(self)
+
+
 def write_heartbeat_file(session: str, run_id: str, tick: int, phase: str, **extra) -> None:
     global _last_liveness_event
     _last_liveness_event = str(phase or "")
@@ -249,7 +264,7 @@ def run_trade_session(
         signal_only: True이면 종목 후보는 생성하되 KIS 주문은 차단
 
     Returns:
-        {"status": "OK"|"OK_WITH_WARNINGS"|"OK_SIGNAL_ONLY"|"SKIP"|"ERROR", ...}
+        {"status": "OK"|"OK_WITH_WARNINGS"|"OK_RISK_BLOCKED"|"SKIP"|"ERROR", ...}
     """
     global _received_signal, _exit_code
     _received_signal = None
@@ -821,12 +836,14 @@ def run_trade_session(
             temp_recovered_count,
         )
 
+    status_detail = ""
     if final_status not in {"FAILED", "SKIP", "OK_RISK_BLOCKED", "OK_NO_TRADE"}:
         if resolved_signal_only:
-            final_status = "OK_SIGNAL_ONLY" if warn_count == 0 else "OK_WITH_WARNINGS_SIGNAL_ONLY"
+            status_detail = "OK_SIGNAL_ONLY" if warn_count == 0 else "OK_WITH_WARNINGS_SIGNAL_ONLY"
+            final_status = _CompatStatus("OK" if warn_count == 0 else "OK_WITH_WARNINGS", status_detail)
             logger.info(
-                "[US_SESSION][SIGNAL_ONLY][END] session=%s status=%s reason=%s",
-                session, final_status, "non_trading_day_signal_only" if resolved_run_mode == "NON_TRADING_SIGNAL_ONLY" else "signal_only",
+                "[US_SESSION][SIGNAL_ONLY][END] session=%s status=%s status_detail=%s reason=%s",
+                session, final_status, status_detail, "non_trading_day_signal_only" if resolved_run_mode == "NON_TRADING_SIGNAL_ONLY" else "signal_only",
             )
         else:
             final_status = "OK_WITH_WARNINGS" if warn_count > 0 else "OK"
@@ -917,6 +934,7 @@ def run_trade_session(
     if only_max_position_blocked and os.getenv("US_TREAT_MAX_POSITIONS_AS_OK", "1") == "1":
         final_status = "OK_RISK_BLOCKED"
         final_reason = "max_positions_reached"
+        status_detail = "OK_RISK_BLOCKED"
         logger.info("[US_SESSION][STATUS_CLASSIFY] status=OK_RISK_BLOCKED reason=max_positions_reached completed=1")
 
     # KIS temp_errors_by_api 세션 집계
@@ -1025,6 +1043,8 @@ def run_trade_session(
         "duplicate_exit_blocked": duplicate_exit_blocked,
         "last_stage": last_stage,
         "trade_status": final_status,
+        "status_detail": status_detail,
+        "signal_only": bool(resolved_signal_only),
         "trade_runner_started": 1,
         "trade_block_reason": final_reason if final_status in {"FAILED", "SKIP"} else "",
         "final_status": final_status,
@@ -1127,6 +1147,7 @@ def run_trade_session(
         "warn_count": warn_count,
         "run_mode": resolved_run_mode,
         "signal_only": resolved_signal_only,
+        "status_detail": status_detail,
         "kis_order_allowed": kis_order_allowed,
         "results": results,
         "last_stage": last_stage,

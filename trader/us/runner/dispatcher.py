@@ -56,7 +56,17 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
     # schedule과 workflow_dispatch는 모두 정상 이벤트. unsupported event만 차단한다.
     _ALLOWED_EVENTS = {"schedule", "workflow_dispatch", ""}
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
-    if event_name and event_name not in _ALLOWED_EVENTS:
+    allow_real_order = str(os.environ.get("ALLOW_REAL_ORDER", "0")).strip().lower() in {"1", "true", "yes", "y"}
+    dry_run = str(os.environ.get("DRY_RUN", "0")).strip().lower() in {"1", "true", "yes", "y"}
+    offline_harness = str(os.environ.get("US_OFFLINE_HARNESS", "0")).strip().lower() in {"1", "true", "yes", "y"}
+    offline_pr_smoke = (
+        event_name == "pull_request"
+        and (bool(offline) or offline_harness or dry_run)
+        and not allow_real_order
+        and bool(force_now)
+        and (int(max_ticks or 0) > 0 or mode in {"prep", "close", "report"})
+    )
+    if event_name and event_name not in _ALLOWED_EVENTS and not offline_pr_smoke:
         logger.error(
             "[US_DISPATCHER][BLOCKED] unsupported_event event=%s raw_mode=%s mode=%s workflow=%s",
             event_name,
@@ -65,6 +75,13 @@ def dispatch(mode: str, env: str = "practice", offline: bool = False, force_now:
             os.environ.get("GITHUB_WORKFLOW", ""),
         )
         return 1
+    if offline_pr_smoke:
+        logger.info(
+            "[US_DISPATCHER][ALLOW_OFFLINE_PULL_REQUEST] mode=%s force_now=%s max_ticks=%s allow_real_order=0",
+            mode,
+            force_now or "",
+            int(max_ticks or 0),
+        )
 
     if event_name == "schedule":
         logger.info(

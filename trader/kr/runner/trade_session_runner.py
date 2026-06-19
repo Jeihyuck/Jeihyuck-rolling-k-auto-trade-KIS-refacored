@@ -344,6 +344,9 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     import trader.pb1_runner as pb1_runner
 
     old_argv = sys.argv[:]
+    os.environ.pop("PB1_LAST_RESULT_STATUS", None)
+    os.environ.pop("PB1_LAST_EXIT_REASON", None)
+    logger.info("[KR_SESSION][PB1_ENV_CLEAR] cleared=PB1_LAST_RESULT_STATUS,PB1_LAST_EXIT_REASON")
     try:
         sys.argv = ["kr-pb1-session", "--window", window, "--phase", "auto", "--env", env]
         exit_code = int(pb1_runner.main() or 0)
@@ -351,7 +354,6 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         sys.argv = old_argv
     pb1_last = str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper()
     pb1_reason = str(os.getenv("PB1_LAST_EXIT_REASON") or "")
-    failed_precheck = exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "FAILED", "ERROR", "FATAL_RUNTIME", "FINAL30_ZERO"}
     if pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason:
         status = "FAILED"
         exit_code = 2
@@ -362,15 +364,21 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = 2
         logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
     summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
-    completed = int(status == "OK" and summary_reason == "PB1_SESSION_DONE")
-    retryable = int(status in {"FAILED", "FAIL", "WARN"})
-    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s", session, status, exit_code, summary_reason, completed, retryable)
     blocked = 0
     if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":
         status = "WARN"
         summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
         blocked = 1
         logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
+    success_completed_statuses = {"OK", "OK_NO_TRADE", "OK_RISK_BLOCKED"}
+    failure_retryable_statuses = {"FAILED", "FAIL", "FAIL_PRECHECK", "FATAL_RUNTIME"}
+    retryable_reasons = {"DB_EXACT_FINAL30_ZERO", "CLOSE_BALANCE_UNCONFIRMED", "BALANCE_TIMEOUT_FAIL_SOFT"}
+    completed = int(status in success_completed_statuses and summary_reason == "PB1_SESSION_DONE")
+    retryable = int(status in failure_retryable_statuses or summary_reason in retryable_reasons or status == "WARN")
+    if summary_reason in retryable_reasons:
+        completed = 0
+        retryable = 1
+    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s", session, status, exit_code, summary_reason, completed, retryable)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
     else:
