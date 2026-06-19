@@ -3,14 +3,13 @@ set -euo pipefail
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
-LOCK_DIR="runtime/locks"
-mkdir -p "$LOCK_DIR"
-LOCK_FILE="$LOCK_DIR/kr-prep.lock"
+LOCK_FILE="/tmp/nullim-kr-prep.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-  echo "[KR_PREP][SKIP] reason=LOCK_HELD lock=$LOCK_FILE ts=$(date -Is)"
+  echo "[KR_PREP][LOCK_SKIP] another instance is already running lock=$LOCK_FILE"
   exit 0
 fi
+echo "[KR_PREP][LOCK_ACQUIRED] lock=$LOCK_FILE"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul
@@ -61,10 +60,21 @@ else
 fi
 
   echo "[KR_PREP][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
+  KR_PREP_TIMEOUT_SEC="${KR_PREP_TIMEOUT_SEC:-7200}"
   set +e
-  python -m trader.kr.runner.trade_session_runner --session prep --env "$STRATEGY_ENV"
+  (
+    # The parent shell keeps the session lock. Close the lock fd before exec'ing
+    # timeout/python so a hung child cannot keep /tmp/nullim-kr-prep.lock busy
+    # after the wrapper exits or is killed.
+    exec 9>&-
+    timeout --kill-after=60s "${KR_PREP_TIMEOUT_SEC}" \
+      python -m trader.kr.runner.trade_session_runner --session prep --env "$STRATEGY_ENV"
+  )
   rc=$?
   set -e
+  if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+    echo "[KR_PREP][TIMEOUT] timeout_sec=${KR_PREP_TIMEOUT_SEC}"
+  fi
   echo "[KR_PREP][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG_FILE" 2>&1
