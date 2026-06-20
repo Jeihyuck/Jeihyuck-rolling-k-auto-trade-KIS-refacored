@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-scripts=(run-kr-prep run-kr-am run-kr-afternoon run-kr-close)
+scripts=(run-kr-prep.sh run-kr-am.sh run-kr-afternoon.sh run-kr-close.sh)
 pattern='kr|trade|nullim'
-script_pattern='run-kr-prep|run-kr-am|run-kr-afternoon|run-kr-close'
-GREP_TIMEOUT_SEC="${KR_SCHEDULE_GREP_TIMEOUT_SEC:-8}"
-GREP_EXCLUDES=(
-  --exclude-dir=.cache
-  --exclude-dir=.cargo
-  --exclude-dir=.codex
-  --exclude-dir=.local
-  --exclude-dir=.npm
-  --exclude-dir=.rustup
-  --exclude-dir=node_modules
-  --exclude-dir=venv
-  --exclude-dir=.venv
-)
+script_pattern='run-kr-prep\.sh|run-kr-am\.sh|run-kr-afternoon\.sh|run-kr-close\.sh'
+APP="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+user_crontab_file="$tmp_dir/user-crontab.txt"
+
+crontab -l >"$user_crontab_file" 2>/dev/null || true
+cron_text="$(cat "$user_crontab_file")"
+
+declare -a scheduler_files=("$user_crontab_file")
+declare -a system_scheduler_files=()
+declare -A scheduler_labels=(["$user_crontab_file"]="current user crontab")
+
 declare -A lock_files=(
   [prep]='/tmp/nullim-kr-prep.lock'
   [am]='/tmp/nullim-kr-am.lock'
@@ -28,32 +28,59 @@ section() {
   echo "========== $* =========="
 }
 
-grep_refs() {
-  local pattern="$1"
-  shift
-  local rc=0
-  (($# == 0)) && return 0
-  timeout "${GREP_TIMEOUT_SEC}s" grep -RInE "${GREP_EXCLUDES[@]}" "$pattern" "$@" 2>/dev/null || rc=$?
-  if [[ "$rc" -eq 124 ]]; then
-    echo "[KR_SCHEDULE][WARN] grep_refs timed out pattern=$pattern"
-  elif [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
-    echo "[KR_SCHEDULE][WARN] grep_refs failed rc=$rc pattern=$pattern"
-  fi
-  return 0
+add_scheduler_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  scheduler_files+=("$file")
+  system_scheduler_files+=("$file")
+  scheduler_labels["$file"]="$file"
 }
 
-grep_files() {
-  local pattern="$1"
+shopt -s nullglob
+for file in \
+  /etc/crontab \
+  /etc/cron.d/* \
+  /etc/cron.daily/* \
+  /etc/cron.hourly/* \
+  /etc/cron.weekly/* \
+  /etc/cron.monthly/* \
+  /etc/systemd/system/* \
+  /etc/systemd/user/* \
+  "$HOME"/.config/systemd/user/*; do
+  add_scheduler_file "$file"
+done
+shopt -u nullglob
+
+grep_scheduler_refs() {
+  local grep_pattern="$1"
   shift
-  local rc=0
   (($# == 0)) && return 0
-  timeout "${GREP_TIMEOUT_SEC}s" grep -RIlE "${GREP_EXCLUDES[@]}" "$pattern" "$@" 2>/dev/null || rc=$?
-  if [[ "$rc" -eq 124 ]]; then
-    echo "[KR_SCHEDULE][WARN] grep_files timed out pattern=$pattern" >&2
-  elif [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
-    echo "[KR_SCHEDULE][WARN] grep_files failed rc=$rc pattern=$pattern" >&2
+
+  local file label matches
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    label="${scheduler_labels[$file]:-$file}"
+    matches="$(grep -nE "$grep_pattern" "$file" 2>/dev/null || true)"
+    [[ -z "$matches" ]] && continue
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && printf '%s:%s\n' "$label" "$line"
+    done <<<"$matches"
+  done
+}
+
+count_scheduler_files() {
+  local grep_pattern="$1"
+  shift
+  if (($# == 0)); then
+    echo 0
+    return 0
   fi
-  return 0
+  (grep -lE "$grep_pattern" "$@" 2>/dev/null || true) | sort -u | wc -l | tr -d ' '
+}
+
+count_crontab_lines() {
+  local grep_pattern="$1"
+  (grep -E "$grep_pattern" "$user_crontab_file" 2>/dev/null || true) | wc -l | tr -d ' '
 }
 
 check_lock() {
@@ -77,18 +104,19 @@ warn_external_flock() {
   local session="$1"
   local script="$2"
   local lock="$3"
-  local warn="$4"
-  local line
   local warned=0
+  local file line label
 
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    if [[ "$line" == *"$lock"* && ( "$line" == *"$script"* || "$line" == *"flock -n $lock"* || "$line" == *"/usr/bin/flock -n $lock"* ) ]]; then
-      echo "$warn"
-      warned=1
-      break
-    fi
-  done <<< "$cron_text"
+  for file in "${scheduler_files[@]}"; do
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      if [[ "$line" == *flock* && "$line" == *"$lock"* && "$line" == *"$script"* ]]; then
+        label="${scheduler_labels[$file]:-$file}"
+        echo "[KR_SCHEDULE][WARN] $session external flock detected in $label; remove outer flock because $script has internal lock"
+        warned=1
+      fi
+    done <"$file"
+  done
 
   if ((warned == 0)); then
     echo "[KR_SCHEDULE][OK] $session has no external flock lock=$lock"
@@ -101,7 +129,18 @@ for session in prep am afternoon close; do
 done
 
 section "KR prep stale process candidates"
-ps -ef | grep -E "run-kr-prep|kr-prep|nullim-kr-prep|prep_runner|trader.kr|python" | grep -v grep || true
+stale_candidates="$(ps -eo user:20,pid,ppid,etime,args | awk -v app="$APP" '
+  NR == 1 { next }
+  /networkd-dispatcher/ || /unattended-upgrades/ { next }
+  index($0, app) || /run-kr-prep\.sh/ || /nullim-kr-prep\.lock/ || /trader\.kr\.runner\.trade_session_runner/ || /kr-prep/ || /KR_SESSION=prep/ || /session[ =]prep/ { print }
+')"
+if [[ -n "$stale_candidates" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && echo "[KR_PREP][STALE_PROCESS][CANDIDATE] $line"
+  done <<<"$stale_candidates"
+else
+  echo "[KR_PREP][STALE_PROCESS][NONE]"
+fi
 
 section "systemd timers matching kr / trade / nullim"
 if command -v systemctl >/dev/null 2>&1; then
@@ -118,30 +157,13 @@ else
 fi
 
 section "current user crontab"
-cron_text="$(crontab -l 2>/dev/null || true)"
 printf '%s\n' "$cron_text"
 
 section "canonical crontab checks"
-warn_external_flock \
-  "kr-prep" \
-  "run-kr-prep.sh" \
-  "/tmp/nullim-kr-prep.lock" \
-  "[KR_SCHEDULE][WARN] kr-prep external flock detected; remove outer flock because run-kr-prep.sh has internal lock"
-warn_external_flock \
-  "kr-am" \
-  "run-kr-am.sh" \
-  "/tmp/nullim-kr-am.lock" \
-  "[KR_SCHEDULE][WARN] kr-am external flock detected; remove outer flock because run-kr-am.sh has internal lock"
-warn_external_flock \
-  "kr-afternoon" \
-  "run-kr-afternoon.sh" \
-  "/tmp/nullim-kr-afternoon.lock" \
-  "[KR_SCHEDULE][WARN] kr-afternoon external flock detected; remove outer flock because run-kr-afternoon.sh has internal lock"
-warn_external_flock \
-  "kr-close" \
-  "run-kr-close.sh" \
-  "/tmp/nullim-kr-close.lock" \
-  "[KR_SCHEDULE][WARN] kr-close external flock detected; remove outer flock because run-kr-close.sh has internal lock"
+warn_external_flock "kr-prep" "run-kr-prep.sh" "/tmp/nullim-kr-prep.lock"
+warn_external_flock "kr-am" "run-kr-am.sh" "/tmp/nullim-kr-am.lock"
+warn_external_flock "kr-afternoon" "run-kr-afternoon.sh" "/tmp/nullim-kr-afternoon.lock"
+warn_external_flock "kr-close" "run-kr-close.sh" "/tmp/nullim-kr-close.lock"
 cat <<'CRON_NOTE'
 [KR_SCHEDULE][CANONICAL] KR crontab should not wrap KR run scripts with /usr/bin/flock because each script owns its internal lock.
 [KR_SCHEDULE][CANONICAL] KR prep recommended example with script-internal timeout/lock:
@@ -150,46 +172,20 @@ cat <<'CRON_NOTE'
 50 6 * * 1-5 cd $APP && timeout --kill-after=60s 7200 $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
 CRON_NOTE
 
-section "/etc/cron* references to KR WSL run scripts"
-cron_roots=()
-while IFS= read -r path; do
-  [[ -e "$path" ]] && cron_roots+=("$path")
-done < <(compgen -G "/etc/cron*" || true)
-if ((${#cron_roots[@]})); then
-  grep_refs "$script_pattern" "${cron_roots[@]}"
-else
-  echo "no /etc/cron* paths found"
-fi
-
-section "/etc/systemd, ~/.config/systemd, and ~/ references to KR WSL run scripts"
-search_roots=(/etc/systemd "$HOME/.config/systemd" "$HOME")
-existing_roots=()
-for root in "${search_roots[@]}"; do
-  [[ -e "$root" ]] && existing_roots+=("$root")
-done
-if ((${#existing_roots[@]})); then
-  grep_refs "$script_pattern" "${existing_roots[@]}"
-else
-  echo "no search roots found"
-fi
+section "actual scheduler references to KR WSL run scripts"
+grep_scheduler_refs "$script_pattern" "${scheduler_files[@]}"
 
 section "summary: duplicate schedule hints"
 for script in "${scripts[@]}"; do
-  count=0
-  cron_count=0
-  systemd_home_count=0
-
-  if ((${#cron_roots[@]})); then
-    cron_count=$(grep_files "$script" "${cron_roots[@]}" | wc -l || true)
-  fi
-  if ((${#existing_roots[@]})); then
-    systemd_home_count=$(grep_files "$script" "${existing_roots[@]}" | wc -l || true)
-  fi
-  count=$((cron_count + systemd_home_count))
+  crontab_line_count="$(count_crontab_lines "$script")"
+  system_file_count="$(count_scheduler_files "$script" "${system_scheduler_files[@]}")"
+  count=$((crontab_line_count + system_file_count))
 
   if ((count >= 2)); then
-    echo "[DUPLICATE_POSSIBLE] $script found in $count files; review overlapping cron/systemd/manual schedule sources."
+    echo "[DUPLICATE_POSSIBLE] $script schedule_sources=$count; review actual scheduler sources only."
+  elif ((count == 1)); then
+    echo "[KR_SCHEDULE][OK] $script schedule_sources=$count"
   else
-    echo "[OK_OR_MANUAL_ONLY] $script found in $count files."
+    echo "[KR_SCHEDULE][WARN] $script schedule_sources=0"
   fi
 done
