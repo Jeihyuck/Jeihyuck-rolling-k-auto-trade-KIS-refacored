@@ -3911,24 +3911,14 @@ class KisAPI:
     def _order_cash(self, body: dict, *, is_sell: bool) -> Optional[dict]:
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         
-        # Live Gate 체크: config에서 계산된 정책 사용
-        from trader.config import ALLOW_LIVE_GATE, FORCE_BLOCK_LIVE, LIVE_GATE_STATUS
-        
-        if not ALLOW_LIVE_GATE or FORCE_BLOCK_LIVE:
+        from trader.config import get_live_gate_status_fresh
+        gate = get_live_gate_status_fresh(reason="kis_order_cash")
+        if gate.force_block_live or not gate.allow_live_gate:
             logger.warning(
-                "[ORDER][BLOCKED] reason=%s code=%s side=%s qty=%s",
-                LIVE_GATE_STATUS.reason,
-                body.get("PDNO"),
-                "SELL" if is_sell else "BUY",
-                body.get("ORD_QTY"),
+                "[ORDER][BLOCKED] reason=%s code=%s side=%s qty=%s gate_window=%s gate_now=%s",
+                gate.reason, body.get("PDNO"), "SELL" if is_sell else "BUY", body.get("ORD_QTY"), gate.window, gate.now_kst.isoformat(),
             )
-            return {
-                "blocked": True,
-                "reason": LIVE_GATE_STATUS.reason,
-                "rt_cd": "1",
-                "msg_cd": "LIVE_GATE_BLOCKED",
-                "msg1": LIVE_GATE_STATUS.reason,
-            }
+            return {"blocked": True, "reason": gate.reason, "rt_cd": "1", "msg_cd": "LIVE_GATE_BLOCKED", "msg1": gate.reason}
         _assert_orders_allowed("order_cash")
 
         # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
@@ -4228,33 +4218,18 @@ class KisAPI:
         return resp
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
-        # Live Gate 체크: config에서 계산된 정책 사용
-        from trader.config import ALLOW_LIVE_GATE, FORCE_BLOCK_LIVE, LIVE_GATE_STATUS
-        
-        # ✅ 진입 로그: wrapper까지 주문이 도달했는지 즉시 확인
+        from trader.config import get_live_gate_status_fresh
+        gate = get_live_gate_status_fresh(reason="kis_order_cash")
         logger.info(
             "[ORDER][WRAPPER][ENTER] func=buy_stock_limit code=%s qty=%s price=%s allow_live_gate=%s force_block_live=%s reason=%s NO_TRADE=%s",
-            pdno, qty, price,
-            int(ALLOW_LIVE_GATE),
-            int(FORCE_BLOCK_LIVE),
-            LIVE_GATE_STATUS.reason,
-            os.getenv("NO_TRADE", "0")
+            pdno, qty, price, int(gate.allow_live_gate), int(gate.force_block_live), gate.reason, os.getenv("NO_TRADE", "0")
         )
-        
-        if not ALLOW_LIVE_GATE or FORCE_BLOCK_LIVE:
+        if gate.force_block_live or not gate.allow_live_gate:
             logger.warning(
-                "[ORDER][BLOCKED] reason=%s code=%s side=BUY qty=%s",
-                LIVE_GATE_STATUS.reason,
-                pdno,
-                qty,
+                "[ORDER][BLOCKED] reason=%s code=%s side=BUY qty=%s gate_window=%s gate_now=%s",
+                gate.reason, pdno, qty, gate.window, gate.now_kst.isoformat(),
             )
-            return {
-                "blocked": True,
-                "reason": LIVE_GATE_STATUS.reason,
-                "rt_cd": "1",
-                "msg_cd": "LIVE_GATE_BLOCKED",
-                "msg1": LIVE_GATE_STATUS.reason,
-            }
+            return {"blocked": True, "reason": gate.reason, "rt_cd": "1", "msg_cd": "LIVE_GATE_BLOCKED", "msg1": gate.reason}
         _assert_orders_allowed("buy_stock_limit")
         
         # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)
@@ -4330,23 +4305,14 @@ class KisAPI:
         return None
 
     def sell_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
-        # Live Gate 체크: config에서 계산된 정책 사용
-        from trader.config import ALLOW_LIVE_GATE, FORCE_BLOCK_LIVE, LIVE_GATE_STATUS
-        
-        if not ALLOW_LIVE_GATE or FORCE_BLOCK_LIVE:
+        from trader.config import get_live_gate_status_fresh
+        gate = get_live_gate_status_fresh(reason="kis_order_cash")
+        if gate.force_block_live or not gate.allow_live_gate:
             logger.warning(
-                "[ORDER][BLOCKED] reason=%s code=%s side=SELL qty=%s",
-                LIVE_GATE_STATUS.reason,
-                pdno,
-                qty,
+                "[ORDER][BLOCKED] reason=%s code=%s side=SELL qty=%s gate_window=%s gate_now=%s",
+                gate.reason, pdno, qty, gate.window, gate.now_kst.isoformat(),
             )
-            return {
-                "blocked": True,
-                "reason": LIVE_GATE_STATUS.reason,
-                "rt_cd": "1",
-                "msg_cd": "LIVE_GATE_BLOCKED",
-                "msg1": LIVE_GATE_STATUS.reason,
-            }
+            return {"blocked": True, "reason": gate.reason, "rt_cd": "1", "msg_cd": "LIVE_GATE_BLOCKED", "msg1": gate.reason}
         _assert_orders_allowed("sell_stock_limit")
         
         # ✅ NO_TRADE 가드: 주문 차단 모드일 때 실제 주문 전송 차단 (intent는 저장됨)

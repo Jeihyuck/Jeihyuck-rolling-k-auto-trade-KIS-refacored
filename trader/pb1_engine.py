@@ -10794,8 +10794,8 @@ class PB1Engine:
             orderable_qty = int(pos.get("orderable_qty") or qty)
             if _router_full_exit:
                 logger.info(
-                    "[EXIT][ROUTER][QTY] code=%s source=router_full_exit router_qty=%s full_exit=1 holding_qty=%s reason=%s",
-                    display_code, orderable_qty, int(_router_qty or 0), qty, exit_eval.primary_reason,
+                    "[EXIT][ROUTER][QTY] code=%s source=router_full_exit router_qty=%s full_exit=%s holding_qty=%s reason=%s",
+                    display_code, orderable_qty, int(bool(_router_full_exit)), qty, exit_eval.primary_reason,
                 )
             else:
                 logger.info(
@@ -12216,7 +12216,7 @@ class PB1Engine:
             "reason",
             "strategy",
         }
-        if source in {"db_pb1_watchlist_final_scored", "final30_locked", "watchlist_env", "candidate_pool_only"}:
+        if source in {"db_pb1_watchlist_final_scored", "final30_locked", "watchlist_env", "candidate_pool_only", "kr_canonical_artifact"}:
             return source
         if source in {"db", "db_only", "best_k_meta", "universe", "plain_universe", "db_plain_universe"}:
             return "db_plain_universe"
@@ -12235,6 +12235,8 @@ class PB1Engine:
         locked_has_contract = len(locked_rows) == 30
         if normalized_source == "db_plain_universe":
             return "stripped_members_contamination", missing_cols
+        if normalized_source == "kr_canonical_artifact":
+            return "missing_kr_canonical_scored_final30_contract", missing_cols
         if normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
             if locked_has_contract:
                 return "locked_final30_source_mismatch", missing_cols
@@ -12301,17 +12303,25 @@ class PB1Engine:
         rows = len(locked_df)
         reason, missing_cols = self._classify_locked_final30_abort_reason(locked_df)
         normalized_source = self._normalize_trade_input_source(locked_df)
+        canonical_ok = bool(
+            normalized_source == "kr_canonical_artifact"
+            and self.final30_locked
+            and rows == 30
+            and not missing_cols
+        )
         usable_locked = bool(
             self.final30_locked
-            and normalized_source in {"db_pb1_watchlist_final_scored", "final30_locked"}
+            and normalized_source in {"db_pb1_watchlist_final_scored", "final30_locked", "kr_canonical_artifact"}
             and rows == 30
             and not missing_cols
         )
         logger.info(
-            "[PB1][ENTRY][INPUT_CHECK] locked=%s source=%s as_of=%s usable=%s",
+            "[PB1][ENTRY][INPUT_CHECK] locked=%s source=%s as_of=%s usable=%s scored=%s contract_ok=%s",
             int(bool(self.final30_locked)),
             normalized_source,
             locked_as_of,
+            int(usable_locked),
+            int(usable_locked),
             int(usable_locked),
         )
         if not usable_locked:
@@ -12324,17 +12334,21 @@ class PB1Engine:
             self._abort_locked_final30(as_of=as_of, reason=reason, rows=rows, missing_cols=missing_cols)
 
         logger.info(
-            "[FINAL30][SOURCE_SUMMARY] source=db_pb1_watchlist_final_scored rows=%s as_of=%s locked=1 usable=1",
+            "[FINAL30][SOURCE_SUMMARY] source=%s rows=%s as_of=%s locked=1 usable=1 scored=1 contract_ok=1",
+            normalized_source,
             rows,
             locked_as_of,
         )
+        if canonical_ok:
+            logger.info("[FINAL30][ACCEPT] source=kr_canonical_artifact rows=%s as_of=%s", rows, locked_as_of)
+            logger.info("[FINAL30][DB_EXACT_CHECK][WARN] result=SUPPLEMENTAL_SKIPPED fallback=canonical_artifact rows=%s", rows)
         try:
             validate_trade_ready(locked_df)
         except RuntimeError:
             reason, missing_cols = self._classify_locked_final30_abort_reason(locked_df)
             self._abort_locked_final30(as_of=as_of, reason=reason, rows=rows, missing_cols=missing_cols)
 
-        if require_scored and normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked"}:
+        if require_scored and normalized_source not in {"db_pb1_watchlist_final_scored", "final30_locked", "kr_canonical_artifact"}:
             self._abort_locked_final30(as_of=as_of, reason="missing_db_exact_scored_final30", rows=rows, missing_cols=missing_cols)
 
         logger.info(
