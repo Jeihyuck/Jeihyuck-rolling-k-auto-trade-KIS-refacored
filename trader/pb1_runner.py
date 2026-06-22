@@ -2161,6 +2161,10 @@ def _write_session_result_file(payload: dict[str, Any]) -> None:
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        logger.info(
+            "[PB1][SESSION_RESULT][WRITE_OK] path=%s status=%s sell_orders_ack=%s buy_orders=%s",
+            path, payload.get("status"), payload.get("sell_orders_ack"), payload.get("buy_orders"),
+        )
     except Exception as exc:
         logger.warning("[PB1][SESSION_RESULT][WRITE_WARN] path=%s err=%s", path, exc)
 
@@ -2214,6 +2218,8 @@ def _record_session_execution_marker(
         "completed": bool(marker["completed"]),
         "retryable": bool(marker["retryable"]),
         "sell_orders_ack": int(marker["sell_orders_ack"]),
+        "sell_orders_ack_source": "pb1_result_file" if os.getenv("PB1_SESSION_RESULT_PATH") else "missing_result_file",
+        "pb1_result_path": str(os.getenv("PB1_SESSION_RESULT_PATH") or ""),
         "sell_completed": bool(marker["sell_completed"]),
         "entry_status": marker["entry_status"],
         "entry_abort_reason": marker["entry_abort_reason"],

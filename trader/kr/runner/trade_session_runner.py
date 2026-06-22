@@ -294,6 +294,17 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
 
 
 
+
+def load_pb1_session_result(path: Path) -> dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        logger.warning("[KR_SESSION][PB1_RESULT][LOAD_WARN] path=%s err=%s", path, exc)
+        return {}
+
 def extract_sell_orders_ack(result: dict | None) -> int:
     """Extract acknowledged sell orders from actual PB1/session result; never read PB1_SELL_ORDERS_ACK."""
     if not isinstance(result, dict):
@@ -442,13 +453,18 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = int(pb1_runner.main() or 0)
     finally:
         sys.argv = old_argv
-    pb1_result: dict[str, Any] = {}
-    try:
-        if pb1_result_path.exists():
-            loaded = json.loads(pb1_result_path.read_text(encoding="utf-8"))
-            pb1_result = loaded if isinstance(loaded, dict) else {}
-    except Exception as exc:
-        logger.warning("[KR_SESSION][PB1_RESULT][WARN] path=%s err=%s", pb1_result_path, exc)
+    if pb1_result_path.exists():
+        pb1_result = load_pb1_session_result(pb1_result_path)
+        logger.info(
+            "[KR_SESSION][PB1_RESULT][LOAD_OK] path=%s keys=%s sell_orders_ack=%s",
+            pb1_result_path, sorted(pb1_result.keys()), extract_sell_orders_ack(pb1_result),
+        )
+    else:
+        pb1_result = {}
+        logger.warning(
+            "[KR_SESSION][PB1_RESULT][MISSING] path=%s exit_code=%s action=continue_with_zero_sell_ack",
+            pb1_result_path, exit_code,
+        )
     pb1_last = str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper()
     pb1_reason = str(os.getenv("PB1_LAST_EXIT_REASON") or "")
     if pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason:

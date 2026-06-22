@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import time
 import json
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 from uuid import uuid4
 
 import pandas as pd
@@ -79,6 +80,63 @@ from trader.universe.build import build_universe
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
+
+
+
+def _run_prep_aux_with_timeout(
+    *,
+    stage: str,
+    timeout_sec: int | float,
+    core_ok: bool,
+    fn: Callable[[], T],
+    default: T | None = None,
+) -> tuple[bool, T | None, str | None]:
+    """Run non-critical prep auxiliary work with a bounded wait."""
+    timeout_f = max(0.01, float(timeout_sec))
+    started = time.perf_counter()
+    logger.info(
+        "[PREP][AUX][START] stage=%s timeout_sec=%s core_ok=%s",
+        stage, timeout_f, int(bool(core_ok)),
+    )
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"prep_aux_{stage}")
+    future = executor.submit(fn)
+    try:
+        result = future.result(timeout=timeout_f)
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "[PREP][AUX][END] stage=%s elapsed=%.2f core_ok=%s",
+            stage, elapsed, int(bool(core_ok)),
+        )
+        return True, result, None
+    except concurrent.futures.TimeoutError:
+        elapsed = time.perf_counter() - started
+        future.cancel()
+        logger.warning(
+            "[PREP][AUX][TIMEOUT] stage=%s timeout_sec=%s elapsed=%.2f core_ok=%s action=%s",
+            stage, timeout_f, elapsed, int(bool(core_ok)),
+            "continue_degraded" if core_ok else "fail_core_not_ready",
+        )
+        return False, default, "timeout"
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+        logger.exception(
+            "[PREP][AUX][FAIL] stage=%s elapsed=%.2f core_ok=%s err_type=%s err=%s action=%s",
+            stage, elapsed, int(bool(core_ok)), type(exc).__name__, exc,
+            "continue_degraded" if core_ok else "fail_core_not_ready",
+        )
+        return False, default, type(exc).__name__
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+def _resolve_prep_final_status(*, prep_core: dict[str, Any], aux_failures: list[dict[str, Any]]) -> tuple[str, int]:
+    if int((prep_core or {}).get("core_ok") or 0) and not aux_failures:
+        return "OK", 0
+    if int((prep_core or {}).get("core_ok") or 0) and aux_failures:
+        return "OK_CORE_AUX_DEGRADED", 0
+    if "quality_not_ok" in list((prep_core or {}).get("reasons") or []):
+        return "FAIL_CORE_QUALITY", 2
+    return "FAIL_CORE_CONTRACT", 2
 
 def compute_prep_core_status(
     *,
@@ -3101,26 +3159,42 @@ def main() -> int:
     else:
         bundle_source = watchlist_bundle.get("meta", {}).get("source", "fresh_build")
     
-    # Verify DB saved counts
+    # Verify DB saved counts as auxiliary work so core-ok prep cannot hang indefinitely here.
     watchlist_repo = WatchlistRepo(engine)
-    saved_counts = {}
-    for strategy_key in [
-        "pb1_universe_scored",
-        "pb1_pool120",
-        "pb1_top50",
-        "pb1_watchlist_final",
-        "pb1_watchlist_final_scored",
-    ]:
-        try:
-            rows, _ = watchlist_repo.load_watchlist(
-                env=env,
-                strategy=strategy_key,
-                as_of=as_of,
-                allow_latest_fallback=False,
-            )
-            saved_counts[strategy_key] = len(rows) if rows else 0
-        except Exception:
-            saved_counts[strategy_key] = -1  # Error indicator
+    aux_failures: list[dict[str, Any]] = []
+
+    def _load_saved_counts() -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for strategy_key in [
+            "pb1_universe_scored",
+            "pb1_pool120",
+            "pb1_top50",
+            "pb1_watchlist_final",
+            "pb1_watchlist_final_scored",
+        ]:
+            try:
+                rows, _ = watchlist_repo.load_watchlist(
+                    env=env,
+                    strategy=strategy_key,
+                    as_of=as_of,
+                    allow_latest_fallback=False,
+                )
+                counts[strategy_key] = len(rows) if rows else 0
+            except Exception:
+                counts[strategy_key] = -1
+        return counts
+
+    aux_timeout = float(os.getenv("KR_PREP_AUX_WATCHLIST_TIMEOUT_SEC", os.getenv("KR_PREP_AUX_DEFAULT_TIMEOUT_SEC", "20")))
+    aux_ok, saved_counts_result, aux_err = _run_prep_aux_with_timeout(
+        stage="watchlist_load_verify",
+        timeout_sec=aux_timeout,
+        core_ok=bool(prep_core.get("core_ok")),
+        fn=_load_saved_counts,
+        default={},
+    )
+    if not aux_ok:
+        aux_failures.append({"stage": "watchlist_load_verify", "reason": aux_err})
+    saved_counts = dict(saved_counts_result or {})
     
     logger.info(
         "[PREP][BUNDLE][FINAL_STATE] as_of=%s bundle_source=%s "
@@ -3161,6 +3235,29 @@ def main() -> int:
             as_of.isoformat(),
         )
 
+
+    final_status, final_exit_code = _resolve_prep_final_status(prep_core=prep_core, aux_failures=aux_failures)
+    prep_summary = {
+        "status": final_status,
+        "core_ok": int(bool(prep_core.get("core_ok"))),
+        "aux_failed": int(bool(aux_failures)),
+        "aux_failures": aux_failures,
+        "exit_code": final_exit_code,
+    }
+    prep_manifest.update({
+        "final_status": final_status,
+        "core_ok": int(bool(prep_core.get("core_ok"))),
+        "aux_failed": int(bool(aux_failures)),
+        "aux_failures": aux_failures,
+        "exit_code": final_exit_code,
+    })
+    prep_manifest_path.write_text(json.dumps(to_jsonable(prep_manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_path = prep_manifest_path.with_name("prep_summary.json")
+    summary_path.write_text(json.dumps(to_jsonable(prep_summary), ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info(
+        "[KR_PREP][DONE] status=%s core_ok=%s aux_failed=%s exit_code=%s",
+        final_status, int(bool(prep_core.get("core_ok"))), int(bool(aux_failures)), final_exit_code,
+    )
     logger.info(
         "[PREP][DONE] as_of=%s source=%s universe=%s pool120=%s top50=%s final30=%s flow_coverage=%.1f final_source=%s contract_mode=%s status=%s quality_ok=%s soft_fail=%s trade_can_proceed=%s aux_ok=%s dt=%.2f",
         as_of.isoformat(),
@@ -3186,8 +3283,8 @@ def main() -> int:
         len(bundle_final30),
         int(final30_gate_decision["trade_can_proceed"]),
     )
-    logger.info("[PREP][EXIT] status=OK")
-    return 0
+    logger.info("[PREP][EXIT] status=%s", final_status)
+    return final_exit_code
 
 
 if __name__ == "__main__":
