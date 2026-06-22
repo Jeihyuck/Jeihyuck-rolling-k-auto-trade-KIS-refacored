@@ -209,6 +209,15 @@ def _guard_trade_session(session: str, ctx: KrSessionContext) -> dict[str, Any] 
                 logger.info("[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=KR_AM_WAIT_TOO_LONG orders_intent=0 orders_ack=0 blocked=0")
                 return {"status": "FAIL", "reason": "KR_AM_WAIT_TOO_LONG", "exit_code": 2}
             raise
+        try:
+            from trader.config import get_live_gate_status_fresh
+            gate = get_live_gate_status_fresh(reason="after_wait_done")
+            logger.info(
+                "[KR_AM][LIVE_GATE_AFTER_WAIT] allow=%s reason=%s window=%s now=%s",
+                int(gate.allow_live_gate), gate.reason, gate.window, gate.now_kst.isoformat(),
+            )
+        except Exception as exc:
+            logger.warning("[KR_AM][LIVE_GATE_AFTER_WAIT][WARN] err=%s", exc)
         logger.info("[KR_AM][RUN_AFTER_TARGET] trade_date=%s", ctx.trade_date)
     if session == "close":
         logger.info("[KR_SESSION][CLOSE_CONTINUE] reason=EXIT_ONLY_DOES_NOT_REQUIRE_ENTRY_ARTIFACT")
@@ -282,6 +291,37 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
                 "performance_reliable": 0,
             }
 
+
+
+def build_session_result(*, exit_code: int, status: str = "UNKNOWN", sell_orders_ack: int = 0, entry_status: str = "UNKNOWN", entry_abort_reason: str | None = None, fatal_error: bool = False) -> dict[str, Any]:
+    return {
+        "exit_code": int(exit_code), "status": str(status or "UNKNOWN"),
+        "sell_orders_ack": int(sell_orders_ack or 0), "entry_status": str(entry_status or "UNKNOWN"),
+        "entry_abort_reason": entry_abort_reason, "fatal_error": bool(fatal_error),
+    }
+
+def compute_session_marker(result: dict[str, Any]) -> dict[str, Any]:
+    status = str((result or {}).get("status") or "UNKNOWN").upper()
+    entry_status = str((result or {}).get("entry_status") or "UNKNOWN").upper()
+    entry_abort_reason = (result or {}).get("entry_abort_reason")
+    exit_code = int((result or {}).get("exit_code") or 0)
+    fatal_error = bool((result or {}).get("fatal_error"))
+    sell_orders_ack = int((result or {}).get("sell_orders_ack") or 0)
+    can_mark_completed = (
+        exit_code == 0
+        and status in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"}
+        and entry_status not in {"ABORT", "ERROR", "UNKNOWN"}
+        and not entry_abort_reason
+        and not fatal_error
+    )
+    partial_retry = bool(sell_orders_ack and (entry_status in {"ABORT", "ERROR", "UNKNOWN"} or entry_abort_reason or exit_code != 0 or fatal_error))
+    marker_status = "PARTIAL_SUCCESS_RETRYABLE" if partial_retry else status
+    return {
+        "status": marker_status, "completed": int(can_mark_completed),
+        "retryable": int((not can_mark_completed) or partial_retry),
+        "sell_completed": int(bool(sell_orders_ack)),
+        "entry_completed": int(entry_status not in {"ABORT", "ERROR", "UNKNOWN"} and not entry_abort_reason),
+    }
 
 def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     ctx = _session_context(session, env)
@@ -370,15 +410,21 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
         blocked = 1
         logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
-    success_completed_statuses = {"OK", "OK_NO_TRADE", "OK_RISK_BLOCKED"}
-    failure_retryable_statuses = {"FAILED", "FAIL", "FAIL_PRECHECK", "FATAL_RUNTIME"}
+    entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR"} else "DONE"
+    entry_reason = pb1_reason if entry_status == "ABORT" else None
+    marker = compute_session_marker(build_session_result(
+        exit_code=exit_code, status=status, sell_orders_ack=int(os.getenv("PB1_SELL_ORDERS_ACK", "0") or 0),
+        entry_status=entry_status, entry_abort_reason=entry_reason, fatal_error=(status in {"FAIL", "FAILED"} and exit_code != 0),
+    ))
     retryable_reasons = {"DB_EXACT_FINAL30_ZERO", "CLOSE_BALANCE_UNCONFIRMED", "BALANCE_TIMEOUT_FAIL_SOFT"}
-    completed = int(status in success_completed_statuses and summary_reason == "PB1_SESSION_DONE")
-    retryable = int(status in failure_retryable_statuses or summary_reason in retryable_reasons or status == "WARN")
+    completed = int(marker["completed"])
+    retryable = int(marker["retryable"] or summary_reason in retryable_reasons or status == "WARN")
+    if retryable and not completed and int(marker.get("sell_completed", 0)):
+        status = "PARTIAL_SUCCESS_RETRYABLE"
     if summary_reason in retryable_reasons:
         completed = 0
         retryable = 1
-    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s", session, status, exit_code, summary_reason, completed, retryable)
+    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, int(os.getenv("PB1_SELL_ORDERS_ACK", "0") or 0), entry_status, entry_reason)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
     else:

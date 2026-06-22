@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export KR_PB1_VOL_MAX="${KR_PB1_VOL_MAX:-1.25}"
+export KR_PB1_VOLU_MAX="${KR_PB1_VOLU_MAX:-1.25}"
+export KR_PB1_VOLU_MAX_INTRADAY="${KR_PB1_VOLU_MAX_INTRADAY:-1.25}"
+export PB1_VOL_MAX="${PB1_VOL_MAX:-$KR_PB1_VOL_MAX}"
+export PB1_VOLU_MAX="${PB1_VOLU_MAX:-$KR_PB1_VOLU_MAX}"
+export PB1_VOLU_MAX_INTRADAY="${PB1_VOLU_MAX_INTRADAY:-$KR_PB1_VOLU_MAX_INTRADAY}"
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime

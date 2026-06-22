@@ -26,6 +26,7 @@ from trader.db.repos import (
     LedgerEventsRepo,
     UniverseRepo,
     WatchlistRepo,
+    save_job_checkpoint,
 )
 from trader.minervini.compute import compute_and_store_derived_minervini
 from trader.candidate_pool_builder import (
@@ -2543,6 +2544,22 @@ def main() -> int:
             int((final30_file_results.get("ledger") or {}).get("rows") or 0),
             int((final30_file_results.get("signals") or {}).get("rows") or 0),
         )
+        core_payload = {
+            "status": "PREP_CORE_OK", "env": env, "trade_date": trade_date.isoformat(),
+            "expected_as_of": as_of.isoformat(), "rows": 30, "source": "canonical",
+            "strategy": "pb1_watchlist_final_scored", "contract_ok": 1, "usable": 1,
+            "created_at_kst": now_kst().isoformat(),
+        }
+        core_key = f"kr_prep_core_ok:{env}:{trade_date.isoformat()}:{as_of.isoformat()}"
+        marker_path = Path("runtime/kr/watchlist") / trade_date.isoformat() / "prep_core_ok.json"
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps(to_jsonable(core_payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[PREP][CORE_OK] trade_date=%s as_of=%s rows=30 source=canonical contract_ok=1", trade_date.isoformat(), as_of.isoformat())
+        try:
+            save_job_checkpoint(engine, core_key, core_payload)
+            logger.info("[PREP][CORE_MARKER][SAVE_OK] key=%s", core_key)
+        except Exception as exc:
+            logger.warning("[PREP][CORE_MARKER][SAVE_WARN] key=%s err=%s", core_key, exc)
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:

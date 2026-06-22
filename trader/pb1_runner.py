@@ -840,7 +840,7 @@ def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: s
     if str(os.getenv("KR_INJECT_CANONICAL_FINAL30", "1")).strip().lower() in {"0", "false", "no"}:
         return pd.DataFrame()
     try:
-        from trader.kr.artifacts import validate_kr_prep_artifact
+        from trader.kr.artifacts import validate_kr_prep_artifact, normalize_and_validate_scored_final30
         art = validate_kr_prep_artifact(
             trade_date=date.fromisoformat(str(trade_date)[:10]),
             expected_as_of=date.fromisoformat(str(expected_as_of)[:10]),
@@ -850,8 +850,30 @@ def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: s
         )
         rows = list(getattr(art, "final30_rows_payload", []) or [])
         if art.ok and rows:
-            df = pd.DataFrame(rows)
-            logger.info("[KR_FINAL30][INJECT] source=canonical rows=%s as_of=%s", len(df), expected_as_of)
+            normalized, contract = normalize_and_validate_scored_final30(
+                rows,
+                expected_as_of=str(expected_as_of)[:10],
+                require_exact_rows=30,
+                source="kr_canonical_artifact",
+            )
+            if int(contract.get("contract_ok") or 0) != 1:
+                raise RuntimeError(f"KR_CANONICAL_FINAL30_CONTRACT_FAIL:{contract.get('reasons')}")
+            df = pd.DataFrame(normalized)
+            df.attrs["final30_context"] = {
+                "source": "kr_canonical_artifact",
+                "as_of": str(expected_as_of)[:10],
+                "rows": 30,
+                "locked": 1,
+                "usable": 1,
+                "is_scored": 1,
+                "contract_ok": 1,
+                "strategy": os.getenv("PB1_FINAL30_STRATEGY_KEY", "pb1_watchlist_final_scored"),
+                "validated_by": "kr_artifact_validate",
+            }
+            logger.info(
+                "[KR_FINAL30][INJECT] source=canonical rows=%s as_of=%s contract_ok=1 usable=1 locked=1",
+                len(df), expected_as_of,
+            )
             return df
     except Exception as exc:
         logger.warning("[KR_FINAL30][INJECT][SKIP] err=%s", exc)
@@ -2118,14 +2140,20 @@ def _record_session_execution_marker(
     spec = _session_recovery_spec(session_kind)
     if spec is None:
         return
+    status_u = str(status or "UNKNOWN").upper()
+    exit_reason_s = str(exit_reason or "")
+    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"} and not exit_reason_s.startswith("missing_") and "ABORT" not in status_u and status_u != "UNKNOWN")
+    retryable = int(not completed)
+    marker_status = status_u if completed else ("PARTIAL_SUCCESS_RETRYABLE" if os.getenv("PB1_SELL_ORDERS_ACK", "0") == "1" else status_u)
     payload = {
         "env": str(env or "").strip().lower() or "practice",
         "session_kind": str(session_kind or "").strip().lower(),
         "trade_date": trade_date.isoformat(),
-        "status": status,
+        "status": marker_status,
         "exit_reason": exit_reason,
         "recovery_used": bool(recovery_used),
-        "completed": True,
+        "completed": bool(completed),
+        "retryable": bool(retryable),
         "updated_at": _get_now_kst().isoformat(),
     }
     try:
@@ -2135,9 +2163,10 @@ def _record_session_execution_marker(
             payload,
         )
         logger.info(
-            "[%s][DEDUPE] source=job_checkpoint completed=1 status=%s exit_reason=%s recovery_used=%s",
+            "[%s][DEDUPE] source=job_checkpoint completed=%s status=%s exit_reason=%s recovery_used=%s",
             spec["log_prefix"],
-            status,
+            completed,
+            marker_status,
             exit_reason,
             int(bool(recovery_used)),
         )
@@ -5012,10 +5041,11 @@ def run_once(
                 run_ctx["final30_locked"] = True
                 run_ctx["final30_rows"] = int(len(precomputed_final30_df))
                 run_ctx["final30_as_of"] = str(run_ctx.get("derived_as_of") or as_of)
+                run_ctx["final30_context"] = dict(precomputed_final30_df.attrs.get("final30_context") or {})
                 setattr(ctx, "final30_df", precomputed_final30_df.copy())
                 setattr(ctx, "canonical_source", "kr_canonical_artifact")
                 setattr(ctx, "canonical_final30_rows", int(len(precomputed_final30_df)))
-                logger.info("[RUN_ONCE][FINAL30_INJECTED] rows=%s source=kr_canonical_artifact", len(precomputed_final30_df))
+                logger.info("[RUN_ONCE][FINAL30_INJECTED] rows=%s source=kr_canonical_artifact usable=1 locked=1 scored=1", len(precomputed_final30_df))
         final30_strategy_key = os.getenv("PB1_FINAL30_STRATEGY_KEY", "pb1_watchlist_final_scored")
         universe_strategy_key = os.getenv("PB1_UNIVERSE_STRATEGY_KEY", os.getenv("PB1_UNIVERSE_STRATEGY", DEFAULT_UNIVERSE_STRATEGY))
         candidate_pool_strategy_key = os.getenv("PB1_CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")

@@ -24,6 +24,109 @@ LEGACY_PATHS = (
     Path("signals/kr/prep_contract.json"),
 )
 
+
+REQUIRED_SCORED_FINAL30_COLUMNS = {
+    "code", "as_of", "rank_final30", "score_final", "tech_score",
+    "breakout_score", "pullback_score", "momentum_score",
+    "entry_style_selected", "ma20", "ma50", "ma150", "rs_percentile",
+    "vcp_score", "atr_pct", "close",
+}
+
+_ENTRY_STYLE_ALIASES = {
+    "PULLBACK": "PULLBACK", "ENTRY_PULLBACK": "PULLBACK",
+    "BREAKOUT": "BREAKOUT", "ENTRY_BREAKOUT": "BREAKOUT",
+    "MOMENTUM": "MOMENTUM", "ENTRY_MOMENTUM": "MOMENTUM",
+    "VCP": "VCP",
+}
+
+def _is_missing_contract_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        import math
+        if isinstance(value, float) and math.isnan(value):
+            return True
+    except Exception:
+        pass
+    return str(value).strip().lower() in {"", "none", "null", "nan"}
+
+def _as_positive_float(value: Any) -> bool:
+    if _is_missing_contract_value(value):
+        return False
+    try:
+        return float(str(value).replace(",", "")) > 0.0
+    except Exception:
+        return False
+
+def normalize_and_validate_scored_final30(
+    rows: list[dict],
+    *,
+    expected_as_of: str,
+    require_exact_rows: int = 30,
+    source: str,
+) -> tuple[list[dict], dict]:
+    """Normalize aliases and validate the strict scored final30 contract shared by KR runner and PB1."""
+    normalized: list[dict] = []
+    as_of_s = str(expected_as_of)[:10]
+    for idx, raw in enumerate(rows or [], start=1):
+        item = dict(raw or {})
+        if "code" not in item and item.get("symbol") is not None:
+            item["code"] = item.get("symbol")
+        if "score_final" not in item and item.get("final_score") is not None:
+            item["score_final"] = item.get("final_score")
+        if "rs_percentile" not in item and item.get("rs_pctile") is not None:
+            item["rs_percentile"] = item.get("rs_pctile")
+        if "rank_final30" not in item and item.get("rank") is not None:
+            item["rank_final30"] = item.get("rank")
+        item["code"] = str(item.get("code") or "").zfill(6)
+        item["as_of"] = str(item.get("as_of") or item.get("expected_as_of") or item.get("base_date") or as_of_s)[:10]
+        style_raw = str(item.get("entry_style_selected") or "").strip().upper()
+        item["entry_style_selected"] = _ENTRY_STYLE_ALIASES.get(style_raw, style_raw)
+        normalized.append(item)
+
+    cols = set().union(*(set(r.keys()) for r in normalized)) if normalized else set()
+    missing_fields = sorted(REQUIRED_SCORED_FINAL30_COLUMNS - cols)
+    null_counts = {c: sum(1 for r in normalized if _is_missing_contract_value(r.get(c))) for c in REQUIRED_SCORED_FINAL30_COLUMNS if c in cols}
+    zero_invalid_fields = {"ma20", "ma50", "ma150", "close", "atr_pct", "score_final", "tech_score"}
+    zero_invalid_counts = {c: sum(1 for r in normalized if not _as_positive_float(r.get(c))) for c in zero_invalid_fields if c in cols}
+    codes = [r.get("code") for r in normalized if r.get("code")]
+    ranks = [r.get("rank_final30") for r in normalized if not _is_missing_contract_value(r.get("rank_final30"))]
+    reasons: list[str] = []
+    if len(normalized) != int(require_exact_rows):
+        reasons.append(f"rows_not_{require_exact_rows}")
+    if len(set(codes)) != int(require_exact_rows):
+        reasons.append("code_unique_not_30")
+    if len(ranks) == int(require_exact_rows):
+        try:
+            rank_ints = {int(float(x)) for x in ranks}
+            if rank_ints != set(range(1, int(require_exact_rows) + 1)):
+                reasons.append("rank_final30_not_1_30_unique")
+        except Exception:
+            if len(set(map(str, ranks))) != int(require_exact_rows):
+                reasons.append("rank_final30_not_unique")
+    else:
+        reasons.append("rank_final30_missing")
+    if missing_fields:
+        reasons.append("critical_columns_missing")
+    if any(v > 0 for k, v in null_counts.items() if k in REQUIRED_SCORED_FINAL30_COLUMNS):
+        reasons.append("critical_null_values")
+    if any(v > 0 for v in zero_invalid_counts.values()):
+        reasons.append("critical_zero_invalid_values")
+    bad_styles = sorted({str(r.get("entry_style_selected") or "") for r in normalized if str(r.get("entry_style_selected") or "") not in set(_ENTRY_STYLE_ALIASES.values())})
+    if bad_styles:
+        reasons.append("entry_style_invalid")
+    if any(str(r.get("as_of") or "")[:10] != as_of_s for r in normalized):
+        reasons.append("as_of_mismatch")
+    ok = not reasons
+    meta = {
+        "rows": len(normalized), "usable": int(ok), "locked": int(ok), "is_scored": int(ok),
+        "contract_ok": int(ok), "source": source, "as_of": as_of_s,
+        "missing_critical_fields": missing_fields, "null_critical_counts": null_counts,
+        "zero_invalid_counts": zero_invalid_counts, "reasons": reasons, "invalid_entry_styles": bad_styles,
+    }
+    return normalized, meta
+
+
 @dataclass
 class KrArtifactValidationResult:
     ok: bool

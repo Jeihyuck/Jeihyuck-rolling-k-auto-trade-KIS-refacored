@@ -990,11 +990,17 @@ PB1_PULLBACK_BAND_KOSDAQ_STRICT = tuple(float(x.strip()) for x in (_cfg("PB1_PUL
 PB1_RELAX_MA_FILTER = _cfg_bool("PB1_RELAX_MA_FILTER", fallback=True)
 PB1_RELAX_MA20_SLOPE = _cfg_bool("PB1_RELAX_MA20_SLOPE", fallback=True)
 PB1_MA20_SLOPE_HARD_FAIL_MIN = float(_cfg("PB1_MA20_SLOPE_HARD_FAIL_MIN") or "-0.05")
-PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.25")
-PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "1.15")
+_IS_KR_SCOPE = (os.getenv("MARKET", "").upper() == "KR" or os.getenv("REGION", "").upper() == "KR" or os.getenv("PB1_MARKET_SCOPE", "").upper() == "KRX")
+if _IS_KR_SCOPE:
+    PB1_VOL_MAX = float(os.getenv("KR_PB1_VOL_MAX") or os.getenv("PB1_VOL_MAX") or os.getenv("PB1_VOL_CONTRACTION_MAX") or "1.25")
+    PB1_VOLU_MAX = float(os.getenv("KR_PB1_VOLU_MAX") or os.getenv("PB1_VOLU_MAX") or os.getenv("PB1_VOLU_CONTRACTION_MAX") or str(PB1_VOL_MAX))
+    PB1_VOLU_MAX_INTRADAY = float(os.getenv("KR_PB1_VOLU_MAX_INTRADAY") or os.getenv("PB1_VOLU_MAX_INTRADAY") or str(PB1_VOLU_MAX))
+else:
+    PB1_VOL_MAX = float(_cfg_with_alias("PB1_VOL_MAX", "PB1_VOL_CONTRACTION_MAX") or "1.25")
+    PB1_VOLU_MAX = float(_cfg_with_alias("PB1_VOLU_MAX", "PB1_VOLU_CONTRACTION_MAX") or "1.15")
+    PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")
 PB1_VOL_CONTRACTION_MAX_STRICT = float(_cfg("PB1_VOL_CONTRACTION_MAX_STRICT") or "1.00")
 PB1_VOLU_CONTRACTION_MAX_STRICT = float(_cfg("PB1_VOLU_CONTRACTION_MAX_STRICT") or "0.98")
-PB1_VOLU_MAX_INTRADAY = float(_cfg("PB1_VOLU_MAX_INTRADAY") or "1.05")
 PB1_PULLBACK_MIN = float(_cfg("PB1_PULLBACK_MIN") or "0.03")
 PB1_PULLBACK_MAX = float(_cfg("PB1_PULLBACK_MAX") or "0.18")
 PB1_ENTRY_MODE = (_cfg("PB1_ENTRY_MODE") or "BOTH").strip().upper()
@@ -1639,6 +1645,25 @@ LIVE_GATE_STATUS: LiveGateStatus = compute_live_gate(
 # 전역 변수로 공개
 ALLOW_LIVE_GATE: bool = LIVE_GATE_STATUS.allow_live_gate
 FORCE_BLOCK_LIVE: bool = LIVE_GATE_STATUS.force_block_live
+
+
+def get_live_gate_status_fresh(*, now_kst: datetime | None = None, reason: str = "runtime") -> LiveGateStatus:
+    """Recompute live order gate from the current KST time; do not reuse import-time gate for orders."""
+    now = now_kst or datetime.now(KST)
+    strategy_mode = os.getenv("STRATEGY_MODE", _strategy_mode_raw).strip().upper() or _strategy_mode_raw
+    status = compute_live_gate(
+        now,
+        kis_env=_KIS_ENV_FROM_SETTINGS,
+        strategy_mode=strategy_mode,
+        dryrun=env_bool("DRY_RUN", default=False),
+        analysis_only=MINERVINI_ONLY,
+    )
+    logger.info(
+        "[LIVE_GATE][REFRESH] reason=%s allow_live_gate=%s force_block_live=%s gate_reason=%s trading_day=%s window=%s now_kst=%s",
+        reason, int(status.allow_live_gate), int(status.force_block_live), status.reason,
+        int(status.trading_day), status.window, status.now_kst.isoformat(),
+    )
+    return status
 
 # 로깅
 logger.info(
