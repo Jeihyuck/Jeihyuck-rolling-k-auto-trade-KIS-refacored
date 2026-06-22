@@ -2119,6 +2119,51 @@ def _detect_trade_am_start_policy(
                 os.environ[key] = value
 
 
+
+def _compute_session_marker_payload(
+    *,
+    status: str,
+    exit_reason: str | None,
+    exit_code: int,
+    sell_orders_ack: int = 0,
+    entry_status: str = "UNKNOWN",
+    entry_abort_reason: str | None = None,
+    fatal_error: bool = False,
+) -> dict[str, Any]:
+    status_u = str(status or "UNKNOWN").upper()
+    entry_status_u = str(entry_status or "UNKNOWN").upper()
+    entry_done = entry_status_u in {"DONE", "OK", "OK_NO_TRADE", "SKIPPED_BY_POLICY"} and not entry_abort_reason
+    completed = int(
+        int(exit_code) == 0
+        and status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"}
+        and entry_done
+        and not fatal_error
+    )
+    sell_ack = int(sell_orders_ack or 0)
+    marker_status = "PARTIAL_SUCCESS_RETRYABLE" if sell_ack > 0 and not completed else (status_u if completed or status_u not in {"", "UNKNOWN"} else "RETRYABLE_FAILURE")
+    return {
+        "status": marker_status,
+        "exit_reason": exit_reason,
+        "completed": bool(completed),
+        "retryable": bool(not completed),
+        "sell_orders_ack": sell_ack,
+        "sell_completed": bool(sell_ack > 0),
+        "entry_status": entry_status_u,
+        "entry_abort_reason": entry_abort_reason,
+        "entry_completed": bool(entry_done),
+    }
+
+def _write_session_result_file(payload: dict[str, Any]) -> None:
+    path = os.getenv("PB1_SESSION_RESULT_PATH")
+    if not path:
+        return
+    try:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[PB1][SESSION_RESULT][WRITE_WARN] path=%s err=%s", path, exc)
+
 def _session_execution_checkpoint_key(*, env: str, session_kind: str, trade_date: date) -> str:
     return f"trade_session:{str(env or '').strip().lower() or 'practice'}:{str(session_kind or '').strip().lower()}:{trade_date.isoformat()}"
 
@@ -2134,26 +2179,45 @@ def _record_session_execution_marker(
     session_kind: str,
     trade_date: date,
     status: str,
-    exit_reason: str,
+    exit_reason: str | None,
     recovery_used: bool,
+    completed: bool | None = None,
+    retryable: bool | None = None,
+    sell_orders_ack: int = 0,
+    entry_status: str = "UNKNOWN",
+    entry_abort_reason: str | None = None,
+    exit_code: int = 0,
 ) -> None:
     spec = _session_recovery_spec(session_kind)
     if spec is None:
         return
-    status_u = str(status or "UNKNOWN").upper()
-    exit_reason_s = str(exit_reason or "")
-    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"} and not exit_reason_s.startswith("missing_") and "ABORT" not in status_u and status_u != "UNKNOWN")
-    retryable = int(not completed)
-    marker_status = status_u if completed else ("PARTIAL_SUCCESS_RETRYABLE" if os.getenv("PB1_SELL_ORDERS_ACK", "0") == "1" else status_u)
+    marker = _compute_session_marker_payload(
+        status=status,
+        exit_reason=exit_reason,
+        exit_code=exit_code,
+        sell_orders_ack=sell_orders_ack,
+        entry_status=entry_status,
+        entry_abort_reason=entry_abort_reason,
+        fatal_error=str(status or "").upper() == "ERROR",
+    )
+    if completed is not None:
+        marker["completed"] = bool(completed)
+    if retryable is not None:
+        marker["retryable"] = bool(retryable)
     payload = {
         "env": str(env or "").strip().lower() or "practice",
         "session_kind": str(session_kind or "").strip().lower(),
         "trade_date": trade_date.isoformat(),
-        "status": marker_status,
+        "status": marker["status"],
         "exit_reason": exit_reason,
         "recovery_used": bool(recovery_used),
-        "completed": bool(completed),
-        "retryable": bool(retryable),
+        "completed": bool(marker["completed"]),
+        "retryable": bool(marker["retryable"]),
+        "sell_orders_ack": int(marker["sell_orders_ack"]),
+        "sell_completed": bool(marker["sell_completed"]),
+        "entry_status": marker["entry_status"],
+        "entry_abort_reason": marker["entry_abort_reason"],
+        "entry_completed": bool(marker["entry_completed"]),
         "updated_at": _get_now_kst().isoformat(),
     }
     try:
@@ -2163,10 +2227,11 @@ def _record_session_execution_marker(
             payload,
         )
         logger.info(
-            "[%s][DEDUPE] source=job_checkpoint completed=%s status=%s exit_reason=%s recovery_used=%s",
+            "[%s][DEDUPE] source=job_checkpoint completed=%s status=%s retryable=%s exit_reason=%s recovery_used=%s",
             spec["log_prefix"],
-            completed,
-            marker_status,
+            int(bool(payload["completed"])),
+            payload["status"],
+            int(bool(payload["retryable"])),
             exit_reason,
             int(bool(recovery_used)),
         )
@@ -7017,7 +7082,18 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             status=last_result_status,
             exit_reason=exit_reason,
             recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
+            sell_orders_ack=int(sell_orders or 0),
+            entry_status="DONE" if str(last_result_status).upper() in {"OK", "OK_NO_TRADE"} else ("ABORT" if str(last_result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else "UNKNOWN"),
+            entry_abort_reason=exit_reason if str(last_result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else None,
+            exit_code=_exit_code_for_status(last_result_status),
         )
+        _write_session_result_file({
+            "status": last_result_status,
+            "exit_reason": exit_reason,
+            "sell_orders_ack": int(sell_orders or 0),
+            "sell_orders": int(sell_orders or 0),
+            "buy_orders": int(buy_orders or 0),
+        })
     finally:
         _finish_session_guard(
             runs_repo=runs_repo,
@@ -7700,7 +7776,18 @@ def main() -> int:
             status=result_status,
             exit_reason=main_exit_reason,
             recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
+            sell_orders_ack=int(metrics.get("sell_orders", 0) or 0),
+            entry_status="DONE" if str(result_status).upper() in {"OK", "OK_NO_TRADE"} else ("ABORT" if str(result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else "UNKNOWN"),
+            entry_abort_reason=main_exit_reason if str(result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else None,
+            exit_code=_exit_code_for_status(result_status),
         )
+        _write_session_result_file({
+            "status": result_status,
+            "exit_reason": main_exit_reason,
+            "sell_orders_ack": int(metrics.get("sell_orders", 0) or 0),
+            "sell_orders": int(metrics.get("sell_orders", 0) or 0),
+            "buy_orders": int(metrics.get("buy_orders", 0) or 0),
+        })
     return _exit_code_for_status(result_status)
 
 

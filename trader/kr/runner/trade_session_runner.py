@@ -293,6 +293,43 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
 
 
 
+
+def extract_sell_orders_ack(result: dict | None) -> int:
+    """Extract acknowledged sell orders from actual PB1/session result; never read PB1_SELL_ORDERS_ACK."""
+    if not isinstance(result, dict):
+        return 0
+    for key in (
+        "sell_orders_ack", "orders_sell_ack", "sell_ack", "sell_accepted", "sell_filled",
+        "sell_orders_accepted", "sell_orders_filled", "sell_orders",
+    ):
+        try:
+            value = int(result.get(key) or 0)
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    summary = result.get("order_summary") or result.get("orders_summary") or {}
+    if isinstance(summary, dict):
+        for key in ("sell_ack", "sell_accepted", "sell_filled", "accepted_sell", "filled_sell", "sell_orders"):
+            try:
+                value = int(summary.get(key) or 0)
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    orders = result.get("orders") or result.get("order_results") or []
+    if isinstance(orders, list):
+        count = 0
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            side = str(order.get("side") or order.get("order_side") or "").upper()
+            status = str(order.get("status") or order.get("result") or "").upper()
+            if side == "SELL" and status in {"ACCEPTED", "FILLED", "OK", "SUBMITTED"}:
+                count += 1
+        return count
+    return 0
+
 def build_session_result(*, exit_code: int, status: str = "UNKNOWN", sell_orders_ack: int = 0, entry_status: str = "UNKNOWN", entry_abort_reason: str | None = None, fatal_error: bool = False) -> dict[str, Any]:
     return {
         "exit_code": int(exit_code), "status": str(status or "UNKNOWN"),
@@ -301,27 +338,37 @@ def build_session_result(*, exit_code: int, status: str = "UNKNOWN", sell_orders
     }
 
 def compute_session_marker(result: dict[str, Any]) -> dict[str, Any]:
+    exit_code = int((result or {}).get("exit_code") or 0)
     status = str((result or {}).get("status") or "UNKNOWN").upper()
     entry_status = str((result or {}).get("entry_status") or "UNKNOWN").upper()
     entry_abort_reason = (result or {}).get("entry_abort_reason")
-    exit_code = int((result or {}).get("exit_code") or 0)
     fatal_error = bool((result or {}).get("fatal_error"))
     sell_orders_ack = int((result or {}).get("sell_orders_ack") or 0)
+    entry_done = entry_status in {"DONE", "OK", "OK_NO_TRADE", "SKIPPED_BY_POLICY"} and not entry_abort_reason
     can_mark_completed = (
         exit_code == 0
         and status in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"}
-        and entry_status not in {"ABORT", "ERROR", "UNKNOWN"}
-        and not entry_abort_reason
+        and entry_done
         and not fatal_error
     )
-    partial_retry = bool(sell_orders_ack and (entry_status in {"ABORT", "ERROR", "UNKNOWN"} or entry_abort_reason or exit_code != 0 or fatal_error))
-    marker_status = "PARTIAL_SUCCESS_RETRYABLE" if partial_retry else status
+    partial_success_retryable = sell_orders_ack > 0 and not can_mark_completed
+    if partial_success_retryable:
+        marker_status = "PARTIAL_SUCCESS_RETRYABLE"
+    elif can_mark_completed:
+        marker_status = status
+    else:
+        marker_status = status if status not in {"", "UNKNOWN"} else "RETRYABLE_FAILURE"
     return {
-        "status": marker_status, "completed": int(can_mark_completed),
-        "retryable": int((not can_mark_completed) or partial_retry),
-        "sell_completed": int(bool(sell_orders_ack)),
-        "entry_completed": int(entry_status not in {"ABORT", "ERROR", "UNKNOWN"} and not entry_abort_reason),
+        "status": marker_status,
+        "completed": int(can_mark_completed),
+        "retryable": int(not can_mark_completed),
+        "sell_completed": int(sell_orders_ack > 0),
+        "entry_completed": int(entry_done),
+        "sell_orders_ack": sell_orders_ack,
+        "entry_status": entry_status,
+        "entry_abort_reason": entry_abort_reason,
     }
+
 
 def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     ctx = _session_context(session, env)
@@ -387,11 +434,21 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     os.environ.pop("PB1_LAST_RESULT_STATUS", None)
     os.environ.pop("PB1_LAST_EXIT_REASON", None)
     logger.info("[KR_SESSION][PB1_ENV_CLEAR] cleared=PB1_LAST_RESULT_STATUS,PB1_LAST_EXIT_REASON")
+    pb1_result_path = ROOT / "runtime/kr/session" / ctx.trade_date.isoformat() / session / "pb1_result.json"
+    pb1_result_path.parent.mkdir(parents=True, exist_ok=True)
+    os.environ["PB1_SESSION_RESULT_PATH"] = str(pb1_result_path)
     try:
         sys.argv = ["kr-pb1-session", "--window", window, "--phase", "auto", "--env", env]
         exit_code = int(pb1_runner.main() or 0)
     finally:
         sys.argv = old_argv
+    pb1_result: dict[str, Any] = {}
+    try:
+        if pb1_result_path.exists():
+            loaded = json.loads(pb1_result_path.read_text(encoding="utf-8"))
+            pb1_result = loaded if isinstance(loaded, dict) else {}
+    except Exception as exc:
+        logger.warning("[KR_SESSION][PB1_RESULT][WARN] path=%s err=%s", pb1_result_path, exc)
     pb1_last = str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper()
     pb1_reason = str(os.getenv("PB1_LAST_EXIT_REASON") or "")
     if pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason:
@@ -412,8 +469,10 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
     entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR"} else "DONE"
     entry_reason = pb1_reason if entry_status == "ABORT" else None
+    sell_orders_ack = extract_sell_orders_ack(pb1_result)
+    logger.info("[KR_SESSION][SELL_ACK] session=%s sell_orders_ack=%s source=pb1_result", session, sell_orders_ack)
     marker = compute_session_marker(build_session_result(
-        exit_code=exit_code, status=status, sell_orders_ack=int(os.getenv("PB1_SELL_ORDERS_ACK", "0") or 0),
+        exit_code=exit_code, status=status, sell_orders_ack=sell_orders_ack,
         entry_status=entry_status, entry_abort_reason=entry_reason, fatal_error=(status in {"FAIL", "FAILED"} and exit_code != 0),
     ))
     retryable_reasons = {"DB_EXACT_FINAL30_ZERO", "CLOSE_BALANCE_UNCONFIRMED", "BALANCE_TIMEOUT_FAIL_SOFT"}
@@ -424,7 +483,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     if summary_reason in retryable_reasons:
         completed = 0
         retryable = 1
-    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, int(os.getenv("PB1_SELL_ORDERS_ACK", "0") or 0), entry_status, entry_reason)
+    logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
     else:

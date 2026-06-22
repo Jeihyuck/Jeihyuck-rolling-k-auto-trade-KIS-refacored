@@ -56,3 +56,57 @@ def test_canonical_final30_missing_critical_columns_aborts():
     assert contract["contract_ok"] == 0
     assert contract["usable"] == 0
     assert "ma20" in contract["missing_critical_fields"]
+
+
+def test_canonical_final30_blank_code_and_symbol_rejected():
+    rows = make_valid_scored_final30_rows(30)
+    rows[0].pop("code", None)
+    rows[0].pop("symbol", None)
+    normalized, contract = normalize_and_validate_scored_final30(
+        rows, expected_as_of="2026-06-19", require_exact_rows=30, source="kr_canonical_artifact"
+    )
+    assert contract["contract_ok"] == 0
+    assert contract["usable"] == 0
+    assert "invalid_code" in contract["reasons"]
+    assert contract["invalid_code_count"] == 1
+    assert normalized[0]["code"] == ""
+
+
+def test_canonical_final30_zero_code_rejected():
+    rows = make_valid_scored_final30_rows(30)
+    rows[0]["symbol"] = "000000"
+    _, contract = normalize_and_validate_scored_final30(
+        rows, expected_as_of="2026-06-19", require_exact_rows=30, source="kr_canonical_artifact"
+    )
+    assert contract["contract_ok"] == 0
+    assert "invalid_code" in contract["reasons"]
+
+
+def test_canonical_final30_masked_code_rejected():
+    rows = make_valid_scored_final30_rows(30)
+    rows[0]["symbol"] = "***6360"
+    _, contract = normalize_and_validate_scored_final30(
+        rows, expected_as_of="2026-06-19", require_exact_rows=30, source="kr_canonical_artifact"
+    )
+    assert contract["contract_ok"] == 0
+    assert "invalid_code" in contract["reasons"]
+
+
+def test_canonical_final30_duplicate_code_rejected():
+    rows = make_valid_scored_final30_rows(30)
+    rows[1]["symbol"] = rows[0]["symbol"]
+    _, contract = normalize_and_validate_scored_final30(
+        rows, expected_as_of="2026-06-19", require_exact_rows=30, source="kr_canonical_artifact"
+    )
+    assert contract["contract_ok"] == 0
+    assert "code_unique_not_30" in contract["reasons"]
+
+
+def test_canonical_final30_short_numeric_code_is_padded():
+    rows = make_valid_scored_final30_rows(30)
+    rows[0]["symbol"] = "6360"
+    normalized, contract = normalize_and_validate_scored_final30(
+        rows, expected_as_of="2026-06-19", require_exact_rows=30, source="kr_canonical_artifact"
+    )
+    assert contract["contract_ok"] == 1
+    assert normalized[0]["code"] == "006360"

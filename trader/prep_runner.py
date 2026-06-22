@@ -79,6 +79,41 @@ from trader.universe.build import build_universe
 
 logger = logging.getLogger(__name__)
 
+
+def compute_prep_core_status(
+    *,
+    scored_contract: dict[str, Any] | None,
+    db_roundtrip_ok: bool,
+    final30_file_contract_ok: bool,
+    final30_quality_ok: bool,
+) -> dict[str, Any]:
+    contract = dict(scored_contract or {})
+    scored_contract_ok = bool(contract) and int(contract.get("contract_ok") or contract.get("ok") or 0) == 1
+    final30_rows_ok = int(contract.get("rows") or 0) == FINAL30_SCORED_REQUIRED_ROWS
+    core_fail_reasons: list[str] = []
+    if not scored_contract_ok:
+        core_fail_reasons.append("scored_contract_not_ok")
+    if not final30_rows_ok:
+        core_fail_reasons.append("rows_not_30")
+    if not bool(db_roundtrip_ok):
+        core_fail_reasons.append("db_roundtrip_not_ok")
+    if not bool(final30_file_contract_ok):
+        core_fail_reasons.append("file_mirror_not_ok")
+    if not bool(final30_quality_ok):
+        core_fail_reasons.append("quality_not_ok")
+    core_ok = not core_fail_reasons
+    status = "PREP_CORE_OK" if core_ok else ("FAIL_CORE_QUALITY" if not bool(final30_quality_ok) else "FAIL_CORE_CONTRACT")
+    return {
+        "core_ok": int(core_ok),
+        "status": status,
+        "scored_contract_ok": int(scored_contract_ok),
+        "rows_ok": int(final30_rows_ok),
+        "db_roundtrip_ok": int(bool(db_roundtrip_ok)),
+        "file_mirror_ok": int(bool(final30_file_contract_ok)),
+        "quality_ok": int(bool(final30_quality_ok)),
+        "reasons": core_fail_reasons,
+    }
+
 FINAL30_SCORED_EXPORT_COLS = [
     "code",
     "name",
@@ -1002,6 +1037,7 @@ def save_final30_scored_core(
         "file_results": file_results,
         "validation": reload_validation,
         "exact_final_rows": exact_final_rows,
+        "db_roundtrip_ok": bool(usable_roundtrip),
     }
 
 
@@ -2175,7 +2211,7 @@ def main() -> int:
         as_of=as_of,
         bundle=aux_bundle,
     )
-    core_done = True
+    core_done = False
     prep_repo_root = repo_root().resolve()
     prep_cwd = Path.cwd().resolve()
     final30_paths = build_final30_scored_paths(prep_repo_root, env, as_of.isoformat())
@@ -2523,6 +2559,18 @@ def main() -> int:
             final30_file_failures,
         )
     strict_contract_failures = list(contract_failures or []) + list(final30_file_failures or []) + list(scored_contract.get("errors") or []) + list(final30_quality.get("errors") or [])
+    prep_core = compute_prep_core_status(
+        scored_contract=scored_contract,
+        db_roundtrip_ok=bool(core_save_result.get("db_roundtrip_ok")),
+        final30_file_contract_ok=bool(final30_file_contract_ok),
+        final30_quality_ok=bool(final30_quality_ok),
+    )
+    if not prep_core["core_ok"]:
+        logger.warning(
+            "[PREP][CORE_NOT_OK] trade_date=%s as_of=%s scored_contract_ok=%s rows_ok=%s db_roundtrip_ok=%s file_mirror_ok=%s quality_ok=%s reasons=%s",
+            trade_date.isoformat(), as_of.isoformat(), prep_core["scored_contract_ok"], prep_core["rows_ok"],
+            prep_core["db_roundtrip_ok"], prep_core["file_mirror_ok"], prep_core["quality_ok"], prep_core["reasons"],
+        )
     if ((not final30_quality_ok) or (not bool(scored_contract.get("ok"))) or (not bool(final30_files_validation.get("ok")))) and not core_done:
         raise RuntimeError(
             "PREP_FINAL30_STRICT_VALIDATE_FAILED:"
@@ -2534,12 +2582,11 @@ def main() -> int:
                 ))
             )
         )
-    if bool(scored_contract) and final30_file_contract_ok:
+    if prep_core["core_ok"]:
+        core_done = True
         logger.info(
             "[PREP][FINAL30_SCORED][CONTRACT_OK] as_of=%s final=%s final_scored=%s runtime=%s ledger=%s signals=%s",
-            as_of.isoformat(),
-            len(exact_final_rows),
-            int(scored_contract.get("rows") or 0),
+            as_of.isoformat(), len(exact_final_rows), int(scored_contract.get("rows") or 0),
             int((final30_file_results.get("runtime") or {}).get("rows") or 0),
             int((final30_file_results.get("ledger") or {}).get("rows") or 0),
             int((final30_file_results.get("signals") or {}).get("rows") or 0),
@@ -2548,18 +2595,21 @@ def main() -> int:
             "status": "PREP_CORE_OK", "env": env, "trade_date": trade_date.isoformat(),
             "expected_as_of": as_of.isoformat(), "rows": 30, "source": "canonical",
             "strategy": "pb1_watchlist_final_scored", "contract_ok": 1, "usable": 1,
+            "quality_ok": 1, "db_roundtrip_ok": 1, "file_mirror_ok": 1,
             "created_at_kst": now_kst().isoformat(),
         }
         core_key = f"kr_prep_core_ok:{env}:{trade_date.isoformat()}:{as_of.isoformat()}"
         marker_path = Path("runtime/kr/watchlist") / trade_date.isoformat() / "prep_core_ok.json"
         marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.write_text(json.dumps(to_jsonable(core_payload), ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info("[PREP][CORE_OK] trade_date=%s as_of=%s rows=30 source=canonical contract_ok=1", trade_date.isoformat(), as_of.isoformat())
+        logger.info("[PREP][CORE_OK] trade_date=%s as_of=%s rows=30 source=canonical contract_ok=1 quality_ok=1 db_roundtrip_ok=1 file_mirror_ok=1", trade_date.isoformat(), as_of.isoformat())
         try:
             save_job_checkpoint(engine, core_key, core_payload)
             logger.info("[PREP][CORE_MARKER][SAVE_OK] key=%s", core_key)
         except Exception as exc:
             logger.warning("[PREP][CORE_MARKER][SAVE_WARN] key=%s err=%s", core_key, exc)
+    else:
+        core_done = False
 
     final_df = frames.get("final30", pd.DataFrame())
     if final_df is None or final_df.empty:

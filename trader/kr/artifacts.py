@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import hashlib
 from dataclasses import dataclass, field
@@ -31,6 +32,29 @@ REQUIRED_SCORED_FINAL30_COLUMNS = {
     "entry_style_selected", "ma20", "ma50", "ma150", "rs_percentile",
     "vcp_score", "atr_pct", "close",
 }
+
+_VALID_KR_CODE_RE = re.compile(r"^\d{6}$")
+_INVALID_CODE_TOKENS = {"", "0", "00", "000", "0000", "00000", "000000", "none", "null", "nan", "nat", "na", "n/a"}
+
+def _normalize_kr_code_for_contract(raw: Any) -> tuple[str, str | None]:
+    """Return (normalized_code, error_reason) for strict KR final30 contract validation."""
+    if raw is None:
+        return "", "code_missing"
+    text = str(raw).strip()
+    if text.lower() in _INVALID_CODE_TOKENS:
+        return "", "code_missing_or_zero"
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if not text.isdigit():
+        return text, "code_non_numeric"
+    if len(text) > 6:
+        return text, "code_too_long"
+    normalized = text.zfill(6)
+    if normalized == "000000":
+        return normalized, "code_zero"
+    if not _VALID_KR_CODE_RE.match(normalized):
+        return normalized, "code_invalid_format"
+    return normalized, None
 
 _ENTRY_STYLE_ALIASES = {
     "PULLBACK": "PULLBACK", "ENTRY_PULLBACK": "PULLBACK",
@@ -67,18 +91,28 @@ def normalize_and_validate_scored_final30(
 ) -> tuple[list[dict], dict]:
     """Normalize aliases and validate the strict scored final30 contract shared by KR runner and PB1."""
     normalized: list[dict] = []
+    code_errors: list[dict[str, Any]] = []
     as_of_s = str(expected_as_of)[:10]
     for idx, raw in enumerate(rows or [], start=1):
         item = dict(raw or {})
-        if "code" not in item and item.get("symbol") is not None:
-            item["code"] = item.get("symbol")
+        raw_code = item.get("code")
+        if raw_code is None or str(raw_code).strip() == "":
+            raw_code = item.get("symbol")
+        normalized_code, code_error = _normalize_kr_code_for_contract(raw_code)
+        item["code"] = normalized_code
+        if code_error:
+            code_errors.append({
+                "row_index": idx,
+                "raw_code": raw_code,
+                "normalized_code": normalized_code,
+                "reason": code_error,
+            })
         if "score_final" not in item and item.get("final_score") is not None:
             item["score_final"] = item.get("final_score")
         if "rs_percentile" not in item and item.get("rs_pctile") is not None:
             item["rs_percentile"] = item.get("rs_pctile")
         if "rank_final30" not in item and item.get("rank") is not None:
             item["rank_final30"] = item.get("rank")
-        item["code"] = str(item.get("code") or "").zfill(6)
         item["as_of"] = str(item.get("as_of") or item.get("expected_as_of") or item.get("base_date") or as_of_s)[:10]
         style_raw = str(item.get("entry_style_selected") or "").strip().upper()
         item["entry_style_selected"] = _ENTRY_STYLE_ALIASES.get(style_raw, style_raw)
@@ -94,8 +128,10 @@ def normalize_and_validate_scored_final30(
     reasons: list[str] = []
     if len(normalized) != int(require_exact_rows):
         reasons.append(f"rows_not_{require_exact_rows}")
-    if len(set(codes)) != int(require_exact_rows):
+    if len(normalized) == int(require_exact_rows) and len(set(codes)) != int(require_exact_rows):
         reasons.append("code_unique_not_30")
+    if code_errors:
+        reasons.append("invalid_code")
     if len(ranks) == int(require_exact_rows):
         try:
             rank_ints = {int(float(x)) for x in ranks}
@@ -123,7 +159,13 @@ def normalize_and_validate_scored_final30(
         "contract_ok": int(ok), "source": source, "as_of": as_of_s,
         "missing_critical_fields": missing_fields, "null_critical_counts": null_counts,
         "zero_invalid_counts": zero_invalid_counts, "reasons": reasons, "invalid_entry_styles": bad_styles,
+        "invalid_code_count": len(code_errors), "invalid_code_errors": code_errors[:10],
     }
+    if not ok:
+        logger.warning(
+            "[KR_FINAL30][CONTRACT_FAIL] source=%s rows=%s reasons=%s invalid_code_count=%s invalid_code_errors=%s",
+            source, len(normalized), reasons, len(code_errors), code_errors[:10],
+        )
     return normalized, meta
 
 
