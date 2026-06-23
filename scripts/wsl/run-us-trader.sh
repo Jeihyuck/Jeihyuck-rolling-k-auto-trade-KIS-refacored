@@ -39,10 +39,22 @@ fi
 
 echo "[WSL_US_TRADER][DISPATCH] session=${session}" >> "$LOG_FILE"
 case "${session}" in
-  prep) exec "${repo_dir}/scripts/wsl/run-us-prep.sh" ;;
-  am|trade-am|session-am) exec "${repo_dir}/scripts/wsl/run-us-am.sh" ;;
-  afternoon|trade-afternoon|session-afternoon) exec "${repo_dir}/scripts/wsl/run-us-afternoon.sh" ;;
-  close|trade-close) exec "${repo_dir}/scripts/wsl/run-us-close.sh" ;;
+  prep)
+    "${repo_dir}/scripts/wsl/run-us-prep.sh"
+    exit $?
+    ;;
+  am|trade-am|session-am)
+    "${repo_dir}/scripts/wsl/run-us-am.sh"
+    exit $?
+    ;;
+  afternoon|trade-afternoon|session-afternoon)
+    "${repo_dir}/scripts/wsl/run-us-afternoon.sh"
+    exit $?
+    ;;
+  close|trade-close)
+    "${repo_dir}/scripts/wsl/run-us-close.sh"
+    exit $?
+    ;;
   *)
     echo "[WSL_US_TRADER][ERROR] unknown session=${session}" >> "$LOG_FILE"
     exit 2

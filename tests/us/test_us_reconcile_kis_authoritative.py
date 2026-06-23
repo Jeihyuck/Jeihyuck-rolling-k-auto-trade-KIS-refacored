@@ -121,7 +121,7 @@ class TestReconcileKisAuthoritative:
             mock_save.assert_not_called()
 
     def test_error_balance_returns_error_status(self):
-        """balance 조회 실패 시 status=ERROR 반환."""
+        """balance 조회 실패 시 TEMP_ERROR + preserve_previous_positions 반환."""
         from trader.us.execution.reconcile import reconcile_positions
 
         mock_provider = MagicMock()
@@ -129,6 +129,9 @@ class TestReconcileKisAuthoritative:
 
         result = reconcile_positions(provider=mock_provider)
 
-        assert result["status"] == "ERROR"
+        assert result["status"] == "TEMP_ERROR"
+        assert result.get("balance_fetch_status") == "FAILED"
+        assert result.get("authoritative_positions") is False
+        assert result.get("preserve_previous_positions") is True
         assert result.get("block_new_entry") is True
 

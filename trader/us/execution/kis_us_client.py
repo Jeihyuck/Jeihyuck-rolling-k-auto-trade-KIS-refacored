@@ -47,9 +47,13 @@ def kis_http_block_enabled() -> bool:
 
 
 def record_kis_http_call(method: str, path: str) -> None:
-    """Best-effort audit marker for actual KIS HTTP attempts."""
+    """Best-effort audit marker for actual KIS HTTP attempts.
+
+    This is an audit marker, not an error. Real HTTP failures must be
+    logged at the request/response exception site.
+    """
     marker = f"[KIS_HTTP_CALL] method={method} path={path}"
-    logger.error(marker)
+    logger.info(marker)
     audit_file = os.getenv("KIS_HTTP_AUDIT_FILE")
     if audit_file:
         try:
