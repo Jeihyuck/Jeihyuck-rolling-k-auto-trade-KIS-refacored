@@ -84,7 +84,10 @@ def reconcile_positions(provider: Any | None = None) -> dict:
     except Exception as exc:
         logger.error("[US_RECONCILE][ERROR] balance fetch failed: %s", exc)
         return {
-            "status": "ERROR",
+            "status": "TEMP_ERROR",
+            "balance_fetch_status": "FAILED",
+            "authoritative_positions": False,
+            "preserve_previous_positions": True,
             "error": str(exc),
             "positions": [],
             "position_count": 0,
@@ -132,6 +135,9 @@ def reconcile_positions(provider: Any | None = None) -> dict:
             "positions": [],
             "balance_parse_status": balance_parse_status,
             "balance_parse_error": balance_parse_error,
+            "balance_fetch_status": "FAILED",
+            "authoritative_positions": False,
+            "preserve_previous_positions": True,
             "block_new_entry": True,
         }
     
@@ -150,6 +156,9 @@ def reconcile_positions(provider: Any | None = None) -> dict:
             "positions": [],
             "balance_parse_status": "CONTRACT_ERROR",
             "balance_parse_error": "raw_output1_nonzero_positions_zero",
+            "balance_fetch_status": "FAILED",
+            "authoritative_positions": False,
+            "preserve_previous_positions": True,
             "block_new_entry": True,
         }
     
@@ -188,6 +197,9 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         "raw_output1_count": raw_output1_count,
         "normalized_position_count": normalized_position_count,
         "balance_parse_status": balance_parse_status,
+        "balance_fetch_status": "OK",
+        "authoritative_positions": True,
+        "preserve_previous_positions": False,
         "block_new_entry": False,
     }
 

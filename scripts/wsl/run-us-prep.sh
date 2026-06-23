@@ -2,11 +2,26 @@
 set -euo pipefail
 
 cd /home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
-mkdir -p runtime
+mkdir -p runtime runtime/locks
 
 set -a
 source .env
 set +a
+
+SESSION_NAME="prep"
+LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
+LOG_FILE="runtime/wsl-us-${SESSION_NAME}.log"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "[$(date -Is)] [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
+  exit 0
+fi
+echo "[$(date -Is)] [US_WSL_LOCK][ACQUIRED] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
+cleanup() {
+  exit_code=$?
+  echo "[$(date -Is)] [US_WSL_LOCK][RELEASED] session=${SESSION_NAME} lock=${LOCK_FILE} exit_code=${exit_code}" >> "${LOG_FILE}"
+}
+trap cleanup EXIT
 
 export STRATEGY_ENV="${STRATEGY_ENV:-practice}"
 export KIS_ENV="${KIS_ENV:-practice}"
@@ -50,4 +65,4 @@ if [[ "${US_OFFLINE:-0}" == "1" ]]; then
   cmd+=(--offline)
 fi
 
-"${cmd[@]}" >> runtime/wsl-us-prep.log 2>&1
+"${cmd[@]}" >> "$LOG_FILE" 2>&1

@@ -103,7 +103,7 @@ def test_us_max_positions_30_blocks_at_30(monkeypatch):
     )
     
     assert result["blocked"] is True
-    assert result["reason"] == "max_positions_reached"
+    assert result["reason"] == "max_positions_reached_new_symbol"
     assert result["qty"] == 0
 
 
