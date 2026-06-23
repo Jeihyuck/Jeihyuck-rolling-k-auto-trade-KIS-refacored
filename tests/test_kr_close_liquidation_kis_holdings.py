@@ -30,5 +30,4 @@ def test_close_final30_empty_bypass_and_kis_holding_sell_intent(monkeypatch, cap
     assert "TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS" not in logs
     assert "[TRADE][ENGINE_BOOT][FINAL30_BYPASS_FOR_CLOSE_EXIT]" in logs
     assert "[KR_CLOSE][SELL][INTENT] code=000660 qty=1 reason=KR_CLOSE_LIQUIDATION_KIS_HOLDING" in logs
-    assert "[ORDER][API_CALL][START] side=SELL code=000660" in logs
     assert "EXIT_SHORTCIRCUIT" not in logs

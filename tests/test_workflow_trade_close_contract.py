@@ -15,6 +15,12 @@ def test_trade_close_workflow_is_close_exit_only_contract():
         'PB1_ENTRY_ENABLED: "0"',
         'PB1_CLOSE_LIQUIDATION_ENABLED: "1"',
         'PB1_CLOSE_ALLOW_KIS_HOLDINGS_WITHOUT_FINAL30: "1"',
+        'KR_BLOCK_EMPTY_FINAL30_ENGINE_BOOT: "1"',
+        'KR_TRADE_FINAL30_DB_FALLBACK: "1"',
+        'DB_LOCK_TIMEOUT_MS: "5000"',
+        'DB_STATEMENT_TIMEOUT_MS: "15000"',
+        'DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"',
+        'PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"',
     }
     for needle in required:
         assert needle in text

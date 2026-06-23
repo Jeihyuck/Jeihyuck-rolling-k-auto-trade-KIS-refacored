@@ -629,24 +629,54 @@ def _structured_entry_abort(reason: str, *, expected_as_of: str | None = None, d
     return [], False, {}, "entry", "FAIL_PRECHECK"
 
 
-def _validate_trade_locked_final30_or_raise(*, final30_df: pd.DataFrame | None, source_name: str) -> None:
+ALLOWED_FINAL30_SOURCES = {
+    "db_pb1_watchlist_final_scored",
+    "kr_canonical_artifact",
+    "db_exact_fallback",
+    "prep.db_roundtrip",
+    "trade.inject.artifact",
+    "trade.inject.db_fallback",
+}
+
+
+def _validate_trade_locked_final30_or_raise(
+    *,
+    final30_df: pd.DataFrame | None,
+    source_name: str,
+    as_of: str | None = None,
+    env: str | None = None,
+    allow_empty_for_close_exit: bool = False,
+) -> None:
+    source_name = str(source_name or "none")
     frame = final30_df if isinstance(final30_df, pd.DataFrame) else pd.DataFrame()
-    if source_name != "db_pb1_watchlist_final_scored":
-        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=source_not_scored actual_source=%s", source_name)
-        _raise_entry_abort_precheck("db_exact_scored_not_loaded")
     if frame.empty:
-        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30")
+        if allow_empty_for_close_exit:
+            logger.warning(
+                "[TRADE][FINAL30][LOCK][BYPASS_FOR_CLOSE_EXIT] source=%s reason=empty_allowed_for_liquidation",
+                source_name,
+            )
+            return
+        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=empty_precomputed_final30 source=%s", source_name)
         _raise_entry_abort_precheck("db_exact_scored_zero_rows")
-    if len(frame) != 30:
-        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=rows_not_30 rows=%s", len(frame))
-        _raise_entry_abort_precheck("db_exact_scored_bad_rowcount")
-    missing_locked_cols = [
-        col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS
-        if col not in set(str(c) for c in frame.columns.tolist())
-    ]
-    if missing_locked_cols:
-        logger.error("[TRADE][FINAL30][LOCK][FAIL] reason=missing_scored_cols missing=%s", missing_locked_cols)
-        _raise_entry_abort_precheck("db_exact_scored_missing_critical_cols")
+    if source_name not in ALLOWED_FINAL30_SOURCES:
+        logger.error(
+            "[TRADE][FINAL30][LOCK][FAIL] reason=unsupported_source source=%s allowed=%s",
+            source_name,
+            sorted(ALLOWED_FINAL30_SOURCES),
+        )
+        _raise_entry_abort_precheck("db_exact_scored_not_loaded")
+    try:
+        _rows, info = assert_final30_contract(
+            frame,
+            as_of=as_of,
+            env=env,
+            source=f"trade.lock.{source_name}",
+            require_count=30,
+        )
+    except Exception as exc:
+        logger.exception("[TRADE][FINAL30][LOCK][FAIL] reason=contract_fail source=%s err=%s", source_name, exc)
+        _raise_entry_abort_precheck("db_exact_scored_contract_fail")
+    logger.info("[TRADE][FINAL30][LOCK][OK] source=%s rows=%s hash=%s", source_name, info.get("rows"), info.get("contract_hash"))
 
 
 def _forced_close_live_execution_enabled() -> bool:
@@ -825,8 +855,8 @@ def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: p
     source = str(run_ctx.get("final30_source") or "none")
     locked = bool(run_ctx.get("final30_locked"))
     missing_cols = [col for col in FINAL30_SCORED_DB_CONTRACT_FIELDS if col not in set(str(c) for c in frame.columns.tolist())]
-    canonical_injected = source in {"kr_canonical_artifact", "canonical", "injected_canonical"}
-    if not locked or (source != "db_pb1_watchlist_final_scored" and not canonical_injected) or rows == 0:
+    source_allowed_for_boot = source in ALLOWED_FINAL30_SOURCES or source in {"canonical", "injected_canonical"}
+    if not locked or not source_allowed_for_boot or rows == 0:
         reason = "db_exact_scored_zero_rows" if rows == 0 else "db_exact_scored_not_loaded"
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         _raise_entry_abort_precheck(reason)
@@ -885,38 +915,97 @@ def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: s
         raise RuntimeError(f"KR_FINAL30_INJECT_FAIL artifact_err={artifact_exc} db_err={db_exc}")
 
 
-def build_close_liquidation_orders_from_kis_holdings(kis_holdings: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    """Build close-liquidation SELL intents directly from KIS holdings rows."""
-    holdings = list(kis_holdings or [])
-    if not holdings:
+def _holding_code_qty(holding: dict[str, Any]) -> tuple[str, int]:
+    code = str((holding or {}).get("code") or (holding or {}).get("pdno") or (holding or {}).get("symbol") or "").strip()
+    if code and code.isdigit():
+        code = code.zfill(6)
+    try:
+        qty = int(float((holding or {}).get("qty") or (holding or {}).get("hldg_qty") or (holding or {}).get("quantity") or 0))
+    except Exception:
+        qty = 0
+    return code, qty
+
+
+def _is_accepted_order_response(resp: Any) -> bool:
+    if not isinstance(resp, dict):
+        return False
+    if str(resp.get("rt_cd") or "") == "0":
+        return True
+    status = str(resp.get("status") or resp.get("result") or "").strip().upper()
+    return status in {"ACCEPTED", "SUBMITTED", "OK"}
+
+
+def run_close_liquidation_from_kis_holdings(
+    *,
+    kis_client: Any,
+    orders_repo: Any = None,
+    env: str = "practice",
+    holdings: list[dict[str, Any]] | None = None,
+    dry_run: bool = False,
+    submit_sell_order: Any = None,
+) -> list[dict[str, Any]]:
+    """Submit close-liquidation SELLs using KIS holdings as source of truth."""
+    if holdings is None:
+        raw = {}
+        if kis_client is not None and hasattr(kis_client, "get_balance"):
+            raw = kis_client.get_balance() or {}
+        elif kis_client is not None and hasattr(kis_client, "inquire_balance"):
+            raw = kis_client.inquire_balance() or {}
+        holdings = raw.get("output1") if isinstance(raw, dict) else []
+    rows = list(holdings or [])
+    if not rows:
         logger.info("[KR_CLOSE][LIQUIDATION][SKIP] reason=NO_KIS_HOLDINGS")
         return []
-    logger.warning("[KR_CLOSE][LIQUIDATION][START] source=kis_holdings holdings=%s", len(holdings))
-    sell_orders: list[dict[str, Any]] = []
-    for holding in holdings:
-        code = str((holding or {}).get("code") or (holding or {}).get("pdno") or (holding or {}).get("symbol") or "").strip()
-        if code and code.isdigit():
-            code = code.zfill(6)
-        try:
-            qty = int(float((holding or {}).get("qty") or (holding or {}).get("hldg_qty") or (holding or {}).get("quantity") or 0))
-        except Exception:
-            qty = 0
+    logger.warning("[KR_CLOSE][LIQUIDATION][START] source=kis_holdings holdings=%s", len(rows))
+    results: list[dict[str, Any]] = []
+    for holding in rows:
+        code, qty = _holding_code_qty(holding)
         if not code or qty <= 0:
             continue
         logger.warning("[KR_CLOSE][SELL][INTENT] code=%s qty=%s reason=KR_CLOSE_LIQUIDATION_KIS_HOLDING", code, qty)
+        if dry_run:
+            results.append({"side": "SELL", "code": code, "qty": qty, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING", "source": "kis_holdings", "dry_run": True})
+            continue
         logger.info("[ORDER][API_CALL][START] side=SELL code=%s", code)
-        order = {"side": "SELL", "code": code, "qty": qty, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING", "source": "kis_holdings", "result": "ACCEPTED"}
-        logger.info("[TRADE][ORDER][SELL] code=%s result=ACCEPTED", code)
-        sell_orders.append(order)
-    if not sell_orders:
-        logger.warning("[KR_CLOSE][LIQUIDATION][NO_ORDER_CREATED] holdings=%s", len(holdings))
-    return sell_orders
+        if submit_sell_order is not None:
+            resp = submit_sell_order(
+                kis_client=kis_client,
+                orders_repo=orders_repo,
+                env=env,
+                code=code,
+                qty=qty,
+                order_type="MARKET",
+                reason="KR_CLOSE_LIQUIDATION_KIS_HOLDING",
+                source="kis_holdings",
+            )
+        elif kis_client is not None and hasattr(kis_client, "sell_stock_market"):
+            resp = kis_client.sell_stock_market(code, qty)
+        else:
+            raise RuntimeError("KIS_SELL_SUBMIT_UNAVAILABLE")
+        ok = _is_accepted_order_response(resp)
+        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        logger.info("[KIS][ORDER][RESPONSE] side=SELL code=%s rt_cd=%s msg_cd=%s msg1=%s", code, rt_cd, msg_cd, msg1)
+        logger.info("[TRADE][ORDER][SELL] code=%s result=%s", code, "ACCEPTED" if ok else "REJECTED")
+        result = dict(resp) if isinstance(resp, dict) else {"resp": resp}
+        result.update({"side": "SELL", "code": code, "qty": qty, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING", "source": "kis_holdings", "accepted": ok})
+        results.append(result)
+    if not results:
+        logger.warning("[KR_CLOSE][LIQUIDATION][NO_ORDER_CREATED] source=kis_holdings holdings=%s", len(rows))
+    return results
 
-def _is_close_or_exit_only_engine_boot(*, phase_name: str, session_kind: str) -> bool:
+
+def build_close_liquidation_orders_from_kis_holdings(kis_holdings: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Build dry-run close liquidation intents without emitting fake API success logs."""
+    return run_close_liquidation_from_kis_holdings(kis_client=None, holdings=kis_holdings, dry_run=True)
+
+def _is_close_or_exit_only_session(*, phase_name: str | None, session_kind: str | None) -> bool:
     return (
         str(phase_name or "").strip().lower() in {"exit", "close", "pm_exit_only"}
         or str(session_kind or "").strip().lower() in {"close", "exit", "trade-close"}
         or str(os.getenv("PB1_ENTRY_ENABLED", "1")).strip() == "0"
+        or str(os.getenv("ENTRY_ENABLED", "1")).strip() == "0"
     )
 
 def _guard_empty_final30_for_engine_boot(
@@ -927,7 +1016,7 @@ def _guard_empty_final30_for_engine_boot(
 ) -> pd.DataFrame:
     if precomputed_final30_df is not None and not precomputed_final30_df.empty:
         return precomputed_final30_df
-    if _is_close_or_exit_only_engine_boot(phase_name=phase_name, session_kind=session_kind):
+    if _is_close_or_exit_only_session(phase_name=phase_name, session_kind=session_kind):
         logger.warning(
             "[TRADE][ENGINE_BOOT][FINAL30_BYPASS_FOR_CLOSE_EXIT] phase=%s session_kind=%s reason=allow_kis_holdings_liquidation",
             phase_name,
@@ -3400,7 +3489,7 @@ def _load_universe_context(
             int(bool(result.get("is_scored"))),
             result_columns,
         )
-        _validate_trade_locked_final30_or_raise(final30_df=df, source_name=result_source)
+        _validate_trade_locked_final30_or_raise(final30_df=df, source_name=result_source, as_of=str(as_of), env=str(env))
 
         require_scored = os.getenv("TRADE_REQUIRE_PREP_FINAL30_SCORED", "1") == "1"
         if require_scored and not bool(result.get("is_scored")):
@@ -5327,10 +5416,19 @@ def run_once(
             setattr(ctx, "precomputed_derived_df", precomputed_derived_df)
             setattr(ctx, "precomputed_universe_df", precomputed_universe_df)
             setattr(ctx, "trade_use_precomputed_features", bool(trade_use_precomputed_features))
+        phase_name_for_lock = str(run_ctx.get("phase_name") or phase_override_arg or os.getenv("FORCE_PB1_PHASE") or "").strip().lower()
+        session_kind_for_lock = str(run_ctx.get("session_kind") or os.getenv("PB1_SESSION_KIND") or "").strip().lower()
+        is_close_or_exit_only_for_lock = _is_close_or_exit_only_session(
+            phase_name=phase_name_for_lock,
+            session_kind=session_kind_for_lock,
+        )
         if (os.getenv("MODE") or "").strip().lower() == "trade":
             _validate_trade_locked_final30_or_raise(
                 final30_df=precomputed_final30_df,
                 source_name=str(run_ctx.get("final30_source") or "none"),
+                as_of=str(run_ctx.get("derived_as_of") or as_of or ""),
+                env=str(run_ctx.get("env") or os.getenv("STRATEGY_ENV") or os.getenv("KIS_ENV") or "practice"),
+                allow_empty_for_close_exit=is_close_or_exit_only_for_lock,
             )
         if _resolve_session_kind(now) == "afternoon":
             final30_rows_for_mode = int(len(precomputed_final30_df) if isinstance(precomputed_final30_df, pd.DataFrame) else 0)
@@ -5873,6 +5971,26 @@ def run_once(
             phase_name=phase_name_for_engine,
             session_kind=session_kind_for_engine,
         )
+        close_liquidation_enabled_for_engine = str(
+            os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "1"))
+        ).strip().lower() not in {"0", "false", "no"}
+        if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
+            if close_liquidation_enabled_for_engine:
+                holdings_for_liquidation = []
+                if isinstance(balance_snapshot_raw, dict):
+                    holdings_for_liquidation = list(balance_snapshot_raw.get("output1") or [])
+                liquidation_results = run_close_liquidation_from_kis_holdings(
+                    kis_client=kis,
+                    orders_repo=orders_repo,
+                    env=env_effective,
+                    holdings=holdings_for_liquidation,
+                    dry_run=dry_run_for_engine,
+                )
+                logger.info("[KR_CLOSE][LIQUIDATION][DONE] orders=%s", len(liquidation_results))
+                return [], bool(liquidation_results), {"buy_orders": 0, "sell_orders": len(liquidation_results), "warning_counts": {}}, phase_for_log, "OK_CLOSE_LIQUIDATION"
+            logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
+            return [], True, {"buy_orders": 0, "sell_orders": 0, "warning_counts": {}}, phase_for_log, "OK_CLOSE_LIQUIDATION_DISABLED"
+
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
             phase_name_for_engine,
