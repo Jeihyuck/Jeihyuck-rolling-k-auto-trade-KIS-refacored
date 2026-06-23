@@ -24,6 +24,9 @@ permissions:
   contents: read
 
 env:
+  KR_FINAL30_SOURCE_OF_TRUTH: "db_roundtrip"
+  KR_TRADE_FINAL30_DB_FALLBACK: "1"
+  KR_BLOCK_EMPTY_FINAL30_ENGINE_BOOT: "1"
   MODE: trade
   EXPECTED_BRANCH: "dual-agent"
   TRADE_AM_WAIT_FOR_PREP: "1"

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
+
+from trader.contracts.final30_contract import assert_final30_contract
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -186,6 +188,7 @@ class KrArtifactValidationResult:
     artifact_as_of: date | None = None
     details: dict = field(default_factory=dict)
     final30_rows_payload: list[dict[str, Any]] = field(default_factory=list)
+    contract_hash: str | None = None
 
     @property
     def final30_rows(self) -> int:
@@ -382,7 +385,37 @@ def _validate_canonical_prep_artifact(*, trade_date: date, expected_as_of: date,
             return _CandidateValidation(False, "PAYLOAD_MISMATCH", p, rows=30, db_exact_rows=db_exact, details={"detail":"rank_list_mismatch"})
         if _payload_hash({"rows": first_rows}) != _payload_hash({"rows": rows}):
             return _CandidateValidation(False, "PAYLOAD_MISMATCH", p, rows=30, db_exact_rows=db_exact)
-    keep = {"payload_match": True}
+    # Validate raw artifact ranks before normalization so a broken artifact cannot be
+    # marked VALIDATE_OK and then fail later during trade injection.
+    raw_rank_reasons: list[str] = []
+    for idx, row in enumerate(first_rows or [], start=1):
+        meta = row.get("meta") if isinstance(row, dict) else {}
+        if not isinstance(meta, dict):
+            meta = {}
+        try:
+            top_rank = int(float((row or {}).get("rank_final30") or 0))
+            meta_rank = int(float(meta.get("rank_final30") or 0))
+        except Exception:
+            top_rank = meta_rank = 0
+        if top_rank != idx or meta_rank != idx or top_rank != meta_rank:
+            raw_rank_reasons.append(f"idx={idx}:top={top_rank}:meta={meta_rank}")
+    if raw_rank_reasons:
+        logger.error("[KR_ARTIFACT][VALIDATE_FAIL] reason=FINAL30_CONTRACT_FAIL details=%s", raw_rank_reasons[:5])
+        return _CandidateValidation(False, "FINAL30_CONTRACT_FAIL", first_path or finals[0], rows=30, db_exact_rows=db_exact, details={"rank_errors": raw_rank_reasons[:10]})
+    try:
+        normalized_rows, info = assert_final30_contract(first_rows or [], as_of=exp, env=env, source="artifact.validate_canonical", require_count=30)
+    except Exception as exc:
+        logger.error("[KR_ARTIFACT][VALIDATE_FAIL] reason=FINAL30_CONTRACT_FAIL details=%s", exc)
+        return _CandidateValidation(False, "FINAL30_CONTRACT_FAIL", first_path or finals[0], rows=len(first_rows or []), db_exact_rows=db_exact, details={"error": str(exc)})
+    expected_hash = None
+    for _, c in loaded_contracts:
+        if c.get("contract_hash"):
+            expected_hash = str(c.get("contract_hash"))
+            break
+    if expected_hash and expected_hash != info.get("contract_hash"):
+        logger.error("[KR_ARTIFACT][VALIDATE_FAIL] reason=CONTRACT_HASH_MISMATCH expected=%s actual=%s", expected_hash, info.get("contract_hash"))
+        return _CandidateValidation(False, "CONTRACT_HASH_MISMATCH", first_path or finals[0], rows=30, db_exact_rows=db_exact, details={"expected_hash": expected_hash, "contract_hash": info.get("contract_hash")})
+    keep = {"payload_match": True, "contract_hash": info.get("contract_hash"), "normalized_rows": normalized_rows}
     for p in (runtime_f, latest_f, runtime_c, latest_c):
         if p.exists():
             keep[p.name + "_" + str(len(keep))] = _rel(p)
@@ -422,8 +455,10 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
         if legacy_paths:
             _quarantine_or_warn_legacy(legacy_paths, trade_date=trade_date, reason="LEGACY_IGNORED_CANONICAL_OK")
             logger.warning("[KR_ARTIFACT][LEGACY_IGNORED] canonical_ok=1 paths=%s", [_rel(p) for p in legacy_paths])
-        logger.info("[KR_ARTIFACT][VALIDATE_OK] trade_date=%s expected_as_of=%s rows=%s db_exact_rows=%s source=canonical", trade_date, expected_as_of, canonical.rows, canonical.db_exact_rows)
-        return KrArtifactValidationResult(True, False, "CANONICAL_OK", source="canonical", rows=canonical.rows, db_exact_rows=canonical.db_exact_rows, legacy_blocked=bool(legacy_paths), legacy_paths=[_rel(p) for p in legacy_paths], canonical_path=_rel(canonical.path) if canonical.path else None, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details=canonical.details, final30_rows_payload=load_kr_canonical_final30_rows(canonical.path))
+        contract_hash = str((canonical.details or {}).get("contract_hash") or "")
+        logger.info("[KR_ARTIFACT][VALIDATE_OK] rows=%s db_exact_rows=%s contract_hash=%s", canonical.rows, canonical.db_exact_rows, contract_hash)
+        payload_rows = list((canonical.details or {}).get("normalized_rows") or load_kr_canonical_final30_rows(canonical.path))
+        return KrArtifactValidationResult(True, False, "CANONICAL_OK", source="canonical", rows=canonical.rows, db_exact_rows=canonical.db_exact_rows, legacy_blocked=bool(legacy_paths), legacy_paths=[_rel(p) for p in legacy_paths], canonical_path=_rel(canonical.path) if canonical.path else None, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details=canonical.details, final30_rows_payload=payload_rows, contract_hash=contract_hash)
 
     legacy_paths = _find_legacy_artifacts(expected_as_of)
     if legacy_paths and strict and not allow_legacy_fallback:
@@ -439,8 +474,11 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
     return KrArtifactValidationResult(False, True, canonical.reason if canonical.reason not in {"CONTRACT_MISSING", "FINAL30_MISSING"} else "CANONICAL_PREP_ARTIFACT_INVALID", rows=canonical.rows, db_exact_rows=canonical.db_exact_rows, detail=canonical.reason, trade_date=trade_date, expected_as_of=expected_as_of)
 
 
-def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, actual_as_of: date, env: str, final30_rows: list[dict], db_exact_rows: int, metadata: dict) -> None:
+def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, actual_as_of: date, env: str, final30_rows: list[dict], db_exact_rows: int, metadata: dict | None = None, contract_hash: str | None = None) -> None:
     logger.info("[KR_ARTIFACT][PUBLISH_START] trade_date=%s expected_as_of=%s", trade_date, expected_as_of)
+    metadata = dict(metadata or {})
+    final30_rows, info = assert_final30_contract(final30_rows, as_of=expected_as_of.isoformat(), env=env, source="artifact.publish", require_count=30)
+    contract_hash = contract_hash or str(info.get("contract_hash"))
     if len(final30_rows) != 30: raise RuntimeError("FINAL30_NOT_READY")
     if int(db_exact_rows) != 30: raise RuntimeError("DB_EXACT_ROWS_NOT_30")
     if expected_as_of != actual_as_of: raise RuntimeError("ASOF_MISMATCH")
@@ -472,7 +510,7 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
     dropped_metadata_keys = sorted(set((metadata or {}).keys()) - set(safe_metadata.keys()))
     if dropped_metadata_keys:
         logger.warning("[KR_ARTIFACT][METADATA_RESERVED_KEYS_DROPPED] keys=%s", dropped_metadata_keys)
-    contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"fresh_build","canonical":True,"rows":30,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True, **safe_metadata}
+    contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"fresh_build","canonical":True,"rows":30,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True,"contract_hash":contract_hash, **safe_metadata}
     tmps = [( _write_tmp(p, payload if "final30_scored" in p.name else contract), p) for p in (runtime_f, runtime_c, latest_f, latest_c)]
     for tmp, final in tmps: os.replace(tmp, final)
     res = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=True, strict=True, allow_legacy_fallback=False)

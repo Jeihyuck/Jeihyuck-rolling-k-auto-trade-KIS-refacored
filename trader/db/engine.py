@@ -100,7 +100,7 @@ def _apply_postgres_timeout_options(connect_args: dict) -> dict:
     existing_options = str(connect_args.get("options", "") or "").strip()
     connect_args["options"] = " ".join([opt for opt in [existing_options, *pg_options] if opt]).strip()
     logger.info(
-        "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_ms=%s",
+        "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s",
         connect_args.get("connect_timeout"),
         lock_timeout_ms,
         statement_timeout_ms,
