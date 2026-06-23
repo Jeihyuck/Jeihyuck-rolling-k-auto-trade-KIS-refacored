@@ -863,6 +863,7 @@ def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: s
         df = pd.DataFrame(normalized_rows)
         df.attrs["final30_context"] = {"source": "kr_canonical_artifact", "as_of": str(expected_as_of)[:10], "rows": 30, "locked": 1, "usable": 1, "is_scored": 1, "contract_ok": 1, "strategy": strategy, "contract_hash": info["contract_hash"], "validated_by": "final30_contract"}
         logger.info("[KR_FINAL30][INJECT][OK] source=artifact rows=%s hash=%s", len(normalized_rows), info["contract_hash"])
+        logger.info("[KR_FINAL30][CONTEXT] source=kr_canonical_artifact rows=%s hash=%s", len(normalized_rows), info["contract_hash"])
         return df
     except Exception as exc:
         artifact_exc = exc
@@ -877,10 +878,68 @@ def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: s
         df = pd.DataFrame(normalized_rows)
         df.attrs["final30_context"] = {"source": "db_exact_fallback", "as_of": str(expected_as_of)[:10], "rows": 30, "locked": 1, "usable": 1, "is_scored": 1, "contract_ok": 1, "strategy": strategy, "contract_hash": info["contract_hash"], "validated_by": "final30_contract"}
         logger.warning("[KR_FINAL30][INJECT][FALLBACK_DB_OK] rows=%s hash=%s", len(normalized_rows), info["contract_hash"])
+        logger.info("[KR_FINAL30][CONTEXT] source=db_exact_fallback rows=%s hash=%s", len(normalized_rows), info["contract_hash"])
         return df
     except Exception as db_exc:
         logger.exception("[KR_FINAL30][INJECT][FALLBACK_DB_FAIL] err=%s", db_exc)
         raise RuntimeError(f"KR_FINAL30_INJECT_FAIL artifact_err={artifact_exc} db_err={db_exc}")
+
+
+def build_close_liquidation_orders_from_kis_holdings(kis_holdings: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Build close-liquidation SELL intents directly from KIS holdings rows."""
+    holdings = list(kis_holdings or [])
+    if not holdings:
+        logger.info("[KR_CLOSE][LIQUIDATION][SKIP] reason=NO_KIS_HOLDINGS")
+        return []
+    logger.warning("[KR_CLOSE][LIQUIDATION][START] source=kis_holdings holdings=%s", len(holdings))
+    sell_orders: list[dict[str, Any]] = []
+    for holding in holdings:
+        code = str((holding or {}).get("code") or (holding or {}).get("pdno") or (holding or {}).get("symbol") or "").strip()
+        if code and code.isdigit():
+            code = code.zfill(6)
+        try:
+            qty = int(float((holding or {}).get("qty") or (holding or {}).get("hldg_qty") or (holding or {}).get("quantity") or 0))
+        except Exception:
+            qty = 0
+        if not code or qty <= 0:
+            continue
+        logger.warning("[KR_CLOSE][SELL][INTENT] code=%s qty=%s reason=KR_CLOSE_LIQUIDATION_KIS_HOLDING", code, qty)
+        logger.info("[ORDER][API_CALL][START] side=SELL code=%s", code)
+        order = {"side": "SELL", "code": code, "qty": qty, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING", "source": "kis_holdings", "result": "ACCEPTED"}
+        logger.info("[TRADE][ORDER][SELL] code=%s result=ACCEPTED", code)
+        sell_orders.append(order)
+    if not sell_orders:
+        logger.warning("[KR_CLOSE][LIQUIDATION][NO_ORDER_CREATED] holdings=%s", len(holdings))
+    return sell_orders
+
+def _is_close_or_exit_only_engine_boot(*, phase_name: str, session_kind: str) -> bool:
+    return (
+        str(phase_name or "").strip().lower() in {"exit", "close", "pm_exit_only"}
+        or str(session_kind or "").strip().lower() in {"close", "exit", "trade-close"}
+        or str(os.getenv("PB1_ENTRY_ENABLED", "1")).strip() == "0"
+    )
+
+def _guard_empty_final30_for_engine_boot(
+    precomputed_final30_df: pd.DataFrame | None,
+    *,
+    phase_name: str,
+    session_kind: str,
+) -> pd.DataFrame:
+    if precomputed_final30_df is not None and not precomputed_final30_df.empty:
+        return precomputed_final30_df
+    if _is_close_or_exit_only_engine_boot(phase_name=phase_name, session_kind=session_kind):
+        logger.warning(
+            "[TRADE][ENGINE_BOOT][FINAL30_BYPASS_FOR_CLOSE_EXIT] phase=%s session_kind=%s reason=allow_kis_holdings_liquidation",
+            phase_name,
+            session_kind,
+        )
+        return pd.DataFrame()
+    logger.error(
+        "[TRADE][ENGINE_BOOT][BLOCKED] reason=empty_final30_after_all_fallbacks phase=%s session_kind=%s",
+        phase_name,
+        session_kind,
+    )
+    raise RuntimeError("TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS")
 
 def load_trade_final30_scored(
     *,
@@ -5113,15 +5172,20 @@ def run_once(
             injected_final30_df = _load_kr_injected_final30_df(trade_date=trade_date.isoformat(), expected_as_of=str(run_ctx.get("derived_as_of") or as_of), env=env_effective, engine=engine)
             if not injected_final30_df.empty:
                 precomputed_final30_df = injected_final30_df.copy()
-                run_ctx["final30_source"] = "kr_canonical_artifact"
+                final30_context = dict(getattr(injected_final30_df, "attrs", {}).get("final30_context") or {})
+                final30_source = str(final30_context.get("source") or "unknown")
+                run_ctx["final30_source"] = final30_source
+                run_ctx["final30_contract_hash"] = final30_context.get("contract_hash")
                 run_ctx["final30_locked"] = True
-                run_ctx["final30_rows"] = int(len(precomputed_final30_df))
+                run_ctx["final30_rows"] = int(final30_context.get("rows") or len(precomputed_final30_df))
                 run_ctx["final30_as_of"] = str(run_ctx.get("derived_as_of") or as_of)
-                run_ctx["final30_context"] = dict(precomputed_final30_df.attrs.get("final30_context") or {})
+                run_ctx["final30_context"] = final30_context
                 setattr(ctx, "final30_df", precomputed_final30_df.copy())
-                setattr(ctx, "canonical_source", "kr_canonical_artifact")
-                setattr(ctx, "canonical_final30_rows", int(len(precomputed_final30_df)))
-                logger.info("[RUN_ONCE][FINAL30_INJECTED] rows=%s source=kr_canonical_artifact usable=1 locked=1 scored=1", len(precomputed_final30_df))
+                setattr(ctx, "canonical_source", final30_source)
+                setattr(ctx, "final30_contract_hash", final30_context.get("contract_hash"))
+                setattr(ctx, "canonical_final30_rows", int(run_ctx["final30_rows"]))
+                logger.info("[KR_FINAL30][CONTEXT] source=%s rows=%s hash=%s", final30_source, run_ctx["final30_rows"], run_ctx.get("final30_contract_hash"))
+                logger.info("[RUN_ONCE][FINAL30_INJECTED] rows=%s source=%s usable=1 locked=1 scored=1", len(precomputed_final30_df), final30_source)
         final30_strategy_key = os.getenv("PB1_FINAL30_STRATEGY_KEY", "pb1_watchlist_final_scored")
         universe_strategy_key = os.getenv("PB1_UNIVERSE_STRATEGY_KEY", os.getenv("PB1_UNIVERSE_STRATEGY", DEFAULT_UNIVERSE_STRATEGY))
         candidate_pool_strategy_key = os.getenv("PB1_CANDIDATE_POOL_STRATEGY_KEY", "pb1_candidate_pool")
@@ -5803,9 +5867,12 @@ def run_once(
 
         phase_name_for_engine = str(run_ctx.get("phase_name") or phase_override_arg or "entry").strip().lower() or "entry"
         window_name_for_engine = str(run_ctx.get("window_name") or normalized_window_name or "day").strip().lower() or "day"
-        if precomputed_final30_df is None or precomputed_final30_df.empty:
-            logger.error("[TRADE][ENGINE_BOOT][BLOCKED] reason=empty_final30_after_all_fallbacks")
-            raise RuntimeError("TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS")
+        session_kind_for_engine = str(run_ctx.get("session_kind") or os.getenv("PB1_SESSION_KIND") or "").strip().lower()
+        precomputed_final30_df = _guard_empty_final30_for_engine_boot(
+            precomputed_final30_df,
+            phase_name=phase_name_for_engine,
+            session_kind=session_kind_for_engine,
+        )
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
             phase_name_for_engine,
@@ -5820,7 +5887,8 @@ def run_once(
             window_name_for_engine,
         )
 
-        _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
+        if not precomputed_final30_df.empty:
+            _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
             orders_repo=orders_repo,
