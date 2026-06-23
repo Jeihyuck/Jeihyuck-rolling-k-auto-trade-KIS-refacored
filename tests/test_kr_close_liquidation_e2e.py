@@ -38,6 +38,8 @@ def test_close_path_empty_final30_allows_kis_sell_submit(monkeypatch, caplog):
 
     assert fake_kis.sell_calls == [{"code": "000660", "qty": 1, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING"}]
     assert len(results) == 1
+    assert "dry_run" not in results[0]
+    assert results[0]["result"] in {"ACCEPTED", "SUBMITTED", "OK"}
     logs = caplog.text
     assert "TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS" not in logs
     assert "DB_EXACT_FINAL30_ZERO" not in logs
@@ -45,6 +47,10 @@ def test_close_path_empty_final30_allows_kis_sell_submit(monkeypatch, caplog):
     assert "[ORDER][API_CALL][START] side=SELL code=000660" in logs
     assert "[KIS][ORDER][RESPONSE] side=SELL code=000660 rt_cd=0" in logs
     assert "[TRADE][ORDER][SELL] code=000660 result=ACCEPTED" in logs
+    assert "DRY_RUN" not in logs
+    assert "INTENT_ONLY" not in logs
+    assert "LIVE_TRADING_ENABLED=0" not in logs
+    assert "DISABLE_LIVE_TRADING" not in logs
 
 
 def test_close_path_no_holdings_skips_normally(caplog):

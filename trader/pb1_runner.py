@@ -946,12 +946,17 @@ def run_close_liquidation_from_kis_holdings(
 ) -> list[dict[str, Any]]:
     """Submit close-liquidation SELLs using KIS holdings as source of truth."""
     if holdings is None:
+        logger.warning("[KR_CLOSE][LIQUIDATION][BALANCE_RELOAD][START] source=kis_client")
         raw = {}
         if kis_client is not None and hasattr(kis_client, "get_balance"):
             raw = kis_client.get_balance() or {}
         elif kis_client is not None and hasattr(kis_client, "inquire_balance"):
             raw = kis_client.inquire_balance() or {}
-        holdings = raw.get("output1") if isinstance(raw, dict) else []
+        if isinstance(raw, dict):
+            holdings = list(raw.get("output1") or raw.get("holdings") or [])
+        else:
+            holdings = []
+        logger.warning("[KR_CLOSE][LIQUIDATION][BALANCE_RELOAD][DONE] holdings=%s", len(holdings or []))
     rows = list(holdings or [])
     if not rows:
         logger.info("[KR_CLOSE][LIQUIDATION][SKIP] reason=NO_KIS_HOLDINGS")
@@ -989,7 +994,7 @@ def run_close_liquidation_from_kis_holdings(
         logger.info("[KIS][ORDER][RESPONSE] side=SELL code=%s rt_cd=%s msg_cd=%s msg1=%s", code, rt_cd, msg_cd, msg1)
         logger.info("[TRADE][ORDER][SELL] code=%s result=%s", code, "ACCEPTED" if ok else "REJECTED")
         result = dict(resp) if isinstance(resp, dict) else {"resp": resp}
-        result.update({"side": "SELL", "code": code, "qty": qty, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING", "source": "kis_holdings", "accepted": ok})
+        result.update({"side": "SELL", "code": code, "qty": qty, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING", "source": "kis_holdings", "accepted": ok, "result": "ACCEPTED" if ok else "REJECTED"})
         results.append(result)
     if not results:
         logger.warning("[KR_CLOSE][LIQUIDATION][NO_ORDER_CREATED] source=kis_holdings holdings=%s", len(rows))
@@ -5976,9 +5981,15 @@ def run_once(
         ).strip().lower() not in {"0", "false", "no"}
         if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
             if close_liquidation_enabled_for_engine:
-                holdings_for_liquidation = []
+                holdings_for_liquidation = None
                 if isinstance(balance_snapshot_raw, dict):
-                    holdings_for_liquidation = list(balance_snapshot_raw.get("output1") or [])
+                    snapshot_holdings = balance_snapshot_raw.get("output1") or []
+                    if snapshot_holdings:
+                        holdings_for_liquidation = list(snapshot_holdings)
+                if holdings_for_liquidation is None:
+                    logger.warning("[KR_CLOSE][LIQUIDATION][BALANCE_RELOAD] reason=missing_or_empty_snapshot source=kis_client")
+                else:
+                    logger.info("[KR_CLOSE][LIQUIDATION][BALANCE_SNAPSHOT] holdings=%s", len(holdings_for_liquidation))
                 liquidation_results = run_close_liquidation_from_kis_holdings(
                     kis_client=kis,
                     orders_repo=orders_repo,

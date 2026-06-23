@@ -1,10 +1,10 @@
 # yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
-# DISABLED: trade-close는 trade-afternoon으로 통합되었습니다.
-# PM + Close 실행은 trade-afternoon.yml에서 처리합니다.
-# 이 워크플로우는 watchdog emergency backup으로만 존재하며 정상 운영 중 실행되지 않아야 합니다.
-# session_kind=close는 내부에서 afternoon으로 normalize됩니다.
-# Exit phase only. New BUY orders are forbidden.
-name: "Trade Close (DISABLED - use trade-afternoon)"
+# KR trade-close emergency liquidation backup
+# This workflow is a practice-account actual SELL liquidation backup.
+# It is close/exit-only and must not create BUY orders.
+# It may submit real KIS practice SELL orders when KIS holdings exist.
+# final30 may be empty in close/exit mode; liquidation uses KIS holdings as source of truth.
+name: "Trade Close Practice Actual Liquidation Backup"
 
 "on":
   workflow_dispatch:
@@ -68,11 +68,11 @@ env:
   PB1_SESSION_EXIT_GRACE_SEC: "15"
   PB1_TICK_HARD_TIMEOUT_SEC: "45"
 
-  STRATEGY_MODE: "INTENT_ONLY"
-  FORCE_STRATEGY_MODE: "INTENT_ONLY"
-  DRY_RUN: "1"
-  DISABLE_LIVE_TRADING: "1"
-  LIVE_TRADING_ENABLED: "0"
+  STRATEGY_MODE: "LIVE"
+  FORCE_STRATEGY_MODE: "LIVE"
+  DRY_RUN: "0"
+  DISABLE_LIVE_TRADING: "0"
+  LIVE_TRADING_ENABLED: "1"
   FORCE_BLOCK_LIVE: "0"
   ALLOW_LIVE_GATE: "1"
   KIS_HTTP_ENABLED: "1"
@@ -130,6 +130,7 @@ env:
   DB_LOCK_TIMEOUT_MS: "5000"
   DB_STATEMENT_TIMEOUT_MS: "15000"
   DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+  DB_IDLE_IN_TX_TIMEOUT_MS: "15000"
   DB_CONNECT_TIMEOUT_SEC: "5"
   PB1_CURRENT_PRICE_CACHE_TTL_SEC: "30"
   PB1_CURRENT_PRICE_MAX_AGE_SEC: "180"
@@ -589,8 +590,8 @@ jobs:
           PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           PB1_ORDER_BLOCK_REASON: ${{ steps.order_mode_guard.outputs.reason }}
           NO_TRADE: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
-          DISABLE_LIVE_TRADING: "1"
-          LIVE_TRADING_ENABLED: "0"
+          DISABLE_LIVE_TRADING: "0"
+          LIVE_TRADING_ENABLED: "1"
           KIS_HTTP_ENABLED: "1"
         run: |
           set -euo pipefail
