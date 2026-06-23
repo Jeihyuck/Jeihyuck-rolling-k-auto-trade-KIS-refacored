@@ -124,6 +124,7 @@ __all__ = [
     "load_watchlist_scored",
     "load_final30_scored_exact",
     "load_final30_scored_db_only",
+    "load_exact_final30_scored",
     "FLOW_OPTIONAL_COLS",
     "REQUIRED_FINAL30_SCORED_COLS",
     "FINAL30_SCORED_PERSIST_COLS",
@@ -6656,6 +6657,39 @@ def load_final30_scored_db_only(
     )
     return df
 
+
+
+def load_exact_final30_scored(
+    engine: Engine,
+    *,
+    env: str,
+    as_of: date | str,
+    strategy: str = "pb1_watchlist_final_scored",
+) -> list[dict]:
+    """Load exact final30 rows for trade fallback; fail closed unless rows are 1..30."""
+    try:
+        df = load_final30_scored_db_only(
+            engine, env=env, as_of=as_of, strategy=strategy, require_exact_rows=30, fail_if_missing=True
+        )
+    except Exception as exc:
+        logger.exception("[DB][FINAL30_EXACT][LOAD_FAIL] env=%s as_of=%s strategy=%s err=%s", env, as_of, strategy, exc)
+        return []
+    rows = [dict(r or {}) for r in df.to_dict(orient="records")]
+    ranks = []
+    for r in rows:
+        try:
+            ranks.append(int(float(r.get("rank_final30") or 0)))
+        except Exception:
+            ranks.append(0)
+    rank_ok = len(rows) == 30 and ranks == list(range(1, 31))
+    logger.info(
+        "[DB][FINAL30_EXACT][LOAD] env=%s as_of=%s strategy=%s rows=%s rank_min=%s rank_max=%s unique=%s rank_ok=%s",
+        env, as_of, strategy, len(rows), min(ranks) if ranks else None, max(ranks) if ranks else None, len(set(ranks)), int(rank_ok),
+    )
+    if not rank_ok:
+        logger.error("[DB][FINAL30_EXACT][CONTRACT_FAIL] env=%s as_of=%s strategy=%s rows=%s ranks=%s", env, as_of, strategy, len(rows), ranks)
+        return []
+    return rows
 
 def verify_final30_scored_contract(
     engine: Engine,

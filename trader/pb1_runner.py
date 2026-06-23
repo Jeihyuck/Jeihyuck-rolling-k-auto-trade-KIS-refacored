@@ -14,6 +14,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
+from trader.contracts.final30_contract import assert_final30_contract
 from trader.final30_quality import (
     format_final30_abort_message,
     normalize_final30_contract_row,
@@ -833,14 +834,21 @@ def _assert_engine_boot_locked_final30(*, run_ctx: dict[str, Any], final30_df: p
         reason = "db_exact_scored_bad_rowcount" if rows != 30 else "db_exact_scored_missing_critical_cols"
         logger.error("[PB1][ENTRY][ABORT] reason=%s", reason)
         _raise_entry_abort_precheck(reason)
-    logger.info("[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s", rows)
+    boot_rows, boot_info = assert_final30_contract(frame, as_of=str(run_ctx.get("derived_as_of") or run_ctx.get("as_of") or ""), env=str(run_ctx.get("env") or os.getenv("KIS_ENV") or "practice"), source="trade.engine_boot", require_count=30)
+    frame = pd.DataFrame(boot_rows)
+    logger.info(
+        "[TRADE][ENGINE_BOOT][FINAL30_OK] rows=%s rank_min=%s rank_max=%s unique=%s hash=%s",
+        len(frame), int(frame["rank_final30"].min()), int(frame["rank_final30"].max()), int(frame["rank_final30"].nunique()), boot_info["contract_hash"],
+    )
 
 
-def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: str) -> pd.DataFrame:
+def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: str, engine=None) -> pd.DataFrame:
     if str(os.getenv("KR_INJECT_CANONICAL_FINAL30", "1")).strip().lower() in {"0", "false", "no"}:
         return pd.DataFrame()
+    strategy = os.getenv("PB1_FINAL30_STRATEGY_KEY") or os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY") or "pb1_watchlist_final_scored"
+    artifact_exc: Exception | None = None
     try:
-        from trader.kr.artifacts import validate_kr_prep_artifact, normalize_and_validate_scored_final30
+        from trader.kr.artifacts import validate_kr_prep_artifact
         art = validate_kr_prep_artifact(
             trade_date=date.fromisoformat(str(trade_date)[:10]),
             expected_as_of=date.fromisoformat(str(expected_as_of)[:10]),
@@ -848,37 +856,31 @@ def _load_kr_injected_final30_df(*, trade_date: str, expected_as_of: str, env: s
             strict=True,
             allow_legacy_fallback=False,
         )
+        if not art.ok:
+            raise RuntimeError(f"KR_ARTIFACT_NOT_OK:{art.reason}")
         rows = list(getattr(art, "final30_rows_payload", []) or [])
-        if art.ok and rows:
-            normalized, contract = normalize_and_validate_scored_final30(
-                rows,
-                expected_as_of=str(expected_as_of)[:10],
-                require_exact_rows=30,
-                source="kr_canonical_artifact",
-            )
-            if int(contract.get("contract_ok") or 0) != 1:
-                raise RuntimeError(f"KR_CANONICAL_FINAL30_CONTRACT_FAIL:{contract.get('reasons')}")
-            df = pd.DataFrame(normalized)
-            df.attrs["final30_context"] = {
-                "source": "kr_canonical_artifact",
-                "as_of": str(expected_as_of)[:10],
-                "rows": 30,
-                "locked": 1,
-                "usable": 1,
-                "is_scored": 1,
-                "contract_ok": 1,
-                "strategy": os.getenv("PB1_FINAL30_STRATEGY_KEY", "pb1_watchlist_final_scored"),
-                "validated_by": "kr_artifact_validate",
-            }
-            logger.info(
-                "[KR_FINAL30][INJECT] source=canonical rows=%s as_of=%s contract_ok=1 usable=1 locked=1",
-                len(df), expected_as_of,
-            )
-            return df
+        normalized_rows, info = assert_final30_contract(rows, as_of=str(expected_as_of)[:10], env=env, source="trade.inject.artifact", require_count=30)
+        df = pd.DataFrame(normalized_rows)
+        df.attrs["final30_context"] = {"source": "kr_canonical_artifact", "as_of": str(expected_as_of)[:10], "rows": 30, "locked": 1, "usable": 1, "is_scored": 1, "contract_ok": 1, "strategy": strategy, "contract_hash": info["contract_hash"], "validated_by": "final30_contract"}
+        logger.info("[KR_FINAL30][INJECT][OK] source=artifact rows=%s hash=%s", len(normalized_rows), info["contract_hash"])
+        return df
     except Exception as exc:
-        logger.warning("[KR_FINAL30][INJECT][SKIP] err=%s", exc)
-    return pd.DataFrame()
+        artifact_exc = exc
+        logger.exception("[KR_FINAL30][INJECT][ARTIFACT_FAIL] err=%s -> trying_db_fallback=1", exc)
 
+    try:
+        if engine is None:
+            raise RuntimeError("DB_ENGINE_MISSING_FOR_FINAL30_FALLBACK")
+        from trader.db.repos import load_exact_final30_scored
+        db_rows = load_exact_final30_scored(engine, env=env, as_of=str(expected_as_of)[:10], strategy=strategy)
+        normalized_rows, info = assert_final30_contract(db_rows, as_of=str(expected_as_of)[:10], env=env, source="trade.inject.db_fallback", require_count=30)
+        df = pd.DataFrame(normalized_rows)
+        df.attrs["final30_context"] = {"source": "db_exact_fallback", "as_of": str(expected_as_of)[:10], "rows": 30, "locked": 1, "usable": 1, "is_scored": 1, "contract_ok": 1, "strategy": strategy, "contract_hash": info["contract_hash"], "validated_by": "final30_contract"}
+        logger.warning("[KR_FINAL30][INJECT][FALLBACK_DB_OK] rows=%s hash=%s", len(normalized_rows), info["contract_hash"])
+        return df
+    except Exception as db_exc:
+        logger.exception("[KR_FINAL30][INJECT][FALLBACK_DB_FAIL] err=%s", db_exc)
+        raise RuntimeError(f"KR_FINAL30_INJECT_FAIL artifact_err={artifact_exc} db_err={db_exc}")
 
 def load_trade_final30_scored(
     *,
@@ -4877,7 +4879,10 @@ def run_once(
         return max(0.0, deadline_ts - time_mod.monotonic())
 
     remaining_s = _remaining_seconds()
-    exit_short_circuit = phase_for_log == "exit" or window_label == "close"
+    close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "1"))).strip().lower() not in {"0", "false", "no"}
+    exit_short_circuit = (phase_for_log == "exit" or window_label == "close") and not close_liquidation_enabled
+    if (phase_for_log == "exit" or window_label == "close") and close_liquidation_enabled:
+        logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled skip_exit_shortcircuit=1")
 
     def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
         checkpoint_key = _close_reconcile_checkpoint_key(
@@ -5105,7 +5110,7 @@ def run_once(
     try:
         injected_final30_df = pd.DataFrame()
         if str(os.getenv("MARKET") or os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or str(os.getenv("PB1_SESSION") or "") in {"am", "afternoon"}:
-            injected_final30_df = _load_kr_injected_final30_df(trade_date=trade_date.isoformat(), expected_as_of=str(run_ctx.get("derived_as_of") or as_of), env=env_effective)
+            injected_final30_df = _load_kr_injected_final30_df(trade_date=trade_date.isoformat(), expected_as_of=str(run_ctx.get("derived_as_of") or as_of), env=env_effective, engine=engine)
             if not injected_final30_df.empty:
                 precomputed_final30_df = injected_final30_df.copy()
                 run_ctx["final30_source"] = "kr_canonical_artifact"
@@ -5798,14 +5803,9 @@ def run_once(
 
         phase_name_for_engine = str(run_ctx.get("phase_name") or phase_override_arg or "entry").strip().lower() or "entry"
         window_name_for_engine = str(run_ctx.get("window_name") or normalized_window_name or "day").strip().lower() or "day"
-        logger.info(
-            "[TRADE][ENGINE_BOOT][PRECHECK_OK] final30_rows=%s balance_state=%s gate_order_allowed=%s phase=%s window=%s",
-            int(len(precomputed_final30_df) if isinstance(precomputed_final30_df, pd.DataFrame) else 0),
-            balance_state,
-            int(bool(order_allowed)),
-            phase_name_for_engine,
-            window_name_for_engine,
-        )
+        if precomputed_final30_df is None or precomputed_final30_df.empty:
+            logger.error("[TRADE][ENGINE_BOOT][BLOCKED] reason=empty_final30_after_all_fallbacks")
+            raise RuntimeError("TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS")
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
             phase_name_for_engine,

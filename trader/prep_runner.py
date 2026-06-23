@@ -24,6 +24,7 @@ from trader.db.health import assert_db_ready
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
     FINAL30_SCORED_REQUIRED_ROWS,
+    load_exact_final30_scored,
     LedgerEventsRepo,
     UniverseRepo,
     WatchlistRepo,
@@ -72,6 +73,7 @@ from trader.time_utils import (
 )
 from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
 from trader.kr.artifacts import publish_kr_prep_artifacts_atomic, quarantine_stale_kr_artifacts
+from trader.contracts.final30_contract import assert_final30_contract
 from trader.kr.market_scope import is_kr_market
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
@@ -2121,6 +2123,14 @@ def main() -> int:
         final30_scored_df_for_export["flow_provider_usage_none"] = int(_flow_usage.get("none", 0))
         final30_scored_df_for_export["flow_failure_reasons"] = json.dumps({k: int(v) for k, v in _flow_reasons.items() if k}, ensure_ascii=False)
 
+    normalized_rows, normalized_info = assert_final30_contract(
+        final30_scored_df_for_export,
+        as_of=as_of.isoformat(),
+        env=env,
+        source="prep.before_db_save",
+        require_count=30,
+    )
+    final30_scored_df_for_export = pd.DataFrame(normalized_rows)
     logger.info("[PREP][DONE_CORE][START] as_of=%s", as_of.isoformat())
     core_save_result = save_final30_scored_core(
         final30_scored_df_for_export,
@@ -2132,6 +2142,18 @@ def main() -> int:
         watchlist_rows=watchlist,
     )
     exact_final_rows = list(core_save_result.get("exact_final_rows") or [])
+    db_roundtrip_rows = load_exact_final30_scored(
+        engine, env=env, as_of=as_of, strategy=watchlist_final_scored_strategy
+    )
+    canonical_rows, canonical_info = assert_final30_contract(
+        db_roundtrip_rows,
+        as_of=as_of.isoformat(),
+        env=env,
+        source="prep.db_roundtrip",
+        require_count=30,
+    )
+    final30_scored_df_for_export = pd.DataFrame(canonical_rows)
+    logger.info("[PREP][FINAL30_SOURCE_OF_TRUTH] source=db_roundtrip rows=%s hash=%s", len(canonical_rows), canonical_info["contract_hash"])
     scored_contract = dict(core_save_result.get("scored_contract") or {})
     final30_file_results = dict(core_save_result.get("file_results") or {})
     final30_files_validation = dict(core_save_result.get("validation") or {})
@@ -2148,16 +2170,18 @@ def main() -> int:
     logger.info("[WATCHLIST][BUILD][DONE] final30=%s", len(final30_scored_df_for_export))
     if kr_market:
         try:
-            final30_payload_rows = to_jsonable(final30_scored_df_for_export.to_dict(orient="records"))
+            final30_payload_rows = to_jsonable(canonical_rows)
             publish_kr_prep_artifacts_atomic(
                 trade_date=trade_date,
                 expected_as_of=as_of,
                 actual_as_of=as_of,
                 env=env,
                 final30_rows=final30_payload_rows,
-                db_exact_rows=int(core_save_result.get("db_rows") or 0),
+                db_exact_rows=len(canonical_rows),
                 metadata={"run_id": run_id},
+                contract_hash=canonical_info["contract_hash"],
             )
+            logger.info("[PREP][FINAL30_ARTIFACT_PUBLISH] rows=%s hash=%s", len(canonical_rows), canonical_info["contract_hash"])
             logger.info("[KR_PREP][SUCCESS] trade_date=%s expected_as_of=%s rows=30", trade_date, as_of)
         except Exception as exc:
             logger.exception("[KR_ARTIFACT][PUBLISH_FAIL] reason=%s", exc)
@@ -3013,8 +3037,10 @@ def main() -> int:
         mirror_sync = sync_prep_final30_file_mirror(
             env=env,
             as_of=as_of.isoformat(),
-            df=final30_scored_df_for_export,
+            df=pd.DataFrame(canonical_rows) if 'canonical_rows' in locals() else final30_scored_df_for_export,
         )
+        if 'canonical_info' in locals():
+            logger.info("[PREP][FINAL30_MIRROR_SYNC] rows=%s hash=%s", len(canonical_rows), canonical_info["contract_hash"])
         final30_file_results = dict(mirror_sync.get("file_results") or {})
         final30_files_validation = dict(mirror_sync.get("validation") or {})
         final30_file_failures = list(dict.fromkeys(list(final30_file_failures) + list(final30_files_validation.get("errors") or [])))
