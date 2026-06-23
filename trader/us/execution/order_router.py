@@ -110,6 +110,24 @@ def route_order(
 
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
+    symbol_upper = str(symbol or "").upper().strip()
+    position_action = (
+        intent.get("position_action")
+        or (intent.get("meta") or {}).get("position_action")
+        or ""
+    )
+    current_position_symbols_upper = {str(s).upper().strip() for s in current_position_symbols or set()}
+    is_existing_position_buy = (
+        side == "BUY"
+        and (
+            position_action == "ADD_TO_EXISTING_BUY"
+            or (current_position_symbols is not None and symbol_upper in current_position_symbols_upper)
+        )
+    )
+    logger.info(
+        "[US_ORDER][POSITION_ACTION] symbol=%s side=%s position_action=%s is_existing_position_buy=%d",
+        symbol_upper, side, position_action, int(is_existing_position_buy),
+    )
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
     exchange = intent.get("exchange", "NASDAQ")
@@ -179,7 +197,7 @@ def route_order(
     # 3. 중복 key: DB + in-memory 합산
 
     # 3. Risk Gate
-    gate_intent = {**intent, "client_order_key": order_key}
+    gate_intent = {**intent, "client_order_key": order_key, "position_action": position_action}
     try:
         assert_order_allowed(
             gate_intent,
@@ -191,6 +209,7 @@ def route_order(
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
             trade_date=trade_date,
+            is_existing_position_buy=is_existing_position_buy,
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
@@ -221,7 +240,7 @@ def route_order(
                 )
                 
                 # risk gate 재시도
-                resized_gate_intent = {**resized_intent, "client_order_key": order_key}
+                resized_gate_intent = {**resized_intent, "client_order_key": order_key, "position_action": position_action}
                 try:
                     assert_order_allowed(
                         resized_gate_intent,
@@ -233,6 +252,7 @@ def route_order(
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,
                         trade_date=trade_date,
+                        is_existing_position_buy=is_existing_position_buy,
                     )
                     
                     # 재시도 성공: 축소된 intent로 계속 진행

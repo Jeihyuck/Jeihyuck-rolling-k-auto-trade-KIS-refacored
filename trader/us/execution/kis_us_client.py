@@ -107,6 +107,34 @@ _TOKEN_CACHE: dict[str, Any] = {
 }
 
 
+def _token_cache_paths(env: str) -> tuple[Path, Path]:
+    from pathlib import Path
+    safe_env = str(env or "practice").lower().replace("/", "_")
+    base = Path("runtime/kis")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"token_cache_us_{safe_env}.json", base / f"token_refresh_us_{safe_env}.lock"
+
+
+def _read_token_file(env: str) -> dict[str, Any]:
+    cache_path, _ = _token_cache_paths(env)
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        exp = datetime.fromisoformat(str(data.get("expires_at")))
+        token = data.get("access_token")
+        if token and datetime.utcnow() < exp - timedelta(minutes=5):
+            return {"access_token": token, "expires_at": exp}
+    except Exception:
+        pass
+    return {}
+
+
+def _write_token_file(env: str, token: str, expires_at: datetime) -> None:
+    cache_path, _ = _token_cache_paths(env)
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"access_token": token, "expires_at": expires_at.isoformat()}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(cache_path)
+
+
 class KisUSClientError(Exception):
     """KIS US API 오류."""
 
@@ -149,17 +177,42 @@ class KisUSClient:
     # ------------------------------------------------------------------
 
     def get_access_token(self) -> str:
-        """액세스 토큰 반환 (캐시 / 갱신)."""
+        """액세스 토큰 반환 (in-process cache + process-safe file cache / refresh lock)."""
         self._assert_not_offline("get_access_token")
         now = datetime.utcnow()
         if _TOKEN_CACHE["access_token"] and _TOKEN_CACHE["expires_at"]:
             if now < _TOKEN_CACHE["expires_at"] - timedelta(minutes=5):
                 return _TOKEN_CACHE["access_token"]  # type: ignore
 
-        token = self._request_new_token()
-        _TOKEN_CACHE["access_token"] = token
-        _TOKEN_CACHE["expires_at"] = now + timedelta(hours=23)
-        return token
+        file_cached = _read_token_file(self._env)
+        if file_cached:
+            _TOKEN_CACHE.update(file_cached)
+            logger.info("[US_AUTH][CACHE] source=file env=%s", self._env)
+            return file_cached["access_token"]
+
+        import fcntl
+        _, lock_path = _token_cache_paths(self._env)
+        with lock_path.open("w", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            file_cached = _read_token_file(self._env)
+            if file_cached:
+                _TOKEN_CACHE.update(file_cached)
+                logger.info("[US_AUTH][CACHE_AFTER_LOCK] source=file env=%s", self._env)
+                return file_cached["access_token"]
+            try:
+                token = self._request_new_token()
+            except Exception as exc:
+                fallback = _read_token_file(self._env)
+                if fallback:
+                    _TOKEN_CACHE.update(fallback)
+                    logger.warning("[US_AUTH][TOKENP_FALLBACK] source=file env=%s err=%s", self._env, exc)
+                    return fallback["access_token"]
+                raise KisUSTemporaryError(f"[US_AUTH][TEMP_ERROR] tokenP failed: {exc}") from exc
+            expires_at = datetime.utcnow() + timedelta(hours=23)
+            _TOKEN_CACHE["access_token"] = token
+            _TOKEN_CACHE["expires_at"] = expires_at
+            _write_token_file(self._env, token, expires_at)
+            return token
 
     def _request_new_token(self) -> str:
         self._assert_not_offline("_request_new_token")

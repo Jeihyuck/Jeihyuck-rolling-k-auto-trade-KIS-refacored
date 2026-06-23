@@ -122,10 +122,15 @@ def check_daily_notional(
         )
 
 
-def check_position_count(current_count: int, symbol: str = "") -> None:
+def check_position_count(
+    current_count: int,
+    symbol: str = "",
+    *,
+    reason: str = "max_positions_reached",
+) -> None:
     limit = int(os.getenv("US_MAX_POSITIONS", "10"))
     if current_count >= limit:
-        _block("max_positions_reached", symbol=symbol, count=current_count, limit=limit)
+        _block(reason, symbol=symbol, count=current_count, limit=limit)
 
 
 def check_position_weight(
@@ -363,6 +368,7 @@ def assert_order_allowed(
     allowed_symbols: "set[str] | None" = None,
     current_position_symbols: "set[str] | None" = None,
     trade_date: str | None = None,
+    is_existing_position_buy: bool = False,
 ) -> None:
     """Order intent의 전체 위험 점검.
 
@@ -411,7 +417,19 @@ def assert_order_allowed(
 
         check_notional(notional_usd, symbol=symbol)
         check_daily_notional(notional_usd, current_daily_notional_usd, symbol=symbol)
-        check_position_count(current_position_count, symbol=symbol)
+        if is_existing_position_buy:
+            logger.info(
+                "[US_RISK][POSITION_COUNT_SKIP] symbol=%s reason=existing_position_add_buy count=%s limit=%s",
+                symbol,
+                current_position_count,
+                os.getenv("US_MAX_POSITIONS", "30"),
+            )
+        else:
+            check_position_count(
+                current_position_count,
+                symbol=symbol,
+                reason="max_positions_reached_new_symbol",
+            )
         check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol)
         check_cash_buffer(available_cash_usd, notional_usd, symbol=symbol)
 

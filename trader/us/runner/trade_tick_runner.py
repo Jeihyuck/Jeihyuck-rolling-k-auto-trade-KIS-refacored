@@ -181,6 +181,21 @@ def run_trade_tick(
 
     # ── 장 phase 확인 ─────────────────────────────────────────────────────────
     phase = market_phase(now)
+    if session == "am" and phase == "PREMARKET":
+        regular_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        seconds_to_open = int((regular_open - now).total_seconds())
+        grace = int(os.getenv("US_OPEN_RECHECK_GRACE_SEC", "10"))
+        if 0 <= seconds_to_open <= grace:
+            logger.info(
+                "[US_MARKET_PHASE][WAIT_UNTIL_OPEN] session=%s seconds_to_open=%d grace=%d",
+                session, seconds_to_open, grace,
+            )
+            if not force_now:
+                time.sleep(seconds_to_open + 1)
+                now = now_ny()
+                phase = market_phase(now)
+            else:
+                logger.info("[US_MARKET_PHASE][FORCE_NOW_NO_SLEEP]")
     if phase not in ("REGULAR_OPEN", "REGULAR_MID", "REGULAR_CLOSE"):
         logger.info("[US_TICK][SKIP] market not open phase=%s", phase)
         return {
@@ -412,7 +427,9 @@ def run_trade_tick(
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
-    if recon_positions:
+    if recon.get("preserve_previous_positions"):
+        logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
+    elif recon_positions:
         try:
             save_position_snapshot(recon_positions)
         except Exception as exc:
@@ -989,8 +1006,21 @@ def run_trade_tick(
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):
                 daily_notional += float(intent.get("notional_usd", 0))
-                if intent.get("side") == "BUY":
-                    position_count += 1
+                if str(intent.get("side", "")).upper() == "BUY":
+                    symbol_upper = str(intent.get("symbol", "")).upper().strip()
+                    position_action = (
+                        intent.get("position_action")
+                        or (intent.get("meta") or {}).get("position_action")
+                        or ""
+                    )
+                    if position_action == "NEW_POSITION_BUY" and symbol_upper not in current_position_symbols:
+                        position_count += 1
+                        current_position_symbols.add(symbol_upper)
+                    else:
+                        logger.info(
+                            "[US_TICK][POSITION_COUNT_NOT_INCREMENTED] symbol=%s position_action=%s current_count=%d",
+                            symbol_upper, position_action, position_count,
+                        )
         except Exception as exc:
             logger.warning("[US_ORDER][ROUTE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})

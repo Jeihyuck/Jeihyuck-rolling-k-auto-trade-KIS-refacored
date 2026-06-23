@@ -666,6 +666,7 @@ def generate_entry_intents(
             price = existing_price
 
         position_state_for_order = (entry_meta or {}).get("position_state", "NOT_HELD")
+        position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
         if position_state_for_order == "HELD":
             allow_add = os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
             allow_avg_down = os.getenv("US_ALLOW_AVERAGING_DOWN", "0") in {"1", "true", "TRUE", "yes", "YES"}
@@ -721,7 +722,7 @@ def generate_entry_intents(
                 continue
             qty = sizing["qty"]
             notional = sizing["notional_usd"]
-            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed pnl_pct=%.4f current_weight=%.4f", symbol, pnl_pct, sizing.get("current_weight", 0.0))
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed position_action=%s pnl_pct=%.4f current_weight=%.4f", symbol, position_action, pnl_pct, sizing.get("current_weight", 0.0))
         else:
             sizing = calc_position_size(
                 price=price,
@@ -741,7 +742,7 @@ def generate_entry_intents(
 
             qty = sizing["qty"]
             notional = sizing["notional_usd"]
-            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=NOT_HELD action=NEW_BUY", symbol)
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=NOT_HELD action=NEW_BUY position_action=%s", symbol, position_action)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
 
@@ -841,6 +842,8 @@ def generate_entry_intents(
             "symbol": symbol,
             "exchange": exchange,
             "side": "BUY",
+            "position_state": position_state_for_order,
+            "position_action": position_action,
             "qty": qty,
             "limit_price": limit_price,
             "notional_usd": notional,
@@ -871,6 +874,8 @@ def generate_entry_intents(
                 "entry_signal_type": _resolve_entry_signal_type(entry_meta),
                 "partial_exit_allowed": os.getenv("US_SELL_PARTIAL_ALLOWED", "0") == "1",
                 "source": "locked_watchlist",
+                "position_state": position_state_for_order,
+                "position_action": position_action,
                 "schema_version": 1,
             },
         }
@@ -935,7 +940,7 @@ def generate_entry_intents(
         "order_cap_qty_zero",
         "intent_notional_exceeds_order_cap_after_sizing",
     )
-    skipped_max_positions_reached = _sr("max_positions_reached")
+    skipped_max_positions_reached = _sr("max_positions_reached") + _sr("max_positions_reached_new_symbol")
     skipped_insufficient_cash = _sr("insufficient_cash")
 
     logger.info(

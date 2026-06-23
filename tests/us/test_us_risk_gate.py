@@ -234,3 +234,50 @@ class TestCheckSymbolContract:
             allowed_symbols={"AAAA"},  # sym이 없는 watchlist
             current_position_symbols=positions,
         )
+
+
+def test_add_to_existing_buy_skips_max_positions(monkeypatch, caplog):
+    monkeypatch.setenv("US_MAX_POSITIONS", "30")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "10000")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "1.0")
+    intent = {
+        "symbol": "DELL", "exchange": "NYSE", "side": "BUY", "qty": 1,
+        "notional_usd": 100.0, "limit_price": 100.0, "client_order_key": "add-buy",
+        "position_action": "ADD_TO_EXISTING_BUY",
+    }
+    caplog.set_level("INFO")
+    assert_order_allowed(
+        intent,
+        current_position_count=30,
+        available_cash_usd=1000.0,
+        total_portfolio_usd=10000.0,
+        allowed_symbols={"DELL"},
+        current_position_symbols={"DELL", "AMD"},
+        is_existing_position_buy=True,
+    )
+    assert "[US_RISK][POSITION_COUNT_SKIP]" in caplog.text
+
+
+def test_new_position_buy_blocks_at_max_positions(monkeypatch):
+    monkeypatch.setenv("US_MAX_POSITIONS", "30")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "2500")
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "10000")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "1.0")
+    intent = {
+        "symbol": "FLEX", "exchange": "NASDAQ", "side": "BUY", "qty": 1,
+        "notional_usd": 100.0, "limit_price": 100.0, "client_order_key": "new-buy",
+        "position_action": "NEW_POSITION_BUY",
+    }
+    with pytest.raises(RiskGateBlocked, match="max_positions_reached_new_symbol"):
+        assert_order_allowed(
+            intent,
+            current_position_count=30,
+            available_cash_usd=1000.0,
+            total_portfolio_usd=10000.0,
+            allowed_symbols={"FLEX"},
+            current_position_symbols={"DELL", "AMD"},
+            is_existing_position_buy=False,
+        )

@@ -15,6 +15,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures
 import json
 import logging
@@ -311,11 +312,30 @@ def run_trade_session(
 
     # ── 파일 기반 session guard 체크 ─────────────────────────────────────────
     from trader.us.utils.session_guard import (
+        acquire_us_session_running_lock,
+        release_us_session_running_lock,
         check_us_session_file_guard,
         now_et_iso,
         write_us_session_done_file,
     )
     session_started_at_et = now_et_iso()
+
+    running_lock = acquire_us_session_running_lock(trade_date, session, run_id)
+    if running_lock.get("acquired"):
+        atexit.register(release_us_session_running_lock, trade_date, session, run_id)
+    if not running_lock.get("acquired"):
+        logger.warning(
+            "[US_SESSION][SKIP_DUPLICATE_RUNNING] session=%s trade_date=%s reason=%s",
+            session, trade_date, running_lock.get("reason"),
+        )
+        return {
+            "status": "SKIP",
+            "reason": "duplicate_session_running",
+            "detail_status": "SKIP_DUPLICATE_RUNNING",
+            "session": session,
+            "trade_date": trade_date,
+            "tick_count": 0,
+        }
 
     _file_guard = check_us_session_file_guard(trade_date, session)
     if (force_now or offline) and _file_guard["already_ran"]:
@@ -350,6 +370,7 @@ def run_trade_session(
             _actual_start_et,
             _delay_seconds,
         )
+        release_us_session_running_lock(trade_date, session, run_id=run_id)
         return {
             "status": "SKIP",
             "skip_reason": "file_guard_already_ran",
@@ -422,6 +443,7 @@ def run_trade_session(
                     },
                     session,
                 )
+                release_us_session_running_lock(trade_date, session, run_id=run_id)
                 return {
                     "status": "FAILED_PREP_GUARD",
                     "reason": f"prep_guard_block:{guard.get('reason')}",
@@ -929,13 +951,13 @@ def run_trade_session(
         and total_orders_sent == 0
         and total_orders_error == 0
         and bool(block_reasons_total)
-        and set(block_reasons_total.keys()) <= {"max_positions_reached"}
+        and set(block_reasons_total.keys()) <= {"max_positions_reached", "max_positions_reached_new_symbol"}
     )
     if only_max_position_blocked and os.getenv("US_TREAT_MAX_POSITIONS_AS_OK", "1") == "1":
         final_status = "OK_RISK_BLOCKED"
-        final_reason = "max_positions_reached"
+        final_reason = "max_positions_reached_new_symbol"
         status_detail = "OK_RISK_BLOCKED"
-        logger.info("[US_SESSION][STATUS_CLASSIFY] status=OK_RISK_BLOCKED reason=max_positions_reached completed=1")
+        logger.info("[US_SESSION][STATUS_CLASSIFY] status=OK_RISK_BLOCKED reason=max_positions_reached_new_symbol completed=1")
 
     # KIS temp_errors_by_api 세션 집계
     kis_temp_errors_by_api: dict[str, dict] = {}
@@ -1024,6 +1046,15 @@ def run_trade_session(
         "block_reasons": block_reasons_total,  # backward compat: total across session
         "block_reasons_total": block_reasons_total,
         "block_reasons_last_tick": final_tick.get("block_reasons", {}),
+        "primary_block_reason": max(block_reasons_total, key=block_reasons_total.get) if block_reasons_total else "",
+        "final_diagnosis": "NO_TRADE_RISK_BLOCKED" if (total_buy_decisions > 0 and total_orders_sent == 0 and total_orders_blocked > 0) else "",
+        "existing_add_buy_blocked_by_max_positions_count": sum(
+            int(cnt or 0) for reason, cnt in block_reasons_total.items()
+            if reason == "max_positions_reached"
+        ),
+        "new_buy_blocked_by_max_positions_count": int(block_reasons_total.get("max_positions_reached_new_symbol", 0) or 0),
+        "duplicate_session_detected": int(any(str(r.get("detail_status") or "") == "SKIP_DUPLICATE_RUNNING" for r in results)),
+        "tokenP_403_detected": int("403" in json.dumps(kis_temp_errors_by_api, ensure_ascii=False)),
         "fills_count": total_fills,
         "fills": total_fills,
         "unique_fills_count": total_fills,
@@ -1129,6 +1160,8 @@ def run_trade_session(
             status=final_status,
             ticks=tick_count,
         )
+
+    release_us_session_running_lock(trade_date, session, run_id=run_id)
 
     logger.info(
         "[RUN_SUMMARY][RESULT] status=%s reason=%s orders_sent=%s orders_blocked=%s last_stage=%s",

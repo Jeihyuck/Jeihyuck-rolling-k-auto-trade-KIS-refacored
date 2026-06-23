@@ -1,160 +1,151 @@
 # -*- coding: utf-8 -*-
-"""trader/us/utils/session_guard.py
-
-미국장 전용 파일 기반 세션 가드.
-
-DB guard만 의존하지 않고 파일 기반 중복 실행 방지 guard를 추가한다.
-한국장 session guard는 수정하지 않는다.
-
-guard 파일 경로:
-  runtime/session_guard/us/YYYY-MM-DD/{session}.done
-
-세션 완료 시 JSON 저장 예:
-  {
-    "market": "US",
-    "session": "am",
-    "trade_date": "2026-05-20",
-    "run_id": "...",
-    "started_at_et": "...",
-    "finished_at_et": "...",
-    "status": "OK_WITH_WARNINGS",
-    "ticks": 31
-  }
-
-미국장 실행 시작 순서:
-  1. stale window check
-  2. file guard check       ← 이 모듈
-  3. DB guard check
-  4. session lock acquire
-  5. trading loop start
-"""
+"""US file-based session guard with .done and atomic .running locks."""
 from __future__ import annotations
 
 import json
 import logging
 import os
-from datetime import datetime
+import socket
+import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
-
 NY_TZ = ZoneInfo("America/New_York")
-
 _GUARD_BASE = Path("runtime/session_guard/us")
+_STALE_DEFAULTS = {"prep": 60, "am": 240, "afternoon": 240, "close": 30, "trader": 480}
 
 
-def _guard_path(trade_date: str, session: str) -> Path:
+def _done_path(trade_date: str, session: str) -> Path:
     return _GUARD_BASE / trade_date / f"{session}.done"
 
 
-def check_us_session_file_guard(trade_date: str, session: str) -> dict:
-    """파일 기반 세션 guard를 확인한다.
-
-    Returns:
-        dict with:
-            already_ran (bool): True이면 해당 세션이 이미 완료됨
-            guard_status: "DONE_FILE_FOUND" | "NOT_FOUND" | "READ_ERROR"
-            payload (dict): 완료 파일 내용 (있는 경우)
-    """
-    path = _guard_path(trade_date, session)
-
-    if not path.exists():
-        return {
-            "already_ran": False,
-            "guard_status": "NOT_FOUND",
-            "payload": {},
-        }
-
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        logger.info(
-            "[US_FILE_GUARD][DONE_FOUND] session=%s trade_date=%s path=%s status=%s",
-            session,
-            trade_date,
-            str(path),
-            payload.get("status"),
-        )
-        return {
-            "already_ran": True,
-            "guard_status": "DONE_FILE_FOUND",
-            "payload": payload,
-        }
-    except Exception as exc:
-        logger.warning(
-            "[US_FILE_GUARD][READ_ERROR] session=%s trade_date=%s error=%s",
-            session,
-            trade_date,
-            exc,
-        )
-        return {
-            "already_ran": False,
-            "guard_status": "READ_ERROR",
-            "payload": {},
-        }
+def _running_path(trade_date: str, session: str) -> Path:
+    return _GUARD_BASE / trade_date / f"{session}.running"
 
 
-def write_us_session_done_file(
-    trade_date: str,
-    session: str,
-    run_id: str,
-    started_at_et: str,
-    finished_at_et: str,
-    status: str,
-    ticks: int = 0,
-    extra: dict | None = None,
-) -> Path | None:
-    """세션 완료 파일을 기록한다.
-
-    Args:
-        trade_date: 거래일 (YYYY-MM-DD)
-        session: "am" | "afternoon" | "close"
-        run_id: GitHub run ID 또는 로컬 ID
-        started_at_et: 시작 시각 (ISO format)
-        finished_at_et: 종료 시각 (ISO format)
-        status: "OK" | "OK_WITH_WARNINGS" | "FAILED" | ...
-        ticks: 실행 tick 수
-        extra: 추가 메타데이터 dict
-
-    Returns:
-        Path to written file, or None on failure
-    """
-    path = _guard_path(trade_date, session)
-
-    payload: dict = {
-        "market": "US",
-        "session": session,
-        "trade_date": trade_date,
-        "run_id": run_id,
-        "started_at_et": started_at_et,
-        "finished_at_et": finished_at_et,
-        "status": status,
-        "ticks": ticks,
-    }
-    if extra:
-        payload.update(extra)
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        logger.info(
-            "[US_FILE_GUARD][WRITE_DONE] session=%s trade_date=%s path=%s status=%s",
-            session,
-            trade_date,
-            str(path),
-            status,
-        )
-        return path
-    except Exception as exc:
-        logger.warning(
-            "[US_FILE_GUARD][WRITE_ERROR] session=%s trade_date=%s error=%s",
-            session,
-            trade_date,
-            exc,
-        )
-        return None
+def _guard_path(trade_date: str, session: str) -> Path:  # backward compatible .done path
+    return _done_path(trade_date, session)
 
 
 def now_et_iso() -> str:
-    """현재 시각 ET ISO 문자열을 반환한다."""
     return datetime.now(tz=NY_TZ).isoformat()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).astimezone(NY_TZ)
+    except Exception:
+        return None
+
+
+def _is_stale(payload: dict, stale_minutes: int) -> bool:
+    ref = _parse_dt(payload.get("heartbeat_at_et")) or _parse_dt(payload.get("started_at_et"))
+    if ref is None:
+        return True
+    return datetime.now(tz=NY_TZ) - ref > timedelta(minutes=stale_minutes)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _atomic_write_new(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+
+
+def acquire_us_session_running_lock(trade_date: str, session: str, run_id: str, stale_minutes: int | None = None) -> dict:
+    if os.getenv("US_BYPASS_RUNNING_LOCK_FOR_TEST") == "1":
+        return {"acquired": True, "reason": "BYPASS_FOR_TEST", "path": str(_running_path(trade_date, session))}
+    stale_minutes = int(stale_minutes or _STALE_DEFAULTS.get(session, 240))
+    path = _running_path(trade_date, session)
+    payload = {
+        "market": "US", "session": session, "trade_date": trade_date, "run_id": run_id,
+        "pid": os.getpid(), "started_at_et": now_et_iso(), "heartbeat_at_et": now_et_iso(),
+        "host": socket.gethostname(), "command": " ".join(sys.argv),
+    }
+    while True:
+        try:
+            _atomic_write_new(path, payload)
+            logger.info("[US_SESSION_GUARD][RUNNING_LOCK_ACQUIRED] session=%s trade_date=%s path=%s pid=%s run_id=%s", session, trade_date, path, os.getpid(), run_id)
+            return {"acquired": True, "reason": "RUNNING_LOCK_ACQUIRED", "path": str(path), "payload": payload}
+        except FileExistsError:
+            old = _read_json(path)
+            old_pid = int(old.get("pid") or 0)
+            if _pid_alive(old_pid) and not _is_stale(old, stale_minutes):
+                logger.warning("[US_SESSION_GUARD][SKIP_DUPLICATE_RUNNING] session=%s trade_date=%s path=%s pid=%s run_id=%s", session, trade_date, path, old_pid, old.get("run_id"))
+                return {"acquired": False, "reason": "SKIP_DUPLICATE_RUNNING", "path": str(path), "payload": old}
+            stale_path = path.with_name(f"{path.name}.stale.{datetime.now(tz=NY_TZ).strftime('%Y%m%d%H%M%S%f')}")
+            try:
+                path.rename(stale_path)
+                logger.warning("[US_SESSION_GUARD][STALE_LOCK_REPLACED] session=%s trade_date=%s old_path=%s stale_path=%s old_pid=%s", session, trade_date, path, stale_path, old_pid)
+            except FileNotFoundError:
+                continue
+            except Exception as exc:
+                return {"acquired": False, "reason": f"RUNNING_LOCK_REPLACE_FAILED:{exc}", "path": str(path), "payload": old}
+
+
+def release_us_session_running_lock(trade_date: str, session: str, run_id: str | None = None) -> dict:
+    path = _running_path(trade_date, session)
+    payload = _read_json(path)
+    if run_id and payload and str(payload.get("run_id")) != str(run_id):
+        logger.warning("[US_SESSION_GUARD][RUNNING_LOCK_RELEASE_SKIP] session=%s trade_date=%s reason=run_id_mismatch path=%s", session, trade_date, path)
+        return {"released": False, "reason": "RUN_ID_MISMATCH", "path": str(path)}
+    try:
+        path.unlink()
+        logger.info("[US_SESSION_GUARD][RUNNING_LOCK_RELEASED] session=%s trade_date=%s path=%s run_id=%s", session, trade_date, path, run_id or "")
+        return {"released": True, "reason": "RUNNING_LOCK_RELEASED", "path": str(path)}
+    except FileNotFoundError:
+        return {"released": False, "reason": "NOT_FOUND", "path": str(path)}
+
+
+def check_us_session_file_guard(trade_date: str, session: str) -> dict:
+    path = _done_path(trade_date, session)
+    if not path.exists():
+        return {"already_ran": False, "guard_status": "NOT_FOUND", "payload": {}}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        logger.info("[US_FILE_GUARD][DONE_FOUND] session=%s trade_date=%s path=%s status=%s", session, trade_date, str(path), payload.get("status"))
+        return {"already_ran": True, "guard_status": "DONE_FILE_FOUND", "payload": payload}
+    except Exception as exc:
+        logger.warning("[US_FILE_GUARD][READ_ERROR] session=%s trade_date=%s error=%s", session, trade_date, exc)
+        return {"already_ran": False, "guard_status": "READ_ERROR", "payload": {}}
+
+
+def write_us_session_done_file(trade_date: str, session: str, run_id: str, started_at_et: str, finished_at_et: str, status: str, ticks: int = 0, extra: dict | None = None) -> Path | None:
+    path = _done_path(trade_date, session)
+    payload = {"market": "US", "session": session, "trade_date": trade_date, "run_id": run_id, "started_at_et": started_at_et, "finished_at_et": finished_at_et, "status": status, "ticks": ticks}
+    if extra:
+        payload.update(extra)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[US_FILE_GUARD][WRITE_DONE] session=%s trade_date=%s path=%s status=%s", session, trade_date, str(path), status)
+        logger.info("[US_SESSION_GUARD][DONE_WRITTEN] session=%s trade_date=%s path=%s status=%s", session, trade_date, str(path), status)
+        return path
+    except Exception as exc:
+        logger.warning("[US_FILE_GUARD][WRITE_ERROR] session=%s trade_date=%s error=%s", session, trade_date, exc)
+        return None

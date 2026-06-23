@@ -24,7 +24,10 @@ def calc_position_size(
     position_count: int,
     score: float = 0.5,
 ) -> dict:
-    """포지션 크기 계산.
+    """신규 종목 BUY(NEW_POSITION_BUY) 전용 포지션 크기 계산.
+
+    기존 보유 종목 추가매수(ADD_TO_EXISTING_BUY)는 이 함수를 거치지 않고
+    us_entry_engine._calc_add_position_size()를 사용해야 한다.
 
     Args:
         price: 현재 주가 (USD)
@@ -56,7 +59,7 @@ def calc_position_size(
             position_count, max_positions,
         )
         return {"qty": 0, "notional_usd": 0.0, "position_weight": 0.0,
-                "blocked": True, "reason": "max_positions_reached", "order_cap_usd": order_cap_usd}
+                "blocked": True, "reason": "max_positions_reached_new_symbol", "order_cap_usd": order_cap_usd}
 
     if price <= 0:
         return {"qty": 0, "notional_usd": 0.0, "position_weight": 0.0,

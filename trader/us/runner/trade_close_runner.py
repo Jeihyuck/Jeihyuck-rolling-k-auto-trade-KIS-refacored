@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import logging
 import sys
 
@@ -42,6 +43,23 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     else:
         now = now_ny()
     trade_date = now.strftime("%Y-%m-%d")
+
+    from trader.us.utils.session_guard import acquire_us_session_running_lock, release_us_session_running_lock
+    run_id = os.getenv("GITHUB_RUN_ID", "local-close")
+    running_lock = acquire_us_session_running_lock(trade_date, "close", run_id)
+    if running_lock.get("acquired"):
+        atexit.register(release_us_session_running_lock, trade_date, "close", run_id)
+    if not running_lock.get("acquired"):
+        logger.warning(
+            "[US_TRADE_CLOSE][SKIP_DUPLICATE_RUNNING] trade_date=%s reason=%s",
+            trade_date, running_lock.get("reason"),
+        )
+        return {
+            "status": "SKIP",
+            "reason": "duplicate_session_running",
+            "detail_status": "SKIP_DUPLICATE_RUNNING",
+            "trade_date": trade_date,
+        }
 
     # ── close entry 정책 ─────────────────────────────────────────────────
     # 기본: US_CLOSE_ENTRY_ENABLED=0 (신규 BUY 금지)
@@ -100,8 +118,11 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
     # 4. Positions DB 저장
     positions = reconcile_result.get("positions", [])
     try:
-        save_position_snapshot(positions)
-        logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", len(positions))
+        if reconcile_result.get("preserve_previous_positions"):
+            logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
+        else:
+            save_position_snapshot(positions)
+            logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", len(positions))
     except Exception as exc:
         logger.warning("[US_TRADE_CLOSE][WARN] save_position_snapshot failed: %s", exc)
 
@@ -160,6 +181,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             fills_error,
         )
     
+    release_us_session_running_lock(trade_date, "close", run_id=run_id)
+
     return {
         "status": status,
         "fills_status": fills_status,
