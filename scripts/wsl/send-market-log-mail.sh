@@ -11,9 +11,12 @@ mkdir -p runtime/cron
 
 BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"
 BRANCH="${BRANCH:-unknown}"
+BRANCH_SAFE="$(printf '%s' "$BRANCH" | sed 's/[^A-Za-z0-9._-]/-/g')"
+BRANCH_SAFE="${BRANCH_SAFE:-unknown}"
+KR_LOG_DATE="$(TZ=Asia/Seoul date +%F)"
 
-OUT="/tmp/nullim-${BRANCH}-${MARKET}-logs-${TS}.tar.gz"
-WARN="/tmp/nullim-${BRANCH}-${MARKET}-logs-${TS}.warn"
+OUT="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-logs-${TS}.tar.gz"
+WARN="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-logs-${TS}.warn"
 
 case "$MARKET" in
   us)
@@ -24,7 +27,7 @@ case "$MARKET" in
   kr)
     SUBJECT="[NULLIM][${BRANCH}][KR][LOG] regular logs ${HUMAN_TS}"
     BODY="한국장 정규장 로그 자동 발송입니다. branch=${BRANCH}"
-    FILES=(runtime/cron runtime/wsl-kr-prep.log runtime/wsl-kr-am.log runtime/wsl-kr-afternoon.log runtime/wsl-kr-close.log runtime/wsl-kr-trader.log runtime/locks reports)
+    FILES=(runtime/cron runtime/wsl-kr-prep.log runtime/wsl-kr-am.log runtime/wsl-kr-afternoon.log runtime/wsl-kr-close.log runtime/wsl-kr-trader.log runtime/logs/kr/${KR_LOG_DATE} runtime/logs/kr runtime/locks reports)
     ;;
   *)
     SUBJECT="[NULLIM][${BRANCH}][ALL][LOG] logs ${HUMAN_TS}"
@@ -53,7 +56,7 @@ for item in "${FILES[@]}"; do
 done
 
 if [ "${#EXISTING_FILES[@]}" -eq 0 ]; then
-  FALLBACK="/tmp/nullim-${BRANCH}-${MARKET}-no-logs-${TS}.txt"
+  FALLBACK="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-no-logs-${TS}.txt"
   { echo "No logs found."; echo "market=${MARKET}"; echo "branch=${BRANCH}"; echo "ts=${HUMAN_TS}"; } > "$FALLBACK"
   EXISTING_FILES=("$FALLBACK")
 fi
@@ -61,7 +64,7 @@ fi
 tar -czf "$OUT" "${EXISTING_FILES[@]}" 2>"$WARN" || true
 
 if [ ! -s "$OUT" ]; then
-  FALLBACK="/tmp/nullim-${BRANCH}-${MARKET}-empty-archive-${TS}.txt"
+  FALLBACK="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-empty-archive-${TS}.txt"
   { echo "Archive was empty."; echo "market=${MARKET}"; echo "branch=${BRANCH}"; echo "ts=${HUMAN_TS}"; } > "$FALLBACK"
   tar -czf "$OUT" "$FALLBACK"
 fi
