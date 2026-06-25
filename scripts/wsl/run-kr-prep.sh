@@ -12,13 +12,7 @@ export KR_PREP_AUX_DEFAULT_TIMEOUT_SEC="${KR_PREP_AUX_DEFAULT_TIMEOUT_SEC:-20}"
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
-LOCK_FILE="/tmp/nullim-kr-prep.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  echo "[KR_PREP][LOCK_SKIP] another instance is already running lock=$LOCK_FILE"
-  exit 0
-fi
-echo "[KR_PREP][LOCK_ACQUIRED] lock=$LOCK_FILE"
+echo "[KR_PREP][LOCK_DELEGATED] external cron /usr/bin/flock owns duplicate prevention"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul

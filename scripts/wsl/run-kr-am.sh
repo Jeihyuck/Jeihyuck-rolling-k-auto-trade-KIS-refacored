@@ -3,13 +3,7 @@ set -euo pipefail
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
-lock_file="/tmp/nullim-kr-am.lock"
-exec 9>"$lock_file"
-if ! flock -n 9; then
-  echo "[KR_AM][LOCK_SKIP] another instance is already running lock=$lock_file"
-  exit 0
-fi
-echo "[KR_AM][LOCK_ACQUIRED] lock=$lock_file"
+echo "[KR_AM][LOCK_DELEGATED] external cron /usr/bin/flock owns duplicate prevention"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul
