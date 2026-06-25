@@ -4,12 +4,16 @@ REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
 lock_file="/tmp/nullim-kr-afternoon.lock"
-exec 9>"$lock_file"
-if ! flock -n 9; then
-  echo "[KR_AFTERNOON][LOCK_SKIP] another instance is already running lock=$lock_file"
-  exit 0
+if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
+  echo "[KR_AFTERNOON][LOCK_DELEGATED] external caller owns duplicate prevention lock=${lock_file}"
+else
+  exec 9>"${lock_file}"
+  if ! flock -n 9; then
+    echo "[KR_AFTERNOON][LOCK_SKIP] another instance is already running lock=${lock_file}"
+    exit 0
+  fi
+  echo "[KR_AFTERNOON][LOCK_ACQUIRED] lock=${lock_file}"
 fi
-echo "[KR_AFTERNOON][LOCK_ACQUIRED] lock=$lock_file"
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul
