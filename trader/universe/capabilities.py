@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 ALLOWED_PROVIDER_CHAIN = {
-    "practice": ["kis_marketcap_top", "seed_static", "emergency_seed"],
+    "practice": ["seed_static", "kis_marketcap_top", "emergency_seed"],
     "real": ["kis_marketcap_top", "seed_static", "emergency_seed"],
 }
 

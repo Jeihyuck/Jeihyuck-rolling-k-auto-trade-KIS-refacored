@@ -159,7 +159,7 @@ class KISMarketcapTopProvider:
         self.validate_params(market, n)
         tr_id = self._pick_tr_id()
         market_code = self._market_code(market)
-        params = {**self.params, "fid_cond_mrkt_div_code": market_code}
+        params = {**self.params, "fid_cond_mrkt_div_code": market_code, "fid_input_cnt_1": str(n)}
 
         headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
         url = f"{API_BASE_URL}{self.endpoint}"

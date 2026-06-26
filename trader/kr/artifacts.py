@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from trader.contracts.final30_contract import assert_final30_contract
+from trader.db.engine import get_engine
+from trader.db.repos import load_exact_final30_scored
 from zoneinfo import ZoneInfo
 
 KST = ZoneInfo("Asia/Seoul")
@@ -329,9 +331,9 @@ def _validate_canonical_prep_artifact(*, trade_date: date, expected_as_of: date,
     contracts = [p for p in (runtime_c, latest_c) if p.exists()]
     finals = [p for p in (runtime_f, latest_f) if p.exists()]
     if not contracts:
-        return _CandidateValidation(False, "CONTRACT_MISSING")
+        return _CandidateValidation(False, "CONTRACT_MISSING", details={"expected_path": _rel(runtime_c), "manifest_path": _rel(latest_c)})
     if not finals:
-        return _CandidateValidation(False, "FINAL30_MISSING")
+        return _CandidateValidation(False, "FINAL30_MISSING", details={"expected_path": _rel(runtime_f), "manifest_path": _rel(latest_f)})
     loaded_contracts: list[tuple[Path, dict[str, Any]]] = []
     loaded_finals: list[tuple[Path, Any]] = []
     try:
@@ -470,8 +472,21 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
         if legacy.ok:
             logger.warning("[KR_ARTIFACT][VALIDATE_OK_LEGACY_FALLBACK] rows=%s path=%s", legacy.rows, _rel(legacy.path) if legacy.path else None)
             return KrArtifactValidationResult(True, False, "LEGACY_FALLBACK_OK", source="legacy", rows=legacy.rows, legacy_paths=[_rel(p) for p in legacy_paths], trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of)
-    logger.error("[KR_ARTIFACT][REJECT] reason=CANONICAL_PREP_ARTIFACT_INVALID trade_date=%s expected_as_of=%s canonical_reason=%s", trade_date, expected_as_of, canonical.reason)
-    return KrArtifactValidationResult(False, True, canonical.reason if canonical.reason not in {"CONTRACT_MISSING", "FINAL30_MISSING"} else "CANONICAL_PREP_ARTIFACT_INVALID", rows=canonical.rows, db_exact_rows=canonical.db_exact_rows, detail=canonical.reason, trade_date=trade_date, expected_as_of=expected_as_of)
+    db_rows = 0
+    if canonical.reason in {"CONTRACT_MISSING", "FINAL30_MISSING"}:
+        try:
+            rows = load_exact_final30_scored(get_engine(), env=env, as_of=expected_as_of, strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"))
+            db_rows = len(rows)
+        except Exception:
+            db_rows = 0
+    logger.error(
+        "[KR_ARTIFACT][REJECT] reason=CANONICAL_PREP_ARTIFACT_INVALID trade_date=%s expected_as_of=%s canonical_reason=%s expected_path=%s manifest_path=%s db_fallback_available=%s db_final30_rows=%s",
+        trade_date, expected_as_of, canonical.reason,
+        (canonical.details or {}).get("expected_path") or _rel(ROOT / "runtime/kr/watchlist" / trade_date.isoformat() / "prep_contract.json"),
+        (canonical.details or {}).get("manifest_path") or _rel(ROOT / "signals/kr/latest_prep_contract.json"),
+        int(db_rows == 30), db_rows,
+    )
+    return KrArtifactValidationResult(False, True, canonical.reason if canonical.reason not in {"CONTRACT_MISSING", "FINAL30_MISSING"} else "CANONICAL_PREP_ARTIFACT_INVALID", rows=canonical.rows, db_exact_rows=db_rows or canonical.db_exact_rows, detail=canonical.reason, trade_date=trade_date, expected_as_of=expected_as_of)
 
 
 def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, actual_as_of: date, env: str, final30_rows: list[dict], db_exact_rows: int, metadata: dict | None = None, contract_hash: str | None = None) -> None:
@@ -510,13 +525,36 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
     dropped_metadata_keys = sorted(set((metadata or {}).keys()) - set(safe_metadata.keys()))
     if dropped_metadata_keys:
         logger.warning("[KR_ARTIFACT][METADATA_RESERVED_KEYS_DROPPED] keys=%s", dropped_metadata_keys)
-    contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"source":"fresh_build","canonical":True,"rows":30,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True,"contract_hash":contract_hash, **safe_metadata}
+    quality = {
+        "uniq_code": len(set(_code_list(final30_rows))),
+        "ma20_null": sum(1 for r in final30_rows if _is_missing_contract_value((r or {}).get("ma20"))),
+        "score_final_nonzero": sum(1 for r in final30_rows if _as_positive_float((r or {}).get("score_final", (r or {}).get("final_score")))),
+        "tech_score_nonzero": sum(1 for r in final30_rows if _as_positive_float((r or {}).get("tech_score"))),
+        "entry_style_invalid": sum(1 for r in final30_rows if str((r or {}).get("entry_style_selected") or "").strip().upper() not in set(_ENTRY_STYLE_ALIASES.values())),
+    }
+    contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"strategy":"pb1_watchlist_final_scored","contract_version":1,"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"created_at":created_at,"source":"prep_runner","canonical":True,"rows":30,"quality":quality,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True,"contract_hash":contract_hash, **safe_metadata}
     tmps = [( _write_tmp(p, payload if "final30_scored" in p.name else contract), p) for p in (runtime_f, runtime_c, latest_f, latest_c)]
     for tmp, final in tmps: os.replace(tmp, final)
     res = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=True, strict=True, allow_legacy_fallback=False)
     if not res.ok: raise RuntimeError(res.reason or "ARTIFACT_VALIDATE_FAILED")
     logger.info("[KR_ARTIFACT][PUBLISH_OK] trade_date=%s expected_as_of=%s rows=30 latest=1 runtime=1", tds, exp)
 
+
+
+def rescue_kr_final30_from_db(*, trade_date: date, expected_as_of: date, env: str, strategy: str | None = None) -> KrArtifactValidationResult:
+    strategy = (strategy or os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY") or "pb1_watchlist_final_scored").strip().lower()
+    try:
+        rows = load_exact_final30_scored(get_engine(), env=env, as_of=expected_as_of, strategy=strategy)
+        normalized, meta = normalize_and_validate_scored_final30(rows, expected_as_of=expected_as_of.isoformat(), source="db_scored_final30")
+        quality_ok = bool(meta.get("contract_ok")) and strategy in {"pb1_watchlist_final_scored", os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()}
+        if quality_ok:
+            logger.warning("[KR_ARTIFACT][RESCUE_FROM_DB] reason=CONTRACT_MISSING trade_date=%s expected_as_of=%s final30_rows=30 source=db_scored_final30 quality_ok=1", trade_date, expected_as_of)
+            return KrArtifactValidationResult(True, False, "DB_FINAL30_VALID_BUT_CONTRACT_MISSING", source="db_final30_scored", rows=30, db_exact_rows=30, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details={"quality_ok": 1, "strategy": strategy, "meta": meta}, final30_rows_payload=normalized)
+        logger.error("[KR_ARTIFACT][RESCUE_FROM_DB][FAIL] reason=DB_FINAL30_INVALID rows=%s quality_ok=0", len(rows or []))
+        return KrArtifactValidationResult(False, True, "DB_FINAL30_INVALID", rows=len(rows or []), db_exact_rows=len(rows or []), detail="DB_FINAL30_INVALID", trade_date=trade_date, expected_as_of=expected_as_of, details={"quality_ok": 0, "strategy": strategy, "meta": meta})
+    except Exception as exc:
+        logger.exception("[KR_ARTIFACT][RESCUE_FROM_DB][FAIL] reason=DB_FINAL30_INVALID rows=0 quality_ok=0 err=%s", exc)
+        return KrArtifactValidationResult(False, True, "DB_FINAL30_INVALID", rows=0, db_exact_rows=0, detail=str(exc), trade_date=trade_date, expected_as_of=expected_as_of, details={"quality_ok": 0, "strategy": strategy})
 
 def quarantine_stale_kr_artifacts(*, trade_date: date, expected_as_of: date, env: str) -> list[Path]:
     logger.info("[KR_PREP][ARTIFACT_CLEAN_START] trade_date=%s expected_as_of=%s", trade_date, expected_as_of)
