@@ -60,7 +60,7 @@ LOG_FILE="${LOG_DIR}/wsl-kr-prep.log"
 LATEST_LINK="runtime/logs/kr/wsl-kr-prep.latest.log"
 ln -sfn "${TODAY_KST}/wsl-kr-prep.log" "$LATEST_LINK"
 {
-NOW_HM=$(TZ=Asia/Seoul date +%H:%M)
+NOW_HM="${NOW_HM:-$(TZ=Asia/Seoul date +%H:%M)}"
 if [[ "$NOW_HM" < "05:00" || "$NOW_HM" > "08:50" ]]; then
   echo "[KR_PREP][SCHEDULE_GUARD] now=$NOW_HM allowed=0 reason=OUTSIDE_PREP_WINDOW"
   if [[ "${ALLOW_KR_PREP_OUTSIDE_WINDOW:-0}" != "1" ]]; then
@@ -88,14 +88,23 @@ fi
   set -e
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
     LAST_STAGE_FILE="runtime/state/kr/prep_last_stage.json"
-    LAST_STAGE=""; LAST_STAGE_TS=""; LAST_STAGE_ASOF=""; LAST_STAGE_ROWS=""
+    LAST_STAGE=""; LAST_STAGE_TS=""; LAST_STAGE_ASOF=""; LAST_STAGE_ROWS=""; LAST_STAGE_PID=""; LAST_STAGE_ELAPSED=""; CORE_DONE="0"; ARTIFACT_SAVED="0"
     if [[ -f "$LAST_STAGE_FILE" ]]; then
       LAST_STAGE=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
       LAST_STAGE_TS=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("updated_at", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
       LAST_STAGE_ASOF=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("expected_as_of", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
       LAST_STAGE_ROWS=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("final30_rows", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+      LAST_STAGE_PID=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("pid", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+      LAST_STAGE_ELAPSED=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("elapsed_sec_from_start", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+      [[ "$LAST_STAGE" == "core_done" ]] && CORE_DONE="1" || true
+      [[ "$LAST_STAGE" == "core_artifact_write_saved" || "$LAST_STAGE" == "core_artifact_files_verify_done" || "$LAST_STAGE" == "core_done" ]] && ARTIFACT_SAVED="1" || true
     fi
-    echo "[KR_PREP][TIMEOUT] timeout_sec=${KR_PREP_TIMEOUT_SEC} last_stage=${LAST_STAGE} last_stage_ts=${LAST_STAGE_TS} expected_as_of=${LAST_STAGE_ASOF} final30_rows=${LAST_STAGE_ROWS}"
+    PREP_DONE_EXISTS=0; LATEST_CONTRACT_EXISTS=0; RUNTIME_CONTRACT_EXISTS=0
+    [[ -f "runtime/kr/watchlist/${TODAY_KST}/prep_done.json" ]] && PREP_DONE_EXISTS=1 || true
+    [[ -f "signals/kr/latest_prep_contract.json" ]] && LATEST_CONTRACT_EXISTS=1 || true
+    [[ -f "runtime/kr/watchlist/${TODAY_KST}/prep_contract.json" ]] && RUNTIME_CONTRACT_EXISTS=1 || true
+    echo "[KR_PREP][TIMEOUT] timeout_sec=${KR_PREP_TIMEOUT_SEC} last_stage=${LAST_STAGE} last_stage_ts=${LAST_STAGE_TS} expected_as_of=${LAST_STAGE_ASOF} final30_rows=${LAST_STAGE_ROWS} pid=${LAST_STAGE_PID} elapsed_sec=${LAST_STAGE_ELAPSED} core_done=${CORE_DONE} artifact_saved=${ARTIFACT_SAVED} prep_done_exists=${PREP_DONE_EXISTS} latest_contract_exists=${LATEST_CONTRACT_EXISTS}"
+    echo "[KR_PREP][TIMEOUT][ARTIFACT_STATE] runtime_contract=${RUNTIME_CONTRACT_EXISTS} latest_contract=${LATEST_CONTRACT_EXISTS} prep_done=${PREP_DONE_EXISTS} db_final30_hint=${LAST_STAGE_ROWS}"
   fi
   echo "[KR_PREP][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc

@@ -4,6 +4,14 @@ REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime
 lock_file="/tmp/nullim-kr-close.lock"
+compat_lock_file="runtime/locks/kr-close.lock"
+if [[ -f "$compat_lock_file" ]]; then
+  exec 8>"$compat_lock_file"
+  if ! flock -n 8; then
+    echo "[KR_CLOSE][LOCK_SKIP] another instance is already running lock=${compat_lock_file}"
+    exit 0
+  fi
+fi
 if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
   echo "[KR_CLOSE][LOCK_DELEGATED] external caller owns duplicate prevention lock=${lock_file}"
 else
@@ -64,10 +72,19 @@ LATEST_LINK="runtime/logs/kr/wsl-kr-close.latest.log"
 ln -sfn "${TODAY_KST}/wsl-kr-close.log" "$LATEST_LINK"
 {
   echo "[KR_CLOSE][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
+  KR_CLOSE_SESSION_TIMEOUT_SEC="${KR_CLOSE_SESSION_TIMEOUT_SEC:-1800}"
+  echo "[KR_CLOSE][EFFECTIVE_ENV] timeout_sec=${KR_CLOSE_SESSION_TIMEOUT_SEC}"
   set +e
-  python -m trader.kr.runner.trade_session_runner --session close --env "$STRATEGY_ENV"
+  timeout --kill-after=30s "${KR_CLOSE_SESSION_TIMEOUT_SEC}" python -m trader.kr.runner.trade_session_runner --session close --env "$STRATEGY_ENV"
   rc=$?
   set -e
+  if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+    LAST_STAGE_FILE="runtime/state/kr/session_last_stage_close.json"
+    LAST_STAGE=""
+    if [[ -f "$LAST_STAGE_FILE" ]]; then LAST_STAGE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true); fi
+    echo "[KR_CLOSE][TIMEOUT] timeout_sec=${KR_CLOSE_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
+    echo "[RUN_SUMMARY][RESULT] market=KR session=close status=FAIL reason=SESSION_TIMEOUT orders_intent=0 orders_ack=0 blocked=0"
+  fi
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG_FILE" 2>&1

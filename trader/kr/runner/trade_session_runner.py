@@ -63,6 +63,24 @@ class BalancePrecheck:
     raw_snapshot: dict[str, Any] | None = None
 
 
+def _write_session_last_stage(*, session: str, trade_date: Any, expected_as_of: Any, stage: str, status: str = "start") -> None:
+    import time as _time
+    started = float(os.getenv("KR_SESSION_STARTED_MONOTONIC", "0") or 0)
+    payload = {"market":"KR","session":session,"trade_date":str(trade_date),"expected_as_of":str(expected_as_of),"stage":stage,"status":status,"updated_at":_now_kst().isoformat(),"elapsed_sec_from_start":round((_time.monotonic()-started),3) if started else 0.0,"pid":os.getpid()}
+    for path in (ROOT/"runtime/state/kr/session_last_stage.json", ROOT/"runtime/state/kr"/f"session_last_stage_{session}.json"):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("[KR_SESSION][LAST_STAGE][WRITE_FAIL] stage=%s err=%s", stage, exc)
+
+def _read_session_last_stage(session: str) -> str:
+    path = ROOT/"runtime/state/kr"/f"session_last_stage_{session}.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("stage", "")
+    except Exception:
+        return ""
+
 def _balance_cash(snapshot: Any) -> int | None:
     if not isinstance(snapshot, dict):
         return None
@@ -188,6 +206,7 @@ def _run_prep(env: str) -> dict[str, Any]:
 
 
 def _guard_trade_session(session: str, ctx: KrSessionContext) -> dict[str, Any] | None:
+    import concurrent.futures
     now = _now_kst()
     tag = f"KR_{session.upper()}" if session != "afternoon" else "KR_AFTERNOON"
     if session == "am":
@@ -195,55 +214,61 @@ def _guard_trade_session(session: str, ctx: KrSessionContext) -> dict[str, Any] 
         hh, mm, ss = [int(x) for x in target_raw.split(":")]
         logger.info("[KR_AM][PREOPEN_WAIT] trade_date=%s target_time=%s", ctx.trade_date, target_raw)
         try:
-            wait_until_kr_am_target(
-                trade_date=ctx.trade_date,
-                target_time=time(hh, mm, ss),
-                max_wait_sec=int(os.getenv("KR_AM_MAX_WAIT_SEC", os.getenv("KR_AM_MAX_WAIT_SECONDS", "900"))),
-            )
+            wait_until_kr_am_target(trade_date=ctx.trade_date, target_time=time(hh, mm, ss), max_wait_sec=int(os.getenv("KR_AM_MAX_WAIT_SEC", os.getenv("KR_AM_MAX_WAIT_SECONDS", "900"))))
         except RuntimeError as exc:
             if str(exc) == "KR_AM_WAIT_TOO_LONG":
-                logger.error(
-                    "[KR_AM][FAIL] reason=KR_AM_WAIT_TOO_LONG trade_date=%s target_time=%s",
-                    ctx.trade_date,
-                    target_raw,
-                )
+                logger.error("[KR_AM][FAIL] reason=KR_AM_WAIT_TOO_LONG trade_date=%s target_time=%s", ctx.trade_date, target_raw)
                 logger.info("[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=KR_AM_WAIT_TOO_LONG orders_intent=0 orders_ack=0 blocked=0")
                 return {"status": "FAIL", "reason": "KR_AM_WAIT_TOO_LONG", "exit_code": 2}
             raise
-        try:
-            from trader.config import get_live_gate_status_fresh
-            gate = get_live_gate_status_fresh(reason="after_wait_done")
-            logger.info(
-                "[KR_AM][LIVE_GATE_AFTER_WAIT] allow=%s reason=%s window=%s now=%s",
-                int(gate.allow_live_gate), gate.reason, gate.window, gate.now_kst.isoformat(),
-            )
-        except Exception as exc:
-            logger.warning("[KR_AM][LIVE_GATE_AFTER_WAIT][WARN] err=%s", exc)
         logger.info("[KR_AM][RUN_AFTER_TARGET] trade_date=%s", ctx.trade_date)
     if session == "close":
         logger.info("[KR_SESSION][CLOSE_CONTINUE] reason=EXIT_ONLY_DOES_NOT_REQUIRE_ENTRY_ARTIFACT")
         return None
-    result = validate_kr_prep_artifact(trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, env=os.getenv("STRATEGY_ENV", "practice"), strict=True, allow_legacy_fallback=False)
-    if not result.ok:
-        if session in {"am", "afternoon", "close"} and result.detail == "CONTRACT_MISSING" and ctx.expected_as_of is not None:
-            rescue = rescue_kr_final30_from_db(
-                trade_date=ctx.trade_date,
-                expected_as_of=ctx.expected_as_of,
-                env=os.getenv("STRATEGY_ENV", "practice"),
-            )
-            if rescue.ok:
-                logger.warning("[KR_SESSION][PRECHECK_RESCUED] session=%s reason=DB_FINAL30_VALID_BUT_CONTRACT_MISSING source=db_final30_scored", session)
-                logger.info("[KR_SESSION][PROCEED] session=%s", session)
-                return None
-            logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=%s detail=%s db_rescue=failed", session, result.reason, result.detail)
-        else:
-            logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=%s detail=%s", session, result.reason, result.detail)
+
+    timeout = float(os.getenv("KR_SESSION_PRECHECK_TIMEOUT_SEC", "30"))
+    logger.info("[KR_SESSION][PRECHECK_START] session=%s timeout_sec=%s", session, timeout)
+    def _precheck() -> dict[str, Any] | None:
+        _write_session_last_stage(session=session, trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, stage="precheck.artifact_files_validate", status="start")
+        logger.info("[KR_SESSION][PRECHECK_STAGE][START] stage=artifact_files_validate")
+        started = _now_kst()
+        result = validate_kr_prep_artifact(trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, env=os.getenv("STRATEGY_ENV", "practice"), require_db_exact=False, strict=True, allow_legacy_fallback=False)
+        logger.info("[KR_SESSION][PRECHECK_STAGE][DONE] stage=artifact_files_validate elapsed=%.3f", (_now_kst()-started).total_seconds())
+        _write_session_last_stage(session=session, trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, stage="precheck.artifact_files_validate", status="done")
+        if result.ok:
+            logger.info("[KR_SESSION][PRECHECK_OK] session=%s source=%s rows=%s reason=%s", session, result.source, result.rows, result.reason)
+            logger.info("[KR_SESSION][PROCEED] session=%s", session)
+            return None
+        _write_session_last_stage(session=session, trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, stage="precheck.db_rescue_load", status="start")
+        logger.info("[KR_SESSION][PRECHECK_STAGE][START] stage=db_rescue_load")
+        rstart = _now_kst()
+        rescue = rescue_kr_final30_from_db(trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, env=os.getenv("STRATEGY_ENV", "practice"))
+        logger.info("[KR_SESSION][PRECHECK_STAGE][DONE] stage=db_rescue_load elapsed=%.3f", (_now_kst()-rstart).total_seconds())
+        _write_session_last_stage(session=session, trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, stage="precheck.db_rescue_quality_validate", status="done" if rescue.ok else "fail")
+        logger.info("[KR_SESSION][PRECHECK_STAGE][DONE] stage=db_rescue_quality_validate elapsed=0.000")
+        if rescue.ok:
+            logger.warning("[KR_SESSION][PRECHECK_RESCUED] session=%s source=db_final30_scored rows=30 artifact_rebuilt=%s", session, int((rescue.details or {}).get("artifact_rebuilt", 0)))
+            logger.info("[KR_SESSION][PROCEED] session=%s", session)
+            return None
+        logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=%s detail=%s db_rescue=failed", session, result.reason, result.detail)
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=FAIL reason=%s orders_intent=0 orders_ack=0 blocked=0", session, result.reason)
         return {"status": "FAIL", "reason": result.reason}
-    logger.info("[KR_SESSION][PRECHECK_OK] session=%s source=%s rows=%s reason=%s", session, result.source, result.rows, result.reason)
-    logger.info("[KR_SESSION][PROCEED] session=%s", session)
-    return None
-
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_precheck)
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        ex.shutdown(wait=False, cancel_futures=True)
+        _write_session_last_stage(session=session, trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, stage="precheck.timeout", status="timeout")
+        logger.error("[KR_SESSION][PRECHECK_TIMEOUT] session=%s timeout_sec=%s last_stage=%s", session, timeout, _read_session_last_stage(session))
+        logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=PRECHECK_TIMEOUT detail=timeout_sec_%s", session, timeout)
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=FAIL reason=PRECHECK_TIMEOUT orders_intent=0 orders_ack=0 blocked=0", session)
+        return {"status": "FAIL", "reason": "PRECHECK_TIMEOUT", "exit_code": 2}
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
 def _assert_balance_available(session: str) -> dict[str, Any] | None:
     td = os.getenv("KR_TRADE_DATE") or _now_kst().strftime("%Y-%m-%d")
@@ -452,7 +477,9 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             return balance_state
 
     window = {"am": "morning", "afternoon": "day", "close": "close"}[session]
-    import trader.pb1_runner as pb1_runner
+    pb1_runner = sys.modules.get("trader.pb1_runner")
+    if pb1_runner is None:
+        import trader.pb1_runner as pb1_runner
 
     old_argv = sys.argv[:]
     os.environ.pop("PB1_LAST_RESULT_STATUS", None)

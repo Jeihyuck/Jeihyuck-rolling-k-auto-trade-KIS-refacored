@@ -448,7 +448,7 @@ def _validate_legacy_artifact(paths: list[Path], *, expected_as_of: date, env: s
     return _CandidateValidation(False, "LEGACY_INVALID")
 
 
-def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: str, require_db_exact: bool = True, strict: bool = True, allow_legacy_fallback: bool = False, allow_legacy: bool | None = None) -> KrArtifactValidationResult:
+def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: str, require_db_exact: bool = False, strict: bool = True, allow_legacy_fallback: bool = False, allow_legacy: bool | None = None) -> KrArtifactValidationResult:
     if allow_legacy is not None:
         allow_legacy_fallback = allow_legacy
     canonical = _validate_canonical_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=require_db_exact)
@@ -472,13 +472,9 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
         if legacy.ok:
             logger.warning("[KR_ARTIFACT][VALIDATE_OK_LEGACY_FALLBACK] rows=%s path=%s", legacy.rows, _rel(legacy.path) if legacy.path else None)
             return KrArtifactValidationResult(True, False, "LEGACY_FALLBACK_OK", source="legacy", rows=legacy.rows, legacy_paths=[_rel(p) for p in legacy_paths], trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of)
+    # Core/session validation must never block on DB fallback. DB rescue is an
+    # explicit bounded path handled by rescue_kr_final30_from_db().
     db_rows = 0
-    if canonical.reason in {"CONTRACT_MISSING", "FINAL30_MISSING"}:
-        try:
-            rows = load_exact_final30_scored(get_engine(), env=env, as_of=expected_as_of, strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"))
-            db_rows = len(rows)
-        except Exception:
-            db_rows = 0
     logger.error(
         "[KR_ARTIFACT][REJECT] reason=CANONICAL_PREP_ARTIFACT_INVALID trade_date=%s expected_as_of=%s canonical_reason=%s expected_path=%s manifest_path=%s db_fallback_available=%s db_final30_rows=%s",
         trade_date, expected_as_of, canonical.reason,
@@ -535,10 +531,60 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
     contract = {"schema_version":"kr_prep_contract_v1","market":"KR","env":env,"trade_date":tds,"expected_as_of":exp,"actual_as_of":actual_as_of.isoformat(),"strategy":"pb1_watchlist_final_scored","contract_version":1,"final30_rows":30,"db_exact_rows":int(db_exact_rows),"artifact_rows":30,"created_at_kst":datetime.now(KST).isoformat(),"created_at":created_at,"source":"prep_runner","canonical":True,"rows":30,"quality":quality,"trade_can_proceed":1,"source_paths":{"runtime_final30":_rel(runtime_f),"latest_final30":_rel(latest_f)},"contract_ok":True,"contract_hash":contract_hash, **safe_metadata}
     tmps = [( _write_tmp(p, payload if "final30_scored" in p.name else contract), p) for p in (runtime_f, runtime_c, latest_f, latest_c)]
     for tmp, final in tmps: os.replace(tmp, final)
-    res = validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=True, strict=True, allow_legacy_fallback=False)
+    res = validate_kr_prep_artifact_files_only(trade_date=trade_date, expected_as_of=expected_as_of, env=env)
     if not res.ok: raise RuntimeError(res.reason or "ARTIFACT_VALIDATE_FAILED")
     logger.info("[KR_ARTIFACT][PUBLISH_OK] trade_date=%s expected_as_of=%s rows=30 latest=1 runtime=1", tds, exp)
 
+
+
+def publish_kr_prep_artifacts_core_fast(*, trade_date: date, expected_as_of: date, actual_as_of: date, env: str, final30_rows: list[dict], db_exact_rows: int, metadata: dict | None = None, contract_hash: str | None = None, validate_files_only: bool = True, require_db_exact: bool = False) -> KrArtifactValidationResult:
+    """Fast core publisher: write canonical/latest artifacts without reading DB."""
+    logger.info("[KR_PREP][CORE_ARTIFACT_WRITE][START] trade_date=%s expected_as_of=%s rows=%s", trade_date, expected_as_of, len(final30_rows or []))
+    publish_kr_prep_artifacts_atomic(trade_date=trade_date, expected_as_of=expected_as_of, actual_as_of=actual_as_of, env=env, final30_rows=final30_rows, db_exact_rows=db_exact_rows, metadata=metadata, contract_hash=contract_hash)
+    _write_kr_prep_status_files(trade_date=trade_date, expected_as_of=expected_as_of, env=env, rows=len(final30_rows or []), db_roundtrip_ok=int(db_exact_rows == 30), source=str((metadata or {}).get("source") or "kr_prep_core"))
+    result = validate_kr_prep_artifact_files_only(trade_date=trade_date, expected_as_of=expected_as_of, env=env) if validate_files_only else KrArtifactValidationResult(True, False, "SKIPPED", rows=len(final30_rows or []), db_exact_rows=db_exact_rows)
+    if require_db_exact:
+        try:
+            db_res = validate_kr_prep_artifact_db_exact(trade_date=trade_date, expected_as_of=expected_as_of, env=env)
+            if not db_res.ok:
+                logger.warning("[KR_ARTIFACT][DB_VERIFY][WARN] reason=%s action=skip_core_post_verify", db_res.reason)
+        except TimeoutError:
+            logger.warning("[KR_ARTIFACT][DB_VERIFY][TIMEOUT] timeout_sec=%s action=skip_core_post_verify", os.getenv("KR_ARTIFACT_DB_VERIFY_TIMEOUT_SEC", "15"))
+    logger.info("[KR_PREP][CORE_ARTIFACT_WRITE][SAVED] trade_date=%s expected_as_of=%s rows=%s", trade_date, expected_as_of, len(final30_rows or []))
+    return result
+
+def validate_kr_prep_artifact_files_only(*, trade_date: date, expected_as_of: date, env: str) -> KrArtifactValidationResult:
+    return validate_kr_prep_artifact(trade_date=trade_date, expected_as_of=expected_as_of, env=env, require_db_exact=False, strict=True, allow_legacy_fallback=False)
+
+def validate_kr_prep_artifact_db_exact(*, trade_date: date, expected_as_of: date, env: str) -> KrArtifactValidationResult:
+    import concurrent.futures
+    timeout = float(os.getenv("KR_ARTIFACT_DB_VERIFY_TIMEOUT_SEC", "15"))
+    def _load_rows():
+        return load_exact_final30_scored(get_engine(), env=env, as_of=expected_as_of, strategy=os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored"))
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_load_rows)
+    try:
+        rows = fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError as exc:
+        ex.shutdown(wait=False, cancel_futures=True)
+        logger.warning("[KR_ARTIFACT][DB_VERIFY][TIMEOUT] timeout_sec=%s action=skip_core_post_verify", timeout)
+        raise TimeoutError("KR_ARTIFACT_DB_VERIFY_TIMEOUT") from exc
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+    ok = len(rows or []) == 30
+    return KrArtifactValidationResult(ok, not ok, "DB_EXACT_OK" if ok else "DB_EXACT_ROWS_NOT_30", source="db_final30_scored", rows=len(rows or []), db_exact_rows=len(rows or []), trade_date=trade_date, expected_as_of=expected_as_of)
+
+def _write_kr_prep_status_files(*, trade_date: date, expected_as_of: date, env: str, rows: int, db_roundtrip_ok: int, source: str) -> None:
+    created_at = datetime.now(KST).isoformat()
+    payload = {"market":"KR","env":env,"trade_date":trade_date.isoformat(),"expected_as_of":expected_as_of.isoformat(),"status":"OK","status_ok":True,"core_done":True,"contract_ok":True,"trade_can_proceed":1,"final30_rows":int(rows),"db_roundtrip_ok":int(db_roundtrip_ok),"artifact_saved":1,"source":source,"created_at":created_at}
+    paths = [ROOT/"runtime/kr/watchlist"/trade_date.isoformat()/"prep_done.json", ROOT/"runtime/kr/prep_status"/trade_date.isoformat()/"prep_status.json", ROOT/"signals/kr/latest_prep_status.json"]
+    for path in paths:
+        tmp = _write_tmp(path, payload)
+        os.replace(tmp, path)
+    logger.info("[KR_PREP][PREP_STATUS][SAVED] path=%s rows=%s", _rel(paths[-1]), rows)
 
 
 def rescue_kr_final30_from_db(*, trade_date: date, expected_as_of: date, env: str, strategy: str | None = None) -> KrArtifactValidationResult:
@@ -549,7 +595,15 @@ def rescue_kr_final30_from_db(*, trade_date: date, expected_as_of: date, env: st
         quality_ok = bool(meta.get("contract_ok")) and strategy in {"pb1_watchlist_final_scored", os.getenv("WATCHLIST_FINAL_SCORED_STRATEGY_KEY", "pb1_watchlist_final_scored").strip().lower()}
         if quality_ok:
             logger.warning("[KR_ARTIFACT][RESCUE_FROM_DB] reason=CONTRACT_MISSING trade_date=%s expected_as_of=%s final30_rows=30 source=db_scored_final30 quality_ok=1", trade_date, expected_as_of)
-            return KrArtifactValidationResult(True, False, "DB_FINAL30_VALID_BUT_CONTRACT_MISSING", source="db_final30_scored", rows=30, db_exact_rows=30, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details={"quality_ok": 1, "strategy": strategy, "meta": meta}, final30_rows_payload=normalized)
+            logger.warning("[KR_ARTIFACT][RESCUE_ARTIFACT_REBUILD][START] trade_date=%s expected_as_of=%s", trade_date, expected_as_of)
+            try:
+                pub = publish_kr_prep_artifacts_core_fast(trade_date=trade_date, expected_as_of=expected_as_of, actual_as_of=expected_as_of, env=env, final30_rows=normalized, db_exact_rows=30, metadata={"source":"db_rescue"}, contract_hash=None, validate_files_only=True, require_db_exact=False)
+                logger.warning("[KR_ARTIFACT][RESCUE_ARTIFACT_REBUILD][SAVED] trade_date=%s expected_as_of=%s", trade_date, expected_as_of)
+                details = {"quality_ok": 1, "strategy": strategy, "meta": meta, "artifact_rebuilt": int(pub.ok)}
+            except Exception as exc:
+                logger.warning("[KR_ARTIFACT][RESCUE_ARTIFACT_REBUILD][FAIL_SOFT] err=%s", exc)
+                details = {"quality_ok": 1, "strategy": strategy, "meta": meta, "artifact_rebuilt": 0, "rebuild_error": str(exc)}
+            return KrArtifactValidationResult(True, False, "DB_FINAL30_VALID_BUT_CONTRACT_MISSING", source="db_final30_scored", rows=30, db_exact_rows=30, trade_date=trade_date, expected_as_of=expected_as_of, artifact_as_of=expected_as_of, details=details, final30_rows_payload=normalized)
         logger.error("[KR_ARTIFACT][RESCUE_FROM_DB][FAIL] reason=DB_FINAL30_INVALID rows=%s quality_ok=0", len(rows or []))
         return KrArtifactValidationResult(False, True, "DB_FINAL30_INVALID", rows=len(rows or []), db_exact_rows=len(rows or []), detail="DB_FINAL30_INVALID", trade_date=trade_date, expected_as_of=expected_as_of, details={"quality_ok": 0, "strategy": strategy, "meta": meta})
     except Exception as exc:
