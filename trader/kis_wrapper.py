@@ -2727,10 +2727,18 @@ class KisAPI:
             except Exception:
                 return 0
 
-        attempts = max(1, int(SUBJECT_FLOW_RETRY) + 1)
-        timeout = (SUBJECT_FLOW_TIMEOUT_SEC, SUBJECT_FLOW_TIMEOUT_SEC + 0.5)
+        if os.getenv("KR_INVESTOR_FLOW_ENABLED", "1") not in {"1", "true", "TRUE", "yes", "on"}:
+            return {"ok": False, "error": "disabled", "inv": None, "flow_missing": 1, "flow_score_imputed": 1}
+        attempts = max(1, int(os.getenv("KR_INVESTOR_FLOW_MAX_RETRIES", "1")) + 1)
+        read_timeout = min(float(os.getenv("KR_INVESTOR_FLOW_HTTP_TIMEOUT_SEC", str(SUBJECT_FLOW_TIMEOUT_SEC))), 1.5)
+        timeout = (read_timeout, read_timeout)
+        stage_started = time.monotonic()
+        stage_timeout = float(os.getenv("KR_INVESTOR_FLOW_STAGE_TIMEOUT_SEC", "30"))
 
         for attempt in range(1, attempts + 1):
+            if time.monotonic() - stage_started > stage_timeout:
+                logger.warning("[KR_FLOW][STAGE_TIMEOUT] elapsed=%.1f action=stop_flow_enrichment_continue_core", time.monotonic() - stage_started)
+                return {"ok": False, "error": "kis_investor_timeout", "inv": None, "flow_missing": 1, "flow_score_imputed": 1, "foreign_20_ratio": 0.0, "inst_20_ratio": 0.0}
             try:
                 self._limiter.wait("investor")
                 resp = self._safe_request(
@@ -2759,10 +2767,13 @@ class KisAPI:
                         inv[key] = _safe_num(output.get(key))
                 return {"ok": True, "inv": inv}
             except Exception as e:
-                logger.info("[INVESTOR_FAIL] %s attempt=%s err=%s", code, attempt, e)
-                if attempt >= attempts:
-                    return {"ok": False, "error": str(e), "inv": None}
-                time.sleep(0.2 * (2 ** (attempt - 1)))
+                err_text = str(e)
+                err_type = "HTTP500" if "500" in err_text else ("TIMEOUT" if "timeout" in err_text.lower() or "ReadTimeout" in err_text else type(e).__name__)
+                logger.warning("[KR_FLOW][KIS_INVESTOR][FAIL_SOFT] code=%s err_type=%s action=impute_and_continue", iscd, err_type)
+                if attempt >= attempts or os.getenv("KR_INVESTOR_FLOW_FAIL_SOFT", "1") == "1":
+                    reason = "kis_investor_http_500" if err_type == "HTTP500" else "kis_investor_timeout" if err_type == "TIMEOUT" else err_type
+                    return {"ok": False, "error": reason, "inv": None, "flow_data_available": 0, "flow_missing": 1, "flow_fail_reason": reason, "flow_score_imputed": 1, "foreign_20_ratio": 0.0, "inst_20_ratio": 0.0}
+                time.sleep(min(0.2 * (2 ** (attempt - 1)), 0.5))
 
     def get_price_snapshot(self, code: str, market: str = "J") -> dict:
         """

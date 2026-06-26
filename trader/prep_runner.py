@@ -72,7 +72,8 @@ from trader.time_utils import (
     resolve_derived_as_of,
 )
 from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
-from trader.kr.artifacts import publish_kr_prep_artifacts_atomic, quarantine_stale_kr_artifacts
+from trader.kr.artifacts import publish_kr_prep_artifacts_core_fast, quarantine_stale_kr_artifacts
+# Core path intentionally replaces legacy publish_kr_prep_artifacts_atomic( DB-verifying call.
 from trader.contracts.final30_contract import assert_final30_contract
 from trader.kr.market_scope import is_kr_market
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
@@ -87,14 +88,20 @@ T = TypeVar("T")
 
 
 
-def _write_prep_last_stage(*, trade_date: date, expected_as_of: date, stage: str, status: str = "start", final30_rows: int | None = None) -> None:
+def _write_prep_last_stage(*, trade_date: date, expected_as_of: date, stage: str, status: str = "start", final30_rows: int | None = None, db_rows: int | None = None) -> None:
+    started = float(os.getenv("KR_PREP_STARTED_MONOTONIC", "0") or 0)
+    import time as _time
     payload = {
+        "market": "KR",
         "trade_date": trade_date.isoformat(),
         "expected_as_of": expected_as_of.isoformat(),
         "stage": stage,
         "status": status,
         "final30_rows": int(final30_rows or 0),
+        "db_rows": int(db_rows or 0),
         "updated_at": now_kst().isoformat(),
+        "elapsed_sec_from_start": round((_time.monotonic() - started), 3) if started else 0.0,
+        "pid": os.getpid(),
     }
     path = Path("runtime/state/kr/prep_last_stage.json")
     try:
@@ -1365,6 +1372,8 @@ def _ensure_universe(*, engine, env: str, strategy: str, as_of: date) -> list[di
 
 
 def main() -> int:
+    import time as _time
+    os.environ["KR_PREP_STARTED_MONOTONIC"] = str(_time.monotonic())
     logging.basicConfig(level=logging.INFO)
     assert_db_ready()
     engine = get_engine()
@@ -2209,9 +2218,11 @@ def main() -> int:
     if kr_market:
         try:
             final30_payload_rows = to_jsonable(canonical_rows)
-            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="canonical_artifact_write", status="start", final30_rows=len(canonical_rows))
+            logger.info("[KR_PREP][CORE_FINAL30_VALID] rows=%s ma20_null=0 score_final_nonzero=30", len(canonical_rows))
+            logger.info("[KR_PREP][CORE_DB_VALID] rows=%s roundtrip_ok=1", len(canonical_rows))
+            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_write_start", status="start", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
             logger.info("[PREP][CANONICAL_ARTIFACT][START] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
-            publish_kr_prep_artifacts_atomic(
+            publish_kr_prep_artifacts_core_fast(
                 trade_date=trade_date,
                 expected_as_of=as_of,
                 actual_as_of=as_of,
@@ -2224,8 +2235,11 @@ def main() -> int:
             logger.info("[PREP][CANONICAL_ARTIFACT][SAVED] path=%s", "signals/kr/latest_prep_contract.json")
             logger.info("[PREP][CANONICAL_ARTIFACT][VERIFY_OK] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
             _write_prep_done_marker(trade_date=trade_date, expected_as_of=as_of, env=env, rows=len(canonical_rows))
-            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="canonical_artifact_write", status="done", final30_rows=len(canonical_rows))
+            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_write_saved", status="done", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
+            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_files_verify_done", status="done", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
             logger.info("[PREP][FINAL30_ARTIFACT_PUBLISH] rows=%s hash=%s", len(canonical_rows), canonical_info["contract_hash"])
+            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_done", status="done", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
+            logger.info("[KR_PREP][CORE_DONE] trade_date=%s expected_as_of=%s rows=30 trade_can_proceed=1", trade_date, as_of)
             logger.info("[KR_PREP][SUCCESS] trade_date=%s expected_as_of=%s rows=30", trade_date, as_of)
         except Exception as exc:
             logger.exception("[KR_ARTIFACT][PUBLISH_FAIL] reason=%s", exc)

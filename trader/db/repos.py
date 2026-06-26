@@ -6667,13 +6667,28 @@ def load_exact_final30_scored(
     strategy: str = "pb1_watchlist_final_scored",
 ) -> list[dict]:
     """Load exact final30 rows for trade fallback; fail closed unless rows are 1..30."""
-    try:
-        df = load_final30_scored_db_only(
+    import concurrent.futures
+    timeout = float(os.getenv("KR_DB_LOAD_FINAL30_TIMEOUT_SEC", "15"))
+    def _load_df():
+        return load_final30_scored_db_only(
             engine, env=env, as_of=as_of, strategy=strategy, require_exact_rows=30, fail_if_missing=True
         )
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_load_df)
+    try:
+        df = fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        ex.shutdown(wait=False, cancel_futures=True)
+        logger.error("[DB][FINAL30_SCORED][LOAD_TIMEOUT] env=%s as_of=%s strategy=%s timeout_sec=%s", env, as_of, strategy, timeout)
+        raise TimeoutError("KR_DB_LOAD_FINAL30_TIMEOUT")
     except Exception as exc:
         logger.exception("[DB][FINAL30_EXACT][LOAD_FAIL] env=%s as_of=%s strategy=%s err=%s", env, as_of, strategy, exc)
         return []
+    finally:
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
     rows = [dict(r or {}) for r in df.to_dict(orient="records")]
     ranks = []
     for r in rows:

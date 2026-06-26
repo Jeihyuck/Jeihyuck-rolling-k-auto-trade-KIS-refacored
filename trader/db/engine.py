@@ -155,7 +155,7 @@ def make_engine() -> sa.Engine:
     try:
         # SQLAlchemy 엔진 생성 (psycopg v3 지원)
         connect_args = _connect_args_for_db_url(url)
-        return sa.create_engine(
+        engine = sa.create_engine(
             url,
             connect_args=connect_args,
             execution_options={"compiled_cache": None},
@@ -167,6 +167,16 @@ def make_engine() -> sa.Engine:
             pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "10")),
             future=True,
         )
+        if _is_postgres_url(url):
+            @sa.event.listens_for(engine, "begin")
+            def _set_local_timeouts(conn):
+                try:
+                    conn.exec_driver_sql("SET LOCAL lock_timeout = '5s'")
+                    conn.exec_driver_sql("SET LOCAL statement_timeout = '15s'")
+                    conn.exec_driver_sql("SET LOCAL idle_in_transaction_session_timeout = '15s'")
+                except Exception as exc:
+                    logger.warning("[DB][TIMEOUTS][SET_LOCAL_FAIL] err=%s", exc)
+        return engine
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Postgres driver missing. Install psycopg[binary]. "
