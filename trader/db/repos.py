@@ -6823,9 +6823,30 @@ class DerivedMinerviniRepo:
         )
         if symbols:
             stmt = stmt.where(schema.derived_minervini.c.symbol.in_(symbols))
-        with self.engine.connect() as conn:
-            rows = conn.execute(stmt).mappings().all()
-        return [self._normalize_derived_row(dict(row)) for row in rows]
+        last_exc = None
+        for attempt in (1, 2):
+            try:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(stmt).mappings().all()
+                return [self._normalize_derived_row(dict(row)) for row in rows]
+            except Exception as exc:
+                last_exc = exc
+                reason = str(exc)
+                if "EDBHANDLEREXITED" not in reason and "connection to database closed" not in reason.lower():
+                    raise
+                try:
+                    self.engine.dispose()
+                except Exception:
+                    pass
+                if attempt == 1:
+                    continue
+                logger.warning(
+                    "[DB][DERIVED][LOAD_FAIL_SOFT] reason=EDBHANDLEREXITED action=use_existing_final30_payload"
+                )
+                return []
+        if last_exc is not None:
+            raise last_exc
+        return []
 
     def count_as_of(self, *, env: str, as_of: date) -> int:
         schema = self._schema
