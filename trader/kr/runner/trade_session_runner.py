@@ -23,6 +23,7 @@ from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
 from trader.kr.artifacts import (
     validate_kr_prep_artifact,
     quarantine_stale_kr_artifacts,
+    rescue_kr_final30_from_db,
 )
 from trader.kr.diagnostics import write_kr_diagnostics_manifest
 from trader.kr.runner.session_policy import exit_code_for_result, kr_prep_schedule_guard, now_kst, wait_until_kr_am_target
@@ -224,7 +225,19 @@ def _guard_trade_session(session: str, ctx: KrSessionContext) -> dict[str, Any] 
         return None
     result = validate_kr_prep_artifact(trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, env=os.getenv("STRATEGY_ENV", "practice"), strict=True, allow_legacy_fallback=False)
     if not result.ok:
-        logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=%s detail=%s", session, result.reason, result.detail)
+        if session in {"am", "afternoon", "close"} and result.detail == "CONTRACT_MISSING" and ctx.expected_as_of is not None:
+            rescue = rescue_kr_final30_from_db(
+                trade_date=ctx.trade_date,
+                expected_as_of=ctx.expected_as_of,
+                env=os.getenv("STRATEGY_ENV", "practice"),
+            )
+            if rescue.ok:
+                logger.warning("[KR_SESSION][PRECHECK_RESCUED] session=%s reason=DB_FINAL30_VALID_BUT_CONTRACT_MISSING source=db_final30_scored", session)
+                logger.info("[KR_SESSION][PROCEED] session=%s", session)
+                return None
+            logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=%s detail=%s db_rescue=failed", session, result.reason, result.detail)
+        else:
+            logger.error("[KR_SESSION][PRECHECK_FAIL] session=%s reason=%s detail=%s", session, result.reason, result.detail)
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=FAIL reason=%s orders_intent=0 orders_ack=0 blocked=0", session, result.reason)
         return {"status": "FAIL", "reason": result.reason}
     logger.info("[KR_SESSION][PRECHECK_OK] session=%s source=%s rows=%s reason=%s", session, result.source, result.rows, result.reason)

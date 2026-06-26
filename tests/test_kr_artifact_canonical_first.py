@@ -231,7 +231,7 @@ def test_publish_metadata_cannot_override_canonical_contract_keys(tmp_path, monk
     contract_path = tmp_path / "runtime/kr/watchlist" / trade_date.isoformat() / "prep_contract.json"
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
 
-    assert contract["source"] == "fresh_build"
+    assert contract["source"] == "prep_runner"
     assert contract["canonical"] is True
     assert contract["rows"] == 30
     assert contract["trade_can_proceed"] == 1

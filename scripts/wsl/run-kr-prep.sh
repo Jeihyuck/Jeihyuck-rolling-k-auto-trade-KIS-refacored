@@ -61,7 +61,7 @@ LATEST_LINK="runtime/logs/kr/wsl-kr-prep.latest.log"
 ln -sfn "${TODAY_KST}/wsl-kr-prep.log" "$LATEST_LINK"
 {
 NOW_HM=$(TZ=Asia/Seoul date +%H:%M)
-if [[ "$NOW_HM" < "06:30" || "$NOW_HM" > "08:50" ]]; then
+if [[ "$NOW_HM" < "05:00" || "$NOW_HM" > "08:50" ]]; then
   echo "[KR_PREP][SCHEDULE_GUARD] now=$NOW_HM allowed=0 reason=OUTSIDE_PREP_WINDOW"
   if [[ "${ALLOW_KR_PREP_OUTSIDE_WINDOW:-0}" != "1" ]]; then
     echo "[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW"
@@ -73,7 +73,8 @@ else
 fi
 
   echo "[KR_PREP][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
-  KR_PREP_TIMEOUT_SEC="${KR_PREP_TIMEOUT_SEC:-7200}"
+  KR_PREP_TIMEOUT_SEC="${KR_PREP_TIMEOUT_SEC:-10800}"
+  echo "[KR_PREP][EFFECTIVE_ENV] timeout_sec=${KR_PREP_TIMEOUT_SEC} allow_outside_window=${ALLOW_KR_PREP_OUTSIDE_WINDOW:-0} artifact_strict=${KR_ARTIFACT_STRICT:-1} require_contract=${KR_REQUIRE_CANONICAL_PREP_CONTRACT:-1}"
   set +e
   (
     # The parent shell keeps the session lock. Close the lock fd before exec'ing
@@ -86,7 +87,15 @@ fi
   rc=$?
   set -e
   if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
-    echo "[KR_PREP][TIMEOUT] timeout_sec=${KR_PREP_TIMEOUT_SEC}"
+    LAST_STAGE_FILE="runtime/state/kr/prep_last_stage.json"
+    LAST_STAGE=""; LAST_STAGE_TS=""; LAST_STAGE_ASOF=""; LAST_STAGE_ROWS=""
+    if [[ -f "$LAST_STAGE_FILE" ]]; then
+      LAST_STAGE=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+      LAST_STAGE_TS=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("updated_at", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+      LAST_STAGE_ASOF=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("expected_as_of", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+      LAST_STAGE_ROWS=$(python -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")); print(d.get("final30_rows", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true)
+    fi
+    echo "[KR_PREP][TIMEOUT] timeout_sec=${KR_PREP_TIMEOUT_SEC} last_stage=${LAST_STAGE} last_stage_ts=${LAST_STAGE_TS} expected_as_of=${LAST_STAGE_ASOF} final30_rows=${LAST_STAGE_ROWS}"
   fi
   echo "[KR_PREP][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc

@@ -86,6 +86,41 @@ T = TypeVar("T")
 
 
 
+
+def _write_prep_last_stage(*, trade_date: date, expected_as_of: date, stage: str, status: str = "start", final30_rows: int | None = None) -> None:
+    payload = {
+        "trade_date": trade_date.isoformat(),
+        "expected_as_of": expected_as_of.isoformat(),
+        "stage": stage,
+        "status": status,
+        "final30_rows": int(final30_rows or 0),
+        "updated_at": now_kst().isoformat(),
+    }
+    path = Path("runtime/state/kr/prep_last_stage.json")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("[PREP][STAGE] stage=%s status=%s final30_rows=%s state_path=%s", stage, status, int(final30_rows or 0), path)
+    except Exception as exc:
+        logger.warning("[PREP][STAGE][WRITE_FAIL] stage=%s err=%s", stage, exc)
+
+
+def _write_prep_done_marker(*, trade_date: date, expected_as_of: date, env: str, rows: int) -> Path:
+    path = Path("runtime/kr/watchlist") / trade_date.isoformat() / "prep_done.json"
+    payload = {
+        "market": "KR",
+        "trade_date": trade_date.isoformat(),
+        "expected_as_of": expected_as_of.isoformat(),
+        "env": env,
+        "rows": int(rows),
+        "status": "PREP_CORE_DONE",
+        "created_at": now_kst().isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("[PREP][DONE_MARKER][SAVED] path=%s", path)
+    return path
+
 def _run_prep_aux_with_timeout(
     *,
     stage: str,
@@ -1395,7 +1430,9 @@ def main() -> int:
         "watchlist": effective_as_of.isoformat(),
     }
 
+    _write_prep_last_stage(trade_date=run_date, expected_as_of=as_of, stage="universe_build", status="start")
     members = _ensure_universe(engine=engine, env=env, strategy=universe_strategy, as_of=effective_as_of)
+    _write_prep_last_stage(trade_date=run_date, expected_as_of=as_of, stage="universe_build", status="done", final30_rows=0)
     if not members:
         logger.error("[PREP][FAIL] universe empty")
         return 1
@@ -2168,9 +2205,12 @@ def main() -> int:
     logger.info("[PREP][DONE_CORE][DB_OK] rows=%s", core_save_result.get("db_rows", 0))
     logger.info("[DB][FINAL30_SCORED][EXACT_COUNT] rows=%s", core_save_result.get("db_rows", 0))
     logger.info("[WATCHLIST][BUILD][DONE] final30=%s", len(final30_scored_df_for_export))
+    _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="watchlist_build_done", status="done", final30_rows=len(final30_scored_df_for_export))
     if kr_market:
         try:
             final30_payload_rows = to_jsonable(canonical_rows)
+            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="canonical_artifact_write", status="start", final30_rows=len(canonical_rows))
+            logger.info("[PREP][CANONICAL_ARTIFACT][START] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
             publish_kr_prep_artifacts_atomic(
                 trade_date=trade_date,
                 expected_as_of=as_of,
@@ -2181,6 +2221,10 @@ def main() -> int:
                 metadata={"run_id": run_id},
                 contract_hash=canonical_info["contract_hash"],
             )
+            logger.info("[PREP][CANONICAL_ARTIFACT][SAVED] path=%s", "signals/kr/latest_prep_contract.json")
+            logger.info("[PREP][CANONICAL_ARTIFACT][VERIFY_OK] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
+            _write_prep_done_marker(trade_date=trade_date, expected_as_of=as_of, env=env, rows=len(canonical_rows))
+            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="canonical_artifact_write", status="done", final30_rows=len(canonical_rows))
             logger.info("[PREP][FINAL30_ARTIFACT_PUBLISH] rows=%s hash=%s", len(canonical_rows), canonical_info["contract_hash"])
             logger.info("[KR_PREP][SUCCESS] trade_date=%s expected_as_of=%s rows=30", trade_date, as_of)
         except Exception as exc:
@@ -2287,12 +2331,16 @@ def main() -> int:
             "source": "prep_runner_existing_final30_scored",
         },
     )
-    aux_bundle_result = save_bundle_aux(
-        engine=engine,
-        env=env,
-        as_of=as_of,
-        bundle=aux_bundle,
-    )
+    try:
+        aux_bundle_result = save_bundle_aux(
+            engine=engine,
+            env=env,
+            as_of=as_of,
+            bundle=aux_bundle,
+        )
+    except Exception as exc:
+        aux_bundle_result = {"ok": False, "error": str(exc)}
+        logger.exception("[PREP][AUX][FAIL_SOFT] stage=save_bundle_aux err=%s action=continue_core_artifact_ready", exc)
     core_done = False
     prep_repo_root = repo_root().resolve()
     prep_cwd = Path.cwd().resolve()
