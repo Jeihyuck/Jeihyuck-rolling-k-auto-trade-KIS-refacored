@@ -1029,6 +1029,10 @@ def run_trade_session(
             # total: 세션 전체 누적 합산 (주문 건수 집계용)
             "entry_intents_total": total_buy_decisions,
             "exit_intents_total": total_sell_decisions,
+            "entry_degraded": int(final_tick.get("entry_degraded", 0) or 0),
+            "entry_degraded_reason": final_tick.get("entry_degraded_reason", ""),
+            "watchlist_fallback_used": int(final_tick.get("watchlist_fallback_used", 0) or 0),
+            "exit_routed_after_entry_degraded": int(final_tick.get("exit_routed_after_entry_degraded", 0) or 0),
             # 하위 호환: entry_intents는 total 값으로 유지
             "entry_intents": total_buy_decisions,
             "orders_sent": total_orders_sent if total_orders_sent else int(final_tick.get("orders_sent", 0) or 0),
