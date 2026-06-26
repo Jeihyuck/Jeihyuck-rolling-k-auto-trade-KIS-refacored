@@ -110,3 +110,34 @@ def test_canonical_final30_short_numeric_code_is_padded():
     )
     assert contract["contract_ok"] == 1
     assert normalized[0]["code"] == "006360"
+
+
+def test_shared_final30_contract_reassigns_rank_and_meta_rank():
+    from trader.contracts.final30_contract import assert_final30_contract
+
+    input_rows = [
+        {
+            "code": f"{i:06d}",
+            "name": f"stock{i}",
+            "as_of": "2026-06-19",
+            "rank": 0,
+            "rank_final30": 0,
+            "final_score": float(100 - i),
+            "meta": {"rank": 0, "rank_final30": 0},
+        }
+        for i in range(1, 31)
+    ]
+
+    rows, info = assert_final30_contract(
+        input_rows,
+        as_of="2026-06-19",
+        env="practice",
+        source="test.final30_contract",
+        require_count=30,
+    )
+
+    assert len(rows) == 30
+    assert [r["rank_final30"] for r in rows] == list(range(1, 31))
+    assert [r["meta"]["rank_final30"] for r in rows] == list(range(1, 31))
+    assert info["ok"] is True
+    assert info["contract_hash"]
