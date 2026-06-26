@@ -579,7 +579,7 @@ def validate_kr_prep_artifact_db_exact(*, trade_date: date, expected_as_of: date
 
 def _write_kr_prep_status_files(*, trade_date: date, expected_as_of: date, env: str, rows: int, db_roundtrip_ok: int, source: str) -> None:
     created_at = datetime.now(KST).isoformat()
-    payload = {"market":"KR","env":env,"trade_date":trade_date.isoformat(),"expected_as_of":expected_as_of.isoformat(),"status":"OK","status_ok":True,"core_done":True,"contract_ok":True,"trade_can_proceed":1,"final30_rows":int(rows),"db_roundtrip_ok":int(db_roundtrip_ok),"artifact_saved":1,"source":source,"created_at":created_at}
+    payload = {"market":"KR","env":env,"trade_date":trade_date.isoformat(),"expected_as_of":expected_as_of.isoformat(),"status":"OK","status_ok":True,"core_done":True,"contract_ok":True,"trade_can_proceed":True,"rows":int(rows),"final30_rows":int(rows),"db_roundtrip_ok":int(db_roundtrip_ok),"artifact_saved":1,"source":source,"created_at":created_at}
     paths = [ROOT/"runtime/kr/watchlist"/trade_date.isoformat()/"prep_done.json", ROOT/"runtime/kr/prep_status"/trade_date.isoformat()/"prep_status.json", ROOT/"signals/kr/latest_prep_status.json"]
     for path in paths:
         tmp = _write_tmp(path, payload)

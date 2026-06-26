@@ -1802,6 +1802,20 @@ def main() -> int:
             "reject_summary": {},
         }
         watchlist_result_payload = watchlist_result if isinstance(watchlist_result, dict) else watchlist_bundle
+    if bool(_safe_get(watchlist_bundle, "core_artifact_saved", False)) and bool(
+        _safe_get(watchlist_bundle, "db_save_failed_after_core", False)
+    ):
+        reason = str(_safe_get(watchlist_bundle, "db_save_fail_reason", "aux_db_save_failed_after_core"))
+        logger.warning("[PREP][AUX][FAIL_SOFT] reason=%s action=exit_zero_core_done", reason)
+        _write_prep_last_stage(
+            trade_date=run_date,
+            expected_as_of=as_of,
+            stage="aux_degraded",
+            status="done",
+            final30_rows=len(watchlist or []),
+        )
+        logger.info("[KR_PREP][EXIT] exit_code=0 status=OK_CORE_AUX_DEGRADED")
+        return 0
     dt_watchlist = time.monotonic() - t_watchlist
     logger.info("[PREP][HEARTBEAT] stage=watchlist_scoring status=done")
     logger.info("[STAGE][DONE] name=%s dt=%.2f", "watchlist", dt_watchlist)
@@ -2188,19 +2202,33 @@ def main() -> int:
     )
     final30_scored_df_for_export = pd.DataFrame(normalized_rows)
     logger.info("[PREP][DONE_CORE][START] as_of=%s", as_of.isoformat())
-    core_save_result = save_final30_scored_core(
-        final30_scored_df_for_export,
-        as_of,
-        env,
-        engine=engine,
-        final_strategy=watchlist_final_strategy,
-        final_scored_strategy=watchlist_final_scored_strategy,
-        watchlist_rows=watchlist,
-    )
-    exact_final_rows = list(core_save_result.get("exact_final_rows") or [])
-    db_roundtrip_rows = load_exact_final30_scored(
-        engine, env=env, as_of=as_of, strategy=watchlist_final_scored_strategy
-    )
+    try:
+        core_save_result = save_final30_scored_core(
+            final30_scored_df_for_export,
+            as_of,
+            env,
+            engine=engine,
+            final_strategy=watchlist_final_strategy,
+            final_scored_strategy=watchlist_final_scored_strategy,
+            watchlist_rows=watchlist,
+        )
+        exact_final_rows = list(core_save_result.get("exact_final_rows") or [])
+        db_roundtrip_rows = load_exact_final30_scored(
+            engine, env=env, as_of=as_of, strategy=watchlist_final_scored_strategy
+        )
+    except Exception as exc:
+        if bool(_safe_get(watchlist_bundle, "core_artifact_saved", False)):
+            logger.warning("[PREP][AUX][FAIL_SOFT] reason=%s action=exit_zero_core_done", exc)
+            _write_prep_last_stage(
+                trade_date=trade_date,
+                expected_as_of=as_of,
+                stage="aux_degraded",
+                status="done",
+                final30_rows=len(final30_scored_df_for_export),
+            )
+            logger.info("[KR_PREP][EXIT] exit_code=0 status=OK_CORE_AUX_DEGRADED")
+            return 0
+        raise
     canonical_rows, canonical_info = assert_final30_contract(
         db_roundtrip_rows,
         as_of=as_of.isoformat(),

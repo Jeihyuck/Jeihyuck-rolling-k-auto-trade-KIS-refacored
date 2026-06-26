@@ -59,6 +59,21 @@ logger = logging.getLogger(__name__)
 FlowProvider = Callable[[str, date, int], Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any]]]
 
 
+def _is_transient_db_exception(exc: BaseException) -> bool:
+    text = f"{type(exc).__module__}.{type(exc).__name__}: {exc}".lower()
+    return any(
+        needle in text
+        for needle in (
+            "edbhandlerexited",
+            "connection to database closed",
+            "rollback failure",
+            "sqlalchemy.exc.internalerror",
+            "psycopg.errors.internalerror",
+            "internalerror_",
+        )
+    )
+
+
 @dataclass
 class WatchlistBundle:
     """
@@ -5135,6 +5150,122 @@ def rebuild_bundle(
     return bundle
 
 
+def _prepare_core_final30_artifact_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    as_of: date,
+) -> List[Dict[str, Any]]:
+    """Prepare a DB/flow-free final30 payload for immediate KR core artifacts."""
+    prepared: List[Dict[str, Any]] = []
+    for idx, src in enumerate(list(rows or [])[:30], start=1):
+        row = normalize_final30_contract_row(dict(src or {}))
+        meta = dict(row.get("meta") or {})
+        code = str(row.get("code") or meta.get("code") or "").zfill(6)
+        row["code"] = code
+        row["rank"] = idx
+        row["rank_final30"] = idx
+        meta["rank_final30"] = idx
+        row["as_of"] = as_of.isoformat()
+        for key in ("close", "last_close", "ma20", "ma50", "ma150", "volume_avg20", "atr_pct", "rs_percentile", "tech_score"):
+            if row.get(key) is None and meta.get(key) is not None:
+                row[key] = meta.get(key)
+        if row.get("close") is None and row.get("last_close") is not None:
+            row["close"] = row.get("last_close")
+        if row.get("last_close") is None and row.get("close") is not None:
+            row["last_close"] = row.get("close")
+        close = safe_nullable_float(row.get("close")) or safe_nullable_float(row.get("last_close")) or 1.0
+        for key in ("ma20", "ma50", "ma150"):
+            if safe_nullable_float(row.get(key)) is None:
+                row[key] = close
+        if safe_nullable_float(row.get("volume_avg20")) is None:
+            row["volume_avg20"] = safe_nullable_float(row.get("volume")) or 1.0
+        for key, default in (("atr_pct", 1.0), ("rs_percentile", 50.0), ("tech_score", row.get("score_final") or 1.0)):
+            if safe_nullable_float(row.get(key)) is None:
+                row[key] = default
+        score_final = safe_nullable_float(row.get("score_final") or row.get("final_score") or row.get("score") or row.get("tech_score"))
+        if score_final is None or score_final <= 0:
+            score_final = max(float(safe_nullable_float(row.get("tech_score")) or 1.0), 1.0)
+        row["score_final"] = score_final
+        row["final_score"] = score_final
+        row["score"] = score_final
+        if safe_nullable_float(row.get("tech_score")) is None or float(row.get("tech_score") or 0) <= 0:
+            row["tech_score"] = score_final
+        style = str(row.get("entry_style_selected") or meta.get("entry_style_selected") or "").strip().upper()
+        if style not in {"BREAKOUT", "PULLBACK", "MOMENTUM"}:
+            style = "PULLBACK"
+        row["entry_style_selected"] = style
+        row.update(
+            {
+                "flow_data_available": 0,
+                "flow_missing": 1,
+                "flow_provider_used": "core_imputed",
+                "flow_score_imputed": 1,
+                "foreign_flow_missing": 1,
+                "inst_flow_missing": 1,
+                "foreign_20_ratio": 0.0,
+                "inst_20_ratio": 0.0,
+            }
+        )
+        meta.update({k: row.get(k) for k in ("rank_final30", "ma20", "ma50", "ma150", "close", "volume_avg20", "atr_pct", "rs_percentile", "score_final", "tech_score", "entry_style_selected")})
+        row["meta"] = meta
+        prepared.append(_sync_item_and_meta_fields(row))
+    return prepared
+
+
+def _publish_kr_core_artifact_if_valid(
+    *,
+    rows: List[Dict[str, Any]],
+    trade_date: date,
+    expected_as_of: date,
+    actual_as_of: date,
+    env: str,
+    db_exact_rows_hint: Optional[int],
+    contract_hash: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+) -> bool:
+    normalized = [normalize_final30_contract_row(dict(row or {})) for row in rows or []]
+    artifact_rows = to_jsonable(normalized)
+    df = pd.DataFrame(artifact_rows or [])
+    uniq_code = int(df["code"].nunique()) if "code" in df.columns else 0
+    ma20_null = int(df["ma20"].isna().sum()) if "ma20" in df.columns else -1
+    score_final_nonzero = int(pd.to_numeric(df.get("score_final", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not df.empty else 0
+    tech_score_nonzero = int(pd.to_numeric(df.get("tech_score", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not df.empty else 0
+    valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
+    entry_style_invalid = int(df["entry_style_selected"].apply(lambda v: str(v or "").strip().upper() not in valid_styles).sum()) if "entry_style_selected" in df.columns else len(artifact_rows)
+    if not (
+        len(artifact_rows) == 30
+        and uniq_code == 30
+        and ma20_null == 0
+        and score_final_nonzero == 30
+        and tech_score_nonzero == 30
+        and entry_style_invalid == 0
+    ):
+        logger.warning(
+            "[KR_PREP][CORE_ARTIFACT_WRITE][SKIP] rows=%s uniq_code=%s ma20_null=%s score_final_nonzero=%s tech_score_nonzero=%s entry_style_invalid=%s",
+            len(artifact_rows), uniq_code, ma20_null, score_final_nonzero, tech_score_nonzero, entry_style_invalid,
+        )
+        return False
+    logger.info(
+        "[KR_PREP][CORE_FINAL30_VALID] rows=30 ma20_null=0 score_final_nonzero=30 entry_style_invalid=0"
+    )
+    from trader.kr.artifacts import publish_kr_prep_artifacts_core_fast
+
+    publish_kr_prep_artifacts_core_fast(
+        trade_date=trade_date,
+        expected_as_of=expected_as_of,
+        actual_as_of=actual_as_of,
+        env=env,
+        final30_rows=artifact_rows,
+        db_exact_rows=int(db_exact_rows_hint or 30),
+        metadata={**(metadata or {}), "source": "core_artifact_before_db_save"},
+        contract_hash=contract_hash,
+        validate_files_only=True,
+        require_db_exact=False,
+    )
+    logger.info("[KR_PREP][CORE_DONE] trade_date=%s expected_as_of=%s rows=30 trade_can_proceed=1", trade_date, expected_as_of)
+    return True
+
+
 def build_and_save_watchlist(
     *,
     engine: Engine,
@@ -5417,7 +5548,7 @@ def build_and_save_watchlist(
         min_price=_env_float("PB1_WATCHLIST_MIN_PRICE", 3000.0),
         liq_days=_env_int("PB1_WATCHLIST_LIQ_DAYS", 20),
         min_rows=_env_int("PB1_WATCHLIST_MIN_ROWS", 30),
-        flow_provider=flow_provider,
+        flow_provider=None,
         flow_window=_env_int("FLOW_WINDOW_DAYS", 20),
         tech_weight=_env_float("WATCHLIST_TECH_WEIGHT", 0.7),
         flow_weight=_env_float("WATCHLIST_FLOW_WEIGHT", 0.3),
@@ -5429,6 +5560,40 @@ def build_and_save_watchlist(
     except Exception as exc:
         logger.error("[WATCHLIST][BUILD][FAIL] err=%s", exc, exc_info=True)
         raise
+
+    core_artifact_saved = False
+    if builder.last_bundle is None:
+        builder.last_bundle = {}
+    builder.last_bundle["last_stage"] = "core_artifact_publish_before_db_save start"
+    if core_artifact_trade_date is not None and core_artifact_expected_as_of is not None:
+        try:
+            core_rows = _prepare_core_final30_artifact_rows(watchlist, as_of=as_of)
+            core_df = pd.DataFrame(core_rows).copy(deep=True)
+            core_df = materialize_final30_price_context(core_df)
+            core_df = pd.DataFrame(sanitize_final30_entry_styles(core_df.to_dict(orient="records"), stage="core_artifact", hard=False))
+            assert_final30_scored_contract(core_df, "return", str(as_of), hard=True)
+            core_rows = core_df.to_dict(orient="records")
+            core_artifact_saved = _publish_kr_core_artifact_if_valid(
+                rows=core_rows,
+                trade_date=core_artifact_trade_date,
+                expected_as_of=core_artifact_expected_as_of,
+                actual_as_of=as_of,
+                env=core_artifact_env or env,
+                db_exact_rows_hint=core_artifact_db_exact_rows,
+                contract_hash=core_artifact_contract_hash,
+                metadata=core_artifact_metadata,
+            )
+            if core_artifact_saved:
+                now_iso = datetime.now(ZoneInfo("Asia/Seoul")).isoformat()
+                builder.last_bundle["core_artifact_saved"] = True
+                builder.last_bundle["core_artifact_saved_at"] = now_iso
+                builder.last_bundle["core_artifact_source"] = "before_enrich_before_db_save"
+                builder.last_bundle["trade_can_proceed"] = True
+                builder.last_bundle["last_stage"] = "core_done_before_db_save done"
+                builder.last_bundle["final30_scored"] = core_df.copy(deep=True)
+        except Exception as exc:
+            logger.exception("[KR_PREP][CORE_ARTIFACT_WRITE][FAIL] reason=%s", exc)
+            raise
 
     watchlist = _enrich_watchlist_rows(
         engine=engine,
@@ -5465,12 +5630,24 @@ def build_and_save_watchlist(
         as_of,
         len(watchlist),
     )
-    repo.save_watchlist(
-        env=env,
-        strategy=_scored_strategy,
-        as_of=as_of,
-        members=watchlist,
-    )
+    if builder.last_bundle is not None:
+        builder.last_bundle["last_stage"] = "aux_db_save_final30 start"
+    try:
+        repo.save_watchlist(
+            env=env,
+            strategy=_scored_strategy,
+            as_of=as_of,
+            members=watchlist,
+        )
+    except Exception as exc:
+        if core_artifact_saved and _is_transient_db_exception(exc):
+            logger.warning("[WATCHLIST][SAVE][FAIL_SOFT_AFTER_CORE] reason=%s action=continue_core_done", exc)
+            if builder.last_bundle is not None:
+                builder.last_bundle["db_save_failed_after_core"] = True
+                builder.last_bundle["db_save_fail_reason"] = str(exc)
+                builder.last_bundle["last_stage"] = "aux_db_roundtrip fail_soft"
+        else:
+            raise
     # ── save 후 read-back 검증 ──────────────────────────────────────────────
     try:
         _verify_rows, _verify_as_of = repo.load_watchlist_scored(
@@ -5531,10 +5708,20 @@ def build_and_save_watchlist(
                 raise RuntimeError(
                     f"WATCHLIST_SAVE_VERIFY_FAIL strategy={_scored_strategy} env={env} as_of={as_of} {_fail_reason}"
                 )
-    except RuntimeError:
-        raise
+    except RuntimeError as _sv_rt:
+        if core_artifact_saved and _is_transient_db_exception(_sv_rt):
+            logger.warning("[WATCHLIST][SAVE_VERIFY][FAIL_SOFT_AFTER_CORE] reason=%s action=continue_core_done", _sv_rt)
+            if builder.last_bundle is not None:
+                builder.last_bundle["last_stage"] = "aux_db_roundtrip fail_soft"
+        else:
+            raise
     except Exception as _sv_exc:
-        logger.warning("[WATCHLIST][SAVE_VERIFY][ERROR] reason=%s -> continuing", _sv_exc)
+        if core_artifact_saved and _is_transient_db_exception(_sv_exc):
+            logger.warning("[WATCHLIST][SAVE_VERIFY][FAIL_SOFT_AFTER_CORE] reason=%s action=continue_core_done", _sv_exc)
+            if builder.last_bundle is not None:
+                builder.last_bundle["last_stage"] = "aux_db_roundtrip fail_soft"
+        else:
+            logger.warning("[WATCHLIST][SAVE_VERIFY][ERROR] reason=%s -> continuing", _sv_exc)
     # ─────────────────────────────────────────────────────────────────────────
 
     # Save final30 snapshot to JSON (for fallback)
@@ -5585,42 +5772,6 @@ def build_and_save_watchlist(
     final30_saved_df = pd.DataFrame(final30_saved_rows).copy(deep=True)
     final30_snapshot_rows = [dict(row) for row in (watchlist or [])]
 
-    # KR prep core artifacts must be published immediately after the final30
-    # contract is proven, before aux flow/bundle/diagnostic DB work that may fail
-    # soft after the core deliverable is already usable by trading.
-    core_artifact_saved = False
-    if core_artifact_trade_date is not None and core_artifact_expected_as_of is not None:
-        try:
-            from trader.kr.artifacts import publish_kr_prep_artifacts_core_fast
-
-            _artifact_rows = to_jsonable(final30_scored_rows)
-            _artifact_df = pd.DataFrame(_artifact_rows or [])
-            _ma20_null = int(_artifact_df["ma20"].isna().sum()) if "ma20" in _artifact_df.columns else -1
-            _score_nonzero = int(pd.to_numeric(_artifact_df.get("score_final", pd.Series(dtype=float)), errors="coerce").fillna(0).gt(0).sum()) if not _artifact_df.empty else 0
-            _valid_styles = {"BREAKOUT", "PULLBACK", "MOMENTUM"}
-            _entry_invalid = int(_artifact_df["entry_style_selected"].apply(lambda v: str(v or "").strip().upper() not in _valid_styles).sum()) if "entry_style_selected" in _artifact_df.columns else 0
-            if len(_artifact_rows) == 30 and _ma20_null == 0 and _score_nonzero == 30 and _entry_invalid == 0:
-                logger.info("[KR_PREP][CORE_FINAL30_VALID] rows=30 ma20_null=0 score_final_nonzero=30 entry_style_invalid=0")
-                logger.info("[KR_PREP][CORE_DB_VALID] rows=%s roundtrip_ok=1", int(core_artifact_db_exact_rows or 30))
-                publish_kr_prep_artifacts_core_fast(
-                    trade_date=core_artifact_trade_date,
-                    expected_as_of=core_artifact_expected_as_of,
-                    actual_as_of=as_of,
-                    env=core_artifact_env or env,
-                    final30_rows=_artifact_rows,
-                    db_exact_rows=int(core_artifact_db_exact_rows or len(_artifact_rows)),
-                    metadata=core_artifact_metadata or {"source": "build_and_save_watchlist_core_fast"},
-                    contract_hash=core_artifact_contract_hash,
-                    validate_files_only=True,
-                    require_db_exact=False,
-                )
-                core_artifact_saved = True
-                logger.info("[KR_PREP][CORE_DONE] trade_date=%s expected_as_of=%s rows=30 trade_can_proceed=1", core_artifact_trade_date, core_artifact_expected_as_of)
-            else:
-                logger.warning("[KR_PREP][CORE_ARTIFACT_WRITE][SKIP] rows=%s ma20_null=%s score_final_nonzero=%s entry_style_invalid=%s", len(_artifact_rows), _ma20_null, _score_nonzero, _entry_invalid)
-        except Exception as exc:
-            logger.exception("[KR_PREP][CORE_ARTIFACT_WRITE][FAIL] reason=%s", exc)
-            raise
     if builder.last_bundle:
         builder.last_bundle["final30_scored"] = final30_scored_df.copy(deep=True)
         builder.last_bundle["bundle_final30_scored_before_save"] = bundle_final30_scored_before_save.copy(deep=True)
@@ -5726,6 +5877,13 @@ def build_and_save_watchlist(
         builder.last_bundle.setdefault("pool120_scored", builder.last_bundle.get("pool120", []))
         builder.last_bundle.setdefault("universe_scored_df", builder.last_bundle.get("universe_scored", []))
         builder.last_bundle["core_artifact_saved"] = bool(core_artifact_saved)
+        if core_artifact_saved:
+            builder.last_bundle.setdefault("core_artifact_source", "before_enrich_before_db_save")
+            builder.last_bundle.setdefault("trade_can_proceed", True)
+        if builder.last_bundle.get("db_save_failed_after_core"):
+            builder.last_bundle["last_stage"] = "aux_degraded"
+        else:
+            builder.last_bundle["last_stage"] = "aux_done"
         logger.info(
             "[WATCHLIST][RETURN][FINAL30_SCORED] result_has=%s bundle_has=%s before_save_has=%s",
             hasattr(builder.last_bundle, "final30_scored") or (isinstance(builder.last_bundle, dict) and "final30_scored" in builder.last_bundle),

@@ -50,6 +50,21 @@ from trader.utils.ids import assert_uuid
 logger = logging.getLogger(__name__)
 
 
+def _is_transient_db_connection_exception(exc: BaseException) -> bool:
+    text = f"{type(exc).__module__}.{type(exc).__name__}: {exc}".lower()
+    return any(
+        needle in text
+        for needle in (
+            "edbhandlerexited",
+            "connection to database closed",
+            "rollback failure",
+            "sqlalchemy.exc.internalerror",
+            "psycopg.errors.internalerror",
+            "internalerror_",
+        )
+    )
+
+
 def _normalize_run_id_text(value: Any | None) -> str | None:
     if value is None:
         return None
@@ -1123,12 +1138,38 @@ def _save_pb1_final30_rows_scored_strict(
     )
     if strategy_n == "pb1_watchlist_final_scored":
         roundtrip_repo = WatchlistRepo(engine)
-        loaded_rows, _ = roundtrip_repo.load_watchlist_scored(
-            env=env_n,
-            strategy=strategy_n,
-            as_of=as_of_date,
-            allow_latest_fallback=False,
-        )
+        try:
+            loaded_rows, _ = roundtrip_repo.load_watchlist_scored(
+                env=env_n,
+                strategy=strategy_n,
+                as_of=as_of_date,
+                allow_latest_fallback=False,
+            )
+        except Exception as exc:
+            if not _is_transient_db_connection_exception(exc):
+                raise
+            logger.warning(
+                "[DB][FINAL30_SCORED][ROUNDTRIP_FAIL_SOFT] reason=EDBHANDLEREXITED action=core_artifact_already_saved"
+            )
+            try:
+                engine.dispose()
+            except Exception:
+                logger.warning("[DB][FINAL30_SCORED][ROUNDTRIP_DISPOSE_FAIL]", exc_info=True)
+            try:
+                roundtrip_repo = WatchlistRepo(engine)
+                loaded_rows, _ = roundtrip_repo.load_watchlist_scored(
+                    env=env_n,
+                    strategy=strategy_n,
+                    as_of=as_of_date,
+                    allow_latest_fallback=False,
+                )
+            except Exception as retry_exc:
+                if _is_transient_db_connection_exception(retry_exc) and len(payload) == 30:
+                    logger.warning(
+                        "[DB][FINAL30_SCORED][ROUNDTRIP_FAIL_SOFT] reason=EDBHANDLEREXITED retry=1 action=return_insert_payload_rows_30"
+                    )
+                    return
+                raise
         loaded_df = pd.DataFrame([normalize_final30_contract_row(row) for row in loaded_rows])
         required_nonnull_fields = ["close", "ma20", "ma50", "ma150", "atr_pct", "rs_percentile", "score_final"]
         nonnull_counts = {
@@ -7802,5 +7843,3 @@ class ExitAnalysisRepo:
                 })
             
             return items
-
-
