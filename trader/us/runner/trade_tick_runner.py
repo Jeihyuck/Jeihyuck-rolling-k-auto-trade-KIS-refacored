@@ -686,8 +686,20 @@ def run_trade_tick(
         from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
         
         last_stage = "prep_status_load"
-        prep_status_info = load_latest_us_prep_status(trade_date)
-        prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
+        try:
+            prep_status_info = load_latest_us_prep_status(trade_date)
+            prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
+        except Exception as prep_exc:
+            if not _is_transient_watchlist_db_error(prep_exc):
+                raise
+            entry_degraded = True
+            entry_degraded_reason = "prep_status_db_degraded"
+            prep_status_info = None
+            prep_status = "UNKNOWN_DB_DEGRADED"
+            logger.warning(
+                "[US_ENTRY][PREP_STATUS][DB_DEGRADED] trade_date=%s error=%s exit_intents=%d",
+                trade_date, prep_exc, len(exit_intents),
+            )
         
         logger.info(
             "[US_ENTRY][PREP_STATUS] date=%s status=%s",
@@ -795,11 +807,21 @@ def run_trade_tick(
                         rows=watchlist_rows,
                         stage="trade_load",
                     )
+                    quality_ok = bool(quality_contract["ok"])
                     
-                    if not quality_contract["ok"]:
+                    if not quality_ok:
                         error_msg = format_us_watchlist_error_message(quality_contract)
                         logger.error(error_msg)
-                        if real_order_mode:
+                        if exit_intents:
+                            entry_degraded = True
+                            entry_degraded_reason = "locked_watchlist_score_contract_fail"
+                            entry_intents = []
+                            logger.warning(
+                                "[US_ENTRY][WATCHLIST][QUALITY][DEGRADED_SKIP_ENTRY] reason=locked_watchlist_score_contract_fail exit_intents=%d",
+                                len(exit_intents),
+                            )
+                            watchlist_rows = []
+                        elif real_order_mode:
                             logger.error(
                                 "[US_TICK][DONE] session=%s status=FAILED reason=locked_watchlist_score_contract_fail",
                                 session,
@@ -832,20 +854,21 @@ def run_trade_tick(
                                 "temp_error_count": temp_error_count,
                                 "temp_recovered_count": temp_recovered_count,
                             }
-                        logger.warning(
-                            "[US_ENTRY][SCORE_CONTRACT][WARN] non_real_order_mode entry disabled"
-                        )
-                        watchlist_rows = []
+                        else:
+                            logger.warning(
+                                "[US_ENTRY][SCORE_CONTRACT][WARN] non_real_order_mode entry disabled"
+                            )
+                            watchlist_rows = []
                     
                     # Contract 통과 로그
                     logger.info(
                         "[US_ENTRY][SCORE_CONTRACT] stage=trade_load rows=%d unique=%d duplicate=%d "
-                        "nonzero=%d zero=%d missing=%d ratio=%.4f ok=1",
+                        "nonzero=%d zero=%d missing=%d ratio=%.4f ok=%d",
                         quality_contract["rows"], quality_contract["unique_symbols"], 
                         quality_contract["duplicate_count"],
                         quality_contract["score_nonzero"], quality_contract["score_zero"], 
                         quality_contract["score_missing"],
-                        quality_contract["score_nonzero_ratio"]
+                        quality_contract["score_nonzero_ratio"], int(quality_ok)
                     )
                     
                     # Pipeline contract 로그

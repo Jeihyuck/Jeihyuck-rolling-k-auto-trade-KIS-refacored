@@ -80,3 +80,35 @@ def test_daily_report_preserves_exit_and_entry_degraded_fields():
     assert '"entry_degraded_reason": final_tick.get("entry_degraded_reason", "")' in text
     assert '"watchlist_fallback_used": int(final_tick.get("watchlist_fallback_used", 0) or 0)' in text
     assert '"exit_routed_after_entry_degraded": int(final_tick.get("exit_routed_after_entry_degraded", 0) or 0)' in text
+
+
+def test_prep_status_transient_db_failure_is_degraded_not_fatal():
+    from trader.us.runner import trade_tick_runner as runner
+
+    assert runner._is_transient_watchlist_db_error(RuntimeError("OperationalError statement timeout"))
+    text = Path("trader/us/runner/trade_tick_runner.py").read_text(encoding="utf-8")
+    prep_start = text.index("last_stage = \"prep_status_load\"")
+    prep_end = text.index("# DEGRADED/ERROR 상태이면 new entry 차단", prep_start)
+    prep_block = text[prep_start:prep_end]
+    assert "try:" in prep_block
+    assert "load_latest_us_prep_status(trade_date)" in prep_block
+    assert "UNKNOWN_DB_DEGRADED" in prep_block
+    assert "[US_ENTRY][PREP_STATUS][DB_DEGRADED]" in prep_block
+    assert "entry_degraded = True" in prep_block
+    assert "return {" not in prep_block
+
+
+def test_quality_contract_failure_with_exit_intents_degrades_entry_only():
+    text = Path("trader/us/runner/trade_tick_runner.py").read_text(encoding="utf-8")
+    quality_start = text.index("if not quality_ok:")
+    quality_end = text.index("# Contract 통과 로그", quality_start)
+    quality_block = text[quality_start:quality_end]
+    assert "if exit_intents:" in quality_block
+    assert "[US_ENTRY][WATCHLIST][QUALITY][DEGRADED_SKIP_ENTRY]" in quality_block
+    assert "entry_degraded = True" in quality_block
+    assert "entry_intents = []" in quality_block
+    assert "watchlist_rows = []" in quality_block
+    assert "elif real_order_mode:" in quality_block
+    exit_degraded_pos = quality_block.index("if exit_intents:")
+    fail_return_pos = quality_block.index("return {")
+    assert exit_degraded_pos < fail_return_pos
