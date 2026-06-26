@@ -14,17 +14,98 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import logging
 import os
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
+
+
+_TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS = (
+    "edbhandlerexited",
+    "connection to database closed",
+    "server closed the connection",
+    "statement timeout",
+    "canceling statement due to statement timeout",
+    "operationalerror",
+    "internalerror",
+    "connection already closed",
+    "ssl syscall error",
+    "terminating connection",
+)
+
+
+def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(pattern in text for pattern in _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS)
+
+
+def _extract_watchlist_rows_from_payload(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for key in ("rows", "watchlist", "final30", "final30_scored", "data", "items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [r for r in value if isinstance(r, dict)]
+    return []
+
+
+def load_watchlist_from_artifact(trade_date: str) -> list[dict]:
+    """Load US locked-watchlist fallback from final30_scored artifacts only."""
+    candidate_paths = [
+        Path("runtime/us/watchlist") / trade_date / "final30_scored.json",
+        Path("runtime/us/prep") / trade_date / "final30_scored.json",
+        Path("signals/us") / trade_date / "final30_scored.json",
+        Path("reports/us_prep") / trade_date / "final30_scored.json",
+    ]
+    errors: list[str] = []
+    for path in candidate_paths:
+        if not path.exists():
+            errors.append(f"{path}:missing")
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw_rows = _extract_watchlist_rows_from_payload(payload)
+            normalized: list[dict] = []
+            for row in raw_rows:
+                symbol = str(row.get("symbol") or "").upper().strip()
+                if not symbol:
+                    continue
+                score_value = row.get("score", row.get("final_score", row.get("rank_score", 0)))
+                try:
+                    score = float(score_value or 0.0)
+                except (TypeError, ValueError):
+                    score = 0.0
+                clean = dict(row)
+                clean["symbol"] = symbol
+                clean["score"] = score
+                clean["exchange"] = str(clean.get("exchange") or "NASDAQ").upper().strip()
+                clean["strategy"] = str(clean.get("strategy") or "us_pb1")
+                normalized.append(clean)
+            deduped = _dedupe_watchlist_best_by_symbol(normalized)
+            nonzero = sum(1 for r in deduped if float(r.get("score") or 0.0) != 0.0)
+            if len(deduped) < 10:
+                raise ValueError(f"artifact_unique_symbols_lt_10 count={len(deduped)} path={path}")
+            if nonzero <= 0:
+                raise ValueError(f"artifact_all_scores_zero path={path}")
+            selected = deduped[:30]
+            logger.info(
+                "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][OK] path=%s rows=%d unique=%d selected=%d nonzero=%d preferred_30=%d",
+                path, len(raw_rows), len(deduped), len(selected), nonzero, int(len(selected) == 30),
+            )
+            return selected
+        except Exception as exc:
+            errors.append(f"{path}:{type(exc).__name__}:{exc}")
+    raise FileNotFoundError("; ".join(errors))
 
 
 def _entry_cutoff_passed(now: datetime) -> bool:
@@ -500,6 +581,10 @@ def run_trade_tick(
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
     entry_intents: list[dict] = []
     entry_eval_error_count = 0
+    entry_degraded = False
+    entry_degraded_reason = ""
+    watchlist_fallback_used = False
+    exit_routed_after_entry_degraded = False
     after_cutoff = _entry_cutoff_passed(now)
 
     # fills contract error 발생 시 신규 BUY 차단 및 즉시 ERROR 반환
@@ -644,91 +729,52 @@ def run_trade_tick(
                         watchlist_timeout_sec,
                         elapsed_ms,
                     )
-                    if not real_order_mode:
+                    entry_degraded = True
+                    entry_degraded_reason = "watchlist_load_timeout"
+                    logger.info("[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][START] trade_date=%s", trade_date)
+                    try:
+                        watchlist_rows = load_watchlist_from_artifact(trade_date)
+                        watchlist_fallback_used = True
+                    except Exception as fb_exc:
                         logger.warning(
-                            "[US_ENTRY][WATCHLIST][LOAD][WARN] timeout in non_real_order_mode; entry disabled"
+                            "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][FAIL] trade_date=%s error=%s",
+                            trade_date, fb_exc,
+                        )
+                        logger.warning(
+                            "[US_ENTRY][WATCHLIST][LOAD][DEGRADED_SKIP_ENTRY] reason=watchlist_load_timeout exit_intents=%d",
+                            len(exit_intents),
                         )
                         watchlist_rows = []
-                    else:
-                        logger.error(
-                            "[US_TICK][DONE] session=%s status=FAILED reason=watchlist_load_timeout",
-                            session,
-                        )
-                        return {
-                            "status": "FAILED",
-                            "reason": "watchlist_load_timeout",
-                            "session": session,
-                            "orders": [],
-                            "ack": 0,
-                            "dry_run": 0,
-                            "blocked": 0,
-                            "signal_only": 0,
-                            "errors": 1,
-                            "budget": budget,
-                            "run_mode": run_mode,
-                            "signal_only_mode": signal_only,
-                            "kis_order_allowed": kis_order_allowed,
-                            "last_stage": last_stage,
-                            "trade_date": trade_date,
-                            "prep_status": prep_status,
-                            "locked_watchlist_count": 0,
-                            "entry_eval_status": "TIMEOUT",
-                            "entry_error_type": "watchlist_load_timeout",
-                            "entry_error_message": "watchlist_load_timeout",
-                            "entry_intents": 0,
-                            "orders_sent": 0,
-                            "fills": len(fills_today),
-                            "positions": position_count,
-                            "temp_error_count": temp_error_count,
-                            "temp_recovered_count": temp_recovered_count,
-                            "timeout_sec": tick_timeout_sec,
-                        }
                 except Exception as exc:
                     elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
+                    is_transient = _is_transient_watchlist_db_error(exc)
                     logger.error(
-                        "[US_ENTRY][WATCHLIST][LOAD][ERROR] error=%s elapsed_ms=%d",
-                        exc,
-                        elapsed_ms,
+                        "[US_ENTRY][WATCHLIST][LOAD][ERROR] transient=%d error=%s elapsed_ms=%d",
+                        int(is_transient), exc, elapsed_ms,
                     )
-                    if not real_order_mode:
+                    if not is_transient:
+                        raise
+                    entry_degraded = True
+                    entry_degraded_reason = "watchlist_load_timeout" if "timeout" in str(exc).lower() else "watchlist_load_transient_db_error"
+                    if "timeout" in str(exc).lower():
+                        logger.error(
+                            "[US_ENTRY][WATCHLIST][LOAD][TIMEOUT] timeout_sec=%d elapsed_ms=%d",
+                            watchlist_timeout_sec, elapsed_ms,
+                        )
+                    logger.info("[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][START] trade_date=%s", trade_date)
+                    try:
+                        watchlist_rows = load_watchlist_from_artifact(trade_date)
+                        watchlist_fallback_used = True
+                    except Exception as fb_exc:
                         logger.warning(
-                            "[US_ENTRY][WATCHLIST][LOAD][WARN] error in non_real_order_mode; entry disabled"
+                            "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][FAIL] trade_date=%s error=%s",
+                            trade_date, fb_exc,
+                        )
+                        logger.warning(
+                            "[US_ENTRY][WATCHLIST][LOAD][DEGRADED_SKIP_ENTRY] reason=%s exit_intents=%d",
+                            entry_degraded_reason, len(exit_intents),
                         )
                         watchlist_rows = []
-                    else:
-                        logger.error(
-                            "[US_TICK][DONE] session=%s status=FAILED reason=watchlist_load_error",
-                            session,
-                        )
-                        return {
-                            "status": "FAILED",
-                            "reason": "watchlist_load_error",
-                            "session": session,
-                            "orders": [],
-                            "ack": 0,
-                            "dry_run": 0,
-                            "blocked": 0,
-                            "signal_only": 0,
-                            "errors": 1,
-                            "budget": budget,
-                            "run_mode": run_mode,
-                            "signal_only_mode": signal_only,
-                            "kis_order_allowed": kis_order_allowed,
-                            "last_stage": last_stage,
-                            "trade_date": trade_date,
-                            "prep_status": prep_status,
-                            "locked_watchlist_count": 0,
-                            "entry_eval_status": "ERROR",
-                            "entry_error_type": "watchlist_load_error",
-                            "entry_error_message": str(exc),
-                            "entry_intents": 0,
-                            "orders_sent": 0,
-                            "fills": len(fills_today),
-                            "positions": position_count,
-                            "temp_error_count": temp_error_count,
-                            "temp_recovered_count": temp_recovered_count,
-                            "timeout_sec": tick_timeout_sec,
-                        }
 
                 elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
                 logger.info(
@@ -820,12 +866,17 @@ def run_trade_tick(
                         len(watchlist_rows)
                     )
                 else:
-                    # locked watchlist empty: pipeline input missing, ERROR 즉시 반환
+                    # locked watchlist empty: pipeline input missing, except degraded DB load path which skips entry only.
                     logger.error(
                         "[US_ENTRY][BLOCK] reason=locked_watchlist_missing trade_date=%s",
                         trade_date,
                     )
-                    if real_order_mode:
+                    if entry_degraded:
+                        logger.warning(
+                            "[US_ENTRY][WATCHLIST][LOAD][DEGRADED_SKIP_ENTRY] reason=%s exit_intents=%d",
+                            entry_degraded_reason or "watchlist_load_degraded", len(exit_intents),
+                        )
+                    elif real_order_mode:
                         logger.error(
                             "[US_TICK][DONE] session=%s status=FAILED reason=locked_watchlist_missing",
                             session,
@@ -857,9 +908,10 @@ def run_trade_tick(
                             "temp_error_count": temp_error_count,
                             "temp_recovered_count": temp_recovered_count,
                         }
-                    logger.warning(
-                        "[US_ENTRY][BLOCK][WARN] non_real_order_mode locklist missing -> no entry intents"
-                    )
+                    if not entry_degraded:
+                        logger.warning(
+                            "[US_ENTRY][BLOCK][WARN] non_real_order_mode locklist missing -> no entry intents"
+                        )
                 
                 if watchlist_rows:
                     engine = _get_strategy_engine(env=env, offline=offline)
@@ -904,7 +956,7 @@ def run_trade_tick(
     
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
-    if entry_eval_error_count > 0 and real_order_mode:
+    if entry_eval_error_count > 0 and real_order_mode and not exit_intents:
         last_stage = "entry_eval"
         logger.error("[US_ORDER][ROUTE][SKIP] reason=entry_eval_error")
         logger.error("[US_TICK][DONE] session=%s status=FAILED reason=entry_eval_error", session)
@@ -939,6 +991,12 @@ def run_trade_tick(
 
     # ── Order routing ─────────────────────────────────────────────────────────
     all_intents = exit_intents + entry_intents
+    if entry_degraded and exit_intents:
+        exit_routed_after_entry_degraded = True
+        logger.warning(
+            "[US_ORDER][ROUTE][EXIT_CONTINUE_AFTER_ENTRY_DEGRADED] exit_intents=%d reason=%s",
+            len(exit_intents), entry_degraded_reason or "entry_degraded",
+        )
     logger.info("[US_ORDER][ROUTE][START] total_intents=%d", len(all_intents))
 
     orders: list[dict] = []
@@ -1194,10 +1252,10 @@ def run_trade_tick(
                 status, exit_intents_count, blocked_cnt,
             )
         elif orders_sent > 0:
-            status = "OK_EXIT_ORDERS_SENT"
+            status = "OK_WITH_WARNINGS" if entry_degraded else "OK_EXIT_ORDERS_SENT"
             logger.info(
-                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d sent=%d",
-                status, exit_intents_count, orders_sent,
+                "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d sent=%d entry_degraded=%d",
+                status, exit_intents_count, orders_sent, int(entry_degraded),
             )
         elif orders_attempted == 0:
             status = "FAILED_EXIT_INTENTS_NOT_ROUTED"
@@ -1271,6 +1329,11 @@ def run_trade_tick(
 
     held_skip = locals().get("held_skip_count")
     held_skip_unknown = 0 if isinstance(held_skip, int) else 1
+    if exit_routed_after_entry_degraded:
+        logger.info(
+            "[US_TICK][SUMMARY] status=OK_WITH_WARNINGS reason=entry_degraded_exit_routed exit_intents=%d entry_degraded=1",
+            exit_intents_count,
+        )
     logger.info(
         "[US_TICK][SUMMARY] session=%s trade_date_et=%s final30=%d holdings=%d held_skip=%s held_skip_unknown=%d buy_intents=%d risk_allowed=%d risk_blocked=%d submitted=%d ack=%d rejected=%d temp_recovered=%d final_errors=%d status=%s",
         session, trade_date, len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
@@ -1282,7 +1345,7 @@ def run_trade_tick(
 
     return {
         "status": status,
-        "reason": primary_reject_reason or ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none"),
+        "reason": primary_reject_reason or ("entry_degraded_exit_routed" if exit_routed_after_entry_degraded else ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none")),
         "primary_reject_reason": primary_reject_reason,
         "reject_reasons": reject_reasons,
         "no_balance_sell_reject_count": no_balance_sell_reject_count,
@@ -1319,9 +1382,13 @@ def run_trade_tick(
         "trade_date": trade_date,
         "prep_status": prep_status if 'prep_status' in locals() else "UNKNOWN",
         "locked_watchlist_count": len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
-        "entry_eval_status": "OK" if entry_eval_error_count == 0 else "ERROR",
-        "entry_error_type": "" if entry_eval_error_count == 0 else "entry_eval_error",
-        "entry_error_message": "" if entry_eval_error_count == 0 else "entry_eval_error",
+        "entry_eval_status": "DEGRADED" if entry_degraded else ("OK" if entry_eval_error_count == 0 else "ERROR"),
+        "entry_error_type": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
+        "entry_error_message": entry_degraded_reason if entry_degraded else ("" if entry_eval_error_count == 0 else "entry_eval_error"),
+        "entry_degraded": int(entry_degraded),
+        "entry_degraded_reason": entry_degraded_reason,
+        "watchlist_fallback_used": int(watchlist_fallback_used),
+        "exit_routed_after_entry_degraded": int(exit_routed_after_entry_degraded),
         "entry_intents": len(entry_intents),
         "orders_sent": orders_sent,  # ack + dry_run
         "fills_count": len(fills_today),
