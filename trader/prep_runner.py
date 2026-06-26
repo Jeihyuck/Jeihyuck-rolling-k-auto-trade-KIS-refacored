@@ -497,6 +497,10 @@ def _make_flow_provider(engine):
         _record_provider_failure("kis", "unexpected_exception")
         return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": "unexpected_exception", "detail": "retry_exhausted"}
 
+    if os.getenv("KR_INVESTOR_FLOW_ENABLED", "1") not in {"1", "true", "TRUE", "yes", "on"}:
+        logger.info("[FLOW][DISABLED] reason=KR_INVESTOR_FLOW_ENABLED=0")
+        providers = []
+
     provider_map = {
         "pykrx": _provider_pykrx,
         "kis": _provider_kis,
@@ -1772,6 +1776,12 @@ def main() -> int:
         flow_provider=flow_provider,
         return_bundle=True,
         save_intermediate_bundle=False,
+        core_artifact_trade_date=run_date if kr_market else None,
+        core_artifact_expected_as_of=effective_as_of if kr_market else None,
+        core_artifact_env=env,
+        core_artifact_db_exact_rows=30,
+        core_artifact_contract_hash=None,
+        core_artifact_metadata={"run_id": os.getenv("TRADER_RUN_ID") or "", "source": "build_and_save_watchlist_core_fast"},
     )
     watchlist_result_payload: Any = None
     if isinstance(watchlist_result, tuple):
@@ -2218,23 +2228,28 @@ def main() -> int:
     if kr_market:
         try:
             final30_payload_rows = to_jsonable(canonical_rows)
-            logger.info("[KR_PREP][CORE_FINAL30_VALID] rows=%s ma20_null=0 score_final_nonzero=30", len(canonical_rows))
-            logger.info("[KR_PREP][CORE_DB_VALID] rows=%s roundtrip_ok=1", len(canonical_rows))
-            _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_write_start", status="start", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
-            logger.info("[PREP][CANONICAL_ARTIFACT][START] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
-            publish_kr_prep_artifacts_core_fast(
-                trade_date=trade_date,
-                expected_as_of=as_of,
-                actual_as_of=as_of,
-                env=env,
-                final30_rows=final30_payload_rows,
-                db_exact_rows=len(canonical_rows),
-                metadata={"run_id": run_id},
-                contract_hash=canonical_info["contract_hash"],
-            )
-            logger.info("[PREP][CANONICAL_ARTIFACT][SAVED] path=%s", "signals/kr/latest_prep_contract.json")
-            logger.info("[PREP][CANONICAL_ARTIFACT][VERIFY_OK] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
-            _write_prep_done_marker(trade_date=trade_date, expected_as_of=as_of, env=env, rows=len(canonical_rows))
+            _core_already_saved = bool(_safe_get(watchlist_bundle, "core_artifact_saved", False))
+            if _core_already_saved:
+                logger.info("[KR_PREP][CORE_ARTIFACT_WRITE][SKIP] reason=already_saved_inside_build_and_save_watchlist")
+                _write_prep_done_marker(trade_date=trade_date, expected_as_of=as_of, env=env, rows=len(canonical_rows))
+            else:
+                logger.info("[KR_PREP][CORE_FINAL30_VALID] rows=%s ma20_null=0 score_final_nonzero=30", len(canonical_rows))
+                logger.info("[KR_PREP][CORE_DB_VALID] rows=%s roundtrip_ok=1", len(canonical_rows))
+                _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_write_start", status="start", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
+                logger.info("[PREP][CANONICAL_ARTIFACT][START] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
+                publish_kr_prep_artifacts_core_fast(
+                    trade_date=trade_date,
+                    expected_as_of=as_of,
+                    actual_as_of=as_of,
+                    env=env,
+                    final30_rows=final30_payload_rows,
+                    db_exact_rows=len(canonical_rows),
+                    metadata={"run_id": run_id},
+                    contract_hash=canonical_info["contract_hash"],
+                )
+                logger.info("[PREP][CANONICAL_ARTIFACT][SAVED] path=%s", "signals/kr/latest_prep_contract.json")
+                logger.info("[PREP][CANONICAL_ARTIFACT][VERIFY_OK] trade_date=%s expected_as_of=%s rows=%s", trade_date, as_of, len(canonical_rows))
+                _write_prep_done_marker(trade_date=trade_date, expected_as_of=as_of, env=env, rows=len(canonical_rows))
             _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_write_saved", status="done", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
             _write_prep_last_stage(trade_date=trade_date, expected_as_of=as_of, stage="core_artifact_files_verify_done", status="done", final30_rows=len(canonical_rows), db_rows=len(canonical_rows))
             logger.info("[PREP][FINAL30_ARTIFACT_PUBLISH] rows=%s hash=%s", len(canonical_rows), canonical_info["contract_hash"])

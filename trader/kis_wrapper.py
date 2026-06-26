@@ -1391,6 +1391,7 @@ class KisAPI:
 
         endpoint_name = endpoint or _endpoint_name(url)
         path_lower = _endpoint_path(url)
+        no_retry_inquire_investor = "inquire-investor" in path_lower
         self._wait_for_http_gap(endpoint_name, url)
         data_gap_paths = (
             "inquire-price",
@@ -1407,6 +1408,8 @@ class KisAPI:
             attempts = max(int(os.getenv("KIS_DATA_RETRY_MAX", str(self._safe_attempts)) or self._safe_attempts), 1)
         else:
             attempts = max(self._safe_attempts, 1)
+        if no_retry_inquire_investor:
+            attempts = 1
         start_ts = time.monotonic()
         auth_refreshed = False
         reset_done = False
@@ -1484,6 +1487,12 @@ class KisAPI:
                     
                     # ✅ EGW002 (초당 거래건수 초과) 전용 처리: exponential backoff + circuit breaker
                     if _is_egw002_error(body, msg_cd):
+                        if no_retry_inquire_investor and msg_cd == "EGW00201" and "초당" in str(body.get("msg1") or ""):
+                            logger.warning(
+                                "[KR_FLOW][KIS_INVESTOR][RATE_LIMIT_FAIL_SOFT] code=%s action=impute_and_continue",
+                                msg_cd,
+                            )
+                            return resp
                         _breaker_record_temp_failure(method, url)
 
                         if "inquire-price" in _endpoint_path(url):
@@ -1509,6 +1518,12 @@ class KisAPI:
                         raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
                     
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        if no_retry_inquire_investor and msg_cd == "EGW00201" and "초당" in str(body.get("msg1") or ""):
+                            logger.warning(
+                                "[KR_FLOW][KIS_INVESTOR][RATE_LIMIT_FAIL_SOFT] code=%s action=impute_and_continue",
+                                msg_cd,
+                            )
+                            return resp
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
                                 _endpoint_name(url),
@@ -2749,6 +2764,15 @@ class KisAPI:
                     timeout=timeout,
                 )
                 data = resp.json()
+                if (
+                    str(data.get("msg_cd") or "").strip() == "EGW00201"
+                    and "초당" in str(data.get("msg1") or "")
+                ):
+                    logger.warning(
+                        "[KR_FLOW][KIS_INVESTOR][RATE_LIMIT_FAIL_SOFT] code=%s action=impute_and_continue",
+                        data.get("msg_cd"),
+                    )
+                    return {"ok": False, "error": "kis_investor_rate_limit", "msg_cd": data.get("msg_cd"), "msg1": data.get("msg1"), "inv": None, "flow_data_available": 0, "flow_missing": 1, "flow_fail_reason": "kis_investor_rate_limit", "flow_score_imputed": 1, "foreign_20_ratio": 0.0, "inst_20_ratio": 0.0}
                 output = data.get("output") or data.get("OutBlock_1") or data.get("outblock")
                 if isinstance(output, list):
                     output = output[0] if output else {}
