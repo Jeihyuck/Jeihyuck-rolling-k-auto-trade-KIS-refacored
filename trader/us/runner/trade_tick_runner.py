@@ -195,14 +195,17 @@ def _dedupe_watchlist_best_by_symbol(rows: list[dict]) -> list[dict]:
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
-    daily_notional: float,
+    buy_daily_notional: float,
     position_count: int,
     effective_budget: float,
     signal_only: bool,
     kis_order_allowed: bool,
     current_position_symbols: set[str],
-) -> tuple[list[dict], float]:
-    """Route SELL intents before any entry watchlist/evaluation work."""
+) -> dict:
+    """Route SELL intents before any entry watchlist/evaluation work.
+
+    SELL notional is reported separately and never added to BUY daily notional.
+    """
     from trader.us.execution.order_router import route_order
 
     sell_intents = [i for i in exit_intents if str(i.get("side") or "").upper() == "SELL"]
@@ -212,18 +215,16 @@ def route_exit_orders_immediately(
         try:
             result = route_order(
                 intent,
-                current_daily_notional_usd=daily_notional,
+                current_daily_notional_usd=buy_daily_notional,
                 current_position_count=position_count,
                 total_portfolio_usd=max(effective_budget, 1000.0),
-                available_cash_usd=max(effective_budget - daily_notional, 0.0),
+                available_cash_usd=max(effective_budget - buy_daily_notional, 0.0),
                 signal_only=signal_only,
                 kis_order_allowed=kis_order_allowed,
                 allowed_symbols=None,
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
             )
             orders.append(result)
-            if result.get("status") in ("DRY_RUN", "ACK"):
-                daily_notional += float(intent.get("notional_usd", 0) or 0)
         except Exception as exc:
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
@@ -231,11 +232,24 @@ def route_exit_orders_immediately(
     sent = sum(1 for o in orders if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"})
     rejected = sum(1 for o in orders if o.get("status") == "REJECT")
     blocked = sum(1 for o in orders if o.get("status") in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
-    logger.info(
-        "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d",
-        len(sell_intents), sent, ack, rejected, blocked,
+    sell_notional_routed = sum(
+        float((o.get("intent") or {}).get("notional_usd", 0) or 0)
+        for o in orders
+        if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"}
     )
-    return orders, daily_notional
+    logger.info(
+        "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d sell_notional=%.2f",
+        len(sell_intents), sent, ack, rejected, blocked, sell_notional_routed,
+    )
+    return {
+        "orders": orders,
+        "sell_notional_routed": sell_notional_routed,
+        "exit_notional_routed": sell_notional_routed,
+        "sent": sent,
+        "ack": ack,
+        "rejected": rejected,
+        "blocked": blocked,
+    }
 
 
 def run_trade_tick(
@@ -284,6 +298,8 @@ def run_trade_tick(
     temp_recovered_count = 0
     kis_temp_errors_by_api: dict[str, dict] = {}
     ack_recon: dict[str, Any] = {"status": "SKIP", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
+    ack_recon_before_route: dict[str, Any] = dict(ack_recon)
+    ack_recon_after_route: dict[str, Any] = dict(ack_recon)
 
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
     from trader.us.market_calendar import now_ny, is_us_trading_day, market_phase
@@ -556,8 +572,9 @@ def run_trade_tick(
                 trade_date=trade_date,
                 env=env,
             )
+            ack_recon_before_route = dict(ack_recon)
             logger.info(
-                "[US_RECONCILE][ACK_RECONCILE][TICK] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
+                "[US_RECONCILE][ACK_RECONCILE][TICK_BEFORE_ROUTE] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
                 ack_recon.get("status"),
                 ack_recon.get("pending_count", 0),
                 ack_recon.get("confirmed_count", 0),
@@ -639,18 +656,20 @@ def run_trade_tick(
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
 
     # Route SELLs immediately before any entry watchlist or entry evaluation work.
-    daily_notional = 0.0
+    buy_daily_notional = 0.0
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
-    orders, daily_notional = route_exit_orders_immediately(
+    exit_route_result = route_exit_orders_immediately(
         exit_intents,
-        daily_notional=daily_notional,
+        buy_daily_notional=buy_daily_notional,
         position_count=position_count,
         effective_budget=effective_budget,
         signal_only=signal_only,
         kis_order_allowed=kis_order_allowed,
         current_position_symbols=current_position_symbols,
     )
+    orders = list(exit_route_result.get("orders", []))
+    sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1
 
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
@@ -1100,10 +1119,10 @@ def run_trade_tick(
         try:
             result = route_order(
                 intent,
-                current_daily_notional_usd=daily_notional,
+                current_daily_notional_usd=buy_daily_notional,
                 current_position_count=position_count,
                 total_portfolio_usd=max(effective_budget, 1000.0),
-                available_cash_usd=max(effective_budget - daily_notional, 0.0),
+                available_cash_usd=max(effective_budget - buy_daily_notional, 0.0),
                 signal_only=signal_only,
                 kis_order_allowed=kis_order_allowed,
                 allowed_symbols=(locked_watchlist_symbols if str(intent.get("side", "BUY")).upper() == "BUY" and locked_watchlist_symbols else None),
@@ -1111,7 +1130,8 @@ def run_trade_tick(
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):
-                daily_notional += float(intent.get("notional_usd", 0))
+                if str(intent.get("side", "")).upper() == "BUY":
+                    buy_daily_notional += float(intent.get("notional_usd", 0) or 0)
                 if str(intent.get("side", "")).upper() == "BUY":
                     symbol_upper = str(intent.get("symbol", "")).upper().strip()
                     position_action = (
@@ -1139,7 +1159,32 @@ def run_trade_tick(
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
-    
+    ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
+
+    if not offline and (ack_cnt > 0 or ack_db_failed_cnt > 0):
+        try:
+            from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+            ack_recon_after_route = reconcile_ack_orders_with_balance(
+                provider=provider,
+                trade_date=trade_date,
+                env=env,
+            )
+            ack_recon = dict(ack_recon_after_route)
+            logger.info(
+                "[US_RECONCILE][ACK_RECONCILE][TICK_AFTER_ROUTE] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
+                ack_recon_after_route.get("status"),
+                ack_recon_after_route.get("pending_count", 0),
+                ack_recon_after_route.get("confirmed_count", 0),
+                ack_recon_after_route.get("balance_reconcile_count", 0),
+                ack_recon_after_route.get("unresolved_count", 0),
+            )
+        except Exception as exc:
+            logger.warning("[US_TICK][WARN] post-route reconcile_ack_orders_with_balance failed: %s", exc)
+            ack_recon_after_route = {"status": "ACK_PENDING_RECONCILE", "error": str(exc), "pending_count": ack_cnt + ack_db_failed_cnt, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": ack_cnt + ack_db_failed_cnt, "symbols_by_status": {"ack_pending_reconcile": []}}
+            ack_recon = dict(ack_recon_after_route)
+    else:
+        ack_recon_after_route = dict(ack_recon_before_route)
+
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
     blocked_sell_symbols: set[str] = set()
@@ -1362,6 +1407,8 @@ def run_trade_tick(
         {"symbol": str((i or {}).get("symbol", "")).upper(), **(((i or {}).get("meta") or {}) if isinstance((i or {}).get("meta"), dict) else {})}
         for i in exit_intents if str((i or {}).get("side") or "").upper() == "SELL"
     ]
+    buy_notional_routed = buy_daily_notional
+    total_order_notional_routed = buy_notional_routed + sell_notional_routed
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
@@ -1441,6 +1488,7 @@ def run_trade_tick(
         "entry_degraded_reason": entry_degraded_reason,
         "watchlist_fallback_used": int(watchlist_fallback_used),
         "entry_watchlist_source": entry_watchlist_source,
+        "exit_routed_before_entry": exit_routed_before_entry,
         "exit_routed_after_entry_degraded": int(exit_routed_after_entry_degraded),
         "entry_intents": len(entry_intents),
         "orders_sent": orders_sent,  # ack + dry_run
@@ -1448,7 +1496,18 @@ def run_trade_tick(
         "fills": len(fills_today),
         "sold_today_count": len(sold_today) if 'sold_today' in locals() else 0,
         "sold_today_symbols": sorted(sold_today) if 'sold_today' in locals() else [],
-        "pending_order_count": int(ack_recon.get("unresolved_count", 0) or 0),
+        "pending_order_count": int(ack_recon_after_route.get("unresolved_count", ack_recon.get("unresolved_count", 0)) or 0),
+        "ack_reconcile_before_route_status": ack_recon_before_route.get("status", "SKIP"),
+        "ack_reconcile_before_route_pending_count": int(ack_recon_before_route.get("pending_count", 0) or 0),
+        "ack_reconcile_before_route_confirmed_count": int(ack_recon_before_route.get("confirmed_count", 0) or 0),
+        "ack_reconcile_before_route_balance_reconcile_count": int(ack_recon_before_route.get("balance_reconcile_count", 0) or 0),
+        "ack_reconcile_before_route_unresolved_count": int(ack_recon_before_route.get("unresolved_count", 0) or 0),
+        "ack_reconcile_after_route_status": ack_recon_after_route.get("status", "SKIP"),
+        "ack_reconcile_after_route_pending_count": int(ack_recon_after_route.get("pending_count", 0) or 0),
+        "ack_reconcile_after_route_confirmed_count": int(ack_recon_after_route.get("confirmed_count", 0) or 0),
+        "ack_reconcile_after_route_balance_reconcile_count": int(ack_recon_after_route.get("balance_reconcile_count", 0) or 0),
+        "ack_reconcile_after_route_unresolved_count": int(ack_recon_after_route.get("unresolved_count", 0) or 0),
+        "ack_reconcile_after_route_symbols_by_status": ack_recon_after_route.get("symbols_by_status", {}),
         "ack_reconcile_status": ack_recon.get("status", "SKIP"),
         "ack_reconcile_pending_count": int(ack_recon.get("pending_count", 0) or 0),
         "ack_reconcile_confirmed_count": int(ack_recon.get("confirmed_count", 0) or 0),
@@ -1456,9 +1515,13 @@ def run_trade_tick(
         "ack_reconcile_unresolved_count": int(ack_recon.get("unresolved_count", 0) or 0),
         "ack_reconcile_symbols_by_status": ack_recon.get("symbols_by_status", {}),
         "fills_api_count": len(fills_today),
-        "synthetic_reconcile_fills_count": int(ack_recon.get("balance_reconcile_count", 0) or 0),
-        "balance_confirmed_count": int(ack_recon.get("balance_reconcile_count", 0) or 0),
-        "unresolved_ack_count": int(ack_recon.get("unresolved_count", 0) or 0),
+        "synthetic_reconcile_fills_count": int(ack_recon_after_route.get("balance_reconcile_count", ack_recon.get("balance_reconcile_count", 0)) or 0),
+        "balance_confirmed_count": int(ack_recon_after_route.get("balance_reconcile_count", ack_recon.get("balance_reconcile_count", 0)) or 0),
+        "unresolved_ack_count": int(ack_recon_after_route.get("unresolved_count", ack_recon.get("unresolved_count", 0)) or 0),
+        "buy_notional_routed": round(buy_notional_routed, 4),
+        "sell_notional_routed": round(sell_notional_routed, 4),
+        "exit_notional_routed": round(sell_notional_routed, 4),
+        "total_order_notional_routed": round(total_order_notional_routed, 4),
         "open_position_count": len(current_positions) if 'current_positions' in locals() else 0,
         "open_position_symbols": [p.get("symbol", "") for p in (current_positions if 'current_positions' in locals() else [])],
         "positions": len(current_positions) if 'current_positions' in locals() else 0,

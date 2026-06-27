@@ -47,12 +47,18 @@ def _runtime_provenance(*, session: str, run_id: str, started_at_et: str = "", e
         et = ZoneInfo("America/New_York")
         kst = ZoneInfo("Asia/Seoul")
         now_utc_dt = datetime.now(timezone.utc)
+        started_utc_val = os.getenv("US_STARTED_AT_UTC") or now_utc_dt.isoformat().replace("+00:00", "Z")
+        started_et_val = started_at_et or now_utc_dt.astimezone(et).isoformat()
+        started_kst_val = os.getenv("US_STARTED_AT_KST") or now_utc_dt.astimezone(kst).isoformat()
         ended_et_val = ended_at_et or now_utc_dt.astimezone(et).isoformat()
         ended_kst_val = now_utc_dt.astimezone(kst).isoformat()
         ended_utc_val = now_utc_dt.isoformat().replace("+00:00", "Z")
     except Exception:
-        ended_et_val = ended_at_et
-        ended_kst_val = ""
+        started_utc_val = os.getenv("US_STARTED_AT_UTC") or datetime.utcnow().isoformat() + "Z"
+        started_et_val = started_at_et or "unknown"
+        started_kst_val = os.getenv("US_STARTED_AT_KST") or "unknown"
+        ended_et_val = ended_at_et or "unknown"
+        ended_kst_val = "unknown"
         ended_utc_val = datetime.utcnow().isoformat() + "Z"
     branch = os.getenv("GITHUB_REF_NAME") or _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
     sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
@@ -71,9 +77,9 @@ def _runtime_provenance(*, session: str, run_id: str, started_at_et: str = "", e
         "run_id": run_id or os.getenv("GITHUB_RUN_ID", "local"),
         "session_id": f"{session}-{run_id or os.getenv('GITHUB_RUN_ID', 'local')}",
         "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
-        "started_at_utc": os.getenv("US_STARTED_AT_UTC", ""),
-        "started_at_et": started_at_et,
-        "started_at_kst": os.getenv("US_STARTED_AT_KST", ""),
+        "started_at_utc": started_utc_val,
+        "started_at_et": started_et_val,
+        "started_at_kst": started_kst_val,
         "ended_at_utc": ended_utc_val,
         "ended_at_et": ended_et_val,
         "ended_at_kst": ended_kst_val,
@@ -198,8 +204,8 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "unique_fills_count": int(payload.get("unique_fills_count", 0) or 0),
             "orders_ack": int(payload.get("orders_ack", 0) or 0),
             "orders_rejected": int(payload.get("orders_rejected", 0) or 0),
-            "run_id": payload.get("run_id", ""),
-            "workflow": payload.get("workflow", ""),
+            "run_id": payload.get("run_id") or prov.get("run_id", ""),
+            "workflow": payload.get("workflow") or prov.get("workflow", ""),
             "wall_elapsed_sec": float(payload.get("wall_elapsed_sec", 0) or 0),
             "missed_trade_window": bool(payload.get("missed_trade_window", False)),
             "recorded_at_utc": now_utc,
@@ -262,7 +268,7 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
         "buy_decisions", "sell_decisions", "real_broker_buys", "real_broker_sells",
         "synthetic_reconcile_buys", "synthetic_reconcile_sells", "broker_ack_only",
-        "broker_rejects", "duplicate_exit_blocked", "sell_decisions_detail",
+        "broker_rejects", "duplicate_exit_blocked", "buy_notional_routed", "sell_notional_routed", "total_order_notional_routed", "sell_decisions_detail",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
     md_lines.extend([
@@ -939,6 +945,7 @@ def run_trade_session(
         real_broker_buys = real_broker_sells = 0
         synthetic_reconcile_buys = synthetic_reconcile_sells = 0
         broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
+        buy_notional_routed = sell_notional_routed = total_order_notional_routed = 0.0
         all_sold_today_symbols: list[str] = []
         all_pending_order_symbols: list[str] = []
         all_open_position_symbols: list[str] = []
@@ -978,6 +985,9 @@ def run_trade_session(
             broker_ack_only += int(tick_result.get("broker_ack_only", 0) or 0)
             broker_rejects += int(tick_result.get("broker_rejects", 0) or 0)
             duplicate_exit_blocked += int(tick_result.get("duplicate_exit_blocked", 0) or 0)
+            buy_notional_routed += float(tick_result.get("buy_notional_routed", 0.0) or 0.0)
+            sell_notional_routed += float(tick_result.get("sell_notional_routed", 0.0) or 0.0)
+            total_order_notional_routed += float(tick_result.get("total_order_notional_routed", 0.0) or 0.0)
 
             # 심볼 배열 (마지막 tick 기준 덮어쓰기)
             if tick_result.get("sold_today_symbols"):
@@ -1124,6 +1134,9 @@ def run_trade_session(
             "broker_ack_only": broker_ack_only,
             "broker_rejects": broker_rejects,
             "duplicate_exit_blocked": duplicate_exit_blocked,
+            "buy_notional_routed": round(buy_notional_routed, 4),
+            "sell_notional_routed": round(sell_notional_routed, 4),
+            "total_order_notional_routed": round(total_order_notional_routed, 4),
             "sell_decisions_detail": final_tick.get("sell_decisions_detail", []),
             "last_stage": last_stage,
             "trade_status": final_status,

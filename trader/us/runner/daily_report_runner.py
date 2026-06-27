@@ -37,6 +37,8 @@ def _report_provenance(session: str | None) -> dict:
     workflow = os.getenv("GITHUB_WORKFLOW") or "local"
     run_id = os.getenv("GITHUB_RUN_ID", "local")
     now_utc = datetime.utcnow().isoformat() + "Z"
+    now_et = datetime.now(tz=NY_TZ).isoformat()
+    now_kst = datetime.now(tz=ZoneInfo("Asia/Seoul")).isoformat()
     return {
         "branch": branch or "unknown",
         "commit_sha": sha or "unknown",
@@ -51,11 +53,11 @@ def _report_provenance(session: str | None) -> dict:
         "session_id": f"{session or 'daily'}-{run_id}",
         "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
         "started_at_utc": os.getenv("US_STARTED_AT_UTC", now_utc),
-        "started_at_et": os.getenv("US_STARTED_AT_ET", ""),
-        "started_at_kst": os.getenv("US_STARTED_AT_KST", ""),
+        "started_at_et": os.getenv("US_STARTED_AT_ET", now_et),
+        "started_at_kst": os.getenv("US_STARTED_AT_KST", now_kst),
         "ended_at_utc": now_utc,
-        "ended_at_et": os.getenv("US_ENDED_AT_ET", ""),
-        "ended_at_kst": os.getenv("US_ENDED_AT_KST", ""),
+        "ended_at_et": os.getenv("US_ENDED_AT_ET", now_et),
+        "ended_at_kst": os.getenv("US_ENDED_AT_KST", now_kst),
         "wall_elapsed_sec": float(os.getenv("US_WALL_ELAPSED_SEC", "0") or 0),
         "code_version_source": "github_actions" if os.getenv("GITHUB_RUN_ID") else "git_fallback",
     }
@@ -162,6 +164,8 @@ def run_daily_report(
         "kis_retry_count": 0,
         "warnings": [],
         "errors": [],
+        "order_final_classification": [],
+        "order_final_classification_counts": {},
     }
     
     # DRY_RUN
@@ -278,6 +282,21 @@ def run_daily_report(
             for warn in reconciled["warnings"]:
                 report["warnings"].append(warn)
                 logger.warning("[US_DAILY_REPORT][RECONCILE_WARN] reason=%s db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", warn, db_ack, fill_count, balance_confirmed, router_summary)
+
+            # Close-session final balance delta classification
+            if session == "close":
+                try:
+                    from trader.us.data_provider import USDataProvider
+                    from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
+                    close_provider = USDataProvider(offline=offline)
+                    close_class = classify_ack_orders_with_final_balance(provider=close_provider, trade_date=trade_date, env=env)
+                    report["order_final_classification"] = close_class.get("orders", [])
+                    report["order_final_classification_counts"] = close_class.get("counts", {})
+                    if close_class.get("pending_order_count") is not None:
+                        report["pending_order_count"] = int(close_class.get("pending_order_count") or 0)
+                except Exception as exc:
+                    report["warnings"].append(f"close_balance_delta_classification_failed: {exc}")
+                    logger.warning("[US_DAILY_REPORT][WARN] close balance delta classification failed: %s", exc)
         
         except Exception as exc:
             report["errors"].append(f"DB_query_failed: {exc}")
@@ -372,6 +391,22 @@ def run_daily_report(
         "",
     ])
     
+
+    if report.get("order_final_classification"):
+        md_lines.extend([
+            "## Order Final Classification",
+            "",
+            "| time | side | symbol | qty | order_no | ack_status | fill_api_status | balance_delta_status | final_status | price_source | pnl_if_sell |",
+            "|---|---|---|---:|---|---|---|---|---|---|---:|",
+        ])
+        for row in report.get("order_final_classification", []):
+            md_lines.append(
+                f"| {row.get('time', '')} | {row.get('side', '')} | {row.get('symbol', '')} | {row.get('qty', 0)} | "
+                f"{row.get('order_no', '')} | {row.get('ack_status', '')} | {row.get('fill_api_status', '')} | "
+                f"{row.get('balance_delta_status', '')} | {row.get('final_status', '')} | {row.get('price_source', '')} | {row.get('pnl_if_sell', '')} |"
+            )
+        md_lines.append("")
+
     if report["warnings"]:
         md_lines.append("## Warnings")
         md_lines.append("")
