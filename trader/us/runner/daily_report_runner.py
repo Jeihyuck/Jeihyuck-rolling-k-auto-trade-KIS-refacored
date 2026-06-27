@@ -17,10 +17,50 @@ import json
 import logging
 import os
 import sys
+import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _git_value(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+
+
+def _report_provenance(session: str | None) -> dict:
+    branch = os.getenv("GITHUB_REF_NAME") or _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
+    workflow = os.getenv("GITHUB_WORKFLOW") or "local"
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    now_utc = datetime.utcnow().isoformat() + "Z"
+    now_et = datetime.now(tz=NY_TZ).isoformat()
+    now_kst = datetime.now(tz=ZoneInfo("Asia/Seoul")).isoformat()
+    return {
+        "branch": branch or "unknown",
+        "commit_sha": sha or "unknown",
+        "sha": sha or "unknown",
+        "workflow": workflow,
+        "github_run_id": run_id,
+        "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", "0"),
+        "event_name": os.getenv("GITHUB_EVENT_NAME", "local"),
+        "actor": os.getenv("GITHUB_ACTOR", os.getenv("USER", "local")),
+        "session": session,
+        "run_id": run_id,
+        "session_id": f"{session or 'daily'}-{run_id}",
+        "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
+        "started_at_utc": os.getenv("US_STARTED_AT_UTC", now_utc),
+        "started_at_et": os.getenv("US_STARTED_AT_ET", now_et),
+        "started_at_kst": os.getenv("US_STARTED_AT_KST", now_kst),
+        "ended_at_utc": now_utc,
+        "ended_at_et": os.getenv("US_ENDED_AT_ET", now_et),
+        "ended_at_kst": os.getenv("US_ENDED_AT_KST", now_kst),
+        "wall_elapsed_sec": float(os.getenv("US_WALL_ELAPSED_SEC", "0") or 0),
+        "code_version_source": "github_actions" if os.getenv("GITHUB_RUN_ID") else "git_fallback",
+    }
 
 NY_TZ = ZoneInfo("America/New_York")
 
@@ -96,6 +136,7 @@ def run_daily_report(
     )
     
     report: dict = {
+        **_report_provenance(session),
         "trade_date": trade_date,
         "session": session,
         "env": env,
@@ -123,6 +164,23 @@ def run_daily_report(
         "kis_retry_count": 0,
         "warnings": [],
         "errors": [],
+        "order_final_classification": [],
+        "order_final_classification_counts": {},
+        "entry_degraded": 0,
+        "entry_degraded_reason": "",
+        "entry_watchlist_source": "",
+        "watchlist_fallback_used": 0,
+        "exit_routed_before_entry": 0,
+        "buy_notional_routed": 0.0,
+        "sell_notional_routed": 0.0,
+        "total_order_notional_routed": 0.0,
+        "buy_daily_notional_after_routing": 0.0,
+        "sell_notional_does_not_consume_buy_budget": 0,
+        "ack_reconcile_before_route_status": "",
+        "ack_reconcile_after_route_status": "",
+        "ack_reconcile_after_route_unresolved_count": 0,
+        "ack_pending_reconcile_count": 0,
+        "pending_order_count": 0,
     }
     
     # DRY_RUN
@@ -239,6 +297,21 @@ def run_daily_report(
             for warn in reconciled["warnings"]:
                 report["warnings"].append(warn)
                 logger.warning("[US_DAILY_REPORT][RECONCILE_WARN] reason=%s db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", warn, db_ack, fill_count, balance_confirmed, router_summary)
+
+            # Close-session final balance delta classification
+            if session == "close":
+                try:
+                    from trader.us.data_provider import USDataProvider
+                    from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
+                    close_provider = USDataProvider(offline=offline)
+                    close_class = classify_ack_orders_with_final_balance(provider=close_provider, trade_date=trade_date, env=env)
+                    report["order_final_classification"] = close_class.get("orders", [])
+                    report["order_final_classification_counts"] = close_class.get("counts", {})
+                    if close_class.get("pending_order_count") is not None:
+                        report["pending_order_count"] = int(close_class.get("pending_order_count") or 0)
+                except Exception as exc:
+                    report["warnings"].append(f"close_balance_delta_classification_failed: {exc}")
+                    logger.warning("[US_DAILY_REPORT][WARN] close balance delta classification failed: %s", exc)
         
         except Exception as exc:
             report["errors"].append(f"DB_query_failed: {exc}")
@@ -287,6 +360,10 @@ def run_daily_report(
         "| Field | Value |",
         "|---|---|",
         f"| trade_date | {trade_date} |",
+        f"| branch | {report.get('branch')} |",
+        f"| commit_sha | {report.get('commit_sha')} |",
+        f"| workflow | {report.get('workflow')} |",
+        f"| run_id | {report.get('run_id')} |",
         f"| session | {session or 'N/A'} |",
         f"| env | {env} |",
         f"| dry_run | {report['dry_run']} |",
@@ -305,6 +382,12 @@ def run_daily_report(
         f"| fills | {report['fills']} |",
         f"| fill_api_count | {report['fill_api_count']} |",
         f"| balance_confirmed_count | {report['balance_confirmed_count']} |",
+        f"| pending_order_count | {report.get('pending_order_count', 0)} |",
+        f"| buy_notional_routed | {report.get('buy_notional_routed', 0)} |",
+        f"| sell_notional_routed | {report.get('sell_notional_routed', 0)} |",
+        f"| total_order_notional_routed | {report.get('total_order_notional_routed', 0)} |",
+        f"| ack_reconcile_after_route_status | {report.get('ack_reconcile_after_route_status', '')} |",
+        f"| ack_pending_reconcile_count | {report.get('ack_pending_reconcile_count', 0)} |",
         f"| positions | {report['positions']} |",
         "",
         "## Watchlist & Score Contract",
@@ -329,6 +412,22 @@ def run_daily_report(
         "",
     ])
     
+
+    if report.get("order_final_classification"):
+        md_lines.extend([
+            "## Order Final Classification",
+            "",
+            "| time | side | symbol | qty | order_no | ack_status | fill_api_status | balance_delta_status | final_status | price_source | pnl_if_sell |",
+            "|---|---|---|---:|---|---|---|---|---|---|---:|",
+        ])
+        for row in report.get("order_final_classification", []):
+            md_lines.append(
+                f"| {row.get('time', '')} | {row.get('side', '')} | {row.get('symbol', '')} | {row.get('qty', 0)} | "
+                f"{row.get('order_no', '')} | {row.get('ack_status', '')} | {row.get('fill_api_status', '')} | "
+                f"{row.get('balance_delta_status', '')} | {row.get('final_status', '')} | {row.get('price_source', '')} | {row.get('pnl_if_sell', '')} |"
+            )
+        md_lines.append("")
+
     if report["warnings"]:
         md_lines.append("## Warnings")
         md_lines.append("")

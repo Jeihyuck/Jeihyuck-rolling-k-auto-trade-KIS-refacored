@@ -49,64 +49,166 @@ def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
 
 
 def _extract_watchlist_rows_from_payload(payload: Any) -> list[dict]:
+    """Extract final30/watchlist rows from common artifact payload shapes."""
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)]
-    if isinstance(payload, dict):
-        for key in ("rows", "watchlist", "final30", "final30_scored", "data", "items"):
-            value = payload.get(key)
+    if not isinstance(payload, dict):
+        return []
+    for key in ("final30_scored", "watchlist", "rows", "data", "items", "final30"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [r for r in value if isinstance(r, dict)]
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        for key in ("final30_scored", "watchlist", "rows", "data", "items", "final30"):
+            value = nested.get(key)
             if isinstance(value, list):
                 return [r for r in value if isinstance(r, dict)]
     return []
 
 
+def _payload_trade_date(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for container in (payload, payload.get("payload"), payload.get("contract")):
+        if isinstance(container, dict):
+            td = container.get("trade_date") or container.get("date")
+            if td:
+                return str(td)
+    return ""
+
+
+def _nested_value(payload: dict, dotted_key: str) -> Any:
+    cur: Any = payload
+    for part in dotted_key.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _candidate_paths_from_latest_summary(payload: dict, summary_path: Path, trade_date: str) -> list[tuple[Path, str, bool]]:
+    """Return (path, source, requires_trade_date_match) candidates referenced by latest summary."""
+    keys = (
+        "final30_scored_path", "final30_path", "watchlist_path", "artifact_path", "output_path",
+        "latest_final30_scored_path", "payload.final30_scored_path", "payload.final30_path",
+        "payload.artifact_path", "contract.final30_scored_path", "contract.final30_path",
+    )
+    candidates: list[tuple[Path, str, bool]] = []
+    for key in keys:
+        value = _nested_value(payload, key)
+        if not value:
+            continue
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = (summary_path.parent / path) if str(value).startswith(".") else Path(str(value))
+        candidates.append((path, "latest_summary_referenced_artifact", True))
+    candidates.extend([
+        (Path("reports/us_prep/latest_final30_scored.json"), "latest_final30_scored", True),
+        (Path("reports/us_prep") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+        (Path("runtime/us/prep") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+        (Path("runtime/us/watchlist") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+        (Path("signals/us") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+    ])
+    return candidates
+
+
+def _normalize_watchlist_rows(raw_rows: list[dict], source: str) -> list[dict]:
+    normalized: list[dict] = []
+    for row in raw_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        score_value = row.get("score", row.get("score_final", row.get("final_score", row.get("rank_score", 0))))
+        try:
+            score = float(score_value or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        clean = dict(row)
+        clean["symbol"] = symbol
+        clean.setdefault("score_final", score)
+        clean["score"] = score
+        clean["exchange"] = str(clean.get("exchange") or "NASDAQ").upper().strip()
+        clean["strategy"] = str(clean.get("strategy") or "us_pb1")
+        clean["entry_watchlist_source"] = source
+        normalized.append(clean)
+    return normalized
+
+
+def _select_watchlist_rows_from_payload(payload: Any, *, path: Path, trade_date: str, source: str, require_trade_date_match: bool) -> list[dict]:
+    if require_trade_date_match:
+        payload_trade_date = _payload_trade_date(payload)
+        if payload_trade_date and payload_trade_date != trade_date:
+            raise ValueError(f"artifact_trade_date_mismatch payload={payload_trade_date} current={trade_date} path={path}")
+    raw_rows = _extract_watchlist_rows_from_payload(payload)
+    if not raw_rows:
+        raise ValueError(f"artifact_missing_final30_rows path={path}")
+    normalized = _normalize_watchlist_rows(raw_rows, source)
+    deduped = _dedupe_watchlist_best_by_symbol(normalized)
+    nonzero = sum(1 for r in deduped if float(r.get("score") or 0.0) != 0.0)
+    if len(deduped) < 10:
+        raise ValueError(f"artifact_unique_symbols_lt_10 count={len(deduped)} path={path}")
+    if nonzero <= 0:
+        raise ValueError(f"artifact_all_scores_zero path={path}")
+    selected = deduped[:30]
+    logger.info(
+        "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][OK] path=%s source=%s rows=%d unique=%d selected=%d nonzero=%d preferred_30=%d",
+        path, source, len(raw_rows), len(deduped), len(selected), nonzero, int(len(selected) == 30),
+    )
+    return selected
+
+
 def load_watchlist_from_artifact(trade_date: str) -> list[dict]:
-    """Load US locked-watchlist fallback from final30_scored artifacts only."""
-    candidate_paths = [
-        Path("runtime/us/watchlist") / trade_date / "final30_scored.json",
-        Path("runtime/us/prep") / trade_date / "final30_scored.json",
-        Path("signals/us") / trade_date / "final30_scored.json",
-        Path("reports/us_prep") / trade_date / "final30_scored.json",
+    """Load US locked-watchlist fallback from final30/latest prep artifacts."""
+    candidate_paths: list[tuple[Path, str, bool]] = [
+        (Path("runtime/us/watchlist") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("runtime/us/prep") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("signals/us") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("reports/us_prep") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("reports/us_prep/latest_us_prep_summary.json"), "latest_summary_embedded_rows", True),
+        (Path("reports/us_prep/latest_final30_scored.json"), "latest_final30_scored", True),
     ]
     errors: list[str] = []
-    for path in candidate_paths:
+    seen: set[str] = set()
+    idx = 0
+    while idx < len(candidate_paths):
+        path, source, require_td = candidate_paths[idx]
+        idx += 1
+        key = str(path.resolve() if path.exists() else path)
+        if key in seen:
+            continue
+        seen.add(key)
         if not path.exists():
             errors.append(f"{path}:missing")
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            raw_rows = _extract_watchlist_rows_from_payload(payload)
-            normalized: list[dict] = []
-            for row in raw_rows:
-                symbol = str(row.get("symbol") or "").upper().strip()
-                if not symbol:
-                    continue
-                score_value = row.get("score", row.get("final_score", row.get("rank_score", 0)))
+            if path.name == "latest_us_prep_summary.json":
+                summary_td = _payload_trade_date(payload)
+                if summary_td and summary_td != trade_date:
+                    raise ValueError(f"latest_prep_summary_trade_date_mismatch payload={summary_td} current={trade_date}")
                 try:
-                    score = float(score_value or 0.0)
-                except (TypeError, ValueError):
-                    score = 0.0
-                clean = dict(row)
-                clean["symbol"] = symbol
-                clean["score"] = score
-                clean["exchange"] = str(clean.get("exchange") or "NASDAQ").upper().strip()
-                clean["strategy"] = str(clean.get("strategy") or "us_pb1")
-                normalized.append(clean)
-            deduped = _dedupe_watchlist_best_by_symbol(normalized)
-            nonzero = sum(1 for r in deduped if float(r.get("score") or 0.0) != 0.0)
-            if len(deduped) < 10:
-                raise ValueError(f"artifact_unique_symbols_lt_10 count={len(deduped)} path={path}")
-            if nonzero <= 0:
-                raise ValueError(f"artifact_all_scores_zero path={path}")
-            selected = deduped[:30]
-            logger.info(
-                "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][OK] path=%s rows=%d unique=%d selected=%d nonzero=%d preferred_30=%d",
-                path, len(raw_rows), len(deduped), len(selected), nonzero, int(len(selected) == 30),
+                    return _select_watchlist_rows_from_payload(
+                        payload,
+                        path=path,
+                        trade_date=trade_date,
+                        source="latest_summary_embedded_rows",
+                        require_trade_date_match=bool(summary_td),
+                    )
+                except Exception as embedded_exc:
+                    errors.append(f"{path}:embedded:{type(embedded_exc).__name__}:{embedded_exc}")
+                    candidate_paths[idx:idx] = _candidate_paths_from_latest_summary(payload, path, trade_date)
+                    continue
+            return _select_watchlist_rows_from_payload(
+                payload,
+                path=path,
+                trade_date=trade_date,
+                source=source,
+                require_trade_date_match=require_td,
             )
-            return selected
         except Exception as exc:
             errors.append(f"{path}:{type(exc).__name__}:{exc}")
     raise FileNotFoundError("; ".join(errors))
-
 
 def _entry_cutoff_passed(now: datetime) -> bool:
     """15:45 ET 이후이면 True."""
@@ -178,6 +280,66 @@ def _dedupe_watchlist_best_by_symbol(rows: list[dict]) -> list[dict]:
     return deduped
 
 
+def route_exit_orders_immediately(
+    exit_intents: list[dict],
+    *,
+    buy_daily_notional: float,
+    position_count: int,
+    effective_budget: float,
+    signal_only: bool,
+    kis_order_allowed: bool,
+    current_position_symbols: set[str],
+) -> dict:
+    """Route SELL intents before any entry watchlist/evaluation work.
+
+    SELL notional is reported separately and never added to BUY daily notional.
+    """
+    from trader.us.execution.order_router import route_order
+
+    sell_intents = [i for i in exit_intents if str(i.get("side") or "").upper() == "SELL"]
+    logger.info("[US_EXIT][ROUTE_IMMEDIATE][START] exit_intents=%d", len(sell_intents))
+    orders: list[dict] = []
+    for intent in sell_intents:
+        try:
+            result = route_order(
+                intent,
+                current_daily_notional_usd=buy_daily_notional,
+                current_position_count=position_count,
+                total_portfolio_usd=max(effective_budget, 1000.0),
+                available_cash_usd=max(effective_budget - buy_daily_notional, 0.0),
+                signal_only=signal_only,
+                kis_order_allowed=kis_order_allowed,
+                allowed_symbols=None,
+                current_position_symbols=current_position_symbols if current_position_symbols else None,
+            )
+            orders.append(result)
+        except Exception as exc:
+            logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
+            orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
+    ack = sum(1 for o in orders if o.get("status") == "ACK")
+    sent = sum(1 for o in orders if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"})
+    rejected = sum(1 for o in orders if o.get("status") == "REJECT")
+    blocked = sum(1 for o in orders if o.get("status") in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"})
+    sell_notional_routed = sum(
+        float((o.get("intent") or {}).get("notional_usd", 0) or 0)
+        for o in orders
+        if o.get("status") in {"ACK", "DRY_RUN", "SIGNAL_ONLY"}
+    )
+    logger.info(
+        "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d sell_notional=%.2f",
+        len(sell_intents), sent, ack, rejected, blocked, sell_notional_routed,
+    )
+    return {
+        "orders": orders,
+        "sell_notional_routed": sell_notional_routed,
+        "exit_notional_routed": sell_notional_routed,
+        "sent": sent,
+        "ack": ack,
+        "rejected": rejected,
+        "blocked": blocked,
+    }
+
+
 def run_trade_tick(
     session: str = "am",
     env: str = "practice",
@@ -223,6 +385,9 @@ def run_trade_tick(
     temp_error_count = 0
     temp_recovered_count = 0
     kis_temp_errors_by_api: dict[str, dict] = {}
+    ack_recon: dict[str, Any] = {"status": "SKIP", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
+    ack_recon_before_route: dict[str, Any] = dict(ack_recon)
+    ack_recon_after_route: dict[str, Any] = dict(ack_recon)
 
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
     from trader.us.market_calendar import now_ny, is_us_trading_day, market_phase
@@ -495,8 +660,9 @@ def run_trade_tick(
                 trade_date=trade_date,
                 env=env,
             )
+            ack_recon_before_route = dict(ack_recon)
             logger.info(
-                "[US_RECONCILE][ACK_RECONCILE][TICK] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
+                "[US_RECONCILE][ACK_RECONCILE][TICK_BEFORE_ROUTE] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
                 ack_recon.get("status"),
                 ack_recon.get("pending_count", 0),
                 ack_recon.get("confirmed_count", 0),
@@ -577,6 +743,23 @@ def run_trade_tick(
         logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
 
+    # Route SELLs immediately before any entry watchlist or entry evaluation work.
+    buy_daily_notional = 0.0
+    if not current_position_symbols and current_positions:
+        current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
+    exit_route_result = route_exit_orders_immediately(
+        exit_intents,
+        buy_daily_notional=buy_daily_notional,
+        position_count=position_count,
+        effective_budget=effective_budget,
+        signal_only=signal_only,
+        kis_order_allowed=kis_order_allowed,
+        current_position_symbols=current_position_symbols,
+    )
+    orders = list(exit_route_result.get("orders", []))
+    sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
+    exit_routed_before_entry = 1
+
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
     entry_intents: list[dict] = []
@@ -584,6 +767,7 @@ def run_trade_tick(
     entry_degraded = False
     entry_degraded_reason = ""
     watchlist_fallback_used = False
+    entry_watchlist_source = "none"
     exit_routed_after_entry_degraded = False
     after_cutoff = _entry_cutoff_passed(now)
 
@@ -747,6 +931,7 @@ def run_trade_tick(
                     try:
                         watchlist_rows = load_watchlist_from_artifact(trade_date)
                         watchlist_fallback_used = True
+                        entry_watchlist_source = (watchlist_rows[0].get("entry_watchlist_source") if watchlist_rows else "artifact_final30_scored")
                     except Exception as fb_exc:
                         logger.warning(
                             "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][FAIL] trade_date=%s error=%s",
@@ -777,6 +962,7 @@ def run_trade_tick(
                     try:
                         watchlist_rows = load_watchlist_from_artifact(trade_date)
                         watchlist_fallback_used = True
+                        entry_watchlist_source = (watchlist_rows[0].get("entry_watchlist_source") if watchlist_rows else "artifact_final30_scored")
                     except Exception as fb_exc:
                         logger.warning(
                             "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][FAIL] trade_date=%s error=%s",
@@ -878,9 +1064,11 @@ def run_trade_tick(
                         "OK" if fills_error_count == 0 else ("CONTRACT_ERROR" if fills_contract_error else "TEMP_ERROR")
                     )
                     
+                    if not watchlist_fallback_used:
+                        entry_watchlist_source = "db_locked_watchlist"
                     logger.info(
-                        "[US_ENTRY][LOCKED_WATCHLIST] raw_count=%d deduped_count=%d prep_status=%s source=db_us_locked_watchlist",
-                        raw_watchlist_count, len(watchlist_rows), prep_status
+                        "[US_ENTRY][LOCKED_WATCHLIST] raw_count=%d deduped_count=%d prep_status=%s source=%s",
+                        raw_watchlist_count, len(watchlist_rows), prep_status, entry_watchlist_source
                     )
                     
                     # INPUT CONTRACT 검증
@@ -900,37 +1088,9 @@ def run_trade_tick(
                             entry_degraded_reason or "watchlist_load_degraded", len(exit_intents),
                         )
                     elif real_order_mode:
-                        logger.error(
-                            "[US_TICK][DONE] session=%s status=FAILED reason=locked_watchlist_missing",
-                            session,
-                        )
-                        return {
-                            "status": "FAILED",
-                            "reason": "locked_watchlist_missing",
-                            "session": session,
-                            "orders": [],
-                            "ack": 0,
-                            "dry_run": 0,
-                            "blocked": 0,
-                            "signal_only": 0,
-                            "errors": 1,
-                            "run_mode": run_mode,
-                            "signal_only_mode": signal_only,
-                            "kis_order_allowed": kis_order_allowed,
-                            "last_stage": last_stage,
-                            "trade_date": trade_date,
-                            "prep_status": prep_status,
-                            "locked_watchlist_count": 0,
-                            "entry_eval_status": "FAILED",
-                            "entry_error_type": "locked_watchlist_missing",
-                            "entry_error_message": "locked_watchlist_missing",
-                            "entry_intents": 0,
-                            "orders_sent": 0,
-                            "fills": len(fills_today),
-                            "positions": position_count,
-                            "temp_error_count": temp_error_count,
-                            "temp_recovered_count": temp_recovered_count,
-                        }
+                        entry_degraded = True
+                        entry_degraded_reason = "locked_watchlist_missing"
+                        logger.warning("[US_ENTRY][DEGRADED_SKIP_ENTRY] reason=locked_watchlist_missing")
                     if not entry_degraded:
                         logger.warning(
                             "[US_ENTRY][BLOCK][WARN] non_real_order_mode locklist missing -> no entry intents"
@@ -980,40 +1140,13 @@ def run_trade_tick(
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
     if entry_eval_error_count > 0 and real_order_mode and not exit_intents:
-        last_stage = "entry_eval"
-        logger.error("[US_ORDER][ROUTE][SKIP] reason=entry_eval_error")
-        logger.error("[US_TICK][DONE] session=%s status=FAILED reason=entry_eval_error", session)
-        return {
-            "status": "FAILED",
-            "reason": "entry_eval_error",
-            "session": session,
-            "orders": [],
-            "ack": 0,
-            "dry_run": 0,
-            "blocked": 0,
-            "signal_only": 0,
-            "errors": entry_eval_error_count,
-            "budget": budget,
-            "run_mode": run_mode,
-            "signal_only_mode": signal_only,
-            "kis_order_allowed": kis_order_allowed,
-            "last_stage": last_stage,
-            "trade_date": trade_date,
-            "prep_status": prep_status if 'prep_status' in locals() else "UNKNOWN",
-            "locked_watchlist_count": len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
-            "entry_eval_status": "FAILED",
-            "entry_error_type": "entry_eval_error",
-            "entry_error_message": "entry_eval_error",
-            "entry_intents": 0,
-            "orders_sent": 0,
-            "fills": len(fills_today),
-            "positions": position_count,
-            "temp_error_count": temp_error_count,
-            "temp_recovered_count": temp_recovered_count,
-        }
+        entry_degraded = True
+        entry_degraded_reason = entry_degraded_reason or "entry_eval_error"
+        logger.warning("[US_ENTRY][DEGRADED_SKIP_ENTRY] reason=entry_eval_error")
+
 
     # ── Order routing ─────────────────────────────────────────────────────────
-    all_intents = exit_intents + entry_intents
+    all_intents = entry_intents
     if entry_degraded and exit_intents:
         exit_routed_after_entry_degraded = True
         logger.warning(
@@ -1022,8 +1155,7 @@ def run_trade_tick(
         )
     logger.info("[US_ORDER][ROUTE][START] total_intents=%d", len(all_intents))
 
-    orders: list[dict] = []
-    daily_notional = 0.0
+    # orders already contains immediately-routed exit orders.
 
     # locked_watchlist_symbols: BUY universe (watchlist_rows에서 dedupe 후 추출)
     locked_watchlist_symbols: set[str] = set()
@@ -1067,7 +1199,7 @@ def run_trade_tick(
                 if not (i.get("side", "BUY").upper() == "BUY"
                         and str(i.get("symbol", "")).upper().strip() in _not_in_wl)
             ]
-            all_intents = exit_intents + entry_intents
+            all_intents = entry_intents
 
     from trader.us.execution.order_router import route_order
 
@@ -1075,18 +1207,19 @@ def run_trade_tick(
         try:
             result = route_order(
                 intent,
-                current_daily_notional_usd=daily_notional,
+                current_daily_notional_usd=buy_daily_notional,
                 current_position_count=position_count,
                 total_portfolio_usd=max(effective_budget, 1000.0),
-                available_cash_usd=max(effective_budget - daily_notional, 0.0),
+                available_cash_usd=max(effective_budget - buy_daily_notional, 0.0),
                 signal_only=signal_only,
                 kis_order_allowed=kis_order_allowed,
-                allowed_symbols=locked_watchlist_symbols if locked_watchlist_symbols else None,
+                allowed_symbols=(locked_watchlist_symbols if str(intent.get("side", "BUY")).upper() == "BUY" and locked_watchlist_symbols else None),
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):
-                daily_notional += float(intent.get("notional_usd", 0))
+                if str(intent.get("side", "")).upper() == "BUY":
+                    buy_daily_notional += float(intent.get("notional_usd", 0) or 0)
                 if str(intent.get("side", "")).upper() == "BUY":
                     symbol_upper = str(intent.get("symbol", "")).upper().strip()
                     position_action = (
@@ -1114,7 +1247,32 @@ def run_trade_tick(
     signal_only_cnt = sum(1 for o in orders if o["status"] == "SIGNAL_ONLY")
     reject_cnt = sum(1 for o in orders if o["status"] == "REJECT")
     err_cnt = sum(1 for o in orders if o["status"] == "ERROR")
-    
+    ack_db_failed_cnt = sum(1 for o in orders if o.get("status") == "ACK_DB_FAILED")
+
+    if not offline and (ack_cnt > 0 or ack_db_failed_cnt > 0):
+        try:
+            from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+            ack_recon_after_route = reconcile_ack_orders_with_balance(
+                provider=provider,
+                trade_date=trade_date,
+                env=env,
+            )
+            ack_recon = dict(ack_recon_after_route)
+            logger.info(
+                "[US_RECONCILE][ACK_RECONCILE][TICK_AFTER_ROUTE] status=%s pending=%d confirmed=%d balance=%d unresolved=%d",
+                ack_recon_after_route.get("status"),
+                ack_recon_after_route.get("pending_count", 0),
+                ack_recon_after_route.get("confirmed_count", 0),
+                ack_recon_after_route.get("balance_reconcile_count", 0),
+                ack_recon_after_route.get("unresolved_count", 0),
+            )
+        except Exception as exc:
+            logger.warning("[US_TICK][WARN] post-route reconcile_ack_orders_with_balance failed: %s", exc)
+            ack_recon_after_route = {"status": "ACK_PENDING_RECONCILE", "error": str(exc), "pending_count": ack_cnt + ack_db_failed_cnt, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": ack_cnt + ack_db_failed_cnt, "symbols_by_status": {"ack_pending_reconcile": []}}
+            ack_recon = dict(ack_recon_after_route)
+    else:
+        ack_recon_after_route = dict(ack_recon_before_route)
+
     # Block reasons 통계 수집
     block_reasons: dict[str, int] = {}
     blocked_sell_symbols: set[str] = set()
@@ -1275,7 +1433,7 @@ def run_trade_tick(
                 status, exit_intents_count, blocked_cnt,
             )
         elif orders_sent > 0:
-            status = "OK_WITH_WARNINGS" if entry_degraded else "OK_EXIT_ORDERS_SENT"
+            status = "OK_EXIT_SENT_ENTRY_DEGRADED" if entry_degraded else "OK_EXIT_ORDERS_SENT"
             logger.info(
                 "[US_TICK][STATUS_DECISION] status=%s exit_intents=%d sent=%d entry_degraded=%d",
                 status, exit_intents_count, orders_sent, int(entry_degraded),
@@ -1295,7 +1453,7 @@ def run_trade_tick(
             )
     elif entry_intents_count == 0 and orders_sent == 0:
         # 진입 후보가 없음 + exit 없음
-        status = "OK_NO_TRADE" if not signal_only else "OK_SIGNAL_ONLY"
+        status = "OK_NO_TRADE_ENTRY_DEGRADED" if entry_degraded else ("OK_NO_TRADE" if not signal_only else "OK_SIGNAL_ONLY")
         logger.info(
             "[US_TICK][STATUS_DECISION] status=%s reason=no_entry_intents signal_only=%s",
             status, int(signal_only)
@@ -1333,6 +1491,15 @@ def run_trade_tick(
             status, total_warnings
         )
     
+    sell_decisions_detail = [
+        {"symbol": str((i or {}).get("symbol", "")).upper(), **(((i or {}).get("meta") or {}) if isinstance((i or {}).get("meta"), dict) else {})}
+        for i in exit_intents if str((i or {}).get("side") or "").upper() == "SELL"
+    ]
+    buy_notional_routed = buy_daily_notional
+    total_order_notional_routed = buy_notional_routed + sell_notional_routed
+    after_symbols_by_status = ack_recon_after_route.get("symbols_by_status", {}) if isinstance(ack_recon_after_route, dict) else {}
+    ack_pending_reconcile_count = len(after_symbols_by_status.get("ack_pending_reconcile", [])) if isinstance(after_symbols_by_status, dict) else 0
+    broker_ack_only_unresolved = int(ack_recon_after_route.get("unresolved_count", 0) or 0)
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
@@ -1358,8 +1525,8 @@ def run_trade_tick(
             exit_intents_count,
         )
     logger.info(
-        "[US_TICK][SUMMARY] session=%s trade_date_et=%s final30=%d holdings=%d held_skip=%s held_skip_unknown=%d buy_intents=%d risk_allowed=%d risk_blocked=%d submitted=%d ack=%d rejected=%d temp_recovered=%d final_errors=%d status=%s",
-        session, trade_date, len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
+        "[US_TICK][SUMMARY] exit_routed_before_entry=%d entry_degraded=%d session=%s trade_date_et=%s final30=%d holdings=%d held_skip=%s held_skip_unknown=%d buy_intents=%d risk_allowed=%d risk_blocked=%d submitted=%d ack=%d rejected=%d temp_recovered=%d final_errors=%d status=%s",
+        exit_routed_before_entry, int(entry_degraded), session, trade_date, len(watchlist_rows) if 'watchlist_rows' in locals() and watchlist_rows else 0,
         len(current_positions) if 'current_positions' in locals() else 0,
         held_skip if held_skip is not None else "None", held_skip_unknown,
         entry_intents_count, orders_sent, blocked_cnt, orders_sent, ack_cnt, reject_cnt, temp_recovered_count, total_errors, status,
@@ -1411,6 +1578,8 @@ def run_trade_tick(
         "entry_degraded": int(entry_degraded),
         "entry_degraded_reason": entry_degraded_reason,
         "watchlist_fallback_used": int(watchlist_fallback_used),
+        "entry_watchlist_source": entry_watchlist_source,
+        "exit_routed_before_entry": exit_routed_before_entry,
         "exit_routed_after_entry_degraded": int(exit_routed_after_entry_degraded),
         "entry_intents": len(entry_intents),
         "orders_sent": orders_sent,  # ack + dry_run
@@ -1418,7 +1587,36 @@ def run_trade_tick(
         "fills": len(fills_today),
         "sold_today_count": len(sold_today) if 'sold_today' in locals() else 0,
         "sold_today_symbols": sorted(sold_today) if 'sold_today' in locals() else [],
-        "pending_order_count": max(0, ack_cnt - len(fills_today)),
+        "pending_order_count": int(ack_recon_after_route.get("unresolved_count", ack_recon.get("unresolved_count", 0)) or 0),
+        "ack_reconcile_before_route_status": ack_recon_before_route.get("status", "SKIP"),
+        "ack_reconcile_before_route_pending_count": int(ack_recon_before_route.get("pending_count", 0) or 0),
+        "ack_reconcile_before_route_confirmed_count": int(ack_recon_before_route.get("confirmed_count", 0) or 0),
+        "ack_reconcile_before_route_balance_reconcile_count": int(ack_recon_before_route.get("balance_reconcile_count", 0) or 0),
+        "ack_reconcile_before_route_unresolved_count": int(ack_recon_before_route.get("unresolved_count", 0) or 0),
+        "ack_reconcile_after_route_status": ack_recon_after_route.get("status", "SKIP"),
+        "ack_reconcile_after_route_pending_count": int(ack_recon_after_route.get("pending_count", 0) or 0),
+        "ack_reconcile_after_route_confirmed_count": int(ack_recon_after_route.get("confirmed_count", 0) or 0),
+        "ack_reconcile_after_route_balance_reconcile_count": int(ack_recon_after_route.get("balance_reconcile_count", 0) or 0),
+        "ack_reconcile_after_route_unresolved_count": int(ack_recon_after_route.get("unresolved_count", 0) or 0),
+        "ack_reconcile_after_route_symbols_by_status": ack_recon_after_route.get("symbols_by_status", {}),
+        "ack_reconcile_status": ack_recon.get("status", "SKIP"),
+        "ack_reconcile_pending_count": int(ack_recon.get("pending_count", 0) or 0),
+        "ack_reconcile_confirmed_count": int(ack_recon.get("confirmed_count", 0) or 0),
+        "ack_reconcile_balance_reconcile_count": int(ack_recon.get("balance_reconcile_count", 0) or 0),
+        "ack_reconcile_unresolved_count": int(ack_recon.get("unresolved_count", 0) or 0),
+        "ack_reconcile_symbols_by_status": ack_recon.get("symbols_by_status", {}),
+        "fills_api_count": len(fills_today),
+        "synthetic_reconcile_fills_count": int(ack_recon_after_route.get("balance_reconcile_count", ack_recon.get("balance_reconcile_count", 0)) or 0),
+        "balance_confirmed_count": int(ack_recon_after_route.get("balance_reconcile_count", ack_recon.get("balance_reconcile_count", 0)) or 0),
+        "unresolved_ack_count": int(ack_recon_after_route.get("unresolved_count", ack_recon.get("unresolved_count", 0)) or 0),
+        "buy_notional_routed": round(buy_notional_routed, 4),
+        "sell_notional_routed": round(sell_notional_routed, 4),
+        "exit_notional_routed": round(sell_notional_routed, 4),
+        "total_order_notional_routed": round(total_order_notional_routed, 4),
+        "buy_daily_notional_after_routing": round(buy_daily_notional, 4),
+        "sell_notional_does_not_consume_buy_budget": int(sell_notional_routed > 0 and buy_daily_notional == buy_notional_routed),
+        "broker_ack_only_unresolved": broker_ack_only_unresolved,
+        "ack_pending_reconcile_count": ack_pending_reconcile_count,
         "open_position_count": len(current_positions) if 'current_positions' in locals() else 0,
         "open_position_symbols": [p.get("symbol", "") for p in (current_positions if 'current_positions' in locals() else [])],
         "positions": len(current_positions) if 'current_positions' in locals() else 0,
@@ -1432,6 +1630,7 @@ def run_trade_tick(
         "broker_ack_only": broker_ack_only,
         "broker_rejects": broker_rejects,
         "duplicate_exit_blocked": duplicate_exit_blocked,
+        "sell_decisions_detail": sell_decisions_detail,
     }
 
 

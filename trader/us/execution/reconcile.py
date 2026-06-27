@@ -359,6 +359,7 @@ def reconcile_ack_orders_with_balance(
             "confirmed_count": 0,
             "balance_reconcile_count": 0,
             "unresolved_count": 0,
+            "symbols_by_status": {},
         }
 
     logger.info(
@@ -379,6 +380,7 @@ def reconcile_ack_orders_with_balance(
     confirmed_count = 0
     balance_reconcile_count = 0
     unresolved_count = 0
+    symbols_by_status: dict[str, list[str]] = {"fill_api_confirmed": [], "balance_confirmed": [], "unresolved": []}
 
     for order in pending_orders:
         symbol = str(order.get("symbol", "")).strip().upper()
@@ -435,6 +437,7 @@ def reconcile_ack_orders_with_balance(
                     meta=_order_meta(order),
                 )
                 confirmed_count += 1
+                symbols_by_status["fill_api_confirmed"].append(symbol)
             except Exception as exc:
                 logger.error(
                     "[US_RECONCILE][ACK_RECONCILE][ERROR] mark_order_filled failed symbol=%s: %s",
@@ -476,6 +479,7 @@ def reconcile_ack_orders_with_balance(
                         meta=_order_meta(order),
                     )
                     balance_reconcile_count += 1
+                    symbols_by_status["balance_confirmed"].append(symbol)
                 except Exception as exc:
                     logger.error(
                         "[US_RECONCILE][ACK_RECONCILE][ERROR] balance_reconcile_buy failed symbol=%s: %s",
@@ -502,6 +506,7 @@ def reconcile_ack_orders_with_balance(
                     qty,
                 )
                 unresolved_count += 1
+                symbols_by_status["unresolved"].append(symbol)
                 continue
 
             if fallback_fill_price > 0:
@@ -537,6 +542,7 @@ def reconcile_ack_orders_with_balance(
                     meta=_order_meta(order),
                 )
                 balance_reconcile_count += 1
+                symbols_by_status["balance_confirmed"].append(symbol)
             except Exception as exc:
                 logger.error(
                     "[US_RECONCILE][ACK_RECONCILE][ERROR] balance_reconcile_fill failed symbol=%s: %s",
@@ -550,6 +556,7 @@ def reconcile_ack_orders_with_balance(
             symbol, order_no, side,
         )
         unresolved_count += 1
+        symbols_by_status["unresolved"].append(symbol)
 
     logger.info(
         "[US_RECONCILE][ACK_RECONCILE][DONE] pending=%d confirmed=%d balance_reconcile=%d unresolved=%d",
@@ -562,4 +569,73 @@ def reconcile_ack_orders_with_balance(
         "confirmed_count": confirmed_count,
         "balance_reconcile_count": balance_reconcile_count,
         "unresolved_count": unresolved_count,
+        "symbols_by_status": symbols_by_status,
     }
+
+def classify_ack_orders_with_final_balance(
+    *,
+    provider: Any,
+    trade_date: str,
+    env: str = "practice",
+    orders: list[dict] | None = None,
+) -> dict:
+    """Classify same-day ACK orders using final close balance deltas.
+
+    Intended for close reports, after the broker's balance has had time to settle.
+    """
+    from trader.us.db.repos import load_pending_ack_orders
+
+    if orders is None:
+        orders = load_pending_ack_orders(trade_date=trade_date, env=env)
+
+    try:
+        balance = provider.get_balance()
+        final_positions = _build_kis_position_by_symbol(balance.get("positions", []))
+    except Exception as exc:
+        return {"status": "ERROR", "error": str(exc), "orders": [], "pending_order_count": len(orders or [])}
+
+    classified: list[dict] = []
+    pending = 0
+    counts: dict[str, int] = {}
+    for order in orders or []:
+        symbol = str(order.get("symbol") or "").upper().strip()
+        side = str(order.get("side") or "").upper()
+        qty = int(order.get("qty_requested") or order.get("qty") or order.get("filled_qty") or order.get("qty_filled") or 0)
+        pre_qty, _source = _extract_pre_order_position_qty(order)
+        final_qty = int((final_positions.get(symbol) or {}).get("qty") or 0)
+        raw_status = str(order.get("status") or "").upper()
+        fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
+        if raw_status in {"REJECT", "REJECTED"}:
+            final_status = "REJECTED"
+        elif raw_status in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
+            final_status = "DUPLICATE_OR_ALREADY_CLOSED" if raw_status == "WARN_DUPLICATE_EXIT_BLOCKED" else "BLOCKED"
+        elif fill_qty > 0 or raw_status in {"FILLED", "PARTIALLY_FILLED"}:
+            final_status = "FILLED_BY_KIS_FILL_API"
+        elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
+            final_status = "FILLED_BY_BALANCE_DELTA"
+        elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty >= qty:
+            final_status = "FILLED_BY_BALANCE_DELTA"
+        elif raw_status in {"ACK", "ACKED", "ACCEPTED", "SENT", "ACK_DB_FAILED"}:
+            final_status = "ACK_UNRESOLVED"
+        else:
+            final_status = "ACK_PENDING_RECONCILE"
+        if final_status in {"ACK_UNRESOLVED", "ACK_PENDING_RECONCILE"}:
+            pending += 1
+        counts[final_status] = counts.get(final_status, 0) + 1
+        classified.append({
+            "time": str(order.get("created_at") or order.get("time") or ""),
+            "side": side,
+            "symbol": symbol,
+            "qty": qty,
+            "order_no": str(order.get("order_no") or order.get("ack_no") or ""),
+            "client_order_key": str(order.get("client_order_key") or ""),
+            "ack_status": raw_status,
+            "fill_api_status": "FILLED_BY_KIS_FILL_API" if final_status == "FILLED_BY_KIS_FILL_API" else "NOT_CONFIRMED_BY_FILL_API",
+            "balance_delta_status": "FILLED_BY_BALANCE_DELTA" if final_status == "FILLED_BY_BALANCE_DELTA" else "NOT_CONFIRMED_BY_BALANCE_DELTA",
+            "final_status": final_status,
+            "price_source": str((order.get("meta") or {}).get("price_source") or order.get("price_source") or ""),
+            "pnl_if_sell": (order.get("meta") or {}).get("pnl_if_sell") if isinstance(order.get("meta") or {}, dict) else None,
+            "pre_order_position_qty": pre_qty,
+            "final_position_qty": final_qty,
+        })
+    return {"status": "OK", "orders": classified, "counts": counts, "pending_order_count": pending}

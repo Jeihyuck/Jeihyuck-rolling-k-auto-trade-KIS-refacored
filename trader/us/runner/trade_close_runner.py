@@ -166,7 +166,23 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] balance fetch failed: %s", exc)
 
-        # 7. Daily report
+        # 7. Final balance delta classification for same-day ACK orders
+        close_order_classification = {"status": "SKIP", "orders": [], "counts": {}, "pending_order_count": 0}
+        if not offline:
+            try:
+                from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
+                close_order_classification = classify_ack_orders_with_final_balance(provider=provider, trade_date=trade_date, env=env)
+                logger.info(
+                    "[US_TRADE_CLOSE][ORDER_FINAL_CLASSIFICATION] status=%s pending=%s counts=%s",
+                    close_order_classification.get("status"),
+                    close_order_classification.get("pending_order_count"),
+                    close_order_classification.get("counts"),
+                )
+            except Exception as exc:
+                close_order_classification = {"status": "ERROR", "error": str(exc), "orders": [], "counts": {}, "pending_order_count": 0}
+                logger.warning("[US_TRADE_CLOSE][WARN] order final classification failed: %s", exc)
+
+        # 8. Daily report
         try:
             from trader.us.runner.daily_report_runner import run_daily_report
             run_daily_report(env=env, offline=offline)
@@ -208,6 +224,9 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "reconcile_status": reconcile_result.get("status"),
             "balance": balance,
             "close_entry_enabled": close_entry_enabled,
+            "order_final_classification": close_order_classification.get("orders", []),
+            "order_final_classification_counts": close_order_classification.get("counts", {}),
+            "pending_order_count": close_order_classification.get("pending_order_count", 0),
         }
     finally:
         release_us_session_running_lock(trade_date, "close", run_id=run_id)

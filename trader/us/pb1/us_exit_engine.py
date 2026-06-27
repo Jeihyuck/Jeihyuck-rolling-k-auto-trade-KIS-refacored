@@ -55,6 +55,7 @@ def evaluate_exit(
     position: dict,
     current_price: float,
     now: datetime | None = None,
+    trail_high_price: float | None = None,
 ) -> dict | None:
     """단일 포지션 청산 조건 평가.
 
@@ -178,6 +179,7 @@ def evaluate_exit(
                 holding_qty=raw_qty,
                 orderable_qty=orderable_qty,
                 now=now,
+                trail_high_price=current_price,
             )
         return None
 
@@ -218,6 +220,8 @@ def evaluate_exit(
             pnl_pct=pnl_pct,
             holding_qty=raw_qty,
             orderable_qty=orderable_qty,
+            now=now,
+            trail_high_price=max_price,
         )
 
     # ── trailing stop ─────────────────────────────────────────────────────────
@@ -232,6 +236,8 @@ def evaluate_exit(
             pnl_pct=pnl_pct,
             holding_qty=raw_qty,
             orderable_qty=orderable_qty,
+            now=now,
+            trail_high_price=max_price,
         )
 
     # ── profit protect ────────────────────────────────────────────────────────
@@ -267,6 +273,8 @@ def evaluate_exit(
                     pnl_pct=pnl_pct,
                     holding_qty=raw_qty,
                     orderable_qty=orderable_qty,
+                    now=now,
+                    trail_high_price=max_price,
                 )
 
     return None
@@ -311,6 +319,7 @@ def _make_exit_intent(
     holding_qty: int = 0,
     orderable_qty: int = 0,
     now: datetime | None = None,
+    trail_high_price: float | None = None,
 ) -> dict | None:
     """Exit order intent 생성."""
     import hashlib
@@ -333,6 +342,20 @@ def _make_exit_intent(
 
     _holding = holding_qty or qty
     _orderable = orderable_qty or _holding
+    trail_high = float(trail_high_price or current_price or 0.0)
+    trail_drawdown_pct = ((trail_high - current_price) / trail_high) if trail_high > 0 else 0.0
+    cfg = _reload_env()
+    stop_type = exit_type
+    threshold = cfg["hard_stop"] if exit_type == "hard_stop" else cfg["trailing_stop"] if exit_type in {"trailing_stop", "profit_protect"} else cfg.get("giveback", 0.0)
+    try:
+        from zoneinfo import ZoneInfo
+        decision_ts_et = (now or datetime.now(tz=ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York")).isoformat()
+    except Exception:
+        decision_ts_et = datetime.utcnow().isoformat() + "Z"
+    logger.info(
+        "[US_EXIT][DECISION_AUDIT] symbol=%s stop_type=%s entry=%.4f current=%.4f pnl_pct=%.4f trail_high=%.4f trail_dd_pct=%.4f threshold=%.4f",
+        symbol, stop_type, entry_price, current_price, pnl_pct, trail_high, trail_drawdown_pct, threshold,
+    )
 
     return {
         "symbol": symbol,
@@ -354,6 +377,19 @@ def _make_exit_intent(
             "orderable_qty": _orderable,
             "sellable_qty": _orderable,
             "qty_source": "orderable_qty_clamp" if qty < _holding else "holding_qty",
+            "sell_reason": reason,
+            "stop_type": stop_type,
+            "entry_price": entry_price,
+            "avg_cost": entry_price,
+            "current_price": current_price,
+            "pnl_pct_from_avg_cost": round(pnl_pct, 6),
+            "hard_stop_threshold_pct": cfg["hard_stop"],
+            "trail_high_price": trail_high,
+            "trail_drawdown_pct": round(trail_drawdown_pct, 6),
+            "trailing_stop_threshold_pct": cfg["trailing_stop"],
+            "price_source": "provider_current_price",
+            "qty": qty,
+            "decision_ts_et": decision_ts_et,
         },
     }
 

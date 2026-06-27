@@ -23,6 +23,7 @@ import os
 import sys
 import time as time_mod
 import signal
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,6 +31,61 @@ logger = logging.getLogger(__name__)
 _received_signal: int | None = None
 _last_liveness_event = ""
 _exit_code: int | None = None
+
+
+def _git_value(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+
+
+def _runtime_provenance(*, session: str, run_id: str, started_at_et: str = "", ended_at_et: str = "", wall_elapsed_sec: float = 0.0) -> dict:
+    from datetime import datetime, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        kst = ZoneInfo("Asia/Seoul")
+        now_utc_dt = datetime.now(timezone.utc)
+        started_utc_val = os.getenv("US_STARTED_AT_UTC") or now_utc_dt.isoformat().replace("+00:00", "Z")
+        started_et_val = started_at_et or now_utc_dt.astimezone(et).isoformat()
+        started_kst_val = os.getenv("US_STARTED_AT_KST") or now_utc_dt.astimezone(kst).isoformat()
+        ended_et_val = ended_at_et or now_utc_dt.astimezone(et).isoformat()
+        ended_kst_val = now_utc_dt.astimezone(kst).isoformat()
+        ended_utc_val = now_utc_dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        started_utc_val = os.getenv("US_STARTED_AT_UTC") or datetime.utcnow().isoformat() + "Z"
+        started_et_val = started_at_et or "unknown"
+        started_kst_val = os.getenv("US_STARTED_AT_KST") or "unknown"
+        ended_et_val = ended_at_et or "unknown"
+        ended_kst_val = "unknown"
+        ended_utc_val = datetime.utcnow().isoformat() + "Z"
+    branch = os.getenv("GITHUB_REF_NAME") or _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
+    workflow = os.getenv("GITHUB_WORKFLOW") or "local"
+    source = "github_actions" if os.getenv("GITHUB_ACTIONS") or os.getenv("GITHUB_RUN_ID") else "git_fallback"
+    return {
+        "branch": branch or "unknown",
+        "commit_sha": sha or "unknown",
+        "sha": sha or "unknown",
+        "workflow": workflow,
+        "github_run_id": os.getenv("GITHUB_RUN_ID", run_id or "local"),
+        "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", "0"),
+        "event_name": os.getenv("GITHUB_EVENT_NAME", "local"),
+        "actor": os.getenv("GITHUB_ACTOR", os.getenv("USER", "local")),
+        "session": session,
+        "run_id": run_id or os.getenv("GITHUB_RUN_ID", "local"),
+        "session_id": f"{session}-{run_id or os.getenv('GITHUB_RUN_ID', 'local')}",
+        "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
+        "started_at_utc": started_utc_val,
+        "started_at_et": started_et_val,
+        "started_at_kst": started_kst_val,
+        "ended_at_utc": ended_utc_val,
+        "ended_at_et": ended_et_val,
+        "ended_at_kst": ended_kst_val,
+        "wall_elapsed_sec": round(float(wall_elapsed_sec or 0.0), 2),
+        "code_version_source": source,
+    }
 
 # 세션별 종료 시각 (ET)
 _SESSION_END_TIMES = {
@@ -136,7 +192,9 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
                 existing = {}
 
         now_utc = _dt.utcnow().isoformat() + "Z"
+        prov = _runtime_provenance(session=session, run_id=str(payload.get("run_id", "")), wall_elapsed_sec=float(payload.get("wall_elapsed_sec", 0) or 0))
         session_entry = {
+            **prov,
             "session": session,
             "trade_date": trade_date,
             "final_status": payload.get("final_status", "UNKNOWN"),
@@ -146,13 +204,28 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "unique_fills_count": int(payload.get("unique_fills_count", 0) or 0),
             "orders_ack": int(payload.get("orders_ack", 0) or 0),
             "orders_rejected": int(payload.get("orders_rejected", 0) or 0),
-            "run_id": payload.get("run_id", ""),
-            "workflow": payload.get("workflow", ""),
+            "entry_degraded": payload.get("entry_degraded", 0),
+            "entry_degraded_reason": payload.get("entry_degraded_reason", ""),
+            "entry_eval_status": payload.get("entry_eval_status", ""),
+            "entry_watchlist_source": payload.get("entry_watchlist_source", ""),
+            "watchlist_fallback_used": payload.get("watchlist_fallback_used", 0),
+            "exit_routed_before_entry": payload.get("exit_routed_before_entry", 0),
+            "buy_notional_routed": payload.get("buy_notional_routed", 0),
+            "sell_notional_routed": payload.get("sell_notional_routed", 0),
+            "total_order_notional_routed": payload.get("total_order_notional_routed", 0),
+            "ack_reconcile_before_route_status": payload.get("ack_reconcile_before_route_status", ""),
+            "ack_reconcile_after_route_status": payload.get("ack_reconcile_after_route_status", ""),
+            "ack_reconcile_after_route_unresolved_count": payload.get("ack_reconcile_after_route_unresolved_count", 0),
+            "ack_pending_reconcile_count": payload.get("ack_pending_reconcile_count", 0),
+            "pending_order_count": payload.get("pending_order_count", 0),
+            "run_id": payload.get("run_id") or prov.get("run_id", ""),
+            "workflow": payload.get("workflow") or prov.get("workflow", ""),
             "wall_elapsed_sec": float(payload.get("wall_elapsed_sec", 0) or 0),
             "missed_trade_window": bool(payload.get("missed_trade_window", False)),
             "recorded_at_utc": now_utc,
         }
 
+        existing.update({k: v for k, v in session_entry.items() if k in {"branch", "commit_sha", "sha", "workflow", "github_run_id", "github_run_attempt", "event_name", "actor", "run_id", "code_version_source"}})
         existing.setdefault("trade_date", trade_date)
         existing.setdefault("sessions", {})
         existing["sessions"][session] = session_entry
@@ -199,7 +272,8 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "",
     ]
     for k in (
-        "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
+        "trade_date", "branch", "commit_sha", "run_id", "github_run_id", "github_run_attempt", "sha", "workflow", "session", "session_id", "event_name", "actor", "env",
+        "source_log_file", "started_at_utc", "started_at_et", "started_at_kst", "ended_at_utc", "ended_at_et", "ended_at_kst", "wall_elapsed_sec", "code_version_source",
         "dry_run", "kis_order_allowed", "prep_status", "prep_run_id", "score_nonzero_count",
         "locked_watchlist_count", "locked_watchlist_count_source",
         "entry_eval_status", "entry_error_type", "entry_error_message", "entry_intents",
@@ -208,7 +282,10 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
         "buy_decisions", "sell_decisions", "real_broker_buys", "real_broker_sells",
         "synthetic_reconcile_buys", "synthetic_reconcile_sells", "broker_ack_only",
-        "broker_rejects", "duplicate_exit_blocked",
+        "broker_rejects", "duplicate_exit_blocked", "buy_notional_routed", "sell_notional_routed", "total_order_notional_routed",
+        "buy_daily_notional_after_routing", "sell_notional_does_not_consume_buy_budget",
+        "ack_reconcile_before_route_status", "ack_reconcile_after_route_status", "ack_reconcile_after_route_unresolved_count",
+        "ack_pending_reconcile_count", "broker_ack_only_unresolved", "sell_decisions_detail",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
     md_lines.extend([
@@ -595,11 +672,11 @@ def run_trade_session(
         hard_error_reasons = {
             # marker: reason=fills_contract_error
             "fills_contract_error",
-            "locked_watchlist_missing",
-            "prep_degraded_or_error",
-            "locked_watchlist_below_min",
-            "watchlist_load_timeout",
-            "entry_eval_error",
+            "prep_guard_block",
+            "balance_position_parse_error",
+            "FAILED_EXIT_INTENTS_NOT_ROUTED",
+            "FAILED_ALL_EXIT_ORDERS_REJECTED",
+            "FAILED_ALL_EXIT_ORDERS_BLOCKED",
         }
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -885,6 +962,8 @@ def run_trade_session(
         real_broker_buys = real_broker_sells = 0
         synthetic_reconcile_buys = synthetic_reconcile_sells = 0
         broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
+        buy_notional_routed = sell_notional_routed = total_order_notional_routed = 0.0
+        ack_pending_reconcile_count = broker_ack_only_unresolved = 0
         all_sold_today_symbols: list[str] = []
         all_pending_order_symbols: list[str] = []
         all_open_position_symbols: list[str] = []
@@ -924,6 +1003,11 @@ def run_trade_session(
             broker_ack_only += int(tick_result.get("broker_ack_only", 0) or 0)
             broker_rejects += int(tick_result.get("broker_rejects", 0) or 0)
             duplicate_exit_blocked += int(tick_result.get("duplicate_exit_blocked", 0) or 0)
+            buy_notional_routed += float(tick_result.get("buy_notional_routed", 0.0) or 0.0)
+            sell_notional_routed += float(tick_result.get("sell_notional_routed", 0.0) or 0.0)
+            total_order_notional_routed += float(tick_result.get("total_order_notional_routed", 0.0) or 0.0)
+            ack_pending_reconcile_count = int(tick_result.get("ack_pending_reconcile_count", 0) or 0)
+            broker_ack_only_unresolved = int(tick_result.get("broker_ack_only_unresolved", 0) or 0)
 
             # 심볼 배열 (마지막 tick 기준 덮어쓰기)
             if tick_result.get("sold_today_symbols"):
@@ -969,9 +1053,7 @@ def run_trade_session(
                 e["recovered"] += int(api_stats.get("recovered", 0) or 0)
                 e["unrecovered"] += int(api_stats.get("unrecovered", 0) or 0)
 
-        # pending = ack - fills (fallback 계산)
-        if total_orders_ack > 0 and total_pending_orders == 0:
-            total_pending_orders = max(0, total_orders_ack - total_fills)
+        # pending_order_count is supplied by ACK/balance reconcile; do not derive it as ack - fills.
 
         prep_contract = prep_guard_result.get("contract") or {}
         prep_status_fallback = prep_contract.get("status") or prep_guard_result.get("status") or "UNKNOWN"
@@ -1003,13 +1085,10 @@ def run_trade_session(
         if prep_status_value == "UNKNOWN":
             prep_status_value = prep_status_fallback
 
+        _prov = _runtime_provenance(session=session, run_id=run_id, started_at_et=session_started_at_et, ended_at_et=now_et_iso(), wall_elapsed_sec=session_wall_elapsed_sec)
         report_payload = {
+            **_prov,
             "trade_date": trade_date,
-            "run_id": run_id,
-            "sha": os.getenv("GITHUB_SHA", ""),
-            "workflow": os.getenv("GITHUB_WORKFLOW", ""),
-            "session": session,
-            "event_name": os.getenv("GITHUB_EVENT_NAME", ""),
             "env": env,
             "dry_run": os.getenv("DRY_RUN", "0") == "1",
             "expected_to_trade": int(expected_to_trade),
@@ -1032,6 +1111,8 @@ def run_trade_session(
             "entry_degraded": int(final_tick.get("entry_degraded", 0) or 0),
             "entry_degraded_reason": final_tick.get("entry_degraded_reason", ""),
             "watchlist_fallback_used": int(final_tick.get("watchlist_fallback_used", 0) or 0),
+            "entry_watchlist_source": final_tick.get("entry_watchlist_source", ""),
+            "exit_routed_before_entry": int(final_tick.get("exit_routed_before_entry", 0) or 0),
             "exit_routed_after_entry_degraded": int(final_tick.get("exit_routed_after_entry_degraded", 0) or 0),
             # 하위 호환: entry_intents는 total 값으로 유지
             "entry_intents": total_buy_decisions,
@@ -1075,6 +1156,17 @@ def run_trade_session(
             "broker_ack_only": broker_ack_only,
             "broker_rejects": broker_rejects,
             "duplicate_exit_blocked": duplicate_exit_blocked,
+            "buy_notional_routed": round(buy_notional_routed, 4),
+            "sell_notional_routed": round(sell_notional_routed, 4),
+            "total_order_notional_routed": round(total_order_notional_routed, 4),
+            "buy_daily_notional_after_routing": round(buy_notional_routed, 4),
+            "sell_notional_does_not_consume_buy_budget": int(sell_notional_routed > 0),
+            "ack_reconcile_before_route_status": final_tick.get("ack_reconcile_before_route_status", ""),
+            "ack_reconcile_after_route_status": final_tick.get("ack_reconcile_after_route_status", ""),
+            "ack_reconcile_after_route_unresolved_count": final_tick.get("ack_reconcile_after_route_unresolved_count", 0),
+            "ack_pending_reconcile_count": ack_pending_reconcile_count,
+            "broker_ack_only_unresolved": broker_ack_only_unresolved,
+            "sell_decisions_detail": final_tick.get("sell_decisions_detail", []),
             "last_stage": last_stage,
             "trade_status": final_status,
             "status_detail": status_detail,
