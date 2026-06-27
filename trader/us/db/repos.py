@@ -1276,7 +1276,7 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
     
     try:
         with engine.begin() as conn:
-            timeout_ms = max(1000, min(int(timeout_sec * 1000), 120000))
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 5000))
             # Use set_config() with true for local scope
             _set_statement_timeout(conn, timeout_ms)
             logger.info(
@@ -1648,7 +1648,7 @@ def load_locked_us_watchlist(
     
     try:
         with engine.begin() as conn:
-            timeout_ms = max(1000, min(int(timeout_sec * 1000), 120000))
+            timeout_ms = max(1000, min(int(timeout_sec * 1000), 5000))
             # Use set_config() with true for local scope
             _set_statement_timeout(conn, timeout_ms)
             logger.info(

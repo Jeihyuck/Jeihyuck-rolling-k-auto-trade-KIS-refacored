@@ -17,10 +17,48 @@ import json
 import logging
 import os
 import sys
+import subprocess
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _git_value(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+
+
+def _report_provenance(session: str | None) -> dict:
+    branch = os.getenv("GITHUB_REF_NAME") or _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
+    workflow = os.getenv("GITHUB_WORKFLOW") or "local"
+    run_id = os.getenv("GITHUB_RUN_ID", "local")
+    now_utc = datetime.utcnow().isoformat() + "Z"
+    return {
+        "branch": branch or "unknown",
+        "commit_sha": sha or "unknown",
+        "sha": sha or "unknown",
+        "workflow": workflow,
+        "github_run_id": run_id,
+        "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", "0"),
+        "event_name": os.getenv("GITHUB_EVENT_NAME", "local"),
+        "actor": os.getenv("GITHUB_ACTOR", os.getenv("USER", "local")),
+        "session": session,
+        "run_id": run_id,
+        "session_id": f"{session or 'daily'}-{run_id}",
+        "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
+        "started_at_utc": os.getenv("US_STARTED_AT_UTC", now_utc),
+        "started_at_et": os.getenv("US_STARTED_AT_ET", ""),
+        "started_at_kst": os.getenv("US_STARTED_AT_KST", ""),
+        "ended_at_utc": now_utc,
+        "ended_at_et": os.getenv("US_ENDED_AT_ET", ""),
+        "ended_at_kst": os.getenv("US_ENDED_AT_KST", ""),
+        "wall_elapsed_sec": float(os.getenv("US_WALL_ELAPSED_SEC", "0") or 0),
+        "code_version_source": "github_actions" if os.getenv("GITHUB_RUN_ID") else "git_fallback",
+    }
 
 NY_TZ = ZoneInfo("America/New_York")
 
@@ -96,6 +134,7 @@ def run_daily_report(
     )
     
     report: dict = {
+        **_report_provenance(session),
         "trade_date": trade_date,
         "session": session,
         "env": env,
@@ -287,6 +326,10 @@ def run_daily_report(
         "| Field | Value |",
         "|---|---|",
         f"| trade_date | {trade_date} |",
+        f"| branch | {report.get('branch')} |",
+        f"| commit_sha | {report.get('commit_sha')} |",
+        f"| workflow | {report.get('workflow')} |",
+        f"| run_id | {report.get('run_id')} |",
         f"| session | {session or 'N/A'} |",
         f"| env | {env} |",
         f"| dry_run | {report['dry_run']} |",

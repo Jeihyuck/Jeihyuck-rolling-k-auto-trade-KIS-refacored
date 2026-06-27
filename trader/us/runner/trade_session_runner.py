@@ -23,6 +23,7 @@ import os
 import sys
 import time as time_mod
 import signal
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,6 +31,55 @@ logger = logging.getLogger(__name__)
 _received_signal: int | None = None
 _last_liveness_event = ""
 _exit_code: int | None = None
+
+
+def _git_value(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
+
+
+def _runtime_provenance(*, session: str, run_id: str, started_at_et: str = "", ended_at_et: str = "", wall_elapsed_sec: float = 0.0) -> dict:
+    from datetime import datetime, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        kst = ZoneInfo("Asia/Seoul")
+        now_utc_dt = datetime.now(timezone.utc)
+        ended_et_val = ended_at_et or now_utc_dt.astimezone(et).isoformat()
+        ended_kst_val = now_utc_dt.astimezone(kst).isoformat()
+        ended_utc_val = now_utc_dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        ended_et_val = ended_at_et
+        ended_kst_val = ""
+        ended_utc_val = datetime.utcnow().isoformat() + "Z"
+    branch = os.getenv("GITHUB_REF_NAME") or _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    sha = os.getenv("GITHUB_SHA") or _git_value(["rev-parse", "HEAD"])
+    workflow = os.getenv("GITHUB_WORKFLOW") or "local"
+    source = "github_actions" if os.getenv("GITHUB_ACTIONS") or os.getenv("GITHUB_RUN_ID") else "git_fallback"
+    return {
+        "branch": branch or "unknown",
+        "commit_sha": sha or "unknown",
+        "sha": sha or "unknown",
+        "workflow": workflow,
+        "github_run_id": os.getenv("GITHUB_RUN_ID", run_id or "local"),
+        "github_run_attempt": os.getenv("GITHUB_RUN_ATTEMPT", "0"),
+        "event_name": os.getenv("GITHUB_EVENT_NAME", "local"),
+        "actor": os.getenv("GITHUB_ACTOR", os.getenv("USER", "local")),
+        "session": session,
+        "run_id": run_id or os.getenv("GITHUB_RUN_ID", "local"),
+        "session_id": f"{session}-{run_id or os.getenv('GITHUB_RUN_ID', 'local')}",
+        "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
+        "started_at_utc": os.getenv("US_STARTED_AT_UTC", ""),
+        "started_at_et": started_at_et,
+        "started_at_kst": os.getenv("US_STARTED_AT_KST", ""),
+        "ended_at_utc": ended_utc_val,
+        "ended_at_et": ended_et_val,
+        "ended_at_kst": ended_kst_val,
+        "wall_elapsed_sec": round(float(wall_elapsed_sec or 0.0), 2),
+        "code_version_source": source,
+    }
 
 # 세션별 종료 시각 (ET)
 _SESSION_END_TIMES = {
@@ -136,7 +186,9 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
                 existing = {}
 
         now_utc = _dt.utcnow().isoformat() + "Z"
+        prov = _runtime_provenance(session=session, run_id=str(payload.get("run_id", "")), wall_elapsed_sec=float(payload.get("wall_elapsed_sec", 0) or 0))
         session_entry = {
+            **prov,
             "session": session,
             "trade_date": trade_date,
             "final_status": payload.get("final_status", "UNKNOWN"),
@@ -153,6 +205,7 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "recorded_at_utc": now_utc,
         }
 
+        existing.update({k: v for k, v in session_entry.items() if k in {"branch", "commit_sha", "sha", "workflow", "github_run_id", "github_run_attempt", "event_name", "actor", "run_id", "code_version_source"}})
         existing.setdefault("trade_date", trade_date)
         existing.setdefault("sessions", {})
         existing["sessions"][session] = session_entry
@@ -199,7 +252,8 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "",
     ]
     for k in (
-        "trade_date", "run_id", "sha", "workflow", "session", "event_name", "env",
+        "trade_date", "branch", "commit_sha", "run_id", "github_run_id", "github_run_attempt", "sha", "workflow", "session", "session_id", "event_name", "actor", "env",
+        "source_log_file", "started_at_utc", "started_at_et", "started_at_kst", "ended_at_utc", "ended_at_et", "ended_at_kst", "wall_elapsed_sec", "code_version_source",
         "dry_run", "kis_order_allowed", "prep_status", "prep_run_id", "score_nonzero_count",
         "locked_watchlist_count", "locked_watchlist_count_source",
         "entry_eval_status", "entry_error_type", "entry_error_message", "entry_intents",
@@ -208,7 +262,7 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
         "buy_decisions", "sell_decisions", "real_broker_buys", "real_broker_sells",
         "synthetic_reconcile_buys", "synthetic_reconcile_sells", "broker_ack_only",
-        "broker_rejects", "duplicate_exit_blocked",
+        "broker_rejects", "duplicate_exit_blocked", "sell_decisions_detail",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
     md_lines.extend([
@@ -595,11 +649,11 @@ def run_trade_session(
         hard_error_reasons = {
             # marker: reason=fills_contract_error
             "fills_contract_error",
-            "locked_watchlist_missing",
-            "prep_degraded_or_error",
-            "locked_watchlist_below_min",
-            "watchlist_load_timeout",
-            "entry_eval_error",
+            "prep_guard_block",
+            "balance_position_parse_error",
+            "FAILED_EXIT_INTENTS_NOT_ROUTED",
+            "FAILED_ALL_EXIT_ORDERS_REJECTED",
+            "FAILED_ALL_EXIT_ORDERS_BLOCKED",
         }
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -969,9 +1023,7 @@ def run_trade_session(
                 e["recovered"] += int(api_stats.get("recovered", 0) or 0)
                 e["unrecovered"] += int(api_stats.get("unrecovered", 0) or 0)
 
-        # pending = ack - fills (fallback 계산)
-        if total_orders_ack > 0 and total_pending_orders == 0:
-            total_pending_orders = max(0, total_orders_ack - total_fills)
+        # pending_order_count is supplied by ACK/balance reconcile; do not derive it as ack - fills.
 
         prep_contract = prep_guard_result.get("contract") or {}
         prep_status_fallback = prep_contract.get("status") or prep_guard_result.get("status") or "UNKNOWN"
@@ -1003,13 +1055,10 @@ def run_trade_session(
         if prep_status_value == "UNKNOWN":
             prep_status_value = prep_status_fallback
 
+        _prov = _runtime_provenance(session=session, run_id=run_id, started_at_et=session_started_at_et, ended_at_et=now_et_iso(), wall_elapsed_sec=session_wall_elapsed_sec)
         report_payload = {
+            **_prov,
             "trade_date": trade_date,
-            "run_id": run_id,
-            "sha": os.getenv("GITHUB_SHA", ""),
-            "workflow": os.getenv("GITHUB_WORKFLOW", ""),
-            "session": session,
-            "event_name": os.getenv("GITHUB_EVENT_NAME", ""),
             "env": env,
             "dry_run": os.getenv("DRY_RUN", "0") == "1",
             "expected_to_trade": int(expected_to_trade),
@@ -1075,6 +1124,7 @@ def run_trade_session(
             "broker_ack_only": broker_ack_only,
             "broker_rejects": broker_rejects,
             "duplicate_exit_blocked": duplicate_exit_blocked,
+            "sell_decisions_detail": final_tick.get("sell_decisions_detail", []),
             "last_stage": last_stage,
             "trade_status": final_status,
             "status_detail": status_detail,
