@@ -41,6 +41,19 @@ def test_latest_summary_referenced_artifact_success(monkeypatch, tmp_path):
     assert result[0]["score"] == result[0]["score_final"]
 
 
+def test_latest_summary_contract_final30_path_success(monkeypatch, tmp_path):
+    from trader.us.runner.trade_tick_runner import load_watchlist_from_artifact
+    monkeypatch.chdir(tmp_path)
+    base = Path("reports/us_prep")
+    ref = base / "contract_final30.json"
+    base.mkdir(parents=True)
+    ref.write_text(json.dumps({"trade_date": "2026-06-26", "payload": {"watchlist": _rows(score_key="final_score")}}))
+    (base / "latest_us_prep_summary.json").write_text(json.dumps({"trade_date": "2026-06-26", "contract": {"final30_path": str(ref)}}))
+    result = load_watchlist_from_artifact("2026-06-26")
+    assert result[0]["entry_watchlist_source"] == "latest_summary_referenced_artifact"
+    assert result[0]["score"] == result[0]["score_final"]
+
+
 def test_latest_final30_scored_success(monkeypatch, tmp_path):
     from trader.us.runner.trade_tick_runner import load_watchlist_from_artifact
     monkeypatch.chdir(tmp_path)

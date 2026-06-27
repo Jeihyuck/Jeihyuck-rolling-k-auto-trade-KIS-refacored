@@ -47,8 +47,34 @@ def test_schedule_health_writes_provenance(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_SHA", "abc123")
     monkeypatch.setenv("GITHUB_WORKFLOW", "wf")
     monkeypatch.setenv("GITHUB_RUN_ID", "42")
-    trade_session_runner._write_us_schedule_health({"trade_date": "2026-06-26", "final_status": "OK_WITH_WARNINGS", "run_id": "42"}, "am")
+    trade_session_runner._write_us_schedule_health({
+        "trade_date": "2026-06-26",
+        "final_status": "OK_WITH_WARNINGS",
+        "run_id": "42",
+        "entry_degraded": 1,
+        "entry_degraded_reason": "watchlist_load_timeout",
+        "entry_watchlist_source": "none",
+        "watchlist_fallback_used": 0,
+        "exit_routed_before_entry": 1,
+        "buy_notional_routed": 0,
+        "sell_notional_routed": 2000,
+        "total_order_notional_routed": 2000,
+        "ack_reconcile_before_route_status": "OK",
+        "ack_reconcile_after_route_status": "OK",
+        "ack_reconcile_after_route_unresolved_count": 0,
+        "ack_pending_reconcile_count": 0,
+        "pending_order_count": 0,
+    }, "am")
     payload = json.loads((tmp_path / "reports/us_schedule_health/2026-06-26.json").read_text())
     for key in ["branch", "commit_sha", "workflow", "github_run_id", "run_id", "code_version_source"]:
         assert payload.get(key)
         assert payload["sessions"]["am"].get(key)
+    session = payload["sessions"]["am"]
+    for key in [
+        "entry_degraded", "entry_degraded_reason", "entry_watchlist_source", "watchlist_fallback_used",
+        "exit_routed_before_entry", "buy_notional_routed", "sell_notional_routed",
+        "total_order_notional_routed", "ack_reconcile_before_route_status",
+        "ack_reconcile_after_route_status", "ack_reconcile_after_route_unresolved_count",
+        "ack_pending_reconcile_count", "pending_order_count",
+    ]:
+        assert key in session
