@@ -204,6 +204,20 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "unique_fills_count": int(payload.get("unique_fills_count", 0) or 0),
             "orders_ack": int(payload.get("orders_ack", 0) or 0),
             "orders_rejected": int(payload.get("orders_rejected", 0) or 0),
+            "entry_degraded": payload.get("entry_degraded", 0),
+            "entry_degraded_reason": payload.get("entry_degraded_reason", ""),
+            "entry_eval_status": payload.get("entry_eval_status", ""),
+            "entry_watchlist_source": payload.get("entry_watchlist_source", ""),
+            "watchlist_fallback_used": payload.get("watchlist_fallback_used", 0),
+            "exit_routed_before_entry": payload.get("exit_routed_before_entry", 0),
+            "buy_notional_routed": payload.get("buy_notional_routed", 0),
+            "sell_notional_routed": payload.get("sell_notional_routed", 0),
+            "total_order_notional_routed": payload.get("total_order_notional_routed", 0),
+            "ack_reconcile_before_route_status": payload.get("ack_reconcile_before_route_status", ""),
+            "ack_reconcile_after_route_status": payload.get("ack_reconcile_after_route_status", ""),
+            "ack_reconcile_after_route_unresolved_count": payload.get("ack_reconcile_after_route_unresolved_count", 0),
+            "ack_pending_reconcile_count": payload.get("ack_pending_reconcile_count", 0),
+            "pending_order_count": payload.get("pending_order_count", 0),
             "run_id": payload.get("run_id") or prov.get("run_id", ""),
             "workflow": payload.get("workflow") or prov.get("workflow", ""),
             "wall_elapsed_sec": float(payload.get("wall_elapsed_sec", 0) or 0),
@@ -268,7 +282,10 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "delay_seconds", "run_window", "recovery_run", "missed_trade_window",
         "buy_decisions", "sell_decisions", "real_broker_buys", "real_broker_sells",
         "synthetic_reconcile_buys", "synthetic_reconcile_sells", "broker_ack_only",
-        "broker_rejects", "duplicate_exit_blocked", "buy_notional_routed", "sell_notional_routed", "total_order_notional_routed", "sell_decisions_detail",
+        "broker_rejects", "duplicate_exit_blocked", "buy_notional_routed", "sell_notional_routed", "total_order_notional_routed",
+        "buy_daily_notional_after_routing", "sell_notional_does_not_consume_buy_budget",
+        "ack_reconcile_before_route_status", "ack_reconcile_after_route_status", "ack_reconcile_after_route_unresolved_count",
+        "ack_pending_reconcile_count", "broker_ack_only_unresolved", "sell_decisions_detail",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
     md_lines.extend([
@@ -946,6 +963,7 @@ def run_trade_session(
         synthetic_reconcile_buys = synthetic_reconcile_sells = 0
         broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
         buy_notional_routed = sell_notional_routed = total_order_notional_routed = 0.0
+        ack_pending_reconcile_count = broker_ack_only_unresolved = 0
         all_sold_today_symbols: list[str] = []
         all_pending_order_symbols: list[str] = []
         all_open_position_symbols: list[str] = []
@@ -988,6 +1006,8 @@ def run_trade_session(
             buy_notional_routed += float(tick_result.get("buy_notional_routed", 0.0) or 0.0)
             sell_notional_routed += float(tick_result.get("sell_notional_routed", 0.0) or 0.0)
             total_order_notional_routed += float(tick_result.get("total_order_notional_routed", 0.0) or 0.0)
+            ack_pending_reconcile_count = int(tick_result.get("ack_pending_reconcile_count", 0) or 0)
+            broker_ack_only_unresolved = int(tick_result.get("broker_ack_only_unresolved", 0) or 0)
 
             # 심볼 배열 (마지막 tick 기준 덮어쓰기)
             if tick_result.get("sold_today_symbols"):
@@ -1091,6 +1111,8 @@ def run_trade_session(
             "entry_degraded": int(final_tick.get("entry_degraded", 0) or 0),
             "entry_degraded_reason": final_tick.get("entry_degraded_reason", ""),
             "watchlist_fallback_used": int(final_tick.get("watchlist_fallback_used", 0) or 0),
+            "entry_watchlist_source": final_tick.get("entry_watchlist_source", ""),
+            "exit_routed_before_entry": int(final_tick.get("exit_routed_before_entry", 0) or 0),
             "exit_routed_after_entry_degraded": int(final_tick.get("exit_routed_after_entry_degraded", 0) or 0),
             # 하위 호환: entry_intents는 total 값으로 유지
             "entry_intents": total_buy_decisions,
@@ -1137,6 +1159,13 @@ def run_trade_session(
             "buy_notional_routed": round(buy_notional_routed, 4),
             "sell_notional_routed": round(sell_notional_routed, 4),
             "total_order_notional_routed": round(total_order_notional_routed, 4),
+            "buy_daily_notional_after_routing": round(buy_notional_routed, 4),
+            "sell_notional_does_not_consume_buy_budget": int(sell_notional_routed > 0),
+            "ack_reconcile_before_route_status": final_tick.get("ack_reconcile_before_route_status", ""),
+            "ack_reconcile_after_route_status": final_tick.get("ack_reconcile_after_route_status", ""),
+            "ack_reconcile_after_route_unresolved_count": final_tick.get("ack_reconcile_after_route_unresolved_count", 0),
+            "ack_pending_reconcile_count": ack_pending_reconcile_count,
+            "broker_ack_only_unresolved": broker_ack_only_unresolved,
             "sell_decisions_detail": final_tick.get("sell_decisions_detail", []),
             "last_stage": last_stage,
             "trade_status": final_status,

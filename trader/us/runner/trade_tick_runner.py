@@ -49,78 +49,166 @@ def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
 
 
 def _extract_watchlist_rows_from_payload(payload: Any) -> list[dict]:
+    """Extract final30/watchlist rows from common artifact payload shapes."""
     if isinstance(payload, list):
         return [r for r in payload if isinstance(r, dict)]
-    if isinstance(payload, dict):
-        for key in ("rows", "watchlist", "final30", "final30_scored", "data", "items"):
-            value = payload.get(key)
+    if not isinstance(payload, dict):
+        return []
+    for key in ("final30_scored", "watchlist", "rows", "data", "items", "final30"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [r for r in value if isinstance(r, dict)]
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        for key in ("final30_scored", "watchlist", "rows", "data", "items", "final30"):
+            value = nested.get(key)
             if isinstance(value, list):
                 return [r for r in value if isinstance(r, dict)]
     return []
 
 
+def _payload_trade_date(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for container in (payload, payload.get("payload"), payload.get("contract")):
+        if isinstance(container, dict):
+            td = container.get("trade_date") or container.get("date")
+            if td:
+                return str(td)
+    return ""
+
+
+def _nested_value(payload: dict, dotted_key: str) -> Any:
+    cur: Any = payload
+    for part in dotted_key.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _candidate_paths_from_latest_summary(payload: dict, summary_path: Path, trade_date: str) -> list[tuple[Path, str, bool]]:
+    """Return (path, source, requires_trade_date_match) candidates referenced by latest summary."""
+    keys = (
+        "final30_scored_path", "final30_path", "watchlist_path", "artifact_path", "output_path",
+        "latest_final30_scored_path", "payload.final30_scored_path", "payload.final30_path",
+        "payload.artifact_path", "contract.final30_scored_path", "contract.final30_path",
+    )
+    candidates: list[tuple[Path, str, bool]] = []
+    for key in keys:
+        value = _nested_value(payload, key)
+        if not value:
+            continue
+        path = Path(str(value))
+        if not path.is_absolute():
+            path = (summary_path.parent / path) if str(value).startswith(".") else Path(str(value))
+        candidates.append((path, "latest_summary_referenced_artifact", True))
+    candidates.extend([
+        (Path("reports/us_prep/latest_final30_scored.json"), "latest_final30_scored", True),
+        (Path("reports/us_prep") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+        (Path("runtime/us/prep") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+        (Path("runtime/us/watchlist") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+        (Path("signals/us") / trade_date / "final30_scored.json", "dated_final30_scored", False),
+    ])
+    return candidates
+
+
+def _normalize_watchlist_rows(raw_rows: list[dict], source: str) -> list[dict]:
+    normalized: list[dict] = []
+    for row in raw_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        score_value = row.get("score", row.get("score_final", row.get("final_score", row.get("rank_score", 0))))
+        try:
+            score = float(score_value or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        clean = dict(row)
+        clean["symbol"] = symbol
+        clean.setdefault("score_final", score)
+        clean["score"] = score
+        clean["exchange"] = str(clean.get("exchange") or "NASDAQ").upper().strip()
+        clean["strategy"] = str(clean.get("strategy") or "us_pb1")
+        clean["entry_watchlist_source"] = source
+        normalized.append(clean)
+    return normalized
+
+
+def _select_watchlist_rows_from_payload(payload: Any, *, path: Path, trade_date: str, source: str, require_trade_date_match: bool) -> list[dict]:
+    if require_trade_date_match:
+        payload_trade_date = _payload_trade_date(payload)
+        if payload_trade_date and payload_trade_date != trade_date:
+            raise ValueError(f"artifact_trade_date_mismatch payload={payload_trade_date} current={trade_date} path={path}")
+    raw_rows = _extract_watchlist_rows_from_payload(payload)
+    if not raw_rows:
+        raise ValueError(f"artifact_missing_final30_rows path={path}")
+    normalized = _normalize_watchlist_rows(raw_rows, source)
+    deduped = _dedupe_watchlist_best_by_symbol(normalized)
+    nonzero = sum(1 for r in deduped if float(r.get("score") or 0.0) != 0.0)
+    if len(deduped) < 10:
+        raise ValueError(f"artifact_unique_symbols_lt_10 count={len(deduped)} path={path}")
+    if nonzero <= 0:
+        raise ValueError(f"artifact_all_scores_zero path={path}")
+    selected = deduped[:30]
+    logger.info(
+        "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][OK] path=%s source=%s rows=%d unique=%d selected=%d nonzero=%d preferred_30=%d",
+        path, source, len(raw_rows), len(deduped), len(selected), nonzero, int(len(selected) == 30),
+    )
+    return selected
+
+
 def load_watchlist_from_artifact(trade_date: str) -> list[dict]:
-    """Load US locked-watchlist fallback from final30_scored/latest prep artifacts only."""
-    candidate_paths = [
-        Path("runtime/us/watchlist") / trade_date / "final30_scored.json",
-        Path("runtime/us/prep") / trade_date / "final30_scored.json",
-        Path("signals/us") / trade_date / "final30_scored.json",
-        Path("reports/us_prep") / trade_date / "final30_scored.json",
-        Path("reports/us_prep/latest_us_prep_summary.json"),
+    """Load US locked-watchlist fallback from final30/latest prep artifacts."""
+    candidate_paths: list[tuple[Path, str, bool]] = [
+        (Path("runtime/us/watchlist") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("runtime/us/prep") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("signals/us") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("reports/us_prep") / trade_date / "final30_scored.json", "artifact_final30_scored", False),
+        (Path("reports/us_prep/latest_us_prep_summary.json"), "latest_summary_embedded_rows", True),
+        (Path("reports/us_prep/latest_final30_scored.json"), "latest_final30_scored", True),
     ]
     errors: list[str] = []
-    for path in candidate_paths:
+    seen: set[str] = set()
+    idx = 0
+    while idx < len(candidate_paths):
+        path, source, require_td = candidate_paths[idx]
+        idx += 1
+        key = str(path.resolve() if path.exists() else path)
+        if key in seen:
+            continue
+        seen.add(key)
         if not path.exists():
             errors.append(f"{path}:missing")
             continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if path.name == "latest_us_prep_summary.json":
-                payload_trade_date = str(payload.get("trade_date") or (payload.get("payload") or {}).get("trade_date") or "")
-                if payload_trade_date != trade_date:
-                    raise ValueError(f"latest_prep_summary_trade_date_mismatch payload={payload_trade_date} current={trade_date}")
-                nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
-                if not (isinstance(nested, dict) and (nested.get("final30_scored") or nested.get("watchlist"))):
-                    raise ValueError("latest_prep_summary_missing_final30_scored")
-                raw_rows = _extract_watchlist_rows_from_payload(nested)
-            else:
-                raw_rows = _extract_watchlist_rows_from_payload(payload)
-            normalized: list[dict] = []
-            for row in raw_rows:
-                symbol = str(row.get("symbol") or "").upper().strip()
-                if not symbol:
-                    continue
-                score_value = row.get("score", row.get("score_final", row.get("final_score", row.get("rank_score", 0))))
+                summary_td = _payload_trade_date(payload)
+                if summary_td and summary_td != trade_date:
+                    raise ValueError(f"latest_prep_summary_trade_date_mismatch payload={summary_td} current={trade_date}")
                 try:
-                    score = float(score_value or 0.0)
-                except (TypeError, ValueError):
-                    score = 0.0
-                clean = dict(row)
-                clean["symbol"] = symbol
-                clean.setdefault("score_final", score)
-                clean["score"] = score
-                clean["exchange"] = str(clean.get("exchange") or "NASDAQ").upper().strip()
-                clean["strategy"] = str(clean.get("strategy") or "us_pb1")
-                normalized.append(clean)
-            deduped = _dedupe_watchlist_best_by_symbol(normalized)
-            nonzero = sum(1 for r in deduped if float(r.get("score") or 0.0) != 0.0)
-            if len(deduped) < 10:
-                raise ValueError(f"artifact_unique_symbols_lt_10 count={len(deduped)} path={path}")
-            if nonzero <= 0:
-                raise ValueError(f"artifact_all_scores_zero path={path}")
-            selected = deduped[:30]
-            logger.info(
-                "[US_ENTRY][WATCHLIST][FALLBACK_ARTIFACT][OK] path=%s rows=%d unique=%d selected=%d nonzero=%d preferred_30=%d",
-                path, len(raw_rows), len(deduped), len(selected), nonzero, int(len(selected) == 30),
+                    return _select_watchlist_rows_from_payload(
+                        payload,
+                        path=path,
+                        trade_date=trade_date,
+                        source="latest_summary_embedded_rows",
+                        require_trade_date_match=bool(summary_td),
+                    )
+                except Exception as embedded_exc:
+                    errors.append(f"{path}:embedded:{type(embedded_exc).__name__}:{embedded_exc}")
+                    candidate_paths[idx:idx] = _candidate_paths_from_latest_summary(payload, path, trade_date)
+                    continue
+            return _select_watchlist_rows_from_payload(
+                payload,
+                path=path,
+                trade_date=trade_date,
+                source=source,
+                require_trade_date_match=require_td,
             )
-            source = "latest_prep_summary" if path.name == "latest_us_prep_summary.json" else "artifact_final30_scored"
-            for row in selected:
-                row["entry_watchlist_source"] = source
-            return selected
         except Exception as exc:
             errors.append(f"{path}:{type(exc).__name__}:{exc}")
     raise FileNotFoundError("; ".join(errors))
-
 
 def _entry_cutoff_passed(now: datetime) -> bool:
     """15:45 ET 이후이면 True."""
@@ -1409,6 +1497,9 @@ def run_trade_tick(
     ]
     buy_notional_routed = buy_daily_notional
     total_order_notional_routed = buy_notional_routed + sell_notional_routed
+    after_symbols_by_status = ack_recon_after_route.get("symbols_by_status", {}) if isinstance(ack_recon_after_route, dict) else {}
+    ack_pending_reconcile_count = len(after_symbols_by_status.get("ack_pending_reconcile", [])) if isinstance(after_symbols_by_status, dict) else 0
+    broker_ack_only_unresolved = int(ack_recon_after_route.get("unresolved_count", 0) or 0)
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
@@ -1522,6 +1613,10 @@ def run_trade_tick(
         "sell_notional_routed": round(sell_notional_routed, 4),
         "exit_notional_routed": round(sell_notional_routed, 4),
         "total_order_notional_routed": round(total_order_notional_routed, 4),
+        "buy_daily_notional_after_routing": round(buy_daily_notional, 4),
+        "sell_notional_does_not_consume_buy_budget": int(sell_notional_routed > 0 and buy_daily_notional == buy_notional_routed),
+        "broker_ack_only_unresolved": broker_ack_only_unresolved,
+        "ack_pending_reconcile_count": ack_pending_reconcile_count,
         "open_position_count": len(current_positions) if 'current_positions' in locals() else 0,
         "open_position_symbols": [p.get("symbol", "") for p in (current_positions if 'current_positions' in locals() else [])],
         "positions": len(current_positions) if 'current_positions' in locals() else 0,
