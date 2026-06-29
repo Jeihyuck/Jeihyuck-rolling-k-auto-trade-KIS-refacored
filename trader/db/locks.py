@@ -175,12 +175,17 @@ def release_advisory_lock(conn, key: int = LOCK_KEY) -> None:
         try:
             engine = getattr(conn, "engine", None)
             if engine is not None:
-                engine.dispose()
-                with engine.connect() as fresh_conn:
+                with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as fresh_conn:
                     _unlock(fresh_conn)
-            else:
-                _unlock(conn)
         except Exception as exc2:
-            logger.warning("[LOCK][RELEASE] best-effort release failed (ignoring): %s", exc2)
+            logger.warning(
+                "[DB][LOCK][RELEASE_WARN] err_type=%s err=%s non_fatal=1",
+                type(exc2).__name__,
+                exc2,
+            )
     except Exception as exc:
-        logger.warning("[LOCK][RELEASE] unexpected error during release (ignoring): %s", exc)
+        logger.warning(
+            "[DB][LOCK][RELEASE_WARN] err_type=%s err=%s non_fatal=1",
+            type(exc).__name__,
+            exc,
+        )

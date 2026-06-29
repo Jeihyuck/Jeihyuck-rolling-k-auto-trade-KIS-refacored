@@ -5194,6 +5194,23 @@ class PB1Engine:
             logger.info("[ENGINE][BALANCE_CACHE] hit=True source=%s", source)
             self._balance_snapshot_source = "tick_cache"
             return self._balance_snapshot
+        fail_soft = (
+            os.getenv("PB1_BALANCE_FAIL_SOFT", "0") == "1"
+            or str(getattr(self, "entry_block_reason", "") or "").lower() in {"balance_unknown", "balance_stale"}
+        )
+        if fail_soft:
+            logger.warning(
+                "[BALANCE][FAIL_SOFT][ENGINE_NO_REQUERY] reason=%s action=return_empty_snapshot",
+                getattr(self, "entry_block_reason", None),
+            )
+            self._balance_snapshot = {
+                "output1": [],
+                "output2": [{"dnca_tot_amt": "0", "ord_psbl_cash": "0"}],
+                "_source": "engine_fail_soft_empty",
+                "_fail_soft": True,
+            }
+            self._balance_snapshot_source = "engine_fail_soft_empty"
+            return self._balance_snapshot
         if not self.kis:
             return {}
         snap, source = self.kis.get_balance_cached(return_source=True)
@@ -11300,6 +11317,10 @@ class PB1Engine:
             "submit_attempt_count": submit_attempt_count,
             "accepted_sell_count": accepted_sell_count,
             "fill_confirmed_sell_count": fill_confirmed_sell_count,
+            "accepted_sells": accepted_sell_count,
+            "fill_confirmed_sells": fill_confirmed_sell_count,
+            "sell_orders_ack": accepted_sell_count,
+            "sell_orders_filled": fill_confirmed_sell_count,
             "no_exit_count": no_exit_count,
             "blocked_count": blocked_count,
             "submitted": submitted_count,
@@ -13368,13 +13389,19 @@ class PB1Engine:
         self._balance_cost = self._extract_holdings_cost(holdings_rows, holdings_summary)
         total_cash_krw = int(available_cash_krw)
         order_possible_cash_krw = int(available_cash_krw)
-        if self.kis and entry_phase:
+        if self.kis and entry_phase and self.order_allowed:
             try:
                 cash_summary = self.kis.get_cash_summary()
                 total_cash_krw = int(cash_summary.get("total_cash_krw") or 0)
                 order_possible_cash_krw = int(cash_summary.get("order_possible_cash_krw") or 0)
             except Exception as exc:
                 logger.warning("[PB1][CASH][SUMMARY_FAIL] err=%s", exc)
+        else:
+            logger.info(
+                "[PB1][CASH][SUMMARY_SKIP] reason=order_blocked_or_no_entry order_allowed=%s entry_phase=%s",
+                int(bool(self.order_allowed)),
+                int(bool(entry_phase)),
+            )
         if order_possible_cash_krw > 0:
             available_cash_krw = order_possible_cash_krw
         self.order_possible_cash_krw = float(order_possible_cash_krw)
@@ -13848,34 +13875,28 @@ class PB1Engine:
                 for m in universe_members
                 if m.get("code")
             }
-            source_meta = (self._universe_context.meta or {}) if self._universe_context else {}
-            source_name = str(source_meta.get("source") or "final30")
-            scored_rows = list(self._universe_context.members or []) if self._universe_context else []
-            has_rank_final30 = int(any("rank_final30" in (row or {}) for row in scored_rows))
-            canonical_codes = list(final30_codes)
-            if scored_rows:
-                if has_rank_final30:
-                    scored_rows = sorted(
-                        scored_rows,
-                        key=lambda x: (float((x or {}).get("rank_final30") or 999999), str((x or {}).get("code") or "")),
-                    )
-                elif any("score_final" in (row or {}) for row in scored_rows):
-                    scored_rows = sorted(
-                        scored_rows,
-                        key=lambda x: (-float((x or {}).get("score_final") or 0.0), str((x or {}).get("code") or "")),
-                    )
-                else:
-                    scored_rows = sorted(scored_rows, key=lambda x: str((x or {}).get("code") or ""))
-                canonical_codes = [str((row or {}).get("code") or "").zfill(6) for row in scored_rows if (row or {}).get("code")]
-            canonical_order_match = int(list(final30_codes) == list(canonical_codes))
+            universe_rows = list(self._universe_context.members or []) if self._universe_context else []
+            has_rank_final30 = int(any("rank_final30" in (row or {}) for row in universe_rows))
+            final30_codes = [str(c).zfill(6) for c in final30_codes if str(c).strip()]
+            if len(final30_codes) != 30 or len(set(final30_codes)) != 30:
+                logger.error(
+                    "[ENTRY][FINAL30][CONTRACT_FAIL] rows=%s uniq=%s codes=%s",
+                    len(final30_codes),
+                    len(set(final30_codes)),
+                    final30_codes,
+                )
+                raise RuntimeError("FINAL30_CONTRACT_INVALID")
+            canonical_order_match = 1
+            scan_members = [{"code": c, "market": code_market.get(c, "")} for c in final30_codes]
+            scan_source = "final30"
             logger.info(
-                "[ENTRY][SCAN_INPUT][ORDER] source=%s has_rank_final30=%s canonical_order_match=%s",
-                source_name,
+                "[ENTRY][SCAN_INPUT][ORDER] source=final30 has_rank_final30=%s canonical_order_match=%s final30_rows=%s universe_rows=%s scan_rows=%s",
                 has_rank_final30,
                 canonical_order_match,
+                len(final30_codes),
+                len(universe_rows),
+                len(scan_members),
             )
-            scan_members = [{"code": c, "market": code_market.get(c, "")} for c in canonical_codes]
-            scan_source = "final30"
             if len(final30_codes) > 0 and len(scan_members) != len(final30_codes):
                 logger.error(
                     "[PB1][INVARIANT][VIOLATION] final30_rows=%s engine_input_rows=%s",

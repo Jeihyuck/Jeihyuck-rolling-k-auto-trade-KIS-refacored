@@ -167,9 +167,9 @@ warn_external_flock "kr-close" "run-kr-close.sh" "/tmp/nullim-kr-close.lock"
 cat <<'CRON_NOTE'
 [KR_SCHEDULE][CANONICAL] KR crontab should not wrap KR run scripts with /usr/bin/flock because each script owns its internal lock.
 [KR_SCHEDULE][CANONICAL] KR prep recommended example with script-internal timeout/lock:
-50 6 * * 1-5 cd $APP && $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
+30 6 * * 1-5 cd $APP && $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
 [KR_SCHEDULE][CANONICAL] Optional crontab-level timeout example if operations explicitly wants an outer timeout too:
-50 6 * * 1-5 cd $APP && timeout --kill-after=60s 7200 $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
+30 6 * * 1-5 cd $APP && timeout --kill-after=60s 7200 $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
 CRON_NOTE
 
 section "actual scheduler references to KR WSL run scripts"

@@ -61,15 +61,15 @@ LATEST_LINK="runtime/logs/kr/wsl-kr-prep.latest.log"
 ln -sfn "${TODAY_KST}/wsl-kr-prep.log" "$LATEST_LINK"
 {
 NOW_HM="${NOW_HM:-$(TZ=Asia/Seoul date +%H:%M)}"
-if [[ "$NOW_HM" < "05:00" || "$NOW_HM" > "08:50" ]]; then
-  echo "[KR_PREP][SCHEDULE_GUARD] now=$NOW_HM allowed=0 reason=OUTSIDE_PREP_WINDOW"
+if [[ "$NOW_HM" < "06:30" || "$NOW_HM" > "08:50" ]]; then
+  echo "[KR_PREP][SCHEDULE_GUARD][SHELL] now=$NOW_HM allowed=0 reason=OUTSIDE_PREP_WINDOW window=06:30-08:50"
   if [[ "${ALLOW_KR_PREP_OUTSIDE_WINDOW:-0}" != "1" ]]; then
-    echo "[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW"
+    echo "[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW action=shell_block_no_python"
     exit 2
   fi
-  echo "[KR_PREP][SCHEDULE_GUARD] now=$NOW_HM allowed=1 reason=OUTSIDE_PREP_WINDOW_ALLOWED"
+  echo "[KR_PREP][SCHEDULE_GUARD][SHELL] now=$NOW_HM allowed=1 reason=OUTSIDE_PREP_WINDOW_ALLOWED window=06:30-08:50"
 else
-  echo "[KR_PREP][SCHEDULE_GUARD] now=$NOW_HM allowed=1 reason=PREP_WINDOW_OK"
+  echo "[KR_PREP][SCHEDULE_GUARD][SHELL] now=$NOW_HM allowed=1 reason=PREP_WINDOW_OK window=06:30-08:50"
 fi
 
   echo "[KR_PREP][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"

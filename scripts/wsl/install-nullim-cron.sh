@@ -18,8 +18,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # KR market schedule
 # =========================
 
-# KR prep: 06:50 KST
-50 6 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-kr-prep.lock env LOCK_DELEGATED=1 $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
+# KR prep: 06:30 KST
+30 6 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-kr-prep.lock env LOCK_DELEGATED=1 $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-prep.sh >> $APP/runtime/cron/kr-prep.log 2>&1
 
 # KR AM: 09:00 KST
 0 9 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-kr-am.lock env LOCK_DELEGATED=1 $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-kr-am.sh >> $APP/runtime/cron/kr-am.log 2>&1

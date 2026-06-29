@@ -19,9 +19,10 @@ class KISMarketcapTopProvider:
     DEFAULT_PARAMS = {
         # 조건 스크린 코드/정렬 기준은 KIS 포털의 "국내주식 시가총액 상위" 기본값을 사용한다.
         # 필요 시 환경 변수 혹은 코드 한 곳만 수정하면 되도록 상수로 모아둔다.
-        "fid_rank_sort_cls_code": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
-        "fid_cond_scr_div_code": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
-        "fid_input_iscd": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
+        "FID_RANK_SORT_CLS_CODE": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
+        "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
+        "FID_INPUT_ISCD": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
+        "FID_PRC_CLS_CODE": os.getenv("KIS_MKTCAP_PRC_CLS_CODE", "0"),
     }
     MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
 
@@ -44,6 +45,13 @@ class KISMarketcapTopProvider:
 
     def _market_code(self, market: str) -> str:
         return self.MARKET_CODE_MAP.get(market.upper(), "J")
+
+    def _build_params(self, market: str, n: int) -> dict:
+        return {
+            **self.params,
+            "FID_COND_MRKT_DIV_CODE": self._market_code(market),
+            "FID_INPUT_CNT_1": str(n),
+        }
 
     def validate_params(self, market: str, n: int) -> None:
         if market.upper() not in self.MARKET_CODE_MAP:
@@ -120,13 +128,7 @@ class KISMarketcapTopProvider:
             return []
 
         tr_id = self._pick_tr_id()
-        market_code = self._market_code(market)
-        # [FIX] FID_INPUT_CNT_1 필수 파라미터 추가 (시가총액 상위 조회 개수)
-        params = {
-            **self.params,
-            "fid_cond_mrkt_div_code": market_code,
-            "fid_input_cnt_1": str(n),
-        }
+        params = self._build_params(market, n)
 
         try:
             headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
@@ -158,8 +160,7 @@ class KISMarketcapTopProvider:
         """
         self.validate_params(market, n)
         tr_id = self._pick_tr_id()
-        market_code = self._market_code(market)
-        params = {**self.params, "fid_cond_mrkt_div_code": market_code, "fid_input_cnt_1": str(n)}
+        params = self._build_params(market, n)
 
         headers = self.kis._headers(tr_id)  # type: ignore[attr-defined]
         url = f"{API_BASE_URL}{self.endpoint}"

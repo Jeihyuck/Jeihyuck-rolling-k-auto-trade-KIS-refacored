@@ -82,11 +82,14 @@ def wait_until_kr_am_target(
     logger.info("[KR_AM][WAIT_DONE] reached=1 now=%s target=%s", now_fn().astimezone(KST), target_dt)
 
 
+KR_PREP_START_TIME = time(6, 30)
+KR_PREP_END_TIME = time(8, 50)
+
 def kr_prep_schedule_guard(now: datetime | None = None, *, allow_outside: bool | None = None) -> SessionDecision:
     now = (now or now_kst()).astimezone(KST)
     allow_outside = os.getenv("ALLOW_KR_PREP_OUTSIDE_WINDOW", "0") == "1" if allow_outside is None else allow_outside
-    start = time(6, 30)
-    end = time(8, 50)
+    start = KR_PREP_START_TIME
+    end = KR_PREP_END_TIME
     allowed = start <= now.time() <= end
     if allowed or allow_outside:
         return SessionDecision("PROCEED", "PREP_WINDOW_OK" if allowed else "OUTSIDE_PREP_WINDOW_ALLOWED", 0, 0)
