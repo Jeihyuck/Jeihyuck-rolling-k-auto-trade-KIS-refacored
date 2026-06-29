@@ -6016,8 +6016,43 @@ def run_once(
             window_name_for_engine,
         )
 
+        if balance_state == BALANCE_STATE_UNKNOWN and entry_block_reason == "balance_unknown":
+            balance_snapshot_raw = {
+                "output1": [],
+                "output2": [{
+                    "dnca_tot_amt": "0",
+                    "ord_psbl_cash": "0",
+                    "scts_evlu_amt": "0",
+                    "tot_evlu_amt": "0",
+                }],
+                "_source": "balance_fail_soft_empty",
+                "_fail_soft": True,
+                "_balance_state": str(balance_state),
+            }
+            balance_source = "balance_fail_soft_empty"
+            os.environ["PB1_BALANCE_FAIL_SOFT"] = "1"
+            logger.warning(
+                "[BALANCE][FAIL_SOFT][SNAPSHOT_INJECT] state=%s source=%s entry_allowed=0 exit_allowed=1",
+                balance_state,
+                balance_source,
+            )
+
         if not precomputed_final30_df.empty:
             _assert_engine_boot_locked_final30(run_ctx=run_ctx, final30_df=precomputed_final30_df)
+            run_ctx["entry_input_locked_to_final30"] = True
+            run_ctx["entry_input_expected_rows"] = 30
+            run_ctx["entry_input_expected_codes"] = [
+                str(code).zfill(6)
+                for code in precomputed_final30_df.get("code", pd.Series(dtype=str)).tolist()
+                if str(code).strip()
+            ]
+            logger.info(
+                "[ENTRY_INPUT_LOCK][FINAL30] locked=%s rows=%s universe_ctx_rows=%s source=%s",
+                int(bool(run_ctx.get("entry_input_locked_to_final30"))),
+                len(precomputed_final30_df),
+                len(getattr(universe_ctx, "members", []) or []),
+                run_ctx.get("final30_source"),
+            )
         engine_runner = PB1Engine(
             universe_repo=universe_repo,
             orders_repo=orders_repo,
@@ -6236,9 +6271,30 @@ def run_once(
             result = engine_runner.run_close_cancel()
         else:
             engine_started = True
-            result = engine_runner.run()
-            engine_completed = True
-            orders_accepted_count = int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))
+            try:
+                result = engine_runner.run()
+                engine_completed = True
+                orders_accepted_count = int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))
+            except Exception as exc:
+                exit_summary = getattr(engine_runner, "_exit_summary_payload", {}) or {}
+                sell_ack = int(exit_summary.get("sell_orders_ack") or exit_summary.get("accepted_sells") or exit_summary.get("accepted_sell_count") or 0)
+                sell_filled = int(exit_summary.get("sell_orders_filled") or exit_summary.get("fill_confirmed_sells") or exit_summary.get("fill_confirmed_sell_count") or 0)
+                if sell_ack > 0:
+                    logger.error(
+                        "[PB1][PARTIAL_OK][EXIT_DONE_ENTRY_FAILED] sell_orders_ack=%s sell_orders_filled=%s err_type=%s err=%s",
+                        sell_ack,
+                        sell_filled,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    return touched_files, True, {
+                        "buy_orders": 0,
+                        "sell_orders": sell_ack,
+                        "sell_orders_ack": sell_ack,
+                        "sell_orders_filled": sell_filled,
+                        "warning_counts": {"entry_failed_after_exit": 1},
+                    }, phase_for_log, "PARTIAL_OK_EXIT_DONE_ENTRY_FAILED"
+                raise
             if entry_scan_compat_failed:
                 logger.info("[ENTRY_SCAN][FALLBACK] source=pb1_engine_internal_scan status=ok")
 

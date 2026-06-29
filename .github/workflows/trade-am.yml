@@ -194,7 +194,6 @@ env:
   PB1_ALLOW_KIS_DAILY_FALLBACK_IN_DIAG: "1"
   PB1_PNL_REPORT_ENABLED: "1"
   # [2026-04-29] Multi-Layer Exit Router
-  PB1_EXIT_ROUTER_ENABLED: "1"
   PB1_PERCENT_EXIT_ENABLED: "1"
   PB1_EXIT_POLICY_MODE: "HYBRID_BY_ENTRY_STYLE"
   PB1_EXIT_POLICY_PATH: "trader/exit_policy/optimized_exit_router_policy.json"

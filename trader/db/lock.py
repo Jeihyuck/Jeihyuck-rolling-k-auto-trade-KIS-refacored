@@ -29,7 +29,12 @@ def release_lock(engine: Engine, key: str) -> None:
     if engine.dialect.name != "postgresql":
         return
     try:
-        with engine.begin() as conn:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             conn.execute(text("SELECT pg_advisory_unlock(hashtext(:key))"), {"key": key})
-    except Exception:
-        logger.exception("Failed to release advisory lock key=%s", key)
+    except Exception as exc:
+        logger.warning(
+            "[DB][LOCK][RELEASE_WARN] key=%s err_type=%s err=%s non_fatal=1",
+            key,
+            type(exc).__name__,
+            exc,
+        )

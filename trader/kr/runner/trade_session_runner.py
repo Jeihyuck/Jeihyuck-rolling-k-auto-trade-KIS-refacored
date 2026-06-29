@@ -157,6 +157,17 @@ def _write_prep_summary(rows: int, status: str, reason: str) -> None:
 
 def _run_prep(env: str) -> dict[str, Any]:
     ctx = _session_context("prep", env)
+    guard = kr_prep_schedule_guard()
+    logger.info(
+        "[KR_PREP][SCHEDULE_GUARD][PY] now=%s allowed=%d reason=%s window=06:30-08:50",
+        _now_kst().strftime("%H:%M"),
+        int(guard.action != "BLOCK"),
+        guard.reason,
+    )
+    if guard.action == "BLOCK":
+        logger.error("[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW action=no_artifact_touch")
+        logger.info("[KR_PREP][ARTIFACT_CLEAN][SKIP] reason=OUTSIDE_PREP_WINDOW")
+        return {"status": "FAIL", "reason": "OUTSIDE_PREP_WINDOW", "exit_code": 2}
     quarantine_stale_kr_artifacts(trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, env=env)
     os.environ.update({
         "STRATEGY_ENV": env,
@@ -170,11 +181,6 @@ def _run_prep(env: str) -> dict[str, Any]:
     logger.info("[KR_SESSION][START] session=prep env=%s", env)
     import trader.prep_runner as prep_runner
 
-    guard = kr_prep_schedule_guard()
-    logger.info("[KR_PREP][SCHEDULE_GUARD] now=%s allowed=%d reason=%s", _now_kst().strftime("%H:%M"), int(guard.action != "BLOCK"), guard.reason)
-    if guard.action == "BLOCK":
-        logger.error("[KR_PREP][BLOCKED] reason=OUTSIDE_PREP_WINDOW")
-        return {"status": "FAIL", "reason": "OUTSIDE_PREP_WINDOW", "exit_code": 2}
     run_started_ts = _now_kst().timestamp()
     exit_code = int(prep_runner.main() or 0)
     artifact = validate_kr_prep_artifact(trade_date=ctx.trade_date, expected_as_of=ctx.expected_as_of, env=env, strict=True, allow_legacy_fallback=False)

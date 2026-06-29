@@ -3602,13 +3602,19 @@ class KisAPI:
                 )
                 last_error = e
                 err_text = str(e)
-                is_rate_limited = "EGW00201" in err_text or "초당" in err_text or "rate" in err_text.lower()
+                is_rate_limited = (
+                    "EGW00201" in err_text
+                    or "EGW00215" in err_text
+                    or "초당" in err_text
+                    or "rate" in err_text.lower()
+                )
                 if empty_cnt < max_empty_retry:
                     empty_cnt += 1
                     sleep_s = [0.5, 1.0, 2.0][min(empty_cnt - 1, 2)] if is_rate_limited else 0.7
                     if is_rate_limited:
                         logger.warning(
-                            "[KIS][RATE_LIMIT][BACKOFF] api=balance err=EGW00201 retry=%s sleep=%.1f",
+                            "[KIS][RATE_LIMIT][BACKOFF] api=balance err=%s retry=%s sleep=%.1f",
+                            "EGW00215" if "EGW00215" in err_text else "EGW00201" if "EGW00201" in err_text else "UNKNOWN",
                             empty_cnt,
                             sleep_s,
                         )
