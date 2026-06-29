@@ -14,6 +14,13 @@ def test_kr_prep_shell_and_python_window_start_0630():
     assert "action=shell_block_no_python" in script
 
 
+def test_kr_prep_cron_installer_uses_0630():
+    text = Path("scripts/wsl/install-nullim-cron.sh").read_text(encoding="utf-8")
+    assert "# KR prep: 06:30 KST" in text
+    assert "30 6 * * 1-5" in text
+    assert "50 6 * * 1-5" not in text
+
+
 def test_kr_prep_outside_window_does_not_quarantine_artifacts(monkeypatch):
     import trader.kr.runner.trade_session_runner as runner
 
