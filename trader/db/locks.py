@@ -163,29 +163,15 @@ def acquire_advisory_lock(
 
 
 def release_advisory_lock(conn, key: int = LOCK_KEY) -> None:
-    """Release advisory lock (best-effort). Network errors are logged but not raised."""
-
-    def _unlock(active_conn) -> None:
-        active_conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
-
+    """Release advisory lock with a fresh autocommit connection when possible."""
+    engine = getattr(conn, "engine", None)
     try:
-        _unlock(conn)
-    except (OperationalError, DBAPIError) as exc:
-        logger.warning("[LOCK][RELEASE] failed, retry once with fresh conn: %s", exc)
-        try:
-            engine = getattr(conn, "engine", None)
-            if engine is not None:
-                with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as fresh_conn:
-                    _unlock(fresh_conn)
-        except Exception as exc2:
-            logger.warning(
-                "[DB][LOCK][RELEASE_WARN] err_type=%s err=%s non_fatal=1",
-                type(exc2).__name__,
-                exc2,
-            )
+        if engine is not None:
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as fresh_conn:
+                fresh_conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+            logger.info("[LOCK][RELEASE][OK] key=%s source=fresh_autocommit", key)
+            return
+        conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
+        logger.info("[LOCK][RELEASE][OK] key=%s source=provided_conn", key)
     except Exception as exc:
-        logger.warning(
-            "[DB][LOCK][RELEASE_WARN] err_type=%s err=%s non_fatal=1",
-            type(exc).__name__,
-            exc,
-        )
+        logger.warning("[LOCK][RELEASE][FRESH_CONN_FAIL] key=%s err=%s", key, exc)

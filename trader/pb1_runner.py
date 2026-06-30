@@ -10,6 +10,7 @@ import traceback
 import time as time_mod
 import copy
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
@@ -2286,6 +2287,19 @@ def _compute_session_marker_payload(
     fatal_error: bool = False,
 ) -> dict[str, Any]:
     status_u = str(status or "UNKNOWN").upper()
+    exit_reason_u = str(exit_reason or "").upper()
+    if status_u == "RETRYABLE_ORDER_BUILD_ERROR" or exit_reason_u in {"ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT", "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT", "RETRYABLE_ORDER_BUILD_ERROR"}:
+        return {
+            "status": "RETRYABLE_ORDER_BUILD_ERROR",
+            "exit_reason": "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT" if exit_reason_u != "RETRYABLE_ORDER_BUILD_ERROR" else str(exit_reason),
+            "completed": False,
+            "retryable": True,
+            "sell_orders_ack": int(sell_orders_ack or 0),
+            "sell_completed": bool(int(sell_orders_ack or 0) > 0),
+            "entry_status": str(entry_status or "UNKNOWN").upper(),
+            "entry_abort_reason": entry_abort_reason,
+            "entry_completed": False,
+        }
     entry_status_u = str(entry_status or "UNKNOWN").upper()
     entry_done = entry_status_u in {"DONE", "OK", "OK_NO_TRADE", "SKIPPED_BY_POLICY"} and not entry_abort_reason
     completed = int(
@@ -2307,6 +2321,56 @@ def _compute_session_marker_payload(
         "entry_abort_reason": entry_abort_reason,
         "entry_completed": bool(entry_done),
     }
+
+
+@dataclass
+class NormalizedSessionResult:
+    status: str
+    reason: str
+    completed: int
+    retryable: int
+    exit_reason: str
+
+
+def normalize_session_result(
+    *,
+    status: str,
+    reason: str,
+    order_candidates: int = 0,
+    api_submitted: int = 0,
+    skipped: int = 0,
+    skip_reasons: list[str] | None = None,
+) -> NormalizedSessionResult:
+    status_u = str(status or "UNKNOWN").upper()
+    reason_u = str(reason or "").upper()
+    skip_reason_set = {str(r or "").upper() for r in (skip_reasons or [])}
+    retryable_tokens = {
+        "ENTRY_PLAN_INVALID",
+        "ENTRY_PLAN_MISSING_OR_INVALID",
+        "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
+    }
+    retryable_order_build_error = (
+        status_u in {"OK_NO_TRADE", "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT", "RETRYABLE_ORDER_BUILD_ERROR"}
+        and int(order_candidates or 0) > 0
+        and int(api_submitted or 0) == 0
+        and (int(skipped or 0) > 0 or bool(skip_reason_set))
+    ) or reason_u in retryable_tokens or bool(skip_reason_set.intersection(retryable_tokens))
+    if retryable_order_build_error:
+        return NormalizedSessionResult(
+            status="RETRYABLE_ORDER_BUILD_ERROR",
+            reason=str(reason or "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT"),
+            completed=0,
+            retryable=1,
+            exit_reason="ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
+        )
+    completed = int(status_u in {"OK", "OK_NO_TRADE", "PB1_SESSION_DONE"})
+    return NormalizedSessionResult(
+        status=status_u,
+        reason=str(reason or ""),
+        completed=completed,
+        retryable=int(not completed),
+        exit_reason=str(reason or ""),
+    )
 
 def _write_session_result_file(payload: dict[str, Any]) -> None:
     path = os.getenv("PB1_SESSION_RESULT_PATH")
