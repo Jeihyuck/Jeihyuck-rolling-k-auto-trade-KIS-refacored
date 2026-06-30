@@ -221,3 +221,55 @@ def test_risk_gate_same_day_rebuy_block():
 
     repos._MEM_FILLS.clear()
     os.environ["US_BLOCK_REBUY_AFTER_SELL_SAME_DAY"] = "0"
+
+
+def test_reentry_blocks_zero_minutes_since_sell():
+    from trader.us.pb1.us_entry_engine import _can_reenter_after_soft_exit
+
+    entry_meta = {
+        "last_exit_type": "soft_stop_loss",
+        "minutes_since_sell": 0,
+        "price_above_vwap": True,
+        "symbol_5m_low_higher": True,
+        "qqq_recovering": True,
+    }
+    assert _can_reenter_after_soft_exit("GENERIC", entry_meta) is False
+
+
+def test_reentry_blocks_29_minutes_since_sell():
+    from trader.us.pb1.us_entry_engine import _can_reenter_after_soft_exit
+
+    entry_meta = {
+        "last_exit_type": "soft_stop_loss",
+        "minutes_since_sell": 29,
+        "price_above_vwap": True,
+        "symbol_5m_low_higher": True,
+        "qqq_recovering": True,
+    }
+    assert _can_reenter_after_soft_exit("GENERIC", entry_meta) is False
+
+
+def test_reentry_allows_after_30_minutes_with_recovery():
+    from trader.us.pb1.us_entry_engine import _can_reenter_after_soft_exit
+
+    entry_meta = {
+        "last_exit_type": "soft_stop_loss",
+        "minutes_since_sell": 30,
+        "price_above_vwap": True,
+        "symbol_5m_low_higher": True,
+        "qqq_recovering": True,
+    }
+    assert _can_reenter_after_soft_exit("GENERIC", entry_meta) is True
+
+
+def test_reentry_blocks_after_hard_stop():
+    from trader.us.pb1.us_entry_engine import _can_reenter_after_soft_exit
+
+    entry_meta = {
+        "last_exit_type": "hard_stop_loss",
+        "minutes_since_sell": 60,
+        "price_above_vwap": True,
+        "symbol_5m_low_higher": True,
+        "qqq_recovering": True,
+    }
+    assert _can_reenter_after_soft_exit("GENERIC", entry_meta) is False

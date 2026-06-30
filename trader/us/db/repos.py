@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ _MEM_ORDERS: list[dict] = []
 _MEM_FILLS: list[dict] = []
 _MEM_POSITIONS: list[dict] = []
 _MEM_RECONCILE_LOGS: list[dict] = []
+_MEM_RISK_STATE: dict[tuple[str, str], dict] = {}
 
 
 def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
@@ -69,13 +70,14 @@ def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
 
 def reset_memory_stores() -> None:
     """테스트용 메모리 스토어 초기화."""
-    global _MEM_WATCHLIST, _MEM_INTENTS, _MEM_ORDERS, _MEM_FILLS, _MEM_POSITIONS, _MEM_RECONCILE_LOGS
+    global _MEM_WATCHLIST, _MEM_INTENTS, _MEM_ORDERS, _MEM_FILLS, _MEM_POSITIONS, _MEM_RECONCILE_LOGS, _MEM_RISK_STATE
     _MEM_WATCHLIST = []
     _MEM_INTENTS = []
     _MEM_ORDERS = []
     _MEM_FILLS = []
     _MEM_POSITIONS = []
     _MEM_RECONCILE_LOGS = []
+    _MEM_RISK_STATE = {}
 
 
 def _has_db_url() -> bool:
@@ -416,6 +418,181 @@ def save_dry_run_order(intent: dict, trade_date: str | None = None) -> bool:
     except Exception as exc:
         logger.error("[US_DRY_RUN_ORDER][SAVE][ERROR] %s", exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Per-position intraday risk state — symbol-agnostic US soft-stop state
+# ---------------------------------------------------------------------------
+
+def _risk_state_key(symbol: str, trade_date: str) -> tuple[str, str]:
+    return (str(trade_date), str(symbol or "").strip().upper())
+
+
+def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> dict:
+    raw = dict(state or {})
+    now_iso = raw.get("updated_at") or datetime.now(timezone.utc).isoformat()
+    return {
+        "trade_date": trade_date,
+        "symbol": str(symbol or "").strip().upper(),
+        "soft_stop_breach_count": int(raw.get("soft_stop_breach_count") or 0),
+        "first_soft_stop_seen_at": raw.get("first_soft_stop_seen_at"),
+        "last_soft_stop_seen_at": raw.get("last_soft_stop_seen_at"),
+        "lowest_price_since_breach": raw.get("lowest_price_since_breach"),
+        "last_price": raw.get("last_price"),
+        "last_pnl_pct": raw.get("last_pnl_pct"),
+        "updated_at": now_iso,
+        "state": raw.get("state") or {},
+    }
+
+
+def _ensure_us_position_risk_state_table(conn) -> None:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS us_position_risk_state (
+            trade_date DATE NOT NULL,
+            symbol TEXT NOT NULL,
+            soft_stop_breach_count INTEGER NOT NULL DEFAULT 0,
+            first_soft_stop_seen_at TIMESTAMPTZ,
+            last_soft_stop_seen_at TIMESTAMPTZ,
+            lowest_price_since_breach NUMERIC,
+            last_price NUMERIC,
+            last_pnl_pct NUMERIC,
+            state JSONB DEFAULT '{}'::jsonb,
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            PRIMARY KEY (trade_date, symbol)
+        )
+    """))
+
+
+def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
+    """Load per-symbol US intraday risk state; never raises into trading loop."""
+    key = _risk_state_key(symbol, trade_date)
+    engine = _get_engine_or_none()
+    if engine is None:
+        return dict(_MEM_RISK_STATE.get(key, {}))
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            row = conn.execute(
+                text("""
+                    SELECT trade_date, symbol, soft_stop_breach_count,
+                           first_soft_stop_seen_at, last_soft_stop_seen_at,
+                           lowest_price_since_breach, last_price, last_pnl_pct,
+                           state, updated_at
+                    FROM us_position_risk_state
+                    WHERE trade_date = :td AND symbol = :symbol
+                """),
+                {"td": trade_date, "symbol": key[1]},
+            ).mappings().first()
+            return dict(row) if row else {}
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][LOAD_WARN] symbol=%s trade_date=%s err=%s", key[1], trade_date, exc)
+        return dict(_MEM_RISK_STATE.get(key, {}))
+
+
+def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> None:
+    """Upsert per-symbol US intraday risk state; idempotent and fail-soft."""
+    key = _risk_state_key(symbol, trade_date)
+    normalized = _normalize_risk_state(key[1], trade_date, state)
+    engine = _get_engine_or_none()
+    if engine is None:
+        _MEM_RISK_STATE[key] = normalized
+        return
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            conn.execute(
+                text("""
+                    INSERT INTO us_position_risk_state (
+                        trade_date, symbol, soft_stop_breach_count,
+                        first_soft_stop_seen_at, last_soft_stop_seen_at,
+                        lowest_price_since_breach, last_price, last_pnl_pct,
+                        state, updated_at
+                    )
+                    VALUES (
+                        :td, :symbol, :soft_stop_breach_count,
+                        :first_soft_stop_seen_at, :last_soft_stop_seen_at,
+                        :lowest_price_since_breach, :last_price, :last_pnl_pct,
+                        CAST(:state AS jsonb), NOW()
+                    )
+                    ON CONFLICT (trade_date, symbol) DO UPDATE SET
+                        soft_stop_breach_count = EXCLUDED.soft_stop_breach_count,
+                        first_soft_stop_seen_at = EXCLUDED.first_soft_stop_seen_at,
+                        last_soft_stop_seen_at = EXCLUDED.last_soft_stop_seen_at,
+                        lowest_price_since_breach = EXCLUDED.lowest_price_since_breach,
+                        last_price = EXCLUDED.last_price,
+                        last_pnl_pct = EXCLUDED.last_pnl_pct,
+                        state = EXCLUDED.state,
+                        updated_at = NOW()
+                """),
+                {
+                    "td": trade_date,
+                    "symbol": key[1],
+                    "soft_stop_breach_count": normalized["soft_stop_breach_count"],
+                    "first_soft_stop_seen_at": normalized["first_soft_stop_seen_at"],
+                    "last_soft_stop_seen_at": normalized["last_soft_stop_seen_at"],
+                    "lowest_price_since_breach": normalized["lowest_price_since_breach"],
+                    "last_price": normalized["last_price"],
+                    "last_pnl_pct": normalized["last_pnl_pct"],
+                    "state": _json_param(normalized["state"]),
+                },
+            )
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][SAVE_WARN] symbol=%s trade_date=%s err=%s", key[1], trade_date, exc)
+        _MEM_RISK_STATE[key] = normalized
+
+
+def update_us_soft_stop_risk_state(
+    *,
+    symbol: str,
+    trade_date: str,
+    pnl_pct: float,
+    current_price: float,
+    now: datetime,
+    soft_stop_pct: float,
+) -> dict:
+    """Increment/reset and persist per-symbol soft-stop state."""
+    key_symbol = _risk_state_key(symbol, trade_date)[1]
+    previous = load_us_position_risk_state(key_symbol, trade_date)
+    now_iso = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).isoformat()
+    if float(pnl_pct) <= -float(soft_stop_pct):
+        previous_low = previous.get("lowest_price_since_breach")
+        try:
+            lowest = min(float(previous_low), float(current_price)) if previous_low is not None else float(current_price)
+        except (TypeError, ValueError):
+            lowest = float(current_price)
+        state = {
+            **previous,
+            "soft_stop_breach_count": int(previous.get("soft_stop_breach_count") or 0) + 1,
+            "first_soft_stop_seen_at": previous.get("first_soft_stop_seen_at") or now_iso,
+            "last_soft_stop_seen_at": now_iso,
+            "lowest_price_since_breach": lowest,
+            "last_price": float(current_price),
+            "last_pnl_pct": float(pnl_pct),
+            "updated_at": now_iso,
+        }
+        save_us_position_risk_state(key_symbol, trade_date, state)
+        logger.info(
+            "[US_RISK_STATE][SOFT_STOP] symbol=%s trade_date=%s count=%d pnl_pct=%.4f price=%.4f action=increment",
+            key_symbol, trade_date, state["soft_stop_breach_count"], pnl_pct, current_price,
+        )
+        return _normalize_risk_state(key_symbol, trade_date, state)
+
+    state = {
+        **previous,
+        "soft_stop_breach_count": 0,
+        "first_soft_stop_seen_at": None,
+        "last_soft_stop_seen_at": None,
+        "lowest_price_since_breach": None,
+        "last_price": float(current_price),
+        "last_pnl_pct": float(pnl_pct),
+        "updated_at": now_iso,
+    }
+    save_us_position_risk_state(key_symbol, trade_date, state)
+    logger.info(
+        "[US_RISK_STATE][SOFT_STOP_RESET] symbol=%s trade_date=%s pnl_pct=%.4f price=%.4f action=reset",
+        key_symbol, trade_date, pnl_pct, current_price,
+    )
+    return _normalize_risk_state(key_symbol, trade_date, state)
 
 
 # ---------------------------------------------------------------------------

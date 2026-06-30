@@ -142,8 +142,10 @@ def run_daily_report(
         "env": env,
         "dry_run": None,
         "orders_ack": 0,
+        "orders_submitted_total": 0,
         "orders_sent_total": 0,
         "orders_ack_total": 0,
+        "orders_balance_confirmed_total": 0,
         "buy_order_count": 0,
         "sell_order_count": 0,
         "orders_dry_run": 0,
@@ -266,10 +268,12 @@ def run_daily_report(
                             report["buy_order_count"] += 1
                         elif side == "SELL":
                             report["sell_order_count"] += 1
-                        if status in {"SUBMITTED", "SENT", "ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "BALANCE_CONFIRMED"}:
-                            report["orders_sent_total"] += 1
-                        if status in {"ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "SENT", "BALANCE_CONFIRMED"}:
-                            report["orders_ack"] += 1
+                        if status in {"SUBMITTED", "SENT"}:
+                            report["orders_submitted_total"] += 1
+                        elif status in {"ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED"}:
+                            report["orders_ack_total"] += 1
+                        elif status == "BALANCE_CONFIRMED":
+                            report["orders_balance_confirmed_total"] += 1
                         elif status == "DRY_RUN":
                             report["orders_dry_run"] += 1
                         elif status == "BLOCKED":
@@ -280,7 +284,8 @@ def run_daily_report(
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":
                             report["orders_signal_only"] += 1
-                    report["orders_ack_total"] = report["orders_ack"]
+                    report["orders_sent_total"] = report["orders_submitted_total"] + report["orders_ack_total"]
+                    report["orders_ack"] = report["orders_ack_total"]
             except Exception as exc:
                 report["warnings"].append(f"orders_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] orders load failed: %s", exc)
@@ -290,6 +295,12 @@ def run_daily_report(
                 fill_breakdown = load_us_fills_breakdown(trade_date)
                 report.update(fill_breakdown)
                 report["fills"] = fill_breakdown["fills_count"]
+                logger.info(
+                    "[US_DAILY_REPORT][ORDER_COUNTS] submitted=%d ack=%d balance_confirmed=%d sent_total=%d fills=%d",
+                    report["orders_submitted_total"], report["orders_ack_total"],
+                    report["orders_balance_confirmed_total"], report["orders_sent_total"],
+                    report["fills"],
+                )
             except Exception as exc:
                 report["warnings"].append(f"fills_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] fills load failed: %s", exc)

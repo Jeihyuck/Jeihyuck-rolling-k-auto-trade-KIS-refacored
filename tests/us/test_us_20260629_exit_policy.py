@@ -58,6 +58,24 @@ def test_loss_without_profit_experience_is_soft_stop_not_trailing(monkeypatch):
     assert intent["qty"] <= 5
 
 
+def test_soft_stop_policy_is_symbol_agnostic(monkeypatch):
+    monkeypatch.setenv("US_OPEN_VOL_GUARD_ENABLED", "0")
+    pos = {
+        "symbol": "GENERIC",
+        "exchange": "NASDAQ",
+        "qty": 10,
+        "entry_price": 100.0,
+        "max_price": 100.0,
+        "soft_stop_breach_count": 3,
+    }
+    intent = evaluate_exit(pos, current_price=95.0, now=datetime(2026, 6, 29, 11, 0, tzinfo=NY))
+
+    assert intent is not None
+    assert intent["exit_type"] == "soft_stop_loss"
+    assert intent["exit_type"] != "profit_trailing_stop"
+    assert intent["qty"] <= 5
+
+
 def test_repeated_kis_fills_are_idempotent(monkeypatch):
     import trader.us.db.repos as repos
 

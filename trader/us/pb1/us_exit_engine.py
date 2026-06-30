@@ -508,6 +508,28 @@ def _make_hold_intent(
     }
 
 
+def _resolve_position_entry_price(position: dict) -> float:
+    for field in ("entry_price", "avg_price_usd", "avg_cost", "average_price", "avg_buy_price"):
+        v = position.get(field)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                pass
+    qty = int(position.get("qty") or position.get("holding_qty") or 0)
+    buy_amount = position.get("buy_amount_usd")
+    if buy_amount is not None and qty > 0:
+        try:
+            ep = float(buy_amount) / qty
+            if ep > 0:
+                return ep
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    return 0.0
+
+
 def generate_exit_intents(
     positions: list[dict],
     provider: Any,
@@ -565,6 +587,24 @@ def generate_exit_intents(
             logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
             skipped_price_nonpositive += 1
             continue
+
+        entry_price_for_state = _resolve_position_entry_price(pos)
+        if entry_price_for_state > 0 and current_price > 0:
+            try:
+                from trader.us.db.repos import update_us_soft_stop_risk_state
+                pnl_pct_for_state = (current_price - entry_price_for_state) / entry_price_for_state
+                risk_state = update_us_soft_stop_risk_state(
+                    symbol=symbol,
+                    trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)),
+                    pnl_pct=pnl_pct_for_state,
+                    current_price=current_price,
+                    now=now or datetime.now(),
+                    soft_stop_pct=float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05")),
+                )
+                pos["risk_state"] = risk_state
+                pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
+            except Exception as exc:
+                logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
 
         # book/horizon 기반 router 사용 — SWING vs DAY 분리
         # fallback: meta 없으면 SWING_BOOK (기본값)

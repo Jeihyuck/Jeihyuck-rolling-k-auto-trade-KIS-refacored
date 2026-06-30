@@ -52,3 +52,28 @@ def test_daily_report_order_source_empty_warning(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     result=drr.run_daily_report(env='practice', session='close', trade_date='2026-06-16', offline=False)
     assert 'ORDER_SOURCE_EMPTY' in result['report']['warnings']
+
+def test_daily_report_does_not_count_balance_confirmed_as_broker_sent(monkeypatch, tmp_path):
+    monkeypatch.setattr(drr, 'load_us_orders', lambda td: [
+        {'status': 'ACK', 'side': 'BUY'},
+        {'status': 'ACK', 'side': 'SELL'},
+        {'status': 'BALANCE_CONFIRMED', 'side': 'BUY'},
+        {'status': 'BALANCE_CONFIRMED', 'side': 'SELL'},
+    ])
+    monkeypatch.setattr(drr, 'load_us_fills_breakdown', lambda td: {
+        'fills_count': 2,
+        'real_broker_buys': 1,
+        'real_broker_sells': 1,
+        'synthetic_reconcile_buys': 0,
+        'synthetic_reconcile_sells': 0,
+    })
+    monkeypatch.setattr(drr, 'load_balance_confirmed_count', lambda td: 2)
+    monkeypatch.setattr(drr, 'load_router_summary_ack_count', lambda td, session=None: 2)
+    monkeypatch.chdir(tmp_path)
+
+    report = drr.run_daily_report(env='practice', session='close', trade_date='2026-06-29', offline=False)['report']
+
+    assert report['orders_ack_total'] == 2
+    assert report['orders_balance_confirmed_total'] == 2
+    assert report['orders_sent_total'] == 2
+    assert report['orders_ack'] == 2
