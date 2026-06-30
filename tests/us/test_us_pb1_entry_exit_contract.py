@@ -120,7 +120,7 @@ def test_exit_hard_stop_trigger():
     result = evaluate_exit(position=position, current_price=92.0)
 
     assert result is not None
-    assert result["exit_type"] == "hard_stop"
+    assert result["exit_type"] == "hard_stop_loss"
     assert result["side"] == "SELL"
     assert result["qty"] == 10
 
@@ -140,7 +140,7 @@ def test_exit_trailing_stop_trigger():
     result = evaluate_exit(position=position, current_price=141.0)
 
     assert result is not None
-    assert result["exit_type"] == "trailing_stop"
+    assert result["exit_type"] == "profit_trailing_stop"
 
 
 def test_exit_no_signal_when_ok():

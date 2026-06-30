@@ -25,7 +25,7 @@ def test_us_exit_hard_stop_uses_avg_price_usd():
 
     assert intent is not None
     assert intent["side"] == "SELL"
-    assert intent["exit_type"] == "hard_stop"
+    assert intent["exit_type"] == "hard_stop_loss"
     assert intent["unrealized_pnl_pct"] <= -0.07
 
 
@@ -87,7 +87,7 @@ def test_us_exit_hard_stop_uses_buy_amount_fallback():
 
     assert intent is not None
     assert intent["side"] == "SELL"
-    assert intent["exit_type"] == "hard_stop"
+    assert intent["exit_type"] == "hard_stop_loss"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ def test_us_exit_trailing_stop():
     intent = evaluate_exit(pos, current_price=112.0)
 
     assert intent is not None
-    assert intent["exit_type"] == "trailing_stop"
+    assert intent["exit_type"] == "profit_trailing_stop"
     assert intent["side"] == "SELL"
 
 
@@ -140,7 +140,7 @@ def test_us_exit_no_crash_without_max_price():
     # current_price=98 → hard_stop 아님, trailing_stop 아님 → None
     intent = evaluate_exit(pos, current_price=98.0)
     # hard_stop (-2%) 이하 아니므로 None or not hard_stop
-    assert intent is None or intent["exit_type"] != "hard_stop"
+    assert intent is None or intent["exit_type"] != "hard_stop_loss"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ def test_us_exit_uses_avg_cost_as_entry_price():
     intent = evaluate_exit(pos, current_price=89.0)
 
     assert intent is not None
-    assert intent["exit_type"] == "hard_stop"
+    assert intent["exit_type"] == "hard_stop_loss"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

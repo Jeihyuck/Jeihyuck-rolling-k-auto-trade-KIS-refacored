@@ -4,8 +4,9 @@
 한국장 PB1의 청산 전략을 미국장용으로 이식.
 
 청산 종류:
-- hard_stop:      손절 한도 초과
-- trailing_stop:  고점 대비 하락
+- hard_stop_loss:      -8% 하드 손절
+- soft_stop_loss:      -5% 소프트 손절(확인/부분매도)
+- profit_trailing_stop: 수익 경험 후 고점 대비 하락
 - profit_protect: 목표 수익 근접 시 이익 보호
 - giveback:       수익 반납 비율 초과
 - time_stop:      보유 기간 초과
@@ -33,8 +34,15 @@ from trader.us.pb1.us_explain import (
 logger = logging.getLogger(__name__)
 
 # 설정값
-_HARD_STOP_PCT = float(os.getenv("US_HARD_STOP_PCT", "0.07"))       # 7% 손절
-_TRAILING_STOP_PCT = float(os.getenv("US_TRAILING_STOP_PCT", "0.05")) # 5% trailing
+EXIT_HARD_STOP_LOSS = "hard_stop_loss"
+EXIT_SOFT_STOP_LOSS = "soft_stop_loss"
+EXIT_PROFIT_TRAILING_STOP = "profit_trailing_stop"
+EXIT_TIME_OR_MOMENTUM_EXIT = "time_or_momentum_exit"
+
+_HARD_STOP_PCT = float(os.getenv("US_HARD_STOP_PCT", "0.08"))       # 8% 하드 손절
+_SOFT_STOP_PCT = float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05"))  # 5% 소프트 손절
+_TRAILING_ACTIVATION_PROFIT_PCT = float(os.getenv("US_TRAILING_ACTIVATION_PROFIT_PCT", "0.03"))
+_TRAILING_STOP_PCT = float(os.getenv("US_TRAILING_STOP_PCT", "0.05")) # 수익 경험 후 5% trailing
 _PROFIT_PROTECT_PCT = float(os.getenv("US_PROFIT_PROTECT_PCT", "0.15")) # 15% 수익 보호
 _GIVEBACK_PCT = float(os.getenv("US_GIVEBACK_PCT", "0.33"))           # 최고 수익 33% 반납
 _TIME_STOP_DAYS = int(os.getenv("US_TIME_STOP_DAYS", "20"))           # 20일 보유
@@ -43,12 +51,36 @@ _TIME_STOP_DAYS = int(os.getenv("US_TIME_STOP_DAYS", "20"))           # 20일 �
 def _reload_env() -> dict:
     """환경변수 최신값 로드."""
     return {
-        "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.07")),
+        "hard_stop": float(os.getenv("US_HARD_STOP_PCT", "0.08")),
+        "soft_stop": float(os.getenv("US_SOFT_STOP_LOSS_PCT", "0.05")),
+        "trailing_activation_profit": float(os.getenv("US_TRAILING_ACTIVATION_PROFIT_PCT", "0.03")),
         "trailing_stop": float(os.getenv("US_TRAILING_STOP_PCT", "0.05")),
         "profit_protect": float(os.getenv("US_PROFIT_PROTECT_PCT", "0.15")),
         "giveback": float(os.getenv("US_GIVEBACK_PCT", "0.33")),
         "time_stop_days": int(os.getenv("US_TIME_STOP_DAYS", "20")),
     }
+
+
+def is_open_vol_guard_window(now: datetime | None) -> bool:
+    """Return True during the regular-open whipsaw guard window (09:30-10:00 ET)."""
+    if os.getenv("US_OPEN_VOL_GUARD_ENABLED", "1") not in {"1", "true", "True", "yes", "YES"}:
+        return False
+    from zoneinfo import ZoneInfo
+    from datetime import time
+    ny = ZoneInfo("America/New_York")
+    dt = (now or datetime.now(tz=ny)).astimezone(ny)
+    return time(9, 30) <= dt.time() < time(10, 0)
+
+
+def _soft_stop_confirmed(position: dict, default_required: int = 2) -> tuple[bool, int, int]:
+    raw_required = position.get("soft_stop_confirm_ticks") or os.getenv("US_SOFT_STOP_CONFIRM_TICKS", str(default_required))
+    required = max(1, int(raw_required))
+    count = int(position.get("soft_stop_breach_count") or position.get("risk_state", {}).get("soft_stop_breach_count") or 0)
+    return count >= required, count, required
+
+
+def _apply_sell_ratio(qty: int, ratio: float) -> int:
+    return max(1, min(qty, int(qty * ratio)))
 
 
 def evaluate_exit(
@@ -199,13 +231,15 @@ def evaluate_exit(
     # ── PnL CHECK 로그 ────────────────────────────────────────────────────────
     logger.info(
         "[US_EXIT][CHECK] symbol=%s qty=%s entry_price=%.4f current_price=%.4f "
-        "pnl_pct=%.4f hard_stop=%.4f trailing_stop=%.4f",
+        "pnl_pct=%.4f hard_stop=%.4f soft_stop=%.4f trailing_activation=%.4f trailing_stop=%.4f",
         symbol,
         qty,
         entry_price,
         current_price,
         pnl_pct,
         cfg["hard_stop"],
+        cfg["soft_stop"],
+        cfg["trailing_activation_profit"],
         cfg["trailing_stop"],
     )
 
@@ -214,7 +248,7 @@ def evaluate_exit(
         return _make_exit_intent(
             symbol=symbol, exchange=exchange, qty=qty,
             current_price=current_price, entry_price=entry_price,
-            exit_type="hard_stop",
+            exit_type=EXIT_HARD_STOP_LOSS,
             reason=f"pnl_pct={pnl_pct:.3f} <= -{cfg['hard_stop']}",
             unrealized_pnl_usd=unrealized_pnl_usd,
             pnl_pct=pnl_pct,
@@ -224,15 +258,58 @@ def evaluate_exit(
             trail_high_price=max_price,
         )
 
-    # ── trailing stop ─────────────────────────────────────────────────────────
-    if max_price > 0 and current_price < max_price * (1 - cfg["trailing_stop"]):
+    # ── profit trailing stop: 수익 경험 후에만 활성화 ────────────────────────
+    max_unrealized_profit_pct = ((max_price - entry_price) / entry_price) if entry_price > 0 and max_price > 0 else 0.0
+    if (
+        max_price > 0
+        and max_unrealized_profit_pct >= cfg["trailing_activation_profit"]
+        and current_price <= max_price * (1 - cfg["trailing_stop"])
+    ):
         trail_pct = (max_price - current_price) / max_price
+        sell_qty = _apply_sell_ratio(qty, float(os.getenv("US_PROFIT_TRAILING_SELL_RATIO", "0.5")))
         return _make_exit_intent(
-            symbol=symbol, exchange=exchange, qty=qty,
+            symbol=symbol, exchange=exchange, qty=sell_qty,
             current_price=current_price, entry_price=entry_price,
-            exit_type="trailing_stop",
-            reason=f"trail_pct={trail_pct:.3f} > {cfg['trailing_stop']}",
-            unrealized_pnl_usd=unrealized_pnl_usd,
+            exit_type=EXIT_PROFIT_TRAILING_STOP,
+            reason=f"max_profit={max_unrealized_profit_pct:.3f} trail_pct={trail_pct:.3f} > {cfg['trailing_stop']}",
+            unrealized_pnl_usd=(current_price - entry_price) * sell_qty,
+            pnl_pct=pnl_pct,
+            holding_qty=raw_qty,
+            orderable_qty=orderable_qty,
+            now=now,
+            trail_high_price=max_price,
+        )
+
+    # ── soft stop: 단일 -5% 틱 전량매도 금지, 확인 후 부분매도 ──────────────
+    if pnl_pct <= -cfg["soft_stop"]:
+        confirmed, breach_count, required_ticks = _soft_stop_confirmed(position)
+        if is_open_vol_guard_window(now):
+            return _make_hold_intent(
+                symbol=symbol,
+                exit_type=EXIT_SOFT_STOP_LOSS,
+                reason="open_vol_guard_blocks_soft_exit",
+                pnl_pct=pnl_pct,
+                breach_count=breach_count,
+                required_ticks=required_ticks,
+                now=now,
+            )
+        if not confirmed:
+            return _make_hold_intent(
+                symbol=symbol,
+                exit_type=EXIT_SOFT_STOP_LOSS,
+                reason="soft_stop_wait_confirm",
+                pnl_pct=pnl_pct,
+                breach_count=breach_count,
+                required_ticks=required_ticks,
+                now=now,
+            )
+        sell_qty = _apply_sell_ratio(qty, float(os.getenv("US_SOFT_STOP_SELL_RATIO", "0.5")))
+        return _make_exit_intent(
+            symbol=symbol, exchange=exchange, qty=sell_qty,
+            current_price=current_price, entry_price=entry_price,
+            exit_type=EXIT_SOFT_STOP_LOSS,
+            reason=f"pnl_pct={pnl_pct:.3f} <= -{cfg['soft_stop']} confirmed_ticks={breach_count}/{required_ticks}",
+            unrealized_pnl_usd=(current_price - entry_price) * sell_qty,
             pnl_pct=pnl_pct,
             holding_qty=raw_qty,
             orderable_qty=orderable_qty,
@@ -346,7 +423,7 @@ def _make_exit_intent(
     trail_drawdown_pct = ((trail_high - current_price) / trail_high) if trail_high > 0 else 0.0
     cfg = _reload_env()
     stop_type = exit_type
-    threshold = cfg["hard_stop"] if exit_type == "hard_stop" else cfg["trailing_stop"] if exit_type in {"trailing_stop", "profit_protect"} else cfg.get("giveback", 0.0)
+    threshold = cfg["hard_stop"] if exit_type in {"hard_stop", EXIT_HARD_STOP_LOSS} else cfg["soft_stop"] if exit_type == EXIT_SOFT_STOP_LOSS else cfg["trailing_stop"] if exit_type in {"trailing_stop", EXIT_PROFIT_TRAILING_STOP, "profit_protect"} else cfg.get("giveback", 0.0)
     try:
         from zoneinfo import ZoneInfo
         decision_ts_et = (now or datetime.now(tz=ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York")).isoformat()
@@ -387,8 +464,45 @@ def _make_exit_intent(
             "trail_high_price": trail_high,
             "trail_drawdown_pct": round(trail_drawdown_pct, 6),
             "trailing_stop_threshold_pct": cfg["trailing_stop"],
+            "soft_stop_threshold_pct": cfg["soft_stop"],
+            "trailing_activation_profit_pct": cfg["trailing_activation_profit"],
             "price_source": "provider_current_price",
             "qty": qty,
+            "decision_ts_et": decision_ts_et,
+        },
+    }
+
+
+def _make_hold_intent(
+    symbol: str,
+    exit_type: str,
+    reason: str,
+    pnl_pct: float,
+    breach_count: int,
+    required_ticks: int,
+    now: datetime | None = None,
+) -> dict:
+    try:
+        from zoneinfo import ZoneInfo
+        decision_ts_et = (now or datetime.now(tz=ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York")).isoformat()
+    except Exception:
+        decision_ts_et = datetime.utcnow().isoformat() + "Z"
+    logger.info(
+        "[US_EXIT][HOLD] symbol=%s exit_type=%s reason=%s pnl_pct=%.4f soft_stop_breach_count=%d required_ticks=%d",
+        symbol, exit_type, reason, pnl_pct, breach_count, required_ticks,
+    )
+    return {
+        "symbol": symbol,
+        "side": "HOLD",
+        "action": "PARTIAL_SOFT_STOP_WAIT",
+        "qty": 0,
+        "exit_type": exit_type,
+        "reason": reason,
+        "unrealized_pnl_pct": round(pnl_pct, 4),
+        "meta": {
+            "full_sell": False,
+            "soft_stop_breach_count": breach_count,
+            "soft_stop_required_ticks": required_ticks,
             "decision_ts_et": decision_ts_et,
         },
     }
@@ -460,7 +574,7 @@ def generate_exit_intents(
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build exit explanation
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if intent is not None:
+        if intent is not None and intent.get("side") == "SELL":
             # SELL decision
             exit_explanation = build_us_exit_explanation(
                 symbol=symbol,
@@ -479,6 +593,16 @@ def generate_exit_intents(
             intent["explanation_quality"] = exit_explanation.get("explanation_quality", "FULL")
             
             intents.append(intent)
+        elif intent is not None and intent.get("side") == "HOLD":
+            hold_explanation = build_us_exit_explanation(
+                symbol=symbol,
+                position=pos,
+                exit_intent=None,
+                current_price=current_price,
+            )
+            hold_explanations.append(hold_explanation)
+            log_us_exit_decision(symbol, "HOLD", hold_explanation)
+            hold_count += 1
         else:
             # HOLD decision (NO_EXIT_SIGNAL)
             hold_explanation = build_us_exit_explanation(

@@ -467,8 +467,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
                                 :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
                         ON CONFLICT (fill_idempotency_key)
-                        DO UPDATE SET
-                            updated_at = NOW()
+                        DO NOTHING
                     """),
                     {
                         "td": td,

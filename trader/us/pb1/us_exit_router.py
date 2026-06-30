@@ -63,6 +63,8 @@ def normalize_horizon(raw: str | None) -> str:
 _SOFT_EXIT_TYPES: frozenset[str] = frozenset({
     "profit_protect",
     "trailing_stop",
+    "soft_stop_loss",
+    "profit_trailing_stop",
     "giveback",
     "time_stop",
     "weak_momentum_exit",
@@ -74,6 +76,7 @@ _SOFT_EXIT_TYPES: frozenset[str] = frozenset({
 # hard exit: 손실 방어/위험 off — 당일이어도 항상 허용
 _HARD_EXIT_TYPES: frozenset[str] = frozenset({
     "hard_stop",
+    "hard_stop_loss",
     "intraday_catastrophic_stop",
     "pnl_missing_fail_closed",
     "risk_off_exit",
@@ -171,6 +174,20 @@ def evaluate_swing_exit(
     if _is_soft_exit(exit_type):
         elapsed, held, required = _min_hold_elapsed(position, now)
         if not elapsed:
+            if exit_type == "soft_stop_loss":
+                original_qty = int(intent.get("qty") or 0)
+                capped_qty = max(1, min(original_qty, int((position.get("qty") or original_qty) * 0.5))) if original_qty > 0 else 0
+                intent["qty"] = capped_qty
+                intent["available_qty"] = capped_qty
+                intent["notional_usd"] = round(float(intent.get("limit_price") or current_price) * capped_qty, 4)
+                intent.setdefault("meta", {})["min_hold_blocks_full_soft_exit"] = True
+                intent["reason"] = f"{intent.get('reason', '')}; min_hold_blocks_full_soft_exit"
+                logger.info(
+                    "[US_EXIT][SWING_GUARD][ALLOW_PARTIAL_SOFT_EXIT] symbol=%s exit_type=%s "
+                    "reason=min_hold_blocks_full_soft_exit held_minutes=%d required_minutes=%d qty=%d",
+                    position.get("symbol"), exit_type, held, required, capped_qty,
+                )
+                return intent
             logger.info(
                 "[US_EXIT][SWING_GUARD][BLOCK_SOFT_EXIT] symbol=%s exit_type=%s "
                 "reason=same_day_min_hold book=SWING_BOOK horizon=SWING_CARRY "

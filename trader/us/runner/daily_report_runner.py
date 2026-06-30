@@ -142,12 +142,21 @@ def run_daily_report(
         "env": env,
         "dry_run": None,
         "orders_ack": 0,
+        "orders_sent_total": 0,
+        "orders_ack_total": 0,
+        "buy_order_count": 0,
+        "sell_order_count": 0,
         "orders_dry_run": 0,
         "orders_blocked": 0,
         "orders_rejected": 0,
         "orders_disabled": 0,
         "orders_signal_only": 0,
         "fills": 0,
+        "fills_count": 0,
+        "real_broker_buys": 0,
+        "real_broker_sells": 0,
+        "synthetic_reconcile_buys": 0,
+        "synthetic_reconcile_sells": 0,
         "fill_api_count": 0,
         "balance_confirmed_count": 0,
         "positions": 0,
@@ -252,6 +261,13 @@ def run_daily_report(
                 if all_orders_today:
                     for order in all_orders_today:
                         status = order.get("status", "").upper()
+                        side = str(order.get("side", "")).upper()
+                        if side == "BUY":
+                            report["buy_order_count"] += 1
+                        elif side == "SELL":
+                            report["sell_order_count"] += 1
+                        if status in {"SUBMITTED", "SENT", "ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "BALANCE_CONFIRMED"}:
+                            report["orders_sent_total"] += 1
                         if status in {"ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "SENT", "BALANCE_CONFIRMED"}:
                             report["orders_ack"] += 1
                         elif status == "DRY_RUN":
@@ -264,13 +280,16 @@ def run_daily_report(
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":
                             report["orders_signal_only"] += 1
+                    report["orders_ack_total"] = report["orders_ack"]
             except Exception as exc:
                 report["warnings"].append(f"orders_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] orders load failed: %s", exc)
             
             # Fills
             try:
-                report["fills"] = load_us_fills_count(trade_date)
+                fill_breakdown = load_us_fills_breakdown(trade_date)
+                report.update(fill_breakdown)
+                report["fills"] = fill_breakdown["fills_count"]
             except Exception as exc:
                 report["warnings"].append(f"fills_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] fills load failed: %s", exc)
@@ -288,7 +307,9 @@ def run_daily_report(
             balance_confirmed = load_balance_confirmed_count(trade_date)
             router_summary = load_router_summary_ack_count(trade_date, session=session)
             reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)
-            report["orders_ack"] = reconciled["orders_ack"]
+            # Canonical daily counts come from orders for submitted/ACK and unique fills for executions.
+            report["orders_ack"] = db_ack
+            report["orders_ack_total"] = db_ack
             report["fill_api_count"] = reconciled["fill_api_count"]
             report["balance_confirmed_count"] = reconciled["balance_confirmed_count"]
             logger.info("[US_DAILY_REPORT][ORDER_SOURCES] db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", db_ack, fill_count, balance_confirmed, router_summary)
@@ -506,6 +527,8 @@ def load_us_orders(trade_date: str) -> list[dict]:
     except Exception as exc:
         logger.warning("[US_ORDERS][SCHEMA][WARN] err=%s", exc)
     ts_candidates = [c for c in ("created_at", "updated_at", "ts", "ordered_at", "submitted_at", "acked_at") if c in available_cols]
+    if not ts_candidates:
+        ts_candidates = ["created_at", "updated_at", "submitted_at", "acked_at"]
     logger.info("[US_ORDERS][SCHEMA] available_ts_columns=%s", ts_candidates)
     queries = [("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}, "trade_date")]
     queries.extend((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}, col) for col in ts_candidates)
@@ -541,6 +564,47 @@ def load_us_fills_count(trade_date: str) -> int:
         except Exception as exc:
             logger.debug("[US_FILLS][LOAD][FALLBACK] sql=%s err=%s", sql, exc)
     return int(os.getenv("US_DAILY_FILL_API_COUNT", "0") or 0) if os.getenv("PYTEST_CURRENT_TEST") else 0
+
+
+def load_us_fills_breakdown(trade_date: str) -> dict:
+    """Count unique fills by broker/synthetic source and side."""
+    from trader.us.db.repos import _get_engine_or_none
+    result = {
+        "fills_count": 0,
+        "real_broker_buys": 0,
+        "real_broker_sells": 0,
+        "synthetic_reconcile_buys": 0,
+        "synthetic_reconcile_sells": 0,
+    }
+    engine = _get_engine_or_none()
+    if engine is None:
+        result["fills_count"] = load_us_fills_count(trade_date)
+        return result
+    try:
+        rows = _read_autocommit(
+            engine,
+            """
+            SELECT side, COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source, COUNT(*) AS n
+            FROM us_fills
+            WHERE trade_date = :td
+            GROUP BY side, COALESCE(meta->>'fill_source', meta->>'source', '')
+            """,
+            {"td": trade_date},
+        )
+        for row in rows:
+            side = str(row.get("side") or "").upper()
+            source = str(row.get("fill_source") or "").lower()
+            n = int(row.get("n") or 0)
+            result["fills_count"] += n
+            is_synthetic = "synthetic" in source or "reconcile" in source
+            if side == "BUY":
+                result["synthetic_reconcile_buys" if is_synthetic else "real_broker_buys"] += n
+            elif side == "SELL":
+                result["synthetic_reconcile_sells" if is_synthetic else "real_broker_sells"] += n
+    except Exception as exc:
+        logger.debug("[US_FILLS][BREAKDOWN][FALLBACK] err=%s", exc)
+        result["fills_count"] = load_us_fills_count(trade_date)
+    return result
 
 
 def load_balance_confirmed_count(trade_date: str) -> int:

@@ -344,6 +344,30 @@ def _calc_add_position_size(*, symbol: str, price: float, available_cash_usd: fl
     return {"blocked": False, "qty": qty, "notional_usd": qty * price, "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
 
 
+def _can_reenter_after_soft_exit(symbol: str, entry_meta: dict, now: datetime | None = None) -> bool:
+    """Allow limited same-day reentry only after a recoverable soft/profit-trailing exit.
+
+    The watchlist/prep layer can provide these fields after checking VWAP, 5m higher-low,
+    and QQQ/SOXX recovery. Hard-stop exits remain blocked.
+    """
+    if os.getenv("US_ALLOW_REENTRY_AFTER_SOFT_EXIT", "1") not in {"1", "true", "True", "yes", "YES"}:
+        return False
+    last_exit_type = str(entry_meta.get("last_exit_type") or entry_meta.get("sell_exit_type") or "").lower()
+    if last_exit_type in {"hard_stop", "hard_stop_loss"}:
+        return False
+    if last_exit_type and last_exit_type not in {"soft_stop_loss", "profit_trailing_stop", "trailing_stop", "profit_protect"}:
+        return False
+    minutes_since_sell = _as_float_or_none(entry_meta.get("minutes_since_sell") or entry_meta.get("minutes_after_sell"))
+    if minutes_since_sell is not None and minutes_since_sell < 30:
+        return False
+    recovered = [
+        bool(entry_meta.get("price_above_vwap") or entry_meta.get("symbol_price_above_vwap")),
+        bool(entry_meta.get("symbol_5m_low_higher") or entry_meta.get("higher_low_5m")),
+        bool(entry_meta.get("qqq_recovering") or entry_meta.get("soxx_recovering")),
+    ]
+    return last_exit_type in {"soft_stop_loss", "profit_trailing_stop", "trailing_stop", "profit_protect"} and sum(recovered) >= 3
+
+
 def generate_entry_intents(
     tickers: list[str] | list[dict] | None,
     provider: Any,
@@ -397,7 +421,9 @@ def generate_entry_intents(
     
     # Price lookup 최적화 설정
     price_lookup_buffer = int(os.getenv("US_ENTRY_PRICE_LOOKUP_BUFFER", "5"))
-    lookup_limit = max_new_entries + price_lookup_buffer
+    min_new_candidates = int(os.getenv("US_ENTRY_MIN_NEW_PRICE_LOOKUP", "8"))
+    max_total_lookup = int(os.getenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20"))
+    lookup_limit = min(max_total_lookup, max(max_new_entries + price_lookup_buffer, min_new_candidates))
     
     # Precomputed score가 있는지 확인 (watchlist가 locked되어 있는 경우)
     has_precomputed_scores = bool(entries_map)
@@ -452,11 +478,15 @@ def generate_entry_intents(
             continue
         seen_symbols.add(symbol)
         
-        # 당일 매도 차단
+        entry_meta_for_reentry = entries_map.get(symbol) or {}
+        # 당일 매도 차단. soft/profit-trailing exit 후 회복 컨텍스트가 명시된 경우 제한적 재진입 허용.
         if symbol in sold_today:
-            track_skip(symbol, "sold_today")
-            logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
-            continue
+            if _can_reenter_after_soft_exit(symbol, entry_meta_for_reentry, now=now):
+                logger.info("[US_ENTRY][REENTRY_AFTER_SOFT_EXIT] symbol=%s max_buy_ratio_of_sold_qty=0.5", symbol)
+            else:
+                track_skip(symbol, "sold_today")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
+                continue
         
         position_state = "HELD" if (current_position_symbols and symbol in current_position_symbols) else "NOT_HELD"
 
@@ -602,10 +632,20 @@ def generate_entry_intents(
     # Sort candidates by score (descending)
     candidates.sort(key=lambda x: x[0], reverse=True)
     
-    # Price lookup plan logging
+    # Price lookup plan logging: 보유/신규 후보를 분리해 top8이 보유종목으로만 채워지는 것을 방지한다.
     total_candidates = len(candidates)
     candidates_needing_price = sum(1 for c in candidates if c[3] is None)
-    actual_lookup_count = min(candidates_needing_price, lookup_limit) if has_precomputed_scores else candidates_needing_price
+    if has_precomputed_scores:
+        add_candidates = [c for c in candidates if (c[4] or {}).get("position_state") == "HELD"]
+        new_candidates = [c for c in candidates if (c[4] or {}).get("position_state") != "HELD"]
+        lookup_order_symbols = {c[1] for c in (new_candidates[:min_new_candidates] + add_candidates)}
+        actual_lookup_count = min(candidates_needing_price, lookup_limit)
+        candidates = sorted(
+            candidates,
+            key=lambda c: (0 if c[1] in lookup_order_symbols else 1, -float(c[0] or 0.0)),
+        )
+    else:
+        actual_lookup_count = candidates_needing_price
     
     logger.info(
         "[US_ENTRY][PRICE_LOOKUP_PLAN] total=%d held_skipped=%d lookup_limit=%d actual_lookup=%d",
