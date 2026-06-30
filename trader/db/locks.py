@@ -163,15 +163,28 @@ def acquire_advisory_lock(
 
 
 def release_advisory_lock(conn, key: int = LOCK_KEY) -> None:
-    """Release advisory lock with a fresh autocommit connection when possible."""
-    engine = getattr(conn, "engine", None)
+    """Release the advisory lock held by the provided session connection."""
     try:
-        if engine is not None:
-            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as fresh_conn:
-                fresh_conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
-            logger.info("[LOCK][RELEASE][OK] key=%s source=fresh_autocommit", key)
-            return
-        conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key})
-        logger.info("[LOCK][RELEASE][OK] key=%s source=provided_conn", key)
+        unlocked = bool(conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key}).scalar())
+        logger.info("[LOCK][RELEASE][OK] key=%s source=provided_conn unlocked=%s", key, int(unlocked))
+        if not unlocked:
+            logger.warning("[LOCK][RELEASE][NOT_HELD] key=%s source=provided_conn unlocked=0", key)
+        return
+    except (OperationalError, DBAPIError) as exc:
+        logger.warning("[LOCK][RELEASE][PROVIDED_CONN_FAIL] key=%s err=%s action=fresh_conn_fallback", key, exc)
+    except Exception as exc:
+        logger.warning("[LOCK][RELEASE][PROVIDED_CONN_FAIL] key=%s err=%s action=fresh_conn_fallback", key, exc)
+
+    engine = getattr(conn, "engine", None)
+    if engine is None:
+        logger.warning("[LOCK][RELEASE][FRESH_CONN_SKIP] key=%s reason=no_engine", key)
+        return
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as fresh_conn:
+            unlocked = bool(fresh_conn.execute(sa.text("SELECT pg_advisory_unlock(:k)"), {"k": key}).scalar())
+        if unlocked:
+            logger.info("[LOCK][RELEASE][FRESH_CONN_UNLOCKED] key=%s unlocked=1", key)
+        else:
+            logger.warning("[LOCK][RELEASE][FRESH_CONN_NOT_HELD] key=%s unlocked=0 reason=advisory_locks_are_session_scoped", key)
     except Exception as exc:
         logger.warning("[LOCK][RELEASE][FRESH_CONN_FAIL] key=%s err=%s", key, exc)
