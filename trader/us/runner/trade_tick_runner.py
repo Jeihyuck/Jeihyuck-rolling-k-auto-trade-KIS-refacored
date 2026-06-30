@@ -430,10 +430,10 @@ def run_trade_tick(
     if session == "am" and phase == "PREMARKET":
         regular_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
         seconds_to_open = int((regular_open - now).total_seconds())
-        grace = int(os.getenv("US_OPEN_RECHECK_GRACE_SEC", "10"))
+        grace = int(os.getenv("US_OPEN_RECHECK_GRACE_SEC", "30"))
         if 0 <= seconds_to_open <= grace:
             logger.info(
-                "[US_MARKET_PHASE][WAIT_UNTIL_OPEN] session=%s seconds_to_open=%d grace=%d",
+                "[US_MARKET_PHASE][WAIT_OPEN_GRACE] session=%s seconds_to_open=%d grace=%d",
                 session, seconds_to_open, grace,
             )
             if not force_now:
@@ -441,7 +441,16 @@ def run_trade_tick(
                 now = now_ny()
                 phase = market_phase(now)
             else:
-                logger.info("[US_MARKET_PHASE][FORCE_NOW_NO_SLEEP]")
+                logger.info("[US_MARKET_PHASE][SKIP_PREOPEN_GRACE] force_now=1")
+                return {
+                    "status": "SKIP_PREOPEN_GRACE",
+                    "reason": "WAIT_OPEN_GRACE",
+                    "phase": phase,
+                    "trade_date": trade_date,
+                    "seconds_to_open": seconds_to_open,
+                }
+            if phase in ("REGULAR_OPEN", "REGULAR_MID", "REGULAR_CLOSE"):
+                logger.info("[US_MARKET_PHASE][STARTED_AFTER_OPEN_GRACE] phase=%s", phase)
     if phase not in ("REGULAR_OPEN", "REGULAR_MID", "REGULAR_CLOSE"):
         logger.info("[US_TICK][SKIP] market not open phase=%s", phase)
         return {

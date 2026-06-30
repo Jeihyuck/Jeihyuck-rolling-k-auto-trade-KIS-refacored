@@ -344,6 +344,49 @@ def _calc_add_position_size(*, symbol: str, price: float, available_cash_usd: fl
     return {"blocked": False, "qty": qty, "notional_usd": qty * price, "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
 
 
+def _can_reenter_after_soft_exit(symbol: str, entry_meta: dict, now: datetime | None = None) -> bool:
+    """Allow limited same-day reentry only after a recoverable soft/profit-trailing exit.
+
+    The watchlist/prep layer can provide these fields after checking VWAP, 5m higher-low,
+    and QQQ/SOXX recovery. Hard-stop exits remain blocked.
+    """
+    if os.getenv("US_ALLOW_REENTRY_AFTER_SOFT_EXIT", "1") not in {"1", "true", "True", "yes", "YES"}:
+        return False
+    last_exit_type = str(entry_meta.get("last_exit_type") or entry_meta.get("sell_exit_type") or "").lower()
+    if last_exit_type in {"hard_stop", "hard_stop_loss"}:
+        logger.info(
+            "[US_ENTRY][REENTRY_CHECK] symbol=%s last_exit_type=%s minutes_since_sell=%s recovery_signals=%d required=%d allowed=%s",
+            symbol, last_exit_type, None, 0, int(os.getenv("US_REENTRY_RECOVERY_MIN_SIGNALS", "3")), False,
+        )
+        return False
+    if last_exit_type and last_exit_type not in {"soft_stop_loss", "profit_trailing_stop", "trailing_stop", "profit_protect"}:
+        return False
+    raw_minutes = entry_meta.get("minutes_since_sell")
+    if raw_minutes is None:
+        raw_minutes = entry_meta.get("minutes_after_sell")
+    minutes_since_sell = _as_float_or_none(raw_minutes)
+    recovered = [
+        bool(entry_meta.get("price_above_vwap") or entry_meta.get("symbol_price_above_vwap")),
+        bool(entry_meta.get("symbol_5m_low_higher") or entry_meta.get("higher_low_5m")),
+        bool(entry_meta.get("qqq_recovering") or entry_meta.get("soxx_recovering")),
+    ]
+    required_recovery_signals = int(os.getenv("US_REENTRY_RECOVERY_MIN_SIGNALS", "3"))
+    recovery_signals = sum(recovered)
+    allowed_exit_type = last_exit_type in {"soft_stop_loss", "profit_trailing_stop", "trailing_stop", "profit_protect"}
+    allowed = bool(
+        allowed_exit_type
+        and minutes_since_sell is not None
+        and minutes_since_sell >= 30
+        and recovery_signals >= required_recovery_signals
+    )
+    logger.info(
+        "[US_ENTRY][REENTRY_CHECK] symbol=%s last_exit_type=%s minutes_since_sell=%s "
+        "recovery_signals=%d required=%d allowed=%s",
+        symbol, last_exit_type, minutes_since_sell, recovery_signals, required_recovery_signals, allowed,
+    )
+    return allowed
+
+
 def generate_entry_intents(
     tickers: list[str] | list[dict] | None,
     provider: Any,
@@ -397,7 +440,9 @@ def generate_entry_intents(
     
     # Price lookup 최적화 설정
     price_lookup_buffer = int(os.getenv("US_ENTRY_PRICE_LOOKUP_BUFFER", "5"))
-    lookup_limit = max_new_entries + price_lookup_buffer
+    min_new_candidates = int(os.getenv("US_ENTRY_MIN_NEW_PRICE_LOOKUP", "8"))
+    max_total_lookup = int(os.getenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20"))
+    lookup_limit = min(max_total_lookup, max(max_new_entries + price_lookup_buffer, min_new_candidates))
     
     # Precomputed score가 있는지 확인 (watchlist가 locked되어 있는 경우)
     has_precomputed_scores = bool(entries_map)
@@ -452,11 +497,15 @@ def generate_entry_intents(
             continue
         seen_symbols.add(symbol)
         
-        # 당일 매도 차단
+        entry_meta_for_reentry = entries_map.get(symbol) or {}
+        # 당일 매도 차단. soft/profit-trailing exit 후 회복 컨텍스트가 명시된 경우 제한적 재진입 허용.
         if symbol in sold_today:
-            track_skip(symbol, "sold_today")
-            logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
-            continue
+            if _can_reenter_after_soft_exit(symbol, entry_meta_for_reentry, now=now):
+                logger.info("[US_ENTRY][REENTRY_AFTER_SOFT_EXIT] symbol=%s max_buy_ratio_of_sold_qty=0.5", symbol)
+            else:
+                track_skip(symbol, "sold_today")
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=sold_today", symbol)
+                continue
         
         position_state = "HELD" if (current_position_symbols and symbol in current_position_symbols) else "NOT_HELD"
 
@@ -602,14 +651,41 @@ def generate_entry_intents(
     # Sort candidates by score (descending)
     candidates.sort(key=lambda x: x[0], reverse=True)
     
-    # Price lookup plan logging
+    # Price lookup plan logging: 보유/신규 후보를 분리해 top8이 보유종목으로만 채워지는 것을 방지한다.
     total_candidates = len(candidates)
     candidates_needing_price = sum(1 for c in candidates if c[3] is None)
-    actual_lookup_count = min(candidates_needing_price, lookup_limit) if has_precomputed_scores else candidates_needing_price
+    if has_precomputed_scores:
+        add_candidates = [c for c in candidates if (c[4] or {}).get("position_state") == "HELD"]
+        new_candidates = [c for c in candidates if (c[4] or {}).get("position_state") != "HELD"]
+        selected_new = new_candidates[:min(min_new_candidates, lookup_limit)]
+        remaining_lookup_slots = max(0, lookup_limit - len(selected_new))
+        selected_add = add_candidates[:remaining_lookup_slots]
+        selected_new_symbols = {c[1] for c in selected_new}
+        selected_add_symbols = {c[1] for c in selected_add}
+        actual_lookup_count = min(candidates_needing_price, lookup_limit)
+        def lookup_priority(c):
+            score = float(c[0] or 0.0)
+            if c[1] in selected_new_symbols:
+                return (0, -score)
+            if c[1] in selected_add_symbols:
+                return (1, -score)
+            return (2, -score)
+        candidates = sorted(
+            candidates,
+            key=lookup_priority,
+        )
+    else:
+        add_candidates = []
+        new_candidates = candidates
+        selected_new = []
+        selected_add = []
+        actual_lookup_count = candidates_needing_price
     
     logger.info(
-        "[US_ENTRY][PRICE_LOOKUP_PLAN] total=%d held_skipped=%d lookup_limit=%d actual_lookup=%d",
-        len(symbols), held_skipped, lookup_limit, actual_lookup_count
+        "[US_ENTRY][PRICE_LOOKUP_PLAN] total=%d held_candidates=%d new_candidates=%d min_new=%d "
+        "lookup_limit=%d selected_new=%d selected_held=%d actual_lookup=%d",
+        len(symbols), len(add_candidates), len(new_candidates), min_new_candidates,
+        lookup_limit, len(selected_new), len(selected_add), actual_lookup_count
     )
     
     # Entry engine 내부 dedupe 요약
@@ -627,10 +703,6 @@ def generate_entry_intents(
     
     # Price lookup 및 intent 생성 (상위 lookup_limit개만)
     for rank, (score, symbol, exchange, existing_price, entry_meta) in enumerate(candidates):
-        # 이미 max_new_entries 만큼 추가했으면 종료
-        if added_count >= max_new_entries:
-            break
-
         # Price lookup (필요한 경우)
         if existing_price is None:
             # Optimization: 상위 lookup_limit개만 price lookup (precomputed score가 있는 경우)
@@ -664,6 +736,10 @@ def generate_entry_intents(
         else:
             # 이미 price가 있음 (runtime calculation)
             price = existing_price
+
+        if added_count >= max_new_entries:
+            track_skip(symbol, "max_new_entries_reached", {"max_new_entries": max_new_entries})
+            continue
 
         position_state_for_order = (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
