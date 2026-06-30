@@ -112,6 +112,65 @@ def _balance_holdings_count(snapshot: Any) -> int | None:
     return count
 
 
+
+@dataclass
+class CloseBalanceGuardResult:
+    status: str
+    retryable: int
+    completed: int
+    reason: str
+
+
+def _safe_int_value(value: Any) -> int:
+    try:
+        return int(float(str(value).replace(",", "")))
+    except Exception:
+        return 0
+
+
+def close_balance_guard(*, holdings_count: int, market_value: float, raw_balance: dict[str, Any] | None = None) -> CloseBalanceGuardResult:
+    if int(holdings_count or 0) == 0 and float(market_value or 0.0) > 0:
+        logger.warning(
+            "[KR_CLOSE][BALANCE_INCONSISTENT] holdings=0 market_value=%s action=retry_balance_reload raw_keys=%s",
+            market_value,
+            sorted((raw_balance or {}).keys()) if isinstance(raw_balance, dict) else [],
+        )
+        return CloseBalanceGuardResult(
+            status="WARN_BALANCE_INCONSISTENT",
+            retryable=1,
+            completed=0,
+            reason="BALANCE_INCONSISTENT_HOLDINGS_UNKNOWN",
+        )
+    return CloseBalanceGuardResult(status="OK", retryable=0, completed=1, reason="ok")
+
+
+def _balance_market_value(snapshot: Any) -> int:
+    if not isinstance(snapshot, dict):
+        return 0
+    out2 = snapshot.get("output2")
+    summary = out2[0] if isinstance(out2, list) and out2 else out2 if isinstance(out2, dict) else {}
+    if not isinstance(summary, dict):
+        return 0
+
+    # Stock/equity valuation fields only. Do not treat total asset value as market value;
+    # cash-only accounts can have positive tot_evlu_amt with no holdings.
+    for key in ("scts_evlu_amt", "evlu_amt_smtl_amt", "stock_evlu_amt", "stk_evlu_amt"):
+        val = _safe_int_value(summary.get(key))
+        if val > 0:
+            return val
+
+    total_raw = summary.get("tot_evlu_amt")
+    cash_raw = None
+    for cash_key in ("dnca_tot_amt", "cash", "cash_krw", "ord_psbl_cash"):
+        if cash_key in summary and summary.get(cash_key) not in (None, ""):
+            cash_raw = summary.get(cash_key)
+            break
+    total = _safe_int_value(total_raw)
+    cash = _safe_int_value(cash_raw)
+    if total_raw not in (None, "") and cash_raw not in (None, "") and total > cash:
+        return total - cash
+    return 0
+
 def _setup_logging() -> None:
     if not logging.getLogger().handlers:
         logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -425,6 +484,48 @@ def compute_session_marker(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def normalize_kr_session_completion(
+    *,
+    status: str,
+    summary_reason: str,
+    marker: dict[str, Any],
+    pb1_status: str,
+    pb1_exit_reason: str,
+) -> tuple[str, str, int, int]:
+    base_retryable_reasons = {
+        "DB_EXACT_FINAL30_ZERO",
+        "CLOSE_BALANCE_UNCONFIRMED",
+        "BALANCE_TIMEOUT_FAIL_SOFT",
+        "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
+        "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
+        "RETRYABLE_ORDER_BUILD_ERROR",
+    }
+    retryable_order_build_reasons = {
+        "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
+        "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
+        "RETRYABLE_ORDER_BUILD_ERROR",
+    }
+    pb1_status_u = str(pb1_status or "").upper()
+    pb1_exit_reason_s = str(pb1_exit_reason or "")
+
+    if pb1_status_u == "RETRYABLE_ORDER_BUILD_ERROR" or pb1_exit_reason_s in retryable_order_build_reasons:
+        return "RETRYABLE_ORDER_BUILD_ERROR", "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT", 0, 1
+
+    if pb1_exit_reason_s == "phase_guard_skip_duplicate_pm_run":
+        completed = int(bool((marker or {}).get("completed")))
+        retryable = int(bool((marker or {}).get("retryable")))
+        if completed and not retryable:
+            return "SKIP_DUPLICATE_NORMAL", "phase_guard_skip_duplicate_pm_run", 1, 0
+        return str(status or "SKIP_DUPLICATE_NORMAL"), "phase_guard_skip_duplicate_pm_run", completed, retryable
+
+    completed = int((marker or {}).get("completed") or 0)
+    retryable = int(bool((marker or {}).get("retryable")) or str(summary_reason or "") in base_retryable_reasons or str(status or "") == "WARN")
+    if str(summary_reason or "") in base_retryable_reasons:
+        completed = 0
+        retryable = 1
+    return str(status or "UNKNOWN"), str(summary_reason or ""), completed, retryable
+
 def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     ctx = _session_context(session, env)
     os.environ.update({
@@ -537,14 +638,33 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code=exit_code, status=status, sell_orders_ack=sell_orders_ack,
         entry_status=entry_status, entry_abort_reason=entry_reason, fatal_error=(status in {"FAIL", "FAILED"} and exit_code != 0),
     ))
-    retryable_reasons = {"DB_EXACT_FINAL30_ZERO", "CLOSE_BALANCE_UNCONFIRMED", "BALANCE_TIMEOUT_FAIL_SOFT"}
-    completed = int(marker["completed"])
-    retryable = int(marker["retryable"] or summary_reason in retryable_reasons or status == "WARN")
+    pb1_status = str(pb1_result.get("status") or pb1_last or "").upper()
+    pb1_exit_reason = str(pb1_result.get("exit_reason") or pb1_reason or "")
+    status, summary_reason, completed, retryable = normalize_kr_session_completion(
+        status=status,
+        summary_reason=summary_reason,
+        marker=marker,
+        pb1_status=pb1_status,
+        pb1_exit_reason=pb1_exit_reason,
+    )
     if retryable and not completed and int(marker.get("sell_completed", 0)):
         status = "PARTIAL_SUCCESS_RETRYABLE"
-    if summary_reason in retryable_reasons:
-        completed = 0
-        retryable = 1
+    if session == "close":
+        raw_balance = None
+        try:
+            raw_balance = KisAPI().get_balance(force=True)
+        except Exception as exc:
+            logger.warning("[KR_CLOSE][BALANCE_INCONSISTENT][RELOAD_WARN] err=%s", exc)
+        guard = close_balance_guard(
+            holdings_count=_balance_holdings_count(raw_balance) or 0,
+            market_value=_balance_market_value(raw_balance),
+            raw_balance=raw_balance if isinstance(raw_balance, dict) else {},
+        )
+        if guard.status == "WARN_BALANCE_INCONSISTENT":
+            status = guard.status
+            summary_reason = guard.reason
+            completed = guard.completed
+            retryable = guard.retryable
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
