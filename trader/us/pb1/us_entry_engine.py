@@ -329,19 +329,39 @@ def _held_current_weight(snapshot: dict, capital_usd_cap: float) -> float | None
 
 
 def _calc_add_position_size(*, symbol: str, price: float, available_cash_usd: float, capital_usd_cap: float, snapshot: dict) -> dict:
-    target_weight = float(os.getenv("US_TARGET_POSITION_WEIGHT", os.getenv("US_MAX_POSITION_WEIGHT", "0.10")) or 0.10)
-    max_symbol_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10") or 0.10)
+    target_weight = float(os.getenv("US_TARGET_POSITION_WEIGHT", "0.025") or 0.025)
+    max_symbol_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05") or 0.05)
     current_weight = _held_current_weight(snapshot, capital_usd_cap)
     if current_weight is None:
-        return {"blocked": True, "reason": "weight_unknown"}
-    if current_weight >= target_weight or current_weight >= max_symbol_weight:
-        return {"blocked": True, "reason": "full_weight", "current_weight": current_weight}
+        return {"blocked": True, "reason": "weight_unknown", "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
+    if current_weight >= max_symbol_weight:
+        return {"blocked": True, "reason": "max_symbol_weight_reached", "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
+    if current_weight >= target_weight:
+        return {"blocked": True, "reason": "target_weight_reached", "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
     allowed_weight = max(0.0, min(target_weight - current_weight, max_symbol_weight - current_weight))
+    if allowed_weight <= 0:
+        return {"blocked": True, "reason": "full_weight", "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight, "allowed_weight": allowed_weight}
     budget_usd = min(available_cash_usd, capital_usd_cap * allowed_weight)
+    if budget_usd <= 0:
+        return {"blocked": True, "reason": "insufficient_cash_for_add", "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight, "allowed_weight": allowed_weight}
     qty = int(budget_usd // price) if price > 0 else 0
     if qty <= 0:
-        return {"blocked": True, "reason": "add_qty_zero", "current_weight": current_weight}
-    return {"blocked": False, "qty": qty, "notional_usd": qty * price, "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight}
+        return {"blocked": True, "reason": "add_qty_zero", "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight, "allowed_weight": allowed_weight}
+    notional_usd = qty * price
+    projected_weight = current_weight + (notional_usd / capital_usd_cap if capital_usd_cap > 0 else 0.0)
+    if projected_weight > max_symbol_weight:
+        return {"blocked": True, "reason": "max_symbol_weight_reached", "current_weight": current_weight, "target_weight": target_weight, "max_symbol_weight": max_symbol_weight, "allowed_weight": allowed_weight, "projected_weight": projected_weight}
+    return {
+        "blocked": False,
+        "qty": qty,
+        "notional_usd": notional_usd,
+        "current_weight": current_weight,
+        "target_weight": target_weight,
+        "max_symbol_weight": max_symbol_weight,
+        "allowed_weight": allowed_weight,
+        "projected_weight": projected_weight,
+        "deployment_action": "ADD_TO_EXISTING_BUY",
+    }
 
 
 def _can_reenter_after_soft_exit(symbol: str, entry_meta: dict, now: datetime | None = None) -> bool:
@@ -398,6 +418,10 @@ def generate_entry_intents(
     max_new_entries: int | None = None,
     watchlist_entries: list[dict] | None = None,
     current_position_symbols: set[str] | None = None,
+    *,
+    allow_new_symbols: bool = True,
+    allow_add_to_existing: bool = True,
+    available_new_slots: int | None = None,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -412,6 +436,9 @@ def generate_entry_intents(
         max_new_entries: tick당 최대 신규 진입 수
         watchlist_entries: locked watchlist rows (authoritative input)
         current_position_symbols: KIS balance에서 얻은 현재 보유 종목 집합
+        allow_new_symbols: False이면 NOT_HELD 신규 후보는 price lookup 전에 skip
+        allow_add_to_existing: HELD 기존 보유 종목 추가매수 허용 여부
+        available_new_slots: 신규 심볼 잔여 슬롯 수
 
     Returns:
         list of order intent dict
@@ -700,9 +727,30 @@ def generate_entry_intents(
     intents: list[dict] = []
     added_count = 0
     price_lookup_count = 0  # 실제 price lookup 횟수 추적
-    
+    skipped_price_lookup_due_to_full_position = 0
+    held_candidates_evaluated_for_add = 0
+
     # Price lookup 및 intent 생성 (상위 lookup_limit개만)
     for rank, (score, symbol, exchange, existing_price, entry_meta) in enumerate(candidates):
+        symbol_upper_for_capacity = str(symbol or "").upper().strip()
+        position_state = (entry_meta or {}).get("position_state")
+        if not position_state:
+            position_state = "HELD" if (current_position_symbols and symbol_upper_for_capacity in {str(s).upper().strip() for s in current_position_symbols}) else "NOT_HELD"
+        if position_state != "HELD" and not allow_new_symbols:
+            skipped_price_lookup_due_to_full_position += 1
+            track_skip(symbol, "max_positions_reached_new_symbol", {
+                "position_count": position_count,
+                "available_new_slots": available_new_slots,
+                "price_lookup_skipped": True,
+            })
+            logger.info(
+                "[US_ENTRY][SKIP] symbol=%s reason=max_positions_reached_new_symbol "
+                "position_count=%s available_new_slots=%s price_lookup_skipped=1",
+                symbol, position_count, available_new_slots,
+            )
+            continue
+        if position_state == "HELD":
+            held_candidates_evaluated_for_add += 1
         # Price lookup (필요한 경우)
         if existing_price is None:
             # Optimization: 상위 lookup_limit개만 price lookup (precomputed score가 있는 경우)
@@ -741,10 +789,10 @@ def generate_entry_intents(
             track_skip(symbol, "max_new_entries_reached", {"max_new_entries": max_new_entries})
             continue
 
-        position_state_for_order = (entry_meta or {}).get("position_state", "NOT_HELD")
+        position_state_for_order = position_state or (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
         if position_state_for_order == "HELD":
-            allow_add = os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
+            allow_add = allow_add_to_existing and os.getenv("US_ALLOW_ADD_TO_EXISTING", "1") in {"1", "true", "TRUE", "yes", "YES"}
             allow_avg_down = os.getenv("US_ALLOW_AVERAGING_DOWN", "0") in {"1", "true", "TRUE", "yes", "YES"}
             min_add_pnl = float(os.getenv("US_ADD_MIN_PNL_PCT", "0.0") or 0.0)
             if not allow_add:
@@ -1018,6 +1066,7 @@ def generate_entry_intents(
     )
     skipped_max_positions_reached = _sr("max_positions_reached") + _sr("max_positions_reached_new_symbol")
     skipped_insufficient_cash = _sr("insufficient_cash")
+    skipped_new_symbol_full_position = _sr("max_positions_reached_new_symbol")
 
     logger.info(
         "[US_ENTRY][SKIP_SUMMARY] "
@@ -1025,12 +1074,16 @@ def generate_entry_intents(
         "skipped_has_kis_position=%d skipped_has_position=%d skipped_pending_order=%d "
         "skipped_sold_today=%d skipped_score_missing=%d skipped_score_below_min=%d "
         "skipped_price_unavailable=%d skipped_price_nonpositive=%d skipped_sizing_blocked=%d "
-        "skipped_qty_zero=%d skipped_max_positions_reached=%d skipped_insufficient_cash=%d",
+        "skipped_qty_zero=%d skipped_max_positions_reached=%d skipped_insufficient_cash=%d "
+        "skipped_capacity_precheck=%d skipped_new_symbol_full_position=%d "
+        "skipped_price_lookup_due_to_full_position=%d held_candidates_evaluated_for_add=%d",
         total_processed, scored_count, added_count, len(intents),
         skipped_has_kis_position, skipped_has_position, skipped_pending_order,
         skipped_sold_today, skipped_score_missing, skipped_score_below_min,
         skipped_price_unavailable, skipped_price_nonpositive, skipped_sizing_blocked,
         skipped_qty_zero, skipped_max_positions_reached, skipped_insufficient_cash,
+        int(not allow_new_symbols), skipped_new_symbol_full_position,
+        skipped_price_lookup_due_to_full_position, held_candidates_evaluated_for_add,
     )
     logger.info("[US_ENTRY][INTENTS] count=%d", len(intents))
     

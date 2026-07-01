@@ -714,14 +714,45 @@ def run_trade_tick(
         except Exception:
             current_positions = []
     position_count = len(current_positions)
-    max_positions = int(os.getenv("US_MAX_POSITIONS", "30") or "30")
+    max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
     full_position = available_new_slots <= 0
-    if full_position:
-        logger.info(
-            "[US_ENTRY][CAPACITY_PRECHECK] entry_eval_status=SKIPPED_FULL_POSITION position_count=%d max_positions=%d available_new_slots=0",
-            position_count, max_positions,
+    allow_new_symbols = available_new_slots > 0
+    allow_add_to_existing = os.getenv("US_ALLOW_ADD_TO_EXISTING", "1").lower() in {"1", "true", "yes"}
+    if full_position and os.getenv("US_FULL_POSITION_ALLOW_ADD_TO_EXISTING", "1").lower() in {"1", "true", "yes"}:
+        allow_add_to_existing = True
+    logger.info(
+        "[US_CAPITAL][CAPACITY] position_count=%d max_positions=%d available_new_slots=%d "
+        "full_position=%d allow_new_symbols=%d allow_add_to_existing=%d",
+        position_count, max_positions, available_new_slots,
+        int(full_position), int(allow_new_symbols), int(allow_add_to_existing),
+    )
+
+    invested_market_value_usd = 0.0
+    for _p in current_positions:
+        try:
+            invested_market_value_usd += float(_p.get("market_value_usd") or _p.get("market_value") or _p.get("eval_amount_usd") or 0)
+        except (TypeError, ValueError):
+            pass
+    try:
+        from trader.us.capital_deployment import compute_deployment_metrics, decide_deployment_action
+        deployment_metrics = compute_deployment_metrics(
+            account_equity_usd=float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0),
+            invested_market_value_usd=invested_market_value_usd,
+            cash_usd=available_cash_usd,
         )
+        capital_deployment_action = decide_deployment_action(deployment_metrics, position_count=position_count, max_positions=max_positions)
+    except Exception as _deploy_exc:
+        logger.warning("[US_CAPITAL][DEPLOYMENT][WARN] error=%s", _deploy_exc)
+        deployment_metrics = {}
+        capital_deployment_action = "NORMAL"
+    if capital_deployment_action == "TRIM_ONLY":
+        allow_new_symbols = False
+        allow_add_to_existing = False
+    elif capital_deployment_action == "ADD_TO_EXISTING_ONLY":
+        allow_new_symbols = False
+    if full_position and deployment_metrics.get("underdeployed"):
+        logger.warning("[US_CAPITAL][WARN] US_CAPITAL_UNDERDEPLOYED_FULL_POSITION action=%s gross_exposure_pct=%.4f target_exposure_pct=%.4f", capital_deployment_action, float(deployment_metrics.get("gross_exposure_pct", 0) or 0), float(deployment_metrics.get("target_exposure_pct", 0) or 0))
 
     # ── EXIT position entry_price 표준화 ──────────────────────────────────────
     # 모든 보유 종목에 대해 exit 평가 전 entry_price를 resolve한다.
@@ -860,14 +891,6 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
-    elif full_position and os.getenv("ALLOW_ADD_BUY_WHEN_FULL", "false").lower() not in {"1", "true", "yes"}:
-        last_stage = "entry_capacity_guard"
-        entry_degraded = True
-        entry_degraded_reason = "SKIPPED_FULL_POSITION"
-        logger.info(
-            "[US_ENTRY][SKIP_SUMMARY] skipped_capacity_precheck=%d skipped_new_symbol_full_position=%d entry_eval_status=SKIPPED_FULL_POSITION",
-            1, max(0, 30),
-        )
     elif after_cutoff:
         last_stage = "entry_cutoff_guard"
         logger.info(
@@ -1136,6 +1159,9 @@ def run_trade_tick(
                                 now,
                                 watchlist_rows,
                                 current_position_symbols,
+                                allow_new_symbols=allow_new_symbols,
+                                allow_add_to_existing=allow_add_to_existing,
+                                available_new_slots=available_new_slots,
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
                     except concurrent.futures.TimeoutError:
@@ -1178,7 +1204,8 @@ def run_trade_tick(
             "[US_ORDER][ROUTE][EXIT_CONTINUE_AFTER_ENTRY_DEGRADED] exit_intents=%d reason=%s",
             len(exit_intents), entry_degraded_reason or "entry_degraded",
         )
-    logger.info("[US_ORDER][ROUTE][START] total_intents=%d", len(all_intents))
+    routing_intents_total = len(exit_intents) + len(entry_intents)
+    logger.info("[US_ORDER][ROUTE][START] total_intents=%d exit_intents=%d entry_intents=%d", routing_intents_total, len(exit_intents), len(entry_intents))
 
     # orders already contains immediately-routed exit orders.
 
@@ -1589,6 +1616,7 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
+        "routing_intents_total": routing_intents_total if 'routing_intents_total' in locals() else (exit_intents_count + entry_intents_count),
         "budget": budget,
         "run_mode": run_mode,
         "signal_only_mode": signal_only,
@@ -1606,6 +1634,17 @@ def run_trade_tick(
         "entry_watchlist_source": entry_watchlist_source,
         "exit_routed_before_entry": exit_routed_before_entry,
         "exit_routed_after_entry_degraded": int(exit_routed_after_entry_degraded),
+        **deployment_metrics,
+        "capital_deployment_action": capital_deployment_action,
+        "position_count": position_count,
+        "max_positions": max_positions,
+        "available_new_slots": available_new_slots,
+        "avg_position_value_usd": (invested_market_value_usd / position_count) if position_count > 0 else 0.0,
+        "positions_below_target_weight": 0,
+        "add_to_existing_candidates": 0,
+        "new_symbol_slots_available": available_new_slots,
+        "full_position": int(full_position),
+        "warnings": ["US_CAPITAL_UNDERDEPLOYED_FULL_POSITION"] if (full_position and deployment_metrics.get("underdeployed")) else [],
         "entry_intents": len(entry_intents),
         "orders_sent": orders_sent,  # ack + dry_run
         "fills_count": len(fills_today),

@@ -24,7 +24,8 @@ import sys
 import time as time_mod
 import signal
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime as dt, timedelta
+datetime = dt  # backward-compatible module-level name; avoid function-local import shadowing
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -432,9 +433,8 @@ def run_trade_session(
             _delay_seconds: int = 0
             try:
                 if _schedule_expected_et:
-                    from datetime import datetime
-                    _exp = datetime.fromisoformat(_schedule_expected_et)
-                    _act = datetime.fromisoformat(_actual_start_et)
+                    _exp = dt.fromisoformat(_schedule_expected_et)
+                    _act = dt.fromisoformat(_actual_start_et)
                     _delay_seconds = max(0, int((_act - _exp).total_seconds()))
             except Exception:
                 pass
@@ -1235,7 +1235,7 @@ def run_trade_session(
             "wall_elapsed_sec": round(session_wall_elapsed_sec, 2),
             "session_started_at_utc": _prov.get("started_at_utc", ""),
             "session_ended_at_utc": _prov.get("ended_at_utc", ""),
-            "report_recorded_at_utc": datetime.utcnow().isoformat() + "Z",
+            "report_recorded_at_utc": dt.utcnow().isoformat() + "Z",
             # Explanation statistics (total 기준)
             "buy_decisions": total_buy_decisions,
             "sell_decisions": total_sell_decisions,

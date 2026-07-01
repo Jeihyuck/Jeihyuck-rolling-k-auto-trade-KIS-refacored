@@ -7,7 +7,7 @@ Features:
 - session 지원 (am, afternoon, close)
 - trade_date: NY 기준 trade_date 자동 계산 또는 force_now 사용
 - stale report 방지: force_now 사용 시 해당 날짜의 report 생성
-- DB 기반 metrics: orders, fills, positions, watchlist score contract
+- DB 기반 metrics: US order/fill/position/watchlist score contract
 - fresh report guarantee: workflow 종료 후 새 report 생성 보장
 """
 from __future__ import annotations
@@ -165,6 +165,27 @@ def run_daily_report(
         "sell_notional_total": 0.0,
         "actual_new_positions": 0,
         "open_position_count": 0,
+        "account_equity_krw": 0.0,
+        "account_equity_usd": 0.0,
+        "invested_market_value_usd": 0.0,
+        "cash_usd": 0.0,
+        "gross_exposure_pct": 0.0,
+        "target_exposure_pct": 0.0,
+        "max_exposure_pct": 0.0,
+        "min_cash_buffer_pct": 0.0,
+        "deployment_gap_usd": 0.0,
+        "deployable_cash_usd": 0.0,
+        "allowed_new_buy_usd": 0.0,
+        "capital_deployment_action": "NORMAL",
+        "position_count": 0,
+        "max_positions": int(os.getenv("US_MAX_POSITIONS", "35") or 35),
+        "available_new_slots": 0,
+        "avg_position_value_usd": 0.0,
+        "positions_below_target_weight": 0,
+        "add_to_existing_candidates": 0,
+        "new_symbol_slots_available": 0,
+        "underdeployed": False,
+        "full_position": False,
         "orders_disabled": 0,
         "orders_signal_only": 0,
         "fills": 0,
@@ -221,12 +242,13 @@ def run_daily_report(
         # DB queries
         try:
             try:
-                from trader.us.db.repos import load_locked_us_watchlist, load_positions, load_us_prep_status
+                from trader.us.db.repos import load_locked_us_watchlist, load_positions, load_us_prep_status, load_us_daily_orders_for_report
             except Exception as exc:
                 logger.warning("[US_DAILY_REPORT][WARN] optional repo imports failed: %s", exc)
                 load_locked_us_watchlist = lambda _td: []
                 load_positions = lambda as_of=None: []
                 load_us_prep_status = lambda _td: None
+                load_us_daily_orders_for_report = lambda _td: []
             try:
                 from trader.us.score_columns import collect_us_score_nonzero_stats
             except Exception:
@@ -326,7 +348,27 @@ def run_daily_report(
             try:
                 positions = load_positions(as_of=trade_date)
                 report["positions"] = len(positions)
+                report["position_count"] = len(positions)
                 report["open_position_count"] = len(positions)
+                report["available_new_slots"] = max(0, int(report.get("max_positions", 35) or 35) - len(positions))
+                report["new_symbol_slots_available"] = report["available_new_slots"]
+                report["full_position"] = report["available_new_slots"] <= 0
+                invested = 0.0
+                for pos in positions:
+                    try:
+                        invested += float(pos.get("market_value_usd") or pos.get("market_value") or pos.get("eval_amount_usd") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    from trader.us.capital_deployment import compute_deployment_metrics, decide_deployment_action
+                    metrics = compute_deployment_metrics(account_equity_usd=float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0), invested_market_value_usd=invested, cash_usd=None)
+                    report.update(metrics)
+                    report["capital_deployment_action"] = decide_deployment_action(metrics, position_count=len(positions), max_positions=int(report.get("max_positions", 35) or 35))
+                    report["avg_position_value_usd"] = invested / len(positions) if positions else 0.0
+                    if report["full_position"] and metrics.get("underdeployed"):
+                        report["warnings"].append("US_CAPITAL_UNDERDEPLOYED_FULL_POSITION")
+                except Exception as exc:
+                    logger.warning("[US_DAILY_REPORT][CAPITAL][WARN] %s", exc)
             except Exception as exc:
                 report["warnings"].append(f"positions_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] positions load failed: %s", exc)
@@ -336,7 +378,7 @@ def run_daily_report(
             balance_confirmed = load_balance_confirmed_count(trade_date)
             router_summary = load_router_summary_ack_count(trade_date, session=session)
             reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)
-            # Canonical daily counts come from orders for submitted/ACK and unique fills for executions.
+            # Canonical daily counts come from US order rows for submitted/ACK and unique fills for executions.
             report["orders_ack"] = db_ack
             report["orders_ack_total"] = db_ack
             report["fill_api_count"] = reconciled["fill_api_count"]
@@ -434,6 +476,23 @@ def run_daily_report(
         f"| sell_notional_total | {report.get('sell_notional_total', 0)} |",
         f"| actual_new_positions | {report.get('actual_new_positions', 0)} |",
         f"| open_position_count | {report.get('open_position_count', 0)} |",
+        f"| account_equity_krw | {report.get('account_equity_krw', 0)} |",
+        f"| account_equity_usd | {report.get('account_equity_usd', 0)} |",
+        f"| invested_market_value_usd | {report.get('invested_market_value_usd', 0)} |",
+        f"| cash_usd | {report.get('cash_usd', 0)} |",
+        f"| gross_exposure_pct | {report.get('gross_exposure_pct', 0)} |",
+        f"| target_exposure_pct | {report.get('target_exposure_pct', 0)} |",
+        f"| max_exposure_pct | {report.get('max_exposure_pct', 0)} |",
+        f"| min_cash_buffer_pct | {report.get('min_cash_buffer_pct', 0)} |",
+        f"| deployment_gap_usd | {report.get('deployment_gap_usd', 0)} |",
+        f"| deployable_cash_usd | {report.get('deployable_cash_usd', 0)} |",
+        f"| allowed_new_buy_usd | {report.get('allowed_new_buy_usd', 0)} |",
+        f"| capital_deployment_action | {report.get('capital_deployment_action', '')} |",
+        f"| max_positions | {report.get('max_positions', 0)} |",
+        f"| available_new_slots | {report.get('available_new_slots', 0)} |",
+        f"| avg_position_value_usd | {report.get('avg_position_value_usd', 0)} |",
+        f"| underdeployed | {report.get('underdeployed', False)} |",
+        f"| full_position | {report.get('full_position', False)} |",
         f"| orders_ack | {report['orders_ack']} |",
         f"| orders_dry_run | {report['orders_dry_run']} |",
         f"| orders_blocked | {report['orders_blocked']} |",
@@ -554,38 +613,13 @@ def _ny_date_bounds_utc(trade_date: str) -> tuple[str, str]:
 
 
 def load_us_orders(trade_date: str) -> list[dict]:
-    """Load US orders by trade_date, then NY date-range timestamp fallbacks."""
-    from trader.us.db.repos import _get_engine_or_none
-    engine = _get_engine_or_none()
-    if engine is None:
-        return []
-    start_utc, end_utc = _ny_date_bounds_utc(trade_date)
-    available_cols: set[str] = set()
-    try:
-        rows = _read_autocommit(engine, "SELECT column_name FROM information_schema.columns WHERE table_name = :table", {"table": "us_orders"})
-        available_cols = {str(r.get("column_name")) for r in rows}
-    except Exception as exc:
-        logger.warning("[US_ORDERS][SCHEMA][WARN] err=%s", exc)
-    ts_candidates = [c for c in ("created_at", "updated_at", "ts", "ordered_at", "submitted_at", "acked_at") if c in available_cols]
-    if not ts_candidates:
-        ts_candidates = ["created_at", "updated_at", "submitted_at", "acked_at"]
-    logger.info("[US_ORDERS][SCHEMA] available_ts_columns=%s", ts_candidates)
-    queries = [("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}, "trade_date")]
-    queries.extend((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}, col) for col in ts_candidates)
-    errors: list[str] = []
-    for sql, params, ts_column in queries:
-        try:
-            rows = _read_autocommit(engine, sql, params)
-            logger.info("[US_ORDERS][LOAD] ts_column=%s rows=%s", ts_column, len(rows))
-            if rows:
-                return rows
-        except Exception as exc:
-            errors.append(str(exc))
-            logger.warning("[US_ORDERS][LOAD][FALLBACK_FAIL] sql=%s err=%s", sql, exc)
-    if errors:
-        logger.warning("[US_ORDERS][LOAD][EMPTY] reason=ORDER_SOURCE_EMPTY attempted=%d", len(queries))
-    return []
+    """Compatibility wrapper for US-only daily order report rows.
 
+    Kept for older callers, but the implementation delegates to the US repo
+    wrapper and does not query KR/common order tables from the report runner.
+    """
+    from trader.us.db.repos import load_us_daily_orders_for_report
+    return load_us_daily_orders_for_report(trade_date)
 
 def load_us_fills_count(trade_date: str) -> int:
     """Count fill API-confirmed fills from fills/us_fills tables, not sold-symbol proxy."""
