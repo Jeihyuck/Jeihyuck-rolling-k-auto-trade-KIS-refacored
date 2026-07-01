@@ -8847,7 +8847,8 @@ class PB1Engine:
         phase = str(getattr(self, "phase", "") or "").lower()
         if window in {"morning", "am"}:
             return "PB1-AM"
-        if window in {"afternoon", "pm"}:
+        session_kind = str(os.getenv("PB1_SESSION") or os.getenv("PB1_SESSION_KIND") or "").strip().lower()
+        if window in {"afternoon", "pm"} or (window == "day" and session_kind in {"afternoon", "pm"}):
             return "PB1-PM"
         if window == "close" or phase == "close":
             return "PB1-CLOSE"
