@@ -51,7 +51,7 @@ def _report_provenance(session: str | None) -> dict:
         "session": session,
         "run_id": run_id,
         "session_id": f"{session or 'daily'}-{run_id}",
-        "source_log_file": os.getenv("US_SOURCE_LOG_FILE", ""),
+        "source_log_file": os.getenv("US_SOURCE_LOG_FILE", "runtime/wsl-us-trader.log"),
         "started_at_utc": os.getenv("US_STARTED_AT_UTC", now_utc),
         "started_at_et": os.getenv("US_STARTED_AT_ET", now_et),
         "started_at_kst": os.getenv("US_STARTED_AT_KST", now_kst),
@@ -96,6 +96,14 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
     nonzero = [v for v in sources.values() if v > 0]
     if nonzero and len(set(sources.values())) > 1:
         warnings.append("SOURCE_MISMATCH")
+        if sources["db_orders"] > 0 and sources["router_summary"] == 0:
+            warnings.append("SOURCE_MISMATCH_DB_ORDER_EXISTS_ROUTER_SUMMARY_MISSING")
+        if sources["fills"] > 0 and sources["balance_confirmed"] == 0:
+            warnings.append("SOURCE_MISMATCH_FILLS_EXIST_BALANCE_CONFIRMATION_MISSING")
+        if sources["db_orders"] > sources["fills"]:
+            warnings.append("SOURCE_MISMATCH_ACK_EXISTS_FILL_MISSING")
+        if sources["router_summary"] == 0 and sources["db_orders"] > 0:
+            warnings.append("SOURCE_MISMATCH_SESSION_SUMMARY_OVERWRITTEN_OR_MISSING")
     if sources["fills"] < orders_ack:
         warnings.append("FILL_API_LESS_THAN_ACK")
     return {
@@ -151,6 +159,12 @@ def run_daily_report(
         "orders_dry_run": 0,
         "orders_blocked": 0,
         "orders_rejected": 0,
+        "orders_rejected_total": 0,
+        "orders_unresolved_total": 0,
+        "buy_notional_total": 0.0,
+        "sell_notional_total": 0.0,
+        "actual_new_positions": 0,
+        "open_position_count": 0,
         "orders_disabled": 0,
         "orders_signal_only": 0,
         "fills": 0,
@@ -280,6 +294,9 @@ def run_daily_report(
                             report["orders_blocked"] += 1
                         elif status == "REJECTED":
                             report["orders_rejected"] += 1
+                            report["orders_rejected_total"] += 1
+                        elif status in {"ACK_UNRESOLVED", "ACK_STALE_UNRESOLVED", "ACK_PENDING_RECONCILE"}:
+                            report["orders_unresolved_total"] += 1
                         elif status == "ORDER_DISABLED":
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":
@@ -309,6 +326,7 @@ def run_daily_report(
             try:
                 positions = load_positions(as_of=trade_date)
                 report["positions"] = len(positions)
+                report["open_position_count"] = len(positions)
             except Exception as exc:
                 report["warnings"].append(f"positions_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] positions load failed: %s", exc)
@@ -386,6 +404,8 @@ def run_daily_report(
         md_lines.append(f"**Session**: {session.upper()}")
         md_lines.append("")
     
+    report["status"] = "OK_WITH_RECONCILE_WARNINGS" if any(str(w).startswith("SOURCE_MISMATCH") or "UNRESOLVED" in str(w) for w in report.get("warnings", [])) or int(report.get("orders_unresolved_total", 0) or 0) > 0 else ("OK" if not report["errors"] else "ERROR")
+
     md_lines.extend([
         "## Runtime Metadata",
         "",
@@ -405,6 +425,15 @@ def run_daily_report(
         "",
         "| Metric | Value |",
         "|---|---|",
+        f"| report_status | {report.get('status')} |",
+        f"| orders_submitted_total | {report.get('orders_submitted_total', 0)} |",
+        f"| orders_ack_total | {report.get('orders_ack_total', 0)} |",
+        f"| orders_rejected_total | {report.get('orders_rejected_total', 0)} |",
+        f"| orders_unresolved_total | {report.get('orders_unresolved_total', 0)} |",
+        f"| buy_notional_total | {report.get('buy_notional_total', 0)} |",
+        f"| sell_notional_total | {report.get('sell_notional_total', 0)} |",
+        f"| actual_new_positions | {report.get('actual_new_positions', 0)} |",
+        f"| open_position_count | {report.get('open_position_count', 0)} |",
         f"| orders_ack | {report['orders_ack']} |",
         f"| orders_dry_run | {report['orders_dry_run']} |",
         f"| orders_blocked | {report['orders_blocked']} |",
@@ -500,7 +529,7 @@ def run_daily_report(
         trade_date, session or "N/A", report["orders_ack"]
     )
     
-    return {"status": "OK" if not report["errors"] else "ERROR", "report": report}
+    return {"status": report.get("status", "OK" if not report["errors"] else "ERROR"), "report": report}
 
 
 def _dict_rows(result) -> list[dict]:

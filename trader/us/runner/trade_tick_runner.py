@@ -714,6 +714,14 @@ def run_trade_tick(
         except Exception:
             current_positions = []
     position_count = len(current_positions)
+    max_positions = int(os.getenv("US_MAX_POSITIONS", "30") or "30")
+    available_new_slots = max(0, max_positions - position_count)
+    full_position = available_new_slots <= 0
+    if full_position:
+        logger.info(
+            "[US_ENTRY][CAPACITY_PRECHECK] entry_eval_status=SKIPPED_FULL_POSITION position_count=%d max_positions=%d available_new_slots=0",
+            position_count, max_positions,
+        )
 
     # ── EXIT position entry_price 표준화 ──────────────────────────────────────
     # 모든 보유 종목에 대해 exit 평가 전 entry_price를 resolve한다.
@@ -780,21 +788,21 @@ def run_trade_tick(
     exit_routed_after_entry_degraded = False
     after_cutoff = _entry_cutoff_passed(now)
 
-    # fills contract error 발생 시 신규 BUY 차단 및 즉시 ERROR 반환
+    # fills contract/temp error is degraded: block duplicate-sensitive BUYs, keep session alive.
     if fills_contract_error and os.getenv("US_REQUIRE_FILL_CONFIRM", "1") == "1":
         last_stage = "fills_contract_guard"
-        logger.error(
-            "[US_ENTRY][BLOCK] reason=fills_contract_error require_fill_confirm=1"
+        logger.warning(
+            "[US_ENTRY][BLOCK] reason=TEMP_FILLS_UNAVAILABLE require_fill_confirm=1 continue_session=1"
         )
-        logger.error(
-            "[US_ORDER][ROUTE][SKIP] reason=fills_contract_error"
+        logger.warning(
+            "[US_ORDER][ROUTE][SKIP] reason=TEMP_FILLS_UNAVAILABLE"
         )
-        logger.error(
-            "[US_TICK][DONE] session=%s status=ERROR reason=fills_contract_error", session
+        logger.warning(
+            "[US_TICK][DONE] session=%s status=DEGRADED_FILLS_UNAVAILABLE reason=TEMP_FILLS_UNAVAILABLE", session
         )
         return {
-            "status": "FAILED",
-            "reason": "fills_contract_error",
+            "status": "DEGRADED_FILLS_UNAVAILABLE",
+            "reason": "TEMP_FILLS_UNAVAILABLE",
             "session": session,
             "orders": [],
             "ack": 0,
@@ -810,9 +818,9 @@ def run_trade_tick(
             "trade_date": trade_date,
             "prep_status": "UNKNOWN",
             "locked_watchlist_count": 0,
-            "entry_eval_status": "BLOCKED",
-            "entry_error_type": "fills_contract_error",
-            "entry_error_message": "fills_contract_error",
+            "entry_eval_status": "DEGRADED_FILLS_UNAVAILABLE",
+            "entry_error_type": "TEMP_FILLS_UNAVAILABLE",
+            "entry_error_message": "temporary fills unavailable; duplicate-sensitive buys blocked",
             "entry_intents": 0,
             "orders_sent": 0,
             "fills": len(fills_today),
@@ -822,11 +830,11 @@ def run_trade_tick(
         }
     elif fills_temp_error and real_order_mode and os.getenv("US_REQUIRE_FILL_CONFIRM", "1") == "1":
         last_stage = "fills_temp_guard"
-        logger.error("[US_ENTRY][BLOCK] reason=fills_temp_error_real_order")
-        logger.error("[US_TICK][DONE] session=%s status=FAILED reason=fills_temp_error", session)
+        logger.warning("[US_ENTRY][BLOCK] reason=TEMP_FILLS_UNAVAILABLE")
+        logger.warning("[US_TICK][DONE] session=%s status=DEGRADED_FILLS_UNAVAILABLE reason=TEMP_FILLS_UNAVAILABLE", session)
         return {
-            "status": "FAILED",
-            "reason": "fills_temp_error",
+            "status": "DEGRADED_FILLS_UNAVAILABLE",
+            "reason": "TEMP_FILLS_UNAVAILABLE",
             "session": session,
             "orders": [],
             "ack": 0,
@@ -842,9 +850,9 @@ def run_trade_tick(
             "trade_date": trade_date,
             "prep_status": "UNKNOWN",
             "locked_watchlist_count": 0,
-            "entry_eval_status": "BLOCKED",
-            "entry_error_type": "fills_temp_error",
-            "entry_error_message": "fills_temp_error",
+            "entry_eval_status": "DEGRADED_FILLS_UNAVAILABLE",
+            "entry_error_type": "TEMP_FILLS_UNAVAILABLE",
+            "entry_error_message": "temporary fills unavailable; duplicate-sensitive buys blocked",
             "entry_intents": 0,
             "orders_sent": 0,
             "fills": len(fills_today),
@@ -852,6 +860,14 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
+    elif full_position and os.getenv("ALLOW_ADD_BUY_WHEN_FULL", "false").lower() not in {"1", "true", "yes"}:
+        last_stage = "entry_capacity_guard"
+        entry_degraded = True
+        entry_degraded_reason = "SKIPPED_FULL_POSITION"
+        logger.info(
+            "[US_ENTRY][SKIP_SUMMARY] skipped_capacity_precheck=%d skipped_new_symbol_full_position=%d entry_eval_status=SKIPPED_FULL_POSITION",
+            1, max(0, 30),
+        )
     elif after_cutoff:
         last_stage = "entry_cutoff_guard"
         logger.info(
