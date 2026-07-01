@@ -137,16 +137,19 @@ def check_position_weight(
     notional_usd: float,
     total_portfolio_usd: float,
     symbol: str = "",
+    current_position_market_value_usd: float = 0.0,
 ) -> None:
     if total_portfolio_usd <= 0:
         return
-    weight = notional_usd / total_portfolio_usd
-    limit = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10"))
+    projected_position_value = max(0.0, current_position_market_value_usd) + notional_usd
+    weight = projected_position_value / total_portfolio_usd
+    limit = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
     if weight > limit:
         _block(
             "position_weight_exceeded",
             symbol=symbol,
             weight=round(weight, 4),
+            projected_position_value=round(projected_position_value, 4),
             limit=limit,
         )
 
@@ -430,7 +433,38 @@ def assert_order_allowed(
                 symbol=symbol,
                 reason="max_positions_reached_new_symbol",
             )
-        check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol)
+        capital_meta = (intent.get("meta") or {}).get("capital_deployment") or {}
+        current_position_market_value_usd = 0.0
+        for _value in (
+            intent.get("current_position_market_value_usd"),
+            capital_meta.get("current_position_market_value_usd"),
+            intent.get("current_market_value_usd"),
+            intent.get("market_value_usd"),
+        ):
+            try:
+                if _value is not None:
+                    current_position_market_value_usd = float(_value or 0.0)
+                    break
+            except (TypeError, ValueError):
+                pass
+        projected_weight = intent.get("projected_weight")
+        if projected_weight is None:
+            projected_weight = capital_meta.get("projected_weight")
+        if projected_weight is not None:
+            try:
+                projected_weight_f = float(projected_weight)
+                limit = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
+                if projected_weight_f > limit:
+                    _block(
+                        "position_weight_exceeded",
+                        symbol=symbol,
+                        weight=round(projected_weight_f, 4),
+                        projected_weight=round(projected_weight_f, 4),
+                        limit=limit,
+                    )
+            except (TypeError, ValueError):
+                pass
+        check_position_weight(notional_usd, total_portfolio_usd, symbol=symbol, current_position_market_value_usd=current_position_market_value_usd)
         check_cash_buffer(available_cash_usd, notional_usd, symbol=symbol)
 
         check_same_day_rebuy(symbol, side)

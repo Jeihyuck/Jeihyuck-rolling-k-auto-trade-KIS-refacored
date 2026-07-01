@@ -24,7 +24,8 @@ import sys
 import time as time_mod
 import signal
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime as dt, timedelta
+datetime = dt  # backward-compatible module-level name; avoid function-local import shadowing
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -366,6 +367,7 @@ def run_trade_session(
         session, env, offline, max_minutes, interval_sec,
     )
     tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
+    tick_timeout_fatal_consecutive = int(os.getenv("US_TICK_TIMEOUT_FATAL_CONSECUTIVE", "3"))
     now_for_date = _now_ny(force_now)
     trade_date = now_for_date.strftime("%Y-%m-%d")
     try:
@@ -431,9 +433,8 @@ def run_trade_session(
             _delay_seconds: int = 0
             try:
                 if _schedule_expected_et:
-                    from datetime import datetime
-                    _exp = datetime.fromisoformat(_schedule_expected_et)
-                    _act = datetime.fromisoformat(_actual_start_et)
+                    _exp = dt.fromisoformat(_schedule_expected_et)
+                    _act = dt.fromisoformat(_actual_start_et)
                     _delay_seconds = max(0, int((_act - _exp).total_seconds()))
             except Exception:
                 pass
@@ -666,6 +667,9 @@ def run_trade_session(
         tick_count = 0
         warn_count = 0
         consecutive_errors = 0
+        consecutive_tick_timeouts = 0
+        root_cause = ""
+        surface_reason = ""
         results: list[dict] = []
         total_orders_blocked = 0
         block_reasons_total: dict[str, int] = {}
@@ -725,6 +729,7 @@ def run_trade_session(
                 )
 
                 try:
+                    write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         fut = pool.submit(
                             run_trade_tick,
@@ -741,6 +746,8 @@ def run_trade_session(
                         tick_result = fut.result(timeout=tick_timeout_sec)
                     results.append(tick_result)
                     final_tick = tick_result
+                    consecutive_tick_timeouts = 0
+                    write_heartbeat_file(session, run_id, tick_count, phase="TICK_DONE", status=tick_result.get("status"), reason=tick_result.get("reason", ""))
                     temp_error_count += int(tick_result.get("temp_error_count", 0) or 0)
                     temp_recovered_count += int(tick_result.get("temp_recovered_count", 0) or 0)
                     last_stage = tick_result.get("last_stage", last_stage)
@@ -756,15 +763,15 @@ def run_trade_session(
                     classification = classify_tick_status(tick_result)
 
                     if tick_result.get("reason") == "fills_contract_error":
-                        # compatibility marker for legacy contract tests: "status": "ERROR"
-                        final_status = "FAILED"
-                        final_reason = "fills_contract_error"
-                        logger.error(
-                            "[US_SESSION][END] session=%s reason=fills_contract_error tick=%d",
-                            session,
-                            tick_count,
+                        # Temporary KIS/fills errors are degraded and must not kill the session.
+                        final_tick["status"] = "DEGRADED_FILLS_UNAVAILABLE"
+                        final_tick["reason"] = "TEMP_FILLS_UNAVAILABLE"
+                        warn_count += 1
+                        logger.warning(
+                            "[US_SESSION][FILLS_DEGRADED] session=%s tick=%d reason=TEMP_FILLS_UNAVAILABLE continue=1",
+                            session, tick_count,
                         )
-                        break
+
 
                     classify_symbols = []
                     for key in ("no_balance_sell_symbols", "recent_sell_ack_symbols", "sell_reject_symbols", "blocked_sell_symbols"):
@@ -800,15 +807,30 @@ def run_trade_session(
                         logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d", tick_count, tick_status, consecutive_errors)
 
                 except concurrent.futures.TimeoutError:
-                    final_status = "FAILED"
-                    final_reason = "tick_timeout"
                     last_stage = f"tick_{tick_count}_timeout"
-                    logger.error(
-                        "[US_TICK][DONE] status=FAILED reason=tick_timeout timeout_sec=%d",
-                        tick_timeout_sec,
+                    root_cause = root_cause or "tick_timeout"
+                    consecutive_tick_timeouts += 1
+                    warn_count += 1
+                    timeout_status = "WARN_TICK_TIMEOUT" if consecutive_tick_timeouts == 1 else f"WARN_CONSECUTIVE_TICK_TIMEOUT_{consecutive_tick_timeouts}"
+                    results.append({
+                        "status": timeout_status,
+                        "reason": "tick_timeout",
+                        "root_cause": "tick_timeout",
+                        "timeout_sec": tick_timeout_sec,
+                        "tick": tick_count,
+                    })
+                    final_tick = results[-1]
+                    write_heartbeat_file(session, run_id, tick_count, phase="TICK_WARN_TIMEOUT", status=timeout_status, timeout_sec=tick_timeout_sec, consecutive_tick_timeouts=consecutive_tick_timeouts)
+                    logger.warning(
+                        "[US_TICK][TIMEOUT][WARN] status=%s reason=tick_timeout timeout_sec=%d consecutive=%d fatal_after=%d",
+                        timeout_status, tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_fatal_consecutive,
                     )
-                    logger.error("[US_SESSION][END] session=%s reason=tick_timeout", session)
-                    break
+                    if consecutive_tick_timeouts >= tick_timeout_fatal_consecutive:
+                        final_status = "FAILED"
+                        final_reason = "FAILED_CONSECUTIVE_TICK_TIMEOUT"
+                        logger.error("[US_SESSION][END] session=%s reason=FAILED_CONSECUTIVE_TICK_TIMEOUT consecutive=%d", session, consecutive_tick_timeouts)
+                        break
+                    continue
                 except Exception as exc:
                     consecutive_errors += 1
                     warn_count += 1
@@ -920,8 +942,13 @@ def run_trade_session(
         
         expected_to_trade = not (force_now or max_ticks > 0 or offline or resolved_signal_only)
         if expected_to_trade and tick_count < expected_min_ticks and final_reason not in {"market_skip", "max_ticks", "force_now_single_tick", "graceful_shutdown"}:
-            final_status = "FAILED"
-            final_reason = "early_termination_min_ticks_not_met"
+            if final_status == "FAILED":
+                surface_reason = "early_termination_min_ticks_not_met"
+                logger.error("[US_SESSION][EARLY_TERMINATION] root_cause=%s surface_reason=%s ticks=%d expected_min_ticks=%d", root_cause or final_reason, surface_reason, tick_count, expected_min_ticks)
+            else:
+                warn_count += 1
+                surface_reason = "early_termination_min_ticks_not_met"
+                logger.warning("[US_SESSION][EARLY_TERMINATION][WARN_ONLY] root_cause=%s surface_reason=%s ticks=%d expected_min_ticks=%d", root_cause or final_reason, surface_reason, tick_count, expected_min_ticks)
         else:
             logger.info("[US_SESSION][LIVENESS_CHECK] expected_min_ticks=%d actual_ticks=%d result=OK reason=%s", expected_min_ticks, tick_count, final_reason)
 
@@ -1194,7 +1221,9 @@ def run_trade_session(
             "liveness_status": "FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK",
             "last_liveness_event": _last_liveness_event,
             "has_session_finally": True,
-            "probable_liveness_cause": "early_end_or_external_kill" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "",
+            "probable_liveness_cause": (root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "",
+            "root_cause": root_cause,
+            "surface_reason": surface_reason,
             "received_signal": _signal_name(_received_signal),
             "exit_code": _exit_code,
             "ticks_total": tick_count,
@@ -1204,6 +1233,9 @@ def run_trade_session(
             "force_now": force_now or "",
             "offline": offline,
             "wall_elapsed_sec": round(session_wall_elapsed_sec, 2),
+            "session_started_at_utc": _prov.get("started_at_utc", ""),
+            "session_ended_at_utc": _prov.get("ended_at_utc", ""),
+            "report_recorded_at_utc": dt.utcnow().isoformat() + "Z",
             # Explanation statistics (total 기준)
             "buy_decisions": total_buy_decisions,
             "sell_decisions": total_sell_decisions,
@@ -1286,7 +1318,15 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        try:
+            write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="SESSION_FINALLY", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
+        except Exception:
+            pass
         release_us_session_running_lock(trade_date, session, run_id=run_id)
+        try:
+            write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="LOCK_RELEASED", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
+        except Exception:
+            pass
 def main() -> None:
     from trader.us.utils.logging_utils import setup_us_logging
     setup_us_logging()

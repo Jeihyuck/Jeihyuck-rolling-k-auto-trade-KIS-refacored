@@ -54,6 +54,10 @@ class USPb1Engine:
         now: datetime | None = None,
         watchlist_entries: list[dict] | None = None,
         current_position_symbols: set[str] | None = None,
+        *,
+        allow_new_symbols: bool = True,
+        allow_add_to_existing: bool = True,
+        available_new_slots: int | None = None,
     ) -> list[dict]:
         """진입 후보 평가.
 
@@ -103,4 +107,7 @@ class USPb1Engine:
             now=now,
             watchlist_entries=watchlist_entries,
             current_position_symbols=current_position_symbols,
+            allow_new_symbols=allow_new_symbols,
+            allow_add_to_existing=allow_add_to_existing,
+            available_new_slots=available_new_slots,
         )

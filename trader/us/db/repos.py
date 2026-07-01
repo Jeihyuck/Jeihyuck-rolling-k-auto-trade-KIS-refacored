@@ -2551,3 +2551,43 @@ def find_recent_sell_ack(symbol: str, trade_date: str | None = None) -> dict | N
     except Exception as exc:
         logger.error("[US_ORDERS][RECENT_SELL_ACK][ERROR] %s", exc)
         return None
+
+
+def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
+    """Load US-only order rows for daily report from us_orders.
+
+    Uses trade_date first, then NY-day timestamp fallbacks. US reporting must
+    not read KR/common order tables.
+    """
+    engine = _get_engine_or_none()
+    if engine is None:
+        return []
+    from sqlalchemy import text
+    from datetime import date, datetime, time, timedelta
+    from zoneinfo import ZoneInfo
+
+    def _rows(result) -> list[dict]:
+        if hasattr(result, "mappings"):
+            return [dict(r) for r in result.mappings().all()]
+        return [dict(r) for r in result]
+
+    ny = ZoneInfo("America/New_York")
+    utc = ZoneInfo("UTC")
+    d = date.fromisoformat(trade_date)
+    start_utc = datetime.combine(d, time.min, tzinfo=ny).astimezone(utc).isoformat()
+    end_utc = datetime.combine(d + timedelta(days=1), time.min, tzinfo=ny).astimezone(utc).isoformat()
+    queries = [("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date})]
+    for col in ("created_at", "updated_at", "submitted_at", "acked_at"):
+        queries.append((f"SELECT * FROM us_orders WHERE {col} >= :start_ts AND {col} < :end_ts", {"start_ts": start_utc, "end_ts": end_utc}))
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            for sql, params in queries:
+                try:
+                    rows = _rows(conn.execute(text(sql), params))
+                    if rows:
+                        return rows
+                except Exception:
+                    continue
+    except Exception:
+        logger.exception("[US_ORDERS][REPORT_LOAD][WARN] trade_date=%s", trade_date)
+    return []

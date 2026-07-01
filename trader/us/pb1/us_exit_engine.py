@@ -83,6 +83,15 @@ def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
 
 
+def _canonical_exit_reason(exit_type: str) -> tuple[str, str]:
+    exit_reason_detail = exit_type
+    if exit_type == EXIT_PROFIT_TRAILING_STOP:
+        return "trailing_stop", exit_reason_detail
+    if exit_type == EXIT_HARD_STOP_LOSS:
+        return "hard_stop", exit_reason_detail
+    return exit_type, exit_reason_detail
+
+
 def evaluate_exit(
     position: dict,
     current_price: float,
@@ -412,9 +421,11 @@ def _make_exit_intent(
     key_raw = f"{symbol}_{trade_date_key}_SELL_{exit_type}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
+    exit_reason, exit_reason_detail = _canonical_exit_reason(exit_type)
+
     logger.info(
-        "[US_EXIT][SIGNAL] symbol=%s exit_type=%s reason=%s pnl_pct=%.3f",
-        symbol, exit_type, reason, pnl_pct,
+        "[US_EXIT][SIGNAL] symbol=%s exit_type=%s exit_reason=%s exit_reason_detail=%s reason=%s pnl_pct=%.3f",
+        symbol, exit_type, exit_reason, exit_reason_detail, reason, pnl_pct,
     )
 
     _holding = holding_qty or qty
@@ -443,6 +454,9 @@ def _make_exit_intent(
         "limit_price": round(current_price * 0.998, 4),  # 0.2% 슬리피지 허용
         "notional_usd": round(current_price * qty, 4),
         "exit_type": exit_type,
+        "exit_reason": exit_reason,
+        "exit_reason_detail": exit_reason_detail,
+        "exit_policy": "US_SWING_DEFAULT",
         "reason": reason,
         "unrealized_pnl_usd": round(unrealized_pnl_usd, 4),
         "unrealized_pnl_pct": round(pnl_pct, 4),
@@ -456,6 +470,9 @@ def _make_exit_intent(
             "qty_source": "orderable_qty_clamp" if qty < _holding else "holding_qty",
             "sell_reason": reason,
             "stop_type": stop_type,
+            "exit_reason": exit_reason,
+            "exit_reason_detail": exit_reason_detail,
+            "exit_policy": "US_SWING_DEFAULT",
             "entry_price": entry_price,
             "avg_cost": entry_price,
             "current_price": current_price,
@@ -487,9 +504,10 @@ def _make_hold_intent(
         decision_ts_et = (now or datetime.now(tz=ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York")).isoformat()
     except Exception:
         decision_ts_et = datetime.utcnow().isoformat() + "Z"
+    exit_reason, exit_reason_detail = _canonical_exit_reason(exit_type)
     logger.info(
-        "[US_EXIT][HOLD] symbol=%s exit_type=%s reason=%s pnl_pct=%.4f soft_stop_breach_count=%d required_ticks=%d",
-        symbol, exit_type, reason, pnl_pct, breach_count, required_ticks,
+        "[US_EXIT][HOLD] symbol=%s exit_type=%s exit_reason=%s exit_reason_detail=%s reason=%s pnl_pct=%.4f soft_stop_breach_count=%d required_ticks=%d",
+        symbol, exit_type, exit_reason, exit_reason_detail, reason, pnl_pct, breach_count, required_ticks,
     )
     return {
         "symbol": symbol,
@@ -497,6 +515,9 @@ def _make_hold_intent(
         "action": "PARTIAL_SOFT_STOP_WAIT",
         "qty": 0,
         "exit_type": exit_type,
+        "exit_reason": exit_reason,
+        "exit_reason_detail": exit_reason_detail,
+        "exit_policy": "US_SWING_DEFAULT",
         "reason": reason,
         "unrealized_pnl_pct": round(pnl_pct, 4),
         "meta": {

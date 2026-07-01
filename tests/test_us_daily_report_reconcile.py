@@ -1,4 +1,5 @@
 from trader.us.runner import daily_report_runner as drr
+from trader.us.db import repos
 
 def test_daily_report_reconcile_sources():
     r=drr.reconcile_order_sources(db_orders=7, fills=4, balance_confirmed=7, router_summary=7)
@@ -10,7 +11,7 @@ def test_daily_report_reconcile_sources():
 def test_daily_report_uses_real_sources_without_env(monkeypatch, tmp_path):
     monkeypatch.delenv('US_DAILY_BALANCE_CONFIRMED_COUNT', raising=False)
     monkeypatch.delenv('US_DAILY_ROUTER_ACK_COUNT', raising=False)
-    monkeypatch.setattr(drr, 'load_us_orders', lambda td: [{'status':'ACK'} for _ in range(7)])
+    monkeypatch.setattr(repos, 'load_us_daily_orders_for_report', lambda td: [{'status':'ACK'} for _ in range(7)])
     monkeypatch.setattr(drr, 'load_us_fills_count', lambda td: 4)
     monkeypatch.setattr(drr, 'load_balance_confirmed_count', lambda td: 7)
     monkeypatch.setattr(drr, 'load_router_summary_ack_count', lambda td, session=None: 7)
@@ -23,8 +24,7 @@ def test_daily_report_uses_real_sources_without_env(monkeypatch, tmp_path):
     assert report['balance_confirmed_count']==7
     assert 'FILL_API_LESS_THAN_ACK' in report['warnings']
 
-def test_load_us_orders_uses_timestamp_fallback(monkeypatch):
-    from trader.us.db import repos
+def test_load_us_daily_orders_for_report_uses_timestamp_fallback(monkeypatch):
     calls=[]
     class Conn:
         def execution_options(self, **kwargs): return self
@@ -39,13 +39,13 @@ def test_load_us_orders_uses_timestamp_fallback(monkeypatch):
     class Engine:
         def connect(self): return Conn()
     monkeypatch.setattr(repos, '_get_engine_or_none', lambda: Engine())
-    rows=drr.load_us_orders('2026-06-16')
+    rows=repos.load_us_daily_orders_for_report('2026-06-16')
     assert len(rows)==1
     assert any('created_at >=' in sql for sql,_ in calls)
     assert any('start_ts' in params and 'end_ts' in params for _,params in calls)
 
 def test_daily_report_order_source_empty_warning(monkeypatch, tmp_path):
-    monkeypatch.setattr(drr, 'load_us_orders', lambda td: [])
+    monkeypatch.setattr(repos, 'load_us_daily_orders_for_report', lambda td: [])
     monkeypatch.setattr(drr, 'load_us_fills_count', lambda td: 0)
     monkeypatch.setattr(drr, 'load_balance_confirmed_count', lambda td: 0)
     monkeypatch.setattr(drr, 'load_router_summary_ack_count', lambda td, session=None: 0)
@@ -54,7 +54,7 @@ def test_daily_report_order_source_empty_warning(monkeypatch, tmp_path):
     assert 'ORDER_SOURCE_EMPTY' in result['report']['warnings']
 
 def test_daily_report_does_not_count_balance_confirmed_as_broker_sent(monkeypatch, tmp_path):
-    monkeypatch.setattr(drr, 'load_us_orders', lambda td: [
+    monkeypatch.setattr(repos, 'load_us_daily_orders_for_report', lambda td: [
         {'status': 'ACK', 'side': 'BUY'},
         {'status': 'ACK', 'side': 'SELL'},
         {'status': 'BALANCE_CONFIRMED', 'side': 'BUY'},
