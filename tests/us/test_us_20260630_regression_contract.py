@@ -79,8 +79,8 @@ def test_daily_report_uses_us_order_repo_not_common_orders():
 
 def test_exit_reason_canonical_contract_markers():
     src = open("trader/us/pb1/us_exit_engine.py", encoding="utf-8").read()
-    assert 'exit_reason = "trailing_stop"' in src
-    assert 'exit_reason = "hard_stop"' in src
+    assert 'return "trailing_stop", exit_reason_detail' in src
+    assert 'return "hard_stop", exit_reason_detail' in src
     assert '"exit_reason_detail": exit_reason_detail' in src
 
 
@@ -90,3 +90,105 @@ def test_full_position_new_symbols_blocked_but_add_allowed_markers():
     assert "price_lookup_skipped" in src
     assert "allow_add_to_existing" in src
     assert "ADD_TO_EXISTING_BUY" in src
+
+
+def test_daily_report_calls_us_daily_order_loader_not_load_us_orders():
+    src = open("trader/us/runner/daily_report_runner.py", encoding="utf-8").read()
+    assert "all_orders_today = load_us_daily_orders_for_report(trade_date)" in src
+    assert "load_us_orders(" not in src
+
+
+def test_hold_intent_has_canonical_exit_reason_without_name_error():
+    from trader.us.pb1.us_exit_engine import _make_hold_intent, EXIT_SOFT_STOP_LOSS
+    hold = _make_hold_intent("AAPL", EXIT_SOFT_STOP_LOSS, "soft_stop_wait_confirm", -0.04, 1, 2)
+    assert hold["side"] == "HOLD"
+    assert hold["exit_reason"] == EXIT_SOFT_STOP_LOSS
+    assert hold["exit_reason_detail"] == EXIT_SOFT_STOP_LOSS
+
+
+def test_full_position_fallback_path_skips_before_any_price_lookup(monkeypatch):
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    class Provider:
+        def __init__(self):
+            self.daily_calls = 0
+            self.price_calls = 0
+        def get_daily_prices(self, *args, **kwargs):
+            self.daily_calls += 1
+            raise AssertionError("daily price lookup should be skipped")
+        def get_current_price(self, *args, **kwargs):
+            self.price_calls += 1
+            raise AssertionError("current price lookup should be skipped")
+
+    provider = Provider()
+    intents = generate_entry_intents(
+        ["AAPL"], provider, set(), 10_000, 35, 100_000,
+        current_position_symbols=set(), allow_new_symbols=False, available_new_slots=0,
+    )
+    assert intents == []
+    assert provider.daily_calls == 0
+    assert provider.price_calls == 0
+
+
+def test_add_to_existing_intent_carries_capital_deployment_fields(monkeypatch):
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    monkeypatch.setenv("US_ADD_MIN_PNL_PCT", "0.02")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "10000")
+    monkeypatch.setenv("US_TARGET_POSITION_WEIGHT", "0.025")
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "0.05")
+
+    class Provider:
+        positions = [{
+            "symbol": "AAPL", "qty": 10, "avg_price": 100.0,
+            "market_value_usd": 1100.0, "unrealized_pnl_pct": 0.10,
+        }]
+        def get_current_price(self, symbol, exchange):
+            return {"last": 110.0}
+
+    intents = generate_entry_intents(
+        ["AAPL"], Provider(), set(), 10_000, 35, 100_000,
+        watchlist_entries=[{"symbol": "AAPL", "exchange": "NASDAQ", "score": 0.9}],
+        current_position_symbols={"AAPL"}, allow_new_symbols=False, allow_add_to_existing=True, available_new_slots=0,
+    )
+    assert intents
+    intent = intents[0]
+    assert intent["position_action"] == "ADD_TO_EXISTING_BUY"
+    assert intent["current_position_market_value_usd"] == 1100.0
+    assert intent["current_weight"] is not None
+    assert intent["projected_weight"] is not None
+    assert intent["meta"]["capital_deployment"]["deployment_action"] == "ADD_TO_EXISTING_BUY"
+
+
+def test_risk_gate_blocks_projected_weight_from_meta(monkeypatch):
+    from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
+    import pytest
+
+    monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "0.05")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "10000")
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "10000")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("US_ORDER_ARMED", "1")
+    monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    monkeypatch.setenv("DISABLE_REAL_TRADING", "0")
+    monkeypatch.setenv("ALLOW_REAL_ORDER", "1")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1")
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("STRATEGY_ENV", "practice")
+    monkeypatch.setenv("TRADING_REGION", "US")
+    intent = {
+        "symbol": "AAPL", "exchange": "NASDAQ", "side": "BUY", "qty": 1,
+        "notional_usd": 100.0, "client_order_key": "k",
+        "position_action": "ADD_TO_EXISTING_BUY",
+        "meta": {"capital_deployment": {"projected_weight": 0.06}},
+    }
+    with pytest.raises(RiskGateBlocked) as exc:
+        assert_order_allowed(
+            intent, current_daily_notional_usd=0, current_position_count=35,
+            total_portfolio_usd=100_000, available_cash_usd=50_000,
+            is_existing_position_buy=True, allowed_symbols={"AAPL"}, trade_date="2026-06-30",
+        )
+    assert "position_weight_exceeded" in str(exc.value)

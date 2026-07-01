@@ -83,6 +83,15 @@ def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
 
 
+def _canonical_exit_reason(exit_type: str) -> tuple[str, str]:
+    exit_reason_detail = exit_type
+    if exit_type == EXIT_PROFIT_TRAILING_STOP:
+        return "trailing_stop", exit_reason_detail
+    if exit_type == EXIT_HARD_STOP_LOSS:
+        return "hard_stop", exit_reason_detail
+    return exit_type, exit_reason_detail
+
+
 def evaluate_exit(
     position: dict,
     current_price: float,
@@ -412,13 +421,7 @@ def _make_exit_intent(
     key_raw = f"{symbol}_{trade_date_key}_SELL_{exit_type}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
-    exit_reason_detail = exit_type
-    if exit_type == EXIT_PROFIT_TRAILING_STOP:
-        exit_reason = "trailing_stop"
-    elif exit_type == EXIT_HARD_STOP_LOSS:
-        exit_reason = "hard_stop"
-    else:
-        exit_reason = exit_type
+    exit_reason, exit_reason_detail = _canonical_exit_reason(exit_type)
 
     logger.info(
         "[US_EXIT][SIGNAL] symbol=%s exit_type=%s exit_reason=%s exit_reason_detail=%s reason=%s pnl_pct=%.3f",
@@ -501,9 +504,10 @@ def _make_hold_intent(
         decision_ts_et = (now or datetime.now(tz=ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York")).isoformat()
     except Exception:
         decision_ts_et = datetime.utcnow().isoformat() + "Z"
+    exit_reason, exit_reason_detail = _canonical_exit_reason(exit_type)
     logger.info(
-        "[US_EXIT][HOLD] symbol=%s exit_type=%s reason=%s pnl_pct=%.4f soft_stop_breach_count=%d required_ticks=%d",
-        symbol, exit_type, reason, pnl_pct, breach_count, required_ticks,
+        "[US_EXIT][HOLD] symbol=%s exit_type=%s exit_reason=%s exit_reason_detail=%s reason=%s pnl_pct=%.4f soft_stop_breach_count=%d required_ticks=%d",
+        symbol, exit_type, exit_reason, exit_reason_detail, reason, pnl_pct, breach_count, required_ticks,
     )
     return {
         "symbol": symbol,

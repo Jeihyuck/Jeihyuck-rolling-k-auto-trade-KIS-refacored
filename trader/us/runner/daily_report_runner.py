@@ -295,7 +295,7 @@ def run_daily_report(
             
             # Orders - count by status
             try:
-                all_orders_today = load_us_orders(trade_date)
+                all_orders_today = load_us_daily_orders_for_report(trade_date)
                 if all_orders_today:
                     for order in all_orders_today:
                         status = order.get("status", "").upper()
@@ -356,7 +356,7 @@ def run_daily_report(
                 invested = 0.0
                 for pos in positions:
                     try:
-                        invested += float(pos.get("market_value_usd") or pos.get("market_value") or pos.get("eval_amount_usd") or 0)
+                        invested += float(pos.get("market_value_usd") or pos.get("market_value") or pos.get("eval_amount_usd") or pos.get("total_pvs_usd") or pos.get("eval_amount") or 0)
                     except (TypeError, ValueError):
                         pass
                 try:
@@ -611,15 +611,6 @@ def _ny_date_bounds_utc(trade_date: str) -> tuple[str, str]:
     end = datetime.combine(d + timedelta(days=1), time.min, tzinfo=ny).astimezone(utc).isoformat()
     return start, end
 
-
-def load_us_orders(trade_date: str) -> list[dict]:
-    """Compatibility wrapper for US-only daily order report rows.
-
-    Kept for older callers, but the implementation delegates to the US repo
-    wrapper and does not query KR/common order tables from the report runner.
-    """
-    from trader.us.db.repos import load_us_daily_orders_for_report
-    return load_us_daily_orders_for_report(trade_date)
 
 def load_us_fills_count(trade_date: str) -> int:
     """Count fill API-confirmed fills from fills/us_fills tables, not sold-symbol proxy."""

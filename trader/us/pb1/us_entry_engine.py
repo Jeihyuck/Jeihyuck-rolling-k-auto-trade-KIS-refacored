@@ -502,6 +502,7 @@ def generate_entry_intents(
     # =========================================================================
     # Phase 1: Filter + Score Validation (NO price lookup yet if precomputed)
     # =========================================================================
+    skipped_price_lookup_due_to_full_position = 0
     candidates: list[tuple[float, str, str, float | None, dict | None]] = []  # (score, symbol, exchange, price, entry_meta)
     seen_symbols: set[str] = set()  # 중복 symbol 차단용
     held_skipped = 0  # 보유종목으로 스킵된 수
@@ -554,6 +555,22 @@ def generate_entry_intents(
         except Exception as exc:
             position_state = "UNKNOWN_POSITION_STATE" if position_state == "NOT_HELD" else position_state
             logger.debug("[US_ENTRY][WARN] DB check failed symbol=%s: %s", symbol, exc)
+
+        # Capacity guard must run before any fallback/precomputed price lookup.
+        if position_state != "HELD" and not allow_new_symbols:
+            skipped_price_lookup_due_to_full_position += 1
+            track_skip(symbol, "max_positions_reached_new_symbol", {
+                "position_count": position_count,
+                "available_new_slots": available_new_slots,
+                "price_lookup_skipped": True,
+                "skip_stage": "before_any_price_lookup",
+            })
+            logger.info(
+                "[US_ENTRY][SKIP] symbol=%s reason=max_positions_reached_new_symbol "
+                "position_count=%s available_new_slots=%s price_lookup_skipped=1 stage=before_any_price_lookup",
+                symbol, position_count, available_new_slots,
+            )
+            continue
 
         # entries_map에 있으면 precomputed score 사용
         entry_meta = entries_map.get(symbol)
@@ -727,7 +744,6 @@ def generate_entry_intents(
     intents: list[dict] = []
     added_count = 0
     price_lookup_count = 0  # 실제 price lookup 횟수 추적
-    skipped_price_lookup_due_to_full_position = 0
     held_candidates_evaluated_for_add = 0
 
     # Price lookup 및 intent 생성 (상위 lookup_limit개만)
@@ -736,19 +752,6 @@ def generate_entry_intents(
         position_state = (entry_meta or {}).get("position_state")
         if not position_state:
             position_state = "HELD" if (current_position_symbols and symbol_upper_for_capacity in {str(s).upper().strip() for s in current_position_symbols}) else "NOT_HELD"
-        if position_state != "HELD" and not allow_new_symbols:
-            skipped_price_lookup_due_to_full_position += 1
-            track_skip(symbol, "max_positions_reached_new_symbol", {
-                "position_count": position_count,
-                "available_new_slots": available_new_slots,
-                "price_lookup_skipped": True,
-            })
-            logger.info(
-                "[US_ENTRY][SKIP] symbol=%s reason=max_positions_reached_new_symbol "
-                "position_count=%s available_new_slots=%s price_lookup_skipped=1",
-                symbol, position_count, available_new_slots,
-            )
-            continue
         if position_state == "HELD":
             held_candidates_evaluated_for_add += 1
         # Price lookup (필요한 경우)
@@ -846,7 +849,14 @@ def generate_entry_intents(
                 continue
             qty = sizing["qty"]
             notional = sizing["notional_usd"]
-            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed position_action=%s pnl_pct=%.4f current_weight=%.4f", symbol, position_action, pnl_pct, sizing.get("current_weight", 0.0))
+            qty_held = _as_float_or_none(held_snapshot.get("qty") or held_snapshot.get("holding_qty") or held_snapshot.get("quantity")) or 0.0
+            held_snapshot_market_value = (
+                _as_float_or_none(held_snapshot.get("market_value_usd"))
+                or _as_float_or_none(held_snapshot.get("market_value"))
+                or _as_float_or_none(held_snapshot.get("eval_amount_usd"))
+                or (qty_held * price)
+            )
+            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed position_action=%s pnl_pct=%.4f current_weight=%.4f projected_weight=%.4f", symbol, position_action, pnl_pct, sizing.get("current_weight", 0.0), sizing.get("projected_weight", 0.0))
         else:
             sizing = calc_position_size(
                 price=price,
@@ -971,6 +981,15 @@ def generate_entry_intents(
             "qty": qty,
             "limit_price": limit_price,
             "notional_usd": notional,
+            **({
+                "current_position_market_value_usd": held_snapshot_market_value,
+                "current_weight": sizing.get("current_weight"),
+                "target_weight": sizing.get("target_weight"),
+                "max_symbol_weight": sizing.get("max_symbol_weight"),
+                "allowed_weight": sizing.get("allowed_weight"),
+                "projected_weight": sizing.get("projected_weight"),
+                "deployment_action": sizing.get("deployment_action", "ADD_TO_EXISTING_BUY"),
+            } if position_state_for_order == "HELD" else {}),
             "score": score,
             "rank": rank + 1,
             "client_order_key": client_order_key,
@@ -1000,6 +1019,17 @@ def generate_entry_intents(
                 "source": "locked_watchlist",
                 "position_state": position_state_for_order,
                 "position_action": position_action,
+                **({
+                    "capital_deployment": {
+                        "current_position_market_value_usd": held_snapshot_market_value,
+                        "current_weight": sizing.get("current_weight"),
+                        "target_weight": sizing.get("target_weight"),
+                        "max_symbol_weight": sizing.get("max_symbol_weight"),
+                        "allowed_weight": sizing.get("allowed_weight"),
+                        "projected_weight": sizing.get("projected_weight"),
+                        "deployment_action": sizing.get("deployment_action", "ADD_TO_EXISTING_BUY"),
+                    }
+                } if position_state_for_order == "HELD" else {}),
                 "schema_version": 1,
             },
         }
