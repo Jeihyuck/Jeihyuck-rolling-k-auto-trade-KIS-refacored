@@ -669,6 +669,7 @@ class CandidateWidthAdjustmentResult:
     backfill_added_count: int = 0
     concentration_guard_triggered: bool = False
     concentration_guard_status: str = "none"
+    planned_spent_after_backfill: float = 0.0
 
 
 @dataclass
@@ -8878,9 +8879,32 @@ class PB1Engine:
         orderable_candidates: list[CandidateFeature],
         candidates: list[CandidateFeature] | None = None,
         budget_meta: dict[str, Any] | None = None,
+        new_position_limit: int = 0,
+        target_new_positions: int = 0,
+        tick_budget_krw: float = 0.0,
+        planned_spent: float = 0.0,
+        available_cash_krw: float = 0.0,
+        min_order_krw: float = 0.0,
     ) -> CandidateWidthAdjustmentResult:
         min_buyable = max(1, int(self._int_env("PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE", self._int_env("PB1_MIN_BUYABLE", PB1_MIN_BUYABLE))))
-        result = CandidateWidthAdjustmentResult(orderable_candidates=orderable_candidates)
+        result = CandidateWidthAdjustmentResult(
+            orderable_candidates=orderable_candidates,
+            planned_spent_after_backfill=float(planned_spent or 0.0),
+        )
+        new_position_limit_i = int(new_position_limit or 0)
+        target_new_positions_i = int(target_new_positions or 0)
+        tick_budget = float(tick_budget_krw or 0.0)
+        planned_spent_running = float(planned_spent or 0.0)
+        available_cash = float(available_cash_krw or 0.0)
+        min_order = float(min_order_krw or 0.0)
+        logger.info(
+            "[ENTRY][BACKFILL][CAPACITY] current_orders=%s new_position_limit=%s target_new_positions=%s tick_budget=%.0f planned_spent=%.0f",
+            len(orderable_candidates),
+            new_position_limit_i,
+            target_new_positions_i,
+            tick_budget,
+            planned_spent_running,
+        )
         if len(orderable_candidates) < min_buyable:
             result.backfill_attempted = True
             logger.info(
@@ -8905,17 +8929,37 @@ class PB1Engine:
                 cur = base_atr
                 pool = list(candidates or [])
                 force_min1 = self._bool_env("PB1_ADAPTIVE_ATR_BACKFILL_FORCE_MIN1", False)
-                available_cash = float(
+                budget_meta_cash = float(
                     (budget_meta or {}).get("available_cash")
                     or (budget_meta or {}).get("usable_cash")
                     or (budget_meta or {}).get("cash")
                     or 0.0
                 )
+                if available_cash <= 0 and budget_meta_cash > 0:
+                    available_cash = budget_meta_cash
                 while len(orderable_candidates) < min_buyable and cur < max_atr:
                     nxt = min(max_atr, cur + step)
                     pass_no += 1
                     selected: list[str] = []
+                    if new_position_limit_i > 0 and len(orderable_candidates) >= new_position_limit_i:
+                        logger.info(
+                            "[ENTRY][BACKFILL][SKIP] code=%s reason=new_position_limit",
+                            "capacity",
+                        )
+                        break
+                    if target_new_positions_i > 0 and len(orderable_candidates) >= target_new_positions_i:
+                        logger.info(
+                            "[ENTRY][BACKFILL][SKIP] code=%s reason=target_new_positions_limit",
+                            "capacity",
+                        )
+                        break
                     for cf in pool:
+                        if new_position_limit_i > 0 and len(orderable_candidates) >= new_position_limit_i:
+                            logger.info("[ENTRY][BACKFILL][SKIP] code=%s reason=new_position_limit", cf.code)
+                            break
+                        if target_new_positions_i > 0 and len(orderable_candidates) >= target_new_positions_i:
+                            logger.info("[ENTRY][BACKFILL][SKIP] code=%s reason=target_new_positions_limit", cf.code)
+                            break
                         features = cf.features or {}
                         if cf.code in existing or cf.code in blocked_codes:
                             continue
@@ -8945,7 +8989,15 @@ class PB1Engine:
                             if not force_min1:
                                 continue
                             qty = 1
-                        if available_cash > 0 and price * qty > available_cash:
+                        order_value = price * qty
+                        if min_order > 0 and order_value < min_order:
+                            logger.info("[ENTRY][BACKFILL][SKIP] code=%s reason=min_order_krw", cf.code)
+                            continue
+                        if available_cash > 0 and order_value > available_cash:
+                            logger.info("[ENTRY][BACKFILL][SKIP] code=%s reason=insufficient_cash", cf.code)
+                            continue
+                        if tick_budget > 0 and planned_spent_running + order_value > tick_budget:
+                            logger.info("[ENTRY][BACKFILL][SKIP] code=%s reason=tick_budget_exceeded", cf.code)
                             continue
                         if features.get("open_order_exists") or features.get("today_buy_exists") or features.get("cooldown_active") or features.get("existing_holding"):
                             continue
@@ -8987,6 +9039,8 @@ class PB1Engine:
                         features["atr_gate_relaxed_pct"] = nxt
                         cf.sizing_reason = "ADAPTIVE_ATR_BACKFILL"
                         orderable_candidates.append(cf)
+                        planned_spent_running += order_value
+                        result.planned_spent_after_backfill = planned_spent_running
                         existing.add(cf.code)
                         selected.append(cf.code)
                         result.backfill_added_count += 1
@@ -16136,6 +16190,12 @@ class PB1Engine:
                 orderable_candidates=orderable_candidates,
                 candidates=candidates if 'candidates' in locals() else [],
                 budget_meta=getattr(self, "_budget_plan_meta", {}) or {},
+                new_position_limit=new_position_limit,
+                target_new_positions=target_new_positions,
+                tick_budget_krw=tick_budget_krw,
+                planned_spent=planned_spent,
+                available_cash_krw=available_cash_krw,
+                min_order_krw=min_order_krw,
             )
             orderable_candidates = candidate_width_result.orderable_candidates
             orderable_codes = [c.code for c in orderable_candidates]

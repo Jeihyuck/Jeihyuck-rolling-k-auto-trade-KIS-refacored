@@ -71,3 +71,49 @@ def test_backfill_candidate_requires_valid_entry_order_plan(monkeypatch):
         assert ok, reasons
         assert cf.client_order_key
         assert int(cf.planned_qty or 0) > 0
+
+
+def test_backfill_respects_new_position_limit(monkeypatch):
+    monkeypatch.setenv("PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE", "5")
+    engine = make_engine()
+    candidate1 = make_candidate(code="111111", order_price=500000, atr_pct=10.5)
+    candidate2 = make_candidate(code="222222", order_price=10000, atr_pct=10.5)
+    candidate3 = make_candidate(code="333333", order_price=10000, atr_pct=11.0)
+    candidate4 = make_candidate(code="444444", order_price=10000, atr_pct=11.5)
+
+    result = engine._apply_candidate_width_backfill_and_concentration_guard(
+        orderable_candidates=[candidate1],
+        candidates=[candidate2, candidate3, candidate4],
+        new_position_limit=1,
+        target_new_positions=1,
+        tick_budget_krw=1_000_000,
+        planned_spent=500_000,
+        available_cash_krw=1_000_000,
+        min_order_krw=0,
+    )
+
+    assert len(result.orderable_candidates) == 1
+    assert result.backfill_added_count == 0
+    assert result.planned_spent_after_backfill == 500_000
+
+
+def test_backfill_respects_tick_budget(monkeypatch):
+    monkeypatch.setenv("PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE", "5")
+    engine = make_engine()
+    candidate_price_900k = make_candidate(code="555555", order_price=900_000, atr_pct=10.5)
+    candidate_price_900k_2 = make_candidate(code="666666", order_price=900_000, atr_pct=11.0)
+
+    result = engine._apply_candidate_width_backfill_and_concentration_guard(
+        orderable_candidates=[],
+        candidates=[candidate_price_900k, candidate_price_900k_2],
+        new_position_limit=5,
+        target_new_positions=5,
+        tick_budget_krw=1_000_000,
+        planned_spent=0,
+        available_cash_krw=5_000_000,
+        min_order_krw=0,
+    )
+
+    assert len(result.orderable_candidates) == 1
+    assert result.backfill_added_count == 1
+    assert result.planned_spent_after_backfill == 900_000
