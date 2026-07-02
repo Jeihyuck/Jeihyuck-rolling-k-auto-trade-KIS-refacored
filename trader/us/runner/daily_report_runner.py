@@ -227,6 +227,17 @@ def run_daily_report(
         "ack_reconcile_after_route_unresolved_count": 0,
         "ack_pending_reconcile_count": 0,
         "pending_order_count": 0,
+        "us_buy_intents_total": 0,
+        "us_buy_clamped_by_weight": 0,
+        "us_buy_rejected_by_weight": 0,
+        "us_buy_submitted_after_clamp": 0,
+        "us_qty_zero_after_weight_clamp": 0,
+        "us_sell_ack_unresolved_count": 0,
+        "us_sell_filled_by_balance_delta_count": 0,
+        "us_sell_partial_by_balance_delta_count": 0,
+        "us_pending_sell_stale_released_count": 0,
+        "us_residual_exit_after_partial_sell_count": 0,
+        "us_kis_endpoint_stats": [],
     }
     
     # DRY_RUN
@@ -418,13 +429,9 @@ def run_daily_report(
         pass
     
     # Save reports
-    try:
-        os.makedirs("repo/reports/us_daily", exist_ok=True)
-    except Exception:
-        os.makedirs("reports/us_daily", exist_ok=True)
-    
-    # Latest report (always overwrite)
-    report_base = "repo/reports/us_daily" if os.path.exists("repo") else "reports/us_daily"
+    # Canonical US daily report path (shared by close/log-mail/package jobs).
+    os.makedirs("reports/us_daily", exist_ok=True)
+    report_base = "reports/us_daily"
     latest_md_path = f"{report_base}/latest_us_daily_report.md"
     latest_json_path = f"{report_base}/latest_us_daily_report.json"
     
@@ -503,6 +510,16 @@ def run_daily_report(
         f"| fill_api_count | {report['fill_api_count']} |",
         f"| balance_confirmed_count | {report['balance_confirmed_count']} |",
         f"| pending_order_count | {report.get('pending_order_count', 0)} |",
+        f"| us_buy_intents_total | {report.get('us_buy_intents_total', 0)} |",
+        f"| us_buy_clamped_by_weight | {report.get('us_buy_clamped_by_weight', 0)} |",
+        f"| us_buy_rejected_by_weight | {report.get('us_buy_rejected_by_weight', 0)} |",
+        f"| us_buy_submitted_after_clamp | {report.get('us_buy_submitted_after_clamp', 0)} |",
+        f"| us_qty_zero_after_weight_clamp | {report.get('us_qty_zero_after_weight_clamp', 0)} |",
+        f"| us_sell_ack_unresolved_count | {report.get('us_sell_ack_unresolved_count', 0)} |",
+        f"| us_sell_filled_by_balance_delta_count | {report.get('us_sell_filled_by_balance_delta_count', 0)} |",
+        f"| us_sell_partial_by_balance_delta_count | {report.get('us_sell_partial_by_balance_delta_count', 0)} |",
+        f"| us_pending_sell_stale_released_count | {report.get('us_pending_sell_stale_released_count', 0)} |",
+        f"| us_residual_exit_after_partial_sell_count | {report.get('us_residual_exit_after_partial_sell_count', 0)} |",
         f"| buy_notional_routed | {report.get('buy_notional_routed', 0)} |",
         f"| sell_notional_routed | {report.get('sell_notional_routed', 0)} |",
         f"| total_order_notional_routed | {report.get('total_order_notional_routed', 0)} |",
@@ -575,10 +592,25 @@ def run_daily_report(
         with open(dated_json_path, "w") as f:
             json.dump(report, f, indent=2, default=str)
         
+        import hashlib
+        source_hash = hashlib.sha256(json.dumps(report, sort_keys=True, default=str).encode()).hexdigest()[:16]
         logger.info(
             "[US_DAILY_REPORT][SAVED] latest=%s dated=%s",
             latest_md_path, dated_md_path
         )
+        logger.info({
+            "event": "us_daily_report_package_fingerprint",
+            "market": "US",
+            "path_md": latest_md_path,
+            "path_json": latest_json_path,
+            "mtime_md": os.path.getmtime(latest_md_path),
+            "mtime_json": os.path.getmtime(latest_json_path),
+            "trade_date": trade_date,
+            "session": session,
+            "orders_ack": report.get("orders_ack"),
+            "fills": report.get("fills"),
+            "source_hash": source_hash,
+        })
     except Exception as exc:
         logger.error("[US_DAILY_REPORT][SAVE_FAILED] %s", exc)
         report["errors"].append(f"report_save_failed: {exc}")
