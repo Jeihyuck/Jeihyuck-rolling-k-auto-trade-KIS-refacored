@@ -8895,30 +8895,103 @@ class PB1Engine:
                 max_atr = float(self._float_env("PB1_ADAPTIVE_ATR_BACKFILL_MAX_PCT", 11.5))
                 step = max(0.1, float(self._float_env("PB1_ADAPTIVE_ATR_BACKFILL_STEP_PCT", 0.5)))
                 existing = {c.code for c in orderable_candidates}
+                blocked_codes = (
+                    set(getattr(self, "_open_buy_codes", []) or [])
+                    | set(getattr(self, "_today_buy_codes", []) or [])
+                    | set(getattr(self, "_cooldown_codes", []) or [])
+                    | set(getattr(self, "_existing_holding_codes", []) or [])
+                )
                 pass_no = 0
                 cur = base_atr
                 pool = list(candidates or [])
+                force_min1 = self._bool_env("PB1_ADAPTIVE_ATR_BACKFILL_FORCE_MIN1", False)
+                available_cash = float(
+                    (budget_meta or {}).get("available_cash")
+                    or (budget_meta or {}).get("usable_cash")
+                    or (budget_meta or {}).get("cash")
+                    or 0.0
+                )
                 while len(orderable_candidates) < min_buyable and cur < max_atr:
                     nxt = min(max_atr, cur + step)
                     pass_no += 1
                     selected: list[str] = []
                     for cf in pool:
-                        if cf.code in existing:
+                        features = cf.features or {}
+                        if cf.code in existing or cf.code in blocked_codes:
                             continue
-                        atr_pct = float((cf.features or {}).get("atr_pct") or (cf.features or {}).get("atr_percent") or 0.0)
-                        price = float((cf.features or {}).get("order_price") or (cf.features or {}).get("close") or 0.0)
-                        if price > 0 and (atr_pct == 0.0 or (base_atr < atr_pct <= nxt)):
-                            cf.features["candidate_tier"] = "adaptive_atr_backfill"
-                            cf.features["risk_tag"] = "ATR_RELAXED"
-                            cf.features["atr_gate_base_pct"] = base_atr
-                            cf.features["atr_gate_relaxed_pct"] = nxt
-                            cf.sizing_reason = "ADAPTIVE_ATR_BACKFILL"
-                            orderable_candidates.append(cf)
-                            existing.add(cf.code)
-                            selected.append(cf.code)
-                            result.backfill_added_count += 1
-                            if len(orderable_candidates) >= min_buyable:
-                                break
+                        setup_loose_ok = bool(
+                            cf.setup_ok
+                            or features.get("setup_loose_ok")
+                            or features.get("rescue_source_ok")
+                            or features.get("minervini_buyable")
+                            or features.get("relax_ok")
+                        )
+                        if not setup_loose_ok:
+                            continue
+                        raw_atr = features.get("atr_pct") if features.get("atr_pct") is not None else features.get("atr_percent")
+                        try:
+                            atr_pct = float(raw_atr) if raw_atr is not None else None
+                        except (TypeError, ValueError):
+                            atr_pct = None
+                        if atr_pct is None or atr_pct <= 0:
+                            continue
+                        if not (base_atr < atr_pct <= nxt):
+                            continue
+                        price = float(features.get("order_price") or features.get("entry_price") or features.get("close") or 0.0)
+                        if price <= 0:
+                            continue
+                        qty = int(cf.planned_qty or features.get("planned_qty") or 0)
+                        if qty <= 0:
+                            if not force_min1:
+                                continue
+                            qty = 1
+                        if available_cash > 0 and price * qty > available_cash:
+                            continue
+                        if features.get("open_order_exists") or features.get("today_buy_exists") or features.get("cooldown_active") or features.get("existing_holding"):
+                            continue
+                        stop_price = float(features.get("stop_price") or features.get("initial_stop") or 0.0)
+                        if stop_price <= 0:
+                            continue
+                        cf.planned_qty = max(1, qty)
+                        cf.client_order_key = cf.client_order_key or self._client_order_key(
+                            cf.code,
+                            cf.mode,
+                            "BUY",
+                            str(getattr(self, "window_label", "day") or "day"),
+                            self._entry_stage_name(),
+                        )
+                        if not cf.client_order_key:
+                            continue
+                        features["entry_price"] = price
+                        features["order_price"] = price
+                        features["stop_price"] = stop_price
+                        cf.entry_plan = self._build_entry_plan(
+                            cf,
+                            entry_price=price,
+                            order_price=price,
+                            stop_price=stop_price,
+                            trigger_ok=bool(features.get("breakout_trigger_ok") or features.get("trigger_ok")),
+                            trigger_info=features.get("entry_trigger") if isinstance(features.get("entry_trigger"), dict) else {},
+                            entry_mode=str(features.get("entry_mode") or "adaptive_atr_backfill"),
+                            stage=self._entry_stage_name(),
+                            price_source=str(features.get("price_source") or "adaptive_atr_backfill"),
+                        )
+                        features["entry_plan"] = cf.entry_plan
+                        plan_ok, plan_reasons = self._validate_entry_plan(cf.entry_plan)
+                        if not plan_ok:
+                            logger.info("[ENTRY][BACKFILL][PLAN_SKIP] code=%s reasons=%s", cf.code, plan_reasons)
+                            continue
+                        features["candidate_tier"] = "adaptive_atr_backfill"
+                        features["risk_tag"] = "ATR_RELAXED"
+                        features["atr_gate_base_pct"] = base_atr
+                        features["atr_gate_relaxed_pct"] = nxt
+                        cf.sizing_reason = "ADAPTIVE_ATR_BACKFILL"
+                        orderable_candidates.append(cf)
+                        existing.add(cf.code)
+                        selected.append(cf.code)
+                        result.backfill_added_count += 1
+                        if len(orderable_candidates) >= min_buyable:
+                            break
                     logger.info("[ENTRY][BACKFILL][ATR_RELAX] pass=%s from=%.1f to=%.1f candidates=%s", pass_no, cur, nxt, selected)
                     cur = nxt
                 if result.backfill_added_count:
@@ -9283,8 +9356,9 @@ class PB1Engine:
             return status
         plan_prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=float(cf.features.get("entry_price") or limit_price or cf.features.get("close") or record_price or 0.0))
         if plan_prepared is None:
+            self._last_order_skip_reasons = getattr(self, "_last_order_skip_reasons", []) + ["entry_exit_plan_missing_or_invalid"]
             status["skipped"] = 1
-            status["skipped_reason"] = "ENTRY_EXIT_PLAN_MISSING_OR_INVALID"
+            status["skipped_reason"] = "entry_exit_plan_missing_or_invalid"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -9555,7 +9629,6 @@ class PB1Engine:
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
-        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
         logger.info(
             "[ORDER][API_CALL][END] code=%s api_submitted=%s accepted=%s odno=%s rt_cd=%s msg_cd=%s msg1=%s",
             cf.code,
@@ -10020,8 +10093,9 @@ class PB1Engine:
             return status
         plan_prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=float(cf.features.get("entry_price") or cap or cf.features.get("close") or 0.0))
         if plan_prepared is None:
+            self._last_order_skip_reasons = getattr(self, "_last_order_skip_reasons", []) + ["entry_exit_plan_missing_or_invalid"]
             status["skipped"] = 1
-            status["skipped_reason"] = "ENTRY_EXIT_PLAN_MISSING_OR_INVALID"
+            status["skipped_reason"] = "entry_exit_plan_missing_or_invalid"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -16065,13 +16139,15 @@ class PB1Engine:
             )
             orderable_candidates = candidate_width_result.orderable_candidates
             orderable_codes = [c.code for c in orderable_candidates]
-            buyable_ok_codes = list(orderable_codes)
+            actual_buyable_ok_count = len(buyable_ok_codes)
+            final_order_count = len(orderable_candidates)
+            backfill_added_count = candidate_width_result.backfill_added_count
             min_buyable_for_width = int(self._int_env("PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE", self._int_env("PB1_MIN_BUYABLE", PB1_MIN_BUYABLE)))
-            if len(orderable_candidates) < min_buyable_for_width or candidate_width_result.concentration_guard_triggered:
+            if final_order_count < min_buyable_for_width or candidate_width_result.concentration_guard_triggered:
                 logger.warning(
-                    "[RUN_SUMMARY][CANDIDATE_WIDTH] final30=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s backfill_added=%s final_orders=%s min_buyable=%s concentration_guard=%s",
+                    "[RUN_SUMMARY][CANDIDATE_WIDTH] final30=%s setup_ok=%s risk_ok=%s sized_ok=%s actual_buyable_ok=%s backfill_added=%s final_orders=%s min_buyable=%s concentration_guard=%s",
                     len(scan_members), len(setup_ok_codes), len(self._debug_risk_ok_codes), len(self._debug_sizing_ok_codes),
-                    len(buyable_ok_codes), candidate_width_result.backfill_added_count, len(orderable_candidates),
+                    actual_buyable_ok_count, backfill_added_count, final_order_count,
                     min_buyable_for_width, candidate_width_result.concentration_guard_status,
                 )
             logger.info("[ORDER_CANDIDATES] count=%s codes=%s", len(orderable_codes), orderable_codes)

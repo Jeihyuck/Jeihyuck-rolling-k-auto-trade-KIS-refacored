@@ -2345,20 +2345,19 @@ def normalize_session_result(
     reason_u = str(reason or "").upper()
     skip_reason_set = {str(r or "").upper() for r in (skip_reasons or [])}
     retryable_tokens = {
-        "ENTRY_PLAN_INVALID",
-        "ENTRY_PLAN_MISSING_OR_INVALID",
-        "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
+        "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
+        "ORDER_CANDIDATE_WITHOUT_API_SUBMIT",
     }
     plan_skip_reasons = {
         r for r in skip_reason_set
         if "ENTRY_PLAN" in r or "ENTRY_ORDER_PLAN" in r or "ENTRY_EXIT_PLAN" in r
     }
     retryable_order_build_error = (
-        status_u in {"OK_NO_TRADE", "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT", "RETRYABLE_ORDER_BUILD_ERROR"}
+        status_u in {"OK_NO_TRADE", "RETRYABLE_ORDER_BUILD_ERROR"}
         and int(order_candidates or 0) > 0
         and int(api_submitted or 0) == 0
-        and (reason_u == "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT" or bool(plan_skip_reasons))
-    ) or reason_u in retryable_tokens or bool(skip_reason_set.intersection(retryable_tokens))
+        and bool(plan_skip_reasons)
+    ) or status_u == "RETRYABLE_ORDER_BUILD_ERROR" or reason_u in retryable_tokens
     if retryable_order_build_error:
         return NormalizedSessionResult(
             status="RETRYABLE_ORDER_BUILD_ERROR",

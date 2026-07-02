@@ -37,3 +37,18 @@ def test_pm_recovery_proceeds_when_marker_retryable():
         "exit_reason": "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
     }
     assert should_skip_duplicate_from_marker(payload) is False
+
+
+def test_all_skipped_without_plan_reason_is_not_retryable():
+    normalized = normalize_session_result(
+        status="OK_NO_TRADE",
+        reason="ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
+        order_candidates=1,
+        api_submitted=0,
+        skipped=1,
+        skip_reasons=["BUYABLE_COOLDOWN"],
+    )
+
+    assert normalized.status == "OK_NO_TRADE"
+    assert normalized.completed == 1
+    assert normalized.retryable == 0
