@@ -450,6 +450,19 @@ jobs:
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         env:
+          PB1_ALLOW_STYLE_MAPPED_ENTRY_EXIT_PLAN: "1"
+          PB1_ADAPTIVE_ATR_BACKFILL_ENABLED: "1"
+          PB1_ADAPTIVE_ATR_BACKFILL_MAX_PCT: "11.5"
+          PB1_ADAPTIVE_ATR_BACKFILL_STEP_PCT: "0.5"
+          PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE: "5"
+          PB1_CONCENTRATION_GUARD_ENABLED: "1"
+          PB1_CONCENTRATION_GUARD_BLOCK_REAL: "0"
+          PB1_HIGH_PRICE_SINGLE_BUDGET_MULT: "1.5"
+          PB1_HIGH_PRICE_SINGLE_BACKFILL_REQUIRED: "1"
+          DB_LOCK_TIMEOUT_MS: "5000"
+          DB_STATEMENT_TIMEOUT_MS: "15000"
+          DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+          PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
           ORDER_ALLOWED: ${{ steps.order_mode_guard.outputs.order_allowed }}
           PB1_COMPUTE_ONLY: ${{ steps.trading_day_guard.outputs.is_trading_day != '1' && '1' || '0' }}
           PB1_ORDER_BLOCK_REASON: ${{ steps.order_mode_guard.outputs.reason }}
