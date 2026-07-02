@@ -3228,6 +3228,43 @@ class OrdersRepo:
             code=code,
         )
 
+    def get_today_session_marker_payload(
+        self,
+        env: str,
+        session: str,
+        trade_date: date | datetime | str | None = None,
+    ) -> dict:
+        if isinstance(trade_date, datetime):
+            marker_date = trade_date.date()
+        elif isinstance(trade_date, date):
+            marker_date = trade_date
+        elif isinstance(trade_date, str) and trade_date.strip():
+            marker_date = datetime.fromisoformat(trade_date).date()
+        else:
+            marker_date = now_kst().date()
+        session_key = str(session or "").strip().lower() or "am"
+        if session_key not in {"am", "pm", "close"}:
+            session_key = "am"
+        job_key = f"trade_session:{str(env or '').strip().lower() or 'practice'}:{session_key}:{marker_date.isoformat()}"
+        schema = schema_for_engine(self.engine)
+        stmt = select(schema.job_checkpoints.c.payload).where(schema.job_checkpoints.c.job_key == job_key)
+        self._last_read_fail_open_op = None
+        try:
+            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                payload = conn.execute(stmt).scalar()
+            return dict(payload or {}) if isinstance(payload, dict) else {}
+        except (OperationalError, DBAPIError, SATimeoutError, StatementError) as exc:
+            fail_open = _order_lookup_fail_open_default()
+            logger.exception(
+                "[DB][READ][FAIL] op=orders.get_today_session_marker_payload fail_open=%s err_type=%s err=%s",
+                int(bool(fail_open)), type(exc).__name__, exc,
+            )
+            if fail_open:
+                self._last_read_fail_open_op = "orders.get_today_session_marker_payload"
+                logger.warning("[DB][READ][FAIL_OPEN] op=orders.get_today_session_marker_payload -> returning {}")
+                return {}
+            raise
+
     def has_today_session_marker(
         self,
         env: str,

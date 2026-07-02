@@ -2349,11 +2349,15 @@ def normalize_session_result(
         "ENTRY_PLAN_MISSING_OR_INVALID",
         "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
     }
+    plan_skip_reasons = {
+        r for r in skip_reason_set
+        if "ENTRY_PLAN" in r or "ENTRY_ORDER_PLAN" in r or "ENTRY_EXIT_PLAN" in r
+    }
     retryable_order_build_error = (
         status_u in {"OK_NO_TRADE", "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT", "RETRYABLE_ORDER_BUILD_ERROR"}
         and int(order_candidates or 0) > 0
         and int(api_submitted or 0) == 0
-        and (int(skipped or 0) > 0 or bool(skip_reason_set))
+        and (reason_u == "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT" or bool(plan_skip_reasons))
     ) or reason_u in retryable_tokens or bool(skip_reason_set.intersection(retryable_tokens))
     if retryable_order_build_error:
         return NormalizedSessionResult(
@@ -2370,6 +2374,22 @@ def normalize_session_result(
         completed=completed,
         retryable=int(not completed),
         exit_reason=str(reason or ""),
+    )
+
+
+def should_skip_duplicate_from_marker(payload: dict[str, Any] | None) -> bool:
+    payload = payload or {}
+    marker_completed = bool(payload.get("completed"))
+    marker_retryable = bool(payload.get("retryable"))
+    marker_status = str(payload.get("status") or "").upper()
+    return bool(
+        marker_completed
+        and not marker_retryable
+        and marker_status not in {
+            "RETRYABLE_ORDER_BUILD_ERROR",
+            "PARTIAL_SUCCESS_RETRYABLE",
+            "RETRYABLE_FAILURE",
+        }
     )
 
 def _write_session_result_file(payload: dict[str, Any]) -> None:
@@ -2484,14 +2504,23 @@ def _has_today_session_buy_activity(orders_repo: OrdersRepo, env: str, now: date
     get_open_orders = getattr(orders_repo, "get_open_orders", None)
     open_orders = get_open_orders(env) if callable(get_open_orders) else []
     open_buy_exists = any(str(order.get("side") or "").upper() == "BUY" for order in open_orders)
-    has_today_session_marker = getattr(orders_repo, "has_today_session_marker", None)
-    if callable(has_today_session_marker):
-        session_completed_marker = bool(has_today_session_marker(env, session, "completed", now.date()))
+    marker_payload: dict[str, Any] = {}
+    get_marker_payload = getattr(orders_repo, "get_today_session_marker_payload", None)
+    if callable(get_marker_payload):
+        marker_payload = get_marker_payload(env, session, now.date()) or {}
+        session_completed_marker = bool(marker_payload.get("completed"))
     else:
-        has_today_am_session_marker = getattr(orders_repo, "has_today_am_session_marker", None)
-        session_completed_marker = bool(has_today_am_session_marker(env, now.date())) if callable(has_today_am_session_marker) and session == "am" else False
+        has_today_session_marker = getattr(orders_repo, "has_today_session_marker", None)
+        if callable(has_today_session_marker):
+            session_completed_marker = bool(has_today_session_marker(env, session, "completed", now.date()))
+            marker_payload = {"completed": session_completed_marker, "status": "UNKNOWN", "retryable": False}
+        else:
+            has_today_am_session_marker = getattr(orders_repo, "has_today_am_session_marker", None)
+            session_completed_marker = bool(has_today_am_session_marker(env, now.date())) if callable(has_today_am_session_marker) and session == "am" else False
+            marker_payload = {"completed": session_completed_marker, "status": "UNKNOWN", "retryable": False}
     session_buy_exists = bool(buy_orders)
-    duplicate = session_buy_exists or open_buy_exists or session_completed_marker
+    duplicate_by_marker = should_skip_duplicate_from_marker(marker_payload)
+    duplicate = session_buy_exists or open_buy_exists or duplicate_by_marker
     if session_buy_exists:
         reason = "session_buy_exists"
     elif open_buy_exists:
@@ -2504,6 +2533,9 @@ def _has_today_session_buy_activity(orders_repo: OrdersRepo, env: str, now: date
         "session_buy_exists": session_buy_exists,
         "open_buy_exists": open_buy_exists,
         "session_completed_marker": session_completed_marker,
+        "marker_status": str(marker_payload.get("status") or "").upper(),
+        "marker_retryable": bool(marker_payload.get("retryable")),
+        "marker_completed": bool(marker_payload.get("completed")),
         "duplicate": duplicate,
         "reason": reason,
     }
@@ -2596,11 +2628,14 @@ def _evaluate_trade_session_start_guard(*, engine, env: str, now: datetime, sess
     orders_repo = OrdersRepo(engine)
     duplicate_activity = _has_today_session_buy_activity(orders_repo, env, now, session)
     logger.warning(
-        "[%s][DEDUPE] session_buy_exists=%s open_buy_exists=%s session_completed_marker=%s result=%s",
+        "[%s][DEDUPE] session_buy_exists=%s open_buy_exists=%s session_completed_marker=%s marker_status=%s marker_retryable=%s marker_completed=%s result=%s",
         session_cfg["log_prefix"],
         int(bool(duplicate_activity["session_buy_exists"])),
         int(bool(duplicate_activity["open_buy_exists"])),
         int(bool(duplicate_activity["session_completed_marker"])),
+        duplicate_activity.get("marker_status") or "NONE",
+        int(bool(duplicate_activity.get("marker_retryable"))),
+        int(bool(duplicate_activity.get("marker_completed"))),
         "skip_duplicate" if duplicate_activity["duplicate"] else "proceed",
     )
     if duplicate_activity["duplicate"]:
@@ -7397,18 +7432,29 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         )
         os.environ["PB1_LAST_RESULT_STATUS"] = str(last_result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
+        marker_metrics = getattr(engine_runner, "_run_summary_payload", {}) or getattr(engine_runner, "_debug_summary", {}) or {}
+        normalized = normalize_session_result(
+            status=last_result_status,
+            reason=exit_reason,
+            order_candidates=int(marker_metrics.get("order_candidates", marker_metrics.get("order_candidate_count", 0)) or 0),
+            api_submitted=int(marker_metrics.get("api_submitted", marker_metrics.get("submitted", marker_metrics.get("submit_success_count", 0))) or 0),
+            skipped=int(marker_metrics.get("skipped", marker_metrics.get("skipped_count", 0)) or 0),
+            skip_reasons=marker_metrics.get("skip_reasons") or [],
+        )
         _record_session_execution_marker(
             engine=engine,
             env=ctx.env,
             session_kind=session_kind,
             trade_date=_get_now_kst().date(),
-            status=last_result_status,
-            exit_reason=exit_reason,
+            status=normalized.status,
+            exit_reason=normalized.exit_reason,
             recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
+            completed=bool(normalized.completed),
+            retryable=bool(normalized.retryable),
             sell_orders_ack=int(sell_orders or 0),
-            entry_status="DONE" if str(last_result_status).upper() in {"OK", "OK_NO_TRADE"} else ("ABORT" if str(last_result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else "UNKNOWN"),
-            entry_abort_reason=exit_reason if str(last_result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else None,
-            exit_code=_exit_code_for_status(last_result_status),
+            entry_status="DONE" if normalized.completed else "ABORT",
+            entry_abort_reason=None if normalized.completed else normalized.exit_reason,
+            exit_code=0 if normalized.completed else 1,
         )
         _write_session_result_file({
             "status": last_result_status,
@@ -8091,18 +8137,28 @@ def main() -> int:
         )
         os.environ["PB1_LAST_RESULT_STATUS"] = str(result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(main_exit_reason)
+        normalized = normalize_session_result(
+            status=result_status,
+            reason=main_exit_reason,
+            order_candidates=int(metrics.get("order_candidates", 0) or 0),
+            api_submitted=int(metrics.get("api_submitted", 0) or metrics.get("submitted", 0) or 0),
+            skipped=int(metrics.get("skipped", 0) or 0),
+            skip_reasons=metrics.get("skip_reasons") or [],
+        )
         _record_session_execution_marker(
             engine=engine,
             env=ctx.env,
             session_kind=_resolve_session_kind(),
             trade_date=_get_now_kst().date(),
-            status=result_status,
-            exit_reason=main_exit_reason,
+            status=normalized.status,
+            exit_reason=normalized.exit_reason,
             recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
+            completed=bool(normalized.completed),
+            retryable=bool(normalized.retryable),
             sell_orders_ack=int(metrics.get("sell_orders", 0) or 0),
-            entry_status="DONE" if str(result_status).upper() in {"OK", "OK_NO_TRADE"} else ("ABORT" if str(result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else "UNKNOWN"),
-            entry_abort_reason=main_exit_reason if str(result_status).upper() in {"FAIL_PRECHECK", "ERROR"} else None,
-            exit_code=_exit_code_for_status(result_status),
+            entry_status="DONE" if normalized.completed else "ABORT",
+            entry_abort_reason=None if normalized.completed else normalized.exit_reason,
+            exit_code=0 if normalized.completed else 1,
         )
         _write_session_result_file({
             "status": result_status,

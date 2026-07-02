@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -246,6 +247,26 @@ from trader.strategies.pb1_pullback_close import (
 
 logger = logging.getLogger(__name__)
 
+
+
+
+def _git_rev_parse(cmd: list[str]) -> str:
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return "unknown"
+
+def _log_code_version() -> None:
+    dirty = _git_rev_parse(["git", "status", "--porcelain"])
+    log_fn = logger.warning if dirty else logger.info
+    log_fn(
+        "[CODE_VERSION] branch=%s commit=%s dirty=%s file_pb1_engine_sha=%s file_pb1_runner_sha=%s",
+        _git_rev_parse(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
+        _git_rev_parse(["git", "rev-parse", "HEAD"]),
+        dirty,
+        _git_rev_parse(["git", "hash-object", "trader/pb1_engine.py"]),
+        _git_rev_parse(["git", "hash-object", "trader/pb1_runner.py"]),
+    )
 
 class PB1StageTimeout(RuntimeError):
     pass
@@ -639,6 +660,15 @@ def _extract_dnca_tot_amt(balance_resp: dict) -> int | None:
         if value is not None and str(value).strip() != "":
             return int(float(str(value).replace(",", "")))
     return None
+
+
+@dataclass
+class CandidateWidthAdjustmentResult:
+    orderable_candidates: list["CandidateFeature"]
+    backfill_attempted: bool = False
+    backfill_added_count: int = 0
+    concentration_guard_triggered: bool = False
+    concentration_guard_status: str = "none"
 
 
 @dataclass
@@ -6308,7 +6338,7 @@ class PB1Engine:
             plan_dict = plan.to_dict()
         except Exception as exc:
             logger.warning(
-                "[PB1][ENTRY_PLAN][MISSING_OR_INVALID] code=%s entry_style=%s entry_reason=%s err=%s action=skip_buy",
+                "[PB1][ENTRY_EXIT_PLAN][MISSING_OR_INVALID] code=%s entry_style=%s entry_reason=%s err=%s action=skip_buy",
                 cf.code, entry_style_selected, entry_reason, exc,
             )
             self._append_ledger_event(
@@ -6321,8 +6351,8 @@ class PB1Engine:
                 price=float(entry_price_for_plan or 0.0),
                 client_order_key=cf.client_order_key,
                 ok=False,
-                reasons=["ENTRY_EXIT_PLAN_MISSING_OR_INVALID"],
-                stage="ENTRY_PLAN_VALIDATE",
+                reasons=["entry_exit_plan_missing_or_invalid"],
+                stage="ENTRY_EXIT_PLAN_VALIDATE",
                 payload_json={
                     "features": cf.features,
                     "entry_style_selected": entry_style_selected,
@@ -6348,7 +6378,7 @@ class PB1Engine:
             "policy_version": plan_dict.get("policy_version"),
         }
         logger.info(
-            "[PB1][ENTRY_PLAN][READY] code=%s thesis=%s style=%s horizon=%s exit_family=%s eod_action=%s force_eod=%s stop=%.2f risk_R=%.2f max_days=%s version=%s",
+            "[PB1][ENTRY_EXIT_PLAN][READY] code=%s thesis=%s style=%s horizon=%s exit_family=%s eod_action=%s force_eod=%s stop=%.2f risk_R=%.2f max_days=%s version=%s",
             cf.code, plan_dict.get("entry_thesis"), plan_dict.get("entry_style_selected"),
             plan_dict.get("trade_horizon"), plan_dict.get("exit_policy_family"), plan_dict.get("eod_action"),
             int(bool(plan_dict.get("force_eod_close"))), float(risk.get("initial_stop") or 0.0),
@@ -8842,6 +8872,73 @@ class PB1Engine:
         return None, None, 1, "missing_all_primary_inputs"
 
 
+    def _apply_candidate_width_backfill_and_concentration_guard(
+        self,
+        *,
+        orderable_candidates: list[CandidateFeature],
+        candidates: list[CandidateFeature] | None = None,
+        budget_meta: dict[str, Any] | None = None,
+    ) -> CandidateWidthAdjustmentResult:
+        min_buyable = max(1, int(self._int_env("PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE", self._int_env("PB1_MIN_BUYABLE", PB1_MIN_BUYABLE))))
+        result = CandidateWidthAdjustmentResult(orderable_candidates=orderable_candidates)
+        if len(orderable_candidates) < min_buyable:
+            result.backfill_attempted = True
+            logger.info(
+                "[ENTRY][BACKFILL][START] current=%s min_buyable=%s setup_ok=%s risk_ok=%s sized_ok=%s",
+                len(orderable_candidates), min_buyable,
+                len(getattr(self, "_debug_setup_ok_codes", []) or []),
+                len(getattr(self, "_debug_risk_ok_codes", []) or []),
+                len(getattr(self, "_debug_sizing_ok_codes", []) or []),
+            )
+            if self._bool_env("PB1_ADAPTIVE_ATR_BACKFILL_ENABLED", True):
+                base_atr = float(self._float_env("PB1_ATR_MAX_PCT", 10.0))
+                max_atr = float(self._float_env("PB1_ADAPTIVE_ATR_BACKFILL_MAX_PCT", 11.5))
+                step = max(0.1, float(self._float_env("PB1_ADAPTIVE_ATR_BACKFILL_STEP_PCT", 0.5)))
+                existing = {c.code for c in orderable_candidates}
+                pass_no = 0
+                cur = base_atr
+                pool = list(candidates or [])
+                while len(orderable_candidates) < min_buyable and cur < max_atr:
+                    nxt = min(max_atr, cur + step)
+                    pass_no += 1
+                    selected: list[str] = []
+                    for cf in pool:
+                        if cf.code in existing:
+                            continue
+                        atr_pct = float((cf.features or {}).get("atr_pct") or (cf.features or {}).get("atr_percent") or 0.0)
+                        price = float((cf.features or {}).get("order_price") or (cf.features or {}).get("close") or 0.0)
+                        if price > 0 and (atr_pct == 0.0 or (base_atr < atr_pct <= nxt)):
+                            cf.features["candidate_tier"] = "adaptive_atr_backfill"
+                            cf.features["risk_tag"] = "ATR_RELAXED"
+                            cf.features["atr_gate_base_pct"] = base_atr
+                            cf.features["atr_gate_relaxed_pct"] = nxt
+                            cf.sizing_reason = "ADAPTIVE_ATR_BACKFILL"
+                            orderable_candidates.append(cf)
+                            existing.add(cf.code)
+                            selected.append(cf.code)
+                            result.backfill_added_count += 1
+                            if len(orderable_candidates) >= min_buyable:
+                                break
+                    logger.info("[ENTRY][BACKFILL][ATR_RELAX] pass=%s from=%.1f to=%.1f candidates=%s", pass_no, cur, nxt, selected)
+                    cur = nxt
+                if result.backfill_added_count:
+                    logger.info("[ENTRY][BACKFILL][SELECTED] codes=%s reason=adaptive_atr", [c.code for c in orderable_candidates[-result.backfill_added_count:]])
+        if self._bool_env("PB1_CONCENTRATION_GUARD_ENABLED", True) and len(orderable_candidates) == 1:
+            only_cf = orderable_candidates[0]
+            meta = budget_meta or getattr(self, "_budget_plan_meta", {}) or {}
+            per_budget = float(meta.get("per_position_budget") or 0.0)
+            price = float((only_cf.features or {}).get("order_price") or (only_cf.features or {}).get("close") or 0.0)
+            mult = float(self._float_env("PB1_HIGH_PRICE_SINGLE_BUDGET_MULT", 1.5))
+            if per_budget > 0 and price > per_budget * mult:
+                result.concentration_guard_triggered = True
+                result.concentration_guard_status = "HIGH_PRICE_SINGLE_ONLY"
+                only_cf.features["concentration_guard"] = "HIGH_PRICE_SINGLE_ONLY"
+                only_cf.features["risk_tag"] = "CONCENTRATED_SINGLE_HIGH_PRICE"
+                logger.warning("[ENTRY][CONCENTRATION_GUARD] high_price_single_only=1 code=%s price=%.0f per_position_budget=%.0f action=backfill", only_cf.code, price, per_budget)
+                if result.backfill_added_count == 0:
+                    logger.warning("[ENTRY][CONCENTRATION_GUARD][BACKFILL_FAIL] code=%s action=allow_with_risk_tag env=%s", only_cf.code, getattr(self, "env", "practice"))
+        return result
+
     def _entry_stage_name(self) -> str:
         window = str(getattr(self, "window_internal", "") or getattr(self, "window_label", "") or "").lower()
         phase = str(getattr(self, "phase", "") or "").lower()
@@ -9007,7 +9104,7 @@ class PB1Engine:
         
         display_code = self._display_code(cf.code)
         stage = self._entry_stage_name()
-        plan = getattr(cf, "entry_plan", None)
+        plan = getattr(cf, "entry_plan", None) or (cf.features or {}).get("entry_plan")
         if not isinstance(plan, dict):
             entry_price_for_plan = float(cf.features.get("entry_price") or cf.features.get("order_price") or cf.features.get("close") or 0.0)
             order_price_for_plan = float(cf.features.get("order_price") or entry_price_for_plan or 0.0)
@@ -9017,26 +9114,47 @@ class PB1Engine:
                 cf, entry_price=entry_price_for_plan, order_price=order_price_for_plan, stop_price=stop_price_for_plan,
                 trigger_ok=bool(cf.features.get("breakout_trigger_ok") or cf.features.get("trigger_ok")),
                 trigger_info=trigger_info_for_plan, entry_mode=str(cf.features.get("entry_mode") or ""),
-                stage=stage, price_source=str(cf.features.get("price_source") or "fallback_in_place_entry"),
+                stage=stage, price_source=str(cf.features.get("price_source") or "rebuild_in_place_entry"),
             )
             cf.entry_plan = plan
+            cf.features["entry_plan"] = plan
+            logger.warning(
+                "[PB1][ENTRY_ORDER_PLAN][RECOVERED] code=%s source=rebuild_in_place_entry stage=%s",
+                display_code, stage,
+            )
         qty = int((plan or {}).get("qty") or cf.planned_qty or 0)
         plan_ok, plan_reasons = self._validate_entry_plan(plan)
+        logger.info(
+            "[ORDER][SUBMIT][ENTRY_PLAN_CHECK] code=%s has_cf_plan=%s has_feature_plan=%s plan_ok=%s reasons=%s stage=%s qty=%s limit=%.0f",
+            display_code,
+            int(isinstance(getattr(cf, "entry_plan", None), dict)),
+            int(isinstance((cf.features or {}).get("entry_plan"), dict)),
+            int(plan_ok), plan_reasons or ["ok"], stage, qty,
+            float((plan or {}).get("limit_price") or (plan or {}).get("order_price") or 0.0),
+        )
         if not plan_ok:
+            logger.error(
+                "[PB1][ENTRY_ORDER_PLAN][CONTRACT_DRIFT] code=%s submit_ok=0 reasons=%s plan_keys=%s plan=%s features_entry_plan_exists=%s cf_entry_plan_exists=%s",
+                display_code, plan_reasons,
+                sorted(list(plan.keys())) if isinstance(plan, dict) else [], plan,
+                int(isinstance((cf.features or {}).get("entry_plan"), dict)),
+                int(isinstance(getattr(cf, "entry_plan", None), dict)),
+            )
             logger.warning(
-                "[PB1][ENTRY_PLAN][MISSING_OR_INVALID] code=%s entry_style=%s entry_reason=%s err=%s entry_style_selected=%s action=skip_buy",
-                display_code, (plan or {}).get("entry_style"), (plan or {}).get("entry_reason"),
-                ",".join(plan_reasons), cf.features.get("entry_style_selected"),
+                "[PB1][ENTRY_ORDER_PLAN][MISSING_OR_INVALID] code=%s reasons=%s plan_keys=%s entry_style=%s entry_family=%s trigger_policy=%s action=skip_buy",
+                display_code, plan_reasons,
+                sorted(list(plan.keys())) if isinstance(plan, dict) else [],
+                (plan or {}).get("entry_style"), (plan or {}).get("entry_family"), (plan or {}).get("trigger_policy"),
             )
             self._append_ledger_event(
                 event_type="ORDER_SKIP", code=cf.code, market=cf.market, mode=cf.mode, side="BUY", qty=qty,
                 price=float((plan or {}).get("limit_price") or cf.features.get("order_price") or cf.features.get("close") or 0.0),
-                client_order_key=cf.client_order_key, ok=False, reasons=["entry_plan_invalid"] + plan_reasons,
+                client_order_key=cf.client_order_key, ok=False, reasons=["entry_order_plan_invalid"] + plan_reasons,
                 stage=stage, payload_json={"entry_plan": plan, "features": cf.features},
             )
-            self._last_order_skip_reasons = getattr(self, "_last_order_skip_reasons", []) + ["entry_plan_invalid"] + plan_reasons
+            self._last_order_skip_reasons = getattr(self, "_last_order_skip_reasons", []) + ["entry_order_plan_invalid"] + plan_reasons
             status["skipped"] = 1
-            status["skipped_reason"] = "entry_plan_invalid"
+            status["skipped_reason"] = "entry_order_plan_invalid"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -9372,6 +9490,14 @@ class PB1Engine:
             return status
         status["submit_attempted"] = 1
         logger.info(
+            "[ORDER][API_CALL][START] code=%s qty=%s price=%.0f order_type=%s client_order_key=%s",
+            cf.code,
+            qty,
+            float(limit_price or record_price or 0.0),
+            order_type,
+            effective_client_order_key,
+        )
+        logger.info(
             "[ORDER][API_REQUEST] code=%s name=%s qty=%s price=%s order_type=%s",
             cf.code,
             stock_name,
@@ -9429,6 +9555,17 @@ class PB1Engine:
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
         msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
+        logger.info(
+            "[ORDER][API_CALL][END] code=%s api_submitted=%s accepted=%s odno=%s rt_cd=%s msg_cd=%s msg1=%s",
+            cf.code,
+            int(status.get("api_submitted", 0)),
+            int(bool(ok)),
+            kis_odno,
+            rt_cd,
+            msg_cd,
+            msg1,
+        )
         status["broker_response_code"] = msg_cd or rt_cd
         status["broker_message"] = msg1
         logger.info(
@@ -13048,6 +13185,7 @@ class PB1Engine:
 
         # ✅ [SESSION_KIND] run() 스코프 내 session_kind 안전 정의 — NameError 방지
         session_kind = self._safe_session_kind()
+        _log_code_version()
         logger.info(
             "[PB1][SESSION_KIND][ENGINE] session_kind=%s phase=%s window=%s window_name=%s market_window=%s",
             session_kind,
@@ -13500,6 +13638,14 @@ class PB1Engine:
             submitted: int,
             blocked_reasons_counter: Counter[str] | dict[str, int] | None,
             no_trade_reason: str | None,
+            api_submitted: int | None = None,
+            attempted: int = 0,
+            accepted: int = 0,
+            filled: int = 0,
+            skipped: int = 0,
+            failed: int = 0,
+            rejected: int = 0,
+            skip_reasons: list[str] | None = None,
         ) -> None:
             blocked_counter = _summarize_blocked_reasons(blocked_reasons_counter)
             entry_skipped = bool(no_trade_reason in {"PORTFOLIO_FULL", "PHASE_VERIFY", "phase_verify"} or submitted == 0 and scanned == 0 and no_trade_reason)
@@ -13513,6 +13659,14 @@ class PB1Engine:
                 "buyable_ok": int(buyable_ok),
                 "order_candidates": int(order_candidates),
                 "submitted": int(submitted),
+                "api_submitted": int(api_submitted if api_submitted is not None else submitted),
+                "attempted": int(attempted),
+                "accepted": int(accepted),
+                "filled": int(filled),
+                "skipped": int(skipped),
+                "failed": int(failed),
+                "rejected": int(rejected),
+                "skip_reasons": list(skip_reasons or []),
                 "blocked_reasons_counter": {key: int(value) for key, value in blocked_counter.items()},
                 "blocked_by": _format_reason_counts(blocked_counter),
                 "no_trade_reason": no_trade_reason,
@@ -13536,6 +13690,14 @@ class PB1Engine:
                 "after_buyable_count": payload["buyable_ok"],
                 "order_candidate_count": payload["order_candidates"],
                 "submit_success_count": payload["submitted"],
+                "api_submitted_count": payload["api_submitted"],
+                "attempted_count": payload["attempted"],
+                "accepted_count": payload["accepted"],
+                "filled_count": payload["filled"],
+                "skipped_count": payload["skipped"],
+                "failed_count": payload["failed"],
+                "rejected_count": payload["rejected"],
+                "skip_reasons": payload["skip_reasons"],
                 "blocked_reasons_counter": payload["blocked_reasons_counter"],
                 "skip_reason_top": payload["no_trade_reason"] or "none",
                 "entry_decision_result": payload["entry_decision_result"],
@@ -15676,7 +15838,7 @@ class PB1Engine:
                     )
                     plan_ok, plan_reasons = self._validate_entry_plan(cf.entry_plan)
                     logger.info(
-                        "[PB1][ENTRY_PLAN][BUILT] code=%s ok=%s style=%s family=%s trigger_policy=%s stage=%s qty=%s entry=%.2f order=%.2f stop=%.2f reasons=%s",
+                        "[PB1][ENTRY_ORDER_PLAN][BUILT] code=%s ok=%s style=%s family=%s trigger_policy=%s stage=%s qty=%s entry=%.2f order=%.2f stop=%.2f reasons=%s",
                         self._display_code(cf.code), int(plan_ok), cf.entry_plan.get("entry_style"),
                         cf.entry_plan.get("entry_family"), cf.entry_plan.get("trigger_policy"), cf.entry_plan.get("stage"),
                         cf.entry_plan.get("qty"), float(cf.entry_plan.get("entry_price") or 0.0),
@@ -15684,10 +15846,10 @@ class PB1Engine:
                         plan_reasons or ["ok"],
                     )
                     if not plan_ok:
-                        self._record_drop(drop_reason_counter, drop_examples, "entry_plan_invalid", cf.code)
-                        self._log_order_skip(cf, ["entry_plan_invalid"] + plan_reasons, actual_stage)
+                        self._record_drop(drop_reason_counter, drop_examples, "entry_order_plan_invalid", cf.code)
+                        self._log_order_skip(cf, ["entry_order_plan_invalid"] + plan_reasons, actual_stage)
                         self._emit_buy_decision(
-                            cf, order_value=order_value, reasons=["entry_plan_invalid"] + plan_reasons,
+                            cf, order_value=order_value, reasons=["entry_order_plan_invalid"] + plan_reasons,
                             entry_allowed=entry_allowed, entry_reason=entry_reason,
                         )
                         continue
@@ -15896,7 +16058,22 @@ class PB1Engine:
                 order_stage_counter["setup_not_ok"] += 1
             orderable_candidates = valid_orderable
 
+            candidate_width_result = self._apply_candidate_width_backfill_and_concentration_guard(
+                orderable_candidates=orderable_candidates,
+                candidates=candidates if 'candidates' in locals() else [],
+                budget_meta=getattr(self, "_budget_plan_meta", {}) or {},
+            )
+            orderable_candidates = candidate_width_result.orderable_candidates
             orderable_codes = [c.code for c in orderable_candidates]
+            buyable_ok_codes = list(orderable_codes)
+            min_buyable_for_width = int(self._int_env("PB1_ADAPTIVE_ATR_BACKFILL_MIN_BUYABLE", self._int_env("PB1_MIN_BUYABLE", PB1_MIN_BUYABLE)))
+            if len(orderable_candidates) < min_buyable_for_width or candidate_width_result.concentration_guard_triggered:
+                logger.warning(
+                    "[RUN_SUMMARY][CANDIDATE_WIDTH] final30=%s setup_ok=%s risk_ok=%s sized_ok=%s buyable_ok=%s backfill_added=%s final_orders=%s min_buyable=%s concentration_guard=%s",
+                    len(scan_members), len(setup_ok_codes), len(self._debug_risk_ok_codes), len(self._debug_sizing_ok_codes),
+                    len(buyable_ok_codes), candidate_width_result.backfill_added_count, len(orderable_candidates),
+                    min_buyable_for_width, candidate_width_result.concentration_guard_status,
+                )
             logger.info("[ORDER_CANDIDATES] count=%s codes=%s", len(orderable_codes), orderable_codes)
             logger.info("[ORDER_CANDIDATES][READY] count=%s codes=%s", len(orderable_codes), orderable_codes)
             if (getattr(self, "_relax_bridge_summary", {}) or {}).get("activated"):
@@ -16407,22 +16584,34 @@ class PB1Engine:
                     open_orders_count,
                 )
                 if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
-                    if skipped_count >= len(orderable_candidates) and attempted_count == 0:
-                        # 모든 후보가 guard / cooldown / 중복 방지로 skip된 정상 케이스 → not-fatal
+                    plan_skip_reasons = [
+                        str(r)
+                        for r in getattr(self, "_last_order_skip_reasons", [])
+                        if "entry_plan" in str(r).lower()
+                        or "entry_order_plan" in str(r).lower()
+                        or "entry_exit_plan" in str(r).lower()
+                    ]
+                    if skipped_count >= len(orderable_candidates) and plan_skip_reasons:
+                        final_status = "RETRYABLE_ORDER_BUILD_ERROR"
+                        final_notes = "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT"
+                        logger.error(
+                            "[RUN_SUMMARY][RESULT] status=RETRYABLE_ORDER_BUILD_ERROR reason=ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT order_candidates=%s skipped=%s api_submitted=%s skip_reasons=%s",
+                            len(orderable_candidates), skipped_count, api_submitted_count, plan_skip_reasons,
+                        )
+                    elif skipped_count >= len(orderable_candidates) and attempted_count == 0:
                         logger.warning(
                             "[ORDER][ALL_SKIPPED_BEFORE_SUBMIT] session=%s candidates=%s skipped=%s reasons=%s",
-                            self.session_kind,
-                            len(orderable_candidates),
-                            skipped_count,
-                            {},
+                            self.session_kind, len(orderable_candidates), skipped_count, getattr(self, "_last_order_skip_reasons", []),
                         )
                         logger.info(
                             "[RUN_SUMMARY][RESULT] session=%s status=OK_NO_TRADE reason=ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
                             self.session_kind,
                         )
                     else:
+                        final_status = "RETRYABLE_ORDER_BUILD_ERROR"
+                        final_notes = "ORDER_CANDIDATE_WITHOUT_API_SUBMIT"
                         logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s skipped=%s", len(orderable_candidates), attempted_count, accepted_count, skipped_count)
-                        if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "1") == "1":
+                        if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "0") == "1":
                             raise RuntimeError(
                                 f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
                             )
@@ -16566,6 +16755,14 @@ class PB1Engine:
             buyable_ok=len(buyable_ok_codes),
             order_candidates=len(orderable_candidates),
             submitted=int(api_submitted_count) if 'api_submitted_count' in locals() else int(submit_success_count),
+            api_submitted=int(api_submitted_count) if 'api_submitted_count' in locals() else int(submit_success_count),
+            attempted=int(attempted_count) if 'attempted_count' in locals() else 0,
+            accepted=int(accepted_count) if 'accepted_count' in locals() else 0,
+            filled=int(filled_count) if 'filled_count' in locals() else 0,
+            skipped=int(skipped_count) if 'skipped_count' in locals() else 0,
+            failed=int(failed_count) if 'failed_count' in locals() else 0,
+            rejected=int(rejected_count) if 'rejected_count' in locals() else 0,
+            skip_reasons=list(getattr(self, "_last_order_skip_reasons", [])),
             blocked_reasons_counter=drop_reason_counter,
             no_trade_reason=(
                 _primary_no_trade_reason(
