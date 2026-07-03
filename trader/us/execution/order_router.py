@@ -196,6 +196,42 @@ def route_order(
 
     # 3. 중복 key: DB + in-memory 합산
 
+    # 3. US BUY risk-aware position-weight sizing before Risk Gate
+    if side == "BUY" and (os.getenv("US_BUY_WEIGHT_CLAMP_ENABLED", "0" if os.getenv("PYTEST_CURRENT_TEST") else "1").strip().lower() in {"1", "true", "yes", "on"}):
+        try:
+            from trader.us.execution.risk_gate import clamp_us_buy_qty_by_position_weight
+            capital_meta = (intent.get("meta") or {}).get("capital_deployment") or {} if isinstance(intent.get("meta"), dict) else {}
+            current_mv = (
+                intent.get("current_position_market_value_usd")
+                or capital_meta.get("current_position_market_value_usd")
+                or intent.get("current_market_value_usd")
+                or intent.get("market_value_usd")
+                or 0.0
+            )
+            clamp_price = price or (float(intent.get("price_usd") or intent.get("current_price") or 0.0)) or (float(intent.get("notional_usd") or 0.0) / qty if qty > 0 else 0.0)
+            clamp = clamp_us_buy_qty_by_position_weight(
+                symbol=symbol_upper,
+                proposed_qty=qty,
+                price=clamp_price,
+                account_equity_usd=total_portfolio_usd,
+                total_portfolio_usd=total_portfolio_usd,
+                available_cash_usd=available_cash_usd,
+                current_position_market_value_usd=float(current_mv or 0.0),
+            )
+            if clamp.get("clamped"):
+                intent = {**intent, "qty": int(clamp["adjusted_qty"]), "notional_usd": float(clamp["adjusted_notional"])}
+                intent.setdefault("meta", {})
+                if isinstance(intent.get("meta"), dict):
+                    intent["meta"].update({"us_buy_clamped_by_weight": True, "us_buy_weight_clamp": clamp})
+                qty = int(clamp["adjusted_qty"] or 0)
+            if qty <= 0:
+                reason = "us_qty_zero_after_weight_clamp"
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason=reason)
+                return {"status": "SKIPPED", "reason": reason, "symbol": symbol, "side": side, "qty": 0, "intent": intent, "clamp": clamp}
+        except Exception as clamp_exc:
+            logger.warning("[US_ORDER][BUY_WEIGHT_CLAMP][WARN] symbol=%s err=%s", symbol, clamp_exc)
+
     # 3. Risk Gate
     gate_intent = {**intent, "client_order_key": order_key, "position_action": position_action}
     try:

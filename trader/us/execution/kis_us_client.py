@@ -1029,10 +1029,7 @@ class KisUSClient:
                 # Success after retry
                 if attempt > 1 and last_error:
                     self.stats["temp_recovered_count"] += 1
-                    logger.info(
-                        f"[US_KIS][TEMP_RECOVERED] endpoint={path.split('/')[-1]} attempt={attempt}/{max_attempts} "
-                        f"last_error={last_error!r}"
-                    )
+                    logger.warning({"event":"us_kis_call_recovered_temp","market":"US","severity":"WARN","endpoint":path.split('/')[-1],"retry_count":attempt-1,"attempt":attempt,"max_retry":max_attempts-1,"last_error":repr(last_error)})
                 
                 return data
             
@@ -1057,10 +1054,7 @@ class KisUSClient:
                 # 최종 실패
                 if not suppress_final_log:
                     self.stats["http_fail_final_count"] += 1
-                    logger.error(
-                        f"[US_KIS][FINAL_ERROR] attempt={attempt}/{max_attempts} "
-                        f"endpoint={path.split('/')[-1]} attempts={max_attempts} error={err!r} temporary={is_temp}"
-                    )
+                    logger.error({"event":"us_kis_call_failed_final","market":"US","severity":"ERROR","endpoint":path.split('/')[-1],"attempt":attempt,"attempts":max_attempts,"error":repr(err),"temporary":is_temp})
                 if is_temp:
                     raise KisUSTemporaryError(f"GET {path} failed after {attempt} attempts: {err}") from err
                 else:
@@ -1091,10 +1085,7 @@ class KisUSClient:
                 # Success after retry
                 if attempt > 1 and last_error:
                     self.stats["temp_recovered_count"] += 1
-                    logger.info(
-                        f"[US_KIS][TEMP_RECOVERED] endpoint={path.split('/')[-1]} attempt={attempt}/{max_attempts} "
-                        f"last_error={last_error!r}"
-                    )
+                    logger.warning({"event":"us_kis_call_recovered_temp","market":"US","severity":"WARN","endpoint":path.split('/')[-1],"retry_count":attempt-1,"attempt":attempt,"max_retry":max_attempts-1,"last_error":repr(last_error)})
                 
                 return data
             
@@ -1118,10 +1109,7 @@ class KisUSClient:
                 
                 # 최종 실패
                 self.stats["http_fail_final_count"] += 1
-                logger.error(
-                    f"[US_KIS][FINAL_ERROR] attempt={attempt}/{max_attempts} "
-                    f"endpoint={path.split('/')[-1]} attempts={max_attempts} error={err!r} temporary={is_temp}"
-                )
+                logger.error({"event":"us_kis_call_failed_final","market":"US","severity":"ERROR","endpoint":path.split('/')[-1],"attempt":attempt,"attempts":max_attempts,"error":repr(err),"temporary":is_temp})
                 if is_temp:
                     raise KisUSTemporaryError(f"POST {path} failed after {attempt} attempts: {err}") from err
                 else:

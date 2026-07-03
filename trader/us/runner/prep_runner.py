@@ -117,6 +117,29 @@ def _save_json_file(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+
+def compute_us_prep_quality_grade(*, universe_count: int, candidate_pool_count: int, candidate_pool_target: int = 50) -> str:
+    if int(universe_count or 0) >= 300 and int(candidate_pool_count or 0) >= int(candidate_pool_target or 0):
+        return "US_PREP_QUALITY_A"
+    if int(universe_count or 0) >= 150:
+        return "US_PREP_QUALITY_B"
+    if int(universe_count or 0) >= 80:
+        return "US_PREP_QUALITY_C"
+    return "US_PREP_QUALITY_D"
+
+def write_us_authoritative_prep_manifest(*, trade_date: str, run_id: str, final30_path: str, quality_grade: str, universe_count: int, candidate_pool_count: int, allow_overwrite: bool = False) -> dict:
+    manifest_dir = Path("reports/us_prep/manifest")
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path = manifest_dir / f"{trade_date}.json"
+    if path.exists() and not allow_overwrite:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        logger.info("[US_PREP][MANIFEST][KEEP_AUTHORITATIVE] trade_date=%s run_id=%s final30_path=%s", trade_date, existing.get("authoritative_prep_run_id"), existing.get("final30_path"))
+        return {"status": "EXISTS", "path": str(path), "manifest": existing}
+    payload = {"market": "US", "trade_date": trade_date, "authoritative_prep_run_id": run_id, "created_at": datetime.utcnow().isoformat() + "Z", "quality_grade": quality_grade, "final30_path": final30_path, "universe_count": int(universe_count or 0), "candidate_pool_count": int(candidate_pool_count or 0), "allow_overwrite": bool(allow_overwrite)}
+    _save_json_file(path, payload)
+    logger.info("[US_PREP][MANIFEST][SAVED] trade_date=%s run_id=%s quality_grade=%s final30_path=%s", trade_date, run_id, quality_grade, final30_path)
+    return {"status": "SAVED", "path": str(path), "manifest": payload}
+
 def run_prep(env: str = "practice", offline: bool = False, force_now: str | None = None) -> dict:
     """Dual-Agent US Prep 실행.
 
@@ -257,6 +280,9 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         )
         cp_count = candidate_pool_result.get("selected_count", 0)
         cp_status = candidate_pool_result.get("status", "ERROR")
+        prep_quality_grade = compute_us_prep_quality_grade(universe_count=du_count, candidate_pool_count=cp_count)
+        if du_count < int(os.getenv("US_UNIVERSE_TARGET", "300") or 300):
+            logger.warning("[US_PREP][LIQUIDITY_FALLBACK][NEEDED] filtered_count=%d target=%s quality_grade=%s", du_count, os.getenv("US_UNIVERSE_TARGET", "300"), prep_quality_grade)
         logger.info("[US_PREP][HEARTBEAT] stage=candidate_pool status=done selected=%d", cp_count)
 
         if cp_status == "ERROR" or cp_count < 50:
@@ -452,7 +478,24 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "contract_ok": contract_ok,
         "trade_can_proceed": trade_can_proceed,
         "watchlist_count": saved_count,
+        "quality_grade": prep_quality_grade,
+        "universe_count": du_count,
+        "candidate_pool_count": cp_count,
     }
+    try:
+        manifest_result = write_us_authoritative_prep_manifest(
+            trade_date=trade_date,
+            run_id=run_id,
+            final30_path=str(us_final30_scored_path(trade_date)),
+            quality_grade=prep_quality_grade,
+            universe_count=du_count,
+            candidate_pool_count=cp_count,
+            allow_overwrite=force_rebuild_prep,
+        )
+        result_dict["authoritative_prep_manifest"] = manifest_result.get("path")
+    except Exception as exc:
+        logger.warning("[US_PREP][MANIFEST][WARN] %s", exc)
+
     finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
 
     logger.info(
@@ -510,6 +553,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
         "trade_can_proceed": trade_can_proceed,
+        "quality_grade": prep_quality_grade,
     }
 
 

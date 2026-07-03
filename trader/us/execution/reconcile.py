@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -571,6 +572,49 @@ def reconcile_ack_orders_with_balance(
         "unresolved_count": unresolved_count,
         "symbols_by_status": symbols_by_status,
     }
+
+
+def reconcile_us_sell_ack_by_balance_delta(order: dict, *, current_balance_qty: int, stale_after_sec: int | None = None, now_ts: float | None = None) -> dict:
+    """Classify a US SELL ACK using position quantity delta. Pure helper for tests/runtime."""
+    import time
+    before_qty, source = _extract_pre_order_position_qty(order)
+    if before_qty is None:
+        before_qty = _safe_int(_first_present(order, ["pre_sell_qty", "position_qty_before_order", "position_qty_before"], 0))
+    ordered_qty = _safe_int(_first_present(order, ["qty_requested", "qty", "filled_qty", "qty_filled"], 0))
+    cur = max(0, int(current_balance_qty or 0))
+    filled_by_balance = max(0, int(before_qty or 0) - cur)
+    if ordered_qty > 0 and filled_by_balance >= ordered_qty:
+        status = "US_FILLED_BY_BALANCE_DELTA"
+        remaining = 0
+        clear_pending = True
+        allow_residual_exit_recheck = cur > 0
+    elif filled_by_balance > 0:
+        status = "US_PARTIALLY_FILLED_BY_BALANCE_DELTA"
+        remaining = max(0, ordered_qty - filled_by_balance)
+        clear_pending = False
+        allow_residual_exit_recheck = cur > 0
+    else:
+        created = order.get("created_at_ts") or order.get("created_ts") or order.get("ack_ts")
+        try:
+            age = float(now_ts if now_ts is not None else time.time()) - float(created)
+        except Exception:
+            age = 0.0
+        max_age = int(stale_after_sec if stale_after_sec is not None else os.getenv("US_PENDING_SELL_MAX_AGE_SEC", "240")) if 'os' in globals() else int(stale_after_sec or 240)
+        if age > max_age > 0:
+            status = "US_PENDING_SELL_STALE_RELEASED"
+            remaining = ordered_qty
+            clear_pending = True
+            allow_residual_exit_recheck = True
+        else:
+            status = "ACK_UNRESOLVED"
+            remaining = ordered_qty
+            clear_pending = False
+            allow_residual_exit_recheck = False
+    return {"status": status, "filled_qty": min(filled_by_balance, ordered_qty) if ordered_qty > 0 else filled_by_balance, "remaining_qty": remaining, "before_qty": before_qty, "current_qty": cur, "ordered_qty": ordered_qty, "pre_qty_source": source, "clear_pending_sell": clear_pending, "allow_residual_exit_recheck": allow_residual_exit_recheck}
+
+def should_us_hard_stop_exit_residual(*, residual_qty: int, pnl_pct: float, hard_stop_pct: float, market: str = "US") -> dict:
+    should = str(market).upper() == "US" and int(residual_qty or 0) > 0 and float(pnl_pct) <= float(hard_stop_pct)
+    return {"should_exit": should, "qty": int(residual_qty or 0) if should else 0, "reason": "us_hard_stop_after_partial_soft_stop" if should else "no_residual_hard_stop_exit"}
 
 def classify_ack_orders_with_final_balance(
     *,
