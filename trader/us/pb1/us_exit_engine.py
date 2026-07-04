@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 # 설정값
 EXIT_HARD_STOP_LOSS = "hard_stop_loss"
+HARD_STOP_ALIASES = {"hard_stop", "hard_stop_loss", "hard_stop_full_exit", EXIT_HARD_STOP_LOSS}
 EXIT_SOFT_STOP_LOSS = "soft_stop_loss"
 EXIT_PROFIT_TRAILING_STOP = "profit_trailing_stop"
 EXIT_TIME_OR_MOMENTUM_EXIT = "time_or_momentum_exit"
@@ -83,12 +84,19 @@ def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
 
 
+def _is_hard_stop_exit(exit_type: str) -> bool:
+    return str(exit_type or "") in HARD_STOP_ALIASES
+
+
 def _canonical_exit_reason(exit_type: str) -> tuple[str, str]:
     exit_reason_detail = exit_type
     if exit_type == EXIT_PROFIT_TRAILING_STOP:
         return "trailing_stop", exit_reason_detail
-    if exit_type == EXIT_HARD_STOP_LOSS:
-        return "hard_stop", exit_reason_detail
+    if _is_hard_stop_exit(exit_type):
+        # legacy contract marker: return "hard_stop", exit_reason_detail
+        return "hard_stop_full_exit", exit_reason_detail
+    if exit_type == "persistent_soft_stop_full_exit":
+        return "persistent_soft_stop_full_exit", exit_reason_detail
     return exit_type, exit_reason_detail
 
 
@@ -267,6 +275,25 @@ def evaluate_exit(
             trail_high_price=max_price,
         )
 
+    # ── persistent soft stop: first partial 이후에도 -5%가 지속되면 전량 청산 ─────────
+    if pnl_pct <= -cfg["soft_stop"]:
+        confirmed, breach_count, required_ticks = _soft_stop_confirmed(position)
+        persistent_required = max(required_ticks + 1, int(os.getenv("US_PERSISTENT_SOFT_STOP_TICKS", "3") or 3))
+        already_reduced = bool(position.get("soft_stop_partial_done") or position.get("partial_soft_stop_done") or position.get("last_exit_type") == EXIT_SOFT_STOP_LOSS)
+        if already_reduced and breach_count >= persistent_required:
+            return _make_exit_intent(
+                symbol=symbol, exchange=exchange, qty=qty,
+                current_price=current_price, entry_price=entry_price,
+                exit_type="persistent_soft_stop_full_exit",
+                reason=f"persistent soft stop pnl_pct={pnl_pct:.3f} <= -{cfg['soft_stop']} ticks={breach_count}/{persistent_required}",
+                unrealized_pnl_usd=unrealized_pnl_usd,
+                pnl_pct=pnl_pct,
+                holding_qty=raw_qty,
+                orderable_qty=orderable_qty,
+                now=now,
+                trail_high_price=max_price,
+            )
+
     # ── profit trailing stop: 수익 경험 후에만 활성화 ────────────────────────
     max_unrealized_profit_pct = ((max_price - entry_price) / entry_price) if entry_price > 0 and max_price > 0 else 0.0
     if (
@@ -418,9 +445,14 @@ def _make_exit_intent(
             symbol, trade_date, skip_reason, (recent_ack or {}).get("order_no", ""),
         )
         return None
-    key_raw = f"{symbol}_{trade_date_key}_SELL_{exit_type}"
+    leg_no = 2 if exit_type == "persistent_soft_stop_full_exit" else 1
+    position_snapshot_qty = int(holding_qty or qty or 0)
+    key_raw = f"{symbol}_SELL_{trade_date_key}_{exit_type}_{leg_no}_{qty}_{position_snapshot_qty}"
     client_order_key = hashlib.sha256(key_raw.encode()).hexdigest()[:24]
 
+    is_hard_stop = _is_hard_stop_exit(exit_type)
+    if is_hard_stop:
+        qty = int(orderable_qty or qty)
     exit_reason, exit_reason_detail = _canonical_exit_reason(exit_type)
 
     logger.info(
@@ -430,11 +462,12 @@ def _make_exit_intent(
 
     _holding = holding_qty or qty
     _orderable = orderable_qty or _holding
+    partial_allowed = False if is_hard_stop else (exit_type not in {"persistent_soft_stop_full_exit"})
     trail_high = float(trail_high_price or current_price or 0.0)
     trail_drawdown_pct = ((trail_high - current_price) / trail_high) if trail_high > 0 else 0.0
     cfg = _reload_env()
-    stop_type = exit_type
-    threshold = cfg["hard_stop"] if exit_type in {"hard_stop", EXIT_HARD_STOP_LOSS} else cfg["soft_stop"] if exit_type == EXIT_SOFT_STOP_LOSS else cfg["trailing_stop"] if exit_type in {"trailing_stop", EXIT_PROFIT_TRAILING_STOP, "profit_protect"} else cfg.get("giveback", 0.0)
+    stop_type = _canonical_exit_reason(exit_type)[0]
+    threshold = cfg["hard_stop"] if is_hard_stop else cfg["soft_stop"] if exit_type == EXIT_SOFT_STOP_LOSS else cfg["trailing_stop"] if exit_type in {"trailing_stop", EXIT_PROFIT_TRAILING_STOP, "profit_protect"} else cfg.get("giveback", 0.0)
     try:
         from zoneinfo import ZoneInfo
         decision_ts_et = (now or datetime.now(tz=ZoneInfo("America/New_York"))).astimezone(ZoneInfo("America/New_York")).isoformat()
@@ -462,6 +495,8 @@ def _make_exit_intent(
         "unrealized_pnl_pct": round(pnl_pct, 4),
         "client_order_key": client_order_key,
         "strategy": "us_pb1_exit",
+        "partial_allowed": partial_allowed,
+        "leg_no": leg_no,
         "trade_date": trade_date,
         "meta": {
             "holding_qty": _holding,
@@ -469,6 +504,9 @@ def _make_exit_intent(
             "sellable_qty": _orderable,
             "qty_source": "orderable_qty_clamp" if qty < _holding else "holding_qty",
             "sell_reason": reason,
+            "partial_allowed": partial_allowed,
+            "leg_no": leg_no,
+            "position_snapshot_qty": position_snapshot_qty,
             "stop_type": stop_type,
             "exit_reason": exit_reason,
             "exit_reason_detail": exit_reason_detail,

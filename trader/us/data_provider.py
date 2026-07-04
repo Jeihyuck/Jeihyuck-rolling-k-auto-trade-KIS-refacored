@@ -721,7 +721,7 @@ class USDataProvider:
             # Re-raise original exception if not temporary or no DB fallback
             raise
 
-    def get_balance(self) -> dict:
+    def get_balance(self, force_refresh: bool = False) -> dict:
         """잔고 조회."""
         if self._offline:
             return {
@@ -740,7 +740,7 @@ class USDataProvider:
                 "queried_exchanges": [],
                 "exchange_result_counts": {},
             }
-        raw = self._get_client().get_us_balance()
+        raw = self._get_client().get_us_balance(force_refresh=force_refresh)
         return normalize_us_balance(raw)
 
     def get_orderable_cash(

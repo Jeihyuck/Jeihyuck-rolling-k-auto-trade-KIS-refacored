@@ -571,6 +571,22 @@ def route_order(
 
     # ── DB ACK 저장 (KIS 성공 이후 별도 try) ─────────────────────────────
     # KIS 주문이 성공했으므로 어떤 경우에도 REJECT로 기록하면 안 된다.
+    ack_meta = {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp}
+    if side.upper() == "SELL":
+        pre_qty = (
+            ack_meta.get("pre_order_position_qty")
+            or ack_meta.get("pre_sell_qty")
+            or ack_meta.get("position_snapshot_qty")
+            or ack_meta.get("holding_qty")
+            or intent.get("holding_qty")
+            or intent.get("available_qty")
+        )
+        if pre_qty not in (None, ""):
+            try:
+                ack_meta["pre_order_position_qty"] = int(float(pre_qty))
+                ack_meta["pre_order_position_source"] = "pre_sell_position_snapshot"
+            except (TypeError, ValueError):
+                logger.warning("[US_ORDER][ACK_META][PRE_QTY_INVALID] symbol=%s pre_qty=%s", symbol, pre_qty)
     ack_result = {
         "client_order_key": order_key,
         "symbol": symbol,
@@ -582,7 +598,7 @@ def route_order(
         "order_no": order_no,
         "status": "ACK",
         "dry_run": False,
-        "meta": {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp},
+        "meta": ack_meta,
     }
 
     ack_db_saved = False

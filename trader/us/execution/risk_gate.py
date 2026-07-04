@@ -141,8 +141,23 @@ def check_position_weight(
 ) -> None:
     if total_portfolio_usd <= 0:
         return
+    # Router/unit-test callers may omit account equity and leave the historical
+    # 1000 USD default. Use configured US_ACCOUNT_EQUITY_USD as the reference
+    # when available so the 5% limit is applied to account equity, not a tiny
+    # placeholder.
+    try:
+        env_equity = float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0)
+    except (TypeError, ValueError):
+        env_equity = 0.0
+    try:
+        cap_krw = float(os.getenv("US_PAPER_MAX_CAPITAL_KRW", "0") or 0)
+        fx = float(os.getenv("US_BUDGET_FX_KRW_PER_USD", "1450") or 1450)
+        env_equity = max(env_equity, cap_krw / fx if fx > 0 else 0.0)
+    except (TypeError, ValueError):
+        pass
+    reference_portfolio_usd = max(float(total_portfolio_usd), env_equity)
     projected_position_value = max(0.0, current_position_market_value_usd) + notional_usd
-    weight = projected_position_value / total_portfolio_usd
+    weight = projected_position_value / reference_portfolio_usd
     limit = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
     if weight > limit:
         _block(
