@@ -75,3 +75,126 @@ def test_daily_final_report_payload_uses_distinct_orders(tmp_path, monkeypatch):
     saved = json.loads((tmp_path / "reports/us_daily/latest_us_daily_report.json").read_text())
     assert saved["session"] in {"daily_final", "close"}
     assert saved["real_broker_sells"] == 10
+
+
+def test_partial_sell_ack_balance_delta_confirm_via_reconcile_path(monkeypatch):
+    import trader.us.execution.reconcile as reconcile
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "load_pending_ack_orders", lambda trade_date, env="practice": [{
+        "symbol": "FLEX",
+        "side": "SELL",
+        "order_no": "0000043867",
+        "client_order_key": "FLEX-SELL-1",
+        "qty_requested": 4,
+        "avg_price_usd": 35.0,
+        "meta": {"pre_sell_qty": 8},
+    }])
+    captured = []
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+
+    class Provider:
+        def __init__(self):
+            self.force_refresh_values = []
+
+        def get_balance(self, force_refresh=False):
+            self.force_refresh_values.append(force_refresh)
+            return {"positions": [{"symbol": "FLEX", "qty": 4, "avg_price": 35.0}]}
+
+        def get_fills_by_order_no(self, **kwargs):
+            return {}
+
+    provider = Provider()
+    result = reconcile.reconcile_ack_orders_with_balance(provider=provider, trade_date="2026-07-02", env="practice")
+
+    assert provider.force_refresh_values == [True]
+    assert result["balance_reconcile_count"] == 1
+    assert result["unresolved_count"] == 0
+    assert "FLEX" in result["symbols_by_status"]["balance_confirmed"]
+    assert captured[0]["source"] == "balance_reconcile_sell"
+    assert captured[0]["meta"]["balance_delta_status"] == "BALANCE_CONFIRMED_SELL"
+
+
+def test_reconcile_bypasses_stale_balance_cache_for_partial_sell(monkeypatch):
+    import trader.us.execution.reconcile as reconcile
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "load_pending_ack_orders", lambda trade_date, env="practice": [{
+        "symbol": "FLEX",
+        "side": "SELL",
+        "order_no": "0000043867",
+        "client_order_key": "FLEX-SELL-1",
+        "qty_requested": 4,
+        "avg_price_usd": 35.0,
+        "meta": {"holding_qty": 8},
+    }])
+    captured = []
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+
+    class Provider:
+        def __init__(self):
+            self.cached_qty = 8
+            self.fresh_qty = 4
+            self.force_refresh_values = []
+
+        def get_balance(self, force_refresh=False):
+            self.force_refresh_values.append(force_refresh)
+            qty = self.fresh_qty if force_refresh else self.cached_qty
+            return {"positions": [{"symbol": "FLEX", "qty": qty, "avg_price": 35.0}]}
+
+        def get_fills_by_order_no(self, **kwargs):
+            return {}
+
+    provider = Provider()
+    result = reconcile.reconcile_ack_orders_with_balance(provider=provider, trade_date="2026-07-02", env="practice")
+
+    assert provider.force_refresh_values == [True]
+    assert result["balance_reconcile_count"] == 1
+    assert result["unresolved_count"] == 0
+    assert captured[0]["filled_qty"] == 4
+
+
+def test_hard_stop_aliases_force_full_exit(monkeypatch):
+    from trader.us.pb1.us_exit_engine import _make_exit_intent, EXIT_HARD_STOP_LOSS
+
+    monkeypatch.setattr("trader.us.pb1.us_exit_engine.should_skip_exit_due_to_pending_sell", lambda *a, **k: (False, None, None))
+    for alias in ["hard_stop", "hard_stop_loss", "hard_stop_full_exit", EXIT_HARD_STOP_LOSS]:
+        intent = _make_exit_intent(
+            "FLEX", "NASDAQ", 1, 90.0, 100.0, alias, "alias hard stop", -40.0, -0.10,
+            holding_qty=8, orderable_qty=4,
+        )
+        assert intent["qty"] == 4
+        assert intent["partial_allowed"] is False
+        assert intent["exit_reason"] == "hard_stop_full_exit"
+        assert intent["meta"]["partial_allowed"] is False
+
+
+def test_full_sell_position_absent_fallback_still_confirms(monkeypatch):
+    import trader.us.execution.reconcile as reconcile
+    import trader.us.db.repos as repos
+
+    monkeypatch.setattr(repos, "load_pending_ack_orders", lambda trade_date, env="practice": [{
+        "symbol": "FLEX",
+        "side": "SELL",
+        "order_no": "0000043867",
+        "client_order_key": "FLEX-SELL-FULL",
+        "qty_requested": 4,
+        "avg_price_usd": 35.0,
+        "pre_order_position_qty": 4,
+        "meta": {},
+    }])
+    captured = []
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {"positions": []}
+
+        def get_fills_by_order_no(self, **kwargs):
+            return {}
+
+    result = reconcile.reconcile_ack_orders_with_balance(provider=Provider(), trade_date="2026-07-02", env="practice")
+
+    assert result["balance_reconcile_count"] == 1
+    assert result["unresolved_count"] == 0
+    assert captured[0]["source"] in {"balance_reconcile_sell", "balance_reconcile_delta_sell"}

@@ -80,7 +80,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         provider = USDataProvider(offline=True)
 
     try:
-        balance = provider.get_balance()
+        balance = _get_balance_force_refresh(provider)
     except Exception as exc:
         logger.error("[US_RECONCILE][ERROR] balance fetch failed: %s", exc)
         return {
@@ -276,19 +276,34 @@ def _nested_get(row: dict, dotted_key: str):
 def _extract_pre_order_position_qty(order: dict) -> tuple[int | None, str]:
     meta = _order_meta(order)
     candidates = [
+        # Priority 1: canonical pre-order snapshot.
         (order, "pre_order_position_qty", "order_pre_order_position_qty"),
+        (meta, "pre_order_position_qty", "meta_pre_order_position_qty"),
+        (meta, "pre_order_position_snapshot.qty", "meta_pre_order_position_snapshot_qty"),
+        # Priority 2: SELL-specific partial-sell snapshot aliases.
+        (order, "pre_sell_qty", "order_pre_sell_qty"),
+        (meta, "pre_sell_qty", "meta_pre_sell_qty"),
+        (meta, "pre_sell_position_snapshot.qty", "meta_pre_sell_position_snapshot_qty"),
+        # Priority 3: generic position snapshot quantity aliases.
+        (order, "position_snapshot_qty", "order_position_snapshot_qty"),
+        (meta, "position_snapshot_qty", "meta_position_snapshot_qty"),
+        # Priority 4: holding quantity aliases.
+        (order, "holding_qty", "order_holding_qty"),
+        (meta, "holding_qty", "meta_holding_qty"),
+        # Existing BUY/generic aliases.
         (order, "pre_order_qty", "order_pre_order_qty"),
         (order, "pre_buy_position_qty", "order_pre_buy_position_qty"),
         (order, "position_qty_before_order", "order_position_qty_before_order"),
         (order, "position_qty_before", "order_position_qty_before"),
         (order, "existing_position_qty", "order_existing_position_qty"),
-        (meta, "pre_order_position_qty", "meta_pre_order_position_qty"),
         (meta, "pre_order_qty", "meta_pre_order_qty"),
         (meta, "pre_buy_position_qty", "meta_pre_buy_position_qty"),
         (meta, "position_qty_before_order", "meta_position_qty_before_order"),
         (meta, "position_qty_before", "meta_position_qty_before"),
         (meta, "existing_position_qty", "meta_existing_position_qty"),
-        (meta, "pre_order_position_snapshot.qty", "meta_pre_order_position_snapshot_qty"),
+        # Priority 5: orderable_qty is last because it can be lower than holding_qty.
+        (order, "orderable_qty", "order_orderable_qty"),
+        (meta, "orderable_qty", "meta_orderable_qty"),
     ]
     for row, key, source in candidates:
         value = _nested_get(row, key) if "." in key else row.get(key)
@@ -317,6 +332,16 @@ def _buy_balance_reconcile_allowed(order: dict, *, current_qty: int, order_qty: 
     # handled above), total current quantity is not safe evidence of a BUY fill.
     return False, "missing_pre_order_qty_snapshot", None
 
+
+
+def _get_balance_force_refresh(provider: Any) -> dict:
+    try:
+        return provider.get_balance(force_refresh=True)
+    except TypeError as exc:
+        if "force_refresh" not in str(exc):
+            raise
+        logger.warning("[US_RECONCILE][BALANCE_FORCE_REFRESH_UNSUPPORTED] provider=%s", type(provider).__name__)
+        return provider.get_balance()
 
 def confirm_order_by_balance_delta(side: str, order_qty: int, pre_qty: int | None, post_qty: int | None) -> dict:
     """Classify an ACK order from explicit pre/post balance quantities without fake fills."""
@@ -385,7 +410,7 @@ def reconcile_ack_orders_with_balance(
     kis_position_by_symbol: dict[str, dict] = {}
     kis_position_symbols: set[str] = set()
     try:
-        balance = provider.get_balance()
+        balance = _get_balance_force_refresh(provider)
         kis_position_by_symbol = _build_kis_position_by_symbol(balance.get("positions", []))
         kis_position_symbols = set(kis_position_by_symbol.keys())
     except Exception as exc:
@@ -632,7 +657,7 @@ def classify_ack_orders_with_final_balance(
         orders = load_pending_ack_orders(trade_date=trade_date, env=env)
 
     try:
-        balance = provider.get_balance()
+        balance = _get_balance_force_refresh(provider)
         final_positions = _build_kis_position_by_symbol(balance.get("positions", []))
     except Exception as exc:
         return {"status": "ERROR", "error": str(exc), "orders": [], "pending_order_count": len(orders or [])}

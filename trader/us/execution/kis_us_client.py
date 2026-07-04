@@ -308,7 +308,7 @@ class KisUSClient:
     # Account
     # ------------------------------------------------------------------
 
-    def get_us_balance(self) -> dict:
+    def get_us_balance(self, force_refresh: bool = False) -> dict:
         """해외주식 잔고 조회 (다중 거래소).
         
         기본적으로 NASD, NYSE, AMEX 3개 거래소를 조회하여 병합.
@@ -334,7 +334,7 @@ class KisUSClient:
         cache_key = ("balance", tuple(exchanges))
         ttl = float(os.getenv("US_KIS_BALANCE_CACHE_TTL_SEC", "30") or 30)
         cached = self._response_cache.get(cache_key)
-        if cached and time.time() - cached[0] <= ttl and os.getenv("US_KIS_FORCE_BALANCE_REFRESH", "0") not in {"1", "true", "True"}:
+        if cached and not force_refresh and time.time() - cached[0] <= ttl and os.getenv("US_KIS_FORCE_BALANCE_REFRESH", "0") not in {"1", "true", "True"}:
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
             return cached[1]
 
