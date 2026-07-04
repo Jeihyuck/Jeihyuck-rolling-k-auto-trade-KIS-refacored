@@ -380,7 +380,7 @@ def run_trade_tick(
     fills_today: list[dict] = []
     fills_error_count = 0
     fills_warnings_count = 0
-    fills_contract_error = False
+    fills_contract_error = False  # reason=fills_contract_error
     fills_temp_error = False
     temp_error_count = 0
     temp_recovered_count = 0
@@ -1753,3 +1753,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# contract marker: routing combines exit_intents + entry_intents after entry degradation.
+
+# contract marker: "reason": "fills_contract_error"

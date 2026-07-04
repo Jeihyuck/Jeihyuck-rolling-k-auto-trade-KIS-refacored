@@ -317,6 +317,20 @@ def _buy_balance_reconcile_allowed(order: dict, *, current_qty: int, order_qty: 
     # handled above), total current quantity is not safe evidence of a BUY fill.
     return False, "missing_pre_order_qty_snapshot", None
 
+
+def confirm_order_by_balance_delta(side: str, order_qty: int, pre_qty: int | None, post_qty: int | None) -> dict:
+    """Classify an ACK order from explicit pre/post balance quantities without fake fills."""
+    if pre_qty is None or post_qty is None or order_qty <= 0:
+        return {"status": "RECONCILE_NEEDS_RECHECK", "pending": True, "filled_qty_by_balance": 0, "remaining_qty": order_qty}
+    delta = int(post_qty) - int(pre_qty)
+    side_u = str(side or "").upper()
+    filled = -delta if side_u == "SELL" else delta if side_u == "BUY" else 0
+    if filled == order_qty:
+        return {"status": f"BALANCE_CONFIRMED_{side_u}", "pending": False, "filled_qty_by_balance": filled, "remaining_qty": 0}
+    if 0 < filled < order_qty:
+        return {"status": "BALANCE_CONFIRMED_PARTIAL", "pending": True, "filled_qty_by_balance": filled, "remaining_qty": order_qty - filled}
+    return {"status": "RECONCILE_NEEDS_RECHECK", "pending": True, "filled_qty_by_balance": max(0, filled), "remaining_qty": order_qty}
+
 def reconcile_ack_orders_with_balance(
     *,
     provider: Any | None = None,
@@ -395,6 +409,9 @@ def reconcile_ack_orders_with_balance(
             or 0
         )
         fallback_fill_price, fallback_price_source = _resolve_order_fill_price(order)
+        pre_qty_for_delta, _pre_source = _extract_pre_order_position_qty(order)
+        post_qty_for_delta = int((kis_position_by_symbol.get(symbol) or {}).get("qty") or 0)
+        delta_confirmation = confirm_order_by_balance_delta(side, qty, pre_qty_for_delta, post_qty_for_delta)
 
         # KIS 체결조회 시도
         fill_confirmed = False
@@ -443,6 +460,32 @@ def reconcile_ack_orders_with_balance(
                     "[US_RECONCILE][ACK_RECONCILE][ERROR] mark_order_filled failed symbol=%s: %s",
                     symbol, exc,
                 )
+            continue
+
+        # fill 미확인: explicit 주문 전/후 잔고 delta가 명확하면 balance-confirmed 처리
+        if delta_confirmation["status"] in {"BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL"}:
+            filled_by_balance = int(delta_confirmation.get("filled_qty_by_balance") or 0)
+            source_name = "balance_reconcile_partial" if delta_confirmation["status"] == "BALANCE_CONFIRMED_PARTIAL" else f"balance_reconcile_{side.lower()}"
+            logger.info(
+                "[US_RECONCILE][BALANCE_DELTA_CONFIRMED] symbol=%s side=%s order_qty=%d filled_qty=%d pre_qty=%s post_qty=%s status=%s",
+                symbol, side, qty, filled_by_balance, pre_qty_for_delta, post_qty_for_delta, delta_confirmation["status"],
+            )
+            try:
+                mark_order_filled_by_reconcile(
+                    order_no=order_no,
+                    client_order_key=client_order_key,
+                    symbol=symbol,
+                    side=side,
+                    filled_qty=filled_by_balance,
+                    avg_price_usd=fallback_fill_price,
+                    source=source_name,
+                    trade_date=trade_date,
+                    meta={**_order_meta(order), "balance_delta_status": delta_confirmation["status"], "remaining_qty": delta_confirmation.get("remaining_qty", 0)},
+                )
+                balance_reconcile_count += 1
+                symbols_by_status["balance_confirmed"].append(symbol)
+            except Exception as exc:
+                logger.error("[US_RECONCILE][ACK_RECONCILE][ERROR] balance_delta_confirm failed symbol=%s: %s", symbol, exc)
             continue
 
         # fill 미확인: BUY이면 KIS 잔고 증가분으로만 balance reconcile
@@ -631,7 +674,7 @@ def classify_ack_orders_with_final_balance(
             "client_order_key": str(order.get("client_order_key") or ""),
             "ack_status": raw_status,
             "fill_api_status": "FILLED_BY_KIS_FILL_API" if final_status == "FILLED_BY_KIS_FILL_API" else "NOT_CONFIRMED_BY_FILL_API",
-            "balance_delta_status": "FILLED_BY_BALANCE_DELTA" if final_status == "FILLED_BY_BALANCE_DELTA" else "NOT_CONFIRMED_BY_BALANCE_DELTA",
+            "balance_delta_status": ("BALANCE_CONFIRMED_" + side) if final_status == "FILLED_BY_BALANCE_DELTA" else (final_status if final_status == "BALANCE_CONFIRMED_PARTIAL" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),
             "final_status": final_status,
             "price_source": str((order.get("meta") or {}).get("price_source") or order.get("price_source") or ""),
             "pnl_if_sell": (order.get("meta") or {}).get("pnl_if_sell") if isinstance(order.get("meta") or {}, dict) else None,

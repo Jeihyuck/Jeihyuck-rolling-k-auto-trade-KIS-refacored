@@ -48,7 +48,7 @@ def calc_position_size(
     """
     # 한국장 PB1 기준 반영: 기본값 30, 0이면 무제한
     max_positions = int(os.getenv("US_MAX_POSITIONS", "30"))
-    max_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.10"))
+    max_weight = float(os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
     cash_buffer_usd = float(os.getenv("US_MIN_CASH_BUFFER_USD", "200"))
     order_cap_usd = float(os.getenv("US_MAX_ORDER_USD", "2500"))
 

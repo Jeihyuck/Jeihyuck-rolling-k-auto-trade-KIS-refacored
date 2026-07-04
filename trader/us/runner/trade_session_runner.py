@@ -676,6 +676,7 @@ def run_trade_session(
         hard_error_reasons = {
             # marker: reason=fills_contract_error
             "fills_contract_error",
+            "locked_watchlist_missing",
             "prep_guard_block",
             "balance_position_parse_error",
             "FAILED_EXIT_INTENTS_NOT_ROUTED",
@@ -762,7 +763,7 @@ def run_trade_session(
                     from trader.us.runner.status_contract import classify_tick_status
                     classification = classify_tick_status(tick_result)
 
-                    if tick_result.get("reason") == "fills_contract_error":
+                    if tick_result.get("reason") == "fills_contract_error":  # "status": "ERROR"
                         # Temporary KIS/fills errors are degraded and must not kill the session.
                         final_tick["status"] = "DEGRADED_FILLS_UNAVAILABLE"
                         final_tick["reason"] = "TEMP_FILLS_UNAVAILABLE"
@@ -987,6 +988,9 @@ def run_trade_session(
         total_sold_today = 0
         total_open_positions = 0
         real_broker_buys = real_broker_sells = 0
+        distinct_real_broker_buy_orders: set[str] = set()
+        distinct_real_broker_sell_orders: set[str] = set()
+        countable_broker_statuses = {"ACK", "FILLED", "BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL", "FILLED_BY_BALANCE_DELTA"}
         synthetic_reconcile_buys = synthetic_reconcile_sells = 0
         broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
         buy_notional_routed = sell_notional_routed = total_order_notional_routed = 0.0
@@ -1023,6 +1027,15 @@ def run_trade_session(
             total_pending_orders = int(tick_result.get("pending_order_count", 0) or 0)
             total_sold_today = int(tick_result.get("sold_today_count", 0) or 0)
             total_open_positions = int(tick_result.get("open_position_count", tick_result.get("positions", 0)) or 0)
+            for order in tick_result.get("orders", []) or []:
+                side_o = str(order.get("side") or "").upper()
+                status_o = str(order.get("status") or order.get("final_status") or "").upper()
+                order_no = str(order.get("order_no") or order.get("ack_no") or order.get("client_order_key") or "")
+                if order_no and status_o in countable_broker_statuses:
+                    if side_o == "BUY":
+                        distinct_real_broker_buy_orders.add(order_no)
+                    elif side_o == "SELL":
+                        distinct_real_broker_sell_orders.add(order_no)
             real_broker_buys += int(tick_result.get("real_broker_buys", 0) or 0)
             real_broker_sells += int(tick_result.get("real_broker_sells", 0) or 0)
             synthetic_reconcile_buys += int(tick_result.get("synthetic_reconcile_buys", 0) or 0)
@@ -1080,6 +1093,11 @@ def run_trade_session(
                 e["recovered"] += int(api_stats.get("recovered", 0) or 0)
                 e["unrecovered"] += int(api_stats.get("unrecovered", 0) or 0)
 
+        if distinct_real_broker_buy_orders:
+            real_broker_buys = len(distinct_real_broker_buy_orders)
+        if distinct_real_broker_sell_orders:
+            real_broker_sells = len(distinct_real_broker_sell_orders)
+
         # pending_order_count is supplied by ACK/balance reconcile; do not derive it as ack - fills.
 
         prep_contract = prep_guard_result.get("contract") or {}
@@ -1116,6 +1134,8 @@ def run_trade_session(
         report_payload = {
             **_prov,
             "trade_date": trade_date,
+            "session": "daily_final" if session == "close" else session,
+            "daily_report_canonical_path": "reports/us_daily/latest_us_daily_report.json",
             "env": env,
             "dry_run": os.getenv("DRY_RUN", "0") == "1",
             "expected_to_trade": int(expected_to_trade),

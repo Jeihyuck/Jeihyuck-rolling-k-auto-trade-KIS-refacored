@@ -36,16 +36,16 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # =========================
 
 # US prep: 21:30 KST, before US open
-30 21 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-us-prep.lock $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-us-prep.sh >> $APP/runtime/cron/us-prep.log 2>&1
+30 21 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-us-prep.lock $APP/scripts/wsl/run-us-session.sh prep >> $APP/runtime/cron/us-prep.log 2>&1
 
 # US AM/open session: 22:30 KST
-30 22 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-us-am.lock $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-us-am.sh >> $APP/runtime/cron/us-am.log 2>&1
+30 22 * * 1-5 cd $APP && /usr/bin/flock -n /tmp/nullim-us-am.lock $APP/scripts/wsl/run-us-session.sh am >> $APP/runtime/cron/us-am.log 2>&1
 
 # US afternoon: 02:00 KST, next calendar day
-0 2 * * 2-6 cd $APP && /usr/bin/flock -n /tmp/nullim-us-afternoon.lock $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-us-afternoon.sh >> $APP/runtime/cron/us-afternoon.log 2>&1
+0 2 * * 2-6 cd $APP && /usr/bin/flock -n /tmp/nullim-us-afternoon.lock $APP/scripts/wsl/run-us-session.sh afternoon >> $APP/runtime/cron/us-afternoon.log 2>&1
 
 # US close: 05:05 KST, next calendar day
-5 5 * * 2-6 cd $APP && /usr/bin/flock -n /tmp/nullim-us-close.lock $APP/scripts/wsl/with-venv.sh $APP/scripts/wsl/run-us-close.sh >> $APP/runtime/cron/us-close.log 2>&1
+5 5 * * 2-6 cd $APP && /usr/bin/flock -n /tmp/nullim-us-close.lock $APP/scripts/wsl/run-us-session.sh close >> $APP/runtime/cron/us-close.log 2>&1
 
 # =========================
 # Log mail schedule

@@ -168,12 +168,16 @@ class KisUSClient:
         self._cano = us_cfg.CANO
         self._acnt_prdt_cd = us_cfg.ACNT_PRDT_CD
         self._last_request_time: dict[str, float] = {}  # endpoint별 rate limiting
+        self._response_cache: dict[tuple, tuple[float, Any]] = {}
+        self._temporary_error_streak: dict[tuple, int] = {}
         self.stats = {
             "get_retry_count": 0,
             "post_retry_count": 0,
             "http_fail_final_count": 0,
             "temp_error_count": 0,
             "temp_recovered_count": 0,
+            "temp_unrecovered_count": 0,
+            "stale_price_fallback_count": 0,
         }
 
     # ------------------------------------------------------------------
@@ -251,7 +255,25 @@ class KisUSClient:
             "EXCD": self._resolve_quote_excd(exchange),
             "SYMB": symbol,
         }
-        return self._get(tr["path"], headers=headers, params=params)
+        cache_key = ("price", symbol.upper(), self._resolve_quote_excd(exchange))
+        ttl = float(os.getenv("US_KIS_PRICE_CACHE_TTL_SEC", "20") or 20)
+        now_ts = time.time()
+        cached = self._response_cache.get(cache_key)
+        if cached and now_ts - cached[0] <= ttl:
+            logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_price symbol=%s ttl=%.1f", symbol, ttl)
+            return cached[1]
+        try:
+            data = self._get(tr["path"], headers=headers, params=params)
+            self._response_cache[cache_key] = (time.time(), data)
+            self._temporary_error_streak[cache_key] = 0
+            return data
+        except KisUSTemporaryError:
+            self._temporary_error_streak[cache_key] = self._temporary_error_streak.get(cache_key, 0) + 1
+            if cached and self._temporary_error_streak[cache_key] >= 2:
+                self.stats["stale_price_fallback_count"] += 1
+                logger.warning("[US_KIS][STALE_PRICE_FALLBACK] endpoint=GET_price symbol=%s streak=%d", symbol, self._temporary_error_streak[cache_key])
+                return cached[1]
+            raise
 
     def get_us_daily_price(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """해외주식 기간별 시세 (일봉)."""
@@ -273,7 +295,13 @@ class KisUSClient:
             "BYMD": bymd,
             "MODP": "0",
         }
+        cache_key = ("dailyprice", symbol.upper(), self._resolve_quote_excd(exchange), bymd)
+        cached = self._response_cache.get(cache_key)
+        if cached:
+            logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_dailyprice symbol=%s bymd=%s", symbol, bymd)
+            return (cached[1].get("output2") or [])[:count]
         result = self._get(tr["path"], headers=headers, params=params)
+        self._response_cache[cache_key] = (time.time(), result)
         return (result.get("output2") or [])[:count]
 
     # ------------------------------------------------------------------
@@ -303,6 +331,13 @@ class KisUSClient:
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
         
+        cache_key = ("balance", tuple(exchanges))
+        ttl = float(os.getenv("US_KIS_BALANCE_CACHE_TTL_SEC", "30") or 30)
+        cached = self._response_cache.get(cache_key)
+        if cached and time.time() - cached[0] <= ttl and os.getenv("US_KIS_FORCE_BALANCE_REFRESH", "0") not in {"1", "true", "True"}:
+            logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
+            return cached[1]
+
         logger.info("[US_BALANCE] querying exchanges=%s", exchanges)
         
         merged_output1: list[dict] = []
@@ -370,7 +405,7 @@ class KisUSClient:
             ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
         )
         
-        return {
+        result_payload = {
             "rt_cd": "0",
             "output1": merged_output1,
             "output2": merged_output2,
@@ -381,6 +416,8 @@ class KisUSClient:
             "raw_count": raw_count,
             "duplicate_skipped": duplicate_skipped,
         }
+        self._response_cache[cache_key] = (time.time(), result_payload)
+        return result_payload
     
     def _get_us_balance_single_exchange(
         self,
@@ -482,11 +519,12 @@ class KisUSClient:
                 bool(next_nk),
             )
         
-        return {
+        result_payload = {
             "rt_cd": "0",
             "output1": all_output1,
             "output2": output2,
         }
+        return result_payload
     
     def _merge_duplicate_symbols(self, rows: list[dict]) -> list[dict]:
         """symbol 중복 처리.
@@ -1062,6 +1100,7 @@ class KisUSClient:
                         f"endpoint={path.split('/')[-1]} attempts={max_attempts} error={err!r} temporary={is_temp}"
                     )
                 if is_temp:
+                    self.stats["temp_unrecovered_count"] += 1
                     raise KisUSTemporaryError(f"GET {path} failed after {attempt} attempts: {err}") from err
                 else:
                     raise

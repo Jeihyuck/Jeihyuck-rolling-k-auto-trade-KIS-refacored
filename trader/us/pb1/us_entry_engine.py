@@ -364,6 +364,62 @@ def _calc_add_position_size(*, symbol: str, price: float, available_cash_usd: fl
     }
 
 
+
+def _risk_clamp_new_buy_size(*, symbol: str, price: float, signal_target_notional: float, account_equity: float, current_symbol_market_value: float = 0.0, remaining_buy_budget: float = 0.0, max_position_weight: float | None = None) -> dict:
+    """Clamp NEW_BUY sizing before router risk gate sees the intent."""
+    max_w = float(max_position_weight if max_position_weight is not None else os.getenv("US_MAX_POSITION_WEIGHT", "0.05"))
+    equity = float(account_equity or 0.0)
+    allowed_notional = max(0.0, equity * max_w - float(current_symbol_market_value or 0.0))
+    budget = float(remaining_buy_budget if remaining_buy_budget is not None else 0.0)
+    final_notional_cap = min(float(signal_target_notional or 0.0), allowed_notional, max(0.0, budget))
+    final_qty = int(final_notional_cap // price) if price > 0 else 0
+    final_notional = final_qty * price
+    result = {
+        "allowed_notional": allowed_notional,
+        "final_notional": final_notional,
+        "final_qty": final_qty,
+        "max_position_weight": max_w,
+        "projected_weight": ((float(current_symbol_market_value or 0.0) + final_notional) / equity) if equity > 0 else 0.0,
+    }
+    if final_qty < 1:
+        result["skip_reason"] = "INSUFFICIENT_CAPACITY_AFTER_RISK_CLAMP"
+    logger.info(
+        "[US_ENTRY][RISK_CLAMP] symbol=%s signal_notional=%.4f allowed_notional=%.4f "
+        "remaining_buy_budget=%.4f final_qty=%d final_notional=%.4f max_position_weight=%.4f",
+        symbol, float(signal_target_notional or 0.0), allowed_notional, budget, final_qty, final_notional, max_w,
+    )
+    return result
+
+
+def _validate_new_buy_explain_contract(symbol: str, entry_meta: dict | None, entry_style: str, signal_score: float | None = None) -> tuple[bool, str]:
+    data = entry_meta or {}
+    style = str(entry_style or data.get("entry_style") or "").upper()
+    score_keys = ("breakout_score", "pullback_score", "momentum_score")
+    scores = []
+    has_component_score = any(key in data for key in score_keys)
+    for key in score_keys:
+        try:
+            scores.append(float(data.get(key) or 0.0))
+        except (TypeError, ValueError):
+            scores.append(0.0)
+    if not has_component_score:
+        try:
+            scores.append(float(data.get("score") or data.get("final_score") or signal_score or 0.0))
+        except (TypeError, ValueError):
+            scores.append(0.0)
+    if signal_score is not None:
+        try:
+            scores.append(float(signal_score or 0.0))
+        except (TypeError, ValueError):
+            pass
+    if style == "SKIP" or not style:
+        logger.error("[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=entry_style_skip_for_new_buy", symbol)
+        return False, "ENTRY_EXPLAIN_CONTRACT_ERROR"
+    if max(scores) <= 0.0:
+        logger.error("[US_ENTRY][ENTRY_EXPLAIN_CONTRACT_ERROR] symbol=%s reason=all_scores_zero", symbol)
+        return False, "ENTRY_EXPLAIN_CONTRACT_ERROR"
+    return True, ""
+
 def _can_reenter_after_soft_exit(symbol: str, entry_meta: dict, now: datetime | None = None) -> bool:
     """Allow limited same-day reentry only after a recoverable soft/profit-trailing exit.
 
@@ -839,8 +895,8 @@ def generate_entry_intents(
             )
             if sizing["blocked"]:
                 reason = sizing.get("reason", "add_sizing_blocked")
-                if reason in {"full_weight", "weight_unknown"}:
-                    action = "SKIP_FULL_WEIGHT" if reason == "full_weight" else "SKIP_ADD_WEIGHT_UNKNOWN"
+                if reason in {"full_weight", "weight_unknown", "max_symbol_weight_reached"}:
+                    action = "SKIP_FULL_WEIGHT" if reason in {"full_weight", "max_symbol_weight_reached"} else "SKIP_ADD_WEIGHT_UNKNOWN"
                     track_skip(symbol, reason)
                     logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=%s current_weight=%s", symbol, action, sizing.get("current_weight"))
                     continue
@@ -874,8 +930,23 @@ def generate_entry_intents(
                 )
                 continue
 
-            qty = sizing["qty"]
-            notional = sizing["notional_usd"]
+            risk_clamp = _risk_clamp_new_buy_size(
+                symbol=symbol,
+                price=price,
+                signal_target_notional=float(sizing["notional_usd"]),
+                account_equity=capital_usd_cap,
+                current_symbol_market_value=0.0,
+                remaining_buy_budget=available_cash_usd,
+            )
+            if risk_clamp.get("final_qty", 0) < 1:
+                track_skip(symbol, "INSUFFICIENT_CAPACITY_AFTER_RISK_CLAMP", risk_clamp)
+                logger.info("[US_ENTRY][SKIP] symbol=%s reason=INSUFFICIENT_CAPACITY_AFTER_RISK_CLAMP allowed_notional=%.4f", symbol, risk_clamp.get("allowed_notional", 0.0))
+                continue
+            qty = int(risk_clamp["final_qty"])
+            notional = float(risk_clamp["final_notional"])
+            sizing["projected_weight"] = risk_clamp.get("projected_weight", 0.0)
+            sizing["max_symbol_weight"] = risk_clamp.get("max_position_weight")
+            sizing["allowed_notional"] = risk_clamp.get("allowed_notional")
             logger.info("[US_ENTRY_DECISION] symbol=%s position_state=NOT_HELD action=NEW_BUY position_action=%s", symbol, position_action)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
@@ -956,6 +1027,13 @@ def generate_entry_intents(
                 symbol, old_qty, qty, old_notional, notional, order_cap_usd,
             )
 
+        if position_action == "NEW_POSITION_BUY":
+            entry_style_for_contract = str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum")
+            ok_contract, contract_reason = _validate_new_buy_explain_contract(symbol, entry_meta, entry_style_for_contract, signal_score=score)
+            if not ok_contract:
+                track_skip(symbol, contract_reason, {"entry_style": entry_style_for_contract})
+                continue
+
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build entry explanation
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -994,7 +1072,10 @@ def generate_entry_intents(
             "rank": rank + 1,
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
-            "entry_style": "momentum",
+            "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
+            "projected_weight": sizing.get("projected_weight"),
+            "max_symbol_weight": sizing.get("max_symbol_weight"),
+            "allowed_notional": sizing.get("allowed_notional"),
             # ── entry_meta: book / horizon / exit_policy ─────────────────────
             # 중요: entry_signal_type (pullback/breakout/momentum)과
             #        book/horizon/exit_policy (포지션 관리 방식)은 다르다.

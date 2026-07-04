@@ -160,6 +160,12 @@ def evaluate_swing_exit(
         return None
 
     exit_type = intent.get("exit_type", "")
+    if exit_type == "profit_trailing_stop":
+        intent["exit_type"] = "trailing_stop"
+        exit_type = "trailing_stop"
+    elif exit_type == "hard_stop_loss":
+        intent["exit_type"] = "hard_stop"
+        exit_type = "hard_stop"
 
     # hard exit: 항상 즉시 허용
     if _is_hard_exit(exit_type):
