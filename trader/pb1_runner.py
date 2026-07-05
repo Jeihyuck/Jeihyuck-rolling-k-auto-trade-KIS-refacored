@@ -2376,7 +2376,42 @@ def normalize_session_result(
     )
 
 
-def should_skip_duplicate_from_marker(payload: dict[str, Any] | None) -> bool:
+PM_RETRYABLE_NO_TRADE_STATUSES = {"OK_NO_TRADE"}
+PM_RETRYABLE_NO_TRADE_REASONS = {
+    "NO_ORDERABLE_CANDIDATES",
+    "NO_CANDIDATES_AFTER_RELAX",
+    "NO_FINAL_SETUPS",
+    "NO_FINAL_SETUPS_AFTER_STYLE_GATE",
+    "NO_BRIDGE_CANDIDATES",
+}
+
+
+def _is_pm_session(session: str | None) -> bool:
+    return str(session or "").strip().lower() in {"afternoon", "pm"}
+
+
+def normalize_pm_no_trade_marker(payload: dict[str, Any] | None, session: str | None = None) -> dict[str, Any]:
+    marker = dict(payload or {})
+    status = str(marker.get("status") or "").upper()
+    reason = str(marker.get("reason") or marker.get("exit_reason") or marker.get("entry_abort_reason") or "").upper()
+    if parse_bool_any(os.getenv("PB1_PM_NO_TRADE_RETRYABLE"), default=True) and _is_pm_session(session):
+        if status in PM_RETRYABLE_NO_TRADE_STATUSES and reason in PM_RETRYABLE_NO_TRADE_REASONS:
+            before_completed = bool(marker.get("completed"))
+            before_retryable = bool(marker.get("retryable"))
+            marker["completed"] = False
+            marker["retryable"] = True
+            logger.info(
+                "[TRADE_PM][DEDUPE][NORMALIZE] marker_status=%s marker_reason=%s before_completed=%s before_retryable=%s after_completed=0 after_retryable=1",
+                status,
+                reason,
+                int(before_completed),
+                int(before_retryable),
+            )
+    return marker
+
+
+def should_skip_duplicate_from_marker(payload: dict[str, Any] | None, session: str | None = None) -> bool:
+    payload = normalize_pm_no_trade_marker(payload, session=session)
     payload = payload or {}
     marker_completed = bool(payload.get("completed"))
     marker_retryable = bool(payload.get("retryable"))
@@ -2390,6 +2425,11 @@ def should_skip_duplicate_from_marker(payload: dict[str, Any] | None) -> bool:
             "RETRYABLE_FAILURE",
         }
     )
+
+
+def _pm_tick_bucket(now_kst: datetime) -> str:
+    minute = 0 if int(now_kst.minute) < 30 else 30
+    return f"{int(now_kst.hour):02d}{minute:02d}"
 
 def _write_session_result_file(payload: dict[str, Any]) -> None:
     path = os.getenv("PB1_SESSION_RESULT_PATH")
@@ -2406,8 +2446,13 @@ def _write_session_result_file(payload: dict[str, Any]) -> None:
     except Exception as exc:
         logger.warning("[PB1][SESSION_RESULT][WRITE_WARN] path=%s err=%s", path, exc)
 
-def _session_execution_checkpoint_key(*, env: str, session_kind: str, trade_date: date) -> str:
-    return f"trade_session:{str(env or '').strip().lower() or 'practice'}:{str(session_kind or '').strip().lower()}:{trade_date.isoformat()}"
+def _session_execution_checkpoint_key(*, env: str, session_kind: str, trade_date: date, now_kst: datetime | None = None) -> str:
+    session_norm = str(session_kind or "").strip().lower()
+    key = f"trade_session:{str(env or '').strip().lower() or 'practice'}:{session_norm}:{trade_date.isoformat()}"
+    if parse_bool_any(os.getenv("PB1_PM_CHECKPOINT_TICK_BUCKET"), default=True) and _is_pm_session(session_norm):
+        now_for_bucket = now_kst or _get_now_kst()
+        key = f"{key}:tick={_pm_tick_bucket(now_for_bucket)}"
+    return key
 
 
 def _close_reconcile_checkpoint_key(*, env: str, trade_date: date) -> str:
@@ -2446,6 +2491,13 @@ def _record_session_execution_marker(
         marker["completed"] = bool(completed)
     if retryable is not None:
         marker["retryable"] = bool(retryable)
+    session_norm = str(session_kind or "").strip().lower()
+    status_u = str(marker.get("status") or status or "").upper()
+    reason_u = str(exit_reason or marker.get("exit_reason") or marker.get("entry_abort_reason") or "").upper()
+    if parse_bool_any(os.getenv("PB1_PM_NO_TRADE_RETRYABLE"), default=True) and _is_pm_session(session_norm):
+        if status_u in PM_RETRYABLE_NO_TRADE_STATUSES and reason_u in PM_RETRYABLE_NO_TRADE_REASONS:
+            marker["completed"] = False
+            marker["retryable"] = True
     payload = {
         "env": str(env or "").strip().lower() or "practice",
         "session_kind": str(session_kind or "").strip().lower(),
@@ -2507,25 +2559,28 @@ def _has_today_session_buy_activity(orders_repo: OrdersRepo, env: str, now: date
     get_marker_payload = getattr(orders_repo, "get_today_session_marker_payload", None)
     if callable(get_marker_payload):
         marker_payload = get_marker_payload(env, session, now.date()) or {}
+        marker_payload = normalize_pm_no_trade_marker(marker_payload, session=session)
         session_completed_marker = bool(marker_payload.get("completed"))
     else:
         has_today_session_marker = getattr(orders_repo, "has_today_session_marker", None)
         if callable(has_today_session_marker):
             session_completed_marker = bool(has_today_session_marker(env, session, "completed", now.date()))
             marker_payload = {"completed": session_completed_marker, "status": "UNKNOWN", "retryable": False}
+            marker_payload = normalize_pm_no_trade_marker(marker_payload, session=session)
         else:
             has_today_am_session_marker = getattr(orders_repo, "has_today_am_session_marker", None)
             session_completed_marker = bool(has_today_am_session_marker(env, now.date())) if callable(has_today_am_session_marker) and session == "am" else False
             marker_payload = {"completed": session_completed_marker, "status": "UNKNOWN", "retryable": False}
+            marker_payload = normalize_pm_no_trade_marker(marker_payload, session=session)
     session_buy_exists = bool(buy_orders)
-    duplicate_by_marker = should_skip_duplicate_from_marker(marker_payload)
+    duplicate_by_marker = should_skip_duplicate_from_marker(marker_payload, session=session)
     duplicate = session_buy_exists or open_buy_exists or duplicate_by_marker
     if session_buy_exists:
         reason = "session_buy_exists"
     elif open_buy_exists:
         reason = "open_buy_exists"
     elif session_completed_marker:
-        reason = "session_completed_marker"
+        reason = "session_completed_marker" if duplicate_by_marker else "no_prior_session_buy"
     else:
         reason = "no_prior_session_buy"
     return {
@@ -2635,7 +2690,7 @@ def _evaluate_trade_session_start_guard(*, engine, env: str, now: datetime, sess
         duplicate_activity.get("marker_status") or "NONE",
         int(bool(duplicate_activity.get("marker_retryable"))),
         int(bool(duplicate_activity.get("marker_completed"))),
-        "skip_duplicate" if duplicate_activity["duplicate"] else "proceed",
+        "skip_duplicate" if duplicate_activity["duplicate"] else ("continue" if duplicate_activity.get("marker_retryable") else "proceed"),
     )
     if duplicate_activity["duplicate"]:
         _apply_trade_session_override_env(

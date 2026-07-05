@@ -476,7 +476,16 @@ def _lookup_fail_open_default() -> bool:
     return False
 
 
-def _resolve_lookup_fail_open() -> bool:
+def _fail_open_on_order_lookup_timeout(env: str | None = None) -> bool:
+    env_norm = str(env or os.getenv("STRATEGY_ENV") or "practice").strip().lower()
+    if env_norm == "real":
+        return _env_flag("PB1_REAL_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=False)
+    return _env_flag("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT", default=True)
+
+
+def _resolve_lookup_fail_open(env: str | None = None) -> bool:
+    if env is not None:
+        return _fail_open_on_order_lookup_timeout(env)
     explicit = os.getenv("PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT")
     if explicit is not None:
         return _env_flag(
@@ -2614,12 +2623,26 @@ class OrdersRepo:
             fail_open = _resolve_lookup_fail_open()
 
         self._last_read_fail_open_op = None
-        rows, fail_open_triggered = safe_read_mappings(
-            self.engine,
-            stmt,
-            op_name=op_name,
-            fail_open=bool(fail_open),
-        )
+        try:
+            rows, fail_open_triggered = safe_read_mappings(
+                self.engine,
+                stmt,
+                op_name=op_name,
+                fail_open=bool(fail_open),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+                op_name,
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if bool(fail_open):
+                self._last_read_fail_open_op = op_name
+                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning fallback=list", op_name)
+                return []
+            raise
         if fail_open_triggered:
             self._last_read_fail_open_op = op_name
         return rows
@@ -2900,7 +2923,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.get_open_orders",
-            fail_open=None,
+            fail_open=_resolve_lookup_fail_open(env),
         )
 
     def has_open_order_for_code(
@@ -3053,7 +3076,7 @@ class OrdersRepo:
         rows = self._read_mappings_with_guard(
             stmt,
             op_name="orders.has_blocking_order_today",
-            fail_open=_resolve_lookup_fail_open(),
+            fail_open=_resolve_lookup_fail_open(env),
         )
         if rows:
             return True, rows[0]
@@ -3083,7 +3106,7 @@ class OrdersRepo:
         return self._read_mappings_with_guard(
             stmt,
             op_name="orders.list_today_orders",
-            fail_open=None,
+            fail_open=_resolve_lookup_fail_open(env),
         )
 
     def list_today_buy_orders(
@@ -3695,12 +3718,26 @@ class FillsRepo:
         if fail_open is None:
             fail_open = _resolve_fill_fail_open()
         self._last_read_fail_open_op = None
-        rows, fail_open_triggered = safe_read_mappings(
-            self.engine,
-            stmt,
-            op_name=op_name,
-            fail_open=bool(fail_open),
-        )
+        try:
+            rows, fail_open_triggered = safe_read_mappings(
+                self.engine,
+                stmt,
+                op_name=op_name,
+                fail_open=bool(fail_open),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[DB][READ][FAIL] op=%s fail_open=%s err_type=%s err=%s",
+                op_name,
+                int(bool(fail_open)),
+                type(exc).__name__,
+                exc,
+            )
+            if bool(fail_open):
+                self._last_read_fail_open_op = op_name
+                logger.warning("[DB][READ][FAIL_OPEN] op=%s -> returning fallback=list", op_name)
+                return []
+            raise
         if fail_open_triggered:
             self._last_read_fail_open_op = op_name
         return rows
@@ -3737,7 +3774,7 @@ class FillsRepo:
         if code:
             conditions.append(self._schema.fills.c.code == str(code).zfill(6))
         stmt = select(self._schema.fills).where(and_(*conditions)).order_by(filled_at_expr.desc())
-        fail_open = _resolve_fill_fail_open()
+        fail_open = _resolve_lookup_fail_open(env)
         try:
             return self._read_mappings_with_guard(
                 stmt,

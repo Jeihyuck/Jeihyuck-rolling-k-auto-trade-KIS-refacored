@@ -310,8 +310,9 @@ def evaluate_filters(feats: Dict[str, float], cfg: MinerviniConfig) -> Tuple[boo
     # MA200_slope NaN degrade: unknown일 때는 soft fail (점수 감점만, hard fail 금지)
     if ma200_slope_method == "unknown":
         # slope 조건 unknown: degrade 처리 (점수 감점용 flag만 추가, hard fail 금지)
-        reasons.append("ma200_slope_unknown")
         feats["ma200_slope_degraded"] = True  # 점수 감점용 플래그
+        if os.getenv("MINERVINI_INCLUDE_SOFT_REASONS", "0") == "1":
+            reasons.append("ma200_slope_unknown")
     elif ma200_slope_method == "simple_compare":
         # 대체 slope 사용: 상승 여부만 체크
         if not (ma200_slope is not None and ma200_slope > 0):
