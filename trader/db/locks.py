@@ -121,6 +121,12 @@ def acquire_advisory_lock(
 
     for attempt in range(1, retries + 1):
         try:
+            lock_timeout_ms = int(os.getenv("DB_LOCK_CONN_LOCK_TIMEOUT_MS", os.getenv("DB_LOCK_TIMEOUT_MS", "5000")))
+            statement_timeout_ms = int(os.getenv("DB_LOCK_CONN_STATEMENT_TIMEOUT_MS", "0"))
+            idle_timeout_ms = int(os.getenv("DB_LOCK_CONN_IDLE_IN_TX_SESSION_TIMEOUT_MS", "0"))
+            conn.execute(sa.text(f"SET lock_timeout = '{lock_timeout_ms}ms'"))
+            conn.execute(sa.text(f"SET statement_timeout = {statement_timeout_ms}"))
+            conn.execute(sa.text(f"SET idle_in_transaction_session_timeout = {idle_timeout_ms}"))
             ok = bool(conn.execute(sa.text("SELECT pg_try_advisory_lock(:k)"), {"k": key}).scalar())
         except Exception as exc:
             logger.warning(
@@ -135,13 +141,17 @@ def acquire_advisory_lock(
             ok = False
 
         if ok:
+            held = True
             logger.info(
-                "[LOCK][ACQUIRE][OK] key=%s context=%s attempt=%s/%s",
+                "[LOCK][ACQUIRE][OK] key=%s context=%s attempt=%s/%s idle_timeout=%s statement_timeout=%s",
                 key,
                 context,
                 attempt,
                 retries,
+                idle_timeout_ms,
+                statement_timeout_ms,
             )
+            logger.info("[LOCK][HELD][CHECK] key=%s held=%s", key, int(bool(held)))
             return True
 
         logger.warning(

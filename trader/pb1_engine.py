@@ -12201,7 +12201,7 @@ class PB1Engine:
     ) -> float | None:
         if current_price is not None and current_price > 0:
             return current_price
-        if not (self.phase in {"entry", "pm_entry"} and last_close is not None and ma20_value is not None and last_close < ma20_value):
+        if not (getattr(self, "phase", "") in {"entry", "pm_entry"} and last_close is not None and ma20_value is not None and last_close < ma20_value):
             return current_price
         get_price = getattr(self, "_get_current_price_for_entry", None)
         if callable(get_price):
@@ -12220,7 +12220,7 @@ class PB1Engine:
     def _relax_bridge_enabled(self) -> tuple[bool, str]:
         raw = os.getenv("PB1_ENABLE_RELAX_BRIDGE")
         env_name = str(self.env or os.getenv("STRATEGY_ENV") or "practice").strip().lower()
-        default_enabled = env_name == "practice"
+        default_enabled = True
         enabled = parse_bool_any(raw, default=default_enabled)
         if not enabled:
             return False, "disabled"
@@ -12286,8 +12286,8 @@ class PB1Engine:
         max_candidates = max(1, int(os.getenv("PB1_RELAX_BRIDGE_MAX_CANDIDATES", "3") or "3"))
         min_rs = float(os.getenv("PB1_RELAX_BRIDGE_MIN_RS", "70") or "70")
         min_score = float(os.getenv("PB1_RELAX_BRIDGE_MIN_SCORE", "70") or "70")
-        require_price = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_CURRENT_PRICE"), default=True)
-        require_reclaim = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_MA20_RECLAIM"), default=True)
+        require_price = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_CURRENT_PRICE"), default=False)
+        require_reclaim = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_MA20_RECLAIM"), default=False)
         require_liquidity = parse_bool_any(os.getenv("PB1_RELAX_BRIDGE_REQUIRE_LIQUIDITY"), default=True)
         selected: list[CandidateFeature] = []
         for cf in sorted(candidates or [], key=lambda c: float((c.features or {}).get("score_final") or (c.features or {}).get("score") or 0), reverse=True):
@@ -12295,32 +12295,36 @@ class PB1Engine:
                 continue
             features = cf.features or {}
             price = self._get_current_price_for_entry(cf.code, features)
+            if price is None or price <= 0:
+                price = self._to_float(features.get("current_price") or features.get("close") or features.get("last_close"))
             ma20 = self._to_float(features.get("ma20"))
             rs = self._to_float(features.get("rs_percentile") or features.get("rs_pctile")) or 0.0
             score = self._to_float(features.get("score_final") or features.get("score") or features.get("final_score")) or 0.0
             atr_pct = self._to_float(features.get("atr_pct")) or 0.0
             value20 = self._to_float(features.get("value20"))
             if require_price and (price is None or price <= 0):
-                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=current_price_missing", cf.code)
+                logger.info("[ENTRY][RELAX_BRIDGE][REJECT] code=%s reason=current_price_missing", cf.code)
                 continue
             reclaim_ok = bool(price is not None and ma20 is not None and price >= ma20 * 1.001)
             if require_reclaim and not reclaim_ok:
-                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=ma20_reclaim_missing", cf.code)
+                logger.info("[ENTRY][RELAX_BRIDGE][REJECT] code=%s reason=ma20_reclaim_missing", cf.code)
                 continue
             if require_liquidity and value20 is not None and value20 < float(PB1_MIN_VALUE20):
-                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=liquidity_fail", cf.code)
+                logger.info("[ENTRY][RELAX_BRIDGE][REJECT] code=%s reason=liquidity_fail value20=%s", cf.code, value20)
                 continue
             if atr_pct > float(PB1_MAX_ATR_PCT_RAW):
-                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=atr_too_high atr_pct=%s", cf.code, atr_pct)
+                logger.info("[ENTRY][RELAX_BRIDGE][REJECT] code=%s reason=atr_too_high atr_pct=%s", cf.code, atr_pct)
                 continue
             if rs < min_rs and score < min_score:
-                logger.info("[ENTRY][RELAX_BRIDGE][SKIP] code=%s reason=score_rs_below_min score=%s rs=%s", cf.code, score, rs)
+                logger.info("[ENTRY][RELAX_BRIDGE][REJECT] code=%s reason=score_rs_below_min score=%s rs=%s", cf.code, score, rs)
                 continue
             cf.setup_ok = True
             cf.reasons = [r for r in (cf.reasons or []) if r not in {"close_below_ma20", "close_below_ma"}]
             features["setup_loose_ok"] = True
-            features["entry_reason"] = "ENTRY_RELAX_BRIDGE"
-            features["decision_family"] = "ENTRY_RELAX_BRIDGE_INTRADAY_RECLAIM"
+            features["setup_source"] = "minervini_relax_bridge"
+            features["entry_reason"] = "ENTRY_MINERVINI_RELAX_BRIDGE"
+            features["decision_family"] = "ENTRY_RELAX_BRIDGE"
+            features["minervini_bridge_candidate"] = True
             flags = set(list(features.get("quality_flags") or []))
             flags.add("RELAX_BRIDGE")
             if reclaim_ok:
@@ -12328,12 +12332,13 @@ class PB1Engine:
             features["quality_flags"] = sorted(flags)
             features["current_price"] = price
             logger.info(
-                "[ENTRY][RELAX_BRIDGE][CANDIDATE] code=%s score=%s rs=%s current_price=%s ma20=%s reason=ENTRY_RELAX_BRIDGE",
+                "[ENTRY][RELAX_BRIDGE][CANDIDATE] code=%s source=minervini score=%s rs=%s current_price=%s ma20=%s reclaim=%s",
                 cf.code,
                 score,
                 rs,
                 price,
                 ma20,
+                int(reclaim_ok),
             )
             selected.append(cf)
         if not selected:
@@ -12355,6 +12360,87 @@ class PB1Engine:
         logger.info("[ENTRY][RELAX_BRIDGE][TO_RISK] count=%s", len(selected))
         self._relax_bridge_summary.update({"activated": True, "reason": "activated", "count": len(selected), "source": source, "max_candidates": max_candidates})
         return selected
+
+    def _evaluate_final30_entry_setup(self, code: str, features: dict, market: str) -> tuple[bool, list[str], dict]:
+        style = str(features.get("entry_style_selected") or "").strip().upper()
+        meta: dict[str, Any] = {}
+        if not parse_bool_any(os.getenv("PB1_STYLE_GATE_ENABLED"), default=True):
+            ok, reasons = evaluate_pb1_setup(features, market=market, require_volume=self.require_volume, mode="relaxed", relax_ma_filter=PB1_RELAX_MA_FILTER, relax_ma20_slope=PB1_RELAX_MA20_SLOPE)
+            return bool(ok), list(reasons or []), {"setup_source": "pb1_pullback_legacy"}
+        if style in {"", "UNKNOWN", "PULLBACK"}:
+            ok, reasons = evaluate_pb1_setup(features, market=market, require_volume=self.require_volume, mode="relaxed", relax_ma_filter=PB1_RELAX_MA_FILTER, relax_ma20_slope=PB1_RELAX_MA20_SLOPE)
+            return bool(ok), list(reasons or []), {"setup_source": "entry_style_pullback"}
+
+        def f(name: str, default: float = 0.0) -> float:
+            val = self._to_float(features.get(name))
+            return default if val is None else val
+
+        price = f("current_price") or f("close") or f("last_close")
+        close = f("close")
+        ma20 = f("ma20")
+        ma50 = f("ma50")
+        atr = f("atr_pct")
+        rs = f("rs_percentile") or f("rs_pctile")
+        reasons: list[str] = []
+
+        if style == "MOMENTUM":
+            if not parse_bool_any(os.getenv("PB1_MOMENTUM_GATE_ENABLED"), default=True):
+                return False, ["momentum_gate_disabled"], meta
+            mom = f("momentum_score")
+            score = f("score_final") or f("final_score") or f("score")
+            min_mom = float(os.getenv("PB1_MOMENTUM_MIN_SCORE", "60") or "60")
+            min_score = float(os.getenv("PB1_MOMENTUM_MIN_FINAL_SCORE", "55") or "55")
+            min_rs = float(os.getenv("PB1_MOMENTUM_MIN_RS", "60") or "60")
+            max_atr = float(os.getenv("PB1_MOMENTUM_MAX_ATR_PCT", "0.10") or "0.10")
+            ma20_tol = float(os.getenv("PB1_MOMENTUM_MA20_TOLERANCE_PCT", "0.005") or "0.005")
+            ma50_tol = float(os.getenv("PB1_MOMENTUM_MA50_TOLERANCE_PCT", "0.03") or "0.03")
+            require_price = parse_bool_any(os.getenv("PB1_MOMENTUM_REQUIRE_CURRENT_PRICE"), default=False)
+            if require_price and price <= 0: reasons.append("price_missing")
+            if ma20 <= 0 or ma50 <= 0: reasons.append("missing_ma")
+            if bool(features.get("volume_missing")): reasons.append("volume_missing")
+            if mom < min_mom: reasons.append("momentum_score_too_low")
+            if score < min_score: reasons.append("score_too_low")
+            if rs < min_rs: reasons.append("rs_too_low")
+            if atr > max_atr: reasons.append("atr_pct_too_high")
+            ref = price or close
+            if ref <= 0: reasons.append("price_missing")
+            if ma20 > 0 and ref < ma20 * (1 - ma20_tol): reasons.append("below_ma20_tolerance")
+            if ma50 > 0 and ref < ma50 * (1 - ma50_tol): reasons.append("below_ma50_tolerance")
+            ok = not reasons
+            meta = {"setup_source": "entry_style_momentum", "entry_reason": "ENTRY_MOMENTUM", "decision_family": "ENTRY_MOMENTUM_CONTINUATION", "setup_loose_ok": ok}
+            log = "[ENTRY][STYLE_GATE][MOMENTUM]" if ok else "[ENTRY][STYLE_GATE][MOMENTUM][REJECT]"
+            logger.info("%s code=%s ok=%s momentum_score=%s score_final=%s rs=%s close=%s current_price=%s ma20=%s ma50=%s reasons=%s", log, code, int(ok), mom, score, rs, close, features.get("current_price"), ma20, ma50, reasons)
+            return ok, reasons, meta
+
+        if style == "BREAKOUT":
+            score = f("breakout_score")
+            min_score = float(os.getenv("PB1_BREAKOUT_MIN_SCORE", "55") or "55")
+            min_rs = float(os.getenv("PB1_BREAKOUT_MIN_RS", "55") or "55")
+            max_atr = float(os.getenv("PB1_BREAKOUT_MAX_ATR_PCT", "0.12") or "0.12")
+            pivot = f("pivot") or f("high20")
+            require_pivot = parse_bool_any(os.getenv("PB1_BREAKOUT_REQUIRE_PIVOT"), default=False)
+            near_pct = float(os.getenv("PB1_BREAKOUT_NEAR_PIVOT_PCT", "0.01") or "0.01")
+            if score < min_score: reasons.append("breakout_score_too_low")
+            if rs < min_rs: reasons.append("rs_too_low")
+            if atr > max_atr: reasons.append("atr_pct_too_high")
+            if require_pivot and pivot <= 0: reasons.append("pivot_missing")
+            elif pivot > 0 and price > 0 and price < pivot * (1 - near_pct): reasons.append("below_pivot")
+            ok = not reasons
+            meta = {"setup_source": "entry_style_breakout", "entry_reason": "ENTRY_BREAKOUT", "decision_family": "ENTRY_BREAKOUT_CONTINUATION"}
+            logger.info("[ENTRY][STYLE_GATE][BREAKOUT]%s code=%s ok=%s breakout_score=%s rs=%s price=%s pivot=%s reasons=%s", "" if ok else "[REJECT]", code, int(ok), score, rs, price, pivot, reasons)
+            return ok, reasons, meta
+
+        # VCP explicit style, or high VCP score fallback.
+        vcp = f("vcp_score")
+        min_vcp = float(os.getenv("PB1_VCP_MIN_SCORE", "45") or "45")
+        min_rs = float(os.getenv("PB1_VCP_MIN_RS", "55") or "55")
+        max_atr = float(os.getenv("PB1_VCP_MAX_ATR_PCT", "0.12") or "0.12")
+        if vcp < min_vcp: reasons.append("vcp_score_too_low")
+        if rs < min_rs: reasons.append("rs_too_low")
+        if atr > max_atr: reasons.append("atr_pct_too_high")
+        ok = not reasons
+        logger.info("[ENTRY][STYLE_GATE][VCP]%s code=%s ok=%s vcp_score=%s rs=%s atr_pct=%s reasons=%s", "" if ok else "[REJECT]", code, int(ok), vcp, rs, atr, reasons)
+        return ok, reasons, {"setup_source": "entry_style_vcp", "entry_reason": "ENTRY_VCP", "decision_family": "ENTRY_VCP"}
 
     def _compute_candidates_from_codes(self, codes: list[str]) -> list[CandidateFeature]:
         # ── [KR][PB1] scope guard + batch OHLCV preload ─────────────────────
@@ -12382,6 +12468,12 @@ class PB1Engine:
             if m.get("code")
         }
         candidates: list[CandidateFeature] = []
+        style_stats: dict[str, dict[str, Any]] = {
+            "PULLBACK": {"scanned": 0, "ok": 0, "reasons": []},
+            "MOMENTUM": {"scanned": 0, "ok": 0, "reasons": []},
+            "BREAKOUT": {"scanned": 0, "ok": 0, "reasons": []},
+            "VCP": {"scanned": 0, "ok": 0, "reasons": []},
+        }
         for raw_code in codes or []:
             code = str(raw_code or "").zfill(6)
             if not code:
@@ -12503,8 +12595,9 @@ class PB1Engine:
                     "precomputed_usable_reasons": list(usable_reasons),
                 }
                 features["market"] = market
-                features["_pb1_vol_max"] = float(self.filter_thresholds.vol_contraction_max)
-                features["_pb1_volu_max"] = float(self.filter_thresholds.volu_contraction_max)
+                filter_thresholds = getattr(self, "filter_thresholds", None)
+                features["_pb1_vol_max"] = float(getattr(filter_thresholds, "vol_contraction_max", PB1_VOL_MAX))
+                features["_pb1_volu_max"] = float(getattr(filter_thresholds, "volu_contraction_max", PB1_VOLU_MAX))
                 features["volume_missing"] = bool(meta.get("volume_missing")) if isinstance(meta, dict) else bool(merged_features.get("volume_missing", False))
                 features["data_ok"] = bool(precomputed_data_ok or not df.empty)
 
@@ -12519,8 +12612,9 @@ class PB1Engine:
                 if current_price is not None and current_price > 0:
                     features["current_price"] = current_price
                 ma20_value = self._to_float(features.get("ma20"))
+                phase_name = getattr(self, "phase", "")
                 if (
-                    self.phase in {"entry", "pm_entry"}
+                    phase_name in {"entry", "pm_entry"}
                     and last_close is not None
                     and current_price is not None
                     and ma20_value is not None
@@ -12539,7 +12633,7 @@ class PB1Engine:
                         ma20_value,
                     )
                 elif (
-                    self.phase in {"entry", "pm_entry"}
+                    phase_name in {"entry", "pm_entry"}
                     and last_close is not None
                     and current_price is not None
                     and ma20_value is not None
@@ -12552,14 +12646,19 @@ class PB1Engine:
                         ma20_value,
                         ma20_value * 1.001,
                     )
-                loose_ok, loose_reasons = evaluate_pb1_setup(
-                    features,
+                entry_ok, entry_reasons, entry_meta = self._evaluate_final30_entry_setup(
+                    code=code,
+                    features=features,
                     market=market,
-                    require_volume=self.require_volume,
-                    mode="relaxed",
-                    relax_ma_filter=PB1_RELAX_MA_FILTER,
-                    relax_ma20_slope=PB1_RELAX_MA20_SLOPE,
                 )
+                style_name = str(features.get("entry_style_selected") or "PULLBACK").strip().upper()
+                if style_name not in style_stats:
+                    style_name = "VCP" if float(features.get("vcp_score") or 0.0) >= float(os.getenv("PB1_VCP_MIN_SCORE", "45") or "45") else "PULLBACK"
+                style_stats[style_name]["scanned"] += 1
+                if entry_ok:
+                    style_stats[style_name]["ok"] += 1
+                else:
+                    style_stats[style_name]["reasons"].extend(list(entry_reasons or []))
                 strict_ok, strict_reasons = evaluate_pb1_setup(
                     features,
                     market=market,
@@ -12568,23 +12667,36 @@ class PB1Engine:
                     relax_ma_filter=False,
                     relax_ma20_slope=False,
                 )
-                features["setup_loose_ok"] = bool(loose_ok)
+                features.update(entry_meta or {})
+                features["setup_loose_ok"] = bool(entry_ok)
+                features["setup_style_ok"] = bool(entry_ok)
+                features["setup_style_reasons"] = list(entry_reasons or [])
                 features["setup_strict_ok"] = bool(strict_ok)
-                features["setup_loose_reasons"] = list(loose_reasons or [])
+                features["setup_loose_reasons"] = list(entry_reasons or [])
                 features["setup_strict_reasons"] = list(strict_reasons or [])
                 cf = CandidateFeature(
                     code=code,
                     market=market,
                     features=features,
-                    setup_ok=bool(loose_ok),
-                    reasons=list(loose_reasons or []),
+                    setup_ok=bool(entry_ok),
+                    reasons=list(entry_reasons or []),
                     mode=1,
-                    mode_reasons=["pb1_from_final30"],
+                    mode_reasons=["final30_style_gate"],
                 )
                 candidates.append(cf)
             except Exception as exc:
-                logger.debug("[PB1][FINAL30][CAND_FAIL] code=%s err=%s", code, exc)
+                logger.warning("[PB1][FINAL30][CAND_FAIL] code=%s err=%s", code, exc)
                 continue
+        for style_name in ("PULLBACK", "MOMENTUM", "BREAKOUT", "VCP"):
+            stats = style_stats[style_name]
+            top_reasons = Counter(stats["reasons"]).most_common(5)
+            logger.info(
+                "[ENTRY][STYLE_GATE][SUMMARY] style=%s scanned=%s ok=%s top_reasons=%s",
+                style_name,
+                stats["scanned"],
+                stats["ok"],
+                top_reasons,
+            )
         return candidates
 
     def _select_final30_codes(self, candidates: list[CandidateFeature]) -> list[str]:

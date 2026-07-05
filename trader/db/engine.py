@@ -83,15 +83,20 @@ def _is_postgres_url(db_url: str) -> bool:
     return bool(base_driver == "postgresql" or drivername.startswith("postgres"))
 
 
-def _apply_postgres_timeout_options(connect_args: dict) -> dict:
-    lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", str(DB_LOCK_TIMEOUT_MS_DEFAULT)))
-    statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", str(DB_STATEMENT_TIMEOUT_MS_DEFAULT)))
-    idle_in_tx_timeout_ms = int(
-        os.getenv(
-            "DB_IDLE_IN_TX_SESSION_TIMEOUT_MS",
-            str(DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT),
+def _apply_postgres_timeout_options(connect_args: dict, *, lock_connection: bool = False) -> dict:
+    if lock_connection:
+        lock_timeout_ms = int(os.getenv("DB_LOCK_CONN_LOCK_TIMEOUT_MS", os.getenv("DB_LOCK_TIMEOUT_MS", str(DB_LOCK_TIMEOUT_MS_DEFAULT))))
+        statement_timeout_ms = int(os.getenv("DB_LOCK_CONN_STATEMENT_TIMEOUT_MS", "0"))
+        idle_in_tx_timeout_ms = int(os.getenv("DB_LOCK_CONN_IDLE_IN_TX_SESSION_TIMEOUT_MS", "0"))
+    else:
+        lock_timeout_ms = int(os.getenv("DB_LOCK_TIMEOUT_MS", str(DB_LOCK_TIMEOUT_MS_DEFAULT)))
+        statement_timeout_ms = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", str(DB_STATEMENT_TIMEOUT_MS_DEFAULT)))
+        idle_in_tx_timeout_ms = int(
+            os.getenv(
+                "DB_IDLE_IN_TX_SESSION_TIMEOUT_MS",
+                str(DB_IDLE_IN_TX_SESSION_TIMEOUT_MS_DEFAULT),
+            )
         )
-    )
     pg_options = [
         f"-c lock_timeout={lock_timeout_ms}",
         f"-c statement_timeout={statement_timeout_ms}",
@@ -100,7 +105,8 @@ def _apply_postgres_timeout_options(connect_args: dict) -> dict:
     existing_options = str(connect_args.get("options", "") or "").strip()
     connect_args["options"] = " ".join([opt for opt in [existing_options, *pg_options] if opt]).strip()
     logger.info(
-        "[DB][CONNECT_ARGS][TIMEOUTS] connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s",
+        "[DB][CONNECT_ARGS][TIMEOUTS] lock_connection=%s connect_timeout=%s lock_timeout_ms=%s statement_timeout_ms=%s idle_in_tx_timeout_ms=%s",
+        int(bool(lock_connection)),
         connect_args.get("connect_timeout"),
         lock_timeout_ms,
         statement_timeout_ms,
@@ -109,7 +115,7 @@ def _apply_postgres_timeout_options(connect_args: dict) -> dict:
     return connect_args
 
 
-def _connect_args_for_db_url(db_url: str) -> dict:
+def _connect_args_for_db_url(db_url: str, *, lock_connection: bool = False) -> dict:
     """
     Supabase pooler(6543, PgBouncer) 환경에서 psycopg3 prepared statement 충돌 방지.
     - psycopg3 문서: PgBouncer/풀러 사용 시 prepared statements 비활성화 권고
@@ -124,7 +130,7 @@ def _connect_args_for_db_url(db_url: str) -> dict:
         "keepalives_count": int(os.getenv("DB_KEEPALIVES_COUNT", "5")),
     }
     if _is_postgres_url(db_url):
-        connect_args = _apply_postgres_timeout_options(connect_args)
+        connect_args = _apply_postgres_timeout_options(connect_args, lock_connection=lock_connection)
 
     app_name = (
         os.getenv("DB_APPLICATION_NAME")
