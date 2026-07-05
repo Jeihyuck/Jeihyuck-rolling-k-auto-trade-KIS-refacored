@@ -2,13 +2,15 @@ from datetime import datetime
 from trader.pb1_runner import should_skip_duplicate_from_marker, normalize_pm_no_trade_marker, _pm_tick_bucket
 
 
-def test_pm_ok_no_trade_does_not_skip_duplicate():
-    marker = normalize_pm_no_trade_marker({
+def test_pm_ok_no_trade_does_not_skip_duplicate(caplog):
+    with caplog.at_level("INFO"):
+        marker = normalize_pm_no_trade_marker({
         "status": "OK_NO_TRADE",
         "reason": "NO_ORDERABLE_CANDIDATES",
         "completed": 1,
         "retryable": 0,
-    }, session="afternoon")
+        }, session="afternoon")
+    assert "[TRADE_PM][DEDUPE][NORMALIZE]" in caplog.text
     assert marker["retryable"] is True
     assert marker["completed"] is False
     assert should_skip_duplicate_from_marker(marker, session="afternoon") is False

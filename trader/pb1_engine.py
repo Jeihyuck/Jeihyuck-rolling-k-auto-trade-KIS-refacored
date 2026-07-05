@@ -12358,6 +12358,12 @@ class PB1Engine:
             max_candidates,
         )
         logger.info("[ENTRY][RELAX_BRIDGE][TO_RISK] count=%s", len(selected))
+        bridge_codes = [str(getattr(c, "code", "")).zfill(6) for c in selected if getattr(c, "code", None)]
+        logger.info(
+            "[ENTRY][RELAX_BRIDGE][ORDERABLE] count=%s codes=%s note=pre_risk_sizing_buyable",
+            len(bridge_codes),
+            bridge_codes,
+        )
         self._relax_bridge_summary.update({"activated": True, "reason": "activated", "count": len(selected), "source": source, "max_candidates": max_candidates})
         return selected
 
@@ -12394,8 +12400,14 @@ class PB1Engine:
             max_atr = float(os.getenv("PB1_MOMENTUM_MAX_ATR_PCT", "0.10") or "0.10")
             ma20_tol = float(os.getenv("PB1_MOMENTUM_MA20_TOLERANCE_PCT", "0.005") or "0.005")
             ma50_tol = float(os.getenv("PB1_MOMENTUM_MA50_TOLERANCE_PCT", "0.03") or "0.03")
-            require_price = parse_bool_any(os.getenv("PB1_MOMENTUM_REQUIRE_CURRENT_PRICE"), default=False)
-            if require_price and price <= 0: reasons.append("price_missing")
+            env_norm = str(getattr(self, "env", None) or os.getenv("STRATEGY_ENV") or "practice").strip().lower()
+            if env_norm == "real":
+                require_price = parse_bool_any(os.getenv("PB1_REAL_MOMENTUM_REQUIRE_CURRENT_PRICE"), default=True)
+            else:
+                require_price = parse_bool_any(os.getenv("PB1_MOMENTUM_REQUIRE_CURRENT_PRICE"), default=False)
+            current_price_present = (self._to_float(features.get("current_price")) or 0.0) > 0
+            if require_price and not current_price_present:
+                reasons.append("price_missing")
             if ma20 <= 0 or ma50 <= 0: reasons.append("missing_ma")
             if bool(features.get("volume_missing")): reasons.append("volume_missing")
             if mom < min_mom: reasons.append("momentum_score_too_low")
@@ -12403,13 +12415,13 @@ class PB1Engine:
             if rs < min_rs: reasons.append("rs_too_low")
             if atr > max_atr: reasons.append("atr_pct_too_high")
             ref = price or close
-            if ref <= 0: reasons.append("price_missing")
+            if ref <= 0 and "price_missing" not in reasons: reasons.append("price_missing")
             if ma20 > 0 and ref < ma20 * (1 - ma20_tol): reasons.append("below_ma20_tolerance")
             if ma50 > 0 and ref < ma50 * (1 - ma50_tol): reasons.append("below_ma50_tolerance")
             ok = not reasons
             meta = {"setup_source": "entry_style_momentum", "entry_reason": "ENTRY_MOMENTUM", "decision_family": "ENTRY_MOMENTUM_CONTINUATION", "setup_loose_ok": ok}
             log = "[ENTRY][STYLE_GATE][MOMENTUM]" if ok else "[ENTRY][STYLE_GATE][MOMENTUM][REJECT]"
-            logger.info("%s code=%s ok=%s momentum_score=%s score_final=%s rs=%s close=%s current_price=%s ma20=%s ma50=%s reasons=%s", log, code, int(ok), mom, score, rs, close, features.get("current_price"), ma20, ma50, reasons)
+            logger.info("%s code=%s ok=%s momentum_score=%s score_final=%s rs=%s close=%s current_price=%s ma20=%s ma50=%s reasons=%s env=%s", log, code, int(ok), mom, score, rs, close, features.get("current_price"), ma20, ma50, reasons, env_norm)
             return ok, reasons, meta
 
         if style == "BREAKOUT":
@@ -12703,6 +12715,76 @@ class PB1Engine:
         setup_ok = [cf for cf in candidates if cf.setup_ok]
         ranked = sorted(setup_ok, key=self._final30_sort_key)
         return [cf.code for cf in ranked[:30]]
+
+    def _log_no_trade_explain(
+        self,
+        *,
+        final30_count: int,
+        candidates: list[CandidateFeature],
+        setup_ok_codes: list[str] | set[str],
+        minervini_passed_codes: set[str] | list[str] | None,
+        risk_ok_count: int,
+        sized_ok_count: int,
+        buyable_ok_count: int,
+        order_candidates_count: int,
+    ) -> None:
+        if getattr(self, "_no_trade_explain_logged", False):
+            return
+        self._no_trade_explain_logged = True
+        styles = ("PULLBACK", "MOMENTUM", "BREAKOUT", "VCP")
+        style_counts = {style: 0 for style in styles}
+        style_gate_ok = {style: 0 for style in styles}
+        reason_counter: Counter[str] = Counter()
+        data_ok_count = 0
+        for cf in candidates or []:
+            features = cf.features or {}
+            if features.get("data_ok"):
+                data_ok_count += 1
+            style = str(features.get("entry_style_selected") or "PULLBACK").strip().upper()
+            if style not in style_counts:
+                style = "VCP" if float(features.get("vcp_score") or 0.0) >= float(os.getenv("PB1_VCP_MIN_SCORE", "45") or "45") else "PULLBACK"
+            style_counts[style] += 1
+            if bool(features.get("setup_style_ok", cf.setup_ok)):
+                style_gate_ok[style] += 1
+            reason_counter.update(list(cf.reasons or features.get("setup_style_reasons") or []))
+
+        bridge_summary = getattr(self, "_relax_bridge_summary", {}) or {}
+        minervini_codes = {str(code).zfill(6) for code in (minervini_passed_codes or []) if code}
+        orderable_codes = set(getattr(self, "_last_orderable_codes", set()) or set())
+        candidate_by_code = {str(getattr(cf, "code", "")).zfill(6): cf for cf in candidates or []}
+        for code in sorted(minervini_codes):
+            if code in orderable_codes:
+                continue
+            cf = candidate_by_code.get(code)
+            if cf is None:
+                reason, detail = "not_in_candidates", "candidate_missing"
+            elif not bool((cf.features or {}).get("minervini_bridge_candidate")):
+                reason = "bridge_rejected"
+                detail = ",".join(list(cf.reasons or (cf.features or {}).get("setup_style_reasons") or ["not_setup_ok_after_bridge"])[:3])
+            elif not cf.setup_ok:
+                reason, detail = "not_setup_ok_after_bridge", ",".join(list(cf.reasons or ["setup_false"])[:3])
+            else:
+                reason, detail = "not_orderable_after_bridge", "risk_sizing_or_buyable_gate"
+            logger.info("[MINERVINI][PASS_BUT_NOT_ORDERABLE] code=%s reason=%s detail=%s", code, reason, detail)
+
+        logger.info(
+            "[ENTRY][NO_TRADE_EXPLAIN] final30=%s scanned=%s data_ok=%s setup_ok=%s style_counts=%s style_gate_ok=%s minervini_pass=%s bridge_enabled=%s bridge_activated=%s bridge_count=%s risk_ok=%s sized_ok=%s buyable_ok=%s order_candidates=%s top_reject_reasons=%s",
+            final30_count,
+            len(candidates or []),
+            data_ok_count,
+            len(set(setup_ok_codes or [])),
+            style_counts,
+            style_gate_ok,
+            len(minervini_codes),
+            int(bool(bridge_summary.get("enabled"))),
+            int(bool(bridge_summary.get("activated"))),
+            int(bridge_summary.get("count") or 0),
+            int(risk_ok_count),
+            int(sized_ok_count),
+            int(buyable_ok_count),
+            int(order_candidates_count),
+            reason_counter.most_common(10),
+        )
 
     @staticmethod
     def _normalize_final30_rows(rows: list[dict]) -> tuple[list[dict], list[str]]:
@@ -14918,10 +15000,11 @@ class PB1Engine:
                     for _bc in bridge_candidates:
                         if _bc.code not in setup_ok_codes:
                             setup_ok_codes.append(_bc.code)
+                    bridge_codes = [str(getattr(c, "code", "")).zfill(6) for c in bridge_candidates if getattr(c, "code", None)]
                     logger.info(
                         "[ENTRY][RELAX_BRIDGE][ORDERABLE] count=%s codes=%s note=pre_risk_sizing_buyable",
-                        0,
-                        [],
+                        len(bridge_codes),
+                        bridge_codes,
                     )
 
                 minervini_path = write_minervini_signals(
@@ -16311,6 +16394,7 @@ class PB1Engine:
             )
             orderable_candidates = candidate_width_result.orderable_candidates
             orderable_codes = [c.code for c in orderable_candidates]
+            self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)
             final_order_count = len(orderable_candidates)
             backfill_added_count = candidate_width_result.backfill_added_count
@@ -16346,6 +16430,17 @@ class PB1Engine:
                     len(orderable_codes),
                 )
             relax_debug_payload["final_orderable_codes"] = orderable_codes
+            if len(orderable_candidates) == 0:
+                self._log_no_trade_explain(
+                    final30_count=len(scan_members),
+                    candidates=candidates if 'candidates' in locals() else [],
+                    setup_ok_codes=setup_ok_codes,
+                    minervini_passed_codes=set(buyable_codes or set()) if 'buyable_codes' in locals() else set(),
+                    risk_ok_count=len(self._debug_risk_ok_codes),
+                    sized_ok_count=len(self._debug_sizing_ok_codes),
+                    buyable_ok_count=len(buyable_ok_codes),
+                    order_candidates_count=len(orderable_candidates),
+                )
 
             after_buyable_check_count = len(buyable_ok_codes)
             after_dedup_count = len(orderable_candidates)
@@ -16832,6 +16927,16 @@ class PB1Engine:
                     open_orders_count,
                 )
                 if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
+                    self._log_no_trade_explain(
+                        final30_count=len(scan_members),
+                        candidates=candidates if 'candidates' in locals() else [],
+                        setup_ok_codes=setup_ok_codes,
+                        minervini_passed_codes=set(buyable_codes or set()) if 'buyable_codes' in locals() else set(),
+                        risk_ok_count=len(self._debug_risk_ok_codes),
+                        sized_ok_count=len(self._debug_sizing_ok_codes),
+                        buyable_ok_count=len(buyable_ok_codes),
+                        order_candidates_count=len(orderable_candidates),
+                    )
                     plan_skip_reasons = [
                         str(r)
                         for r in getattr(self, "_last_order_skip_reasons", [])

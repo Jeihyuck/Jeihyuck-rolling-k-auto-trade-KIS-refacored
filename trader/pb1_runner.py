@@ -2396,8 +2396,17 @@ def normalize_pm_no_trade_marker(payload: dict[str, Any] | None, session: str | 
     reason = str(marker.get("reason") or marker.get("exit_reason") or marker.get("entry_abort_reason") or "").upper()
     if parse_bool_any(os.getenv("PB1_PM_NO_TRADE_RETRYABLE"), default=True) and _is_pm_session(session):
         if status in PM_RETRYABLE_NO_TRADE_STATUSES and reason in PM_RETRYABLE_NO_TRADE_REASONS:
+            before_completed = bool(marker.get("completed"))
+            before_retryable = bool(marker.get("retryable"))
             marker["completed"] = False
             marker["retryable"] = True
+            logger.info(
+                "[TRADE_PM][DEDUPE][NORMALIZE] marker_status=%s marker_reason=%s before_completed=%s before_retryable=%s after_completed=0 after_retryable=1",
+                status,
+                reason,
+                int(before_completed),
+                int(before_retryable),
+            )
     return marker
 
 
