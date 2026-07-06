@@ -6488,6 +6488,110 @@ class PB1Engine:
         )
         return plan_dict, meta
 
+    @staticmethod
+    def _practice_force_stale_statuses() -> set[str]:
+        return {"SKIPPED", "SKIPPED_BY_POLICY", "REJECTED", "ERROR", "FAILED", "CANCELLED", "EXPIRED", "DRY_RUN", "SIMULATED", "INTENT_ONLY"}
+
+    @staticmethod
+    def _practice_force_active_statuses() -> set[str]:
+        return {"SUBMITTED", "ACCEPTED", "PENDING_CONFIRM", "PARTIALLY_FILLED", "FILLED"}
+
+    def _practice_force_today_buy_blocks(
+        self,
+        *,
+        code: str,
+        today_buy_codes: set[str],
+        buyable_gate_context: dict[str, dict[str, Any]] | None,
+    ) -> bool:
+        code_key = str(code or "").zfill(6)
+        if code_key not in set(today_buy_codes or set()):
+            return False
+        context = (buyable_gate_context or {}).get(code_key) or {}
+        events = list(context.get("today_buy_events") or []) + list(context.get("today_order_events") or [])
+        statuses = {str((event or {}).get("status") or "").upper() for event in events if isinstance(event, dict)}
+        stale = statuses & self._practice_force_stale_statuses()
+        active = statuses & self._practice_force_active_statuses()
+        if stale and not active:
+            for status in sorted(stale):
+                logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][STALE_TODAY_BUY_IGNORED] code=%s status=%s", code_key, status)
+            return False
+        return True
+
+    def _build_practice_force_min_trade_candidate(
+        self,
+        *,
+        scan_members: list[dict[str, Any]],
+        candidates: list[CandidateFeature],
+        held_codes: set[str],
+        open_buy_codes: set[str],
+        today_buy_codes: set[str],
+        buyable_gate_context: dict[str, dict[str, Any]] | None,
+        entry_mode: str | None,
+    ) -> CandidateFeature | None:
+        is_practice = str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice"
+        if not is_practice or os.getenv("PB1_PRACTICE_FORCE_MIN_TRADE", os.getenv("PB1_FORCE_MIN_ONE_ORDER_PRACTICE", "1")) != "1":
+            return None
+        assert str(self.env or "").lower() == "practice"
+        practice_atr_fallback = float(os.getenv("PB1_PRACTICE_ATR_MAX_PCT_FALLBACK", "14") or 14)
+        code_to_cf = {str(c.code).zfill(6): c for c in (candidates or [])}
+        for row in scan_members or []:
+            rowd = dict(row or {})
+            code = str(rowd.get("code") or rowd.get("pdno") or "").zfill(6)
+            if not code or code == "000000" or code in set(held_codes or set()) or code in set(open_buy_codes or set()):
+                continue
+            if self._practice_force_today_buy_blocks(code=code, today_buy_codes=set(today_buy_codes or set()), buyable_gate_context=buyable_gate_context):
+                continue
+            cf = code_to_cf.get(code)
+            if cf is None:
+                cf = CandidateFeature(code=code, market="KR", features=dict(rowd), setup_ok=True, reasons=["PRACTICE_FORCE_MIN_TRADE"], mode=1, mode_reasons=["PRACTICE_FORCE_MIN_TRADE"])
+            atr_pct = self._to_float(cf.features.get("atr_pct") or rowd.get("atr_pct"))
+            atr_cmp = float(atr_pct or 0.0)
+            if atr_cmp and atr_cmp <= 1.0:
+                atr_cmp *= 100.0
+            if atr_cmp and atr_cmp > practice_atr_fallback:
+                continue
+            price = None
+            for key in ("ask", "prpr", "current_price", "order_price", "close", "last_close", "final30_close"):
+                price = self._to_float(cf.features.get(key) or rowd.get(key))
+                if price and price > 0:
+                    break
+            if not price:
+                continue
+            if atr_cmp:
+                cf.features["risk_tag"] = "PRACTICE_ATR_FALLBACK"
+                logger.warning("[KR][ATR_FALLBACK][USED] code=%s atr_pct=%s max=%s", code, atr_cmp, practice_atr_fallback)
+            cf.features.update({
+                "entry_price": float(price),
+                "order_price": float(round_to_tick(float(price) * 1.005)),
+                "limit_price": float(round_to_tick(float(price) * 1.005)),
+                "close": float(price),
+                "stop_price": float(price) * 0.97,
+                "initial_stop": float(price) * 0.97,
+                "entry_style_selected": cf.features.get("entry_style_selected") or "PULLBACK",
+                "entry_reason": cf.features.get("entry_reason") or "ENTRY_PULLBACK",
+                "force_reason": "PRACTICE_FORCE_MIN_TRADE",
+            })
+            cf.planned_qty = 1
+            cf.planned_value = float(cf.features["order_price"])
+            cf.setup_ok = True
+            cf.reasons = ["PRACTICE_FORCE_MIN_TRADE"]
+            cf.client_order_key = cf.client_order_key or self._client_order_key(cf.code, cf.mode, "BUY", "entry", "PB1")
+            cf.entry_plan = self._build_entry_plan(
+                cf,
+                entry_price=float(cf.features["entry_price"]),
+                order_price=float(cf.features["order_price"]),
+                stop_price=float(cf.features["stop_price"]),
+                trigger_ok=True,
+                trigger_info={"reason": "PRACTICE_FORCE_MIN_TRADE"},
+                entry_mode=entry_mode,
+                stage=self._entry_stage_name(),
+                price_source="practice_force_min_trade",
+            )
+            logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][SELECTED] code=%s reason=PRACTICE_FORCE_MIN_TRADE", code)
+            logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][SUBMIT_PATH] code=%s qty=1", code)
+            return cf
+        return None
+
     def _portfolio_risk_diag_settings(self) -> dict[str, Any]:
         return {
             "sector_max_positions": self._int_env("PB1_SECTOR_MAX_POSITIONS", 0),
@@ -16529,64 +16633,17 @@ class PB1Engine:
                 and os.getenv("PB1_PRACTICE_FORCE_MIN_TRADE", os.getenv("PB1_FORCE_MIN_ONE_ORDER_PRACTICE", "1")) == "1"
                 and len(scan_members) >= 1
             ):
-                assert str(self.env or "").lower() == "practice"
-                practice_atr_fallback = float(os.getenv("PB1_PRACTICE_ATR_MAX_PCT_FALLBACK", "14") or 14)
-                code_to_cf = {str(c.code).zfill(6): c for c in (candidates if 'candidates' in locals() else [])}
-                for row in scan_members:
-                    rowd = dict(row or {})
-                    code = str(rowd.get("code") or rowd.get("pdno") or "").zfill(6)
-                    if not code or code == "000000" or code in held_codes or code in open_buy_codes or code in today_buy_codes:
-                        continue
-                    cf = code_to_cf.get(code)
-                    if cf is None:
-                        cf = CandidateFeature(code=code, market="KR", features=dict(rowd), setup_ok=True, reasons=["PRACTICE_FORCE_MIN_TRADE"], mode=1, mode_reasons=["PRACTICE_FORCE_MIN_TRADE"])
-                    atr_pct = self._to_float(cf.features.get("atr_pct") or rowd.get("atr_pct"))
-                    atr_cmp = float(atr_pct or 0.0)
-                    if atr_cmp and atr_cmp <= 1.0:
-                        atr_cmp *= 100.0
-                    if atr_cmp and atr_cmp > practice_atr_fallback:
-                        continue
-                    price = None
-                    for key in ("ask", "prpr", "current_price", "order_price", "close", "last_close", "final30_close"):
-                        price = self._to_float(cf.features.get(key) or rowd.get(key))
-                        if price and price > 0:
-                            break
-                    if not price:
-                        continue
-                    if atr_cmp:
-                        cf.features["risk_tag"] = "PRACTICE_ATR_FALLBACK"
-                        logger.warning("[KR][ATR_FALLBACK][USED] code=%s atr_pct=%s max=%s", code, atr_cmp, practice_atr_fallback)
-                    cf.features.update({
-                        "entry_price": float(price),
-                        "order_price": float(round_to_tick(float(price) * 1.005)),
-                        "limit_price": float(round_to_tick(float(price) * 1.005)),
-                        "close": float(price),
-                        "stop_price": float(price) * 0.97,
-                        "initial_stop": float(price) * 0.97,
-                        "entry_style_selected": cf.features.get("entry_style_selected") or "PULLBACK",
-                        "entry_reason": cf.features.get("entry_reason") or "ENTRY_PULLBACK",
-                        "force_reason": "PRACTICE_FORCE_MIN_TRADE",
-                    })
-                    cf.planned_qty = 1
-                    cf.planned_value = float(cf.features["order_price"])
-                    cf.setup_ok = True
-                    cf.reasons = ["PRACTICE_FORCE_MIN_TRADE"]
-                    cf.client_order_key = cf.client_order_key or self._client_order_key(cf.code, cf.mode, "BUY", "entry", "PB1")
-                    cf.entry_plan = self._build_entry_plan(
-                        cf,
-                        entry_price=float(cf.features["entry_price"]),
-                        order_price=float(cf.features["order_price"]),
-                        stop_price=float(cf.features["stop_price"]),
-                        trigger_ok=True,
-                        trigger_info={"reason": "PRACTICE_FORCE_MIN_TRADE"},
-                        entry_mode=entry_mode,
-                        stage=self._entry_stage_name(),
-                        price_source="practice_force_min_trade",
-                    )
-                    orderable_candidates.append(cf)
-                    logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][SELECTED] code=%s reason=PRACTICE_FORCE_MIN_TRADE", code)
-                    logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][SUBMIT_PATH] code=%s qty=1", code)
-                    break
+                force_cf = self._build_practice_force_min_trade_candidate(
+                    scan_members=[dict(row or {}) for row in scan_members],
+                    candidates=candidates if 'candidates' in locals() else [],
+                    held_codes=set(held_codes or set()),
+                    open_buy_codes=set(open_buy_codes or set()),
+                    today_buy_codes=set(today_buy_codes or set()),
+                    buyable_gate_context=buyable_gate_context if 'buyable_gate_context' in locals() else {},
+                    entry_mode=entry_mode,
+                )
+                if force_cf is not None:
+                    orderable_candidates.append(force_cf)
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)

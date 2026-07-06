@@ -143,7 +143,8 @@ def parse_plan_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 def seed_plan_fields_for_entry_style(entry_style_selected: Any) -> dict[str, Any]:
-    style = str(entry_style_selected or "").strip().upper()
+    style_raw = str(entry_style_selected or "").strip().upper()
+    style = ENTRY_STYLE_ALIAS.get(style_raw, style_raw)
     mapped = STYLE_PLAN_MAPPING.get(style)
     if not mapped:
         return {"entry_thesis": None, "trade_horizon": None, "exit_policy_family": None, "eod_action": None, "force_eod_close": False}

@@ -1,5 +1,5 @@
 from datetime import datetime
-from pathlib import Path
+import subprocess
 from zoneinfo import ZoneInfo
 
 import sqlalchemy as sa
@@ -92,20 +92,49 @@ def test_kr_practice_price_fallback_to_final30_close(monkeypatch):
     assert cf.features["order_price"] == round_to_tick(10000 * 1.005)
 
 
-def test_force_min_trade_candidate_shape():
-    cf = make_cf()
-    cf.features["force_reason"] = "PRACTICE_FORCE_MIN_TRADE"
-    cf.features["risk_tag"] = "PRACTICE_ATR_FALLBACK"
-    cf.planned_qty = 1
-    assert cf.planned_qty == 1
-    assert cf.features["force_reason"] == "PRACTICE_FORCE_MIN_TRADE"
+def test_force_min_trade_builds_candidate_when_orderable_zero(monkeypatch):
+    monkeypatch.setenv("PB1_MARKET_SCOPE", "KR")
+    monkeypatch.setenv("PB1_PRACTICE_FORCE_MIN_TRADE", "1")
+    engine = make_engine()
+    candidate = engine._build_practice_force_min_trade_candidate(
+        scan_members=[{"code": "000810", "close": 659000, "atr_pct": 13.13, "entry_style_selected": "PULLBACK"}],
+        candidates=[], held_codes=set(), open_buy_codes=set(), today_buy_codes=set(),
+        buyable_gate_context={}, entry_mode="",
+    )
+    assert candidate is not None
+    assert candidate.code == "000810"
+    assert candidate.planned_qty == 1
+    assert candidate.features["force_reason"] == "PRACTICE_FORCE_MIN_TRADE"
+    assert candidate.entry_plan["qty"] == 1
 
 
-def test_stale_skipped_order_status_is_not_blocking_contract():
-    ignored = {"SKIPPED", "SKIPPED_BY_POLICY", "REJECTED", "ERROR", "FAILED", "CANCELLED", "EXPIRED", "DRY_RUN", "SIMULATED", "INTENT_ONLY"}
-    blocking = {"SUBMITTED", "ACCEPTED", "PENDING_CONFIRM", "PARTIALLY_FILLED", "FILLED"}
-    assert "SKIPPED" in ignored and "FILLED" in blocking
+def test_force_min_trade_ignores_stale_today_buy_code(monkeypatch, caplog):
+    monkeypatch.setenv("PB1_MARKET_SCOPE", "KR")
+    monkeypatch.setenv("PB1_PRACTICE_FORCE_MIN_TRADE", "1")
+    engine = make_engine()
+    candidate = engine._build_practice_force_min_trade_candidate(
+        scan_members=[{"code": "000810", "close": 659000, "atr_pct": 13.13}],
+        candidates=[], held_codes=set(), open_buy_codes=set(), today_buy_codes={"000810"},
+        buyable_gate_context={"000810": {"today_buy_events": [{"status": "INTENT_ONLY"}]}},
+        entry_mode="",
+    )
+    assert candidate is not None
+    assert "[KR][PRACTICE_FORCE_MIN_TRADE][STALE_TODAY_BUY_IGNORED] code=000810 status=INTENT_ONLY" in caplog.text
+
+
+def test_force_min_trade_blocks_active_today_buy_code(monkeypatch):
+    monkeypatch.setenv("PB1_MARKET_SCOPE", "KR")
+    monkeypatch.setenv("PB1_PRACTICE_FORCE_MIN_TRADE", "1")
+    engine = make_engine()
+    candidate = engine._build_practice_force_min_trade_candidate(
+        scan_members=[{"code": "000810", "close": 659000, "atr_pct": 13.13}],
+        candidates=[], held_codes=set(), open_buy_codes=set(), today_buy_codes={"000810"},
+        buyable_gate_context={"000810": {"today_buy_events": [{"status": "SUBMITTED"}]}},
+        entry_mode="",
+    )
+    assert candidate is None
 
 
 def test_us_path_no_touch():
-    assert not any(str(p).startswith(("trader/us/", "scripts/wsl/run-us-")) for p in Path(".").glob("trader/us/*")) or Path("trader/us").exists()
+    diff_names = subprocess.check_output(["git", "diff", "--name-only", "HEAD^", "HEAD"], text=True).splitlines()
+    assert not any(path.startswith("trader/us/") or path.startswith("scripts/wsl/run-us-") for path in diff_names)

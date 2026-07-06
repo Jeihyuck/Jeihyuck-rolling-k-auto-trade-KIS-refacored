@@ -7,7 +7,7 @@ from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRe
 from trader.db.schema import schema_for_engine
 from trader.pb1_engine import CandidateFeature, PB1Engine
 from trader.window_router import WindowDecision
-from trader.trade_plan import build_entry_exit_plan
+from trader.trade_plan import build_entry_exit_plan, seed_plan_fields_for_entry_style
 
 
 class FakeKis:
@@ -111,3 +111,10 @@ def test_entry_exit_plan_fail_open_reaches_submit(monkeypatch):
     status = engine._place_entry(cf)
     assert status["api_submitted"] == 1
     assert "entry_exit_plan" in cf.features
+
+
+def test_seed_plan_fields_accepts_raw_styles():
+    assert seed_plan_fields_for_entry_style("PULLBACK")["trade_horizon"] == "SWING"
+    assert seed_plan_fields_for_entry_style("BREAKOUT")["trade_horizon"] == "DAY_TRADE"
+    assert seed_plan_fields_for_entry_style("MOMENTUM")["trade_horizon"] == "DAY_TRADE"
+    assert seed_plan_fields_for_entry_style("VCP")["trade_horizon"] == "SWING"
