@@ -45,3 +45,17 @@ def test_pm_duplicate_after_entry_plan_invalid_marker_is_retryable():
     assert reason == "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT"
     assert completed == 0
     assert retryable == 1
+
+
+def test_order_candidate_but_zero_api_submit_reason_preserved():
+    status, reason, completed, retryable = normalize_kr_session_completion(
+        status="OK_NO_TRADE",
+        summary_reason="PB1_SESSION_DONE",
+        marker={"completed": 1, "retryable": 0},
+        pb1_status="RETRYABLE_ORDER_BUILD_ERROR",
+        pb1_exit_reason="ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
+    )
+    assert status == "RETRYABLE_ORDER_BUILD_ERROR"
+    assert reason == "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT"
+    assert completed == 0
+    assert retryable == 1

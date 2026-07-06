@@ -339,6 +339,11 @@ jobs:
       KIS_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.STRATEGY_ENV || 'practice' }}
 
     steps:
+      - name: KR workflow order mode notice
+        run: |
+          echo "[KR_WORKFLOW_MODE] mode=INTENT_ONLY dry_run=1 live=0 reason=github_actions_not_live_order_path"
+          echo "[KR_WORKFLOW_MODE][DOC] live_order_path=scripts/wsl/run-kr-am.sh,scripts/wsl/run-kr-afternoon.sh"
+
       - name: Branch guard
         run: |
           set -euo pipefail

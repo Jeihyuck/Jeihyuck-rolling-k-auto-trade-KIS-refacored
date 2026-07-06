@@ -6,6 +6,16 @@ from typing import Any, Mapping
 
 POLICY_VERSION = "pb1_entry_exit_plan_v1"
 
+ENTRY_STYLE_ALIAS = {
+    "PULLBACK": "ENTRY_PULLBACK",
+    "BREAKOUT": "ENTRY_BREAKOUT",
+    "MOMENTUM": "ENTRY_MOMENTUM",
+    "VCP": "ENTRY_VCP",
+    "PULLBACK_OVERRIDE": "ENTRY_PULLBACK_OVERRIDE",
+    "BREAKOUT_TRIGGER": "ENTRY_BREAKOUT",
+    "MOMENTUM_CONTINUATION": "ENTRY_MOMENTUM_CONTINUATION",
+}
+
 STYLE_PLAN_MAPPING: dict[str, dict[str, Any]] = {
     "ENTRY_BREAKOUT": {"entry_thesis": "BREAKOUT_DAYTRADE", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
     "ENTRY_OPEN_PUSH": {"entry_thesis": "BREAKOUT_DAYTRADE", "trade_horizon": "DAY_TRADE", "exit_policy_family": "INTRADAY_PROFIT_PROTECT", "eod_action": "FORCE_EXIT", "force_eod_close": True},
@@ -79,6 +89,7 @@ class EntryExitPlan:
     protection_plan: ProtectionPlan
     time_plan: TimePlan
     policy_source: str
+    entry_style_raw: str | None = None
     policy_version: str = POLICY_VERSION
 
     def to_dict(self) -> dict[str, Any]:
@@ -141,7 +152,8 @@ def seed_plan_fields_for_entry_style(entry_style_selected: Any) -> dict[str, Any
 
 def build_entry_exit_plan(*, code: str, market: str | None = None, entry_style_selected: str | None, entry_reason: str | None, entry_price: float, features: Any | None = None) -> EntryExitPlan:
     features = features or {}
-    style = str(entry_style_selected or _feature(features, "entry_style_selected") or "").strip().upper()
+    style_raw = str(entry_style_selected or _feature(features, "entry_style_selected") or "").strip().upper()
+    style = ENTRY_STYLE_ALIAS.get(style_raw, style_raw)
     if not style:
         raise ValueError("entry_style_selected is required")
     mapped = STYLE_PLAN_MAPPING.get(style)
@@ -221,6 +233,7 @@ def build_entry_exit_plan(*, code: str, market: str | None = None, entry_style_s
         entry_thesis=base["entry_thesis"],
         entry_style_selected=style,
         entry_reason=str(entry_reason or _feature(features, "entry_reason") or style),
+        entry_style_raw=style_raw,
         trade_horizon=horizon,
         exit_policy_family=base["exit_policy_family"],
         eod_action=base["eod_action"],
