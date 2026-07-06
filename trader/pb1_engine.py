@@ -5650,6 +5650,18 @@ class PB1Engine:
                 key=lambda row: self._coerce_kst_datetime(row.get("submitted_at") or row.get("acked_at") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
                 reverse=True,
             )
+            if str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice":
+                stale_statuses = {"SKIPPED", "SKIPPED_BY_POLICY", "REJECTED", "ERROR", "FAILED", "CANCELLED", "EXPIRED", "DRY_RUN", "SIMULATED", "INTENT_ONLY"}
+                active_statuses = {"SUBMITTED", "ACCEPTED", "PENDING_CONFIRM", "PARTIALLY_FILLED", "FILLED"}
+                filtered_order_events = []
+                for order_row in recent_order_events:
+                    status_text = str(order_row.get("status") or "").upper()
+                    if status_text in stale_statuses:
+                        logger.info("[BUYABLE][STALE_ORDER_IGNORED] code=%s status=%s reason=practice_retry", code_key, status_text)
+                        continue
+                    if status_text in active_statuses or not status_text:
+                        filtered_order_events.append(order_row)
+                recent_order_events = filtered_order_events
             recent_ledger_events = sorted(
                 recent_ledger_by_code.get(code_key, []),
                 key=lambda row: self._coerce_kst_datetime(row.get("ts") or row.get("created_at")) or datetime.min.replace(tzinfo=KST),
@@ -6386,6 +6398,199 @@ class PB1Engine:
             float(risk.get("risk_R") or 0.0), time_plan.get("max_trading_days"), plan_dict.get("policy_version"),
         )
         return plan_dict, entry_meta
+
+    def ensure_entry_exit_plan(
+        self,
+        cf: CandidateFeature,
+        *,
+        entry_price: float,
+        order_price: float,
+        qty: int,
+        stage: str,
+        allow_fail_open: bool | None = None,
+    ) -> tuple[dict, dict]:
+        """Synchronize entry_plan and entry_exit_plan before KR practice submit."""
+        features = cf.features or {}
+        is_kr = str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
+        is_practice = str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice"
+        fail_open = os.getenv("PB1_ENTRY_PLAN_FAIL_OPEN", "1") == "1" if allow_fail_open is None else bool(allow_fail_open)
+
+        ep = getattr(cf, "entry_plan", None) or features.get("entry_plan")
+        if not isinstance(ep, dict):
+            ep_entry = float(entry_price or features.get("entry_price") or features.get("close") or features.get("last_close") or 0.0)
+            ep_order = float(order_price or features.get("order_price") or ep_entry or 0.0)
+            ep_stop = float(features.get("stop_price") or features.get("initial_stop") or (ep_entry * 0.97 if ep_entry > 0 else 0.0))
+            cf.planned_qty = max(1, int(qty or cf.planned_qty or 1)) if is_kr and is_practice and fail_open else int(qty or cf.planned_qty or 0)
+            ep = self._build_entry_plan(
+                cf,
+                entry_price=ep_entry,
+                order_price=ep_order,
+                stop_price=ep_stop,
+                trigger_ok=bool(features.get("breakout_trigger_ok") or features.get("trigger_ok")),
+                trigger_info=features.get("entry_trigger") if isinstance(features.get("entry_trigger"), dict) else {},
+                entry_mode=str(features.get("entry_mode") or ""),
+                stage=stage,
+                price_source=str(features.get("price_source") or "ensure_entry_exit_plan"),
+            )
+        cf.entry_plan = ep
+        features["entry_plan"] = ep
+
+        plan_price = float(entry_price or ep.get("entry_price") or features.get("entry_price") or features.get("close") or features.get("last_close") or 0.0)
+        try:
+            prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=plan_price)
+            if prepared is None:
+                raise ValueError("entry_exit_plan_missing_or_invalid")
+            plan_dict, meta = prepared
+        except Exception as exc:
+            if not (is_kr and is_practice and fail_open):
+                raise
+            fallback_entry = float(plan_price or features.get("entry_price") or features.get("close") or features.get("last_close") or 0.0)
+            if fallback_entry <= 0:
+                raise
+            features.setdefault("entry_price", fallback_entry)
+            features.setdefault("order_price", float(order_price or fallback_entry * 1.005))
+            features.setdefault("stop_price", float(features.get("initial_stop") or fallback_entry * 0.97))
+            features.setdefault("initial_stop", features["stop_price"])
+            features.setdefault("entry_style_selected", "PULLBACK")
+            features.setdefault("entry_reason", "ENTRY_PULLBACK")
+            cf.planned_qty = max(1, int(qty or cf.planned_qty or 1))
+            logger.warning("[PB1][ENTRY_EXIT_PLAN][FAIL_OPEN] code=%s reason=%s action=use_fallback_plan", cf.code, exc)
+            plan_obj = build_entry_exit_plan(
+                code=cf.code,
+                market=cf.market,
+                entry_style_selected=str(features.get("entry_style_selected") or "PULLBACK"),
+                entry_reason=str(features.get("entry_reason") or "ENTRY_PULLBACK"),
+                entry_price=fallback_entry,
+                features=features,
+            )
+            plan_dict = plan_obj.to_dict()
+            risk = plan_dict.get("risk_plan") or {}
+            time_plan = plan_dict.get("time_plan") or {}
+            meta = {
+                "entry_thesis": plan_dict.get("entry_thesis"),
+                "entry_style_selected": plan_dict.get("entry_style_selected"),
+                "entry_reason": plan_dict.get("entry_reason"),
+                "trade_horizon": plan_dict.get("trade_horizon"),
+                "exit_policy_family": plan_dict.get("exit_policy_family"),
+                "eod_action": plan_dict.get("eod_action"),
+                "force_eod_close": plan_dict.get("force_eod_close"),
+                "initial_stop_price": risk.get("initial_stop"),
+                "initial_risk_r": risk.get("risk_R"),
+                "max_trading_days": time_plan.get("max_trading_days"),
+                "policy_source": plan_dict.get("policy_source"),
+                "policy_version": plan_dict.get("policy_version"),
+            }
+        setattr(cf, "entry_exit_plan", plan_dict)
+        features["entry_exit_plan"] = plan_dict
+        logger.info(
+            "[PB1][ENTRY_EXIT_PLAN][VALID] code=%s style=%s horizon=%s exit_policy=%s",
+            cf.code, plan_dict.get("entry_style_selected"), plan_dict.get("trade_horizon"), plan_dict.get("exit_policy_family"),
+        )
+        return plan_dict, meta
+
+    @staticmethod
+    def _practice_force_stale_statuses() -> set[str]:
+        return {"SKIPPED", "SKIPPED_BY_POLICY", "REJECTED", "ERROR", "FAILED", "CANCELLED", "EXPIRED", "DRY_RUN", "SIMULATED", "INTENT_ONLY"}
+
+    @staticmethod
+    def _practice_force_active_statuses() -> set[str]:
+        return {"SUBMITTED", "ACCEPTED", "PENDING_CONFIRM", "PARTIALLY_FILLED", "FILLED"}
+
+    def _practice_force_today_buy_blocks(
+        self,
+        *,
+        code: str,
+        today_buy_codes: set[str],
+        buyable_gate_context: dict[str, dict[str, Any]] | None,
+    ) -> bool:
+        code_key = str(code or "").zfill(6)
+        if code_key not in set(today_buy_codes or set()):
+            return False
+        context = (buyable_gate_context or {}).get(code_key) or {}
+        events = list(context.get("today_buy_events") or []) + list(context.get("today_order_events") or [])
+        statuses = {str((event or {}).get("status") or "").upper() for event in events if isinstance(event, dict)}
+        stale = statuses & self._practice_force_stale_statuses()
+        active = statuses & self._practice_force_active_statuses()
+        if stale and not active:
+            for status in sorted(stale):
+                logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][STALE_TODAY_BUY_IGNORED] code=%s status=%s", code_key, status)
+            return False
+        return True
+
+    def _build_practice_force_min_trade_candidate(
+        self,
+        *,
+        scan_members: list[dict[str, Any]],
+        candidates: list[CandidateFeature],
+        held_codes: set[str],
+        open_buy_codes: set[str],
+        today_buy_codes: set[str],
+        buyable_gate_context: dict[str, dict[str, Any]] | None,
+        entry_mode: str | None,
+    ) -> CandidateFeature | None:
+        is_practice = str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice"
+        if not is_practice or os.getenv("PB1_PRACTICE_FORCE_MIN_TRADE", os.getenv("PB1_FORCE_MIN_ONE_ORDER_PRACTICE", "1")) != "1":
+            return None
+        assert str(self.env or "").lower() == "practice"
+        practice_atr_fallback = float(os.getenv("PB1_PRACTICE_ATR_MAX_PCT_FALLBACK", "14") or 14)
+        code_to_cf = {str(c.code).zfill(6): c for c in (candidates or [])}
+        for row in scan_members or []:
+            rowd = dict(row or {})
+            code = str(rowd.get("code") or rowd.get("pdno") or "").zfill(6)
+            if not code or code == "000000" or code in set(held_codes or set()) or code in set(open_buy_codes or set()):
+                continue
+            if self._practice_force_today_buy_blocks(code=code, today_buy_codes=set(today_buy_codes or set()), buyable_gate_context=buyable_gate_context):
+                continue
+            cf = code_to_cf.get(code)
+            if cf is None:
+                cf = CandidateFeature(code=code, market="KR", features=dict(rowd), setup_ok=True, reasons=["PRACTICE_FORCE_MIN_TRADE"], mode=1, mode_reasons=["PRACTICE_FORCE_MIN_TRADE"])
+            atr_pct = self._to_float(cf.features.get("atr_pct") or rowd.get("atr_pct"))
+            atr_cmp = float(atr_pct or 0.0)
+            if atr_cmp and atr_cmp <= 1.0:
+                atr_cmp *= 100.0
+            if atr_cmp and atr_cmp > practice_atr_fallback:
+                continue
+            price = None
+            for key in ("ask", "prpr", "current_price", "order_price", "close", "last_close", "final30_close"):
+                price = self._to_float(cf.features.get(key) or rowd.get(key))
+                if price and price > 0:
+                    break
+            if not price:
+                continue
+            if atr_cmp:
+                cf.features["risk_tag"] = "PRACTICE_ATR_FALLBACK"
+                logger.warning("[KR][ATR_FALLBACK][USED] code=%s atr_pct=%s max=%s", code, atr_cmp, practice_atr_fallback)
+            cf.features.update({
+                "entry_price": float(price),
+                "order_price": float(round_to_tick(float(price) * 1.005)),
+                "limit_price": float(round_to_tick(float(price) * 1.005)),
+                "close": float(price),
+                "stop_price": float(price) * 0.97,
+                "initial_stop": float(price) * 0.97,
+                "entry_style_selected": cf.features.get("entry_style_selected") or "PULLBACK",
+                "entry_reason": cf.features.get("entry_reason") or "ENTRY_PULLBACK",
+                "force_reason": "PRACTICE_FORCE_MIN_TRADE",
+            })
+            cf.planned_qty = 1
+            cf.planned_value = float(cf.features["order_price"])
+            cf.setup_ok = True
+            cf.reasons = ["PRACTICE_FORCE_MIN_TRADE"]
+            cf.client_order_key = cf.client_order_key or self._client_order_key(cf.code, cf.mode, "BUY", "entry", "PB1")
+            cf.entry_plan = self._build_entry_plan(
+                cf,
+                entry_price=float(cf.features["entry_price"]),
+                order_price=float(cf.features["order_price"]),
+                stop_price=float(cf.features["stop_price"]),
+                trigger_ok=True,
+                trigger_info={"reason": "PRACTICE_FORCE_MIN_TRADE"},
+                entry_mode=entry_mode,
+                stage=self._entry_stage_name(),
+                price_source="practice_force_min_trade",
+            )
+            logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][SELECTED] code=%s reason=PRACTICE_FORCE_MIN_TRADE", code)
+            logger.warning("[KR][PRACTICE_FORCE_MIN_TRADE][SUBMIT_PATH] code=%s qty=1", code)
+            return cf
+        return None
 
     def _portfolio_risk_diag_settings(self) -> dict[str, Any]:
         return {
@@ -9250,6 +9455,24 @@ class PB1Engine:
                 display_code, stage,
             )
         qty = int((plan or {}).get("qty") or cf.planned_qty or 0)
+        if isinstance(plan, dict) and str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice" and (
+            str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
+        ) and os.getenv("PB1_PRICE_FALLBACK_TO_FINAL30_CLOSE", "1") == "1":
+            plan_order_px = self._to_float(plan.get("order_price") or plan.get("limit_price"))
+            if not plan_order_px or plan_order_px <= 0:
+                for source_key in ("close", "last_close", "prep_close", "final30_close"):
+                    fallback_close = self._to_float(cf.features.get(source_key))
+                    if fallback_close and fallback_close > 0:
+                        fallback_order = float(round_to_tick(float(fallback_close) * 1.005))
+                        plan["entry_price"] = float(plan.get("entry_price") or fallback_close)
+                        plan["order_price"] = fallback_order
+                        plan["limit_price"] = fallback_order
+                        cf.features["order_price"] = fallback_order
+                        cf.features["limit_price"] = fallback_order
+                        cf.features.setdefault("entry_price", float(fallback_close))
+                        cf.features["price_source"] = source_key
+                        logger.warning("[KR][PRICE_FALLBACK][USED] code=%s source=%s order_price=%s", display_code, source_key, fallback_order)
+                        break
         plan_ok, plan_reasons = self._validate_entry_plan(plan)
         logger.info(
             "[ORDER][SUBMIT][ENTRY_PLAN_CHECK] code=%s has_cf_plan=%s has_feature_plan=%s plan_ok=%s reasons=%s stage=%s qty=%s limit=%.0f",
@@ -9387,6 +9610,27 @@ class PB1Engine:
             limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
             order_type = "LIMIT"
         record_price = float(limit_price or entry_price or 0.0)
+        if record_price <= 0 and str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice" and (
+            str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
+        ) and os.getenv("PB1_PRICE_FALLBACK_TO_FINAL30_CLOSE", "1") == "1":
+            for source_key in ("close", "last_close", "prep_close", "final30_close"):
+                fallback_close = self._to_float(cf.features.get(source_key))
+                if fallback_close and fallback_close > 0:
+                    record_price = float(round_to_tick(float(fallback_close) * 1.005))
+                    limit_price = record_price
+                    plan["order_price"] = record_price
+                    plan["limit_price"] = record_price
+                    cf.features["order_price"] = record_price
+                    cf.features["price_source"] = source_key
+                    logger.warning("[KR][PRICE_FALLBACK][USED] code=%s source=%s order_price=%s", display_code, source_key, record_price)
+                    break
+        entry_exit_plan_dict, plan_entry_meta = self.ensure_entry_exit_plan(
+            cf,
+            entry_price=float(entry_price or cf.features.get("entry_price") or record_price or 0.0),
+            order_price=float(record_price or 0.0),
+            qty=qty,
+            stage=stage,
+        )
         pre_submit = self._resolve_entry_pre_submit(
             cf=cf,
             stage=stage,
@@ -9408,15 +9652,6 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
-        plan_prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=float(cf.features.get("entry_price") or limit_price or cf.features.get("close") or record_price or 0.0))
-        if plan_prepared is None:
-            self._last_order_skip_reasons = getattr(self, "_last_order_skip_reasons", []) + ["entry_exit_plan_missing_or_invalid"]
-            status["skipped"] = 1
-            status["skipped_reason"] = "entry_exit_plan_missing_or_invalid"
-            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
-            status["terminal_event"] = "FINAL_SKIP"
-            return status
-        entry_exit_plan_dict, plan_entry_meta = plan_prepared
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=record_price)
         entry_meta.update(plan_entry_meta)
         # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
@@ -10145,15 +10380,13 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
-        plan_prepared = self._prepare_entry_exit_plan(cf, entry_price_for_plan=float(cf.features.get("entry_price") or cap or cf.features.get("close") or 0.0))
-        if plan_prepared is None:
-            self._last_order_skip_reasons = getattr(self, "_last_order_skip_reasons", []) + ["entry_exit_plan_missing_or_invalid"]
-            status["skipped"] = 1
-            status["skipped_reason"] = "entry_exit_plan_missing_or_invalid"
-            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
-            status["terminal_event"] = "FINAL_SKIP"
-            return status
-        entry_exit_plan_dict, plan_entry_meta = plan_prepared
+        entry_exit_plan_dict, plan_entry_meta = self.ensure_entry_exit_plan(
+            cf,
+            entry_price=float(cf.features.get("entry_price") or cap or cf.features.get("close") or 0.0),
+            order_price=float(cap or 0.0),
+            qty=int(cf.planned_qty or 0),
+            stage="PB1-CLOSE",
+        )
         entry_meta = self._build_entry_metadata(cf, entry_price_planned=float(cap or 0.0))
         entry_meta.update(plan_entry_meta)
         # ── [ENTRY][HORIZON] / [ENTRY][RISK_UNIT] 태깅 ───────────────────────
@@ -16393,6 +16626,24 @@ class PB1Engine:
                 min_order_krw=min_order_krw,
             )
             orderable_candidates = candidate_width_result.orderable_candidates
+            if (
+                not orderable_candidates
+                and str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice"
+                and (str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or any(_is_kr_stock_code(getattr(c, "code", "")) for c in (candidates if 'candidates' in locals() else [])))
+                and os.getenv("PB1_PRACTICE_FORCE_MIN_TRADE", os.getenv("PB1_FORCE_MIN_ONE_ORDER_PRACTICE", "1")) == "1"
+                and len(scan_members) >= 1
+            ):
+                force_cf = self._build_practice_force_min_trade_candidate(
+                    scan_members=[dict(row or {}) for row in scan_members],
+                    candidates=candidates if 'candidates' in locals() else [],
+                    held_codes=set(held_codes or set()),
+                    open_buy_codes=set(open_buy_codes or set()),
+                    today_buy_codes=set(today_buy_codes or set()),
+                    buyable_gate_context=buyable_gate_context if 'buyable_gate_context' in locals() else {},
+                    entry_mode=entry_mode,
+                )
+                if force_cf is not None:
+                    orderable_candidates.append(force_cf)
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)
@@ -16926,7 +17177,7 @@ class PB1Engine:
                     sell_filled,
                     open_orders_count,
                 )
-                if len(orderable_candidates) > 0 and self.order_allowed and not self.dry_run and self.intended_live and api_submitted_count == 0:
+                if len(orderable_candidates) > 0 and api_submitted_count == 0:
                     self._log_no_trade_explain(
                         final30_count=len(scan_members),
                         candidates=candidates if 'candidates' in locals() else [],
@@ -16944,30 +17195,18 @@ class PB1Engine:
                         or "entry_order_plan" in str(r).lower()
                         or "entry_exit_plan" in str(r).lower()
                     ]
-                    if skipped_count >= len(orderable_candidates) and plan_skip_reasons:
-                        final_status = "RETRYABLE_ORDER_BUILD_ERROR"
-                        final_notes = "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT"
-                        logger.error(
-                            "[RUN_SUMMARY][RESULT] status=RETRYABLE_ORDER_BUILD_ERROR reason=ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT order_candidates=%s skipped=%s api_submitted=%s skip_reasons=%s",
-                            len(orderable_candidates), skipped_count, api_submitted_count, plan_skip_reasons,
+                    final_status = "RETRYABLE_ORDER_BUILD_ERROR"
+                    final_notes = "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT"
+                    os.environ["PB1_LAST_RESULT_STATUS"] = final_status
+                    os.environ["PB1_LAST_EXIT_REASON"] = final_notes
+                    logger.error(
+                        "[KR][ORDER_ZERO_API][FAIL] order_candidates=%s api_submitted=0 reason=ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
+                        len(orderable_candidates),
+                    )
+                    if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "0") == "1":
+                        raise RuntimeError(
+                            f"[KR][ORDER_ZERO_API][FAIL] order_candidates={len(orderable_candidates)} api_submitted=0"
                         )
-                    elif skipped_count >= len(orderable_candidates) and attempted_count == 0:
-                        logger.warning(
-                            "[ORDER][ALL_SKIPPED_BEFORE_SUBMIT] session=%s candidates=%s skipped=%s reasons=%s",
-                            self.session_kind, len(orderable_candidates), skipped_count, getattr(self, "_last_order_skip_reasons", []),
-                        )
-                        logger.info(
-                            "[RUN_SUMMARY][RESULT] session=%s status=OK_NO_TRADE reason=ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
-                            self.session_kind,
-                        )
-                    else:
-                        final_status = "RETRYABLE_ORDER_BUILD_ERROR"
-                        final_notes = "ORDER_CANDIDATE_WITHOUT_API_SUBMIT"
-                        logger.error("[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates=%s attempted=%s accepted=%s skipped=%s", len(orderable_candidates), attempted_count, accepted_count, skipped_count)
-                        if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "0") == "1":
-                            raise RuntimeError(
-                                f"[ORDER][ANOMALY][CANDIDATE_WITHOUT_API_SUBMIT] candidates={len(orderable_candidates)} attempted={attempted_count} api_submitted={api_submitted_count} skipped={skipped_count}"
-                            )
                 if entry_allowed and self.phase in {"entry", "pm_entry"} and allow_add_to_existing:
                     remaining_budget = max(0.0, float(tick_budget_krw) - planned_spent)
                     for pos in existing_positions:

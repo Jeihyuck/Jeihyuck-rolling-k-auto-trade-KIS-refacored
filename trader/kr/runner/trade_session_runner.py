@@ -498,19 +498,24 @@ def normalize_kr_session_completion(
         "CLOSE_BALANCE_UNCONFIRMED",
         "BALANCE_TIMEOUT_FAIL_SOFT",
         "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
+        "ENTRY_EXIT_PLAN_MISSING_OR_INVALID",
         "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
         "RETRYABLE_ORDER_BUILD_ERROR",
+        "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
     }
     retryable_order_build_reasons = {
         "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
+        "ENTRY_EXIT_PLAN_MISSING_OR_INVALID",
         "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
         "RETRYABLE_ORDER_BUILD_ERROR",
+        "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
     }
     pb1_status_u = str(pb1_status or "").upper()
     pb1_exit_reason_s = str(pb1_exit_reason or "")
 
     if pb1_status_u == "RETRYABLE_ORDER_BUILD_ERROR" or pb1_exit_reason_s in retryable_order_build_reasons:
-        return "RETRYABLE_ORDER_BUILD_ERROR", "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT", 0, 1
+        reason = pb1_exit_reason_s if pb1_exit_reason_s in retryable_order_build_reasons else "RETRYABLE_ORDER_BUILD_ERROR"
+        return "RETRYABLE_ORDER_BUILD_ERROR", reason, 0, 1
 
     if pb1_exit_reason_s == "phase_guard_skip_duplicate_pm_run":
         completed = int(bool((marker or {}).get("completed")))
