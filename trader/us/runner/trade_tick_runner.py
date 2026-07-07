@@ -350,6 +350,12 @@ def run_trade_tick(
     kis_order_allowed: bool = True,
     session_entry_allowed: bool | None = None,
     session_buy_orders_count: int | None = None,
+    tick_index: int = 1,
+    balance_reconcile_interval: int = 3,
+    prep_status_cache: dict | None = None,
+    locked_watchlist_cache: list[dict] | None = None,
+    prep_cache_source: str | None = None,
+    watchlist_cache_source: str | None = None,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -471,7 +477,7 @@ def run_trade_tick(
         and os.getenv("US_KIS_ORDER_ALLOWED", "1") == "1"
         and kis_order_allowed
     )
-    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
+    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "270"))
     watchlist_timeout_sec = int(os.getenv("US_WATCHLIST_LOAD_TIMEOUT_SEC", "20"))
     entry_eval_timeout_sec = int(os.getenv("US_ENTRY_EVAL_TIMEOUT_SEC", "60"))
 
@@ -515,10 +521,27 @@ def run_trade_tick(
     effective_budget = budget["effective_order_budget_usd"]
 
     # ── reconcile ─────────────────────────────────────────────────────────────
-    logger.info("[US_RECONCILE][START] session=%s", session)
+    should_reconcile_balance = (
+        session == "close"
+        or int(tick_index or 1) <= 1
+        or (int(balance_reconcile_interval or 0) > 0 and int(tick_index or 1) % int(balance_reconcile_interval or 1) == 0)
+    )
+    logger.info("[US_RECONCILE][START] session=%s tick_index=%s should_reconcile_balance=%d interval=%s", session, tick_index, int(should_reconcile_balance), balance_reconcile_interval)
     try:
-        from trader.us.execution.reconcile import reconcile_positions
-        recon = reconcile_positions(provider=provider)
+        if should_reconcile_balance:
+            from trader.us.execution.reconcile import reconcile_positions
+            recon = reconcile_positions(provider=provider)
+        else:
+            from trader.us.db.repos import load_positions as _load_positions_for_reconcile_skip
+            _positions = _load_positions_for_reconcile_skip()
+            recon = {
+                "status": "SKIPPED_BALANCE_RECONCILE",
+                "reason": "reconcile_interval_skip",
+                "positions": _positions,
+                "position_count": len(_positions),
+                "position_symbols": [str(p.get("symbol") or "").upper() for p in _positions if p.get("symbol")],
+                "block_new_entry": False,
+            }
         logger.info(
             "[US_RECONCILE][DONE] status=%s positions=%s",
             recon.get("status"),
@@ -919,8 +942,16 @@ def run_trade_tick(
         
         last_stage = "prep_status_load"
         try:
-            prep_status_info = load_latest_us_prep_status(trade_date)
-            prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
+            if prep_status_cache is not None:
+                prep_status_info = dict(prep_status_cache)
+                prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
+                logger.info("[US_ENTRY][PREP_STATUS][CACHE] source=%s status=%s", prep_cache_source or "session_cache", prep_status)
+            else:
+                try:
+                    prep_status_info = load_latest_us_prep_status(trade_date, timeout_sec=max(1, int(os.getenv("US_PREP_STATUS_LOAD_TIMEOUT_SEC", "5"))))
+                except TypeError:
+                    prep_status_info = load_latest_us_prep_status(trade_date)
+                prep_status = prep_status_info.get("status", "UNKNOWN") if prep_status_info else "UNKNOWN"
         except Exception as prep_exc:
             if not _is_transient_watchlist_db_error(prep_exc):
                 raise
@@ -957,15 +988,21 @@ def run_trade_tick(
                 )
                 
                 try:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        fut = pool.submit(
-                            load_locked_us_watchlist,
-                            trade_date,
-                            min_watchlist_count,
-                            allow_degraded,
-                            watchlist_timeout_sec,
-                        )
-                        watchlist_rows = fut.result(timeout=watchlist_timeout_sec + 1)
+                    if locked_watchlist_cache is not None:
+                        watchlist_rows = list(locked_watchlist_cache)
+                        watchlist_fallback_used = (watchlist_cache_source or "").startswith("artifact")
+                        entry_watchlist_source = watchlist_cache_source or "session_cache"
+                        logger.info("[US_ENTRY][WATCHLIST][CACHE] source=%s count=%d", entry_watchlist_source, len(watchlist_rows))
+                    else:
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            fut = pool.submit(
+                                load_locked_us_watchlist,
+                                trade_date,
+                                min_watchlist_count,
+                                allow_degraded,
+                                watchlist_timeout_sec,
+                            )
+                            watchlist_rows = fut.result(timeout=watchlist_timeout_sec + 1)
                 except concurrent.futures.TimeoutError:
                     elapsed_ms = int((time.monotonic() - watchlist_start) * 1000)
                     logger.error(

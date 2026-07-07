@@ -254,6 +254,8 @@ def _write_us_session_report(payload: dict, session: str) -> None:
     trade_date = str(payload.get("trade_date") or "")
     latest_json = report_base / "latest_us_daily_report.json"
     latest_md = report_base / "latest_us_daily_report.md"
+    session_summary_json = report_base / trade_date / f"{session}_summary.json" if trade_date else None
+    session_summary_md = report_base / trade_date / f"{session}_summary.md" if trade_date else None
 
     if trade_date:
         dated_dir = report_base / trade_date / session
@@ -264,7 +266,11 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         dated_json = None
         dated_md = None
 
-    latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    if session_summary_json is not None:
+        session_summary_json.parent.mkdir(parents=True, exist_ok=True)
+        session_summary_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    if session == "close":
+        latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
     md_lines = [
         f"# US Daily Report - {payload.get('trade_date', 'N/A')}",
@@ -297,12 +303,38 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         f"- 내부 잔고 보정: {payload.get('synthetic_reconcile_buys', 0) + payload.get('synthetic_reconcile_sells', 0)}건",
         "- 내부 잔고 보정은 실제 MTS 신규 매수 체결이 아님",
     ])
-    latest_md.write_text("\n".join(md_lines) + "\n")
+    if session_summary_md is not None:
+        session_summary_md.write_text("\n".join(md_lines) + "\n")
+    if session == "close":
+        latest_md.write_text("\n".join(md_lines) + "\n")
 
     if dated_json is not None and dated_md is not None:
         dated_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         dated_md.write_text("\n".join(md_lines) + "\n")
 
+
+
+def _count_trade_date_order_activity(trade_date: str) -> int:
+    """Best-effort count of DB order rows used to classify timeout-after-order as non-fatal."""
+    try:
+        from trader.us.db.repos import load_us_daily_orders_for_report
+        rows = load_us_daily_orders_for_report(trade_date) or []
+        return len(rows)
+    except Exception as exc:
+        logger.warning("[US_SESSION][ORDER_ACTIVITY][WARN] trade_date=%s err=%s", trade_date, exc)
+        return 0
+
+
+def _tick_has_order_activity(tick_result: dict | None, before_count: int, after_count: int) -> bool:
+    if tick_result:
+        if int(tick_result.get("orders_ack", 0) or 0) > 0:
+            return True
+        if int(tick_result.get("orders_sent", 0) or 0) > 0:
+            return True
+        for order in tick_result.get("orders", []) or []:
+            if str(order.get("status") or "").upper() in {"ACK", "FILLED", "SUBMITTED", "SENT"}:
+                return True
+    return after_count > before_count
 
 def _now_ny(force_now: str | None = None) -> datetime:
     from zoneinfo import ZoneInfo
@@ -366,7 +398,18 @@ def run_trade_session(
         "[US_SESSION][START] session=%s env=%s offline=%s max_minutes=%d interval_sec=%d",
         session, env, offline, max_minutes, interval_sec,
     )
-    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
+    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "270"))
+    if interval_sec >= 300 and tick_timeout_sec < 240:
+        logger.warning(
+            "[US_SESSION][CONFIG][TICK_TIMEOUT_RAISED] interval_sec=%d requested_timeout_sec=%d effective_timeout_sec=240",
+            interval_sec, tick_timeout_sec,
+        )
+        tick_timeout_sec = 240
+    if tick_timeout_sec < max(60, int(interval_sec * 0.8)):
+        logger.warning(
+            "[US_SESSION][CONFIG][TICK_TIMEOUT_LOW] interval_sec=%d timeout_sec=%d recommendation=>=80%%_interval",
+            interval_sec, tick_timeout_sec,
+        )
     tick_timeout_fatal_consecutive = int(os.getenv("US_TICK_TIMEOUT_FATAL_CONSECUTIVE", "3"))
     now_for_date = _now_ny(force_now)
     trade_date = now_for_date.strftime("%Y-%m-%d")
@@ -662,7 +705,46 @@ def run_trade_session(
         )
 
         # ── Tick loop (try/finally로 감싸서 report를 항상 작성) ───────────────────
-        from trader.us.runner.trade_tick_runner import run_trade_tick
+        from trader.us.runner.trade_tick_runner import load_watchlist_from_artifact, run_trade_tick
+
+        prep_status_cache: dict | None = None
+        locked_watchlist_cache: list[dict] | None = None
+        prep_cache_source = "none"
+        watchlist_cache_source = "none"
+        if session in {"am", "afternoon"}:
+            try:
+                from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+                db_timeout_sec = max(1, int(os.getenv("US_SESSION_PREP_CACHE_TIMEOUT_SEC", "5")))
+                min_watchlist_count = int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10"))
+                allow_degraded = os.getenv("US_ALLOW_DEGRADED_IN_TRADE", "0") == "1"
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as cache_pool:
+                    prep_fut = cache_pool.submit(load_latest_us_prep_status, trade_date, db_timeout_sec)
+                    wl_fut = cache_pool.submit(load_locked_us_watchlist, trade_date, min_watchlist_count, allow_degraded, db_timeout_sec)
+                    try:
+                        prep_status_cache = prep_fut.result(timeout=db_timeout_sec + 1) or {}
+                        prep_cache_source = "db_session_cache"
+                    except Exception as exc:
+                        prep_status_cache = {"status": "UNKNOWN_DB_DEGRADED", "error": str(exc), "source": "session_cache_db_fallback"}
+                        prep_cache_source = "db_degraded"
+                        logger.warning("[US_SESSION][PREP_CACHE][DEGRADED] trade_date=%s error=%s", trade_date, exc)
+                    try:
+                        locked_watchlist_cache = wl_fut.result(timeout=db_timeout_sec + 1) or []
+                        watchlist_cache_source = "db_session_cache"
+                    except Exception as exc:
+                        logger.warning("[US_SESSION][WATCHLIST_CACHE][DB_DEGRADED] trade_date=%s error=%s", trade_date, exc)
+                        try:
+                            locked_watchlist_cache = load_watchlist_from_artifact(trade_date)
+                            watchlist_cache_source = "artifact_session_cache"
+                        except Exception as fb_exc:
+                            locked_watchlist_cache = []
+                            watchlist_cache_source = "artifact_failed"
+                            logger.warning("[US_SESSION][WATCHLIST_CACHE][FALLBACK_FAIL] trade_date=%s error=%s", trade_date, fb_exc)
+                logger.info(
+                    "[US_SESSION][ENTRY_CACHE][READY] prep_source=%s prep_status=%s watchlist_source=%s watchlist_count=%d",
+                    prep_cache_source, (prep_status_cache or {}).get("status"), watchlist_cache_source, len(locked_watchlist_cache or []),
+                )
+            except Exception as exc:
+                logger.warning("[US_SESSION][ENTRY_CACHE][SKIP] trade_date=%s error=%s", trade_date, exc)
 
         tick_count = 0
         warn_count = 0
@@ -731,7 +813,9 @@ def run_trade_session(
 
                 try:
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    order_activity_before = _count_trade_date_order_activity(trade_date)
+                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    try:
                         fut = pool.submit(
                             run_trade_tick,
                             session=session,
@@ -743,8 +827,16 @@ def run_trade_session(
                             kis_order_allowed=kis_order_allowed,
                             session_entry_allowed=session_entry_allowed,
                             session_buy_orders_count=buy_count,
+                            tick_index=tick_count,
+                            balance_reconcile_interval=int(os.getenv("US_BALANCE_RECONCILE_INTERVAL_TICKS", "3")),
+                            prep_status_cache=prep_status_cache,
+                            locked_watchlist_cache=locked_watchlist_cache,
+                            prep_cache_source=prep_cache_source,
+                            watchlist_cache_source=watchlist_cache_source,
                         )
                         tick_result = fut.result(timeout=tick_timeout_sec)
+                    finally:
+                        pool.shutdown(wait=False, cancel_futures=True)
                     results.append(tick_result)
                     final_tick = tick_result
                     consecutive_tick_timeouts = 0
@@ -810,22 +902,37 @@ def run_trade_session(
                 except concurrent.futures.TimeoutError:
                     last_stage = f"tick_{tick_count}_timeout"
                     root_cause = root_cause or "tick_timeout"
-                    consecutive_tick_timeouts += 1
                     warn_count += 1
-                    timeout_status = "WARN_TICK_TIMEOUT" if consecutive_tick_timeouts == 1 else f"WARN_CONSECUTIVE_TICK_TIMEOUT_{consecutive_tick_timeouts}"
+                    # Give DB order persistence a short grace window, then classify timeout-after-order as non-fatal.
+                    time_mod.sleep(float(os.getenv("US_TIMEOUT_ORDER_ACTIVITY_GRACE_SEC", "0.2") or 0.2))
+                    order_activity_after = _count_trade_date_order_activity(trade_date)
+                    has_order_activity = _tick_has_order_activity(None, locals().get("order_activity_before", 0), order_activity_after)
+                    if has_order_activity:
+                        consecutive_tick_timeouts = 0
+                        timeout_status = "DEGRADED_TICK_TIMEOUT_AFTER_ACK"
+                        final_status = "DEGRADED_WITH_ORDER_ACK"
+                        final_reason = "WARN_TICK_LATENCY_AFTER_ORDER"
+                    else:
+                        consecutive_tick_timeouts += 1
+                        timeout_status = "WARN_TICK_TIMEOUT" if consecutive_tick_timeouts == 1 else f"WARN_CONSECUTIVE_TICK_TIMEOUT_{consecutive_tick_timeouts}"
                     results.append({
                         "status": timeout_status,
-                        "reason": "tick_timeout",
+                        "reason": "WARN_TICK_LATENCY_AFTER_ORDER" if has_order_activity else "tick_timeout",
                         "root_cause": "tick_timeout",
+                        "timeout_after_order_ack": int(has_order_activity),
+                        "order_activity_before": locals().get("order_activity_before", 0),
+                        "order_activity_after": order_activity_after,
                         "timeout_sec": tick_timeout_sec,
                         "tick": tick_count,
                     })
                     final_tick = results[-1]
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_WARN_TIMEOUT", status=timeout_status, timeout_sec=tick_timeout_sec, consecutive_tick_timeouts=consecutive_tick_timeouts)
                     logger.warning(
-                        "[US_TICK][TIMEOUT][WARN] status=%s reason=tick_timeout timeout_sec=%d consecutive=%d fatal_after=%d",
-                        timeout_status, tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_fatal_consecutive,
+                        "[US_TICK][TIMEOUT][WARN] status=%s reason=%s timeout_sec=%d consecutive=%d fatal_after=%d order_activity=%d",
+                        timeout_status, final_tick.get("reason", "tick_timeout"), tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_fatal_consecutive, int(has_order_activity),
                     )
+                    if has_order_activity:
+                        continue
                     if consecutive_tick_timeouts >= tick_timeout_fatal_consecutive:
                         final_status = "FAILED"
                         final_reason = "FAILED_CONSECUTIVE_TICK_TIMEOUT"
@@ -963,7 +1070,7 @@ def run_trade_session(
             )
 
         status_detail = ""
-        if final_status not in {"FAILED", "SKIP", "OK_RISK_BLOCKED", "OK_NO_TRADE"}:
+        if final_status not in {"FAILED", "SKIP", "OK_RISK_BLOCKED", "OK_NO_TRADE", "DEGRADED_WITH_ORDER_ACK", "OK_WITH_TIMEOUT_WARNINGS"}:
             if resolved_signal_only:
                 status_detail = "OK_SIGNAL_ONLY" if warn_count == 0 else "OK_WITH_WARNINGS_SIGNAL_ONLY"
                 final_status = _CompatStatus("OK" if warn_count == 0 else "OK_WITH_WARNINGS", status_detail)

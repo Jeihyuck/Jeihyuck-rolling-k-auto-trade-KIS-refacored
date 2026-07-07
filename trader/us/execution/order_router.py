@@ -77,6 +77,26 @@ def resolve_dry_run_for_us_order() -> bool:
     return dry_run
 
 
+
+def _pending_sell_qty_for_symbol(symbol: str, trade_date: str | None) -> int:
+    """Best-effort pending SELL quantity for available_to_sell sizing."""
+    statuses = {"ACK", "SUBMITTED", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    try:
+        from trader.us.db.repos import load_us_daily_orders_for_report
+        total = 0
+        for row in load_us_daily_orders_for_report(trade_date or "") or []:
+            if str(row.get("symbol") or "").upper().strip() != str(symbol or "").upper().strip():
+                continue
+            if str(row.get("side") or "").upper() != "SELL":
+                continue
+            if str(row.get("status") or "").upper() not in statuses:
+                continue
+            total += int(row.get("qty") or row.get("order_qty") or row.get("quantity") or 0)
+        return max(0, total)
+    except Exception as exc:
+        logger.warning("[US_ORDER][PENDING_SELL_QTY][WARN] symbol=%s trade_date=%s err=%s", symbol, trade_date, exc)
+        return 0
+
 def route_order(
     intent: dict,
     *,
@@ -412,6 +432,18 @@ def route_order(
                 logger.warning("[US_ORDER][BALANCE_MATCH][WARN] db fallback failed: %s", _db_exc)
 
         sell_qty, guard_meta = resolve_sell_qty(intent, _pos_for_guard)
+        pending_sell_qty = _pending_sell_qty_for_symbol(symbol, trade_date)
+        available_to_sell = max(0, int(guard_meta.get("orderable_qty") or guard_meta.get("holding_qty") or sell_qty or 0) - pending_sell_qty)
+        if pending_sell_qty > 0 and available_to_sell < sell_qty:
+            logger.warning(
+                "[US_ORDER][SELL_AVAILABLE_TO_SELL_CLAMP] symbol=%s sell_qty=%d pending_sell_qty=%d available_to_sell=%d",
+                symbol, sell_qty, pending_sell_qty, available_to_sell,
+            )
+            sell_qty = available_to_sell
+            intent = {**intent, "qty": sell_qty, "notional_usd": sell_qty * price}
+            intent.setdefault("meta", {})
+            if isinstance(intent.get("meta"), dict):
+                intent["meta"].update({"pending_sell_qty": pending_sell_qty, "available_to_sell": available_to_sell})
 
         logger.info(
             "[US_ORDER][BALANCE_MATCH] symbol=%s intent_qty=%s holding_qty=%s"
