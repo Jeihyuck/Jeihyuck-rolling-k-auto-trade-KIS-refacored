@@ -71,3 +71,52 @@ def test_buy_stock_limit_payload_never_sends_181905(monkeypatch):
 def test_kis_tick_size_error_is_permanent_not_temporary():
     body = {"rt_cd": "1", "msg_cd": "40030000", "msg1": "호가단위 오류"}
     assert kis_wrapper._is_kis_tick_size_error_body(body)
+
+
+def test_engine_and_kis_wrapper_share_same_kr_price_rules():
+    import trader.core_utils as core_utils
+    from trader import kis_wrapper
+
+    cases = [
+        999,
+        1000,
+        1001,
+        4999,
+        5000,
+        9999,
+        10000,
+        10001,
+        49999,
+        50000,
+        50001,
+        99999,
+        100000,
+        181905,
+        499999,
+        500000,
+        500001,
+    ]
+
+    for price in cases:
+        assert core_utils._krx_tick(price) == kis_wrapper._krx_tick_for_order(price)
+        assert core_utils._round_to_tick(price, mode="up") == kis_wrapper._normalize_kr_order_price(price, side="BUY")[0]
+        assert core_utils._round_to_tick(price, mode="down") == kis_wrapper._normalize_kr_order_price(price, side="SELL")[0]
+
+
+def test_shared_kr_price_utils_181905_buy_sell():
+    from trader.kr_price_utils import krx_tick, normalize_kr_order_price, round_to_tick
+
+    assert krx_tick(181905) == 500
+
+    buy_px, buy_tick = normalize_kr_order_price(181905, side="BUY")
+    assert buy_tick == 500
+    assert buy_px == 182000
+    assert buy_px % buy_tick == 0
+
+    sell_px, sell_tick = normalize_kr_order_price(181905, side="SELL")
+    assert sell_tick == 500
+    assert sell_px == 181500
+    assert sell_px % sell_tick == 0
+
+    assert round_to_tick(181905, mode="up") == 182000
+    assert round_to_tick(181905, mode="down") == 181500

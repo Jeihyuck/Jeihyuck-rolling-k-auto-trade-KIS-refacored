@@ -46,36 +46,17 @@ from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 from trader.eventlog import emit_event
+from trader.kr_price_utils import krx_tick, normalize_kr_order_price
 
 logger = logging.getLogger(__name__)
 
 
 def _krx_tick_for_order(price: float) -> int:
-    p = float(price or 0)
-    if p >= 500_000:
-        return 1_000
-    if p >= 100_000:
-        return 500
-    if p >= 50_000:
-        return 100
-    if p >= 10_000:
-        return 50
-    if p >= 5_000:
-        return 10
-    if p >= 1_000:
-        return 5
-    return 1
+    return krx_tick(price)
 
 
 def _normalize_kr_order_price(price: float, *, side: str = "BUY") -> tuple[int, int]:
-    tick = _krx_tick_for_order(price)
-    q = float(price or 0) / tick
-    if str(side or "").upper() == "SELL":
-        normalized = int(q) * tick
-    else:
-        normalized = (int(q) if q == int(q) else int(q) + 1) * tick
-    return int(normalized), int(tick)
-
+    return normalize_kr_order_price(price, side=side)
 
 
 

@@ -223,7 +223,8 @@ from trader.strategies.pb1_minervini_v2 import (
 )
 from trader.time_utils import now_kst, week_monday, prev_business_day
 from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst_date
-from trader.core_utils import _krx_tick, _round_to_tick
+from trader.core_utils import _round_to_tick
+from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -2117,10 +2118,7 @@ def round_to_tick(price: float) -> int:
 
 
 def normalize_kr_order_price(price: float, *, side: str = "BUY") -> tuple[int, int]:
-    """Final KR order-price guardrail: BUY rounds up, SELL rounds down to KRX tick."""
-    mode = "down" if str(side or "").upper() == "SELL" else "up"
-    normalized = int(_round_to_tick(float(price or 0), mode=mode))
-    return normalized, int(_krx_tick(normalized or float(price or 0)))
+    return _normalize_kr_order_price_shared(price, side=side)
 
 
 def _extract_px_from_snapshot(snapshot: dict) -> tuple[float | None, float | None, float | None]:
