@@ -366,7 +366,18 @@ def run_trade_session(
         "[US_SESSION][START] session=%s env=%s offline=%s max_minutes=%d interval_sec=%d",
         session, env, offline, max_minutes, interval_sec,
     )
-    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "90"))
+    tick_timeout_sec = int(os.getenv("US_TICK_TIMEOUT_SEC", "270"))
+    if interval_sec >= 300 and tick_timeout_sec < 240:
+        logger.warning(
+            "[US_SESSION][CONFIG][TICK_TIMEOUT_RAISED] interval_sec=%d requested_timeout_sec=%d effective_timeout_sec=240",
+            interval_sec, tick_timeout_sec,
+        )
+        tick_timeout_sec = 240
+    if tick_timeout_sec < max(60, int(interval_sec * 0.8)):
+        logger.warning(
+            "[US_SESSION][CONFIG][TICK_TIMEOUT_LOW] interval_sec=%d timeout_sec=%d recommendation=>=80%%_interval",
+            interval_sec, tick_timeout_sec,
+        )
     tick_timeout_fatal_consecutive = int(os.getenv("US_TICK_TIMEOUT_FATAL_CONSECUTIVE", "3"))
     now_for_date = _now_ny(force_now)
     trade_date = now_for_date.strftime("%Y-%m-%d")
@@ -662,7 +673,46 @@ def run_trade_session(
         )
 
         # ── Tick loop (try/finally로 감싸서 report를 항상 작성) ───────────────────
-        from trader.us.runner.trade_tick_runner import run_trade_tick
+        from trader.us.runner.trade_tick_runner import load_watchlist_from_artifact, run_trade_tick
+
+        prep_status_cache: dict | None = None
+        locked_watchlist_cache: list[dict] | None = None
+        prep_cache_source = "none"
+        watchlist_cache_source = "none"
+        if session in {"am", "afternoon"}:
+            try:
+                from trader.us.db.repos import load_latest_us_prep_status, load_locked_us_watchlist
+                db_timeout_sec = max(1, int(os.getenv("US_SESSION_PREP_CACHE_TIMEOUT_SEC", "5")))
+                min_watchlist_count = int(os.getenv("US_MIN_LOCKED_WATCHLIST_COUNT", "10"))
+                allow_degraded = os.getenv("US_ALLOW_DEGRADED_IN_TRADE", "0") == "1"
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as cache_pool:
+                    prep_fut = cache_pool.submit(load_latest_us_prep_status, trade_date, db_timeout_sec)
+                    wl_fut = cache_pool.submit(load_locked_us_watchlist, trade_date, min_watchlist_count, allow_degraded, db_timeout_sec)
+                    try:
+                        prep_status_cache = prep_fut.result(timeout=db_timeout_sec + 1) or {}
+                        prep_cache_source = "db_session_cache"
+                    except Exception as exc:
+                        prep_status_cache = {"status": "UNKNOWN_DB_DEGRADED", "error": str(exc), "source": "session_cache_db_fallback"}
+                        prep_cache_source = "db_degraded"
+                        logger.warning("[US_SESSION][PREP_CACHE][DEGRADED] trade_date=%s error=%s", trade_date, exc)
+                    try:
+                        locked_watchlist_cache = wl_fut.result(timeout=db_timeout_sec + 1) or []
+                        watchlist_cache_source = "db_session_cache"
+                    except Exception as exc:
+                        logger.warning("[US_SESSION][WATCHLIST_CACHE][DB_DEGRADED] trade_date=%s error=%s", trade_date, exc)
+                        try:
+                            locked_watchlist_cache = load_watchlist_from_artifact(trade_date)
+                            watchlist_cache_source = "artifact_session_cache"
+                        except Exception as fb_exc:
+                            locked_watchlist_cache = []
+                            watchlist_cache_source = "artifact_failed"
+                            logger.warning("[US_SESSION][WATCHLIST_CACHE][FALLBACK_FAIL] trade_date=%s error=%s", trade_date, fb_exc)
+                logger.info(
+                    "[US_SESSION][ENTRY_CACHE][READY] prep_source=%s prep_status=%s watchlist_source=%s watchlist_count=%d",
+                    prep_cache_source, (prep_status_cache or {}).get("status"), watchlist_cache_source, len(locked_watchlist_cache or []),
+                )
+            except Exception as exc:
+                logger.warning("[US_SESSION][ENTRY_CACHE][SKIP] trade_date=%s error=%s", trade_date, exc)
 
         tick_count = 0
         warn_count = 0
@@ -743,6 +793,10 @@ def run_trade_session(
                             kis_order_allowed=kis_order_allowed,
                             session_entry_allowed=session_entry_allowed,
                             session_buy_orders_count=buy_count,
+                            prep_status_cache=prep_status_cache,
+                            locked_watchlist_cache=locked_watchlist_cache,
+                            prep_cache_source=prep_cache_source,
+                            watchlist_cache_source=watchlist_cache_source,
                         )
                         tick_result = fut.result(timeout=tick_timeout_sec)
                     results.append(tick_result)

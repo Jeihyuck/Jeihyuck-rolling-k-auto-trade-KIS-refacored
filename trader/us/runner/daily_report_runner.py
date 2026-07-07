@@ -148,6 +148,13 @@ def run_daily_report(
         "trade_date": trade_date,
         "session": session,
         "env": env,
+        "kis_env": env,
+        "broker_environment": env,
+        "environment_notice": (
+            "모의투자 주문이며 실계좌/MTS에는 표시되지 않음"
+            if str(env).lower() in {"practice", "paper", "mock"}
+            else "실계좌 주문 환경"
+        ),
         "dry_run": None,
         "orders_ack": 0,
         "orders_submitted_total": 0,
@@ -442,9 +449,24 @@ def run_daily_report(
         "",
     ]
     
+    md_lines.extend([
+        f"> **KIS_ENV: {str(env).upper()}**",
+        f"> {report.get('environment_notice', '')}",
+        "",
+    ])
+
     if session:
         md_lines.append(f"**Session**: {session.upper()}")
         md_lines.append("")
+
+    if int(report.get("positions", 0) or 0) == 0 and report.get("open_position_symbols"):
+        report["errors"].append("REPORT_VALIDATION_FAILED: positions_zero_but_open_position_symbols_present")
+    if str(report.get("started_at_utc") or "") == str(report.get("ended_at_utc") or "") and float(report.get("wall_elapsed_sec") or 0) > 1:
+        report["errors"].append("REPORT_VALIDATION_FAILED: identical_start_end_with_elapsed")
+    if any(str(w).startswith("SOURCE_MISMATCH") for w in report.get("warnings", [])):
+        report["report_consistency"] = "REPORT_INCONSISTENT"
+    else:
+        report["report_consistency"] = "OK"
     
     report["status"] = "OK_WITH_RECONCILE_WARNINGS" if any(str(w).startswith("SOURCE_MISMATCH") or "UNRESOLVED" in str(w) for w in report.get("warnings", [])) or int(report.get("orders_unresolved_total", 0) or 0) > 0 else ("OK" if not report["errors"] else "ERROR")
 
@@ -460,6 +482,8 @@ def run_daily_report(
         f"| run_id | {report.get('run_id')} |",
         f"| session | {session or 'N/A'} |",
         f"| env | {env} |",
+        f"| KIS_ENV | {report.get('kis_env')} |",
+        f"| environment_notice | {report.get('environment_notice')} |",
         f"| dry_run | {report['dry_run']} |",
         f"| force_now | {force_now or 'N/A'} |",
         "",
@@ -468,6 +492,7 @@ def run_daily_report(
         "| Metric | Value |",
         "|---|---|",
         f"| report_status | {report.get('status')} |",
+        f"| report_consistency | {report.get('report_consistency')} |",
         f"| orders_submitted_total | {report.get('orders_submitted_total', 0)} |",
         f"| orders_ack_total | {report.get('orders_ack_total', 0)} |",
         f"| orders_rejected_total | {report.get('orders_rejected_total', 0)} |",
