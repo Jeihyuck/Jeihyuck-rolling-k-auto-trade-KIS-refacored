@@ -350,6 +350,8 @@ def run_trade_tick(
     kis_order_allowed: bool = True,
     session_entry_allowed: bool | None = None,
     session_buy_orders_count: int | None = None,
+    tick_index: int = 1,
+    balance_reconcile_interval: int = 3,
     prep_status_cache: dict | None = None,
     locked_watchlist_cache: list[dict] | None = None,
     prep_cache_source: str | None = None,
@@ -519,10 +521,27 @@ def run_trade_tick(
     effective_budget = budget["effective_order_budget_usd"]
 
     # ── reconcile ─────────────────────────────────────────────────────────────
-    logger.info("[US_RECONCILE][START] session=%s", session)
+    should_reconcile_balance = (
+        session == "close"
+        or int(tick_index or 1) <= 1
+        or (int(balance_reconcile_interval or 0) > 0 and int(tick_index or 1) % int(balance_reconcile_interval or 1) == 0)
+    )
+    logger.info("[US_RECONCILE][START] session=%s tick_index=%s should_reconcile_balance=%d interval=%s", session, tick_index, int(should_reconcile_balance), balance_reconcile_interval)
     try:
-        from trader.us.execution.reconcile import reconcile_positions
-        recon = reconcile_positions(provider=provider)
+        if should_reconcile_balance:
+            from trader.us.execution.reconcile import reconcile_positions
+            recon = reconcile_positions(provider=provider)
+        else:
+            from trader.us.db.repos import load_positions as _load_positions_for_reconcile_skip
+            _positions = _load_positions_for_reconcile_skip()
+            recon = {
+                "status": "SKIPPED_BALANCE_RECONCILE",
+                "reason": "reconcile_interval_skip",
+                "positions": _positions,
+                "position_count": len(_positions),
+                "position_symbols": [str(p.get("symbol") or "").upper() for p in _positions if p.get("symbol")],
+                "block_new_entry": False,
+            }
         logger.info(
             "[US_RECONCILE][DONE] status=%s positions=%s",
             recon.get("status"),

@@ -192,3 +192,36 @@ def test_risk_gate_blocks_projected_weight_from_meta(monkeypatch):
             is_existing_position_buy=True, allowed_symbols={"AAPL"}, trade_date="2026-06-30",
         )
     assert "position_weight_exceeded" in str(exc.value)
+
+
+def test_timeout_after_order_activity_is_non_fatal_contract():
+    from trader.us.runner.trade_session_runner import _tick_has_order_activity
+    assert _tick_has_order_activity(None, before_count=3, after_count=4) is True
+    assert _tick_has_order_activity({"orders_ack": 1, "orders_sent": 1}, before_count=3, after_count=3) is True
+    assert _tick_has_order_activity(None, before_count=3, after_count=3) is False
+
+
+def test_session_runner_timeout_executor_shutdown_non_blocking_marker_present():
+    src = open("trader/us/runner/trade_session_runner.py", encoding="utf-8").read()
+    assert "pool.shutdown(wait=False, cancel_futures=True)" in src
+    assert "DEGRADED_TICK_TIMEOUT_AFTER_ACK" in src
+    assert "DEGRADED_WITH_ORDER_ACK" in src
+
+
+def test_daily_report_canonical_session_summary_markers_present():
+    src = open("trader/us/runner/daily_report_runner.py", encoding="utf-8").read()
+    assert "_canonical_source_summary" in src
+    assert "kis_fills_inquire_ccnl" in src
+    assert "{session}_summary.json" in src
+    assert "REPORT_INCONSISTENT" in src
+
+
+def test_balance_reconcile_interval_and_sell_available_markers_present():
+    tick_src = open("trader/us/runner/trade_tick_runner.py", encoding="utf-8").read()
+    router_src = open("trader/us/execution/order_router.py", encoding="utf-8").read()
+    kis_src = open("trader/us/execution/kis_us_client.py", encoding="utf-8").read()
+    assert "balance_reconcile_interval" in tick_src
+    assert "SKIPPED_BALANCE_RECONCILE" in tick_src
+    assert "available_to_sell" in router_src
+    assert "pending_sell_qty" in router_src
+    assert "CACHE_HIT" in kis_src and "GET_dailyprice" in kis_src

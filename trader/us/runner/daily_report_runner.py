@@ -115,6 +115,42 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
     }
 
 
+
+
+def _session_summary_paths(report_base: str, trade_date: str, session: str | None) -> tuple[str | None, str | None]:
+    if not session:
+        return None, None
+    base = os.path.join(report_base, trade_date)
+    os.makedirs(base, exist_ok=True)
+    return (
+        os.path.join(base, f"{session}_summary.json"),
+        os.path.join(base, f"{session}_summary.md"),
+    )
+
+
+def _canonical_source_summary(*, db_orders: int, fills: int, final_positions: int, open_position_symbols: list, router_summary: int) -> dict:
+    sources = {
+        "kis_fills_inquire_ccnl": int(fills or 0),
+        "kis_final_balance_positions": int(final_positions or 0),
+        "db_orders": int(db_orders or 0),
+        "router_session_summary": int(router_summary or 0),
+    }
+    inconsistencies: list[str] = []
+    if sources["db_orders"] and sources["kis_fills_inquire_ccnl"] and sources["db_orders"] != sources["kis_fills_inquire_ccnl"]:
+        inconsistencies.append("db_orders_fills_mismatch")
+    if sources["db_orders"] and sources["router_session_summary"] and sources["db_orders"] != sources["router_session_summary"]:
+        inconsistencies.append("db_orders_router_summary_mismatch")
+    if sources["kis_final_balance_positions"] == 0 and open_position_symbols:
+        inconsistencies.append("positions_zero_but_open_position_symbols_present")
+    return {
+        "canonical_priority": ["kis_fills_inquire_ccnl", "kis_final_balance", "db_orders", "router_session_summary"],
+        "canonical_order_source": "kis_fills_inquire_ccnl" if sources["kis_fills_inquire_ccnl"] else ("db_orders" if sources["db_orders"] else "router_session_summary"),
+        "canonical_position_source": "kis_final_balance",
+        "source_counts": sources,
+        "inconsistencies": inconsistencies,
+        "report_consistency": "REPORT_INCONSISTENT" if inconsistencies else "OK",
+    }
+
 def run_daily_report(
     env: str = "practice",
     session: str | None = None,
@@ -234,6 +270,9 @@ def run_daily_report(
         "ack_reconcile_after_route_unresolved_count": 0,
         "ack_pending_reconcile_count": 0,
         "pending_order_count": 0,
+        "open_position_symbols": [],
+        "canonical_sources": {},
+        "report_consistency": "OK",
     }
     
     # DRY_RUN
@@ -357,6 +396,7 @@ def run_daily_report(
                 report["positions"] = len(positions)
                 report["position_count"] = len(positions)
                 report["open_position_count"] = len(positions)
+                report["open_position_symbols"] = sorted({str(p.get("symbol") or "").upper() for p in positions if p.get("symbol")})
                 report["available_new_slots"] = max(0, int(report.get("max_positions", 35) or 35) - len(positions))
                 report["new_symbol_slots_available"] = report["available_new_slots"]
                 report["full_position"] = report["available_new_slots"] <= 0
@@ -397,6 +437,16 @@ def run_daily_report(
                 report["warnings"].append(warn)
                 logger.warning("[US_DAILY_REPORT][RECONCILE_WARN] reason=%s db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", warn, db_ack, fill_count, balance_confirmed, router_summary)
 
+            report["canonical_sources"] = _canonical_source_summary(
+                db_orders=db_ack,
+                fills=fill_count,
+                final_positions=int(report.get("positions", 0) or 0),
+                open_position_symbols=report.get("open_position_symbols") or [],
+                router_summary=router_summary,
+            )
+            if report["canonical_sources"].get("report_consistency") == "REPORT_INCONSISTENT":
+                report["warnings"].append("REPORT_INCONSISTENT:" + ",".join(report["canonical_sources"].get("inconsistencies") or []))
+
             # Close-session final balance delta classification
             if session == "close":
                 try:
@@ -434,6 +484,7 @@ def run_daily_report(
     report_base = "repo/reports/us_daily" if os.path.exists("repo") else "reports/us_daily"
     latest_md_path = f"{report_base}/latest_us_daily_report.md"
     latest_json_path = f"{report_base}/latest_us_daily_report.json"
+    session_summary_json_path, session_summary_md_path = _session_summary_paths(report_base, trade_date, session)
     
     # Dated report (for history)
     dated_dir = f"{report_base}/{trade_date}"
@@ -463,10 +514,10 @@ def run_daily_report(
         report["errors"].append("REPORT_VALIDATION_FAILED: positions_zero_but_open_position_symbols_present")
     if str(report.get("started_at_utc") or "") == str(report.get("ended_at_utc") or "") and float(report.get("wall_elapsed_sec") or 0) > 1:
         report["errors"].append("REPORT_VALIDATION_FAILED: identical_start_end_with_elapsed")
-    if any(str(w).startswith("SOURCE_MISMATCH") for w in report.get("warnings", [])):
+    if any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
         report["report_consistency"] = "REPORT_INCONSISTENT"
     else:
-        report["report_consistency"] = "OK"
+        report["report_consistency"] = (report.get("canonical_sources") or {}).get("report_consistency", "OK")
     
     report["status"] = "OK_WITH_RECONCILE_WARNINGS" if any(str(w).startswith("SOURCE_MISMATCH") or "UNRESOLVED" in str(w) for w in report.get("warnings", [])) or int(report.get("orders_unresolved_total", 0) or 0) > 0 else ("OK" if not report["errors"] else "ERROR")
 
@@ -493,6 +544,8 @@ def run_daily_report(
         "|---|---|",
         f"| report_status | {report.get('status')} |",
         f"| report_consistency | {report.get('report_consistency')} |",
+        f"| canonical_order_source | {(report.get('canonical_sources') or {}).get('canonical_order_source', '')} |",
+        f"| canonical_position_source | {(report.get('canonical_sources') or {}).get('canonical_position_source', '')} |",
         f"| orders_submitted_total | {report.get('orders_submitted_total', 0)} |",
         f"| orders_ack_total | {report.get('orders_ack_total', 0)} |",
         f"| orders_rejected_total | {report.get('orders_rejected_total', 0)} |",
@@ -591,10 +644,16 @@ def run_daily_report(
     
     # Write reports
     try:
-        with open(latest_md_path, "w") as f:
-            f.write(md_content)
-        with open(latest_json_path, "w") as f:
-            json.dump(report, f, indent=2, default=str)
+        if session_summary_md_path and session_summary_json_path:
+            with open(session_summary_md_path, "w") as f:
+                f.write(md_content)
+            with open(session_summary_json_path, "w") as f:
+                json.dump(report, f, indent=2, default=str)
+        if session in (None, "close"):
+            with open(latest_md_path, "w") as f:
+                f.write(md_content)
+            with open(latest_json_path, "w") as f:
+                json.dump(report, f, indent=2, default=str)
         with open(dated_md_path, "w") as f:
             f.write(md_content)
         with open(dated_json_path, "w") as f:
