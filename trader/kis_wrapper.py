@@ -46,8 +46,37 @@ from trader.db.schema import PRICE_DAILY
 from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 from trader.eventlog import emit_event
+from trader.kr_price_utils import krx_tick, normalize_kr_order_price
 
 logger = logging.getLogger(__name__)
+
+
+def _krx_tick_for_order(price: float) -> int:
+    return krx_tick(price)
+
+
+def _normalize_kr_order_price(price: float, *, side: str = "BUY") -> tuple[int, int]:
+    return normalize_kr_order_price(price, side=side)
+
+
+
+def _extract_order_pdno_from_kwargs(kwargs: dict[str, Any]) -> str:
+    payload = kwargs.get("json")
+    if not isinstance(payload, dict):
+        raw_data = kwargs.get("data")
+        try:
+            if isinstance(raw_data, (bytes, bytearray)):
+                payload = json.loads(raw_data.decode("utf-8"))
+            elif isinstance(raw_data, str):
+                payload = json.loads(raw_data)
+        except Exception:
+            payload = {}
+    return str((payload or {}).get("PDNO") or "")
+
+def _is_kis_tick_size_error_body(body: Any) -> bool:
+    if not isinstance(body, dict):
+        return False
+    return str(body.get("msg_cd") or "").strip() == "40030000" or "호가단위 오류" in str(body.get("msg1") or "")
 
 
 # ===== [NEW] KIS HTTP 차단 함수 =====
@@ -1517,6 +1546,14 @@ class KisAPI:
                             continue
                         raise KisTemporaryError(f"EGW002 msg_cd={msg_cd}")
                     
+                    if is_order_endpoint(url) and _is_kis_tick_size_error_body(body):
+                        logger.error(
+                            "[KIS][ORDER][PERMANENT_REJECT] code=%s msg_cd=%s msg1=%s",
+                            _extract_order_pdno_from_kwargs(kwargs),
+                            msg_cd,
+                            body.get("msg1"),
+                        )
+                        return resp
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
                         if no_retry_inquire_investor and msg_cd == "EGW00201" and "초당" in str(body.get("msg1") or ""):
                             logger.warning(
@@ -1542,6 +1579,14 @@ class KisAPI:
                         logger.warning("[KIS][HTTP_FAIL] method=%s url=%s params=%s json=%s headers=%s status=%s elapsed_ms=%.0f resp_text=%s rt_cd=%s msg_cd=%s msg1=%s",
                                        method, url, params_masked, json_masked, headers_masked, status, elapsed_ms, resp.text[:500], rt_cd, msg_cd, body.get("msg1"))
                         raise KisTemporaryError(f"BODY_TEMP_ERROR msg_cd={msg_cd}")
+                    if is_order_endpoint(url) and _is_kis_tick_size_error_body(body):
+                        logger.error(
+                            "[KIS][ORDER][PERMANENT_REJECT] code=%s msg_cd=%s msg1=%s",
+                            _extract_order_pdno_from_kwargs(kwargs),
+                            msg_cd,
+                            body.get("msg1"),
+                        )
+                        return resp
                     if any(token in msg_text for token in ("timeout", "tempor", "일시", "오류", "지연", "초당")):
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
@@ -4260,6 +4305,15 @@ class KisAPI:
 
     def buy_stock_limit(self, pdno: str, qty: int, price: int) -> Optional[dict]:
         from trader.config import get_live_gate_status_fresh
+        raw_price = float(price or 0)
+        normalized_price, tick_size = _normalize_kr_order_price(raw_price, side="BUY")
+        if int(round(raw_price)) != int(normalized_price):
+            logger.info(
+                "[ORDER][PRICE_NORMALIZE] code=%s side=BUY raw=%s normalized=%s tick=%s source=pre_kis_final",
+                pdno, int(round(raw_price)), normalized_price, tick_size,
+            )
+        assert isinstance(normalized_price, int) and normalized_price > 0 and normalized_price % tick_size == 0
+        price = normalized_price
         gate = get_live_gate_status_fresh(reason="kis_order_cash")
         logger.info(
             "[ORDER][WRAPPER][ENTER] func=buy_stock_limit code=%s qty=%s price=%s allow_live_gate=%s force_block_live=%s reason=%s NO_TRADE=%s",
@@ -4296,6 +4350,8 @@ class KisAPI:
             "ORD_UNPR": str(int(price)),
             "EXCG_ID_DVSN_CD": "KRX",
         }
+        payload_price = int(body["ORD_UNPR"])
+        assert isinstance(payload_price, int) and payload_price % tick_size == 0
         hk = self._create_hashkey(body)
         tr_list = _pick_tr(self.env, "ORDER_BUY")
         if not tr_list:
@@ -4319,6 +4375,12 @@ class KisAPI:
             masked.get("msg1"),
             masked.get("odno"),
         )
+        if _is_kis_tick_size_error_body(data):
+            logger.error(
+                "[KIS][ORDER][PERMANENT_REJECT] code=%s msg_cd=%s msg1=%s",
+                pdno, data.get("msg_cd"), data.get("msg1"),
+            )
+            return {**data, "final_status": "PERMANENT_ORDER_REJECT"}
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
             try:

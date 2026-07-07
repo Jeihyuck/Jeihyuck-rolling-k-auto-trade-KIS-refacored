@@ -224,6 +224,7 @@ from trader.strategies.pb1_minervini_v2 import (
 from trader.time_utils import now_kst, week_monday, prev_business_day
 from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst_date
 from trader.core_utils import _round_to_tick
+from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -2114,6 +2115,10 @@ def compute_window(now_kst: datetime) -> str:
 def round_to_tick(price: float) -> int:
     """KRX 호가단위로 올림(ceiling) 처리"""
     return _round_to_tick(price, mode="up")
+
+
+def normalize_kr_order_price(price: float, *, side: str = "BUY") -> tuple[int, int]:
+    return _normalize_kr_order_price_shared(price, side=side)
 
 
 def _extract_px_from_snapshot(snapshot: dict) -> tuple[float | None, float | None, float | None]:
@@ -9610,6 +9615,20 @@ class PB1Engine:
             limit_price = round_to_tick(float(base_price) * (1 + buffer_pct / 100))
             order_type = "LIMIT"
         record_price = float(limit_price or entry_price or 0.0)
+        if order_type == "LIMIT" and record_price > 0:
+            raw_price = record_price
+            normalized_price, tick_size = normalize_kr_order_price(raw_price, side="BUY")
+            if int(round(raw_price)) != int(normalized_price):
+                logger.info(
+                    "[ORDER][PRICE_NORMALIZE] code=%s side=BUY raw=%s normalized=%s tick=%s source=entry_plan",
+                    cf.code, int(round(raw_price)), normalized_price, tick_size,
+                )
+            limit_price = float(normalized_price)
+            record_price = float(normalized_price)
+            plan["limit_price"] = float(normalized_price)
+            plan["order_price"] = float(normalized_price)
+            cf.features["limit_price"] = float(normalized_price)
+            cf.features["order_price"] = float(normalized_price)
         if record_price <= 0 and str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice" and (
             str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
         ) and os.getenv("PB1_PRICE_FALLBACK_TO_FINAL30_CLOSE", "1") == "1":
@@ -9882,7 +9901,15 @@ class PB1Engine:
         kis_odno = None
         try:
             if order_type == "LIMIT":
-                resp = self.kis.buy_stock_limit(cf.code, qty, float(limit_price))
+                raw_submit_price = float(limit_price)
+                final_price, tick_size = normalize_kr_order_price(raw_submit_price, side="BUY")
+                if int(round(raw_submit_price)) != int(final_price):
+                    logger.info(
+                        "[ORDER][PRICE_NORMALIZE] code=%s side=BUY raw=%s normalized=%s tick=%s source=pre_kis_final",
+                        cf.code, int(round(raw_submit_price)), final_price, tick_size,
+                    )
+                assert isinstance(final_price, int) and final_price > 0 and final_price % tick_size == 0
+                resp = self.kis.buy_stock_limit(cf.code, qty, final_price)
             else:
                 resp = self.kis.buy_stock_market(cf.code, qty)
             kis_odno = extract_order_no(resp)
@@ -10347,6 +10374,13 @@ class PB1Engine:
             status["skipped_reason"] = "missing_quote_base"
             return status
         cap = round_to_tick(base * (1 + cap_buffer_pct / 100.0))
+        raw_cap = cap
+        cap, tick_size = normalize_kr_order_price(raw_cap, side="BUY")
+        if int(round(float(raw_cap or 0))) != int(cap):
+            logger.info(
+                "[ORDER][PRICE_NORMALIZE] code=%s side=BUY raw=%s normalized=%s tick=%s source=entry_plan",
+                cf.code, int(round(float(raw_cap or 0))), cap, tick_size,
+            )
         logger.info(
             "[PB1][CLOSE_ENTRY][WHY] code=%s selected_family=%s trigger_policy=%s base_from=%s base=%.2f cap=%s cap_buffer_pct=%.2f ref_daily_close=%s reasons=%s",
             display_code,
@@ -10575,7 +10609,15 @@ class PB1Engine:
         try:
             status["submit_attempted"] = 1
             logger.info("[ORDER][API_REQUEST] code=%s name=%s qty=%s price=%s order_type=LIMIT", cf.code, str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code), cf.planned_qty, float(cap or 0.0))
-            resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, cap)
+            raw_submit_price = float(cap)
+            final_price, tick_size = normalize_kr_order_price(raw_submit_price, side="BUY")
+            if int(round(raw_submit_price)) != int(final_price):
+                logger.info(
+                    "[ORDER][PRICE_NORMALIZE] code=%s side=BUY raw=%s normalized=%s tick=%s source=pre_kis_final",
+                    cf.code, int(round(raw_submit_price)), final_price, tick_size,
+                )
+            assert isinstance(final_price, int) and final_price > 0 and final_price % tick_size == 0
+            resp = self.kis.buy_stock_limit(cf.code, cf.planned_qty, final_price)
             kis_odno = extract_order_no(resp)
             status["broker_submit_called"] = 1
             status["api_submitted"] = 1
@@ -13740,6 +13782,7 @@ class PB1Engine:
 
         # ✅ [SESSION_KIND] run() 스코프 내 session_kind 안전 정의 — NameError 방지
         session_kind = self._safe_session_kind()
+        entry_mode = str(getattr(self, "entry_mode", os.getenv("PB1_ENTRY_COND_MODE", "OR")) or "OR").upper()
         _log_code_version()
         logger.info(
             "[PB1][SESSION_KIND][ENGINE] session_kind=%s phase=%s window=%s window_name=%s market_window=%s",
@@ -16088,7 +16131,7 @@ class PB1Engine:
                         cfg=self.minervini_config,
                     )
                     setup_filters_ok = bool(cf.features.get("setup_loose_ok", cf.features.get("pullback_ok", cf.setup_ok)))
-                    entry_ok, entry_reasons, entry_mode = self._entry_gate(
+                    entry_ok, entry_reasons, entry_mode_used = self._entry_gate(
                         setup_filters_ok=setup_filters_ok,
                         breakout_trigger_ok=trigger_ok,
                     )
@@ -16126,7 +16169,7 @@ class PB1Engine:
                     cf.features["setup_snapshot_json"] = {
                         "setup_filters_ok": setup_filters_ok,
                         "override_ok": override_ok,
-                        "entry_cond_mode": entry_mode,
+                        "entry_cond_mode": entry_mode_used,
                         "close": cf.features.get("close"),
                         "ma50": cf.features.get("ma50"),
                         "ma150": cf.features.get("ma150"),
@@ -16153,7 +16196,7 @@ class PB1Engine:
                         setup_filters_ok=setup_filters_ok,
                         breakout_trigger_ok=trigger_ok,
                         entry_ok=entry_ok,
-                        entry_mode=entry_mode,
+                        entry_mode=entry_mode_used,
                         setup_metrics={
                             "close": cf.features.get("close"),
                             "ma50": cf.features.get("ma50"),
@@ -16388,7 +16431,7 @@ class PB1Engine:
                         stop_price=float(stop0),
                         trigger_ok=bool(trigger_ok),
                         trigger_info=trigger_info if isinstance(trigger_info, dict) else {},
-                        entry_mode=entry_mode,
+                        entry_mode=entry_mode_used,
                         stage=actual_stage,
                         price_source=str(cf.features.get("price_source") or "unknown"),
                     )
@@ -17177,7 +17220,15 @@ class PB1Engine:
                     sell_filled,
                     open_orders_count,
                 )
-                if len(orderable_candidates) > 0 and api_submitted_count == 0:
+                balance_order_blocked = bool(getattr(self, "balance_fail_soft_active", False)) and ((not bool(entry_allowed)) or (not bool(order_allowed)))
+                if balance_order_blocked and len(orderable_candidates) > 0 and api_submitted_count == 0:
+                    logger.info("[ENTRY][SKIP] reason=BALANCE_UNCONFIRMED_ORDER_BLOCKED")
+                    final_status = "RETRYABLE_BALANCE_BLOCK"
+                    final_notes = "SKIP_BALANCE_UNCONFIRMED"
+                    os.environ["PB1_LAST_RESULT_STATUS"] = final_status
+                    os.environ["PB1_LAST_EXIT_REASON"] = final_notes
+                    logger.info("[RUN_SUMMARY][RESULT] status=RETRYABLE_BALANCE_BLOCK")
+                elif len(orderable_candidates) > 0 and api_submitted_count == 0:
                     self._log_no_trade_explain(
                         final30_count=len(scan_members),
                         candidates=candidates if 'candidates' in locals() else [],

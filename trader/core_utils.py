@@ -20,6 +20,7 @@ from .core_constants import (
     logger,
 )
 from .kis_wrapper import KisAPI
+from trader.kr_price_utils import krx_tick, round_to_tick
 
 __all__ = [
     "_krx_tick",
@@ -42,35 +43,11 @@ __all__ = [
 
 
 def _krx_tick(price: float) -> int:
-    p = float(price or 0)
-    if p >= 500_000:
-        return 1_000
-    if p >= 100_000:
-        return 500
-    if p >= 50_000:
-        return 100
-    if p >= 10_000:
-        return 50
-    if p >= 5_000:
-        return 10
-    if p >= 1_000:
-        return 5
-    return 1
+    return krx_tick(price)
 
 
 def _round_to_tick(price: float, mode: str = "nearest") -> int:
-    """mode: 'down' | 'up' | 'nearest'"""
-    if price is None or price <= 0:
-        return 0
-    tick = _krx_tick(price)
-    q = price / tick
-    if mode == "down":
-        q = int(q)
-    elif mode == "up":
-        q = int(q) if q == int(q) else int(q) + 1
-    else:
-        q = int(q + 0.5)
-    return int(q * tick)
+    return round_to_tick(price, mode=mode)
 
 
 def get_market(code: str) -> str:
