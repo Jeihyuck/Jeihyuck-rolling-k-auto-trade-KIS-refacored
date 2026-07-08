@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 _SENT_ORDER_KEYS: set[str] = set()
 _BLOCKED_INTENT_KEYS: set[tuple[str, str, str]] = set()
 _CASH_EXHAUSTED_TICKS: set[str] = set()
+_CASH_UNAVAILABLE_TICKS: set[str] = set()
 
 
 def _kis_env() -> str:
@@ -86,6 +87,10 @@ def _parse_orderable_cash_output(output: dict, *, symbol: str = "", account_env:
                 return None
     logger.warning("[US_ORDER][BROKER_CASH_PARSE_WARN] env=%s symbol=%s keys=%s reason=orderable_cash_key_missing", account_env, symbol, sorted(output.keys()))
     return None
+
+
+def _has_broker_orderable_cash_method(kis_client: Any) -> bool:
+    return _client_method(kis_client, "get_orderable_cash") is not None or _client_method(kis_client, "get_us_orderable_cash") is not None
 
 
 def _get_broker_orderable_cash(kis_client: Any, symbol: str, exchange: str, price: float, account_env: str = "") -> float | None:
@@ -495,11 +500,21 @@ def route_order(
             if order_key:
                 mark_order_intent_blocked(order_key, reason="broker_orderable_cash_insufficient")
             return {"status": "BLOCKED", "reason": "broker_orderable_cash_insufficient", "cash_exhausted": True, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
+        if tick_key in _CASH_UNAVAILABLE_TICKS:
+            if order_key:
+                mark_order_intent_blocked(order_key, reason="broker_orderable_cash_unavailable")
+            return {"status": "BLOCKED", "reason": "broker_orderable_cash_unavailable", "cash_exhausted": False, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
         safety_buffer = float(os.getenv("US_BROKER_ORDERABLE_CASH_SAFETY_BUFFER", "1.01") or 1.01)
         broker_cash = _get_broker_orderable_cash(kis_client, symbol, exchange, price, account_env=account_env)
         required_cash = float(qty) * float(price) * safety_buffer
         if broker_cash is None:
             logger.warning("[US_ORDER][BROKER_CASH_CHECK][SKIP] env=%s symbol=%s reason=broker_orderable_cash_unavailable", account_env, symbol)
+            if _has_broker_orderable_cash_method(kis_client):
+                _CASH_UNAVAILABLE_TICKS.add(tick_key)
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason="broker_orderable_cash_unavailable")
+                logger.error("[US_ORDER][BUY_BLOCKED] env=%s symbol=%s reason=broker_orderable_cash_unavailable cash_exhausted=0", account_env, symbol)
+                return {"status": "BLOCKED", "reason": "broker_orderable_cash_unavailable", "cash_exhausted": False, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
         else:
             logger.info("[US_ORDER][BROKER_CASH_CHECK] env=%s symbol=%s qty=%s price=%.4f broker_orderable_cash=%.2f required_cash=%.2f", account_env, symbol, qty, price, broker_cash, required_cash)
         if broker_cash is not None and broker_cash < required_cash:

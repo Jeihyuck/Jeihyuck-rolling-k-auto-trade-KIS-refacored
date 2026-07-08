@@ -209,6 +209,7 @@ def run_daily_report(
         "balance_delta_confirmed": 0,
         "ack_only_unresolved": 0,
         "broker_orderable_cash_blocks": 0,
+        "broker_orderable_cash_unknown_blocks": 0,
         "broker_orderable_qty_blocks": 0,
         "broker_position_mismatch": 0,
         "cash_exhausted": False,
@@ -374,6 +375,10 @@ def run_daily_report(
                             report["balance_delta_confirmed"] += 1
                         elif status == "DRY_RUN":
                             report["orders_dry_run"] += 1
+                        elif status == "BLOCKED" and "broker_orderable_cash_unavailable" in reason:
+                            report["orders_blocked"] += 1
+                            report["broker_orderable_cash_blocks"] += 1
+                            report["broker_orderable_cash_unknown_blocks"] += 1
                         elif status == "BLOCKED" and "broker_orderable_cash_insufficient" in reason:
                             report["orders_blocked"] += 1
                             report["broker_orderable_cash_blocks"] += 1
@@ -386,6 +391,9 @@ def run_daily_report(
                         elif status == "REJECTED":
                             report["orders_rejected"] += 1
                             report["orders_rejected_total"] += 1
+                            if "broker_orderable_cash_unavailable" in reason:
+                                report["broker_orderable_cash_blocks"] += 1
+                                report["broker_orderable_cash_unknown_blocks"] += 1
                             if "broker_orderable_cash_insufficient" in reason or "주문가능금액" in reason:
                                 report["broker_orderable_cash_blocks"] += 1
                                 report["cash_exhausted"] = True
@@ -614,6 +622,7 @@ def run_daily_report(
         f"| balance_delta_confirmed | {report.get('balance_delta_confirmed', 0)} |",
         f"| ack_only_unresolved | {report.get('ack_only_unresolved', 0)} |",
         f"| broker_orderable_cash_blocks | {report.get('broker_orderable_cash_blocks', 0)} |",
+        f"| broker_orderable_cash_unknown_blocks | {report.get('broker_orderable_cash_unknown_blocks', 0)} |",
         f"| broker_orderable_qty_blocks | {report.get('broker_orderable_qty_blocks', 0)} |",
         f"| broker_position_mismatch | {report.get('broker_position_mismatch', 0)} |",
         f"| cash_exhausted | {report.get('cash_exhausted', False)} |",

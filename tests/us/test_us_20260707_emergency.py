@@ -178,3 +178,44 @@ def test_daily_report_counts_broker_blocked_reasons(monkeypatch, tmp_path):
     assert report["broker_orderable_cash_blocks"] == 1
     assert report["broker_orderable_qty_blocks"] == 1
     assert report["cash_exhausted"] is True
+
+
+class CashUnparseableClient:
+    def __init__(self):
+        self.buy_calls = 0
+    def get_us_orderable_cash(self, **kwargs):
+        return {"output": {"unexpected_cash_key": "999999"}}
+    def place_us_buy_order(self, *args, **kwargs):
+        self.buy_calls += 1
+        return {"rt_cd": "0", "output": {"ODNO": "BAD"}}
+
+
+def test_unparseable_orderable_cash_blocks_live_buy(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution import order_router
+    repos.reset_memory_stores(); order_router._CASH_EXHAUSTED_TICKS.clear(); order_router._CASH_UNAVAILABLE_TICKS.clear()
+    monkeypatch.setenv("DRY_RUN", "0"); monkeypatch.setenv("KIS_ENV", "practice"); monkeypatch.setenv("US_PAPER_TRADING_ENABLED", "1"); monkeypatch.setenv("LIVE_TRADING_ENABLED", "1"); monkeypatch.setenv("US_LIVE_TRADING_ENABLED", "1"); monkeypatch.setenv("US_ORDER_ARMED", "1"); monkeypatch.setenv("DISABLE_LIVE_TRADING", "0"); monkeypatch.setenv("STRATEGY_ENV", "practice"); monkeypatch.setenv("US_SESSION_WINDOW_VALID", "1"); monkeypatch.setenv("US_PREP_CONTRACT_OK", "1"); monkeypatch.setenv("US_BALANCE_AVAILABLE", "1"); monkeypatch.setenv("US_MAX_ORDER_USD", "100000")
+    client = CashUnparseableClient()
+    result = order_router.route_order(_intent("AAPL", "BUY", 1, 100), total_portfolio_usd=100000, kis_client=client)
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "broker_orderable_cash_unavailable"
+    assert result["cash_exhausted"] is False
+    assert client.buy_calls == 0
+
+
+def test_daily_report_counts_broker_cash_unavailable(monkeypatch, tmp_path):
+    from trader.us.runner import daily_report_runner as drr
+    import trader.us.db.repos as repos
+    monkeypatch.chdir(tmp_path)
+    rows = [{"status": "BLOCKED", "side": "BUY", "symbol": "A", "meta": {"reason": "broker_orderable_cash_unavailable"}}]
+    monkeypatch.setattr(repos, "load_us_daily_orders_for_report", lambda td: rows)
+    monkeypatch.setattr(repos, "load_positions", lambda as_of=None: [])
+    monkeypatch.setattr(drr, "load_us_fills_breakdown", lambda td: {"fills_count": 0})
+    monkeypatch.setattr(drr, "load_balance_confirmed_count", lambda td: 0)
+    monkeypatch.setattr(drr, "load_router_summary_ack_count", lambda td, session=None: 0)
+    out = drr.run_daily_report(session="close", trade_date="2026-07-07", offline=False)
+    report = out["report"]
+    assert report["orders_blocked"] == 1
+    assert report["broker_orderable_cash_blocks"] == 1
+    assert report["broker_orderable_cash_unknown_blocks"] == 1
+    assert report["cash_exhausted"] is False
