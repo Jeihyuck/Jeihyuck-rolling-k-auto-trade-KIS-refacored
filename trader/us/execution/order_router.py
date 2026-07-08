@@ -36,6 +36,45 @@ logger = logging.getLogger(__name__)
 # in-process 중복 키 (DB fallback 없을 때도 동일 process 내 중복 차단)
 _SENT_ORDER_KEYS: set[str] = set()
 _BLOCKED_INTENT_KEYS: set[tuple[str, str, str]] = set()
+_CASH_EXHAUSTED_TICKS: set[str] = set()
+
+
+def _kis_env() -> str:
+    return (os.getenv("KIS_ENV") or "practice").strip().lower() or "practice"
+
+
+def _is_cash_insufficient_reject(msg: str) -> bool:
+    text = str(msg or "").lower()
+    return any(token in text for token in ("주문가능금액 부족", "주문가능금액부족", "insufficient cash", "ord psbl", "cash insufficient"))
+
+
+def _cash_tick_key(trade_date: str | None) -> str:
+    return str(trade_date or "unknown")
+
+
+def _get_broker_orderable_cash(kis_client: Any, symbol: str, exchange: str, price: float) -> float:
+    if hasattr(kis_client, "get_orderable_cash"):
+        return float(kis_client.get_orderable_cash(symbol=symbol, exchange=exchange, price=price) or 0.0)
+    if hasattr(kis_client, "get_us_orderable_cash"):
+        raw = kis_client.get_us_orderable_cash(symbol=symbol, exchange=exchange, price=price)
+        output = raw.get("output", raw) if isinstance(raw, dict) else {}
+        for key in ("frcr_ord_psbl_amt1", "ord_psbl_cash", "ovrs_ord_psbl_amt", "orderable_cash", "cash", "psbl_amt"):
+            if isinstance(output, dict) and output.get(key) not in (None, ""):
+                return float(output.get(key) or 0.0)
+    return 0.0
+
+
+def _get_broker_position(kis_client: Any, symbol: str) -> dict:
+    if hasattr(kis_client, "get_balance"):
+        bal = kis_client.get_balance(force_refresh=True)
+    else:
+        from trader.us.data_provider import normalize_us_balance
+        bal = normalize_us_balance(kis_client.get_us_balance(force_refresh=True)) if hasattr(kis_client, "get_us_balance") else {}
+    for pos in bal.get("positions", []) if isinstance(bal, dict) else []:
+        if str(pos.get("symbol") or "").upper().strip() == str(symbol or "").upper().strip():
+            return pos
+    return {}
+
 
 
 def resolve_dry_run_for_us_order() -> bool:
@@ -402,19 +441,63 @@ def route_order(
         from trader.us.execution.kis_us_client import KisUSClient
         kis_client = KisUSClient(env="practice")
 
-    # SELL 직전 balance-match guard: orderable_qty 초과 주문 방지
+    account_env = _kis_env()
+    logger.info("[US_ORDER][BROKER_ENV] env=%s symbol=%s side=%s", account_env, symbol, side)
+
+    if side == "BUY":
+        tick_key = _cash_tick_key(trade_date)
+        if tick_key in _CASH_EXHAUSTED_TICKS:
+            if order_key:
+                mark_order_intent_blocked(order_key, reason="broker_orderable_cash_insufficient")
+            return {"status": "BLOCKED", "reason": "broker_orderable_cash_insufficient", "cash_exhausted": True, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
+        safety_buffer = float(os.getenv("US_BROKER_ORDERABLE_CASH_SAFETY_BUFFER", "1.01") or 1.01)
+        broker_cash = _get_broker_orderable_cash(kis_client, symbol, exchange, price)
+        required_cash = float(qty) * float(price) * safety_buffer
+        logger.info("[US_ORDER][BROKER_CASH_CHECK] env=%s symbol=%s qty=%s price=%.4f broker_orderable_cash=%.2f required_cash=%.2f", account_env, symbol, qty, price, broker_cash, required_cash)
+        if broker_cash < required_cash:
+            resized_qty = int(broker_cash // (float(price) * safety_buffer)) if price > 0 else 0
+            if resized_qty >= 1:
+                logger.warning("[US_ORDER][BROKER_CASH_RESIZE] env=%s symbol=%s old_qty=%s new_qty=%s broker_orderable_cash=%.2f", account_env, symbol, qty, resized_qty, broker_cash)
+                qty = resized_qty
+                intent = {**intent, "qty": qty, "notional_usd": qty * price}
+                intent.setdefault("meta", {})
+                if isinstance(intent.get("meta"), dict):
+                    intent["meta"].update({"broker_orderable_cash_usd": broker_cash, "broker_cash_resized": True, "account_env": account_env})
+            else:
+                _CASH_EXHAUSTED_TICKS.add(tick_key)
+                if order_key:
+                    mark_order_intent_blocked(order_key, reason="broker_orderable_cash_insufficient")
+                logger.error("[US_ORDER][BUY_BLOCKED] env=%s symbol=%s reason=broker_orderable_cash_insufficient broker_orderable_cash=%.2f required_cash=%.2f cash_exhausted=1", account_env, symbol, broker_cash, required_cash)
+                return {"status": "BLOCKED", "reason": "broker_orderable_cash_insufficient", "cash_exhausted": True, "broker_orderable_cash": broker_cash, "required_cash": required_cash, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
+
+    # SELL 직전 broker balance hard guard: DB/cache가 아닌 KIS 최신 잔고 기준
     if side == "SELL":
+        broker_pos = _get_broker_position(kis_client, symbol)
+        broker_holding_qty = int(broker_pos.get("qty") or broker_pos.get("holding_qty") or 0) if broker_pos else 0
+        broker_orderable_qty = int(broker_pos.get("orderable_qty") or 0) if broker_pos else 0
+        logger.info("[US_ORDER][BROKER_QTY_CHECK] env=%s symbol=%s exchange=%s holding_qty=%s orderable_qty=%s currency=%s account_env=%s", account_env, symbol, exchange, broker_holding_qty, broker_orderable_qty, broker_pos.get("currency", "USD") if broker_pos else "USD", account_env)
+        if broker_orderable_qty <= 0:
+            if order_key:
+                mark_order_intent_blocked(order_key, reason="broker_orderable_qty_zero")
+            return {"status": "BLOCKED", "reason": "broker_orderable_qty_zero", "symbol": symbol, "side": side, "qty": qty, "intent": intent, "broker_position": broker_pos}
+        if broker_orderable_qty < qty:
+            qty = broker_orderable_qty
+            intent = {**intent, "qty": qty, "notional_usd": qty * price}
         from trader.us.execution.us_sell_qty_guard import resolve_sell_qty
 
         # intent 또는 us_positions에서 holding_qty/orderable_qty 확보
         _pos_for_guard = {
             "holding_qty": intent.get("holding_qty")
                            or intent.get("available_qty")
-                           or (intent.get("meta") or {}).get("holding_qty"),
+                           or (intent.get("meta") or {}).get("holding_qty")
+                           or broker_holding_qty,
             "orderable_qty": intent.get("orderable_qty")
-                             or (intent.get("meta") or {}).get("orderable_qty"),
+                             or (intent.get("meta") or {}).get("orderable_qty")
+                             or broker_orderable_qty,
             "sellable_qty": intent.get("sellable_qty")
-                            or (intent.get("meta") or {}).get("sellable_qty"),
+                            or (intent.get("meta") or {}).get("sellable_qty")
+                            or broker_orderable_qty,
+            "position_source": "kis_broker_balance",
         }
         # DB fallback: intent에 orderable_qty가 없으면 us_positions 조회
         if not _pos_for_guard["orderable_qty"] and symbol:
@@ -565,7 +648,14 @@ def route_order(
     except Exception as exc:
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
         msg = str(exc)
-        if side == "SELL" and is_no_balance_sell_reject(msg):
+        if side == "SELL" and (is_no_balance_sell_reject(msg) or "잔고내역" in msg):
+            try:
+                from trader.us.db.repos import load_us_position_risk_state, save_us_position_risk_state
+                st = load_us_position_risk_state(symbol, trade_date or "")
+                st.update({"stale_broker_mismatch": True, "broker_position_mismatch": True, "sell_blocked_for_day": True, "reason": "broker_position_mismatch"})
+                save_us_position_risk_state(symbol, trade_date or "", st)
+            except Exception as stale_exc:
+                logger.warning("[US_ORDER][BROKER_POSITION_MISMATCH][WARN] symbol=%s err=%s", symbol, stale_exc)
             try:
                 from trader.us.db.repos import find_recent_sell_ack, load_us_positions_by_symbols
                 recent_ack = find_recent_sell_ack(symbol=symbol, trade_date=trade_date)
@@ -580,7 +670,10 @@ def route_order(
                     return {"status": "WARN_SELL_REJECT_RECONCILE_PENDING", "reason": msg, "symbol": symbol, "side": side, "requires_reconcile": True, "intent": intent}
             except Exception as nb_exc:
                 logger.warning("[US_ORDER][SELL_NO_BALANCE][WARN] reconcile probe failed: %s", nb_exc)
-        logger.error("[US_ORDER][REJECT] symbol=%s side=%s error=%s", symbol, side, exc)
+        if side == "BUY" and _is_cash_insufficient_reject(msg):
+            _CASH_EXHAUSTED_TICKS.add(_cash_tick_key(trade_date))
+            logger.error("[US_ORDER][CASH_EXHAUSTED] env=%s symbol=%s reason=broker_orderable_cash_insufficient cash_exhausted=1", account_env, symbol)
+        logger.error("[US_ORDER][REJECT] env=%s symbol=%s side=%s error=%s", account_env, symbol, side, exc)
         reject_result = {
             "client_order_key": order_key,
             "symbol": symbol,
@@ -598,6 +691,7 @@ def route_order(
             "kis_ack": False,
             "ack_db_saved": False,
             "requires_reconcile": False,
+            "cash_exhausted": bool(side == "BUY" and _is_cash_insufficient_reject(msg)),
             "intent": intent,
         }
 

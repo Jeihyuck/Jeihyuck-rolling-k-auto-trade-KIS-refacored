@@ -204,6 +204,14 @@ def run_daily_report(
         "orders_rejected": 0,
         "orders_rejected_total": 0,
         "orders_unresolved_total": 0,
+        "orders_submitted": 0,
+        "broker_fill_confirmed": 0,
+        "balance_delta_confirmed": 0,
+        "ack_only_unresolved": 0,
+        "broker_orderable_cash_blocks": 0,
+        "broker_orderable_qty_blocks": 0,
+        "broker_position_mismatch": 0,
+        "cash_exhausted": False,
         "buy_notional_total": 0.0,
         "sell_notional_total": 0.0,
         "actual_new_positions": 0,
@@ -350,12 +358,20 @@ def run_daily_report(
                             report["buy_order_count"] += 1
                         elif side == "SELL":
                             report["sell_order_count"] += 1
+                        meta = order.get("meta") or {}
+                        reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
                         if status in {"SUBMITTED", "SENT"}:
                             report["orders_submitted_total"] += 1
-                        elif status in {"ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED"}:
+                            report["orders_submitted"] += 1
+                        elif status in {"ACK", "ACKED", "ACCEPTED"}:
                             report["orders_ack_total"] += 1
-                        elif status == "BALANCE_CONFIRMED":
+                            report["ack_only_unresolved"] += 1
+                        elif status in {"FILLED", "PARTIALLY_FILLED"}:
+                            report["orders_ack_total"] += 1
+                            report["broker_fill_confirmed"] += 1
+                        elif status in {"BALANCE_CONFIRMED", "BALANCE_DELTA_CONFIRMED"}:
                             report["orders_balance_confirmed_total"] += 1
+                            report["balance_delta_confirmed"] += 1
                         elif status == "DRY_RUN":
                             report["orders_dry_run"] += 1
                         elif status == "BLOCKED":
@@ -363,14 +379,28 @@ def run_daily_report(
                         elif status == "REJECTED":
                             report["orders_rejected"] += 1
                             report["orders_rejected_total"] += 1
+                            if "broker_orderable_cash_insufficient" in reason or "주문가능금액" in reason:
+                                report["broker_orderable_cash_blocks"] += 1
+                                report["cash_exhausted"] = True
+                            if "잔고내역" in reason or "broker_position_mismatch" in reason:
+                                report["broker_position_mismatch"] += 1
                         elif status in {"ACK_UNRESOLVED", "ACK_STALE_UNRESOLVED", "ACK_PENDING_RECONCILE"}:
                             report["orders_unresolved_total"] += 1
+                            report["ack_only_unresolved"] += 1
+                        elif status == "BLOCKED" and "broker_orderable_cash_insufficient" in reason:
+                            report["orders_blocked"] += 1
+                            report["broker_orderable_cash_blocks"] += 1
+                            report["cash_exhausted"] = True
+                        elif status == "BLOCKED" and "broker_orderable_qty_zero" in reason:
+                            report["orders_blocked"] += 1
+                            report["broker_orderable_qty_blocks"] += 1
                         elif status == "ORDER_DISABLED":
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":
                             report["orders_signal_only"] += 1
                     report["orders_sent_total"] = report["orders_submitted_total"] + report["orders_ack_total"]
                     report["orders_ack"] = report["orders_ack_total"]
+                    report["orders_submitted"] = report["orders_submitted_total"]
             except Exception as exc:
                 report["warnings"].append(f"orders_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] orders load failed: %s", exc)
@@ -475,13 +505,10 @@ def run_daily_report(
         pass
     
     # Save reports
-    try:
-        os.makedirs("repo/reports/us_daily", exist_ok=True)
-    except Exception:
-        os.makedirs("reports/us_daily", exist_ok=True)
-    
+    report_base = os.getenv("US_DAILY_REPORT_BASE", "reports/us_daily")
+    os.makedirs(report_base, exist_ok=True)
+
     # Latest report (always overwrite)
-    report_base = "repo/reports/us_daily" if os.path.exists("repo") else "reports/us_daily"
     latest_md_path = f"{report_base}/latest_us_daily_report.md"
     latest_json_path = f"{report_base}/latest_us_daily_report.json"
     session_summary_json_path, session_summary_md_path = _session_summary_paths(report_base, trade_date, session)
@@ -515,11 +542,21 @@ def run_daily_report(
     if str(report.get("started_at_utc") or "") == str(report.get("ended_at_utc") or "") and float(report.get("wall_elapsed_sec") or 0) > 1:
         report["errors"].append("REPORT_VALIDATION_FAILED: identical_start_end_with_elapsed")
     if any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
-        report["report_consistency"] = "REPORT_INCONSISTENT"
+        report["report_consistency"] = "SOURCE_MISMATCH"
     else:
         report["report_consistency"] = (report.get("canonical_sources") or {}).get("report_consistency", "OK")
-    
-    report["status"] = "OK_WITH_RECONCILE_WARNINGS" if any(str(w).startswith("SOURCE_MISMATCH") or "UNRESOLVED" in str(w) for w in report.get("warnings", [])) or int(report.get("orders_unresolved_total", 0) or 0) > 0 else ("OK" if not report["errors"] else "ERROR")
+
+    if report.get("report_consistency") == "SOURCE_MISMATCH":
+        report["status"] = "WARNING_RECONCILE_MISMATCH"
+    elif report["errors"]:
+        report["status"] = "FAILED_RECONCILE"
+    elif int(report.get("orders_unresolved_total", 0) or 0) > 0:
+        report["status"] = "WARNING_RECONCILE_MISMATCH"
+    else:
+        report["status"] = "OK"
+
+    if report.get("report_consistency") == "SOURCE_MISMATCH":
+        md_lines.extend(["# ⚠️ SOURCE_MISMATCH", "", f"source_counts={(report.get('canonical_sources') or {}).get('source_counts', {})}", ""])
 
     md_lines.extend([
         "## Runtime Metadata",
@@ -571,7 +608,15 @@ def run_daily_report(
         f"| avg_position_value_usd | {report.get('avg_position_value_usd', 0)} |",
         f"| underdeployed | {report.get('underdeployed', False)} |",
         f"| full_position | {report.get('full_position', False)} |",
+        f"| orders_submitted | {report.get('orders_submitted', 0)} |",
         f"| orders_ack | {report['orders_ack']} |",
+        f"| broker_fill_confirmed | {report.get('broker_fill_confirmed', 0)} |",
+        f"| balance_delta_confirmed | {report.get('balance_delta_confirmed', 0)} |",
+        f"| ack_only_unresolved | {report.get('ack_only_unresolved', 0)} |",
+        f"| broker_orderable_cash_blocks | {report.get('broker_orderable_cash_blocks', 0)} |",
+        f"| broker_orderable_qty_blocks | {report.get('broker_orderable_qty_blocks', 0)} |",
+        f"| broker_position_mismatch | {report.get('broker_position_mismatch', 0)} |",
+        f"| cash_exhausted | {report.get('cash_exhausted', False)} |",
         f"| orders_dry_run | {report['orders_dry_run']} |",
         f"| orders_blocked | {report['orders_blocked']} |",
         f"| orders_rejected | {report['orders_rejected']} |",

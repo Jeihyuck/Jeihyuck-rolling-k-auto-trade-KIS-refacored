@@ -674,20 +674,20 @@ def classify_ack_orders_with_final_balance(
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
         if raw_status in {"REJECT", "REJECTED"}:
-            final_status = "REJECTED"
+            final_status = "rejected"
         elif raw_status in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
             final_status = "DUPLICATE_OR_ALREADY_CLOSED" if raw_status == "WARN_DUPLICATE_EXIT_BLOCKED" else "BLOCKED"
         elif fill_qty > 0 or raw_status in {"FILLED", "PARTIALLY_FILLED"}:
-            final_status = "FILLED_BY_KIS_FILL_API"
+            final_status = "broker_fill_confirmed"
         elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
-            final_status = "FILLED_BY_BALANCE_DELTA"
+            final_status = "balance_delta_confirmed"
         elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty >= qty:
-            final_status = "FILLED_BY_BALANCE_DELTA"
+            final_status = "balance_delta_confirmed"
         elif raw_status in {"ACK", "ACKED", "ACCEPTED", "SENT", "ACK_DB_FAILED"}:
-            final_status = "ACK_UNRESOLVED"
+            final_status = "ack_only_unresolved"
         else:
-            final_status = "ACK_PENDING_RECONCILE"
-        if final_status in {"ACK_UNRESOLVED", "ACK_PENDING_RECONCILE"}:
+            final_status = "ack_only_unresolved"
+        if final_status in {"ack_only_unresolved"}:
             pending += 1
         counts[final_status] = counts.get(final_status, 0) + 1
         classified.append({
@@ -698,8 +698,8 @@ def classify_ack_orders_with_final_balance(
             "order_no": str(order.get("order_no") or order.get("ack_no") or ""),
             "client_order_key": str(order.get("client_order_key") or ""),
             "ack_status": raw_status,
-            "fill_api_status": "FILLED_BY_KIS_FILL_API" if final_status == "FILLED_BY_KIS_FILL_API" else "NOT_CONFIRMED_BY_FILL_API",
-            "balance_delta_status": ("BALANCE_CONFIRMED_" + side) if final_status == "FILLED_BY_BALANCE_DELTA" else (final_status if final_status == "BALANCE_CONFIRMED_PARTIAL" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),
+            "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
+            "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else "NOT_CONFIRMED_BY_BALANCE_DELTA",
             "final_status": final_status,
             "price_source": str((order.get("meta") or {}).get("price_source") or order.get("price_source") or ""),
             "pnl_if_sell": (order.get("meta") or {}).get("pnl_if_sell") if isinstance(order.get("meta") or {}, dict) else None,

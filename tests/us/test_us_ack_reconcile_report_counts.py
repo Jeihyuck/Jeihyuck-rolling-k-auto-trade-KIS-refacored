@@ -75,7 +75,7 @@ def test_close_final_balance_delta_classifies_pending_out_of_report():
 
     result = classify_ack_orders_with_final_balance(provider=_Provider(), trade_date="2026-06-26", orders=orders)
     by_symbol = {row["symbol"]: row for row in result["orders"]}
-    assert by_symbol["B1"]["final_status"] == "FILLED_BY_BALANCE_DELTA"
-    assert by_symbol["S1"]["final_status"] == "FILLED_BY_BALANCE_DELTA"
-    assert by_symbol["U1"]["final_status"] == "ACK_UNRESOLVED"
+    assert by_symbol["B1"]["final_status"] == "balance_delta_confirmed"
+    assert by_symbol["S1"]["final_status"] == "balance_delta_confirmed"
+    assert by_symbol["U1"]["final_status"] == "ack_only_unresolved"
     assert result["pending_order_count"] == 1

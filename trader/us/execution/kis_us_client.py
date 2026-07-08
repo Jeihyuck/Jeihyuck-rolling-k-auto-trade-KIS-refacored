@@ -179,6 +179,19 @@ class KisUSClient:
             "temp_unrecovered_count": 0,
             "stale_price_fallback_count": 0,
         }
+        masked_cano = (self._cano[:4] + "****") if self._cano else ""
+        port = "29443" if "29443" in self._base_url else ""
+        logger.info(
+            "[US_ACCOUNT][BOOT] env=%s base_url=%s port=%s dry_run=%s live_order=%s cano=%s acnt_prdt_cd=%s is_practice=%s",
+            os.getenv("KIS_ENV", self._env),
+            self._base_url.replace("https://", ""),
+            port,
+            str(os.getenv("DRY_RUN", "1")).lower(),
+            str(os.getenv("DRY_RUN", "1")).strip() in {"0", "false", "False"},
+            masked_cano,
+            self._acnt_prdt_cd,
+            str(self._env == "practice").lower(),
+        )
 
     # ------------------------------------------------------------------
     # Auth
