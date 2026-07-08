@@ -139,3 +139,42 @@ def test_daily_report_source_mismatch_status(monkeypatch, tmp_path):
     report = out["report"]
     assert report["status"] == "WARNING_RECONCILE_MISMATCH"
     assert "SOURCE_MISMATCH" in report["warnings"]
+
+
+def test_cash_exhausted_key_is_tick_scoped(monkeypatch):
+    from trader.us.execution import order_router
+    monkeypatch.setenv("PB1_SESSION", "am")
+    monkeypatch.setenv("GITHUB_RUN_ID", "run-1")
+    k1 = order_router._cash_tick_key("2026-07-07", {"meta": {"tick_seq": 1}})
+    k2 = order_router._cash_tick_key("2026-07-07", {"meta": {"tick_seq": 2}})
+    assert k1 != k2
+    assert "2026-07-07" in k1 and "am" in k1 and "run-1" in k1
+
+
+def test_orderable_cash_parser_handles_kis_psamount_sample(caplog):
+    from trader.us.execution.order_router import _parse_orderable_cash_output
+    sample = {"ord_psbl_frcr_amt": "2432.55", "ord_psbl_qty": "4", "max_ord_psbl_qty": "4"}
+    assert _parse_orderable_cash_output(sample, symbol="META", account_env="practice") == 2432.55
+    assert _parse_orderable_cash_output({"unexpected": "1"}, symbol="META", account_env="practice") is None
+    assert "[US_ORDER][BROKER_CASH_PARSE_WARN]" in caplog.text
+
+
+def test_daily_report_counts_broker_blocked_reasons(monkeypatch, tmp_path):
+    from trader.us.runner import daily_report_runner as drr
+    import trader.us.db.repos as repos
+    monkeypatch.chdir(tmp_path)
+    rows = [
+        {"status": "BLOCKED", "side": "BUY", "symbol": "A", "meta": {"reason": "broker_orderable_cash_insufficient"}},
+        {"status": "BLOCKED", "side": "SELL", "symbol": "B", "meta": {"reason": "broker_orderable_qty_zero"}},
+    ]
+    monkeypatch.setattr(repos, "load_us_daily_orders_for_report", lambda td: rows)
+    monkeypatch.setattr(repos, "load_positions", lambda as_of=None: [])
+    monkeypatch.setattr(drr, "load_us_fills_breakdown", lambda td: {"fills_count": 0})
+    monkeypatch.setattr(drr, "load_balance_confirmed_count", lambda td: 0)
+    monkeypatch.setattr(drr, "load_router_summary_ack_count", lambda td, session=None: 0)
+    out = drr.run_daily_report(session="close", trade_date="2026-07-07", offline=False)
+    report = out["report"]
+    assert report["orders_blocked"] == 2
+    assert report["broker_orderable_cash_blocks"] == 1
+    assert report["broker_orderable_qty_blocks"] == 1
+    assert report["cash_exhausted"] is True

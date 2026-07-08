@@ -374,6 +374,13 @@ def run_daily_report(
                             report["balance_delta_confirmed"] += 1
                         elif status == "DRY_RUN":
                             report["orders_dry_run"] += 1
+                        elif status == "BLOCKED" and "broker_orderable_cash_insufficient" in reason:
+                            report["orders_blocked"] += 1
+                            report["broker_orderable_cash_blocks"] += 1
+                            report["cash_exhausted"] = True
+                        elif status == "BLOCKED" and "broker_orderable_qty_zero" in reason:
+                            report["orders_blocked"] += 1
+                            report["broker_orderable_qty_blocks"] += 1
                         elif status == "BLOCKED":
                             report["orders_blocked"] += 1
                         elif status == "REJECTED":
@@ -387,13 +394,6 @@ def run_daily_report(
                         elif status in {"ACK_UNRESOLVED", "ACK_STALE_UNRESOLVED", "ACK_PENDING_RECONCILE"}:
                             report["orders_unresolved_total"] += 1
                             report["ack_only_unresolved"] += 1
-                        elif status == "BLOCKED" and "broker_orderable_cash_insufficient" in reason:
-                            report["orders_blocked"] += 1
-                            report["broker_orderable_cash_blocks"] += 1
-                            report["cash_exhausted"] = True
-                        elif status == "BLOCKED" and "broker_orderable_qty_zero" in reason:
-                            report["orders_blocked"] += 1
-                            report["broker_orderable_qty_blocks"] += 1
                         elif status == "ORDER_DISABLED":
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":

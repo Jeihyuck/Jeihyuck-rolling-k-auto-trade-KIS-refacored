@@ -269,8 +269,7 @@ def _write_us_session_report(payload: dict, session: str) -> None:
     if session_summary_json is not None:
         session_summary_json.parent.mkdir(parents=True, exist_ok=True)
         session_summary_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
-    if session == "close":
-        latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    latest_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
     md_lines = [
         f"# US Daily Report - {payload.get('trade_date', 'N/A')}",
@@ -305,8 +304,7 @@ def _write_us_session_report(payload: dict, session: str) -> None:
     ])
     if session_summary_md is not None:
         session_summary_md.write_text("\n".join(md_lines) + "\n")
-    if session == "close":
-        latest_md.write_text("\n".join(md_lines) + "\n")
+    latest_md.write_text("\n".join(md_lines) + "\n")
 
     if dated_json is not None and dated_md is not None:
         dated_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
