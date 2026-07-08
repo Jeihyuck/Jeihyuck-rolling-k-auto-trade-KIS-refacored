@@ -340,7 +340,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
 
     # ── 7. final30_scored 저장 (runtime/signals/bot_state mirror) ─────────
     try:
-        final30_payload = {"trade_date": trade_date, "env": env, "final30_scored": final30_scored}
+        final30_payload = {"trade_date": trade_date, "env": env, "final30_scored": final30_scored, "rotation_context": watchlist_result.get("rotation_context", {}), "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {})}
         # runtime
         _save_json_file(us_final30_scored_path(trade_date), final30_payload)
         # signals mirror
@@ -424,6 +424,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                     "rank_final30": row.get("rank_final30"),
                     "agent_a_score": row.get("agent_a_score"),
                     "agent_b_score": row.get("agent_b_score"),
+                    "theme_cluster": row.get("theme_cluster"),
+                    "rotation_regime": row.get("rotation_regime"),
                 },
             }
             for row in final30_scored
@@ -452,6 +454,14 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "contract_ok": contract_ok,
         "trade_can_proceed": trade_can_proceed,
         "watchlist_count": saved_count,
+        "rotation_regime": watchlist_result.get("rotation_regime"),
+        "rotation_context": watchlist_result.get("rotation_context", {}),
+        "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
+        "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio", 0.0),
+        "portfolio_cluster_weights": watchlist_result.get("portfolio_cluster_weights", {}),
+        "cap_violations": watchlist_result.get("cap_violations", []),
+        "blocked_by_cluster_cap": watchlist_result.get("blocked_by_cluster_cap", []),
+        "selected_by_bucket_champion": watchlist_result.get("selected_by_bucket_champion", False),
     }
     finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
 
@@ -489,6 +499,14 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "env": env,
             "event": _event_name,
             "workflow": _workflow_name,
+            "rotation_regime": watchlist_result.get("rotation_regime"),
+            "rotation_context": watchlist_result.get("rotation_context", {}),
+            "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
+            "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio", 0.0),
+            "portfolio_cluster_weights": watchlist_result.get("portfolio_cluster_weights", {}),
+            "cap_violations": watchlist_result.get("cap_violations", []),
+            "blocked_by_cluster_cap": watchlist_result.get("blocked_by_cluster_cap", []),
+            "selected_by_bucket_champion": watchlist_result.get("selected_by_bucket_champion", False),
         }
         _save_json_file(_status_file, prep_status_payload)
         logger.info(
@@ -510,6 +528,12 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
         "trade_can_proceed": trade_can_proceed,
+        "rotation_regime": watchlist_result.get("rotation_regime"),
+        "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
+        "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio", 0.0),
+        "cap_violations": watchlist_result.get("cap_violations", []),
+        "blocked_by_cluster_cap": watchlist_result.get("blocked_by_cluster_cap", []),
+        "selected_by_bucket_champion": watchlist_result.get("selected_by_bucket_champion", False),
     }
 
 

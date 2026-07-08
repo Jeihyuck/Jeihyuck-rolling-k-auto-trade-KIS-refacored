@@ -14,6 +14,12 @@ import logging
 import os
 from typing import Any
 
+from trader.us.rotation import (
+    AI_CAP_CLUSTERS, AI_CLUSTERS, NON_TECH_ROTATION_CLUSTERS, apply_cap_flags,
+    classify_rotation_regime, cluster_caps_for_regime, compute_cluster_exposure,
+    period_return, select_bucket_champions, theme_cluster_for,
+)
+
 logger = logging.getLogger(__name__)
 
 # 허용 ETF 최대 비율 (final30 중 최대 5개)
@@ -210,17 +216,42 @@ def _compute_agent_b_score(row: dict, daily_rows: list[dict]) -> tuple[float, li
 # Final Score
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _compute_final_score(agent_a_score: float, agent_b_score: float, liquidity_score: float, risk_score: float) -> float:
+def _compute_final_score(agent_a_score: float, agent_b_score: float, liquidity_score: float, risk_score: float, row: dict | None = None, rotation_context: dict | None = None) -> float:
     agent_a_w = _env_float("US_AGENT_A_WEIGHT", 0.40)
     agent_b_w = _env_float("US_AGENT_B_WEIGHT", 0.45)
     liq_w = _env_float("US_LIQUIDITY_WEIGHT", 0.10)
     risk_w = _env_float("US_RISK_WEIGHT", 0.05)
-    score = (
+    base = (
         agent_a_w * agent_a_score
         + agent_b_w * agent_b_score
         + liq_w * liquidity_score
         + risk_w * risk_score
     )
+    if not row:
+        return round(max(0.0, min(1.0, base)), 4)
+
+    # Rotation-aware score overlay requested for US prep:
+    # stock_momentum 35%, sector relative strength 25%, stock-vs-sector alpha 15%,
+    # volume quality 10%, volatility-adjusted trend 10%, drawdown control 5%, minus concentration penalty.
+    sector_rs = _safe_float(row.get("sector_relative_strength"), _safe_float(row.get("sector_rs_score"), 0.5))
+    stock_alpha = _safe_float(row.get("stock_vs_sector_alpha"), _safe_float(row.get("rs_20d_score"), 0.5) - sector_rs + 0.5)
+    volume_quality = _safe_float(row.get("volume_quality"), _safe_float(row.get("volume_accel_score"), 0.5))
+    vol_adj_trend = _safe_float(row.get("volatility_adjusted_trend"), _safe_float(row.get("trend_score"), 0.5) * risk_score)
+    drawdown_control = _safe_float(row.get("drawdown_control"), risk_score)
+    stock_momentum = agent_b_score
+    rotation_score = (
+        0.35 * stock_momentum
+        + 0.25 * sector_rs
+        + 0.15 * max(0.0, min(1.0, stock_alpha))
+        + 0.10 * volume_quality
+        + 0.10 * vol_adj_trend
+        + 0.05 * drawdown_control
+    )
+    score = 0.5 * base + 0.5 * rotation_score
+    regime = str((rotation_context or {}).get("rotation_regime") or "NEUTRAL")
+    cluster = theme_cluster_for(str(row.get("symbol") or ""), row)
+    if regime == "AI_OFF_ROTATION" and cluster in AI_CAP_CLUSTERS:
+        score -= 0.08
     return round(max(0.0, min(1.0, score)), 4)
 
 
@@ -278,6 +309,24 @@ def build_us_watchlist(
         as_of_date,
     )
 
+    rotation_context = _build_rotation_context(provider, candidate_pool, as_of_date)
+    logger.info(
+        "[US_ROTATION][REGIME] rotation_regime=%s qqq_vs_spy_3d=%.4f smh_vs_spy_3d=%.4f dia_vs_spy_3d=%.4f rsp_vs_spy_3d=%.4f strongest=%s weakest=%s",
+        rotation_context.get("rotation_regime"), rotation_context.get("qqq_vs_spy_3d", 0.0),
+        rotation_context.get("smh_vs_spy_3d", 0.0), rotation_context.get("dia_vs_spy_3d", 0.0),
+        rotation_context.get("rsp_vs_spy_3d", 0.0), rotation_context.get("strongest_sectors"), rotation_context.get("weakest_sectors"),
+    )
+
+    portfolio_cluster_weights: dict[str, Any] = {}
+    blocked_clusters: set[str] = set()
+    try:
+        from trader.us.db.repos import load_positions
+        positions = load_positions(as_of=trade_date)
+        portfolio_cluster_weights = apply_cap_flags(compute_cluster_exposure(positions), str(rotation_context.get("rotation_regime") or "NEUTRAL"))
+        blocked_clusters = {c for c, v in portfolio_cluster_weights.items() if v.get("over_cap")}
+    except Exception as exc:
+        logger.info("[US_ROTATION][PORTFOLIO_EXPOSURE][SKIP] %s", exc)
+
     broader_scored: list[dict] = []
 
     for row in candidate_pool:
@@ -301,7 +350,9 @@ def build_us_watchlist(
         liquidity_score = _safe_float(row.get("liquidity_score"), 0.5)
 
         # Final
-        score_final = _compute_final_score(agent_a_score, agent_b_score, liquidity_score, risk_score)
+        theme_cluster = theme_cluster_for(symbol, row)
+        row["theme_cluster"] = theme_cluster
+        score_final = _compute_final_score(agent_a_score, agent_b_score, liquidity_score, risk_score, row=row, rotation_context=rotation_context)
 
         # tech_score (종합 기술적 점수)
         tech_score = round(
@@ -316,6 +367,8 @@ def build_us_watchlist(
             "symbol": symbol,
             "rank_final30": 0,  # 나중에 갱신
             "score_final": score_final,
+            "theme_cluster": theme_cluster,
+            "rotation_regime": rotation_context.get("rotation_regime"),
             "agent_a": {
                 "score": agent_a_score,
                 "reasons": agent_a_reasons,
@@ -344,12 +397,15 @@ def build_us_watchlist(
             "breakout_score": breakout_score,
             "vcp_score": vcp_score,
             "entry_style_selected": entry_style,
+            "theme_cluster": theme_cluster,
+            "rotation_regime": rotation_context.get("rotation_regime"),
             "reason_json": reason_json,
             "trade_date": trade_date,
             # candidate_score는 candidate_pool_builder에서 넘어옴
         }
         broader_scored.append(scored_row)
 
+    _apply_concentration_penalty(broader_scored, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters)
     logger.info("[US_DUAL_AGENT][SCORE] broader_scored=%d", len(broader_scored))
 
     # top50 선택 (ETF는 최대 5개까지)
@@ -382,21 +438,25 @@ def build_us_watchlist(
 
     logger.info("[US_WATCHLIST][TOP50] rows=%d", len(top50))
 
-    # final30 선택 (top50에서 상위 finaln개)
+    # final30: bucket champion selection.  Do not simply take top score rows;
+    # regime quotas and cluster caps prevent AI/tech concentration during rotations.
     top50_sorted = sorted(top50, key=lambda r: -r["score_final"])
-    final30_candidates = top50_sorted[:finaln]
-
-    # final30이 finaln 미만이면 broader_scored에서 채움
-    if len(final30_candidates) < finaln:
-        existing_syms = {r["symbol"] for r in final30_candidates}
+    final30, bucket_meta = select_bucket_champions(
+        top50_sorted if len(top50_sorted) >= finaln else sorted_broader,
+        finaln,
+        str(rotation_context.get("rotation_regime") or "NEUTRAL"),
+        blocked_clusters=blocked_clusters,
+    )
+    if len(final30) < finaln:
+        existing_syms = {r["symbol"] for r in final30}
         for row in sorted_broader:
-            if len(final30_candidates) >= finaln:
+            if len(final30) >= finaln:
                 break
-            if row["symbol"] not in existing_syms:
-                final30_candidates.append(row)
+            if row["symbol"] not in existing_syms and row.get("theme_cluster") not in blocked_clusters:
+                final30.append(row)
                 existing_syms.add(row["symbol"])
 
-    final30 = final30_candidates[:finaln]
+    final30 = final30[:finaln]
 
     # rank 부여 + final30_scored 구성
     final30_scored: list[dict] = []
@@ -414,6 +474,15 @@ def build_us_watchlist(
             scored["entry_style_selected"],
         )
         final30_scored.append(scored)
+
+    final30_cluster_counts = bucket_meta.get("final30_cluster_counts", {}) if 'bucket_meta' in locals() else {}
+    ai_count = sum(1 for r in final30_scored if r.get("theme_cluster") in AI_CLUSTERS)
+    logger.info(
+        "[US_ROTATION][FINAL30] rotation_regime=%s final30_cluster_counts=%s final30_ai_tech_ratio=%.4f cap_violations=%s blocked_by_cluster_cap=%s selected_by_bucket_champion=%s",
+        rotation_context.get("rotation_regime"), final30_cluster_counts, ai_count / max(1, len(final30_scored)),
+        [c for c, v in portfolio_cluster_weights.items() if v.get("over_cap")], sorted(blocked_clusters),
+        bool((bucket_meta or {}).get("selected_by_bucket_champion")),
+    )
 
     logger.info(
         "[US_WATCHLIST][STAGE_COUNTS] upstream_universe=%d filtered_universe=%d"
@@ -438,4 +507,72 @@ def build_us_watchlist(
         "top50_scored": top50,
         "final30": final30,
         "final30_scored": final30_scored,
+        "rotation_regime": rotation_context.get("rotation_regime"),
+        "rotation_context": rotation_context,
+        "final30_cluster_counts": final30_cluster_counts,
+        "final30_ai_tech_ratio": ai_count / max(1, len(final30_scored)),
+        "portfolio_cluster_weights": portfolio_cluster_weights,
+        "cap_violations": [c for c, v in portfolio_cluster_weights.items() if v.get("over_cap")],
+        "blocked_by_cluster_cap": sorted(blocked_clusters),
+        "selected_by_bucket_champion": bool((bucket_meta or {}).get("selected_by_bucket_champion")),
     }
+
+
+def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_date: str) -> dict[str, Any]:
+    symbols = ["SPY", "QQQ", "SMH", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"]
+    returns: dict[str, dict[int, float]] = {}
+    for sym in symbols:
+        closes: list[float] = []
+        try:
+            rows = provider.get_daily_prices(sym, "NYSE", as_of_date=as_of_date)
+            closes = [_safe_float(r.get("close") or r.get("price")) for r in (rows or [])]
+        except Exception:
+            closes = []
+        returns[sym] = {d: period_return(closes, d) for d in (1, 3, 5, 20)}
+    ai_rows = [r for r in candidate_pool if theme_cluster_for(str(r.get("symbol") or ""), r) in AI_CAP_CLUSTERS]
+    ai_basket_3d = None
+    if ai_rows:
+        vals = [_safe_float(r.get("rs_3d") or r.get("return_3d") or r.get("ret_3d"), 0.0) for r in ai_rows]
+        ai_basket_3d = sum(vals) / len(vals) if vals else None
+    ctx = classify_rotation_regime(returns, ai_basket_3d=ai_basket_3d)
+    ctx["benchmark_returns"] = returns
+    ctx["cluster_caps"] = cluster_caps_for_regime(str(ctx.get("rotation_regime") or "NEUTRAL"))
+    return ctx
+
+
+def _apply_concentration_penalty(rows: list[dict], finaln: int, regime: str, blocked_clusters: set[str] | None = None) -> None:
+    """Apply score penalties before final bucket selection.
+
+    If one theme cluster would dominate more than 35% of the provisional top30,
+    reduce that cluster's score. In AI_OFF_ROTATION, AI-cap clusters receive an
+    additional haircut, and clusters already over portfolio cap are marked as
+    blocked for new buys.
+    """
+    blocked_clusters = blocked_clusters or set()
+    provisional = sorted(rows, key=lambda r: float(r.get("score_final") or 0.0), reverse=True)[:finaln]
+    counts: dict[str, int] = {}
+    for row in provisional:
+        c = row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+        counts[c] = counts.get(c, 0) + 1
+    crowded = {c for c, n in counts.items() if n / max(1, finaln) > 0.35}
+    for row in rows:
+        cluster = row.get("theme_cluster") or theme_cluster_for(str(row.get("symbol") or ""), row)
+        penalty = 0.0
+        reasons = []
+        if cluster in crowded:
+            penalty += 0.03
+            reasons.append("cluster_over_35pct_provisional_top30")
+        if regime == "AI_OFF_ROTATION" and cluster in AI_CAP_CLUSTERS:
+            penalty += 0.04
+            reasons.append("ai_off_rotation_ai_cluster_haircut")
+        if cluster in blocked_clusters:
+            penalty += 1.0
+            row["blocked_by_cluster_cap"] = True
+            reasons.append("portfolio_cluster_cap_exceeded")
+        if penalty:
+            row["concentration_penalty"] = round(penalty, 4)
+            row["concentration_penalty_reasons"] = reasons
+            row["score_final"] = round(max(0.0, float(row.get("score_final") or 0.0) - penalty), 4)
+            if isinstance(row.get("reason_json"), dict):
+                row["reason_json"]["concentration_penalty"] = row["concentration_penalty"]
+                row["reason_json"]["concentration_penalty_reasons"] = reasons
