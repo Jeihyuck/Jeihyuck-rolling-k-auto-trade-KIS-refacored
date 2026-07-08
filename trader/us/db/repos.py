@@ -431,7 +431,11 @@ def _risk_state_key(symbol: str, trade_date: str) -> tuple[str, str]:
 def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> dict:
     raw = dict(state or {})
     now_iso = raw.get("updated_at") or datetime.now(timezone.utc).isoformat()
-    return {
+    nested_state = dict(raw.get("state") or {})
+    for extra_key in ("stale_broker_mismatch", "broker_position_mismatch", "sell_blocked_for_day", "reason"):
+        if extra_key in raw:
+            nested_state[extra_key] = raw.get(extra_key)
+    normalized = {
         "trade_date": trade_date,
         "symbol": str(symbol or "").strip().upper(),
         "soft_stop_breach_count": int(raw.get("soft_stop_breach_count") or 0),
@@ -441,8 +445,12 @@ def _normalize_risk_state(symbol: str, trade_date: str, state: dict | None) -> d
         "last_price": raw.get("last_price"),
         "last_pnl_pct": raw.get("last_pnl_pct"),
         "updated_at": now_iso,
-        "state": raw.get("state") or {},
+        "state": nested_state,
     }
+    for extra_key in ("stale_broker_mismatch", "broker_position_mismatch", "sell_blocked_for_day", "reason"):
+        if extra_key in nested_state:
+            normalized[extra_key] = nested_state.get(extra_key)
+    return normalized
 
 
 def _ensure_us_position_risk_state_table(conn) -> None:
