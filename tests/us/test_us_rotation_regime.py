@@ -74,3 +74,68 @@ def test_bucket_champion_not_simple_top_score():
     simple_top = rows[:30]
     assert [r["symbol"] for r in selected] != [r["symbol"] for r in simple_top]
     assert any(r["theme_cluster"] == "FINANCIAL" for r in selected)
+
+
+def test_ai_off_rotation_blocks_mega_tech_fill_pool_and_caps_ai_tech_ratio():
+    rows = [_row(f"M{i}", 1 - i * .001, "MEGA_TECH") for i in range(30)]
+    rows += [_row(f"AI{i}", .95 - i * .001, "AI_SEMI") for i in range(10)]
+    rotation_clusters = ["INDUSTRIAL", "FINANCIAL", "HEALTHCARE", "CONSUMER_STAPLES", "DEFENSIVE_UTILITY", "ENERGY_MATERIALS", "ETF_INDEX"]
+    for i in range(50):
+        rows.append(_row(f"R{i}", .7 - i * .001, rotation_clusters[i % len(rotation_clusters)]))
+
+    selected, _ = select_bucket_champions(rows, 30, "AI_OFF_ROTATION")
+    ai_tech = sum(1 for r in selected if r["theme_cluster"] in AI_CAP_CLUSTERS)
+    nontech = sum(1 for r in selected if r["theme_cluster"] not in AI_CAP_CLUSTERS)
+
+    assert ai_tech / 30 <= 0.30
+    assert nontech / 30 >= 0.50
+    assert sum(1 for r in selected if r["theme_cluster"] == "MEGA_TECH") <= 2
+
+
+def test_rotation_context_records_missing_benchmark_symbols():
+    from trader.us.watchlist_builder import _build_rotation_context
+
+    class PartialProvider:
+        def get_daily_prices(self, symbol, exchange="NYSE", as_of_date=None):
+            if symbol in {"SMH", "XLK"}:
+                raise RuntimeError("missing fixture")
+            return [{"close": 100 + i} for i in range(6)]
+
+    ctx = _build_rotation_context(PartialProvider(), [], "2026-07-08")
+    assert ctx["benchmark_data_quality"] == "degraded"
+    assert set(ctx["missing_symbols"]) >= {"SMH", "XLK"}
+    assert ctx["benchmark_exchange_map"]["QQQ"] in {"NASD", "NASDAQ"}
+
+
+def test_final30_cluster_counts_recomputed_after_fallback_matches_actual():
+    from trader.us.watchlist_builder import build_us_watchlist
+
+    class FlatProvider:
+        def get_daily_prices(self, symbol, exchange="NYSE", as_of_date=None):
+            return [{"close": 100 + i} for i in range(25)]
+
+    clusters = ["AI_SEMI", "MEGA_TECH", "INDUSTRIAL", "FINANCIAL", "HEALTHCARE", "CONSUMER_STAPLES", "DEFENSIVE_UTILITY", "ENERGY_MATERIALS"]
+    rows = []
+    for i in range(80):
+        cluster = clusters[i % len(clusters)]
+        rows.append({
+            "symbol": f"T{i}",
+            "exchange": "NYSE",
+            "sector": cluster,
+            "theme_cluster": cluster,
+            "price": 100,
+            "rs_20d_score": .6,
+            "rs_60d_score": .6,
+            "rs_120d_score": .6,
+            "volume_accel_score": .6,
+            "liquidity_score": .8,
+            "near_high_score": .7,
+            "trend_score": .7,
+        })
+
+    result = build_us_watchlist(trade_date="2026-07-08", env="practice", candidate_pool=rows, provider=FlatProvider())
+    actual = {}
+    for row in result["final30_scored"]:
+        actual[row["theme_cluster"]] = actual.get(row["theme_cluster"], 0) + 1
+    assert result["final30_cluster_counts"] == actual
+    assert result["final30_ai_tech_ratio"] == sum(actual.get(c, 0) for c in {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}) / 30

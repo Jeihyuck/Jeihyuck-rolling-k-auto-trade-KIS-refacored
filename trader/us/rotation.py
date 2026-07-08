@@ -12,7 +12,7 @@ from math import ceil
 from typing import Any
 
 AI_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
-AI_CAP_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER"}
+AI_CAP_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 DEFENSIVE_CLUSTERS = {"DEFENSIVE_UTILITY", "HEALTHCARE", "CONSUMER_STAPLES"}
 NON_TECH_ROTATION_CLUSTERS = {"INDUSTRIAL", "FINANCIAL", "HEALTHCARE", "CONSUMER_STAPLES", "DEFENSIVE_UTILITY", "ENERGY_MATERIALS", "ETF_INDEX"}
 
@@ -98,8 +98,8 @@ def classify_rotation_regime(returns: dict[str, dict[int, float]], ai_basket_3d:
 
 def cluster_caps_for_regime(regime: str) -> dict[str, Any]:
     if regime == "AI_ON": return {"AI_COMBINED": 0.60, "AI_SEMI": 0.35, "DEFENSIVE_MIN": 0.10, "CASH_MIN": 0.05}
-    if regime == "AI_OFF_ROTATION": return {"AI_COMBINED": 0.25, "AI_SEMI": 0.15, "ROTATION_MIN": 0.45, "CASH_MIN": 0.10, "NON_TECH_MIN": 0.50}
-    if regime == "RISK_OFF": return {"AI_COMBINED": 0.15, "DEFENSIVE_CASH_MIN": 0.60, "CASH_MIN": 0.25}
+    if regime == "AI_OFF_ROTATION": return {"AI_COMBINED": 0.30, "AI_TECH_COMBINED": 0.30, "AI_SEMI": 0.15, "ROTATION_MIN": 0.45, "CASH_MIN": 0.10, "NON_TECH_MIN": 0.50}
+    if regime == "RISK_OFF": return {"AI_COMBINED": 0.15, "AI_TECH_COMBINED": 0.15, "DEFENSIVE_CASH_MIN": 0.60, "CASH_MIN": 0.25}
     if regime == "BROAD_UP": return {"SINGLE_CLUSTER": 0.40, "CASH_MIN": 0.05}
     return {"SINGLE_CLUSTER": 0.30, "AI_TECH_COMBINED": 0.40, "CASH_MIN": 0.05}
 
@@ -159,7 +159,8 @@ def select_bucket_champions(rows: list[dict], finaln: int, regime: str, blocked_
 
 def _quotas(finaln: int, regime: str) -> dict[str, int]:
     if regime == "AI_OFF_ROTATION":
-        return {"AI_SEMI": 3, "AI_SOFTWARE": 2, "DATA_CENTER_POWER": 2, "INDUSTRIAL": 5, "FINANCIAL": 4, "HEALTHCARE": 4, "CONSUMER_STAPLES": 3, "DEFENSIVE_UTILITY": 1, "ENERGY_MATERIALS": 3, "ETF_INDEX": 2}
+        # AI/tech combined quota is capped at 8/30 (26.7%); MEGA_TECH is part of the cap.
+        return {"AI_SEMI": 3, "AI_SOFTWARE": 2, "DATA_CENTER_POWER": 1, "MEGA_TECH": 2, "INDUSTRIAL": 5, "FINANCIAL": 4, "HEALTHCARE": 4, "CONSUMER_STAPLES": 3, "DEFENSIVE_UTILITY": 1, "ENERGY_MATERIALS": 3, "ETF_INDEX": 2}
     if regime == "RISK_OFF":
         return {"AI_SEMI": 2, "AI_SOFTWARE": 1, "DATA_CENTER_POWER": 1, "HEALTHCARE": 7, "CONSUMER_STAPLES": 6, "DEFENSIVE_UTILITY": 5, "ETF_INDEX": 3, "ENERGY_MATERIALS": 2, "FINANCIAL": 1, "INDUSTRIAL": 1}
     if regime == "AI_ON":
