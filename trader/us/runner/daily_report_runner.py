@@ -282,6 +282,10 @@ def run_daily_report(
         "open_position_symbols": [],
         "canonical_sources": {},
         "report_consistency": "OK",
+        "rotation_regime": "UNKNOWN",
+        "portfolio_cluster_weights": {},
+        "cluster_exposure": {},
+        "cap_violations": [],
     }
     
     # DRY_RUN
@@ -344,6 +348,9 @@ def run_daily_report(
                             result_data = {}
                     report["prep_trade_can_proceed"] = result_data.get("trade_can_proceed")
                     report["score_contract_ok"] = result_data.get("score_contract_ok")
+                    report["rotation_regime"] = result_data.get("rotation_regime") or result_data.get("rotation_context", {}).get("rotation_regime") or report.get("rotation_regime")
+                    report["portfolio_cluster_weights"] = result_data.get("portfolio_cluster_weights") or report.get("portfolio_cluster_weights")
+                    report["cap_violations"] = result_data.get("cap_violations") or report.get("cap_violations")
             except Exception as exc:
                 report["warnings"].append(f"prep_status_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] prep status load failed: %s", exc)
@@ -444,6 +451,16 @@ def run_daily_report(
                         invested += float(pos.get("market_value_usd") or pos.get("market_value") or pos.get("eval_amount_usd") or pos.get("total_pvs_usd") or pos.get("eval_amount") or 0)
                     except (TypeError, ValueError):
                         pass
+                try:
+                    from trader.us.rotation import apply_cap_flags, compute_cluster_exposure
+                    regime = str(report.get("rotation_regime") or "NEUTRAL")
+                    report["cluster_exposure"] = apply_cap_flags(compute_cluster_exposure(positions), regime)
+                    if not report.get("portfolio_cluster_weights"):
+                        report["portfolio_cluster_weights"] = report["cluster_exposure"]
+                    if not report.get("cap_violations"):
+                        report["cap_violations"] = [c for c, v in report["cluster_exposure"].items() if v.get("over_cap")]
+                except Exception as exc:
+                    logger.warning("[US_DAILY_REPORT][CLUSTER][WARN] %s", exc)
                 try:
                     from trader.us.capital_deployment import compute_deployment_metrics, decide_deployment_action
                     metrics = compute_deployment_metrics(account_equity_usd=float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0), invested_market_value_usd=invested, cash_usd=None)
@@ -641,6 +658,8 @@ def run_daily_report(
         f"| ack_reconcile_after_route_status | {report.get('ack_reconcile_after_route_status', '')} |",
         f"| ack_pending_reconcile_count | {report.get('ack_pending_reconcile_count', 0)} |",
         f"| positions | {report['positions']} |",
+        f"| rotation_regime | {report.get('rotation_regime', 'UNKNOWN')} |",
+        f"| cap_violations | {report.get('cap_violations', [])} |",
         "",
         "## Watchlist & Score Contract",
         "",
@@ -662,7 +681,20 @@ def run_daily_report(
         f"| prep_status | {report['prep_status'] or 'N/A'} |",
         f"| prep_trade_can_proceed | {report['prep_trade_can_proceed']} |",
         "",
+        "## Cluster Exposure & Rotation",
+        "",
+        f"**rotation_regime**: {report.get('rotation_regime', 'UNKNOWN')}",
+        "",
+        "| Cluster | Market Value | Weight | Unrealized PNL | 1D PNL | Cap | Over Cap |",
+        "|---|---:|---:|---:|---:|---:|---|",
     ])
+    for cluster, row in sorted((report.get('portfolio_cluster_weights') or report.get('cluster_exposure') or {}).items()):
+        md_lines.append(
+            f"| {cluster} | {float(row.get('cluster_market_value', 0.0)):.2f} | {float(row.get('cluster_weight', 0.0)):.4f} | "
+            f"{float(row.get('cluster_unrealized_pnl', 0.0)):.2f} | {float(row.get('cluster_1d_pnl', 0.0)):.2f} | "
+            f"{float(row.get('cluster_cap', 0.0)):.4f} | {row.get('over_cap', False)} |"
+        )
+    md_lines.append("")
     
 
     if report.get("order_final_classification"):
