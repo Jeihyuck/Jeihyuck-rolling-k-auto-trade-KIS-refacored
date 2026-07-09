@@ -225,6 +225,8 @@ from trader.time_utils import now_kst, week_monday, prev_business_day
 from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst_date
 from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
+from trader.kr.market_state_overlay import evaluate_kr_market_state, apply_kr_market_state_to_budget, filter_kr_entry_intent
+from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -14348,6 +14350,22 @@ class PB1Engine:
             budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
             tick_budget_krw = int(entry_capital_krw * budget_pct)
             self.entry_tick_budget_krw = float(tick_budget_krw)
+            self._kr_market_state_overlay = None
+            if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
+                try:
+                    self._kr_market_state_overlay = evaluate_kr_market_state(
+                        trade_date=str(self._today),
+                        provider=self,
+                        index_context={},
+                        final30_rows=(self.final30_df.to_dict("records") if isinstance(self.final30_df, pd.DataFrame) else None),
+                        positions=[],
+                        account_snapshot={"portfolio_equity_krw": float(entry_usable_krw or 0), "cash_krw": float(available_cash_krw or 0)},
+                        now=getattr(self, "_now_kst", None),
+                    )
+                    tick_budget_krw = int(apply_kr_market_state_to_budget(float(tick_budget_krw), self._kr_market_state_overlay, legacy_kr_stress_guard_triggered=False))
+                    self.entry_tick_budget_krw = float(tick_budget_krw)
+                except Exception as exc:
+                    logger.warning("[KR_MARKET_STATE][OVERLAY_FAIL_OPEN] err=%s", exc)
             logger.info(
                 "[PB1][CAPITAL] mode=%s total_cash=%s order_possible_cash=%s reserve_pct=%.2f usable=%s base_cash=%s override=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
                 PB1_CAPITAL_MODE,
@@ -16687,6 +16705,19 @@ class PB1Engine:
                 )
                 if force_cf is not None:
                     orderable_candidates.append(force_cf)
+            if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
+                overlay = getattr(self, "_kr_market_state_overlay", None) or {"market_state": "KR_NORMAL", "force_entry_block": False}
+                kept_orderable = []
+                for cf in orderable_candidates:
+                    intent = {"side": "BUY", "code": getattr(cf, "code", ""), "name": (getattr(cf, "features", {}) or {}).get("name") or getattr(cf, "name", ""), **(getattr(cf, "features", {}) or {})}
+                    blocked = filter_kr_entry_intent(intent, overlay)
+                    if blocked.get("status") == "BLOCKED":
+                        order_stage_counter[str(blocked.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")] += 1
+                        self._log_order_skip(cf, [str(blocked.get("reason"))], "PB1-CLOSE")
+                    else:
+                        kept_orderable.append(cf)
+                logger.info("[KR_MARKET_STATE][ENTRY_FILTER_APPLIED] before=%s after=%s market_state=%s", len(orderable_candidates), len(kept_orderable), overlay.get("market_state"))
+                orderable_candidates = kept_orderable
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)

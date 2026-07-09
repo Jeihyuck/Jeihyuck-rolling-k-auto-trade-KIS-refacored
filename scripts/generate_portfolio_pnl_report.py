@@ -741,6 +741,41 @@ def _build_markdown(
     lines.append(f"| Worst Position | {summary.get('worst_position', '')} |")
     lines.append("")
 
+    # PR49 KR Market State Overlay summary (populated when PB1/artifacts include the keys).
+    kr = summary.get("kr_market_state_overlay") or summary.get("kr_market_state") or {}
+    if not isinstance(kr, dict):
+        kr = {"kr_market_state": kr}
+    lines.append("## KR Market State Overlay")
+    lines.append("")
+    lines.append("229200 단일 기준이 아니라 KOSPI/KOSDAQ/KOSPI200/KOSDAQ150 및 섹터 프록시 종합 기준으로 한국장 상태를 표시합니다.")
+    lines.append("")
+    lines.append("| Field | Value |")
+    lines.append("|---|---|")
+    lines.append(f"| kr_market_state | {kr.get('kr_market_state') or kr.get('market_state') or 'N/A'} |")
+    lines.append(f"| defense_regime | {kr.get('defense_regime', 'N/A')} |")
+    lines.append(f"| risk_on_regime | {kr.get('risk_on_regime', 'N/A')} |")
+    lines.append(f"| market_state_reasons | {kr.get('market_state_reasons') or kr.get('reasons') or 'N/A'} |")
+    lines.append(f"| exposure_multiplier | {kr.get('exposure_multiplier', 'N/A')} |")
+    lines.append(f"| effective_budget_before_overlay | {kr.get('effective_budget_before_overlay', 'N/A')} |")
+    lines.append(f"| effective_budget_after_overlay | {kr.get('effective_budget_after_overlay', 'N/A')} |")
+    lines.append(f"| kospi_1d_return | {(kr.get('index_returns') or {}).get('kospi_1d_return', kr.get('kospi_1d_return', 'N/A'))} |")
+    lines.append(f"| kosdaq_1d_return | {(kr.get('index_returns') or {}).get('kosdaq_1d_return', kr.get('kosdaq_1d_return', 'N/A'))} |")
+    lines.append(f"| kospi200_1d_return | {(kr.get('index_returns') or {}).get('kospi200_1d_return', kr.get('kospi200_1d_return', 'N/A'))} |")
+    lines.append(f"| kosdaq150_1d_return | {(kr.get('index_returns') or {}).get('kosdaq150_1d_return', kr.get('kosdaq150_1d_return', 'N/A'))} |")
+    lines.append(f"| rotation_regime | {kr.get('rotation_regime', 'N/A')} |")
+    lines.append(f"| sector_leaders | {kr.get('sector_leaders', 'N/A')} |")
+    lines.append(f"| sector_laggards | {kr.get('sector_laggards', 'N/A')} |")
+    lines.append(f"| sector_proxy_quality | {kr.get('sector_proxy_quality', 'N/A')} |")
+    lines.append(f"| final30_cluster_counts | {kr.get('final30_cluster_counts', 'N/A')} |")
+    lines.append(f"| final30_high_beta_ratio | {kr.get('final30_high_beta_ratio', 'N/A')} |")
+    lines.append(f"| final30_quality_stress | {kr.get('final30_quality_stress', 'N/A')} |")
+    lines.append(f"| defense_trim_count | {kr.get('defense_trim_count', 'N/A')} |")
+    lines.append(f"| partial_take_profit_count | {kr.get('partial_take_profit_count', 'N/A')} |")
+    lines.append(f"| trailing_stop_mode | {kr.get('trailing_stop_mode', 'N/A')} |")
+    lines.append(f"| account_loss_kill_switch_triggered | {kr.get('account_loss_kill_switch_triggered', 'N/A')} |")
+    lines.append(f"| forbidden_product_block_count | {kr.get('forbidden_product_block_count', 'N/A')} |")
+    lines.append("")
+
     # Holdings PNL Table
     lines.append("## Holdings PNL Table\n")
     lines.append("| Rank | Code | Name | Qty | Entry Date | Days Held | Avg Buy | Final Price | Cost | Market Value | Unrealized PNL | PNL % | Entry Thesis | Entry Style | Entry Reason | Horizon | Exit Policy | EOD Action | Force EOD | Initial Stop | Initial R | Max Days | Policy Source | Policy Version | Close Action | Close Reason | Plan Status | Last Fill |")
