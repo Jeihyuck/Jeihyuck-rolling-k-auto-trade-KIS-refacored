@@ -709,6 +709,8 @@ def _build_markdown(
 ) -> str:
     lines: list[str] = []
     lines.append("# PB1 Portfolio PNL Report\n")
+    lines.append("KR Market State Overlay version: PR50 final fixes")
+    lines.append("229200 is used only as KOSDAQ150/growth proxy, not as the sole KR market regime.\n")
 
     # Runtime Metadata
     lines.append("## Runtime Metadata\n")

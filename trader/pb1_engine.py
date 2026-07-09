@@ -2484,6 +2484,95 @@ class PB1Engine:
             "[PB1][ASOF][USE] component=engine value=%s source=run_ctx",
             self.derived_as_of,
         )
+        self._initialize_kr_market_state_overlay()
+
+    def _kr_overlay_enabled(self) -> bool:
+        return str(os.getenv("KR_MARKET_STATE_OVERLAY_ENABLE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+    def _initialize_kr_market_state_overlay(self) -> None:
+        """Evaluate and store the KR market-state overlay for PB1 trading paths."""
+        self._kr_market_state_overlay = {"market_state": "KR_NORMAL", "overlay_version": "PR50", "overlay_base": "PR49"}
+        self._kr_overlay_positions = []
+        if not self._kr_overlay_enabled():
+            return
+        try:
+            from trader.kr.market_state_overlay import evaluate_kr_market_state
+            from trader.kr.account_risk import build_kr_account_risk_snapshot
+
+            account_snapshot = build_kr_account_risk_snapshot(getattr(self, "_balance_snapshot", None) or {})
+            self._kr_market_state_overlay = evaluate_kr_market_state(
+                index_context={"index_resolution": {}},
+                sector_proxy_summary={},
+                account_snapshot=account_snapshot,
+                final30_stress=False,
+            )
+            self._kr_overlay_positions = self._extract_kr_overlay_positions()
+            self._kr_overlay_exit_intents = self._generate_kr_overlay_exit_intents()
+            logger.info(
+                "[KR_MARKET_STATE][PB1_INIT] market_state=%s exposure_multiplier=%s data_quality=%s",
+                self._kr_market_state_overlay.get("market_state"),
+                self._kr_market_state_overlay.get("exposure_multiplier"),
+                self._kr_market_state_overlay.get("data_quality"),
+            )
+        except Exception as exc:
+            logger.warning("[KR_MARKET_STATE][PB1_INIT_FAIL] err=%s", exc)
+
+    def _extract_kr_overlay_positions(self) -> list[dict[str, Any]]:
+        positions = []
+        try:
+            raw = getattr(self, "_balance_snapshot", None) or {}
+            rows = raw.get("output1") if isinstance(raw, dict) else None
+            for row in rows or []:
+                positions.append({
+                    "code": row.get("pdno") or row.get("code") or row.get("symbol"),
+                    "qty": row.get("hldg_qty") or row.get("qty") or row.get("quantity") or 0,
+                    "pnl_pct": row.get("evlu_pfls_rt") or row.get("pnl_pct"),
+                })
+        except Exception:
+            return []
+        return positions
+
+    def _apply_kr_market_state_budget(self, tick_budget: float) -> float:
+        if not self._kr_overlay_enabled():
+            return tick_budget
+        from trader.kr.market_state_overlay import apply_kr_market_state_to_budget
+
+        adjusted, meta = apply_kr_market_state_to_budget(tick_budget, getattr(self, "_kr_market_state_overlay", None))
+        self._kr_market_state_budget_meta = meta
+        logger.info("[KR_MARKET_STATE][BUDGET] original=%.0f adjusted=%.0f market_state=%s", tick_budget, adjusted, meta.get("market_state"))
+        return adjusted
+
+    def _filter_kr_market_state_entry_candidates(self, candidates: list[Any]) -> list[Any]:
+        if not self._kr_overlay_enabled():
+            return candidates
+        from trader.kr.market_state_overlay import filter_kr_entry_candidates
+
+        filtered = filter_kr_entry_candidates(candidates, getattr(self, "_kr_market_state_overlay", None))
+        if len(filtered) != len(candidates or []):
+            logger.info("[KR_MARKET_STATE][ENTRY_FILTER] before=%s after=%s", len(candidates or []), len(filtered))
+        return filtered
+
+    def _pre_api_kr_market_state_buy_block(self, *, code: str, qty: int, reason: str = "pre_api") -> tuple[bool, str]:
+        if not self._kr_overlay_enabled():
+            return False, ""
+        from trader.kr.market_state_overlay import pre_api_kr_buy_block
+
+        blocked, block_reason = pre_api_kr_buy_block({"side": "BUY", "code": code, "qty": qty, "reason": reason}, getattr(self, "_kr_market_state_overlay", None))
+        if blocked:
+            logger.warning("[KR_MARKET_STATE][PRE_API_BLOCK] side=BUY code=%s qty=%s reason=%s", code, qty, block_reason)
+        return blocked, block_reason
+
+    def _generate_kr_overlay_exit_intents(self) -> list[dict[str, Any]]:
+        if not self._kr_overlay_enabled():
+            return []
+        from trader.kr.market_state_overlay import generate_kr_defense_trim_intents, generate_kr_profit_capture_intents
+
+        positions = getattr(self, "_kr_overlay_positions", []) or []
+        overlay = getattr(self, "_kr_market_state_overlay", None)
+        intents = generate_kr_profit_capture_intents(positions, overlay) + generate_kr_defense_trim_intents(positions, overlay)
+        if intents:
+            logger.info("[KR_MARKET_STATE][EXIT_INTENTS] count=%s reasons=%s", len(intents), [i.get("reason") for i in intents])
+        return intents
 
     @contextlib.contextmanager
     def _stage_timer(self, stage_name: str):
@@ -8206,12 +8295,13 @@ class PB1Engine:
 
         # 2) 점수 내림차순 정렬
         filtered.sort(key=lambda c: float(c.features.get("score") or 0.0), reverse=True)
-        ranked = filtered
+        ranked = self._filter_kr_market_state_entry_candidates(filtered)
 
         # 3) 사이징: tick budget 분할 + 1주 가능 필터
         tick_budget = float(self.entry_tick_budget_krw or 0.0)
         if tick_budget <= 0:
             tick_budget = float(self.entry_usable_krw or 0.0)
+        tick_budget = self._apply_kr_market_state_budget(tick_budget)
         if tick_budget <= 0:
             logger.warning("[PB1][SIZE] skip sizing: tick_budget=0 applied_score_cut=%.1f", applied_cut)
             return candidates
@@ -9650,6 +9740,20 @@ class PB1Engine:
             qty=qty,
             stage=stage,
         )
+        pre_api_blocked, pre_api_reason = self._pre_api_kr_market_state_buy_block(code=cf.code, qty=qty, reason="before_kis_order_api")
+        if pre_api_blocked:
+            self._log_final_skip(
+                cf=cf,
+                reason_code=pre_api_reason,
+                reason_detail="KR_MARKET_STATE_PRE_API_BUY_BLOCK",
+                stage=stage,
+                price=record_price,
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = pre_api_reason
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            return status
+
         pre_submit = self._resolve_entry_pre_submit(
             cf=cf,
             stage=stage,
