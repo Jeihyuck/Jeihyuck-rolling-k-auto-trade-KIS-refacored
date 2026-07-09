@@ -23,6 +23,7 @@ from typing import Any
 from trader.us import config as us_cfg
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
 from trader.us.runner.status_contract import is_no_balance_sell_reject
+from trader.us.market_state_overlay import FORBIDDEN_HEDGE_SYMBOLS
 from trader.us.db.repos import (  # test patch surface
     load_today_order_keys,
     mark_order_intent_blocked,
@@ -249,9 +250,22 @@ def route_order(
     )
 
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
-    if side == "BUY" and (intent.get("blocked_reason") == "BLOCKED_CLUSTER_EXPOSURE" or meta.get("blocked_reason") == "BLOCKED_CLUSTER_EXPOSURE"):
-        logger.warning("[US_ORDER][BUY_BLOCKED] symbol=%s reason=BLOCKED_CLUSTER_EXPOSURE", symbol_upper)
-        return {"status": "BLOCKED", "reason": "BLOCKED_CLUSTER_EXPOSURE", "symbol": symbol, "side": side, "qty": qty, "intent": intent}
+    hard_block_reasons = {
+        "FORBIDDEN_HEDGE_OR_INVERSE_ETF",
+        "DEFENSE_CRASH_ENTRY_BLOCK",
+        "DEFENSE_RISK_OFF_AI_TECH_BLOCK",
+        "PREP_CONTRACT_TRADE_BLOCK",
+        "MARKET_STATE_ENTRY_BLOCK",
+        "BLOCKED_CLUSTER_EXPOSURE",
+    }
+    blocked_reason = str(intent.get("blocked_reason") or meta.get("blocked_reason") or "")
+    if side == "BUY" and symbol_upper in FORBIDDEN_HEDGE_SYMBOLS:
+        blocked_reason = "FORBIDDEN_HEDGE_OR_INVERSE_ETF"
+    if side == "BUY" and (blocked_reason in hard_block_reasons or qty <= 0 or float(intent.get("notional_usd") or 0) <= 0):
+        if not blocked_reason:
+            blocked_reason = "invalid_buy_qty_or_notional"
+        logger.warning("[US_ORDER][BUY_BLOCKED] symbol=%s reason=%s", symbol_upper, blocked_reason)
+        return {"status": "BLOCKED", "reason": blocked_reason, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
 
     # KIS order disabled
     if not kis_order_allowed:
