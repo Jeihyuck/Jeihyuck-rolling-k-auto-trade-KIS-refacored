@@ -57,3 +57,33 @@ def test_legacy_workflow_dispatch_done_is_ignored(tmp_path, monkeypatch):
     done.parent.mkdir(parents=True)
     done.write_text('{"event_name":"workflow_dispatch","status":"OK","ticks":2}', encoding="utf-8")
     assert check_us_session_file_guard("2026-07-09", "am")["already_ran"] is False
+
+
+def test_incomplete_final30_never_trade_can_proceed_even_when_cap_clean():
+    from trader.us.prep_contract import build_us_prep_contract
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-09",
+        env="practice",
+        status="OK",
+        dynamic_universe_result={"filtered_count": 100},
+        candidate_pool_result={"selected_count": 80, "status": "OK"},
+        watchlist_result={
+            "top50_count": 50,
+            "final30_count": 24,
+            "final30_scored_count": 24,
+            "cluster_contract_ok": True,
+            "final30_cluster_cap_clean": True,
+            "cap_violations": [],
+            "rotation_regime": "RISK_OFF",
+            "final30_cluster_counts": {"HEALTHCARE": 24},
+            "final30_ai_tech_ratio": 0.0,
+        },
+        validation={"ok": True, "score_nonzero_count": 24, "warnings": [], "errors": []},
+        paths={},
+    )
+    assert contract["final30_complete"] is False
+    assert contract["cluster_contract_ok"] is True
+    assert contract["cap_violations"] == []
+    assert contract["status"] == "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
+    assert contract["trade_can_proceed"] == 0

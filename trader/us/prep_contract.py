@@ -72,6 +72,7 @@ def build_us_prep_contract(
     final30_scored_count = watchlist_result.get("final30_scored_count", 0)
     score_nonzero_count = validation.get("score_nonzero_count", 0)
 
+    final30_complete = final30_scored_count == 30
     cap_violations = list(watchlist_result.get("cap_violations") or [])
     rotation_context = watchlist_result.get("rotation_context") or {}
     cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
@@ -86,6 +87,8 @@ def build_us_prep_contract(
     )
     if not cluster_contract_ok:
         status = "FAILED_CLUSTER_CAP_CONTRACT"
+    elif not final30_complete:
+        status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
 
     agent_a_ok = validation.get("agent_a_nonzero_count", 0) >= 25
     agent_b_ok = validation.get("agent_b_nonzero_count", 0) >= 25
@@ -95,6 +98,7 @@ def build_us_prep_contract(
         status in ("OK", "OK_WITH_WARNINGS")
         and contract_ok
         and cluster_contract_ok
+        and final30_complete
         and score_nonzero_count == final30_scored_count
         and not cap_violations
     )
@@ -124,6 +128,7 @@ def build_us_prep_contract(
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
         "cluster_contract_ok": cluster_contract_ok,
+        "final30_complete": final30_complete,
         "rotation_regime": watchlist_result.get("rotation_regime") or rotation_context.get("rotation_regime"),
         "rotation_context": rotation_context,
         "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),

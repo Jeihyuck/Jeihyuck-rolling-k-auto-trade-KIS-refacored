@@ -372,6 +372,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
 
     score_nonzero_count = validation.get("score_nonzero_count", 0)
     contract_ok = validation.get("ok", False)
+    final30_complete = wl_final30 == 30
     cap_violations = list(watchlist_result.get("cap_violations") or [])
     cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
     if (watchlist_result.get("rotation_context") or {}).get("rotation_context_suspect") and str((watchlist_result.get("rotation_context") or {}).get("rotation_suspect_policy") or "block") == "block":
@@ -380,11 +381,14 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             cap_violations.append("ROTATION_CONTEXT_SUSPECT")
     if not cluster_contract_ok:
         final_status = "FAILED_CLUSTER_CAP_CONTRACT"
+    elif not final30_complete:
+        final_status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
 
     trade_can_proceed = int(
         final_status in ("OK", "OK_WITH_WARNINGS")
         and contract_ok
         and cluster_contract_ok
+        and final30_complete
         and score_nonzero_count == wl_final30
         and not cap_violations
     )
@@ -468,6 +472,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
         "cluster_contract_ok": cluster_contract_ok,
+        "final30_complete": final30_complete,
         "trade_can_proceed": trade_can_proceed,
         "watchlist_count": saved_count,
         "rotation_regime": watchlist_result.get("rotation_regime"),
@@ -511,6 +516,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "status_ok": _status_ok,
             "contract_ok": contract_ok,
             "cluster_contract_ok": cluster_contract_ok,
+            "final30_complete": final30_complete,
             "trade_can_proceed": trade_can_proceed,
             "final30_rows": wl_final30,
             "watchlist_rows": saved_count,
@@ -553,6 +559,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
         "cluster_contract_ok": cluster_contract_ok,
+        "final30_complete": final30_complete,
         "trade_can_proceed": trade_can_proceed,
         "rotation_regime": watchlist_result.get("rotation_regime"),
         "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
