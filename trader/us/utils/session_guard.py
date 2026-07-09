@@ -17,8 +17,9 @@ _GUARD_BASE = Path("runtime/session_guard/us")
 _STALE_DEFAULTS = {"prep": 60, "am": 240, "afternoon": 240, "close": 30, "trader": 480}
 
 
-def _done_path(trade_date: str, session: str) -> Path:
-    return _GUARD_BASE / trade_date / f"{session}.done"
+def _done_path(trade_date: str, session: str, run_type: str = "schedule") -> Path:
+    suffix = ".done" if str(run_type or "schedule") == "schedule" else f".{run_type}.done"
+    return _GUARD_BASE / trade_date / f"{session}{suffix}"
 
 
 def _running_path(trade_date: str, session: str) -> Path:
@@ -123,23 +124,42 @@ def release_us_session_running_lock(trade_date: str, session: str, run_id: str |
 
 
 def check_us_session_file_guard(trade_date: str, session: str) -> dict:
-    path = _done_path(trade_date, session)
+    path = _done_path(trade_date, session, "schedule")
     if not path.exists():
         return {"already_ran": False, "guard_status": "NOT_FOUND", "payload": {}}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        logger.info("[US_FILE_GUARD][DONE_FOUND] session=%s trade_date=%s path=%s status=%s", session, trade_date, str(path), payload.get("status"))
-        return {"already_ran": True, "guard_status": "DONE_FILE_FOUND", "payload": payload}
+        prior_run_type = str(payload.get("run_type") or "")
+        prior_event_name = str(payload.get("event_name") or "")
+        prior_max_ticks = int(payload.get("max_ticks") or 0)
+        accepted = (
+            prior_run_type == "schedule"
+            and prior_event_name == "schedule"
+            and prior_max_ticks <= 0
+            and not bool(payload.get("offline"))
+            and not bool(payload.get("dry_run"))
+            and not bool(payload.get("force_now"))
+        )
+        logger.info("[US_FILE_GUARD][DONE_FOUND] session=%s trade_date=%s path=%s status=%s prior_run_type=%s prior_event_name=%s prior_offline=%s prior_dry_run=%s prior_force_now=%s prior_max_ticks=%s prior_ticks=%s accepted_as_schedule_done=%s", session, trade_date, str(path), payload.get("status"), prior_run_type or "<legacy>", prior_event_name, payload.get("offline"), payload.get("dry_run"), payload.get("force_now"), prior_max_ticks, payload.get("ticks"), accepted)
+        if accepted:
+            return {"already_ran": True, "guard_status": "DONE_FILE_FOUND", "payload": payload}
+        return {"already_ran": False, "guard_status": "IGNORED_NON_SCHEDULE_DONE", "payload": payload}
     except Exception as exc:
         logger.warning("[US_FILE_GUARD][READ_ERROR] session=%s trade_date=%s error=%s", session, trade_date, exc)
         return {"already_ran": False, "guard_status": "READ_ERROR", "payload": {}}
 
 
 def write_us_session_done_file(trade_date: str, session: str, run_id: str, started_at_et: str, finished_at_et: str, status: str, ticks: int = 0, extra: dict | None = None) -> Path | None:
-    path = _done_path(trade_date, session)
-    payload = {"market": "US", "session": session, "trade_date": trade_date, "run_id": run_id, "started_at_et": started_at_et, "finished_at_et": finished_at_et, "status": status, "ticks": ticks}
-    if extra:
-        payload.update(extra)
+    extra = extra or {}
+    event_name = str(extra.get("event_name") or os.getenv("GITHUB_EVENT_NAME") or "")
+    offline = bool(extra.get("offline") or os.getenv("OFFLINE") == "1")
+    dry_run = bool(extra.get("dry_run") or os.getenv("DRY_RUN") == "1")
+    force_now = bool(extra.get("force_now") or os.getenv("US_FORCE_NOW") or os.getenv("FORCE_NOW"))
+    max_ticks = int(extra.get("max_ticks") or os.getenv("MAX_TICKS") or os.getenv("US_MAX_TICKS") or 0)
+    run_type = str(extra.get("run_type") or ("schedule" if event_name == "schedule" and not offline and not dry_run and not force_now and max_ticks <= 0 else ("offline" if offline else "manual")))
+    path = _done_path(trade_date, session, run_type)
+    payload = {"market": "US", "session": session, "trade_date": trade_date, "run_id": run_id, "started_at_et": started_at_et, "finished_at_et": finished_at_et, "status": status, "ticks": ticks, "event_name": event_name, "workflow": extra.get("workflow") or os.getenv("GITHUB_WORKFLOW"), "offline": offline, "dry_run": dry_run, "force_now": force_now, "max_ticks": max_ticks, "run_type": run_type, "expected_min_ticks": extra.get("expected_min_ticks", 0), "wall_elapsed_sec": extra.get("wall_elapsed_sec", 0)}
+    payload.update(extra)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

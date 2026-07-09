@@ -72,11 +72,23 @@ def build_us_prep_contract(
     final30_scored_count = watchlist_result.get("final30_scored_count", 0)
     score_nonzero_count = validation.get("score_nonzero_count", 0)
 
+    final30_complete = final30_scored_count == 30
+    cap_violations = list(watchlist_result.get("cap_violations") or [])
+    rotation_context = watchlist_result.get("rotation_context") or {}
+    cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
+    if rotation_context.get("rotation_context_suspect") and str(rotation_context.get("rotation_suspect_policy") or "block") == "block":
+        cluster_contract_ok = False
+        if "ROTATION_CONTEXT_SUSPECT" not in cap_violations:
+            cap_violations.append("ROTATION_CONTEXT_SUSPECT")
     contract_ok = (
         validation.get("ok", False)
         and final30_scored_count == 30
-        and score_nonzero_count == 30
+        and score_nonzero_count == final30_scored_count
     )
+    if not cluster_contract_ok:
+        status = "FAILED_CLUSTER_CAP_CONTRACT"
+    elif not final30_complete:
+        status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
 
     agent_a_ok = validation.get("agent_a_nonzero_count", 0) >= 25
     agent_b_ok = validation.get("agent_b_nonzero_count", 0) >= 25
@@ -85,8 +97,10 @@ def build_us_prep_contract(
     trade_can_proceed = int(
         status in ("OK", "OK_WITH_WARNINGS")
         and contract_ok
-        and final30_scored_count == 30
-        and score_nonzero_count == 30
+        and cluster_contract_ok
+        and final30_complete
+        and score_nonzero_count == final30_scored_count
+        and not cap_violations
     )
 
     warnings: list[str] = []
@@ -113,6 +127,19 @@ def build_us_prep_contract(
         "final30_scored_count": final30_scored_count,
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
+        "cluster_contract_ok": cluster_contract_ok,
+        "final30_complete": final30_complete,
+        "rotation_regime": watchlist_result.get("rotation_regime") or rotation_context.get("rotation_regime"),
+        "rotation_context": rotation_context,
+        "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
+        "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio", 0.0),
+        "cap_violations": cap_violations,
+        "final30_cluster_cap_clean": watchlist_result.get("final30_cluster_cap_clean", cluster_contract_ok),
+        "blocked_by_cluster_cap": watchlist_result.get("blocked_by_cluster_cap", []),
+        "selected_by_bucket_champion": watchlist_result.get("selected_by_bucket_champion", False),
+        "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
+        "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
+        "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
         "agent_a_ok": agent_a_ok,
         "agent_b_ok": agent_b_ok,
         "validation": validation,

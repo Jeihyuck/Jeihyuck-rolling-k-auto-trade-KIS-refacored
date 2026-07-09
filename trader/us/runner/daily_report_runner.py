@@ -479,6 +479,21 @@ def run_daily_report(
             fill_count = int(report.get("fills", 0) or 0)
             balance_confirmed = load_balance_confirmed_count(trade_date)
             router_summary = load_router_summary_ack_count(trade_date, session=session)
+            schedule_fallback = load_schedule_health_fallback(trade_date, session=session)
+            if router_summary == 0 and int(schedule_fallback.get("orders_ack") or 0) > 0:
+                report["warnings"].append("SOURCE_MISMATCH_ROUTER_SUMMARY_ZERO_USING_SCHEDULE_HEALTH")
+                router_summary = int(schedule_fallback.get("orders_ack") or 0)
+                report["orders_ack"] = max(db_ack, router_summary)
+                report["orders_ack_total"] = max(db_ack, router_summary)
+                report["buy_notional_routed"] = max(float(report.get("buy_notional_routed") or 0.0), float(schedule_fallback.get("buy_notional_routed") or 0.0))
+                report["sell_notional_routed"] = max(float(report.get("sell_notional_routed") or 0.0), float(schedule_fallback.get("sell_notional_routed") or 0.0))
+                report["total_order_notional_routed"] = max(float(report.get("total_order_notional_routed") or 0.0), float(schedule_fallback.get("total_order_notional_routed") or 0.0))
+                report["buy_notional_total"] = max(float(report.get("buy_notional_total") or 0.0), float(report.get("buy_notional_routed") or 0.0))
+                report["sell_notional_total"] = max(float(report.get("sell_notional_total") or 0.0), float(report.get("sell_notional_routed") or 0.0))
+                report["notional_total_source_note"] = "buy_notional_total/sell_notional_total synchronized from routed fallback; prefer *_routed fields"
+                report["deprecated_notional_total_fields"] = ["buy_notional_total", "sell_notional_total"]
+                db_ack = int(report.get("orders_ack") or 0)
+            report["source_numbers"] = {"db_orders": db_ack, "kis_fills": fill_count, "router_session_summary": router_summary, "schedule_health_fallback": schedule_fallback, "final_balance_positions": int(report.get("positions", 0) or 0)}
             reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)
             # Canonical daily counts come from US order rows for submitted/ACK and unique fills for executions.
             report["orders_ack"] = db_ack
@@ -860,6 +875,31 @@ def load_balance_confirmed_count(trade_date: str) -> int:
         except Exception as exc:
             logger.debug("[US_BALANCE_CONFIRMED][LOAD][FALLBACK] sql=%s err=%s", sql, exc)
     return int(os.getenv("US_DAILY_BALANCE_CONFIRMED_COUNT", "0") or 0) if os.getenv("PYTEST_CURRENT_TEST") else 0
+
+
+def load_schedule_health_fallback(trade_date: str, session: str | None = None) -> dict:
+    path = os.path.abspath(f"reports/us_schedule_health/{trade_date}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        candidates = []
+        if session:
+            candidates.extend([payload.get(session), (payload.get("sessions") or {}).get(session), (payload.get("session_aggregate") or {}).get(session)])
+        candidates.extend([payload.get("aggregate"), payload.get("totals"), payload])
+        for row in candidates:
+            if isinstance(row, dict) and any(k in row for k in ("orders_ack", "fills_count", "buy_notional_routed", "sell_notional_routed")):
+                return {
+                    "orders_ack": int(row.get("orders_ack") or row.get("ack") or 0),
+                    "fills_count": int(row.get("fills_count") or row.get("fills") or 0),
+                    "buy_notional_routed": float(row.get("buy_notional_routed") or 0.0),
+                    "sell_notional_routed": float(row.get("sell_notional_routed") or 0.0),
+                    "total_order_notional_routed": float(row.get("total_order_notional_routed") or (float(row.get("buy_notional_routed") or 0.0) + float(row.get("sell_notional_routed") or 0.0))),
+                }
+    except Exception as exc:
+        logger.warning("[US_DAILY_REPORT][SCHEDULE_HEALTH_FALLBACK][WARN] path=%s err=%s", path, exc)
+    return {}
 
 
 def load_router_summary_ack_count(trade_date: str, session: str | None = None) -> int:

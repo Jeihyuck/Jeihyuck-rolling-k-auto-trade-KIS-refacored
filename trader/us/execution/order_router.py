@@ -248,6 +248,11 @@ def route_order(
         symbol, side, qty, float(intent.get("notional_usd", 0)), order_key,
     )
 
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if side == "BUY" and (intent.get("blocked_reason") == "BLOCKED_CLUSTER_EXPOSURE" or meta.get("blocked_reason") == "BLOCKED_CLUSTER_EXPOSURE"):
+        logger.warning("[US_ORDER][BUY_BLOCKED] symbol=%s reason=BLOCKED_CLUSTER_EXPOSURE", symbol_upper)
+        return {"status": "BLOCKED", "reason": "BLOCKED_CLUSTER_EXPOSURE", "symbol": symbol, "side": side, "qty": qty, "intent": intent}
+
     # KIS order disabled
     if not kis_order_allowed:
         logger.info(

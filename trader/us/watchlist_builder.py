@@ -465,16 +465,17 @@ def build_us_watchlist(
         str(rotation_context.get("rotation_regime") or "NEUTRAL"),
         blocked_clusters=blocked_clusters,
     )
+    fallback_meta = {"fallback_fill_used": False, "fallback_fill_count": 0, "fallback_fill_cap_safe": True}
     if len(final30) < finaln:
-        existing_syms = {r["symbol"] for r in final30}
-        for row in sorted_broader:
-            if len(final30) >= finaln:
-                break
-            if row["symbol"] not in existing_syms and row.get("theme_cluster") not in blocked_clusters:
-                final30.append(row)
-                existing_syms.add(row["symbol"])
+        before = len(final30)
+        final30, fallback_meta = refill_under_cluster_caps(final30, sorted_broader, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters, prefer_non_tech=True)
+        fallback_meta["fallback_fill_used"] = fallback_meta.get("fallback_fill_used") or len(final30) > before
 
     final30 = _enforce_final30_etf_cap(final30[:finaln], sorted_broader, finaln, _MAX_ETF_IN_FINAL30, blocked_clusters)
+    final30, etf_refill_meta = refill_under_cluster_caps(final30, sorted_broader, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters, prefer_non_tech=True)
+    fallback_meta["fallback_fill_used"] = bool(fallback_meta.get("fallback_fill_used") or etf_refill_meta.get("fallback_fill_used"))
+    fallback_meta["fallback_fill_count"] = int(fallback_meta.get("fallback_fill_count") or 0) + int(etf_refill_meta.get("fallback_fill_count") or 0)
+    fallback_meta["fallback_fill_cap_safe"] = bool(fallback_meta.get("fallback_fill_cap_safe", True) and etf_refill_meta.get("fallback_fill_cap_safe", True))
 
     # rank 부여 + final30_scored 구성
     final30_scored: list[dict] = []
@@ -493,9 +494,10 @@ def build_us_watchlist(
         )
         final30_scored.append(scored)
 
-    final30_cluster_counts = _cluster_counts(final30_scored)
+    cluster_contract = validate_final30_cluster_contract(final30_scored, str(rotation_context.get("rotation_regime") or "NEUTRAL"))
+    final30_cluster_counts = cluster_contract["final30_cluster_counts"]
     ai_count = sum(1 for r in final30_scored if r.get("theme_cluster") in AI_CLUSTERS)
-    final30_cap_violations = _final30_cap_violations(final30_cluster_counts, len(final30_scored), str(rotation_context.get("rotation_regime") or "NEUTRAL"))
+    final30_cap_violations = list(cluster_contract.get("cap_violations") or [])
     logger.info(
         "[US_ROTATION][FINAL30] rotation_regime=%s final30_cluster_counts=%s final30_ai_tech_ratio=%.4f cap_violations=%s blocked_by_cluster_cap=%s selected_by_bucket_champion=%s",
         rotation_context.get("rotation_regime"), final30_cluster_counts, ai_count / max(1, len(final30_scored)),
@@ -517,7 +519,7 @@ def build_us_watchlist(
     return {
         "trade_date": trade_date,
         "env": env,
-        "status": "OK" if len(final30_scored) >= finaln else "ERROR",
+        "status": "OK" if cluster_contract.get("cluster_contract_ok") else "FAILED_CLUSTER_CAP_CONTRACT",
         "broader_scored_count": len(broader_scored),
         "top50_count": len(top50),
         "final30_count": len(final30),
@@ -534,6 +536,9 @@ def build_us_watchlist(
         "cap_violations": final30_cap_violations + [c for c, v in portfolio_cluster_weights.items() if v.get("over_cap")],
         "blocked_by_cluster_cap": sorted(blocked_clusters),
         "selected_by_bucket_champion": bool((bucket_meta or {}).get("selected_by_bucket_champion")),
+        "cluster_contract_ok": bool(cluster_contract.get("cluster_contract_ok")),
+        "final30_cluster_cap_clean": bool(cluster_contract.get("final30_cluster_cap_clean")),
+        **fallback_meta,
     }
 
 
@@ -577,6 +582,15 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     ai_basket_status = "ok" if ai_basket_returns else "unavailable"
 
     ctx = classify_rotation_regime(returns, ai_basket_3d=ai_basket_3d)
+    core_rel = {k: float(ctx.get(f"{k.lower()}_vs_spy_3d", 0.0) or 0.0) for k in ("QQQ", "SMH", "DIA", "RSP")}
+    zero_relative_return_symbols = [k for k, v in core_rel.items() if abs(v) < 1e-12]
+    rotation_context_suspect = len(zero_relative_return_symbols) == 4
+    ai_basket_suspect = bool(ai_basket_returns) and all(abs(float(v or 0.0)) < 1e-12 for v in ai_basket_returns.values())
+    policy = os.getenv("US_ROTATION_SUSPECT_POLICY", "block").strip().lower() or "block"
+    if len([s for s in ("SPY", "QQQ", "SMH", "DIA", "RSP") if s in missing_symbols]) >= 2:
+        ctx["rotation_regime"] = "UNKNOWN"
+    elif rotation_context_suspect and policy == "conservative":
+        ctx["rotation_regime"] = "CONSERVATIVE_ROTATION"
     ctx["benchmark_returns"] = returns
     ctx["benchmark_exchange_map"] = {sym: ETF_EXCHANGE_MAP.get(sym, "NYSE") for sym in symbols}
     ctx["benchmark_data_quality"] = "ok" if not missing_symbols else "degraded"
@@ -588,6 +602,11 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     ctx["ai_basket_status"] = ai_basket_status
     ctx["ai_basket_missing_symbols"] = ai_missing
     ctx["regime_confidence"] = 0.5 if missing_symbols or ai_basket_status == "unavailable" else 1.0
+    ctx["rotation_context_suspect"] = rotation_context_suspect
+    ctx["ai_basket_suspect"] = ai_basket_suspect
+    ctx["zero_relative_return_symbols"] = zero_relative_return_symbols
+    ctx["rotation_suspect_policy"] = policy
+    logger.warning("[US_ROTATION][DATA_QUALITY] benchmark_data_quality=%s rotation_context_suspect=%s ai_basket_suspect=%s missing_symbols=%s zero_relative_return_symbols=%s policy=%s", ctx.get("benchmark_data_quality"), rotation_context_suspect, ai_basket_suspect, missing_symbols, zero_relative_return_symbols, policy)
     ctx["cluster_caps"] = cluster_caps_for_regime(str(ctx.get("rotation_regime") or "NEUTRAL"))
     return ctx
 
@@ -654,6 +673,70 @@ def _final30_cap_violations(counts: dict[str, int], total: int, regime: str) -> 
                 violations.append(cluster)
     return violations
 
+
+
+def validate_final30_cluster_contract(final30: list[dict], regime: str) -> dict[str, Any]:
+    counts = _cluster_counts(final30)
+    total = len(final30 or [])
+    violations = _final30_cap_violations(counts, total, regime)
+    ai_count = sum(counts.get(c, 0) for c in AI_CLUSTERS)
+    if str(regime) == "AI_OFF_ROTATION":
+        if counts.get("AI_SEMI", 0) > 3 and "AI_SEMI" not in violations:
+            violations.append("AI_SEMI")
+        if counts.get("MEGA_TECH", 0) > 2 and "MEGA_TECH" not in violations:
+            violations.append("MEGA_TECH")
+        non_tech = total - ai_count
+        if total and non_tech / total < 0.50 and "NON_TECH_MIN" not in violations:
+            violations.append("NON_TECH_MIN")
+    return {
+        "cluster_contract_ok": not violations,
+        "final30_cluster_cap_clean": not violations,
+        "cap_violations": violations,
+        "final30_cluster_counts": counts,
+        "final30_ai_tech_ratio": ai_count / max(1, total),
+        "rotation_regime": regime,
+    }
+
+
+def can_add_under_cluster_caps(selected: list[dict], candidate: dict, regime: str, finaln: int) -> bool:
+    sym = str(candidate.get("symbol") or "")
+    if not sym or sym in {str(r.get("symbol") or "") for r in selected}:
+        return False
+    test = list(selected) + [candidate]
+    counts = _cluster_counts(test)
+    violations = _final30_cap_violations(counts, max(finaln, len(test)), regime)
+    if str(regime) == "AI_OFF_ROTATION":
+        if counts.get("AI_SEMI", 0) > 3 and "AI_SEMI" not in violations:
+            violations.append("AI_SEMI")
+        if counts.get("MEGA_TECH", 0) > 2 and "MEGA_TECH" not in violations:
+            violations.append("MEGA_TECH")
+    return not violations
+
+
+def refill_under_cluster_caps(selected: list[dict], candidate_pool: list[dict], finaln: int, regime: str, blocked_clusters: set[str] | None, prefer_non_tech: bool = True) -> tuple[list[dict], dict[str, Any]]:
+    blocked_clusters = blocked_clusters or set()
+    out = list(selected)
+    used = {str(r.get("symbol") or "") for r in out}
+    pool = [r for r in candidate_pool if str(r.get("symbol") or "") not in used and (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) not in blocked_clusters]
+    if prefer_non_tech:
+        pool.sort(key=lambda r: ((r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS, -float(r.get("score_final") or 0)))
+    else:
+        pool.sort(key=lambda r: -float(r.get("score_final") or 0))
+    attempted = 0
+    for row in pool:
+        if len(out) >= finaln:
+            break
+        attempted += 1
+        if can_add_under_cluster_caps(out, row, regime, finaln):
+            out.append(row)
+    # If non-tech supply is insufficient, prefer returning fewer than finaln over a dirty cap.
+    while out and not validate_final30_cluster_contract(out, regime).get("cluster_contract_ok"):
+        ai_indexes = [idx for idx, r in enumerate(out) if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS]
+        if not ai_indexes:
+            break
+        drop_idx = min(ai_indexes, key=lambda idx: float(out[idx].get("score_final") or 0.0))
+        out.pop(drop_idx)
+    return out, {"fallback_fill_used": len(out) > len(selected), "fallback_fill_count": max(0, len(out) - len(selected)), "fallback_fill_cap_safe": bool(validate_final30_cluster_contract(out, regime).get("cluster_contract_ok")), "fallback_fill_attempted": attempted}
 
 def _is_etf_row(row: dict) -> bool:
     return str(row.get("asset_type") or "").lower() == "etf" or str(row.get("symbol") or "").upper() in _CORE_ETFS
