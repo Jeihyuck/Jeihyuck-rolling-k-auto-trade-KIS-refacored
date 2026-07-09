@@ -1,3 +1,5 @@
 {
-  "SEMICONDUCTOR": {"source": "basket", "basket_symbols": ["005930", "000660", "042700", "039030", "240810"]}
+  "SEMICONDUCTOR": {"source": "basket", "basket_symbols": ["005930", "000660", "042700", "039030", "240810"]},
+  "BATTERY": {"source": "basket", "basket_symbols": ["373220", "006400", "247540", "051910", "096770"]},
+  "BIO": {"source": "basket", "basket_symbols": ["207940", "068270", "196170", "091990", "000100"]}
 }

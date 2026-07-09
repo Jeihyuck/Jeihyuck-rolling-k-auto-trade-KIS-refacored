@@ -47,3 +47,12 @@ def compute_sector_basket_return(sector: str, basket_symbols: list[str], lookbac
         "source_quality": source_quality,
         "missing_symbols": missing,
     }
+
+
+def load_sector_proxy_config(path: str) -> dict[str, Any]:
+    import json
+    from pathlib import Path
+    p = Path(path)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))

@@ -2,11 +2,10 @@ from trader.kr.market_state_overlay import build_index_context, evaluate_kr_mark
 
 
 def test_only_229200_proxy_cannot_create_risk_on(tmp_path):
-    returns = {("229200", 1): 0.03}
-    ctx = build_index_context(lambda symbol, lookback: returns.get((symbol, lookback)), lookback=1)
+    ctx = build_index_context(lambda symbol, lookback: 0.03 if symbol == "229200" else None, lookback=1)
     overlay = evaluate_kr_market_state(ctx)
-    assert overlay["market_state"] not in {"KR_RISK_ON", "KR_STRONG_RISK_ON"}
     assert overlay["market_state"] == "KR_NORMAL"
+    assert overlay["market_state"] not in {"KR_RISK_ON", "KR_STRONG_RISK_ON"}
     assert overlay["data_quality"] == "degraded"
     assert "only_kosdaq150_proxy_available" in overlay["data_quality_warnings"]
     out = tmp_path / "kr_market_state_overlay.json"
@@ -34,7 +33,7 @@ def test_account_intraday_pnl_separate_from_unrealized():
 
 
 def test_sell_and_exit_intents_are_never_market_state_blocked():
-    overlay = {"market_state": "KR_DEFENSE_CRASH"}
+    overlay = {"market_state": "KR_DEFENSE_CRASH", "force_entry_block": True}
     for reason in ["KR_CLOSE_LIQUIDATION_KIS_HOLDING", "defense_trim", "profit_capture", "hard_stop", "normal_exit"]:
         result = filter_kr_entry_intent({"side": "SELL", "symbol": "252670", "reason": reason}, overlay)
         assert result.get("status") != "BLOCKED"
