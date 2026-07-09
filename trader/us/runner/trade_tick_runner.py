@@ -814,6 +814,20 @@ def run_trade_tick(
         logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
 
+    cluster_guard_result = {"portfolio_cluster_guard_status": "NOT_EVALUATED", "portfolio_ai_tech_weight": 0.0, "portfolio_cluster_cap_violations": [], "cluster_guard_trim_intents": [], "cluster_guard_trim_notional": 0.0}
+    try:
+        from trader.us.db.repos import load_latest_us_prep_status
+        from trader.us.portfolio_cluster_guard import evaluate_portfolio_cluster_guard
+        _prep_for_cluster = load_latest_us_prep_status(trade_date) or {}
+        _rotation_regime = str(_prep_for_cluster.get("rotation_regime") or (_prep_for_cluster.get("rotation_context") or {}).get("rotation_regime") or "UNKNOWN")
+        if (_prep_for_cluster.get("rotation_context") or {}).get("rotation_context_suspect"):
+            _rotation_regime = "UNKNOWN"
+        cluster_guard_result = evaluate_portfolio_cluster_guard(current_positions, _rotation_regime, effective_budget, exit_intents, provider, now)
+        if cluster_guard_result.get("cluster_guard_trim_intents"):
+            exit_intents.extend(cluster_guard_result.get("cluster_guard_trim_intents") or [])
+    except Exception as _cluster_guard_exc:
+        logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
+
     # Route SELLs immediately before any entry watchlist or entry evaluation work.
     buy_daily_notional = 0.0
     if not current_position_symbols and current_positions:
@@ -1225,6 +1239,12 @@ def run_trade_tick(
                 logger.error("[US_ENTRY][EVAL][ERROR] %s", exc)
                 entry_eval_error_count += 1
     
+    try:
+        from trader.us.portfolio_cluster_guard import filter_entry_intents_for_cluster_guard
+        entry_intents, cluster_guard_blocked_buys = filter_entry_intents_for_cluster_guard(entry_intents, cluster_guard_result)
+    except Exception as _cluster_guard_filter_exc:
+        logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
+        cluster_guard_blocked_buys = []
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
     if entry_eval_error_count > 0 and real_order_mode and not exit_intents:
@@ -1671,6 +1691,12 @@ def run_trade_tick(
         "entry_watchlist_source": entry_watchlist_source,
         "exit_routed_before_entry": exit_routed_before_entry,
         "exit_routed_after_entry_degraded": int(exit_routed_after_entry_degraded),
+        "portfolio_cluster_guard_status": cluster_guard_result.get("portfolio_cluster_guard_status"),
+        "portfolio_ai_tech_weight": cluster_guard_result.get("portfolio_ai_tech_weight"),
+        "portfolio_cluster_cap_violations": cluster_guard_result.get("portfolio_cluster_cap_violations", []),
+        "cluster_guard_blocked_buys": cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [],
+        "cluster_guard_trim_intents": cluster_guard_result.get("cluster_guard_trim_intents", []),
+        "cluster_guard_trim_notional": cluster_guard_result.get("cluster_guard_trim_notional", 0.0),
         **deployment_metrics,
         "capital_deployment_action": capital_deployment_action,
         "position_count": position_count,

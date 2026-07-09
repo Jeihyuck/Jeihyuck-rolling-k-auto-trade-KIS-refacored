@@ -99,8 +99,12 @@ def classify_rotation_regime(returns: dict[str, dict[int, float]], ai_basket_3d:
 def cluster_caps_for_regime(regime: str) -> dict[str, Any]:
     if regime == "AI_ON": return {"AI_COMBINED": 0.60, "AI_SEMI": 0.35, "DEFENSIVE_MIN": 0.10, "CASH_MIN": 0.05}
     if regime == "AI_OFF_ROTATION": return {"AI_COMBINED": 0.30, "AI_TECH_COMBINED": 0.30, "AI_SEMI": 0.15, "ROTATION_MIN": 0.45, "CASH_MIN": 0.10, "NON_TECH_MIN": 0.50}
-    if regime == "RISK_OFF": return {"AI_COMBINED": 0.15, "AI_TECH_COMBINED": 0.15, "DEFENSIVE_CASH_MIN": 0.60, "CASH_MIN": 0.25}
+    if regime == "RISK_OFF": return {"AI_COMBINED": 0.20, "AI_TECH_COMBINED": 0.20, "DEFENSIVE_CASH_MIN": 0.60, "CASH_MIN": 0.25}
     if regime == "BROAD_UP": return {"SINGLE_CLUSTER": 0.40, "CASH_MIN": 0.05}
+    if regime in ("UNKNOWN", "RISK_GUARD"):
+        return {"SINGLE_CLUSTER": 0.25, "AI_COMBINED": 0.0, "AI_TECH_COMBINED": 0.0, "CASH_MIN": 0.25}
+    if regime == "CONSERVATIVE_ROTATION":
+        return {"AI_COMBINED": 0.10, "AI_TECH_COMBINED": 0.10, "AI_SEMI": 0.10, "CASH_MIN": 0.30, "NON_TECH_MIN": 0.70}
     return {"SINGLE_CLUSTER": 0.30, "AI_TECH_COMBINED": 0.40, "CASH_MIN": 0.05}
 
 
