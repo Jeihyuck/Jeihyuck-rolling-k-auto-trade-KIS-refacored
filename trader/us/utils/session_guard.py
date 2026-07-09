@@ -129,8 +129,18 @@ def check_us_session_file_guard(trade_date: str, session: str) -> dict:
         return {"already_ran": False, "guard_status": "NOT_FOUND", "payload": {}}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        accepted = str(payload.get("run_type") or "schedule") == "schedule" and not bool(payload.get("offline")) and not bool(payload.get("dry_run")) and not bool(payload.get("force_now"))
-        logger.info("[US_FILE_GUARD][DONE_FOUND] session=%s trade_date=%s path=%s status=%s accepted_as_schedule_done=%s", session, trade_date, str(path), payload.get("status"), accepted)
+        prior_run_type = str(payload.get("run_type") or "")
+        prior_event_name = str(payload.get("event_name") or "")
+        prior_max_ticks = int(payload.get("max_ticks") or 0)
+        accepted = (
+            prior_run_type == "schedule"
+            and prior_event_name == "schedule"
+            and prior_max_ticks <= 0
+            and not bool(payload.get("offline"))
+            and not bool(payload.get("dry_run"))
+            and not bool(payload.get("force_now"))
+        )
+        logger.info("[US_FILE_GUARD][DONE_FOUND] session=%s trade_date=%s path=%s status=%s prior_run_type=%s prior_event_name=%s prior_offline=%s prior_dry_run=%s prior_force_now=%s prior_max_ticks=%s prior_ticks=%s accepted_as_schedule_done=%s", session, trade_date, str(path), payload.get("status"), prior_run_type or "<legacy>", prior_event_name, payload.get("offline"), payload.get("dry_run"), payload.get("force_now"), prior_max_ticks, payload.get("ticks"), accepted)
         if accepted:
             return {"already_ran": True, "guard_status": "DONE_FILE_FOUND", "payload": payload}
         return {"already_ran": False, "guard_status": "IGNORED_NON_SCHEDULE_DONE", "payload": payload}

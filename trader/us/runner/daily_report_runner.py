@@ -488,6 +488,10 @@ def run_daily_report(
                 report["buy_notional_routed"] = max(float(report.get("buy_notional_routed") or 0.0), float(schedule_fallback.get("buy_notional_routed") or 0.0))
                 report["sell_notional_routed"] = max(float(report.get("sell_notional_routed") or 0.0), float(schedule_fallback.get("sell_notional_routed") or 0.0))
                 report["total_order_notional_routed"] = max(float(report.get("total_order_notional_routed") or 0.0), float(schedule_fallback.get("total_order_notional_routed") or 0.0))
+                report["buy_notional_total"] = max(float(report.get("buy_notional_total") or 0.0), float(report.get("buy_notional_routed") or 0.0))
+                report["sell_notional_total"] = max(float(report.get("sell_notional_total") or 0.0), float(report.get("sell_notional_routed") or 0.0))
+                report["notional_total_source_note"] = "buy_notional_total/sell_notional_total synchronized from routed fallback; prefer *_routed fields"
+                report["deprecated_notional_total_fields"] = ["buy_notional_total", "sell_notional_total"]
                 db_ack = int(report.get("orders_ack") or 0)
             report["source_numbers"] = {"db_orders": db_ack, "kis_fills": fill_count, "router_session_summary": router_summary, "schedule_health_fallback": schedule_fallback, "final_balance_positions": int(report.get("positions", 0) or 0)}
             reconciled = reconcile_order_sources(db_orders=db_ack, fills=fill_count, balance_confirmed=balance_confirmed, router_summary=router_summary)

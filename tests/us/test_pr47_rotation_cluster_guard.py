@@ -36,6 +36,8 @@ def test_portfolio_guard_blocks_buys_and_creates_trim():
     guard = evaluate_portfolio_cluster_guard(positions, "RISK_OFF", 10000, [], None, None)
     assert guard["portfolio_cluster_cap_violations"]
     assert guard["cluster_guard_trim_intents"]
+    dup_guard = evaluate_portfolio_cluster_guard(positions, "RISK_OFF", 10000, [{"symbol": "NVDA", "side": "SELL"}], None, None)
+    assert not dup_guard["cluster_guard_trim_intents"]
     kept, blocked = filter_entry_intents_for_cluster_guard([{"symbol": "AMD", "side": "BUY"}, {"symbol": "JNJ", "side": "BUY"}], guard)
     assert blocked == ["AMD"]
     assert [i["symbol"] for i in kept] == ["JNJ"]
@@ -47,3 +49,11 @@ def test_manual_done_does_not_block_schedule(tmp_path, monkeypatch):
     assert check_us_session_file_guard("2026-07-09", "am")["already_ran"] is False
     write_us_session_done_file("2026-07-09", "am", "r2", "s", "f", "OK", ticks=10, extra={"event_name": "schedule", "run_type": "schedule", "dry_run": False})
     assert check_us_session_file_guard("2026-07-09", "am")["already_ran"] is True
+
+
+def test_legacy_workflow_dispatch_done_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    done = tmp_path / "runtime/session_guard/us/2026-07-09/am.done"
+    done.parent.mkdir(parents=True)
+    done.write_text('{"event_name":"workflow_dispatch","status":"OK","ticks":2}', encoding="utf-8")
+    assert check_us_session_file_guard("2026-07-09", "am")["already_ran"] is False

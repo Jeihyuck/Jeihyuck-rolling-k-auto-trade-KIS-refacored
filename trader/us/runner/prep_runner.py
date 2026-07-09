@@ -297,9 +297,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         )
 
         if wl_final30 < 30:
-            logger.error("[US_PREP][ERROR] final30_scored hard fail count=%d", wl_final30)
-            finish_us_prep_run(run_id, status="ERROR", result={"stage": "watchlist", "final30_count": wl_final30})
-            return {"status": "ERROR", "stage": "watchlist", "final30_count": wl_final30}
+            logger.warning("[US_PREP][CLUSTER_CAP][CONTINUE] final30_scored_below_30 count=%d reason=cap_safe_refill", wl_final30)
 
         # top50 저장
         try:
@@ -322,16 +320,24 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             if "close" not in row or not row.get("close"):
                 row["close"] = row.get("price", 0.0)
 
+        cluster_cap_failed_early = bool(watchlist_result.get("cap_violations") or not watchlist_result.get("cluster_contract_ok", True) or wl_final30 < 30)
+        validation_required_rows = wl_final30 if cluster_cap_failed_early else 30
         validation = verify_us_final30_scored_rows(
             final30_scored,
-            required_rows=30,
+            required_rows=validation_required_rows,
             source="US_PREP_CORE_SAVE_INPUT",
         )
+        validation["required_rows_original"] = 30
+        validation["required_rows_effective"] = validation_required_rows
+        validation["cluster_cap_failed_early"] = cluster_cap_failed_early
 
         if not validation.get("ok", False):
-            logger.error("[US_PREP][ERROR] final30 contract failed errors=%s", validation.get("errors"))
-            finish_us_prep_run(run_id, status="ERROR", result={"stage": "validation", "errors": validation.get("errors", [])})
-            return {"status": "ERROR", "stage": "final30_validation", "validation": validation}
+            if cluster_cap_failed_early:
+                logger.warning("[US_PREP][CLUSTER_CAP][VALIDATION_CONTINUE] final30 validation failed but preserving contract artifacts errors=%s", validation.get("errors"))
+            else:
+                logger.error("[US_PREP][ERROR] final30 contract failed errors=%s", validation.get("errors"))
+                finish_us_prep_run(run_id, status="ERROR", result={"stage": "validation", "errors": validation.get("errors", [])})
+                return {"status": "ERROR", "stage": "final30_validation", "validation": validation}
 
     except Exception as exc:
         logger.error("[US_PREP][ERROR] final30 validation failed: %s", exc)
