@@ -37,6 +37,13 @@ def _ret(provider: Any, symbol: str, trade_date: str, lb: int) -> float | None:
                 try: return float(fn(symbol, trade_date, lb))
                 except Exception: pass
             except Exception: pass
+    fn = getattr(provider, "_kr_return_from_daily", None)
+    if callable(fn):
+        try: return float(fn(symbol, lb))
+        except TypeError:
+            try: return float(fn(symbol=symbol, lookback=lb))
+            except Exception: pass
+        except Exception: pass
     data = getattr(provider, "returns", None) or getattr(provider, "data", None) or {}
     for key in ((symbol, lb), (symbol, f"return_{lb}d"), f"{symbol}_{lb}d", symbol):
         if key in data:

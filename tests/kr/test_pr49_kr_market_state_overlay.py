@@ -71,3 +71,13 @@ def test_sell_close_liquidation_is_never_blocked_by_overlay():
     overlay={"market_state":"KR_DEFENSE_CRASH","force_entry_block":True}
     sell = filter_kr_entry_intent({"side":"SELL","code":"005930","name":"삼성전자","reason":"CLOSE_LIQUIDATION"}, overlay)
     assert sell.get("status") != "BLOCKED"
+
+def test_unrealized_loss_only_does_not_trigger_account_kill_switch():
+    o = evaluate_kr_market_state(
+        trade_date="2026-07-09", provider=P(), index_context=ctx(),
+        positions=[{"code":"X","qty":10,"market_value_krw":980_000,"total_cost":1_000_000,"unrealized_pnl_pct":-0.02}],
+        account_snapshot={"portfolio_equity_krw":1_500_000,"invested_market_value_krw":980_000,"cash_krw":520_000,"gross_exposure_pct":0.65},
+        sector_context={"rotation_regime":"KR_MIXED","sector_leaders":[],"sector_laggards":[],"sector_strength":{},"sector_proxy_quality":{}},
+    )
+    assert o["account_loss_kill_switch_triggered"] is False
+    assert o["market_state"] != "KR_DEFENSE_CRASH"

@@ -13696,17 +13696,38 @@ class PB1Engine:
             logger.warning("[KR_MARKET_STATE][INDEX_RETURN_FAIL] symbol=%s lookback=%s err=%s", symbol, lookback, exc)
             return None
 
+    def get_return(self, symbol: str, trade_date: str | None = None, lookback: int = 1) -> float | None:
+        return self._kr_return_from_daily(symbol, lookback)
+
+    def get_index_return(self, symbol: str, trade_date: str | None = None, lookback: int = 1) -> float | None:
+        return self._kr_return_from_daily(symbol, lookback)
+
+    def _kr_return_with_symbol_fallbacks(self, logical_name: str, symbols: list[str], lookback: int) -> float | None:
+        tried: list[str] = []
+        for symbol in [s for s in symbols if str(s or "").strip()]:
+            symbol = str(symbol).strip()
+            if symbol in tried:
+                continue
+            tried.append(symbol)
+            ret = self._kr_return_from_daily(symbol, lookback)
+            if ret is not None:
+                if len(tried) > 1:
+                    logger.info("[KR_MARKET_STATE][INDEX_FALLBACK] index=%s selected=%s tried=%s lookback=%s", logical_name, symbol, tried, lookback)
+                return ret
+        logger.warning("[KR_MARKET_STATE][INDEX_MISSING] index=%s lookback=%s tried=%s", logical_name, lookback, tried)
+        return None
+
     def _kr_index_context_for_overlay(self) -> dict[str, float | None]:
         symbols = {
-            "kospi": os.getenv("KR_INDEX_KOSPI_SYMBOL", "KOSPI"),
-            "kosdaq": os.getenv("KR_INDEX_KOSDAQ_SYMBOL", "KOSDAQ"),
-            "kospi200": os.getenv("KR_INDEX_KOSPI200_PROXY", "KOSPI200"),
-            "kosdaq150": os.getenv("KR_INDEX_KOSDAQ150_PROXY", "229200"),
+            "kospi": [os.getenv("KR_INDEX_KOSPI_SYMBOL", "KOSPI"), os.getenv("KR_INDEX_KOSPI_FALLBACK_PROXY", "")],
+            "kosdaq": [os.getenv("KR_INDEX_KOSDAQ_SYMBOL", "KOSDAQ"), os.getenv("KR_INDEX_KOSDAQ_FALLBACK_PROXY", "")],
+            "kospi200": [os.getenv("KR_INDEX_KOSPI200_PROXY", "KOSPI200"), os.getenv("KR_INDEX_KOSPI200_FALLBACK_PROXY", "")],
+            "kosdaq150": [os.getenv("KR_INDEX_KOSDAQ150_PROXY", "229200"), os.getenv("KR_INDEX_KOSDAQ150_FALLBACK_PROXY", "")],
         }
         ctx: dict[str, float | None] = {}
-        for name, symbol in symbols.items():
-            ctx[f"{name}_1d_return"] = self._kr_return_from_daily(symbol, 1)
-            ctx[f"{name}_3d_return"] = self._kr_return_from_daily(symbol, 3)
+        for name, candidates in symbols.items():
+            ctx[f"{name}_1d_return"] = self._kr_return_with_symbol_fallbacks(name, candidates, 1)
+            ctx[f"{name}_3d_return"] = self._kr_return_with_symbol_fallbacks(name, candidates, 3)
         return ctx
 
     def _kr_positions_for_overlay(self, positions: list[dict], *, marks_fallback: dict[str, float] | None = None) -> list[dict]:
@@ -13731,13 +13752,27 @@ class PB1Engine:
         invested = sum(float(p.get("market_value_krw") or p.get("total_cost") or 0.0) for p in positions or [])
         cost = sum(float(p.get("total_cost") or 0.0) for p in positions or [])
         equity = float(available_cash_krw or 0.0) + invested
+        portfolio_unrealized_pnl_pct = ((invested - cost) / cost) if cost > 0 else None
         intraday = None
-        if cost > 0:
-            intraday = (invested - cost) / cost
+        for key in ("KR_ACCOUNT_INTRADAY_PNL_PCT", "ACCOUNT_INTRADAY_PNL_PCT"):
+            raw = os.getenv(key)
+            if raw not in (None, ""):
+                try:
+                    intraday = float(raw)
+                    break
+                except Exception:
+                    pass
+        if intraday is None:
+            for key in ("account_intraday_pnl_pct", "intraday_pnl_pct", "day_pnl_pct", "asst_icdc_erng_rt"):
+                val = self._to_float((self._holdings_summary or {}).get(key))
+                if val is not None:
+                    intraday = val / 100.0 if abs(val) > 1.0 else val
+                    break
         exposure = calculate_kr_sector_exposure(positions=positions or [], candidate_orders=None, equity_krw=equity)
         return {
             "account_intraday_pnl_pct": intraday,
             "account_5d_pnl_pct": None,
+            "portfolio_unrealized_pnl_pct": portfolio_unrealized_pnl_pct,
             "portfolio_equity_krw": equity,
             "invested_market_value_krw": invested,
             "cash_krw": float(available_cash_krw or 0.0),
