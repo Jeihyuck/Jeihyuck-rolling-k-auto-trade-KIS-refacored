@@ -1,1 +1,12 @@
-{}
+{
+  "SEMICONDUCTOR": {"basket_symbols": ["005930", "000660", "042700", "000990", "058470"], "fallback_keywords": ["반도체", "HBM", "장비", "소재", "파운드리"]},
+  "BIO_HEALTHCARE": {"basket_symbols": ["068270", "207940", "128940", "000100", "302440"], "fallback_keywords": ["바이오", "제약", "헬스케어", "신약", "CDMO"]},
+  "SECONDARY_BATTERY": {"basket_symbols": ["373220", "051910", "006400", "247540", "066970"], "fallback_keywords": ["2차전지", "배터리", "양극재", "음극재", "전해액", "분리막"]},
+  "FINANCIAL": {"basket_symbols": ["105560", "055550", "086790", "316140", "032830"], "fallback_keywords": ["은행", "보험", "증권", "금융지주"]},
+  "AUTO": {"basket_symbols": ["005380", "000270", "012330", "011210", "161390"], "fallback_keywords": ["자동차", "부품", "타이어", "전장"]},
+  "SHIPBUILDING_MACHINERY": {"basket_symbols": ["329180", "009540", "010140", "042660", "012450"], "fallback_keywords": ["조선", "기계", "방산", "중공업"]},
+  "DEFENSIVE_CONSUMER": {"basket_symbols": ["097950", "271560", "004370", "007310", "005180"], "fallback_keywords": ["음식료", "생활소비재", "필수소비재"]},
+  "TELECOM_UTILITY": {"basket_symbols": ["017670", "030200", "015760", "036460", "032640"], "fallback_keywords": ["통신", "전력", "가스", "유틸리티"]},
+  "ENTERTAINMENT_GAME": {"basket_symbols": ["352820", "041510", "035900", "251270", "259960"], "fallback_keywords": ["게임", "엔터", "미디어", "콘텐츠"]},
+  "ENERGY_MATERIALS": {"basket_symbols": ["096770", "010950", "005490", "051910", "011170"], "fallback_keywords": ["화학", "정유", "에너지", "철강", "소재"]}
+}

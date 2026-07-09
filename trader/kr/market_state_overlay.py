@@ -24,6 +24,29 @@ def _v(d,*keys):
         if d and d.get(k) is not None: return float(d[k])
     return None
 
+def normalize_rs_percentile(value: Any) -> float:
+    try:
+        rs = float(value or 0.0)
+    except Exception:
+        return 0.0
+    return rs / 100.0 if rs > 1.0 else rs
+
+def _state_sector_cap(state: str) -> float:
+    if state in {"KR_RISK_ON", "KR_STRONG_RISK_ON"}:
+        return _f("KR_MAX_SECTOR_EXPOSURE_RISK_ON", 0.45)
+    if state in {"KR_DEFENSE_RISK_OFF", "KR_DEFENSE_CRASH"}:
+        return _f("KR_MAX_SECTOR_EXPOSURE_RISK_OFF", 0.20)
+    return _f("KR_MAX_SECTOR_EXPOSURE_NORMAL", 0.35)
+
+def _state_high_beta_cap(state: str) -> float:
+    if state in {"KR_RISK_ON", "KR_STRONG_RISK_ON"}:
+        return _f("KR_MAX_HIGH_BETA_EXPOSURE_RISK_ON", 0.55)
+    if state == "KR_DEFENSE_CAUTION":
+        return _f("KR_MAX_HIGH_BETA_EXPOSURE_CAUTION", 0.25)
+    if state in {"KR_DEFENSE_RISK_OFF", "KR_DEFENSE_CRASH"}:
+        return _f("KR_MAX_HIGH_BETA_EXPOSURE_RISK_OFF", 0.15)
+    return _f("KR_MAX_HIGH_BETA_EXPOSURE_NORMAL", 0.45)
+
 def _pct_from_provider(provider, symbol, trade_date, lb):
     for name in ("get_index_return","get_return","return_pct"):
         fn=getattr(provider,name,None)
@@ -84,6 +107,10 @@ def evaluate_kr_market_state(*, trade_date: str, provider, index_context: dict |
     acct=evaluate_kr_account_risk(account_snapshot)
     equity=float((account_snapshot or {}).get("portfolio_equity_krw") or 0)
     sector_exp=calculate_kr_sector_exposure(positions=positions or [], candidate_orders=None, equity_krw=equity) if equity>0 else {"sector_exposure_pct":{},"high_beta_exposure_pct":None,"unknown_exposure_pct":0}
+    if (account_snapshot or {}).get("sector_exposure_pct"):
+        sector_exp["sector_exposure_pct"] = dict((account_snapshot or {}).get("sector_exposure_pct") or {})
+    if (account_snapshot or {}).get("high_beta_exposure_pct") is not None:
+        sector_exp["high_beta_exposure_pct"] = float((account_snapshot or {}).get("high_beta_exposure_pct") or 0.0)
     gross=(account_snapshot or {}).get("gross_exposure_pct")
     if gross is None and equity>0: gross=float((account_snapshot or {}).get("invested_market_value_krw") or 0)/equity
     reasons=[]; state="KR_NORMAL"
@@ -111,7 +138,7 @@ def evaluate_kr_market_state(*, trade_date: str, provider, index_context: dict |
         reasons.append("gross_exposure_cap_blocks_new_buy")
     mult=_f(MULT_ENV[state], MULT_DEFAULT[state]); mode, env, d=TRAIL[state]; trail=_f(env,d)
     allow_new = state != "KR_DEFENSE_CRASH" and not ((gross is not None) and float(gross) >= _f("KR_MAX_GROSS_EXPOSURE_PCT",0.95))
-    out={"market_state":state,"defense_regime":state.startswith("KR_DEFENSE"),"risk_on_regime":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"market_state_reasons":reasons or ["normal"],"exposure_multiplier":mult,"effective_budget_before_overlay":None,"effective_budget_after_overlay":None,"allow_new_buy":allow_new,"allow_add_to_existing":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"allow_growth_buy":state not in {"KR_DEFENSE_CRASH","KR_DEFENSE_RISK_OFF"},"allow_high_beta_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"allow_defensive_buy":state != "KR_DEFENSE_CRASH","allow_semiconductor_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "SEMICONDUCTOR" in leaders),"allow_bio_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"} and "BIO_HEALTHCARE" in leaders,"allow_secondary_battery_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"} and "SECONDARY_BATTERY" in leaders,"allow_financial_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "FINANCIAL" in leaders),"allow_auto_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "AUTO" in leaders),"force_entry_block":state=="KR_DEFENSE_CRASH","trim_required":state in {"KR_DEFENSE_CRASH","KR_DEFENSE_RISK_OFF"},"profit_capture_enabled":os.getenv("KR_PROFIT_CAPTURE_ENABLE","1")!="0","trailing_stop_mode":mode,"trailing_stop_pct":trail,"stop_tightening_level":state.lower(),"account_loss_kill_switch_triggered":acct["account_loss_kill_switch_triggered"],"account_loss_kill_switch_level":acct["account_loss_kill_switch_level"],"data_quality":data_quality,"data_quality_warnings":warnings+rotation.get("rotation_warnings",[]),"index_returns":idx,"relative_strength":{"kosdaq_vs_kospi_1d":idx.get("kosdaq_vs_kospi_1d"),"kosdaq150_vs_kospi200_3d":idx.get("kosdaq150_vs_kospi200_3d")},"sector_strength":rotation.get("sector_strength",{}),"sector_proxy_quality":rotation.get("sector_proxy_quality",{}),"sector_leaders":rotation.get("sector_leaders",[]),"sector_laggards":rotation.get("sector_laggards",[]),"final30_cluster_counts":fq["counts"],"final30_unknown_cluster_ratio":fq["unknown_ratio"],"final30_high_beta_ratio":fq["high_beta_ratio"],"final30_quality_stress":fq["final30_quality_stress"],"gross_exposure_pct":gross,"sector_exposure_pct":sector_exp["sector_exposure_pct"],"high_beta_exposure_pct":sector_exp["high_beta_exposure_pct"],"forbidden_products":[BLOCK_REASON]}
+    out={"market_state":state,"defense_regime":state.startswith("KR_DEFENSE"),"risk_on_regime":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"market_state_reasons":reasons or ["normal"],"exposure_multiplier":mult,"effective_budget_before_overlay":None,"effective_budget_after_overlay":None,"allow_new_buy":allow_new,"allow_add_to_existing":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"allow_growth_buy":state not in {"KR_DEFENSE_CRASH","KR_DEFENSE_RISK_OFF"},"allow_high_beta_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"allow_defensive_buy":state != "KR_DEFENSE_CRASH","allow_semiconductor_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "SEMICONDUCTOR" in leaders),"allow_bio_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"} and "BIO_HEALTHCARE" in leaders,"allow_secondary_battery_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"} and "SECONDARY_BATTERY" in leaders,"allow_financial_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "FINANCIAL" in leaders),"allow_auto_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "AUTO" in leaders),"force_entry_block":state=="KR_DEFENSE_CRASH","trim_required":state in {"KR_DEFENSE_CRASH","KR_DEFENSE_RISK_OFF"},"profit_capture_enabled":os.getenv("KR_PROFIT_CAPTURE_ENABLE","1")!="0","trailing_stop_mode":mode,"trailing_stop_pct":trail,"stop_tightening_level":state.lower(),"account_loss_kill_switch_triggered":acct["account_loss_kill_switch_triggered"],"account_loss_kill_switch_level":acct["account_loss_kill_switch_level"],"data_quality":data_quality,"data_quality_warnings":warnings+rotation.get("rotation_warnings",[]),"index_returns":idx,"relative_strength":{"kosdaq_vs_kospi_1d":idx.get("kosdaq_vs_kospi_1d"),"kosdaq150_vs_kospi200_3d":idx.get("kosdaq150_vs_kospi200_3d")},"sector_strength":rotation.get("sector_strength",{}),"sector_proxy_quality":rotation.get("sector_proxy_quality",{}),"sector_leaders":rotation.get("sector_leaders",[]),"sector_laggards":rotation.get("sector_laggards",[]),"final30_cluster_counts":fq["counts"],"final30_unknown_cluster_ratio":fq["unknown_ratio"],"final30_high_beta_ratio":fq["high_beta_ratio"],"final30_quality_stress":fq["final30_quality_stress"],"gross_exposure_pct":gross,"portfolio_equity_krw":equity,"sector_exposure_pct":sector_exp["sector_exposure_pct"],"high_beta_exposure_pct":sector_exp["high_beta_exposure_pct"],"forbidden_products":[BLOCK_REASON]}
     logger.info("[KR_MARKET_STATE][REGIME] market_state=%s defense_regime=%s risk_on_regime=%s reasons=%s kospi_1d=%s kosdaq_1d=%s kospi200_1d=%s kosdaq150_1d=%s rotation_regime=%s sector_leaders=%s exposure_multiplier=%.2f allow_new_buy=%s allow_add_to_existing=%s allow_high_beta_buy=%s force_entry_block=%s", state, out["defense_regime"], out["risk_on_regime"], out["market_state_reasons"], k1, q1, kp1, q1501, rotation.get("rotation_regime"), out["sector_leaders"], mult, out["allow_new_buy"], out["allow_add_to_existing"], out["allow_high_beta_buy"], out["force_entry_block"])
     return out
 
@@ -126,16 +153,50 @@ def filter_kr_entry_intent(intent: dict, overlay: dict, *, positions: list[dict]
     side=str(intent.get("side") or intent.get("action") or "").upper()
     out=dict(intent)
     if side != "BUY": return out
+    state = str(overlay.get("market_state") or "KR_NORMAL")
+    cls=classify_kr_sector(out); cluster=cls["sector_cluster"]
+    equity=float(overlay.get("portfolio_equity_krw") or out.get("portfolio_equity_krw") or 0.0)
+    notional=float(out.get("notional") or out.get("order_value") or out.get("planned_value") or out.get("planned_cap") or 0.0)
+    add_pct=(notional / equity) if equity > 0 and notional > 0 else 0.0
+    sector_exposure=dict(overlay.get("sector_exposure_pct") or {})
+    sector_after=float(sector_exposure.get(cluster) or 0.0) + add_pct
+    high_beta_after=float(overlay.get("high_beta_exposure_pct") or 0.0) + (add_pct if cls["is_high_beta"] else 0.0)
+    unknown_after=float(sector_exposure.get("UNKNOWN") or 0.0) + (add_pct if cluster == "UNKNOWN" else 0.0)
+    gross_after=float(overlay.get("gross_exposure_pct") or 0.0) + add_pct
+    reason = ""
     if is_forbidden_kr_product(row=out): reason=BLOCK_REASON
     elif overlay.get("force_entry_block"): reason="KR_DEFENSE_CRASH_ENTRY_BLOCK"
+    elif gross_after >= _f("KR_MAX_GROSS_EXPOSURE_PCT",0.95): reason="KR_MAX_GROSS_EXPOSURE_BLOCK"
     else:
-        cls=classify_kr_sector(out); cluster=cls["sector_cluster"]; state=overlay.get("market_state")
-        if state=="KR_DEFENSE_RISK_OFF" and cls["is_high_beta"]: reason="KR_DEFENSE_RISK_OFF_HIGH_BETA_BLOCK"
-        elif state=="KR_DEFENSE_RISK_OFF" and cluster in {"BIO_HEALTHCARE","SECONDARY_BATTERY"}: reason="KR_DEFENSE_RISK_OFF_GROWTH_BLOCK"
-        elif state=="KR_DEFENSE_CAUTION" and cls["is_high_beta"] and float(out.get("rs_percentile") or 0) < 0.85: reason="KR_DEFENSE_CAUTION_ENTRY_REDUCED"
-        else: return out
+        # Add-to-existing/single-position cap. Loss averaging stays disallowed by default.
+        code=str(out.get("code") or out.get("symbol") or "")
+        existing_value=0.0; existing_loss=False
+        for p in positions or []:
+            if str(p.get("code") or p.get("symbol") or "") == code:
+                existing_value += float(p.get("market_value_krw") or p.get("market_value") or p.get("total_cost") or 0.0)
+                existing_loss = existing_loss or float(p.get("unrealized_pnl_pct") or p.get("return_pct") or 0.0) < 0
+        if existing_loss:
+            reason="KR_LOSS_AVERAGING_BLOCK"
+        elif equity > 0 and (existing_value + notional) / equity > _f("KR_MAX_SINGLE_POSITION_PCT",0.10):
+            reason="KR_SINGLE_POSITION_CAP_BLOCK"
+        elif cluster == "UNKNOWN" and unknown_after > _f("KR_MAX_UNKNOWN_SECTOR_EXPOSURE",0.15):
+            reason="KR_UNKNOWN_SECTOR_CAP_BLOCK"
+        elif sector_after > _state_sector_cap(state):
+            reason="KR_SECTOR_CAP_BLOCK"
+        elif cls["is_high_beta"] and high_beta_after > _state_high_beta_cap(state):
+            reason="KR_HIGH_BETA_CAP_BLOCK"
+        elif state=="KR_DEFENSE_RISK_OFF" and cls["is_high_beta"]:
+            reason="KR_DEFENSE_RISK_OFF_HIGH_BETA_BLOCK"
+        elif state=="KR_DEFENSE_RISK_OFF" and cluster in {"BIO_HEALTHCARE","SECONDARY_BATTERY"}:
+            reason="KR_DEFENSE_RISK_OFF_GROWTH_BLOCK"
+        elif state=="KR_DEFENSE_CAUTION" and cls["is_high_beta"] and normalize_rs_percentile(out.get("rs_percentile") or out.get("rs_pctile")) < 0.85:
+            reason="KR_DEFENSE_CAUTION_ENTRY_REDUCED"
+    if not reason:
+        return out
     out.update({"status":"BLOCKED","reason":reason,"blocked_reason":reason,"market_state":overlay.get("market_state")})
-    logger.info("[KR_MARKET_STATE][ENTRY_BLOCK] symbol=%s name=%s cluster=%s reason=%s market_state=%s", out.get("code") or out.get("symbol"), out.get("name"), classify_kr_sector(out)["sector_cluster"], reason, overlay.get("market_state"))
+    if reason == BLOCK_REASON:
+        logger.info("[KR_FORBIDDEN_PRODUCT][BLOCK] symbol=%s name=%s side=BUY reason=%s", out.get("code") or out.get("symbol"), out.get("name"), reason)
+    logger.info("[KR_MARKET_STATE][ENTRY_BLOCK] symbol=%s name=%s cluster=%s reason=%s market_state=%s sector_exposure_pct=%.4f high_beta_exposure_pct=%.4f", out.get("code") or out.get("symbol"), out.get("name"), cluster, reason, overlay.get("market_state"), sector_after, high_beta_after)
     return out
 
 def generate_kr_profit_capture_intents(positions: list[dict], overlay: dict) -> list[dict]:
@@ -148,7 +209,9 @@ def generate_kr_profit_capture_intents(positions: list[dict], overlay: dict) -> 
             if pnl >= thr and not meta.get(flag) and qty>0:
                 sell_qty=max(1,int(qty*sell_pct)); runner_min=int(qty*_f("KR_RUNNER_MIN_REMAIN_PCT",0.40))
                 if overlay.get("market_state") not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CRASH"}: sell_qty=min(sell_qty, max(1, qty-runner_min))
-                result.append({"side":"SELL","code":p.get("code") or p.get("symbol"),"qty":sell_qty,"reason":reason,"market_state":overlay.get("market_state")}); break
+                result.append({"side":"SELL","code":p.get("code") or p.get("symbol"),"qty":sell_qty,"reason":reason,"market_state":overlay.get("market_state")})
+                logger.info("[KR_PROFIT_CAPTURE][%s] symbol=%s qty=%s pnl_pct=%.4f market_state=%s", reason.rsplit("_", 1)[-1], p.get("code") or p.get("symbol"), sell_qty, pnl, overlay.get("market_state"))
+                break
     return result
 
 def generate_kr_defense_trim_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None=None) -> list[dict]:
@@ -162,6 +225,10 @@ def generate_kr_defense_trim_intents(positions: list[dict], overlay: dict, exist
         cls=classify_kr_sector(p); weak=float(p.get("unrealized_pnl_pct") or 0)<0 or cls["is_high_beta"] or state=="KR_DEFENSE_CRASH"
         if weak:
             qty=int(p.get("orderable_qty") or p.get("qty") or 0); sell_qty=max(1,int(qty*pct)) if qty>0 else 0
-            if sell_qty>0: out.append({"side":"SELL","code":code,"qty":min(sell_qty, qty-1 if os.getenv("KR_DEFENSE_DO_NOT_FULL_LIQUIDATE_INTRADAY","1")!="0" and qty>1 else qty),"reason":"KR_DEFENSE_CRASH_TRIM" if state=="KR_DEFENSE_CRASH" else "KR_DEFENSE_RISK_OFF_TRIM","market_state":state})
+            if sell_qty>0:
+                trim_qty = min(sell_qty, qty-1 if os.getenv("KR_DEFENSE_DO_NOT_FULL_LIQUIDATE_INTRADAY","1")!="0" and qty>1 else qty)
+                reason = "KR_DEFENSE_CRASH_TRIM" if state=="KR_DEFENSE_CRASH" else "KR_DEFENSE_RISK_OFF_TRIM"
+                out.append({"side":"SELL","code":code,"qty":trim_qty,"reason":reason,"market_state":state})
+                logger.info("[KR_DEFENSE][TRIM] symbol=%s qty=%s reason=%s market_state=%s", code, trim_qty, reason, state)
         if len(out)>=maxn: break
     return out

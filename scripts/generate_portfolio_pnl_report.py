@@ -1007,6 +1007,12 @@ def main() -> int:
             balance_rows=balance_output1,
         )
         summary["cash_source"] = cash_source
+        try:
+            overlay_path = Path("artifacts/kr_market_state_overlay.json")
+            if overlay_path.exists():
+                summary["kr_market_state_overlay"] = json.loads(overlay_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("[REPORT][KR_MARKET_STATE][LOAD_FAIL] err=%s", exc)
 
         # Today trades
         today_trades = _build_today_trades(today_orders, today_fills, balance_output1, db_positions)

@@ -1,8 +1,10 @@
 """KR sector proxy map and return resolver for PR49."""
 from __future__ import annotations
-import copy, json, os
+import copy, json, logging, os
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 KR_SECTOR_PROXY_MAP = {
  "SEMICONDUCTOR":{"primary_index":None,"etf_proxies":[],"basket_symbols":[],"fallback_keywords":["반도체","HBM","장비","소재","파운드리"]},
@@ -63,4 +65,8 @@ def compute_sector_proxy_return(*, sector: str, provider, trade_date: str, lookb
     for idx_name, key in (("kospi","kospi_3d_return"),("kosdaq","kosdaq_3d_return"),("kospi200","kospi200_3d_return"),("kosdaq150","kosdaq150_3d_return")):
         base = idx.get(key)
         out[f"vs_{idx_name}_3d"] = round(r3 - float(base), 10) if r3 is not None and base is not None else None
+    logger.info(
+        "[KR_SECTOR_PROXY][RETURN] sector=%s source=%s source_quality=%s return_1d=%s return_3d=%s return_5d=%s vs_kospi_3d=%s vs_kosdaq_3d=%s vs_kospi200_3d=%s vs_kosdaq150_3d=%s",
+        sector, out.get("source"), out.get("source_quality"), out.get("return_1d"), out.get("return_3d"), out.get("return_5d"), out.get("vs_kospi_3d"), out.get("vs_kosdaq_3d"), out.get("vs_kospi200_3d"), out.get("vs_kosdaq150_3d"),
+    )
     return out

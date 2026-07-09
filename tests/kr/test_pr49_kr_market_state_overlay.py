@@ -40,3 +40,34 @@ def test_profit_capture_tp1_partial_runner():
     intents = generate_kr_profit_capture_intents([{"code":"005930","qty":100,"unrealized_pnl_pct":0.031,"meta":{}}], {"market_state":"KR_STRONG_RISK_ON"})
     assert intents[0]["reason"] == "KR_TAKE_PROFIT_TP1"
     assert intents[0]["qty"] < 100
+
+def test_empty_sector_proxy_config_cannot_create_risk_on(tmp_path, monkeypatch):
+    empty = tmp_path / "empty.json"
+    empty.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("KR_SECTOR_PROXY_CONFIG_PATH", str(empty))
+    o = evaluate_kr_market_state(
+        trade_date="2026-07-09", provider=P(),
+        index_context=ctx(kospi_1d_return=0.01, kosdaq_1d_return=0.01, kospi200_1d_return=0.01, kosdaq150_1d_return=0.01),
+        sector_context={"rotation_regime":"KR_BROAD_UP","sector_leaders":["FINANCIAL"],"sector_laggards":[],"sector_strength":{},"sector_proxy_quality":{"FINANCIAL":"low"}},
+    )
+    assert o["market_state"] not in {"KR_RISK_ON", "KR_STRONG_RISK_ON"}
+
+
+def test_rs_percentile_80_normalizes_under_caution_threshold():
+    overlay={"market_state":"KR_DEFENSE_CAUTION","force_entry_block":False,"sector_exposure_pct":{},"portfolio_equity_krw":1_000_000,"gross_exposure_pct":0.0,"high_beta_exposure_pct":0.0}
+    blocked = filter_kr_entry_intent({"side":"BUY","code":"X","name":"바이오 제약","rs_percentile":80,"planned_value":10_000}, overlay)
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["reason"] == "KR_DEFENSE_CAUTION_ENTRY_REDUCED"
+
+
+def test_high_beta_exposure_cap_blocks_new_high_beta():
+    overlay={"market_state":"KR_NORMAL","force_entry_block":False,"sector_exposure_pct":{"BIO_HEALTHCARE":0.10},"portfolio_equity_krw":1_000_000,"gross_exposure_pct":0.2,"high_beta_exposure_pct":0.46}
+    blocked = filter_kr_entry_intent({"side":"BUY","code":"X","name":"바이오 제약","rs_percentile":90,"planned_value":10_000}, overlay)
+    assert blocked["status"] == "BLOCKED"
+    assert blocked["reason"] == "KR_HIGH_BETA_CAP_BLOCK"
+
+
+def test_sell_close_liquidation_is_never_blocked_by_overlay():
+    overlay={"market_state":"KR_DEFENSE_CRASH","force_entry_block":True}
+    sell = filter_kr_entry_intent({"side":"SELL","code":"005930","name":"삼성전자","reason":"CLOSE_LIQUIDATION"}, overlay)
+    assert sell.get("status") != "BLOCKED"

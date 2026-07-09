@@ -225,7 +225,7 @@ from trader.time_utils import now_kst, week_monday, prev_business_day
 from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst_date
 from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
-from trader.kr.market_state_overlay import evaluate_kr_market_state, apply_kr_market_state_to_budget, filter_kr_entry_intent
+from trader.kr.market_state_overlay import evaluate_kr_market_state, apply_kr_market_state_to_budget, filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
@@ -9811,6 +9811,18 @@ class PB1Engine:
                 raise
             status["skipped_reason"] = "intent_log_fail"
             return status
+        if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
+            overlay = getattr(self, "_kr_market_state_overlay", None) or {"market_state": "KR_NORMAL", "force_entry_block": False}
+            _pre_api_intent = {"side": "BUY", "code": cf.code, "name": stock_name, "planned_value": float(record_price or 0.0) * float(qty or 0), **(cf.features or {})}
+            _pre_api_block = filter_kr_entry_intent(_pre_api_intent, overlay, positions=getattr(self, "_kr_overlay_positions", []))
+            if _pre_api_block.get("status") == "BLOCKED":
+                reason = str(_pre_api_block.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")
+                logger.info("[KR_MARKET_STATE][PRE_API_BLOCK] code=%s reason=%s market_state=%s", display_code, reason, overlay.get("market_state"))
+                status["skipped"] = 1
+                status["skipped_reason"] = reason
+                status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+                status["terminal_event"] = "FINAL_SKIP"
+                return status
         if self.dry_run:
             logger.info("[PB1][ENTRY-DRY] code=%s qty=%s key=%s order_id=%s", display_code, cf.planned_qty, cf.client_order_key, order_id)
             logger.info(
@@ -11162,6 +11174,9 @@ class PB1Engine:
             final_reason = _blocked_reason or "SWING_SAME_DAY_GUARD_BLOCK"
             ordered_reasons = [final_reason]
 
+        _router_qty: int | None = None
+        _router_full_exit = False
+        _router_sell_pct = None
         _router_reason = final_reason
         if exit_policy_family in {
             "INTRADAY_PROFIT_PROTECT",
@@ -11310,6 +11325,27 @@ class PB1Engine:
                 final_reason = close_reason
                 ordered_reasons = [close_reason]
                 eval_reason = "NO_EXIT_SIGNAL"
+
+        # PR49 overlay exits: hard stops/close liquidation keep priority; defense trim and profit capture can create partial SELLs when no stronger exit is active.
+        overlay = getattr(self, "_kr_market_state_overlay", None) or {}
+        if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True) and str(window_tag).lower() != "close":
+            pos_for_overlay = {**pos, "code": code, "qty": qty, "orderable_qty": int(pos.get("orderable_qty") or qty), "unrealized_pnl_pct": ret_pct / 100.0, "market_value_krw": float(mark or 0.0) * qty}
+            strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP"}
+            if not strong_exit_active:
+                kr_trim = generate_kr_defense_trim_intents([pos_for_overlay], overlay, existing_sell_symbols=set())
+                kr_tp = [] if kr_trim else generate_kr_profit_capture_intents([pos_for_overlay], overlay)
+                kr_intent = (kr_trim or kr_tp or [None])[0]
+                if kr_intent:
+                    final_reason = str(kr_intent.get("reason") or final_reason)
+                    ordered_reasons = [final_reason]
+                    exit_policy = {**exit_policy, "exit_ok": True, "final_reason": final_reason}
+                    _router_qty = int(kr_intent.get("qty") or 0)
+                    _router_full_exit = False
+                    _router_sell_pct = None
+                    _router_reason = final_reason
+                    signal_hit = True
+                    eval_reason = final_reason
+                    logger.info("[KR_MARKET_STATE][EXIT_OVERLAY_APPLIED] code=%s reason=%s qty=%s market_state=%s", display_code, final_reason, _router_qty, overlay.get("market_state"))
 
         exit_eval = ExitEvaluation(
             code=code,
@@ -13643,6 +13679,102 @@ class PB1Engine:
         )
         return members, source
 
+    def _kr_return_from_daily(self, symbol: str, lookback: int) -> float | None:
+        try:
+            df, _meta = self._fetch_daily(symbol, count=max(lookback + 2, 8))
+            if df is None or df.empty or "close" not in df.columns or len(df) <= lookback:
+                return None
+            close = df["close"].astype(float).dropna()
+            if len(close) <= lookback:
+                return None
+            prev = float(close.iloc[-1 - lookback])
+            last = float(close.iloc[-1])
+            if prev <= 0:
+                return None
+            return (last / prev) - 1.0
+        except Exception as exc:
+            logger.warning("[KR_MARKET_STATE][INDEX_RETURN_FAIL] symbol=%s lookback=%s err=%s", symbol, lookback, exc)
+            return None
+
+    def _kr_index_context_for_overlay(self) -> dict[str, float | None]:
+        symbols = {
+            "kospi": os.getenv("KR_INDEX_KOSPI_SYMBOL", "KOSPI"),
+            "kosdaq": os.getenv("KR_INDEX_KOSDAQ_SYMBOL", "KOSDAQ"),
+            "kospi200": os.getenv("KR_INDEX_KOSPI200_PROXY", "KOSPI200"),
+            "kosdaq150": os.getenv("KR_INDEX_KOSDAQ150_PROXY", "229200"),
+        }
+        ctx: dict[str, float | None] = {}
+        for name, symbol in symbols.items():
+            ctx[f"{name}_1d_return"] = self._kr_return_from_daily(symbol, 1)
+            ctx[f"{name}_3d_return"] = self._kr_return_from_daily(symbol, 3)
+        return ctx
+
+    def _kr_positions_for_overlay(self, positions: list[dict], *, marks_fallback: dict[str, float] | None = None) -> list[dict]:
+        marks_fallback = marks_fallback or {}
+        out: list[dict] = []
+        for pos in positions or []:
+            row = dict(pos or {})
+            code = str(row.get("code") or row.get("symbol") or "").zfill(6)
+            qty = int(row.get("qty") or row.get("holding_qty") or 0)
+            avg = self._to_float(row.get("avg_buy_price") or row.get("avg_price") or row.get("entry_price")) or 0.0
+            mark = self._to_float(row.get("last_price") or row.get("current_price") or marks_fallback.get(code) or avg) or avg
+            row["code"] = code
+            row["qty"] = qty
+            row.setdefault("market_value_krw", float(mark or 0.0) * qty)
+            row.setdefault("total_cost", float(avg or 0.0) * qty)
+            if avg > 0 and row.get("unrealized_pnl_pct") is None:
+                row["unrealized_pnl_pct"] = (float(mark or avg) / avg) - 1.0
+            out.append(row)
+        return out
+
+    def _kr_account_snapshot_for_overlay(self, positions: list[dict], available_cash_krw: float) -> dict[str, Any]:
+        invested = sum(float(p.get("market_value_krw") or p.get("total_cost") or 0.0) for p in positions or [])
+        cost = sum(float(p.get("total_cost") or 0.0) for p in positions or [])
+        equity = float(available_cash_krw or 0.0) + invested
+        intraday = None
+        if cost > 0:
+            intraday = (invested - cost) / cost
+        exposure = calculate_kr_sector_exposure(positions=positions or [], candidate_orders=None, equity_krw=equity)
+        return {
+            "account_intraday_pnl_pct": intraday,
+            "account_5d_pnl_pct": None,
+            "portfolio_equity_krw": equity,
+            "invested_market_value_krw": invested,
+            "cash_krw": float(available_cash_krw or 0.0),
+            "gross_exposure_pct": (invested / equity) if equity > 0 else None,
+            "sector_exposure_pct": exposure.get("sector_exposure_pct") or {},
+            "high_beta_exposure_pct": exposure.get("high_beta_exposure_pct"),
+        }
+
+    def _evaluate_kr_market_state_overlay_for_tick(self, *, tick_budget_krw: float, positions: list[dict], available_cash_krw: float, final30_rows: list[dict] | None = None) -> tuple[dict | None, float]:
+        if not (self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True)):
+            return None, float(tick_budget_krw or 0.0)
+        try:
+            overlay_positions = self._kr_positions_for_overlay(positions)
+            account_snapshot = self._kr_account_snapshot_for_overlay(overlay_positions, available_cash_krw)
+            overlay = evaluate_kr_market_state(
+                trade_date=str(self._today),
+                provider=self,
+                index_context=self._kr_index_context_for_overlay(),
+                final30_rows=final30_rows,
+                positions=overlay_positions,
+                account_snapshot=account_snapshot,
+                now=getattr(self, "_now_kst", None),
+            )
+            after = apply_kr_market_state_to_budget(float(tick_budget_krw or 0.0), overlay, legacy_kr_stress_guard_triggered=False)
+            self._kr_market_state_overlay = overlay
+            self._kr_overlay_positions = overlay_positions
+            try:
+                artifact_dir = Path("artifacts")
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_dir / "kr_market_state_overlay.json").write_text(json.dumps(overlay, ensure_ascii=False, default=str), encoding="utf-8")
+            except Exception as artifact_exc:
+                logger.warning("[KR_MARKET_STATE][ARTIFACT_WRITE_FAIL] err=%s", artifact_exc)
+            return overlay, after
+        except Exception as exc:
+            logger.warning("[KR_MARKET_STATE][OVERLAY_FAIL_OPEN] err=%s", exc)
+            return None, float(tick_budget_krw or 0.0)
+
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
         marks = self._fetch_marks([p["code"] for p in positions], fallback)
@@ -14278,6 +14410,7 @@ class PB1Engine:
                 "max_positions": max_positions,
                 "slots_remaining": slots_remaining,
                 "session_kind": session_kind,
+                "kr_market_state_overlay": dict(getattr(self, "_kr_market_state_overlay", {}) or {}),
             }
             self._run_summary_payload = payload
             self._debug_summary = {
@@ -14301,6 +14434,7 @@ class PB1Engine:
                 "blocked_reasons_counter": payload["blocked_reasons_counter"],
                 "skip_reason_top": payload["no_trade_reason"] or "none",
                 "entry_decision_result": payload["entry_decision_result"],
+                "kr_market_state_overlay": payload.get("kr_market_state_overlay") or {},
             }
 
         holdings_snapshot = self._fetch_holdings_snapshot()
@@ -14350,22 +14484,9 @@ class PB1Engine:
             budget_pct = min(max(float(PB1_ENTRY_BUDGET_PCT_PER_TICK), 0.0), 1.0)
             tick_budget_krw = int(entry_capital_krw * budget_pct)
             self.entry_tick_budget_krw = float(tick_budget_krw)
+            self._kr_base_tick_budget_krw = float(tick_budget_krw)
             self._kr_market_state_overlay = None
-            if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
-                try:
-                    self._kr_market_state_overlay = evaluate_kr_market_state(
-                        trade_date=str(self._today),
-                        provider=self,
-                        index_context={},
-                        final30_rows=(self.final30_df.to_dict("records") if isinstance(self.final30_df, pd.DataFrame) else None),
-                        positions=[],
-                        account_snapshot={"portfolio_equity_krw": float(entry_usable_krw or 0), "cash_krw": float(available_cash_krw or 0)},
-                        now=getattr(self, "_now_kst", None),
-                    )
-                    tick_budget_krw = int(apply_kr_market_state_to_budget(float(tick_budget_krw), self._kr_market_state_overlay, legacy_kr_stress_guard_triggered=False))
-                    self.entry_tick_budget_krw = float(tick_budget_krw)
-                except Exception as exc:
-                    logger.warning("[KR_MARKET_STATE][OVERLAY_FAIL_OPEN] err=%s", exc)
+            self._kr_overlay_positions = []
             logger.info(
                 "[PB1][CAPITAL] mode=%s total_cash=%s order_possible_cash=%s reserve_pct=%.2f usable=%s base_cash=%s override=%s use_override=%s entry_capital=%s cap_limit=%s tick_budget=%s tick_budget_pct=%.2f source=%s",
                 PB1_CAPITAL_MODE,
@@ -14495,6 +14616,18 @@ class PB1Engine:
         existing_positions_count = len(existing_positions)
         positions_cost = sum(float(p.get("total_cost") or 0.0) for p in positions_for_exit)
         self._equity_krw = float(available_cash_krw) + positions_cost
+        if entry_phase:
+            _final30_rows_for_overlay = self.final30_df.to_dict("records") if isinstance(self.final30_df, pd.DataFrame) else None
+            _overlay, _overlay_budget = self._evaluate_kr_market_state_overlay_for_tick(
+                tick_budget_krw=float(getattr(self, "_kr_base_tick_budget_krw", tick_budget_krw) or tick_budget_krw),
+                positions=positions_for_exit,
+                available_cash_krw=float(available_cash_krw or 0.0),
+                final30_rows=_final30_rows_for_overlay,
+            )
+            if _overlay is not None:
+                tick_budget_krw = int(_overlay_budget)
+                self.entry_tick_budget_krw = float(tick_budget_krw)
+                logger.info("[KR_MARKET_STATE][POST_POSITION_EVAL] market_state=%s tick_budget=%s positions=%s", _overlay.get("market_state"), tick_budget_krw, len(positions_for_exit or []))
         slots_remaining = max(0, max_positions - existing_positions_count)
         target_new_positions = min(target_new_positions_raw, slots_remaining)
         if slots_remaining > 0:
@@ -16709,8 +16842,8 @@ class PB1Engine:
                 overlay = getattr(self, "_kr_market_state_overlay", None) or {"market_state": "KR_NORMAL", "force_entry_block": False}
                 kept_orderable = []
                 for cf in orderable_candidates:
-                    intent = {"side": "BUY", "code": getattr(cf, "code", ""), "name": (getattr(cf, "features", {}) or {}).get("name") or getattr(cf, "name", ""), **(getattr(cf, "features", {}) or {})}
-                    blocked = filter_kr_entry_intent(intent, overlay)
+                    intent = {"side": "BUY", "code": getattr(cf, "code", ""), "name": (getattr(cf, "features", {}) or {}).get("name") or getattr(cf, "name", ""), "planned_value": float(getattr(cf, "planned_value", 0.0) or 0.0), **(getattr(cf, "features", {}) or {})}
+                    blocked = filter_kr_entry_intent(intent, overlay, positions=getattr(self, "_kr_overlay_positions", existing_positions if 'existing_positions' in locals() else []))
                     if blocked.get("status") == "BLOCKED":
                         order_stage_counter[str(blocked.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")] += 1
                         self._log_order_skip(cf, [str(blocked.get("reason"))], "PB1-CLOSE")
