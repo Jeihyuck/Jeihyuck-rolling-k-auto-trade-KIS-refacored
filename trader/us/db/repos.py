@@ -616,13 +616,19 @@ def mark_us_profit_capture_stage(
     existing = load_us_profit_capture_state(td, [sym]).get(sym, {})
     now_iso = datetime.now(timezone.utc).isoformat()
     status_upper = str(status or "PENDING").upper()
-    existing[f"{stg}_pending"] = status_upper == "PENDING"
-    if status_upper in {"ACK", "DONE", "FILLED", "PENDING"}:
-        # Treat PENDING as done for duplicate prevention, while preserving pending flag.
-        existing[f"{stg}_done"] = True
+    terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
+    if terminal_failure:
+        existing[f"{stg}_pending"] = False
+        existing[f"{stg}_done"] = False
+    else:
+        existing[f"{stg}_pending"] = status_upper == "PENDING"
+        if status_upper in {"ACK", "DONE", "FILLED", "PENDING"}:
+            # Treat PENDING as done for duplicate prevention, while preserving pending flag.
+            existing[f"{stg}_done"] = True
     if order_key:
         existing[f"{stg}_order_key"] = order_key
-    existing[f"{stg}_at"] = existing.get(f"{stg}_at") or now_iso
+    if not terminal_failure:
+        existing[f"{stg}_at"] = existing.get(f"{stg}_at") or now_iso
     existing["last_profit_capture_at"] = now_iso
     meta = dict(existing.get("meta") or {})
     meta.update({"last_stage": stg, "last_status": status_upper})

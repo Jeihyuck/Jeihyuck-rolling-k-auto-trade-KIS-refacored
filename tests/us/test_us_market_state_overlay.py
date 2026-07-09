@@ -141,6 +141,46 @@ def test_profit_capture_persistent_duplicate_prevention(monkeypatch):
     assert build_profit_capture_intents([{**pos, "pnl_rate": 9.0}], overlay, trade_date="2026-07-09") == []
 
 
+
+def test_profit_capture_stage_order_gap_up_starts_with_tp1(monkeypatch):
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
+    pos = {"symbol": "GAP", "qty": 100, "current_price_usd": 109, "pnl_rate": 9.0}
+    first = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
+    assert len(first) == 1
+    assert first[0]["reason"] == "TAKE_PROFIT_TP1"
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp1", status="ACK")
+    second = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
+    assert len(second) == 1
+    assert second[0]["reason"] == "TAKE_PROFIT_TP2"
+    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp2", status="ACK")
+    third = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
+    assert len(third) == 1
+    assert third[0]["reason"] == "TAKE_PROFIT_TP3"
+    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp3", status="ACK")
+    assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-10") == []
+
+
+def test_profit_capture_rejected_stage_can_retry(monkeypatch):
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
+    pos = {"symbol": "RETRY", "qty": 100, "current_price_usd": 103, "pnl_rate": 3.0}
+    repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="PENDING")
+    assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-11") == []
+    repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="REJECTED")
+    retry = build_profit_capture_intents([pos], overlay, trade_date="2026-07-11")
+    assert len(retry) == 1
+    assert retry[0]["reason"] == "TAKE_PROFIT_TP1"
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="ACK")
+    assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-11") == []
+    repos._MEM_PROFIT_CAPTURE_STATE.clear()
+    repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="DONE")
+    assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-11") == []
+
 def test_defense_trim_current_px_alias_partial_and_no_duplicate_existing_sell():
     overlay = {"market_state": "DEFENSE_RISK_OFF"}
     positions = [

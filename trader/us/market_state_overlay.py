@@ -304,7 +304,7 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             profit_capture_state = {}
     profit_capture_state = profit_capture_state or {}
     runner_min = _env_float("US_RUNNER_MIN_REMAIN_PCT", 0.40)
-    stages = [("tp3_done", _env_float("US_TP3_PCT", .08), _env_float("US_TP3_SELL_PCT", .20), "TAKE_PROFIT_TP3"), ("tp2_done", _env_float("US_TP2_PCT", .05), _env_float("US_TP2_SELL_PCT", .25), "TAKE_PROFIT_TP2"), ("tp1_done", _env_float("US_TP1_PCT", .03), _env_float("US_TP1_SELL_PCT", .25), "TAKE_PROFIT_TP1")]
+    stages = [("tp1_done", _env_float("US_TP1_PCT", .03), _env_float("US_TP1_SELL_PCT", .25), "TAKE_PROFIT_TP1"), ("tp2_done", _env_float("US_TP2_PCT", .05), _env_float("US_TP2_SELL_PCT", .25), "TAKE_PROFIT_TP2"), ("tp3_done", _env_float("US_TP3_PCT", .08), _env_float("US_TP3_SELL_PCT", .20), "TAKE_PROFIT_TP3")]
     intents=[]
     for p in positions or []:
         sym=_symbol(p); q=_qty(p); price=_price(p); meta=p.get("meta") if isinstance(p.get("meta"), dict) else p
