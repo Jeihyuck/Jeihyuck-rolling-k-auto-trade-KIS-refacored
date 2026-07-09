@@ -114,6 +114,13 @@ def build_us_prep_contract(
     errors.extend(dynamic_universe_result.get("errors", []))
     errors.extend(validation.get("errors", []))
 
+    market_state = watchlist_result.get("market_state_overlay") or watchlist_result.get("market_state") or {}
+    if not isinstance(market_state, dict):
+        market_state = {}
+    if market_state.get("market_state") == "DEFENSE_CRASH":
+        trade_can_proceed = 0
+        status = "DEFENSE_CRASH_ENTRY_BLOCKED"
+
     contract = {
         "market": "US",
         "env": env,
@@ -146,6 +153,18 @@ def build_us_prep_contract(
         "warnings": warnings,
         "errors": errors,
         "paths": paths,
+        "market_state": market_state.get("market_state", "NORMAL"),
+        "defense_regime": market_state.get("defense_regime", "NONE"),
+        "risk_on_regime": market_state.get("risk_on_regime", "NONE"),
+        "market_state_reasons": market_state.get("market_state_reasons", []),
+        "exposure_multiplier": market_state.get("exposure_multiplier", 1.0),
+        "allow_new_buy": market_state.get("allow_new_buy", True),
+        "allow_ai_tech_buy": market_state.get("allow_ai_tech_buy", False),
+        "force_entry_block": market_state.get("force_entry_block", False),
+        "profit_capture_enabled": market_state.get("profit_capture_enabled", True),
+        "trailing_stop_mode": market_state.get("trailing_stop_mode", "normal"),
+        "account_loss_kill_switch_triggered": market_state.get("account_loss_kill_switch_triggered", False),
+        "forbidden_hedge_symbols": market_state.get("forbidden_hedge_symbols", []),
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
 

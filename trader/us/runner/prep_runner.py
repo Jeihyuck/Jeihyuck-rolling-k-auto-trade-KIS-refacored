@@ -360,7 +360,24 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         finish_us_prep_run(run_id, status="ERROR", result={"stage": "final30_save", "error": str(exc)})
         return {"status": "ERROR", "stage": "final30_save", "error": str(exc)}
 
-    # ── 8. Final Status 결정 ──────────────────────────────────────────────
+    # ── 8. Market State Overlay ───────────────────────────────────────────
+    try:
+        from trader.us.market_state_overlay import evaluate_us_market_state
+        market_state_overlay = evaluate_us_market_state(
+            trade_date=trade_date,
+            provider=provider,
+            rotation_context=watchlist_result.get("rotation_context") or {},
+            prep_result={"rotation_regime": watchlist_result.get("rotation_regime"), "rotation_context": watchlist_result.get("rotation_context") or {}, "final30_cluster_counts": watchlist_result.get("final30_cluster_counts"), "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio")},
+            positions=[],
+            account_snapshot={},
+        )
+        watchlist_result["market_state_overlay"] = market_state_overlay
+        logger.info("[US_MARKET_STATE][PREP] market_state=%s exposure_multiplier=%s", market_state_overlay.get("market_state"), market_state_overlay.get("exposure_multiplier"))
+    except Exception as exc:
+        logger.warning("[US_MARKET_STATE][PREP][WARN] %s", exc)
+        market_state_overlay = {}
+
+    # ── 9. Final Status 결정 ──────────────────────────────────────────────
     du_warn = du_status == "OK_WITH_WARNINGS"
     cp_warn = cp_status == "OK_WITH_WARNINGS"
     if du_status == "ERROR" or cp_status == "ERROR":
@@ -383,6 +400,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         final_status = "FAILED_CLUSTER_CAP_CONTRACT"
     elif not final30_complete:
         final_status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
+    if (market_state_overlay or {}).get("market_state") == "DEFENSE_CRASH":
+        final_status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
     trade_can_proceed = int(
         final_status in ("OK", "OK_WITH_WARNINGS")
@@ -391,6 +410,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         and final30_complete
         and score_nonzero_count == wl_final30
         and not cap_violations
+        and not (market_state_overlay or {}).get("force_entry_block", False)
     )
 
     logger.info(

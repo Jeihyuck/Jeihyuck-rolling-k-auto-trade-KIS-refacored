@@ -258,6 +258,23 @@ def run_daily_report(
         "score_nonzero_ratio": 0.0,
         "score_contract_ok": None,
         "prep_status": None,
+        "market_state": "UNKNOWN",
+        "defense_regime": "NONE",
+        "risk_on_regime": "NONE",
+        "market_state_reasons": [],
+        "exposure_multiplier": 1.0,
+        "effective_budget_before_overlay": 0.0,
+        "effective_budget_after_overlay": 0.0,
+        "defense_entry_blocked_count": 0,
+        "defense_trim_count": 0,
+        "defense_trim_notional": 0.0,
+        "partial_take_profit_count": 0,
+        "partial_take_profit_notional": 0.0,
+        "runner_positions_count": 0,
+        "trailing_stop_mode": "normal",
+        "profit_locked_notional": 0.0,
+        "account_loss_kill_switch_triggered": False,
+        "forbidden_hedge_block_count": 0,
         "prep_trade_can_proceed": None,
         "kis_retry_count": 0,
         "warnings": [],
@@ -351,6 +368,9 @@ def run_daily_report(
                     report["rotation_regime"] = result_data.get("rotation_regime") or result_data.get("rotation_context", {}).get("rotation_regime") or report.get("rotation_regime")
                     report["portfolio_cluster_weights"] = result_data.get("portfolio_cluster_weights") or report.get("portfolio_cluster_weights")
                     report["cap_violations"] = result_data.get("cap_violations") or report.get("cap_violations")
+                    for key in ("market_state", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
+                        if key in result_data:
+                            report[key] = result_data.get(key)
             except Exception as exc:
                 report["warnings"].append(f"prep_status_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] prep status load failed: %s", exc)
@@ -368,6 +388,17 @@ def run_daily_report(
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
+                        if "FORBIDDEN_HEDGE_OR_INVERSE_ETF" in reason:
+                            report["forbidden_hedge_block_count"] += 1
+                        if "DEFENSE_" in reason and "ENTRY" in reason:
+                            report["defense_entry_blocked_count"] += 1
+                        if "DEFENSE_" in reason and "TRIM" in reason:
+                            report["defense_trim_count"] += 1
+                            report["defense_trim_notional"] += float(order.get("notional_usd") or order.get("notional") or 0)
+                        if "TAKE_PROFIT_TP" in reason:
+                            report["partial_take_profit_count"] += 1
+                            report["partial_take_profit_notional"] += float(order.get("notional_usd") or order.get("notional") or 0)
+                            report["profit_locked_notional"] += float(order.get("notional_usd") or order.get("notional") or 0)
                         if status in {"SUBMITTED", "SENT"}:
                             report["orders_submitted_total"] += 1
                             report["orders_submitted"] += 1
@@ -620,6 +651,19 @@ def run_daily_report(
         "| Metric | Value |",
         "|---|---|",
         f"| report_status | {report.get('status')} |",
+        f"| market_state | {report.get('market_state')} |",
+        f"| defense_regime | {report.get('defense_regime')} |",
+        f"| risk_on_regime | {report.get('risk_on_regime')} |",
+        f"| market_state_reasons | {report.get('market_state_reasons')} |",
+        f"| exposure_multiplier | {report.get('exposure_multiplier')} |",
+        f"| effective_budget_before_overlay | {report.get('effective_budget_before_overlay')} |",
+        f"| effective_budget_after_overlay | {report.get('effective_budget_after_overlay')} |",
+        f"| 신규매수 허용/차단 | {report.get('market_state')} / blocked={report.get('defense_entry_blocked_count')} |",
+        f"| 방어 trim | count={report.get('defense_trim_count')} notional={report.get('defense_trim_notional')} |",
+        f"| 부분익절 | count={report.get('partial_take_profit_count')} notional={report.get('partial_take_profit_notional')} |",
+        f"| trailing_stop_mode | {report.get('trailing_stop_mode')} |",
+        f"| account_loss_kill_switch_triggered | {report.get('account_loss_kill_switch_triggered')} |",
+        f"| forbidden_hedge_block_count | {report.get('forbidden_hedge_block_count')} |",
         f"| report_consistency | {report.get('report_consistency')} |",
         f"| canonical_order_source | {(report.get('canonical_sources') or {}).get('canonical_order_source', '')} |",
         f"| canonical_position_source | {(report.get('canonical_sources') or {}).get('canonical_position_source', '')} |",

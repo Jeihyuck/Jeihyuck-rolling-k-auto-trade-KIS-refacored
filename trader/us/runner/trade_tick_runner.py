@@ -824,6 +824,46 @@ def run_trade_tick(
         logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
 
+    market_state_overlay = {"market_state": "NORMAL", "exposure_multiplier": 1.0, "allow_new_buy": True, "allow_add_to_existing": allow_add_to_existing, "force_entry_block": False, "trailing_stop_mode": "normal"}
+    prep_result_for_overlay = {}
+    try:
+        from trader.us.db.repos import load_latest_us_prep_status as _load_prep_for_overlay
+        _prep_overlay_info = _load_prep_for_overlay(trade_date) or {}
+        prep_result_for_overlay = _prep_overlay_info.get("result") if isinstance(_prep_overlay_info.get("result"), dict) else _prep_overlay_info
+        from trader.us.market_state_overlay import evaluate_us_market_state, build_profit_capture_intents
+        account_snapshot = {
+            "portfolio_equity_usd": portfolio_equity_usd,
+            "invested_market_value_usd": invested_market_value_usd,
+            "cash_usd": available_cash_usd,
+            "gross_exposure_pct": deployment_metrics.get("gross_exposure_pct"),
+            "account_intraday_pnl_pct": os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT"),
+            "account_5d_pnl_pct": os.getenv("US_ACCOUNT_5D_PNL_PCT"),
+        }
+        market_state_overlay = evaluate_us_market_state(
+            trade_date=trade_date,
+            provider=provider,
+            rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
+            prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
+            positions=current_positions,
+            account_snapshot=account_snapshot,
+            now=now,
+        )
+        existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
+        profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now)
+        if profit_capture_intents:
+            exit_intents.extend(profit_capture_intents)
+    except Exception as _market_state_exc:
+        logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
+    effective_budget_before_overlay = effective_budget
+    exposure_multiplier = float(market_state_overlay.get("exposure_multiplier") or 1.0)
+    effective_budget_after_overlay = effective_budget_before_overlay * exposure_multiplier
+    if market_state_overlay.get("force_entry_block"):
+        effective_budget_after_overlay = 0.0
+    effective_budget = effective_budget_after_overlay
+    allow_new_symbols = bool(allow_new_symbols and market_state_overlay.get("allow_new_buy", True))
+    allow_add_to_existing = bool(allow_add_to_existing and market_state_overlay.get("allow_add_to_existing", True))
+    logger.info("[US_MARKET_STATE][BUDGET] effective_budget_before_overlay=%.2f exposure_multiplier=%.2f effective_budget_after_overlay=%.2f", effective_budget_before_overlay, exposure_multiplier, effective_budget_after_overlay)
+
     cluster_guard_result = {"portfolio_cluster_guard_status": "NOT_EVALUATED", "portfolio_ai_tech_weight": 0.0, "portfolio_cluster_cap_violations": [], "cluster_guard_trim_intents": [], "cluster_guard_trim_notional": 0.0}
     try:
         from trader.us.db.repos import load_latest_us_prep_status
@@ -835,6 +875,14 @@ def run_trade_tick(
         cluster_guard_result = evaluate_portfolio_cluster_guard(current_positions, _rotation_regime, portfolio_equity_usd, exit_intents, provider, now)
         if cluster_guard_result.get("cluster_guard_trim_intents"):
             exit_intents.extend(cluster_guard_result.get("cluster_guard_trim_intents") or [])
+        try:
+            from trader.us.market_state_overlay import build_defense_trim_intents
+            existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
+            defense_trim_intents = build_defense_trim_intents(current_positions, market_state_overlay, existing_sell_symbols)
+            if defense_trim_intents:
+                exit_intents.extend(defense_trim_intents)
+        except Exception as _def_trim_exc:
+            logger.warning("[US_DEFENSE][TRIM][WARN] error=%s", _def_trim_exc)
     except Exception as _cluster_guard_exc:
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
 
@@ -992,12 +1040,33 @@ def run_trade_tick(
             "[US_ENTRY][PREP_STATUS] date=%s status=%s",
             trade_date, prep_status
         )
+        prep_result = prep_status_info.get("result") if isinstance(prep_status_info, dict) and isinstance(prep_status_info.get("result"), dict) else {}
+        if not prep_result and isinstance(prep_status_info, dict):
+            prep_result = prep_status_info
+        entry_allowed_by_prep_contract = (
+            prep_status in ("OK", "OK_WITH_WARNINGS")
+            and bool(prep_result.get("trade_can_proceed"))
+            and bool(prep_result.get("cluster_contract_ok"))
+            and bool(prep_result.get("final30_complete"))
+            and not list(prep_result.get("cap_violations") or [])
+        )
+        rotation_regime = (
+            prep_result.get("rotation_regime")
+            or (prep_result.get("rotation_context") or {}).get("rotation_regime")
+            or (prep_status_info or {}).get("rotation_regime")
+            or "UNKNOWN"
+        )
+        if not entry_allowed_by_prep_contract:
+            if real_order_mode:
+                entry_degraded = True
+                entry_degraded_reason = "prep_contract_trade_block"
+            logger.warning("[US_ENTRY][BLOCK] reason=prep_contract_trade_block status=%s rotation_regime=%s", prep_status, rotation_regime)
         
         # DEGRADED/ERROR 상태이면 new entry 차단
-        if prep_status in ("DEGRADED", "ERROR"):
+        if prep_status in ("DEGRADED", "ERROR") or not entry_allowed_by_prep_contract or market_state_overlay.get("force_entry_block"):
             logger.warning(
-                "[US_ENTRY][BLOCK] reason=prep_degraded_or_error status=%s",
-                prep_status
+                "[US_ENTRY][BLOCK] reason=%s status=%s",
+                "prep_contract_trade_block" if not entry_allowed_by_prep_contract else ("market_state_entry_block" if market_state_overlay.get("force_entry_block") else "prep_degraded_or_error"), prep_status
             )
         else:
             # locked watchlist 로드
@@ -1252,6 +1321,8 @@ def run_trade_tick(
     try:
         from trader.us.portfolio_cluster_guard import filter_entry_intents_for_cluster_guard
         entry_intents, cluster_guard_blocked_buys = filter_entry_intents_for_cluster_guard(entry_intents, cluster_guard_result)
+        from trader.us.market_state_overlay import filter_entry_intents_for_market_state
+        entry_intents, market_state_blocked_buys = filter_entry_intents_for_market_state(entry_intents, market_state_overlay, current_positions)
     except Exception as _cluster_guard_filter_exc:
         logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
         cluster_guard_blocked_buys = []
@@ -1683,6 +1754,11 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
+        "prep_contract_trade_block": bool(entry_degraded_reason == "prep_contract_trade_block"),
+        "market_state": market_state_overlay.get("market_state") if 'market_state_overlay' in locals() else "NORMAL",
+        "exposure_multiplier": exposure_multiplier if 'exposure_multiplier' in locals() else 1.0,
+        "effective_budget_before_overlay": effective_budget_before_overlay if 'effective_budget_before_overlay' in locals() else effective_budget,
+        "effective_budget_after_overlay": effective_budget_after_overlay if 'effective_budget_after_overlay' in locals() else effective_budget,
         "routing_intents_total": routing_intents_total if 'routing_intents_total' in locals() else (exit_intents_count + entry_intents_count),
         "budget": budget,
         "run_mode": run_mode,
