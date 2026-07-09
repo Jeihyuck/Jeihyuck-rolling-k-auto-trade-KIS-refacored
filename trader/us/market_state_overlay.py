@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from trader.us.rotation import AI_CLUSTERS, theme_cluster_for
@@ -55,39 +55,81 @@ def _qty(pos: dict) -> int:
         return 0
 
 
+def _num(v: Any) -> float | None:
+    if v in (None, ""):
+        return None
+    try:
+        x = float(str(v).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    return x
+
+
 def _price(pos: dict) -> float:
-    for k in ("last_price", "current_price", "price", "close"):
-        try:
-            v = float(pos.get(k) or 0)
-            if v > 0:
-                return v
-        except (TypeError, ValueError):
-            pass
+    for k in (
+        "last_price", "current_price", "current_price_usd", "current_px",
+        "price", "close", "now_pric2", "ovrs_now_pric", "bass_pric",
+        "avg_current_price",
+    ):
+        v = _num(pos.get(k))
+        if v is not None and v > 0:
+            return v
     return 0.0
+
+
+def _entry_price(pos: dict) -> float:
+    for k in ("entry_price", "avg_price_usd", "avg_cost", "avg_price"):
+        v = _num(pos.get(k))
+        if v is not None and v > 0:
+            return v
+    return 0.0
+
+
+def _pnl_pct(pos: dict) -> float | None:
+    for k in ("unrealized_pnl_pct", "pnl_pct", "profit_pct", "pnl_rate", "evlu_pfls_rt", "prls_rt"):
+        v = _pct(pos.get(k))
+        if v is not None:
+            return v
+    current = _price(pos)
+    entry = _entry_price(pos)
+    if current > 0 and entry > 0:
+        return current / entry - 1.0
+    return None
+
+def _row_date_value(row: dict) -> str:
+    for key in ("xymd", "date", "stck_bsop_date", "bas_dt", "trad_dvsn"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _row_close_value(row: dict) -> float | None:
+    for key in ("close", "clos", "stck_clpr", "last", "price", "ovrs_nmix_prpr", "prpr"):
+        v = _num(row.get(key))
+        if v is not None and v > 0:
+            return v
+    return None
 
 
 def _ret_from_rows(rows: Any, days: int) -> float | None:
     if not isinstance(rows, list) or len(rows) < days + 1:
         return None
+    clean_rows = [r for r in rows if isinstance(r, dict)]
+    if not clean_rows or len(clean_rows) < days + 1:
+        return None
+    if any(_row_date_value(r) for r in clean_rows):
+        clean_rows = sorted(clean_rows, key=lambda r: _row_date_value(r) or "00000000")
     vals: list[float] = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        for k in ("close", "stck_clpr", "last", "price"):
-            try:
-                v = float(str(r.get(k) or "").replace(",", ""))
-                if v > 0:
-                    vals.append(v); break
-            except (TypeError, ValueError):
-                continue
-        if len(vals) >= days + 1:
-            break
+    for row in clean_rows:
+        close = _row_close_value(row)
+        if close is not None:
+            vals.append(close)
     if len(vals) < days + 1:
         return None
-    # providers usually return newest first; if oldest first this is still sane for flat tests when rows are explicit.
-    newest, past = vals[0], vals[days]
-    return (newest / past) - 1.0 if past else None
-
+    latest = vals[-1]
+    past = vals[-1 - days]
+    return (latest / past) - 1.0 if past else None
 
 def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict[str, float | None]:
     out: dict[str, float | None] = {}
@@ -240,31 +282,52 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
 
 def is_strong_holding(pos: dict, row: dict | None = None) -> bool:
     row = row or {}
-    unreal = _pct(pos.get("unrealized_pnl_pct") or pos.get("pnl_pct") or pos.get("profit_pct"))
+    unreal = _pnl_pct(pos)
     day = _pct(pos.get("day_pnl_pct") or pos.get("pnl_1d_pct") or pos.get("day_pnl"))
-    price, entry = _price(pos), float(pos.get("entry_price") or pos.get("avg_price") or 0)
+    price, entry = _price(pos), _entry_price(pos)
     rank = int(row.get("rank_final30") or 99)
     score = float(row.get("score_final") or row.get("score") or 0)
     trend = float(row.get("trend_score") or 0)
     return (unreal is None or unreal > 0) and (day is None or day > -0.01) and (entry <= 0 or price > entry) and rank <= 10 and score >= 0.6 and trend >= 0
 
 
-def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None) -> list[dict]:
+def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None) -> list[dict]:
     if not overlay.get("profit_capture_enabled", True): return []
     existing_sell_symbols = existing_sell_symbols or set()
+    if profit_capture_state is None and trade_date:
+        try:
+            from trader.us.db.repos import load_us_profit_capture_state
+            symbols = [_symbol(p) for p in positions or [] if _symbol(p)]
+            profit_capture_state = load_us_profit_capture_state(trade_date, symbols)
+        except Exception as exc:
+            logger.warning("[US_PROFIT_CAPTURE][STATE_LOAD_WARN] trade_date=%s err=%s", trade_date, exc)
+            profit_capture_state = {}
+    profit_capture_state = profit_capture_state or {}
     runner_min = _env_float("US_RUNNER_MIN_REMAIN_PCT", 0.40)
     stages = [("tp3_done", _env_float("US_TP3_PCT", .08), _env_float("US_TP3_SELL_PCT", .20), "TAKE_PROFIT_TP3"), ("tp2_done", _env_float("US_TP2_PCT", .05), _env_float("US_TP2_SELL_PCT", .25), "TAKE_PROFIT_TP2"), ("tp1_done", _env_float("US_TP1_PCT", .03), _env_float("US_TP1_SELL_PCT", .25), "TAKE_PROFIT_TP1")]
     intents=[]
     for p in positions or []:
         sym=_symbol(p); q=_qty(p); price=_price(p); meta=p.get("meta") if isinstance(p.get("meta"), dict) else p
         if not sym or sym in existing_sell_symbols or q<=1 or price<=0: continue
-        pnl=_pct(p.get("unrealized_pnl_pct") or p.get("pnl_pct") or p.get("profit_pct"))
+        state = dict(profit_capture_state.get(sym) or profit_capture_state.get(sym.upper()) or {})
+        meta_state = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+        pnl=_pnl_pct(p)
         if pnl is None: continue
         for flag, thresh, sell_pct, reason in stages:
-            if pnl >= thresh and not bool(meta.get(flag)):
+            pending_flag = flag.replace("_done", "_pending")
+            if pnl >= thresh and not bool(meta.get(flag)) and not bool(meta_state.get(flag)) and not bool(state.get(flag)) and not bool(state.get(pending_flag)):
                 max_sell=max(0, q-int(q*runner_min)); qty=min(max_sell, max(1, int(q*sell_pct)))
                 if qty>0:
-                    intents.append({"symbol":sym,"side":"SELL","qty":qty,"quantity":qty,"limit_price":price,"notional_usd":qty*price,"reason":reason,"meta":{"reason":reason,flag:True,"runner_remaining_pct":(q-qty)/q,"market_state":overlay.get("market_state"),"last_profit_capture_at":(now or datetime.utcnow()).isoformat()}})
+                    order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{reason}"
+                    intents.append({"symbol":sym,"side":"SELL","qty":qty,"quantity":qty,"limit_price":price,"notional_usd":qty*price,"reason":reason,"client_order_key":order_key,"meta":{"reason":reason,"profit_capture_stage":flag.replace("_done", ""),flag:True,"runner_remaining_pct":(q-qty)/q,"market_state":overlay.get("market_state"),"last_profit_capture_at":(now or datetime.now(timezone.utc)).isoformat()}})
+                    if trade_date:
+                        try:
+                            from trader.us.db.repos import mark_us_profit_capture_stage
+                            mark_us_profit_capture_stage(trade_date, sym, flag.replace("_done", ""), order_key=order_key, qty=qty, notional_usd=qty*price, status="PENDING")
+                            state[pending_flag] = True
+                            profit_capture_state[sym] = state
+                        except Exception as exc:
+                            logger.warning("[US_PROFIT_CAPTURE][STATE_MARK_WARN] symbol=%s stage=%s err=%s", sym, flag, exc)
                     logger.info("[US_PROFIT_CAPTURE][%s] symbol=%s qty=%d pnl=%.4f runner_remaining_pct=%.4f", reason[-3:], sym, qty, pnl, (q-qty)/q)
                 break
     return intents
@@ -281,7 +344,7 @@ def build_defense_trim_intents(positions: list[dict], overlay: dict, existing_se
         cluster=theme_cluster_for(sym,p)
         if state=="DEFENSE_RISK_OFF" and cluster not in AI_TECH_CLUSTERS: continue
         candidates.append(p)
-    candidates.sort(key=lambda p: (_pct(p.get("unrealized_pnl_pct") or p.get("pnl_pct")) or 0, _pct(p.get("day_pnl_pct") or p.get("day_pnl")) or 0))
+    candidates.sort(key=lambda p: (_pnl_pct(p) or 0, _pct(p.get("day_pnl_pct") or p.get("day_pnl")) or 0))
     intents=[]
     for p in candidates[:maxn]:
         q=_qty(p); price=_price(p); sym=_symbol(p)

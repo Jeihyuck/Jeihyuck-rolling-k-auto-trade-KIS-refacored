@@ -42,6 +42,7 @@ _MEM_FILLS: list[dict] = []
 _MEM_POSITIONS: list[dict] = []
 _MEM_RECONCILE_LOGS: list[dict] = []
 _MEM_RISK_STATE: dict[tuple[str, str], dict] = {}
+_MEM_PROFIT_CAPTURE_STATE: dict[tuple[str, str], dict] = {}
 
 
 def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
@@ -548,6 +549,95 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
         logger.warning("[US_RISK_STATE][SAVE_WARN] symbol=%s trade_date=%s err=%s", key[1], trade_date, exc)
         _MEM_RISK_STATE[key] = normalized
 
+
+
+
+def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | None) -> dict:
+    raw = dict(state or {})
+    meta = dict(raw.get("meta") or {})
+    out = {
+        "trade_date": str(trade_date),
+        "symbol": str(symbol or "").strip().upper(),
+        "tp1_done": bool(raw.get("tp1_done") or raw.get("tp1_pending") or meta.get("tp1_done") or meta.get("tp1_pending")),
+        "tp2_done": bool(raw.get("tp2_done") or raw.get("tp2_pending") or meta.get("tp2_done") or meta.get("tp2_pending")),
+        "tp3_done": bool(raw.get("tp3_done") or raw.get("tp3_pending") or meta.get("tp3_done") or meta.get("tp3_pending")),
+        "tp1_pending": bool(raw.get("tp1_pending") or meta.get("tp1_pending")),
+        "tp2_pending": bool(raw.get("tp2_pending") or meta.get("tp2_pending")),
+        "tp3_pending": bool(raw.get("tp3_pending") or meta.get("tp3_pending")),
+        "tp1_order_key": raw.get("tp1_order_key") or meta.get("tp1_order_key"),
+        "tp2_order_key": raw.get("tp2_order_key") or meta.get("tp2_order_key"),
+        "tp3_order_key": raw.get("tp3_order_key") or meta.get("tp3_order_key"),
+        "tp1_at": raw.get("tp1_at") or meta.get("tp1_at"),
+        "tp2_at": raw.get("tp2_at") or meta.get("tp2_at"),
+        "tp3_at": raw.get("tp3_at") or meta.get("tp3_at"),
+        "last_profit_capture_at": raw.get("last_profit_capture_at") or meta.get("last_profit_capture_at"),
+        "meta": meta,
+    }
+    return out
+
+
+def load_us_profit_capture_state(trade_date: str, symbols: list[str]) -> dict[str, dict]:
+    """Load TP1/TP2/TP3 state for same-day duplicate prevention.
+
+    Uses us_position_risk_state.state.profit_capture when DB is available and an
+    in-memory fallback when DB is unavailable, so tests/offline ticks remain
+    idempotent.
+    """
+    out: dict[str, dict] = {}
+    for symbol in symbols or []:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            continue
+        mem = _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym))
+        risk = load_us_position_risk_state(sym, trade_date)
+        nested = (risk.get("state") or {}).get("profit_capture") if isinstance(risk.get("state"), dict) else None
+        state = nested or mem or {}
+        out[sym] = _normalize_profit_capture_state(trade_date, sym, state)
+    return out
+
+
+def mark_us_profit_capture_stage(
+    trade_date: str,
+    symbol: str,
+    stage: str,
+    order_key: str | None = None,
+    qty: int | None = None,
+    notional_usd: float | None = None,
+    status: str = "PENDING",
+) -> None:
+    """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
+    sym = str(symbol or "").strip().upper()
+    td = str(trade_date)
+    if not sym:
+        return
+    stg = str(stage or "").lower().replace("_done", "")
+    if stg not in {"tp1", "tp2", "tp3"}:
+        return
+    existing = load_us_profit_capture_state(td, [sym]).get(sym, {})
+    now_iso = datetime.now(timezone.utc).isoformat()
+    status_upper = str(status or "PENDING").upper()
+    existing[f"{stg}_pending"] = status_upper == "PENDING"
+    if status_upper in {"ACK", "DONE", "FILLED", "PENDING"}:
+        # Treat PENDING as done for duplicate prevention, while preserving pending flag.
+        existing[f"{stg}_done"] = True
+    if order_key:
+        existing[f"{stg}_order_key"] = order_key
+    existing[f"{stg}_at"] = existing.get(f"{stg}_at") or now_iso
+    existing["last_profit_capture_at"] = now_iso
+    meta = dict(existing.get("meta") or {})
+    meta.update({"last_stage": stg, "last_status": status_upper})
+    if qty is not None:
+        meta[f"{stg}_qty"] = int(qty)
+    if notional_usd is not None:
+        meta[f"{stg}_notional_usd"] = float(notional_usd)
+    existing["meta"] = meta
+    normalized = _normalize_profit_capture_state(td, sym, existing)
+    _MEM_PROFIT_CAPTURE_STATE[(td, sym)] = normalized
+    risk = load_us_position_risk_state(sym, td)
+    risk_state = dict(risk.get("state") or {}) if isinstance(risk, dict) else {}
+    risk_state["profit_capture"] = normalized
+    risk["state"] = risk_state
+    save_us_position_risk_state(sym, td, risk)
 
 def update_us_soft_stop_risk_state(
     *,

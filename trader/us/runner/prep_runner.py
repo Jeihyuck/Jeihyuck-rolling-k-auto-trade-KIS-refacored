@@ -375,7 +375,29 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         logger.info("[US_MARKET_STATE][PREP] market_state=%s exposure_multiplier=%s", market_state_overlay.get("market_state"), market_state_overlay.get("exposure_multiplier"))
     except Exception as exc:
         logger.warning("[US_MARKET_STATE][PREP][WARN] %s", exc)
-        market_state_overlay = {}
+        market_state_overlay = {"market_state": "NORMAL", "defense_regime": "NONE", "risk_on_regime": "NONE", "market_state_reasons": ["MARKET_STATE_OVERLAY_EVAL_FAILED"], "exposure_multiplier": 1.0, "allow_new_buy": True, "allow_add_to_existing": False, "allow_ai_tech_buy": False, "allow_defensive_buy": True, "force_entry_block": False, "trim_required": False, "profit_capture_enabled": True, "trailing_stop_mode": "normal", "trailing_stop_pct": 0.02, "account_loss_kill_switch_triggered": False, "account_loss_kill_switch_level": "NONE", "data_quality": "degraded", "data_quality_warnings": [str(exc)], "forbidden_hedge_symbols": []}
+
+    market_state_fields = {
+        "market_state": (market_state_overlay or {}).get("market_state", "NORMAL"),
+        "defense_regime": (market_state_overlay or {}).get("defense_regime", "NONE"),
+        "risk_on_regime": (market_state_overlay or {}).get("risk_on_regime", "NONE"),
+        "market_state_reasons": (market_state_overlay or {}).get("market_state_reasons", []),
+        "exposure_multiplier": (market_state_overlay or {}).get("exposure_multiplier", 1.0),
+        "allow_new_buy": (market_state_overlay or {}).get("allow_new_buy", True),
+        "allow_add_to_existing": (market_state_overlay or {}).get("allow_add_to_existing", False),
+        "allow_ai_tech_buy": (market_state_overlay or {}).get("allow_ai_tech_buy", False),
+        "allow_defensive_buy": (market_state_overlay or {}).get("allow_defensive_buy", True),
+        "force_entry_block": (market_state_overlay or {}).get("force_entry_block", False),
+        "trim_required": (market_state_overlay or {}).get("trim_required", False),
+        "profit_capture_enabled": (market_state_overlay or {}).get("profit_capture_enabled", True),
+        "trailing_stop_mode": (market_state_overlay or {}).get("trailing_stop_mode", "normal"),
+        "trailing_stop_pct": (market_state_overlay or {}).get("trailing_stop_pct", 0.02),
+        "account_loss_kill_switch_triggered": (market_state_overlay or {}).get("account_loss_kill_switch_triggered", False),
+        "account_loss_kill_switch_level": (market_state_overlay or {}).get("account_loss_kill_switch_level", "NONE"),
+        "data_quality": (market_state_overlay or {}).get("data_quality", "ok"),
+        "data_quality_warnings": (market_state_overlay or {}).get("data_quality_warnings", []),
+        "forbidden_hedge_symbols": (market_state_overlay or {}).get("forbidden_hedge_symbols", []),
+    }
 
     # ── 9. Final Status 결정 ──────────────────────────────────────────────
     du_warn = du_status == "OK_WITH_WARNINGS"
@@ -507,6 +529,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
         "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
         "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
+        **market_state_fields,
     }
     finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
 
@@ -558,6 +581,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
             "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
             "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
+            **market_state_fields,
         }
         _save_json_file(_status_file, prep_status_payload)
         logger.info(
@@ -591,6 +615,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
         "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
         "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
+        **market_state_fields,
     }
 
 

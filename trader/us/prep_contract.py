@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -165,7 +165,7 @@ def build_us_prep_contract(
         "trailing_stop_mode": market_state.get("trailing_stop_mode", "normal"),
         "account_loss_kill_switch_triggered": market_state.get("account_loss_kill_switch_triggered", False),
         "forbidden_hedge_symbols": market_state.get("forbidden_hedge_symbols", []),
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
     return contract

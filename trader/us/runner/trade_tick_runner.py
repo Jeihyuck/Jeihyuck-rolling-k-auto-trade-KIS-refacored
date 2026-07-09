@@ -849,7 +849,7 @@ def run_trade_tick(
             now=now,
         )
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
-        profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now)
+        profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
         if profit_capture_intents:
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
@@ -869,8 +869,20 @@ def run_trade_tick(
         from trader.us.db.repos import load_latest_us_prep_status
         from trader.us.portfolio_cluster_guard import evaluate_portfolio_cluster_guard
         _prep_for_cluster = load_latest_us_prep_status(trade_date) or {}
-        _rotation_regime = str(_prep_for_cluster.get("rotation_regime") or (_prep_for_cluster.get("rotation_context") or {}).get("rotation_regime") or "UNKNOWN")
-        if (_prep_for_cluster.get("rotation_context") or {}).get("rotation_context_suspect"):
+        _prep_cluster_result = _prep_for_cluster.get("result") if isinstance(_prep_for_cluster.get("result"), dict) else {}
+        _rotation_context = (
+            _prep_cluster_result.get("rotation_context")
+            or _prep_for_cluster.get("rotation_context")
+            or {}
+        )
+        _rotation_regime = str(
+            _prep_cluster_result.get("rotation_regime")
+            or (_prep_cluster_result.get("rotation_context") or {}).get("rotation_regime")
+            or _prep_for_cluster.get("rotation_regime")
+            or (_prep_for_cluster.get("rotation_context") or {}).get("rotation_regime")
+            or "UNKNOWN"
+        )
+        if _rotation_context.get("rotation_context_suspect"):
             _rotation_regime = "UNKNOWN"
         cluster_guard_result = evaluate_portfolio_cluster_guard(current_positions, _rotation_regime, portfolio_equity_usd, exit_intents, provider, now)
         if cluster_guard_result.get("cluster_guard_trim_intents"):
@@ -1408,6 +1420,20 @@ def run_trade_tick(
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):
+                if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("profit_capture_stage") or ""):
+                    try:
+                        from trader.us.db.repos import mark_us_profit_capture_stage
+                        mark_us_profit_capture_stage(
+                            trade_date,
+                            str(intent.get("symbol") or ""),
+                            str((intent.get("meta") or {}).get("profit_capture_stage")),
+                            order_key=str(intent.get("client_order_key") or intent.get("order_key") or "") or None,
+                            qty=int(intent.get("qty") or intent.get("quantity") or 0),
+                            notional_usd=float(intent.get("notional_usd") or 0.0),
+                            status="ACK" if result["status"] == "ACK" else "PENDING",
+                        )
+                    except Exception as _pc_ack_exc:
+                        logger.warning("[US_PROFIT_CAPTURE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _pc_ack_exc)
                 if str(intent.get("side", "")).upper() == "BUY":
                     buy_daily_notional += float(intent.get("notional_usd", 0) or 0)
                 if str(intent.get("side", "")).upper() == "BUY":
