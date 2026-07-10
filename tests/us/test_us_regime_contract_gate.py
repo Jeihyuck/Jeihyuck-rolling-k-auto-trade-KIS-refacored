@@ -65,6 +65,7 @@ def test_risk_off_is_not_prep_error():
     assert contract["contract_version"] == "us_sector_rotation_v3"
     assert contract["market_regime_version"] == "us_leading_regime_v1"
 
+
 def test_exchange_alias_nasd_does_not_break_rotation_context():
     from trader.us.symbols import get_quote_exchange_code
     from trader.us.watchlist_builder import _build_rotation_context
@@ -169,3 +170,28 @@ def test_degraded_benchmark_with_mild_weakness_not_crash():
     )
     assert result["market_state"] != "DEFENSE_CRASH"
     assert "DEGRADED_BENCHMARK_WITH_WEAK_INDEX" not in result["market_state_reasons"]
+
+
+def test_market_state_uses_etf_exchange_map_for_breadth_and_sector_etfs():
+    from trader.us.market_state_overlay import _market_returns
+
+    calls = []
+
+    class Provider:
+        def get_daily_prices(self, symbol, exchange="NYSE", as_of_date=None):
+            calls.append((symbol, exchange))
+            return [{"date": f"202607{day:02d}", "close": 100.0 + day} for day in range(1, 25)]
+
+    warnings = []
+    result = _market_returns(Provider(), "2026-07-10", warnings)
+    call_map = dict(calls)
+
+    for symbol in ("SPY", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"):
+        assert call_map[symbol] == "AMEX"
+    for symbol in ("QQQ", "SMH"):
+        assert call_map[symbol] == "NASDAQ"
+
+    assert result["rsp_20d_return"] is not None
+    assert result["iwm_20d_return"] is not None
+    assert result["xlk_20d_return"] is not None
+    assert not [w for w in warnings if w.startswith("market_return_missing:")]
