@@ -98,7 +98,7 @@ def merge_reason_counts(dst: dict | None, src: dict | None) -> dict[str, int]:
 def _apply_regime_session_summary(report: dict, session_summary: dict | None) -> dict:
     if not isinstance(session_summary, dict):
         return report
-    for key in ("market_regime", "capital_scale", "sector_cap_enforced", "trade_block_reason"):
+    for key in ("market_regime", "capital_scale", "effective_capital_scale", "effective_max_new_positions", "underfilled_tier", "sector_cap_enforced", "trade_block_reason"):
         if key in session_summary and session_summary.get(key) not in (None, "", {}):
             report[key] = session_summary.get(key)
     if session_summary.get("blocked_entry_reason_counts"):
@@ -341,6 +341,13 @@ def run_daily_report(
         "cap_violations": [],
         "market_regime": "NEUTRAL",
         "capital_scale": 1.0,
+        "effective_capital_scale": None,
+        "effective_max_new_positions": None,
+        "final30_complete": None,
+        "final30_trade_ready": None,
+        "underfilled_final30": None,
+        "underfilled_tier": None,
+        "underfilled_capital_haircut": None,
         "blocked_entry_reason_counts": {},
         "trade_block_reason": "ok",
         "sector_cap_enforced": False,
@@ -409,7 +416,7 @@ def run_daily_report(
                     report["rotation_regime"] = result_data.get("rotation_regime") or result_data.get("rotation_context", {}).get("rotation_regime") or report.get("rotation_regime")
                     report["portfolio_cluster_weights"] = result_data.get("portfolio_cluster_weights") or report.get("portfolio_cluster_weights")
                     report["cap_violations"] = result_data.get("cap_violations") or report.get("cap_violations")
-                    for key in ("market_state", "market_regime", "capital_scale", "sector_cap_enforced", "trade_block_reason", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
+                    for key in ("market_state", "market_regime", "capital_scale", "effective_capital_scale", "effective_max_new_positions", "final30_complete", "final30_trade_ready", "underfilled_final30", "underfilled_tier", "underfilled_capital_haircut", "sector_cap_enforced", "trade_block_reason", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
                         if key in result_data:
                             report[key] = result_data.get(key)
             except Exception as exc:
@@ -769,6 +776,13 @@ def run_daily_report(
         f"| rotation_regime | {report.get('rotation_regime', 'UNKNOWN')} |",
         f"| market_regime | {report.get('market_regime', 'NEUTRAL')} |",
         f"| capital_scale | {report.get('capital_scale', 1.0)} |",
+        f"| effective_capital_scale | {report.get('effective_capital_scale')} |",
+        f"| effective_max_new_positions | {report.get('effective_max_new_positions')} |",
+        f"| final30_complete | {report.get('final30_complete')} |",
+        f"| final30_trade_ready | {report.get('final30_trade_ready')} |",
+        f"| underfilled_final30 | {report.get('underfilled_final30')} |",
+        f"| underfilled_tier | {report.get('underfilled_tier')} |",
+        f"| underfilled_capital_haircut | {report.get('underfilled_capital_haircut')} |",
         f"| sector_cap_enforced | {report.get('sector_cap_enforced', False)} |",
         f"| blocked_entry_reason_counts | {report.get('blocked_entry_reason_counts', {})} |",
         f"| trade_block_reason | {report.get('trade_block_reason', 'ok')} |",

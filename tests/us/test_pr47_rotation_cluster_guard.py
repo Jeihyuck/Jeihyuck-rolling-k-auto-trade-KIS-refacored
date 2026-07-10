@@ -86,7 +86,9 @@ def test_incomplete_final30_never_trade_can_proceed_even_when_cap_clean():
     assert contract["cluster_contract_ok"] is True
     assert contract["cap_violations"] == []
     assert contract["status"] == "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
-    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "ok"
+    assert contract["underfilled_tier"] == "degraded_underfilled"
 
 
 def test_sector_cap_enforced_neutral_removes_ai_overweight():

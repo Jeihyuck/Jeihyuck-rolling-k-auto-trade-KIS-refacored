@@ -933,14 +933,17 @@ def run_trade_tick(
     except Exception as _market_state_exc:
         logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
     effective_budget_before_overlay = effective_budget
-    exposure_multiplier = float(market_state_overlay.get("capital_scale", market_state_overlay.get("exposure_multiplier") or 1.0) or 0.0)
+    exposure_multiplier = float(market_state_overlay.get(
+        "effective_capital_scale",
+        market_state_overlay.get("capital_scale", market_state_overlay.get("exposure_multiplier") or 1.0),
+    ) or 0.0)
     effective_budget_after_overlay = effective_budget_before_overlay * exposure_multiplier
     if market_state_overlay.get("force_entry_block"):
         effective_budget_after_overlay = 0.0
     effective_budget = effective_budget_after_overlay
     allow_new_symbols = bool(allow_new_symbols and market_state_overlay.get("allow_new_buy", True))
     allow_add_to_existing = bool(allow_add_to_existing and market_state_overlay.get("allow_add_to_existing", True))
-    logger.info("[US_MARKET_STATE][BUDGET] effective_budget_before_overlay=%.2f exposure_multiplier=%.2f effective_budget_after_overlay=%.2f", effective_budget_before_overlay, exposure_multiplier, effective_budget_after_overlay)
+    logger.info("[US_MARKET_STATE][BUDGET] effective_budget_before_overlay=%.2f exposure_multiplier=%.2f effective_budget_after_overlay=%.2f effective_capital_scale=%s effective_max_new_positions=%s", effective_budget_before_overlay, exposure_multiplier, effective_budget_after_overlay, market_state_overlay.get("effective_capital_scale"), market_state_overlay.get("effective_max_new_positions"))
 
     cluster_guard_result = {"portfolio_cluster_guard_status": "NOT_EVALUATED", "portfolio_ai_tech_weight": 0.0, "portfolio_cluster_cap_violations": [], "cluster_guard_trim_intents": [], "cluster_guard_trim_notional": 0.0}
     try:
@@ -1142,7 +1145,7 @@ def run_trade_tick(
         actual_regime_version = gate["actual_regime_version"]
         contract_block_reason = gate["reason"]
         entry_allowed_by_prep_contract = bool(gate["ok"])
-        logger.info("[US_ENTRY][REGIME_CONTRACT] session=%s market_regime=%s capital_scale=%s allow_new_buy=%s allow_ai_tech_buy=%s max_ai_tech_ratio=%s max_new_positions=%s", session, prep_result.get("market_regime"), prep_result.get("capital_scale"), prep_result.get("allow_new_buy"), prep_result.get("allow_ai_tech_buy"), prep_result.get("max_ai_tech_ratio"), prep_result.get("max_new_positions"))
+        logger.info("[US_ENTRY][REGIME_CONTRACT] session=%s market_regime=%s capital_scale=%s effective_capital_scale=%s allow_new_buy=%s allow_ai_tech_buy=%s max_ai_tech_ratio=%s max_new_positions=%s effective_max_new_positions=%s underfilled_tier=%s", session, prep_result.get("market_regime"), prep_result.get("capital_scale"), prep_result.get("effective_capital_scale"), prep_result.get("allow_new_buy"), prep_result.get("allow_ai_tech_buy"), prep_result.get("max_ai_tech_ratio"), prep_result.get("max_new_positions"), prep_result.get("effective_max_new_positions"), prep_result.get("underfilled_tier"))
         rotation_regime = (
             prep_result.get("rotation_regime")
             or (prep_result.get("rotation_context") or {}).get("rotation_regime")
@@ -1872,6 +1875,9 @@ def run_trade_tick(
         "prep_contract_trade_block": bool(entry_degraded_reason in {"prep_contract_trade_block", "prep_contract_version_mismatch", "risk_off_entry_block", "force_entry_block", "allow_new_buy_false"}),
         "market_regime": market_state_overlay.get("market_regime") if 'market_state_overlay' in locals() else "NEUTRAL",
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,
+        "effective_capital_scale": market_state_overlay.get("effective_capital_scale") if 'market_state_overlay' in locals() else None,
+        "effective_max_new_positions": market_state_overlay.get("effective_max_new_positions") if 'market_state_overlay' in locals() else None,
+        "underfilled_tier": market_state_overlay.get("underfilled_tier") if 'market_state_overlay' in locals() else None,
         "sector_cap_enforced": market_state_overlay.get("sector_cap_enforced") if 'market_state_overlay' in locals() else False,
         "market_state": market_state_overlay.get("market_state") if 'market_state_overlay' in locals() else "NORMAL",
         "exposure_multiplier": exposure_multiplier if 'exposure_multiplier' in locals() else 1.0,

@@ -195,3 +195,144 @@ def test_market_state_uses_etf_exchange_map_for_breadth_and_sector_etfs():
     assert result["iwm_20d_return"] is not None
     assert result["xlk_20d_return"] is not None
     assert not [w for w in warnings if w.startswith("market_return_missing:")]
+
+
+def test_risk_on_final30_28_allows_trade_without_haircut(monkeypatch):
+    monkeypatch.setenv("US_ABSOLUTE_MIN_FINAL30_FOR_TRADE", "15")
+    monkeypatch.setenv("US_DEGRADED_MIN_FINAL30_FOR_TRADE", "20")
+    monkeypatch.setenv("US_NORMAL_MIN_FINAL30_FOR_TRADE", "25")
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50},
+        candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 28, "final30_scored_count": 28, "cluster_contract_ok": True, "final30_cluster_cap_clean": True, "cap_violations": [], "market_state_overlay": {"market_state": "STRONG_RISK_ON", "market_regime": "RISK_ON", "capital_scale": 1.0, "max_new_positions": 30, "allow_new_buy": True, "allow_ai_tech_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 28, "agent_a_nonzero_count": 28, "agent_b_nonzero_count": 28, "warnings": [], "errors": []},
+        paths={},
+    )
+
+    assert contract["status"] == "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
+    assert contract["trade_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "ok"
+    assert contract["contract_ok"] is True
+    assert contract["final30_complete"] is False
+    assert contract["final30_trade_ready"] is True
+    assert contract["underfilled_final30"] is True
+    assert contract["underfilled_tier"] == "normal_underfilled"
+    assert contract["underfilled_capital_haircut"] == 1.0
+    assert contract["effective_capital_scale"] == 1.0
+    assert contract["effective_max_new_positions"] == 28
+
+
+def test_final30_24_allows_trade_with_degraded_haircut(monkeypatch):
+    monkeypatch.setenv("US_ABSOLUTE_MIN_FINAL30_FOR_TRADE", "15")
+    monkeypatch.setenv("US_DEGRADED_MIN_FINAL30_FOR_TRADE", "20")
+    monkeypatch.setenv("US_NORMAL_MIN_FINAL30_FOR_TRADE", "25")
+    monkeypatch.setenv("US_UNDERFILLED_DEGRADED_CAPITAL_HAIRCUT", "0.75")
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 24, "final30_scored_count": 24, "cluster_contract_ok": True, "final30_cluster_cap_clean": True, "cap_violations": [], "market_state_overlay": {"market_state": "NORMAL", "market_regime": "NEUTRAL", "capital_scale": 0.5, "max_new_positions": 10, "allow_new_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 24, "agent_a_nonzero_count": 24, "agent_b_nonzero_count": 24, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "ok"
+    assert contract["underfilled_tier"] == "degraded_underfilled"
+    assert contract["underfilled_capital_haircut"] == 0.75
+    assert contract["effective_capital_scale"] == 0.375
+    assert contract["effective_max_new_positions"] == 10
+
+
+def test_final30_18_risk_on_allows_limited_trade(monkeypatch):
+    monkeypatch.setenv("US_ABSOLUTE_MIN_FINAL30_FOR_TRADE", "15")
+    monkeypatch.setenv("US_DEGRADED_MIN_FINAL30_FOR_TRADE", "20")
+    monkeypatch.setenv("US_NORMAL_MIN_FINAL30_FOR_TRADE", "25")
+    monkeypatch.setenv("US_UNDERFILLED_SEVERE_CAPITAL_HAIRCUT", "0.50")
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 18, "final30_scored_count": 18, "cluster_contract_ok": True, "final30_cluster_cap_clean": True, "cap_violations": [], "market_state_overlay": {"market_state": "STRONG_RISK_ON", "market_regime": "RISK_ON", "capital_scale": 1.0, "max_new_positions": 30, "allow_new_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 18, "agent_a_nonzero_count": 18, "agent_b_nonzero_count": 18, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "ok"
+    assert contract["underfilled_tier"] == "severe_underfilled"
+    assert contract["underfilled_capital_haircut"] == 0.5
+    assert contract["effective_capital_scale"] == 0.5
+    assert contract["effective_max_new_positions"] <= 5
+
+
+def test_final30_18_neutral_blocks_trade(monkeypatch):
+    monkeypatch.setenv("US_ABSOLUTE_MIN_FINAL30_FOR_TRADE", "15")
+    monkeypatch.setenv("US_DEGRADED_MIN_FINAL30_FOR_TRADE", "20")
+    monkeypatch.setenv("US_NORMAL_MIN_FINAL30_FOR_TRADE", "25")
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 18, "final30_scored_count": 18, "cluster_contract_ok": True, "cap_violations": [], "market_state_overlay": {"market_state": "NORMAL", "market_regime": "NEUTRAL", "capital_scale": 0.5, "allow_new_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 18, "agent_a_nonzero_count": 18, "agent_b_nonzero_count": 18, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_block_reason"] == "final30_underfilled_regime_block"
+    assert contract["underfilled_tier"] == "severe_underfilled_blocked"
+    assert contract["effective_capital_scale"] == 0.0
+    assert contract["effective_max_new_positions"] == 0
+
+
+def test_final30_14_blocks_even_in_risk_on(monkeypatch):
+    monkeypatch.setenv("US_ABSOLUTE_MIN_FINAL30_FOR_TRADE", "15")
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 14, "final30_scored_count": 14, "cluster_contract_ok": True, "cap_violations": [], "market_state_overlay": {"market_state": "STRONG_RISK_ON", "market_regime": "RISK_ON", "capital_scale": 1.0, "allow_new_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 14, "agent_a_nonzero_count": 14, "agent_b_nonzero_count": 14, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_block_reason"] == "final30_below_absolute_min"
+    assert contract["underfilled_tier"] == "blocked_underfilled"
+
+
+def test_risk_off_blocks_even_when_final30_28_ready(monkeypatch):
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 28, "final30_scored_count": 28, "cluster_contract_ok": True, "cap_violations": [], "market_state_overlay": {"market_state": "DEFENSE_RISK_OFF", "market_regime": "RISK_OFF", "capital_scale": 0.0, "allow_new_buy": False, "force_entry_block": True}},
+        validation={"ok": True, "score_nonzero_count": 28, "agent_a_nonzero_count": 28, "agent_b_nonzero_count": 28, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_block_reason"] == "risk_off_entry_block"
+    assert contract["effective_capital_scale"] == 0.0
+    assert contract["effective_max_new_positions"] == 0
+
+
+def test_underfilled_score_mismatch_blocks_trade(monkeypatch):
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 24, "final30_scored_count": 24, "cluster_contract_ok": True, "cap_violations": [], "market_state_overlay": {"market_regime": "RISK_ON", "capital_scale": 1.0, "allow_new_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 23, "agent_a_nonzero_count": 24, "agent_b_nonzero_count": 24, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_block_reason"] == "score_contract_failed"
+
+
+def test_underfilled_cap_violation_blocks_trade(monkeypatch):
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10", env="practice", status="OK",
+        dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={"top50_count": 50, "final30_count": 24, "final30_scored_count": 24, "cluster_contract_ok": False, "cap_violations": ["SINGLE_CLUSTER"], "market_state_overlay": {"market_regime": "RISK_ON", "capital_scale": 1.0, "allow_new_buy": True, "force_entry_block": False}},
+        validation={"ok": True, "score_nonzero_count": 24, "agent_a_nonzero_count": 24, "agent_b_nonzero_count": 24, "warnings": [], "errors": []}, paths={},
+    )
+
+    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_block_reason"] == "sector_cap_violation_block"
