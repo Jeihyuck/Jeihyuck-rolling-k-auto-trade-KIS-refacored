@@ -191,3 +191,43 @@ def test_build_us_watchlist_etf_max_5():
         final30 = result.get("final30_scored", [])
         etf_count = sum(1 for r in final30 if r.get("asset_type") == "etf")
         assert etf_count <= 5, f"Too many ETFs in final30: {etf_count}"
+
+
+def test_prep_regime_single_source_of_truth_constraints_flow():
+    from trader.us.watchlist_builder import build_us_watchlist
+    from trader.us.prep_contract import build_us_prep_contract
+
+    constraints = {
+        "market_state": "NORMAL",
+        "market_regime": "GROWTH_LEADERSHIP",
+        "market_regime_version": "us_leading_regime_v1",
+        "capital_scale": 0.70,
+        "max_ai_tech_ratio": 0.45,
+        "max_single_cluster_ratio": 0.50,
+        "allow_new_buy": True,
+        "allow_ai_tech_buy": True,
+        "allow_defensive_buy": True,
+        "force_entry_block": False,
+    }
+    result = build_us_watchlist(
+        trade_date="2024-05-01",
+        env="practice",
+        candidate_pool=_make_candidate_rows(80),
+        provider=_make_provider(200),
+        force_rebuild=True,
+        market_regime_constraints=constraints,
+    )
+    assert result["market_regime_constraints"]["market_regime"] == "GROWTH_LEADERSHIP"
+    assert result["market_regime_constraints"]["max_ai_tech_ratio"] == 0.45
+    contract = build_us_prep_contract(
+        trade_date="2024-05-01",
+        env="practice",
+        status="OK",
+        dynamic_universe_result={"filtered_count": 80},
+        candidate_pool_result={"selected_count": 80, "status": "OK"},
+        watchlist_result=result,
+        validation={"ok": result["final30_scored_count"] == 30, "score_nonzero_count": result["final30_scored_count"], "warnings": [], "errors": []},
+        paths={},
+    )
+    assert contract["market_regime"] == result["market_regime_constraints"]["market_regime"]
+    assert contract["max_ai_tech_ratio"] == result["market_regime_constraints"]["max_ai_tech_ratio"]

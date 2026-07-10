@@ -34,6 +34,7 @@ def _patch_tick_basics(monkeypatch, calls: list):
     monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
     monkeypatch.setenv("US_WATCHLIST_LOAD_TIMEOUT_SEC", "0")
     monkeypatch.setenv("US_ENTRY_EVAL_TIMEOUT_SEC", "1")
+    monkeypatch.setenv("US_ALLOW_LEGACY_PREP_FOR_TEST", "1")
     monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda d: True)
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda now: "REGULAR_MID")
     monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": 5000.0})
@@ -94,7 +95,7 @@ def test_run_trade_tick_routes_exit_before_watchlist_timeout(monkeypatch):
         return {"status": "OK", "pending_count": 0, "confirmed_count": len(reconcile_calls), "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_ack_orders_with_balance", fake_reconcile_ack)
 
-    result = run_trade_tick(session="am", env="practice", offline=False, force_now="2026-06-05T10:00:00-04:00")
+    result = run_trade_tick(session="am", env="practice", offline=False, force_now="2026-06-05T10:00:00-04:00", kis_order_allowed=False)
 
     route_idx = next(i for i, c in enumerate(calls) if c[0] == "route_order")
     watch_idx = next(i for i, c in enumerate(calls) if c[0] == "watchlist_load")

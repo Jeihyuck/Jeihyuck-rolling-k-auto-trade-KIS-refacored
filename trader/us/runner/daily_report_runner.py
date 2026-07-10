@@ -84,6 +84,42 @@ def get_ny_trade_date(force_now: str | None = None) -> str:
     return datetime.now(tz=NY_TZ).strftime("%Y-%m-%d")
 
 
+
+def merge_reason_counts(dst: dict | None, src: dict | None) -> dict[str, int]:
+    out = dict(dst or {})
+    for k, v in (src or {}).items():
+        try:
+            out[str(k)] = out.get(str(k), 0) + int(v or 0)
+        except (TypeError, ValueError):
+            out[str(k)] = out.get(str(k), 0) + 1
+    return out
+
+
+def _apply_regime_session_summary(report: dict, session_summary: dict | None) -> dict:
+    if not isinstance(session_summary, dict):
+        return report
+    for key in ("market_regime", "capital_scale", "sector_cap_enforced", "trade_block_reason"):
+        if key in session_summary and session_summary.get(key) not in (None, "", {}):
+            report[key] = session_summary.get(key)
+    if session_summary.get("blocked_entry_reason_counts"):
+        report["blocked_entry_reason_counts"] = merge_reason_counts(
+            report.get("blocked_entry_reason_counts") or {},
+            session_summary.get("blocked_entry_reason_counts") or {},
+        )
+    return report
+
+
+def _load_json_if_exists(path: str | None) -> dict:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("[US_DAILY_REPORT][SESSION_SUMMARY][WARN] path=%s err=%s", path, exc)
+        return {}
+
 def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int) -> dict:
     sources = {
         "db_orders": int(db_orders or 0),
@@ -303,6 +339,11 @@ def run_daily_report(
         "portfolio_cluster_weights": {},
         "cluster_exposure": {},
         "cap_violations": [],
+        "market_regime": "NEUTRAL",
+        "capital_scale": 1.0,
+        "blocked_entry_reason_counts": {},
+        "trade_block_reason": "ok",
+        "sector_cap_enforced": False,
     }
     
     # DRY_RUN
@@ -368,7 +409,7 @@ def run_daily_report(
                     report["rotation_regime"] = result_data.get("rotation_regime") or result_data.get("rotation_context", {}).get("rotation_regime") or report.get("rotation_regime")
                     report["portfolio_cluster_weights"] = result_data.get("portfolio_cluster_weights") or report.get("portfolio_cluster_weights")
                     report["cap_violations"] = result_data.get("cap_violations") or report.get("cap_violations")
-                    for key in ("market_state", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
+                    for key in ("market_state", "market_regime", "capital_scale", "sector_cap_enforced", "trade_block_reason", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
                         if key in result_data:
                             report[key] = result_data.get(key)
             except Exception as exc:
@@ -388,6 +429,9 @@ def run_daily_report(
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
+                        reason_counts = report.setdefault("blocked_entry_reason_counts", {})
+                        if status in {"BLOCKED", "ORDER_DISABLED", "SIGNAL_ONLY"} and reason:
+                            reason_counts[reason] = reason_counts.get(reason, 0) + 1
                         if "FORBIDDEN_HEDGE_OR_INVERSE_ETF" in reason:
                             report["forbidden_hedge_block_count"] += 1
                         if "DEFENSE_" in reason and "ENTRY" in reason:
@@ -511,6 +555,8 @@ def run_daily_report(
             balance_confirmed = load_balance_confirmed_count(trade_date)
             router_summary = load_router_summary_ack_count(trade_date, session=session)
             schedule_fallback = load_schedule_health_fallback(trade_date, session=session)
+            if schedule_fallback:
+                _apply_regime_session_summary(report, schedule_fallback)
             if router_summary == 0 and int(schedule_fallback.get("orders_ack") or 0) > 0:
                 report["warnings"].append("SOURCE_MISMATCH_ROUTER_SUMMARY_ZERO_USING_SCHEDULE_HEALTH")
                 router_summary = int(schedule_fallback.get("orders_ack") or 0)
@@ -583,7 +629,10 @@ def run_daily_report(
     latest_md_path = f"{report_base}/latest_us_daily_report.md"
     latest_json_path = f"{report_base}/latest_us_daily_report.json"
     session_summary_json_path, session_summary_md_path = _session_summary_paths(report_base, trade_date, session)
-    
+    session_summary = _load_json_if_exists(session_summary_json_path)
+    if session_summary:
+        _apply_regime_session_summary(report, session_summary)
+
     # Dated report (for history)
     dated_dir = f"{report_base}/{trade_date}"
     if session:
@@ -718,6 +767,11 @@ def run_daily_report(
         f"| ack_pending_reconcile_count | {report.get('ack_pending_reconcile_count', 0)} |",
         f"| positions | {report['positions']} |",
         f"| rotation_regime | {report.get('rotation_regime', 'UNKNOWN')} |",
+        f"| market_regime | {report.get('market_regime', 'NEUTRAL')} |",
+        f"| capital_scale | {report.get('capital_scale', 1.0)} |",
+        f"| sector_cap_enforced | {report.get('sector_cap_enforced', False)} |",
+        f"| blocked_entry_reason_counts | {report.get('blocked_entry_reason_counts', {})} |",
+        f"| trade_block_reason | {report.get('trade_block_reason', 'ok')} |",
         f"| cap_violations | {report.get('cap_violations', [])} |",
         "",
         "## Watchlist & Score Contract",
@@ -940,6 +994,11 @@ def load_schedule_health_fallback(trade_date: str, session: str | None = None) -
                     "buy_notional_routed": float(row.get("buy_notional_routed") or 0.0),
                     "sell_notional_routed": float(row.get("sell_notional_routed") or 0.0),
                     "total_order_notional_routed": float(row.get("total_order_notional_routed") or (float(row.get("buy_notional_routed") or 0.0) + float(row.get("sell_notional_routed") or 0.0))),
+                    "market_regime": row.get("market_regime"),
+                    "capital_scale": row.get("capital_scale"),
+                    "sector_cap_enforced": row.get("sector_cap_enforced"),
+                    "blocked_entry_reason_counts": row.get("blocked_entry_reason_counts") or {},
+                    "trade_block_reason": row.get("trade_block_reason"),
                 }
     except Exception as exc:
         logger.warning("[US_DAILY_REPORT][SCHEDULE_HEALTH_FALLBACK][WARN] path=%s err=%s", path, exc)

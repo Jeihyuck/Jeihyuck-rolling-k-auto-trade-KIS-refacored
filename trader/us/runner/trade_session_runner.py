@@ -166,6 +166,53 @@ def _safe_int_env(name: str, default: int = 0) -> int:
         return default
 
 
+
+def _merge_reason_counts(dst: dict | None, src: dict | None) -> dict[str, int]:
+    out = dict(dst or {})
+    for key, value in (src or {}).items():
+        try:
+            inc = int(value or 0)
+        except (TypeError, ValueError):
+            inc = 1
+        out[str(key)] = out.get(str(key), 0) + inc
+    return out
+
+
+def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
+    market_regime_last = ""
+    capital_scale_last = 1.0
+    sector_cap_enforced_last = False
+    trade_block_reason_last = ""
+    blocked_entry_reason_counts_total: dict[str, int] = {}
+    for tick_result in results or []:
+        if tick_result.get("market_regime"):
+            market_regime_last = str(tick_result.get("market_regime") or "")
+        if tick_result.get("capital_scale") is not None:
+            try:
+                capital_scale_last = float(tick_result.get("capital_scale") or 1.0)
+            except (TypeError, ValueError):
+                capital_scale_last = 1.0
+        if tick_result.get("sector_cap_enforced") is not None:
+            sector_cap_enforced_last = bool(tick_result.get("sector_cap_enforced"))
+        reason = (
+            tick_result.get("trade_block_reason")
+            or tick_result.get("entry_degraded_reason")
+            or tick_result.get("entry_error_type")
+        )
+        if reason:
+            trade_block_reason_last = str(reason)
+        blocked_entry_reason_counts_total = _merge_reason_counts(
+            blocked_entry_reason_counts_total,
+            tick_result.get("blocked_entry_reason_counts") or {},
+        )
+    return {
+        "market_regime": market_regime_last,
+        "capital_scale": capital_scale_last,
+        "sector_cap_enforced": sector_cap_enforced_last,
+        "trade_block_reason": trade_block_reason_last,
+        "blocked_entry_reason_counts": blocked_entry_reason_counts_total,
+    }
+
 def _write_us_schedule_health(payload: dict, session: str) -> None:
     """reports/us_schedule_health/{trade_date}.json 에 세션 결과를 기록한다.
 
@@ -292,6 +339,7 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         "buy_daily_notional_after_routing", "sell_notional_does_not_consume_buy_budget",
         "ack_reconcile_before_route_status", "ack_reconcile_after_route_status", "ack_reconcile_after_route_unresolved_count",
         "ack_pending_reconcile_count", "broker_ack_only_unresolved", "sell_decisions_detail",
+        "market_regime", "capital_scale", "sector_cap_enforced", "trade_block_reason", "blocked_entry_reason_counts",
     ):
         md_lines.append(f"- {k}: {payload.get(k)}")
     md_lines.extend([
@@ -466,7 +514,7 @@ def run_trade_session(
                 trade_date,
                 "force_now" if force_now else "offline",
             )
-        elif _file_guard["already_ran"]:
+        elif _file_guard["already_ran"] or (max_ticks <= 0 and (_file_guard.get("payload") or {}).get("status") == "OK"):
             guard_payload = _file_guard["payload"]
             # P7: stale guard 리포트 — 실제 시작 시각과 예상 시각 차이 계산
             _schedule_expected_et = _file_guard.get("schedule_expected_et", "")
@@ -1205,6 +1253,8 @@ def run_trade_session(
 
         # pending_order_count is supplied by ACK/balance reconcile; do not derive it as ack - fills.
 
+        regime_block_report = _aggregate_regime_block_reporting(results)
+
         prep_contract = prep_guard_result.get("contract") or {}
         prep_status_fallback = prep_contract.get("status") or prep_guard_result.get("status") or "UNKNOWN"
         prep_run_id = (
@@ -1236,6 +1286,12 @@ def run_trade_session(
             prep_status_value = prep_status_fallback
 
         _prov = _runtime_provenance(session=session, run_id=run_id, started_at_et=session_started_at_et, ended_at_et=now_et_iso(), wall_elapsed_sec=session_wall_elapsed_sec)
+        session_trade_block_reason = (
+            regime_block_report.get("trade_block_reason")
+            or final_tick.get("trade_block_reason")
+            or final_tick.get("entry_degraded_reason")
+            or (final_reason if final_status in {"FAILED", "SKIP"} else "")
+        )
         report_payload = {
             **_prov,
             "trade_date": trade_date,
@@ -1324,7 +1380,11 @@ def run_trade_session(
             "status_detail": status_detail,
             "signal_only": bool(resolved_signal_only),
             "trade_runner_started": 1,
-            "trade_block_reason": final_reason if final_status in {"FAILED", "SKIP"} else "",
+            "market_regime": regime_block_report.get("market_regime") or final_tick.get("market_regime", "NEUTRAL"),
+            "capital_scale": regime_block_report.get("capital_scale", final_tick.get("capital_scale", 1.0)),
+            "sector_cap_enforced": regime_block_report.get("sector_cap_enforced", final_tick.get("sector_cap_enforced", False)),
+            "blocked_entry_reason_counts": regime_block_report.get("blocked_entry_reason_counts", {}),
+            "trade_block_reason": session_trade_block_reason,
             "final_status": final_status,
             "reason": final_reason,
             "temp_error_count": temp_error_count,

@@ -93,15 +93,32 @@ def build_us_prep_contract(
     agent_a_ok = validation.get("agent_a_nonzero_count", 0) >= 25
     agent_b_ok = validation.get("agent_b_nonzero_count", 0) >= 25
 
-    # trade_can_proceed 기준
-    trade_can_proceed = int(
-        status in ("OK", "OK_WITH_WARNINGS")
-        and contract_ok
-        and cluster_contract_ok
-        and final30_complete
-        and score_nonzero_count == final30_scored_count
-        and not cap_violations
-    )
+    market_state = watchlist_result.get("market_state_overlay") or watchlist_result.get("market_state") or {}
+    if not isinstance(market_state, dict):
+        market_state = {}
+    market_regime = str(market_state.get("market_regime") or "NEUTRAL")
+    force_entry_block = bool(market_state.get("force_entry_block", False))
+    allow_new_buy = bool(market_state.get("allow_new_buy", True))
+    trade_block_reason = "ok"
+    if status == "ERROR":
+        trade_block_reason = "prep_status_error"
+    elif cap_violations:
+        trade_block_reason = "sector_cap_violation_block"
+    elif not cluster_contract_ok:
+        trade_block_reason = "cluster_cap_contract_failed"
+    elif not contract_ok:
+        trade_block_reason = "contract_ok_false"
+    elif not final30_complete:
+        trade_block_reason = "final30_incomplete"
+    elif score_nonzero_count != final30_scored_count:
+        trade_block_reason = "score_contract_failed"
+    elif market_regime == "RISK_OFF":
+        trade_block_reason = "risk_off_entry_block"
+    elif force_entry_block:
+        trade_block_reason = "force_entry_block"
+    elif not allow_new_buy:
+        trade_block_reason = "allow_new_buy_false"
+    trade_can_proceed = int(trade_block_reason == "ok")
 
     warnings: list[str] = []
     errors: list[str] = []
@@ -114,19 +131,26 @@ def build_us_prep_contract(
     errors.extend(dynamic_universe_result.get("errors", []))
     errors.extend(validation.get("errors", []))
 
-    market_state = watchlist_result.get("market_state_overlay") or watchlist_result.get("market_state") or {}
-    if not isinstance(market_state, dict):
-        market_state = {}
-    if market_state.get("market_state") == "DEFENSE_CRASH":
+    if market_regime == "RISK_OFF":
         trade_can_proceed = 0
+        trade_block_reason = "risk_off_entry_block"
+        status = "RISK_OFF_ENTRY_BLOCKED" if market_state.get("market_state") != "DEFENSE_CRASH" else "DEFENSE_CRASH_ENTRY_BLOCKED"
+    if market_state.get("market_state") == "DEFENSE_CRASH" or force_entry_block:
+        trade_can_proceed = 0
+        trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
     contract = {
         "market": "US",
+        "contract_version": "us_sector_rotation_v3",
+        "market_regime_version": "us_leading_regime_v1",
+        "selector_version": watchlist_result.get("selector_version", "bucket_champion_v2"),
+        "sector_cap_enforced": True,
         "env": env,
         "trade_date": trade_date,
         "status": status,
         "trade_can_proceed": trade_can_proceed,
+        "trade_block_reason": trade_block_reason,
         "dynamic_universe_count": dynamic_universe_count,
         "candidate_pool_count": candidate_pool_count,
         "top50_count": top50_count,
@@ -154,13 +178,32 @@ def build_us_prep_contract(
         "errors": errors,
         "paths": paths,
         "market_state": market_state.get("market_state", "NORMAL"),
+        "market_regime": market_regime,
+        "regime_score": market_state.get("regime_score", 0),
+        "risk_score": market_state.get("risk_score", 0),
+        "growth_score": market_state.get("growth_score", 0),
+        "breadth_score": market_state.get("breadth_score", 0),
+        "defensive_score": market_state.get("defensive_score", 0),
+        "capital_scale": market_state.get("capital_scale", market_state.get("exposure_multiplier", 1.0)),
+        "max_ai_tech_ratio": market_state.get("max_ai_tech_ratio", 0.35),
+        "max_single_cluster_ratio": market_state.get("max_single_cluster_ratio", 0.20),
+        "max_new_positions": market_state.get("max_new_positions", 10),
+        "entry_aggressiveness": market_state.get("entry_aggressiveness", "normal"),
+        "take_profit_mode": market_state.get("take_profit_mode", "staged_take_profit"),
+        "trailing_stop_pct": market_state.get("trailing_stop_pct", 0.02),
+        "stop_tightening_level": market_state.get("stop_tightening_level", "normal"),
+        "allow_defensive_buy": market_state.get("allow_defensive_buy", True),
+        "regime_reasons": market_state.get("regime_reasons", market_state.get("market_state_reasons", [])),
+        "data_quality": market_state.get("data_quality", "ok"),
+        "data_quality_warnings": market_state.get("data_quality_warnings", []),
+        "leading_indicators": market_state.get("leading_indicators", {}),
         "defense_regime": market_state.get("defense_regime", "NONE"),
         "risk_on_regime": market_state.get("risk_on_regime", "NONE"),
         "market_state_reasons": market_state.get("market_state_reasons", []),
         "exposure_multiplier": market_state.get("exposure_multiplier", 1.0),
-        "allow_new_buy": market_state.get("allow_new_buy", True),
+        "allow_new_buy": allow_new_buy,
         "allow_ai_tech_buy": market_state.get("allow_ai_tech_buy", False),
-        "force_entry_block": market_state.get("force_entry_block", False),
+        "force_entry_block": force_entry_block,
         "profit_capture_enabled": market_state.get("profit_capture_enabled", True),
         "trailing_stop_mode": market_state.get("trailing_stop_mode", "normal"),
         "account_loss_kill_switch_triggered": market_state.get("account_loss_kill_switch_triggered", False),
