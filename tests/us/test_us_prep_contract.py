@@ -145,8 +145,8 @@ def test_build_us_prep_contract_validation_fail_blocks():
     assert contract["trade_can_proceed"] == 0
 
 
-def test_build_us_prep_contract_final30_less_than_30_blocks():
-    """final30_scored_count < 30 → trade_can_proceed=0이어야 한다."""
+def test_build_us_prep_contract_final30_less_than_30_allows_safe_underfilled():
+    """safe final30_scored_count < 30 can trade with an underfilled tier."""
     try:
         from trader.us.prep_contract import build_us_prep_contract
     except ImportError:
@@ -166,7 +166,9 @@ def test_build_us_prep_contract_final30_less_than_30_blocks():
         paths=paths,
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "ok"
+    assert contract["underfilled_tier"] == "normal_underfilled"
 
 
 def test_build_us_prep_contract_error_status_blocks():

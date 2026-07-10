@@ -135,3 +135,86 @@ def test_sell_notional_does_not_consume_buy_daily_notional(monkeypatch):
     )
     assert result["sell_notional_routed"] == 2000
     assert calls[0][1]["current_daily_notional_usd"] == 0.0
+
+
+def _run_tick_and_capture_available_slots(monkeypatch, effective_max_new_positions):
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+
+    calls = []
+    _patch_tick_basics(monkeypatch, calls)
+    monkeypatch.setenv("US_MAX_POSITIONS", "35")
+
+    prep_contract = {
+        "status": "OK",
+        "contract_version": "us_sector_rotation_v3",
+        "market_regime_version": "us_leading_regime_v1",
+        "trade_can_proceed": 1,
+        "trade_block_reason": "ok",
+        "market_regime": "RISK_ON",
+        "capital_scale": 1.0,
+        "effective_capital_scale": 1.0,
+        "allow_new_buy": True,
+        "allow_add_to_existing": True,
+        "force_entry_block": False,
+        "max_new_positions": 30,
+        "underfilled_tier": "severe_underfilled" if effective_max_new_positions == 5 else "degraded_underfilled",
+    }
+    if effective_max_new_positions is not None:
+        prep_contract["effective_max_new_positions"] = effective_max_new_positions
+
+    monkeypatch.setattr(
+        "trader.us.db.repos.load_latest_us_prep_status",
+        lambda trade_date, *args, **kwargs: {"status": "OK", "result": dict(prep_contract)},
+    )
+    monkeypatch.setattr(
+        "trader.us.execution.order_router.route_order",
+        lambda intent, **kwargs: {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent},
+    )
+
+    captured = {}
+
+    class _Engine:
+        def evaluate_exits(self, positions, provider, now):
+            return []
+
+        def evaluate_entries(self, *args, **kwargs):
+            captured["available_new_slots"] = kwargs.get("available_new_slots")
+            captured["allow_new_symbols"] = kwargs.get("allow_new_symbols")
+            return []
+
+    monkeypatch.setattr("trader.us.runner.trade_tick_runner._get_strategy_engine", lambda env, offline: _Engine())
+
+    watchlist = [{"symbol": f"SYM{i}", "score": 1.0 - i * 0.01} for i in range(10)]
+    result = run_trade_tick(
+        session="am",
+        env="practice",
+        offline=False,
+        force_now="2026-06-05T10:00:00-04:00",
+        kis_order_allowed=False,
+        prep_status_cache={"status": "OK", "result": dict(prep_contract)},
+        locked_watchlist_cache=watchlist,
+    )
+    return captured, result
+
+
+def test_underfilled_effective_max_positions_limits_entry_slots_to_5(monkeypatch):
+    captured, result = _run_tick_and_capture_available_slots(monkeypatch, 5)
+
+    assert captured["available_new_slots"] <= 5
+    assert captured["available_new_slots"] == 5
+    assert result["available_new_slots"] == 5
+
+
+def test_underfilled_effective_max_positions_limits_entry_slots_to_24(monkeypatch):
+    captured, result = _run_tick_and_capture_available_slots(monkeypatch, 24)
+
+    assert captured["available_new_slots"] <= 24
+    assert captured["available_new_slots"] == 24
+    assert result["available_new_slots"] == 24
+
+
+def test_missing_effective_max_positions_preserves_existing_entry_slots(monkeypatch):
+    captured, result = _run_tick_and_capture_available_slots(monkeypatch, None)
+
+    assert captured["available_new_slots"] == 34
+    assert result["available_new_slots"] == 34

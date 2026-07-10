@@ -39,6 +39,20 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
 def build_us_prep_contract(
     *,
     trade_date: str,
@@ -72,7 +86,6 @@ def build_us_prep_contract(
     final30_scored_count = watchlist_result.get("final30_scored_count", 0)
     score_nonzero_count = validation.get("score_nonzero_count", 0)
 
-    final30_complete = final30_scored_count == 30
     cap_violations = list(watchlist_result.get("cap_violations") or [])
     rotation_context = watchlist_result.get("rotation_context") or {}
     cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
@@ -80,18 +93,6 @@ def build_us_prep_contract(
         cluster_contract_ok = False
         if "ROTATION_CONTEXT_SUSPECT" not in cap_violations:
             cap_violations.append("ROTATION_CONTEXT_SUSPECT")
-    contract_ok = (
-        validation.get("ok", False)
-        and final30_scored_count == 30
-        and score_nonzero_count == final30_scored_count
-    )
-    if not cluster_contract_ok:
-        status = "FAILED_CLUSTER_CAP_CONTRACT"
-    elif not final30_complete:
-        status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
-
-    agent_a_ok = validation.get("agent_a_nonzero_count", 0) >= 25
-    agent_b_ok = validation.get("agent_b_nonzero_count", 0) >= 25
 
     market_state = watchlist_result.get("market_state_overlay") or watchlist_result.get("market_state") or {}
     if not isinstance(market_state, dict):
@@ -99,18 +100,82 @@ def build_us_prep_contract(
     market_regime = str(market_state.get("market_regime") or "NEUTRAL")
     force_entry_block = bool(market_state.get("force_entry_block", False))
     allow_new_buy = bool(market_state.get("allow_new_buy", True))
+
+    absolute_min_final30 = _env_int("US_ABSOLUTE_MIN_FINAL30_FOR_TRADE", 15)
+    degraded_min_final30 = _env_int("US_DEGRADED_MIN_FINAL30_FOR_TRADE", 20)
+    normal_min_final30 = _env_int("US_NORMAL_MIN_FINAL30_FOR_TRADE", 25)
+
+    degraded_haircut = _env_float("US_UNDERFILLED_DEGRADED_CAPITAL_HAIRCUT", 0.75)
+    severe_haircut = _env_float("US_UNDERFILLED_SEVERE_CAPITAL_HAIRCUT", 0.50)
+
+    final30_complete = final30_scored_count == 30
+    final30_empty = final30_scored_count <= 0
+
+    validation_ok = bool(validation.get("ok", False))
+    score_contract_ok = (
+        final30_scored_count > 0
+        and score_nonzero_count == final30_scored_count
+    )
+
+    if final30_scored_count >= normal_min_final30:
+        underfilled_tier = "normal" if final30_complete else "normal_underfilled"
+        final30_trade_ready = True
+        underfilled_capital_haircut = 1.0
+    elif final30_scored_count >= degraded_min_final30:
+        underfilled_tier = "degraded_underfilled"
+        final30_trade_ready = True
+        underfilled_capital_haircut = degraded_haircut
+    elif final30_scored_count >= absolute_min_final30:
+        if market_regime in {"RISK_ON", "GROWTH_LEADERSHIP"}:
+            underfilled_tier = "severe_underfilled"
+            final30_trade_ready = True
+            underfilled_capital_haircut = severe_haircut
+        else:
+            underfilled_tier = "severe_underfilled_blocked"
+            final30_trade_ready = False
+            underfilled_capital_haircut = 0.0
+    else:
+        underfilled_tier = "blocked_underfilled"
+        final30_trade_ready = False
+        underfilled_capital_haircut = 0.0
+
+    underfilled_final30 = bool(final30_scored_count < 30 and final30_trade_ready)
+
+    contract_ok = (
+        validation_ok
+        and final30_trade_ready
+        and score_contract_ok
+        and cluster_contract_ok
+        and not cap_violations
+    )
+    if not cluster_contract_ok:
+        status = "FAILED_CLUSTER_CAP_CONTRACT"
+    elif not final30_complete and final30_trade_ready:
+        status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
+    elif not final30_trade_ready:
+        status = "FAILED_FINAL30_UNDERFILLED"
+
+    agent_a_ok = validation.get("agent_a_nonzero_count", 0) >= 25
+    agent_b_ok = validation.get("agent_b_nonzero_count", 0) >= 25
+
     trade_block_reason = "ok"
+
     if status == "ERROR":
         trade_block_reason = "prep_status_error"
     elif cap_violations:
         trade_block_reason = "sector_cap_violation_block"
     elif not cluster_contract_ok:
         trade_block_reason = "cluster_cap_contract_failed"
-    elif not contract_ok:
-        trade_block_reason = "contract_ok_false"
-    elif not final30_complete:
-        trade_block_reason = "final30_incomplete"
-    elif score_nonzero_count != final30_scored_count:
+    elif final30_empty:
+        trade_block_reason = "final30_empty"
+    elif not final30_trade_ready:
+        if final30_scored_count < absolute_min_final30:
+            trade_block_reason = "final30_below_absolute_min"
+        else:
+            trade_block_reason = "final30_underfilled_regime_block"
+    elif not validation_ok:
+        trade_block_reason = "validation_failed"
+    elif not score_contract_ok:
         trade_block_reason = "score_contract_failed"
     elif market_regime == "RISK_OFF":
         trade_block_reason = "risk_off_entry_block"
@@ -118,7 +183,20 @@ def build_us_prep_contract(
         trade_block_reason = "force_entry_block"
     elif not allow_new_buy:
         trade_block_reason = "allow_new_buy_false"
+
     trade_can_proceed = int(trade_block_reason == "ok")
+
+    base_capital_scale = float(market_state.get("capital_scale", market_state.get("exposure_multiplier", 1.0)) or 1.0)
+    effective_capital_scale = base_capital_scale * underfilled_capital_haircut
+
+    base_max_new_positions = int(market_state.get("max_new_positions", 10) or 10)
+
+    if underfilled_tier == "severe_underfilled":
+        effective_max_new_positions = min(5, final30_scored_count, base_max_new_positions)
+    elif underfilled_tier in {"normal_underfilled", "degraded_underfilled", "normal"}:
+        effective_max_new_positions = min(final30_scored_count, base_max_new_positions)
+    else:
+        effective_max_new_positions = 0
 
     warnings: list[str] = []
     errors: list[str] = []
@@ -140,6 +218,10 @@ def build_us_prep_contract(
         trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
+    if trade_can_proceed == 0:
+        effective_capital_scale = 0.0
+        effective_max_new_positions = 0
+
     contract = {
         "market": "US",
         "contract_version": "us_sector_rotation_v3",
@@ -159,7 +241,17 @@ def build_us_prep_contract(
         "score_nonzero_count": score_nonzero_count,
         "contract_ok": contract_ok,
         "cluster_contract_ok": cluster_contract_ok,
+        "absolute_min_final30_for_trade": absolute_min_final30,
+        "degraded_min_final30_for_trade": degraded_min_final30,
+        "normal_min_final30_for_trade": normal_min_final30,
         "final30_complete": final30_complete,
+        "final30_trade_ready": final30_trade_ready,
+        "final30_empty": final30_empty,
+        "underfilled_final30": underfilled_final30,
+        "underfilled_tier": underfilled_tier,
+        "underfilled_capital_haircut": underfilled_capital_haircut,
+        "effective_capital_scale": effective_capital_scale,
+        "effective_max_new_positions": effective_max_new_positions,
         "rotation_regime": watchlist_result.get("rotation_regime") or rotation_context.get("rotation_regime"),
         "rotation_context": rotation_context,
         "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
@@ -184,10 +276,10 @@ def build_us_prep_contract(
         "growth_score": market_state.get("growth_score", 0),
         "breadth_score": market_state.get("breadth_score", 0),
         "defensive_score": market_state.get("defensive_score", 0),
-        "capital_scale": market_state.get("capital_scale", market_state.get("exposure_multiplier", 1.0)),
+        "capital_scale": base_capital_scale,
         "max_ai_tech_ratio": market_state.get("max_ai_tech_ratio", 0.35),
         "max_single_cluster_ratio": market_state.get("max_single_cluster_ratio", 0.20),
-        "max_new_positions": market_state.get("max_new_positions", 10),
+        "max_new_positions": base_max_new_positions,
         "entry_aggressiveness": market_state.get("entry_aggressiveness", "normal"),
         "take_profit_mode": market_state.get("take_profit_mode", "staged_take_profit"),
         "trailing_stop_pct": market_state.get("trailing_stop_pct", 0.02),
@@ -285,6 +377,14 @@ def save_us_prep_summary(contract: dict) -> None:
             "",
             "## Contract",
             f"- contract_ok: {contract.get('contract_ok')}",
+            f"- trade_block_reason: {contract.get('trade_block_reason')}",
+            f"- final30_complete: {contract.get('final30_complete')}",
+            f"- final30_trade_ready: {contract.get('final30_trade_ready')}",
+            f"- underfilled_final30: {contract.get('underfilled_final30')}",
+            f"- underfilled_tier: {contract.get('underfilled_tier')}",
+            f"- underfilled_capital_haircut: {contract.get('underfilled_capital_haircut')}",
+            f"- effective_capital_scale: {contract.get('effective_capital_scale')}",
+            f"- effective_max_new_positions: {contract.get('effective_max_new_positions')}",
             f"- agent_a_ok: {contract.get('agent_a_ok')}",
             f"- agent_b_ok: {contract.get('agent_b_ok')}",
             "",
