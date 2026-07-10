@@ -30,9 +30,9 @@ _CORE_ETFS: set[str] = {"SPY", "QQQ", "QQQM", "SMH", "SOXX"}
 
 # KIS US dailyprice exchange hints for benchmark/sector ETFs.
 ETF_EXCHANGE_MAP: dict[str, str] = {
-    "QQQ": "NASD", "QQQM": "NASD",
+    "QQQ": "NASDAQ", "QQQM": "NASDAQ",
     "SPY": "AMEX", "DIA": "AMEX", "IWM": "AMEX", "RSP": "AMEX",
-    "SMH": "NASD", "SOXX": "NASD",
+    "SMH": "NASDAQ", "SOXX": "NASDAQ",
     "XLK": "AMEX", "XLI": "AMEX", "XLF": "AMEX", "XLV": "AMEX",
     "XLP": "AMEX", "XLU": "AMEX", "XLE": "AMEX",
 }
@@ -41,9 +41,9 @@ AI_BASKET_SYMBOLS: tuple[str, ...] = (
     "NVDA", "AMD", "AVGO", "ARM", "MU", "TSM", "ASML", "AMAT", "LRCX", "PLTR", "MSFT", "META",
 )
 AI_BASKET_EXCHANGE_MAP: dict[str, str] = {
-    "NVDA": "NASD", "AMD": "NASD", "AVGO": "NASD", "ARM": "NASD", "MU": "NASD",
-    "TSM": "NYSE", "ASML": "NASD", "AMAT": "NASD", "LRCX": "NASD",
-    "PLTR": "NASD", "MSFT": "NASD", "META": "NASD",
+    "NVDA": "NASDAQ", "AMD": "NASDAQ", "AVGO": "NASDAQ", "ARM": "NASDAQ", "MU": "NASDAQ",
+    "TSM": "NYSE", "ASML": "NASDAQ", "AMAT": "NASDAQ", "LRCX": "NASDAQ",
+    "PLTR": "NASDAQ", "MSFT": "NASDAQ", "META": "NASDAQ",
 }
 
 
@@ -482,7 +482,27 @@ def build_us_watchlist(
     final30 = _enforce_final30_etf_cap(final30[:finaln], sorted_broader, finaln, _MAX_ETF_IN_FINAL30, blocked_clusters)
     final30, etf_refill_meta = refill_under_cluster_caps(final30, sorted_broader, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters, prefer_non_tech=True)
     _regime_overlay = constraints
-    final30, regime_cap_meta = enforce_regime_sector_caps(final30, sorted_broader, constraints, finaln)
+    if constraints.get("market_regime") == "RISK_OFF":
+        # RISK_OFF blocks new BUYs in the prep contract.  Preserve final30 as a
+        # diagnostic/visibility artifact instead of deleting candidates because
+        # the very tight RISK_OFF sector caps cannot be satisfied by an
+        # underfilled list.
+        regime_cap_meta = {
+            "sector_cap_enforced": True,
+            "risk_off_entry_block": True,
+            "before_ai_tech_ratio": sum(
+                1 for r in final30 if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS
+            ) / max(1, finaln),
+            "after_ai_tech_ratio": sum(
+                1 for r in final30 if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS
+            ) / max(1, finaln),
+            "blocked_by_cluster_cap": [],
+            "sector_cap_replacements": [],
+            "cap_violations": [],
+            "risk_off_cap_warning": "entry_blocked_but_final30_preserved",
+        }
+    else:
+        final30, regime_cap_meta = enforce_regime_sector_caps(final30, sorted_broader, constraints, finaln)
     fallback_meta["fallback_fill_used"] = bool(fallback_meta.get("fallback_fill_used") or etf_refill_meta.get("fallback_fill_used"))
     fallback_meta["fallback_fill_count"] = int(fallback_meta.get("fallback_fill_count") or 0) + int(etf_refill_meta.get("fallback_fill_count") or 0)
     fallback_meta["fallback_fill_cap_safe"] = bool(fallback_meta.get("fallback_fill_cap_safe", True) and etf_refill_meta.get("fallback_fill_cap_safe", True))
@@ -584,7 +604,7 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     ai_basket_returns: dict[str, float] = {}
     ai_missing: list[str] = []
     for sym in AI_BASKET_SYMBOLS:
-        exchange = AI_BASKET_EXCHANGE_MAP.get(sym, "NASD")
+        exchange = AI_BASKET_EXCHANGE_MAP.get(sym, "NASDAQ")
         closes: list[float] = []
         try:
             rows = provider.get_daily_prices(sym, exchange, as_of_date=as_of_date)
@@ -762,13 +782,24 @@ def enforce_regime_sector_caps(selected: list[dict], candidate_pool: list[dict],
     max_single = float((constraints or {}).get("max_single_cluster_ratio", 1.0))
     regime = str((constraints or {}).get("market_regime") or "NEUTRAL")
     before = list(selected or [])
-    before_ai = sum(1 for r in before if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS) / max(1, len(before))
+    before_ai = sum(1 for r in before if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS) / max(1, finaln)
+    if regime == "RISK_OFF":
+        return before[:finaln], {
+            "sector_cap_enforced": True,
+            "risk_off_entry_block": True,
+            "blocked_by_cluster_cap": [],
+            "sector_cap_replacements": [],
+            "cap_violations": [],
+            "before_ai_tech_ratio": before_ai,
+            "after_ai_tech_ratio": before_ai,
+            "risk_off_cap_warning": "entry_blocked_but_final30_preserved",
+        }
     blocked: list[str] = []
     replacements: list[str] = []
     removed_violation_reasons: set[str] = set()
     out = sorted(before, key=lambda r: float(r.get("score_final") or 0), reverse=True)
     def ratios(rows):
-        counts = _cluster_counts(rows); total=max(1,len(rows)); ai=sum(counts.get(c,0) for c in AI_CLUSTERS)/total; single=max(counts.values() or [0])/total; return ai,single,counts
+        counts = _cluster_counts(rows); total=max(1,finaln); ai=sum(counts.get(c,0) for c in AI_CLUSTERS)/total; single=max(counts.values() or [0])/total; return ai,single,counts
     while out:
         ai,single,counts = ratios(out)
         if ai <= max_ai and single <= max_single: break

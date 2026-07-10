@@ -64,3 +64,108 @@ def test_risk_off_is_not_prep_error():
     assert contract["trade_block_reason"] == "risk_off_entry_block"
     assert contract["contract_version"] == "us_sector_rotation_v3"
     assert contract["market_regime_version"] == "us_leading_regime_v1"
+
+def test_exchange_alias_nasd_does_not_break_rotation_context():
+    from trader.us.symbols import get_quote_exchange_code
+    from trader.us.watchlist_builder import _build_rotation_context
+
+    assert get_quote_exchange_code("NASD") == "NAS"
+    assert get_quote_exchange_code("NAS") == "NAS"
+    assert get_quote_exchange_code("NASDAQ") == "NAS"
+
+    calls = []
+
+    class Provider:
+        def get_daily_prices(self, symbol, exchange="NYSE", as_of_date=None):
+            calls.append((symbol, exchange))
+            if symbol in {"QQQ", "SMH", "NVDA"}:
+                assert exchange == "NASDAQ"
+            return [{"close": 100 + i} for i in range(6)]
+
+    ctx = _build_rotation_context(Provider(), [], "2026-07-10")
+    assert ctx["benchmark_symbol_quality"]["QQQ"] == "ok"
+    assert ctx["benchmark_symbol_quality"]["SMH"] == "ok"
+    assert "QQQ" not in ctx["missing_symbols"]
+    assert "SMH" not in ctx["missing_symbols"]
+    assert ("NVDA", "NASDAQ") in calls
+
+
+def test_enforce_regime_sector_caps_uses_finaln_denominator():
+    from trader.us.watchlist_builder import enforce_regime_sector_caps
+
+    rows = [{"symbol": f"H{i}", "theme_cluster": "HEALTHCARE", "score_final": 1.0 - i * 0.01} for i in range(3)]
+    final, meta = enforce_regime_sector_caps(
+        rows,
+        rows,
+        {"market_regime": "NEUTRAL", "max_ai_tech_ratio": 1.0, "max_single_cluster_ratio": 0.10},
+        30,
+    )
+    assert len(final) == 3
+    assert meta["cap_violations"] == []
+
+
+def test_risk_off_preserves_final30_artifact():
+    from trader.us.prep_contract import build_us_prep_contract
+    from trader.us.watchlist_builder import enforce_regime_sector_caps
+
+    rows = [{"symbol": f"H{i}", "theme_cluster": "HEALTHCARE", "score_final": 1.0 - i * 0.01} for i in range(12)]
+    final, meta = enforce_regime_sector_caps(
+        rows,
+        rows,
+        {"market_regime": "RISK_OFF", "max_ai_tech_ratio": 0.10, "max_single_cluster_ratio": 0.10},
+        30,
+    )
+    assert len(final) == 12
+    assert meta["risk_off_entry_block"] is True
+    assert meta["cap_violations"] == []
+
+    contract = build_us_prep_contract(
+        trade_date="2026-07-10",
+        env="practice",
+        status="OK",
+        dynamic_universe_result={"filtered_count": 50},
+        candidate_pool_result={"selected_count": 30, "status": "OK"},
+        watchlist_result={
+            "top50_count": 50,
+            "final30_count": len(final),
+            "final30_scored_count": len(final),
+            "cluster_contract_ok": True,
+            "final30_cluster_cap_clean": True,
+            "cap_violations": [],
+            "market_state_overlay": {
+                "market_regime": "RISK_OFF",
+                "capital_scale": 0.0,
+                "allow_new_buy": False,
+                "force_entry_block": True,
+            },
+        },
+        validation={"ok": True, "score_nonzero_count": len(final), "warnings": [], "errors": []},
+        paths={},
+    )
+    assert contract["trade_can_proceed"] == 0
+    assert contract["trade_block_reason"] == "risk_off_entry_block"
+    assert contract["final30_count"] == 12
+    assert contract["score_nonzero_count"] == 12
+
+
+def test_degraded_benchmark_with_mild_weakness_not_crash():
+    from trader.us.market_state_overlay import evaluate_us_market_state
+
+    def series(last_return):
+        return [{"date": "20260709", "close": 100.0}, {"date": "20260710", "close": 100.0 * (1 + last_return)}]
+
+    provider = {
+        "SPY": series(0.0),
+        "QQQ": series(-0.003),
+        "SMH": series(-0.011),
+    }
+    result = evaluate_us_market_state(
+        trade_date="2026-07-10",
+        provider=provider,
+        rotation_context={"benchmark_data_quality": "degraded", "missing_symbols": ["XLK"], "rotation_regime": "NEUTRAL"},
+        prep_result={},
+        positions=[],
+        account_snapshot={},
+    )
+    assert result["market_state"] != "DEFENSE_CRASH"
+    assert "DEGRADED_BENCHMARK_WITH_WEAK_INDEX" not in result["market_state_reasons"]

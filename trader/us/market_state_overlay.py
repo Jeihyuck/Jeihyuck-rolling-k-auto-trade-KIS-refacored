@@ -245,7 +245,21 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
     hit(pnl1 is not None and pnl1 <= -0.018, "crash", "ACCOUNT_INTRADAY_LE_-1.8pct")
     hit(pnl5 is not None and pnl5 <= -0.050, "crash", "ACCOUNT_5D_LE_-5.0pct")
     hit(suspect and suspect_policy == "block", "crash", "ROTATION_CONTEXT_SUSPECT_BLOCK")
-    hit(quality != "ok" and any(x is not None and x < -0.005 for x in (spy1, qqq1, smh1)), "crash", "DEGRADED_BENCHMARK_WITH_WEAK_INDEX")
+    critical_missing = {
+        str(s).upper()
+        for s in (rc.get("missing_symbols") or (prep_result or {}).get("missing_symbols") or [])
+        if str(s).upper() in {"SPY", "QQQ", "SMH"}
+    }
+    degraded_crash = (
+        quality != "ok"
+        and (
+            (spy1 is not None and spy1 <= -0.012)
+            or (qqq1 is not None and qqq1 <= -0.018)
+            or (smh1 is not None and smh1 <= -0.025)
+            or (len(critical_missing) >= 2 and suspect_policy == "block")
+        )
+    )
+    hit(degraded_crash, "crash", "DEGRADED_BENCHMARK_WITH_WEAK_INDEX")
     hit(spy1 is not None and spy1 <= -0.012, "riskoff", "SPY_1D_LE_-1.2pct")
     hit(qqq1 is not None and qqq1 <= -0.018, "riskoff", "QQQ_1D_LE_-1.8pct")
     hit(smh1 is not None and smh1 <= -0.025, "riskoff", "SMH_1D_LE_-2.5pct")
