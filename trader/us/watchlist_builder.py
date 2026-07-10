@@ -473,6 +473,13 @@ def build_us_watchlist(
 
     final30 = _enforce_final30_etf_cap(final30[:finaln], sorted_broader, finaln, _MAX_ETF_IN_FINAL30, blocked_clusters)
     final30, etf_refill_meta = refill_under_cluster_caps(final30, sorted_broader, finaln, str(rotation_context.get("rotation_regime") or "NEUTRAL"), blocked_clusters, prefer_non_tech=True)
+    try:
+        from trader.us.market_state_overlay import evaluate_us_market_state
+        _regime_overlay = evaluate_us_market_state(trade_date=trade_date, provider=provider, rotation_context=rotation_context, prep_result={"rotation_regime": rotation_context.get("rotation_regime"), "rotation_context": rotation_context}, positions=[], account_snapshot={})
+    except Exception as _regime_exc:
+        logger.warning("[US_SECTOR_CAP][ENFORCE_WARN] regime_eval_failed=%s", _regime_exc)
+        _regime_overlay = {"market_regime": "NEUTRAL", "max_ai_tech_ratio": 0.35, "max_single_cluster_ratio": 0.20}
+    final30, regime_cap_meta = enforce_regime_sector_caps(final30, sorted_broader, _regime_overlay, finaln)
     fallback_meta["fallback_fill_used"] = bool(fallback_meta.get("fallback_fill_used") or etf_refill_meta.get("fallback_fill_used"))
     fallback_meta["fallback_fill_count"] = int(fallback_meta.get("fallback_fill_count") or 0) + int(etf_refill_meta.get("fallback_fill_count") or 0)
     fallback_meta["fallback_fill_cap_safe"] = bool(fallback_meta.get("fallback_fill_cap_safe", True) and etf_refill_meta.get("fallback_fill_cap_safe", True))
@@ -495,6 +502,10 @@ def build_us_watchlist(
         final30_scored.append(scored)
 
     cluster_contract = validate_final30_cluster_contract(final30_scored, str(rotation_context.get("rotation_regime") or "NEUTRAL"))
+    if regime_cap_meta.get("cap_violations"):
+        cluster_contract["cluster_contract_ok"] = False
+        cluster_contract["final30_cluster_cap_clean"] = False
+        cluster_contract["cap_violations"] = list(set(list(cluster_contract.get("cap_violations") or []) + list(regime_cap_meta.get("cap_violations") or [])))
     final30_cluster_counts = cluster_contract["final30_cluster_counts"]
     ai_count = sum(1 for r in final30_scored if r.get("theme_cluster") in AI_CLUSTERS)
     final30_cap_violations = list(cluster_contract.get("cap_violations") or [])
@@ -534,7 +545,10 @@ def build_us_watchlist(
         "final30_ai_tech_ratio": ai_count / max(1, len(final30_scored)),
         "portfolio_cluster_weights": portfolio_cluster_weights,
         "cap_violations": final30_cap_violations + [c for c, v in portfolio_cluster_weights.items() if v.get("over_cap")],
-        "blocked_by_cluster_cap": sorted(blocked_clusters),
+        "blocked_by_cluster_cap": sorted(set(blocked_clusters) | set(regime_cap_meta.get("blocked_by_cluster_cap") or [])),
+        "sector_cap_enforced": True,
+        "sector_cap_replacements": regime_cap_meta.get("sector_cap_replacements", []),
+        "market_regime_constraints": _regime_overlay,
         "selected_by_bucket_champion": bool((bucket_meta or {}).get("selected_by_bucket_champion")),
         "cluster_contract_ok": bool(cluster_contract.get("cluster_contract_ok")),
         "final30_cluster_cap_clean": bool(cluster_contract.get("final30_cluster_cap_clean")),
@@ -737,6 +751,48 @@ def refill_under_cluster_caps(selected: list[dict], candidate_pool: list[dict], 
         drop_idx = min(ai_indexes, key=lambda idx: float(out[idx].get("score_final") or 0.0))
         out.pop(drop_idx)
     return out, {"fallback_fill_used": len(out) > len(selected), "fallback_fill_count": max(0, len(out) - len(selected)), "fallback_fill_cap_safe": bool(validate_final30_cluster_contract(out, regime).get("cluster_contract_ok")), "fallback_fill_attempted": attempted}
+
+
+def enforce_regime_sector_caps(selected: list[dict], candidate_pool: list[dict], constraints: dict, finaln: int) -> tuple[list[dict], dict[str, Any]]:
+    max_ai = float((constraints or {}).get("max_ai_tech_ratio", 1.0))
+    max_single = float((constraints or {}).get("max_single_cluster_ratio", 1.0))
+    regime = str((constraints or {}).get("market_regime") or "NEUTRAL")
+    if regime == "RISK_OFF":
+        max_single = 1.0  # keep comparable final30 artifact; entries remain blocked by contract.
+    before = list(selected or [])
+    before_ai = sum(1 for r in before if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS) / max(1, len(before))
+    blocked: list[str] = []
+    replacements: list[str] = []
+    out = sorted(before, key=lambda r: float(r.get("score_final") or 0), reverse=True)
+    def ratios(rows):
+        counts = _cluster_counts(rows); total=max(1,len(rows)); ai=sum(counts.get(c,0) for c in AI_CLUSTERS)/total; single=max(counts.values() or [0])/total; return ai,single,counts
+    while out:
+        ai,single,counts = ratios(out)
+        if ai <= max_ai and single <= max_single: break
+        if ai > max_ai:
+            idxs=[i for i,r in enumerate(out) if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r)) in AI_CLUSTERS]
+        else:
+            worst=max(counts, key=counts.get); idxs=[i for i,r in enumerate(out) if (r.get("theme_cluster") or theme_cluster_for(str(r.get("symbol") or ""), r))==worst]
+        if not idxs: break
+        idx=min(idxs, key=lambda i: float(out[i].get("score_final") or 0))
+        blocked.append(str(out[idx].get("symbol") or "")); out.pop(idx)
+    used={str(r.get("symbol") or "") for r in out}
+    for row in sorted(candidate_pool or [], key=lambda r: float(r.get("score_final") or 0), reverse=True):
+        if len(out) >= finaln: break
+        sym=str(row.get("symbol") or "")
+        if not sym or sym in used: continue
+        cluster=row.get("theme_cluster") or theme_cluster_for(sym,row)
+        if cluster in AI_CLUSTERS and ratios(out+[row])[0] > max_ai: continue
+        if ratios(out+[row])[1] > max_single: continue
+        # Prefer replacements from non-AI defensive/cyclical clusters when caps are tight.
+        out.append(row); used.add(sym); replacements.append(sym)
+    after_ai = ratios(out)[0]
+    cap_violations=[]
+    ai,single,_=ratios(out)
+    if ai > max_ai: cap_violations.append("AI_TECH_COMBINED")
+    if single > max_single: cap_violations.append("SINGLE_CLUSTER")
+    logger.info("[US_SECTOR_CAP][ENFORCED] market_regime=%s before_ai_tech_ratio=%.4f after_ai_tech_ratio=%.4f max_ai_tech_ratio=%.4f blocked=%s replacements=%s", regime, before_ai, after_ai, max_ai, blocked, replacements)
+    return out[:finaln], {"sector_cap_enforced": True, "before_ai_tech_ratio": before_ai, "after_ai_tech_ratio": after_ai, "blocked_by_cluster_cap": blocked, "sector_cap_replacements": replacements, "cap_violations": cap_violations}
 
 def _is_etf_row(row: dict) -> bool:
     return str(row.get("asset_type") or "").lower() == "etf" or str(row.get("symbol") or "").upper() in _CORE_ETFS

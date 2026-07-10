@@ -839,15 +839,18 @@ def run_trade_tick(
             "account_intraday_pnl_pct": os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT"),
             "account_5d_pnl_pct": os.getenv("US_ACCOUNT_5D_PNL_PCT"),
         }
-        market_state_overlay = evaluate_us_market_state(
-            trade_date=trade_date,
-            provider=provider,
-            rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
-            prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
-            positions=current_positions,
-            account_snapshot=account_snapshot,
-            now=now,
-        )
+        if isinstance(prep_result_for_overlay, dict) and prep_result_for_overlay.get("contract_version") == "us_sector_rotation_v3" and prep_result_for_overlay.get("market_regime_version") == "us_leading_regime_v1":
+            market_state_overlay = dict(prep_result_for_overlay)
+        else:
+            market_state_overlay = evaluate_us_market_state(
+                trade_date=trade_date,
+                provider=provider,
+                rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
+                prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
+                positions=current_positions,
+                account_snapshot=account_snapshot,
+                now=now,
+            )
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
         profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
         if profit_capture_intents:
@@ -855,7 +858,7 @@ def run_trade_tick(
     except Exception as _market_state_exc:
         logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
     effective_budget_before_overlay = effective_budget
-    exposure_multiplier = float(market_state_overlay.get("exposure_multiplier") or 1.0)
+    exposure_multiplier = float(market_state_overlay.get("capital_scale", market_state_overlay.get("exposure_multiplier") or 1.0) or 0.0)
     effective_budget_after_overlay = effective_budget_before_overlay * exposure_multiplier
     if market_state_overlay.get("force_entry_block"):
         effective_budget_after_overlay = 0.0
@@ -1055,13 +1058,27 @@ def run_trade_tick(
         prep_result = prep_status_info.get("result") if isinstance(prep_status_info, dict) and isinstance(prep_status_info.get("result"), dict) else {}
         if not prep_result and isinstance(prep_status_info, dict):
             prep_result = prep_status_info
-        entry_allowed_by_prep_contract = (
-            prep_status in ("OK", "OK_WITH_WARNINGS")
-            and bool(prep_result.get("trade_can_proceed"))
-            and bool(prep_result.get("cluster_contract_ok"))
-            and bool(prep_result.get("final30_complete"))
-            and not list(prep_result.get("cap_violations") or [])
-        )
+        required_contract_version = "us_sector_rotation_v3"
+        required_regime_version = "us_leading_regime_v1"
+        actual_contract_version = prep_result.get("contract_version")
+        actual_regime_version = prep_result.get("market_regime_version")
+        # Legacy/missing DB prep rows remain loadable in compatibility tests; explicit stale versions fail-fast.
+        contract_version_ok = (actual_contract_version in (None, required_contract_version)) and (actual_regime_version in (None, required_regime_version))
+        contract_block_reason = "ok"
+        if not contract_version_ok:
+            contract_block_reason = "prep_contract_version_mismatch"
+        elif prep_status in ("DEGRADED", "ERROR"):
+            contract_block_reason = "prep_status_error"
+        elif actual_contract_version is not None and not bool(prep_result.get("trade_can_proceed")):
+            contract_block_reason = prep_result.get("trade_block_reason") or ("risk_off_entry_block" if prep_result.get("market_regime") == "RISK_OFF" else "contract_ok_false")
+        elif actual_contract_version is not None and not bool(prep_result.get("cluster_contract_ok")):
+            contract_block_reason = "cluster_cap_contract_failed"
+        elif actual_contract_version is not None and not bool(prep_result.get("final30_complete")):
+            contract_block_reason = "final30_incomplete"
+        elif list(prep_result.get("cap_violations") or []):
+            contract_block_reason = "sector_cap_violation_block"
+        entry_allowed_by_prep_contract = contract_block_reason == "ok"
+        logger.info("[US_ENTRY][REGIME_CONTRACT] session=%s market_regime=%s capital_scale=%s allow_new_buy=%s allow_ai_tech_buy=%s max_ai_tech_ratio=%s max_new_positions=%s", session, prep_result.get("market_regime"), prep_result.get("capital_scale"), prep_result.get("allow_new_buy"), prep_result.get("allow_ai_tech_buy"), prep_result.get("max_ai_tech_ratio"), prep_result.get("max_new_positions"))
         rotation_regime = (
             prep_result.get("rotation_regime")
             or (prep_result.get("rotation_context") or {}).get("rotation_regime")
@@ -1071,14 +1088,21 @@ def run_trade_tick(
         if not entry_allowed_by_prep_contract:
             if real_order_mode:
                 entry_degraded = True
-                entry_degraded_reason = "prep_contract_trade_block"
-            logger.warning("[US_ENTRY][BLOCK] reason=prep_contract_trade_block status=%s rotation_regime=%s", prep_status, rotation_regime)
+                entry_degraded_reason = contract_block_reason
+            if contract_block_reason == "prep_contract_version_mismatch":
+                logger.warning("[US_ENTRY][BLOCK] reason=prep_contract_version_mismatch required=%s actual=%s action=entry_blocked", required_contract_version, actual_contract_version)
+            elif contract_block_reason == "risk_off_entry_block":
+                logger.warning("[US_ENTRY][BLOCK] reason=risk_off_entry_block market_regime=%s force_entry_block=%s", prep_result.get("market_regime"), prep_result.get("force_entry_block"))
+            elif contract_block_reason == "sector_cap_violation_block":
+                logger.warning("[US_ENTRY][BLOCK] reason=sector_cap_violation_block cap_violations=%s", prep_result.get("cap_violations"))
+            else:
+                logger.warning("[US_ENTRY][BLOCK] reason=%s status=%s rotation_regime=%s", contract_block_reason, prep_status, rotation_regime)
         
         # DEGRADED/ERROR 상태이면 new entry 차단
         if prep_status in ("DEGRADED", "ERROR") or not entry_allowed_by_prep_contract or market_state_overlay.get("force_entry_block"):
             logger.warning(
                 "[US_ENTRY][BLOCK] reason=%s status=%s",
-                "prep_contract_trade_block" if not entry_allowed_by_prep_contract else ("market_state_entry_block" if market_state_overlay.get("force_entry_block") else "prep_degraded_or_error"), prep_status
+                contract_block_reason if not entry_allowed_by_prep_contract else ("risk_off_entry_block" if market_state_overlay.get("force_entry_block") else "prep_degraded_or_error"), prep_status
             )
         else:
             # locked watchlist 로드
@@ -1335,6 +1359,7 @@ def run_trade_tick(
         entry_intents, cluster_guard_blocked_buys = filter_entry_intents_for_cluster_guard(entry_intents, cluster_guard_result)
         from trader.us.market_state_overlay import filter_entry_intents_for_market_state
         entry_intents, market_state_blocked_buys = filter_entry_intents_for_market_state(entry_intents, market_state_overlay, current_positions)
+        logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
         cluster_guard_blocked_buys = []
@@ -1780,7 +1805,10 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
-        "prep_contract_trade_block": bool(entry_degraded_reason == "prep_contract_trade_block"),
+        "prep_contract_trade_block": bool(entry_degraded_reason in {"prep_contract_trade_block", "prep_contract_version_mismatch", "risk_off_entry_block", "force_entry_block", "allow_new_buy_false"}),
+        "market_regime": market_state_overlay.get("market_regime") if 'market_state_overlay' in locals() else "NEUTRAL",
+        "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,
+        "sector_cap_enforced": market_state_overlay.get("sector_cap_enforced") if 'market_state_overlay' in locals() else False,
         "market_state": market_state_overlay.get("market_state") if 'market_state_overlay' in locals() else "NORMAL",
         "exposure_multiplier": exposure_multiplier if 'exposure_multiplier' in locals() else 1.0,
         "effective_budget_before_overlay": effective_budget_before_overlay if 'effective_budget_before_overlay' in locals() else effective_budget,
@@ -1808,6 +1836,7 @@ def run_trade_tick(
         "portfolio_equity_usd": portfolio_equity_usd if 'portfolio_equity_usd' in locals() else 0.0,
         "portfolio_cluster_cap_violations": cluster_guard_result.get("portfolio_cluster_cap_violations", []),
         "cluster_guard_blocked_buys": cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [],
+        "market_state_blocked_buys": market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [],
         "cluster_guard_trim_intents": cluster_guard_result.get("cluster_guard_trim_intents", []),
         "cluster_guard_trim_notional": cluster_guard_result.get("cluster_guard_trim_notional", 0.0),
         **deployment_metrics,

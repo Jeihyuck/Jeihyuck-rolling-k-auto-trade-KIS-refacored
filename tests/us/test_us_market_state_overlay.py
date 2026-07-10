@@ -202,3 +202,44 @@ def test_gross_cap_blocks_new_buy_even_in_risk_on_and_weak_add_blocked():
     kept, blocked = filter_entry_intents_for_market_state([{"symbol": "NVDA", "side": "BUY", "rank_final30": 1, "score_final": 0.9, "trend_score": 1.0}], strong, positions=[{"symbol": "NVDA", "qty": 10, "current_price_usd": 95, "entry_price": 100}])
     assert kept == []
     assert blocked[0]["reason"] == "MARKET_STATE_ENTRY_BLOCK"
+
+
+def provider20(vals: dict[str, tuple[float, float, float, float]]):
+    # Four anchors are expanded into 21 oldest-first rows preserving 20d/3d/1d returns.
+    base = {}
+    for sym in ["SPY", "QQQ", "SMH", "RSP", "IWM", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE", "DIA"]:
+        p20, p3, p1, last = vals.get(sym, (100, 100, 100, 100))
+        closes = [p20] + [p20] * 16 + [p3, 100, p1, last]
+        base[sym] = rows_oldest_first(*closes)
+    return base
+
+
+def test_market_regime_risk_on():
+    p = provider20({"SPY": (100, 101, 102, 104), "QQQ": (100, 104, 104, 108), "SMH": (100, 105, 105, 110), "RSP": (100, 102, 103, 106), "IWM": (100, 102, 103, 106), "XLK": (100, 104, 104, 108), "XLI": (100, 103, 103, 107), "XLF": (100, 103, 103, 107), "XLE": (100, 103, 103, 107)})
+    o = eval_state(provider=p, rotation_context={"rotation_regime": "AI_ON", "benchmark_data_quality": "ok"}, prep_result={"rotation_regime": "AI_ON"})
+    assert o["market_regime"] == "RISK_ON"
+    assert o["capital_scale"] >= 0.9
+    assert o["allow_ai_tech_buy"] is True
+
+
+def test_market_regime_growth_leadership():
+    p = provider20({"SPY": (100, 101, 102, 104), "QQQ": (100, 104, 104, 108), "SMH": (100, 105, 105, 110), "RSP": (100, 99, 100, 102), "IWM": (100, 99, 100, 102), "XLK": (100, 104, 104, 108)})
+    o = eval_state(provider=p, rotation_context={"rotation_regime": "AI_ON", "benchmark_data_quality": "ok"}, prep_result={"rotation_regime": "AI_ON"})
+    assert o["market_regime"] == "GROWTH_LEADERSHIP"
+    assert o["capital_scale"] == pytest.approx(0.70)
+    assert o["max_ai_tech_ratio"] <= 0.45
+
+
+def test_market_regime_defensive():
+    p = provider20({"SPY": (100, 99, 99, 98.5), "QQQ": (100, 98, 98, 97.5), "SMH": (100, 98, 98, 97.5), "XLV": (100, 102, 102, 103), "XLP": (100, 102, 102, 103), "XLU": (100, 102, 102, 103)})
+    o = eval_state(provider=p)
+    assert o["market_regime"] == "DEFENSIVE"
+    assert o["allow_ai_tech_buy"] is False
+    assert o["max_ai_tech_ratio"] <= 0.20
+
+
+def test_market_regime_risk_off_contract_block_fields():
+    o = eval_state(provider=provider20({"SPY": (100, 98, 99, 97), "QQQ": (100, 96, 98, 95), "SMH": (100, 95, 97, 94)}), rotation_context={"rotation_regime": "NORMAL", "rotation_context_suspect": True, "rotation_suspect_policy": "block"})
+    assert o["market_regime"] == "RISK_OFF"
+    assert o["force_entry_block"] is True
+    assert o["allow_new_buy"] is False

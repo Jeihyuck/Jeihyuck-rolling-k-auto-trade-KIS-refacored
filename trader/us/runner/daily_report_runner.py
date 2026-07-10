@@ -303,6 +303,10 @@ def run_daily_report(
         "portfolio_cluster_weights": {},
         "cluster_exposure": {},
         "cap_violations": [],
+        "market_regime": "NEUTRAL",
+        "capital_scale": 1.0,
+        "blocked_entry_reason_counts": {},
+        "sector_cap_enforced": False,
     }
     
     # DRY_RUN
@@ -368,7 +372,7 @@ def run_daily_report(
                     report["rotation_regime"] = result_data.get("rotation_regime") or result_data.get("rotation_context", {}).get("rotation_regime") or report.get("rotation_regime")
                     report["portfolio_cluster_weights"] = result_data.get("portfolio_cluster_weights") or report.get("portfolio_cluster_weights")
                     report["cap_violations"] = result_data.get("cap_violations") or report.get("cap_violations")
-                    for key in ("market_state", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
+                    for key in ("market_state", "market_regime", "capital_scale", "sector_cap_enforced", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
                         if key in result_data:
                             report[key] = result_data.get(key)
             except Exception as exc:
@@ -718,6 +722,10 @@ def run_daily_report(
         f"| ack_pending_reconcile_count | {report.get('ack_pending_reconcile_count', 0)} |",
         f"| positions | {report['positions']} |",
         f"| rotation_regime | {report.get('rotation_regime', 'UNKNOWN')} |",
+        f"| market_regime | {report.get('market_regime', 'NEUTRAL')} |",
+        f"| capital_scale | {report.get('capital_scale', 1.0)} |",
+        f"| sector_cap_enforced | {report.get('sector_cap_enforced', False)} |",
+        f"| blocked_entry_reason_counts | {report.get('blocked_entry_reason_counts', {})} |",
         f"| cap_violations | {report.get('cap_violations', [])} |",
         "",
         "## Watchlist & Score Contract",

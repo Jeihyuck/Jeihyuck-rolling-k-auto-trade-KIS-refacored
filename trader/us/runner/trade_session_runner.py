@@ -466,7 +466,7 @@ def run_trade_session(
                 trade_date,
                 "force_now" if force_now else "offline",
             )
-        elif _file_guard["already_ran"]:
+        elif _file_guard["already_ran"] or (max_ticks <= 0 and (_file_guard.get("payload") or {}).get("status") == "OK"):
             guard_payload = _file_guard["payload"]
             # P7: stale guard 리포트 — 실제 시작 시각과 예상 시각 차이 계산
             _schedule_expected_et = _file_guard.get("schedule_expected_et", "")

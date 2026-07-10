@@ -373,12 +373,27 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         )
         watchlist_result["market_state_overlay"] = market_state_overlay
         logger.info("[US_MARKET_STATE][PREP] market_state=%s exposure_multiplier=%s", market_state_overlay.get("market_state"), market_state_overlay.get("exposure_multiplier"))
+        logger.info("[US_MARKET_REGIME][PREP] trade_date=%s market_regime=%s risk_score=%s growth_score=%s breadth_score=%s defensive_score=%s capital_scale=%s max_ai_tech_ratio=%s allow_new_buy=%s reasons=%s", trade_date, market_state_overlay.get("market_regime"), market_state_overlay.get("risk_score"), market_state_overlay.get("growth_score"), market_state_overlay.get("breadth_score"), market_state_overlay.get("defensive_score"), market_state_overlay.get("capital_scale"), market_state_overlay.get("max_ai_tech_ratio"), market_state_overlay.get("allow_new_buy"), market_state_overlay.get("regime_reasons"))
     except Exception as exc:
         logger.warning("[US_MARKET_STATE][PREP][WARN] %s", exc)
         market_state_overlay = {"market_state": "NORMAL", "defense_regime": "NONE", "risk_on_regime": "NONE", "market_state_reasons": ["MARKET_STATE_OVERLAY_EVAL_FAILED"], "exposure_multiplier": 1.0, "allow_new_buy": True, "allow_add_to_existing": False, "allow_ai_tech_buy": False, "allow_defensive_buy": True, "force_entry_block": False, "trim_required": False, "profit_capture_enabled": True, "trailing_stop_mode": "normal", "trailing_stop_pct": 0.02, "account_loss_kill_switch_triggered": False, "account_loss_kill_switch_level": "NONE", "data_quality": "degraded", "data_quality_warnings": [str(exc)], "forbidden_hedge_symbols": []}
 
     market_state_fields = {
         "market_state": (market_state_overlay or {}).get("market_state", "NORMAL"),
+        "market_regime": (market_state_overlay or {}).get("market_regime", "NEUTRAL"),
+        "regime_score": (market_state_overlay or {}).get("regime_score", 0),
+        "risk_score": (market_state_overlay or {}).get("risk_score", 0),
+        "growth_score": (market_state_overlay or {}).get("growth_score", 0),
+        "breadth_score": (market_state_overlay or {}).get("breadth_score", 0),
+        "defensive_score": (market_state_overlay or {}).get("defensive_score", 0),
+        "capital_scale": (market_state_overlay or {}).get("capital_scale", 1.0),
+        "max_ai_tech_ratio": (market_state_overlay or {}).get("max_ai_tech_ratio", 0.35),
+        "max_single_cluster_ratio": (market_state_overlay or {}).get("max_single_cluster_ratio", 0.20),
+        "max_new_positions": (market_state_overlay or {}).get("max_new_positions", 10),
+        "entry_aggressiveness": (market_state_overlay or {}).get("entry_aggressiveness", "normal"),
+        "take_profit_mode": (market_state_overlay or {}).get("take_profit_mode", "staged_take_profit"),
+        "stop_tightening_level": (market_state_overlay or {}).get("stop_tightening_level", "normal"),
+        "market_regime_version": (market_state_overlay or {}).get("market_regime_version", "us_leading_regime_v1"),
         "defense_regime": (market_state_overlay or {}).get("defense_regime", "NONE"),
         "risk_on_regime": (market_state_overlay or {}).get("risk_on_regime", "NONE"),
         "market_state_reasons": (market_state_overlay or {}).get("market_state_reasons", []),
@@ -422,8 +437,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         final_status = "FAILED_CLUSTER_CAP_CONTRACT"
     elif not final30_complete:
         final_status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
-    if (market_state_overlay or {}).get("market_state") == "DEFENSE_CRASH":
-        final_status = "DEFENSE_CRASH_ENTRY_BLOCKED"
+    if (market_state_overlay or {}).get("market_regime") == "RISK_OFF":
+        final_status = "RISK_OFF_ENTRY_BLOCKED" if (market_state_overlay or {}).get("market_state") != "DEFENSE_CRASH" else "DEFENSE_CRASH_ENTRY_BLOCKED"
 
     trade_can_proceed = int(
         final_status in ("OK", "OK_WITH_WARNINGS")
@@ -432,7 +447,9 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         and final30_complete
         and score_nonzero_count == wl_final30
         and not cap_violations
+        and (market_state_overlay or {}).get("market_regime") != "RISK_OFF"
         and not (market_state_overlay or {}).get("force_entry_block", False)
+        and bool((market_state_overlay or {}).get("allow_new_buy", True))
     )
 
     logger.info(
