@@ -1146,6 +1146,29 @@ def run_trade_tick(
         contract_block_reason = gate["reason"]
         entry_allowed_by_prep_contract = bool(gate["ok"])
         logger.info("[US_ENTRY][REGIME_CONTRACT] session=%s market_regime=%s capital_scale=%s effective_capital_scale=%s allow_new_buy=%s allow_ai_tech_buy=%s max_ai_tech_ratio=%s max_new_positions=%s effective_max_new_positions=%s underfilled_tier=%s", session, prep_result.get("market_regime"), prep_result.get("capital_scale"), prep_result.get("effective_capital_scale"), prep_result.get("allow_new_buy"), prep_result.get("allow_ai_tech_buy"), prep_result.get("max_ai_tech_ratio"), prep_result.get("max_new_positions"), prep_result.get("effective_max_new_positions"), prep_result.get("underfilled_tier"))
+        available_new_slots_before_underfilled_limit = available_new_slots
+        effective_max_new_positions = prep_result.get(
+            "effective_max_new_positions",
+            market_state_overlay.get("effective_max_new_positions") if isinstance(market_state_overlay, dict) else None,
+        )
+        if effective_max_new_positions is not None:
+            try:
+                effective_max_new_positions_int = int(effective_max_new_positions)
+                available_new_slots = min(available_new_slots, max(0, effective_max_new_positions_int))
+                allow_new_symbols = bool(allow_new_symbols and available_new_slots > 0)
+                logger.info(
+                    "[US_ENTRY][UNDERFILLED_LIMIT] available_new_slots_before=%d effective_max_new_positions=%d available_new_slots_after=%d underfilled_tier=%s",
+                    available_new_slots_before_underfilled_limit,
+                    effective_max_new_positions_int,
+                    available_new_slots,
+                    prep_result.get("underfilled_tier") or market_state_overlay.get("underfilled_tier"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[US_ENTRY][UNDERFILLED_LIMIT][WARN] invalid_effective_max_new_positions=%s error=%s",
+                    effective_max_new_positions,
+                    exc,
+                )
         rotation_regime = (
             prep_result.get("rotation_regime")
             or (prep_result.get("rotation_context") or {}).get("rotation_regime")
