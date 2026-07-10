@@ -419,62 +419,62 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "forbidden_hedge_symbols": (market_state_overlay or {}).get("forbidden_hedge_symbols", []),
     }
 
-    # ── 9. Final Status 결정 ──────────────────────────────────────────────
+    # ── 9. Prep Contract 생성 + 저장 ──────────────────────────────────────
+    # runner는 provisional status만 계산하고, 최종 gate/status는 prep_contract를
+    # authoritative source로 사용한다. Underfilled final30 정책은 contract에 있다.
     du_warn = du_status == "OK_WITH_WARNINGS"
     cp_warn = cp_status == "OK_WITH_WARNINGS"
     if du_status == "ERROR" or cp_status == "ERROR":
-        final_status = "ERROR"
+        provisional_status = "ERROR"
     elif du_warn or cp_warn:
-        final_status = "OK_WITH_WARNINGS"
+        provisional_status = "OK_WITH_WARNINGS"
     else:
-        final_status = "OK"
+        provisional_status = "OK"
 
-    score_nonzero_count = validation.get("score_nonzero_count", 0)
-    contract_ok = validation.get("ok", False)
-    final30_complete = wl_final30 == 30
-    cap_violations = list(watchlist_result.get("cap_violations") or [])
-    cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
-    if (watchlist_result.get("rotation_context") or {}).get("rotation_context_suspect") and str((watchlist_result.get("rotation_context") or {}).get("rotation_suspect_policy") or "block") == "block":
-        cluster_contract_ok = False
-        if "ROTATION_CONTEXT_SUSPECT" not in cap_violations:
-            cap_violations.append("ROTATION_CONTEXT_SUSPECT")
-    if not cluster_contract_ok:
-        final_status = "FAILED_CLUSTER_CAP_CONTRACT"
-    elif not final30_complete:
-        final_status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
-    if (market_state_overlay or {}).get("market_regime") == "RISK_OFF":
-        final_status = "RISK_OFF_ENTRY_BLOCKED" if (market_state_overlay or {}).get("market_state") != "DEFENSE_CRASH" else "DEFENSE_CRASH_ENTRY_BLOCKED"
-
-    trade_can_proceed = int(
-        final_status in ("OK", "OK_WITH_WARNINGS")
-        and contract_ok
-        and cluster_contract_ok
-        and final30_complete
-        and score_nonzero_count == wl_final30
-        and not cap_violations
-        and (market_state_overlay or {}).get("market_regime") != "RISK_OFF"
-        and not (market_state_overlay or {}).get("force_entry_block", False)
-        and bool((market_state_overlay or {}).get("allow_new_buy", True))
-    )
-
-    logger.info(
-        "[US_PREP][FINAL_STATUS] final=%s final30=%d score_nonzero=%d contract_ok=%d trade_can_proceed=%d",
-        final_status, wl_final30, score_nonzero_count, int(contract_ok), trade_can_proceed,
-    )
-
-    # ── 9. Prep Contract 생성 + 저장 ──────────────────────────────────────
     try:
         from trader.us.prep_contract import build_us_prep_contract, save_us_prep_contract, save_us_prep_summary
         contract = build_us_prep_contract(
             trade_date=trade_date,
             env=env,
-            status=final_status,
+            status=provisional_status,
             dynamic_universe_result=dynamic_universe_result,
             candidate_pool_result=candidate_pool_result,
             watchlist_result=watchlist_result,
             validation=validation,
             paths=paths,
         )
+
+        final_status = contract.get("status", provisional_status)
+        trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)
+        trade_block_reason = contract.get("trade_block_reason", "unknown")
+        contract_ok = bool(contract.get("contract_ok", False))
+        cluster_contract_ok = bool(contract.get("cluster_contract_ok", False))
+        final30_complete = bool(contract.get("final30_complete", False))
+        final30_trade_ready = bool(contract.get("final30_trade_ready", False))
+        final30_empty = bool(contract.get("final30_empty", False))
+        underfilled_final30 = bool(contract.get("underfilled_final30", False))
+        underfilled_tier = contract.get("underfilled_tier")
+        underfilled_capital_haircut = contract.get("underfilled_capital_haircut")
+        effective_capital_scale = contract.get("effective_capital_scale")
+        effective_max_new_positions = contract.get("effective_max_new_positions")
+        score_nonzero_count = int(contract.get("score_nonzero_count", validation.get("score_nonzero_count", 0)) or 0)
+        cap_violations = list(contract.get("cap_violations") or [])
+
+        logger.info(
+            "[US_PREP][FINAL_STATUS] final=%s final30=%d score_nonzero=%d contract_ok=%d "
+            "trade_can_proceed=%d trade_block_reason=%s underfilled_tier=%s "
+            "effective_capital_scale=%s effective_max_new_positions=%s",
+            final_status,
+            wl_final30,
+            score_nonzero_count,
+            int(contract_ok),
+            trade_can_proceed,
+            trade_block_reason,
+            underfilled_tier,
+            effective_capital_scale,
+            effective_max_new_positions,
+        )
+
         contract_save = save_us_prep_contract(contract)
         if not contract_save["ok"]:
             logger.error("[US_PREP][ERROR] prep_contract save failed: %s", contract_save["errors"])
@@ -526,19 +526,29 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         saved_count = len(final30_scored)
 
     # ── 11. finish run ────────────────────────────────────────────────────
-    result_dict = {
+    result_dict = dict(contract)
+    result_dict.update({
         "status": final_status,
-        "dynamic_universe_count": du_count,
-        "candidate_pool_count": cp_count,
-        "top50_count": watchlist_result.get("top50_count", 0),
-        "final30_count": wl_final30,
-        "final30_scored_count": wl_final30,
-        "score_nonzero_count": score_nonzero_count,
+        "dynamic_universe_count": contract.get("dynamic_universe_count", du_count),
+        "candidate_pool_count": contract.get("candidate_pool_count", cp_count),
+        "top50_count": contract.get("top50_count", watchlist_result.get("top50_count", 0)),
+        "final30_count": contract.get("final30_count", wl_final30),
+        "final30_scored_count": contract.get("final30_scored_count", wl_final30),
+        "score_nonzero_count": contract.get("score_nonzero_count", score_nonzero_count),
         "contract_ok": contract_ok,
         "cluster_contract_ok": cluster_contract_ok,
         "final30_complete": final30_complete,
+        "final30_trade_ready": final30_trade_ready,
+        "final30_empty": final30_empty,
+        "underfilled_final30": underfilled_final30,
+        "underfilled_tier": underfilled_tier,
+        "underfilled_capital_haircut": underfilled_capital_haircut,
+        "effective_capital_scale": effective_capital_scale,
+        "effective_max_new_positions": effective_max_new_positions,
         "trade_can_proceed": trade_can_proceed,
+        "trade_block_reason": trade_block_reason,
         "watchlist_count": saved_count,
+        "locked_count": saved_count,
         "rotation_regime": watchlist_result.get("rotation_regime"),
         "rotation_context": watchlist_result.get("rotation_context", {}),
         "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
@@ -552,7 +562,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
         "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
         **market_state_fields,
-    }
+    })
     finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
 
     logger.info(
@@ -572,17 +582,40 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         _status_file = _status_dir / "prep_status.json"
         _event_name = os.environ.get("GITHUB_EVENT_NAME", "")
         _workflow_name = os.environ.get("GITHUB_WORKFLOW", "US Trade Prep")
-        _status_ok = final_status in ("OK", "OK_WITH_WARNINGS", "SUCCESS", "COMPLETED")
+        blocked_statuses = {
+            "ERROR",
+            "FAILED_CLUSTER_CAP_CONTRACT",
+            "FAILED_FINAL30_UNDERFILLED",
+            "RISK_OFF_ENTRY_BLOCKED",
+            "DEFENSE_CRASH_ENTRY_BLOCKED",
+        }
+        _status_ok = bool(
+            trade_can_proceed == 1
+            or (
+                final_status in {"OK", "OK_WITH_WARNINGS", "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"}
+                and final_status not in blocked_statuses
+            )
+        )
         prep_status_payload = {
             "market": "US",
             "as_of": trade_date,
             "trade_date": trade_date,
+            **market_state_fields,
+            **contract,
             "status": final_status,
             "status_ok": _status_ok,
             "contract_ok": contract_ok,
             "cluster_contract_ok": cluster_contract_ok,
             "final30_complete": final30_complete,
+            "final30_trade_ready": final30_trade_ready,
+            "final30_empty": final30_empty,
+            "underfilled_final30": underfilled_final30,
+            "underfilled_tier": underfilled_tier,
+            "underfilled_capital_haircut": underfilled_capital_haircut,
+            "effective_capital_scale": effective_capital_scale,
+            "effective_max_new_positions": effective_max_new_positions,
             "trade_can_proceed": trade_can_proceed,
+            "trade_block_reason": trade_block_reason,
             "final30_rows": wl_final30,
             "watchlist_rows": saved_count,
             "score_nonzero_count": score_nonzero_count,
@@ -591,19 +624,6 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "env": env,
             "event": _event_name,
             "workflow": _workflow_name,
-            "rotation_regime": watchlist_result.get("rotation_regime"),
-            "rotation_context": watchlist_result.get("rotation_context", {}),
-            "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
-            "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio", 0.0),
-            "portfolio_cluster_weights": watchlist_result.get("portfolio_cluster_weights", {}),
-            "cap_violations": cap_violations,
-            "final30_cluster_cap_clean": watchlist_result.get("final30_cluster_cap_clean", cluster_contract_ok),
-            "blocked_by_cluster_cap": watchlist_result.get("blocked_by_cluster_cap", []),
-            "selected_by_bucket_champion": watchlist_result.get("selected_by_bucket_champion", False),
-            "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
-            "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
-            "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
-            **market_state_fields,
         }
         _save_json_file(_status_file, prep_status_payload)
         logger.info(
@@ -613,32 +633,26 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     except Exception as exc:
         logger.warning("[US_PREP][WARN] prep_status.json save failed: %s", exc)
 
-    return {
+    result = dict(contract)
+    result.update({
         "status": final_status,
         "run_id": run_id,
         "trade_date": trade_date,
-        "dynamic_universe_count": du_count,
-        "candidate_pool_count": cp_count,
-        "top50_count": watchlist_result.get("top50_count", 0),
-        "final30_count": wl_final30,
-        "final30_scored_count": wl_final30,
-        "score_nonzero_count": score_nonzero_count,
-        "contract_ok": contract_ok,
-        "cluster_contract_ok": cluster_contract_ok,
-        "final30_complete": final30_complete,
+        "watchlist_count": saved_count,
+        "locked_count": saved_count,
         "trade_can_proceed": trade_can_proceed,
-        "rotation_regime": watchlist_result.get("rotation_regime"),
-        "final30_cluster_counts": watchlist_result.get("final30_cluster_counts", {}),
-        "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio", 0.0),
-        "cap_violations": cap_violations,
-        "final30_cluster_cap_clean": watchlist_result.get("final30_cluster_cap_clean", cluster_contract_ok),
-        "blocked_by_cluster_cap": watchlist_result.get("blocked_by_cluster_cap", []),
-        "selected_by_bucket_champion": watchlist_result.get("selected_by_bucket_champion", False),
-        "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
-        "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
-        "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
-        **market_state_fields,
-    }
+        "trade_block_reason": trade_block_reason,
+    })
+    return result
+
+
+def _prep_exit_code(result: dict) -> int:
+    """Return process exit code for a prep result using contract-authoritative gate."""
+    if int(result.get("trade_can_proceed", 0) or 0) == 1:
+        return 0
+    if result.get("status") in {"OK", "OK_WITH_WARNINGS"}:
+        return 0
+    return 1
 
 
 def main() -> None:
@@ -662,8 +676,7 @@ def main() -> None:
             logger.info("[US_PREP][OFFLINE_EXIT] status=%s allowed", result["status"])
             sys.exit(0)
 
-    if result["status"] not in ("OK", "OK_WITH_WARNINGS"):
-        sys.exit(1)
+    sys.exit(_prep_exit_code(result))
 
 
 if __name__ == "__main__":
