@@ -173,7 +173,8 @@ def resolve_exchange(symbol: str) -> str:
 
 def get_quote_exchange_code(exchange: str) -> str:
     """KIS quote API용 exchange code (예: NAS, NYS, AMS)."""
-    info = US_EXCHANGE_REGISTRY.get(exchange.upper())
+    normalized = normalize_us_exchange(exchange)
+    info = US_EXCHANGE_REGISTRY.get(normalized)
     if info is None:
         raise ValueError(f"get_quote_exchange_code: unknown exchange={exchange!r}")
     return info["quote_excd"]
@@ -181,7 +182,8 @@ def get_quote_exchange_code(exchange: str) -> str:
 
 def get_order_exchange_code(exchange: str) -> str:
     """KIS order API용 exchange code (예: NASD, NYSE, AMEX)."""
-    info = US_EXCHANGE_REGISTRY.get(exchange.upper())
+    normalized = normalize_us_exchange(exchange)
+    info = US_EXCHANGE_REGISTRY.get(normalized)
     if info is None:
         raise ValueError(f"get_order_exchange_code: unknown exchange={exchange!r}")
     return info["order_exchange_code"]
@@ -197,7 +199,7 @@ def reject_unknown_symbol(symbol: str) -> None:
 def register_symbol(symbol: str, exchange: str) -> None:
     """런타임에 심볼을 레지스트리에 추가 (universe 로드 시 사용)."""
     sym = normalize_symbol(symbol)
-    exc = exchange.upper()
+    exc = normalize_us_exchange(exchange)
     if exc not in US_EXCHANGE_REGISTRY:
         raise ValueError(f"register_symbol: unknown exchange={exc!r}")
     _SYMBOL_EXCHANGE_MAP[sym] = exc
