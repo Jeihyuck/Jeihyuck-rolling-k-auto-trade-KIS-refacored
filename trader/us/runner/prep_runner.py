@@ -276,7 +276,25 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         finish_us_prep_run(run_id, status="ERROR", result=str(exc))
         return {"status": "ERROR", "stage": "candidate_pool", "error": str(exc)}
 
-    # ── 5. Watchlist (Dual-Agent Scoring) ─────────────────────────────────
+    # ── 5. Market Regime (single source of truth) + Watchlist ──────────────
+    try:
+        from trader.us.market_state_overlay import evaluate_us_market_state
+        from trader.us.watchlist_builder import _build_rotation_context
+        prep_rotation_context = _build_rotation_context(provider, candidate_pool_result["rows"], as_of_date)
+        market_state_overlay = evaluate_us_market_state(
+            trade_date=trade_date,
+            provider=provider,
+            rotation_context=prep_rotation_context,
+            prep_result={"rotation_regime": prep_rotation_context.get("rotation_regime"), "rotation_context": prep_rotation_context},
+            positions=[],
+            account_snapshot={},
+        )
+        logger.info("[US_MARKET_STATE][PREP] market_state=%s exposure_multiplier=%s", market_state_overlay.get("market_state"), market_state_overlay.get("exposure_multiplier"))
+        logger.info("[US_MARKET_REGIME][PREP] trade_date=%s market_regime=%s risk_score=%s growth_score=%s breadth_score=%s defensive_score=%s capital_scale=%s max_ai_tech_ratio=%s allow_new_buy=%s reasons=%s", trade_date, market_state_overlay.get("market_regime"), market_state_overlay.get("risk_score"), market_state_overlay.get("growth_score"), market_state_overlay.get("breadth_score"), market_state_overlay.get("defensive_score"), market_state_overlay.get("capital_scale"), market_state_overlay.get("max_ai_tech_ratio"), market_state_overlay.get("allow_new_buy"), market_state_overlay.get("regime_reasons"))
+    except Exception as exc:
+        logger.warning("[US_MARKET_STATE][PREP][WARN] %s", exc)
+        market_state_overlay = {"market_state": "NORMAL", "market_regime": "NEUTRAL", "market_regime_version": "us_leading_regime_v1", "defense_regime": "NONE", "risk_on_regime": "NONE", "market_state_reasons": ["MARKET_STATE_OVERLAY_EVAL_FAILED"], "regime_reasons": ["MARKET_STATE_OVERLAY_EVAL_FAILED"], "exposure_multiplier": 1.0, "capital_scale": 0.50, "max_ai_tech_ratio": 0.35, "max_single_cluster_ratio": 0.20, "max_new_positions": 10, "entry_aggressiveness": "normal", "take_profit_mode": "staged_take_profit", "allow_new_buy": True, "allow_add_to_existing": False, "allow_ai_tech_buy": False, "allow_defensive_buy": True, "force_entry_block": False, "trim_required": False, "profit_capture_enabled": True, "trailing_stop_mode": "normal", "trailing_stop_pct": 0.02, "account_loss_kill_switch_triggered": False, "account_loss_kill_switch_level": "NONE", "data_quality": "degraded", "data_quality_warnings": [str(exc)], "forbidden_hedge_symbols": []}
+
     logger.info("[US_PREP][HEARTBEAT] stage=watchlist_scoring status=start")
     try:
         from trader.us.watchlist_builder import build_us_watchlist
@@ -287,7 +305,10 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             candidate_pool=candidate_pool_result["rows"],
             provider=provider,
             force_rebuild=True,
+            market_regime_constraints=market_state_overlay,
         )
+        watchlist_result["market_state_overlay"] = market_state_overlay
+        watchlist_result["market_regime_constraints"] = market_state_overlay
         wl_final30 = watchlist_result.get("final30_scored_count", 0)
         logger.info("[US_PREP][HEARTBEAT] stage=watchlist_scoring status=done final30=%d", wl_final30)
         logger.info(
@@ -360,23 +381,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         finish_us_prep_run(run_id, status="ERROR", result={"stage": "final30_save", "error": str(exc)})
         return {"status": "ERROR", "stage": "final30_save", "error": str(exc)}
 
-    # ── 8. Market State Overlay ───────────────────────────────────────────
-    try:
-        from trader.us.market_state_overlay import evaluate_us_market_state
-        market_state_overlay = evaluate_us_market_state(
-            trade_date=trade_date,
-            provider=provider,
-            rotation_context=watchlist_result.get("rotation_context") or {},
-            prep_result={"rotation_regime": watchlist_result.get("rotation_regime"), "rotation_context": watchlist_result.get("rotation_context") or {}, "final30_cluster_counts": watchlist_result.get("final30_cluster_counts"), "final30_ai_tech_ratio": watchlist_result.get("final30_ai_tech_ratio")},
-            positions=[],
-            account_snapshot={},
-        )
-        watchlist_result["market_state_overlay"] = market_state_overlay
-        logger.info("[US_MARKET_STATE][PREP] market_state=%s exposure_multiplier=%s", market_state_overlay.get("market_state"), market_state_overlay.get("exposure_multiplier"))
-        logger.info("[US_MARKET_REGIME][PREP] trade_date=%s market_regime=%s risk_score=%s growth_score=%s breadth_score=%s defensive_score=%s capital_scale=%s max_ai_tech_ratio=%s allow_new_buy=%s reasons=%s", trade_date, market_state_overlay.get("market_regime"), market_state_overlay.get("risk_score"), market_state_overlay.get("growth_score"), market_state_overlay.get("breadth_score"), market_state_overlay.get("defensive_score"), market_state_overlay.get("capital_scale"), market_state_overlay.get("max_ai_tech_ratio"), market_state_overlay.get("allow_new_buy"), market_state_overlay.get("regime_reasons"))
-    except Exception as exc:
-        logger.warning("[US_MARKET_STATE][PREP][WARN] %s", exc)
-        market_state_overlay = {"market_state": "NORMAL", "defense_regime": "NONE", "risk_on_regime": "NONE", "market_state_reasons": ["MARKET_STATE_OVERLAY_EVAL_FAILED"], "exposure_multiplier": 1.0, "allow_new_buy": True, "allow_add_to_existing": False, "allow_ai_tech_buy": False, "allow_defensive_buy": True, "force_entry_block": False, "trim_required": False, "profit_capture_enabled": True, "trailing_stop_mode": "normal", "trailing_stop_pct": 0.02, "account_loss_kill_switch_triggered": False, "account_loss_kill_switch_level": "NONE", "data_quality": "degraded", "data_quality_warnings": [str(exc)], "forbidden_hedge_symbols": []}
+    # ── 8. Market State Overlay already computed before watchlist ─────────
 
     market_state_fields = {
         "market_state": (market_state_overlay or {}).get("market_state", "NORMAL"),
@@ -649,8 +654,11 @@ def main() -> None:
     result = run_prep(env=args.env, offline=args.offline, force_now=args.force_now)
 
     allow_empty_offline = int(os.getenv("US_PREP_ALLOW_EMPTY_WATCHLIST_OFFLINE", "0")) != 0
-    if args.offline and allow_empty_offline:
-        if result["status"] in ("OK", "OK_WITH_WARNINGS", "ERROR"):
+    if args.offline:
+        offline_allowed_statuses = {"OK", "OK_WITH_WARNINGS", "RISK_OFF_ENTRY_BLOCKED", "DEFENSE_CRASH_ENTRY_BLOCKED"}
+        if allow_empty_offline:
+            offline_allowed_statuses.add("ERROR")
+        if result["status"] in offline_allowed_statuses:
             logger.info("[US_PREP][OFFLINE_EXIT] status=%s allowed", result["status"])
             sys.exit(0)
 

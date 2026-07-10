@@ -306,6 +306,7 @@ def run_daily_report(
         "market_regime": "NEUTRAL",
         "capital_scale": 1.0,
         "blocked_entry_reason_counts": {},
+        "trade_block_reason": "ok",
         "sector_cap_enforced": False,
     }
     
@@ -372,7 +373,7 @@ def run_daily_report(
                     report["rotation_regime"] = result_data.get("rotation_regime") or result_data.get("rotation_context", {}).get("rotation_regime") or report.get("rotation_regime")
                     report["portfolio_cluster_weights"] = result_data.get("portfolio_cluster_weights") or report.get("portfolio_cluster_weights")
                     report["cap_violations"] = result_data.get("cap_violations") or report.get("cap_violations")
-                    for key in ("market_state", "market_regime", "capital_scale", "sector_cap_enforced", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
+                    for key in ("market_state", "market_regime", "capital_scale", "sector_cap_enforced", "trade_block_reason", "defense_regime", "risk_on_regime", "market_state_reasons", "exposure_multiplier", "trailing_stop_mode", "account_loss_kill_switch_triggered"):
                         if key in result_data:
                             report[key] = result_data.get(key)
             except Exception as exc:
@@ -392,6 +393,9 @@ def run_daily_report(
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
+                        reason_counts = report.setdefault("blocked_entry_reason_counts", {})
+                        if status in {"BLOCKED", "ORDER_DISABLED", "SIGNAL_ONLY"} and reason:
+                            reason_counts[reason] = reason_counts.get(reason, 0) + 1
                         if "FORBIDDEN_HEDGE_OR_INVERSE_ETF" in reason:
                             report["forbidden_hedge_block_count"] += 1
                         if "DEFENSE_" in reason and "ENTRY" in reason:
@@ -726,6 +730,7 @@ def run_daily_report(
         f"| capital_scale | {report.get('capital_scale', 1.0)} |",
         f"| sector_cap_enforced | {report.get('sector_cap_enforced', False)} |",
         f"| blocked_entry_reason_counts | {report.get('blocked_entry_reason_counts', {})} |",
+        f"| trade_block_reason | {report.get('trade_block_reason', 'ok')} |",
         f"| cap_violations | {report.get('cap_violations', [])} |",
         "",
         "## Watchlist & Score Contract",

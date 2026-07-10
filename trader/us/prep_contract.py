@@ -100,10 +100,12 @@ def build_us_prep_contract(
     force_entry_block = bool(market_state.get("force_entry_block", False))
     allow_new_buy = bool(market_state.get("allow_new_buy", True))
     trade_block_reason = "ok"
-    if not cluster_contract_ok:
-        trade_block_reason = "cluster_cap_contract_failed"
+    if status == "ERROR":
+        trade_block_reason = "prep_status_error"
     elif cap_violations:
         trade_block_reason = "sector_cap_violation_block"
+    elif not cluster_contract_ok:
+        trade_block_reason = "cluster_cap_contract_failed"
     elif not contract_ok:
         trade_block_reason = "contract_ok_false"
     elif not final30_complete:
@@ -116,8 +118,6 @@ def build_us_prep_contract(
         trade_block_reason = "force_entry_block"
     elif not allow_new_buy:
         trade_block_reason = "allow_new_buy_false"
-    elif status not in ("OK", "OK_WITH_WARNINGS"):
-        trade_block_reason = "prep_status_error"
     trade_can_proceed = int(trade_block_reason == "ok")
 
     warnings: list[str] = []
@@ -133,9 +133,11 @@ def build_us_prep_contract(
 
     if market_regime == "RISK_OFF":
         trade_can_proceed = 0
+        trade_block_reason = "risk_off_entry_block"
         status = "RISK_OFF_ENTRY_BLOCKED" if market_state.get("market_state") != "DEFENSE_CRASH" else "DEFENSE_CRASH_ENTRY_BLOCKED"
-    elif force_entry_block:
+    if market_state.get("market_state") == "DEFENSE_CRASH" or force_entry_block:
         trade_can_proceed = 0
+        trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
     contract = {

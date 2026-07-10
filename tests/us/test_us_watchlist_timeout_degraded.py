@@ -12,7 +12,7 @@ def test_run_trade_tick_exit_survives_missing_fallback_artifact(monkeypatch):
     _patch_tick_basics(monkeypatch, calls)
     monkeypatch.setattr("trader.us.execution.order_router.route_order", lambda intent, **kwargs: {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent})
 
-    result = run_trade_tick(session="am", env="practice", offline=False, force_now="2026-06-05T10:00:00-04:00")
+    result = run_trade_tick(session="am", env="practice", offline=False, force_now="2026-06-05T10:00:00-04:00", kis_order_allowed=False)
 
     assert result["status"] != "FAILED"
     assert result["entry_eval_status"] == "DEGRADED"

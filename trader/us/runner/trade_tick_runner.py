@@ -43,10 +43,85 @@ _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS = (
 )
 
 
+
+def validate_us_regime_contract_for_entry(prep_result: dict | None, *, real_order_mode: bool, kis_order_allowed: bool) -> dict[str, Any]:
+    prep_result = prep_result or {}
+    required_contract_version = "us_sector_rotation_v3"
+    required_regime_version = "us_leading_regime_v1"
+    actual_contract_version = prep_result.get("contract_version")
+    actual_regime_version = prep_result.get("market_regime_version")
+    is_real_trade_path = bool(real_order_mode or kis_order_allowed or os.getenv("GITHUB_EVENT_NAME") == "schedule")
+    allow_legacy_for_test = (
+        not is_real_trade_path
+        and os.getenv("US_ALLOW_LEGACY_PREP_FOR_TEST", "0").lower() in {"1", "true", "yes", "on"}
+    )
+    if allow_legacy_for_test and actual_contract_version is None and actual_regime_version is None:
+        contract_version_ok = True
+    else:
+        contract_version_ok = (
+            actual_contract_version == required_contract_version
+            and actual_regime_version == required_regime_version
+        )
+    if not contract_version_ok:
+        reason = "prep_contract_version_mismatch"
+    elif prep_result.get("status") in ("DEGRADED", "ERROR"):
+        reason = "prep_status_error"
+    elif not bool(prep_result.get("trade_can_proceed", True)):
+        reason = prep_result.get("trade_block_reason") or ("risk_off_entry_block" if prep_result.get("market_regime") == "RISK_OFF" else "trade_can_proceed_false")
+    elif not bool(prep_result.get("contract_ok", True)):
+        reason = "contract_ok_false"
+    elif not bool(prep_result.get("final30_complete", True)):
+        reason = "final30_incomplete"
+    elif int(prep_result.get("score_nonzero_count") or 0) != int(prep_result.get("final30_scored_count") or prep_result.get("score_nonzero_count") or 0):
+        reason = "score_contract_failed"
+    elif not bool(prep_result.get("cluster_contract_ok", True)):
+        reason = "cluster_cap_contract_failed"
+    elif list(prep_result.get("cap_violations") or []):
+        reason = "sector_cap_violation_block"
+    elif prep_result.get("market_regime") == "RISK_OFF":
+        reason = "risk_off_entry_block"
+    elif bool(prep_result.get("force_entry_block", False)):
+        reason = "force_entry_block"
+    elif not bool(prep_result.get("allow_new_buy", True)):
+        reason = "allow_new_buy_false"
+    else:
+        reason = "ok"
+    return {
+        "ok": reason == "ok",
+        "reason": reason,
+        "required_contract_version": required_contract_version,
+        "required_regime_version": required_regime_version,
+        "actual_contract_version": actual_contract_version,
+        "actual_regime_version": actual_regime_version,
+        "allow_legacy_for_test": allow_legacy_for_test,
+        "is_real_trade_path": is_real_trade_path,
+    }
+
 def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(pattern in text for pattern in _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS)
 
+
+
+def _blocked_entry_reason_counts(cluster_blocked: Any, market_blocked: Any, entry_degraded_reason: str | None = None) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    def add(reason: str | None) -> None:
+        if not reason:
+            return
+        counts[str(reason)] = counts.get(str(reason), 0) + 1
+    for item in cluster_blocked or []:
+        if isinstance(item, dict):
+            add(item.get("reason") or item.get("blocked_reason"))
+        else:
+            add("cluster_guard_blocked")
+    for item in market_blocked or []:
+        if isinstance(item, dict):
+            add(item.get("reason") or item.get("blocked_reason"))
+        else:
+            add("market_state_entry_block")
+    if entry_degraded_reason:
+        add(entry_degraded_reason)
+    return counts
 
 def _extract_watchlist_rows_from_payload(payload: Any) -> list[dict]:
     """Extract final30/watchlist rows from common artifact payload shapes."""
@@ -1058,26 +1133,15 @@ def run_trade_tick(
         prep_result = prep_status_info.get("result") if isinstance(prep_status_info, dict) and isinstance(prep_status_info.get("result"), dict) else {}
         if not prep_result and isinstance(prep_status_info, dict):
             prep_result = prep_status_info
-        required_contract_version = "us_sector_rotation_v3"
-        required_regime_version = "us_leading_regime_v1"
-        actual_contract_version = prep_result.get("contract_version")
-        actual_regime_version = prep_result.get("market_regime_version")
-        # Legacy/missing DB prep rows remain loadable in compatibility tests; explicit stale versions fail-fast.
-        contract_version_ok = (actual_contract_version in (None, required_contract_version)) and (actual_regime_version in (None, required_regime_version))
-        contract_block_reason = "ok"
-        if not contract_version_ok:
-            contract_block_reason = "prep_contract_version_mismatch"
-        elif prep_status in ("DEGRADED", "ERROR"):
-            contract_block_reason = "prep_status_error"
-        elif actual_contract_version is not None and not bool(prep_result.get("trade_can_proceed")):
-            contract_block_reason = prep_result.get("trade_block_reason") or ("risk_off_entry_block" if prep_result.get("market_regime") == "RISK_OFF" else "contract_ok_false")
-        elif actual_contract_version is not None and not bool(prep_result.get("cluster_contract_ok")):
-            contract_block_reason = "cluster_cap_contract_failed"
-        elif actual_contract_version is not None and not bool(prep_result.get("final30_complete")):
-            contract_block_reason = "final30_incomplete"
-        elif list(prep_result.get("cap_violations") or []):
-            contract_block_reason = "sector_cap_violation_block"
-        entry_allowed_by_prep_contract = contract_block_reason == "ok"
+        if isinstance(prep_result, dict):
+            prep_result.setdefault("status", prep_status)
+        gate = validate_us_regime_contract_for_entry(prep_result, real_order_mode=real_order_mode, kis_order_allowed=kis_order_allowed)
+        required_contract_version = gate["required_contract_version"]
+        required_regime_version = gate["required_regime_version"]
+        actual_contract_version = gate["actual_contract_version"]
+        actual_regime_version = gate["actual_regime_version"]
+        contract_block_reason = gate["reason"]
+        entry_allowed_by_prep_contract = bool(gate["ok"])
         logger.info("[US_ENTRY][REGIME_CONTRACT] session=%s market_regime=%s capital_scale=%s allow_new_buy=%s allow_ai_tech_buy=%s max_ai_tech_ratio=%s max_new_positions=%s", session, prep_result.get("market_regime"), prep_result.get("capital_scale"), prep_result.get("allow_new_buy"), prep_result.get("allow_ai_tech_buy"), prep_result.get("max_ai_tech_ratio"), prep_result.get("max_new_positions"))
         rotation_regime = (
             prep_result.get("rotation_regime")
@@ -1090,7 +1154,7 @@ def run_trade_tick(
                 entry_degraded = True
                 entry_degraded_reason = contract_block_reason
             if contract_block_reason == "prep_contract_version_mismatch":
-                logger.warning("[US_ENTRY][BLOCK] reason=prep_contract_version_mismatch required=%s actual=%s action=entry_blocked", required_contract_version, actual_contract_version)
+                logger.warning("[US_ENTRY][BLOCK] reason=prep_contract_version_mismatch required=%s actual=%s required_regime=%s actual_regime=%s action=entry_blocked", required_contract_version, actual_contract_version, required_regime_version, actual_regime_version)
             elif contract_block_reason == "risk_off_entry_block":
                 logger.warning("[US_ENTRY][BLOCK] reason=risk_off_entry_block market_regime=%s force_entry_block=%s", prep_result.get("market_regime"), prep_result.get("force_entry_block"))
             elif contract_block_reason == "sector_cap_violation_block":
@@ -1837,6 +1901,7 @@ def run_trade_tick(
         "portfolio_cluster_cap_violations": cluster_guard_result.get("portfolio_cluster_cap_violations", []),
         "cluster_guard_blocked_buys": cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [],
         "market_state_blocked_buys": market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [],
+        "blocked_entry_reason_counts": _blocked_entry_reason_counts(cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [], market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [], entry_degraded_reason),
         "cluster_guard_trim_intents": cluster_guard_result.get("cluster_guard_trim_intents", []),
         "cluster_guard_trim_notional": cluster_guard_result.get("cluster_guard_trim_notional", 0.0),
         **deployment_metrics,
