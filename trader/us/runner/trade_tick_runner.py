@@ -816,6 +816,30 @@ def run_trade_tick(
             current_positions = db_load_positions()
         except Exception:
             current_positions = []
+    try:
+        from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        lifecycle_map = reconcile_us_position_lifecycles(
+            positions=current_positions,
+            trade_date=trade_date,
+            now=now,
+            authoritative=(
+                bool(should_reconcile_balance)
+                and not recon.get("preserve_previous_positions")
+                and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
+            ),
+        )
+        for _p in current_positions:
+            _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
+            if _lc:
+                _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
+                _p["opened_trade_date"] = _lc.get("opened_trade_date")
+                _p["holding_trade_days"] = _lc.get("holding_trade_days")
+                _p["lifecycle_state_source"] = "us_position_risk_state"
+                _p["high_watermark"] = _lc.get("high_watermark")
+                _p["max_price"] = _lc.get("high_watermark")
+                _p["high_watermark_source"] = _lc.get("high_watermark_source")
+    except Exception as _lc_exc:
+        logger.warning("[US_POSITION][LIFECYCLE][WARN] err=%s", _lc_exc)
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -1454,10 +1478,15 @@ def run_trade_tick(
         entry_intents, cluster_guard_blocked_buys = filter_entry_intents_for_cluster_guard(entry_intents, cluster_guard_result)
         from trader.us.market_state_overlay import filter_entry_intents_for_market_state
         entry_intents, market_state_blocked_buys = filter_entry_intents_for_market_state(entry_intents, market_state_overlay, current_positions)
+        from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
+        entry_intents, trend_blocked_buys = filter_add_to_existing_by_trend_state(entry_intents, current_positions)
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
         cluster_guard_blocked_buys = []
+        trend_blocked_buys = []
+    if 'trend_blocked_buys' not in locals():
+        trend_blocked_buys = []
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
     if entry_eval_error_count > 0 and real_order_mode and not exit_intents:
@@ -1554,6 +1583,19 @@ def run_trade_tick(
                         )
                     except Exception as _pc_ack_exc:
                         logger.warning("[US_PROFIT_CAPTURE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _pc_ack_exc)
+                if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("trend_stage") or ""):
+                    try:
+                        from trader.us.db.repos import mark_us_position_exit_stage
+                        mark_us_position_exit_stage(
+                            trade_date,
+                            str(intent.get("symbol") or ""),
+                            str((intent.get("meta") or {}).get("trend_stage")),
+                            order_key=str(intent.get("client_order_key") or intent.get("order_key") or "") or None,
+                            status="ACK" if result["status"] == "ACK" else "PENDING",
+                            lifecycle_id=(intent.get("meta") or {}).get("position_lifecycle_id"),
+                        )
+                    except Exception as _trend_ack_exc:
+                        logger.warning("[US_POSITION][TREND_STATE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_ack_exc)
                 if str(intent.get("side", "")).upper() == "BUY":
                     buy_daily_notional += float(intent.get("notional_usd", 0) or 0)
                 if str(intent.get("side", "")).upper() == "BUY":
@@ -1900,6 +1942,15 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
+        "trend_healthy_count": sum(1 for p in current_positions if p.get("trend_state") == "HEALTHY"),
+        "trend_warning_count": sum(1 for p in current_positions if p.get("trend_state") == "WARNING"),
+        "trend_trim_count": sum(1 for p in current_positions if p.get("trend_state") == "TRIM"),
+        "trend_exit_count": sum(1 for p in current_positions if p.get("trend_state") == "EXIT"),
+        "trend_unknown_count": sum(1 for p in current_positions if p.get("trend_state") == "UNKNOWN"),
+        "high_watermark_updated_count": sum(1 for p in current_positions if p.get("high_watermark_source") == "us_position_risk_state"),
+        "time_stop_trim_count": sum(1 for i in exit_intents if i.get("exit_type") == "time_stop_trim"),
+        "time_stop_exit_count": sum(1 for i in exit_intents if i.get("exit_type") == "time_stop_exit"),
+        "trend_add_blocked_count": len(trend_blocked_buys) if 'trend_blocked_buys' in locals() else 0,
         "prep_contract_trade_block": bool(entry_degraded_reason in {"prep_contract_trade_block", "prep_contract_version_mismatch", "risk_off_entry_block", "force_entry_block", "allow_new_buy_false"}),
         "market_regime": market_state_overlay.get("market_regime") if 'market_state_overlay' in locals() else "NEUTRAL",
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,

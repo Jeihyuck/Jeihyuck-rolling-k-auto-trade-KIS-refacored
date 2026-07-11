@@ -498,6 +498,71 @@ def load_us_position_risk_state(symbol: str, trade_date: str) -> dict:
         return dict(_MEM_RISK_STATE.get(key, {}))
 
 
+
+def load_latest_us_position_risk_state(symbol: str, on_or_before_trade_date: str) -> dict:
+    """Load most recent per-symbol risk state on or before trade_date."""
+    key_symbol = str(symbol or "").strip().upper()
+    td = str(on_or_before_trade_date)
+    engine = _get_engine_or_none()
+    if engine is None:
+        candidates = [v for (d, sym), v in _MEM_RISK_STATE.items() if sym == key_symbol and str(d) <= td]
+        candidates.sort(key=lambda r: (str(r.get("trade_date") or ""), str(r.get("updated_at") or "")), reverse=True)
+        return dict(candidates[0]) if candidates else {}
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            row = conn.execute(text("""
+                SELECT trade_date, symbol, soft_stop_breach_count,
+                       first_soft_stop_seen_at, last_soft_stop_seen_at,
+                       lowest_price_since_breach, last_price, last_pnl_pct,
+                       state, updated_at
+                FROM us_position_risk_state
+                WHERE symbol = :symbol AND trade_date <= :trade_date
+                ORDER BY trade_date DESC, updated_at DESC
+                LIMIT 1
+            """), {"symbol": key_symbol, "trade_date": td}).mappings().first()
+            return dict(row) if row else {}
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][LOAD_LATEST_WARN] symbol=%s trade_date=%s err=%s", key_symbol, td, exc)
+        candidates = [v for (d, sym), v in _MEM_RISK_STATE.items() if sym == key_symbol and str(d) <= td]
+        candidates.sort(key=lambda r: (str(r.get("trade_date") or ""), str(r.get("updated_at") or "")), reverse=True)
+        return dict(candidates[0]) if candidates else {}
+
+
+def load_latest_open_us_position_lifecycles(on_or_before_trade_date: str) -> dict[str, dict]:
+    """Return latest open lifecycle per symbol on or before trade_date."""
+    td = str(on_or_before_trade_date)
+    out: dict[str, dict] = {}
+    engine = _get_engine_or_none()
+    if engine is None:
+        latest: dict[str, dict] = {}
+        for (d, sym), row in _MEM_RISK_STATE.items():
+            if str(d) <= td and (sym not in latest or (str(d), str(row.get("updated_at") or "")) > (str(latest[sym].get("trade_date") or ""), str(latest[sym].get("updated_at") or ""))):
+                latest[sym] = row
+        for sym, row in latest.items():
+            lifecycle = ((row.get("state") or {}).get("lifecycle") or {}) if isinstance(row.get("state"), dict) else {}
+            if lifecycle.get("is_open") is True:
+                out[sym] = dict(lifecycle)
+        return out
+    try:
+        with engine.begin() as conn:
+            _ensure_us_position_risk_state_table(conn)
+            rows = conn.execute(text("""
+                SELECT DISTINCT ON (symbol) trade_date, symbol, state, updated_at
+                FROM us_position_risk_state
+                WHERE trade_date <= :trade_date
+                ORDER BY symbol, trade_date DESC, updated_at DESC
+            """), {"trade_date": td}).mappings()
+            for row in rows:
+                st = row.get("state") or {}
+                lifecycle = (st.get("lifecycle") or {}) if isinstance(st, dict) else {}
+                if lifecycle.get("is_open") is True:
+                    out[str(row.get("symbol") or "").upper()] = dict(lifecycle)
+            return out
+    except Exception as exc:
+        logger.warning("[US_RISK_STATE][LOAD_OPEN_LIFECYCLES_WARN] trade_date=%s err=%s", td, exc)
+        return {}
+
 def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> None:
     """Upsert per-symbol US intraday risk state; idempotent and fail-soft."""
     key = _risk_state_key(symbol, trade_date)
@@ -643,6 +708,50 @@ def mark_us_profit_capture_stage(
     risk_state = dict(risk.get("state") or {}) if isinstance(risk, dict) else {}
     risk_state["profit_capture"] = normalized
     risk["state"] = risk_state
+    save_us_position_risk_state(sym, td, risk)
+
+
+def mark_us_position_exit_stage(
+    trade_date: str,
+    symbol: str,
+    stage: str,
+    order_key: str | None = None,
+    status: str = "PENDING",
+    lifecycle_id: str | None = None,
+) -> None:
+    """Persist trend/time exit stage transitions in state.trend."""
+    sym = str(symbol or "").strip().upper()
+    stg = str(stage or "").strip().lower()
+    if stg not in {"trend_trim", "trend_exit", "time_stop_trim", "time_stop_exit"}:
+        return
+    td = str(trade_date)
+    risk = load_us_position_risk_state(sym, td) or load_latest_us_position_risk_state(sym, td) or {}
+    state = dict(risk.get("state") or {})
+    trend = dict(state.get("trend") or {})
+    if lifecycle_id and trend.get("lifecycle_id") and trend.get("lifecycle_id") != lifecycle_id:
+        trend = {"lifecycle_id": lifecycle_id}
+    status_upper = str(status or "PENDING").upper()
+    terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
+    done = status_upper in {"FILLED", "DONE"}
+    pending = status_upper in {"PENDING", "ACK", "SUBMITTED", "PARTIALLY_FILLED", "ACK_DB_FAILED"}
+    trend[f"{stg}_pending"] = bool(pending and not done and not terminal_failure)
+    if done:
+        trend[f"{stg}_done"] = True
+    elif terminal_failure:
+        trend[f"{stg}_done"] = False
+    if order_key:
+        trend[f"{stg}_order_key"] = order_key
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if done:
+        trend[f"{stg}_trade_date"] = td
+        trend[f"{stg}_at"] = now_iso
+    trend["last_exit_stage"] = stg
+    trend["last_exit_stage_status"] = status_upper
+    trend["updated_at"] = now_iso
+    if lifecycle_id:
+        trend["lifecycle_id"] = lifecycle_id
+    state["trend"] = trend
+    risk["state"] = state
     save_us_position_risk_state(sym, td, risk)
 
 def update_us_soft_stop_risk_state(
@@ -839,6 +948,13 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
                 "entry_price_source": p.get("entry_price_source"),
                 "raw_exchange": p.get("raw_exchange"),
                 "balance_source": p.get("balance_source", "kis_balance_authoritative"),
+                "position_lifecycle_id": p.get("position_lifecycle_id"),
+                "opened_trade_date": p.get("opened_trade_date"),
+                "holding_trade_days": p.get("holding_trade_days"),
+                "high_watermark": p.get("high_watermark"),
+                "high_watermark_at": p.get("high_watermark_at"),
+                "high_watermark_source": p.get("high_watermark_source"),
+                "trend_state": p.get("trend_state"),
             })
             _MEM_POSITIONS.append({
                 **p, "as_of": td,
@@ -863,6 +979,13 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
                     "entry_price_source": p.get("entry_price_source"),
                     "raw_exchange": p.get("raw_exchange"),
                     "balance_source": p.get("balance_source", "kis_balance_authoritative"),
+                    "position_lifecycle_id": p.get("position_lifecycle_id"),
+                    "opened_trade_date": p.get("opened_trade_date"),
+                    "holding_trade_days": p.get("holding_trade_days"),
+                    "high_watermark": p.get("high_watermark"),
+                    "high_watermark_at": p.get("high_watermark_at"),
+                    "high_watermark_source": p.get("high_watermark_source"),
+                    "trend_state": p.get("trend_state"),
                 })
                 conn.execute(
                     text("""

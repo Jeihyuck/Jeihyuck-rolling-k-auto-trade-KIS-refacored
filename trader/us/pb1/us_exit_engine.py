@@ -390,6 +390,47 @@ def evaluate_exit(
                     trail_high_price=max_price,
                 )
 
+    # ── staged trend/time exits (after all safety/profit exits) ──────────────
+    trend = dict(position.get("trend") or {})
+    if not trend:
+        trend = {k: position.get(k) for k in ("trend_state", "weakness_signals", "final30_absent_streak", "below_ma20_streak", "below_ma50_streak", "trend_trim_done", "trend_trim_pending", "trend_exit_done", "trend_exit_pending", "time_stop_trim_done", "time_stop_trim_pending", "time_stop_exit_done", "time_stop_exit_pending", "holding_trade_days", "current_price", "ma20", "lifecycle_id") if k in position}
+    try:
+        from trader.us.position_trend_state import choose_trend_time_exit
+        choice = choose_trend_time_exit(position, trend, pnl_pct=pnl_pct, orderable_qty=orderable_qty)
+    except Exception as exc:
+        logger.warning("[US_POSITION][TREND_STATE][EXIT_WARN] symbol=%s err=%s", symbol, exc)
+        choice = None
+    if choice:
+        exit_type, sell_qty, stage = choice
+        if stage.startswith("time_stop"):
+            logger.info("[US_POSITION][TIME_STOP] symbol=%s holding_trade_days=%s pnl_pct=%.4f trend_state=%s action=%s", symbol, position.get("holding_trade_days") or trend.get("holding_trade_days"), pnl_pct, trend.get("trend_state"), "SELL_50PCT" if exit_type == "time_stop_trim" else "SELL_FULL")
+        intent = _make_exit_intent(
+            symbol=symbol, exchange=exchange, qty=sell_qty, current_price=current_price, entry_price=entry_price,
+            exit_type=exit_type, reason=f"{stage} trend_state={trend.get('trend_state')} signals={','.join(trend.get('weakness_signals') or [])}",
+            unrealized_pnl_usd=(current_price - entry_price) * sell_qty, pnl_pct=pnl_pct,
+            holding_qty=raw_qty, orderable_qty=orderable_qty, now=now, trail_high_price=max_price,
+            meta_extra={
+                "position_lifecycle_id": position.get("position_lifecycle_id") or trend.get("lifecycle_id"),
+                "holding_trade_days": position.get("holding_trade_days") or trend.get("holding_trade_days"),
+                "trend_state": trend.get("trend_state"),
+                "weakness_signals": trend.get("weakness_signals") or [],
+                "final30_absent_streak": trend.get("final30_absent_streak"),
+                "below_ma20_streak": trend.get("below_ma20_streak"),
+                "below_ma50_streak": trend.get("below_ma50_streak"),
+                "high_watermark": max_price,
+                "high_watermark_source": position.get("high_watermark_source"),
+                "trend_stage": stage,
+                "small_position_forced_full_exit": bool(orderable_qty == 1 and sell_qty == 1 and exit_type.endswith("trim")),
+            },
+        )
+        if intent:
+            try:
+                from trader.us.db.repos import mark_us_position_exit_stage
+                mark_us_position_exit_stage(intent.get("trade_date"), symbol, stage, intent.get("client_order_key"), "PENDING", position.get("position_lifecycle_id") or trend.get("lifecycle_id"))
+            except Exception as exc:
+                logger.warning("[US_POSITION][TREND_STATE][STAGE_WARN] symbol=%s stage=%s err=%s", symbol, stage, exc)
+        return intent
+
     return None
 
 
@@ -433,6 +474,7 @@ def _make_exit_intent(
     orderable_qty: int = 0,
     now: datetime | None = None,
     trail_high_price: float | None = None,
+    meta_extra: dict | None = None,
 ) -> dict | None:
     """Exit order intent 생성."""
     import hashlib
@@ -462,7 +504,7 @@ def _make_exit_intent(
 
     _holding = holding_qty or qty
     _orderable = orderable_qty or _holding
-    partial_allowed = False if is_hard_stop else (exit_type not in {"persistent_soft_stop_full_exit"})
+    partial_allowed = False if is_hard_stop else (exit_type not in {"persistent_soft_stop_full_exit", "trend_deterioration_exit", "time_stop_exit"})
     trail_high = float(trail_high_price or current_price or 0.0)
     trail_drawdown_pct = ((trail_high - current_price) / trail_high) if trail_high > 0 else 0.0
     cfg = _reload_env()
@@ -524,6 +566,7 @@ def _make_exit_intent(
             "price_source": "provider_current_price",
             "qty": qty,
             "decision_ts_et": decision_ts_et,
+            **(meta_extra or {}),
         },
     }
 
@@ -664,6 +707,23 @@ def generate_exit_intents(
                 pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
             except Exception as exc:
                 logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+
+        if entry_price_for_state > 0 and current_price > 0:
+            try:
+                from trader.us.position_lifecycle_state import update_us_position_high_watermark
+                lifecycle_id = pos.get("position_lifecycle_id") or ((pos.get("risk_state") or {}).get("state") or {}).get("lifecycle", {}).get("lifecycle_id")
+                if lifecycle_id:
+                    high_state = update_us_position_high_watermark(
+                        symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
+                        current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
+                    )
+                    pos["high_watermark"] = high_state.get("high_watermark")
+                    pos["max_price"] = high_state.get("high_watermark")
+                    pos["high_watermark_source"] = "us_position_risk_state"
+                    pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
+            except Exception as exc:
+                logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+
 
         # book/horizon 기반 router 사용 — SWING vs DAY 분리
         # fallback: meta 없으면 SWING_BOOK (기본값)

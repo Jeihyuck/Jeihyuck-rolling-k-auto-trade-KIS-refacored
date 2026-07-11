@@ -268,16 +268,36 @@ def _enrich_single_position(
             pos.get("pnl_rate"),
         )
 
-    # max_price fallback: entry_price 기준
-    if not pos.get("max_price") and not pos.get("high_watermark"):
-        current_price_v = _safe_float(
-            pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px")
-        )
+    # high-watermark fallback priority: persisted lifecycle > position fields > current/entry.
+    try:
+        from trader.us.db.repos import load_latest_us_position_risk_state
+        latest = load_latest_us_position_risk_state(symbol, trade_date) if trade_date else {}
+        lifecycle = ((latest.get("state") or {}).get("lifecycle") or {}) if isinstance(latest.get("state"), dict) else {}
+        hwm = _safe_float(lifecycle.get("high_watermark"))
+        if hwm is not None and hwm > 0:
+            enriched["high_watermark"] = hwm
+            enriched["max_price"] = hwm
+            enriched["high_watermark_source"] = "us_position_risk_state"
+            enriched["position_lifecycle_id"] = lifecycle.get("lifecycle_id") or enriched.get("position_lifecycle_id")
+            enriched["opened_trade_date"] = lifecycle.get("opened_trade_date") or enriched.get("opened_trade_date")
+            enriched["holding_trade_days"] = lifecycle.get("holding_trade_days") or enriched.get("holding_trade_days")
+    except Exception as exc:
+        logger.debug("[US_EXIT_RESOLVER][HWM_FAIL] symbol=%s err=%s", symbol, exc)
+    if not enriched.get("max_price") and not enriched.get("high_watermark"):
+        current_price_v = _safe_float(pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px"))
         base = enriched.get("entry_price") or 0.0
-        if current_price_v and current_price_v > 0:
+        hwm = _safe_float(pos.get("high_watermark") or pos.get("max_price"))
+        if hwm is not None and hwm > 0:
+            enriched["high_watermark"] = hwm; enriched["max_price"] = hwm
+            enriched["high_watermark_source"] = pos.get("high_watermark_source") or "position_field"
+        elif current_price_v and current_price_v > 0:
             enriched["max_price"] = max(base, current_price_v)
+            enriched["high_watermark"] = enriched["max_price"]
+            enriched["high_watermark_source"] = "fallback_current_or_entry"
         elif base > 0:
             enriched["max_price"] = base
+            enriched["high_watermark"] = base
+            enriched["high_watermark_source"] = "fallback_current_or_entry"
 
     return enriched
 
