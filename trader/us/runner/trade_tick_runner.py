@@ -70,8 +70,13 @@ def validate_us_regime_contract_for_entry(prep_result: dict | None, *, real_orde
         reason = prep_result.get("trade_block_reason") or ("risk_off_entry_block" if prep_result.get("market_regime") == "RISK_OFF" else "trade_can_proceed_false")
     elif not bool(prep_result.get("contract_ok", True)):
         reason = "contract_ok_false"
-    elif not bool(prep_result.get("final30_complete", True)):
-        reason = "final30_incomplete"
+    elif not bool(
+        prep_result.get(
+            "final30_trade_ready",
+            prep_result.get("final30_complete", True),
+        )
+    ):
+        reason = "final30_not_trade_ready"
     elif int(prep_result.get("score_nonzero_count") or 0) != int(prep_result.get("final30_scored_count") or prep_result.get("score_nonzero_count") or 0):
         reason = "score_contract_failed"
     elif not bool(prep_result.get("cluster_contract_ok", True)):
