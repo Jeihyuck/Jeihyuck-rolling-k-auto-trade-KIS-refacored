@@ -427,20 +427,53 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     prep = load_latest_us_prep_status(trade_date, timeout_sec=20) or {}
     status = prep.get("status", "UNKNOWN")
     run_id = prep.get("run_id", "")
+    result = prep.get("result") or {}
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            result = {}
+    if not isinstance(result, dict):
+        result = {}
 
-    if status not in ("OK", "OK_WITH_WARNINGS"):
+    trade_can_proceed_raw = (
+        result.get("trade_can_proceed")
+        if "trade_can_proceed" in result
+        else prep.get("trade_can_proceed")
+    )
+    base_payload = {
+        "contract": None,
+        "source": "db",
+        "prep_status": status,
+        "run_id": run_id,
+        "trade_block_reason": result.get("trade_block_reason", "ok"),
+        "underfilled_tier": result.get("underfilled_tier"),
+        "effective_capital_scale": result.get("effective_capital_scale"),
+        "effective_max_new_positions": result.get("effective_max_new_positions"),
+    }
+
+    if trade_can_proceed_raw is not None:
+        try:
+            trade_can_proceed = int(trade_can_proceed_raw or 0)
+        except (TypeError, ValueError):
+            trade_can_proceed = 0
+        if trade_can_proceed != 1:
+            return {
+                **base_payload,
+                "ok": False,
+                "trade_can_proceed": False,
+                "reason": f"db_trade_can_proceed=0:{result.get('trade_block_reason') or status}",
+            }
+    elif status not in ("OK", "OK_WITH_WARNINGS"):
         logger.warning(
             "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_prep_status_not_ok status=%s",
             trade_date, status,
         )
         return {
+            **base_payload,
             "ok": False,
             "trade_can_proceed": False,
             "reason": f"db_prep_status_not_ok:{status}",
-            "contract": None,
-            "source": "db",
-            "prep_status": status,
-            "run_id": run_id,
         }
 
     rows = load_locked_us_watchlist(
@@ -452,72 +485,48 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
 
     locked_count = len(rows)
     score_nonzero_count = sum(1 for r in rows if _score_positive(r))
+    count_payload = {**base_payload, "locked_count": locked_count, "final30_scored_count": locked_count, "score_nonzero_count": score_nonzero_count}
 
     if locked_count < 10:
-        logger.warning(
-            "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_locked_watchlist_count=%d<10",
-            trade_date, locked_count,
-        )
         return {
+            **count_payload,
             "ok": False,
             "trade_can_proceed": False,
             "reason": f"db_locked_watchlist_count={locked_count}<10",
-            "contract": None,
-            "source": "db",
-            "prep_status": status,
-            "run_id": run_id,
-            "locked_count": locked_count,
-            "score_nonzero_count": score_nonzero_count,
         }
 
     if score_nonzero_count <= 0:
-        logger.warning(
-            "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_locked_watchlist_score_nonzero=0 locked_count=%d",
-            trade_date, locked_count,
-        )
         return {
+            **count_payload,
             "ok": False,
             "trade_can_proceed": False,
             "reason": "db_locked_watchlist_score_nonzero=0",
-            "contract": None,
-            "source": "db",
-            "prep_status": status,
-            "run_id": run_id,
-            "locked_count": locked_count,
-            "score_nonzero_count": score_nonzero_count,
+        }
+
+    if score_nonzero_count != locked_count:
+        return {
+            **count_payload,
+            "ok": False,
+            "trade_can_proceed": False,
+            "reason": f"db_score_contract_failed:{score_nonzero_count}!={locked_count}",
         }
 
     logger.info(
         "[US_PREP_GUARD][OK] source=db trade_date=%s prep_status=%s run_id=%s "
-        "final30=%d score_nonzero=%d",
+        "final30=%d score_nonzero=%d trade_block_reason=%s underfilled_tier=%s effective_capital_scale=%s effective_max_new_positions=%s",
         trade_date, status, run_id, locked_count, score_nonzero_count,
+        count_payload.get("trade_block_reason"), count_payload.get("underfilled_tier"),
+        count_payload.get("effective_capital_scale"), count_payload.get("effective_max_new_positions"),
     )
     return {
+        **count_payload,
         "ok": True,
         "trade_can_proceed": True,
         "reason": "ok_db_fallback",
-        "contract": None,
-        "source": "db",
-        "prep_status": status,
-        "run_id": run_id,
-        "final30_scored_count": locked_count,
-        "score_nonzero_count": score_nonzero_count,
-        "locked_count": locked_count,
     }
 
-
 def check_us_prep_guard(trade_date: str) -> dict:
-    """AM/Afternoon session이 사용하는 prep guard 체크.
-
-    Returns:
-        {
-            "ok": bool,
-            "trade_can_proceed": bool,
-            "reason": str,
-            "contract": dict | None,
-            "source": str,
-        }
-    """
+    """AM/Afternoon session이 사용하는 contract-authoritative prep guard 체크."""
     from trader.us.path_contract import load_us_prep_contract
 
     contract = load_us_prep_contract(trade_date)
@@ -525,7 +534,6 @@ def check_us_prep_guard(trade_date: str) -> dict:
         logger.warning("[US_PREP_GUARD][CONTRACT_MISSING][DB_FALLBACK] trade_date=%s", trade_date)
         return _check_us_prep_guard_from_db(trade_date)
 
-    # contract trade_date 검증
     if contract.get("trade_date") != trade_date:
         return {
             "ok": False,
@@ -535,50 +543,40 @@ def check_us_prep_guard(trade_date: str) -> dict:
             "source": "stale",
         }
 
-    # contract 상태 검증
     status = contract.get("status", "")
-    if status not in ("OK", "OK_WITH_WARNINGS"):
-        return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": f"prep_status_not_ok:{status}",
-            "contract": contract,
-            "source": "runtime",
-        }
+    try:
+        trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)
+    except (TypeError, ValueError):
+        trade_can_proceed = 0
+    trade_block_reason = str(contract.get("trade_block_reason") or "")
+    contract_ok = bool(contract.get("contract_ok", False))
+    final30_trade_ready = bool(contract.get("final30_trade_ready", contract_ok and trade_can_proceed == 1))
+    final30_scored_count = int(contract.get("final30_scored_count", 0) or 0)
+    score_nonzero_count = int(contract.get("score_nonzero_count", 0) or 0)
 
-    if not contract.get("contract_ok", False):
-        return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": "contract_ok=false",
-            "contract": contract,
-            "source": "runtime",
-        }
-
-    if contract.get("final30_scored_count", 0) < 30:
-        return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": f"final30_scored_count={contract.get('final30_scored_count')}<30",
-            "contract": contract,
-            "source": "runtime",
-        }
-
-    if not contract.get("trade_can_proceed", 0):
-        return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": "trade_can_proceed=0",
-            "contract": contract,
-            "source": "runtime",
-        }
-
-    return {
-        "ok": True,
-        "trade_can_proceed": True,
-        "reason": "ok",
+    base_payload = {
         "contract": contract,
         "source": "runtime",
-        "final30_scored_count": contract.get("final30_scored_count", 30),
-        "score_nonzero_count": contract.get("score_nonzero_count", 0),
+        "prep_status": status,
+        "trade_block_reason": trade_block_reason,
+        "final30_scored_count": final30_scored_count,
+        "score_nonzero_count": score_nonzero_count,
+        "underfilled_tier": contract.get("underfilled_tier"),
+        "effective_capital_scale": contract.get("effective_capital_scale"),
+        "effective_max_new_positions": contract.get("effective_max_new_positions"),
+        "final30_trade_ready": final30_trade_ready,
     }
+
+    if trade_can_proceed != 1:
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"trade_can_proceed=0:{trade_block_reason or status}"}
+    if not contract_ok:
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": "contract_ok=false"}
+    if not final30_trade_ready:
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"final30_trade_ready=false:{trade_block_reason or status}"}
+    if final30_scored_count <= 0:
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": "final30_scored_count=0"}
+    if score_nonzero_count != final30_scored_count:
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"score_contract_failed:{score_nonzero_count}!={final30_scored_count}"}
+
+    return {**base_payload, "ok": True, "trade_can_proceed": True, "reason": "ok"}
+

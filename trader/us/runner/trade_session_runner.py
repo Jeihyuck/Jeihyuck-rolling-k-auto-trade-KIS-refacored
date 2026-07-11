@@ -588,17 +588,30 @@ def run_trade_session(
                 if guard["ok"]:
                     logger.info(
                         "[US_PREP_GUARD][OK] workflow=us-trade-%s session=%s trade_date=%s"
-                        " final30=%s score_nonzero=%s source=%s",
+                        " final30=%s score_nonzero=%s source=%s prep_status=%s"
+                        " trade_block_reason=%s underfilled_tier=%s effective_capital_scale=%s"
+                        " effective_max_new_positions=%s final30_trade_ready=%s",
                         session, session, trade_date,
                         guard.get("final30_scored_count", "?"),
                         guard.get("score_nonzero_count", "?"),
                         guard.get("source", "runtime"),
+                        guard.get("prep_status", "?"),
+                        guard.get("trade_block_reason", "?"),
+                        guard.get("underfilled_tier", "?"),
+                        guard.get("effective_capital_scale", "?"),
+                        guard.get("effective_max_new_positions", "?"),
+                        int(bool(guard.get("final30_trade_ready"))),
                     )
                 else:
                     logger.error(
-                        "[US_PREP_GUARD][BLOCK] workflow=us-trade-%s session=%s"
-                        " reason=final30_missing_or_contract_fail trade_date=%s detail=%s",
+                        "[US_PREP_GUARD][BLOCK] workflow=us-trade-%s session=%s trade_date=%s"
+                        " detail=%s prep_status=%s trade_block_reason=%s final30=%s score_nonzero=%s underfilled_tier=%s",
                         session, session, trade_date, guard.get("reason"),
+                        guard.get("prep_status", "?"),
+                        guard.get("trade_block_reason", "?"),
+                        guard.get("final30_scored_count", "?"),
+                        guard.get("score_nonzero_count", "?"),
+                        guard.get("underfilled_tier", "?"),
                     )
                     _write_us_schedule_health(
                         {
@@ -1538,7 +1551,8 @@ def main() -> None:
         run_mode=args.run_mode,
         signal_only=args.signal_only,
     )
-    if result["status"] in ("ERROR", "FAILED"):
+    failed_status = str(result.get("status") or "")
+    if failed_status in {"ERROR", "FAILED"} or failed_status.startswith("FAILED"):
         sys.exit(1)
 
 
