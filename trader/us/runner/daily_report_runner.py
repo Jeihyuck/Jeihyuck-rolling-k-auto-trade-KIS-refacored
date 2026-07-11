@@ -18,11 +18,66 @@ import logging
 import os
 import sys
 import subprocess
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+
+
+def _position_market_value_usd(position: dict) -> float:
+    """Return the best available USD market value from DB or KIS balance rows."""
+    for key in (
+        "market_value_usd",
+        "market_value",
+        "total_pvs_usd",
+        "eval_amount_usd",
+        "eval_amount",
+        "ord_psbl_amt",
+    ):
+        try:
+            value = float(position.get(key) or 0)
+        except (TypeError, ValueError, AttributeError):
+            value = 0.0
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _extract_positions_from_payload(payload: object) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    for key in ("final_balance_positions", "kis_final_balance_positions_detail", "balance_positions", "positions_detail", "positions"):
+        rows = payload.get(key)
+        if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
+            return rows
+    final_balance = payload.get("final_balance") or payload.get("kis_final_balance") or payload.get("balance_snapshot")
+    if isinstance(final_balance, dict):
+        return _extract_positions_from_payload(final_balance)
+    return []
+
+
+def _load_close_final_balance_positions(trade_date: str) -> list[dict]:
+    """Load close-session KIS final balance positions persisted by session reports."""
+    candidates = [
+        Path("reports/us_daily") / trade_date / "close_summary.json",
+        Path("reports/us_daily") / trade_date / "close" / "us_daily_report.json",
+        Path("reports/us_daily/latest_us_daily_report.json"),
+    ]
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(payload.get("trade_date") or "") != str(trade_date):
+            continue
+        rows = _extract_positions_from_payload(payload)
+        if rows:
+            return rows
+    return []
 
 def _git_value(args: list[str]) -> str:
     try:
@@ -527,16 +582,29 @@ def run_daily_report(
                 report["available_new_slots"] = max(0, int(report.get("max_positions", 35) or 35) - len(positions))
                 report["new_symbol_slots_available"] = report["available_new_slots"]
                 report["full_position"] = report["available_new_slots"] <= 0
-                invested = 0.0
-                for pos in positions:
-                    try:
-                        invested += float(pos.get("market_value_usd") or pos.get("market_value") or pos.get("eval_amount_usd") or pos.get("total_pvs_usd") or pos.get("eval_amount") or 0)
-                    except (TypeError, ValueError):
-                        pass
+                invested = sum(_position_market_value_usd(pos) for pos in positions)
+                final_balance_positions = _load_close_final_balance_positions(trade_date)
+                final_balance_invested = sum(_position_market_value_usd(pos) for pos in final_balance_positions)
+                canonical_positions = positions
+                if final_balance_positions and (not positions or invested <= 0):
+                    canonical_positions = final_balance_positions
+                    invested = final_balance_invested
+                    report["positions"] = len(canonical_positions)
+                    report["position_count"] = len(canonical_positions)
+                    report["open_position_count"] = len(canonical_positions)
+                    report["open_position_symbols"] = sorted({str(p.get("symbol") or p.get("pdno") or "").upper() for p in canonical_positions if p.get("symbol") or p.get("pdno")})
+                    report["available_new_slots"] = max(0, int(report.get("max_positions", 35) or 35) - len(canonical_positions))
+                    report["new_symbol_slots_available"] = report["available_new_slots"]
+                    report["full_position"] = report["available_new_slots"] <= 0
+                    report["canonical_position_source"] = "kis_final_balance"
+                else:
+                    report["canonical_position_source"] = "db_positions"
+                if len(canonical_positions) > 0 and invested <= 0:
+                    report["warnings"].append("REPORT_VALIDATION_FAILED: positions_nonzero_but_invested_zero")
                 try:
                     from trader.us.rotation import apply_cap_flags, compute_cluster_exposure
                     regime = str(report.get("rotation_regime") or "NEUTRAL")
-                    report["cluster_exposure"] = apply_cap_flags(compute_cluster_exposure(positions), regime)
+                    report["cluster_exposure"] = apply_cap_flags(compute_cluster_exposure(canonical_positions), regime)
                     if not report.get("portfolio_cluster_weights"):
                         report["portfolio_cluster_weights"] = report["cluster_exposure"]
                     if not report.get("cap_violations"):
@@ -545,10 +613,15 @@ def run_daily_report(
                     logger.warning("[US_DAILY_REPORT][CLUSTER][WARN] %s", exc)
                 try:
                     from trader.us.capital_deployment import compute_deployment_metrics, decide_deployment_action
-                    metrics = compute_deployment_metrics(account_equity_usd=float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0), invested_market_value_usd=invested, cash_usd=None)
+                    account_equity_usd = float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0)
+                    cash_usd = None
+                    if account_equity_usd > 0 and invested > 0:
+                        cash_usd = max(0.0, account_equity_usd - invested)
+                        report["cash_usd_estimated"] = True
+                    metrics = compute_deployment_metrics(account_equity_usd=account_equity_usd, invested_market_value_usd=invested, cash_usd=cash_usd)
                     report.update(metrics)
-                    report["capital_deployment_action"] = decide_deployment_action(metrics, position_count=len(positions), max_positions=int(report.get("max_positions", 35) or 35))
-                    report["avg_position_value_usd"] = invested / len(positions) if positions else 0.0
+                    report["capital_deployment_action"] = decide_deployment_action(metrics, position_count=len(canonical_positions), max_positions=int(report.get("max_positions", 35) or 35))
+                    report["avg_position_value_usd"] = invested / len(canonical_positions) if canonical_positions else 0.0
                     if report["full_position"] and metrics.get("underdeployed"):
                         report["warnings"].append("US_CAPITAL_UNDERDEPLOYED_FULL_POSITION")
                 except Exception as exc:
