@@ -317,6 +317,50 @@ class KisUSClient:
         self._response_cache[cache_key] = (time.time(), result)
         return (result.get("output2") or [])[:count]
 
+
+    def get_us_daily_price_history(
+        self,
+        symbol: str,
+        exchange: str,
+        *,
+        as_of_date: str,
+        required_bars: int = 260,
+        stop_at_date: str | None = None,
+        max_pages: int = 6,
+    ) -> list[dict]:
+        """Paginated US daily history fetch, oldest-to-newest with date dedupe."""
+        from datetime import timedelta
+        from trader.us.dates import canonical_us_bar_date
+        rows_by_date: dict = {}
+        next_as_of = as_of_date
+        seen_pages: set[tuple] = set()
+        stop_date = canonical_us_bar_date(stop_at_date) if stop_at_date else None
+        pages = 0
+        for _ in range(max(1, int(max_pages or 1))):
+            page = self.get_us_daily_price(symbol, exchange, int(required_bars), as_of_date=next_as_of)
+            dated = []
+            for row in page or []:
+                d = canonical_us_bar_date(row.get("xymd") or row.get("date") or row.get("stck_bsop_date"))
+                if not d:
+                    continue
+                if stop_date and d <= stop_date:
+                    continue
+                rows_by_date[d] = row
+                dated.append(d)
+            pages += 1
+            page_key = tuple(sorted(dated))
+            if not dated or page_key in seen_pages or len(rows_by_date) >= int(required_bars):
+                break
+            seen_pages.add(page_key)
+            oldest = min(dated)
+            if stop_date and oldest <= stop_date:
+                break
+            next_as_of = (oldest - timedelta(days=1)).strftime("%Y%m%d")
+        self.last_daily_pages = pages
+        out = [rows_by_date[d] for d in sorted(rows_by_date)]
+        logger.info("[US_OHLCV][BACKFILL] symbol=%s target=%s fetched=%d pages=%d", symbol, required_bars, len(out), pages)
+        return out[-int(required_bars):]
+
     # ------------------------------------------------------------------
     # Account
     # ------------------------------------------------------------------

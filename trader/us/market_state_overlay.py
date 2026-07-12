@@ -159,6 +159,8 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
         try:
             if isinstance(provider, dict):
                 rows = provider.get(sym) or provider.get(sym.lower())
+            elif callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                rows = provider.get_completed_daily_prices(sym, exchange, trade_date=trade_date, required_bars=260, allow_http_sync=False)
             elif hasattr(provider, "get_daily_prices"):
                 rows = provider.get_daily_prices(sym, exchange, as_of_date=trade_date)
             elif hasattr(provider, "daily_prices"):

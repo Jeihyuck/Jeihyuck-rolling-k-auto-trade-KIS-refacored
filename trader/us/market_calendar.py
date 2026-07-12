@@ -21,9 +21,8 @@ _REGULAR_CLOSE = time(16, 0)
 _PREMARKET_START = time(4, 0)
 _AFTERMARKET_END = time(20, 0)
 
-# 미국 연방 공휴일 (고정 날짜 기반, 실제 관측일은 _OBSERVED_HOLIDAYS에서 처리)
-# config/us_market_holidays.yaml 로드로 보완
-_STATIC_MARKET_HOLIDAYS_2026: set[date] = {
+# 미국장 완전 휴장일 / 조기 폐장일 (config/us_market_holidays.yaml 로드로 보완)
+_FULL_CLOSE_DATES_2026: set[date] = {
     date(2026, 1, 1),   # New Year's Day
     date(2026, 1, 19),  # MLK Day
     date(2026, 2, 16),  # Presidents' Day
@@ -33,12 +32,15 @@ _STATIC_MARKET_HOLIDAYS_2026: set[date] = {
     date(2026, 7, 3),   # Independence Day (observed)
     date(2026, 9, 7),   # Labor Day
     date(2026, 11, 26), # Thanksgiving Day
-    date(2026, 11, 27), # Day after Thanksgiving (early close, not full holiday)
-    date(2026, 12, 24), # Christmas Eve (early close)
     date(2026, 12, 25), # Christmas Day
 }
+_EARLY_CLOSE_DATES_2026: set[date] = {
+    date(2026, 11, 27), # Day after Thanksgiving
+    date(2026, 12, 24), # Christmas Eve
+}
 
-_RUNTIME_HOLIDAYS: set[date] = set(_STATIC_MARKET_HOLIDAYS_2026)
+_RUNTIME_HOLIDAYS: set[date] = set(_FULL_CLOSE_DATES_2026)
+_RUNTIME_EARLY_CLOSES: set[date] = set(_EARLY_CLOSE_DATES_2026)
 
 
 def _load_yaml_holidays() -> None:
@@ -53,6 +55,8 @@ def _load_yaml_holidays() -> None:
             data = yaml.safe_load(f) or {}
         for d in (data.get("full_close") or []):
             _RUNTIME_HOLIDAYS.add(date.fromisoformat(str(d)))
+        for d in (data.get("early_close") or []):
+            _RUNTIME_EARLY_CLOSES.add(date.fromisoformat(str(d)))
     except Exception:
         pass
 
@@ -83,6 +87,18 @@ def is_us_market_holiday(d: date | None = None) -> bool:
     return d in _RUNTIME_HOLIDAYS
 
 
+def is_us_early_close_day(d: date | None = None) -> bool:
+    if d is None:
+        d = now_ny().date()
+    return d in _RUNTIME_EARLY_CLOSES
+
+
+def regular_close_time_for_date(d: date | None = None) -> time:
+    if d is None:
+        d = now_ny().date()
+    return time(13, 0) if is_us_early_close_day(d) else _REGULAR_CLOSE
+
+
 def is_us_weekend(d: date | None = None) -> bool:
     """토/일이면 True."""
     if d is None:
@@ -104,7 +120,7 @@ def is_us_regular_market_open(now: datetime | None = None) -> bool:
     if not is_us_trading_day(d):
         return False
     t = now.time()
-    return _REGULAR_OPEN <= t < _REGULAR_CLOSE
+    return _REGULAR_OPEN <= t < regular_close_time_for_date(d)
 
 
 def is_us_premarket_window(now: datetime | None = None) -> bool:
@@ -124,7 +140,7 @@ def is_us_aftermarket_window(now: datetime | None = None) -> bool:
     if not is_us_trading_day(d):
         return False
     t = now.time()
-    return _REGULAR_CLOSE <= t < _AFTERMARKET_END
+    return regular_close_time_for_date(d) <= t < _AFTERMARKET_END
 
 
 def resolve_us_trade_date(now: datetime | None = None) -> date:
@@ -133,6 +149,28 @@ def resolve_us_trade_date(now: datetime | None = None) -> date:
     d = now.date()
     # 미래로 무한 탐색 방지
     for _ in range(10):
+        if is_us_trading_day(d):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
+def previous_completed_us_session(value: date | datetime | str | None = None) -> date:
+    """Return the latest completed US trading session strictly before *value*."""
+    if value is None:
+        d = now_ny().date()
+    elif isinstance(value, datetime):
+        d = value.astimezone(NY_TZ).date() if value.tzinfo else value.date()
+    elif isinstance(value, date):
+        d = value
+    else:
+        raw = str(value or "").strip()
+        if len(raw) == 8 and raw.isdigit():
+            d = datetime.strptime(raw, "%Y%m%d").date()
+        else:
+            d = datetime.fromisoformat(raw[:10]).date()
+    d -= timedelta(days=1)
+    for _ in range(14):
         if is_us_trading_day(d):
             return d
         d -= timedelta(days=1)
@@ -152,23 +190,28 @@ def market_phase(now: datetime | None = None) -> str:
         return "CLOSED"
 
     t = now.time()
+    close_time = regular_close_time_for_date(d)
 
-    if t < _PREMARKET_START or t >= _AFTERMARKET_END:
+    if t < _PREMARKET_START:
         return "CLOSED"
 
     if t < _REGULAR_OPEN:
         return "PREMARKET"
 
+    if t >= _AFTERMARKET_END:
+        return "CLOSED"
+
+    if t >= close_time:
+        return "AFTERMARKET"
+
     if t < time(11, 30):
         return "REGULAR_OPEN"
 
-    if t < time(15, 0):
+    close_phase_start = time(12, 0) if close_time == time(13, 0) else time(15, 0)
+    if t < close_phase_start:
         return "REGULAR_MID"
 
-    if t < _REGULAR_CLOSE:
-        return "REGULAR_CLOSE"
-
-    return "AFTERMARKET"
+    return "REGULAR_CLOSE"
 
 
 def register_holiday(d: date) -> None:

@@ -68,6 +68,10 @@ _SOFT_EXIT_TYPES: frozenset[str] = frozenset({
     "giveback",
     "time_stop",
     "weak_momentum_exit",
+    "trend_deterioration_trim",
+    "trend_deterioration_exit",
+    "time_stop_trim",
+    "time_stop_exit",
     "day_profit_take",
     "day_trailing",
     "day_close_flatten",
@@ -145,6 +149,7 @@ def evaluate_swing_exit(
     position: dict,
     current_price: float,
     now: datetime | None = None,
+    include_trend_time: bool = True,
 ) -> dict | None:
     """SWING_BOOK 포지션 청산 평가.
 
@@ -155,7 +160,7 @@ def evaluate_swing_exit(
     """
     from trader.us.pb1.us_exit_engine import evaluate_exit
 
-    intent = evaluate_exit(position=position, current_price=current_price, now=now)
+    intent = evaluate_exit(position=position, current_price=current_price, now=now, include_trend_time=include_trend_time)
     if intent is None:
         return None
 
@@ -273,6 +278,7 @@ def evaluate_day_exit(
     position: dict,
     current_price: float,
     now: datetime | None = None,
+    include_trend_time: bool = True,
 ) -> dict | None:
     """DAY_BOOK 포지션 청산 평가.
 
@@ -284,7 +290,7 @@ def evaluate_day_exit(
     from trader.us.pb1.us_exit_engine import evaluate_exit
 
     # hard_stop 먼저 base evaluate_exit로 확인
-    base_intent = evaluate_exit(position=position, current_price=current_price, now=now)
+    base_intent = evaluate_exit(position=position, current_price=current_price, now=now, include_trend_time=include_trend_time)
     if base_intent and _is_hard_exit(base_intent.get("exit_type", "")):
         base_intent["exit_policy"] = "DAY_BOOK"
         base_intent["book"] = "DAY_BOOK"
@@ -365,6 +371,7 @@ def route_exit_by_book_horizon(
     position: dict,
     current_price: float,
     now: datetime | None = None,
+    include_trend_time: bool = True,
 ) -> dict | None:
     """book/horizon 기반 청산 평가 라우터.
 
@@ -393,13 +400,23 @@ def route_exit_by_book_horizon(
     )
 
     if book == "DAY_BOOK" or horizon == "DAY_TRADE":
-        intent = evaluate_day_exit(position=position, current_price=current_price, now=now)
+        try:
+            intent = evaluate_day_exit(position=position, current_price=current_price, now=now, include_trend_time=include_trend_time)
+        except TypeError as exc:
+            if "include_trend_time" not in str(exc):
+                raise
+            intent = evaluate_day_exit(position=position, current_price=current_price, now=now)
         if intent:
             intent.setdefault("exit_policy", "DAY_BOOK")
         return intent
 
     # SWING_BOOK (기본)
-    intent = evaluate_swing_exit(position=position, current_price=current_price, now=now)
+    try:
+        intent = evaluate_swing_exit(position=position, current_price=current_price, now=now, include_trend_time=include_trend_time)
+    except TypeError as exc:
+        if "include_trend_time" not in str(exc):
+            raise
+        intent = evaluate_swing_exit(position=position, current_price=current_price, now=now)
     if intent:
         intent.setdefault("exit_policy", "US_SWING_DEFAULT")
         intent.setdefault("book", "SWING_BOOK")

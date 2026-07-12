@@ -30,12 +30,24 @@ def _make_stub_daily(symbol: str, count: int = 60) -> list[dict]:
     """offline/test 용 stub daily price 데이터 (xymd 오름차순)."""
     base_price = 100.0
     prices = []
-    d = date.today()
-    for i in range(count):
+    try:
+        from trader.us.market_calendar import previous_completed_us_session, is_us_trading_day
+        d = previous_completed_us_session(date.today() + timedelta(days=1))
+        dates = []
+        cur = d
+        while len(dates) < count:
+            if is_us_trading_day(cur):
+                dates.append(cur)
+            cur -= timedelta(days=1)
+        dates = list(reversed(dates))
+    except Exception:
+        d = date.today()
+        dates = [d - timedelta(days=count - i - 1) for i in range(count)]
+    for i, bar_date in enumerate(dates):
         idx = count - i - 1
         price = base_price * (1 + 0.001 * idx)
         prices.append({
-            "xymd": (d - timedelta(days=idx)).strftime("%Y%m%d"),
+            "xymd": bar_date.strftime("%Y%m%d"),
             "clos": f"{price:.2f}",
             "open": f"{price * 0.99:.2f}",
             "high": f"{price * 1.01:.2f}",
@@ -483,6 +495,7 @@ class USDataProvider:
             "price_ok_symbols": set(),
             "price_fail_symbols": set(),
             "fail_reasons": {},
+            "daily_http_call_count": 0,
         }
 
     def _get_client(self):
@@ -644,6 +657,102 @@ class USDataProvider:
                     self.stats["fail_reasons"][symbol.upper()] = str(type(exc).__name__)
             # Re-raise original exception if not temporary or no DB fallback
             raise
+
+
+    def get_completed_daily_prices_result(
+        self,
+        symbol: str,
+        exchange: str,
+        *,
+        trade_date: str,
+        required_bars: int = 260,
+        allow_http_sync: bool,
+    ) -> dict:
+        """DB-first completed US daily bars with structured quality metadata."""
+        from trader.us.db.price_daily_repo import (
+            audit_us_daily_history,
+            get_latest_us_daily_date,
+            load_recent_us_daily_bars,
+            upsert_us_daily_bars,
+        )
+        from trader.us.market_calendar import previous_completed_us_session
+        required = int(required_bars or int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
+        try:
+            rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+            audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+        except Exception as exc:
+            logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
+            return {"rows": [], "quality": "DB_ERROR", "valid_bar_count": 0, "db_latest": None, "expected_latest": None, "invalid_close_count": 0, "duplicate_count": 0, "http_sync_attempted": False, "http_sync_succeeded": False}
+        expected_latest = previous_completed_us_session(trade_date)
+        db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        from trader.us.dates import canonical_us_bar_date
+        audit_last_date = canonical_us_bar_date(audit.get("last_date"))
+        invalid_close_count = int(audit.get("invalid_close_count") or 0)
+        duplicate_count = int(audit.get("duplicate_count") or 0)
+        if len(rows) >= required and audit_last_date == expected_latest and invalid_close_count == 0 and duplicate_count == 0:
+            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0", symbol, required, len(rows), audit.get("last_date"), expected_latest)
+            return {"rows": normalize_daily_rows(symbol, rows), "quality": "OK", "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": False, "http_sync_succeeded": False}
+        if not allow_http_sync or os.getenv("US_DAILY_SYNC_ENABLED", "1") in {"0", "false", "False", "no"}:
+            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0 quality=INSUFFICIENT_OR_STALE", symbol, required, len(rows), audit.get("last_date"), expected_latest)
+            return {"rows": normalize_daily_rows(symbol, rows), "quality": ("STALE" if audit_last_date != expected_latest else "INSUFFICIENT_HISTORY"), "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": False, "http_sync_succeeded": False}
+        max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
+        client = None if self._offline else self._get_client()
+
+        def _fetch_history(*, as_of: str, need: int, stop_at: str | None, direction: str) -> list[dict]:
+            if self._offline:
+                return _make_stub_daily(symbol, max(required + 5, need + 5))
+            if hasattr(client, "get_us_daily_price_history"):
+                self.stats["daily_http_call_count"] += 1
+                return client.get_us_daily_price_history(symbol, exchange, as_of_date=as_of, required_bars=need, stop_at_date=stop_at, max_pages=max_pages)
+            self.stats["daily_http_call_count"] += 1
+            return client.get_us_daily_price(symbol, exchange, need, as_of_date=as_of)
+
+        total_fetched = 0
+        total_upserted = 0
+        if db_latest is None or db_latest < expected_latest:
+            logger.info("[US_OHLCV][SYNC_GAP] symbol=%s direction=forward db_latest=%s expected_latest=%s", symbol, db_latest, expected_latest)
+            fetched = _fetch_history(as_of=str(trade_date), need=required, stop_at=(db_latest.isoformat() if db_latest else None), direction="forward")
+            total_fetched += len(fetched or [])
+            total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
+            rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+            db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+
+        if db_latest == expected_latest and len(rows) < required:
+            from trader.us.dates import canonical_us_bar_date
+            from datetime import timedelta as _td
+            oldest = canonical_us_bar_date((rows[0] or {}).get("date") or (rows[0] or {}).get("xymd")) if rows else expected_latest
+            as_of_back = (oldest - _td(days=1)).strftime("%Y%m%d") if oldest else str(trade_date)
+            missing = max(required - len(rows), 1)
+            logger.info("[US_OHLCV][SYNC_GAP] symbol=%s direction=backward oldest=%s missing=%d", symbol, oldest, missing)
+            fetched = _fetch_history(as_of=as_of_back, need=max(missing, required), stop_at=None, direction="backward")
+            total_fetched += len(fetched or [])
+            total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
+
+        pages = getattr(client, "last_daily_pages", None) if client is not None else None
+        logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, total_fetched, pages)
+        logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d", symbol, total_fetched, total_upserted)
+        rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+        audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+        db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        audit_last_date = canonical_us_bar_date(audit.get("last_date"))
+        invalid_close_count = int(audit.get("invalid_close_count") or 0)
+        duplicate_count = int(audit.get("duplicate_count") or 0)
+        quality = "OK" if len(rows) >= required and audit_last_date == expected_latest and invalid_close_count == 0 and duplicate_count == 0 else ("STALE" if audit_last_date != expected_latest else "INSUFFICIENT_HISTORY")
+        logger.info("[US_OHLCV][VERIFY] symbol=%s quality=%s valid_bar_count=%d latest=%s expected=%s invalid_close_count=%s duplicate_count=%s", symbol, quality, len(rows), db_latest, expected_latest, audit.get("invalid_close_count"), audit.get("duplicate_count"))
+        return {"rows": normalize_daily_rows(symbol, rows), "quality": quality, "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": invalid_close_count, "duplicate_count": duplicate_count, "http_sync_attempted": total_fetched > 0, "http_sync_succeeded": total_fetched == 0 or total_upserted > 0}
+
+    def get_completed_daily_prices(
+        self,
+        symbol: str,
+        exchange: str,
+        *,
+        trade_date: str,
+        required_bars: int = 260,
+        allow_http_sync: bool,
+    ) -> list[dict]:
+        return self.get_completed_daily_prices_result(
+            symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=allow_http_sync
+        ).get("rows", [])
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).

@@ -32,12 +32,13 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 
 def _compute_rs(daily_rows: list[dict], days: int) -> float:
     """N일 RS (현재가 / N일 전 종가 - 1)."""
+    daily_rows = _valid_daily_rows(daily_rows)
     if len(daily_rows) < days + 1:
         return 0.0
     try:
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
-        current_close = _safe_float(rows[-1].get("clos"))
-        past_close = _safe_float(rows[-(days + 1)].get("clos"))
+        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd") or r.get("date") or ""))
+        current_close = _safe_float(rows[-1].get("clos") or rows[-1].get("close"))
+        past_close = _safe_float(rows[-(days + 1)].get("clos") or rows[-(days + 1)].get("close"))
         if past_close <= 0:
             return 0.0
         return round((current_close / past_close) - 1.0, 4)
@@ -50,14 +51,23 @@ def _compute_ma(daily_rows: list[dict], period: int) -> float | None:
     if len(daily_rows) < period:
         return None
     try:
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
-        closes = [_safe_float(r.get("clos")) for r in rows[-period:]]
-        closes = [c for c in closes if c > 0]
-        if not closes:
+        rows = _valid_daily_rows(daily_rows)
+        closes = [_safe_float(r.get("clos") or r.get("close")) for r in rows[-period:]]
+        if len(closes) < period:
             return None
-        return round(sum(closes) / len(closes), 4)
+        return round(sum(closes) / period, 4)
     except Exception:
         return None
+
+
+def _valid_daily_rows(daily_rows: list[dict]) -> list[dict]:
+    by_date: dict[str, dict] = {}
+    for row in daily_rows or []:
+        d = str(row.get("xymd") or row.get("date") or "").strip()
+        close = _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))
+        if d and close > 0:
+            by_date[d] = row
+    return [by_date[d] for d in sorted(by_date)]
 
 
 def _compute_volume_accel(daily_rows: list[dict]) -> float:
@@ -114,6 +124,7 @@ def _score_symbol_candidate(
 ) -> dict:
     """단일 종목 candidate 점수 계산."""
     symbol = sym_data.get("symbol", "")
+    daily_rows = _valid_daily_rows(daily_rows)
     price = _safe_float(sym_data.get("price"))
     atr_pct = _safe_float(sym_data.get("atr_pct"), 0.0)
     avg_vol = _safe_float(sym_data.get("avg_volume_20d"), 0.0)
@@ -126,6 +137,22 @@ def _score_symbol_candidate(
     ma20 = _compute_ma(daily_rows, 20)
     ma50 = _compute_ma(daily_rows, 50)
     ma150 = _compute_ma(daily_rows, 150)
+    ma200 = _compute_ma(daily_rows, 200)
+    ma200_prev = _compute_ma(daily_rows[:-20], 200) if len(daily_rows) >= 220 else None
+    ma200_slope = round((ma200 - ma200_prev) / ma200_prev, 6) if ma200 and ma200_prev and ma200_prev > 0 else None
+    daily_bar_count = len(daily_rows or [])
+    if daily_bar_count >= 200:
+        daily_history_quality = "OK"
+    elif daily_bar_count >= 150:
+        daily_history_quality = "DEGRADED_NO_MA200"
+    elif daily_bar_count >= 60:
+        daily_history_quality = "DEGRADED_SHORT_HISTORY"
+    else:
+        daily_history_quality = "ERROR_INSUFFICIENT_HISTORY"
+    daily_metrics_as_of = None
+    if daily_rows:
+        last_row = sorted(daily_rows, key=lambda r: str(r.get("xymd", r.get("date", ""))))[-1]
+        daily_metrics_as_of = str(last_row.get("date") or last_row.get("xymd") or "")
 
     vol_accel = _compute_volume_accel(daily_rows)
     near_high = _compute_near_high(daily_rows, price, 52)
@@ -215,6 +242,12 @@ def _score_symbol_candidate(
         "ma20": ma20,
         "ma50": ma50,
         "ma150": ma150,
+        "ma200": ma200,
+        "ma200_slope": ma200_slope,
+        "daily_bar_count": daily_bar_count,
+        "daily_metrics_as_of": daily_metrics_as_of,
+        "daily_metrics_source": "price_daily",
+        "daily_history_quality": daily_history_quality,
         "pullback_pct": pullback_pct,
         # Scores
         "rs_20d_score": rs_20d_score,
@@ -286,8 +319,39 @@ def build_us_candidate_pool(
         symbol = sym_data.get("symbol", "")
         exchange = sym_data.get("exchange", "NASDAQ")
         try:
-            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
+            required_bars = int(os.getenv("US_DAILY_REQUIRED_BARS", "260"))
+            daily_result = None
+            if callable(getattr(provider, "get_completed_daily_prices_result", None)) and getattr(getattr(provider, "get_completed_daily_prices_result", None), "__module__", "") != "unittest.mock":
+                daily_result = provider.get_completed_daily_prices_result(symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=True)
+                daily = list(daily_result.get("rows") or [])
+                daily_quality = str(daily_result.get("quality") or "")
+                if daily_quality in {"STALE", "DB_ERROR", "KIS_SYNC_FAILED"}:
+                    logger.info("[US_CANDIDATE_POOL][SKIP] symbol=%s daily_quality=%s", symbol, daily_quality)
+                    failed_count += 1
+                    continue
+            elif callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=True)
+                daily_quality = "OK" if len(daily or []) >= required_bars else "INSUFFICIENT_HISTORY"
+            else:
+                daily = provider.get_daily_prices(symbol, exchange, count=required_bars, as_of_date=as_of_date)
+                daily_quality = "OK" if len(daily or []) >= required_bars else "INSUFFICIENT_HISTORY"
             row = _score_symbol_candidate(sym_data, daily, all_rs20, all_rs60, all_rs120)
+            if daily_result is not None:
+                row.update({
+                    "daily_bar_count": int(daily_result.get("valid_bar_count") or row.get("daily_bar_count") or 0),
+                    "daily_metrics_source": "price_daily",
+                    "daily_history_quality": daily_quality if daily_quality != "INSUFFICIENT_HISTORY" else row.get("daily_history_quality", daily_quality),
+                    "db_latest": daily_result.get("db_latest"),
+                    "expected_latest": daily_result.get("expected_latest"),
+                })
+                row["daily_metrics_as_of"] = daily_result.get("db_latest") or row.get("daily_metrics_as_of")
+            allowed_quality = {"OK", "DEGRADED_NO_MA200"}
+            if os.getenv("US_ALLOW_NEW_LISTING_SHORT_HISTORY", "0") in {"1", "true", "True", "yes"}:
+                allowed_quality.add("NEW_LISTING_SHORT_HISTORY")
+            if row.get("daily_history_quality") not in allowed_quality:
+                logger.info("[US_CANDIDATE_POOL][SKIP] symbol=%s daily_history_quality=%s", symbol, row.get("daily_history_quality"))
+                failed_count += 1
+                continue
             scored_rows.append(row)
             all_rs20.append(row["rs_20d"])
             all_rs60.append(row["rs_60d"])

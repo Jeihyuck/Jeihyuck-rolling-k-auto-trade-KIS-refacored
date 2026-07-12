@@ -215,6 +215,225 @@ def _normalize_watchlist_rows(raw_rows: list[dict], source: str) -> list[dict]:
     return normalized
 
 
+
+
+def _row_date(row: dict) -> str:
+    return str(row.get("date") or row.get("trade_date") or row.get("as_of") or row.get("timestamp") or "")[:10]
+
+
+def _row_close(row: dict) -> float | None:
+    for key in ("close", "close_price", "adj_close", "stck_clpr", "price"):
+        try:
+            v = float(row.get(key))
+            if v > 0 and v == v:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def _compute_completed_daily_metrics(rows: list[dict], trade_date: str) -> dict:
+    completed = [r for r in rows or [] if isinstance(r, dict) and _row_date(r) and _row_date(r) < str(trade_date)]
+    completed.sort(key=_row_date)
+    closes = [c for r in completed if (c := _row_close(r)) is not None]
+    if len(closes) < 60:
+        raise ValueError(f"daily_rows_insufficient completed={len(closes)} required=60")
+    def ma(n: int) -> float | None:
+        return round(sum(closes[-n:]) / n, 6) if len(closes) >= n else None
+    def rs(n: int) -> float | None:
+        return round((closes[-1] - closes[-1-n]) / closes[-1-n], 6) if len(closes) > n and closes[-1-n] > 0 else None
+    ma200 = ma(200)
+    ma200_prev = round(sum(closes[-220:-20]) / 200, 6) if len(closes) >= 220 else None
+    ma200_slope = round((ma200 - ma200_prev) / ma200_prev, 6) if ma200 and ma200_prev and ma200_prev > 0 else None
+    return {"ma20": ma(20), "ma50": ma(50), "ma150": ma(150), "ma200": ma200, "ma200_slope": ma200_slope, "rs_20d": rs(20), "rs_60d": rs(60), "rs_120d": rs(120), "daily_bar_count": len(closes), "daily_metrics_as_of": _row_date(completed[-1]) if completed else None}
+
+
+def _final30_score_contract_ok(rows: list[dict]) -> bool:
+    if not rows:
+        return False
+    for row in rows:
+        try:
+            if float(row.get("score_final", row.get("score", 0)) or 0) == 0.0:
+                return False
+        except Exception:
+            return False
+    return True
+
+
+def _build_final30_symbol_map_for_trend(*, trade_date: str, locked_watchlist_cache: list[dict] | None, watchlist_cache_source: str | None) -> tuple[dict[str, dict], bool, str, list[dict]]:
+    rows: list[dict] = []
+    source = watchlist_cache_source or "unknown"
+    try:
+        if locked_watchlist_cache is not None:
+            rows = _dedupe_watchlist_best_by_symbol(_normalize_watchlist_rows(list(locked_watchlist_cache), source or "session_cache"))
+            source = source or "session_cache"
+        else:
+            # Do not perform a potentially slow DB watchlist load before SELL-first exit
+            # routing. Session-level callers should pass locked_watchlist_cache when
+            # available; otherwise trend input uses the local final30 artifact and
+            # treats failures as missing/stale rather than absent.
+            rows = load_watchlist_from_artifact(trade_date)
+            source = "artifact_final30_scored"
+        rows = _dedupe_watchlist_best_by_symbol(_normalize_watchlist_rows(rows, source))
+        if any((_row_date(r) and _row_date(r) != str(trade_date)) for r in rows):
+            logger.warning("[US_POSITION][TREND_INPUT] trade_date=%s final30_source=%s status=STALE action=do_not_increment_absent", trade_date, source)
+            return {}, False, "missing_or_stale", rows
+        ok = _final30_score_contract_ok(rows)
+        if not ok:
+            logger.warning("[US_POSITION][TREND_INPUT] trade_date=%s final30_source=%s status=SCORE_CONTRACT_ERROR action=do_not_increment_absent", trade_date, source)
+            return {}, False, "score_contract_error", rows
+        out = {str(r.get("symbol") or "").upper().strip(): {**r, "rank_final30": idx + 1} for idx, r in enumerate(rows) if r.get("symbol")}
+        logger.info("[US_POSITION][TREND_INPUT] trade_date=%s final30_source=%s status=OK symbols=%d", trade_date, source, len(out))
+        return out, True, "ok", rows
+    except Exception as exc:
+        logger.warning("[US_POSITION][TREND_INPUT] trade_date=%s final30_source=%s status=ERROR reason=%s action=do_not_increment_absent", trade_date, source, exc)
+        return {}, False, "missing_or_stale", rows
+
+
+def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, trade_date: str, now: datetime, locked_watchlist_cache: list[dict] | None = None, watchlist_cache_source: str | None = None) -> tuple[list[dict], dict, list[dict] | None, str | None]:
+    final30_map, final30_ok, final30_quality, loaded_rows = _build_final30_symbol_map_for_trend(trade_date=trade_date, locked_watchlist_cache=locked_watchlist_cache, watchlist_cache_source=watchlist_cache_source)
+    if locked_watchlist_cache is None and loaded_rows:
+        locked_watchlist_cache = loaded_rows
+        watchlist_cache_source = "trend_final30_preload"
+    counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
+    for pos in positions or []:
+        symbol = str(pos.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        exchange = str(pos.get("exchange") or "NASDAQ")
+        row = final30_map.get(symbol)
+        final30_payload = {
+            "trade_date": trade_date,
+            "available": final30_ok,
+            "score_contract_ok": final30_ok,
+            "in_final30_today": bool(row),
+        }
+        if final30_ok and row:
+            final30_payload.update({
+                "rank_final30": row.get("rank_final30"),
+                "score_final": row.get("score_final", row.get("score")),
+                "trend_score": row.get("trend_score"),
+                "theme_cluster": row.get("theme_cluster"),
+                "rotation_regime": row.get("rotation_regime"),
+            })
+        elif not final30_ok:
+            final30_payload["trade_date"] = "" if final30_quality != "ok" else trade_date
+        current_price = pos.get("resolved_current_price") or pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px")
+        if current_price is None:
+            try:
+                px = provider.get_current_price(symbol, exchange)
+                current_price = (px or {}).get("last")
+                pos["current_price_usd"] = current_price
+            except Exception as px_exc:
+                logger.warning("[US_POSITION][TREND_INPUT] symbol=%s trade_date=%s current_price_status=ERROR reason=%s", symbol, trade_date, px_exc)
+        daily = {}
+        metrics_source = "insufficient_history"
+        try:
+            from trader.us.market_calendar import previous_completed_us_session
+            expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
+            from trader.us.position_trend_state import load_trend_state
+            persisted = load_trend_state(symbol, trade_date)
+            if (
+                persisted.get("daily_metrics_trade_date") == trade_date
+                and str(persisted.get("daily_metrics_as_of") or "") == expected_metrics_as_of
+                and str(persisted.get("daily_history_quality") or "") == "OK"
+                and persisted.get("ma20") and persisted.get("ma50")
+            ):
+                daily = {k: persisted.get(k) for k in ("ma20", "ma50", "ma150", "ma200", "ma200_slope", "rs_20d", "rs_60d", "rs_120d", "daily_bar_count", "daily_metrics_as_of", "daily_history_quality")}
+                metrics_source = "persisted_trend_metrics"
+            elif (
+                final30_ok and row
+                and str(row.get("daily_metrics_as_of") or "") == expected_metrics_as_of
+                and int(row.get("daily_bar_count") or 0) >= 150
+                and str(row.get("daily_history_quality") or "OK") in {"OK", "DEGRADED_NO_MA200"}
+                and row.get("ma20") and row.get("ma50")
+            ):
+                daily = {k: row.get(k) for k in ("ma20", "ma50", "ma150", "ma200", "ma200_slope", "rs_20d", "rs_60d", "rs_120d", "daily_bar_count", "daily_metrics_as_of", "daily_history_quality")}
+                metrics_source = "final30_prep_metrics"
+            else:
+                from trader.us.db.price_daily_repo import load_recent_us_daily_bars
+                rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
+                daily = _compute_completed_daily_metrics(list(rows or []), trade_date)
+                if str(daily.get("daily_metrics_as_of") or "") != expected_metrics_as_of:
+                    daily["daily_history_quality"] = "STALE"
+                else:
+                    daily["daily_history_quality"] = "OK" if int(daily.get("daily_bar_count") or 0) >= 200 else "DEGRADED_SHORT_HISTORY"
+                metrics_source = "price_daily"
+            daily["daily_metrics_source"] = metrics_source
+            daily["daily_metrics_trade_date"] = trade_date
+            logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=%s metrics_as_of=%s", symbol, metrics_source, daily.get("daily_metrics_as_of"))
+        except Exception as exc:
+            logger.warning("[US_POSITION][TREND_INPUT] symbol=%s trade_date=%s daily_status=ERROR reason=%s action=UNKNOWN", symbol, trade_date, exc)
+            daily = {"daily_history_quality": "INSUFFICIENT_DAILY_HISTORY", "daily_metrics_source": "insufficient_history", "daily_metrics_trade_date": trade_date}
+            logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=insufficient_history state=UNKNOWN", symbol)
+        try:
+            from trader.us.position_trend_state import update_us_position_trend_state
+            trend = update_us_position_trend_state(
+                symbol=symbol,
+                trade_date=trade_date,
+                now=now,
+                current_price=float(current_price) if current_price is not None else None,
+                holding_trade_days=int(pos.get("holding_trade_days") or 0),
+                final30=final30_payload,
+                daily=daily,
+                lifecycle_id=pos.get("position_lifecycle_id"),
+            )
+        except Exception as exc:
+            logger.warning("[US_POSITION][TREND_STATE][WARN] symbol=%s err=%s", symbol, exc)
+            trend = {"trend_state": "UNKNOWN", "weakness_signals": [], "final30_absent_streak": 0, "below_ma20_streak": 0, "below_ma50_streak": 0, "ma20": None, "ma50": None, "rs_20d": None}
+        pos["trend"] = trend
+        pos["trend_state"] = trend.get("trend_state")
+        pos["weakness_signals"] = trend.get("weakness_signals") or []
+        pos["final30_absent_streak"] = trend.get("final30_absent_streak")
+        pos["below_ma20_streak"] = trend.get("below_ma20_streak")
+        pos["below_ma50_streak"] = trend.get("below_ma50_streak")
+        pos["ma20"] = trend.get("ma20")
+        pos["ma50"] = trend.get("ma50")
+        pos["rs_20d"] = trend.get("rs_20d")
+        counts[str(trend.get("trend_state") or "UNKNOWN")] = counts.get(str(trend.get("trend_state") or "UNKNOWN"), 0) + 1
+    return positions, counts, locked_watchlist_cache, watchlist_cache_source
+
+
+def _mark_trend_stages_from_records(records: Any, *, trade_date: str, status: str) -> None:
+    if isinstance(records, dict):
+        iterable = []
+        for key in ("fills", "orders", "confirmed_orders", "confirmed", "results", "items"):
+            val = records.get(key)
+            if isinstance(val, list):
+                iterable.extend(val)
+        if not iterable:
+            iterable = [records]
+    else:
+        iterable = list(records or [])
+    for rec in iterable:
+        if not isinstance(rec, dict):
+            continue
+        meta = rec.get("meta") or rec.get("intent", {}).get("meta") or {}
+        order_key = rec.get("client_order_key") or rec.get("order_key") or meta.get("client_order_key")
+        symbol = rec.get("symbol") or meta.get("symbol") or rec.get("pdno")
+        if not meta.get("trend_stage"):
+            try:
+                from trader.us.db.repos import load_us_order_for_fill
+                order = load_us_order_for_fill(order_no=rec.get("order_no"), client_order_key=order_key, symbol=str(symbol or ""), trade_date=trade_date)
+                order_meta = order.get("meta") or {}
+                if isinstance(order_meta, str):
+                    import json as _json
+                    order_meta = _json.loads(order_meta or "{}")
+                meta = {**order_meta, **meta}
+                order_key = order.get("client_order_key") or order_key
+                symbol = order.get("symbol") or symbol
+            except Exception as exc:
+                logger.warning("[US_POSITION][TREND_STAGE][ORDER_LOOKUP_WARN] symbol=%s order_no=%s err=%s", symbol, rec.get("order_no"), exc)
+        stage = meta.get("trend_stage") or rec.get("trend_stage")
+        if not stage:
+            continue
+        lifecycle_id = meta.get("position_lifecycle_id") or rec.get("position_lifecycle_id")
+        try:
+            from trader.us.db.repos import mark_us_position_exit_stage
+            mark_us_position_exit_stage(trade_date, str(symbol or ""), str(stage), order_key=str(order_key or "") or None, status=status, lifecycle_id=lifecycle_id)
+        except Exception as exc:
+            logger.warning("[US_POSITION][TREND_STAGE][MARK_WARN] symbol=%s stage=%s status=%s err=%s", symbol, stage, status, exc)
+
 def _select_watchlist_rows_from_payload(payload: Any, *, path: Path, trade_date: str, source: str, require_trade_date_match: bool) -> list[dict]:
     if require_trade_date_match:
         payload_trade_date = _payload_trade_date(payload)
@@ -762,6 +981,10 @@ def run_trade_tick(
             save_fills(fills_today)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] save_fills failed: %s", exc)
+        try:
+            _mark_trend_stages_from_records(fills_today, trade_date=trade_date, status="FILLED")
+        except Exception as exc:
+            logger.warning("[US_POSITION][TREND_STAGE][FILL_MARK_WARN] err=%s", exc)
 
     # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
     if not offline:
@@ -781,6 +1004,10 @@ def run_trade_tick(
                 ack_recon.get("balance_reconcile_count", 0),
                 ack_recon.get("unresolved_count", 0),
             )
+            try:
+                _mark_trend_stages_from_records(ack_recon, trade_date=trade_date, status="FILLED")
+            except Exception as exc:
+                logger.warning("[US_POSITION][TREND_STAGE][ACK_RECON_MARK_WARN] err=%s", exc)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
 
@@ -816,6 +1043,30 @@ def run_trade_tick(
             current_positions = db_load_positions()
         except Exception:
             current_positions = []
+    try:
+        from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+        lifecycle_map = reconcile_us_position_lifecycles(
+            positions=current_positions,
+            trade_date=trade_date,
+            now=now,
+            authoritative=(
+                bool(should_reconcile_balance)
+                and not recon.get("preserve_previous_positions")
+                and recon.get("status") not in {"WARN", "ERROR", "CONTRACT_ERROR"}
+            ),
+        )
+        for _p in current_positions:
+            _lc = lifecycle_map.get(str(_p.get("symbol") or "").upper())
+            if _lc:
+                _p["position_lifecycle_id"] = _lc.get("lifecycle_id")
+                _p["opened_trade_date"] = _lc.get("opened_trade_date")
+                _p["holding_trade_days"] = _lc.get("holding_trade_days")
+                _p["lifecycle_state_source"] = "us_position_risk_state"
+                _p["high_watermark"] = _lc.get("high_watermark")
+                _p["max_price"] = _lc.get("high_watermark")
+                _p["high_watermark_source"] = _lc.get("high_watermark_source")
+    except Exception as _lc_exc:
+        logger.warning("[US_POSITION][LIFECYCLE][WARN] err=%s", _lc_exc)
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -890,16 +1141,69 @@ def run_trade_tick(
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
 
-    # ── EXIT 평가 ─────────────────────────────────────────────────────────────
+    # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─
+    trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
     try:
         engine = _get_strategy_engine(env=env, offline=offline)
-        exit_intents = engine.evaluate_exits(
-            positions=current_positions,
-            provider=provider,
-            now=now,
-        )
+        is_default_pb1_engine = engine.__class__.__module__ == "trader.us.pb1.us_pb1_engine"
+        if not is_default_pb1_engine:
+            try:
+                trend_positions, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
+                    positions=current_positions,
+                    provider=provider,
+                    trade_date=_exit_trade_date,
+                    now=now,
+                    locked_watchlist_cache=locked_watchlist_cache,
+                    watchlist_cache_source=watchlist_cache_source,
+                )
+            except Exception as _trend_exc:
+                logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
+                trend_positions = current_positions
+            exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
+        else:
+            from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
+            try:
+                exit_snapshots = prepare_exit_position_snapshots(current_positions, provider, now)
+            except Exception as _snapshot_exc:
+                logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
+                exit_snapshots = []
+            try:
+                safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
+            except Exception as _safety_eval_exc:
+                logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
+                safety_exit_intents = []
+            safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
+            trend_targets = [p for p in exit_snapshots if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
+            try:
+                trend_targets, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
+                    positions=trend_targets,
+                    provider=provider,
+                    trade_date=_exit_trade_date,
+                    now=now,
+                    locked_watchlist_cache=locked_watchlist_cache,
+                    watchlist_cache_source=watchlist_cache_source,
+                )
+            except Exception as _trend_exc:
+                logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
+            if trend_targets:
+                try:
+                    trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
+                except Exception as _trend_eval_exc:
+                    logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
+                    trend_exit_intents = []
+            else:
+                trend_exit_intents = []
+            exit_intents = []
+            seen_sell_symbols: set[str] = set()
+            for intent in list(safety_exit_intents or []) + list(trend_exit_intents or []):
+                sym = str(intent.get("symbol") or "").upper()
+                if str(intent.get("side") or "").upper() == "SELL":
+                    if sym in seen_sell_symbols:
+                        continue
+                    seen_sell_symbols.add(sym)
+                exit_intents.append(intent)
     except Exception as exc:
         logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
@@ -1454,10 +1758,15 @@ def run_trade_tick(
         entry_intents, cluster_guard_blocked_buys = filter_entry_intents_for_cluster_guard(entry_intents, cluster_guard_result)
         from trader.us.market_state_overlay import filter_entry_intents_for_market_state
         entry_intents, market_state_blocked_buys = filter_entry_intents_for_market_state(entry_intents, market_state_overlay, current_positions)
+        from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
+        entry_intents, trend_blocked_buys = filter_add_to_existing_by_trend_state(entry_intents, current_positions)
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
         cluster_guard_blocked_buys = []
+        trend_blocked_buys = []
+    if 'trend_blocked_buys' not in locals():
+        trend_blocked_buys = []
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(entry_intents))
 
     if entry_eval_error_count > 0 and real_order_mode and not exit_intents:
@@ -1554,8 +1863,35 @@ def run_trade_tick(
                         )
                     except Exception as _pc_ack_exc:
                         logger.warning("[US_PROFIT_CAPTURE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _pc_ack_exc)
+                if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("trend_stage") or ""):
+                    try:
+                        from trader.us.db.repos import mark_us_position_exit_stage
+                        mark_us_position_exit_stage(
+                            trade_date,
+                            str(intent.get("symbol") or ""),
+                            str((intent.get("meta") or {}).get("trend_stage")),
+                            order_key=str(intent.get("client_order_key") or intent.get("order_key") or "") or None,
+                            status="ACK" if result["status"] == "ACK" else "PENDING",
+                            lifecycle_id=(intent.get("meta") or {}).get("position_lifecycle_id"),
+                        )
+                    except Exception as _trend_ack_exc:
+                        logger.warning("[US_POSITION][TREND_STATE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_ack_exc)
                 if str(intent.get("side", "")).upper() == "BUY":
                     buy_daily_notional += float(intent.get("notional_usd", 0) or 0)
+            elif str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("trend_stage") or ""):
+                try:
+                    from trader.us.db.repos import mark_us_position_exit_stage
+                    mapped_status = "REJECTED" if str(result.get("status") or "").upper() in {"REJECTED", "FAILED", "ERROR", "BLOCKED"} else str(result.get("status") or "").upper()
+                    mark_us_position_exit_stage(
+                        trade_date,
+                        str(intent.get("symbol") or ""),
+                        str((intent.get("meta") or {}).get("trend_stage")),
+                        order_key=str(intent.get("client_order_key") or intent.get("order_key") or "") or None,
+                        status=mapped_status,
+                        lifecycle_id=(intent.get("meta") or {}).get("position_lifecycle_id"),
+                    )
+                except Exception as _trend_rej_exc:
+                    logger.warning("[US_POSITION][TREND_STATE][REJECT_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_rej_exc)
                 if str(intent.get("side", "")).upper() == "BUY":
                     symbol_upper = str(intent.get("symbol", "")).upper().strip()
                     position_action = (
@@ -1900,6 +2236,22 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
+        "trend_healthy_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("HEALTHY", 0)),
+        "trend_warning_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("WARNING", 0)),
+        "trend_trim_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("TRIM", 0)),
+        "trend_exit_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("EXIT", 0)),
+        "trend_unknown_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("UNKNOWN", 0)),
+        "high_watermark_updated_count": sum(1 for p in current_positions if p.get("high_watermark_source") == "us_position_risk_state"),
+        "time_stop_trim_count": sum(1 for i in exit_intents if i.get("exit_type") == "time_stop_trim"),
+        "time_stop_exit_count": sum(1 for i in exit_intents if i.get("exit_type") == "time_stop_exit"),
+        "trend_add_blocked_count": len(trend_blocked_buys) if 'trend_blocked_buys' in locals() else 0,
+        "trend_metrics_persisted_count": sum(1 for p in current_positions if (p.get("trend") or {}).get("daily_metrics_source") == "persisted_trend_metrics"),
+        "trend_metrics_final30_count": sum(1 for p in current_positions if (p.get("trend") or {}).get("daily_metrics_source") == "final30_prep_metrics"),
+        "trend_metrics_price_daily_count": sum(1 for p in current_positions if (p.get("trend") or {}).get("daily_metrics_source") == "price_daily"),
+        "trend_metrics_unknown_count": sum(1 for p in current_positions if p.get("trend_state") == "UNKNOWN"),
+        "trend_trim_intent_count": sum(1 for i in exit_intents if i.get("exit_type") == "trend_deterioration_trim"),
+        "trend_exit_intent_count": sum(1 for i in exit_intents if i.get("exit_type") == "trend_deterioration_exit"),
+        "daily_http_call_count": int((provider.get_client_stats() if hasattr(provider, "get_client_stats") else getattr(provider, "stats", {})).get("daily_http_call_count", 0) if hasattr((provider.get_client_stats() if hasattr(provider, "get_client_stats") else getattr(provider, "stats", {})), "get") else 0),
         "prep_contract_trade_block": bool(entry_degraded_reason in {"prep_contract_trade_block", "prep_contract_version_mismatch", "risk_off_entry_block", "force_entry_block", "allow_new_buy_false"}),
         "market_regime": market_state_overlay.get("market_regime") if 'market_state_overlay' in locals() else "NEUTRAL",
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,

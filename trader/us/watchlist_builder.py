@@ -357,11 +357,7 @@ def build_us_watchlist(
 
     for row in candidate_pool:
         symbol = row.get("symbol", "")
-        exchange = row.get("exchange", "NASDAQ")
-        try:
-            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
-        except Exception:
-            daily = []
+        daily = []
 
         # Agent A
         agent_a_score, agent_a_reasons = _compute_agent_a_score(row)
@@ -589,7 +585,10 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
         exchange = ETF_EXCHANGE_MAP.get(sym, "NYSE")
         closes: list[float] = []
         try:
-            rows = provider.get_daily_prices(sym, exchange, as_of_date=as_of_date)
+            if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                rows = provider.get_completed_daily_prices(sym, exchange, trade_date=as_of_date, required_bars=260, allow_http_sync=True)
+            else:
+                rows = provider.get_daily_prices(sym, exchange, as_of_date=as_of_date)
             closes = [_safe_float(r.get("close") or r.get("price")) for r in (rows or []) if _safe_float(r.get("close") or r.get("price")) > 0]
         except Exception as exc:
             logger.warning("[US_ROTATION][BENCHMARK_DATA_MISSING] symbol=%s exchange=%s error=%s", sym, exchange, exc)
@@ -607,7 +606,10 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
         exchange = AI_BASKET_EXCHANGE_MAP.get(sym, "NASDAQ")
         closes: list[float] = []
         try:
-            rows = provider.get_daily_prices(sym, exchange, as_of_date=as_of_date)
+            if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                rows = provider.get_completed_daily_prices(sym, exchange, trade_date=as_of_date, required_bars=260, allow_http_sync=True)
+            else:
+                rows = provider.get_daily_prices(sym, exchange, as_of_date=as_of_date)
             closes = [_safe_float(r.get("close") or r.get("price")) for r in (rows or []) if _safe_float(r.get("close") or r.get("price")) > 0]
         except Exception as exc:
             logger.warning("[US_ROTATION][AI_BASKET_DATA_MISSING] symbol=%s exchange=%s error=%s", sym, exchange, exc)

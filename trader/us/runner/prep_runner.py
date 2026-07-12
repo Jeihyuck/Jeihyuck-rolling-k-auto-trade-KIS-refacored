@@ -243,6 +243,61 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         finish_us_prep_run(run_id, status="ERROR", result=str(exc))
         return {"status": "ERROR", "stage": "dynamic_universe", "error": str(exc)}
 
+    daily_sync_summary = {"sync_target_count": 0, "sync_ok_count": 0, "sync_failed_count": 0, "sync_failed_symbols": [], "open_position_sync_failed_symbols": [], "benchmark_sync_failed_symbols": []}
+    try:
+        from trader.us.db.repos import load_latest_open_us_position_lifecycles, load_positions
+        from trader.us.symbols import resolve_exchange
+        benchmark_symbols = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
+        sync_symbols = {str(s.get("symbol") or "").upper() for s in dynamic_universe_result.get("symbols", [])}
+        sync_symbols |= benchmark_symbols
+        open_position_symbols: set[str] = set()
+        try:
+            open_position_symbols |= {str(p.get("symbol") or "").upper() for p in (load_positions(as_of=trade_date) or [])}
+            sync_symbols |= open_position_symbols
+        except Exception:
+            pass
+        try:
+            lifecycle_symbols = set((load_latest_open_us_position_lifecycles(trade_date) or {}).keys())
+            open_position_symbols |= lifecycle_symbols
+            sync_symbols |= lifecycle_symbols
+        except Exception:
+            pass
+        sync_symbols = {s for s in sync_symbols if s}
+        sync_ok: list[str] = []
+        sync_failed: list[dict] = []
+        for sym in sorted(sync_symbols):
+            try:
+                if hasattr(provider, "get_completed_daily_prices_result"):
+                    result = provider.get_completed_daily_prices_result(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                else:
+                    rows = provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                    result = {"quality": "OK" if rows else "INSUFFICIENT_HISTORY", "valid_bar_count": len(rows or []), "db_latest": None, "expected_latest": None}
+                if result.get("quality") == "OK":
+                    sync_ok.append(sym)
+                else:
+                    sync_failed.append({
+                        "symbol": sym,
+                        "quality": result.get("quality"),
+                        "valid_bar_count": result.get("valid_bar_count"),
+                        "db_latest": result.get("db_latest"),
+                        "expected_latest": result.get("expected_latest"),
+                    })
+            except Exception as exc:
+                sync_failed.append({"symbol": sym, "reason": str(exc)})
+                logger.warning("[US_PREP][DAILY_SYNC][SYMBOL_WARN] symbol=%s err=%s", sym, exc)
+        daily_sync_summary = {
+            "sync_target_count": len(sync_symbols),
+            "sync_ok_count": len(sync_ok),
+            "sync_failed_count": len(sync_failed),
+            "sync_failed_symbols": [x["symbol"] for x in sync_failed],
+            "open_position_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in open_position_symbols],
+            "benchmark_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in benchmark_symbols],
+            "daily_sync_quality_by_symbol": {x["symbol"]: x for x in sync_failed} | {s: {"symbol": s, "quality": "OK"} for s in sync_ok},
+        }
+        logger.info("[US_PREP][DAILY_SYNC] %s", daily_sync_summary)
+    except Exception as exc:
+        logger.warning("[US_PREP][DAILY_SYNC][WARN] %s", exc)
+
     # ── 4. Candidate Pool ─────────────────────────────────────────────────
     logger.info("[US_PREP][HEARTBEAT] stage=candidate_pool status=start")
     try:
@@ -424,9 +479,43 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     # authoritative source로 사용한다. Underfilled final30 정책은 contract에 있다.
     du_warn = du_status == "OK_WITH_WARNINGS"
     cp_warn = cp_status == "OK_WITH_WARNINGS"
+    open_position_daily_failed = bool(daily_sync_summary.get("open_position_sync_failed_symbols"))
+    benchmark_daily_failed = bool(set(daily_sync_summary.get("benchmark_sync_failed_symbols") or []) & {"SPY", "QQQ", "SMH"})
+    if benchmark_daily_failed:
+        market_state_overlay = dict(watchlist_result.get("market_state_overlay") or market_state_overlay or {})
+        market_state_overlay.update({
+            "market_state": "UNKNOWN",
+            "market_regime": "UNKNOWN",
+            "allow_new_buy": False,
+            "allow_add_to_existing": False,
+            "force_entry_block": True,
+            "capital_scale": 0.0,
+            "exposure_multiplier": 0.0,
+            "max_new_positions": 0,
+        })
+        watchlist_result["market_state_overlay"] = dict(market_state_overlay)
+        market_state_fields.update({
+            "market_state": "UNKNOWN",
+            "market_regime": "UNKNOWN",
+            "allow_new_buy": False,
+            "allow_add_to_existing": False,
+            "force_entry_block": True,
+            "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+            "daily_data_status": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+            "capital_scale": 0.0,
+            "exposure_multiplier": 0.0,
+            "max_new_positions": 0,
+        })
+        watchlist_result["market_regime"] = "UNKNOWN"
+        watchlist_result["allow_new_buy"] = False
+        watchlist_result["allow_add_to_existing"] = False
+        watchlist_result["force_entry_block"] = True
+        validation["trade_block_reason"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+    elif open_position_daily_failed:
+        market_state_fields["daily_data_status"] = "DEGRADED_POSITION_DAILY_DATA"
     if du_status == "ERROR" or cp_status == "ERROR":
         provisional_status = "ERROR"
-    elif du_warn or cp_warn:
+    elif benchmark_daily_failed or open_position_daily_failed or du_warn or cp_warn or daily_sync_summary.get("sync_failed_count", 0):
         provisional_status = "OK_WITH_WARNINGS"
     else:
         provisional_status = "OK"
@@ -443,6 +532,19 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             validation=validation,
             paths=paths,
         )
+        contract["daily_sync_summary"] = daily_sync_summary
+        if benchmark_daily_failed:
+            contract.update({
+                "trade_can_proceed": 0,
+                "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+                "allow_new_buy": False,
+                "allow_add_to_existing": False,
+                "force_entry_block": True,
+                "market_regime": "UNKNOWN",
+                "market_state": "UNKNOWN",
+                "effective_capital_scale": 0.0,
+                "effective_max_new_positions": 0,
+            })
 
         final_status = contract.get("status", provisional_status)
         trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)
@@ -494,6 +596,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     try:
         legacy_entries = [
             {
+                **row,
                 "symbol": row.get("symbol"),
                 "exchange": row.get("exchange", "NASDAQ"),
                 "strategy": row.get("entry_style_selected", "dual_agent"),
@@ -503,12 +606,26 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                 "scores": {"final": row.get("score_final", 0.0)},
                 "reason_json": row.get("reason_json", {}),
                 "meta": {
+                    **(row.get("meta") or {}),
                     "run_id": run_id,
                     "rank_final30": row.get("rank_final30"),
                     "agent_a_score": row.get("agent_a_score"),
                     "agent_b_score": row.get("agent_b_score"),
                     "theme_cluster": row.get("theme_cluster"),
                     "rotation_regime": row.get("rotation_regime"),
+                    "ma20": row.get("ma20"),
+                    "ma50": row.get("ma50"),
+                    "ma150": row.get("ma150"),
+                    "ma200": row.get("ma200"),
+                    "ma200_slope": row.get("ma200_slope"),
+                    "rs_20d": row.get("rs_20d"),
+                    "rs_60d": row.get("rs_60d"),
+                    "rs_120d": row.get("rs_120d"),
+                    "trend_score": row.get("trend_score"),
+                    "daily_bar_count": row.get("daily_bar_count"),
+                    "daily_metrics_as_of": row.get("daily_metrics_as_of"),
+                    "daily_metrics_source": row.get("daily_metrics_source"),
+                    "daily_history_quality": row.get("daily_history_quality"),
                 },
             }
             for row in final30_scored
@@ -561,6 +678,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
         "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
         "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
+        "daily_sync_summary": daily_sync_summary,
         **market_state_fields,
     })
     finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
@@ -624,6 +742,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "env": env,
             "event": _event_name,
             "workflow": _workflow_name,
+            "daily_sync_summary": daily_sync_summary,
         }
         _save_json_file(_status_file, prep_status_payload)
         logger.info(
@@ -681,4 +800,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

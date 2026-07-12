@@ -105,6 +105,7 @@ def evaluate_exit(
     current_price: float,
     now: datetime | None = None,
     trail_high_price: float | None = None,
+    include_trend_time: bool = True,
 ) -> dict | None:
     """단일 포지션 청산 조건 평가.
 
@@ -390,6 +391,49 @@ def evaluate_exit(
                     trail_high_price=max_price,
                 )
 
+    # ── staged trend/time exits (after all safety/profit exits) ──────────────
+    if not include_trend_time:
+        return None
+    trend = dict(position.get("trend") or {})
+    if not trend:
+        trend = {k: position.get(k) for k in ("trend_state", "weakness_signals", "final30_absent_streak", "below_ma20_streak", "below_ma50_streak", "trend_trim_done", "trend_trim_pending", "trend_exit_done", "trend_exit_pending", "time_stop_trim_done", "time_stop_trim_pending", "time_stop_exit_done", "time_stop_exit_pending", "holding_trade_days", "current_price", "ma20", "lifecycle_id") if k in position}
+    try:
+        from trader.us.position_trend_state import choose_trend_time_exit
+        choice = choose_trend_time_exit(position, trend, pnl_pct=pnl_pct, orderable_qty=orderable_qty)
+    except Exception as exc:
+        logger.warning("[US_POSITION][TREND_STATE][EXIT_WARN] symbol=%s err=%s", symbol, exc)
+        choice = None
+    if choice:
+        exit_type, sell_qty, stage = choice
+        if stage.startswith("time_stop"):
+            logger.info("[US_POSITION][TIME_STOP] symbol=%s holding_trade_days=%s pnl_pct=%.4f trend_state=%s action=%s", symbol, position.get("holding_trade_days") or trend.get("holding_trade_days"), pnl_pct, trend.get("trend_state"), "SELL_50PCT" if exit_type == "time_stop_trim" else "SELL_FULL")
+        intent = _make_exit_intent(
+            symbol=symbol, exchange=exchange, qty=sell_qty, current_price=current_price, entry_price=entry_price,
+            exit_type=exit_type, reason=f"{stage} trend_state={trend.get('trend_state')} signals={','.join(trend.get('weakness_signals') or [])}",
+            unrealized_pnl_usd=(current_price - entry_price) * sell_qty, pnl_pct=pnl_pct,
+            holding_qty=raw_qty, orderable_qty=orderable_qty, now=now, trail_high_price=max_price,
+            meta_extra={
+                "position_lifecycle_id": position.get("position_lifecycle_id") or trend.get("lifecycle_id"),
+                "holding_trade_days": position.get("holding_trade_days") or trend.get("holding_trade_days"),
+                "trend_state": trend.get("trend_state"),
+                "weakness_signals": trend.get("weakness_signals") or [],
+                "final30_absent_streak": trend.get("final30_absent_streak"),
+                "below_ma20_streak": trend.get("below_ma20_streak"),
+                "below_ma50_streak": trend.get("below_ma50_streak"),
+                "high_watermark": max_price,
+                "high_watermark_source": position.get("high_watermark_source"),
+                "trend_stage": stage,
+                "small_position_forced_full_exit": bool(orderable_qty == 1 and sell_qty == 1 and exit_type.endswith("trim")),
+            },
+        )
+        if intent:
+            try:
+                from trader.us.db.repos import mark_us_position_exit_stage
+                mark_us_position_exit_stage(intent.get("trade_date"), symbol, stage, intent.get("client_order_key"), "PENDING", position.get("position_lifecycle_id") or trend.get("lifecycle_id"))
+            except Exception as exc:
+                logger.warning("[US_POSITION][TREND_STATE][STAGE_WARN] symbol=%s stage=%s err=%s", symbol, stage, exc)
+        return intent
+
     return None
 
 
@@ -433,6 +477,7 @@ def _make_exit_intent(
     orderable_qty: int = 0,
     now: datetime | None = None,
     trail_high_price: float | None = None,
+    meta_extra: dict | None = None,
 ) -> dict | None:
     """Exit order intent 생성."""
     import hashlib
@@ -462,7 +507,7 @@ def _make_exit_intent(
 
     _holding = holding_qty or qty
     _orderable = orderable_qty or _holding
-    partial_allowed = False if is_hard_stop else (exit_type not in {"persistent_soft_stop_full_exit"})
+    partial_allowed = False if is_hard_stop else (exit_type not in {"persistent_soft_stop_full_exit", "trend_deterioration_exit", "time_stop_exit"})
     trail_high = float(trail_high_price or current_price or 0.0)
     trail_drawdown_pct = ((trail_high - current_price) / trail_high) if trail_high > 0 else 0.0
     cfg = _reload_env()
@@ -524,6 +569,7 @@ def _make_exit_intent(
             "price_source": "provider_current_price",
             "qty": qty,
             "decision_ts_et": decision_ts_et,
+            **(meta_extra or {}),
         },
     }
 
@@ -589,42 +635,17 @@ def _resolve_position_entry_price(position: dict) -> float:
     return 0.0
 
 
-def generate_exit_intents(
+def prepare_exit_position_snapshots(
     positions: list[dict],
     provider: Any,
     now: datetime | None = None,
 ) -> list[dict]:
-    """보유 포지션 전체에 대해 청산 조건 평가.
-
-    Args:
-        positions: 보유 포지션 목록
-        provider: USDataProvider
-        now: 현재 시각
-
-    Returns:
-        청산 intent 목록
-    """
     from trader.us.symbols import normalize_us_exchange
-    
-    intents: list[dict] = []
-    sell_explanations: list[dict] = []
-    hold_explanations: list[dict] = []
-
-    if not positions:
-        logger.info("[US_EXIT][NO_SIGNAL] positions=0")
-        return intents
-
-    logger.info("[US_EXIT][EVAL][START] positions=%d", len(positions))
-
-    skipped_price_fetch_failed: int = 0
-    skipped_price_nonpositive: int = 0
-    hold_count: int = 0
-
-    for pos in positions:
+    snapshots: list[dict] = []
+    for original_pos in positions:
+        pos = dict(original_pos or {})
         symbol = pos.get("symbol", "")
         raw_exchange = pos.get("exchange", "NASDAQ")
-        
-        # Normalize exchange for price lookup (NASD → NASDAQ, etc.)
         try:
             exchange = normalize_us_exchange(raw_exchange)
         except ValueError as exc:
@@ -633,20 +654,23 @@ def generate_exit_intents(
                 symbol, raw_exchange, exc
             )
             exchange = "NASDAQ"
-
         try:
-            price_data = provider.get_current_price(symbol, exchange)
-            current_price = float(price_data.get("last", 0))
+            if hasattr(provider, "get_current_price"):
+                price_data = provider.get_current_price(symbol, exchange)
+                if isinstance(price_data, dict):
+                    current_price = float(price_data.get("last") or price_data.get("price") or 0)
+                else:
+                    current_price = float(price_data or 0)
+            elif hasattr(provider, "get_current_price_usd"):
+                current_price = float(provider.get_current_price_usd(symbol, exchange) or 0)
+            else:
+                current_price = float(pos.get("current_price") or pos.get("current_price_usd") or pos.get("last_price") or 0)
         except Exception as exc:
             logger.warning("[US_EXIT][WARN] price fetch failed symbol=%s exchange=%s error=%s", symbol, exchange, exc)
-            skipped_price_fetch_failed += 1
             continue
-
         if current_price <= 0:
             logger.debug("[US_EXIT][SKIP] symbol=%s reason=price_nonpositive price=%.4f", symbol, current_price)
-            skipped_price_nonpositive += 1
             continue
-
         entry_price_for_state = _resolve_position_entry_price(pos)
         if entry_price_for_state > 0 and current_price > 0:
             try:
@@ -665,10 +689,62 @@ def generate_exit_intents(
             except Exception as exc:
                 logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
 
-        # book/horizon 기반 router 사용 — SWING vs DAY 분리
-        # fallback: meta 없으면 SWING_BOOK (기본값)
-        from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
-        intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now)
+        if entry_price_for_state > 0 and current_price > 0:
+            try:
+                from trader.us.position_lifecycle_state import update_us_position_high_watermark
+                lifecycle_id = pos.get("position_lifecycle_id") or ((pos.get("risk_state") or {}).get("state") or {}).get("lifecycle", {}).get("lifecycle_id")
+                if lifecycle_id:
+                    high_state = update_us_position_high_watermark(
+                        symbol=symbol, trade_date=_trade_date_from_key(resolve_us_trade_date_key(now)), lifecycle_id=str(lifecycle_id),
+                        current_price=current_price, entry_price=entry_price_for_state, now=now or datetime.now(),
+                    )
+                    pos["high_watermark"] = high_state.get("high_watermark")
+                    pos["max_price"] = high_state.get("high_watermark")
+                    pos["high_watermark_source"] = "us_position_risk_state"
+                    pos["position_lifecycle_id"] = high_state.get("lifecycle_id")
+            except Exception as exc:
+                logger.warning("[US_POSITION][HIGH_WATERMARK][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
+        if entry_price_for_state > 0:
+            pos["resolved_pnl_pct"] = (current_price - entry_price_for_state) / entry_price_for_state
+        pos["resolved_current_price"] = current_price
+        pos["current_price_usd"] = current_price
+        pos["current_price"] = current_price
+        pos["resolved_entry_price"] = entry_price_for_state
+        pos["resolved_exchange"] = exchange
+        if isinstance(original_pos, dict):
+            original_pos.update({
+                "risk_state": pos.get("risk_state", original_pos.get("risk_state")),
+                "soft_stop_breach_count": pos.get("soft_stop_breach_count", original_pos.get("soft_stop_breach_count")),
+                "high_watermark": pos.get("high_watermark", original_pos.get("high_watermark")),
+                "max_price": pos.get("max_price", original_pos.get("max_price")),
+                "high_watermark_source": pos.get("high_watermark_source", original_pos.get("high_watermark_source")),
+                "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
+                "resolved_current_price": current_price,
+                "current_price_usd": current_price,
+                "current_price": current_price,
+            })
+        snapshots.append(pos)
+    return snapshots
+
+
+def _evaluate_exit_intents_from_snapshots(
+    snapshots: list[dict],
+    *,
+    now: datetime | None = None,
+    include_trend_time: bool = True,
+) -> list[dict]:
+    intents: list[dict] = []
+    sell_explanations: list[dict] = []
+    hold_explanations: list[dict] = []
+    hold_count = 0
+    from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
+    for pos in snapshots or []:
+        symbol = pos.get("symbol", "")
+        current_price = float(pos.get("resolved_current_price") or 0)
+        if current_price <= 0:
+            continue
+
+        intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now, include_trend_time=include_trend_time)
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build exit explanation
@@ -716,23 +792,20 @@ def generate_exit_intents(
             log_us_exit_decision(symbol, "HOLD", hold_explanation)
             hold_count += 1
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Skip/Hold Summary for Observability
-    # ─────────────────────────────────────────────────────────────────────────
     exit_intents_count = len(intents)
     logger.info(
         "[US_EXIT][SKIP_SUMMARY] "
         "positions_total=%d evaluated=%d exit_intents=%d hold=%d "
         "skipped_price_fetch_failed=%d skipped_price_nonpositive=%d",
-        len(positions),
-        len(positions) - skipped_price_fetch_failed - skipped_price_nonpositive,
+        len(snapshots or []),
+        len(snapshots or []),
         exit_intents_count,
         hold_count,
-        skipped_price_fetch_failed,
-        skipped_price_nonpositive,
+        0,
+        0,
     )
     if exit_intents_count == 0:
-        logger.info("[US_EXIT][NO_SIGNAL] no exit intents generated positions=%d", len(positions))
+        logger.info("[US_EXIT][NO_SIGNAL] no exit intents generated positions=%d", len(snapshots or []))
     logger.info("[US_EXIT][INTENTS] count=%d", exit_intents_count)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -761,3 +834,20 @@ def generate_exit_intents(
         logger.warning("[US_EXIT][EXPLANATION_QUALITY] no explanations generated")
 
     return intents
+
+
+def generate_exit_intents(
+    positions: list[dict],
+    provider: Any | None = None,
+    now: datetime | None = None,
+    *,
+    prepared_snapshots: list[dict] | None = None,
+    include_trend_time: bool = True,
+) -> list[dict]:
+    """보유 포지션 전체에 대해 청산 조건 평가."""
+    if not positions and not prepared_snapshots:
+        logger.info("[US_EXIT][NO_SIGNAL] positions=0")
+        return []
+    logger.info("[US_EXIT][EVAL][START] positions=%d", len(prepared_snapshots or positions or []))
+    snapshots = prepared_snapshots if prepared_snapshots is not None else prepare_exit_position_snapshots(positions, provider, now)
+    return _evaluate_exit_intents_from_snapshots(snapshots, now=now, include_trend_time=include_trend_time)
