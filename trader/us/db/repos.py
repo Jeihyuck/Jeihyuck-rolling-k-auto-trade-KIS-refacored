@@ -728,7 +728,11 @@ def mark_us_position_exit_stage(
     risk = load_us_position_risk_state(sym, td) or load_latest_us_position_risk_state(sym, td) or {}
     state = dict(risk.get("state") or {})
     trend = dict(state.get("trend") or {})
+    current_lifecycle = (state.get("lifecycle") or {}).get("lifecycle_id") if isinstance(state.get("lifecycle"), dict) else None
     if lifecycle_id and trend.get("lifecycle_id") and trend.get("lifecycle_id") != lifecycle_id:
+        if current_lifecycle and current_lifecycle != lifecycle_id:
+            logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s lifecycle_id=%s action=IGNORE_STALE_LIFECYCLE current_lifecycle_id=%s", sym, stg, status, lifecycle_id, current_lifecycle)
+            return
         trend = {"lifecycle_id": lifecycle_id}
     status_upper = str(status or "PENDING").upper()
     terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
@@ -753,6 +757,7 @@ def mark_us_position_exit_stage(
     state["trend"] = trend
     risk["state"] = state
     save_us_position_risk_state(sym, td, risk)
+    logger.info("[US_POSITION][TREND_STAGE] symbol=%s stage=%s status=%s pending=%s done=%s order_key=%s lifecycle_id=%s", sym, stg, status_upper, trend.get(f"{stg}_pending"), trend.get(f"{stg}_done"), order_key, lifecycle_id)
 
 def update_us_soft_stop_risk_state(
     *,

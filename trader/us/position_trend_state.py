@@ -141,7 +141,7 @@ def filter_add_to_existing_by_trend_state(entry_intents: list[dict], current_pos
         if str(it.get("side", "BUY")).upper() == "BUY" and p and trend_state != "HEALTHY":
             b = {**it, "block_reason": "POSITION_TREND_NOT_HEALTHY"}
             blocked.append(b)
-            logger.info("[US_ENTRY][TREND_BLOCK] symbol=%s trend_state=%s signals=%s action=BLOCK_ADD_TO_EXISTING", sym, trend_state, ",".join(((p or {}).get("weakness_signals") or [])))
+            logger.info("[US_ENTRY][TREND_BLOCK] symbol=%s trend_state=%s signals=%s reason=%s action=BLOCK_ADD_TO_EXISTING", sym, trend_state, ",".join(((p or {}).get("weakness_signals") or [])), "TREND_DATA_UNKNOWN" if trend_state == "UNKNOWN" else "POSITION_TREND_NOT_HEALTHY")
         else:
             kept.append(it)
     return kept, blocked
