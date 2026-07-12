@@ -55,11 +55,14 @@ def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetim
     rs20, rs60 = _f(daily.get("rs_20d")), _f(daily.get("rs_60d"))
     trend_score = _f(final30.get("trend_score") if final30.get("trend_score") is not None else daily.get("trend_score"))
     quality = "ok"
+    daily_quality = str(daily.get("daily_history_quality") or "")
     valid_final30 = final30.get("trade_date") == trade_date and final30.get("score_contract_ok", True) and final30.get("available", True)
     if final30 and not valid_final30:
         quality = "missing_or_stale"
     final30_invalid = bool(final30 and not valid_final30)
-    required_missing = cp is None or ma20 is None or ma50 is None or final30_invalid
+    required_missing = cp is None or ma20 is None or ma50 is None or final30_invalid or daily_quality in {"STALE", "DB_ERROR", "KIS_SYNC_FAILED", "INSUFFICIENT_HISTORY"}
+    if daily_quality in {"STALE", "DB_ERROR", "KIS_SYNC_FAILED", "INSUFFICIENT_HISTORY"}:
+        quality = daily_quality
     if not daily and required_missing:
         quality = "missing"
     in_final = bool(final30.get("in_final30_today")) if valid_final30 else bool(prev.get("in_final30_today"))

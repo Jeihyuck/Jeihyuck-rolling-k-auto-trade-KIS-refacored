@@ -267,11 +267,21 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         sync_failed: list[dict] = []
         for sym in sorted(sync_symbols):
             try:
-                rows = provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
-                if rows:
+                if hasattr(provider, "get_completed_daily_prices_result"):
+                    result = provider.get_completed_daily_prices_result(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                else:
+                    rows = provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                    result = {"quality": "OK" if rows else "INSUFFICIENT_HISTORY", "valid_bar_count": len(rows or []), "db_latest": None, "expected_latest": None}
+                if result.get("quality") == "OK":
                     sync_ok.append(sym)
                 else:
-                    sync_failed.append({"symbol": sym, "reason": "empty_or_insufficient"})
+                    sync_failed.append({
+                        "symbol": sym,
+                        "quality": result.get("quality"),
+                        "valid_bar_count": result.get("valid_bar_count"),
+                        "db_latest": result.get("db_latest"),
+                        "expected_latest": result.get("expected_latest"),
+                    })
             except Exception as exc:
                 sync_failed.append({"symbol": sym, "reason": str(exc)})
                 logger.warning("[US_PREP][DAILY_SYNC][SYMBOL_WARN] symbol=%s err=%s", sym, exc)
@@ -282,6 +292,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "sync_failed_symbols": [x["symbol"] for x in sync_failed],
             "open_position_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in open_position_symbols],
             "benchmark_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in benchmark_symbols],
+            "daily_sync_quality_by_symbol": {x["symbol"]: x for x in sync_failed} | {s: {"symbol": s, "quality": "OK"} for s in sync_ok},
         }
         logger.info("[US_PREP][DAILY_SYNC] %s", daily_sync_summary)
     except Exception as exc:
@@ -487,6 +498,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             validation=validation,
             paths=paths,
         )
+        contract["daily_sync_summary"] = daily_sync_summary
 
         final_status = contract.get("status", provisional_status)
         trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)
@@ -605,6 +617,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "fallback_fill_used": watchlist_result.get("fallback_fill_used", False),
         "fallback_fill_count": watchlist_result.get("fallback_fill_count", 0),
         "fallback_fill_cap_safe": watchlist_result.get("fallback_fill_cap_safe", True),
+        "daily_sync_summary": daily_sync_summary,
         **market_state_fields,
     })
     finish_us_prep_run(run_id=run_id, status=final_status, result=result_dict)
@@ -668,6 +681,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "env": env,
             "event": _event_name,
             "workflow": _workflow_name,
+            "daily_sync_summary": daily_sync_summary,
         }
         _save_json_file(_status_file, prep_status_payload)
         logger.info(

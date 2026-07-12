@@ -190,23 +190,28 @@ def market_phase(now: datetime | None = None) -> str:
         return "CLOSED"
 
     t = now.time()
+    close_time = regular_close_time_for_date(d)
 
-    if t < _PREMARKET_START or t >= _AFTERMARKET_END:
+    if t < _PREMARKET_START:
         return "CLOSED"
 
     if t < _REGULAR_OPEN:
         return "PREMARKET"
 
+    if t >= _AFTERMARKET_END:
+        return "CLOSED"
+
+    if t >= close_time:
+        return "AFTERMARKET"
+
     if t < time(11, 30):
         return "REGULAR_OPEN"
 
-    if t < time(15, 0):
+    close_phase_start = time(12, 0) if close_time == time(13, 0) else time(15, 0)
+    if t < close_phase_start:
         return "REGULAR_MID"
 
-    if t < regular_close_time_for_date(d):
-        return "REGULAR_CLOSE"
-
-    return "AFTERMARKET"
+    return "REGULAR_CLOSE"
 
 
 def register_holiday(d: date) -> None:

@@ -499,7 +499,7 @@ class USDataProvider:
         try:
             engine = _get_engine()
             if engine is None:
-                return []
+                return {"rows": [], "quality": "DB_ERROR", "valid_bar_count": 0, "db_latest": None, "expected_latest": None, "invalid_close_count": 0, "duplicate_count": 0, "http_sync_attempted": False, "http_sync_succeeded": False}
             
             with engine.begin() as conn:
                 cutoff_date = date.today() - timedelta(days=days)
@@ -647,7 +647,7 @@ class USDataProvider:
             raise
 
 
-    def get_completed_daily_prices(
+    def get_completed_daily_prices_result(
         self,
         symbol: str,
         exchange: str,
@@ -655,8 +655,8 @@ class USDataProvider:
         trade_date: str,
         required_bars: int = 260,
         allow_http_sync: bool,
-    ) -> list[dict]:
-        """DB-first completed US daily bars; HTTP sync only allowed for prep."""
+    ) -> dict:
+        """DB-first completed US daily bars with structured quality metadata."""
         from trader.us.db.price_daily_repo import (
             audit_us_daily_history,
             get_latest_us_daily_date,
@@ -670,15 +670,15 @@ class USDataProvider:
             audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
         except Exception as exc:
             logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
-            return []
+            return {"rows": [], "quality": "DB_ERROR", "valid_bar_count": 0, "db_latest": None, "expected_latest": None, "invalid_close_count": 0, "duplicate_count": 0, "http_sync_attempted": False, "http_sync_succeeded": False}
         expected_latest = previous_completed_us_session(trade_date)
         db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
         if len(rows) >= required and db_latest == expected_latest:
             logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0", symbol, required, len(rows), audit.get("last_date"), expected_latest)
-            return normalize_daily_rows(symbol, rows)
+            return {"rows": normalize_daily_rows(symbol, rows), "quality": "OK", "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": int(audit.get("invalid_close_count") or 0), "duplicate_count": int(audit.get("duplicate_count") or 0), "http_sync_attempted": False, "http_sync_succeeded": False}
         if not allow_http_sync or os.getenv("US_DAILY_SYNC_ENABLED", "1") in {"0", "false", "False", "no"}:
             logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0 quality=INSUFFICIENT_OR_STALE", symbol, required, len(rows), audit.get("last_date"), expected_latest)
-            return normalize_daily_rows(symbol, rows)
+            return {"rows": normalize_daily_rows(symbol, rows), "quality": ("STALE" if db_latest != expected_latest else "INSUFFICIENT_HISTORY"), "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": int(audit.get("invalid_close_count") or 0), "duplicate_count": int(audit.get("duplicate_count") or 0), "http_sync_attempted": False, "http_sync_succeeded": False}
         max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
         client = None if self._offline else self._get_client()
 
@@ -720,7 +720,20 @@ class USDataProvider:
         db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
         quality = "OK" if len(rows) >= required and db_latest == expected_latest and int(audit.get("invalid_close_count") or 0) == 0 and int(audit.get("duplicate_count") or 0) == 0 else ("STALE" if db_latest != expected_latest else "INSUFFICIENT_HISTORY")
         logger.info("[US_OHLCV][VERIFY] symbol=%s quality=%s valid_bar_count=%d latest=%s expected=%s invalid_close_count=%s duplicate_count=%s", symbol, quality, len(rows), db_latest, expected_latest, audit.get("invalid_close_count"), audit.get("duplicate_count"))
-        return normalize_daily_rows(symbol, rows)
+        return {"rows": normalize_daily_rows(symbol, rows), "quality": quality, "valid_bar_count": len(rows), "db_latest": db_latest.isoformat() if db_latest else None, "expected_latest": expected_latest.isoformat(), "invalid_close_count": int(audit.get("invalid_close_count") or 0), "duplicate_count": int(audit.get("duplicate_count") or 0), "http_sync_attempted": total_fetched > 0, "http_sync_succeeded": total_fetched == 0 or total_upserted > 0}
+
+    def get_completed_daily_prices(
+        self,
+        symbol: str,
+        exchange: str,
+        *,
+        trade_date: str,
+        required_bars: int = 260,
+        allow_http_sync: bool,
+    ) -> list[dict]:
+        return self.get_completed_daily_prices_result(
+            symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=allow_http_sync
+        ).get("rows", [])
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).

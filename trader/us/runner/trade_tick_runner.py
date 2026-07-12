@@ -329,19 +329,35 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
         daily = {}
         metrics_source = "insufficient_history"
         try:
+            from trader.us.market_calendar import previous_completed_us_session
+            expected_metrics_as_of = previous_completed_us_session(trade_date).isoformat()
             from trader.us.position_trend_state import load_trend_state
             persisted = load_trend_state(symbol, trade_date)
-            if persisted.get("daily_metrics_trade_date") == trade_date and persisted.get("ma20") and persisted.get("ma50"):
+            if (
+                persisted.get("daily_metrics_trade_date") == trade_date
+                and str(persisted.get("daily_metrics_as_of") or "") == expected_metrics_as_of
+                and str(persisted.get("daily_history_quality") or "") == "OK"
+                and persisted.get("ma20") and persisted.get("ma50")
+            ):
                 daily = {k: persisted.get(k) for k in ("ma20", "ma50", "ma150", "ma200", "ma200_slope", "rs_20d", "rs_60d", "rs_120d", "daily_bar_count", "daily_metrics_as_of", "daily_history_quality")}
                 metrics_source = "persisted_trend_metrics"
-            elif final30_ok and row and row.get("daily_metrics_as_of") and str(row.get("daily_metrics_as_of")) < str(trade_date) and int(row.get("daily_bar_count") or 0) >= 150 and row.get("ma20") and row.get("ma50"):
+            elif (
+                final30_ok and row
+                and str(row.get("daily_metrics_as_of") or "") == expected_metrics_as_of
+                and int(row.get("daily_bar_count") or 0) >= 150
+                and str(row.get("daily_history_quality") or "OK") in {"OK", "DEGRADED_NO_MA200"}
+                and row.get("ma20") and row.get("ma50")
+            ):
                 daily = {k: row.get(k) for k in ("ma20", "ma50", "ma150", "ma200", "ma200_slope", "rs_20d", "rs_60d", "rs_120d", "daily_bar_count", "daily_metrics_as_of", "daily_history_quality")}
                 metrics_source = "final30_prep_metrics"
             else:
                 from trader.us.db.price_daily_repo import load_recent_us_daily_bars
                 rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
                 daily = _compute_completed_daily_metrics(list(rows or []), trade_date)
-                daily["daily_history_quality"] = "OK" if int(daily.get("daily_bar_count") or 0) >= 200 else "DEGRADED_SHORT_HISTORY"
+                if str(daily.get("daily_metrics_as_of") or "") != expected_metrics_as_of:
+                    daily["daily_history_quality"] = "STALE"
+                else:
+                    daily["daily_history_quality"] = "OK" if int(daily.get("daily_bar_count") or 0) >= 200 else "DEGRADED_SHORT_HISTORY"
                 metrics_source = "price_daily"
             daily["daily_metrics_source"] = metrics_source
             daily["daily_metrics_trade_date"] = trade_date
@@ -1131,38 +1147,58 @@ def run_trade_tick(
     exit_intents: list[dict] = []
     try:
         engine = _get_strategy_engine(env=env, offline=offline)
-        _old_disable_trend = os.environ.get("US_EXIT_DISABLE_TREND_TIME")
-        os.environ["US_EXIT_DISABLE_TREND_TIME"] = "1"
-        try:
-            safety_exit_intents = engine.evaluate_exits(positions=current_positions, provider=provider, now=now)
-        finally:
-            if _old_disable_trend is None:
-                os.environ.pop("US_EXIT_DISABLE_TREND_TIME", None)
+        is_default_pb1_engine = engine.__class__.__module__ == "trader.us.pb1.us_pb1_engine"
+        if not is_default_pb1_engine:
+            try:
+                trend_positions, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
+                    positions=current_positions,
+                    provider=provider,
+                    trade_date=_exit_trade_date,
+                    now=now,
+                    locked_watchlist_cache=locked_watchlist_cache,
+                    watchlist_cache_source=watchlist_cache_source,
+                )
+            except Exception as _trend_exc:
+                logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
+                trend_positions = current_positions
+            exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
+        else:
+            try:
+                from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
+                exit_snapshots = prepare_exit_position_snapshots(current_positions, provider, now)
+                safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
+            except Exception:
+                exit_snapshots = current_positions
+                safety_exit_intents = engine.evaluate_exits(positions=current_positions, provider=provider, now=now)
+            safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
+            trend_targets = [p for p in exit_snapshots if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
+            try:
+                trend_targets, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
+                    positions=trend_targets,
+                    provider=provider,
+                    trade_date=_exit_trade_date,
+                    now=now,
+                    locked_watchlist_cache=locked_watchlist_cache,
+                    watchlist_cache_source=watchlist_cache_source,
+                )
+            except Exception as _trend_exc:
+                logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
+            if trend_targets:
+                try:
+                    trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
+                except Exception:
+                    trend_exit_intents = engine.evaluate_exits(positions=trend_targets, provider=provider, now=now)
             else:
-                os.environ["US_EXIT_DISABLE_TREND_TIME"] = _old_disable_trend
-        safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
-        trend_targets = [p for p in current_positions if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
-        try:
-            trend_targets, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
-                positions=trend_targets,
-                provider=provider,
-                trade_date=_exit_trade_date,
-                now=now,
-                locked_watchlist_cache=locked_watchlist_cache,
-                watchlist_cache_source=watchlist_cache_source,
-            )
-        except Exception as _trend_exc:
-            logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
-        trend_exit_intents = engine.evaluate_exits(positions=trend_targets, provider=provider, now=now) if trend_targets else []
-        exit_intents = []
-        seen_sell_symbols: set[str] = set()
-        for intent in list(safety_exit_intents or []) + list(trend_exit_intents or []):
-            sym = str(intent.get("symbol") or "").upper()
-            if str(intent.get("side") or "").upper() == "SELL":
-                if sym in seen_sell_symbols:
-                    continue
-                seen_sell_symbols.add(sym)
-            exit_intents.append(intent)
+                trend_exit_intents = []
+            exit_intents = []
+            seen_sell_symbols: set[str] = set()
+            for intent in list(safety_exit_intents or []) + list(trend_exit_intents or []):
+                sym = str(intent.get("symbol") or "").upper()
+                if str(intent.get("side") or "").upper() == "SELL":
+                    if sym in seen_sell_symbols:
+                        continue
+                    seen_sell_symbols.add(sym)
+                exit_intents.append(intent)
     except Exception as exc:
         logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))

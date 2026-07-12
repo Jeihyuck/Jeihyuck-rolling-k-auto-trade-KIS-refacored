@@ -157,3 +157,13 @@ def test_early_close_dates_are_trading_days_and_previous_sessions():
     assert is_us_trading_day(date(2026, 11, 26)) is False
     assert is_us_trading_day(date(2026, 12, 25)) is False
     assert regular_close_time_for_date(date(2026, 11, 27)) == time(13, 0)
+
+
+def test_early_close_market_phase_boundaries():
+    assert market_phase(ny("2026-11-27 12:30")) == "REGULAR_CLOSE"
+    assert market_phase(ny("2026-11-27 12:59")) == "REGULAR_CLOSE"
+    assert market_phase(ny("2026-11-27 13:00")) == "AFTERMARKET"
+    assert market_phase(ny("2026-11-27 13:30")) == "AFTERMARKET"
+    assert market_phase(ny("2026-12-24 13:30")) == "AFTERMARKET"
+    assert market_phase(ny("2026-04-30 13:30")) == "REGULAR_MID"
+    assert market_phase(ny("2026-04-30 15:30")) == "REGULAR_CLOSE"

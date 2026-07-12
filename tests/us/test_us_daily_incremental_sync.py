@@ -83,3 +83,12 @@ def test_stale_and_short_history_fills_both_directions():
     assert c.stops[0] == "2026-07-09"
     assert c.stops[1] is None
     assert len(rows) == 260
+
+
+def test_completed_daily_prices_result_quality_contract_ok_and_stale():
+    upsert_us_daily_bars(symbol="AAPL", bars=_bars(260, end=date(2026,7,11)), source="TEST")
+    p=USDataProvider(offline=True); c=Client(); p._client=c; p._offline=False
+    ok=p.get_completed_daily_prices_result("AAPL","NASDAQ",trade_date="2026-07-13",required_bars=260,allow_http_sync=False)
+    assert ok["quality"] == "OK" and ok["valid_bar_count"] == 260 and ok["http_sync_attempted"] is False
+    stale=p.get_completed_daily_prices_result("AAPL","NASDAQ",trade_date="2026-07-14",required_bars=260,allow_http_sync=False)
+    assert stale["quality"] == "STALE" and stale["db_latest"] == "2026-07-10"
