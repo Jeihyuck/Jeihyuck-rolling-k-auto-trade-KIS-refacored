@@ -243,6 +243,26 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         finish_us_prep_run(run_id, status="ERROR", result=str(exc))
         return {"status": "ERROR", "stage": "dynamic_universe", "error": str(exc)}
 
+    try:
+        from trader.us.db.repos import load_latest_open_us_position_lifecycles, load_positions
+        from trader.us.symbols import resolve_exchange
+        sync_symbols = {str(s.get("symbol") or "").upper() for s in dynamic_universe_result.get("symbols", [])}
+        sync_symbols |= {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
+        try:
+            sync_symbols |= {str(p.get("symbol") or "").upper() for p in (load_positions(as_of=trade_date) or [])}
+        except Exception:
+            pass
+        try:
+            sync_symbols |= set((load_latest_open_us_position_lifecycles(trade_date) or {}).keys())
+        except Exception:
+            pass
+        sync_symbols = {s for s in sync_symbols if s}
+        for sym in sorted(sync_symbols):
+            provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+        logger.info("[US_PREP][DAILY_SYNC] symbols=%d source=db_first", len(sync_symbols))
+    except Exception as exc:
+        logger.warning("[US_PREP][DAILY_SYNC][WARN] %s", exc)
+
     # ── 4. Candidate Pool ─────────────────────────────────────────────────
     logger.info("[US_PREP][HEARTBEAT] stage=candidate_pool status=start")
     try:
@@ -681,4 +701,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

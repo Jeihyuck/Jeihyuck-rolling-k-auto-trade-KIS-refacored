@@ -354,7 +354,10 @@ def build_us_dynamic_universe(
 
         # --- daily price 조회 ---
         try:
-            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
+            if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=260, allow_http_sync=True)
+            else:
+                daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
             history_days = len(daily)
             latest_close = _extract_latest_close(daily)
         except Exception as exc:

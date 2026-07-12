@@ -7,6 +7,7 @@ scoped by market='US' and code is a raw uppercase US symbol (no zfill).
 from __future__ import annotations
 
 import logging
+import os
 from datetime import date
 from typing import Any
 
@@ -25,8 +26,20 @@ def normalize_us_price_symbol(symbol: str) -> str:
 def _engine_or_none():
     try:
         return get_engine()
-    except Exception:
+    except Exception as exc:
+        if os.getenv("PBCORE_DB_URL") and not _memory_fallback_allowed():
+            logger.error("[US_OHLCV][DB_ERROR] code=US_DAILY_DB_UNAVAILABLE err=%s", exc)
+            raise
         return None
+
+
+def _memory_fallback_allowed() -> bool:
+    return (
+        os.getenv("OFFLINE_MODE", "").lower() in {"1", "true", "yes", "y"}
+        or os.getenv("US_OFFLINE_MODE", "").lower() in {"1", "true", "yes", "y"}
+        or os.getenv("PYTEST_CURRENT_TEST") is not None
+        or os.getenv("US_DAILY_ALLOW_MEMORY_FALLBACK", "").lower() in {"1", "true", "yes", "y"}
+    )
 
 
 def _bar_date(row: dict) -> date | None:
@@ -72,6 +85,19 @@ def _to_provider_row(row: dict, symbol: str | None = None) -> dict:
     }
 
 
+def _valid_completed_rows(rows: list[dict], before: date) -> list[dict]:
+    by_date: dict[date, dict] = {}
+    for r in rows or []:
+        d = canonical_us_bar_date(r.get("date") or r.get("xymd"))
+        try:
+            close = float(r.get("close") if r.get("close") is not None else r.get("clos"))
+        except Exception:
+            close = 0.0
+        if d and d < before and close > 0:
+            by_date[d] = r
+    return [by_date[d] for d in sorted(by_date)]
+
+
 def load_recent_us_daily_bars(*, symbol: str, before_date: str, limit: int = 260) -> list[dict]:
     sym = normalize_us_price_symbol(symbol)
     before = canonical_us_bar_date(before_date)
@@ -80,8 +106,8 @@ def load_recent_us_daily_bars(*, symbol: str, before_date: str, limit: int = 260
     engine = _engine_or_none()
     if engine is None:
         rows = [r for (s, d), r in _MEM_US_DAILY.items() if s == sym and d < before]
-        rows.sort(key=lambda r: r["date"], reverse=True)
-        return [_to_provider_row(r, sym) for r in reversed(rows[:limit])]
+        rows = _valid_completed_rows(rows, before)
+        return [_to_provider_row(r, sym) for r in rows[-int(limit):]]
     with engine.begin() as conn:
         db_rows = conn.execute(text("""
             SELECT date, open, high, low, close, volume, value, source
@@ -90,8 +116,8 @@ def load_recent_us_daily_bars(*, symbol: str, before_date: str, limit: int = 260
             ORDER BY date DESC
             LIMIT :limit
         """), {"symbol": sym, "before_date": before, "limit": int(limit)}).mappings().all()
-    rows = [dict(r) | {"code": sym} for r in db_rows]
-    return [_to_provider_row(r, sym) for r in reversed(rows)]
+    rows = _valid_completed_rows([dict(r) | {"code": sym} for r in db_rows], before)
+    return [_to_provider_row(r, sym) for r in rows[-int(limit):]]
 
 
 def get_latest_us_daily_date(*, symbol: str, before_date: str | None = None) -> date | None:

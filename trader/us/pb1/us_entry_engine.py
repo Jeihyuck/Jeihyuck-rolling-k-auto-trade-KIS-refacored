@@ -703,10 +703,14 @@ def generate_entry_intents(
             candidates.append((s, symbol, exchange, None, canonical_entry))  # price=None, entry_meta=canonical_entry
             
         else:
-            # precomputed score가 없으면 실시간 계산 필요 (기존 로직 유지)
+            # Trade fallback must not call KIS dailyprice intraday. Use DB-only
+            # completed daily if a USDataProvider supports it; otherwise skip.
             try:
                 exchange = resolve_exchange(symbol)
-                daily = provider.get_daily_prices(symbol, exchange, count=120)
+                if not hasattr(provider, "get_completed_daily_prices"):
+                    raise RuntimeError("locked_watchlist_precomputed_score_required")
+                trade_date = (now.date().isoformat() if now else datetime.now().date().isoformat())
+                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=260, allow_http_sync=False)
                 current = provider.get_current_price(symbol, exchange)
             except Exception as exc:
                 track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})

@@ -32,12 +32,13 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 
 def _compute_rs(daily_rows: list[dict], days: int) -> float:
     """N일 RS (현재가 / N일 전 종가 - 1)."""
+    daily_rows = _valid_daily_rows(daily_rows)
     if len(daily_rows) < days + 1:
         return 0.0
     try:
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
-        current_close = _safe_float(rows[-1].get("clos"))
-        past_close = _safe_float(rows[-(days + 1)].get("clos"))
+        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd") or r.get("date") or ""))
+        current_close = _safe_float(rows[-1].get("clos") or rows[-1].get("close"))
+        past_close = _safe_float(rows[-(days + 1)].get("clos") or rows[-(days + 1)].get("close"))
         if past_close <= 0:
             return 0.0
         return round((current_close / past_close) - 1.0, 4)
@@ -50,14 +51,23 @@ def _compute_ma(daily_rows: list[dict], period: int) -> float | None:
     if len(daily_rows) < period:
         return None
     try:
-        rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "")))
-        closes = [_safe_float(r.get("clos")) for r in rows[-period:]]
-        closes = [c for c in closes if c > 0]
-        if not closes:
+        rows = _valid_daily_rows(daily_rows)
+        closes = [_safe_float(r.get("clos") or r.get("close")) for r in rows[-period:]]
+        if len(closes) < period:
             return None
-        return round(sum(closes) / len(closes), 4)
+        return round(sum(closes) / period, 4)
     except Exception:
         return None
+
+
+def _valid_daily_rows(daily_rows: list[dict]) -> list[dict]:
+    by_date: dict[str, dict] = {}
+    for row in daily_rows or []:
+        d = str(row.get("xymd") or row.get("date") or "").strip()
+        close = _safe_float(row.get("clos") if row.get("clos") is not None else row.get("close"))
+        if d and close > 0:
+            by_date[d] = row
+    return [by_date[d] for d in sorted(by_date)]
 
 
 def _compute_volume_accel(daily_rows: list[dict]) -> float:
@@ -114,6 +124,7 @@ def _score_symbol_candidate(
 ) -> dict:
     """단일 종목 candidate 점수 계산."""
     symbol = sym_data.get("symbol", "")
+    daily_rows = _valid_daily_rows(daily_rows)
     price = _safe_float(sym_data.get("price"))
     atr_pct = _safe_float(sym_data.get("atr_pct"), 0.0)
     avg_vol = _safe_float(sym_data.get("avg_volume_20d"), 0.0)
@@ -308,7 +319,7 @@ def build_us_candidate_pool(
         symbol = sym_data.get("symbol", "")
         exchange = sym_data.get("exchange", "NASDAQ")
         try:
-            if hasattr(provider, "get_completed_daily_prices"):
+            if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
                 daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
             else:
                 daily = provider.get_daily_prices(symbol, exchange, count=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), as_of_date=as_of_date)

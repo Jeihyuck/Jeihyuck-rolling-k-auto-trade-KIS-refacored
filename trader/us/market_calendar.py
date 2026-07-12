@@ -139,6 +139,28 @@ def resolve_us_trade_date(now: datetime | None = None) -> date:
     return d
 
 
+def previous_completed_us_session(value: date | datetime | str | None = None) -> date:
+    """Return the latest completed US trading session strictly before *value*."""
+    if value is None:
+        d = now_ny().date()
+    elif isinstance(value, datetime):
+        d = value.astimezone(NY_TZ).date() if value.tzinfo else value.date()
+    elif isinstance(value, date):
+        d = value
+    else:
+        raw = str(value or "").strip()
+        if len(raw) == 8 and raw.isdigit():
+            d = datetime.strptime(raw, "%Y%m%d").date()
+        else:
+            d = datetime.fromisoformat(raw[:10]).date()
+    d -= timedelta(days=1)
+    for _ in range(14):
+        if is_us_trading_day(d):
+            return d
+        d -= timedelta(days=1)
+    return d
+
+
 def market_phase(now: datetime | None = None) -> str:
     """현재 미국장 phase.
 

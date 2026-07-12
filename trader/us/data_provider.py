@@ -663,28 +663,42 @@ class USDataProvider:
             load_recent_us_daily_bars,
             upsert_us_daily_bars,
         )
+        from trader.us.market_calendar import previous_completed_us_session
         required = int(required_bars or int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
-        rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
-        audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
-        if len(rows) >= required:
-            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s kis_calls=0", symbol, required, len(rows), audit.get("last_date"))
+        try:
+            rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+            audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+        except Exception as exc:
+            logger.error("[US_OHLCV][DB_ERROR] symbol=%s code=US_DAILY_DB_UNAVAILABLE err=%s", symbol, exc)
+            return []
+        expected_latest = previous_completed_us_session(trade_date)
+        db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        if len(rows) >= required and db_latest == expected_latest:
+            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0", symbol, required, len(rows), audit.get("last_date"), expected_latest)
             return normalize_daily_rows(symbol, rows)
         if not allow_http_sync or os.getenv("US_DAILY_SYNC_ENABLED", "1") in {"0", "false", "False", "no"}:
-            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s kis_calls=0 quality=INSUFFICIENT", symbol, required, len(rows), audit.get("last_date"))
+            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0 quality=INSUFFICIENT_OR_STALE", symbol, required, len(rows), audit.get("last_date"), expected_latest)
             return normalize_daily_rows(symbol, rows)
-        latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
-        logger.info("[US_OHLCV][SYNC_GAP] symbol=%s db_latest=%s expected_before=%s", symbol, latest, trade_date)
+        latest = db_latest
+        logger.info("[US_OHLCV][SYNC_GAP] symbol=%s db_latest=%s expected_latest=%s", symbol, latest, expected_latest)
         max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
         fetched: list[dict]
-        client = self._get_client()
-        if hasattr(client, "get_us_daily_price_history"):
-            self.stats["daily_http_call_count"] += 1
-            fetched = client.get_us_daily_price_history(symbol, exchange, as_of_date=trade_date, required_bars=required, stop_at_date=(latest.isoformat() if latest else None), max_pages=max_pages)
+        if self._offline:
+            fetched = _make_stub_daily(symbol, required + 5)
         else:
-            self.stats["daily_http_call_count"] += 1
-            fetched = client.get_us_daily_price(symbol, exchange, required, as_of_date=trade_date)
+            client = self._get_client()
+            if hasattr(client, "get_us_daily_price_history"):
+                self.stats["daily_http_call_count"] += 1
+                fetched = client.get_us_daily_price_history(symbol, exchange, as_of_date=trade_date, required_bars=required, stop_at_date=(latest.isoformat() if latest else None), max_pages=max_pages)
+            else:
+                self.stats["daily_http_call_count"] += 1
+                fetched = client.get_us_daily_price(symbol, exchange, required, as_of_date=trade_date)
+        if not self._offline and hasattr(locals().get("client"), "last_daily_pages"):
+            pages = getattr(locals().get("client"), "last_daily_pages", None)
+        else:
+            pages = None
         upserted = upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
-        logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, len(fetched or []), getattr(client, "last_daily_pages", None))
+        logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, len(fetched or []), pages)
         logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d", symbol, len(fetched or []), upserted)
         rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
         return normalize_daily_rows(symbol, rows)
