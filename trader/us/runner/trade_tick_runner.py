@@ -242,7 +242,10 @@ def _compute_completed_daily_metrics(rows: list[dict], trade_date: str) -> dict:
         return round(sum(closes[-n:]) / n, 6) if len(closes) >= n else None
     def rs(n: int) -> float | None:
         return round((closes[-1] - closes[-1-n]) / closes[-1-n], 6) if len(closes) > n and closes[-1-n] > 0 else None
-    return {"ma20": ma(20), "ma50": ma(50), "ma150": ma(150), "rs_20d": rs(20), "rs_60d": rs(60)}
+    ma200 = ma(200)
+    ma200_prev = round(sum(closes[-220:-20]) / 200, 6) if len(closes) >= 220 else None
+    ma200_slope = round((ma200 - ma200_prev) / ma200_prev, 6) if ma200 and ma200_prev and ma200_prev > 0 else None
+    return {"ma20": ma(20), "ma50": ma(50), "ma150": ma(150), "ma200": ma200, "ma200_slope": ma200_slope, "rs_20d": rs(20), "rs_60d": rs(60), "rs_120d": rs(120), "daily_bar_count": len(closes), "daily_metrics_as_of": _row_date(completed[-1]) if completed else None}
 
 
 def _final30_score_contract_ok(rows: list[dict]) -> bool:
@@ -315,23 +318,38 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
             })
         elif not final30_ok:
             final30_payload["trade_date"] = "" if final30_quality != "ok" else trade_date
+        current_price = pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px")
+        if current_price is None:
+            try:
+                px = provider.get_current_price(symbol, exchange)
+                current_price = (px or {}).get("last")
+                pos["current_price_usd"] = current_price
+            except Exception as px_exc:
+                logger.warning("[US_POSITION][TREND_INPUT] symbol=%s trade_date=%s current_price_status=ERROR reason=%s", symbol, trade_date, px_exc)
+        daily = {}
+        metrics_source = "insufficient_history"
         try:
-            rows = provider.get_daily_prices(symbol, exchange, count=160, as_of_date=trade_date)
-            if isinstance(rows, dict):
-                rows = rows.get("prices") or rows.get("rows") or rows.get("data") or []
-            daily = _compute_completed_daily_metrics(list(rows or []), trade_date)
-            current_price = pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px")
-            if current_price is None:
-                try:
-                    px = provider.get_current_price(symbol, exchange)
-                    current_price = (px or {}).get("last")
-                    pos["current_price_usd"] = current_price
-                except Exception as px_exc:
-                    raise ValueError(f"current_price_unavailable: {px_exc}")
+            from trader.us.position_trend_state import load_trend_state
+            persisted = load_trend_state(symbol, trade_date)
+            if persisted.get("daily_metrics_trade_date") == trade_date and persisted.get("ma20") and persisted.get("ma50"):
+                daily = {k: persisted.get(k) for k in ("ma20", "ma50", "ma150", "ma200", "ma200_slope", "rs_20d", "rs_60d", "rs_120d", "daily_bar_count", "daily_metrics_as_of", "daily_history_quality")}
+                metrics_source = "persisted_trend_metrics"
+            elif final30_ok and row and row.get("daily_metrics_as_of") and str(row.get("daily_metrics_as_of")) < str(trade_date) and int(row.get("daily_bar_count") or 0) >= 150 and row.get("ma20") and row.get("ma50"):
+                daily = {k: row.get(k) for k in ("ma20", "ma50", "ma150", "ma200", "ma200_slope", "rs_20d", "rs_60d", "rs_120d", "daily_bar_count", "daily_metrics_as_of", "daily_history_quality")}
+                metrics_source = "final30_prep_metrics"
+            else:
+                from trader.us.db.price_daily_repo import load_recent_us_daily_bars
+                rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
+                daily = _compute_completed_daily_metrics(list(rows or []), trade_date)
+                daily["daily_history_quality"] = "OK" if int(daily.get("daily_bar_count") or 0) >= 200 else "DEGRADED_SHORT_HISTORY"
+                metrics_source = "price_daily"
+            daily["daily_metrics_source"] = metrics_source
+            daily["daily_metrics_trade_date"] = trade_date
+            logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=%s metrics_as_of=%s", symbol, metrics_source, daily.get("daily_metrics_as_of"))
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_INPUT] symbol=%s trade_date=%s daily_status=ERROR reason=%s action=UNKNOWN", symbol, trade_date, exc)
-            daily = {}
-            current_price = None
+            daily = {"daily_history_quality": "INSUFFICIENT_DAILY_HISTORY", "daily_metrics_source": "insufficient_history", "daily_metrics_trade_date": trade_date}
+            logger.info("[US_POSITION][TREND_METRICS_SOURCE] symbol=%s source=insufficient_history state=UNKNOWN", symbol)
         try:
             from trader.us.position_trend_state import update_us_position_trend_state
             trend = update_us_position_trend_state(
@@ -375,11 +393,24 @@ def _mark_trend_stages_from_records(records: Any, *, trade_date: str, status: st
         if not isinstance(rec, dict):
             continue
         meta = rec.get("meta") or rec.get("intent", {}).get("meta") or {}
+        order_key = rec.get("client_order_key") or rec.get("order_key") or meta.get("client_order_key")
+        symbol = rec.get("symbol") or meta.get("symbol") or rec.get("pdno")
+        if not meta.get("trend_stage"):
+            try:
+                from trader.us.db.repos import load_us_order_for_fill
+                order = load_us_order_for_fill(order_no=rec.get("order_no"), client_order_key=order_key, symbol=str(symbol or ""), trade_date=trade_date)
+                order_meta = order.get("meta") or {}
+                if isinstance(order_meta, str):
+                    import json as _json
+                    order_meta = _json.loads(order_meta or "{}")
+                meta = {**order_meta, **meta}
+                order_key = order.get("client_order_key") or order_key
+                symbol = order.get("symbol") or symbol
+            except Exception as exc:
+                logger.warning("[US_POSITION][TREND_STAGE][ORDER_LOOKUP_WARN] symbol=%s order_no=%s err=%s", symbol, rec.get("order_no"), exc)
         stage = meta.get("trend_stage") or rec.get("trend_stage")
         if not stage:
             continue
-        order_key = rec.get("client_order_key") or rec.get("order_key") or meta.get("client_order_key")
-        symbol = rec.get("symbol") or meta.get("symbol") or rec.get("pdno")
         lifecycle_id = meta.get("position_lifecycle_id") or rec.get("position_lifecycle_id")
         try:
             from trader.us.db.repos import mark_us_position_exit_stage
@@ -2159,6 +2190,13 @@ def run_trade_tick(
         "time_stop_trim_count": sum(1 for i in exit_intents if i.get("exit_type") == "time_stop_trim"),
         "time_stop_exit_count": sum(1 for i in exit_intents if i.get("exit_type") == "time_stop_exit"),
         "trend_add_blocked_count": len(trend_blocked_buys) if 'trend_blocked_buys' in locals() else 0,
+        "trend_metrics_persisted_count": sum(1 for p in current_positions if (p.get("trend") or {}).get("daily_metrics_source") == "persisted_trend_metrics"),
+        "trend_metrics_final30_count": sum(1 for p in current_positions if (p.get("trend") or {}).get("daily_metrics_source") == "final30_prep_metrics"),
+        "trend_metrics_price_daily_count": sum(1 for p in current_positions if (p.get("trend") or {}).get("daily_metrics_source") == "price_daily"),
+        "trend_metrics_unknown_count": sum(1 for p in current_positions if p.get("trend_state") == "UNKNOWN"),
+        "trend_trim_intent_count": sum(1 for i in exit_intents if i.get("exit_type") == "trend_deterioration_trim"),
+        "trend_exit_intent_count": sum(1 for i in exit_intents if i.get("exit_type") == "trend_deterioration_exit"),
+        "daily_http_call_count": int((provider.get_client_stats() if hasattr(provider, "get_client_stats") else getattr(provider, "stats", {})).get("daily_http_call_count", 0) if hasattr((provider.get_client_stats() if hasattr(provider, "get_client_stats") else getattr(provider, "stats", {})), "get") else 0),
         "prep_contract_trade_block": bool(entry_degraded_reason in {"prep_contract_trade_block", "prep_contract_version_mismatch", "risk_off_entry_block", "force_entry_block", "allow_new_buy_false"}),
         "market_regime": market_state_overlay.get("market_regime") if 'market_state_overlay' in locals() else "NEUTRAL",
         "capital_scale": market_state_overlay.get("capital_scale") if 'market_state_overlay' in locals() else 1.0,

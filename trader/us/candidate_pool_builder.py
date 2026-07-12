@@ -126,6 +126,22 @@ def _score_symbol_candidate(
     ma20 = _compute_ma(daily_rows, 20)
     ma50 = _compute_ma(daily_rows, 50)
     ma150 = _compute_ma(daily_rows, 150)
+    ma200 = _compute_ma(daily_rows, 200)
+    ma200_prev = _compute_ma(daily_rows[:-20], 200) if len(daily_rows) >= 220 else None
+    ma200_slope = round((ma200 - ma200_prev) / ma200_prev, 6) if ma200 and ma200_prev and ma200_prev > 0 else None
+    daily_bar_count = len(daily_rows or [])
+    if daily_bar_count >= 200:
+        daily_history_quality = "OK"
+    elif daily_bar_count >= 150:
+        daily_history_quality = "DEGRADED_NO_MA200"
+    elif daily_bar_count >= 60:
+        daily_history_quality = "DEGRADED_SHORT_HISTORY"
+    else:
+        daily_history_quality = "ERROR_INSUFFICIENT_HISTORY"
+    daily_metrics_as_of = None
+    if daily_rows:
+        last_row = sorted(daily_rows, key=lambda r: str(r.get("xymd", r.get("date", ""))))[-1]
+        daily_metrics_as_of = str(last_row.get("date") or last_row.get("xymd") or "")
 
     vol_accel = _compute_volume_accel(daily_rows)
     near_high = _compute_near_high(daily_rows, price, 52)
@@ -215,6 +231,12 @@ def _score_symbol_candidate(
         "ma20": ma20,
         "ma50": ma50,
         "ma150": ma150,
+        "ma200": ma200,
+        "ma200_slope": ma200_slope,
+        "daily_bar_count": daily_bar_count,
+        "daily_metrics_as_of": daily_metrics_as_of,
+        "daily_metrics_source": "price_daily",
+        "daily_history_quality": daily_history_quality,
         "pullback_pct": pullback_pct,
         # Scores
         "rs_20d_score": rs_20d_score,
@@ -286,7 +308,10 @@ def build_us_candidate_pool(
         symbol = sym_data.get("symbol", "")
         exchange = sym_data.get("exchange", "NASDAQ")
         try:
-            daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
+            if hasattr(provider, "get_completed_daily_prices"):
+                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+            else:
+                daily = provider.get_daily_prices(symbol, exchange, count=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), as_of_date=as_of_date)
             row = _score_symbol_candidate(sym_data, daily, all_rs20, all_rs60, all_rs120)
             scored_rows.append(row)
             all_rs20.append(row["rs_20d"])

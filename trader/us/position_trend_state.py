@@ -58,7 +58,8 @@ def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetim
     valid_final30 = final30.get("trade_date") == trade_date and final30.get("score_contract_ok", True) and final30.get("available", True)
     if final30 and not valid_final30:
         quality = "missing_or_stale"
-    required_missing = cp is None or ma20 is None or ma50 is None
+    final30_invalid = bool(final30 and not valid_final30)
+    required_missing = cp is None or ma20 is None or ma50 is None or final30_invalid
     if not daily and required_missing:
         quality = "missing"
     in_final = bool(final30.get("in_final30_today")) if valid_final30 else bool(prev.get("in_final30_today"))
@@ -94,7 +95,7 @@ def update_us_position_trend_state(*, symbol: str, trade_date: str, now: datetim
             state = "EXIT"
         elif (absent >= 2 and sig_count >= 2) or (below20 >= 2 and sig_count >= 2) or (cp is not None and ma50 is not None and cp < ma50 and ((rs20 or 0) < 0 or (trend_score is not None and trend_score < severe_thr))):
             state = "TRIM"
-    trend = {**prev, "last_daily_update_trade_date": trade_date, "in_final30_today": in_final, "final30_absent_streak": absent, "below_ma20_streak": below20, "below_ma50_streak": below50, "holding_trade_days": holding_trade_days or _i(prev.get("holding_trade_days")), "rank_final30": final30.get("rank_final30") if valid_final30 else prev.get("rank_final30"), "score_final": final30.get("score_final") if valid_final30 else prev.get("score_final"), "trend_score": trend_score, "current_price": cp, "ma20": ma20, "ma50": ma50, "ma150": ma150, "rs_20d": rs20, "rs_60d": rs60, "sector_relative_strength": daily.get("sector_relative_strength"), "stock_vs_sector_alpha": alpha, "theme_cluster": theme, "rotation_regime": rotation, "trend_state": state, "trend_data_quality": quality, "weakness_signals": signals, "updated_at": _iso(now)}
+    trend = {**prev, "last_daily_update_trade_date": trade_date, "in_final30_today": in_final, "final30_absent_streak": absent, "below_ma20_streak": below20, "below_ma50_streak": below50, "holding_trade_days": holding_trade_days or _i(prev.get("holding_trade_days")), "rank_final30": final30.get("rank_final30") if valid_final30 else prev.get("rank_final30"), "score_final": final30.get("score_final") if valid_final30 else prev.get("score_final"), "trend_score": trend_score, "current_price": cp, "ma20": ma20, "ma50": ma50, "ma150": ma150, "ma200": daily.get("ma200"), "ma200_slope": daily.get("ma200_slope"), "rs_20d": rs20, "rs_60d": rs60, "rs_120d": daily.get("rs_120d"), "daily_bar_count": daily.get("daily_bar_count"), "daily_metrics_as_of": daily.get("daily_metrics_as_of"), "daily_metrics_source": daily.get("daily_metrics_source"), "daily_metrics_trade_date": daily.get("daily_metrics_trade_date"), "daily_history_quality": daily.get("daily_history_quality"), "sector_relative_strength": daily.get("sector_relative_strength"), "stock_vs_sector_alpha": alpha, "theme_cluster": theme, "rotation_regime": rotation, "trend_state": state, "trend_data_quality": quality, "weakness_signals": signals, "updated_at": _iso(now)}
     if lifecycle_id and prev.get("lifecycle_id") and prev.get("lifecycle_id") != lifecycle_id:
         for k in list(trend):
             if k.endswith("_pending") or k.endswith("_done") or k.endswith("_order_key") or k.endswith("_trade_date") or k.endswith("_at"):
@@ -134,14 +135,21 @@ def choose_trend_time_exit(position: dict, trend: dict, *, pnl_pct: float, order
 def filter_add_to_existing_by_trend_state(entry_intents: list[dict], current_positions: list[dict]) -> tuple[list[dict], list[dict]]:
     pos = {str(p.get("symbol") or "").upper(): p for p in current_positions or []}
     kept=[]; blocked=[]
+    reason_by_state = {
+        "UNKNOWN": "TREND_UNKNOWN",
+        "WARNING": "TREND_WARNING",
+        "TRIM": "TREND_TRIM",
+        "EXIT": "TREND_EXIT",
+    }
     for it in entry_intents or []:
         sym = str(it.get("symbol") or "").upper()
         p = pos.get(sym)
         trend_state = (p or {}).get("trend_state") or ((p or {}).get("trend") or {}).get("trend_state")
         if str(it.get("side", "BUY")).upper() == "BUY" and p and trend_state != "HEALTHY":
-            b = {**it, "block_reason": "POSITION_TREND_NOT_HEALTHY"}
+            reason = reason_by_state.get(str(trend_state or "UNKNOWN"), "TREND_UNKNOWN")
+            b = {**it, "block_reason": reason}
             blocked.append(b)
-            logger.info("[US_ENTRY][TREND_BLOCK] symbol=%s trend_state=%s signals=%s reason=%s action=BLOCK_ADD_TO_EXISTING", sym, trend_state, ",".join(((p or {}).get("weakness_signals") or [])), "TREND_DATA_UNKNOWN" if trend_state == "UNKNOWN" else "POSITION_TREND_NOT_HEALTHY")
+            logger.info("[US_ENTRY][TREND_BLOCK] symbol=%s trend_state=%s signals=%s reason=%s action=BLOCK_ADD_TO_EXISTING", sym, trend_state, ",".join(((p or {}).get("weakness_signals") or [])), reason)
         else:
             kept.append(it)
     return kept, blocked

@@ -483,6 +483,7 @@ class USDataProvider:
             "price_ok_symbols": set(),
             "price_fail_symbols": set(),
             "fail_reasons": {},
+            "daily_http_call_count": 0,
         }
 
     def _get_client(self):
@@ -644,6 +645,49 @@ class USDataProvider:
                     self.stats["fail_reasons"][symbol.upper()] = str(type(exc).__name__)
             # Re-raise original exception if not temporary or no DB fallback
             raise
+
+
+    def get_completed_daily_prices(
+        self,
+        symbol: str,
+        exchange: str,
+        *,
+        trade_date: str,
+        required_bars: int = 260,
+        allow_http_sync: bool,
+    ) -> list[dict]:
+        """DB-first completed US daily bars; HTTP sync only allowed for prep."""
+        from trader.us.db.price_daily_repo import (
+            audit_us_daily_history,
+            get_latest_us_daily_date,
+            load_recent_us_daily_bars,
+            upsert_us_daily_bars,
+        )
+        required = int(required_bars or int(os.getenv("US_DAILY_REQUIRED_BARS", "260")))
+        rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+        audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+        if len(rows) >= required:
+            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s kis_calls=0", symbol, required, len(rows), audit.get("last_date"))
+            return normalize_daily_rows(symbol, rows)
+        if not allow_http_sync or os.getenv("US_DAILY_SYNC_ENABLED", "1") in {"0", "false", "False", "no"}:
+            logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s kis_calls=0 quality=INSUFFICIENT", symbol, required, len(rows), audit.get("last_date"))
+            return normalize_daily_rows(symbol, rows)
+        latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        logger.info("[US_OHLCV][SYNC_GAP] symbol=%s db_latest=%s expected_before=%s", symbol, latest, trade_date)
+        max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
+        fetched: list[dict]
+        client = self._get_client()
+        if hasattr(client, "get_us_daily_price_history"):
+            self.stats["daily_http_call_count"] += 1
+            fetched = client.get_us_daily_price_history(symbol, exchange, as_of_date=trade_date, required_bars=required, stop_at_date=(latest.isoformat() if latest else None), max_pages=max_pages)
+        else:
+            self.stats["daily_http_call_count"] += 1
+            fetched = client.get_us_daily_price(symbol, exchange, required, as_of_date=trade_date)
+        upserted = upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
+        logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, len(fetched or []), getattr(client, "last_daily_pages", None))
+        logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d", symbol, len(fetched or []), upserted)
+        rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+        return normalize_daily_rows(symbol, rows)
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:
         """일봉 데이터 조회 (xymd 기준 오름차순 정렬, KIS → DB fallback).

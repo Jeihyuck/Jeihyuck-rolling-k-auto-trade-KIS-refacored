@@ -45,6 +45,21 @@ _MEM_RISK_STATE: dict[tuple[str, str], dict] = {}
 _MEM_PROFIT_CAPTURE_STATE: dict[tuple[str, str], dict] = {}
 
 
+
+_US_DAILY_METRIC_FIELDS = (
+    "ma20", "ma50", "ma150", "ma200", "ma200_slope",
+    "rs_20d", "rs_60d", "rs_120d", "trend_score",
+    "daily_bar_count", "daily_metrics_as_of", "daily_metrics_source", "daily_history_quality",
+)
+
+def _merge_us_daily_metrics_meta(row: dict) -> dict:
+    meta = dict(row.get("meta") or {}) if isinstance(row.get("meta"), dict) else {}
+    for field in _US_DAILY_METRIC_FIELDS:
+        if row.get(field) is not None:
+            meta[field] = row.get(field)
+    return meta
+
+
 def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
     return (
         trade_date,
@@ -79,6 +94,11 @@ def reset_memory_stores() -> None:
     _MEM_POSITIONS = []
     _MEM_RECONCILE_LOGS = []
     _MEM_RISK_STATE = {}
+    try:
+        from trader.us.db.price_daily_repo import reset_us_daily_memory
+        reset_us_daily_memory()
+    except Exception:
+        pass
 
 
 def _has_db_url() -> bool:
@@ -135,7 +155,7 @@ def save_us_watchlist(entries: list[dict], trade_date: str | None = None) -> int
                         "exchange": e.get("exchange", "NASDAQ"),
                         "strategy": e.get("strategy", "us_pb1"),
                         "score": e.get("score"),
-                        "meta": _json_param(e.get("meta")),
+                        "meta": _json_param(_merge_us_daily_metrics_meta(e)),
                     },
                 )
                 count += 1
@@ -1205,6 +1225,48 @@ def _safe_float_meta(meta: dict, keys: list[str]) -> float | None:
     return None
 
 
+
+
+def load_us_order_for_fill(
+    *,
+    order_no: str | None,
+    client_order_key: str | None,
+    symbol: str,
+    trade_date: str,
+) -> dict:
+    """Resolve original us_orders row for a KIS fill using order_no/client key."""
+    sym = str(symbol or "").strip().upper()
+    td = str(trade_date)
+    on = str(order_no or "")
+    cok = str(client_order_key or "")
+    engine = _get_engine_or_none()
+    if engine is None:
+        matches = []
+        for o in _MEM_ORDERS:
+            if str(o.get("trade_date") or td) != td:
+                continue
+            if sym and str(o.get("symbol") or "").upper() != sym:
+                continue
+            if (on and str(o.get("order_no") or "") == on) or (cok and str(o.get("client_order_key") or "") == cok):
+                matches.append(o)
+        return dict(matches[-1]) if matches else {}
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(text("""
+                SELECT trade_date, client_order_key, symbol, exchange, side,
+                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                FROM us_orders
+                WHERE trade_date = :td AND symbol = :symbol
+                  AND ((:order_no <> '' AND order_no = :order_no)
+                       OR (:cok <> '' AND client_order_key = :cok))
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+                LIMIT 1
+            """), {"td": td, "symbol": sym, "order_no": on, "cok": cok}).mappings().first()
+            return dict(row) if row else {}
+    except Exception as exc:
+        logger.warning("[US_ORDER][LOAD_FOR_FILL_WARN] symbol=%s order_no=%s cok=%s err=%s", sym, on, cok, exc)
+        return {}
+
 def mark_order_filled_by_reconcile(
     *,
     order_no: str,
@@ -1274,6 +1336,8 @@ def mark_order_filled_by_reconcile(
                 ),
             }
             save_fills([fill], trade_date=td)
+            if fill_side == "SELL" and merged_meta.get("trend_stage"):
+                mark_us_position_exit_stage(td, fill_symbol, str(merged_meta.get("trend_stage")), client_order_key or order_no, "FILLED", merged_meta.get("position_lifecycle_id"))
             logger.info(
                 "[US_FILLS][SYNTHETIC_RECONCILE_FILL][SAVE] symbol=%s side=%s qty=%d price=%.4f source=%s",
                 fill_symbol, fill_side, qty, price, source,
@@ -1364,6 +1428,8 @@ def mark_order_filled_by_reconcile(
                         "fill_idempotency_key": idempotency_key,
                     },
                 )
+                if fill_side == "SELL" and merged_meta.get("trend_stage"):
+                    mark_us_position_exit_stage(td, fill_symbol, str(merged_meta.get("trend_stage")), client_order_key or order_no, "FILLED", merged_meta.get("position_lifecycle_id"))
                 logger.info(
                     "[US_FILLS][SYNTHETIC_RECONCILE_FILL][SAVE] symbol=%s side=%s qty=%d price=%.4f source=%s",
                     fill_symbol, fill_side, qty, price, source,
@@ -1880,6 +1946,7 @@ def clear_and_save_locked_us_watchlist(
                 "locked": True,
                 "prep_status": prep_status,
                 "run_id": run_id,
+                "meta": _merge_us_daily_metrics_meta(e),
             })
         logger.info("[US_WATCHLIST][LOCK_SAVE] count=%d (in-memory)", unique_count)
         return {
@@ -1911,7 +1978,7 @@ def clear_and_save_locked_us_watchlist(
                 data_source = e.get("meta", {}).get("data_source", "kis") if isinstance(e.get("meta"), dict) else "kis"
                 
                 # meta에 rank, prep_run_id 추가
-                meta = e.get("meta", {})
+                meta = _merge_us_daily_metrics_meta(e)
                 if isinstance(meta, dict):
                     meta["prep_run_id"] = run_id
                     meta["locked_rank"] = rank
