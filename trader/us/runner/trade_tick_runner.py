@@ -1125,30 +1125,44 @@ def run_trade_tick(
     except Exception as _resolve_exc:
         logger.warning("[US_EXIT][POSITION_RESOLVE][WARN] resolver failed: %s", _resolve_exc)
 
-    # ── POSITION TREND 계산: exit 평가 전에 보유종목 trend state 주입 ───────────
+    # ── EXIT safety pass: trend DB work must not delay hard/soft/trailing exits ─
     trend_state_counts = {"HEALTHY": 0, "WARNING": 0, "TRIM": 0, "EXIT": 0, "UNKNOWN": 0}
-    try:
-        current_positions, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
-            positions=current_positions,
-            provider=provider,
-            trade_date=_exit_trade_date,
-            now=now,
-            locked_watchlist_cache=locked_watchlist_cache,
-            watchlist_cache_source=watchlist_cache_source,
-        )
-    except Exception as _trend_exc:
-        logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
-
-    # ── EXIT 평가 ─────────────────────────────────────────────────────────────
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
     try:
         engine = _get_strategy_engine(env=env, offline=offline)
-        exit_intents = engine.evaluate_exits(
-            positions=current_positions,
-            provider=provider,
-            now=now,
-        )
+        _old_disable_trend = os.environ.get("US_EXIT_DISABLE_TREND_TIME")
+        os.environ["US_EXIT_DISABLE_TREND_TIME"] = "1"
+        try:
+            safety_exit_intents = engine.evaluate_exits(positions=current_positions, provider=provider, now=now)
+        finally:
+            if _old_disable_trend is None:
+                os.environ.pop("US_EXIT_DISABLE_TREND_TIME", None)
+            else:
+                os.environ["US_EXIT_DISABLE_TREND_TIME"] = _old_disable_trend
+        safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
+        trend_targets = [p for p in current_positions if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
+        try:
+            trend_targets, trend_state_counts, locked_watchlist_cache, watchlist_cache_source = _update_position_trends_for_tick(
+                positions=trend_targets,
+                provider=provider,
+                trade_date=_exit_trade_date,
+                now=now,
+                locked_watchlist_cache=locked_watchlist_cache,
+                watchlist_cache_source=watchlist_cache_source,
+            )
+        except Exception as _trend_exc:
+            logger.warning("[US_POSITION][TREND_STATE][TICK_WARN] err=%s", _trend_exc)
+        trend_exit_intents = engine.evaluate_exits(positions=trend_targets, provider=provider, now=now) if trend_targets else []
+        exit_intents = []
+        seen_sell_symbols: set[str] = set()
+        for intent in list(safety_exit_intents or []) + list(trend_exit_intents or []):
+            sym = str(intent.get("symbol") or "").upper()
+            if str(intent.get("side") or "").upper() == "SELL":
+                if sym in seen_sell_symbols:
+                    continue
+                seen_sell_symbols.add(sym)
+            exit_intents.append(intent)
     except Exception as exc:
         logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))

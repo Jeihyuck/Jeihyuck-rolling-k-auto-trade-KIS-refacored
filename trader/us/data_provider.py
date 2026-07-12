@@ -679,28 +679,47 @@ class USDataProvider:
         if not allow_http_sync or os.getenv("US_DAILY_SYNC_ENABLED", "1") in {"0", "false", "False", "no"}:
             logger.info("[US_OHLCV][DB_HIT] symbol=%s required=%d loaded=%d latest=%s expected=%s kis_calls=0 quality=INSUFFICIENT_OR_STALE", symbol, required, len(rows), audit.get("last_date"), expected_latest)
             return normalize_daily_rows(symbol, rows)
-        latest = db_latest
-        logger.info("[US_OHLCV][SYNC_GAP] symbol=%s db_latest=%s expected_latest=%s", symbol, latest, expected_latest)
         max_pages = int(os.getenv("US_DAILY_BACKFILL_MAX_PAGES", "6") or 6)
-        fetched: list[dict]
-        if self._offline:
-            fetched = _make_stub_daily(symbol, required + 5)
-        else:
-            client = self._get_client()
+        client = None if self._offline else self._get_client()
+
+        def _fetch_history(*, as_of: str, need: int, stop_at: str | None, direction: str) -> list[dict]:
+            if self._offline:
+                return _make_stub_daily(symbol, max(required + 5, need + 5))
             if hasattr(client, "get_us_daily_price_history"):
                 self.stats["daily_http_call_count"] += 1
-                fetched = client.get_us_daily_price_history(symbol, exchange, as_of_date=trade_date, required_bars=required, stop_at_date=(latest.isoformat() if latest else None), max_pages=max_pages)
-            else:
-                self.stats["daily_http_call_count"] += 1
-                fetched = client.get_us_daily_price(symbol, exchange, required, as_of_date=trade_date)
-        if not self._offline and hasattr(locals().get("client"), "last_daily_pages"):
-            pages = getattr(locals().get("client"), "last_daily_pages", None)
-        else:
-            pages = None
-        upserted = upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
-        logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, len(fetched or []), pages)
-        logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d", symbol, len(fetched or []), upserted)
+                return client.get_us_daily_price_history(symbol, exchange, as_of_date=as_of, required_bars=need, stop_at_date=stop_at, max_pages=max_pages)
+            self.stats["daily_http_call_count"] += 1
+            return client.get_us_daily_price(symbol, exchange, need, as_of_date=as_of)
+
+        total_fetched = 0
+        total_upserted = 0
+        if db_latest is None or db_latest < expected_latest:
+            logger.info("[US_OHLCV][SYNC_GAP] symbol=%s direction=forward db_latest=%s expected_latest=%s", symbol, db_latest, expected_latest)
+            fetched = _fetch_history(as_of=str(trade_date), need=required, stop_at=(db_latest.isoformat() if db_latest else None), direction="forward")
+            total_fetched += len(fetched or [])
+            total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
+            rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+            db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+
+        if db_latest == expected_latest and len(rows) < required:
+            from trader.us.dates import canonical_us_bar_date
+            from datetime import timedelta as _td
+            oldest = canonical_us_bar_date((rows[0] or {}).get("date") or (rows[0] or {}).get("xymd")) if rows else expected_latest
+            as_of_back = (oldest - _td(days=1)).strftime("%Y%m%d") if oldest else str(trade_date)
+            missing = max(required - len(rows), 1)
+            logger.info("[US_OHLCV][SYNC_GAP] symbol=%s direction=backward oldest=%s missing=%d", symbol, oldest, missing)
+            fetched = _fetch_history(as_of=as_of_back, need=max(missing, required), stop_at=None, direction="backward")
+            total_fetched += len(fetched or [])
+            total_upserted += upsert_us_daily_bars(symbol=symbol, bars=fetched, source="KIS_US_DAILY")
+
+        pages = getattr(client, "last_daily_pages", None) if client is not None else None
+        logger.info("[US_OHLCV][BACKFILL] symbol=%s before_count=%d target=%d fetched=%d pages=%s", symbol, len(rows), required, total_fetched, pages)
+        logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d", symbol, total_fetched, total_upserted)
         rows = load_recent_us_daily_bars(symbol=symbol, before_date=trade_date, limit=required)
+        audit = audit_us_daily_history(symbol=symbol, before_date=trade_date, required_bars=required)
+        db_latest = get_latest_us_daily_date(symbol=symbol, before_date=trade_date)
+        quality = "OK" if len(rows) >= required and db_latest == expected_latest and int(audit.get("invalid_close_count") or 0) == 0 and int(audit.get("duplicate_count") or 0) == 0 else ("STALE" if db_latest != expected_latest else "INSUFFICIENT_HISTORY")
+        logger.info("[US_OHLCV][VERIFY] symbol=%s quality=%s valid_bar_count=%d latest=%s expected=%s invalid_close_count=%s duplicate_count=%s", symbol, quality, len(rows), db_latest, expected_latest, audit.get("invalid_close_count"), audit.get("duplicate_count"))
         return normalize_daily_rows(symbol, rows)
 
     def get_daily_prices(self, symbol: str, exchange: str, count: int = 120, as_of_date: str | None = None) -> list[dict]:

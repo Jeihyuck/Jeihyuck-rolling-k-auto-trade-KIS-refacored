@@ -243,23 +243,47 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         finish_us_prep_run(run_id, status="ERROR", result=str(exc))
         return {"status": "ERROR", "stage": "dynamic_universe", "error": str(exc)}
 
+    daily_sync_summary = {"sync_target_count": 0, "sync_ok_count": 0, "sync_failed_count": 0, "sync_failed_symbols": [], "open_position_sync_failed_symbols": [], "benchmark_sync_failed_symbols": []}
     try:
         from trader.us.db.repos import load_latest_open_us_position_lifecycles, load_positions
         from trader.us.symbols import resolve_exchange
+        benchmark_symbols = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
         sync_symbols = {str(s.get("symbol") or "").upper() for s in dynamic_universe_result.get("symbols", [])}
-        sync_symbols |= {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
+        sync_symbols |= benchmark_symbols
+        open_position_symbols: set[str] = set()
         try:
-            sync_symbols |= {str(p.get("symbol") or "").upper() for p in (load_positions(as_of=trade_date) or [])}
+            open_position_symbols |= {str(p.get("symbol") or "").upper() for p in (load_positions(as_of=trade_date) or [])}
+            sync_symbols |= open_position_symbols
         except Exception:
             pass
         try:
-            sync_symbols |= set((load_latest_open_us_position_lifecycles(trade_date) or {}).keys())
+            lifecycle_symbols = set((load_latest_open_us_position_lifecycles(trade_date) or {}).keys())
+            open_position_symbols |= lifecycle_symbols
+            sync_symbols |= lifecycle_symbols
         except Exception:
             pass
         sync_symbols = {s for s in sync_symbols if s}
+        sync_ok: list[str] = []
+        sync_failed: list[dict] = []
         for sym in sorted(sync_symbols):
-            provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
-        logger.info("[US_PREP][DAILY_SYNC] symbols=%d source=db_first", len(sync_symbols))
+            try:
+                rows = provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                if rows:
+                    sync_ok.append(sym)
+                else:
+                    sync_failed.append({"symbol": sym, "reason": "empty_or_insufficient"})
+            except Exception as exc:
+                sync_failed.append({"symbol": sym, "reason": str(exc)})
+                logger.warning("[US_PREP][DAILY_SYNC][SYMBOL_WARN] symbol=%s err=%s", sym, exc)
+        daily_sync_summary = {
+            "sync_target_count": len(sync_symbols),
+            "sync_ok_count": len(sync_ok),
+            "sync_failed_count": len(sync_failed),
+            "sync_failed_symbols": [x["symbol"] for x in sync_failed],
+            "open_position_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in open_position_symbols],
+            "benchmark_sync_failed_symbols": [x["symbol"] for x in sync_failed if x["symbol"] in benchmark_symbols],
+        }
+        logger.info("[US_PREP][DAILY_SYNC] %s", daily_sync_summary)
     except Exception as exc:
         logger.warning("[US_PREP][DAILY_SYNC][WARN] %s", exc)
 

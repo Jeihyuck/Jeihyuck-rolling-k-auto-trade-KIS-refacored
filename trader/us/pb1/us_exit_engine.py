@@ -391,6 +391,8 @@ def evaluate_exit(
                 )
 
     # ── staged trend/time exits (after all safety/profit exits) ──────────────
+    if os.getenv("US_EXIT_DISABLE_TREND_TIME", "0").lower() in {"1", "true", "yes", "y"}:
+        return None
     trend = dict(position.get("trend") or {})
     if not trend:
         trend = {k: position.get(k) for k in ("trend_state", "weakness_signals", "final30_absent_streak", "below_ma20_streak", "below_ma50_streak", "trend_trim_done", "trend_trim_pending", "trend_exit_done", "trend_exit_pending", "time_stop_trim_done", "time_stop_trim_pending", "time_stop_exit_done", "time_stop_exit_pending", "holding_trade_days", "current_price", "ma20", "lifecycle_id") if k in position}

@@ -51,3 +51,35 @@ def test_us_holiday_trade_date_previous_session_latest_calls_kis_zero():
     p=USDataProvider(offline=True); c=Client(); p._client=c; p._offline=False
     rows=p.get_completed_daily_prices("QQQ","NASDAQ",trade_date="2026-07-06",required_bars=260,allow_http_sync=True)
     assert len(rows) == 260 and c.calls == 0 and rows[-1]["xymd"] == "20260702"
+
+
+def test_current_but_short_history_backfills_older_bars():
+    # Latest matches expected previous session, but only 100 valid bars exist.
+    upsert_us_daily_bars(symbol="MSFT", bars=_bars(100, end=date(2026,7,11)), source="TEST")
+    class Older(Client):
+        def __init__(self): super().__init__(); self.asofs=[]
+        def get_us_daily_price_history(self, *a, **k):
+            self.calls += 1; self.asofs.append(k.get("as_of_date"))
+            return _bars(200, end=date(2026,3,23), close=10)
+    p=USDataProvider(offline=True); c=Older(); p._client=c; p._offline=False
+    rows=p.get_completed_daily_prices("MSFT","NASDAQ",trade_date="2026-07-13",required_bars=260,allow_http_sync=True)
+    assert c.calls == 1
+    assert c.asofs[0] < "20260710"
+    assert len(rows) == 260
+
+
+def test_stale_and_short_history_fills_both_directions():
+    upsert_us_daily_bars(symbol="META", bars=_bars(100, end=date(2026,7,10)), source="TEST")
+    class Both(Client):
+        def __init__(self): super().__init__(); self.asofs=[]; self.stops=[]
+        def get_us_daily_price_history(self, *a, **k):
+            self.calls += 1; self.asofs.append(k.get("as_of_date")); self.stops.append(k.get("stop_at_date"))
+            if self.calls == 1:
+                return [{"date":"2026-07-10","close":999,"open":999,"high":999,"low":999,"volume":1}]
+            return _bars(200, end=date(2026,3,23), close=10)
+    p=USDataProvider(offline=True); c=Both(); p._client=c; p._offline=False
+    rows=p.get_completed_daily_prices("META","NASDAQ",trade_date="2026-07-13",required_bars=260,allow_http_sync=True)
+    assert c.calls == 2
+    assert c.stops[0] == "2026-07-09"
+    assert c.stops[1] is None
+    assert len(rows) == 260
