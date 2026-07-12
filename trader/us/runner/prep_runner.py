@@ -479,9 +479,26 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     # authoritative source로 사용한다. Underfilled final30 정책은 contract에 있다.
     du_warn = du_status == "OK_WITH_WARNINGS"
     cp_warn = cp_status == "OK_WITH_WARNINGS"
+    open_position_daily_failed = bool(daily_sync_summary.get("open_position_sync_failed_symbols"))
+    benchmark_daily_failed = bool(set(daily_sync_summary.get("benchmark_sync_failed_symbols") or []) & {"SPY", "QQQ", "SMH"})
+    if benchmark_daily_failed:
+        market_state_fields.update({
+            "market_state": "UNKNOWN",
+            "market_regime": "UNKNOWN",
+            "allow_new_buy": False,
+            "force_entry_block": True,
+            "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+            "daily_data_status": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+        })
+        watchlist_result["market_regime"] = "UNKNOWN"
+        watchlist_result["allow_new_buy"] = False
+        watchlist_result["force_entry_block"] = True
+        validation["trade_block_reason"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+    elif open_position_daily_failed:
+        market_state_fields["daily_data_status"] = "DEGRADED_POSITION_DAILY_DATA"
     if du_status == "ERROR" or cp_status == "ERROR":
         provisional_status = "ERROR"
-    elif du_warn or cp_warn:
+    elif benchmark_daily_failed or open_position_daily_failed or du_warn or cp_warn or daily_sync_summary.get("sync_failed_count", 0):
         provisional_status = "OK_WITH_WARNINGS"
     else:
         provisional_status = "OK"
@@ -550,6 +567,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     try:
         legacy_entries = [
             {
+                **row,
                 "symbol": row.get("symbol"),
                 "exchange": row.get("exchange", "NASDAQ"),
                 "strategy": row.get("entry_style_selected", "dual_agent"),
@@ -559,12 +577,26 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
                 "scores": {"final": row.get("score_final", 0.0)},
                 "reason_json": row.get("reason_json", {}),
                 "meta": {
+                    **(row.get("meta") or {}),
                     "run_id": run_id,
                     "rank_final30": row.get("rank_final30"),
                     "agent_a_score": row.get("agent_a_score"),
                     "agent_b_score": row.get("agent_b_score"),
                     "theme_cluster": row.get("theme_cluster"),
                     "rotation_regime": row.get("rotation_regime"),
+                    "ma20": row.get("ma20"),
+                    "ma50": row.get("ma50"),
+                    "ma150": row.get("ma150"),
+                    "ma200": row.get("ma200"),
+                    "ma200_slope": row.get("ma200_slope"),
+                    "rs_20d": row.get("rs_20d"),
+                    "rs_60d": row.get("rs_60d"),
+                    "rs_120d": row.get("rs_120d"),
+                    "trend_score": row.get("trend_score"),
+                    "daily_bar_count": row.get("daily_bar_count"),
+                    "daily_metrics_as_of": row.get("daily_metrics_as_of"),
+                    "daily_metrics_source": row.get("daily_metrics_source"),
+                    "daily_history_quality": row.get("daily_history_quality"),
                 },
             }
             for row in final30_scored

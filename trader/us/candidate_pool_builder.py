@@ -319,11 +319,35 @@ def build_us_candidate_pool(
         symbol = sym_data.get("symbol", "")
         exchange = sym_data.get("exchange", "NASDAQ")
         try:
-            if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
-                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+            required_bars = int(os.getenv("US_DAILY_REQUIRED_BARS", "260"))
+            daily_result = None
+            if callable(getattr(provider, "get_completed_daily_prices_result", None)) and getattr(getattr(provider, "get_completed_daily_prices_result", None), "__module__", "") != "unittest.mock":
+                daily_result = provider.get_completed_daily_prices_result(symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=True)
+                daily = list(daily_result.get("rows") or [])
+                daily_quality = str(daily_result.get("quality") or "")
+                if daily_quality in {"STALE", "DB_ERROR", "KIS_SYNC_FAILED"}:
+                    logger.info("[US_CANDIDATE_POOL][SKIP] symbol=%s daily_quality=%s", symbol, daily_quality)
+                    failed_count += 1
+                    continue
+            elif callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=required_bars, allow_http_sync=True)
+                daily_quality = "OK" if len(daily or []) >= required_bars else "INSUFFICIENT_HISTORY"
             else:
-                daily = provider.get_daily_prices(symbol, exchange, count=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), as_of_date=as_of_date)
+                daily = provider.get_daily_prices(symbol, exchange, count=required_bars, as_of_date=as_of_date)
+                daily_quality = "OK" if len(daily or []) >= required_bars else "INSUFFICIENT_HISTORY"
             row = _score_symbol_candidate(sym_data, daily, all_rs20, all_rs60, all_rs120)
+            if daily_result is not None:
+                row.update({
+                    "daily_bar_count": int(daily_result.get("valid_bar_count") or row.get("daily_bar_count") or 0),
+                    "daily_metrics_source": "price_daily",
+                    "daily_history_quality": daily_quality if daily_quality != "INSUFFICIENT_HISTORY" else row.get("daily_history_quality", daily_quality),
+                    "db_latest": daily_result.get("db_latest"),
+                    "expected_latest": daily_result.get("expected_latest"),
+                })
+                row["daily_metrics_as_of"] = daily_result.get("db_latest") or row.get("daily_metrics_as_of")
+            if row.get("daily_history_quality") in {"STALE", "DB_ERROR", "KIS_SYNC_FAILED"}:
+                failed_count += 1
+                continue
             scored_rows.append(row)
             all_rs20.append(row["rs_20d"])
             all_rs60.append(row["rs_60d"])

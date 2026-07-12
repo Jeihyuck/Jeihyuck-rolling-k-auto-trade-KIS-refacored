@@ -707,6 +707,8 @@ def prepare_exit_position_snapshots(
         if entry_price_for_state > 0:
             pos["resolved_pnl_pct"] = (current_price - entry_price_for_state) / entry_price_for_state
         pos["resolved_current_price"] = current_price
+        pos["current_price_usd"] = current_price
+        pos["current_price"] = current_price
         pos["resolved_entry_price"] = entry_price_for_state
         pos["resolved_exchange"] = exchange
         if isinstance(original_pos, dict):
@@ -717,6 +719,9 @@ def prepare_exit_position_snapshots(
                 "max_price": pos.get("max_price", original_pos.get("max_price")),
                 "high_watermark_source": pos.get("high_watermark_source", original_pos.get("high_watermark_source")),
                 "position_lifecycle_id": pos.get("position_lifecycle_id", original_pos.get("position_lifecycle_id")),
+                "resolved_current_price": current_price,
+                "current_price_usd": current_price,
+                "current_price": current_price,
             })
         snapshots.append(pos)
     return snapshots

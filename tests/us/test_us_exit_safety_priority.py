@@ -94,3 +94,17 @@ def test_run_trade_tick_soft_stop_state_and_price_once(monkeypatch):
     result = run_trade_tick(session="am", env="practice", offline=False, force_now="2026-07-10T10:00:00-04:00", kis_order_allowed=False, locked_watchlist_cache=[], watchlist_cache_source="test")
     assert calls == {"price":1, "risk":1, "hwm":1}
     assert result["daily_http_call_count"] == 0
+
+
+def test_prepare_snapshots_uses_fresh_price_once_per_position():
+    from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots
+    calls=[]
+    class P:
+        def get_current_price(self, symbol, exchange):
+            calls.append(symbol)
+            return {"last": 95 if symbol == "A" else 96}
+    positions=[{"symbol":"A","exchange":"NASDAQ","qty":1,"entry_price":100,"current_price_usd":93},{"symbol":"B","exchange":"NASDAQ","qty":1,"entry_price":100}]
+    snaps=prepare_exit_position_snapshots(positions, P())
+    assert calls == ["A", "B"]
+    assert [s["resolved_current_price"] for s in snaps] == [95, 96]
+    assert positions[0]["current_price_usd"] == 95 and positions[1]["current_price_usd"] == 96

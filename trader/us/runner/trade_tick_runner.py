@@ -318,7 +318,7 @@ def _update_position_trends_for_tick(*, positions: list[dict], provider: Any, tr
             })
         elif not final30_ok:
             final30_payload["trade_date"] = "" if final30_quality != "ok" else trade_date
-        current_price = pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px")
+        current_price = pos.get("resolved_current_price") or pos.get("current_price_usd") or pos.get("current_price") or pos.get("current_px")
         if current_price is None:
             try:
                 px = provider.get_current_price(symbol, exchange)
@@ -1186,8 +1186,9 @@ def run_trade_tick(
             if trend_targets:
                 try:
                     trend_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=trend_targets, include_trend_time=True)
-                except Exception:
-                    trend_exit_intents = engine.evaluate_exits(positions=trend_targets, provider=provider, now=now)
+                except Exception as _trend_eval_exc:
+                    logger.warning("[US_EXIT][TREND_TIME][EVAL_WARN] err=%s", _trend_eval_exc)
+                    trend_exit_intents = []
             else:
                 trend_exit_intents = []
             exit_intents = []

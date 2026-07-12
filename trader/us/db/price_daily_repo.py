@@ -58,7 +58,7 @@ def _num(v: Any, default: float | None = None) -> float | None:
 def _row_from_bar(symbol: str, bar: dict, source: str) -> dict | None:
     d = _bar_date(bar)
     close = _num(bar.get("close", bar.get("clos", bar.get("stck_clpr"))))
-    if not d or close is None:
+    if not d or close is None or close <= 0:
         return None
     open_v = _num(bar.get("open", bar.get("stck_oprc")), close)
     high_v = _num(bar.get("high", bar.get("stck_hgpr")), close)
@@ -112,7 +112,7 @@ def load_recent_us_daily_bars(*, symbol: str, before_date: str, limit: int = 260
         db_rows = conn.execute(text("""
             SELECT date, open, high, low, close, volume, value, source
             FROM price_daily
-            WHERE market = 'US' AND code = :symbol AND date < :before_date
+            WHERE market = 'US' AND code = :symbol AND close IS NOT NULL AND close > 0 AND date < :before_date
             ORDER BY date DESC
             LIMIT :limit
         """), {"symbol": sym, "before_date": before, "limit": int(limit)}).mappings().all()
@@ -125,7 +125,12 @@ def get_latest_us_daily_date(*, symbol: str, before_date: str | None = None) -> 
     before = canonical_us_bar_date(before_date) if before_date else None
     engine = _engine_or_none()
     if engine is None:
-        dates = [d for (s, d), r in _MEM_US_DAILY.items() if s == sym and (before is None or d < before)]
+        dates = []
+        for (s, d), r in _MEM_US_DAILY.items():
+            if s != sym or (before is not None and d >= before):
+                continue
+            if (_num(r.get("close")) or 0) > 0:
+                dates.append(d)
         return max(dates) if dates else None
     where_before = "AND date < :before_date" if before else ""
     params = {"symbol": sym}
@@ -135,7 +140,7 @@ def get_latest_us_daily_date(*, symbol: str, before_date: str | None = None) -> 
         row = conn.execute(text(f"""
             SELECT MAX(date) AS latest_date
             FROM price_daily
-            WHERE market = 'US' AND code = :symbol {where_before}
+            WHERE market = 'US' AND code = :symbol AND close IS NOT NULL AND close > 0 {where_before}
         """), params).mappings().first()
     return canonical_us_bar_date(row.get("latest_date")) if row else None
 

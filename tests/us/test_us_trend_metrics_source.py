@@ -29,3 +29,12 @@ def test_stale_trend_metrics_become_unknown():
     tr=positions[0]["trend"]
     assert tr["trend_state"] == "UNKNOWN"
     assert tr["daily_history_quality"] in {"INSUFFICIENT_DAILY_HISTORY", "STALE"}
+
+
+def test_trend_uses_resolved_snapshot_price_over_balance_price():
+    final=[{"symbol":"AMD","trade_date":"2026-07-13","score":1,"score_final":1,"daily_metrics_as_of":"2026-07-10","daily_history_quality":"OK","daily_bar_count":260,"ma20":102,"ma50":90,"ma150":80,"trend_score":0.5}]
+    positions=[{"symbol":"AMD","qty":1,"current_price_usd":100,"resolved_current_price":105}]
+    positions, *_ = _update_position_trends_for_tick(positions=positions, provider=P(), trade_date="2026-07-13", now=datetime(2026,7,13,tzinfo=timezone.utc), locked_watchlist_cache=final, watchlist_cache_source="test")
+    tr=positions[0]["trend"]
+    assert tr["current_price"] == 105
+    assert "BELOW_MA20" not in tr["weakness_signals"]
