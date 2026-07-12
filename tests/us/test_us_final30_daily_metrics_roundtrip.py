@@ -10,3 +10,13 @@ def test_final30_daily_metrics_survive_memory_roundtrip():
     meta=out[0].get("meta") or {}
     for k in ["ma20","ma50","ma150","ma200","ma200_slope","rs_20d","rs_60d","rs_120d","daily_bar_count","daily_metrics_as_of","daily_metrics_source","daily_history_quality"]:
         assert meta.get(k) == row[k]
+
+
+def test_prep_runner_benchmark_failure_contract_fields_present_in_source():
+    import inspect
+    from trader.us.runner import prep_runner
+    src = inspect.getsource(prep_runner.run_prep)
+    assert 'watchlist_result["market_state_overlay"] = dict(market_state_overlay)' in src
+    assert '"trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE"' in src
+    assert '"effective_capital_scale": 0.0' in src
+    assert '"effective_max_new_positions": 0' in src

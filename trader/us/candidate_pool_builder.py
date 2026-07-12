@@ -345,7 +345,11 @@ def build_us_candidate_pool(
                     "expected_latest": daily_result.get("expected_latest"),
                 })
                 row["daily_metrics_as_of"] = daily_result.get("db_latest") or row.get("daily_metrics_as_of")
-            if row.get("daily_history_quality") in {"STALE", "DB_ERROR", "KIS_SYNC_FAILED"}:
+            allowed_quality = {"OK", "DEGRADED_NO_MA200"}
+            if os.getenv("US_ALLOW_NEW_LISTING_SHORT_HISTORY", "0") in {"1", "true", "True", "yes"}:
+                allowed_quality.add("NEW_LISTING_SHORT_HISTORY")
+            if row.get("daily_history_quality") not in allowed_quality:
+                logger.info("[US_CANDIDATE_POOL][SKIP] symbol=%s daily_history_quality=%s", symbol, row.get("daily_history_quality"))
                 failed_count += 1
                 continue
             scored_rows.append(row)

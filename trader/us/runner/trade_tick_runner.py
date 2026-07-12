@@ -1163,13 +1163,17 @@ def run_trade_tick(
                 trend_positions = current_positions
             exit_intents = engine.evaluate_exits(positions=trend_positions, provider=provider, now=now)
         else:
+            from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
             try:
-                from trader.us.pb1.us_exit_engine import prepare_exit_position_snapshots, generate_exit_intents as _gen_exit_from_snapshots
                 exit_snapshots = prepare_exit_position_snapshots(current_positions, provider, now)
+            except Exception as _snapshot_exc:
+                logger.warning("[US_EXIT][SNAPSHOT][WARN] err=%s", _snapshot_exc)
+                exit_snapshots = []
+            try:
                 safety_exit_intents = _gen_exit_from_snapshots([], provider=None, now=now, prepared_snapshots=exit_snapshots, include_trend_time=False)
-            except Exception:
-                exit_snapshots = current_positions
-                safety_exit_intents = engine.evaluate_exits(positions=current_positions, provider=provider, now=now)
+            except Exception as _safety_eval_exc:
+                logger.warning("[US_EXIT][SAFETY][EVAL_WARN] err=%s", _safety_eval_exc)
+                safety_exit_intents = []
             safety_sell_symbols = {str(i.get("symbol") or "").upper() for i in safety_exit_intents or [] if str(i.get("side") or "").upper() == "SELL"}
             trend_targets = [p for p in exit_snapshots if str(p.get("symbol") or "").upper() not in safety_sell_symbols]
             try:

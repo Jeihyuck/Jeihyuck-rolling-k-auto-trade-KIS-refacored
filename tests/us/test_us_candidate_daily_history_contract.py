@@ -28,3 +28,18 @@ def test_candidate_excludes_stale_db_error_and_keeps_ok(monkeypatch):
     res=build_us_candidate_pool(trade_date="2026-07-13", as_of_date="20260710", env="practice", dynamic_universe=universe, provider=P(), force_rebuild=True)
     assert [r["symbol"] for r in res["rows"]] == ["OK"]
     assert res["rows"][0]["daily_history_quality"] == "OK"
+
+
+def test_candidate_blocks_short_history_and_allows_degraded_no_ma200(monkeypatch):
+    from trader.us.candidate_pool_builder import build_us_candidate_pool
+    monkeypatch.setenv("US_CANDIDATE_POOL_MIN", "1")
+    monkeypatch.setenv("US_CANDIDATE_POOL_TARGET", "1")
+    monkeypatch.setenv("US_CANDIDATE_POOL_MAX", "10")
+    class P:
+        def get_completed_daily_prices_result(self, symbol, exchange, **kwargs):
+            n={"D20":20,"D59":59,"D120":120,"D160":160}[symbol]
+            return {"rows": _rows(n), "quality": "INSUFFICIENT_HISTORY", "valid_bar_count": n, "db_latest":"2026-07-10", "expected_latest":"2026-07-10"}
+    universe=[{"symbol":s,"exchange":"NASDAQ","price":130,"avg_dollar_volume_20d":1_000_000} for s in ["D20","D59","D120","D160"]]
+    res=build_us_candidate_pool(trade_date="2026-07-13", as_of_date="20260710", env="practice", dynamic_universe=universe, provider=P(), force_rebuild=True)
+    assert [r["symbol"] for r in res["rows"]] == ["D160"]
+    assert res["rows"][0]["daily_history_quality"] == "DEGRADED_NO_MA200"

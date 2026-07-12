@@ -108,3 +108,11 @@ def test_prepare_snapshots_uses_fresh_price_once_per_position():
     assert calls == ["A", "B"]
     assert [s["resolved_current_price"] for s in snaps] == [95, 96]
     assert positions[0]["current_price_usd"] == 95 and positions[1]["current_price_usd"] == 96
+
+
+def test_default_tick_does_not_fallback_to_raw_engine_after_snapshot(monkeypatch):
+    import inspect
+    from trader.us.runner import trade_tick_runner
+    src = inspect.getsource(trade_tick_runner.run_trade_tick)
+    assert "safety_exit_intents = engine.evaluate_exits(positions=current_positions" not in src
+    assert "trend_exit_intents = engine.evaluate_exits(positions=trend_targets" not in src

@@ -482,16 +482,33 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     open_position_daily_failed = bool(daily_sync_summary.get("open_position_sync_failed_symbols"))
     benchmark_daily_failed = bool(set(daily_sync_summary.get("benchmark_sync_failed_symbols") or []) & {"SPY", "QQQ", "SMH"})
     if benchmark_daily_failed:
+        market_state_overlay = dict(watchlist_result.get("market_state_overlay") or market_state_overlay or {})
+        market_state_overlay.update({
+            "market_state": "UNKNOWN",
+            "market_regime": "UNKNOWN",
+            "allow_new_buy": False,
+            "allow_add_to_existing": False,
+            "force_entry_block": True,
+            "capital_scale": 0.0,
+            "exposure_multiplier": 0.0,
+            "max_new_positions": 0,
+        })
+        watchlist_result["market_state_overlay"] = dict(market_state_overlay)
         market_state_fields.update({
             "market_state": "UNKNOWN",
             "market_regime": "UNKNOWN",
             "allow_new_buy": False,
+            "allow_add_to_existing": False,
             "force_entry_block": True,
             "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
             "daily_data_status": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+            "capital_scale": 0.0,
+            "exposure_multiplier": 0.0,
+            "max_new_positions": 0,
         })
         watchlist_result["market_regime"] = "UNKNOWN"
         watchlist_result["allow_new_buy"] = False
+        watchlist_result["allow_add_to_existing"] = False
         watchlist_result["force_entry_block"] = True
         validation["trade_block_reason"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
     elif open_position_daily_failed:
@@ -516,6 +533,18 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             paths=paths,
         )
         contract["daily_sync_summary"] = daily_sync_summary
+        if benchmark_daily_failed:
+            contract.update({
+                "trade_can_proceed": 0,
+                "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+                "allow_new_buy": False,
+                "allow_add_to_existing": False,
+                "force_entry_block": True,
+                "market_regime": "UNKNOWN",
+                "market_state": "UNKNOWN",
+                "effective_capital_scale": 0.0,
+                "effective_max_new_positions": 0,
+            })
 
         final_status = contract.get("status", provisional_status)
         trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)
