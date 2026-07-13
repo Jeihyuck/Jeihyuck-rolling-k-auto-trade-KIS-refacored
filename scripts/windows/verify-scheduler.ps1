@@ -1,27 +1,18 @@
+param([string]$Repo="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored")
 $ErrorActionPreference = "Continue"
 $expected = [ordered]@{
-  "PB1 KR Prep WSL"      = "run-kr-prep.sh"
-  "PB1 KR AM WSL"        = "run-kr-am.sh"
-  "PB1 KR Afternoon WSL" = "run-kr-afternoon.sh"
-  "PB1 KR Close WSL"     = "run-kr-close.sh"
-  "PB1 US Prep WSL"      = "run-us-prep.sh"
-  "PB1 US AM WSL"        = "run-us-am.sh"
-  "PB1 US Afternoon WSL" = "run-us-afternoon.sh"
-  "PB1 US Close WSL"     = "run-us-close.sh"
+ "PB1 KR Prep WSL"=@("06:30","run-kr-prep.sh"); "PB1 KR AM WSL"=@("08:55","run-kr-am.sh"); "PB1 KR Afternoon WSL"=@("13:00","run-kr-afternoon.sh"); "PB1 KR Close WSL"=@("15:15","run-kr-close.sh"); "PB1 KR Mail WSL"=@("16:00","send-market-log-mail.sh kr"); "PB1 KR Health WSL"=@("16:10","check-nullim-day-health.sh kr");
+ "PB1 US Prep WSL"=@("21:30","run-us-prep.sh"); "PB1 US AM WSL"=@("22:30","run-us-am.sh"); "PB1 US Afternoon WSL"=@("02:00","run-us-afternoon.sh"); "PB1 US Close WSL"=@("05:05","run-us-close.sh"); "PB1 US Mail WSL"=@("07:00","send-market-log-mail.sh us"); "PB1 US Health WSL"=@("07:10","check-nullim-day-health.sh us")
 }
-$krScripts = @("run-kr-prep.sh","run-kr-am.sh","run-kr-afternoon.sh","run-kr-close.sh")
-$base = "/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored/scripts/wsl"
-$failed = $false
-foreach ($name in $expected.Keys) {
-  $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-  if ($null -eq $task) { Write-Host "[SCHEDULER][FAIL] $name missing"; $failed = $true; continue }
-  $actionText = ($task.Actions | Out-String)
-  if ($name -like "PB1 KR*" -and $actionText -match "run-kr-trader\.sh") { Write-Host "[SCHEDULER][FAIL] $name still points to run-kr-trader.sh"; $failed = $true; continue }
-  if ($actionText -match [regex]::Escape($expected[$name])) { Write-Host "[SCHEDULER][OK] $name -> $($expected[$name])" } else { Write-Host "[SCHEDULER][FAIL] $name expected $($expected[$name]) action=$actionText"; $failed = $true }
+$failed=$false
+foreach($name in $expected.Keys){
+ $task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+ if($null -eq $task){Write-Host "[SCHEDULER][FAIL] $name missing"; $failed=$true; continue}
+ $info=Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue
+ $action=($task.Actions | Out-String); $trig=($task.Triggers | Select-Object -First 1); $wantTime=$expected[$name][0]; $wantCmd=$expected[$name][1]
+ $timeOk=($trig.StartBoundary -match "T$([regex]::Escape($wantTime)):")
+ $settingsOk=($task.Settings.StartWhenAvailable -and $task.Settings.MultipleInstances -eq "IgnoreNew")
+ $cmdOk=($action -match [regex]::Escape($wantCmd))
+ if($cmdOk -and $timeOk -and $settingsOk){Write-Host "[SCHEDULER][OK] $name next=$($info.NextRunTime) last=$($info.LastTaskResult) time=$wantTime cmd=$wantCmd"} else {Write-Host "[SCHEDULER][FAIL] $name cmdOk=$cmdOk timeOk=$timeOk settingsOk=$settingsOk action=$action trigger=$($trig.StartBoundary)"; $failed=$true}
 }
-foreach ($script in $krScripts) {
-  $check = wsl.exe -- bash -lc "test -x '$base/$script'"
-  if ($LASTEXITCODE -ne 0) { Write-Host "[SCHEDULER][FAIL] KR script missing or not executable: $script"; $failed = $true }
-}
-if ($failed) { exit 1 }
-exit 0
+if($failed){exit 1}

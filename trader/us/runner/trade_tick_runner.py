@@ -66,10 +66,8 @@ def validate_us_regime_contract_for_entry(prep_result: dict | None, *, real_orde
         reason = "prep_contract_version_mismatch"
     elif prep_result.get("status") in ("DEGRADED", "ERROR"):
         reason = "prep_status_error"
-    elif not bool(prep_result.get("trade_can_proceed", True)):
-        reason = prep_result.get("trade_block_reason") or ("risk_off_entry_block" if prep_result.get("market_regime") == "RISK_OFF" else "trade_can_proceed_false")
-    elif not bool(prep_result.get("contract_ok", True)):
-        reason = "contract_ok_false"
+    elif not bool(prep_result.get("entry_can_proceed", prep_result.get("trade_can_proceed", True))):
+        reason = prep_result.get("degraded_reason") or prep_result.get("trade_block_reason") or ("risk_off_entry_block" if prep_result.get("market_regime") == "RISK_OFF" else "entry_can_proceed_false")
     elif not bool(
         prep_result.get(
             "final30_trade_ready",

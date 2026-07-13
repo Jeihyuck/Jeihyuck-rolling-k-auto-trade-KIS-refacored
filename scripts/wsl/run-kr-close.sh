@@ -84,6 +84,13 @@ ln -sfn "${TODAY_KST}/wsl-kr-close.log" "$LATEST_LINK"
     if [[ -f "$LAST_STAGE_FILE" ]]; then LAST_STAGE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true); fi
     echo "[KR_CLOSE][TIMEOUT] timeout_sec=${KR_CLOSE_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
     echo "[RUN_SUMMARY][RESULT] market=KR session=close status=FAIL reason=SESSION_TIMEOUT orders_intent=0 orders_ack=0 blocked=0"
+  elif [[ "$rc" -ne 0 ]] && tail -n 300 "$LOG_FILE" 2>/dev/null | grep -Eiq 'Kis(Auth|Temporary|TokenRateLimit)Error|EGW00133|1분당 1회|tokenP|AUTH_REFRESH|HTTP 403'; then
+    HEALTH_DIR="runtime/health"
+    mkdir -p "$HEALTH_DIR"
+    printf '{"status":"RETRYABLE_DEGRADED","market":"KR","session":"close","date":"%s","reason":"kis_auth_or_token_temporary","exit_code":%s,"ts":"%s"}\n' "${TODAY_KST}" "$rc" "$(date -Is)" > "${HEALTH_DIR}/kr-close-${TODAY_KST}.json"
+    echo "[KR_CLOSE][DEGRADED] reason=kis_auth_or_token_temporary original_exit_code=${rc} marker=${HEALTH_DIR}/kr-close-${TODAY_KST}.json"
+    echo "[RUN_SUMMARY][RESULT] market=KR session=close status=RETRYABLE_DEGRADED reason=kis_auth_or_token_temporary orders_intent=0 orders_ack=0 blocked=0"
+    rc=0
   fi
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc

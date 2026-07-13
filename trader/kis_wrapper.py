@@ -244,6 +244,13 @@ class KisAuthError(Exception):
     """401/403 인증 오류."""
 
 
+class KisTokenRateLimitError(KisAuthError):
+    """KIS tokenP 1분당 1회 제한. retry_after 초 뒤 cache reload 우선."""
+    def __init__(self, message: str = "KIS token rate limited", retry_after: int = 65) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class KisPermanentError(Exception):
     """기타 4xx 등 영구 오류."""
 
@@ -1664,7 +1671,9 @@ class KisAPI:
     @classmethod
     def _resolve_cache_path(cls) -> Path:
         if cls._cache_path is None:
-            cls._cache_path = botstate_path("runtime", "kis_token.json")
+            env_name = str(os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "practice").lower()
+            suffix = "real" if env_name in {"real", "live", "prod", "production"} else "practice"
+            cls._cache_path = botstate_path("runtime", "private", f"kis_token_{suffix}.json")
             cls._cache_path.parent.mkdir(parents=True, exist_ok=True)
         return cls._cache_path
 
@@ -1698,15 +1707,27 @@ class KisAPI:
                     return self._token_cache["token"]
                 raise Exception("토큰 발급 제한(1분 1회), 잠시 후 재시도 필요")
 
-            try:
-                token, expires_in = self._issue_token_and_expire()
-            except Exception as exc:
-                msg = str(exc)
-                if "1분당 1회" in msg or "1분 1회" in msg or "1 minute" in msg:
-                    logger.warning("[토큰] rate limit 감지 -> 65초 대기 후 재시도")
-                    time.sleep(65)
+            import fcntl
+            lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+            with open(lock_path, "w", encoding="utf-8") as lock_fh:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                cache_after_lock = self._load_token_cache_file(cache_path, now)
+                if cache_after_lock:
+                    return cache_after_lock
+                try:
                     token, expires_in = self._issue_token_and_expire()
-                else:
+                except Exception as exc:
+                    msg = str(exc)
+                    if "EGW00133" in msg or "1분당 1회" in msg or "1분 1회" in msg or "1 minute" in msg:
+                        logger.warning("[토큰] rate limit/unknown issuance 감지 -> cache reload before reissue retry_after=65")
+                        time.sleep(65)
+                        cache_after_wait = self._load_token_cache_file(cache_path, time.time())
+                        if cache_after_wait:
+                            return cache_after_wait
+                        raise KisTokenRateLimitError(str(exc), retry_after=65) from exc
+                    cache_after_error = self._load_token_cache_file(cache_path, time.time())
+                    if cache_after_error:
+                        return cache_after_error
                     raise
             issued_at = time.time()
             expires_at = issued_at + int(expires_in)
@@ -1722,6 +1743,19 @@ class KisAPI:
                 logger.warning(f"[토큰캐시 쓰기 실패] {e}")
             logger.info("[토큰캐시] 새 토큰 발급 및 캐시")
             return token
+
+    def _load_token_cache_file(self, cache_path: Path, now: float) -> str | None:
+        try:
+            if cache_path.exists():
+                cache = json.loads(cache_path.read_text(encoding="utf-8"))
+                if "access_token" in cache and now < float(cache.get("expires_at", 0)) - 300:
+                    issued_at = cache.get("issued_at", cache.get("last_issued", 0))
+                    self._token_cache.update({"token": cache["access_token"], "expires_at": cache["expires_at"], "issued_at": issued_at})
+                    logger.info("[토큰캐시] 파일캐시 사용 expires_at=%s", cache["expires_at"])
+                    return str(cache["access_token"])
+        except Exception as e:
+            logger.warning(f"[토큰캐시 읽기 실패] {e}")
+        return None
 
     def _issue_token_and_expire(self):
         strategy_mode = os.getenv("STRATEGY_MODE", "").upper()

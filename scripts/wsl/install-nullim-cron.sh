@@ -5,6 +5,14 @@ APP="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 
 mkdir -p "$APP/runtime/cron"
 
+if grep -qi microsoft /proc/version 2>/dev/null || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+  existing="$(crontab -l 2>/dev/null || true)"
+  cleaned="$(printf '%s\n' "$existing" | sed '/# NULLIM_CRON_START/,/# NULLIM_CRON_END/d')"
+  printf '%s\n' "$cleaned" | sed '/^[[:space:]]*$/d' | crontab - 2>/dev/null || true
+  echo "[CRON_INSTALL][BLOCK] reason=WSL_USES_WINDOWS_TASK_SCHEDULER"
+  exit 0
+fi
+
 NULLIM_CRON_BLOCK="$(cat <<'CRON'
 # NULLIM_CRON_START
 SHELL=/bin/bash
