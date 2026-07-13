@@ -114,9 +114,10 @@ _TOKEN_CACHE: dict[str, Any] = {
 def _token_cache_paths(env: str) -> tuple[Path, Path]:
     from pathlib import Path
     safe_env = str(env or "practice").lower().replace("/", "_")
-    base = Path("runtime/kis")
+    base = Path("runtime/private")
     base.mkdir(parents=True, exist_ok=True)
-    return base / f"token_cache_us_{safe_env}.json", base / f"token_refresh_us_{safe_env}.lock"
+    suffix = "real" if safe_env in {"real", "live", "prod", "production"} else "practice"
+    return base / f"kis_token_us_{suffix}.json", base / f"kis_token_us_{suffix}.lock"
 
 
 def _read_token_file(env: str) -> dict[str, Any]:
@@ -223,6 +224,10 @@ class KisUSClient:
             try:
                 token = self._request_new_token()
             except Exception as exc:
+                text = str(exc)
+                if "EGW00133" in text or "1분당 1회" in text or "1분 1회" in text or "1 minute" in text or "timeout" in text.lower():
+                    logger.warning("[US_AUTH][TOKENP_UNKNOWN_OR_RATE_LIMIT] wait=65 err=%s", exc)
+                    time.sleep(65)
                 fallback = _read_token_file(self._env)
                 if fallback:
                     _TOKEN_CACHE.update(fallback)

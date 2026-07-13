@@ -583,7 +583,10 @@ def run_trade_session(
         if session in ("am", "afternoon") and not offline:
             try:
                 from trader.us.prep_contract import check_us_prep_guard
-                guard = check_us_prep_guard(trade_date)
+                try:
+                    guard = check_us_prep_guard(trade_date, session=session)
+                except TypeError:
+                    guard = check_us_prep_guard(trade_date)
                 prep_guard_result = guard or {}
                 if guard["ok"]:
                     logger.info(
@@ -641,7 +644,10 @@ def run_trade_session(
         if session == "close":
             try:
                 from trader.us.prep_contract import check_us_prep_guard
-                guard = check_us_prep_guard(trade_date)
+                try:
+                    guard = check_us_prep_guard(trade_date, session=session)
+                except TypeError:
+                    guard = check_us_prep_guard(trade_date)
                 logger.info(
                     "[US_PREP_GUARD][READ] workflow=us-trade-close session=close"
                     " trade_date=%s status=%s",

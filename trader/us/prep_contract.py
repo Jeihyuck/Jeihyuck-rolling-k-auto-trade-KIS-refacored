@@ -88,7 +88,8 @@ def build_us_prep_contract(
 
     cap_violations = list(watchlist_result.get("cap_violations") or [])
     rotation_context = watchlist_result.get("rotation_context") or {}
-    cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
+    raw_cluster_contract_ok = bool(watchlist_result.get("cluster_contract_ok", not cap_violations)) and not cap_violations
+    cluster_contract_ok = raw_cluster_contract_ok
     if rotation_context.get("rotation_context_suspect") and str(rotation_context.get("rotation_suspect_policy") or "block") == "block":
         cluster_contract_ok = False
         if "ROTATION_CONTEXT_SUSPECT" not in cap_violations:
@@ -141,15 +142,11 @@ def build_us_prep_contract(
 
     underfilled_final30 = bool(final30_scored_count < 30 and final30_trade_ready)
 
-    contract_ok = (
-        validation_ok
-        and final30_trade_ready
-        and score_contract_ok
-        and cluster_contract_ok
-        and not cap_violations
-    )
+    # Session liveness/reconcile/exit must not be killed solely by entry-quality warnings.
+    hard_quality_ok = validation_ok and final30_trade_ready and score_contract_ok and not final30_empty
+    contract_ok = bool(hard_quality_ok)
     if not cluster_contract_ok:
-        status = "FAILED_CLUSTER_CAP_CONTRACT"
+        status = "OK_WITH_WARNINGS_CLUSTER_CAP" if hard_quality_ok else "FAILED_CLUSTER_CAP_CONTRACT"
     elif not final30_complete and final30_trade_ready:
         status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
     elif not final30_trade_ready:
@@ -184,7 +181,14 @@ def build_us_prep_contract(
     elif not allow_new_buy:
         trade_block_reason = "allow_new_buy_false"
 
-    trade_can_proceed = int(trade_block_reason == "ok")
+    exit_can_proceed = int(hard_quality_ok)
+    close_can_proceed = 1
+    entry_can_proceed = int(trade_block_reason == "ok")
+    if cap_violations or not cluster_contract_ok:
+        # Degrade to liveness/exit/reconcile; block new BUYs in risky clusters.
+        entry_can_proceed = 0
+    trade_can_proceed = int(exit_can_proceed or entry_can_proceed)
+    degraded_reason = "" if entry_can_proceed else trade_block_reason
 
     base_capital_scale = float(market_state.get("capital_scale", market_state.get("exposure_multiplier", 1.0)) or 1.0)
     effective_capital_scale = base_capital_scale * underfilled_capital_haircut
@@ -210,17 +214,19 @@ def build_us_prep_contract(
     errors.extend(validation.get("errors", []))
 
     if market_regime == "RISK_OFF":
-        trade_can_proceed = 0
+        entry_can_proceed = 0
         trade_block_reason = "risk_off_entry_block"
         status = "RISK_OFF_ENTRY_BLOCKED" if market_state.get("market_state") != "DEFENSE_CRASH" else "DEFENSE_CRASH_ENTRY_BLOCKED"
     if market_state.get("market_state") == "DEFENSE_CRASH" or force_entry_block:
-        trade_can_proceed = 0
+        entry_can_proceed = 0
         trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
-    if trade_can_proceed == 0:
+    trade_can_proceed = int(entry_can_proceed == 1 or (exit_can_proceed == 1 and trade_block_reason == "ok"))
+    if entry_can_proceed == 0:
         effective_capital_scale = 0.0
         effective_max_new_positions = 0
+        degraded_reason = trade_block_reason
 
     contract = {
         "market": "US",
@@ -232,7 +238,13 @@ def build_us_prep_contract(
         "trade_date": trade_date,
         "status": status,
         "trade_can_proceed": trade_can_proceed,
+        "entry_can_proceed": entry_can_proceed,
+        "exit_can_proceed": exit_can_proceed,
+        "close_can_proceed": close_can_proceed,
         "trade_block_reason": trade_block_reason,
+        "degraded_reason": degraded_reason,
+        "raw_final30_count": final30_count,
+        "effective_final30_count": final30_scored_count,
         "dynamic_universe_count": dynamic_universe_count,
         "candidate_pool_count": candidate_pool_count,
         "top50_count": top50_count,
@@ -525,8 +537,8 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
         "reason": "ok_db_fallback",
     }
 
-def check_us_prep_guard(trade_date: str) -> dict:
-    """AM/Afternoon session이 사용하는 contract-authoritative prep guard 체크."""
+def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
+    """Session-aware contract-authoritative prep guard check."""
     from trader.us.path_contract import load_us_prep_contract
 
     contract = load_us_prep_contract(trade_date)
@@ -554,9 +566,12 @@ def check_us_prep_guard(trade_date: str) -> dict:
     final30_scored_count = int(contract.get("final30_scored_count", 0) or 0)
     score_nonzero_count = int(contract.get("score_nonzero_count", 0) or 0)
 
+    session_name = str(session or "am").lower()
+
     base_payload = {
         "contract": contract,
         "source": "runtime",
+        "session": session_name,
         "prep_status": status,
         "trade_block_reason": trade_block_reason,
         "final30_scored_count": final30_scored_count,
@@ -565,17 +580,26 @@ def check_us_prep_guard(trade_date: str) -> dict:
         "effective_capital_scale": contract.get("effective_capital_scale"),
         "effective_max_new_positions": contract.get("effective_max_new_positions"),
         "final30_trade_ready": final30_trade_ready,
+        "entry_can_proceed": bool(contract.get("entry_can_proceed", trade_can_proceed)),
+        "exit_can_proceed": bool(contract.get("exit_can_proceed", trade_can_proceed)),
+        "close_can_proceed": bool(contract.get("close_can_proceed", trade_can_proceed)),
     }
 
-    if trade_can_proceed != 1:
+    has_split_permissions = any(k in contract for k in ("entry_can_proceed", "exit_can_proceed", "close_can_proceed"))
+    entry_can_proceed = int(contract.get("entry_can_proceed", trade_can_proceed) or 0)
+    exit_can_proceed = int(contract.get("exit_can_proceed", trade_can_proceed) or 0)
+    close_can_proceed = int(contract.get("close_can_proceed", exit_can_proceed or trade_can_proceed) or 0)
+    if trade_can_proceed != 1 and not has_split_permissions:
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"trade_can_proceed=0:{trade_block_reason or status}"}
-    if not contract_ok:
-        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": "contract_ok=false"}
-    if not final30_trade_ready:
+    session_permission_ok = bool(close_can_proceed) if session_name == "close" else bool(entry_can_proceed or exit_can_proceed)
+    if not session_permission_ok:
+        reason = "close_can_proceed=0" if session_name == "close" else "entry_and_exit_can_proceed_false"
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "reason": f"{reason}:{trade_block_reason or status}"}
+    if not final30_trade_ready and session_name != "close":
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"final30_trade_ready=false:{trade_block_reason or status}"}
-    if final30_scored_count <= 0:
+    if final30_scored_count <= 0 and session_name != "close":
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": "final30_scored_count=0"}
-    if score_nonzero_count != final30_scored_count:
+    if score_nonzero_count != final30_scored_count and session_name != "close":
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"score_contract_failed:{score_nonzero_count}!={final30_scored_count}"}
 
     return {**base_payload, "ok": True, "trade_can_proceed": True, "reason": "ok"}

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APP="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MARKET="${1:-kr}"
+DAY="${2:-$(TZ=Asia/Seoul date +%F)}"
+cd "$APP"
+mkdir -p runtime/health
+OUT="runtime/health/${MARKET}-${DAY}.json"
+SUMMARY="runtime/health/${MARKET}-${DAY}.summary.txt"
+python - "$MARKET" "$DAY" "$OUT" "$SUMMARY" <<'PY'
+import json, re, sys
+from pathlib import Path
+market, day, out, summary = sys.argv[1:]
+root = Path('.')
+def text(paths):
+    buf=[]
+    for p in paths:
+        if p.exists():
+            try: buf.append(p.read_text(encoding='utf-8', errors='ignore')[-200000:])
+            except Exception: pass
+    return '\n'.join(buf)
+def ticks(t): return len(re.findall(r'(?:US_TICK_LOOP\]\[TICK|\[TICK\]|tick=)', t, re.I))
+logs = list((root/'runtime/logs'/market/day).glob('*.log')) if (root/'runtime/logs'/market/day).exists() else []
+logs += list((root/'runtime').glob(f'wsl-{market}-*.log'))
+blob = text(logs)
+mail_marker = root/'runtime/health'/f'{market}-mail-{day}.json'
+result = {'market': market.upper(), 'date': day, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs]}
+if mail_marker.exists():
+    try: result['mail_ok'] = json.loads(mail_marker.read_text()).get('status') == 'OK'
+    except Exception: pass
+if market == 'us':
+    prep = root/'reports/us_prep/latest_us_prep_summary.json'
+    if prep.exists():
+        try:
+            d=json.loads(prep.read_text()); c=d.get('contract') or d
+            result.update({k:c.get(k) for k in ['status','trade_can_proceed','entry_can_proceed','exit_can_proceed','close_can_proceed']})
+        except Exception as e: result['prep_error']=str(e)
+else:
+    result['prep_final30_ok'] = 'final30=30' in blob or 'final30_rows=30' in blob
+result['ok'] = bool(result.get('tick_count',0) >= 2 or re.search(r'session_end|graceful_shutdown|retryable close failure', blob, re.I))
+Path(out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+lines=[f"NULLIM {market.upper()} health {day}"]+[f"- {k}: {v}" for k,v in result.items() if k!='logs_checked']
+Path(summary).write_text('\n'.join(lines)+'\n', encoding='utf-8')
+print('\n'.join(lines))
+PY
