@@ -1673,7 +1673,7 @@ class KisAPI:
         if cls._cache_path is None:
             env_name = str(os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "practice").lower()
             suffix = "real" if env_name in {"real", "live", "prod", "production"} else "practice"
-            cls._cache_path = botstate_path("runtime", "private", f"kis_token_{suffix}.json")
+            cls._cache_path = botstate_path("runtime", "private", f"kis_token_kr_{suffix}.json")
             cls._cache_path.parent.mkdir(parents=True, exist_ok=True)
         return cls._cache_path
 

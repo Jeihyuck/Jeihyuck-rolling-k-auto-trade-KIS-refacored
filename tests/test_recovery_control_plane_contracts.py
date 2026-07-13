@@ -23,10 +23,37 @@ def test_cron_installer_blocks_wsl_and_scheduler_verifies_settings():
 
 def test_kis_token_cache_private_and_rate_limit_error():
     s = Path('trader/kis_wrapper.py').read_text()
-    assert 'runtime", "private", f"kis_token_{suffix}.json"' in s
+    assert 'runtime", "private", f"kis_token_kr_{suffix}.json"' in s
     assert 'class KisTokenRateLimitError' in s
     assert 'EGW00133' in s and 'retry_after=65' in s
     us = Path('trader/us/execution/kis_us_client.py').read_text()
     assert 'Path("runtime/private")' in us
-    assert 'kis_token_practice.json' in us
+    assert 'kis_token_us_{suffix}.json' in us
+    assert 'kis_token_us_{suffix}.lock' in us
     assert 'TOKENP_UNKNOWN_OR_RATE_LIMIT' in us
+
+
+def test_kr_us_token_cache_paths_are_separated():
+    kr = Path('trader/kis_wrapper.py').read_text()
+    us = Path('trader/us/execution/kis_us_client.py').read_text()
+    assert 'kis_token_kr_practice.json' not in us
+    assert 'kis_token_us_practice.json' not in kr
+    assert 'kis_token_kr_{suffix}.json' in kr
+    assert 'kis_token_us_{suffix}.json' in us
+
+
+def test_kr_numeric_and_us_iso_token_cache_contracts_do_not_collide():
+    kr = Path('trader/kis_wrapper.py').read_text()
+    us = Path('trader/us/execution/kis_us_client.py').read_text()
+    assert 'float(cache.get("expires_at", 0))' in kr
+    assert 'datetime.fromisoformat(str(data.get("expires_at")))' in us
+    assert 'kis_token_kr_' in kr and 'kis_token_us_' in us
+
+
+def test_kr_us_token_refresh_locks_prevent_reissue_storm():
+    kr = Path('trader/kis_wrapper.py').read_text()
+    us = Path('trader/us/execution/kis_us_client.py').read_text()
+    assert 'fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)' in kr
+    assert 'fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)' in us
+    assert 'cache_after_lock' in kr
+    assert 'CACHE_AFTER_LOCK' in us

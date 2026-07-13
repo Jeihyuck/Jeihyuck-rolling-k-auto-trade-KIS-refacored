@@ -22,7 +22,7 @@ def test_underfilled_final30_degrades_but_session_can_proceed():
 
 def test_cluster_cap_warning_allows_liveness_but_blocks_entry():
     c = _base(24, cluster_ok=False, cap=["SINGLE_CLUSTER"])
-    assert c["trade_can_proceed"] == 1
+    assert c["trade_can_proceed"] == 0
     assert c["entry_can_proceed"] == 0
     assert c["exit_can_proceed"] == 1
     assert c["cluster_contract_ok"] is False
@@ -34,3 +34,35 @@ def test_entry_guard_split_uses_entry_permission():
     g = validate_us_regime_contract_for_entry(c, real_order_mode=True, kis_order_allowed=True)
     assert not g["ok"]
     assert g["reason"] in {"sector_cap_violation_block", "cluster_cap_contract_failed"}
+
+
+def test_close_only_permission_blocks_am_but_allows_close(monkeypatch):
+    from trader.us import prep_contract as pc
+    contract = {
+        "trade_date": "2026-07-13",
+        "status": "OK_WITH_WARNINGS_CLOSE_ONLY",
+        "trade_can_proceed": 1,
+        "entry_can_proceed": 0,
+        "exit_can_proceed": 0,
+        "close_can_proceed": 1,
+        "trade_block_reason": "close_only",
+        "contract_ok": True,
+        "final30_trade_ready": True,
+        "final30_scored_count": 17,
+        "score_nonzero_count": 17,
+    }
+    monkeypatch.setattr("trader.us.path_contract.load_us_prep_contract", lambda trade_date: contract)
+    assert pc.check_us_prep_guard("2026-07-13", session="am")["ok"] is False
+    assert pc.check_us_prep_guard("2026-07-13", session="afternoon")["ok"] is False
+    assert pc.check_us_prep_guard("2026-07-13", session="close")["ok"] is True
+
+
+def test_cluster_warning_entry_block_exit_allowed_passes_am_guard(monkeypatch):
+    from trader.us import prep_contract as pc
+    c = _base(24, cluster_ok=False, cap=["SINGLE_CLUSTER"])
+    c["trade_date"] = "2026-07-13"
+    monkeypatch.setattr("trader.us.path_contract.load_us_prep_contract", lambda trade_date: c)
+    guard = pc.check_us_prep_guard("2026-07-13", session="am")
+    assert guard["ok"] is True
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True

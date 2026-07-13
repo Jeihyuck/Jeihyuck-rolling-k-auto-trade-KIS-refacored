@@ -222,7 +222,7 @@ def build_us_prep_contract(
         trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
-    trade_can_proceed = int(exit_can_proceed or entry_can_proceed)
+    trade_can_proceed = int(entry_can_proceed == 1 or (exit_can_proceed == 1 and trade_block_reason == "ok"))
     if entry_can_proceed == 0:
         effective_capital_scale = 0.0
         effective_max_new_positions = 0
@@ -537,8 +537,8 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
         "reason": "ok_db_fallback",
     }
 
-def check_us_prep_guard(trade_date: str) -> dict:
-    """AM/Afternoon session이 사용하는 contract-authoritative prep guard 체크."""
+def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
+    """Session-aware contract-authoritative prep guard check."""
     from trader.us.path_contract import load_us_prep_contract
 
     contract = load_us_prep_contract(trade_date)
@@ -566,9 +566,12 @@ def check_us_prep_guard(trade_date: str) -> dict:
     final30_scored_count = int(contract.get("final30_scored_count", 0) or 0)
     score_nonzero_count = int(contract.get("score_nonzero_count", 0) or 0)
 
+    session_name = str(session or "am").lower()
+
     base_payload = {
         "contract": contract,
         "source": "runtime",
+        "session": session_name,
         "prep_status": status,
         "trade_block_reason": trade_block_reason,
         "final30_scored_count": final30_scored_count,
@@ -582,16 +585,21 @@ def check_us_prep_guard(trade_date: str) -> dict:
         "close_can_proceed": bool(contract.get("close_can_proceed", trade_can_proceed)),
     }
 
+    has_split_permissions = any(k in contract for k in ("entry_can_proceed", "exit_can_proceed", "close_can_proceed"))
     entry_can_proceed = int(contract.get("entry_can_proceed", trade_can_proceed) or 0)
     exit_can_proceed = int(contract.get("exit_can_proceed", trade_can_proceed) or 0)
     close_can_proceed = int(contract.get("close_can_proceed", exit_can_proceed or trade_can_proceed) or 0)
-    if not (entry_can_proceed or exit_can_proceed or close_can_proceed):
-        return {**base_payload, "ok": False, "trade_can_proceed": False, "entry_can_proceed": False, "exit_can_proceed": False, "close_can_proceed": False, "reason": f"all_session_permissions_false:{trade_block_reason or status}"}
-    if not final30_trade_ready:
+    if trade_can_proceed != 1 and not has_split_permissions:
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"trade_can_proceed=0:{trade_block_reason or status}"}
+    session_permission_ok = bool(close_can_proceed) if session_name == "close" else bool(entry_can_proceed or exit_can_proceed)
+    if not session_permission_ok:
+        reason = "close_can_proceed=0" if session_name == "close" else "entry_and_exit_can_proceed_false"
+        return {**base_payload, "ok": False, "trade_can_proceed": False, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "reason": f"{reason}:{trade_block_reason or status}"}
+    if not final30_trade_ready and session_name != "close":
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"final30_trade_ready=false:{trade_block_reason or status}"}
-    if final30_scored_count <= 0:
+    if final30_scored_count <= 0 and session_name != "close":
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": "final30_scored_count=0"}
-    if score_nonzero_count != final30_scored_count:
+    if score_nonzero_count != final30_scored_count and session_name != "close":
         return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"score_contract_failed:{score_nonzero_count}!={final30_scored_count}"}
 
     return {**base_payload, "ok": True, "trade_can_proceed": True, "reason": "ok"}

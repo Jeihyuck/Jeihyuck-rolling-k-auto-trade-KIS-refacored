@@ -116,8 +116,8 @@ def _token_cache_paths(env: str) -> tuple[Path, Path]:
     safe_env = str(env or "practice").lower().replace("/", "_")
     base = Path("runtime/private")
     base.mkdir(parents=True, exist_ok=True)
-    name = "kis_token_real.json" if safe_env in {"real", "live", "prod", "production"} else "kis_token_practice.json"
-    return base / name, base / f"kis_token_{safe_env}.lock"
+    suffix = "real" if safe_env in {"real", "live", "prod", "production"} else "practice"
+    return base / f"kis_token_us_{suffix}.json", base / f"kis_token_us_{suffix}.lock"
 
 
 def _read_token_file(env: str) -> dict[str, Any]:
