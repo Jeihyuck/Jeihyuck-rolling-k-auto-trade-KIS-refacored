@@ -1062,6 +1062,138 @@ def build_kr_close_policy_orders_from_tagged_positions(
     return orders
 
 
+def _load_kr_close_tagged_metadata(
+    *,
+    holdings: list[dict[str, Any]],
+    positions_repo: Any,
+    fills_repo: Any,
+    orders_repo: Any,
+    env: str,
+    strategy: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    codes = [code for code, qty in (_holding_code_qty(row) for row in (holdings or [])) if code and qty > 0]
+    db_positions: list[dict[str, Any]] = []
+    latest_buy_fills: list[dict[str, Any]] = []
+    if positions_repo is not None:
+        if hasattr(positions_repo, "list_positions_by_codes"):
+            db_positions = list(positions_repo.list_positions_by_codes(env=env, strategy=strategy, codes=codes) or [])
+        elif hasattr(positions_repo, "list_positions"):
+            all_positions = list(positions_repo.list_positions(env, strategy) or [])
+            code_set = set(codes)
+            db_positions = [dict(row) for row in all_positions if str((row or {}).get("code") or "").zfill(6) in code_set]
+    latest_by_code: dict[str, dict[str, Any]] = {}
+    if fills_repo is not None and hasattr(fills_repo, "list_latest_buy_fills_by_codes"):
+        raw_latest = fills_repo.list_latest_buy_fills_by_codes(env, codes) or {}
+        if isinstance(raw_latest, dict):
+            latest_by_code = {str(code).zfill(6): dict(row or {}) for code, row in raw_latest.items()}
+    elif fills_repo is not None and hasattr(fills_repo, "list_today_fills"):
+        for code in codes:
+            rows = fills_repo.list_today_fills(env, side="BUY", code=code) or []
+            if rows:
+                latest_by_code[code] = dict(rows[0] or {})
+    if orders_repo is not None:
+        for code in codes:
+            if latest_by_code.get(code) and _parse_meta_json(latest_by_code[code].get("fill_meta_json")):
+                continue
+            entry_meta: dict[str, Any] = {}
+            if hasattr(orders_repo, "list_today_buy_orders"):
+                buy_orders = orders_repo.list_today_buy_orders(env, code=code) or []
+                if buy_orders:
+                    entry_meta = _parse_meta_json((buy_orders[0] or {}).get("entry_meta_json"))
+            if not entry_meta and hasattr(orders_repo, "find_latest_buy_entry_exit_plan"):
+                plan_row = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code) or {}
+                entry_meta = _parse_meta_json(plan_row.get("entry_meta"))
+            if entry_meta:
+                latest_by_code.setdefault(code, {"code": code})
+                latest_by_code[code]["entry_meta_json"] = entry_meta
+    latest_buy_fills = list(latest_by_code.values())
+    logger.info(
+        "[KR_CLOSE][POLICY][DB_METADATA] holdings=%s db_positions=%s latest_buy_fills=%s codes=%s",
+        len(codes), len(db_positions), len(latest_buy_fills), ",".join(codes[:20]),
+    )
+    return db_positions, latest_buy_fills
+
+
+def submit_kr_close_policy_orders(
+    *,
+    policy_orders: list[dict[str, Any]],
+    kis_client: Any,
+    orders_repo: Any = None,
+    env: str = "practice",
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for order in list(policy_orders or []):
+        code = str((order or {}).get("code") or "").zfill(6)
+        qty = int((order or {}).get("qty") or 0)
+        if not code or qty <= 0:
+            continue
+        reason = str((order or {}).get("reason") or "KR_CLOSE_POLICY_SELL")
+        logger.info("[KR_CLOSE][POLICY][SELL][INTENT] code=%s qty=%s reason=%s metadata_source=%s", code, qty, reason, (order or {}).get("metadata_source"))
+        if dry_run:
+            results.append({**dict(order), "accepted": False, "dry_run": True, "result": "DRY_RUN"})
+            continue
+        if kis_client is None or not hasattr(kis_client, "sell_stock_market"):
+            raise RuntimeError("KIS_SELL_SUBMIT_UNAVAILABLE_FOR_KR_CLOSE_POLICY")
+        logger.info("[ORDER][API_CALL][START] side=SELL code=%s source=tagged_close_policy", code)
+        resp = kis_client.sell_stock_market(code, qty)
+        ok = _is_accepted_order_response(resp)
+        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        logger.info("[KIS][ORDER][RESPONSE] side=SELL code=%s rt_cd=%s msg_cd=%s msg1=%s source=tagged_close_policy", code, rt_cd, msg_cd, msg1)
+        logger.info("[TRADE][ORDER][SELL] code=%s result=%s source=tagged_close_policy", code, "ACCEPTED" if ok else "REJECTED")
+        result = dict(resp) if isinstance(resp, dict) else {"resp": resp}
+        result.update({**dict(order), "accepted": ok, "result": "ACCEPTED" if ok else "REJECTED"})
+        results.append(result)
+    return results
+
+
+def run_kr_close_policy_from_tagged_positions(
+    *,
+    kis_holdings: list[dict[str, Any]],
+    positions_repo: Any,
+    fills_repo: Any,
+    orders_repo: Any,
+    kis_client: Any,
+    env: str,
+    strategy: str = "pb1_pullback_close",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    db_positions, latest_buy_fills = _load_kr_close_tagged_metadata(
+        holdings=kis_holdings,
+        positions_repo=positions_repo,
+        fills_repo=fills_repo,
+        orders_repo=orders_repo,
+        env=env,
+        strategy=strategy,
+    )
+    policy_orders = build_kr_close_policy_orders_from_tagged_positions(
+        kis_holdings,
+        db_positions=db_positions,
+        latest_buy_fills=latest_buy_fills,
+        orders_repo=orders_repo,
+        fills_repo=fills_repo,
+        positions_repo=positions_repo,
+    )
+    policy_results = submit_kr_close_policy_orders(
+        policy_orders=policy_orders,
+        kis_client=kis_client,
+        orders_repo=orders_repo,
+        env=env,
+        dry_run=dry_run,
+    )
+    accepted_policy_sells = sum(1 for row in policy_results if bool((row or {}).get("accepted")))
+    return {
+        "policy_orders": policy_orders,
+        "policy_results": policy_results,
+        "accepted_policy_sells": accepted_policy_sells,
+        "db_positions": db_positions,
+        "latest_buy_fills": latest_buy_fills,
+        "policy_sell_candidates": len(policy_orders),
+    }
+
+
 def run_close_liquidation_from_kis_holdings(
     *,
     kis_client: Any,
@@ -6335,17 +6467,31 @@ def run_once(
             holdings_for_policy = []
             if isinstance(balance_snapshot_raw, dict):
                 holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
-            policy_orders = build_kr_close_policy_orders_from_tagged_positions(
-                holdings_for_policy,
-                db_positions=[],
-                latest_buy_fills=[],
-                orders_repo=orders_repo,
-                fills_repo=fills_repo,
+            close_policy_result = run_kr_close_policy_from_tagged_positions(
+                kis_holdings=holdings_for_policy,
                 positions_repo=positions_repo,
+                fills_repo=fills_repo,
+                orders_repo=orders_repo,
+                kis_client=kis,
+                env=env_effective,
+                strategy="pb1_pullback_close",
+                dry_run=dry_run_for_engine,
             )
+            policy_orders = list(close_policy_result.get("policy_orders") or [])
+            policy_results = list(close_policy_result.get("policy_results") or [])
+            accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
             logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
-            logger.info("[KR_CLOSE][POLICY][DONE] sell_orders=%s holds=%s", len(policy_orders), max(0, len(holdings_for_policy) - len(policy_orders)))
-            return [], True, {"buy_orders": 0, "sell_orders": len(policy_orders), "warning_counts": {}}, phase_for_log, "OK_CLOSE_POLICY"
+            logger.info(
+                "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
+                len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
+            )
+            return [], True, {
+                "buy_orders": 0,
+                "sell_orders": accepted_policy_sells,
+                "sell_orders_ack": accepted_policy_sells,
+                "policy_sell_candidates": len(policy_orders),
+                "warning_counts": {},
+            }, phase_for_log, "OK_CLOSE_POLICY"
 
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
