@@ -84,8 +84,8 @@ def test_prep_guard_block_when_trade_can_proceed_zero(tmp_path):
         assert g["ok"] is False
 
 
-def test_prep_guard_block_when_final30_count_less_than_30(tmp_path):
-    """final30_scored_count < 30이면 ok=False여야 한다."""
+def test_prep_guard_allows_session_when_final30_count_less_than_30(tmp_path):
+    """final30_scored_count < 30 blocks entry only and keeps session guard ok."""
     try:
         from trader.us.prep_contract import check_us_prep_guard
     except ImportError:
@@ -100,7 +100,9 @@ def test_prep_guard_block_when_final30_count_less_than_30(tmp_path):
     with patch("trader.us.path_contract.us_prep_contract_path", return_value=f), \
          patch("trader.us.path_contract.us_signals_latest_prep_contract_path", return_value=missing):
         g = check_us_prep_guard("2024-05-01")
-        assert g["ok"] is False
+        assert g["ok"] is True
+        assert g["entry_can_proceed"] is False
+        assert g["exit_can_proceed"] is True
 
 
 def test_no_session_pm():

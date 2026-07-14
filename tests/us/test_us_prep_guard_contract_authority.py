@@ -72,7 +72,7 @@ def test_runtime_contract_risk_off_blocks(monkeypatch):
     assert "risk_off_entry_block" in guard["reason"]
 
 
-def test_runtime_contract_score_mismatch_blocks(monkeypatch):
+def test_runtime_contract_score_mismatch_blocks_entry_only(monkeypatch):
     guard = _guard(monkeypatch, {
         "status": "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE",
         "trade_can_proceed": 1,
@@ -82,8 +82,10 @@ def test_runtime_contract_score_mismatch_blocks(monkeypatch):
         "final30_scored_count": 25,
         "score_nonzero_count": 24,
     })
-    assert guard["ok"] is False
-    assert "score_contract_failed" in guard["reason"]
+    assert guard["ok"] is True
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
+    assert "entry_blocked_by_final30_quality" in guard["reason"]
 
 
 def test_db_fallback_trade_can_proceed_allows_cluster_incomplete(monkeypatch):

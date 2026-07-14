@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,12 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
+def _current_git_commit_sha() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return "unknown"
 
 def build_us_prep_contract(
     *,
@@ -142,15 +149,21 @@ def build_us_prep_contract(
 
     underfilled_final30 = bool(final30_scored_count < 30 and final30_trade_ready)
 
-    # Session liveness/reconcile/exit must not be killed solely by entry-quality warnings.
-    hard_quality_ok = validation_ok and final30_trade_ready and score_contract_ok and not final30_empty
-    contract_ok = bool(hard_quality_ok)
+    # Entry quality is deliberately separated from session/exit liveness.
+    # Final30 underfill, cluster caps, and risk-off regimes block only new BUYs;
+    # they must not stop balance reconcile, existing-position exit monitoring, or close.
+    hard_system_failure = status == "ERROR" or bool(validation.get("hard_system_failure", False))
+    # Exit/close liveness must not depend on Final30/watchlist/score/cluster/regime quality.
+    # Those are entry-quality signals only. System/broker hard failures are the only
+    # prep-time reason to disable exit monitoring.
+    exit_quality_ok = bool(not hard_system_failure)
+    contract_ok = bool(exit_quality_ok)
     if not cluster_contract_ok:
-        status = "OK_WITH_WARNINGS_CLUSTER_CAP" if hard_quality_ok else "FAILED_CLUSTER_CAP_CONTRACT"
+        status = "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP"
     elif not final30_complete and final30_trade_ready:
         status = "OK_WITH_WARNINGS_CLUSTER_INCOMPLETE"
     elif not final30_trade_ready:
-        status = "FAILED_FINAL30_UNDERFILLED"
+        status = "OK_WITH_WARNINGS_ENTRY_BLOCKED_UNDERFILLED"
 
     agent_a_ok = validation.get("agent_a_nonzero_count", 0) >= 25
     agent_b_ok = validation.get("agent_b_nonzero_count", 0) >= 25
@@ -181,8 +194,8 @@ def build_us_prep_contract(
     elif not allow_new_buy:
         trade_block_reason = "allow_new_buy_false"
 
-    exit_can_proceed = int(hard_quality_ok)
-    close_can_proceed = 1
+    exit_can_proceed = int(exit_quality_ok)
+    close_can_proceed = int(not hard_system_failure)
     entry_can_proceed = int(trade_block_reason == "ok")
     if cap_violations or not cluster_contract_ok:
         # Degrade to liveness/exit/reconcile; block new BUYs in risky clusters.
@@ -222,7 +235,7 @@ def build_us_prep_contract(
         trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"
 
-    trade_can_proceed = int(entry_can_proceed == 1 or (exit_can_proceed == 1 and trade_block_reason == "ok"))
+    trade_can_proceed = int(entry_can_proceed == 1 or exit_can_proceed == 1 or close_can_proceed == 1)
     if entry_can_proceed == 0:
         effective_capital_scale = 0.0
         effective_max_new_positions = 0
@@ -312,6 +325,7 @@ def build_us_prep_contract(
         "trailing_stop_mode": market_state.get("trailing_stop_mode", "normal"),
         "account_loss_kill_switch_triggered": market_state.get("account_loss_kill_switch_triggered", False),
         "forbidden_hedge_symbols": market_state.get("forbidden_hedge_symbols", []),
+        "git_commit_sha": _current_git_commit_sha(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -589,18 +603,30 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
     entry_can_proceed = int(contract.get("entry_can_proceed", trade_can_proceed) or 0)
     exit_can_proceed = int(contract.get("exit_can_proceed", trade_can_proceed) or 0)
     close_can_proceed = int(contract.get("close_can_proceed", exit_can_proceed or trade_can_proceed) or 0)
-    if trade_can_proceed != 1 and not has_split_permissions:
-        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"trade_can_proceed=0:{trade_block_reason or status}"}
+    if not has_split_permissions:
+        if trade_can_proceed != 1 and (status == "FAILED_CLUSTER_CAP_CONTRACT" or trade_block_reason == "sector_cap_violation_block"):
+            entry_can_proceed = 0
+            exit_can_proceed = 1
+            close_can_proceed = 1
+            logger.warning("[US_PREP_GUARD][LEGACY_CONTRACT_DEGRADED] split_permissions_missing entry_can_proceed=0 exit_can_proceed=1 close_can_proceed=1 original_status=%s", status)
+        elif trade_can_proceed != 1:
+            return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"trade_can_proceed=0:{trade_block_reason or status}"}
     session_permission_ok = bool(close_can_proceed) if session_name == "close" else bool(entry_can_proceed or exit_can_proceed)
     if not session_permission_ok:
         reason = "close_can_proceed=0" if session_name == "close" else "entry_and_exit_can_proceed_false"
         return {**base_payload, "ok": False, "trade_can_proceed": False, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "reason": f"{reason}:{trade_block_reason or status}"}
-    if not final30_trade_ready and session_name != "close":
-        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"final30_trade_ready=false:{trade_block_reason or status}"}
-    if final30_scored_count <= 0 and session_name != "close":
-        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": "final30_scored_count=0"}
-    if score_nonzero_count != final30_scored_count and session_name != "close":
-        return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"score_contract_failed:{score_nonzero_count}!={final30_scored_count}"}
-
-    return {**base_payload, "ok": True, "trade_can_proceed": True, "reason": "ok"}
+    reason = trade_block_reason or "ok"
+    if session_name != "close":
+        if (not final30_trade_ready) or final30_scored_count <= 0 or score_nonzero_count != final30_scored_count:
+            entry_can_proceed = 0
+            reason = reason if reason != "ok" else "entry_blocked_by_final30_quality"
+    prep_sha = str(contract.get("git_commit_sha") or "")
+    current_sha = _current_git_commit_sha()
+    if prep_sha and current_sha != "unknown" and prep_sha != current_sha:
+        entry_can_proceed = 0
+        reason = "entry_blocked_by_prep_contract_version_mismatch"
+        logger.warning("[US_CONTRACT_VERSION][MISMATCH] prep_sha=%s current_sha=%s action=entry_block_exit_allowed", prep_sha, current_sha)
+    ok_payload = {**base_payload, "ok": True, "trade_can_proceed": True, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "session_can_run": True, "reason": reason}
+    logger.info("[US_PREP_GUARD][OK] session=%s entry_can_proceed=%d exit_can_proceed=%d close_can_proceed=%d reason=%s final30=%d", session_name, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)), int(bool(close_can_proceed)), reason, final30_scored_count)
+    return ok_payload
 

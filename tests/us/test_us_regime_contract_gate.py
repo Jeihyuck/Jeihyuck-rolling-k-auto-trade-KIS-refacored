@@ -44,7 +44,9 @@ def test_sector_cap_violation_blocks_trade():
         paths={},
     )
     assert contract["cluster_contract_ok"] is False
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] in {"sector_cap_violation_block", "cluster_cap_contract_failed", "final30_incomplete"}
 
 
@@ -60,7 +62,9 @@ def test_risk_off_is_not_prep_error():
         paths={},
     )
     assert contract["status"] in {"RISK_OFF_ENTRY_BLOCKED", "DEFENSE_CRASH_ENTRY_BLOCKED"}
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "risk_off_entry_block"
     assert contract["contract_version"] == "us_sector_rotation_v3"
     assert contract["market_regime_version"] == "us_leading_regime_v1"
@@ -143,7 +147,9 @@ def test_risk_off_preserves_final30_artifact():
         validation={"ok": True, "score_nonzero_count": len(final), "warnings": [], "errors": []},
         paths={},
     )
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "risk_off_entry_block"
     assert contract["final30_count"] == 12
     assert contract["score_nonzero_count"] == 12
@@ -278,7 +284,9 @@ def test_final30_18_neutral_blocks_trade(monkeypatch):
         validation={"ok": True, "score_nonzero_count": 18, "agent_a_nonzero_count": 18, "agent_b_nonzero_count": 18, "warnings": [], "errors": []}, paths={},
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "final30_underfilled_regime_block"
     assert contract["underfilled_tier"] == "severe_underfilled_blocked"
     assert contract["effective_capital_scale"] == 0.0
@@ -295,7 +303,9 @@ def test_final30_14_blocks_even_in_risk_on(monkeypatch):
         validation={"ok": True, "score_nonzero_count": 14, "agent_a_nonzero_count": 14, "agent_b_nonzero_count": 14, "warnings": [], "errors": []}, paths={},
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "final30_below_absolute_min"
     assert contract["underfilled_tier"] == "blocked_underfilled"
 
@@ -308,7 +318,9 @@ def test_risk_off_blocks_even_when_final30_28_ready(monkeypatch):
         validation={"ok": True, "score_nonzero_count": 28, "agent_a_nonzero_count": 28, "agent_b_nonzero_count": 28, "warnings": [], "errors": []}, paths={},
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "risk_off_entry_block"
     assert contract["effective_capital_scale"] == 0.0
     assert contract["effective_max_new_positions"] == 0
@@ -322,7 +334,9 @@ def test_underfilled_score_mismatch_blocks_trade(monkeypatch):
         validation={"ok": True, "score_nonzero_count": 23, "agent_a_nonzero_count": 24, "agent_b_nonzero_count": 24, "warnings": [], "errors": []}, paths={},
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "score_contract_failed"
 
 
@@ -334,5 +348,7 @@ def test_underfilled_cap_violation_blocks_trade(monkeypatch):
         validation={"ok": True, "score_nonzero_count": 24, "agent_a_nonzero_count": 24, "agent_b_nonzero_count": 24, "warnings": [], "errors": []}, paths={},
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] == "sector_cap_violation_block"

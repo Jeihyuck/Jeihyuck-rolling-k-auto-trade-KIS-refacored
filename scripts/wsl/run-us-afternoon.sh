@@ -1,19 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p runtime runtime/locks
 
-set -a
-source .env
-set +a
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
 
 SESSION_NAME="afternoon"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
 LOG_FILE="runtime/wsl-us-${SESSION_NAME}.log"
+TRADE_DATE="${US_TRADE_DATE:-$(date -u +%F)}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if [[ -x .venv/bin/python ]]; then PYTHON_BIN=.venv/bin/python; fi
+LOCK_RESULT="$(${PYTHON_BIN} -m trader.us.session_lock --market us --session "${SESSION_NAME}" --trade-date "${TRADE_DATE}" --min-interval-sec 60 2>/dev/null)" || lock_rc=$?
+lock_rc="${lock_rc:-0}"
+if [[ "${lock_rc}" == "10" ]]; then
+  echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] session=${SESSION_NAME} trade_date=${TRADE_DATE} result=${LOCK_RESULT}" >> "${LOG_FILE}"
+  exit 0
+elif [[ "${lock_rc}" != "0" ]]; then
+  echo "[$(date -Is)] [US_SCHEDULER][LOCK_HELPER_WARN] session=${SESSION_NAME} trade_date=${TRADE_DATE} rc=${lock_rc}" >> "${LOG_FILE}"
+fi
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
-  echo "[$(date -Is)] [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
+  echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] reason=already_running [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi
 echo "[$(date -Is)] [US_WSL_LOCK][ACQUIRED] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
@@ -87,7 +100,7 @@ export KIS_BALANCE_TIMEOUT_SEC="${KIS_BALANCE_TIMEOUT_SEC:-5}"
 max_minutes="${US_AFTERNOON_MAX_MINUTES:-185}"
 interval_sec="${US_SESSION_INTERVAL_SEC:-300}"
 run_mode="${US_RUN_MODE:-TRADE}"
-cmd=(.venv/bin/python -m trader.us.runner.trade_session_runner --session afternoon --env practice --max-minutes "${max_minutes}" --interval-sec "${interval_sec}" --run-mode "${run_mode}")
+cmd=("${PYTHON_BIN}" -m trader.us.runner.trade_session_runner --session afternoon --env practice --max-minutes "${max_minutes}" --interval-sec "${interval_sec}" --run-mode "${run_mode}")
 if [[ "${US_SIGNAL_ONLY:-0}" == "1" ]]; then
   cmd+=(--signal-only)
 fi

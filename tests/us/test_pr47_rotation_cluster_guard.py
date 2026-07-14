@@ -107,5 +107,7 @@ def test_cap_violation_without_replacement_blocks_trade():
     selected = [row(f"AI{i}", "AI_SEMI", 1.0 - i * 0.001) for i in range(21)] + [row(f"H{i}", "HEALTHCARE", 0.7) for i in range(9)]
     final, meta = enforce_regime_sector_caps(selected, selected, {"market_regime": "NEUTRAL", "max_ai_tech_ratio": 0.35, "max_single_cluster_ratio": 1.0}, 30)
     contract = build_us_prep_contract(trade_date="2026-07-09", env="practice", status="OK", dynamic_universe_result={"filtered_count": 50}, candidate_pool_result={"selected_count": 30, "status": "OK"}, watchlist_result={"top50_count": 30, "final30_count": len(final), "final30_scored_count": len(final), "cluster_contract_ok": False, "final30_cluster_cap_clean": False, "cap_violations": meta["cap_violations"] or ["AI_TECH_COMBINED"], "blocked_by_cluster_cap": meta["blocked_by_cluster_cap"], "market_state_overlay": {"market_regime": "NEUTRAL", "allow_new_buy": True}}, validation={"ok": True, "score_nonzero_count": len(final), "warnings": [], "errors": []}, paths={})
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
     assert contract["trade_block_reason"] in {"sector_cap_violation_block", "cluster_cap_contract_failed"}

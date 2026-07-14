@@ -82,3 +82,10 @@ def test_tick_runner_offline_after_cutoff_no_entry_intents():
     # SKIP 또는 OK/OK_WITH_WARNINGS/OK_NO_TRADE
     assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE"), \
         f"Unexpected status: {result}"
+
+
+def test_monitoring_universe_is_union_of_final30_and_positions():
+    from trader.us.runner.trade_tick_runner import build_monitoring_universe
+    final30 = {"NVDA", "TSLA"}
+    positions = {"APP", "BE", "INTC"}
+    assert build_monitoring_universe(final30, positions) == {"NVDA", "TSLA", "APP", "BE", "INTC"}

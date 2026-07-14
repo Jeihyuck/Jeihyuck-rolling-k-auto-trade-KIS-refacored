@@ -593,7 +593,7 @@ def run_trade_session(
                         "[US_PREP_GUARD][OK] workflow=us-trade-%s session=%s trade_date=%s"
                         " final30=%s score_nonzero=%s source=%s prep_status=%s"
                         " trade_block_reason=%s underfilled_tier=%s effective_capital_scale=%s"
-                        " effective_max_new_positions=%s final30_trade_ready=%s",
+                        " effective_max_new_positions=%s final30_trade_ready=%s entry_can_proceed=%s exit_can_proceed=%s close_can_proceed=%s",
                         session, session, trade_date,
                         guard.get("final30_scored_count", "?"),
                         guard.get("score_nonzero_count", "?"),
@@ -604,6 +604,9 @@ def run_trade_session(
                         guard.get("effective_capital_scale", "?"),
                         guard.get("effective_max_new_positions", "?"),
                         int(bool(guard.get("final30_trade_ready"))),
+                        int(bool(guard.get("entry_can_proceed"))),
+                        int(bool(guard.get("exit_can_proceed"))),
+                        int(bool(guard.get("close_can_proceed"))),
                     )
                 else:
                     logger.error(
@@ -870,10 +873,14 @@ def run_trade_session(
                 tick_count += 1
                 last_stage = f"tick_{tick_count}"
                 logger.info(
-                    "[US_TICK_LOOP][TICK] session=%s tick=%d force_now=%s",
+                    "[US_TICK_LOOP][TICK] session=%s tick=%d force_now=%s entry_can_proceed=%s exit_can_proceed=%s positions=%s monitoring_universe=%s",
                     session,
                     tick_count,
                     tick_force_now or "",
+                    int(bool(prep_guard_result.get("entry_can_proceed", True))),
+                    int(bool(prep_guard_result.get("exit_can_proceed", True))),
+                    "?",
+                    "?",
                 )
 
                 try:
@@ -898,6 +905,8 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
+                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", True)),
+                            exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
                         )
                         tick_result = fut.result(timeout=tick_timeout_sec)
                     finally:

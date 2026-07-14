@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p runtime runtime/locks
 
-set -a
-source .env
-set +a
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
 
 SESSION_NAME="close"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
@@ -67,7 +69,9 @@ export KIS_BALANCE_BREAKER_COOLDOWN_SEC="${KIS_BALANCE_BREAKER_COOLDOWN_SEC:-30}
 export KIS_BALANCE_MAX_RETRIES="${KIS_BALANCE_MAX_RETRIES:-2}"
 export KIS_BALANCE_TIMEOUT_SEC="${KIS_BALANCE_TIMEOUT_SEC:-5}"
 
-cmd=(.venv/bin/python -m trader.us.runner.dispatcher --mode trade-close --env practice)
+PYTHON_BIN="python"
+if [[ -x .venv/bin/python ]]; then PYTHON_BIN=.venv/bin/python; fi
+cmd=("${PYTHON_BIN}" -m trader.us.runner.dispatcher --mode trade-close --env practice)
 if [[ -n "${US_FORCE_NOW:-}" ]]; then
   cmd+=(--force-now "${US_FORCE_NOW}")
 fi

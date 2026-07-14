@@ -100,6 +100,18 @@ def validate_us_regime_contract_for_entry(prep_result: dict | None, *, real_orde
         "is_real_trade_path": is_real_trade_path,
     }
 
+def build_monitoring_universe(final30_symbols: Any, current_position_symbols: Any) -> set[str]:
+    def norm(values: Any) -> set[str]:
+        out: set[str] = set()
+        for item in values or []:
+            symbol = item.get("symbol") if isinstance(item, dict) else item
+            symbol = str(symbol or "").upper().strip()
+            if symbol:
+                out.add(symbol)
+        return out
+    return norm(final30_symbols) | norm(current_position_symbols)
+
+
 def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(pattern in text for pattern in _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS)
@@ -653,6 +665,8 @@ def run_trade_tick(
     locked_watchlist_cache: list[dict] | None = None,
     prep_cache_source: str | None = None,
     watchlist_cache_source: str | None = None,
+    entry_can_proceed: bool = True,
+    exit_can_proceed: bool = True,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -674,9 +688,15 @@ def run_trade_tick(
         {"status": "OK"|"SKIP"|"ERROR"|"OK_WITH_WARNINGS", ...}
     """
     logger.info(
-        "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s",
-        session, env, offline, run_mode, signal_only,
+        "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s entry_can_proceed=%d exit_can_proceed=%d",
+        session, env, offline, run_mode, signal_only, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)),
     )
+    if not exit_can_proceed:
+        entry_can_proceed = False
+        logger.error(
+            "[US_EXIT][DISABLED] session=%s reason=exit_can_proceed_false action=skip_exit_and_block_entry",
+            session,
+        )
     last_stage = "tick_start"
 
     # ── 변수 사전 초기화 (reconcile 실패 시 UnboundLocalError 방지) ──────────
@@ -1144,6 +1164,9 @@ def run_trade_tick(
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
     try:
+        if not exit_can_proceed:
+            logger.error("[US_EXIT_EVAL][SKIP] session=%s tick=%s reason=exit_can_proceed_false", session, tick_index)
+            raise RuntimeError("exit_can_proceed_false")
         engine = _get_strategy_engine(env=env, offline=offline)
         is_default_pb1_engine = engine.__class__.__module__ == "trader.us.pb1.us_pb1_engine"
         if not is_default_pb1_engine:
@@ -1203,7 +1226,11 @@ def run_trade_tick(
                     seen_sell_symbols.add(sym)
                 exit_intents.append(intent)
     except Exception as exc:
-        logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+        if str(exc) == "exit_can_proceed_false":
+            logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
+        else:
+            logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+    logger.info("[US_EXIT_EVAL][SUMMARY] session=%s tick=%s positions_evaluated=%d sell_candidates=%d sell_orders=%d", session, tick_index, len(current_positions), len([i for i in exit_intents if str(i.get("side") or "").upper()=="SELL"]), 0)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
 
     market_state_overlay = {"market_state": "NORMAL", "exposure_multiplier": 1.0, "allow_new_buy": True, "allow_add_to_existing": allow_add_to_existing, "force_entry_block": False, "trailing_stop_mode": "normal"}
@@ -1290,6 +1317,12 @@ def run_trade_tick(
     buy_daily_notional = 0.0
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
+    try:
+        _final30_symbols_for_monitor = [r.get("symbol") for r in (locked_watchlist_cache or []) if isinstance(r, dict)]
+        monitoring_universe = build_monitoring_universe(_final30_symbols_for_monitor, current_position_symbols)
+        logger.info("[US_TICK_LOOP][TICK] session=%s tick=%s entry_can_proceed=%d exit_can_proceed=%d positions=%d monitoring_universe=%d", session, tick_index, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)), len(current_positions), len(monitoring_universe))
+    except Exception:
+        monitoring_universe = set(current_position_symbols or [])
     exit_route_result = route_exit_orders_immediately(
         exit_intents,
         buy_daily_notional=buy_daily_notional,
@@ -1386,6 +1419,10 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
+    elif not entry_can_proceed:
+        entry_degraded = True
+        entry_degraded_reason = "entry_can_proceed_false"
+        logger.info("[US_ENTRY][SKIP] session=%s tick=%s reason=entry_can_proceed_false", session, tick_index)
     elif after_cutoff:
         last_stage = "entry_cutoff_guard"
         logger.info(
@@ -2338,6 +2375,10 @@ def run_trade_tick(
         "open_position_count": len(current_positions) if 'current_positions' in locals() else 0,
         "open_position_symbols": [p.get("symbol", "") for p in (current_positions if 'current_positions' in locals() else [])],
         "positions": len(current_positions) if 'current_positions' in locals() else 0,
+        "positions_evaluated": len(current_positions) if 'current_positions' in locals() else 0,
+        "entry_skipped": bool(not entry_can_proceed),
+        "buy_orders": sum(1 for o in orders if str(o.get("side") or "").upper() == "BUY") if 'orders' in locals() else 0,
+        "monitoring_universe_count": len(monitoring_universe) if 'monitoring_universe' in locals() else 0,
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
