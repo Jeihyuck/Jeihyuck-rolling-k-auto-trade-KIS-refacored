@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
+_DAILY_RAW_KEYS_LOGGED: set[str] = set()
 
 
 def _get_engine():
@@ -107,13 +108,19 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
     return default
 
 
-def _get_first_valid(row: dict, keys: tuple[str, ...], default: Any = None) -> Any:
-    """row에서 여러 key 후보 중 첫 번째로 존재하는 값을 반환."""
+def _get_first_valid(row: dict, keys: tuple[str, ...], default: Any = None, *, positive_numeric: bool = False) -> Any:
+    """row에서 여러 key 후보 중 첫 번째로 존재하는 값을 반환.
+
+    positive_numeric=True이면 None/blank/0은 결측으로 간주하고 다음 후보를 탐색한다.
+    """
     for k in keys:
         if k in row:
             val = row[k]
-            if val is not None and val != "":
-                return val
+            if val is None or val == "":
+                continue
+            if positive_numeric and _safe_float(val, 0.0) <= 0:
+                continue
+            return val
     return default
 
 
@@ -122,7 +129,11 @@ _CLOSE_KEYS = ("clos", "close", "stck_clpr", "ovrs_nmix_prpr", "prpr", "last", "
 _OPEN_KEYS = ("open", "ovrs_nmix_oprc", "stck_oprc")
 _HIGH_KEYS = ("high", "ovrs_nmix_hgpr", "stck_hgpr")
 _LOW_KEYS = ("low", "ovrs_nmix_lwpr", "stck_lwpr")
-_VOLUME_KEYS = ("volume", "acml_vol", "tvol", "stck_sdpr")
+_VOLUME_KEYS = (
+    "volume", "vol", "tvol", "acml_vol",
+    "cntg_vol", "trqu", "tvol_qty", "ovrs_vol",
+)
+_VALUE_KEYS = ("value", "amount", "acml_tr_pbmn")
 _DATE_KEYS = ("xymd", "date", "stck_bsop_date", "bas_dt", "trad_dvsn")
 
 
@@ -136,14 +147,16 @@ def normalize_daily_row(row: dict) -> dict:
     open_raw = _get_first_valid(row, _OPEN_KEYS)
     high_raw = _get_first_valid(row, _HIGH_KEYS)
     low_raw = _get_first_valid(row, _LOW_KEYS)
-    volume_raw = _get_first_valid(row, _VOLUME_KEYS)
+    volume_raw = _get_first_valid(row, _VOLUME_KEYS, positive_numeric=True)
+    value_raw = _get_first_valid(row, _VALUE_KEYS, positive_numeric=True)
     date_raw = _get_first_valid(row, _DATE_KEYS)
 
     close_val = _safe_float(close_raw) if close_raw is not None else None
     open_val = _safe_float(open_raw) if open_raw is not None else None
     high_val = _safe_float(high_raw) if high_raw is not None else None
     low_val = _safe_float(low_raw) if low_raw is not None else None
-    volume_val = _safe_int(volume_raw) if volume_raw is not None else None
+    volume_val = _safe_int(volume_raw) if volume_raw is not None else 0
+    value_val = _safe_float(value_raw) if value_raw is not None else None
 
     result = dict(row)  # 원본 필드 보존 (기존 코드 호환)
     result["close"] = close_val
@@ -151,18 +164,27 @@ def normalize_daily_row(row: dict) -> dict:
     result["high"] = high_val
     result["low"] = low_val
     result["volume"] = volume_val
+    if value_val is not None:
+        result["value"] = value_val
+        result["amount"] = value_val
     result["date"] = str(date_raw) if date_raw is not None else None
     # 하위 호환: clos / tvol 필드도 정규화 값으로 갱신
     if close_val is not None:
         result["clos"] = str(close_val)
-    if volume_val is not None:
-        result["tvol"] = str(volume_val)
+    result["tvol"] = str(volume_val)
     return result
 
 
 def normalize_daily_rows(symbol: str, rows: list[dict]) -> list[dict]:
     """일봉 row list를 정규화하고 필수 로그를 남긴다."""
     rows_raw = len(rows)
+    if rows and symbol not in _DAILY_RAW_KEYS_LOGGED:
+        _DAILY_RAW_KEYS_LOGGED.add(symbol)
+        logger.info(
+            "[US_DATA_PROVIDER][DAILY_RAW_KEYS] symbol=%s keys=%s",
+            symbol,
+            sorted(str(k) for k in rows[0].keys()),
+        )
     normalized = [normalize_daily_row(r) for r in rows]
     rows_norm = len(normalized)
     close_nonnull = sum(1 for r in normalized if r.get("close") is not None and r["close"] > 0)

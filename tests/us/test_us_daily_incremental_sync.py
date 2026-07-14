@@ -107,3 +107,31 @@ def test_invalid_latest_close_is_stale_and_zero_close_not_upserted():
     assert stale["quality"] == "STALE"
     synced=p.get_completed_daily_prices_result("BAD","NASDAQ",trade_date="2026-07-13",required_bars=260,allow_http_sync=True)
     assert c.calls == 1 and synced["quality"] == "OK" and synced["db_latest"] == "2026-07-10"
+
+
+def test_kis_dailyprice_value_field_not_mapped_to_volume():
+    from trader.us.data_provider import normalize_daily_row
+    raw = {"xymd": "20260710", "clos": "123.45", "high": "125", "low": "122", "acml_tr_pbmn": "1,234,567"}
+    row = normalize_daily_row(raw)
+    assert row["volume"] == 0
+    assert row["tvol"] == "0"
+    assert row["value"] == 1234567.0
+    assert row["amount"] == 1234567.0
+
+
+def test_kis_dailyprice_price_field_not_mapped_to_volume():
+    from trader.us.data_provider import normalize_daily_row
+    raw = {"xymd": "20260710", "clos": "123.45", "stck_sdpr": "99.99"}
+    row = normalize_daily_row(raw)
+    assert row["volume"] == 0
+    assert row["tvol"] == "0"
+
+
+def test_kis_dailyprice_real_volume_candidate_mapping():
+    from trader.us.data_provider import normalize_daily_row
+    row = normalize_daily_row({"xymd": "20260710", "clos": "123.45", "ovrs_vol": "2,345,678"})
+    assert row["volume"] == 2345678
+    assert row["tvol"] == "2345678"
+    row = normalize_daily_row({"xymd": "20260710", "clos": "123.45", "acml_vol": "3,456,789"})
+    assert row["volume"] == 3456789
+    assert row["tvol"] == "3456789"

@@ -276,3 +276,33 @@ def test_legacy_failed_cluster_contract_allows_exit(monkeypatch):
     assert guard["ok"] is True
     assert guard["entry_can_proceed"] is False
     assert guard["exit_can_proceed"] is True
+
+
+def test_volume_missing_fallback_permission_split_blocks_entry_by_default(monkeypatch):
+    from trader.us.prep_contract import build_us_prep_contract
+    monkeypatch.delenv("US_ALLOW_ENTRY_WITH_VOLUME_MISSING_FALLBACK", raising=False)
+    du, cp, wl, val, paths = _make_valid_inputs(30)
+    du.update({"volume_missing_fallback_used": True, "volume_missing_fallback_count": 50, "warnings": ["volume_missing_from_provider"]})
+    contract = build_us_prep_contract(
+        trade_date="2024-05-01", env="practice", status="OK_WITH_WARNINGS",
+        dynamic_universe_result=du, candidate_pool_result=cp, watchlist_result=wl, validation=val, paths=paths,
+    )
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["close_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "volume_missing_provider_entry_block"
+
+
+def test_volume_missing_fallback_permission_split_allows_entry_when_env_enabled(monkeypatch):
+    from trader.us.prep_contract import build_us_prep_contract
+    monkeypatch.setenv("US_ALLOW_ENTRY_WITH_VOLUME_MISSING_FALLBACK", "1")
+    du, cp, wl, val, paths = _make_valid_inputs(30)
+    du.update({"volume_missing_fallback_used": True, "volume_missing_fallback_count": 50, "warnings": ["volume_missing_from_provider"]})
+    contract = build_us_prep_contract(
+        trade_date="2024-05-01", env="practice", status="OK_WITH_WARNINGS",
+        dynamic_universe_result=du, candidate_pool_result=cp, watchlist_result=wl, validation=val, paths=paths,
+    )
+    assert contract["entry_can_proceed"] == 1
+    assert contract["exit_can_proceed"] == 1
+    assert contract["close_can_proceed"] == 1

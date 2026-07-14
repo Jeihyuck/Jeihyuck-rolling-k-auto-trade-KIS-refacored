@@ -194,9 +194,16 @@ def build_us_prep_contract(
     elif not allow_new_buy:
         trade_block_reason = "allow_new_buy_false"
 
+    volume_missing_fallback_used = bool(dynamic_universe_result.get("volume_missing_fallback_used"))
+    allow_entry_with_volume_missing = _env_int("US_ALLOW_ENTRY_WITH_VOLUME_MISSING_FALLBACK", 0) == 1
+
     exit_can_proceed = int(exit_quality_ok)
     close_can_proceed = int(not hard_system_failure)
     entry_can_proceed = int(trade_block_reason == "ok")
+    if volume_missing_fallback_used and not allow_entry_with_volume_missing:
+        entry_can_proceed = 0
+        if trade_block_reason == "ok":
+            trade_block_reason = "volume_missing_provider_entry_block"
     if cap_violations or not cluster_contract_ok:
         # Degrade to liveness/exit/reconcile; block new BUYs in risky clusters.
         entry_can_proceed = 0
@@ -256,6 +263,8 @@ def build_us_prep_contract(
         "close_can_proceed": close_can_proceed,
         "trade_block_reason": trade_block_reason,
         "degraded_reason": degraded_reason,
+        "volume_missing_fallback_used": volume_missing_fallback_used,
+        "volume_missing_fallback_count": int(dynamic_universe_result.get("volume_missing_fallback_count", 0) or 0),
         "raw_final30_count": final30_count,
         "effective_final30_count": final30_scored_count,
         "dynamic_universe_count": dynamic_universe_count,
