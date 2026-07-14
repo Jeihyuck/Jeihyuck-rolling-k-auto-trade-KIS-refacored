@@ -107,3 +107,11 @@ def test_invalid_latest_close_is_stale_and_zero_close_not_upserted():
     assert stale["quality"] == "STALE"
     synced=p.get_completed_daily_prices_result("BAD","NASDAQ",trade_date="2026-07-13",required_bars=260,allow_http_sync=True)
     assert c.calls == 1 and synced["quality"] == "OK" and synced["db_latest"] == "2026-07-10"
+
+
+def test_kis_dailyprice_volume_candidate_mapping():
+    from trader.us.data_provider import normalize_daily_row
+    raw = {"xymd": "20260710", "clos": "123.45", "high": "125", "low": "122", "acml_tr_pbmn": "1,234,567"}
+    row = normalize_daily_row(raw)
+    assert row["volume"] == 1234567
+    assert row["tvol"] == "1234567"

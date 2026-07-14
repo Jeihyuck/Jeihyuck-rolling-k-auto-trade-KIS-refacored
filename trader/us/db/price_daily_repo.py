@@ -55,6 +55,17 @@ def _num(v: Any, default: float | None = None) -> float | None:
         return default
 
 
+_VOLUME_CANDIDATE_KEYS = ("volume", "vol", "tvol", "acml_vol", "acml_tr_pbmn", "cntg_vol", "trqu", "tvol_qty", "ovrs_vol")
+
+
+def _first_positive_num(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
+    for key in keys:
+        v = _num(row.get(key), None)
+        if v is not None and v > 0:
+            return v
+    return default
+
+
 def _row_from_bar(symbol: str, bar: dict, source: str) -> dict | None:
     d = _bar_date(bar)
     close = _num(bar.get("close", bar.get("clos", bar.get("stck_clpr"))))
@@ -63,7 +74,7 @@ def _row_from_bar(symbol: str, bar: dict, source: str) -> dict | None:
     open_v = _num(bar.get("open", bar.get("stck_oprc")), close)
     high_v = _num(bar.get("high", bar.get("stck_hgpr")), close)
     low_v = _num(bar.get("low", bar.get("stck_lwpr")), close)
-    vol = _num(bar.get("volume", bar.get("tvol", bar.get("acml_vol"))), 0.0) or 0.0
+    vol = _first_positive_num(bar, _VOLUME_CANDIDATE_KEYS, 0.0)
     value = _num(bar.get("value", bar.get("amount")), None)
     return {
         "market": "US", "code": normalize_us_price_symbol(symbol), "date": d,
@@ -151,10 +162,19 @@ def upsert_us_daily_bars(*, symbol: str, bars: list[dict], source: str = "KIS_US
     if not clean:
         return 0
     engine = _engine_or_none()
+    volume_preserved_count = 0
     if engine is None:
-        for r in clean:
-            _MEM_US_DAILY[(sym, r["date"])] = r
-        logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d source=%s", sym, len(bars or []), len(clean), source)
+        for i, r in enumerate(clean):
+            key = (sym, r["date"])
+            old = _MEM_US_DAILY.get(key)
+            if int(r.get("volume") or 0) <= 0 and old and int(old.get("volume") or 0) > 0:
+                r = {**r, "volume": int(old.get("volume") or 0)}
+                clean[i] = r
+                volume_preserved_count += 1
+            _MEM_US_DAILY[key] = r
+        volume_nonnull = sum(1 for r in clean if int(r.get("volume") or 0) > 0)
+        volume_zero_count = sum(1 for r in clean if int(r.get("volume") or 0) <= 0)
+        logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d source=%s volume_nonnull=%d volume_zero_count=%d volume_preserved_count=%d", sym, len(bars or []), len(clean), source, volume_nonnull, volume_zero_count, volume_preserved_count)
         return len(clean)
     with engine.begin() as conn:
         for r in clean:
@@ -163,10 +183,26 @@ def upsert_us_daily_bars(*, symbol: str, bars: list[dict], source: str = "KIS_US
                 VALUES ('US', :symbol, :date, :open, :high, :low, :close, :volume, :value, :source)
                 ON CONFLICT (market, code, date)
                 DO UPDATE SET open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
-                              close = EXCLUDED.close, volume = EXCLUDED.volume,
+                              close = EXCLUDED.close,
+                              volume = CASE
+                                  WHEN COALESCE(EXCLUDED.volume, 0) <= 0 AND COALESCE(price_daily.volume, 0) > 0
+                                  THEN price_daily.volume ELSE EXCLUDED.volume END,
                               value = EXCLUDED.value, source = EXCLUDED.source
             """), {"symbol": sym, **r})
-    logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d source=%s", sym, len(bars or []), len(clean), source)
+            if int(r.get("volume") or 0) <= 0:
+                preserved = int(conn.execute(text("""
+                    SELECT CASE WHEN COALESCE(volume, 0) > 0 THEN 1 ELSE 0 END AS preserved
+                    FROM price_daily WHERE market='US' AND code=:symbol AND date=:date
+                """), {"symbol": sym, "date": r["date"]}).scalar() or 0)
+                volume_preserved_count += preserved
+                if preserved:
+                    r["volume"] = int(conn.execute(text("""
+                        SELECT COALESCE(volume, 0) FROM price_daily
+                        WHERE market='US' AND code=:symbol AND date=:date
+                    """), {"symbol": sym, "date": r["date"]}).scalar() or 0)
+    volume_nonnull = sum(1 for r in clean if int(r.get("volume") or 0) > 0)
+    volume_zero_count = sum(1 for r in clean if int(r.get("volume") or 0) <= 0)
+    logger.info("[US_OHLCV][UPSERT] symbol=%s fetched=%d upserted=%d source=%s volume_nonnull=%d volume_zero_count=%d volume_preserved_count=%d", sym, len(bars or []), len(clean), source, volume_nonnull, volume_zero_count, volume_preserved_count)
     return len(clean)
 
 

@@ -296,3 +296,55 @@ def test_filter_log_strict_relaxed_fallback(caplog):
     assert "[US_UNIVERSE_BUILDER][FILTER][STRICT]" in log_text
     assert "[US_UNIVERSE_BUILDER][FILTER][RELAXED]" in log_text
     assert "[US_UNIVERSE_BUILDER][FILTER][FALLBACK]" in log_text
+
+
+def test_volume_missing_provider_fallback_avoids_hard_fail():
+    """260 bars with close history but zero provider volume should pass >=30 as warning fallback."""
+    from trader.us.universe_builder import build_us_dynamic_universe
+
+    symbols = [f"T{i:03d}" for i in range(50)]
+    provider = MagicMock()
+    provider.get_current_price.return_value = {"last": "120"}
+    provider.get_daily_prices.return_value = _make_daily(260, close=120.0, volume=0)
+
+    with _PATCH_DYNAMIC:
+        result = build_us_dynamic_universe(
+            trade_date="2026-05-29",
+            env="practice",
+            provider=provider,
+            manual_seed=symbols,
+            force_rebuild=True,
+        )
+
+    assert result["status"] == "OK_WITH_WARNINGS"
+    assert result["filtered_count"] >= 30
+    assert result["volume_missing_fallback_used"] is True
+    assert result["filter_counts"].get("failed_volume", 0) == 0
+    assert all(s["filter_mode"] == "fallback_price_history_only" for s in result["symbols"])
+
+
+def test_regression_filtered_20_hard_fail_becomes_warning_with_volume_fallback_candidates():
+    """Regression: previous 20 strict pass + many zero-volume history candidates should not ERROR."""
+    from trader.us.universe_builder import build_us_dynamic_universe
+
+    symbols = [f"R{i:03d}" for i in range(50)]
+    provider = MagicMock()
+    provider.get_current_price.return_value = {"last": "120"}
+
+    def daily_for(symbol, exchange, as_of_date=None):
+        idx = int(symbol[1:])
+        return _make_daily(260, close=120.0, volume=(2_000_000 if idx < 20 else 0))
+
+    provider.get_daily_prices.side_effect = daily_for
+    with _PATCH_DYNAMIC:
+        result = build_us_dynamic_universe(
+            trade_date="2026-05-29",
+            env="practice",
+            provider=provider,
+            manual_seed=symbols,
+            force_rebuild=True,
+        )
+
+    assert result["status"] == "OK_WITH_WARNINGS"
+    assert result["filtered_count"] >= 30
+    assert result["volume_missing_fallback_count"] >= 30

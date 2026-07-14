@@ -21,3 +21,11 @@ def test_recent_us_daily_returns_limit_ascending_excludes_trade_date():
     assert rows[-1]["date"] < "2026-07-10"
     audit = audit_us_daily_history(symbol="NVDA", before_date="2026-07-10", required_bars=260)
     assert audit["enough_history"] is True and audit["invalid_close_count"] == 0
+
+
+def test_upsert_preserves_existing_nonzero_volume_when_incoming_zero():
+    upsert_us_daily_bars(symbol="NVDA", bars=[{"date": "2026-07-09", "close": 100, "volume": 100000}], source="OLD")
+    upsert_us_daily_bars(symbol="NVDA", bars=[{"date": "2026-07-09", "close": 101, "volume": 0}], source="NEW")
+    rows = load_recent_us_daily_bars(symbol="NVDA", before_date="2026-07-10", limit=10)
+    assert rows[-1]["close"] == 101
+    assert rows[-1]["volume"] == 100000

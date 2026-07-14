@@ -563,6 +563,15 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         cap_violations = list(contract.get("cap_violations") or [])
 
         logger.info(
+            "[US_PREP][PERMISSION] trade_can_proceed=%d entry_can_proceed=%d exit_can_proceed=%d close_can_proceed=%d reason=%s",
+            trade_can_proceed,
+            int(contract.get("entry_can_proceed", 0) or 0),
+            int(contract.get("exit_can_proceed", 0) or 0),
+            int(contract.get("close_can_proceed", 0) or 0),
+            trade_block_reason,
+        )
+
+        logger.info(
             "[US_PREP][FINAL_STATUS] final=%s final30=%d score_nonzero=%d contract_ok=%d "
             "trade_can_proceed=%d trade_block_reason=%s underfilled_tier=%s "
             "effective_capital_scale=%s effective_max_new_positions=%s",

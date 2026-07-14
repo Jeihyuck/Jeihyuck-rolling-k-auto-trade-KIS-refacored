@@ -317,12 +317,14 @@ def build_us_dynamic_universe(
         "failed_dollar_volume": 0,
         "failed_history": 0,
         "failed_atr": 0,
+        "volume_missing_provider": 0,
     }
 
     # 3단계 버킷
     strict_pass: list[dict] = []
     relaxed_pass: list[dict] = []
     fallback_pass: list[dict] = []
+    volume_missing_fallback_pass: list[dict] = []
 
     # 실패 상세 추적 (수정 6)
     _fail_details: list[dict] = []
@@ -418,6 +420,19 @@ def build_us_dynamic_universe(
             and avg_dv > 0
         )
 
+        # provider volume missing fallback: price/history/ATR are sound, but provider sent no volume.
+        volume_missing_provider = (
+            volume_nonnull == 0
+            and close_nonnull >= relaxed_history_days
+            and history_days >= relaxed_history_days
+        )
+        volume_missing_fallback_ok = (
+            price_ok
+            and latest_close is not None
+            and volume_missing_provider
+            and (atr_pct is None or atr_pct <= max_atr_pct)
+        )
+
         # fallback 조건 평가 (수정 5: core seed는 price만 있으면 허용)
         is_core_seed = symbol in _CORE_SEED_SYMBOLS or "manual_seed" in ticker_tags.get(symbol, [])
         fallback_ok = price_ok and (latest_close is not None) and is_core_seed
@@ -439,6 +454,14 @@ def build_us_dynamic_universe(
             strict_pass.append({**base_entry, "filter_mode": "strict"})
         elif relaxed_ok:
             relaxed_pass.append({**base_entry, "filter_mode": "relaxed"})
+        elif volume_missing_fallback_ok:
+            volume_missing_fallback_pass.append({
+                **base_entry,
+                "filter_mode": "fallback_price_history_only",
+                "warning": "volume_missing_from_provider",
+                "reason": "volume_missing_provider_fallback",
+            })
+            filter_counts["volume_missing_provider"] += 1
         elif fallback_ok:
             fallback_pass.append({
                 **base_entry,
@@ -454,6 +477,9 @@ def build_us_dynamic_universe(
             elif history_days < relaxed_history_days:
                 fail_reason = "failed_history"
                 filter_counts["failed_history"] += 1
+            elif volume_missing_provider:
+                fail_reason = "volume_missing_provider"
+                filter_counts["volume_missing_provider"] += 1
             elif avg_vol < min_avg_volume:
                 fail_reason = "failed_volume"
                 filter_counts["failed_volume"] += 1
@@ -482,6 +508,11 @@ def build_us_dynamic_universe(
     logger.info("[US_UNIVERSE_BUILDER][FILTER][STRICT] passed=%d", len(strict_pass))
     logger.info("[US_UNIVERSE_BUILDER][FILTER][RELAXED] passed=%d", len(relaxed_pass))
     logger.info("[US_UNIVERSE_BUILDER][FILTER][FALLBACK] passed=%d", len(fallback_pass))
+    logger.warning("[US_UNIVERSE_BUILDER][VOLUME_MISSING_FALLBACK] count=%d", len(volume_missing_fallback_pass))
+    logger.info(
+        "[US_UNIVERSE_BUILDER][FILTER_MODE_COUNTS] strict=%d relaxed=%d volume_missing_fallback=%d seed_fallback=%d",
+        len(strict_pass), len(relaxed_pass), len(volume_missing_fallback_pass), len(fallback_pass),
+    )
 
     # ── 최종 selected 구성 (strict 우선) ─────────────────────────────────
     # strict → relaxed → fallback 순으로 누적
@@ -489,6 +520,11 @@ def build_us_dynamic_universe(
     selected_set: set[str] = {s["symbol"] for s in filtered_symbols}
 
     for entry in relaxed_pass:
+        if entry["symbol"] not in selected_set:
+            filtered_symbols.append(entry)
+            selected_set.add(entry["symbol"])
+
+    for entry in volume_missing_fallback_pass:
         if entry["symbol"] not in selected_set:
             filtered_symbols.append(entry)
             selected_set.add(entry["symbol"])
@@ -538,10 +574,14 @@ def build_us_dynamic_universe(
             )
 
     # ── 상태 결정 (수정 7) ────────────────────────────────────────────────
+    volume_missing_fallback_used = bool(volume_missing_fallback_pass)
+    if volume_missing_fallback_used:
+        warnings.append("volume_missing_from_provider")
+
     if filtered_count < 30:
         status = "ERROR"
         errors.append(f"filtered_count={filtered_count} < hard_min=30")
-        logger.error("[US_UNIVERSE_BUILDER][ERROR] filtered_count=%d < 30 → hard fail", filtered_count)
+        logger.error("[US_UNIVERSE_BUILDER][ERROR] filtered_count=%d < 30 hard fail reason=insufficient_price_history_atr_candidates volume_missing_fallback=%d", filtered_count, len(volume_missing_fallback_pass))
     elif filtered_count < 80:
         status = "OK_WITH_WARNINGS"
         warnings.append(f"filtered_count={filtered_count} < 80 (used_relaxed_or_fallback)")
@@ -572,4 +612,6 @@ def build_us_dynamic_universe(
         "symbols": filtered_symbols,
         "warnings": warnings,
         "errors": errors,
+        "volume_missing_fallback_used": volume_missing_fallback_used,
+        "volume_missing_fallback_count": len(volume_missing_fallback_pass),
     }
