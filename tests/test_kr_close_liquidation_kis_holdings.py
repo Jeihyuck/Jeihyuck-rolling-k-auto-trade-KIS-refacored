@@ -22,12 +22,9 @@ def test_close_final30_empty_bypass_and_kis_holding_sell_intent(monkeypatch, cap
         {"code": "000660", "qty": 1},
     ])
 
-    assert len(orders) == 1
-    assert orders[0]["code"] == "000660"
-    assert orders[0]["side"] == "SELL"
-    assert orders[0]["reason"] == "KR_CLOSE_LIQUIDATION_KIS_HOLDING"
+    assert orders == []
     logs = caplog.text
     assert "TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS" not in logs
     assert "[TRADE][ENGINE_BOOT][FINAL30_BYPASS_FOR_CLOSE_EXIT]" in logs
-    assert "[KR_CLOSE][SELL][INTENT] code=000660 qty=1 reason=KR_CLOSE_LIQUIDATION_KIS_HOLDING" in logs
+    assert "[KR_CLOSE][LIQUIDATION][BLOCKED] reason=MISSING_EXPLICIT_CONFIRM" in logs
     assert "EXIT_SHORTCIRCUIT" not in logs

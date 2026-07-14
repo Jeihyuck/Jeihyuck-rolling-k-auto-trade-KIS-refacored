@@ -501,7 +501,6 @@ def normalize_kr_session_completion(
         "ENTRY_EXIT_PLAN_MISSING_OR_INVALID",
         "ALL_CANDIDATES_SKIPPED_BEFORE_API_SUBMIT",
         "RETRYABLE_ORDER_BUILD_ERROR",
-        "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
     }
     retryable_order_build_reasons = {
         "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
@@ -512,6 +511,21 @@ def normalize_kr_session_completion(
     }
     pb1_status_u = str(pb1_status or "").upper()
     pb1_exit_reason_s = str(pb1_exit_reason or "")
+    policy_block_reasons = {
+        "BUYABLE_EXISTING_HOLDING_KIS",
+        "BUYABLE_TODAY_BUY_EXISTS",
+        "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
+        "BUYABLE_COOLDOWN",
+        "BUYABLE_DUPLICATE",
+        "MARKET_RISK_OFF_ENTRY_BLOCK",
+        "SECTOR_CAP_BLOCK",
+        "GROSS_EXPOSURE_CAP",
+        "CASH_INSUFFICIENT",
+        "MAX_POSITIONS_REACHED",
+    }
+
+    if pb1_exit_reason_s.upper() in policy_block_reasons:
+        return "OK_NO_TRADE", pb1_exit_reason_s, 1, 0
 
     if pb1_status_u == "RETRYABLE_ORDER_BUILD_ERROR" or pb1_exit_reason_s in retryable_order_build_reasons:
         reason = pb1_exit_reason_s if pb1_exit_reason_s in retryable_order_build_reasons else "RETRYABLE_ORDER_BUILD_ERROR"
@@ -551,7 +565,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         os.environ["PB1_ENTRY_ENABLED"] = "0"
         os.environ["PB1_EXIT_ENABLED"] = "1"
         os.environ["PB1_CLOSE_ENABLED"] = "1"
-        os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] = "1"
+        os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] = os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", "0")
         os.environ["KR_CLOSE_SESSION"] = "1"
         phase_marker = ROOT / "runtime/kr/session" / ctx.trade_date.isoformat() / "close" / "phase.json"
         phase_marker.parent.mkdir(parents=True, exist_ok=True)
@@ -565,7 +579,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
                     "entry_enabled": False,
                     "exit_enabled": True,
                     "close_enabled": True,
-                    "close_liquidation_enabled": True,
+                    "close_liquidation_enabled": False,
                     "created_at_kst": _now_kst().isoformat(),
                 },
                 ensure_ascii=False,
@@ -573,7 +587,17 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             ),
             encoding="utf-8",
         )
-        logger.info("[KR_CLOSE][PHASE] phase=close entry_enabled=0 exit_enabled=1 close_enabled=1 close_liquidation_enabled=1")
+        logger.info("[KR_CLOSE][PHASE] phase=close entry_enabled=0 exit_enabled=1 close_enabled=1 close_liquidation_enabled=0")
+
+    # KR PR #61 권한 모델: entry block must not kill exit/close liveness.
+    kr_entry_can_proceed = str(os.getenv("PB1_ENTRY_ENABLED", "1")).strip() == "1"
+    kr_exit_can_proceed = str(os.getenv("PB1_EXIT_ENABLED", "1")).strip() == "1"
+    kr_close_can_proceed = session == "close" or str(os.getenv("PB1_CLOSE_ENABLED", "1")).strip() == "1"
+    kr_session_can_run = kr_entry_can_proceed or kr_exit_can_proceed or kr_close_can_proceed
+    logger.info(
+        "[KR_SESSION][PERMISSION] entry_can_proceed=%s exit_can_proceed=%s close_can_proceed=%s session_can_run=%s",
+        int(kr_entry_can_proceed), int(kr_exit_can_proceed), int(kr_close_can_proceed), int(kr_session_can_run),
+    )
     guarded = _guard_trade_session(session, ctx)
     if guarded is not None:
         return guarded

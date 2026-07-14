@@ -27,7 +27,7 @@ def test_close_session_forces_close_env_and_does_not_skip(monkeypatch, tmp_path)
     assert runner.os.environ["FORCE_MARKET_WINDOW"] == "close"
     assert runner.os.environ["PB1_EXIT_ENABLED"] == "1"
     assert runner.os.environ["PB1_CLOSE_ENABLED"] == "1"
-    assert runner.os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] == "1"
+    assert runner.os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] == "0"
     assert runner.os.environ["KR_CLOSE_SESSION"] == "1"
     assert result["reason"] != "SKIP_PHASE_WINDOW"
 
@@ -69,7 +69,7 @@ def test_diagnostics_manifest_reads_close_phase_marker(monkeypatch, tmp_path):
             "entry_enabled": False,
             "exit_enabled": True,
             "close_enabled": True,
-            "close_liquidation_enabled": True,
+            "close_liquidation_enabled": False,
         }),
         encoding="utf-8",
     )
@@ -89,5 +89,5 @@ def test_diagnostics_manifest_reads_close_phase_marker(monkeypatch, tmp_path):
         "entry_enabled": False,
         "exit_enabled": True,
         "close_enabled": True,
-        "close_liquidation_enabled": True,
+        "close_liquidation_enabled": False,
     }

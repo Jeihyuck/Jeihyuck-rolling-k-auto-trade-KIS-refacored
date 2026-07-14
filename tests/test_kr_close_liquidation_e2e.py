@@ -18,7 +18,7 @@ class FakeKis:
         return {"rt_cd": "0", "msg_cd": "OK", "msg1": "accepted", "output": {"ODNO": "1"}}
 
 
-def test_close_path_empty_final30_allows_kis_sell_submit(monkeypatch, caplog):
+def test_close_path_empty_final30_blocks_kis_sell_without_confirm(monkeypatch, caplog):
     caplog.set_level(logging.INFO)
     monkeypatch.setenv("PB1_SESSION_KIND", "close")
     monkeypatch.setenv("FORCE_PB1_PHASE", "exit")
@@ -36,17 +36,12 @@ def test_close_path_empty_final30_allows_kis_sell_submit(monkeypatch, caplog):
     fake_kis = FakeKis([{"code": "000660", "qty": 1}])
     results = pb1_runner.run_close_liquidation_from_kis_holdings(kis_client=fake_kis, env="practice")
 
-    assert fake_kis.sell_calls == [{"code": "000660", "qty": 1, "reason": "KR_CLOSE_LIQUIDATION_KIS_HOLDING"}]
-    assert len(results) == 1
-    assert "dry_run" not in results[0]
-    assert results[0]["result"] in {"ACCEPTED", "SUBMITTED", "OK"}
+    assert fake_kis.sell_calls == []
+    assert results == []
     logs = caplog.text
     assert "TRADE_FINAL30_EMPTY_AFTER_ALL_FALLBACKS" not in logs
     assert "DB_EXACT_FINAL30_ZERO" not in logs
     assert "EXIT_SHORTCIRCUIT" not in logs
-    assert "[ORDER][API_CALL][START] side=SELL code=000660" in logs
-    assert "[KIS][ORDER][RESPONSE] side=SELL code=000660 rt_cd=0" in logs
-    assert "[TRADE][ORDER][SELL] code=000660 result=ACCEPTED" in logs
     assert "DRY_RUN" not in logs
     assert "INTENT_ONLY" not in logs
     assert "LIVE_TRADING_ENABLED=0" not in logs
@@ -59,4 +54,4 @@ def test_close_path_no_holdings_skips_normally(caplog):
     results = pb1_runner.run_close_liquidation_from_kis_holdings(kis_client=fake_kis, env="practice")
     assert results == []
     assert fake_kis.sell_calls == []
-    assert "[KR_CLOSE][LIQUIDATION][SKIP] reason=NO_KIS_HOLDINGS" in caplog.text
+    assert "[KR_CLOSE][LIQUIDATION][BLOCKED] reason=MISSING_EXPLICIT_CONFIRM" in caplog.text

@@ -2409,6 +2409,8 @@ class PB1Engine:
         self._entry_evaluations: list[dict[str, Any]] = []
         self._exit_evaluations: list[dict[str, Any]] = []
         self._exit_summary_payload: dict[str, Any] = {}
+        self.session_exit_submitted_codes: set[str] = set()
+        self.no_sellable_qty_terminal_codes: set[str] = set()
         self._exit_holdings_meta: dict[str, Any] = {
             "source": "empty",
             "snapshot_ts": self._now_kst.isoformat(),
@@ -11586,10 +11588,21 @@ class PB1Engine:
             strategy_qty,
             sell_qty,
         )
+        if display_code in self.session_exit_submitted_codes:
+            exit_eval_payload["order_skip_reasons"] = ["ALREADY_SUBMITTED_THIS_SESSION"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_ALREADY_SUBMITTED"
+            logger.info("[EXIT][SKIP_ALREADY_SUBMITTED] code=%s", display_code)
+            return exit_eval_payload
+        if display_code in self.no_sellable_qty_terminal_codes:
+            exit_eval_payload["order_skip_reasons"] = ["NO_SELLABLE_QTY_TERMINAL"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY_TERMINAL"
+            logger.info("[EXIT][TERMINAL_NO_SELLABLE_QTY] code=%s", display_code)
+            return exit_eval_payload
         if sell_qty <= 0:
             exit_eval_payload["order_skip_reasons"] = ["NO_SELLABLE_QTY"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY"
-            logger.info("[EXIT][ORDER_SKIP] code=%s reason=NO_SELLABLE_QTY", display_code)
+            self.no_sellable_qty_terminal_codes.add(display_code)
+            logger.info("[EXIT][TERMINAL_NO_SELLABLE_QTY] code=%s", display_code)
             return exit_eval_payload
         orderable_qty = sell_qty
 
@@ -11802,6 +11815,7 @@ class PB1Engine:
         )
         if ok:
             exit_eval_payload["submitted"] = 1
+            self.session_exit_submitted_codes.add(display_code)
             try:
                 self.orders_repo.mark_acked(self.env, kis_odno, resp)
                 logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
@@ -17438,6 +17452,26 @@ class PB1Engine:
                         buyable_ok_count=len(buyable_ok_codes),
                         order_candidates_count=len(orderable_candidates),
                     )
+                    policy_block_reasons = {
+                        "BUYABLE_EXISTING_HOLDING_KIS",
+                        "BUYABLE_TODAY_BUY_EXISTS",
+                        "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
+                        "BUYABLE_COOLDOWN",
+                        "BUYABLE_DUPLICATE",
+                        "MARKET_RISK_OFF_ENTRY_BLOCK",
+                        "SECTOR_CAP_BLOCK",
+                        "GROSS_EXPOSURE_CAP",
+                        "CASH_INSUFFICIENT",
+                        "MAX_POSITIONS_REACHED",
+                    }
+                    top_policy_blocker = next(
+                        (
+                            str(reason)
+                            for reason, count in getattr(drop_reason_counter, "items", lambda: [])()
+                            if int(count or 0) > 0 and str(reason).upper() in policy_block_reasons
+                        ),
+                        "",
+                    )
                     plan_skip_reasons = [
                         str(r)
                         for r in getattr(self, "_last_order_skip_reasons", [])
@@ -17445,14 +17479,23 @@ class PB1Engine:
                         or "entry_order_plan" in str(r).lower()
                         or "entry_exit_plan" in str(r).lower()
                     ]
-                    final_status = "RETRYABLE_ORDER_BUILD_ERROR"
-                    final_notes = "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT"
+                    if top_policy_blocker and not plan_skip_reasons:
+                        final_status = "OK_NO_TRADE"
+                        final_notes = top_policy_blocker
+                        logger.info(
+                            "[KR][ORDER_ZERO_API][POLICY_BLOCK] order_candidates=%s api_submitted=0 reason=%s",
+                            len(orderable_candidates),
+                            top_policy_blocker,
+                        )
+                    else:
+                        final_status = "RETRYABLE_ORDER_BUILD_ERROR"
+                        final_notes = "ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT"
+                        logger.error(
+                            "[KR][ORDER_ZERO_API][FAIL] order_candidates=%s api_submitted=0 reason=ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
+                            len(orderable_candidates),
+                        )
                     os.environ["PB1_LAST_RESULT_STATUS"] = final_status
                     os.environ["PB1_LAST_EXIT_REASON"] = final_notes
-                    logger.error(
-                        "[KR][ORDER_ZERO_API][FAIL] order_candidates=%s api_submitted=0 reason=ORDER_CANDIDATE_BUT_ZERO_API_SUBMIT",
-                        len(orderable_candidates),
-                    )
                     if os.getenv("PB1_HARD_FAIL_ON_CANDIDATE_WITHOUT_API_SUBMIT", "0") == "1":
                         raise RuntimeError(
                             f"[KR][ORDER_ZERO_API][FAIL] order_candidates={len(orderable_candidates)} api_submitted=0"
