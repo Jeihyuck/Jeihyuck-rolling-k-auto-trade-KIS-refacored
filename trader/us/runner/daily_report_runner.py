@@ -574,6 +574,9 @@ def run_daily_report(
             
             # Positions
             try:
+                final_balance_positions = _load_close_final_balance_positions(trade_date)
+                if final_balance_positions:
+                    logger.info("[US_DAILY_REPORT][POSITION_SOURCE] source=kis_authoritative positions=%d", len(final_balance_positions))
                 positions = load_positions(as_of=trade_date)
                 report["positions"] = len(positions)
                 report["position_count"] = len(positions)
@@ -583,10 +586,9 @@ def run_daily_report(
                 report["new_symbol_slots_available"] = report["available_new_slots"]
                 report["full_position"] = report["available_new_slots"] <= 0
                 invested = sum(_position_market_value_usd(pos) for pos in positions)
-                final_balance_positions = _load_close_final_balance_positions(trade_date)
                 final_balance_invested = sum(_position_market_value_usd(pos) for pos in final_balance_positions)
                 canonical_positions = positions
-                if final_balance_positions and (not positions or invested <= 0):
+                if final_balance_positions and (not positions or invested <= 0 or len(final_balance_positions) > len(positions)):
                     canonical_positions = final_balance_positions
                     invested = final_balance_invested
                     report["positions"] = len(canonical_positions)
@@ -627,6 +629,25 @@ def run_daily_report(
                 except Exception as exc:
                     logger.warning("[US_DAILY_REPORT][CAPITAL][WARN] %s", exc)
             except Exception as exc:
+                try:
+                    final_balance_positions = _load_close_final_balance_positions(trade_date)
+                except Exception:
+                    final_balance_positions = []
+                if final_balance_positions:
+                    invested = sum(_position_market_value_usd(pos) for pos in final_balance_positions)
+                    report["positions"] = len(final_balance_positions)
+                    report["position_count"] = len(final_balance_positions)
+                    report["open_position_count"] = len(final_balance_positions)
+                    report["open_position_symbols"] = sorted({str(p.get("symbol") or p.get("pdno") or "").upper() for p in final_balance_positions if p.get("symbol") or p.get("pdno")})
+                    report["invested_market_value_usd"] = invested
+                    report["gross_exposure_usd"] = invested
+                    report["canonical_position_source"] = "kis_final_balance"
+                    report["report_consistency"] = "DEGRADED_DB_FALLBACK_TO_KIS"
+                    report["warnings"].append("db_error_but_kis_authoritative_positions_used")
+                    logger.info("[US_DAILY_REPORT][POSITION_SOURCE] source=kis_authoritative positions=%d", len(final_balance_positions))
+                else:
+                    report["warnings"].append("position_source_unavailable")
+                    report["report_consistency"] = "FAILED"
                 report["warnings"].append(f"positions_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] positions load failed: %s", exc)
 
@@ -741,7 +762,13 @@ def run_daily_report(
         report["errors"].append("REPORT_VALIDATION_FAILED: positions_zero_but_open_position_symbols_present")
     if str(report.get("started_at_utc") or "") == str(report.get("ended_at_utc") or "") and float(report.get("wall_elapsed_sec") or 0) > 1:
         report["errors"].append("REPORT_VALIDATION_FAILED: identical_start_end_with_elapsed")
-    if any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
+    if int(report.get("close_kis_position_count", 0) or 0) > 0 and int(report.get("open_position_count", 0) or 0) == 0:
+        report["report_consistency"] = "FAILED"
+        report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
+        logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
+    if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
+        pass
+    elif any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
         report["report_consistency"] = "SOURCE_MISMATCH"
     else:
         report["report_consistency"] = (report.get("canonical_sources") or {}).get("report_consistency", "OK")

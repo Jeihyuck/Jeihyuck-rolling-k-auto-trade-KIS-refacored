@@ -22,7 +22,7 @@ def test_underfilled_final30_degrades_but_session_can_proceed():
 
 def test_cluster_cap_warning_allows_liveness_but_blocks_entry():
     c = _base(24, cluster_ok=False, cap=["SINGLE_CLUSTER"])
-    assert c["trade_can_proceed"] == 0
+    assert c["trade_can_proceed"] == 1
     assert c["entry_can_proceed"] == 0
     assert c["exit_can_proceed"] == 1
     assert c["cluster_contract_ok"] is False

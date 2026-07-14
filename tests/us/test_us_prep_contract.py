@@ -121,8 +121,8 @@ def test_build_us_prep_contract_trade_can_proceed_ok():
     assert contract["trade_can_proceed"] == 1
 
 
-def test_build_us_prep_contract_validation_fail_blocks():
-    """validation ok=False → trade_can_proceed=0이어야 한다."""
+def test_build_us_prep_contract_validation_fail_blocks_entry_and_exit_only():
+    """validation ok=False blocks entry/exit quality but close liveness remains explicit."""
     try:
         from trader.us.prep_contract import build_us_prep_contract
     except ImportError:
@@ -142,7 +142,10 @@ def test_build_us_prep_contract_validation_fail_blocks():
         paths=paths,
     )
 
-    assert contract["trade_can_proceed"] == 0
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 0
+    assert contract["close_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
 
 
 def test_build_us_prep_contract_final30_less_than_30_allows_safe_underfilled():
@@ -235,3 +238,41 @@ def test_check_us_prep_guard_blocks_when_no_contract(tmp_path):
          patch("trader.us.path_contract.us_signals_latest_prep_contract_path", return_value=missing):
         guard = check_us_prep_guard("2024-05-01")
         assert guard["ok"] is False
+
+
+def test_cluster_cap_blocks_entry_but_allows_exit_and_close():
+    from trader.us.prep_contract import build_us_prep_contract
+    du, cp, wl, val, paths = _make_valid_inputs(17)
+    wl.update({
+        "cluster_contract_ok": False,
+        "cap_violations": ["SINGLE_CLUSTER", "AI_TECH_COMBINED"],
+        "market_state_overlay": {"market_regime": "DEFENSIVE", "allow_new_buy": True},
+    })
+    contract = build_us_prep_contract(
+        trade_date="2026-07-13", env="practice", status="OK",
+        dynamic_universe_result=du, candidate_pool_result=cp, watchlist_result=wl,
+        validation=val, paths=paths,
+    )
+    assert contract["entry_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
+    assert contract["close_can_proceed"] == 1
+    assert contract["trade_can_proceed"] == 1
+    assert contract["effective_max_new_positions"] == 0
+    assert contract["status"].startswith("OK_WITH_WARNINGS_ENTRY_BLOCKED")
+
+
+def test_legacy_failed_cluster_contract_allows_exit(monkeypatch):
+    import trader.us.prep_contract as pc
+    legacy_contract = {
+        "trade_date": "2026-07-13",
+        "status": "FAILED_CLUSTER_CAP_CONTRACT",
+        "trade_can_proceed": 0,
+        "trade_block_reason": "sector_cap_violation_block",
+        "final30_scored_count": 17,
+        "score_nonzero_count": 17,
+    }
+    monkeypatch.setattr("trader.us.path_contract.load_us_prep_contract", lambda trade_date: legacy_contract)
+    guard = pc.check_us_prep_guard("2026-07-13", session="am")
+    assert guard["ok"] is True
+    assert guard["entry_can_proceed"] is False
+    assert guard["exit_can_proceed"] is True
