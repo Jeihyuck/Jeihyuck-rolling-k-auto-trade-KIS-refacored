@@ -691,6 +691,12 @@ def run_trade_tick(
         "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s entry_can_proceed=%d exit_can_proceed=%d",
         session, env, offline, run_mode, signal_only, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)),
     )
+    if not exit_can_proceed:
+        entry_can_proceed = False
+        logger.error(
+            "[US_EXIT][DISABLED] session=%s reason=exit_can_proceed_false action=skip_exit_and_block_entry",
+            session,
+        )
     last_stage = "tick_start"
 
     # ── 변수 사전 초기화 (reconcile 실패 시 UnboundLocalError 방지) ──────────
@@ -1158,6 +1164,9 @@ def run_trade_tick(
     logger.info("[US_EXIT][EVAL][START] session=%s positions=%d", session, position_count)
     exit_intents: list[dict] = []
     try:
+        if not exit_can_proceed:
+            logger.error("[US_EXIT_EVAL][SKIP] session=%s tick=%s reason=exit_can_proceed_false", session, tick_index)
+            raise RuntimeError("exit_can_proceed_false")
         engine = _get_strategy_engine(env=env, offline=offline)
         is_default_pb1_engine = engine.__class__.__module__ == "trader.us.pb1.us_pb1_engine"
         if not is_default_pb1_engine:
@@ -1217,7 +1226,10 @@ def run_trade_tick(
                     seen_sell_symbols.add(sym)
                 exit_intents.append(intent)
     except Exception as exc:
-        logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
+        if str(exc) == "exit_can_proceed_false":
+            logger.error("[US_EXIT][EVAL][DISABLED] session=%s tick=%s positions_evaluated=0", session, tick_index)
+        else:
+            logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT_EVAL][SUMMARY] session=%s tick=%s positions_evaluated=%d sell_candidates=%d sell_orders=%d", session, tick_index, len(current_positions), len([i for i in exit_intents if str(i.get("side") or "").upper()=="SELL"]), 0)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
 

@@ -121,8 +121,8 @@ def test_build_us_prep_contract_trade_can_proceed_ok():
     assert contract["trade_can_proceed"] == 1
 
 
-def test_build_us_prep_contract_validation_fail_blocks_entry_and_exit_only():
-    """validation ok=False blocks entry/exit quality but close liveness remains explicit."""
+def test_build_us_prep_contract_validation_fail_blocks_entry_only():
+    """watchlist validation ok=False blocks entry only; exit/close liveness remains explicit."""
     try:
         from trader.us.prep_contract import build_us_prep_contract
     except ImportError:
@@ -143,7 +143,7 @@ def test_build_us_prep_contract_validation_fail_blocks_entry_and_exit_only():
     )
 
     assert contract["entry_can_proceed"] == 0
-    assert contract["exit_can_proceed"] == 0
+    assert contract["exit_can_proceed"] == 1
     assert contract["close_can_proceed"] == 1
     assert contract["trade_can_proceed"] == 1
 

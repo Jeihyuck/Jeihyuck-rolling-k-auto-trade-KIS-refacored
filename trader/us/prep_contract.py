@@ -153,8 +153,10 @@ def build_us_prep_contract(
     # Final30 underfill, cluster caps, and risk-off regimes block only new BUYs;
     # they must not stop balance reconcile, existing-position exit monitoring, or close.
     hard_system_failure = status == "ERROR" or bool(validation.get("hard_system_failure", False))
-    score_contract_ok_or_degradable = final30_scored_count <= 0 or score_nonzero_count in {0, final30_scored_count}
-    exit_quality_ok = bool(validation_ok and score_contract_ok_or_degradable and not hard_system_failure)
+    # Exit/close liveness must not depend on Final30/watchlist/score/cluster/regime quality.
+    # Those are entry-quality signals only. System/broker hard failures are the only
+    # prep-time reason to disable exit monitoring.
+    exit_quality_ok = bool(not hard_system_failure)
     contract_ok = bool(exit_quality_ok)
     if not cluster_contract_ok:
         status = "OK_WITH_WARNINGS_ENTRY_BLOCKED_CLUSTER_CAP"
