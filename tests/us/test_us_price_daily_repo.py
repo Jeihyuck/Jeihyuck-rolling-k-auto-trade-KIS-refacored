@@ -29,3 +29,10 @@ def test_upsert_preserves_existing_nonzero_volume_when_incoming_zero():
     rows = load_recent_us_daily_bars(symbol="NVDA", before_date="2026-07-10", limit=10)
     assert rows[-1]["close"] == 101
     assert rows[-1]["volume"] == 100000
+
+
+def test_upsert_maps_acml_tr_pbmn_to_value_not_volume():
+    upsert_us_daily_bars(symbol="AMZN", bars=[{"date": "2026-07-09", "close": 100, "acml_tr_pbmn": "9,876,543"}], source="TEST")
+    rows = load_recent_us_daily_bars(symbol="AMZN", before_date="2026-07-10", limit=10)
+    assert rows[-1]["volume"] == 0
+    assert rows[-1]["value"] == 9876543.0

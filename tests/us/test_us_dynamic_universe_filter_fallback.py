@@ -249,7 +249,7 @@ def test_normalize_daily_row_kis_fields():
 
 
 def test_normalize_daily_row_stck_fields():
-    """KIS 국내 스타일 필드도 변환되어야 한다."""
+    """KIS price/date fields convert, but stck_sdpr must not be treated as volume."""
     try:
         from trader.us.data_provider import normalize_daily_row
     except ImportError:
@@ -265,7 +265,7 @@ def test_normalize_daily_row_stck_fields():
     }
     row = normalize_daily_row(raw)
     assert row["close"] == pytest.approx(180.50)
-    assert row["volume"] == 999999
+    assert row["volume"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +348,35 @@ def test_regression_filtered_20_hard_fail_becomes_warning_with_volume_fallback_c
     assert result["status"] == "OK_WITH_WARNINGS"
     assert result["filtered_count"] >= 30
     assert result["volume_missing_fallback_count"] >= 30
+
+
+def test_value_or_price_fields_do_not_disable_volume_missing_fallback():
+    """Value/price-only pseudo-volume fields must not make volume fallback disappear."""
+    from trader.us.data_provider import normalize_daily_rows
+    from trader.us.universe_builder import build_us_dynamic_universe
+
+    symbols = [f"V{i:03d}" for i in range(50)]
+    provider = MagicMock()
+    provider.get_current_price.return_value = {"last": "120"}
+    raw_daily = []
+    from datetime import date, timedelta
+    end = date(2026, 5, 29)
+    for i in range(260):
+        d = end - timedelta(days=260 - i - 1)
+        raw_daily.append({
+            "xymd": d.strftime("%Y%m%d"),
+            "clos": "120", "high": "121", "low": "119", "open": "120",
+            "acml_tr_pbmn": "999,999,999",
+            "stck_sdpr": "100",
+        })
+    provider.get_daily_prices.return_value = normalize_daily_rows("V000", raw_daily)
+
+    with _PATCH_DYNAMIC:
+        result = build_us_dynamic_universe(
+            trade_date="2026-05-29", env="practice", provider=provider,
+            manual_seed=symbols, force_rebuild=True,
+        )
+
+    assert result["volume_missing_fallback_used"] is True
+    assert result["volume_missing_fallback_count"] >= 30
+    assert result["status"] == "OK_WITH_WARNINGS"

@@ -55,7 +55,8 @@ def _num(v: Any, default: float | None = None) -> float | None:
         return default
 
 
-_VOLUME_CANDIDATE_KEYS = ("volume", "vol", "tvol", "acml_vol", "acml_tr_pbmn", "cntg_vol", "trqu", "tvol_qty", "ovrs_vol")
+_VOLUME_CANDIDATE_KEYS = ("volume", "vol", "tvol", "acml_vol", "cntg_vol", "trqu", "tvol_qty", "ovrs_vol")
+_VALUE_CANDIDATE_KEYS = ("value", "amount", "acml_tr_pbmn")
 
 
 def _first_positive_num(row: dict, keys: tuple[str, ...], default: float = 0.0) -> float:
@@ -75,7 +76,9 @@ def _row_from_bar(symbol: str, bar: dict, source: str) -> dict | None:
     high_v = _num(bar.get("high", bar.get("stck_hgpr")), close)
     low_v = _num(bar.get("low", bar.get("stck_lwpr")), close)
     vol = _first_positive_num(bar, _VOLUME_CANDIDATE_KEYS, 0.0)
-    value = _num(bar.get("value", bar.get("amount")), None)
+    value = _first_positive_num(bar, _VALUE_CANDIDATE_KEYS, 0.0)
+    if value <= 0:
+        value = None
     return {
         "market": "US", "code": normalize_us_price_symbol(symbol), "date": d,
         "open": open_v, "high": high_v, "low": low_v, "close": close,

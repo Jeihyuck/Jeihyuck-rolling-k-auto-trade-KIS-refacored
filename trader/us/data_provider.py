@@ -130,9 +130,10 @@ _OPEN_KEYS = ("open", "ovrs_nmix_oprc", "stck_oprc")
 _HIGH_KEYS = ("high", "ovrs_nmix_hgpr", "stck_hgpr")
 _LOW_KEYS = ("low", "ovrs_nmix_lwpr", "stck_lwpr")
 _VOLUME_KEYS = (
-    "volume", "vol", "tvol", "acml_vol", "acml_tr_pbmn",
-    "cntg_vol", "trqu", "tvol_qty", "stck_sdpr", "ovrs_vol",
+    "volume", "vol", "tvol", "acml_vol",
+    "cntg_vol", "trqu", "tvol_qty", "ovrs_vol",
 )
+_VALUE_KEYS = ("value", "amount", "acml_tr_pbmn")
 _DATE_KEYS = ("xymd", "date", "stck_bsop_date", "bas_dt", "trad_dvsn")
 
 
@@ -147,13 +148,15 @@ def normalize_daily_row(row: dict) -> dict:
     high_raw = _get_first_valid(row, _HIGH_KEYS)
     low_raw = _get_first_valid(row, _LOW_KEYS)
     volume_raw = _get_first_valid(row, _VOLUME_KEYS, positive_numeric=True)
+    value_raw = _get_first_valid(row, _VALUE_KEYS, positive_numeric=True)
     date_raw = _get_first_valid(row, _DATE_KEYS)
 
     close_val = _safe_float(close_raw) if close_raw is not None else None
     open_val = _safe_float(open_raw) if open_raw is not None else None
     high_val = _safe_float(high_raw) if high_raw is not None else None
     low_val = _safe_float(low_raw) if low_raw is not None else None
-    volume_val = _safe_int(volume_raw) if volume_raw is not None else None
+    volume_val = _safe_int(volume_raw) if volume_raw is not None else 0
+    value_val = _safe_float(value_raw) if value_raw is not None else None
 
     result = dict(row)  # 원본 필드 보존 (기존 코드 호환)
     result["close"] = close_val
@@ -161,12 +164,14 @@ def normalize_daily_row(row: dict) -> dict:
     result["high"] = high_val
     result["low"] = low_val
     result["volume"] = volume_val
+    if value_val is not None:
+        result["value"] = value_val
+        result["amount"] = value_val
     result["date"] = str(date_raw) if date_raw is not None else None
     # 하위 호환: clos / tvol 필드도 정규화 값으로 갱신
     if close_val is not None:
         result["clos"] = str(close_val)
-    if volume_val is not None:
-        result["tvol"] = str(volume_val)
+    result["tvol"] = str(volume_val)
     return result
 
 
