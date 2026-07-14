@@ -936,6 +936,264 @@ def _is_accepted_order_response(resp: Any) -> bool:
     return status in {"ACCEPTED", "SUBMITTED", "OK"}
 
 
+def _kr_close_liquidation_explicitly_confirmed() -> bool:
+    return (
+        str(os.getenv("KR_CLOSE_LIQUIDATION_ALL_ENABLED", "0")).strip().lower() in {"1", "true", "yes"}
+        and os.getenv("KR_CLOSE_LIQUIDATION_ALL_CONFIRM") == "RUN_KR_CLOSE_LIQUIDATION_ALL"
+    )
+
+
+def _parse_meta_json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+KR_CLOSE_METADATA_DEFAULTS = {
+    "position_book": "SWING_BOOK",
+    "trade_horizon": "SWING_CARRY",
+    "exit_policy_family": "SWING_STAGED_EXIT",
+    "eod_action": "CARRY_IF_NO_EXIT_SIGNAL",
+    "force_eod_close": False,
+}
+
+
+def _coerce_bool_meta(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _extract_tagged_close_metadata(
+    code: str,
+    *,
+    db_positions: list[dict[str, Any]] | None,
+    latest_buy_fills: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any], str]:
+    code = str(code or "").zfill(6)
+    for source_name, rows, meta_fields in (
+        ("position_meta", db_positions or [], ("position_meta", "position_meta_json", "meta", "meta_json")),
+        ("fill_meta", latest_buy_fills or [], ("fill_meta_json", "entry_meta_json", "meta", "meta_json")),
+    ):
+        for row in rows:
+            row_code = str((row or {}).get("code") or (row or {}).get("pdno") or "").zfill(6)
+            if row_code != code:
+                continue
+            meta: dict[str, Any] = {}
+            for key in meta_fields:
+                meta.update(_parse_meta_json((row or {}).get(key)))
+            for key in KR_CLOSE_METADATA_DEFAULTS:
+                if (row or {}).get(key) not in (None, ""):
+                    meta[key] = (row or {}).get(key)
+            if meta:
+                return meta, source_name
+    return {}, "metadata_missing"
+
+
+def build_kr_close_policy_orders_from_tagged_positions(
+    kis_holdings: list[dict[str, Any]] | None,
+    db_positions: list[dict[str, Any]] | None = None,
+    latest_buy_fills: list[dict[str, Any]] | None = None,
+    orders_repo: Any = None,
+    fills_repo: Any = None,
+    positions_repo: Any = None,
+    market_state_overlay: Any = None,
+) -> list[dict[str, Any]]:
+    """Build KR close SELL orders only when tagged DAY/SWING/CORE policy allows it.
+
+    Missing metadata is intentionally conservative: fallback to SWING_CARRY/HOLD.
+    """
+    orders: list[dict[str, Any]] = []
+    for holding in list(kis_holdings or []):
+        code, qty = _holding_code_qty(holding)
+        if not code or qty <= 0:
+            continue
+        meta, metadata_source = _extract_tagged_close_metadata(
+            code,
+            db_positions=db_positions,
+            latest_buy_fills=latest_buy_fills,
+        )
+        missing = not bool(meta)
+        merged = dict(KR_CLOSE_METADATA_DEFAULTS)
+        merged.update(meta)
+        book = str(merged.get("position_book") or "").upper()
+        horizon = str(merged.get("trade_horizon") or "").upper()
+        exit_family = str(merged.get("exit_policy_family") or "").upper()
+        eod_action = str(merged.get("eod_action") or "").upper()
+        close_action = str(merged.get("close_action") or "").upper()
+        force_eod = _coerce_bool_meta(merged.get("force_eod_close"))
+        action = "HOLD"
+        reason = "KR_CLOSE_HOLD_METADATA_MISSING" if missing else "KR_CLOSE_HOLD_SWING_CARRY"
+        if missing:
+            logger.info("[KR_CLOSE][POLICY][METADATA_MISSING] code=%s action=HOLD fallback=SWING_CARRY", code)
+        is_day = book == "DAY_BOOK" or horizon in {"DAY_TRADE", "DAY_PROTECT"}
+        is_core = book == "CORE_BOOK" or horizon in {"CORE", "CORE_CARRY"}
+        if is_day and (force_eod or eod_action in {"FORCE_EXIT", "CLOSE", "EOD_CLOSE"} or close_action == "FORCE_SELL"):
+            action = "SELL"
+            reason = "KR_CLOSE_DAY_FORCE_EOD"
+        elif is_core:
+            reason = "KR_CLOSE_HOLD_CORE_CARRY"
+        elif not missing:
+            reason = "KR_CLOSE_HOLD_SWING_CARRY"
+        logger.info(
+            "[KR_CLOSE][POLICY][EVAL] code=%s book=%s horizon=%s force_eod=%s action=%s reason=%s",
+            code, book, horizon, int(force_eod), action, reason,
+        )
+        if action == "SELL":
+            orders.append({
+                "code": code,
+                "qty": qty,
+                "side": "SELL",
+                "reason": reason,
+                "source": "tagged_close_policy",
+                "position_book": book,
+                "trade_horizon": horizon,
+                "exit_policy_family": exit_family,
+                "force_eod_close": force_eod,
+                "eod_action": eod_action,
+                "metadata_source": metadata_source,
+            })
+    return orders
+
+
+def _load_kr_close_tagged_metadata(
+    *,
+    holdings: list[dict[str, Any]],
+    positions_repo: Any,
+    fills_repo: Any,
+    orders_repo: Any,
+    env: str,
+    strategy: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    codes = [code for code, qty in (_holding_code_qty(row) for row in (holdings or [])) if code and qty > 0]
+    db_positions: list[dict[str, Any]] = []
+    latest_buy_fills: list[dict[str, Any]] = []
+    if positions_repo is not None:
+        if hasattr(positions_repo, "list_positions_by_codes"):
+            db_positions = list(positions_repo.list_positions_by_codes(env=env, strategy=strategy, codes=codes) or [])
+        elif hasattr(positions_repo, "list_positions"):
+            all_positions = list(positions_repo.list_positions(env, strategy) or [])
+            code_set = set(codes)
+            db_positions = [dict(row) for row in all_positions if str((row or {}).get("code") or "").zfill(6) in code_set]
+    latest_by_code: dict[str, dict[str, Any]] = {}
+    if fills_repo is not None and hasattr(fills_repo, "list_latest_buy_fills_by_codes"):
+        raw_latest = fills_repo.list_latest_buy_fills_by_codes(env, codes) or {}
+        if isinstance(raw_latest, dict):
+            latest_by_code = {str(code).zfill(6): dict(row or {}) for code, row in raw_latest.items()}
+    elif fills_repo is not None and hasattr(fills_repo, "list_today_fills"):
+        for code in codes:
+            rows = fills_repo.list_today_fills(env, side="BUY", code=code) or []
+            if rows:
+                latest_by_code[code] = dict(rows[0] or {})
+    if orders_repo is not None:
+        for code in codes:
+            if latest_by_code.get(code) and _parse_meta_json(latest_by_code[code].get("fill_meta_json")):
+                continue
+            entry_meta: dict[str, Any] = {}
+            if hasattr(orders_repo, "list_today_buy_orders"):
+                buy_orders = orders_repo.list_today_buy_orders(env, code=code) or []
+                if buy_orders:
+                    entry_meta = _parse_meta_json((buy_orders[0] or {}).get("entry_meta_json"))
+            if not entry_meta and hasattr(orders_repo, "find_latest_buy_entry_exit_plan"):
+                plan_row = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code) or {}
+                entry_meta = _parse_meta_json(plan_row.get("entry_meta"))
+            if entry_meta:
+                latest_by_code.setdefault(code, {"code": code})
+                latest_by_code[code]["entry_meta_json"] = entry_meta
+    latest_buy_fills = list(latest_by_code.values())
+    logger.info(
+        "[KR_CLOSE][POLICY][DB_METADATA] holdings=%s db_positions=%s latest_buy_fills=%s codes=%s",
+        len(codes), len(db_positions), len(latest_buy_fills), ",".join(codes[:20]),
+    )
+    return db_positions, latest_buy_fills
+
+
+def submit_kr_close_policy_orders(
+    *,
+    policy_orders: list[dict[str, Any]],
+    kis_client: Any,
+    orders_repo: Any = None,
+    env: str = "practice",
+    dry_run: bool = False,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for order in list(policy_orders or []):
+        code = str((order or {}).get("code") or "").zfill(6)
+        qty = int((order or {}).get("qty") or 0)
+        if not code or qty <= 0:
+            continue
+        reason = str((order or {}).get("reason") or "KR_CLOSE_POLICY_SELL")
+        logger.info("[KR_CLOSE][POLICY][SELL][INTENT] code=%s qty=%s reason=%s metadata_source=%s", code, qty, reason, (order or {}).get("metadata_source"))
+        if dry_run:
+            results.append({**dict(order), "accepted": False, "dry_run": True, "result": "DRY_RUN"})
+            continue
+        if kis_client is None or not hasattr(kis_client, "sell_stock_market"):
+            raise RuntimeError("KIS_SELL_SUBMIT_UNAVAILABLE_FOR_KR_CLOSE_POLICY")
+        logger.info("[ORDER][API_CALL][START] side=SELL code=%s source=tagged_close_policy", code)
+        resp = kis_client.sell_stock_market(code, qty)
+        ok = _is_accepted_order_response(resp)
+        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
+        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
+        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
+        logger.info("[KIS][ORDER][RESPONSE] side=SELL code=%s rt_cd=%s msg_cd=%s msg1=%s source=tagged_close_policy", code, rt_cd, msg_cd, msg1)
+        logger.info("[TRADE][ORDER][SELL] code=%s result=%s source=tagged_close_policy", code, "ACCEPTED" if ok else "REJECTED")
+        result = dict(resp) if isinstance(resp, dict) else {"resp": resp}
+        result.update({**dict(order), "accepted": ok, "result": "ACCEPTED" if ok else "REJECTED"})
+        results.append(result)
+    return results
+
+
+def run_kr_close_policy_from_tagged_positions(
+    *,
+    kis_holdings: list[dict[str, Any]],
+    positions_repo: Any,
+    fills_repo: Any,
+    orders_repo: Any,
+    kis_client: Any,
+    env: str,
+    strategy: str = "pb1_pullback_close",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    db_positions, latest_buy_fills = _load_kr_close_tagged_metadata(
+        holdings=kis_holdings,
+        positions_repo=positions_repo,
+        fills_repo=fills_repo,
+        orders_repo=orders_repo,
+        env=env,
+        strategy=strategy,
+    )
+    policy_orders = build_kr_close_policy_orders_from_tagged_positions(
+        kis_holdings,
+        db_positions=db_positions,
+        latest_buy_fills=latest_buy_fills,
+        orders_repo=orders_repo,
+        fills_repo=fills_repo,
+        positions_repo=positions_repo,
+    )
+    policy_results = submit_kr_close_policy_orders(
+        policy_orders=policy_orders,
+        kis_client=kis_client,
+        orders_repo=orders_repo,
+        env=env,
+        dry_run=dry_run,
+    )
+    accepted_policy_sells = sum(1 for row in policy_results if bool((row or {}).get("accepted")))
+    return {
+        "policy_orders": policy_orders,
+        "policy_results": policy_results,
+        "accepted_policy_sells": accepted_policy_sells,
+        "db_positions": db_positions,
+        "latest_buy_fills": latest_buy_fills,
+        "policy_sell_candidates": len(policy_orders),
+    }
+
+
 def run_close_liquidation_from_kis_holdings(
     *,
     kis_client: Any,
@@ -945,7 +1203,10 @@ def run_close_liquidation_from_kis_holdings(
     dry_run: bool = False,
     submit_sell_order: Any = None,
 ) -> list[dict[str, Any]]:
-    """Submit close-liquidation SELLs using KIS holdings as source of truth."""
+    """Submit emergency close-liquidation SELLs using KIS holdings as source of truth."""
+    if not _kr_close_liquidation_explicitly_confirmed():
+        logger.error("[KR_CLOSE][LIQUIDATION][BLOCKED] reason=MISSING_EXPLICIT_CONFIRM")
+        return []
     if holdings is None:
         logger.warning("[KR_CLOSE][LIQUIDATION][BALANCE_RELOAD][START] source=kis_client")
         raw = {}
@@ -1002,9 +1263,13 @@ def run_close_liquidation_from_kis_holdings(
     return results
 
 
+def run_emergency_close_liquidation_from_kis_holdings(**kwargs: Any) -> list[dict[str, Any]]:
+    return run_close_liquidation_from_kis_holdings(**kwargs)
+
+
 def build_close_liquidation_orders_from_kis_holdings(kis_holdings: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Build dry-run close liquidation intents without emitting fake API success logs."""
-    return run_close_liquidation_from_kis_holdings(kis_client=None, holdings=kis_holdings, dry_run=True)
+    return run_emergency_close_liquidation_from_kis_holdings(kis_client=None, holdings=kis_holdings, dry_run=True)
 
 def _is_close_or_exit_only_session(*, phase_name: str | None, session_kind: str | None) -> bool:
     return (
@@ -2344,6 +2609,30 @@ def normalize_session_result(
     status_u = str(status or "UNKNOWN").upper()
     reason_u = str(reason or "").upper()
     skip_reason_set = {str(r or "").upper() for r in (skip_reasons or [])}
+    policy_block_reasons = {
+        "BUYABLE_EXISTING_HOLDING_KIS",
+        "BUYABLE_TODAY_BUY_EXISTS",
+        "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
+        "BUYABLE_COOLDOWN",
+        "BUYABLE_DUPLICATE",
+        "MARKET_RISK_OFF_ENTRY_BLOCK",
+        "SECTOR_CAP_BLOCK",
+        "GROSS_EXPOSURE_CAP",
+        "CASH_INSUFFICIENT",
+        "MAX_POSITIONS_REACHED",
+    }
+    if (
+        reason_u in policy_block_reasons
+        or "BUYABLE_EXISTING_HOLDING_KIS" in reason_u
+        or bool(skip_reason_set & policy_block_reasons)
+    ):
+        return NormalizedSessionResult(
+            status="OK_NO_TRADE",
+            reason=str(reason or next(iter(skip_reason_set & policy_block_reasons), reason_u)),
+            completed=1,
+            retryable=0,
+            exit_reason=str(reason or next(iter(skip_reason_set & policy_block_reasons), reason_u)),
+        )
     retryable_tokens = {
         "ENTRY_PLAN_INVALID_BEFORE_API_SUBMIT",
         "ORDER_CANDIDATE_WITHOUT_API_SUBMIT",
@@ -2436,6 +2725,29 @@ def _write_session_result_file(payload: dict[str, Any]) -> None:
     if not path:
         return
     try:
+        required_defaults = {
+            "status": "UNKNOWN",
+            "exit_reason": "",
+            "terminal_state": "",
+            "ticks_total": 0,
+            "buy_orders": 0,
+            "buy_orders_ack": 0,
+            "sell_orders": 0,
+            "sell_orders_ack": 0,
+            "rejected_orders": 0,
+            "skipped_orders": 0,
+            "exit_evaluated_positions": 0,
+            "entry_candidates": 0,
+            "order_candidates": 0,
+            "api_submitted": 0,
+            "exit_submitted_codes": [],
+            "no_sellable_qty_terminal_codes": [],
+            "fatal_error_type": "",
+            "fatal_error_message": "",
+            "warning_counts": {},
+        }
+        for key, value in required_defaults.items():
+            payload.setdefault(key, value)
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -5185,7 +5497,7 @@ def run_once(
         return max(0.0, deadline_ts - time_mod.monotonic())
 
     remaining_s = _remaining_seconds()
-    close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "1"))).strip().lower() not in {"0", "false", "no"}
+    close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "0"))).strip().lower() not in {"0", "false", "no"}
     exit_short_circuit = (phase_for_log == "exit" or window_label == "close") and not close_liquidation_enabled
     if (phase_for_log == "exit" or window_label == "close") and close_liquidation_enabled:
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled skip_exit_shortcircuit=1")
@@ -6130,7 +6442,7 @@ def run_once(
             session_kind=session_kind_for_engine,
         )
         close_liquidation_enabled_for_engine = str(
-            os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "1"))
+            os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "0"))
         ).strip().lower() not in {"0", "false", "no"}
         if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
             if close_liquidation_enabled_for_engine:
@@ -6143,7 +6455,7 @@ def run_once(
                     logger.warning("[KR_CLOSE][LIQUIDATION][BALANCE_RELOAD] reason=missing_or_empty_snapshot source=kis_client")
                 else:
                     logger.info("[KR_CLOSE][LIQUIDATION][BALANCE_SNAPSHOT] holdings=%s", len(holdings_for_liquidation))
-                liquidation_results = run_close_liquidation_from_kis_holdings(
+                liquidation_results = run_emergency_close_liquidation_from_kis_holdings(
                     kis_client=kis,
                     orders_repo=orders_repo,
                     env=env_effective,
@@ -6152,8 +6464,34 @@ def run_once(
                 )
                 logger.info("[KR_CLOSE][LIQUIDATION][DONE] orders=%s", len(liquidation_results))
                 return [], bool(liquidation_results), {"buy_orders": 0, "sell_orders": len(liquidation_results), "warning_counts": {}}, phase_for_log, "OK_CLOSE_LIQUIDATION"
+            holdings_for_policy = []
+            if isinstance(balance_snapshot_raw, dict):
+                holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
+            close_policy_result = run_kr_close_policy_from_tagged_positions(
+                kis_holdings=holdings_for_policy,
+                positions_repo=positions_repo,
+                fills_repo=fills_repo,
+                orders_repo=orders_repo,
+                kis_client=kis,
+                env=env_effective,
+                strategy="pb1_pullback_close",
+                dry_run=dry_run_for_engine,
+            )
+            policy_orders = list(close_policy_result.get("policy_orders") or [])
+            policy_results = list(close_policy_result.get("policy_results") or [])
+            accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
             logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
-            return [], True, {"buy_orders": 0, "sell_orders": 0, "warning_counts": {}}, phase_for_log, "OK_CLOSE_LIQUIDATION_DISABLED"
+            logger.info(
+                "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
+                len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
+            )
+            return [], True, {
+                "buy_orders": 0,
+                "sell_orders": accepted_policy_sells,
+                "sell_orders_ack": accepted_policy_sells,
+                "policy_sell_candidates": len(policy_orders),
+                "warning_counts": {},
+            }, phase_for_log, "OK_CLOSE_POLICY"
 
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
@@ -6832,6 +7170,12 @@ def run_once(
         "balance_tick_cache_hits": result.balance_tick_cache_hits if result else 0,
         "buy_orders": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0)),
         "sell_orders": int((getattr(engine_runner, "_exit_summary_payload", {}) or {}).get("submitted", 0)),
+        "sell_orders_ack": int((getattr(engine_runner, "_exit_summary_payload", {}) or {}).get("accepted_sell_count", 0)),
+        "exit_evaluated_positions": int((getattr(engine_runner, "_exit_summary_payload", {}) or {}).get("evaluated_count", 0)),
+        "exit_submitted_codes": sorted(getattr(engine_runner, "session_exit_submitted_codes", set()) or []),
+        "no_sellable_qty_terminal_codes": sorted(getattr(engine_runner, "no_sellable_qty_terminal_codes", set()) or []),
+        "order_candidates": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("order_candidates", 0)),
+        "api_submitted": int((getattr(engine_runner, "_run_summary_payload", {}) or {}).get("api_submitted", (getattr(engine_runner, "_run_summary_payload", {}) or {}).get("submitted", 0))),
         "degraded": bool(getattr(result, "status", "") == "DEGRADED_POSTPROCESS"),
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
@@ -8209,7 +8553,7 @@ def main() -> int:
             recovery_used=str(os.getenv("PB1_SESSION_RECOVERY_USED") or "0") == "1",
             completed=bool(normalized.completed),
             retryable=bool(normalized.retryable),
-            sell_orders_ack=int(metrics.get("sell_orders", 0) or 0),
+            sell_orders_ack=int(metrics.get("sell_orders_ack", metrics.get("sell_orders", 0)) or 0),
             entry_status="DONE" if normalized.completed else "ABORT",
             entry_abort_reason=None if normalized.completed else normalized.exit_reason,
             exit_code=0 if normalized.completed else 1,
@@ -8217,8 +8561,13 @@ def main() -> int:
         _write_session_result_file({
             "status": result_status,
             "exit_reason": main_exit_reason,
-            "sell_orders_ack": int(metrics.get("sell_orders", 0) or 0),
+            "sell_orders_ack": int(metrics.get("sell_orders_ack", metrics.get("sell_orders", 0)) or 0),
             "sell_orders": int(metrics.get("sell_orders", 0) or 0),
+            "exit_evaluated_positions": int(metrics.get("exit_evaluated_positions", 0) or 0),
+            "order_candidates": int(metrics.get("order_candidates", 0) or 0),
+            "api_submitted": int(metrics.get("api_submitted", 0) or 0),
+            "exit_submitted_codes": list(metrics.get("exit_submitted_codes", []) or []),
+            "no_sellable_qty_terminal_codes": list(metrics.get("no_sellable_qty_terminal_codes", []) or []),
             "buy_orders": int(metrics.get("buy_orders", 0) or 0),
         })
     return _exit_code_for_status(result_status)
