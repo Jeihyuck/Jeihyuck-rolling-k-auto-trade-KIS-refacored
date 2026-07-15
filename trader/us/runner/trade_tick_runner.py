@@ -1248,18 +1248,15 @@ def run_trade_tick(
             "account_intraday_pnl_pct": os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT"),
             "account_5d_pnl_pct": os.getenv("US_ACCOUNT_5D_PNL_PCT"),
         }
-        if isinstance(prep_result_for_overlay, dict) and prep_result_for_overlay.get("contract_version") == "us_sector_rotation_v3" and prep_result_for_overlay.get("market_regime_version") == "us_leading_regime_v1":
-            market_state_overlay = dict(prep_result_for_overlay)
-        else:
-            market_state_overlay = evaluate_us_market_state(
-                trade_date=trade_date,
-                provider=provider,
-                rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
-                prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
-                positions=current_positions,
-                account_snapshot=account_snapshot,
-                now=now,
-            )
+        market_state_overlay = evaluate_us_market_state(
+            trade_date=trade_date,
+            provider=provider,
+            rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
+            prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
+            positions=current_positions,
+            account_snapshot=account_snapshot,
+            now=now,
+        )
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
         profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
         if profit_capture_intents:

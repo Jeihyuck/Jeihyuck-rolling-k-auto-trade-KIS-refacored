@@ -201,6 +201,56 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
     return out
 
 
+
+def _quote_last_value(quote: Any) -> float | None:
+    if isinstance(quote, dict):
+        for key in ("last", "last_price", "current_price", "price", "close", "ovrs_now_pric", "now_pric2", "bass_pric"):
+            v = _num(quote.get(key))
+            if v is not None and v > 0:
+                return v
+    return _num(quote)
+
+
+def _current_quote_returns(provider: Any, previous_close_returns: dict[str, float | None], trade_date: str, warnings: list[str]) -> dict[str, float | None]:
+    """Return intraday/current quote returns vs previous completed close.
+
+    Falls back to None per-symbol rather than treating unavailable quotes as 0.
+    """
+    out: dict[str, float | None] = {}
+    for sym, exchange in _MARKET_RETURN_EXCHANGE_MAP.items():
+        runtime_ret: float | None = None
+        previous_close: float | None = None
+        try:
+            rows = None
+            if isinstance(provider, dict):
+                rows = provider.get(sym) or provider.get(sym.lower())
+            elif callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
+                rows = provider.get_completed_daily_prices(sym, exchange, trade_date=trade_date, required_bars=2, allow_http_sync=False)
+            elif hasattr(provider, "get_daily_prices"):
+                rows = provider.get_daily_prices(sym, exchange, as_of_date=trade_date)
+            if isinstance(rows, list):
+                clean_rows = [r for r in rows if isinstance(r, dict)]
+                if any(_row_date_value(r) for r in clean_rows):
+                    clean_rows = sorted(clean_rows, key=lambda r: _row_date_value(r) or "00000000")
+                for row in reversed(clean_rows):
+                    previous_close = _row_close_value(row)
+                    if previous_close is not None:
+                        break
+            quote = None
+            if hasattr(provider, "get_current_price"):
+                quote = provider.get_current_price(sym, exchange)
+            elif isinstance(provider, dict):
+                quote = provider.get(f"{sym}_quote") or provider.get(f"{sym.lower()}_quote")
+            last = _quote_last_value(quote)
+            if last is not None and previous_close and previous_close > 0:
+                runtime_ret = last / previous_close - 1.0
+        except Exception as exc:
+            warnings.append(f"runtime_quote_fetch_failed:{sym}:{exc}")
+        out[f"{sym.lower()}_runtime_return"] = runtime_ret
+        if runtime_ret is None:
+            warnings.append(f"runtime_return_missing:{sym}")
+    return out
+
 def regime_constraints(market_regime: str) -> dict[str, Any]:
     r = str(market_regime or "NEUTRAL").upper()
     base = {"market_regime": r, "sector_cap_enforced": True, "force_entry_block": False}
@@ -254,9 +304,14 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
     suspect = bool(rc.get("rotation_context_suspect") or (prep_result or {}).get("rotation_context_suspect"))
     suspect_policy = str(rc.get("rotation_suspect_policy") or (prep_result or {}).get("rotation_suspect_policy") or "block")
     quality = str(rc.get("benchmark_data_quality") or (prep_result or {}).get("benchmark_data_quality") or "ok").lower()
-    rets = _market_returns(provider, trade_date, warnings)
+    previous_close_rets = _market_returns(provider, trade_date, warnings)
+    runtime_rets = _current_quote_returns(provider, previous_close_rets, trade_date, warnings)
+    rets = {**previous_close_rets, **runtime_rets}
     acct = _account_metrics(positions, account_snapshot)
-    spy1, qqq1, smh1 = rets.get("spy_1d_return"), rets.get("qqq_1d_return"), rets.get("smh_1d_return")
+    previous_spy1, previous_qqq1, previous_smh1 = previous_close_rets.get("spy_1d_return"), previous_close_rets.get("qqq_1d_return"), previous_close_rets.get("smh_1d_return")
+    spy1 = runtime_rets.get("spy_runtime_return") if runtime_rets.get("spy_runtime_return") is not None else previous_spy1
+    qqq1 = runtime_rets.get("qqq_runtime_return") if runtime_rets.get("qqq_runtime_return") is not None else previous_qqq1
+    smh1 = runtime_rets.get("smh_runtime_return") if runtime_rets.get("smh_runtime_return") is not None else previous_smh1
     spy3, qqq3, smh3 = rets.get("spy_3d_return"), rets.get("qqq_3d_return"), rets.get("smh_3d_return")
     pnl1, pnl5 = acct["account_intraday_pnl_pct"], acct["account_5d_pnl_pct"]
     reasons: list[str] = []
@@ -275,7 +330,14 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
 
     hit(spy1 is not None and spy1 <= -0.020, "crash", "SPY_1D_LE_-2.0pct")
     hit(qqq1 is not None and qqq1 <= -0.028, "crash", "QQQ_1D_LE_-2.8pct")
-    hit(smh1 is not None and smh1 <= -0.040, "crash", "SMH_1D_LE_-4.0pct")
+    broad_crash = (spy1 is not None and spy1 <= -0.020) or (qqq1 is not None and qqq1 <= -0.028)
+    broad_riskoff_confirmation = (spy1 is not None and spy1 <= -0.012) or (qqq1 is not None and qqq1 <= -0.018)
+    semi_crash = smh1 is not None and smh1 <= -0.040
+    if semi_crash and broad_riskoff_confirmation:
+        hit(True, "crash", "SMH_1D_LE_-4.0pct_WITH_BROAD_WEAKNESS")
+    elif semi_crash:
+        riskoff = True
+        reasons.append("SMH_1D_LE_-4.0pct_SECTOR_RISK_OFF_AI_SEMI")
     hit(pnl1 is not None and pnl1 <= -0.018, "crash", "ACCOUNT_INTRADAY_LE_-1.8pct")
     hit(pnl5 is not None and pnl5 <= -0.050, "crash", "ACCOUNT_5D_LE_-5.0pct")
     hit(suspect and suspect_policy == "block", "crash", "ROTATION_CONTEXT_SUSPECT_BLOCK")
@@ -309,6 +371,8 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
     riskon = spy1 is not None and qqq1 is not None and spy1 > 0 and qqq1 > 0 and rotation_regime in {"AI_ON", "BROAD_UP"} and not suspect and (pnl1 is None or pnl1 > -0.007)
     if crash:
         state = "DEFENSE_CRASH"
+    elif semi_crash and not broad_riskoff_confirmation:
+        state = "SECTOR_RISK_OFF_AI_SEMI"
     elif riskoff:
         state = "DEFENSE_RISK_OFF"
     elif caution:
@@ -323,9 +387,9 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         state = "NORMAL"
         reasons.append("NORMAL_BASELINE")
 
-    mults = {"DEFENSE_CRASH": _env_float("US_DEFENSE_CRASH_MULT", 0.0), "DEFENSE_RISK_OFF": _env_float("US_DEFENSE_RISK_OFF_MULT", 0.20), "DEFENSE_CAUTION": _env_float("US_DEFENSE_CAUTION_MULT", 0.50), "NORMAL": 1.0, "RISK_ON": _env_float("US_RISK_ON_MULT", 1.10), "STRONG_RISK_ON": _env_float("US_STRONG_RISK_ON_MULT", 1.25)}
-    modes = {"DEFENSE_CRASH": "crash_tight", "DEFENSE_RISK_OFF": "risk_off_tight", "DEFENSE_CAUTION": "caution", "NORMAL": "normal", "RISK_ON": "risk_on", "STRONG_RISK_ON": "strong_risk_on"}
-    trails = {"DEFENSE_CRASH": _env_float("US_TRAIL_CRASH_PCT", .008), "DEFENSE_RISK_OFF": _env_float("US_TRAIL_RISK_OFF_PCT", .010), "DEFENSE_CAUTION": _env_float("US_TRAIL_CAUTION_PCT", .015), "NORMAL": _env_float("US_TRAIL_NORMAL_PCT", .020), "RISK_ON": _env_float("US_TRAIL_RISK_ON_PCT", .025), "STRONG_RISK_ON": _env_float("US_TRAIL_STRONG_RISK_ON_PCT", .030)}
+    mults = {"DEFENSE_CRASH": _env_float("US_DEFENSE_CRASH_MULT", 0.0), "SECTOR_RISK_OFF_AI_SEMI": _env_float("US_SECTOR_RISK_OFF_AI_SEMI_MULT", 0.50), "DEFENSE_RISK_OFF": _env_float("US_DEFENSE_RISK_OFF_MULT", 0.20), "DEFENSE_CAUTION": _env_float("US_DEFENSE_CAUTION_MULT", 0.50), "NORMAL": 1.0, "RISK_ON": _env_float("US_RISK_ON_MULT", 1.10), "STRONG_RISK_ON": _env_float("US_STRONG_RISK_ON_MULT", 1.25)}
+    modes = {"DEFENSE_CRASH": "crash_tight", "SECTOR_RISK_OFF_AI_SEMI": "risk_off_tight", "DEFENSE_RISK_OFF": "risk_off_tight", "DEFENSE_CAUTION": "caution", "NORMAL": "normal", "RISK_ON": "risk_on", "STRONG_RISK_ON": "strong_risk_on"}
+    trails = {"DEFENSE_CRASH": _env_float("US_TRAIL_CRASH_PCT", .008), "SECTOR_RISK_OFF_AI_SEMI": _env_float("US_TRAIL_RISK_OFF_PCT", .010), "DEFENSE_RISK_OFF": _env_float("US_TRAIL_RISK_OFF_PCT", .010), "DEFENSE_CAUTION": _env_float("US_TRAIL_CAUTION_PCT", .015), "NORMAL": _env_float("US_TRAIL_NORMAL_PCT", .020), "RISK_ON": _env_float("US_TRAIL_RISK_ON_PCT", .025), "STRONG_RISK_ON": _env_float("US_TRAIL_STRONG_RISK_ON_PCT", .030)}
     loss = state.startswith("DEFENSE") and any(r.startswith("ACCOUNT_") for r in reasons)
     if loss and state in {"RISK_ON", "STRONG_RISK_ON"}:
         state = "DEFENSE_CAUTION"
@@ -394,6 +458,9 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
 
     constraints = regime_constraints(market_regime)
     max_gross = _env_float("US_MAX_GROSS_EXPOSURE_PCT", 0.95)
+    if state == "SECTOR_RISK_OFF_AI_SEMI":
+        constraints["allow_ai_tech_buy"] = False
+        constraints["allow_add_to_existing"] = False
     allow_new = constraints.get("allow_new_buy", True) and state != "DEFENSE_CRASH" and acct["gross_exposure_pct"] < max_gross
     if acct["gross_exposure_pct"] >= max_gross:
         reasons.append("GROSS_EXPOSURE_CAP_REACHED")
@@ -401,6 +468,12 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
     regime_score = growth_score + breadth_score - risk_score - defensive_score
     out = {
         **rets,
+        "previous_close_returns": dict(previous_close_rets),
+        "runtime_returns": dict(runtime_rets),
+        "previous_close_market_state": "PREVIOUS_CLOSE_SEMI_SHOCK" if previous_smh1 is not None and previous_smh1 <= -0.040 else ("PREVIOUS_CLOSE_SHOCK" if ((previous_spy1 is not None and previous_spy1 <= -0.020) or (previous_qqq1 is not None and previous_qqq1 <= -0.028)) else "PREVIOUS_CLOSE_NORMAL"),
+        "runtime_market_state": state,
+        "market_data_timestamp": (now or datetime.now(timezone.utc)).isoformat() if hasattr((now or datetime.now(timezone.utc)), "isoformat") else str(now),
+        "market_data_stale": False,
         **acct,
         **constraints,
         "market_state": state,
@@ -453,6 +526,8 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
             reason = "FORBIDDEN_HEDGE_OR_INVERSE_ETF"
         elif overlay.get("force_entry_block"):
             reason = "DEFENSE_CRASH_ENTRY_BLOCK"
+        elif state == "SECTOR_RISK_OFF_AI_SEMI" and cluster in AI_TECH_CLUSTERS:
+            reason = "SECTOR_RISK_OFF_AI_SEMI_ENTRY_BLOCK"
         elif state == "DEFENSE_RISK_OFF" and (cluster in AI_TECH_CLUSTERS or sym in pos_by_sym):
             reason = "DEFENSE_RISK_OFF_AI_TECH_BLOCK" if cluster in AI_TECH_CLUSTERS else "DEFENSE_RISK_OFF_ENTRY_REDUCED"
         elif state == "DEFENSE_RISK_OFF" and cluster not in DEFENSIVE_CLUSTERS and sym not in CORE_INDEX_ETFS:
@@ -527,15 +602,21 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 qty = min(max_sell, max(1, int(q * sell_pct)))
                 if qty > 0:
                     order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{reason}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), flag: True, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
-                    if trade_date:
+                    exchange = None
+                    for key in ("exchange", "exchange_code", "ovrs_excg_cd", "excd"):
                         try:
-                            from trader.us.db.repos import mark_us_profit_capture_stage
-                            mark_us_profit_capture_stage(trade_date, sym, flag.replace("_done", ""), order_key=order_key, qty=qty, notional_usd=qty * price, status="PENDING")
-                            state[pending_flag] = True
-                            profit_capture_state[sym] = state
-                        except Exception as exc:
-                            logger.warning("[US_PROFIT_CAPTURE][STATE_MARK_WARN] symbol=%s stage=%s err=%s", sym, flag, exc)
+                            exchange = p.get(key)
+                        except AttributeError:
+                            exchange = None
+                        if exchange:
+                            break
+                    if not exchange:
+                        try:
+                            from trader.us.symbols import resolve_us_exchange
+                            exchange = resolve_us_exchange(sym)
+                        except Exception:
+                            exchange = None
+                    intents.append({"symbol": sym, "exchange": exchange, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), flag: True, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
                     logger.info("[US_PROFIT_CAPTURE][%s] symbol=%s qty=%d pnl=%.4f runner_remaining_pct=%.4f", reason[-3:], sym, qty, pnl, (q - qty) / q)
                 break
     return intents

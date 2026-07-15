@@ -192,8 +192,8 @@ def verify_us_final30_scored_rows(
         af = _safe_float(row.get("agent_a_score"))
         if af is not None and af > 0:
             agent_a_nonzero_count += 1
-    if agent_a_nonzero_count < max(25, required_rows - 5):
-        errors.append(f"agent_a_nonzero_count={agent_a_nonzero_count} < required")
+    if agent_a_nonzero_count < required_rows:
+        errors.append(f"agent_a_nonzero_count={agent_a_nonzero_count} < {required_rows}")
 
     # ── agent_b_score nonzero ─────────────────────────────────────────────────
     agent_b_nonzero_count = 0
@@ -201,27 +201,27 @@ def verify_us_final30_scored_rows(
         bf = _safe_float(row.get("agent_b_score"))
         if bf is not None and bf > 0:
             agent_b_nonzero_count += 1
-    if agent_b_nonzero_count < max(25, required_rows - 5):
-        errors.append(f"agent_b_nonzero_count={agent_b_nonzero_count} < required")
+    if agent_b_nonzero_count < required_rows:
+        errors.append(f"agent_b_nonzero_count={agent_b_nonzero_count} < {required_rows}")
 
     # ── close (price) 존재 ────────────────────────────────────────────────────
     close_count = sum(1 for r in rows if _row_has_close(r))
     if close_count != required_rows:
         errors.append(f"close_not_null_count={close_count} != {required_rows}")
 
-    # ── ma20, ma50 존재 (>= 25개) ─────────────────────────────────────────────
+    # ── ma20, ma50 존재 (required_rows 기준) ────────────────────────────────
     ma20_count = sum(1 for r in rows if _safe_float(r.get("ma20")) is not None and _safe_float(r.get("ma20", 0)) > 0)
-    if ma20_count < 25:
-        errors.append(f"ma20_not_null_count={ma20_count} < 25")
+    if ma20_count < required_rows:
+        errors.append(f"ma20_not_null_count={ma20_count} < {required_rows}")
 
     ma50_count = sum(1 for r in rows if _safe_float(r.get("ma50")) is not None and _safe_float(r.get("ma50", 0)) > 0)
-    if ma50_count < 25:
-        errors.append(f"ma50_not_null_count={ma50_count} < 25")
+    if ma50_count < required_rows:
+        errors.append(f"ma50_not_null_count={ma50_count} < {required_rows}")
 
-    # ── atr_pct 존재 (>= 25개) ────────────────────────────────────────────────
+    # ── atr_pct 존재 (required_rows 기준) ────────────────────────────────────
     atr_count = sum(1 for r in rows if _safe_float(r.get("atr_pct")) is not None)
-    if atr_count < 25:
-        errors.append(f"atr_pct_not_null_count={atr_count} < 25")
+    if atr_count < required_rows:
+        errors.append(f"atr_pct_not_null_count={atr_count} < {required_rows}")
 
     # ── entry_style_selected 존재 (== required_rows) ──────────────────────────
     entry_style_count = sum(1 for r in rows if r.get("entry_style_selected") not in (None, ""))

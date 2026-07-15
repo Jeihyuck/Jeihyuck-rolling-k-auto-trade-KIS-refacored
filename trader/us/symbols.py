@@ -40,6 +40,16 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "QQQM": "NASDAQ",
     "SMH": "NASDAQ",
     "SOXX": "NASDAQ",
+    "DIA": "AMEX",
+    "IWM": "AMEX",
+    "RSP": "AMEX",
+    "XLK": "AMEX",
+    "XLI": "AMEX",
+    "XLF": "AMEX",
+    "XLV": "AMEX",
+    "XLP": "AMEX",
+    "XLU": "AMEX",
+    "XLE": "AMEX",
     # Mega AI
     "NVDA": "NASDAQ",
     "MSFT": "NASDAQ",
@@ -48,6 +58,13 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "META": "NASDAQ",
     "GOOGL": "NASDAQ",
     "AVGO": "NASDAQ",
+    "AMD": "NASDAQ",
+    "AMAT": "NASDAQ",
+    "ARM": "NASDAQ",
+    "MU": "NASDAQ",
+    "PANW": "NASDAQ",
+    "PLTR": "NASDAQ",
+    "TXN": "NASDAQ",
     "TSM": "NYSE",
     # AI Infra
     "VRT": "NYSE",
@@ -170,6 +187,38 @@ def resolve_exchange(symbol: str) -> str:
     )
     return exchange
 
+
+
+def resolve_us_exchange(
+    symbol: str,
+    explicit_exchange: str | None = None,
+    position_exchange: str | None = None,
+    universe_exchange: str | None = None,
+    *,
+    allow_fallback: bool = True,
+) -> str:
+    """Resolve a US exchange with one canonical priority order.
+
+    Priority: explicit caller value, KIS position/balance value, dynamic universe
+    value, canonical registry, then a logged NASDAQ fallback for otherwise valid
+    tickers.  The fallback keeps dynamic prep/daily sync from disagreeing with
+    universe construction while still surfacing a data-quality warning in logs.
+    """
+    sym = normalize_symbol(symbol)
+    for candidate in (explicit_exchange, position_exchange, universe_exchange):
+        if candidate:
+            return normalize_us_exchange(candidate)
+    try:
+        return resolve_exchange(sym)
+    except ValueError:
+        if not allow_fallback:
+            raise
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[US_SYMBOLS][EXCHANGE_FALLBACK] symbol=%s exchange=NASDAQ reason=not_in_registry",
+            sym,
+        )
+        return "NASDAQ"
 
 def get_quote_exchange_code(exchange: str) -> str:
     """KIS quote API용 exchange code (예: NAS, NYS, AMS)."""
