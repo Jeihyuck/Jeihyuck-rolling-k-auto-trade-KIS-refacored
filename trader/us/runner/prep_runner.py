@@ -246,7 +246,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     daily_sync_summary = {"sync_target_count": 0, "sync_ok_count": 0, "sync_failed_count": 0, "sync_failed_symbols": [], "open_position_sync_failed_symbols": [], "benchmark_sync_failed_symbols": []}
     try:
         from trader.us.db.repos import load_latest_open_us_position_lifecycles, load_positions
-        from trader.us.symbols import resolve_exchange
+        from trader.us.symbols import resolve_us_exchange
         benchmark_symbols = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
         sync_symbols = {str(s.get("symbol") or "").upper() for s in dynamic_universe_result.get("symbols", [])}
         sync_symbols |= benchmark_symbols
@@ -268,9 +268,9 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         for sym in sorted(sync_symbols):
             try:
                 if hasattr(provider, "get_completed_daily_prices_result"):
-                    result = provider.get_completed_daily_prices_result(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                    result = provider.get_completed_daily_prices_result(sym, resolve_us_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
                 else:
-                    rows = provider.get_completed_daily_prices(sym, resolve_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
+                    rows = provider.get_completed_daily_prices(sym, resolve_us_exchange(sym), trade_date=trade_date, required_bars=int(os.getenv("US_DAILY_REQUIRED_BARS", "260")), allow_http_sync=True)
                     result = {"quality": "OK" if rows else "INSUFFICIENT_HISTORY", "valid_bar_count": len(rows or []), "db_latest": None, "expected_latest": None}
                 if result.get("quality") == "OK":
                     sync_ok.append(sym)
@@ -482,35 +482,8 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     open_position_daily_failed = bool(daily_sync_summary.get("open_position_sync_failed_symbols"))
     benchmark_daily_failed = bool(set(daily_sync_summary.get("benchmark_sync_failed_symbols") or []) & {"SPY", "QQQ", "SMH"})
     if benchmark_daily_failed:
-        market_state_overlay = dict(watchlist_result.get("market_state_overlay") or market_state_overlay or {})
-        market_state_overlay.update({
-            "market_state": "UNKNOWN",
-            "market_regime": "UNKNOWN",
-            "allow_new_buy": False,
-            "allow_add_to_existing": False,
-            "force_entry_block": True,
-            "capital_scale": 0.0,
-            "exposure_multiplier": 0.0,
-            "max_new_positions": 0,
-        })
-        watchlist_result["market_state_overlay"] = dict(market_state_overlay)
-        market_state_fields.update({
-            "market_state": "UNKNOWN",
-            "market_regime": "UNKNOWN",
-            "allow_new_buy": False,
-            "allow_add_to_existing": False,
-            "force_entry_block": True,
-            "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
-            "daily_data_status": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
-            "capital_scale": 0.0,
-            "exposure_multiplier": 0.0,
-            "max_new_positions": 0,
-        })
-        watchlist_result["market_regime"] = "UNKNOWN"
-        watchlist_result["allow_new_buy"] = False
-        watchlist_result["allow_add_to_existing"] = False
-        watchlist_result["force_entry_block"] = True
-        validation["trade_block_reason"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+        market_state_fields["daily_data_status"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+        validation.setdefault("warnings", []).append("BENCHMARK_DAILY_DATA_UNAVAILABLE")
     elif open_position_daily_failed:
         market_state_fields["daily_data_status"] = "DEGRADED_POSITION_DAILY_DATA"
     if du_status == "ERROR" or cp_status == "ERROR":
@@ -533,18 +506,6 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             paths=paths,
         )
         contract["daily_sync_summary"] = daily_sync_summary
-        if benchmark_daily_failed:
-            contract.update({
-                "trade_can_proceed": 0,
-                "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
-                "allow_new_buy": False,
-                "allow_add_to_existing": False,
-                "force_entry_block": True,
-                "market_regime": "UNKNOWN",
-                "market_state": "UNKNOWN",
-                "effective_capital_scale": 0.0,
-                "effective_max_new_positions": 0,
-            })
 
         final_status = contract.get("status", provisional_status)
         trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)
