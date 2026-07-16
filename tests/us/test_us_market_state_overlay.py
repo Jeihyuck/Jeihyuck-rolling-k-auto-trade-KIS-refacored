@@ -42,11 +42,14 @@ def test_forbidden_symbols_include_inverse_and_not_defensive_etfs():
 
 
 def test_oldest_first_defense_crash_thresholds_and_entry_block():
-    for p in [provider(spy=(100, 100, 100, 98)), provider(qqq=(100, 100, 100, 97.2)), provider(smh=(100, 100, 100, 96))]:
+    for p in [provider(spy=(100, 100, 100, 98)), provider(qqq=(100, 100, 100, 97.2))]:
         o = eval_state(provider=p)
         assert o["market_state"] == "DEFENSE_CRASH"
         assert o["force_entry_block"] is True
         assert o["exposure_multiplier"] == 0.0
+    smh_only = eval_state(provider=provider(smh=(100, 100, 100, 96)))
+    assert smh_only["market_state"] != "DEFENSE_CRASH"
+    assert any("SECTOR_CRASH_AI_SEMI" in r for r in smh_only["market_state_reasons"])
     kept, blocked = filter_entry_intents_for_market_state([{"symbol": "AAPL", "side": "BUY"}], o)
     assert kept == []
     assert blocked[0]["reason"] == "DEFENSE_CRASH_ENTRY_BLOCK"

@@ -45,7 +45,10 @@ def test_prep_guard_block_when_missing(tmp_path):
     with patch("trader.us.path_contract.us_prep_contract_path", return_value=missing), \
          patch("trader.us.path_contract.us_signals_latest_prep_contract_path", return_value=missing):
         g = check_us_prep_guard("2024-05-01")
-        assert g["ok"] is False
+        assert g["ok"] is True
+        assert g["entry_can_proceed"] is False
+        assert g["exit_can_proceed"] is True
+        assert g["reason"] == "PREP_MISSING_EXIT_ONLY"
 
 
 def test_prep_guard_block_when_wrong_trade_date(tmp_path):
@@ -81,7 +84,10 @@ def test_prep_guard_block_when_trade_can_proceed_zero(tmp_path):
     with patch("trader.us.path_contract.us_prep_contract_path", return_value=f), \
          patch("trader.us.path_contract.us_signals_latest_prep_contract_path", return_value=missing):
         g = check_us_prep_guard("2024-05-01")
-        assert g["ok"] is False
+        assert g["ok"] is True
+        assert g["entry_can_proceed"] is False
+        assert g["exit_can_proceed"] is True
+        assert str(g["reason"]).startswith("PREP_DEGRADED_ENTRY_BLOCKED")
 
 
 def test_prep_guard_allows_session_when_final30_count_less_than_30(tmp_path):

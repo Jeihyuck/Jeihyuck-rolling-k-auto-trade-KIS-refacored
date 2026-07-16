@@ -766,6 +766,10 @@ def run_daily_report(
         report["report_consistency"] = "FAILED"
         report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
+    if int(report.get("open_position_count", report.get("positions", 0)) or 0) > 0 and float(report.get("invested_market_value_usd", 0) or 0) <= 0:
+        report["report_consistency"] = "REPORT_INCONSISTENT"
+        report["errors"].append("REPORT_VALIDATION_FAILED: positions_nonzero_but_invested_zero")
+        logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=positions_nonzero_but_invested_zero")
     if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
         pass
     elif any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
@@ -980,10 +984,16 @@ def run_daily_report(
         logger.error("[US_DAILY_REPORT][SAVE_FAILED] %s", exc)
         report["errors"].append(f"report_save_failed: {exc}")
     
-    logger.info(
-        "[US_DAILY_REPORT][OK] date=%s session=%s orders_ack=%d",
-        trade_date, session or "N/A", report["orders_ack"]
-    )
+    if report.get("status") == "OK" and report.get("report_consistency") == "OK":
+        logger.info(
+            "[US_DAILY_REPORT][OK] date=%s session=%s orders_ack=%d",
+            trade_date, session or "N/A", report["orders_ack"]
+        )
+    else:
+        logger.error(
+            "[US_DAILY_REPORT][REPORT_INCONSISTENT] date=%s session=%s status=%s consistency=%s errors=%s",
+            trade_date, session or "N/A", report.get("status"), report.get("report_consistency"), report.get("errors", [])
+        )
     
     return {"status": report.get("status", "OK" if not report["errors"] else "ERROR"), "report": report}
 

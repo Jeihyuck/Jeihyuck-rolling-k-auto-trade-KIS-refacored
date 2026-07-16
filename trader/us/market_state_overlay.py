@@ -273,9 +273,18 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
             else:
                 caution = True
 
+    global_crash_confirmations = 0
+    global_crash_confirmations += int(spy1 is not None and spy1 <= -0.012)
+    global_crash_confirmations += int(qqq1 is not None and qqq1 <= -0.018)
+    global_crash_confirmations += int(smh1 is not None and smh1 <= -0.025)
     hit(spy1 is not None and spy1 <= -0.020, "crash", "SPY_1D_LE_-2.0pct")
     hit(qqq1 is not None and qqq1 <= -0.028, "crash", "QQQ_1D_LE_-2.8pct")
-    hit(smh1 is not None and smh1 <= -0.040, "crash", "SMH_1D_LE_-4.0pct")
+    if smh1 is not None and smh1 <= -0.040:
+        if global_crash_confirmations >= 2:
+            hit(True, "crash", "SMH_1D_LE_-4.0pct_WITH_GLOBAL_CONFIRM")
+        else:
+            riskoff = True
+            reasons.append("SECTOR_CRASH_AI_SEMI:SMH_1D_LE_-4.0pct")
     hit(pnl1 is not None and pnl1 <= -0.018, "crash", "ACCOUNT_INTRADAY_LE_-1.8pct")
     hit(pnl5 is not None and pnl5 <= -0.050, "crash", "ACCOUNT_5D_LE_-5.0pct")
     hit(suspect and suspect_policy == "block", "crash", "ROTATION_CONTEXT_SUSPECT_BLOCK")

@@ -240,7 +240,19 @@ def route_order(
     )
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
-    exchange = intent.get("exchange", "NASDAQ")
+    exchange = intent.get("exchange", "")
+    if side == "SELL" and not str(exchange or "").strip():
+        source_chain = ["intent.exchange:missing"]
+        try:
+            from trader.us.symbols import resolve_exchange
+            exchange = resolve_exchange(symbol_upper)
+            intent["exchange"] = exchange
+            source_chain.append(f"symbol_registry:{exchange}")
+            logger.info("[US_EXIT_INTENT][EXCHANGE_ENRICHED] symbol=%s exchange=%s source_chain=%s", symbol_upper, exchange, ">".join(source_chain))
+        except Exception:
+            logger.error("[US_EXIT_INTENT][EXCHANGE_MISSING_FATAL] symbol=%s source_chain=%s", symbol_upper, ">".join(source_chain))
+    if side != "SELL" and not str(exchange or "").strip():
+        exchange = "NASDAQ"
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
     trade_date = intent.get("trade_date")
 

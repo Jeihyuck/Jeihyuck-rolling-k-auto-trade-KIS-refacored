@@ -275,6 +275,18 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
 
         existing.update({k: v for k, v in session_entry.items() if k in {"branch", "commit_sha", "sha", "workflow", "github_run_id", "github_run_attempt", "event_name", "actor", "run_id", "code_version_source"}})
         existing.setdefault("trade_date", trade_date)
+        existing["active_scheduler"] = "windows_task_scheduler"
+        existing.setdefault("expected_sessions", {
+            "prep_prewarm": {"expected_at_kst": ["19:30", "20:30"], "scheduler": "windows_task_scheduler"},
+            "prep_regular": {"expected_at_kst": "21:30", "scheduler": "windows_task_scheduler", "log": "runtime/wsl-us-prep.log"},
+            "prep_recovery": {"expected_at_kst": "22:10", "scheduler": "windows_task_scheduler", "log": "runtime/wsl-us-prep-recovery.log"},
+            "am_preflight": {"expected_at_kst": "22:20", "scheduler": "windows_task_scheduler", "log": "runtime/wsl-us-am-preflight.log"},
+            "am": {"expected_at_kst": "22:30", "scheduler": "windows_task_scheduler"},
+            "afternoon": {"expected_at_kst": "02:00", "scheduler": "windows_task_scheduler"},
+            "close": {"expected_at_kst": "05:05", "scheduler": "windows_task_scheduler"},
+            "mail": {"expected_at_kst": "07:00", "scheduler": "windows_task_scheduler"},
+            "health": {"expected_at_kst": "07:10", "scheduler": "windows_task_scheduler"},
+        })
         existing.setdefault("sessions", {})
         existing["sessions"][session] = session_entry
         existing["updated_at_utc"] = now_utc
@@ -619,22 +631,34 @@ def run_trade_session(
                         guard.get("score_nonzero_count", "?"),
                         guard.get("underfilled_tier", "?"),
                     )
-                    _write_us_schedule_health(
-                        {
-                            "trade_date": trade_date,
-                            "final_status": "FAILED_PREP_GUARD",
+                    if guard.get("guard_state") == "PREP_HARD_SYSTEM_FAILURE":
+                        _write_us_schedule_health(
+                            {
+                                "trade_date": trade_date,
+                                "final_status": "FAILED_PREP_GUARD",
+                                "reason": f"prep_guard_block:{guard.get('reason')}",
+                                "tick_count": 0,
+                                "workflow": f"us-trade-{session}",
+                            },
+                            session,
+                        )
+                        return {
+                            "status": "FAILED_PREP_GUARD",
                             "reason": f"prep_guard_block:{guard.get('reason')}",
-                            "tick_count": 0,
-                            "workflow": f"us-trade-{session}",
-                        },
-                        session,
-                    )
-                    return {
-                        "status": "FAILED_PREP_GUARD",
-                        "reason": f"prep_guard_block:{guard.get('reason')}",
-                        "session": session,
-                        "trade_date": trade_date,
+                            "session": session,
+                            "trade_date": trade_date,
+                        }
+                    prep_guard_result = {
+                        **prep_guard_result,
+                        "entry_can_proceed": False,
+                        "exit_can_proceed": bool(guard.get("exit_can_proceed", True)),
+                        "close_can_proceed": bool(guard.get("close_can_proceed", True)),
+                        "reason": guard.get("reason", "PREP_DEGRADED_ENTRY_BLOCKED"),
                     }
+                    logger.warning(
+                        "[US_PREP_GUARD][EXIT_ONLY] workflow=us-trade-%s session=%s trade_date=%s reason=%s",
+                        session, session, trade_date, prep_guard_result["reason"],
+                    )
             except Exception as _guard_exc:
                 logger.warning(
                     "[US_PREP_GUARD][WARN] session=%s guard check failed: %s — proceeding with caution",
@@ -1431,10 +1455,10 @@ def run_trade_session(
             },
             # 추가 필드
             "expected_min_ticks": expected_min_ticks,
-            "liveness_status": "FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK",
+            "liveness_status": "FAILED" if (session in ("am", "afternoon") and tick_count == 0 and actual_is_trading_day) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
             "last_liveness_event": _last_liveness_event,
             "has_session_finally": True,
-            "probable_liveness_cause": (root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "",
+            "probable_liveness_cause": ("NO_TICK_EXECUTED" if (session in ("am", "afternoon") and tick_count == 0 and actual_is_trading_day) else ((root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "")),
             "root_cause": root_cause,
             "surface_reason": surface_reason,
             "received_signal": _signal_name(_received_signal),
