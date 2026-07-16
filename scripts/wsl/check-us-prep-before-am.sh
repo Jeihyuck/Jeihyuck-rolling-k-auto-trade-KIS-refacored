@@ -23,10 +23,11 @@ export WSL_RUN_SOURCE="local-wsl"
 export WSL_RUN_MARKET="US"
 export WSL_RUN_SESSION="prep_guard"
 
-cmd=("${PYTHON_BIN}" scripts/guard_us_prep_contract.py --session am)
 if [[ -n "${US_FORCE_NOW:-}" ]]; then
-  cmd+=(--force-now "${US_FORCE_NOW}")
+  export FORCE_NOW_INPUT="${US_FORCE_NOW}"
 fi
 
-echo "[$(date -Is)] [US_PREP_GUARD_WSL][START] cmd=${cmd[*]}" >> "${LOG_FILE}"
+cmd=("${PYTHON_BIN}" scripts/guard_us_prep_contract.py --session am)
+
+echo "[$(date -Is)] [US_PREP_GUARD_WSL][START] cmd=${cmd[*]} force_now_input=${FORCE_NOW_INPUT:-}" >> "${LOG_FILE}"
 "${cmd[@]}" >> "${LOG_FILE}" 2>&1
