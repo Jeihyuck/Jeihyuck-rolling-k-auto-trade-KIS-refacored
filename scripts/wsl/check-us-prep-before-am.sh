@@ -2,7 +2,20 @@
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p runtime/health
-trade_date="${US_TRADE_DATE:-$(TZ=America/New_York date +%F)}"
+if [[ -n "${US_TRADE_DATE:-}" ]]; then
+  trade_date="${US_TRADE_DATE}"
+elif [[ -n "${US_FORCE_NOW:-}" ]]; then
+  export FORCE_NOW_INPUT="${US_FORCE_NOW}"
+  trade_date="$(python - <<'PYDATE'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import os
+print(datetime.fromisoformat(os.environ["US_FORCE_NOW"]).astimezone(ZoneInfo("America/New_York")).date().isoformat())
+PYDATE
+)"
+else
+  trade_date="$(TZ=America/New_York date +%F)"
+fi
 check() {
 python - "$trade_date" <<'PY'
 import json, sys

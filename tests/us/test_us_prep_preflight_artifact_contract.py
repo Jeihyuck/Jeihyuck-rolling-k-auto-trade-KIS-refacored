@@ -7,7 +7,7 @@ def test_preflight_uses_final30_scored_not_locked_watchlist():
     assert 'locked_watchlist.json' not in script
 
 
-def test_us_force_now_exports_force_now_input():
+def test_us_force_now_passes_cli_and_exports_force_now_input():
     script = Path('scripts/wsl/run-us-prep.sh').read_text()
     assert 'export FORCE_NOW_INPUT="${US_FORCE_NOW}"' in script
-    assert 'cmd+=(--force-now "${US_FORCE_NOW}")' not in script
+    assert 'cmd+=(--force-now "${US_FORCE_NOW}")' in script

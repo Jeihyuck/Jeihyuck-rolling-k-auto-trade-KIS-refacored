@@ -127,11 +127,26 @@ def _get_broker_position(kis_client: Any, symbol: str) -> dict | None:
     return {}
 
 
+def _normalize_exchange_code(exchange: str) -> str:
+    ex = str(exchange or "").upper().strip()
+    aliases = {
+        "NAS": "NASDAQ",
+        "NASD": "NASDAQ",
+        "NASDAQ": "NASDAQ",
+        "NYS": "NYSE",
+        "NYSE": "NYSE",
+        "AMS": "AMEX",
+        "AMEX": "AMEX",
+        "ASE": "AMEX",
+    }
+    return aliases.get(ex, ex)
+
+
 def _lookup_nested_exchange(obj: Any) -> str:
     if not isinstance(obj, dict):
         return ""
     for key in ("exchange", "exch", "market", "ovrs_excg_cd", "tr_mket_name"):
-        val = str(obj.get(key) or "").upper().strip()
+        val = _normalize_exchange_code(obj.get(key))
         if val:
             return val
     return ""
@@ -159,7 +174,7 @@ def enrich_sell_exchange(intent: dict, kis_client: Any = None) -> str:
     static_map = {"SPY": "NYSE", "DIA": "NYSE", "IWM": "NYSE", "QQQ": "NASDAQ", "QQQM": "NASDAQ", "SMH": "NASDAQ", "SOXX": "NASDAQ"}
     candidates.append(static_map.get(symbol, ""))
     for ex in candidates:
-        ex = str(ex or "").upper().strip()
+        ex = _normalize_exchange_code(ex)
         if ex:
             intent["exchange"] = ex
             return ex
