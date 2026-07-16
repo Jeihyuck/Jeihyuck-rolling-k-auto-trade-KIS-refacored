@@ -2,6 +2,17 @@
 
 ## 운영 원칙
 
+## 단일 자동 스케줄러 원칙
+
+- Windows Task Scheduler is the only automatic scheduler for KR/US WSL trading.
+- WSL cron must not run trading sessions under WSL; `scripts/wsl/install-nullim-cron.sh` removes legacy NULLIM cron blocks.
+- GitHub Actions workflows are manual diagnostic/smoke/report workflows only.
+- US prep/market schedule (KST): 19:30/20:30 prewarm, 21:30 regular prep, 22:10 recovery, 22:20 AM preflight, 22:30 AM, 02:00 afternoon, 05:05 close, 07:00 mail, 07:10 health.
+- If same-day US prep is missing, entry is blocked but exit monitoring and close/reconcile continue.
+- Verify Windows tasks with `powershell -ExecutionPolicy Bypass -File scripts/windows/verify-scheduler.ps1`.
+- `runtime/cron` logs are legacy; use `runtime/wsl-us-*.log` and `reports/us_schedule_health/*.json` for current status.
+
+
 - GitHub Actions schedule은 한국장/미국장 주문 가능 workflow에서 모두 제거되었습니다.
 - GitHub Actions는 `workflow_dispatch` 수동 실행만 가능합니다.
 - GitHub Actions 수동 실행은 기본 `INTENT_ONLY`/`DRY_RUN` 안전모드입니다.

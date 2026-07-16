@@ -63,7 +63,7 @@ PYTHON_BIN="python"
 if [[ -x .venv/bin/python ]]; then PYTHON_BIN=.venv/bin/python; fi
 cmd=("${PYTHON_BIN}" -m trader.us.runner.dispatcher --mode prep --env practice)
 if [[ -n "${US_FORCE_NOW:-}" ]]; then
-  cmd+=(--force-now "${US_FORCE_NOW}")
+  export FORCE_NOW_INPUT="${US_FORCE_NOW}"
 fi
 if [[ "${US_OFFLINE:-0}" == "1" ]]; then
   cmd+=(--offline)

@@ -588,7 +588,7 @@ def run_daily_report(
                 invested = sum(_position_market_value_usd(pos) for pos in positions)
                 final_balance_invested = sum(_position_market_value_usd(pos) for pos in final_balance_positions)
                 canonical_positions = positions
-                if final_balance_positions and (not positions or invested <= 0 or len(final_balance_positions) > len(positions)):
+                if final_balance_positions:
                     canonical_positions = final_balance_positions
                     invested = final_balance_invested
                     report["positions"] = len(canonical_positions)
@@ -602,7 +602,8 @@ def run_daily_report(
                 else:
                     report["canonical_position_source"] = "db_positions"
                 if len(canonical_positions) > 0 and invested <= 0:
-                    report["warnings"].append("REPORT_VALIDATION_FAILED: positions_nonzero_but_invested_zero")
+                    report["warnings"].append("REPORT_INCONSISTENT: positions_nonzero_but_invested_zero")
+                    report["report_consistency"] = "REPORT_INCONSISTENT"
                 try:
                     from trader.us.rotation import apply_cap_flags, compute_cluster_exposure
                     regime = str(report.get("rotation_regime") or "NEUTRAL")
@@ -768,12 +769,14 @@ def run_daily_report(
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
     if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
         pass
-    elif any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
+    elif any(str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
+        report["report_consistency"] = "REPORT_INCONSISTENT"
+    elif any(str(w).startswith("SOURCE_MISMATCH") for w in report.get("warnings", [])):
         report["report_consistency"] = "SOURCE_MISMATCH"
     else:
         report["report_consistency"] = (report.get("canonical_sources") or {}).get("report_consistency", "OK")
 
-    if report.get("report_consistency") == "SOURCE_MISMATCH":
+    if report.get("report_consistency") in {"SOURCE_MISMATCH", "REPORT_INCONSISTENT"}:
         report["status"] = "WARNING_RECONCILE_MISMATCH"
     elif report["errors"]:
         report["status"] = "FAILED_RECONCILE"
@@ -980,10 +983,16 @@ def run_daily_report(
         logger.error("[US_DAILY_REPORT][SAVE_FAILED] %s", exc)
         report["errors"].append(f"report_save_failed: {exc}")
     
-    logger.info(
-        "[US_DAILY_REPORT][OK] date=%s session=%s orders_ack=%d",
-        trade_date, session or "N/A", report["orders_ack"]
-    )
+    if report.get("status") == "OK" and report.get("report_consistency") == "OK" and not report.get("errors"):
+        logger.info(
+            "[US_DAILY_REPORT][OK] date=%s session=%s orders_ack=%d",
+            trade_date, session or "N/A", report["orders_ack"]
+        )
+    else:
+        logger.warning(
+            "[US_DAILY_REPORT][NOT_OK] date=%s session=%s status=%s consistency=%s errors=%d",
+            trade_date, session or "N/A", report.get("status"), report.get("report_consistency"), len(report.get("errors") or [])
+        )
     
     return {"status": report.get("status", "OK" if not report["errors"] else "ERROR"), "report": report}
 

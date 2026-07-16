@@ -273,9 +273,19 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
             else:
                 caution = True
 
+    global_crash_confirmations = [
+        spy1 is not None and spy1 <= -0.012,
+        qqq1 is not None and qqq1 <= -0.018,
+        smh1 is not None and smh1 <= -0.025,
+        pnl1 is not None and pnl1 <= -0.018,
+    ]
+    sector_crash_ai_semi = bool(smh1 is not None and smh1 <= -0.040 and sum(1 for x in global_crash_confirmations if x) < 2)
     hit(spy1 is not None and spy1 <= -0.020, "crash", "SPY_1D_LE_-2.0pct")
     hit(qqq1 is not None and qqq1 <= -0.028, "crash", "QQQ_1D_LE_-2.8pct")
-    hit(smh1 is not None and smh1 <= -0.040, "crash", "SMH_1D_LE_-4.0pct")
+    hit(smh1 is not None and smh1 <= -0.040 and not sector_crash_ai_semi, "crash", "SMH_1D_LE_-4.0pct")
+    if sector_crash_ai_semi:
+        reasons.append("SECTOR_CRASH_AI_SEMI:SMH_1D_LE_-4.0pct")
+        riskoff = True
     hit(pnl1 is not None and pnl1 <= -0.018, "crash", "ACCOUNT_INTRADAY_LE_-1.8pct")
     hit(pnl5 is not None and pnl5 <= -0.050, "crash", "ACCOUNT_5D_LE_-5.0pct")
     hit(suspect and suspect_policy == "block", "crash", "ROTATION_CONTEXT_SUSPECT_BLOCK")
@@ -404,6 +414,8 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         **acct,
         **constraints,
         "market_state": state,
+        "sector_state": "SECTOR_CRASH_AI_SEMI" if sector_crash_ai_semi else "NONE",
+        "global_crash_confirmations": sum(1 for x in global_crash_confirmations if x),
         "defense_regime": state if state.startswith("DEFENSE") else "NONE",
         "risk_on_regime": state if state.endswith("RISK_ON") else "NONE",
         "market_state_reasons": reasons,
