@@ -11,6 +11,8 @@ $defs = @(
   @{Name="PB1 KR Mail WSL"; Time="16:00"; Cmd="$base/send-market-log-mail.sh kr"; Limit="PT1H"},
   @{Name="PB1 KR Health WSL"; Time="16:10"; Cmd="$base/check-nullim-day-health.sh kr"; Limit="PT30M"},
   @{Name="PB1 US Prep WSL"; Time="21:30"; Cmd="$base/run-us-prep.sh"; Limit="PT2H"},
+  @{Name="PB1 US Prep Guard WSL"; Time="22:20"; Cmd="bash $base/check-us-prep-before-am.sh"; Limit="PT30M"},
+  @{Name="PB1 US Prep Recovery WSL"; Time="22:25"; Cmd="bash $base/run-us-prep-recovery.sh"; Limit="PT1H"},
   @{Name="PB1 US AM WSL"; Time="22:30"; Cmd="$base/run-us-am.sh"; Limit="PT5H"},
   @{Name="PB1 US Afternoon WSL"; Time="02:00"; Cmd="$base/run-us-afternoon.sh"; Limit="PT5H"},
   @{Name="PB1 US Close WSL"; Time="05:05"; Cmd="$base/run-us-close.sh"; Limit="PT1H"},

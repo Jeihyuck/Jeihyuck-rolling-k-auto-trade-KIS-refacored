@@ -636,9 +636,20 @@ def run_trade_session(
                         "trade_date": trade_date,
                     }
             except Exception as _guard_exc:
+                prep_guard_result = {
+                    "ok": False,
+                    "status": "PREP_GUARD_EXCEPTION_EXIT_ONLY",
+                    "reason": "PREP_GUARD_EXCEPTION_EXIT_ONLY",
+                    "entry_can_proceed": False,
+                    "exit_can_proceed": True,
+                    "close_can_proceed": True,
+                    "session_can_run": True,
+                    "guard_exception": str(_guard_exc),
+                }
                 logger.warning(
-                    "[US_PREP_GUARD][WARN] session=%s guard check failed: %s — proceeding with caution",
-                    session, _guard_exc,
+                    "[US_PREP_GUARD][EXCEPTION_EXIT_ONLY] session=%s trade_date=%s "
+                    "reason=PREP_GUARD_EXCEPTION_EXIT_ONLY error=%s entry_can_proceed=0 exit_can_proceed=1 close_can_proceed=1 session_can_run=1",
+                    session, trade_date, _guard_exc,
                 )
         elif session in ("am", "afternoon") and offline:
             logger.info("[US_PREP_GUARD][BYPASS] session=%s offline=True — skipping prep guard", session)
