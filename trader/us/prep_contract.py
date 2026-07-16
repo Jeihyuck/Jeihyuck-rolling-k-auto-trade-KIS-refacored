@@ -538,24 +538,42 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     if locked_count < 10:
         return {
             **count_payload,
-            "ok": False,
-            "trade_can_proceed": False,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
             "reason": f"db_locked_watchlist_count={locked_count}<10",
         }
 
     if score_nonzero_count <= 0:
         return {
             **count_payload,
-            "ok": False,
-            "trade_can_proceed": False,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
             "reason": "db_locked_watchlist_score_nonzero=0",
         }
 
     if score_nonzero_count != locked_count:
         return {
             **count_payload,
-            "ok": False,
-            "trade_can_proceed": False,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
             "reason": f"db_score_contract_failed:{score_nonzero_count}!={locked_count}",
         }
 
@@ -584,9 +602,15 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
 
     if contract.get("trade_date") != trade_date:
         return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": f"prep_contract_trade_date_mismatch:{contract.get('trade_date')}!={trade_date}",
+            "ok": True,
+            "guard_state": "PREP_STALE_EXIT_ONLY",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
+            "reason": f"PREP_STALE_EXIT_ONLY:prep_contract_trade_date_mismatch:{contract.get('trade_date')}!={trade_date}",
             "contract": contract,
             "source": "stale",
         }

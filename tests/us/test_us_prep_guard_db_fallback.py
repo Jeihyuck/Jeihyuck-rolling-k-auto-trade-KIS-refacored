@@ -45,7 +45,7 @@ def test_db_fallback_ok_when_file_missing(monkeypatch):
 
 
 def test_db_fallback_fail_when_prep_status_unknown(monkeypatch):
-    """prep_status=UNKNOWN이면 ok=False."""
+    """prep_status=UNKNOWN이면 PREP_MISSING_EXIT_ONLY로 exit/close를 살린다."""
     import trader.us.prep_contract as pc_mod
     import trader.us.db.repos as repos_mod
 
@@ -65,12 +65,16 @@ def test_db_fallback_fail_when_prep_status_unknown(monkeypatch):
     )
 
     result = pc_mod.check_us_prep_guard("2026-06-01")
-    assert result["ok"] is False
-    assert "UNKNOWN" in result["reason"]
+    assert result["ok"] is True
+    assert result["guard_state"] == "PREP_MISSING_EXIT_ONLY"
+    assert result["entry_can_proceed"] is False
+    assert result["exit_can_proceed"] is True
+    assert result["close_can_proceed"] is True
+    assert result["reason"] == "PREP_MISSING_EXIT_ONLY"
 
 
 def test_db_fallback_fail_when_locked_count_zero(monkeypatch):
-    """locked rows=0이면 ok=False."""
+    """locked rows=0이면 entry만 차단하고 exit/close는 허용한다."""
     import trader.us.prep_contract as pc_mod
     import trader.us.db.repos as repos_mod
 
@@ -90,12 +94,16 @@ def test_db_fallback_fail_when_locked_count_zero(monkeypatch):
     )
 
     result = pc_mod.check_us_prep_guard("2026-06-01")
-    assert result["ok"] is False
+    assert result["ok"] is True
+    assert result["guard_state"] == "PREP_DEGRADED_ENTRY_BLOCKED"
+    assert result["entry_can_proceed"] is False
+    assert result["exit_can_proceed"] is True
+    assert result["close_can_proceed"] is True
     assert "locked_watchlist_count" in result["reason"]
 
 
 def test_db_fallback_fail_when_score_nonzero_zero(monkeypatch):
-    """locked rows 30개이지만 score=0이면 ok=False."""
+    """locked rows 30개이지만 score=0이면 entry만 차단한다."""
     import trader.us.prep_contract as pc_mod
     import trader.us.db.repos as repos_mod
 
@@ -117,7 +125,10 @@ def test_db_fallback_fail_when_score_nonzero_zero(monkeypatch):
     )
 
     result = pc_mod.check_us_prep_guard("2026-06-01")
-    assert result["ok"] is False
+    assert result["ok"] is True
+    assert result["guard_state"] == "PREP_DEGRADED_ENTRY_BLOCKED"
+    assert result["entry_can_proceed"] is False
+    assert result["exit_can_proceed"] is True
     assert "score_nonzero" in result["reason"]
 
 

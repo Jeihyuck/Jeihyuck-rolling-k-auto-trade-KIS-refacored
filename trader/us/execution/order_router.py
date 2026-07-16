@@ -187,6 +187,76 @@ def _pending_sell_qty_for_symbol(symbol: str, trade_date: str | None) -> int:
         logger.warning("[US_ORDER][PENDING_SELL_QTY][WARN] symbol=%s trade_date=%s err=%s", symbol, trade_date, exc)
         return 0
 
+
+def _first_exchange_from_mapping(row: Any) -> str:
+    if not isinstance(row, dict):
+        return ""
+    for key in ("exchange", "exch", "market", "ovrs_excg_cd", "pdno_excg_cd"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _enrich_sell_exchange(intent: dict, symbol: str, kis_client: Any | None = None) -> str:
+    """Resolve SELL exchange before risk gate using holding/balance/watchlist/registry fallbacks."""
+    source_chain: list[str] = []
+    exchange = str(intent.get("exchange") or "").strip()
+    if exchange:
+        return exchange
+    source_chain.append("intent.exchange:missing")
+
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    for label, row in (
+        ("current_holding", intent.get("current_holding") or intent.get("holding") or meta.get("current_holding") or meta.get("holding") or meta.get("position")),
+        ("kis_balance", intent.get("kis_balance_position") or intent.get("balance_position") or meta.get("kis_balance_position") or meta.get("balance_position")),
+        ("locked_watchlist", intent.get("locked_watchlist_row") or meta.get("locked_watchlist_row") or meta.get("watchlist_row")),
+    ):
+        exchange = _first_exchange_from_mapping(row)
+        if exchange:
+            source_chain.append(f"{label}:{exchange}")
+            intent["exchange"] = exchange
+            logger.info("[US_EXIT_INTENT][EXCHANGE_ENRICHED] symbol=%s exchange=%s source_chain=%s", symbol, exchange, ">".join(source_chain))
+            return exchange
+        source_chain.append(f"{label}:missing")
+
+    if kis_client is not None:
+        try:
+            broker_pos = _get_broker_position(kis_client, symbol) or {}
+            exchange = _first_exchange_from_mapping(broker_pos)
+            if exchange:
+                source_chain.append(f"kis_balance_api:{exchange}")
+                intent["exchange"] = exchange
+                logger.info("[US_EXIT_INTENT][EXCHANGE_ENRICHED] symbol=%s exchange=%s source_chain=%s", symbol, exchange, ">".join(source_chain))
+                return exchange
+        except Exception as exc:
+            source_chain.append(f"kis_balance_api_error:{type(exc).__name__}")
+
+    try:
+        from trader.us.symbols import resolve_exchange
+        exchange = resolve_exchange(symbol)
+        intent["exchange"] = exchange
+        source_chain.append(f"symbol_registry:{exchange}")
+        logger.info("[US_EXIT_INTENT][EXCHANGE_ENRICHED] symbol=%s exchange=%s source_chain=%s", symbol, exchange, ">".join(source_chain))
+        return exchange
+    except Exception:
+        source_chain.append("symbol_registry:missing")
+
+    known_map = {
+        "AAPL": "NASDAQ", "AMZN": "NASDAQ", "GOOGL": "NASDAQ", "META": "NASDAQ", "MSFT": "NASDAQ",
+        "NVDA": "NASDAQ", "QQQ": "NASDAQ", "QQQM": "NASDAQ", "SMH": "NASDAQ", "SOXX": "NASDAQ",
+        "TSLA": "NASDAQ", "JPM": "NYSE", "V": "NYSE", "CAT": "NYSE", "IBM": "NYSE", "TSM": "NYSE",
+    }
+    exchange = known_map.get(str(symbol or "").upper().strip(), "")
+    if exchange:
+        intent["exchange"] = exchange
+        source_chain.append(f"known_us_exchange_map:{exchange}")
+        logger.info("[US_EXIT_INTENT][EXCHANGE_ENRICHED] symbol=%s exchange=%s source_chain=%s", symbol, exchange, ">".join(source_chain))
+        return exchange
+
+    logger.error("[US_EXIT_INTENT][EXCHANGE_MISSING_FATAL] symbol=%s source_chain=%s", symbol, ">".join(source_chain))
+    return ""
+
 def route_order(
     intent: dict,
     *,
@@ -242,15 +312,7 @@ def route_order(
     price = float(intent.get("limit_price", 0.0))
     exchange = intent.get("exchange", "")
     if side == "SELL" and not str(exchange or "").strip():
-        source_chain = ["intent.exchange:missing"]
-        try:
-            from trader.us.symbols import resolve_exchange
-            exchange = resolve_exchange(symbol_upper)
-            intent["exchange"] = exchange
-            source_chain.append(f"symbol_registry:{exchange}")
-            logger.info("[US_EXIT_INTENT][EXCHANGE_ENRICHED] symbol=%s exchange=%s source_chain=%s", symbol_upper, exchange, ">".join(source_chain))
-        except Exception:
-            logger.error("[US_EXIT_INTENT][EXCHANGE_MISSING_FATAL] symbol=%s source_chain=%s", symbol_upper, ">".join(source_chain))
+        exchange = _enrich_sell_exchange(intent, symbol_upper, kis_client=kis_client)
     if side != "SELL" and not str(exchange or "").strip():
         exchange = "NASDAQ"
     order_key = intent.get("client_order_key") or intent.get("order_key", "")

@@ -52,7 +52,7 @@ def test_prep_guard_block_when_missing(tmp_path):
 
 
 def test_prep_guard_block_when_wrong_trade_date(tmp_path):
-    """trade_date 불일치 시 ok=False여야 한다."""
+    """trade_date 불일치 시 stale exit-only로 session liveness를 유지한다."""
     try:
         from trader.us.prep_contract import check_us_prep_guard
     except ImportError:
@@ -65,7 +65,12 @@ def test_prep_guard_block_when_wrong_trade_date(tmp_path):
     with patch("trader.us.path_contract.us_prep_contract_path", return_value=f), \
          patch("trader.us.path_contract.us_signals_latest_prep_contract_path", return_value=missing):
         g = check_us_prep_guard("2024-05-01")
-        assert g["ok"] is False
+        assert g["ok"] is True
+        assert g["guard_state"] == "PREP_STALE_EXIT_ONLY"
+        assert g["entry_can_proceed"] is False
+        assert g["exit_can_proceed"] is True
+        assert g["close_can_proceed"] is True
+        assert str(g["reason"]).startswith("PREP_STALE_EXIT_ONLY:prep_contract_trade_date_mismatch")
 
 
 def test_prep_guard_block_when_trade_can_proceed_zero(tmp_path):
