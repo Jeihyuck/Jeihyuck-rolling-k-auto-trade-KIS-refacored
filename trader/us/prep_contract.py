@@ -495,20 +495,33 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
         if trade_can_proceed != 1:
             return {
                 **base_payload,
-                "ok": False,
-                "trade_can_proceed": False,
-                "reason": f"db_trade_can_proceed=0:{result.get('trade_block_reason') or status}",
+                "ok": True,
+                "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+                "trade_can_proceed": True,
+                "session_can_run": True,
+                "entry_can_proceed": False,
+                "exit_can_proceed": True,
+                "close_can_proceed": True,
+                "new_buy_budget": 0,
+                "reason": f"PREP_DEGRADED_ENTRY_BLOCKED:db_trade_can_proceed=0:{result.get('trade_block_reason') or status}",
             }
     elif status not in ("OK", "OK_WITH_WARNINGS"):
         logger.warning(
             "[US_PREP_GUARD][DB_FALLBACK][FAIL] trade_date=%s reason=db_prep_status_not_ok status=%s",
             trade_date, status,
         )
+        safe_reason = "PREP_MISSING_EXIT_ONLY" if status == "UNKNOWN" else "PREP_STALE_EXIT_ONLY"
         return {
             **base_payload,
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": f"db_prep_status_not_ok:{status}",
+            "ok": True,
+            "guard_state": safe_reason,
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
+            "reason": safe_reason,
         }
 
     rows = load_locked_us_watchlist(
@@ -525,24 +538,42 @@ def _check_us_prep_guard_from_db(trade_date: str) -> dict:
     if locked_count < 10:
         return {
             **count_payload,
-            "ok": False,
-            "trade_can_proceed": False,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
             "reason": f"db_locked_watchlist_count={locked_count}<10",
         }
 
     if score_nonzero_count <= 0:
         return {
             **count_payload,
-            "ok": False,
-            "trade_can_proceed": False,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
             "reason": "db_locked_watchlist_score_nonzero=0",
         }
 
     if score_nonzero_count != locked_count:
         return {
             **count_payload,
-            "ok": False,
-            "trade_can_proceed": False,
+            "ok": True,
+            "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
             "reason": f"db_score_contract_failed:{score_nonzero_count}!={locked_count}",
         }
 
@@ -571,9 +602,15 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
 
     if contract.get("trade_date") != trade_date:
         return {
-            "ok": False,
-            "trade_can_proceed": False,
-            "reason": f"prep_contract_trade_date_mismatch:{contract.get('trade_date')}!={trade_date}",
+            "ok": True,
+            "guard_state": "PREP_STALE_EXIT_ONLY",
+            "trade_can_proceed": True,
+            "session_can_run": True,
+            "entry_can_proceed": False,
+            "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "new_buy_budget": 0,
+            "reason": f"PREP_STALE_EXIT_ONLY:prep_contract_trade_date_mismatch:{contract.get('trade_date')}!={trade_date}",
             "contract": contract,
             "source": "stale",
         }
@@ -619,7 +656,7 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
             close_can_proceed = 1
             logger.warning("[US_PREP_GUARD][LEGACY_CONTRACT_DEGRADED] split_permissions_missing entry_can_proceed=0 exit_can_proceed=1 close_can_proceed=1 original_status=%s", status)
         elif trade_can_proceed != 1:
-            return {**base_payload, "ok": False, "trade_can_proceed": False, "reason": f"trade_can_proceed=0:{trade_block_reason or status}"}
+            return {**base_payload, "ok": True, "guard_state": "PREP_DEGRADED_ENTRY_BLOCKED", "trade_can_proceed": True, "session_can_run": True, "entry_can_proceed": False, "exit_can_proceed": True, "close_can_proceed": True, "new_buy_budget": 0, "reason": f"PREP_DEGRADED_ENTRY_BLOCKED:{trade_block_reason or status}"}
     session_permission_ok = bool(close_can_proceed) if session_name == "close" else bool(entry_can_proceed or exit_can_proceed)
     if not session_permission_ok:
         reason = "close_can_proceed=0" if session_name == "close" else "entry_and_exit_can_proceed_false"
@@ -638,4 +675,3 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
     ok_payload = {**base_payload, "ok": True, "trade_can_proceed": True, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "session_can_run": True, "reason": reason}
     logger.info("[US_PREP_GUARD][OK] session=%s entry_can_proceed=%d exit_can_proceed=%d close_can_proceed=%d reason=%s final30=%d", session_name, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)), int(bool(close_can_proceed)), reason, final30_scored_count)
     return ok_payload
-

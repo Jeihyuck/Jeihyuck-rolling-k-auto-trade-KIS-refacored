@@ -587,8 +587,8 @@ def run_daily_report(
                 report["full_position"] = report["available_new_slots"] <= 0
                 invested = sum(_position_market_value_usd(pos) for pos in positions)
                 final_balance_invested = sum(_position_market_value_usd(pos) for pos in final_balance_positions)
-                canonical_positions = positions
-                if final_balance_positions and (not positions or invested <= 0 or len(final_balance_positions) > len(positions)):
+                canonical_positions = final_balance_positions if final_balance_positions else positions
+                if final_balance_positions:
                     canonical_positions = final_balance_positions
                     invested = final_balance_invested
                     report["positions"] = len(canonical_positions)
@@ -653,7 +653,26 @@ def run_daily_report(
 
             db_ack = int(report.get("orders_ack", 0) or 0)
             fill_count = int(report.get("fills", 0) or 0)
-            balance_confirmed = load_balance_confirmed_count(trade_date)
+            close_balance_delta_confirmed = 0
+            if session == "close":
+                try:
+                    from trader.us.data_provider import USDataProvider
+                    from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
+                    close_provider = USDataProvider(offline=offline)
+                    close_class = classify_ack_orders_with_final_balance(provider=close_provider, trade_date=trade_date, env=env)
+                    report["order_final_classification"] = close_class.get("orders", [])
+                    report["order_final_classification_counts"] = close_class.get("counts", {})
+                    close_balance_delta_confirmed = int((close_class.get("counts") or {}).get("balance_delta_confirmed", 0) or 0)
+                    if close_class.get("pending_order_count") is not None:
+                        report["pending_order_count"] = int(close_class.get("pending_order_count") or 0)
+                except Exception as exc:
+                    report["warnings"].append(f"close_balance_delta_classification_failed: {exc}")
+                    logger.warning("[US_DAILY_REPORT][WARN] close balance delta classification failed: %s", exc)
+            balance_confirmed = max(load_balance_confirmed_count(trade_date), close_balance_delta_confirmed)
+            if close_balance_delta_confirmed:
+                report["balance_delta_confirmed"] = max(int(report.get("balance_delta_confirmed", 0) or 0), close_balance_delta_confirmed)
+                report["orders_balance_confirmed_total"] = max(int(report.get("orders_balance_confirmed_total", 0) or 0), close_balance_delta_confirmed)
+                report["ack_only_unresolved"] = max(0, int(report.get("ack_only_unresolved", 0) or 0) - close_balance_delta_confirmed)
             router_summary = load_router_summary_ack_count(trade_date, session=session)
             schedule_fallback = load_schedule_health_fallback(trade_date, session=session)
             if schedule_fallback:
@@ -695,20 +714,6 @@ def run_daily_report(
             if report["canonical_sources"].get("report_consistency") == "REPORT_INCONSISTENT":
                 report["warnings"].append("REPORT_INCONSISTENT:" + ",".join(report["canonical_sources"].get("inconsistencies") or []))
 
-            # Close-session final balance delta classification
-            if session == "close":
-                try:
-                    from trader.us.data_provider import USDataProvider
-                    from trader.us.execution.reconcile import classify_ack_orders_with_final_balance
-                    close_provider = USDataProvider(offline=offline)
-                    close_class = classify_ack_orders_with_final_balance(provider=close_provider, trade_date=trade_date, env=env)
-                    report["order_final_classification"] = close_class.get("orders", [])
-                    report["order_final_classification_counts"] = close_class.get("counts", {})
-                    if close_class.get("pending_order_count") is not None:
-                        report["pending_order_count"] = int(close_class.get("pending_order_count") or 0)
-                except Exception as exc:
-                    report["warnings"].append(f"close_balance_delta_classification_failed: {exc}")
-                    logger.warning("[US_DAILY_REPORT][WARN] close balance delta classification failed: %s", exc)
         
         except Exception as exc:
             report["errors"].append(f"DB_query_failed: {exc}")
@@ -766,6 +771,10 @@ def run_daily_report(
         report["report_consistency"] = "FAILED"
         report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
+    if int(report.get("open_position_count", report.get("positions", 0)) or 0) > 0 and float(report.get("invested_market_value_usd", 0) or 0) <= 0:
+        report["report_consistency"] = "REPORT_INCONSISTENT"
+        report["errors"].append("REPORT_VALIDATION_FAILED: positions_nonzero_but_invested_zero")
+        logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=positions_nonzero_but_invested_zero")
     if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
         pass
     elif any(str(w).startswith("SOURCE_MISMATCH") or str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
@@ -980,10 +989,16 @@ def run_daily_report(
         logger.error("[US_DAILY_REPORT][SAVE_FAILED] %s", exc)
         report["errors"].append(f"report_save_failed: {exc}")
     
-    logger.info(
-        "[US_DAILY_REPORT][OK] date=%s session=%s orders_ack=%d",
-        trade_date, session or "N/A", report["orders_ack"]
-    )
+    if report.get("status") == "OK" and report.get("report_consistency") == "OK":
+        logger.info(
+            "[US_DAILY_REPORT][OK] date=%s session=%s orders_ack=%d",
+            trade_date, session or "N/A", report["orders_ack"]
+        )
+    else:
+        logger.error(
+            "[US_DAILY_REPORT][REPORT_INCONSISTENT] date=%s session=%s status=%s consistency=%s errors=%s",
+            trade_date, session or "N/A", report.get("status"), report.get("report_consistency"), report.get("errors", [])
+        )
     
     return {"status": report.get("status", "OK" if not report["errors"] else "ERROR"), "report": report}
 
