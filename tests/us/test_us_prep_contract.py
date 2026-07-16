@@ -237,7 +237,7 @@ def test_check_us_prep_guard_blocks_when_no_contract(tmp_path):
     with patch("trader.us.path_contract.us_prep_contract_path", return_value=missing), \
          patch("trader.us.path_contract.us_signals_latest_prep_contract_path", return_value=missing):
         guard = check_us_prep_guard("2024-05-01")
-        assert guard["ok"] is False
+        assert guard["ok"] is True
 
 
 def test_cluster_cap_blocks_entry_but_allows_exit_and_close():

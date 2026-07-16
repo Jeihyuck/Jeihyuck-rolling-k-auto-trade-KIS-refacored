@@ -127,6 +127,60 @@ def _get_broker_position(kis_client: Any, symbol: str) -> dict | None:
     return {}
 
 
+def _normalize_exchange_code(exchange: str) -> str:
+    ex = str(exchange or "").upper().strip()
+    aliases = {
+        "NAS": "NASDAQ",
+        "NASD": "NASDAQ",
+        "NASDAQ": "NASDAQ",
+        "NYS": "NYSE",
+        "NYSE": "NYSE",
+        "AMS": "AMEX",
+        "AMEX": "AMEX",
+        "ASE": "AMEX",
+    }
+    return aliases.get(ex, ex)
+
+
+def _lookup_nested_exchange(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    for key in ("exchange", "exch", "market", "ovrs_excg_cd", "tr_mket_name"):
+        val = _normalize_exchange_code(obj.get(key))
+        if val:
+            return val
+    return ""
+
+
+def enrich_sell_exchange(intent: dict, kis_client: Any = None) -> str:
+    """Fill SELL exchange before risk gate so exit intents are not blocked."""
+    symbol = str(intent.get("symbol") or "").upper().strip()
+    candidates = [
+        intent.get("exchange"),
+        _lookup_nested_exchange(intent.get("current_holding")),
+        _lookup_nested_exchange(intent.get("kis_balance_position")),
+        _lookup_nested_exchange(intent.get("locked_watchlist_row")),
+    ]
+    if kis_client is not None:
+        try:
+            candidates.append(_lookup_nested_exchange(_get_broker_position(kis_client, symbol) or {}))
+        except Exception as exc:
+            logger.warning("[US_EXIT_INTENT][EXCHANGE_LOOKUP_WARN] symbol=%s err=%s", symbol, exc)
+    try:
+        from trader.us.symbols import resolve_exchange
+        candidates.append(resolve_exchange(symbol))
+    except Exception:
+        pass
+    static_map = {"SPY": "NYSE", "DIA": "NYSE", "IWM": "NYSE", "QQQ": "NASDAQ", "QQQM": "NASDAQ", "SMH": "NASDAQ", "SOXX": "NASDAQ"}
+    candidates.append(static_map.get(symbol, ""))
+    for ex in candidates:
+        ex = _normalize_exchange_code(ex)
+        if ex:
+            intent["exchange"] = ex
+            return ex
+    logger.error("[US_EXIT_INTENT][EXCHANGE_MISSING_FATAL] symbol=%s", symbol)
+    return ""
+
 
 def resolve_dry_run_for_us_order() -> bool:
     """US order DRY_RUN 여부를 resolve하고 runtime guard 검증.
@@ -240,7 +294,9 @@ def route_order(
     )
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
-    exchange = intent.get("exchange", "NASDAQ")
+    exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
+    if side == "SELL":
+        exchange = enrich_sell_exchange(intent, kis_client)
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
     trade_date = intent.get("trade_date")
 
@@ -325,7 +381,7 @@ def route_order(
     # 3. 중복 key: DB + in-memory 합산
 
     # 3. Risk Gate
-    gate_intent = {**intent, "client_order_key": order_key, "position_action": position_action}
+    gate_intent = {**intent, "exchange": exchange, "client_order_key": order_key, "position_action": position_action}
     try:
         assert_order_allowed(
             gate_intent,

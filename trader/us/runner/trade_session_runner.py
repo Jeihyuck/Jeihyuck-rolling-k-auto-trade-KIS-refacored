@@ -579,7 +579,7 @@ def run_trade_session(
         )
 
         # ── Prep Guard (am / afternoon session) ──────────────────────────────
-        prep_guard_result: dict = {}
+        prep_guard_result: dict = {"entry_can_proceed": False, "exit_can_proceed": True, "close_can_proceed": True, "guard_state": "PREP_MISSING_EXIT_ONLY"}
         if session in ("am", "afternoon") and not offline:
             try:
                 from trader.us.prep_contract import check_us_prep_guard
@@ -637,9 +637,10 @@ def run_trade_session(
                     }
             except Exception as _guard_exc:
                 logger.warning(
-                    "[US_PREP_GUARD][WARN] session=%s guard check failed: %s — proceeding with caution",
+                    "[US_PREP_GUARD][WARN] session=%s guard check failed: %s — exit-only fallback",
                     session, _guard_exc,
                 )
+                prep_guard_result = {"ok": False, "guard_state": "PREP_GUARD_EXCEPTION_EXIT_ONLY", "session_can_run": True, "trade_can_proceed": True, "entry_can_proceed": False, "exit_can_proceed": True, "close_can_proceed": True, "reason": "PREP_GUARD_EXCEPTION_EXIT_ONLY"}
         elif session in ("am", "afternoon") and offline:
             logger.info("[US_PREP_GUARD][BYPASS] session=%s offline=True — skipping prep guard", session)
 
@@ -877,7 +878,7 @@ def run_trade_session(
                     session,
                     tick_count,
                     tick_force_now or "",
-                    int(bool(prep_guard_result.get("entry_can_proceed", True))),
+                    int(bool(prep_guard_result.get("entry_can_proceed", False))),
                     int(bool(prep_guard_result.get("exit_can_proceed", True))),
                     "?",
                     "?",
@@ -905,7 +906,7 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
-                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", True)),
+                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)),
                             exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
                         )
                         tick_result = fut.result(timeout=tick_timeout_sec)
@@ -1431,10 +1432,10 @@ def run_trade_session(
             },
             # 추가 필드
             "expected_min_ticks": expected_min_ticks,
-            "liveness_status": "FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK",
+            "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
             "last_liveness_event": _last_liveness_event,
             "has_session_finally": True,
-            "probable_liveness_cause": (root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "",
+            "probable_liveness_cause": ("FAILED_PREP_GUARD" if str(final_reason).startswith("prep_guard") else "NO_TICK_EXECUTED") if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ((root_cause or final_reason) if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else ""),
             "root_cause": root_cause,
             "surface_reason": surface_reason,
             "received_signal": _signal_name(_received_signal),

@@ -1,6 +1,8 @@
 name: "US Dispatcher Manual"
 # dispatcher는 수동 실행/디버깅용 router 전용.
-# 자동 schedule 금지: 각 세션(prep/am/afternoon/close)은 전용 workflow가 실행한다.
+# automatic schedule forbidden: not an automatic trading scheduler.
+# Production WSL automation is controlled by Windows Task Scheduler.
+# This 06:30 ET resolver is diagnostic/manual only when selected by workflow_dispatch.
 # [US_DISPATCHER][MANUAL_ONLY] trigger=workflow_dispatch
 
 "on":

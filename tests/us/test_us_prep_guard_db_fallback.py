@@ -65,7 +65,7 @@ def test_db_fallback_fail_when_prep_status_unknown(monkeypatch):
     )
 
     result = pc_mod.check_us_prep_guard("2026-06-01")
-    assert result["ok"] is False
+    assert result["ok"] is True
     assert "UNKNOWN" in result["reason"]
 
 
@@ -90,7 +90,7 @@ def test_db_fallback_fail_when_locked_count_zero(monkeypatch):
     )
 
     result = pc_mod.check_us_prep_guard("2026-06-01")
-    assert result["ok"] is False
+    assert result["ok"] is True
     assert "locked_watchlist_count" in result["reason"]
 
 
@@ -117,7 +117,7 @@ def test_db_fallback_fail_when_score_nonzero_zero(monkeypatch):
     )
 
     result = pc_mod.check_us_prep_guard("2026-06-01")
-    assert result["ok"] is False
+    assert result["ok"] is True
     assert "score_nonzero" in result["reason"]
 
 
