@@ -221,11 +221,16 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
         pending_count = int(close_order_classification.get("pending_order_count") or 0)
         report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
+        report_failed = (
+            daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS"}
+            or bool((daily_report_result.get("report") or {}).get("errors"))
+            or report_consistency != "OK"
+        )
         if fills_status == "CONTRACT_ERROR":
             status = "ERROR"
         elif reconcile_result.get("status") in {"CONTRACT_ERROR", "FATAL_ERROR"}:
             status = "ERROR"
-        elif daily_report_result.get("status") == "ERROR" or str(report_consistency).startswith("REPORT_INCONSISTENT"):
+        elif report_failed:
             status = "ERROR"
         elif close_order_classification.get("status") == "ERROR":
             status = "ERROR"

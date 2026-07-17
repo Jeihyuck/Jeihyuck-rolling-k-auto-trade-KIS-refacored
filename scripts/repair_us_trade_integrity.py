@@ -28,6 +28,12 @@ def _meta(row: dict) -> dict:
         return {}
 
 
+def _is_synthetic(row: dict) -> bool:
+    meta = _meta(row)
+    return bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")
+                or meta.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
+
+
 def audit(orders: list[dict], fills: list[dict]) -> dict:
     key_symbols, order_symbols = defaultdict(set), defaultdict(set)
     actual_by_order = {}
@@ -37,7 +43,7 @@ def audit(orders: list[dict], fills: list[dict]) -> dict:
         if not _blank(row.get("order_no")):
             order_symbols[str(row["order_no"])].add(str(row.get("symbol") or "").upper())
     for fill in fills:
-        if not bool(_meta(fill).get("synthetic")) and not _blank(fill.get("order_no")):
+        if not _is_synthetic(fill) and not _blank(fill.get("order_no")):
             actual_by_order[str(fill["order_no"])] = fill
     issues = []
     for table, rows in (("us_orders", orders), ("us_fills", fills)):
@@ -51,18 +57,21 @@ def audit(orders: list[dict], fills: list[dict]) -> dict:
             actual = actual_by_order.get(ono)
             if actual and str(actual.get("symbol") or "").upper() != str(row.get("symbol") or "").upper(): reasons.append("KIS_SYMBOL_MISMATCH")
             if actual and str(actual.get("side") or "").upper() != str(row.get("side") or "").upper(): reasons.append("KIS_SIDE_MISMATCH")
-            if table == "us_fills" and actual is not row and actual and bool(_meta(row).get("synthetic")):
+            if table == "us_fills" and actual is not row and actual and _is_synthetic(row):
                 reasons.append("SYNTHETIC_DUPLICATES_KIS_ACTUAL")
             if reasons: issues.append({"table": table, "reasons": reasons, "row": row})
     return {"generated_at": datetime.now(timezone.utc).isoformat(), "orders": len(orders), "fills": len(fills),
             "issue_count": len(issues), "issues": issues}
 
 
-def apply_integrity_plan(engine, trade_date: str, result: dict) -> dict:
+def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills: list[dict] | None = None,
+                         authoritative_positions: list[dict] | None = None) -> dict:
     """Quarantine and delete only identified rows in one transaction."""
     from sqlalchemy import text
     counts = {"quarantined_rows": 0, "corrected_rows": 0,
               "deleted_synthetic_duplicates": 0, "closed_stale_positions": 0,
+              "recalculated_realized_pnl_rows": 0, "repaired_lifecycle_rows": 0,
+              "regenerated_reports": 0,
               "row_ids": []}
     with engine.begin() as conn:
         conn.execute(text("""CREATE TABLE IF NOT EXISTS us_trade_integrity_quarantine (
@@ -85,7 +94,35 @@ def apply_integrity_plan(engine, trade_date: str, result: dict) -> dict:
             counts["row_ids"].append({"table": table, "id": row_id})
             if "SYNTHETIC_DUPLICATES_KIS_ACTUAL" in issue.get("reasons", []):
                 counts["deleted_synthetic_duplicates"] += 1
-    counts["destructive_mutations"] = counts["quarantined_rows"] + counts["corrected_rows"] + counts["closed_stale_positions"]
+        for fill in actual_fills or []:
+            order_no = str(fill.get("order_no") or "")
+            if not order_no: continue
+            qty = int(fill.get("qty") or fill.get("filled_qty") or 0)
+            updated = conn.execute(text("""UPDATE us_orders SET qty_filled=:qty,
+              status=CASE WHEN :qty < qty_requested THEN 'PARTIALLY_FILLED' ELSE 'FILLED' END,
+              meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('remaining_qty',GREATEST(qty_requested-:qty,0))
+              WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side"""),
+              {"qty":qty,"td":trade_date,"order_no":order_no,"symbol":fill.get("symbol"),"side":fill.get("side")})
+            counts["corrected_rows"] += int(updated.rowcount or 0)
+            pnl = conn.execute(text("""UPDATE us_fills SET meta=COALESCE(meta,'{}'::jsonb)||
+              jsonb_build_object('realized_pnl_usd',(price_usd-NULLIF((meta->>'cost_basis_price_usd')::numeric,0))*qty)
+              WHERE trade_date=:td AND order_no=:order_no AND side='SELL' AND meta ? 'cost_basis_price_usd'"""),
+              {"td":trade_date,"order_no":order_no})
+            counts["recalculated_realized_pnl_rows"] += int(pnl.rowcount or 0)
+        if authoritative_positions is not None:
+            symbols=[str(p.get("symbol") or "").upper() for p in authoritative_positions]
+            closed=conn.execute(text("""UPDATE us_positions SET qty=0,
+              meta=COALESCE(meta,'{}'::jsonb)||'{"position_status":"CLOSED_BY_INTEGRITY_REPAIR"}'::jsonb
+              WHERE as_of=:td AND qty>0 AND NOT (UPPER(symbol)=ANY(:symbols))"""),
+              {"td":trade_date,"symbols":symbols or ["__NONE__"]})
+            counts["closed_stale_positions"] += int(closed.rowcount or 0)
+            try:
+                lifecycle=conn.execute(text("""UPDATE us_position_risk_state SET state=state||'{"lifecycle_status":"REPAIRED_FROM_KIS"}'::jsonb
+                  WHERE trade_date=:td AND UPPER(symbol)=ANY(:symbols)"""),{"td":trade_date,"symbols":symbols or ["__NONE__"]})
+                counts["repaired_lifecycle_rows"] += int(lifecycle.rowcount or 0)
+            except Exception:
+                pass
+    counts["destructive_mutations"] = sum(counts[k] for k in ("quarantined_rows","corrected_rows","deleted_synthetic_duplicates","closed_stale_positions","recalculated_realized_pnl_rows","repaired_lifecycle_rows"))
     return counts
 
 
@@ -117,9 +154,30 @@ def main() -> int:
     (out / f"{args.trade_date}-before.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     quarantine = {"trade_date": args.trade_date, "applied": bool(args.apply), "rows": result["issues"]}
     (out / f"{args.trade_date}-quarantine.json").write_text(json.dumps(quarantine, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    mutations = apply_integrity_plan(engine, args.trade_date, result) if args.apply else {
+    actual_fills: list[dict] = []
+    authoritative_positions = None
+    if args.apply:
+        from trader.us.data_provider import USDataProvider
+        from trader.us.execution.fills import get_fills_today
+        provider = USDataProvider(offline=False)
+        fill_result = get_fills_today(provider=provider, trade_date=args.trade_date)
+        if fill_result.get("status") != "OK": raise RuntimeError("KIS actual fills unavailable; refusing repair")
+        actual_fills = fill_result.get("fills") or []
+        balance = provider.get_balance(force_refresh=True)
+        authoritative_positions = balance.get("positions") if balance.get("balance_parse_status", "OK") == "OK" else None
+        if authoritative_positions is None: raise RuntimeError("KIS authoritative balance unavailable; refusing repair")
+    mutations = apply_integrity_plan(engine, args.trade_date, result, actual_fills=actual_fills,
+                                     authoritative_positions=authoritative_positions) if args.apply else {
         "destructive_mutations": 0, "quarantined_rows": 0, "corrected_rows": 0,
-        "deleted_synthetic_duplicates": 0, "closed_stale_positions": 0, "row_ids": []}
+        "deleted_synthetic_duplicates": 0, "closed_stale_positions": 0,
+        "recalculated_realized_pnl_rows": 0, "repaired_lifecycle_rows": 0,
+        "regenerated_reports": 0, "row_ids": []}
+    if args.apply:
+        from trader.us.runner.daily_report_runner import run_daily_report
+        report_result=run_daily_report(env="practice",session="close",trade_date=args.trade_date,
+            final_balance=balance,final_positions=authoritative_positions,kis_fills=actual_fills)
+        if report_result.get("status") not in {"OK","OK_WITH_WARNINGS"}: raise RuntimeError("daily report regeneration failed")
+        mutations["regenerated_reports"] = 1
     after = {**result, "mode": "apply" if args.apply else "dry_run", **mutations}
     (out / f"{args.trade_date}-after.json").write_text(json.dumps(after, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     print(json.dumps({"trade_date": args.trade_date, "issues": result["issue_count"], "applied": args.apply}))

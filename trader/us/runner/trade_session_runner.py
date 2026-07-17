@@ -1041,8 +1041,13 @@ def run_trade_session(
                     )
                     from trader.us.execution.order_journal import replay_order_journal
                     try:
+                        timeout_provider = None
+                        if not offline:
+                            from trader.us.data_provider import USDataProvider
+                            timeout_provider = USDataProvider(offline=False)
                         timeout_reconcile = replay_order_journal(
                             trade_date, session_run_id=session_run_id, tick_id=tick_id,
+                            provider=timeout_provider,
                         )
                         timeout_blocked_symbol_sides.update(
                             (str(x[0]).upper(), str(x[1]).upper())
@@ -1051,7 +1056,7 @@ def run_trade_session(
                     except Exception as replay_exc:
                         timeout_reconcile = {"status": "ERROR", "error": str(replay_exc), "failed_count": 1}
                     order_activity_after = _count_trade_date_order_activity(trade_date)
-                    has_order_activity = int(timeout_reconcile.get("restored_ack_count", 0) or 0) > 0 or int(timeout_reconcile.get("unresolved_count", 0) or 0) > 0
+                    has_order_activity = int(timeout_reconcile.get("db_ack_restored_count", 0) or 0) > 0 or int(timeout_reconcile.get("unresolved_count", 0) or 0) > 0
                     if has_order_activity:
                         consecutive_tick_timeouts = 0
                         timeout_status = "DEGRADED_TICK_TIMEOUT_AFTER_ACK"
@@ -1066,8 +1071,10 @@ def run_trade_session(
                     elif timeout_reconcile.get("unresolved_count"):
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
                         timeout_entry_block = True
-                    elif timeout_reconcile.get("restored_ack_count") or timeout_reconcile.get("filled_count"):
+                    elif timeout_reconcile.get("broker_confirmed_count"):
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"
+                    elif timeout_reconcile.get("db_ack_restored_count"):
+                        timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
                     else:
                         timeout_status = timeout_process.get("status", "TICK_TIMEOUT_TERMINATED_NO_ORDER")
                     results.append({

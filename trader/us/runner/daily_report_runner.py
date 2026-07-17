@@ -24,6 +24,22 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+_CONSISTENCY_SEVERITY = {"OK": 0, "DEGRADED_DB_FALLBACK_TO_KIS": 1, "SOURCE_MISMATCH": 2,
+                         "REPORT_INCONSISTENT": 3, "REPORT_INCONSISTENT_POSITION_VALUE": 4, "FAILED": 5}
+
+
+def worsen_consistency(current: str, new: str) -> str:
+    return new if _CONSISTENCY_SEVERITY.get(new, 3) > _CONSISTENCY_SEVERITY.get(current, 0) else current
+
+
+def _fill_is_synthetic(fill: dict) -> bool:
+    meta = fill.get("meta") or {}
+    if isinstance(meta, str):
+        try: meta = json.loads(meta)
+        except Exception: meta = {}
+    return bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")
+                or meta.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
+
 
 
 def _position_market_value_usd(position: dict) -> float:
@@ -622,7 +638,7 @@ def run_daily_report(
                     report["canonical_position_source"] = "db_positions"
                 if len(canonical_positions) > 0 and invested <= 0:
                     report["warnings"].append("REPORT_INCONSISTENT: positions_nonzero_but_invested_zero")
-                    report["report_consistency"] = "REPORT_INCONSISTENT"
+                    report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "REPORT_INCONSISTENT")
                 try:
                     from trader.us.rotation import apply_cap_flags, compute_cluster_exposure
                     regime = str(report.get("rotation_regime") or "NEUTRAL")
@@ -662,12 +678,12 @@ def run_daily_report(
                     report["invested_market_value_usd"] = invested
                     report["gross_exposure_usd"] = invested
                     report["canonical_position_source"] = "kis_final_balance"
-                    report["report_consistency"] = "DEGRADED_DB_FALLBACK_TO_KIS"
+                    report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "DEGRADED_DB_FALLBACK_TO_KIS")
                     report["warnings"].append("db_error_but_kis_authoritative_positions_used")
                     logger.info("[US_DAILY_REPORT][POSITION_SOURCE] source=kis_authoritative positions=%d", len(final_balance_positions))
                 else:
                     report["warnings"].append("position_source_unavailable")
-                    report["report_consistency"] = "FAILED"
+                    report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
                 report["warnings"].append(f"positions_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] positions load failed: %s", exc)
 
@@ -744,12 +760,15 @@ def run_daily_report(
         if final_balance:
             report["account_equity_usd"] = float(final_balance.get("total_pvs") or final_balance.get("total_pvs_usd") or final_balance.get("evaluation_amount") or 0)
         if canonical and invested <= 0:
-            report["report_consistency"] = "REPORT_INCONSISTENT_POSITION_VALUE"
+            report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "REPORT_INCONSISTENT_POSITION_VALUE")
             report["errors"].append("REPORT_INCONSISTENT_POSITION_VALUE")
     if kis_fills is not None:
-        actual = [f for f in kis_fills if not bool((f.get("meta") or {}).get("synthetic"))]
+        actual = [f for f in kis_fills if not _fill_is_synthetic(f)]
         report["kis_fill_execution_count"] = len(actual)
         report["kis_fill_order_count"] = len({(trade_date, str(f.get("order_no") or "").strip()) for f in actual if str(f.get("order_no") or "").strip()})
+        report["kis_actual_fill_execution_count"] = len(actual)
+        report["kis_actual_fill_order_count"] = report["kis_fill_order_count"]
+        report["balance_synthetic_confirmation_count"] = sum(1 for f in kis_fills if _fill_is_synthetic(f) and str(((f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}).get("fill_evidence_type") or "") == "BALANCE_DELTA_SYNTHETIC")
     if close_order_classification is not None:
         report["order_final_classification"] = close_order_classification.get("orders", [])
         report["order_final_classification_counts"] = close_order_classification.get("counts", {})
@@ -805,17 +824,17 @@ def run_daily_report(
     if str(report.get("started_at_utc") or "") == str(report.get("ended_at_utc") or "") and float(report.get("wall_elapsed_sec") or 0) > 1:
         report["errors"].append("REPORT_VALIDATION_FAILED: identical_start_end_with_elapsed")
     if int(report.get("close_kis_position_count", 0) or 0) > 0 and int(report.get("open_position_count", 0) or 0) == 0:
-        report["report_consistency"] = "FAILED"
+        report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "FAILED")
         report["errors"].append("REPORT_VALIDATION_FAILED: kis_positions_nonzero_report_zero")
         logger.error("[US_DAILY_REPORT][CONSISTENCY_FAIL] reason=kis_positions_nonzero_report_zero")
     if report.get("report_consistency") in {"DEGRADED_DB_FALLBACK_TO_KIS", "FAILED"}:
         pass
     elif any(str(w).startswith("REPORT_INCONSISTENT") for w in report.get("warnings", [])):
-        report["report_consistency"] = "REPORT_INCONSISTENT"
+        report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "REPORT_INCONSISTENT")
     elif any(str(w).startswith("SOURCE_MISMATCH") for w in report.get("warnings", [])):
-        report["report_consistency"] = "SOURCE_MISMATCH"
+        report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "SOURCE_MISMATCH")
     else:
-        report["report_consistency"] = (report.get("canonical_sources") or {}).get("report_consistency", "OK")
+        report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), (report.get("canonical_sources") or {}).get("report_consistency", "OK"))
 
     if report.get("report_consistency") in {"SOURCE_MISMATCH", "REPORT_INCONSISTENT"}:
         report["status"] = "WARNING_RECONCILE_MISMATCH"
@@ -1087,6 +1106,11 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         "real_broker_sells": 0,
         "synthetic_reconcile_buys": 0,
         "synthetic_reconcile_sells": 0,
+        "kis_actual_fill_execution_count": 0,
+        "kis_actual_fill_order_count": 0,
+        "balance_synthetic_confirmation_count": 0,
+        "legacy_synthetic_fill_count": 0,
+        "accounting_confirmed_order_count": 0,
     }
     engine = _get_engine_or_none()
     if engine is None:
@@ -1096,10 +1120,13 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         rows = _read_autocommit(
             engine,
             """
-            SELECT side, COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source, COUNT(*) AS n
+            SELECT side, order_no, COALESCE(meta->>'fill_evidence_type','') AS evidence_type,
+              COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,
+                       (meta->>'synthetic_fill')::boolean,false) AS is_synthetic,
+              COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source, COUNT(*) AS n
             FROM us_fills
             WHERE trade_date = :td
-            GROUP BY side, COALESCE(meta->>'fill_source', meta->>'source', '')
+            GROUP BY side, order_no, evidence_type, is_synthetic, COALESCE(meta->>'fill_source', meta->>'source', '')
             """,
             {"td": trade_date},
         )
@@ -1108,11 +1135,22 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
             source = str(row.get("fill_source") or "").lower()
             n = int(row.get("n") or 0)
             result["fills_count"] += n
-            is_synthetic = "synthetic" in source or "reconcile" in source
+            evidence = str(row.get("evidence_type") or "")
+            is_synthetic = bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+            if not is_synthetic:
+                result["kis_actual_fill_execution_count"] += n
+            elif evidence == "BALANCE_DELTA_SYNTHETIC":
+                result["balance_synthetic_confirmation_count"] += n
+            else:
+                result["legacy_synthetic_fill_count"] += n
             if side == "BUY":
                 result["synthetic_reconcile_buys" if is_synthetic else "real_broker_buys"] += n
             elif side == "SELL":
                 result["synthetic_reconcile_sells" if is_synthetic else "real_broker_sells"] += n
+        actual_orders = {str(row.get("order_no") or "") for row in rows if not bool(row.get("is_synthetic")) and row.get("order_no")}
+        synthetic_orders = {str(row.get("order_no") or "") for row in rows if bool(row.get("is_synthetic")) and row.get("order_no")}
+        result["kis_actual_fill_order_count"] = len(actual_orders)
+        result["accounting_confirmed_order_count"] = len(actual_orders | synthetic_orders)
     except Exception as exc:
         logger.debug("[US_FILLS][BREAKDOWN][FALLBACK] err=%s", exc)
         result["fills_count"] = load_us_fills_count(trade_date)

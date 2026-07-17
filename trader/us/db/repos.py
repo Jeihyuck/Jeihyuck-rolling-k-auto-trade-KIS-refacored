@@ -1172,12 +1172,16 @@ def load_today_symbols_sold(trade_date: str | None = None) -> set[str]:
     td = trade_date or _today()
     engine = _get_engine_or_none()
     if engine is None:
-        return {f["symbol"] for f in _MEM_FILLS
-                if f.get("trade_date") == td and f.get("side") == "SELL"}
+        fully_sold_keys = {o.get("client_order_key") for o in _MEM_ORDERS
+                           if o.get("trade_date") == td and o.get("side") == "SELL" and o.get("status") == "FILLED"}
+        return {f["symbol"] for f in _MEM_FILLS if f.get("trade_date") == td and f.get("side") == "SELL"
+                and (not f.get("client_order_key") or f.get("client_order_key") in fully_sold_keys)}
     try:
         with engine.begin() as conn:
             rows = conn.execute(
-                text("SELECT DISTINCT symbol FROM us_fills WHERE trade_date=:td AND side='SELL'"),
+                text("""SELECT DISTINCT f.symbol FROM us_fills f LEFT JOIN us_orders o
+                    ON o.trade_date=f.trade_date AND o.client_order_key=f.client_order_key
+                    WHERE f.trade_date=:td AND f.side='SELL' AND (o.id IS NULL OR o.status='FILLED')"""),
                 {"td": td},
             )
             return {r[0] for r in rows}
@@ -1215,8 +1219,8 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
         return [
             o for o in _MEM_ORDERS
             if o.get("trade_date") == td
-            and o.get("status") in ("ACK", "SENT")
-            and int(o.get("qty_filled", 0) or 0) == 0
+            and o.get("status") in ("ACK", "SENT", "PARTIALLY_FILLED")
+            and int(o.get("qty_filled", 0) or 0) < int(o.get("qty_requested", 0) or 0)
         ]
     try:
         with engine.begin() as conn:
@@ -1225,8 +1229,8 @@ def load_pending_ack_orders(trade_date: str, env: str = "practice") -> list[dict
                     SELECT *
                     FROM us_orders
                     WHERE trade_date = :td
-                      AND status IN ('ACK', 'SENT')
-                      AND COALESCE(qty_filled, 0) = 0
+                      AND status IN ('ACK', 'SENT', 'PARTIALLY_FILLED')
+                      AND COALESCE(qty_filled, 0) < qty_requested
                     ORDER BY created_at ASC
                 """),
                 {"td": td},
@@ -1262,7 +1266,8 @@ def _synthetic_reconcile_fill_meta(
     fill_meta = _parse_json_meta(base_meta)
     fill_meta.update({
         "source": source,
-        "synthetic_fill": True,
+        "is_synthetic": True,
+        "fill_evidence_type": "BALANCE_DELTA_SYNTHETIC",
         "reconcile_source": source,
         "order_no": order_no,
         "client_order_key": client_order_key,
@@ -1279,6 +1284,12 @@ def _synthetic_reconcile_fill_meta(
         fill_meta["realized_pnl_usd"] = round(realized, 4)
         fill_meta["realized_pnl_pct"] = round(((float(avg_price_usd) - float(cost_basis)) / float(cost_basis)) * 100.0, 4)
     return fill_meta
+
+
+def is_synthetic_fill_meta(meta: Any) -> bool:
+    value = _parse_json_meta(meta)
+    return bool(value.get("is_synthetic") or value.get("synthetic") or value.get("synthetic_fill")
+                or value.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
 
 
 def _safe_float_meta(meta: dict, keys: list[str]) -> float | None:
@@ -1349,7 +1360,8 @@ def mark_order_filled_by_reconcile(
     *, order_no: str, client_order_key: str, symbol: str | None = None,
     side: str | None = None, filled_qty: int, avg_price_usd: float,
     source: str = "balance_reconcile", trade_date: str | None = None,
-    meta: dict | None = None,
+    meta: dict | None = None, requested_qty: int | None = None,
+    cumulative_filled_qty: int | None = None, evidence_type: str | None = None,
 ) -> dict:
     """Strictly update exactly one order and create at most one synthetic fill."""
     from datetime import datetime, timezone
@@ -1374,22 +1386,35 @@ def mark_order_filled_by_reconcile(
                                             requested_symbol=sym, requested_side=side_u, matches=matches)
         if check["status"] != "OK": return check
         order = check["order"]
-        order.update({"status": "FILLED", "qty_filled": qty, "avg_price_usd": price, "updated_at": now_utc})
-        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {})}
+        requested = int(requested_qty or order.get("qty_requested") or qty)
+        previous = int(order.get("qty_filled") or 0)
+        cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
+        cumulative = max(previous, min(cumulative, requested))
+        remaining = max(0, requested - cumulative)
+        status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
+        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {}), "remaining_qty": remaining}
+        order.update({"status": status, "qty_filled": cumulative, "avg_price_usd": price,
+                      "updated_at": now_utc, "meta": order_meta})
         actual_exists = any(str(f.get("trade_date") or "") == td and on and str(f.get("order_no") or "") == on
-                            and not bool(_parse_json_meta(f.get("meta")).get("synthetic")) for f in _MEM_FILLS)
-        if not actual_exists:
+                            and not is_synthetic_fill_meta(f.get("meta")) and int(f.get("cumulative_filled_qty") or 0) == cumulative for f in _MEM_FILLS)
+        evidence = evidence_type or ("KIS_ORDER_DETAIL_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
+        synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+        delta = max(0, cumulative - previous)
+        if delta and not actual_exists:
+            fill_meta = ({**order_meta, "source": source, "is_synthetic": False, "fill_evidence_type": evidence}
+                         if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
+                             client_order_key=cok, side=side_u, qty=delta, avg_price_usd=price, base_meta=order_meta))
             save_fills([{"trade_date": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
-                         "side": side_u, "qty": qty, "price_usd": price, "order_no": on,
+                         "side": side_u, "qty": delta, "price_usd": price, "order_no": on,
                          "client_order_key": cok or order.get("client_order_key"), "filled_at": now_utc,
-                         "meta": _synthetic_reconcile_fill_meta(source=source, order_no=on,
-                             client_order_key=cok, side=side_u, qty=qty, avg_price_usd=price,
-                             base_meta=order_meta)}], trade_date=td)
-        return {"status": "OK", "synthetic_fill_created": not actual_exists}
+                         "cumulative_filled_qty": cumulative, "meta": fill_meta}], trade_date=td)
+        return {"status": "OK", "order_status": status, "qty_filled": cumulative,
+                "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual_exists)}
     try:
         with engine.begin() as conn:
             rows = conn.execute(text("""
-                SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta
+                SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta,
+                       qty_requested, qty_filled
                 FROM us_orders WHERE trade_date=:td AND
                   ((:order_no <> '' AND order_no=:order_no) OR
                    (:cok <> '' AND client_order_key=:cok)) FOR UPDATE
@@ -1399,29 +1424,45 @@ def mark_order_filled_by_reconcile(
                                                 requested_symbol=sym, requested_side=side_u, matches=matches)
             if check["status"] != "OK": return check
             order = check["order"]
-            conn.execute(text("""UPDATE us_orders SET status = 'FILLED', qty_filled = :qty,
-                avg_price_usd = :price, updated_at = :ts WHERE id = :id"""),
-                {"qty": qty, "price": price, "ts": now_utc, "id": order["id"]})
+            requested = int(requested_qty or order.get("qty_requested") or qty)
+            previous = int(order.get("qty_filled") or 0)
+            cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
+            cumulative = max(previous, min(cumulative, requested))
+            remaining = max(0, requested - cumulative)
+            status = "ACK" if cumulative <= 0 else "PARTIALLY_FILLED" if remaining else "FILLED"
+            merged = {**_parse_json_meta(order.get("meta")), **(meta or {}), "remaining_qty": remaining}
+            conn.execute(text("""UPDATE us_orders SET status = :status, qty_filled = :qty,
+                avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts WHERE id = :id"""),
+                {"status": status, "qty": cumulative, "price": price, "meta": _json_param(merged), "ts": now_utc, "id": order["id"]})
+            evidence = evidence_type or ("KIS_ORDER_DETAIL_ACTUAL" if source in {"fills_by_order_no", "journal_replay_kis_fill"} else "BALANCE_DELTA_SYNTHETIC")
+            synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
             actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
                 AND :order_no <> '' AND order_no=:order_no
-                AND NOT COALESCE((meta->>'synthetic')::boolean, false) LIMIT 1"""),
-                {"td": td, "order_no": on}).first()
-            if not actual:
-                merged = {**_parse_json_meta(order.get("meta")), **(meta or {})}
-                fill = {"symbol": sym, "side": side_u, "qty": qty, "price_usd": price,
+                AND symbol=:symbol AND side=:side
+                AND NOT COALESCE((meta->>'is_synthetic')::boolean,
+                    (meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
+                AND COALESCE((meta->>'cumulative_filled_qty')::integer, qty)=:cumulative LIMIT 1"""),
+                {"td": td, "order_no": on, "symbol": sym, "side": side_u, "cumulative": cumulative}).first()
+            delta = max(0, cumulative - previous)
+            if delta and not actual:
+                fill = {"symbol": sym, "side": side_u, "qty": delta, "price_usd": price,
                         "order_no": on, "client_order_key": cok or order["client_order_key"]}
+                fill_meta = ({**merged, "source": source, "is_synthetic": False,
+                              "fill_evidence_type": evidence, "cumulative_filled_qty": cumulative}
+                             if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
+                                client_order_key=fill["client_order_key"], side=side_u, qty=delta,
+                                avg_price_usd=price, base_meta={**merged, "cumulative_filled_qty": cumulative}))
                 conn.execute(text("""INSERT INTO us_fills
                     (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
                     VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
                     ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
                     {"td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
-                     "side": side_u, "qty": qty, "price": price, "order_no": on,
+                     "side": side_u, "qty": delta, "price": price, "order_no": on,
                      "cok": fill["client_order_key"], "ts": now_utc,
-                     "meta": _json_param(_synthetic_reconcile_fill_meta(source=source, order_no=on,
-                        client_order_key=fill["client_order_key"], side=side_u, qty=qty,
-                        avg_price_usd=price, base_meta=merged)),
+                     "meta": _json_param(fill_meta),
                      "idem": _us_fill_idempotency_key_text(fill, td)})
-            return {"status": "OK", "synthetic_fill_created": not bool(actual)}
+            return {"status": "OK", "order_status": status, "qty_filled": cumulative,
+                    "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual)}
     except Exception as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
         return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
