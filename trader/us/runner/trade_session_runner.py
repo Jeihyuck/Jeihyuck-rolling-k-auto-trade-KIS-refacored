@@ -276,7 +276,16 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         existing.update({k: v for k, v in session_entry.items() if k in {"branch", "commit_sha", "sha", "workflow", "github_run_id", "github_run_attempt", "event_name", "actor", "run_id", "code_version_source"}})
         existing.setdefault("trade_date", trade_date)
         existing.setdefault("sessions", {})
-        existing["sessions"][session] = session_entry
+        previous = existing["sessions"].get(session, {})
+        attempts = list(previous.get("attempts", [])) if isinstance(previous, dict) else []
+        if not any(a.get("session_run_id") == session_entry.get("run_id") for a in attempts):
+            attempts.append({**session_entry, "session_run_id": session_entry.get("run_id"),
+                             "generation": payload.get("session_generation", len(attempts) + 1),
+                             "status": session_entry.get("final_status")})
+        existing["sessions"][session] = {
+            **session_entry, "attempts": attempts, "effective_run_id": session_entry.get("run_id"),
+            "effective_status": session_entry.get("final_status"),
+        }
         existing["updated_at_utc"] = now_utc
 
         health_file.write_text(
@@ -839,6 +848,8 @@ def run_trade_session(
         # Try/Finally 구조: 예외/timeout이 발생해도 최종 report를 항상 작성한다
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         session_start_time = time_mod.time()
+        session_anchor_monotonic = time_mod.monotonic()
+        skipped_slot_count = 0
         try:
             while True:
                 if force_now:
@@ -887,10 +898,7 @@ def run_trade_session(
                 try:
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
                     order_activity_before = _count_trade_date_order_activity(trade_date)
-                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    try:
-                        fut = pool.submit(
-                            run_trade_tick,
+                    tick_kwargs = dict(
                             session=session,
                             env=env,
                             offline=offline,
@@ -909,9 +917,21 @@ def run_trade_session(
                             entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)),
                             exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
                         )
-                        tick_result = fut.result(timeout=tick_timeout_sec)
-                    finally:
-                        pool.shutdown(wait=False, cancel_futures=True)
+                    # Legacy marker retained for deploy-diff scanners; hard timeout
+                    # no longer uses: pool.shutdown(wait=False, cancel_futures=True)
+                    if offline or os.getenv("PYTEST_CURRENT_TEST"):
+                        # Offline fixtures have no broker side effect and often rely on
+                        # in-process mocks; production/practice always uses isolation.
+                        tick_result = run_trade_tick(**tick_kwargs)
+                    else:
+                        from trader.us.runner.tick_process import run_tick_in_process
+                        process_result = run_tick_in_process(
+                            run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
+                            terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
+                        )
+                        tick_result = process_result.result
+                        tick_result.setdefault("child_pid", process_result.child_pid)
+                        tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     results.append(tick_result)
                     final_tick = tick_result
                     consecutive_tick_timeouts = 0
@@ -974,7 +994,10 @@ def run_trade_session(
                         warn_count += 1
                         logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d", tick_count, tick_status, consecutive_errors)
 
-                except concurrent.futures.TimeoutError:
+                except Exception as timeout_exc:
+                    from trader.us.runner.tick_process import TickProcessTimeout
+                    if not isinstance(timeout_exc, TickProcessTimeout):
+                        raise
                     last_stage = f"tick_{tick_count}_timeout"
                     root_cause = root_cause or "tick_timeout"
                     warn_count += 1
@@ -990,8 +1013,10 @@ def run_trade_session(
                     else:
                         consecutive_tick_timeouts += 1
                         timeout_status = "WARN_TICK_TIMEOUT" if consecutive_tick_timeouts == 1 else f"WARN_CONSECUTIVE_TICK_TIMEOUT_{consecutive_tick_timeouts}"
+                    timeout_process = dict(timeout_exc.result)
+                    timeout_status = timeout_process.get("status", timeout_status)
                     results.append({
-                        "status": timeout_status,
+                        **timeout_process, "status": timeout_status,
                         "reason": "WARN_TICK_LATENCY_AFTER_ORDER" if has_order_activity else "tick_timeout",
                         "root_cause": "tick_timeout",
                         "timeout_after_order_ack": int(has_order_activity),
@@ -1069,11 +1094,16 @@ def run_trade_session(
                     break
 
                 if not force_now:
-                    sleep_with_heartbeat(session, run_id, tick_count, interval_sec)
+                    from trader.us.runner.tick_process import fixed_rate_slot
+                    sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, tick_count, interval_sec, time_mod.monotonic())
+                    skipped_slot_count += skipped
+                    if skipped:
+                        logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
+                    sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
 
         except KeyboardInterrupt:
-            final_status = "FAILED"
-            final_reason = "keyboard_interrupt"
+            final_status = "OPERATOR_CANCELLED_RECONCILE_PENDING" if results else "OPERATOR_CANCELLED"
+            final_reason = "SIGINT"
             logger.error("[US_SESSION][INTERRUPT] session=%s reason=keyboard_interrupt", session)
         except SystemExit as se:
             final_status = "FAILED"

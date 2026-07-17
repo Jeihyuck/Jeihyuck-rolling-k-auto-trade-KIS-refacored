@@ -152,16 +152,20 @@ def _lookup_nested_exchange(obj: Any) -> str:
     return ""
 
 
-def enrich_sell_exchange(intent: dict, kis_client: Any = None) -> str:
+def enrich_sell_exchange(intent: dict, kis_client: Any = None, context: Any = None) -> str:
     """Fill SELL exchange before risk gate so exit intents are not blocked."""
     symbol = str(intent.get("symbol") or "").upper().strip()
     candidates = [
         intent.get("exchange"),
+        (getattr(context, "exchange_by_symbol", {}) or {}).get(symbol),
+        _lookup_nested_exchange((getattr(context, "positions_by_symbol", {}) or {}).get(symbol, {})),
         _lookup_nested_exchange(intent.get("current_holding")),
         _lookup_nested_exchange(intent.get("kis_balance_position")),
         _lookup_nested_exchange(intent.get("locked_watchlist_row")),
     ]
-    if kis_client is not None:
+    # A tick context is authoritative and deliberately prevents N balance calls
+    # for N sell intents. Legacy one-off callers retain the broker fallback.
+    if kis_client is not None and context is None:
         try:
             candidates.append(_lookup_nested_exchange(_get_broker_position(kis_client, symbol) or {}))
         except Exception as exc:
@@ -253,6 +257,7 @@ def route_order(
     kis_order_allowed: bool = True,
     allowed_symbols: "set[str] | None" = None,
     current_position_symbols: "set[str] | None" = None,
+    context: Any | None = None,
 ) -> dict:
     """Order intent를 라우팅한다.
 
@@ -272,6 +277,12 @@ def route_order(
     )
     from trader.utils.env import env_bool
 
+    from trader.us.execution.order_identity import InvalidOrderIdentity, normalize_and_validate_order_identity
+    try:
+        intent = normalize_and_validate_order_identity(intent, context)
+    except InvalidOrderIdentity as exc:
+        logger.critical("[US_ORDER][INVALID_ORDER_IDENTITY] error=%s", exc)
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": str(exc), "broker_submit": False, "intent": intent}
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
     symbol_upper = str(symbol or "").upper().strip()
@@ -296,7 +307,7 @@ def route_order(
     price = float(intent.get("limit_price", 0.0))
     exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
     if side == "SELL":
-        exchange = enrich_sell_exchange(intent, kis_client)
+        exchange = enrich_sell_exchange(intent, kis_client, context)
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
     trade_date = intent.get("trade_date")
 
@@ -376,7 +387,8 @@ def route_order(
         }
 
     # 2. intent DB 저장
-    save_order_intent(intent)
+    if not save_order_intent(intent):
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": "intent_persistence_rejected", "broker_submit": False, "intent": intent}
 
     # 3. 중복 key: DB + in-memory 합산
 
@@ -781,6 +793,17 @@ def route_order(
                     (_pos_for_guard.get("position_source") if "_pos_for_guard" in locals() else None) or "pre_sell_position_snapshot",
                 )
 
+    # Last possible fence and durable write occur immediately before the API.
+    if context is not None and not context.broker_submit_allowed():
+        from trader.us.execution.order_journal import append_order_event
+        append_order_event("ORDER_FENCED", intent, context=context, broker_status="ORDER_FENCED_BEFORE_BROKER_SUBMIT")
+        return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_or_cancelled_tick", "broker_submit": False, "intent": intent}
+    from trader.us.execution.order_journal import append_order_event
+    try:
+        append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
+    except Exception as exc:
+        logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": "durable_journal_write_failed", "broker_submit": False, "intent": intent}
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
     # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────
@@ -796,6 +819,7 @@ def route_order(
 
         from trader.us.execution.kis_us_response_parser import extract_order_no
         order_no = extract_order_no(resp)
+        append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no or "", broker_status="ACK", raw_response=resp)
         logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
 
     except Exception as exc:
@@ -884,6 +908,7 @@ def route_order(
     try:
         ack_db_saved = bool(save_order_ack(ack_result))
         if ack_db_saved:
+            append_order_event("DB_ACK_PERSISTED", intent, context=context, broker_order_no=order_no or "", broker_status="ACK")
             logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
     except Exception:
         logger.exception(

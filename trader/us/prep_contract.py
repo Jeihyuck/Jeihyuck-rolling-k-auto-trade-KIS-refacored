@@ -92,6 +92,14 @@ def build_us_prep_contract(
     final30_count = watchlist_result.get("final30_count", 0)
     final30_scored_count = watchlist_result.get("final30_scored_count", 0)
     score_nonzero_count = validation.get("score_nonzero_count", 0)
+    daily_sync_target_count = int(dynamic_universe_result.get("daily_sync_target_count", 0) or 0)
+    daily_sync_ok_count = int(dynamic_universe_result.get("daily_sync_ok_count", daily_sync_target_count) or 0)
+    daily_sync_failed_count = int(dynamic_universe_result.get("daily_sync_failed_count", max(0, daily_sync_target_count - daily_sync_ok_count)) or 0)
+    daily_sync_success_ratio = (daily_sync_ok_count / daily_sync_target_count) if daily_sync_target_count else 1.0
+    benchmark_sync_failed_count = int(dynamic_universe_result.get("benchmark_sync_failed_count", 0) or 0)
+    open_position_sync_failed_count = int(dynamic_universe_result.get("open_position_sync_failed_count", 0) or 0)
+    final30_sync_failed_count = int(watchlist_result.get("final30_sync_failed_count", 0) or 0)
+    exchange_failed_symbols = list(dynamic_universe_result.get("exchange_resolution_failed_symbols") or [])
 
     cap_violations = list(watchlist_result.get("cap_violations") or [])
     rotation_context = watchlist_result.get("rotation_context") or {}
@@ -207,6 +215,10 @@ def build_us_prep_contract(
     if cap_violations or not cluster_contract_ok:
         # Degrade to liveness/exit/reconcile; block new BUYs in risky clusters.
         entry_can_proceed = 0
+    min_sync_ratio = _env_float("US_FINAL30_DAILY_SYNC_MIN_RATIO", 0.90)
+    if daily_sync_success_ratio < min_sync_ratio or benchmark_sync_failed_count > 0 or final30_sync_failed_count > 0 or exchange_failed_symbols:
+        entry_can_proceed = 0
+        trade_block_reason = "data_sync_quality_entry_block"
     trade_can_proceed = int(exit_can_proceed or entry_can_proceed)
     degraded_reason = "" if entry_can_proceed else trade_block_reason
 
@@ -256,6 +268,15 @@ def build_us_prep_contract(
         "sector_cap_enforced": True,
         "env": env,
         "trade_date": trade_date,
+        "daily_sync_target_count": daily_sync_target_count,
+        "daily_sync_ok_count": daily_sync_ok_count,
+        "daily_sync_failed_count": daily_sync_failed_count,
+        "daily_sync_success_ratio": daily_sync_success_ratio,
+        "benchmark_sync_failed_count": benchmark_sync_failed_count,
+        "open_position_sync_failed_count": open_position_sync_failed_count,
+        "final30_sync_failed_count": final30_sync_failed_count,
+        "exchange_resolution_failed_count": len(exchange_failed_symbols),
+        "exchange_resolution_failed_symbols": exchange_failed_symbols,
         "status": status,
         "trade_can_proceed": trade_can_proceed,
         "entry_can_proceed": entry_can_proceed,

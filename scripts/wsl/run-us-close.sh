@@ -31,6 +31,7 @@ export MARKET="US"
 export EXCHANGE="US"
 export PB1_MARKET_SCOPE="US"
 export WSL_RUN_SOURCE="local-wsl"
+export US_RUN_SOURCE="${US_RUN_SOURCE:-WINDOWS_SCHEDULE}"
 export WSL_RUN_MARKET="US"
 export WSL_RUN_SESSION="close"
 

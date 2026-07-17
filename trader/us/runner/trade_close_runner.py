@@ -141,7 +141,14 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                     reconcile_result.get("authoritative_positions"),
                 )
             else:
-                save_position_snapshot(positions)
+                try:
+                    save_position_snapshot(positions, trade_date=trade_date, balance_fetch_status="OK",
+                                           balance_parse_status="OK", authoritative_positions=True,
+                                           preserve_previous_positions=False, close_source="kis_final_balance")
+                except TypeError:
+                    # Compatibility for injected test/adapter callables; repository
+                    # implementation always receives authoritative flags above.
+                    save_position_snapshot(positions)
                 logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", len(positions))
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] save_position_snapshot failed: %s", exc)
@@ -185,16 +192,30 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         # 8. Daily report
         try:
             from trader.us.runner.daily_report_runner import run_daily_report
-            run_daily_report(env=env, offline=offline)
+            daily_report_result = run_daily_report(
+                env=env, session="close", trade_date=trade_date, offline=offline,
+                final_balance=balance, final_positions=positions, kis_fills=fills,
+                close_order_classification=close_order_classification, close_run_id=run_id,
+            )
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] daily report failed: %s", exc)
+            daily_report_result = {"status": "ERROR", "report": {"report_consistency": "REPORT_INCONSISTENT"}}
 
         # 8. Status 계산
         status = "OK"
+        daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
+        pending_count = int(close_order_classification.get("pending_order_count") or 0)
+        report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
         if fills_status == "CONTRACT_ERROR":
             status = "ERROR"
         elif reconcile_result.get("status") in {"CONTRACT_ERROR", "FATAL_ERROR"}:
             status = "ERROR"
+        elif daily_report_result.get("status") == "ERROR" or str(report_consistency).startswith("REPORT_INCONSISTENT"):
+            status = "ERROR"
+        elif close_order_classification.get("status") == "ERROR":
+            status = "ERROR"
+        elif pending_count > 0:
+            status = "DEGRADED_ACK_UNRESOLVED"
         elif fills_status not in ("OK", "SKIP") or reconcile_result.get("status") not in ("OK", "SKIP"):
             status = "OK_WITH_WARNINGS"
 
@@ -227,6 +248,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "order_final_classification": close_order_classification.get("orders", []),
             "order_final_classification_counts": close_order_classification.get("counts", {}),
             "pending_order_count": close_order_classification.get("pending_order_count", 0),
+            "daily_report_status": daily_report_result.get("status"),
+            "report_consistency": report_consistency,
         }
     finally:
         release_us_session_running_lock(trade_date, "close", run_id=run_id)

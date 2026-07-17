@@ -247,6 +247,11 @@ def run_daily_report(
     session: str | None = None,
     trade_date: str | None = None,
     offline: bool = False,
+    final_balance: dict | None = None,
+    final_positions: list[dict] | None = None,
+    kis_fills: list[dict] | None = None,
+    close_order_classification: dict | None = None,
+    close_run_id: str | None = None,
 ) -> dict:
     """Generate US daily report.
     
@@ -406,6 +411,11 @@ def run_daily_report(
         "blocked_entry_reason_counts": {},
         "trade_block_reason": "ok",
         "sector_cap_enforced": False,
+        "report_run_id": close_run_id or "",
+        "broker_orders_created": 0, "broker_orders_submitted": 0, "broker_orders_ack": 0,
+        "broker_orders_filled": 0, "broker_orders_rejected": 0, "broker_orders_unresolved": 0,
+        "kis_fill_order_count": 0, "kis_fill_execution_count": 0,
+        "balance_delta_confirmed_order_count": 0, "synthetic_fill_order_count": 0,
     }
     
     # DRY_RUN
@@ -715,6 +725,28 @@ def run_daily_report(
             report["errors"].append(f"DB_query_failed: {exc}")
             logger.error("[US_DAILY_REPORT][ERROR] DB query failed: %s", exc)
     
+    # A close runner's in-memory broker response is the highest-priority source.
+    if final_positions is not None:
+        canonical = [p for p in final_positions if int(float(p.get("qty", p.get("holding_qty", 0)) or 0)) > 0]
+        invested = sum(_position_market_value_usd(p) for p in canonical)
+        report.update({"positions": len(canonical), "position_count": len(canonical), "open_position_count": len(canonical),
+                       "open_position_symbols": sorted({str(p.get("symbol") or p.get("pdno") or "").upper() for p in canonical}),
+                       "invested_market_value_usd": invested, "canonical_position_source": "close_direct_kis_balance"})
+        if final_balance:
+            report["account_equity_usd"] = float(final_balance.get("total_pvs") or final_balance.get("total_pvs_usd") or final_balance.get("evaluation_amount") or 0)
+        if canonical and invested <= 0:
+            report["report_consistency"] = "REPORT_INCONSISTENT_POSITION_VALUE"
+            report["errors"].append("REPORT_INCONSISTENT_POSITION_VALUE")
+    if kis_fills is not None:
+        actual = [f for f in kis_fills if not bool((f.get("meta") or {}).get("synthetic"))]
+        report["kis_fill_execution_count"] = len(actual)
+        report["kis_fill_order_count"] = len({(trade_date, str(f.get("order_no") or "").strip()) for f in actual if str(f.get("order_no") or "").strip()})
+    if close_order_classification is not None:
+        report["order_final_classification"] = close_order_classification.get("orders", [])
+        report["order_final_classification_counts"] = close_order_classification.get("counts", {})
+        report["pending_order_count"] = int(close_order_classification.get("pending_order_count") or 0)
+        report["broker_orders_unresolved"] = report["pending_order_count"]
+
     # Budget cap
     try:
         from trader.us.budget import get_us_capital_usd_cap

@@ -73,6 +73,8 @@ def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
 
 
 def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
+    if fill.get("_fill_idempotency_key_override"):
+        return str(fill["_fill_idempotency_key_override"])
     price_usd = float(fill.get("price_usd") or fill.get("price") or 0.0)
     qty = int(fill.get("qty", 0) or 0)
     order_no = str(fill.get("order_no") or "")
@@ -173,8 +175,16 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
     """us_order_intents 저장. schema: trade_date, client_order_key, symbol, exchange,
     side, qty, limit_price_usd, notional_usd, strategy, status, meta"""
     td = trade_date or _today()
+    from trader.us.execution.order_identity import assert_same_identity, valid_identity
+    if not valid_identity(intent.get("client_order_key")):
+        logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_order_intents")
+        return False
     engine = _get_engine_or_none()
     if engine is None:
+        for existing in _MEM_INTENTS:
+            if existing.get("client_order_key") == intent.get("client_order_key"):
+                assert_same_identity(existing, {**intent, "trade_date": td})
+                return True
         _MEM_INTENTS.append({**intent, "trade_date": td, "status": "PENDING"})
         return True
     try:
@@ -305,6 +315,16 @@ def mark_order_intent_dry_run(client_order_key: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _upsert_order(conn: Any, td: str, row: dict) -> None:
+    from trader.us.execution.order_identity import assert_same_identity, require_identity
+    require_identity(row.get("client_order_key"))
+    existing = conn.execute(text("SELECT * FROM us_orders WHERE client_order_key=:cok FOR UPDATE"), {"cok": row["client_order_key"]}).fetchone()
+    if existing:
+        assert_same_identity(dict(existing._mapping), {**row, "trade_date": td})
+    order_no = str(row.get("order_no") or "").strip()
+    if order_no:
+        broker_existing = conn.execute(text("SELECT * FROM us_orders WHERE trade_date=:td AND order_no=:ono FOR UPDATE"), {"td": td, "ono": order_no}).fetchone()
+        if broker_existing:
+            assert_same_identity(dict(broker_existing._mapping), {**row, "trade_date": td})
     conn.execute(
         text("""
             INSERT INTO us_orders
@@ -343,8 +363,17 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
 def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
     """us_orders ACK 저장."""
     td = trade_date or _today()
+    from trader.us.execution.order_identity import valid_identity, assert_same_identity
+    if not valid_identity(order_result.get("client_order_key")):
+        logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_orders_ack")
+        return False
     engine = _get_engine_or_none()
     if engine is None:
+        for existing in _MEM_ORDERS:
+            if existing.get("client_order_key") == order_result.get("client_order_key"):
+                assert_same_identity(existing, {**order_result, "trade_date": td})
+                existing.update({**order_result, "trade_date": td})
+                return True
         _MEM_ORDERS.append({
             **order_result, "trade_date": td,
             "status": order_result.get("status", "ACK"),
@@ -378,6 +407,9 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
 def save_order_reject(order_result: dict, trade_date: str | None = None) -> bool:
     """us_orders REJECT 저장."""
     td = trade_date or _today()
+    from trader.us.execution.order_identity import valid_identity
+    if not valid_identity(order_result.get("client_order_key")):
+        return False
     engine = _get_engine_or_none()
     if engine is None:
         _MEM_ORDERS.append({
@@ -411,6 +443,9 @@ def save_order_reject(order_result: dict, trade_date: str | None = None) -> bool
 def save_dry_run_order(intent: dict, trade_date: str | None = None) -> bool:
     """us_orders DRY_RUN 저장. status='DRY_RUN', dry_run=True."""
     td = trade_date or _today()
+    from trader.us.execution.order_identity import valid_identity
+    if not valid_identity(intent.get("client_order_key")):
+        return False
     engine = _get_engine_or_none()
     if engine is None:
         _MEM_ORDERS.append({
@@ -843,6 +878,15 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     td = trade_date or _today()
     if not fills:
         return 0
+    from trader.us.execution.order_identity import valid_identity
+    for f in fills:
+        if not valid_identity(f.get("client_order_key")) and valid_identity(f.get("order_no")):
+            f["_fill_idempotency_key_override"] = _us_fill_idempotency_key_text(f, td)
+            f["client_order_key"] = f"KIS_{td}_{str(f.get('order_no')).strip()}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
+    invalid = [f for f in fills if not valid_identity(f.get("client_order_key"))]
+    if invalid:
+        logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_fills count=%d", len(invalid))
+        return 0
     engine = _get_engine_or_none()
     if engine is None:
         existing_keys = {_us_fill_idempotency_key(f, td) for f in _MEM_FILLS if f.get("trade_date") == td}
@@ -953,7 +997,10 @@ def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> li
 #                      unrealized_pnl_usd, meta
 # ---------------------------------------------------------------------------
 
-def save_position_snapshot(positions: list[dict], trade_date: str | None = None) -> int:
+def save_position_snapshot(positions: list[dict], trade_date: str | None = None, *,
+                           balance_fetch_status: str = "UNKNOWN", balance_parse_status: str = "UNKNOWN",
+                           authoritative_positions: bool = False, preserve_previous_positions: bool = True,
+                           close_source: str = "kis_final_balance") -> int:
     """us_positions 스냅샷 저장 (upsert). qty>0이면 open position.
 
     meta에 holding_qty, orderable_qty, sellable_qty, entry_price,
@@ -962,7 +1009,15 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
     td = trade_date or _today()
     engine = _get_engine_or_none()
     if engine is None:
-        _MEM_POSITIONS.clear()
+        if authoritative_positions and not preserve_previous_positions and balance_fetch_status == "OK" and balance_parse_status == "OK":
+            current = {str(p.get("symbol") or "").upper() for p in positions}
+            now = datetime.now(timezone.utc).isoformat()
+            for old in _MEM_POSITIONS:
+                if str(old.get("symbol") or "").upper() not in current:
+                    old["qty"] = 0
+                    old.setdefault("meta", {}).update({"position_status": "CLOSED_BY_AUTHORITATIVE_BALANCE", "closed_at": now, "close_source": close_source})
+        else:
+            _MEM_POSITIONS.clear()
         for p in positions:
             meta = dict(p.get("meta") or {})
             meta.update({
@@ -1038,6 +1093,18 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None)
                     },
                 )
                 count += 1
+            if authoritative_positions and not preserve_previous_positions and balance_fetch_status == "OK" and balance_parse_status == "OK":
+                symbols = [str(p.get("symbol") or "").upper() for p in positions if p.get("symbol")]
+                conn.execute(
+                    text("""
+                        UPDATE us_positions SET qty=0,
+                          meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                            'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
+                            'closed_at',NOW()::text,'close_source',:source)
+                        WHERE as_of=:td AND qty>0
+                          AND NOT (UPPER(symbol) = ANY(:symbols))
+                    """), {"td": td, "symbols": symbols or ["__NONE__"], "source": close_source},
+                )
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
     logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", count)

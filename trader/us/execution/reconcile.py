@@ -356,6 +356,19 @@ def confirm_order_by_balance_delta(side: str, order_qty: int, pre_qty: int | Non
         return {"status": "BALANCE_CONFIRMED_PARTIAL", "pending": True, "filled_qty_by_balance": filled, "remaining_qty": order_qty - filled}
     return {"status": "RECONCILE_NEEDS_RECHECK", "pending": True, "filled_qty_by_balance": max(0, filled), "remaining_qty": order_qty}
 
+
+def validate_reconcile_identity(*, trade_date: str, order_no: str = "", client_order_key: str = "",
+                                requested_symbol: str, requested_side: str, matches: list[dict]) -> dict:
+    """Strict lookup result gate; callers must not create fills on non-OK."""
+    if not str(trade_date or "").strip(): return {"status": "RECONCILE_TRADE_DATE_REQUIRED"}
+    if not str(order_no or "").strip() and not str(client_order_key or "").strip(): return {"status": "RECONCILE_ORDER_IDENTITY_REQUIRED"}
+    if not matches: return {"status": "RECONCILE_ORDER_NOT_FOUND"}
+    if len(matches) != 1: return {"status": "RECONCILE_ORDER_AMBIGUOUS"}
+    row = matches[0]
+    if str(row.get("symbol") or "").upper() != str(requested_symbol or "").upper(): return {"status": "RECONCILE_SYMBOL_MISMATCH"}
+    if str(row.get("side") or "").upper() != str(requested_side or "").upper(): return {"status": "RECONCILE_SIDE_MISMATCH"}
+    return {"status": "OK", "order": row}
+
 def reconcile_ack_orders_with_balance(
     *,
     provider: Any | None = None,
@@ -448,6 +461,14 @@ def reconcile_ack_orders_with_balance(
             fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol)
             if fills_resp and isinstance(fills_resp, dict):
                 if fills_resp.get("filled_qty", 0) > 0:
+                    fill_symbol = str(fills_resp.get("symbol") or symbol).upper()
+                    fill_side = str(fills_resp.get("side") or side).upper()
+                    fill_order_no = str(fills_resp.get("order_no") or order_no)
+                    if fill_symbol != symbol or fill_side != side or fill_order_no != order_no:
+                        logger.error("[US_RECONCILE][IDENTITY_MISMATCH] order_no=%s symbol=%s/%s side=%s/%s", order_no, symbol, fill_symbol, side, fill_side)
+                        unresolved_count += 1
+                        symbols_by_status["unresolved"].append(symbol)
+                        continue
                     fill_price = float(fills_resp.get("avg_price", 0) or 0)
                     fill_price_source = "fills_by_order_no"
                     fill_qty = int(fills_resp.get("filled_qty", qty))
@@ -706,4 +727,5 @@ def classify_ack_orders_with_final_balance(
             "pre_order_position_qty": pre_qty,
             "final_position_qty": final_qty,
         })
-    return {"status": "OK", "orders": classified, "counts": counts, "pending_order_count": pending}
+    return {"status": "OK" if pending == 0 else "DEGRADED_ACK_UNRESOLVED", "orders": classified, "counts": counts, "pending_order_count": pending,
+            "reason": "" if pending == 0 else "ACK_ONLY_UNRESOLVED"}
