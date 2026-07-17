@@ -37,9 +37,10 @@ def test_qty_requested_used_for_sell_balance_reconcile(monkeypatch) -> None:
         env="practice",
     )
 
-    assert result["balance_reconcile_count"] == 1
-    assert captured[0]["filled_qty"] == 4
-    assert captured[0]["avg_price_usd"] == 500.6966
+    # Symbol absence alone is not quantity evidence; no synthetic full fill.
+    assert result["balance_reconcile_count"] == 0
+    assert result["unresolved_count"] == 1
+    assert captured == []
 
 
 def test_missing_qty_requested_is_marked_unresolved(monkeypatch, caplog) -> None:

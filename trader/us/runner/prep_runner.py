@@ -531,6 +531,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             watchlist_result=watchlist_result,
             validation=validation,
             paths=paths,
+            daily_sync_summary=daily_sync_summary,
         )
         contract["daily_sync_summary"] = daily_sync_summary
         if benchmark_daily_failed:

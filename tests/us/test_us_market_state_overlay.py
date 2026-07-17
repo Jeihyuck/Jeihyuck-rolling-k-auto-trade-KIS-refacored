@@ -190,7 +190,7 @@ def test_defense_trim_current_px_alias_partial_and_no_duplicate_existing_sell():
         {"symbol": "NVDA", "qty": 10, "current_px": 100, "theme_cluster": "AI_SEMI", "pnl_rate": -2.0},
         {"symbol": "MSFT", "qty": 10, "current_px": 100, "theme_cluster": "MEGA_TECH", "pnl_rate": -1.0},
     ]
-    intents = build_defense_trim_intents(positions, overlay, existing_sell_symbols={"MSFT"})
+    intents = build_defense_trim_intents(positions, overlay, existing_sell_symbols={"MSFT"}, trade_date="2026-07-16")
     assert len(intents) == 1
     assert intents[0]["symbol"] == "NVDA"
     assert intents[0]["notional_usd"] > 0

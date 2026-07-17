@@ -35,6 +35,7 @@ def _position_market_value_usd(position: dict) -> float:
         "eval_amount_usd",
         "eval_amount",
         "ord_psbl_amt",
+        "evlu_amt", "frcr_evlu_amt2", "ovrs_stck_evlu_amt",
     ):
         try:
             value = float(position.get(key) or 0)
@@ -42,6 +43,14 @@ def _position_market_value_usd(position: dict) -> float:
             value = 0.0
         if value > 0:
             return value
+    try:
+        qty = float(position.get("qty") or position.get("holding_qty") or 0)
+        price = float(position.get("current_price_usd") or position.get("current_price")
+                      or position.get("current_px") or position.get("last_price") or 0)
+        if qty > 0 and price > 0:
+            return qty * price
+    except (TypeError, ValueError, AttributeError):
+        pass
     return 0.0
 
 

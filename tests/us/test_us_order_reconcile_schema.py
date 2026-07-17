@@ -22,6 +22,8 @@ def test_mark_order_filled_by_reconcile_in_memory_uses_avg_price_usd(monkeypatch
         "client_order_key": "CK1",
         "status": "ACK",
         "qty_filled": 0,
+        "symbol": "AAPL",
+        "side": "BUY",
     })
 
     repos.mark_order_filled_by_reconcile(
@@ -29,6 +31,9 @@ def test_mark_order_filled_by_reconcile_in_memory_uses_avg_price_usd(monkeypatch
         client_order_key="CK1",
         filled_qty=4,
         avg_price_usd=123.45,
+        trade_date="2026-06-05",
+        symbol="AAPL",
+        side="BUY",
     )
 
     saved = repos._MEM_ORDERS[0]

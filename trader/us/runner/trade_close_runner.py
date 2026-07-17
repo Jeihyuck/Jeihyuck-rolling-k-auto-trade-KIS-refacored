@@ -168,8 +168,10 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
         # 6. Balance snapshot
         balance = {}
+        balance_fetch_ok = False
         try:
             balance = provider.get_balance()
+            balance_fetch_ok = isinstance(balance, dict) and str(balance.get("balance_parse_status", "OK")) == "OK"
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] balance fetch failed: %s", exc)
 
@@ -192,9 +194,22 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         # 8. Daily report
         try:
             from trader.us.runner.daily_report_runner import run_daily_report
+            final_positions_authoritative = bool(
+                reconcile_result.get("status") == "OK"
+                and reconcile_result.get("balance_fetch_status") == "OK"
+                and reconcile_result.get("balance_parse_status", "OK") == "OK"
+                and reconcile_result.get("preserve_previous_positions") is False
+            )
+            direct_positions = positions if final_positions_authoritative else None
+            direct_balance = reconcile_result if final_positions_authoritative else None
+            if not final_positions_authoritative and balance_fetch_ok:
+                candidate_positions = balance.get("positions")
+                if isinstance(candidate_positions, list):
+                    direct_positions = candidate_positions
+                    direct_balance = balance
             daily_report_result = run_daily_report(
                 env=env, session="close", trade_date=trade_date, offline=offline,
-                final_balance=balance, final_positions=positions, kis_fills=fills,
+                final_balance=direct_balance, final_positions=direct_positions, kis_fills=fills,
                 close_order_classification=close_order_classification, close_run_id=run_id,
             )
         except Exception as exc:

@@ -66,7 +66,7 @@ def normalize_and_validate_order_identity(intent: dict, context: Any | None = No
         raise InvalidOrderIdentity("side must be BUY or SELL")
     normalized["side"] = side
     normalized["qty"] = int(normalized.get("qty", normalized.get("quantity", 0)) or 0)
-    for field in ("trade_date", "session", "session_run_id", "session_generation", "tick_id", "prep_run_id",
+    for field in ("trade_date", "session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source",
                   "position_lifecycle_id", "pre_order_position_qty"):
         value = normalized.get(field, meta.get(field))
         if value is None and context is not None:

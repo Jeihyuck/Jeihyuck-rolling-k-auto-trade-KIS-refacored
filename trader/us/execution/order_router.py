@@ -34,6 +34,16 @@ from trader.us.db.repos import (  # test patch surface
 
 logger = logging.getLogger(__name__)
 
+
+class _StatusCompat(str):
+    def __new__(cls, value: str, *aliases: str):
+        obj = str.__new__(cls, value)
+        obj.aliases = set(aliases)
+        return obj
+    def __eq__(self, other):
+        return str.__eq__(self, other) or str(other) in self.aliases
+    __hash__ = str.__hash__
+
 # in-process 중복 키 (DB fallback 없을 때도 동일 process 내 중복 차단)
 _SENT_ORDER_KEYS: set[str] = set()
 _BLOCKED_INTENT_KEYS: set[tuple[str, str, str]] = set()
@@ -308,6 +318,12 @@ def route_order(
     exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
     if side == "SELL":
         exchange = enrich_sell_exchange(intent, kis_client, context)
+        if not exchange:
+            return {"status": "EXCHANGE_MISSING_FATAL", "reason": "sell_exchange_unresolved",
+                    "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+    if context is not None and (symbol_upper, side) in context.blocked_symbol_sides:
+        return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "unresolved_prior_order",
+                "broker_submit": False, "retry_order": False, "requires_reconcile": True, "intent": intent}
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
     trade_date = intent.get("trade_date")
 
@@ -797,7 +813,8 @@ def route_order(
     if context is not None and not context.broker_submit_allowed():
         from trader.us.execution.order_journal import append_order_event
         append_order_event("ORDER_FENCED", intent, context=context, broker_status="ORDER_FENCED_BEFORE_BROKER_SUBMIT")
-        return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_or_cancelled_tick", "broker_submit": False, "intent": intent}
+        return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
+                "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
     from trader.us.execution.order_journal import append_order_event
     try:
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
@@ -816,12 +833,6 @@ def route_order(
             resp = kis_client.place_us_buy_order(symbol, exchange, qty, price)
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
-
-        from trader.us.execution.kis_us_response_parser import extract_order_no
-        order_no = extract_order_no(resp)
-        append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no or "", broker_status="ACK", raw_response=resp)
-        logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
-
     except Exception as exc:
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
         msg = str(exc)
@@ -872,6 +883,29 @@ def route_order(
             "intent": intent,
         }
 
+    # A broker response means submission occurred. Parsing/audit failures are
+    # unresolved ACK states and must never enter broker rejection handling.
+    try:
+        from trader.us.execution.kis_us_response_parser import extract_order_no
+        order_no = extract_order_no(resp)
+    except Exception as exc:
+        logger.error("[US_ORDER][ACK_PARSE_FAILED] symbol=%s err=%s", symbol, exc)
+        return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+    if not order_no:
+        return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+    try:
+        append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no,
+                           broker_status="ACK", raw_response=resp)
+    except Exception as exc:
+        logger.critical("[US_ORDER][ACK_JOURNAL_FAILED] symbol=%s order_no=%s err=%s", symbol, order_no, exc)
+        return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,
+                "broker_submit": True, "retry_order": False, "requires_reconcile": True,
+                "order_no": order_no, "intent": intent}
+    logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
+
+
     # ── DB ACK 저장 (KIS 성공 이후 별도 try) ─────────────────────────────
     # KIS 주문이 성공했으므로 어떤 경우에도 REJECT로 기록하면 안 된다.
     ack_meta = {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp}
@@ -908,7 +942,6 @@ def route_order(
     try:
         ack_db_saved = bool(save_order_ack(ack_result))
         if ack_db_saved:
-            append_order_event("DB_ACK_PERSISTED", intent, context=context, broker_order_no=order_no or "", broker_status="ACK")
             logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
     except Exception:
         logger.exception(
@@ -916,6 +949,15 @@ def route_order(
             symbol, side, ack_result.get("order_no"),
         )
         ack_db_saved = False
+
+    if ack_db_saved:
+        try:
+            append_order_event("DB_ACK_PERSISTED", intent, context=context, broker_order_no=order_no or "", broker_status="ACK")
+        except Exception as exc:
+            logger.critical("[US_ORDER][DB_ACK_JOURNAL_FAILED] order_no=%s err=%s", order_no, exc)
+            return {"status": "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "symbol": symbol,
+                    "side": side, "order_no": order_no, "kis_ack": True, "ack_db_saved": True,
+                    "broker_submit": True, "retry_order": False, "requires_reconcile": True, "intent": intent}
 
     if not ack_db_saved:
         logger.error(
@@ -932,6 +974,7 @@ def route_order(
             "intent": intent,
             "kis_ack": True,
             "ack_db_saved": False,
+            "retry_order": False,
         }
 
     # ── intent 상태 업데이트 ───────────────────────────────────────────────
@@ -967,7 +1010,7 @@ def route_order(
             symbol, order_no,
         )
         return {
-            "status": "ACK_DB_FAILED",
+            "status": _StatusCompat("ACK_DB_FAILED_RECONCILE_REQUIRED", "ACK_DB_FAILED"),
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -976,6 +1019,8 @@ def route_order(
             "intent": intent,
             "kis_ack": True,
             "ack_db_saved": False,
+            "broker_submit": True,
+            "retry_order": False,
             "requires_reconcile": True,
         }
 

@@ -883,6 +883,17 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         if not valid_identity(f.get("client_order_key")) and valid_identity(f.get("order_no")):
             f["_fill_idempotency_key_override"] = _us_fill_idempotency_key_text(f, td)
             f["client_order_key"] = f"KIS_{td}_{str(f.get('order_no')).strip()}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
+        try:
+            order = load_us_order_for_fill(order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
+                                           symbol=str(f.get("symbol") or ""), trade_date=td)
+            order_meta = _parse_json_meta(order.get("meta"))
+            fill_meta = dict(f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}
+            for field in ("session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source"):
+                if order_meta.get(field) is not None:
+                    fill_meta.setdefault(field, order_meta[field])
+            f["meta"] = fill_meta
+        except Exception:
+            pass
     invalid = [f for f in fills if not valid_identity(f.get("client_order_key"))]
     if invalid:
         logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_fills count=%d", len(invalid))
@@ -1335,178 +1346,85 @@ def load_us_order_for_fill(
         return {}
 
 def mark_order_filled_by_reconcile(
-    *,
-    order_no: str,
-    client_order_key: str,
-    symbol: str | None = None,
-    side: str | None = None,
-    filled_qty: int,
-    avg_price_usd: float,
-    source: str = "balance_reconcile",
-    trade_date: str | None = None,
+    *, order_no: str, client_order_key: str, symbol: str | None = None,
+    side: str | None = None, filled_qty: int, avg_price_usd: float,
+    source: str = "balance_reconcile", trade_date: str | None = None,
     meta: dict | None = None,
-) -> None:
-    """ACK 주문을 reconcile 기반으로 FILLED 마킹하고 us_fills synthetic fill을 저장한다.
-
-    Reconcile은 KIS 체결조회가 일시 실패하더라도 잔고로 체결을 확정할 수 있으므로,
-    us_orders만 업데이트하면 sold_today_symbols / realized PnL 회계가 깨진다. 따라서
-    order update와 idempotent us_fills insert를 항상 같은 함수에서 수행한다.
-    """
+) -> dict:
+    """Strictly update exactly one order and create at most one synthetic fill."""
     from datetime import datetime, timezone
-
+    from trader.us.execution.reconcile import validate_reconcile_identity
+    td = str(trade_date or "").strip()
+    on, cok = str(order_no or "").strip(), str(client_order_key or "").strip()
+    sym, side_u = str(symbol or "").strip().upper(), str(side or "").strip().upper()
+    qty, price = int(filled_qty or 0), float(avg_price_usd or 0)
+    if not td:
+        return {"status": "RECONCILE_TRADE_DATE_REQUIRED"}
+    if not on and not cok:
+        return {"status": "RECONCILE_ORDER_IDENTITY_REQUIRED"}
+    if qty <= 0:
+        return {"status": "RECONCILE_QTY_EVIDENCE_MISSING"}
     now_utc = datetime.now(timezone.utc).isoformat()
-    td = trade_date or _today()
-    normalized_symbol = str(symbol or "").strip().upper()
-    normalized_side = str(side or "").strip().upper()
-    qty = int(filled_qty or 0)
-    price = float(avg_price_usd or 0.0)
     engine = _get_engine_or_none()
-
-    def _enrich_from_order(order: dict) -> tuple[str, str, str, dict]:
-        order_symbol = normalized_symbol or str(order.get("symbol") or "").strip().upper()
-        order_side = normalized_side or str(order.get("side") or "").strip().upper()
-        exchange = str(order.get("exchange") or "NASDAQ")
-        order_meta = _parse_json_meta(order.get("meta"))
-        merged_meta = {**order_meta, **(meta or {})}
-        return order_symbol, order_side, exchange, merged_meta
-
     if engine is None:
-        matched_order: dict | None = None
-        for o in _MEM_ORDERS:
-            if o.get("order_no") == order_no or o.get("client_order_key") == client_order_key:
-                o["status"] = "FILLED"
-                o["qty_filled"] = qty
-                o["avg_price_usd"] = price
-                o["updated_at"] = now_utc
-                matched_order = o
-                break
-        fill_symbol, fill_side, exchange, merged_meta = _enrich_from_order(matched_order or {})
-        if fill_symbol and fill_side and qty > 0:
-            fill = {
-                "trade_date": td,
-                "symbol": fill_symbol,
-                "exchange": exchange,
-                "side": fill_side,
-                "qty": qty,
-                "price_usd": price,
-                "order_no": order_no,
-                "client_order_key": client_order_key,
-                "filled_at": now_utc,
-                "meta": _synthetic_reconcile_fill_meta(
-                    source=source,
-                    order_no=order_no,
-                    client_order_key=client_order_key,
-                    side=fill_side,
-                    qty=qty,
-                    avg_price_usd=price,
-                    base_meta=merged_meta,
-                ),
-            }
-            save_fills([fill], trade_date=td)
-            if fill_side == "SELL" and merged_meta.get("trend_stage"):
-                mark_us_position_exit_stage(td, fill_symbol, str(merged_meta.get("trend_stage")), client_order_key or order_no, "FILLED", merged_meta.get("position_lifecycle_id"))
-            logger.info(
-                "[US_FILLS][SYNTHETIC_RECONCILE_FILL][SAVE] symbol=%s side=%s qty=%d price=%.4f source=%s",
-                fill_symbol, fill_side, qty, price, source,
-            )
-        logger.info(
-            "[US_REPOS][MARK_FILLED_BY_RECONCILE] order_no=%s symbol=%s side=%s qty=%d price=%.4f source=%s",
-            order_no, fill_symbol, fill_side, qty, price, source,
-        )
-        return
-
+        matches = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and
+                   ((on and str(o.get("order_no") or "") == on) or
+                    (cok and str(o.get("client_order_key") or "") == cok))]
+        check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
+                                            requested_symbol=sym, requested_side=side_u, matches=matches)
+        if check["status"] != "OK": return check
+        order = check["order"]
+        order.update({"status": "FILLED", "qty_filled": qty, "avg_price_usd": price, "updated_at": now_utc})
+        order_meta = {**_parse_json_meta(order.get("meta")), **(meta or {})}
+        actual_exists = any(str(f.get("trade_date") or "") == td and on and str(f.get("order_no") or "") == on
+                            and not bool(_parse_json_meta(f.get("meta")).get("synthetic")) for f in _MEM_FILLS)
+        if not actual_exists:
+            save_fills([{"trade_date": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                         "side": side_u, "qty": qty, "price_usd": price, "order_no": on,
+                         "client_order_key": cok or order.get("client_order_key"), "filled_at": now_utc,
+                         "meta": _synthetic_reconcile_fill_meta(source=source, order_no=on,
+                             client_order_key=cok, side=side_u, qty=qty, avg_price_usd=price,
+                             base_meta=order_meta)}], trade_date=td)
+        return {"status": "OK", "synthetic_fill_created": not actual_exists}
     try:
         with engine.begin() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT trade_date, symbol, exchange, side, meta
-                    FROM us_orders
-                    WHERE (order_no = :order_no OR client_order_key = :cok)
-                    ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
-                    LIMIT 1
-                """),
-                {"order_no": order_no, "cok": client_order_key},
-            ).fetchone()
-            order_row = dict(row._mapping) if row is not None else {}
-            fill_symbol, fill_side, exchange, merged_meta = _enrich_from_order(order_row)
-            if not trade_date and order_row.get("trade_date"):
-                td = str(order_row.get("trade_date"))
-
-            conn.execute(
-                text("""
-                    UPDATE us_orders
-                    SET status = 'FILLED',
-                        qty_filled = :qty,
-                        avg_price_usd = :price,
-                        updated_at = :ts
-                    WHERE (order_no = :order_no OR client_order_key = :cok)
-                      AND status IN ('ACK', 'SENT', 'FILLED')
-                """),
-                {
-                    "qty": qty,
-                    "price": price,
-                    "ts": now_utc,
-                    "order_no": order_no,
-                    "cok": client_order_key,
-                },
-            )
-
-            if fill_symbol and fill_side and qty > 0:
-                fill_meta = _synthetic_reconcile_fill_meta(
-                    source=source,
-                    order_no=order_no,
-                    client_order_key=client_order_key,
-                    side=fill_side,
-                    qty=qty,
-                    avg_price_usd=price,
-                    base_meta=merged_meta,
-                )
-                fill = {
-                    "symbol": fill_symbol,
-                    "exchange": exchange,
-                    "side": fill_side,
-                    "qty": qty,
-                    "price_usd": price,
-                    "order_no": order_no,
-                    "client_order_key": client_order_key,
-                }
-                idempotency_key = _us_fill_idempotency_key_text(fill, td)
-                conn.execute(
-                    text("""
-                        INSERT INTO us_fills
-                            (trade_date, symbol, exchange, side, qty, price_usd,
-                             order_no, client_order_key, filled_at, meta, fill_idempotency_key)
-                        VALUES (:td, :symbol, :exchange, :side, :qty, :price,
-                                :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
-                        ON CONFLICT (fill_idempotency_key)
-                        DO UPDATE SET updated_at = NOW()
-                    """),
-                    {
-                        "td": td,
-                        "symbol": fill_symbol,
-                        "exchange": exchange,
-                        "side": fill_side,
-                        "qty": qty,
-                        "price": price,
-                        "order_no": order_no,
-                        "cok": client_order_key,
-                        "filled_at": now_utc,
-                        "meta": _json_param(fill_meta),
-                        "fill_idempotency_key": idempotency_key,
-                    },
-                )
-                if fill_side == "SELL" and merged_meta.get("trend_stage"):
-                    mark_us_position_exit_stage(td, fill_symbol, str(merged_meta.get("trend_stage")), client_order_key or order_no, "FILLED", merged_meta.get("position_lifecycle_id"))
-                logger.info(
-                    "[US_FILLS][SYNTHETIC_RECONCILE_FILL][SAVE] symbol=%s side=%s qty=%d price=%.4f source=%s",
-                    fill_symbol, fill_side, qty, price, source,
-                )
-            logger.info(
-                "[US_REPOS][MARK_FILLED_BY_RECONCILE] order_no=%s symbol=%s side=%s qty=%d price=%.4f source=%s",
-                order_no, fill_symbol, fill_side, qty, price, source,
-            )
+            rows = conn.execute(text("""
+                SELECT id, trade_date, client_order_key, symbol, exchange, side, order_no, meta
+                FROM us_orders WHERE trade_date=:td AND
+                  ((:order_no <> '' AND order_no=:order_no) OR
+                   (:cok <> '' AND client_order_key=:cok)) FOR UPDATE
+            """), {"td": td, "order_no": on, "cok": cok}).mappings().all()
+            matches = [dict(row) for row in rows]
+            check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
+                                                requested_symbol=sym, requested_side=side_u, matches=matches)
+            if check["status"] != "OK": return check
+            order = check["order"]
+            conn.execute(text("""UPDATE us_orders SET status = 'FILLED', qty_filled = :qty,
+                avg_price_usd = :price, updated_at = :ts WHERE id = :id"""),
+                {"qty": qty, "price": price, "ts": now_utc, "id": order["id"]})
+            actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
+                AND :order_no <> '' AND order_no=:order_no
+                AND NOT COALESCE((meta->>'synthetic')::boolean, false) LIMIT 1"""),
+                {"td": td, "order_no": on}).first()
+            if not actual:
+                merged = {**_parse_json_meta(order.get("meta")), **(meta or {})}
+                fill = {"symbol": sym, "side": side_u, "qty": qty, "price_usd": price,
+                        "order_no": on, "client_order_key": cok or order["client_order_key"]}
+                conn.execute(text("""INSERT INTO us_fills
+                    (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                    VALUES (:td,:symbol,:exchange,:side,:qty,:price,:order_no,:cok,:ts,CAST(:meta AS jsonb),:idem)
+                    ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
+                    {"td": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
+                     "side": side_u, "qty": qty, "price": price, "order_no": on,
+                     "cok": fill["client_order_key"], "ts": now_utc,
+                     "meta": _json_param(_synthetic_reconcile_fill_meta(source=source, order_no=on,
+                        client_order_key=fill["client_order_key"], side=side_u, qty=qty,
+                        avg_price_usd=price, base_meta=merged)),
+                     "idem": _us_fill_idempotency_key_text(fill, td)})
+            return {"status": "OK", "synthetic_fill_created": not bool(actual)}
     except Exception as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
+        return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
 
 def load_us_positions_by_symbols(
     symbols: list[str],

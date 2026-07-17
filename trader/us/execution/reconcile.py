@@ -439,6 +439,15 @@ def reconcile_ack_orders_with_balance(
         side = str(order.get("side", "")).upper()
         order_no = str(order.get("order_no") or order.get("ack_no") or "")
         client_order_key = str(order.get("client_order_key") or "")
+        identity = validate_reconcile_identity(
+            trade_date=trade_date, order_no=order_no, client_order_key=client_order_key,
+            requested_symbol=symbol, requested_side=side, matches=[order],
+        )
+        if identity.get("status") != "OK":
+            unresolved_count += 1
+            symbols_by_status["unresolved"].append(symbol)
+            logger.error("[US_RECONCILE][STRICT_IDENTITY] status=%s symbol=%s", identity.get("status"), symbol)
+            continue
         qty = int(
             order.get("qty_requested")
             or order.get("qty")
@@ -446,6 +455,8 @@ def reconcile_ack_orders_with_balance(
             or order.get("qty_filled")
             or 0
         )
+        if qty <= 0:
+            logger.warning("[US_RECONCILE][ACK_RECONCILE][INVALID_QTY] symbol=%s order_no=%s side=%s qty=%d reason=missing_qty_requested", symbol, order_no, side, qty)
         fallback_fill_price, fallback_price_source = _resolve_order_fill_price(order)
         pre_qty_for_delta, _pre_source = _extract_pre_order_position_qty(order)
         post_qty_for_delta = int((kis_position_by_symbol.get(symbol) or {}).get("qty") or 0)
@@ -585,60 +596,6 @@ def reconcile_ack_orders_with_balance(
                 buy_reason if fill_price_candidate > 0 else "missing_fill_price",
             )
 
-        # fill 미확인: SELL이면 KIS 잔고에 포지션 없으면 balance reconcile
-        if side == "SELL" and symbol not in kis_position_symbols:
-            if qty <= 0:
-                logger.warning(
-                    "[US_RECONCILE][ACK_RECONCILE][INVALID_QTY] symbol=%s order_no=%s side=SELL qty=%d reason=missing_qty_requested",
-                    symbol,
-                    order_no,
-                    qty,
-                )
-                unresolved_count += 1
-                symbols_by_status["unresolved"].append(symbol)
-                continue
-
-            if fallback_fill_price > 0:
-                logger.info(
-                    "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=SELL qty=%d price_source=%s price=%.4f source=balance_reconcile_sell",
-                    symbol,
-                    qty,
-                    fill_price_source,
-                    fallback_fill_price,
-                )
-            else:
-                logger.warning(
-                    "[US_RECONCILE][BALANCE_RECONCILE_FILL_PRICE_MISSING] symbol=%s side=SELL qty=%d source=balance_reconcile_sell",
-                    symbol,
-                    qty,
-                )
-
-            logger.info(
-                "[US_RECONCILE][BALANCE_RECONCILE_TRIGGER] symbol=%s side=SELL qty=%d",
-                symbol,
-                qty,
-            )
-            try:
-                mark_order_filled_by_reconcile(
-                    order_no=order_no,
-                    client_order_key=client_order_key,
-                    symbol=symbol,
-                    side="SELL",
-                    filled_qty=qty,
-                    avg_price_usd=fallback_fill_price,
-                    source="balance_reconcile_sell",
-                    trade_date=trade_date,
-                    meta=_order_meta(order),
-                )
-                balance_reconcile_count += 1
-                symbols_by_status["balance_confirmed"].append(symbol)
-            except Exception as exc:
-                logger.error(
-                    "[US_RECONCILE][ACK_RECONCILE][ERROR] balance_reconcile_fill failed symbol=%s: %s",
-                    symbol, exc,
-                )
-            continue
-
         # 미해결
         logger.warning(
             "[US_RECONCILE][ACK_RECONCILE][UNRESOLVED] symbol=%s order_no=%s side=%s",
@@ -694,6 +651,17 @@ def classify_ack_orders_with_final_balance(
         final_qty = int((final_positions.get(symbol) or {}).get("qty") or 0)
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
+        identity = validate_reconcile_identity(
+            trade_date=trade_date, order_no=str(order.get("order_no") or ""),
+            client_order_key=str(order.get("client_order_key") or ""),
+            requested_symbol=symbol, requested_side=side, matches=[order],
+        )
+        if identity.get("status") != "OK":
+            final_status = identity["status"]
+            pending += 1
+            counts[final_status] = counts.get(final_status, 0) + 1
+            classified.append({"symbol": symbol, "side": side, "final_status": final_status})
+            continue
         if raw_status in {"REJECT", "REJECTED"}:
             final_status = "rejected"
         elif raw_status in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:

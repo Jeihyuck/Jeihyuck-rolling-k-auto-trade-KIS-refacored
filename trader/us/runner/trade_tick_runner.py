@@ -598,6 +598,7 @@ def route_exit_orders_immediately(
     signal_only: bool,
     kis_order_allowed: bool,
     current_position_symbols: set[str],
+    context=None,
 ) -> dict:
     """Route SELL intents before any entry watchlist/evaluation work.
 
@@ -620,6 +621,7 @@ def route_exit_orders_immediately(
                 kis_order_allowed=kis_order_allowed,
                 allowed_symbols=None,
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
+                context=context,
             )
             orders.append(result)
         except Exception as exc:
@@ -667,6 +669,13 @@ def run_trade_tick(
     watchlist_cache_source: str | None = None,
     entry_can_proceed: bool = True,
     exit_can_proceed: bool = True,
+    session_run_id: str = "",
+    session_generation: int = 1,
+    prep_run_id: str = "",
+    tick_id: str = "",
+    tick_cancellation_event=None,
+    active_session_state_path: str | None = None,
+    blocked_symbol_sides: list[list[str]] | None = None,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -723,6 +732,8 @@ def run_trade_tick(
     else:
         now = now_ny()
     trade_date = now.strftime("%Y-%m-%d")
+    session_run_id = session_run_id or os.getenv("US_RUN_ID") or os.getenv("GITHUB_RUN_ID", "local")
+    tick_id = tick_id or f"{session_run_id}:{tick_index}"
 
     logger.info(
         "[US_TICK][TIME] session=%s force_now=%s resolved_now_et=%s",
@@ -1085,6 +1096,36 @@ def run_trade_tick(
                 _p["high_watermark_source"] = _lc.get("high_watermark_source")
     except Exception as _lc_exc:
         logger.warning("[US_POSITION][LIFECYCLE][WARN] err=%s", _lc_exc)
+    from trader.us.execution.tick_context import TickExecutionContext
+    from trader.us.symbols import normalize_us_exchange
+    positions_by_symbol = {str(p.get("symbol") or "").upper(): p for p in current_positions if p.get("symbol")}
+    exchange_by_symbol: dict[str, str] = {}
+    for _sym, _pos in positions_by_symbol.items():
+        for _raw_ex in (_pos.get("exchange"), _pos.get("raw_exchange"), (_pos.get("meta") or {}).get("raw_exchange")):
+            try:
+                exchange_by_symbol[_sym] = normalize_us_exchange(str(_raw_ex))
+                break
+            except Exception:
+                continue
+    try:
+        from trader.us.db.repos import load_pending_ack_orders, load_today_order_keys
+        pending_ack_orders = load_pending_ack_orders(trade_date=trade_date, env=env)
+        today_order_keys = load_today_order_keys(trade_date=trade_date)
+    except Exception as _ctx_exc:
+        logger.warning("[US_TICK][CONTEXT_LOAD_WARN] err=%s", _ctx_exc)
+        pending_ack_orders, today_order_keys = [], set()
+    tick_context = TickExecutionContext(
+        trade_date=trade_date, session=session, session_run_id=session_run_id,
+        session_generation=int(session_generation), tick_id=tick_id, prep_run_id=prep_run_id,
+        run_source=os.getenv("US_RUN_SOURCE", ""),
+        balance_snapshot=recon, positions_by_symbol=positions_by_symbol,
+        exchange_by_symbol=exchange_by_symbol, fills_snapshot=fills_today,
+        pending_ack_orders=pending_ack_orders, today_order_keys=set(today_order_keys or set()),
+        cancellation_token=tick_cancellation_event, session_state="ACTIVE",
+        active_tick_id=tick_id, active_session_run_id=session_run_id,
+        active_session_generation=int(session_generation), active_session_state_path=active_session_state_path,
+        blocked_symbol_sides={(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2},
+    )
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -1305,7 +1346,10 @@ def run_trade_tick(
         try:
             from trader.us.market_state_overlay import build_defense_trim_intents
             existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
-            defense_trim_intents = build_defense_trim_intents(current_positions, market_state_overlay, existing_sell_symbols)
+            defense_trim_intents = build_defense_trim_intents(
+                current_positions, market_state_overlay, existing_sell_symbols,
+                trade_date=trade_date, context=tick_context,
+            )
             if defense_trim_intents:
                 exit_intents.extend(defense_trim_intents)
         except Exception as _def_trim_exc:
@@ -1331,6 +1375,7 @@ def run_trade_tick(
         signal_only=signal_only,
         kis_order_allowed=kis_order_allowed,
         current_position_symbols=current_position_symbols,
+        context=tick_context,
     )
     orders = list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
@@ -1881,6 +1926,7 @@ def run_trade_tick(
                 kis_order_allowed=kis_order_allowed,
                 allowed_symbols=(locked_watchlist_symbols if str(intent.get("side", "BUY")).upper() == "BUY" and locked_watchlist_symbols else None),
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
+                context=tick_context,
             )
             orders.append(result)
             if result["status"] in ("DRY_RUN", "ACK"):

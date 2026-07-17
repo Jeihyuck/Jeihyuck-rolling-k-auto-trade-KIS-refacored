@@ -70,6 +70,7 @@ def build_us_prep_contract(
     watchlist_result: dict,
     validation: dict,
     paths: dict,
+    daily_sync_summary: dict | None = None,
 ) -> dict:
     """US Prep Contract 생성.
 
@@ -92,12 +93,13 @@ def build_us_prep_contract(
     final30_count = watchlist_result.get("final30_count", 0)
     final30_scored_count = watchlist_result.get("final30_scored_count", 0)
     score_nonzero_count = validation.get("score_nonzero_count", 0)
-    daily_sync_target_count = int(dynamic_universe_result.get("daily_sync_target_count", 0) or 0)
-    daily_sync_ok_count = int(dynamic_universe_result.get("daily_sync_ok_count", daily_sync_target_count) or 0)
-    daily_sync_failed_count = int(dynamic_universe_result.get("daily_sync_failed_count", max(0, daily_sync_target_count - daily_sync_ok_count)) or 0)
+    sync = dict(daily_sync_summary or {})
+    daily_sync_target_count = int(sync.get("sync_target_count", 0) or 0)
+    daily_sync_ok_count = int(sync.get("sync_ok_count", 0) or 0)
+    daily_sync_failed_count = int(sync.get("sync_failed_count", max(0, daily_sync_target_count - daily_sync_ok_count)) or 0)
     daily_sync_success_ratio = (daily_sync_ok_count / daily_sync_target_count) if daily_sync_target_count else 1.0
-    benchmark_sync_failed_count = int(dynamic_universe_result.get("benchmark_sync_failed_count", 0) or 0)
-    open_position_sync_failed_count = int(dynamic_universe_result.get("open_position_sync_failed_count", 0) or 0)
+    benchmark_sync_failed_count = len(sync.get("benchmark_sync_failed_symbols") or [])
+    open_position_sync_failed_count = len(sync.get("open_position_sync_failed_symbols") or [])
     final30_sync_failed_count = int(watchlist_result.get("final30_sync_failed_count", 0) or 0)
     exchange_failed_symbols = list(dynamic_universe_result.get("exchange_resolution_failed_symbols") or [])
 
@@ -271,6 +273,7 @@ def build_us_prep_contract(
         "daily_sync_target_count": daily_sync_target_count,
         "daily_sync_ok_count": daily_sync_ok_count,
         "daily_sync_failed_count": daily_sync_failed_count,
+        "daily_sync_failed_symbols": list(sync.get("sync_failed_symbols") or []),
         "daily_sync_success_ratio": daily_sync_success_ratio,
         "benchmark_sync_failed_count": benchmark_sync_failed_count,
         "open_position_sync_failed_count": open_position_sync_failed_count,

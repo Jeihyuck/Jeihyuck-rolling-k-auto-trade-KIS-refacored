@@ -7,6 +7,8 @@ import queue
 import signal
 import time
 import traceback
+import json
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -42,13 +44,26 @@ def run_tick_in_process(target: Callable, *, kwargs: dict, timeout_sec: float,
     ctx = mp_context or mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
     result_queue = ctx.Queue(maxsize=1)
     cancellation = ctx.Event()
-    process = ctx.Process(target=_child_entry, args=(result_queue, cancellation, target, kwargs), daemon=False)
+    child_kwargs = dict(kwargs)
+    child_kwargs["tick_cancellation_event"] = cancellation
+    process = ctx.Process(target=_child_entry, args=(result_queue, cancellation, target, child_kwargs), daemon=False)
     started = time.monotonic()
     process.start()
     pid = int(process.pid or 0)
     process.join(max(0.001, timeout_sec))
     if process.is_alive():
         cancellation.set()
+        state_path = child_kwargs.get("active_session_state_path")
+        if state_path:
+            try:
+                path = Path(state_path)
+                state = json.loads(path.read_text(encoding="utf-8"))
+                state["state"] = "CANCELLING"
+                tmp = path.with_suffix(path.suffix + ".timeout.tmp")
+                tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+                os.replace(tmp, path)
+            except Exception:
+                pass
         try:
             if hasattr(os, "killpg"):
                 os.killpg(pid, signal.SIGTERM)
