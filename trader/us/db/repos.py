@@ -11,6 +11,7 @@ us_* 테이블에 대한 CRUD 함수 모음.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -60,19 +61,53 @@ def _merge_us_daily_metrics_meta(row: dict) -> dict:
     return meta
 
 
-def _fill_execution_identity(fill: dict) -> str:
+def canonical_actual_execution_key(
+    *,
+    trade_date: str,
+    order_no: str,
+    symbol: str,
+    side: str,
+    broker_execution_id: str | None = None,
+    execution_sequence: str | int | None = None,
+    execution_timestamp: str | None = None,
+    qty: int,
+    price: float,
+    raw: Any | None = None,
+) -> str:
+    base = f"{trade_date}|{str(symbol).upper()}|{str(side).upper()}|{order_no}"
+    if broker_execution_id not in (None, ""):
+        return f"{base}|exec={broker_execution_id}"
+    if execution_sequence not in (None, ""):
+        return f"{base}|seq={execution_sequence}"
+    if execution_timestamp not in (None, ""):
+        return f"{base}|ts={execution_timestamp}|qty={int(qty or 0)}|price={float(price or 0.0)}"
+    if raw is not None:
+        digest = hashlib.sha256(json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
+        return f"{base}|raw={digest}"
+    return f"{base}|qty={int(qty or 0)}|price={float(price or 0.0)}"
+
+
+def _fill_execution_identity(fill: dict, trade_date: str | None = None) -> str:
     meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
-    for key in ("broker_execution_id", "execution_id", "exec_id", "fill_id"):
-        value = fill.get(key) or meta.get(key)
-        if value not in (None, ""):
-            return f"exec={value}"
-    seq = fill.get("execution_sequence") or fill.get("fill_sequence") or meta.get("execution_sequence") or meta.get("fill_sequence")
-    if seq not in (None, ""):
-        return f"seq={seq}"
-    ts = fill.get("execution_timestamp") or fill.get("filled_at") or meta.get("execution_timestamp")
-    if ts not in (None, ""):
-        return f"ts={ts}|qty={int(fill.get('qty', 0) or 0)}"
     evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+    order_no = str(fill.get("order_no") or "")
+    if evidence in {"KIS_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL"}:
+        cumulative = fill.get("cumulative_filled_qty") or meta.get("cumulative_filled_qty")
+        has_execution_identity = any((fill.get(k) or meta.get(k)) not in (None, "") for k in ("broker_execution_id", "execution_sequence", "execution_timestamp")) or bool(fill.get("raw") or meta.get("raw"))
+        if evidence == "KIS_ORDER_DETAIL_ACTUAL" and cumulative not in (None, "") and not has_execution_identity:
+            return f"{str(trade_date or fill.get('trade_date') or '')}|{str(fill.get('symbol') or '').upper()}|{str(fill.get('side') or '').upper()}|{order_no}|evidence=KIS_ORDER_DETAIL_CUMULATIVE_ACTUAL|cumulative={int(cumulative or 0)}"
+        return canonical_actual_execution_key(
+            trade_date=str(trade_date or fill.get("trade_date") or ""),
+            order_no=order_no,
+            symbol=str(fill.get("symbol") or "").upper(),
+            side=str(fill.get("side") or "").upper(),
+            broker_execution_id=fill.get("broker_execution_id") or meta.get("broker_execution_id"),
+            execution_sequence=fill.get("execution_sequence") or meta.get("execution_sequence"),
+            execution_timestamp=fill.get("execution_timestamp") or meta.get("execution_timestamp"),
+            qty=int(fill.get("qty", 0) or 0),
+            price=float(fill.get("price_usd") or fill.get("price") or 0.0),
+            raw=fill.get("raw") or meta.get("raw"),
+        )
     cumulative = fill.get("cumulative_filled_qty") or meta.get("cumulative_filled_qty")
     if cumulative not in (None, ""):
         return f"evidence={evidence}|cumulative={int(cumulative or 0)}"
@@ -83,13 +118,17 @@ def _fill_execution_identity(fill: dict) -> str:
 
 
 def _us_fill_idempotency_key(fill: dict, trade_date: str) -> tuple:
+    ident = _fill_execution_identity(fill, trade_date)
+    meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
+    if str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL"}:
+        return (ident,)
     return (
         trade_date,
         str(fill.get("symbol") or "").strip().upper(),
         str(fill.get("side") or "").strip().upper(),
         str(fill.get("order_no") or ""),
         str(fill.get("client_order_key") or ""),
-        _fill_execution_identity(fill),
+        ident,
     )
 
 
@@ -100,7 +139,11 @@ def _us_fill_idempotency_key_text(fill: dict, trade_date: str) -> str:
     client_order_key = str(fill.get("client_order_key") or "")
     symbol = str(fill.get("symbol") or "").strip().upper()
     side = str(fill.get("side") or "").strip().upper()
-    return f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{_fill_execution_identity(fill)}"
+    ident = _fill_execution_identity(fill, trade_date)
+    meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else {}
+    if str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL"}:
+        return ident
+    return f"{trade_date}|{symbol}|{side}|{order_no}|{client_order_key}|{ident}"
 
 
 def reset_memory_stores() -> None:
@@ -897,21 +940,30 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         return 0
     from trader.us.execution.order_identity import valid_identity
     for f in fills:
-        if not valid_identity(f.get("client_order_key")) and valid_identity(f.get("order_no")):
-            f["_fill_idempotency_key_override"] = _us_fill_idempotency_key_text(f, td)
-            f["client_order_key"] = f"KIS_{td}_{str(f.get('order_no')).strip()}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
         try:
             order = load_us_order_for_fill(order_no=f.get("order_no"), client_order_key=f.get("client_order_key"),
                                            symbol=str(f.get("symbol") or ""), trade_date=td)
+            if valid_identity(order.get("client_order_key")):
+                f["client_order_key"] = order.get("client_order_key")
             order_meta = _parse_json_meta(order.get("meta"))
             fill_meta = dict(f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}
             for field in ("session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source"):
                 if order_meta.get(field) is not None:
                     fill_meta.setdefault(field, order_meta[field])
+            if str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL"}:
+                fill_meta.setdefault("is_synthetic", False)
             f["meta"] = fill_meta
         except Exception:
             pass
-    invalid = [f for f in fills if not valid_identity(f.get("client_order_key"))]
+        fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+        evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+        if evidence in {"KIS_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL"} and not valid_identity(f.get("client_order_key")) and valid_identity(f.get("order_no")):
+            f["client_order_key"] = f"KIS_{td}_{str(f.get('order_no')).strip()}_{str(f.get('symbol') or '').upper()}_{str(f.get('side') or '').upper()}"
+    invalid = [
+        f for f in fills
+        if str((f.get("meta") or {}).get("fill_evidence_type") or f.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL"}
+        and not valid_identity(f.get("client_order_key"))
+    ]
     if invalid:
         logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_fills count=%d", len(invalid))
         return 0
@@ -927,6 +979,8 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                 for existing_fill in _MEM_FILLS:
                     if _us_fill_idempotency_key(existing_fill, td) == key:
                         existing_fill["updated_at"] = time.time()
+                        if valid_identity(f.get("client_order_key")):
+                            existing_fill["client_order_key"] = f.get("client_order_key")
                         existing_fill["fill_idempotency_key"] = _us_fill_idempotency_key_text(existing_fill, td)
                         break
                 continue
@@ -954,7 +1008,9 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         VALUES (:td, :symbol, :exchange, :side, :qty, :price_usd,
                                 :order_no, :cok, :filled_at, CAST(:meta AS jsonb), :fill_idempotency_key)
                         ON CONFLICT (fill_idempotency_key)
-                        DO NOTHING
+                        DO UPDATE SET
+                            client_order_key = EXCLUDED.client_order_key,
+                            meta = us_fills.meta || EXCLUDED.meta
                     """),
                     {
                         "td": td,
@@ -1419,7 +1475,7 @@ def _supersede_synthetic_fills_for_actual(*, trade_date: str, order_no: str, cli
 
 
 def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client_order_key: str, conn: Any | None = None) -> dict:
-    result = {"actual": 0, "synthetic": 0}
+    result = {"actual": 0, "synthetic": 0, "actual_individual": 0}
     if conn is None:
         for f in _MEM_FILLS:
             if str(f.get("trade_date") or "") != trade_date:
@@ -1436,6 +1492,9 @@ def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client
                 result["synthetic"] = max(result["synthetic"], cum)
             else:
                 result["actual"] = max(result["actual"], cum)
+                evidence = str(meta.get("fill_evidence_type") or "")
+                if evidence == "KIS_ACTUAL" or meta.get("broker_execution_id") or meta.get("execution_sequence") or meta.get("execution_timestamp"):
+                    result["actual_individual"] += int(f.get("qty") or 0)
         return result
     rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
         AND (:order_no='' OR order_no=:order_no) AND (:cok='' OR client_order_key=:cok)
@@ -1448,6 +1507,9 @@ def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client
             result["synthetic"] = max(result["synthetic"], cum)
         else:
             result["actual"] = max(result["actual"], cum)
+            evidence = str(meta.get("fill_evidence_type") or "")
+            if evidence == "KIS_ACTUAL" or meta.get("broker_execution_id") or meta.get("execution_sequence") or meta.get("execution_timestamp"):
+                result["actual_individual"] += int(row.get("qty") or 0)
     return result
 
 
@@ -1504,6 +1566,8 @@ def mark_order_filled_by_reconcile(
         delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
         delta = max(0, observed_cumulative - delta_base)
         fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
+        if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
+            fill_delta = 0
         if fill_delta and not actual_exists:
             fill_meta = ({**order_meta, "source": source, "is_synthetic": False, "fill_evidence_type": evidence}
                          if not synthetic else _synthetic_reconcile_fill_meta(source=source, order_no=on,
@@ -1563,6 +1627,8 @@ def mark_order_filled_by_reconcile(
             delta_base = int(active.get("synthetic" if synthetic else "actual", 0) or 0)
             delta = max(0, observed_cumulative - delta_base)
             fill_delta = observed_cumulative if (not synthetic and promotion.get("superseded")) else delta
+            if not synthetic and int(active.get("actual_individual", 0) or 0) > 0:
+                fill_delta = 0
             if fill_delta and not actual:
                 fill_meta = ({**merged, "source": source, "is_synthetic": False,
                               "fill_evidence_type": evidence, "cumulative_filled_qty": observed_cumulative}
@@ -1591,6 +1657,42 @@ def mark_order_filled_by_reconcile(
     except Exception as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
         return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}
+
+def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
+    """Verify order cumulative quantity equals accounting-active fill evidence."""
+    td, on = str(trade_date), str(order_no or "")
+    if not td or not on:
+        return {"status": "FILL_ACCOUNTING_IDENTITY_REQUIRED", "retry_order": False, "entry_fence": True}
+    engine = _get_engine_or_none()
+    if engine is None:
+        orders = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and str(o.get("order_no") or "") == on]
+        if not orders:
+            return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+        order_qty = int(orders[-1].get("qty_filled") or 0)
+        active = [f for f in _MEM_FILLS if str(f.get("trade_date") or "") == td and str(f.get("order_no") or "") == on and (not isinstance(f.get("meta"), dict) or f["meta"].get("accounting_active") is not False)]
+        actual_qty = sum(int(f.get("qty") or 0) for f in active if not is_synthetic_fill_meta(f.get("meta")))
+        synthetic_qty = sum(int(f.get("qty") or 0) for f in active if is_synthetic_fill_meta(f.get("meta")))
+    else:
+        with engine.begin() as conn:
+            row = conn.execute(text("SELECT qty_filled FROM us_orders WHERE trade_date=:td AND order_no=:on"), {"td": td, "on": on}).first()
+            if not row:
+                return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+            order_qty = int(row[0] if not isinstance(row, dict) else row.get("qty_filled") or 0)
+            rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
+                AND COALESCE((meta->>'accounting_active')::boolean,true)"""), {"td": td, "on": on}).mappings().all()
+            actual_qty = 0; synthetic_qty = 0
+            for fill in rows:
+                if is_synthetic_fill_meta(_parse_json_meta(fill.get("meta"))):
+                    synthetic_qty += int(fill.get("qty") or 0)
+                else:
+                    actual_qty += int(fill.get("qty") or 0)
+    total = actual_qty + synthetic_qty
+    if order_qty != total:
+        return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                "report_consistency": "FAILED", "order_qty_filled": order_qty, "active_fill_qty": total,
+                "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
+    return {"status": "OK", "order_qty_filled": order_qty, "active_fill_qty": total,
+            "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
 
 def load_us_positions_by_symbols(
     symbols: list[str],
@@ -2793,6 +2895,42 @@ def check_us_afternoon_already_ran(trade_date: str, timeout_sec: int = 5) -> dic
 # ---------------------------------------------------------------------------
 # US Exit Position Resolver DB helpers
 # ---------------------------------------------------------------------------
+
+def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
+    """Verify order cumulative quantity equals accounting-active fill evidence."""
+    td, on = str(trade_date), str(order_no or "")
+    if not td or not on:
+        return {"status": "FILL_ACCOUNTING_IDENTITY_REQUIRED", "retry_order": False, "entry_fence": True}
+    engine = _get_engine_or_none()
+    if engine is None:
+        orders = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and str(o.get("order_no") or "") == on]
+        if not orders:
+            return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+        order_qty = int(orders[-1].get("qty_filled") or 0)
+        active = [f for f in _MEM_FILLS if str(f.get("trade_date") or "") == td and str(f.get("order_no") or "") == on and (not isinstance(f.get("meta"), dict) or f["meta"].get("accounting_active") is not False)]
+        actual_qty = sum(int(f.get("qty") or 0) for f in active if not is_synthetic_fill_meta(f.get("meta")))
+        synthetic_qty = sum(int(f.get("qty") or 0) for f in active if is_synthetic_fill_meta(f.get("meta")))
+    else:
+        with engine.begin() as conn:
+            row = conn.execute(text("SELECT qty_filled FROM us_orders WHERE trade_date=:td AND order_no=:on"), {"td": td, "on": on}).first()
+            if not row:
+                return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
+            order_qty = int(row[0] if not isinstance(row, dict) else row.get("qty_filled") or 0)
+            rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
+                AND COALESCE((meta->>'accounting_active')::boolean,true)"""), {"td": td, "on": on}).mappings().all()
+            actual_qty = 0; synthetic_qty = 0
+            for fill in rows:
+                if is_synthetic_fill_meta(_parse_json_meta(fill.get("meta"))):
+                    synthetic_qty += int(fill.get("qty") or 0)
+                else:
+                    actual_qty += int(fill.get("qty") or 0)
+    total = actual_qty + synthetic_qty
+    if order_qty != total:
+        return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                "report_consistency": "FAILED", "order_qty_filled": order_qty, "active_fill_qty": total,
+                "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
+    return {"status": "OK", "order_qty_filled": order_qty, "active_fill_qty": total,
+            "active_actual_qty": actual_qty, "active_synthetic_qty": synthetic_qty}
 
 def load_us_positions_by_symbols(
     symbols: list[str],

@@ -11,6 +11,26 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+def _first_nonblank(row: dict, *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> str:
+    date_text = str(date_value or "").replace("-", "").strip()
+    time_text = ""
+    for value in time_values:
+        if value not in (None, ""):
+            time_text = str(value).replace(":", "").strip()
+            break
+    if date_text and time_text:
+        time_text = time_text.zfill(6)[:6]
+        return f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}T{time_text[:2]}:{time_text[2:4]}:{time_text[4:6]}"
+    return date_text
+
 
 def get_fills_today(
     provider: Any | None = None,
@@ -70,14 +90,27 @@ def get_fills_today(
         raw = client.get_us_fills_today(trade_date=trade_date)
         fills = []
         for row in raw:
+            order_no = _first_nonblank(row, "odno", "order_no", "ODNO")
+            execution_sequence = _first_nonblank(row, "execution_sequence", "ccld_seq", "seq", "CCLD_SEQ")
+            broker_execution_id = _first_nonblank(row, "broker_execution_id", "execution_id", "exec_id", "ccld_no", "cntg_no", "CCLD_NO", "CNTG_NO")
+            if not broker_execution_id and order_no and execution_sequence:
+                broker_execution_id = f"{order_no}-{execution_sequence}"
+            execution_timestamp = _combine_kis_date_time(_first_nonblank(row, "ord_dt", "ORD_DT"), _first_nonblank(row, "ord_tmd", "ccld_tmd", "ORD_TMD", "CCLD_TMD"))
             fills.append({
                 "symbol": row.get("pdno", ""),
                 "exchange": row.get("ovrs_excg_cd", ""),
                 "side": "BUY" if row.get("sll_buy_dvsn_cd") == "02" else "SELL",
                 "qty": int(row.get("ft_ccld_qty", 0) or 0),
                 "price": float(row.get("ft_ccld_unpr3", 0) or 0),
-                "filled_at": row.get("ord_dt", ""),
-                "order_no": row.get("odno", ""),
+                "filled_at": execution_timestamp or row.get("ord_dt", ""),
+                "order_no": order_no,
+                "broker_execution_id": broker_execution_id,
+                "execution_sequence": execution_sequence,
+                "execution_timestamp": execution_timestamp,
+                "requested_qty": int(row.get("ft_ord_qty") or row.get("ord_qty") or 0),
+                "filled_qty": int(row.get("ft_ccld_qty", 0) or 0),
+                "remaining_qty": int(row.get("nccs_qty") or row.get("rmn_qty") or 0),
+                "meta": {"is_synthetic": False, "fill_evidence_type": "KIS_ACTUAL", "broker_execution_id": broker_execution_id, "execution_sequence": execution_sequence, "execution_timestamp": execution_timestamp},
                 "raw": row,
             })
         logger.info("[US_FILLS][OK] count=%d", len(fills))

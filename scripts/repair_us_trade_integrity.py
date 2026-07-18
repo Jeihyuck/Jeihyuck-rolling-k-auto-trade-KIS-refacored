@@ -132,12 +132,15 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
             # Do not insert aggregate KIS_REPAIR summary rows into us_fills.
             # Only missing individual KIS executions are inserted idempotently.
             running = 0
+            from trader.us.db.repos import canonical_actual_execution_key
             for seq, fill in enumerate([f for f in (actual_fills or []) if str(f.get("order_no") or "") == order_no and str(f.get("symbol") or "").upper() == symbol and str(f.get("side") or "").upper() == side], start=1):
                 exec_qty = int(fill.get("qty") or fill.get("filled_qty") or 0)
                 exec_price = float(fill.get("price_usd") or fill.get("price") or fill.get("avg_price") or 0)
                 running += exec_qty
-                exec_ts = str(fill.get("execution_timestamp") or fill.get("filled_at") or seq)
-                idem = f"{td}|{symbol}|{side}|{order_no}|exec_ts={exec_ts}|qty={exec_qty}|price={exec_price}|seq={seq}"
+                exec_ts = str(fill.get("execution_timestamp") or fill.get("filled_at") or "")
+                idem = canonical_actual_execution_key(trade_date=td, order_no=order_no, symbol=symbol, side=side,
+                    broker_execution_id=fill.get("broker_execution_id"), execution_sequence=fill.get("execution_sequence"),
+                    execution_timestamp=exec_ts, qty=exec_qty, price=exec_price, raw=fill.get("raw"))
                 conn.execute(text("""INSERT INTO us_fills(trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
                   SELECT :td,:symbol,'NASDAQ',:side,:qty,:price,:order_no,client_order_key,:filled_at,
                          jsonb_build_object('is_synthetic',false,'fill_evidence_type','KIS_ACTUAL','execution_sequence',:seq,'cumulative_filled_qty',:running),:idem
