@@ -94,20 +94,51 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
             counts["row_ids"].append({"table": table, "id": row_id})
             if "SYNTHETIC_DUPLICATES_KIS_ACTUAL" in issue.get("reasons", []):
                 counts["deleted_synthetic_duplicates"] += 1
+        grouped_actual = defaultdict(lambda: {"qty": 0, "value": 0.0, "sample": {}})
         for fill in actual_fills or []:
             order_no = str(fill.get("order_no") or "")
-            if not order_no: continue
+            symbol = str(fill.get("symbol") or "").upper()
+            side = str(fill.get("side") or "").upper()
+            if not order_no or not symbol or not side:
+                continue
             qty = int(fill.get("qty") or fill.get("filled_qty") or 0)
-            updated = conn.execute(text("""UPDATE us_orders SET qty_filled=:qty,
+            price = float(fill.get("price_usd") or fill.get("price") or fill.get("avg_price") or 0)
+            key = (trade_date, order_no, symbol, side)
+            grouped_actual[key]["qty"] += qty
+            grouped_actual[key]["value"] += qty * price
+            grouped_actual[key]["sample"] = fill
+        for (td, order_no, symbol, side), agg in grouped_actual.items():
+            qty = int(agg["qty"] or 0)
+            avg_price = (float(agg["value"]) / qty) if qty else 0.0
+            updated = conn.execute(text("""UPDATE us_orders SET qty_filled=:qty, avg_price_usd=:avg_price,
               status=CASE WHEN :qty < qty_requested THEN 'PARTIALLY_FILLED' ELSE 'FILLED' END,
-              meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('remaining_qty',GREATEST(qty_requested-:qty,0))
+              meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('remaining_qty',GREATEST(qty_requested-:qty,0),'repair_actual_cumulative_qty',:qty)
               WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side"""),
-              {"qty":qty,"td":trade_date,"order_no":order_no,"symbol":fill.get("symbol"),"side":fill.get("side")})
-            counts["corrected_rows"] += int(updated.rowcount or 0)
+              {"qty":qty,"avg_price":avg_price,"td":td,"order_no":order_no,"symbol":symbol,"side":side})
+            if int(updated.rowcount or 0) == 0:
+                intent = conn.execute(text("SELECT client_order_key FROM us_order_intents WHERE trade_date=:td AND symbol=:symbol AND side=:side LIMIT 2"),
+                                      {"td":td,"symbol":symbol,"side":side}).fetchall()
+                if len(intent) == 1:
+                    cok = intent[0][0]
+                    conn.execute(text("""INSERT INTO us_orders(trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,avg_price_usd,order_no,status,meta)
+                      VALUES(:td,:cok,:symbol,'NASDAQ',:side,:qty,:qty,:avg_price,:order_no,'FILLED',jsonb_build_object('repair_reconstructed',true,'remaining_qty',0))"""),
+                      {"td":td,"cok":cok,"symbol":symbol,"side":side,"qty":qty,"avg_price":avg_price,"order_no":order_no})
+                    counts["corrected_rows"] += 1
+                else:
+                    counts["row_ids"].append({"table":"us_orders","order_no":order_no,"reason":"REPAIR_ORDER_IDENTITY_UNRESOLVED"})
+            else:
+                counts["corrected_rows"] += int(updated.rowcount or 0)
+            idem = f"{td}|{symbol}|{side}|{order_no}|KIS_REPAIR|evidence=KIS_ACTUAL|cumulative={qty}"
+            conn.execute(text("""INSERT INTO us_fills(trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+              SELECT :td,:symbol,'NASDAQ',:side,:qty,:avg_price,:order_no,client_order_key,now(),
+                     jsonb_build_object('is_synthetic',false,'fill_evidence_type','KIS_ACTUAL','repair_actual_cumulative_qty',:qty),:idem
+              FROM us_orders WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side LIMIT 1
+              ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
+              {"td":td,"symbol":symbol,"side":side,"qty":qty,"avg_price":avg_price,"order_no":order_no,"idem":idem})
             pnl = conn.execute(text("""UPDATE us_fills SET meta=COALESCE(meta,'{}'::jsonb)||
               jsonb_build_object('realized_pnl_usd',(price_usd-NULLIF((meta->>'cost_basis_price_usd')::numeric,0))*qty)
               WHERE trade_date=:td AND order_no=:order_no AND side='SELL' AND meta ? 'cost_basis_price_usd'"""),
-              {"td":trade_date,"order_no":order_no})
+              {"td":td,"order_no":order_no})
             counts["recalculated_realized_pnl_rows"] += int(pnl.rowcount or 0)
         if authoritative_positions is not None:
             symbols=[str(p.get("symbol") or "").upper() for p in authoritative_positions]
@@ -117,9 +148,12 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
               {"td":trade_date,"symbols":symbols or ["__NONE__"]})
             counts["closed_stale_positions"] += int(closed.rowcount or 0)
             try:
-                lifecycle=conn.execute(text("""UPDATE us_position_risk_state SET state=state||'{"lifecycle_status":"REPAIRED_FROM_KIS"}'::jsonb
-                  WHERE trade_date=:td AND UPPER(symbol)=ANY(:symbols)"""),{"td":trade_date,"symbols":symbols or ["__NONE__"]})
-                counts["repaired_lifecycle_rows"] += int(lifecycle.rowcount or 0)
+                from trader.us.position_lifecycle_state import reconcile_us_position_lifecycles
+                lifecycle_map = reconcile_us_position_lifecycles(positions=authoritative_positions, trade_date=trade_date, now=datetime.now(timezone.utc), authoritative=True)
+                for symbol, state in lifecycle_map.items():
+                    lifecycle=conn.execute(text("""UPDATE us_position_risk_state SET state=COALESCE(state,'{}'::jsonb)||jsonb_build_object('lifecycle',CAST(:lifecycle AS jsonb))
+                      WHERE trade_date=:td AND symbol=:symbol"""), {"td":trade_date,"symbol":symbol,"lifecycle":json.dumps(state, default=str)})
+                    counts["repaired_lifecycle_rows"] += int(lifecycle.rowcount or 0)
             except Exception:
                 pass
     counts["destructive_mutations"] = sum(counts[k] for k in ("quarantined_rows","corrected_rows","deleted_synthetic_duplicates","closed_stale_positions","recalculated_realized_pnl_rows","repaired_lifecycle_rows"))

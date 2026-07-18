@@ -87,6 +87,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             response = get_fills_today(provider=provider, trade_date=trade_date)
             all_fills = response.get("fills") if response.get("status") == "OK" else None
         except Exception: all_fills = None
+    positions_by_symbol = {}
+    if isinstance(balance, dict):
+        for pos in balance.get("positions") or []:
+            positions_by_symbol[str(pos.get("symbol") or pos.get("pdno") or "").upper()] = pos
+
     for key, order_events in grouped.items():
         latest = order_events[-1]; types = {e.get("event_type") for e in order_events}
         if "BROKER_SUBMIT_STARTED" not in types: continue
@@ -136,7 +141,29 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         counts["broker_rejected_count"]+=1
                     else: counts["broker_unfilled_ack_count"]+=1
                 else:
-                    counts["broker_unknown_count"]+=1; unresolved_symbol_sides.append([symbol,side])
+                    pre_qty_raw = latest.get("pre_order_position_qty") or latest.get("pre_qty") or (latest.get("meta") or {}).get("pre_order_position_qty") if isinstance(latest.get("meta"), dict) else None
+                    post_pos = positions_by_symbol.get(symbol) if positions_by_symbol else None
+                    post_qty_raw = (post_pos or {}).get("qty") or (post_pos or {}).get("holding_qty") or (post_pos or {}).get("ovrs_cblc_qty")
+                    if pre_qty_raw is not None and post_qty_raw is not None and requested > 0:
+                        try:
+                            pre_qty = int(float(pre_qty_raw)); post_qty = int(float(post_qty_raw))
+                            delta = (pre_qty - post_qty) if side == "SELL" else (post_qty - pre_qty)
+                        except Exception:
+                            delta = 0
+                        if delta > 0:
+                            cumulative = min(delta, requested)
+                            result=mark_order_filled_by_reconcile(order_no=order_no,client_order_key=key,symbol=symbol,side=side,
+                                filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,
+                                avg_price_usd=float(latest.get("limit_price") or latest.get("price") or 0),source="journal_replay_balance_delta",
+                                evidence_type="BALANCE_DELTA_SYNTHETIC",trade_date=trade_date,meta={"journal_replay":True})
+                            if result.get("status") != "OK": raise RuntimeError(result.get("status"))
+                            counts["broker_full_fill_count" if cumulative>=requested else "broker_partial_fill_count"] += 1
+                            append_order_event("JOURNAL_REPLAY_FILL_CONFIRMED",ack,broker_order_no=order_no,
+                                               broker_status="BROKER_FILL_CONFIRMED" if cumulative>=requested else "BROKER_PARTIAL_FILL_CONFIRMED")
+                        else:
+                            counts["broker_unknown_count"]+=1; unresolved_symbol_sides.append([symbol,side])
+                    else:
+                        counts["broker_unknown_count"]+=1; unresolved_symbol_sides.append([symbol,side])
         except Exception as exc:
             counts["failed_count"]+=1; unresolved_symbol_sides.append([symbol,side])
             append_order_event("JOURNAL_REPLAY_FAILED",latest,raw_response={"error":str(exc)})

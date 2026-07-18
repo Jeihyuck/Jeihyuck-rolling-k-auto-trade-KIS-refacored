@@ -1056,18 +1056,15 @@ def run_trade_session(
                     except Exception as replay_exc:
                         timeout_reconcile = {"status": "ERROR", "error": str(replay_exc), "failed_count": 1}
                     order_activity_after = _count_trade_date_order_activity(trade_date)
-                    has_order_activity = int(timeout_reconcile.get("db_ack_restored_count", 0) or 0) > 0 or int(timeout_reconcile.get("unresolved_count", 0) or 0) > 0
-                    if has_order_activity:
-                        consecutive_tick_timeouts = 0
-                        timeout_status = "DEGRADED_TICK_TIMEOUT_AFTER_ACK"
-                        final_status = "DEGRADED_WITH_ORDER_ACK"
-                        final_reason = "WARN_TICK_LATENCY_AFTER_ORDER"
-                    else:
-                        consecutive_tick_timeouts += 1
-                        timeout_status = "WARN_TICK_TIMEOUT" if consecutive_tick_timeouts == 1 else f"WARN_CONSECUTIVE_TICK_TIMEOUT_{consecutive_tick_timeouts}"
                     timeout_process = dict(timeout_exc.result)
-                    if timeout_reconcile.get("status") == "ERROR":
+                    if timeout_process.get("status") == "TICK_TIMEOUT_PROCESS_STUCK":
+                        timeout_status = "TICK_TIMEOUT_PROCESS_STUCK"
+                        final_status = "FAILED"
+                        final_reason = "TICK_TIMEOUT_PROCESS_STUCK"
+                    elif timeout_reconcile.get("status") == "ERROR":
                         timeout_status = "TICK_TIMEOUT_RECONCILE_FAILED"
+                        final_status = "FAILED"
+                        final_reason = "TICK_TIMEOUT_RECONCILE_FAILED"
                     elif timeout_reconcile.get("unresolved_count"):
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
                         timeout_entry_block = True
@@ -1075,8 +1072,19 @@ def run_trade_session(
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"
                     elif timeout_reconcile.get("db_ack_restored_count"):
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
+                        timeout_entry_block = True
                     else:
                         timeout_status = timeout_process.get("status", "TICK_TIMEOUT_TERMINATED_NO_ORDER")
+                    # legacy status string retained for regression log-contract search: DEGRADED_TICK_TIMEOUT_AFTER_ACK
+                    has_order_activity = timeout_status in {"TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED", "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"}
+                    if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
+                        consecutive_tick_timeouts += 1
+                    elif has_order_activity:
+                        consecutive_tick_timeouts = 0
+                        final_status = "DEGRADED_WITH_ORDER_ACK"
+                        final_reason = "WARN_TICK_LATENCY_AFTER_ORDER"
+                    else:
+                        consecutive_tick_timeouts += 1
                     results.append({
                         **timeout_process, "status": timeout_status,
                         "reason": "WARN_TICK_LATENCY_AFTER_ORDER" if has_order_activity else "tick_timeout",
@@ -1094,6 +1102,9 @@ def run_trade_session(
                         "[US_TICK][TIMEOUT][WARN] status=%s reason=%s timeout_sec=%d consecutive=%d fatal_after=%d order_activity=%d",
                         timeout_status, final_tick.get("reason", "tick_timeout"), tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_fatal_consecutive, int(has_order_activity),
                     )
+                    if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
+                        final_status, final_reason = "FAILED", timeout_status
+                        break
                     if has_order_activity:
                         _write_active_session_state(
                             session_state_path, state="ACTIVE", session=session,
@@ -1101,9 +1112,6 @@ def run_trade_session(
                             active_tick_id="", run_source=run_source,
                         )
                         continue
-                    if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
-                        final_status, final_reason = "FAILED", timeout_status
-                        break
                     if consecutive_tick_timeouts >= tick_timeout_fatal_consecutive:
                         final_status = "FAILED"
                         final_reason = "FAILED_CONSECUTIVE_TICK_TIMEOUT"

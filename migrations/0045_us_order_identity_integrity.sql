@@ -31,11 +31,30 @@ SELECT 'us_fills', 'BLANK_CLIENT_ORDER_KEY', to_jsonb(t) FROM us_fills t
 DELETE FROM us_fills WHERE client_order_key IS NULL OR btrim(client_order_key) = '' OR lower(btrim(client_order_key)) IN ('none','null');
 
 -- Ambiguous client identities and broker order numbers have no safe canonical
--- row without KIS evidence. Quarantine every member, then remove the group.
-INSERT INTO us_trade_integrity_quarantine(source_table, reason, original_row)
-SELECT 'us_orders','DUPLICATE_CLIENT_KEY_IDENTITY',to_jsonb(o) FROM us_orders o
-JOIN (SELECT client_order_key FROM us_orders GROUP BY client_order_key
+-- row without KIS evidence. Quarantine every dependent row in one batch,
+-- then remove the full group so no orphan intents/fills survive.
+INSERT INTO us_trade_integrity_quarantine
+ (source_table,reason,original_row,quarantine_batch_id,trade_date,client_order_key,order_no)
+SELECT 'us_order_intents','DUPLICATE_CLIENT_KEY_IDENTITY_RELATED_INTENT',to_jsonb(i),
+       md5('client|'||i.client_order_key),i.trade_date,i.client_order_key,NULL
+FROM us_order_intents i JOIN (SELECT client_order_key FROM us_orders GROUP BY client_order_key
       HAVING count(DISTINCT (trade_date,symbol,side,exchange)) > 1) d USING(client_order_key);
+INSERT INTO us_trade_integrity_quarantine
+ (source_table,reason,original_row,quarantine_batch_id,trade_date,client_order_key,order_no)
+SELECT 'us_fills','DUPLICATE_CLIENT_KEY_IDENTITY_RELATED_FILL',to_jsonb(f),
+       md5('client|'||f.client_order_key),f.trade_date,f.client_order_key,f.order_no
+FROM us_fills f JOIN (SELECT client_order_key FROM us_orders GROUP BY client_order_key
+      HAVING count(DISTINCT (trade_date,symbol,side,exchange)) > 1) d USING(client_order_key);
+INSERT INTO us_trade_integrity_quarantine
+ (source_table,reason,original_row,quarantine_batch_id,trade_date,client_order_key,order_no)
+SELECT 'us_orders','DUPLICATE_CLIENT_KEY_IDENTITY',to_jsonb(o),
+       md5('client|'||o.client_order_key),o.trade_date,o.client_order_key,o.order_no
+FROM us_orders o JOIN (SELECT client_order_key FROM us_orders GROUP BY client_order_key
+      HAVING count(DISTINCT (trade_date,symbol,side,exchange)) > 1) d USING(client_order_key);
+DELETE FROM us_order_intents i USING (SELECT client_order_key FROM us_orders GROUP BY client_order_key
+  HAVING count(DISTINCT (trade_date,symbol,side,exchange)) > 1) d WHERE i.client_order_key=d.client_order_key;
+DELETE FROM us_fills f USING (SELECT client_order_key FROM us_orders GROUP BY client_order_key
+  HAVING count(DISTINCT (trade_date,symbol,side,exchange)) > 1) d WHERE f.client_order_key=d.client_order_key;
 DELETE FROM us_orders o USING (
   SELECT client_order_key FROM us_orders GROUP BY client_order_key
   HAVING count(DISTINCT (trade_date,symbol,side,exchange)) > 1

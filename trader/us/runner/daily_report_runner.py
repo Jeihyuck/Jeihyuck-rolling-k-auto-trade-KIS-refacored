@@ -836,14 +836,20 @@ def run_daily_report(
     else:
         report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), (report.get("canonical_sources") or {}).get("report_consistency", "OK"))
 
-    if report.get("report_consistency") in {"SOURCE_MISMATCH", "REPORT_INCONSISTENT"}:
+    if report.get("report_consistency") in {"REPORT_INCONSISTENT_POSITION_VALUE", "FAILED"}:
+        report["status"] = "FAILED_RECONCILE"
+    elif report.get("report_consistency") in {"SOURCE_MISMATCH", "REPORT_INCONSISTENT"}:
         report["status"] = "WARNING_RECONCILE_MISMATCH"
+    elif report.get("report_consistency") == "DEGRADED_DB_FALLBACK_TO_KIS":
+        report["status"] = "OK_WITH_WARNINGS"
     elif report["errors"]:
         report["status"] = "FAILED_RECONCILE"
     elif int(report.get("orders_unresolved_total", 0) or 0) > 0:
         report["status"] = "WARNING_RECONCILE_MISMATCH"
     else:
         report["status"] = "OK"
+    if report.get("report_consistency") == "FAILED" and report.get("status") != "FAILED_RECONCILE":
+        report["status"] = "FAILED_RECONCILE"
 
     if report.get("report_consistency") == "SOURCE_MISMATCH":
         md_lines.extend(["# ⚠️ SOURCE_MISMATCH", "", f"source_counts={(report.get('canonical_sources') or {}).get('source_counts', {})}", ""])
@@ -1123,10 +1129,11 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
             SELECT side, order_no, COALESCE(meta->>'fill_evidence_type','') AS evidence_type,
               COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,
                        (meta->>'synthetic_fill')::boolean,false) AS is_synthetic,
+              COALESCE((meta->>'accounting_active')::boolean,true) AS accounting_active,
               COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source, COUNT(*) AS n
             FROM us_fills
             WHERE trade_date = :td
-            GROUP BY side, order_no, evidence_type, is_synthetic, COALESCE(meta->>'fill_source', meta->>'source', '')
+            GROUP BY side, order_no, evidence_type, is_synthetic, accounting_active, COALESCE(meta->>'fill_source', meta->>'source', '')
             """,
             {"td": trade_date},
         )
@@ -1136,7 +1143,10 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
             n = int(row.get("n") or 0)
             result["fills_count"] += n
             evidence = str(row.get("evidence_type") or "")
-            is_synthetic = bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+            is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
+            accounting_active = row.get("accounting_active") is not False
+            if not accounting_active:
+                continue
             if not is_synthetic:
                 result["kis_actual_fill_execution_count"] += n
             elif evidence == "BALANCE_DELTA_SYNTHETIC":
@@ -1147,8 +1157,17 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
                 result["synthetic_reconcile_buys" if is_synthetic else "real_broker_buys"] += n
             elif side == "SELL":
                 result["synthetic_reconcile_sells" if is_synthetic else "real_broker_sells"] += n
-        actual_orders = {str(row.get("order_no") or "") for row in rows if not bool(row.get("is_synthetic")) and row.get("order_no")}
-        synthetic_orders = {str(row.get("order_no") or "") for row in rows if bool(row.get("is_synthetic")) and row.get("order_no")}
+        actual_orders = set()
+        synthetic_orders = set()
+        for row in rows:
+            evidence = str(row.get("evidence_type") or "")
+            accounting_active = row.get("accounting_active") is not False
+            is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
+            order_no = str(row.get("order_no") or "")
+            if not order_no or not accounting_active:
+                continue
+            (synthetic_orders if is_synthetic else actual_orders).add(order_no)
+        synthetic_orders -= actual_orders
         result["kis_actual_fill_order_count"] = len(actual_orders)
         result["accounting_confirmed_order_count"] = len(actual_orders | synthetic_orders)
     except Exception as exc:

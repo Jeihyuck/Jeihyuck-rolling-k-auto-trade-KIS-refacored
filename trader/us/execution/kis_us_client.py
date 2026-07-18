@@ -989,6 +989,10 @@ class KisUSClient:
             f"KIS fills contract error: all schemas failed: {errors}"
         )
 
+    def get_us_today_orders(self, trade_date: str | None = None) -> list[dict]:
+        """Return KIS same-day overseas order/fill rows for status normalization."""
+        return self.get_us_fills_today(trade_date=trade_date)
+
     def _build_us_fills_params(self, ord_dt: str, schema: str) -> dict:
         """US fills inquiry params를 schema에 따라 생성.
         
