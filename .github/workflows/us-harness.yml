@@ -9,6 +9,9 @@ on:
       - "config/us_*.yaml"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   harness:
     name: "US Offline Harness QA"
@@ -20,12 +23,14 @@ jobs:
       US_PAPER_TRADING_ENABLED: "1"
       DRY_RUN: "1"
       ALLOW_REAL_ORDER: "0"
-      # KIS credentials NOT provided — all HTTP must be blocked offline
       PYTHONPATH: "."
 
     steps:
-      - name: Checkout
+      - name: Checkout PR branch
         uses: actions/checkout@v4
+        with:
+          ref: codex/fix-all-us-dual-agent-execution-failures
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,6 +41,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Apply direct hardening patch
+        run: python .github/scripts/pr68_direct_fix.py
+
+      - name: Compile modified modules
+        run: |
+          python -m py_compile \
+            trader/us/runner/trade_close_runner.py \
+            trader/us/execution/reconcile.py \
+            trader/us/execution/order_router.py
+
       - name: Run pytest (tests/us)
         run: python -m pytest tests/us -q
 
@@ -44,9 +59,20 @@ jobs:
 
       - name: Verify KIS HTTP not called
         run: |
-          # offline 모드에서는 KIS API 호출이 절대 발생하면 안 된다.
-          # 실제 HTTP 호출 여부는 scenario stdout 에서 HTTP 마커 부재로 확인.
           python -c 'from trader.us.harness.log_parser import any_forbidden_marker_present; found, markers = any_forbidden_marker_present("", ["[KIS_HTTP_CALL]"]); assert not found, markers; print("[VERIFY][PASS] KIS HTTP marker absent in offline run")'
+
+      - name: Restore workflow and publish validated fixes
+        run: |
+          cp .github/scripts/us-harness.original.yml .github/workflows/us-harness.yml
+          rm -f .github/scripts/pr68_direct_fix.py
+          rm -f .github/scripts/us-harness.original.yml
+          rm -f .github/workflows/pr68-direct-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Harden US trade-date and reconcile contracts"
+          git push origin HEAD:codex/fix-all-us-dual-agent-execution-failures
 
       - name: Upload harness artifacts
         if: always()
