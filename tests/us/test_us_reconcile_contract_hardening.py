@@ -171,3 +171,47 @@ def test_close_position_snapshot_failure_is_error(tmp_path, monkeypatch):
     assert result["status"] == "ERROR"
     assert result["report_consistency"] == "FAILED"
     assert result["position_snapshot_error"] == "db down"
+
+
+def test_close_reconcile_position_persist_error_is_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {"positions": [], "balance_parse_status": "OK"}
+
+    monkeypatch.setattr("trader.us.data_provider.USDataProvider", lambda offline=False: Provider())
+    monkeypatch.setattr(
+        "trader.us.execution.fills.get_fills_today",
+        lambda **kwargs: {"status": "OK", "fills": []},
+    )
+    monkeypatch.setattr(
+        "trader.us.execution.reconcile.reconcile_positions",
+        lambda provider, trade_date: {
+            "status": "POSITION_PERSIST_ERROR",
+            "balance_fetch_status": "OK",
+            "authoritative_positions": True,
+            "preserve_previous_positions": True,
+            "positions": [{"symbol": "AMD", "qty": 3}],
+            "error": "db down",
+        },
+    )
+    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "trader.us.execution.reconcile.classify_ack_orders_with_final_balance",
+        lambda **kwargs: {"status": "OK", "orders": [], "counts": {}, "pending_order_count": 0},
+    )
+    monkeypatch.setattr(
+        "trader.us.runner.daily_report_runner.run_daily_report",
+        lambda **kwargs: {"status": "OK", "report": {"report_consistency": "OK"}},
+    )
+
+    from trader.us.runner.trade_close_runner import run_trade_close
+
+    result = run_trade_close(
+        env="practice", offline=False, force_now="2026-07-17T16:05:00-04:00"
+    )
+
+    assert result["status"] == "ERROR"
+    assert result["reconcile_status"] == "POSITION_PERSIST_ERROR"
+    assert result["report_consistency"] == "FAILED"
