@@ -12,6 +12,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_FILL_CONTRACT_ERROR_STATUSES = {
+    "EVIDENCE_QUANTITY_REGRESSION",
+    "EVIDENCE_QUANTITY_CONFLICT",
+    "EVIDENCE_QUANTITY_OVERFLOW",
+    "FILL_ACCOUNTING_INVARIANT_FAILED",
+    "RECONCILE_UPDATE_FAILED",
+    "CONTRACT_ERROR",
+    "ERROR",
+}
+
 
 def _safe_float(value: Any) -> float:
     try:
@@ -493,8 +503,10 @@ def reconcile_ack_orders_with_balance(
         try:
             fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
             if fills_resp and isinstance(fills_resp, dict):
-                fill_contract_status = str(fills_resp.get("status") or "OK").upper()
-                if fill_contract_status != "OK":
+                fill_contract_status = str(
+                    fills_resp.get("evidence_status") or fills_resp.get("status") or "OK"
+                ).upper()
+                if fill_contract_status in _FILL_CONTRACT_ERROR_STATUSES:
                     logger.error(
                         "[US_RECONCILE][ACK_RECONCILE][FILL_CONTRACT_ERROR] symbol=%s status=%s",
                         symbol, fill_contract_status,
