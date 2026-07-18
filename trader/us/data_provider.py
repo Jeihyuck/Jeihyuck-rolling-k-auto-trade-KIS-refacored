@@ -967,10 +967,25 @@ class USDataProvider:
         matches = [r for r in rows if str(r.get("order_no") or "") == str(order_no) and str(r.get("symbol") or "").upper() == str(symbol).upper()]
         if not matches:
             return None
-        filled = sum(_safe_int(r.get("filled_qty") or 0) for r in matches)
-        total_value = sum(_safe_int(r.get("filled_qty") or 0) * _safe_float(r.get("avg_price") or 0.0) for r in matches)
-        last = matches[-1]
-        return {**last, "filled_qty": filled, "avg_price": (total_value / filled if filled else _safe_float(last.get("avg_price") or 0.0))}
+        def _observed(row: dict) -> str:
+            return str(row.get("observed_at") or row.get("updated_at") or row.get("order_timestamp") or row.get("order_time") or "")
+        best = matches[0]
+        conflict = False
+        for row in matches[1:]:
+            row_qty = _safe_int(row.get("filled_qty") or row.get("cumulative_filled_qty") or 0)
+            best_qty = _safe_int(best.get("filled_qty") or best.get("cumulative_filled_qty") or 0)
+            if row_qty > best_qty or (row_qty == best_qty and _observed(row) >= _observed(best)):
+                best = row
+            elif _observed(row) > _observed(best) and row_qty < best_qty:
+                conflict = True
+        out = dict(best)
+        out["filled_qty"] = _safe_int(best.get("filled_qty") or best.get("cumulative_filled_qty") or 0)
+        out["cumulative_filled_qty"] = out["filled_qty"]
+        out["avg_price"] = _safe_float(best.get("avg_price") or best.get("avg_price_usd") or 0.0)
+        if conflict:
+            out["status"] = "EVIDENCE_QUANTITY_REGRESSION"
+            out["requires_reconcile"] = True
+        return out
 
     def get_client_stats(self) -> dict:
         """KIS client stats 반환 (retry count 등)."""

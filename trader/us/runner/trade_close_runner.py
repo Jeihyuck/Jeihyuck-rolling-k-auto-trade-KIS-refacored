@@ -27,7 +27,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
     from trader.us.data_provider import USDataProvider
     from trader.us.db.repos import (
-        save_fills, save_position_snapshot, save_reconcile_log,
+        save_fills_with_result, save_position_snapshot, save_reconcile_log,
     )
     from trader.us.market_calendar import now_ny
     from datetime import datetime
@@ -92,10 +92,19 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
         # 2. Fills DB 저장
         try:
-            save_fills(fills)
-            logger.info("[US_FILLS][SAVE] count=%d", len(fills))
+            if fills:
+                fill_save_result = save_fills_with_result(fills, trade_date=trade_date)
+            else:
+                fill_save_result = {"status": "OK", "inserted_count": 0, "updated_count": 0, "unchanged_count": 0, "regression_count": 0}
+            if fill_save_result.get("status") != "OK":
+                fills_status = fill_save_result.get("status", "ERROR")
+                fills_error = fill_save_result.get("error") or fills_status
+                logger.error("[US_FILLS][SAVE][FAILED] result=%s", fill_save_result)
+            logger.info("[US_FILLS][SAVE] count=%d result=%s", len(fills), fill_save_result)
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] save_fills failed: %s", exc)
+            fills_status = "DB_ERROR"
+            fills_error = str(exc)
 
         # 3. Reconcile
         reconcile_result: dict = {
@@ -109,7 +118,10 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         if not offline:
             try:
                 from trader.us.execution.reconcile import reconcile_positions
-                reconcile_result = reconcile_positions(provider=provider)
+                try:
+                    reconcile_result = reconcile_positions(provider=provider, trade_date=trade_date)
+                except TypeError:
+                    reconcile_result = reconcile_positions(provider=provider)
                 logger.info("[US_TRADE_CLOSE][RECONCILE] status=%s", reconcile_result.get("status"))
             except Exception as exc:
                 logger.error("[US_TRADE_CLOSE][ERROR] reconcile failed: %s", exc)
@@ -161,7 +173,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 "position_count": len(positions),
                 "total_pvs": reconcile_result.get("total_pvs_usd", 0),
                 "detail": {"env": env, "runner": "trade_close"},
-            })
+            }, trade_date=trade_date)
             logger.info("[US_RECONCILE_LOG][SAVE]")
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] save_reconcile_log failed: %s", exc)
@@ -221,12 +233,14 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
         pending_count = int(close_order_classification.get("pending_order_count") or 0)
         report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
+        if fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
+            report_consistency = "FAILED"
         report_failed = (
             daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS"}
             or bool((daily_report_result.get("report") or {}).get("errors"))
             or report_consistency != "OK"
         )
-        if fills_status == "CONTRACT_ERROR":
+        if fills_status in {"CONTRACT_ERROR", "DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
             status = "ERROR"
         elif reconcile_result.get("status") in {"CONTRACT_ERROR", "FATAL_ERROR"}:
             status = "ERROR"

@@ -55,7 +55,7 @@ def _resolve_order_fill_price(order: dict) -> tuple[float, str | None]:
     return 0.0, None
 
 
-def reconcile_positions(provider: Any | None = None) -> dict:
+def reconcile_positions(provider: Any | None = None, *, trade_date: str | None = None) -> dict:
     """잔고 조회 및 reconcile.
 
     Args:
@@ -78,6 +78,9 @@ def reconcile_positions(provider: Any | None = None) -> dict:
     if provider is None:
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
+    if not trade_date:
+        from datetime import date
+        trade_date = date.today().isoformat()
 
     try:
         balance = _get_balance_force_refresh(provider)
@@ -178,7 +181,10 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         )
         try:
             from trader.us.db.repos import save_position_snapshot
-            saved = save_position_snapshot(positions)
+            try:
+                saved = save_position_snapshot(positions, trade_date=trade_date)
+            except TypeError:
+                saved = save_position_snapshot(positions)
             logger.info(
                 "[US_RECONCILE][UPSERT_POSITIONS] count=%d source=kis_balance_authoritative",
                 saved,
@@ -396,6 +402,9 @@ def reconcile_ack_orders_with_balance(
     if provider is None:
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
+    if not trade_date:
+        from datetime import date
+        trade_date = date.today().isoformat()
 
     try:
         pending_orders = load_pending_ack_orders(trade_date=trade_date, env=env)
@@ -432,6 +441,7 @@ def reconcile_ack_orders_with_balance(
     confirmed_count = 0
     balance_reconcile_count = 0
     unresolved_count = 0
+    failed_count = 0
     symbols_by_status: dict[str, list[str]] = {"fill_api_confirmed": [], "balance_confirmed": [], "unresolved": []}
 
     for order in pending_orders:
@@ -469,7 +479,7 @@ def reconcile_ack_orders_with_balance(
         fill_qty = qty
 
         try:
-            fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol)
+            fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
             if fills_resp and isinstance(fills_resp, dict):
                 if fills_resp.get("filled_qty", 0) > 0:
                     fill_symbol = str(fills_resp.get("symbol") or symbol).upper()
@@ -487,6 +497,12 @@ def reconcile_ack_orders_with_balance(
         except AttributeError:
             # provider does not support get_fills_by_order_no (offline/mock)
             pass
+        except TypeError as exc:
+            logger.error("[US_RECONCILE][ACK_RECONCILE][CONTRACT_ERROR] fills_by_order_no signature error symbol=%s: %s", symbol, exc)
+            failed_count += 1
+            unresolved_count += 1
+            symbols_by_status["unresolved"].append(symbol)
+            continue
         except Exception as exc:
             logger.warning(
                 "[US_RECONCILE][ACK_RECONCILE][WARN] fills_by_order_no failed symbol=%s: %s",
@@ -499,7 +515,7 @@ def reconcile_ack_orders_with_balance(
                 symbol, order_no, fill_qty, fill_price,
             )
             try:
-                mark_order_filled_by_reconcile(
+                mark_result = mark_order_filled_by_reconcile(
                     order_no=order_no,
                     client_order_key=client_order_key,
                     symbol=symbol,
@@ -513,8 +529,12 @@ def reconcile_ack_orders_with_balance(
                     trade_date=trade_date,
                     meta=_order_meta(order),
                 )
-                confirmed_count += 1
-                symbols_by_status["fill_api_confirmed"].append(symbol)
+                if not isinstance(mark_result, dict) or mark_result.get("status") == "OK":
+                    confirmed_count += 1
+                    symbols_by_status["fill_api_confirmed"].append(symbol)
+                else:
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
             except Exception as exc:
                 logger.error(
                     "[US_RECONCILE][ACK_RECONCILE][ERROR] mark_order_filled failed symbol=%s: %s",
@@ -531,7 +551,7 @@ def reconcile_ack_orders_with_balance(
                 symbol, side, qty, filled_by_balance, pre_qty_for_delta, post_qty_for_delta, delta_confirmation["status"],
             )
             try:
-                mark_order_filled_by_reconcile(
+                mark_result = mark_order_filled_by_reconcile(
                     order_no=order_no,
                     client_order_key=client_order_key,
                     symbol=symbol,
@@ -545,8 +565,12 @@ def reconcile_ack_orders_with_balance(
                     trade_date=trade_date,
                     meta={**_order_meta(order), "balance_delta_status": delta_confirmation["status"], "remaining_qty": delta_confirmation.get("remaining_qty", 0)},
                 )
-                balance_reconcile_count += 1
-                symbols_by_status["balance_confirmed"].append(symbol)
+                if not isinstance(mark_result, dict) or mark_result.get("status") == "OK":
+                    balance_reconcile_count += 1
+                    symbols_by_status["balance_confirmed"].append(symbol)
+                else:
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
             except Exception as exc:
                 logger.error("[US_RECONCILE][ACK_RECONCILE][ERROR] balance_delta_confirm failed symbol=%s: %s", symbol, exc)
             continue
@@ -573,7 +597,7 @@ def reconcile_ack_orders_with_balance(
                     buy_reason,
                 )
                 try:
-                    mark_order_filled_by_reconcile(
+                    mark_result = mark_order_filled_by_reconcile(
                         order_no=order_no,
                         client_order_key=client_order_key,
                         symbol=symbol,
@@ -587,8 +611,12 @@ def reconcile_ack_orders_with_balance(
                         trade_date=trade_date,
                         meta=_order_meta(order),
                     )
-                    balance_reconcile_count += 1
-                    symbols_by_status["balance_confirmed"].append(symbol)
+                    if not isinstance(mark_result, dict) or mark_result.get("status") == "OK":
+                        balance_reconcile_count += 1
+                        symbols_by_status["balance_confirmed"].append(symbol)
+                    else:
+                        unresolved_count += 1
+                        symbols_by_status["unresolved"].append(symbol)
                 except Exception as exc:
                     logger.error(
                         "[US_RECONCILE][ACK_RECONCILE][ERROR] balance_reconcile_buy failed symbol=%s: %s",
@@ -624,6 +652,7 @@ def reconcile_ack_orders_with_balance(
         "confirmed_count": confirmed_count,
         "balance_reconcile_count": balance_reconcile_count,
         "unresolved_count": unresolved_count,
+        "failed_count": failed_count,
         "symbols_by_status": symbols_by_status,
     }
 

@@ -326,6 +326,17 @@ def route_order(
                 "broker_submit": False, "retry_order": False, "requires_reconcile": True, "intent": intent}
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
     trade_date = intent.get("trade_date")
+    if not str(trade_date or "").strip():
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": "trade_date_required_before_broker_submit",
+                "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+
+    def _persist_with_trade_date(func, payload):
+        try:
+            return func(payload, trade_date=trade_date)
+        except TypeError:
+            # Compatibility for older injected test adapters; production repo
+            # functions accept and receive the explicit US trade_date above.
+            return func(payload)
 
     logger.info(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
@@ -403,7 +414,7 @@ def route_order(
         }
 
     # 2. intent DB 저장
-    if not save_order_intent(intent):
+    if not _persist_with_trade_date(save_order_intent, intent):
         return {"status": "INVALID_ORDER_IDENTITY", "reason": "intent_persistence_rejected", "broker_submit": False, "intent": intent}
 
     # 3. 중복 key: DB + in-memory 합산
@@ -541,7 +552,7 @@ def route_order(
     if dry_run_resolved:
         logger.info("[US_ORDER][DRY_RUN] symbol=%s side=%s qty=%s", symbol, side, qty)
         dry_intent = {**intent, "client_order_key": order_key}
-        save_dry_run_order(dry_intent)
+        _persist_with_trade_date(save_dry_run_order, dry_intent)
         if order_key:
             # Mark as DRY_RUN instead of SENT to distinguish from real orders
             mark_order_intent_dry_run(order_key)
@@ -870,7 +881,7 @@ def route_order(
             "qty": qty,
             "reason": msg,
         }
-        save_order_reject(reject_result)
+        _persist_with_trade_date(save_order_reject, reject_result)
         if order_key:
             mark_order_intent_rejected(order_key, reason=msg)
         return {
@@ -940,7 +951,7 @@ def route_order(
 
     ack_db_saved = False
     try:
-        ack_db_saved = bool(save_order_ack(ack_result))
+        ack_db_saved = bool(_persist_with_trade_date(save_order_ack, ack_result))
         if ack_db_saved:
             logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
     except Exception:

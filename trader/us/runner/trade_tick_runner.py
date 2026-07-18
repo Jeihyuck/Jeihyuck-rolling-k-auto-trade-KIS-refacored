@@ -858,7 +858,10 @@ def run_trade_tick(
     try:
         if should_reconcile_balance:
             from trader.us.execution.reconcile import reconcile_positions
-            recon = reconcile_positions(provider=provider)
+            try:
+                recon = reconcile_positions(provider=provider, trade_date=trade_date)
+            except TypeError:
+                recon = reconcile_positions(provider=provider)
         else:
             from trader.us.db.repos import load_positions as _load_positions_for_reconcile_skip
             _positions = _load_positions_for_reconcile_skip()
@@ -1007,7 +1010,10 @@ def run_trade_tick(
     # fills DB 저장
     if fills_today:
         try:
-            save_fills(fills_today)
+            try:
+                save_fills(fills_today, trade_date=trade_date)
+            except TypeError:
+                save_fills(fills_today)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] save_fills failed: %s", exc)
         try:
@@ -1046,19 +1052,26 @@ def run_trade_tick(
         logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
     elif recon_positions:
         try:
-            save_position_snapshot(recon_positions)
+            try:
+                save_position_snapshot(recon_positions, trade_date=trade_date)
+            except TypeError:
+                save_position_snapshot(recon_positions)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] save_position_snapshot failed: %s", exc)
 
     # reconcile log DB 저장
     try:
-        save_reconcile_log({
+        payload = {
             "status": recon.get("status", "OK"),
             "message": recon.get("error", ""),
             "position_count": len(recon_positions),
             "total_pvs": recon.get("total_pvs_usd", 0),
             "detail": {"session": session},
-        })
+        }
+        try:
+            save_reconcile_log(payload, trade_date=trade_date)
+        except TypeError:
+            save_reconcile_log(payload)
     except Exception as exc:
         logger.warning("[US_TICK][WARN] save_reconcile_log failed: %s", exc)
 

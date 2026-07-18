@@ -7,7 +7,7 @@ class _Provider:
     def get_balance(self) -> dict:
         return {"positions": []}
 
-    def get_fills_by_order_no(self, order_no: str, symbol: str) -> dict:
+    def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict:
         return {}
 
 

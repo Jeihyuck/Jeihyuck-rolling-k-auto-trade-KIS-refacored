@@ -21,6 +21,13 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class FillAccountingInvariantError(RuntimeError):
+    def __init__(self, payload: dict):
+        super().__init__(str(payload))
+        self.payload = payload
+
+
 try:
     from sqlalchemy import text
     from trader.db.engine import get_engine as _get_engine_impl
@@ -44,6 +51,7 @@ _MEM_POSITIONS: list[dict] = []
 _MEM_RECONCILE_LOGS: list[dict] = []
 _MEM_RISK_STATE: dict[tuple[str, str], dict] = {}
 _MEM_PROFIT_CAPTURE_STATE: dict[tuple[str, str], dict] = {}
+_LAST_SAVE_FILLS_ERROR: str | None = None
 
 
 
@@ -960,6 +968,8 @@ def update_us_soft_stop_risk_state(
 
 def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     """us_fills 저장."""
+    global _LAST_SAVE_FILLS_ERROR
+    _LAST_SAVE_FILLS_ERROR = None
     td = trade_date or _today()
     if not fills:
         return 0
@@ -1044,6 +1054,23 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     try:
         with engine.begin() as conn:
             for f in fills:
+                idem = _us_fill_idempotency_key_text(f, td)
+                incoming_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+                evidence = str(incoming_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+                incoming_cum = int(incoming_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+                if _is_kis_order_cumulative_evidence(evidence):
+                    existing = conn.execute(
+                        text("""SELECT qty, meta FROM us_fills
+                                  WHERE fill_idempotency_key=:fill_idempotency_key FOR UPDATE"""),
+                        {"fill_idempotency_key": idem},
+                    ).mappings().first()
+                    if existing:
+                        existing_meta = existing.get("meta") if isinstance(existing.get("meta"), dict) else {}
+                        existing_cum = int(existing_meta.get("cumulative_filled_qty") or existing.get("qty") or 0)
+                        if incoming_cum < existing_cum:
+                            f["save_status"] = "EVIDENCE_QUANTITY_REGRESSION"
+                            skipped_duplicates += 1
+                            continue
                 result = conn.execute(
                     text("""
                         INSERT INTO us_fills
@@ -1072,7 +1099,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                         "cok": f.get("client_order_key", ""),
                         "filled_at": f.get("filled_at"),
                         "meta": _json_param(f.get("meta")),
-                        "fill_idempotency_key": _us_fill_idempotency_key_text(f, td),
+                        "fill_idempotency_key": idem,
                     },
                 )
                 if int(result.rowcount or 0) > 0:
@@ -1080,11 +1107,27 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                 else:
                     skipped_duplicates += 1
     except Exception as exc:
+        _LAST_SAVE_FILLS_ERROR = str(exc)
         logger.error("[US_FILLS][SAVE][ERROR] %s", exc)
     logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
     logger.info("[US_FILLS][SAVE][DONE] inserted=%d input=%d", count, len(fills))
     return count
 
+
+
+def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> dict:
+    """Structured fill-save result for close/reconcile callers."""
+    inserted = save_fills(fills, trade_date=trade_date)
+    regression_count = sum(1 for f in (fills or []) if f.get("save_status") == "EVIDENCE_QUANTITY_REGRESSION")
+    if _LAST_SAVE_FILLS_ERROR:
+        return {"status": "DB_ERROR", "inserted_count": int(inserted or 0), "updated_count": 0,
+                "unchanged_count": 0, "regression_count": regression_count, "error": _LAST_SAVE_FILLS_ERROR}
+    if regression_count:
+        return {"status": "EVIDENCE_QUANTITY_REGRESSION", "inserted_count": int(inserted or 0),
+                "updated_count": 0, "unchanged_count": max(0, len(fills or []) - int(inserted or 0) - regression_count),
+                "regression_count": regression_count}
+    return {"status": "OK", "inserted_count": int(inserted or 0), "updated_count": 0,
+            "unchanged_count": max(0, len(fills or []) - int(inserted or 0)), "regression_count": 0}
 
 def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> list[dict]:
     """당일 DB fills 조회 (signal-only / DB-only 모드용).
@@ -1688,6 +1731,15 @@ def mark_order_filled_by_reconcile(
             synthetic = evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
             resolved_client_order_key = cok or order["client_order_key"] or ""
             active = _active_fill_cumulatives_for_order(trade_date=td, order_no=on, client_order_key=resolved_client_order_key, symbol=sym, side=side_u, conn=conn)
+            if not synthetic and observed_cumulative > requested:
+                return {"status": "EVIDENCE_QUANTITY_OVERFLOW", "requires_reconcile": True, "retry_order": False,
+                        "observed_actual_cumulative": observed_cumulative, "requested_qty": requested, "entry_fence": True}
+            if not synthetic and _is_kis_order_cumulative_evidence(evidence) and observed_cumulative < int(active.get("actual", 0) or 0):
+                return {"status": "EVIDENCE_QUANTITY_REGRESSION", "requires_reconcile": True, "retry_order": False,
+                        "observed_actual_cumulative": observed_cumulative, "previous_actual_cumulative": int(active.get("actual", 0) or 0), "entry_fence": True}
+            if not synthetic and int(active.get("actual_individual", 0) or 0) > 0 and observed_cumulative != int(active.get("actual_individual", 0) or 0):
+                return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                        "order_cumulative": observed_cumulative, "execution_actual_qty": int(active.get("actual_individual", 0) or 0)}
             if not synthetic and observed_cumulative < int(active.get("synthetic", 0) or 0):
                 return {"status": "EVIDENCE_QUANTITY_CONFLICT", "requires_reconcile": True, "retry_order": False,
                         "observed_actual_cumulative": observed_cumulative, "synthetic_cumulative": int(active.get("synthetic", 0) or 0)}
@@ -1757,13 +1809,16 @@ def mark_order_filled_by_reconcile(
                     cumulative_qty = max(cumulative_qty, int(meta_after.get("cumulative_filled_qty") or qty_after or 0))
             active_total = execution_qty if execution_qty > 0 else cumulative_qty if cumulative_qty > 0 else synthetic_qty
             if cumulative != active_total:
-                return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
-                        "order_qty_filled": cumulative, "active_fill_qty": active_total}
+                raise FillAccountingInvariantError({"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
+                        "order_qty_filled": cumulative, "active_fill_qty": active_total})
             return {"status": "OK", "order_status": status, "qty_filled": cumulative,
                     "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual),
                     "synthetic_superseded_count": int(promotion.get("superseded", 0)),
                     "evidence_quantity_conflict_count": int(promotion.get("conflict", 0)),
                     "fill_accounting": {"status": "OK", "order_qty_filled": cumulative, "active_fill_qty": active_total}}
+    except FillAccountingInvariantError as exc:
+        logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
+        return exc.payload
     except Exception as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][ERROR] %s", exc)
         return {"status": "RECONCILE_UPDATE_FAILED", "error": str(exc)}

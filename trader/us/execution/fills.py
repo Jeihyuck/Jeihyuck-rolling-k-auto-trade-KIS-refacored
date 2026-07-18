@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ def get_fills_today(
         logger.info("[US_FILLS][SIGNAL_ONLY] skipping KIS fill query, using DB-only")
         try:
             from trader.us.db.repos import load_today_fills
-            db_fills = load_today_fills()
+            db_fills = load_today_fills(trade_date=trade_date)
             logger.info("[US_FILLS][DB_ONLY] count=%d", len(db_fills))
             return {
                 "status": "OK",
@@ -88,6 +89,7 @@ def get_fills_today(
     try:
         client = provider._get_client()
         raw = client.get_us_fills_today(trade_date=trade_date)
+        observed_at = datetime.now(timezone.utc).isoformat()
         fills = []
         for row in raw:
             order_no = _first_nonblank(row, "odno", "order_no", "ODNO")
@@ -107,7 +109,7 @@ def get_fills_today(
                 "price": avg_price_usd,
                 "avg_price_usd": avg_price_usd,
                 "filled_at": order_timestamp or row.get("ord_dt", ""),
-                "observed_at": order_timestamp or row.get("ord_dt", ""),
+                "observed_at": observed_at,
                 "order_timestamp": order_timestamp,
                 "order_no": order_no,
                 "requested_qty": requested_qty,
@@ -122,7 +124,7 @@ def get_fills_today(
                     "remaining_qty": remaining_qty,
                     "requested_qty": requested_qty,
                     "order_timestamp": order_timestamp,
-                    "observed_at": order_timestamp or row.get("ord_dt", ""),
+                    "observed_at": observed_at,
                 },
                 "raw": row,
             })

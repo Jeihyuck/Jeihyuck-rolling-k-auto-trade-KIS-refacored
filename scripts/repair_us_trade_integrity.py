@@ -95,6 +95,7 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
             if "SYNTHETIC_DUPLICATES_KIS_ACTUAL" in issue.get("reasons", []):
                 counts["deleted_synthetic_duplicates"] += 1
         grouped_actual = {}
+        conflicted_actual_keys = set()
         for fill in actual_fills or []:
             order_no = str(fill.get("order_no") or "")
             symbol = str(fill.get("symbol") or "").upper()
@@ -106,12 +107,17 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
             observed_at = str(fill.get("observed_at") or fill.get("order_timestamp") or fill.get("filled_at") or "")
             key = (trade_date, order_no, symbol, side)
             current = grouped_actual.get(key)
-            if current and qty < int(current.get("qty") or 0) and observed_at > str(current.get("observed_at") or ""):
-                counts["row_ids"].append({"table":"us_fills","order_no":order_no,"reason":"REPAIR_CUMULATIVE_SNAPSHOT_CONFLICT"})
+            current_qty = int(current.get("qty") or 0) if current else 0
+            current_observed = str(current.get("observed_at") or "") if current else ""
+            if current and qty < current_qty:
+                conflicted_actual_keys.add(key)
+                counts["row_ids"].append({"table":"us_fills","order_no":order_no,"reason":"REPAIR_CUMULATIVE_SNAPSHOT_CONFLICT","kept_cumulative":current_qty,"regressed_cumulative":qty})
                 continue
-            if current is None or qty > int(current.get("qty") or 0) or observed_at >= str(current.get("observed_at") or ""):
+            if current is None or qty > current_qty or (qty == current_qty and observed_at >= current_observed):
                 grouped_actual[key] = {"qty": qty, "avg_price": price, "sample": fill, "observed_at": observed_at}
         for (td, order_no, symbol, side), agg in grouped_actual.items():
+            if (td, order_no, symbol, side) in conflicted_actual_keys:
+                continue
             qty = int(agg["qty"] or 0)
             avg_price = float(agg.get("avg_price") or 0.0)
             updated = conn.execute(text("""UPDATE us_orders SET qty_filled=:qty, avg_price_usd=:avg_price,

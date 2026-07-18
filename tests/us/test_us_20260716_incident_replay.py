@@ -14,7 +14,7 @@ class KIS:
     def __init__(self): self.submits=0; self.calls=[]
     def get_balance(self,**kw): self.calls.append('balance'); return {'positions':POSITIONS,'balance_parse_status':'OK','total_pvs':37429.49}
     def get_today_orders(self,**kw): self.calls.append('orders'); return [{'order_no':'TIMEOUT1','symbol':'AMD','side':'SELL','status':'ACK'}]
-    def get_fills_by_order_no(self,order_no,symbol):
+    def get_fills_by_order_no(self,order_no,symbol,trade_date):
         self.calls.append(('fill',order_no)); return {'filled_qty':3,'avg_price':100,'symbol':symbol,'side':'SELL'}
 
 def hanging(tick_cancellation_event=None):

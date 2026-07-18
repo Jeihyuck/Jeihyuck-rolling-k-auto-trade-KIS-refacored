@@ -36,3 +36,26 @@ def test_timeout_replay_identity_mismatch(tmp_path,monkeypatch):
     journal(tmp_path,monkeypatch); r=replay_order_journal('2026-07-16',tick_id='t',provider=Provider({'filled_qty':1,'symbol':'AMZN','side':'SELL'})); assert r['identity_mismatch_count']==1
 def test_timeout_replay_blocks_duplicate_symbol_side(tmp_path,monkeypatch):
     journal(tmp_path,monkeypatch,False); r=replay_order_journal('2026-07-16',tick_id='t',provider=Provider()); assert ['AMD','SELL'] in r['unresolved_symbol_sides']
+
+def test_journal_replay_fallback_uses_max_cumulative_not_sum(tmp_path, monkeypatch):
+    import trader.us.db.repos as repos
+    repos.reset_memory_stores()
+    journal(tmp_path, monkeypatch)
+
+    class _Provider(Provider):
+        def get_fills_by_order_no(self, **kw):
+            self.calls['fill'] += 1
+            return None
+
+    monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda provider, trade_date: {
+        "status": "OK",
+        "fills": [
+            {"order_no": "O1", "symbol": "AMD", "side": "SELL", "qty": 3, "cumulative_filled_qty": 3, "price_usd": 100, "observed_at": "2026-07-16T14:00:00Z"},
+            {"order_no": "O1", "symbol": "AMD", "side": "SELL", "qty": 7, "cumulative_filled_qty": 7, "price_usd": 101, "observed_at": "2026-07-16T14:01:00Z"},
+        ],
+    })
+
+    result = replay_order_journal("2026-07-16", tick_id="t", provider=_Provider())
+
+    assert result["broker_partial_fill_count"] == 1
+    assert repos._MEM_ORDERS[0]["qty_filled"] == 7

@@ -132,14 +132,24 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 if callable(detail):
                     try:
                         broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=trade_date)
-                    except TypeError:
-                        broker_fill = detail(order_no=order_no, symbol=symbol)
+                    except TypeError as exc:
+                        counts["failed_count"] += 1
+                        unresolved_symbol_sides.append([symbol, side])
+                        append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="PROVIDER_CONTRACT_ERROR", raw_response={"error": str(exc)})
+                        continue
                 if not broker_fill and isinstance(all_fills, list):
-                    matched = [f for f in all_fills if str(f.get("order_no") or "") == order_no]
+                    matched = [f for f in all_fills if str(f.get("order_no") or "") == order_no and str(f.get("symbol") or symbol).upper() == symbol and str(f.get("side") or side).upper() == side]
                     if matched:
-                        broker_fill = {"filled_qty": sum(int(f.get("qty") or 0) for f in matched),
-                                       "avg_price": float(matched[-1].get("price") or matched[-1].get("price_usd") or 0),
-                                       "symbol": matched[-1].get("symbol"), "side": matched[-1].get("side")}
+                        def _cum(row):
+                            return int(row.get("cumulative_filled_qty") or row.get("filled_qty") or row.get("qty") or 0)
+                        def _obs(row):
+                            return str(row.get("observed_at") or row.get("updated_at") or row.get("filled_at") or "")
+                        best = max(matched, key=lambda row: (_cum(row), _obs(row)))
+                        later_regression = any(_obs(row) > _obs(best) and _cum(row) < _cum(best) for row in matched)
+                        broker_fill = {"filled_qty": _cum(best), "cumulative_filled_qty": _cum(best),
+                                       "avg_price": float(best.get("avg_price") or best.get("price") or best.get("price_usd") or 0),
+                                       "symbol": best.get("symbol"), "side": best.get("side"),
+                                       "status": "EVIDENCE_QUANTITY_REGRESSION" if later_regression else best.get("status")}
             if broker_fill and int(broker_fill.get("filled_qty") or 0) > 0:
                 if str(broker_fill.get("symbol") or symbol).upper()!=symbol or str(broker_fill.get("side") or side).upper()!=side:
                     counts["identity_mismatch_count"] += 1; unresolved_symbol_sides.append([symbol,side]); continue
