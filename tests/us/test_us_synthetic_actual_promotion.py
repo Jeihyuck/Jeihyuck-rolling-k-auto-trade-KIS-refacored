@@ -21,7 +21,7 @@ def test_kis_actual_supersedes_prior_synthetic_partial():
 def test_actual_smaller_than_synthetic_is_quarantined():
     _seed(); repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=10,requested_qty=10,cumulative_filled_qty=10,avg_price_usd=100,trade_date="2026-07-16",evidence_type="BALANCE_DELTA_SYNTHETIC")
     r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=7,requested_qty=10,cumulative_filled_qty=7,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
-    assert r["evidence_quantity_conflict_count"] == 1
+    assert r["status"] == "EVIDENCE_QUANTITY_CONFLICT" and r["synthetic_cumulative"] == 10
 
 
 def test_promoted_synthetic_is_not_counted_in_accounting():

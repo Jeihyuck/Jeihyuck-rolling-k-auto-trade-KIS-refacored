@@ -116,25 +116,38 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
               WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side"""),
               {"qty":qty,"avg_price":avg_price,"td":td,"order_no":order_no,"symbol":symbol,"side":side})
             if int(updated.rowcount or 0) == 0:
-                intent = conn.execute(text("SELECT client_order_key FROM us_order_intents WHERE trade_date=:td AND symbol=:symbol AND side=:side LIMIT 2"),
-                                      {"td":td,"symbol":symbol,"side":side}).fetchall()
-                if len(intent) == 1:
-                    cok = intent[0][0]
+                sample = agg.get("sample") or {}
+                cok = str(sample.get("client_order_key") or "").strip()
+                requested_qty = int(sample.get("requested_qty") or sample.get("order_qty") or qty or 0)
+                if cok:
+                    status = "PARTIALLY_FILLED" if qty < requested_qty else "FILLED"
                     conn.execute(text("""INSERT INTO us_orders(trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,avg_price_usd,order_no,status,meta)
-                      VALUES(:td,:cok,:symbol,'NASDAQ',:side,:qty,:qty,:avg_price,:order_no,'FILLED',jsonb_build_object('repair_reconstructed',true,'remaining_qty',0))"""),
-                      {"td":td,"cok":cok,"symbol":symbol,"side":side,"qty":qty,"avg_price":avg_price,"order_no":order_no})
+                      VALUES(:td,:cok,:symbol,'NASDAQ',:side,:requested,:qty,:avg_price,:order_no,:status,jsonb_build_object('repair_reconstructed',true,'remaining_qty',GREATEST(:requested-:qty,0)))"""),
+                      {"td":td,"cok":cok,"symbol":symbol,"side":side,"requested":requested_qty,"qty":qty,"avg_price":avg_price,"order_no":order_no,"status":status})
                     counts["corrected_rows"] += 1
                 else:
                     counts["row_ids"].append({"table":"us_orders","order_no":order_no,"reason":"REPAIR_ORDER_IDENTITY_UNRESOLVED"})
             else:
                 counts["corrected_rows"] += int(updated.rowcount or 0)
-            idem = f"{td}|{symbol}|{side}|{order_no}|KIS_REPAIR|evidence=KIS_ACTUAL|cumulative={qty}"
-            conn.execute(text("""INSERT INTO us_fills(trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
-              SELECT :td,:symbol,'NASDAQ',:side,:qty,:avg_price,:order_no,client_order_key,now(),
-                     jsonb_build_object('is_synthetic',false,'fill_evidence_type','KIS_ACTUAL','repair_actual_cumulative_qty',:qty),:idem
-              FROM us_orders WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side LIMIT 1
-              ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
-              {"td":td,"symbol":symbol,"side":side,"qty":qty,"avg_price":avg_price,"order_no":order_no,"idem":idem})
+            # Do not insert aggregate KIS_REPAIR summary rows into us_fills.
+            # Only missing individual KIS executions are inserted idempotently.
+            running = 0
+            for seq, fill in enumerate([f for f in (actual_fills or []) if str(f.get("order_no") or "") == order_no and str(f.get("symbol") or "").upper() == symbol and str(f.get("side") or "").upper() == side], start=1):
+                exec_qty = int(fill.get("qty") or fill.get("filled_qty") or 0)
+                exec_price = float(fill.get("price_usd") or fill.get("price") or fill.get("avg_price") or 0)
+                running += exec_qty
+                exec_ts = str(fill.get("execution_timestamp") or fill.get("filled_at") or seq)
+                idem = f"{td}|{symbol}|{side}|{order_no}|exec_ts={exec_ts}|qty={exec_qty}|price={exec_price}|seq={seq}"
+                conn.execute(text("""INSERT INTO us_fills(trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+                  SELECT :td,:symbol,'NASDAQ',:side,:qty,:price,:order_no,client_order_key,:filled_at,
+                         jsonb_build_object('is_synthetic',false,'fill_evidence_type','KIS_ACTUAL','execution_sequence',:seq,'cumulative_filled_qty',:running),:idem
+                  FROM us_orders WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side LIMIT 1
+                  ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
+                  {"td":td,"symbol":symbol,"side":side,"qty":exec_qty,"price":exec_price,"order_no":order_no,"filled_at":exec_ts,"seq":seq,"running":running,"idem":idem})
+            conn.execute(text("""UPDATE us_fills SET meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('accounting_active',false,'superseded_by_kis_actual',true)
+              WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side
+              AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)"""),
+              {"td":td,"order_no":order_no,"symbol":symbol,"side":side})
             pnl = conn.execute(text("""UPDATE us_fills SET meta=COALESCE(meta,'{}'::jsonb)||
               jsonb_build_object('realized_pnl_usd',(price_usd-NULLIF((meta->>'cost_basis_price_usd')::numeric,0))*qty)
               WHERE trade_date=:td AND order_no=:order_no AND side='SELL' AND meta ? 'cost_basis_price_usd'"""),
@@ -154,8 +167,10 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
                     lifecycle=conn.execute(text("""UPDATE us_position_risk_state SET state=COALESCE(state,'{}'::jsonb)||jsonb_build_object('lifecycle',CAST(:lifecycle AS jsonb))
                       WHERE trade_date=:td AND symbol=:symbol"""), {"td":trade_date,"symbol":symbol,"lifecycle":json.dumps(state, default=str)})
                     counts["repaired_lifecycle_rows"] += int(lifecycle.rowcount or 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                counts["lifecycle_repair_failed"] = True
+                counts["lifecycle_repair_error"] = str(exc)
+                raise
     counts["destructive_mutations"] = sum(counts[k] for k in ("quarantined_rows","corrected_rows","deleted_synthetic_duplicates","closed_stale_positions","recalculated_realized_pnl_rows","repaired_lifecycle_rows"))
     return counts
 

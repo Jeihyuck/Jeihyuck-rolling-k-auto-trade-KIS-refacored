@@ -959,11 +959,11 @@ class USDataProvider:
             raw = method(trade_date=trade_date)
         return [normalize_us_order_status_row(row) for row in (raw or [])]
 
-    def get_fills_by_order_no(self, order_no: str, symbol: str) -> dict | None:
+    def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict | None:
         """Return normalized cumulative fill/order detail for a single broker order."""
         if self._offline:
             return None
-        rows = self.get_today_orders(date.today().isoformat())
+        rows = self.get_today_orders(trade_date)
         matches = [r for r in rows if str(r.get("order_no") or "") == str(order_no) and str(r.get("symbol") or "").upper() == str(symbol).upper()]
         if not matches:
             return None

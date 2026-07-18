@@ -1117,6 +1117,9 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         "balance_synthetic_confirmation_count": 0,
         "legacy_synthetic_fill_count": 0,
         "accounting_confirmed_order_count": 0,
+        "physical_fill_row_count": 0,
+        "accounting_active_fill_count": 0,
+        "superseded_synthetic_row_count": 0,
     }
     engine = _get_engine_or_none()
     if engine is None:
@@ -1141,12 +1144,16 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
             side = str(row.get("side") or "").upper()
             source = str(row.get("fill_source") or "").lower()
             n = int(row.get("n") or 0)
-            result["fills_count"] += n
+            result["physical_fill_row_count"] += n
             evidence = str(row.get("evidence_type") or "")
             is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
             accounting_active = row.get("accounting_active") is not False
             if not accounting_active:
+                if is_synthetic:
+                    result["superseded_synthetic_row_count"] += n
                 continue
+            result["fills_count"] += n
+            result["accounting_active_fill_count"] += n
             if not is_synthetic:
                 result["kis_actual_fill_execution_count"] += n
             elif evidence == "BALANCE_DELTA_SYNTHETIC":

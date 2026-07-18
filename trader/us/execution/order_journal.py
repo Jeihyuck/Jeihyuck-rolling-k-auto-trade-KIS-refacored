@@ -21,6 +21,18 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
     if not td:
         raise OSError("journal event requires trade_date")
     raw = json.dumps(raw_response or {}, sort_keys=True, ensure_ascii=False, default=str)
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    pre_order_position_qty = intent.get("pre_order_position_qty")
+    if pre_order_position_qty is None:
+        pre_order_position_qty = meta.get("pre_order_position_qty")
+    position_lifecycle_id = intent.get("position_lifecycle_id")
+    if position_lifecycle_id is None:
+        position_lifecycle_id = meta.get("position_lifecycle_id")
+    limit_price = intent.get("limit_price")
+    if limit_price is None:
+        limit_price = intent.get("limit_price_usd")
+    if limit_price is None:
+        limit_price = meta.get("limit_price") or meta.get("limit_price_usd")
     event = {
         "event_id": str(uuid.uuid4()), "event_type": event_type, "trade_date": td,
         "session": intent.get("session") or getattr(context, "session", ""),
@@ -32,6 +44,12 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "client_order_key": intent.get("client_order_key", ""), "symbol": intent.get("symbol", ""),
         "exchange": intent.get("exchange", ""), "side": intent.get("side", ""), "qty": intent.get("qty", 0),
         "broker_order_no": broker_order_no, "broker_status": broker_status,
+        "pre_order_position_qty": pre_order_position_qty,
+        "pre_order_position_source": intent.get("pre_order_position_source") or meta.get("pre_order_position_source"),
+        "position_lifecycle_id": position_lifecycle_id,
+        "limit_price": limit_price, "order_price": intent.get("order_price") or meta.get("order_price"),
+        "notional_usd": intent.get("notional_usd") or meta.get("notional_usd"),
+        "meta": meta,
         "timestamp": datetime.now(timezone.utc).isoformat(), "raw_response_hash": hashlib.sha256(raw.encode()).hexdigest(),
     }
     path = journal_path(td)
@@ -111,7 +129,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
             broker_fill = None
             if provider is not None:
                 detail = getattr(provider, "get_fills_by_order_no", None)
-                if callable(detail): broker_fill = detail(order_no=order_no, symbol=symbol)
+                if callable(detail):
+                    try:
+                        broker_fill = detail(order_no=order_no, symbol=symbol, trade_date=trade_date)
+                    except TypeError:
+                        broker_fill = detail(order_no=order_no, symbol=symbol)
                 if not broker_fill and isinstance(all_fills, list):
                     matched = [f for f in all_fills if str(f.get("order_no") or "") == order_no]
                     if matched:
@@ -126,6 +148,10 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                     filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,
                     avg_price_usd=float(broker_fill.get("avg_price") or 0),source="fills_by_order_no",
                     evidence_type="KIS_ORDER_DETAIL_ACTUAL",trade_date=trade_date,meta={"journal_replay":True})
+                if result.get("status") == "EVIDENCE_QUANTITY_CONFLICT":
+                    counts["identity_mismatch_count"] += 1; unresolved_symbol_sides.append([symbol,side])
+                    append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="EVIDENCE_QUANTITY_CONFLICT", raw_response=result)
+                    continue
                 if result.get("status") != "OK": raise RuntimeError(result.get("status"))
                 bucket="broker_full_fill_count" if cumulative>=requested else "broker_partial_fill_count"; counts[bucket]+=1
                 append_order_event("JOURNAL_REPLAY_FILL_CONFIRMED",ack,broker_order_no=order_no,
@@ -141,7 +167,11 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                         counts["broker_rejected_count"]+=1
                     else: counts["broker_unfilled_ack_count"]+=1
                 else:
-                    pre_qty_raw = latest.get("pre_order_position_qty") or latest.get("pre_qty") or (latest.get("meta") or {}).get("pre_order_position_qty") if isinstance(latest.get("meta"), dict) else None
+                    pre_qty_raw = latest.get("pre_order_position_qty")
+                    if pre_qty_raw is None:
+                        pre_qty_raw = latest.get("pre_qty")
+                    if pre_qty_raw is None and isinstance(latest.get("meta"), dict):
+                        pre_qty_raw = latest["meta"].get("pre_order_position_qty")
                     post_pos = positions_by_symbol.get(symbol) if positions_by_symbol else None
                     post_qty_raw = (post_pos or {}).get("qty") or (post_pos or {}).get("holding_qty") or (post_pos or {}).get("ovrs_cblc_qty")
                     if pre_qty_raw is not None and post_qty_raw is not None and requested > 0:
