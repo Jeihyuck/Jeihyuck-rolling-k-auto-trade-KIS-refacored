@@ -234,12 +234,27 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             logger.warning("[US_TRADE_CLOSE][WARN] daily report failed: %s", exc)
             daily_report_result = {"status": "ERROR", "report": {"report_consistency": "REPORT_INCONSISTENT"}}
 
-        # 8. Status 계산
+        # 9. Status 계산
         status = "OK"
         daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
         pending_count = int(close_order_classification.get("pending_order_count") or 0)
         report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
-        if fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"} or position_snapshot_error:
+        reconcile_status = str(reconcile_result.get("status") or "UNKNOWN").upper()
+        reconcile_error_statuses = {
+            "CONTRACT_ERROR",
+            "FATAL_ERROR",
+            "POSITION_PERSIST_ERROR",
+            "FILL_ACCOUNTING_INVARIANT_FAILED",
+            "RECONCILE_UPDATE_FAILED",
+            "EVIDENCE_QUANTITY_REGRESSION",
+            "EVIDENCE_QUANTITY_CONFLICT",
+            "EVIDENCE_QUANTITY_OVERFLOW",
+        }
+        if (
+            fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}
+            or position_snapshot_error
+            or reconcile_status in reconcile_error_statuses
+        ):
             report_consistency = "FAILED"
         report_failed = (
             daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS"}
@@ -248,7 +263,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         )
         if fills_status in {"CONTRACT_ERROR", "DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
             status = "ERROR"
-        elif reconcile_result.get("status") in {"CONTRACT_ERROR", "FATAL_ERROR"}:
+        elif reconcile_status in reconcile_error_statuses:
             status = "ERROR"
         elif position_snapshot_error:
             status = "ERROR"
@@ -258,23 +273,23 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             status = "ERROR"
         elif pending_count > 0:
             status = "DEGRADED_ACK_UNRESOLVED"
-        elif fills_status not in ("OK", "SKIP") or reconcile_result.get("status") not in ("OK", "SKIP"):
+        elif fills_status not in ("OK", "SKIP") or reconcile_status not in ("OK", "SKIP"):
             status = "OK_WITH_WARNINGS"
 
-        # 9. Final 로그
+        # 10. Final 로그
         if status == "OK":
             logger.info("[US_TRADE_CLOSE][OK]")
         elif status == "OK_WITH_WARNINGS":
             logger.warning(
                 "[US_TRADE_CLOSE][WARNINGS] fills_status=%s reconcile_status=%s",
                 fills_status,
-                reconcile_result.get("status"),
+                reconcile_status,
             )
         else:
             logger.error(
                 "[US_TRADE_CLOSE][ERROR] final_status=ERROR fills_status=%s reconcile_status=%s fills_error=%s position_snapshot_error=%s",
                 fills_status,
-                reconcile_result.get("status"),
+                reconcile_status,
                 fills_error,
                 position_snapshot_error,
             )
@@ -285,7 +300,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "fills_error": fills_error,
             "fills_count": len(fills),
             "positions_count": len(positions),
-            "reconcile_status": reconcile_result.get("status"),
+            "reconcile_status": reconcile_status,
             "balance": balance,
             "close_entry_enabled": close_entry_enabled,
             "order_final_classification": close_order_classification.get("orders", []),
