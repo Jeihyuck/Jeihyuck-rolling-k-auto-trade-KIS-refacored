@@ -118,11 +118,20 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         if not offline:
             try:
                 from trader.us.execution.reconcile import reconcile_positions
-                try:
-                    reconcile_result = reconcile_positions(provider=provider, trade_date=trade_date)
-                except TypeError:
-                    reconcile_result = reconcile_positions(provider=provider)
+                reconcile_result = reconcile_positions(provider=provider, trade_date=trade_date)
                 logger.info("[US_TRADE_CLOSE][RECONCILE] status=%s", reconcile_result.get("status"))
+            except TypeError as exc:
+                logger.error("[US_TRADE_CLOSE][CONTRACT_ERROR] reconcile TypeError: %s", exc)
+                reconcile_result = {
+                    "status": "CONTRACT_ERROR",
+                    "reason": "reconcile_internal_type_error",
+                    "balance_fetch_status": "FAILED",
+                    "authoritative_positions": False,
+                    "preserve_previous_positions": True,
+                    "error": str(exc),
+                    "positions": [],
+                    "position_count": 0,
+                }
             except Exception as exc:
                 logger.error("[US_TRADE_CLOSE][ERROR] reconcile failed: %s", exc)
                 reconcile_result = {
@@ -137,6 +146,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
         # 4. Positions DB 저장 — only authoritative OK zero/positions may overwrite snapshot.
         positions = reconcile_result.get("positions", [])
+        position_snapshot_error = ""
         try:
             can_save_positions = (
                 reconcile_result.get("status") == "OK"
@@ -153,17 +163,13 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                     reconcile_result.get("authoritative_positions"),
                 )
             else:
-                try:
-                    save_position_snapshot(positions, trade_date=trade_date, balance_fetch_status="OK",
-                                           balance_parse_status="OK", authoritative_positions=True,
-                                           preserve_previous_positions=False, close_source="kis_final_balance")
-                except TypeError:
-                    # Compatibility for injected test/adapter callables; repository
-                    # implementation always receives authoritative flags above.
-                    save_position_snapshot(positions)
+                save_position_snapshot(positions, trade_date=trade_date, balance_fetch_status="OK",
+                                       balance_parse_status="OK", authoritative_positions=True,
+                                       preserve_previous_positions=False, close_source="kis_final_balance")
                 logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", len(positions))
         except Exception as exc:
-            logger.warning("[US_TRADE_CLOSE][WARN] save_position_snapshot failed: %s", exc)
+            position_snapshot_error = str(exc)
+            logger.error("[US_TRADE_CLOSE][ERROR] save_position_snapshot failed: %s", exc)
 
         # 5. Reconcile log DB 저장
         try:
@@ -233,7 +239,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
         pending_count = int(close_order_classification.get("pending_order_count") or 0)
         report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
-        if fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
+        if fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"} or position_snapshot_error:
             report_consistency = "FAILED"
         report_failed = (
             daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS"}
@@ -243,6 +249,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         if fills_status in {"CONTRACT_ERROR", "DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
             status = "ERROR"
         elif reconcile_result.get("status") in {"CONTRACT_ERROR", "FATAL_ERROR"}:
+            status = "ERROR"
+        elif position_snapshot_error:
             status = "ERROR"
         elif report_failed:
             status = "ERROR"
@@ -264,10 +272,11 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             )
         else:
             logger.error(
-                "[US_TRADE_CLOSE][ERROR] final_status=ERROR fills_status=%s reconcile_status=%s fills_error=%s",
+                "[US_TRADE_CLOSE][ERROR] final_status=ERROR fills_status=%s reconcile_status=%s fills_error=%s position_snapshot_error=%s",
                 fills_status,
                 reconcile_result.get("status"),
                 fills_error,
+                position_snapshot_error,
             )
 
         return {
@@ -284,6 +293,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "pending_order_count": close_order_classification.get("pending_order_count", 0),
             "daily_report_status": daily_report_result.get("status"),
             "report_consistency": report_consistency,
+            "position_snapshot_error": position_snapshot_error,
         }
     finally:
         release_us_session_running_lock(trade_date, "close", run_id=run_id)
