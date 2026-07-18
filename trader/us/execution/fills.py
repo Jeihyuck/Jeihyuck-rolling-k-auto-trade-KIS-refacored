@@ -91,26 +91,39 @@ def get_fills_today(
         fills = []
         for row in raw:
             order_no = _first_nonblank(row, "odno", "order_no", "ODNO")
-            execution_sequence = _first_nonblank(row, "execution_sequence", "ccld_seq", "seq", "CCLD_SEQ")
-            broker_execution_id = _first_nonblank(row, "broker_execution_id", "execution_id", "exec_id", "ccld_no", "cntg_no", "CCLD_NO", "CNTG_NO")
-            if not broker_execution_id and order_no and execution_sequence:
-                broker_execution_id = f"{order_no}-{execution_sequence}"
-            execution_timestamp = _combine_kis_date_time(_first_nonblank(row, "ord_dt", "ORD_DT"), _first_nonblank(row, "ord_tmd", "ccld_tmd", "ORD_TMD", "CCLD_TMD"))
+            order_timestamp = _combine_kis_date_time(
+                _first_nonblank(row, "ord_dt", "ORD_DT"),
+                _first_nonblank(row, "ord_tmd", "ORD_TMD"),
+            )
+            requested_qty = int(row.get("ft_ord_qty") or row.get("ord_qty") or 0)
+            cumulative_filled_qty = int(row.get("ft_ccld_qty", 0) or 0)
+            remaining_qty = int(row.get("nccs_qty") or row.get("rmn_qty") or 0)
+            avg_price_usd = float(row.get("ft_ccld_unpr3", 0) or 0)
             fills.append({
                 "symbol": row.get("pdno", ""),
                 "exchange": row.get("ovrs_excg_cd", ""),
                 "side": "BUY" if row.get("sll_buy_dvsn_cd") == "02" else "SELL",
-                "qty": int(row.get("ft_ccld_qty", 0) or 0),
-                "price": float(row.get("ft_ccld_unpr3", 0) or 0),
-                "filled_at": execution_timestamp or row.get("ord_dt", ""),
+                "qty": cumulative_filled_qty,
+                "price": avg_price_usd,
+                "avg_price_usd": avg_price_usd,
+                "filled_at": order_timestamp or row.get("ord_dt", ""),
+                "observed_at": order_timestamp or row.get("ord_dt", ""),
+                "order_timestamp": order_timestamp,
                 "order_no": order_no,
-                "broker_execution_id": broker_execution_id,
-                "execution_sequence": execution_sequence,
-                "execution_timestamp": execution_timestamp,
-                "requested_qty": int(row.get("ft_ord_qty") or row.get("ord_qty") or 0),
-                "filled_qty": int(row.get("ft_ccld_qty", 0) or 0),
-                "remaining_qty": int(row.get("nccs_qty") or row.get("rmn_qty") or 0),
-                "meta": {"is_synthetic": False, "fill_evidence_type": "KIS_ACTUAL", "broker_execution_id": broker_execution_id, "execution_sequence": execution_sequence, "execution_timestamp": execution_timestamp},
+                "requested_qty": requested_qty,
+                "cumulative_filled_qty": cumulative_filled_qty,
+                "remaining_qty": remaining_qty,
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "meta": {
+                    "is_synthetic": False,
+                    "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    "source_endpoint": "KIS_INQUIRE_CCNL",
+                    "cumulative_filled_qty": cumulative_filled_qty,
+                    "remaining_qty": remaining_qty,
+                    "requested_qty": requested_qty,
+                    "order_timestamp": order_timestamp,
+                    "observed_at": order_timestamp or row.get("ord_dt", ""),
+                },
                 "raw": row,
             })
         logger.info("[US_FILLS][OK] count=%d", len(fills))

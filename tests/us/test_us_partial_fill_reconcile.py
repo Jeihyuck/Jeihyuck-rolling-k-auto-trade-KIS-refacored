@@ -6,7 +6,7 @@ def memory(monkeypatch):
     monkeypatch.setattr(repos,'_get_engine_or_none',lambda:None); repos.reset_memory_stores()
     repos._MEM_ORDERS.append({'trade_date':'2026-07-16','order_no':'O1','client_order_key':'K1','symbol':'AMD','exchange':'NASDAQ','side':'SELL','qty_requested':10,'qty_filled':0,'status':'ACK','meta':{}})
 
-def execute(cumulative,evidence='KIS_ORDER_DETAIL_ACTUAL'):
+def execute(cumulative,evidence='KIS_ORDER_CUMULATIVE_ACTUAL'):
     return repos.mark_order_filled_by_reconcile(order_no='O1',client_order_key='K1',symbol='AMD',side='SELL',filled_qty=cumulative,requested_qty=10,cumulative_filled_qty=cumulative,avg_price_usd=100,source='fills_by_order_no',evidence_type=evidence,trade_date='2026-07-16')
 
 def test_kis_partial_fill_keeps_order_partially_filled():

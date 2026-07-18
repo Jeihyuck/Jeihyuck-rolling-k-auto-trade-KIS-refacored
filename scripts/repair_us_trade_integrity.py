@@ -94,22 +94,26 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
             counts["row_ids"].append({"table": table, "id": row_id})
             if "SYNTHETIC_DUPLICATES_KIS_ACTUAL" in issue.get("reasons", []):
                 counts["deleted_synthetic_duplicates"] += 1
-        grouped_actual = defaultdict(lambda: {"qty": 0, "value": 0.0, "sample": {}})
+        grouped_actual = {}
         for fill in actual_fills or []:
             order_no = str(fill.get("order_no") or "")
             symbol = str(fill.get("symbol") or "").upper()
             side = str(fill.get("side") or "").upper()
             if not order_no or not symbol or not side:
                 continue
-            qty = int(fill.get("qty") or fill.get("filled_qty") or 0)
-            price = float(fill.get("price_usd") or fill.get("price") or fill.get("avg_price") or 0)
+            qty = int(fill.get("cumulative_filled_qty") or fill.get("qty") or fill.get("filled_qty") or 0)
+            price = float(fill.get("avg_price_usd") or fill.get("price_usd") or fill.get("price") or fill.get("avg_price") or 0)
+            observed_at = str(fill.get("observed_at") or fill.get("order_timestamp") or fill.get("filled_at") or "")
             key = (trade_date, order_no, symbol, side)
-            grouped_actual[key]["qty"] += qty
-            grouped_actual[key]["value"] += qty * price
-            grouped_actual[key]["sample"] = fill
+            current = grouped_actual.get(key)
+            if current and qty < int(current.get("qty") or 0) and observed_at > str(current.get("observed_at") or ""):
+                counts["row_ids"].append({"table":"us_fills","order_no":order_no,"reason":"REPAIR_CUMULATIVE_SNAPSHOT_CONFLICT"})
+                continue
+            if current is None or qty > int(current.get("qty") or 0) or observed_at >= str(current.get("observed_at") or ""):
+                grouped_actual[key] = {"qty": qty, "avg_price": price, "sample": fill, "observed_at": observed_at}
         for (td, order_no, symbol, side), agg in grouped_actual.items():
             qty = int(agg["qty"] or 0)
-            avg_price = (float(agg["value"]) / qty) if qty else 0.0
+            avg_price = float(agg.get("avg_price") or 0.0)
             updated = conn.execute(text("""UPDATE us_orders SET qty_filled=:qty, avg_price_usd=:avg_price,
               status=CASE WHEN :qty < qty_requested THEN 'PARTIALLY_FILLED' ELSE 'FILLED' END,
               meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('remaining_qty',GREATEST(qty_requested-:qty,0),'repair_actual_cumulative_qty',:qty)
@@ -129,24 +133,19 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
                     counts["row_ids"].append({"table":"us_orders","order_no":order_no,"reason":"REPAIR_ORDER_IDENTITY_UNRESOLVED"})
             else:
                 counts["corrected_rows"] += int(updated.rowcount or 0)
-            # Do not insert aggregate KIS_REPAIR summary rows into us_fills.
-            # Only missing individual KIS executions are inserted idempotently.
-            running = 0
-            from trader.us.db.repos import canonical_actual_execution_key
-            for seq, fill in enumerate([f for f in (actual_fills or []) if str(f.get("order_no") or "") == order_no and str(f.get("symbol") or "").upper() == symbol and str(f.get("side") or "").upper() == side], start=1):
-                exec_qty = int(fill.get("qty") or fill.get("filled_qty") or 0)
-                exec_price = float(fill.get("price_usd") or fill.get("price") or fill.get("avg_price") or 0)
-                running += exec_qty
-                exec_ts = str(fill.get("execution_timestamp") or fill.get("filled_at") or "")
-                idem = canonical_actual_execution_key(trade_date=td, order_no=order_no, symbol=symbol, side=side,
-                    broker_execution_id=fill.get("broker_execution_id"), execution_sequence=fill.get("execution_sequence"),
-                    execution_timestamp=exec_ts, qty=exec_qty, price=exec_price, raw=fill.get("raw"))
-                conn.execute(text("""INSERT INTO us_fills(trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
-                  SELECT :td,:symbol,'NASDAQ',:side,:qty,:price,:order_no,client_order_key,:filled_at,
-                         jsonb_build_object('is_synthetic',false,'fill_evidence_type','KIS_ACTUAL','execution_sequence',:seq,'cumulative_filled_qty',:running),:idem
-                  FROM us_orders WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side LIMIT 1
-                  ON CONFLICT (fill_idempotency_key) DO NOTHING"""),
-                  {"td":td,"symbol":symbol,"side":side,"qty":exec_qty,"price":exec_price,"order_no":order_no,"filled_at":exec_ts,"seq":seq,"running":running,"idem":idem})
+            from trader.us.db.repos import canonical_kis_order_cumulative_key
+            idem = canonical_kis_order_cumulative_key(trade_date=td, order_no=order_no, symbol=symbol, side=side)
+            sample = agg.get("sample") or {}
+            requested_qty = int(sample.get("requested_qty") or sample.get("order_qty") or qty or 0)
+            remaining_qty = int(sample.get("remaining_qty") or max(requested_qty - qty, 0))
+            observed_at = str(agg.get("observed_at") or "")
+            conn.execute(text("""INSERT INTO us_fills(trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+              SELECT :td,:symbol,'NASDAQ',:side,:qty,:price,:order_no,client_order_key,:filled_at,
+                     jsonb_build_object('is_synthetic',false,'fill_evidence_type','KIS_ORDER_CUMULATIVE_ACTUAL','source_endpoint','KIS_INQUIRE_CCNL','cumulative_filled_qty',:qty,'requested_qty',:requested,'remaining_qty',:remaining,'observed_at',:filled_at),:idem
+              FROM us_orders WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side LIMIT 1
+              ON CONFLICT (fill_idempotency_key) DO UPDATE SET qty=EXCLUDED.qty, price_usd=EXCLUDED.price_usd, filled_at=EXCLUDED.filled_at, client_order_key=EXCLUDED.client_order_key, meta=us_fills.meta||EXCLUDED.meta
+              WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer,EXCLUDED.qty) >= COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer,us_fills.qty)"""),
+              {"td":td,"symbol":symbol,"side":side,"qty":qty,"price":avg_price,"order_no":order_no,"filled_at":observed_at,"requested":requested_qty,"remaining":remaining_qty,"idem":idem})
             conn.execute(text("""UPDATE us_fills SET meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('accounting_active',false,'superseded_by_kis_actual',true)
               WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side
               AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)"""),

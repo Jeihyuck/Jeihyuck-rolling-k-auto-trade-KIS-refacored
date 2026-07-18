@@ -507,7 +507,7 @@ def reconcile_ack_orders_with_balance(
                     filled_qty=fill_qty,
                     requested_qty=qty,
                     cumulative_filled_qty=fill_qty,
-                    evidence_type="KIS_ORDER_DETAIL_ACTUAL",
+                    evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
                     avg_price_usd=fill_price,
                     source="fills_reconcile",
                     trade_date=trade_date,

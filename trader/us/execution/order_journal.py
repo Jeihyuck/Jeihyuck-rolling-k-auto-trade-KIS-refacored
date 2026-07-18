@@ -147,7 +147,7 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                 result=mark_order_filled_by_reconcile(order_no=order_no,client_order_key=key,symbol=symbol,side=side,
                     filled_qty=cumulative,requested_qty=requested,cumulative_filled_qty=cumulative,
                     avg_price_usd=float(broker_fill.get("avg_price") or 0),source="fills_by_order_no",
-                    evidence_type="KIS_ORDER_DETAIL_ACTUAL",trade_date=trade_date,meta={"journal_replay":True})
+                    evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",trade_date=trade_date,meta={"journal_replay":True})
                 if result.get("status") == "EVIDENCE_QUANTITY_CONFLICT":
                     counts["identity_mismatch_count"] += 1; unresolved_symbol_sides.append([symbol,side])
                     append_order_event("JOURNAL_REPLAY_FAILED", ack, broker_order_no=order_no, broker_status="EVIDENCE_QUANTITY_CONFLICT", raw_response=result)

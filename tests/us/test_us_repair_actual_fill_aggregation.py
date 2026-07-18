@@ -1,14 +1,9 @@
 from pathlib import Path
-
 SRC=Path('scripts/repair_us_trade_integrity.py').read_text()
 
-
-def test_repair_groups_actual_fills_by_order_before_update():
-    assert 'grouped_actual = defaultdict' in SRC
-    assert 'grouped_actual[key]["qty"] += qty' in SRC
-    assert 'weighted_avg' not in SRC or 'avg_price' in SRC
-
-
-def test_repair_reconstructs_missing_order_or_quarantines_identity():
-    assert 'repair_reconstructed' in SRC
-    assert 'REPAIR_ORDER_IDENTITY_UNRESOLVED' in SRC
+def test_repair_selects_cumulative_snapshot_instead_of_summing_inquire_ccnl_rows():
+    assert 'grouped_actual = {}' in SRC
+    forbidden = 'grouped_actual[key]["qty"]' + ' += qty'
+    assert forbidden not in SRC
+    assert 'canonical_kis_order_cumulative_key' in SRC
+    assert 'KIS_ORDER_CUMULATIVE_ACTUAL' in SRC

@@ -22,7 +22,7 @@ def hanging(tick_cancellation_event=None):
     time.sleep(10)
 
 POSITIONS=[{'symbol':f'P{i}','qty':1,'current_px':1000+(i*10.0),'exchange':'NASDAQ'} for i in range(21)]
-ACTUAL=[{'symbol':f'P{i%21}','side':'SELL','qty':1,'price_usd':100,'order_no':f'F{i}','client_order_key':f'K{i}','meta':{'is_synthetic':False,'fill_evidence_type':'KIS_ACTUAL'}} for i in range(15)]
+ACTUAL=[{'symbol':f'P{i%21}','side':'SELL','qty':1,'price_usd':100,'order_no':f'F{i}','client_order_key':f'K{i}','meta':{'is_synthetic':False,'fill_evidence_type':'KIS_EXECUTION_ACTUAL'}} for i in range(15)]
 
 def test_20260716_connected_timeout_replay_and_close_accounting(tmp_path,monkeypatch):
     monkeypatch.chdir(tmp_path); monkeypatch.setenv('US_ORDER_JOURNAL_DIR',str(tmp_path/'journal'))

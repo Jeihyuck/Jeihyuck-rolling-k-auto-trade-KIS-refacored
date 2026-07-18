@@ -47,15 +47,15 @@ class Engine:
 
 def test_postgres_synthetic_promotion_actual_cumulative_full(monkeypatch):
     e=Engine(); monkeypatch.setattr(repos,"_get_engine_or_none",lambda:e)
-    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=6,requested_qty=10,cumulative_filled_qty=6,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
+    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=6,requested_qty=10,cumulative_filled_qty=6,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no")
     assert r["status"]=="OK" and e.order["qty_filled"]==6
     assert e.fills[0]["meta"]["accounting_active"] is False
-    assert e.fills[1]["qty"]==6 and "cumulative=6" in e.fills[1]["fill_idempotency_key"]
+    assert e.fills[1]["qty"]==6 and "KIS_ORDER_CUMULATIVE_ACTUAL" in e.fills[1]["fill_idempotency_key"]
 
 
 def test_postgres_promotion_rollback_keeps_synthetic_active(monkeypatch):
     e=Engine(fail_insert=True); monkeypatch.setattr(repos,"_get_engine_or_none",lambda:e)
-    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=6,requested_qty=10,cumulative_filled_qty=6,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
+    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=6,requested_qty=10,cumulative_filled_qty=6,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no")
     assert r["status"]=="RECONCILE_UPDATE_FAILED"
     assert e.order["qty_filled"]==3 and e.fills[0]["meta"].get("accounting_active", True) is True
 
@@ -63,6 +63,6 @@ def test_postgres_promotion_rollback_keeps_synthetic_active(monkeypatch):
 def test_postgres_actual_smaller_than_synthetic_conflicts_before_update(monkeypatch):
     e=Engine(); e.order["qty_filled"]=10; e.fills[0]["qty"]=10; e.fills[0]["meta"]["cumulative_filled_qty"]=10
     monkeypatch.setattr(repos,"_get_engine_or_none",lambda:e)
-    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=7,requested_qty=10,cumulative_filled_qty=7,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
+    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=7,requested_qty=10,cumulative_filled_qty=7,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no")
     assert r["status"]=="EVIDENCE_QUANTITY_CONFLICT"
     assert e.order["qty_filled"]==10 and e.fills[0]["meta"].get("accounting_active", True) is True

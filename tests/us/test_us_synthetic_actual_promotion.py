@@ -8,19 +8,19 @@ def _seed():
 
 def test_kis_actual_promotes_equal_cumulative_synthetic():
     _seed(); repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=3,requested_qty=10,cumulative_filled_qty=3,avg_price_usd=100,trade_date="2026-07-16",evidence_type="BALANCE_DELTA_SYNTHETIC")
-    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=3,requested_qty=10,cumulative_filled_qty=3,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
+    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=3,requested_qty=10,cumulative_filled_qty=3,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no")
     assert r["synthetic_superseded_count"] == 1 and any(not repos.is_synthetic_fill_meta(f["meta"]) for f in repos._MEM_FILLS)
 
 
 def test_kis_actual_supersedes_prior_synthetic_partial():
     _seed(); repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=3,requested_qty=10,cumulative_filled_qty=3,avg_price_usd=100,trade_date="2026-07-16",evidence_type="BALANCE_DELTA_SYNTHETIC")
-    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=6,requested_qty=10,cumulative_filled_qty=6,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
+    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=6,requested_qty=10,cumulative_filled_qty=6,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no")
     assert r["synthetic_superseded_count"] == 1 and repos._MEM_ORDERS[0]["qty_filled"] == 6
 
 
 def test_actual_smaller_than_synthetic_is_quarantined():
     _seed(); repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=10,requested_qty=10,cumulative_filled_qty=10,avg_price_usd=100,trade_date="2026-07-16",evidence_type="BALANCE_DELTA_SYNTHETIC")
-    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=7,requested_qty=10,cumulative_filled_qty=7,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_DETAIL_ACTUAL",source="fills_by_order_no")
+    r=repos.mark_order_filled_by_reconcile(order_no="O1",client_order_key="K",symbol="AMD",side="SELL",filled_qty=7,requested_qty=10,cumulative_filled_qty=7,avg_price_usd=100,trade_date="2026-07-16",evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",source="fills_by_order_no")
     assert r["status"] == "EVIDENCE_QUANTITY_CONFLICT" and r["synthetic_cumulative"] == 10
 
 
