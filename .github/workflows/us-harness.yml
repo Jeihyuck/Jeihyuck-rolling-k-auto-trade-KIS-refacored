@@ -7,7 +7,6 @@ on:
       - "trader/us/**"
       - "tests/us/**"
       - "config/us_*.yaml"
-      - "scripts/pr68_patch_*.py"
       - ".github/workflows/us-harness.yml"
   workflow_dispatch:
 
@@ -16,6 +15,21 @@ jobs:
     name: "US Offline Harness QA"
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: us_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d us_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     env:
       TRADING_REGION: "US"
       KIS_ENV: "practice"
@@ -23,6 +37,7 @@ jobs:
       DRY_RUN: "1"
       ALLOW_REAL_ORDER: "0"
       PYTHONPATH: "."
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/us_ci
 
     steps:
       - name: Checkout
@@ -35,19 +50,24 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Apply staged PR68 patches
-        shell: bash
         run: |
-          if [[ -f scripts/pr68_patch_1.py ]]; then
-            python scripts/pr68_patch_1.py
-            python scripts/pr68_patch_2.py
-            python scripts/pr68_patch_3.py
-            python scripts/pr68_patch_4.py
-          fi
+          python -m pip install -r requirements.txt
+          python -m pip install psycopg2-binary
 
-      - name: Run pytest (tests/us)
+      - name: Byte compile critical US modules
+        run: |
+          python -m py_compile \
+            trader/us/execution/kis_us_client.py \
+            trader/us/execution/fills.py \
+            trader/us/execution/order_router.py \
+            trader/us/execution/order_journal.py \
+            trader/us/execution/reconcile.py \
+            trader/us/db/repos.py \
+            trader/us/runner/trade_tick_runner.py \
+            trader/us/runner/trade_close_runner.py \
+            scripts/repair_us_trade_integrity.py
+
+      - name: Run pytest (tests/us, including real PostgreSQL integration)
         shell: bash
         run: |
           set -o pipefail
