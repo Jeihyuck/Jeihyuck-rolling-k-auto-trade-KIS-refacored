@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-02
+# US Daily Report - 2026-07-18
 
 ## Required Fields
 
-- trade_date: 2026-05-02
+- trade_date: 2026-07-18
 - branch: 68/merge
 - commit_sha: test-sha
 - run_id: 25718405741
@@ -16,12 +16,12 @@
 - actor: Jeihyuck
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-07-19T01:11:11.994593Z
-- started_at_et: 2026-07-18T21:11:11.993265-04:00
-- started_at_kst: 2026-07-19T10:11:11.994593+09:00
-- ended_at_utc: 2026-07-19T01:11:11.994593Z
-- ended_at_et: 2026-07-18T21:11:11.994582-04:00
-- ended_at_kst: 2026-07-19T10:11:11.994593+09:00
+- started_at_utc: 2026-07-19T01:11:11.998712Z
+- started_at_et: 2026-07-18T21:11:11.996658-04:00
+- started_at_kst: 2026-07-19T10:11:11.998712+09:00
+- ended_at_utc: 2026-07-19T01:11:11.998712Z
+- ended_at_et: 2026-07-18T21:11:11.998703-04:00
+- ended_at_kst: 2026-07-19T10:11:11.998712+09:00
 - wall_elapsed_sec: 0.0
 - code_version_source: github_actions
 - dry_run: True
@@ -38,9 +38,9 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_1
-- final_status: SKIP
-- reason: not_trading_day
+- last_stage: tick_2
+- final_status: OK
+- reason: max_ticks
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 
@@ -72,7 +72,7 @@
 - market_regime: NEUTRAL
 - capital_scale: 1.0
 - sector_cap_enforced: False
-- trade_block_reason: not_trading_day
+- trade_block_reason: 
 - blocked_entry_reason_counts: {}
 
 ## Broker/Reconcile Classification

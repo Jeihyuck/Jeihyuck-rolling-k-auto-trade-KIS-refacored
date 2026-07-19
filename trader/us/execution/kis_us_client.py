@@ -901,135 +901,102 @@ class KisUSClient:
     # ------------------------------------------------------------------
 
     def get_us_fills_today(self, trade_date: str | None = None) -> list[dict]:
-        """당일 체결 내역 조회.
-        
-        Args:
-            trade_date: YYYY-MM-DD 형식. None이면 NY 기준 오늘.
-            
-        Returns:
-            체결 내역 list
+        """Return all same-day overseas order/fill snapshots from KIS practice.
+
+        The practice contract requires blank PDNO/OVRS_EXCG_CD/ORD_DT and date
+        range fields. Pagination follows tr_cont plus CTX_AREA_NK200/FK200.
         """
         self._assert_not_offline("get_us_fills_today")
         tr = get_tr_info("us_fills_today")
         headers = self._build_headers(tr["tr_id"])
-        
-        # trade_date 처리: YYYY-MM-DD → YYYYMMDD
+
         if trade_date:
             ord_dt = trade_date.replace("-", "")
         else:
-            # NY 기준 today
             from zoneinfo import ZoneInfo
             from datetime import datetime as dt
-            ny_tz = ZoneInfo("America/New_York")
-            ord_dt = dt.now(tz=ny_tz).strftime("%Y%m%d")
-        
-        # Schema fallback: ALL_DATES first, then ORD_DT, then ORD_RANGE
-        schemas = ["ALL_DATES", "ORD_DT", "ORD_RANGE"]
-        errors = []
+            ord_dt = dt.now(tz=ZoneInfo("America/New_York")).strftime("%Y%m%d")
 
-        for schema in schemas:
-            params = self._build_us_fills_params(ord_dt, schema)
+        params = self._build_us_fills_params(ord_dt, "PRACTICE_RANGE")
+        all_rows: list[dict] = []
+        seen_cursors: set[tuple[str, str]] = set()
+        max_pages = 10
+
+        for page_index in range(max_pages):
+            page_headers = dict(headers)
+            if page_index > 0:
+                page_headers["tr_cont"] = "N"
             logger.info(
-                "[US_FILLS][REQUEST] schema=%s ord_dt=%s endpoint=inquire-ccnl",
-                schema,
+                "[US_FILLS][REQUEST] schema=PRACTICE_RANGE ord_dt=%s endpoint=inquire-ccnl page=%d",
                 ord_dt,
+                page_index + 1,
             )
-
             try:
                 result = self._get(
                     tr["path"],
-                    headers=headers,
+                    headers=page_headers,
                     params=params,
                     suppress_final_log=True,
                 )
-                fills = result.get("output") or []
-                logger.info(
-                    "[US_FILLS][FETCHED] count=%d status=OK schema=%s",
-                    len(fills),
-                    schema,
-                )
-                return fills
-
             except Exception as exc:
                 error_msg = str(exc)
-                errors.append({"schema": schema, "error": error_msg})
-
-                if "INPUT_FIELD_NAME" in error_msg:
-                    missing_field = _extract_input_field_name(error_msg)
-                    logger.warning(
-                        "[US_FILLS][SCHEMA_RETRY] failed_schema=%s missing_field=%s msg=%s",
-                        schema,
-                        missing_field,
-                        error_msg,
-                    )
-                    continue
-
                 if "EGW002" in error_msg or "RATE" in error_msg.upper():
-                    logger.warning(
-                        "[US_FILLS][ERROR][TEMP] schema=%s msg=%s",
-                        schema,
-                        error_msg,
-                    )
                     raise KisUSTemporaryError(f"KIS temporary error: {error_msg}") from exc
+                raise KisUSClientError(f"KIS fills contract error: {error_msg}") from exc
 
-                missing_field = _extract_input_field_name(error_msg)
-                logger.warning(
-                    "[US_FILLS][SCHEMA_RETRY] failed_schema=%s missing_field=%s msg=%s",
-                    schema,
-                    missing_field,
-                    error_msg,
+            rows = result.get("output") or []
+            if isinstance(rows, dict):
+                rows = [rows]
+            all_rows.extend(row for row in rows if isinstance(row, dict))
+
+            response_meta = result.get("_response_meta") if isinstance(result.get("_response_meta"), dict) else {}
+            tr_cont = str(response_meta.get("tr_cont") or "").upper()
+            nk200 = str(result.get("ctx_area_nk200") or result.get("CTX_AREA_NK200") or "")
+            fk200 = str(result.get("ctx_area_fk200") or result.get("CTX_AREA_FK200") or "")
+            if tr_cont not in {"M", "F"}:
+                logger.info(
+                    "[US_FILLS][FETCHED] count=%d pages=%d status=OK schema=PRACTICE_RANGE",
+                    len(all_rows),
+                    page_index + 1,
                 )
-                continue
+                return all_rows
 
-        logger.error(
-            "[US_FILLS][ERROR][CONTRACT] all_schemas_failed errors=%s",
-            errors,
-        )
-        raise KisUSClientError(
-            f"KIS fills contract error: all schemas failed: {errors}"
-        )
+            cursor = (nk200, fk200)
+            if cursor == ("", "") or cursor in seen_cursors:
+                raise KisUSClientError(
+                    f"KIS fills pagination contract error: tr_cont={tr_cont!r} cursor={cursor!r}"
+                )
+            seen_cursors.add(cursor)
+            params = dict(params)
+            params["CTX_AREA_NK200"] = nk200
+            params["CTX_AREA_FK200"] = fk200
+
+        raise KisUSClientError(f"KIS fills pagination exceeded max_pages={max_pages}")
 
     def get_us_today_orders(self, trade_date: str | None = None) -> list[dict]:
         """Return KIS same-day overseas order/fill rows for status normalization."""
         return self.get_us_fills_today(trade_date=trade_date)
 
     def _build_us_fills_params(self, ord_dt: str, schema: str) -> dict:
-        """US fills inquiry params를 schema에 따라 생성.
-        
-        Args:
-            ord_dt: YYYYMMDD 형식 날짜
-            schema: "ALL_DATES", "ORD_DT" 또는 "ORD_RANGE"
-            
-        Returns:
-            KIS fills inquiry params dict
-        """
-        base = {
+        """Build the official KIS practice inquire-ccnl parameter contract."""
+        if schema not in {"PRACTICE_RANGE", "ALL_DATES", "ORD_DT", "ORD_RANGE"}:
+            raise ValueError(f"unknown fills schema: {schema}")
+        return {
             "CANO": self._cano,
             "ACNT_PRDT_CD": self._acnt_prdt_cd,
             "PDNO": "",
-            "ORD_GNO_BRNO": "",
-            "ODNO": "",
+            "ORD_STRT_DT": ord_dt,
+            "ORD_END_DT": ord_dt,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
-            "OVRS_EXCG_CD": "NASD",
+            "OVRS_EXCG_CD": "",
             "SORT_SQN": "DS",
-            "CTX_AREA_FK200": "",
+            "ORD_DT": "",
+            "ORD_GNO_BRNO": "",
+            "ODNO": "",
             "CTX_AREA_NK200": "",
+            "CTX_AREA_FK200": "",
         }
-
-        if schema == "ALL_DATES":
-            base["ORD_DT"] = ord_dt
-            base["ORD_STRT_DT"] = ord_dt
-            base["ORD_END_DT"] = ord_dt
-        elif schema == "ORD_DT":
-            base["ORD_DT"] = ord_dt
-        elif schema == "ORD_RANGE":
-            base["ORD_STRT_DT"] = ord_dt
-            base["ORD_END_DT"] = ord_dt
-        else:
-            raise ValueError(f"unknown fills schema: {schema}")
-
-        return base
 
     # ------------------------------------------------------------------
     # HTTP helpers

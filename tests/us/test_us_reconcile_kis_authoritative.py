@@ -120,7 +120,11 @@ class TestReconcileKisAuthoritative:
             result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
 
             assert result["status"] == "OK"
-            mock_save.assert_not_called()
+            mock_save.assert_called_once()
+        args, kwargs = mock_save.call_args
+        assert args[0] == []
+        assert kwargs["authoritative_positions"] is True
+        assert kwargs["preserve_previous_positions"] is False
 
     def test_error_balance_returns_error_status(self):
         from trader.us.execution.reconcile import reconcile_positions

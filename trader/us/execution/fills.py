@@ -101,6 +101,14 @@ def get_fills_today(
             cumulative_filled_qty = int(row.get("ft_ccld_qty", 0) or 0)
             remaining_qty = int(row.get("nccs_qty") or row.get("rmn_qty") or 0)
             avg_price_usd = float(row.get("ft_ccld_unpr3", 0) or 0)
+            if cumulative_filled_qty <= 0:
+                logger.debug(
+                    "[US_FILLS][SKIP_UNFILLED_ORDER] order_no=%s symbol=%s remaining_qty=%s",
+                    order_no,
+                    row.get("pdno", ""),
+                    remaining_qty,
+                )
+                continue
             fills.append({
                 "symbol": row.get("pdno", ""),
                 "exchange": row.get("ovrs_excg_cd", ""),

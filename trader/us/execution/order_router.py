@@ -331,12 +331,7 @@ def route_order(
                 "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
 
     def _persist_with_trade_date(func, payload):
-        try:
-            return func(payload, trade_date=trade_date)
-        except TypeError:
-            # Compatibility for older injected test adapters; production repo
-            # functions accept and receive the explicit US trade_date above.
-            return func(payload)
+        return func(payload, trade_date=trade_date)
 
     logger.info(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
@@ -576,7 +571,7 @@ def route_order(
                 try:
                     from trader.us.db.repos import load_us_positions_by_symbols
 
-                    db_positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                    db_positions = load_us_positions_by_symbols([symbol], as_of=trade_date) if symbol else {}
                     db_pos = db_positions.get(symbol, {})
                     if db_pos:
                         pre_qty = int(db_pos.get("qty") or db_pos.get("holding_qty") or 0)

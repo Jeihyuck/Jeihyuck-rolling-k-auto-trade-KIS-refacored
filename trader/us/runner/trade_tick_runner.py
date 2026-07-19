@@ -858,13 +858,10 @@ def run_trade_tick(
     try:
         if should_reconcile_balance:
             from trader.us.execution.reconcile import reconcile_positions
-            try:
-                recon = reconcile_positions(provider=provider, trade_date=trade_date)
-            except TypeError:
-                recon = reconcile_positions(provider=provider)
+            recon = reconcile_positions(provider=provider, trade_date=trade_date)
         else:
             from trader.us.db.repos import load_positions as _load_positions_for_reconcile_skip
-            _positions = _load_positions_for_reconcile_skip()
+            _positions = _load_positions_for_reconcile_skip(trade_date)
             recon = {
                 "status": "SKIPPED_BALANCE_RECONCILE",
                 "reason": "reconcile_interval_skip",
@@ -872,15 +869,38 @@ def run_trade_tick(
                 "position_count": len(_positions),
                 "position_symbols": [str(p.get("symbol") or "").upper() for p in _positions if p.get("symbol")],
                 "block_new_entry": False,
+                "authoritative_positions": False,
+                "preserve_previous_positions": True,
             }
         logger.info(
             "[US_RECONCILE][DONE] status=%s positions=%s",
             recon.get("status"),
             recon.get("position_count", 0),
         )
+    except TypeError as exc:
+        logger.error("[US_RECONCILE][CONTRACT_ERROR] %s", exc)
+        recon = {
+            "status": "CONTRACT_ERROR",
+            "reason": "reconcile_internal_type_error",
+            "error": str(exc),
+            "block_new_entry": True,
+            "authoritative_positions": False,
+            "preserve_previous_positions": True,
+            "positions": [],
+            "position_count": 0,
+        }
     except Exception as exc:
-        logger.warning("[US_RECONCILE][WARN] %s", exc)
-        recon = {"status": "WARN", "error": str(exc), "block_new_entry": False}
+        logger.error("[US_RECONCILE][ERROR] %s", exc)
+        recon = {
+            "status": "ERROR",
+            "reason": "reconcile_failed",
+            "error": str(exc),
+            "block_new_entry": True,
+            "authoritative_positions": False,
+            "preserve_previous_positions": True,
+            "positions": [],
+            "position_count": 0,
+        }
     
     # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
     if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
@@ -1010,12 +1030,29 @@ def run_trade_tick(
     # fills DB 저장
     if fills_today:
         try:
-            try:
-                save_fills(fills_today, trade_date=trade_date)
-            except TypeError:
-                save_fills(fills_today)
+            from trader.us.db.repos import save_fills_with_result
+            fill_save_result = save_fills_with_result(fills_today, trade_date=trade_date)
         except Exception as exc:
-            logger.warning("[US_TICK][WARN] save_fills failed: %s", exc)
+            logger.error("[US_TICK][FILL_SAVE_ERROR] %s", exc)
+            fill_save_result = {"status": "DB_ERROR", "error": str(exc)}
+        if fill_save_result.get("status") != "OK":
+            logger.error("[US_TICK][FAILED] reason=fill_persistence_failed result=%s", fill_save_result)
+            return {
+                "status": "FAILED",
+                "reason": "fill_persistence_failed",
+                "session": session,
+                "orders": [],
+                "ack": 0,
+                "dry_run": 0,
+                "blocked": 0,
+                "signal_only": 0,
+                "errors": 1,
+                "trade_date": trade_date,
+                "fills": len(fills_today),
+                "positions": int(recon.get("position_count") or 0),
+                "fill_save_result": fill_save_result,
+                "block_new_entry": True,
+            }
         try:
             _mark_trend_stages_from_records(fills_today, trade_date=trade_date, status="FILLED")
         except Exception as exc:
@@ -1048,16 +1085,36 @@ def run_trade_tick(
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
-    if recon.get("preserve_previous_positions"):
-        logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
-    elif recon_positions:
+    authoritative_recon = bool(
+        recon.get("status") == "OK"
+        and recon.get("balance_fetch_status") == "OK"
+        and recon.get("authoritative_positions") is True
+        and recon.get("preserve_previous_positions") is False
+    )
+    if authoritative_recon:
         try:
-            try:
-                save_position_snapshot(recon_positions, trade_date=trade_date)
-            except TypeError:
-                save_position_snapshot(recon_positions)
+            save_position_snapshot(
+                recon_positions,
+                trade_date=trade_date,
+                balance_fetch_status="OK",
+                balance_parse_status="OK",
+                authoritative_positions=True,
+                preserve_previous_positions=False,
+                close_source="kis_tick_balance",
+            )
         except Exception as exc:
-            logger.warning("[US_TICK][WARN] save_position_snapshot failed: %s", exc)
+            logger.error("[US_TICK][POSITION_PERSIST_ERROR] %s", exc)
+            return {
+                "status": "FAILED",
+                "reason": "authoritative_position_persist_failed",
+                "session": session,
+                "orders": [],
+                "errors": 1,
+                "trade_date": trade_date,
+                "block_new_entry": True,
+            }
+    elif recon.get("preserve_previous_positions"):
+        logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
 
     # reconcile log DB 저장
     try:
@@ -1068,21 +1125,17 @@ def run_trade_tick(
             "total_pvs": recon.get("total_pvs_usd", 0),
             "detail": {"session": session},
         }
-        try:
-            save_reconcile_log(payload, trade_date=trade_date)
-        except TypeError:
-            save_reconcile_log(payload)
+        save_reconcile_log(payload, trade_date=trade_date)
     except Exception as exc:
         logger.warning("[US_TICK][WARN] save_reconcile_log failed: %s", exc)
 
     # ── 현재 포지션 ───────────────────────────────────────────────────────────
-    # reconcile 결과 우선, 비어 있으면 DB fallback
     from trader.us.db.repos import load_positions as db_load_positions
-    if recon_positions:
-        current_positions = recon_positions
+    if authoritative_recon:
+        current_positions = list(recon_positions)
     else:
         try:
-            current_positions = db_load_positions()
+            current_positions = db_load_positions(trade_date)
         except Exception:
             current_positions = []
     try:

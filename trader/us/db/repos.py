@@ -1283,6 +1283,8 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                 )
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
+        if authoritative_positions:
+            raise
     logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", count)
     return count
 

@@ -106,7 +106,37 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             fills_status = "DB_ERROR"
             fills_error = str(exc)
 
-        # 3. Reconcile
+        # 3. Final ACK reconciliation against the just-saved KIS snapshots.
+        ack_reconcile_result: dict = {
+            "status": "SKIP",
+            "pending_count": 0,
+            "confirmed_count": 0,
+            "balance_reconcile_count": 0,
+            "unresolved_count": 0,
+            "failed_count": 0,
+        }
+        if not offline:
+            try:
+                from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+                ack_reconcile_result = reconcile_ack_orders_with_balance(
+                    provider=provider,
+                    trade_date=trade_date,
+                    env=env,
+                )
+                logger.info("[US_TRADE_CLOSE][ACK_RECONCILE] result=%s", ack_reconcile_result)
+            except Exception as exc:
+                ack_reconcile_result = {
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "pending_count": 0,
+                    "confirmed_count": 0,
+                    "balance_reconcile_count": 0,
+                    "unresolved_count": 0,
+                    "failed_count": 1,
+                }
+                logger.error("[US_TRADE_CLOSE][ACK_RECONCILE_ERROR] %s", exc)
+
+        # 4. Reconcile
         reconcile_result: dict = {
             "status": "SKIP",
             "balance_fetch_status": "SKIP",
@@ -240,6 +270,13 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         pending_count = int(close_order_classification.get("pending_order_count") or 0)
         report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
         reconcile_status = str(reconcile_result.get("status") or "UNKNOWN").upper()
+        ack_reconcile_status = str(ack_reconcile_result.get("status") or "UNKNOWN").upper()
+        ack_reconcile_failed = bool(
+            ack_reconcile_status not in {"OK", "SKIP"}
+            or int(ack_reconcile_result.get("failed_count") or 0) > 0
+        )
+        ack_unresolved_count = int(ack_reconcile_result.get("unresolved_count") or 0)
+        pending_count = max(pending_count, ack_unresolved_count)
         reconcile_error_statuses = {
             "CONTRACT_ERROR",
             "FATAL_ERROR",
@@ -254,6 +291,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}
             or position_snapshot_error
             or reconcile_status in reconcile_error_statuses
+            or ack_reconcile_failed
         ):
             report_consistency = "FAILED"
         report_failed = (
@@ -264,6 +302,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         if fills_status in {"CONTRACT_ERROR", "DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
             status = "ERROR"
         elif reconcile_status in reconcile_error_statuses:
+            status = "ERROR"
+        elif ack_reconcile_failed:
             status = "ERROR"
         elif position_snapshot_error:
             status = "ERROR"
@@ -301,6 +341,8 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "fills_count": len(fills),
             "positions_count": len(positions),
             "reconcile_status": reconcile_status,
+            "ack_reconcile_status": ack_reconcile_status,
+            "ack_reconcile_result": ack_reconcile_result,
             "balance": balance,
             "close_entry_enabled": close_entry_enabled,
             "order_final_classification": close_order_classification.get("orders", []),

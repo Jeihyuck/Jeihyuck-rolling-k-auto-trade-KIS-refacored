@@ -181,43 +181,46 @@ def reconcile_positions(provider: Any | None = None, *, trade_date: str | None =
         total_pvs_source,
     )
 
-    if positions:
-        logger.info(
-            "[US_RECONCILE][AUTHORITATIVE] source=kis_balance positions=%d symbols=%s",
-            len(positions),
-            ",".join(position_symbols),
+    logger.info(
+        "[US_RECONCILE][AUTHORITATIVE] source=kis_balance positions=%d symbols=%s",
+        len(positions),
+        ",".join(position_symbols),
+    )
+    try:
+        from trader.us.db.repos import save_position_snapshot
+        saved = save_position_snapshot(
+            positions,
+            trade_date=trade_date,
+            balance_fetch_status="OK",
+            balance_parse_status="OK",
+            authoritative_positions=True,
+            preserve_previous_positions=False,
+            close_source="kis_reconcile_balance",
         )
-        try:
-            from trader.us.db.repos import save_position_snapshot
-            saved = save_position_snapshot(
-                positions,
-                trade_date=trade_date,
-                balance_fetch_status="OK",
-                balance_parse_status="OK",
-                authoritative_positions=True,
-                preserve_previous_positions=False,
-                close_source="kis_reconcile_balance",
+        if positions and int(saved or 0) < len(positions):
+            raise RuntimeError(
+                f"authoritative position persistence incomplete saved={saved} expected={len(positions)}"
             )
-            logger.info(
-                "[US_RECONCILE][UPSERT_POSITIONS] count=%d source=kis_balance_authoritative",
-                saved,
-            )
-        except Exception as exc:
-            logger.error("[US_RECONCILE][UPSERT_ERROR] failed to persist authoritative positions: %s", exc)
-            return {
-                "status": "POSITION_PERSIST_ERROR",
-                "reason": "authoritative_position_persist_failed",
-                "error": str(exc),
-                "position_count": len(positions),
-                "total_pvs": total_pvs,
-                "positions": positions,
-                "position_symbols": position_symbols,
-                "balance_parse_status": balance_parse_status,
-                "balance_fetch_status": "OK",
-                "authoritative_positions": True,
-                "preserve_previous_positions": True,
-                "block_new_entry": True,
-            }
+        logger.info(
+            "[US_RECONCILE][UPSERT_POSITIONS] count=%d source=kis_balance_authoritative",
+            saved,
+        )
+    except Exception as exc:
+        logger.error("[US_RECONCILE][UPSERT_ERROR] failed to persist authoritative positions: %s", exc)
+        return {
+            "status": "POSITION_PERSIST_ERROR",
+            "reason": "authoritative_position_persist_failed",
+            "error": str(exc),
+            "position_count": len(positions),
+            "total_pvs": total_pvs,
+            "positions": positions,
+            "position_symbols": position_symbols,
+            "balance_parse_status": balance_parse_status,
+            "balance_fetch_status": "OK",
+            "authoritative_positions": True,
+            "preserve_previous_positions": True,
+            "block_new_entry": True,
+        }
 
     return {
         "status": "OK",

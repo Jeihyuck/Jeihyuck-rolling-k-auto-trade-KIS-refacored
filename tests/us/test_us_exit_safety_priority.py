@@ -27,13 +27,13 @@ def test_run_trade_tick_hard_stop_skips_trend_loader(monkeypatch):
         def get_client_stats(self): return self.stats
     monkeypatch.setattr("trader.us.data_provider.USDataProvider", lambda offline=False: Provider())
     positions = [{"symbol":"AMD","exchange":"NASDAQ","qty":10,"orderable_qty":10,"entry_price":100.0,"current_price_usd":90.0}]
-    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None: {"status":"OK","positions":positions,"total_pvs_usd":10000})
+    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None, trade_date=None: {"status":"OK","positions":positions,"total_pvs_usd":10000,"balance_fetch_status":"OK","balance_parse_status":"OK","authoritative_positions":True,"preserve_previous_positions":False})
     monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda provider=None, signal_only=False, trade_date=None: {"status":"OK","fills":[]})
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_ack_orders_with_balance", lambda provider=None, trade_date=None, env="practice": {"status":"OK","confirmed_orders":[]})
     monkeypatch.setattr("trader.us.db.repos.save_fills", lambda fills: 0)
     monkeypatch.setattr("trader.us.db.repos.load_today_symbols_sold", lambda trade_date=None: set())
-    monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda positions: 0)
-    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda log: True)
+    monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda positions, **kwargs: 0)
+    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda log, **kwargs: True)
     monkeypatch.setattr("trader.us.db.repos.get_today_buy_orders_count", lambda trade_date, env="practice": 0)
     monkeypatch.setattr("trader.us.db.repos.load_latest_us_prep_status", lambda trade_date, *a, **k: {"status":"OK","contract_version":"us_sector_rotation_v3","market_regime_version":"us_leading_regime_v1","final30_trade_ready":True,"score_nonzero_count":30,"final30_scored_count":30})
     def boom(*a, **k):
@@ -77,13 +77,13 @@ def test_run_trade_tick_soft_stop_state_and_price_once(monkeypatch):
         def get_client_stats(self): return self.stats
     monkeypatch.setattr("trader.us.data_provider.USDataProvider", lambda offline=False: Provider())
     positions = [{"symbol":"AMD","exchange":"NASDAQ","qty":10,"orderable_qty":10,"entry_price":100.0,"current_price_usd":94.9,"position_lifecycle_id":"L1"}]
-    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None: {"status":"OK","positions":positions,"total_pvs_usd":10000})
+    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None, trade_date=None: {"status":"OK","positions":positions,"total_pvs_usd":10000,"balance_fetch_status":"OK","balance_parse_status":"OK","authoritative_positions":True,"preserve_previous_positions":False})
     monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda provider=None, signal_only=False, trade_date=None: {"status":"OK","fills":[]})
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_ack_orders_with_balance", lambda provider=None, trade_date=None, env="practice": {"status":"OK","confirmed_orders":[]})
     monkeypatch.setattr("trader.us.db.repos.save_fills", lambda fills: 0)
     monkeypatch.setattr("trader.us.db.repos.load_today_symbols_sold", lambda trade_date=None: set())
-    monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda positions: 0)
-    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda log: True)
+    monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda positions, **kwargs: 0)
+    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda log, **kwargs: True)
     monkeypatch.setattr("trader.us.db.repos.get_today_buy_orders_count", lambda trade_date, env="practice": 0)
     monkeypatch.setattr("trader.us.db.repos.load_latest_us_prep_status", lambda trade_date, *a, **k: {"status":"OK","contract_version":"us_sector_rotation_v3","market_regime_version":"us_leading_regime_v1","final30_trade_ready":True,"score_nonzero_count":30,"final30_scored_count":30})
     def risk(*a, **k): calls["risk"] += 1; return {"soft_stop_breach_count": 1}

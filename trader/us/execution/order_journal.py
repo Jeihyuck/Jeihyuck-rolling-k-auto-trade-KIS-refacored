@@ -150,6 +150,29 @@ def replay_order_journal(trade_date: str, session_run_id: str | None = None,
                                        "avg_price": float(best.get("avg_price") or best.get("price") or best.get("price_usd") or 0),
                                        "symbol": best.get("symbol"), "side": best.get("side"),
                                        "status": "EVIDENCE_QUANTITY_REGRESSION" if later_regression else best.get("status")}
+            broker_fill_status = str(
+                (broker_fill or {}).get("evidence_status")
+                or (broker_fill or {}).get("status")
+                or "OK"
+            ).upper()
+            if broker_fill_status in {
+                "EVIDENCE_QUANTITY_REGRESSION",
+                "EVIDENCE_QUANTITY_CONFLICT",
+                "EVIDENCE_QUANTITY_OVERFLOW",
+                "FILL_ACCOUNTING_INVARIANT_FAILED",
+                "CONTRACT_ERROR",
+                "RECONCILE_UPDATE_FAILED",
+            }:
+                counts["failed_count"] += 1
+                unresolved_symbol_sides.append([symbol, side])
+                append_order_event(
+                    "JOURNAL_REPLAY_FAILED",
+                    ack,
+                    broker_order_no=order_no,
+                    broker_status=broker_fill_status,
+                    raw_response=broker_fill,
+                )
+                continue
             if broker_fill and int(broker_fill.get("filled_qty") or 0) > 0:
                 if str(broker_fill.get("symbol") or symbol).upper()!=symbol or str(broker_fill.get("side") or side).upper()!=side:
                     counts["identity_mismatch_count"] += 1; unresolved_symbol_sides.append([symbol,side]); continue

@@ -34,6 +34,16 @@ def _is_synthetic(row: dict) -> bool:
                 or meta.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
 
 
+def validate_repair_cumulative(*, qty: int, requested_qty: int) -> dict:
+    qty = int(qty or 0)
+    requested_qty = int(requested_qty or 0)
+    if qty < 0:
+        return {"status": "EVIDENCE_QUANTITY_INVALID", "qty": qty, "requested_qty": requested_qty}
+    if requested_qty > 0 and qty > requested_qty:
+        return {"status": "EVIDENCE_QUANTITY_OVERFLOW", "qty": qty, "requested_qty": requested_qty}
+    return {"status": "OK", "qty": qty, "requested_qty": requested_qty}
+
+
 def audit(orders: list[dict], fills: list[dict]) -> dict:
     key_symbols, order_symbols = defaultdict(set), defaultdict(set)
     actual_by_order = {}
@@ -120,6 +130,23 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
                 continue
             qty = int(agg["qty"] or 0)
             avg_price = float(agg.get("avg_price") or 0.0)
+            existing_order = conn.execute(
+                text("""SELECT qty_requested FROM us_orders
+                        WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side
+                        FOR UPDATE"""),
+                {"td": td, "order_no": order_no, "symbol": symbol, "side": side},
+            ).mappings().first()
+            existing_requested = int((existing_order or {}).get("qty_requested") or 0)
+            validation = validate_repair_cumulative(qty=qty, requested_qty=existing_requested)
+            if validation["status"] != "OK":
+                counts["row_ids"].append({
+                    "table": "us_orders",
+                    "order_no": order_no,
+                    "reason": validation["status"],
+                    "observed_cumulative": qty,
+                    "requested_qty": existing_requested,
+                })
+                continue
             updated = conn.execute(text("""UPDATE us_orders SET qty_filled=:qty, avg_price_usd=:avg_price,
               status=CASE WHEN :qty < qty_requested THEN 'PARTIALLY_FILLED' ELSE 'FILLED' END,
               meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('remaining_qty',GREATEST(qty_requested-:qty,0),'repair_actual_cumulative_qty',:qty)
@@ -156,6 +183,28 @@ def apply_integrity_plan(engine, trade_date: str, result: dict, *, actual_fills:
               WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side
               AND COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)"""),
               {"td":td,"order_no":order_no,"symbol":symbol,"side":side})
+            active_rows = conn.execute(text("""SELECT qty, meta FROM us_fills
+              WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side
+              AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
+              {"td":td,"order_no":order_no,"symbol":symbol,"side":side}).mappings().all()
+            execution_qty = 0
+            cumulative_qty = 0
+            synthetic_qty = 0
+            for active_row in active_rows:
+                active_meta = _meta(active_row)
+                active_qty = int(active_row.get("qty") or 0)
+                evidence_type = str(active_meta.get("fill_evidence_type") or "")
+                if _is_synthetic(active_row):
+                    synthetic_qty = max(synthetic_qty, int(active_meta.get("cumulative_filled_qty") or active_qty or 0))
+                elif evidence_type in {"KIS_EXECUTION_ACTUAL", "KIS_ACTUAL"}:
+                    execution_qty += active_qty
+                else:
+                    cumulative_qty = max(cumulative_qty, int(active_meta.get("cumulative_filled_qty") or active_qty or 0))
+            active_total = execution_qty if execution_qty > 0 else cumulative_qty if cumulative_qty > 0 else synthetic_qty
+            if active_total != qty:
+                raise RuntimeError(
+                    f"repair fill accounting invariant failed order_no={order_no} order_qty={qty} active_fill_qty={active_total}"
+                )
             pnl = conn.execute(text("""UPDATE us_fills SET meta=COALESCE(meta,'{}'::jsonb)||
               jsonb_build_object('realized_pnl_usd',(price_usd-NULLIF((meta->>'cost_basis_price_usd')::numeric,0))*qty)
               WHERE trade_date=:td AND order_no=:order_no AND side='SELL' AND meta ? 'cost_basis_price_usd'"""),

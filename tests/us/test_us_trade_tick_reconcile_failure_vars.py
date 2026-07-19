@@ -47,7 +47,7 @@ def test_reconcile_contract_error_no_unbound(monkeypatch):
     )
 
     assert result["status"] == "FAILED", f"status={result['status']}"
-    assert result.get("reason") == "balance_position_parse_error"
+    assert result.get("reason") == "reconcile_internal_type_error"
     assert result.get("fills") == 0
     assert result.get("temp_error_count") == 0
     assert result.get("temp_recovered_count") == 0
