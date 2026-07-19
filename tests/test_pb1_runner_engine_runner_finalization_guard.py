@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import builtins
 
+import pytest
+
 
 def test_engine_runner_guard_tracks_real_engine_summary():
     import trader
@@ -28,7 +30,6 @@ def test_engine_runner_guard_tracks_real_engine_summary():
 
 
 def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
-    import pytest
     import trader
 
     class FailingEngine:
