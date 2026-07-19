@@ -25,7 +25,6 @@ def test_engine_runner_guard_tracks_real_engine_summary():
     assert trader._wrap_pb1_engine_class(DummyEngine) is True
     engine = DummyEngine()
     assert engine.run() == {"ok": True}
-
     assert builtins.engine_runner is engine
     assert _session_finalization_marker_metrics_lookup() == {
         "order_candidates": 2,
@@ -47,7 +46,6 @@ def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
     engine = FailingEngine()
     with pytest.raises(RuntimeError, match="simulated tick failure"):
         engine.run()
-
     assert builtins.engine_runner is engine
     assert _session_finalization_marker_metrics_lookup() == {
         "order_candidates": 0,
