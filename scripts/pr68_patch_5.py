@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Bring legacy mocks up to the explicit trade-date repository/provider contract.
+# Bring legacy mocks up to the explicit trade-date and authoritative-balance contract.
 for path in (ROOT / "tests/us").rglob("*.py"):
     source = path.read_text(encoding="utf-8")
     updated = source
@@ -17,6 +16,18 @@ for path in (ROOT / "tests/us").rglob("*.py"):
     updated = updated.replace(
         '"trader.us.db.repos.load_us_positions_by_symbols", lambda symbols:',
         '"trader.us.db.repos.load_us_positions_by_symbols", lambda symbols, as_of=None:',
+    )
+    updated = updated.replace(
+        '"trader.us.db.repos.save_order_intent", lambda intent:',
+        '"trader.us.db.repos.save_order_intent", lambda intent, trade_date=None:',
+    )
+    updated = updated.replace(
+        '{"status":"OK","positions":positions,"total_pvs_usd":10000}',
+        '{"status":"OK","positions":positions,"total_pvs_usd":10000,"balance_fetch_status":"OK","balance_parse_status":"OK","authoritative_positions":True,"preserve_previous_positions":False}',
+    )
+    updated = updated.replace(
+        '{"status": "OK", "positions": positions, "total_pvs_usd": 10000}',
+        '{"status": "OK", "positions": positions, "total_pvs_usd": 10000, "balance_fetch_status": "OK", "balance_parse_status": "OK", "authoritative_positions": True, "preserve_previous_positions": False}',
     )
     if updated != source:
         path.write_text(updated, encoding="utf-8")
