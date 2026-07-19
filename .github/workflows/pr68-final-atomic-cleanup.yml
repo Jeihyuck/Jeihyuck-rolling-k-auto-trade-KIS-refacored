@@ -78,6 +78,18 @@ jobs:
           python -m pytest tests/us -q 2>&1 | tee /tmp/us-pytest.log
       - name: Run offline harness
         run: python -m trader.us.harness.runner --scenario all --offline
+      - name: Restore reports after tests
+        run: |
+          git fetch origin dual-agent --depth=1
+          git diff --name-only origin/dual-agent -- reports/us_daily reports/us_prep | while read rel; do
+            if [ -z "$rel" ]; then continue; fi
+            if git cat-file -e "origin/dual-agent:$rel" 2>/dev/null; then
+              git checkout origin/dual-agent -- "$rel"
+            else
+              rm -f "$rel"
+            fi
+          done
+          git clean -fd reports/us_daily reports/us_prep
       - name: Verify no report artifacts remain after cleanup
         run: |
           git diff --name-only origin/dual-agent -- reports/us_daily reports/us_prep | tee /tmp/report-diff.txt
