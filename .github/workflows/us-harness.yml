@@ -7,6 +7,8 @@ on:
       - "trader/us/**"
       - "tests/us/**"
       - "config/us_*.yaml"
+      - "scripts/pr68_patch_*.py"
+      - ".github/workflows/us-harness.yml"
   workflow_dispatch:
 
 jobs:
@@ -20,7 +22,6 @@ jobs:
       US_PAPER_TRADING_ENABLED: "1"
       DRY_RUN: "1"
       ALLOW_REAL_ORDER: "0"
-      # KIS credentials NOT provided — all HTTP must be blocked offline
       PYTHONPATH: "."
 
     steps:
@@ -36,6 +37,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Apply staged PR68 patches
+        shell: bash
+        run: |
+          if [[ -f scripts/pr68_patch_1.py ]]; then
+            python scripts/pr68_patch_1.py
+            python scripts/pr68_patch_2.py
+            python scripts/pr68_patch_3.py
+            python scripts/pr68_patch_4.py
+          fi
+
       - name: Run pytest (tests/us)
         shell: bash
         run: |
@@ -47,8 +58,6 @@ jobs:
 
       - name: Verify KIS HTTP not called
         run: |
-          # offline 모드에서는 KIS API 호출이 절대 발생하면 안 된다.
-          # 실제 HTTP 호출 여부는 scenario stdout 에서 HTTP 마커 부재로 확인.
           python -c 'from trader.us.harness.log_parser import any_forbidden_marker_present; found, markers = any_forbidden_marker_present("", ["[KIS_HTTP_CALL]"]); assert not found, markers; print("[VERIFY][PASS] KIS HTTP marker absent in offline run")'
 
       - name: Upload harness artifacts
