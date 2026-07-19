@@ -13,10 +13,10 @@ _logger = logging.getLogger(__name__)
 class _MissingEngineRunnerSummary:
     """Last-resort empty summary for PB1 session finalization.
 
-    The real fix is installed below: PB1Engine.run()/run_close_cancel() updates
-    builtins.engine_runner to the actual latest engine instance, so legacy
-    pb1_runner finalization can read the real _run_summary_payload.
-    This fallback only prevents an import-time NameError before the first tick.
+    This object is used only before the first PB1 tick has run.  Once a real
+    PB1Engine.run()/run_close_cancel() call starts, the wrapper below replaces
+    builtins.engine_runner with the actual engine instance so finalization reads
+    the real run metrics.
     """
 
     _run_summary_payload: dict[str, Any] = {}
@@ -31,13 +31,14 @@ def _ensure_engine_runner_fallback() -> None:
 def _wrap_pb1_engine_class(engine_cls: type[Any]) -> bool:
     """Make legacy pb1_runner finalization see the latest real PB1Engine.
 
-    pb1_runner._run_loop still has a legacy unqualified lookup:
-        getattr(engine_runner, "_run_summary_payload", ...)
+    Current pb1_runner session finalization reads an unqualified engine_runner
+    name after loop execution.  That name is not local to the finalization block,
+    so without this guard it can raise NameError and skip pb1_result.json.
 
-    That name is outside the loop scope, so the previous patch only supplied an
-    empty builtins fallback.  This wrapper is stronger: every PB1Engine run stores
-    the actual engine instance in builtins.engine_runner before and after the run.
-    The finalizer then reads the real run summary instead of an empty object.
+    The guard stores the currently running PB1Engine instance in builtins before
+    and after each engine run.  Python's normal name lookup then resolves the
+    legacy engine_runner reference to the actual latest engine, preserving real
+    _run_summary_payload/_debug_summary values for the result marker.
     """
 
     if getattr(engine_cls, "_engine_runner_finalization_guard_installed", False):
