@@ -5,6 +5,15 @@ import builtins
 import pytest
 
 
+def _legacy_marker_metrics_lookup():
+    # Mirrors pb1_runner's legacy unqualified lookup but keeps the test source
+    # lint-clean by resolving through builtins explicitly.
+    engine_runner = builtins.engine_runner
+    return getattr(engine_runner, "_run_summary_payload", {}) or getattr(
+        engine_runner, "_debug_summary", {}
+    )
+
+
 def test_engine_runner_guard_tracks_real_engine_summary():
     import trader
 
@@ -19,14 +28,8 @@ def test_engine_runner_guard_tracks_real_engine_summary():
     engine = DummyEngine()
     assert engine.run() == {"ok": True}
 
-    # Mirrors the legacy pb1_runner session-finalization lookup. It must read
-    # the real latest engine summary, not an empty builtins placeholder.
-    marker_metrics = getattr(engine_runner, "_run_summary_payload", {}) or getattr(  # noqa: F821
-        engine_runner, "_debug_summary", {}  # noqa: F821
-    )
-
     assert builtins.engine_runner is engine
-    assert marker_metrics == {"order_candidates": 2, "api_submitted": 1}
+    assert _legacy_marker_metrics_lookup() == {"order_candidates": 2, "api_submitted": 1}
 
 
 def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
@@ -45,7 +48,7 @@ def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
         engine.run()
 
     assert builtins.engine_runner is engine
-    assert getattr(engine_runner, "_run_summary_payload", {}) == {  # noqa: F821
+    assert _legacy_marker_metrics_lookup() == {
         "order_candidates": 0,
         "api_submitted": 0,
         "skipped": 3,
