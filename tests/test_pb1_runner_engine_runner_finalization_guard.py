@@ -4,6 +4,8 @@ import builtins
 
 import pytest
 
+from trader.pb1_runtime_guards import _wrap_pb1_engine_class
+
 
 def _session_finalization_marker_metrics_lookup():
     engine_runner = builtins.engine_runner
@@ -13,8 +15,6 @@ def _session_finalization_marker_metrics_lookup():
 
 
 def test_engine_runner_guard_tracks_real_engine_summary():
-    import trader
-
     class DummyEngine:
         _run_summary_payload = {"order_candidates": 2, "api_submitted": 1}
         _debug_summary = {"fallback": True}
@@ -22,7 +22,7 @@ def test_engine_runner_guard_tracks_real_engine_summary():
         def run(self):
             return {"ok": True}
 
-    assert trader._wrap_pb1_engine_class(DummyEngine) is True
+    assert _wrap_pb1_engine_class(DummyEngine) is True
     engine = DummyEngine()
     assert engine.run() == {"ok": True}
     assert builtins.engine_runner is engine
@@ -33,8 +33,6 @@ def test_engine_runner_guard_tracks_real_engine_summary():
 
 
 def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
-    import trader
-
     class FailingEngine:
         _run_summary_payload = {"order_candidates": 0, "api_submitted": 0, "skipped": 3}
         _debug_summary = {"skip_reasons": ["EXHAUSTED_CANDIDATES"]}
@@ -42,7 +40,7 @@ def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
         def run(self):
             raise RuntimeError("simulated tick failure")
 
-    assert trader._wrap_pb1_engine_class(FailingEngine) is True
+    assert _wrap_pb1_engine_class(FailingEngine) is True
     engine = FailingEngine()
     with pytest.raises(RuntimeError, match="simulated tick failure"):
         engine.run()
@@ -55,13 +53,11 @@ def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
 
 
 def test_engine_runner_guard_is_idempotent_for_engine_class():
-    import trader
-
     class DummyEngine:
         def run(self):
             return "ok"
 
-    assert trader._wrap_pb1_engine_class(DummyEngine) is True
+    assert _wrap_pb1_engine_class(DummyEngine) is True
     first_run = DummyEngine.run
-    assert trader._wrap_pb1_engine_class(DummyEngine) is False
+    assert _wrap_pb1_engine_class(DummyEngine) is False
     assert DummyEngine.run is first_run
