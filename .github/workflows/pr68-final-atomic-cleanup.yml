@@ -64,11 +64,12 @@ jobs:
             scripts/repair_us_trade_integrity.py
       - name: Run focused atomic tests
         run: |
+          set -o pipefail
           python -m pytest \
             tests/us/test_us_postgres_integration_real.py \
             tests/us/test_us_final_operational_hardening.py \
             tests/us/test_us_trade_date_and_cumulative_connection.py \
-            -q
+            -q 2>&1 | tee /tmp/focused-pytest.log
       - name: Run full US suite
         run: |
           set -o pipefail
