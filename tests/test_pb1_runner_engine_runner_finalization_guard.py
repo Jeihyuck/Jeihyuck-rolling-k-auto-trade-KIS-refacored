@@ -17,7 +17,7 @@ def test_engine_runner_guard_tracks_real_engine_summary():
     engine = DummyEngine()
     assert engine.run() == {"ok": True}
 
-    # Mirrors the legacy pb1_runner session-finalization lookup.  It must read
+    # Mirrors the legacy pb1_runner session-finalization lookup. It must read
     # the real latest engine summary, not an empty builtins placeholder.
     marker_metrics = getattr(engine_runner, "_run_summary_payload", {}) or getattr(  # noqa: F821
         engine_runner, "_debug_summary", {}  # noqa: F821
@@ -25,6 +25,30 @@ def test_engine_runner_guard_tracks_real_engine_summary():
 
     assert builtins.engine_runner is engine
     assert marker_metrics == {"order_candidates": 2, "api_submitted": 1}
+
+
+def test_engine_runner_guard_survives_engine_exception_and_keeps_summary():
+    import pytest
+    import trader
+
+    class FailingEngine:
+        _run_summary_payload = {"order_candidates": 0, "api_submitted": 0, "skipped": 3}
+        _debug_summary = {"skip_reasons": ["EXHAUSTED_CANDIDATES"]}
+
+        def run(self):
+            raise RuntimeError("simulated tick failure")
+
+    assert trader._wrap_pb1_engine_class(FailingEngine) is True
+    engine = FailingEngine()
+    with pytest.raises(RuntimeError, match="simulated tick failure"):
+        engine.run()
+
+    assert builtins.engine_runner is engine
+    assert getattr(engine_runner, "_run_summary_payload", {}) == {  # noqa: F821
+        "order_candidates": 0,
+        "api_submitted": 0,
+        "skipped": 3,
+    }
 
 
 def test_engine_runner_guard_is_idempotent_for_engine_class():
