@@ -18,7 +18,7 @@ def _patch_entry_db(monkeypatch, pos):
     monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
     monkeypatch.setattr("trader.us.db.repos.has_position", lambda symbol: symbol in pos)
     monkeypatch.setattr("trader.us.db.repos.load_today_order_keys", lambda trade_date=None: set())
-    monkeypatch.setattr("trader.us.db.repos.load_us_positions_by_symbols", lambda symbols: {s: pos[s] for s in symbols if s in pos})
+    monkeypatch.setattr("trader.us.db.repos.load_us_positions_by_symbols", lambda symbols, as_of=None: {s: pos[s] for s in symbols if s in pos})
 
 
 def _run_entry(monkeypatch, pos, price=110.0):
@@ -146,7 +146,7 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
         "side": "SELL", "qty": 1, "order_no": "S1", "status": "ACK",
     }, trade_date="2026-06-18")
     _risk_env(monkeypatch)
-    monkeypatch.setattr("trader.us.db.repos.load_us_positions_by_symbols", lambda symbols: {"AAOI": {"symbol": "AAOI", "qty": 0, "orderable_qty": 0}})
+    monkeypatch.setattr("trader.us.db.repos.load_us_positions_by_symbols", lambda symbols, as_of=None: {"AAOI": {"symbol": "AAOI", "qty": 0, "orderable_qty": 0}})
     monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
 
     class _Kis:
@@ -259,7 +259,7 @@ def test_sell_no_orderable_qty_after_recent_ack_returns_position_closed(monkeypa
     monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **kwargs: False)
     monkeypatch.setattr("trader.us.execution.us_sell_qty_guard.resolve_sell_qty", lambda intent, pos: (0, {"holding_qty": 1, "orderable_qty": 0}))
     called = {"save": 0}
-    monkeypatch.setattr("trader.us.db.repos.save_order_intent", lambda intent: called.__setitem__("save", called["save"] + 1) or True)
+    monkeypatch.setattr("trader.us.db.repos.save_order_intent", lambda intent, trade_date=None: called.__setitem__("save", called["save"] + 1) or True)
     result = route_order(
         {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 0, "limit_price": 10, "notional_usd": 10, "client_order_key": "no-orderable", "trade_date": "2026-06-18"},
         allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=object(),

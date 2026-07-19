@@ -14,12 +14,12 @@ def test_reconcile_ack_orders_confirms_fill_api_and_balance_delta(monkeypatch):
     ]
     monkeypatch.setattr("trader.us.db.repos.load_pending_ack_orders", lambda trade_date, env="practice": orders)
     marked = []
-    monkeypatch.setattr("trader.us.db.repos.mark_order_filled_by_reconcile", lambda **kwargs: marked.append(kwargs))
+    monkeypatch.setattr("trader.us.db.repos.mark_order_filled_by_reconcile", lambda **kwargs: (marked.append(kwargs) or {"status": "OK"}))
 
     class _Provider:
         def get_balance(self):
             return {"positions": [{"symbol": "B1", "qty": 1, "avg_price": 10}, {"symbol": "B2", "qty": 1, "avg_price": 20}]}
-        def get_fills_by_order_no(self, order_no, symbol):
+        def get_fills_by_order_no(self, order_no, symbol, trade_date):
             if order_no.startswith("s"):
                 return {"filled_qty": 1, "avg_price": 30}
             return {"filled_qty": 0}
@@ -43,12 +43,12 @@ def test_buy_balance_reconcile_requires_pre_order_position_qty(monkeypatch):
     orders = [{"symbol": "B1", "side": "BUY", "order_no": "b1", "qty_requested": 1, "limit_price": 10}]
     monkeypatch.setattr("trader.us.db.repos.load_pending_ack_orders", lambda trade_date, env="practice": orders)
     marked = []
-    monkeypatch.setattr("trader.us.db.repos.mark_order_filled_by_reconcile", lambda **kwargs: marked.append(kwargs))
+    monkeypatch.setattr("trader.us.db.repos.mark_order_filled_by_reconcile", lambda **kwargs: (marked.append(kwargs) or {"status": "OK"}))
 
     class _Provider:
         def get_balance(self):
             return {"positions": [{"symbol": "B1", "qty": 1, "avg_price": 10}]}
-        def get_fills_by_order_no(self, order_no, symbol):
+        def get_fills_by_order_no(self, order_no, symbol, trade_date):
             return {"filled_qty": 0}
 
     result = reconcile.reconcile_ack_orders_with_balance(provider=_Provider(), trade_date="2026-06-26", env="practice")

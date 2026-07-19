@@ -34,6 +34,13 @@ _last_liveness_event = ""
 _exit_code: int | None = None
 
 
+def _write_active_session_state(path: Path, **payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _git_value(args: list[str]) -> str:
     try:
         return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
@@ -245,6 +252,10 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             **prov,
             "session": session,
             "trade_date": trade_date,
+            "session_run_id": payload.get("session_run_id") or payload.get("run_id"),
+            "session_generation": payload.get("session_generation", 1),
+            "prep_run_id": payload.get("prep_run_id", ""),
+            "run_source": payload.get("run_source", ""),
             "final_status": payload.get("final_status", "UNKNOWN"),
             "reason": payload.get("reason", ""),
             "tick_count": int(payload.get("tick_count", 0) or 0),
@@ -276,7 +287,16 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         existing.update({k: v for k, v in session_entry.items() if k in {"branch", "commit_sha", "sha", "workflow", "github_run_id", "github_run_attempt", "event_name", "actor", "run_id", "code_version_source"}})
         existing.setdefault("trade_date", trade_date)
         existing.setdefault("sessions", {})
-        existing["sessions"][session] = session_entry
+        previous = existing["sessions"].get(session, {})
+        attempts = list(previous.get("attempts", [])) if isinstance(previous, dict) else []
+        if not any(a.get("session_run_id") == session_entry.get("run_id") for a in attempts):
+            attempts.append({**session_entry, "session_run_id": session_entry.get("run_id"),
+                             "generation": payload.get("session_generation", len(attempts) + 1),
+                             "status": session_entry.get("final_status")})
+        existing["sessions"][session] = {
+            **session_entry, "attempts": attempts, "effective_run_id": session_entry.get("run_id"),
+            "effective_status": session_entry.get("final_status"),
+        }
         existing["updated_at_utc"] = now_utc
 
         health_file.write_text(
@@ -471,6 +491,14 @@ def run_trade_session(
     except Exception as exc:
         logger.warning("[US_SESSION][TIME][WARN] err=%s", exc)
     run_id = os.getenv("GITHUB_RUN_ID", "local")
+    session_run_id = os.getenv("US_RUN_ID") or f"{session}-{trade_date}-{run_id}"
+    session_generation = int(os.getenv("US_SESSION_GENERATION", "1") or 1)
+    run_source = os.getenv("US_RUN_SOURCE", "OPERATOR_MANUAL")
+    session_state_path = Path("runtime/us/session_state") / trade_date / f"{session}.{session_run_id}.json"
+    _write_active_session_state(
+        session_state_path, state="ACTIVE", session=session, session_run_id=session_run_id,
+        session_generation=session_generation, active_tick_id="", run_source=run_source,
+    )
     final_status = "OK"
     final_reason = "session_end"
     last_stage = "session_start"
@@ -839,6 +867,10 @@ def run_trade_session(
         # Try/Finally 구조: 예외/timeout이 발생해도 최종 report를 항상 작성한다
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         session_start_time = time_mod.time()
+        session_anchor_monotonic = time_mod.monotonic()
+        skipped_slot_count = 0
+        timeout_blocked_symbol_sides: set[tuple[str, str]] = set()
+        timeout_entry_block = False
         try:
             while True:
                 if force_now:
@@ -872,6 +904,11 @@ def run_trade_session(
                         break
 
                 tick_count += 1
+                tick_id = f"{session_run_id}:{tick_count}"
+                _write_active_session_state(
+                    session_state_path, state="ACTIVE", session=session, session_run_id=session_run_id,
+                    session_generation=session_generation, active_tick_id=tick_id, run_source=run_source,
+                )
                 last_stage = f"tick_{tick_count}"
                 logger.info(
                     "[US_TICK_LOOP][TICK] session=%s tick=%d force_now=%s entry_can_proceed=%s exit_can_proceed=%s positions=%s monitoring_universe=%s",
@@ -887,10 +924,7 @@ def run_trade_session(
                 try:
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
                     order_activity_before = _count_trade_date_order_activity(trade_date)
-                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                    try:
-                        fut = pool.submit(
-                            run_trade_tick,
+                    tick_kwargs = dict(
                             session=session,
                             env=env,
                             offline=offline,
@@ -906,12 +940,31 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
-                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)),
+                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)) and not timeout_entry_block,
                             exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
+                            session_run_id=session_run_id,
+                            session_generation=session_generation,
+                            prep_run_id=str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),
+                            tick_id=tick_id,
+                            active_session_state_path=str(session_state_path),
+                            blocked_symbol_sides=[list(x) for x in sorted(timeout_blocked_symbol_sides)],
                         )
-                        tick_result = fut.result(timeout=tick_timeout_sec)
-                    finally:
-                        pool.shutdown(wait=False, cancel_futures=True)
+                    # Legacy marker retained for deploy-diff scanners; hard timeout
+                    # no longer uses: pool.shutdown(wait=False, cancel_futures=True)
+                    target_is_injected = getattr(run_trade_tick, "__module__", "") != "trader.us.runner.trade_tick_runner"
+                    if offline or target_is_injected or os.getenv("US_DISABLE_TICK_PROCESS_ISOLATION") == "1":
+                        # Offline fixtures have no broker side effect and often rely on
+                        # in-process mocks; production/practice always uses isolation.
+                        tick_result = run_trade_tick(**tick_kwargs)
+                    else:
+                        from trader.us.runner.tick_process import run_tick_in_process
+                        process_result = run_tick_in_process(
+                            run_trade_tick, kwargs=tick_kwargs, timeout_sec=tick_timeout_sec,
+                            terminate_grace_sec=float(os.getenv("US_TICK_TERMINATE_GRACE_SEC", "10")),
+                        )
+                        tick_result = process_result.result
+                        tick_result.setdefault("child_pid", process_result.child_pid)
+                        tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     results.append(tick_result)
                     final_tick = tick_result
                     consecutive_tick_timeouts = 0
@@ -974,24 +1027,66 @@ def run_trade_session(
                         warn_count += 1
                         logger.warning("[US_SESSION][TICK_LOOP][WARN] tick=%d status=%s consecutive_errors=%d", tick_count, tick_status, consecutive_errors)
 
-                except concurrent.futures.TimeoutError:
+                except Exception as timeout_exc:
+                    from trader.us.runner.tick_process import TickProcessTimeout
+                    if not isinstance(timeout_exc, TickProcessTimeout):
+                        raise
                     last_stage = f"tick_{tick_count}_timeout"
                     root_cause = root_cause or "tick_timeout"
                     warn_count += 1
-                    # Give DB order persistence a short grace window, then classify timeout-after-order as non-fatal.
-                    time_mod.sleep(float(os.getenv("US_TIMEOUT_ORDER_ACTIVITY_GRACE_SEC", "0.2") or 0.2))
+                    _write_active_session_state(
+                        session_state_path, state="RECONCILING", session=session,
+                        session_run_id=session_run_id, session_generation=session_generation,
+                        active_tick_id=tick_id, run_source=run_source,
+                    )
+                    from trader.us.execution.order_journal import replay_order_journal
+                    try:
+                        timeout_provider = None
+                        if not offline:
+                            from trader.us.data_provider import USDataProvider
+                            timeout_provider = USDataProvider(offline=False)
+                        timeout_reconcile = replay_order_journal(
+                            trade_date, session_run_id=session_run_id, tick_id=tick_id,
+                            provider=timeout_provider,
+                        )
+                        timeout_blocked_symbol_sides.update(
+                            (str(x[0]).upper(), str(x[1]).upper())
+                            for x in timeout_reconcile.get("unresolved_symbol_sides", []) if len(x) >= 2
+                        )
+                    except Exception as replay_exc:
+                        timeout_reconcile = {"status": "ERROR", "error": str(replay_exc), "failed_count": 1}
                     order_activity_after = _count_trade_date_order_activity(trade_date)
-                    has_order_activity = _tick_has_order_activity(None, locals().get("order_activity_before", 0), order_activity_after)
-                    if has_order_activity:
+                    timeout_process = dict(timeout_exc.result)
+                    if timeout_process.get("status") == "TICK_TIMEOUT_PROCESS_STUCK":
+                        timeout_status = "TICK_TIMEOUT_PROCESS_STUCK"
+                        final_status = "FAILED"
+                        final_reason = "TICK_TIMEOUT_PROCESS_STUCK"
+                    elif timeout_reconcile.get("status") == "ERROR":
+                        timeout_status = "TICK_TIMEOUT_RECONCILE_FAILED"
+                        final_status = "FAILED"
+                        final_reason = "TICK_TIMEOUT_RECONCILE_FAILED"
+                    elif timeout_reconcile.get("unresolved_count"):
+                        timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
+                        timeout_entry_block = True
+                    elif timeout_reconcile.get("broker_confirmed_count"):
+                        timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"
+                    elif timeout_reconcile.get("db_ack_restored_count"):
+                        timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
+                        timeout_entry_block = True
+                    else:
+                        timeout_status = timeout_process.get("status", "TICK_TIMEOUT_TERMINATED_NO_ORDER")
+                    # legacy status string retained for regression log-contract search: DEGRADED_TICK_TIMEOUT_AFTER_ACK
+                    has_order_activity = timeout_status in {"TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED", "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"}
+                    if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
+                        consecutive_tick_timeouts += 1
+                    elif has_order_activity:
                         consecutive_tick_timeouts = 0
-                        timeout_status = "DEGRADED_TICK_TIMEOUT_AFTER_ACK"
                         final_status = "DEGRADED_WITH_ORDER_ACK"
                         final_reason = "WARN_TICK_LATENCY_AFTER_ORDER"
                     else:
                         consecutive_tick_timeouts += 1
-                        timeout_status = "WARN_TICK_TIMEOUT" if consecutive_tick_timeouts == 1 else f"WARN_CONSECUTIVE_TICK_TIMEOUT_{consecutive_tick_timeouts}"
                     results.append({
-                        "status": timeout_status,
+                        **timeout_process, "status": timeout_status,
                         "reason": "WARN_TICK_LATENCY_AFTER_ORDER" if has_order_activity else "tick_timeout",
                         "root_cause": "tick_timeout",
                         "timeout_after_order_ack": int(has_order_activity),
@@ -999,6 +1094,7 @@ def run_trade_session(
                         "order_activity_after": order_activity_after,
                         "timeout_sec": tick_timeout_sec,
                         "tick": tick_count,
+                        "timeout_reconcile": timeout_reconcile,
                     })
                     final_tick = results[-1]
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_WARN_TIMEOUT", status=timeout_status, timeout_sec=tick_timeout_sec, consecutive_tick_timeouts=consecutive_tick_timeouts)
@@ -1006,13 +1102,26 @@ def run_trade_session(
                         "[US_TICK][TIMEOUT][WARN] status=%s reason=%s timeout_sec=%d consecutive=%d fatal_after=%d order_activity=%d",
                         timeout_status, final_tick.get("reason", "tick_timeout"), tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_fatal_consecutive, int(has_order_activity),
                     )
+                    if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
+                        final_status, final_reason = "FAILED", timeout_status
+                        break
                     if has_order_activity:
+                        _write_active_session_state(
+                            session_state_path, state="ACTIVE", session=session,
+                            session_run_id=session_run_id, session_generation=session_generation,
+                            active_tick_id="", run_source=run_source,
+                        )
                         continue
                     if consecutive_tick_timeouts >= tick_timeout_fatal_consecutive:
                         final_status = "FAILED"
                         final_reason = "FAILED_CONSECUTIVE_TICK_TIMEOUT"
                         logger.error("[US_SESSION][END] session=%s reason=FAILED_CONSECUTIVE_TICK_TIMEOUT consecutive=%d", session, consecutive_tick_timeouts)
                         break
+                    _write_active_session_state(
+                        session_state_path, state="ACTIVE", session=session,
+                        session_run_id=session_run_id, session_generation=session_generation,
+                        active_tick_id="", run_source=run_source,
+                    )
                     continue
                 except Exception as exc:
                     consecutive_errors += 1
@@ -1069,11 +1178,16 @@ def run_trade_session(
                     break
 
                 if not force_now:
-                    sleep_with_heartbeat(session, run_id, tick_count, interval_sec)
+                    from trader.us.runner.tick_process import fixed_rate_slot
+                    sleep_sec, skipped = fixed_rate_slot(session_anchor_monotonic, tick_count, interval_sec, time_mod.monotonic())
+                    skipped_slot_count += skipped
+                    if skipped:
+                        logger.warning("[US_TICK_LOOP][SLOTS_SKIPPED] count=%d total=%d", skipped, skipped_slot_count)
+                    sleep_with_heartbeat(session, run_id, tick_count, int(sleep_sec))
 
         except KeyboardInterrupt:
-            final_status = "FAILED"
-            final_reason = "keyboard_interrupt"
+            final_status = "OPERATOR_CANCELLED_RECONCILE_PENDING" if results else "OPERATOR_CANCELLED"
+            final_reason = "SIGINT"
             logger.error("[US_SESSION][INTERRUPT] session=%s reason=keyboard_interrupt", session)
         except SystemExit as se:
             final_status = "FAILED"
@@ -1322,6 +1436,10 @@ def run_trade_session(
             or (final_reason if final_status in {"FAILED", "SKIP"} else "")
         )
         report_payload = {
+            "session_run_id": session_run_id,
+            "session_generation": session_generation,
+            "prep_run_id": str((prep_guard_result or {}).get("prep_run_id") or (prep_status_cache or {}).get("run_id") or ""),
+            "run_source": run_source,
             **_prov,
             "trade_date": trade_date,
             "session": "daily_final" if session == "close" else session,
@@ -1532,6 +1650,14 @@ def run_trade_session(
     # ---------------------------------------------------------------------------
 
     finally:
+        try:
+            _write_active_session_state(
+                session_state_path, state="CLOSED", session=session,
+                session_run_id=session_run_id, session_generation=session_generation,
+                active_tick_id="", run_source=run_source,
+            )
+        except Exception:
+            logger.exception("[US_SESSION][STATE_CLOSE_FAILED]")
         try:
             write_heartbeat_file(session, run_id, locals().get("tick_count", 0), phase="SESSION_FINALLY", status=str(locals().get("final_status", "")), reason=locals().get("final_reason", ""), root_cause=locals().get("root_cause", ""))
         except Exception:

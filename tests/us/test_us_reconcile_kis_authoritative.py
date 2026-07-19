@@ -7,9 +7,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch, call
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 
 def _make_provider_balance(holdings: list[dict], raw_count: int = 0) -> dict:
@@ -44,7 +42,6 @@ def _make_position(symbol: str, qty: int, orderable: int | None = None) -> dict:
 
 class TestReconcileKisAuthoritative:
     def test_kis_balance_triggers_upsert(self):
-        """KIS balance 성공 시 save_position_snapshot이 호출되어야 한다."""
         from trader.us.execution.reconcile import reconcile_positions
 
         positions = [
@@ -58,17 +55,21 @@ class TestReconcileKisAuthoritative:
 
         with patch("trader.us.db.repos.save_position_snapshot") as mock_save:
             mock_save.return_value = len(positions)
-            result = reconcile_positions(provider=mock_provider)
+            result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
 
+            assert result["status"] == "OK"
             assert mock_save.called, "save_position_snapshot should have been called"
             saved_positions = mock_save.call_args[0][0]
             assert isinstance(saved_positions, list)
             symbols = {p["symbol"] for p in saved_positions}
             assert "CRDO" in symbols
             assert "LITE" in symbols
+            kwargs = mock_save.call_args.kwargs
+            assert kwargs["trade_date"] == "2026-07-17"
+            assert kwargs["authoritative_positions"] is True
+            assert kwargs["preserve_previous_positions"] is False
 
     def test_balance_source_authoritative(self):
-        """결과에 balance_source='kis_balance_authoritative'가 포함되어야 한다."""
         from trader.us.execution.reconcile import reconcile_positions
 
         positions = [_make_position("VRT", 6)]
@@ -78,12 +79,11 @@ class TestReconcileKisAuthoritative:
         mock_provider.get_balance.return_value = balance_resp
 
         with patch("trader.us.db.repos.save_position_snapshot", return_value=1):
-            result = reconcile_positions(provider=mock_provider)
+            result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
 
         assert result.get("balance_source") == "kis_balance_authoritative"
 
     def test_qty_not_doubled(self):
-        """KIS balance에서 qty=12인 경우 저장된 qty도 12여야 한다 (2배 방지)."""
         from trader.us.execution.reconcile import reconcile_positions
 
         positions = [_make_position("CRDO", 12, orderable=12)]
@@ -94,20 +94,21 @@ class TestReconcileKisAuthoritative:
 
         saved_snapshots: list = []
 
-        def capture_save(snaps):
+        def capture_save(snaps, **kwargs):
             saved_snapshots.extend(snaps)
+            assert kwargs["trade_date"] == "2026-07-17"
             return len(snaps)
 
         with patch("trader.us.db.repos.save_position_snapshot", side_effect=capture_save):
-            reconcile_positions(provider=mock_provider)
+            result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
 
+        assert result["status"] == "OK"
         crdo_saved = next((s for s in saved_snapshots if s.get("symbol") == "CRDO"), None)
         assert crdo_saved is not None, "CRDO position should have been saved"
         saved_qty = crdo_saved.get("qty") or crdo_saved.get("holding_qty")
         assert int(saved_qty) == 12, f"Expected qty=12, got {saved_qty}"
 
     def test_empty_positions_skips_upsert(self):
-        """positions=[] → save_position_snapshot 호출 없음."""
         from trader.us.execution.reconcile import reconcile_positions
 
         balance_resp = _make_provider_balance([])
@@ -116,18 +117,22 @@ class TestReconcileKisAuthoritative:
         mock_provider.get_balance.return_value = balance_resp
 
         with patch("trader.us.db.repos.save_position_snapshot") as mock_save:
-            result = reconcile_positions(provider=mock_provider)
+            result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
 
-            mock_save.assert_not_called()
+            assert result["status"] == "OK"
+            mock_save.assert_called_once()
+        args, kwargs = mock_save.call_args
+        assert args[0] == []
+        assert kwargs["authoritative_positions"] is True
+        assert kwargs["preserve_previous_positions"] is False
 
     def test_error_balance_returns_error_status(self):
-        """balance 조회 실패 시 TEMP_ERROR + preserve_previous_positions 반환."""
         from trader.us.execution.reconcile import reconcile_positions
 
         mock_provider = MagicMock()
         mock_provider.get_balance.side_effect = RuntimeError("KIS API timeout")
 
-        result = reconcile_positions(provider=mock_provider)
+        result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
 
         assert result["status"] == "TEMP_ERROR"
         assert result.get("balance_fetch_status") == "FAILED"
@@ -135,3 +140,16 @@ class TestReconcileKisAuthoritative:
         assert result.get("preserve_previous_positions") is True
         assert result.get("block_new_entry") is True
 
+    def test_authoritative_position_persist_failure_fails_closed(self):
+        from trader.us.execution.reconcile import reconcile_positions
+
+        positions = [_make_position("AMD", 3)]
+        mock_provider = MagicMock()
+        mock_provider.get_balance.return_value = _make_provider_balance(positions)
+
+        with patch("trader.us.db.repos.save_position_snapshot", side_effect=RuntimeError("db down")):
+            result = reconcile_positions(provider=mock_provider, trade_date="2026-07-17")
+
+        assert result["status"] == "POSITION_PERSIST_ERROR"
+        assert result["block_new_entry"] is True
+        assert result["preserve_previous_positions"] is True

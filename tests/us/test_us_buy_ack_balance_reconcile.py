@@ -5,7 +5,7 @@ class _BuyProvider:
     def get_balance(self) -> dict:
         return {"positions": [{"symbol": "AMD", "qty": 5, "avg_price": 123.45}]}
 
-    def get_fills_by_order_no(self, order_no: str, symbol: str) -> dict:
+    def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict:
         return {}
 
 
@@ -22,7 +22,7 @@ def test_buy_ack_reconciles_from_kis_balance(monkeypatch) -> None:
         "meta": {"pre_order_position_qty": 0, "pre_order_position_source": "db_position_absent"},
     }])
     captured: list[dict] = []
-    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: (captured.append(kwargs) or {"status": "OK"}))
 
     result = reconcile.reconcile_ack_orders_with_balance(
         provider=_BuyProvider(),
@@ -42,7 +42,7 @@ class _ExistingHoldingProvider:
     def get_balance(self) -> dict:
         return {"positions": [{"symbol": "AMD", "qty": 5, "avg_price": 123.45}]}
 
-    def get_fills_by_order_no(self, order_no: str, symbol: str) -> dict:
+    def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict:
         return {}
 
 
@@ -59,7 +59,7 @@ def test_buy_ack_balance_reconcile_skips_when_snapshot_missing_for_existing_hold
         "meta": {"pre_order_position_source": "lookup_failed"},
     }])
     captured: list[dict] = []
-    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: (captured.append(kwargs) or {"status": "OK"}))
 
     result = reconcile.reconcile_ack_orders_with_balance(
         provider=_ExistingHoldingProvider(),

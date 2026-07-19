@@ -5,11 +5,22 @@ KIS 잔고와 로컬 DB 잔고를 비교 검증.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_FILL_CONTRACT_ERROR_STATUSES = {
+    "EVIDENCE_QUANTITY_REGRESSION",
+    "EVIDENCE_QUANTITY_CONFLICT",
+    "EVIDENCE_QUANTITY_OVERFLOW",
+    "FILL_ACCOUNTING_INVARIANT_FAILED",
+    "RECONCILE_UPDATE_FAILED",
+    "CONTRACT_ERROR",
+    "ERROR",
+}
 
 
 def _safe_float(value: Any) -> float:
@@ -55,7 +66,12 @@ def _resolve_order_fill_price(order: dict) -> tuple[float, str | None]:
     return 0.0, None
 
 
-def reconcile_positions(provider: Any | None = None) -> dict:
+def _ny_trade_date() -> str:
+    from trader.us.market_calendar import now_ny
+    return now_ny().strftime("%Y-%m-%d")
+
+
+def reconcile_positions(provider: Any | None = None, *, trade_date: str | None = None) -> dict:
     """잔고 조회 및 reconcile.
 
     Args:
@@ -78,6 +94,9 @@ def reconcile_positions(provider: Any | None = None) -> dict:
     if provider is None:
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
+    if not str(trade_date or "").strip():
+        trade_date = _ny_trade_date()
+        logger.warning("[US_RECONCILE][TRADE_DATE_FALLBACK] source=ny_clock trade_date=%s", trade_date)
 
     try:
         balance = _get_balance_force_refresh(provider)
@@ -94,7 +113,6 @@ def reconcile_positions(provider: Any | None = None) -> dict:
             "block_new_entry": True,
         }
 
-    # Extract fields from normalized balance
     positions = balance.get("positions", [])
     total_pvs = balance.get("total_pvs", "0")
     total_pvs_source = balance.get("total_pvs_source", "unknown")
@@ -103,13 +121,9 @@ def reconcile_positions(provider: Any | None = None) -> dict:
     position_symbols = balance.get("position_symbols", [])
     balance_parse_status = balance.get("balance_parse_status", "UNKNOWN")
     balance_parse_error = balance.get("balance_parse_error")
-    
-    # Log raw and normalized counts
-    logger.info(
-        "[US_RECONCILE][BALANCE_RAW] output1_count=%d",
-        raw_output1_count,
-    )
-    
+
+    logger.info("[US_RECONCILE][BALANCE_RAW] output1_count=%d", raw_output1_count)
+
     if positions:
         logger.info(
             "[US_RECONCILE][POSITIONS_NORMALIZED] count=%d symbols=%s",
@@ -118,8 +132,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         )
     else:
         logger.info("[US_RECONCILE][POSITIONS_NORMALIZED] count=0")
-    
-    # Check balance parse status
+
     if balance_parse_status not in ("OK", "UNKNOWN"):
         logger.error(
             "[US_RECONCILE][CONTRACT_ERROR] balance_parse_status=%s error=%s",
@@ -140,8 +153,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
             "preserve_previous_positions": True,
             "block_new_entry": True,
         }
-    
-    # Check contract error: raw > 0 but normalized == 0
+
     if raw_output1_count > 0 and normalized_position_count == 0:
         logger.error(
             "[US_RECONCILE][CONTRACT_ERROR] raw_output1_count=%d normalized_position_count=0",
@@ -161,7 +173,7 @@ def reconcile_positions(provider: Any | None = None) -> dict:
             "preserve_previous_positions": True,
             "block_new_entry": True,
         }
-    
+
     logger.info(
         "[US_RECONCILE][OK] position_count=%d total_pvs=%s total_pvs_source=%s",
         len(positions),
@@ -169,22 +181,46 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         total_pvs_source,
     )
 
-    # KIS balance authoritative: us_positions DB 동기화
-    if positions:
-        logger.info(
-            "[US_RECONCILE][AUTHORITATIVE] source=kis_balance positions=%d symbols=%s",
-            len(positions),
-            ",".join(position_symbols),
+    logger.info(
+        "[US_RECONCILE][AUTHORITATIVE] source=kis_balance positions=%d symbols=%s",
+        len(positions),
+        ",".join(position_symbols),
+    )
+    try:
+        from trader.us.db.repos import save_position_snapshot
+        saved = save_position_snapshot(
+            positions,
+            trade_date=trade_date,
+            balance_fetch_status="OK",
+            balance_parse_status="OK",
+            authoritative_positions=True,
+            preserve_previous_positions=False,
+            close_source="kis_reconcile_balance",
         )
-        try:
-            from trader.us.db.repos import save_position_snapshot
-            saved = save_position_snapshot(positions)
-            logger.info(
-                "[US_RECONCILE][UPSERT_POSITIONS] count=%d source=kis_balance_authoritative",
-                saved,
+        if positions and int(saved or 0) < len(positions):
+            raise RuntimeError(
+                f"authoritative position persistence incomplete saved={saved} expected={len(positions)}"
             )
-        except Exception as exc:
-            logger.warning("[US_RECONCILE][UPSERT_WARN] failed to upsert positions: %s", exc)
+        logger.info(
+            "[US_RECONCILE][UPSERT_POSITIONS] count=%d source=kis_balance_authoritative",
+            saved,
+        )
+    except Exception as exc:
+        logger.error("[US_RECONCILE][UPSERT_ERROR] failed to persist authoritative positions: %s", exc)
+        return {
+            "status": "POSITION_PERSIST_ERROR",
+            "reason": "authoritative_position_persist_failed",
+            "error": str(exc),
+            "position_count": len(positions),
+            "total_pvs": total_pvs,
+            "positions": positions,
+            "position_symbols": position_symbols,
+            "balance_parse_status": balance_parse_status,
+            "balance_fetch_status": "OK",
+            "authoritative_positions": True,
+            "preserve_previous_positions": True,
+            "block_new_entry": True,
+        }
 
     return {
         "status": "OK",
@@ -202,7 +238,6 @@ def reconcile_positions(provider: Any | None = None) -> dict:
         "preserve_previous_positions": False,
         "block_new_entry": False,
     }
-
 
 
 def _first_present(row: dict, keys: list[str], default=None):
@@ -276,21 +311,16 @@ def _nested_get(row: dict, dotted_key: str):
 def _extract_pre_order_position_qty(order: dict) -> tuple[int | None, str]:
     meta = _order_meta(order)
     candidates = [
-        # Priority 1: canonical pre-order snapshot.
         (order, "pre_order_position_qty", "order_pre_order_position_qty"),
         (meta, "pre_order_position_qty", "meta_pre_order_position_qty"),
         (meta, "pre_order_position_snapshot.qty", "meta_pre_order_position_snapshot_qty"),
-        # Priority 2: SELL-specific partial-sell snapshot aliases.
         (order, "pre_sell_qty", "order_pre_sell_qty"),
         (meta, "pre_sell_qty", "meta_pre_sell_qty"),
         (meta, "pre_sell_position_snapshot.qty", "meta_pre_sell_position_snapshot_qty"),
-        # Priority 3: generic position snapshot quantity aliases.
         (order, "position_snapshot_qty", "order_position_snapshot_qty"),
         (meta, "position_snapshot_qty", "meta_position_snapshot_qty"),
-        # Priority 4: holding quantity aliases.
         (order, "holding_qty", "order_holding_qty"),
         (meta, "holding_qty", "meta_holding_qty"),
-        # Existing BUY/generic aliases.
         (order, "pre_order_qty", "order_pre_order_qty"),
         (order, "pre_buy_position_qty", "order_pre_buy_position_qty"),
         (order, "position_qty_before_order", "order_position_qty_before_order"),
@@ -301,7 +331,6 @@ def _extract_pre_order_position_qty(order: dict) -> tuple[int | None, str]:
         (meta, "position_qty_before_order", "meta_position_qty_before_order"),
         (meta, "position_qty_before", "meta_position_qty_before"),
         (meta, "existing_position_qty", "meta_existing_position_qty"),
-        # Priority 5: orderable_qty is last because it can be lower than holding_qty.
         (order, "orderable_qty", "order_orderable_qty"),
         (meta, "orderable_qty", "meta_orderable_qty"),
     ]
@@ -327,21 +356,27 @@ def _buy_balance_reconcile_allowed(order: dict, *, current_qty: int, order_qty: 
         if delta >= order_qty:
             return True, f"position_delta source={source} pre_qty={pre_qty} current_qty={current_qty} delta={delta}", pre_qty
         return False, f"position_delta_insufficient source={source} pre_qty={pre_qty} current_qty={current_qty} delta={delta}", pre_qty
-
-    # Without an explicit pre-order snapshot (or explicit was_new_position metadata
-    # handled above), total current quantity is not safe evidence of a BUY fill.
     return False, "missing_pre_order_qty_snapshot", None
 
 
+def _accepts_keyword(func: Any, keyword: str) -> bool:
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        param.name == keyword or param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in params
+    )
+
 
 def _get_balance_force_refresh(provider: Any) -> dict:
-    try:
-        return provider.get_balance(force_refresh=True)
-    except TypeError as exc:
-        if "force_refresh" not in str(exc):
-            raise
-        logger.warning("[US_RECONCILE][BALANCE_FORCE_REFRESH_UNSUPPORTED] provider=%s", type(provider).__name__)
-        return provider.get_balance()
+    method = provider.get_balance
+    if _accepts_keyword(method, "force_refresh"):
+        return method(force_refresh=True)
+    logger.warning("[US_RECONCILE][BALANCE_FORCE_REFRESH_UNSUPPORTED] provider=%s", type(provider).__name__)
+    return method()
+
 
 def confirm_order_by_balance_delta(side: str, order_qty: int, pre_qty: int | None, post_qty: int | None) -> dict:
     """Classify an ACK order from explicit pre/post balance quantities without fake fills."""
@@ -356,33 +391,47 @@ def confirm_order_by_balance_delta(side: str, order_qty: int, pre_qty: int | Non
         return {"status": "BALANCE_CONFIRMED_PARTIAL", "pending": True, "filled_qty_by_balance": filled, "remaining_qty": order_qty - filled}
     return {"status": "RECONCILE_NEEDS_RECHECK", "pending": True, "filled_qty_by_balance": max(0, filled), "remaining_qty": order_qty}
 
+
+def validate_reconcile_identity(*, trade_date: str, order_no: str = "", client_order_key: str = "",
+                                requested_symbol: str, requested_side: str, matches: list[dict]) -> dict:
+    """Strict lookup result gate; callers must not create fills on non-OK."""
+    if not str(trade_date or "").strip(): return {"status": "RECONCILE_TRADE_DATE_REQUIRED"}
+    if not str(order_no or "").strip() and not str(client_order_key or "").strip(): return {"status": "RECONCILE_ORDER_IDENTITY_REQUIRED"}
+    if not matches: return {"status": "RECONCILE_ORDER_NOT_FOUND"}
+    if len(matches) != 1: return {"status": "RECONCILE_ORDER_AMBIGUOUS"}
+    row = matches[0]
+    if str(row.get("symbol") or "").upper() != str(requested_symbol or "").upper(): return {"status": "RECONCILE_SYMBOL_MISMATCH"}
+    if str(row.get("side") or "").upper() != str(requested_side or "").upper(): return {"status": "RECONCILE_SIDE_MISMATCH"}
+    return {"status": "OK", "order": row}
+
+
+def _record_reconcile_failure(
+    *,
+    symbol: str,
+    mark_result: Any,
+    symbols_by_status: dict[str, list[str]],
+) -> str:
+    status = str(mark_result.get("status") if isinstance(mark_result, dict) else "INVALID_RECONCILE_RESULT")
+    symbols_by_status["unresolved"].append(symbol)
+    logger.error("[US_RECONCILE][MARK_FAILED] symbol=%s status=%s result=%r", symbol, status, mark_result)
+    return status
+
+
 def reconcile_ack_orders_with_balance(
     *,
     provider: Any | None = None,
     trade_date: str,
     env: str = "practice",
 ) -> dict:
-    """ACK 상태이나 qty_filled=0인 주문의 체결 여부를 KIS fills + 잔고로 확인.
-
-    1. us_orders에서 ACK + qty_filled=0 주문 로드
-    2. KIS 체결조회로 fill 확인 → 확인되면 us_fills 저장 + us_orders.status=FILLED
-    3. fill 미확인 시 잔고 변화 확인 → SELL이면 포지션 소멸 여부로 판단
-    4. 결과 반환
-
-    Returns:
-        {
-            "status": "OK"|"WARN"|"ERROR",
-            "pending_count": int,
-            "confirmed_count": int,
-            "balance_reconcile_count": int,
-            "unresolved_count": int,
-        }
-    """
+    """ACK 상태이나 qty_filled=0인 주문의 체결 여부를 KIS fills + 잔고로 확인."""
     from trader.us.db.repos import load_pending_ack_orders, mark_order_filled_by_reconcile
 
     if provider is None:
         from trader.us.data_provider import USDataProvider
         provider = USDataProvider(offline=True)
+    if not str(trade_date or "").strip():
+        trade_date = _ny_trade_date()
+        logger.warning("[US_RECONCILE][TRADE_DATE_FALLBACK] source=ny_clock trade_date=%s", trade_date)
 
     try:
         pending_orders = load_pending_ack_orders(trade_date=trade_date, env=env)
@@ -398,6 +447,7 @@ def reconcile_ack_orders_with_balance(
             "confirmed_count": 0,
             "balance_reconcile_count": 0,
             "unresolved_count": 0,
+            "failed_count": 0,
             "symbols_by_status": {},
         }
 
@@ -406,19 +456,17 @@ def reconcile_ack_orders_with_balance(
         len(pending_orders), trade_date,
     )
 
-    # KIS 잔고 조회 (BUY 생성 / SELL 소멸 확인용)
     kis_position_by_symbol: dict[str, dict] = {}
-    kis_position_symbols: set[str] = set()
     try:
         balance = _get_balance_force_refresh(provider)
         kis_position_by_symbol = _build_kis_position_by_symbol(balance.get("positions", []))
-        kis_position_symbols = set(kis_position_by_symbol.keys())
     except Exception as exc:
         logger.warning("[US_RECONCILE][ACK_RECONCILE][WARN] balance fetch failed: %s", exc)
 
     confirmed_count = 0
     balance_reconcile_count = 0
     unresolved_count = 0
+    failed_count = 0
     symbols_by_status: dict[str, list[str]] = {"fill_api_confirmed": [], "balance_confirmed": [], "unresolved": []}
 
     for order in pending_orders:
@@ -426,6 +474,16 @@ def reconcile_ack_orders_with_balance(
         side = str(order.get("side", "")).upper()
         order_no = str(order.get("order_no") or order.get("ack_no") or "")
         client_order_key = str(order.get("client_order_key") or "")
+        identity = validate_reconcile_identity(
+            trade_date=trade_date, order_no=order_no, client_order_key=client_order_key,
+            requested_symbol=symbol, requested_side=side, matches=[order],
+        )
+        if identity.get("status") != "OK":
+            unresolved_count += 1
+            symbols_by_status["unresolved"].append(symbol)
+            logger.error("[US_RECONCILE][STRICT_IDENTITY] status=%s symbol=%s", identity.get("status"), symbol)
+            continue
+
         qty = int(
             order.get("qty_requested")
             or order.get("qty")
@@ -433,28 +491,55 @@ def reconcile_ack_orders_with_balance(
             or order.get("qty_filled")
             or 0
         )
+        if qty <= 0:
+            logger.warning("[US_RECONCILE][ACK_RECONCILE][INVALID_QTY] symbol=%s order_no=%s side=%s qty=%d reason=missing_qty_requested", symbol, order_no, side, qty)
         fallback_fill_price, fallback_price_source = _resolve_order_fill_price(order)
         pre_qty_for_delta, _pre_source = _extract_pre_order_position_qty(order)
         post_qty_for_delta = int((kis_position_by_symbol.get(symbol) or {}).get("qty") or 0)
         delta_confirmation = confirm_order_by_balance_delta(side, qty, pre_qty_for_delta, post_qty_for_delta)
 
-        # KIS 체결조회 시도
         fill_confirmed = False
         fill_price = fallback_fill_price
         fill_price_source = fallback_price_source or "unavailable"
         fill_qty = qty
 
         try:
-            fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol)
+            fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
             if fills_resp and isinstance(fills_resp, dict):
+                fill_contract_status = str(
+                    fills_resp.get("evidence_status") or fills_resp.get("status") or "OK"
+                ).upper()
+                if fill_contract_status in _FILL_CONTRACT_ERROR_STATUSES:
+                    logger.error(
+                        "[US_RECONCILE][ACK_RECONCILE][FILL_CONTRACT_ERROR] symbol=%s status=%s",
+                        symbol, fill_contract_status,
+                    )
+                    failed_count += 1
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
+                    continue
                 if fills_resp.get("filled_qty", 0) > 0:
+                    fill_symbol = str(fills_resp.get("symbol") or symbol).upper()
+                    fill_side = str(fills_resp.get("side") or side).upper()
+                    fill_order_no = str(fills_resp.get("order_no") or order_no)
+                    if fill_symbol != symbol or fill_side != side or fill_order_no != order_no:
+                        logger.error("[US_RECONCILE][IDENTITY_MISMATCH] order_no=%s symbol=%s/%s side=%s/%s", order_no, symbol, fill_symbol, side, fill_side)
+                        failed_count += 1
+                        unresolved_count += 1
+                        symbols_by_status["unresolved"].append(symbol)
+                        continue
                     fill_price = float(fills_resp.get("avg_price", 0) or 0)
                     fill_price_source = "fills_by_order_no"
                     fill_qty = int(fills_resp.get("filled_qty", qty))
                     fill_confirmed = True
         except AttributeError:
-            # provider does not support get_fills_by_order_no (offline/mock)
             pass
+        except TypeError as exc:
+            logger.error("[US_RECONCILE][ACK_RECONCILE][CONTRACT_ERROR] fills_by_order_no signature error symbol=%s: %s", symbol, exc)
+            failed_count += 1
+            unresolved_count += 1
+            symbols_by_status["unresolved"].append(symbol)
+            continue
         except Exception as exc:
             logger.warning(
                 "[US_RECONCILE][ACK_RECONCILE][WARN] fills_by_order_no failed symbol=%s: %s",
@@ -467,27 +552,37 @@ def reconcile_ack_orders_with_balance(
                 symbol, order_no, fill_qty, fill_price,
             )
             try:
-                mark_order_filled_by_reconcile(
+                mark_result = mark_order_filled_by_reconcile(
                     order_no=order_no,
                     client_order_key=client_order_key,
                     symbol=symbol,
                     side=side,
                     filled_qty=fill_qty,
+                    requested_qty=qty,
+                    cumulative_filled_qty=fill_qty,
+                    evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
                     avg_price_usd=fill_price,
                     source="fills_reconcile",
                     trade_date=trade_date,
                     meta=_order_meta(order),
                 )
-                confirmed_count += 1
-                symbols_by_status["fill_api_confirmed"].append(symbol)
+                if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
+                    confirmed_count += 1
+                    symbols_by_status["fill_api_confirmed"].append(symbol)
+                else:
+                    _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
+                    failed_count += 1
+                    unresolved_count += 1
             except Exception as exc:
                 logger.error(
                     "[US_RECONCILE][ACK_RECONCILE][ERROR] mark_order_filled failed symbol=%s: %s",
                     symbol, exc,
                 )
+                failed_count += 1
+                unresolved_count += 1
+                symbols_by_status["unresolved"].append(symbol)
             continue
 
-        # fill 미확인: explicit 주문 전/후 잔고 delta가 명확하면 balance-confirmed 처리
         if delta_confirmation["status"] in {"BALANCE_CONFIRMED_BUY", "BALANCE_CONFIRMED_SELL", "BALANCE_CONFIRMED_PARTIAL"}:
             filled_by_balance = int(delta_confirmation.get("filled_qty_by_balance") or 0)
             source_name = "balance_reconcile_partial" if delta_confirmation["status"] == "BALANCE_CONFIRMED_PARTIAL" else f"balance_reconcile_{side.lower()}"
@@ -496,24 +591,34 @@ def reconcile_ack_orders_with_balance(
                 symbol, side, qty, filled_by_balance, pre_qty_for_delta, post_qty_for_delta, delta_confirmation["status"],
             )
             try:
-                mark_order_filled_by_reconcile(
+                mark_result = mark_order_filled_by_reconcile(
                     order_no=order_no,
                     client_order_key=client_order_key,
                     symbol=symbol,
                     side=side,
                     filled_qty=filled_by_balance,
+                    requested_qty=qty,
+                    cumulative_filled_qty=filled_by_balance,
+                    evidence_type="BALANCE_DELTA_SYNTHETIC",
                     avg_price_usd=fallback_fill_price,
                     source=source_name,
                     trade_date=trade_date,
                     meta={**_order_meta(order), "balance_delta_status": delta_confirmation["status"], "remaining_qty": delta_confirmation.get("remaining_qty", 0)},
                 )
-                balance_reconcile_count += 1
-                symbols_by_status["balance_confirmed"].append(symbol)
+                if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
+                    balance_reconcile_count += 1
+                    symbols_by_status["balance_confirmed"].append(symbol)
+                else:
+                    _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
+                    failed_count += 1
+                    unresolved_count += 1
             except Exception as exc:
                 logger.error("[US_RECONCILE][ACK_RECONCILE][ERROR] balance_delta_confirm failed symbol=%s: %s", symbol, exc)
+                failed_count += 1
+                unresolved_count += 1
+                symbols_by_status["unresolved"].append(symbol)
             continue
 
-        # fill 미확인: BUY이면 KIS 잔고 증가분으로만 balance reconcile
         if side == "BUY" and symbol in kis_position_by_symbol:
             position = kis_position_by_symbol[symbol]
             position_qty = int(position.get("qty") or 0)
@@ -535,24 +640,35 @@ def reconcile_ack_orders_with_balance(
                     buy_reason,
                 )
                 try:
-                    mark_order_filled_by_reconcile(
+                    mark_result = mark_order_filled_by_reconcile(
                         order_no=order_no,
                         client_order_key=client_order_key,
                         symbol=symbol,
                         side="BUY",
                         filled_qty=qty,
+                        requested_qty=qty,
+                        cumulative_filled_qty=qty,
+                        evidence_type="BALANCE_DELTA_SYNTHETIC",
                         avg_price_usd=fill_price_candidate,
                         source="balance_reconcile_buy",
                         trade_date=trade_date,
                         meta=_order_meta(order),
                     )
-                    balance_reconcile_count += 1
-                    symbols_by_status["balance_confirmed"].append(symbol)
+                    if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
+                        balance_reconcile_count += 1
+                        symbols_by_status["balance_confirmed"].append(symbol)
+                    else:
+                        _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
+                        failed_count += 1
+                        unresolved_count += 1
                 except Exception as exc:
                     logger.error(
                         "[US_RECONCILE][ACK_RECONCILE][ERROR] balance_reconcile_buy failed symbol=%s: %s",
                         symbol, exc,
                     )
+                    failed_count += 1
+                    unresolved_count += 1
+                    symbols_by_status["unresolved"].append(symbol)
                 continue
             logger.warning(
                 "[US_RECONCILE][BUY_BALANCE_RECONCILE][SKIP] symbol=%s order_no=%s qty=%d current_qty=%d pre_qty=%s reason=%s",
@@ -564,61 +680,6 @@ def reconcile_ack_orders_with_balance(
                 buy_reason if fill_price_candidate > 0 else "missing_fill_price",
             )
 
-        # fill 미확인: SELL이면 KIS 잔고에 포지션 없으면 balance reconcile
-        if side == "SELL" and symbol not in kis_position_symbols:
-            if qty <= 0:
-                logger.warning(
-                    "[US_RECONCILE][ACK_RECONCILE][INVALID_QTY] symbol=%s order_no=%s side=SELL qty=%d reason=missing_qty_requested",
-                    symbol,
-                    order_no,
-                    qty,
-                )
-                unresolved_count += 1
-                symbols_by_status["unresolved"].append(symbol)
-                continue
-
-            if fallback_fill_price > 0:
-                logger.info(
-                    "[US_RECONCILE][BALANCE_RECONCILE_FILL] symbol=%s side=SELL qty=%d price_source=%s price=%.4f source=balance_reconcile_sell",
-                    symbol,
-                    qty,
-                    fill_price_source,
-                    fallback_fill_price,
-                )
-            else:
-                logger.warning(
-                    "[US_RECONCILE][BALANCE_RECONCILE_FILL_PRICE_MISSING] symbol=%s side=SELL qty=%d source=balance_reconcile_sell",
-                    symbol,
-                    qty,
-                )
-
-            logger.info(
-                "[US_RECONCILE][BALANCE_RECONCILE_TRIGGER] symbol=%s side=SELL qty=%d",
-                symbol,
-                qty,
-            )
-            try:
-                mark_order_filled_by_reconcile(
-                    order_no=order_no,
-                    client_order_key=client_order_key,
-                    symbol=symbol,
-                    side="SELL",
-                    filled_qty=qty,
-                    avg_price_usd=fallback_fill_price,
-                    source="balance_reconcile_sell",
-                    trade_date=trade_date,
-                    meta=_order_meta(order),
-                )
-                balance_reconcile_count += 1
-                symbols_by_status["balance_confirmed"].append(symbol)
-            except Exception as exc:
-                logger.error(
-                    "[US_RECONCILE][ACK_RECONCILE][ERROR] balance_reconcile_fill failed symbol=%s: %s",
-                    symbol, exc,
-                )
-            continue
-
-        # 미해결
         logger.warning(
             "[US_RECONCILE][ACK_RECONCILE][UNRESOLVED] symbol=%s order_no=%s side=%s",
             symbol, order_no, side,
@@ -627,18 +688,20 @@ def reconcile_ack_orders_with_balance(
         symbols_by_status["unresolved"].append(symbol)
 
     logger.info(
-        "[US_RECONCILE][ACK_RECONCILE][DONE] pending=%d confirmed=%d balance_reconcile=%d unresolved=%d",
-        len(pending_orders), confirmed_count, balance_reconcile_count, unresolved_count,
+        "[US_RECONCILE][ACK_RECONCILE][DONE] pending=%d confirmed=%d balance_reconcile=%d unresolved=%d failed=%d",
+        len(pending_orders), confirmed_count, balance_reconcile_count, unresolved_count, failed_count,
     )
 
     return {
-        "status": "OK" if unresolved_count == 0 else "WARN",
+        "status": "ERROR" if failed_count > 0 else ("OK" if unresolved_count == 0 else "WARN"),
         "pending_count": len(pending_orders),
         "confirmed_count": confirmed_count,
         "balance_reconcile_count": balance_reconcile_count,
         "unresolved_count": unresolved_count,
+        "failed_count": failed_count,
         "symbols_by_status": symbols_by_status,
     }
+
 
 def classify_ack_orders_with_final_balance(
     *,
@@ -673,6 +736,17 @@ def classify_ack_orders_with_final_balance(
         final_qty = int((final_positions.get(symbol) or {}).get("qty") or 0)
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
+        identity = validate_reconcile_identity(
+            trade_date=trade_date, order_no=str(order.get("order_no") or ""),
+            client_order_key=str(order.get("client_order_key") or ""),
+            requested_symbol=symbol, requested_side=side, matches=[order],
+        )
+        if identity.get("status") != "OK":
+            final_status = identity["status"]
+            pending += 1
+            counts[final_status] = counts.get(final_status, 0) + 1
+            classified.append({"symbol": symbol, "side": side, "final_status": final_status})
+            continue
         if raw_status in {"REJECT", "REJECTED"}:
             final_status = "rejected"
         elif raw_status in {"BLOCKED", "WARN_DUPLICATE_EXIT_BLOCKED"}:
@@ -683,11 +757,9 @@ def classify_ack_orders_with_final_balance(
             final_status = "balance_delta_confirmed"
         elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty >= qty:
             final_status = "balance_delta_confirmed"
-        elif raw_status in {"ACK", "ACKED", "ACCEPTED", "SENT", "ACK_DB_FAILED"}:
-            final_status = "ack_only_unresolved"
         else:
             final_status = "ack_only_unresolved"
-        if final_status in {"ack_only_unresolved"}:
+        if final_status == "ack_only_unresolved":
             pending += 1
         counts[final_status] = counts.get(final_status, 0) + 1
         classified.append({
@@ -706,4 +778,10 @@ def classify_ack_orders_with_final_balance(
             "pre_order_position_qty": pre_qty,
             "final_position_qty": final_qty,
         })
-    return {"status": "OK", "orders": classified, "counts": counts, "pending_order_count": pending}
+    return {
+        "status": "OK" if pending == 0 else "DEGRADED_ACK_UNRESOLVED",
+        "orders": classified,
+        "counts": counts,
+        "pending_order_count": pending,
+        "reason": "" if pending == 0 else "ACK_ONLY_UNRESOLVED",
+    }

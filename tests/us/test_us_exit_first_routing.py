@@ -49,14 +49,14 @@ def _patch_tick_basics(monkeypatch, calls: list):
 
     monkeypatch.setattr("trader.us.data_provider.USDataProvider", _Provider)
     positions = [{"symbol": "BE", "exchange": "NASDAQ", "qty": 1, "orderable_qty": 1, "entry_price": 100.0}]
-    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None: {"status": "OK", "positions": positions, "position_count": 1, "position_symbols": ["BE"]})
+    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda provider=None, trade_date=None: {"status": "OK", "positions": positions, "position_count": 1, "position_symbols": ["BE"]})
     monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda provider=None, signal_only=False, trade_date=None: {"status": "OK", "fills": []})
     monkeypatch.setattr("trader.us.db.repos.load_today_symbols_sold", lambda trade_date=None: set())
     monkeypatch.setattr("trader.us.db.repos.save_fills", lambda fills: 0)
     monkeypatch.setattr("trader.us.execution.reconcile.reconcile_ack_orders_with_balance", lambda provider=None, trade_date=None, env="practice": {"status": "OK", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}})
-    monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda positions: 0)
-    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda log: True)
-    monkeypatch.setattr("trader.us.db.repos.load_positions", lambda: positions)
+    monkeypatch.setattr("trader.us.db.repos.save_position_snapshot", lambda positions, **kwargs: 0)
+    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda log, **kwargs: True)
+    monkeypatch.setattr("trader.us.db.repos.load_positions", lambda trade_date=None: positions)
     monkeypatch.setattr("trader.us.pb1.us_exit_position_resolver.enrich_us_positions_for_exit", lambda positions, trade_date, env, provider: (positions, {"total": 1, "ok": 1, "missing": 0, "sources": {}, "missing_symbols": []}))
     monkeypatch.setattr("trader.us.db.repos.get_today_buy_orders_count", lambda trade_date, env="practice": 0)
     monkeypatch.setattr("trader.us.db.repos.load_latest_us_prep_status", lambda trade_date: {"status": "OK"})

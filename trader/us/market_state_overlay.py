@@ -553,7 +553,12 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
     return intents
 
 
-def build_defense_trim_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None) -> list[dict]:
+def build_defense_trim_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None,
+                               trade_date: str | None = None, context=None) -> list[dict]:
+    from trader.us.execution.order_identity import InvalidOrderIdentity
+    trade_date = trade_date or getattr(context, "trade_date", None)
+    if not trade_date:
+        raise InvalidOrderIdentity("defense trim requires trade_date")
     state = overlay.get("market_state")
     if state not in {"DEFENSE_RISK_OFF", "DEFENSE_CRASH"}:
         return []
@@ -579,6 +584,20 @@ def build_defense_trim_intents(positions: list[dict], overlay: dict, existing_se
             continue
         qty = min(q - 1, max(1, int(q * pct)))
         reason = "DEFENSE_CRASH_TRIM" if state == "DEFENSE_CRASH" else "DEFENSE_RISK_OFF_TRIM"
-        intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "meta": {"reason": reason, "market_state": state}})
+        lifecycle = p.get("position_lifecycle_id") or (p.get("meta") or {}).get("position_lifecycle_id") or "NA"
+        td = trade_date
+        order_key = f"US_DEF_{td}_{sym}_{lifecycle}_{state}_{q}_{qty}"
+        intents.append({
+            "symbol": sym, "exchange": p.get("exchange") or p.get("raw_exchange") or "",
+            "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price,
+            "notional_usd": qty * price, "reason": reason, "client_order_key": order_key,
+            "trade_date": td, "position_lifecycle_id": lifecycle, "pre_order_position_qty": q,
+            "session": getattr(context, "session", ""),
+            "session_run_id": getattr(context, "session_run_id", ""),
+            "session_generation": getattr(context, "session_generation", 1),
+            "tick_id": getattr(context, "tick_id", ""), "prep_run_id": getattr(context, "prep_run_id", ""),
+            "meta": {"reason": reason, "market_state": state, "position_lifecycle_id": lifecycle,
+                     "pre_order_position_qty": q},
+        })
         logger.warning("[US_DEFENSE][TRIM] symbol=%s qty=%d notional=%.2f reason=%s market_state=%s", sym, qty, qty * price, reason, state)
     return intents

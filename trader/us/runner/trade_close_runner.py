@@ -27,7 +27,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
     from trader.us.data_provider import USDataProvider
     from trader.us.db.repos import (
-        save_fills, save_position_snapshot, save_reconcile_log,
+        save_fills_with_result, save_position_snapshot, save_reconcile_log,
     )
     from trader.us.market_calendar import now_ny
     from datetime import datetime
@@ -92,12 +92,51 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
         # 2. Fills DB 저장
         try:
-            save_fills(fills)
-            logger.info("[US_FILLS][SAVE] count=%d", len(fills))
+            if fills:
+                fill_save_result = save_fills_with_result(fills, trade_date=trade_date)
+            else:
+                fill_save_result = {"status": "OK", "inserted_count": 0, "updated_count": 0, "unchanged_count": 0, "regression_count": 0}
+            if fill_save_result.get("status") != "OK":
+                fills_status = fill_save_result.get("status", "ERROR")
+                fills_error = fill_save_result.get("error") or fills_status
+                logger.error("[US_FILLS][SAVE][FAILED] result=%s", fill_save_result)
+            logger.info("[US_FILLS][SAVE] count=%d result=%s", len(fills), fill_save_result)
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] save_fills failed: %s", exc)
+            fills_status = "DB_ERROR"
+            fills_error = str(exc)
 
-        # 3. Reconcile
+        # 3. Final ACK reconciliation against the just-saved KIS snapshots.
+        ack_reconcile_result: dict = {
+            "status": "SKIP",
+            "pending_count": 0,
+            "confirmed_count": 0,
+            "balance_reconcile_count": 0,
+            "unresolved_count": 0,
+            "failed_count": 0,
+        }
+        if not offline:
+            try:
+                from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
+                ack_reconcile_result = reconcile_ack_orders_with_balance(
+                    provider=provider,
+                    trade_date=trade_date,
+                    env=env,
+                )
+                logger.info("[US_TRADE_CLOSE][ACK_RECONCILE] result=%s", ack_reconcile_result)
+            except Exception as exc:
+                ack_reconcile_result = {
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "pending_count": 0,
+                    "confirmed_count": 0,
+                    "balance_reconcile_count": 0,
+                    "unresolved_count": 0,
+                    "failed_count": 1,
+                }
+                logger.error("[US_TRADE_CLOSE][ACK_RECONCILE_ERROR] %s", exc)
+
+        # 4. Reconcile
         reconcile_result: dict = {
             "status": "SKIP",
             "balance_fetch_status": "SKIP",
@@ -109,8 +148,20 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         if not offline:
             try:
                 from trader.us.execution.reconcile import reconcile_positions
-                reconcile_result = reconcile_positions(provider=provider)
+                reconcile_result = reconcile_positions(provider=provider, trade_date=trade_date)
                 logger.info("[US_TRADE_CLOSE][RECONCILE] status=%s", reconcile_result.get("status"))
+            except TypeError as exc:
+                logger.error("[US_TRADE_CLOSE][CONTRACT_ERROR] reconcile TypeError: %s", exc)
+                reconcile_result = {
+                    "status": "CONTRACT_ERROR",
+                    "reason": "reconcile_internal_type_error",
+                    "balance_fetch_status": "FAILED",
+                    "authoritative_positions": False,
+                    "preserve_previous_positions": True,
+                    "error": str(exc),
+                    "positions": [],
+                    "position_count": 0,
+                }
             except Exception as exc:
                 logger.error("[US_TRADE_CLOSE][ERROR] reconcile failed: %s", exc)
                 reconcile_result = {
@@ -125,6 +176,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
 
         # 4. Positions DB 저장 — only authoritative OK zero/positions may overwrite snapshot.
         positions = reconcile_result.get("positions", [])
+        position_snapshot_error = ""
         try:
             can_save_positions = (
                 reconcile_result.get("status") == "OK"
@@ -141,10 +193,13 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                     reconcile_result.get("authoritative_positions"),
                 )
             else:
-                save_position_snapshot(positions)
+                save_position_snapshot(positions, trade_date=trade_date, balance_fetch_status="OK",
+                                       balance_parse_status="OK", authoritative_positions=True,
+                                       preserve_previous_positions=False, close_source="kis_final_balance")
                 logger.info("[US_POSITIONS][SNAPSHOT][SAVE] count=%d", len(positions))
         except Exception as exc:
-            logger.warning("[US_TRADE_CLOSE][WARN] save_position_snapshot failed: %s", exc)
+            position_snapshot_error = str(exc)
+            logger.error("[US_TRADE_CLOSE][ERROR] save_position_snapshot failed: %s", exc)
 
         # 5. Reconcile log DB 저장
         try:
@@ -154,15 +209,17 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
                 "position_count": len(positions),
                 "total_pvs": reconcile_result.get("total_pvs_usd", 0),
                 "detail": {"env": env, "runner": "trade_close"},
-            })
+            }, trade_date=trade_date)
             logger.info("[US_RECONCILE_LOG][SAVE]")
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] save_reconcile_log failed: %s", exc)
 
         # 6. Balance snapshot
         balance = {}
+        balance_fetch_ok = False
         try:
             balance = provider.get_balance()
+            balance_fetch_ok = isinstance(balance, dict) and str(balance.get("balance_parse_status", "OK")) == "OK"
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] balance fetch failed: %s", exc)
 
@@ -185,34 +242,96 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         # 8. Daily report
         try:
             from trader.us.runner.daily_report_runner import run_daily_report
-            run_daily_report(env=env, offline=offline)
+            final_positions_authoritative = bool(
+                reconcile_result.get("status") == "OK"
+                and reconcile_result.get("balance_fetch_status") == "OK"
+                and reconcile_result.get("balance_parse_status", "OK") == "OK"
+                and reconcile_result.get("preserve_previous_positions") is False
+            )
+            direct_positions = positions if final_positions_authoritative else None
+            direct_balance = reconcile_result if final_positions_authoritative else None
+            if not final_positions_authoritative and balance_fetch_ok:
+                candidate_positions = balance.get("positions")
+                if isinstance(candidate_positions, list):
+                    direct_positions = candidate_positions
+                    direct_balance = balance
+            daily_report_result = run_daily_report(
+                env=env, session="close", trade_date=trade_date, offline=offline,
+                final_balance=direct_balance, final_positions=direct_positions, kis_fills=fills,
+                close_order_classification=close_order_classification, close_run_id=run_id,
+            )
         except Exception as exc:
             logger.warning("[US_TRADE_CLOSE][WARN] daily report failed: %s", exc)
+            daily_report_result = {"status": "ERROR", "report": {"report_consistency": "REPORT_INCONSISTENT"}}
 
-        # 8. Status 계산
+        # 9. Status 계산
         status = "OK"
-        if fills_status == "CONTRACT_ERROR":
+        daily_report_result = daily_report_result or {"status": "OK", "report": {"report_consistency": "OK"}}
+        pending_count = int(close_order_classification.get("pending_order_count") or 0)
+        report_consistency = (daily_report_result.get("report") or {}).get("report_consistency", "OK")
+        reconcile_status = str(reconcile_result.get("status") or "UNKNOWN").upper()
+        ack_reconcile_status = str(ack_reconcile_result.get("status") or "UNKNOWN").upper()
+        ack_reconcile_failed = bool(
+            ack_reconcile_status not in {"OK", "SKIP"}
+            or int(ack_reconcile_result.get("failed_count") or 0) > 0
+        )
+        ack_unresolved_count = int(ack_reconcile_result.get("unresolved_count") or 0)
+        pending_count = max(pending_count, ack_unresolved_count)
+        reconcile_error_statuses = {
+            "CONTRACT_ERROR",
+            "FATAL_ERROR",
+            "POSITION_PERSIST_ERROR",
+            "FILL_ACCOUNTING_INVARIANT_FAILED",
+            "RECONCILE_UPDATE_FAILED",
+            "EVIDENCE_QUANTITY_REGRESSION",
+            "EVIDENCE_QUANTITY_CONFLICT",
+            "EVIDENCE_QUANTITY_OVERFLOW",
+        }
+        if (
+            fills_status in {"DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}
+            or position_snapshot_error
+            or reconcile_status in reconcile_error_statuses
+            or ack_reconcile_failed
+        ):
+            report_consistency = "FAILED"
+        report_failed = (
+            daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS"}
+            or bool((daily_report_result.get("report") or {}).get("errors"))
+            or report_consistency != "OK"
+        )
+        if fills_status in {"CONTRACT_ERROR", "DB_ERROR", "EVIDENCE_QUANTITY_REGRESSION"}:
             status = "ERROR"
-        elif reconcile_result.get("status") in {"CONTRACT_ERROR", "FATAL_ERROR"}:
+        elif reconcile_status in reconcile_error_statuses:
             status = "ERROR"
-        elif fills_status not in ("OK", "SKIP") or reconcile_result.get("status") not in ("OK", "SKIP"):
+        elif ack_reconcile_failed:
+            status = "ERROR"
+        elif position_snapshot_error:
+            status = "ERROR"
+        elif report_failed:
+            status = "ERROR"
+        elif close_order_classification.get("status") == "ERROR":
+            status = "ERROR"
+        elif pending_count > 0:
+            status = "DEGRADED_ACK_UNRESOLVED"
+        elif fills_status not in ("OK", "SKIP") or reconcile_status not in ("OK", "SKIP"):
             status = "OK_WITH_WARNINGS"
 
-        # 9. Final 로그
+        # 10. Final 로그
         if status == "OK":
             logger.info("[US_TRADE_CLOSE][OK]")
         elif status == "OK_WITH_WARNINGS":
             logger.warning(
                 "[US_TRADE_CLOSE][WARNINGS] fills_status=%s reconcile_status=%s",
                 fills_status,
-                reconcile_result.get("status"),
+                reconcile_status,
             )
         else:
             logger.error(
-                "[US_TRADE_CLOSE][ERROR] final_status=ERROR fills_status=%s reconcile_status=%s fills_error=%s",
+                "[US_TRADE_CLOSE][ERROR] final_status=ERROR fills_status=%s reconcile_status=%s fills_error=%s position_snapshot_error=%s",
                 fills_status,
-                reconcile_result.get("status"),
+                reconcile_status,
                 fills_error,
+                position_snapshot_error,
             )
 
         return {
@@ -221,12 +340,17 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "fills_error": fills_error,
             "fills_count": len(fills),
             "positions_count": len(positions),
-            "reconcile_status": reconcile_result.get("status"),
+            "reconcile_status": reconcile_status,
+            "ack_reconcile_status": ack_reconcile_status,
+            "ack_reconcile_result": ack_reconcile_result,
             "balance": balance,
             "close_entry_enabled": close_entry_enabled,
             "order_final_classification": close_order_classification.get("orders", []),
             "order_final_classification_counts": close_order_classification.get("counts", {}),
             "pending_order_count": close_order_classification.get("pending_order_count", 0),
+            "daily_report_status": daily_report_result.get("status"),
+            "report_consistency": report_consistency,
+            "position_snapshot_error": position_snapshot_error,
         }
     finally:
         release_us_session_running_lock(trade_date, "close", run_id=run_id)

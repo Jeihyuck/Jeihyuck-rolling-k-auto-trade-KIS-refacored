@@ -77,6 +77,11 @@ def test_daily_final_report_payload_uses_distinct_orders(tmp_path, monkeypatch):
     assert saved["real_broker_sells"] == 10
 
 
+def _capture_success(captured, **kwargs):
+    captured.append(kwargs)
+    return {"status": "OK"}
+
+
 def test_partial_sell_ack_balance_delta_confirm_via_reconcile_path(monkeypatch):
     import trader.us.execution.reconcile as reconcile
     import trader.us.db.repos as repos
@@ -91,7 +96,7 @@ def test_partial_sell_ack_balance_delta_confirm_via_reconcile_path(monkeypatch):
         "meta": {"pre_sell_qty": 8},
     }])
     captured = []
-    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: _capture_success(captured, **kwargs))
 
     class Provider:
         def __init__(self):
@@ -129,7 +134,7 @@ def test_reconcile_bypasses_stale_balance_cache_for_partial_sell(monkeypatch):
         "meta": {"holding_qty": 8},
     }])
     captured = []
-    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: _capture_success(captured, **kwargs))
 
     class Provider:
         def __init__(self):
@@ -184,7 +189,7 @@ def test_full_sell_position_absent_fallback_still_confirms(monkeypatch):
         "meta": {},
     }])
     captured = []
-    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: captured.append(kwargs))
+    monkeypatch.setattr(repos, "mark_order_filled_by_reconcile", lambda **kwargs: _capture_success(captured, **kwargs))
 
     class Provider:
         def get_balance(self, force_refresh=False):

@@ -34,6 +34,16 @@ from trader.us.db.repos import (  # test patch surface
 
 logger = logging.getLogger(__name__)
 
+
+class _StatusCompat(str):
+    def __new__(cls, value: str, *aliases: str):
+        obj = str.__new__(cls, value)
+        obj.aliases = set(aliases)
+        return obj
+    def __eq__(self, other):
+        return str.__eq__(self, other) or str(other) in self.aliases
+    __hash__ = str.__hash__
+
 # in-process 중복 키 (DB fallback 없을 때도 동일 process 내 중복 차단)
 _SENT_ORDER_KEYS: set[str] = set()
 _BLOCKED_INTENT_KEYS: set[tuple[str, str, str]] = set()
@@ -152,16 +162,20 @@ def _lookup_nested_exchange(obj: Any) -> str:
     return ""
 
 
-def enrich_sell_exchange(intent: dict, kis_client: Any = None) -> str:
+def enrich_sell_exchange(intent: dict, kis_client: Any = None, context: Any = None) -> str:
     """Fill SELL exchange before risk gate so exit intents are not blocked."""
     symbol = str(intent.get("symbol") or "").upper().strip()
     candidates = [
         intent.get("exchange"),
+        (getattr(context, "exchange_by_symbol", {}) or {}).get(symbol),
+        _lookup_nested_exchange((getattr(context, "positions_by_symbol", {}) or {}).get(symbol, {})),
         _lookup_nested_exchange(intent.get("current_holding")),
         _lookup_nested_exchange(intent.get("kis_balance_position")),
         _lookup_nested_exchange(intent.get("locked_watchlist_row")),
     ]
-    if kis_client is not None:
+    # A tick context is authoritative and deliberately prevents N balance calls
+    # for N sell intents. Legacy one-off callers retain the broker fallback.
+    if kis_client is not None and context is None:
         try:
             candidates.append(_lookup_nested_exchange(_get_broker_position(kis_client, symbol) or {}))
         except Exception as exc:
@@ -253,6 +267,7 @@ def route_order(
     kis_order_allowed: bool = True,
     allowed_symbols: "set[str] | None" = None,
     current_position_symbols: "set[str] | None" = None,
+    context: Any | None = None,
 ) -> dict:
     """Order intent를 라우팅한다.
 
@@ -272,6 +287,12 @@ def route_order(
     )
     from trader.utils.env import env_bool
 
+    from trader.us.execution.order_identity import InvalidOrderIdentity, normalize_and_validate_order_identity
+    try:
+        intent = normalize_and_validate_order_identity(intent, context)
+    except InvalidOrderIdentity as exc:
+        logger.critical("[US_ORDER][INVALID_ORDER_IDENTITY] error=%s", exc)
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": str(exc), "broker_submit": False, "intent": intent}
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
     symbol_upper = str(symbol or "").upper().strip()
@@ -296,9 +317,21 @@ def route_order(
     price = float(intent.get("limit_price", 0.0))
     exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
     if side == "SELL":
-        exchange = enrich_sell_exchange(intent, kis_client)
+        exchange = enrich_sell_exchange(intent, kis_client, context)
+        if not exchange:
+            return {"status": "EXCHANGE_MISSING_FATAL", "reason": "sell_exchange_unresolved",
+                    "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+    if context is not None and (symbol_upper, side) in context.blocked_symbol_sides:
+        return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "unresolved_prior_order",
+                "broker_submit": False, "retry_order": False, "requires_reconcile": True, "intent": intent}
     order_key = intent.get("client_order_key") or intent.get("order_key", "")
     trade_date = intent.get("trade_date")
+    if not str(trade_date or "").strip():
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": "trade_date_required_before_broker_submit",
+                "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+
+    def _persist_with_trade_date(func, payload):
+        return func(payload, trade_date=trade_date)
 
     logger.info(
         "[US_ORDER][INTENT] symbol=%s side=%s qty=%s notional_usd=%.2f key=%s",
@@ -376,7 +409,8 @@ def route_order(
         }
 
     # 2. intent DB 저장
-    save_order_intent(intent)
+    if not _persist_with_trade_date(save_order_intent, intent):
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": "intent_persistence_rejected", "broker_submit": False, "intent": intent}
 
     # 3. 중복 key: DB + in-memory 합산
 
@@ -513,7 +547,7 @@ def route_order(
     if dry_run_resolved:
         logger.info("[US_ORDER][DRY_RUN] symbol=%s side=%s qty=%s", symbol, side, qty)
         dry_intent = {**intent, "client_order_key": order_key}
-        save_dry_run_order(dry_intent)
+        _persist_with_trade_date(save_dry_run_order, dry_intent)
         if order_key:
             # Mark as DRY_RUN instead of SENT to distinguish from real orders
             mark_order_intent_dry_run(order_key)
@@ -537,7 +571,7 @@ def route_order(
                 try:
                     from trader.us.db.repos import load_us_positions_by_symbols
 
-                    db_positions = load_us_positions_by_symbols([symbol]) if symbol else {}
+                    db_positions = load_us_positions_by_symbols([symbol], as_of=trade_date) if symbol else {}
                     db_pos = db_positions.get(symbol, {})
                     if db_pos:
                         pre_qty = int(db_pos.get("qty") or db_pos.get("holding_qty") or 0)
@@ -781,6 +815,18 @@ def route_order(
                     (_pos_for_guard.get("position_source") if "_pos_for_guard" in locals() else None) or "pre_sell_position_snapshot",
                 )
 
+    # Last possible fence and durable write occur immediately before the API.
+    if context is not None and not context.broker_submit_allowed():
+        from trader.us.execution.order_journal import append_order_event
+        append_order_event("ORDER_FENCED", intent, context=context, broker_status="ORDER_FENCED_BEFORE_BROKER_SUBMIT")
+        return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
+                "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
+    from trader.us.execution.order_journal import append_order_event
+    try:
+        append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
+    except Exception as exc:
+        logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
+        return {"status": "INVALID_ORDER_IDENTITY", "reason": "durable_journal_write_failed", "broker_submit": False, "intent": intent}
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
     # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────
@@ -793,11 +839,6 @@ def route_order(
             resp = kis_client.place_us_buy_order(symbol, exchange, qty, price)
         else:
             resp = kis_client.place_us_sell_order(symbol, exchange, qty, price)
-
-        from trader.us.execution.kis_us_response_parser import extract_order_no
-        order_no = extract_order_no(resp)
-        logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
-
     except Exception as exc:
         # KIS API 자체 실패 → REJECT (SELL no-balance after ACK is reconciliatory, not fatal)
         msg = str(exc)
@@ -835,7 +876,7 @@ def route_order(
             "qty": qty,
             "reason": msg,
         }
-        save_order_reject(reject_result)
+        _persist_with_trade_date(save_order_reject, reject_result)
         if order_key:
             mark_order_intent_rejected(order_key, reason=msg)
         return {
@@ -847,6 +888,29 @@ def route_order(
             "cash_exhausted": bool(side == "BUY" and _is_cash_insufficient_reject(msg)),
             "intent": intent,
         }
+
+    # A broker response means submission occurred. Parsing/audit failures are
+    # unresolved ACK states and must never enter broker rejection handling.
+    try:
+        from trader.us.execution.kis_us_response_parser import extract_order_no
+        order_no = extract_order_no(resp)
+    except Exception as exc:
+        logger.error("[US_ORDER][ACK_PARSE_FAILED] symbol=%s err=%s", symbol, exc)
+        return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+    if not order_no:
+        return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
+                "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
+    try:
+        append_order_event("BROKER_ACK_RECEIVED", intent, context=context, broker_order_no=order_no,
+                           broker_status="ACK", raw_response=resp)
+    except Exception as exc:
+        logger.critical("[US_ORDER][ACK_JOURNAL_FAILED] symbol=%s order_no=%s err=%s", symbol, order_no, exc)
+        return {"status": "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "kis_ack": True,
+                "broker_submit": True, "retry_order": False, "requires_reconcile": True,
+                "order_no": order_no, "intent": intent}
+    logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
+
 
     # ── DB ACK 저장 (KIS 성공 이후 별도 try) ─────────────────────────────
     # KIS 주문이 성공했으므로 어떤 경우에도 REJECT로 기록하면 안 된다.
@@ -882,7 +946,7 @@ def route_order(
 
     ack_db_saved = False
     try:
-        ack_db_saved = bool(save_order_ack(ack_result))
+        ack_db_saved = bool(_persist_with_trade_date(save_order_ack, ack_result))
         if ack_db_saved:
             logger.info("[US_ORDER][ACK_DB_SAVE][OK] symbol=%s order_no=%s", symbol, order_no)
     except Exception:
@@ -891,6 +955,15 @@ def route_order(
             symbol, side, ack_result.get("order_no"),
         )
         ack_db_saved = False
+
+    if ack_db_saved:
+        try:
+            append_order_event("DB_ACK_PERSISTED", intent, context=context, broker_order_no=order_no or "", broker_status="ACK")
+        except Exception as exc:
+            logger.critical("[US_ORDER][DB_ACK_JOURNAL_FAILED] order_no=%s err=%s", order_no, exc)
+            return {"status": "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "symbol": symbol,
+                    "side": side, "order_no": order_no, "kis_ack": True, "ack_db_saved": True,
+                    "broker_submit": True, "retry_order": False, "requires_reconcile": True, "intent": intent}
 
     if not ack_db_saved:
         logger.error(
@@ -907,6 +980,7 @@ def route_order(
             "intent": intent,
             "kis_ack": True,
             "ack_db_saved": False,
+            "retry_order": False,
         }
 
     # ── intent 상태 업데이트 ───────────────────────────────────────────────
@@ -942,7 +1016,7 @@ def route_order(
             symbol, order_no,
         )
         return {
-            "status": "ACK_DB_FAILED",
+            "status": _StatusCompat("ACK_DB_FAILED_RECONCILE_REQUIRED", "ACK_DB_FAILED"),
             "symbol": symbol,
             "side": side,
             "qty": qty,
@@ -951,6 +1025,8 @@ def route_order(
             "intent": intent,
             "kis_ack": True,
             "ack_db_saved": False,
+            "broker_submit": True,
+            "retry_order": False,
             "requires_reconcile": True,
         }
 

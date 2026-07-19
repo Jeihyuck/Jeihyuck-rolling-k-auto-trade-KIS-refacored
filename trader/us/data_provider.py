@@ -487,6 +487,36 @@ def normalize_us_balance(raw: dict) -> dict:
     
     return result
 
+def normalize_us_order_status_row(row: dict) -> dict:
+    """Normalize KIS US order/fill status fields for timeout replay."""
+    order_no = str(_get_first_valid(row, ("order_no", "odno", "ODNO"), "") or "").strip()
+    symbol = str(_get_first_valid(row, ("symbol", "pdno", "PDNO"), "") or "").strip().upper()
+    side_raw = str(_get_first_valid(row, ("side", "sll_buy_dvsn_cd", "SLL_BUY_DVSN_CD"), "") or "").upper()
+    side = "BUY" if side_raw in {"BUY", "02", "B"} else "SELL" if side_raw in {"SELL", "01", "S"} else side_raw
+    requested = _safe_int(_get_first_valid(row, ("requested_qty", "qty", "ord_qty", "ft_ord_qty", "ORD_QTY"), 0))
+    filled = _safe_int(_get_first_valid(row, ("filled_qty", "ft_ccld_qty", "ccld_qty", "tot_ccld_qty"), 0))
+    remaining = _safe_int(_get_first_valid(row, ("remaining_qty", "nccs_qty", "rmn_qty"), max(0, requested - filled)))
+    raw_status = str(_get_first_valid(row, ("status", "ord_dvsn_name", "ord_sttus", "rjct_rson"), "") or "").upper()
+    if "REJECT" in raw_status or "거부" in raw_status:
+        status = "REJECTED"
+    elif "CANCEL" in raw_status or "취소" in raw_status:
+        status = "CANCELLED"
+    elif requested and filled >= requested:
+        status = "FILLED"
+    elif filled > 0:
+        status = "PARTIALLY_FILLED"
+    elif order_no:
+        status = "ACK"
+    else:
+        status = "UNKNOWN"
+    return {
+        "order_no": order_no, "symbol": symbol, "side": side,
+        "requested_qty": requested, "filled_qty": filled, "remaining_qty": remaining,
+        "status": status,
+        "avg_price": _safe_float(_get_first_valid(row, ("avg_price", "ft_ccld_unpr3", "avg_prvs"), 0.0)),
+        "raw": row,
+    }
+
 
 class USDataProvider:
     """미국주식 데이터 제공자.
@@ -915,6 +945,48 @@ class USDataProvider:
         logger.warning("[US_DATA][WARN] orderable_cash not found in response, returning 0.0")
         return 0.0
     
+
+    def get_today_orders(self, trade_date: str) -> list[dict]:
+        """Return normalized same-day US broker order status rows."""
+        if self._offline:
+            return []
+        client = self._get_client()
+        method = getattr(client, "get_us_today_orders", None)
+        if not callable(method):
+            # KIS order/fill endpoint exposes order status in ccnl rows on many schemas.
+            raw = client.get_us_fills_today(trade_date=trade_date)
+        else:
+            raw = method(trade_date=trade_date)
+        return [normalize_us_order_status_row(row) for row in (raw or [])]
+
+    def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict | None:
+        """Return normalized cumulative fill/order detail for a single broker order."""
+        if self._offline:
+            return None
+        rows = self.get_today_orders(trade_date)
+        matches = [r for r in rows if str(r.get("order_no") or "") == str(order_no) and str(r.get("symbol") or "").upper() == str(symbol).upper()]
+        if not matches:
+            return None
+        def _observed(row: dict) -> str:
+            return str(row.get("observed_at") or row.get("updated_at") or row.get("order_timestamp") or row.get("order_time") or "")
+        best = matches[0]
+        conflict = False
+        for row in matches[1:]:
+            row_qty = _safe_int(row.get("filled_qty") or row.get("cumulative_filled_qty") or 0)
+            best_qty = _safe_int(best.get("filled_qty") or best.get("cumulative_filled_qty") or 0)
+            if row_qty > best_qty or (row_qty == best_qty and _observed(row) >= _observed(best)):
+                best = row
+            elif _observed(row) > _observed(best) and row_qty < best_qty:
+                conflict = True
+        out = dict(best)
+        out["filled_qty"] = _safe_int(best.get("filled_qty") or best.get("cumulative_filled_qty") or 0)
+        out["cumulative_filled_qty"] = out["filled_qty"]
+        out["avg_price"] = _safe_float(best.get("avg_price") or best.get("avg_price_usd") or 0.0)
+        if conflict:
+            out["status"] = "EVIDENCE_QUANTITY_REGRESSION"
+            out["requires_reconcile"] = True
+        return out
+
     def get_client_stats(self) -> dict:
         """KIS client stats 반환 (retry count 등)."""
         if self._client is None:

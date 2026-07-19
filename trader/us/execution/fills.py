@@ -7,9 +7,30 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+def _first_nonblank(row: dict, *keys: str) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _combine_kis_date_time(date_value: str | None, *time_values: str | None) -> str:
+    date_text = str(date_value or "").replace("-", "").strip()
+    time_text = ""
+    for value in time_values:
+        if value not in (None, ""):
+            time_text = str(value).replace(":", "").strip()
+            break
+    if date_text and time_text:
+        time_text = time_text.zfill(6)[:6]
+        return f"{date_text[:4]}-{date_text[4:6]}-{date_text[6:8]}T{time_text[:2]}:{time_text[2:4]}:{time_text[4:6]}"
+    return date_text
 
 
 def get_fills_today(
@@ -44,7 +65,7 @@ def get_fills_today(
         logger.info("[US_FILLS][SIGNAL_ONLY] skipping KIS fill query, using DB-only")
         try:
             from trader.us.db.repos import load_today_fills
-            db_fills = load_today_fills()
+            db_fills = load_today_fills(trade_date=trade_date)
             logger.info("[US_FILLS][DB_ONLY] count=%d", len(db_fills))
             return {
                 "status": "OK",
@@ -68,16 +89,51 @@ def get_fills_today(
     try:
         client = provider._get_client()
         raw = client.get_us_fills_today(trade_date=trade_date)
+        observed_at = datetime.now(timezone.utc).isoformat()
         fills = []
         for row in raw:
+            order_no = _first_nonblank(row, "odno", "order_no", "ODNO")
+            order_timestamp = _combine_kis_date_time(
+                _first_nonblank(row, "ord_dt", "ORD_DT"),
+                _first_nonblank(row, "ord_tmd", "ORD_TMD"),
+            )
+            requested_qty = int(row.get("ft_ord_qty") or row.get("ord_qty") or 0)
+            cumulative_filled_qty = int(row.get("ft_ccld_qty", 0) or 0)
+            remaining_qty = int(row.get("nccs_qty") or row.get("rmn_qty") or 0)
+            avg_price_usd = float(row.get("ft_ccld_unpr3", 0) or 0)
+            if cumulative_filled_qty <= 0:
+                logger.debug(
+                    "[US_FILLS][SKIP_UNFILLED_ORDER] order_no=%s symbol=%s remaining_qty=%s",
+                    order_no,
+                    row.get("pdno", ""),
+                    remaining_qty,
+                )
+                continue
             fills.append({
                 "symbol": row.get("pdno", ""),
                 "exchange": row.get("ovrs_excg_cd", ""),
                 "side": "BUY" if row.get("sll_buy_dvsn_cd") == "02" else "SELL",
-                "qty": int(row.get("ft_ccld_qty", 0) or 0),
-                "price": float(row.get("ft_ccld_unpr3", 0) or 0),
-                "filled_at": row.get("ord_dt", ""),
-                "order_no": row.get("odno", ""),
+                "qty": cumulative_filled_qty,
+                "price": avg_price_usd,
+                "avg_price_usd": avg_price_usd,
+                "filled_at": order_timestamp or row.get("ord_dt", ""),
+                "observed_at": observed_at,
+                "order_timestamp": order_timestamp,
+                "order_no": order_no,
+                "requested_qty": requested_qty,
+                "cumulative_filled_qty": cumulative_filled_qty,
+                "remaining_qty": remaining_qty,
+                "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                "meta": {
+                    "is_synthetic": False,
+                    "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+                    "source_endpoint": "KIS_INQUIRE_CCNL",
+                    "cumulative_filled_qty": cumulative_filled_qty,
+                    "remaining_qty": remaining_qty,
+                    "requested_qty": requested_qty,
+                    "order_timestamp": order_timestamp,
+                    "observed_at": observed_at,
+                },
                 "raw": row,
             })
         logger.info("[US_FILLS][OK] count=%d", len(fills))

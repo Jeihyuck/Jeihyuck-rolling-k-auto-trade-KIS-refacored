@@ -92,6 +92,12 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "HOOD": "NASDAQ",
     "MSTR": "NASDAQ",
     "CEG": "NASDAQ",
+    "AMD": "NASDAQ", "AMAT": "NASDAQ", "ALAB": "NASDAQ", "CRWD": "NASDAQ",
+    "DDOG": "NASDAQ", "INTC": "NASDAQ", "MDB": "NASDAQ", "MU": "NASDAQ",
+    "PANW": "NASDAQ", "TXN": "NASDAQ",
+    "PLTR": "NASDAQ",
+    "DIA": "NYSE", "IWM": "NYSE", "RSP": "NYSE",
+    "XLK": "NYSE", "XLV": "NYSE",
 }
 
 _VALID_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")
