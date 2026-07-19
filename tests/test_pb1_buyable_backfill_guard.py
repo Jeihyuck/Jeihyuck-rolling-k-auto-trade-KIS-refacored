@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import trader
+from trader.pb1_runtime_guards import _apply_buyable_candidate_backfill
 
 
 class DummyEngine:
@@ -86,7 +86,7 @@ def test_buyable_backfill_skips_existing_holding_and_promotes_next_candidate():
     held = _candidate("207940", held=True, score=99.0)
     nxt = _candidate("005930", score=41.0)
 
-    added = trader._apply_buyable_candidate_backfill(
+    added = _apply_buyable_candidate_backfill(
         engine,
         result=result,
         orderable_candidates=result.orderable_candidates,
@@ -120,7 +120,7 @@ def test_buyable_backfill_does_not_force_trade_when_all_candidates_blocked():
         planned_spent_after_backfill=0.0,
     )
 
-    added = trader._apply_buyable_candidate_backfill(
+    added = _apply_buyable_candidate_backfill(
         engine,
         result=result,
         orderable_candidates=result.orderable_candidates,
