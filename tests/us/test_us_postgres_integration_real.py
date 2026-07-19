@@ -1,6 +1,7 @@
 import os
 import pytest
 
+# PR68 final accounting integration tests use the real PostgreSQL service in CI.
 pytestmark = pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="real PostgreSQL integration URL not configured")
 
 @pytest.fixture()
