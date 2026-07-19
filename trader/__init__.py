@@ -13,10 +13,9 @@ _logger = logging.getLogger(__name__)
 class _MissingEngineRunnerSummary:
     """Last-resort empty summary for PB1 session finalization.
 
-    This object is used only before the first PB1 tick has run.  Once a real
-    PB1Engine.run()/run_close_cancel() call starts, the wrapper below replaces
-    builtins.engine_runner with the actual engine instance so finalization reads
-    the real run metrics.
+    Used only before the first PB1 tick has run. Once a real PB1Engine run starts,
+    the wrapper below replaces builtins.engine_runner with the actual engine
+    instance so finalization reads real run metrics.
     """
 
     _run_summary_payload: dict[str, Any] = {}
@@ -29,16 +28,13 @@ def _ensure_engine_runner_fallback() -> None:
 
 
 def _wrap_pb1_engine_class(engine_cls: type[Any]) -> bool:
-    """Make legacy pb1_runner finalization see the latest real PB1Engine.
+    """Make session finalization see the latest real PB1Engine.
 
-    Current pb1_runner session finalization reads an unqualified engine_runner
-    name after loop execution.  That name is not local to the finalization block,
-    so without this guard it can raise NameError and skip pb1_result.json.
-
-    The guard stores the currently running PB1Engine instance in builtins before
-    and after each engine run.  Python's normal name lookup then resolves the
-    legacy engine_runner reference to the actual latest engine, preserving real
-    _run_summary_payload/_debug_summary values for the result marker.
+    pb1_runner finalization reads an engine_runner name after loop execution.
+    Without this guard the name can be unresolved and finalization can fail before
+    pb1_result.json is written. The guard publishes the actual current PB1Engine
+    instance through builtins during every run, preserving _run_summary_payload and
+    _debug_summary for the result marker.
     """
 
     if getattr(engine_cls, "_engine_runner_finalization_guard_installed", False):
