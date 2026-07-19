@@ -1003,6 +1003,77 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_fills count=%d", len(invalid))
         return 0
     engine = _get_engine_or_none()
+    atomic_count = 0
+    if engine is not None:
+        # KIS order-level cumulative snapshots are the accounting source of truth.
+        # Persist them through mark_order_filled_by_reconcile() so validation,
+        # actual upsert, synthetic supersession, us_orders.qty_filled, and final
+        # invariant live in one PostgreSQL transaction.  Conflict/overflow/
+        # regression must leave both us_orders and us_fills unchanged.
+        remaining_fills: list[dict] = []
+        original_fill_count = len(fills)
+        for f in fills:
+            fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
+            evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
+            if not _is_kis_order_cumulative_evidence(evidence):
+                remaining_fills.append(f)
+                continue
+            try:
+                order = load_us_order_for_fill(
+                    order_no=f.get("order_no"),
+                    client_order_key=f.get("client_order_key"),
+                    symbol=str(f.get("symbol") or ""),
+                    trade_date=td,
+                )
+                if not order:
+                    f["save_status"] = "FILL_ORDER_NOT_FOUND"
+                    logger.error(
+                        "[US_FILLS][ATOMIC_ACTUAL][ORDER_NOT_FOUND] trade_date=%s order_no=%s symbol=%s side=%s",
+                        td, f.get("order_no"), f.get("symbol"), f.get("side"),
+                    )
+                    continue
+                resolved_symbol = str(f.get("symbol") or order.get("symbol") or "").strip().upper()
+                resolved_side = str(f.get("side") or order.get("side") or "").strip().upper()
+                requested_qty = int(fill_meta.get("requested_qty") or f.get("requested_qty") or order.get("qty_requested") or f.get("qty") or 0)
+                cumulative_qty = int(fill_meta.get("cumulative_filled_qty") or f.get("cumulative_filled_qty") or f.get("qty") or 0)
+                avg_price = float(f.get("price_usd") or f.get("price") or fill_meta.get("avg_price_usd") or 0.0)
+                merged_meta = {**_parse_json_meta(order.get("meta")), **fill_meta}
+                merged_meta.setdefault("source", fill_meta.get("source") or "save_fills_kis_actual")
+                merged_meta.setdefault("fill_evidence_type", evidence)
+                merged_meta.setdefault("is_synthetic", False)
+                mark_result = mark_order_filled_by_reconcile(
+                    order_no=str(f.get("order_no") or order.get("order_no") or ""),
+                    client_order_key=str(f.get("client_order_key") or order.get("client_order_key") or ""),
+                    symbol=resolved_symbol,
+                    side=resolved_side,
+                    filled_qty=cumulative_qty,
+                    requested_qty=requested_qty,
+                    cumulative_filled_qty=cumulative_qty,
+                    evidence_type=evidence,
+                    avg_price_usd=avg_price,
+                    source="save_fills_kis_actual",
+                    trade_date=td,
+                    meta=merged_meta,
+                )
+                status = str((mark_result or {}).get("status") or "RECONCILE_UPDATE_FAILED")
+                f["save_status"] = status
+                f["atomic_reconcile_result"] = mark_result
+                if status == "OK":
+                    atomic_count += 1
+                else:
+                    logger.error(
+                        "[US_FILLS][ATOMIC_ACTUAL][FAILED] status=%s trade_date=%s order_no=%s symbol=%s result=%s",
+                        status, td, f.get("order_no"), resolved_symbol, mark_result,
+                    )
+            except Exception as exc:
+                f["save_status"] = "RECONCILE_UPDATE_FAILED"
+                f["atomic_reconcile_error"] = str(exc)
+                logger.error("[US_FILLS][ATOMIC_ACTUAL][ERROR] %s", exc)
+        if len(remaining_fills) != len(fills):
+            fills = remaining_fills
+            if not fills:
+                logger.info("[US_FILLS][SAVE][ATOMIC_ACTUAL_DONE] confirmed=%d input=%d", atomic_count, original_fill_count)
+                return atomic_count
     if engine is None:
         existing_keys = {_us_fill_idempotency_key(f, td) for f in _MEM_FILLS if f.get("trade_date") == td}
         skipped_duplicates = 0
@@ -1049,7 +1120,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
         logger.info("[US_FILLS][SAVE][DEDUP] skipped_duplicate=%d", skipped_duplicates)
         logger.info("[US_FILLS][SAVE][DONE] inserted=%d input=%d", inserted, len(fills))
         return inserted
-    count = 0
+    count = atomic_count
     skipped_duplicates = 0
     try:
         with engine.begin() as conn:
@@ -1118,16 +1189,47 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
 def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> dict:
     """Structured fill-save result for close/reconcile callers."""
     inserted = save_fills(fills, trade_date=trade_date)
-    regression_count = sum(1 for f in (fills or []) if f.get("save_status") == "EVIDENCE_QUANTITY_REGRESSION")
+    terminal_statuses = {
+        "EVIDENCE_QUANTITY_REGRESSION",
+        "EVIDENCE_QUANTITY_CONFLICT",
+        "EVIDENCE_QUANTITY_OVERFLOW",
+        "FILL_ACCOUNTING_INVARIANT_FAILED",
+        "RECONCILE_UPDATE_FAILED",
+        "FILL_ORDER_NOT_FOUND",
+        "RECONCILE_ORDER_IDENTITY_REQUIRED",
+        "RECONCILE_TRADE_DATE_REQUIRED",
+        "RECONCILE_QTY_EVIDENCE_MISSING",
+    }
+    status_counts: dict[str, int] = {}
+    for f in fills or []:
+        status = str(f.get("save_status") or "")
+        if status in terminal_statuses:
+            status_counts[status] = status_counts.get(status, 0) + 1
+    regression_count = status_counts.get("EVIDENCE_QUANTITY_REGRESSION", 0)
     if _LAST_SAVE_FILLS_ERROR:
         return {"status": "DB_ERROR", "inserted_count": int(inserted or 0), "updated_count": 0,
-                "unchanged_count": 0, "regression_count": regression_count, "error": _LAST_SAVE_FILLS_ERROR}
-    if regression_count:
-        return {"status": "EVIDENCE_QUANTITY_REGRESSION", "inserted_count": int(inserted or 0),
-                "updated_count": 0, "unchanged_count": max(0, len(fills or []) - int(inserted or 0) - regression_count),
-                "regression_count": regression_count}
+                "unchanged_count": 0, "regression_count": regression_count,
+                "error_status_counts": status_counts, "error": _LAST_SAVE_FILLS_ERROR}
+    if status_counts:
+        priority = [
+            "EVIDENCE_QUANTITY_OVERFLOW",
+            "EVIDENCE_QUANTITY_CONFLICT",
+            "EVIDENCE_QUANTITY_REGRESSION",
+            "FILL_ACCOUNTING_INVARIANT_FAILED",
+            "RECONCILE_UPDATE_FAILED",
+            "FILL_ORDER_NOT_FOUND",
+            "RECONCILE_ORDER_IDENTITY_REQUIRED",
+            "RECONCILE_TRADE_DATE_REQUIRED",
+            "RECONCILE_QTY_EVIDENCE_MISSING",
+        ]
+        status = next((s for s in priority if status_counts.get(s)), next(iter(status_counts)))
+        return {"status": status, "inserted_count": int(inserted or 0),
+                "updated_count": 0,
+                "unchanged_count": max(0, len(fills or []) - int(inserted or 0) - sum(status_counts.values())),
+                "regression_count": regression_count, "error_status_counts": status_counts}
     return {"status": "OK", "inserted_count": int(inserted or 0), "updated_count": 0,
-            "unchanged_count": max(0, len(fills or []) - int(inserted or 0)), "regression_count": 0}
+            "unchanged_count": max(0, len(fills or []) - int(inserted or 0)), "regression_count": 0,
+            "error_status_counts": {}}
 
 def load_today_fills(trade_date: str | None = None, *, market: str = "US") -> list[dict]:
     """당일 DB fills 조회 (signal-only / DB-only 모드용).

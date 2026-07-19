@@ -66,3 +66,34 @@ def test_real_postgres_promotion_regression_and_rollback(pg_engine):
     with pg_engine.begin() as conn:
         assert conn.execute(text("SELECT qty_filled FROM us_orders WHERE order_no='ROLL'")).scalar_one() == 3
         assert conn.execute(text("SELECT COALESCE((meta->>'accounting_active')::boolean,true) FROM us_fills WHERE order_no='ROLL'")).scalar_one() is True
+
+def test_real_postgres_save_fills_actual_conflict_and_overflow_are_atomic(pg_engine):
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+
+    _seed_order(pg_engine, key="K3", order_no="C1", qty_requested=10, qty_filled=7)
+    conflict = repos.save_fills_with_result([{
+        "symbol": "AMD", "exchange": "NASDAQ", "side": "SELL", "qty": 3,
+        "price_usd": 99, "order_no": "C1", "client_order_key": "K3",
+        "cumulative_filled_qty": 3, "requested_qty": 10,
+        "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "meta": {"fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL", "cumulative_filled_qty": 3, "requested_qty": 10, "is_synthetic": False},
+    }], trade_date="2026-07-16")
+    assert conflict["status"] == "EVIDENCE_QUANTITY_CONFLICT"
+    with pg_engine.begin() as conn:
+        assert conn.execute(text("SELECT qty_filled FROM us_orders WHERE order_no='C1'")).scalar_one() == 7
+        assert conn.execute(text("SELECT count(*) FROM us_fills WHERE order_no='C1' AND NOT COALESCE((meta->>'is_synthetic')::boolean,false)")).scalar_one() == 0
+        assert conn.execute(text("SELECT COALESCE((meta->>'accounting_active')::boolean,true) FROM us_fills WHERE order_no='C1'")).scalar_one() is True
+
+    _seed_order(pg_engine, key="K4", order_no="OFL", qty_requested=10, qty_filled=0)
+    overflow = repos.save_fills_with_result([{
+        "symbol": "AMD", "exchange": "NASDAQ", "side": "SELL", "qty": 11,
+        "price_usd": 101, "order_no": "OFL", "client_order_key": "K4",
+        "cumulative_filled_qty": 11, "requested_qty": 10,
+        "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL",
+        "meta": {"fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL", "cumulative_filled_qty": 11, "requested_qty": 10, "is_synthetic": False},
+    }], trade_date="2026-07-16")
+    assert overflow["status"] == "EVIDENCE_QUANTITY_OVERFLOW"
+    with pg_engine.begin() as conn:
+        assert conn.execute(text("SELECT qty_filled FROM us_orders WHERE order_no='OFL'")).scalar_one() == 0
+        assert conn.execute(text("SELECT count(*) FROM us_fills WHERE order_no='OFL' AND NOT COALESCE((meta->>'is_synthetic')::boolean,false)")).scalar_one() == 0
