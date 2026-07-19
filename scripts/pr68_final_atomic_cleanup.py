@@ -21,6 +21,13 @@ def append_once(path: Path, marker: str, block: str) -> None:
     path.write_text(text.rstrip() + "\n\n" + block.strip() + "\n", encoding="utf-8")
 
 
+def replace_after(path: Path, anchor: str, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(anchor)
+    idx = text.index(old, start)
+    path.write_text(text[:idx] + new + text[idx + len(old):], encoding="utf-8")
+
+
 def restore_reports_from_base() -> None:
     subprocess.run(["git", "fetch", "origin", "dual-agent", "--depth=1"], cwd=ROOT, check=True)
     proc = subprocess.run(
@@ -42,18 +49,19 @@ def restore_reports_from_base() -> None:
 
 def patch_repos() -> None:
     path = ROOT / "trader/us/db/repos.py"
-    old = '''    engine = _get_engine_or_none()
+    old_engine = '''    engine = _get_engine_or_none()
     if engine is None:
 '''
-    new = '''    engine = _get_engine_or_none()
+    new_engine = '''    engine = _get_engine_or_none()
     atomic_count = 0
     if engine is not None:
-        # KIS order-level cumulative snapshots must be validated and persisted
-        # atomically with the matching us_orders row.  Do not first upsert an
-        # active actual fill and only later discover overflow/conflict in ACK
-        # reconcile; conflict/overflow/regression must leave both us_orders and
-        # us_fills unchanged.
+        # KIS order-level cumulative snapshots are the accounting source of truth.
+        # Persist them through mark_order_filled_by_reconcile() so validation,
+        # actual upsert, synthetic supersession, us_orders.qty_filled, and final
+        # invariant live in one PostgreSQL transaction.  Conflict/overflow/
+        # regression must leave both us_orders and us_fills unchanged.
         remaining_fills: list[dict] = []
+        original_fill_count = len(fills)
         for f in fills:
             fill_meta = f.get("meta") if isinstance(f.get("meta"), dict) else {}
             evidence = str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "")
@@ -114,12 +122,13 @@ def patch_repos() -> None:
         if len(remaining_fills) != len(fills):
             fills = remaining_fills
             if not fills:
-                logger.info("[US_FILLS][SAVE][ATOMIC_ACTUAL_DONE] confirmed=%d input=%d", atomic_count, len(fills))
+                logger.info("[US_FILLS][SAVE][ATOMIC_ACTUAL_DONE] confirmed=%d input=%d", atomic_count, original_fill_count)
                 return atomic_count
     if engine is None:
 '''
-    replace_once(path, old, new)
-    replace_once(path, "    count = 0\n    skipped_duplicates = 0\n", "    count = atomic_count\n    skipped_duplicates = 0\n")
+    replace_after(path, "def save_fills(", old_engine, new_engine)
+    replace_after(path, "def save_fills(", "    count = 0\n    skipped_duplicates = 0\n", "    count = atomic_count\n    skipped_duplicates = 0\n")
+
     old_result = '''def save_fills_with_result(fills: list[dict], trade_date: str | None = None) -> dict:
     """Structured fill-save result for close/reconcile callers."""
     inserted = save_fills(fills, trade_date=trade_date)
@@ -224,7 +233,6 @@ def main() -> None:
     patch_repos()
     patch_tests()
     restore_reports_from_base()
-    # Remove this temporary staging script and workflow before the verified commit.
     (ROOT / "scripts/pr68_final_atomic_cleanup.py").unlink(missing_ok=True)
     (ROOT / ".github/workflows/pr68-final-atomic-cleanup.yml").unlink(missing_ok=True)
 
