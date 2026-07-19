@@ -11,12 +11,7 @@ _logger = logging.getLogger(__name__)
 
 
 class _MissingEngineRunnerSummary:
-    """Last-resort empty summary for PB1 session finalization.
-
-    Used only before the first PB1 tick has run. Once a real PB1Engine run starts,
-    the wrapper below replaces builtins.engine_runner with the actual engine
-    instance so finalization reads real run metrics.
-    """
+    """Last-resort empty summary for PB1 session finalization."""
 
     _run_summary_payload: dict[str, Any] = {}
     _debug_summary: dict[str, Any] = {}
@@ -28,14 +23,7 @@ def _ensure_engine_runner_fallback() -> None:
 
 
 def _wrap_pb1_engine_class(engine_cls: type[Any]) -> bool:
-    """Make session finalization see the latest real PB1Engine.
-
-    pb1_runner finalization reads an engine_runner name after loop execution.
-    Without this guard the name can be unresolved and finalization can fail before
-    pb1_result.json is written. The guard publishes the actual current PB1Engine
-    instance through builtins during every run, preserving _run_summary_payload and
-    _debug_summary for the result marker.
-    """
+    """Make session finalization see the latest real PB1Engine."""
 
     if getattr(engine_cls, "_engine_runner_finalization_guard_installed", False):
         return False
