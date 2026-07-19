@@ -78,9 +78,9 @@ jobs:
           python -m pytest tests/us -q 2>&1 | tee /tmp/us-pytest.log
       - name: Run offline harness
         run: python -m trader.us.harness.runner --scenario all --offline
-      - name: Verify no report artifacts remain in PR diff
+      - name: Verify no report artifacts remain after cleanup
         run: |
-          git diff --name-only origin/dual-agent...HEAD -- reports/us_daily reports/us_prep | tee /tmp/report-diff.txt
+          git diff --name-only origin/dual-agent -- reports/us_daily reports/us_prep | tee /tmp/report-diff.txt
           test ! -s /tmp/report-diff.txt
       - name: Commit verified cleanup
         run: |
