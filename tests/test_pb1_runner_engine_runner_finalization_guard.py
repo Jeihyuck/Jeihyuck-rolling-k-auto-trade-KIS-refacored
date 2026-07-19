@@ -6,8 +6,8 @@ import pytest
 
 
 def _session_finalization_marker_metrics_lookup():
-    # Equivalent to the legacy pb1_runner finalization lookup after Python name
-    # resolution falls back to builtins.engine_runner.
+    # Equivalent to pb1_runner finalization after Python name resolution falls
+    # back to builtins.engine_runner.
     engine_runner = builtins.engine_runner
     return getattr(engine_runner, "_run_summary_payload", {}) or getattr(
         engine_runner, "_debug_summary", {}
