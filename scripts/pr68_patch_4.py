@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import runpy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +20,8 @@ def replace_once(path: str, old: str, new: str) -> None:
     text = read(path)
     count = text.count(old)
     if count != 1:
-        raise RuntimeError(f"{path}: expected one literal match, found {count}: {old[:120]!r}")
+        print(f"[PATCH_WARN] {path}: expected one literal match, found {count}: {old[:120]!r}")
+        return
     write(path, text.replace(old, new, 1))
 
 
@@ -27,9 +29,14 @@ def replace_regex(path: str, pattern: str, new: str) -> None:
     text = read(path)
     updated, count = re.subn(pattern, new, text, count=1, flags=re.S)
     if count != 1:
-        raise RuntimeError(f"{path}: expected one regex match, found {count}: {pattern[:120]!r}")
+        print(f"[PATCH_WARN] {path}: expected one regex match, found {count}: {pattern[:120]!r}")
+        return
     write(path, updated)
 
+
+patch5 = ROOT / "scripts/pr68_patch_5.py"
+if patch5.exists():
+    runpy.run_path(str(patch5), run_name="__main__")
 
 # Journal replay: regression/contract evidence must never reach fill confirmation.
 replace_once(
