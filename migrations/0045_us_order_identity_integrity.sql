@@ -14,7 +14,7 @@ BEGIN
   SELECT count(*) INTO dup_keys FROM (SELECT client_order_key FROM us_orders GROUP BY client_order_key HAVING count(*)>1) x;
   SELECT count(*) INTO dup_orders FROM (SELECT trade_date,order_no FROM us_orders WHERE order_no IS NOT NULL AND btrim(order_no)<>'' GROUP BY trade_date,order_no HAVING count(*)>1) x;
   SELECT count(*) INTO conflicts FROM (SELECT client_order_key FROM us_orders GROUP BY client_order_key HAVING count(DISTINCT (trade_date,symbol,side,exchange))>1) x;
-  RAISE NOTICE 'us identity cleanup blank_keys=% duplicate_client_keys=% duplicate_order_numbers=% identity_conflicts=%', blanks,dup_keys,dup_orders,conflicts;
+  RAISE NOTICE 'us identity cleanup blank_keys=%% duplicate_client_keys=%% duplicate_order_numbers=%% identity_conflicts=%%', blanks,dup_keys,dup_orders,conflicts;
 END $$;
 
 INSERT INTO us_trade_integrity_quarantine(source_table, reason, original_row)

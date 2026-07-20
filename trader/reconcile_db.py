@@ -211,7 +211,9 @@ def close_stale_positions_guarded(
         closable_codes.append(code)
 
     if not closable_codes:
-        skip_reason = "kis_has_holdings" if rows_kept else "no_soft_close_candidates"
+        # A live KIS holding only protects its own row; never use it as a
+        # portfolio-wide reason to hide stale DB positions.
+        skip_reason = "no_rowwise_soft_close_candidates" if rows_kept else "no_soft_close_candidates"
         logger.warning(
             "[STALE_DB][SOFT_CLOSE][SKIP] reason=%s rows_kept=%s",
             skip_reason,

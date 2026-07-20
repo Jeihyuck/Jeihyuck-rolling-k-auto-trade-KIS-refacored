@@ -39,7 +39,7 @@ BEGIN
     WHERE con.contype = 'f'
       AND con.confrelid = 'public.runs'::regclass
   LOOP
-    RAISE NOTICE 'Dropping FK: %.% -> %', fk.table_schema, fk.table_name, fk.constraint_name;
+    RAISE NOTICE 'Dropping FK: %%.%% -> %%', fk.table_schema, fk.table_name, fk.constraint_name;
     EXECUTE 'ALTER TABLE '
       || quote_ident(fk.table_schema) || '.' || quote_ident(fk.table_name)
       || ' DROP CONSTRAINT ' || quote_ident(fk.constraint_name);
@@ -166,13 +166,13 @@ BEGIN
         AND c.relname = t.table_name
         AND con.conname = t.table_name || '_run_id_fkey'
     ) THEN
-      RAISE NOTICE 'Creating FK: %.% -> runs(run_id)', t.table_schema, t.table_name;
+      RAISE NOTICE 'Creating FK: %%.%% -> runs(run_id)', t.table_schema, t.table_name;
       EXECUTE
         'ALTER TABLE ' || quote_ident(t.table_schema) || '.' || quote_ident(t.table_name)
         || ' ADD CONSTRAINT ' || quote_ident(t.table_name || '_run_id_fkey')
         || ' FOREIGN KEY (run_id) REFERENCES public.runs(run_id) ON DELETE CASCADE';
     ELSE
-      RAISE NOTICE 'FK already exists: %.%_run_id_fkey', t.table_schema, t.table_name;
+      RAISE NOTICE 'FK already exists: %%.%%_run_id_fkey', t.table_schema, t.table_name;
     END IF;
   END LOOP;
 

@@ -635,6 +635,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             "[KR_SESSION][PB1_RESULT][LOAD_OK] path=%s keys=%s sell_orders_ack=%s",
             pb1_result_path, sorted(pb1_result.keys()), extract_sell_orders_ack(pb1_result),
         )
+        logger.info("[KR_SESSION][PB1_RESULT][OK] path=%s", pb1_result_path)
     else:
         pb1_result = {}
         logger.warning(

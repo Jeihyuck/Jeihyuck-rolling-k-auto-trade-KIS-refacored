@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
+cd "$APP_DIR"
+source scripts/wsl/deploy-preflight.sh
+deploy_preflight
 export KR_PB1_VOL_MAX="${KR_PB1_VOL_MAX:-1.25}"
 export KR_PB1_VOLU_MAX="${KR_PB1_VOLU_MAX:-1.25}"
 export KR_PB1_VOLU_MAX_INTRADAY="${KR_PB1_VOLU_MAX_INTRADAY:-1.25}"

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
+cd "$APP_DIR"
+source scripts/wsl/deploy-preflight.sh
+deploy_preflight
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime

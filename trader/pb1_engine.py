@@ -4957,6 +4957,10 @@ class PB1Engine:
             )
         if bool(gate_context.get("open_order_exists")):
             reason_codes.append("BUYABLE_OPEN_ORDER")
+        if bool(gate_context.get("today_submit_exists")):
+            reason_codes.append("BUYABLE_TODAY_SUBMIT")
+        if bool(gate_context.get("today_fill_exists")):
+            reason_codes.append("BUYABLE_TODAY_FILL")
         if bool(gate_context.get("today_buy_exists")):
             reason_codes.append("BUYABLE_TODAY_BUY_EXISTS")
         # [2026-04-30] 당일 매도 후 재매수 차단
@@ -4973,7 +4977,9 @@ class PB1Engine:
         if bool(gate_context.get("cooldown_active")):
             reason_codes.append("BUYABLE_COOLDOWN")
         if bool(gate_context.get("blocking_duplicate_exists")):
-            reason_codes.append("BUYABLE_DUPLICATE")
+            reason_codes.append("BUYABLE_DUPLICATE_CLIENT_KEY")
+        elif bool(gate_context.get("duplicate_intent_exists")):
+            reason_codes.append("BUYABLE_DUPLICATE_INTENT")
         ok = not reason_codes
         return UnifiedGateDecision(
             ok=ok,

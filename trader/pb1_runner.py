@@ -3474,14 +3474,22 @@ def _run_build_watchlist_job() -> int:
         
         # Minervini config
         minervini_config = MinerviniConfig()
+        rs_min_pctile = float(getattr(minervini_config, "rs_min_percentile", getattr(minervini_config, "rs_min", 70.0)))
+        if rs_min_pctile <= 1:
+            rs_min_pctile *= 100
+        heavy_volume_mult = float(getattr(minervini_config, "heavy_volume_mult", getattr(minervini_config, "heavy_vol_mult_10", 1.5)))
+        time_stop_days = int(getattr(minervini_config, "time_stop_days", os.getenv("PB1_TIME_STOP_DAYS", 20)))
         minervini_config_dict = {
-            "rs_min": minervini_config.rs_min,
+            # Keep both contracts while old watchlist builders are deployed.
+            "rs_min": rs_min_pctile,
+            "rs_min_percentile": rs_min_pctile,
             "breakout_vol_mult_20": minervini_config.breakout_vol_mult_20,
-            "heavy_vol_mult_10": minervini_config.heavy_vol_mult_10,
+            "heavy_vol_mult_10": heavy_volume_mult,
+            "heavy_volume_mult": heavy_volume_mult,
             "add_on_R": minervini_config.add_on_R,
             "max_pyramid_levels": minervini_config.max_pyramid_levels,
             "initial_stop_pct": minervini_config.initial_stop_pct,
-            "time_stop_days": minervini_config.time_stop_days,
+            "time_stop_days": time_stop_days,
             "risk_pct_of_equity": minervini_config.risk_pct_of_equity,
             "add_on_size_frac": minervini_config.add_on_size_frac,
             "add_on_max_extension": minervini_config.add_on_max_extension,
@@ -7458,6 +7466,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         ticks_degraded = 0
         buy_orders = 0
         sell_orders = 0
+        # A loop owns no PB1Engine instance: every tick creates and finalizes one
+        # inside run_once. Preserve only its returned summary for session markers.
+        # Do not reference an unqualified engine_runner here (it caused the AM/PM
+        # finalizer NameError before pb1_result.json could be written).
+        last_tick_metrics: dict[str, Any] = {}
         os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
         while True:
             if stop_requested["value"]:
@@ -7545,6 +7558,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         runs_ledger_fail_open=runs_ledger_fail_open,
                     ),
                 )
+                last_tick_metrics = dict(metrics or {})
                 logger.info(
                     "[PB1][TICK][DONE] kind=%s now=%s result_status=%s",
                     session_kind,
@@ -7830,7 +7844,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         )
         os.environ["PB1_LAST_RESULT_STATUS"] = str(last_result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
-        marker_metrics = getattr(engine_runner, "_run_summary_payload", {}) or getattr(engine_runner, "_debug_summary", {}) or {}
+        marker_metrics = last_tick_metrics
         normalized = normalize_session_result(
             status=last_result_status,
             reason=exit_reason,
