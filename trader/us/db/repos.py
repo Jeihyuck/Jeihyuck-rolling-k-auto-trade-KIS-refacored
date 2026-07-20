@@ -1286,15 +1286,28 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
     """
     td = trade_date or _today()
     engine = _get_engine_or_none()
+    # An empty authoritative balance is the *only* empty-symbol case that may
+    # close every existing position.  A non-empty payload without usable
+    # symbols is malformed and must never be interpreted as "no positions".
+    symbols = [str(p.get("symbol") or "").upper() for p in positions if p.get("symbol")]
+    stale_close_requested = (
+        authoritative_positions
+        and not preserve_previous_positions
+        and balance_fetch_status == "OK"
+        and balance_parse_status == "OK"
+    )
+    if stale_close_requested and positions and not symbols:
+        raise ValueError("authoritative_positions_missing_symbols")
+
     if engine is None:
-        if authoritative_positions and not preserve_previous_positions and balance_fetch_status == "OK" and balance_parse_status == "OK":
-            current = {str(p.get("symbol") or "").upper() for p in positions}
+        if stale_close_requested:
+            current = set(symbols)
             now = datetime.now(timezone.utc).isoformat()
             for old in _MEM_POSITIONS:
                 if str(old.get("symbol") or "").upper() not in current:
                     old["qty"] = 0
                     old.setdefault("meta", {}).update({"position_status": "CLOSED_BY_AUTHORITATIVE_BALANCE", "closed_at": now, "close_source": close_source})
-        else:
+        elif not preserve_previous_positions:
             _MEM_POSITIONS.clear()
         for p in positions:
             meta = dict(p.get("meta") or {})
@@ -1371,17 +1384,16 @@ def save_position_snapshot(positions: list[dict], trade_date: str | None = None,
                     },
                 )
                 count += 1
-            if authoritative_positions and not preserve_previous_positions and balance_fetch_status == "OK" and balance_parse_status == "OK":
-                symbols = [str(p.get("symbol") or "").upper() for p in positions if p.get("symbol")]
+            if stale_close_requested:
                 conn.execute(
                     text("""
                         UPDATE us_positions SET qty=0,
                           meta=COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
                             'position_status','CLOSED_BY_AUTHORITATIVE_BALANCE',
-                            'closed_at',NOW()::text,'close_source',:source)
+                            'closed_at',NOW()::text,'close_source',CAST(:source AS text))
                         WHERE as_of=:td AND qty>0
-                          AND NOT (UPPER(symbol) = ANY(:symbols))
-                    """), {"td": td, "symbols": symbols or ["__NONE__"], "source": close_source},
+                          AND NOT (UPPER(symbol) = ANY(CAST(:symbols AS text[])))
+                    """), {"td": td, "symbols": symbols, "source": close_source},
                 )
     except Exception as exc:
         logger.error("[US_POSITIONS][SNAPSHOT][ERROR] %s", exc)
