@@ -905,17 +905,18 @@ def run_trade_tick(
     # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
     if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
         last_stage = "reconcile"
+        reconcile_reason = recon.get("reason", "balance_position_parse_error")
         logger.error(
             "[US_RECONCILE][BLOCK_NEW_ENTRY] reason=%s status=%s",
-            recon.get("reason", "balance_position_parse_error"),
+            reconcile_reason,
             recon.get("status", "CONTRACT_ERROR"),
         )
         logger.error(
-            "[US_TICK][DONE] session=%s status=FAILED reason=balance_position_parse_error", session
+            "[US_TICK][DONE] session=%s status=FAILED reason=%s", session, reconcile_reason
         )
         return {
             "status": "FAILED",
-            "reason": recon.get("reason", "balance_position_parse_error"),
+            "reason": reconcile_reason,
             "session": session,
             "orders": [],
             "ack": 0,
@@ -932,8 +933,8 @@ def run_trade_tick(
             "prep_status": "UNKNOWN",
             "locked_watchlist_count": 0,
             "entry_eval_status": "BLOCKED",
-            "entry_error_type": "balance_position_parse_error",
-            "entry_error_message": recon.get("balance_parse_error", "balance_position_parse_error"),
+            "entry_error_type": reconcile_reason,
+            "entry_error_message": recon.get("error") or recon.get("balance_parse_error") or reconcile_reason,
             "entry_intents": 0,
             "orders_sent": 0,
             "fills": len(fills_today),
