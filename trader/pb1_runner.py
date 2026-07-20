@@ -3474,14 +3474,22 @@ def _run_build_watchlist_job() -> int:
         
         # Minervini config
         minervini_config = MinerviniConfig()
+        rs_min_pctile = float(getattr(minervini_config, "rs_min_percentile", getattr(minervini_config, "rs_min", 70.0)))
+        if rs_min_pctile <= 1:
+            rs_min_pctile *= 100
+        heavy_volume_mult = float(getattr(minervini_config, "heavy_volume_mult", getattr(minervini_config, "heavy_vol_mult_10", 1.5)))
+        time_stop_days = int(getattr(minervini_config, "time_stop_days", os.getenv("PB1_TIME_STOP_DAYS", 20)))
         minervini_config_dict = {
-            "rs_min": minervini_config.rs_min,
+            # Keep both contracts while old watchlist builders are deployed.
+            "rs_min": rs_min_pctile,
+            "rs_min_percentile": rs_min_pctile,
             "breakout_vol_mult_20": minervini_config.breakout_vol_mult_20,
-            "heavy_vol_mult_10": minervini_config.heavy_vol_mult_10,
+            "heavy_vol_mult_10": heavy_volume_mult,
+            "heavy_volume_mult": heavy_volume_mult,
             "add_on_R": minervini_config.add_on_R,
             "max_pyramid_levels": minervini_config.max_pyramid_levels,
             "initial_stop_pct": minervini_config.initial_stop_pct,
-            "time_stop_days": minervini_config.time_stop_days,
+            "time_stop_days": time_stop_days,
             "risk_pct_of_equity": minervini_config.risk_pct_of_equity,
             "add_on_size_frac": minervini_config.add_on_size_frac,
             "add_on_max_extension": minervini_config.add_on_max_extension,

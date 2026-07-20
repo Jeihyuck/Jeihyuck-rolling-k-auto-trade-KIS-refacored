@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
+cd "$APP_DIR"
+source scripts/wsl/deploy-preflight.sh
+deploy_preflight
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p runtime runtime/locks
