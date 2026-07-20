@@ -7466,6 +7466,11 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         ticks_degraded = 0
         buy_orders = 0
         sell_orders = 0
+        # A loop owns no PB1Engine instance: every tick creates and finalizes one
+        # inside run_once. Preserve only its returned summary for session markers.
+        # Do not reference an unqualified engine_runner here (it caused the AM/PM
+        # finalizer NameError before pb1_result.json could be written).
+        last_tick_metrics: dict[str, Any] = {}
         os.environ.pop("PB1_PENDING_RECONCILE_ONLY", None)
         while True:
             if stop_requested["value"]:
@@ -7553,6 +7558,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                         runs_ledger_fail_open=runs_ledger_fail_open,
                     ),
                 )
+                last_tick_metrics = dict(metrics or {})
                 logger.info(
                     "[PB1][TICK][DONE] kind=%s now=%s result_status=%s",
                     session_kind,
@@ -7838,7 +7844,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         )
         os.environ["PB1_LAST_RESULT_STATUS"] = str(last_result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
-        marker_metrics = getattr(engine_runner, "_run_summary_payload", {}) or getattr(engine_runner, "_debug_summary", {}) or {}
+        marker_metrics = last_tick_metrics
         normalized = normalize_session_result(
             status=last_result_status,
             reason=exit_reason,

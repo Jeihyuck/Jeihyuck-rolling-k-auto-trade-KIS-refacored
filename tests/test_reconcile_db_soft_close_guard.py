@@ -104,3 +104,18 @@ def test_soft_close_requires_sell_fill_and_stale_confirm(tmp_path):
 
     assert closed == 1
     assert _load_qty(engine, "028260") == 0
+
+
+def test_soft_close_is_rowwise_when_another_kis_holding_exists(tmp_path):
+    engine = _make_engine()
+    _insert_position(engine, code="090430", qty=8)
+    _insert_position(engine, code="207940", qty=1)
+    save_reconcile_guard(tmp_path, {"empty_streak": 2, "last_holdings_empty": True})
+    closed = close_stale_positions(
+        engine=engine, env="practice", strategy="pb1_pullback_close", reason="exit_phase", ts=datetime.utcnow(),
+        kis_balance={"output1": [{"pdno": "090430", "hldg_qty": "8", "ord_psbl_qty": "8"}]},
+        sell_fill_codes={"207940"}, runtime_dir=tmp_path,
+    )
+    assert closed == 1
+    assert _load_qty(engine, "090430") == 8
+    assert _load_qty(engine, "207940") == 0
