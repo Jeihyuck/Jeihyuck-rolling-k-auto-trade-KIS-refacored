@@ -21,7 +21,7 @@ def write_kr_diagnostics_manifest(*, trade_date: date, expected_as_of: date, ses
         except Exception:
             existing = {}
     session_results = dict(existing.get("session_results") or {})
-    session_results[session] = str(result.get("status") or result.get("reason") or "UNKNOWN")
+    session_results[session] = dict(result)
     balance_path = ROOT / "runtime/kr/session" / trade_date.isoformat() / session / "balance_precheck.json"
     phase_path = ROOT / "runtime/kr/session" / trade_date.isoformat() / "close" / "phase.json"
     balance: dict[str, Any] = {}
@@ -85,4 +85,19 @@ def write_kr_diagnostics_manifest(*, trade_date: date, expected_as_of: date, ses
         },
     }
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Health is a schedule-level contract, not merely a diagnostics attachment.
+    # In particular a locked PB1 engine must never make a KR trading day look OK.
+    sessions = session_results
+    locked = any(str((value or {}).get("reason") or "") == "PB1_ADVISORY_LOCK_UNAVAILABLE" for value in sessions.values() if isinstance(value, dict))
+    failed = any(str((value or {}).get("status") or "").upper() in {"FAIL", "FAILED", "SKIP_LOCKED"} for value in sessions.values() if isinstance(value, dict))
+    health = {
+        "ok": not (locked or failed),
+        "status": "FAILED" if (locked or failed) else "OK",
+        "reason": "kr_pb1_advisory_lock_unavailable" if locked else ("kr_session_failed" if failed else "KR_SESSION_DONE"),
+        "trade_date": trade_date.isoformat(),
+        "sessions": sessions,
+    }
+    for health_path in (ROOT / "runtime/health" / f"kr-{trade_date.isoformat()}.json", ROOT / "reports/kr_schedule_health" / f"{trade_date.isoformat()}.json"):
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        health_path.write_text(json.dumps(health, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     return path
