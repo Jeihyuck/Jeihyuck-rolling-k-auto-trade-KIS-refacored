@@ -609,6 +609,7 @@ def route_exit_orders_immediately(
     sell_intents = [i for i in exit_intents if str(i.get("side") or "").upper() == "SELL"]
     logger.info("[US_EXIT][ROUTE_IMMEDIATE][START] exit_intents=%d", len(sell_intents))
     orders: list[dict] = []
+    decisions: list[dict] = []
     for intent in sell_intents:
         try:
             result = route_order(
@@ -624,6 +625,15 @@ def route_exit_orders_immediately(
                 context=context,
             )
             orders.append(result)
+            status = str(result.get("status") or "ERROR")
+            action = "ROUTED" if status in {"ACK", "DRY_RUN", "SIGNAL_ONLY"} else ("DEDUP" if "DUPLICATE" in status else "BLOCKED" if "BLOCK" in status else "SKIPPED")
+            decision = {"symbol": str(intent.get("symbol") or "").upper(), "side": "SELL", "qty": int(intent.get("qty") or intent.get("quantity") or 0),
+                        "reason": (intent.get("meta") or {}).get("reason") or intent.get("reason") or intent.get("exit_type") or "",
+                        "action": action, "skip_reason": result.get("reason") or result.get("error") or "",
+                        "route_cap_reason": result.get("route_cap_reason") or "", "order_no": result.get("order_no") or "",
+                        "pre_position_qty": (intent.get("meta") or {}).get("pre_order_position_qty"), "post_expected_qty": (intent.get("meta") or {}).get("post_expected_qty")}
+            decisions.append(decision)
+            logger.info("[US_EXIT_INTENT][ROUTE_DECISION] symbol=%s side=SELL action=%s qty=%s reason=%s skip_reason=%s route_cap_reason=%s order_no=%s", decision["symbol"], action, decision["qty"], decision["reason"], decision["skip_reason"], decision["route_cap_reason"], decision["order_no"])
         except Exception as exc:
             logger.warning("[US_EXIT][ROUTE_IMMEDIATE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
@@ -640,6 +650,7 @@ def route_exit_orders_immediately(
         "[US_EXIT][ROUTE_IMMEDIATE][DONE] exit_intents=%d sent=%d ack=%d rejected=%d blocked=%d sell_notional=%.2f",
         len(sell_intents), sent, ack, rejected, blocked, sell_notional_routed,
     )
+    logger.info("[US_EXIT_INTENT][ROUTE_SUMMARY] intents=%d routed=%d skipped=%d blocked=%d dedup=%d", len(sell_intents), sent, sum(1 for d in decisions if d["action"] == "SKIPPED"), sum(1 for d in decisions if d["action"] == "BLOCKED"), sum(1 for d in decisions if d["action"] == "DEDUP"))
     return {
         "orders": orders,
         "sell_notional_routed": sell_notional_routed,
@@ -648,6 +659,7 @@ def route_exit_orders_immediately(
         "ack": ack,
         "rejected": rejected,
         "blocked": blocked,
+        "decisions": decisions,
     }
 
 

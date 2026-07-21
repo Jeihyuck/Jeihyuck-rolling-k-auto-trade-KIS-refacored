@@ -914,7 +914,9 @@ def route_order(
 
     # ── DB ACK 저장 (KIS 성공 이후 별도 try) ─────────────────────────────
     # KIS 주문이 성공했으므로 어떤 경우에도 REJECT로 기록하면 안 된다.
-    ack_meta = {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp}
+    from trader.us.utils.order_no import normalize_us_order_no
+    ack_meta = {**(intent.get("meta") if isinstance(intent.get("meta"), dict) else {}), "raw_response": resp,
+                "order_no_raw": str(order_no), "order_no_norm": normalize_us_order_no(order_no)}
     if side.upper() == "SELL":
         pre_qty = (
             ack_meta.get("pre_order_position_qty")

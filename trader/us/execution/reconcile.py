@@ -522,7 +522,8 @@ def reconcile_ack_orders_with_balance(
                     fill_symbol = str(fills_resp.get("symbol") or symbol).upper()
                     fill_side = str(fills_resp.get("side") or side).upper()
                     fill_order_no = str(fills_resp.get("order_no") or order_no)
-                    if fill_symbol != symbol or fill_side != side or fill_order_no != order_no:
+                    from trader.us.utils.order_no import normalize_us_order_no
+                    if fill_symbol != symbol or fill_side != side or normalize_us_order_no(fill_order_no) != normalize_us_order_no(order_no):
                         logger.error("[US_RECONCILE][IDENTITY_MISMATCH] order_no=%s symbol=%s/%s side=%s/%s", order_no, symbol, fill_symbol, side, fill_side)
                         failed_count += 1
                         unresolved_count += 1

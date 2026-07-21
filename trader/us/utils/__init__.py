@@ -1,2 +1,1 @@
-# -*- coding: utf-8 -*-
-"""US trading utilities."""
+"""Small shared utilities for the US trading domain."""
