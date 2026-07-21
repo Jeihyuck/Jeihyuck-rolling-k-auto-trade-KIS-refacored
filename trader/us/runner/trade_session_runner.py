@@ -260,6 +260,7 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "reason": payload.get("reason", ""),
             "tick_count": int(payload.get("tick_count", 0) or 0),
             "fills_count": int(payload.get("fills_count", 0) or 0),
+            "broker_fills_fetched": int(payload.get("broker_fills_fetched", payload.get("kis_fill_execution_count", 0)) or 0),
             "unique_fills_count": int(payload.get("unique_fills_count", 0) or 0),
             "orders_ack": int(payload.get("orders_ack", 0) or 0),
             "orders_rejected": int(payload.get("orders_rejected", 0) or 0),
@@ -297,12 +298,32 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             **session_entry, "attempts": attempts, "effective_run_id": session_entry.get("run_id"),
             "effective_status": session_entry.get("final_status"),
         }
+        sessions = existing["sessions"]
+        fatal = [name for name, row in sessions.items() if str((row or {}).get("effective_status") or "").upper() == "FAILED" or "fill_persistence_failed" in str((row or {}).get("reason") or "")]
+        mismatch = [name for name, row in sessions.items() if "MISMATCH" in str((row or {}).get("final_status") or "").upper()]
+        broker_fills = max(int((row or {}).get("broker_fills_fetched", 0) or 0) for row in sessions.values()) if sessions else 0
+        persisted_fills = max(int((row or {}).get("fills_count", 0) or 0) for row in sessions.values()) if sessions else 0
+        if fatal:
+            health_status, health_ok, health_reason = "FAILED", False, "fill_persistence_failed" if any("fill_persistence_failed" in str((sessions[n] or {}).get("reason") or "") for n in fatal) else "us_session_failed"
+        elif broker_fills > 0 and persisted_fills == 0:
+            health_status, health_ok, health_reason = "FAILED", False, "broker_fills_not_persisted"
+        elif mismatch:
+            health_status, health_ok, health_reason = "WARNING_RECONCILE_MISMATCH", False, "us_fill_or_reconcile_mismatch"
+        else:
+            health_status, health_ok, health_reason = "OK", True, ""
+        existing.update({"ok": health_ok, "status": health_status, "reason": health_reason,
+                         "us": {"am": sessions.get("am", {}), "afternoon": sessions.get("afternoon", {}), "close": sessions.get("close", {}),
+                                "fills_count": persisted_fills, "broker_fills_fetched": broker_fills,
+                                "pending_order_count": max(int((row or {}).get("pending_order_count", 0) or 0) for row in sessions.values()) if sessions else 0}})
         existing["updated_at_utc"] = now_utc
 
         health_file.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
+        runtime_health = Path("runtime/health")
+        runtime_health.mkdir(parents=True, exist_ok=True)
+        (runtime_health / f"us-{trade_date}.json").write_text(json.dumps(existing, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         logger.info(
             "[US_SCHEDULE_HEALTH][SAVED] file=%s session=%s status=%s",
             health_file,
@@ -1450,6 +1471,20 @@ def run_trade_session(
             "kis_order_allowed": int(kis_order_allowed),
             "prep_status": prep_status_value,
             "prep_run_id": prep_run_id,
+            "prep_contract": {"trade_date": prep_contract.get("trade_date") or trade_date, "prep_run_id": prep_run_id,
+                              "prep_sha": prep_contract.get("git_commit_sha") or prep_contract.get("prep_sha") or "",
+                              "current_sha": _prov.get("commit_sha", ""),
+                              "version_mismatch": bool((prep_guard_result or {}).get("version_mismatch", False)),
+                              "entry_can_proceed": bool((prep_guard_result or {}).get("entry_can_proceed", False)),
+                              "exit_can_proceed": bool((prep_guard_result or {}).get("exit_can_proceed", True)),
+                              "close_can_proceed": bool((prep_guard_result or {}).get("close_can_proceed", True)),
+                              "reason": (prep_guard_result or {}).get("reason", "")},
+            "risk_off_entry_block": bool(final_tick.get("trade_block_reason") == "risk_off_entry_block"),
+            "prep_version_mismatch_entry_block": bool((prep_guard_result or {}).get("version_mismatch", False)),
+            "entry_can_proceed": bool((prep_guard_result or {}).get("entry_can_proceed", False)),
+            "exit_can_proceed": bool((prep_guard_result or {}).get("exit_can_proceed", True)),
+            "close_can_proceed": bool((prep_guard_result or {}).get("close_can_proceed", True)),
+            "contract_block_reason": (prep_guard_result or {}).get("reason", ""),
             "score_nonzero_count": score_nonzero_count,
             "locked_watchlist_count": locked_watchlist_count,
             "locked_watchlist_count_source": locked_watchlist_count_source,

@@ -210,7 +210,13 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
     orders_ack = max(sources.values())
     warnings = []
     nonzero = [v for v in sources.values() if v > 0]
-    if nonzero and len(set(sources.values())) > 1:
+    # A persisted KIS actual fill is authoritative for its ACK order.  Balance
+    # confirmation is supplementary evidence, not a prerequisite; treating its
+    # zero value as a source mismatch made fully-filled SELL orders look broken.
+    broker_reconciled = sources["fills"] > 0 and sources["fills"] == sources["db_orders"] and (
+        sources["router_summary"] in {0, sources["db_orders"]} or sources["router_summary"] <= sources["fills"]
+    )
+    if nonzero and len(set(sources.values())) > 1 and not broker_reconciled:
         warnings.append("SOURCE_MISMATCH")
         if sources["db_orders"] > 0 and sources["router_summary"] == 0:
             warnings.append("SOURCE_MISMATCH_DB_ORDER_EXISTS_ROUTER_SUMMARY_MISSING")
@@ -228,6 +234,8 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
         "fill_api_count": sources["fills"],
         "balance_confirmed_count": sources["balance_confirmed"],
         "warnings": warnings,
+        "consistency": "BROKER_RECONCILED" if broker_reconciled else "OK",
+        "broker_reconciled": broker_reconciled,
     }
 
 

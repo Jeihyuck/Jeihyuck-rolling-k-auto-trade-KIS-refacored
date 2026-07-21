@@ -408,12 +408,19 @@ def save_us_prep_contract(contract: dict) -> dict:
 
 def save_us_prep_summary(contract: dict) -> None:
     """prep summary JSON + Markdown 저장."""
+    contract = dict(contract)
     trade_date = contract["trade_date"]
+    purpose = str(contract.get("report_purpose") or os.getenv("US_PREP_REPORT_PURPOSE") or "am_runtime_contract")
+    contract["report_purpose"] = purpose
+    contract["actual_am_contract"] = purpose == "am_runtime_contract"
 
     # JSON
     try:
         _write_json(us_prep_summary_json_path(trade_date), contract)
         _write_json(us_prep_latest_summary_json_path(), contract)
+        namespace = Path("reports/us_prep/by_trade_date") / trade_date
+        namespace.mkdir(parents=True, exist_ok=True)
+        _write_json(namespace / ("am_contract.json" if purpose == "am_runtime_contract" else f"{purpose}.json"), contract)
     except Exception as exc:
         logger.warning("[US_PREP_SUMMARY][WARN] json save failed: %s", exc)
 
@@ -425,6 +432,8 @@ def save_us_prep_summary(contract: dict) -> None:
             f"**status**: {contract.get('status')}",
             f"**trade_can_proceed**: {contract.get('trade_can_proceed')}",
             f"**env**: {contract.get('env')}",
+            f"**report_purpose**: {purpose}",
+            f"**actual_am_contract**: {contract['actual_am_contract']}",
             "",
             "## Stage Counts",
             f"- dynamic_universe_count: {contract.get('dynamic_universe_count')}",
@@ -456,6 +465,7 @@ def save_us_prep_summary(contract: dict) -> None:
         md = "\n".join(lines)
         _write_text(us_prep_summary_md_path(trade_date), md)
         _write_text(us_prep_latest_summary_md_path(), md)
+        _write_text(namespace / ("am_contract.md" if purpose == "am_runtime_contract" else f"{purpose}.md"), md)
     except Exception as exc:
         logger.warning("[US_PREP_SUMMARY][WARN] md save failed: %s", exc)
 
