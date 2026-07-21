@@ -85,7 +85,7 @@ from trader.runtime_paths import runtime_root, runtime_path
 from trader.logging_utils import append_jsonl
 from trader.db.engine import make_engine, dispose_engine_safely
 from trader.db.health import assert_db_ready
-from trader.db.locks import acquire_advisory_lock, release_advisory_lock
+from trader.db.locks import acquire_advisory_xact_lock, release_advisory_xact_lock
 from trader.db.migrate import run_migrations
 from trader.db.repos import (
     FINAL30_SCORED_DB_CONTRACT_FIELDS,
@@ -142,7 +142,7 @@ SESSION_WARNING_KEYS = (
 
 
 def try_acquire_lock(*args, **kwargs):
-    return acquire_advisory_lock(*args, **kwargs)
+    return acquire_advisory_xact_lock(*args, **kwargs)
 
 
 def is_trading_day(now: datetime) -> bool:
@@ -7284,6 +7284,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
     total_start_ts = time_mod.monotonic()
     engine = make_engine()
+    # Dedicated lock-scope connection only; trading persistence uses repository
+    # connections from ``engine`` and is never part of this rollback scope.
     lock_conn = engine.connect()
     lock_context = (
         f"mode=loop "
@@ -7884,7 +7886,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             last_phase=last_phase,
         )
         try:
-            release_advisory_lock(lock_conn)
+            release_advisory_xact_lock(lock_conn, context=lock_context)
         except Exception as exc:
             logger.warning("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed (ignoring): %s", exc)
         try:
@@ -8419,9 +8421,11 @@ def main() -> int:
                 time_mod.sleep(sleep_for)
         logger.warning("[PB1][RUN] engine missing connect() -> exit")
         return 0
+    # Dedicated lock-scope connection only; do not run order/fill/report writes
+    # through it because release_advisory_xact_lock rolls its transaction back.
     lock_conn = engine.connect()
     lock_context = (
-        f"mode=single "
+        f"market=KR mode=single "
         f"strategy_env={os.getenv('STRATEGY_ENV') or os.getenv('KIS_ENV') or os.getenv('ENV')} "
         f"session={os.getenv('PB1_SESSION_KIND') or os.getenv('SESSION_KIND') or os.getenv('FORCE_MARKET_WINDOW') or 'unknown'} "
         f"workflow={os.getenv('GITHUB_WORKFLOW')} "
@@ -8435,8 +8439,21 @@ def main() -> int:
             "[PB1][RUN][SKIP_LOCKED] run lock unavailable owner_logged=1 action=safe_skip context=%s",
             lock_context,
         )
+        os.environ["PB1_LAST_RESULT_STATUS"] = "SKIP_LOCKED"
+        os.environ["PB1_LAST_EXIT_REASON"] = "PB1_ADVISORY_LOCK_UNAVAILABLE"
+        _write_session_result_file({
+            "status": "SKIP_LOCKED",
+            "final_status": "SKIP_LOCKED",
+            "exit_reason": "PB1_ADVISORY_LOCK_UNAVAILABLE",
+            "engine_started": False,
+            "pb1_result_present": False,
+            "orders_intent": 0,
+            "orders_ack": 0,
+            "sell_orders_ack": 0,
+            "retryable": True,
+        })
         lock_conn.close()
-        return 0
+        return 1
     _ensure_bootstrap_migrations(engine)
     _write_change_flag(False, ["init"])
     
@@ -8528,7 +8545,7 @@ def main() -> int:
         result_status = "ERROR"
     finally:
         try:
-            release_advisory_lock(lock_conn)
+            release_advisory_xact_lock(lock_conn, context=lock_context)
         except Exception as exc:
             logger.warning("[PB1][LOCK][RELEASE_FAIL] advisory lock release failed (ignoring): %s", exc)
         try:

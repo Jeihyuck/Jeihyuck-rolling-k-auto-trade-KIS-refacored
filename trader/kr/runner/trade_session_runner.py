@@ -484,6 +484,16 @@ def compute_session_marker(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def lock_unavailable_result_fields() -> dict[str, Any]:
+    """Stable contract for a PB1 engine that never started due to its DB lock."""
+    return {
+        "engine_started": False,
+        "pb1_result_present": False,
+        "orders_intent": 0,
+        "orders_ack": 0,
+    }
+
+
 
 def normalize_kr_session_completion(
     *,
@@ -511,6 +521,10 @@ def normalize_kr_session_completion(
     }
     pb1_status_u = str(pb1_status or "").upper()
     pb1_exit_reason_s = str(pb1_exit_reason or "")
+    if pb1_status_u == "SKIP_LOCKED" or pb1_exit_reason_s == "PB1_ADVISORY_LOCK_UNAVAILABLE":
+        return "FAILED", "PB1_ADVISORY_LOCK_UNAVAILABLE", 0, 1
+    if pb1_exit_reason_s == "PB1_RESULT_MISSING":
+        return "FAILED", "PB1_RESULT_MISSING", 0, 1
     policy_block_reasons = {
         "BUYABLE_EXISTING_HOLDING_KIS",
         "BUYABLE_TODAY_BUY_EXISTS",
@@ -629,7 +643,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = int(pb1_runner.main() or 0)
     finally:
         sys.argv = old_argv
-    if pb1_result_path.exists():
+    pb1_result_present = pb1_result_path.exists()
+    if pb1_result_present:
         pb1_result = load_pb1_session_result(pb1_result_path)
         logger.info(
             "[KR_SESSION][PB1_RESULT][LOAD_OK] path=%s keys=%s sell_orders_ack=%s",
@@ -639,12 +654,23 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     else:
         pb1_result = {}
         logger.warning(
-            "[KR_SESSION][PB1_RESULT][MISSING] path=%s exit_code=%s action=continue_with_zero_sell_ack",
+            "[KR_SESSION][RESULT][MISSING] session=%s reason=PB1_RESULT_MISSING action=mark_failed path=%s exit_code=%s",
+            session,
             pb1_result_path, exit_code,
         )
     pb1_last = str(os.getenv("PB1_LAST_RESULT_STATUS") or "").upper()
     pb1_reason = str(os.getenv("PB1_LAST_EXIT_REASON") or "")
-    if pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason:
+    lock_unavailable = pb1_last == "SKIP_LOCKED" or pb1_reason == "PB1_ADVISORY_LOCK_UNAVAILABLE"
+    summary_reason = ""
+    if lock_unavailable:
+        status = "FAILED"
+        exit_code = max(exit_code, 1)
+        summary_reason = "PB1_ADVISORY_LOCK_UNAVAILABLE"
+    elif not pb1_result_present:
+        status = "FAILED"
+        exit_code = max(exit_code, 1)
+        summary_reason = "PB1_RESULT_MISSING"
+    elif pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason:
         status = "FAILED"
         exit_code = 2
     else:
@@ -653,15 +679,16 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         status = "FAIL"
         exit_code = 2
         logger.error("[KR_CLOSE][FAIL] reason=CLOSE_PHASE_NOT_EXECUTED")
-    summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
+    if not summary_reason:
+        summary_reason = "DB_EXACT_FINAL30_ZERO" if (pb1_last == "FAIL_PRECHECK" or "DB_EXACT_FINAL30_ZERO" in pb1_reason) else "PB1_SESSION_DONE"
     blocked = 0
     if session == "close" and balance_state is not None and balance_state.get("status") == "WARN":
         status = "WARN"
         summary_reason = "CLOSE_BALANCE_UNCONFIRMED"
         blocked = 1
         logger.warning("[KR_CLOSE][WARN] reason=BALANCE_UNCONFIRMED close_orders_blocked=1")
-    entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR"} else "DONE"
-    entry_reason = pb1_reason if entry_status == "ABORT" else None
+    entry_status = "ABORT" if exit_code != 0 or pb1_last in {"FAIL_PRECHECK", "ERROR", "SKIP_LOCKED"} or not pb1_result_present else "DONE"
+    entry_reason = (pb1_reason or summary_reason) if entry_status == "ABORT" else None
     sell_orders_ack = extract_sell_orders_ack(pb1_result)
     logger.info("[KR_SESSION][SELL_ACK] session=%s sell_orders_ack=%s source=pb1_result", session, sell_orders_ack)
     marker = compute_session_marker(build_session_result(
@@ -700,7 +727,9 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
     else:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s", session, status, summary_reason, blocked)
-    result = {"status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable)}
+    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": int(pb1_result.get("order_candidates", 0) or 0), "orders_ack": int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)}
+    if lock_unavailable:
+        result.update(lock_unavailable_result_fields())
     if session == "close":
         result.update({
             "phase": "close",

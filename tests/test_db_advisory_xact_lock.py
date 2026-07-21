@@ -1,0 +1,73 @@
+from trader.db.locks import acquire_advisory_xact_lock, release_advisory_xact_lock
+
+
+class _Scalar:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar(self):
+        return self.value
+
+
+class _Connection:
+    def __init__(self):
+        self.sql = []
+        self.rolled_back = False
+
+    def execute(self, statement, params=None):
+        text = str(statement)
+        self.sql.append(text)
+        return _Scalar("pg_try_advisory_xact_lock" in text)
+
+    def in_transaction(self):
+        return True
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def test_transaction_lock_uses_xact_function_and_releases_on_transaction_end(monkeypatch):
+    monkeypatch.setenv("LOCK_ACQUIRE_RETRIES", "1")
+    monkeypatch.setenv("DB_LOCK_CONN_IDLE_IN_TX_SESSION_TIMEOUT_MS", "30000")
+    monkeypatch.delenv("DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS", raising=False)
+    conn = _Connection()
+
+    assert acquire_advisory_xact_lock(conn, key=912345678, context="market=KR session=am") is True
+    release_advisory_xact_lock(conn, key=912345678, context="market=KR session=am")
+
+    assert any("pg_try_advisory_xact_lock" in sql for sql in conn.sql)
+    assert any("SET LOCAL idle_in_transaction_session_timeout = 0" in sql for sql in conn.sql)
+    assert conn.rolled_back is True
+
+
+def test_transaction_lock_uses_dedicated_idle_timeout_env(monkeypatch):
+    monkeypatch.setenv("LOCK_ACQUIRE_RETRIES", "1")
+    monkeypatch.setenv("DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS", "0")
+    conn = _Connection()
+
+    assert acquire_advisory_xact_lock(conn, key=912345678, context="market=KR session=afternoon") is True
+    assert any("SET LOCAL idle_in_transaction_session_timeout = 0" in sql for sql in conn.sql)
+
+
+def test_stale_holder_requires_idle_advisory_transaction(monkeypatch):
+    from trader.db.locks import _stale_holder
+
+    monkeypatch.setenv("KR_LOCK_STALE_XACT_SEC", "300")
+    stale, reason = _stale_holder({"state": "idle in transaction", "query": "SELECT pg_try_advisory_lock($1)", "xact_age_seconds": 301})
+    assert stale is True
+    assert reason == "idle_in_transaction_advisory_lock"
+
+
+def test_stale_termination_is_blocked_in_live_environment(monkeypatch):
+    from trader.db.locks import _terminate_stale_holder_if_allowed
+
+    monkeypatch.setenv("KR_LOCK_TERMINATE_STALE_HOLDER", "1")
+    monkeypatch.setenv("STRATEGY_ENV", "live")
+    conn = _Connection()
+    terminated = _terminate_stale_holder_if_allowed(
+        conn, key=912345678,
+        row={"pid": 456, "state": "idle in transaction", "query": "SELECT pg_try_advisory_xact_lock($1)", "xact_age_seconds": 301},
+        current_pid=123,
+    )
+    assert terminated is False
+    assert not any("pg_terminate_backend" in sql for sql in conn.sql)
