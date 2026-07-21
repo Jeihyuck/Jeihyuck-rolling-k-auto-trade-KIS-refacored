@@ -28,6 +28,10 @@ if [[ "${lock_rc}" == "10" ]]; then
 elif [[ "${lock_rc}" != "0" ]]; then
   echo "[$(date -Is)] [US_SCHEDULER][LOCK_HELPER_WARN] session=${SESSION_NAME} trade_date=${TRADE_DATE} rc=${lock_rc}" >> "${LOG_FILE}"
 fi
+if [[ "${LOCK_RESULT}" == *'"reason": "stale_lock_removed"'* ]]; then
+  stale_pid="$(printf '%s' "${LOCK_RESULT}" | sed -n 's/.*"stale_pid": \([0-9][0-9]*\).*/\1/p')"
+  echo "[$(date -Is)] [US_SCHEDULER][STALE_LOCK_REMOVED] session=${SESSION_NAME} trade_date=${TRADE_DATE} path=runtime/locks/us-${SESSION_NAME}-${TRADE_DATE}.json pid=${stale_pid:-0}" >> "${LOG_FILE}"
+fi
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
   echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] reason=already_running [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"

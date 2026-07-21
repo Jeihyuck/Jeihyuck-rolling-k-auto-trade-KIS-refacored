@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +16,19 @@ class SessionLockResult:
     ok: bool
     reason: str = "ok"
     path: str = ""
+    stale_pid: int = 0
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def acquire_session_lock(
@@ -27,14 +43,20 @@ def acquire_session_lock(
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"{str(market).lower()}-{str(session).lower()}-{trade_date}.json"
     now = datetime.now(timezone.utc).timestamp()
+    stale_pid = 0
+    stale_removed = False
     if path.exists():
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             last = float(payload.get("timestamp", 0) or 0)
-            if now - last < min_interval_sec:
-                return SessionLockResult(False, "duplicate_recent_run", str(path))
             if payload.get("status") == "running":
-                return SessionLockResult(False, "session_already_running", str(path))
+                stale_pid = int(payload.get("pid") or 0)
+                if _pid_alive(stale_pid):
+                    return SessionLockResult(False, "session_already_running", str(path), stale_pid)
+                path.unlink()
+                stale_removed = True
+            elif now - last < min_interval_sec:
+                return SessionLockResult(False, "duplicate_recent_run", str(path))
         except Exception:
             pass
     path.write_text(
@@ -44,12 +66,16 @@ def acquire_session_lock(
                 "session": session,
                 "trade_date": trade_date,
                 "timestamp": now,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "pid": os.getpid(),
+                "hostname": socket.gethostname(),
+                "cmdline": " ".join(sys.argv),
                 "status": "running",
             }
         ),
         encoding="utf-8",
     )
-    return SessionLockResult(True, "ok", str(path))
+    return SessionLockResult(True, "stale_lock_removed" if stale_removed else "ok", str(path), stale_pid)
 
 
 def main(argv: list[str] | None = None) -> int:
