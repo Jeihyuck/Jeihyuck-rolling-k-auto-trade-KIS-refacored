@@ -28,13 +28,25 @@ class _Connection:
 
 def test_transaction_lock_uses_xact_function_and_releases_on_transaction_end(monkeypatch):
     monkeypatch.setenv("LOCK_ACQUIRE_RETRIES", "1")
+    monkeypatch.setenv("DB_LOCK_CONN_IDLE_IN_TX_SESSION_TIMEOUT_MS", "30000")
+    monkeypatch.delenv("DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS", raising=False)
     conn = _Connection()
 
     assert acquire_advisory_xact_lock(conn, key=912345678, context="market=KR session=am") is True
     release_advisory_xact_lock(conn, key=912345678, context="market=KR session=am")
 
     assert any("pg_try_advisory_xact_lock" in sql for sql in conn.sql)
+    assert any("SET LOCAL idle_in_transaction_session_timeout = 0" in sql for sql in conn.sql)
     assert conn.rolled_back is True
+
+
+def test_transaction_lock_uses_dedicated_idle_timeout_env(monkeypatch):
+    monkeypatch.setenv("LOCK_ACQUIRE_RETRIES", "1")
+    monkeypatch.setenv("DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS", "0")
+    conn = _Connection()
+
+    assert acquire_advisory_xact_lock(conn, key=912345678, context="market=KR session=afternoon") is True
+    assert any("SET LOCAL idle_in_transaction_session_timeout = 0" in sql for sql in conn.sql)
 
 
 def test_stale_holder_requires_idle_advisory_transaction(monkeypatch):

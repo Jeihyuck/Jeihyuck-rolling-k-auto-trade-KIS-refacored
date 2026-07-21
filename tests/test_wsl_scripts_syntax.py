@@ -26,6 +26,7 @@ def test_kr_close_uses_the_same_advisory_lock_policy_as_intraday_sessions():
         ("DB_LOCK_CONN_LOCK_TIMEOUT_MS", "5000"),
         ("DB_LOCK_CONN_STATEMENT_TIMEOUT_MS", "15000"),
         ("DB_LOCK_CONN_IDLE_IN_TX_SESSION_TIMEOUT_MS", "30000"),
+        ("DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS", "0"),
         ("KR_LOCK_STALE_XACT_SEC", "300"),
         ("KR_LOCK_TERMINATE_STALE_HOLDER", "0"),
         ("PB1_LOCK_LOG_OWNER_ON_FAIL", "1"),
@@ -33,3 +34,8 @@ def test_kr_close_uses_the_same_advisory_lock_policy_as_intraday_sessions():
         ("LOCK_ACQUIRE_SLEEP_SEC", "0.5"),
     ):
         assert f'export {name}="${{{name}:-{value}}}"' in text
+
+
+def test_kr_workflows_keep_xact_lock_owner_idle_timeout_disabled():
+    for workflow in (Path(".github/workflows/trade-am.yml"), Path(".github/workflows/trade-afternoon.yml")):
+        assert 'DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS: "0"' in workflow.read_text()

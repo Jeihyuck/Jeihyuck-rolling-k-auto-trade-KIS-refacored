@@ -26,6 +26,17 @@ def _timeouts() -> tuple[int, int, int]:
     )
 
 
+def _xact_lock_idle_timeout_ms() -> int:
+    """Return the timeout for the dedicated transaction-lock connection.
+
+    PB1 deliberately keeps this connection idle while trading persistence uses
+    other connections.  It must not inherit the general lock connection's
+    idle-in-transaction timeout or PostgreSQL could release the xact lock
+    during an active PB1 run.
+    """
+    return _int_env("DB_XACT_LOCK_IDLE_IN_TX_SESSION_TIMEOUT_MS", 0)
+
+
 def _stale_holder(row: dict) -> tuple[bool, str | None]:
     """Return whether a holder is safe to consider for explicit termination."""
     threshold = _int_env("KR_LOCK_STALE_XACT_SEC", 300)
@@ -265,7 +276,8 @@ def acquire_advisory_xact_lock(conn, key: int = LOCK_KEY, *, context: str = "", 
     sleep_sec = float(os.getenv("LOCK_ACQUIRE_SLEEP_SEC", "0.5"))
     if log_owner_on_fail is None:
         log_owner_on_fail = os.getenv("PB1_LOCK_LOG_OWNER_ON_FAIL", "1").strip().lower() in {"1", "true", "yes", "on"}
-    lock_timeout_ms, statement_timeout_ms, idle_timeout_ms = _timeouts()
+    lock_timeout_ms, statement_timeout_ms, _ = _timeouts()
+    idle_timeout_ms = _xact_lock_idle_timeout_ms()
     for attempt in range(1, retries + 1):
         try:
             conn.execute(sa.text(f"SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"))
