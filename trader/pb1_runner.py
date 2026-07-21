@@ -7284,6 +7284,8 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
     total_start_ts = time_mod.monotonic()
     engine = make_engine()
+    # Dedicated lock-scope connection only; trading persistence uses repository
+    # connections from ``engine`` and is never part of this rollback scope.
     lock_conn = engine.connect()
     lock_context = (
         f"mode=loop "
@@ -8419,6 +8421,8 @@ def main() -> int:
                 time_mod.sleep(sleep_for)
         logger.warning("[PB1][RUN] engine missing connect() -> exit")
         return 0
+    # Dedicated lock-scope connection only; do not run order/fill/report writes
+    # through it because release_advisory_xact_lock rolls its transaction back.
     lock_conn = engine.connect()
     lock_context = (
         f"market=KR mode=single "

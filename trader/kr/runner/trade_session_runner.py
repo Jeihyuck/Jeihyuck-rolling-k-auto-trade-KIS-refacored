@@ -484,6 +484,16 @@ def compute_session_marker(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def lock_unavailable_result_fields() -> dict[str, Any]:
+    """Stable contract for a PB1 engine that never started due to its DB lock."""
+    return {
+        "engine_started": False,
+        "pb1_result_present": False,
+        "orders_intent": 0,
+        "orders_ack": 0,
+    }
+
+
 
 def normalize_kr_session_completion(
     *,
@@ -718,6 +728,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     else:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s", session, status, summary_reason, blocked)
     result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": int(pb1_result.get("order_candidates", 0) or 0), "orders_ack": int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)}
+    if lock_unavailable:
+        result.update(lock_unavailable_result_fields())
     if session == "close":
         result.update({
             "phase": "close",

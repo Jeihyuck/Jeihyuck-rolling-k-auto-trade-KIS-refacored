@@ -32,7 +32,8 @@ def _stale_holder(row: dict) -> tuple[bool, str | None]:
     state = str(row.get("state") or "").lower()
     query = str(row.get("query") or "").lower()
     xact_age = float(row.get("xact_age_seconds") or 0)
-    is_stale = state == "idle in transaction" and "pg_try_advisory_lock" in query and xact_age >= threshold
+    advisory_query = "pg_try_advisory_lock" in query or "pg_try_advisory_xact_lock" in query
+    is_stale = state == "idle in transaction" and advisory_query and xact_age >= threshold
     return is_stale, "idle_in_transaction_advisory_lock" if is_stale else None
 
 
@@ -40,6 +41,22 @@ def _termination_allowed() -> bool:
     enabled = os.getenv("KR_LOCK_TERMINATE_STALE_HOLDER", "0").strip().lower() in {"1", "true", "yes", "on"}
     env = os.getenv("STRATEGY_ENV", os.getenv("KIS_ENV", "practice")).strip().lower()
     return enabled and env in {"practice", "local", "dev", "development"}
+
+
+def _terminate_stale_holder_if_allowed(conn, *, key: int, row: dict, current_pid: int | None) -> bool:
+    """Terminate only a verified stale *other* backend in a non-live environment."""
+    stale, _ = _stale_holder(row)
+    pid = int(row.get("pid") or 0)
+    if not (stale and _termination_allowed() and pid and pid != current_pid):
+        return False
+    logger.warning("[LOCK][STALE][TERMINATE_ATTEMPT] key=%s pid=%s xact_age_sec=%s", key, pid, row.get("xact_age_seconds"))
+    try:
+        terminated = bool(conn.execute(sa.text("SELECT pg_terminate_backend(:pid)"), {"pid": pid}).scalar())
+        logger.warning("[LOCK][STALE][TERMINATE_DONE] key=%s pid=%s terminated=%s", key, pid, int(terminated))
+        return terminated
+    except Exception as exc:
+        logger.warning("[LOCK][STALE][TERMINATE_FAIL] key=%s pid=%s err=%s", key, pid, exc)
+        return False
 
 
 def _advisory_key_parts(key: int) -> tuple:
@@ -147,14 +164,7 @@ def log_advisory_lock_holders(conn, *, key: int = LOCK_KEY, context: str = "", l
             stale_reason,
             r.get("query"),
         )
-        if stale and _termination_allowed() and int(r.get("pid") or 0) != current_pid:
-            pid = int(r["pid"])
-            logger.warning("[LOCK][STALE][TERMINATE_ATTEMPT] key=%s pid=%s xact_age_sec=%s", key, pid, r.get("xact_age_seconds"))
-            try:
-                terminated = bool(conn.execute(sa.text("SELECT pg_terminate_backend(:pid)"), {"pid": pid}).scalar())
-                logger.warning("[LOCK][STALE][TERMINATE_DONE] key=%s pid=%s terminated=%s", key, pid, int(terminated))
-            except Exception as exc:
-                logger.warning("[LOCK][STALE][TERMINATE_FAIL] key=%s pid=%s err=%s", key, pid, exc)
+        _terminate_stale_holder_if_allowed(conn, key=key, row=dict(r), current_pid=current_pid)
 
 
 def log_kr_lock_diagnostics(conn, *, key: int, context: str) -> None:
@@ -247,7 +257,9 @@ def acquire_advisory_xact_lock(conn, key: int = LOCK_KEY, *, context: str = "", 
     """Acquire a transaction-scoped PostgreSQL advisory lock on *conn*.
 
     The caller must retain the transaction for the protected work.  Rollback,
-    commit, or closing the connection releases the lock automatically.
+    commit, or closing the connection releases the lock automatically.  This
+    must be a dedicated lock-scope connection: never use it for order, fill,
+    or report persistence, because release rolls back this transaction.
     """
     retries = _int_env("LOCK_ACQUIRE_RETRIES", 3)
     sleep_sec = float(os.getenv("LOCK_ACQUIRE_SLEEP_SEC", "0.5"))
@@ -303,7 +315,11 @@ def release_advisory_lock(conn, key: int = LOCK_KEY) -> None:
 
 
 def release_advisory_xact_lock(conn, key: int = LOCK_KEY, *, context: str = "") -> None:
-    """End the lock transaction; xact-level locks cannot be unlocked separately."""
+    """End a dedicated lock-only transaction; xact locks cannot be unlocked separately.
+
+    Do not use ``conn`` for trading writes.  Its rollback releases only the
+    advisory-lock transaction and must not be allowed to roll back persistence.
+    """
     try:
         if getattr(conn, "in_transaction", lambda: False)():
             conn.rollback()

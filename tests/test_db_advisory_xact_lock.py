@@ -44,3 +44,18 @@ def test_stale_holder_requires_idle_advisory_transaction(monkeypatch):
     stale, reason = _stale_holder({"state": "idle in transaction", "query": "SELECT pg_try_advisory_lock($1)", "xact_age_seconds": 301})
     assert stale is True
     assert reason == "idle_in_transaction_advisory_lock"
+
+
+def test_stale_termination_is_blocked_in_live_environment(monkeypatch):
+    from trader.db.locks import _terminate_stale_holder_if_allowed
+
+    monkeypatch.setenv("KR_LOCK_TERMINATE_STALE_HOLDER", "1")
+    monkeypatch.setenv("STRATEGY_ENV", "live")
+    conn = _Connection()
+    terminated = _terminate_stale_holder_if_allowed(
+        conn, key=912345678,
+        row={"pid": 456, "state": "idle in transaction", "query": "SELECT pg_try_advisory_xact_lock($1)", "xact_age_seconds": 301},
+        current_pid=123,
+    )
+    assert terminated is False
+    assert not any("pg_terminate_backend" in sql for sql in conn.sql)
