@@ -15,6 +15,12 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
+from trader import install_legacy_pb1_runtime_guards
+
+# ``pb1_runner`` is the legacy Korean-market runner.  Keep its compatibility
+# guards here instead of eagerly importing them for every ``trader.us`` module.
+install_legacy_pb1_runtime_guards()
+
 from trader.contracts.final30_contract import assert_final30_contract
 from trader.final30_quality import (
     format_final30_abort_message,

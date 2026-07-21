@@ -8,6 +8,11 @@ PB1 runner.
 """
 from __future__ import annotations
 
+# Legacy PB1 guards intentionally load only from the Korean execution path.
+from trader import install_legacy_pb1_runtime_guards
+
+install_legacy_pb1_runtime_guards()
+
 import argparse
 import json
 import logging

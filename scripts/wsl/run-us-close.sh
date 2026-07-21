@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Set scope before any Python helper import; US jobs must never load KR providers.
+export MARKET_SCOPE="us"
+export TRADING_MARKET="us"
+export DISABLE_KR_IMPORTS_IN_US="1"
 APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
 cd "$APP_DIR"
 source scripts/wsl/deploy-preflight.sh
@@ -13,6 +17,11 @@ if [[ -f .env ]]; then
   source .env
   set +a
 fi
+
+# .env may carry Korean defaults; pin the process back to US before lock helpers run.
+export MARKET_SCOPE="us"
+export TRADING_MARKET="us"
+export DISABLE_KR_IMPORTS_IN_US="1"
 
 SESSION_NAME="close"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
