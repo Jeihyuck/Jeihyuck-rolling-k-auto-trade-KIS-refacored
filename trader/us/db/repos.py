@@ -18,6 +18,7 @@ import os
 import time
 from datetime import date, datetime, timezone
 from typing import Any
+from trader.us.utils.order_no import normalize_us_order_no
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def canonical_actual_execution_key(
     price: float,
     raw: Any | None = None,
 ) -> str:
-    base = f"{trade_date}|{str(symbol).upper()}|{str(side).upper()}|{order_no}"
+    base = f"{trade_date}|{str(symbol).upper()}|{str(side).upper()}|{normalize_us_order_no(order_no)}"
     if broker_execution_id not in (None, ""):
         return f"{base}|exec={broker_execution_id}"
     if execution_sequence not in (None, ""):
@@ -98,7 +99,7 @@ def canonical_actual_execution_key(
 
 
 def canonical_kis_order_cumulative_key(*, trade_date: str, order_no: str, symbol: str, side: str) -> str:
-    return f"{trade_date}|{str(symbol).upper()}|{str(side).upper()}|{order_no}|KIS_ORDER_CUMULATIVE_ACTUAL"
+    return f"{trade_date}|{str(symbol).upper()}|{str(side).upper()}|{normalize_us_order_no(order_no)}|KIS_ORDER_CUMULATIVE_ACTUAL"
 
 
 def _fill_evidence_type(fill: dict) -> str:
@@ -460,6 +461,15 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
     if not valid_identity(order_result.get("client_order_key")):
         logger.critical("[US_INTEGRITY][INVALID_ORDER_IDENTITY] store=us_orders_ack")
         return False
+    # Preserve the provider's display/audit value while storing its stable
+    # identity beside it.  This works on existing schemas (meta is JSONB).
+    order_result = dict(order_result)
+    raw_order_no = str(order_result.get("order_no") or "").strip()
+    order_result["meta"] = {
+        **_parse_json_meta(order_result.get("meta")),
+        "order_no_raw": raw_order_no,
+        "order_no_norm": normalize_us_order_no(raw_order_no),
+    }
     engine = _get_engine_or_none()
     if engine is None:
         for existing in _MEM_ORDERS:
@@ -966,6 +976,35 @@ def update_us_soft_stop_risk_state(
 #                 order_no, client_order_key, filled_at, meta
 # ---------------------------------------------------------------------------
 
+def _import_broker_actual_order(fill: dict, *, trade_date: str) -> dict:
+    """Create an auditable local order for a valid broker fill with no ACK.
+
+    A broker fill is authoritative.  This deliberately returns an empty dict
+    for malformed evidence, so persistence errors remain distinguishable from
+    an imported-order recovery.
+    """
+    meta = _parse_json_meta(fill.get("meta"))
+    order_no_raw = str(fill.get("order_no_raw") or fill.get("order_no") or "").strip()
+    symbol, side = str(fill.get("symbol") or "").strip().upper(), str(fill.get("side") or "").strip().upper()
+    qty = int(meta.get("cumulative_filled_qty") or fill.get("cumulative_filled_qty") or fill.get("qty") or 0)
+    if not (trade_date and order_no_raw and symbol and side in {"BUY", "SELL"} and qty > 0):
+        return {}
+    key = f"KIS_IMPORTED_{trade_date}_{normalize_us_order_no(order_no_raw)}_{symbol}_{side}"
+    saved = save_order_ack({
+        "client_order_key": key, "symbol": symbol, "exchange": fill.get("exchange") or "NASDAQ",
+        "side": side, "qty_requested": int(meta.get("requested_qty") or fill.get("requested_qty") or qty),
+        "qty_filled": 0, "avg_price_usd": fill.get("price_usd") or fill.get("price"),
+        "order_no": order_no_raw, "status": "BROKER_FILLED_IMPORTED", "dry_run": False,
+        "meta": {**meta, "order_origin": "broker_actual_without_local_order",
+                 "import_reason": "local_order_not_found_after_normalization",
+                 "source": "kis_actual_fill_import", "order_no_raw": order_no_raw,
+                 "order_no_norm": normalize_us_order_no(order_no_raw)},
+    }, trade_date=trade_date)
+    if not saved:
+        return {}
+    logger.warning("[US_FILLS][IMPORTED_ORDER] trade_date=%s order_no=%s symbol=%s side=%s", trade_date, order_no_raw, symbol, side)
+    return load_us_order_for_fill(order_no=order_no_raw, client_order_key=key, symbol=symbol, trade_date=trade_date)
+
 def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
     """us_fills 저장."""
     global _LAST_SAVE_FILLS_ERROR
@@ -1026,12 +1065,11 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                     trade_date=td,
                 )
                 if not order:
-                    f["save_status"] = "FILL_ORDER_NOT_FOUND"
-                    logger.error(
-                        "[US_FILLS][ATOMIC_ACTUAL][ORDER_NOT_FOUND] trade_date=%s order_no=%s symbol=%s side=%s",
-                        td, f.get("order_no"), f.get("symbol"), f.get("side"),
-                    )
-                    continue
+                    order = _import_broker_actual_order(f, trade_date=td)
+                    if not order:
+                        f["save_status"] = "FILL_PERSIST_ERROR"
+                        logger.error("[US_FILLS][ATOMIC_ACTUAL][IMPORT_FAILED] trade_date=%s order_no=%s symbol=%s side=%s", td, f.get("order_no"), f.get("symbol"), f.get("side"))
+                        continue
                 resolved_symbol = str(f.get("symbol") or order.get("symbol") or "").strip().upper()
                 resolved_side = str(f.get("side") or order.get("side") or "").strip().upper()
                 requested_qty = int(fill_meta.get("requested_qty") or f.get("requested_qty") or order.get("qty_requested") or f.get("qty") or 0)
@@ -1608,6 +1646,7 @@ def load_us_order_for_fill(
     sym = str(symbol or "").strip().upper()
     td = str(trade_date)
     on = str(order_no or "")
+    on_norm = normalize_us_order_no(on)
     cok = str(client_order_key or "")
     engine = _get_engine_or_none()
     if engine is None:
@@ -1617,11 +1656,19 @@ def load_us_order_for_fill(
                 continue
             if sym and str(o.get("symbol") or "").upper() != sym:
                 continue
-            if (on and str(o.get("order_no") or "") == on) or (cok and str(o.get("client_order_key") or "") == cok):
+            order_no_match = on and (
+                str(o.get("order_no") or "") == on
+                or normalize_us_order_no(o.get("order_no")) == on_norm
+                or normalize_us_order_no(_parse_json_meta(o.get("meta")).get("order_no_norm")) == on_norm
+            )
+            if order_no_match or (cok and str(o.get("client_order_key") or "") == cok):
                 matches.append(o)
         return dict(matches[-1]) if matches else {}
     try:
         with engine.begin() as conn:
+            # Exact lookup remains the fast path.  The bounded candidate query
+            # then handles KIS' leading-zero presentation difference without a
+            # migration/index requirement.
             row = conn.execute(text("""
                 SELECT trade_date, client_order_key, symbol, exchange, side,
                        qty_requested, qty_filled, avg_price_usd, order_no, status, meta
@@ -1632,7 +1679,22 @@ def load_us_order_for_fill(
                 ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
                 LIMIT 1
             """), {"td": td, "symbol": sym, "order_no": on, "cok": cok}).mappings().first()
-            return dict(row) if row else {}
+            if row:
+                return dict(row)
+            if not on_norm:
+                return {}
+            candidates = conn.execute(text("""
+                SELECT trade_date, client_order_key, symbol, exchange, side,
+                       qty_requested, qty_filled, avg_price_usd, order_no, status, meta
+                FROM us_orders WHERE trade_date=:td AND symbol=:symbol
+                ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+            """), {"td": td, "symbol": sym}).mappings().all()
+            for candidate in candidates:
+                candidate_dict = dict(candidate)
+                meta = _parse_json_meta(candidate_dict.get("meta"))
+                if normalize_us_order_no(candidate_dict.get("order_no")) == on_norm or normalize_us_order_no(meta.get("order_no_norm")) == on_norm:
+                    return candidate_dict
+            return {}
     except Exception as exc:
         logger.warning("[US_ORDER][LOAD_FOR_FILL_WARN] symbol=%s order_no=%s cok=%s err=%s", sym, on, cok, exc)
         return {}
@@ -1759,12 +1821,15 @@ def mark_order_filled_by_reconcile(
     engine = _get_engine_or_none()
     if engine is None:
         matches = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and
-                   ((on and str(o.get("order_no") or "") == on) or
+                   ((on and normalize_us_order_no(o.get("order_no")) == normalize_us_order_no(on)) or
                     (cok and str(o.get("client_order_key") or "") == cok))]
         check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
                                             requested_symbol=sym, requested_side=side_u, matches=matches)
         if check["status"] != "OK": return check
         order = check["order"]
+        # All subsequent accounting uses the persisted raw representation so a
+        # replay with unpadded KIS order_no updates the original ACK row/fill.
+        on = str(order.get("order_no") or on)
         requested = int(requested_qty or order.get("qty_requested") or qty)
         previous = int(order.get("qty_filled") or 0)
         observed_cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)
@@ -1816,7 +1881,8 @@ def mark_order_filled_by_reconcile(
             save_fills([{"trade_date": td, "symbol": sym, "exchange": order.get("exchange") or "NASDAQ",
                          "side": side_u, "qty": fill_delta, "price_usd": price, "order_no": on,
                          "client_order_key": cok or order.get("client_order_key"), "filled_at": now_utc,
-                         "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence, "meta": fill_meta}], trade_date=td)
+                         "cumulative_filled_qty": observed_cumulative, "fill_evidence_type": evidence,
+                         "_already_reconciled": True, "meta": fill_meta}], trade_date=td)
         result = {"status": "OK", "order_status": status, "qty_filled": cumulative,
                   "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual_exists),
                   "synthetic_superseded_count": int(promotion.get("superseded", 0)),
@@ -1833,13 +1899,17 @@ def mark_order_filled_by_reconcile(
                        qty_requested, qty_filled
                 FROM us_orders WHERE trade_date=:td AND
                   ((:order_no <> '' AND order_no=:order_no) OR
-                   (:cok <> '' AND client_order_key=:cok)) FOR UPDATE
-            """), {"td": td, "order_no": on, "cok": cok}).mappings().all()
-            matches = [dict(row) for row in rows]
+                   (:cok <> '' AND client_order_key=:cok)
+                   OR (:order_no <> '' AND symbol=:symbol)) FOR UPDATE
+            """), {"td": td, "order_no": on, "cok": cok, "symbol": sym}).mappings().all()
+            matches = [dict(row) for row in rows if
+                       (cok and str(row.get("client_order_key") or "") == cok)
+                       or (on and normalize_us_order_no(row.get("order_no")) == normalize_us_order_no(on))]
             check = validate_reconcile_identity(trade_date=td, order_no=on, client_order_key=cok,
                                                 requested_symbol=sym, requested_side=side_u, matches=matches)
             if check["status"] != "OK": return check
             order = check["order"]
+            on = str(order.get("order_no") or on)
             requested = int(requested_qty or order.get("qty_requested") or qty)
             previous = int(order.get("qty_filled") or 0)
             observed_cumulative = int(cumulative_filled_qty if cumulative_filled_qty is not None else qty)

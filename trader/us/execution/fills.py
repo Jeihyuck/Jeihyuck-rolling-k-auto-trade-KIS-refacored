@@ -9,6 +9,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
+from trader.us.utils.order_no import normalize_us_order_no
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,8 @@ def get_fills_today(
                 "observed_at": observed_at,
                 "order_timestamp": order_timestamp,
                 "order_no": order_no,
+                "order_no_raw": order_no,
+                "order_no_norm": normalize_us_order_no(order_no),
                 "requested_qty": requested_qty,
                 "cumulative_filled_qty": cumulative_filled_qty,
                 "remaining_qty": remaining_qty,
@@ -133,6 +136,8 @@ def get_fills_today(
                     "requested_qty": requested_qty,
                     "order_timestamp": order_timestamp,
                     "observed_at": observed_at,
+                    "order_no_raw": order_no,
+                    "order_no_norm": normalize_us_order_no(order_no),
                 },
                 "raw": row,
             })
