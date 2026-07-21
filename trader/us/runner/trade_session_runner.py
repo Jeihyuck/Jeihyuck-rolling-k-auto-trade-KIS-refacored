@@ -303,6 +303,7 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         mismatch = [name for name, row in sessions.items() if "MISMATCH" in str((row or {}).get("final_status") or "").upper()]
         broker_fills = max(int((row or {}).get("broker_fills_fetched", 0) or 0) for row in sessions.values()) if sessions else 0
         persisted_fills = max(int((row or {}).get("fills_count", 0) or 0) for row in sessions.values()) if sessions else 0
+        manual_reconcile_required = any(bool((row or {}).get("manual_reconcile_required")) for row in sessions.values())
         if fatal:
             health_status, health_ok, health_reason = "FAILED", False, "fill_persistence_failed" if any("fill_persistence_failed" in str((sessions[n] or {}).get("reason") or "") for n in fatal) else "us_session_failed"
         elif broker_fills > 0 and persisted_fills == 0:
@@ -314,6 +315,7 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         existing.update({"ok": health_ok, "status": health_status, "reason": health_reason,
                          "us": {"am": sessions.get("am", {}), "afternoon": sessions.get("afternoon", {}), "close": sessions.get("close", {}),
                                 "fills_count": persisted_fills, "broker_fills_fetched": broker_fills,
+                                "manual_reconcile_required": int(manual_reconcile_required),
                                 "pending_order_count": max(int((row or {}).get("pending_order_count", 0) or 0) for row in sessions.values()) if sessions else 0}})
         existing["updated_at_utc"] = now_utc
 
@@ -1043,6 +1045,17 @@ def run_trade_session(
                         if tick_status in {"FAILED", "ERROR"}:
                             final_status = "FAILED"
                             final_reason = tick_result.get("reason", "tick_failed")
+                            prior_orders_sent = sum(int(row.get("orders_sent", 0) or 0) for row in results)
+                            prior_orders_ack = sum(int(row.get("orders_ack", 0) or 0) for row in results)
+                            if final_reason == "fill_persistence_failed" and (prior_orders_sent > 0 or prior_orders_ack > 0):
+                                final_status = "FAILED_FILL_PERSISTENCE_AFTER_ORDERS_SENT"
+                                final_reason = "fill_persistence_failed_after_orders_sent"
+                                final_tick["reason"] = final_reason
+                                final_tick["manual_reconcile_required"] = 1
+                                logger.critical(
+                                    "[US_SESSION][MANUAL_RECONCILE_REQUIRED] session=%s tick=%d orders_sent=%d ack=%d reason=%s",
+                                    session, tick_count, prior_orders_sent, prior_orders_ack, final_reason,
+                                )
                             logger.error("[US_SESSION][END] session=%s reason=%s tick=%d", session, final_reason, tick_count)
                             break
                         warn_count += 1
@@ -1510,6 +1523,11 @@ def run_trade_session(
             "orders_sent_total": total_orders_sent if total_orders_sent else int(final_tick.get("orders_sent", 0) or 0),
             "orders_ack": total_orders_ack,
             "orders_ack_total": total_orders_ack,
+            "fill_persistence_failed": int("fill_persistence_failed" in str(final_reason)),
+            "manual_reconcile_required": int(
+                "fill_persistence_failed_after_orders_sent" in str(final_reason)
+                and (total_orders_sent > 0 or total_orders_ack > 0)
+            ),
             "orders_rejected": total_orders_rejected,
             "orders_reject_total": total_orders_rejected,
             "orders_error": total_orders_error,

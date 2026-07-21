@@ -42,6 +42,38 @@ def _seed_order(engine, *, key, order_no, qty_requested=10, qty_filled=3):
             VALUES ('2026-07-16','AMD','NASDAQ','SELL',:qty,100,:order_no,:key,now(),CAST(:meta AS jsonb),:idem)"""),
             {"qty":qty_filled,"order_no":order_no,"key":key,"idem":f"synthetic-{order_no}","meta":json.dumps({"is_synthetic":True,"fill_evidence_type":"BALANCE_DELTA_SYNTHETIC","cumulative_filled_qty":qty_filled,"accounting_active":True})})
 
+
+def test_real_postgres_reconcile_updates_actual_fill_with_typed_jsonb_binds(pg_engine):
+    """Regression: psycopg3 must type the 2026-07-21 KIS JSONB arguments."""
+    from sqlalchemy import text
+    import json
+    import trader.us.db.repos as repos
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,avg_price_usd,order_no,status,meta)
+            VALUES ('2026-07-21','e741f4c726b86941c78ed3f0','AMD','NASDAQ','SELL',1,0,NULL,'0000037900','ACK','{}'::jsonb)"""))
+        conn.execute(text("""INSERT INTO us_fills
+            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+            VALUES ('2026-07-21','AMD','NASDAQ','SELL',1,0,'0000037900','e741f4c726b86941c78ed3f0',now(),CAST(:meta AS jsonb),'actual-amd-0000037900')"""),
+            {"meta": json.dumps({"is_synthetic": False, "fill_evidence_type": "KIS_ORDER_CUMULATIVE_ACTUAL"})})
+
+    result = repos.mark_order_filled_by_reconcile(
+        order_no="0000037900", client_order_key="e741f4c726b86941c78ed3f0", symbol="AMD", side="SELL",
+        filled_qty=1, requested_qty=1, cumulative_filled_qty=1, avg_price_usd=529.245,
+        trade_date="2026-07-21", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", source="fills_by_order_no",
+    )
+
+    assert result["status"] == "OK"
+    with pg_engine.begin() as conn:
+        row = conn.execute(text("SELECT qty,price_usd,meta FROM us_fills WHERE order_no='0000037900'")).mappings().one()
+    assert row["qty"] == 1
+    assert float(row["price_usd"]) == 529.245
+    assert row["meta"]["cumulative_filled_qty"] == 1
+    assert row["meta"]["remaining_qty"] == 0
+    assert row["meta"]["requested_qty"] == 1
+    assert row["meta"]["observed_at"]
+
 def test_real_postgres_promotion_regression_and_rollback(pg_engine):
     from sqlalchemy import text
     import trader.us.db.repos as repos

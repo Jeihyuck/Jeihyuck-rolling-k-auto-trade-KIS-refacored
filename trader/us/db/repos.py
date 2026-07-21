@@ -30,6 +30,7 @@ class FillAccountingInvariantError(RuntimeError):
 
 
 try:
+    import sqlalchemy as sa
     from sqlalchemy import text
     from trader.db.engine import get_engine as _get_engine_impl
     _SQLALCHEMY_AVAILABLE = True
@@ -39,6 +40,57 @@ except ImportError:  # pragma: no cover
         raise RuntimeError("sqlalchemy not available")
     def _get_engine_impl():  # type: ignore[no-redef]
         raise RuntimeError("sqlalchemy not available")
+
+
+_MARK_FILLED_BY_RECONCILE_SQL = """
+    UPDATE us_fills
+    SET
+      qty = CAST(:qty AS integer),
+      price_usd = CAST(:price AS numeric),
+      client_order_key = CAST(:cok AS text),
+      meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+        'cumulative_filled_qty', CAST(:qty AS integer),
+        'remaining_qty', CAST(:remaining AS integer),
+        'requested_qty', CAST(:requested AS integer),
+        'observed_at', CAST(:ts AS text)
+      )
+    WHERE trade_date = CAST(:td AS date)
+      AND order_no = CAST(:order_no AS text)
+      AND symbol = CAST(:symbol AS text)
+      AND side = CAST(:side AS text)
+      AND NOT COALESCE(
+        (meta->>'is_synthetic')::boolean,
+        (meta->>'synthetic')::boolean,
+        (meta->>'synthetic_fill')::boolean,
+        false
+      )
+      AND COALESCE(meta->>'fill_evidence_type', '') IN (
+        'KIS_ORDER_CUMULATIVE_ACTUAL',
+        'KIS_ORDER_DETAIL_ACTUAL'
+      )
+"""
+
+
+def _mark_filled_by_reconcile_stmt():
+    """Build the typed actual-fill update used by PostgreSQL reconciliation.
+
+    psycopg3 must not receive JSONB object values as ``unknown`` parameters:
+    PostgreSQL cannot infer their type in ``jsonb_build_object``.  Keep both SQL
+    casts and SQLAlchemy bind types because this statement is executed through
+    different SQLAlchemy/psycopg3 versions in production and repair jobs.
+    """
+    return sa.text(_MARK_FILLED_BY_RECONCILE_SQL).bindparams(
+        sa.bindparam("qty", type_=sa.Integer()),
+        sa.bindparam("price", type_=sa.Numeric()),
+        sa.bindparam("cok", type_=sa.String()),
+        sa.bindparam("remaining", type_=sa.Integer()),
+        sa.bindparam("requested", type_=sa.Integer()),
+        sa.bindparam("ts", type_=sa.String()),
+        sa.bindparam("td", type_=sa.Date()),
+        sa.bindparam("order_no", type_=sa.String()),
+        sa.bindparam("symbol", type_=sa.String()),
+        sa.bindparam("side", type_=sa.String()),
+    )
 
 # ---------------------------------------------------------------------------
 # In-memory fallback store (offline / test 환경)
@@ -1940,13 +1992,9 @@ def mark_order_filled_by_reconcile(
                 avg_price_usd = :price, meta = CAST(:meta AS jsonb), updated_at = :ts WHERE id = :id"""),
                 {"status": status, "qty": cumulative, "price": price, "meta": _json_param(merged), "ts": now_utc, "id": order["id"]})
             if not synthetic and _is_kis_order_cumulative_evidence(evidence):
-                conn.execute(text("""UPDATE us_fills SET qty=:qty, price_usd=:price, client_order_key=:cok,
-                    meta=COALESCE(meta,'{}'::jsonb)||jsonb_build_object('cumulative_filled_qty',:qty,'remaining_qty',:remaining,'requested_qty',:requested,'observed_at',:ts)
-                    WHERE trade_date=:td AND order_no=:order_no AND symbol=:symbol AND side=:side
-                    AND NOT COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,(meta->>'synthetic_fill')::boolean,false)
-                    AND COALESCE(meta->>'fill_evidence_type','') IN ('KIS_ORDER_CUMULATIVE_ACTUAL','KIS_ORDER_DETAIL_ACTUAL')"""),
+                conn.execute(_mark_filled_by_reconcile_stmt(),
                     {"qty": observed_cumulative, "price": price, "cok": resolved_client_order_key, "remaining": remaining, "requested": requested, "ts": now_utc,
-                     "td": td, "order_no": on, "symbol": sym, "side": side_u})
+                     "td": date.fromisoformat(td), "order_no": on, "symbol": sym, "side": side_u})
             actual = conn.execute(text("""SELECT 1 FROM us_fills WHERE trade_date=:td
                 AND :order_no <> '' AND order_no=:order_no
                 AND symbol=:symbol AND side=:side

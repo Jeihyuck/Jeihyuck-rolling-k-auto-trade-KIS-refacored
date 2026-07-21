@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Set scope before any Python helper import; US jobs must never load KR providers.
+export MARKET_SCOPE="us"
+export TRADING_MARKET="us"
+export DISABLE_KR_IMPORTS_IN_US="1"
 APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
 cd "$APP_DIR"
 source scripts/wsl/deploy-preflight.sh
@@ -13,6 +17,11 @@ if [[ -f .env ]]; then
   source .env
   set +a
 fi
+
+# .env may carry Korean defaults; pin the process back to US before lock helpers run.
+export MARKET_SCOPE="us"
+export TRADING_MARKET="us"
+export DISABLE_KR_IMPORTS_IN_US="1"
 
 SESSION_NAME="am"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
@@ -28,12 +37,20 @@ if [[ "${lock_rc}" == "10" ]]; then
 elif [[ "${lock_rc}" != "0" ]]; then
   echo "[$(date -Is)] [US_SCHEDULER][LOCK_HELPER_WARN] session=${SESSION_NAME} trade_date=${TRADE_DATE} rc=${lock_rc}" >> "${LOG_FILE}"
 fi
+if [[ "${LOCK_RESULT}" == *'"reason": "stale_lock_removed"'* ]]; then
+  stale_pid="$(printf '%s' "${LOCK_RESULT}" | sed -n 's/.*"stale_pid": \([0-9][0-9]*\).*/\1/p')"
+  echo "[$(date -Is)] [US_SCHEDULER][STALE_LOCK_REMOVED] session=${SESSION_NAME} trade_date=${TRADE_DATE} path=runtime/locks/us-${SESSION_NAME}-${TRADE_DATE}.json pid=${stale_pid:-0}" >> "${LOG_FILE}"
+fi
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
   echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] reason=already_running [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi
 echo "[$(date -Is)] [US_WSL_LOCK][ACQUIRED] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
+if [[ "${US_LOCK_ONLY:-0}" == "1" ]]; then
+  echo "[$(date -Is)] [US_SCHEDULER][LOCK_ONLY_DONE] session=${SESSION_NAME} trade_date=${TRADE_DATE}" >> "${LOG_FILE}"
+  exit 0
+fi
 cleanup() {
   exit_code=$?
   echo "[$(date -Is)] [US_WSL_LOCK][RELEASED] session=${SESSION_NAME} lock=${LOCK_FILE} exit_code=${exit_code}" >> "${LOG_FILE}"
