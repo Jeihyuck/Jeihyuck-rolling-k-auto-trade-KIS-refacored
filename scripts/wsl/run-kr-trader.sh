@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/nullim-repo-root.sh"
+nullim_resolve_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
+cd "$APP_DIR"
+NULLIM_WRAPPER="${BASH_SOURCE[0]}"
+export WSL_RUN_MARKET="KR"
+export MARKET="KR"
+export WSL_RUN_SESSION="dispatcher"
+export PB1_SESSION="dispatcher"
+source scripts/wsl/deploy-preflight.sh
+deploy_preflight
+if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 echo "[KR_TRADER][DEPRECATED] this script is not valid for PB1 prep/am/afternoon/close scheduler"
 if [ "${ALLOW_LEGACY_KR_TRADER:-0}" != "1" ]; then
   echo "[KR_TRADER][BLOCKED] reason=LEGACY_SCRIPT_NOT_ALLOWED_FOR_SCHEDULER"
@@ -8,8 +21,7 @@ if [ "${ALLOW_LEGACY_KR_TRADER:-0}" != "1" ]; then
 fi
 
 echo "[KR_TRADER][WARNING] PB1 scheduler forbidden; legacy execution manually allowed"
-REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
-if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
+REPO="$APP_DIR"
 cd "$REPO"
 
 mkdir -p runtime
@@ -17,6 +29,9 @@ mkdir -p runtime
 set -a
 source .env
 set +a
+nullim_reassert_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
+cd "$APP_DIR"
 
 export STRATEGY_ENV="${STRATEGY_ENV:-practice}"
 export KIS_ENV="${KIS_ENV:-practice}"

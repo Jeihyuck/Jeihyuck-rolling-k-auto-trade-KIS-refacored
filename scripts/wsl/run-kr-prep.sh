@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/nullim-repo-root.sh"
+nullim_resolve_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
+NULLIM_WRAPPER="${BASH_SOURCE[0]}"
+export WSL_RUN_MARKET="KR"
+export MARKET="KR"
+export WSL_RUN_SESSION="prep"
+export PB1_SESSION="prep"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
+if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 export KR_PB1_VOL_MAX="${KR_PB1_VOL_MAX:-1.25}"
 export KR_PB1_VOLU_MAX="${KR_PB1_VOLU_MAX:-1.25}"
 export KR_PB1_VOLU_MAX_INTRADAY="${KR_PB1_VOLU_MAX_INTRADAY:-1.25}"
@@ -13,8 +22,7 @@ export PB1_VOLU_MAX_INTRADAY="${PB1_VOLU_MAX_INTRADAY:-$KR_PB1_VOLU_MAX_INTRADAY
 export KR_PREP_AUX_WATCHLIST_TIMEOUT_SEC="${KR_PREP_AUX_WATCHLIST_TIMEOUT_SEC:-20}"
 export KR_PREP_AUX_REPORT_TIMEOUT_SEC="${KR_PREP_AUX_REPORT_TIMEOUT_SEC:-30}"
 export KR_PREP_AUX_DEFAULT_TIMEOUT_SEC="${KR_PREP_AUX_DEFAULT_TIMEOUT_SEC:-20}"
-REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
-if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
+REPO="$APP_DIR"
 cd "$REPO"; mkdir -p runtime runtime/locks
 export WSL_RUN_SOURCE="${WSL_RUN_SOURCE:-local-wsl}"
 export WSL_RUN_MARKET="KR"
@@ -32,6 +40,9 @@ else
   echo "[KR_PREP][LOCK_ACQUIRED] lock=${LOCK_FILE}"
 fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
+nullim_reassert_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
+cd "$APP_DIR"
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul
 export PYTHONUNBUFFERED=1

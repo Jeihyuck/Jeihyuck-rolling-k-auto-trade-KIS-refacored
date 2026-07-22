@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/nullim-repo-root.sh"
+nullim_resolve_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
+cd "$APP_DIR"
+NULLIM_WRAPPER="${BASH_SOURCE[0]}"
+export WSL_RUN_MARKET="US"
+export MARKET="US"
+export WSL_RUN_SESSION="prep_recovery"
+export PB1_SESSION="prep_recovery"
+source scripts/wsl/deploy-preflight.sh
+deploy_preflight
+if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 mkdir -p runtime runtime/locks runtime/health
 
 export US_PREP_RECOVERY_RUN="${US_PREP_RECOVERY_RUN:-1}"
