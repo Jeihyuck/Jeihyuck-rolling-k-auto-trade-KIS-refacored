@@ -9,16 +9,11 @@ def test_wsl_scripts_parse_and_common_venv_wrapper_exists():
         assert subprocess.run(["bash", "-n", str(script)], check=False).returncode == 0, script
 
 
-def test_cron_installer_creates_kr_log_directory_and_keeps_us_in_new_york():
+def test_cron_installer_is_cleanup_only():
     text = Path("scripts/wsl/install-nullim-cron.sh").read_text()
-    assert 'mkdir -p "$APP/runtime/cron_logs"' in text
-    kr_start = text.index("CRON_TZ=Asia/Seoul")
-    us_start = text.index("CRON_TZ=America/New_York")
-    assert kr_start < us_start
-    us_block = text[us_start:]
-    for session in ("run-us-prep.sh", "run-us-am.sh", "run-us-afternoon.sh", "run-us-close.sh"):
-        assert session in us_block
-
+    assert "[CRON_INSTALL][BLOCK] reason=WINDOWS_TASK_SCHEDULER_ONLY" in text
+    assert "cat <<EOF" not in text
+    assert "CRON_TZ=" not in text
 
 def test_kr_close_uses_the_same_advisory_lock_policy_as_intraday_sessions():
     text = Path("scripts/wsl/run-kr-close.sh").read_text()
