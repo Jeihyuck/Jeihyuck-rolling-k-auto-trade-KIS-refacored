@@ -123,7 +123,7 @@ def _prior_failed_orders_require_reconcile_only(trade_date: str, session: str) -
     A fill-persistence fatal after an ACK is deliberately sticky: a later session
     may reconcile broker state, but it must not place a replacement order.
     """
-    rows: list[dict] = []
+    rows: list[tuple[str, dict]] = []
     paths = [
         Path("reports/us_schedule_health") / f"{trade_date}.json",
         Path("runtime/health") / f"us-{trade_date}.json",
@@ -137,16 +137,65 @@ def _prior_failed_orders_require_reconcile_only(trade_date: str, session: str) -
         except (OSError, ValueError, TypeError):
             continue
         if isinstance(payload, dict) and isinstance(payload.get("sessions"), dict):
-            rows.extend(row for name, row in payload["sessions"].items() if name != session and isinstance(row, dict))
-        elif isinstance(payload, dict) and str(payload.get("session") or "") != session:
-            rows.append(payload)
-    for row in rows:
+            rows.extend((name, row) for name, row in payload["sessions"].items() if isinstance(row, dict))
+        elif isinstance(payload, dict):
+            rows.append((str(payload.get("session") or ""), payload))
+
+    # A clean marker is deliberately durable for the rest of the trade date.
+    # It supersedes the original fatal record, unless its own reconciliation
+    # state still says pending/unresolved/manual action is required.
+    clean_rows = [row for _name, row in rows if int(row.get("reconcile_only_clean", 0) or 0) == 1]
+    if clean_rows:
+        latest_clean = clean_rows[-1]
+        if (
+            int(latest_clean.get("pending_ack_count", 0) or 0) == 0
+            and int(latest_clean.get("unresolved_ack_count", 0) or 0) == 0
+            and not bool(latest_clean.get("manual_reconcile_required"))
+        ):
+            return False
+        return True
+
+    for row_session, row in rows:
+        if row_session == session:
+            continue
         status = str(row.get("effective_status") or row.get("final_status") or row.get("status") or "").upper()
         reason = str(row.get("reason") or "")
         orders = int(row.get("orders_ack", 0) or 0) + int(row.get("orders_sent", 0) or 0)
-        if status == "FAILED" and reason == "fill_persistence_failed" and orders > 0:
+        if status == "FAILED" and "fill_persistence_failed" in reason and orders > 0:
             return True
     return False
+
+
+def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_index: int) -> str:
+    """Persist a tick-level clean marker so the next tick is allowed to trade."""
+    timestamp = datetime.utcnow().isoformat() + "Z"
+    paths = (
+        Path("runtime/health") / f"us-{trade_date}.json",
+        Path("reports/us_schedule_health") / f"{trade_date}.json",
+    )
+    try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                payload = {"trade_date": trade_date, "sessions": {}}
+            sessions = payload.setdefault("sessions", {})
+            current = dict(sessions.get(session) or {})
+            current.update({
+                "session": session, "trade_date": trade_date,
+                "reconcile_only_clean": 1, "reconcile_only_until_clean": 0,
+                "pending_ack_count": 0, "unresolved_ack_count": 0,
+                "manual_reconcile_required": 0,
+                "reconcile_only_clean_at": timestamp,
+                "reconcile_only_clean_session": session,
+                "reconcile_only_clean_tick": int(tick_index),
+            })
+            sessions[session] = current
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[US_SAFETY][RECONCILE_ONLY_CLEAN_MARKER_WARN] error=%s", exc)
+    return timestamp
 
 
 def _suppress_pending_sell_exit_intents(exit_intents: list[dict], trade_date: str) -> list[dict]:
@@ -1217,6 +1266,10 @@ def run_trade_tick(
     if reconcile_only_until_clean or ack_order_block:
         reason = "prior_failed_orders_reconcile_required" if reconcile_only_until_clean else "unresolved_ack_exists"
         logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
+        reconcile_only_clean_at = (
+            _write_reconcile_only_clean_marker(trade_date=trade_date, session=session, tick_index=tick_index)
+            if reconcile_only_clean else ""
+        )
         return {
             "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
             "reason": reason,
@@ -1227,6 +1280,9 @@ def run_trade_tick(
             "prior_failed_orders_reconcile_required": int(prior_failed_orders_reconcile_required),
             "reconcile_only_until_clean": int(reconcile_only_until_clean),
             "reconcile_only_clean": int(reconcile_only_clean),
+            "reconcile_only_clean_at": reconcile_only_clean_at,
+            "reconcile_only_clean_session": session if reconcile_only_clean else "",
+            "reconcile_only_clean_tick": int(tick_index) if reconcile_only_clean else 0,
             "pending_ack_count": pending_ack_count,
             "unresolved_ack_count": unresolved_ack_count,
             "blocked_new_orders_due_to_reconcile": 1,

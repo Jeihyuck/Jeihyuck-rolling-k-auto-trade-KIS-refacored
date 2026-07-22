@@ -758,7 +758,13 @@ def classify_ack_orders_with_final_balance(
             final_status = "balance_delta_confirmed"
         elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty >= qty:
             final_status = "balance_delta_confirmed"
-        elif side == "SELL" and qty > 0 and final_qty == 0:
+        elif (
+            side == "SELL" and qty > 0 and final_qty == 0
+            and (
+                (pre_qty is not None and pre_qty > 0)
+                or raw_status in {"ACK", "ACKED", "ACCEPTED"}
+            )
+        ):
             # A final authoritative balance with no symbol is sufficient SELL
             # evidence even when the pre-order snapshot was unavailable.
             final_status = "position_absent_confirmed_sell"
