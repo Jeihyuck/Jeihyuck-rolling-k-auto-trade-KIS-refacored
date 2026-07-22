@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/nullim-repo-root.sh"
+nullim_resolve_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
+NULLIM_WRAPPER="${BASH_SOURCE[0]}"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
-REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
-if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
+if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
+REPO="$APP_DIR"
 cd "$REPO"; mkdir -p runtime runtime/locks
 export WSL_RUN_SOURCE="${WSL_RUN_SOURCE:-local-wsl}"
 export WSL_RUN_MARKET="KR"

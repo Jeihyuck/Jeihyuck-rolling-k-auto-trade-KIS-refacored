@@ -15,7 +15,7 @@ $canonical = @($defs | ForEach-Object Name)
 $repoMarker = 'Jeihyuck-rolling-k-auto-trade-KIS-refacored'
 $runnerMarker = 'run-kr-|run-us-|run_pb1_kr\.sh|send-market-log-mail\.sh|check-nullim-day-health\.sh|pb1_runner|trade_session_runner'
 Get-ScheduledTask | ForEach-Object {
-  $task = $_; $action = ($task.Actions | Out-String)
+  $task = $_; $action = (@($task.Actions) | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join " "
   # Preserve unrelated tasks even when they use a generically named runner.
   $isNullimTask = $action -match [regex]::Escape($repoMarker) -and $action -match $runnerMarker
   if (($canonical -notcontains $task.TaskName -or $task.TaskPath -ne "\") -and $isNullimTask) {
@@ -26,9 +26,13 @@ Get-ScheduledTask | ForEach-Object {
 $orderTasks = @("PB1 KR AM WSL","PB1 KR Afternoon WSL","PB1 KR Close WSL","PB1 US AM WSL","PB1 US Afternoon WSL","PB1 US Close WSL")
 foreach ($d in $defs) {
   $restart = if ($orderTasks -contains $d.Name) { 0 } else { 3 }
-  $action = New-ScheduledTaskAction -Execute $wsl -Argument "-d $Distro -- bash -lc 'cd $Repo && bash $($d.Cmd)'"
+  $action = New-ScheduledTaskAction -Execute $wsl -Argument "-d $Distro -- bash -lc 'unset NULLIM_APP_DIR; cd ""$Repo"" && exec bash ""$($d.Cmd)""'"
   $trigger = New-ScheduledTaskTrigger -Daily -At $d.Time
-  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount $restart -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -ExecutionTimeLimit ([System.Xml.XmlConvert]::ToTimeSpan($d.Limit)) -WakeToRun
+  if ($restart -gt 0) {
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount $restart -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew -ExecutionTimeLimit ([System.Xml.XmlConvert]::ToTimeSpan($d.Limit)) -WakeToRun
+  } else {
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([System.Xml.XmlConvert]::ToTimeSpan($d.Limit)) -WakeToRun
+  }
   $settings.DisallowStartIfOnBatteries=$false; $settings.StopIfGoingOnBatteries=$false; $settings.RunOnlyIfIdle=$false
   Register-ScheduledTask -TaskName $d.Name -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
   Write-Host "[SCHEDULER][OK] $($d.Name) time=$($d.Time) cmd=$($d.Cmd) restart_count=$restart"

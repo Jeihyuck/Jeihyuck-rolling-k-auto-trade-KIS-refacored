@@ -4,10 +4,15 @@ set -euo pipefail
 export MARKET_SCOPE="us"
 export TRADING_MARKET="us"
 export DISABLE_KR_IMPORTS_IN_US="1"
-APP_DIR="${NULLIM_APP_DIR:-/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored}"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/nullim-repo-root.sh"
+nullim_resolve_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
+NULLIM_WRAPPER="${BASH_SOURCE[0]}"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
+if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p runtime runtime/locks
