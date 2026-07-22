@@ -7,6 +7,8 @@ deploy_preflight
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime runtime/locks
+export WSL_RUN_SOURCE="${WSL_RUN_SOURCE:-local-wsl}"
+export WSL_RUN_MARKET="KR"
 source scripts/wsl/kr-session-lock.sh
 lock_file="runtime/locks/kr-close.lock"
 if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
@@ -63,8 +65,6 @@ export KR_BALANCE_CACHE_MAX_AGE_SEC="${KR_BALANCE_CACHE_MAX_AGE_SEC:-180}"
 export KR_ALLOW_BALANCE_CACHE_FOR_ENTRY="${KR_ALLOW_BALANCE_CACHE_FOR_ENTRY:-0}"
 export KR_ALLOW_BALANCE_CACHE_FOR_EXIT="${KR_ALLOW_BALANCE_CACHE_FOR_EXIT:-1}"
 export KR_ALLOW_BALANCE_CACHE_FOR_CLOSE="${KR_ALLOW_BALANCE_CACHE_FOR_CLOSE:-1}"
-export WSL_RUN_SOURCE="local-wsl"
-export WSL_RUN_MARKET="KR"
 
 export PB1_SESSION=close WSL_RUN_SESSION=close STRATEGY_MODE=LIVE DRY_RUN=0 DISABLE_LIVE_TRADING=0 LIVE_TRADING_ENABLED=1 KR_LIVE_TRADING_ENABLED=1 KR_ORDER_ARMED=1
 export FORCE_PB1_PHASE=close

@@ -11,10 +11,11 @@ $defs = @(
 & $wsl -d $Distro -- bash -lc "cd '$Repo' && bash scripts/wsl/install-nullim-cron.sh"
 if ($LASTEXITCODE -ne 0) { throw "WSL NULLIM scheduler cleanup failed" }
 $canonical = @($defs | ForEach-Object Name)
+# Canonical identity is root TaskPath + task name; same name below another path is a duplicate.
 $needles = 'run-kr-|run-us-|run_pb1_kr\.sh|send-market-log-mail\.sh|check-nullim-day-health\.sh|trader\.pb1_runner|trade_session_runner'
 Get-ScheduledTask | ForEach-Object {
   $task = $_; $action = ($task.Actions | Out-String)
-  if ($canonical -notcontains $task.TaskName -and $action -match [regex]::Escape($Repo) -and $action -match $needles) {
+  if (($canonical -notcontains $task.TaskName -or $task.TaskPath -ne "\") -and $action -match [regex]::Escape($Repo) -and $action -match $needles) {
     Write-Host "[SCHEDULER][REMOVE_LEGACY] task=$($task.TaskName) action=$action"
     Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false
   }

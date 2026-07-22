@@ -33,7 +33,7 @@ def test_us_prep_and_recovery_share_prep_lock():
 
 def test_order_capable_workflows_have_no_schedule():
     needles=('run-kr-','run-us-','run_pb1_kr.sh','trader.pb1_runner','trade_session_runner','LIVE_TRADING_ENABLED','KR_ORDER_ARMED','US_ORDER_ARMED')
-    for path in (ROOT/'.github/workflows').glob('*.yml'):
+    for path in (ROOT/'.github/workflows').glob('*.*ml'):
         text=path.read_text()
         if any(n in text for n in needles): assert 'schedule:' not in text, path
 
@@ -41,3 +41,18 @@ def test_docs_and_windows_installer_declare_single_owner():
     assert 'sole automatic owner' in (ROOT/'docs/WSL_KR_US_SCHEDULE_RUNBOOK.md').read_text()
     installer=(ROOT/'scripts/windows/update-nullim-scheduler.ps1').read_text()
     assert 'install-nullim-cron.sh' in installer and 'verify-scheduler.ps1' in installer
+
+def test_kr_duplicate_evidence_never_overwrites_canonical_result():
+    text=(ROOT/'scripts/wsl/kr-session-lock.sh').read_text()
+    assert '/duplicates/duplicate-' in text
+    assert 'Path(sys.argv[2]).write_text' in text
+    assert 'duplicates/duplicate-' in text
+
+
+def test_cleanup_refuses_unbalanced_markers(tmp_path):
+    state=tmp_path/'cron'; state.write_text('safe cron\n# NULLIM_CRON_START\nunsafe\n')
+    fake=tmp_path/'bin'; fake.mkdir(); cr=fake/'crontab'
+    cr.write_text('#!/usr/bin/env bash\nif [[ "$1" == "-l" ]]; then cat "$CRON_STATE"; else cat > "$CRON_STATE"; fi\n'); cr.chmod(0o755)
+    env={**os.environ,'PATH':f'{fake}:{os.environ["PATH"]}','CRON_STATE':str(state),'NULLIM_CRON_BACKUP_DIR':str(tmp_path/'backup')}
+    result=subprocess.run(['bash',str(ROOT/'scripts/wsl/install-nullim-cron.sh')],cwd=ROOT,env=env,text=True,capture_output=True)
+    assert result.returncode == 1 and state.read_text().startswith('safe cron')

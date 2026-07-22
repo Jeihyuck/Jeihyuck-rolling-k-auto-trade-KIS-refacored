@@ -7,6 +7,8 @@ deploy_preflight
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
 cd "$REPO"; mkdir -p runtime runtime/locks
+export WSL_RUN_SOURCE="${WSL_RUN_SOURCE:-local-wsl}"
+export WSL_RUN_MARKET="KR"
 source scripts/wsl/kr-session-lock.sh
 lock_file="runtime/locks/kr-afternoon.lock"
 if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
@@ -58,8 +60,6 @@ export KR_BALANCE_CACHE_MAX_AGE_SEC="${KR_BALANCE_CACHE_MAX_AGE_SEC:-180}"
 export KR_ALLOW_BALANCE_CACHE_FOR_ENTRY="${KR_ALLOW_BALANCE_CACHE_FOR_ENTRY:-1}"
 export KR_ALLOW_BALANCE_CACHE_FOR_EXIT="${KR_ALLOW_BALANCE_CACHE_FOR_EXIT:-1}"
 export KR_ALLOW_BALANCE_CACHE_FOR_CLOSE="${KR_ALLOW_BALANCE_CACHE_FOR_CLOSE:-1}"
-export WSL_RUN_SOURCE="local-wsl"
-export WSL_RUN_MARKET="KR"
 export PB1_ENTRY_PLAN_FAIL_OPEN="${PB1_ENTRY_PLAN_FAIL_OPEN:-1}"
 export PB1_PRACTICE_FORCE_MIN_TRADE="${PB1_PRACTICE_FORCE_MIN_TRADE:-0}"
 export PB1_FORCE_MIN_ONE_ORDER_PRACTICE="${PB1_FORCE_MIN_ONE_ORDER_PRACTICE:-0}"

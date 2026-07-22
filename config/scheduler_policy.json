@@ -1,0 +1,1 @@
+{"policy_version":1,"automatic_scheduler_owner":"windows_task_scheduler","wsl_user_cron_allowed":false,"wsl_system_cron_allowed":false,"wsl_systemd_timer_allowed":false,"github_actions_live_schedule_allowed":false,"markets":["KR","US"],"manual_entrypoints_allowed":true,"database_advisory_lock_is_final_guard_only":true}

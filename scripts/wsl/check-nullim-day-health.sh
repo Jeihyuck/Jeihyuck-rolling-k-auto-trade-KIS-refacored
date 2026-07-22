@@ -7,7 +7,8 @@ cd "$APP"
 mkdir -p runtime/health
 POLICY_STATUS="OK"
 FORBIDDEN=0
-if ! bash scripts/wsl/verify-no-nullim-auto-scheduler.sh; then POLICY_STATUS="FAIL"; FORBIDDEN=1; fi
+VERIFY_OUTPUT="$(bash scripts/wsl/verify-no-nullim-auto-scheduler.sh 2>&1)" || { POLICY_STATUS="FAIL"; FORBIDDEN="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/.*forbidden_sources=\([0-9][0-9]*\).*/\1/p' | tail -1)"; FORBIDDEN="${FORBIDDEN:-1}"; }
+printf '%s\n' "$VERIFY_OUTPUT"
 OUT="runtime/health/${MARKET}-${DAY}.json"
 SUMMARY="runtime/health/${MARKET}-${DAY}.summary.txt"
 python - "$MARKET" "$DAY" "$OUT" "$SUMMARY" "$POLICY_STATUS" "$FORBIDDEN" <<'PY'
@@ -27,6 +28,9 @@ def ticks(t): return len(re.findall(r'(?:US_TICK_LOOP\]\[TICK|\[TICK\]|tick=)', 
 logs = list((root/'runtime/logs'/market/day).glob('*.log')) if (root/'runtime/logs'/market/day).exists() else []
 logs += list((root/'runtime').glob(f'wsl-{market}-*.log'))
 blob = text(logs)
+# Flat US logs are append-only; retain only the requested UTC trade-date lines.
+if market == 'us':
+    blob='\n'.join(line for line in blob.splitlines() if day in line)
 mail_marker = root/'runtime/health'/f'{market}-mail-{day}.json'
 duplicate_skips=len(re.findall(r'SKIP_DUPLICATE|DUPLICATE_BLOCKED', blob, re.I))
 advisory_unavailable=len(re.findall(r'PB1_ADVISORY_LOCK_UNAVAILABLE', blob))

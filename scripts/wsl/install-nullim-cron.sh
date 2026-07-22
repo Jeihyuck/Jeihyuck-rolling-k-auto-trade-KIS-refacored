@@ -9,7 +9,14 @@ backup="$BACKUP_DIR/crontab-before-$(date +%Y%m%d-%H%M%S).txt"
 printf '%s\n' "$existing" > "$backup"
 echo "[CRON_CLEANUP][POLICY] owner=WINDOWS_TASK_SCHEDULER"
 echo "[CRON_CLEANUP][BACKUP] path=$backup"
-# Remove managed blocks first, including every line between unmatched legacy delimiters.
+# Never guess across an unbalanced legacy block: preserve all user cron and fail safely.
+start_markers=$(printf '%s\n' "$existing" | awk '/# NULLIM_CRON_START/{n++} END{print n+0}')
+end_markers=$(printf '%s\n' "$existing" | awk '/# NULLIM_CRON_END/{n++} END{print n+0}')
+if [[ "$start_markers" != "$end_markers" ]]; then
+  echo "[CRON_CLEANUP][VERIFY][FAIL] reason=UNBALANCED_NULLIM_MARKERS start=$start_markers end=$end_markers"
+  exit 1
+fi
+# Remove managed blocks only after marker balance is established.
 block_count=$(printf '%s\n' "$existing" | awk '/# NULLIM_CRON_START/{n++} END{print n+0}')
 without_blocks=$(printf '%s\n' "$existing" | awk '
   /# NULLIM_CRON_START/ {skip=1; next}
