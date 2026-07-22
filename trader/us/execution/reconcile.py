@@ -758,6 +758,16 @@ def classify_ack_orders_with_final_balance(
             final_status = "balance_delta_confirmed"
         elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty >= qty:
             final_status = "balance_delta_confirmed"
+        elif (
+            side == "SELL" and qty > 0 and final_qty == 0
+            and (
+                (pre_qty is not None and pre_qty > 0)
+                or raw_status in {"ACK", "ACKED", "ACCEPTED"}
+            )
+        ):
+            # A final authoritative balance with no symbol is sufficient SELL
+            # evidence even when the pre-order snapshot was unavailable.
+            final_status = "position_absent_confirmed_sell"
         else:
             final_status = "ack_only_unresolved"
         if final_status == "ack_only_unresolved":
@@ -772,7 +782,7 @@ def classify_ack_orders_with_final_balance(
             "client_order_key": str(order.get("client_order_key") or ""),
             "ack_status": raw_status,
             "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
-            "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else "NOT_CONFIRMED_BY_BALANCE_DELTA",
+            "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else ("position_absent_confirmed_sell" if final_status == "position_absent_confirmed_sell" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),
             "final_status": final_status,
             "price_source": str((order.get("meta") or {}).get("price_source") or order.get("price_source") or ""),
             "pnl_if_sell": (order.get("meta") or {}).get("pnl_if_sell") if isinstance(order.get("meta") or {}, dict) else None,

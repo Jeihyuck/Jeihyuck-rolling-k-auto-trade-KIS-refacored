@@ -278,6 +278,18 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
             "ack_reconcile_after_route_unresolved_count": payload.get("ack_reconcile_after_route_unresolved_count", 0),
             "ack_pending_reconcile_count": payload.get("ack_pending_reconcile_count", 0),
             "pending_order_count": payload.get("pending_order_count", 0),
+            "prior_failed_orders_reconcile_required": int(payload.get("prior_failed_orders_reconcile_required", 0) or 0),
+            "reconcile_only_until_clean": int(payload.get("reconcile_only_until_clean", 0) or 0),
+            "reconcile_only_clean": int(payload.get("reconcile_only_clean", 0) or 0),
+            "reconcile_only_clean_at": payload.get("reconcile_only_clean_at", ""),
+            "reconcile_only_clean_session": payload.get("reconcile_only_clean_session", ""),
+            "reconcile_only_clean_tick": int(payload.get("reconcile_only_clean_tick", 0) or 0),
+            "unresolved_ack_count": int(payload.get("unresolved_ack_count", payload.get("ack_reconcile_after_route_unresolved_count", 0)) or 0),
+            "pending_ack_count": int(payload.get("pending_ack_count", payload.get("ack_pending_reconcile_count", 0)) or 0),
+            "blocked_new_orders_due_to_reconcile": int(payload.get("blocked_new_orders_due_to_reconcile", 0) or 0),
+            "last_unresolved_symbols": payload.get("last_unresolved_symbols", []),
+            "last_unresolved_order_nos": payload.get("last_unresolved_order_nos", []),
+            "manual_reconcile_required": int(payload.get("manual_reconcile_required", 0) or 0),
             "run_id": payload.get("run_id") or prov.get("run_id", ""),
             "workflow": payload.get("workflow") or prov.get("workflow", ""),
             "wall_elapsed_sec": float(payload.get("wall_elapsed_sec", 0) or 0),
@@ -303,7 +315,7 @@ def _write_us_schedule_health(payload: dict, session: str) -> None:
         mismatch = [name for name, row in sessions.items() if "MISMATCH" in str((row or {}).get("final_status") or "").upper()]
         broker_fills = max(int((row or {}).get("broker_fills_fetched", 0) or 0) for row in sessions.values()) if sessions else 0
         persisted_fills = max(int((row or {}).get("fills_count", 0) or 0) for row in sessions.values()) if sessions else 0
-        manual_reconcile_required = any(bool((row or {}).get("manual_reconcile_required")) for row in sessions.values())
+        manual_reconcile_required = any(bool((row or {}).get("manual_reconcile_required")) or int((row or {}).get("pending_order_count", 0) or 0) > 0 or int((row or {}).get("unresolved_ack_count", 0) or 0) > 0 or str((row or {}).get("ack_reconcile_before_route_status") or "").upper() == "WARN" for row in sessions.values())
         if fatal:
             health_status, health_ok, health_reason = "FAILED", False, "fill_persistence_failed" if any("fill_persistence_failed" in str((sessions[n] or {}).get("reason") or "") for n in fatal) else "us_session_failed"
         elif broker_fills > 0 and persisted_fills == 0:
@@ -1524,9 +1536,23 @@ def run_trade_session(
             "orders_ack": total_orders_ack,
             "orders_ack_total": total_orders_ack,
             "fill_persistence_failed": int("fill_persistence_failed" in str(final_reason)),
+            "prior_failed_orders_reconcile_required": int(final_tick.get("prior_failed_orders_reconcile_required", 0) or 0),
+            "reconcile_only_until_clean": int(final_tick.get("reconcile_only_until_clean", 0) or 0),
+            "reconcile_only_clean": int(final_tick.get("reconcile_only_clean", 0) or 0),
+            "reconcile_only_clean_at": final_tick.get("reconcile_only_clean_at", ""),
+            "reconcile_only_clean_session": final_tick.get("reconcile_only_clean_session", ""),
+            "reconcile_only_clean_tick": int(final_tick.get("reconcile_only_clean_tick", 0) or 0),
+            "unresolved_ack_count": int(final_tick.get("unresolved_ack_count", final_tick.get("ack_reconcile_after_route_unresolved_count", 0)) or 0),
+            "pending_ack_count": int(final_tick.get("pending_ack_count", ack_pending_reconcile_count) or 0),
+            "blocked_new_orders_due_to_reconcile": int(final_tick.get("blocked_new_orders_due_to_reconcile", 0) or 0),
+            "last_unresolved_symbols": final_tick.get("last_unresolved_symbols", []),
+            "last_unresolved_order_nos": final_tick.get("last_unresolved_order_nos", []),
             "manual_reconcile_required": int(
-                "fill_persistence_failed_after_orders_sent" in str(final_reason)
-                and (total_orders_sent > 0 or total_orders_ack > 0)
+                bool(final_tick.get("manual_reconcile_required"))
+                or ("fill_persistence_failed" in str(final_reason) and (total_orders_sent > 0 or total_orders_ack > 0))
+                or total_pending_orders > 0
+                or int(final_tick.get("unresolved_ack_count", 0) or 0) > 0
+                or str(final_tick.get("ack_reconcile_before_route_status") or "").upper() == "WARN"
             ),
             "orders_rejected": total_orders_rejected,
             "orders_reject_total": total_orders_rejected,
