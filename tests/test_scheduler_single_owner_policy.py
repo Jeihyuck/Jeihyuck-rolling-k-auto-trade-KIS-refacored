@@ -68,3 +68,10 @@ def test_scheduler_ci_installs_pytest_and_separates_steps():
     text=(ROOT/'.github/workflows/scheduler-policy.yml').read_text()
     assert 'Install test dependencies' in text and 'pip install --upgrade pip pytest' in text
     assert 'Validate shell syntax' in text and 'Run scheduler policy regression tests' in text
+
+def test_windows_legacy_detection_requires_repo_and_runner_markers():
+    for path in (ROOT/'scripts/windows/update-nullim-scheduler.ps1', ROOT/'scripts/windows/verify-scheduler.ps1'):
+        text=path.read_text()
+        assert "$repoMarker" in text and "$runnerMarker" in text and "$isNullimTask" in text
+        assert "Jeihyuck-rolling-k-auto-trade-KIS-refacored" in text
+        assert "-and $action -match $runnerMarker" in text or "-and $a -match $runnerMarker" in text
