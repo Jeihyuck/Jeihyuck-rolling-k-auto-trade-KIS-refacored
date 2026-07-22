@@ -6,6 +6,10 @@ nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
 NULLIM_WRAPPER="${BASH_SOURCE[0]}"
+export WSL_RUN_MARKET="KR"
+export MARKET="KR"
+export WSL_RUN_SESSION="prep"
+export PB1_SESSION="prep"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
@@ -36,6 +40,9 @@ else
   echo "[KR_PREP][LOCK_ACQUIRED] lock=${LOCK_FILE}"
 fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
+nullim_reassert_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
+cd "$APP_DIR"
 if [[ -f .venv/bin/activate ]]; then source .venv/bin/activate; fi
 export TZ=Asia/Seoul
 export PYTHONUNBUFFERED=1

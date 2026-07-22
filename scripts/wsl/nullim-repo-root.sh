@@ -24,3 +24,16 @@ nullim_resolve_repo_root() {
   export NULLIM_APP_DIR="$repo_root"
   export NULLIM_RESOLVED_REPO_ROOT="$repo_root"
 }
+
+nullim_reassert_repo_root() {
+  local caller="${1:-${BASH_SOURCE[1]}}" caller_path caller_dir repo_root stale
+  caller_path="$(readlink -f "$caller")" || return 1
+  caller_dir="$(cd "$(dirname "$caller_path")" && pwd -P)"
+  repo_root="$(cd "$caller_dir/../.." && pwd -P)"
+  stale="${NULLIM_APP_DIR:-}"
+  if [[ -n "$stale" && "$(readlink -f "$stale" 2>/dev/null || printf '%s' "$stale")" != "$repo_root" ]]; then
+    printf '%s\n' "[NULLIM_PATH][STALE_ENV_AFTER_DOTENV_IGNORED] inherited=$stale resolved=$repo_root" >&2
+  fi
+  export NULLIM_APP_DIR="$repo_root"
+  export NULLIM_RESOLVED_REPO_ROOT="$repo_root"
+}

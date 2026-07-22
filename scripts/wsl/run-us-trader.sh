@@ -7,6 +7,10 @@ nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
 NULLIM_WRAPPER="${BASH_SOURCE[0]}"
+export WSL_RUN_MARKET="US"
+export MARKET="US"
+export WSL_RUN_SESSION="dispatcher"
+export PB1_SESSION="dispatcher"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi

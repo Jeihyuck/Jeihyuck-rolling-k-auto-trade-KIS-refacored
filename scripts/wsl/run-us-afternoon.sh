@@ -10,6 +10,10 @@ nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
 NULLIM_WRAPPER="${BASH_SOURCE[0]}"
+export WSL_RUN_MARKET="US"
+export MARKET="US"
+export WSL_RUN_SESSION="afternoon"
+export PB1_SESSION="afternoon"
 source scripts/wsl/deploy-preflight.sh
 deploy_preflight
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then exit 0; fi
@@ -22,6 +26,9 @@ if [[ -f .env ]]; then
   source .env
   set +a
 fi
+nullim_reassert_repo_root "${BASH_SOURCE[0]}"
+APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
+cd "$APP_DIR"
 
 # .env may carry Korean defaults; pin the process back to US before lock helpers run.
 export MARKET_SCOPE="us"

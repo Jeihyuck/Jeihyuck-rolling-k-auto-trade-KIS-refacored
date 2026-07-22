@@ -23,3 +23,10 @@ def test_windows_verifier_uses_raw_actions_and_null_restart_is_valid():
 def test_wsl_verifier_skips_missing_files():
     text = (ROOT / 'scripts/wsl/verify-no-nullim-auto-scheduler.sh').read_text()
     assert '[[ -f "$1" ]] || return 0' in text
+
+def test_mail_and_health_define_scripts_and_arguments_separately():
+    text = (ROOT / 'scripts/windows/update-nullim-scheduler.ps1').read_text()
+    assert 'function New-NullimTaskActionArguments' in text
+    assert 'Script="$base/send-market-log-mail.sh";Args=@("kr")' in text
+    assert 'Script="$base/check-nullim-day-health.sh";Args=@("us")' in text
+    assert 'exec bash $scriptQ' in text

@@ -49,3 +49,5 @@ bash scripts/wsl/run-us-am.sh
 ```
 
 After deployment, Windows administrator PowerShell must run the installer and verifier commands in the deployment section above. Linux CI cannot prove that Task Scheduler accepts the generated XML; confirm the final `[SCHEDULER_POLICY][OK]` output and inspect an order task's `RestartCount` (`$null` or `0` is correct).
+
+Mail and Health actions render the wrapper script and `kr`/`us` market value as separate shell tokens. The Windows verifier checks this action contract and requires every canonical action to `unset NULLIM_APP_DIR`. Wrappers reassert their location-derived repository root immediately after loading `.env`, so `.env` cannot reintroduce either stale path variable. `deploy-preflight.log` must contain the wrapper's concrete market and session; `market=unknown` or `session=unknown` is not a valid production result.

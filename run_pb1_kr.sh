@@ -8,6 +8,10 @@ source "$SCRIPT_DIR/scripts/wsl/nullim-repo-root.sh"
 nullim_resolve_repo_root "$SCRIPT_DIR/scripts/wsl/nullim-repo-root.sh"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
 cd "$APP_DIR"
+export WSL_RUN_MARKET="KR"
+export MARKET="KR"
+export WSL_RUN_SESSION="$phase"
+export PB1_SESSION="$phase"
 if [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then
   NULLIM_WRAPPER="${BASH_SOURCE[0]}"
   source scripts/wsl/deploy-preflight.sh
