@@ -1,7 +1,11 @@
 # Windows Task Scheduler is the sole automatic scheduler for NULLIM KR/US sessions.
 param([string]$Distro="Ubuntu-22.04", [string]$Repo="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored")
 $ErrorActionPreference = "Stop"
-function ConvertTo-BashSingleQuoted([string]$Value) { return "'" + ($Value -replace "'", "'\"'\"'") + "'" }
+function ConvertTo-BashSingleQuoted([string]$Value) {
+  $singleQuote = [string][char]39
+  $replacement = $singleQuote + '"' + $singleQuote + '"' + $singleQuote
+  return $singleQuote + ($Value -replace $singleQuote, $replacement) + $singleQuote
+}
 function New-NullimTaskActionArguments([string]$Distro, [string]$Repo, [string]$Script, [string[]]$Args) {
   $repoQ=ConvertTo-BashSingleQuoted $Repo; $scriptQ=ConvertTo-BashSingleQuoted $Script
   $argsQ=@($Args | ForEach-Object { ConvertTo-BashSingleQuoted $_ })

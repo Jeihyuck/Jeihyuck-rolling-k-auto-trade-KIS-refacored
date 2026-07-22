@@ -30,3 +30,25 @@ def test_mail_and_health_define_scripts_and_arguments_separately():
     assert 'Script="$base/send-market-log-mail.sh";Args=@("kr")' in text
     assert 'Script="$base/check-nullim-day-health.sh";Args=@("us")' in text
     assert 'exec bash $scriptQ' in text
+
+def _bash_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+def test_mail_health_actions_keep_script_and_market_as_distinct_bash_words(tmp_path):
+    fixture = tmp_path / 'fixture.sh'
+    fixture.write_text('#!/usr/bin/env bash\nprintf "%s|%s" "$0" "$1"\n')
+    fixture.chmod(0o755)
+    for market in ('kr', 'us'):
+        command = f'exec bash {_bash_single_quote(str(fixture))} {_bash_single_quote(market)}'
+        import subprocess
+        result = subprocess.run(['bash', '-lc', command], text=True, capture_output=True, check=True)
+        assert result.stdout == f'{fixture}|{market}'
+        bad = f'exec bash {_bash_single_quote(str(fixture) + " " + market)}'
+        assert str(fixture) + ' ' + market in bad
+        assert bad != command
+
+def test_windows_scheduler_scripts_have_a_real_parser_check():
+    text = (ROOT / 'scripts/windows/test-parse.ps1').read_text()
+    assert 'Parser]::ParseFile' in text
+    workflow = (ROOT / '.github/workflows/scheduler-policy.yml').read_text()
+    assert 'powershell-parse:' in workflow and 'test-parse.ps1' in workflow

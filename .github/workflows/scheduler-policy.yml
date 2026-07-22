@@ -22,3 +22,11 @@ jobs:
           bash -n scripts/wsl/run-us-prep.sh scripts/wsl/run-us-prep-recovery.sh scripts/wsl/run-us-am.sh scripts/wsl/run-us-afternoon.sh scripts/wsl/run-us-close.sh
       - name: Run scheduler policy regression tests
         run: pytest -q tests/test_scheduler_single_owner_policy.py tests/test_recovery_control_plane_contracts.py tests/test_wsl_scripts_syntax.py tests/test_kr_runner_env_contract.py tests/test_scheduler_pr76_followup.py tests/test_nullim_wrapper_repo_root.py tests/test_nullim_wrapper_execution.py
+
+  powershell-parse:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse Windows PowerShell scheduler scripts
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-parse.ps1
