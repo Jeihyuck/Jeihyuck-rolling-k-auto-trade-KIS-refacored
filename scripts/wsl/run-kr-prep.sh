@@ -15,16 +15,20 @@ export KR_PREP_AUX_REPORT_TIMEOUT_SEC="${KR_PREP_AUX_REPORT_TIMEOUT_SEC:-30}"
 export KR_PREP_AUX_DEFAULT_TIMEOUT_SEC="${KR_PREP_AUX_DEFAULT_TIMEOUT_SEC:-20}"
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
-cd "$REPO"; mkdir -p runtime
-LOCK_FILE="/tmp/nullim-kr-prep.lock"
+cd "$REPO"; mkdir -p runtime runtime/locks
+export WSL_RUN_SOURCE="${WSL_RUN_SOURCE:-local-wsl}"
+export WSL_RUN_MARKET="KR"
+source scripts/wsl/kr-session-lock.sh
+LOCK_FILE="runtime/locks/kr-prep.lock"
 if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
   echo "[KR_PREP][LOCK_DELEGATED] external caller owns duplicate prevention lock=${LOCK_FILE}"
 else
   exec 9>"${LOCK_FILE}"
   if ! flock -n 9; then
-    echo "[KR_PREP][LOCK_SKIP] another instance is already running lock=${LOCK_FILE}"
+    kr_duplicate_result "${lock_file:-$LOCK_FILE}" "prep"
     exit 0
   fi
+  kr_lock_owner "$LOCK_FILE" "prep"
   echo "[KR_PREP][LOCK_ACQUIRED] lock=${LOCK_FILE}"
 fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
@@ -53,8 +57,6 @@ export KR_BALANCE_CACHE_MAX_AGE_SEC="${KR_BALANCE_CACHE_MAX_AGE_SEC:-180}"
 export KR_ALLOW_BALANCE_CACHE_FOR_ENTRY="${KR_ALLOW_BALANCE_CACHE_FOR_ENTRY:-0}"
 export KR_ALLOW_BALANCE_CACHE_FOR_EXIT="${KR_ALLOW_BALANCE_CACHE_FOR_EXIT:-1}"
 export KR_ALLOW_BALANCE_CACHE_FOR_CLOSE="${KR_ALLOW_BALANCE_CACHE_FOR_CLOSE:-1}"
-export WSL_RUN_SOURCE="local-wsl"
-export WSL_RUN_MARKET="KR"
 
 export PB1_SESSION=prep WSL_RUN_SESSION=prep STRATEGY_MODE=PREP DRY_RUN=1 DISABLE_LIVE_TRADING=1 LIVE_TRADING_ENABLED=0
 TODAY_KST="$(TZ=Asia/Seoul date +%F)"
@@ -82,7 +84,7 @@ fi
   set +e
   (
     # The parent shell keeps the session lock. Close the lock fd before exec'ing
-    # timeout/python so a hung child cannot keep /tmp/nullim-kr-prep.lock busy
+    # timeout/python so a hung child cannot keep runtime/locks/kr-prep.lock busy
     # after the wrapper exits or is killed.
     exec 9>&-
     timeout --kill-after=60s "${KR_PREP_TIMEOUT_SEC}" \

@@ -1,19 +1,10 @@
-param([string]$Repo="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored")
-$ErrorActionPreference = "Continue"
-$base = "$Repo/scripts/wsl"
-$expected = [ordered]@{
- "PB1 KR Prep WSL"=@("06:30","run-kr-prep.sh"); "PB1 KR AM WSL"=@("08:55","run-kr-am.sh"); "PB1 KR Afternoon WSL"=@("13:00","run-kr-afternoon.sh"); "PB1 KR Close WSL"=@("15:15","run-kr-close.sh"); "PB1 KR Mail WSL"=@("16:00","send-market-log-mail.sh kr"); "PB1 KR Health WSL"=@("16:10","check-nullim-day-health.sh kr");
- "PB1 US Prep Prewarm EDT WSL"=@("19:30","run-us-prep.sh"); "PB1 US Prep Prewarm EST WSL"=@("20:30","run-us-prep.sh"); "PB1 US Prep WSL"=@("21:30","run-us-prep.sh"); "PB1 US Prep Recovery WSL"=@("22:10","bash $base/run-us-prep-recovery.sh"); "PB1 US AM Preflight WSL"=@("22:20","bash $base/check-us-prep-before-am.sh"); "PB1 US AM WSL"=@("22:30","run-us-am.sh"); "PB1 US Afternoon WSL"=@("02:00","run-us-afternoon.sh"); "PB1 US Close WSL"=@("05:05","run-us-close.sh"); "PB1 US Mail WSL"=@("07:00","send-market-log-mail.sh us"); "PB1 US Health WSL"=@("07:10","check-nullim-day-health.sh us")
-}
-$failed=$false
-foreach($name in $expected.Keys){
- $task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
- if($null -eq $task){Write-Host "[SCHEDULER][FAIL] $name missing"; $failed=$true; continue}
- $info=Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue
- $action=($task.Actions | Out-String); $trig=($task.Triggers | Select-Object -First 1); $wantTime=$expected[$name][0]; $wantCmd=$expected[$name][1]
- $timeOk=($trig.StartBoundary -match "T$([regex]::Escape($wantTime)):")
- $settingsOk=($task.Settings.StartWhenAvailable -and $task.Settings.MultipleInstances -eq "IgnoreNew")
- $cmdOk=($action -match [regex]::Escape($wantCmd))
- if($cmdOk -and $timeOk -and $settingsOk){Write-Host "[SCHEDULER][OK] $name next=$($info.NextRunTime) last=$($info.LastTaskResult) time=$wantTime cmd=$wantCmd"} else {Write-Host "[SCHEDULER][FAIL] $name cmdOk=$cmdOk timeOk=$timeOk settingsOk=$settingsOk action=$action trigger=$($trig.StartBoundary)"; $failed=$true}
-}
-if($failed){exit 1}
+param([string]$Repo="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored", [string]$Distro="Ubuntu-22.04")
+$ErrorActionPreference="Continue"; $failed=$false; $wsl="$env:SystemRoot\System32\wsl.exe"; $base="$Repo/scripts/wsl"
+$expected=[ordered]@{
+"PB1 KR Prep WSL"=@("06:30","run-kr-prep.sh",$false);"PB1 KR AM WSL"=@("08:55","run-kr-am.sh",$true);"PB1 KR Afternoon WSL"=@("13:00","run-kr-afternoon.sh",$true);"PB1 KR Close WSL"=@("15:15","run-kr-close.sh",$true);"PB1 KR Mail WSL"=@("16:00","send-market-log-mail.sh kr",$false);"PB1 KR Health WSL"=@("16:10","check-nullim-day-health.sh kr",$false);
+"PB1 US Prep Prewarm EDT WSL"=@("19:30","run-us-prep.sh",$false);"PB1 US Prep Prewarm EST WSL"=@("20:30","run-us-prep.sh",$false);"PB1 US Prep WSL"=@("21:30","run-us-prep.sh",$false);"PB1 US Prep Recovery WSL"=@("22:10","run-us-prep-recovery.sh",$false);"PB1 US AM Preflight WSL"=@("22:20","check-us-prep-before-am.sh",$false);"PB1 US AM WSL"=@("22:30","run-us-am.sh",$true);"PB1 US Afternoon WSL"=@("02:00","run-us-afternoon.sh",$true);"PB1 US Close WSL"=@("05:05","run-us-close.sh",$true);"PB1 US Mail WSL"=@("07:00","send-market-log-mail.sh us",$false);"PB1 US Health WSL"=@("07:10","check-nullim-day-health.sh us",$false)}
+foreach($name in $expected.Keys){$info=Get-ScheduledTaskInfo -TaskName $name -ErrorAction SilentlyContinue;$task=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction SilentlyContinue;if($null -eq $task){Write-Host "[SCHEDULER][FAIL] $name missing";$failed=$true;continue};$a=($task.Actions|Out-String);$trigs=@($task.Triggers);$e=$expected[$name];$timeOk=($trigs.Count -eq 1 -and $trigs[0].StartBoundary -match "T$([regex]::Escape($e[0])):");$settingsOk=($task.Settings.StartWhenAvailable -and $task.Settings.MultipleInstances -eq 'IgnoreNew' -and $task.Settings.WakeToRun -and -not $task.Settings.RunOnlyIfIdle -and -not $task.Settings.DisallowStartIfOnBatteries -and -not $task.Settings.StopIfGoingOnBatteries);$restartOk=(!$e[2] -or $task.Settings.RestartCount -eq 0);$ok=($task.TaskPath -eq '\' -and $task.State -ne 'Disabled' -and $a -match [regex]::Escape($Repo) -and $a -match [regex]::Escape($e[1]) -and $a -match [regex]::Escape($Distro) -and $a -match 'bash -lc' -and $timeOk -and $settingsOk -and $restartOk);if(!$ok){Write-Host "[SCHEDULER][FAIL] reason=CANONICAL_CONTRACT task=$name next=$($info.NextRunTime) last=$($info.LastTaskResult)";$failed=$true}}
+$canonical=@($expected.Keys);$repoMarker='Jeihyuck-rolling-k-auto-trade-KIS-refacored';$runnerMarker='run-kr-|run-us-|run_pb1_kr\.sh|send-market-log-mail\.sh|check-nullim-day-health\.sh|pb1_runner|trade_session_runner';$non=0
+Get-ScheduledTask|ForEach-Object{$a=($_.Actions|Out-String);$isNullimTask=$a -match [regex]::Escape($repoMarker) -and $a -match $runnerMarker;if(($canonical -notcontains $_.TaskName -or $_.TaskPath -ne '\') -and $isNullimTask){Write-Host "[SCHEDULER][FAIL] reason=NON_CANONICAL_WINDOWS_TASK task=$($_.TaskName)";$non++;$failed=$true}}
+& $wsl -d $Distro -- bash -lc "cd '$Repo' && bash scripts/wsl/verify-no-nullim-auto-scheduler.sh";if($LASTEXITCODE -ne 0){$failed=$true;Write-Host '[SCHEDULER_POLICY][FAIL] reason=FORBIDDEN_WSL_SCHEDULER'}
+if($failed){exit 1};Write-Host '[SCHEDULER_POLICY][OK]';Write-Host 'owner=WINDOWS_TASK_SCHEDULER';Write-Host 'canonical_windows_tasks=16';Write-Host "noncanonical_windows_tasks=$non";Write-Host 'forbidden_wsl_sources=0'

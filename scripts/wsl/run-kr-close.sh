@@ -6,24 +6,20 @@ source scripts/wsl/deploy-preflight.sh
 deploy_preflight
 REPO="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
 if [[ ! -d "$REPO" ]]; then REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; fi
-cd "$REPO"; mkdir -p runtime
-lock_file="/tmp/nullim-kr-close.lock"
-compat_lock_file="runtime/locks/kr-close.lock"
-if [[ -f "$compat_lock_file" ]]; then
-  exec 8>"$compat_lock_file"
-  if ! flock -n 8; then
-    echo "[KR_CLOSE][LOCK_SKIP] another instance is already running lock=${compat_lock_file}"
-    exit 0
-  fi
-fi
+cd "$REPO"; mkdir -p runtime runtime/locks
+export WSL_RUN_SOURCE="${WSL_RUN_SOURCE:-local-wsl}"
+export WSL_RUN_MARKET="KR"
+source scripts/wsl/kr-session-lock.sh
+lock_file="runtime/locks/kr-close.lock"
 if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
   echo "[KR_CLOSE][LOCK_DELEGATED] external caller owns duplicate prevention lock=${lock_file}"
 else
   exec 9>"${lock_file}"
   if ! flock -n 9; then
-    echo "[KR_CLOSE][LOCK_SKIP] another instance is already running lock=${lock_file}"
+    kr_duplicate_result "${lock_file:-$LOCK_FILE}" "close"
     exit 0
   fi
+  kr_lock_owner "$lock_file" "close"
   echo "[KR_CLOSE][LOCK_ACQUIRED] lock=${lock_file}"
 fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
@@ -69,8 +65,6 @@ export KR_BALANCE_CACHE_MAX_AGE_SEC="${KR_BALANCE_CACHE_MAX_AGE_SEC:-180}"
 export KR_ALLOW_BALANCE_CACHE_FOR_ENTRY="${KR_ALLOW_BALANCE_CACHE_FOR_ENTRY:-0}"
 export KR_ALLOW_BALANCE_CACHE_FOR_EXIT="${KR_ALLOW_BALANCE_CACHE_FOR_EXIT:-1}"
 export KR_ALLOW_BALANCE_CACHE_FOR_CLOSE="${KR_ALLOW_BALANCE_CACHE_FOR_CLOSE:-1}"
-export WSL_RUN_SOURCE="local-wsl"
-export WSL_RUN_MARKET="KR"
 
 export PB1_SESSION=close WSL_RUN_SESSION=close STRATEGY_MODE=LIVE DRY_RUN=0 DISABLE_LIVE_TRADING=0 LIVE_TRADING_ENABLED=1 KR_LIVE_TRADING_ENABLED=1 KR_ORDER_ARMED=1
 export FORCE_PB1_PHASE=close

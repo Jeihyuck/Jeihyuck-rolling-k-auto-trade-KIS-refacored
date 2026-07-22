@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
+# Compatibility name: this removes legacy NULLIM user-cron entries; it never installs jobs.
 set -euo pipefail
-# Canonical Ubuntu cron contract.  All jobs enter through the apps checkout so
-# deploy-preflight can reject a stale or accidentally patched checkout.
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BACKUP_DIR="${NULLIM_CRON_BACKUP_DIR:-$APP_DIR/runtime/scheduler-backups}"
+mkdir -p "$BACKUP_DIR"
 existing="$(crontab -l 2>/dev/null || true)"
-cleaned="$(printf '%s\n' "$existing" | sed '/# NULLIM_CRON_START/,/# NULLIM_CRON_END/d')"
-APP="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored"
-# Cron opens redirection targets before invoking the runner.  Create this at
-# install time so a fresh canonical checkout cannot silently skip KR sessions.
-mkdir -p "$APP/runtime/cron_logs"
-{
-  printf '%s\n' "$cleaned" | sed '/^[[:space:]]*$/d'
-  cat <<EOF
-# NULLIM_CRON_START
-CRON_TZ=Asia/Seoul
-TZ=Asia/Seoul
-30 6 * * 1-5 cd $APP && ./run_pb1_kr.sh prep >> runtime/cron_logs/kr-prep.log 2>&1
-0 9 * * 1-5 cd $APP && ./run_pb1_kr.sh am >> runtime/cron_logs/kr-am.log 2>&1
-0 13 * * 1-5 cd $APP && ./run_pb1_kr.sh pm >> runtime/cron_logs/kr-pm.log 2>&1
-15 15 * * 1-5 cd $APP && ./run_pb1_kr.sh close >> runtime/cron_logs/kr-close.log 2>&1
-CRON_TZ=America/New_York
-0 6 * * 1-5 cd $APP && /usr/bin/env bash scripts/wsl/run-us-prep.sh
-30 9 * * 1-5 cd $APP && /usr/bin/env bash scripts/wsl/run-us-am.sh
-0 13 * * 1-5 cd $APP && /usr/bin/env bash scripts/wsl/run-us-afternoon.sh
-10 16 * * 1-5 cd $APP && /usr/bin/env bash scripts/wsl/run-us-close.sh
-# NULLIM_CRON_END
-EOF
-} | crontab -
-echo "[CRON_INSTALL][OK] app_dir=$APP"
+backup="$BACKUP_DIR/crontab-before-$(date +%Y%m%d-%H%M%S).txt"
+printf '%s\n' "$existing" > "$backup"
+echo "[CRON_CLEANUP][POLICY] owner=WINDOWS_TASK_SCHEDULER"
+echo "[CRON_CLEANUP][BACKUP] path=$backup"
+# Never guess across an unbalanced legacy block: preserve all user cron and fail safely.
+start_markers=$(printf '%s\n' "$existing" | awk '/# NULLIM_CRON_START/{n++} END{print n+0}')
+end_markers=$(printf '%s\n' "$existing" | awk '/# NULLIM_CRON_END/{n++} END{print n+0}')
+if [[ "$start_markers" != "$end_markers" ]]; then
+  echo "[CRON_CLEANUP][VERIFY][FAIL] reason=UNBALANCED_NULLIM_MARKERS start=$start_markers end=$end_markers"
+  exit 1
+fi
+# Remove managed blocks only after marker balance is established.
+block_count=$(printf '%s\n' "$existing" | awk '/# NULLIM_CRON_START/{n++} END{print n+0}')
+without_blocks=$(printf '%s\n' "$existing" | awk '
+  /# NULLIM_CRON_START/ {skip=1; next}
+  /# NULLIM_CRON_END/ {skip=0; next}
+  !skip {print}
+')
+# Only remove cron lines that execute a NULLIM scheduler runner; unrelated cron remains intact.
+forbidden='run_pb1_kr\.sh[[:space:]]+(prep|am|pm|close)|scripts/wsl/run-kr-(prep|am|afternoon|close)\.sh|scripts/wsl/run-us-(prep|prep-recovery|am|afternoon|close|session)\.sh|send-market-log-mail\.sh[[:space:]]+(kr|us)|check-nullim-day-health\.sh[[:space:]]+(kr|us)|python[[:space:]]+-m[[:space:]]+trader\.(pb1_runner|kr\.runner\.trade_session_runner|us\.runner\.trade_session_runner)'
+orphan_count=$(printf '%s\n' "$without_blocks" | awk -v pat="$forbidden" '$0 ~ pat {n++} END{print n+0}')
+cleaned=$(printf '%s\n' "$without_blocks" | awk -v pat="$forbidden" '$0 !~ pat')
+printf '%s\n' "$cleaned" | crontab -
+remaining=$(crontab -l 2>/dev/null | awk -v pat="$forbidden" '$0 ~ pat {n++} END{print n+0}')
+echo "[CRON_CLEANUP][REMOVED_BLOCK] count=$block_count"
+echo "[CRON_CLEANUP][REMOVED_ORPHAN] count=$orphan_count"
+if [[ "$remaining" != 0 ]]; then
+  echo "[CRON_CLEANUP][VERIFY][FAIL] forbidden_entries=$remaining"
+  exit 1
+fi
+echo "[CRON_CLEANUP][VERIFY][OK] forbidden_entries=0"
+echo "[CRON_INSTALL][BLOCK] reason=WINDOWS_TASK_SCHEDULER_ONLY"
