@@ -117,6 +117,63 @@ def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
     return any(pattern in text for pattern in _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS)
 
 
+def _prior_failed_orders_require_reconcile_only(trade_date: str, session: str) -> bool:
+    """Read same-day US health/session summaries before permitting a new route.
+
+    A fill-persistence fatal after an ACK is deliberately sticky: a later session
+    may reconcile broker state, but it must not place a replacement order.
+    """
+    rows: list[dict] = []
+    paths = [
+        Path("reports/us_schedule_health") / f"{trade_date}.json",
+        Path("runtime/health") / f"us-{trade_date}.json",
+        Path("reports/us_daily") / trade_date / "am_summary.json",
+        Path("reports/us_daily") / trade_date / "afternoon_summary.json",
+        Path("reports/us_daily") / trade_date / "close_summary.json",
+    ]
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("sessions"), dict):
+            rows.extend(row for name, row in payload["sessions"].items() if name != session and isinstance(row, dict))
+        elif isinstance(payload, dict) and str(payload.get("session") or "") != session:
+            rows.append(payload)
+    for row in rows:
+        status = str(row.get("effective_status") or row.get("final_status") or row.get("status") or "").upper()
+        reason = str(row.get("reason") or "")
+        orders = int(row.get("orders_ack", 0) or 0) + int(row.get("orders_sent", 0) or 0)
+        if status == "FAILED" and reason == "fill_persistence_failed" and orders > 0:
+            return True
+    return False
+
+
+def _suppress_pending_sell_exit_intents(exit_intents: list[dict], trade_date: str) -> list[dict]:
+    """Do not repeatedly create SELL intents while a same-day SELL is pending."""
+    try:
+        from trader.us.db.repos import has_pending_order_for_symbol_side
+    except Exception:
+        return exit_intents
+    statuses = {"SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+    kept: list[dict] = []
+    for intent in exit_intents:
+        if str(intent.get("side") or "").upper() != "SELL":
+            kept.append(intent)
+            continue
+        symbol = str(intent.get("symbol") or "").upper().strip()
+        try:
+            pending = bool(symbol) and has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=trade_date, include_statuses=statuses)
+        except Exception as exc:
+            logger.warning("[US_EXIT][INTENT_SUPPRESS_CHECK_WARN] symbol=%s err=%s", symbol, exc)
+            pending = False
+        if pending:
+            logger.info("[US_EXIT][INTENT_SUPPRESS] symbol=%s reason=pending_sell_order_exists", symbol)
+            continue
+        kept.append(intent)
+    return kept
+
+
 
 def _blocked_entry_reason_counts(cluster_blocked: Any, market_blocked: Any, entry_degraded_reason: str | None = None) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -732,6 +789,7 @@ def run_trade_tick(
     ack_recon: dict[str, Any] = {"status": "SKIP", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
     ack_recon_before_route: dict[str, Any] = dict(ack_recon)
     ack_recon_after_route: dict[str, Any] = dict(ack_recon)
+    fill_save_result: dict[str, Any] = {"status": "OK"}
 
     # ── 시각 결정 ──────────────────────────────────────────────────────────────
     from trader.us.market_calendar import now_ny, is_us_trading_day, market_phase
@@ -746,6 +804,10 @@ def run_trade_tick(
     trade_date = now.strftime("%Y-%m-%d")
     session_run_id = session_run_id or os.getenv("US_RUN_ID") or os.getenv("GITHUB_RUN_ID", "local")
     tick_id = tick_id or f"{session_run_id}:{tick_index}"
+    prior_failed_orders_reconcile_required = _prior_failed_orders_require_reconcile_only(trade_date, session)
+    reconcile_only_until_clean = prior_failed_orders_reconcile_required
+    if reconcile_only_until_clean:
+        logger.warning("[US_SAFETY][RECONCILE_ONLY] reason=prior_failed_orders_reconcile_required")
 
     logger.info(
         "[US_TICK][TIME] session=%s force_now=%s resolved_now_et=%s",
@@ -862,6 +924,8 @@ def run_trade_tick(
 
     # ── reconcile ─────────────────────────────────────────────────────────────
     should_reconcile_balance = (
+        reconcile_only_until_clean
+        or
         session == "close"
         or int(tick_index or 1) <= 1
         or (int(balance_reconcile_interval or 0) > 0 and int(tick_index or 1) % int(balance_reconcile_interval or 1) == 0)
@@ -1128,6 +1192,50 @@ def run_trade_tick(
             }
     elif recon.get("preserve_previous_positions"):
         logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
+
+    # A prior ACK followed by fill persistence failure is a recovery operation,
+    # never a trading opportunity.  This return is intentionally before exit
+    # intent generation and route_exit_orders_immediately().
+    pending_ack_count = int(ack_recon.get("pending_count", 0) or 0)
+    unresolved_ack_count = int(ack_recon.get("unresolved_count", 0) or 0)
+    ack_reconcile_ok = str(ack_recon.get("status") or "").upper() == "OK"
+    reconcile_only_clean = bool(
+        reconcile_only_until_clean
+        and fill_save_result.get("status", "OK") == "OK"
+        and ack_reconcile_ok
+        and authoritative_recon
+        and pending_ack_count == 0
+        and unresolved_ack_count == 0
+    )
+    ack_order_block = (
+        str(ack_recon.get("status") or "").upper() == "WARN"
+        or pending_ack_count > 0
+        or unresolved_ack_count > 0
+    )
+    if ack_order_block:
+        logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
+    if reconcile_only_until_clean or ack_order_block:
+        reason = "prior_failed_orders_reconcile_required" if reconcile_only_until_clean else "unresolved_ack_exists"
+        logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
+        return {
+            "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
+            "reason": reason,
+            "session": session,
+            "orders": [], "ack": 0, "dry_run": 0, "blocked": 0, "signal_only": 0,
+            "errors": 0, "trade_date": trade_date, "fills": len(fills_today),
+            "positions": len(recon_positions), "orders_sent": 0,
+            "prior_failed_orders_reconcile_required": int(prior_failed_orders_reconcile_required),
+            "reconcile_only_until_clean": int(reconcile_only_until_clean),
+            "reconcile_only_clean": int(reconcile_only_clean),
+            "pending_ack_count": pending_ack_count,
+            "unresolved_ack_count": unresolved_ack_count,
+            "blocked_new_orders_due_to_reconcile": 1,
+            "last_unresolved_symbols": (ack_recon.get("symbols_by_status") or {}).get("unresolved", []),
+            "last_unresolved_order_nos": ack_recon.get("unresolved_order_nos", []),
+            "manual_reconcile_required": int(not reconcile_only_clean),
+            "ack_reconcile_before_route_status": ack_recon.get("status"),
+            "ack_pending_reconcile_count": pending_ack_count,
+        }
 
     # reconcile log DB 저장
     try:
@@ -1435,6 +1543,10 @@ def run_trade_tick(
             logger.warning("[US_DEFENSE][TRIM][WARN] error=%s", _def_trim_exc)
     except Exception as _cluster_guard_exc:
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
+
+    # Suppress at intent generation (rather than only in the router) so all
+    # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
+    exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)
 
     # Route SELLs immediately before any entry watchlist or entry evaluation work.
     buy_daily_notional = 0.0

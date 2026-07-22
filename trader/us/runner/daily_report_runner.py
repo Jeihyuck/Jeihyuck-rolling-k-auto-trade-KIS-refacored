@@ -750,6 +750,9 @@ def run_daily_report(
                     report["order_final_classification_counts"] = close_class.get("counts", {})
                     if close_class.get("pending_order_count") is not None:
                         report["pending_order_count"] = int(close_class.get("pending_order_count") or 0)
+                        report["broker_orders_unresolved"] = report["pending_order_count"]
+                        report["orders_unresolved_total"] = report["pending_order_count"]
+                        report["ack_only_unresolved"] = report["pending_order_count"]
                 except Exception as exc:
                     report["warnings"].append(f"close_balance_delta_classification_failed: {exc}")
                     logger.warning("[US_DAILY_REPORT][WARN] close balance delta classification failed: %s", exc)
@@ -782,6 +785,10 @@ def run_daily_report(
         report["order_final_classification_counts"] = close_order_classification.get("counts", {})
         report["pending_order_count"] = int(close_order_classification.get("pending_order_count") or 0)
         report["broker_orders_unresolved"] = report["pending_order_count"]
+        # The close balance classification is authoritative for unresolved ACKs.
+        # Do not retain an earlier DB-only ACK count after a balance-confirmed sell.
+        report["orders_unresolved_total"] = report["pending_order_count"]
+        report["ack_only_unresolved"] = report["pending_order_count"]
 
     # Budget cap
     try:
@@ -858,6 +865,13 @@ def run_daily_report(
         report["status"] = "OK"
     if report.get("report_consistency") == "FAILED" and report.get("status") != "FAILED_RECONCILE":
         report["status"] = "FAILED_RECONCILE"
+    report["manual_reconcile_required"] = int(
+        bool(report.get("manual_reconcile_required"))
+        or int(report.get("pending_order_count", 0) or 0) > 0
+        or int(report.get("broker_orders_unresolved", 0) or 0) > 0
+        or report.get("status") == "WARNING_RECONCILE_MISMATCH"
+        or report.get("report_consistency") == "REPORT_INCONSISTENT"
+    )
 
     if report.get("report_consistency") == "SOURCE_MISMATCH":
         md_lines.extend(["# ⚠️ SOURCE_MISMATCH", "", f"source_counts={(report.get('canonical_sources') or {}).get('source_counts', {})}", ""])
