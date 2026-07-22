@@ -56,3 +56,15 @@ def test_cleanup_refuses_unbalanced_markers(tmp_path):
     env={**os.environ,'PATH':f'{fake}:{os.environ["PATH"]}','CRON_STATE':str(state),'NULLIM_CRON_BACKUP_DIR':str(tmp_path/'backup')}
     result=subprocess.run(['bash',str(ROOT/'scripts/wsl/install-nullim-cron.sh')],cwd=ROOT,env=env,text=True,capture_output=True)
     assert result.returncode == 1 and state.read_text().startswith('safe cron')
+
+def test_us_health_uses_kst_overnight_window_not_day_substring():
+    text=(ROOT/'scripts/wsl/check-nullim-day-health.sh').read_text()
+    assert "timedelta(hours=12, minutes=30)" in text
+    assert "start <= stamp <= end" in text
+    assert "day in line" not in text
+
+
+def test_scheduler_ci_installs_pytest_and_separates_steps():
+    text=(ROOT/'.github/workflows/scheduler-policy.yml').read_text()
+    assert 'Install test dependencies' in text and 'pip install --upgrade pip pytest' in text
+    assert 'Validate shell syntax' in text and 'Run scheduler policy regression tests' in text

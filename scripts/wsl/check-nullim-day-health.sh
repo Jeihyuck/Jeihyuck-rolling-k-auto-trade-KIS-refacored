@@ -28,9 +28,27 @@ def ticks(t): return len(re.findall(r'(?:US_TICK_LOOP\]\[TICK|\[TICK\]|tick=)', 
 logs = list((root/'runtime/logs'/market/day).glob('*.log')) if (root/'runtime/logs'/market/day).exists() else []
 logs += list((root/'runtime').glob(f'wsl-{market}-*.log'))
 blob = text(logs)
-# Flat US logs are append-only; retain only the requested UTC trade-date lines.
+# Flat US logs are append-only.  US health runs at 07:10 KST: inspect the
+# complete overnight execution window from the prior KST day 19:00 through the
+# requested KST day 07:30, rather than a fragile single-date substring.
 if market == 'us':
-    blob='\n'.join(line for line in blob.splitlines() if day in line)
+    from datetime import datetime, time, timedelta
+    from zoneinfo import ZoneInfo
+    kst=ZoneInfo('Asia/Seoul')
+    end=datetime.combine(datetime.fromisoformat(day).date(), time(7,30), kst)
+    start=end-timedelta(hours=12, minutes=30)
+    kept=[]
+    for line in blob.splitlines():
+        match=re.search(r'\[?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:?\d{2}|Z)?)', line)
+        if not match:
+            continue
+        try:
+            stamp=datetime.fromisoformat(match.group(1).replace('Z','+00:00')).astimezone(kst)
+        except ValueError:
+            continue
+        if start <= stamp <= end:
+            kept.append(line)
+    blob='\n'.join(kept)
 mail_marker = root/'runtime/health'/f'{market}-mail-{day}.json'
 duplicate_skips=len(re.findall(r'SKIP_DUPLICATE|DUPLICATE_BLOCKED', blob, re.I))
 advisory_unavailable=len(re.findall(r'PB1_ADVISORY_LOCK_UNAVAILABLE', blob))
