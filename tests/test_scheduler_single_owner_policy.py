@@ -42,6 +42,13 @@ def test_docs_and_windows_installer_declare_single_owner():
     installer=(ROOT/'scripts/windows/update-nullim-scheduler.ps1').read_text()
     assert 'install-nullim-cron.sh' in installer and 'verify-scheduler.ps1' in installer
 
+def test_scheduler_marker_command_uses_bash_safe_quoting():
+    installer=(ROOT/'scripts/windows/update-nullim-scheduler.ps1').read_text()
+    assert '$markerRepoQ=ConvertTo-BashSingleQuoted $Repo' in installer
+    assert '$markerPythonQ=ConvertTo-BashSingleQuoted $markerPython' in installer
+    assert 'python3 -c $markerPythonQ' in installer
+    assert 'python3 -c `"$markerPython`"' not in installer
+
 def test_kr_duplicate_evidence_never_overwrites_canonical_result():
     text=(ROOT/'scripts/wsl/kr-session-lock.sh').read_text()
     assert '/duplicates/duplicate-' in text
