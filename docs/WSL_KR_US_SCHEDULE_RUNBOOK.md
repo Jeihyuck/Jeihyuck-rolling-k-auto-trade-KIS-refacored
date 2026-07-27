@@ -8,6 +8,10 @@
 
 PR #60 and PR #67's single Windows scheduler policy is the final policy. PR #70's WSL cron installation regression must not be reintroduced.
 
+## Legacy GitHub Actions schedule policy
+
+The legacy GitHub Actions schedule is not a production trading scheduler. Scheduled workflows must not invoke `run-us-trader.sh` or `run-kr-trader.sh` for automatic live or practice orders. GitHub Actions may use those wrappers only for CI, explicitly manual diagnostics, or non-ordering smoke tests. Windows Task Scheduler remains the sole automatic owner.
+
 ## Deployment and recovery
 
 After this PR is merged and pulled (do **not** run the pre-fix installer):
