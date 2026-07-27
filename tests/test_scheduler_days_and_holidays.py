@@ -28,11 +28,34 @@ def test_us_morning_uses_masks_and_requires_saturday():
     assert 'function ConvertTo-NullimDayMask' in text
     assert text.count(',124)') == 4
     assert text.count(',62)') == 12
-    assert 'DaysOfWeek=@($actualDaysMask -eq [int]$e[3]' in text
+    assert 'DaysOfWeek=(New-NullimCheck -Ok ($actualDaysMask -eq [int]$e[3])' in text
     contract=(ROOT/'scripts/windows/test-scheduler-trigger-contract.ps1').read_text()
     assert 'New-ScheduledTaskTrigger -Weekly' in contract
     assert "if(($usMask -band 64) -eq 0)" in contract
     assert "if(($usMask -band 2) -ne 0)" in contract
+
+
+def test_windows_installer_preserves_health_script_arguments():
+    text=INSTALLER.read_text()
+    assert '[string[]]$ScriptArgs' in text
+    assert '[string[]]$Args' not in text
+    assert '$scriptArgsQ=@($ScriptArgs' in text
+    assert '-ScriptArgs @($d.Args)' in text
+    assert 'Args=@("kr")' in text
+    assert 'Args=@("us")' in text
+
+
+def test_windows_verifier_uses_structured_checks_and_accepts_never_run_code():
+    text=VERIFIER.read_text()
+    assert 'function New-NullimCheck' in text
+    assert 'TaskPath=(New-NullimCheck -Ok ($task.TaskPath -eq' in text
+    assert '$c.Ok' in text
+    assert '$c.Expected' in text
+    assert '$c.Actual' in text
+    assert '267011 # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN' in text
+    assert "runState='LAST_RUN_NOT_YET_EXECUTED'" in text
+    assert '@($task.TaskPath -eq' not in text
+    assert '@($a -match' not in text
 
 
 def test_canonical_calendar_exit_contract():
