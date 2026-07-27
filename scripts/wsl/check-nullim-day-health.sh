@@ -39,7 +39,7 @@ PY_CLOSED
 elif [[ "$TRADING_DAY_RC" != 0 ]]; then echo '[HEALTH][FAIL] reason=CALENDAR_ERROR' >&2; exit 1; fi
 OUT="runtime/health/${MARKET}-${DAY}.json"
 SUMMARY="runtime/health/${MARKET}-${DAY}.summary.txt"
-python - "$MARKET" "$DAY" "$TRADE_DATE" "$OUT" "$SUMMARY" "$POLICY_STATUS" "$FORBIDDEN" <<'PY'
+"$CALENDAR_PYTHON" - "$MARKET" "$DAY" "$TRADE_DATE" "$OUT" "$SUMMARY" "$POLICY_STATUS" "$FORBIDDEN" <<'PY'
 import json, re, subprocess, sys
 from pathlib import Path
 market, day, trade_date, out, summary, policy_status, forbidden = sys.argv[1:]
