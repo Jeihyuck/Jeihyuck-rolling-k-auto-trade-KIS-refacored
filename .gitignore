@@ -48,3 +48,5 @@ bot_state/universe_lkg/**
 
 # SSOT: bot_state must not live in repo
 /bot_state/
+
+!config/krx_holidays.json

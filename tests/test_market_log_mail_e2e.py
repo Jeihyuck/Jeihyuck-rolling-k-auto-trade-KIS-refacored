@@ -17,6 +17,7 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry") -> Path
         shutil.copy2(ROOT / "scripts/wsl" / name, root / "scripts/wsl" / name)
     shutil.copy2(ROOT / "scripts/notify/send_mail_attachment.py", root / "scripts/notify/send_mail_attachment.py")
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-trading-day.py", root / "scripts/wsl/check-nullim-trading-day.py")
+    shutil.copy2(ROOT / "scripts/wsl/resolve-nullim-python.sh", root / "scripts/wsl/resolve-nullim-python.sh")
     purposes = ("prep", "am", "afternoon", "close") if market == "kr" else (
         "prep-prewarm-edt", "prep-prewarm-est", "prep", "prep-recovery", "am-preflight", "am", "afternoon", "close"
     )
@@ -48,7 +49,7 @@ echo '[MAIL][MESSAGE_ID] fixture-message'; exit 0
 
 def run_mail(root: Path, market: str, *, dry=True):
     archive=root/f"nullim-test-{market}-logs.tar.gz"
-    env={**os.environ,"NULLIM_KST_RUN_DATE":DATE,"US_TRADE_DATE":DATE,"NULLIM_LOG_MAIL_OUT":str(archive),"NULLIM_KEEP_MAIL_ARCHIVE":"1","MAIL_TO":"ops@example.test","NULLIM_TRADING_DAY_OVERRIDE":"open","NULLIM_SMTP_RETRY_SLEEP_1":"0","NULLIM_SMTP_RETRY_SLEEP_2":"0"}
+    env={**os.environ,"NULLIM_KST_RUN_DATE":DATE,"US_TRADE_DATE":DATE,"NULLIM_LOG_MAIL_OUT":str(archive),"NULLIM_KEEP_MAIL_ARCHIVE":"1","MAIL_TO":"ops@example.test","NULLIM_TRADING_DAY_OVERRIDE":"open","NULLIM_PYTHON_BIN":os.sys.executable,"NULLIM_SMTP_RETRY_SLEEP_1":"0","NULLIM_SMTP_RETRY_SLEEP_2":"0"}
     if dry: env["NULLIM_MAIL_DRY_RUN"]="1"
     result=subprocess.run(["bash",str(root/f"scripts/wsl/send-{market}-log-mail.sh")],cwd=root,env=env,text=True,capture_output=True)
     return result,archive
@@ -143,13 +144,14 @@ def test_final_health_requires_real_mail_and_returns_matching_exit_code(tmp_path
     root=tmp_path/"health-repo"; scripts=root/"scripts/wsl"; scripts.mkdir(parents=True)
     shutil.copy2(ROOT/"scripts/wsl/check-nullim-day-health.sh",scripts/"check-nullim-day-health.sh")
     shutil.copy2(ROOT/"scripts/wsl/check-nullim-trading-day.py",scripts/"check-nullim-trading-day.py")
+    shutil.copy2(ROOT/"scripts/wsl/resolve-nullim-python.sh",scripts/"resolve-nullim-python.sh")
     verify=scripts/"verify-no-nullim-auto-scheduler.sh"; verify.write_text("#!/usr/bin/env bash\necho '[SCHEDULER_POLICY][WSL][OK] forbidden_sources=0'\n"); verify.chmod(0o755)
     log=root/f"runtime/logs/kr/{DATE}/am/run.log"; log.parent.mkdir(parents=True); log.write_text("[TICK]\n[TICK]\nsession_end\n")
     subprocess.run(["git","init","-q"],cwd=root,check=True); subprocess.run(["git","config","user.email","fixture@example.test"],cwd=root,check=True); subprocess.run(["git","config","user.name","Fixture"],cwd=root,check=True)
     (root/"tracked").write_text("x"); subprocess.run(["git","add","tracked"],cwd=root,check=True); subprocess.run(["git","commit","-qm","fixture"],cwd=root,check=True)
     sha=subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip(); health=root/"runtime/health"; health.mkdir(parents=True)
-    (health/"windows-scheduler-install.json").write_text(json.dumps({"status":"OK","installed_commit_sha":sha}))
-    health_env={**os.environ,"NULLIM_TRADING_DAY_OVERRIDE":"open"}
+    (health/"windows-scheduler-install.json").write_text(json.dumps({"status":"OK","scheduler_owner":"WINDOWS_TASK_SCHEDULER","installed_commit_sha":sha}))
+    health_env={**os.environ,"NULLIM_TRADING_DAY_OVERRIDE":"open","NULLIM_PYTHON_BIN":os.sys.executable}
     missing=subprocess.run(["bash",str(scripts/"check-nullim-day-health.sh"),"kr",DATE],cwd=root,env=health_env)
     assert missing.returncode == 1
     (health/f"kr-mail-{DATE}.json").write_text(json.dumps({"status":"DRY_RUN","mail_sent":False,"market":"kr","trade_date":DATE,"required_missing_count":0,"archive_sha256":"x"}))

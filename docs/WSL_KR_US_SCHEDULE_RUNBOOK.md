@@ -121,7 +121,7 @@ Friday US trading session. The verifier compares the complete `DaysOfWeek` set a
 Saturday is missing from a US morning task or a forbidden Monday/Sunday is present.
 
 Weekday exchange holidays are guarded independently of scheduler weekdays by
-`check-nullim-trading-day.py`, which delegates to `trader.time_utils.is_krx_trading_day` for KR and
+`check-nullim-trading-day.py`, which delegates to `trader.time_utils.resolve_krx_trading_day_strict` for KR and
 `trader.us.market_calendar.is_us_trading_day` for US. Session wrappers record an attempt with
 `SKIPPED_NON_TRADING_DAY`/`MARKET_CLOSED` and exit zero before deploy preflight, watchlist work,
 reconciliation, or an order-capable runner. Closed-day mail is not sent by default; its production
@@ -136,3 +136,27 @@ manifest mutation from racing packaging. KR archives include only the dated ledg
 After deploying this change, rerun the administrator installer and verifier because `git pull`
 does not replace existing Daily triggers. Confirm KR and US-evening `Monday–Friday`, US-morning
 `Tuesday–Saturday`, no Sunday trigger, and that the next-run values match the host's KST policy.
+
+### Strict calendar runtime and holiday policy audit
+
+Trading-day gates never invoke the system Python. They resolve
+`<repo>/.venv/bin/python` first, then an explicitly executable `NULLIM_PYTHON_BIN`; absence of both
+is a fail-closed calendar error and no runner starts. KR scheduling uses
+`resolve_krx_trading_day_strict`: a weekend or configured holiday proves closure, a successful
+PyKRX lookup may prove open/closed, and missing/unsupported configuration plus lookup failure is
+`CALENDAR_ERROR`, never a weekday-open heuristic. `config/krx_holidays.json` carries repository-
+validated dates for 2025–2027; unlisted weekdays still require external confirmation.
+
+The US calendar exposes its supported years and YAML load status. Unsupported weekday years or a
+missing/unreadable YAML dependency are `CALENDAR_ERROR`. Early-close dates remain trading days and
+the checker reports `early_close=true` with `regular_close_et=13:00`.
+
+Holiday health still audits scheduler ownership, installed/current SHA, and forbidden WSL
+cron/systemd sources before accepting the calendar skip. Only tick/session/mail requirements are
+waived. Drift, a missing install marker, wrong owner, forbidden scheduler source, or unknown
+calendar produces `ok=false` and a nonzero task result even on an exchange holiday.
+
+Windows verification normalizes `DaysOfWeek` to masks (62 for Mon–Fri, 124 for Tue–Sat), avoiding
+localized/string rendering assumptions. CI creates real `New-ScheduledTaskTrigger` objects on
+`windows-latest` and verifies masks, Saturday presence, Monday/Sunday absence, and one-week
+intervals before deployment.

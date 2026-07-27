@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Canonical NULLIM trading-day gate (0=open, 10=closed, 1=error)."""
+"""Canonical NULLIM trading-day gate (0=open, 10=closed, 1=unknown/error)."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
-from pathlib import Path
 from datetime import date
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def emit(market: str, day: date, *, is_open: bool | None, status: str, reason: str, **extra: object) -> int:
+    payload = {"market": market.upper(), "trade_date": day.isoformat(), "is_trading_day": is_open,
+               "status": status, "reason": reason, **extra}
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return 0 if is_open is True else 10 if is_open is False else 1
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -25,26 +32,39 @@ def main() -> int:
         if override:
             if override not in {"open", "closed"}:
                 raise ValueError("NULLIM_TRADING_DAY_OVERRIDE must be open or closed")
-            is_open = override == "open"
-            source = "test_override"
-        elif args.market == "us":
-            from trader.us.market_calendar import is_us_trading_day
-            is_open = bool(is_us_trading_day(day)); source = "trader.us.market_calendar.is_us_trading_day"
-        else:
-            from trader.time_utils import is_krx_trading_day
-            is_open = bool(is_krx_trading_day(day)); source = "trader.time_utils.is_krx_trading_day"
-        payload = {
-            "market": args.market.upper(), "trade_date": day.isoformat(),
-            "is_trading_day": is_open, "status": "TRADING_DAY" if is_open else "SKIPPED_NON_TRADING_DAY",
-            "reason": "MARKET_OPEN" if is_open else "MARKET_HOLIDAY", "calendar_source": source,
-        }
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return 0 if is_open else 10
+            return emit(args.market, day, is_open=override == "open",
+                        status="TRADING_DAY" if override == "open" else "SKIPPED_NON_TRADING_DAY",
+                        reason="MARKET_OPEN" if override == "open" else "MARKET_HOLIDAY",
+                        calendar_source="test_override")
+        if args.market == "kr":
+            from trader.time_utils import resolve_krx_trading_day_strict
+            state, source = resolve_krx_trading_day_strict(day)
+            if state == "UNKNOWN":
+                return emit("kr", day, is_open=None, status="CALENDAR_ERROR", reason=source)
+            return emit("kr", day, is_open=state == "OPEN",
+                        status="TRADING_DAY" if state == "OPEN" else "SKIPPED_NON_TRADING_DAY",
+                        reason="MARKET_OPEN" if state == "OPEN" else "MARKET_HOLIDAY", calendar_source=source)
+        from trader.us.market_calendar import (
+            is_us_early_close_day, is_us_market_holiday, is_us_weekend,
+            regular_close_time_for_date, us_calendar_load_error, us_calendar_supported_years,
+        )
+        if is_us_weekend(day):
+            return emit("us", day, is_open=False, status="SKIPPED_NON_TRADING_DAY", reason="WEEKEND", calendar_source="WEEKEND")
+        load_error = us_calendar_load_error()
+        if load_error:
+            return emit("us", day, is_open=None, status="CALENDAR_ERROR", reason=load_error)
+        if day.year not in us_calendar_supported_years():
+            return emit("us", day, is_open=None, status="CALENDAR_ERROR", reason="UNSUPPORTED_CALENDAR_YEAR")
+        closed = is_us_market_holiday(day); early = is_us_early_close_day(day)
+        return emit("us", day, is_open=not closed,
+                    status="SKIPPED_NON_TRADING_DAY" if closed else "TRADING_DAY",
+                    reason="MARKET_HOLIDAY" if closed else "MARKET_OPEN",
+                    calendar_source="US_CONFIG", early_close=early,
+                    regular_close_et=regular_close_time_for_date(day).strftime("%H:%M"))
     except Exception as exc:
-        print(json.dumps({"market": args.market.upper(), "trade_date": args.trade_date,
-                          "is_trading_day": None, "status": "CALENDAR_ERROR",
-                          "reason": type(exc).__name__, "detail": str(exc)}, ensure_ascii=False, sort_keys=True))
-        return 1
+        reason = "KRX_CALENDAR_UNAVAILABLE" if args.market == "kr" else "US_CALENDAR_UNAVAILABLE"
+        return emit(args.market, date.fromisoformat(args.trade_date), is_open=None,
+                    status="CALENDAR_ERROR", reason=reason, detail=f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

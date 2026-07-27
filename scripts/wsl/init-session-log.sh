@@ -75,8 +75,11 @@ PY
 }
 
 nullim_require_trading_day() {
-  local market="${1:?market required}" trade_date="${2:?trade date required}" output rc
-  output="$(python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/check-nullim-trading-day.py" --market "${market,,}" --date "$trade_date" 2>&1)"
+  local market="${1:?market required}" trade_date="${2:?trade date required}" root python_bin output rc
+  root="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd -P)"
+  source "$root/scripts/wsl/resolve-nullim-python.sh"
+  python_bin="$(nullim_resolve_python "$root")" || return 1
+  output="$("$python_bin" "$root/scripts/wsl/check-nullim-trading-day.py" --market "${market,,}" --date "$trade_date" 2>&1)"
   rc=$?
   printf '%s\n' "$output"
   if [[ "$rc" == 10 ]]; then

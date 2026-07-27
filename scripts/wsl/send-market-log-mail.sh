@@ -3,6 +3,8 @@ set -euo pipefail
 EX_USAGE=64; MARKET="${1:-}"
 case "$MARKET" in kr|us) ;; *) echo '[LOG_MAIL][FAIL] reason=MISSING_OR_INVALID_MARKET' >&2; exit "$EX_USAGE";; esac
 APP="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd -P)"; cd "$APP"
+source "$APP/scripts/wsl/resolve-nullim-python.sh"
+CALENDAR_PYTHON="$(nullim_resolve_python "$APP")" || { echo "[CALENDAR][FAIL] reason=PROJECT_PYTHON_MISSING" >&2; exit 1; }
 KST_RUN_DATE="${NULLIM_KST_RUN_DATE:-$(TZ=Asia/Seoul date +%F)}"; US_TRADE_DATE_ET="${US_TRADE_DATE:-$(TZ=America/New_York date +%F)}"
 TRADE_DATE="$KST_RUN_DATE"; [[ "$MARKET" == us ]] && TRADE_DATE="$US_TRADE_DATE_ET"
 TS="$(date +%Y%m%d-%H%M%S)"; BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"; BRANCH="${BRANCH:-unknown}"
@@ -13,7 +15,7 @@ READINESS="runtime/health/${MARKET}-mail-readiness-${KST_RUN_DATE}.json"; mkdir 
 cleanup(){ rm -rf "$STAGE" "$WARN"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 || "${NULLIM_KEEP_MAIL_ARCHIVE:-0}" == 1 ]] || rm -f "$OUT"; }; trap cleanup EXIT
 # Closed weekdays are successful no-mail operations and do not require session evidence.
 set +e
-TRADING_DAY_JSON="$(python3 "$APP/scripts/wsl/check-nullim-trading-day.py" --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
+TRADING_DAY_JSON="$("$CALENDAR_PYTHON" "$APP/scripts/wsl/check-nullim-trading-day.py" --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
 TRADING_DAY_RC=$?; set -e
 printf '%s\n' "$TRADING_DAY_JSON"
 if [[ "$TRADING_DAY_RC" == 10 ]]; then

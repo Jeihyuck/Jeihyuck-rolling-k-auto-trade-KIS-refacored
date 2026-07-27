@@ -4,7 +4,7 @@ ROOT=Path(__file__).parents[1]
 WRAPPERS={'run-kr-prep.sh':('KR','prep'),'run-kr-am.sh':('KR','am'),'run-kr-afternoon.sh':('KR','afternoon'),'run-kr-close.sh':('KR','close'),'run-us-prep.sh':('US','prep'),'run-us-prep-recovery.sh':('US','prep_recovery'),'check-us-prep-before-am.sh':('US','am_preflight'),'run-us-am.sh':('US','am'),'run-us-afternoon.sh':('US','afternoon'),'run-us-close.sh':('US','close')}
 def test_preflight_only_wrappers_ignore_stale_paths_and_log_metadata(tmp_path):
  for script,(market,session) in WRAPPERS.items():
-  env={**os.environ,'NULLIM_APP_DIR':'/old/path','NULLIM_RESOLVED_REPO_ROOT':'/another/old/path','NULLIM_PREFLIGHT_ONLY':'1','ALLOW_STALE_CODE':'1','ALLOW_DIRTY_CODE':'1'}
+  env={**os.environ,'NULLIM_APP_DIR':'/old/path','NULLIM_RESOLVED_REPO_ROOT':'/another/old/path','NULLIM_PREFLIGHT_ONLY':'1','ALLOW_STALE_CODE':'1','ALLOW_DIRTY_CODE':'1','NULLIM_TRADING_DAY_OVERRIDE':'open','NULLIM_PYTHON_BIN':os.sys.executable}
   r=subprocess.run(['bash',str(ROOT/'scripts/wsl'/script)],cwd=tmp_path,env=env,text=True,capture_output=True)
   assert r.returncode==0,r.stderr+r.stdout
   logs=sorted((ROOT/'runtime/logs'/market.lower()).rglob('*.log'),key=lambda p:p.stat().st_mtime)

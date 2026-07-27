@@ -1,4 +1,4 @@
-param([string[]]$Paths = @("scripts/windows/update-nullim-scheduler.ps1", "scripts/windows/verify-scheduler.ps1"))
+param([string[]]$Paths = @("scripts/windows/update-nullim-scheduler.ps1", "scripts/windows/verify-scheduler.ps1", "scripts/windows/test-scheduler-trigger-contract.ps1"))
 $errors = @()
 foreach ($path in $Paths) {
   $tokens = $null; $parseErrors = $null
