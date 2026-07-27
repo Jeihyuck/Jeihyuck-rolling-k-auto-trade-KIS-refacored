@@ -46,6 +46,7 @@ if [[ -x .venv/bin/python ]]; then PYTHON_BIN=.venv/bin/python; fi
 LOCK_RESULT="$(${PYTHON_BIN} -m trader.us.session_lock --market us --session "${SESSION_NAME}" --trade-date "${TRADE_DATE}" --min-interval-sec 60 2>/dev/null)" || lock_rc=$?
 lock_rc="${lock_rc:-0}"
 if [[ "${lock_rc}" == "10" ]]; then
+  export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
   echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] session=${SESSION_NAME} trade_date=${TRADE_DATE} result=${LOCK_RESULT}" >> "${LOG_FILE}"
   exit 0
 elif [[ "${lock_rc}" != "0" ]]; then
@@ -57,6 +58,7 @@ if [[ "${LOCK_RESULT}" == *'"reason": "stale_lock_removed"'* ]]; then
 fi
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
+  export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
   echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] reason=already_running [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi

@@ -17,7 +17,7 @@ def test_cron_installer_blocks_wsl_and_scheduler_verifies_settings():
     cron = Path('scripts/wsl/install-nullim-cron.sh').read_text()
     assert '[CRON_INSTALL][BLOCK] reason=WINDOWS_TASK_SCHEDULER_ONLY' in cron
     verify = Path('scripts/windows/verify-scheduler.ps1').read_text()
-    for needle in ['StartWhenAvailable','MultipleInstances','NextRunTime','LastTaskResult','send-market-log-mail.sh us','check-nullim-day-health.sh kr']:
+    for needle in ['StartWhenAvailable','MultipleInstances','NextRunTime','LastTaskResult','send-us-log-mail.sh','expectedArgFragment']:
         assert needle in verify
 
 

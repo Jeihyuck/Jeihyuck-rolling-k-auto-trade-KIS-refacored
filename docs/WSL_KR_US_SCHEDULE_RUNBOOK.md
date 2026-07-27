@@ -55,10 +55,10 @@ Mail and Health actions render the wrapper script and `kr`/`us` market value as 
 ## Verified market log delivery
 
 Scheduled mail jobs invoke `send-kr-log-mail.sh` and `send-us-log-mail.sh`; they never pass a
-market argument and can therefore never silently become an `all` archive. `all` is restricted
-to manual diagnostics with `ALLOW_ALL_LOG_MAIL=1`. Each wrapper writes from bootstrap onward to
-`runtime/logs/<market>/<KST-date>/<purpose>/<run-id>.log` and updates the dated session manifest.
-US manifests additionally retain the New York trade date.
+market argument and can therefore never silently become an `all` archive. The collector accepts
+only `kr` or `us`; combined `all` mail mode has been removed. Each wrapper writes from bootstrap
+onward to `runtime/logs/kr/<KST-date>/<purpose>/<run-id>.log` for KR or
+`runtime/logs/us/<ET-trade-date>/<purpose>/<run-id>.log` for US and updates the partition manifest.
 
 Mail packaging is fail-closed: dated session logs, health, reports and trading evidence are
 copied into a private staging directory, redacted, manifested, archived, integrity checked and
@@ -73,3 +73,36 @@ entry output is retained under `runtime/scheduler/windows/<KST-date>/`.
 Raw session logs are retained for 90 days by operational policy; health and manifests should be
 retained for at least one year. Mail staging and warnings are removed at the end of every run;
 a successfully sent archive is removed immediately. Dry-run archives are retained for inspection.
+
+### PR #78 mail readiness and canonical evidence
+
+Mail packaging creates `runtime/health/<market>-mail-readiness-<KST-date>.json` itself. It does
+**not** depend on the final daily health file: the 16:00/07:00 mail tasks run first, and the
+16:10/07:10 health tasks subsequently require the production mail marker. Dry runs write only
+`<market>-mail-dry-run-<KST-date>.json` with `mail_sent=false` and cannot satisfy final health.
+A failed final health exits non-zero so Task Scheduler's `LastTaskResult` agrees with its JSON.
+
+KR logs use the KST trade date. US logs use the New York trade date as their partition, so evening
+prep and AM plus the following KST morning's afternoon/close attempts share
+`runtime/logs/us/<ET-trade-date>/`. Every purpose directory and every attempt log is packaged.
+Canonical evidence is collected from `reports/kr_prep`, `runtime/kr/watchlist`,
+`runtime/kr/session`, `bot_state/trader_ledger`, `reports/us_daily`, `reports/us_prep`,
+`runtime/us/session_state`, `runtime/us/watchlist`, and `reports/us_schedule_health`.
+
+SMTP delivery retries at most three times (30 then 120 seconds). All retries share one attempt
+group. Idempotency uses a stable digest of evidence path/content, market, trade date, recipient,
+and commit—not gzip or manifest timestamps. `UNKNOWN_AFTER_SEND` is distinct from a definite SMTP
+failure. The archive SHA-256 and source-evidence SHA-256 are recorded separately.
+
+### Administrator deployment gate and rollback
+
+Do not merge/deploy until the `windows-latest` PowerShell parser succeeds. On the actual Windows
+host, export the existing 16 task XML definitions, run `update-nullim-scheduler.ps1`, then run
+`verify-scheduler.ps1`. Review every emitted `CONFIG_OK`/`LAST_RUN_*` state, the installed/current
+SHA values, `canonical_windows_tasks=16`, `noncanonical_windows_tasks=0`, and
+`forbidden_wsl_sources=0`. Perform KR and US dry-run fixture packaging, then one real test mail per
+market. A repository pull alone never updates registered tasks.
+
+Rollback is fail-closed: disable the 16 NULLIM tasks, restore the saved XML definitions, check out
+the previous verified commit, rerun that commit's verifier, and keep tasks disabled until SHA,
+action, and WSL forbidden-source checks pass. Never introduce cron or systemd as rollback.

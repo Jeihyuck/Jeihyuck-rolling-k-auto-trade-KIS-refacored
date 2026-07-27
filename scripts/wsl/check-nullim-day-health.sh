@@ -31,7 +31,8 @@ def text(paths):
             except Exception: pass
     return '\n'.join(buf)
 def ticks(t): return len(re.findall(r'(?:US_TICK_LOOP\]\[TICK|\[TICK\]|tick=)', t, re.I))
-logs = list((root/'runtime/logs'/market/day).rglob('*.log')) if (root/'runtime/logs'/market/day).exists() else []
+log_partition = trade_date if market == 'us' else day
+logs = list((root/'runtime/logs'/market/log_partition).rglob('*.log')) if (root/'runtime/logs'/market/log_partition).exists() else []
 blob = text(logs)
 # Date-scoped US logs retain every line, including shell errors without timestamps.
 mail_marker = root/'runtime/health'/f'{market}-mail-{day}.json'
@@ -41,7 +42,7 @@ result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'auto
 if mail_marker.exists():
     try:
         marker=json.loads(mail_marker.read_text())
-        result['mail_ok'] = (marker.get('status') == 'OK' and marker.get('market') == market and marker.get('required_missing_count') == 0 and bool(marker.get('archive_sha256')) and marker.get('trade_date') == trade_date)
+        result['mail_ok'] = (marker.get('status') == 'OK' and marker.get('mail_sent') is True and marker.get('market') == market and marker.get('required_missing_count') == 0 and bool(marker.get('archive_sha256')) and marker.get('trade_date') == trade_date)
     except Exception: pass
 
 install_marker=root/'runtime/health/windows-scheduler-install.json'
@@ -77,4 +78,5 @@ Path(out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding=
 lines=[f"NULLIM {market.upper()} health {day}"]+[f"- {k}: {v}" for k,v in result.items() if k!='logs_checked']
 Path(summary).write_text('\n'.join(lines)+'\n', encoding='utf-8')
 print('\n'.join(lines))
+raise SystemExit(0 if result.get('ok') else 1)
 PY

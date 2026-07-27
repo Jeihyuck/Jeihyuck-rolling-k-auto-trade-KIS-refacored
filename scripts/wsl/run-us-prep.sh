@@ -42,6 +42,7 @@ LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
 LOG_FILE="$NULLIM_SESSION_LOG"
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
+  export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
   echo "[$(date -Is)] [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi

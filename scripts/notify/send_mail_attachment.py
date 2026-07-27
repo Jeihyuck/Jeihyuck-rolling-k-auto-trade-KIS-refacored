@@ -82,12 +82,20 @@ def main():
 
     print(f"[MAIL][SEND][START] host={args.smtp_host} port={args.smtp_port} to={args.to} subject={args.subject}")
 
-    with smtplib.SMTP(args.smtp_host, args.smtp_port, timeout=30) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.ehlo()
-        smtp.login(args.smtp_user, args.smtp_pass)
-        smtp.send_message(msg)
+    accepted = False
+    try:
+        with smtplib.SMTP(args.smtp_host, args.smtp_port, timeout=30) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
+            smtp.ehlo()
+            smtp.login(args.smtp_user, args.smtp_pass)
+            smtp.send_message(msg)
+            accepted = True
+    except (smtplib.SMTPServerDisconnected, TimeoutError, OSError) as exc:
+        if accepted:
+            print(f"[MAIL][UNKNOWN_AFTER_SEND] {exc}", file=sys.stderr)
+            return 75
+        raise
 
     print("[MAIL][SEND][OK]")
     print(f"[MAIL][MESSAGE_ID] {args.attempt_id}")

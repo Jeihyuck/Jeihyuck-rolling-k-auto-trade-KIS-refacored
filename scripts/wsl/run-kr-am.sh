@@ -26,6 +26,7 @@ if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
 else
   exec 9>"${lock_file}"
   if ! flock -n 9; then
+    export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
     kr_duplicate_result "${lock_file:-$LOCK_FILE}" "am"
     exit 0
   fi
@@ -98,7 +99,7 @@ LOG_DIR="runtime/logs/kr/${TODAY_KST}"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$NULLIM_SESSION_LOG"
 LATEST_LINK="runtime/logs/kr/wsl-kr-am.latest.log"
-ln -sfn "${TODAY_KST}/wsl-kr-am.log" "$LATEST_LINK"
+ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_LOG")" "$LATEST_LINK"
 {
   echo "[KR_AM][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
   KR_AM_SESSION_TIMEOUT_SEC="${KR_AM_SESSION_TIMEOUT_SEC:-3600}"
@@ -111,6 +112,7 @@ ln -sfn "${TODAY_KST}/wsl-kr-am.log" "$LATEST_LINK"
     LAST_STAGE_FILE="runtime/state/kr/session_last_stage_am.json"
     LAST_STAGE=""
     if [[ -f "$LAST_STAGE_FILE" ]]; then LAST_STAGE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true); fi
+    export NULLIM_SESSION_FINAL_STATUS=TIMEOUT NULLIM_SESSION_FINAL_REASON=SESSION_TIMEOUT
     echo "[KR_AM][TIMEOUT] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
     echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=SESSION_TIMEOUT orders_intent=unknown orders_ack=unknown blocked=0"
   fi
