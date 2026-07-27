@@ -1,4 +1,8 @@
-param([string]$Repo="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored", [string]$Distro="Ubuntu-22.04")
+param(
+  [string]$Repo="/home/infiny/apps/Jeihyuck-rolling-k-auto-trade-KIS-refacored",
+  [string]$Distro="Ubuntu-22.04",
+  [switch]$SkipInstallMarkerCheck
+)
 function ConvertTo-NullimDayMask {
   param([object]$DaysOfWeek)
   if($null -eq $DaysOfWeek){return 0}
@@ -38,10 +42,14 @@ foreach($name in $expected.Keys) {
 }
 $canonical=@($expected.Keys);$repoMarker='Jeihyuck-rolling-k-auto-trade-KIS-refacored';$runnerMarker='run-kr-|run-us-|run_pb1_kr\.sh|send-(market|kr|us)-log-mail\.sh|check-nullim-day-health\.sh|pb1_runner|trade_session_runner';$non=0
 Get-ScheduledTask|ForEach-Object{$a=Get-ActionText $_;$isNullimTask=$a -match [regex]::Escape($repoMarker) -and $a -match $runnerMarker;if(($canonical -notcontains $_.TaskName -or $_.TaskPath -ne '\') -and $isNullimTask){Write-Host "[SCHEDULER][FAIL] reason=NON_CANONICAL_WINDOWS_TASK task=$($_.TaskName)";$non++;$failed=$true}}
-$installJson=& $wsl -d $Distro -- cat "$Repo/runtime/health/windows-scheduler-install.json"
-$currentSha=(& $wsl -d $Distro -- git -C $Repo rev-parse HEAD).Trim()
-try{$installedSha=($installJson|ConvertFrom-Json).installed_commit_sha}catch{$installedSha="missing"}
-Write-Host "installed_commit_sha=$installedSha"; Write-Host "current_commit_sha=$currentSha"
-if($LASTEXITCODE -ne 0 -or $installedSha -ne $currentSha){$failed=$true;Write-Host '[SCHEDULER][FAIL] reason=INSTALL_SHA_DRIFT'}
+if(-not $SkipInstallMarkerCheck){
+  $installJson=& $wsl -d $Distro -- cat "$Repo/runtime/health/windows-scheduler-install.json"; $installReadExit=$LASTEXITCODE
+  $currentSha=(& $wsl -d $Distro -- git -C $Repo rev-parse HEAD).Trim(); $currentReadExit=$LASTEXITCODE
+  try{$installedSha=($installJson|ConvertFrom-Json).installed_commit_sha}catch{$installedSha="missing"}
+  Write-Host "installed_commit_sha=$installedSha"; Write-Host "current_commit_sha=$currentSha"
+  if($installReadExit -ne 0 -or $currentReadExit -ne 0 -or $installedSha -ne $currentSha){$failed=$true;Write-Host '[SCHEDULER][FAIL] reason=INSTALL_SHA_DRIFT'}
+}else{
+  Write-Host '[SCHEDULER][INFO] install_marker_check=SKIPPED_CONFIGURATION_PHASE'
+}
 & $wsl -d $Distro -- bash -lc "cd '$Repo' && bash scripts/wsl/verify-no-nullim-auto-scheduler.sh";if($LASTEXITCODE -ne 0){$failed=$true;Write-Host '[SCHEDULER_POLICY][FAIL] reason=FORBIDDEN_WSL_SCHEDULER'}
 if($failed){exit 1};Write-Host '[SCHEDULER_POLICY][OK]';Write-Host 'owner=WINDOWS_TASK_SCHEDULER';Write-Host 'canonical_windows_tasks=16';Write-Host "noncanonical_windows_tasks=$non";Write-Host 'forbidden_wsl_sources=0'
