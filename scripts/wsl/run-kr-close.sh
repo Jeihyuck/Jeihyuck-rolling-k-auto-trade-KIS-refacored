@@ -3,6 +3,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 source "$SCRIPT_DIR/init-session-log.sh"
 nullim_init_session_log KR close "close" "${BASH_SOURCE[0]}"
+set +e
+nullim_require_trading_day kr "$NULLIM_TRADE_DATE"
+trading_day_rc=$?
+set -e
+[[ "$trading_day_rc" == 10 ]] && exit 0
+[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"

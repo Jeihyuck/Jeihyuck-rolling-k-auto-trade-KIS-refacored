@@ -11,6 +11,24 @@ WARN="${OUT%.tar.gz}.warn"; STAGE="$(mktemp -d "/tmp/nullim-${MARKET}-mail.XXXXX
 PROD_MARKER="runtime/health/${MARKET}-mail-${KST_RUN_DATE}.json"; DRY_MARKER="runtime/health/${MARKET}-mail-dry-run-${KST_RUN_DATE}.json"
 READINESS="runtime/health/${MARKET}-mail-readiness-${KST_RUN_DATE}.json"; mkdir -p runtime/health
 cleanup(){ rm -rf "$STAGE" "$WARN"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 || "${NULLIM_KEEP_MAIL_ARCHIVE:-0}" == 1 ]] || rm -f "$OUT"; }; trap cleanup EXIT
+# Closed weekdays are successful no-mail operations and do not require session evidence.
+set +e
+TRADING_DAY_JSON="$(python3 "$APP/scripts/wsl/check-nullim-trading-day.py" --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
+TRADING_DAY_RC=$?; set -e
+printf '%s\n' "$TRADING_DAY_JSON"
+if [[ "$TRADING_DAY_RC" == 10 ]]; then
+ python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" <<'PY_CLOSED'
+import json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+p,m,d,k=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'SKIPPED_NON_TRADING_DAY','mail_sent':False,'mail_required':False,'market':m,'trade_date':d,'run_date_kst':k,'reason':'MARKET_HOLIDAY','ok':True,'created_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+PY_CLOSED
+ echo "[LOG_MAIL][SKIP] reason=SKIPPED_NON_TRADING_DAY market=$MARKET trade_date=$TRADE_DATE"; exit 0
+elif [[ "$TRADING_DAY_RC" != 0 ]]; then
+ echo "[LOG_MAIL][FAIL] reason=CALENDAR_ERROR market=$MARKET trade_date=$TRADE_DATE" >&2; exit 1
+fi
+# Exclusive snapshot lock remains held through staging and tar creation. Sessions take it shared.
+mkdir -p runtime/locks; exec {SNAPSHOT_FD}>"runtime/locks/${MARKET}-mail-snapshot.lock"; flock -x "$SNAPSHOT_FD"
 fail(){ local reason="$1" rc="${2:-1}" marker="$PROD_MARKER"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"; python3 - "$marker" "$MARKET" "$TRADE_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" <<'PY'
 import json,sys
 from datetime import datetime,timezone
@@ -19,13 +37,14 @@ p,m,d,r,a,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'FAIL','ma
 PY
  echo "[LOG_MAIL][FAIL] market=$MARKET reason=$reason" >&2; exit "$rc"; }
 if [[ "${NULLIM_SKIP_SESSION_ACTIVE_CHECK:-0}" != 1 ]]; then
- for lock in runtime/locks/${MARKET}-*.lock; do [[ -e "$lock" ]] || continue; exec {fd}>"$lock"; flock -n "$fd" || fail SESSION_STILL_RUNNING; eval "exec ${fd}>&-"; done
+ for lock in runtime/locks/${MARKET}-*.lock; do [[ -e "$lock" ]] || continue; [[ "$lock" == *-mail-snapshot.lock ]] && continue; exec {fd}>"$lock"; flock -n "$fd" || fail SESSION_STILL_RUNNING; eval "exec ${fd}>&-"; done
 fi
 LOG_ROOT="runtime/logs/$MARKET/$TRADE_DATE"; [[ -f "$LOG_ROOT/session-manifest.json" ]] || fail REQUIRED_LOG_MISSING
 required=("$LOG_ROOT/session-manifest.json")
 if [[ "$MARKET" == kr ]]; then
  purposes=(prep am afternoon close)
- evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE" "bot_state/trader_ledger")
+ LEDGER_ENV="${NULLIM_LEDGER_ENV:-${STRATEGY_ENV:-practice}}"
+ evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE" "bot_state/trader_ledger/final30/$LEDGER_ENV/$TRADE_DATE")
 else
  purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
  evidence_groups=("reports/us_daily/$TRADE_DATE" "reports/us_prep/$TRADE_DATE" "runtime/us/session_state/$TRADE_DATE" "runtime/us/watchlist/$TRADE_DATE" "reports/us_schedule_health/$TRADE_DATE.json")

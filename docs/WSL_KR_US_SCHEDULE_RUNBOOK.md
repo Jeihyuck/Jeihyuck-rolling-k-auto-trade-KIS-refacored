@@ -106,3 +106,33 @@ market. A repository pull alone never updates registered tasks.
 Rollback is fail-closed: disable the 16 NULLIM tasks, restore the saved XML definitions, check out
 the previous verified commit, rerun that commit's verifier, and keep tasks disabled until SHA,
 action, and WSL forbidden-source checks pass. Never introduce cron or systemd as rollback.
+
+### Weekly triggers and closed-market behavior
+
+The 16 Windows tasks use explicit weekly triggers in KST; there is no `Daily` fallback:
+
+* KR tasks: Monday through Friday.
+* US evening prep/preflight/AM tasks: Monday through Friday.
+* US post-midnight afternoon/close/mail/health tasks: Tuesday through Saturday.
+* Sunday: no NULLIM task. Monday 02:00–07:10: no US task.
+
+Saturday US morning execution is intentional and required to finish, package, and validate the
+Friday US trading session. The verifier compares the complete `DaysOfWeek` set and fails if
+Saturday is missing from a US morning task or a forbidden Monday/Sunday is present.
+
+Weekday exchange holidays are guarded independently of scheduler weekdays by
+`check-nullim-trading-day.py`, which delegates to `trader.time_utils.is_krx_trading_day` for KR and
+`trader.us.market_calendar.is_us_trading_day` for US. Session wrappers record an attempt with
+`SKIPPED_NON_TRADING_DAY`/`MARKET_CLOSED` and exit zero before deploy preflight, watchlist work,
+reconciliation, or an order-capable runner. Closed-day mail is not sent by default; its production
+marker records `mail_sent=false`, `mail_required=false`, and `ok=true`. Final health similarly
+returns a successful `SKIPPED_NON_TRADING_DAY` result without requiring ticks or mail.
+
+Mail takes an exclusive `runtime/locks/<market>-mail-snapshot.lock` through staging and tar
+creation. Session wrappers hold a shared lock for their lifetime, preventing a new session or
+manifest mutation from racing packaging. KR archives include only the dated ledger directory
+`bot_state/trader_ledger/final30/<env>/<trade-date>`; the all-dates ledger root is forbidden.
+
+After deploying this change, rerun the administrator installer and verifier because `git pull`
+does not replace existing Daily triggers. Confirm KR and US-evening `Monday–Friday`, US-morning
+`Tuesday–Saturday`, no Sunday trigger, and that the next-run values match the host's KST policy.

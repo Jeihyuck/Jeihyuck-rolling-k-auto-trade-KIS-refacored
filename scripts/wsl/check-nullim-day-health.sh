@@ -4,25 +4,36 @@ APP="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MARKET="${1:-}"
 case "$MARKET" in kr|us) ;; *) echo "[HEALTH][FAIL] reason=MISSING_OR_INVALID_MARKET" >&2; exit 64;; esac
 DAY="${2:-$(TZ=Asia/Seoul date +%F)}"
+TRADE_DATE="$DAY"; [[ "$MARKET" == us ]] && TRADE_DATE="${US_TRADE_DATE:-$(TZ=America/New_York date +%F)}"
 cd "$APP"
 mkdir -p runtime/health
+set +e
+TRADING_DAY_JSON="$(python3 scripts/wsl/check-nullim-trading-day.py --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
+TRADING_DAY_RC=$?; set -e
+printf '%s\n' "$TRADING_DAY_JSON"
+if [[ "$TRADING_DAY_RC" == 10 ]]; then
+ python3 - "$MARKET" "$DAY" "$TRADE_DATE" <<'PY_CLOSED'
+import json,sys
+from pathlib import Path
+market,day,trade=sys.argv[1:]; result={'market':market.upper(),'date':day,'trade_date':trade,'status':'SKIPPED_NON_TRADING_DAY','ok':True,'mail_ok':True,'mail_required':False,'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER'}
+out=Path('runtime/health')/f'{market}-{day}.json'; summary=Path('runtime/health')/f'{market}-{day}.summary.txt'
+out.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n'); summary.write_text(f'NULLIM {market.upper()} health {day}\n- status: SKIPPED_NON_TRADING_DAY\n- ok: True\n')
+print(json.dumps(result,ensure_ascii=False))
+PY_CLOSED
+ exit 0
+elif [[ "$TRADING_DAY_RC" != 0 ]]; then echo '[HEALTH][FAIL] reason=CALENDAR_ERROR' >&2; exit 1; fi
 POLICY_STATUS="OK"
 FORBIDDEN=0
 VERIFY_OUTPUT="$(bash scripts/wsl/verify-no-nullim-auto-scheduler.sh 2>&1)" || { POLICY_STATUS="FAIL"; FORBIDDEN="$(printf '%s\n' "$VERIFY_OUTPUT" | sed -n 's/.*forbidden_sources=\([0-9][0-9]*\).*/\1/p' | tail -1)"; FORBIDDEN="${FORBIDDEN:-1}"; }
 printf '%s\n' "$VERIFY_OUTPUT"
 OUT="runtime/health/${MARKET}-${DAY}.json"
 SUMMARY="runtime/health/${MARKET}-${DAY}.summary.txt"
-python - "$MARKET" "$DAY" "$OUT" "$SUMMARY" "$POLICY_STATUS" "$FORBIDDEN" <<'PY'
+python - "$MARKET" "$DAY" "$TRADE_DATE" "$OUT" "$SUMMARY" "$POLICY_STATUS" "$FORBIDDEN" <<'PY'
 import json, re, subprocess, sys
 from pathlib import Path
-market, day, out, summary, policy_status, forbidden = sys.argv[1:]
+market, day, trade_date, out, summary, policy_status, forbidden = sys.argv[1:]
 forbidden = int(forbidden)
 root = Path('.')
-trade_date = day
-if market == 'us':
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    trade_date = datetime.now(ZoneInfo('America/New_York')).date().isoformat()
 def text(paths):
     buf=[]
     for p in paths:

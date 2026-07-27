@@ -8,6 +8,10 @@ nullim_init_session_log() {
   local purpose="${3:-$session}" wrapper="${4:-${BASH_SOURCE[1]}}"
   local root run_date_kst trade_date_et partition run_id log_dir manifest lock
   root="$(cd "$(dirname "$(readlink -f "$wrapper")")/../.." && pwd -P)"
+  mkdir -p "$root/runtime/locks"
+  # Sessions hold a shared lock for their lifetime; mail packaging takes it exclusively.
+  exec {NULLIM_SNAPSHOT_FD}>"$root/runtime/locks/${market,,}-mail-snapshot.lock"
+  flock -s "$NULLIM_SNAPSHOT_FD"
   run_date_kst="${NULLIM_KST_RUN_DATE:-$(TZ=Asia/Seoul date +%F)}"
   trade_date_et="${US_TRADE_DATE:-$(TZ=America/New_York date +%F)}"
   if [[ "${market,,}" == us ]]; then partition="$trade_date_et"; else partition="$run_date_kst"; trade_date_et="$run_date_kst"; fi
@@ -67,5 +71,17 @@ Path(tmp).write_text(json.dumps(data,ensure_ascii=False,indent=2)+"\n"); os.repl
 PY
   flock -u "$NULLIM_MANIFEST_FD"; eval "exec ${NULLIM_MANIFEST_FD}>&-"
   printf '[NULLIM_RUN][END] run_id=%s status=%s reason=%s exit_code=%s ended_at=%s\n' "$NULLIM_RUN_ID" "$status" "$reason" "$rc" "$(date -Is)"
+  return "$rc"
+}
+
+nullim_require_trading_day() {
+  local market="${1:?market required}" trade_date="${2:?trade date required}" output rc
+  output="$(python3 "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/check-nullim-trading-day.py" --market "${market,,}" --date "$trade_date" 2>&1)"
+  rc=$?
+  printf '%s\n' "$output"
+  if [[ "$rc" == 10 ]]; then
+    export NULLIM_SESSION_FINAL_STATUS=SKIPPED_NON_TRADING_DAY NULLIM_SESSION_FINAL_REASON=MARKET_CLOSED
+    echo "[NULLIM_RUN][SKIP] reason=SKIPPED_NON_TRADING_DAY market=${market^^} trade_date=$trade_date"
+  fi
   return "$rc"
 }

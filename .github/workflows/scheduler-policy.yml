@@ -32,6 +32,8 @@ jobs:
         run: pytest -q tests/test_market_log_mail_e2e.py::test_stable_source_digest_skips_second_smtp_send tests/test_market_log_mail_e2e.py::test_smtp_retries_twice_then_succeeds
       - name: Session attempts and health-mail sequencing
         run: pytest -q tests/test_market_log_mail_e2e.py::test_session_manifest_preserves_attempts_and_effective_status tests/test_market_log_mail_e2e.py::test_final_health_requires_real_mail_and_returns_matching_exit_code
+      - name: Weekly scheduler days and market-holiday skips
+        run: pytest -q tests/test_scheduler_days_and_holidays.py
 
   powershell-parse:
     runs-on: windows-latest
