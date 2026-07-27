@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export NULLIM_RUN_PURPOSE="prep-recovery"
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/init-session-log.sh"
+nullim_init_session_log US prep-recovery prep-recovery "${BASH_SOURCE[0]}"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"

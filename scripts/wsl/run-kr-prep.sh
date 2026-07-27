@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/init-session-log.sh"
+nullim_init_session_log KR prep "prep" "${BASH_SOURCE[0]}"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
@@ -73,7 +75,7 @@ export PB1_SESSION=prep WSL_RUN_SESSION=prep STRATEGY_MODE=PREP DRY_RUN=1 DISABL
 TODAY_KST="$(TZ=Asia/Seoul date +%F)"
 LOG_DIR="runtime/logs/kr/${TODAY_KST}"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/wsl-kr-prep.log"
+LOG_FILE="$NULLIM_SESSION_LOG"
 LATEST_LINK="runtime/logs/kr/wsl-kr-prep.latest.log"
 ln -sfn "${TODAY_KST}/wsl-kr-prep.log" "$LATEST_LINK"
 {

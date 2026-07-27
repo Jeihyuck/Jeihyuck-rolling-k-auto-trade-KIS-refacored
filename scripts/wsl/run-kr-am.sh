@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/init-session-log.sh"
+nullim_init_session_log KR am "am" "${BASH_SOURCE[0]}"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
@@ -94,7 +96,7 @@ if [[ "${DRY_RUN:-0}" == "1" || "${KR_ORDER_ARMED:-0}" == "0" ]]; then echo "[KR
 TODAY_KST="$(TZ=Asia/Seoul date +%F)"
 LOG_DIR="runtime/logs/kr/${TODAY_KST}"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/wsl-kr-am.log"
+LOG_FILE="$NULLIM_SESSION_LOG"
 LATEST_LINK="runtime/logs/kr/wsl-kr-am.latest.log"
 ln -sfn "${TODAY_KST}/wsl-kr-am.log" "$LATEST_LINK"
 {
@@ -110,7 +112,7 @@ ln -sfn "${TODAY_KST}/wsl-kr-am.log" "$LATEST_LINK"
     LAST_STAGE=""
     if [[ -f "$LAST_STAGE_FILE" ]]; then LAST_STAGE=$(python -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("stage", ""))' "$LAST_STAGE_FILE" 2>/dev/null || true); fi
     echo "[KR_AM][TIMEOUT] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
-    echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=SESSION_TIMEOUT orders_intent=0 orders_ack=0 blocked=0"
+    echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=SESSION_TIMEOUT orders_intent=unknown orders_ack=unknown blocked=0"
   fi
   echo "[KR_AM][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc

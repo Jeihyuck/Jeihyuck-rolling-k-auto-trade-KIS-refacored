@@ -51,3 +51,25 @@ bash scripts/wsl/run-us-am.sh
 After deployment, Windows administrator PowerShell must run the installer and verifier commands in the deployment section above. Linux CI cannot prove that Task Scheduler accepts the generated XML; confirm the final `[SCHEDULER_POLICY][OK]` output and inspect an order task's `RestartCount` (`$null` or `0` is correct).
 
 Mail and Health actions render the wrapper script and `kr`/`us` market value as separate shell tokens. The Windows verifier checks this action contract and requires every canonical action to `unset NULLIM_APP_DIR`. Wrappers reassert their location-derived repository root immediately after loading `.env`, so `.env` cannot reintroduce either stale path variable. `deploy-preflight.log` must contain the wrapper's concrete market and session; `market=unknown` or `session=unknown` is not a valid production result.
+
+## Verified market log delivery
+
+Scheduled mail jobs invoke `send-kr-log-mail.sh` and `send-us-log-mail.sh`; they never pass a
+market argument and can therefore never silently become an `all` archive. `all` is restricted
+to manual diagnostics with `ALLOW_ALL_LOG_MAIL=1`. Each wrapper writes from bootstrap onward to
+`runtime/logs/<market>/<KST-date>/<purpose>/<run-id>.log` and updates the dated session manifest.
+US manifests additionally retain the New York trade date.
+
+Mail packaging is fail-closed: dated session logs, health, reports and trading evidence are
+copied into a private staging directory, redacted, manifested, archived, integrity checked and
+size checked before SMTP. A successful checksum marker prevents Windows retry from sending the
+same archive twice. Normal mail tasks do not use Task Scheduler automatic restart.
+
+After every pull, run the administrator PowerShell installer and verifier shown above. A pull
+does not update registered tasks. The installer records the installed commit in
+`runtime/health/windows-scheduler-install.json`; drift is an operational failure. Windows Task
+entry output is retained under `runtime/scheduler/windows/<KST-date>/`.
+
+Raw session logs are retained for 90 days by operational policy; health and manifests should be
+retained for at least one year. Mail staging and warnings are removed at the end of every run;
+a successfully sent archive is removed immediately. Dry-run archives are retained for inspection.

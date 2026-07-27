@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 APP="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MARKET="${1:-kr}"
+MARKET="${1:-}"
+case "$MARKET" in kr|us) ;; *) echo "[HEALTH][FAIL] reason=MISSING_OR_INVALID_MARKET" >&2; exit 64;; esac
 DAY="${2:-$(TZ=Asia/Seoul date +%F)}"
 cd "$APP"
 mkdir -p runtime/health
@@ -12,11 +13,16 @@ printf '%s\n' "$VERIFY_OUTPUT"
 OUT="runtime/health/${MARKET}-${DAY}.json"
 SUMMARY="runtime/health/${MARKET}-${DAY}.summary.txt"
 python - "$MARKET" "$DAY" "$OUT" "$SUMMARY" "$POLICY_STATUS" "$FORBIDDEN" <<'PY'
-import json, re, sys
+import json, re, subprocess, sys
 from pathlib import Path
 market, day, out, summary, policy_status, forbidden = sys.argv[1:]
 forbidden = int(forbidden)
 root = Path('.')
+trade_date = day
+if market == 'us':
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    trade_date = datetime.now(ZoneInfo('America/New_York')).date().isoformat()
 def text(paths):
     buf=[]
     for p in paths:
@@ -25,37 +31,29 @@ def text(paths):
             except Exception: pass
     return '\n'.join(buf)
 def ticks(t): return len(re.findall(r'(?:US_TICK_LOOP\]\[TICK|\[TICK\]|tick=)', t, re.I))
-logs = list((root/'runtime/logs'/market/day).glob('*.log')) if (root/'runtime/logs'/market/day).exists() else []
-logs += list((root/'runtime').glob(f'wsl-{market}-*.log'))
+logs = list((root/'runtime/logs'/market/day).rglob('*.log')) if (root/'runtime/logs'/market/day).exists() else []
 blob = text(logs)
-# Flat US logs are append-only.  US health runs at 07:10 KST: inspect the
-# complete overnight execution window from the prior KST day 19:00 through the
-# requested KST day 07:30, rather than a fragile single-date substring.
-if market == 'us':
-    from datetime import datetime, time, timedelta
-    from zoneinfo import ZoneInfo
-    kst=ZoneInfo('Asia/Seoul')
-    end=datetime.combine(datetime.fromisoformat(day).date(), time(7,30), kst)
-    start=end-timedelta(hours=12, minutes=30)
-    kept=[]
-    for line in blob.splitlines():
-        match=re.search(r'\[?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:?\d{2}|Z)?)', line)
-        if not match:
-            continue
-        try:
-            stamp=datetime.fromisoformat(match.group(1).replace('Z','+00:00')).astimezone(kst)
-        except ValueError:
-            continue
-        if start <= stamp <= end:
-            kept.append(line)
-    blob='\n'.join(kept)
+# Date-scoped US logs retain every line, including shell errors without timestamps.
 mail_marker = root/'runtime/health'/f'{market}-mail-{day}.json'
 duplicate_skips=len(re.findall(r'SKIP_DUPLICATE|DUPLICATE_BLOCKED', blob, re.I))
 advisory_unavailable=len(re.findall(r'PB1_ADVISORY_LOCK_UNAVAILABLE', blob))
-result = {'market': market.upper(), 'date': day, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'advisory_lock_unavailable_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs]}
+result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'advisory_lock_unavailable_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs]}
 if mail_marker.exists():
-    try: result['mail_ok'] = json.loads(mail_marker.read_text()).get('status') == 'OK'
+    try:
+        marker=json.loads(mail_marker.read_text())
+        result['mail_ok'] = (marker.get('status') == 'OK' and marker.get('market') == market and marker.get('required_missing_count') == 0 and bool(marker.get('archive_sha256')) and marker.get('trade_date') == trade_date)
     except Exception: pass
+
+install_marker=root/'runtime/health/windows-scheduler-install.json'
+try:
+    installed=json.loads(install_marker.read_text())
+    current=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+    result['scheduler_install_sha']=installed.get('installed_commit_sha')
+    result['current_commit_sha']=current
+    result['scheduler_sha_matches']=installed.get('status') == 'OK' and installed.get('installed_commit_sha') == current
+except Exception:
+    result['scheduler_sha_matches']=False
+
 if market == 'us':
     prep = root/'reports/us_prep/latest_us_prep_summary.json'
     if prep.exists():
@@ -66,6 +64,12 @@ if market == 'us':
 else:
     result['prep_final30_ok'] = 'final30=30' in blob or 'final30_rows=30' in blob
 result['ok'] = bool(result.get('tick_count',0) >= 2 or re.search(r'session_end|graceful_shutdown|retryable close failure', blob, re.I))
+if not result.get('scheduler_sha_matches'):
+    result['ok']=False
+    result['failure_reason']='FAILED_SCHEDULER_DRIFT'
+if not result['mail_ok']:
+    result['ok']=False
+    result.setdefault('failure_reason','FAILED_MAIL_VALIDATION')
 if forbidden or duplicate_skips or advisory_unavailable:
     result['ok']=False
     result['failure_reason']='SCHEDULER_POLICY_VIOLATION' if forbidden else 'DUPLICATE_SESSION_START'

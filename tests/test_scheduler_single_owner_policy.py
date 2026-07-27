@@ -59,9 +59,9 @@ def test_cleanup_refuses_unbalanced_markers(tmp_path):
 
 def test_us_health_uses_kst_overnight_window_not_day_substring():
     text=(ROOT/'scripts/wsl/check-nullim-day-health.sh').read_text()
-    assert "timedelta(hours=12, minutes=30)" in text
-    assert "start <= stamp <= end" in text
-    assert "day in line" not in text
+    assert "rglob('*.log')" in text
+    assert "including shell errors without timestamps" in text
+    assert "runtime').glob(f'wsl-{market}-*.log')" not in text
 
 
 def test_scheduler_ci_installs_pytest_and_separates_steps():

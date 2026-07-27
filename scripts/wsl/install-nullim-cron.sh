@@ -24,7 +24,7 @@ without_blocks=$(printf '%s\n' "$existing" | awk '
   !skip {print}
 ')
 # Only remove cron lines that execute a NULLIM scheduler runner; unrelated cron remains intact.
-forbidden='run_pb1_kr\.sh[[:space:]]+(prep|am|pm|close)|scripts/wsl/run-kr-(prep|am|afternoon|close)\.sh|scripts/wsl/run-us-(prep|prep-recovery|am|afternoon|close|session)\.sh|send-market-log-mail\.sh[[:space:]]+(kr|us)|check-nullim-day-health\.sh[[:space:]]+(kr|us)|python[[:space:]]+-m[[:space:]]+trader\.(pb1_runner|kr\.runner\.trade_session_runner|us\.runner\.trade_session_runner)'
+forbidden='run_pb1_kr\.sh|run-kr-[A-Za-z0-9_-]+\.sh|run-us-[A-Za-z0-9_-]+\.sh|(send-market-log-mail|send-kr-log-mail|send-us-log-mail)\.sh([[:space:]]|$)|check-nullim-day-health\.sh([[:space:]]|$)|python[[:space:]]+-m[[:space:]]+trader\.(pb1_runner|kr\.runner\.trade_session_runner|us\.runner\.trade_session_runner)'
 orphan_count=$(printf '%s\n' "$without_blocks" | awk -v pat="$forbidden" '$0 ~ pat {n++} END{print n+0}')
 cleaned=$(printf '%s\n' "$without_blocks" | awk -v pat="$forbidden" '$0 !~ pat')
 printf '%s\n' "$cleaned" | crontab -
