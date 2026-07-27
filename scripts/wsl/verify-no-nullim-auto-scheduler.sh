@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-pattern='run_pb1_kr\.sh[[:space:]]+(prep|am|pm|close)|run-kr-(prep|am|afternoon|close)\.sh|run-us-(prep|prep-recovery|am|afternoon|close|session)\.sh|send-market-log-mail\.sh[[:space:]]+(kr|us)|check-nullim-day-health\.sh[[:space:]]+(kr|us)|python[[:space:]]+-m[[:space:]]+trader\.(pb1_runner|kr\.runner\.trade_session_runner|us\.runner\.trade_session_runner)'
+pattern='run_pb1_kr\.sh|run-kr-[A-Za-z0-9_-]+\.sh|run-us-[A-Za-z0-9_-]+\.sh|(send-market-log-mail|send-kr-log-mail|send-us-log-mail)\.sh([[:space:]]|$)|check-nullim-day-health\.sh([[:space:]]|$)|python[[:space:]]+-m[[:space:]]+trader\.(pb1_runner|kr\.runner\.trade_session_runner|us\.runner\.trade_session_runner)'
 count=0
 check_source(){ local source="$1" content="$2"; while IFS= read -r line; do [[ -z "$line" ]]&&continue; echo "[SCHEDULER_POLICY][WSL][FAIL] source=$source line=$line"; count=$((count+1)); done < <(printf '%s\n' "$content"|grep -E "$pattern"||true); }
 check_file(){

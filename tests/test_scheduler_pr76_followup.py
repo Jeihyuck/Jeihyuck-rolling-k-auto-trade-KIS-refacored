@@ -27,9 +27,11 @@ def test_wsl_verifier_skips_missing_files():
 def test_mail_and_health_define_scripts_and_arguments_separately():
     text = (ROOT / 'scripts/windows/update-nullim-scheduler.ps1').read_text()
     assert 'function New-NullimTaskActionArguments' in text
-    assert 'Script="$base/send-market-log-mail.sh";Args=@("kr")' in text
+    assert 'Script="$base/send-kr-log-mail.sh";Args=@()' in text
+    assert 'Script="$base/send-us-log-mail.sh";Args=@()' in text
+    assert 'Script="$base/send-market-log-mail.sh"' not in text
     assert 'Script="$base/check-nullim-day-health.sh";Args=@("us")' in text
-    assert 'exec bash $scriptQ' in text
+    assert 'exec bash $entryQ $scriptQ' in text
 
 def _bash_single_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"

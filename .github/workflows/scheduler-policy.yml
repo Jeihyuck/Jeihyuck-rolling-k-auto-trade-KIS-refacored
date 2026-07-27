@@ -11,17 +11,31 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.11'}
       - name: Install test dependencies
-        run: python -m pip install --upgrade pip pytest
+        run: python -m pip install --upgrade pip pytest PyYAML
       - name: Validate shell syntax
         run: |
           bash -n scripts/wsl/nullim-repo-root.sh
           bash -n run_pb1_kr.sh scripts/wsl/run-kr-trader.sh scripts/wsl/run-us-trader.sh
           bash -n scripts/wsl/install-nullim-cron.sh
           bash -n scripts/wsl/verify-no-nullim-auto-scheduler.sh
+          bash -n scripts/wsl/init-session-log.sh scripts/wsl/resolve-nullim-python.sh scripts/wsl/run-windows-scheduled-task.sh
+          bash -n scripts/wsl/send-market-log-mail.sh scripts/wsl/send-kr-log-mail.sh scripts/wsl/send-us-log-mail.sh scripts/wsl/check-nullim-day-health.sh
           bash -n scripts/wsl/run-kr-prep.sh scripts/wsl/run-kr-am.sh scripts/wsl/run-kr-afternoon.sh scripts/wsl/run-kr-close.sh
           bash -n scripts/wsl/run-us-prep.sh scripts/wsl/run-us-prep-recovery.sh scripts/wsl/run-us-am.sh scripts/wsl/run-us-afternoon.sh scripts/wsl/run-us-close.sh
       - name: Run scheduler policy regression tests
-        run: pytest -q tests/test_scheduler_single_owner_policy.py tests/test_recovery_control_plane_contracts.py tests/test_wsl_scripts_syntax.py tests/test_kr_runner_env_contract.py tests/test_scheduler_pr76_followup.py tests/test_nullim_wrapper_repo_root.py tests/test_nullim_wrapper_execution.py
+        run: pytest -q tests/test_scheduler_single_owner_policy.py tests/test_recovery_control_plane_contracts.py tests/test_wsl_scripts_syntax.py tests/test_kr_runner_env_contract.py tests/test_scheduler_pr76_followup.py tests/test_nullim_wrapper_repo_root.py tests/test_nullim_wrapper_execution.py tests/test_market_log_mail_hardening.py
+      - name: KR mail end-to-end fixture and canonical evidence paths
+        run: pytest -q tests/test_market_log_mail_e2e.py::test_kr_end_to_end_uses_canonical_paths_and_dry_run_isolated
+      - name: US cross-midnight ET partition fixture
+        run: pytest -q tests/test_market_log_mail_e2e.py::test_us_cross_midnight_partition_collects_every_purpose
+      - name: Stable idempotency and SMTP retry mock
+        run: pytest -q tests/test_market_log_mail_e2e.py::test_stable_source_digest_skips_second_smtp_send tests/test_market_log_mail_e2e.py::test_smtp_retries_twice_then_succeeds
+      - name: Session attempts and health-mail sequencing
+        run: pytest -q tests/test_market_log_mail_e2e.py::test_session_manifest_preserves_attempts_and_effective_status tests/test_market_log_mail_e2e.py::test_final_health_requires_real_mail_and_returns_matching_exit_code
+      - name: Weekly scheduler days and market-holiday skips
+        run: pytest -q tests/test_scheduler_days_and_holidays.py
+      - name: Strict KR and US calendars and project Python resolution
+        run: pytest -q tests/test_trading_day_strict.py tests/test_krx_calendar.py
 
   powershell-parse:
     runs-on: windows-latest
@@ -30,3 +44,6 @@ jobs:
       - name: Parse Windows PowerShell scheduler scripts
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-parse.ps1
+      - name: Test actual scheduler trigger contracts
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows/test-scheduler-trigger-contract.ps1

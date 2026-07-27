@@ -5,6 +5,14 @@ export MARKET_SCOPE="us"
 export TRADING_MARKET="us"
 export DISABLE_KR_IMPORTS_IN_US="1"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/init-session-log.sh"
+nullim_init_session_log US close "close" "${BASH_SOURCE[0]}"
+set +e
+nullim_require_trading_day us "$NULLIM_TRADE_DATE"
+trading_day_rc=$?
+set -e
+[[ "$trading_day_rc" == 10 ]] && exit 0
+[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
@@ -37,15 +45,18 @@ export DISABLE_KR_IMPORTS_IN_US="1"
 
 SESSION_NAME="close"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
-LOG_FILE="runtime/wsl-us-${SESSION_NAME}.log"
+LOG_FILE="$NULLIM_SESSION_LOG"
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
+  export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
   echo "[$(date -Is)] [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi
 echo "[$(date -Is)] [US_WSL_LOCK][ACQUIRED] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
 cleanup() {
   exit_code=$?
+  trap - EXIT
+  nullim_finish_session_log "$exit_code" || true
   echo "[$(date -Is)] [US_WSL_LOCK][RELEASED] session=${SESSION_NAME} lock=${LOCK_FILE} exit_code=${exit_code}" >> "${LOG_FILE}"
 }
 trap cleanup EXIT

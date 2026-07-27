@@ -5,6 +5,14 @@ export MARKET_SCOPE="us"
 export TRADING_MARKET="us"
 export DISABLE_KR_IMPORTS_IN_US="1"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/init-session-log.sh"
+nullim_init_session_log US am "am" "${BASH_SOURCE[0]}"
+set +e
+nullim_require_trading_day us "$NULLIM_TRADE_DATE"
+trading_day_rc=$?
+set -e
+[[ "$trading_day_rc" == 10 ]] && exit 0
+[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
@@ -37,13 +45,14 @@ export DISABLE_KR_IMPORTS_IN_US="1"
 
 SESSION_NAME="am"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
-LOG_FILE="runtime/wsl-us-${SESSION_NAME}.log"
+LOG_FILE="$NULLIM_SESSION_LOG"
 TRADE_DATE="${US_TRADE_DATE:-$(date -u +%F)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 if [[ -x .venv/bin/python ]]; then PYTHON_BIN=.venv/bin/python; fi
 LOCK_RESULT="$(${PYTHON_BIN} -m trader.us.session_lock --market us --session "${SESSION_NAME}" --trade-date "${TRADE_DATE}" --min-interval-sec 60 2>/dev/null)" || lock_rc=$?
 lock_rc="${lock_rc:-0}"
 if [[ "${lock_rc}" == "10" ]]; then
+  export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
   echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] session=${SESSION_NAME} trade_date=${TRADE_DATE} result=${LOCK_RESULT}" >> "${LOG_FILE}"
   exit 0
 elif [[ "${lock_rc}" != "0" ]]; then
@@ -55,6 +64,7 @@ if [[ "${LOCK_RESULT}" == *'"reason": "stale_lock_removed"'* ]]; then
 fi
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
+  export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
   echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] reason=already_running [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi
@@ -65,6 +75,8 @@ if [[ "${US_LOCK_ONLY:-0}" == "1" ]]; then
 fi
 cleanup() {
   exit_code=$?
+  trap - EXIT
+  nullim_finish_session_log "$exit_code" || true
   echo "[$(date -Is)] [US_WSL_LOCK][RELEASED] session=${SESSION_NAME} lock=${LOCK_FILE} exit_code=${exit_code}" >> "${LOG_FILE}"
 }
 trap cleanup EXIT

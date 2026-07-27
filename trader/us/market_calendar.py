@@ -41,30 +41,42 @@ _EARLY_CLOSE_DATES_2026: set[date] = {
 
 _RUNTIME_HOLIDAYS: set[date] = set(_FULL_CLOSE_DATES_2026)
 _RUNTIME_EARLY_CLOSES: set[date] = set(_EARLY_CLOSE_DATES_2026)
+_US_CALENDAR_SUPPORTED_YEARS: set[int] = {2026}
+_US_CALENDAR_LOAD_ERROR: str | None = None
 
 
 def _load_yaml_holidays() -> None:
-    """config/us_market_holidays.yaml이 있으면 로드."""
+    """Load the configured calendar and expose failures to scheduler gates."""
+    global _US_CALENDAR_LOAD_ERROR
     from pathlib import Path
     yaml_path = Path(__file__).resolve().parents[2] / "config" / "us_market_holidays.yaml"
     if not yaml_path.exists():
+        _US_CALENDAR_LOAD_ERROR = "US_CALENDAR_FILE_MISSING"
         return
     try:
         import yaml  # type: ignore
-        with open(yaml_path, "r") as f:
-            data = yaml.safe_load(f) or {}
-        for d in (data.get("full_close") or []):
-            _RUNTIME_HOLIDAYS.add(date.fromisoformat(str(d)))
-        for d in (data.get("early_close") or []):
-            _RUNTIME_EARLY_CLOSES.add(date.fromisoformat(str(d)))
-    except Exception:
-        pass
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+        values = list(data.get("full_close") or []) + list(data.get("early_close") or [])
+        if not values:
+            raise ValueError("US calendar contains no dated entries")
+        for value in data.get("full_close") or []:
+            parsed = date.fromisoformat(str(value)); _RUNTIME_HOLIDAYS.add(parsed); _US_CALENDAR_SUPPORTED_YEARS.add(parsed.year)
+        for value in data.get("early_close") or []:
+            parsed = date.fromisoformat(str(value)); _RUNTIME_EARLY_CLOSES.add(parsed); _US_CALENDAR_SUPPORTED_YEARS.add(parsed.year)
+        _US_CALENDAR_LOAD_ERROR = None
+    except Exception as exc:
+        _US_CALENDAR_LOAD_ERROR = f"US_CALENDAR_LOAD_FAILED:{type(exc).__name__}"
 
 
-try:
-    _load_yaml_holidays()
-except Exception:
-    pass
+_load_yaml_holidays()
+
+
+def us_calendar_supported_years() -> set[int]:
+    return set(_US_CALENDAR_SUPPORTED_YEARS)
+
+
+def us_calendar_load_error() -> str | None:
+    return _US_CALENDAR_LOAD_ERROR
 
 
 def now_ny() -> datetime:

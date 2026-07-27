@@ -1,100 +1,122 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-APP="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-MARKET="${1:-all}"
-TS="$(date +%Y%m%d-%H%M%S)"
-HUMAN_TS="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-
-cd "$APP"
-mkdir -p runtime/cron runtime/health
-
-BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"
-BRANCH="${BRANCH:-unknown}"
-BRANCH_SAFE="$(printf '%s' "$BRANCH" | sed 's/[^A-Za-z0-9._-]/-/g')"
-BRANCH_SAFE="${BRANCH_SAFE:-unknown}"
-KR_LOG_DATE="$(TZ=Asia/Seoul date +%F)"
-
-OUT="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-logs-${TS}.tar.gz"
-WARN="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-logs-${TS}.warn"
-
-case "$MARKET" in
-  us)
-    SUBJECT="[NULLIM][${BRANCH}][US][LOG] overnight logs ${HUMAN_TS}"
-    BODY="미국장 overnight 로그 자동 발송입니다. branch=${BRANCH}"
-    FILES=(runtime/cron runtime/logs/us/${KR_LOG_DATE} runtime/wsl-us-prep.log runtime/wsl-us-am.log runtime/wsl-us-afternoon.log runtime/wsl-us-close.log reports/us_liveness reports/us_daily/latest_us_daily_report.md reports/us_daily/latest_us_daily_report.json reports/us_prep/latest_us_prep_summary.md reports/us_prep/latest_us_prep_summary.json reports/us_schedule_health runtime/health)
-    ;;
-  kr)
-    SUBJECT="[NULLIM][${BRANCH}][KR][LOG] regular logs ${HUMAN_TS}"
-    BODY="한국장 정규장 로그 자동 발송입니다. branch=${BRANCH}"
-    FILES=(runtime/cron runtime/wsl-kr-prep.log runtime/wsl-kr-am.log runtime/wsl-kr-afternoon.log runtime/wsl-kr-close.log runtime/logs/kr/${KR_LOG_DATE} runtime/health reports/kr reports)
-    ;;
-  *)
-    SUBJECT="[NULLIM][${BRANCH}][ALL][LOG] logs ${HUMAN_TS}"
-    BODY="미국장/한국장 전체 로그 자동 발송입니다. branch=${BRANCH}"
-    FILES=(runtime/cron runtime/wsl-*.log runtime/locks reports)
-    ;;
-esac
-
-echo "[LOG_MAIL][START] market=${MARKET} branch=${BRANCH} out=${OUT}"
-
-EXISTING_FILES=()
-for item in "${FILES[@]}"; do
-  matches=()
-  if [[ "$item" == *'*'* ]]; then
-    shopt -s nullglob
-    matches=( $item )
-    shopt -u nullglob
-  elif [ -e "$item" ]; then
-    matches=("$item")
-  fi
-  if [ "${#matches[@]}" -gt 0 ]; then
-    EXISTING_FILES+=("${matches[@]}")
-  else
-    echo "[LOG_MAIL][MISSING_OPTIONAL] $item"
-  fi
-done
-
-if [ "${#EXISTING_FILES[@]}" -eq 0 ]; then
-  FALLBACK="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-no-logs-${TS}.txt"
-  { echo "No logs found."; echo "market=${MARKET}"; echo "branch=${BRANCH}"; echo "ts=${HUMAN_TS}"; } > "$FALLBACK"
-  EXISTING_FILES=("$FALLBACK")
+EX_USAGE=64; MARKET="${1:-}"
+case "$MARKET" in kr|us) ;; *) echo '[LOG_MAIL][FAIL] reason=MISSING_OR_INVALID_MARKET' >&2; exit "$EX_USAGE";; esac
+APP="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd -P)"; cd "$APP"
+source "$APP/scripts/wsl/resolve-nullim-python.sh"
+CALENDAR_PYTHON="$(nullim_resolve_python "$APP")" || { echo "[CALENDAR][FAIL] reason=PROJECT_PYTHON_MISSING" >&2; exit 1; }
+KST_RUN_DATE="${NULLIM_KST_RUN_DATE:-$(TZ=Asia/Seoul date +%F)}"; US_TRADE_DATE_ET="${US_TRADE_DATE:-$(TZ=America/New_York date +%F)}"
+TRADE_DATE="$KST_RUN_DATE"; [[ "$MARKET" == us ]] && TRADE_DATE="$US_TRADE_DATE_ET"
+TS="$(date +%Y%m%d-%H%M%S)"; BRANCH="$(git branch --show-current 2>/dev/null || echo unknown)"; BRANCH="${BRANCH:-unknown}"
+BRANCH_SAFE="$(printf %s "$BRANCH"|sed 's/[^A-Za-z0-9._-]/-/g')"; OUT="${NULLIM_LOG_MAIL_OUT:-/tmp/nullim-${BRANCH_SAFE}-${MARKET}-logs-${TS}.tar.gz}"
+WARN="${OUT%.tar.gz}.warn"; STAGE="$(mktemp -d "/tmp/nullim-${MARKET}-mail.XXXXXX")"; ATTEMPT_GROUP="${NULLIM_MAIL_ATTEMPT_ID:-$(date +%s)-$$}"
+PROD_MARKER="runtime/health/${MARKET}-mail-${KST_RUN_DATE}.json"; DRY_MARKER="runtime/health/${MARKET}-mail-dry-run-${KST_RUN_DATE}.json"
+READINESS="runtime/health/${MARKET}-mail-readiness-${KST_RUN_DATE}.json"; mkdir -p runtime/health
+cleanup(){ rm -rf "$STAGE" "$WARN"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 || "${NULLIM_KEEP_MAIL_ARCHIVE:-0}" == 1 ]] || rm -f "$OUT"; }; trap cleanup EXIT
+# Closed weekdays are successful no-mail operations and do not require session evidence.
+set +e
+TRADING_DAY_JSON="$("$CALENDAR_PYTHON" "$APP/scripts/wsl/check-nullim-trading-day.py" --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
+TRADING_DAY_RC=$?; set -e
+printf '%s\n' "$TRADING_DAY_JSON"
+if [[ "$TRADING_DAY_RC" == 10 ]]; then
+ python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" <<'PY_CLOSED'
+import json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+p,m,d,k=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'SKIPPED_NON_TRADING_DAY','mail_sent':False,'mail_required':False,'market':m,'trade_date':d,'run_date_kst':k,'reason':'MARKET_HOLIDAY','ok':True,'created_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+PY_CLOSED
+ echo "[LOG_MAIL][SKIP] reason=SKIPPED_NON_TRADING_DAY market=$MARKET trade_date=$TRADE_DATE"; exit 0
+elif [[ "$TRADING_DAY_RC" != 0 ]]; then
+ echo "[LOG_MAIL][FAIL] reason=CALENDAR_ERROR market=$MARKET trade_date=$TRADE_DATE" >&2; exit 1
 fi
-
-tar -czf "$OUT" "${EXISTING_FILES[@]}" 2>"$WARN" || true
-
-if [ ! -s "$OUT" ]; then
-  FALLBACK="/tmp/nullim-${BRANCH_SAFE}-${MARKET}-empty-archive-${TS}.txt"
-  { echo "Archive was empty."; echo "market=${MARKET}"; echo "branch=${BRANCH}"; echo "ts=${HUMAN_TS}"; } > "$FALLBACK"
-  tar -czf "$OUT" "$FALLBACK"
+# Exclusive snapshot lock remains held through staging and tar creation. Sessions take it shared.
+mkdir -p runtime/locks; exec {SNAPSHOT_FD}>"runtime/locks/${MARKET}-mail-snapshot.lock"; flock -x "$SNAPSHOT_FD"
+fail(){ local reason="$1" rc="${2:-1}" marker="$PROD_MARKER"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"; python3 - "$marker" "$MARKET" "$TRADE_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+p,m,d,r,a,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'FAIL','mail_sent':False,'market':m,'trade_date':d,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+PY
+ echo "[LOG_MAIL][FAIL] market=$MARKET reason=$reason" >&2; exit "$rc"; }
+if [[ "${NULLIM_SKIP_SESSION_ACTIVE_CHECK:-0}" != 1 ]]; then
+ for lock in runtime/locks/${MARKET}-*.lock; do [[ -e "$lock" ]] || continue; [[ "$lock" == *-mail-snapshot.lock ]] && continue; exec {fd}>"$lock"; flock -n "$fd" || fail SESSION_STILL_RUNNING; eval "exec ${fd}>&-"; done
 fi
-
-echo "[LOG_MAIL][TAR] out=${OUT} size=$(stat -c%s "$OUT" 2>/dev/null || echo 0)"
-
-if [ -s "$WARN" ]; then
-  echo "[LOG_MAIL][TAR_WARN]"
-  cat "$WARN"
-fi
-
-rc=1
-for attempt in 1 2 3; do
-  echo "[LOG_MAIL][SEND_ATTEMPT] attempt=${attempt}"
-  if "$APP/scripts/wsl/with-venv.sh" python "$APP/scripts/notify/send_mail_attachment.py" \
-    --subject "$SUBJECT" \
-    --body "$BODY" \
-    --attach "$OUT"; then
-    rc=0
-    break
-  fi
-  sleep $((attempt * 10))
-done
-MARKER_DATE="$(TZ=Asia/Seoul date +%F)"
-MARKER="runtime/health/${MARKET}-mail-${MARKER_DATE}.json"
-if [[ "$rc" -eq 0 ]]; then
-  printf '{"status":"OK","market":"%s","date":"%s","archive":"%s","sent_at":"%s"}\n' "$MARKET" "$MARKER_DATE" "$OUT" "$(date -Is)" > "$MARKER"
-  echo "[LOG_MAIL][OK] market=${MARKET} branch=${BRANCH} out=${OUT} marker=${MARKER}"
+LOG_ROOT="runtime/logs/$MARKET/$TRADE_DATE"; [[ -f "$LOG_ROOT/session-manifest.json" ]] || fail REQUIRED_LOG_MISSING
+required=("$LOG_ROOT/session-manifest.json")
+if [[ "$MARKET" == kr ]]; then
+ purposes=(prep am afternoon close)
+ LEDGER_ENV="${NULLIM_LEDGER_ENV:-${STRATEGY_ENV:-practice}}"
+ evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE" "bot_state/trader_ledger/final30/$LEDGER_ENV/$TRADE_DATE")
 else
-  printf '{"status":"FAIL","market":"%s","date":"%s","archive":"%s","sent_at":"%s"}\n' "$MARKET" "$MARKER_DATE" "$OUT" "$(date -Is)" > "$MARKER"
-  echo "[LOG_MAIL][FAIL] market=${MARKET} marker=${MARKER}"
-  exit 1
+ purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
+ evidence_groups=("reports/us_daily/$TRADE_DATE" "reports/us_prep/$TRADE_DATE" "runtime/us/session_state/$TRADE_DATE" "runtime/us/watchlist/$TRADE_DATE" "reports/us_schedule_health/$TRADE_DATE.json")
 fi
+for purpose in "${purposes[@]}"; do dir="$LOG_ROOT/$purpose"; [[ -d "$dir" ]] || fail "REQUIRED_LOG_MISSING_${purpose}"; find "$dir" -maxdepth 1 -type f -name '*.log' -print -quit | grep -q . || fail "REQUIRED_LOG_MISSING_${purpose}"; required+=("$dir"); done
+for item in "${evidence_groups[@]}"; do [[ -e "$item" ]] || fail "REQUIRED_EVIDENCE_MISSING_$(basename "$item")"; required+=("$item"); done
+# Readiness is a pre-mail snapshot, not the final post-mail health report.
+python3 - "$READINESS" "$MARKET" "$KST_RUN_DATE" "$TRADE_DATE" "${#purposes[@]}" "${#required[@]}" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+p,m,k,d,purposes,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'READY','market':m,'run_date_kst':k,'trade_date':d,'required_purpose_count':int(purposes),'required_path_count':int(count),'created_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+PY
+required+=("$READINESS")
+for item in "${required[@]}"; do mkdir -p "$STAGE/$(dirname "$item")"; cp -a "$item" "$STAGE/$item" || fail STAGING_COPY_FAILED; done
+find "$STAGE" -type f -print0 | xargs -0 -r sed -E -i \
+ -e 's/((APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD)[=:][[:space:]]*)[^[:space:]",]+/\1[REDACTED]/Ig' \
+ -e 's/(Authorization:[[:space:]]*Bearer)[[:space:]]+[^[:space:]]+/\1 [REDACTED]/Ig' -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[REDACTED_EMAIL]/g' \
+ -e 's/([0-9]{4})[- ]?[0-9]{4}[- ]?([0-9]{2,6})/\1-****-\2/g'
+COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"; RECIPIENT="${MAIL_TO:-${NAVER_MAIL_TO:-${REPORT_MAIL_TO:-dry-run}}}"
+SOURCE_SHA="$(python3 - "$STAGE" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$COMMIT" "$READINESS" <<'PY'
+import hashlib,sys
+from pathlib import Path
+stage,market,trade,recipient,commit,readiness=sys.argv[1:]; root=Path(stage); h=hashlib.sha256()
+for value in (market,trade,recipient,commit): h.update(value.encode()+b'\0')
+for p in sorted(x for x in root.rglob('*') if x.is_file() and str(x.relative_to(root)) != readiness):
+ h.update(str(p.relative_to(root)).encode()+b'\0'); h.update(p.read_bytes())
+print(h.hexdigest())
+PY
+)"
+if [[ "${NULLIM_MAIL_DRY_RUN:-0}" != 1 && -f "$PROD_MARKER" && "${NULLIM_FORCE_RESEND:-0}" != 1 ]] && python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$SOURCE_SHA" <<'PY'
+import json,sys
+try:d=json.load(open(sys.argv[1])); raise SystemExit(not(d.get('status')=='OK' and d.get('mail_sent') is True and d.get('market')==sys.argv[2] and d.get('trade_date')==sys.argv[3] and d.get('recipient')==sys.argv[4] and d.get('source_evidence_sha256')==sys.argv[5]))
+except Exception: raise SystemExit(1)
+PY
+then echo "[LOG_MAIL][IDEMPOTENT_SKIP] source_evidence_sha256=$SOURCE_SHA"; exit 0; fi
+python3 - "$STAGE" "$MARKET" "$KST_RUN_DATE" "$TRADE_DATE" "$BRANCH" "$COMMIT" "$ATTEMPT_GROUP" "$SOURCE_SHA" "${required[@]}" <<'PY'
+import json,os,sys
+from datetime import datetime,timezone
+from pathlib import Path
+stage,market,kst,trade,branch,commit,attempt,source,*required=sys.argv[1:]
+data={'market':market,'run_date_kst':kst,'trade_date_et':trade,'branch':branch,'commit_sha':commit,'scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_task':os.getenv('NULLIM_SCHEDULER_TASK_NAME','manual'),'archive_created_at':datetime.now(timezone.utc).isoformat(),'required_files':required,'included_required_files':required,'missing_required_files':[],'required_missing_count':0,'optional_files':[],'source_evidence_sha256':source,'redaction_applied':True,'session_active_at_packaging':False,'mail_attempt_id':attempt}
+Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n'); Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.txt').write_text('\n'.join(f'{k}={v}' for k,v in data.items())+'\n')
+PY
+if ! tar -C "$STAGE" -czf "$OUT" . 2>"$WARN"; then fail TAR_FAILED; fi
+[[ ! -s "$WARN" ]] || fail TAR_WARNING; tar -tzf "$OUT" >/dev/null || fail TAR_VERIFY_FAILED; tar -tzf "$OUT"|grep -q 'NULLIM_LOG_ARCHIVE_MANIFEST.json' || fail ARCHIVE_MANIFEST_MISSING
+SIZE="$(stat -c%s "$OUT")"; MAX=$(( ${NULLIM_MAIL_MAX_ATTACHMENT_MB:-15} * 1024 * 1024 )); (( SIZE <= MAX )) || fail ARCHIVE_TOO_LARGE
+ARCHIVE_SHA="$(sha256sum "$OUT"|awk '{print $1}')"; echo "[LOG_MAIL][ARCHIVE_OK] out=$OUT size=$SIZE source_sha256=$SOURCE_SHA archive_sha256=$ARCHIVE_SHA"
+if [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]]; then
+ python3 - "$DRY_MARKER" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$SOURCE_SHA" "$ARCHIVE_SHA" "$ATTEMPT_GROUP" "$OUT" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+p,m,d,k,source,archive,a,out=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'DRY_RUN','mail_sent':False,'market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'mail_attempt_id':a,'archive':out,'created_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+PY
+ echo "[LOG_MAIL][DRY_RUN] market=$MARKET archive=$OUT marker=$DRY_MARKER"; exit 0
+fi
+mail_rc=1; attempt_count=0; message_id=""; unknown_after_send=0
+for attempt_no in 1 2 3; do
+ attempt_count="$attempt_no"; MAIL_ATTEMPT_COUNT="$attempt_no"; echo "[LOG_MAIL][SEND_ATTEMPT] group=$ATTEMPT_GROUP attempt=$attempt_no"
+ set +e; mail_output="$("$APP/scripts/wsl/with-venv.sh" python "$APP/scripts/notify/send_mail_attachment.py" --subject "[NULLIM][$BRANCH][${MARKET^^}][LOG] $TRADE_DATE" --body "NULLIM ${MARKET^^} verified redacted log archive" --attach "$OUT" --attempt-id "$ATTEMPT_GROUP" 2>&1)"; mail_rc=$?; set -e
+ printf '%s\n' "$mail_output"; [[ "$mail_rc" == 75 ]] && unknown_after_send=1
+ if [[ "$mail_rc" == 0 ]]; then message_id="$(printf '%s\n' "$mail_output"|sed -n 's/^\[MAIL\]\[MESSAGE_ID\] //p'|tail -1)"; break; fi
+ [[ "$attempt_no" == 1 ]] && sleep "${NULLIM_SMTP_RETRY_SLEEP_1:-30}"; [[ "$attempt_no" == 2 ]] && sleep "${NULLIM_SMTP_RETRY_SLEEP_2:-120}"
+done
+if [[ "$mail_rc" != 0 ]]; then [[ "$unknown_after_send" == 1 ]] && fail UNKNOWN_AFTER_SEND 75; fail FAILED_SMTP; fi
+python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" "$SOURCE_SHA" "$ARCHIVE_SHA" "$ATTEMPT_GROUP" "$message_id" "$RECIPIENT" "$OUT" "$attempt_count" <<'PY'
+import json,sys
+from datetime import datetime,timezone
+from pathlib import Path
+p,m,d,k,source,archive,a,msg,recipient,out,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'OK','mail_sent':True,'market':m,'trade_date':d,'run_date_kst':k,'source_evidence_sha256':source,'archive_sha256':archive,'required_missing_count':0,'mail_attempt_id':a,'message_id':msg or a,'recipient':recipient,'archive':out,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+PY
+echo "[LOG_MAIL][OK] market=$MARKET archive=$OUT marker=$PROD_MARKER attempt_count=$attempt_count"

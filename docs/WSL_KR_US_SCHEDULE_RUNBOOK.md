@@ -8,6 +8,10 @@
 
 PR #60 and PR #67's single Windows scheduler policy is the final policy. PR #70's WSL cron installation regression must not be reintroduced.
 
+## Legacy GitHub Actions schedule policy
+
+The legacy GitHub Actions schedule is not a production trading scheduler. Scheduled workflows must not invoke `run-us-trader.sh` or `run-kr-trader.sh` for automatic live or practice orders. GitHub Actions may use those wrappers only for CI, explicitly manual diagnostics, or non-ordering smoke tests. Windows Task Scheduler remains the sole automatic owner.
+
 ## Deployment and recovery
 
 After this PR is merged and pulled (do **not** run the pre-fix installer):
@@ -51,3 +55,112 @@ bash scripts/wsl/run-us-am.sh
 After deployment, Windows administrator PowerShell must run the installer and verifier commands in the deployment section above. Linux CI cannot prove that Task Scheduler accepts the generated XML; confirm the final `[SCHEDULER_POLICY][OK]` output and inspect an order task's `RestartCount` (`$null` or `0` is correct).
 
 Mail and Health actions render the wrapper script and `kr`/`us` market value as separate shell tokens. The Windows verifier checks this action contract and requires every canonical action to `unset NULLIM_APP_DIR`. Wrappers reassert their location-derived repository root immediately after loading `.env`, so `.env` cannot reintroduce either stale path variable. `deploy-preflight.log` must contain the wrapper's concrete market and session; `market=unknown` or `session=unknown` is not a valid production result.
+
+## Verified market log delivery
+
+Scheduled mail jobs invoke `send-kr-log-mail.sh` and `send-us-log-mail.sh`; they never pass a
+market argument and can therefore never silently become an `all` archive. The collector accepts
+only `kr` or `us`; combined `all` mail mode has been removed. Each wrapper writes from bootstrap
+onward to `runtime/logs/kr/<KST-date>/<purpose>/<run-id>.log` for KR or
+`runtime/logs/us/<ET-trade-date>/<purpose>/<run-id>.log` for US and updates the partition manifest.
+
+Mail packaging is fail-closed: dated session logs, health, reports and trading evidence are
+copied into a private staging directory, redacted, manifested, archived, integrity checked and
+size checked before SMTP. A successful checksum marker prevents Windows retry from sending the
+same archive twice. Normal mail tasks do not use Task Scheduler automatic restart.
+
+After every pull, run the administrator PowerShell installer and verifier shown above. A pull
+does not update registered tasks. The installer records the installed commit in
+`runtime/health/windows-scheduler-install.json`; drift is an operational failure. Windows Task
+entry output is retained under `runtime/scheduler/windows/<KST-date>/`.
+
+Raw session logs are retained for 90 days by operational policy; health and manifests should be
+retained for at least one year. Mail staging and warnings are removed at the end of every run;
+a successfully sent archive is removed immediately. Dry-run archives are retained for inspection.
+
+### PR #78 mail readiness and canonical evidence
+
+Mail packaging creates `runtime/health/<market>-mail-readiness-<KST-date>.json` itself. It does
+**not** depend on the final daily health file: the 16:00/07:00 mail tasks run first, and the
+16:10/07:10 health tasks subsequently require the production mail marker. Dry runs write only
+`<market>-mail-dry-run-<KST-date>.json` with `mail_sent=false` and cannot satisfy final health.
+A failed final health exits non-zero so Task Scheduler's `LastTaskResult` agrees with its JSON.
+
+KR logs use the KST trade date. US logs use the New York trade date as their partition, so evening
+prep and AM plus the following KST morning's afternoon/close attempts share
+`runtime/logs/us/<ET-trade-date>/`. Every purpose directory and every attempt log is packaged.
+Canonical evidence is collected from `reports/kr_prep`, `runtime/kr/watchlist`,
+`runtime/kr/session`, `bot_state/trader_ledger`, `reports/us_daily`, `reports/us_prep`,
+`runtime/us/session_state`, `runtime/us/watchlist`, and `reports/us_schedule_health`.
+
+SMTP delivery retries at most three times (30 then 120 seconds). All retries share one attempt
+group. Idempotency uses a stable digest of evidence path/content, market, trade date, recipient,
+and commit—not gzip or manifest timestamps. `UNKNOWN_AFTER_SEND` is distinct from a definite SMTP
+failure. The archive SHA-256 and source-evidence SHA-256 are recorded separately.
+
+### Administrator deployment gate and rollback
+
+Do not merge/deploy until the `windows-latest` PowerShell parser succeeds. On the actual Windows
+host, export the existing 16 task XML definitions, run `update-nullim-scheduler.ps1`, then run
+`verify-scheduler.ps1`. Review every emitted `CONFIG_OK`/`LAST_RUN_*` state, the installed/current
+SHA values, `canonical_windows_tasks=16`, `noncanonical_windows_tasks=0`, and
+`forbidden_wsl_sources=0`. Perform KR and US dry-run fixture packaging, then one real test mail per
+market. A repository pull alone never updates registered tasks.
+
+Rollback is fail-closed: disable the 16 NULLIM tasks, restore the saved XML definitions, check out
+the previous verified commit, rerun that commit's verifier, and keep tasks disabled until SHA,
+action, and WSL forbidden-source checks pass. Never introduce cron or systemd as rollback.
+
+### Weekly triggers and closed-market behavior
+
+The 16 Windows tasks use explicit weekly triggers in KST; there is no `Daily` fallback:
+
+* KR tasks: Monday through Friday.
+* US evening prep/preflight/AM tasks: Monday through Friday.
+* US post-midnight afternoon/close/mail/health tasks: Tuesday through Saturday.
+* Sunday: no NULLIM task. Monday 02:00–07:10: no US task.
+
+Saturday US morning execution is intentional and required to finish, package, and validate the
+Friday US trading session. The verifier compares the complete `DaysOfWeek` set and fails if
+Saturday is missing from a US morning task or a forbidden Monday/Sunday is present.
+
+Weekday exchange holidays are guarded independently of scheduler weekdays by
+`check-nullim-trading-day.py`, which delegates to `trader.time_utils.resolve_krx_trading_day_strict` for KR and
+`trader.us.market_calendar.is_us_trading_day` for US. Session wrappers record an attempt with
+`SKIPPED_NON_TRADING_DAY`/`MARKET_CLOSED` and exit zero before deploy preflight, watchlist work,
+reconciliation, or an order-capable runner. Closed-day mail is not sent by default; its production
+marker records `mail_sent=false`, `mail_required=false`, and `ok=true`. Final health similarly
+returns a successful `SKIPPED_NON_TRADING_DAY` result without requiring ticks or mail.
+
+Mail takes an exclusive `runtime/locks/<market>-mail-snapshot.lock` through staging and tar
+creation. Session wrappers hold a shared lock for their lifetime, preventing a new session or
+manifest mutation from racing packaging. KR archives include only the dated ledger directory
+`bot_state/trader_ledger/final30/<env>/<trade-date>`; the all-dates ledger root is forbidden.
+
+After deploying this change, rerun the administrator installer and verifier because `git pull`
+does not replace existing Daily triggers. Confirm KR and US-evening `Monday–Friday`, US-morning
+`Tuesday–Saturday`, no Sunday trigger, and that the next-run values match the host's KST policy.
+
+### Strict calendar runtime and holiday policy audit
+
+Trading-day gates never invoke the system Python. They resolve
+`<repo>/.venv/bin/python` first, then an explicitly executable `NULLIM_PYTHON_BIN`; absence of both
+is a fail-closed calendar error and no runner starts. KR scheduling uses
+`resolve_krx_trading_day_strict`: a weekend or configured holiday proves closure, a successful
+PyKRX lookup may prove open/closed, and missing/unsupported configuration plus lookup failure is
+`CALENDAR_ERROR`, never a weekday-open heuristic. `config/krx_holidays.json` carries repository-
+validated dates for 2025–2027; unlisted weekdays still require external confirmation.
+
+The US calendar exposes its supported years and YAML load status. Unsupported weekday years or a
+missing/unreadable YAML dependency are `CALENDAR_ERROR`. Early-close dates remain trading days and
+the checker reports `early_close=true` with `regular_close_et=13:00`.
+
+Holiday health still audits scheduler ownership, installed/current SHA, and forbidden WSL
+cron/systemd sources before accepting the calendar skip. Only tick/session/mail requirements are
+waived. Drift, a missing install marker, wrong owner, forbidden scheduler source, or unknown
+calendar produces `ok=false` and a nonzero task result even on an exchange holiday.
+
+Windows verification normalizes `DaysOfWeek` to masks (62 for Mon–Fri, 124 for Tue–Sat), avoiding
+localized/string rendering assumptions. CI creates real `New-ScheduledTaskTrigger` objects on
+`windows-latest` and verifies masks, Saturday presence, Monday/Sunday absence, and one-week
+intervals before deployment.

@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
+source "$SCRIPT_DIR/init-session-log.sh"
+nullim_init_session_log KR prep "prep" "${BASH_SOURCE[0]}"
+set +e
+nullim_require_trading_day kr "$NULLIM_TRADE_DATE"
+trading_day_rc=$?
+set -e
+[[ "$trading_day_rc" == 10 ]] && exit 0
+[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
@@ -33,6 +41,7 @@ if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
 else
   exec 9>"${LOCK_FILE}"
   if ! flock -n 9; then
+    export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
     kr_duplicate_result "${lock_file:-$LOCK_FILE}" "prep"
     exit 0
   fi
@@ -73,9 +82,9 @@ export PB1_SESSION=prep WSL_RUN_SESSION=prep STRATEGY_MODE=PREP DRY_RUN=1 DISABL
 TODAY_KST="$(TZ=Asia/Seoul date +%F)"
 LOG_DIR="runtime/logs/kr/${TODAY_KST}"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/wsl-kr-prep.log"
+LOG_FILE="$NULLIM_SESSION_LOG"
 LATEST_LINK="runtime/logs/kr/wsl-kr-prep.latest.log"
-ln -sfn "${TODAY_KST}/wsl-kr-prep.log" "$LATEST_LINK"
+ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_LOG")" "$LATEST_LINK"
 {
 NOW_HM="${NOW_HM:-$(TZ=Asia/Seoul date +%H:%M)}"
 if [[ "$NOW_HM" < "06:30" || "$NOW_HM" > "08:50" ]]; then
