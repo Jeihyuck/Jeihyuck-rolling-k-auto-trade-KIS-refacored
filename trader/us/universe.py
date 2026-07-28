@@ -44,19 +44,8 @@ def load_universe(force: bool = False) -> dict[str, list[str]]:
     raw = _load_yaml()
     _UNIVERSE = raw
 
-    # symbols 레지스트리에 등록
-    from trader.us.symbols import register_symbol, US_EXCHANGE_REGISTRY, _SYMBOL_EXCHANGE_MAP
-
-    # us_universe.yaml에는 exchange 정보 없음 → symbols.py의 known map 우선
-    # 미등록 symbol은 NASDAQ 기본으로 등록
-    for category, tickers in raw.items():
-        for ticker in tickers:
-            try:
-                from trader.us.symbols import is_known_symbol
-                if not is_known_symbol(ticker):
-                    register_symbol(ticker, "NASDAQ")  # 기본값; 개선 가능
-            except Exception as exc:
-                logger.warning("[US_UNIVERSE][SKIP] ticker=%s error=%s", ticker, exc)
+    # YAML에는 거래소 근거가 없으므로 여기서 미등록 종목을 추정하지 않는다.
+    # 정적 master 또는 Prep의 원천 메타데이터 준비 단계에서만 등록한다.
 
     _LOADED = True
     logger.info("[US_UNIVERSE][OK] loaded %d categories %d tickers",

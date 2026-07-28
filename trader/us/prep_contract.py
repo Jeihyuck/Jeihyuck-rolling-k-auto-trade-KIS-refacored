@@ -101,7 +101,11 @@ def build_us_prep_contract(
     benchmark_sync_failed_count = len(sync.get("benchmark_sync_failed_symbols") or [])
     open_position_sync_failed_count = len(sync.get("open_position_sync_failed_symbols") or [])
     final30_sync_failed_count = int(watchlist_result.get("final30_sync_failed_count", 0) or 0)
-    exchange_failed_symbols = list(dynamic_universe_result.get("exchange_resolution_failed_symbols") or [])
+    exchange_failed_symbols = list(
+        sync.get("exchange_resolution_failed_symbols")
+        or dynamic_universe_result.get("exchange_resolution_failed_symbols")
+        or []
+    )
 
     cap_violations = list(watchlist_result.get("cap_violations") or [])
     rotation_context = watchlist_result.get("rotation_context") or {}
@@ -274,6 +278,7 @@ def build_us_prep_contract(
         "daily_sync_ok_count": daily_sync_ok_count,
         "daily_sync_failed_count": daily_sync_failed_count,
         "daily_sync_failed_symbols": list(sync.get("sync_failed_symbols") or []),
+        "price_data_failed_symbols": list(sync.get("price_data_failed_symbols") or []),
         "daily_sync_success_ratio": daily_sync_success_ratio,
         "benchmark_sync_failed_count": benchmark_sync_failed_count,
         "open_position_sync_failed_count": open_position_sync_failed_count,
