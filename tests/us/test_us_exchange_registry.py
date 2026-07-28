@@ -96,3 +96,81 @@ def test_normalize_us_exchange_unknown_raises():
 
     with pytest.raises(ValueError):
         normalize_us_exchange("UNKNOWN")
+
+
+def test_prepare_registers_dynamic_universe_source_exchange(monkeypatch):
+    from trader.us import symbols
+    from trader.us.exchange_registry import prepare_exchange_registry
+
+    monkeypatch.delitem(symbols._SYMBOL_EXCHANGE_MAP, "ZZZZ", raising=False)
+    with pytest.raises(ValueError, match="unknown symbol"):
+        symbols.resolve_exchange("ZZZZ")
+
+    result = prepare_exchange_registry(
+        dynamic_universe_result={"symbols": [{"symbol": "ZZZZ", "exchange_code": "NYS"}]},
+        benchmark_symbols=(),
+    )
+    assert result["failed_count"] == 0
+    assert symbols.resolve_exchange("ZZZZ") == "NYSE"
+
+
+def test_prepare_does_not_guess_missing_exchange(monkeypatch):
+    from trader.us import symbols
+    from trader.us.exchange_registry import prepare_exchange_registry
+
+    monkeypatch.delitem(symbols._SYMBOL_EXCHANGE_MAP, "ZZZZ", raising=False)
+    result = prepare_exchange_registry(
+        dynamic_universe_result={"symbols": [{"symbol": "ZZZZ"}]},
+        benchmark_symbols=(),
+    )
+    assert result["failed_symbols"] == ["ZZZZ"]
+    with pytest.raises(ValueError, match="unknown symbol"):
+        symbols.resolve_exchange("ZZZZ")
+
+
+def test_prepare_isolates_invalid_symbol_without_aborting(monkeypatch):
+    from trader.us import symbols
+    from trader.us.exchange_registry import prepare_exchange_registry
+
+    monkeypatch.delitem(symbols._SYMBOL_EXCHANGE_MAP, "ZZZZ", raising=False)
+    result = prepare_exchange_registry(
+        dynamic_universe_result={"symbols": [
+            {"symbol": "BRK.B", "exchange_code": "NYS"},
+            {"symbol": "ZZZZ", "exchange_code": "NYS"},
+        ]},
+        benchmark_symbols=(),
+    )
+    assert result["failed_symbols"] == ["BRK.B"]
+    assert result["registered_symbols"] == ["ZZZZ"]
+    assert symbols.resolve_exchange("ZZZZ") == "NYSE"
+
+
+def test_prepare_preserves_metadata_when_lifecycle_bare_symbol_duplicates(monkeypatch):
+    from trader.us import symbols
+    from trader.us.exchange_registry import prepare_exchange_registry
+
+    monkeypatch.delitem(symbols._SYMBOL_EXCHANGE_MAP, "ZZZZ", raising=False)
+    result = prepare_exchange_registry(
+        dynamic_universe_result={"symbols": []},
+        benchmark_symbols=(),
+        open_positions=[{"symbol": "ZZZZ", "exchange": "NYS"}, "ZZZZ"],
+    )
+    assert result["failed_count"] == 0
+    assert result["registered_symbols"] == ["ZZZZ"]
+    assert symbols.resolve_exchange("ZZZZ") == "NYSE"
+
+
+def test_dynamic_universe_resolve_exchange_does_not_guess_nasdaq(monkeypatch):
+    from trader.us import symbols
+    from trader.us.universe_builder import _resolve_exchange
+
+    monkeypatch.delitem(symbols._SYMBOL_EXCHANGE_MAP, "ZZZZ", raising=False)
+    with pytest.raises(ValueError, match="unknown symbol"):
+        _resolve_exchange("ZZZZ")
+
+
+def test_all_prep_benchmarks_resolve():
+    from trader.us.symbols import resolve_exchange
+
+    benchmarks = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
+    assert {resolve_exchange(symbol) for symbol in benchmarks} <= {"NASDAQ", "NYSE", "AMEX"}

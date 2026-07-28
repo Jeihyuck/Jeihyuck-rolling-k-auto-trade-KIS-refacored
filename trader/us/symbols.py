@@ -97,7 +97,21 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "PANW": "NASDAQ", "TXN": "NASDAQ",
     "PLTR": "NASDAQ",
     "DIA": "NYSE", "IWM": "NYSE", "RSP": "NYSE",
-    "XLK": "NYSE", "XLV": "NYSE",
+    "XLK": "NYSE", "XLI": "NYSE", "XLF": "NYSE", "XLV": "NYSE",
+    "XLP": "NYSE", "XLU": "NYSE", "XLE": "NYSE",
+    # Verified listings used by the dynamic universe.  This is intentionally
+    # explicit: an unknown US ticker must never silently become NASDAQ.
+    "ADI": "NASDAQ", "APP": "NASDAQ", "ARM": "NASDAQ", "ASML": "NASDAQ",
+    "CRWV": "NASDAQ", "ENPH": "NASDAQ", "FLEX": "NASDAQ", "FLNC": "NASDAQ",
+    "FSLR": "NASDAQ", "IREN": "NASDAQ", "KLAC": "NASDAQ", "LRCX": "NASDAQ",
+    "LSCC": "NASDAQ", "MCHP": "NASDAQ", "MPWR": "NASDAQ", "NXPI": "NASDAQ",
+    "QCOM": "NASDAQ", "SHOP": "NASDAQ", "SMCI": "NASDAQ", "TEAM": "NASDAQ",
+    "ZS": "NASDAQ",
+    # Remaining verified constituents from config/us_dynamic_sources.yaml.
+    "NOW": "NYSE", "SNOW": "NYSE", "NET": "NYSE", "U": "NYSE",
+    "AI": "NYSE", "ORCL": "NYSE", "CRM": "NYSE", "ANET": "NYSE",
+    "CLS": "NYSE", "JBL": "NYSE", "NEE": "NYSE", "SO": "NYSE",
+    "DUK": "NYSE", "RDDT": "NYSE", "COMM": "NASDAQ", "ON": "NASDAQ",
 }
 
 _VALID_SYMBOL_RE = re.compile(r"^[A-Z]{1,5}$")

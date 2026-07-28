@@ -16,6 +16,19 @@ from trader.us.symbols import (
 )
 
 
+@pytest.mark.parametrize(
+    "symbol, expected_exchange",
+    [
+        ("XLE", "NYSE"), ("XLF", "NYSE"), ("XLI", "NYSE"),
+        ("XLP", "NYSE"), ("XLU", "NYSE"), ("ARM", "NASDAQ"),
+        ("ASML", "NASDAQ"), ("LRCX", "NASDAQ"), ("QCOM", "NASDAQ"),
+        ("ADI", "NASDAQ"),
+    ],
+)
+def test_required_prep_symbols_resolve(symbol, expected_exchange):
+    assert resolve_exchange(symbol) == expected_exchange
+
+
 class TestNormalizeSymbol:
     def test_uppercase(self):
         assert normalize_symbol("nvda") == "NVDA"

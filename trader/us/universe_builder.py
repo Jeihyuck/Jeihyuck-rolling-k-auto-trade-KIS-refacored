@@ -60,12 +60,14 @@ def _load_dynamic_sources() -> dict[str, list[str]]:
 
 
 def _resolve_exchange(symbol: str) -> str:
-    """symbols 레지스트리에서 거래소 조회, 미등록이면 NASDAQ 기본값."""
-    try:
-        from trader.us.symbols import resolve_exchange
-        return resolve_exchange(symbol)
-    except Exception:
-        return "NASDAQ"
+    """symbols 레지스트리에서 거래소 조회.
+
+    미등록 심볼을 NASDAQ으로 추정하지 않는다.  Dynamic Universe 단계에서
+    잘못된 거래소로 시세를 조회하면 후보군이 왜곡되므로, 호출부에서
+    exchange_resolution_failed로 분리해 나머지 종목 처리만 계속한다.
+    """
+    from trader.us.symbols import resolve_exchange
+    return resolve_exchange(symbol)
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -90,7 +92,6 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
         rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
         recent = rows[-15:]
         for i in range(1, len(recent)):
-            # normalize_daily_rows 이후 close/high/low 필드 우선, fallback clos
             prev_close = recent[i - 1].get("close") or float(str(recent[i - 1].get("clos", 0) or 0).replace(",", ""))
             high = recent[i].get("high") or float(str(recent[i].get("high", 0) or 0).replace(",", ""))
             low = recent[i].get("low") or float(str(recent[i].get("low", 0) or 0).replace(",", ""))
@@ -110,7 +111,6 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
         if not trs:
             return None
         atr = sum(trs) / len(trs)
-        # normalize_daily_rows 이후 close 필드 우선
         last_close_val = rows[-1].get("close")
         if last_close_val is None:
             last_close_val = float(str(rows[-1].get("clos", 0) or 0).replace(",", ""))
@@ -190,6 +190,22 @@ def _compute_avg_dollar_volume(daily_rows: list[dict], days: int = 20) -> float:
         return 0.0
 
 
+def _safe_append_unique(
+    *,
+    symbol: str,
+    tag: str,
+    seen: set[str],
+    all_tickers: list[str],
+    ticker_tags: dict[str, list[str]],
+) -> None:
+    if symbol not in seen:
+        seen.add(symbol)
+        all_tickers.append(symbol)
+        ticker_tags[symbol] = [tag]
+    elif tag not in ticker_tags.get(symbol, []):
+        ticker_tags[symbol].append(tag)
+
+
 def build_us_dynamic_universe(
     *,
     trade_date: str,
@@ -201,16 +217,9 @@ def build_us_dynamic_universe(
 ) -> dict:
     """US Dynamic Universe 빌드.
 
-    Args:
-        trade_date: YYYY-MM-DD
-        as_of_date: KIS dailyprice BYMD 기준일. None이면 trade_date와 동일.
-        env: practice / live
-        provider: USDataProvider 인스턴스
-        manual_seed: config/us_universe.yaml에서 로드된 ticker list
-        force_rebuild: 캐시 무시 재빌드
-
-    Returns:
-        dynamic universe result dict
+    Universe Discovery 단계에서는 미등록 거래소를 NASDAQ으로 추정하지 않는다.
+    미해결 심볼은 exchange_resolution_failed로 분리하고 나머지 종목은 계속
+    평가한다.
     """
     as_of_date = as_of_date or trade_date
     logger.info("[US_UNIVERSE_BUILDER][START] trade_date=%s env=%s", trade_date, env)
@@ -220,27 +229,22 @@ def build_us_dynamic_universe(
         as_of_date,
     )
 
-    # ── 환경변수 ─────────────────────────────────────────────────────────
     min_price = _env_float("US_MIN_PRICE", 5.0)
     min_avg_volume = _env_float("US_MIN_AVG_VOLUME_20D", 500_000.0)
     min_avg_dollar_volume = _env_float("US_MIN_AVG_DOLLAR_VOLUME_20D", 50_000_000.0)
-    # 수정 3: 기본값 120 → 60, relaxed=30
     strict_history_days = _env_int("US_MIN_HISTORY_DAYS", 60)
     relaxed_history_days = max(30, strict_history_days // 2)
     max_atr_pct = _env_float("US_MAX_ATR_PCT", 0.18)
     universe_min = _env_int("US_DYNAMIC_UNIVERSE_MIN", 80)
     universe_target = _env_int("US_DYNAMIC_UNIVERSE_TARGET", 300)
 
-    # 수정 5: manual seed / core ETF - price만 있으면 fallback 허용
     _CORE_SEED_SYMBOLS: frozenset[str] = frozenset({
         "SPY", "QQQ", "QQQM", "SMH", "SOXX",
         "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO",
     })
 
-    # ── Source 수집 ──────────────────────────────────────────────────────
     dynamic_sources = _load_dynamic_sources()
 
-    # manual_seed
     manual_seed_list: list[str] = []
     if manual_seed:
         for s in manual_seed:
@@ -248,7 +252,6 @@ def build_us_dynamic_universe(
             if ns:
                 manual_seed_list.append(ns)
 
-    # dynamic_sources 전체 ticker 수집
     dynamic_tickers: list[str] = []
     for tickers in dynamic_sources.values():
         for t in tickers:
@@ -256,7 +259,6 @@ def build_us_dynamic_universe(
             if ns:
                 dynamic_tickers.append(ns)
 
-    # source별 카운트 (중복 제거 전)
     source_counts = {
         "manual_seed": len(manual_seed_list),
         "dynamic_sources": len(dynamic_tickers),
@@ -273,45 +275,39 @@ def build_us_dynamic_universe(
         source_counts["etf_holdings"],
     )
 
-    # ── 중복 제거 ─────────────────────────────────────────────────────────
     seen: set[str] = set()
     all_tickers: list[str] = []
-    # source_tags 추적
     ticker_tags: dict[str, list[str]] = {}
 
     for t in manual_seed_list:
-        if t not in seen:
-            seen.add(t)
-            all_tickers.append(t)
-            ticker_tags[t] = ["manual_seed"]
-        else:
-            if "manual_seed" not in ticker_tags.get(t, []):
-                ticker_tags[t].append("manual_seed")
+        _safe_append_unique(
+            symbol=t,
+            tag="manual_seed",
+            seen=seen,
+            all_tickers=all_tickers,
+            ticker_tags=ticker_tags,
+        )
 
     for category, tickers in dynamic_sources.items():
         for ticker in tickers:
             ns = _normalize_symbol(ticker)
             if not ns:
                 continue
-            if ns not in seen:
-                seen.add(ns)
-                all_tickers.append(ns)
-                ticker_tags[ns] = [category]
-            else:
-                if category not in ticker_tags.get(ns, []):
-                    ticker_tags[ns].append(category)
+            _safe_append_unique(
+                symbol=ns,
+                tag=category,
+                seen=seen,
+                all_tickers=all_tickers,
+                ticker_tags=ticker_tags,
+            )
 
     raw_count = len(manual_seed_list) + len(dynamic_tickers)
     unique_count = len(all_tickers)
-    logger.info(
-        "[US_UNIVERSE_BUILDER][DEDUP] raw=%d unique=%d",
-        raw_count,
-        unique_count,
-    )
+    logger.info("[US_UNIVERSE_BUILDER][DEDUP] raw=%d unique=%d", raw_count, unique_count)
 
-    # ── 데이터 조회 + 3단계 필터 ────────────────────────────────────────────
     filter_counts = {
         "passed": 0,
+        "failed_exchange": 0,
         "failed_price": 0,
         "failed_volume": 0,
         "failed_dollar_volume": 0,
@@ -320,27 +316,47 @@ def build_us_dynamic_universe(
         "volume_missing_provider": 0,
     }
 
-    # 3단계 버킷
     strict_pass: list[dict] = []
     relaxed_pass: list[dict] = []
     fallback_pass: list[dict] = []
     volume_missing_fallback_pass: list[dict] = []
 
-    # 실패 상세 추적 (수정 6)
     _fail_details: list[dict] = []
-
+    exchange_resolution_failed_symbols: list[str] = []
     warnings: list[str] = []
     errors: list[str] = []
 
     for symbol in all_tickers:
-        exchange = _resolve_exchange(symbol)
+        try:
+            exchange = _resolve_exchange(symbol)
+        except Exception as exc:
+            filter_counts["failed_exchange"] += 1
+            exchange_resolution_failed_symbols.append(symbol)
+            _fail_details.append({
+                "symbol": symbol,
+                "price": None,
+                "latest_close": None,
+                "current_price": None,
+                "daily_rows": 0,
+                "history_days": 0,
+                "close_nonnull": 0,
+                "volume_nonnull": 0,
+                "reason": "exchange_resolution_failed",
+                "error": str(exc),
+            })
+            logger.warning(
+                "[US_UNIVERSE_BUILDER][EXCHANGE_RESOLUTION_FAILED] symbol=%s error=%s",
+                symbol,
+                exc,
+            )
+            continue
+
         current_price: float | None = None
         latest_close: float | None = None
         daily: list[dict] = []
         history_days: int = 0
         current_price_raw_val: str = "None"
 
-        # --- current price 조회 ---
         try:
             current = provider.get_current_price(symbol, exchange)
             _raw_last = current.get("last", 0) or current.get("close", 0) or 0
@@ -354,10 +370,16 @@ def build_us_dynamic_universe(
                 symbol, exc,
             )
 
-        # --- daily price 조회 ---
         try:
-            if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
-                daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=260, allow_http_sync=True)
+            completed_method = getattr(provider, "get_completed_daily_prices", None)
+            if callable(completed_method) and getattr(completed_method, "__module__", "") != "unittest.mock":
+                daily = provider.get_completed_daily_prices(
+                    symbol,
+                    exchange,
+                    trade_date=trade_date,
+                    required_bars=260,
+                    allow_http_sync=True,
+                )
             else:
                 daily = provider.get_daily_prices(symbol, exchange, as_of_date=as_of_date)
             history_days = len(daily)
@@ -368,7 +390,6 @@ def build_us_dynamic_universe(
                 symbol, exc,
             )
 
-        # --- price fallback (수정 2) ---
         price: float | None = current_price
         price_source = "current"
         if (price is None or price <= 0) and latest_close and latest_close > 0:
@@ -380,14 +401,12 @@ def build_us_dynamic_universe(
             )
 
         price_ok = price is not None and price > 0 and price >= min_price
-
         if price_ok:
             logger.debug(
-                "[US_UNIVERSE_BUILDER][PRICE_OK] symbol=%s price=%.4f source=%s",
-                symbol, price, price_source,
+                "[US_UNIVERSE_BUILDER][PRICE_OK] symbol=%s price=%.4f source=%s raw=%s",
+                symbol, price, price_source, current_price_raw_val,
             )
 
-        # --- 각 실패 항목 상세 로그 (수정 6) ---
         close_nonnull = sum(
             1 for r in daily
             if (r.get("close") is not None and r.get("close", 0) > 0)
@@ -403,7 +422,6 @@ def build_us_dynamic_universe(
         avg_dv = _compute_avg_dollar_volume(daily, 20)
         atr_pct = _compute_atr_pct(daily)
 
-        # strict 조건 평가
         strict_ok = (
             price_ok
             and history_days >= strict_history_days
@@ -412,7 +430,6 @@ def build_us_dynamic_universe(
             and (atr_pct is None or atr_pct <= max_atr_pct)
         )
 
-        # relaxed 조건 평가
         relaxed_ok = (
             price_ok
             and history_days >= relaxed_history_days
@@ -420,7 +437,6 @@ def build_us_dynamic_universe(
             and avg_dv > 0
         )
 
-        # provider volume missing fallback: price/history/ATR are sound, but provider sent no volume.
         volume_missing_provider = (
             volume_nonnull == 0
             and close_nonnull >= relaxed_history_days
@@ -433,7 +449,6 @@ def build_us_dynamic_universe(
             and (atr_pct is None or atr_pct <= max_atr_pct)
         )
 
-        # fallback 조건 평가 (수정 5: core seed는 price만 있으면 허용)
         is_core_seed = symbol in _CORE_SEED_SYMBOLS or "manual_seed" in ticker_tags.get(symbol, [])
         fallback_ok = price_ok and (latest_close is not None) and is_core_seed
 
@@ -469,7 +484,6 @@ def build_us_dynamic_universe(
                 "warning": "insufficient_history_but_seed_allowed",
             })
         else:
-            # 실패 사유 추적
             fail_reason: str
             if not price_ok:
                 fail_reason = "failed_price"
@@ -504,7 +518,6 @@ def build_us_dynamic_universe(
                 "reason": fail_reason,
             })
 
-    # ── strict/relaxed/fallback 집계 로그 ─────────────────────────────────
     logger.info("[US_UNIVERSE_BUILDER][FILTER][STRICT] passed=%d", len(strict_pass))
     logger.info("[US_UNIVERSE_BUILDER][FILTER][RELAXED] passed=%d", len(relaxed_pass))
     logger.info("[US_UNIVERSE_BUILDER][FILTER][FALLBACK] passed=%d", len(fallback_pass))
@@ -514,8 +527,6 @@ def build_us_dynamic_universe(
         len(strict_pass), len(relaxed_pass), len(volume_missing_fallback_pass), len(fallback_pass),
     )
 
-    # ── 최종 selected 구성 (strict 우선) ─────────────────────────────────
-    # strict → relaxed → fallback 순으로 누적
     filtered_symbols: list[dict] = list(strict_pass)
     selected_set: set[str] = {s["symbol"] for s in filtered_symbols}
 
@@ -538,10 +549,11 @@ def build_us_dynamic_universe(
     filter_counts["passed"] = filtered_count
 
     logger.info(
-        "[US_UNIVERSE_BUILDER][FILTER] input=%d passed=%d failed_price=%d"
+        "[US_UNIVERSE_BUILDER][FILTER] input=%d passed=%d failed_exchange=%d failed_price=%d"
         " failed_volume=%d failed_dollar_volume=%d failed_history=%d failed_atr=%d",
         unique_count,
         filter_counts["passed"],
+        filter_counts["failed_exchange"],
         filter_counts["failed_price"],
         filter_counts["failed_volume"],
         filter_counts["failed_dollar_volume"],
@@ -549,7 +561,6 @@ def build_us_dynamic_universe(
         filter_counts["failed_atr"],
     )
 
-    # ── 실패 상세 로그 (수정 6) ─────────────────────────────────────────────
     if _fail_details:
         price_fail_samples = [d["symbol"] for d in _fail_details if d["reason"] == "failed_price"][:10]
         if price_fail_samples:
@@ -557,7 +568,13 @@ def build_us_dynamic_universe(
                 "[US_UNIVERSE_BUILDER][FILTER_FAIL_SAMPLE] reason=failed_price symbols=%s",
                 ",".join(price_fail_samples),
             )
-        for det in _fail_details[:20]:  # 최대 20개 상세 로그
+        exchange_fail_samples = [d["symbol"] for d in _fail_details if d["reason"] == "exchange_resolution_failed"][:10]
+        if exchange_fail_samples:
+            logger.warning(
+                "[US_UNIVERSE_BUILDER][FILTER_FAIL_SAMPLE] reason=exchange_resolution_failed symbols=%s",
+                ",".join(exchange_fail_samples),
+            )
+        for det in _fail_details[:20]:
             logger.warning(
                 "[US_UNIVERSE_BUILDER][FILTER_FAIL_DETAIL] symbol=%s price=%s latest_close=%s"
                 " current_price=%s daily_rows=%d history_days=%d"
@@ -573,15 +590,24 @@ def build_us_dynamic_universe(
                 det["reason"],
             )
 
-    # ── 상태 결정 (수정 7) ────────────────────────────────────────────────
     volume_missing_fallback_used = bool(volume_missing_fallback_pass)
     if volume_missing_fallback_used:
         warnings.append("volume_missing_from_provider")
+    if exchange_resolution_failed_symbols:
+        warnings.append("exchange_resolution_failed")
+        errors.append(
+            f"exchange_resolution_failed_count={len(exchange_resolution_failed_symbols)}"
+        )
 
     if filtered_count < 30:
         status = "ERROR"
         errors.append(f"filtered_count={filtered_count} < hard_min=30")
-        logger.error("[US_UNIVERSE_BUILDER][ERROR] filtered_count=%d < 30 hard fail reason=insufficient_price_history_atr_candidates volume_missing_fallback=%d", filtered_count, len(volume_missing_fallback_pass))
+        logger.error(
+            "[US_UNIVERSE_BUILDER][ERROR] filtered_count=%d < 30 hard fail reason=insufficient_price_history_atr_candidates volume_missing_fallback=%d exchange_failed=%d",
+            filtered_count,
+            len(volume_missing_fallback_pass),
+            len(exchange_resolution_failed_symbols),
+        )
     elif filtered_count < 80:
         status = "OK_WITH_WARNINGS"
         warnings.append(f"filtered_count={filtered_count} < 80 (used_relaxed_or_fallback)")
@@ -594,11 +620,7 @@ def build_us_dynamic_universe(
     else:
         status = "OK"
 
-    logger.info(
-        "[US_UNIVERSE_BUILDER][DONE] filtered=%d status=%s",
-        filtered_count,
-        status,
-    )
+    logger.info("[US_UNIVERSE_BUILDER][DONE] filtered=%d status=%s", filtered_count, status)
 
     return {
         "trade_date": trade_date,
@@ -612,6 +634,9 @@ def build_us_dynamic_universe(
         "symbols": filtered_symbols,
         "warnings": warnings,
         "errors": errors,
+        "exchange_resolution_failed_symbols": sorted(exchange_resolution_failed_symbols),
+        "exchange_resolution_failed_count": len(exchange_resolution_failed_symbols),
+        "fail_details": _fail_details,
         "volume_missing_fallback_used": volume_missing_fallback_used,
         "volume_missing_fallback_count": len(volume_missing_fallback_pass),
     }
