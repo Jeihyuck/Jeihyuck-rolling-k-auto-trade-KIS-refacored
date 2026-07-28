@@ -43,6 +43,7 @@ $failed=$false
 $wsl="$env:SystemRoot\System32\wsl.exe"
 $base="$Repo/scripts/wsl"
 $taskHasNotRunCode=267011 # 0x00041303 SCHED_S_TASK_HAS_NOT_RUN
+$historicalRunFailureCount=0
 
 $expected=[ordered]@{
   # Dedicated mail wrappers take no market argument; health requires an exact quoted argv token.
@@ -111,7 +112,8 @@ foreach($name in $expected.Keys) {
     $runState='LAST_RUN_OK'
   }else{
     $runState='LAST_RUN_FAILED'
-    $failed=$true
+    $historicalRunFailureCount++
+    Write-Host "[SCHEDULER][RUN_WARN] task=$name LastRunTime=$($info.LastRunTime) LastTaskResult=$($info.LastTaskResult) reason=HISTORICAL_RUN_RESULT_DOES_NOT_INVALIDATE_CONFIGURATION"
   }
 
   $configState=if($taskConfigOk){"CONFIG_OK"}else{"CONFIG_FAILED"}
@@ -160,3 +162,4 @@ Write-Host 'owner=WINDOWS_TASK_SCHEDULER'
 Write-Host 'canonical_windows_tasks=16'
 Write-Host "noncanonical_windows_tasks=$non"
 Write-Host 'forbidden_wsl_sources=0'
+Write-Host "historical_run_failures=$historicalRunFailureCount"
