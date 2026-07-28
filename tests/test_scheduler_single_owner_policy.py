@@ -42,12 +42,14 @@ def test_docs_and_windows_installer_declare_single_owner():
     installer=(ROOT/'scripts/windows/update-nullim-scheduler.ps1').read_text()
     assert 'install-nullim-cron.sh' in installer and 'verify-scheduler.ps1' in installer
 
-def test_scheduler_marker_command_uses_bash_safe_quoting():
+def test_scheduler_marker_is_streamed_to_wsl_tee_without_nested_shell_quoting():
     installer=(ROOT/'scripts/windows/update-nullim-scheduler.ps1').read_text()
-    assert '$markerRepoQ=ConvertTo-BashSingleQuoted $Repo' in installer
-    assert '$markerPythonQ=ConvertTo-BashSingleQuoted $markerPython' in installer
-    assert 'python3 -c $markerPythonQ' in installer
-    assert 'python3 -c `"$markerPython`"' not in installer
+    assert '$markerJson=[ordered]@{' in installer
+    assert 'ConvertTo-Json -Depth 3' in installer
+    assert '/usr/bin/mkdir -p $markerDir' in installer
+    assert '$markerJson | & $wsl -d $Distro -- /usr/bin/tee $markerPath' in installer
+    assert '$markerPython' not in installer
+    assert 'python3 -c' not in installer
 
 def test_scheduler_config_verification_warns_on_historical_run_failures():
     verifier=(ROOT/'scripts/windows/verify-scheduler.ps1').read_text()
