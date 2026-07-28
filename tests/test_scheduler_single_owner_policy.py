@@ -49,6 +49,14 @@ def test_scheduler_marker_command_uses_bash_safe_quoting():
     assert 'python3 -c $markerPythonQ' in installer
     assert 'python3 -c `"$markerPython`"' not in installer
 
+def test_scheduler_config_verification_warns_on_historical_run_failures():
+    verifier=(ROOT/'scripts/windows/verify-scheduler.ps1').read_text()
+    assert "$runState='LAST_RUN_FAILED'" in verifier
+    assert '$historicalRunFailureCount++' in verifier
+    assert '[SCHEDULER][RUN_WARN]' in verifier
+    assert 'historical_run_failures=$historicalRunFailureCount' in verifier
+    assert "$runState='LAST_RUN_FAILED'\n    $failed=$true" not in verifier
+
 def test_kr_duplicate_evidence_never_overwrites_canonical_result():
     text=(ROOT/'scripts/wsl/kr-session-lock.sh').read_text()
     assert '/duplicates/duplicate-' in text
