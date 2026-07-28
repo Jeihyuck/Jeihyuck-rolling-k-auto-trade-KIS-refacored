@@ -40,8 +40,18 @@ foreach($d in $defs){
   Register-ScheduledTask -TaskName $d.Name -Action $action -Trigger $trigger -Settings $settings -Force|Out-Null
 }
 & "$PSScriptRoot/verify-scheduler.ps1" -Repo $Repo -Distro $Distro -SkipInstallMarkerCheck;if($LASTEXITCODE -ne 0){throw "NULLIM scheduler configuration verification failed"}
-$markerPython = "import json,datetime,pathlib; p=pathlib.Path('runtime/health/windows-scheduler-install.json'); p.parent.mkdir(parents=True,exist_ok=True); now=datetime.datetime.now(datetime.timezone.utc).isoformat(); p.write_text(json.dumps({'status':'OK','scheduler_owner':'WINDOWS_TASK_SCHEDULER','installed_commit_sha':'$installSha','canonical_windows_tasks':16,'noncanonical_windows_tasks':0,'forbidden_wsl_sources':0,'installed_at':now,'verified_at':now},indent=2)+'\n')"
-$markerRepoQ=ConvertTo-BashSingleQuoted $Repo
-$markerPythonQ=ConvertTo-BashSingleQuoted $markerPython
-& $wsl -d $Distro -- bash -lc "cd $markerRepoQ && python3 -c $markerPythonQ"; if($LASTEXITCODE -ne 0){throw "Scheduler install marker write failed"}
+$markerDir="$Repo/runtime/health"
+$markerPath="$markerDir/windows-scheduler-install.json"
+$markerJson=[ordered]@{
+  status='OK'
+  scheduler_owner='WINDOWS_TASK_SCHEDULER'
+  installed_commit_sha=$installSha
+  canonical_windows_tasks=16
+  noncanonical_windows_tasks=0
+  forbidden_wsl_sources=0
+  installed_at=[datetime]::UtcNow.ToString('o')
+  verified_at=[datetime]::UtcNow.ToString('o')
+} | ConvertTo-Json -Depth 3
+& $wsl -d $Distro -- /usr/bin/mkdir -p $markerDir; if($LASTEXITCODE -ne 0){throw "Scheduler install marker directory creation failed"}
+$markerJson | & $wsl -d $Distro -- /usr/bin/tee $markerPath | Out-Null; if($LASTEXITCODE -ne 0){throw "Scheduler install marker write failed"}
 & "$PSScriptRoot/verify-scheduler.ps1" -Repo $Repo -Distro $Distro;if($LASTEXITCODE -ne 0){throw "NULLIM final scheduler verification failed"}
