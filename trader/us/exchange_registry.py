@@ -32,6 +32,18 @@ def _item_exchange(item: Mapping[str, Any]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _has_exchange_metadata(item: Mapping[str, Any] | None) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    raw_exchange, _ = _item_exchange(item)
+    return raw_exchange is not None
+
+
+def _symbol_label(raw_symbol: Any) -> str:
+    label = str(raw_symbol or "").strip().upper()
+    return label or "<EMPTY>"
+
+
 def prepare_exchange_registry(
     *,
     dynamic_universe_result: Mapping[str, Any],
@@ -46,20 +58,44 @@ def prepare_exchange_registry(
     NASDAQ fallback.
     """
     targets: dict[str, tuple[str, Mapping[str, Any] | None]] = {}
+    failures: list[dict[str, str]] = []
+
+    def add_target(raw_symbol: Any, source: str, item: Mapping[str, Any] | None = None) -> None:
+        label = _symbol_label(raw_symbol)
+        try:
+            symbol = normalize_symbol(str(raw_symbol or ""))
+        except ValueError as exc:
+            failures.append({"symbol": label, "source": source, "reason": f"normalize_symbol_failed: {exc}"})
+            logger.warning("[US_EXCHANGE_REGISTRY][FAIL] symbol=%s reason=%s source=%s", label, failures[-1]["reason"], source)
+            return
+
+        existing = targets.get(symbol)
+        if existing is None:
+            targets[symbol] = (source, item)
+            return
+
+        _, existing_item = existing
+        existing_has_metadata = _has_exchange_metadata(existing_item)
+        new_has_metadata = _has_exchange_metadata(item)
+        # Preserve authoritative metadata-bearing rows when later dedup inputs are
+        # bare lifecycle symbols.  Replace only when the new target carries
+        # exchange metadata and the existing one does not.
+        if existing_has_metadata and not new_has_metadata:
+            return
+        if new_has_metadata and not existing_has_metadata:
+            targets[symbol] = (source, item)
+
     for raw in dynamic_universe_result.get("symbols", []) or []:
         if isinstance(raw, Mapping):
-            symbol = normalize_symbol(str(raw.get("symbol") or ""))
-            targets[symbol] = ("dynamic_universe", raw)
+            add_target(raw.get("symbol"), "dynamic_universe", raw)
     for symbol in benchmark_symbols:
-        targets[normalize_symbol(str(symbol))] = ("benchmark", None)
+        add_target(symbol, "benchmark", None)
     for raw in open_positions:
         item = raw if isinstance(raw, Mapping) else None
-        symbol = normalize_symbol(str(item.get("symbol") if item is not None else raw))
-        targets[symbol] = ("open_position", item)
+        add_target(item.get("symbol") if item is not None else raw, "open_position", item)
 
     registered: list[str] = []
     already_known: list[str] = []
-    failures: list[dict[str, str]] = []
     for symbol, (source, item) in sorted(targets.items()):
         if is_known_symbol(symbol):
             already_known.append(symbol)
@@ -93,7 +129,7 @@ def prepare_exchange_registry(
             logger.warning("[US_EXCHANGE_REGISTRY][FAIL] symbol=%s reason=%s source=%s", symbol, exc, source)
 
     result = {
-        "target_count": len(targets),
+        "target_count": len(targets) + len([row for row in failures if row.get("reason", "").startswith("normalize_symbol_failed")]),
         "registered_count": len(registered),
         "already_known_count": len(already_known),
         "failed_count": len(failures),
@@ -102,5 +138,5 @@ def prepare_exchange_registry(
         "failed_symbols": [row["symbol"] for row in failures],
         "failures": failures,
     }
-    logger.info("[US_EXCHANGE_REGISTRY][PREPARE] targets=%d registered=%d already_known=%d failed=%d", len(targets), len(registered), len(already_known), len(failures))
+    logger.info("[US_EXCHANGE_REGISTRY][PREPARE] targets=%d registered=%d already_known=%d failed=%d", result["target_count"], len(registered), len(already_known), len(failures))
     return result
