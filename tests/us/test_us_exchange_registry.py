@@ -160,6 +160,15 @@ def test_prepare_preserves_metadata_when_lifecycle_bare_symbol_duplicates(monkey
     assert symbols.resolve_exchange("ZZZZ") == "NYSE"
 
 
+def test_dynamic_universe_resolve_exchange_does_not_guess_nasdaq(monkeypatch):
+    from trader.us import symbols
+    from trader.us.universe_builder import _resolve_exchange
+
+    monkeypatch.delitem(symbols._SYMBOL_EXCHANGE_MAP, "ZZZZ", raising=False)
+    with pytest.raises(ValueError, match="unknown symbol"):
+        _resolve_exchange("ZZZZ")
+
+
 def test_all_prep_benchmarks_resolve():
     from trader.us.symbols import resolve_exchange
 
