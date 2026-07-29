@@ -152,3 +152,14 @@ def test_kr_wrappers_treat_calendar_as_advisory():
         assert '[KR_SESSION][CALENDAR_WARN]' in text
         assert '[[ "$trading_day_rc" == 10 ]] && exit 0' not in text
         assert '[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"' not in text
+
+
+def test_common_calendar_helper_never_marks_kr_session_skipped():
+    text=(ROOT/'scripts/wsl/init-session-log.sh').read_text()
+    kr_branch=text[text.index('if [[ "${market,,}" == kr'):text.index('elif [[ "$rc" == 10 ]]')]
+    us_branch=text[text.index('elif [[ "$rc" == 10 ]]'):]
+    assert '[NULLIM_RUN][CALENDAR_ADVISORY]' in kr_branch
+    assert '[NULLIM_RUN][SKIP]' not in kr_branch
+    assert 'NULLIM_SESSION_FINAL_STATUS' not in kr_branch
+    assert '[NULLIM_RUN][SKIP]' in us_branch
+    assert 'NULLIM_SESSION_FINAL_STATUS=SKIPPED_NON_TRADING_DAY' in us_branch
