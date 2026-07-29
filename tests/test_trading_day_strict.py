@@ -25,19 +25,24 @@ def test_configured_krx_holiday_is_closed_without_pykrx():
     data=json.loads(result.stdout); assert data['status']=='SKIPPED_NON_TRADING_DAY' and data['calendar_source']=='KRX_HOLIDAY_CONFIG'
 
 
-def test_strict_krx_open_requires_positive_pykrx_confirmation():
-    with patch.object(kr_time,'_safe_get_nearest_business_day_in_a_week',return_value=('20260526',None)):
-        assert kr_time.resolve_krx_trading_day_strict(date(2026,5,26)) == ('OPEN','PYKRX')
+def test_kr_weekday_does_not_call_pykrx():
+    with patch.object(kr_time,'_safe_get_nearest_business_day_in_a_week',side_effect=AssertionError('must not call pykrx')):
+        assert kr_time.resolve_krx_trading_day_strict(date(2026,5,26)) == ('OPEN','KRX_HOLIDAY_CONFIG_FALLBACK')
 
 
-def test_strict_krx_missing_config_and_external_failure_is_unknown():
-    with patch.object(kr_time,'_get_krx_holidays_config_path',side_effect=FileNotFoundError), patch.object(kr_time,'_safe_get_nearest_business_day_in_a_week',return_value=(None,'ImportError')):
-        assert kr_time.resolve_krx_trading_day_strict(date(2026,8,17)) == ('UNKNOWN','KRX_CALENDAR_UNAVAILABLE')
+def test_strict_krx_missing_config_fails_open():
+    with patch.object(kr_time,'_get_krx_holidays_config_path',side_effect=FileNotFoundError):
+        assert kr_time.resolve_krx_trading_day_strict(date(2026,8,17)) == ('OPEN','KRX_CALENDAR_UNAVAILABLE_FAIL_OPEN')
 
 
-def test_strict_krx_unsupported_year_and_external_failure_is_unknown():
-    with patch.object(kr_time,'_safe_get_nearest_business_day_in_a_week',return_value=(None,'ConnectionError')):
-        assert kr_time.resolve_krx_trading_day_strict(date(2028,1,17)) == ('UNKNOWN','UNSUPPORTED_CALENDAR_YEAR')
+def test_strict_krx_unsupported_year_fails_open():
+    assert kr_time.resolve_krx_trading_day_strict(date(2028,1,17)) == ('OPEN','UNSUPPORTED_CALENDAR_YEAR_FAIL_OPEN')
+
+
+def test_kr_checker_never_fails_when_external_calendar_is_disabled():
+    result=checker('kr','2026-07-29',env={'NULLIM_DISABLE_PYKRX_FOR_TEST':'1'})
+    assert result.returncode == 0
+    assert json.loads(result.stdout)['status'] == 'TRADING_DAY'
 
 
 def test_us_calendar_open_closed_early_and_unsupported():

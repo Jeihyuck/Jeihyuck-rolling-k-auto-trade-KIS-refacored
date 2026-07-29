@@ -17,6 +17,10 @@ set +e
 TRADING_DAY_JSON="$("$CALENDAR_PYTHON" scripts/wsl/check-nullim-trading-day.py --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
 TRADING_DAY_RC=$?; set -e
 printf '%s\n' "$TRADING_DAY_JSON"
+if [[ "$MARKET" == kr && "$TRADING_DAY_RC" != 0 ]]; then
+ echo "[HEALTH][WARN] reason=KR_CALENDAR_ADVISORY rc=$TRADING_DAY_RC action=continue"
+ TRADING_DAY_RC=0
+fi
 if [[ "$TRADING_DAY_RC" == 10 ]]; then
  "$CALENDAR_PYTHON" - "$MARKET" "$DAY" "$TRADE_DATE" "$POLICY_STATUS" "$FORBIDDEN" <<'PY_CLOSED'
 import json,subprocess,sys

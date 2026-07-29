@@ -124,13 +124,10 @@ Saturday US morning execution is intentional and required to finish, package, an
 Friday US trading session. The verifier compares the complete `DaysOfWeek` set and fails if
 Saturday is missing from a US morning task or a forbidden Monday/Sunday is present.
 
-Weekday exchange holidays are guarded independently of scheduler weekdays by
-`check-nullim-trading-day.py`, which delegates to `trader.time_utils.resolve_krx_trading_day_strict` for KR and
-`trader.us.market_calendar.is_us_trading_day` for US. Session wrappers record an attempt with
-`SKIPPED_NON_TRADING_DAY`/`MARKET_CLOSED` and exit zero before deploy preflight, watchlist work,
-reconciliation, or an order-capable runner. Closed-day mail is not sent by default; its production
-marker records `mail_sent=false`, `mail_required=false`, and `ok=true`. Final health similarly
-returns a successful `SKIPPED_NON_TRADING_DAY` result without requiring ticks or mail.
+`check-nullim-trading-day.py` reports exchange holidays independently of scheduler weekdays. For
+KR this result is advisory: Windows Task Scheduler owns execution timing, session wrappers continue
+to record the actual KIS/data/order outcome, and log mail packages the available logs even on a
+configured holiday. US wrappers retain the closed-day skip policy.
 
 Mail takes an exclusive `runtime/locks/<market>-mail-snapshot.lock` through staging and tar
 creation. Session wrappers hold a shared lock for their lifetime, preventing a new session or
@@ -141,15 +138,16 @@ After deploying this change, rerun the administrator installer and verifier beca
 does not replace existing Daily triggers. Confirm KR and US-evening `Monday–Friday`, US-morning
 `Tuesday–Saturday`, no Sunday trigger, and that the next-run values match the host's KST policy.
 
-### Strict calendar runtime and holiday policy audit
+### Calendar runtime and holiday policy audit
 
 Trading-day gates never invoke the system Python. They resolve
 `<repo>/.venv/bin/python` first, then an explicitly executable `NULLIM_PYTHON_BIN`; absence of both
-is a fail-closed calendar error and no runner starts. KR scheduling uses
-`resolve_krx_trading_day_strict`: a weekend or configured holiday proves closure, a successful
-PyKRX lookup may prove open/closed, and missing/unsupported configuration plus lookup failure is
-`CALENDAR_ERROR`, never a weekday-open heuristic. `config/krx_holidays.json` carries repository-
-validated dates for 2025–2027; unlisted weekdays still require external confirmation.
+is a fail-closed runtime setup error. KR production scheduling does not depend on PyKRX or live KRX
+calendar availability. Calendar checks are advisory only, and
+`config/krx_holidays.json` is used for reporting without blocking KR sessions or mail. Missing or
+unsupported KR configuration fails open for scheduled weekdays. The emergency command
+`NULLIM_TRADING_DAY_OVERRIDE=open bash scripts/wsl/send-kr-log-mail.sh` remains available for older
+deployments, but is not required by this policy.
 
 The US calendar exposes its supported years and YAML load status. Unsupported weekday years or a
 missing/unreadable YAML dependency are `CALENDAR_ERROR`. Early-close dates remain trading days and
@@ -157,8 +155,9 @@ the checker reports `early_close=true` with `regular_close_et=13:00`.
 
 Holiday health still audits scheduler ownership, installed/current SHA, and forbidden WSL
 cron/systemd sources before accepting the calendar skip. Only tick/session/mail requirements are
-waived. Drift, a missing install marker, wrong owner, forbidden scheduler source, or unknown
-calendar produces `ok=false` and a nonzero task result even on an exchange holiday.
+waived. Drift, a missing install marker, wrong owner, forbidden scheduler source, or
+US calendar errors produce `ok=false` and a nonzero task result. KR calendar availability is not a
+health failure; KR health is determined from session logs, mail evidence, and scheduler policy.
 
 Windows verification normalizes `DaysOfWeek` to masks (62 for Mon–Fri, 124 for Tue–Sat), avoiding
 localized/string rendering assumptions. CI creates real `New-ScheduledTaskTrigger` objects on

@@ -13,12 +13,16 @@ WARN="${OUT%.tar.gz}.warn"; STAGE="$(mktemp -d "/tmp/nullim-${MARKET}-mail.XXXXX
 PROD_MARKER="runtime/health/${MARKET}-mail-${KST_RUN_DATE}.json"; DRY_MARKER="runtime/health/${MARKET}-mail-dry-run-${KST_RUN_DATE}.json"
 READINESS="runtime/health/${MARKET}-mail-readiness-${KST_RUN_DATE}.json"; mkdir -p runtime/health
 cleanup(){ rm -rf "$STAGE" "$WARN"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 || "${NULLIM_KEEP_MAIL_ARCHIVE:-0}" == 1 ]] || rm -f "$OUT"; }; trap cleanup EXIT
-# Closed weekdays are successful no-mail operations and do not require session evidence.
+# KR calendar results are advisory: package the day's logs even when closed or unavailable.
 set +e
 TRADING_DAY_JSON="$("$CALENDAR_PYTHON" "$APP/scripts/wsl/check-nullim-trading-day.py" --market "$MARKET" --date "$TRADE_DATE" 2>&1)"
 TRADING_DAY_RC=$?; set -e
 printf '%s\n' "$TRADING_DAY_JSON"
 if [[ "$TRADING_DAY_RC" == 10 ]]; then
+ if [[ "$MARKET" == kr ]]; then
+  echo "[LOG_MAIL][WARN] reason=MARKET_CLOSED_BUT_PACKAGE_LOGS market=$MARKET trade_date=$TRADE_DATE"
+  TRADING_DAY_RC=0
+ else
  python3 - "$PROD_MARKER" "$MARKET" "$TRADE_DATE" "$KST_RUN_DATE" <<'PY_CLOSED'
 import json,sys
 from datetime import datetime,timezone
@@ -26,8 +30,14 @@ from pathlib import Path
 p,m,d,k=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'SKIPPED_NON_TRADING_DAY','mail_sent':False,'mail_required':False,'market':m,'trade_date':d,'run_date_kst':k,'reason':'MARKET_HOLIDAY','ok':True,'created_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
 PY_CLOSED
  echo "[LOG_MAIL][SKIP] reason=SKIPPED_NON_TRADING_DAY market=$MARKET trade_date=$TRADE_DATE"; exit 0
+ fi
 elif [[ "$TRADING_DAY_RC" != 0 ]]; then
- echo "[LOG_MAIL][FAIL] reason=CALENDAR_ERROR market=$MARKET trade_date=$TRADE_DATE" >&2; exit 1
+ if [[ "$MARKET" == kr ]]; then
+  echo "[LOG_MAIL][WARN] reason=CALENDAR_ERROR_FAIL_OPEN market=$MARKET trade_date=$TRADE_DATE"
+  TRADING_DAY_RC=0
+ else
+  echo "[LOG_MAIL][FAIL] reason=CALENDAR_ERROR market=$MARKET trade_date=$TRADE_DATE" >&2; exit 1
+ fi
 fi
 # Exclusive snapshot lock remains held through staging and tar creation. Sessions take it shared.
 mkdir -p runtime/locks; exec {SNAPSHOT_FD}>"runtime/locks/${MARKET}-mail-snapshot.lock"; flock -x "$SNAPSHOT_FD"
