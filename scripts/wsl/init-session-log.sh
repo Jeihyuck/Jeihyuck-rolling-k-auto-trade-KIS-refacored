@@ -82,7 +82,13 @@ nullim_require_trading_day() {
   output="$("$python_bin" "$root/scripts/wsl/check-nullim-trading-day.py" --market "${market,,}" --date "$trade_date" 2>&1)"
   rc=$?
   printf '%s\n' "$output"
-  if [[ "$rc" == 10 ]]; then
+  if [[ "${market,,}" == kr && "$rc" != 0 ]]; then
+    if [[ "$rc" == 10 ]]; then
+      echo "[NULLIM_RUN][CALENDAR_ADVISORY] reason=MARKET_CLOSED market=${market^^} trade_date=$trade_date action=continue"
+    else
+      echo "[NULLIM_RUN][CALENDAR_ADVISORY] reason=CALENDAR_ERROR market=${market^^} trade_date=$trade_date rc=$rc action=continue"
+    fi
+  elif [[ "$rc" == 10 ]]; then
     export NULLIM_SESSION_FINAL_STATUS=SKIPPED_NON_TRADING_DAY NULLIM_SESSION_FINAL_REASON=MARKET_CLOSED
     echo "[NULLIM_RUN][SKIP] reason=SKIPPED_NON_TRADING_DAY market=${market^^} trade_date=$trade_date"
   fi

@@ -40,7 +40,9 @@ def main() -> int:
             from trader.time_utils import resolve_krx_trading_day_strict
             state, source = resolve_krx_trading_day_strict(day)
             if state == "UNKNOWN":
-                return emit("kr", day, is_open=None, status="CALENDAR_ERROR", reason=source)
+                return emit("kr", day, is_open=True, status="TRADING_DAY",
+                            reason="MARKET_OPEN_FAIL_OPEN",
+                            calendar_source=source or "KRX_CALENDAR_UNAVAILABLE_FAIL_OPEN")
             return emit("kr", day, is_open=state == "OPEN",
                         status="TRADING_DAY" if state == "OPEN" else "SKIPPED_NON_TRADING_DAY",
                         reason="MARKET_OPEN" if state == "OPEN" else "MARKET_HOLIDAY", calendar_source=source)
@@ -62,9 +64,14 @@ def main() -> int:
                     calendar_source="US_CONFIG", early_close=early,
                     regular_close_et=regular_close_time_for_date(day).strftime("%H:%M"))
     except Exception as exc:
-        reason = "KRX_CALENDAR_UNAVAILABLE" if args.market == "kr" else "US_CALENDAR_UNAVAILABLE"
-        return emit(args.market, date.fromisoformat(args.trade_date), is_open=None,
-                    status="CALENDAR_ERROR", reason=reason, detail=f"{type(exc).__name__}: {exc}")
+        if args.market == "kr":
+            return emit("kr", date.fromisoformat(args.trade_date), is_open=True,
+                        status="TRADING_DAY", reason="MARKET_OPEN_FAIL_OPEN",
+                        calendar_source="KRX_CALENDAR_UNAVAILABLE_FAIL_OPEN",
+                        detail=f"{type(exc).__name__}: {exc}")
+        return emit("us", date.fromisoformat(args.trade_date), is_open=None,
+                    status="CALENDAR_ERROR", reason="US_CALENDAR_UNAVAILABLE",
+                    detail=f"{type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

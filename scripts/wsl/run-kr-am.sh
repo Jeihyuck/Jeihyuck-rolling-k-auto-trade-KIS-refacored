@@ -3,12 +3,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 source "$SCRIPT_DIR/init-session-log.sh"
 nullim_init_session_log KR am "am" "${BASH_SOURCE[0]}"
+# The KR calendar is advisory only; Windows Task Scheduler owns execution timing.
 set +e
 nullim_require_trading_day kr "$NULLIM_TRADE_DATE"
 trading_day_rc=$?
 set -e
-[[ "$trading_day_rc" == 10 ]] && exit 0
-[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"
+if [[ "$trading_day_rc" != 0 ]]; then
+  echo "[KR_SESSION][CALENDAR_WARN] rc=$trading_day_rc action=continue"
+fi
+unset NULLIM_SESSION_FINAL_STATUS NULLIM_SESSION_FINAL_REASON
 source "$SCRIPT_DIR/nullim-repo-root.sh"
 nullim_resolve_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"

@@ -76,7 +76,7 @@ def _closed_repo(tmp_path, market):
 
 
 def test_closed_day_mail_skips_before_missing_evidence_and_never_builds_all(tmp_path):
-    for market in ('kr','us'):
+    for market in ('us',):
         root=_closed_repo(tmp_path,market); date='2026-12-25'; archive=root/f'nullim-{market}-logs.tar.gz'
         env={**os.environ,'NULLIM_TRADING_DAY_OVERRIDE':'closed','NULLIM_KST_RUN_DATE':date,'US_TRADE_DATE':date,'NULLIM_LOG_MAIL_OUT':str(archive),'NULLIM_PYTHON_BIN':os.sys.executable}
         result=subprocess.run(['bash',str(root/f'scripts/wsl/send-{market}-log-mail.sh')],cwd=root,env=env,text=True,capture_output=True)
@@ -102,21 +102,21 @@ echo '[SCHEDULER_POLICY][WSL][OK] forbidden_sources=0'
 
 
 def test_closed_day_health_still_enforces_policy_and_sha(tmp_path):
-    root=_closed_repo(tmp_path,'kr'); date='2026-08-17'; sha=_prepare_closed_health(root)
+    root=_closed_repo(tmp_path,'us'); date='2026-08-17'; sha=_prepare_closed_health(root)
     env={**os.environ,'NULLIM_TRADING_DAY_OVERRIDE':'closed','NULLIM_PYTHON_BIN':os.sys.executable}
     script=root/'scripts/wsl/check-nullim-day-health.sh'
-    result=subprocess.run(['bash',str(script),'kr',date],cwd=root,env=env,text=True,capture_output=True)
+    result=subprocess.run(['bash',str(script),'us',date],cwd=root,env=env,text=True,capture_output=True)
     assert result.returncode == 0
-    data=json.loads((root/f'runtime/health/kr-{date}.json').read_text())
+    data=json.loads((root/f'runtime/health/us-{date}.json').read_text())
     assert data['status']=='SKIPPED_NON_TRADING_DAY' and data['ok'] is True and data['scheduler_sha_matches'] is True
     marker=root/'runtime/health/windows-scheduler-install.json'
     marker.write_text(json.dumps({'status':'OK','scheduler_owner':'WINDOWS_TASK_SCHEDULER','installed_commit_sha':'drift'}))
-    drift=subprocess.run(['bash',str(script),'kr',date],cwd=root,env=env,text=True,capture_output=True)
-    drift_data=json.loads((root/f'runtime/health/kr-{date}.json').read_text())
+    drift=subprocess.run(['bash',str(script),'us',date],cwd=root,env=env,text=True,capture_output=True)
+    drift_data=json.loads((root/f'runtime/health/us-{date}.json').read_text())
     assert drift.returncode == 1 and drift_data['failure_reason']=='FAILED_SCHEDULER_DRIFT'
     marker.write_text(json.dumps({'status':'OK','scheduler_owner':'WINDOWS_TASK_SCHEDULER','installed_commit_sha':sha}))
-    forbidden=subprocess.run(['bash',str(script),'kr',date],cwd=root,env={**env,'FORBIDDEN_TEST':'1'},text=True,capture_output=True)
-    forbidden_data=json.loads((root/f'runtime/health/kr-{date}.json').read_text())
+    forbidden=subprocess.run(['bash',str(script),'us',date],cwd=root,env={**env,'FORBIDDEN_TEST':'1'},text=True,capture_output=True)
+    forbidden_data=json.loads((root/f'runtime/health/us-{date}.json').read_text())
     assert forbidden.returncode == 1 and forbidden_data['failure_reason']=='SCHEDULER_POLICY_VIOLATION'
 
 
@@ -131,7 +131,7 @@ def test_wrappers_gate_before_runner_and_snapshot_lock_contract():
 
 
 def test_closed_session_wrapper_records_attempt_without_reaching_preflight(tmp_path):
-    for market,name,purpose in (("kr","run-kr-am.sh","am"),("us","run-us-am.sh","am")):
+    for market,name,purpose in (("us","run-us-am.sh","am"),):
         root=tmp_path/f"wrapper-{market}"; scripts=root/"scripts/wsl"; scripts.mkdir(parents=True)
         for source in (name,"init-session-log.sh","check-nullim-trading-day.py","resolve-nullim-python.sh"):
             shutil.copy2(ROOT/"scripts/wsl"/source,scripts/source)
@@ -144,3 +144,22 @@ def test_closed_session_wrapper_records_attempt_without_reaching_preflight(tmp_p
         log=(root/attempt["log_file"]).read_text()
         assert "[NULLIM_RUN][SKIP] reason=SKIPPED_NON_TRADING_DAY" in log
         assert "deploy-preflight" not in log
+
+
+def test_kr_wrappers_treat_calendar_as_advisory():
+    for name in ('run-kr-prep.sh','run-kr-am.sh','run-kr-afternoon.sh','run-kr-close.sh'):
+        text=(ROOT/'scripts/wsl'/name).read_text()
+        assert '[KR_SESSION][CALENDAR_WARN]' in text
+        assert '[[ "$trading_day_rc" == 10 ]] && exit 0' not in text
+        assert '[[ "$trading_day_rc" == 0 ]] || exit "$trading_day_rc"' not in text
+
+
+def test_common_calendar_helper_never_marks_kr_session_skipped():
+    text=(ROOT/'scripts/wsl/init-session-log.sh').read_text()
+    kr_branch=text[text.index('if [[ "${market,,}" == kr'):text.index('elif [[ "$rc" == 10 ]]')]
+    us_branch=text[text.index('elif [[ "$rc" == 10 ]]'):]
+    assert '[NULLIM_RUN][CALENDAR_ADVISORY]' in kr_branch
+    assert '[NULLIM_RUN][SKIP]' not in kr_branch
+    assert 'NULLIM_SESSION_FINAL_STATUS' not in kr_branch
+    assert '[NULLIM_RUN][SKIP]' in us_branch
+    assert 'NULLIM_SESSION_FINAL_STATUS=SKIPPED_NON_TRADING_DAY' in us_branch

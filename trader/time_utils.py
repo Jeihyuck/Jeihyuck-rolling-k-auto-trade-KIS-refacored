@@ -108,12 +108,13 @@ def _reload_krx_holidays() -> set[date]:
 
 
 def resolve_krx_trading_day_strict(d: date | str) -> tuple[str, str]:
-    """Resolve KRX day for automatic scheduling without weekday fail-open.
+    """Resolve a KRX day without making a live calendar a runtime dependency.
 
-    Returns ``("OPEN", source)``, ``("CLOSED", source)``, or
-    ``("UNKNOWN", reason)``.  The holiday file can prove closure; only a
-    successful external KRX calendar lookup can prove that an unlisted weekday
-    is open.
+    Weekends and configured holidays are reported closed.  Every other weekday
+    is open for scheduling purposes, including when the configuration is
+    unavailable or does not cover the requested year.  PyKRX is deliberately
+    not called here: KR production calendar information is advisory and must
+    never prevent a scheduled session or log-mail run.
     """
     if isinstance(d, str):
         d = date.fromisoformat(d)
@@ -123,23 +124,25 @@ def resolve_krx_trading_day_strict(d: date | str) -> tuple[str, str]:
         path = _get_krx_holidays_config_path()
         raw = json.loads(path.read_text(encoding="utf-8"))
         year_dates = raw.get(str(d.year))
-        if not isinstance(year_dates, list):
-            config_error = "UNSUPPORTED_CALENDAR_YEAR"
-        else:
+        if isinstance(year_dates, list):
             holidays = {date.fromisoformat(str(value)) for value in year_dates}
             if d in holidays:
                 return "CLOSED", "KRX_HOLIDAY_CONFIG"
-            config_error = ""
-    except Exception:
-        config_error = "KRX_CALENDAR_UNAVAILABLE"
-    resolved, error = _safe_get_nearest_business_day_in_a_week(d.strftime("%Y%m%d"), prev=True)
-    if error is None and resolved:
-        try:
-            confirmed = date.fromisoformat(f"{resolved[:4]}-{resolved[4:6]}-{resolved[6:8]}")
-            return ("OPEN", "PYKRX") if confirmed == d else ("CLOSED", "PYKRX")
-        except (ValueError, IndexError):
-            pass
-    return "UNKNOWN", config_error or "KRX_CALENDAR_UNAVAILABLE"
+            return "OPEN", "KRX_HOLIDAY_CONFIG_FALLBACK"
+        logger.warning(
+            "[TIME][KRX][CALENDAR_FAIL_OPEN] date=%s "
+            "reason=UNSUPPORTED_CALENDAR_YEAR action=OPEN",
+            d.isoformat(),
+        )
+        return "OPEN", "UNSUPPORTED_CALENDAR_YEAR_FAIL_OPEN"
+    except Exception as exc:
+        logger.warning(
+            "[TIME][KRX][CALENDAR_FAIL_OPEN] date=%s "
+            "reason=KRX_CALENDAR_UNAVAILABLE action=OPEN err=%s",
+            d.isoformat(),
+            exc,
+        )
+        return "OPEN", "KRX_CALENDAR_UNAVAILABLE_FAIL_OPEN"
 
 
 def is_krx_trading_day(d: date | str) -> bool:
