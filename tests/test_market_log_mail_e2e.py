@@ -126,6 +126,15 @@ def test_kr_mail_previous_final30_skips_krx_holiday(tmp_path):
     previous=root/f"bot_state/trader_ledger/final30/practice/{previous_session}"
     previous.mkdir(parents=True)
     (previous/"final30_scored.json").write_text('{"as_of":"2026-05-22","rows":[]}',encoding="utf-8")
+    time_utils=root/"trader/time_utils.py"
+    time_utils.write_text(
+        time_utils.read_text(encoding="utf-8")
+        + "\n\ndef is_krx_trading_day(*args, **kwargs):\n"
+          "    raise RuntimeError('pykrx-dependent trading-day resolver must not be called')\n"
+          "\n\ndef resolve_prev_krx_trading_day(*args, **kwargs):\n"
+          "    raise RuntimeError('pykrx-dependent previous-session resolver must not be called')\n",
+        encoding="utf-8",
+    )
 
     result,archive=run_mail(root,"kr",trade_date=trade_date)
     assert result.returncode == 0, result.stderr+result.stdout
@@ -191,6 +200,7 @@ def test_smtp_retries_twice_then_succeeds(tmp_path):
     assert (root/"smtp-count").read_text().strip() == "3"
     marker=json.loads((root/f"runtime/health/kr-mail-{DATE}.json").read_text())
     assert marker["attempt_count"] == 3 and marker["status"] == "OK"
+
 
 def test_session_manifest_preserves_attempts_and_effective_status(tmp_path):
     root=tmp_path/"session-repo"; scripts=root/"scripts/wsl"; scripts.mkdir(parents=True)
