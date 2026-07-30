@@ -1642,6 +1642,7 @@ def run_trade_session(
             "skip_zero_snapshot_count": skip_zero_snapshot_count,
             "balance_reconcile_degraded": balance_circuit["balance_reconcile_degraded"],
             "entry_blocked_by_balance_degraded": balance_circuit["entry_blocked_by_balance_degraded"],
+            "balance_consecutive_failed_ticks": balance_circuit["balance_consecutive_failed_ticks"],
             "entry_block_reasons": balance_circuit["entry_block_reasons"],
             "schedule_expected_et": os.getenv("US_SCHEDULE_EXPECTED_ET", ""),
             "actual_start_et": os.getenv("US_ACTUAL_START_ET", ""),
