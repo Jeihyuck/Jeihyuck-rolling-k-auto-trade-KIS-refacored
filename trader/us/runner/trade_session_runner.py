@@ -1296,7 +1296,7 @@ def run_trade_session(
             logger.info("[US_SESSION][LIVENESS_CHECK] expected_min_ticks=%d actual_ticks=%d result=OK reason=%s", expected_min_ticks, tick_count, final_reason)
 
         # KIS TEMP_ERROR recovery warning
-        if temp_recovered_count > 0:
+        if temp_error_count >= 5:
             warn_count += 1
             logger.warning(
                 "[US_SESSION][WARN] KIS TEMP_ERROR recovered temp_error_count=%d temp_recovered_count=%d",

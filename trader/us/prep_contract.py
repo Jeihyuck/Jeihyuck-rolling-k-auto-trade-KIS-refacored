@@ -140,14 +140,17 @@ def build_us_prep_contract(
     )
 
     if final30_scored_count >= normal_min_final30:
+        underfilled_status = "OK"
         underfilled_tier = "normal" if final30_complete else "normal_underfilled"
         final30_trade_ready = True
         underfilled_capital_haircut = 1.0
     elif final30_scored_count >= degraded_min_final30:
+        underfilled_status = "WATCHLIST_UNDERFILLED_DEGRADED"
         underfilled_tier = "degraded_underfilled"
         final30_trade_ready = True
         underfilled_capital_haircut = degraded_haircut
     elif final30_scored_count >= absolute_min_final30:
+        underfilled_status = "WATCHLIST_UNDERFILLED_TRADE_BLOCKED"
         if market_regime in {"RISK_ON", "GROWTH_LEADERSHIP"}:
             underfilled_tier = "severe_underfilled"
             final30_trade_ready = True
@@ -157,6 +160,7 @@ def build_us_prep_contract(
             final30_trade_ready = False
             underfilled_capital_haircut = 0.0
     else:
+        underfilled_status = "WATCHLIST_UNDERFILLED_FATAL"
         underfilled_tier = "blocked_underfilled"
         final30_trade_ready = False
         underfilled_capital_haircut = 0.0
@@ -312,6 +316,7 @@ def build_us_prep_contract(
         "final30_empty": final30_empty,
         "underfilled_final30": underfilled_final30,
         "underfilled_tier": underfilled_tier,
+        "underfilled_status": underfilled_status,
         "underfilled_capital_haircut": underfilled_capital_haircut,
         "effective_capital_scale": effective_capital_scale,
         "effective_max_new_positions": effective_max_new_positions,
@@ -695,6 +700,14 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
         reason = "entry_blocked_by_prep_contract_version_mismatch"
         logger.warning("[US_CONTRACT_VERSION][MISMATCH] prep_sha=%s current_sha=%s action=entry_block_exit_allowed", prep_sha, current_sha)
     ok_payload = {**base_payload, "ok": True, "trade_can_proceed": True, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "session_can_run": True, "reason": reason}
+    reasons = list(contract.get("entry_block_reasons") or [])
+    if trade_block_reason == "risk_off_entry_block" and "risk_off_entry_block" not in reasons: reasons.append("risk_off_entry_block")
+    if reason == "entry_blocked_by_prep_contract_version_mismatch":
+        reasons.append("prep_contract_version_mismatch")
+        ok_payload["contract_block_reason"] = reason
+        ok_payload["version_mismatch"] = True
+    ok_payload["entry_block_reasons"] = list(dict.fromkeys(reasons))
+    ok_payload["primary_entry_block_reason"] = ok_payload["entry_block_reasons"][0] if ok_payload["entry_block_reasons"] else None
     ok_payload["guard_state"] = "PREP_OK" if bool(entry_can_proceed) else "PREP_DEGRADED_ENTRY_BLOCKED"
     if not bool(entry_can_proceed):
         ok_payload["new_buy_budget"] = 0

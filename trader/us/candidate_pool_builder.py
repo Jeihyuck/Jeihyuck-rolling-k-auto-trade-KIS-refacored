@@ -13,6 +13,23 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+QUALITY_ERROR_STATUSES = {"ERROR_CANDIDATE_SCORE_DEGENERATE", "ERROR_ATR_SANITY_FAILED", "ERROR_FALLBACK_ONLY_POOL"}
+
+def evaluate_candidate_pool_quality(all_selected: list[dict], strict_rows: list[dict], relaxed_rows: list[dict], fallback_rows: list[dict], scored_rows: list[dict]) -> dict:
+    selected = len(all_selected)
+    nonzero = sum(_safe_float(r.get("candidate_score")) > 0 for r in all_selected)
+    fallback_ratio = len(fallback_rows) / max(1, selected)
+    atr_bad = sum(_safe_float(r.get("atr_pct")) > 0.25 for r in scored_rows)
+    reason = None
+    # Data degeneration has precedence; it is the most actionable root cause.
+    if nonzero < min(20, selected * .5): reason = "ERROR_CANDIDATE_SCORE_DEGENERATE"
+    elif atr_bad >= 5: reason = "ERROR_ATR_SANITY_FAILED"
+    elif not strict_rows and not relaxed_rows or fallback_ratio >= .80: reason = "ERROR_FALLBACK_ONLY_POOL"
+    return {"ok": reason is None, "score_nonzero_count": nonzero, "strict_count": len(strict_rows),
+            "relaxed_count": len(relaxed_rows), "fallback_count": len(fallback_rows),
+            "fallback_ratio": round(fallback_ratio, 4), "atr_sanity_fail_count": atr_bad,
+            "failure_reason": reason}
+
 
 def _env_int(key: str, default: int) -> int:
     try:
@@ -412,15 +429,17 @@ def build_us_candidate_pool(
     # 점수 기준 정렬 후 pool_max 제한
     all_selected = sorted(all_selected, key=lambda r: -r["candidate_score"])[:pool_max]
     selected_count = len(all_selected)
+    quality_contract = evaluate_candidate_pool_quality(all_selected, strict_rows, relaxed_rows, fallback_rows, scored_rows)
 
     # 상태 판정
     if selected_count < pool_min:
+        # Preserve the legacy generic error for an empty/short pool while the
+        # structured contract still records the more specific root cause.
         status = "ERROR"
-        logger.error(
-            "[US_CANDIDATE_POOL][ERROR] selected=%d < pool_min=%d → hard fail",
-            selected_count,
-            pool_min,
-        )
+        logger.error("[US_CANDIDATE_POOL][ERROR] selected=%d < pool_min=%d → hard fail", selected_count, pool_min)
+    elif not quality_contract["ok"]:
+        status = quality_contract["failure_reason"]
+        logger.error("[US_CANDIDATE_POOL][QUALITY_FAIL] reason=%s selected=%d score_nonzero=%d strict=%d relaxed=%d fallback=%d atr_sanity_fail=%d", status, selected_count, quality_contract["score_nonzero_count"], len(strict_rows), len(relaxed_rows), len(fallback_rows), quality_contract["atr_sanity_fail_count"])
     elif selected_count < pool_target:
         status = "OK_WITH_WARNINGS"
     else:
@@ -446,4 +465,5 @@ def build_us_candidate_pool(
             "fallback": len(fallback_rows),
         },
         "rows": all_selected,
+        "quality_contract": quality_contract,
     }

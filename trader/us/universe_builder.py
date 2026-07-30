@@ -50,7 +50,8 @@ def _load_dynamic_sources() -> dict[str, list[str]]:
         import yaml  # type: ignore
         with open(_DYNAMIC_SOURCES_PATH, "r") as f:
             data = yaml.safe_load(f) or {}
-        return {k: [str(v).upper() for v in vs] for k, vs in data.items() if isinstance(vs, list)}
+        from trader.us.universe import validate_symbol
+        return {k: [validate_symbol(v, path=_DYNAMIC_SOURCES_PATH) for v in vs] for k, vs in data.items() if isinstance(vs, list)}
     except FileNotFoundError:
         logger.warning("[US_UNIVERSE_BUILDER][WARN] dynamic_sources not found: %s", _DYNAMIC_SOURCES_PATH)
         return {}
@@ -83,7 +84,7 @@ def _is_etf(symbol: str) -> bool:
     return symbol in _KNOWN_ETFS
 
 
-def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
+def _compute_atr_pct(daily_rows: list[dict], symbol: str = "UNKNOWN") -> float | None:
     """최근 14일 ATR% 계산 (normalize_daily_rows 정규화 이후 데이터 대응)."""
     if len(daily_rows) < 15:
         return None
@@ -104,11 +105,17 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
                 low = float(low or 0)
             if not isinstance(c, (int, float)):
                 c = float(c or 0)
-            if prev_close <= 0:
+            valid_ohlc = (prev_close > 0 and high > 0 and low > 0 and c > 0
+                          and high >= low and low <= c <= high * 1.20)
+            if not valid_ohlc:
+                logger.debug("[US_ATR][INVALID_OHLC_SKIP] symbol=%s date=%s high=%s low=%s close=%s prev_close=%s", symbol, recent[i].get("xymd") or recent[i].get("date"), high, low, c, prev_close)
                 continue
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            if tr / prev_close > _env_float("US_ATR_SANITY_MAX_BAR_TR_PCT", 0.25):
+                logger.debug("[US_ATR][INVALID_OHLC_SKIP] symbol=%s date=%s high=%s low=%s close=%s prev_close=%s reason=bar_tr_pct", symbol, recent[i].get("xymd") or recent[i].get("date"), high, low, c, prev_close)
+                continue
             trs.append(tr)
-        if not trs:
+        if len(trs) < 10:
             return None
         atr = sum(trs) / len(trs)
         last_close_val = rows[-1].get("close")
@@ -117,7 +124,11 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
         last_close = float(last_close_val or 0)
         if last_close <= 0:
             return None
-        return round(atr / last_close, 4)
+        atr_pct = round(atr / last_close, 4)
+        if atr_pct > _env_float("US_ATR_SANITY_MAX_PCT", 0.20):
+            logger.warning("[US_ATR][SANITY_FAIL] symbol=%s atr_pct=%.4f valid_tr_count=%d reason=atr_pct_above_limit", symbol, atr_pct, len(trs))
+            return None
+        return atr_pct
     except Exception:
         return None
 
@@ -420,7 +431,7 @@ def build_us_dynamic_universe(
 
         avg_vol = _compute_avg_volume(daily, 20)
         avg_dv = _compute_avg_dollar_volume(daily, 20)
-        atr_pct = _compute_atr_pct(daily)
+        atr_pct = _compute_atr_pct(daily, symbol)
 
         strict_ok = (
             price_ok

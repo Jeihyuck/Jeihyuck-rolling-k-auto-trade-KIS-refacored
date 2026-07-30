@@ -7,6 +7,7 @@ symbols.py registry에 등록한다.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,16 @@ logger = logging.getLogger(__name__)
 _LOADED: bool = False
 _UNIVERSE: dict[str, list[str]] = {}
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "us_universe.yaml"
+INVALID_SYMBOL_LITERALS = {"TRUE", "FALSE", "NONE", "NULL", "YES", "NO", "ON", "OFF"}
+_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
+
+def validate_symbol(symbol: Any, *, path: str | Path = _CONFIG_PATH) -> str:
+    if not isinstance(symbol, str):
+        raise ValueError(f"[US_UNIVERSE_CONFIG][INVALID_SYMBOL] value={symbol!r} type={type(symbol).__name__} path={path}")
+    normalized = symbol.strip().upper()
+    if normalized in INVALID_SYMBOL_LITERALS or not _SYMBOL_RE.fullmatch(normalized):
+        raise ValueError(f"[US_UNIVERSE_CONFIG][INVALID_SYMBOL] value={symbol!r} type=str path={path}")
+    return normalized
 
 
 def _load_yaml() -> dict[str, list[str]]:
@@ -22,7 +33,7 @@ def _load_yaml() -> dict[str, list[str]]:
         import yaml  # type: ignore
         with open(_CONFIG_PATH, "r") as f:
             data = yaml.safe_load(f) or {}
-        return {k: [str(v) for v in vs] for k, vs in data.items() if isinstance(vs, list)}
+        return {k: [validate_symbol(v) for v in vs] for k, vs in data.items() if isinstance(vs, list)}
     except FileNotFoundError:
         logger.warning("[US_UNIVERSE][WARN] config not found: %s", _CONFIG_PATH)
         return {}

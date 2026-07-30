@@ -20,7 +20,6 @@ ai_semiconductor_extended:
   - KLAC
   - MRVL
   - MCHP
-  - ON
   - QCOM
   - INTC
   - TXN
@@ -110,3 +109,144 @@ growth_liquidity_watch:
   - HOOD
   - COIN
   - MSTR
+
+financial:
+  - JPM
+  - BAC
+  - WFC
+  - C
+  - GS
+  - MS
+  - BLK
+  - SCHW
+  - AXP
+  - V
+  - MA
+  - COF
+  - PNC
+  - USB
+  - TFC
+  - BX
+  - KKR
+  - ICE
+  - CME
+  - SPGI
+  - MCO
+  - AJG
+  - MMC
+  - AON
+  - CB
+healthcare:
+  - LLY
+  - UNH
+  - JNJ
+  - MRK
+  - ABBV
+  - PFE
+  - TMO
+  - DHR
+  - ABT
+  - MDT
+  - ISRG
+  - AMGN
+  - GILD
+  - REGN
+  - BMY
+  - CVS
+  - CI
+  - ELV
+  - ZTS
+  - SYK
+  - BSX
+  - EW
+  - HUM
+  - HCA
+  - MCK
+consumer_staples:
+  - COST
+  - WMT
+  - PG
+  - KO
+  - PEP
+  - MDLZ
+  - CL
+  - KMB
+  - GIS
+  - KHC
+  - KR
+  - HSY
+  - SYY
+  - ADM
+  - TAP
+industrial:
+  - CAT
+  - DE
+  - HON
+  - GE
+  - MMM
+  - RTX
+  - LMT
+  - UPS
+  - FDX
+  - ETN
+  - EMR
+  - PH
+  - ITW
+  - CARR
+  - JCI
+  - NOC
+  - GD
+  - WM
+  - RSG
+  - CSX
+  - UNP
+  - NSC
+  - PCAR
+  - FAST
+  - URI
+energy_materials:
+  - XOM
+  - CVX
+  - COP
+  - SLB
+  - EOG
+  - MPC
+  - PSX
+  - OXY
+  - FCX
+  - NEM
+  - APD
+  - LIN
+  - SHW
+  - NUE
+  - DOW
+defensive_utility:
+  - NEE
+  - SO
+  - DUK
+  - AEP
+  - EXC
+  - SRE
+  - D
+  - XEL
+  - PEG
+  - ED
+  - WEC
+  - DTE
+etf_index_sector:
+  - SPY
+  - QQQ
+  - QQQM
+  - DIA
+  - IWM
+  - RSP
+  - XLK
+  - XLI
+  - XLF
+  - XLV
+  - XLP
+  - XLU
+  - XLE
+  - SMH
+  - SOXX
+  - VTI

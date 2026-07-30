@@ -72,10 +72,8 @@ p,m,k,d,purposes,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'RE
 PY
 required+=("$READINESS")
 for item in "${required[@]}"; do mkdir -p "$STAGE/$(dirname "$item")"; cp -a "$item" "$STAGE/$item" || fail STAGING_COPY_FAILED; done
-find "$STAGE" -type f -print0 | xargs -0 -r sed -E -i \
- -e 's/((APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD)[=:][[:space:]]*)[^[:space:]",]+/\1[REDACTED]/Ig' \
- -e 's/(Authorization:[[:space:]]*Bearer)[[:space:]]+[^[:space:]]+/\1 [REDACTED]/Ig' -e 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/[REDACTED_EMAIL]/g' \
- -e 's/([0-9]{4})[- ]?[0-9]{4}[- ]?([0-9]{2,6})/\1-****-\2/g'
+python3 "$APP/scripts/wsl/redact-log-archive.py" "$STAGE" || fail REDACTION_FAILED
+python3 "$APP/scripts/wsl/validate-json-files.py" "$STAGE" || fail INVALID_JSON_AFTER_REDACTION
 COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"; RECIPIENT="${MAIL_TO:-${NAVER_MAIL_TO:-${REPORT_MAIL_TO:-dry-run}}}"
 SOURCE_SHA="$(python3 - "$STAGE" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$COMMIT" "$READINESS" <<'PY'
 import hashlib,sys
@@ -101,6 +99,7 @@ stage,market,kst,trade,branch,commit,attempt,source,*required=sys.argv[1:]
 data={'market':market,'run_date_kst':kst,'trade_date_et':trade,'branch':branch,'commit_sha':commit,'scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_task':os.getenv('NULLIM_SCHEDULER_TASK_NAME','manual'),'archive_created_at':datetime.now(timezone.utc).isoformat(),'required_files':required,'included_required_files':required,'missing_required_files':[],'required_missing_count':0,'optional_files':[],'source_evidence_sha256':source,'redaction_applied':True,'session_active_at_packaging':False,'mail_attempt_id':attempt}
 Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n'); Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.txt').write_text('\n'.join(f'{k}={v}' for k,v in data.items())+'\n')
 PY
+python3 "$APP/scripts/wsl/validate-json-files.py" "$STAGE" || fail INVALID_JSON_BEFORE_TAR
 if ! tar -C "$STAGE" -czf "$OUT" . 2>"$WARN"; then fail TAR_FAILED; fi
 [[ ! -s "$WARN" ]] || fail TAR_WARNING; tar -tzf "$OUT" >/dev/null || fail TAR_VERIFY_FAILED; tar -tzf "$OUT"|grep -q 'NULLIM_LOG_ARCHIVE_MANIFEST.json' || fail ARCHIVE_MANIFEST_MISSING
 SIZE="$(stat -c%s "$OUT")"; MAX=$(( ${NULLIM_MAIL_MAX_ATTACHMENT_MB:-15} * 1024 * 1024 )); (( SIZE <= MAX )) || fail ARCHIVE_TOO_LARGE

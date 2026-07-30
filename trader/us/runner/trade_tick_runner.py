@@ -28,6 +28,24 @@ logger = logging.getLogger(__name__)
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
 
+def evaluate_balance_error_circuit(temp_error_count: int, recovered_count: int = 0,
+                                   skip_zero_snapshot_count: int = 0,
+                                   consecutive_failed_ticks: int = 0,
+                                   entry_block_reasons: list[str] | None = None) -> dict[str, Any]:
+    """Return the session-level KIS balance health and split permissions."""
+    warning = temp_error_count >= 5
+    degraded = temp_error_count >= 10
+    blocked = temp_error_count >= 20 or consecutive_failed_ticks >= 3
+    reasons = list(entry_block_reasons or [])
+    if degraded and "balance_reconcile_degraded" not in reasons: reasons.append("balance_reconcile_degraded")
+    return {"kis_balance_temp_error_count": temp_error_count,
+            "kis_balance_temp_recovered_count": recovered_count,
+            "skip_zero_snapshot_count": skip_zero_snapshot_count,
+            "balance_warning": warning, "balance_reconcile_degraded": degraded,
+            "entry_blocked_by_balance_degraded": blocked,
+            "entry_can_proceed": not blocked, "exit_can_proceed": True,
+            "entry_block_reasons": reasons}
+
 
 _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS = (
     "edbhandlerexited",
