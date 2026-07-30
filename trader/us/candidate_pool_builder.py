@@ -19,7 +19,12 @@ def evaluate_candidate_pool_quality(all_selected: list[dict], strict_rows: list[
     selected = len(all_selected)
     nonzero = sum(_safe_float(r.get("candidate_score")) > 0 for r in all_selected)
     fallback_ratio = len(fallback_rows) / max(1, selected)
-    atr_bad = sum(_safe_float(r.get("atr_pct")) > 0.25 for r in scored_rows)
+    atr_bad = sum(
+        bool(r.get("atr_sanity_failed"))
+        or str(r.get("atr_status") or "") == "ERROR_ATR_SANITY_FAILED"
+        or _safe_float(r.get("atr_pct")) > 0.25
+        for r in scored_rows
+    )
     reason = None
     # Data degeneration has precedence; it is the most actionable root cause.
     if nonzero < min(20, selected * .5): reason = "ERROR_CANDIDATE_SCORE_DEGENERATE"

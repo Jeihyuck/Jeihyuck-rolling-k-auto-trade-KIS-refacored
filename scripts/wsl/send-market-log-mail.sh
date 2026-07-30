@@ -72,8 +72,38 @@ p,m,k,d,purposes,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'RE
 PY
 required+=("$READINESS")
 for item in "${required[@]}"; do mkdir -p "$STAGE/$(dirname "$item")"; cp -a "$item" "$STAGE/$item" || fail STAGING_COPY_FAILED; done
-python3 "$APP/scripts/wsl/redact-log-archive.py" "$STAGE" || fail REDACTION_FAILED
-python3 "$APP/scripts/wsl/validate-json-files.py" "$STAGE" || fail INVALID_JSON_AFTER_REDACTION
+if [[ -f "$APP/scripts/wsl/redact-log-archive.py" ]]; then
+ python3 "$APP/scripts/wsl/redact-log-archive.py" "$STAGE" || fail REDACTION_FAILED
+else
+ # Self-contained fallback keeps deployed/minimal scheduler fixtures safe when
+ # this shell wrapper is copied before its helper files.
+ python3 - "$STAGE" <<'PY_REDACT' || fail REDACTION_FAILED
+import json,re,sys
+from pathlib import Path
+root=Path(sys.argv[1]); keys={x.lower() for x in 'CANO ACNT_PRDT_CD APP_KEY APP_SECRET KIS_APP_KEY KIS_APP_SECRET ACCESS_TOKEN SMTP_PASS DATABASE_URL DB_URL authorization token password account recipient message_id'.split()}
+email=re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+secret=re.compile(r'(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,\"]+')
+account=re.compile(r'(?<![\d.])(\d{4})[- ]?\d{4}[- ]?(\d{2,6})(?![\d.])')
+def clean(v):
+ if isinstance(v,dict): return {k:'[REDACTED]' if str(k).lower() in keys else clean(x) for k,x in v.items()}
+ if isinstance(v,list): return [clean(x) for x in v]
+ return v
+for p in root.rglob('*'):
+ if not p.is_file(): continue
+ if p.suffix.lower()=='.json': p.write_text(json.dumps(clean(json.loads(p.read_text())),ensure_ascii=False,indent=2)+'\n')
+ elif p.suffix.lower() in {'.log','.txt','.md'}:
+  s=p.read_text(errors='replace'); p.write_text(account.sub(r'\1-****-\2',email.sub('[REDACTED_EMAIL]',secret.sub(r'\1[REDACTED]',s))))
+PY_REDACT
+fi
+if [[ -f "$APP/scripts/wsl/validate-json-files.py" ]]; then
+ python3 "$APP/scripts/wsl/validate-json-files.py" "$STAGE" || fail INVALID_JSON_AFTER_REDACTION
+else
+ python3 - "$STAGE" <<'PY_JSON' || fail INVALID_JSON_AFTER_REDACTION
+import json,sys
+from pathlib import Path
+for p in Path(sys.argv[1]).rglob('*.json'): json.load(p.open())
+PY_JSON
+fi
 COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"; RECIPIENT="${MAIL_TO:-${NAVER_MAIL_TO:-${REPORT_MAIL_TO:-dry-run}}}"
 SOURCE_SHA="$(python3 - "$STAGE" "$MARKET" "$TRADE_DATE" "$RECIPIENT" "$COMMIT" "$READINESS" <<'PY'
 import hashlib,sys
@@ -99,7 +129,12 @@ stage,market,kst,trade,branch,commit,attempt,source,*required=sys.argv[1:]
 data={'market':market,'run_date_kst':kst,'trade_date_et':trade,'branch':branch,'commit_sha':commit,'scheduler_owner':'WINDOWS_TASK_SCHEDULER','scheduler_task':os.getenv('NULLIM_SCHEDULER_TASK_NAME','manual'),'archive_created_at':datetime.now(timezone.utc).isoformat(),'required_files':required,'included_required_files':required,'missing_required_files':[],'required_missing_count':0,'optional_files':[],'source_evidence_sha256':source,'redaction_applied':True,'session_active_at_packaging':False,'mail_attempt_id':attempt}
 Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n'); Path(stage,'NULLIM_LOG_ARCHIVE_MANIFEST.txt').write_text('\n'.join(f'{k}={v}' for k,v in data.items())+'\n')
 PY
-python3 "$APP/scripts/wsl/validate-json-files.py" "$STAGE" || fail INVALID_JSON_BEFORE_TAR
+if [[ -f "$APP/scripts/wsl/validate-json-files.py" ]]; then python3 "$APP/scripts/wsl/validate-json-files.py" "$STAGE"; else python3 - "$STAGE" <<'PY_JSON'
+import json,sys
+from pathlib import Path
+for p in Path(sys.argv[1]).rglob('*.json'): json.load(p.open())
+PY_JSON
+fi || fail INVALID_JSON_BEFORE_TAR
 if ! tar -C "$STAGE" -czf "$OUT" . 2>"$WARN"; then fail TAR_FAILED; fi
 [[ ! -s "$WARN" ]] || fail TAR_WARNING; tar -tzf "$OUT" >/dev/null || fail TAR_VERIFY_FAILED; tar -tzf "$OUT"|grep -q 'NULLIM_LOG_ARCHIVE_MANIFEST.json' || fail ARCHIVE_MANIFEST_MISSING
 SIZE="$(stat -c%s "$OUT")"; MAX=$(( ${NULLIM_MAIL_MAX_ATTACHMENT_MB:-15} * 1024 * 1024 )); (( SIZE <= MAX )) || fail ARCHIVE_TOO_LARGE

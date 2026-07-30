@@ -37,7 +37,8 @@ def evaluate_balance_error_circuit(temp_error_count: int, recovered_count: int =
     degraded = temp_error_count >= 10
     blocked = temp_error_count >= 20 or consecutive_failed_ticks >= 3
     reasons = list(entry_block_reasons or [])
-    if degraded and "balance_reconcile_degraded" not in reasons: reasons.append("balance_reconcile_degraded")
+    if (degraded or blocked) and "balance_reconcile_degraded" not in reasons:
+        reasons.append("balance_reconcile_degraded")
     return {"kis_balance_temp_error_count": temp_error_count,
             "kis_balance_temp_recovered_count": recovered_count,
             "skip_zero_snapshot_count": skip_zero_snapshot_count,
@@ -812,6 +813,8 @@ def run_trade_tick(
     tick_cancellation_event=None,
     active_session_state_path: str | None = None,
     blocked_symbol_sides: list[list[str]] | None = None,
+    session_balance_temp_error_count: int = 0,
+    balance_consecutive_failed_ticks: int = 0,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -852,6 +855,8 @@ def run_trade_tick(
     fills_temp_error = False
     temp_error_count = 0
     temp_recovered_count = 0
+    balance_fetch_failed = False
+    skip_zero_snapshot_count = 0
     kis_temp_errors_by_api: dict[str, dict] = {}
     ack_recon: dict[str, Any] = {"status": "SKIP", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
     ack_recon_before_route: dict[str, Any] = dict(ack_recon)
@@ -1162,6 +1167,21 @@ def run_trade_tick(
         except Exception:
             pass
 
+    # Apply the session-wide balance circuit before any BUY evaluation/routing
+    # in this tick. Exits deliberately remain enabled.
+    balance_circuit = evaluate_balance_error_circuit(
+        session_balance_temp_error_count + temp_error_count,
+        recovered_count=temp_recovered_count,
+        skip_zero_snapshot_count=skip_zero_snapshot_count,
+        consecutive_failed_ticks=(balance_consecutive_failed_ticks + 1 if balance_fetch_failed else 0),
+    )
+    if not balance_circuit["entry_can_proceed"]:
+        entry_can_proceed = False
+        logger.warning(
+            "[US_KIS][BALANCE_DEGRADED] temp_error_count=%d recovered=%d skip_zero_snapshot=%d action=entry_block_exit_allowed",
+            balance_circuit["kis_balance_temp_error_count"], temp_recovered_count, skip_zero_snapshot_count,
+        )
+
     # KIS fills + DB sold_today 합산
     from trader.us.db.repos import load_today_symbols_sold, save_fills, save_position_snapshot, save_reconcile_log
     kis_sold = {f["symbol"] for f in fills_today if f.get("side") == "SELL"}
@@ -1259,6 +1279,11 @@ def run_trade_tick(
             }
     elif recon.get("preserve_previous_positions"):
         logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
+    balance_fetch_failed = bool(
+        recon.get("preserve_previous_positions")
+        or str(recon.get("balance_fetch_status") or "").upper() not in {"", "OK", "SKIP"}
+    )
+    skip_zero_snapshot_count = int(bool(recon.get("preserve_previous_positions")))
 
     # A prior ACK followed by fill persistence failure is a recovery operation,
     # never a trading opportunity.  This return is intentionally before exit
@@ -2692,6 +2717,9 @@ def run_trade_tick(
         "monitoring_universe_count": len(monitoring_universe) if 'monitoring_universe' in locals() else 0,
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
+        "balance_fetch_failed": balance_fetch_failed,
+        "skip_zero_snapshot_count": skip_zero_snapshot_count,
+        "balance_circuit": balance_circuit,
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
         "real_broker_buys": real_broker_buys,
         "real_broker_sells": real_broker_sells,

@@ -20,6 +20,7 @@ ai_semiconductor_extended:
   - KLAC
   - MRVL
   - MCHP
+  - "ON"
   - QCOM
   - INTC
   - TXN

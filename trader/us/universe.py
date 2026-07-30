@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 _LOADED: bool = False
 _UNIVERSE: dict[str, list[str]] = {}
 _CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "us_universe.yaml"
-INVALID_SYMBOL_LITERALS = {"TRUE", "FALSE", "NONE", "NULL", "YES", "NO", "ON", "OFF"}
+INVALID_SYMBOL_LITERALS = {"TRUE", "FALSE", "NONE", "NULL", "YES", "NO", "OFF"}
 _SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
 def validate_symbol(symbol: Any, *, path: str | Path = _CONFIG_PATH) -> str:

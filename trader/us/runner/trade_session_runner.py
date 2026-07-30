@@ -540,6 +540,8 @@ def run_trade_session(
     final_tick: dict = {}
     temp_error_count = 0
     temp_recovered_count = 0
+    skip_zero_snapshot_count = 0
+    consecutive_balance_failed_ticks = 0
 
     # ── 파일 기반 session guard 체크 ─────────────────────────────────────────
     from trader.us.utils.session_guard import (
@@ -983,6 +985,8 @@ def run_trade_session(
                             tick_id=tick_id,
                             active_session_state_path=str(session_state_path),
                             blocked_symbol_sides=[list(x) for x in sorted(timeout_blocked_symbol_sides)],
+                            session_balance_temp_error_count=temp_error_count,
+                            balance_consecutive_failed_ticks=consecutive_balance_failed_ticks,
                         )
                     # Legacy marker retained for deploy-diff scanners; hard timeout
                     # no longer uses: pool.shutdown(wait=False, cancel_futures=True)
@@ -1006,6 +1010,11 @@ def run_trade_session(
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_DONE", status=tick_result.get("status"), reason=tick_result.get("reason", ""))
                     temp_error_count += int(tick_result.get("temp_error_count", 0) or 0)
                     temp_recovered_count += int(tick_result.get("temp_recovered_count", 0) or 0)
+                    skip_zero_snapshot_count += int(tick_result.get("skip_zero_snapshot_count", 0) or 0)
+                    consecutive_balance_failed_ticks = (
+                        consecutive_balance_failed_ticks + 1
+                        if tick_result.get("balance_fetch_failed") else 0
+                    )
                     last_stage = tick_result.get("last_stage", last_stage)
 
                     # orders_blocked 세션 누적
@@ -1294,6 +1303,19 @@ def run_trade_session(
                 logger.warning("[US_SESSION][EARLY_TERMINATION][WARN_ONLY] root_cause=%s surface_reason=%s ticks=%d expected_min_ticks=%d", root_cause or final_reason, surface_reason, tick_count, expected_min_ticks)
         else:
             logger.info("[US_SESSION][LIVENESS_CHECK] expected_min_ticks=%d actual_ticks=%d result=OK reason=%s", expected_min_ticks, tick_count, final_reason)
+
+        from trader.us.runner.trade_tick_runner import evaluate_balance_error_circuit
+        balance_circuit = evaluate_balance_error_circuit(
+            temp_error_count,
+            temp_recovered_count,
+            skip_zero_snapshot_count,
+            consecutive_balance_failed_ticks,
+            ["risk_off_entry_block"]
+            if str((prep_guard_result or {}).get("trade_block_reason") or (prep_guard_result or {}).get("reason") or "") == "risk_off_entry_block"
+            else [],
+        )
+        if balance_circuit["entry_blocked_by_balance_degraded"]:
+            prep_guard_result["entry_can_proceed"] = False
 
         # KIS TEMP_ERROR recovery warning
         if temp_error_count >= 5:
@@ -1615,6 +1637,12 @@ def run_trade_session(
             "reason": final_reason,
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
+            "kis_balance_temp_error_count": temp_error_count,
+            "kis_balance_temp_recovered_count": temp_recovered_count,
+            "skip_zero_snapshot_count": skip_zero_snapshot_count,
+            "balance_reconcile_degraded": balance_circuit["balance_reconcile_degraded"],
+            "entry_blocked_by_balance_degraded": balance_circuit["entry_blocked_by_balance_degraded"],
+            "entry_block_reasons": balance_circuit["entry_block_reasons"],
             "schedule_expected_et": os.getenv("US_SCHEDULE_EXPECTED_ET", ""),
             "actual_start_et": os.getenv("US_ACTUAL_START_ET", ""),
             "delay_seconds": _safe_int_env("US_DELAY_SECONDS", 0),
