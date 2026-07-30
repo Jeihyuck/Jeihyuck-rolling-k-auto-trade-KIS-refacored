@@ -9,7 +9,7 @@ ROOT = Path(__file__).parents[1]
 DATE = "2099-01-02"
 
 
-def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry") -> Path:
+def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_date: str = DATE) -> Path:
     root = tmp_path / "repo"
     (root / "scripts/wsl").mkdir(parents=True)
     (root / "scripts/notify").mkdir(parents=True)
@@ -18,10 +18,15 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry") -> Path
     shutil.copy2(ROOT / "scripts/notify/send_mail_attachment.py", root / "scripts/notify/send_mail_attachment.py")
     shutil.copy2(ROOT / "scripts/wsl/check-nullim-trading-day.py", root / "scripts/wsl/check-nullim-trading-day.py")
     shutil.copy2(ROOT / "scripts/wsl/resolve-nullim-python.sh", root / "scripts/wsl/resolve-nullim-python.sh")
+    (root / "trader").mkdir()
+    shutil.copy2(ROOT / "trader/__init__.py", root / "trader/__init__.py")
+    shutil.copy2(ROOT / "trader/time_utils.py", root / "trader/time_utils.py")
+    (root / "config").mkdir()
+    shutil.copy2(ROOT / "config/krx_holidays.json", root / "config/krx_holidays.json")
     purposes = ("prep", "am", "afternoon", "close") if market == "kr" else (
         "prep-prewarm-edt", "prep-prewarm-est", "prep", "prep-recovery", "am-preflight", "am", "afternoon", "close"
     )
-    log_root = root / "runtime/logs" / market / DATE
+    log_root = root / "runtime/logs" / market / trade_date
     for purpose in purposes:
         p = log_root / purpose
         p.mkdir(parents=True)
@@ -29,12 +34,14 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry") -> Path
         (p / "attempt-2.log").write_text(f"purpose={purpose} retry=yes\n")
     (log_root / "session-manifest.json").write_text(json.dumps({"market": market.upper(), "sessions": {}}))
     if market == "kr":
-        paths = (f"reports/kr_prep/{DATE}", f"runtime/kr/watchlist/{DATE}", f"runtime/kr/session/{DATE}", f"bot_state/trader_ledger/final30/practice/{DATE}")
+        paths = (f"reports/kr_prep/{trade_date}", f"runtime/kr/watchlist/{trade_date}", f"runtime/kr/session/{trade_date}", f"bot_state/trader_ledger/final30/practice/{trade_date}")
     else:
-        paths = (f"reports/us_daily/{DATE}", f"reports/us_prep/{DATE}", f"runtime/us/session_state/{DATE}", f"runtime/us/watchlist/{DATE}")
-        health = root / f"reports/us_schedule_health/{DATE}.json"; health.parent.mkdir(parents=True); health.write_text("{}")
+        paths = (f"reports/us_daily/{trade_date}", f"reports/us_prep/{trade_date}", f"runtime/us/session_state/{trade_date}", f"runtime/us/watchlist/{trade_date}")
+        health = root / f"reports/us_schedule_health/{trade_date}.json"; health.parent.mkdir(parents=True); health.write_text("{}")
     for item in paths:
         p=root/item; p.mkdir(parents=True); (p/"evidence.json").write_text('{"ok":true}')
+    if market == "kr":
+        (root/f"bot_state/trader_ledger/final30/practice/{trade_date}/final30_scored.json").write_text('{"rows": []}')
     counter=root/"smtp-count"
     if smtp_mode != "dry":
         wrapper=root/"scripts/wsl/with-venv.sh"
@@ -47,9 +54,9 @@ echo '[MAIL][MESSAGE_ID] fixture-message'; exit 0
     return root
 
 
-def run_mail(root: Path, market: str, *, dry=True):
+def run_mail(root: Path, market: str, *, dry=True, trade_date: str = DATE):
     archive=root/f"nullim-test-{market}-logs.tar.gz"
-    env={**os.environ,"NULLIM_KST_RUN_DATE":DATE,"US_TRADE_DATE":DATE,"NULLIM_LOG_MAIL_OUT":str(archive),"NULLIM_KEEP_MAIL_ARCHIVE":"1","MAIL_TO":"ops@example.test","NULLIM_TRADING_DAY_OVERRIDE":"open","NULLIM_PYTHON_BIN":os.sys.executable,"NULLIM_SMTP_RETRY_SLEEP_1":"0","NULLIM_SMTP_RETRY_SLEEP_2":"0"}
+    env={**os.environ,"NULLIM_KST_RUN_DATE":trade_date,"US_TRADE_DATE":trade_date,"NULLIM_LOG_MAIL_OUT":str(archive),"NULLIM_KEEP_MAIL_ARCHIVE":"1","MAIL_TO":"ops@example.test","NULLIM_TRADING_DAY_OVERRIDE":"open","NULLIM_PYTHON_BIN":os.sys.executable,"NULLIM_SMTP_RETRY_SLEEP_1":"0","NULLIM_SMTP_RETRY_SLEEP_2":"0"}
     if dry: env["NULLIM_MAIL_DRY_RUN"]="1"
     result=subprocess.run(["bash",str(root/f"scripts/wsl/send-{market}-log-mail.sh")],cwd=root,env=env,text=True,capture_output=True)
     return result,archive
@@ -76,6 +83,92 @@ def test_kr_end_to_end_uses_canonical_paths_and_dry_run_isolated(tmp_path):
     assert not (root/f"runtime/health/kr-mail-{DATE}.json").exists()
     dry=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
     assert dry["status"] == "DRY_RUN" and dry["mail_sent"] is False
+
+
+def test_kr_mail_accepts_previous_business_day_final30(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    previous=root/"bot_state/trader_ledger/final30/practice/2099-01-01"
+    previous.mkdir(parents=True)
+    (previous/"final30_scored.json").write_text('{"as_of":"2099-01-01","rows":[]}')
+    result,archive=run_mail(root,"kr")
+    assert result.returncode == 0, result.stderr+result.stdout
+    assert "[LOG_MAIL][DRY_RUN]" in result.stdout
+    with tarfile.open(archive,"r:gz") as tf:
+        assert any("final30/practice/2099-01-01/final30_scored.json" in name for name in tf.getnames())
+
+
+def test_kr_mail_accepts_runtime_watchlist_final30_without_ledger(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    (root/f"runtime/kr/watchlist/{DATE}/final30_scored.json").write_text('{"as_of":"2099-01-01","rows":[]}')
+    result,_=run_mail(root,"kr")
+    assert result.returncode == 0, result.stderr+result.stdout
+    assert "[LOG_MAIL][DRY_RUN]" in result.stdout
+
+
+def test_kr_mail_failure_marker_records_full_missing_evidence_path(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    result,_=run_mail(root,"kr")
+    assert result.returncode != 0
+    expected=f"bot_state/trader_ledger/final30/practice/{DATE}/final30_scored.json"
+    assert expected in result.stderr
+    marker=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
+    assert marker["failure_reason"] == "REQUIRED_EVIDENCE_MISSING"
+    assert marker["missing_path"] == expected
+
+
+def test_kr_mail_previous_final30_skips_krx_holiday(tmp_path):
+    trade_date, holiday, previous_session = "2026-05-26", "2026-05-25", "2026-05-22"
+    root=fixture_repo(tmp_path,"kr",trade_date=trade_date)
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{trade_date}")
+    previous=root/f"bot_state/trader_ledger/final30/practice/{previous_session}"
+    previous.mkdir(parents=True)
+    (previous/"final30_scored.json").write_text('{"as_of":"2026-05-22","rows":[]}',encoding="utf-8")
+    time_utils=root/"trader/time_utils.py"
+    time_utils.write_text(
+        time_utils.read_text(encoding="utf-8")
+        + "\n\ndef is_krx_trading_day(*args, **kwargs):\n"
+          "    raise RuntimeError('pykrx-dependent trading-day resolver must not be called')\n"
+          "\n\ndef resolve_prev_krx_trading_day(*args, **kwargs):\n"
+          "    raise RuntimeError('pykrx-dependent previous-session resolver must not be called')\n",
+        encoding="utf-8",
+    )
+
+    result,archive=run_mail(root,"kr",trade_date=trade_date)
+    assert result.returncode == 0, result.stderr+result.stdout
+    with tarfile.open(archive,"r:gz") as tf:
+        names=tf.getnames()
+    assert any(f"final30/practice/{previous_session}/final30_scored.json" in name for name in names)
+    assert not any(f"final30/practice/{holiday}/final30_scored.json" in name for name in names)
+
+
+def test_kr_mail_rejects_source_path_outside_repo(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    outside=tmp_path/"final30_scored.json"
+    outside.write_text('{"rows":[]}',encoding="utf-8")
+    contract=root/f"runtime/kr/watchlist/{DATE}/prep_contract.json"
+    contract.write_text(json.dumps({"source_paths":{"final30":str(outside)}}),encoding="utf-8")
+
+    result,archive=run_mail(root,"kr")
+    assert result.returncode != 0
+    assert "REQUIRED_EVIDENCE_MISSING" in result.stderr
+    assert not archive.exists()
+
+
+def test_kr_mail_failure_reports_searched_paths(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    result,_=run_mail(root,"kr")
+    assert result.returncode != 0
+    marker=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
+    searched=marker["searched_paths"]
+    assert f"bot_state/trader_ledger/final30/practice/{DATE}" in searched
+    assert f"runtime/kr/watchlist/{DATE}/final30_scored.json" in searched
+    assert "bot_state/trader_ledger/final30/practice/2099-01-01" in searched
+    assert "searched_paths=" in result.stderr
 
 
 def test_us_cross_midnight_partition_collects_every_purpose(tmp_path):
@@ -107,6 +200,7 @@ def test_smtp_retries_twice_then_succeeds(tmp_path):
     assert (root/"smtp-count").read_text().strip() == "3"
     marker=json.loads((root/f"runtime/health/kr-mail-{DATE}.json").read_text())
     assert marker["attempt_count"] == 3 and marker["status"] == "OK"
+
 
 def test_session_manifest_preserves_attempts_and_effective_status(tmp_path):
     root=tmp_path/"session-repo"; scripts=root/"scripts/wsl"; scripts.mkdir(parents=True)

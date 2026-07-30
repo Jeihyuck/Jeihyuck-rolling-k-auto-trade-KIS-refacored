@@ -41,13 +41,95 @@ elif [[ "$TRADING_DAY_RC" != 0 ]]; then
 fi
 # Exclusive snapshot lock remains held through staging and tar creation. Sessions take it shared.
 mkdir -p runtime/locks; exec {SNAPSHOT_FD}>"runtime/locks/${MARKET}-mail-snapshot.lock"; flock -x "$SNAPSHOT_FD"
-fail(){ local reason="$1" rc="${2:-1}" marker="$PROD_MARKER"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"; python3 - "$marker" "$MARKET" "$TRADE_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" <<'PY'
+fail(){ local reason="$1" rc="${2:-1}" missing_path="${3:-}" searched_file="${4:-}" marker="$PROD_MARKER"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"; python3 - "$marker" "$MARKET" "$TRADE_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" "$searched_file" <<'PY'
 import json,sys
 from datetime import datetime,timezone
 from pathlib import Path
-p,m,d,r,a,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'FAIL','mail_sent':False,'market':m,'trade_date':d,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+p,m,d,r,a,count,missing,searched_file=sys.argv[1:]
+data={'status':'FAIL','mail_sent':False,'market':m,'trade_date':d,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+if missing: data['missing_path']=missing
+if searched_file and Path(searched_file).is_file(): data['searched_paths']=[x for x in Path(searched_file).read_text().splitlines() if x]
+Path(p).write_text(json.dumps(data,indent=2)+'\n')
 PY
- echo "[LOG_MAIL][FAIL] market=$MARKET reason=$reason" >&2; exit "$rc"; }
+ local searched=""; [[ -z "$searched_file" || ! -f "$searched_file" ]] || searched="$(paste -sd, "$searched_file")"
+ echo "[LOG_MAIL][FAIL] market=$MARKET reason=$reason${missing_path:+ missing_path=$missing_path}${searched:+ searched_paths=$searched}" >&2; exit "$rc"; }
+fail_missing_evidence(){ fail REQUIRED_EVIDENCE_MISSING 1 "$1" "${2:-}"; }
+
+resolve_kr_final30_evidence() {
+ local env="$1" trade_date="$2" searched_file="$3"
+ local trade_ledger="bot_state/trader_ledger/final30/$env/$trade_date"
+ local runtime_final30="runtime/kr/watchlist/$trade_date/final30_scored.json"
+ local contract="runtime/kr/watchlist/$trade_date/prep_contract.json"
+ local prev_krx_trading_day contract_as_of source_final30 candidate
+ local candidates=("$trade_ledger" "$runtime_final30")
+
+ if [[ -f "$contract" ]]; then
+  readarray -t contract_values < <(python3 - "$contract" <<'PY_CONTRACT'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(str(data.get("as_of") or "")[:10])
+    print(str((data.get("source_paths") or {}).get("final30") or ""))
+except Exception:
+    print("")
+    print("")
+PY_CONTRACT
+)
+  contract_as_of="${contract_values[0]:-}"
+  source_final30="${contract_values[1]:-}"
+  [[ -z "$contract_as_of" ]] || candidates+=("bot_state/trader_ledger/final30/$env/$contract_as_of")
+  if [[ -n "$source_final30" ]]; then
+   source_final30="$(python3 - "$APP" "$source_final30" <<'PY_SOURCE_PATH'
+from pathlib import Path
+import sys
+app = Path(sys.argv[1]).resolve()
+raw = Path(sys.argv[2])
+resolved = raw.resolve() if raw.is_absolute() else (app / raw).resolve()
+try: relative = resolved.relative_to(app)
+except ValueError: raise SystemExit(2)
+print(relative)
+PY_SOURCE_PATH
+)" || source_final30=""
+   [[ -z "$source_final30" ]] || candidates+=("$source_final30")
+  fi
+ fi
+
+ prev_krx_trading_day="$("$CALENDAR_PYTHON" - "$trade_date" <<'PY_PREV_KRX'
+from datetime import date, timedelta
+import sys
+from pathlib import Path
+ROOT = Path.cwd()
+if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
+from trader.time_utils import resolve_krx_trading_day_strict
+
+trade_date = date.fromisoformat(sys.argv[1])
+candidate = trade_date - timedelta(days=1)
+skipped: list[str] = []
+for _ in range(14):
+    state, source = resolve_krx_trading_day_strict(candidate)
+    if state == "OPEN":
+        print(candidate.isoformat())
+        raise SystemExit(0)
+    skipped.append(f"{candidate.isoformat()}:{state}:{source}")
+    candidate -= timedelta(days=1)
+raise RuntimeError(
+    f"could not resolve previous KRX trading day before {trade_date.isoformat()}; "
+    f"skipped={','.join(skipped) if skipped else 'none'}"
+)
+PY_PREV_KRX
+)" || return 2
+ candidates+=("bot_state/trader_ledger/final30/$env/$prev_krx_trading_day")
+ printf '%s\n' "${candidates[@]}" > "$searched_file"
+
+ for candidate in "${candidates[@]}"; do
+  # A directory is evidence only when it contains the actual scored artifact.
+  if [[ -f "$candidate" && "$(basename "$candidate")" == final30_scored.json ]] || [[ -d "$candidate" && -f "$candidate/final30_scored.json" ]]; then
+   printf '%s\n' "$candidate"
+   return 0
+  fi
+ done
+ return 1
+}
 if [[ "${NULLIM_SKIP_SESSION_ACTIVE_CHECK:-0}" != 1 ]]; then
  for lock in runtime/locks/${MARKET}-*.lock; do [[ -e "$lock" ]] || continue; [[ "$lock" == *-mail-snapshot.lock ]] && continue; exec {fd}>"$lock"; flock -n "$fd" || fail SESSION_STILL_RUNNING; eval "exec ${fd}>&-"; done
 fi
@@ -56,13 +138,18 @@ required=("$LOG_ROOT/session-manifest.json")
 if [[ "$MARKET" == kr ]]; then
  purposes=(prep am afternoon close)
  LEDGER_ENV="${NULLIM_LEDGER_ENV:-${STRATEGY_ENV:-practice}}"
- evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE" "bot_state/trader_ledger/final30/$LEDGER_ENV/$TRADE_DATE")
+ evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE")
+ final30_search_file="$STAGE/kr-final30-searched-paths.txt"; resolver_rc=0
+ final30_evidence="$(resolve_kr_final30_evidence "$LEDGER_ENV" "$TRADE_DATE" "$final30_search_file")" || resolver_rc=$?
+ [[ "$resolver_rc" != 2 ]] || fail KRX_PREV_TRADING_DAY_RESOLVE_FAILED 1 "$TRADE_DATE" "$final30_search_file"
+ [[ "$resolver_rc" == 0 ]] || fail_missing_evidence "bot_state/trader_ledger/final30/$LEDGER_ENV/$TRADE_DATE/final30_scored.json" "$final30_search_file"
+ evidence_groups+=("$final30_evidence")
 else
  purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
  evidence_groups=("reports/us_daily/$TRADE_DATE" "reports/us_prep/$TRADE_DATE" "runtime/us/session_state/$TRADE_DATE" "runtime/us/watchlist/$TRADE_DATE" "reports/us_schedule_health/$TRADE_DATE.json")
 fi
 for purpose in "${purposes[@]}"; do dir="$LOG_ROOT/$purpose"; [[ -d "$dir" ]] || fail "REQUIRED_LOG_MISSING_${purpose}"; find "$dir" -maxdepth 1 -type f -name '*.log' -print -quit | grep -q . || fail "REQUIRED_LOG_MISSING_${purpose}"; required+=("$dir"); done
-for item in "${evidence_groups[@]}"; do [[ -e "$item" ]] || fail "REQUIRED_EVIDENCE_MISSING_$(basename "$item")"; required+=("$item"); done
+for item in "${evidence_groups[@]}"; do [[ -e "$item" ]] || fail_missing_evidence "$item"; required+=("$item"); done
 # Readiness is a pre-mail snapshot, not the final post-mail health report.
 python3 - "$READINESS" "$MARKET" "$KST_RUN_DATE" "$TRADE_DATE" "${#purposes[@]}" "${#required[@]}" <<'PY'
 import json,sys
@@ -82,7 +169,7 @@ import json,re,sys
 from pathlib import Path
 root=Path(sys.argv[1]); keys={x.lower() for x in 'CANO ACNT_PRDT_CD APP_KEY APP_SECRET KIS_APP_KEY KIS_APP_SECRET ACCESS_TOKEN SMTP_PASS DATABASE_URL DB_URL authorization token password account recipient message_id'.split()}
 email=re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
-secret=re.compile(r'(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,\"]+')
+secret=re.compile(r'(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,"]+')
 account=re.compile(r'(?<![\d.])(\d{4})[- ]?\d{4}[- ]?(\d{2,6})(?![\d.])')
 def clean(v):
  if isinstance(v,dict): return {k:'[REDACTED]' if str(k).lower() in keys else clean(x) for k,x in v.items()}
