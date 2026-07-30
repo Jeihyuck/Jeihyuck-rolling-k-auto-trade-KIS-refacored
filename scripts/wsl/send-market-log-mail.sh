@@ -41,13 +41,68 @@ elif [[ "$TRADING_DAY_RC" != 0 ]]; then
 fi
 # Exclusive snapshot lock remains held through staging and tar creation. Sessions take it shared.
 mkdir -p runtime/locks; exec {SNAPSHOT_FD}>"runtime/locks/${MARKET}-mail-snapshot.lock"; flock -x "$SNAPSHOT_FD"
-fail(){ local reason="$1" rc="${2:-1}" marker="$PROD_MARKER"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"; python3 - "$marker" "$MARKET" "$TRADE_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" <<'PY'
+fail(){ local reason="$1" rc="${2:-1}" missing_path="${3:-}" marker="$PROD_MARKER"; [[ "${NULLIM_MAIL_DRY_RUN:-0}" == 1 ]] && marker="$DRY_MARKER"; python3 - "$marker" "$MARKET" "$TRADE_DATE" "$reason" "$ATTEMPT_GROUP" "${MAIL_ATTEMPT_COUNT:-0}" "$missing_path" <<'PY'
 import json,sys
 from datetime import datetime,timezone
 from pathlib import Path
-p,m,d,r,a,count=sys.argv[1:]; Path(p).write_text(json.dumps({'status':'FAIL','mail_sent':False,'market':m,'trade_date':d,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()},indent=2)+'\n')
+p,m,d,r,a,count,missing=sys.argv[1:]
+data={'status':'FAIL','mail_sent':False,'market':m,'trade_date':d,'failure_reason':r,'mail_attempt_id':a,'attempt_count':int(count),'sent_at':datetime.now(timezone.utc).isoformat()}
+if missing: data['missing_path']=missing
+Path(p).write_text(json.dumps(data,indent=2)+'\n')
 PY
- echo "[LOG_MAIL][FAIL] market=$MARKET reason=$reason" >&2; exit "$rc"; }
+ echo "[LOG_MAIL][FAIL] market=$MARKET reason=$reason${missing_path:+ missing_path=$missing_path}" >&2; exit "$rc"; }
+fail_missing_evidence(){ fail REQUIRED_EVIDENCE_MISSING 1 "$1"; }
+
+resolve_kr_final30_evidence() {
+ local env="$1" trade_date="$2"
+ local trade_ledger="bot_state/trader_ledger/final30/$env/$trade_date"
+ local runtime_final30="runtime/kr/watchlist/$trade_date/final30_scored.json"
+ local contract="runtime/kr/watchlist/$trade_date/prep_contract.json"
+ local prev_business_day contract_as_of source_final30 candidate
+ local candidates=("$trade_ledger" "$runtime_final30")
+
+ if [[ -f "$contract" ]]; then
+  readarray -t contract_values < <(python3 - "$contract" <<'PY_CONTRACT'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(str(data.get("as_of") or "")[:10])
+    print(str((data.get("source_paths") or {}).get("final30") or ""))
+except Exception:
+    print("")
+    print("")
+PY_CONTRACT
+)
+  contract_as_of="${contract_values[0]:-}"
+  source_final30="${contract_values[1]:-}"
+  [[ -z "$contract_as_of" ]] || candidates+=("bot_state/trader_ledger/final30/$env/$contract_as_of")
+  if [[ -n "$source_final30" ]]; then
+   # Prep contracts may contain an absolute path rooted at this checkout.
+   [[ "$source_final30" != "$APP/"* ]] || source_final30="${source_final30#"$APP/"}"
+   candidates+=("$source_final30")
+  fi
+ fi
+
+ prev_business_day="$(python3 - "$trade_date" <<'PY_PREV'
+from datetime import date, timedelta
+import sys
+d = date.fromisoformat(sys.argv[1]) - timedelta(days=1)
+while d.weekday() >= 5:
+    d -= timedelta(days=1)
+print(d.isoformat())
+PY_PREV
+)"
+ candidates+=("bot_state/trader_ledger/final30/$env/$prev_business_day")
+
+ for candidate in "${candidates[@]}"; do
+  # A directory is evidence only when it contains the actual scored artifact.
+  if [[ -f "$candidate" ]] || [[ -d "$candidate" && -f "$candidate/final30_scored.json" ]]; then
+   printf '%s\n' "$candidate"
+   return 0
+  fi
+ done
+ return 1
+}
 if [[ "${NULLIM_SKIP_SESSION_ACTIVE_CHECK:-0}" != 1 ]]; then
  for lock in runtime/locks/${MARKET}-*.lock; do [[ -e "$lock" ]] || continue; [[ "$lock" == *-mail-snapshot.lock ]] && continue; exec {fd}>"$lock"; flock -n "$fd" || fail SESSION_STILL_RUNNING; eval "exec ${fd}>&-"; done
 fi
@@ -56,13 +111,15 @@ required=("$LOG_ROOT/session-manifest.json")
 if [[ "$MARKET" == kr ]]; then
  purposes=(prep am afternoon close)
  LEDGER_ENV="${NULLIM_LEDGER_ENV:-${STRATEGY_ENV:-practice}}"
- evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE" "bot_state/trader_ledger/final30/$LEDGER_ENV/$TRADE_DATE")
+ evidence_groups=("reports/kr_prep/$TRADE_DATE" "runtime/kr/watchlist/$TRADE_DATE" "runtime/kr/session/$TRADE_DATE")
+ final30_evidence="$(resolve_kr_final30_evidence "$LEDGER_ENV" "$TRADE_DATE")" || fail_missing_evidence "bot_state/trader_ledger/final30/$LEDGER_ENV/$TRADE_DATE/final30_scored.json"
+ evidence_groups+=("$final30_evidence")
 else
  purposes=(prep-prewarm-edt prep-prewarm-est prep prep-recovery am-preflight am afternoon close)
  evidence_groups=("reports/us_daily/$TRADE_DATE" "reports/us_prep/$TRADE_DATE" "runtime/us/session_state/$TRADE_DATE" "runtime/us/watchlist/$TRADE_DATE" "reports/us_schedule_health/$TRADE_DATE.json")
 fi
 for purpose in "${purposes[@]}"; do dir="$LOG_ROOT/$purpose"; [[ -d "$dir" ]] || fail "REQUIRED_LOG_MISSING_${purpose}"; find "$dir" -maxdepth 1 -type f -name '*.log' -print -quit | grep -q . || fail "REQUIRED_LOG_MISSING_${purpose}"; required+=("$dir"); done
-for item in "${evidence_groups[@]}"; do [[ -e "$item" ]] || fail "REQUIRED_EVIDENCE_MISSING_$(basename "$item")"; required+=("$item"); done
+for item in "${evidence_groups[@]}"; do [[ -e "$item" ]] || fail_missing_evidence "$item"; required+=("$item"); done
 # Readiness is a pre-mail snapshot, not the final post-mail health report.
 python3 - "$READINESS" "$MARKET" "$KST_RUN_DATE" "$TRADE_DATE" "${#purposes[@]}" "${#required[@]}" <<'PY'
 import json,sys

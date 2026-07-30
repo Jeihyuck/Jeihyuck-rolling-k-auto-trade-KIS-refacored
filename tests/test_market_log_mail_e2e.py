@@ -35,6 +35,8 @@ def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry") -> Path
         health = root / f"reports/us_schedule_health/{DATE}.json"; health.parent.mkdir(parents=True); health.write_text("{}")
     for item in paths:
         p=root/item; p.mkdir(parents=True); (p/"evidence.json").write_text('{"ok":true}')
+    if market == "kr":
+        (root/f"bot_state/trader_ledger/final30/practice/{DATE}/final30_scored.json").write_text('{"rows": []}')
     counter=root/"smtp-count"
     if smtp_mode != "dry":
         wrapper=root/"scripts/wsl/with-venv.sh"
@@ -76,6 +78,40 @@ def test_kr_end_to_end_uses_canonical_paths_and_dry_run_isolated(tmp_path):
     assert not (root/f"runtime/health/kr-mail-{DATE}.json").exists()
     dry=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
     assert dry["status"] == "DRY_RUN" and dry["mail_sent"] is False
+
+
+def test_kr_mail_accepts_previous_business_day_final30(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    previous=root/"bot_state/trader_ledger/final30/practice/2099-01-01"
+    previous.mkdir(parents=True)
+    (previous/"final30_scored.json").write_text('{"as_of":"2099-01-01","rows":[]}')
+    result,archive=run_mail(root,"kr")
+    assert result.returncode == 0, result.stderr+result.stdout
+    assert "[LOG_MAIL][DRY_RUN]" in result.stdout
+    with tarfile.open(archive,"r:gz") as tf:
+        assert any("final30/practice/2099-01-01/final30_scored.json" in name for name in tf.getnames())
+
+
+def test_kr_mail_accepts_runtime_watchlist_final30_without_ledger(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    (root/f"runtime/kr/watchlist/{DATE}/final30_scored.json").write_text('{"as_of":"2099-01-01","rows":[]}')
+    result,_=run_mail(root,"kr")
+    assert result.returncode == 0, result.stderr+result.stdout
+    assert "[LOG_MAIL][DRY_RUN]" in result.stdout
+
+
+def test_kr_mail_failure_marker_records_full_missing_evidence_path(tmp_path):
+    root=fixture_repo(tmp_path,"kr")
+    shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
+    result,_=run_mail(root,"kr")
+    assert result.returncode != 0
+    expected=f"bot_state/trader_ledger/final30/practice/{DATE}/final30_scored.json"
+    assert expected in result.stderr
+    marker=json.loads((root/f"runtime/health/kr-mail-dry-run-{DATE}.json").read_text())
+    assert marker["failure_reason"] == "REQUIRED_EVIDENCE_MISSING"
+    assert marker["missing_path"] == expected
 
 
 def test_us_cross_midnight_partition_collects_every_purpose(tmp_path):
