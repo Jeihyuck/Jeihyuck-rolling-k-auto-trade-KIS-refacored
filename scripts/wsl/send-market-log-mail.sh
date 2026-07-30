@@ -95,13 +95,27 @@ PY_SOURCE_PATH
  fi
 
  prev_krx_trading_day="$("$CALENDAR_PYTHON" - "$trade_date" <<'PY_PREV_KRX'
-from datetime import date
+from datetime import date, timedelta
 import sys
 from pathlib import Path
 ROOT = Path.cwd()
 if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
-from trader.time_utils import resolve_prev_krx_trading_day
-print(resolve_prev_krx_trading_day(date.fromisoformat(sys.argv[1])).isoformat())
+from trader.time_utils import resolve_krx_trading_day_strict
+
+trade_date = date.fromisoformat(sys.argv[1])
+candidate = trade_date - timedelta(days=1)
+skipped: list[str] = []
+for _ in range(14):
+    state, source = resolve_krx_trading_day_strict(candidate)
+    if state == "OPEN":
+        print(candidate.isoformat())
+        raise SystemExit(0)
+    skipped.append(f"{candidate.isoformat()}:{state}:{source}")
+    candidate -= timedelta(days=1)
+raise RuntimeError(
+    f"could not resolve previous KRX trading day before {trade_date.isoformat()}; "
+    f"skipped={','.join(skipped) if skipped else 'none'}"
+)
 PY_PREV_KRX
 )" || return 2
  candidates+=("bot_state/trader_ledger/final30/$env/$prev_krx_trading_day")
@@ -155,7 +169,7 @@ import json,re,sys
 from pathlib import Path
 root=Path(sys.argv[1]); keys={x.lower() for x in 'CANO ACNT_PRDT_CD APP_KEY APP_SECRET KIS_APP_KEY KIS_APP_SECRET ACCESS_TOKEN SMTP_PASS DATABASE_URL DB_URL authorization token password account recipient message_id'.split()}
 email=re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
-secret=re.compile(r'(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,\"]+')
+secret=re.compile(r'(?i)((?:APP_KEY|APP_SECRET|KIS_APP_KEY|KIS_APP_SECRET|ACCESS_TOKEN|SMTP_PASS|DATABASE_URL|DB_URL|CANO|ACNT_PRDT_CD|token|password|account)\s*[=:]\s*)[^\s,"]+')
 account=re.compile(r'(?<![\d.])(\d{4})[- ]?\d{4}[- ]?(\d{2,6})(?![\d.])')
 def clean(v):
  if isinstance(v,dict): return {k:'[REDACTED]' if str(k).lower() in keys else clean(x) for k,x in v.items()}
