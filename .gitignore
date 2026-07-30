@@ -50,3 +50,7 @@ bot_state/universe_lkg/**
 /bot_state/
 
 !config/krx_holidays.json
+/reports/us_daily/latest_us_daily_report.md
+/reports/us_prep/latest_us_prep_summary.md
+/reports/us_prep/by_trade_date/
+/reports/us_daily/by_trade_date/

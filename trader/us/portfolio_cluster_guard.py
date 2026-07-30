@@ -36,7 +36,8 @@ def evaluate_portfolio_cluster_guard(positions: list[dict], regime: str, equity_
             trim_intents.append({"symbol": sym, "side": "SELL", "qty": min(q, sell_qty), "quantity": min(q, sell_qty), "notional_usd": price * min(q, sell_qty), "reason": "CLUSTER_EXPOSURE_TRIM", "meta": {"reason": "CLUSTER_EXPOSURE_TRIM", "rotation_regime": regime, "portfolio_ai_tech_weight": ai_weight}})
     trim_notional = sum(float(i.get("notional_usd") or 0.0) for i in trim_intents)
     status = "OVER_CAP" if over_cap else "OK"
-    logger.warning("[US_CLUSTER_GUARD][PORTFOLIO] rotation_regime=%s ai_tech_weight=%.4f cap=%.4f over_cap=%s blocked_buy_symbols=%s trim_symbols=%s trim_notional=%.2f", regime, ai_weight, cap, over_cap, sorted(blocked_clusters), [i.get("symbol") for i in trim_intents], trim_notional)
+    log = logger.warning if over_cap else logger.info
+    log("[US_CLUSTER_GUARD][PORTFOLIO] rotation_regime=%s ai_tech_weight=%.4f cap=%.4f over_cap=%s blocked_buy_symbols=%s trim_symbols=%s trim_notional=%.2f", regime, ai_weight, cap, over_cap, sorted(blocked_clusters), [i.get("symbol") for i in trim_intents], trim_notional)
     return {"portfolio_cluster_guard_status": status, "portfolio_ai_tech_weight": ai_weight, "portfolio_equity_usd": equity_usd, "portfolio_cluster_cap_violations": ["AI_TECH_COMBINED"] if over_cap else [], "blocked_clusters": sorted(blocked_clusters), "cluster_guard_trim_intents": trim_intents, "cluster_guard_trim_notional": trim_notional, "cluster_guard_existing_sell_symbols": sorted(existing_sell_symbols)}
 
 

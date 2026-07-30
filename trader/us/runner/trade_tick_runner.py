@@ -28,6 +28,29 @@ logger = logging.getLogger(__name__)
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
 
+def evaluate_balance_error_circuit(temp_error_count: int, recovered_count: int = 0,
+                                   skip_zero_snapshot_count: int = 0,
+                                   consecutive_failed_ticks: int = 0,
+                                   entry_block_reasons: list[str] | None = None) -> dict[str, Any]:
+    """Return the session-level KIS balance health and split permissions."""
+    warning = temp_error_count >= 5
+    degraded = temp_error_count >= 10
+    blocked = temp_error_count >= 20 or consecutive_failed_ticks >= 3
+    reasons = list(entry_block_reasons or [])
+    if (degraded or blocked) and "balance_reconcile_degraded" not in reasons:
+        reasons.append("balance_reconcile_degraded")
+    if blocked and "balance_entry_blocked" not in reasons:
+        reasons.append("balance_entry_blocked")
+    return {"kis_balance_temp_error_count": temp_error_count,
+            "kis_balance_temp_recovered_count": recovered_count,
+            "skip_zero_snapshot_count": skip_zero_snapshot_count,
+            "balance_warning": warning, "balance_reconcile_degraded": degraded,
+            "entry_blocked_by_balance_degraded": blocked,
+            "balance_consecutive_failed_ticks": consecutive_failed_ticks,
+            "entry_can_proceed": not blocked, "exit_can_proceed": True,
+            "close_can_proceed": True,
+            "entry_block_reasons": reasons}
+
 
 _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS = (
     "edbhandlerexited",
@@ -794,6 +817,8 @@ def run_trade_tick(
     tick_cancellation_event=None,
     active_session_state_path: str | None = None,
     blocked_symbol_sides: list[list[str]] | None = None,
+    session_balance_temp_error_count: int = 0,
+    balance_consecutive_failed_ticks: int = 0,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -834,6 +859,8 @@ def run_trade_tick(
     fills_temp_error = False
     temp_error_count = 0
     temp_recovered_count = 0
+    balance_fetch_failed = False
+    skip_zero_snapshot_count = 0
     kis_temp_errors_by_api: dict[str, dict] = {}
     ack_recon: dict[str, Any] = {"status": "SKIP", "pending_count": 0, "confirmed_count": 0, "balance_reconcile_count": 0, "unresolved_count": 0, "symbols_by_status": {}}
     ack_recon_before_route: dict[str, Any] = dict(ack_recon)
@@ -1241,6 +1268,34 @@ def run_trade_tick(
             }
     elif recon.get("preserve_previous_positions"):
         logger.warning("[US_RECONCILE][SKIP_ZERO_SNAPSHOT] reason=balance_fetch_failed preserve_previous=1")
+    balance_fetch_failed = bool(
+        recon.get("preserve_previous_positions")
+        or str(recon.get("balance_fetch_status") or "").upper() not in {"", "OK", "SKIP"}
+    )
+    skip_zero_snapshot_count = int(bool(recon.get("preserve_previous_positions")))
+
+    # Evaluate only after the current reconcile result has populated the
+    # failure flags. This remains before exit/entry intent generation; only
+    # BUY permission is degraded and existing-position exits stay live.
+    balance_circuit = evaluate_balance_error_circuit(
+        session_balance_temp_error_count + temp_error_count,
+        recovered_count=temp_recovered_count,
+        skip_zero_snapshot_count=skip_zero_snapshot_count,
+        consecutive_failed_ticks=(
+            balance_consecutive_failed_ticks + 1 if balance_fetch_failed else 0
+        ),
+    )
+    if not balance_circuit["entry_can_proceed"]:
+        entry_can_proceed = False
+        logger.warning(
+            "[US_KIS][BALANCE_DEGRADED] temp_error_count=%d recovered=%d "
+            "skip_zero_snapshot=%d consecutive_failed_ticks=%d "
+            "action=entry_block_exit_allowed",
+            balance_circuit["kis_balance_temp_error_count"],
+            temp_recovered_count,
+            skip_zero_snapshot_count,
+            balance_circuit["balance_consecutive_failed_ticks"],
+        )
 
     # A prior ACK followed by fill persistence failure is a recovery operation,
     # never a trading opportunity.  This return is intentionally before exit
@@ -2674,6 +2729,9 @@ def run_trade_tick(
         "monitoring_universe_count": len(monitoring_universe) if 'monitoring_universe' in locals() else 0,
         "temp_error_count": temp_error_count,
         "temp_recovered_count": temp_recovered_count,
+        "balance_fetch_failed": balance_fetch_failed,
+        "skip_zero_snapshot_count": skip_zero_snapshot_count,
+        "balance_circuit": balance_circuit,
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
         "real_broker_buys": real_broker_buys,
         "real_broker_sells": real_broker_sells,

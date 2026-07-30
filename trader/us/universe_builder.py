@@ -50,7 +50,8 @@ def _load_dynamic_sources() -> dict[str, list[str]]:
         import yaml  # type: ignore
         with open(_DYNAMIC_SOURCES_PATH, "r") as f:
             data = yaml.safe_load(f) or {}
-        return {k: [str(v).upper() for v in vs] for k, vs in data.items() if isinstance(vs, list)}
+        from trader.us.universe import validate_symbol
+        return {k: [validate_symbol(v, path=_DYNAMIC_SOURCES_PATH) for v in vs] for k, vs in data.items() if isinstance(vs, list)}
     except FileNotFoundError:
         logger.warning("[US_UNIVERSE_BUILDER][WARN] dynamic_sources not found: %s", _DYNAMIC_SOURCES_PATH)
         return {}
@@ -83,10 +84,13 @@ def _is_etf(symbol: str) -> bool:
     return symbol in _KNOWN_ETFS
 
 
-def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
+def _compute_atr_pct(
+    daily_rows: list[dict], symbol: str = "UNKNOWN", *, return_status: bool = False
+) -> float | None | tuple[float | None, str]:
     """최근 14일 ATR% 계산 (normalize_daily_rows 정규화 이후 데이터 대응)."""
     if len(daily_rows) < 15:
-        return None
+        result = (None, "INSUFFICIENT_HISTORY")
+        return result if return_status else result[0]
     try:
         trs = []
         rows = sorted(daily_rows, key=lambda r: str(r.get("xymd", "") or r.get("date", "")))
@@ -104,22 +108,37 @@ def _compute_atr_pct(daily_rows: list[dict]) -> float | None:
                 low = float(low or 0)
             if not isinstance(c, (int, float)):
                 c = float(c or 0)
-            if prev_close <= 0:
+            valid_ohlc = (prev_close > 0 and high > 0 and low > 0 and c > 0
+                          and high >= low and low <= c <= high * 1.20)
+            if not valid_ohlc:
+                logger.debug("[US_ATR][INVALID_OHLC_SKIP] symbol=%s date=%s high=%s low=%s close=%s prev_close=%s", symbol, recent[i].get("xymd") or recent[i].get("date"), high, low, c, prev_close)
                 continue
             tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+            if tr / prev_close > _env_float("US_ATR_SANITY_MAX_BAR_TR_PCT", 0.25):
+                logger.debug("[US_ATR][INVALID_OHLC_SKIP] symbol=%s date=%s high=%s low=%s close=%s prev_close=%s reason=bar_tr_pct", symbol, recent[i].get("xymd") or recent[i].get("date"), high, low, c, prev_close)
+                continue
             trs.append(tr)
-        if not trs:
-            return None
+        if len(trs) < 10:
+            result = (None, "INSUFFICIENT_VALID_TR")
+            return result if return_status else result[0]
         atr = sum(trs) / len(trs)
         last_close_val = rows[-1].get("close")
         if last_close_val is None:
             last_close_val = float(str(rows[-1].get("clos", 0) or 0).replace(",", ""))
         last_close = float(last_close_val or 0)
         if last_close <= 0:
-            return None
-        return round(atr / last_close, 4)
+            result = (None, "INVALID_LAST_CLOSE")
+            return result if return_status else result[0]
+        atr_pct = round(atr / last_close, 4)
+        if atr_pct > _env_float("US_ATR_SANITY_MAX_PCT", 0.20):
+            logger.warning("[US_ATR][SANITY_FAIL] symbol=%s atr_pct=%.4f valid_tr_count=%d reason=atr_pct_above_limit", symbol, atr_pct, len(trs))
+            result = (None, "ERROR_ATR_SANITY_FAILED")
+            return result if return_status else result[0]
+        result = (atr_pct, "OK")
+        return result if return_status else result[0]
     except Exception:
-        return None
+        result = (None, "CALCULATION_ERROR")
+        return result if return_status else result[0]
 
 
 def _extract_latest_close(daily_rows: list[dict]) -> float | None:
@@ -420,18 +439,21 @@ def build_us_dynamic_universe(
 
         avg_vol = _compute_avg_volume(daily, 20)
         avg_dv = _compute_avg_dollar_volume(daily, 20)
-        atr_pct = _compute_atr_pct(daily)
+        atr_pct, atr_status = _compute_atr_pct(daily, symbol, return_status=True)
+        atr_sanity_failed = atr_status == "ERROR_ATR_SANITY_FAILED"
 
         strict_ok = (
             price_ok
             and history_days >= strict_history_days
             and avg_vol >= min_avg_volume
             and avg_dv >= min_avg_dollar_volume
+            and not atr_sanity_failed
             and (atr_pct is None or atr_pct <= max_atr_pct)
         )
 
         relaxed_ok = (
             price_ok
+            and not atr_sanity_failed
             and history_days >= relaxed_history_days
             and avg_vol > 0
             and avg_dv > 0
@@ -446,11 +468,12 @@ def build_us_dynamic_universe(
             price_ok
             and latest_close is not None
             and volume_missing_provider
+            and not atr_sanity_failed
             and (atr_pct is None or atr_pct <= max_atr_pct)
         )
 
         is_core_seed = symbol in _CORE_SEED_SYMBOLS or "manual_seed" in ticker_tags.get(symbol, [])
-        fallback_ok = price_ok and (latest_close is not None) and is_core_seed
+        fallback_ok = price_ok and (latest_close is not None) and is_core_seed and not atr_sanity_failed
 
         asset_type = "etf" if _is_etf(symbol) else "stock"
         base_entry = {
@@ -463,6 +486,8 @@ def build_us_dynamic_universe(
             "avg_dollar_volume_20d": round(avg_dv, 0),
             "history_days": history_days,
             "atr_pct": atr_pct if atr_pct is not None else 0.0,
+            "atr_status": atr_status,
+            "atr_sanity_failed": atr_sanity_failed,
         }
 
         if strict_ok:
@@ -500,7 +525,7 @@ def build_us_dynamic_universe(
             elif avg_dv < min_avg_dollar_volume:
                 fail_reason = "failed_dollar_volume"
                 filter_counts["failed_dollar_volume"] += 1
-            elif atr_pct is not None and atr_pct > max_atr_pct:
+            elif atr_sanity_failed or (atr_pct is not None and atr_pct > max_atr_pct):
                 fail_reason = "failed_atr"
                 filter_counts["failed_atr"] += 1
             else:

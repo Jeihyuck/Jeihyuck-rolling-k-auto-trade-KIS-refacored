@@ -179,9 +179,11 @@ def test_selected_count_ge_30_with_40_valid():
         pytest.skip("universe_builder not available")
 
     # 40개 유효 종목 (daily 70일, close 100)
-    valid_symbols = [f"SYM{i:03d}" for i in range(40)]
+    from trader.us.symbols import list_known_symbols
+    known_symbols = list_known_symbols()
+    valid_symbols = known_symbols[:40]
     # 61개 실패 종목 (daily 0일, price None)
-    invalid_symbols = [f"BAD{i:03d}" for i in range(61)]
+    invalid_symbols = known_symbols[40:101]
     all_symbols = valid_symbols + invalid_symbols
 
     def _side_effect_daily(symbol, exchange, **kwargs):
@@ -302,7 +304,8 @@ def test_volume_missing_provider_fallback_avoids_hard_fail():
     """260 bars with close history but zero provider volume should pass >=30 as warning fallback."""
     from trader.us.universe_builder import build_us_dynamic_universe
 
-    symbols = [f"T{i:03d}" for i in range(50)]
+    from trader.us.symbols import list_known_symbols
+    symbols = list_known_symbols()[:50]
     provider = MagicMock()
     provider.get_current_price.return_value = {"last": "120"}
     provider.get_daily_prices.return_value = _make_daily(260, close=120.0, volume=0)
@@ -327,12 +330,14 @@ def test_regression_filtered_20_hard_fail_becomes_warning_with_volume_fallback_c
     """Regression: previous 20 strict pass + many zero-volume history candidates should not ERROR."""
     from trader.us.universe_builder import build_us_dynamic_universe
 
-    symbols = [f"R{i:03d}" for i in range(50)]
+    from trader.us.symbols import list_known_symbols
+    symbols = list_known_symbols()[:50]
+    symbol_index = {symbol: idx for idx, symbol in enumerate(symbols)}
     provider = MagicMock()
     provider.get_current_price.return_value = {"last": "120"}
 
     def daily_for(symbol, exchange, as_of_date=None):
-        idx = int(symbol[1:])
+        idx = symbol_index[symbol]
         return _make_daily(260, close=120.0, volume=(2_000_000 if idx < 20 else 0))
 
     provider.get_daily_prices.side_effect = daily_for
@@ -355,7 +360,8 @@ def test_value_or_price_fields_do_not_disable_volume_missing_fallback():
     from trader.us.data_provider import normalize_daily_rows
     from trader.us.universe_builder import build_us_dynamic_universe
 
-    symbols = [f"V{i:03d}" for i in range(50)]
+    from trader.us.symbols import list_known_symbols
+    symbols = list_known_symbols()[:50]
     provider = MagicMock()
     provider.get_current_price.return_value = {"last": "120"}
     raw_daily = []

@@ -334,7 +334,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         cp_status = candidate_pool_result.get("status", "ERROR")
         logger.info("[US_PREP][HEARTBEAT] stage=candidate_pool status=done selected=%d", cp_count)
 
-        if cp_status == "ERROR" or cp_count < 50:
+        if cp_status == "ERROR" or str(cp_status).startswith("ERROR_") or cp_count < 50:
             logger.error("[US_PREP][ERROR] candidate_pool hard fail count=%d status=%s", cp_count, cp_status)
             finish_us_prep_run(run_id, status="ERROR", result={"stage": "candidate_pool", "count": cp_count})
             return {"status": "ERROR", "stage": "candidate_pool", "count": cp_count}
