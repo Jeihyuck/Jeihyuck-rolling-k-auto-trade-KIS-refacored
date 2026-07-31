@@ -104,7 +104,7 @@ def validate_us_regime_contract_for_entry(prep_result: dict | None, *, real_orde
         reason = "cluster_cap_contract_failed"
     elif list(prep_result.get("cap_violations") or []):
         reason = "sector_cap_violation_block"
-    elif prep_result.get("market_regime") == "RISK_OFF":
+    elif prep_result.get("market_regime") == "RISK_OFF" and prep_result.get("market_state") != "DEFENSE_CRASH_REBOUND":
         reason = "risk_off_entry_block"
     elif bool(prep_result.get("force_entry_block", False)):
         reason = "force_entry_block"
@@ -1587,18 +1587,23 @@ def run_trade_tick(
             "account_intraday_pnl_pct": os.getenv("US_ACCOUNT_INTRADAY_PNL_PCT"),
             "account_5d_pnl_pct": os.getenv("US_ACCOUNT_5D_PNL_PCT"),
         }
-        if isinstance(prep_result_for_overlay, dict) and prep_result_for_overlay.get("contract_version") == "us_sector_rotation_v3" and prep_result_for_overlay.get("market_regime_version") == "us_leading_regime_v1":
-            market_state_overlay = dict(prep_result_for_overlay)
-        else:
-            market_state_overlay = evaluate_us_market_state(
-                trade_date=trade_date,
-                provider=provider,
-                rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
-                prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
-                positions=current_positions,
-                account_snapshot=account_snapshot,
-                now=now,
-            )
+        # Re-evaluate at every tick: a prep-time completed-daily crash must be
+        # able to unlock after live quotes confirm a broad rebound.
+        market_state_overlay = evaluate_us_market_state(
+            trade_date=trade_date,
+            provider=provider,
+            rotation_context=(prep_result_for_overlay or {}).get("rotation_context") or {},
+            prep_result=prep_result_for_overlay if isinstance(prep_result_for_overlay, dict) else {},
+            positions=current_positions,
+            account_snapshot=account_snapshot,
+            now=now,
+        )
+        if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
+            prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
+            if prep_reason in {"risk_off_entry_block", "force_entry_block", "DEFENSE_CRASH_ENTRY_BLOCKED"} or (prep_result_for_overlay or {}).get("status") == "DEFENSE_CRASH_ENTRY_BLOCKED":
+                entry_can_proceed = True
+                allow_new_symbols = True
+                logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
         profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
         if profit_capture_intents:
@@ -1830,6 +1835,8 @@ def run_trade_tick(
         if isinstance(prep_result, dict):
             prep_result.setdefault("status", prep_status)
         gate = validate_us_regime_contract_for_entry(prep_result, real_order_mode=real_order_mode, kis_order_allowed=kis_order_allowed)
+        if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND" and gate["reason"] in {"risk_off_entry_block", "force_entry_block", "entry_can_proceed_false"}:
+            gate = {**gate, "ok": True, "reason": "ok_crash_rebound_limited"}
         required_contract_version = gate["required_contract_version"]
         required_regime_version = gate["required_regime_version"]
         actual_contract_version = gate["actual_contract_version"]
@@ -1838,9 +1845,10 @@ def run_trade_tick(
         entry_allowed_by_prep_contract = bool(gate["ok"])
         logger.info("[US_ENTRY][REGIME_CONTRACT] session=%s market_regime=%s capital_scale=%s effective_capital_scale=%s allow_new_buy=%s allow_ai_tech_buy=%s max_ai_tech_ratio=%s max_new_positions=%s effective_max_new_positions=%s underfilled_tier=%s", session, prep_result.get("market_regime"), prep_result.get("capital_scale"), prep_result.get("effective_capital_scale"), prep_result.get("allow_new_buy"), prep_result.get("allow_ai_tech_buy"), prep_result.get("max_ai_tech_ratio"), prep_result.get("max_new_positions"), prep_result.get("effective_max_new_positions"), prep_result.get("underfilled_tier"))
         available_new_slots_before_underfilled_limit = available_new_slots
-        effective_max_new_positions = prep_result.get(
-            "effective_max_new_positions",
-            market_state_overlay.get("effective_max_new_positions") if isinstance(market_state_overlay, dict) else None,
+        effective_max_new_positions = (
+            market_state_overlay.get("effective_max_new_positions")
+            if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND"
+            else prep_result.get("effective_max_new_positions", market_state_overlay.get("effective_max_new_positions"))
         )
         if effective_max_new_positions is not None:
             try:

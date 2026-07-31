@@ -306,3 +306,22 @@ def test_volume_missing_fallback_permission_split_allows_entry_when_env_enabled(
     assert contract["entry_can_proceed"] == 1
     assert contract["exit_can_proceed"] == 1
     assert contract["close_can_proceed"] == 1
+
+
+def test_crash_rebound_risk_off_is_saved_as_limited_tradeable():
+    from trader.us.prep_contract import build_us_prep_contract
+    du, cp, wl, val, paths = _make_valid_inputs(30)
+    wl["market_state_overlay"] = {
+        "market_state": "DEFENSE_CRASH_REBOUND", "market_regime": "RISK_OFF",
+        "allow_new_buy": True, "force_entry_block": False,
+        "capital_scale": .25, "exposure_multiplier": .25, "max_new_positions": 3,
+    }
+    contract = build_us_prep_contract(
+        trade_date="2026-07-30", env="practice", status="OK",
+        dynamic_universe_result=du, candidate_pool_result=cp,
+        watchlist_result=wl, validation=val, paths=paths,
+    )
+    assert contract["entry_can_proceed"] == 1
+    assert contract["trade_block_reason"] == "ok_crash_rebound_limited"
+    assert contract["effective_capital_scale"] == pytest.approx(.25)
+    assert contract["effective_max_new_positions"] == 3

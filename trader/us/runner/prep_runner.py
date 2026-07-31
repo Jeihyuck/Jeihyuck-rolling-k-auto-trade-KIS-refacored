@@ -491,6 +491,7 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         "account_loss_kill_switch_level": (market_state_overlay or {}).get("account_loss_kill_switch_level", "NONE"),
         "data_quality": (market_state_overlay or {}).get("data_quality", "ok"),
         "data_quality_warnings": (market_state_overlay or {}).get("data_quality_warnings", []),
+        "intraday_rebound": (market_state_overlay or {}).get("intraday_rebound"),
         "forbidden_hedge_symbols": (market_state_overlay or {}).get("forbidden_hedge_symbols", []),
     }
 

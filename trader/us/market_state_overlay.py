@@ -172,6 +172,10 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
         out[f"{sym.lower()}_20d_return"] = _ret_from_rows(rows, 20)
         if out[f"{sym.lower()}_1d_return"] is None:
             warnings.append(f"market_return_missing:{sym}")
+        clean_rows = [r for r in (rows or []) if isinstance(r, dict)] if isinstance(rows, list) else []
+        if any(_row_date_value(r) for r in clean_rows):
+            clean_rows.sort(key=lambda r: _row_date_value(r) or "00000000")
+        out[f"{sym.lower()}_previous_close"] = _row_close_value(clean_rows[-1]) if clean_rows else None
 
     spy3 = out.get("spy_3d_return")
     spy20 = out.get("spy_20d_return")
@@ -200,6 +204,53 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
     out["ai_relative_strength"] = out["smh_vs_spy_3d"]
     return out
 
+
+def _intraday_rebound(provider: Any, rets: dict[str, float | None], warnings: list[str]) -> dict[str, Any]:
+    """Fetch and validate the live SPY/QQQ/SMH crash-rebound snapshot."""
+    snapshots: dict[str, dict] = {}
+    for sym in ("SPY", "QQQ", "SMH"):
+        quote = None
+        try:
+            if isinstance(provider, dict):
+                quotes = provider.get("intraday_quotes") or provider.get("quotes") or {}
+                quote = quotes.get(sym) or quotes.get(sym.lower())
+            elif callable(getattr(provider, "get_current_price", None)):
+                quote = provider.get_current_price(sym, _MARKET_RETURN_EXCHANGE_MAP[sym])
+        except Exception as exc:
+            warnings.append(f"intraday_rebound_fetch_failed:{sym}:{exc}")
+        quote = quote if isinstance(quote, dict) else {}
+        def first(keys):
+            return next((_num(quote.get(k)) for k in keys if _num(quote.get(k)) is not None), None)
+        current = first(("last", "current", "current_price", "price", "ovrs_nmix_prpr", "prpr"))
+        open_px = first(("open", "open_price", "day_open"))
+        vwap = first(("vwap", "VWAP", "weighted_average_price"))
+        prev_close = first(("previous_close", "prev_close", "base", "bass_pric"))
+        if prev_close is None:
+            prev_close = rets.get(f"{sym.lower()}_previous_close")
+        if prev_close is None and isinstance(provider, dict):
+            rows = provider.get(sym) or provider.get(sym.lower()) or []
+            clean = [r for r in rows if isinstance(r, dict)]
+            if clean:
+                if any(_row_date_value(r) for r in clean):
+                    clean.sort(key=lambda r: _row_date_value(r) or "00000000")
+                prev_close = _row_close_value(clean[-1])
+        suspect = bool(quote.get("suspect") or quote.get("stale") or quote.get("_stale_date"))
+        valid = bool(current and current > 0 and prev_close and prev_close > 0 and not suspect)
+        intraday_return = current / prev_close - 1.0 if valid else None
+        snapshots[sym] = {"current": current, "previous_close": prev_close, "open": open_px, "vwap": vwap, "intraday_return": intraday_return, "valid": valid, "suspect": suspect}
+        if not valid:
+            warnings.append(f"intraday_rebound_missing_or_suspect:{sym}")
+    spy, qqq, smh = (snapshots[s] for s in ("SPY", "QQQ", "SMH"))
+    signals = {
+        "spy_return": spy["intraday_return"] is not None and spy["intraday_return"] >= .003,
+        "qqq_return": qqq["intraday_return"] is not None and qqq["intraday_return"] >= .008,
+        "smh_return": smh["intraday_return"] is not None and smh["intraday_return"] >= .015,
+        "qqq_price_strength": bool(qqq["current"] and ((qqq["vwap"] and qqq["current"] > qqq["vwap"]) or (qqq["open"] and qqq["current"] >= qqq["open"]))),
+        "smh_price_strength": bool(smh["current"] and ((smh["vwap"] and smh["current"] > smh["vwap"]) or (smh["open"] and smh["current"] >= smh["open"]))),
+    }
+    hard_down = any((spy["intraday_return"] is not None and spy["intraday_return"] <= -.005, qqq["intraday_return"] is not None and qqq["intraday_return"] <= -.008, smh["intraday_return"] is not None and smh["intraday_return"] <= -.015))
+    data_ok = all(snapshot["valid"] for snapshot in snapshots.values())
+    return {"snapshots": snapshots, "signals": signals, "confirmation_count": sum(signals.values()), "data_ok": data_ok, "hard_down": hard_down, "smh_recovered": bool(signals["smh_return"] or signals["smh_price_strength"])}
 
 def regime_constraints(market_regime: str) -> dict[str, Any]:
     r = str(market_regime or "NEUTRAL").upper()
@@ -317,8 +368,21 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
 
     strong = rotation_regime == "AI_ON" and spy3 is not None and qqq3 is not None and smh3 is not None and spy3 > 0 and qqq3 > spy3 and smh3 > spy3 and ((qqq1 is not None and qqq1 >= 0) or (spy1 is not None and spy1 >= 0)) and not suspect and (pnl1 is None or pnl1 > -0.005) and quality == "ok"
     riskon = spy1 is not None and qqq1 is not None and spy1 > 0 and qqq1 > 0 and rotation_regime in {"AI_ON", "BROAD_UP"} and not suspect and (pnl1 is None or pnl1 > -0.007)
+    rebound = None
+    daily_crash = any(reason.startswith(("SPY_1D_", "QQQ_1D_", "SMH_1D_")) for reason in reasons)
+    hard_non_market_crash = any(reason.startswith(("ACCOUNT_", "ROTATION_CONTEXT_", "DEGRADED_BENCHMARK_")) for reason in reasons)
     if crash:
-        state = "DEFENSE_CRASH"
+        state = "DEFENSE_CRASH_PENDING"
+        rebound = _intraday_rebound(provider, rets, warnings) if daily_crash and not hard_non_market_crash else {"snapshots": {}, "signals": {}, "confirmation_count": 0, "data_ok": False, "hard_down": True, "smh_recovered": False}
+        logger.info("[US_MARKET_STATE][INTRADAY_REBOUND] data_ok=%s hard_down=%s confirmations=%s signals=%s snapshots=%s", rebound["data_ok"], rebound["hard_down"], rebound["confirmation_count"], rebound["signals"], rebound["snapshots"])
+        if rebound["data_ok"] and not rebound["hard_down"] and rebound["confirmation_count"] >= 2:
+            state = "DEFENSE_CRASH_REBOUND"
+            reasons.append("INTRADAY_CRASH_REBOUND_CONFIRMED")
+            logger.warning("[US_MARKET_STATE][CRASH_REBOUND_UNLOCK] confirmations=%s", rebound["confirmation_count"])
+        else:
+            state = "DEFENSE_CRASH_CONFIRMED"
+            reasons.append("INTRADAY_CRASH_REBOUND_BLOCKED")
+            logger.warning("[US_MARKET_STATE][CRASH_REBOUND_BLOCK] data_ok=%s hard_down=%s confirmations=%s", rebound["data_ok"], rebound["hard_down"], rebound["confirmation_count"])
     elif riskoff:
         state = "DEFENSE_RISK_OFF"
     elif caution:
@@ -333,9 +397,9 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         state = "NORMAL"
         reasons.append("NORMAL_BASELINE")
 
-    mults = {"DEFENSE_CRASH": _env_float("US_DEFENSE_CRASH_MULT", 0.0), "DEFENSE_RISK_OFF": _env_float("US_DEFENSE_RISK_OFF_MULT", 0.20), "DEFENSE_CAUTION": _env_float("US_DEFENSE_CAUTION_MULT", 0.50), "NORMAL": 1.0, "RISK_ON": _env_float("US_RISK_ON_MULT", 1.10), "STRONG_RISK_ON": _env_float("US_STRONG_RISK_ON_MULT", 1.25)}
-    modes = {"DEFENSE_CRASH": "crash_tight", "DEFENSE_RISK_OFF": "risk_off_tight", "DEFENSE_CAUTION": "caution", "NORMAL": "normal", "RISK_ON": "risk_on", "STRONG_RISK_ON": "strong_risk_on"}
-    trails = {"DEFENSE_CRASH": _env_float("US_TRAIL_CRASH_PCT", .008), "DEFENSE_RISK_OFF": _env_float("US_TRAIL_RISK_OFF_PCT", .010), "DEFENSE_CAUTION": _env_float("US_TRAIL_CAUTION_PCT", .015), "NORMAL": _env_float("US_TRAIL_NORMAL_PCT", .020), "RISK_ON": _env_float("US_TRAIL_RISK_ON_PCT", .025), "STRONG_RISK_ON": _env_float("US_TRAIL_STRONG_RISK_ON_PCT", .030)}
+    mults = {"DEFENSE_CRASH_PENDING": 0.0, "DEFENSE_CRASH_CONFIRMED": _env_float("US_DEFENSE_CRASH_MULT", 0.0), "DEFENSE_CRASH_REBOUND": _env_float("US_DEFENSE_CRASH_REBOUND_MULT", 0.25), "DEFENSE_RISK_OFF": _env_float("US_DEFENSE_RISK_OFF_MULT", 0.20), "DEFENSE_CAUTION": _env_float("US_DEFENSE_CAUTION_MULT", 0.50), "NORMAL": 1.0, "RISK_ON": _env_float("US_RISK_ON_MULT", 1.10), "STRONG_RISK_ON": _env_float("US_STRONG_RISK_ON_MULT", 1.25)}
+    modes = {"DEFENSE_CRASH_PENDING": "crash_tight", "DEFENSE_CRASH_CONFIRMED": "crash_tight", "DEFENSE_CRASH_REBOUND": "crash_rebound_tight", "DEFENSE_RISK_OFF": "risk_off_tight", "DEFENSE_CAUTION": "caution", "NORMAL": "normal", "RISK_ON": "risk_on", "STRONG_RISK_ON": "strong_risk_on"}
+    trails = {"DEFENSE_CRASH_PENDING": _env_float("US_TRAIL_CRASH_PCT", .008), "DEFENSE_CRASH_CONFIRMED": _env_float("US_TRAIL_CRASH_PCT", .008), "DEFENSE_CRASH_REBOUND": _env_float("US_TRAIL_CRASH_REBOUND_PCT", .010), "DEFENSE_RISK_OFF": _env_float("US_TRAIL_RISK_OFF_PCT", .010), "DEFENSE_CAUTION": _env_float("US_TRAIL_CAUTION_PCT", .015), "NORMAL": _env_float("US_TRAIL_NORMAL_PCT", .020), "RISK_ON": _env_float("US_TRAIL_RISK_ON_PCT", .025), "STRONG_RISK_ON": _env_float("US_TRAIL_STRONG_RISK_ON_PCT", .030)}
     loss = state.startswith("DEFENSE") and any(r.startswith("ACCOUNT_") for r in reasons)
     if loss and state in {"RISK_ON", "STRONG_RISK_ON"}:
         state = "DEFENSE_CAUTION"
@@ -395,7 +459,7 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         market_regime = "GROWTH_LEADERSHIP"
     else:
         market_regime = "NEUTRAL"
-    if state in {"DEFENSE_CRASH"}:
+    if state in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED", "DEFENSE_CRASH_REBOUND"}:
         market_regime = "RISK_OFF"
     elif state in {"DEFENSE_CAUTION", "DEFENSE_RISK_OFF"} and market_regime not in {"RISK_OFF"}:
         market_regime = "DEFENSIVE"
@@ -404,10 +468,21 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
 
     constraints = regime_constraints(market_regime)
     max_gross = _env_float("US_MAX_GROSS_EXPOSURE_PCT", 0.95)
-    allow_new = constraints.get("allow_new_buy", True) and state != "DEFENSE_CRASH" and acct["gross_exposure_pct"] < max_gross
+    allow_new = constraints.get("allow_new_buy", True) and acct["gross_exposure_pct"] < max_gross
+    if state.startswith("DEFENSE_CRASH"):
+        allow_new = state == "DEFENSE_CRASH_REBOUND" and acct["gross_exposure_pct"] < max_gross
     if acct["gross_exposure_pct"] >= max_gross:
         reasons.append("GROSS_EXPOSURE_CAP_REACHED")
     constraints["allow_new_buy"] = bool(allow_new)
+    if state == "DEFENSE_CRASH_REBOUND":
+        constraints.update(
+            force_entry_block=False,
+            allow_new_buy=True,
+            allow_ai_tech_buy=bool(rebound and rebound["smh_recovered"]),
+            trailing_stop_mode="crash_rebound_tight",
+            take_profit_mode="fast_profit_capture",
+            max_new_positions=int(_env_float("US_DEFENSE_CRASH_REBOUND_MAX_NEW_POSITIONS", 3)),
+        )
     regime_score = growth_score + breadth_score - risk_score - defensive_score
     out = {
         **rets,
@@ -430,8 +505,9 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         "leading_indicators": dict(rets),
         "exposure_multiplier": mults[state],
         "allow_new_buy": constraints.get("allow_new_buy", allow_new),
-        "allow_add_to_existing": market_regime in {"NEUTRAL", "GROWTH_LEADERSHIP", "RISK_ON"},
-        "trim_required": state in {"DEFENSE_CRASH", "DEFENSE_RISK_OFF"},
+        "allow_add_to_existing": False if state == "DEFENSE_CRASH_REBOUND" else market_regime in {"NEUTRAL", "GROWTH_LEADERSHIP", "RISK_ON"},
+        "trim_required": state in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED", "DEFENSE_RISK_OFF"},
+        "intraday_rebound": rebound,
         "profit_capture_enabled": os.getenv("US_PROFIT_CAPTURE_ENABLE", "1") not in {"0", "false", "False"},
         "trailing_stop_mode": constraints.get("trailing_stop_mode", modes[state]),
         "trailing_stop_pct": trails[state],
@@ -445,6 +521,9 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         "data_quality_warnings": warnings,
         "forbidden_hedge_symbols": sorted(FORBIDDEN_HEDGE_SYMBOLS),
     }
+    if state == "DEFENSE_CRASH_REBOUND":
+        out["effective_capital_scale"] = mults[state]
+        out["effective_max_new_positions"] = constraints["max_new_positions"]
     logger.info("[US_MARKET_STATE][REGIME] market_state=%s defense_regime=%s risk_on_regime=%s reasons=%s rotation_regime=%s spy_1d=%s qqq_1d=%s smh_1d=%s exposure_multiplier=%.2f allow_new_buy=%s allow_add_to_existing=%s allow_ai_tech_buy=%s", out["market_state"], out["defense_regime"], out["risk_on_regime"], out["market_state_reasons"], rotation_regime, spy1, qqq1, smh1, out["exposure_multiplier"], out["allow_new_buy"], out["allow_add_to_existing"], out["allow_ai_tech_buy"])
     return out
 
@@ -472,7 +551,7 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
                 reason = "DEFENSE_RISK_OFF_ENTRY_REDUCED"
         elif state == "DEFENSE_CAUTION" and (sym in pos_by_sym or (cluster in AI_TECH_CLUSTERS and not overlay.get("allow_ai_tech_buy"))):
             reason = "DEFENSE_CAUTION_ENTRY_REDUCED"
-        elif overlay.get("market_regime") == "RISK_OFF":
+        elif overlay.get("market_regime") == "RISK_OFF" and state != "DEFENSE_CRASH_REBOUND":
             reason = "risk_off_entry_block"
         elif overlay.get("market_regime") == "DEFENSIVE" and cluster not in DEFENSIVE_CLUSTERS:
             reason = "defensive_only_entry_block"

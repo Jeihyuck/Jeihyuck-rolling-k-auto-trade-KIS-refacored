@@ -44,7 +44,7 @@ def test_forbidden_symbols_include_inverse_and_not_defensive_etfs():
 def test_oldest_first_defense_crash_thresholds_and_entry_block():
     for p in [provider(spy=(100, 100, 100, 98)), provider(qqq=(100, 100, 100, 97.2))]:
         o = eval_state(provider=p)
-        assert o["market_state"] == "DEFENSE_CRASH"
+        assert o["market_state"] == "DEFENSE_CRASH_CONFIRMED"
     smh_only = eval_state(provider=provider(smh=(100, 100, 100, 96)))
     assert smh_only["market_state"] != "DEFENSE_CRASH"
     assert smh_only.get("sector_state") == "SECTOR_CRASH_AI_SEMI"
@@ -65,7 +65,7 @@ def test_mixed_date_rows_are_sorted_before_return_calculation():
     ]
     o = eval_state(provider=p)
     assert o["spy_1d_return"] == pytest.approx(-0.02)
-    assert o["market_state"] == "DEFENSE_CRASH"
+    assert o["market_state"] == "DEFENSE_CRASH_CONFIRMED"
 
 
 def test_risk_off_and_caution_budget_multipliers():
@@ -88,7 +88,7 @@ def test_oldest_first_risk_on_and_strong_risk_on_multipliers():
 def test_account_loss_kill_switch_overrides_risk_on():
     strong_provider = provider(spy=(100, 101, 102, 103), qqq=(100, 102, 104, 106), smh=(100, 102, 105, 108))
     killed = eval_state(provider=strong_provider, rotation_context={"rotation_regime": "AI_ON", "benchmark_data_quality": "ok"}, prep_result={"rotation_regime": "AI_ON"}, account_snapshot={"account_intraday_pnl_pct": -0.018})
-    assert killed["market_state"] == "DEFENSE_CRASH"
+    assert killed["market_state"] == "DEFENSE_CRASH_CONFIRMED"
     assert killed["account_loss_kill_switch_triggered"] is True
 
 
@@ -246,3 +246,39 @@ def test_market_regime_risk_off_contract_block_fields():
     assert o["market_regime"] == "RISK_OFF"
     assert o["force_entry_block"] is True
     assert o["allow_new_buy"] is False
+
+
+def test_daily_crash_unlocks_on_valid_intraday_rebound(monkeypatch):
+    p = provider(qqq=(100, 100, 100, 98), smh=(100, 100, 100, 95))
+    p["intraday_quotes"] = {
+        "SPY": {"last": 100.4, "previous_close": 100, "open": 100.1, "vwap": 100.2},
+        "QQQ": {"last": 99.0, "previous_close": 98, "open": 98.2, "vwap": 98.5},
+        "SMH": {"last": 96.6, "previous_close": 95, "open": 95.2, "vwap": 96.0},
+    }
+    o = eval_state(provider=p)
+    assert o["market_state"] == "DEFENSE_CRASH_REBOUND"
+    assert o["exposure_multiplier"] == pytest.approx(.25)
+    assert o["allow_new_buy"] is True
+    assert o["force_entry_block"] is False
+    assert o["allow_add_to_existing"] is False
+    assert o["allow_ai_tech_buy"] is True
+    assert o["effective_max_new_positions"] == 3
+    assert o["trailing_stop_mode"] == "crash_rebound_tight"
+    assert o["take_profit_mode"] == "fast_profit_capture"
+
+
+def test_daily_crash_rebound_missing_or_hard_down_fails_closed():
+    missing = eval_state(provider=provider(qqq=(100, 100, 100, 98), smh=(100, 100, 100, 95)))
+    assert missing["market_state"] == "DEFENSE_CRASH_CONFIRMED"
+    assert missing["allow_new_buy"] is False
+    assert missing["force_entry_block"] is True
+
+    p = provider(qqq=(100, 100, 100, 98), smh=(100, 100, 100, 95))
+    p["intraday_quotes"] = {
+        "SPY": {"last": 99.4, "previous_close": 100, "open": 100},
+        "QQQ": {"last": 99, "previous_close": 98, "open": 98},
+        "SMH": {"last": 97, "previous_close": 95, "open": 95},
+    }
+    blocked = eval_state(provider=p)
+    assert blocked["market_state"] == "DEFENSE_CRASH_CONFIRMED"
+    assert blocked["intraday_rebound"]["hard_down"] is True
