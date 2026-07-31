@@ -26,7 +26,7 @@ def test_two_orderable_candidates_size_against_two_not_remaining_slots(monkeypat
 def test_final_quantity_is_rebuilt_and_can_increase_from_old_small_plan():
     from trader.pb1_engine import CandidateFeature, _recalculate_kr_orderable_quantities
     candidate = CandidateFeature("005930", "KOSPI", {
-        "order_price": 100_000, "stop_price": 95_000, "volume_avg20": 100_000,
+        "order_price": 100_000, "stop_price": 95_000, "vol20": 100_000,
     }, True, [], 1, [], planned_qty=1, planned_value=100_000)
     result = _recalculate_kr_orderable_quantities(
         [candidate], per_position_budget=13_500_000, account_equity=1_000_000_000, risk_pct=.5)

@@ -50,3 +50,20 @@ def test_breadth_missing_fields_is_explicitly_blocked(monkeypatch,tmp_path,caplo
     result=calculate_market_breadth([{"code":"1","market":"KOSPI","close":100}],as_of="2026-07-31",source="final30_fallback")
     assert result["markets"]["KOSPI"]["data_quality"] == "BLOCKED"
     assert "BREADTH_INPUT_BLOCKED" in caplog.text
+
+def test_all_regime_symbols_allow_long_fetch_in_trade_precomputed_mode():
+    import pandas as pd
+    from types import SimpleNamespace
+    from trader.kr.regime import KR_REGIME_REQUIRED_SYMBOLS
+    calls=[]
+    class Provider:
+        def get_ohlcv(self,code,count,**kwargs):
+            calls.append((code,count,kwargs))
+            df=pd.DataFrame({"date":pd.date_range("2025-01-01",periods=260),"close":range(260),"volume":[100]*260})
+            return SimpleNamespace(df=df,meta={"source":"db"})
+    e=PB1Engine.__new__(PB1Engine); e.phase="entry"; e.trade_use_precomputed_features=True
+    e._precomputed_final30_map={"x":{}}; e.window_internal="morning"; e.env="trade"; e.daily_fetch_count=0; e.ohlcv_provider=Provider(); e._data_metrics={}
+    for symbol in KR_REGIME_REQUIRED_SYMBOLS:
+        df,_=e._fetch_daily(symbol,count=260)
+        assert len(df) == 260
+    assert all(kwargs["purpose"] == "kr_regime" and kwargs["allow_long_fetch"] for _,_,kwargs in calls)

@@ -54,7 +54,7 @@ def test_three_ticks_ten_minutes_confirms_but_never_risk_on():
     row.update({"close": 90, "ma20": 100, "ma50": 110, "intraday_return_positive": .04,
                 "gap_up_return": .02, "above_open": True, "above_vwap": True,
                 "advance_ratio_intraday": .72, "turnover_expansion": 1.5,
-                "leader_confirmation_count": 2, "distance_from_intraday_high": -.01,
+                "leader_confirmation_count": 2, "kospi_confirmation_ok": True, "market": "KOSPI", "distance_from_intraday_high": -.01,
                 "shock_consecutive_ticks": 3, "shock_minutes": 10})
     snap = build_kr_regime_snapshot({"KOSPI": row, "KOSDAQ": row})
     assert snap.global_state == "KR_SHOCK_REBOUND_CONFIRMED"
@@ -124,9 +124,37 @@ def test_confirmed_rebound_and_weaker_market_never_exceed_25_percent():
     kospi=observations(True); kospi.update({"close":90,"ma20":100,"ma50":110,
       "intraday_return_positive":.08,"gap_up_return":.04,"above_open":True,"above_vwap":True,
       "advance_ratio_intraday":.82,"turnover_expansion":1.8,"distance_from_intraday_high":-.01,
-      "leader_confirmation_count":3,"shock_consecutive_ticks":3,"shock_minutes":11})
+      "leader_confirmation_count":3,"kospi_confirmation_ok":True,"market":"KOSPI","shock_consecutive_ticks":3,"shock_minutes":11})
     kosdaq=observations(False)
     snap=build_kr_regime_snapshot({"KOSPI":kospi,"KOSDAQ":kosdaq})
     assert snap.market_states["KOSPI"].state == "KR_SHOCK_REBOUND_CONFIRMED"
     assert snap.execution_policy.budget_multiplier <= .25
     assert snap.execution_policy.allow_add_to_existing is False
+
+
+def test_kosdaq_confirmed_uses_own_proxy_and_breadth_not_kospi_leaders():
+    kosdaq=observations(True); kosdaq.update({"market":"KOSDAQ","close":90,"ma20":100,"ma50":110,
+      "intraday_return_positive":.05,"gap_up_return":.02,"above_open":True,"above_vwap":True,
+      "advance_ratio_intraday":.75,"median_return_1d":.03,"turnover_expansion":1.5,
+      "distance_from_intraday_high":-.01,"leader_confirmation_count":0,"shock_consecutive_ticks":3,"shock_minutes":11})
+    snap=build_kr_regime_snapshot({"KOSPI":{},"KOSDAQ":kosdaq})
+    assert snap.market_states["KOSDAQ"].state == "KR_SHOCK_REBOUND_CONFIRMED"
+
+
+def test_kospi_confirmation_requires_direction_votes():
+    kospi=observations(True); kospi.update({"market":"KOSPI","close":90,"ma20":100,"ma50":110,
+      "intraday_return_positive":.05,"gap_up_return":.02,"above_open":True,"above_vwap":True,
+      "advance_ratio_intraday":.8,"turnover_expansion":1.5,"distance_from_intraday_high":-.01,
+      "leader_confirmation_count":3,"kospi_confirmation_ok":False,"shock_consecutive_ticks":3,"shock_minutes":11})
+    snap=build_kr_regime_snapshot({"KOSPI":kospi,"KOSDAQ":{}})
+    assert snap.market_states["KOSPI"].state == "KR_SHOCK_REBOUND_PENDING"
+
+
+def test_market_budget_is_applied_independently():
+    from trader.kr.regime import calculate_market_budgets
+    kospi=observations(True)
+    kosdaq=observations(False)
+    snap=build_kr_regime_snapshot({"KOSPI":kospi,"KOSDAQ":kosdaq})
+    budgets=calculate_market_budgets(snap,10_000_000,100_000_000)
+    assert budgets["KOSPI"] != budgets["KOSDAQ"]
+    assert budgets["KOSPI"] > budgets["KOSDAQ"]

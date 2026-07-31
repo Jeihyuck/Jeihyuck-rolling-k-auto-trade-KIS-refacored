@@ -227,8 +227,8 @@ from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
 from trader.kr.regime import (
-    KR_MARKET_ETFS, KR_LEADER_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
-    build_kr_regime_snapshot, candidate_allows_buy, constrain_global_policy, execution_policy, market_allows_buy, market_execution_policies, write_snapshot,
+    KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
+    build_kr_regime_snapshot, calculate_market_budgets, candidate_allows_buy, constrain_global_policy, execution_policy, market_allows_buy, market_execution_policies, normalize_kr_market, write_snapshot,
 )
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
 from trader.kr.account_risk import evaluate_kr_account_risk
@@ -697,6 +697,25 @@ class CandidateFeature:
     sizing_reason: str | None = None  # 명확한 reason 코드 (BUDGET_INSUFFICIENT_FOR_1_SHARE, MIN_ORDER_NOTIONAL_FAIL 등)
     sizing_details: Dict[str, Any] | None = None  # 수치 정보: buy_budget, price, qty, shortfall 등
     entry_plan: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self.features = normalize_kr_candidate_runtime_features(self.features)
+
+
+def _first_positive(*values: Any) -> float | None:
+    for value in values:
+        try:
+            numeric = float(value)
+            if numeric > 0: return numeric
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def normalize_kr_candidate_runtime_features(features: dict[str, Any] | None) -> dict[str, Any]:
+    out = dict(features or {})
+    out["volume_avg20"] = _first_positive(out.get("volume_avg20"), out.get("avg_volume20"), out.get("vol20"))
+    return out
 
 
 def _normalize_sizing_failure_reason(raw_reason: str | None) -> str:
@@ -1179,7 +1198,7 @@ def _recalculate_kr_orderable_quantities(
         per_share_risk = price - stop
         risk_qty = int((account_equity * (risk_pct / 100.0)) // per_share_risk)
         budget_qty = int(per_position_budget // price)
-        avg_volume = float(features.get("volume_avg20") or features.get("avg_volume20") or 0.0)
+        avg_volume = float(_first_positive(features.get("volume_avg20"), features.get("avg_volume20"), features.get("vol20")) or 0.0)
         liquidity_qty = int(avg_volume * liquidity_participation) if avg_volume > 0 else 0
         final_qty = min(risk_qty, budget_qty, liquidity_qty)
         if final_qty <= 0:
@@ -6973,7 +6992,7 @@ class PB1Engine:
             count = days if days is not None else int(PB1_OHLCV_DAYS_BASE)
         
         # Benchmark fetches are data preparation, never a regime fallback.
-        purpose = "benchmark" if code in {RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ} else None
+        purpose = "kr_regime" if code in KR_REGIME_REQUIRED_SYMBOLS else ("benchmark" if code in {RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ} else None)
 
         trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
         trade_precomputed_only = bool(
@@ -6985,9 +7004,9 @@ class PB1Engine:
         )
         usage_context = "trade" if (self.env == "trade" or os.getenv("MODE") == "trade") else None
         allow_long_fetch = True
-        if trade_precomputed_only and count > 60 and purpose != "regime":
+        if trade_precomputed_only and count > 60 and purpose not in {"kr_regime", "benchmark"}:
             allow_long_fetch = False
-        if purpose == "regime":
+        if purpose == "kr_regime":
             logger.info(
                 "[OHLCV][TRADE][REGIME_EXCEPTION] symbol=%s days=%s db_first=1 long_fetch_allowed=1",
                 code,
@@ -13850,6 +13869,7 @@ class PB1Engine:
     def _kr_etf_observation(self, symbol: str, breadth: dict[str, float] | None) -> dict[str, Any]:
         """Load a real KRX security; literal index names must never reach OHLCV."""
         df, _ = self._fetch_daily(symbol, count=260)
+        logger.info("[KR_REGIME][SYMBOL_READINESS] symbol=%s rows=%s source=db ready=%s", symbol, len(df) if df is not None else 0, int(df is not None and len(df) >= 201))
         if df is None or len(df) < 201 or "close" not in df:
             logger.warning("[KR_REGIME][INDEX_RESOLUTION] symbol=%s available=0", symbol)
             return {"stale": True}
@@ -13899,7 +13919,7 @@ class PB1Engine:
             if value.get("data_quality") == "BLOCKED": return None
             return {"breadth_ma20": value.get("breadth_ma20"), "breadth_ma50": value.get("breadth_ma50"),
                     "advance_ratio": value.get("advance_ratio"), "advance_ratio_intraday": value.get("advance_ratio"),
-                    "median_return_5d": value.get("median_return_5d"), "input_data_quality": value.get("data_quality")}
+                    "median_return_1d": value.get("median_return_1d"), "median_return_5d": value.get("median_return_5d"), "input_data_quality": value.get("data_quality")}
         kospi_breadth = breadth_for("KOSPI")
         kosdaq_breadth = breadth_for("KOSDAQ")
         observations = {
@@ -13911,13 +13931,16 @@ class PB1Engine:
         confirm = self._kr_etf_observation(KR_MARKET_ETFS["KOSPI_CONFIRM"], kospi_breadth)
         if confirm.get("stale"):
             observations["KOSPI"]["stale"] = True
+        confirmation_votes = sum((float(confirm.get("intraday_return") or 0) > 0, bool(confirm.get("above_open")), bool(confirm.get("above_vwap")), float(confirm.get("distance_from_intraday_high") or -1) >= -.02, float(confirm.get("turnover_expansion") or 0) >= 1.0))
+        kospi_confirmation_ok = confirmation_votes >= 3
+        logger.info("[KR_REGIME][KOSPI_CONFIRMATION] symbol=226490 positive_votes=%s required=3 confirmed=%s", confirmation_votes, int(kospi_confirmation_ok))
         leader_count = 0
-        for symbol in KR_LEADER_SYMBOLS:
+        for symbol in KR_MARKET_LEADERS["KOSPI"]:
             leader = self._kr_etf_observation(symbol, kospi_breadth)
             if not leader.get("stale") and leader.get("close", 0) > leader.get("ma20", float("inf")):
                 leader_count += 1
-        for value in observations.values():
-            value["leader_confirmation_count"] = leader_count
+        observations["KOSPI"].update({"market": "KOSPI", "leader_confirmation_count": leader_count, "kospi_confirmation_ok": kospi_confirmation_ok})
+        observations["KOSDAQ"].update({"market": "KOSDAQ", "leader_confirmation_count": 0})
         now = getattr(self, "_now_kst", None) or now_kst()
         persisted = load_runtime_state(str(self._today), now=now)
         trackers = {}
@@ -13976,7 +13999,9 @@ class PB1Engine:
         if snapshot.data_quality == "DEGRADED":
             stable_policy = replace(stable_policy, budget_multiplier=stable_policy.budget_multiplier * .8)
         stable_market_policies = market_execution_policies(stable_states, snapshot.data_quality)
-        stable_policy = constrain_global_policy(stable_policy, stable_market_policies)
+        active_market_policies = [p for p in stable_market_policies.values() if p.data_quality != "BLOCKED"]
+        if active_market_policies:
+            stable_policy = replace(stable_policy, budget_multiplier=max(p.budget_multiplier for p in active_market_policies), allow_new_buy=any(p.allow_new_buy for p in active_market_policies))
         snapshot = replace(snapshot, market_states=stable_states, global_state=stable_global,
                            execution_policy=stable_policy, market_policies=stable_market_policies)
         self._kr_regime_snapshot = snapshot
@@ -17111,24 +17136,32 @@ class PB1Engine:
                         logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=PASS", cf.code, normalized_market)
                         kept_orderable.append(cf)
                 logger.info("[KR_MARKET_STATE][ENTRY_FILTER_APPLIED] before=%s after=%s market_state=%s", len(orderable_candidates), len(kept_orderable), overlay.get("market_state"))
-                orderable_candidates = kept_orderable
-                policy_max = overlay.get("max_new_positions")
-                per_position_budget, sizing_meta = _compute_kr_per_position_budget(
-                    tick_budget=float(tick_budget_krw or 0.0),
-                    orderable_count=len(orderable_candidates),
-                    slots_remaining=slots_remaining,
-                    session_kind=session_kind,
-                    policy_max_new_positions=int(policy_max) if policy_max is not None else None,
-                )
-                effective_target = int(sizing_meta["actual_target"])
-                orderable_candidates = orderable_candidates[:effective_target]
-                orderable_candidates = _recalculate_kr_orderable_quantities(
-                    orderable_candidates, per_position_budget=per_position_budget,
-                    account_equity=float(getattr(self, "_equity_krw", 0.0) or available_cash_krw),
-                    risk_pct=float(RISK_PER_TRADE_PCT),
-                    liquidity_participation=float(os.getenv("PB1_KR_LIQUIDITY_PARTICIPATION", ".01")),
-                )
-                logger.info("[KR_REGIME][SIZING] tick_budget=%.0f orderable_count=%s slots_remaining=%s policy_max=%s effective_target=%s per_position_budget=%.0f", float(tick_budget_krw or 0), len(orderable_candidates), slots_remaining, policy_max, effective_target, per_position_budget)
+                sized_candidates = []
+                base_tick_budget = float(getattr(self, "_kr_base_tick_budget_krw", tick_budget_krw) or tick_budget_krw)
+                market_budgets = calculate_market_budgets(snapshot, base_tick_budget, float(available_cash_krw or 0))
+                remaining_slots = slots_remaining
+                for market in ("KOSPI", "KOSDAQ"):
+                    market_candidates = [c for c in kept_orderable if normalize_kr_market(getattr(c, "market", "")) == market]
+                    market_policy = snapshot.market_policies[market]
+                    market_tick_budget = market_budgets[market]
+                    per_position_budget, sizing_meta = _compute_kr_per_position_budget(
+                        tick_budget=market_tick_budget, orderable_count=len(market_candidates), slots_remaining=remaining_slots,
+                        session_kind=session_kind, policy_max_new_positions=market_policy.max_new_positions)
+                    effective_target = int(sizing_meta["actual_target"]) if market_candidates else 0
+                    market_candidates = _recalculate_kr_orderable_quantities(
+                        market_candidates[:effective_target], per_position_budget=per_position_budget,
+                        account_equity=float(getattr(self, "_equity_krw", 0.0) or available_cash_krw), risk_pct=float(RISK_PER_TRADE_PCT),
+                        liquidity_participation=float(os.getenv("PB1_KR_LIQUIDITY_PARTICIPATION", ".01")))
+                    sized_candidates.extend(market_candidates); remaining_slots -= len(market_candidates)
+                    logger.info("[KR_REGIME][SIZING] market=%s tick_budget=%.0f orderable_count=%s slots_remaining=%s policy_max=%s effective_target=%s per_position_budget=%.0f", market, market_tick_budget, len(market_candidates), remaining_slots, market_policy.max_new_positions, effective_target, per_position_budget)
+                remaining_cash = float(available_cash_krw or 0)
+                orderable_candidates = []
+                for cf in sized_candidates:
+                    price = float((cf.features or {}).get("order_price") or 0)
+                    cf.planned_qty = min(cf.planned_qty, int(remaining_cash // price) if price > 0 else 0)
+                    cf.planned_value = cf.planned_qty * price
+                    if cf.planned_qty > 0:
+                        orderable_candidates.append(cf); remaining_cash -= cf.planned_value
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)

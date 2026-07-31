@@ -78,6 +78,7 @@ from trader.contracts.final30_contract import assert_final30_contract
 from trader.kr.market_scope import is_kr_market
 from trader.kr.regime_runtime import calculate_market_breadth
 from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ
+from trader.kr.regime import KR_REGIME_REQUIRED_SYMBOLS
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
@@ -237,6 +238,8 @@ FINAL30_SCORED_EXPORT_COLS = [
     "ma150",
     "pullback_pct",
     "entry_style_selected",
+    "market", "market_code", "rs_benchmark", "return_1d", "return_5d",
+    "above_ma20", "above_ma50", "volume_avg20",
 ]
 FINAL30_STRICT_REQUIRED_FIELDS = [
     "code",
@@ -252,6 +255,7 @@ FINAL30_STRICT_REQUIRED_FIELDS = [
     "tech_score",
     "score_final",
     "entry_style_selected",
+    "market", "rs_benchmark", "return_1d", "return_5d", "volume_avg20",
 ]
 
 def _env_true(name: str, default: str = "0") -> bool:
@@ -805,6 +809,15 @@ def decide_prep_trade_gate(hard_fail_reasons: list[str] | None, soft_fail_reason
 
 def _strict_validate_final30_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
     _log_entry_style_distribution(rows, prefix="PREP")
+    for raw in rows:
+        row = normalize_final30_contract_row(raw)
+        missing = []
+        if row.get("market") in (None, "", "UNKNOWN"): missing.append("market")
+        for field in ("return_1d", "return_5d"):
+            if row.get(field) is None: missing.append(field)
+        if not row.get("volume_avg20") or float(row.get("volume_avg20") or 0) <= 0: missing.append("volume_avg20")
+        if missing:
+            logger.error("[FINAL30][KR_REGIME_CONTRACT_BLOCKED] code=%s missing=%s", row.get("code"), ",".join(missing))
     result = verify_final30_scored_rows(
         rows,
         required_rows=FINAL30_SCORED_REQUIRED_ROWS,
@@ -1462,9 +1475,9 @@ def main() -> int:
                 symbols.append(code_norm)
 
     # Prefetch both real ETF benchmarks used by market-specific RS ranking.
-    for benchmark in (RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ):
-        if benchmark not in symbols:
-            symbols.append(benchmark)
+    for regime_symbol in KR_REGIME_REQUIRED_SYMBOLS:
+        if regime_symbol not in symbols:
+            symbols.append(regime_symbol)
 
     t_ohlcv = time.monotonic()
     logger.info("[PREP][HEARTBEAT] stage=ohlcv_prefetch status=start")

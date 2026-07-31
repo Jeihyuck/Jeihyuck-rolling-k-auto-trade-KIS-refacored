@@ -9,7 +9,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-KR_REGIME_REQUIRED_FINAL30_FIELDS = {"code", "market", "close", "ma20", "ma50", "return_1d", "return_5d"}
+KR_REGIME_REQUIRED_FINAL30_FIELDS = {"code", "market", "close", "ma20", "ma50", "return_1d", "return_5d", "volume_avg20"}
 FINAL30_REQUIRED_COLUMNS = {"code", "name", "as_of", "rank", "rank_final30", "final_score"} | KR_REGIME_REQUIRED_FINAL30_FIELDS
 
 

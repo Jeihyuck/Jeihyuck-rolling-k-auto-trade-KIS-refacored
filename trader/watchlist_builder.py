@@ -2257,6 +2257,17 @@ class WatchlistBuilder:
         }
 
     def _normalize_item(self, item: Dict[str, Any], *, score_key: str, rank_key: str) -> Dict[str, Any]:
+        source_meta = dict(item.get("meta") or {})
+        normalized_market = normalize_kr_market(item.get("market") or item.get("market_code") or source_meta.get("market") or source_meta.get("market_code"))
+        rs_benchmark = item.get("rs_benchmark") or source_meta.get("rs_benchmark")
+        regime_fields = {
+            "market": normalized_market, "market_code": normalized_market, "rs_benchmark": rs_benchmark,
+            "close": item.get("close") if item.get("close") is not None else item.get("last_close"),
+            "ma20": item.get("ma20"), "ma50": item.get("ma50"),
+            "return_1d": item.get("return_1d"), "return_5d": item.get("return_5d"),
+            "above_ma20": item.get("above_ma20"), "above_ma50": item.get("above_ma50"),
+            "volume_avg20": item.get("volume_avg20") or item.get("avg_volume20") or item.get("vol20"),
+        }
         score_val = float(item.get(score_key, 0.0) or 0.0)
         rank_val = item.get(rank_key) or item.get("rank")
         reject_reasons = list(item.get("reject_reasons", []) or [])
@@ -2420,6 +2431,7 @@ class WatchlistBuilder:
         meta["breakout_pass"] = breakout_pass
         meta["pullback_pass"] = pullback_pass
         meta["momentum_pass"] = momentum_pass
+        meta.update(regime_fields)
         return {
             "as_of": str(item.get("as_of") or ""),
             "code": str(item.get("code") or "").zfill(6),
@@ -2460,6 +2472,7 @@ class WatchlistBuilder:
             "score_tech": score_tech,
             "score_flow": score_flow,
             "score_final": score_final,
+            **regime_fields,
         }
 
     def _stage_a_liquidity_filter(self, members: List[Dict[str, Any]], as_of: date) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:

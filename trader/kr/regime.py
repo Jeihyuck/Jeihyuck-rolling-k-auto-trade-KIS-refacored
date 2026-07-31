@@ -17,7 +17,9 @@ logger = logging.getLogger(__name__)
 
 MARKETS = ("KOSPI", "KOSDAQ")
 KR_MARKET_ETFS = {"KOSPI": "069500", "KOSPI_CONFIRM": "226490", "KOSDAQ": "229200"}
-KR_LEADER_SYMBOLS = ("091160", "005930", "000660")
+KR_MARKET_LEADERS = {"KOSPI": ("091160", "005930", "000660"), "KOSDAQ": ()}
+KR_LEADER_SYMBOLS = KR_MARKET_LEADERS["KOSPI"]
+KR_REGIME_REQUIRED_SYMBOLS = ("069500", "226490", "229200", "091160", "005930", "000660")
 STATE_ORDER = (
     "KR_DEFENSE_CRASH", "KR_DEFENSE_RISK_OFF", "KR_DEFENSE_CAUTION",
     "KR_SHOCK_REBOUND_PENDING", "KR_SHOCK_REBOUND_CONFIRMED",
@@ -148,6 +150,7 @@ def structural_regime_cap(observations: Mapping[str, Any]) -> str:
 
 
 def _shock_rebound_state(observations: Mapping[str, Any]) -> str | None:
+    market = str(observations.get("market") or "")
     positive = sum((
         (_number(observations, "intraday_return_positive") or 0) >= .02,
         (_number(observations, "gap_up_return") or 0) >= .01,
@@ -160,10 +163,13 @@ def _shock_rebound_state(observations: Mapping[str, Any]) -> str | None:
     if positive < 4:
         return None
     held = int(observations.get("shock_consecutive_ticks") or 0) >= 3 and float(observations.get("shock_minutes") or 0) >= 10
+    market_confirmation = (bool(observations.get("kospi_confirmation_ok")) and int(observations.get("leader_confirmation_count") or 0) >= 2) if market == "KOSPI" else (
+        market == "KOSDAQ" and (_number(observations, "advance_ratio_intraday") or 0) >= .70
+        and (_number(observations, "median_return_1d") or 0) > 0)
     confirmed = (held and bool(observations.get("above_open")) and bool(observations.get("above_vwap"))
                  and (_number(observations, "advance_ratio_intraday") or 0) >= .65
                  and (_number(observations, "turnover_expansion") or 0) >= 1.2
-                 and int(observations.get("leader_confirmation_count") or 0) >= 2
+                 and market_confirmation
                  and (_number(observations, "distance_from_intraday_high") or -1) >= -.03)
     return "KR_SHOCK_REBOUND_CONFIRMED" if confirmed else "KR_SHOCK_REBOUND_PENDING"
 
@@ -270,7 +276,9 @@ def build_kr_regime_snapshot(observations: Mapping[str, Mapping[str, Any]], *,
     if quality == "DEGRADED":
         policy = replace(policy, budget_multiplier=policy.budget_multiplier * .8)
     market_policies = market_execution_policies(states, quality)
-    policy = constrain_global_policy(policy, market_policies)
+    active_policies = [p for p in market_policies.values() if p.data_quality != "BLOCKED"]
+    if active_policies:
+        policy = replace(policy, budget_multiplier=max(p.budget_multiplier for p in active_policies), allow_new_buy=any(p.allow_new_buy for p in active_policies))
     snap = KRRegimeSnapshot(as_of or datetime.now(timezone.utc).isoformat(), global_state,
                             states, quality, policy, market_policies, tuple(sector_leaders), source.upper())
     logger.info("[KR_REGIME][SNAPSHOT] as_of=%s source=%s global_state=%s data_quality=%s", snap.as_of, snap.source, snap.global_state, snap.data_quality)
@@ -288,6 +296,11 @@ def market_allows_buy(snapshot: KRRegimeSnapshot, market: str) -> bool:
     return bool(snapshot.execution_policy.allow_new_buy and local and local.allow_new_buy and market in snapshot.market_states
                 and snapshot.market_states[market].data_quality != "BLOCKED"
                 and STATE_ORDER.index(snapshot.market_states[market].state) >= STATE_ORDER.index("KR_DEFENSE_CAUTION"))
+
+
+def calculate_market_budgets(snapshot: KRRegimeSnapshot, base_tick_budget: float, available_cash: float) -> dict[str, float]:
+    return {market: min(float(available_cash), float(base_tick_budget) * policy.budget_multiplier)
+            if policy.allow_new_buy else 0.0 for market, policy in snapshot.market_policies.items()}
 
 
 def candidate_allows_buy(candidate: Mapping[str, Any], state: str) -> tuple[bool, str | None]:
