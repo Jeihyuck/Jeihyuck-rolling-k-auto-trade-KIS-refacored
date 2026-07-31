@@ -337,8 +337,8 @@ CONFIG = {
     "MINERVINI_HEAVY_VOL_MULT": "1.5",
     # Minervini Pro universe/RS
     "UNIVERSE_POOL_SIZE": "200",
-    "RS_BENCHMARK_KOSPI": "KOSPI",
-    "RS_BENCHMARK_KOSDAQ": "KOSDAQ",
+    "RS_BENCHMARK_KOSPI": "069500",
+    "RS_BENCHMARK_KOSDAQ": "229200",
     "RS_LOOKBACK_DAYS": "63",
     "RS_LOOKBACK2_DAYS": "126",
     "RS_MIN_PCTILE": "60",
@@ -1154,8 +1154,8 @@ def _normalize_index_code(raw: str | None, fallback: str) -> str:
     return fallback
 
 
-RS_BENCHMARK_KOSPI = (_cfg("RS_BENCHMARK_KOSPI") or "KOSPI").strip()
-RS_BENCHMARK_KOSDAQ = (_cfg("RS_BENCHMARK_KOSDAQ") or "KOSDAQ").strip()
+RS_BENCHMARK_KOSPI = (_cfg("RS_BENCHMARK_KOSPI") or "069500").strip()
+RS_BENCHMARK_KOSDAQ = (_cfg("RS_BENCHMARK_KOSDAQ") or "229200").strip()
 
 def get_kr_rs_benchmark(market: str) -> str:
     normalized = str(market or "").strip().upper()
@@ -1165,9 +1165,6 @@ def get_kr_rs_benchmark(market: str) -> str:
         return RS_BENCHMARK_KOSDAQ
     raise ValueError(f"unknown Korean market for RS benchmark: {market!r}")
 
-# Transitional non-regime consumers default to KOSDAQ index data; callers that
-# handle mixed universes must use get_kr_rs_benchmark.
-RS_BENCHMARK = RS_BENCHMARK_KOSDAQ
 RS_LOOKBACK_DAYS = int(_cfg("RS_LOOKBACK_DAYS") or "63")
 RS_LOOKBACK2_DAYS = int(_cfg("RS_LOOKBACK2_DAYS") or "126")
 RS_MIN_PCTILE = float(_cfg("RS_MIN_PCTILE") or "60")
@@ -1582,9 +1579,10 @@ logger.info(
     CANDIDATE_POOL_TTL_DAYS,
 )
 logger.info(
-    "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
+    "[CONFIG][MINERVINI] universe_pool=%s rs_benchmarks=%s/%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
     UNIVERSE_POOL_SIZE,
-    RS_BENCHMARK,
+    RS_BENCHMARK_KOSPI,
+    RS_BENCHMARK_KOSDAQ,
     RS_LOOKBACK_DAYS,
     RS_LOOKBACK2_DAYS,
     RS_MIN_PCTILE,

@@ -76,6 +76,7 @@ from trader.kr.artifacts import publish_kr_prep_artifacts_core_fast, quarantine_
 # Core path intentionally replaces legacy publish_kr_prep_artifacts_atomic( DB-verifying call.
 from trader.contracts.final30_contract import assert_final30_contract
 from trader.kr.market_scope import is_kr_market
+from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
@@ -1450,9 +1451,6 @@ def main() -> int:
         logger.error("[PREP][FAIL] universe empty")
         return 1
 
-    # ---- RS benchmark handling (229200 etc.) ----
-    bench = os.getenv("RS_BENCHMARK", "229200").strip()
-
     # Universe symbols (strict str list for downstream typed functions)
     symbols: list[str] = []
     for member in members:
@@ -1462,9 +1460,10 @@ def main() -> int:
             if code_norm:
                 symbols.append(code_norm)
 
-    # Ensure benchmark included for downstream RS/Stage_B computations
-    if bench and bench not in symbols:
-        symbols.append(bench)
+    # Prefetch both real ETF benchmarks used by market-specific RS ranking.
+    for benchmark in (RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ):
+        if benchmark not in symbols:
+            symbols.append(benchmark)
 
     t_ohlcv = time.monotonic()
     logger.info("[PREP][HEARTBEAT] stage=ohlcv_prefetch status=start")
@@ -1557,6 +1556,7 @@ def main() -> int:
         env=env,
         as_of=effective_as_of,
         lookback_days=int(os.getenv("MINERVINI_OHLCV_DAYS", "520")),
+        symbol_markets={str(m.get("code") or "").zfill(6): str(m.get("market") or m.get("market_code") or "") for m in members},
     )
     dt_derived = time.monotonic() - t_derived
     logger.info("[PREP][HEARTBEAT] stage=derived_minervini status=done")

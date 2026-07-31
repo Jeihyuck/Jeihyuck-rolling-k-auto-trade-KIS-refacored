@@ -8,7 +8,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_COMPOSITE_W1, RS_COMPOSITE_W2, RS_MIN_PCTILE
+from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_COMPOSITE_W1, RS_COMPOSITE_W2, RS_MIN_PCTILE
 from trader.db.repos import DerivedMinerviniRepo, load_price_daily
 from trader.factors.rs_rank import rank_rs
 from trader.final30_quality import is_invalid_entry_input, is_placeholder_entry_value, normalize_entry_input_value
@@ -341,6 +341,7 @@ def compute_minervini_features_for_asof(
     env: str | None = None,
     as_of: date | str | None = None,
     lookback_days: int | None = None,
+    symbol_markets: dict[str, str] | None = None,
 ) -> list[dict]:
     """Compute Minervini features from DB OHLCV and return rows for upsert."""
     as_of_date = _as_of_date(as_of)
@@ -351,8 +352,10 @@ def compute_minervini_features_for_asof(
 
     need_days = int(lookback_days or 520)
 
-    bench_df = _load_df_from_db(engine=engine, symbol=RS_BENCHMARK, as_of=as_of_date, days=need_days)
-    bench_close = bench_df["close"] if not bench_df.empty and "close" in bench_df.columns else pd.Series(dtype=float)
+    benchmark_prices = {}
+    for market, benchmark in (("KOSPI", RS_BENCHMARK_KOSPI), ("KOSDAQ", RS_BENCHMARK_KOSDAQ)):
+        bench_df = _load_df_from_db(engine=engine, symbol=benchmark, as_of=as_of_date, days=need_days)
+        benchmark_prices[market] = bench_df["close"] if not bench_df.empty and "close" in bench_df.columns else pd.Series(dtype=float)
 
     price_series: dict[str, pd.Series] = {}
     features_map: dict[str, dict] = {}
@@ -394,11 +397,13 @@ def compute_minervini_features_for_asof(
 
     rs_df = rank_rs(
         price_series,
-        bench_close,
+        None,
         lookback_days=RS_LOOKBACK_DAYS,
         lookback2_days=RS_LOOKBACK2_DAYS,
         w1=RS_COMPOSITE_W1,
         w2=RS_COMPOSITE_W2,
+        benchmark_prices_by_market=benchmark_prices,
+        ticker_markets=symbol_markets or {},
     )
     rs_map = {row["ticker"]: float(row.get("pctile") or 0.0) for _, row in rs_df.iterrows()}
 
@@ -534,6 +539,7 @@ def compute_and_store_derived_minervini(
     env: str | None = None,
     as_of: date | str | None = None,
     lookback_days: int | None = None,
+    symbol_markets: dict[str, str] | None = None,
 ) -> int:
     as_of_date = _as_of_date(as_of)
     start = time.monotonic()
@@ -544,6 +550,7 @@ def compute_and_store_derived_minervini(
         env=env,
         as_of=as_of_date,
         lookback_days=lookback_days,
+        symbol_markets=symbol_markets,
     )
     
     # NaN/Inf 완전 차단 (DB upsert 직전 sanitize)

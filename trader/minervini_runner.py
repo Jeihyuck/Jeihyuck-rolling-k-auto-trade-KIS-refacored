@@ -15,7 +15,7 @@ import pandas as pd
 from sqlalchemy import Engine
 
 from trader.candidate_pool_builder import load_candidate_pool
-from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS
+from trader.config import RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.db.repos import UniverseRepo, WatchlistRepo
 from trader.minervini.report import run_minervini_report

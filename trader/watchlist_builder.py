@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from sqlalchemy import Engine
 
-from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
+from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
 from trader.constants import (
     CRITICAL_SCORED_COLS,
     FINAL30_SCORED_IDENTITY_COLS,
@@ -2577,15 +2577,17 @@ class WatchlistBuilder:
             logger.warning("[WATCHLIST][PIPELINE][B_TOP50] kept=0 from=0")
             return []
 
-        try:
-            bench_df, _ = self.ohlcv_provider(RS_BENCHMARK, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
-            bench_df = _normalize_ohlcv_columns(bench_df if bench_df is not None else pd.DataFrame())
-            if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
-                raise ValueError(f"benchmark {RS_BENCHMARK} empty")
-            bench_close = bench_df["close"]
-        except Exception as exc:
-            logger.error("[WATCHLIST][PIPELINE][B_TOP50][BENCH_FAIL] err=%s", exc)
-            bench_close = None
+        bench_closes: dict[str, pd.Series | None] = {}
+        for market, benchmark in (("KOSPI", RS_BENCHMARK_KOSPI), ("KOSDAQ", RS_BENCHMARK_KOSDAQ)):
+            try:
+                bench_df, _ = self.ohlcv_provider(benchmark, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
+                bench_df = _normalize_ohlcv_columns(bench_df if bench_df is not None else pd.DataFrame())
+                if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
+                    raise ValueError(f"benchmark {benchmark} empty")
+                bench_closes[market] = bench_df["close"]
+            except Exception as exc:
+                logger.error("[WATCHLIST][PIPELINE][B_TOP50][BENCH_FAIL] market=%s err=%s", market, exc)
+                bench_closes[market] = None
 
         rs_min_pctile = float(self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE))
         if rs_min_pctile <= 1.0:
@@ -2624,6 +2626,14 @@ class WatchlistBuilder:
                 item["reject_reasons"] = reject_reasons
                 continue
 
+            raw_market = str(item.get("market") or item.get("market_code") or "").upper()
+            market = "KOSPI" if raw_market in {"KOSPI", "KS", "P"} else "KOSDAQ" if raw_market in {"KOSDAQ", "KQ", "Q"} else ""
+            bench_close = bench_closes.get(market)
+            if not market or bench_close is None:
+                reject_reasons.append("unknown_market_rs_benchmark")
+                item["reject_reasons"] = reject_reasons
+                continue
+            item["rs_benchmark"] = RS_BENCHMARK_KOSPI if market == "KOSPI" else RS_BENCHMARK_KOSDAQ
             rs_pctile = self._compute_rs_percentile(df["close"], bench_close)
             rs_features = compute_rs_features(df["close"], bench_close)
             vcp_score = self._compute_vcp_score(df)

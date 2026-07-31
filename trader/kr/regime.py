@@ -16,8 +16,11 @@ from typing import Any, Mapping
 logger = logging.getLogger(__name__)
 
 MARKETS = ("KOSPI", "KOSDAQ")
+KR_MARKET_ETFS = {"KOSPI": "069500", "KOSPI_CONFIRM": "226490", "KOSDAQ": "229200"}
+KR_LEADER_SYMBOLS = ("091160", "005930", "000660")
 STATE_ORDER = (
     "KR_DEFENSE_CRASH", "KR_DEFENSE_RISK_OFF", "KR_DEFENSE_CAUTION",
+    "KR_SHOCK_REBOUND_PENDING", "KR_SHOCK_REBOUND_CONFIRMED",
     "KR_NORMAL", "KR_RISK_ON", "KR_STRONG_RISK_ON",
 )
 
@@ -70,7 +73,7 @@ class KRRegimeStabilizer:
 
     def update(self, proposed: str, now: datetime) -> str:
         current_rank, proposed_rank = STATE_ORDER.index(self.state), STATE_ORDER.index(proposed)
-        if proposed == "KR_DEFENSE_CRASH":
+        if proposed in {"KR_DEFENSE_CRASH", "KR_SHOCK_REBOUND_PENDING"}:
             return self._accept(proposed, now)
         if proposed == self.state:
             self._candidate, self._count = None, 0
@@ -102,12 +105,46 @@ def _number(data: Mapping[str, Any], key: str) -> float | None:
 
 
 def state_for_score(score: float) -> str:
-    if score <= -60: return STATE_ORDER[0]
-    if score <= -30: return STATE_ORDER[1]
-    if score <= -10: return STATE_ORDER[2]
-    if score < 20: return STATE_ORDER[3]
-    if score < 50: return STATE_ORDER[4]
-    return STATE_ORDER[5]
+    if score <= -60: return "KR_DEFENSE_CRASH"
+    if score <= -30: return "KR_DEFENSE_RISK_OFF"
+    if score <= -10: return "KR_DEFENSE_CAUTION"
+    if score < 20: return "KR_NORMAL"
+    if score < 50: return "KR_RISK_ON"
+    return "KR_STRONG_RISK_ON"
+
+
+def structural_regime_cap(observations: Mapping[str, Any]) -> str:
+    """MA structure is a hard ceiling, not another additive score component."""
+    close, ma20, ma50 = (_number(observations, key) for key in ("close", "ma20", "ma50"))
+    if None in (close, ma20, ma50):
+        return "KR_DEFENSE_CRASH"
+    if close < ma20 and close < ma50:
+        return "KR_DEFENSE_CAUTION"
+    if close >= ma20 and close < ma50:
+        return "KR_NORMAL"
+    if (_number(observations, "ma20_slope_5d") or 0) <= 0:
+        return "KR_NORMAL"
+    breadth_strong = (_number(observations, "breadth_ma20") or 0) >= .60 and (_number(observations, "breadth_ma50") or 0) >= .55
+    return "KR_STRONG_RISK_ON" if close >= ma50 and breadth_strong else "KR_RISK_ON"
+
+
+def _shock_rebound_state(observations: Mapping[str, Any]) -> str | None:
+    positive = sum((
+        (_number(observations, "intraday_return_positive") or 0) >= .02,
+        (_number(observations, "gap_up_return") or 0) >= .01,
+        bool(observations.get("above_open")), bool(observations.get("above_vwap")),
+        (_number(observations, "advance_ratio_intraday") or 0) >= .65,
+        (_number(observations, "turnover_expansion") or 0) >= 1.2,
+    ))
+    if positive < 4:
+        return None
+    held = int(observations.get("shock_consecutive_ticks") or 0) >= 3 and float(observations.get("shock_minutes") or 0) >= 10
+    confirmed = (held and bool(observations.get("above_open")) and bool(observations.get("above_vwap"))
+                 and (_number(observations, "advance_ratio_intraday") or 0) >= .65
+                 and (_number(observations, "turnover_expansion") or 0) >= 1.2
+                 and int(observations.get("leader_confirmation_count") or 0) >= 2
+                 and (_number(observations, "distance_from_intraday_high") or -1) >= -.03)
+    return "KR_SHOCK_REBOUND_CONFIRMED" if confirmed else "KR_SHOCK_REBOUND_PENDING"
 
 
 def calculate_market_state(market: str, observations: Mapping[str, Any], *,
@@ -144,8 +181,15 @@ def calculate_market_state(market: str, observations: Mapping[str, Any], *,
     if observations.get("volatility_spike"): risk -= 2.0
     if (_number(observations, "intraday_return") or 0.0) <= -.02: risk -= 2.0
     if (_number(observations, "gap_return") or 0.0) <= -.015: risk -= 2.0
-    score = max(-100.0, min(100.0, trend + breadth + momentum + risk))
+    score = max(-100.0, min(100.0, breadth + momentum + risk))
     state = state_for_score(score)
+    cap = structural_regime_cap(observations)
+    if STATE_ORDER.index(state) > STATE_ORDER.index(cap):
+        state = cap
+    shock = _shock_rebound_state(observations)
+    below_structure = v["close"] < v["ma20"] and v["close"] < v["ma50"]
+    if shock and below_structure:
+        state = shock
     independent_strength = sum((trend > 0, breadth > 0, momentum > 0))
     if state == "KR_STRONG_RISK_ON" and (sector_data_suspect or account_kill_switch or independent_strength < 2):
         state = "KR_RISK_ON"
@@ -157,15 +201,16 @@ def calculate_market_state(market: str, observations: Mapping[str, Any], *,
 def execution_policy(state: str, *, data_quality: str = "OK") -> KRExecutionPolicy:
     blocked = data_quality == "BLOCKED"
     table = {
-        STATE_ORDER[0]: (0.0, 0, False), STATE_ORDER[1]: (.20, 2, False),
-        STATE_ORDER[2]: (.50, 3, False), STATE_ORDER[3]: (.80, None, True),
-        STATE_ORDER[4]: (1.0, None, True), STATE_ORDER[5]: (1.10, None, True),
+        "KR_DEFENSE_CRASH": (0.0, 0, False), "KR_DEFENSE_RISK_OFF": (.20, 2, False),
+        "KR_DEFENSE_CAUTION": (.50, 3, False), "KR_SHOCK_REBOUND_PENDING": (.10, 1, False),
+        "KR_SHOCK_REBOUND_CONFIRMED": (.25, 3, False), "KR_NORMAL": (.80, None, True),
+        "KR_RISK_ON": (1.0, None, True), "KR_STRONG_RISK_ON": (1.10, None, True),
     }
     budget, positions, add = table[state]
-    risk_off = state in STATE_ORDER[:2]
-    sector_cap = .20 if risk_off else (.45 if state in STATE_ORDER[4:] else .35)
+    risk_off = state in {"KR_DEFENSE_CRASH", "KR_DEFENSE_RISK_OFF"}
+    sector_cap = .20 if risk_off else (.45 if state in {"KR_RISK_ON", "KR_STRONG_RISK_ON"} else .35)
     return KRExecutionPolicy(0.0 if blocked else budget, 0 if blocked else positions,
-                             not blocked and state != STATE_ORDER[0], not blocked and add,
+                             not blocked and state != "KR_DEFENSE_CRASH", not blocked and add,
                              sector_cap=sector_cap, high_beta_sector_cap=.15 if risk_off else .45)
 
 
@@ -195,6 +240,30 @@ def market_allows_buy(snapshot: KRRegimeSnapshot, market: str) -> bool:
     return bool(snapshot.execution_policy.allow_new_buy and market in snapshot.market_states
                 and snapshot.market_states[market].data_quality == "OK"
                 and STATE_ORDER.index(snapshot.market_states[market].state) >= STATE_ORDER.index("KR_DEFENSE_CAUTION"))
+
+
+def candidate_allows_buy(candidate: Mapping[str, Any], state: str) -> tuple[bool, str | None]:
+    """Final stock-level MA/VWAP/liquidity/RS gate; SELL never calls this gate."""
+    close = _number(candidate, "last_price") or _number(candidate, "close")
+    ma20 = _number(candidate, "ma20")
+    if close is None or ma20 is None or close <= ma20:
+        return False, "KR_STOCK_BELOW_MA20"
+    if not bool(candidate.get("above_vwap", candidate.get("vwap_ok", False))):
+        return False, "KR_STOCK_BELOW_VWAP"
+    if not bool(candidate.get("liq_ok", False)):
+        return False, "KR_STOCK_LIQUIDITY_BLOCK"
+    rs = _number(candidate, "rs_percentile") or _number(candidate, "rs_pctile") or 0.0
+    if rs > 1: rs /= 100.0
+    if rs < .70:
+        return False, "KR_STOCK_RS_BLOCK"
+    if state in {"KR_SHOCK_REBOUND_PENDING", "KR_SHOCK_REBOUND_CONFIRMED"}:
+        if not bool(candidate.get("above_open")) or (_number(candidate, "turnover_expansion") or 0) < 1.2:
+            return False, "KR_SHOCK_STOCK_CONFIRMATION_BLOCK"
+        if (_number(candidate, "distance_from_intraday_high") or -1) < -.05:
+            return False, "KR_SHOCK_STOCK_HIGH_DISTANCE_BLOCK"
+    elif (_number(candidate, "ma20_slope_5d") or 0) <= 0 and not bool(candidate.get("breakout_ok")):
+        return False, "KR_STOCK_MA20_SLOPE_BLOCK"
+    return True, None
 
 
 def write_snapshot(snapshot: KRRegimeSnapshot, path: str | Path = "artifacts/kr_regime_snapshot.json") -> Path:
