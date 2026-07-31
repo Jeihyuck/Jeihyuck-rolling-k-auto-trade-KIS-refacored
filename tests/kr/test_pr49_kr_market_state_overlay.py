@@ -24,7 +24,8 @@ def test_missing_market_data_does_not_crash_or_strong_risk_on():
     o = evaluate_kr_market_state(trade_date="2026-07-09", provider=P(), index_context={"kosdaq150_1d_return":0.02})
     assert o["market_state"] != "KR_DEFENSE_CRASH"
     assert o["market_state"] != "KR_STRONG_RISK_ON"
-    assert o["data_quality"] == "degraded"
+    assert o["data_quality"] == "BLOCKED"
+    assert o["allow_new_buy"] is False
 
 def test_account_loss_kill_switch_crash():
     o = evaluate_kr_market_state(trade_date="2026-07-09", provider=P(), index_context=ctx(), account_snapshot={"account_intraday_pnl_pct":-0.019})

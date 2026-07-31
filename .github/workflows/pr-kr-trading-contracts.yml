@@ -59,6 +59,9 @@ jobs:
           pytest tests/test_live_gate_refresh_order.py -q
           pytest tests/test_pb1_volume_config_unified.py -q
 
+      - name: Check KR legacy regime removal
+        run: bash scripts/check_kr_legacy_regime.sh
+
       - name: Existing entry and exit tests
         run: |
           pytest tests/test_entry_guard_final30.py tests/test_final30_load_required.py -q

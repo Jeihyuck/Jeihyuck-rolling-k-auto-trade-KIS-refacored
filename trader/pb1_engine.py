@@ -123,7 +123,6 @@ from trader.config import (
     MAX_SPREAD_PROXY_BPS,
     MIN_AVG_VALUE_KRW,
     REENTRY_COOLDOWN_DAYS,
-    REGIME_INDEX,
     REGIME_MA_FAST,
     REGIME_MA_SLOW,
     REGIME_MAX_RISK,
@@ -6902,8 +6901,8 @@ class PB1Engine:
         scored.sort(reverse=True, key=lambda x: x[0])
         top = [m for _, m in scored[:limit]]
         
-        # benchmark 포함 보장 (예: 229200)
-        benchmark_codes = [RS_BENCHMARK, "229200", "005930"]
+        # Include the configured market benchmark and a liquid KOSPI sentinel.
+        benchmark_codes = [RS_BENCHMARK, "005930"]
         for bcode in benchmark_codes:
             if any(str(m.get("code") or "").zfill(6) == bcode for m in members):
                 if not any(str(m.get("code") or "").zfill(6) == bcode for m in top):
@@ -6934,12 +6933,8 @@ class PB1Engine:
         if count is None:
             count = days if days is not None else int(PB1_OHLCV_DAYS_BASE)
         
-        # ✅ 레짐/벤치마크 심볼 판단 (trade-tick 긴 조회 예외 허용)
-        purpose = None
-        if code == str(REGIME_INDEX).zfill(6) or code == REGIME_INDEX:
-            purpose = "regime"
-        elif code == str(RS_BENCHMARK).zfill(6) or code == RS_BENCHMARK:
-            purpose = "regime"
+        # Benchmark fetches are data preparation, never a regime fallback.
+        purpose = "benchmark" if code == str(RS_BENCHMARK).zfill(6) or code == RS_BENCHMARK else None
 
         trade_input = (os.getenv("TRADE_INPUT") or "final30").strip().lower() or "final30"
         trade_precomputed_only = bool(
@@ -13822,13 +13817,18 @@ class PB1Engine:
             try:
                 artifact_dir = Path("artifacts")
                 artifact_dir.mkdir(parents=True, exist_ok=True)
-                (artifact_dir / "kr_market_state_overlay.json").write_text(json.dumps(overlay, ensure_ascii=False, default=str), encoding="utf-8")
+                (artifact_dir / "kr_regime_snapshot.json").write_text(json.dumps(overlay, ensure_ascii=False, default=str), encoding="utf-8")
             except Exception as artifact_exc:
                 logger.warning("[KR_MARKET_STATE][ARTIFACT_WRITE_FAIL] err=%s", artifact_exc)
             return overlay, after
         except Exception as exc:
-            logger.warning("[KR_MARKET_STATE][OVERLAY_FAIL_OPEN] err=%s", exc)
-            return None, float(tick_budget_krw or 0.0)
+            # BUY fails closed; SELL/reconcile paths do not depend on this budget.
+            logger.exception("[KR_REGIME][FAIL_CLOSED] action=block_new_buy err=%s", exc)
+            blocked = {"market_state": "KR_DEFENSE_CRASH", "data_quality": "BLOCKED",
+                       "force_entry_block": True, "allow_new_buy": False,
+                       "exposure_multiplier": 0.0, "market_states": {}}
+            self._kr_market_state_overlay = blocked
+            return blocked, 0.0
 
     def _pnl_snapshot(self, positions: List[Dict]) -> Dict[str, float]:
         fallback: Dict[str, float] = {p["code"]: p.get("avg_buy_price") or 0.0 for p in positions}
@@ -14198,23 +14198,9 @@ class PB1Engine:
         except Exception as e:
             logger.warning("[PB1][SCHEMA_CHECK][FAIL] Failed to check schema via self.engine: %s. Available alternatives: universe_repo.engine=%s, orders_repo.engine=%s", 
                            str(e), hasattr(self.universe_repo, 'engine'), hasattr(self.orders_repo, 'engine'))
-        regime = {"regime": "UNKNOWN"}
-        risk_mult = float(REGIME_MIN_RISK)
-        regime_df, _ = self._fetch_daily(REGIME_INDEX, count=max(REGIME_MA_SLOW + 5, 260))
-        if not regime_df.empty:
-            regime = get_regime(regime_df["close"], REGIME_MA_FAST, REGIME_MA_SLOW)
-            risk_mult = risk_multiplier(
-                regime,
-                REGIME_MODE,
-                max_risk=REGIME_MAX_RISK,
-                mid_risk=REGIME_MID_RISK,
-                min_risk=REGIME_MIN_RISK,
-            )
-        self._regime = regime
-        self._regime_risk_mult = risk_mult
-        if risk_mult <= 0.0 and REGIME_MODE.upper() == "STRICT":
-            entry_allowed = False
-            entry_reason = "regime_risk_off"
+        # The multi-market overlay below is the only Korean regime authority.
+        self._regime = {"regime": "PENDING_KR_REGIME_SNAPSHOT"}
+        self._regime_risk_mult = 0.0
         emit_event(
             as_of=self._today,
             event="PB1_RUN_START",

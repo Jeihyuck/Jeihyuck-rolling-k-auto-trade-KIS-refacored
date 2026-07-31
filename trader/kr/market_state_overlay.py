@@ -72,11 +72,13 @@ def _index_returns(trade_date, provider, ctx):
             if val is None: val=_pct_from_provider(provider, sym, trade_date, lb)
             out[key]=val
             if val is None: warn.append(f"missing_{key}")
+        logger.info("[KR_REGIME][INDEX_RESOLUTION] index=%s symbol=%s available=%s", name.upper(), sym, out.get(f"{name}_1d_return") is not None)
     out["kosdaq_vs_kospi_1d"] = None if out["kosdaq_1d_return"] is None or out["kospi_1d_return"] is None else out["kosdaq_1d_return"]-out["kospi_1d_return"]
     out["kosdaq150_vs_kospi200_1d"] = None if out["kosdaq150_1d_return"] is None or out["kospi200_1d_return"] is None else out["kosdaq150_1d_return"]-out["kospi200_1d_return"]
     out["kosdaq_vs_kospi_3d"] = None if out["kosdaq_3d_return"] is None or out["kospi_3d_return"] is None else out["kosdaq_3d_return"]-out["kospi_3d_return"]
     out["kosdaq150_vs_kospi200_3d"] = None if out["kosdaq150_3d_return"] is None or out["kospi200_3d_return"] is None else out["kosdaq150_3d_return"]-out["kospi200_3d_return"]
-    quality = "ok" if not warn else ("usable" if len(warn) <= 3 else "degraded")
+    primary_missing = any(out[f"{market}_{lb}d_return"] is None for market in ("kospi", "kosdaq") for lb in (1, 3))
+    quality = "BLOCKED" if primary_missing else ("ok" if not warn else "usable")
     return out, quality, warn
 
 def calculate_kr_sector_exposure(*, positions: list[dict], candidate_orders: list[dict] | None, equity_krw: float) -> dict:
@@ -137,7 +139,7 @@ def evaluate_kr_market_state(*, trade_date: str, provider, index_context: dict |
     if (account_snapshot or {}).get("gross_exposure_pct") is not None and float((account_snapshot or {}).get("gross_exposure_pct")) >= _f("KR_MAX_GROSS_EXPOSURE_PCT",0.95):
         reasons.append("gross_exposure_cap_blocks_new_buy")
     mult=_f(MULT_ENV[state], MULT_DEFAULT[state]); mode, env, d=TRAIL[state]; trail=_f(env,d)
-    allow_new = state != "KR_DEFENSE_CRASH" and not ((gross is not None) and float(gross) >= _f("KR_MAX_GROSS_EXPOSURE_PCT",0.95))
+    allow_new = data_quality != "BLOCKED" and state != "KR_DEFENSE_CRASH" and not ((gross is not None) and float(gross) >= _f("KR_MAX_GROSS_EXPOSURE_PCT",0.95))
     out={"market_state":state,"defense_regime":state.startswith("KR_DEFENSE"),"risk_on_regime":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"market_state_reasons":reasons or ["normal"],"exposure_multiplier":mult,"effective_budget_before_overlay":None,"effective_budget_after_overlay":None,"allow_new_buy":allow_new,"allow_add_to_existing":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"allow_growth_buy":state not in {"KR_DEFENSE_CRASH","KR_DEFENSE_RISK_OFF"},"allow_high_beta_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"},"allow_defensive_buy":state != "KR_DEFENSE_CRASH","allow_semiconductor_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "SEMICONDUCTOR" in leaders),"allow_bio_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"} and "BIO_HEALTHCARE" in leaders,"allow_secondary_battery_buy":state in {"KR_RISK_ON","KR_STRONG_RISK_ON"} and "SECONDARY_BATTERY" in leaders,"allow_financial_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "FINANCIAL" in leaders),"allow_auto_buy": state not in {"KR_DEFENSE_CRASH"} and (state not in {"KR_DEFENSE_RISK_OFF","KR_DEFENSE_CAUTION"} or "AUTO" in leaders),"force_entry_block":state=="KR_DEFENSE_CRASH","trim_required":state in {"KR_DEFENSE_CRASH","KR_DEFENSE_RISK_OFF"},"profit_capture_enabled":os.getenv("KR_PROFIT_CAPTURE_ENABLE","1")!="0","trailing_stop_mode":mode,"trailing_stop_pct":trail,"stop_tightening_level":state.lower(),"account_loss_kill_switch_triggered":acct["account_loss_kill_switch_triggered"],"account_loss_kill_switch_level":acct["account_loss_kill_switch_level"],"data_quality":data_quality,"data_quality_warnings":warnings+rotation.get("rotation_warnings",[]),"index_returns":idx,"relative_strength":{"kosdaq_vs_kospi_1d":idx.get("kosdaq_vs_kospi_1d"),"kosdaq150_vs_kospi200_3d":idx.get("kosdaq150_vs_kospi200_3d")},"sector_strength":rotation.get("sector_strength",{}),"sector_proxy_quality":rotation.get("sector_proxy_quality",{}),"sector_leaders":rotation.get("sector_leaders",[]),"sector_laggards":rotation.get("sector_laggards",[]),"final30_cluster_counts":fq["counts"],"final30_unknown_cluster_ratio":fq["unknown_ratio"],"final30_high_beta_ratio":fq["high_beta_ratio"],"final30_quality_stress":fq["final30_quality_stress"],"gross_exposure_pct":gross,"portfolio_equity_krw":equity,"sector_exposure_pct":sector_exp["sector_exposure_pct"],"high_beta_exposure_pct":sector_exp["high_beta_exposure_pct"],"forbidden_products":[BLOCK_REASON]}
     logger.info("[KR_MARKET_STATE][REGIME] market_state=%s defense_regime=%s risk_on_regime=%s reasons=%s kospi_1d=%s kosdaq_1d=%s kospi200_1d=%s kosdaq150_1d=%s rotation_regime=%s sector_leaders=%s exposure_multiplier=%.2f allow_new_buy=%s allow_add_to_existing=%s allow_high_beta_buy=%s force_entry_block=%s data_quality=%s data_quality_warnings=%s", state, out["defense_regime"], out["risk_on_regime"], out["market_state_reasons"], k1, q1, kp1, q1501, rotation.get("rotation_regime"), out["sector_leaders"], mult, out["allow_new_buy"], out["allow_add_to_existing"], out["allow_high_beta_buy"], out["force_entry_block"], data_quality, out["data_quality_warnings"])
     return out
@@ -164,7 +166,9 @@ def filter_kr_entry_intent(intent: dict, overlay: dict, *, positions: list[dict]
     unknown_after=float(sector_exposure.get("UNKNOWN") or 0.0) + (add_pct if cluster == "UNKNOWN" else 0.0)
     gross_after=float(overlay.get("gross_exposure_pct") or 0.0) + add_pct
     reason = ""
-    if is_forbidden_kr_product(row=out): reason=BLOCK_REASON
+    if overlay.get("data_quality") == "BLOCKED": reason="KR_REGIME_DATA_BLOCKED"
+    elif str(out.get("market") or out.get("market_code") or "").upper() == "UNKNOWN": reason="KR_MARKET_UNKNOWN_ENTRY_BLOCK"
+    elif is_forbidden_kr_product(row=out): reason=BLOCK_REASON
     elif overlay.get("force_entry_block"): reason="KR_DEFENSE_CRASH_ENTRY_BLOCK"
     elif gross_after >= _f("KR_MAX_GROSS_EXPOSURE_PCT",0.95): reason="KR_MAX_GROSS_EXPOSURE_BLOCK"
     else:
