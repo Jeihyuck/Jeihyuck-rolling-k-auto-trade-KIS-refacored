@@ -76,6 +76,7 @@ from trader.kr.artifacts import publish_kr_prep_artifacts_core_fast, quarantine_
 # Core path intentionally replaces legacy publish_kr_prep_artifacts_atomic( DB-verifying call.
 from trader.contracts.final30_contract import assert_final30_contract
 from trader.kr.market_scope import is_kr_market
+from trader.kr.regime_runtime import calculate_market_breadth
 from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
@@ -2428,6 +2429,16 @@ def main() -> int:
         final30_paths["signals"],
         int(len(final30_scored_df_for_export)),
     )
+
+    breadth_candidates = list(watchlist_bundle.get("universe_scored", []) or [])
+    breadth_source = "broader_scored_universe"
+    if not breadth_candidates:
+        breadth_candidates = list(watchlist_bundle.get("pool120", []) or []); breadth_source = "candidate_pool120"
+    if not breadth_candidates:
+        breadth_candidates = list(watchlist_bundle.get("top50", []) or []); breadth_source = "top50"
+    if not breadth_candidates:
+        breadth_candidates = final30_scored_df_for_export.to_dict("records"); breadth_source = "final30_fallback"
+    calculate_market_breadth(breadth_candidates, as_of=str(effective_as_of), source=breadth_source)
 
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),

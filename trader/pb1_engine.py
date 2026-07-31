@@ -228,10 +228,11 @@ from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_orde
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_LEADER_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
-    build_kr_regime_snapshot, candidate_allows_buy, execution_policy, market_allows_buy, write_snapshot,
+    build_kr_regime_snapshot, candidate_allows_buy, constrain_global_policy, execution_policy, market_allows_buy, market_execution_policies, write_snapshot,
 )
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
 from trader.kr.account_risk import evaluate_kr_account_risk
+from trader.kr.regime_runtime import calculate_market_breadth, load_runtime_state, save_runtime_state, time_adjusted_turnover
 from trader.decision_schema import build_entry_evaluation, build_exit_evaluation
 from trader.reasons import ReasonCode
 from trader.eventlog import emit_event
@@ -1160,6 +1161,36 @@ def _compute_kr_per_position_budget(
         max_krw,
     )
     return per_position_budget, debug
+
+
+def _recalculate_kr_orderable_quantities(
+    candidates: list["CandidateFeature"], *, per_position_budget: float,
+    account_equity: float, risk_pct: float, liquidity_participation: float = .01,
+) -> list["CandidateFeature"]:
+    """Rebuild quantities from zero after every BUY gate has completed."""
+    result = []
+    for candidate in candidates:
+        features = candidate.features or {}
+        price = float(features.get("order_price") or 0.0)
+        stop = float(features.get("stop_price") or features.get("initial_stop") or features.get("stop0") or 0.0)
+        if price <= 0 or stop <= 0 or stop >= price:
+            logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s result=BLOCK reason=invalid_runtime_stop", candidate.code)
+            continue
+        per_share_risk = price - stop
+        risk_qty = int((account_equity * (risk_pct / 100.0)) // per_share_risk)
+        budget_qty = int(per_position_budget // price)
+        avg_volume = float(features.get("volume_avg20") or features.get("avg_volume20") or 0.0)
+        liquidity_qty = int(avg_volume * liquidity_participation) if avg_volume > 0 else 0
+        final_qty = min(risk_qty, budget_qty, liquidity_qty)
+        if final_qty <= 0:
+            logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s result=BLOCK reason=quantity_zero risk_qty=%s budget_qty=%s liquidity_qty=%s", candidate.code, risk_qty, budget_qty, liquidity_qty)
+            continue
+        candidate.planned_qty = final_qty
+        candidate.planned_value = final_qty * price
+        features.update({"risk_qty": risk_qty, "budget_qty": budget_qty, "liquidity_qty": liquidity_qty,
+                         "per_position_budget": per_position_budget})
+        result.append(candidate)
+    return result
 
 
 def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | None) -> int:
@@ -8275,7 +8306,17 @@ class PB1Engine:
                 cf.features["above_vwap"] = bool(vwap_price and last_price > vwap_price)
                 cf.features["distance_from_intraday_high"] = (last_price / high_price - 1.0) if high_price else -1.0
             avg_volume = self._to_float(cf.features.get("volume_avg20") or cf.features.get("avg_volume20"))
-            cf.features["turnover_expansion"] = (last_volume / avg_volume) if last_volume and avg_volume else 0.0
+            if last_volume and avg_volume:
+                turnover, turnover_source = time_adjusted_turnover(
+                    accumulated_volume=last_volume, avg_daily_volume=avg_volume,
+                    now=getattr(self, "_now_kst", None) or now_kst(),
+                    expected_volume_until_now=self._to_float(quote.get("expected_volume_until_now")),
+                    curve_fraction=self._to_float(quote.get("intraday_volume_curve_fraction")),
+                )
+                cf.features["turnover_expansion"] = turnover
+                logger.info("[KR_REGIME][TURNOVER_MODEL] symbol=%s source=%s ratio=%.3f", cf.code, turnover_source, turnover)
+            else:
+                cf.features["turnover_expansion"] = 0.0
             if source and source != "ask":
                 logger.info("[PB1][PRICE][FALLBACK] code=%s used=%s px=%.2f", cf.code, source, order_px)
                 if source == "daily_close":
@@ -13791,25 +13832,20 @@ class PB1Engine:
             "high_beta_exposure_pct": exposure.get("high_beta_exposure_pct"),
         }
 
-    @staticmethod
-    def _kr_breadth_observation(rows: list[dict], market: str) -> dict[str, float] | None:
-        aliases = {"KOSPI": {"KOSPI", "KS", "P"}, "KOSDAQ": {"KOSDAQ", "KQ", "Q"}}[market]
-        selected = [r for r in rows if str(r.get("market") or r.get("market_code") or "").upper() in aliases]
-        if not selected:
-            return None
-        def ratio(predicate):
-            valid = [r for r in selected if predicate(r) is not None]
-            return sum(bool(predicate(r)) for r in valid) / len(valid) if valid else None
-        def above(key):
-            return lambda r: None if r.get("close") is None or r.get(key) is None else float(r["close"]) > float(r[key])
-        returns = [float(r.get("return_5d")) for r in selected if r.get("return_5d") is not None]
-        advances = [float(r.get("intraday_return") or r.get("return_1d")) > 0 for r in selected if r.get("intraday_return") is not None or r.get("return_1d") is not None]
-        return {
-            "breadth_ma20": ratio(above("ma20")), "breadth_ma50": ratio(above("ma50")),
-            "advance_ratio": sum(advances) / len(advances) if advances else None,
-            "advance_ratio_intraday": sum(advances) / len(advances) if advances else None,
-            "median_return_5d": float(np.median(returns)) if returns else None,
-        }
+    def _kr_breadth_input(self, final30_rows: list[dict]) -> tuple[list[dict], str]:
+        sources = (
+            (getattr(self, "_kr_broader_scored_universe", None), "broader_scored_universe"),
+            (list((getattr(self, "_precomputed_derived_map", {}) or {}).values()), "broader_scored_universe"),
+            (getattr(self, "_kr_candidate_pool_rows", None), "candidate_pool120"),
+            (getattr(self, "top_candidates", None), "top50"),
+            (final30_rows, "final30_fallback"),
+        )
+        for rows, source in sources:
+            normalized = [dict(r) for r in (rows or []) if isinstance(r, dict)]
+            usable = [r for r in normalized if r.get("market") is not None and all(r.get(k) is not None for k in ("close", "ma20", "ma50", "return_1d", "return_5d"))]
+            if usable:
+                return normalized, source
+        return [], "missing"
 
     def _kr_etf_observation(self, symbol: str, breadth: dict[str, float] | None) -> dict[str, Any]:
         """Load a real KRX security; literal index names must never reach OHLCV."""
@@ -13834,7 +13870,13 @@ class PB1Engine:
         turnover_expansion = None
         intraday_volume = self._to_float(quote.get("acml_vol") or quote.get("volume"))
         if intraday_volume and len(volume.dropna()) >= 20 and float(volume.tail(20).mean()) > 0:
-            turnover_expansion = intraday_volume / float(volume.tail(20).mean())
+            now = getattr(self, "_now_kst", None) or now_kst()
+            expected = self._to_float(quote.get("expected_volume_until_now"))
+            curve = self._to_float(quote.get("intraday_volume_curve_fraction"))
+            turnover_expansion, turnover_source = time_adjusted_turnover(
+                accumulated_volume=intraday_volume, avg_daily_volume=float(volume.tail(20).mean()), now=now,
+                expected_volume_until_now=expected, curve_fraction=curve)
+            logger.info("[KR_REGIME][TURNOVER_MODEL] symbol=%s source=%s ratio=%.3f", symbol, turnover_source, turnover_expansion)
         result = {
             "close": current, "ma20": float(ma20.iloc[-1]), "ma50": float(ma50.iloc[-1]), "ma200": float(ma200.iloc[-1]),
             "ma20_slope_5d": float(ma20.iloc[-1] - ma20.iloc[-6]),
@@ -13850,8 +13892,16 @@ class PB1Engine:
 
     def _build_kr_regime_snapshot_for_tick(self, final30_rows: list[dict] | None, account_snapshot: dict) -> Any:
         rows = list(final30_rows or [])
-        kospi_breadth = self._kr_breadth_observation(rows, "KOSPI")
-        kosdaq_breadth = self._kr_breadth_observation(rows, "KOSDAQ")
+        breadth_rows, breadth_source = self._kr_breadth_input(rows)
+        breadth_artifact = calculate_market_breadth(breadth_rows, as_of=str(self._today), source=breadth_source)
+        def breadth_for(market):
+            value = dict(breadth_artifact["markets"].get(market) or {})
+            if value.get("data_quality") == "BLOCKED": return None
+            return {"breadth_ma20": value.get("breadth_ma20"), "breadth_ma50": value.get("breadth_ma50"),
+                    "advance_ratio": value.get("advance_ratio"), "advance_ratio_intraday": value.get("advance_ratio"),
+                    "median_return_5d": value.get("median_return_5d"), "input_data_quality": value.get("data_quality")}
+        kospi_breadth = breadth_for("KOSPI")
+        kosdaq_breadth = breadth_for("KOSDAQ")
         observations = {
             "KOSPI": self._kr_etf_observation(KR_MARKET_ETFS["KOSPI"], kospi_breadth),
             "KOSDAQ": self._kr_etf_observation(KR_MARKET_ETFS["KOSDAQ"], kosdaq_breadth),
@@ -13869,7 +13919,13 @@ class PB1Engine:
         for value in observations.values():
             value["leader_confirmation_count"] = leader_count
         now = getattr(self, "_now_kst", None) or now_kst()
-        trackers = getattr(self, "_kr_shock_trackers", {})
+        persisted = load_runtime_state(str(self._today), now=now)
+        trackers = {}
+        for market, value in (persisted.get("markets") or {}).items():
+            first = value.get("shock_first_seen_at")
+            if first:
+                try: trackers[market] = (datetime.fromisoformat(first), int(value.get("shock_consecutive_ticks") or 0))
+                except ValueError: pass
         for market, value in observations.items():
             positive_count = sum((
                 float(value.get("intraday_return_positive") or 0) >= .02,
@@ -13877,6 +13933,8 @@ class PB1Engine:
                 bool(value.get("above_open")), bool(value.get("above_vwap")),
                 float(value.get("advance_ratio_intraday") or 0) >= .65,
                 float(value.get("turnover_expansion") or 0) >= 1.2,
+                float(value.get("distance_from_intraday_high") or -1) >= -.015,
+                int(value.get("leader_confirmation_count") or 0) >= 2,
             ))
             previous = trackers.get(market)
             if positive_count >= 4:
@@ -13889,23 +13947,51 @@ class PB1Engine:
                 trackers.pop(market, None)
                 value["shock_consecutive_ticks"] = 0
                 value["shock_minutes"] = 0.0
+            logger.info("[KR_REGIME][SHOCK_TRACKER] market=%s first_seen=%s consecutive_ticks=%s elapsed_minutes=%.1f", market, trackers.get(market, (None, 0))[0], value["shock_consecutive_ticks"], value["shock_minutes"])
         self._kr_shock_trackers = trackers
         account_risk = evaluate_kr_account_risk(account_snapshot)
         snapshot = build_kr_regime_snapshot(
-            observations, as_of=str(self._today), source="INTRADAY",
+            observations, as_of=now.isoformat(), source="INTRADAY",
             sector_data_suspect=leader_count == 0,
             account_kill_switch=bool(account_risk.get("account_loss_kill_switch_triggered")),
         )
-        stabilizers = getattr(self, "_kr_regime_stabilizers", None)
-        if stabilizers is None:
-            stabilizers = {m: KRRegimeStabilizer(snapshot.market_states[m].state) for m in ("KOSPI", "KOSDAQ")}
-            self._kr_regime_stabilizers = stabilizers
+        stabilizers = {}
+        for market in ("KOSPI", "KOSDAQ"):
+            saved = (persisted.get("markets") or {}).get(market) or {}
+            stabilizer = KRRegimeStabilizer(saved.get("stable_state") or snapshot.market_states[market].state)
+            stabilizer._candidate = saved.get("pending_upgrade_state")
+            stabilizer._count = int(saved.get("pending_upgrade_count") or 0)
+            last = saved.get("last_change_at")
+            if last:
+                try: stabilizer._last_change_at = datetime.fromisoformat(last)
+                except ValueError: pass
+            elif trackers.get(market):
+                stabilizer._last_change_at = trackers[market][0]
+            stabilizers[market] = stabilizer
+        self._kr_regime_stabilizers = stabilizers
+        raw_states = dict(snapshot.market_states)
         stable_states = {m: replace(v, state=stabilizers[m].update(v.state, now)) for m, v in snapshot.market_states.items()}
         stable_global = min((v.state for v in stable_states.values()), key=STATE_ORDER.index)
+        stable_policy = execution_policy(stable_global, data_quality=snapshot.data_quality)
+        if snapshot.data_quality == "DEGRADED":
+            stable_policy = replace(stable_policy, budget_multiplier=stable_policy.budget_multiplier * .8)
+        stable_market_policies = market_execution_policies(stable_states, snapshot.data_quality)
+        stable_policy = constrain_global_policy(stable_policy, stable_market_policies)
         snapshot = replace(snapshot, market_states=stable_states, global_state=stable_global,
-                           execution_policy=execution_policy(stable_global, data_quality=snapshot.data_quality))
+                           execution_policy=stable_policy, market_policies=stable_market_policies)
         self._kr_regime_snapshot = snapshot
         write_snapshot(snapshot)
+        runtime_markets = {}
+        for market, value in stable_states.items():
+            tracker = trackers.get(market)
+            stabilizer = stabilizers[market]
+            runtime_markets[market] = {"shock_first_seen_at": tracker[0].isoformat() if tracker else None,
+                "shock_consecutive_ticks": tracker[1] if tracker else 0, "raw_state": raw_states[market].state,
+                "stable_state": value.state, "pending_upgrade_state": stabilizer._candidate,
+                "pending_upgrade_count": stabilizer._count,
+                "last_change_at": stabilizer._last_change_at.isoformat() if stabilizer._last_change_at else None}
+            logger.info("[KR_REGIME][SHOCK_TRACKER] market=%s first_seen=%s consecutive_ticks=%s elapsed_minutes=%.1f raw_state=%s stable_state=%s", market, tracker[0] if tracker else None, tracker[1] if tracker else 0, ((now - tracker[0]).total_seconds() / 60.0) if tracker else 0.0, raw_states[market].state, value.state)
+        save_runtime_state(str(self._today), now, runtime_markets)
         return snapshot
 
     def _evaluate_kr_market_state_overlay_for_tick(self, *, tick_budget_krw: float, positions: list[dict], available_cash_krw: float, final30_rows: list[dict] | None = None) -> tuple[dict | None, float]:
@@ -13917,6 +14003,7 @@ class PB1Engine:
             snapshot = self._build_kr_regime_snapshot_for_tick(final30_rows, account_snapshot)
             policy = snapshot.execution_policy
             overlay = {"market_state": snapshot.global_state, "market_states": snapshot.market_states,
+                       "market_policies": snapshot.market_policies,
                        "data_quality": snapshot.data_quality, "allow_new_buy": policy.allow_new_buy,
                        "allow_add_to_existing": policy.allow_add_to_existing,
                        "force_entry_block": not policy.allow_new_buy,
@@ -17008,10 +17095,12 @@ class PB1Engine:
                     candidate_market = str(getattr(cf, "market", "") or intent.get("market") or "").upper()
                     normalized_market = "KOSPI" if candidate_market in {"KOSPI", "KS", "P"} else "KOSDAQ" if candidate_market in {"KOSDAQ", "KQ", "Q"} else "UNKNOWN"
                     if snapshot is None or not market_allows_buy(snapshot, normalized_market):
+                        logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=BLOCK stage=market", cf.code, normalized_market)
                         self._log_order_skip(cf, ["KR_MARKET_REGIME_BLOCK" if normalized_market != "UNKNOWN" else "KR_MARKET_UNKNOWN_ENTRY_BLOCK"], "PB1-CLOSE")
                         continue
                     stock_ok, stock_reason = candidate_allows_buy(intent, snapshot.market_states[normalized_market].state)
                     if not stock_ok:
+                        logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=BLOCK stage=stock reason=%s", cf.code, normalized_market, stock_reason)
                         self._log_order_skip(cf, [str(stock_reason)], "PB1-CLOSE")
                         continue
                     blocked = filter_kr_entry_intent(intent, overlay, positions=getattr(self, "_kr_overlay_positions", existing_positions if 'existing_positions' in locals() else []))
@@ -17019,6 +17108,7 @@ class PB1Engine:
                         order_stage_counter[str(blocked.get("reason") or "KR_MARKET_STATE_ENTRY_BLOCK")] += 1
                         self._log_order_skip(cf, [str(blocked.get("reason"))], "PB1-CLOSE")
                     else:
+                        logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=PASS", cf.code, normalized_market)
                         kept_orderable.append(cf)
                 logger.info("[KR_MARKET_STATE][ENTRY_FILTER_APPLIED] before=%s after=%s market_state=%s", len(orderable_candidates), len(kept_orderable), overlay.get("market_state"))
                 orderable_candidates = kept_orderable
@@ -17032,14 +17122,13 @@ class PB1Engine:
                 )
                 effective_target = int(sizing_meta["actual_target"])
                 orderable_candidates = orderable_candidates[:effective_target]
-                for cf in orderable_candidates:
-                    order_price = float((getattr(cf, "features", {}) or {}).get("order_price") or 0.0)
-                    affordable_qty = int(per_position_budget // order_price) if order_price > 0 else 0
-                    current_qty = int(getattr(cf, "planned_qty", 0) or affordable_qty)
-                    cf.planned_qty = min(current_qty, affordable_qty)
-                    cf.planned_value = float(cf.planned_qty) * order_price
-                    (getattr(cf, "features", {}) or {})["per_position_budget"] = per_position_budget
-                orderable_candidates = [cf for cf in orderable_candidates if cf.planned_qty > 0]
+                orderable_candidates = _recalculate_kr_orderable_quantities(
+                    orderable_candidates, per_position_budget=per_position_budget,
+                    account_equity=float(getattr(self, "_equity_krw", 0.0) or available_cash_krw),
+                    risk_pct=float(RISK_PER_TRADE_PCT),
+                    liquidity_participation=float(os.getenv("PB1_KR_LIQUIDITY_PARTICIPATION", ".01")),
+                )
+                logger.info("[KR_REGIME][SIZING] tick_budget=%.0f orderable_count=%s slots_remaining=%s policy_max=%s effective_target=%s per_position_budget=%.0f", float(tick_budget_krw or 0), len(orderable_candidates), slots_remaining, policy_max, effective_target, per_position_budget)
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)

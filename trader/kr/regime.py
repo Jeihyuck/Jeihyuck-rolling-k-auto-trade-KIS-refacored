@@ -6,7 +6,7 @@ Missing mandatory observations are *blocked*, never silently replaced by an ETF.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import logging
@@ -48,12 +48,22 @@ class KRExecutionPolicy:
 
 
 @dataclass(frozen=True)
+class KRMarketExecutionPolicy:
+    market: str
+    data_quality: str
+    allow_new_buy: bool
+    budget_multiplier: float
+    max_new_positions: int | None
+
+
+@dataclass(frozen=True)
 class KRRegimeSnapshot:
     as_of: str
     global_state: str
     market_states: dict[str, KRMarketState]
     data_quality: str
     execution_policy: KRExecutionPolicy
+    market_policies: dict[str, KRMarketExecutionPolicy] = field(default_factory=dict)
     sector_leaders: tuple[str, ...] = ()
     source: str = "PREP"
     schema_version: int = 1
@@ -73,11 +83,13 @@ class KRRegimeStabilizer:
 
     def update(self, proposed: str, now: datetime) -> str:
         current_rank, proposed_rank = STATE_ORDER.index(self.state), STATE_ORDER.index(proposed)
-        if proposed in {"KR_DEFENSE_CRASH", "KR_SHOCK_REBOUND_PENDING"}:
-            return self._accept(proposed, now)
         if proposed == self.state:
             self._candidate, self._count = None, 0
             return self.state
+        if proposed in {"KR_DEFENSE_CRASH", "KR_SHOCK_REBOUND_PENDING"}:
+            return self._accept(proposed, now)
+        if proposed == "KR_SHOCK_REBOUND_CONFIRMED" and self.state == "KR_SHOCK_REBOUND_PENDING" and self._last_change_at and (now - self._last_change_at).total_seconds() >= 600:
+            return self._accept(proposed, now)
         if self._candidate != proposed:
             self._candidate, self._count = proposed, 1
         else:
@@ -102,6 +114,13 @@ def _number(data: Mapping[str, Any], key: str) -> float | None:
         return None if value is None else float(value)
     except (TypeError, ValueError):
         return None
+
+
+def normalize_kr_market(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    if raw in {"KOSPI", "KS", "P"}: return "KOSPI"
+    if raw in {"KOSDAQ", "KQ", "Q"}: return "KOSDAQ"
+    return "UNKNOWN"
 
 
 def state_for_score(score: float) -> str:
@@ -135,6 +154,8 @@ def _shock_rebound_state(observations: Mapping[str, Any]) -> str | None:
         bool(observations.get("above_open")), bool(observations.get("above_vwap")),
         (_number(observations, "advance_ratio_intraday") or 0) >= .65,
         (_number(observations, "turnover_expansion") or 0) >= 1.2,
+        (_number(observations, "distance_from_intraday_high") or -1) >= -.015,
+        int(observations.get("leader_confirmation_count") or 0) >= 2,
     ))
     if positive < 4:
         return None
@@ -194,8 +215,8 @@ def calculate_market_state(market: str, observations: Mapping[str, Any], *,
     if state == "KR_STRONG_RISK_ON" and (sector_data_suspect or account_kill_switch or independent_strength < 2):
         state = "KR_RISK_ON"
     if account_kill_switch:
-        state = STATE_ORDER[max(0, STATE_ORDER.index(state) - 1)]
-    return KRMarketState(market, score, state, "OK", {"trend": trend, "breadth": breadth, "momentum": momentum, "risk": risk})
+        state = "KR_DEFENSE_CRASH"
+    return KRMarketState(market, score, state, str(observations.get("input_data_quality") or "OK"), {"trend": trend, "breadth": breadth, "momentum": momentum, "risk": risk})
 
 
 def execution_policy(state: str, *, data_quality: str = "OK") -> KRExecutionPolicy:
@@ -214,6 +235,25 @@ def execution_policy(state: str, *, data_quality: str = "OK") -> KRExecutionPoli
                              sector_cap=sector_cap, high_beta_sector_cap=.15 if risk_off else .45)
 
 
+def market_execution_policies(states: Mapping[str, KRMarketState], quality: str) -> dict[str, KRMarketExecutionPolicy]:
+    result = {}
+    for market, value in states.items():
+        local = execution_policy(value.state, data_quality=value.data_quality)
+        multiplier = local.budget_multiplier * (.8 if quality == "DEGRADED" else 1.0)
+        result[market] = KRMarketExecutionPolicy(market, value.data_quality, local.allow_new_buy, multiplier, local.max_new_positions)
+    return result
+
+
+def constrain_global_policy(policy: KRExecutionPolicy, market_policies: Mapping[str, KRMarketExecutionPolicy]) -> KRExecutionPolicy:
+    active = [p for p in market_policies.values() if p.data_quality != "BLOCKED"]
+    if not active:
+        return replace(policy, budget_multiplier=0.0, max_new_positions=0, allow_new_buy=False, allow_add_to_existing=False)
+    finite_limits = [p.max_new_positions for p in active if p.max_new_positions is not None]
+    return replace(policy, budget_multiplier=min(p.budget_multiplier for p in active),
+                   max_new_positions=min(finite_limits) if finite_limits else None,
+                   allow_new_buy=any(p.allow_new_buy for p in active))
+
+
 def build_kr_regime_snapshot(observations: Mapping[str, Mapping[str, Any]], *,
                              as_of: str | None = None, source: str = "PREP",
                              sector_leaders: list[str] | tuple[str, ...] = (),
@@ -222,23 +262,31 @@ def build_kr_regime_snapshot(observations: Mapping[str, Mapping[str, Any]], *,
     states = {m: calculate_market_state(m, observations.get(m, {}),
               sector_data_suspect=sector_data_suspect,
               account_kill_switch=account_kill_switch) for m in MARKETS}
-    quality = "BLOCKED" if any(x.data_quality == "BLOCKED" for x in states.values()) else "OK"
-    # The weaker market constrains common capital, while per-market gates remain independent.
-    global_state = min((x.state for x in states.values()), key=STATE_ORDER.index)
+    healthy = [x for x in states.values() if x.data_quality != "BLOCKED"]
+    quality = "BLOCKED" if not healthy else "OK" if len(healthy) == len(states) and all(x.data_quality == "OK" for x in healthy) else "DEGRADED"
+    # A failed market is excluded rather than zeroing a healthy market's budget.
+    global_state = min((x.state for x in healthy), key=STATE_ORDER.index) if healthy else "KR_DEFENSE_CRASH"
     policy = execution_policy(global_state, data_quality=quality)
+    if quality == "DEGRADED":
+        policy = replace(policy, budget_multiplier=policy.budget_multiplier * .8)
+    market_policies = market_execution_policies(states, quality)
+    policy = constrain_global_policy(policy, market_policies)
     snap = KRRegimeSnapshot(as_of or datetime.now(timezone.utc).isoformat(), global_state,
-                            states, quality, policy, tuple(sector_leaders), source.upper())
+                            states, quality, policy, market_policies, tuple(sector_leaders), source.upper())
     logger.info("[KR_REGIME][SNAPSHOT] as_of=%s source=%s global_state=%s data_quality=%s", snap.as_of, snap.source, snap.global_state, snap.data_quality)
     for market, value in states.items():
         logger.info("[KR_REGIME][MARKET_STATE] market=%s state=%s score=%.1f data_quality=%s", market, value.state, value.score, value.data_quality)
     logger.info("[KR_REGIME][EXECUTION_POLICY] budget_multiplier=%.2f allow_new_buy=%s max_new_positions=%s", policy.budget_multiplier, policy.allow_new_buy, policy.max_new_positions)
+    for market, value in market_policies.items():
+        logger.info("[KR_REGIME][MARKET_POLICY] market=%s quality=%s allow_new_buy=%s budget_multiplier=%.2f max_new_positions=%s", market, value.data_quality, value.allow_new_buy, value.budget_multiplier, value.max_new_positions)
     return snap
 
 
 def market_allows_buy(snapshot: KRRegimeSnapshot, market: str) -> bool:
     market = str(market or "").upper()
-    return bool(snapshot.execution_policy.allow_new_buy and market in snapshot.market_states
-                and snapshot.market_states[market].data_quality == "OK"
+    local = snapshot.market_policies.get(market)
+    return bool(snapshot.execution_policy.allow_new_buy and local and local.allow_new_buy and market in snapshot.market_states
+                and snapshot.market_states[market].data_quality != "BLOCKED"
                 and STATE_ORDER.index(snapshot.market_states[market].state) >= STATE_ORDER.index("KR_DEFENSE_CAUTION"))
 
 
@@ -257,6 +305,8 @@ def candidate_allows_buy(candidate: Mapping[str, Any], state: str) -> tuple[bool
     if rs < .70:
         return False, "KR_STOCK_RS_BLOCK"
     if state in {"KR_SHOCK_REBOUND_PENDING", "KR_SHOCK_REBOUND_CONFIRMED"}:
+        if not (bool(candidate.get("is_market_leader")) or bool(candidate.get("is_sector_leader")) or rs >= .85):
+            return False, "KR_SHOCK_STOCK_LEADERSHIP_BLOCK"
         if not bool(candidate.get("above_open")) or (_number(candidate, "turnover_expansion") or 0) < 1.2:
             return False, "KR_SHOCK_STOCK_CONFIRMATION_BLOCK"
         if (_number(candidate, "distance_from_intraday_high") or -1) < -.05:

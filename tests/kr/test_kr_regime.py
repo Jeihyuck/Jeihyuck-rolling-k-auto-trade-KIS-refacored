@@ -15,9 +15,10 @@ def observations(up=True):
 
 def test_missing_primary_market_fails_closed_but_policy_is_entry_only():
     snap = build_kr_regime_snapshot({"KOSPI": observations(True)})
-    assert snap.data_quality == "BLOCKED"
-    assert snap.execution_policy.allow_new_buy is False
-    assert snap.execution_policy.budget_multiplier == 0
+    assert snap.data_quality == "DEGRADED"
+    assert snap.market_policies["KOSPI"].allow_new_buy is True
+    assert snap.market_policies["KOSDAQ"].allow_new_buy is False
+    assert snap.execution_policy.budget_multiplier > 0
 
 
 def test_markets_are_gated_independently():
@@ -100,3 +101,32 @@ def test_pb1_snapshot_path_fetches_only_real_krx_symbols(monkeypatch, tmp_path):
     engine._build_kr_regime_snapshot_for_tick([], {})
     assert set(calls) == {"069500", "226490", "229200", "091160", "005930", "000660"}
     assert not ({"KOSPI", "KOSDAQ", "KOSPI200"} & set(calls))
+
+
+def test_one_market_failure_is_degraded_and_healthy_market_keeps_budget():
+    snap = build_kr_regime_snapshot({"KOSPI": observations(True)})
+    assert snap.data_quality == "DEGRADED"
+    assert snap.execution_policy.budget_multiplier > 0
+    assert market_allows_buy(snap, "KOSPI")
+    assert not market_allows_buy(snap, "KOSDAQ")
+    assert snap.market_policies["KOSDAQ"].budget_multiplier == 0
+
+
+def test_both_market_failures_block_all_buys():
+    snap = build_kr_regime_snapshot({})
+    assert snap.data_quality == "BLOCKED"
+    assert snap.execution_policy.budget_multiplier == 0
+    assert not market_allows_buy(snap, "KOSPI")
+    assert not market_allows_buy(snap, "KOSDAQ")
+
+
+def test_confirmed_rebound_and_weaker_market_never_exceed_25_percent():
+    kospi=observations(True); kospi.update({"close":90,"ma20":100,"ma50":110,
+      "intraday_return_positive":.08,"gap_up_return":.04,"above_open":True,"above_vwap":True,
+      "advance_ratio_intraday":.82,"turnover_expansion":1.8,"distance_from_intraday_high":-.01,
+      "leader_confirmation_count":3,"shock_consecutive_ticks":3,"shock_minutes":11})
+    kosdaq=observations(False)
+    snap=build_kr_regime_snapshot({"KOSPI":kospi,"KOSDAQ":kosdaq})
+    assert snap.market_states["KOSPI"].state == "KR_SHOCK_REBOUND_CONFIRMED"
+    assert snap.execution_policy.budget_multiplier <= .25
+    assert snap.execution_policy.allow_add_to_existing is False

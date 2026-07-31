@@ -51,6 +51,7 @@ from trader.factors.multifactor import (
     optimize_meta_k,
 )
 from trader.indicators import compute_atr_pct_from_ohlcv, compute_ma20_from_ohlcv, safe_nullable_float
+from trader.kr.regime import normalize_kr_market
 from trader.score_columns import resolve_score_column
 from trader.time_coerce import to_date
 
@@ -2216,11 +2217,15 @@ class WatchlistBuilder:
         )
         return filled[:target_n], degrade_meta
 
-    def _base_item(self, code: str, *, name: str = "", as_of: Optional[date] = None) -> Dict[str, Any]:
+    def _base_item(self, code: str, *, name: str = "", as_of: Optional[date] = None, market: str = "UNKNOWN") -> Dict[str, Any]:
+        normalized_market = normalize_kr_market(market)
         return {
             "as_of": as_of.isoformat() if isinstance(as_of, date) else "",
             "code": code,
             "name": name,
+            "market": normalized_market,
+            "market_code": normalized_market,
+            "rs_benchmark": RS_BENCHMARK_KOSPI if normalized_market == "KOSPI" else RS_BENCHMARK_KOSDAQ if normalized_market == "KOSDAQ" else None,
             "rank": None,
             "score": None,
             "liq_avg": 0.0,
@@ -2479,7 +2484,7 @@ class WatchlistBuilder:
             if not code:
                 continue
 
-            item = self._base_item(code, name=str(m.get("name") or ""), as_of=as_of)
+            item = self._base_item(code, name=str(m.get("name") or ""), as_of=as_of, market=m.get("market") or m.get("market_code"))
 
             try:
                 df, _meta = self.ohlcv_provider(code, count=max(self.min_rows, self.liq_days + 30, 260))
@@ -2542,10 +2547,14 @@ class WatchlistBuilder:
                 item.setdefault("reject_reasons", []).append("ma20_missing")
             item["volume"] = volume_last
             item["volume_avg20"] = volume_avg20
+            item["return_1d"] = float(close_series.iloc[-1] / close_series.iloc[-2] - 1.0) if len(close_series) >= 2 else None
+            item["return_5d"] = float(close_series.iloc[-1] / close_series.iloc[-6] - 1.0) if len(close_series) >= 6 else None
+            item["above_ma20"] = bool(ma20 is not None and float(last_close) > ma20)
+            item["above_ma50"] = bool(ma50 is not None and float(last_close) > ma50)
             item["trading_value"] = trading_value
             item["turnover_pct"] = float(turnover_pct)
             item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
-            item["meta"] = {"as_of": as_of.isoformat()}
+            item["meta"] = {"as_of": as_of.isoformat(), "market": item["market"], "market_code": item["market_code"], "rs_benchmark": item["rs_benchmark"]}
             candidates.append(item)
             universe_items.append(item)
 
