@@ -120,6 +120,7 @@ def build_us_prep_contract(
     if not isinstance(market_state, dict):
         market_state = {}
     market_regime = str(market_state.get("market_regime") or "NEUTRAL")
+    crash_rebound_limited = market_state.get("market_state") == "DEFENSE_CRASH_REBOUND"
     force_entry_block = bool(market_state.get("force_entry_block", False))
     allow_new_buy = bool(market_state.get("allow_new_buy", True))
 
@@ -205,7 +206,7 @@ def build_us_prep_contract(
         trade_block_reason = "validation_failed"
     elif not score_contract_ok:
         trade_block_reason = "score_contract_failed"
-    elif market_regime == "RISK_OFF":
+    elif market_regime == "RISK_OFF" and not crash_rebound_limited:
         trade_block_reason = "risk_off_entry_block"
     elif force_entry_block:
         trade_block_reason = "force_entry_block"
@@ -217,7 +218,9 @@ def build_us_prep_contract(
 
     exit_can_proceed = int(exit_quality_ok)
     close_can_proceed = int(not hard_system_failure)
-    entry_can_proceed = int(trade_block_reason == "ok")
+    if crash_rebound_limited and trade_block_reason == "ok":
+        trade_block_reason = "ok_crash_rebound_limited"
+    entry_can_proceed = int(trade_block_reason in {"ok", "ok_crash_rebound_limited"})
     if volume_missing_fallback_used and not allow_entry_with_volume_missing:
         entry_can_proceed = 0
         if trade_block_reason == "ok":
@@ -255,11 +258,11 @@ def build_us_prep_contract(
     errors.extend(dynamic_universe_result.get("errors", []))
     errors.extend(validation.get("errors", []))
 
-    if market_regime == "RISK_OFF":
+    if market_regime == "RISK_OFF" and not crash_rebound_limited:
         entry_can_proceed = 0
         trade_block_reason = "risk_off_entry_block"
         status = "RISK_OFF_ENTRY_BLOCKED" if market_state.get("market_state") != "DEFENSE_CRASH" else "DEFENSE_CRASH_ENTRY_BLOCKED"
-    if market_state.get("market_state") == "DEFENSE_CRASH" or force_entry_block:
+    if market_state.get("market_state") in {"DEFENSE_CRASH", "DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"} or force_entry_block:
         entry_can_proceed = 0
         trade_block_reason = "risk_off_entry_block" if market_regime == "RISK_OFF" else "force_entry_block"
         status = "DEFENSE_CRASH_ENTRY_BLOCKED"

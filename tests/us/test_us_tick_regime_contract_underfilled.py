@@ -103,3 +103,18 @@ def test_final30_complete_false_alone_does_not_block_when_trade_ready_true():
 
     assert result["ok"] is True
     assert result["reason"] == "ok"
+
+
+def test_crash_rebound_risk_off_contract_passes_but_sha_mismatch_stays_hard():
+    rebound = _contract(
+        status="OK_WITH_WARNINGS_CRASH_REBOUND_LIMITED",
+        market_state="DEFENSE_CRASH_REBOUND",
+        market_regime="RISK_OFF",
+        entry_can_proceed=1,
+        trade_block_reason="ok_crash_rebound_limited",
+        effective_capital_scale=.25,
+        effective_max_new_positions=3,
+    )
+    assert _gate(rebound)["ok"] is True
+    mismatch = dict(rebound, contract_version="old")
+    assert _gate(mismatch)["reason"] == "prep_contract_version_mismatch"
