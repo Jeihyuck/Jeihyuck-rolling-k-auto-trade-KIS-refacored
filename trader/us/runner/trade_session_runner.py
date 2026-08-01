@@ -191,6 +191,13 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
     sector_cap_enforced_last = False
     trade_block_reason_last = ""
     blocked_entry_reason_counts_total: dict[str, int] = {}
+    blocked_entry_stage_counts_total: dict[str, int] = {}
+    candidate_metric_keys = (
+        "raw_watchlist_candidates", "prefilter_eligible_candidates",
+        "intent_generation_attempted", "final_entry_intents",
+        "backfill_attempt_count", "backfill_success_count",
+    )
+    candidate_metrics = {key: 0 for key in candidate_metric_keys}
     for tick_result in results or []:
         if tick_result.get("market_regime"):
             market_regime_last = str(tick_result.get("market_regime") or "")
@@ -212,12 +219,21 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
             blocked_entry_reason_counts_total,
             tick_result.get("blocked_entry_reason_counts") or {},
         )
+        blocked_entry_stage_counts_total = _merge_reason_counts(
+            blocked_entry_stage_counts_total,
+            tick_result.get("blocked_entry_stage_counts") or {},
+        )
+        for key in candidate_metric_keys:
+            candidate_metrics[key] += int(tick_result.get(key) or 0)
     return {
         "market_regime": market_regime_last,
         "capital_scale": capital_scale_last,
         "sector_cap_enforced": sector_cap_enforced_last,
         "trade_block_reason": trade_block_reason_last,
         "blocked_entry_reason_counts": blocked_entry_reason_counts_total,
+        "blocked_entry_stage_counts": blocked_entry_stage_counts_total,
+        "candidate_pool_exhausted": bool(results and results[-1].get("candidate_pool_exhausted")),
+        **candidate_metrics,
     }
 
 def _write_us_schedule_health(payload: dict, session: str) -> None:

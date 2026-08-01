@@ -267,6 +267,15 @@ def _blocked_entry_reason_counts(cluster_blocked: Any, market_blocked: Any, entr
         add(entry_degraded_reason)
     return counts
 
+
+def _blocked_entry_stage_counts(blocked_candidates: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in blocked_candidates or []:
+        stage = item.get("block_stage") if isinstance(item, dict) else None
+        key = str(stage or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
 def _extract_watchlist_rows_from_payload(payload: Any) -> list[dict]:
     """Extract final30/watchlist rows from common artifact payload shapes."""
     if isinstance(payload, list):
@@ -2101,8 +2110,21 @@ def run_trade_tick(
                 
                 if watchlist_rows:
                     from trader.us.market_state_overlay import filter_watchlist_rows_for_market_state
-                    eligible_watchlist_rows, preblocked_rows = filter_watchlist_rows_for_market_state(
+                    from trader.us.portfolio_cluster_guard import filter_watchlist_rows_for_cluster_guard
+                    from trader.us.position_trend_state import filter_watchlist_rows_for_trend_state
+                    market_eligible_rows, market_preblocked_rows = filter_watchlist_rows_for_market_state(
                         watchlist_rows, market_state_overlay, current_positions
+                    )
+                    cluster_eligible_rows, cluster_preblocked_rows = filter_watchlist_rows_for_cluster_guard(
+                        market_eligible_rows, cluster_guard_result
+                    )
+                    eligible_watchlist_rows, trend_preblocked_rows = filter_watchlist_rows_for_trend_state(
+                        cluster_eligible_rows, current_positions
+                    )
+                    preblocked_rows = market_preblocked_rows + cluster_preblocked_rows + trend_preblocked_rows
+                    logger.info(
+                        "[US_ENTRY][PREFILTER] raw=%d eligible=%d blocked=%d",
+                        len(watchlist_rows), len(eligible_watchlist_rows), len(preblocked_rows),
                     )
                     engine = _get_strategy_engine(env=env, offline=offline)
                     try:
@@ -2123,6 +2145,7 @@ def run_trade_tick(
                                 available_new_slots=available_new_slots,
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
+                        entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
                         if eligible_watchlist_rows and not entry_intents:
                             logger.warning(
                                 "[US_ENTRY][ELIGIBLE_BUT_NO_INTENT] eligible=%d preblocked=%d",
@@ -2169,6 +2192,21 @@ def run_trade_tick(
                 )
         from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
         entry_intents, trend_blocked_buys = filter_add_to_existing_by_trend_state(entry_intents, current_positions)
+        postfilter_blocked_candidates = []
+        postfilter_blocked_candidates.extend(
+            {"symbol": symbol, "reason": "BLOCKED_CLUSTER_EXPOSURE", "block_stage": "postfilter_cluster_guard"}
+            for symbol in cluster_guard_blocked_buys
+        )
+        postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_market_state"} for item in market_state_blocked_buys)
+        postfilter_blocked_candidates.extend({**item, "block_stage": "postfilter_position_trend"} for item in trend_blocked_buys)
+        if postfilter_blocked_candidates:
+            logger.error(
+                "[US_ENTRY][CANDIDATE_FILTER_INVARIANT_FAIL] blocked=%s",
+                postfilter_blocked_candidates,
+            )
+            entry_eval_error_count += 1
+            entry_degraded = True
+            entry_degraded_reason = "candidate_filter_invariant_fail"
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
@@ -2642,6 +2680,8 @@ def run_trade_tick(
         "signal_only": signal_only_cnt,
         "errors": err_cnt,
         "orders_rejected": reject_cnt,
+        "orders_routed": routing_intents_total,
+        "orders_error": err_cnt,
         "orders_failed": orders_failed,
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
@@ -2696,8 +2736,35 @@ def run_trade_tick(
         "portfolio_equity_usd": portfolio_equity_usd if 'portfolio_equity_usd' in locals() else 0.0,
         "portfolio_cluster_cap_violations": cluster_guard_result.get("portfolio_cluster_cap_violations", []),
         "cluster_guard_blocked_buys": cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [],
-        "market_state_blocked_buys": market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [],
-        "blocked_entry_reason_counts": _blocked_entry_reason_counts(cluster_guard_blocked_buys if 'cluster_guard_blocked_buys' in locals() else [], market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [], entry_degraded_reason),
+        "market_state_blocked_buys": (locals().get("market_preblocked_rows", []) + (market_state_blocked_buys if 'market_state_blocked_buys' in locals() else [])),
+        "raw_watchlist_candidates": len(watchlist_rows) if 'watchlist_rows' in locals() else 0,
+        "prefilter_eligible_candidates": len(eligible_watchlist_rows) if 'eligible_watchlist_rows' in locals() else 0,
+        "prefilter_blocked_candidates": locals().get("preblocked_rows", []),
+        "intent_generation_attempted": locals().get("entry_generation_diagnostics", {}).get("attempted", 0),
+        "intent_generation_blocked": locals().get("entry_generation_diagnostics", {}).get("blocked", []),
+        "postfilter_blocked_candidates": locals().get("postfilter_blocked_candidates", []),
+        "final_entry_intents": len(entry_intents),
+        "blocked_entry_reason_counts": _blocked_entry_reason_counts(
+            locals().get("preblocked_rows", []) + locals().get("entry_generation_diagnostics", {}).get("blocked", []),
+            locals().get("postfilter_blocked_candidates", []), entry_degraded_reason,
+        ),
+        "blocked_entry_stage_counts": _blocked_entry_stage_counts(
+            locals().get("preblocked_rows", []) + locals().get("entry_generation_diagnostics", {}).get("blocked", []) + locals().get("postfilter_blocked_candidates", [])
+        ),
+        "backfill_attempt_count": len(locals().get("preblocked_rows", [])) + locals().get("entry_generation_diagnostics", {}).get("backfill_attempt_count", 0),
+        "backfill_success_count": max(
+            locals().get("entry_generation_diagnostics", {}).get("backfill_success_count", 0),
+            sum(1 for index, intent in enumerate(entry_intents, 1) if int(intent.get("rank_final30") or index) > index),
+        ),
+        "candidate_pool_exhausted": locals().get("entry_generation_diagnostics", {}).get(
+            "candidate_pool_exhausted",
+            bool(locals().get("eligible_watchlist_rows", [])) and len(entry_intents) < min(int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")), available_new_slots),
+        ),
+        "explicitly_deferred_candidates": max(
+            0,
+            len(locals().get("eligible_watchlist_rows", []))
+            - locals().get("entry_generation_diagnostics", {}).get("attempted", len(locals().get("eligible_watchlist_rows", []))),
+        ),
         "cluster_guard_trim_intents": cluster_guard_result.get("cluster_guard_trim_intents", []),
         "cluster_guard_trim_notional": cluster_guard_result.get("cluster_guard_trim_notional", 0.0),
         **deployment_metrics,

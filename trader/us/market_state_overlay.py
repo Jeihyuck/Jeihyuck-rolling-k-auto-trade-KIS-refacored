@@ -585,17 +585,33 @@ def filter_watchlist_rows_for_market_state(
         trend_score = float(row.get("trend_score") or 0.0)
         score_final = float(row.get("score_final") or row.get("score") or 0.0)
         rank_final30 = int(row.get("rank_final30") or row.get("rank") or fallback_rank)
+        position_state = "HELD" if sym in held_symbols else str(row.get("position_state") or "NOT_HELD")
         reason = resolve_market_state_entry_block_reason(
             symbol=sym, cluster=cluster, trend_score=trend_score,
             score_final=score_final, rank_final30=rank_final30,
-            position_state="HELD" if sym in held_symbols else str(row.get("position_state") or "NOT_HELD"),
+            position_state=position_state,
             overlay=overlay,
         )
+        if reason is None and overlay.get("market_state") == "STRONG_RISK_ON" and sym in held_symbols:
+            position = next((p for p in positions or [] if _symbol(p) == sym), {})
+            if not is_strong_holding(position, row):
+                reason = "MARKET_STATE_ENTRY_BLOCK"
         if reason:
-            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "market_state": overlay.get("market_state", "NORMAL")})
+            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "block_stage": "market_state", "market_state": overlay.get("market_state", "NORMAL")})
             logger.warning("[US_MARKET_STATE][WATCHLIST_BLOCK] symbol=%s cluster=%s reason=%s", sym, cluster, reason)
         else:
-            kept.append(row)
+            kept.append({
+                **row,
+                "theme_cluster": cluster,
+                "trend_score": trend_score,
+                "score_final": score_final,
+                "rank_final30": rank_final30,
+                "position_state": position_state,
+                "market_state": overlay.get("market_state", "NORMAL"),
+                "market_regime": overlay.get("market_regime", "NEUTRAL"),
+                "blocked_reason": None,
+                "block_stage": None,
+            })
     kept.sort(key=lambda row: float(row.get("score_final") or row.get("score") or 0.0), reverse=True)
     return kept, blocked
 
@@ -610,8 +626,21 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
             continue
         sym = str(intent.get("symbol") or "").upper().strip()
         meta = intent.setdefault("meta", {}) if isinstance(intent.setdefault("meta", {}), dict) else {}
+        metadata_mismatch = next(
+            (
+                key for key in (
+                    "theme_cluster", "trend_score", "score_final", "rank_final30",
+                    "entry_style", "position_state", "position_action",
+                    "market_state", "market_regime", "blocked_reason", "block_stage",
+                )
+                if intent.get(key) is not None
+                and meta.get(key) is not None
+                and intent.get(key) != meta.get(key)
+            ),
+            None,
+        )
         cluster = str(intent.get("theme_cluster") or intent.get("cluster") or meta.get("theme_cluster") or theme_cluster_for(sym, intent))
-        reason = resolve_market_state_entry_block_reason(
+        reason = "ENTRY_METADATA_INVARIANT_FAIL" if metadata_mismatch else resolve_market_state_entry_block_reason(
             symbol=sym, cluster=cluster,
             trend_score=float(intent.get("trend_score") or meta.get("trend_score") or 0),
             score_final=float(intent.get("score_final") or intent.get("score") or meta.get("score_final") or 0),
@@ -623,7 +652,8 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
             reason = "MARKET_STATE_ENTRY_BLOCK"
         if reason:
             meta["blocked_reason"] = reason
-            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "market_state": state})
+            meta["block_stage"] = "metadata" if metadata_mismatch else "market_state"
+            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "block_stage": meta["block_stage"], "metadata_field": metadata_mismatch, "market_state": state})
             logger.warning("[US_MARKET_STATE][ENTRY_BLOCK] symbol=%s cluster=%s reason=%s market_state=%s", sym, cluster, reason, state)
         else:
             kept.append(intent)

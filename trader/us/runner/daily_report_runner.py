@@ -186,6 +186,20 @@ def _apply_regime_session_summary(report: dict, session_summary: dict | None) ->
             report.get("blocked_entry_reason_counts") or {},
             session_summary.get("blocked_entry_reason_counts") or {},
         )
+    if session_summary.get("blocked_entry_stage_counts"):
+        report["blocked_entry_stage_counts"] = merge_reason_counts(
+            report.get("blocked_entry_stage_counts") or {},
+            session_summary.get("blocked_entry_stage_counts") or {},
+        )
+    for key in (
+        "raw_watchlist_candidates", "prefilter_eligible_candidates",
+        "intent_generation_attempted", "final_entry_intents",
+        "backfill_attempt_count", "backfill_success_count",
+    ):
+        if key in session_summary:
+            report[key] = int(report.get(key) or 0) + int(session_summary.get(key) or 0)
+    if "candidate_pool_exhausted" in session_summary:
+        report["candidate_pool_exhausted"] = bool(session_summary.get("candidate_pool_exhausted"))
     return report
 
 

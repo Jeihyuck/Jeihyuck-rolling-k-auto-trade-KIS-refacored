@@ -97,7 +97,8 @@ class USPb1Engine:
         capital_usd_cap = get_us_capital_usd_cap()
 
         from trader.us.pb1.us_entry_engine import generate_entry_intents
-        return generate_entry_intents(
+        diagnostics: dict[str, Any] = {}
+        intents = generate_entry_intents(
             tickers=tickers,
             provider=provider,
             sold_today=sold_today,
@@ -110,4 +111,7 @@ class USPb1Engine:
             allow_new_symbols=allow_new_symbols,
             allow_add_to_existing=allow_add_to_existing,
             available_new_slots=available_new_slots,
+            diagnostics=diagnostics,
         )
+        self.last_entry_diagnostics = diagnostics
+        return intents

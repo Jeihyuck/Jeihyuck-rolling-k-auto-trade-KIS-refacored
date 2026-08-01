@@ -156,3 +156,29 @@ def filter_add_to_existing_by_trend_state(entry_intents: list[dict], current_pos
         else:
             kept.append(it)
     return kept, blocked
+
+
+def filter_watchlist_rows_for_trend_state(rows: list[dict], current_positions: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Reject weak held/add candidates before they can consume a top-N slot."""
+    pos = {str(p.get("symbol") or p.get("code") or "").upper().strip(): p for p in current_positions or []}
+    reason_by_state = {
+        "UNKNOWN": "TREND_UNKNOWN",
+        "WARNING": "TREND_WARNING",
+        "TRIM": "TREND_TRIM",
+        "EXIT": "TREND_EXIT",
+    }
+    kept: list[dict] = []
+    blocked: list[dict] = []
+    for row in rows or []:
+        symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+        position = pos.get(symbol)
+        trend_state = (position or {}).get("trend_state") or ((position or {}).get("trend") or {}).get("trend_state")
+        if position and trend_state != "HEALTHY":
+            blocked.append({
+                "symbol": symbol,
+                "reason": reason_by_state.get(str(trend_state or "UNKNOWN"), "TREND_UNKNOWN"),
+                "block_stage": "position_trend_state",
+            })
+        else:
+            kept.append(row)
+    return kept, blocked

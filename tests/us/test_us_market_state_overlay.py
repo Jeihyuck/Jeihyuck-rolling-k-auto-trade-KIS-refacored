@@ -146,6 +146,56 @@ def test_crash_states_prefilter_all_new_buys(state):
     assert blocked[0]["reason"] == "DEFENSE_CRASH_ENTRY_BLOCK"
 
 
+@pytest.mark.parametrize(
+    "state,overlay_extra,cluster,expected",
+    [
+        ("NORMAL", {}, "HEALTHCARE", True),
+        ("DEFENSE_CAUTION", {"allow_ai_tech_buy": False}, "AI_SOFTWARE", False),
+        ("DEFENSE_RISK_OFF", {}, "CONSUMER_STAPLES", True),
+        ("DEFENSE_CRASH_PENDING", {}, "HEALTHCARE", False),
+        ("DEFENSE_CRASH_CONFIRMED", {}, "HEALTHCARE", False),
+        ("DEFENSE_CRASH_REBOUND", {"allow_ai_tech_buy": False}, "AI_SOFTWARE", False),
+        ("RISK_ON", {}, "AI_SOFTWARE", True),
+        ("STRONG_RISK_ON", {}, "AI_SOFTWARE", True),
+    ],
+)
+def test_market_state_candidate_policy_matrix(state, overlay_extra, cluster, expected):
+    overlay = {"market_state": state, "market_regime": "RISK_ON", "allow_new_buy": True, "allow_ai_tech_buy": True, **overlay_extra}
+    kept, _blocked = filter_watchlist_rows_for_market_state(
+        [{"symbol": "TEST", "theme_cluster": cluster, "score_final": .8, "trend_score": 1, "rank_final30": 1}],
+        overlay,
+    )
+    assert bool(kept) is expected
+
+
+@pytest.mark.parametrize(
+    "before,after,after_allowed",
+    [
+        ("NORMAL", "DEFENSE_CAUTION", False),
+        ("DEFENSE_CAUTION", "DEFENSE_RISK_OFF", False),
+        ("DEFENSE_RISK_OFF", "DEFENSE_CRASH_PENDING", False),
+        ("DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED", False),
+        ("DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_REBOUND", True),
+        ("DEFENSE_CRASH_CONFIRMED", "DEFENSE_CRASH_REBOUND", True),
+        ("DEFENSE_CRASH_REBOUND", "DEFENSE_RISK_OFF", False),
+        ("DEFENSE_RISK_OFF", "NORMAL", True),
+        ("NORMAL", "STRONG_RISK_ON", True),
+    ],
+)
+def test_market_state_transition_uses_current_overlay_without_stale_block(before, after, after_allowed):
+    row = {"symbol": "AI", "theme_cluster": "AI_SOFTWARE", "score_final": .8, "trend_score": 1, "rank_final30": 1}
+    common = {"market_regime": "RISK_ON", "allow_new_buy": True, "allow_ai_tech_buy": True}
+    def overlay(state):
+        return {
+            **common,
+            "market_state": state,
+            "allow_ai_tech_buy": state not in {"DEFENSE_CAUTION", "DEFENSE_RISK_OFF"},
+        }
+    filter_watchlist_rows_for_market_state([row], overlay(before))
+    kept, _ = filter_watchlist_rows_for_market_state([row], overlay(after))
+    assert bool(kept) is after_allowed
+
+
 def test_profit_capture_price_aliases_and_pnl_rate_resolver(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     td = "2026-07-09"

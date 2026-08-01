@@ -51,3 +51,23 @@ def filter_entry_intents_for_cluster_guard(entry_intents: list[dict], guard: dic
             continue
         kept.append(intent)
     return kept, blocked_syms
+
+
+def filter_watchlist_rows_for_cluster_guard(rows: list[dict], guard: dict) -> tuple[list[dict], list[dict]]:
+    """Apply the portfolio cluster guard before an entry slot is selected."""
+    blocked_clusters = set(guard.get("blocked_clusters") or [])
+    kept: list[dict] = []
+    blocked: list[dict] = []
+    for row in rows or []:
+        symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+        cluster = theme_cluster_for(symbol, row)
+        if cluster in blocked_clusters:
+            blocked.append({
+                "symbol": symbol,
+                "cluster": cluster,
+                "reason": "BLOCKED_CLUSTER_EXPOSURE",
+                "block_stage": "portfolio_cluster_guard",
+            })
+        else:
+            kept.append(row)
+    return kept, blocked
