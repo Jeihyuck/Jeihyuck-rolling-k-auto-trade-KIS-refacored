@@ -2331,7 +2331,12 @@ def run_trade_tick(
             ]
             all_intents = entry_intents
 
-    from trader.us.execution.order_router import route_order, select_preflight_buy_candidates
+    from trader.us.execution.order_router import (
+        canonical_risk_snapshot_changed_fields,
+        normalize_canonical_risk_snapshot,
+        route_order,
+        select_preflight_buy_candidates,
+    )
 
     _preflight_effective_max = market_state_overlay.get("effective_max_new_positions")
     _preflight_effective_max = available_new_slots if _preflight_effective_max is None else max(0, int(_preflight_effective_max))
@@ -2417,41 +2422,51 @@ def run_trade_tick(
             _route_preflight_snapshot = getattr(locals().get("incremental_preflight_session"), "accepted_states", {}).get(
                 _route_identity, locals().get("preflight_diagnostics", {}).get("accepted_states", {}).get(_route_identity, {})
             )
+            _router_risk_state = {
+                "available_cash_usd": float(_route_preflight_snapshot.get("available_cash_usd", routing_available_cash)),
+                "daily_notional_usd": float(_route_preflight_snapshot.get("daily_notional_usd", buy_daily_notional)),
+                "position_count": int(_route_preflight_snapshot.get("position_count", position_count)),
+                "portfolio_usd": float(_route_preflight_snapshot.get("portfolio_equity_usd", portfolio_equity_usd or 0.0)),
+                "order_keys": set(_route_preflight_snapshot.get("order_keys") or set()),
+                "cluster_exposure": dict(_route_preflight_snapshot.get("cluster_exposure", routing_cluster_exposure)),
+                "cluster_caps_usd": dict(_route_preflight_snapshot.get("cluster_caps_usd", projected_state.get("cluster_caps_usd") or {})),
+                "default_cluster_cap_usd": _route_preflight_snapshot.get("default_cluster_cap_usd", projected_state.get("default_cluster_cap_usd")),
+                "ai_combined_cap_usd": _route_preflight_snapshot.get("ai_combined_cap_usd", projected_state.get("ai_combined_cap_usd")),
+                "now": now,
+            }
+            _router_allowed_symbols = set(_route_preflight_snapshot.get("allowed_symbols") or locked_watchlist_symbols) if str(intent.get("side", "BUY")).upper() == "BUY" else None
+            _router_position_symbols = set(_route_preflight_snapshot.get("current_position_symbols") or current_position_symbols) or None
             result = route_order(
                 intent,
-                current_daily_notional_usd=float(_route_preflight_snapshot.get("daily_notional_usd", buy_daily_notional)),
-                current_position_count=int(_route_preflight_snapshot.get("position_count", position_count)),
-                total_portfolio_usd=float(_route_preflight_snapshot.get("portfolio_equity_usd", portfolio_equity_usd or 0.0)),
-                available_cash_usd=float(_route_preflight_snapshot.get("available_cash_usd", routing_available_cash)),
+                current_daily_notional_usd=_router_risk_state["daily_notional_usd"],
+                current_position_count=_router_risk_state["position_count"],
+                total_portfolio_usd=_router_risk_state["portfolio_usd"],
+                available_cash_usd=_router_risk_state["available_cash_usd"],
                 signal_only=signal_only,
                 kis_order_allowed=kis_order_allowed,
-                allowed_symbols=(set(_route_preflight_snapshot.get("allowed_symbols") or locked_watchlist_symbols) if str(intent.get("side", "BUY")).upper() == "BUY" else None),
-                current_position_symbols=set(_route_preflight_snapshot.get("current_position_symbols") or current_position_symbols) or None,
+                allowed_symbols=_router_allowed_symbols,
+                current_position_symbols=_router_position_symbols,
                 context=tick_context,
-                now=_route_preflight_snapshot.get("now", now),
-                projected_cluster_exposure=dict(_route_preflight_snapshot.get("cluster_exposure", routing_cluster_exposure)),
-                cluster_caps_usd=dict(_route_preflight_snapshot.get("cluster_caps_usd", projected_state.get("cluster_caps_usd") or {})),
-                default_cluster_cap_usd=_route_preflight_snapshot.get("default_cluster_cap_usd", projected_state.get("default_cluster_cap_usd")),
-                ai_combined_cap_usd=_route_preflight_snapshot.get("ai_combined_cap_usd", projected_state.get("ai_combined_cap_usd")),
-                projected_order_keys=set(_route_preflight_snapshot.get("order_keys") or set()),
+                now=now,
+                projected_cluster_exposure=_router_risk_state["cluster_exposure"],
+                cluster_caps_usd=_router_risk_state["cluster_caps_usd"],
+                default_cluster_cap_usd=_router_risk_state["default_cluster_cap_usd"],
+                ai_combined_cap_usd=_router_risk_state["ai_combined_cap_usd"],
+                projected_order_keys=_router_risk_state["order_keys"],
             )
             orders.append(result)
             if str(intent.get("side") or "BUY").upper() == "BUY" and result.get("status") in {
                 "BLOCKED", "INVALID_ORDER_IDENTITY", "ORDER_DISABLED", "EXCHANGE_MISSING_FATAL",
             }:
                 _preflight_input = _route_preflight_snapshot
-                _router_input = {
-                    "available_cash_usd": float(_route_preflight_snapshot.get("available_cash_usd", routing_available_cash)),
-                    "daily_notional_usd": float(_route_preflight_snapshot.get("daily_notional_usd", buy_daily_notional)),
-                    "position_count": int(_route_preflight_snapshot.get("position_count", position_count)),
-                    "order_keys": sorted(_route_preflight_snapshot.get("order_keys") or []),
-                    "cluster_exposure": dict(routing_cluster_exposure),
-                }
+                _router_input = result.get("canonical_risk_state") or normalize_canonical_risk_snapshot(
+                    _router_risk_state, allowed_symbols=_router_allowed_symbols, current_position_symbols=_router_position_symbols,
+                )
                 mismatch = {
                     "symbol": intent.get("symbol"), "reason": result.get("reason"),
                     "block_stage": "router_after_preflight", "preflight_state": _preflight_input,
                     "router_state": _router_input,
-                    "changed_fields": sorted(key for key in _router_input if _preflight_input.get(key) != _router_input.get(key)),
+                    "changed_fields": canonical_risk_snapshot_changed_fields(_preflight_input, _router_input),
                 }
                 router_blocked_after_preflight.append(mismatch)
                 system_invariant_failure = "PREFLIGHT_ROUTER_MISMATCH"

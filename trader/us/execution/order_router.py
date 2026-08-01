@@ -37,6 +37,34 @@ logger = logging.getLogger(__name__)
 AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 
 
+def normalize_canonical_risk_snapshot(projected_state: dict, *, allowed_symbols=None, current_position_symbols=None) -> dict:
+    """Return the complete, deterministic schema used for preflight/router comparison."""
+    now = projected_state.get("now")
+    return {
+        "available_cash_usd": float(projected_state.get("available_cash_usd") or 0.0),
+        "daily_notional_usd": float(projected_state.get("daily_notional_usd") or 0.0),
+        "position_count": int(projected_state.get("position_count") or 0),
+        "portfolio_equity_usd": float(projected_state.get("portfolio_usd") or 0.0),
+        "order_keys": sorted(projected_state.get("order_keys") or []),
+        "cluster_exposure": dict(sorted((projected_state.get("cluster_exposure") or {}).items())),
+        "cluster_caps_usd": dict(sorted((projected_state.get("cluster_caps_usd") or {}).items())),
+        "default_cluster_cap_usd": projected_state.get("default_cluster_cap_usd"),
+        "ai_combined_cap_usd": projected_state.get("ai_combined_cap_usd"),
+        "now": now.isoformat() if hasattr(now, "isoformat") else str(now or ""),
+        "allowed_symbols": sorted(allowed_symbols or []),
+        "current_position_symbols": sorted(current_position_symbols or []),
+    }
+
+
+def canonical_risk_snapshot_changed_fields(preflight_state: dict, router_state: dict) -> list[str]:
+    """Return every canonical input whose normalized value changed."""
+    return sorted(
+        key
+        for key in set(preflight_state) | set(router_state)
+        if preflight_state.get(key) != router_state.get(key)
+    )
+
+
 class _StatusCompat(str):
     def __new__(cls, value: str, *aliases: str):
         obj = str.__new__(cls, value)
@@ -102,20 +130,10 @@ class BuyPreflightSession:
             return decision
         accepted = decision.resized_intent or intent
         identity = str(accepted.get("client_order_key") or accepted.get("order_key") or accepted.get("symbol") or len(self.accepted))
-        self.accepted_states[identity] = {
-            "available_cash_usd": self.state.get("available_cash_usd"),
-            "daily_notional_usd": self.state.get("daily_notional_usd"),
-            "position_count": self.state.get("position_count"),
-            "order_keys": sorted(self.state.get("order_keys") or []),
-            "cluster_exposure": dict(self.state.get("cluster_exposure") or {}),
-            "portfolio_equity_usd": self.state.get("portfolio_usd"),
-            "cluster_caps_usd": dict(self.state.get("cluster_caps_usd") or {}),
-            "default_cluster_cap_usd": self.state.get("default_cluster_cap_usd"),
-            "ai_combined_cap_usd": self.state.get("ai_combined_cap_usd"),
-            "now": self.state.get("now"),
-            "allowed_symbols": sorted(self.allowed_symbols or []),
-            "current_position_symbols": sorted(str(item.get("symbol") or item.get("code") or "").upper().strip() for item in self.current_positions if isinstance(item, dict)),
-        }
+        current_symbols = {str(item.get("symbol") or item.get("code") or "").upper().strip() for item in self.current_positions if isinstance(item, dict)}
+        self.accepted_states[identity] = normalize_canonical_risk_snapshot(
+            self.state, allowed_symbols=self.allowed_symbols, current_position_symbols=current_symbols,
+        )
         self.accepted.append(accepted)
         self.add_accepted += int(is_add)
         self.new_accepted += int(not is_add)
@@ -627,21 +645,27 @@ def route_order(
 
     # 3. Risk Gate
     gate_intent = {**intent, "exchange": exchange, "client_order_key": order_key, "position_action": position_action}
+    gate_state = {
+        "daily_notional_usd": current_daily_notional_usd,
+        "position_count": current_position_count,
+        "portfolio_usd": total_portfolio_usd,
+        "available_cash_usd": available_cash_usd,
+        "order_keys": existing_keys,
+        "now": now,
+        "cluster_exposure": projected_cluster_exposure or {},
+        "cluster_caps_usd": cluster_caps_usd or {},
+        "default_cluster_cap_usd": default_cluster_cap_usd,
+        "ai_combined_cap_usd": ai_combined_cap_usd,
+    }
+    gate_snapshot = normalize_canonical_risk_snapshot(
+        gate_state,
+        allowed_symbols=allowed_symbols,
+        current_position_symbols=current_position_symbols,
+    )
     try:
         canonical_order_risk_check(
             gate_intent,
-            {
-                "daily_notional_usd": current_daily_notional_usd,
-                "position_count": current_position_count,
-                "portfolio_usd": total_portfolio_usd,
-                "available_cash_usd": available_cash_usd,
-                "order_keys": existing_keys,
-                "now": now,
-                "cluster_exposure": projected_cluster_exposure or {},
-                "cluster_caps_usd": cluster_caps_usd or {},
-                "default_cluster_cap_usd": default_cluster_cap_usd,
-                "ai_combined_cap_usd": ai_combined_cap_usd,
-            },
+            gate_state,
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
         )
@@ -678,18 +702,7 @@ def route_order(
                 try:
                     canonical_order_risk_check(
                         resized_gate_intent,
-                        {
-                            "daily_notional_usd": current_daily_notional_usd,
-                            "position_count": current_position_count,
-                            "portfolio_usd": total_portfolio_usd,
-                            "available_cash_usd": available_cash_usd,
-                            "order_keys": existing_keys,
-                            "now": now,
-                            "cluster_exposure": projected_cluster_exposure or {},
-                            "cluster_caps_usd": cluster_caps_usd or {},
-                            "default_cluster_cap_usd": default_cluster_cap_usd,
-                            "ai_combined_cap_usd": ai_combined_cap_usd,
-                        },
+                        gate_state,
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,
                     )
@@ -710,7 +723,7 @@ def route_order(
                     )
                     if order_key:
                         mark_order_intent_blocked(order_key, reason=f"resize_retry_blocked: {exc2}")
-                    return {"status": "BLOCKED", "reason": f"resize_retry_blocked: {exc2}", "intent": resized_intent}
+                    return {"status": "BLOCKED", "reason": f"resize_retry_blocked: {exc2}", "intent": resized_intent, "canonical_risk_state": gate_snapshot}
             else:
                 # 축소해도 qty가 0 이하거나 원래 qty와 같음
                 logger.warning(
@@ -719,7 +732,7 @@ def route_order(
                 )
                 if order_key:
                     mark_order_intent_blocked(order_key, reason=str(exc))
-                return {"status": "BLOCKED", "reason": str(exc), "intent": intent}
+                return {"status": "BLOCKED", "reason": str(exc), "intent": intent, "canonical_risk_state": gate_snapshot}
         else:
             # notional_exceeds_order_limit가 아닌 다른 block reason
             reason_text = str(exc)
@@ -760,7 +773,7 @@ def route_order(
                 if order_key:
                     mark_order_intent_blocked(order_key, reason=reason_text)
             blocked_status = "WARN_DUPLICATE_EXIT_BLOCKED" if (side == "SELL" and duplicate_blocked) else "BLOCKED"
-            return {"status": blocked_status, "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent}
+            return {"status": blocked_status, "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent, "canonical_risk_state": gate_snapshot}
 
     # 4. DRY_RUN resolve with runtime guard
     dry_run_resolved = resolve_dry_run_for_us_order()

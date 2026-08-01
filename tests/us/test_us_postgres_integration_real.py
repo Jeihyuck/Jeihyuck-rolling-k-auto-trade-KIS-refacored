@@ -130,3 +130,43 @@ def test_real_postgres_save_fills_actual_conflict_and_overflow_are_atomic(pg_eng
     with pg_engine.begin() as conn:
         assert conn.execute(text("SELECT qty_filled FROM us_orders WHERE order_no='OFL'")).scalar_one() == 0
         assert conn.execute(text("SELECT count(*) FROM us_fills WHERE order_no='OFL' AND NOT COALESCE((meta->>'is_synthetic')::boolean,false)")).scalar_one() == 0
+
+
+def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and_query_failure(pg_engine):
+    """Risk loader must query PostgreSQL directly, dedupe keys, and fail closed."""
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE us_orders ADD COLUMN notional_usd numeric"))
+        conn.execute(text("ALTER TABLE us_orders ADD COLUMN env text"))
+        for key, status, notional, env in (
+            ("ack-key", "ACK", 600, "practice"),
+            ("ack-key", "PENDING", 600, "practice"),
+            ("pending-key", "PENDING", 300, "practice"),
+            ("dry-key", "DRY_RUN", 100, "practice"),
+            ("other-env", "ACK", 999, "prod"),
+        ):
+            conn.execute(text("""INSERT INTO us_orders
+                (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+                 avg_price_usd,order_no,status,meta,notional_usd,env)
+                VALUES ('2026-07-31',:key,'AAPL','NASDAQ','BUY',1,0,100,:key,:status,
+                        '{}'::jsonb,:notional,:env)"""),
+                {"key": key, "status": status, "notional": notional, "env": env})
+
+    committed = repos.load_today_committed_buy_notional_result("2026-07-31", env="practice")
+    assert committed.available is True
+    assert committed.notional_usd == 1000.0
+    assert committed.row_count == 5
+
+    empty = repos.load_today_committed_buy_notional_result("2026-08-01", env="practice")
+    assert empty.available is True
+    assert empty.notional_usd == 0.0
+    assert empty.row_count == 0
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("DROP TABLE us_orders"))
+    unavailable = repos.load_today_committed_buy_notional_result("2026-07-31", env="practice")
+    assert unavailable.available is False
+    assert unavailable.notional_usd == 0.0
+    assert unavailable.error

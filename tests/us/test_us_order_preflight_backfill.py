@@ -335,3 +335,57 @@ def test_actual_pb1_intents_pass_actual_preflight_with_projected_state(monkeypat
         "position_state", "position_action",
     ):
         assert accepted[0][key] == accepted[0]["meta"][key]
+
+
+def test_complete_canonical_snapshot_detects_cap_universe_and_order_key_changes():
+    from trader.us.execution.order_router import (
+        canonical_risk_snapshot_changed_fields,
+        normalize_canonical_risk_snapshot,
+    )
+
+    state = _state(keys={"existing"})
+    state.update({
+        "cluster_exposure": {"AI_SOFTWARE": 100.0},
+        "cluster_caps_usd": {"AI_SOFTWARE": 5000.0},
+        "default_cluster_cap_usd": 4000.0,
+        "ai_combined_cap_usd": 35000.0,
+    })
+    preflight = normalize_canonical_risk_snapshot(
+        state, allowed_symbols={"AAPL", "MSFT"}, current_position_symbols={"AAPL"},
+    )
+    assert set(preflight) == {
+        "available_cash_usd", "daily_notional_usd", "position_count",
+        "portfolio_equity_usd", "order_keys", "cluster_exposure",
+        "cluster_caps_usd", "default_cluster_cap_usd", "ai_combined_cap_usd",
+        "now", "allowed_symbols", "current_position_symbols",
+    }
+
+    changed = dict(preflight)
+    changed["ai_combined_cap_usd"] = 99.0
+    assert canonical_risk_snapshot_changed_fields(preflight, changed) == ["ai_combined_cap_usd"]
+
+    changed = dict(preflight)
+    changed["allowed_symbols"] = ["AAPL"]
+    changed["order_keys"] = ["different"]
+    assert canonical_risk_snapshot_changed_fields(preflight, changed) == ["allowed_symbols", "order_keys"]
+
+
+def test_fallback_selector_records_complete_accepted_snapshot():
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+
+    state = _state()
+    state.update({
+        "cluster_exposure": {}, "cluster_caps_usd": {"TECH": 5000.0},
+        "default_cluster_cap_usd": 5000.0, "ai_combined_cap_usd": 35000.0,
+    })
+    accepted, rejected, diagnostics = select_preflight_buy_candidates(
+        [_intent("AAPL")], target_accept_count=1, projected_state=state,
+        allowed_symbols={"AAPL"}, current_positions=[],
+    )
+    assert len(accepted) == 1 and rejected == []
+    snapshot = diagnostics["accepted_states"]["key-AAPL"]
+    assert snapshot["portfolio_equity_usd"] == 100000.0
+    assert snapshot["ai_combined_cap_usd"] == 35000.0
+    assert snapshot["cluster_caps_usd"] == {"TECH": 5000.0}
+    assert snapshot["allowed_symbols"] == ["AAPL"]
+    assert snapshot["current_position_symbols"] == []
