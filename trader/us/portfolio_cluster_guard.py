@@ -10,6 +10,21 @@ from trader.us.rotation import AI_CLUSTERS, cluster_caps_for_regime, compute_clu
 logger = logging.getLogger(__name__)
 
 
+def resolve_position_market_value_usd(position: dict) -> float:
+    for key in ("market_value_usd", "market_value", "eval_amount_usd"):
+        try:
+            value = float(position.get(key) or 0.0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        price = float(position.get("last_price") or position.get("current_price") or position.get("price") or 0.0)
+        return max(0.0, price * _qty(position))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _qty(pos: dict) -> int:
     return int(float(pos.get("qty") or pos.get("quantity") or pos.get("holdings_qty") or 0))
 

@@ -2148,19 +2148,21 @@ def run_trade_tick(
                     _incremental_max_new = min(int(os.getenv("US_MAX_NEW_SYMBOL_BUYS_PER_TICK", os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3"))), max(0, available_new_slots), _incremental_effective_max)
                     projected_cash_start = max(effective_budget, 0.0)
                     projected_daily_notional_start = buy_daily_notional
+                    _exposure_equity_usd = float(portfolio_equity_usd or 0.0)
                     projected_state = {
                         "available_cash_usd": projected_cash_start, "daily_notional_usd": buy_daily_notional,
-                        "position_count": position_count, "portfolio_usd": max(effective_budget, 1000.0),
+                        "position_count": position_count, "portfolio_usd": _exposure_equity_usd,
                         "order_keys": set(), "now": now, "cluster_exposure": {},
-                        "default_cluster_cap_usd": max(effective_budget, 1000.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
+                        "default_cluster_cap_usd": _exposure_equity_usd * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
                     }
                     from trader.us.rotation import theme_cluster_for
+                    from trader.us.portfolio_cluster_guard import resolve_position_market_value_usd
                     for _position in current_positions or []:
                         _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
-                        _value = float(_position.get("market_value_usd") or _position.get("market_value") or 0.0)
+                        _value = resolve_position_market_value_usd(_position)
                         projected_state["cluster_exposure"][_cluster] = projected_state["cluster_exposure"].get(_cluster, 0.0) + _value
                     projected_state["cluster_exposure_start"] = dict(projected_state["cluster_exposure"])
-                    projected_state["ai_combined_cap_usd"] = max(effective_budget, 1000.0) * float(market_state_overlay.get("max_ai_tech_ratio", 1.0) or 1.0)
+                    projected_state["ai_combined_cap_usd"] = _exposure_equity_usd * float(market_state_overlay.get("max_ai_tech_ratio", 1.0) or 1.0)
                     try:
                         from trader.us.db.repos import load_today_order_keys
                         projected_state["order_keys"] = set(load_today_order_keys(trade_date=trade_date) or set())
@@ -2345,19 +2347,20 @@ def run_trade_tick(
         "available_cash_usd": projected_cash_start,
         "daily_notional_usd": projected_daily_notional_start,
         "position_count": position_count,
-        "portfolio_usd": max(effective_budget, 1000.0),
+        "portfolio_usd": float(portfolio_equity_usd or 0.0),
         "order_keys": set(),
         "now": now,
         "cluster_exposure": {},
         "cluster_exposure_start": {},
-        "default_cluster_cap_usd": max(effective_budget, 1000.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
-        "ai_combined_cap_usd": max(effective_budget, 1000.0) * float(market_state_overlay.get("max_ai_tech_ratio", 1.0) or 1.0),
+        "default_cluster_cap_usd": float(portfolio_equity_usd or 0.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
+        "ai_combined_cap_usd": float(portfolio_equity_usd or 0.0) * float(market_state_overlay.get("max_ai_tech_ratio", 1.0) or 1.0),
     }
     if not projected_state.get("cluster_exposure_start"):
         for _position in current_positions or []:
             from trader.us.rotation import theme_cluster_for
+            from trader.us.portfolio_cluster_guard import resolve_position_market_value_usd
             _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
-            _value = float(_position.get("market_value_usd") or _position.get("market_value") or 0.0)
+            _value = resolve_position_market_value_usd(_position)
             projected_state["cluster_exposure"][_cluster] = projected_state["cluster_exposure"].get(_cluster, 0.0) + _value
         projected_state["cluster_exposure_start"] = dict(projected_state["cluster_exposure"])
     try:
@@ -2404,29 +2407,32 @@ def run_trade_tick(
     if not routing_cluster_exposure:
         for _position in current_positions or []:
             from trader.us.rotation import theme_cluster_for
+            from trader.us.portfolio_cluster_guard import resolve_position_market_value_usd
             _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
-            routing_cluster_exposure[_cluster] = routing_cluster_exposure.get(_cluster, 0.0) + float(_position.get("market_value_usd") or _position.get("market_value") or 0.0)
+            routing_cluster_exposure[_cluster] = routing_cluster_exposure.get(_cluster, 0.0) + resolve_position_market_value_usd(_position)
 
     for intent in all_intents:
         try:
             _route_identity = str(intent.get("client_order_key") or intent.get("order_key") or intent.get("symbol") or "")
-            _route_preflight_snapshot = getattr(locals().get("incremental_preflight_session"), "accepted_states", {}).get(_route_identity, {})
+            _route_preflight_snapshot = getattr(locals().get("incremental_preflight_session"), "accepted_states", {}).get(
+                _route_identity, locals().get("preflight_diagnostics", {}).get("accepted_states", {}).get(_route_identity, {})
+            )
             result = route_order(
                 intent,
                 current_daily_notional_usd=float(_route_preflight_snapshot.get("daily_notional_usd", buy_daily_notional)),
                 current_position_count=int(_route_preflight_snapshot.get("position_count", position_count)),
-                total_portfolio_usd=max(effective_budget, 1000.0),
+                total_portfolio_usd=float(_route_preflight_snapshot.get("portfolio_equity_usd", portfolio_equity_usd or 0.0)),
                 available_cash_usd=float(_route_preflight_snapshot.get("available_cash_usd", routing_available_cash)),
                 signal_only=signal_only,
                 kis_order_allowed=kis_order_allowed,
-                allowed_symbols=(locked_watchlist_symbols if str(intent.get("side", "BUY")).upper() == "BUY" and locked_watchlist_symbols else None),
-                current_position_symbols=current_position_symbols if current_position_symbols else None,
+                allowed_symbols=(set(_route_preflight_snapshot.get("allowed_symbols") or locked_watchlist_symbols) if str(intent.get("side", "BUY")).upper() == "BUY" else None),
+                current_position_symbols=set(_route_preflight_snapshot.get("current_position_symbols") or current_position_symbols) or None,
                 context=tick_context,
-                now=now,
-                projected_cluster_exposure=routing_cluster_exposure,
-                cluster_caps_usd=projected_state.get("cluster_caps_usd"),
-                default_cluster_cap_usd=projected_state.get("default_cluster_cap_usd"),
-                ai_combined_cap_usd=projected_state.get("ai_combined_cap_usd"),
+                now=_route_preflight_snapshot.get("now", now),
+                projected_cluster_exposure=dict(_route_preflight_snapshot.get("cluster_exposure", routing_cluster_exposure)),
+                cluster_caps_usd=dict(_route_preflight_snapshot.get("cluster_caps_usd", projected_state.get("cluster_caps_usd") or {})),
+                default_cluster_cap_usd=_route_preflight_snapshot.get("default_cluster_cap_usd", projected_state.get("default_cluster_cap_usd")),
+                ai_combined_cap_usd=_route_preflight_snapshot.get("ai_combined_cap_usd", projected_state.get("ai_combined_cap_usd")),
                 projected_order_keys=set(_route_preflight_snapshot.get("order_keys") or set()),
             )
             orders.append(result)

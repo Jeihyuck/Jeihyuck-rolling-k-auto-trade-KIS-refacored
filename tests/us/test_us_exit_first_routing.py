@@ -59,6 +59,7 @@ def _patch_tick_basics(monkeypatch, calls: list):
     monkeypatch.setattr("trader.us.db.repos.load_positions", lambda trade_date=None: positions)
     monkeypatch.setattr("trader.us.pb1.us_exit_position_resolver.enrich_us_positions_for_exit", lambda positions, trade_date, env, provider: (positions, {"total": 1, "ok": 1, "missing": 0, "sources": {}, "missing_symbols": []}))
     monkeypatch.setattr("trader.us.db.repos.get_today_buy_orders_count", lambda trade_date, env="practice": 0)
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *args, **kwargs: 0.0)
     monkeypatch.setattr("trader.us.db.repos.load_latest_us_prep_status", lambda trade_date: {"status": "OK"})
 
     class _Engine:
@@ -120,10 +121,17 @@ def test_daily_notional_unavailable_fails_buy_closed_but_routes_sell(monkeypatch
     from trader.us.runner.trade_tick_runner import run_trade_tick
     calls = []
     _patch_tick_basics(monkeypatch, calls)
-    monkeypatch.setattr(
-        "trader.us.db.repos.load_today_committed_buy_notional",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("orders db unavailable")),
-    )
+    class BrokenOrdersEngine:
+        def connect(self):
+            raise RuntimeError("orders db unavailable")
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: BrokenOrdersEngine())
+    def strict_load(*args, **kwargs):
+        from trader.us.db.repos import load_today_committed_buy_notional_result
+        result = load_today_committed_buy_notional_result(*args, **kwargs)
+        if not result.available:
+            raise RuntimeError(result.error)
+        return result.notional_usd
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", strict_load)
     monkeypatch.setattr("trader.us.execution.order_router.route_order", lambda intent, **kwargs: (
         calls.append(("route_order", intent, kwargs))
         or {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent}

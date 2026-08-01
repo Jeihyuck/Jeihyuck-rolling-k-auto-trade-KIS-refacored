@@ -120,7 +120,8 @@ def test_trade_tick_runner_signal_only_allows_non_trading_day():
          patch("trader.us.market_calendar.market_phase") as mock_phase, \
          patch("trader.us.execution.order_router.route_order") as mock_route, \
          patch("trader.us.execution.fills.get_fills_today") as mock_fills, \
-         patch("trader.us.execution.reconcile.reconcile_positions") as mock_reconcile:
+         patch("trader.us.execution.reconcile.reconcile_positions") as mock_reconcile, \
+         patch("trader.us.db.repos.load_today_committed_buy_notional", return_value=0.0):
         
         mock_is_td.return_value = False  # Non-trading day
         mock_phase.return_value = "REGULAR_OPEN"

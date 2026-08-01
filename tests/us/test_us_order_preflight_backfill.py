@@ -64,7 +64,10 @@ def test_candidate_router_blocks_backfill_to_next_three(monkeypatch):
     assert [r["reason"] for r in rejected] == [
         "pending_order_exists", "position_weight_exceeded", "duplicate_client_order_key",
     ]
-    assert diag == {"global_stop_reason": "", "system_invariant_failure": "", "attempted": 6, "accepted": 3, "rejected": 3, "candidate_pool_exhausted": False}
+    assert {key: diag[key] for key in ("global_stop_reason", "system_invariant_failure", "attempted", "accepted", "rejected", "candidate_pool_exhausted")} == {
+        "global_stop_reason": "", "system_invariant_failure": "", "attempted": 6,
+        "accepted": 3, "rejected": 3, "candidate_pool_exhausted": False,
+    }
 
 
 def test_projected_cash_is_consumed_and_later_candidate_can_backfill(monkeypatch):
@@ -102,8 +105,38 @@ def test_committed_daily_buy_notional_deduplicates_statuses(monkeypatch):
         {"side": "BUY", "status": "DRY_RUN", "client_order_key": "b", "notional_usd": 300},
         {"side": "SELL", "status": "ACK", "client_order_key": "c", "notional_usd": 999},
     ]
-    monkeypatch.setattr("trader.us.db.repos.load_us_daily_orders_for_report", lambda trade_date: rows)
+    class Result:
+        def mappings(self): return self
+        def all(self): return rows
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def execute(self, *args): return Result()
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: type("Engine", (), {"connect": lambda self: Connection()})())
     assert load_today_committed_buy_notional("2026-07-31") == 900
+
+
+def test_strict_committed_notional_distinguishes_unavailable_zero_and_fallback(monkeypatch):
+    from trader.us.db.repos import load_today_committed_buy_notional_result
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: None)
+    assert load_today_committed_buy_notional_result("2026-07-31").available is False
+
+    class Result:
+        def __init__(self, rows): self.rows = rows
+        def mappings(self): return self
+        def all(self): return self.rows
+    class Connection:
+        calls = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def execute(self, *args):
+            self.calls += 1
+            if self.calls == 1: raise RuntimeError("primary query failed")
+            return Result([])
+    connection = Connection()
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: type("Engine", (), {"connect": lambda self: connection})())
+    result = load_today_committed_buy_notional_result("2026-07-31")
+    assert result.available is True and result.notional_usd == 0 and connection.calls == 2
 
 
 def test_oversized_daily_notional_candidate_backfills_smaller_candidates(monkeypatch):
@@ -195,6 +228,27 @@ def test_existing_cluster_exposure_is_counted_once():
     assert len(accepted) == 1 and rejected == []
     assert state["cluster_exposure_start"]["AI_SOFTWARE"] == 100
     assert state["cluster_exposure"]["AI_SOFTWARE"] == 150
+
+
+def test_ai_cap_uses_portfolio_equity_not_available_cash():
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+    candidate = _intent("NVDA", 1000, theme_cluster="AI_SEMI")
+    candidate["meta"]["theme_cluster"] = "AI_SEMI"
+    state = _state(cash=10000)
+    state["portfolio_usd"] = 100000
+    state["cluster_exposure"] = {"AI_SOFTWARE": 20000}
+    state["ai_combined_cap_usd"] = state["portfolio_usd"] * .35
+    accepted, rejected, _ = select_preflight_buy_candidates(
+        [candidate], target_accept_count=1, projected_state=state,
+        allowed_symbols={"NVDA"}, current_positions=[],
+    )
+    assert len(accepted) == 1 and rejected == []
+    assert state["ai_combined_cap_usd"] == 35000
+
+
+def test_eval_amount_is_used_by_canonical_position_value_resolver():
+    from trader.us.portfolio_cluster_guard import resolve_position_market_value_usd
+    assert resolve_position_market_value_usd({"eval_amount_usd": 1234.5}) == 1234.5
 
 
 def test_system_failure_after_accept_discards_all_prior_accepts():

@@ -23,6 +23,7 @@ def test_afternoon_session_passes_conservative_entry_guard_to_tick(monkeypatch, 
     monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"capital_usd_cap": 10000.0})
     monkeypatch.setattr("trader.us.prep_contract.check_us_prep_guard", lambda trade_date: {"ok": True, "status": "OK"})
     monkeypatch.setattr("trader.us.db.repos.get_today_buy_orders_count", lambda trade_date, env="practice": 3)
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *args, **kwargs: 0.0)
 
     def _run_tick(**kwargs):
         seen.update(kwargs)
@@ -66,6 +67,7 @@ def test_tick_runner_logs_already_bought_today_skip(monkeypatch, caplog) -> None
 
     monkeypatch.setenv("DRY_RUN", "1")
     monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "0")
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *args, **kwargs: 0.0)
     monkeypatch.setattr("trader.us.market_calendar.now_ny", lambda: __import__("datetime").datetime.fromisoformat("2026-06-05T12:35:00-04:00"))
     monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda d: True)
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda now: "REGULAR_MID")

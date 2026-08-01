@@ -37,7 +37,7 @@ def test_tick_runner_am_offline():
         force_now="2026-01-02T09:35:00-05:00",
     )
 
-    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE"), \
+    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE", "OK_NO_TRADE_ENTRY_DEGRADED"), \
         f"Unexpected status: {result}"
 
 
@@ -80,7 +80,7 @@ def test_tick_runner_offline_after_cutoff_no_entry_intents():
     )
 
     # SKIP 또는 OK/OK_WITH_WARNINGS/OK_NO_TRADE
-    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE"), \
+    assert result["status"] in ("OK", "OK_WITH_WARNINGS", "SKIP", "OK_NO_TRADE", "OK_NO_TRADE_ENTRY_DEGRADED"), \
         f"Unexpected status: {result}"
 
 
@@ -98,6 +98,7 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch):
     _setup_env()
     monkeypatch.setenv("US_ALLOW_LEGACY_PREP_FOR_TEST", "1")
     monkeypatch.setenv("US_ENTRY_EVAL_TIMEOUT_SEC", "3")
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *args, **kwargs: 0.0)
     monkeypatch.setattr("trader.us.watchlist_quality.US_MIN_LOCKED_WATCHLIST_COUNT", 5)
     monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda date: True)
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda now: "REGULAR_MID")

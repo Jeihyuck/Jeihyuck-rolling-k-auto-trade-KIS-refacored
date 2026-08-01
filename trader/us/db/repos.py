@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from datetime import date, datetime, timezone
+from dataclasses import dataclass
 from typing import Any
 from trader.us.utils.order_no import normalize_us_order_no
 
@@ -3616,14 +3617,45 @@ def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
     return []
 
 
-def load_today_committed_buy_notional(trade_date: str, env: str = "practice", include_pending: bool = True) -> float:
-    """Return deduplicated committed BUY notional for the trading day."""
+@dataclass(frozen=True)
+class CommittedBuyNotionalResult:
+    available: bool
+    notional_usd: float
+    row_count: int
+    error: str | None = None
+
+
+def load_today_committed_buy_notional_result(trade_date: str, env: str = "practice", include_pending: bool = True) -> CommittedBuyNotionalResult:
+    """Strict risk-data load that distinguishes a healthy zero from DB failure."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        return CommittedBuyNotionalResult(False, 0.0, 0, "orders_db_engine_unavailable")
+    from sqlalchemy import text
+    queries = [
+        ("SELECT * FROM us_orders WHERE trade_date = :td", {"td": trade_date}),
+        ("SELECT * FROM us_orders WHERE substr(created_at, 1, 10) = :td", {"td": trade_date}),
+    ]
+    rows: list[dict] | None = None
+    errors: list[str] = []
+    try:
+        with engine.connect() as conn:
+            for sql, params in queries:
+                try:
+                    result = conn.execute(text(sql), params)
+                    rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
+                    break
+                except Exception as exc:
+                    errors.append(f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
+    if rows is None:
+        return CommittedBuyNotionalResult(False, 0.0, 0, "; ".join(errors) or "all_orders_queries_failed")
     statuses = {"ACK", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED", "DRY_RUN"}
     if include_pending:
         statuses.add("PENDING")
     seen: set[str] = set()
     total = 0.0
-    for index, row in enumerate(load_us_daily_orders_for_report(trade_date) or []):
+    for index, row in enumerate(rows):
         if str(row.get("side") or "").upper() != "BUY" or str(row.get("status") or "").upper() not in statuses:
             continue
         row_env = str(row.get("env") or row.get("kis_env") or env).lower()
@@ -3637,4 +3669,11 @@ def load_today_committed_buy_notional(trade_date: str, env: str = "practice", in
             total += float(row.get("notional_usd") or row.get("order_notional_usd") or 0.0)
         except (TypeError, ValueError):
             continue
-    return total
+    return CommittedBuyNotionalResult(True, total, len(rows), None)
+
+
+def load_today_committed_buy_notional(trade_date: str, env: str = "practice", include_pending: bool = True) -> float:
+    result = load_today_committed_buy_notional_result(trade_date, env, include_pending)
+    if not result.available:
+        raise RuntimeError(result.error or "committed_buy_notional_unavailable")
+    return result.notional_usd

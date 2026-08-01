@@ -108,6 +108,13 @@ class BuyPreflightSession:
             "position_count": self.state.get("position_count"),
             "order_keys": sorted(self.state.get("order_keys") or []),
             "cluster_exposure": dict(self.state.get("cluster_exposure") or {}),
+            "portfolio_equity_usd": self.state.get("portfolio_usd"),
+            "cluster_caps_usd": dict(self.state.get("cluster_caps_usd") or {}),
+            "default_cluster_cap_usd": self.state.get("default_cluster_cap_usd"),
+            "ai_combined_cap_usd": self.state.get("ai_combined_cap_usd"),
+            "now": self.state.get("now"),
+            "allowed_symbols": sorted(self.allowed_symbols or []),
+            "current_position_symbols": sorted(str(item.get("symbol") or item.get("code") or "").upper().strip() for item in self.current_positions if isinstance(item, dict)),
         }
         self.accepted.append(accepted)
         self.add_accepted += int(is_add)
@@ -130,7 +137,8 @@ class BuyPreflightSession:
     def diagnostics(self) -> dict:
         return {"global_stop_reason": self.global_stop_reason, "system_invariant_failure": self.system_invariant_failure,
                 "attempted": self.attempted, "accepted": len(self.accepted), "rejected": len(self.rejected),
-                "candidate_pool_exhausted": not self.global_stop_reason and len(self.accepted) < self.target}
+                "candidate_pool_exhausted": not self.global_stop_reason and len(self.accepted) < self.target,
+                "accepted_states": dict(self.accepted_states)}
 
 
 _GLOBAL_PREFLIGHT_REASONS = {
@@ -187,6 +195,10 @@ def preflight_buy_order(intent: dict, projected_state: dict, allowed_symbols=Non
         return OrderPreflightDecision(True, resized_intent=dict(intent))
     if projected_state.get("available_cash_usd") is None:
         return OrderPreflightDecision(False, "cash_unavailable", "GLOBAL")
+    if float(projected_state.get("portfolio_usd") or 0.0) <= 0 and (
+        projected_state.get("default_cluster_cap_usd") is not None or projected_state.get("ai_combined_cap_usd") is not None
+    ):
+        return OrderPreflightDecision(False, "portfolio_equity_unavailable", "SYSTEM")
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
     required = ("theme_cluster", "position_state", "position_action")
     cluster_value = str(intent.get("theme_cluster") or meta.get("theme_cluster") or "").upper()
