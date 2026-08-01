@@ -1074,6 +1074,10 @@ def generate_entry_intents(
             } if position_state_for_order == "HELD" else {}),
             "score": score,
             "rank": rank + 1,
+            "theme_cluster": (entry_meta or {}).get("theme_cluster"),
+            "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
+            "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
+            "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
             "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
@@ -1104,6 +1108,10 @@ def generate_entry_intents(
                 "source": "locked_watchlist",
                 "position_state": position_state_for_order,
                 "position_action": position_action,
+                "theme_cluster": (entry_meta or {}).get("theme_cluster"),
+                "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
+                "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
+                "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
                 **({
                     "capital_deployment": {
                         "current_position_market_value_usd": held_snapshot_market_value,

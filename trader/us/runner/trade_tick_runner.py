@@ -2100,6 +2100,10 @@ def run_trade_tick(
                         )
                 
                 if watchlist_rows:
+                    from trader.us.market_state_overlay import filter_watchlist_rows_for_market_state
+                    eligible_watchlist_rows, preblocked_rows = filter_watchlist_rows_for_market_state(
+                        watchlist_rows, market_state_overlay, current_positions
+                    )
                     engine = _get_strategy_engine(env=env, offline=offline)
                     try:
                         last_stage = "entry_eval"
@@ -2112,13 +2116,18 @@ def run_trade_tick(
                                 effective_budget,
                                 position_count,
                                 now,
-                                watchlist_rows,
+                                eligible_watchlist_rows,
                                 current_position_symbols,
                                 allow_new_symbols=allow_new_symbols,
                                 allow_add_to_existing=allow_add_to_existing,
                                 available_new_slots=available_new_slots,
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
+                        if eligible_watchlist_rows and not entry_intents:
+                            logger.warning(
+                                "[US_ENTRY][ELIGIBLE_BUT_NO_INTENT] eligible=%d preblocked=%d",
+                                len(eligible_watchlist_rows), len(preblocked_rows),
+                            )
                     except concurrent.futures.TimeoutError:
                         logger.error(
                             "[US_ENTRY][EVAL][TIMEOUT] timeout_sec=%d",
@@ -2148,6 +2157,16 @@ def run_trade_tick(
         entry_intents, cluster_guard_blocked_buys = filter_entry_intents_for_cluster_guard(entry_intents, cluster_guard_result)
         from trader.us.market_state_overlay import filter_entry_intents_for_market_state
         entry_intents, market_state_blocked_buys = filter_entry_intents_for_market_state(entry_intents, market_state_overlay, current_positions)
+        eligible_symbols = {
+            str(row.get("symbol") or row.get("code") or "").upper().strip()
+            for row in locals().get("eligible_watchlist_rows", [])
+        }
+        for blocked_buy in market_state_blocked_buys:
+            if blocked_buy.get("symbol") in eligible_symbols:
+                logger.error(
+                    "[US_ENTRY][MARKET_FILTER_INVARIANT_FAIL] symbol=%s prefilter=allowed postfilter=%s",
+                    blocked_buy.get("symbol"), blocked_buy.get("reason"),
+                )
         from trader.us.position_trend_state import filter_add_to_existing_by_trend_state
         entry_intents, trend_blocked_buys = filter_add_to_existing_by_trend_state(entry_intents, current_positions)
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)

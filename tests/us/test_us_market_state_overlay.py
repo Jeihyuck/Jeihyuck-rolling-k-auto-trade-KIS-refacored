@@ -7,6 +7,7 @@ from trader.us.market_state_overlay import (
     build_profit_capture_intents,
     evaluate_us_market_state,
     filter_entry_intents_for_market_state,
+    filter_watchlist_rows_for_market_state,
 )
 
 
@@ -106,6 +107,43 @@ def test_risk_off_blocks_ai_but_allows_xlv():
     kept, blocked = filter_entry_intents_for_market_state(intents, overlay)
     assert [i["symbol"] for i in kept] == ["XLV"]
     assert blocked[0]["reason"] == "DEFENSE_RISK_OFF_AI_TECH_BLOCK"
+
+
+def test_risk_off_prefilter_backfills_after_ai_leaders_and_preserves_mpc_metadata():
+    rows = [
+        {"symbol": "DDOG", "theme_cluster": "AI_SOFTWARE", "trend_score": 1.0, "score_final": .9, "rank_final30": 1},
+        {"symbol": "SNOW", "theme_cluster": "AI_SOFTWARE", "trend_score": 1.0, "score_final": .8, "rank_final30": 2},
+        {"symbol": "MPC", "theme_cluster": "ENERGY_MATERIALS", "trend_score": 1.0, "score_final": .6063, "rank_final30": 3},
+        {"symbol": "KO", "theme_cluster": "CONSUMER_STAPLES", "trend_score": .5, "score_final": .55, "rank_final30": 4},
+        {"symbol": "AMGN", "theme_cluster": "HEALTHCARE", "trend_score": .4, "score_final": .5, "rank_final30": 5},
+    ]
+    overlay = {"market_state": "DEFENSE_RISK_OFF", "market_regime": "DEFENSIVE", "allow_new_buy": True}
+
+    eligible, preblocked = filter_watchlist_rows_for_market_state(rows, overlay)
+
+    assert [row["symbol"] for row in eligible[:3]] == ["MPC", "KO", "AMGN"]
+    assert [row["symbol"] for row in preblocked] == ["DDOG", "SNOW"]
+    mpc = eligible[0]
+    assert mpc["theme_cluster"] == "ENERGY_MATERIALS"
+    assert mpc["trend_score"] == 1.0
+    assert mpc["score_final"] >= .6
+    assert mpc["rank_final30"] == 3
+
+    kept, blocked = filter_entry_intents_for_market_state(
+        [{**mpc, "side": "BUY", "meta": dict(mpc)}], overlay
+    )
+    assert blocked == []
+    assert kept[0]["symbol"] == "MPC"
+
+
+@pytest.mark.parametrize("state", ["DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"])
+def test_crash_states_prefilter_all_new_buys(state):
+    eligible, blocked = filter_watchlist_rows_for_market_state(
+        [{"symbol": "XLV", "theme_cluster": "HEALTHCARE", "score_final": .8, "rank_final30": 1}],
+        {"market_state": state, "allow_new_buy": True},
+    )
+    assert eligible == []
+    assert blocked[0]["reason"] == "DEFENSE_CRASH_ENTRY_BLOCK"
 
 
 def test_profit_capture_price_aliases_and_pnl_rate_resolver(monkeypatch):
