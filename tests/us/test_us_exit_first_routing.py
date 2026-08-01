@@ -116,6 +116,31 @@ def test_run_trade_tick_routes_exit_before_watchlist_timeout(monkeypatch):
     assert result["pending_order_count"] == 0
 
 
+def test_daily_notional_unavailable_fails_buy_closed_but_routes_sell(monkeypatch):
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+    calls = []
+    _patch_tick_basics(monkeypatch, calls)
+    monkeypatch.setattr(
+        "trader.us.db.repos.load_today_committed_buy_notional",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("orders db unavailable")),
+    )
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", lambda intent, **kwargs: (
+        calls.append(("route_order", intent, kwargs))
+        or {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent}
+    ))
+    result = run_trade_tick(
+        session="am", env="practice", offline=False,
+        force_now="2026-06-05T10:00:00-04:00", kis_order_allowed=True,
+    )
+    routed = [call[1] for call in calls if call[0] == "route_order"]
+    assert [intent["side"] for intent in routed] == ["SELL"]
+    assert result["entry_intents"] == 0
+    assert result["entry_degraded"] == 1
+    assert result["entry_degraded_reason"] == "DAILY_NOTIONAL_UNAVAILABLE"
+    assert result["global_stop_reason"] == "daily_notional_unavailable"
+    assert "orders db unavailable" in result["daily_notional_load_error"]
+
+
 def test_sell_notional_does_not_consume_buy_daily_notional(monkeypatch):
     calls = []
 

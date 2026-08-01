@@ -167,6 +167,61 @@ def test_projected_cluster_cap_rejects_second_cluster_and_backfills():
     assert rejected[0]["reason"] == "projected_cluster_cap_exceeded"
 
 
+def test_ai_combined_cap_rejects_cross_cluster_candidate_and_backfills():
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+    semi = _intent("NVDA", 100, theme_cluster="AI_SEMI"); semi["meta"]["theme_cluster"] = "AI_SEMI"
+    software = _intent("MSFT", 100, theme_cluster="AI_SOFTWARE"); software["meta"]["theme_cluster"] = "AI_SOFTWARE"
+    health = _intent("AMGN", 100, theme_cluster="HEALTHCARE"); health["meta"]["theme_cluster"] = "HEALTHCARE"
+    state = _state(); state["ai_combined_cap_usd"] = 150
+    accepted, rejected, _ = select_preflight_buy_candidates(
+        [semi, software, health], target_accept_count=2, projected_state=state,
+        allowed_symbols={"NVDA", "MSFT", "AMGN"}, current_positions=[],
+    )
+    assert [item["symbol"] for item in accepted] == ["NVDA", "AMGN"]
+    assert rejected[0]["reason"] == "projected_ai_tech_combined_cap_exceeded"
+
+
+def test_existing_cluster_exposure_is_counted_once():
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+    candidate = _intent("MSFT", 50, theme_cluster="AI_SOFTWARE")
+    candidate["meta"]["theme_cluster"] = "AI_SOFTWARE"
+    state = _state()
+    state["cluster_exposure"] = {"AI_SOFTWARE": 100}
+    state["cluster_exposure_start"] = {"AI_SOFTWARE": 100}
+    accepted, rejected, _ = select_preflight_buy_candidates(
+        [candidate], target_accept_count=1, projected_state=state,
+        allowed_symbols={"MSFT"}, current_positions=[],
+    )
+    assert len(accepted) == 1 and rejected == []
+    assert state["cluster_exposure_start"]["AI_SOFTWARE"] == 100
+    assert state["cluster_exposure"]["AI_SOFTWARE"] == 150
+
+
+def test_system_failure_after_accept_discards_all_prior_accepts():
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+    first = _intent("AAPL")
+    mismatch = _intent("NVDA"); mismatch["meta"]["theme_cluster"] = "HEALTHCARE"
+    third = _intent("MSFT")
+    accepted, _rejected, diag = select_preflight_buy_candidates(
+        [first, mismatch, third], target_accept_count=3, projected_state=_state(),
+        allowed_symbols={"AAPL", "NVDA", "MSFT"}, current_positions=[],
+    )
+    assert accepted == []
+    assert diag["system_invariant_failure"] == "ENTRY_METADATA_INVARIANT_FAIL"
+
+
+def test_projected_cash_and_daily_notional_have_independent_start_values():
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+    state = _state(cash=10000, daily=2000)
+    accepted, _, _ = select_preflight_buy_candidates(
+        [_intent("AAPL", 500)], target_accept_count=1, projected_state=state,
+        allowed_symbols={"AAPL"}, current_positions=[],
+    )
+    assert len(accepted) == 1
+    assert state["available_cash_usd"] == 9500
+    assert state["daily_notional_usd"] == 2500
+
+
 def test_missing_classification_backfills_and_metadata_mismatch_is_system_failure():
     from trader.us.execution.order_router import select_preflight_buy_candidates
     missing = _intent("AAPL")

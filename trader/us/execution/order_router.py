@@ -34,6 +34,7 @@ from trader.us.db.repos import (  # test patch surface
 )
 
 logger = logging.getLogger(__name__)
+AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 
 
 class _StatusCompat(str):
@@ -106,6 +107,7 @@ class BuyPreflightSession:
             "daily_notional_usd": self.state.get("daily_notional_usd"),
             "position_count": self.state.get("position_count"),
             "order_keys": sorted(self.state.get("order_keys") or []),
+            "cluster_exposure": dict(self.state.get("cluster_exposure") or {}),
         }
         self.accepted.append(accepted)
         self.add_accepted += int(is_add)
@@ -159,6 +161,11 @@ def canonical_order_risk_check(intent: dict, projected_state: dict, *, allowed_s
         current_cluster = float((projected_state.get("cluster_exposure") or {}).get(cluster) or 0.0)
         if current_cluster + float(intent.get("notional_usd") or 0.0) > float(cap):
             raise RiskGateBlocked(f"[US_RISK][BLOCK] symbol={symbol} reason=projected_cluster_cap_exceeded")
+    ai_cap = projected_state.get("ai_combined_cap_usd")
+    if ai_cap is not None and cluster in AI_TECH_COMBINED_CLUSTERS:
+        ai_exposure = sum(float((projected_state.get("cluster_exposure") or {}).get(name) or 0.0) for name in AI_TECH_COMBINED_CLUSTERS)
+        if ai_exposure + float(intent.get("notional_usd") or 0.0) > float(ai_cap):
+            raise RiskGateBlocked(f"[US_RISK][BLOCK] symbol={symbol} reason=projected_ai_tech_combined_cap_exceeded")
     assert_order_allowed(
         intent,
         current_daily_notional_usd=float(projected_state.get("daily_notional_usd") or 0),
@@ -233,7 +240,8 @@ def select_preflight_buy_candidates(
         if len(session.accepted) >= max(0, target_accept_count) or session.global_stop_reason:
             break
         session.consider(intent)
-    return session.accepted, session.rejected, session.diagnostics()
+    diagnostics = session.diagnostics()
+    return ([] if diagnostics["system_invariant_failure"] else session.accepted), session.rejected, diagnostics
 
 
 def _kis_env() -> str:
@@ -457,6 +465,8 @@ def route_order(
     projected_cluster_exposure: dict | None = None,
     cluster_caps_usd: dict | None = None,
     default_cluster_cap_usd: float | None = None,
+    ai_combined_cap_usd: float | None = None,
+    projected_order_keys: set[str] | None = None,
 ) -> dict:
     """Order intent를 라우팅한다.
 
@@ -582,7 +592,7 @@ def route_order(
         db_keys = load_today_order_keys()
     except Exception:
         db_keys = set()
-    existing_keys = _SENT_ORDER_KEYS | db_keys
+    existing_keys = _SENT_ORDER_KEYS | db_keys | set(projected_order_keys or set())
     if side == "SELL" and order_key and order_key in existing_keys:
         logger.info(
             "[US_ORDER][DEDUP_PRECHECK] symbol=%s side=SELL key=%s action=skip_before_save_intent",
@@ -618,6 +628,7 @@ def route_order(
                 "cluster_exposure": projected_cluster_exposure or {},
                 "cluster_caps_usd": cluster_caps_usd or {},
                 "default_cluster_cap_usd": default_cluster_cap_usd,
+                "ai_combined_cap_usd": ai_combined_cap_usd,
             },
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
@@ -665,6 +676,7 @@ def route_order(
                             "cluster_exposure": projected_cluster_exposure or {},
                             "cluster_caps_usd": cluster_caps_usd or {},
                             "default_cluster_cap_usd": default_cluster_cap_usd,
+                            "ai_combined_cap_usd": ai_combined_cap_usd,
                         },
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,
