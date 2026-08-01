@@ -195,6 +195,7 @@ def _apply_regime_session_summary(report: dict, session_summary: dict | None) ->
         "raw_watchlist_candidates", "prefilter_eligible_candidates",
         "intent_generation_attempted", "final_entry_intents",
         "backfill_attempt_count", "backfill_success_count", "submitted_orders",
+        "price_lookup_count",
     ):
         if key in session_summary:
             report[key] = int(report.get(key) or 0) + int(session_summary.get(key) or 0)
@@ -208,6 +209,7 @@ def _apply_regime_session_summary(report: dict, session_summary: dict | None) ->
     for key in (
         "global_stop_reason", "system_invariant_failure", "projected_cash_start",
         "projected_cash_end", "projected_daily_notional_start", "projected_daily_notional_end",
+        "committed_buy_notional_start", "actual_daily_buy_notional",
     ):
         if key in session_summary and session_summary.get(key) not in (None, ""):
             report[key] = session_summary.get(key)

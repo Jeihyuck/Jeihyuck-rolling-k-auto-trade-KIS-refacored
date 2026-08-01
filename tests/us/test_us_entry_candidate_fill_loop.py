@@ -63,3 +63,34 @@ def test_candidate_fill_count_equals_available_candidates(monkeypatch):
         max_new_entries=3, watchlist_entries=rows, current_position_symbols=set(),
     )
     assert len(intents) == min(3, 4)
+
+
+def test_incremental_preflight_stops_price_lookups_at_target(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.execution.order_router import OrderPreflightDecision
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr(repos, "has_position", lambda symbol: False)
+    monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    rows = [{"symbol": f"S{i}", "exchange": "NASDAQ", "score": 1 - i * .01} for i in range(30)]
+    class Provider:
+        calls = []
+        def get_current_price(self, symbol, exchange):
+            self.calls.append(symbol)
+            return {"last": 100}
+    provider = Provider()
+    attempted = 0
+    def accept(intent):
+        nonlocal attempted
+        attempted += 1
+        if attempted <= 5:
+            return OrderPreflightDecision(False, "candidate_test_block", "CANDIDATE")
+        return OrderPreflightDecision(True, resized_intent=intent)
+    intents = generate_entry_intents(
+        None, provider, set(), 10000, 0, 10000, max_new_entries=3,
+        watchlist_entries=rows, current_position_symbols=set(), intent_acceptor=accept,
+    )
+    assert len(intents) == 3
+    assert len(provider.calls) == 8

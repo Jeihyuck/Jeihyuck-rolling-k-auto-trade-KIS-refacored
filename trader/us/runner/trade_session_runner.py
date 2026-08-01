@@ -196,6 +196,7 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
         "raw_watchlist_candidates", "prefilter_eligible_candidates",
         "intent_generation_attempted", "final_entry_intents",
         "backfill_attempt_count", "backfill_success_count", "submitted_orders",
+        "price_lookup_count",
     )
     candidate_metrics = {key: 0 for key in candidate_metric_keys}
     candidate_local_reject_counts_total: dict[str, int] = {}
@@ -238,6 +239,7 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
         for key in (
             "projected_cash_start", "projected_cash_end",
             "projected_daily_notional_start", "projected_daily_notional_end",
+            "committed_buy_notional_start", "actual_daily_buy_notional",
         ):
             if tick_result.get(key) is not None:
                 projected_metrics[key] = float(tick_result.get(key) or 0.0)

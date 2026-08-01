@@ -1674,7 +1674,12 @@ def run_trade_tick(
     exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)
 
     # Route SELLs immediately before any entry watchlist or entry evaluation work.
-    buy_daily_notional = 0.0
+    try:
+        from trader.us.db.repos import load_today_committed_buy_notional
+        buy_daily_notional = load_today_committed_buy_notional(trade_date, env=env, include_pending=True)
+    except Exception as _daily_buy_notional_exc:
+        logger.warning("[US_ENTRY][DAILY_NOTIONAL_LOAD_WARN] error=%s", _daily_buy_notional_exc)
+        buy_daily_notional = 0.0
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
     try:
@@ -2126,6 +2131,36 @@ def run_trade_tick(
                         "[US_ENTRY][PREFILTER] raw=%d eligible=%d blocked=%d",
                         len(watchlist_rows), len(eligible_watchlist_rows), len(preblocked_rows),
                     )
+                    from trader.us.execution.order_router import BuyPreflightSession
+                    _incremental_total_target = int(os.getenv("US_MAX_TOTAL_BUY_INTENTS_PER_TICK", os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")))
+                    _incremental_effective_max = market_state_overlay.get("effective_max_new_positions")
+                    _incremental_effective_max = available_new_slots if _incremental_effective_max is None else max(0, int(_incremental_effective_max))
+                    _incremental_max_new = min(int(os.getenv("US_MAX_NEW_SYMBOL_BUYS_PER_TICK", os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3"))), max(0, available_new_slots), _incremental_effective_max)
+                    projected_cash_start = max(effective_budget - buy_daily_notional, 0.0)
+                    projected_daily_notional_start = buy_daily_notional
+                    projected_state = {
+                        "available_cash_usd": projected_cash_start, "daily_notional_usd": buy_daily_notional,
+                        "position_count": position_count, "portfolio_usd": max(effective_budget, 1000.0),
+                        "order_keys": set(), "now": now, "cluster_exposure": {},
+                        "default_cluster_cap_usd": max(effective_budget, 1000.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
+                    }
+                    from trader.us.rotation import theme_cluster_for
+                    for _position in current_positions or []:
+                        _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
+                        _value = float(_position.get("market_value_usd") or _position.get("market_value") or 0.0)
+                        projected_state["cluster_exposure"][_cluster] = projected_state["cluster_exposure"].get(_cluster, 0.0) + _value
+                    try:
+                        from trader.us.db.repos import load_today_order_keys
+                        projected_state["order_keys"] = set(load_today_order_keys(trade_date=trade_date) or set())
+                    except Exception:
+                        pass
+                    incremental_preflight_session = BuyPreflightSession(
+                        target=_incremental_total_target, projected_state=projected_state,
+                        allowed_symbols={str(row.get("symbol") or "").upper().strip() for row in watchlist_rows},
+                        current_positions=current_positions, available_new_symbol_slots=max(0, available_new_slots),
+                        max_new_symbol_buys=_incremental_max_new,
+                        max_add_to_existing_buys=int(os.getenv("US_MAX_ADD_TO_EXISTING_BUYS_PER_TICK", str(_incremental_total_target))),
+                    )
                     engine = _get_strategy_engine(env=env, offline=offline)
                     try:
                         last_stage = "entry_eval"
@@ -2143,7 +2178,8 @@ def run_trade_tick(
                                 allow_new_symbols=allow_new_symbols,
                                 allow_add_to_existing=allow_add_to_existing,
                                 available_new_slots=available_new_slots,
-                                max_new_entries=len(eligible_watchlist_rows),
+                                max_new_entries=_incremental_total_target,
+                                intent_acceptor=incremental_preflight_session.consider,
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
@@ -2285,32 +2321,45 @@ def run_trade_tick(
 
     _preflight_effective_max = market_state_overlay.get("effective_max_new_positions")
     _preflight_effective_max = available_new_slots if _preflight_effective_max is None else max(0, int(_preflight_effective_max))
-    target_accept_count = min(
-        int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")),
-        max(0, available_new_slots),
-        _preflight_effective_max,
+    target_accept_count = int(os.getenv("US_MAX_TOTAL_BUY_INTENTS_PER_TICK", os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")))
+    max_new_symbol_buys = min(
+        int(os.getenv("US_MAX_NEW_SYMBOL_BUYS_PER_TICK", os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3"))),
+        max(0, available_new_slots), _preflight_effective_max,
     )
-    projected_cash_start = max(effective_budget - buy_daily_notional, 0.0)
-    projected_daily_notional_start = buy_daily_notional
-    projected_state = {
+    max_add_to_existing_buys = int(os.getenv("US_MAX_ADD_TO_EXISTING_BUYS_PER_TICK", str(target_accept_count)))
+    projected_cash_start = locals().get("projected_cash_start", max(effective_budget - buy_daily_notional, 0.0))
+    projected_daily_notional_start = locals().get("projected_daily_notional_start", buy_daily_notional)
+    projected_state = locals().get("projected_state") or {
         "available_cash_usd": projected_cash_start,
         "daily_notional_usd": projected_daily_notional_start,
         "position_count": position_count,
         "portfolio_usd": max(effective_budget, 1000.0),
         "order_keys": set(),
         "now": now,
+        "cluster_exposure": {},
+        "default_cluster_cap_usd": max(effective_budget, 1000.0) * float(market_state_overlay.get("max_single_cluster_ratio", 1.0) or 1.0),
     }
+    for _position in current_positions or []:
+        from trader.us.rotation import theme_cluster_for
+        _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
+        _value = float(_position.get("market_value_usd") or _position.get("market_value") or 0.0)
+        projected_state["cluster_exposure"][_cluster] = projected_state["cluster_exposure"].get(_cluster, 0.0) + _value
     try:
         from trader.us.db.repos import load_today_order_keys
         projected_state["order_keys"] = set(load_today_order_keys(trade_date=trade_date) or set())
     except Exception as _preflight_keys_exc:
         logger.warning("[US_ENTRY][PREFLIGHT_KEYS_WARN] error=%s", _preflight_keys_exc)
-    preflight_rejected_candidates = []
+    preflight_rejected_candidates = list(getattr(locals().get("incremental_preflight_session"), "rejected", []))
     accepted_preflight_candidates = []
     global_stop_reason = ""
     system_invariant_failure = entry_degraded_reason if entry_degraded_reason == "candidate_filter_invariant_fail" else ""
     if real_order_mode and not kis_order_allowed:
         global_stop_reason = "kis_order_allowed_false"
+    elif not system_invariant_failure and 'incremental_preflight_session' in locals() and getattr(engine, "last_entry_diagnostics", None) is not None:
+        accepted_preflight_candidates = list(entry_intents)
+        preflight_diagnostics = incremental_preflight_session.diagnostics()
+        global_stop_reason = preflight_diagnostics["global_stop_reason"]
+        system_invariant_failure = preflight_diagnostics["system_invariant_failure"]
     elif not system_invariant_failure:
         accepted_preflight_candidates, preflight_rejected_candidates, preflight_diagnostics = select_preflight_buy_candidates(
             entry_intents,
@@ -2318,6 +2367,9 @@ def run_trade_tick(
             projected_state=projected_state,
             allowed_symbols=locked_watchlist_symbols or None,
             current_positions=current_positions,
+            available_new_symbol_slots=max(0, available_new_slots),
+            max_new_symbol_buys=max_new_symbol_buys,
+            max_add_to_existing_buys=max_add_to_existing_buys,
         )
         global_stop_reason = preflight_diagnostics["global_stop_reason"]
         system_invariant_failure = preflight_diagnostics["system_invariant_failure"]
@@ -2328,6 +2380,12 @@ def run_trade_tick(
     entry_intents = accepted_preflight_candidates
     all_intents = entry_intents
     router_blocked_after_preflight = []
+    routing_cluster_exposure = dict(projected_state.get("cluster_exposure_start") or {})
+    if not routing_cluster_exposure:
+        for _position in current_positions or []:
+            from trader.us.rotation import theme_cluster_for
+            _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
+            routing_cluster_exposure[_cluster] = routing_cluster_exposure.get(_cluster, 0.0) + float(_position.get("market_value_usd") or _position.get("market_value") or 0.0)
 
     for intent in all_intents:
         try:
@@ -2343,14 +2401,26 @@ def run_trade_tick(
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
                 context=tick_context,
                 now=now,
+                projected_cluster_exposure=routing_cluster_exposure,
+                cluster_caps_usd=projected_state.get("cluster_caps_usd"),
+                default_cluster_cap_usd=projected_state.get("default_cluster_cap_usd"),
             )
             orders.append(result)
             if str(intent.get("side") or "BUY").upper() == "BUY" and result.get("status") in {
                 "BLOCKED", "INVALID_ORDER_IDENTITY", "ORDER_DISABLED", "EXCHANGE_MISSING_FATAL",
             }:
+                _identity = str(intent.get("client_order_key") or intent.get("order_key") or intent.get("symbol") or "")
+                _preflight_input = getattr(locals().get("incremental_preflight_session"), "accepted_states", {}).get(_identity, {})
+                _router_input = {
+                    "available_cash_usd": max(effective_budget - buy_daily_notional, 0.0),
+                    "daily_notional_usd": buy_daily_notional,
+                    "position_count": position_count,
+                }
                 mismatch = {
                     "symbol": intent.get("symbol"), "reason": result.get("reason"),
-                    "block_stage": "router_after_preflight",
+                    "block_stage": "router_after_preflight", "preflight_state": _preflight_input,
+                    "router_state": _router_input,
+                    "changed_fields": sorted(key for key in _router_input if _preflight_input.get(key) != _router_input.get(key)),
                 }
                 router_blocked_after_preflight.append(mismatch)
                 system_invariant_failure = "PREFLIGHT_ROUTER_MISMATCH"
@@ -2388,6 +2458,13 @@ def run_trade_tick(
                         logger.warning("[US_POSITION][TREND_STATE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_ack_exc)
                 if str(intent.get("side", "")).upper() == "BUY":
                     buy_daily_notional += float(intent.get("notional_usd", 0) or 0)
+                    symbol_upper = str(intent.get("symbol", "")).upper().strip()
+                    position_action = intent.get("position_action") or (intent.get("meta") or {}).get("position_action") or ""
+                    if position_action == "NEW_POSITION_BUY" and symbol_upper not in current_position_symbols:
+                        position_count += 1
+                        current_position_symbols.add(symbol_upper)
+                    _cluster = str(intent.get("theme_cluster") or (intent.get("meta") or {}).get("theme_cluster") or "")
+                    routing_cluster_exposure[_cluster] = routing_cluster_exposure.get(_cluster, 0.0) + float(intent.get("notional_usd") or 0.0)
             elif str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("trend_stage") or ""):
                 try:
                     from trader.us.db.repos import mark_us_position_exit_stage
@@ -2402,21 +2479,6 @@ def run_trade_tick(
                     )
                 except Exception as _trend_rej_exc:
                     logger.warning("[US_POSITION][TREND_STATE][REJECT_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_rej_exc)
-                if str(intent.get("side", "")).upper() == "BUY":
-                    symbol_upper = str(intent.get("symbol", "")).upper().strip()
-                    position_action = (
-                        intent.get("position_action")
-                        or (intent.get("meta") or {}).get("position_action")
-                        or ""
-                    )
-                    if position_action == "NEW_POSITION_BUY" and symbol_upper not in current_position_symbols:
-                        position_count += 1
-                        current_position_symbols.add(symbol_upper)
-                    else:
-                        logger.info(
-                            "[US_TICK][POSITION_COUNT_NOT_INCREMENTED] symbol=%s position_action=%s current_count=%d",
-                            symbol_upper, position_action, position_count,
-                        )
         except Exception as exc:
             logger.warning("[US_ORDER][ROUTE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
@@ -2816,6 +2878,9 @@ def run_trade_tick(
         "projected_cash_end": locals().get("projected_state", {}).get("available_cash_usd", locals().get("projected_cash_start", 0.0)),
         "projected_daily_notional_start": locals().get("projected_daily_notional_start", 0.0),
         "projected_daily_notional_end": locals().get("projected_state", {}).get("daily_notional_usd", locals().get("projected_daily_notional_start", 0.0)),
+        "committed_buy_notional_start": locals().get("projected_daily_notional_start", 0.0),
+        "actual_daily_buy_notional": buy_daily_notional,
+        "price_lookup_count": locals().get("entry_generation_diagnostics", {}).get("price_lookup_count", 0),
         "postfilter_blocked_candidates": locals().get("postfilter_blocked_candidates", []),
         "final_entry_intents": len(entry_intents),
         "blocked_entry_reason_counts": _blocked_entry_reason_counts(

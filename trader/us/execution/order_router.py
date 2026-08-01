@@ -60,8 +60,78 @@ class OrderPreflightDecision:
     resized_intent: dict | None = None
 
 
+class BuyPreflightSession:
+    """Stateful but side-effect-free projected-account preflight session."""
+    def __init__(self, *, target: int, projected_state: dict, allowed_symbols=None, current_positions=None,
+                 available_new_symbol_slots=None, max_new_symbol_buys=None, max_add_to_existing_buys=None):
+        self.target = max(0, target)
+        self.state = projected_state
+        self.allowed_symbols = allowed_symbols
+        self.current_positions = current_positions or []
+        self.available_new_symbol_slots = available_new_symbol_slots
+        self.max_new_symbol_buys = max_new_symbol_buys
+        self.max_add_to_existing_buys = max_add_to_existing_buys
+        self.accepted: list[dict] = []
+        self.accepted_states: dict[str, dict] = {}
+        self.rejected: list[dict] = []
+        self.attempted = self.new_accepted = self.add_accepted = 0
+        self.global_stop_reason = self.system_invariant_failure = ""
+
+    def consider(self, intent: dict) -> OrderPreflightDecision:
+        if len(self.accepted) >= self.target or self.global_stop_reason:
+            return OrderPreflightDecision(False, "preflight_target_reached", "GLOBAL")
+        self.attempted += 1
+        action = intent.get("position_action") or (intent.get("meta") or {}).get("position_action")
+        is_add = action == "ADD_TO_EXISTING_BUY"
+        if is_add and self.max_add_to_existing_buys is not None and self.add_accepted >= self.max_add_to_existing_buys:
+            decision = OrderPreflightDecision(False, "max_add_buys_per_tick", "CANDIDATE")
+        elif not is_add and (
+            (self.available_new_symbol_slots is not None and self.new_accepted >= self.available_new_symbol_slots)
+            or (self.max_new_symbol_buys is not None and self.new_accepted >= self.max_new_symbol_buys)
+        ):
+            decision = OrderPreflightDecision(False, "max_positions_reached_new_symbol", "CANDIDATE")
+        else:
+            decision = preflight_buy_order(intent, self.state, self.allowed_symbols, self.current_positions)
+        if not decision.allowed:
+            self.rejected.append({"symbol": intent.get("symbol"), "reason": decision.reason, "scope": decision.scope, "block_stage": "order_preflight"})
+            if decision.scope in {"GLOBAL", "SYSTEM"} and decision.reason != "preflight_target_reached":
+                self.global_stop_reason = decision.reason
+                if decision.scope == "SYSTEM":
+                    self.system_invariant_failure = decision.reason
+            return decision
+        accepted = decision.resized_intent or intent
+        identity = str(accepted.get("client_order_key") or accepted.get("order_key") or accepted.get("symbol") or len(self.accepted))
+        self.accepted_states[identity] = {
+            "available_cash_usd": self.state.get("available_cash_usd"),
+            "daily_notional_usd": self.state.get("daily_notional_usd"),
+            "position_count": self.state.get("position_count"),
+            "order_keys": sorted(self.state.get("order_keys") or []),
+        }
+        self.accepted.append(accepted)
+        self.add_accepted += int(is_add)
+        self.new_accepted += int(not is_add)
+        notional = float(accepted.get("notional_usd") or 0.0)
+        self.state["available_cash_usd"] -= notional
+        self.state["daily_notional_usd"] += notional
+        symbol = str(accepted.get("symbol") or "").upper().strip()
+        if not is_add:
+            self.state["position_count"] += 1
+        key = accepted.get("client_order_key") or accepted.get("order_key")
+        if key: self.state.setdefault("order_keys", set()).add(key)
+        values = self.state.setdefault("symbol_market_value", {})
+        values[symbol] = float(values.get(symbol) or 0) + notional
+        cluster = str(accepted.get("theme_cluster") or (accepted.get("meta") or {}).get("theme_cluster") or "UNCLASSIFIED")
+        exposures = self.state.setdefault("cluster_exposure", {})
+        exposures[cluster] = float(exposures.get(cluster) or 0) + notional
+        return decision
+
+    def diagnostics(self) -> dict:
+        return {"global_stop_reason": self.global_stop_reason, "system_invariant_failure": self.system_invariant_failure,
+                "attempted": self.attempted, "accepted": len(self.accepted), "rejected": len(self.rejected),
+                "candidate_pool_exhausted": not self.global_stop_reason and len(self.accepted) < self.target}
+
+
 _GLOBAL_PREFLIGHT_REASONS = {
-    "daily_notional_exceeded", "max_positions_reached_new_symbol",
     "after_entry_cutoff", "outside_session_window", "prep_contract_not_ok",
     "balance_unavailable", "cash_unavailable", "kis_order_allowed_false",
     "us_agent_not_enabled", "trading_region_not_us", "kis_env_not_practice",
@@ -82,6 +152,13 @@ def canonical_order_risk_check(intent: dict, projected_state: dict, *, allowed_s
     """The single side-effect-free risk check shared by preflight and router."""
     symbol = str(intent.get("symbol") or "").upper().strip()
     position_action = intent.get("position_action") or (intent.get("meta") or {}).get("position_action") or ""
+    cluster = str(intent.get("theme_cluster") or (intent.get("meta") or {}).get("theme_cluster") or "")
+    cluster_caps = projected_state.get("cluster_caps_usd") or {}
+    cap = cluster_caps.get(cluster, projected_state.get("default_cluster_cap_usd"))
+    if cap is not None:
+        current_cluster = float((projected_state.get("cluster_exposure") or {}).get(cluster) or 0.0)
+        if current_cluster + float(intent.get("notional_usd") or 0.0) > float(cap):
+            raise RiskGateBlocked(f"[US_RISK][BLOCK] symbol={symbol} reason=projected_cluster_cap_exceeded")
     assert_order_allowed(
         intent,
         current_daily_notional_usd=float(projected_state.get("daily_notional_usd") or 0),
@@ -103,6 +180,18 @@ def preflight_buy_order(intent: dict, projected_state: dict, allowed_symbols=Non
         return OrderPreflightDecision(True, resized_intent=dict(intent))
     if projected_state.get("available_cash_usd") is None:
         return OrderPreflightDecision(False, "cash_unavailable", "GLOBAL")
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    required = ("theme_cluster", "position_state", "position_action")
+    cluster_value = str(intent.get("theme_cluster") or meta.get("theme_cluster") or "").upper()
+    if cluster_value in {"", "OTHER", "UNKNOWN", "UNCLASSIFIED"} or any(intent.get(key) in (None, "") and meta.get(key) in (None, "") for key in required):
+        return OrderPreflightDecision(False, "classification_metadata_missing", "CANDIDATE")
+    invariant_fields = (
+        "source_tags", "sector", "industry", "theme_cluster", "classification_source",
+        "trend_score", "score_final", "rank_final30", "market_state", "market_regime",
+        "position_state", "position_action",
+    )
+    if any(intent.get(key) is not None and meta.get(key) is not None and intent.get(key) != meta.get(key) for key in invariant_fields):
+        return OrderPreflightDecision(False, "ENTRY_METADATA_INVARIANT_FAIL", "SYSTEM")
     current_symbols = {
         str(item.get("symbol") or item.get("code") or item).upper().strip()
         for item in current_positions or []
@@ -111,6 +200,12 @@ def preflight_buy_order(intent: dict, projected_state: dict, allowed_symbols=Non
         canonical_order_risk_check(intent, projected_state, allowed_symbols=allowed_symbols, current_position_symbols=current_symbols)
     except RiskGateBlocked as exc:
         reason = _risk_reason(exc)
+        if reason == "daily_notional_exceeded" and float(projected_state.get("daily_notional_usd") or 0) >= float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", "500")):
+            return OrderPreflightDecision(False, reason, "GLOBAL")
+        if reason in {"cash_below_buffer", "us_capital_budget_exceeded"}:
+            buffer = float(os.getenv("US_MIN_CASH_BUFFER_USD", "50"))
+            if float(projected_state.get("available_cash_usd") or 0) <= buffer:
+                return OrderPreflightDecision(False, reason, "GLOBAL")
         return OrderPreflightDecision(False, reason, "GLOBAL" if reason in _GLOBAL_PREFLIGHT_REASONS else "CANDIDATE")
     except Exception as exc:
         logger.exception("[US_ENTRY][PREFLIGHT_SYSTEM_ERROR] symbol=%s", intent.get("symbol"))
@@ -125,53 +220,20 @@ def select_preflight_buy_candidates(
     projected_state: dict,
     allowed_symbols=None,
     current_positions=None,
+    available_new_symbol_slots: int | None = None,
+    max_new_symbol_buys: int | None = None,
+    max_add_to_existing_buys: int | None = None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Fill final BUY slots using cumulative, side-effect-free risk checks."""
-    accepted: list[dict] = []
-    rejected: list[dict] = []
-    diagnostics = {"global_stop_reason": "", "system_invariant_failure": "", "attempted": 0}
-    current_symbols = {
-        str(item.get("symbol") or item.get("code") or "").upper().strip()
-        for item in current_positions or [] if isinstance(item, dict)
-    }
+    session = BuyPreflightSession(target=target_accept_count, projected_state=projected_state,
+        allowed_symbols=allowed_symbols, current_positions=current_positions,
+        available_new_symbol_slots=available_new_symbol_slots, max_new_symbol_buys=max_new_symbol_buys,
+        max_add_to_existing_buys=max_add_to_existing_buys)
     for intent in intents or []:
-        if len(accepted) >= max(0, target_accept_count):
+        if len(session.accepted) >= max(0, target_accept_count) or session.global_stop_reason:
             break
-        diagnostics["attempted"] += 1
-        decision = preflight_buy_order(intent, projected_state, allowed_symbols, current_positions)
-        if not decision.allowed:
-            rejected.append({
-                "symbol": intent.get("symbol"), "reason": decision.reason,
-                "scope": decision.scope, "block_stage": "order_preflight",
-            })
-            if decision.scope in {"GLOBAL", "SYSTEM"}:
-                diagnostics["global_stop_reason"] = decision.reason
-                if decision.scope == "SYSTEM":
-                    diagnostics["system_invariant_failure"] = decision.reason
-                break
-            continue
-        accepted_intent = decision.resized_intent or intent
-        accepted.append(accepted_intent)
-        notional = float(accepted_intent.get("notional_usd") or 0.0)
-        projected_state["available_cash_usd"] -= notional
-        projected_state["daily_notional_usd"] += notional
-        symbol = str(accepted_intent.get("symbol") or "").upper().strip()
-        action = accepted_intent.get("position_action") or (accepted_intent.get("meta") or {}).get("position_action")
-        if action != "ADD_TO_EXISTING_BUY" and symbol not in current_symbols:
-            projected_state["position_count"] += 1
-            current_symbols.add(symbol)
-        key = accepted_intent.get("client_order_key") or accepted_intent.get("order_key")
-        if key:
-            projected_state.setdefault("order_keys", set()).add(key)
-        symbol_values = projected_state.setdefault("symbol_market_value", {})
-        symbol_values[symbol] = float(symbol_values.get(symbol) or 0.0) + notional
-        cluster = accepted_intent.get("theme_cluster") or (accepted_intent.get("meta") or {}).get("theme_cluster")
-        cluster_values = projected_state.setdefault("cluster_exposure", {})
-        cluster_values[str(cluster or "UNCLASSIFIED")] = float(cluster_values.get(str(cluster or "UNCLASSIFIED")) or 0.0) + notional
-    diagnostics["accepted"] = len(accepted)
-    diagnostics["rejected"] = len(rejected)
-    diagnostics["candidate_pool_exhausted"] = not diagnostics["global_stop_reason"] and len(accepted) < max(0, target_accept_count)
-    return accepted, rejected, diagnostics
+        session.consider(intent)
+    return session.accepted, session.rejected, session.diagnostics()
 
 
 def _kis_env() -> str:
@@ -392,6 +454,9 @@ def route_order(
     current_position_symbols: "set[str] | None" = None,
     context: Any | None = None,
     now: Any | None = None,
+    projected_cluster_exposure: dict | None = None,
+    cluster_caps_usd: dict | None = None,
+    default_cluster_cap_usd: float | None = None,
 ) -> dict:
     """Order intent를 라우팅한다.
 
@@ -550,6 +615,9 @@ def route_order(
                 "available_cash_usd": available_cash_usd,
                 "order_keys": existing_keys,
                 "now": now,
+                "cluster_exposure": projected_cluster_exposure or {},
+                "cluster_caps_usd": cluster_caps_usd or {},
+                "default_cluster_cap_usd": default_cluster_cap_usd,
             },
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
@@ -594,6 +662,9 @@ def route_order(
                             "available_cash_usd": available_cash_usd,
                             "order_keys": existing_keys,
                             "now": now,
+                            "cluster_exposure": projected_cluster_exposure or {},
+                            "cluster_caps_usd": cluster_caps_usd or {},
+                            "default_cluster_cap_usd": default_cluster_cap_usd,
                         },
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,

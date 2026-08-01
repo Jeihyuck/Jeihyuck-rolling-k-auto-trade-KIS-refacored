@@ -479,6 +479,7 @@ def generate_entry_intents(
     allow_add_to_existing: bool = True,
     available_new_slots: int | None = None,
     diagnostics: dict[str, Any] | None = None,
+    intent_acceptor: Any | None = None,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -1156,6 +1157,15 @@ def generate_entry_intents(
             intent["filters_passed"] = entry_explanation.get("filters_passed", [])
             intent["explanation_quality"] = entry_explanation.get("explanation_quality", "MINIMAL")
         
+        if intent_acceptor is not None:
+            decision = intent_acceptor(intent)
+            if not getattr(decision, "allowed", bool(decision)):
+                reason = getattr(decision, "reason", "order_preflight_rejected")
+                track_skip(symbol, reason, {"block_stage": "order_preflight"})
+                if getattr(decision, "scope", "") in {"GLOBAL", "SYSTEM"}:
+                    break
+                continue
+            intent = getattr(decision, "resized_intent", None) or intent
         intents.append(intent)
         added_count += 1
         if diagnostics is not None:
@@ -1300,5 +1310,6 @@ def generate_entry_intents(
             "backfill_attempt_count": max(0, price_lookup_count - len(intents)),
             "backfill_success_count": sum(1 for i, intent in enumerate(intents) if int(intent.get("rank_final30") or i + 1) > i + 1),
             "candidate_pool_exhausted": len(intents) < max_new_entries,
+            "price_lookup_count": price_lookup_count,
         })
     return intents

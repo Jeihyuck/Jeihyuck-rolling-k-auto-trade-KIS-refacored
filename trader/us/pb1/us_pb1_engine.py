@@ -59,6 +59,7 @@ class USPb1Engine:
         allow_add_to_existing: bool = True,
         available_new_slots: int | None = None,
         max_new_entries: int | None = None,
+        intent_acceptor: Any | None = None,
     ) -> list[dict]:
         """진입 후보 평가.
 
@@ -114,6 +115,7 @@ class USPb1Engine:
             available_new_slots=available_new_slots,
             max_new_entries=max_new_entries,
             diagnostics=diagnostics,
+            intent_acceptor=intent_acceptor,
         )
         self.last_entry_diagnostics = diagnostics
         return intents

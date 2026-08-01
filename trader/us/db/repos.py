@@ -3614,3 +3614,27 @@ def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
     except Exception:
         logger.exception("[US_ORDERS][REPORT_LOAD][WARN] trade_date=%s", trade_date)
     return []
+
+
+def load_today_committed_buy_notional(trade_date: str, env: str = "practice", include_pending: bool = True) -> float:
+    """Return deduplicated committed BUY notional for the trading day."""
+    statuses = {"ACK", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED", "DRY_RUN"}
+    if include_pending:
+        statuses.add("PENDING")
+    seen: set[str] = set()
+    total = 0.0
+    for index, row in enumerate(load_us_daily_orders_for_report(trade_date) or []):
+        if str(row.get("side") or "").upper() != "BUY" or str(row.get("status") or "").upper() not in statuses:
+            continue
+        row_env = str(row.get("env") or row.get("kis_env") or env).lower()
+        if row_env and row_env != str(env or "practice").lower():
+            continue
+        key = str(row.get("client_order_key") or row.get("order_key") or row.get("order_no") or f"row:{index}")
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            total += float(row.get("notional_usd") or row.get("order_notional_usd") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return total
