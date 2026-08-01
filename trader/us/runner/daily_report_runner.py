@@ -194,12 +194,23 @@ def _apply_regime_session_summary(report: dict, session_summary: dict | None) ->
     for key in (
         "raw_watchlist_candidates", "prefilter_eligible_candidates",
         "intent_generation_attempted", "final_entry_intents",
-        "backfill_attempt_count", "backfill_success_count",
+        "backfill_attempt_count", "backfill_success_count", "submitted_orders",
     ):
         if key in session_summary:
             report[key] = int(report.get(key) or 0) + int(session_summary.get(key) or 0)
     if "candidate_pool_exhausted" in session_summary:
         report["candidate_pool_exhausted"] = bool(session_summary.get("candidate_pool_exhausted"))
+    if session_summary.get("candidate_local_reject_counts"):
+        report["candidate_local_reject_counts"] = merge_reason_counts(
+            report.get("candidate_local_reject_counts") or {},
+            session_summary.get("candidate_local_reject_counts") or {},
+        )
+    for key in (
+        "global_stop_reason", "system_invariant_failure", "projected_cash_start",
+        "projected_cash_end", "projected_daily_notional_start", "projected_daily_notional_end",
+    ):
+        if key in session_summary and session_summary.get(key) not in (None, ""):
+            report[key] = session_summary.get(key)
     return report
 
 

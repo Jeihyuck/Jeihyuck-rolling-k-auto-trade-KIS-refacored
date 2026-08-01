@@ -58,6 +58,7 @@ class USPb1Engine:
         allow_new_symbols: bool = True,
         allow_add_to_existing: bool = True,
         available_new_slots: int | None = None,
+        max_new_entries: int | None = None,
     ) -> list[dict]:
         """진입 후보 평가.
 
@@ -111,6 +112,7 @@ class USPb1Engine:
             allow_new_symbols=allow_new_symbols,
             allow_add_to_existing=allow_add_to_existing,
             available_new_slots=available_new_slots,
+            max_new_entries=max_new_entries,
             diagnostics=diagnostics,
         )
         self.last_entry_diagnostics = diagnostics

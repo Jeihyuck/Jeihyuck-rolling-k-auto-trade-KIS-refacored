@@ -101,7 +101,7 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch):
     monkeypatch.setattr("trader.us.watchlist_quality.US_MIN_LOCKED_WATCHLIST_COUNT", 5)
     monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda date: True)
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda now: "REGULAR_MID")
-    monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": 5000.0})
+    monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": 5000.0, "capital_usd_cap": 5000.0})
 
     class Provider:
         stats = {}

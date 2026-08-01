@@ -2143,6 +2143,7 @@ def run_trade_tick(
                                 allow_new_symbols=allow_new_symbols,
                                 allow_add_to_existing=allow_add_to_existing,
                                 available_new_slots=available_new_slots,
+                                max_new_entries=len(eligible_watchlist_rows),
                             )
                             entry_intents = fut.result(timeout=entry_eval_timeout_sec)
                         entry_generation_diagnostics = dict(getattr(engine, "last_entry_diagnostics", {}) or {})
@@ -2207,6 +2208,7 @@ def run_trade_tick(
             entry_eval_error_count += 1
             entry_degraded = True
             entry_degraded_reason = "candidate_filter_invariant_fail"
+            entry_intents = []
         logger.info("[US_ENTRY][MARKET_STATE_FILTER] kept=%d blocked=%d blocked_entries=%s", len(entry_intents), len(market_state_blocked_buys), market_state_blocked_buys)
     except Exception as _cluster_guard_filter_exc:
         logger.warning("[US_CLUSTER_GUARD][ENTRY_FILTER][WARN] error=%s", _cluster_guard_filter_exc)
@@ -2279,7 +2281,53 @@ def run_trade_tick(
             ]
             all_intents = entry_intents
 
-    from trader.us.execution.order_router import route_order
+    from trader.us.execution.order_router import route_order, select_preflight_buy_candidates
+
+    _preflight_effective_max = market_state_overlay.get("effective_max_new_positions")
+    _preflight_effective_max = available_new_slots if _preflight_effective_max is None else max(0, int(_preflight_effective_max))
+    target_accept_count = min(
+        int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")),
+        max(0, available_new_slots),
+        _preflight_effective_max,
+    )
+    projected_cash_start = max(effective_budget - buy_daily_notional, 0.0)
+    projected_daily_notional_start = buy_daily_notional
+    projected_state = {
+        "available_cash_usd": projected_cash_start,
+        "daily_notional_usd": projected_daily_notional_start,
+        "position_count": position_count,
+        "portfolio_usd": max(effective_budget, 1000.0),
+        "order_keys": set(),
+        "now": now,
+    }
+    try:
+        from trader.us.db.repos import load_today_order_keys
+        projected_state["order_keys"] = set(load_today_order_keys(trade_date=trade_date) or set())
+    except Exception as _preflight_keys_exc:
+        logger.warning("[US_ENTRY][PREFLIGHT_KEYS_WARN] error=%s", _preflight_keys_exc)
+    preflight_rejected_candidates = []
+    accepted_preflight_candidates = []
+    global_stop_reason = ""
+    system_invariant_failure = entry_degraded_reason if entry_degraded_reason == "candidate_filter_invariant_fail" else ""
+    if real_order_mode and not kis_order_allowed:
+        global_stop_reason = "kis_order_allowed_false"
+    elif not system_invariant_failure:
+        accepted_preflight_candidates, preflight_rejected_candidates, preflight_diagnostics = select_preflight_buy_candidates(
+            entry_intents,
+            target_accept_count=target_accept_count,
+            projected_state=projected_state,
+            allowed_symbols=locked_watchlist_symbols or None,
+            current_positions=current_positions,
+        )
+        global_stop_reason = preflight_diagnostics["global_stop_reason"]
+        system_invariant_failure = preflight_diagnostics["system_invariant_failure"]
+        if system_invariant_failure:
+            accepted_preflight_candidates = []
+            entry_degraded = True
+            entry_degraded_reason = system_invariant_failure
+    entry_intents = accepted_preflight_candidates
+    all_intents = entry_intents
+    router_blocked_after_preflight = []
 
     for intent in all_intents:
         try:
@@ -2294,8 +2342,22 @@ def run_trade_tick(
                 allowed_symbols=(locked_watchlist_symbols if str(intent.get("side", "BUY")).upper() == "BUY" and locked_watchlist_symbols else None),
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
                 context=tick_context,
+                now=now,
             )
             orders.append(result)
+            if str(intent.get("side") or "BUY").upper() == "BUY" and result.get("status") in {
+                "BLOCKED", "INVALID_ORDER_IDENTITY", "ORDER_DISABLED", "EXCHANGE_MISSING_FATAL",
+            }:
+                mismatch = {
+                    "symbol": intent.get("symbol"), "reason": result.get("reason"),
+                    "block_stage": "router_after_preflight",
+                }
+                router_blocked_after_preflight.append(mismatch)
+                system_invariant_failure = "PREFLIGHT_ROUTER_MISMATCH"
+                entry_degraded = True
+                entry_degraded_reason = system_invariant_failure
+                logger.error("[US_ENTRY][PREFLIGHT_ROUTER_MISMATCH] detail=%s", mismatch)
+                break
             if result["status"] in ("DRY_RUN", "ACK"):
                 if str(intent.get("side", "")).upper() == "SELL" and str((intent.get("meta") or {}).get("profit_capture_stage") or ""):
                     try:
@@ -2742,6 +2804,18 @@ def run_trade_tick(
         "prefilter_blocked_candidates": locals().get("preblocked_rows", []),
         "intent_generation_attempted": locals().get("entry_generation_diagnostics", {}).get("attempted", 0),
         "intent_generation_blocked": locals().get("entry_generation_diagnostics", {}).get("blocked", []),
+        "engine_rejected_candidates": locals().get("entry_generation_diagnostics", {}).get("blocked", []),
+        "preflight_rejected_candidates": locals().get("preflight_rejected_candidates", []),
+        "accepted_preflight_candidates": locals().get("accepted_preflight_candidates", []),
+        "submitted_orders": len([o for o in orders if str(o.get("side") or (o.get("intent") or {}).get("side") or "").upper() == "BUY"]),
+        "router_blocked_after_preflight": locals().get("router_blocked_after_preflight", []),
+        "candidate_local_reject_counts": _blocked_entry_reason_counts(locals().get("preflight_rejected_candidates", []), []),
+        "global_stop_reason": locals().get("global_stop_reason", ""),
+        "system_invariant_failure": locals().get("system_invariant_failure", ""),
+        "projected_cash_start": locals().get("projected_cash_start", 0.0),
+        "projected_cash_end": locals().get("projected_state", {}).get("available_cash_usd", locals().get("projected_cash_start", 0.0)),
+        "projected_daily_notional_start": locals().get("projected_daily_notional_start", 0.0),
+        "projected_daily_notional_end": locals().get("projected_state", {}).get("daily_notional_usd", locals().get("projected_daily_notional_start", 0.0)),
         "postfilter_blocked_candidates": locals().get("postfilter_blocked_candidates", []),
         "final_entry_intents": len(entry_intents),
         "blocked_entry_reason_counts": _blocked_entry_reason_counts(
@@ -2751,14 +2825,17 @@ def run_trade_tick(
         "blocked_entry_stage_counts": _blocked_entry_stage_counts(
             locals().get("preblocked_rows", []) + locals().get("entry_generation_diagnostics", {}).get("blocked", []) + locals().get("postfilter_blocked_candidates", [])
         ),
-        "backfill_attempt_count": len(locals().get("preblocked_rows", [])) + locals().get("entry_generation_diagnostics", {}).get("backfill_attempt_count", 0),
+        "backfill_attempt_count": len(locals().get("preblocked_rows", [])) + locals().get("entry_generation_diagnostics", {}).get("backfill_attempt_count", 0) + len(locals().get("preflight_rejected_candidates", [])),
         "backfill_success_count": max(
             locals().get("entry_generation_diagnostics", {}).get("backfill_success_count", 0),
             sum(1 for index, intent in enumerate(entry_intents, 1) if int(intent.get("rank_final30") or index) > index),
         ),
-        "candidate_pool_exhausted": locals().get("entry_generation_diagnostics", {}).get(
+        "candidate_pool_exhausted": locals().get("preflight_diagnostics", {}).get(
             "candidate_pool_exhausted",
-            bool(locals().get("eligible_watchlist_rows", [])) and len(entry_intents) < min(int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")), available_new_slots),
+            locals().get("entry_generation_diagnostics", {}).get(
+                "candidate_pool_exhausted",
+                bool(locals().get("eligible_watchlist_rows", [])) and len(entry_intents) < min(int(os.getenv("US_MAX_NEW_ENTRIES_PER_TICK", "3")), available_new_slots),
+            ),
         ),
         "explicitly_deferred_candidates": max(
             0,

@@ -629,6 +629,7 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
         metadata_mismatch = next(
             (
                 key for key in (
+                    "source_tags", "sector", "industry", "classification_source",
                     "theme_cluster", "trend_score", "score_final", "rank_final30",
                     "entry_style", "position_state", "position_action",
                     "market_state", "market_regime", "blocked_reason", "block_stage",

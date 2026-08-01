@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 from trader.us import config as us_cfg
@@ -49,6 +50,128 @@ _SENT_ORDER_KEYS: set[str] = set()
 _BLOCKED_INTENT_KEYS: set[tuple[str, str, str]] = set()
 _CASH_EXHAUSTED_TICKS: set[str] = set()
 _CASH_UNAVAILABLE_TICKS: set[str] = set()
+
+
+@dataclass(frozen=True)
+class OrderPreflightDecision:
+    allowed: bool
+    reason: str = ""
+    scope: str = "CANDIDATE"
+    resized_intent: dict | None = None
+
+
+_GLOBAL_PREFLIGHT_REASONS = {
+    "daily_notional_exceeded", "max_positions_reached_new_symbol",
+    "after_entry_cutoff", "outside_session_window", "prep_contract_not_ok",
+    "balance_unavailable", "cash_unavailable", "kis_order_allowed_false",
+    "us_agent_not_enabled", "trading_region_not_us", "kis_env_not_practice",
+    "strategy_env_not_practice",
+}
+
+
+def _risk_reason(exc: Exception) -> str:
+    text = str(exc)
+    if "reason=" in text:
+        return text.split("reason=", 1)[1].split()[0]
+    if "[US_DUPLICATE][BLOCK]" in text:
+        return "duplicate_client_order_key"
+    return text
+
+
+def canonical_order_risk_check(intent: dict, projected_state: dict, *, allowed_symbols=None, current_position_symbols=None) -> None:
+    """The single side-effect-free risk check shared by preflight and router."""
+    symbol = str(intent.get("symbol") or "").upper().strip()
+    position_action = intent.get("position_action") or (intent.get("meta") or {}).get("position_action") or ""
+    assert_order_allowed(
+        intent,
+        current_daily_notional_usd=float(projected_state.get("daily_notional_usd") or 0),
+        current_position_count=int(projected_state.get("position_count") or 0),
+        total_portfolio_usd=float(projected_state.get("portfolio_usd") or 0),
+        available_cash_usd=float(projected_state.get("available_cash_usd") or 0),
+        existing_order_keys=set(projected_state.get("order_keys") or set()),
+        now=projected_state.get("now"),
+        allowed_symbols=allowed_symbols,
+        current_position_symbols=current_position_symbols,
+        trade_date=intent.get("trade_date"),
+        is_existing_position_buy=position_action == "ADD_TO_EXISTING_BUY" or symbol in set(current_position_symbols or set()),
+    )
+
+
+def preflight_buy_order(intent: dict, projected_state: dict, allowed_symbols=None, current_positions=None) -> OrderPreflightDecision:
+    """Run canonical BUY risk checks without persistence or broker submission."""
+    if str(intent.get("side") or "BUY").upper() != "BUY":
+        return OrderPreflightDecision(True, resized_intent=dict(intent))
+    if projected_state.get("available_cash_usd") is None:
+        return OrderPreflightDecision(False, "cash_unavailable", "GLOBAL")
+    current_symbols = {
+        str(item.get("symbol") or item.get("code") or item).upper().strip()
+        for item in current_positions or []
+    }
+    try:
+        canonical_order_risk_check(intent, projected_state, allowed_symbols=allowed_symbols, current_position_symbols=current_symbols)
+    except RiskGateBlocked as exc:
+        reason = _risk_reason(exc)
+        return OrderPreflightDecision(False, reason, "GLOBAL" if reason in _GLOBAL_PREFLIGHT_REASONS else "CANDIDATE")
+    except Exception as exc:
+        logger.exception("[US_ENTRY][PREFLIGHT_SYSTEM_ERROR] symbol=%s", intent.get("symbol"))
+        return OrderPreflightDecision(False, f"preflight_system_error:{type(exc).__name__}", "SYSTEM")
+    return OrderPreflightDecision(True, resized_intent=dict(intent))
+
+
+def select_preflight_buy_candidates(
+    intents: list[dict],
+    *,
+    target_accept_count: int,
+    projected_state: dict,
+    allowed_symbols=None,
+    current_positions=None,
+) -> tuple[list[dict], list[dict], dict]:
+    """Fill final BUY slots using cumulative, side-effect-free risk checks."""
+    accepted: list[dict] = []
+    rejected: list[dict] = []
+    diagnostics = {"global_stop_reason": "", "system_invariant_failure": "", "attempted": 0}
+    current_symbols = {
+        str(item.get("symbol") or item.get("code") or "").upper().strip()
+        for item in current_positions or [] if isinstance(item, dict)
+    }
+    for intent in intents or []:
+        if len(accepted) >= max(0, target_accept_count):
+            break
+        diagnostics["attempted"] += 1
+        decision = preflight_buy_order(intent, projected_state, allowed_symbols, current_positions)
+        if not decision.allowed:
+            rejected.append({
+                "symbol": intent.get("symbol"), "reason": decision.reason,
+                "scope": decision.scope, "block_stage": "order_preflight",
+            })
+            if decision.scope in {"GLOBAL", "SYSTEM"}:
+                diagnostics["global_stop_reason"] = decision.reason
+                if decision.scope == "SYSTEM":
+                    diagnostics["system_invariant_failure"] = decision.reason
+                break
+            continue
+        accepted_intent = decision.resized_intent or intent
+        accepted.append(accepted_intent)
+        notional = float(accepted_intent.get("notional_usd") or 0.0)
+        projected_state["available_cash_usd"] -= notional
+        projected_state["daily_notional_usd"] += notional
+        symbol = str(accepted_intent.get("symbol") or "").upper().strip()
+        action = accepted_intent.get("position_action") or (accepted_intent.get("meta") or {}).get("position_action")
+        if action != "ADD_TO_EXISTING_BUY" and symbol not in current_symbols:
+            projected_state["position_count"] += 1
+            current_symbols.add(symbol)
+        key = accepted_intent.get("client_order_key") or accepted_intent.get("order_key")
+        if key:
+            projected_state.setdefault("order_keys", set()).add(key)
+        symbol_values = projected_state.setdefault("symbol_market_value", {})
+        symbol_values[symbol] = float(symbol_values.get(symbol) or 0.0) + notional
+        cluster = accepted_intent.get("theme_cluster") or (accepted_intent.get("meta") or {}).get("theme_cluster")
+        cluster_values = projected_state.setdefault("cluster_exposure", {})
+        cluster_values[str(cluster or "UNCLASSIFIED")] = float(cluster_values.get(str(cluster or "UNCLASSIFIED")) or 0.0) + notional
+    diagnostics["accepted"] = len(accepted)
+    diagnostics["rejected"] = len(rejected)
+    diagnostics["candidate_pool_exhausted"] = not diagnostics["global_stop_reason"] and len(accepted) < max(0, target_accept_count)
+    return accepted, rejected, diagnostics
 
 
 def _kis_env() -> str:
@@ -268,6 +391,7 @@ def route_order(
     allowed_symbols: "set[str] | None" = None,
     current_position_symbols: "set[str] | None" = None,
     context: Any | None = None,
+    now: Any | None = None,
 ) -> dict:
     """Order intent를 라우팅한다.
 
@@ -417,17 +541,18 @@ def route_order(
     # 3. Risk Gate
     gate_intent = {**intent, "exchange": exchange, "client_order_key": order_key, "position_action": position_action}
     try:
-        assert_order_allowed(
+        canonical_order_risk_check(
             gate_intent,
-            current_daily_notional_usd=current_daily_notional_usd,
-            current_position_count=current_position_count,
-            total_portfolio_usd=total_portfolio_usd,
-            available_cash_usd=available_cash_usd,
-            existing_order_keys=existing_keys,
+            {
+                "daily_notional_usd": current_daily_notional_usd,
+                "position_count": current_position_count,
+                "portfolio_usd": total_portfolio_usd,
+                "available_cash_usd": available_cash_usd,
+                "order_keys": existing_keys,
+                "now": now,
+            },
             allowed_symbols=allowed_symbols,
             current_position_symbols=current_position_symbols,
-            trade_date=trade_date,
-            is_existing_position_buy=is_existing_position_buy,
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
@@ -460,17 +585,18 @@ def route_order(
                 # risk gate 재시도
                 resized_gate_intent = {**resized_intent, "client_order_key": order_key, "position_action": position_action}
                 try:
-                    assert_order_allowed(
+                    canonical_order_risk_check(
                         resized_gate_intent,
-                        current_daily_notional_usd=current_daily_notional_usd,
-                        current_position_count=current_position_count,
-                        total_portfolio_usd=total_portfolio_usd,
-                        available_cash_usd=available_cash_usd,
-                        existing_order_keys=existing_keys,
+                        {
+                            "daily_notional_usd": current_daily_notional_usd,
+                            "position_count": current_position_count,
+                            "portfolio_usd": total_portfolio_usd,
+                            "available_cash_usd": available_cash_usd,
+                            "order_keys": existing_keys,
+                            "now": now,
+                        },
                         allowed_symbols=allowed_symbols,
                         current_position_symbols=current_position_symbols,
-                        trade_date=trade_date,
-                        is_existing_position_buy=is_existing_position_buy,
                     )
                     
                     # 재시도 성공: 축소된 intent로 계속 진행
