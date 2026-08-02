@@ -37,6 +37,43 @@ logger = logging.getLogger(__name__)
 AI_TECH_COMBINED_CLUSTERS = {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_POWER", "MEGA_TECH"}
 
 
+def resolve_entry_metadata_contract_reason(intent: dict, *, required: bool = False) -> str | None:
+    """Validate classification metadata without treating explicit OTHER as missing."""
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    candidate_fields = ("theme_cluster", "classification_source", "position_state", "position_action")
+    if not required and not any(
+        intent.get(key) not in (None, "") or meta.get(key) not in (None, "")
+        for key in candidate_fields
+    ):
+        # Legacy/manual router callers do not carry a Final30 classification
+        # contract. PB1 candidates always do and are validated identically in
+        # preflight and router.
+        return None
+    invariant_fields = (
+        "source_tags", "sector", "industry", "theme_cluster", "classification_source",
+        "trend_score", "score_final", "rank_final30", "market_state", "market_regime",
+        "position_state", "position_action",
+    )
+    if any(
+        intent.get(key) is not None
+        and meta.get(key) is not None
+        and intent.get(key) != meta.get(key)
+        for key in invariant_fields
+    ):
+        return "ENTRY_METADATA_INVARIANT_FAIL"
+    required = ("theme_cluster", "position_state", "position_action")
+    if any(intent.get(key) in (None, "") and meta.get(key) in (None, "") for key in required):
+        return "classification_metadata_missing"
+    top_cluster = str(intent.get("theme_cluster") or "").strip().upper()
+    meta_cluster = str(meta.get("theme_cluster") or "").strip().upper()
+    if top_cluster == "OTHER" and meta_cluster == "OTHER":
+        top_source = str(intent.get("classification_source") or "").strip()
+        meta_source = str(meta.get("classification_source") or "").strip()
+        if not top_source or not meta_source:
+            return "classification_metadata_missing"
+    return None
+
+
 def normalize_canonical_risk_snapshot(projected_state: dict, *, allowed_symbols=None, current_position_symbols=None) -> dict:
     """Return the complete, deterministic schema used for preflight/router comparison."""
     now = projected_state.get("now")
@@ -178,6 +215,10 @@ def _risk_reason(exc: Exception) -> str:
 
 def canonical_order_risk_check(intent: dict, projected_state: dict, *, allowed_symbols=None, current_position_symbols=None) -> None:
     """The single side-effect-free risk check shared by preflight and router."""
+    if str(intent.get("side") or "BUY").upper() == "BUY":
+        metadata_reason = resolve_entry_metadata_contract_reason(intent)
+        if metadata_reason:
+            raise RiskGateBlocked(f"[US_RISK][BLOCK] symbol={intent.get('symbol')} reason={metadata_reason}")
     symbol = str(intent.get("symbol") or "").upper().strip()
     position_action = intent.get("position_action") or (intent.get("meta") or {}).get("position_action") or ""
     cluster = str(intent.get("theme_cluster") or (intent.get("meta") or {}).get("theme_cluster") or "")
@@ -217,18 +258,10 @@ def preflight_buy_order(intent: dict, projected_state: dict, allowed_symbols=Non
         projected_state.get("default_cluster_cap_usd") is not None or projected_state.get("ai_combined_cap_usd") is not None
     ):
         return OrderPreflightDecision(False, "portfolio_equity_unavailable", "SYSTEM")
-    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
-    required = ("theme_cluster", "position_state", "position_action")
-    cluster_value = str(intent.get("theme_cluster") or meta.get("theme_cluster") or "").upper()
-    if cluster_value in {"", "OTHER", "UNKNOWN", "UNCLASSIFIED"} or any(intent.get(key) in (None, "") and meta.get(key) in (None, "") for key in required):
-        return OrderPreflightDecision(False, "classification_metadata_missing", "CANDIDATE")
-    invariant_fields = (
-        "source_tags", "sector", "industry", "theme_cluster", "classification_source",
-        "trend_score", "score_final", "rank_final30", "market_state", "market_regime",
-        "position_state", "position_action",
-    )
-    if any(intent.get(key) is not None and meta.get(key) is not None and intent.get(key) != meta.get(key) for key in invariant_fields):
-        return OrderPreflightDecision(False, "ENTRY_METADATA_INVARIANT_FAIL", "SYSTEM")
+    metadata_reason = resolve_entry_metadata_contract_reason(intent, required=True)
+    if metadata_reason:
+        scope = "SYSTEM" if metadata_reason == "ENTRY_METADATA_INVARIANT_FAIL" else "CANDIDATE"
+        return OrderPreflightDecision(False, metadata_reason, scope)
     current_symbols = {
         str(item.get("symbol") or item.get("code") or item).upper().strip()
         for item in current_positions or []

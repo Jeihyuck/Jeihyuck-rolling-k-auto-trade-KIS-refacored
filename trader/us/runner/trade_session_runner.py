@@ -196,14 +196,18 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
         "raw_watchlist_candidates", "prefilter_eligible_candidates",
         "intent_generation_attempted", "final_entry_intents",
         "backfill_attempt_count", "backfill_success_count", "submitted_orders",
-        "price_lookup_count",
+        "price_lookup_count", "price_lookup_attempted", "price_lookup_used",
     )
     candidate_metrics = {key: 0 for key in candidate_metric_keys}
+    price_lookup_budget_exhausted = False
+    price_lookup_limit_last = 0
     candidate_local_reject_counts_total: dict[str, int] = {}
     global_stop_reason_last = ""
     system_invariant_failure_last = ""
     projected_metrics: dict[str, float] = {}
     for tick_result in results or []:
+        price_lookup_budget_exhausted = price_lookup_budget_exhausted or bool(tick_result.get("price_lookup_budget_exhausted"))
+        price_lookup_limit_last = int(tick_result.get("price_lookup_limit") or price_lookup_limit_last)
         if tick_result.get("market_regime"):
             market_regime_last = str(tick_result.get("market_regime") or "")
         if tick_result.get("capital_scale") is not None:
@@ -251,6 +255,8 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
         "blocked_entry_reason_counts": blocked_entry_reason_counts_total,
         "blocked_entry_stage_counts": blocked_entry_stage_counts_total,
         "candidate_pool_exhausted": bool(results and results[-1].get("candidate_pool_exhausted")),
+        "price_lookup_budget_exhausted": price_lookup_budget_exhausted,
+        "price_lookup_limit": price_lookup_limit_last,
         "candidate_local_reject_counts": candidate_local_reject_counts_total,
         "global_stop_reason": global_stop_reason_last,
         "system_invariant_failure": system_invariant_failure_last,

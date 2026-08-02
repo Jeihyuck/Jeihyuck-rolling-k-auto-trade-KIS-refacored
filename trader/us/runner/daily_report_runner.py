@@ -195,12 +195,16 @@ def _apply_regime_session_summary(report: dict, session_summary: dict | None) ->
         "raw_watchlist_candidates", "prefilter_eligible_candidates",
         "intent_generation_attempted", "final_entry_intents",
         "backfill_attempt_count", "backfill_success_count", "submitted_orders",
-        "price_lookup_count",
+        "price_lookup_count", "price_lookup_attempted", "price_lookup_used",
     ):
         if key in session_summary:
             report[key] = int(report.get(key) or 0) + int(session_summary.get(key) or 0)
     if "candidate_pool_exhausted" in session_summary:
         report["candidate_pool_exhausted"] = bool(session_summary.get("candidate_pool_exhausted"))
+    if "price_lookup_budget_exhausted" in session_summary:
+        report["price_lookup_budget_exhausted"] = bool(session_summary.get("price_lookup_budget_exhausted"))
+    if "price_lookup_limit" in session_summary:
+        report["price_lookup_limit"] = int(session_summary.get("price_lookup_limit") or 0)
     if session_summary.get("candidate_local_reject_counts"):
         report["candidate_local_reject_counts"] = merge_reason_counts(
             report.get("candidate_local_reject_counts") or {},

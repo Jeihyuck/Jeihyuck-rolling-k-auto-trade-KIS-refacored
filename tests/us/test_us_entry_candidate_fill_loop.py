@@ -94,3 +94,68 @@ def test_incremental_preflight_stops_price_lookups_at_target(monkeypatch):
     )
     assert len(intents) == 3
     assert len(provider.calls) == 8
+
+
+def test_provider_price_lookup_hard_cap_and_exhaustion_diagnostics(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr(repos, "has_position", lambda symbol: False)
+    monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
+    monkeypatch.setenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20")
+    rows = [{"symbol": f"CAP{i}", "exchange": "NASDAQ", "score": 1 - i * .01} for i in range(30)]
+
+    class Provider:
+        calls = 0
+        def get_current_price(self, symbol, exchange):
+            self.calls += 1
+            return {"last": 0}
+
+    provider = Provider()
+    diagnostics = {}
+    intents = generate_entry_intents(
+        None, provider, set(), 10000, 0, 10000, max_new_entries=3,
+        watchlist_entries=rows, current_position_symbols=set(), diagnostics=diagnostics,
+    )
+    assert intents == []
+    assert provider.calls == 20
+    assert diagnostics["price_lookup_budget_exhausted"] is True
+    assert diagnostics["price_lookup_used"] == 20
+    assert diagnostics["price_lookup_limit"] == 20
+    assert diagnostics["price_lookup_attempted"] == 30
+    assert diagnostics["candidate_pool_exhausted"] is True
+
+
+def test_cached_prices_do_not_consume_lookup_budget_and_target_stops_early(monkeypatch):
+    from trader.us.db import repos
+    from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+    monkeypatch.setattr(repos, "has_pending_order_for_symbol_side", lambda **kwargs: False)
+    monkeypatch.setattr(repos, "has_position", lambda symbol: False)
+    monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
+    monkeypatch.setenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "1")
+    monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+    rows = [
+        {"symbol": f"CACHE{i}", "exchange": "NASDAQ", "score": 1 - i * .01, "current_price": 100}
+        for i in range(30)
+    ]
+
+    class Provider:
+        calls = 0
+        def get_current_price(self, symbol, exchange):
+            self.calls += 1
+            return {"last": 100}
+
+    provider = Provider()
+    diagnostics = {}
+    intents = generate_entry_intents(
+        None, provider, set(), 10000, 0, 10000, max_new_entries=3,
+        watchlist_entries=rows, current_position_symbols=set(), diagnostics=diagnostics,
+    )
+    assert len(intents) == 3
+    assert provider.calls == 0
+    assert diagnostics["price_lookup_used"] == 0
+    assert diagnostics["price_lookup_budget_exhausted"] is False

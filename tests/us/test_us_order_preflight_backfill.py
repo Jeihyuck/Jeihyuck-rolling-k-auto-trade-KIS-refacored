@@ -348,6 +348,36 @@ def test_missing_classification_backfills_and_metadata_mismatch_is_system_failur
     assert diag["system_invariant_failure"] == "ENTRY_METADATA_INVARIANT_FAIL"
 
 
+def test_explicit_other_classification_with_canonical_evidence_is_allowed():
+    from trader.us.execution.order_router import canonical_order_risk_check, preflight_buy_order
+
+    intent = _intent("GENERIC", theme_cluster="OTHER", classification_source="final30_classifier")
+    intent["meta"].update({
+        "theme_cluster": "OTHER",
+        "classification_source": "final30_classifier",
+    })
+    decision = preflight_buy_order(intent, _state(), {"GENERIC"}, [])
+    assert decision.allowed is True
+    canonical_order_risk_check(
+        intent, _state(), allowed_symbols={"GENERIC"}, current_position_symbols=set(),
+    )
+
+
+def test_other_classification_missing_and_mismatch_contracts_fail_closed():
+    from trader.us.execution.order_router import preflight_buy_order
+
+    missing = _intent("MISSING")
+    missing["theme_cluster"] = missing["meta"]["theme_cluster"] = ""
+    assert preflight_buy_order(missing, _state(), {"MISSING"}, []).reason == "classification_metadata_missing"
+
+    mismatch = _intent("MISMATCH", theme_cluster="OTHER", classification_source="final30_classifier")
+    mismatch["meta"].update({"theme_cluster": "HEALTHCARE", "classification_source": "final30_classifier"})
+    decision = preflight_buy_order(mismatch, _state(), {"MISMATCH"}, [])
+    assert decision.allowed is False
+    assert decision.reason == "ENTRY_METADATA_INVARIANT_FAIL"
+    assert decision.scope == "SYSTEM"
+
+
 def test_actual_pb1_intents_pass_actual_preflight_with_projected_state(monkeypatch):
     from trader.us.db import repos
     from trader.us.execution.order_router import select_preflight_buy_candidates

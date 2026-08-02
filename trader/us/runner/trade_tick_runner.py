@@ -2987,6 +2987,10 @@ def run_trade_tick(
         "committed_buy_notional_start": locals().get("projected_daily_notional_start", 0.0),
         "actual_daily_buy_notional": buy_daily_notional,
         "price_lookup_count": locals().get("entry_generation_diagnostics", {}).get("price_lookup_count", 0),
+        "price_lookup_budget_exhausted": bool(locals().get("entry_generation_diagnostics", {}).get("price_lookup_budget_exhausted", False)),
+        "price_lookup_attempted": locals().get("entry_generation_diagnostics", {}).get("price_lookup_attempted", 0),
+        "price_lookup_used": locals().get("entry_generation_diagnostics", {}).get("price_lookup_used", 0),
+        "price_lookup_limit": locals().get("entry_generation_diagnostics", {}).get("price_lookup_limit", 0),
         "postfilter_blocked_candidates": locals().get("postfilter_blocked_candidates", []),
         "final_entry_intents": len(entry_intents),
         "blocked_entry_reason_counts": _blocked_entry_reason_counts(

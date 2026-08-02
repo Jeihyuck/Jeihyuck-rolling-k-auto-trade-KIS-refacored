@@ -526,7 +526,7 @@ def generate_entry_intents(
     # Price lookup 최적화 설정
     price_lookup_buffer = int(os.getenv("US_ENTRY_PRICE_LOOKUP_BUFFER", "5"))
     min_new_candidates = int(os.getenv("US_ENTRY_MIN_NEW_PRICE_LOOKUP", "8"))
-    max_total_lookup = int(os.getenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20"))
+    max_total_lookup = max(0, int(os.getenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20")))
     lookup_limit = min(max_total_lookup, max(max_new_entries + price_lookup_buffer, min_new_candidates))
     
     # Precomputed score가 있는지 확인 (watchlist가 locked되어 있는 경우)
@@ -566,6 +566,9 @@ def generate_entry_intents(
     candidates: list[tuple[float, str, str, float | None, dict | None]] = []  # (score, symbol, exchange, price, entry_meta)
     seen_symbols: set[str] = set()  # 중복 symbol 차단용
     held_skipped = 0  # 보유종목으로 스킵된 수
+    price_lookup_count = 0
+    price_lookup_attempted = 0
+    price_lookup_budget_exhausted = False
 
     for symbol in symbols:
         # symbol이 str인지 확인
@@ -704,7 +707,12 @@ def generate_entry_intents(
             
             canonical_entry["position_state"] = position_state
             # Phase 1: NO price lookup yet (if precomputed score exists)
-            candidates.append((s, symbol, exchange, None, canonical_entry))  # price=None, entry_meta=canonical_entry
+            cached_price = _as_float_or_none(
+                canonical_entry.get("cached_price")
+                or canonical_entry.get("current_price")
+                or canonical_entry.get("current_px")
+            )
+            candidates.append((s, symbol, exchange, cached_price, canonical_entry))
             
         else:
             # Trade fallback must not call KIS dailyprice intraday. Use DB-only
@@ -715,6 +723,12 @@ def generate_entry_intents(
                     raise RuntimeError("locked_watchlist_precomputed_score_required")
                 trade_date = (now.date().isoformat() if now else datetime.now().date().isoformat())
                 daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=260, allow_http_sync=False)
+                price_lookup_attempted += 1
+                if price_lookup_count >= max_total_lookup:
+                    price_lookup_budget_exhausted = True
+                    track_skip(symbol, "price_lookup_budget_exhausted")
+                    continue
+                price_lookup_count += 1
                 current = provider.get_current_price(symbol, exchange)
             except Exception as exc:
                 track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})
@@ -807,7 +821,6 @@ def generate_entry_intents(
 
     intents: list[dict] = []
     added_count = 0
-    price_lookup_count = 0  # 실제 price lookup 횟수 추적
     held_candidates_evaluated_for_add = 0
 
     # Candidate fill loop: a rejected candidate never consumes an accepted
@@ -824,6 +837,14 @@ def generate_entry_intents(
             held_candidates_evaluated_for_add += 1
         # Price lookup (필요한 경우)
         if existing_price is None:
+            price_lookup_attempted += 1
+            if price_lookup_count >= max_total_lookup:
+                price_lookup_budget_exhausted = True
+                track_skip(symbol, "price_lookup_budget_exhausted", {
+                    "price_lookup_used": price_lookup_count,
+                    "price_lookup_limit": max_total_lookup,
+                })
+                continue
             price_lookup_count += 1
             try:
                 current = provider.get_current_price(symbol, exchange)
@@ -1311,5 +1332,9 @@ def generate_entry_intents(
             "backfill_success_count": sum(1 for i, intent in enumerate(intents) if int(intent.get("rank_final30") or i + 1) > i + 1),
             "candidate_pool_exhausted": len(intents) < max_new_entries,
             "price_lookup_count": price_lookup_count,
+            "price_lookup_budget_exhausted": price_lookup_budget_exhausted,
+            "price_lookup_attempted": price_lookup_attempted,
+            "price_lookup_used": price_lookup_count,
+            "price_lookup_limit": max_total_lookup,
         })
     return intents
