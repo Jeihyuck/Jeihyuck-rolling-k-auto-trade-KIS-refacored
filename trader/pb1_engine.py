@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import time
 import subprocess
@@ -1353,6 +1354,110 @@ def _enforce_kr_final_order_invariants(
         "planned_value_sum": planned_sum, "projected_gross_exposure_pct": projected_overlay.get("gross_exposure_pct", 0.0),
         "invariant_valid": valid, "reason": None if valid else "KR_FINAL_ORDER_INVARIANT_BLOCK",
     }
+
+
+def _finalize_kr_order_candidates(
+    candidates: list["CandidateFeature"], *, snapshot: KRRegimeSnapshot,
+    overlay: dict[str, Any], existing_positions: list[dict[str, Any]],
+    base_tick_budget: float, available_cash: float,
+    slots_remaining: int, max_positions: int, existing_positions_count: int,
+    session_kind: str, risk_pct: float, liquidity_participation: float,
+) -> tuple[list["CandidateFeature"], dict[str, Any]]:
+    """Production KR finalization path from local-market candidates to orders."""
+    import math
+
+    mtm_equity_krw = float(overlay.get("portfolio_equity_krw") or 0.0)
+    if mtm_equity_krw <= 0 or not math.isfinite(mtm_equity_krw):
+        return [], {
+            "invariant_valid": False, "reason": "INVALID_PORTFOLIO_EQUITY",
+            "market_budgets": {"KOSPI": 0.0, "KOSDAQ": 0.0},
+            "market_budget_sum": 0.0, "total_tick_cap": 0.0,
+            "planned_value_by_market": {"KOSPI": 0.0, "KOSDAQ": 0.0},
+            "planned_value_sum": 0.0, "final_new_orders": 0,
+            "slots_start": slots_remaining, "projected_gross_exposure_pct": overlay.get("gross_exposure_pct", 0.0),
+        }
+
+    eligible = [
+        candidate for candidate in candidates
+        if market_allows_buy(snapshot, normalize_kr_market(candidate.market or (candidate.features or {}).get("market")))
+    ]
+    candidate_counts = {
+        market: sum(1 for candidate in eligible if normalize_kr_market(candidate.market) == market)
+        for market in ("KOSPI", "KOSDAQ")
+    }
+    total_tick_cap = min(float(available_cash or 0.0), float(base_tick_budget) * snapshot.execution_policy.budget_multiplier)
+    market_budgets = calculate_market_budgets(
+        snapshot, float(base_tick_budget), float(available_cash or 0.0), candidate_counts,
+    )
+    sized_candidates: list[CandidateFeature] = []
+    remaining_slots = max(0, int(slots_remaining))
+    for market in ("KOSPI", "KOSDAQ"):
+        market_candidates = [candidate for candidate in eligible if normalize_kr_market(candidate.market) == market]
+        policy = snapshot.market_policies[market]
+        per_position_budget, sizing_meta = _compute_kr_per_position_budget(
+            tick_budget=market_budgets[market], orderable_count=len(market_candidates),
+            slots_remaining=remaining_slots, session_kind=session_kind,
+            policy_max_new_positions=policy.max_new_positions,
+        )
+        effective_target = int(sizing_meta["actual_target"])
+        rebuilt = _recalculate_kr_orderable_quantities(
+            market_candidates[:effective_target], per_position_budget=per_position_budget,
+            account_equity=mtm_equity_krw, risk_pct=risk_pct,
+            liquidity_participation=liquidity_participation,
+        )
+        sized_candidates.extend(rebuilt)
+        remaining_slots -= len(rebuilt)
+
+    finalized, meta = _enforce_kr_final_order_invariants(
+        sized_candidates, snapshot=snapshot, base_overlay=overlay,
+        existing_positions=existing_positions, market_budgets=market_budgets,
+        total_tick_cap=total_tick_cap, slots_remaining_at_tick_start=slots_remaining,
+        max_positions=max_positions, existing_positions_count=existing_positions_count,
+        available_cash=available_cash,
+    )
+    meta.update({
+        "market_budgets": market_budgets, "market_budget_sum": sum(market_budgets.values()),
+        "total_tick_cap": total_tick_cap, "candidate_counts": candidate_counts,
+        "mtm_equity_krw": mtm_equity_krw,
+    })
+    composite_valid = (
+        bool(meta["invariant_valid"])
+        and meta["market_budget_sum"] <= total_tick_cap + .01
+        and float(meta["planned_value_sum"]) <= float(available_cash or 0.0) + .01
+    )
+    meta["invariant_valid"] = composite_valid
+    if not composite_valid:
+        meta["reason"] = meta.get("reason") or "COMPOSITE_INVARIANT_FAILURE"
+        return [], meta
+    return finalized, meta
+
+
+def _submit_finalized_order_candidates(
+    candidates: list["CandidateFeature"], *, submitter: Any,
+    pre_submit_gate: Any | None = None,
+) -> dict[str, Any]:
+    """Single production submission seam, injectable with a fake KIS submitter."""
+    counts = {"attempted": 0, "api_submitted": 0, "accepted": 0, "filled": 0,
+              "rejected": 0, "skipped": 0, "failed": 0}
+    results = []
+    for candidate in candidates:
+        if pre_submit_gate is not None and not pre_submit_gate(candidate):
+            counts["skipped"] += 1
+            continue
+        try:
+            status = submitter(candidate)
+            results.append(status)
+            counts["attempted"] += int(status.get("submit_attempted", 0) or 0)
+            counts["api_submitted"] += int(status.get("api_submitted", 0) or 0)
+            counts["accepted"] += int(status.get("accepted", 0) or 0)
+            counts["filled"] += int(status.get("filled", 0) or 0)
+            counts["rejected"] += int(status.get("rejected", 0) or 0)
+            counts["skipped"] += int(status.get("skipped", 0) or 0)
+            counts["failed"] += int(status.get("failed", 0) or 0)
+        except Exception:
+            counts["failed"] += 1
+            logger.exception("[ORDER][SUBMIT][ERROR] code=%s", candidate.code)
+    return {**counts, "results": results}
 
 
 def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | None) -> int:
@@ -17296,40 +17401,25 @@ class PB1Engine:
                         logger.info("[KR_REGIME][ENTRY_GATE] symbol=%s market=%s result=PASS", cf.code, normalized_market)
                         kept_orderable.append(cf)
                 logger.info("[KR_MARKET_STATE][ENTRY_FILTER_APPLIED] before=%s after=%s market_state=%s", len(orderable_candidates), len(kept_orderable), overlay.get("market_state"))
-                sized_candidates = []
                 base_tick_budget = float(getattr(self, "_kr_base_tick_budget_krw", tick_budget_krw) or tick_budget_krw)
-                candidate_counts = {market: sum(1 for c in kept_orderable if normalize_kr_market(getattr(c, "market", "")) == market) for market in ("KOSPI", "KOSDAQ")}
-                total_tick_cap = min(float(available_cash_krw or 0), base_tick_budget * snapshot.execution_policy.budget_multiplier)
-                market_budgets = calculate_market_budgets(snapshot, base_tick_budget, float(available_cash_krw or 0), candidate_counts)
-                logger.info("[KR_REGIME][TOTAL_TICK_BUDGET] base_tick_budget=%.0f global_multiplier=%.2f available_cash=%.0f total_tick_cap=%.0f", base_tick_budget, snapshot.execution_policy.budget_multiplier, float(available_cash_krw or 0), total_tick_cap)
-                remaining_slots = slots_remaining
-                for market in ("KOSPI", "KOSDAQ"):
-                    market_candidates = [c for c in kept_orderable if normalize_kr_market(getattr(c, "market", "")) == market]
-                    market_policy = snapshot.market_policies[market]
-                    market_tick_budget = market_budgets[market]
-                    logger.info("[KR_REGIME][MARKET_BUDGET] market=%s candidate_count=%s policy_multiplier=%.2f allocated_budget=%.0f", market, candidate_counts[market], market_policy.budget_multiplier, market_tick_budget)
-                    per_position_budget, sizing_meta = _compute_kr_per_position_budget(
-                        tick_budget=market_tick_budget, orderable_count=len(market_candidates), slots_remaining=remaining_slots,
-                        session_kind=session_kind, policy_max_new_positions=market_policy.max_new_positions)
-                    effective_target = int(sizing_meta["actual_target"]) if market_candidates else 0
-                    market_candidates = _recalculate_kr_orderable_quantities(
-                        market_candidates[:effective_target], per_position_budget=per_position_budget,
-                        account_equity=float(getattr(self, "_equity_krw", 0.0) or available_cash_krw), risk_pct=float(RISK_PER_TRADE_PCT),
-                        liquidity_participation=float(os.getenv("PB1_KR_LIQUIDITY_PARTICIPATION", ".01")))
-                    sized_candidates.extend(market_candidates); remaining_slots -= len(market_candidates)
-                    logger.info("[KR_REGIME][SIZING] market=%s tick_budget=%.0f orderable_count=%s slots_remaining=%s policy_max=%s effective_target=%s per_position_budget=%.0f", market, market_tick_budget, len(market_candidates), remaining_slots, market_policy.max_new_positions, effective_target, per_position_budget)
-                orderable_candidates, final_invariants = _enforce_kr_final_order_invariants(
-                    sized_candidates, snapshot=snapshot, base_overlay=overlay,
+                orderable_candidates, final_invariants = _finalize_kr_order_candidates(
+                    kept_orderable, snapshot=snapshot, overlay=overlay,
                     existing_positions=getattr(self, "_kr_overlay_positions", existing_positions),
-                    market_budgets=market_budgets, total_tick_cap=total_tick_cap,
-                    slots_remaining_at_tick_start=slots_remaining, max_positions=max_positions,
-                    existing_positions_count=existing_positions_count,
-                    available_cash=float(available_cash_krw or 0.0),
+                    base_tick_budget=base_tick_budget, available_cash=float(available_cash_krw or 0.0),
+                    slots_remaining=slots_remaining, max_positions=max_positions,
+                    existing_positions_count=existing_positions_count, session_kind=session_kind,
+                    risk_pct=float(RISK_PER_TRADE_PCT),
+                    liquidity_participation=float(os.getenv("PB1_KR_LIQUIDITY_PARTICIPATION", ".01")),
                 )
                 planned_sum = float(final_invariants["planned_value_sum"])
                 planned_by_market = dict(final_invariants["planned_value_by_market"])
-                budget_sum = sum(market_budgets.values())
-                invariant_valid = bool(final_invariants["invariant_valid"]) and budget_sum <= total_tick_cap + .01 and planned_sum <= float(available_cash_krw or 0) + .01
+                market_budgets = dict(final_invariants["market_budgets"])
+                budget_sum = float(final_invariants["market_budget_sum"])
+                total_tick_cap = float(final_invariants["total_tick_cap"])
+                invariant_valid = bool(final_invariants["invariant_valid"])
+                logger.info("[KR_REGIME][TOTAL_TICK_BUDGET] base_tick_budget=%.0f global_multiplier=%.2f available_cash=%.0f total_tick_cap=%.0f mtm_equity=%.0f", base_tick_budget, snapshot.execution_policy.budget_multiplier, float(available_cash_krw or 0), total_tick_cap, float(final_invariants.get("mtm_equity_krw") or 0))
+                for market in ("KOSPI", "KOSDAQ"):
+                    logger.info("[KR_REGIME][MARKET_BUDGET] market=%s candidate_count=%s allocated_budget=%.0f", market, int((final_invariants.get("candidate_counts") or {}).get(market, 0)), float(market_budgets.get(market, 0)))
                 if not invariant_valid:
                     logger.error("[KR_REGIME][BUDGET_INVARIANT][BLOCK] reason=%s total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f", final_invariants.get("reason") or "COMPOSITE_INVARIANT_FAILURE", total_tick_cap, budget_sum, planned_sum)
                     for candidate in orderable_candidates:
@@ -17337,7 +17427,7 @@ class PB1Engine:
                     orderable_candidates = []
                     final_invariants["final_new_orders"] = 0
                 logger.info("[KR_REGIME][BUDGET_INVARIANT] total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f planned_kospi=%.0f planned_kosdaq=%.0f slots_start=%s final_new_orders=%s projected_gross=%.4f valid=%s", total_tick_cap, budget_sum, planned_sum, planned_by_market["KOSPI"], planned_by_market["KOSDAQ"], final_invariants["slots_start"], final_invariants["final_new_orders"], final_invariants["projected_gross_exposure_pct"], int(invariant_valid))
-                atomic_json_write("artifacts/kr_market_budget.json", {"as_of": str(getattr(self, "_now_kst", None) or now_kst()), "base_tick_budget": base_tick_budget, "global_multiplier": snapshot.execution_policy.budget_multiplier, "total_tick_cap": total_tick_cap, "available_cash": float(available_cash_krw or 0), "market_budgets": market_budgets, "market_budget_sum": budget_sum, "planned_value_by_market": planned_by_market, "planned_value_sum": planned_sum, "slots_remaining_at_tick_start": final_invariants["slots_start"], "final_new_orders": final_invariants["final_new_orders"], "projected_gross_exposure_pct": final_invariants["projected_gross_exposure_pct"], "invariant_valid": invariant_valid})
+                atomic_json_write("artifacts/kr_market_budget.json", {"as_of": str(getattr(self, "_now_kst", None) or now_kst()), "base_tick_budget": base_tick_budget, "global_multiplier": snapshot.execution_policy.budget_multiplier, "total_tick_cap": total_tick_cap, "available_cash": float(available_cash_krw or 0), "mtm_equity_krw": float(final_invariants.get("mtm_equity_krw") or 0), "market_budgets": market_budgets, "market_budget_sum": budget_sum, "planned_value_by_market": planned_by_market, "planned_value_sum": planned_sum, "slots_remaining_at_tick_start": final_invariants["slots_start"], "final_new_orders": final_invariants["final_new_orders"], "projected_gross_exposure_pct": final_invariants["projected_gross_exposure_pct"], "invariant_valid": invariant_valid, "invariant_reason": final_invariants.get("reason")})
             orderable_codes = [c.code for c in orderable_candidates]
             self._last_orderable_codes = set(orderable_codes)
             actual_buyable_ok_count = len(buyable_ok_codes)
@@ -17783,44 +17873,31 @@ class PB1Engine:
                         )
                         skipped_count = len(orderable_candidates)
                     else:
-                        for cf in orderable_candidates:
-                            try:
-                                buy_allowed, buy_block_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(now_kst())
-                                if not buy_allowed:
-                                    logger.warning(
-                                        "[ORDER][PRE_SUBMIT][BLOCK] side=BUY code=%s reason=%s now=%s cutoff=%s",
-                                        cf.code,
-                                        buy_block_reason,
-                                        now_kst().isoformat(),
-                                        runtime_cutoff_dt.isoformat(),
-                                    )
-                                    skipped_count += 1
-                                    continue
-                                logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
-                                if self.window_internal == "close":
-                                    order_status = self._place_entry_close(cf)
-                                else:
-                                    order_status = self._place_entry(cf)
-                                terminal_event = str(order_status.get("terminal_event") or "")
-                                if terminal_event not in {"API_RESULT", "FINAL_SKIP"}:
-                                    raise RuntimeError(
-                                        f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}"
-                                    )
-                                attempted_count += int(order_status.get("submit_attempted", 0) or 0)
-                                api_submitted_count += int(order_status.get("api_submitted", 0) or 0)
-                                accepted_count += int(order_status.get("accepted", 0) or 0)
-                                filled_count += int(order_status.get("filled", 0) or 0)
-                                rejected_count += int(order_status.get("rejected", 0) or 0)
-                                skipped_count += int(order_status.get("skipped", 0) or 0)
-                                failed_count += int(order_status.get("failed", 0) or 0)
-                            except Exception as e:
-                                failed_count += 1
-                                logger.exception(
-                                    "[ORDER][SUBMIT][ERROR] trace=%s code=%s error=%s",
-                                    trace_id,
-                                    cf.code,
-                                    str(e),
-                                )
+                        def _pre_submit_gate(cf: CandidateFeature) -> bool:
+                            buy_allowed, buy_block_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(now_kst())
+                            if not buy_allowed:
+                                logger.warning("[ORDER][PRE_SUBMIT][BLOCK] side=BUY code=%s reason=%s now=%s cutoff=%s", cf.code, buy_block_reason, now_kst().isoformat(), runtime_cutoff_dt.isoformat())
+                            return buy_allowed
+
+                        def _submit_candidate(cf: CandidateFeature) -> dict[str, Any]:
+                            logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
+                            status = self._place_entry_close(cf) if self.window_internal == "close" else self._place_entry(cf)
+                            terminal_event = str(status.get("terminal_event") or "")
+                            if terminal_event not in {"API_RESULT", "FINAL_SKIP"}:
+                                raise RuntimeError(f"missing terminal submit event for code={cf.code} terminal_event={terminal_event or 'none'}")
+                            return status
+
+                        submit_result = _submit_finalized_order_candidates(
+                            orderable_candidates, submitter=_submit_candidate,
+                            pre_submit_gate=_pre_submit_gate,
+                        )
+                        attempted_count = int(submit_result["attempted"])
+                        api_submitted_count = int(submit_result["api_submitted"])
+                        accepted_count = int(submit_result["accepted"])
+                        filled_count = int(submit_result["filled"])
+                        rejected_count = int(submit_result["rejected"])
+                        skipped_count = int(submit_result["skipped"])
+                        failed_count = int(submit_result["failed"])
                     dt_order_submit = time.monotonic() - t_order_submit
                 submit_success_count = api_submitted_count
                 logger.info(
@@ -17976,7 +18053,15 @@ class PB1Engine:
                         if last_volume < vol20 * self.minervini_config.breakout_vol_mult_20:
                             continue
                         stop_price = float(pos.get("stop_price") or initial_stop)
-                        risk_krw = float(self._equity_krw or 0.0) * float(self.minervini_config.risk_pct_of_equity) * float(
+                        risk_equity_krw = (
+                            float((getattr(self, "_kr_market_state_overlay", None) or {}).get("portfolio_equity_krw") or 0.0)
+                            if self._is_kr_equity_context()
+                            else float(self._equity_krw or 0.0)
+                        )
+                        if risk_equity_krw <= 0 or not math.isfinite(risk_equity_krw):
+                            logger.error("[KR_REGIME][ENTRY_GATE] symbol=%s result=BLOCK reason=INVALID_PORTFOLIO_EQUITY stage=add_on_risk", code)
+                            continue
+                        risk_krw = risk_equity_krw * float(self.minervini_config.risk_pct_of_equity) * float(
                             self.minervini_config.add_on_size_frac
                         )
                         max_cap = min(remaining_budget, float(PB1_MAX_POS_PCT) * float(tick_budget_krw))
