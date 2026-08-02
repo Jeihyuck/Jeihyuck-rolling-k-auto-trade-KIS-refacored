@@ -28,14 +28,17 @@ def compute_rs_composite(rs_3m: float, rs_6m: float, w1: float, w2: float) -> fl
 
 def rank_rs(
     universe_prices: dict[str, pd.Series],
-    bench_prices: pd.Series,
+    bench_prices: pd.Series | None = None,
     lookback_days: int = 63,
     lookback2_days: int = 126,
     w1: float = 0.6,
     w2: float = 0.4,
+    *,
+    benchmark_prices_by_market: dict[str, pd.Series] | None = None,
+    ticker_markets: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     min_len = max(lookback_days, lookback2_days) + 1
-    if bench_prices is None or len(bench_prices) < min_len:
+    if benchmark_prices_by_market is None and (bench_prices is None or len(bench_prices) < min_len):
         logger.warning(
             "[RS][RANK][SKIP] bench_missing=1 len=%s required=%s",
             len(bench_prices) if bench_prices is not None else 0,
@@ -48,10 +51,17 @@ def rank_rs(
         return pd.DataFrame(rows)
     rows: list[dict] = []
     for ticker, series in universe_prices.items():
-        rs_3m = compute_rs(series, bench_prices, lookback_days)
-        rs_6m = compute_rs(series, bench_prices, lookback2_days)
+        market = str((ticker_markets or {}).get(ticker) or "").upper()
+        selected_bench = bench_prices
+        benchmark = None
+        if benchmark_prices_by_market is not None:
+            normalized = "KOSPI" if market in {"KOSPI", "KS", "P"} else "KOSDAQ" if market in {"KOSDAQ", "KQ", "Q"} else ""
+            selected_bench = benchmark_prices_by_market.get(normalized)
+            benchmark = "069500" if normalized == "KOSPI" else "229200" if normalized == "KOSDAQ" else None
+        rs_3m = compute_rs(series, selected_bench, lookback_days)
+        rs_6m = compute_rs(series, selected_bench, lookback2_days)
         composite = compute_rs_composite(rs_3m, rs_6m, w1, w2)
-        rows.append({"ticker": ticker, "rs": rs_3m, "rs6m": rs_6m, "composite": composite})
+        rows.append({"ticker": ticker, "market": market, "benchmark": benchmark, "rs": rs_3m, "rs6m": rs_6m, "composite": composite})
 
     df = pd.DataFrame(rows)
     if df.empty:

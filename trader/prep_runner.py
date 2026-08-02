@@ -76,6 +76,9 @@ from trader.kr.artifacts import publish_kr_prep_artifacts_core_fast, quarantine_
 # Core path intentionally replaces legacy publish_kr_prep_artifacts_atomic( DB-verifying call.
 from trader.contracts.final30_contract import assert_final30_contract
 from trader.kr.market_scope import is_kr_market
+from trader.kr.regime_runtime import calculate_market_breadth
+from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ
+from trader.kr.regime import KR_REGIME_REQUIRED_SYMBOLS
 from trader.runtime_paths import build_final30_scored_paths, get_final30_artifact_paths, repo_root
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
@@ -235,6 +238,8 @@ FINAL30_SCORED_EXPORT_COLS = [
     "ma150",
     "pullback_pct",
     "entry_style_selected",
+    "market", "market_code", "rs_benchmark", "return_1d", "return_5d",
+    "above_ma20", "above_ma50", "volume_avg20",
 ]
 FINAL30_STRICT_REQUIRED_FIELDS = [
     "code",
@@ -250,6 +255,7 @@ FINAL30_STRICT_REQUIRED_FIELDS = [
     "tech_score",
     "score_final",
     "entry_style_selected",
+    "market", "rs_benchmark", "return_1d", "return_5d", "volume_avg20",
 ]
 
 def _env_true(name: str, default: str = "0") -> bool:
@@ -803,6 +809,15 @@ def decide_prep_trade_gate(hard_fail_reasons: list[str] | None, soft_fail_reason
 
 def _strict_validate_final30_rows(rows: list[dict[str, Any]], *, source: str) -> dict[str, Any]:
     _log_entry_style_distribution(rows, prefix="PREP")
+    for raw in rows:
+        row = normalize_final30_contract_row(raw)
+        missing = []
+        if row.get("market") in (None, "", "UNKNOWN"): missing.append("market")
+        for field in ("return_1d", "return_5d"):
+            if row.get(field) is None: missing.append(field)
+        if not row.get("volume_avg20") or float(row.get("volume_avg20") or 0) <= 0: missing.append("volume_avg20")
+        if missing:
+            logger.error("[FINAL30][KR_REGIME_CONTRACT_BLOCKED] code=%s missing=%s", row.get("code"), ",".join(missing))
     result = verify_final30_scored_rows(
         rows,
         required_rows=FINAL30_SCORED_REQUIRED_ROWS,
@@ -1450,9 +1465,6 @@ def main() -> int:
         logger.error("[PREP][FAIL] universe empty")
         return 1
 
-    # ---- RS benchmark handling (229200 etc.) ----
-    bench = os.getenv("RS_BENCHMARK", "229200").strip()
-
     # Universe symbols (strict str list for downstream typed functions)
     symbols: list[str] = []
     for member in members:
@@ -1462,9 +1474,10 @@ def main() -> int:
             if code_norm:
                 symbols.append(code_norm)
 
-    # Ensure benchmark included for downstream RS/Stage_B computations
-    if bench and bench not in symbols:
-        symbols.append(bench)
+    # Prefetch both real ETF benchmarks used by market-specific RS ranking.
+    for regime_symbol in KR_REGIME_REQUIRED_SYMBOLS:
+        if regime_symbol not in symbols:
+            symbols.append(regime_symbol)
 
     t_ohlcv = time.monotonic()
     logger.info("[PREP][HEARTBEAT] stage=ohlcv_prefetch status=start")
@@ -1557,6 +1570,7 @@ def main() -> int:
         env=env,
         as_of=effective_as_of,
         lookback_days=int(os.getenv("MINERVINI_OHLCV_DAYS", "520")),
+        symbol_markets={str(m.get("code") or "").zfill(6): str(m.get("market") or m.get("market_code") or "") for m in members},
     )
     dt_derived = time.monotonic() - t_derived
     logger.info("[PREP][HEARTBEAT] stage=derived_minervini status=done")
@@ -2428,6 +2442,16 @@ def main() -> int:
         final30_paths["signals"],
         int(len(final30_scored_df_for_export)),
     )
+
+    breadth_candidates = list(watchlist_bundle.get("universe_scored", []) or [])
+    breadth_source = "broader_scored_universe"
+    if not breadth_candidates:
+        breadth_candidates = list(watchlist_bundle.get("pool120", []) or []); breadth_source = "candidate_pool120"
+    if not breadth_candidates:
+        breadth_candidates = list(watchlist_bundle.get("top50", []) or []); breadth_source = "top50"
+    if not breadth_candidates:
+        breadth_candidates = final30_scored_df_for_export.to_dict("records"); breadth_source = "final30_fallback"
+    calculate_market_breadth(breadth_candidates, as_of=str(effective_as_of), source=breadth_source)
 
     frames = {
         "universe_scored": pd.DataFrame(watchlist_bundle.get("universe_scored", [])),

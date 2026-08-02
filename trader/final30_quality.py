@@ -12,10 +12,18 @@ from trader.indicators import safe_nullable_float
 
 
 FINAL30_PRESERVE_FIELDS = (
+    "market",
+    "market_code",
+    "rs_benchmark",
     "close",
     "ma20",
     "ma50",
     "ma150",
+    "return_1d",
+    "return_5d",
+    "above_ma20",
+    "above_ma50",
+    "volume_avg20",
     "atr_pct",
     "rs_percentile",
     "breakout_score",
@@ -171,12 +179,19 @@ def normalize_final30_contract_row(row: dict[str, Any] | None) -> dict[str, Any]
         meta.get("entry_style"),
     )
     out["entry_component"] = _pick_string(out.get("entry_component"), meta.get("entry_component"))
+    from trader.kr.regime import normalize_kr_market
+    out["market"] = normalize_kr_market(out.get("market") or out.get("market_code") or meta.get("market") or meta.get("market_code"))
+    out["market_code"] = out["market"]
+    out["rs_benchmark"] = _pick_string(out.get("rs_benchmark"), meta.get("rs_benchmark"))
 
     numeric_aliases: dict[str, tuple[Any, ...]] = {
         "close": (out.get("close"), meta.get("close"), out.get("last_close"), meta.get("last_close")),
         "ma20": (out.get("ma20"), meta.get("ma20")),
         "ma50": (out.get("ma50"), meta.get("ma50")),
         "ma150": (out.get("ma150"), meta.get("ma150")),
+        "return_1d": (out.get("return_1d"), meta.get("return_1d")),
+        "return_5d": (out.get("return_5d"), meta.get("return_5d")),
+        "volume_avg20": (out.get("volume_avg20"), out.get("avg_volume20"), out.get("vol20"), meta.get("volume_avg20"), meta.get("vol20")),
         "atr_pct": (out.get("atr_pct"), meta.get("atr_pct")),
         "rs_percentile": (out.get("rs_percentile"), out.get("rs_pctile"), meta.get("rs_percentile"), meta.get("rs_pctile")),
         "rs_pctile": (out.get("rs_pctile"), out.get("rs_percentile"), meta.get("rs_pctile"), meta.get("rs_percentile")),

@@ -209,6 +209,8 @@ FINAL30_SCORED_DB_CONTRACT_FIELDS = [
     "reasons",
     "filters_passed",
     "filters_failed",
+    "market", "market_code", "rs_benchmark", "return_1d", "return_5d",
+    "above_ma20", "above_ma50", "volume_avg20",
 ]
 
 FINAL30_SCORED_REQUIRED_ROWS = 30

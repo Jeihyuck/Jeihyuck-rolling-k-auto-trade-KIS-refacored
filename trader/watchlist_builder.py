@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from sqlalchemy import Engine
 
-from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
+from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
 from trader.constants import (
     CRITICAL_SCORED_COLS,
     FINAL30_SCORED_IDENTITY_COLS,
@@ -51,6 +51,7 @@ from trader.factors.multifactor import (
     optimize_meta_k,
 )
 from trader.indicators import compute_atr_pct_from_ohlcv, compute_ma20_from_ohlcv, safe_nullable_float
+from trader.kr.regime import normalize_kr_market
 from trader.score_columns import resolve_score_column
 from trader.time_coerce import to_date
 
@@ -2216,11 +2217,15 @@ class WatchlistBuilder:
         )
         return filled[:target_n], degrade_meta
 
-    def _base_item(self, code: str, *, name: str = "", as_of: Optional[date] = None) -> Dict[str, Any]:
+    def _base_item(self, code: str, *, name: str = "", as_of: Optional[date] = None, market: str = "UNKNOWN") -> Dict[str, Any]:
+        normalized_market = normalize_kr_market(market)
         return {
             "as_of": as_of.isoformat() if isinstance(as_of, date) else "",
             "code": code,
             "name": name,
+            "market": normalized_market,
+            "market_code": normalized_market,
+            "rs_benchmark": RS_BENCHMARK_KOSPI if normalized_market == "KOSPI" else RS_BENCHMARK_KOSDAQ if normalized_market == "KOSDAQ" else None,
             "rank": None,
             "score": None,
             "liq_avg": 0.0,
@@ -2252,6 +2257,17 @@ class WatchlistBuilder:
         }
 
     def _normalize_item(self, item: Dict[str, Any], *, score_key: str, rank_key: str) -> Dict[str, Any]:
+        source_meta = dict(item.get("meta") or {})
+        normalized_market = normalize_kr_market(item.get("market") or item.get("market_code") or source_meta.get("market") or source_meta.get("market_code"))
+        rs_benchmark = item.get("rs_benchmark") or source_meta.get("rs_benchmark")
+        regime_fields = {
+            "market": normalized_market, "market_code": normalized_market, "rs_benchmark": rs_benchmark,
+            "close": item.get("close") if item.get("close") is not None else item.get("last_close"),
+            "ma20": item.get("ma20"), "ma50": item.get("ma50"),
+            "return_1d": item.get("return_1d"), "return_5d": item.get("return_5d"),
+            "above_ma20": item.get("above_ma20"), "above_ma50": item.get("above_ma50"),
+            "volume_avg20": item.get("volume_avg20") or item.get("avg_volume20") or item.get("vol20"),
+        }
         score_val = float(item.get(score_key, 0.0) or 0.0)
         rank_val = item.get(rank_key) or item.get("rank")
         reject_reasons = list(item.get("reject_reasons", []) or [])
@@ -2415,6 +2431,7 @@ class WatchlistBuilder:
         meta["breakout_pass"] = breakout_pass
         meta["pullback_pass"] = pullback_pass
         meta["momentum_pass"] = momentum_pass
+        meta.update(regime_fields)
         return {
             "as_of": str(item.get("as_of") or ""),
             "code": str(item.get("code") or "").zfill(6),
@@ -2455,6 +2472,7 @@ class WatchlistBuilder:
             "score_tech": score_tech,
             "score_flow": score_flow,
             "score_final": score_final,
+            **regime_fields,
         }
 
     def _stage_a_liquidity_filter(self, members: List[Dict[str, Any]], as_of: date) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -2479,7 +2497,7 @@ class WatchlistBuilder:
             if not code:
                 continue
 
-            item = self._base_item(code, name=str(m.get("name") or ""), as_of=as_of)
+            item = self._base_item(code, name=str(m.get("name") or ""), as_of=as_of, market=m.get("market") or m.get("market_code"))
 
             try:
                 df, _meta = self.ohlcv_provider(code, count=max(self.min_rows, self.liq_days + 30, 260))
@@ -2542,10 +2560,14 @@ class WatchlistBuilder:
                 item.setdefault("reject_reasons", []).append("ma20_missing")
             item["volume"] = volume_last
             item["volume_avg20"] = volume_avg20
+            item["return_1d"] = float(close_series.iloc[-1] / close_series.iloc[-2] - 1.0) if len(close_series) >= 2 else None
+            item["return_5d"] = float(close_series.iloc[-1] / close_series.iloc[-6] - 1.0) if len(close_series) >= 6 else None
+            item["above_ma20"] = bool(ma20 is not None and float(last_close) > ma20)
+            item["above_ma50"] = bool(ma50 is not None and float(last_close) > ma50)
             item["trading_value"] = trading_value
             item["turnover_pct"] = float(turnover_pct)
             item["liquidity_score"] = compute_liquidity_score(float(liq_avg), float(turnover_pct))
-            item["meta"] = {"as_of": as_of.isoformat()}
+            item["meta"] = {"as_of": as_of.isoformat(), "market": item["market"], "market_code": item["market_code"], "rs_benchmark": item["rs_benchmark"]}
             candidates.append(item)
             universe_items.append(item)
 
@@ -2577,15 +2599,17 @@ class WatchlistBuilder:
             logger.warning("[WATCHLIST][PIPELINE][B_TOP50] kept=0 from=0")
             return []
 
-        try:
-            bench_df, _ = self.ohlcv_provider(RS_BENCHMARK, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
-            bench_df = _normalize_ohlcv_columns(bench_df if bench_df is not None else pd.DataFrame())
-            if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
-                raise ValueError(f"benchmark {RS_BENCHMARK} empty")
-            bench_close = bench_df["close"]
-        except Exception as exc:
-            logger.error("[WATCHLIST][PIPELINE][B_TOP50][BENCH_FAIL] err=%s", exc)
-            bench_close = None
+        bench_closes: dict[str, pd.Series | None] = {}
+        for market, benchmark in (("KOSPI", RS_BENCHMARK_KOSPI), ("KOSDAQ", RS_BENCHMARK_KOSDAQ)):
+            try:
+                bench_df, _ = self.ohlcv_provider(benchmark, count=max(RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, 260) + 10)
+                bench_df = _normalize_ohlcv_columns(bench_df if bench_df is not None else pd.DataFrame())
+                if bench_df is None or bench_df.empty or "close" not in bench_df.columns:
+                    raise ValueError(f"benchmark {benchmark} empty")
+                bench_closes[market] = bench_df["close"]
+            except Exception as exc:
+                logger.error("[WATCHLIST][PIPELINE][B_TOP50][BENCH_FAIL] market=%s err=%s", market, exc)
+                bench_closes[market] = None
 
         rs_min_pctile = float(self.minervini_config.get("rs_min_pctile", RS_MIN_PCTILE))
         if rs_min_pctile <= 1.0:
@@ -2624,6 +2648,14 @@ class WatchlistBuilder:
                 item["reject_reasons"] = reject_reasons
                 continue
 
+            raw_market = str(item.get("market") or item.get("market_code") or "").upper()
+            market = "KOSPI" if raw_market in {"KOSPI", "KS", "P"} else "KOSDAQ" if raw_market in {"KOSDAQ", "KQ", "Q"} else ""
+            bench_close = bench_closes.get(market)
+            if not market or bench_close is None:
+                reject_reasons.append("unknown_market_rs_benchmark")
+                item["reject_reasons"] = reject_reasons
+                continue
+            item["rs_benchmark"] = RS_BENCHMARK_KOSPI if market == "KOSPI" else RS_BENCHMARK_KOSDAQ
             rs_pctile = self._compute_rs_percentile(df["close"], bench_close)
             rs_features = compute_rs_features(df["close"], bench_close)
             vcp_score = self._compute_vcp_score(df)

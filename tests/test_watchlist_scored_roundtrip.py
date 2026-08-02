@@ -63,6 +63,11 @@ def _scored_member(idx: int) -> dict:
         "close": 50000,
         "volume": 100000,
         "volume_avg20": 90000,
+        "market": "KOSPI" if idx % 2 else "KOSDAQ",
+        "market_code": "KOSPI" if idx % 2 else "KOSDAQ",
+        "rs_benchmark": "069500" if idx % 2 else "229200",
+        "return_1d": 0.01, "return_5d": 0.03,
+        "above_ma20": True, "above_ma50": True,
         "ma20": 49000,
         "ma50": 47000,
         "ma150": 43000,
@@ -103,6 +108,10 @@ def test_scored_watchlist_roundtrip_preserves_critical_columns() -> None:
     assert len(loaded) == 30
     df = pd.DataFrame(loaded)
     assert set(CRITICAL_SCORED_COLS).issubset(set(df.columns))
+    assert set(df["market"]) == {"KOSPI", "KOSDAQ"}
+    assert df["return_1d"].notna().all() and df["return_5d"].notna().all()
+    assert (df["volume_avg20"] > 0).all()
+    assert set(df["rs_benchmark"]) == {"069500", "229200"}
 
     summary = verify_final30_scored_contract(
         engine,

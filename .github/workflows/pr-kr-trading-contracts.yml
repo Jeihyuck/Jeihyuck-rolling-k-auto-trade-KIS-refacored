@@ -39,6 +39,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -58,6 +61,20 @@ jobs:
           pytest tests/test_kr_session_result_file.py -q
           pytest tests/test_live_gate_refresh_order.py -q
           pytest tests/test_pb1_volume_config_unified.py -q
+
+      - name: New KR regime tests
+        run: |
+          pytest tests/kr/test_kr_regime.py -q
+          pytest tests/kr/test_kr_regime_runtime.py -q
+          pytest tests/kr/test_kr_regime_production_path.py -q
+          pytest tests/kr/test_kr_market_budget_allocation.py -q
+          pytest tests/kr/test_kr_market_local_entry_and_trim.py -q
+          pytest tests/kr/test_kr_final_order_invariants.py -q
+          pytest tests/test_watchlist_scored_roundtrip.py -q
+          pytest tests/kr -q
+
+      - name: Check KR legacy regime removal
+        run: bash scripts/check_kr_legacy_regime.sh
 
       - name: Existing entry and exit tests
         run: |

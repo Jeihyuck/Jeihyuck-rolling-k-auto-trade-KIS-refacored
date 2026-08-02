@@ -1,24 +1,9 @@
 from trader.pb1_engine import PB1Engine
 
 
-def test_pb1_index_context_uses_symbol_fallback(monkeypatch):
-    engine = PB1Engine.__new__(PB1Engine)
-    calls=[]
-    def fake(symbol, lookback):
-        calls.append((symbol, lookback))
-        if symbol in {"KOSPI", "KOSDAQ", "KOSPI200"}:
-            return None
-        return {("KOSPIETF",1):0.01,("KOSPIETF",3):0.02,("KOSDAQETF",1):0.005,("KOSDAQETF",3):0.01,("K200ETF",1):0.006,("K200ETF",3):0.012,("229200",1):0.004,("229200",3):0.008}.get((symbol, lookback))
-    engine._kr_return_from_daily = fake
-    monkeypatch.setenv("KR_INDEX_KOSPI_FALLBACK_PROXY", "KOSPIETF")
-    monkeypatch.setenv("KR_INDEX_KOSDAQ_FALLBACK_PROXY", "KOSDAQETF")
-    monkeypatch.setenv("KR_INDEX_KOSPI200_FALLBACK_PROXY", "K200ETF")
-    ctx = PB1Engine._kr_index_context_for_overlay(engine)
-    assert ctx["kospi_1d_return"] == 0.01
-    assert ctx["kosdaq_3d_return"] == 0.01
-    assert ctx["kospi200_1d_return"] == 0.006
-    assert ctx["kosdaq150_3d_return"] == 0.008
-    assert ("KOSPI", 1) in calls and ("KOSPIETF", 1) in calls
+def test_pb1_regime_path_has_no_literal_index_fallback():
+    assert not hasattr(PB1Engine, "_kr_index_context_for_overlay")
+    assert not hasattr(PB1Engine, "_kr_return_with_symbol_fallbacks")
 
 
 def test_pb1_get_return_public_wrapper_calls_private():

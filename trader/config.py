@@ -337,14 +337,14 @@ CONFIG = {
     "MINERVINI_HEAVY_VOL_MULT": "1.5",
     # Minervini Pro universe/RS
     "UNIVERSE_POOL_SIZE": "200",
-    "RS_BENCHMARK": "229200",
+    "RS_BENCHMARK_KOSPI": "069500",
+    "RS_BENCHMARK_KOSDAQ": "229200",
     "RS_LOOKBACK_DAYS": "63",
     "RS_LOOKBACK2_DAYS": "126",
     "RS_MIN_PCTILE": "60",
     "RS_COMPOSITE_W1": "0.6",
     "RS_COMPOSITE_W2": "0.4",
     # Market regime
-    "REGIME_INDEX": "229200",
     "REGIME_MODE": "RELAXED",
     "REGIME_MA_FAST": "50",
     "REGIME_MA_SLOW": "200",
@@ -474,17 +474,6 @@ CONFIG = {
 
     # === PR49 KR Market State Overlay v2 ===
     "KR_MARKET_STATE_OVERLAY_ENABLE": "1",
-    "KR_INDEX_KOSPI_SYMBOL": "KOSPI",
-    "KR_INDEX_KOSDAQ_SYMBOL": "KOSDAQ",
-    "KR_INDEX_KOSPI200_PROXY": "KOSPI200",
-    "KR_INDEX_KOSDAQ150_PROXY": "229200",
-    "KR_INDEX_KOSPI_FALLBACK_PROXY": "",
-    "KR_INDEX_KOSDAQ_FALLBACK_PROXY": "",
-    "KR_INDEX_KOSPI200_FALLBACK_PROXY": "",
-    "KR_INDEX_KOSDAQ150_FALLBACK_PROXY": "229200",
-    "KR_USE_229200_AS_PRIMARY_REGIME": "0",
-    "KR_USE_229200_AS_GROWTH_PROXY": "1",
-    "KR_LEGACY_REGIME_FALLBACK_ENABLE": "1",
     "KR_SECTOR_PROXY_CONFIG_PATH": "config/kr_sector_proxy_map.json",
     "KR_SECTOR_PROXY_REQUIRE_FOR_RISK_ON": "1",
     "KR_SECTOR_PROXY_MIN_VALID_SOURCES_FOR_RISK_ON": "1",
@@ -1154,13 +1143,22 @@ def _normalize_index_code(raw: str | None, fallback: str) -> str:
     return fallback
 
 
-RS_BENCHMARK = _normalize_index_code(_cfg("RS_BENCHMARK"), _cfg("KOSDAQ_ETF_FALLBACK") or "229200")
+RS_BENCHMARK_KOSPI = (_cfg("RS_BENCHMARK_KOSPI") or "069500").strip()
+RS_BENCHMARK_KOSDAQ = (_cfg("RS_BENCHMARK_KOSDAQ") or "229200").strip()
+
+def get_kr_rs_benchmark(market: str) -> str:
+    normalized = str(market or "").strip().upper()
+    if normalized in {"KOSPI", "KS", "P"}:
+        return RS_BENCHMARK_KOSPI
+    if normalized in {"KOSDAQ", "KQ", "Q"}:
+        return RS_BENCHMARK_KOSDAQ
+    raise ValueError(f"unknown Korean market for RS benchmark: {market!r}")
+
 RS_LOOKBACK_DAYS = int(_cfg("RS_LOOKBACK_DAYS") or "63")
 RS_LOOKBACK2_DAYS = int(_cfg("RS_LOOKBACK2_DAYS") or "126")
 RS_MIN_PCTILE = float(_cfg("RS_MIN_PCTILE") or "60")
 RS_COMPOSITE_W1 = float(_cfg("RS_COMPOSITE_W1") or "0.6")
 RS_COMPOSITE_W2 = float(_cfg("RS_COMPOSITE_W2") or "0.4")
-REGIME_INDEX = _normalize_index_code(_cfg("REGIME_INDEX"), _cfg("KOSDAQ_ETF_FALLBACK") or "229200")
 REGIME_MODE = _cfg("REGIME_MODE") or "STRICT"
 REGIME_MA_FAST = int(_cfg("REGIME_MA_FAST") or "50")
 REGIME_MA_SLOW = int(_cfg("REGIME_MA_SLOW") or "200")
@@ -1570,13 +1568,13 @@ logger.info(
     CANDIDATE_POOL_TTL_DAYS,
 )
 logger.info(
-    "[CONFIG][MINERVINI] universe_pool=%s rs_benchmark=%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_index=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
+    "[CONFIG][MINERVINI] universe_pool=%s rs_benchmarks=%s/%s rs_lookbacks=%s/%s rs_min_pctile=%s regime_mode=%s vcp_lookback=%s vcp_min_score=%s entry_mode=%s risk_pct=%s",
     UNIVERSE_POOL_SIZE,
-    RS_BENCHMARK,
+    RS_BENCHMARK_KOSPI,
+    RS_BENCHMARK_KOSDAQ,
     RS_LOOKBACK_DAYS,
     RS_LOOKBACK2_DAYS,
     RS_MIN_PCTILE,
-    REGIME_INDEX,
     REGIME_MODE,
     VCP_LOOKBACK,
     VCP_MIN_SCORE,

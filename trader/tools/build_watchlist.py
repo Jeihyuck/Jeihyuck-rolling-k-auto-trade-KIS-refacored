@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from sqlalchemy import create_engine
 
-from trader.config import RS_BENCHMARK, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
+from trader.config import RS_BENCHMARK_KOSPI, RS_BENCHMARK_KOSDAQ, RS_LOOKBACK_DAYS, RS_LOOKBACK2_DAYS, RS_MIN_PCTILE
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.db.repos import UniverseRepo
 from trader.kis_wrapper import KisAPI
@@ -77,7 +77,7 @@ def main():
     
     # Minervini config
     minervini_config = {
-        "rs_benchmark": RS_BENCHMARK,
+        "rs_benchmark_by_market": {"KOSPI": RS_BENCHMARK_KOSPI, "KOSDAQ": RS_BENCHMARK_KOSDAQ},
         "rs_lookback": RS_LOOKBACK_DAYS,
         "rs_lookback2": RS_LOOKBACK2_DAYS,
         "rs_min_pctile": RS_MIN_PCTILE,
