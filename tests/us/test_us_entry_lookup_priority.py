@@ -45,6 +45,8 @@ def test_entry_lookup_prioritizes_new_candidates_over_held_candidates(monkeypatc
     )
 
     looked_new = [s for s in provider.lookups if s.startswith("NEW")]
-    assert len(set(looked_new)) >= 8
-    assert provider.lookups[:8] == [f"NEW{i}" for i in range(8)]
-    assert len(provider.lookups) <= 20
+    assert looked_new == ["NEW0"]
+    assert provider.lookups[0] == "NEW0"
+    # Stop as soon as the accepted target is full; when candidates are
+    # rejected, the fill loop instead expands through the remaining pool.
+    assert len(provider.lookups) == 1

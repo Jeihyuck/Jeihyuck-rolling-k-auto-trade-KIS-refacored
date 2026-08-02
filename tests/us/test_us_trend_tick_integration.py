@@ -148,6 +148,7 @@ def test_run_trade_tick_injects_warning_before_exit_and_blocks_existing_buy(monk
     monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
     monkeypatch.setenv("US_ALLOW_LEGACY_PREP_FOR_TEST", "1")
     monkeypatch.setenv("US_ENTRY_EVAL_TIMEOUT_SEC", "3")
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *args, **kwargs: 0.0)
     monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda d: True)
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda now: "REGULAR_MID")
     monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": 5000.0})
@@ -182,4 +183,7 @@ def test_run_trade_tick_injects_warning_before_exit_and_blocks_existing_buy(monk
     assert captured["exit_positions"][0]["trend_state"] == "WARNING"
     assert result["exit_intents"] == 0
     assert result["trend_add_blocked_count"] == 1
-    assert [i["symbol"] for i in routed] == ["NEW"]
+    # A postfilter rejection after the same row passed prefilter is a system
+    # invariant failure: fail all BUYs closed rather than route a partial set.
+    assert routed == []
+    assert result["entry_degraded_reason"] == "candidate_filter_invariant_fail"

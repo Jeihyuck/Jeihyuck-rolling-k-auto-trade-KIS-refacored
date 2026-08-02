@@ -478,6 +478,8 @@ def generate_entry_intents(
     allow_new_symbols: bool = True,
     allow_add_to_existing: bool = True,
     available_new_slots: int | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    intent_acceptor: Any | None = None,
 ) -> list[dict]:
     """진입 intent 목록 생성.
 
@@ -524,7 +526,7 @@ def generate_entry_intents(
     # Price lookup 최적화 설정
     price_lookup_buffer = int(os.getenv("US_ENTRY_PRICE_LOOKUP_BUFFER", "5"))
     min_new_candidates = int(os.getenv("US_ENTRY_MIN_NEW_PRICE_LOOKUP", "8"))
-    max_total_lookup = int(os.getenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20"))
+    max_total_lookup = max(0, int(os.getenv("US_ENTRY_MAX_TOTAL_PRICE_LOOKUP", "20")))
     lookup_limit = min(max_total_lookup, max(max_new_entries + price_lookup_buffer, min_new_candidates))
     
     # Precomputed score가 있는지 확인 (watchlist가 locked되어 있는 경우)
@@ -543,6 +545,8 @@ def generate_entry_intents(
         if details:
             skip_detail.update(details)
         skip_details.append(skip_detail)
+        if diagnostics is not None:
+            diagnostics.setdefault("blocked", []).append({**skip_detail, "block_stage": "intent_generation"})
         
         # Build skip explanation for observability
         entry_data = entries_map.get(symbol, {})
@@ -562,6 +566,9 @@ def generate_entry_intents(
     candidates: list[tuple[float, str, str, float | None, dict | None]] = []  # (score, symbol, exchange, price, entry_meta)
     seen_symbols: set[str] = set()  # 중복 symbol 차단용
     held_skipped = 0  # 보유종목으로 스킵된 수
+    price_lookup_count = 0
+    price_lookup_attempted = 0
+    price_lookup_budget_exhausted = False
 
     for symbol in symbols:
         # symbol이 str인지 확인
@@ -700,7 +707,12 @@ def generate_entry_intents(
             
             canonical_entry["position_state"] = position_state
             # Phase 1: NO price lookup yet (if precomputed score exists)
-            candidates.append((s, symbol, exchange, None, canonical_entry))  # price=None, entry_meta=canonical_entry
+            cached_price = _as_float_or_none(
+                canonical_entry.get("cached_price")
+                or canonical_entry.get("current_price")
+                or canonical_entry.get("current_px")
+            )
+            candidates.append((s, symbol, exchange, cached_price, canonical_entry))
             
         else:
             # Trade fallback must not call KIS dailyprice intraday. Use DB-only
@@ -711,6 +723,12 @@ def generate_entry_intents(
                     raise RuntimeError("locked_watchlist_precomputed_score_required")
                 trade_date = (now.date().isoformat() if now else datetime.now().date().isoformat())
                 daily = provider.get_completed_daily_prices(symbol, exchange, trade_date=trade_date, required_bars=260, allow_http_sync=False)
+                price_lookup_attempted += 1
+                if price_lookup_count >= max_total_lookup:
+                    price_lookup_budget_exhausted = True
+                    track_skip(symbol, "price_lookup_budget_exhausted")
+                    continue
+                price_lookup_count += 1
                 current = provider.get_current_price(symbol, exchange)
             except Exception as exc:
                 track_skip(symbol, "daily_price_unavailable", {"error": str(exc)})
@@ -803,11 +821,14 @@ def generate_entry_intents(
 
     intents: list[dict] = []
     added_count = 0
-    price_lookup_count = 0  # 실제 price lookup 횟수 추적
     held_candidates_evaluated_for_add = 0
 
-    # Price lookup 및 intent 생성 (상위 lookup_limit개만)
+    # Candidate fill loop: a rejected candidate never consumes an accepted
+    # slot.  Evaluate the complete deterministic pool until N intents are
+    # accepted or the pool is exhausted.
     for rank, (score, symbol, exchange, existing_price, entry_meta) in enumerate(candidates):
+        if added_count >= max_new_entries:
+            break
         symbol_upper_for_capacity = str(symbol or "").upper().strip()
         position_state = (entry_meta or {}).get("position_state")
         if not position_state:
@@ -816,15 +837,14 @@ def generate_entry_intents(
             held_candidates_evaluated_for_add += 1
         # Price lookup (필요한 경우)
         if existing_price is None:
-            # Optimization: 상위 lookup_limit개만 price lookup (precomputed score가 있는 경우)
-            if has_precomputed_scores and price_lookup_count >= lookup_limit:
-                logger.debug(
-                    "[US_ENTRY][SKIP] symbol=%s rank=%d reason=beyond_lookup_limit limit=%d",
-                    symbol, rank + 1, lookup_limit
-                )
-                track_skip(symbol, "beyond_lookup_limit", {"rank": rank + 1, "limit": lookup_limit})
-                continue  # 다음 candidate로 (break 아님 - 이미 price 있는 것은 처리)
-
+            price_lookup_attempted += 1
+            if price_lookup_count >= max_total_lookup:
+                price_lookup_budget_exhausted = True
+                track_skip(symbol, "price_lookup_budget_exhausted", {
+                    "price_lookup_used": price_lookup_count,
+                    "price_lookup_limit": max_total_lookup,
+                })
+                continue
             price_lookup_count += 1
             try:
                 current = provider.get_current_price(symbol, exchange)
@@ -847,10 +867,6 @@ def generate_entry_intents(
         else:
             # 이미 price가 있음 (runtime calculation)
             price = existing_price
-
-        if added_count >= max_new_entries:
-            track_skip(symbol, "max_new_entries_reached", {"max_new_entries": max_new_entries})
-            continue
 
         position_state_for_order = position_state or (entry_meta or {}).get("position_state", "NOT_HELD")
         position_action = "ADD_TO_EXISTING_BUY" if position_state_for_order == "HELD" else "NEW_POSITION_BUY"
@@ -1074,6 +1090,18 @@ def generate_entry_intents(
             } if position_state_for_order == "HELD" else {}),
             "score": score,
             "rank": rank + 1,
+            "theme_cluster": (entry_meta or {}).get("theme_cluster"),
+            "source_tags": (entry_meta or {}).get("source_tags"),
+            "sector": (entry_meta or {}).get("sector"),
+            "industry": (entry_meta or {}).get("industry"),
+            "classification_source": (entry_meta or {}).get("theme_cluster_source") or (entry_meta or {}).get("classification_source"),
+            "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
+            "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
+            "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
+            "market_state": (entry_meta or {}).get("market_state"),
+            "market_regime": (entry_meta or {}).get("market_regime"),
+            "blocked_reason": None,
+            "block_stage": None,
             "client_order_key": client_order_key,
             "strategy": "us_pb1",
             "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
@@ -1104,6 +1132,19 @@ def generate_entry_intents(
                 "source": "locked_watchlist",
                 "position_state": position_state_for_order,
                 "position_action": position_action,
+                "theme_cluster": (entry_meta or {}).get("theme_cluster"),
+                "source_tags": (entry_meta or {}).get("source_tags"),
+                "sector": (entry_meta or {}).get("sector"),
+                "industry": (entry_meta or {}).get("industry"),
+                "classification_source": (entry_meta or {}).get("theme_cluster_source") or (entry_meta or {}).get("classification_source"),
+                "trend_score": float((entry_meta or {}).get("trend_score") or 0.0),
+                "score_final": float((entry_meta or {}).get("score_final") or (entry_meta or {}).get("score") or score),
+                "rank_final30": int((entry_meta or {}).get("rank_final30") or (entry_meta or {}).get("rank") or rank + 1),
+                "entry_style": str((entry_meta or {}).get("entry_style") or _resolve_entry_signal_type(entry_meta) or "momentum").lower(),
+                "market_state": (entry_meta or {}).get("market_state"),
+                "market_regime": (entry_meta or {}).get("market_regime"),
+                "blocked_reason": None,
+                "block_stage": None,
                 **({
                     "capital_deployment": {
                         "current_position_market_value_usd": held_snapshot_market_value,
@@ -1137,8 +1178,19 @@ def generate_entry_intents(
             intent["filters_passed"] = entry_explanation.get("filters_passed", [])
             intent["explanation_quality"] = entry_explanation.get("explanation_quality", "MINIMAL")
         
+        if intent_acceptor is not None:
+            decision = intent_acceptor(intent)
+            if not getattr(decision, "allowed", bool(decision)):
+                reason = getattr(decision, "reason", "order_preflight_rejected")
+                track_skip(symbol, reason, {"block_stage": "order_preflight"})
+                if getattr(decision, "scope", "") in {"GLOBAL", "SYSTEM"}:
+                    break
+                continue
+            intent = getattr(decision, "resized_intent", None) or intent
         intents.append(intent)
         added_count += 1
+        if diagnostics is not None:
+            diagnostics.setdefault("accepted_symbols", []).append(symbol)
 
         logger.info(
             "[US_ENTRY][INTENT] symbol=%s rank=%d score=%.6f qty=%d notional=%.2f",
@@ -1272,4 +1324,17 @@ def generate_entry_intents(
         logger.warning("[US_ENTRY][EXPLANATION_QUALITY] no explanations generated")
 
     logger.info("[US_ENTRY][EVAL][DONE] entry_intents=%d", len(intents))
+    if diagnostics is not None:
+        diagnostics.update({
+            "attempted": len(seen_symbols),
+            "accepted": len(intents),
+            "backfill_attempt_count": max(0, price_lookup_count - len(intents)),
+            "backfill_success_count": sum(1 for i, intent in enumerate(intents) if int(intent.get("rank_final30") or i + 1) > i + 1),
+            "candidate_pool_exhausted": len(intents) < max_new_entries,
+            "price_lookup_count": price_lookup_count,
+            "price_lookup_budget_exhausted": price_lookup_budget_exhausted,
+            "price_lookup_attempted": price_lookup_attempted,
+            "price_lookup_used": price_lookup_count,
+            "price_lookup_limit": max_total_lookup,
+        })
     return intents

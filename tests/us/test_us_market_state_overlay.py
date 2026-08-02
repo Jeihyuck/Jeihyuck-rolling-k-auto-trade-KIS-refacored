@@ -7,6 +7,7 @@ from trader.us.market_state_overlay import (
     build_profit_capture_intents,
     evaluate_us_market_state,
     filter_entry_intents_for_market_state,
+    filter_watchlist_rows_for_market_state,
 )
 
 
@@ -106,6 +107,93 @@ def test_risk_off_blocks_ai_but_allows_xlv():
     kept, blocked = filter_entry_intents_for_market_state(intents, overlay)
     assert [i["symbol"] for i in kept] == ["XLV"]
     assert blocked[0]["reason"] == "DEFENSE_RISK_OFF_AI_TECH_BLOCK"
+
+
+def test_risk_off_prefilter_backfills_after_ai_leaders_and_preserves_mpc_metadata():
+    rows = [
+        {"symbol": "DDOG", "theme_cluster": "AI_SOFTWARE", "trend_score": 1.0, "score_final": .9, "rank_final30": 1},
+        {"symbol": "SNOW", "theme_cluster": "AI_SOFTWARE", "trend_score": 1.0, "score_final": .8, "rank_final30": 2},
+        {"symbol": "MPC", "theme_cluster": "ENERGY_MATERIALS", "trend_score": 1.0, "score_final": .6063, "rank_final30": 3},
+        {"symbol": "KO", "theme_cluster": "CONSUMER_STAPLES", "trend_score": .5, "score_final": .55, "rank_final30": 4},
+        {"symbol": "AMGN", "theme_cluster": "HEALTHCARE", "trend_score": .4, "score_final": .5, "rank_final30": 5},
+    ]
+    overlay = {"market_state": "DEFENSE_RISK_OFF", "market_regime": "DEFENSIVE", "allow_new_buy": True}
+
+    eligible, preblocked = filter_watchlist_rows_for_market_state(rows, overlay)
+
+    assert [row["symbol"] for row in eligible[:3]] == ["MPC", "KO", "AMGN"]
+    assert [row["symbol"] for row in preblocked] == ["DDOG", "SNOW"]
+    mpc = eligible[0]
+    assert mpc["theme_cluster"] == "ENERGY_MATERIALS"
+    assert mpc["trend_score"] == 1.0
+    assert mpc["score_final"] >= .6
+    assert mpc["rank_final30"] == 3
+
+    kept, blocked = filter_entry_intents_for_market_state(
+        [{**mpc, "side": "BUY", "meta": dict(mpc)}], overlay
+    )
+    assert blocked == []
+    assert kept[0]["symbol"] == "MPC"
+
+
+@pytest.mark.parametrize("state", ["DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"])
+def test_crash_states_prefilter_all_new_buys(state):
+    eligible, blocked = filter_watchlist_rows_for_market_state(
+        [{"symbol": "XLV", "theme_cluster": "HEALTHCARE", "score_final": .8, "rank_final30": 1}],
+        {"market_state": state, "allow_new_buy": True},
+    )
+    assert eligible == []
+    assert blocked[0]["reason"] == "DEFENSE_CRASH_ENTRY_BLOCK"
+
+
+@pytest.mark.parametrize(
+    "state,overlay_extra,cluster,expected",
+    [
+        ("NORMAL", {}, "HEALTHCARE", True),
+        ("DEFENSE_CAUTION", {"allow_ai_tech_buy": False}, "AI_SOFTWARE", False),
+        ("DEFENSE_RISK_OFF", {}, "CONSUMER_STAPLES", True),
+        ("DEFENSE_CRASH_PENDING", {}, "HEALTHCARE", False),
+        ("DEFENSE_CRASH_CONFIRMED", {}, "HEALTHCARE", False),
+        ("DEFENSE_CRASH_REBOUND", {"allow_ai_tech_buy": False}, "AI_SOFTWARE", False),
+        ("RISK_ON", {}, "AI_SOFTWARE", True),
+        ("STRONG_RISK_ON", {}, "AI_SOFTWARE", True),
+    ],
+)
+def test_market_state_candidate_policy_matrix(state, overlay_extra, cluster, expected):
+    overlay = {"market_state": state, "market_regime": "RISK_ON", "allow_new_buy": True, "allow_ai_tech_buy": True, **overlay_extra}
+    kept, _blocked = filter_watchlist_rows_for_market_state(
+        [{"symbol": "TEST", "theme_cluster": cluster, "score_final": .8, "trend_score": 1, "rank_final30": 1}],
+        overlay,
+    )
+    assert bool(kept) is expected
+
+
+@pytest.mark.parametrize(
+    "before,after,after_allowed",
+    [
+        ("NORMAL", "DEFENSE_CAUTION", False),
+        ("DEFENSE_CAUTION", "DEFENSE_RISK_OFF", False),
+        ("DEFENSE_RISK_OFF", "DEFENSE_CRASH_PENDING", False),
+        ("DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED", False),
+        ("DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_REBOUND", True),
+        ("DEFENSE_CRASH_CONFIRMED", "DEFENSE_CRASH_REBOUND", True),
+        ("DEFENSE_CRASH_REBOUND", "DEFENSE_RISK_OFF", False),
+        ("DEFENSE_RISK_OFF", "NORMAL", True),
+        ("NORMAL", "STRONG_RISK_ON", True),
+    ],
+)
+def test_market_state_transition_uses_current_overlay_without_stale_block(before, after, after_allowed):
+    row = {"symbol": "AI", "theme_cluster": "AI_SOFTWARE", "score_final": .8, "trend_score": 1, "rank_final30": 1}
+    common = {"market_regime": "RISK_ON", "allow_new_buy": True, "allow_ai_tech_buy": True}
+    def overlay(state):
+        return {
+            **common,
+            "market_state": state,
+            "allow_ai_tech_buy": state not in {"DEFENSE_CAUTION", "DEFENSE_RISK_OFF"},
+        }
+    filter_watchlist_rows_for_market_state([row], overlay(before))
+    kept, _ = filter_watchlist_rows_for_market_state([row], overlay(after))
+    assert bool(kept) is after_allowed
 
 
 def test_profit_capture_price_aliases_and_pnl_rate_resolver(monkeypatch):

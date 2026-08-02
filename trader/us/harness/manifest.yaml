@@ -2,6 +2,20 @@
 # Harness 시나리오 목록
 
 scenarios:
+  - name: market_state_backfill
+    description: "risk-off 후보 백필과 crash fail-closed 확인"
+    command: "python -m trader.us.harness.scenarios.market_state_backfill"
+    env:
+      TRADING_REGION: "US"
+      DRY_RUN: "1"
+      DISABLE_REAL_TRADING: "1"
+    expected_markers:
+      - "[US_BACKFILL][OK]"
+      - "[US_HARNESS][PASS]"
+    forbidden_markers:
+      - "[US_HARNESS][FAIL]"
+      - "Traceback"
+
   - name: offline_quote_success
     description: "offline 모드에서 prep runner 정상 실행 확인 (빈 watchlist 허용)"
     command: "python -m trader.us.runner.prep_runner --env practice --offline"

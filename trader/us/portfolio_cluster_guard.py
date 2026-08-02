@@ -10,6 +10,21 @@ from trader.us.rotation import AI_CLUSTERS, cluster_caps_for_regime, compute_clu
 logger = logging.getLogger(__name__)
 
 
+def resolve_position_market_value_usd(position: dict) -> float:
+    for key in ("market_value_usd", "market_value", "eval_amount_usd"):
+        try:
+            value = float(position.get(key) or 0.0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    try:
+        price = float(position.get("last_price") or position.get("current_price") or position.get("price") or 0.0)
+        return max(0.0, price * _qty(position))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _qty(pos: dict) -> int:
     return int(float(pos.get("qty") or pos.get("quantity") or pos.get("holdings_qty") or 0))
 
@@ -51,3 +66,23 @@ def filter_entry_intents_for_cluster_guard(entry_intents: list[dict], guard: dic
             continue
         kept.append(intent)
     return kept, blocked_syms
+
+
+def filter_watchlist_rows_for_cluster_guard(rows: list[dict], guard: dict) -> tuple[list[dict], list[dict]]:
+    """Apply the portfolio cluster guard before an entry slot is selected."""
+    blocked_clusters = set(guard.get("blocked_clusters") or [])
+    kept: list[dict] = []
+    blocked: list[dict] = []
+    for row in rows or []:
+        symbol = str(row.get("symbol") or row.get("code") or "").upper().strip()
+        cluster = theme_cluster_for(symbol, row)
+        if cluster in blocked_clusters:
+            blocked.append({
+                "symbol": symbol,
+                "cluster": cluster,
+                "reason": "BLOCKED_CLUSTER_EXPOSURE",
+                "block_stage": "portfolio_cluster_guard",
+            })
+        else:
+            kept.append(row)
+    return kept, blocked

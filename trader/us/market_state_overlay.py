@@ -528,6 +528,94 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
     return out
 
 
+def resolve_market_state_entry_block_reason(
+    *,
+    symbol: str,
+    cluster: str,
+    trend_score: float,
+    score_final: float,
+    rank_final30: int,
+    position_state: str,
+    overlay: dict,
+) -> str | None:
+    """Return the canonical market-state block reason for a BUY candidate."""
+    sym = str(symbol or "").upper().strip()
+    cluster = str(cluster or theme_cluster_for(sym, {})).upper().strip()
+    state = str(overlay.get("market_state") or "NORMAL")
+    held = str(position_state or "NOT_HELD").upper() == "HELD"
+    if sym in FORBIDDEN_HEDGE_SYMBOLS:
+        return "FORBIDDEN_HEDGE_OR_INVERSE_ETF"
+    if overlay.get("force_entry_block") or state in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"}:
+        return "DEFENSE_CRASH_ENTRY_BLOCK"
+    if state == "DEFENSE_RISK_OFF" and (cluster in AI_TECH_CLUSTERS or held):
+        return "DEFENSE_RISK_OFF_AI_TECH_BLOCK" if cluster in AI_TECH_CLUSTERS else "DEFENSE_RISK_OFF_ENTRY_REDUCED"
+    if state == "DEFENSE_RISK_OFF" and cluster not in DEFENSIVE_CLUSTERS and sym not in CORE_INDEX_ETFS:
+        if cluster != "ENERGY_MATERIALS" or trend_score < 0.6 or score_final < 0.6:
+            return "DEFENSE_RISK_OFF_ENTRY_REDUCED"
+    if state == "DEFENSE_CAUTION" and (held or (cluster in AI_TECH_CLUSTERS and not overlay.get("allow_ai_tech_buy"))):
+        return "DEFENSE_CAUTION_ENTRY_REDUCED"
+    if overlay.get("market_regime") == "RISK_OFF" and state != "DEFENSE_CRASH_REBOUND":
+        return "risk_off_entry_block"
+    # DEFENSE_RISK_OFF has the more specific policy above, including its
+    # strong ENERGY_MATERIALS exception; do not override it with the generic
+    # defensive-regime rule.
+    if overlay.get("market_regime") == "DEFENSIVE" and state != "DEFENSE_RISK_OFF" and cluster not in DEFENSIVE_CLUSTERS:
+        return "defensive_only_entry_block"
+    if overlay.get("market_regime") == "NEUTRAL" and cluster in AI_TECH_CLUSTERS and not (rank_final30 <= 10 and score_final >= 0.60):
+        return "neutral_ai_tech_rank_score_block"
+    if not overlay.get("allow_new_buy", True):
+        return "allow_new_buy_false"
+    if cluster in AI_TECH_CLUSTERS and not overlay.get("allow_ai_tech_buy", True):
+        return "allow_ai_tech_buy_false"
+    return None
+
+
+def filter_watchlist_rows_for_market_state(
+    rows: list[dict],
+    overlay: dict,
+    positions: list[dict] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Filter Final30 before top-N intent selection, retaining its metadata."""
+    held_symbols = {_symbol(p) for p in positions or []}
+    kept: list[dict] = []
+    blocked: list[dict] = []
+    for fallback_rank, row in enumerate(rows or [], 1):
+        sym = str(row.get("symbol") or row.get("code") or "").upper().strip()
+        cluster = str(row.get("theme_cluster") or row.get("cluster") or theme_cluster_for(sym, row))
+        trend_score = float(row.get("trend_score") or 0.0)
+        score_final = float(row.get("score_final") or row.get("score") or 0.0)
+        rank_final30 = int(row.get("rank_final30") or row.get("rank") or fallback_rank)
+        position_state = "HELD" if sym in held_symbols else str(row.get("position_state") or "NOT_HELD")
+        reason = resolve_market_state_entry_block_reason(
+            symbol=sym, cluster=cluster, trend_score=trend_score,
+            score_final=score_final, rank_final30=rank_final30,
+            position_state=position_state,
+            overlay=overlay,
+        )
+        if reason is None and overlay.get("market_state") == "STRONG_RISK_ON" and sym in held_symbols:
+            position = next((p for p in positions or [] if _symbol(p) == sym), {})
+            if not is_strong_holding(position, row):
+                reason = "MARKET_STATE_ENTRY_BLOCK"
+        if reason:
+            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "block_stage": "market_state", "market_state": overlay.get("market_state", "NORMAL")})
+            logger.warning("[US_MARKET_STATE][WATCHLIST_BLOCK] symbol=%s cluster=%s reason=%s", sym, cluster, reason)
+        else:
+            kept.append({
+                **row,
+                "theme_cluster": cluster,
+                "trend_score": trend_score,
+                "score_final": score_final,
+                "rank_final30": rank_final30,
+                "position_state": position_state,
+                "market_state": overlay.get("market_state", "NORMAL"),
+                "market_regime": overlay.get("market_regime", "NEUTRAL"),
+                "blocked_reason": None,
+                "block_stage": None,
+            })
+    kept.sort(key=lambda row: float(row.get("score_final") or row.get("score") or 0.0), reverse=True)
+    return kept, blocked
+
+
 def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: dict, positions: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     kept, blocked = [], []
     state = overlay.get("market_state", "NORMAL")
@@ -538,34 +626,35 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
             continue
         sym = str(intent.get("symbol") or "").upper().strip()
         meta = intent.setdefault("meta", {}) if isinstance(intent.setdefault("meta", {}), dict) else {}
+        metadata_mismatch = next(
+            (
+                key for key in (
+                    "source_tags", "sector", "industry", "classification_source",
+                    "theme_cluster", "trend_score", "score_final", "rank_final30",
+                    "entry_style", "position_state", "position_action",
+                    "market_state", "market_regime", "blocked_reason", "block_stage",
+                )
+                if intent.get(key) is not None
+                and meta.get(key) is not None
+                and intent.get(key) != meta.get(key)
+            ),
+            None,
+        )
         cluster = str(intent.get("theme_cluster") or intent.get("cluster") or meta.get("theme_cluster") or theme_cluster_for(sym, intent))
-        reason = None
-        if sym in FORBIDDEN_HEDGE_SYMBOLS:
-            reason = "FORBIDDEN_HEDGE_OR_INVERSE_ETF"
-        elif overlay.get("force_entry_block"):
-            reason = "DEFENSE_CRASH_ENTRY_BLOCK"
-        elif state == "DEFENSE_RISK_OFF" and (cluster in AI_TECH_CLUSTERS or sym in pos_by_sym):
-            reason = "DEFENSE_RISK_OFF_AI_TECH_BLOCK" if cluster in AI_TECH_CLUSTERS else "DEFENSE_RISK_OFF_ENTRY_REDUCED"
-        elif state == "DEFENSE_RISK_OFF" and cluster not in DEFENSIVE_CLUSTERS and sym not in CORE_INDEX_ETFS:
-            if cluster != "ENERGY_MATERIALS" or float(intent.get("trend_score") or 0) < 0.6 or float(intent.get("score_final") or intent.get("score") or 0) < 0.6:
-                reason = "DEFENSE_RISK_OFF_ENTRY_REDUCED"
-        elif state == "DEFENSE_CAUTION" and (sym in pos_by_sym or (cluster in AI_TECH_CLUSTERS and not overlay.get("allow_ai_tech_buy"))):
-            reason = "DEFENSE_CAUTION_ENTRY_REDUCED"
-        elif overlay.get("market_regime") == "RISK_OFF" and state != "DEFENSE_CRASH_REBOUND":
-            reason = "risk_off_entry_block"
-        elif overlay.get("market_regime") == "DEFENSIVE" and cluster not in DEFENSIVE_CLUSTERS:
-            reason = "defensive_only_entry_block"
-        elif overlay.get("market_regime") == "NEUTRAL" and cluster in AI_TECH_CLUSTERS and not (int(intent.get("rank_final30") or meta.get("rank_final30") or 99) <= 10 and float(intent.get("score_final") or intent.get("score") or meta.get("score_final") or 0) >= 0.60):
-            reason = "neutral_ai_tech_rank_score_block"
-        elif not overlay.get("allow_new_buy", True):
-            reason = "allow_new_buy_false"
-        elif cluster in AI_TECH_CLUSTERS and not overlay.get("allow_ai_tech_buy", True):
-            reason = "allow_ai_tech_buy_false"
-        elif state == "STRONG_RISK_ON" and sym in pos_by_sym and not is_strong_holding(pos_by_sym[sym], intent):
+        reason = "ENTRY_METADATA_INVARIANT_FAIL" if metadata_mismatch else resolve_market_state_entry_block_reason(
+            symbol=sym, cluster=cluster,
+            trend_score=float(intent.get("trend_score") or meta.get("trend_score") or 0),
+            score_final=float(intent.get("score_final") or intent.get("score") or meta.get("score_final") or 0),
+            rank_final30=int(intent.get("rank_final30") or meta.get("rank_final30") or 99),
+            position_state="HELD" if sym in pos_by_sym else str(intent.get("position_state") or "NOT_HELD"),
+            overlay=overlay,
+        )
+        if reason is None and state == "STRONG_RISK_ON" and sym in pos_by_sym and not is_strong_holding(pos_by_sym[sym], intent):
             reason = "MARKET_STATE_ENTRY_BLOCK"
         if reason:
             meta["blocked_reason"] = reason
-            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "market_state": state})
+            meta["block_stage"] = "metadata" if metadata_mismatch else "market_state"
+            blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "block_stage": meta["block_stage"], "metadata_field": metadata_mismatch, "market_state": state})
             logger.warning("[US_MARKET_STATE][ENTRY_BLOCK] symbol=%s cluster=%s reason=%s market_state=%s", sym, cluster, reason, state)
         else:
             kept.append(intent)

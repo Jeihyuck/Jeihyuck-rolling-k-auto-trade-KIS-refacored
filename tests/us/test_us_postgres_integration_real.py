@@ -12,19 +12,11 @@ def pg_engine(monkeypatch):
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS us_fills CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS us_orders CASCADE"))
-        conn.execute(text("""CREATE TABLE us_orders (
-            id bigserial PRIMARY KEY, trade_date date NOT NULL, client_order_key text NOT NULL,
-            symbol text NOT NULL, exchange text NOT NULL, side text NOT NULL,
-            qty_requested integer NOT NULL, qty_filled integer NOT NULL DEFAULT 0,
-            avg_price_usd numeric, order_no text, status text,
-            meta jsonb NOT NULL DEFAULT '{}'::jsonb,
-            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now())"""))
-        conn.execute(text("""CREATE TABLE us_fills (
-            id bigserial PRIMARY KEY, trade_date date NOT NULL, symbol text NOT NULL,
-            exchange text NOT NULL, side text NOT NULL, qty integer NOT NULL,
-            price_usd numeric, order_no text, client_order_key text NOT NULL,
-            filled_at timestamptz, meta jsonb NOT NULL DEFAULT '{}'::jsonb,
-            fill_idempotency_key text UNIQUE)"""))
+        conn.execute(text("DROP TABLE IF EXISTS us_order_intents CASCADE"))
+        # Exercise the same production migrations rather than a test-only schema.
+        conn.exec_driver_sql(open("migrations/0038_us_agent_tables.sql", encoding="utf-8").read())
+        conn.exec_driver_sql(open("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql", encoding="utf-8").read())
+        conn.exec_driver_sql(open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read())
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
     yield engine
     engine.dispose()
@@ -130,3 +122,116 @@ def test_real_postgres_save_fills_actual_conflict_and_overflow_are_atomic(pg_eng
     with pg_engine.begin() as conn:
         assert conn.execute(text("SELECT qty_filled FROM us_orders WHERE order_no='OFL'")).scalar_one() == 0
         assert conn.execute(text("SELECT count(*) FROM us_fills WHERE order_no='OFL' AND NOT COALESCE((meta->>'is_synthetic')::boolean,false)")).scalar_one() == 0
+
+
+def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and_query_failure(pg_engine, monkeypatch):
+    """Risk loader must query PostgreSQL directly, dedupe keys, and fail closed."""
+    from sqlalchemy import text
+    import trader.us.db.repos as repos
+
+    assert repos.save_order_ack({
+        "client_order_key": "ack-key", "symbol": "AAPL", "exchange": "NASDAQ",
+        "side": "BUY", "qty_requested": 6, "qty_filled": 0, "order_no": "ack-order",
+        "status": "ACK", "committed_notional_usd": 600, "env": "practice",
+    }, trade_date="2026-07-31")
+    # The real reconcile path transitions ACK to FILLED while retaining the
+    # original requested commitment used by the daily limit.
+    filled = repos.mark_order_filled_by_reconcile(
+        order_no="ack-order", client_order_key="ack-key", symbol="AAPL", side="BUY",
+        filled_qty=6, requested_qty=6, cumulative_filled_qty=6, avg_price_usd=101,
+        trade_date="2026-07-31", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+    )
+    assert filled["status"] == "OK"
+    with pg_engine.begin() as conn:
+        assert conn.execute(text("SELECT status FROM us_orders WHERE client_order_key='ack-key'")).scalar_one() == "FILLED"
+    assert repos.save_dry_run_order({
+        "client_order_key": "dry-key", "symbol": "MSFT", "exchange": "NASDAQ",
+        "side": "BUY", "qty": 1, "limit_price_usd": 100, "notional_usd": 100,
+        "env": "practice", "meta": {},
+    }, trade_date="2026-07-31")
+    assert repos.save_order_ack({
+        "client_order_key": "other-env", "symbol": "NVDA", "exchange": "NASDAQ",
+        "side": "BUY", "qty_requested": 1, "qty_filled": 0, "order_no": "prod-order",
+        "status": "PENDING", "committed_notional_usd": 999, "env": "prod",
+    }, trade_date="2026-07-31")
+    for index, status in enumerate(("PENDING", "SUBMITTED", "RECONCILE_PENDING", "ACK_DB_FAILED")):
+        assert repos.save_order_ack({
+            "client_order_key": f"status-{index}", "symbol": "GOOGL", "exchange": "NASDAQ",
+            "side": "BUY", "qty_requested": 1, "qty_filled": 0,
+            "order_no": f"status-order-{index}", "status": status,
+            "committed_notional_usd": 10, "env": "practice",
+        }, trade_date="2026-07-31")
+    assert repos.save_order_ack({
+        "client_order_key": "sell-key", "symbol": "AAPL", "exchange": "NASDAQ",
+        "side": "SELL", "qty_requested": 1, "qty_filled": 0, "order_no": "sell-order",
+        "status": "ACK", "committed_notional_usd": 999, "env": "practice",
+    }, trade_date="2026-07-31")
+
+    # Legacy row: canonical columns null, recovered through the persisted intent.
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_order_intents
+            (trade_date,client_order_key,symbol,exchange,side,qty,limit_price_usd,notional_usd,status,meta)
+            VALUES ('2026-07-31','legacy-key','AMZN','NASDAQ','BUY',3,100,300,'SENT',
+                    '{"env":"practice"}'::jsonb)"""))
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             order_no,status,dry_run,meta,committed_notional_usd,env)
+            VALUES ('2026-07-31','legacy-key','AMZN','NASDAQ','BUY',3,0,
+                    'legacy-order','SUBMITTED',false,'{}'::jsonb,NULL,'unknown')"""))
+
+    committed = repos.load_today_committed_buy_notional_result("2026-07-31", env="practice")
+    assert committed.available is True
+    assert committed.notional_usd == 1040.0
+    assert committed.row_count == 9
+
+    # A later tick starts from the actually persisted first-tick total.  A
+    # candidate larger than the remaining daily allowance is skipped while a
+    # smaller candidate can still backfill.
+    from trader.us.execution.order_router import select_preflight_buy_candidates
+    monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "1500")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "1000")
+    state = {
+            "available_cash_usd": 10000, "daily_notional_usd": committed.notional_usd,
+            "position_count": 0, "portfolio_usd": 100000, "order_keys": set(),
+    }
+    candidates = [
+            {"symbol": "COST", "exchange": "NASDAQ", "side": "BUY", "qty": 1,
+             "limit_price": 500, "notional_usd": 500, "client_order_key": "tick2-large",
+             "position_state": "NOT_HELD", "position_action": "NEW_POSITION_BUY",
+             "theme_cluster": "CONSUMER_STAPLES", "meta": {"position_state": "NOT_HELD",
+             "position_action": "NEW_POSITION_BUY", "theme_cluster": "CONSUMER_STAPLES"}},
+            {"symbol": "KO", "exchange": "NYSE", "side": "BUY", "qty": 1,
+             "limit_price": 400, "notional_usd": 400, "client_order_key": "tick2-small",
+             "position_state": "NOT_HELD", "position_action": "NEW_POSITION_BUY",
+             "theme_cluster": "CONSUMER_STAPLES", "meta": {"position_state": "NOT_HELD",
+             "position_action": "NEW_POSITION_BUY", "theme_cluster": "CONSUMER_STAPLES"}},
+    ]
+    accepted, rejected, _ = select_preflight_buy_candidates(
+        candidates, target_accept_count=1, projected_state=state,
+        allowed_symbols={"COST", "KO"}, current_positions=[],
+    )
+    assert [item["symbol"] for item in accepted] == ["KO"]
+    assert rejected[0]["reason"] == "daily_notional_exceeded"
+
+    empty = repos.load_today_committed_buy_notional_result("2026-08-01", env="practice")
+    assert empty.available is True
+    assert empty.notional_usd == 0.0
+    assert empty.row_count == 0
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,status,dry_run,meta,
+             committed_notional_usd,env)
+            VALUES ('2026-08-02','unsafe-legacy','META','NASDAQ','BUY',1,'ACK',false,
+                    '{}'::jsonb,NULL,'unknown')"""))
+    unsafe = repos.load_today_committed_buy_notional_result("2026-08-02", env="practice")
+    assert unsafe.available is False
+    assert "environment_unavailable" in (unsafe.error or "")
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("DROP TABLE us_orders"))
+    unavailable = repos.load_today_committed_buy_notional_result("2026-07-31", env="practice")
+    assert unavailable.available is False
+    assert unavailable.notional_usd == 0.0
+    assert unavailable.error

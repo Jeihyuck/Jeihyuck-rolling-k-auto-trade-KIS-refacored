@@ -17,6 +17,7 @@ import logging
 import os
 import time
 from datetime import date, datetime, timezone
+from dataclasses import dataclass
 from typing import Any
 from trader.us.utils.order_no import normalize_us_order_no
 
@@ -356,7 +357,10 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "notional_usd": intent.get("notional_usd"),
                     "strategy": intent.get("strategy", "us_pb1"),
                     "status": "PENDING",
-                    "meta": _json_param(intent.get("meta")),
+                    "meta": _json_param({
+                        **_parse_json_meta(intent.get("meta")),
+                        "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
+                    }),
                 },
             )
         return True
@@ -456,7 +460,7 @@ def mark_order_intent_dry_run(client_order_key: str) -> None:
 # ---------------------------------------------------------------------------
 # Orders — schema: trade_date, client_order_key, symbol, exchange, side,
 #                  qty_requested, qty_filled, avg_price_usd, order_no,
-#                  status, dry_run, meta
+#                  status, dry_run, committed_notional_usd, env, meta
 # 금지 컬럼: qty, order_type, limit_price_usd, notional_usd, raw_response
 # ---------------------------------------------------------------------------
 
@@ -476,16 +480,18 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
             INSERT INTO us_orders
                 (trade_date, client_order_key, symbol, exchange, side,
                  qty_requested, qty_filled, avg_price_usd, order_no,
-                 status, dry_run, meta)
+                 status, dry_run, committed_notional_usd, env, meta)
             VALUES (:td, :cok, :symbol, :exchange, :side,
                     :qty_requested, :qty_filled, :avg_price_usd, :order_no,
-                    :status, :dry_run, CAST(:meta AS jsonb))
+                    :status, :dry_run, :committed_notional_usd, :env, CAST(:meta AS jsonb))
             ON CONFLICT (client_order_key) DO UPDATE
                 SET qty_filled    =EXCLUDED.qty_filled,
                     avg_price_usd =EXCLUDED.avg_price_usd,
                     order_no      =EXCLUDED.order_no,
                     status        =EXCLUDED.status,
                     dry_run       =EXCLUDED.dry_run,
+                    committed_notional_usd=COALESCE(us_orders.committed_notional_usd, EXCLUDED.committed_notional_usd),
+                    env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
                     meta          =EXCLUDED.meta,
                     updated_at    =NOW()
         """),
@@ -501,6 +507,8 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
             "order_no": row.get("order_no", ""),
             "status": row["status"],
             "dry_run": bool(row.get("dry_run", False)),
+            "committed_notional_usd": row.get("committed_notional_usd"),
+            "env": row.get("env"),
             "meta": _json_param(row.get("meta")),
         },
     )
@@ -549,6 +557,8 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
             "order_no": order_result.get("order_no", ""),
             "status": order_result.get("status", "ACK"),
             "dry_run": False,
+            "committed_notional_usd": order_result.get("committed_notional_usd") or order_result.get("notional_usd"),
+            "env": str(order_result.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
             "meta": order_result.get("meta") or {},
         }
         with engine.begin() as conn:
@@ -585,6 +595,8 @@ def save_order_reject(order_result: dict, trade_date: str | None = None) -> bool
             "order_no": "",
             "status": "REJECTED",
             "dry_run": False,
+            "committed_notional_usd": order_result.get("committed_notional_usd") or order_result.get("notional_usd"),
+            "env": str(order_result.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
             "meta": {"reason": order_result.get("reason", ""), **(order_result.get("meta") or {})},
         }
         with engine.begin() as conn:
@@ -621,6 +633,8 @@ def save_dry_run_order(intent: dict, trade_date: str | None = None) -> bool:
             "order_no": "",
             "status": "DRY_RUN",
             "dry_run": True,
+            "committed_notional_usd": intent.get("committed_notional_usd") or intent.get("notional_usd"),
+            "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
             "meta": intent.get("meta") or {},
         }
         with engine.begin() as conn:
@@ -3614,3 +3628,100 @@ def load_us_daily_orders_for_report(trade_date: str) -> list[dict]:
     except Exception:
         logger.exception("[US_ORDERS][REPORT_LOAD][WARN] trade_date=%s", trade_date)
     return []
+
+
+@dataclass(frozen=True)
+class CommittedBuyNotionalResult:
+    available: bool
+    notional_usd: float
+    row_count: int
+    error: str | None = None
+
+
+def load_today_committed_buy_notional_result(trade_date: str, env: str = "practice", include_pending: bool = True) -> CommittedBuyNotionalResult:
+    """Strict risk-data load that distinguishes a healthy zero from DB failure."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        return CommittedBuyNotionalResult(False, 0.0, 0, "orders_db_engine_unavailable")
+    from sqlalchemy import text
+    query = """
+        SELECT o.*, i.notional_usd AS intent_notional_usd,
+               i.limit_price_usd AS intent_limit_price_usd,
+               i.meta AS intent_meta
+        FROM us_orders o
+        LEFT JOIN us_order_intents i
+          ON i.client_order_key = o.client_order_key
+        WHERE o.trade_date = :td
+    """
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(query), {"td": trade_date})
+            rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
+    except Exception as exc:
+        return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
+    statuses = {
+        "ACK", "SUBMITTED", "PARTIALLY_FILLED", "FILLED",
+        "RECONCILE_PENDING", "ACK_DB_FAILED", "DRY_RUN",
+    }
+    if include_pending:
+        statuses.add("PENDING")
+    seen: set[str] = set()
+    total = 0.0
+    for index, row in enumerate(rows):
+        if str(row.get("side") or "").upper() != "BUY" or str(row.get("status") or "").upper() not in statuses:
+            continue
+        order_meta = _parse_json_meta(row.get("meta"))
+        intent_meta = _parse_json_meta(row.get("intent_meta"))
+        persisted_env = str(row.get("env") or "").strip().lower()
+        if persisted_env in {"unknown", "unavailable", "legacy_unknown"}:
+            persisted_env = ""
+        row_env = str(
+            persisted_env
+            or order_meta.get("env") or order_meta.get("kis_env")
+            or intent_meta.get("env") or intent_meta.get("kis_env")
+            or ""
+        ).strip().lower()
+        if not row_env:
+            return CommittedBuyNotionalResult(
+                False, 0.0, len(rows),
+                f"committed_buy_environment_unavailable key={row.get('client_order_key')}",
+            )
+        if row_env != str(env or "practice").lower():
+            continue
+        key = str(row.get("client_order_key") or row.get("order_key") or row.get("order_no") or f"row:{index}")
+        if key in seen:
+            continue
+        seen.add(key)
+        explicit_price = (
+            order_meta.get("requested_price_usd") or order_meta.get("order_price_usd")
+            or intent_meta.get("requested_price_usd") or row.get("intent_limit_price_usd")
+        )
+        notional = (
+            row.get("committed_notional_usd")
+            or row.get("intent_notional_usd")
+            or order_meta.get("requested_notional_usd")
+            or intent_meta.get("requested_notional_usd")
+        )
+        if notional in (None, "") and explicit_price not in (None, ""):
+            try:
+                notional = int(row.get("qty_requested") or 0) * float(explicit_price)
+            except (TypeError, ValueError):
+                notional = None
+        try:
+            notional_value = float(notional)
+        except (TypeError, ValueError):
+            notional_value = 0.0
+        if notional_value <= 0:
+            return CommittedBuyNotionalResult(
+                False, 0.0, len(rows),
+                f"committed_buy_notional_unavailable key={key}",
+            )
+        total += notional_value
+    return CommittedBuyNotionalResult(True, total, len(rows), None)
+
+
+def load_today_committed_buy_notional(trade_date: str, env: str = "practice", include_pending: bool = True) -> float:
+    result = load_today_committed_buy_notional_result(trade_date, env, include_pending)
+    if not result.available:
+        raise RuntimeError(result.error or "committed_buy_notional_unavailable")
+    return result.notional_usd

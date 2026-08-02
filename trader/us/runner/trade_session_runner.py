@@ -191,7 +191,23 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
     sector_cap_enforced_last = False
     trade_block_reason_last = ""
     blocked_entry_reason_counts_total: dict[str, int] = {}
+    blocked_entry_stage_counts_total: dict[str, int] = {}
+    candidate_metric_keys = (
+        "raw_watchlist_candidates", "prefilter_eligible_candidates",
+        "intent_generation_attempted", "final_entry_intents",
+        "backfill_attempt_count", "backfill_success_count", "submitted_orders",
+        "price_lookup_count", "price_lookup_attempted", "price_lookup_used",
+    )
+    candidate_metrics = {key: 0 for key in candidate_metric_keys}
+    price_lookup_budget_exhausted = False
+    price_lookup_limit_last = 0
+    candidate_local_reject_counts_total: dict[str, int] = {}
+    global_stop_reason_last = ""
+    system_invariant_failure_last = ""
+    projected_metrics: dict[str, float] = {}
     for tick_result in results or []:
+        price_lookup_budget_exhausted = price_lookup_budget_exhausted or bool(tick_result.get("price_lookup_budget_exhausted"))
+        price_lookup_limit_last = int(tick_result.get("price_lookup_limit") or price_lookup_limit_last)
         if tick_result.get("market_regime"):
             market_regime_last = str(tick_result.get("market_regime") or "")
         if tick_result.get("capital_scale") is not None:
@@ -212,12 +228,40 @@ def _aggregate_regime_block_reporting(results: list[dict]) -> dict:
             blocked_entry_reason_counts_total,
             tick_result.get("blocked_entry_reason_counts") or {},
         )
+        blocked_entry_stage_counts_total = _merge_reason_counts(
+            blocked_entry_stage_counts_total,
+            tick_result.get("blocked_entry_stage_counts") or {},
+        )
+        for key in candidate_metric_keys:
+            candidate_metrics[key] += int(tick_result.get(key) or 0)
+        candidate_local_reject_counts_total = _merge_reason_counts(
+            candidate_local_reject_counts_total,
+            tick_result.get("candidate_local_reject_counts") or {},
+        )
+        global_stop_reason_last = str(tick_result.get("global_stop_reason") or global_stop_reason_last)
+        system_invariant_failure_last = str(tick_result.get("system_invariant_failure") or system_invariant_failure_last)
+        for key in (
+            "projected_cash_start", "projected_cash_end",
+            "projected_daily_notional_start", "projected_daily_notional_end",
+            "committed_buy_notional_start", "actual_daily_buy_notional",
+        ):
+            if tick_result.get(key) is not None:
+                projected_metrics[key] = float(tick_result.get(key) or 0.0)
     return {
         "market_regime": market_regime_last,
         "capital_scale": capital_scale_last,
         "sector_cap_enforced": sector_cap_enforced_last,
         "trade_block_reason": trade_block_reason_last,
         "blocked_entry_reason_counts": blocked_entry_reason_counts_total,
+        "blocked_entry_stage_counts": blocked_entry_stage_counts_total,
+        "candidate_pool_exhausted": bool(results and results[-1].get("candidate_pool_exhausted")),
+        "price_lookup_budget_exhausted": price_lookup_budget_exhausted,
+        "price_lookup_limit": price_lookup_limit_last,
+        "candidate_local_reject_counts": candidate_local_reject_counts_total,
+        "global_stop_reason": global_stop_reason_last,
+        "system_invariant_failure": system_invariant_failure_last,
+        **projected_metrics,
+        **candidate_metrics,
     }
 
 def _write_us_schedule_health(payload: dict, session: str) -> None:
