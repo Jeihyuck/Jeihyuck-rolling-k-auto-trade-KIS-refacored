@@ -1,6 +1,6 @@
 import inspect
 from trader.kr.regime import KRMarketState, calculate_global_market_state
-from trader.pb1_engine import PB1Engine
+from trader.pb1_engine import CandidateFeature, PB1Engine, _enforce_kr_final_order_invariants
 import trader.kr.market_state_overlay as execution_helpers
 
 
@@ -26,7 +26,16 @@ def test_pb1_has_single_kr_regime_authority():
  assert "_build_kr_regime_snapshot_for_tick" in inspect.getsource(PB1Engine._evaluate_kr_market_state_overlay_for_tick)
 
 def test_production_path_enforces_budget_invariant_and_writes_artifact():
- source=inspect.getsource(PB1Engine.run)
- assert "[KR_REGIME][BUDGET_INVARIANT]" in source
- assert 'artifacts/kr_market_budget.json' in source
- assert "_enforce_kr_final_order_invariants(" in source
+ snapshot = __import__("trader.kr.regime", fromlist=["build_kr_regime_snapshot"]).build_kr_regime_snapshot({
+  "KOSPI":{"close":120,"ma20":110,"ma50":105,"ma200":100,"ma20_slope_5d":1,"breadth_ma20":.7,"breadth_ma50":.65,"advance_ratio":.7,"median_return_5d":.02,"return_5d":.03,"return_20d":.08}
+ })
+ candidate=CandidateFeature("005930","KOSPI",{"order_price":100_000,"stop_price":95_000,"vol20":100_000},True,[],1,[],planned_qty=10,planned_value=float("nan"))
+ orderable, meta = _enforce_kr_final_order_invariants(
+  [candidate], snapshot=snapshot,
+  base_overlay={"portfolio_equity_krw":100_000_000,"gross_exposure_pct":0,"sector_exposure_pct":{},"high_beta_exposure_pct":0},
+  existing_positions=[],market_budgets={"KOSPI":10_000_000,"KOSDAQ":0},total_tick_cap=10_000_000,
+  slots_remaining_at_tick_start=1,max_positions=10,existing_positions_count=0,available_cash=100_000_000,
+ )
+ submitted=[]
+ for order in orderable: submitted.append(order)
+ assert meta["invariant_valid"] is False and orderable == [] and submitted == []

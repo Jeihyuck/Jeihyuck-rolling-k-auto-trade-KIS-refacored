@@ -36,7 +36,7 @@ def _apply(candidates, *, slots=10, existing_count=0, budgets=None, cap=40_000_0
         existing_positions=[], market_budgets=budgets or {"KOSPI": 20_000_000, "KOSDAQ": 20_000_000},
         total_tick_cap=cap, slots_remaining_at_tick_start=slots,
         max_positions=10, existing_positions_count=existing_count,
-        equity_krw=100_000_000,
+        available_cash=100_000_000,
     )
 
 
@@ -117,3 +117,82 @@ def test_final_resized_value_rechecks_sector_cap(monkeypatch):
     monkeypatch.setenv("KR_MAX_SECTOR_EXPOSURE_RISK_ON", "0.05")
     out, _ = _apply([_candidate("005930", "KOSPI"), _candidate("000660", "KOSPI")])
     assert sum(c.planned_value for c in out) <= 5_000_000
+
+
+def test_final_gate_uses_mark_to_market_portfolio_equity():
+    out, meta = _apply([_candidate("005930", "KOSPI")], overlay={
+        "portfolio_equity_krw": 50_000_000, "gross_exposure_pct": .80,
+        "sector_exposure_pct": {}, "high_beta_exposure_pct": 0,
+    })
+    assert meta["projected_gross_exposure_pct"] < .95
+    assert sum(c.planned_value for c in out) < 7_500_000
+
+
+def test_final_gate_does_not_overwrite_overlay_equity_with_cost_basis():
+    # The helper has no cost-basis equity argument: the overlay is authoritative.
+    out, meta = _apply([_candidate("005930", "KOSPI")], overlay={
+        "portfolio_equity_krw": 40_000_000, "gross_exposure_pct": .90,
+        "sector_exposure_pct": {}, "high_beta_exposure_pct": 0,
+    })
+    assert meta["projected_gross_exposure_pct"] < .95
+    assert sum(c.planned_value for c in out) < 2_000_000
+
+
+def test_unrealized_loss_account_does_not_overallocate_from_cost_basis_equity():
+    out, _ = _apply([_candidate("005930", "KOSPI")], overlay={
+        "portfolio_equity_krw": 50_000_000, "gross_exposure_pct": 0,
+        "sector_exposure_pct": {}, "high_beta_exposure_pct": 0,
+    })
+    assert sum(c.planned_value for c in out) <= 5_000_000  # 10% of MTM equity
+
+
+def test_unrealized_gain_account_uses_same_equity_for_base_and_incremental_exposure():
+    out, meta = _apply([_candidate("005930", "KOSPI")], overlay={
+        "portfolio_equity_krw": 200_000_000, "gross_exposure_pct": .90,
+        "sector_exposure_pct": {}, "high_beta_exposure_pct": 0,
+    })
+    expected = .90 + sum(c.planned_value for c in out) / 200_000_000
+    assert meta["projected_gross_exposure_pct"] == expected
+
+
+def test_invalid_portfolio_equity_fails_closed():
+    out, meta = _apply([_candidate("005930", "KOSPI")], overlay={
+        "portfolio_equity_krw": 0, "gross_exposure_pct": 0,
+        "sector_exposure_pct": {}, "high_beta_exposure_pct": 0,
+    })
+    assert out == [] and not meta["invariant_valid"]
+    assert meta["reason"] == "INVALID_PORTFOLIO_EQUITY"
+
+
+def test_nan_or_nonfinite_final_notional_fails_closed():
+    candidate = _candidate("005930", "KOSPI")
+    candidate.planned_value = float("nan")
+    out, meta = _apply([candidate])
+    assert out == [] and not meta["invariant_valid"]
+    assert meta["reason"] == "NONFINITE_FINAL_ORDER"
+
+
+def test_market_budget_invariant_failure_blocks_order_submission():
+    out, meta = _apply([_candidate("005930", "KOSPI")], budgets={
+        "KOSPI": float("nan"), "KOSDAQ": 0,
+    })
+    assert out == [] and not meta["invariant_valid"]
+
+
+def test_invariant_false_clears_all_orderable_candidates(monkeypatch):
+    monkeypatch.setenv("KR_MAX_GROSS_EXPOSURE_PCT", "0.50")
+    out, meta = _apply([_candidate("005930", "KOSPI")], overlay={
+        "portfolio_equity_krw": 100_000_000, "gross_exposure_pct": .60,
+        "sector_exposure_pct": {}, "high_beta_exposure_pct": 0,
+    })
+    assert out == [] and not meta["invariant_valid"]
+
+
+def test_production_sequence_does_not_submit_when_final_invariant_is_false():
+    submitted = []
+    candidate = _candidate("005930", "KOSPI")
+    candidate.planned_value = float("inf")
+    orderable, meta = _apply([candidate])
+    for order in orderable:  # production submits only this returned collection
+        submitted.append(order)
+    assert not meta["invariant_valid"] and orderable == [] and submitted == []

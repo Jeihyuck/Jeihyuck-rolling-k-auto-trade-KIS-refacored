@@ -1228,7 +1228,7 @@ def _enforce_kr_final_order_invariants(
     base_overlay: dict[str, Any], existing_positions: list[dict[str, Any]],
     market_budgets: dict[str, float], total_tick_cap: float,
     slots_remaining_at_tick_start: int, max_positions: int,
-    existing_positions_count: int, equity_krw: float,
+    existing_positions_count: int, available_cash: float,
 ) -> tuple[list["CandidateFeature"], dict[str, Any]]:
     """Apply the last, notional-aware portfolio gate immediately before orders.
 
@@ -1236,13 +1236,35 @@ def _enforce_kr_final_order_invariants(
     increase ``planned_value``.  This pass enforces slot, market, account,
     single-name and cumulative sector/gross limits using the rebuilt quantity.
     """
+    import math
+
+    def _number_or_nan(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError, OverflowError):
+            return float("nan")
+
     accepted: list[CandidateFeature] = []
     accepted_positions: list[dict[str, Any]] = []
     planned_by_market = {"KOSPI": 0.0, "KOSDAQ": 0.0}
-    remaining_total = max(0.0, float(total_tick_cap))
+    total_tick_cap = _number_or_nan(total_tick_cap)
+    remaining_total = max(0.0, total_tick_cap) if math.isfinite(total_tick_cap) else 0.0
     slot_cap = max(0, min(int(slots_remaining_at_tick_start), int(max_positions) - int(existing_positions_count)))
     projected_overlay = dict(base_overlay or {})
-    projected_overlay["portfolio_equity_krw"] = float(equity_krw or 0.0)
+    # Mark-to-market equity from the account snapshot is the sole denominator.
+    # Never replace it with available_cash + position cost basis.
+    equity_krw = _number_or_nan(projected_overlay.get("portfolio_equity_krw") or 0.0)
+    cash = _number_or_nan(available_cash or 0.0)
+    gross_cap = _number_or_nan(os.getenv("KR_MAX_GROSS_EXPOSURE_PCT", "0.95"))
+    normalized_market_budgets = {market: _number_or_nan(market_budgets.get(market, 0.0)) for market in planned_by_market}
+    input_values = [equity_krw, cash, total_tick_cap, gross_cap, *normalized_market_budgets.values()]
+    if equity_krw <= 0 or cash < 0 or not all(math.isfinite(v) for v in input_values):
+        return [], {
+            "slots_start": slots_remaining_at_tick_start, "slot_cap": slot_cap,
+            "final_new_orders": 0, "planned_value_by_market": planned_by_market,
+            "planned_value_sum": 0.0, "projected_gross_exposure_pct": projected_overlay.get("gross_exposure_pct", 0.0),
+            "invariant_valid": False, "reason": "INVALID_PORTFOLIO_EQUITY" if equity_krw <= 0 else "NONFINITE_INVARIANT_INPUT",
+        }
 
     for candidate in candidates:
         if len(accepted) >= slot_cap:
@@ -1251,10 +1273,20 @@ def _enforce_kr_final_order_invariants(
         market = normalize_kr_market(getattr(candidate, "market", "") or features.get("market"))
         if market not in planned_by_market:
             continue
-        price = float(features.get("order_price") or 0.0)
-        remaining_market = max(0.0, float(market_budgets.get(market, 0.0)) - planned_by_market[market])
+        price = _number_or_nan(features.get("order_price") or 0.0)
+        planned_qty = _number_or_nan(candidate.planned_qty or 0)
+        planned_value = _number_or_nan(candidate.planned_value or 0.0)
+        if not all(math.isfinite(v) and v > 0 for v in (price, planned_qty, planned_value)):
+            return [], {
+                "slots_start": slots_remaining_at_tick_start, "slot_cap": slot_cap,
+                "final_new_orders": 0, "planned_value_by_market": planned_by_market,
+                "planned_value_sum": sum(planned_by_market.values()),
+                "projected_gross_exposure_pct": projected_overlay.get("gross_exposure_pct", 0.0),
+                "invariant_valid": False, "reason": "NONFINITE_FINAL_ORDER",
+            }
+        remaining_market = max(0.0, normalized_market_budgets[market] - planned_by_market[market])
         max_notional = min(remaining_total, remaining_market)
-        qty = min(int(candidate.planned_qty or 0), int(max_notional // price) if price > 0 else 0)
+        qty = min(int(planned_qty), int(max_notional // price) if price > 0 else 0)
 
         # The portfolio gate is monotonic in quantity.  Binary search preserves
         # the largest affordable quantity instead of discarding a useful order.
@@ -1301,13 +1333,25 @@ def _enforce_kr_final_order_invariants(
         len(accepted) <= slot_cap
         and existing_positions_count + len(accepted) <= max_positions
         and planned_sum <= total_tick_cap + 0.01
-        and all(planned_by_market[m] <= float(market_budgets.get(m, 0.0)) + 0.01 for m in planned_by_market)
+        and planned_sum <= cash + 0.01
+        and all(planned_by_market[m] <= normalized_market_budgets[m] + 0.01 for m in planned_by_market)
+        and math.isfinite(float(projected_overlay.get("gross_exposure_pct") or 0.0))
+        and float(projected_overlay.get("gross_exposure_pct") or 0.0) < gross_cap
+        and all(
+            math.isfinite(float(c.planned_qty)) and c.planned_qty > 0
+            and math.isfinite(float(c.planned_value)) and c.planned_value > 0
+            and math.isfinite(float((c.features or {}).get("order_price") or 0.0))
+            and float((c.features or {}).get("order_price") or 0.0) > 0
+            for c in accepted
+        )
     )
+    if not valid:
+        accepted = []
     return accepted, {
         "slots_start": slots_remaining_at_tick_start, "slot_cap": slot_cap,
         "final_new_orders": len(accepted), "planned_value_by_market": planned_by_market,
         "planned_value_sum": planned_sum, "projected_gross_exposure_pct": projected_overlay.get("gross_exposure_pct", 0.0),
-        "invariant_valid": valid,
+        "invariant_valid": valid, "reason": None if valid else "KR_FINAL_ORDER_INVARIANT_BLOCK",
     }
 
 
@@ -17280,12 +17324,18 @@ class PB1Engine:
                     market_budgets=market_budgets, total_tick_cap=total_tick_cap,
                     slots_remaining_at_tick_start=slots_remaining, max_positions=max_positions,
                     existing_positions_count=existing_positions_count,
-                    equity_krw=float(getattr(self, "_equity_krw", 0.0) or available_cash_krw),
+                    available_cash=float(available_cash_krw or 0.0),
                 )
                 planned_sum = float(final_invariants["planned_value_sum"])
                 planned_by_market = dict(final_invariants["planned_value_by_market"])
                 budget_sum = sum(market_budgets.values())
                 invariant_valid = bool(final_invariants["invariant_valid"]) and budget_sum <= total_tick_cap + .01 and planned_sum <= float(available_cash_krw or 0) + .01
+                if not invariant_valid:
+                    logger.error("[KR_REGIME][BUDGET_INVARIANT][BLOCK] reason=%s total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f", final_invariants.get("reason") or "COMPOSITE_INVARIANT_FAILURE", total_tick_cap, budget_sum, planned_sum)
+                    for candidate in orderable_candidates:
+                        self._log_order_skip(candidate, ["KR_FINAL_ORDER_INVARIANT_BLOCK"], "PB1-CLOSE")
+                    orderable_candidates = []
+                    final_invariants["final_new_orders"] = 0
                 logger.info("[KR_REGIME][BUDGET_INVARIANT] total_tick_cap=%.0f market_budget_sum=%.0f planned_value_sum=%.0f planned_kospi=%.0f planned_kosdaq=%.0f slots_start=%s final_new_orders=%s projected_gross=%.4f valid=%s", total_tick_cap, budget_sum, planned_sum, planned_by_market["KOSPI"], planned_by_market["KOSDAQ"], final_invariants["slots_start"], final_invariants["final_new_orders"], final_invariants["projected_gross_exposure_pct"], int(invariant_valid))
                 atomic_json_write("artifacts/kr_market_budget.json", {"as_of": str(getattr(self, "_now_kst", None) or now_kst()), "base_tick_budget": base_tick_budget, "global_multiplier": snapshot.execution_policy.budget_multiplier, "total_tick_cap": total_tick_cap, "available_cash": float(available_cash_krw or 0), "market_budgets": market_budgets, "market_budget_sum": budget_sum, "planned_value_by_market": planned_by_market, "planned_value_sum": planned_sum, "slots_remaining_at_tick_start": final_invariants["slots_start"], "final_new_orders": final_invariants["final_new_orders"], "projected_gross_exposure_pct": final_invariants["projected_gross_exposure_pct"], "invariant_valid": invariant_valid})
             orderable_codes = [c.code for c in orderable_candidates]
