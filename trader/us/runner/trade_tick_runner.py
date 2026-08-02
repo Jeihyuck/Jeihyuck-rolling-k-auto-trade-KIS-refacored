@@ -189,6 +189,28 @@ def _prior_failed_orders_require_reconcile_only(trade_date: str, session: str) -
     return False
 
 
+def _journal_has_unrecovered_buy_ack(trade_date: str) -> bool:
+    """Fence BUY while a broker ACK has no durable DB-ACK recovery evidence."""
+    try:
+        from trader.us.execution.order_journal import load_order_events
+        events = load_order_events(trade_date)
+    except Exception as exc:
+        logger.error("[US_SAFETY][JOURNAL_ACK_CHECK_FAILED] trade_date=%s error=%s", trade_date, exc)
+        return True
+    grouped: dict[str, list[dict]] = {}
+    for event in events:
+        key = str(event.get("client_order_key") or "").strip()
+        if key:
+            grouped.setdefault(key, []).append(event)
+    recovered_types = {"DB_ACK_PERSISTED", "JOURNAL_REPLAY_DB_ACK_RESTORED"}
+    for order_events in grouped.values():
+        types = {str(event.get("event_type") or "") for event in order_events}
+        side = str(order_events[-1].get("side") or "").upper()
+        if side == "BUY" and "BROKER_ACK_RECEIVED" in types and not (types & recovered_types):
+            return True
+    return False
+
+
 def _write_reconcile_only_clean_marker(*, trade_date: str, session: str, tick_index: int) -> str:
     """Persist a tick-level clean marker so the next tick is allowed to trade."""
     timestamp = datetime.utcnow().isoformat() + "Z"
@@ -889,7 +911,10 @@ def run_trade_tick(
     trade_date = now.strftime("%Y-%m-%d")
     session_run_id = session_run_id or os.getenv("US_RUN_ID") or os.getenv("GITHUB_RUN_ID", "local")
     tick_id = tick_id or f"{session_run_id}:{tick_index}"
-    prior_failed_orders_reconcile_required = _prior_failed_orders_require_reconcile_only(trade_date, session)
+    prior_failed_orders_reconcile_required = (
+        _prior_failed_orders_require_reconcile_only(trade_date, session)
+        or _journal_has_unrecovered_buy_ack(trade_date)
+    )
     reconcile_only_until_clean = prior_failed_orders_reconcile_required
     if reconcile_only_until_clean:
         logger.warning("[US_SAFETY][RECONCILE_ONLY] reason=prior_failed_orders_reconcile_required")
@@ -2409,6 +2434,7 @@ def run_trade_tick(
     router_blocked_after_preflight = []
     routing_cluster_exposure = dict(projected_state.get("cluster_exposure_start") or {})
     routing_available_cash = max(effective_budget, 0.0)
+    ack_db_failed_buy_stop = False
     if not routing_cluster_exposure:
         for _position in current_positions or []:
             from trader.us.rotation import theme_cluster_for
@@ -2455,6 +2481,33 @@ def run_trade_tick(
                 projected_order_keys=_router_risk_state["order_keys"],
             )
             orders.append(result)
+            if (
+                str(intent.get("side") or "BUY").upper() == "BUY"
+                and result.get("status") == "ACK_DB_FAILED"
+            ):
+                # The broker accepted this order even though durable order-row
+                # persistence failed. Account for the commitment immediately,
+                # then stop every later BUY until journal reconciliation proves
+                # the ACK has been recovered. Exits have already routed first.
+                ack_payload = result.get("ack") if isinstance(result.get("ack"), dict) else {}
+                committed = float(
+                    ack_payload.get("committed_notional_usd")
+                    or intent.get("notional_usd")
+                    or (float(intent.get("qty") or 0) * float(intent.get("limit_price") or intent.get("limit_price_usd") or 0))
+                    or 0.0
+                )
+                buy_daily_notional += committed
+                routing_available_cash = max(0.0, routing_available_cash - committed)
+                ack_db_failed_buy_stop = True
+                reconcile_only_until_clean = True
+                global_stop_reason = "ack_db_failed_reconcile_required"
+                entry_degraded = True
+                entry_degraded_reason = "ACK_DB_FAILED_RECONCILE_REQUIRED"
+                logger.critical(
+                    "[US_ENTRY][ACK_DB_FAILED][BUY_STOP] symbol=%s committed=%.4f subsequent_buy=blocked",
+                    intent.get("symbol"), committed,
+                )
+                break
             if str(intent.get("side") or "BUY").upper() == "BUY" and result.get("status") in {
                 "BLOCKED", "INVALID_ORDER_IDENTITY", "ORDER_DISABLED", "EXCHANGE_MISSING_FATAL",
             }:
@@ -2658,7 +2711,8 @@ def run_trade_tick(
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     total_errors = fills_error_count + entry_eval_error_count + err_cnt
     total_warnings = fills_warnings_count
-    orders_sent = ack_cnt + dry_cnt  # ACK + DRY_RUN = 실제 주문 시도 수
+    # ACK_DB_FAILED still means the broker accepted a real submission.
+    orders_sent = ack_cnt + dry_cnt + ack_db_failed_cnt
     orders_failed = reject_cnt + err_cnt
     exit_intents_count = len(exit_intents)
     entry_intents_count = len(entry_intents)
@@ -2921,6 +2975,9 @@ def run_trade_tick(
         "router_blocked_after_preflight": locals().get("router_blocked_after_preflight", []),
         "candidate_local_reject_counts": _blocked_entry_reason_counts(locals().get("preflight_rejected_candidates", []), []),
         "global_stop_reason": locals().get("global_stop_reason", ""),
+        "reconcile_only_until_clean": int(locals().get("reconcile_only_until_clean", False)),
+        "manual_reconcile_required": int(locals().get("ack_db_failed_buy_stop", False)),
+        "ack_db_failed_buy_stop": int(locals().get("ack_db_failed_buy_stop", False)),
         "daily_notional_load_error": locals().get("daily_notional_load_error", ""),
         "system_invariant_failure": locals().get("system_invariant_failure", ""),
         "projected_cash_start": locals().get("projected_cash_start", 0.0),

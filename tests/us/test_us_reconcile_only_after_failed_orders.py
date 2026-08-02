@@ -2,10 +2,28 @@ import json
 
 from trader.us.execution import reconcile
 from trader.us.runner.trade_tick_runner import (
+    _journal_has_unrecovered_buy_ack,
     _prior_failed_orders_require_reconcile_only,
     _suppress_pending_sell_exit_intents,
     run_trade_tick,
 )
+
+
+def test_unrecovered_buy_ack_journal_fences_next_tick_until_db_ack_recovery(tmp_path, monkeypatch):
+    from trader.us.execution.order_journal import append_order_event
+
+    monkeypatch.setenv("US_ORDER_JOURNAL_DIR", str(tmp_path / "journal"))
+    intent = {
+        "trade_date": "2026-07-31", "client_order_key": "buy-ack-db-failed",
+        "symbol": "AAPL", "exchange": "NASDAQ", "side": "BUY", "qty": 1,
+        "limit_price": 100, "notional_usd": 100,
+    }
+    append_order_event("BROKER_SUBMIT_STARTED", intent)
+    append_order_event("BROKER_ACK_RECEIVED", intent, broker_order_no="ORDER-1", broker_status="ACK")
+    assert _journal_has_unrecovered_buy_ack("2026-07-31") is True
+
+    append_order_event("JOURNAL_REPLAY_DB_ACK_RESTORED", intent, broker_order_no="ORDER-1")
+    assert _journal_has_unrecovered_buy_ack("2026-07-31") is False
 
 
 def test_prior_failed_ack_session_requires_reconcile_only(tmp_path, monkeypatch):

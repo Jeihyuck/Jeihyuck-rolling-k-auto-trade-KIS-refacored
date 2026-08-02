@@ -116,6 +116,24 @@ def test_committed_daily_buy_notional_deduplicates_statuses(monkeypatch):
     assert load_today_committed_buy_notional("2026-07-31") == 900
 
 
+def test_filled_buy_remains_in_committed_daily_notional(monkeypatch):
+    from trader.us.db.repos import load_today_committed_buy_notional
+
+    rows = [{
+        "side": "BUY", "status": "FILLED", "client_order_key": "filled-key",
+        "committed_notional_usd": 600, "env": "practice",
+    }]
+    class Result:
+        def mappings(self): return self
+        def all(self): return rows
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def execute(self, *args): return Result()
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: type("Engine", (), {"connect": lambda self: Connection()})())
+    assert load_today_committed_buy_notional("2026-07-31") == 600
+
+
 def test_strict_committed_notional_distinguishes_unavailable_from_authoritative_zero(monkeypatch):
     from trader.us.db.repos import load_today_committed_buy_notional_result
     monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: None)

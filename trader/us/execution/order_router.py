@@ -1214,9 +1214,11 @@ def route_order(
             "symbol": symbol,
             "side": side,
             "ack": ack_result,
+            "committed_notional_usd": ack_result.get("committed_notional_usd"),
             "requires_reconcile": True,
             "intent": intent,
             "kis_ack": True,
+            "broker_submit": True,
             "ack_db_saved": False,
             "retry_order": False,
         }

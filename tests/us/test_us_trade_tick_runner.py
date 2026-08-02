@@ -91,7 +91,8 @@ def test_monitoring_universe_is_union_of_final30_and_positions():
     assert build_monitoring_universe(final30, positions) == {"NVDA", "TSLA", "APP", "BE", "INTC"}
 
 
-def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch):
+@pytest.mark.parametrize("ack_db_failure", [False, True])
+def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch, ack_db_failure):
     """Regression: filtered leaders must not consume the engine's three slots."""
     from trader.us.runner.trade_tick_runner import run_trade_tick
 
@@ -137,7 +138,14 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch):
     captured = {}
     class Engine:
         last_entry_diagnostics = {"attempted": 3, "accepted": 3}
-        def evaluate_exits(self, positions, provider, now): return []
+        def evaluate_exits(self, positions, provider, now):
+            if not ack_db_failure:
+                return []
+            return [{
+                "symbol": "EXIT", "exchange": "NYSE", "side": "SELL", "qty": 1,
+                "notional_usd": 50, "limit_price": 50, "client_order_key": "key-exit",
+                "meta": {},
+            }]
         def evaluate_entries(self, *args, **kwargs):
             rows = args[6]
             captured["eligible"] = [row["symbol"] for row in rows]
@@ -148,9 +156,17 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch):
             } for row in rows[:3]]
     monkeypatch.setattr("trader.us.runner.trade_tick_runner._get_strategy_engine", lambda **kwargs: Engine())
     routed = []
-    monkeypatch.setattr("trader.us.execution.order_router.route_order", lambda intent, **kwargs: (
-        routed.append(intent) or {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent}
-    ))
+    def fake_route(intent, **kwargs):
+        routed.append(intent)
+        if ack_db_failure and intent["side"] == "BUY":
+            return {
+                "status": "ACK_DB_FAILED", "side": intent["side"], "symbol": intent["symbol"],
+                "intent": intent, "kis_ack": True, "ack_db_saved": False,
+                "requires_reconcile": True,
+                "ack": {"committed_notional_usd": intent["notional_usd"]},
+            }
+        return {"status": "ACK", "side": intent["side"], "symbol": intent["symbol"], "intent": intent}
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", fake_route)
 
     rows = [
         {"symbol": "DDOG", "exchange": "NASDAQ", "theme_cluster": "AI_SOFTWARE", "trend_score": 1, "score_final": .9, "score": .9, "rank_final30": 1},
@@ -166,6 +182,12 @@ def test_20260731_risk_off_prefilter_backfills_full_tick(monkeypatch):
     )
 
     assert captured["eligible"][:3] == ["MPC", "KO", "AMGN"]
-    assert [intent["symbol"] for intent in routed] == ["MPC", "KO", "AMGN"]
+    assert [intent["symbol"] for intent in routed] == (["EXIT", "MPC"] if ack_db_failure else ["MPC", "KO", "AMGN"])
     assert result["prefilter_blocked_candidates"][0]["symbol"] == "DDOG"
     assert result["final_entry_intents"] == 3
+    if ack_db_failure:
+        assert result["entry_degraded_reason"] == "ACK_DB_FAILED_RECONCILE_REQUIRED"
+        assert result["global_stop_reason"] == "ack_db_failed_reconcile_required"
+        assert result["ack_db_failed_buy_stop"] == 1
+        assert result["reconcile_only_until_clean"] == 1
+        assert result["actual_daily_buy_notional"] == 100.0

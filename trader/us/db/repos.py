@@ -3659,7 +3659,10 @@ def load_today_committed_buy_notional_result(trade_date: str, env: str = "practi
             rows = [dict(row) for row in result.mappings().all()] if hasattr(result, "mappings") else [dict(row) for row in result]
     except Exception as exc:
         return CommittedBuyNotionalResult(False, 0.0, 0, f"{type(exc).__name__}: {exc}")
-    statuses = {"ACK", "SUBMITTED", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED", "DRY_RUN"}
+    statuses = {
+        "ACK", "SUBMITTED", "PARTIALLY_FILLED", "FILLED",
+        "RECONCILE_PENDING", "ACK_DB_FAILED", "DRY_RUN",
+    }
     if include_pending:
         statuses.add("PENDING")
     seen: set[str] = set()

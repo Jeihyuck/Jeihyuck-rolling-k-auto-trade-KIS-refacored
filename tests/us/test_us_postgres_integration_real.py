@@ -134,12 +134,17 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
         "side": "BUY", "qty_requested": 6, "qty_filled": 0, "order_no": "ack-order",
         "status": "ACK", "committed_notional_usd": 600, "env": "practice",
     }, trade_date="2026-07-31")
-    # A status transition for one key updates the row and must not double count.
-    assert repos.save_order_ack({
-        "client_order_key": "ack-key", "symbol": "AAPL", "exchange": "NASDAQ",
-        "side": "BUY", "qty_requested": 6, "qty_filled": 1, "order_no": "ack-order",
-        "status": "PARTIALLY_FILLED", "committed_notional_usd": 600, "env": "practice",
-    }, trade_date="2026-07-31")
+    # The real reconcile path transitions ACK to FILLED while retaining the
+    # original requested commitment used by the daily limit.
+    filled = repos.mark_order_filled_by_reconcile(
+        order_no="ack-order", client_order_key="ack-key", symbol="AAPL", side="BUY",
+        filled_qty=6, requested_qty=6, cumulative_filled_qty=6, avg_price_usd=101,
+        trade_date="2026-07-31", evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
+        source="fills_by_order_no",
+    )
+    assert filled["status"] == "OK"
+    with pg_engine.begin() as conn:
+        assert conn.execute(text("SELECT status FROM us_orders WHERE client_order_key='ack-key'")).scalar_one() == "FILLED"
     assert repos.save_dry_run_order({
         "client_order_key": "dry-key", "symbol": "MSFT", "exchange": "NASDAQ",
         "side": "BUY", "qty": 1, "limit_price_usd": 100, "notional_usd": 100,
@@ -185,6 +190,7 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
     # smaller candidate can still backfill.
     from trader.us.execution.order_router import select_preflight_buy_candidates
     monkeypatch.setenv("US_MAX_DAILY_NOTIONAL_USD", "1500")
+    monkeypatch.setenv("US_MAX_ORDER_USD", "1000")
     state = {
             "available_cash_usd": 10000, "daily_notional_usd": committed.notional_usd,
             "position_count": 0, "portfolio_usd": 100000, "order_keys": set(),
