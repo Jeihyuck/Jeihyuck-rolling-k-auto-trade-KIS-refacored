@@ -25,3 +25,20 @@ def test_account_kill_switch_can_trim_both_markets():
 
 def test_unknown_position_market_is_not_regime_trimmed():
     assert generate_kr_defense_trim_intents([{"code":"A","qty":10}],snapshot()) == []
+
+
+def test_defense_trim_global_max_symbols_per_tick(monkeypatch):
+    monkeypatch.setenv("KR_DEFENSE_MAX_TRIM_SYMBOLS_PER_TICK", "2")
+    positions = [{"code": f"A{i}", "market": "KOSDAQ", "qty": 10, "unrealized_pnl_pct": -.01} for i in range(5)]
+    assert len(generate_kr_defense_trim_intents(positions, snapshot())) == 2
+
+
+def test_per_position_exit_loop_cannot_reset_trim_limit():
+    import inspect
+    from trader.pb1_engine import PB1Engine
+
+    exit_pass = inspect.getsource(PB1Engine._run_exit_always)
+    exit_plan = inspect.getsource(PB1Engine._plan_exit_event)
+    assert "self._kr_defense_trim_symbols_this_tick = set()" in exit_pass
+    assert 'getattr(self, "_kr_defense_trim_symbols_this_tick", set())' in exit_plan
+    assert "trimmed_this_tick.add(code)" in exit_plan

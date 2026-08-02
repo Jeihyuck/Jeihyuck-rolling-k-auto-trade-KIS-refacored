@@ -29,4 +29,4 @@ def test_production_path_enforces_budget_invariant_and_writes_artifact():
  source=inspect.getsource(PB1Engine.run)
  assert "[KR_REGIME][BUDGET_INVARIANT]" in source
  assert 'artifacts/kr_market_budget.json' in source
- assert "remaining_cash = total_tick_cap" in source
+ assert "_enforce_kr_final_order_invariants(" in source

@@ -69,6 +69,7 @@ jobs:
           pytest tests/kr/test_kr_regime_production_path.py -q
           pytest tests/kr/test_kr_market_budget_allocation.py -q
           pytest tests/kr/test_kr_market_local_entry_and_trim.py -q
+          pytest tests/kr/test_kr_final_order_invariants.py -q
           pytest tests/test_watchlist_scored_roundtrip.py -q
           pytest tests/kr -q
 
