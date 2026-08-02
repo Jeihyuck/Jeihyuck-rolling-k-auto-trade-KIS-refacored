@@ -63,7 +63,14 @@ jobs:
           pytest tests/test_pb1_volume_config_unified.py -q
 
       - name: New KR regime tests
-        run: pytest tests/kr -q
+        run: |
+          pytest tests/kr/test_kr_regime.py -q
+          pytest tests/kr/test_kr_regime_runtime.py -q
+          pytest tests/kr/test_kr_regime_production_path.py -q
+          pytest tests/kr/test_kr_market_budget_allocation.py -q
+          pytest tests/kr/test_kr_market_local_entry_and_trim.py -q
+          pytest tests/test_watchlist_scored_roundtrip.py -q
+          pytest tests/kr -q
 
       - name: Check KR legacy regime removal
         run: bash scripts/check_kr_legacy_regime.sh

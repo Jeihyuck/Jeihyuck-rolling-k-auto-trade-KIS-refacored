@@ -141,7 +141,9 @@ def structural_regime_cap(observations: Mapping[str, Any]) -> str:
         return "KR_DEFENSE_CRASH"
     if close < ma20 and close < ma50:
         return "KR_DEFENSE_CAUTION"
-    if close >= ma20 and close < ma50:
+    if close < ma20:
+        return "KR_NORMAL"
+    if close < ma50:
         return "KR_NORMAL"
     if (_number(observations, "ma20_slope_5d") or 0) <= 0:
         return "KR_NORMAL"
@@ -208,7 +210,8 @@ def calculate_market_state(market: str, observations: Mapping[str, Any], *,
     if observations.get("volatility_spike"): risk -= 2.0
     if (_number(observations, "intraday_return") or 0.0) <= -.02: risk -= 2.0
     if (_number(observations, "gap_return") or 0.0) <= -.015: risk -= 2.0
-    score = max(-100.0, min(100.0, breadth + momentum + risk))
+    components = {"trend": trend, "breadth": breadth, "momentum": momentum, "risk": risk}
+    score = max(-100.0, min(100.0, sum(components.values())))
     state = state_for_score(score)
     cap = structural_regime_cap(observations)
     if STATE_ORDER.index(state) > STATE_ORDER.index(cap):
@@ -222,7 +225,7 @@ def calculate_market_state(market: str, observations: Mapping[str, Any], *,
         state = "KR_RISK_ON"
     if account_kill_switch:
         state = "KR_DEFENSE_CRASH"
-    return KRMarketState(market, score, state, str(observations.get("input_data_quality") or "OK"), {"trend": trend, "breadth": breadth, "momentum": momentum, "risk": risk})
+    return KRMarketState(market, score, state, str(observations.get("input_data_quality") or "OK"), components)
 
 
 def execution_policy(state: str, *, data_quality: str = "OK") -> KRExecutionPolicy:
@@ -250,14 +253,9 @@ def market_execution_policies(states: Mapping[str, KRMarketState], quality: str)
     return result
 
 
-def constrain_global_policy(policy: KRExecutionPolicy, market_policies: Mapping[str, KRMarketExecutionPolicy]) -> KRExecutionPolicy:
-    active = [p for p in market_policies.values() if p.data_quality != "BLOCKED"]
-    if not active:
-        return replace(policy, budget_multiplier=0.0, max_new_positions=0, allow_new_buy=False, allow_add_to_existing=False)
-    finite_limits = [p.max_new_positions for p in active if p.max_new_positions is not None]
-    return replace(policy, budget_multiplier=min(p.budget_multiplier for p in active),
-                   max_new_positions=min(finite_limits) if finite_limits else None,
-                   allow_new_buy=any(p.allow_new_buy for p in active))
+def calculate_global_market_state(market_states: Mapping[str, KRMarketState]) -> str:
+    healthy = [value.state for value in market_states.values() if value.data_quality != "BLOCKED"]
+    return min(healthy, key=STATE_ORDER.index) if healthy else "KR_DEFENSE_CRASH"
 
 
 def build_kr_regime_snapshot(observations: Mapping[str, Mapping[str, Any]], *,
@@ -271,7 +269,7 @@ def build_kr_regime_snapshot(observations: Mapping[str, Mapping[str, Any]], *,
     healthy = [x for x in states.values() if x.data_quality != "BLOCKED"]
     quality = "BLOCKED" if not healthy else "OK" if len(healthy) == len(states) and all(x.data_quality == "OK" for x in healthy) else "DEGRADED"
     # A failed market is excluded rather than zeroing a healthy market's budget.
-    global_state = min((x.state for x in healthy), key=STATE_ORDER.index) if healthy else "KR_DEFENSE_CRASH"
+    global_state = calculate_global_market_state(states)
     policy = execution_policy(global_state, data_quality=quality)
     if quality == "DEGRADED":
         policy = replace(policy, budget_multiplier=policy.budget_multiplier * .8)
@@ -298,9 +296,41 @@ def market_allows_buy(snapshot: KRRegimeSnapshot, market: str) -> bool:
                 and STATE_ORDER.index(snapshot.market_states[market].state) >= STATE_ORDER.index("KR_DEFENSE_CAUTION"))
 
 
-def calculate_market_budgets(snapshot: KRRegimeSnapshot, base_tick_budget: float, available_cash: float) -> dict[str, float]:
-    return {market: min(float(available_cash), float(base_tick_budget) * policy.budget_multiplier)
-            if policy.allow_new_buy else 0.0 for market, policy in snapshot.market_policies.items()}
+def calculate_market_budgets(snapshot: KRRegimeSnapshot, base_tick_budget: float, available_cash: float,
+                             candidate_counts: Mapping[str, int] | None = None) -> dict[str, float]:
+    counts = {market: max(0, int((candidate_counts or {}).get(market, 0))) for market in MARKETS}
+    total_cap = min(float(available_cash), float(base_tick_budget) * snapshot.execution_policy.budget_multiplier)
+    weights: dict[str, float] = {}
+    local_caps: dict[str, float] = {}
+    for market, policy in snapshot.market_policies.items():
+        effective = min(counts[market], policy.max_new_positions if policy.max_new_positions is not None else counts[market])
+        if policy.allow_new_buy and effective > 0:
+            weights[market] = policy.budget_multiplier * effective
+            local_caps[market] = float(base_tick_budget) * policy.budget_multiplier
+    budgets = {market: 0.0 for market in MARKETS}
+    remaining = total_cap
+    active = set(weights)
+    while active and remaining > .01:
+        weight_sum = sum(weights[m] for m in active)
+        allocated = 0.0
+        for market in tuple(active):
+            room = local_caps[market] - budgets[market]
+            addition = min(room, remaining * weights[market] / weight_sum)
+            budgets[market] += addition; allocated += addition
+            if room - addition <= .01: active.remove(market)
+        if allocated <= .01: break
+        remaining -= allocated
+    return budgets
+
+
+def build_market_local_overlay(base_overlay: Mapping[str, Any], snapshot: KRRegimeSnapshot, market: str) -> dict[str, Any]:
+    normalized = normalize_kr_market(market)
+    state = snapshot.market_states[normalized]; policy = snapshot.market_policies[normalized]
+    global_veto = bool(base_overlay.get("account_loss_kill_switch_triggered"))
+    return {**dict(base_overlay), "market": normalized, "market_state": state.state,
+            "data_quality": state.data_quality, "allow_new_buy": policy.allow_new_buy and not global_veto,
+            "force_entry_block": global_veto or not policy.allow_new_buy, "exposure_multiplier": policy.budget_multiplier,
+            "max_new_positions": policy.max_new_positions}
 
 
 def candidate_allows_buy(candidate: Mapping[str, Any], state: str) -> tuple[bool, str | None]:

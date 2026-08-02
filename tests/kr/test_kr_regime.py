@@ -1,4 +1,4 @@
-from trader.kr.regime import build_kr_regime_snapshot, market_allows_buy, write_snapshot
+from trader.kr.regime import build_kr_regime_snapshot, calculate_market_state, market_allows_buy, write_snapshot
 
 
 def observations(up=True):
@@ -155,6 +155,24 @@ def test_market_budget_is_applied_independently():
     kospi=observations(True)
     kosdaq=observations(False)
     snap=build_kr_regime_snapshot({"KOSPI":kospi,"KOSDAQ":kosdaq})
-    budgets=calculate_market_budgets(snap,10_000_000,100_000_000)
+    budgets=calculate_market_budgets(snap,10_000_000,100_000_000,{"KOSPI":2,"KOSDAQ":1})
     assert budgets["KOSPI"] != budgets["KOSDAQ"]
     assert budgets["KOSPI"] > budgets["KOSDAQ"]
+
+
+def test_close_below_ma20_above_ma50_caps_at_normal():
+    row=observations(True); row.update({"close":105,"ma20":110,"ma50":100})
+    assert calculate_market_state("KOSPI",row).state == "KR_NORMAL"
+
+def test_components_sum_matches_market_score_and_includes_trend():
+    state=calculate_market_state("KOSPI",observations(True))
+    assert state.score == max(-100,min(100,sum(state.components.values())))
+    assert state.components["trend"] == 40
+
+def test_negative_trend_downgrades_otherwise_positive_market():
+    positive=observations(True); negative=dict(positive); negative.update({"close":90,"ma20":110,"ma50":105,"ma200":100,"ma20_slope_5d":-1})
+    assert calculate_market_state("KOSPI",negative).score < calculate_market_state("KOSPI",positive).score
+
+def test_both_blocked_markets_produce_global_crash():
+    snap=build_kr_regime_snapshot({})
+    assert snap.global_state == "KR_DEFENSE_CRASH" and snap.data_quality == "BLOCKED"
