@@ -100,10 +100,10 @@ def test_expensive_candidate_does_not_globally_stop_cheaper_candidate():
 def test_committed_daily_buy_notional_deduplicates_statuses(monkeypatch):
     from trader.us.db.repos import load_today_committed_buy_notional
     rows = [
-        {"side": "BUY", "status": "ACK", "client_order_key": "a", "notional_usd": 600},
-        {"side": "BUY", "status": "PENDING", "client_order_key": "a", "notional_usd": 600},
-        {"side": "BUY", "status": "DRY_RUN", "client_order_key": "b", "notional_usd": 300},
-        {"side": "SELL", "status": "ACK", "client_order_key": "c", "notional_usd": 999},
+        {"side": "BUY", "status": "ACK", "client_order_key": "a", "committed_notional_usd": 600, "env": "practice"},
+        {"side": "BUY", "status": "PENDING", "client_order_key": "a", "committed_notional_usd": 600, "env": "practice"},
+        {"side": "BUY", "status": "DRY_RUN", "client_order_key": "b", "committed_notional_usd": 300, "env": "practice"},
+        {"side": "SELL", "status": "ACK", "client_order_key": "c", "committed_notional_usd": 999, "env": "practice"},
     ]
     class Result:
         def mappings(self): return self
@@ -116,7 +116,7 @@ def test_committed_daily_buy_notional_deduplicates_statuses(monkeypatch):
     assert load_today_committed_buy_notional("2026-07-31") == 900
 
 
-def test_strict_committed_notional_distinguishes_unavailable_zero_and_fallback(monkeypatch):
+def test_strict_committed_notional_distinguishes_unavailable_from_authoritative_zero(monkeypatch):
     from trader.us.db.repos import load_today_committed_buy_notional_result
     monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: None)
     assert load_today_committed_buy_notional_result("2026-07-31").available is False
@@ -131,12 +131,43 @@ def test_strict_committed_notional_distinguishes_unavailable_zero_and_fallback(m
         def __exit__(self, *args): pass
         def execute(self, *args):
             self.calls += 1
-            if self.calls == 1: raise RuntimeError("primary query failed")
-            return Result([])
+            raise RuntimeError("authoritative query failed")
     connection = Connection()
     monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: type("Engine", (), {"connect": lambda self: connection})())
     result = load_today_committed_buy_notional_result("2026-07-31")
-    assert result.available is True and result.notional_usd == 0 and connection.calls == 2
+    assert result.available is False and connection.calls == 1
+
+    class HealthyConnection(Connection):
+        def execute(self, *args):
+            self.calls += 1
+            return Result([])
+    healthy = HealthyConnection()
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: type("Engine", (), {"connect": lambda self: healthy})())
+    result = load_today_committed_buy_notional_result("2026-07-31")
+    assert result.available is True and result.notional_usd == 0 and healthy.calls == 1
+
+
+@pytest.mark.parametrize(
+    "row,error_fragment",
+    [
+        ({"side": "BUY", "status": "ACK", "client_order_key": "missing-env", "committed_notional_usd": 100}, "environment"),
+        ({"side": "BUY", "status": "ACK", "client_order_key": "missing-value", "env": "practice"}, "notional"),
+    ],
+)
+def test_strict_committed_notional_fails_closed_on_unrecoverable_legacy_risk_data(monkeypatch, row, error_fragment):
+    from trader.us.db.repos import load_today_committed_buy_notional_result
+
+    class Result:
+        def mappings(self): return self
+        def all(self): return [row]
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def execute(self, *args): return Result()
+    monkeypatch.setattr("trader.us.db.repos._get_engine_or_none", lambda: type("Engine", (), {"connect": lambda self: Connection()})())
+    result = load_today_committed_buy_notional_result("2026-07-31")
+    assert result.available is False
+    assert error_fragment in (result.error or "")
 
 
 def test_oversized_daily_notional_candidate_backfills_smaller_candidates(monkeypatch):

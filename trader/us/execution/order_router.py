@@ -1177,6 +1177,8 @@ def route_order(
         "order_no": order_no,
         "status": "ACK",
         "dry_run": False,
+        "committed_notional_usd": float(qty) * float(price),
+        "env": account_env,
         "meta": ack_meta,
     }
 

@@ -8,6 +8,7 @@ import pathlib
 REPOS_PATH = pathlib.Path("trader/us/db/repos.py")
 MIGRATION_PATH = pathlib.Path("migrations/0038_us_agent_tables.sql")
 MIGRATION_0043_PATH = pathlib.Path("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql")
+MIGRATION_0046_PATH = pathlib.Path("migrations/0046_us_orders_committed_notional.sql")
 
 
 def _read(path):
@@ -17,6 +18,7 @@ def _read(path):
 def test_migration_exists():
     assert MIGRATION_PATH.exists()
     assert MIGRATION_0043_PATH.exists()
+    assert MIGRATION_0046_PATH.exists()
 
 
 def test_repos_uses_qty_requested():
@@ -116,6 +118,15 @@ def test_0043_has_us_fills_dedup_before_unique_index():
     assert "DELETE FROM us_fills" in sql
     assert "[DB][MIGRATE][DEDUP][DONE] status=OK" in sql
     assert sql.index("WITH ranked AS") < sql.index("CREATE UNIQUE INDEX IF NOT EXISTS uq_us_fills_idempotent")
+
+
+def test_0046_persists_committed_notional_and_environment_without_legacy_notional_column():
+    sql = _read(MIGRATION_0046_PATH)
+    assert "committed_notional_usd NUMERIC(18, 4)" in sql
+    assert "ADD COLUMN IF NOT EXISTS env TEXT" in sql
+    assert "us_order_intents i" in sql
+    assert "i.notional_usd" in sql
+    assert "ADD COLUMN IF NOT EXISTS notional_usd" not in sql
 
 
 def test_0043_adds_fill_idempotency_key_unique_index():

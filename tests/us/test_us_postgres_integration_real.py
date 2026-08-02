@@ -12,13 +12,22 @@ def pg_engine(monkeypatch):
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS us_fills CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS us_orders CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS us_order_intents CASCADE"))
+        conn.execute(text("""CREATE TABLE us_order_intents (
+            id bigserial PRIMARY KEY, trade_date date NOT NULL, client_order_key text NOT NULL UNIQUE,
+            symbol text NOT NULL, exchange text NOT NULL, side text NOT NULL, qty integer NOT NULL,
+            limit_price_usd numeric, notional_usd numeric, strategy text, status text NOT NULL DEFAULT 'PENDING',
+            meta jsonb, created_at timestamptz NOT NULL DEFAULT now())"""))
         conn.execute(text("""CREATE TABLE us_orders (
             id bigserial PRIMARY KEY, trade_date date NOT NULL, client_order_key text NOT NULL,
             symbol text NOT NULL, exchange text NOT NULL, side text NOT NULL,
             qty_requested integer NOT NULL, qty_filled integer NOT NULL DEFAULT 0,
             avg_price_usd numeric, order_no text, status text,
-            meta jsonb NOT NULL DEFAULT '{}'::jsonb,
-            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now())"""))
+            dry_run boolean NOT NULL DEFAULT true, meta jsonb,
+            created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE (client_order_key))"""))
+        migration = open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read()
+        conn.execute(text(migration))
         conn.execute(text("""CREATE TABLE us_fills (
             id bigserial PRIMARY KEY, trade_date date NOT NULL, symbol text NOT NULL,
             exchange text NOT NULL, side text NOT NULL, qty integer NOT NULL,
@@ -137,27 +146,56 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
     from sqlalchemy import text
     import trader.us.db.repos as repos
 
+    assert repos.save_order_ack({
+        "client_order_key": "ack-key", "symbol": "AAPL", "exchange": "NASDAQ",
+        "side": "BUY", "qty_requested": 6, "qty_filled": 0, "order_no": "ack-order",
+        "status": "ACK", "committed_notional_usd": 600, "env": "practice",
+    }, trade_date="2026-07-31")
+    # A status transition for one key updates the row and must not double count.
+    assert repos.save_order_ack({
+        "client_order_key": "ack-key", "symbol": "AAPL", "exchange": "NASDAQ",
+        "side": "BUY", "qty_requested": 6, "qty_filled": 1, "order_no": "ack-order",
+        "status": "PARTIALLY_FILLED", "committed_notional_usd": 600, "env": "practice",
+    }, trade_date="2026-07-31")
+    assert repos.save_dry_run_order({
+        "client_order_key": "dry-key", "symbol": "MSFT", "exchange": "NASDAQ",
+        "side": "BUY", "qty": 1, "limit_price_usd": 100, "notional_usd": 100,
+        "env": "practice", "meta": {},
+    }, trade_date="2026-07-31")
+    assert repos.save_order_ack({
+        "client_order_key": "other-env", "symbol": "NVDA", "exchange": "NASDAQ",
+        "side": "BUY", "qty_requested": 1, "qty_filled": 0, "order_no": "prod-order",
+        "status": "PENDING", "committed_notional_usd": 999, "env": "prod",
+    }, trade_date="2026-07-31")
+    for index, status in enumerate(("PENDING", "SUBMITTED", "RECONCILE_PENDING", "ACK_DB_FAILED")):
+        assert repos.save_order_ack({
+            "client_order_key": f"status-{index}", "symbol": "GOOGL", "exchange": "NASDAQ",
+            "side": "BUY", "qty_requested": 1, "qty_filled": 0,
+            "order_no": f"status-order-{index}", "status": status,
+            "committed_notional_usd": 10, "env": "practice",
+        }, trade_date="2026-07-31")
+    assert repos.save_order_ack({
+        "client_order_key": "sell-key", "symbol": "AAPL", "exchange": "NASDAQ",
+        "side": "SELL", "qty_requested": 1, "qty_filled": 0, "order_no": "sell-order",
+        "status": "ACK", "committed_notional_usd": 999, "env": "practice",
+    }, trade_date="2026-07-31")
+
+    # Legacy row: canonical columns null, recovered through the persisted intent.
     with pg_engine.begin() as conn:
-        conn.execute(text("ALTER TABLE us_orders ADD COLUMN notional_usd numeric"))
-        conn.execute(text("ALTER TABLE us_orders ADD COLUMN env text"))
-        for key, status, notional, env in (
-            ("ack-key", "ACK", 600, "practice"),
-            ("ack-key", "PENDING", 600, "practice"),
-            ("pending-key", "PENDING", 300, "practice"),
-            ("dry-key", "DRY_RUN", 100, "practice"),
-            ("other-env", "ACK", 999, "prod"),
-        ):
-            conn.execute(text("""INSERT INTO us_orders
-                (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
-                 avg_price_usd,order_no,status,meta,notional_usd,env)
-                VALUES ('2026-07-31',:key,'AAPL','NASDAQ','BUY',1,0,100,:key,:status,
-                        '{}'::jsonb,:notional,:env)"""),
-                {"key": key, "status": status, "notional": notional, "env": env})
+        conn.execute(text("""INSERT INTO us_order_intents
+            (trade_date,client_order_key,symbol,exchange,side,qty,limit_price_usd,notional_usd,status,meta)
+            VALUES ('2026-07-31','legacy-key','AMZN','NASDAQ','BUY',3,100,300,'SENT',
+                    '{"env":"practice"}'::jsonb)"""))
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,
+             order_no,status,dry_run,meta,committed_notional_usd,env)
+            VALUES ('2026-07-31','legacy-key','AMZN','NASDAQ','BUY',3,0,
+                    'legacy-order','SUBMITTED',false,'{}'::jsonb,NULL,'unknown')"""))
 
     committed = repos.load_today_committed_buy_notional_result("2026-07-31", env="practice")
     assert committed.available is True
-    assert committed.notional_usd == 1000.0
-    assert committed.row_count == 5
+    assert committed.notional_usd == 1040.0
+    assert committed.row_count == 9
 
     empty = repos.load_today_committed_buy_notional_result("2026-08-01", env="practice")
     assert empty.available is True
