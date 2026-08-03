@@ -1497,13 +1497,14 @@ def main() -> int:
     )
 
     logger.info(
-        "[PREP][PHASE] ohlcv_prefetch_start symbols=%s mode=%s prefetch_days=%s delta_days=%s need_days=%s benchmark=%s",
+        "[PREP][PHASE] ohlcv_prefetch_start symbols=%s mode=%s prefetch_days=%s delta_days=%s need_days=%s kospi_benchmark=%s kosdaq_benchmark=%s",
         len(symbols),
         prefetch_mode,
         prefetch_days,
         delta_days,
         need_days,
-        bench,
+        RS_BENCHMARK_KOSPI,
+        RS_BENCHMARK_KOSDAQ,
     )
 
     if prefetch_mode not in {"auto", "full", "delta"}:
@@ -1551,9 +1552,10 @@ def main() -> int:
             logger.info("[PREP][OHLCV][AUTO_BACKFILL] skipped (all symbols have enough history)")
 
     logger.info(
-        "[OHLCV][PREFETCH_DONE] mode=%s benchmark=%s delta=%s full=%s",
+        "[OHLCV][PREFETCH_DONE] mode=%s kospi_benchmark=%s kosdaq_benchmark=%s delta=%s full=%s",
         prefetch_mode,
-        bench,
+        RS_BENCHMARK_KOSPI,
+        RS_BENCHMARK_KOSDAQ,
         to_jsonable(delta_result),
         to_jsonable(full_result),
     )

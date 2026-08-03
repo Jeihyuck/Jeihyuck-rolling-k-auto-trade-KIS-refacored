@@ -47,10 +47,13 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          pip install pytest
+          pip install pytest ruff
 
       - name: Byte compile
         run: python -m compileall trader
+
+      - name: Check KR prep undefined names
+        run: ruff check trader/prep_runner.py --select F821
 
       - name: KR contract tests
         run: |
@@ -71,6 +74,7 @@ jobs:
           pytest tests/kr/test_kr_market_local_entry_and_trim.py -q
           pytest tests/kr/test_kr_final_order_invariants.py -q
           pytest tests/test_watchlist_scored_roundtrip.py -q
+          pytest tests/test_kr_prep_market_benchmark_runtime.py -q
           pytest tests/kr -q
 
       - name: Check KR legacy regime removal
