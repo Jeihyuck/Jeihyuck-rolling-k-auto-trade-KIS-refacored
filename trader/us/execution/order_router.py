@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -601,6 +602,21 @@ def route_order(
     )
 
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    intent["submit_attempt_id"] = str(intent.get("submit_attempt_id") or uuid.uuid4())
+    meta["submit_attempt_id"] = intent["submit_attempt_id"]
+    intent["meta"] = meta
+    if side == "SELL" and str(intent.get("reason") or meta.get("reason") or "").startswith("TAKE_PROFIT"):
+        from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
+        try:
+            broker_avg, _ = authoritative_broker_avg({**meta, "qty": qty, "orderable_qty": intent.get("available_qty", qty), "position_lifecycle_id": intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id")})
+            executable = as_decimal(intent.get("limit_price"), name="executable_price")
+            threshold = as_decimal(meta.get("tp_threshold_fraction"), name="tp_threshold")
+            actual_return = calc_return_rate(executable, broker_avg)
+            if actual_return <= 0 or actual_return < threshold:
+                raise ValueError("threshold_not_met" if actual_return > 0 else "non_positive_return")
+        except ValueError as exc:
+            logger.warning("[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=%s", symbol_upper, exc)
+            return {"status": "BLOCKED", "reason": "take_profit_pre_submit_guard_failed", "guard_reason": str(exc), "broker_submit": False, "intent": intent}
     hard_block_reasons = {
         "FORBIDDEN_HEDGE_OR_INVERSE_ETF",
         "DEFENSE_CRASH_ENTRY_BLOCK",
@@ -1093,7 +1109,7 @@ def route_order(
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
     except Exception as exc:
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
-        return {"status": "INVALID_ORDER_IDENTITY", "reason": "durable_journal_write_failed", "broker_submit": False, "intent": intent}
+        return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
     # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────
@@ -1131,6 +1147,12 @@ def route_order(
                     return {"status": "WARN_SELL_REJECT_RECONCILE_PENDING", "reason": msg, "symbol": symbol, "side": side, "requires_reconcile": True, "intent": intent}
             except Exception as nb_exc:
                 logger.warning("[US_ORDER][SELL_NO_BALANCE][WARN] reconcile probe failed: %s", nb_exc)
+        deterministic = is_no_balance_sell_reject(msg) or _is_cash_insufficient_reject(msg) or any(token in msg.lower() for token in ("invalid quantity", "invalid price", "업무 거절", "주문 불가"))
+        if not deterministic:
+            append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response={"error": msg})
+            return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "reason": msg, "kis_ack": False,
+                    "broker_submit": True, "retry_order": False, "requires_reconcile": True,
+                    "submit_attempt_id": intent["submit_attempt_id"], "intent": intent}
         if side == "BUY" and _is_cash_insufficient_reject(msg):
             _CASH_EXHAUSTED_TICKS.add(_cash_tick_key(trade_date, intent))
             logger.error("[US_ORDER][CASH_EXHAUSTED] env=%s symbol=%s reason=broker_orderable_cash_insufficient cash_exhausted=1", account_env, symbol)
@@ -1144,6 +1166,7 @@ def route_order(
             "reason": msg,
         }
         _persist_with_trade_date(save_order_reject, reject_result)
+        append_order_event("ORDER_REJECTED", intent, context=context, broker_status="REJECTED", raw_response={"reason": msg})
         if order_key:
             mark_order_intent_rejected(order_key, reason=msg)
         return {
@@ -1163,9 +1186,11 @@ def route_order(
         order_no = extract_order_no(resp)
     except Exception as exc:
         logger.error("[US_ORDER][ACK_PARSE_FAILED] symbol=%s err=%s", symbol, exc)
+        append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
                 "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
     if not order_no:
+        append_order_event("BROKER_SUBMIT_RESULT_UNKNOWN", intent, context=context, broker_status="AMBIGUOUS_ACK", raw_response=resp)
         return {"status": "BROKER_SUBMIT_RESULT_UNKNOWN", "kis_ack": True, "broker_submit": True,
                 "retry_order": False, "requires_reconcile": True, "raw_response": resp, "intent": intent}
     try:

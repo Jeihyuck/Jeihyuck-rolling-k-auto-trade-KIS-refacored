@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
+from trader.us.utils.order_no import normalize_us_order_no
 
 logger = logging.getLogger(__name__)
 _DAILY_RAW_KEYS_LOGGED: set[str] = set()
@@ -394,6 +395,8 @@ def normalize_us_balance(raw: dict) -> dict:
             orderable_source,
         )
 
+        snapshot_asof = datetime.now(timezone.utc).isoformat()
+        lifecycle_id = str(row.get("position_lifecycle_id") or row.get("lifecycle_id") or "").strip()
         positions.append({
             "symbol": symbol,
             "name": str(name),
@@ -405,6 +408,12 @@ def normalize_us_balance(raw: dict) -> dict:
             "orderable_qty": orderable_qty,
             "sellable_qty": orderable_qty,
             "avg_price_usd": avg_price_usd,
+            "broker_avg_price": _resolved_avg_price if _resolved_avg_price > 0 else None,
+            "broker_avg_price_source": "kis_pchs_avg_pric" if avg_price_usd > 0 else "kis_buy_amount_div_qty" if _resolved_avg_price > 0 else None,
+            "broker_avg_price_currency": "USD",
+            "broker_avg_price_asof": snapshot_asof,
+            "authoritative_positions": True,
+            "position_lifecycle_id": lifecycle_id or None,
             "current_price_usd": current_price_usd,
             "market_value_usd": market_value_usd,
             "buy_amount_usd": buy_amount_usd,
@@ -505,14 +514,37 @@ def normalize_us_order_status_row(row: dict) -> dict:
         status = "FILLED"
     elif filled > 0:
         status = "PARTIALLY_FILLED"
+    elif requested > 0 and remaining > 0:
+        status = "OPEN"
     elif order_no:
-        status = "ACK"
+        status = "ACK_PENDING"
     else:
         status = "UNKNOWN"
+    trade_date_raw = str(_get_first_valid(row, ("trade_date", "ord_dt", "ORD_DT"), "") or "")
+    order_time_raw = str(_get_first_valid(row, ("ord_tmd", "ORD_TMD"), "") or "")
+    submitted_at_utc = _get_first_valid(row, ("submitted_at_utc", "order_timestamp", "observed_at"), None)
+    time_error = None
+    if not submitted_at_utc and trade_date_raw and order_time_raw:
+        try:
+            from zoneinfo import ZoneInfo
+            local = datetime.strptime(trade_date_raw.replace("-", "") + order_time_raw, "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("America/New_York"))
+            submitted_at_utc = local.astimezone(timezone.utc).isoformat()
+        except Exception:
+            time_error = "invalid_kis_order_datetime"
+    normalization_result = "normalized" if order_no and symbol and side in {"BUY", "SELL"} and requested > 0 and not time_error else "quarantined"
+    filter_reason = None if normalization_result == "normalized" else time_error or "required_order_schema_missing"
     return {
-        "order_no": order_no, "symbol": symbol, "side": side,
+        "order_no": order_no, "raw_order_no": order_no,
+        "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
         "requested_qty": requested, "filled_qty": filled, "remaining_qty": remaining,
         "status": status,
+        "trade_date": trade_date_raw,
+        "exchange": str(_get_first_valid(row, ("exchange", "ovrs_excg_cd", "OVRS_EXCG_CD"), "") or ""),
+        "limit_price": _safe_float(_get_first_valid(row, ("limit_price", "ft_ord_unpr3", "ord_unpr"), 0.0)),
+        "submitted_at_utc": submitted_at_utc,
+        "original_order_no": str(_get_first_valid(row, ("orgn_odno", "original_order_no"), "") or ""),
+        "raw_row_id": row.get("raw_row_id"), "page_index": row.get("page_index", 0),
+        "normalization_result": normalization_result, "filter_reason": filter_reason,
         "avg_price": _safe_float(_get_first_valid(row, ("avg_price", "ft_ccld_unpr3", "avg_prvs"), 0.0)),
         "raw": row,
     }
@@ -957,14 +989,22 @@ class USDataProvider:
             raw = client.get_us_fills_today(trade_date=trade_date)
         else:
             raw = method(trade_date=trade_date)
-        return [normalize_us_order_status_row(row) for row in (raw or [])]
+        normalized = [normalize_us_order_status_row(row) for row in (raw or [])]
+        quarantined = sum(row["normalization_result"] == "quarantined" for row in normalized)
+        valid = len(normalized) - quarantined
+        logger.info("[ORDER_NORMALIZATION] raw_count=%d normalized_count=%d ignored_count=0 quarantined_count=%d", len(raw or []), valid, quarantined)
+        for row in normalized:
+            logger.info("[ORDER_NORMALIZATION][ROW] raw_row_id=%s page_index=%s raw_order_no=%s canonical_order_no=%s symbol=%s side=%s requested_qty=%s filled_qty=%s remaining_qty=%s normalization_result=%s filter_reason=%s",
+                        row.get("raw_row_id"), row.get("page_index"), row.get("raw_order_no"), row.get("canonical_order_no"), row.get("symbol"), row.get("side"), row.get("requested_qty"), row.get("filled_qty"), row.get("remaining_qty"), row.get("normalization_result"), row.get("filter_reason"))
+        return normalized
 
     def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict | None:
         """Return normalized cumulative fill/order detail for a single broker order."""
         if self._offline:
             return None
         rows = self.get_today_orders(trade_date)
-        matches = [r for r in rows if str(r.get("order_no") or "") == str(order_no) and str(r.get("symbol") or "").upper() == str(symbol).upper()]
+        wanted = normalize_us_order_no(order_no)
+        matches = [r for r in rows if normalize_us_order_no(r.get("order_no")) == wanted and str(r.get("symbol") or "").upper() == str(symbol).upper()]
         if not matches:
             return None
         def _observed(row: dict) -> str:

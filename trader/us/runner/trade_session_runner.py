@@ -750,6 +750,24 @@ def run_trade_session(
                     session, _guard_exc,
                 )
                 prep_guard_result = {"ok": False, "guard_state": "PREP_GUARD_EXCEPTION_EXIT_ONLY", "session_can_run": True, "trade_can_proceed": True, "entry_can_proceed": False, "exit_can_proceed": True, "close_can_proceed": True, "reason": "PREP_GUARD_EXCEPTION_EXIT_ONLY"}
+        current_revision = os.getenv("US_PINNED_RUN_REVISION") or _git_value(["rev-parse", "HEAD"]) or os.getenv("GITHUB_SHA") or "unknown"
+        from trader.us.run_manifest import verify_run_revision
+        contract_for_revision = prep_guard_result.get("contract") if isinstance(prep_guard_result.get("contract"), dict) else {}
+        expected_revision = str(contract_for_revision.get("run_revision") or contract_for_revision.get("git_commit_sha") or prep_guard_result.get("run_revision") or "").strip()
+        revision_guard = verify_run_revision(trade_date, current_revision, expected_revision=expected_revision or None)
+        prep_guard_result["prep_revision"] = (
+            revision_guard.get("expected_revision")
+            or (revision_guard.get("manifest") or {}).get("run_revision")
+        )
+        prep_guard_result["session_revision"] = current_revision
+        prep_guard_result["run_revision_mismatch"] = not bool(revision_guard.get("ok"))
+        if not revision_guard.get("entry_can_proceed"):
+            prep_guard_result["entry_can_proceed"] = False
+            prep_guard_result["version_mismatch"] = True
+            prep_guard_result["entry_block_reasons"] = list(dict.fromkeys([
+                *(prep_guard_result.get("entry_block_reasons") or []), revision_guard.get("reason")]))
+            logger.error("[RUN_REVISION_MISMATCH] trade_date=%s prep_revision=%s session_revision=%s entry_blocked=1 exit_reconcile_allowed=1 reason=%s",
+                         trade_date, prep_guard_result.get("prep_revision"), current_revision, revision_guard.get("reason"))
         elif session in ("am", "afternoon") and offline:
             logger.info("[US_PREP_GUARD][BYPASS] session=%s offline=True — skipping prep guard", session)
 

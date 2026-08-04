@@ -555,15 +555,44 @@ def run_daily_report(
             # Orders - count by status
             try:
                 all_orders_today = load_us_daily_orders_for_report(trade_date)
+                from trader.us.execution.order_journal import order_audit_timelines
+                audit_timelines = order_audit_timelines(trade_date)
                 if all_orders_today:
                     for order in all_orders_today:
                         status = order.get("status", "").upper()
                         side = str(order.get("side", "")).upper()
-                        if side == "BUY":
+                        submitted_statuses = {"SUBMITTED", "SENT", "ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "ACK_UNRESOLVED", "ACK_STALE_UNRESOLVED", "ACK_PENDING_RECONCILE"}
+                        if status in submitted_statuses and side == "BUY":
                             report["buy_order_count"] += 1
-                        elif side == "SELL":
+                        elif status in submitted_statuses and side == "SELL":
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
+                        timeline = audit_timelines.get(str(order.get("client_order_key") or ""), {})
+                        fees = timeline.get("fees") if timeline.get("fees") is not None else order.get("fees") if order.get("fees") is not None else meta.get("fees")
+                        report.setdefault("order_audit", []).append({
+                            "symbol": order.get("symbol"), "side": side,
+                            "strategy_reason": meta.get("reason") or order.get("reason"),
+                            "tp_stage": meta.get("profit_capture_stage"),
+                            "position_lifecycle_id": meta.get("position_lifecycle_id"),
+                            "broker_avg_price": meta.get("broker_avg_price"),
+                            "broker_avg_price_source": meta.get("broker_avg_price_source"),
+                            "decision_price": meta.get("decision_price") or meta.get("executable_price"),
+                            "limit_price": order.get("limit_price") or order.get("avg_price_usd"),
+                            "fill_price": timeline.get("fill_price") or ((order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None),
+                            "filled_qty": timeline.get("filled_qty") if timeline.get("filled_qty") is not None else order.get("qty_filled"),
+                            "gross_realized_pnl": meta.get("gross_realized_pnl"), "fees": fees,
+                            "fees_status": "AVAILABLE" if fees is not None else "UNAVAILABLE",
+                            "net_realized_pnl": meta.get("net_realized_pnl") if fees is not None else None,
+                            "return_rate_at_decision": meta.get("return_rate_at_decision"),
+                            "return_rate_at_fill": meta.get("return_rate_at_fill"),
+                            "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
+                            "canonical_order_no": meta.get("order_no_norm"),
+                            "client_order_key": order.get("client_order_key"),
+                            "submit_attempt_id": meta.get("submit_attempt_id"),
+                            "submitted_at": timeline.get("submitted_at"),
+                            "acknowledged_at": timeline.get("acknowledged_at"), "filled_at": timeline.get("filled_at"),
+                            "session_revision": meta.get("session_revision") or report.get("commit_sha"),
+                        })
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
                         reason_counts = report.setdefault("blocked_entry_reason_counts", {})
                         if status in {"BLOCKED", "ORDER_DISABLED", "SIGNAL_ONLY"} and reason:
@@ -624,9 +653,25 @@ def run_daily_report(
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":
                             report["orders_signal_only"] += 1
-                    report["orders_sent_total"] = report["orders_submitted_total"] + report["orders_ack_total"]
+                    # ACK is a lifecycle transition of an already submitted order,
+                    # not another order.  Submitted side counts are the single source.
+                    report["orders_sent_total"] = report["buy_order_count"] + report["sell_order_count"]
                     report["orders_ack"] = report["orders_ack_total"]
                     report["orders_submitted"] = report["orders_submitted_total"]
+                from trader.us.execution.order_journal import aggregate_order_events
+                journal_counts = aggregate_order_events(trade_date)
+                if journal_counts.get("orders_sent_total", 0):
+                    report.update(journal_counts)
+                    report["buy_order_count"] = journal_counts["buy_orders_count"]
+                    report["sell_order_count"] = journal_counts["sell_orders_count"]
+                    invariant_ok = (
+                        report["orders_sent_total"] == report["buy_orders_count"] + report["sell_orders_count"]
+                        and report["orders_ack_total"] + report["orders_reject_total"] <= report["orders_sent_total"]
+                        and report["orders_fill_confirmed"] <= report["orders_ack_total"]
+                    )
+                    if not invariant_ok:
+                        report["warnings"].append("ORDER_JOURNAL_INVARIANT_FAILED")
+                        report["report_consistency"] = "REPORT_INCONSISTENT"
             except Exception as exc:
                 report["warnings"].append(f"orders_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] orders load failed: %s", exc)

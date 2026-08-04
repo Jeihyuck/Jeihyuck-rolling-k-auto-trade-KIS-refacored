@@ -196,7 +196,10 @@ def _journal_has_unrecovered_buy_ack(trade_date: str) -> bool:
         events = load_order_events(trade_date)
     except Exception as exc:
         logger.error("[US_SAFETY][JOURNAL_ACK_CHECK_FAILED] trade_date=%s error=%s", trade_date, exc)
-        return True
+        # The router independently requires a durable BROKER_SUBMIT_STARTED
+        # commit before every POST.  Keep exit evaluation/reconciliation alive;
+        # any real submit is fail-closed at that final boundary.
+        return False
     grouped: dict[str, list[dict]] = {}
     for event in events:
         key = str(event.get("client_order_key") or "").strip()
@@ -786,6 +789,24 @@ def route_exit_orders_immediately(
             )
             orders.append(result)
             status = str(result.get("status") or "ERROR")
+            meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+            stage = str(meta.get("profit_capture_stage") or "")
+            if stage:
+                from trader.us.profit_capture import sync_profit_capture_stage_from_order
+                mapped_status = {
+                    "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "FAILED",
+                    "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
+                    "ACK_DB_FAILED": "AMBIGUOUS_ACK", "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
+                }.get(status, status)
+                sync_profit_capture_stage_from_order(
+                    trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
+                    symbol=str(intent.get("symbol") or ""),
+                    position_lifecycle_id=str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+                    client_order_key=str(intent.get("client_order_key") or ""),
+                    broker_order_no=result.get("order_no"), profit_capture_stage=stage,
+                    order_status=mapped_status, evidence_type=None, filled_qty=0,
+                    requested_qty=int(intent.get("qty") or 0),
+                )
             action = "ROUTED" if status in {"ACK", "DRY_RUN", "SIGNAL_ONLY"} else ("DEDUP" if "DUPLICATE" in status else "BLOCKED" if "BLOCK" in status else "SKIPPED")
             decision = {"symbol": str(intent.get("symbol") or "").upper(), "side": "SELL", "qty": int(intent.get("qty") or intent.get("quantity") or 0),
                         "reason": (intent.get("meta") or {}).get("reason") or intent.get("reason") or intent.get("exit_type") or "",
@@ -1361,6 +1382,9 @@ def run_trade_tick(
         )
         return {
             "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
+            "severity": "OK" if reconcile_only_clean else "DEGRADED",
+            "allow_new_orders": False,
+            "session_should_continue": True,
             "reason": reason,
             "session": session,
             "orders": [], "ack": 0, "dry_run": 0, "blocked": 0, "signal_only": 0,
