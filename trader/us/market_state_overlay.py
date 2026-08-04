@@ -674,7 +674,7 @@ def is_strong_holding(pos: dict, row: dict | None = None) -> bool:
 
 def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None) -> list[dict]:
     from decimal import Decimal
-    from trader.us.profit_capture import as_decimal, calc_return_rate
+    from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
     if not overlay.get("profit_capture_enabled", True):
         return []
     existing_sell_symbols = existing_sell_symbols or set()
@@ -682,7 +682,8 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
         try:
             from trader.us.db.repos import load_us_profit_capture_state
             symbols = [_symbol(p) for p in positions or [] if _symbol(p)]
-            profit_capture_state = load_us_profit_capture_state(trade_date, symbols)
+            lifecycle_by_symbol = {_symbol(p): str(p.get("position_lifecycle_id") or "") for p in positions or [] if _symbol(p)}
+            profit_capture_state = load_us_profit_capture_state(trade_date, symbols, lifecycle_by_symbol)
         except Exception as exc:
             logger.warning("[US_PROFIT_CAPTURE][STATE_LOAD_WARN] trade_date=%s err=%s", trade_date, exc)
             profit_capture_state = {}
@@ -700,10 +701,9 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             continue
         state = dict(profit_capture_state.get(sym) or profit_capture_state.get(sym.upper()) or {})
         meta_state = p.get("meta") if isinstance(p.get("meta"), dict) else {}
-        broker_avg_raw = p.get("avg_price_usd") or p.get("entry_price") or p.get("avg_cost")
         try:
             executable = as_decimal(price, name="executable_price")
-            broker_avg = as_decimal(broker_avg_raw, name="broker_avg_price")
+            broker_avg, avg_provenance = authoritative_broker_avg(p, now=now)
             return_rate = calc_return_rate(executable, broker_avg)
         except ValueError as exc:
             logger.warning("[US_PROFIT_CAPTURE][DECISION] symbol=%s decision=BLOCK reason=%s", sym, exc)
@@ -719,12 +719,13 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                 max_sell = max(0, q - int(q * runner_min))
                 qty = min(max_sell, max(1, int(q * sell_pct)))
                 if qty > 0:
-                    order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{reason}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "broker_avg_price": str(broker_avg), "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
+                    lifecycle = str(p.get("position_lifecycle_id"))
+                    order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
+                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
                     if trade_date:
                         try:
                             from trader.us.db.repos import mark_us_profit_capture_stage
-                            mark_us_profit_capture_stage(trade_date, sym, flag.replace("_done", ""), order_key=order_key, qty=qty, notional_usd=qty * price, status="PENDING")
+                            mark_us_profit_capture_stage(trade_date, sym, flag.replace("_done", ""), position_lifecycle_id=lifecycle, order_key=order_key, qty=qty, notional_usd=qty * price, status="PENDING")
                             state[pending_flag] = True
                             profit_capture_state[sym] = state
                         except Exception as exc:

@@ -565,6 +565,31 @@ def run_daily_report(
                         elif status in submitted_statuses and side == "SELL":
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
+                        fees = order.get("fees") if order.get("fees") is not None else meta.get("fees")
+                        report.setdefault("order_audit", []).append({
+                            "symbol": order.get("symbol"), "side": side,
+                            "strategy_reason": meta.get("reason") or order.get("reason"),
+                            "tp_stage": meta.get("profit_capture_stage"),
+                            "position_lifecycle_id": meta.get("position_lifecycle_id"),
+                            "broker_avg_price": meta.get("broker_avg_price"),
+                            "broker_avg_price_source": meta.get("broker_avg_price_source"),
+                            "decision_price": meta.get("decision_price") or meta.get("executable_price"),
+                            "limit_price": order.get("limit_price") or order.get("avg_price_usd"),
+                            "fill_price": (order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None,
+                            "filled_qty": order.get("qty_filled"),
+                            "gross_realized_pnl": meta.get("gross_realized_pnl"), "fees": fees,
+                            "fees_status": "AVAILABLE" if fees is not None else "UNAVAILABLE",
+                            "net_realized_pnl": meta.get("net_realized_pnl") if fees is not None else None,
+                            "return_rate_at_decision": meta.get("return_rate_at_decision"),
+                            "return_rate_at_fill": meta.get("return_rate_at_fill"),
+                            "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
+                            "canonical_order_no": meta.get("order_no_norm"),
+                            "client_order_key": order.get("client_order_key"),
+                            "submit_attempt_id": meta.get("submit_attempt_id"),
+                            "submitted_at": order.get("submitted_at") or order.get("created_at"),
+                            "acknowledged_at": order.get("acknowledged_at"), "filled_at": order.get("filled_at"),
+                            "session_revision": meta.get("session_revision") or report.get("commit_sha"),
+                        })
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
                         reason_counts = report.setdefault("blocked_entry_reason_counts", {})
                         if status in {"BLOCKED", "ORDER_DISABLED", "SIGNAL_ONLY"} and reason:
@@ -630,6 +655,20 @@ def run_daily_report(
                     report["orders_sent_total"] = report["buy_order_count"] + report["sell_order_count"]
                     report["orders_ack"] = report["orders_ack_total"]
                     report["orders_submitted"] = report["orders_submitted_total"]
+                from trader.us.execution.order_journal import aggregate_order_events
+                journal_counts = aggregate_order_events(trade_date)
+                if journal_counts.get("orders_sent_total", 0):
+                    report.update(journal_counts)
+                    report["buy_order_count"] = journal_counts["buy_orders_count"]
+                    report["sell_order_count"] = journal_counts["sell_orders_count"]
+                    invariant_ok = (
+                        report["orders_sent_total"] == report["buy_orders_count"] + report["sell_orders_count"]
+                        and report["orders_ack_total"] + report["orders_reject_total"] <= report["orders_sent_total"]
+                        and report["orders_fill_confirmed"] <= report["orders_ack_total"]
+                    )
+                    if not invariant_ok:
+                        report["warnings"].append("ORDER_JOURNAL_INVARIANT_FAILED")
+                        report["report_consistency"] = "REPORT_INCONSISTENT"
             except Exception as exc:
                 report["warnings"].append(f"orders_load_failed: {exc}")
                 logger.warning("[US_DAILY_REPORT][WARN] orders load failed: %s", exc)

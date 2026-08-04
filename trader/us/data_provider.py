@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -395,6 +395,8 @@ def normalize_us_balance(raw: dict) -> dict:
             orderable_source,
         )
 
+        snapshot_asof = datetime.now(timezone.utc).isoformat()
+        lifecycle_id = str(row.get("position_lifecycle_id") or row.get("lifecycle_id") or "").strip()
         positions.append({
             "symbol": symbol,
             "name": str(name),
@@ -406,6 +408,12 @@ def normalize_us_balance(raw: dict) -> dict:
             "orderable_qty": orderable_qty,
             "sellable_qty": orderable_qty,
             "avg_price_usd": avg_price_usd,
+            "broker_avg_price": _resolved_avg_price if _resolved_avg_price > 0 else None,
+            "broker_avg_price_source": "kis_pchs_avg_pric" if avg_price_usd > 0 else "kis_buy_amount_div_qty" if _resolved_avg_price > 0 else None,
+            "broker_avg_price_currency": "USD",
+            "broker_avg_price_asof": snapshot_asof,
+            "authoritative_positions": True,
+            "position_lifecycle_id": lifecycle_id or None,
             "current_price_usd": current_price_usd,
             "market_value_usd": market_value_usd,
             "buy_amount_usd": buy_amount_usd,
@@ -512,11 +520,15 @@ def normalize_us_order_status_row(row: dict) -> dict:
         status = "ACK_PENDING"
     else:
         status = "UNKNOWN"
+    normalization_result = "normalized" if order_no and symbol and side in {"BUY", "SELL"} and requested > 0 else "quarantined"
+    filter_reason = None if normalization_result == "normalized" else "required_order_schema_missing"
     return {
         "order_no": order_no, "raw_order_no": order_no,
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
         "requested_qty": requested, "filled_qty": filled, "remaining_qty": remaining,
         "status": status,
+        "raw_row_id": row.get("raw_row_id"), "page_index": row.get("page_index", 0),
+        "normalization_result": normalization_result, "filter_reason": filter_reason,
         "avg_price": _safe_float(_get_first_valid(row, ("avg_price", "ft_ccld_unpr3", "avg_prvs"), 0.0)),
         "raw": row,
     }
@@ -962,7 +974,12 @@ class USDataProvider:
         else:
             raw = method(trade_date=trade_date)
         normalized = [normalize_us_order_status_row(row) for row in (raw or [])]
-        logger.info("[ORDER_NORMALIZATION] raw_count=%d normalized_count=%d ignored_count=0 quarantined_count=0", len(raw or []), len(normalized))
+        quarantined = sum(row["normalization_result"] == "quarantined" for row in normalized)
+        valid = len(normalized) - quarantined
+        logger.info("[ORDER_NORMALIZATION] raw_count=%d normalized_count=%d ignored_count=0 quarantined_count=%d", len(raw or []), valid, quarantined)
+        for row in normalized:
+            logger.info("[ORDER_NORMALIZATION][ROW] raw_row_id=%s page_index=%s raw_order_no=%s canonical_order_no=%s symbol=%s side=%s requested_qty=%s filled_qty=%s remaining_qty=%s normalization_result=%s filter_reason=%s",
+                        row.get("raw_row_id"), row.get("page_index"), row.get("raw_order_no"), row.get("canonical_order_no"), row.get("symbol"), row.get("side"), row.get("requested_qty"), row.get("filled_qty"), row.get("remaining_qty"), row.get("normalization_result"), row.get("filter_reason"))
         return normalized
 
     def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict | None:

@@ -786,6 +786,24 @@ def route_exit_orders_immediately(
             )
             orders.append(result)
             status = str(result.get("status") or "ERROR")
+            meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+            stage = str(meta.get("profit_capture_stage") or "")
+            if stage:
+                from trader.us.profit_capture import sync_profit_capture_stage_from_order
+                mapped_status = {
+                    "ACK": "ACK", "REJECT": "REJECTED", "BLOCKED": "FAILED",
+                    "BROKER_SUBMIT_RESULT_UNKNOWN": "AMBIGUOUS_ACK",
+                    "ACK_DB_FAILED": "AMBIGUOUS_ACK", "ACK_DB_FAILED_RECONCILE_REQUIRED": "AMBIGUOUS_ACK",
+                }.get(status, status)
+                sync_profit_capture_stage_from_order(
+                    trade_date=str(intent.get("trade_date") or getattr(context, "trade_date", "")),
+                    symbol=str(intent.get("symbol") or ""),
+                    position_lifecycle_id=str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or ""),
+                    client_order_key=str(intent.get("client_order_key") or ""),
+                    broker_order_no=result.get("order_no"), profit_capture_stage=stage,
+                    order_status=mapped_status, evidence_type=None, filled_qty=0,
+                    requested_qty=int(intent.get("qty") or 0),
+                )
             action = "ROUTED" if status in {"ACK", "DRY_RUN", "SIGNAL_ONLY"} else ("DEDUP" if "DUPLICATE" in status else "BLOCKED" if "BLOCK" in status else "SKIPPED")
             decision = {"symbol": str(intent.get("symbol") or "").upper(), "side": "SELL", "qty": int(intent.get("qty") or intent.get("quantity") or 0),
                         "reason": (intent.get("meta") or {}).get("reason") or intent.get("reason") or intent.get("exit_type") or "",

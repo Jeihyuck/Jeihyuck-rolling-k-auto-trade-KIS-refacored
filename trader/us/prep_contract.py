@@ -372,6 +372,7 @@ def build_us_prep_contract(
         "account_loss_kill_switch_triggered": market_state.get("account_loss_kill_switch_triggered", False),
         "forbidden_hedge_symbols": market_state.get("forbidden_hedge_symbols", []),
         "git_commit_sha": _current_git_commit_sha(),
+        "run_revision": _current_git_commit_sha(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -385,6 +386,9 @@ def save_us_prep_contract(contract: dict) -> dict:
         {"ok": bool, "saved_paths": list[str], "errors": list[str]}
     """
     trade_date = contract["trade_date"]
+    from trader.us.run_manifest import pin_run_revision
+    pin_run_revision(trade_date, str(contract.get("run_revision") or contract.get("git_commit_sha") or "unknown"),
+                     replace=os.getenv("US_REPREP_NEW_REVISION", "0") == "1")
     saved_paths: list[str] = []
     save_errors: list[str] = []
 
@@ -696,7 +700,7 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
         if (not final30_trade_ready) or final30_scored_count <= 0 or score_nonzero_count != final30_scored_count:
             entry_can_proceed = 0
             reason = reason if reason != "ok" else "entry_blocked_by_final30_quality"
-    prep_sha = str(contract.get("git_commit_sha") or "")
+    prep_sha = str(contract.get("run_revision") or contract.get("git_commit_sha") or "")
     current_sha = _current_git_commit_sha()
     if prep_sha and current_sha != "unknown" and prep_sha != current_sha:
         entry_can_proceed = 0

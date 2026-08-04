@@ -98,7 +98,7 @@ def test_kis_failure_returns_reject():
 
     intent = _make_intent()
     kis_client = MagicMock()
-    kis_client.place_us_buy_order.side_effect = RuntimeError("KIS API error")
+    kis_client.place_us_buy_order.side_effect = RuntimeError("KIS 업무 거절: 주문 불가")
 
     with (
         _patch_risk_gate(),

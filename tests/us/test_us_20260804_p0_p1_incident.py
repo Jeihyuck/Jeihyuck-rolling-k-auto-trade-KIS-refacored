@@ -1,4 +1,5 @@
 from decimal import Decimal
+from datetime import datetime, timezone
 
 import trader.us.db.repos as repos
 from trader.us.data_provider import normalize_us_order_status_row
@@ -12,7 +13,11 @@ OVERLAY = {"market_state": "NORMAL", "profit_capture_enabled": True}
 
 
 def _position(symbol, avg, price, qty=10):
-    return {"symbol": symbol, "qty": qty, "avg_price_usd": avg, "current_price_usd": price}
+    return {"symbol": symbol, "qty": qty, "orderable_qty": qty, "current_price_usd": price,
+            "broker_avg_price": avg, "broker_avg_price_source": "kis_pchs_avg_pric",
+            "broker_avg_price_currency": "USD", "broker_avg_price_asof": datetime.now(timezone.utc).isoformat(),
+            "balance_source": "kis_balance_authoritative", "authoritative_positions": True,
+            "position_lifecycle_id": f"life-{symbol}"}
 
 
 def test_decimal_return_and_loss_tp_block():

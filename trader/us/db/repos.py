@@ -841,12 +841,14 @@ def save_us_position_risk_state(symbol: str, trade_date: str, state: dict) -> No
 
 
 
-def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | None) -> dict:
+def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | None,
+                                    position_lifecycle_id: str = "LEGACY") -> dict:
     raw = dict(state or {})
     meta = dict(raw.get("meta") or {})
     out = {
         "trade_date": str(trade_date),
         "symbol": str(symbol or "").strip().upper(),
+        "position_lifecycle_id": str(raw.get("position_lifecycle_id") or position_lifecycle_id),
         "tp1_done": bool(raw.get("tp1_done") or meta.get("tp1_done")),
         "tp2_done": bool(raw.get("tp2_done") or meta.get("tp2_done")),
         "tp3_done": bool(raw.get("tp3_done") or meta.get("tp3_done")),
@@ -865,7 +867,8 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
     return out
 
 
-def load_us_profit_capture_state(trade_date: str, symbols: list[str]) -> dict[str, dict]:
+def load_us_profit_capture_state(trade_date: str, symbols: list[str],
+                                 lifecycle_by_symbol: dict[str, str] | None = None) -> dict[str, dict]:
     """Load TP1/TP2/TP3 state for same-day duplicate prevention.
 
     Uses us_position_risk_state.state.profit_capture when DB is available and an
@@ -877,11 +880,14 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str]) -> dict[st
         sym = str(symbol or "").strip().upper()
         if not sym:
             continue
-        mem = _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym))
+        lifecycle = str((lifecycle_by_symbol or {}).get(sym) or "LEGACY")
+        mem = _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym, lifecycle)) or _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym))
         risk = load_us_position_risk_state(sym, trade_date)
         nested = (risk.get("state") or {}).get("profit_capture") if isinstance(risk.get("state"), dict) else None
         state = nested or mem or {}
-        out[sym] = _normalize_profit_capture_state(trade_date, sym, state)
+        if state and str(state.get("position_lifecycle_id") or "LEGACY") != lifecycle:
+            state = {}
+        out[sym] = _normalize_profit_capture_state(trade_date, sym, state, lifecycle)
     return out
 
 
@@ -893,6 +899,8 @@ def mark_us_profit_capture_stage(
     qty: int | None = None,
     notional_usd: float | None = None,
     status: str = "PENDING",
+    position_lifecycle_id: str = "LEGACY",
+    broker_order_no: str | None = None,
 ) -> None:
     """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
     sym = str(symbol or "").strip().upper()
@@ -902,7 +910,10 @@ def mark_us_profit_capture_stage(
     stg = str(stage or "").lower().replace("_done", "")
     if stg not in {"tp1", "tp2", "tp3"}:
         return
-    existing = load_us_profit_capture_state(td, [sym]).get(sym, {})
+    lifecycle = str(position_lifecycle_id or "").strip()
+    if not lifecycle:
+        return
+    existing = load_us_profit_capture_state(td, [sym], {sym: lifecycle}).get(sym, {})
     now_iso = datetime.now(timezone.utc).isoformat()
     status_upper = str(status or "PENDING").upper()
     terminal_failure = status_upper in {"REJECTED", "FAILED", "EXPIRED", "CANCELLED", "CANCELED"}
@@ -910,12 +921,15 @@ def mark_us_profit_capture_stage(
         existing[f"{stg}_pending"] = False
         existing[f"{stg}_done"] = False
     else:
-        existing[f"{stg}_pending"] = status_upper in {"PENDING", "SUBMITTED", "ACK", "OPEN", "PARTIALLY_FILLED"}
+        existing[f"{stg}_pending"] = status_upper in {"PENDING", "SUBMITTED", "ACK", "ACK_PENDING", "OPEN", "PARTIALLY_FILLED", "AMBIGUOUS_ACK", "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED"}
         if status_upper in {"DONE", "FILLED"}:
             existing[f"{stg}_done"] = True
             existing[f"{stg}_pending"] = False
     if order_key:
         existing[f"{stg}_order_key"] = order_key
+    existing["position_lifecycle_id"] = lifecycle
+    if broker_order_no:
+        existing[f"{stg}_broker_order_no"] = str(broker_order_no)
     if not terminal_failure:
         existing[f"{stg}_at"] = existing.get(f"{stg}_at") or now_iso
     existing["last_profit_capture_at"] = now_iso
@@ -926,8 +940,8 @@ def mark_us_profit_capture_stage(
     if notional_usd is not None:
         meta[f"{stg}_notional_usd"] = float(notional_usd)
     existing["meta"] = meta
-    normalized = _normalize_profit_capture_state(td, sym, existing)
-    _MEM_PROFIT_CAPTURE_STATE[(td, sym)] = normalized
+    normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
+    _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
     risk = load_us_position_risk_state(sym, td)
     risk_state = dict(risk.get("state") or {}) if isinstance(risk, dict) else {}
     risk_state["profit_capture"] = normalized
@@ -1957,6 +1971,15 @@ def mark_order_filled_by_reconcile(
         if invariant.get("status") != "OK":
             return invariant
         result["fill_accounting"] = invariant
+        if side_u == "SELL" and order_meta.get("profit_capture_stage"):
+            from trader.us.profit_capture import sync_profit_capture_stage_from_order
+            sync_profit_capture_stage_from_order(
+                trade_date=td, symbol=sym,
+                position_lifecycle_id=str(order_meta.get("position_lifecycle_id") or ""),
+                client_order_key=cok or str(order.get("client_order_key") or ""),
+                broker_order_no=on, profit_capture_stage=str(order_meta.get("profit_capture_stage")),
+                order_status=status, evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
+            )
         return result
     try:
         with engine.begin() as conn:
@@ -2059,11 +2082,20 @@ def mark_order_filled_by_reconcile(
             if cumulative != active_total:
                 raise FillAccountingInvariantError({"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
                         "order_qty_filled": cumulative, "active_fill_qty": active_total})
-            return {"status": "OK", "order_status": status, "qty_filled": cumulative,
+            result = {"status": "OK", "order_status": status, "qty_filled": cumulative,
                     "remaining_qty": remaining, "synthetic_fill_created": bool(delta and synthetic and not actual),
                     "synthetic_superseded_count": int(promotion.get("superseded", 0)),
                     "evidence_quantity_conflict_count": int(promotion.get("conflict", 0)),
                     "fill_accounting": {"status": "OK", "order_qty_filled": cumulative, "active_fill_qty": active_total}}
+            if side_u == "SELL" and merged.get("profit_capture_stage"):
+                from trader.us.profit_capture import sync_profit_capture_stage_from_order
+                sync_profit_capture_stage_from_order(
+                    trade_date=td, symbol=sym, position_lifecycle_id=str(merged.get("position_lifecycle_id") or ""),
+                    client_order_key=resolved_client_order_key, broker_order_no=on,
+                    profit_capture_stage=str(merged.get("profit_capture_stage")), order_status=status,
+                    evidence_type=evidence, filled_qty=cumulative, requested_qty=requested,
+                )
+            return result
     except FillAccountingInvariantError as exc:
         logger.error("[US_REPOS][MARK_FILLED_BY_RECONCILE][INVARIANT] %s", exc.payload)
         return exc.payload

@@ -42,6 +42,7 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "prep_run_id": intent.get("prep_run_id") or getattr(context, "prep_run_id", ""),
         "run_source": intent.get("run_source") or (intent.get("meta") or {}).get("run_source") or os.getenv("US_RUN_SOURCE", ""),
         "client_order_key": intent.get("client_order_key", ""), "symbol": intent.get("symbol", ""),
+        "submit_attempt_id": intent.get("submit_attempt_id") or meta.get("submit_attempt_id") or "",
         "exchange": intent.get("exchange", ""), "side": intent.get("side", ""), "qty": intent.get("qty", 0),
         "broker_order_no": broker_order_no, "broker_status": broker_status,
         "pre_order_position_qty": pre_order_position_qty,
@@ -70,6 +71,35 @@ def load_order_events(trade_date: str, *, session_run_id: str | None = None) -> 
         return []
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     return [e for e in events if not session_run_id or e.get("session_run_id") == session_run_id]
+
+
+def aggregate_order_events(trade_date: str, *, session_run_id: str | None = None) -> dict:
+    """Aggregate immutable unique submit attempts; reconciliation never adds submits."""
+    events = load_order_events(trade_date, session_run_id=session_run_id)
+    submits: dict[str, dict] = {}
+    lifecycle: dict[str, set[str]] = {}
+    fill_execution_rows = 0
+    for event in events:
+        attempt = str(event.get("submit_attempt_id") or "").strip()
+        if not attempt:
+            continue
+        event_type = str(event.get("event_type") or "")
+        if event_type == "BROKER_SUBMIT_STARTED":
+            submits.setdefault(attempt, event)
+        lifecycle.setdefault(attempt, set()).add(event_type)
+        if event_type in {"ORDER_PARTIALLY_FILLED", "ORDER_FILLED"}:
+            fill_execution_rows += 1
+    ack = {a for a, types in lifecycle.items() if "BROKER_ACK_RECEIVED" in types}
+    rejected = {a for a, types in lifecycle.items() if "ORDER_REJECTED" in types}
+    filled = {a for a, types in lifecycle.items() if "ORDER_FILLED" in types}
+    buy = sum(str(e.get("side") or "").upper() == "BUY" for e in submits.values())
+    sell = sum(str(e.get("side") or "").upper() == "SELL" for e in submits.values())
+    return {"scope": "trade_day", "orders_sent_total": len(submits), "buy_orders_count": buy,
+            "sell_orders_count": sell, "orders_ack_total": len(ack), "orders_reject_total": len(rejected),
+            "orders_fill_confirmed": len(filled), "fill_execution_row_count": fill_execution_rows,
+            "unique_submit_attempt_count": len(submits),
+            "unique_client_order_count": len({e.get('client_order_key') for e in submits.values()}),
+            "unique_broker_order_count": len({e.get('broker_order_no') for e in events if e.get('broker_order_no')})}
 
 
 def replay_order_journal(trade_date: str, session_run_id: str | None = None,
