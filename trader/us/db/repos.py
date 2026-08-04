@@ -485,10 +485,14 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     :qty_requested, :qty_filled, :avg_price_usd, :order_no,
                     :status, :dry_run, :committed_notional_usd, :env, CAST(:meta AS jsonb))
             ON CONFLICT (client_order_key) DO UPDATE
-                SET qty_filled    =EXCLUDED.qty_filled,
+                SET qty_filled    =GREATEST(us_orders.qty_filled, EXCLUDED.qty_filled),
                     avg_price_usd =EXCLUDED.avg_price_usd,
                     order_no      =EXCLUDED.order_no,
-                    status        =EXCLUDED.status,
+                    status        =CASE
+                        WHEN us_orders.status IN ('FILLED','CANCELLED','REJECTED','EXPIRED')
+                             AND EXCLUDED.status NOT IN ('FILLED','CANCELLED','REJECTED','EXPIRED') THEN us_orders.status
+                        WHEN us_orders.status='PARTIALLY_FILLED' AND EXCLUDED.status IN ('ACK','OPEN') THEN us_orders.status
+                        ELSE EXCLUDED.status END,
                     dry_run       =EXCLUDED.dry_run,
                     committed_notional_usd=COALESCE(us_orders.committed_notional_usd, EXCLUDED.committed_notional_usd),
                     env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
@@ -512,6 +516,57 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
             "meta": _json_param(row.get("meta")),
         },
     )
+
+
+def append_us_order_event(event: dict) -> bool:
+    """Idempotently persist the authoritative order lifecycle event."""
+    engine = _get_engine_or_none()
+    if engine is None:
+        return False
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO us_order_events
+                (event_id,trade_date,event_type,event_timestamp,session,session_run_id,tick_id,
+                 client_order_key,submit_attempt_id,symbol,side,requested_qty,
+                 raw_broker_order_no,canonical_broker_order_no,position_lifecycle_id,
+                 profit_capture_stage,cumulative_filled_qty,payload,idempotency_key)
+                VALUES (CAST(:event_id AS uuid),CAST(:trade_date AS date),:event_type,CAST(:event_timestamp AS timestamptz),
+                 :session,:session_run_id,:tick_id,:client_order_key,:submit_attempt_id,:symbol,:side,:requested_qty,
+                 :raw_broker_order_no,:canonical_broker_order_no,:position_lifecycle_id,
+                 :profit_capture_stage,:cumulative_filled_qty,CAST(:payload AS jsonb),:idempotency_key)
+                ON CONFLICT (idempotency_key) DO NOTHING
+            """), {**event, "payload": _json_param(event.get("payload") or {})})
+        return True
+    except Exception as exc:
+        logger.error("[US_ORDER_EVENT][DB_APPEND_FAILED] %s", exc)
+        return False
+
+
+def load_us_order_events(trade_date: str, session_run_id: str | None = None) -> list[dict] | None:
+    engine = _get_engine_or_none()
+    if engine is None:
+        return None
+    sql = "SELECT *, event_timestamp AS timestamp, raw_broker_order_no AS broker_order_no FROM us_order_events WHERE trade_date=:td"
+    params = {"td": trade_date}
+    if session_run_id:
+        sql += " AND session_run_id=:session_run_id"
+        params["session_run_id"] = session_run_id
+    sql += " ORDER BY event_timestamp,event_id"
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(sql), params).mappings().all()
+        result = []
+        for row in rows:
+            item = dict(row)
+            payload = _parse_json_meta(item.pop("payload", {}))
+            item.update(payload)
+            item["timestamp"] = str(item.get("timestamp") or "")
+            result.append(item)
+        return result
+    except Exception as exc:
+        logger.error("[US_ORDER_EVENT][DB_LOAD_FAILED] %s", exc)
+        raise
 
 
 def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
@@ -543,7 +598,12 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
             if existing.get("client_order_key") == order_result.get("client_order_key"):
                 assert_same_identity(existing, {**order_result, "trade_date": td})
                 merged_meta = {**_parse_json_meta(existing.get("meta")), **_parse_json_meta(order_result.get("meta"))}
-                existing.update({**order_result, "trade_date": td, "meta": merged_meta})
+                protected = str(existing.get("status") or "").upper() in {"OPEN","PARTIALLY_FILLED","FILLED","CANCELLED","REJECTED","EXPIRED"}
+                incoming = {**order_result, "trade_date": td, "meta": merged_meta}
+                if protected:
+                    incoming["status"] = existing.get("status")
+                    incoming["qty_filled"] = max(int(existing.get("qty_filled") or 0), int(order_result.get("qty_filled") or 0))
+                existing.update(incoming)
                 return True
         _MEM_ORDERS.append({
             **order_result, "trade_date": td,
@@ -589,6 +649,8 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
     allowed = {"ACK", "OPEN", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
     if status not in allowed:
         return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
+    if int(filled_qty) < 0 or int(filled_qty) > int(requested_qty):
+        return {"status":"BROKER_OBSERVATION_QUARANTINED","reason":"cumulative_filled_qty_out_of_range"}
     meta_patch = {"order_no_raw": str(raw_order_no), "order_no_norm": str(canonical_order_no),
                   "remaining_qty": int(remaining_qty), "broker_observed_at": observed_at,
                   "broker_raw_row": raw_row or {}, "fill_evidence_type": evidence_type}
@@ -597,11 +659,21 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
         identity_rows = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
         if len(identity_rows) != 1: return {"status": "ORDER_IDENTITY_NOT_UNIQUE"}
         order_meta = {**_parse_json_meta(identity_rows[0].get("meta")), **meta_patch}
+        old_status=str(identity_rows[0].get("status") or "ACK").upper()
+        old_filled=int(identity_rows[0].get("qty_filled") or 0)
     else:
         with engine.connect() as conn:
             identity_row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key"), {"td": td, "key": key}).mappings().first()
         if not identity_row: return {"status": "ORDER_NOT_FOUND"}
         order_meta = {**_parse_json_meta(identity_row.get("meta")), **meta_patch}
+        old_status="ACK"; old_filled=0
+        with engine.connect() as conn:
+            state_row=conn.execute(text("SELECT status,qty_filled FROM us_orders WHERE trade_date=:td AND client_order_key=:key"),{"td":td,"key":key}).mappings().first()
+        if state_row: old_status=str(state_row.get("status") or "ACK").upper(); old_filled=int(state_row.get("qty_filled") or 0)
+    terminal={"FILLED","CANCELLED","REJECTED","EXPIRED"}
+    stale = (old_status in terminal and status != old_status) or (old_status=="PARTIALLY_FILLED" and status in {"ACK","OPEN"}) or int(filled_qty)<old_filled
+    if stale:
+        return {"status":"OK","order_status":old_status,"observation_ignored":"ORDER_OBSERVATION_IGNORED_STALE"}
     if status in {"PARTIALLY_FILLED", "FILLED"} and int(filled_qty) > 0:
         result = mark_order_filled_by_reconcile(
             order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
@@ -629,7 +701,12 @@ def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
                 row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key FOR UPDATE"), {"td": td, "key": key}).mappings().first()
                 if not row: return {"status": "ORDER_NOT_FOUND"}
                 order_meta = {**_parse_json_meta(row.get("meta")), **meta_patch}
-                conn.execute(text("UPDATE us_orders SET status=:status, order_no=COALESCE(NULLIF(order_no,''),:ono), meta=CAST(:meta AS jsonb), updated_at=NOW() WHERE trade_date=:td AND client_order_key=:key"),
+                conn.execute(text("""UPDATE us_orders SET status=CASE
+                    WHEN status IN ('FILLED','CANCELLED','REJECTED','EXPIRED') AND status<>:status THEN status
+                    WHEN status='PARTIALLY_FILLED' AND :status IN ('ACK','OPEN') THEN status
+                    ELSE :status END,
+                    order_no=COALESCE(NULLIF(order_no,''),:ono), meta=meta || CAST(:meta AS jsonb), updated_at=NOW()
+                    WHERE trade_date=:td AND client_order_key=:key"""),
                              {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta), "td": td, "key": key})
         if side.upper() == "SELL" and order_meta.get("profit_capture_stage"):
             from trader.us.profit_capture import sync_profit_capture_stage_from_order
@@ -958,15 +1035,30 @@ def load_us_profit_capture_state(trade_date: str, symbols: list[str],
     idempotent.
     """
     out: dict[str, dict] = {}
+    engine = _get_engine_or_none()
     for symbol in symbols or []:
         sym = str(symbol or "").strip().upper()
         if not sym:
             continue
         lifecycle = str((lifecycle_by_symbol or {}).get(sym) or "LEGACY")
-        mem = _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym, lifecycle)) or _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym))
-        risk = load_us_position_risk_state(sym, trade_date)
-        nested = (risk.get("state") or {}).get("profit_capture") if isinstance(risk.get("state"), dict) else None
-        state = nested or mem or {}
+        if lifecycle == "LEGACY":
+            out[sym] = _normalize_profit_capture_state(trade_date, sym, {}, lifecycle)
+            continue
+        mem = _MEM_PROFIT_CAPTURE_STATE.get((str(trade_date), sym, lifecycle)) or {}
+        state = mem
+        if engine is not None:
+            with engine.connect() as conn:
+                rows = conn.execute(text("""SELECT stage,stage_status,client_order_key,raw_broker_order_no,
+                    cumulative_filled_qty,state,updated_at FROM us_profit_capture_lifecycle
+                    WHERE trade_date=:td AND symbol=:symbol AND position_lifecycle_id=:lifecycle"""),
+                    {"td": trade_date,"symbol":sym,"lifecycle":lifecycle}).mappings().all()
+            state={"position_lifecycle_id":lifecycle,"meta":{}}
+            for row in rows:
+                stage=str(row["stage"]); status=str(row["stage_status"])
+                state[f"{stage}_pending"]=status=="PENDING"
+                state[f"{stage}_done"]=status=="DONE"
+                state[f"{stage}_order_key"]=row.get("client_order_key")
+                state["meta"].update(_parse_json_meta(row.get("state")))
         if state and str(state.get("position_lifecycle_id") or "LEGACY") != lifecycle:
             state = {}
         out[sym] = _normalize_profit_capture_state(trade_date, sym, state, lifecycle)
@@ -981,7 +1073,7 @@ def mark_us_profit_capture_stage(
     qty: int | None = None,
     notional_usd: float | None = None,
     status: str = "PENDING",
-    position_lifecycle_id: str = "LEGACY",
+    position_lifecycle_id: str = "",
     broker_order_no: str | None = None,
 ) -> None:
     """Persist a profit-capture stage as PENDING/ACK/DONE to block duplicates."""
@@ -1024,11 +1116,25 @@ def mark_us_profit_capture_stage(
     existing["meta"] = meta
     normalized = _normalize_profit_capture_state(td, sym, existing, lifecycle)
     _MEM_PROFIT_CAPTURE_STATE[(td, sym, lifecycle)] = normalized
-    risk = load_us_position_risk_state(sym, td)
-    risk_state = dict(risk.get("state") or {}) if isinstance(risk, dict) else {}
-    risk_state["profit_capture"] = normalized
-    risk["state"] = risk_state
-    save_us_position_risk_state(sym, td, risk)
+    engine = _get_engine_or_none()
+    if engine is not None:
+        stage_status = "DONE" if normalized.get(f"{stg}_done") else "PENDING" if normalized.get(f"{stg}_pending") else "NOT_TRIGGERED"
+        with engine.begin() as conn:
+            conn.execute(text("""INSERT INTO us_profit_capture_lifecycle
+                (trade_date,symbol,position_lifecycle_id,stage,stage_status,client_order_key,
+                 raw_broker_order_no,canonical_broker_order_no,requested_qty,cumulative_filled_qty,state,updated_at)
+                VALUES (:td,:symbol,:lifecycle,:stage,:status,:key,:raw,:canonical,:requested,:filled,CAST(:state AS jsonb),NOW())
+                ON CONFLICT (trade_date,symbol,position_lifecycle_id,stage) DO UPDATE SET
+                 stage_status=EXCLUDED.stage_status,client_order_key=COALESCE(EXCLUDED.client_order_key,us_profit_capture_lifecycle.client_order_key),
+                 raw_broker_order_no=COALESCE(EXCLUDED.raw_broker_order_no,us_profit_capture_lifecycle.raw_broker_order_no),
+                 canonical_broker_order_no=COALESCE(EXCLUDED.canonical_broker_order_no,us_profit_capture_lifecycle.canonical_broker_order_no),
+                 requested_qty=GREATEST(us_profit_capture_lifecycle.requested_qty,EXCLUDED.requested_qty),
+                 cumulative_filled_qty=GREATEST(us_profit_capture_lifecycle.cumulative_filled_qty,EXCLUDED.cumulative_filled_qty),
+                 state=us_profit_capture_lifecycle.state || EXCLUDED.state,updated_at=NOW()"""),
+                {"td":td,"symbol":sym,"lifecycle":lifecycle,"stage":stg,"status":stage_status,
+                 "key":order_key,"raw":broker_order_no,"canonical":normalize_us_order_no(broker_order_no),
+                 "requested":int(qty or meta.get(f"{stg}_qty") or 0),"filled":int(meta.get(f"{stg}_filled_qty") or 0),
+                 "state":_json_param(normalized)})
 
 
 def mark_us_position_exit_stage(

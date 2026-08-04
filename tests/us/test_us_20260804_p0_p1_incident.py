@@ -67,9 +67,9 @@ def test_seven_valid_raw_rows_all_normalize():
 def test_profit_capture_state_ack_is_pending_until_fill(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
-    repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="ACK")
-    state = repos.load_us_profit_capture_state("2026-08-04", ["JPM"])["JPM"]
+    repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="ACK", position_lifecycle_id="life-JPM")
+    state = repos.load_us_profit_capture_state("2026-08-04", ["JPM"], {"JPM":"life-JPM"})["JPM"]
     assert state["tp1_pending"] and not state["tp1_done"]
-    repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="FILLED")
-    state = repos.load_us_profit_capture_state("2026-08-04", ["JPM"])["JPM"]
+    repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="FILLED", position_lifecycle_id="life-JPM")
+    state = repos.load_us_profit_capture_state("2026-08-04", ["JPM"], {"JPM":"life-JPM"})["JPM"]
     assert state["tp1_done"] and not state["tp1_pending"]

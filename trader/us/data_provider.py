@@ -520,17 +520,29 @@ def normalize_us_order_status_row(row: dict) -> dict:
         status = "ACK_PENDING"
     else:
         status = "UNKNOWN"
-    normalization_result = "normalized" if order_no and symbol and side in {"BUY", "SELL"} and requested > 0 else "quarantined"
-    filter_reason = None if normalization_result == "normalized" else "required_order_schema_missing"
+    trade_date_raw = str(_get_first_valid(row, ("trade_date", "ord_dt", "ORD_DT"), "") or "")
+    order_time_raw = str(_get_first_valid(row, ("ord_tmd", "ORD_TMD"), "") or "")
+    submitted_at_utc = _get_first_valid(row, ("submitted_at_utc", "order_timestamp", "observed_at"), None)
+    time_error = None
+    if not submitted_at_utc and trade_date_raw and order_time_raw:
+        try:
+            from zoneinfo import ZoneInfo
+            local = datetime.strptime(trade_date_raw.replace("-", "") + order_time_raw, "%Y%m%d%H%M%S").replace(tzinfo=ZoneInfo("America/New_York"))
+            submitted_at_utc = local.astimezone(timezone.utc).isoformat()
+        except Exception:
+            time_error = "invalid_kis_order_datetime"
+    normalization_result = "normalized" if order_no and symbol and side in {"BUY", "SELL"} and requested > 0 and not time_error else "quarantined"
+    filter_reason = None if normalization_result == "normalized" else time_error or "required_order_schema_missing"
     return {
         "order_no": order_no, "raw_order_no": order_no,
         "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
         "requested_qty": requested, "filled_qty": filled, "remaining_qty": remaining,
         "status": status,
-        "trade_date": str(_get_first_valid(row, ("trade_date", "ord_dt", "ORD_DT"), "") or ""),
+        "trade_date": trade_date_raw,
         "exchange": str(_get_first_valid(row, ("exchange", "ovrs_excg_cd", "OVRS_EXCG_CD"), "") or ""),
         "limit_price": _safe_float(_get_first_valid(row, ("limit_price", "ft_ord_unpr3", "ord_unpr"), 0.0)),
-        "submitted_at_utc": _get_first_valid(row, ("submitted_at_utc", "order_timestamp", "observed_at"), None),
+        "submitted_at_utc": submitted_at_utc,
+        "original_order_no": str(_get_first_valid(row, ("orgn_odno", "original_order_no"), "") or ""),
         "raw_row_id": row.get("raw_row_id"), "page_index": row.get("page_index", 0),
         "normalization_result": normalization_result, "filter_reason": filter_reason,
         "avg_price": _safe_float(_get_first_valid(row, ("avg_price", "ft_ccld_unpr3", "avg_prvs"), 0.0)),

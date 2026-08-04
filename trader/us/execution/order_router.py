@@ -602,6 +602,9 @@ def route_order(
     )
 
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    intent["submit_attempt_id"] = str(intent.get("submit_attempt_id") or uuid.uuid4())
+    meta["submit_attempt_id"] = intent["submit_attempt_id"]
+    intent["meta"] = meta
     if side == "SELL" and str(intent.get("reason") or meta.get("reason") or "").startswith("TAKE_PROFIT"):
         from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
         try:
@@ -1102,13 +1105,11 @@ def route_order(
         return {"status": "ORDER_FENCED_BEFORE_BROKER_SUBMIT", "reason": "stale_cancelled_or_superseded_tick",
                 "broker_submit": False, "retry_order": False, "requires_reconcile": False, "intent": intent}
     from trader.us.execution.order_journal import append_order_event
-    intent["submit_attempt_id"] = str(intent.get("submit_attempt_id") or uuid.uuid4())
-    meta["submit_attempt_id"] = intent["submit_attempt_id"]
     try:
         append_order_event("BROKER_SUBMIT_STARTED", intent, context=context)
     except Exception as exc:
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
-        return {"status": "INVALID_ORDER_IDENTITY", "reason": "durable_journal_write_failed", "broker_submit": False, "intent": intent}
+        return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
 
     # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────

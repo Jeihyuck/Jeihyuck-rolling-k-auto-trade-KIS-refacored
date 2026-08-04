@@ -382,13 +382,13 @@ jobs:
           cache: pip
           cache-dependency-path: repo/requirements.txt
 
-      - name: Install deps
+      - name: Install minimal revision resolver dependency
         if: steps.phase_guard.outputs.should_run == '1'
         working-directory: repo
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          python -m pip install 'psycopg[binary]'
 
       - name: Checkout pinned US trade-day revision
         if: steps.phase_guard.outputs.should_run == '1'
@@ -399,6 +399,11 @@ jobs:
           git fetch --depth=1 origin "${revision}"
           git checkout --detach "${revision}"
           echo "US_PINNED_RUN_REVISION=${revision}" >> "$GITHUB_ENV"
+
+      - name: Install dependencies from pinned revision
+        if: steps.phase_guard.outputs.should_run == '1'
+        working-directory: repo
+        run: python -m pip install -r requirements.txt
 
       - name: US Python syntax preflight
         if: steps.phase_guard.outputs.should_run == '1'

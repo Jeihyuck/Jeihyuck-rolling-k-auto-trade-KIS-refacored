@@ -5,6 +5,7 @@ from pathlib import Path
 
 from trader.us.db import repos
 from trader.us.execution.order_journal import append_order_event, aggregate_order_events, replay_order_journal
+from trader.us.execution.order_journal import match_ambiguous_submit_to_broker_order
 from trader.us.market_state_overlay import build_profit_capture_intents
 
 
@@ -110,6 +111,14 @@ def test_jpm_two_page_provider_pipeline_preserves_all_seven(monkeypatch):
     assert sum(row["normalization_result"]=="normalized" for row in normalized)==7
     jpm=[row for row in normalized if row["symbol"]=="JPM"]
     assert len(jpm)==2 and {row["canonical_order_no"] for row in jpm}=={"40991"}
+    assert all(row["submitted_at_utc"] for row in normalized)
+    # 09:31:06 EDT == 13:31:06 UTC.  No synthetic timestamp is injected into broker rows.
+    matched=match_ambiguous_submit_to_broker_order(trade_date="2026-07-16",symbol="JPM",side="SELL",
+        requested_qty=2,limit_price=353.69,submitted_at_utc="2026-07-16T13:31:06+00:00",
+        exchange="NYSE",broker_rows=normalized)
+    assert matched["status"]=="MATCHED"
+    assert matched["match"]["canonical_order_no"]=="40991"
+    assert matched["match"]["filled_qty"]==2
 
     repeated=iter([{"output":[],"CTX_AREA_NK200":"SAME","CTX_AREA_FK200":"F","_response_meta":{"tr_cont":"M"}},
                    {"output":[],"CTX_AREA_NK200":"SAME","CTX_AREA_FK200":"F","_response_meta":{"tr_cont":"M"}}])

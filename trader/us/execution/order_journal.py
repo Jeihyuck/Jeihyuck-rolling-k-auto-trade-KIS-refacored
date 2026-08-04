@@ -33,6 +33,10 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         limit_price = intent.get("limit_price_usd")
     if limit_price is None:
         limit_price = meta.get("limit_price") or meta.get("limit_price_usd")
+    canonical_no = ""
+    if broker_order_no:
+        from trader.us.utils.order_no import normalize_us_order_no
+        canonical_no = normalize_us_order_no(broker_order_no)
     event = {
         "event_id": str(uuid.uuid4()), "event_type": event_type, "trade_date": td,
         "session": intent.get("session") or getattr(context, "session", ""),
@@ -61,6 +65,31 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "fees": (raw_response or {}).get("fees") if isinstance(raw_response, dict) else None,
         "timestamp": datetime.now(timezone.utc).isoformat(), "raw_response_hash": hashlib.sha256(raw.encode()).hexdigest(),
     }
+    idem_material = "|".join(str(v or "") for v in (
+        td, event.get("submit_attempt_id"), canonical_no, event_type,
+        event.get("cumulative_filled_qty"), event.get("broker_execution_id"),
+        event.get("raw_response_hash")))
+    event["idempotency_key"] = hashlib.sha256(idem_material.encode()).hexdigest()
+    event["raw_broker_order_no"] = broker_order_no
+    event["canonical_broker_order_no"] = canonical_no
+    from trader.us.db.repos import append_us_order_event
+    db_event = {
+        "event_id": event["event_id"], "trade_date": td, "event_type": event_type,
+        "event_timestamp": event["timestamp"], "session": event.get("session"),
+        "session_run_id": event.get("session_run_id"), "tick_id": event.get("tick_id"),
+        "client_order_key": event.get("client_order_key"), "submit_attempt_id": event.get("submit_attempt_id"),
+        "symbol": event.get("symbol"), "side": event.get("side"), "requested_qty": event.get("requested_qty"),
+        "raw_broker_order_no": broker_order_no, "canonical_broker_order_no": canonical_no,
+        "position_lifecycle_id": event.get("position_lifecycle_id"),
+        "profit_capture_stage": event.get("profit_capture_stage"),
+        "cumulative_filled_qty": event.get("cumulative_filled_qty"),
+        "payload": event, "idempotency_key": event["idempotency_key"],
+    }
+    db_saved = append_us_order_event(db_event)
+    fallback_allowed = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("US_OFFLINE") == "1" or os.getenv("OFFLINE") == "1")
+    if not db_saved and not fallback_allowed:
+        raise OSError("durable_order_event_ledger_unavailable")
+    event["ledger_source"] = "postgres" if db_saved else "jsonl_test_fallback"
     path = journal_path(td)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str) + "\n"
@@ -74,6 +103,13 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
 
 
 def load_order_events(trade_date: str, *, session_run_id: str | None = None) -> list[dict]:
+    from trader.us.db.repos import load_us_order_events
+    db_events = load_us_order_events(trade_date, session_run_id=session_run_id)
+    if db_events is not None:
+        return db_events
+    fallback_allowed = bool(os.getenv("PYTEST_CURRENT_TEST") or os.getenv("US_OFFLINE") == "1" or os.getenv("OFFLINE") == "1")
+    if not fallback_allowed:
+        raise OSError("durable_order_event_ledger_unavailable")
     path = journal_path(trade_date)
     if not path.exists():
         return []
@@ -143,7 +179,7 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
     except Exception: wanted_exchange = str(exchange or "").upper()
     try: submitted = datetime.fromisoformat(str(submitted_at_utc).replace("Z", "+00:00"))
     except Exception: return {"status": "AMBIGUOUS_SUBMIT_IDENTITY_INVALID", "matches": []}
-    matches = []
+    eligible = []
     for row in broker_rows or []:
         row_date = str(row.get("trade_date") or row.get("ord_dt") or "").replace(".", "-")
         if row_date and row_date.replace("-", "") != trade_date.replace("-", ""): continue
@@ -153,8 +189,8 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
         try: row_exchange = normalize_us_exchange(str(row.get("exchange") or row.get("raw_exchange") or exchange))
         except Exception: row_exchange = str(row.get("exchange") or row.get("raw_exchange") or "").upper()
         if wanted_exchange and row_exchange and row_exchange != wanted_exchange: continue
-        row_price = float(row.get("limit_price") or row.get("order_price") or row.get("avg_price") or 0)
-        if limit_price > 0 and (row_price <= 0 or abs(row_price - limit_price) > price_tolerance): continue
+        row_price = float(row.get("limit_price") or row.get("order_price") or 0)
+        if limit_price > 0 and row_price > 0 and abs(row_price - limit_price) > price_tolerance: continue
         time_raw = row.get("submitted_at_utc") or row.get("order_timestamp") or row.get("observed_at")
         if not time_raw: continue
         try:
@@ -162,7 +198,26 @@ def match_ambiguous_submit_to_broker_order(*, trade_date: str, symbol: str, side
             if observed.tzinfo is None: observed = observed.replace(tzinfo=timezone.utc)
             if abs((observed - submitted).total_seconds()) > window: continue
         except Exception: continue
-        matches.append(row)
+        eligible.append(row)
+    groups: dict[str, list[dict]] = {}
+    from trader.us.utils.order_no import normalize_us_order_no
+    for row in eligible:
+        key = normalize_us_order_no(row.get("original_order_no") or row.get("orgn_odno") or row.get("order_no"))
+        if key: groups.setdefault(key, []).append(row)
+    matches=[]
+    priority={"ACK":1,"ACK_PENDING":1,"OPEN":2,"PARTIALLY_FILLED":3,"FILLED":4}
+    for canonical, rows in groups.items():
+        identities={(str(r.get("symbol") or "").upper(),str(r.get("side") or "").upper(),str(r.get("exchange") or "").upper(),int(r.get("requested_qty") or 0)) for r in rows}
+        if len(identities)!=1:
+            return {"status":"AMBIGUOUS_BROKER_EVIDENCE_CONFLICT","matches":rows}
+        quantities={int(r.get("requested_qty") or 0) for r in rows}
+        if len(quantities)!=1: return {"status":"AMBIGUOUS_BROKER_EVIDENCE_CONFLICT","matches":rows}
+        best=max(rows,key=lambda r:(priority.get(str(r.get("status") or "").upper(),0),str(r.get("observed_at") or r.get("submitted_at_utc") or "")))
+        merged={**best,"canonical_order_no":canonical,"order_no":best.get("raw_order_no") or best.get("order_no"),
+                "filled_qty":max(int(r.get("filled_qty") or 0) for r in rows),
+                "submitted_at_utc":min(str(r.get("submitted_at_utc")) for r in rows if r.get("submitted_at_utc"))}
+        merged["remaining_qty"]=max(0,int(merged.get("requested_qty") or 0)-int(merged.get("filled_qty") or 0))
+        matches.append(merged)
     if len(matches) == 1: return {"status": "MATCHED", "match": matches[0], "matches": matches}
     return {"status": "NO_MATCH" if not matches else "AMBIGUOUS_MULTIPLE_BROKER_CANDIDATES", "matches": matches}
 

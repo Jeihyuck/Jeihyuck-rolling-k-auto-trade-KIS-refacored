@@ -35,7 +35,13 @@ def pin_run_revision(trade_date: str, revision: str, *, replace: bool = False) -
     return payload
 
 
-def verify_run_revision(trade_date: str, current_revision: str) -> dict:
+def verify_run_revision(trade_date: str, current_revision: str, *, expected_revision: str | None = None,
+                        source: str = "local_manifest_cache") -> dict:
+    if expected_revision:
+        ok = str(expected_revision) == str(current_revision)
+        return {"ok": ok, "reason": "ok" if ok else "run_revision_mismatch",
+                "entry_can_proceed": ok, "reconciliation_can_proceed": True,
+                "source": "db_prep_contract", "expected_revision": expected_revision}
     path = manifest_path(trade_date)
     if not path.exists():
         return {"ok": False, "reason": "run_manifest_missing", "entry_can_proceed": False,
@@ -43,4 +49,5 @@ def verify_run_revision(trade_date: str, current_revision: str) -> dict:
     manifest = json.loads(path.read_text(encoding="utf-8"))
     ok = manifest.get("run_revision") == current_revision
     return {"ok": ok, "reason": "ok" if ok else "run_revision_mismatch",
-            "entry_can_proceed": ok, "reconciliation_can_proceed": True, "manifest": manifest}
+            "entry_can_proceed": ok, "reconciliation_can_proceed": True, "manifest": manifest,
+            "source": source}

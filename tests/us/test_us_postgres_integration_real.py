@@ -13,10 +13,13 @@ def pg_engine(monkeypatch):
         conn.execute(text("DROP TABLE IF EXISTS us_fills CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS us_orders CASCADE"))
         conn.execute(text("DROP TABLE IF EXISTS us_order_intents CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS us_order_events CASCADE"))
+        conn.execute(text("DROP TABLE IF EXISTS us_profit_capture_lifecycle CASCADE"))
         # Exercise the same production migrations rather than a test-only schema.
         conn.exec_driver_sql(open("migrations/0038_us_agent_tables.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0043_us_fills_idempotency_and_order_reconcile_fix.sql", encoding="utf-8").read())
         conn.exec_driver_sql(open("migrations/0046_us_orders_committed_notional.sql", encoding="utf-8").read())
+        conn.exec_driver_sql(open("migrations/0047_us_order_events_profit_lifecycle.sql", encoding="utf-8").read())
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: engine)
     yield engine
     engine.dispose()
@@ -33,6 +36,34 @@ def _seed_order(engine, *, key, order_no, qty_requested=10, qty_filled=3):
             (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
             VALUES ('2026-07-16','AMD','NASDAQ','SELL',:qty,100,:order_no,:key,now(),CAST(:meta AS jsonb),:idem)"""),
             {"qty":qty_filled,"order_no":order_no,"key":key,"idem":f"synthetic-{order_no}","meta":json.dumps({"is_synthetic":True,"fill_evidence_type":"BALANCE_DELTA_SYNTHETIC","cumulative_filled_qty":qty_filled,"accounting_active":True})})
+
+
+def test_real_postgres_durable_ledger_and_lifecycle_isolation(pg_engine):
+    from trader.us.db import repos
+
+    event = {
+        "event_id": "2d71827d-31c8-4f50-818a-b27881db6fa6",
+        "trade_date": "2026-08-04", "event_type": "BROKER_SUBMIT_STARTED",
+        "event_timestamp": "2026-08-04T13:30:00+00:00", "session": "am",
+        "session_run_id": "R1", "tick_id": "T1", "client_order_key": "L1K",
+        "submit_attempt_id": "A1", "symbol": "JPM", "side": "SELL",
+        "requested_qty": 2, "raw_broker_order_no": None,
+        "canonical_broker_order_no": None, "position_lifecycle_id": "L1",
+        "profit_capture_stage": "tp1", "cumulative_filled_qty": 0,
+        "payload": {"strategy_reason": "TAKE_PROFIT_TP1"}, "idempotency_key": "idem-A1",
+    }
+    assert repos.append_us_order_event(event)
+    assert repos.append_us_order_event(event)
+    assert len(repos.load_us_order_events("2026-08-04")) == 1
+
+    repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="FILLED",
+                                       position_lifecycle_id="L1", order_key="L1K")
+    repos.mark_us_profit_capture_stage("2026-08-04", "JPM", "tp1", status="PENDING",
+                                       position_lifecycle_id="L2", order_key="L2K")
+    l1 = repos.load_us_profit_capture_state("2026-08-04", ["JPM"], {"JPM": "L1"})["JPM"]
+    l2 = repos.load_us_profit_capture_state("2026-08-04", ["JPM"], {"JPM": "L2"})["JPM"]
+    assert l1["tp1_done"] and not l1["tp1_pending"]
+    assert l2["tp1_pending"] and not l2["tp1_done"]
 
 
 def test_real_postgres_reconcile_updates_actual_fill_with_typed_jsonb_binds(pg_engine):

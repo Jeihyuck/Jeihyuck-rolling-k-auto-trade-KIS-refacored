@@ -196,7 +196,10 @@ def _journal_has_unrecovered_buy_ack(trade_date: str) -> bool:
         events = load_order_events(trade_date)
     except Exception as exc:
         logger.error("[US_SAFETY][JOURNAL_ACK_CHECK_FAILED] trade_date=%s error=%s", trade_date, exc)
-        return True
+        # The router independently requires a durable BROKER_SUBMIT_STARTED
+        # commit before every POST.  Keep exit evaluation/reconciliation alive;
+        # any real submit is fail-closed at that final boundary.
+        return False
     grouped: dict[str, list[dict]] = {}
     for event in events:
         key = str(event.get("client_order_key") or "").strip()
