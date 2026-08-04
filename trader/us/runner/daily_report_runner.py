@@ -555,6 +555,8 @@ def run_daily_report(
             # Orders - count by status
             try:
                 all_orders_today = load_us_daily_orders_for_report(trade_date)
+                from trader.us.execution.order_journal import order_audit_timelines
+                audit_timelines = order_audit_timelines(trade_date)
                 if all_orders_today:
                     for order in all_orders_today:
                         status = order.get("status", "").upper()
@@ -565,7 +567,8 @@ def run_daily_report(
                         elif status in submitted_statuses and side == "SELL":
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
-                        fees = order.get("fees") if order.get("fees") is not None else meta.get("fees")
+                        timeline = audit_timelines.get(str(order.get("client_order_key") or ""), {})
+                        fees = timeline.get("fees") if timeline.get("fees") is not None else order.get("fees") if order.get("fees") is not None else meta.get("fees")
                         report.setdefault("order_audit", []).append({
                             "symbol": order.get("symbol"), "side": side,
                             "strategy_reason": meta.get("reason") or order.get("reason"),
@@ -575,8 +578,8 @@ def run_daily_report(
                             "broker_avg_price_source": meta.get("broker_avg_price_source"),
                             "decision_price": meta.get("decision_price") or meta.get("executable_price"),
                             "limit_price": order.get("limit_price") or order.get("avg_price_usd"),
-                            "fill_price": (order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None,
-                            "filled_qty": order.get("qty_filled"),
+                            "fill_price": timeline.get("fill_price") or ((order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None),
+                            "filled_qty": timeline.get("filled_qty") if timeline.get("filled_qty") is not None else order.get("qty_filled"),
                             "gross_realized_pnl": meta.get("gross_realized_pnl"), "fees": fees,
                             "fees_status": "AVAILABLE" if fees is not None else "UNAVAILABLE",
                             "net_realized_pnl": meta.get("net_realized_pnl") if fees is not None else None,
@@ -586,8 +589,8 @@ def run_daily_report(
                             "canonical_order_no": meta.get("order_no_norm"),
                             "client_order_key": order.get("client_order_key"),
                             "submit_attempt_id": meta.get("submit_attempt_id"),
-                            "submitted_at": order.get("submitted_at") or order.get("created_at"),
-                            "acknowledged_at": order.get("acknowledged_at"), "filled_at": order.get("filled_at"),
+                            "submitted_at": timeline.get("submitted_at"),
+                            "acknowledged_at": timeline.get("acknowledged_at"), "filled_at": timeline.get("filled_at"),
                             "session_revision": meta.get("session_revision") or report.get("commit_sha"),
                         })
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")

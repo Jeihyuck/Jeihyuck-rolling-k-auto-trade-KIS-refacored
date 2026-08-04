@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 
 AUTHORITATIVE_AVG_SOURCES = {"kis_pchs_avg_pric", "kis_buy_amount_div_qty"}
-BROKER_TERMINAL_EVIDENCE = {"KIS_ORDER_CUMULATIVE_ACTUAL", "KIS_EXECUTION_ACTUAL"}
+BROKER_TERMINAL_EVIDENCE = {"KIS_ORDER_CUMULATIVE_ACTUAL", "KIS_EXECUTION_ACTUAL", "KIS_ORDER_STATUS_ACTUAL"}
 
 
 def as_decimal(value: object, *, name: str) -> Decimal:

@@ -424,7 +424,7 @@ def reconcile_ack_orders_with_balance(
     env: str = "practice",
 ) -> dict:
     """ACK 상태이나 qty_filled=0인 주문의 체결 여부를 KIS fills + 잔고로 확인."""
-    from trader.us.db.repos import load_pending_ack_orders, mark_order_filled_by_reconcile
+    from trader.us.db.repos import load_pending_ack_orders, mark_order_filled_by_reconcile, apply_broker_order_observation
 
     if provider is None:
         from trader.us.data_provider import USDataProvider
@@ -553,20 +553,25 @@ def reconcile_ack_orders_with_balance(
                 symbol, order_no, fill_qty, fill_price,
             )
             try:
-                mark_result = mark_order_filled_by_reconcile(
-                    order_no=order_no,
-                    client_order_key=client_order_key,
-                    symbol=symbol,
-                    side=side,
-                    filled_qty=fill_qty,
-                    requested_qty=qty,
-                    cumulative_filled_qty=fill_qty,
+                mark_result = apply_broker_order_observation(
+                    trade_date=trade_date, client_order_key=client_order_key,
+                    raw_order_no=order_no, canonical_order_no=normalize_us_order_no(order_no),
+                    symbol=symbol, side=side, requested_qty=qty, filled_qty=fill_qty,
+                    remaining_qty=max(0, qty-fill_qty),
+                    broker_status="FILLED" if fill_qty >= qty else "PARTIALLY_FILLED",
                     evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL",
-                    avg_price_usd=fill_price,
-                    source="fills_reconcile",
-                    trade_date=trade_date,
-                    meta=_order_meta(order),
+                    observed_at=fills_resp.get("observed_at"),
+                    raw_row={**fills_resp, "avg_price": fill_price},
                 )
+                if mark_result.get("status") in {"ORDER_IDENTITY_NOT_UNIQUE", "ORDER_NOT_FOUND"}:
+                    # Compatibility for injected/provider-only reconciliation;
+                    # production pending orders always have a durable DB identity.
+                    mark_result = mark_order_filled_by_reconcile(
+                        order_no=order_no, client_order_key=client_order_key,
+                        symbol=symbol, side=side, filled_qty=fill_qty,
+                        requested_qty=qty, cumulative_filled_qty=fill_qty,
+                        evidence_type="KIS_ORDER_CUMULATIVE_ACTUAL", avg_price_usd=fill_price,
+                        source="fills_reconcile", trade_date=trade_date, meta=_order_meta(order))
                 if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
                     confirmed_count += 1
                     symbols_by_status["fill_api_confirmed"].append(symbol)

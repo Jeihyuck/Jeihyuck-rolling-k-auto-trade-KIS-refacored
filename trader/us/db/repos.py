@@ -492,7 +492,7 @@ def _upsert_order(conn: Any, td: str, row: dict) -> None:
                     dry_run       =EXCLUDED.dry_run,
                     committed_notional_usd=COALESCE(us_orders.committed_notional_usd, EXCLUDED.committed_notional_usd),
                     env           =COALESCE(NULLIF(us_orders.env, ''), EXCLUDED.env),
-                    meta          =EXCLUDED.meta,
+                    meta          =COALESCE(us_orders.meta, '{}'::jsonb) || EXCLUDED.meta,
                     updated_at    =NOW()
         """),
         {
@@ -530,12 +530,20 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
         "order_no_raw": raw_order_no,
         "order_no_norm": normalize_us_order_no(raw_order_no),
     }
+    if order_result["meta"].get("profit_capture_stage"):
+        required = ("profit_capture_stage", "position_lifecycle_id", "broker_avg_price",
+                    "tp_threshold_fraction", "return_rate_at_decision")
+        missing = [field for field in required if order_result["meta"].get(field) in (None, "")]
+        if missing or not order_result.get("client_order_key") or int(order_result.get("qty_requested") or 0) <= 0:
+            logger.error("[US_ORDER_ACK][TP_META_INVALID] missing=%s", missing)
+            return False
     engine = _get_engine_or_none()
     if engine is None:
         for existing in _MEM_ORDERS:
             if existing.get("client_order_key") == order_result.get("client_order_key"):
                 assert_same_identity(existing, {**order_result, "trade_date": td})
-                existing.update({**order_result, "trade_date": td})
+                merged_meta = {**_parse_json_meta(existing.get("meta")), **_parse_json_meta(order_result.get("meta"))}
+                existing.update({**order_result, "trade_date": td, "meta": merged_meta})
                 return True
         _MEM_ORDERS.append({
             **order_result, "trade_date": td,
@@ -567,6 +575,80 @@ def save_order_ack(order_result: dict, trade_date: str | None = None) -> bool:
     except Exception as exc:
         logger.error("[US_ORDER_ACK][SAVE][ERROR] %s", exc)
         return False
+
+
+def apply_broker_order_observation(*, trade_date: str, client_order_key: str,
+        raw_order_no: str, canonical_order_no: str, symbol: str, side: str,
+        requested_qty: int, filled_qty: int, remaining_qty: int,
+        broker_status: str, evidence_type: str, observed_at: str | None = None,
+        raw_row: dict | None = None) -> dict:
+    """Atomically apply broker truth, then emit the canonical lifecycle event."""
+    td, key = str(trade_date), str(client_order_key)
+    status = str(broker_status or "").upper().replace("CANCELED", "CANCELLED")
+    if status == "ACK_PENDING": status = "ACK"
+    allowed = {"ACK", "OPEN", "PARTIALLY_FILLED", "FILLED", "REJECTED", "CANCELLED", "EXPIRED"}
+    if status not in allowed:
+        return {"status": "BROKER_OBSERVATION_QUARANTINED", "broker_status": status}
+    meta_patch = {"order_no_raw": str(raw_order_no), "order_no_norm": str(canonical_order_no),
+                  "remaining_qty": int(remaining_qty), "broker_observed_at": observed_at,
+                  "broker_raw_row": raw_row or {}, "fill_evidence_type": evidence_type}
+    engine = _get_engine_or_none()
+    if engine is None:
+        identity_rows = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
+        if len(identity_rows) != 1: return {"status": "ORDER_IDENTITY_NOT_UNIQUE"}
+        order_meta = {**_parse_json_meta(identity_rows[0].get("meta")), **meta_patch}
+    else:
+        with engine.connect() as conn:
+            identity_row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key"), {"td": td, "key": key}).mappings().first()
+        if not identity_row: return {"status": "ORDER_NOT_FOUND"}
+        order_meta = {**_parse_json_meta(identity_row.get("meta")), **meta_patch}
+    if status in {"PARTIALLY_FILLED", "FILLED"} and int(filled_qty) > 0:
+        result = mark_order_filled_by_reconcile(
+            order_no=raw_order_no, client_order_key=key, symbol=symbol, side=side,
+            filled_qty=filled_qty, requested_qty=requested_qty,
+            cumulative_filled_qty=filled_qty,
+            avg_price_usd=float((raw_row or {}).get("avg_price") or 0),
+            source="broker_order_observation", evidence_type=evidence_type,
+            trade_date=td, meta=meta_patch,
+        )
+        if result.get("status") != "OK": return result
+    else:
+        if engine is None:
+            matches = [o for o in _MEM_ORDERS if str(o.get("trade_date")) == td and str(o.get("client_order_key")) == key]
+            if len(matches) != 1: return {"status": "ORDER_IDENTITY_NOT_UNIQUE"}
+            order = matches[0]
+            from trader.us.execution.order_identity import assert_same_identity
+            assert_same_identity(order, {"trade_date": td, "symbol": symbol, "side": side,
+                                         "exchange": order.get("exchange"), "meta": order.get("meta")})
+            order["status"] = status
+            order["order_no"] = order.get("order_no") or raw_order_no
+            order["meta"] = {**_parse_json_meta(order.get("meta")), **meta_patch}
+            order_meta = order["meta"]
+        else:
+            with engine.begin() as conn:
+                row = conn.execute(text("SELECT meta FROM us_orders WHERE trade_date=:td AND client_order_key=:key FOR UPDATE"), {"td": td, "key": key}).mappings().first()
+                if not row: return {"status": "ORDER_NOT_FOUND"}
+                order_meta = {**_parse_json_meta(row.get("meta")), **meta_patch}
+                conn.execute(text("UPDATE us_orders SET status=:status, order_no=COALESCE(NULLIF(order_no,''),:ono), meta=CAST(:meta AS jsonb), updated_at=NOW() WHERE trade_date=:td AND client_order_key=:key"),
+                             {"status": status, "ono": raw_order_no, "meta": _json_param(order_meta), "td": td, "key": key})
+        if side.upper() == "SELL" and order_meta.get("profit_capture_stage"):
+            from trader.us.profit_capture import sync_profit_capture_stage_from_order
+            sync_profit_capture_stage_from_order(trade_date=td, symbol=symbol,
+                position_lifecycle_id=str(order_meta.get("position_lifecycle_id") or ""),
+                client_order_key=key, broker_order_no=raw_order_no,
+                profit_capture_stage=str(order_meta.get("profit_capture_stage")),
+                order_status=status, evidence_type=evidence_type, filled_qty=filled_qty,
+                requested_qty=requested_qty)
+    from trader.us.execution.order_journal import append_order_event
+    event_type = {"ACK": "BROKER_ACK_RECOVERED", "OPEN": "ORDER_OPEN",
+                  "PARTIALLY_FILLED": "ORDER_PARTIALLY_FILLED", "FILLED": "ORDER_FILLED",
+                  "REJECTED": "ORDER_REJECTED", "CANCELLED": "ORDER_CANCELLED",
+                  "EXPIRED": "ORDER_EXPIRED"}[status]
+    append_order_event(event_type, {"trade_date": td, "client_order_key": key,
+        "submit_attempt_id": order_meta.get("submit_attempt_id"), "symbol": symbol,
+        "side": side, "qty": requested_qty, "meta": order_meta},
+        broker_order_no=raw_order_no, broker_status=status)
+    return {"status": "OK", "order_status": status}
 
 
 def save_order_reject(order_result: dict, trade_date: str | None = None) -> bool:

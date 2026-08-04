@@ -13,6 +13,11 @@ def manifest_path(trade_date: str) -> Path:
 
 def pin_run_revision(trade_date: str, revision: str, *, replace: bool = False) -> dict:
     path = manifest_path(trade_date)
+    if replace:
+        approved = os.getenv("US_REPREP_APPROVED", "0") == "1"
+        reason = os.getenv("US_REPREP_AUDIT_REASON", "").strip()
+        if not approved or not reason:
+            raise RuntimeError("reprep_requires_operator_approval_and_audit_reason")
     if path.exists() and not replace:
         current = json.loads(path.read_text(encoding="utf-8"))
         if current.get("run_revision") != revision:
@@ -21,6 +26,8 @@ def pin_run_revision(trade_date: str, revision: str, *, replace: bool = False) -
     payload = {"trade_date": trade_date, "run_revision": revision,
                "strategy_schema_version": "us-v1", "prep_schema_version": "1",
                "generated_at": datetime.now(timezone.utc).isoformat()}
+    if replace:
+        payload["reprep_audit_reason"] = reason
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
