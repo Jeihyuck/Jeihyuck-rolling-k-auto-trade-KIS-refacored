@@ -16,6 +16,7 @@ WARNING_STATUSES = {
     "WARN_SELL_REJECT_RECONCILE_PENDING", "WARN_DUPLICATE_EXIT_BLOCKED",
     "FAILED_PARTIAL_EXIT_ORDERS_REJECTED", "OK_WITH_ERRORS",
     "OK_ENTRY_DEGRADED_NO_BUY", "OK_EXIT_SENT_ENTRY_DEGRADED", "OK_NO_TRADE_ENTRY_DEGRADED",
+    "OK_RECONCILE_ONLY_PENDING",
 }
 
 FATAL_STATUSES = {
@@ -39,6 +40,11 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
     """Return success/warning/fatal for a tick result payload or raw status."""
     if isinstance(tick_result, dict):
         status = str(tick_result.get("status") or "")
+        severity = str(tick_result.get("severity") or "").upper()
+        if severity in {"RECOVERABLE", "DEGRADED"}:
+            return "warning"
+        if severity == "FATAL":
+            return "fatal"
         if status == "FAILED_ALL_EXIT_ORDERS_BLOCKED":
             duplicate_exit_blocked = bool(tick_result.get("duplicate_exit_blocked"))
             block_reasons = tick_result.get("block_reasons") or {}

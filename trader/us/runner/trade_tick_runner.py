@@ -1361,6 +1361,9 @@ def run_trade_tick(
         )
         return {
             "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
+            "severity": "OK" if reconcile_only_clean else "DEGRADED",
+            "allow_new_orders": False,
+            "session_should_continue": True,
             "reason": reason,
             "session": session,
             "orders": [], "ack": 0, "dry_run": 0, "blocked": 0, "signal_only": 0,

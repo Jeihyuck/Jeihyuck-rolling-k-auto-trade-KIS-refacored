@@ -601,6 +601,18 @@ def route_order(
     )
 
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    if side == "SELL" and str(intent.get("reason") or meta.get("reason") or "").startswith("TAKE_PROFIT"):
+        from trader.us.profit_capture import as_decimal, calc_return_rate
+        try:
+            broker_avg = as_decimal(meta.get("broker_avg_price"), name="broker_avg_price")
+            executable = as_decimal(intent.get("limit_price"), name="executable_price")
+            threshold = as_decimal(meta.get("tp_threshold_fraction"), name="tp_threshold")
+            actual_return = calc_return_rate(executable, broker_avg)
+            if actual_return <= 0 or actual_return < threshold:
+                raise ValueError("threshold_not_met" if actual_return > 0 else "non_positive_return")
+        except ValueError as exc:
+            logger.warning("[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=%s", symbol_upper, exc)
+            return {"status": "BLOCKED", "reason": "take_profit_pre_submit_guard_failed", "guard_reason": str(exc), "broker_submit": False, "intent": intent}
     hard_block_reasons = {
         "FORBIDDEN_HEDGE_OR_INVERSE_ETF",
         "DEFENSE_CRASH_ENTRY_BLOCK",

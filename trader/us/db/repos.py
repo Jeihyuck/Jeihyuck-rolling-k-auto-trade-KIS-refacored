@@ -847,9 +847,9 @@ def _normalize_profit_capture_state(trade_date: str, symbol: str, state: dict | 
     out = {
         "trade_date": str(trade_date),
         "symbol": str(symbol or "").strip().upper(),
-        "tp1_done": bool(raw.get("tp1_done") or raw.get("tp1_pending") or meta.get("tp1_done") or meta.get("tp1_pending")),
-        "tp2_done": bool(raw.get("tp2_done") or raw.get("tp2_pending") or meta.get("tp2_done") or meta.get("tp2_pending")),
-        "tp3_done": bool(raw.get("tp3_done") or raw.get("tp3_pending") or meta.get("tp3_done") or meta.get("tp3_pending")),
+        "tp1_done": bool(raw.get("tp1_done") or meta.get("tp1_done")),
+        "tp2_done": bool(raw.get("tp2_done") or meta.get("tp2_done")),
+        "tp3_done": bool(raw.get("tp3_done") or meta.get("tp3_done")),
         "tp1_pending": bool(raw.get("tp1_pending") or meta.get("tp1_pending")),
         "tp2_pending": bool(raw.get("tp2_pending") or meta.get("tp2_pending")),
         "tp3_pending": bool(raw.get("tp3_pending") or meta.get("tp3_pending")),
@@ -910,10 +910,10 @@ def mark_us_profit_capture_stage(
         existing[f"{stg}_pending"] = False
         existing[f"{stg}_done"] = False
     else:
-        existing[f"{stg}_pending"] = status_upper == "PENDING"
-        if status_upper in {"ACK", "DONE", "FILLED", "PENDING"}:
-            # Treat PENDING as done for duplicate prevention, while preserving pending flag.
+        existing[f"{stg}_pending"] = status_upper in {"PENDING", "SUBMITTED", "ACK", "OPEN", "PARTIALLY_FILLED"}
+        if status_upper in {"DONE", "FILLED"}:
             existing[f"{stg}_done"] = True
+            existing[f"{stg}_pending"] = False
     if order_key:
         existing[f"{stg}_order_key"] = order_key
     if not terminal_failure:

@@ -202,10 +202,10 @@ def test_profit_capture_price_aliases_and_pnl_rate_resolver(monkeypatch):
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
     cases = [
-        ({"symbol": "AAPL", "qty": 100, "current_price_usd": 110, "unrealized_pnl_pct": 0.03}, "TAKE_PROFIT_TP1"),
-        ({"symbol": "MSFT", "qty": 100, "current_price_usd": 110, "pnl_rate": 3.0}, "TAKE_PROFIT_TP1"),
-        ({"symbol": "GOOG", "qty": 100, "current_price_usd": 110, "pnl_rate": 0.03}, "TAKE_PROFIT_TP1"),
-        ({"symbol": "META", "qty": 100, "current_price_usd": 110, "evlu_pfls_rt": 5.0, "meta": {"tp1_done": True}}, "TAKE_PROFIT_TP2"),
+        ({"symbol": "AAPL", "qty": 100, "current_price_usd": 103, "avg_price_usd": 100}, "TAKE_PROFIT_TP1"),
+        ({"symbol": "MSFT", "qty": 100, "current_price_usd": 103, "avg_price_usd": 100}, "TAKE_PROFIT_TP1"),
+        ({"symbol": "GOOG", "qty": 100, "current_price_usd": 103, "avg_price_usd": 100}, "TAKE_PROFIT_TP1"),
+        ({"symbol": "META", "qty": 100, "current_price_usd": 105, "avg_price_usd": 100, "meta": {"tp1_done": True}}, "TAKE_PROFIT_TP2"),
         ({"symbol": "AMZN", "qty": 100, "current_price_usd": 103, "entry_price": 100}, "TAKE_PROFIT_TP1"),
     ]
     for idx, (pos, reason) in enumerate(cases):
@@ -218,18 +218,20 @@ def test_profit_capture_persistent_duplicate_prevention(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
-    pos = {"symbol": "AAPL", "qty": 100, "current_price_usd": 110, "pnl_rate": 3.0}
+    pos = {"symbol": "AAPL", "qty": 100, "current_price_usd": 103, "avg_price_usd": 100}
     first = build_profit_capture_intents([pos], overlay, trade_date="2026-07-09")
     second = build_profit_capture_intents([pos], overlay, trade_date="2026-07-09")
     assert len(first) == 1
     assert second == []
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp1", status="ACK")
-    tp2 = build_profit_capture_intents([{**pos, "pnl_rate": 5.0}], overlay, trade_date="2026-07-09")
+    assert build_profit_capture_intents([{**pos, "current_price_usd": 105}], overlay, trade_date="2026-07-09") == []
+    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp1", status="FILLED")
+    tp2 = build_profit_capture_intents([{**pos, "current_price_usd": 105}], overlay, trade_date="2026-07-09")
     assert tp2 and tp2[0]["reason"] == "TAKE_PROFIT_TP2"
-    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp2", status="ACK")
-    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp3", status="ACK")
-    assert build_profit_capture_intents([{**pos, "pnl_rate": 9.0}], overlay, trade_date="2026-07-09") == []
+    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp2", status="FILLED")
+    repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp3", status="FILLED")
+    assert build_profit_capture_intents([{**pos, "current_price_usd": 109}], overlay, trade_date="2026-07-09") == []
 
 
 
@@ -237,20 +239,20 @@ def test_profit_capture_stage_order_gap_up_starts_with_tp1(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
-    pos = {"symbol": "GAP", "qty": 100, "current_price_usd": 109, "pnl_rate": 9.0}
+    pos = {"symbol": "GAP", "qty": 100, "current_price_usd": 109, "avg_price_usd": 100}
     first = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
     assert len(first) == 1
     assert first[0]["reason"] == "TAKE_PROFIT_TP1"
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
-    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp1", status="ACK")
+    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp1", status="FILLED")
     second = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
     assert len(second) == 1
     assert second[0]["reason"] == "TAKE_PROFIT_TP2"
-    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp2", status="ACK")
+    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp2", status="FILLED")
     third = build_profit_capture_intents([pos], overlay, trade_date="2026-07-10")
     assert len(third) == 1
     assert third[0]["reason"] == "TAKE_PROFIT_TP3"
-    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp3", status="ACK")
+    repos.mark_us_profit_capture_stage("2026-07-10", "GAP", "tp3", status="FILLED")
     assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-10") == []
 
 
@@ -258,7 +260,7 @@ def test_profit_capture_rejected_stage_can_retry(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
-    pos = {"symbol": "RETRY", "qty": 100, "current_price_usd": 103, "pnl_rate": 3.0}
+    pos = {"symbol": "RETRY", "qty": 100, "current_price_usd": 103, "avg_price_usd": 100}
     repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="PENDING")
     assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-11") == []
     repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="REJECTED")

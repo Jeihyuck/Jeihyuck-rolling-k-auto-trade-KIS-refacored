@@ -673,6 +673,8 @@ def is_strong_holding(pos: dict, row: dict | None = None) -> bool:
 
 
 def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None) -> list[dict]:
+    from decimal import Decimal
+    from trader.us.profit_capture import as_decimal, calc_return_rate
     if not overlay.get("profit_capture_enabled", True):
         return []
     existing_sell_symbols = existing_sell_symbols or set()
@@ -684,7 +686,8 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
         except Exception as exc:
             logger.warning("[US_PROFIT_CAPTURE][STATE_LOAD_WARN] trade_date=%s err=%s", trade_date, exc)
             profit_capture_state = {}
-    profit_capture_state = profit_capture_state or {}
+    if profit_capture_state is None:
+        profit_capture_state = {}
     runner_min = _env_float("US_RUNNER_MIN_REMAIN_PCT", 0.40)
     stages = [("tp1_done", _env_float("US_TP1_PCT", .03), _env_float("US_TP1_SELL_PCT", .25), "TAKE_PROFIT_TP1"), ("tp2_done", _env_float("US_TP2_PCT", .05), _env_float("US_TP2_SELL_PCT", .25), "TAKE_PROFIT_TP2"), ("tp3_done", _env_float("US_TP3_PCT", .08), _env_float("US_TP3_SELL_PCT", .20), "TAKE_PROFIT_TP3")]
     intents = []
@@ -697,17 +700,27 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
             continue
         state = dict(profit_capture_state.get(sym) or profit_capture_state.get(sym.upper()) or {})
         meta_state = p.get("meta") if isinstance(p.get("meta"), dict) else {}
-        pnl = _pnl_pct(p)
-        if pnl is None:
+        broker_avg_raw = p.get("avg_price_usd") or p.get("entry_price") or p.get("avg_cost")
+        try:
+            executable = as_decimal(price, name="executable_price")
+            broker_avg = as_decimal(broker_avg_raw, name="broker_avg_price")
+            return_rate = calc_return_rate(executable, broker_avg)
+        except ValueError as exc:
+            logger.warning("[US_PROFIT_CAPTURE][DECISION] symbol=%s decision=BLOCK reason=%s", sym, exc)
             continue
-        for flag, thresh, sell_pct, reason in stages:
+        for stage_index, (flag, thresh, sell_pct, reason) in enumerate(stages):
             pending_flag = flag.replace("_done", "_pending")
-            if pnl >= thresh and not bool(meta.get(flag)) and not bool(meta_state.get(flag)) and not bool(state.get(flag)) and not bool(state.get(pending_flag)):
+            prior_filled = stage_index == 0 or bool(state.get(stages[stage_index - 1][0]) or meta.get(stages[stage_index - 1][0]))
+            threshold = Decimal(str(thresh))
+            if not prior_filled:
+                logger.info("[US_PROFIT_CAPTURE][DECISION] symbol=%s decision=BLOCK reason=tp%d_not_filled", sym, stage_index)
+                break
+            if return_rate >= threshold and return_rate > 0 and not bool(meta.get(flag)) and not bool(meta_state.get(flag)) and not bool(state.get(flag)) and not bool(state.get(pending_flag)):
                 max_sell = max(0, q - int(q * runner_min))
                 qty = min(max_sell, max(1, int(q * sell_pct)))
                 if qty > 0:
                     order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{reason}"
-                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), flag: True, "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
+                    intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "broker_avg_price": str(broker_avg), "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
                     if trade_date:
                         try:
                             from trader.us.db.repos import mark_us_profit_capture_stage
@@ -716,7 +729,7 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                             profit_capture_state[sym] = state
                         except Exception as exc:
                             logger.warning("[US_PROFIT_CAPTURE][STATE_MARK_WARN] symbol=%s stage=%s err=%s", sym, flag, exc)
-                    logger.info("[US_PROFIT_CAPTURE][%s] symbol=%s qty=%d pnl=%.4f runner_remaining_pct=%.4f", reason[-3:], sym, qty, pnl, (q - qty) / q)
+                    logger.info("[US_PROFIT_CAPTURE][DECISION] symbol=%s broker_avg_price=%s executable_price=%s return_rate=%s threshold_unit=fraction threshold=%s decision=SUBMIT stage=%s", sym, broker_avg, executable, return_rate, threshold, reason)
                 break
     return intents
 

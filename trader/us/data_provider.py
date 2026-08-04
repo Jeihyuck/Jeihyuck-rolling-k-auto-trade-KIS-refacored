@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import text
+from trader.us.utils.order_no import normalize_us_order_no
 
 logger = logging.getLogger(__name__)
 _DAILY_RAW_KEYS_LOGGED: set[str] = set()
@@ -505,12 +506,15 @@ def normalize_us_order_status_row(row: dict) -> dict:
         status = "FILLED"
     elif filled > 0:
         status = "PARTIALLY_FILLED"
+    elif requested > 0 and remaining > 0:
+        status = "OPEN"
     elif order_no:
-        status = "ACK"
+        status = "ACK_PENDING"
     else:
         status = "UNKNOWN"
     return {
-        "order_no": order_no, "symbol": symbol, "side": side,
+        "order_no": order_no, "raw_order_no": order_no,
+        "canonical_order_no": normalize_us_order_no(order_no), "symbol": symbol, "side": side,
         "requested_qty": requested, "filled_qty": filled, "remaining_qty": remaining,
         "status": status,
         "avg_price": _safe_float(_get_first_valid(row, ("avg_price", "ft_ccld_unpr3", "avg_prvs"), 0.0)),
@@ -957,14 +961,17 @@ class USDataProvider:
             raw = client.get_us_fills_today(trade_date=trade_date)
         else:
             raw = method(trade_date=trade_date)
-        return [normalize_us_order_status_row(row) for row in (raw or [])]
+        normalized = [normalize_us_order_status_row(row) for row in (raw or [])]
+        logger.info("[ORDER_NORMALIZATION] raw_count=%d normalized_count=%d ignored_count=0 quarantined_count=0", len(raw or []), len(normalized))
+        return normalized
 
     def get_fills_by_order_no(self, order_no: str, symbol: str, trade_date: str) -> dict | None:
         """Return normalized cumulative fill/order detail for a single broker order."""
         if self._offline:
             return None
         rows = self.get_today_orders(trade_date)
-        matches = [r for r in rows if str(r.get("order_no") or "") == str(order_no) and str(r.get("symbol") or "").upper() == str(symbol).upper()]
+        wanted = normalize_us_order_no(order_no)
+        matches = [r for r in rows if normalize_us_order_no(r.get("order_no")) == wanted and str(r.get("symbol") or "").upper() == str(symbol).upper()]
         if not matches:
             return None
         def _observed(row: dict) -> str:

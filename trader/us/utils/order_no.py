@@ -7,9 +7,14 @@ audit, but use this value for identity and idempotency comparisons.
 from __future__ import annotations
 
 
+def canonical_order_no(value: object) -> str | None:
+    """Canonical comparison key while callers retain the unmodified raw value."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return (raw.lstrip("0") or "0") if raw.isdigit() else raw
+
+
 def normalize_us_order_no(value: object) -> str:
     """Return the stable KIS order number, with leading zeroes removed."""
-    text = str(value or "").strip().replace(" ", "")
-    if not text:
-        return ""
-    return text.lstrip("0") or "0"
+    return canonical_order_no(value) or ""

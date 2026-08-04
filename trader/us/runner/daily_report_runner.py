@@ -559,9 +559,10 @@ def run_daily_report(
                     for order in all_orders_today:
                         status = order.get("status", "").upper()
                         side = str(order.get("side", "")).upper()
-                        if side == "BUY":
+                        submitted_statuses = {"SUBMITTED", "SENT", "ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED", "ACK_UNRESOLVED", "ACK_STALE_UNRESOLVED", "ACK_PENDING_RECONCILE"}
+                        if status in submitted_statuses and side == "BUY":
                             report["buy_order_count"] += 1
-                        elif side == "SELL":
+                        elif status in submitted_statuses and side == "SELL":
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
@@ -624,7 +625,9 @@ def run_daily_report(
                             report["orders_disabled"] += 1
                         elif status == "SIGNAL_ONLY":
                             report["orders_signal_only"] += 1
-                    report["orders_sent_total"] = report["orders_submitted_total"] + report["orders_ack_total"]
+                    # ACK is a lifecycle transition of an already submitted order,
+                    # not another order.  Submitted side counts are the single source.
+                    report["orders_sent_total"] = report["buy_order_count"] + report["sell_order_count"]
                     report["orders_ack"] = report["orders_ack_total"]
                     report["orders_submitted"] = report["orders_submitted_total"]
             except Exception as exc:
