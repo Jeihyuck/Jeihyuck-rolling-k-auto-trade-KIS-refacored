@@ -5403,6 +5403,23 @@ class PB1Engine:
             context=gate_context,
         )
 
+    def _assert_authoritative_order_candidate(self, *, cf: CandidateFeature, gate_snapshot: dict[str, Any] | None) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        features = getattr(cf, "features", {}) or {}
+
+        if not bool(getattr(cf, "setup_ok", False)):
+            reasons.append("SETUP_NOT_PASSED")
+        if not bool(features.get("risk_ok")):
+            reasons.append("RISK_NOT_PASSED")
+        if not bool(features.get("sizing_ok")):
+            reasons.append("SIZING_NOT_PASSED")
+        if not bool(features.get("buyable_ok")):
+            reasons.append("BUYABLE_NOT_PASSED")
+        if not isinstance(gate_snapshot, dict) or not gate_snapshot:
+            reasons.append("BUYABLE_GATE_CONTEXT_MISSING")
+
+        return (len(reasons) == 0), reasons
+
     def _log_final_skip(self, *, cf: CandidateFeature, reason_code: str, reason_detail: str, stage: str, price: float) -> None:
         logger.info(
             "[ORDER][FINAL_SKIP] code=%s reason_code=%s reason_detail=%s",
@@ -9986,6 +10003,8 @@ class PB1Engine:
             qty=qty,
             stage=stage,
         )
+        code_key = str(cf.code or "").zfill(6)
+        gate_snapshot = (getattr(self, "_buyable_gate_context", {}) or {}).get(code_key, {})
         pre_submit = self._resolve_entry_pre_submit(
             cf=cf,
             stage=stage,
@@ -10004,6 +10023,28 @@ class PB1Engine:
             )
             status["skipped"] = 1
             status["skipped_reason"] = final_reason
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
+            return status
+        authoritative_ok, authoritative_reasons = self._assert_authoritative_order_candidate(
+            cf=cf,
+            gate_snapshot=gate_snapshot,
+        )
+        if not authoritative_ok:
+            logger.warning(
+                "[ORDER][HARD_BLOCK][AUTHORITATIVE_GATE] code=%s reasons=%s",
+                self._display_code(cf.code),
+                authoritative_reasons,
+            )
+            self._log_final_skip(
+                cf=cf,
+                reason_code="AUTHORITATIVE_GATE_BLOCK",
+                reason_detail=",".join(authoritative_reasons),
+                stage=stage,
+                price=record_price,
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = "AUTHORITATIVE_GATE_BLOCK"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -10039,7 +10080,17 @@ class PB1Engine:
             "current_stop_price": _eh_stop_px,
         })
         # ─────────────────────────────────────────────────────────────────────
-        request_payload = {"entry_plan": plan, "features": cf.features, "reasons": cf.reasons, "entry_meta": entry_meta, "entry_exit_plan": entry_exit_plan_dict}
+        pre_order_holding_qty = int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        request_payload = {
+            "entry_plan": plan,
+            "features": cf.features,
+            "reasons": cf.reasons,
+            "entry_meta": entry_meta,
+            "entry_exit_plan": entry_exit_plan_dict,
+            "pre_order_holding_qty": pre_order_holding_qty,
+            "requested_qty": int(qty or 0),
+            "submitted_qty": int(qty or 0),
+        }
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()
@@ -10266,12 +10317,17 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][ENTRY][FAIL] code=%s", display_code)
             status["failed"] = 1
+        submitted_qty = int(qty or 0)
+        if isinstance(resp, dict):
+            execution_meta = resp.get("_order_execution") if isinstance(resp.get("_order_execution"), dict) else {}
+            submitted_qty = int(execution_meta.get("submitted_qty") or submitted_qty)
         self.orders_repo.mark_submitted(
             self.env,
             effective_client_order_key or "",
             kis_odno,
             resp if isinstance(resp, dict) else {"resp": resp},
             entry_meta_json=entry_meta,
+            submitted_qty=submitted_qty,
         )
         status["submitted"] = int(status.get("api_submitted", 0) or 0)
         status["broker_order_no"] = kis_odno
@@ -10741,6 +10797,8 @@ class PB1Engine:
             ref_daily_close,
             reasons,
         )
+        code_key = str(cf.code or "").zfill(6)
+        gate_snapshot = (getattr(self, "_buyable_gate_context", {}) or {}).get(code_key, {})
         pre_submit = self._resolve_entry_pre_submit(
             cf=cf,
             stage="PB1-CLOSE",
@@ -10759,6 +10817,28 @@ class PB1Engine:
             )
             status["skipped"] = 1
             status["skipped_reason"] = final_reason
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            status["terminal_event"] = "FINAL_SKIP"
+            return status
+        authoritative_ok, authoritative_reasons = self._assert_authoritative_order_candidate(
+            cf=cf,
+            gate_snapshot=gate_snapshot,
+        )
+        if not authoritative_ok:
+            logger.warning(
+                "[ORDER][HARD_BLOCK][AUTHORITATIVE_GATE] code=%s reasons=%s",
+                self._display_code(cf.code),
+                authoritative_reasons,
+            )
+            self._log_final_skip(
+                cf=cf,
+                reason_code="AUTHORITATIVE_GATE_BLOCK",
+                reason_detail=",".join(authoritative_reasons),
+                stage="PB1-CLOSE",
+                price=float(cap or 0.0),
+            )
+            status["skipped"] = 1
+            status["skipped_reason"] = "AUTHORITATIVE_GATE_BLOCK"
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
@@ -10836,6 +10916,9 @@ class PB1Engine:
                     "cap_buffer_pct": cap_buffer_pct,
                     "entry_meta": entry_meta,
                     "entry_exit_plan": entry_exit_plan_dict,
+                    "pre_order_holding_qty": int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0),
+                    "requested_qty": int(cf.planned_qty or 0),
+                    "submitted_qty": int(cf.planned_qty or 0),
                 },
                 status="CREATED",
                 entry_meta_json=entry_meta,
@@ -10972,12 +11055,17 @@ class PB1Engine:
         except Exception:
             logger.exception("[PB1][CLOSE_ENTRY][FAIL] code=%s", display_code)
             status["failed"] = 1
+        submitted_qty = int(cf.planned_qty or 0)
+        if isinstance(resp, dict):
+            execution_meta = resp.get("_order_execution") if isinstance(resp.get("_order_execution"), dict) else {}
+            submitted_qty = int(execution_meta.get("submitted_qty") or submitted_qty)
         self.orders_repo.mark_submitted(
             self.env,
             effective_client_order_key or "",
             kis_odno,
             resp if isinstance(resp, dict) else {"resp": resp},
             entry_meta_json=entry_meta,
+            submitted_qty=submitted_qty,
         )
         status["submitted"] = int(status.get("api_submitted", 0) or 0)
         status["broker_order_no"] = kis_odno
@@ -12116,12 +12204,21 @@ class PB1Engine:
         )
         resp = None
         kis_odno = None
+        requested_qty = int(orderable_qty or 0)
         try:
-            resp = self.kis.sell_stock_market(code, orderable_qty)
+            resp = self.kis.sell_stock_market(code, requested_qty)
             kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
         except Exception:
             logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
-        self.orders_repo.mark_submitted(self.env, client_key, kis_odno, resp if isinstance(resp, dict) else {"resp": resp})
+        execution_meta = (resp.get("_order_execution") if isinstance(resp, dict) and isinstance(resp.get("_order_execution"), dict) else {})
+        submitted_qty = int(execution_meta.get("submitted_qty") or requested_qty)
+        self.orders_repo.mark_submitted(
+            self.env,
+            client_key,
+            kis_odno,
+            resp if isinstance(resp, dict) else {"resp": resp},
+            submitted_qty=submitted_qty,
+        )
         ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
         rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
         msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
@@ -12153,7 +12250,7 @@ class PB1Engine:
             code,
             stock_name,
             kis_odno or order_id,
-            orderable_qty,
+            submitted_qty,
             float(mark or 0.0),
             "ACCEPTED" if ok else "REJECTED",
         )
@@ -12171,70 +12268,13 @@ class PB1Engine:
                 )
                 if not _soft_ack:
                     raise
-            self.orders_repo.mark_filled(self.env, kis_odno=kis_odno, client_order_key=client_key)
-            filled_at = now_kst()
-            avg_buy_at_sell = float(pos.get("avg_buy_price") or avg or 0.0)
-            position_qty_before_sell = int(pos.get("qty") or 0)
-            sold_qty = int(orderable_qty or 0)
-            cost_basis_at_sell = avg_buy_at_sell * sold_qty if avg_buy_at_sell > 0 else 0.0
-            realized_pnl_at_sell = ((float(mark or 0.0) - avg_buy_at_sell) * sold_qty) if avg_buy_at_sell > 0 else 0.0
-            realized_pnl_pct_at_sell = ((float(mark or 0.0) - avg_buy_at_sell) / avg_buy_at_sell * 100.0) if avg_buy_at_sell > 0 else 0.0
-            self.fills_repo.upsert_fill(
-                env=self.env,
-                run_id=self.run_id,
-                order_id=order_id,
-                kis_odno=kis_odno,
-                trade_id=None,
-                code=code,
-                market=market,
-                side="SELL",
-                qty=orderable_qty,
-                price=mark,
-                fee=0.0,
-                tax=0.0,
-                filled_at=filled_at,
-                raw_json={"kis_response": resp, "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
-                fill_meta_json={
-                    "avg_buy_at_sell": avg_buy_at_sell,
-                    "cost_basis_at_sell": cost_basis_at_sell,
-                    "position_qty_before_sell": position_qty_before_sell,
-                    "entry_date": pos.get("entry_date") or pos.get("entry_ts") or pos.get("last_fill_at"),
-                    "realized_pnl": realized_pnl_at_sell,
-                    "realized_pnl_pct": realized_pnl_pct_at_sell,
-                    "exit_reason": exit_eval.primary_reason,
-                    "exit_meta": exit_meta,
-                },
-            )
-            self.positions_repo.apply_fill(
-                env=self.env,
-                strategy=self.STRATEGY_NAME,
-                sid=1,
-                mode=mode,
-                code=code,
-                market=market,
-                side="SELL",
-                qty=orderable_qty,
-                price=mark,
-                fee=0.0,
-                tax=0.0,
-                filled_at=filled_at,
-                entry_meta_json=exit_meta,
-            )
             logger.info(
-                "[POSITIONS][UPSERT_AFTER_FILL] code=%s name=%s side=%s qty=%s price=%s source=order_fill",
-                code,
-                stock_name,
-                "SELL",
-                orderable_qty,
-                mark,
-            )
-            logger.info(
-                "[TRADE][FILL][SELL] code=%s name=%s oid=%s fill_qty=%s fill_px=%.2f",
+                "[ORDER][ACCEPTED] side=SELL code=%s name=%s odno=%s fill_status=pending submitted_qty=%s requested_qty=%s",
                 code,
                 stock_name,
                 kis_odno or order_id,
-                orderable_qty,
-                float(mark or 0.0),
+                submitted_qty,
+                requested_qty,
             )
             if cooldown_until:
                 self.positions_repo.update_position_fields(

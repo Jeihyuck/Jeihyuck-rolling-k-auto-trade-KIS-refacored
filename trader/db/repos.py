@@ -2761,6 +2761,7 @@ class OrdersRepo:
         response_json: dict | None,
         *,
         entry_meta_json: dict | None = None,
+        submitted_qty: int | None = None,
     ) -> None:
         safe_response_json = json_sanitize(response_json or {})
         values = {
@@ -2771,6 +2772,8 @@ class OrdersRepo:
             "submitted_at": func.now(),
             "updated_at": func.now(),
         }
+        if submitted_qty is not None and int(submitted_qty) > 0:
+            values["qty"] = int(submitted_qty)
         if entry_meta_json:
             values.update(_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"))
         with self.engine.begin() as conn:

@@ -142,8 +142,72 @@ def _promote_open_buy_orders_from_holdings(
 
         request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
         response_json = order.get("response_json") if isinstance(order.get("response_json"), dict) else {}
+        execution_meta = response_json.get("_order_execution") if isinstance(response_json.get("_order_execution"), dict) else {}
         order_qty = _to_int(order.get("qty")) or 0
-        fill_qty = min(order_qty, holding_qty) if order_qty > 0 else holding_qty
+        submitted_qty = _to_int(execution_meta.get("submitted_qty")) or _to_int(response_json.get("submitted_qty")) or _to_int(request_json.get("submitted_qty")) or order_qty
+        requested_qty = _to_int(execution_meta.get("requested_qty")) or _to_int(response_json.get("requested_qty")) or _to_int(request_json.get("requested_qty")) or submitted_qty
+        pre_order_holding_qty = _to_int(request_json.get("pre_order_holding_qty"))
+        if pre_order_holding_qty is None and isinstance(response_json, dict):
+            pre_order_holding_qty = _to_int(response_json.get("pre_order_holding_qty"))
+        if submitted_qty <= 0:
+            submitted_qty = order_qty
+        if requested_qty <= 0:
+            requested_qty = submitted_qty
+
+        if pre_order_holding_qty is None and holding_qty > 0:
+            orders_repo.upsert_reconciled_order(
+                env=env,
+                run_id=ctx_run_id,
+                strategy=strategy,
+                sid=int(order.get("sid") or 1),
+                mode=int(order.get("mode") or 1),
+                code=code,
+                market=order.get("market"),
+                side="BUY",
+                ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
+                qty=max(0, submitted_qty),
+                limit_price=_to_float(order.get("limit_price")) or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0),
+                stage=str(order.get("stage") or "RECONCILE"),
+                client_order_key=str(order.get("client_order_key") or f"{env}:{strategy}:{code}:promote").strip(),
+                kis_odno=str(order.get("kis_odno") or order.get("broker_order_id") or "").strip() or None,
+                status="ACKED",
+                request_json=request_json,
+                response_json={
+                    **response_json,
+                    "promotion_source": "kis_holdings",
+                    "promoted_from_status": status,
+                    "holding_qty": holding_qty,
+                    "reconcile_required": 1,
+                    "reason": "HOLDING_BASELINE_MISSING",
+                    "submitted_qty": submitted_qty,
+                    "requested_qty": requested_qty,
+                },
+                submitted_at=order.get("submitted_at") or tick_ts,
+                acked_at=order.get("acked_at") or tick_ts,
+            )
+            logger.warning(
+                "[RECONCILE][PROMOTE_SKIP] env=%s code=%s reason=HOLDING_BASELINE_MISSING from=%s to=ACKED holding_qty=%s submitted_qty=%s",
+                env,
+                code,
+                status,
+                holding_qty,
+                submitted_qty,
+            )
+            continue
+
+        delta = int(holding_qty - int(pre_order_holding_qty or 0))
+        confirmed_fill_qty = max(0, min(delta, int(submitted_qty or 0)))
+        if delta <= 0:
+            next_status = "ACKED"
+        elif confirmed_fill_qty < int(submitted_qty or 0):
+            next_status = "PARTIAL_FILLED"
+        else:
+            next_status = "FILLED"
+
+        if confirmed_fill_qty > int(submitted_qty or 0):
+            next_status = "RECONCILE_ERROR"
+            confirmed_fill_qty = 0
+
         fill_price = (
             _to_float(order.get("limit_price"))
             or _to_float(request_json.get("ORD_UNPR"))
@@ -164,65 +228,91 @@ def _promote_open_buy_orders_from_holdings(
             market=order.get("market"),
             side="BUY",
             ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
-            qty=fill_qty,
+            qty=max(0, int(submitted_qty or 0)),
             limit_price=fill_price,
             stage=str(order.get("stage") or "RECONCILE"),
             client_order_key=client_order_key,
             kis_odno=kis_odno,
-            status="FILLED",
+            status=next_status,
             request_json=request_json,
             response_json={
                 **response_json,
                 "promotion_source": "kis_holdings",
                 "promoted_from_status": status,
                 "holding_qty": holding_qty,
+                "pre_order_holding_qty": pre_order_holding_qty,
+                "holding_delta": delta,
+                "submitted_qty": submitted_qty,
+                "requested_qty": requested_qty,
+                "confirmed_fill_qty": confirmed_fill_qty,
             },
             submitted_at=order.get("submitted_at") or order_time,
             acked_at=order_time,
         )
         promoted_orders += 1
 
-        fills_repo.upsert_fill(
-            env=env,
-            run_id=ctx_run_id,
-            order_id=str(order.get("order_id") or "") or None,
-            kis_odno=kis_odno,
-            trade_id=f"PROMOTE:{kis_odno or client_order_key}",
-            code=code,
-            market=order.get("market"),
-            side="BUY",
-            qty=fill_qty,
-            price=float(fill_price or 0.0),
-            fee=0.0,
-            tax=0.0,
-            filled_at=order_time,
-            raw_json={
-                "promotion_source": "kis_holdings_fallback",
-                "promoted_from_status": status,
-                "holding_qty": holding_qty,
-                "ccld_status": "timeout",
-                "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
-                "entry_meta": (request_json or {}).get("entry_meta") or {},
-                "entry_exit_plan": (request_json or {}).get("entry_exit_plan") or {},
-            },
-            fill_meta_json={
-                "fill_source": "kis_holdings_fallback",
-                "promoted_from_status": status,
-                "ccld_status": "timeout",
-                "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
-            },
-        )
-        promoted_fills += 1
-        promoted_codes.append(code)
-        logger.warning(
-            "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=FILLED qty=%s holding_qty=%s",
-            env,
-            code,
-            kis_odno,
-            status,
-            fill_qty,
-            holding_qty,
-        )
+        if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"}:
+            fills_repo.upsert_fill(
+                env=env,
+                run_id=ctx_run_id,
+                order_id=str(order.get("order_id") or "") or None,
+                kis_odno=kis_odno,
+                trade_id=f"PROMOTE:{kis_odno or client_order_key}",
+                code=code,
+                market=order.get("market"),
+                side="BUY",
+                qty=confirmed_fill_qty,
+                price=float(fill_price or 0.0),
+                fee=0.0,
+                tax=0.0,
+                filled_at=order_time,
+                raw_json={
+                    "promotion_source": "kis_holdings_fallback",
+                    "promoted_from_status": status,
+                    "holding_qty": holding_qty,
+                    "pre_order_holding_qty": pre_order_holding_qty,
+                    "holding_delta": delta,
+                    "submitted_qty": submitted_qty,
+                    "requested_qty": requested_qty,
+                    "confirmed_fill_qty": confirmed_fill_qty,
+                    "ccld_status": "timeout",
+                    "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                    "entry_meta": (request_json or {}).get("entry_meta") or {},
+                    "entry_exit_plan": (request_json or {}).get("entry_exit_plan") or {},
+                },
+                fill_meta_json={
+                    "fill_source": "kis_holdings_fallback",
+                    "promoted_from_status": status,
+                    "ccld_status": "timeout",
+                    "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
+                },
+            )
+            promoted_fills += 1
+            promoted_codes.append(code)
+            logger.warning(
+                "[RECONCILE][PROMOTE_FILL] env=%s source=kis_holdings_fallback ccld_status=timeout code=%s kis_odno=%s from=%s to=%s qty=%s holding_qty=%s delta=%s submitted_qty=%s",
+                env,
+                code,
+                kis_odno,
+                status,
+                next_status,
+                confirmed_fill_qty,
+                holding_qty,
+                delta,
+                submitted_qty,
+            )
+        else:
+            logger.info(
+                "[RECONCILE][PROMOTE_HOLD] env=%s code=%s from=%s to=%s holding_qty=%s pre_order_holding_qty=%s delta=%s submitted_qty=%s",
+                env,
+                code,
+                status,
+                next_status,
+                holding_qty,
+                pre_order_holding_qty,
+                delta,
+                submitted_qty,
+            )
         logger.info(
             "[POSITION_AGE][ENTRY_TS] code=%s source=promote_fill.detected_time entry_ts=%s",
             code,

@@ -2731,6 +2731,23 @@ def _write_session_result_file(payload: dict[str, Any]) -> None:
     if not path:
         return
     try:
+        buy_orders = int(payload.get("buy_orders", 0) or 0)
+        sell_orders = int(payload.get("sell_orders", 0) or 0)
+        buy_orders_ack = int(payload.get("buy_orders_ack", payload.get("accepted", buy_orders)) or 0)
+        sell_orders_ack = int(payload.get("sell_orders_ack", sell_orders) or 0)
+        api_submitted = int(payload.get("api_submitted", buy_orders_ack + sell_orders_ack) or 0)
+        order_candidates = int(payload.get("order_candidates", payload.get("entry_candidates", 0)) or 0)
+        ticks_total = int(payload.get("ticks_total", 0) or 0)
+        payload["buy_orders"] = buy_orders
+        payload["sell_orders"] = sell_orders
+        payload["buy_orders_ack"] = max(0, min(buy_orders_ack, buy_orders if buy_orders > 0 else buy_orders_ack))
+        payload["sell_orders_ack"] = max(0, min(sell_orders_ack, sell_orders if sell_orders > 0 else sell_orders_ack))
+        payload["api_submitted"] = max(0, api_submitted)
+        payload["order_candidates"] = max(0, order_candidates)
+        payload["ticks_total"] = max(0, ticks_total)
+        if int(payload.get("api_submitted", 0) or 0) > 0 and str(payload.get("status") or "").upper() == "OK_NO_TRADE":
+            payload["status"] = "OK_WITH_ORDERS"
+
         required_defaults = {
             "status": "UNKNOWN",
             "exit_reason": "",
@@ -7474,6 +7491,20 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         ticks_degraded = 0
         buy_orders = 0
         sell_orders = 0
+        session_metrics: dict[str, int] = {
+            "ticks_total": 0,
+            "buy_orders": 0,
+            "buy_orders_ack": 0,
+            "sell_orders": 0,
+            "sell_orders_ack": 0,
+            "order_candidates": 0,
+            "api_submitted": 0,
+            "accepted": 0,
+            "filled_confirmed": 0,
+            "partial_filled_confirmed": 0,
+            "rejected": 0,
+            "skipped": 0,
+        }
         # A loop owns no PB1Engine instance: every tick creates and finalizes one
         # inside run_once. Preserve only its returned summary for session markers.
         # Do not reference an unqualified engine_runner here (it caused the AM/PM
@@ -7567,6 +7598,17 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                     ),
                 )
                 last_tick_metrics = dict(metrics or {})
+                session_metrics["ticks_total"] += 1
+                session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
+                session_metrics["sell_orders"] += int(last_tick_metrics.get("sell_orders", 0) or 0)
+                session_metrics["buy_orders_ack"] += int(last_tick_metrics.get("accepted", 0) or 0)
+                session_metrics["sell_orders_ack"] += int(last_tick_metrics.get("sell_orders_ack", last_tick_metrics.get("sell_orders", 0)) or 0)
+                session_metrics["order_candidates"] += int(last_tick_metrics.get("order_candidates", last_tick_metrics.get("order_candidate_count", 0)) or 0)
+                session_metrics["api_submitted"] += int(last_tick_metrics.get("api_submitted", last_tick_metrics.get("submitted", last_tick_metrics.get("submit_success_count", 0))) or 0)
+                session_metrics["accepted"] += int(last_tick_metrics.get("accepted", 0) or 0)
+                session_metrics["rejected"] += int(last_tick_metrics.get("rejected", 0) or 0)
+                session_metrics["skipped"] += int(last_tick_metrics.get("skipped", last_tick_metrics.get("skipped_count", 0)) or 0)
+                session_metrics["filled_confirmed"] += int(last_tick_metrics.get("filled", 0) or 0)
                 logger.info(
                     "[PB1][TICK][DONE] kind=%s now=%s result_status=%s",
                     session_kind,
@@ -7852,9 +7894,12 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         )
         os.environ["PB1_LAST_RESULT_STATUS"] = str(last_result_status)
         os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
-        marker_metrics = last_tick_metrics
+        marker_metrics = session_metrics
+        status_for_marker = str(last_result_status or "")
+        if int(session_metrics.get("api_submitted", 0) or 0) > 0 and status_for_marker.upper() == "OK_NO_TRADE":
+            status_for_marker = "OK_WITH_ORDERS"
         normalized = normalize_session_result(
-            status=last_result_status,
+            status=status_for_marker,
             reason=exit_reason,
             order_candidates=int(marker_metrics.get("order_candidates", marker_metrics.get("order_candidate_count", 0)) or 0),
             api_submitted=int(marker_metrics.get("api_submitted", marker_metrics.get("submitted", marker_metrics.get("submit_success_count", 0))) or 0),
@@ -7877,11 +7922,19 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             exit_code=0 if normalized.completed else 1,
         )
         _write_session_result_file({
-            "status": last_result_status,
+            "status": status_for_marker,
             "exit_reason": exit_reason,
-            "sell_orders_ack": int(sell_orders or 0),
-            "sell_orders": int(sell_orders or 0),
-            "buy_orders": int(buy_orders or 0),
+            "ticks_total": int(session_metrics.get("ticks_total", ticks_total) or 0),
+            "sell_orders_ack": int(session_metrics.get("sell_orders_ack", sell_orders) or 0),
+            "sell_orders": int(session_metrics.get("sell_orders", sell_orders) or 0),
+            "buy_orders": int(session_metrics.get("buy_orders", buy_orders) or 0),
+            "buy_orders_ack": int(session_metrics.get("buy_orders_ack", 0) or 0),
+            "order_candidates": int(session_metrics.get("order_candidates", 0) or 0),
+            "api_submitted": int(session_metrics.get("api_submitted", 0) or 0),
+            "accepted": int(session_metrics.get("accepted", 0) or 0),
+            "filled_confirmed": int(session_metrics.get("filled_confirmed", 0) or 0),
+            "rejected": int(session_metrics.get("rejected", 0) or 0),
+            "skipped": int(session_metrics.get("skipped", 0) or 0),
         })
     finally:
         _finish_session_guard(

@@ -75,7 +75,9 @@ def _candidate(code: str, *, held: bool = False, score: float = 40.0):
     )
 
 
-def test_buyable_backfill_skips_existing_holding_and_promotes_next_candidate():
+def test_buyable_backfill_skips_existing_holding_and_promotes_next_candidate(monkeypatch):
+    monkeypatch.setenv("PB1_BUYABLE_BACKFILL_ENABLED", "1")
+    monkeypatch.setenv("PB1_BUYABLE_BACKFILL_FORCE_MIN1", "0")
     engine = DummyEngine()
     result = SimpleNamespace(
         orderable_candidates=[],
@@ -107,7 +109,34 @@ def test_buyable_backfill_skips_existing_holding_and_promotes_next_candidate():
     assert result.orderable_candidates[0].features["entry_plan"]["qty"] == 1
 
 
-def test_buyable_backfill_does_not_force_trade_when_all_candidates_blocked():
+def test_buyable_backfill_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("PB1_BUYABLE_BACKFILL_ENABLED", raising=False)
+    engine = DummyEngine()
+    result = SimpleNamespace(
+        orderable_candidates=[],
+        backfill_attempted=False,
+        backfill_added_count=0,
+        planned_spent_after_backfill=0.0,
+    )
+    added = _apply_buyable_candidate_backfill(
+        engine,
+        result=result,
+        orderable_candidates=result.orderable_candidates,
+        candidates=[_candidate("005930", score=50.0)],
+        new_position_limit=1,
+        target_new_positions=1,
+        tick_budget_krw=1_000_000,
+        planned_spent=0,
+        available_cash_krw=1_000_000,
+        min_order_krw=0,
+    )
+    assert added == 0
+    assert result.orderable_candidates == []
+
+
+def test_buyable_backfill_does_not_force_trade_when_all_candidates_blocked(monkeypatch):
+    monkeypatch.setenv("PB1_BUYABLE_BACKFILL_ENABLED", "1")
+    monkeypatch.setenv("PB1_BUYABLE_BACKFILL_FORCE_MIN1", "0")
     engine = DummyEngine()
     engine._buyable_gate_context = {
         "207940": {"kis_holding_qty": 1},

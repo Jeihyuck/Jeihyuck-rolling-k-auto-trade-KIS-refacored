@@ -389,6 +389,34 @@ def is_order_accepted(response: dict | None, *, kis_env: str | None = None) -> b
     return False
 
 
+def _attach_order_execution_meta(
+    response: dict | None,
+    *,
+    side: str,
+    code: str,
+    requested_qty: int,
+    submitted_qty: int,
+    sellable_qty: int | None = None,
+    kis_env: str | None = None,
+) -> dict | None:
+    if not isinstance(response, dict):
+        return response
+    accepted = bool(is_order_accepted(response, kis_env=kis_env))
+    execution = {
+        "side": str(side or "").upper(),
+        "code": str(code or "").strip(),
+        "requested_qty": int(max(0, requested_qty)),
+        "submitted_qty": int(max(0, submitted_qty)),
+        "sellable_qty": int(max(0, sellable_qty if sellable_qty is not None else submitted_qty)),
+        "accepted": accepted,
+        "broker_order_id": extract_order_no(response),
+    }
+    response["_order_execution"] = execution
+    response.setdefault("submitted_qty", execution["submitted_qty"])
+    response.setdefault("requested_qty", execution["requested_qty"])
+    return response
+
+
 def _json_dumps(body: dict) -> str:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=False)
 
@@ -1451,18 +1479,26 @@ class KisAPI:
         reset_done = False
         consecutive_temp_failures = 0
 
-        # Apply rate limiter based on endpoint
+        # Unified limiter: account-level global quota + endpoint sub-quota
         parsed = urlparse(url)
         path = parsed.path
-        limiter_key = None
-        if "inquire-price" in path:
-            limiter_key = "PRICE"
-        elif "inquire-daily-itemchartprice" in path:
-            limiter_key = "DAILY_CHART"
-        elif "inquire-asking-price-exp-ccn" in path:
-            limiter_key = "HOGA"
-        if limiter_key:
-            get_kis_limiter().acquire(limiter_key)
+        endpoint_category = "data"
+        if is_order_endpoint(url):
+            endpoint_category = "order"
+        elif any(token in path for token in ("inquire-balance", "inquire-psbl-order", "inquire-daily-ccld")):
+            endpoint_category = "balance"
+        elif "inquire-price" in path:
+            endpoint_category = "price"
+        gate = get_kis_gate()
+        account_key = f"{str(self.CANO or '').strip()}:{str(self.ACNT_PRDT_CD or '').strip()}"
+        wait_limiter = gate.acquire(
+            environment=str(self.env or "practice"),
+            account_key=account_key,
+            endpoint_category=endpoint_category,
+            priority=endpoint_category in {"order", "balance"},
+        )
+        if wait_limiter > 0:
+            time.sleep(wait_limiter)
 
         breaker_open, breaker_until = _breaker_check(method, url)
         if breaker_open:
@@ -1501,6 +1537,7 @@ class KisAPI:
                     raise KisAuthError(f"HTTP {status} for {url}")
                 if status in (429, 500, 502, 503, 504):
                     if status == 429 and "inquire-price" in _endpoint_path(url):
+                        gate.set_global_cooldown(str(self.env or "practice"), account_key, seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"))
                         _mark_price_rate_limited(
                             _endpoint_name(url),
                             str((kwargs.get("params") or {}).get("fid_input_iscd") or "") or None,
@@ -1530,6 +1567,11 @@ class KisAPI:
                             )
                             return resp
                         _breaker_record_temp_failure(method, url)
+                        gate.set_global_cooldown(
+                            str(self.env or "practice"),
+                            account_key,
+                            seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                        )
 
                         if "inquire-price" in _endpoint_path(url):
                             _mark_price_rate_limited(
@@ -1562,6 +1604,12 @@ class KisAPI:
                         )
                         return resp
                     if msg_cd and msg_cd in _KIS_TEMP_ERROR_CODES:
+                        if msg_cd == "EGW00201":
+                            gate.set_global_cooldown(
+                                str(self.env or "practice"),
+                                account_key,
+                                seconds=float(os.getenv("KIS_RATE_LIMIT_COOLDOWN_SEC", "8.0") or "8.0"),
+                            )
                         if no_retry_inquire_investor and msg_cd == "EGW00201" and "초당" in str(body.get("msg1") or ""):
                             logger.warning(
                                 "[KR_FLOW][KIS_INVESTOR][RATE_LIMIT_FAIL_SOFT] code=%s action=impute_and_continue",
@@ -4247,6 +4295,7 @@ class KisAPI:
     # -------------------------------
     def buy_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
         logger.info("[KIS][ORDER][REQUEST] type=MARKET side=BUY code=%s qty=%s price=0", pdno, qty)
+        requested_qty = int(qty or 0)
         body = {
             "CANO": self.CANO,
             "ACNT_PRDT_CD": self.ACNT_PRDT_CD,
@@ -4256,6 +4305,15 @@ class KisAPI:
             "ORD_UNPR": "0",
         }
         response = self._order_cash(body, is_sell=False)
+        response = _attach_order_execution_meta(
+            response,
+            side="BUY",
+            code=safe_strip(pdno),
+            requested_qty=requested_qty,
+            submitted_qty=requested_qty,
+            sellable_qty=requested_qty,
+            kis_env=self.env,
+        )
         masked = mask_order_response(response)
         logger.info(
             "[KIS][ORDER][RESPONSE] type=MARKET side=BUY code=%s rt_cd=%s msg_cd=%s msg1=%s odno=%s",
@@ -4268,6 +4326,7 @@ class KisAPI:
         return response
 
     def sell_stock_market(self, pdno: str, qty: int) -> Optional[dict]:
+        requested_qty = int(qty or 0)
         # --- 강화된 사전점검: 보유수량 우선 ---
         pos = self.get_positions() or []
         hldg = 0
@@ -4328,6 +4387,15 @@ class KisAPI:
             "EXCG_ID_DVSN_CD": "KRX",
         }
         resp = self._order_cash(body, is_sell=True)
+        resp = _attach_order_execution_meta(
+            resp,
+            side="SELL",
+            code=safe_strip(pdno),
+            requested_qty=requested_qty,
+            submitted_qty=int(qty or 0),
+            sellable_qty=int(sell_qty or 0),
+            kis_env=self.env,
+        )
         if resp and isinstance(resp, dict) and resp.get("rt_cd") == "0":
             with self._recent_sells_lock:
                 self._recent_sells[pdno] = time.time()
@@ -4394,6 +4462,7 @@ class KisAPI:
         headers = self._headers(tr_id, hk)
         url = f"{API_BASE_URL}/uapi/domestic-stock/v1/trading/order-cash"
         logger.info("[KIS][ORDER][REQUEST] type=LIMIT side=BUY code=%s qty=%s price=%s", pdno, qty, price)
+        requested_qty = int(qty or 0)
         self._wait_before_order_submit()
         # [CHG] 안전요청 사용
         resp = self._safe_request(
@@ -4415,6 +4484,15 @@ class KisAPI:
                 pdno, data.get("msg_cd"), data.get("msg1"),
             )
             return {**data, "final_status": "PERMANENT_ORDER_REJECT"}
+        data = _attach_order_execution_meta(
+            data,
+            side="BUY",
+            code=safe_strip(pdno),
+            requested_qty=requested_qty,
+            submitted_qty=requested_qty,
+            sellable_qty=requested_qty,
+            kis_env=self.env,
+        )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[BUY_LIMIT_OK] output={data.get('output')}")
             try:
@@ -4498,6 +4576,7 @@ class KisAPI:
                 "ord_psbl_qty": ord_psbl,
             }
 
+        requested_qty = int(qty or 0)
         if qty > sell_qty:
             logger.warning(
                 f"[SELL_LIMIT_PRECHECK] 수량 보정: req={qty} -> sellable={sell_qty} "
@@ -4539,6 +4618,15 @@ class KisAPI:
             "POST", url, headers=headers, data=_json_dumps(body).encode("utf-8"), timeout=(3.0, 7.0)
         )
         data = resp.json()
+        data = _attach_order_execution_meta(
+            data,
+            side="SELL",
+            code=safe_strip(pdno),
+            requested_qty=requested_qty,
+            submitted_qty=int(qty or 0),
+            sellable_qty=int(sell_qty or 0),
+            kis_env=self.env,
+        )
         if resp.status_code == 200 and data.get("rt_cd") == "0":
             logger.info(f"[SELL_LIMIT_OK] output={data.get('output')}")
             try:

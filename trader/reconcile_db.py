@@ -122,9 +122,14 @@ def _kis_holdings_by_code(kis_balance: dict[str, Any] | None) -> dict[str, dict[
             ord_psbl_qty = int(float(str(row.get("ord_psbl_qty") or 0).replace(",", "")))
         except Exception:
             ord_psbl_qty = 0
+        try:
+            avg_buy_price = float(str(row.get("pchs_avg_pric") or row.get("avg_prvs") or 0).replace(",", ""))
+        except Exception:
+            avg_buy_price = 0.0
         holdings[code] = {
             "hldg_qty": max(0, hldg_qty),
             "ord_psbl_qty": max(0, ord_psbl_qty),
+            "avg_buy_price": max(0.0, avg_buy_price),
         }
     return holdings
 
@@ -149,7 +154,6 @@ def close_stale_positions_guarded(
     if reason in {"stale_db_holdings_empty", "STALE_DB_BUT_KIS_EMPTY"}:
         status_value = "ORPHAN"
     schema = schema_for_engine(engine)
-    sell_fill_code_set = {str(code or "").zfill(6) for code in (sell_fill_codes or []) if str(code or "").strip()}
     holdings_by_code = _kis_holdings_by_code(kis_balance)
     guard = load_reconcile_guard(runtime_dir or Path(".")) if runtime_dir is not None else {}
     stale_confirmed = bool(guard.get("last_holdings_empty")) and int(guard.get("empty_streak") or 0) >= EMPTY_STREAK_MIN
@@ -171,11 +175,26 @@ def close_stale_positions_guarded(
             ).mappings().all()
         ]
 
+    open_order_codes: set[str] = set()
+    with engine.connect() as conn:
+        order_rows = conn.execute(
+            sa.select(schema.orders.c.code).where(
+                sa.and_(
+                    schema.orders.c.env == env,
+                    schema.orders.c.strategy == strategy,
+                    schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+                )
+            )
+        ).mappings().all()
+    for row in order_rows:
+        open_order_codes.add(str((row or {}).get("code") or "").zfill(6))
+
     if not open_rows:
         logger.info("[STALE_DB][SOFT_CLOSE][SKIP] reason=no_open_positions rows_kept=0")
         return 0
 
     closable_codes: list[str] = []
+    adjustable_rows: list[tuple[str, int, int, float]] = []
     rows_kept = 0
     for row in open_rows:
         code = str((row or {}).get("code") or "").zfill(6)
@@ -183,37 +202,84 @@ def close_stale_positions_guarded(
         kis_state = holdings_by_code.get(code) or {}
         kis_qty = int(kis_state.get("hldg_qty") or 0)
         ord_psbl_qty = int(kis_state.get("ord_psbl_qty") or 0)
-        if kis_qty > 0 or ord_psbl_qty > 0:
+        canonical_kis_qty = max(kis_qty, ord_psbl_qty)
+        qty_diff = canonical_kis_qty - db_qty
+        if qty_diff == 0:
             rows_kept += 1
             logger.info(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=KIS_HOLDING_EXISTS",
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=MATCH",
                 code,
                 db_qty,
-                max(kis_qty, ord_psbl_qty),
+                canonical_kis_qty,
             )
             continue
-        if code not in sell_fill_code_set:
+        if code in open_order_codes:
             rows_kept += 1
-            logger.info(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=0 action=KEEP reason=SELL_FILL_CONFIRM_MISSING",
+            logger.warning(
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s",
                 code,
                 db_qty,
+                canonical_kis_qty,
+                qty_diff,
             )
             continue
-        if not stale_confirmed:
-            rows_kept += 1
-            logger.info(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=0 action=KEEP reason=STALE_CONFIRM_PENDING",
+        if stale_confirmed:
+            adjustable_rows.append((code, db_qty, canonical_kis_qty, float(kis_state.get("avg_buy_price") or 0.0)))
+            logger.warning(
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=ADJUST reason=POSITION_QTY_MISMATCH qty_diff=%s",
                 code,
                 db_qty,
+                canonical_kis_qty,
+                qty_diff,
             )
             continue
-        closable_codes.append(code)
+        rows_kept += 1
+        logger.warning(
+            "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s",
+            code,
+            db_qty,
+            canonical_kis_qty,
+            qty_diff,
+        )
+        continue
+
+    if adjustable_rows:
+        with engine.begin() as conn:
+            for code, db_qty_before, kis_qty_after, avg_buy_price in adjustable_rows:
+                next_status = "OPEN" if kis_qty_after > 0 else "BROKER_RECONCILED_CLOSED"
+                conn.execute(
+                    sa.text(
+                        """
+                        UPDATE positions
+                        SET qty = :qty,
+                            avg_buy_price = :avg_buy_price,
+                            status = :status,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE env = :env AND strategy = :strategy AND code = :code
+                        """
+                    ),
+                    {
+                        "qty": int(kis_qty_after),
+                        "avg_buy_price": float(avg_buy_price or 0.0) if int(kis_qty_after) > 0 else None,
+                        "status": next_status,
+                        "env": env,
+                        "strategy": strategy,
+                        "code": code,
+                    },
+                )
+                logger.warning(
+                    "[POSITION_RECONCILE_ADJUST] code=%s db_qty_before=%s kis_qty=%s qty_after=%s source=KIS_CANONICAL_BALANCE snapshots_confirmed=%s",
+                    code,
+                    db_qty_before,
+                    kis_qty_after,
+                    kis_qty_after,
+                    int(stale_confirmed),
+                )
 
     if not closable_codes:
         # A live KIS holding only protects its own row; never use it as a
         # portfolio-wide reason to hide stale DB positions.
-        skip_reason = "no_rowwise_soft_close_candidates" if rows_kept else "no_soft_close_candidates"
+        skip_reason = "no_rowwise_soft_close_candidates" if rows_kept or adjustable_rows else "no_soft_close_candidates"
         logger.warning(
             "[STALE_DB][SOFT_CLOSE][SKIP] reason=%s rows_kept=%s",
             skip_reason,

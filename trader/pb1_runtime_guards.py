@@ -315,7 +315,7 @@ def _apply_buyable_candidate_backfill(
     available_cash_krw: float = 0.0,
     min_order_krw: float = 0.0,
 ) -> int:
-    if not _env_bool("PB1_BUYABLE_BACKFILL_ENABLED", True):
+    if not _env_bool("PB1_BUYABLE_BACKFILL_ENABLED", False):
         return 0
     pool = list(candidates or [])
     if orderable_candidates or not pool:
@@ -381,7 +381,7 @@ def _apply_buyable_candidate_backfill(
         )
         qty = _safe_int(getattr(cf, "planned_qty", 0) or features.get("planned_qty") or features.get("qty"))
         if qty <= 0:
-            if not _env_bool("PB1_BUYABLE_BACKFILL_FORCE_MIN1", True):
+            if not _env_bool("PB1_BUYABLE_BACKFILL_FORCE_MIN1", False):
                 _logger.info("[ENTRY][BUYABLE_BACKFILL][SKIP] code=%s reason=qty_zero", code)
                 continue
             qty = 1
@@ -399,11 +399,6 @@ def _apply_buyable_candidate_backfill(
         if not _ensure_backfill_entry_plan(engine, cf, price=price, qty=qty):
             continue
 
-        try:
-            cf.setup_ok = True
-        except Exception:
-            pass
-        features["buyable_ok"] = True
         features["buyable_backfill"] = True
         features["candidate_tier"] = "buyable_backfill"
         features["risk_tag"] = features.get("risk_tag") or "BUYABLE_BACKFILL"
@@ -432,39 +427,9 @@ def _apply_buyable_candidate_backfill(
 
 
 def _wrap_candidate_width_backfill(engine_cls: type[Any]) -> bool:
-    if getattr(engine_cls, "_buyable_candidate_backfill_guard_installed", False):
-        return False
-    original = getattr(engine_cls, "_apply_candidate_width_backfill_and_concentration_guard", None)
-    if not callable(original):
-        return False
-
-    @functools.wraps(original)
-    def guarded(self: Any, *args: Any, **kwargs: Any) -> Any:
-        result = original(self, *args, **kwargs)
-        try:
-            orderable_candidates = getattr(result, "orderable_candidates", None)
-            if orderable_candidates is None:
-                orderable_candidates = kwargs.get("orderable_candidates") or []
-            if not orderable_candidates:
-                _apply_buyable_candidate_backfill(
-                    self,
-                    result=result,
-                    orderable_candidates=orderable_candidates,
-                    candidates=kwargs.get("candidates") or [],
-                    new_position_limit=int(kwargs.get("new_position_limit") or 0),
-                    target_new_positions=int(kwargs.get("target_new_positions") or 0),
-                    tick_budget_krw=float(kwargs.get("tick_budget_krw") or 0.0),
-                    planned_spent=float(kwargs.get("planned_spent") or 0.0),
-                    available_cash_krw=float(kwargs.get("available_cash_krw") or 0.0),
-                    min_order_krw=float(kwargs.get("min_order_krw") or 0.0),
-                )
-        except Exception as exc:  # pragma: no cover - fail closed; do not crash trade loop
-            _logger.warning("[ENTRY][BUYABLE_BACKFILL][GUARD_FAIL_CLOSED] err=%s", exc)
-        return result
-
-    setattr(engine_cls, "_apply_candidate_width_backfill_and_concentration_guard", guarded)
-    setattr(engine_cls, "_buyable_candidate_backfill_guard_installed", True)
-    return True
+    # Runtime monkey patch backfill is intentionally disabled.
+    # Candidate widening must be handled by the authoritative engine pipeline only.
+    return False
 
 
 def _wrap_pb1_engine_class(engine_cls: type[Any]) -> bool:

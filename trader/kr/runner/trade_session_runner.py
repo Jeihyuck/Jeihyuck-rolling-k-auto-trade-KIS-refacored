@@ -728,11 +728,13 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             completed = guard.completed
             retryable = guard.retryable
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
+    orders_intent = int(pb1_result.get("order_candidates", 0) or 0)
+    orders_ack = int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s balance_state=TIMEOUT", session, status, summary_reason, blocked)
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_ack, blocked)
     else:
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=0 orders_ack=0 blocked=%s", session, status, summary_reason, blocked)
-    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": int(pb1_result.get("order_candidates", 0) or 0), "orders_ack": int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)}
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_ack, blocked)
+    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_ack": orders_ack}
     if lock_unavailable:
         result.update(lock_unavailable_result_fields())
     if session == "close":
