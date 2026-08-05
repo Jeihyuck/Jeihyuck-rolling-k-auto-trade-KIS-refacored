@@ -117,6 +117,85 @@ def _save_json_file(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
 
+def _normalize_iso_date(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:10]
+
+
+def _evaluate_benchmark_daily_gate(
+    *,
+    daily_sync_summary: dict,
+    rotation_context: dict,
+    market_state_overlay: dict,
+) -> dict:
+    """최종 benchmark daily 품질로 신규 매수 gate 여부를 계산한다."""
+    required_benchmarks = ("SPY", "QQQ", "SMH")
+    quality_map = daily_sync_summary.get("daily_sync_quality_by_symbol") or {}
+    context_quality = str(rotation_context.get("benchmark_data_quality") or "").strip().lower()
+    context_missing = {
+        str(s).upper()
+        for s in (rotation_context.get("missing_symbols") or [])
+        if str(s).upper()
+    }
+    allow_new_buy = bool(market_state_overlay.get("allow_new_buy", True))
+
+    symbol_status: dict[str, dict] = {}
+    missing_symbols: list[str] = []
+
+    for symbol in required_benchmarks:
+        row = quality_map.get(symbol) if isinstance(quality_map, dict) else None
+        if not isinstance(row, dict):
+            row = {}
+        quality = str(row.get("quality") or "UNKNOWN").upper()
+        latest_date = _normalize_iso_date(row.get("db_latest") or row.get("latest_date"))
+        expected_date = _normalize_iso_date(row.get("expected_latest") or row.get("expected_date"))
+
+        # Backfill 이후 latest==expected and quality=OK면 sync_failed 이력이 있어도 최종 정상으로 본다.
+        final_ok = quality == "OK"
+        if final_ok and latest_date and expected_date:
+            final_ok = latest_date == expected_date
+
+        reason = ""
+        if quality != "OK":
+            reason = f"quality={quality}"
+        elif latest_date and expected_date and latest_date != expected_date:
+            reason = f"date_mismatch latest={latest_date} expected={expected_date}"
+        elif symbol in context_missing:
+            reason = "rotation_context_missing"
+
+        if not final_ok or symbol in context_missing:
+            missing_symbols.append(symbol)
+
+        symbol_status[symbol] = {
+            "symbol": symbol,
+            "quality": quality,
+            "latest_date": latest_date,
+            "expected_date": expected_date,
+            "final_ok": bool(final_ok and symbol not in context_missing),
+            "reason": reason,
+        }
+
+    final_quality_ok = context_quality == "ok" and not context_missing
+    benchmark_daily_failed = bool(missing_symbols)
+
+    # market overlay + rotation context가 최종 OK면 stale sync 실패 이력은 gate 사유에서 제외한다.
+    if allow_new_buy and final_quality_ok and not missing_symbols:
+        benchmark_daily_failed = False
+
+    return {
+        "required_benchmarks": list(required_benchmarks),
+        "allow_new_buy": allow_new_buy,
+        "benchmark_data_quality": context_quality or ("bad" if benchmark_daily_failed else "ok"),
+        "missing_symbols": missing_symbols,
+        "symbol_status": symbol_status,
+        "benchmark_daily_failed": benchmark_daily_failed,
+    }
+
+
 def run_prep(env: str = "practice", offline: bool = False, force_now: str | None = None) -> dict:
     """Dual-Agent US Prep 실행.
 
@@ -501,7 +580,28 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
     du_warn = du_status == "OK_WITH_WARNINGS"
     cp_warn = cp_status == "OK_WITH_WARNINGS"
     open_position_daily_failed = bool(daily_sync_summary.get("open_position_sync_failed_symbols"))
-    benchmark_daily_failed = bool(set(daily_sync_summary.get("benchmark_sync_failed_symbols") or []) & {"SPY", "QQQ", "SMH"})
+    benchmark_gate = _evaluate_benchmark_daily_gate(
+        daily_sync_summary=daily_sync_summary,
+        rotation_context=watchlist_result.get("rotation_context") or {},
+        market_state_overlay=watchlist_result.get("market_state_overlay") or market_state_overlay or {},
+    )
+    benchmark_daily_failed = bool(benchmark_gate.get("benchmark_daily_failed"))
+    benchmark_missing_symbols = list(benchmark_gate.get("missing_symbols") or [])
+    benchmark_symbol_status = dict(benchmark_gate.get("symbol_status") or {})
+    if benchmark_daily_failed:
+        logger.warning(
+            "[US_PREP][BENCHMARK_DAILY][BLOCK] quality=%s missing_symbols=%s symbol_status=%s",
+            benchmark_gate.get("benchmark_data_quality"),
+            benchmark_missing_symbols,
+            benchmark_symbol_status,
+        )
+    else:
+        logger.info(
+            "[US_PREP][BENCHMARK_DAILY][OK] quality=%s required=%s",
+            benchmark_gate.get("benchmark_data_quality"),
+            benchmark_gate.get("required_benchmarks"),
+        )
+
     if benchmark_daily_failed:
         market_state_overlay = dict(watchlist_result.get("market_state_overlay") or market_state_overlay or {})
         market_state_overlay.update({
@@ -523,6 +623,9 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             "force_entry_block": True,
             "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
             "daily_data_status": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
+            "benchmark_data_quality": benchmark_gate.get("benchmark_data_quality"),
+            "benchmark_missing_symbols": benchmark_missing_symbols,
+            "benchmark_symbol_status": benchmark_symbol_status,
             "capital_scale": 0.0,
             "exposure_multiplier": 0.0,
             "max_new_positions": 0,
@@ -532,7 +635,13 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         watchlist_result["allow_add_to_existing"] = False
         watchlist_result["force_entry_block"] = True
         validation["trade_block_reason"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
-    elif open_position_daily_failed:
+    else:
+        market_state_fields.update({
+            "benchmark_data_quality": benchmark_gate.get("benchmark_data_quality"),
+            "benchmark_missing_symbols": benchmark_missing_symbols,
+            "benchmark_symbol_status": benchmark_symbol_status,
+        })
+    if open_position_daily_failed:
         market_state_fields["daily_data_status"] = "DEGRADED_POSITION_DAILY_DATA"
     if du_status == "ERROR" or cp_status == "ERROR":
         provisional_status = "ERROR"
@@ -555,18 +664,10 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
             daily_sync_summary=daily_sync_summary,
         )
         contract["daily_sync_summary"] = daily_sync_summary
-        if benchmark_daily_failed:
-            contract.update({
-                "trade_can_proceed": 0,
-                "trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE",
-                "allow_new_buy": False,
-                "allow_add_to_existing": False,
-                "force_entry_block": True,
-                "market_regime": "UNKNOWN",
-                "market_state": "UNKNOWN",
-                "effective_capital_scale": 0.0,
-                "effective_max_new_positions": 0,
-            })
+        contract["benchmark_data_quality"] = benchmark_gate.get("benchmark_data_quality")
+        contract["benchmark_missing_symbols"] = benchmark_missing_symbols
+        contract["benchmark_symbol_status"] = benchmark_symbol_status
+        contract["benchmark_daily_failed"] = benchmark_daily_failed
 
         final_status = contract.get("status", provisional_status)
         trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)

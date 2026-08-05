@@ -12,11 +12,13 @@ def test_final30_daily_metrics_survive_memory_roundtrip():
         assert meta.get(k) == row[k]
 
 
-def test_prep_runner_benchmark_failure_contract_fields_present_in_source():
+def test_prep_runner_uses_final_benchmark_gate_and_contract_metadata_fields():
     import inspect
     from trader.us.runner import prep_runner
     src = inspect.getsource(prep_runner.run_prep)
-    assert 'watchlist_result["market_state_overlay"] = dict(market_state_overlay)' in src
-    assert '"trade_block_reason": "BENCHMARK_DAILY_DATA_UNAVAILABLE"' in src
-    assert '"effective_capital_scale": 0.0' in src
-    assert '"effective_max_new_positions": 0' in src
+    assert "_evaluate_benchmark_daily_gate(" in src
+    assert 'contract["benchmark_data_quality"] = benchmark_gate.get("benchmark_data_quality")' in src
+    assert 'contract["benchmark_missing_symbols"] = benchmark_missing_symbols' in src
+    assert 'contract["benchmark_symbol_status"] = benchmark_symbol_status' in src
+    assert 'contract["benchmark_daily_failed"] = benchmark_daily_failed' in src
+    assert 'if benchmark_daily_failed:\n            contract.update({' not in src
