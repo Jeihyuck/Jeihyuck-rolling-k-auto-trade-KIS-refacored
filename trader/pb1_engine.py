@@ -698,9 +698,29 @@ class CandidateFeature:
     sizing_reason: str | None = None  # 명확한 reason 코드 (BUDGET_INSUFFICIENT_FOR_1_SHARE, MIN_ORDER_NOTIONAL_FAIL 등)
     sizing_details: Dict[str, Any] | None = None  # 수치 정보: buy_budget, price, qty, shortfall 등
     entry_plan: dict[str, Any] | None = None
+    setup_passed: bool = False
+    risk_passed: bool = False
+    sizing_passed: bool = False
+    buyable_passed: bool = False
+    authoritative_gate_passed: bool = False
 
     def __post_init__(self) -> None:
         self.features = normalize_kr_candidate_runtime_features(self.features)
+        self.setup_passed = bool(self.features.get("setup_passed", self.setup_ok))
+        self.risk_passed = bool(self.features.get("risk_passed", self.features.get("risk_ok", self.risk_passed)))
+        self.sizing_passed = bool(self.features.get("sizing_passed", self.features.get("sizing_ok", self.sizing_passed)))
+        self.buyable_passed = bool(self.features.get("buyable_passed", self.features.get("buyable_ok", self.buyable_passed)))
+        self.authoritative_gate_passed = bool(
+            self.features.get(
+                "authoritative_gate_passed",
+                self.setup_passed and self.risk_passed and self.sizing_passed and self.buyable_passed,
+            )
+        )
+        self.features["setup_passed"] = bool(self.setup_passed)
+        self.features["risk_passed"] = bool(self.risk_passed)
+        self.features["sizing_passed"] = bool(self.sizing_passed)
+        self.features["buyable_passed"] = bool(self.buyable_passed)
+        self.features["authoritative_gate_passed"] = bool(self.authoritative_gate_passed)
 
 
 def _first_positive(*values: Any) -> float | None:
@@ -2716,6 +2736,10 @@ class PB1Engine:
         self._exit_summary_payload: dict[str, Any] = {}
         self.session_exit_submitted_codes: set[str] = set()
         self.no_sellable_qty_terminal_codes: set[str] = set()
+        self._session_sell_blocked_codes: dict[str, dict[str, Any]] = {}
+        self._session_sell_accepted_codes: dict[str, dict[str, Any]] = {}
+        self._session_no_sellable_codes: dict[str, dict[str, Any]] = {}
+        self._today_sell_fill_cache: dict[str, bool] = {}
         self._exit_holdings_meta: dict[str, Any] = {
             "source": "empty",
             "snapshot_ts": self._now_kst.isoformat(),
@@ -5403,22 +5427,99 @@ class PB1Engine:
             context=gate_context,
         )
 
-    def _assert_authoritative_order_candidate(self, *, cf: CandidateFeature, gate_snapshot: dict[str, Any] | None) -> tuple[bool, list[str]]:
-        reasons: list[str] = []
+    def _ensure_candidate_authoritative_gate_state(self, cf: CandidateFeature) -> dict[str, Any]:
         features = getattr(cf, "features", {}) or {}
+        setup_passed = bool(features.get("setup_passed", getattr(cf, "setup_passed", getattr(cf, "setup_ok", False))))
+        risk_passed = bool(features.get("risk_passed", features.get("risk_ok", getattr(cf, "risk_passed", False))))
+        sizing_passed = bool(features.get("sizing_passed", features.get("sizing_ok", getattr(cf, "sizing_passed", False))))
+        buyable_passed = bool(features.get("buyable_passed", features.get("buyable_ok", getattr(cf, "buyable_passed", False))))
+        sizing_reason = str(features.get("sizing_reason") or getattr(cf, "sizing_reason", "") or "")
+        planned_qty = int(getattr(cf, "planned_qty", 0) or features.get("planned_qty") or 0)
+        authoritative_gate_passed = bool(setup_passed and risk_passed and sizing_passed and buyable_passed)
 
-        if not bool(getattr(cf, "setup_ok", False)):
+        cf.setup_passed = setup_passed
+        cf.risk_passed = risk_passed
+        cf.sizing_passed = sizing_passed
+        cf.buyable_passed = buyable_passed
+        cf.authoritative_gate_passed = authoritative_gate_passed
+
+        features["setup_passed"] = setup_passed
+        features["risk_passed"] = risk_passed
+        features["sizing_passed"] = sizing_passed
+        features["buyable_passed"] = buyable_passed
+        features["authoritative_gate_passed"] = authoritative_gate_passed
+        features["risk_ok"] = risk_passed
+        features["sizing_ok"] = sizing_passed
+        features["buyable_ok"] = buyable_passed
+        features["planned_qty"] = planned_qty
+        if sizing_reason:
+            features["sizing_reason"] = sizing_reason
+        if not isinstance(features.get("risk_reasons"), list):
+            features["risk_reasons"] = ["ok"] if risk_passed else ["risk_reason_missing"]
+        if not isinstance(features.get("buyable_reasons"), list):
+            features["buyable_reasons"] = ["ok"] if buyable_passed else ["buyable_reason_missing"]
+
+        return {
+            "setup_passed": setup_passed,
+            "risk_passed": risk_passed,
+            "sizing_passed": sizing_passed,
+            "buyable_passed": buyable_passed,
+            "authoritative_gate_passed": authoritative_gate_passed,
+            "planned_qty": planned_qty,
+            "sizing_reason": sizing_reason,
+            "risk_reasons": list(features.get("risk_reasons") or []),
+            "buyable_reasons": list(features.get("buyable_reasons") or []),
+        }
+
+    def _extract_authoritative_gate_state(self, cf: CandidateFeature) -> tuple[dict[str, Any], str]:
+        candidate_state = self._ensure_candidate_authoritative_gate_state(cf)
+        plan = getattr(cf, "entry_plan", None) or (getattr(cf, "features", {}) or {}).get("entry_plan")
+        if isinstance(plan, dict) and isinstance(plan.get("gate_state"), dict):
+            gate_state = dict(plan.get("gate_state") or {})
+            return {
+                "setup_passed": bool(gate_state.get("setup_passed")),
+                "risk_passed": bool(gate_state.get("risk_passed")),
+                "sizing_passed": bool(gate_state.get("sizing_passed")),
+                "buyable_passed": bool(gate_state.get("buyable_passed")),
+                "authoritative_gate_passed": bool(gate_state.get("authoritative_gate_passed")),
+                "planned_qty": int(gate_state.get("planned_qty") or 0),
+                "sizing_reason": str(gate_state.get("sizing_reason") or ""),
+                "risk_reasons": list(gate_state.get("risk_reasons") or candidate_state.get("risk_reasons") or []),
+                "buyable_reasons": list(gate_state.get("buyable_reasons") or candidate_state.get("buyable_reasons") or []),
+            }, "order_plan"
+        return candidate_state, "candidate"
+
+    def _assert_authoritative_order_candidate(self, *, cf: CandidateFeature, gate_snapshot: dict[str, Any] | None) -> tuple[bool, list[str], dict[str, Any]]:
+        reasons: list[str] = []
+        gate_state, source = self._extract_authoritative_gate_state(cf)
+
+        setup_passed = bool(gate_state.get("setup_passed"))
+        risk_passed = bool(gate_state.get("risk_passed"))
+        sizing_passed = bool(gate_state.get("sizing_passed"))
+        buyable_passed = bool(gate_state.get("buyable_passed"))
+
+        if not setup_passed:
             reasons.append("SETUP_NOT_PASSED")
-        if not bool(features.get("risk_ok")):
+        if not risk_passed:
             reasons.append("RISK_NOT_PASSED")
-        if not bool(features.get("sizing_ok")):
+        if not sizing_passed:
             reasons.append("SIZING_NOT_PASSED")
-        if not bool(features.get("buyable_ok")):
+        if not buyable_passed:
             reasons.append("BUYABLE_NOT_PASSED")
-        if not isinstance(gate_snapshot, dict) or not gate_snapshot:
-            reasons.append("BUYABLE_GATE_CONTEXT_MISSING")
-
-        return (len(reasons) == 0), reasons
+        diag = {
+            "source": source,
+            "setup_passed": int(setup_passed),
+            "risk_passed": int(risk_passed),
+            "sizing_passed": int(sizing_passed),
+            "buyable_passed": int(buyable_passed),
+            "authoritative_gate_passed": int(bool(gate_state.get("authoritative_gate_passed"))),
+            "planned_qty": int(gate_state.get("planned_qty") or 0),
+            "sizing_reason": str(gate_state.get("sizing_reason") or ""),
+            "risk_reasons": list(gate_state.get("risk_reasons") or []),
+            "buyable_reasons": list(gate_state.get("buyable_reasons") or []),
+            "features_keys": sorted(list((getattr(cf, "features", {}) or {}).keys())),
+        }
+        return (len(reasons) == 0), reasons, diag
 
     def _log_final_skip(self, *, cf: CandidateFeature, reason_code: str, reason_detail: str, stage: str, price: float) -> None:
         logger.info(
@@ -5561,6 +5662,11 @@ class PB1Engine:
             self.balance_tick_cache_hits += 1
             source = self._balance_snapshot_source or "tick_cache"
             logger.info("[ENGINE][BALANCE_CACHE] hit=True source=%s", source)
+            if str(self.window_internal or "").lower() == "close":
+                logger.info(
+                    "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
+                    source,
+                )
             self._balance_snapshot_source = "tick_cache"
             return self._balance_snapshot
         fail_soft = (
@@ -5588,6 +5694,11 @@ class PB1Engine:
         else:
             self.balance_cache_hits += 1
         logger.info("[ENGINE][BALANCE_CACHE] hit=%s source=%s", source != "api", source)
+        if str(self.window_internal or "").lower() == "close" and source != "api":
+            logger.info(
+                "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
+                source,
+            )
         self._balance_snapshot = snap
         return self._balance_snapshot
 
@@ -6489,6 +6600,11 @@ class PB1Engine:
         reasons: list[str] | None,
         decision_reason: str | None = None,
     ) -> dict[str, Any]:
+        gate_state = self._ensure_candidate_authoritative_gate_state(cf)
+        setup_ok = bool(gate_state.get("setup_passed", setup_ok))
+        risk_ok = bool(gate_state.get("risk_passed", risk_ok))
+        sizing_ok = bool(gate_state.get("sizing_passed", sizing_ok))
+        buyable_ok = bool(gate_state.get("buyable_passed", buyable_ok))
         evaluation = build_entry_evaluation(
             code=cf.code,
             as_of=self.get_as_of(),
@@ -7159,6 +7275,66 @@ class PB1Engine:
         if accepted > 0:
             return "ACCEPTED_PENDING_FILL"
         return "BROKER_REJECTED"
+
+    def _register_session_sell_accepted(self, *, code: str, qty: int, price: float, order_id: str | None) -> None:
+        code_key = str(code or "").zfill(6)
+        self._session_sell_accepted_codes[code_key] = {
+            "reason": "SELL_ACCEPTED",
+            "qty": int(qty or 0),
+            "price": float(price or 0.0),
+            "order_id": order_id,
+            "ts": now_kst().isoformat(),
+        }
+        self._session_sell_blocked_codes[code_key] = {
+            "reason": "SELL_ACCEPTED",
+            "blocked_until": "SESSION_END",
+        }
+
+    def _register_session_no_sellable(self, *, code: str, reason: str = "KIS_NO_SELLABLE_QTY") -> int:
+        code_key = str(code or "").zfill(6)
+        prior = dict(self._session_no_sellable_codes.get(code_key) or {})
+        count = int(prior.get("count") or 0) + 1
+        now_iso = now_kst().isoformat()
+        self._session_no_sellable_codes[code_key] = {
+            "reason": reason,
+            "first_seen": prior.get("first_seen") or now_iso,
+            "last_seen": now_iso,
+            "count": count,
+        }
+        self._session_sell_blocked_codes[code_key] = {
+            "reason": reason,
+            "blocked_until": "SESSION_END",
+        }
+        if count >= 2:
+            logger.error(
+                "[EXIT][RETRY_BLOCK][ERROR] code=%s reason=NO_SELLABLE_QTY count=%s action=block_for_session",
+                self._display_code(code_key),
+                count,
+            )
+        return count
+
+    def _has_sell_accepted_today(self, code: str) -> bool:
+        code_key = str(code or "").zfill(6)
+        if code_key in self._session_sell_accepted_codes:
+            return True
+        cached = self._today_sell_fill_cache.get(code_key)
+        if cached is not None:
+            return bool(cached)
+        try:
+            today_start = self._now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+            tomorrow_start = today_start + timedelta(days=1)
+            rows = self.fills_repo.list_fills_in_window(
+                self.env,
+                start_at=today_start,
+                end_at=tomorrow_start,
+                side="SELL",
+                codes=[code_key],
+            )
+            accepted = bool(rows)
+            self._today_sell_fill_cache[code_key] = accepted
+            return accepted
+        except Exception:
+            return False
 
     def _log_setup(self, cf: CandidateFeature) -> None:
         self.total_candidates += 1
@@ -8470,6 +8646,8 @@ class PB1Engine:
         for cf in ok_list:
             if not cf.setup_ok:
                 continue
+            cf.setup_passed = bool(cf.setup_ok)
+            cf.features["setup_passed"] = bool(cf.setup_ok)
             atr_ratio = cf.features.get("atr_pct")  # ratio (0~1)
             value20 = cf.features.get("value20")
             risk_reasons: list[str] = []
@@ -8519,10 +8697,18 @@ class PB1Engine:
             )
 
             if risk_reasons:
+                cf.risk_passed = False
+                cf.features["risk_passed"] = False
+                cf.features["risk_ok"] = False
+                cf.features["risk_reasons"] = list(risk_reasons)
                 cf.setup_ok = False
                 cf.reasons.extend(risk_reasons)
                 continue
 
+            cf.risk_passed = True
+            cf.features["risk_passed"] = True
+            cf.features["risk_ok"] = True
+            cf.features["risk_reasons"] = ["ok"]
             filtered.append(cf)
 
         risk_ok_codes = [c.code for c in filtered]
@@ -8910,8 +9096,15 @@ class PB1Engine:
             if qty <= 0:
                 cf.setup_ok = False
                 cf.sizing_reason = _normalize_sizing_failure_reason(sizing_reason)
+                cf.sizing_passed = False
+                cf.features["sizing_passed"] = False
+                cf.features["sizing_ok"] = False
+                cf.features["sizing_reason"] = cf.sizing_reason
+                cf.features["planned_qty"] = 0
+                cf.features["planned_value"] = 0.0
                 cf.reasons.append(cf.sizing_reason)
                 cf.sizing_details = sizing_details
+                cf.features["sizing_details"] = sizing_details
                 continue
             logger.info(
                 "[PB1][SIZING][QTY] code=%s price=%.0f per_position_budget=%.0f tick_budget_remaining=%.0f qty_raw=%.3f qty_final=%s",
@@ -8936,7 +9129,14 @@ class PB1Engine:
             cf.features["initial_stop"] = float(stop0)
             cf.features["stop_price"] = float(stop0)
             cf.sizing_reason = "SIZING_OK"
+            cf.sizing_passed = True
             cf.sizing_details = {"qty": qty, "price": order_px, "notional": cf.planned_value}
+            cf.features["sizing_passed"] = True
+            cf.features["sizing_ok"] = True
+            cf.features["sizing_reason"] = "SIZING_OK"
+            cf.features["planned_qty"] = int(qty)
+            cf.features["planned_value"] = float(cf.planned_value)
+            cf.features["sizing_details"] = cf.sizing_details
             cf.client_order_key = self._client_order_key(cf.code, cf.mode, "BUY", "close", "PB1")
             allocated_slots += 1
             logger.info(
@@ -9686,6 +9886,7 @@ class PB1Engine:
         price_source: str | None = None,
     ) -> dict:
         features = cf.features or {}
+        gate_state = self._ensure_candidate_authoritative_gate_state(cf)
         entry_style, entry_family, trigger_policy = self._infer_entry_family(cf, trigger_ok=trigger_ok, trigger_info=trigger_info)
         qty = int(cf.planned_qty or 0)
         limit_price = float(features.get("limit_price") or features.get("order_price") or order_price or entry_price or 0.0)
@@ -9701,6 +9902,23 @@ class PB1Engine:
             "price_source": price_source or features.get("price_source") or "unknown",
             "price_gate_blocked": bool(features.get("price_gate_blocked")),
             "created_at": now_kst().isoformat(),
+            "setup_passed": bool(gate_state.get("setup_passed")),
+            "risk_passed": bool(gate_state.get("risk_passed")),
+            "sizing_passed": bool(gate_state.get("sizing_passed")),
+            "buyable_passed": bool(gate_state.get("buyable_passed")),
+            "authoritative_gate_passed": bool(gate_state.get("authoritative_gate_passed")),
+            "sizing_reason": gate_state.get("sizing_reason"),
+            "gate_state": {
+                "setup_passed": bool(gate_state.get("setup_passed")),
+                "risk_passed": bool(gate_state.get("risk_passed")),
+                "sizing_passed": bool(gate_state.get("sizing_passed")),
+                "buyable_passed": bool(gate_state.get("buyable_passed")),
+                "authoritative_gate_passed": bool(gate_state.get("authoritative_gate_passed")),
+                "sizing_reason": gate_state.get("sizing_reason"),
+                "planned_qty": int(gate_state.get("planned_qty") or qty or 0),
+                "risk_reasons": list(gate_state.get("risk_reasons") or []),
+                "buyable_reasons": list(gate_state.get("buyable_reasons") or []),
+            },
         }
         features["entry_style_selected"] = entry_style
         features["selected_family"] = entry_family
@@ -9812,6 +10030,27 @@ class PB1Engine:
                 "[PB1][ENTRY_ORDER_PLAN][RECOVERED] code=%s source=rebuild_in_place_entry stage=%s",
                 display_code, stage,
             )
+        gate_state = self._ensure_candidate_authoritative_gate_state(cf)
+        if isinstance(plan, dict):
+            plan["setup_passed"] = bool(gate_state.get("setup_passed"))
+            plan["risk_passed"] = bool(gate_state.get("risk_passed"))
+            plan["sizing_passed"] = bool(gate_state.get("sizing_passed"))
+            plan["buyable_passed"] = bool(gate_state.get("buyable_passed"))
+            plan["authoritative_gate_passed"] = bool(gate_state.get("authoritative_gate_passed"))
+            plan["sizing_reason"] = gate_state.get("sizing_reason")
+            plan["gate_state"] = {
+                "setup_passed": bool(gate_state.get("setup_passed")),
+                "risk_passed": bool(gate_state.get("risk_passed")),
+                "sizing_passed": bool(gate_state.get("sizing_passed")),
+                "buyable_passed": bool(gate_state.get("buyable_passed")),
+                "authoritative_gate_passed": bool(gate_state.get("authoritative_gate_passed")),
+                "sizing_reason": gate_state.get("sizing_reason"),
+                "planned_qty": int(gate_state.get("planned_qty") or 0),
+                "risk_reasons": list(gate_state.get("risk_reasons") or []),
+                "buyable_reasons": list(gate_state.get("buyable_reasons") or []),
+            }
+            cf.entry_plan = plan
+            cf.features["entry_plan"] = plan
         qty = int((plan or {}).get("qty") or cf.planned_qty or 0)
         if isinstance(plan, dict) and str(self.env or os.getenv("KIS_ENV") or "").lower() == "practice" and (
             str(os.getenv("PB1_MARKET_SCOPE") or "").upper() in {"KR", "KRX"} or _is_kr_stock_code(cf.code)
@@ -10026,15 +10265,26 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
-        authoritative_ok, authoritative_reasons = self._assert_authoritative_order_candidate(
+        authoritative_ok, authoritative_reasons, gate_diag = self._assert_authoritative_order_candidate(
             cf=cf,
             gate_snapshot=gate_snapshot,
         )
         if not authoritative_ok:
             logger.warning(
-                "[ORDER][HARD_BLOCK][AUTHORITATIVE_GATE] code=%s reasons=%s",
+                "[ORDER][HARD_BLOCK][AUTHORITATIVE_GATE] code=%s reasons=%s source=%s setup_passed=%s risk_passed=%s sizing_passed=%s buyable_passed=%s authoritative_gate_passed=%s planned_qty=%s sizing_reason=%s risk_reasons=%s buyable_reasons=%s features_keys=%s",
                 self._display_code(cf.code),
                 authoritative_reasons,
+                gate_diag.get("source"),
+                gate_diag.get("setup_passed"),
+                gate_diag.get("risk_passed"),
+                gate_diag.get("sizing_passed"),
+                gate_diag.get("buyable_passed"),
+                gate_diag.get("authoritative_gate_passed"),
+                gate_diag.get("planned_qty"),
+                gate_diag.get("sizing_reason"),
+                gate_diag.get("risk_reasons"),
+                gate_diag.get("buyable_reasons"),
+                gate_diag.get("features_keys"),
             )
             self._log_final_skip(
                 cf=cf,
@@ -10820,15 +11070,26 @@ class PB1Engine:
             status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
             status["terminal_event"] = "FINAL_SKIP"
             return status
-        authoritative_ok, authoritative_reasons = self._assert_authoritative_order_candidate(
+        authoritative_ok, authoritative_reasons, gate_diag = self._assert_authoritative_order_candidate(
             cf=cf,
             gate_snapshot=gate_snapshot,
         )
         if not authoritative_ok:
             logger.warning(
-                "[ORDER][HARD_BLOCK][AUTHORITATIVE_GATE] code=%s reasons=%s",
+                "[ORDER][HARD_BLOCK][AUTHORITATIVE_GATE] code=%s reasons=%s source=%s setup_passed=%s risk_passed=%s sizing_passed=%s buyable_passed=%s authoritative_gate_passed=%s planned_qty=%s sizing_reason=%s risk_reasons=%s buyable_reasons=%s features_keys=%s",
                 self._display_code(cf.code),
                 authoritative_reasons,
+                gate_diag.get("source"),
+                gate_diag.get("setup_passed"),
+                gate_diag.get("risk_passed"),
+                gate_diag.get("sizing_passed"),
+                gate_diag.get("buyable_passed"),
+                gate_diag.get("authoritative_gate_passed"),
+                gate_diag.get("planned_qty"),
+                gate_diag.get("sizing_reason"),
+                gate_diag.get("risk_reasons"),
+                gate_diag.get("buyable_reasons"),
+                gate_diag.get("features_keys"),
             )
             self._log_final_skip(
                 cf=cf,
@@ -12009,29 +12270,111 @@ class PB1Engine:
             return exit_eval_payload
 
         holding_qty = max(0, int(qty or 0))
-        orderable_balance_qty = max(0, int(pos.get("orderable_qty") or 0))
+        db_qty = holding_qty
         strategy_qty = max(0, int(orderable_qty or 0))
-        sell_qty = min(strategy_qty, holding_qty, orderable_balance_qty)
-        logger.info(
-            "[SELLABLE][CHECK] code=%s holding_qty=%s orderable_qty=%s strategy_qty=%s sell_qty=%s",
-            display_code,
-            holding_qty,
-            orderable_balance_qty,
-            strategy_qty,
-            sell_qty,
-        )
+        holding_source = str(pos.get("holding_source") or (self._exit_holdings_meta or {}).get("source") or "unknown")
+        kis_authoritative = holding_source == "kis_balance"
+        kis_qty = max(0, int(pos.get("kis_qty") or 0)) if kis_authoritative else 0
+        kis_sellable_qty = max(0, int(pos.get("orderable_qty") or 0)) if kis_authoritative else 0
+
+        mismatch_status = "MATCHED"
+        mismatch_action = "allow"
+        if db_qty > 0 and kis_qty == 0:
+            if self._has_sell_accepted_today(code):
+                mismatch_status = "PENDING_CLOSE_OR_STALE_DB_AFTER_SELL_ACCEPTED"
+                mismatch_action = "block_sell_order"
+            else:
+                mismatch_status = "STALE_DB_POSITION_KIS_ZERO"
+                mismatch_action = "block_sell_order"
+        elif db_qty > kis_qty > 0:
+            mismatch_status = "DB_QTY_GT_KIS_QTY"
+            mismatch_action = "allow_kis_sellable_qty"
+        elif kis_qty > db_qty:
+            mismatch_status = "KIS_QTY_GT_DB_QTY"
+            mismatch_action = "allow_kis_sellable_qty"
+        if mismatch_status != "MATCHED":
+            logger.warning(
+                "[RECONCILE][POSITION_MISMATCH] code=%s db_qty=%s kis_qty=%s kis_sellable_qty=%s status=%s action=%s",
+                display_code,
+                db_qty,
+                kis_qty,
+                kis_sellable_qty,
+                mismatch_status,
+                mismatch_action,
+            )
+
+        code_key = str(code or "").zfill(6)
+        if code_key in self._session_sell_blocked_codes:
+            block_reason = str((self._session_sell_blocked_codes.get(code_key) or {}).get("reason") or "SESSION_SELL_BLOCKED")
+            exit_eval_payload["order_skip_reasons"] = [block_reason]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_SESSION_BLOCKED"
+            logger.info("[EXIT][RETRY_BLOCK] code=%s reason=%s action=skip_sell_order", display_code, block_reason)
+            return exit_eval_payload
+        if code_key in self._session_sell_accepted_codes:
+            exit_eval_payload["order_skip_reasons"] = ["SELL_ALREADY_ACCEPTED_THIS_SESSION"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_ALREADY_ACCEPTED_THIS_SESSION"
+            logger.info("[EXIT][RETRY_BLOCK] code=%s reason=SELL_ALREADY_ACCEPTED_THIS_SESSION action=skip_sell_order", display_code)
+            return exit_eval_payload
         if display_code in self.session_exit_submitted_codes:
             exit_eval_payload["order_skip_reasons"] = ["ALREADY_SUBMITTED_THIS_SESSION"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_ALREADY_SUBMITTED"
             logger.info("[EXIT][SKIP_ALREADY_SUBMITTED] code=%s", display_code)
             return exit_eval_payload
+
+        if mismatch_status in {"STALE_DB_POSITION_KIS_ZERO", "PENDING_CLOSE_OR_STALE_DB_AFTER_SELL_ACCEPTED"}:
+            self._register_session_no_sellable(code=code, reason=mismatch_status)
+            exit_eval_payload["order_skip_reasons"] = [mismatch_status]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_POSITION_MISMATCH"
+            logger.info("[EXIT][RETRY_BLOCK] code=%s reason=%s action=skip_sell_order", display_code, mismatch_status)
+            return exit_eval_payload
+
+        if not kis_authoritative:
+            self._register_session_no_sellable(code=code, reason="STALE_DB_POSITION")
+            exit_eval_payload["order_skip_reasons"] = ["STALE_DB_POSITION"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_STALE_DB_POSITION"
+            logger.info(
+                "[EXIT][SELLABLE_GATE] code=%s db_qty=%s kis_qty=%s kis_sellable_qty=%s ok=0 reason=STALE_DB_POSITION action=session_block",
+                display_code,
+                db_qty,
+                kis_qty,
+                kis_sellable_qty,
+            )
+            return exit_eval_payload
+
+        if kis_sellable_qty <= 0:
+            self._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
+            self.no_sellable_qty_terminal_codes.add(display_code)
+            exit_eval_payload["order_skip_reasons"] = ["KIS_NO_SELLABLE_QTY"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY"
+            logger.info(
+                "[EXIT][SELLABLE_GATE] code=%s db_qty=%s kis_qty=%s kis_sellable_qty=%s ok=0 reason=KIS_NO_SELLABLE_QTY action=session_block",
+                display_code,
+                db_qty,
+                kis_qty,
+                kis_sellable_qty,
+            )
+            return exit_eval_payload
+
+        orderable_balance_qty = kis_sellable_qty
+        sell_qty = min(strategy_qty, holding_qty, orderable_balance_qty)
+        logger.info(
+            "[EXIT][SELLABLE_GATE] code=%s db_qty=%s kis_qty=%s kis_sellable_qty=%s ok=%s reason=%s action=%s",
+            display_code,
+            db_qty,
+            kis_qty,
+            kis_sellable_qty,
+            int(sell_qty > 0),
+            "ok" if sell_qty > 0 else "KIS_NO_SELLABLE_QTY",
+            "allow" if sell_qty > 0 else "session_block",
+        )
         if display_code in self.no_sellable_qty_terminal_codes:
             exit_eval_payload["order_skip_reasons"] = ["NO_SELLABLE_QTY_TERMINAL"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY_TERMINAL"
             logger.info("[EXIT][TERMINAL_NO_SELLABLE_QTY] code=%s", display_code)
             return exit_eval_payload
         if sell_qty <= 0:
-            exit_eval_payload["order_skip_reasons"] = ["NO_SELLABLE_QTY"]
+            self._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
+            exit_eval_payload["order_skip_reasons"] = ["KIS_NO_SELLABLE_QTY"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY"
             self.no_sellable_qty_terminal_codes.add(display_code)
             logger.info("[EXIT][TERMINAL_NO_SELLABLE_QTY] code=%s", display_code)
@@ -12257,6 +12600,12 @@ class PB1Engine:
         if ok:
             exit_eval_payload["submitted"] = 1
             self.session_exit_submitted_codes.add(display_code)
+            self._register_session_sell_accepted(
+                code=code,
+                qty=submitted_qty,
+                price=float(mark or 0.0),
+                order_id=str(kis_odno or order_id or ""),
+            )
             try:
                 self.orders_repo.mark_acked(self.env, kis_odno, resp)
                 logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
@@ -12286,6 +12635,16 @@ class PB1Engine:
                     fields={"cooldown_until": cooldown_until},
                 )
         else:
+            reject_reason = str(self._format_order_result_reason(resp if isinstance(resp, dict) else None) or "")
+            msg_cd_norm = str(msg_cd or "").upper()
+            msg1_norm = str(msg1 or "").lower()
+            if (
+                msg_cd_norm == "NO_SELLABLE_QTY"
+                or "ORDER_SKIP_NO_SELLABLE_QTY" in reject_reason
+                or "sellable quantity is zero" in msg1_norm
+            ):
+                self._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
+                self.no_sellable_qty_terminal_codes.add(display_code)
             self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
         self.positions_repo.update_position_fields(
             env=self.env,
@@ -16760,7 +17119,11 @@ class PB1Engine:
                             )
                             self._log_buyable_gate_unified(code=cf.code, decision=unified_decision)
                             if not unified_decision.ok:
+                                cf.buyable_passed = False
+                                cf.features["buyable_passed"] = False
+                                cf.features["buyable_ok"] = False
                                 final_reasons = [reason for reason in unified_decision.reason_codes if reason != "ok"] or ["BUYABLE_GATE_BLOCKED"]
+                                cf.features["buyable_reasons"] = list(final_reasons)
                                 for reason in final_reasons:
                                     self._record_drop(drop_reason_counter, drop_examples, reason, cf.code)
                                     buyable_stage_counter[reason] += 1
@@ -16812,6 +17175,9 @@ class PB1Engine:
                                 )
                                 continue
                             cf.features["buyable_ok"] = True
+                            cf.buyable_passed = True
+                            cf.features["buyable_passed"] = True
+                            cf.features["buyable_reasons"] = ["ok"]
                             self._log_buyable_gate(code=cf.code, ok=True, reasons=[])
                             buyable_ok_codes.append(cf.code)
                         if self._buyable_gate_timeout_exceeded(code=code_key, started=candidate_gate_started, max_sec=buyable_gate_max_sec):

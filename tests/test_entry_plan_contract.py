@@ -53,6 +53,16 @@ def test_entry_plan_survives_from_orderable_to_submit(monkeypatch):
             "stop_price": 2107678.57,
             "initial_stop": 2107678.57,
             "trigger_policy": "PULLBACK_OVERRIDE",
+            "setup_passed": True,
+            "risk_passed": True,
+            "sizing_passed": True,
+            "buyable_passed": True,
+            "risk_ok": True,
+            "sizing_ok": True,
+            "buyable_ok": True,
+            "sizing_reason": "SIZING_OK",
+            "risk_reasons": ["ok"],
+            "buyable_reasons": ["ok"],
         },
         setup_ok=True,
         reasons=[],
@@ -103,7 +113,7 @@ def test_entry_exit_plan_fail_open_reaches_submit(monkeypatch):
     engine = make_engine()
     cf = CandidateFeature(
         code="000660", market="J",
-        features={"entry_style_selected": "PULLBACK", "entry_reason": "ENTRY_PULLBACK", "close": 2560000, "entry_price": 2560000, "order_price": 2560000, "stop_price": 2107678.57, "initial_stop": 2107678.57, "trigger_policy": "PULLBACK_OVERRIDE"},
+        features={"entry_style_selected": "PULLBACK", "entry_reason": "ENTRY_PULLBACK", "close": 2560000, "entry_price": 2560000, "order_price": 2560000, "stop_price": 2107678.57, "initial_stop": 2107678.57, "trigger_policy": "PULLBACK_OVERRIDE", "setup_passed": True, "risk_passed": True, "sizing_passed": True, "buyable_passed": True, "risk_ok": True, "sizing_ok": True, "buyable_ok": True, "sizing_reason": "SIZING_OK", "risk_reasons": ["ok"], "buyable_reasons": ["ok"]},
         setup_ok=True, reasons=[], mode=1, mode_reasons=[], planned_qty=1, client_order_key="test-key-exit-plan-fail",
     )
     cf.entry_plan = engine._build_entry_plan(cf, entry_price=2560000, order_price=2560000, stop_price=2107678.57, trigger_ok=False, trigger_info={}, entry_mode="", stage="PB1-AM", price_source="test")
