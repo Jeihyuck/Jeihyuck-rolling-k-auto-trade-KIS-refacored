@@ -11,13 +11,25 @@ def manifest_path(trade_date: str) -> Path:
     return Path(os.getenv("US_RUN_MANIFEST_DIR", "runtime/us/run_manifests")) / f"{trade_date}.json"
 
 
-def pin_run_revision(trade_date: str, revision: str, *, replace: bool = False) -> dict:
+def pin_run_revision(
+    trade_date: str,
+    revision: str,
+    *,
+    replace: bool = False,
+    allow_recovery_upgrade: bool = False,
+    replace_reason: str | None = None,
+    replace_meta: dict | None = None,
+) -> dict:
     path = manifest_path(trade_date)
+    reason = ""
     if replace:
-        approved = os.getenv("US_REPREP_APPROVED", "0") == "1"
-        reason = os.getenv("US_REPREP_AUDIT_REASON", "").strip()
-        if not approved or not reason:
-            raise RuntimeError("reprep_requires_operator_approval_and_audit_reason")
+        if allow_recovery_upgrade:
+            reason = str(replace_reason or "RECOVERY_UPGRADE_ALLOWED").strip()
+        else:
+            approved = os.getenv("US_REPREP_APPROVED", "0") == "1"
+            reason = os.getenv("US_REPREP_AUDIT_REASON", "").strip()
+            if not approved or not reason:
+                raise RuntimeError("reprep_requires_operator_approval_and_audit_reason")
     if path.exists() and not replace:
         current = json.loads(path.read_text(encoding="utf-8"))
         if current.get("run_revision") != revision:
@@ -28,6 +40,10 @@ def pin_run_revision(trade_date: str, revision: str, *, replace: bool = False) -
                "generated_at": datetime.now(timezone.utc).isoformat()}
     if replace:
         payload["reprep_audit_reason"] = reason
+        payload["replaced"] = True
+        payload["replace_mode"] = "recovery_upgrade" if allow_recovery_upgrade else "manual_reprep"
+    if isinstance(replace_meta, dict) and replace_meta:
+        payload["replace_meta"] = replace_meta
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")

@@ -9,6 +9,7 @@ authoritative prep contract를 생성하고 저장한다.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import subprocess
@@ -28,6 +29,125 @@ from trader.us.runtime_paths import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_CONTRACT_STATUS_PRIORITY = {
+    "OK": 5,
+    "OK_WITH_WARNINGS": 4,
+    "DEGRADED": 3,
+    "DEFENSE_CRASH_ENTRY_BLOCKED": 2,
+    "ERROR": 1,
+}
+
+
+def _status_priority(status: str) -> int:
+    normalized = str(status or "").upper()
+    if normalized in _CONTRACT_STATUS_PRIORITY:
+        return _CONTRACT_STATUS_PRIORITY[normalized]
+    if normalized.startswith("OK_WITH_WARNINGS"):
+        return _CONTRACT_STATUS_PRIORITY["OK_WITH_WARNINGS"]
+    if normalized.startswith("DEGRADED"):
+        return _CONTRACT_STATUS_PRIORITY["DEGRADED"]
+    return 0
+
+
+def _normalize_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        val = value.strip()
+        return [val] if val else []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _stable_hash(payload: Any) -> str:
+    try:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    except Exception:
+        encoded = str(payload)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _compute_final30_hash(watchlist_result: dict) -> str:
+    rows = list(
+        watchlist_result.get("final30_scored")
+        or watchlist_result.get("final30")
+        or []
+    )
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized.append(
+            {
+                "symbol": str(row.get("symbol") or "").upper(),
+                "exchange": str(row.get("exchange") or "").upper(),
+                "score_final": float(row.get("score_final") or row.get("final_score") or row.get("score") or 0.0),
+                "rank_final30": int(row.get("rank_final30") or 0),
+                "entry_style_selected": str(row.get("entry_style_selected") or ""),
+            }
+        )
+    normalized.sort(key=lambda x: (x["symbol"], x["rank_final30"]))
+    return _stable_hash(normalized)
+
+
+def _compute_strategy_param_hash(
+    *,
+    market_regime_version: str,
+    selector_version: str,
+    market_state: dict,
+    effective_capital_scale: float,
+    effective_max_new_positions: int,
+    underfilled_tier: str,
+    underfilled_capital_haircut: float,
+) -> str:
+    payload = {
+        "market_regime_version": market_regime_version,
+        "selector_version": selector_version,
+        "market_state": str(market_state.get("market_state") or ""),
+        "market_regime": str(market_state.get("market_regime") or ""),
+        "capital_scale": float(market_state.get("capital_scale", market_state.get("exposure_multiplier", 1.0)) or 1.0),
+        "max_new_positions": int(market_state.get("max_new_positions", 10) or 10),
+        "allow_new_buy": bool(market_state.get("allow_new_buy", True)),
+        "force_entry_block": bool(market_state.get("force_entry_block", False)),
+        "effective_capital_scale": float(effective_capital_scale or 0.0),
+        "effective_max_new_positions": int(effective_max_new_positions or 0),
+        "underfilled_tier": str(underfilled_tier or ""),
+        "underfilled_capital_haircut": float(underfilled_capital_haircut or 0.0),
+    }
+    return _stable_hash(payload)
+
+
+def _contract_is_upgrade_candidate(old_contract: dict, new_contract: dict) -> tuple[bool, str]:
+    old_status = str(old_contract.get("status") or "")
+    new_status = str(new_contract.get("status") or "")
+    old_status_upper = old_status.upper()
+    new_status_upper = new_status.upper()
+    old_entry = int(old_contract.get("entry_can_proceed", old_contract.get("trade_can_proceed", 0)) or 0)
+    new_entry = int(new_contract.get("entry_can_proceed", new_contract.get("trade_can_proceed", 0)) or 0)
+    old_priority = _status_priority(old_status)
+    new_priority = _status_priority(new_status)
+
+    old_in_recoverable_bad = old_status_upper in {"DEFENSE_CRASH_ENTRY_BLOCKED", "ERROR", "DEGRADED"} or old_status_upper.startswith("DEGRADED")
+    new_in_recoverable_good = new_status_upper == "OK" or new_status_upper.startswith("OK_WITH_WARNINGS")
+    if old_in_recoverable_bad and new_in_recoverable_good and new_entry == 1:
+        return True, "recover_bad_to_good"
+
+    if old_entry == 0 and new_entry == 1 and new_priority >= old_priority:
+        return True, "entry_recovery_upgrade"
+
+    if new_priority > old_priority and new_entry == 1:
+        return True, "status_priority_upgrade"
+
+    return False, "not_upgrade"
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -250,13 +370,13 @@ def build_us_prep_contract(
     warnings: list[str] = []
     errors: list[str] = []
 
-    warnings.extend(dynamic_universe_result.get("warnings", []))
+    warnings.extend(_normalize_str_list(dynamic_universe_result.get("warnings")))
     warnings.extend(candidate_pool_result.get("status") == "OK_WITH_WARNINGS"
                     and ["candidate_pool_count_below_target"] or [])
-    warnings.extend(validation.get("warnings", []))
+    warnings.extend(_normalize_str_list(validation.get("warnings")))
 
-    errors.extend(dynamic_universe_result.get("errors", []))
-    errors.extend(validation.get("errors", []))
+    errors.extend(_normalize_str_list(dynamic_universe_result.get("errors")))
+    errors.extend(_normalize_str_list(validation.get("errors")))
 
     if market_regime == "RISK_OFF" and not crash_rebound_limited:
         entry_can_proceed = 0
@@ -273,14 +393,34 @@ def build_us_prep_contract(
         effective_max_new_positions = 0
         degraded_reason = trade_block_reason
 
+    selector_version = watchlist_result.get("selector_version", "bucket_champion_v2")
+    market_regime_version = str(market_state.get("market_regime_version") or "us_leading_regime_v1")
+    final30_hash = _compute_final30_hash(watchlist_result)
+    strategy_param_hash = _compute_strategy_param_hash(
+        market_regime_version=market_regime_version,
+        selector_version=selector_version,
+        market_state=market_state,
+        effective_capital_scale=effective_capital_scale,
+        effective_max_new_positions=effective_max_new_positions,
+        underfilled_tier=underfilled_tier,
+        underfilled_capital_haircut=underfilled_capital_haircut,
+    )
+    recoverable_contract = bool(
+        status == "DEFENSE_CRASH_ENTRY_BLOCKED"
+        or str(trade_block_reason or "") == "BENCHMARK_DAILY_DATA_UNAVAILABLE"
+    )
+
     contract = {
         "market": "US",
         "contract_version": "us_sector_rotation_v3",
-        "market_regime_version": "us_leading_regime_v1",
-        "selector_version": watchlist_result.get("selector_version", "bucket_champion_v2"),
+        "market_regime_version": market_regime_version,
+        "selector_version": selector_version,
         "sector_cap_enforced": True,
         "env": env,
         "trade_date": trade_date,
+        "recoverable_contract": recoverable_contract,
+        "final30_hash": final30_hash,
+        "strategy_param_hash": strategy_param_hash,
         "daily_sync_target_count": daily_sync_target_count,
         "daily_sync_ok_count": daily_sync_ok_count,
         "daily_sync_failed_count": daily_sync_failed_count,
@@ -386,9 +526,71 @@ def save_us_prep_contract(contract: dict) -> dict:
         {"ok": bool, "saved_paths": list[str], "errors": list[str]}
     """
     trade_date = contract["trade_date"]
+    from trader.us.path_contract import load_us_prep_contract
     from trader.us.run_manifest import pin_run_revision
-    pin_run_revision(trade_date, str(contract.get("run_revision") or contract.get("git_commit_sha") or "unknown"),
-                     replace=os.getenv("US_REPREP_NEW_REVISION", "0") == "1")
+    from trader.us.db.repos import get_today_broker_progress_order_count
+
+    new_revision = str(contract.get("run_revision") or contract.get("git_commit_sha") or "unknown")
+    existing_contract = load_us_prep_contract(trade_date) or {}
+    existing_revision = str(existing_contract.get("run_revision") or existing_contract.get("git_commit_sha") or "")
+    should_upgrade, upgrade_reason = _contract_is_upgrade_candidate(existing_contract, contract)
+    progress_order_count = int(get_today_broker_progress_order_count(trade_date=trade_date) or 0)
+
+    recoverable_contract = bool(contract.get("recoverable_contract", False))
+    should_pin = not (recoverable_contract and int(contract.get("entry_can_proceed", 0) or 0) == 0)
+
+    if not should_pin:
+        logger.warning(
+            "[US_PREP_CONTRACT][RECOVERABLE_NOT_PINNED] trade_date=%s status=%s reason=%s",
+            trade_date,
+            contract.get("status"),
+            contract.get("trade_block_reason"),
+        )
+    else:
+        try:
+            pin_run_revision(
+                trade_date,
+                new_revision,
+                replace=os.getenv("US_REPREP_NEW_REVISION", "0") == "1",
+            )
+        except RuntimeError as exc:
+            if str(exc) != "trade_day_revision_already_pinned":
+                raise
+            if should_upgrade and progress_order_count <= 0:
+                replace_meta = {
+                    "old_revision": existing_revision,
+                    "new_revision": new_revision,
+                    "old_status": str(existing_contract.get("status") or ""),
+                    "new_status": str(contract.get("status") or ""),
+                    "upgrade_reason": upgrade_reason,
+                }
+                pin_run_revision(
+                    trade_date,
+                    new_revision,
+                    replace=True,
+                    allow_recovery_upgrade=True,
+                    replace_reason="RECOVERY_UPGRADE_ALLOWED",
+                    replace_meta=replace_meta,
+                )
+                logger.warning(
+                    "[US_PREP_CONTRACT][RECOVERY_UPGRADE_ALLOWED] trade_date=%s old_revision=%s new_revision=%s old_status=%s new_status=%s upgrade_reason=%s",
+                    trade_date,
+                    existing_revision,
+                    new_revision,
+                    replace_meta["old_status"],
+                    replace_meta["new_status"],
+                    upgrade_reason,
+                )
+            else:
+                if should_upgrade and progress_order_count > 0:
+                    logger.error(
+                        "[US_PREP_CONTRACT][UPGRADE_BLOCKED] trade_date=%s reason=broker_orders_already_progressed progress_order_count=%d old_status=%s new_status=%s",
+                        trade_date,
+                        progress_order_count,
+                        existing_contract.get("status"),
+                        contract.get("status"),
+                    )
+                raise
     saved_paths: list[str] = []
     save_errors: list[str] = []
 
@@ -702,17 +904,20 @@ def check_us_prep_guard(trade_date: str, session: str = "am") -> dict:
             reason = reason if reason != "ok" else "entry_blocked_by_final30_quality"
     prep_sha = str(contract.get("run_revision") or contract.get("git_commit_sha") or "")
     current_sha = _current_git_commit_sha()
+    version_mismatch = False
     if prep_sha and current_sha != "unknown" and prep_sha != current_sha:
-        entry_can_proceed = 0
-        reason = "entry_blocked_by_prep_contract_version_mismatch"
-        logger.warning("[US_CONTRACT_VERSION][MISMATCH] prep_sha=%s current_sha=%s action=entry_block_exit_allowed", prep_sha, current_sha)
+        version_mismatch = True
+        logger.warning("[US_CONTRACT_VERSION][MISMATCH] prep_sha=%s current_sha=%s action=mark_only_no_entry_block", prep_sha, current_sha)
     ok_payload = {**base_payload, "ok": True, "trade_can_proceed": True, "entry_can_proceed": bool(entry_can_proceed), "exit_can_proceed": bool(exit_can_proceed), "close_can_proceed": bool(close_can_proceed), "session_can_run": True, "reason": reason}
     reasons = list(contract.get("entry_block_reasons") or [])
     if trade_block_reason == "risk_off_entry_block" and "risk_off_entry_block" not in reasons: reasons.append("risk_off_entry_block")
-    if reason == "entry_blocked_by_prep_contract_version_mismatch":
+    if version_mismatch:
         reasons.append("prep_contract_version_mismatch")
-        ok_payload["contract_block_reason"] = reason
         ok_payload["version_mismatch"] = True
+        ok_payload["prep_revision"] = prep_sha
+        ok_payload["session_revision"] = current_sha
+        if not ok_payload.get("contract_block_reason"):
+            ok_payload["contract_block_reason"] = "prep_contract_version_mismatch"
     ok_payload["entry_block_reasons"] = list(dict.fromkeys(reasons))
     ok_payload["primary_entry_block_reason"] = ok_payload["entry_block_reasons"][0] if ok_payload["entry_block_reasons"] else None
     ok_payload["guard_state"] = "PREP_OK" if bool(entry_can_proceed) else "PREP_DEGRADED_ENTRY_BLOCKED"

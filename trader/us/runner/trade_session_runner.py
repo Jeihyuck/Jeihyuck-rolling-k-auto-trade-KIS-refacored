@@ -48,6 +48,57 @@ def _git_value(args: list[str]) -> str:
         return ""
 
 
+def _load_latest_same_day_prep_contract(trade_date: str) -> dict:
+    try:
+        from trader.us.runtime_paths import us_signals_latest_prep_contract_path
+        path = us_signals_latest_prep_contract_path()
+        if not path.exists():
+            return {}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and str(payload.get("trade_date") or "") == str(trade_date):
+            return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def _revision_mismatch_is_safe(prep_contract: dict, latest_contract: dict) -> tuple[bool, str]:
+    if not isinstance(prep_contract, dict):
+        return False, "missing_prep_contract"
+    entry_allowed = int(prep_contract.get("entry_can_proceed", prep_contract.get("trade_can_proceed", 0)) or 0) == 1
+    if not entry_allowed:
+        return False, "prep_entry_blocked"
+
+    if not isinstance(latest_contract, dict) or not latest_contract:
+        return False, "latest_contract_missing"
+
+    prep_final30_hash = str(prep_contract.get("final30_hash") or "")
+    latest_final30_hash = str(latest_contract.get("final30_hash") or "")
+    same_final30 = bool(prep_final30_hash and latest_final30_hash and prep_final30_hash == latest_final30_hash)
+
+    prep_selector = str(prep_contract.get("selector_version") or "")
+    latest_selector = str(latest_contract.get("selector_version") or "")
+    prep_regime = str(prep_contract.get("market_regime_version") or "")
+    latest_regime = str(latest_contract.get("market_regime_version") or "")
+    prep_param_hash = str(prep_contract.get("strategy_param_hash") or "")
+    latest_param_hash = str(latest_contract.get("strategy_param_hash") or "")
+
+    same_selector = bool(prep_selector and latest_selector and prep_selector == latest_selector)
+    same_regime = bool(prep_regime and latest_regime and prep_regime == latest_regime)
+    same_params = bool(prep_param_hash and latest_param_hash and prep_param_hash == latest_param_hash)
+
+    if not (same_selector and same_regime and same_params):
+        return False, "strategy_param_hash_mismatch"
+
+    prep_created_at = str(prep_contract.get("created_at") or "")
+    latest_created_at = str(latest_contract.get("created_at") or "")
+    latest_is_newer_or_same = bool(latest_created_at and (not prep_created_at or latest_created_at >= prep_created_at))
+    if same_final30 or latest_is_newer_or_same:
+        reason = "final30_hash_equal" if same_final30 else "latest_contract_available"
+        return True, reason
+    return False, "latest_contract_not_newer"
+
+
 def _runtime_provenance(*, session: str, run_id: str, started_at_et: str = "", ended_at_et: str = "", wall_elapsed_sec: float = 0.0) -> dict:
     from datetime import datetime, timezone
     try:
@@ -762,12 +813,39 @@ def run_trade_session(
         prep_guard_result["session_revision"] = current_revision
         prep_guard_result["run_revision_mismatch"] = not bool(revision_guard.get("ok"))
         if not revision_guard.get("entry_can_proceed"):
-            prep_guard_result["entry_can_proceed"] = False
+            prep_contract_for_revision = contract_for_revision or {}
+            latest_contract_for_revision = _load_latest_same_day_prep_contract(trade_date)
+            safe_mismatch, safe_reason = _revision_mismatch_is_safe(
+                prep_contract_for_revision,
+                latest_contract_for_revision,
+            )
             prep_guard_result["version_mismatch"] = True
-            prep_guard_result["entry_block_reasons"] = list(dict.fromkeys([
-                *(prep_guard_result.get("entry_block_reasons") or []), revision_guard.get("reason")]))
-            logger.error("[RUN_REVISION_MISMATCH] trade_date=%s prep_revision=%s session_revision=%s entry_blocked=1 exit_reconcile_allowed=1 reason=%s",
-                         trade_date, prep_guard_result.get("prep_revision"), current_revision, revision_guard.get("reason"))
+            prep_guard_result["entry_block_source"] = "revision_mismatch"
+            if safe_mismatch:
+                prep_guard_result["entry_can_proceed"] = bool(prep_guard_result.get("entry_can_proceed", False))
+                prep_guard_result["revision_mismatch_recovery_allowed"] = True
+                prep_guard_result["entry_block_source"] = "RECOVERY_UPGRADE_ALLOWED"
+                prep_guard_result["entry_block_reasons"] = list(dict.fromkeys([
+                    *(prep_guard_result.get("entry_block_reasons") or []),
+                    "run_revision_mismatch_recovery_allowed",
+                    safe_reason,
+                ]))
+                logger.warning(
+                    "[RUN_REVISION_MISMATCH][RECOVERY_ALLOWED] trade_date=%s prep_revision=%s session_revision=%s reason=%s",
+                    trade_date,
+                    prep_guard_result.get("prep_revision"),
+                    current_revision,
+                    safe_reason,
+                )
+            else:
+                prep_guard_result["entry_can_proceed"] = False
+                prep_guard_result["entry_block_reasons"] = list(dict.fromkeys([
+                    *(prep_guard_result.get("entry_block_reasons") or []),
+                    revision_guard.get("reason"),
+                    safe_reason,
+                ]))
+                logger.error("[RUN_REVISION_MISMATCH] trade_date=%s prep_revision=%s session_revision=%s entry_blocked=1 exit_reconcile_allowed=1 reason=%s detail=%s",
+                             trade_date, prep_guard_result.get("prep_revision"), current_revision, revision_guard.get("reason"), safe_reason)
         elif session in ("am", "afternoon") and offline:
             logger.info("[US_PREP_GUARD][BYPASS] session=%s offline=True — skipping prep guard", session)
 

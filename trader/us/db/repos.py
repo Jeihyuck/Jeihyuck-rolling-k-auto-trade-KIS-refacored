@@ -2573,6 +2573,43 @@ def finish_us_prep_run(
         logger.warning("[US_PREP_RUN][FINISH] No DB, run_id=%s status=%s", run_id, status)
         return True
     
+    normalized_status = str(status or "UNKNOWN").upper()
+    normalized_result: dict
+    if isinstance(result, dict):
+        normalized_result = dict(result)
+    elif isinstance(result, str):
+        normalized_result = {
+            "status": normalized_status,
+            "warnings": [],
+            "errors": [result],
+            "message": result,
+        }
+    elif result is None:
+        normalized_result = {}
+    else:
+        normalized_result = {
+            "status": normalized_status,
+            "warnings": [],
+            "errors": [str(result)],
+            "message": str(result),
+        }
+
+    def _to_str_list(value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, (list, tuple, set)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        text = str(value).strip()
+        return [text] if text else []
+
+    normalized_result["warnings"] = _to_str_list(normalized_result.get("warnings"))
+    normalized_result["errors"] = _to_str_list(normalized_result.get("errors"))
+    if not isinstance(normalized_result.get("status"), str) or not str(normalized_result.get("status") or "").strip():
+        normalized_result["status"] = normalized_status
+
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -2585,28 +2622,28 @@ def finish_us_prep_run(
                 """),
                 {
                     "run_id": run_id,
-                    "status": status,
-                    "result": _json_param(result or {}),
+                    "status": normalized_status,
+                    "result": _json_param(normalized_result),
                 },
             )
         
         # Quality summary 로깅
-        if result:
-            watchlist_count = result.get("watchlist_unique_count") or result.get("watchlist_count") or 0
-            score_nonzero = result.get("score_nonzero_count", 0)
-            score_zero = result.get("score_zero_count", 0)
-            score_missing = result.get("score_missing_count", 0)
-            score_ratio = result.get("score_nonzero_ratio", 0.0)
-            trade_can_proceed = result.get("trade_can_proceed", False)
+        if normalized_result:
+            watchlist_count = normalized_result.get("watchlist_unique_count") or normalized_result.get("watchlist_count") or 0
+            score_nonzero = normalized_result.get("score_nonzero_count", 0)
+            score_zero = normalized_result.get("score_zero_count", 0)
+            score_missing = normalized_result.get("score_missing_count", 0)
+            score_ratio = normalized_result.get("score_nonzero_ratio", 0.0)
+            trade_can_proceed = normalized_result.get("trade_can_proceed", False)
             
             logger.info(
                 "[US_PREP_RUN][FINISH] run_id=%s status=%s watchlist_unique=%d "
                 "score_nonzero=%d score_zero=%d missing=%d ratio=%.4f trade_can_proceed=%d",
-                run_id, status, watchlist_count, score_nonzero, score_zero, score_missing,
+                run_id, normalized_status, watchlist_count, score_nonzero, score_zero, score_missing,
                 score_ratio, int(trade_can_proceed)
             )
         else:
-            logger.info("[US_PREP_RUN][FINISH] run_id=%s status=%s", run_id, status)
+            logger.info("[US_PREP_RUN][FINISH] run_id=%s status=%s", run_id, normalized_status)
         
         return True
     except Exception as exc:
@@ -3472,6 +3509,57 @@ def get_today_buy_orders_count(trade_date: str | None = None, env: str = "practi
     except Exception as exc:
         logger.warning(
             "[US_BUY_ORDERS][WARN] trade_date=%s env=%s error=%s returning=0",
+            td,
+            env,
+            exc,
+        )
+        return 0
+
+
+def get_today_broker_progress_order_count(trade_date: str | None = None, env: str = "practice") -> int:
+    """Count same-day orders that already reached submitted/ack/fill progression."""
+    td = trade_date or _today()
+    progressed_statuses = {
+        "SUBMITTED", "SENT",
+        "ACK", "ACKED", "ACCEPTED",
+        "PARTIALLY_FILLED", "FILLED",
+    }
+
+    engine = _get_engine_or_none()
+    if engine is None:
+        return sum(
+            1
+            for o in _MEM_ORDERS
+            if o.get("trade_date") == td
+            and str(o.get("status") or "").upper() in progressed_statuses
+        )
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM us_orders
+                    WHERE trade_date = :td
+                      AND UPPER(COALESCE(status, '')) IN (
+                        'SUBMITTED','SENT','ACK','ACKED','ACCEPTED','PARTIALLY_FILLED','FILLED'
+                      )
+                    """
+                ),
+                {"td": td},
+            ).fetchone()
+            count = int(row[0]) if row else 0
+            logger.info(
+                "[US_BROKER_PROGRESS_ORDERS][COUNT] trade_date=%s progressed_count=%d env=%s",
+                td,
+                count,
+                env,
+            )
+            return count
+    except Exception as exc:
+        logger.warning(
+            "[US_BROKER_PROGRESS_ORDERS][WARN] trade_date=%s env=%s error=%s returning=0",
             td,
             env,
             exc,

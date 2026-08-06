@@ -3,12 +3,27 @@
 ## Required Fields
 
 - trade_date: 2026-01-02
+- branch: dual-agent
+- commit_sha: test-sha
 - run_id: 25718405741
+- github_run_id: 25718405741
+- github_run_attempt: 0
 - sha: test-sha
 - workflow: US Trade AM
 - session: am
+- session_id: am-25718405741
 - event_name: workflow_dispatch
+- actor: codespace
 - env: practice
+- source_log_file: 
+- started_at_utc: 2026-08-06T01:48:47.946956Z
+- started_at_et: 2026-08-05T21:48:47.808397-04:00
+- started_at_kst: 2026-08-06T10:48:47.946956+09:00
+- ended_at_utc: 2026-08-06T01:48:47.946956Z
+- ended_at_et: 2026-08-05T21:48:47.946933-04:00
+- ended_at_kst: 2026-08-06T10:48:47.946956+09:00
+- wall_elapsed_sec: 0.11
+- code_version_source: github_actions
 - dry_run: True
 - kis_order_allowed: 0
 - prep_status: UNKNOWN
@@ -16,15 +31,15 @@
 - score_nonzero_count: 0
 - locked_watchlist_count: 0
 - locked_watchlist_count_source: default_zero
-- entry_eval_status: OK
-- entry_error_type: 
-- entry_error_message: 
+- entry_eval_status: DEGRADED
+- entry_error_type: DAILY_NOTIONAL_UNAVAILABLE
+- entry_error_message: DAILY_NOTIONAL_UNAVAILABLE
 - entry_intents: 0
 - orders_sent: 0
 - fills: 0
 - positions: 0
 - last_stage: order_route
-- final_status: OK
+- final_status: OK_WITH_WARNINGS
 - reason: force_now_single_tick
 - temp_error_count: 0
 - temp_recovered_count: 0
@@ -36,3 +51,32 @@
 - missed_trade_window: False
 - buy_decisions: 0
 - sell_decisions: 0
+- real_broker_buys: 0
+- real_broker_sells: 0
+- synthetic_reconcile_buys: 0
+- synthetic_reconcile_sells: 0
+- broker_ack_only: 0
+- broker_rejects: 0
+- duplicate_exit_blocked: 0
+- buy_notional_routed: 0.0
+- sell_notional_routed: 0.0
+- total_order_notional_routed: 0.0
+- buy_daily_notional_after_routing: 0.0
+- sell_notional_does_not_consume_buy_budget: 0
+- ack_reconcile_before_route_status: SKIP
+- ack_reconcile_after_route_status: SKIP
+- ack_reconcile_after_route_unresolved_count: 0
+- ack_pending_reconcile_count: 0
+- broker_ack_only_unresolved: 0
+- sell_decisions_detail: []
+- market_regime: NEUTRAL
+- capital_scale: 0.5
+- sector_cap_enforced: True
+- trade_block_reason: DAILY_NOTIONAL_UNAVAILABLE
+- blocked_entry_reason_counts: {'DAILY_NOTIONAL_UNAVAILABLE': 1}
+
+## Broker/Reconcile Classification
+- 실제 MTS 신규 매수: 0건
+- 실제 MTS 매도: 0건
+- 내부 잔고 보정: 0건
+- 내부 잔고 보정은 실제 MTS 신규 매수 체결이 아님

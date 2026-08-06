@@ -668,6 +668,10 @@ def run_prep(env: str = "practice", offline: bool = False, force_now: str | None
         contract["benchmark_missing_symbols"] = benchmark_missing_symbols
         contract["benchmark_symbol_status"] = benchmark_symbol_status
         contract["benchmark_daily_failed"] = benchmark_daily_failed
+        if benchmark_daily_failed:
+            contract["recoverable_contract"] = True
+            if str(contract.get("trade_block_reason") or "") in {"", "force_entry_block"}:
+                contract["trade_block_reason"] = "BENCHMARK_DAILY_DATA_UNAVAILABLE"
 
         final_status = contract.get("status", provisional_status)
         trade_can_proceed = int(contract.get("trade_can_proceed", 0) or 0)

@@ -231,6 +231,36 @@ def _load_json_if_exists(path: str | None) -> dict:
         logger.warning("[US_DAILY_REPORT][SESSION_SUMMARY][WARN] path=%s err=%s", path, exc)
         return {}
 
+
+def _load_contract_status_snapshot(trade_date: str) -> dict:
+    pinned_contract = {}
+    latest_contract = {}
+    try:
+        from trader.us.runtime_paths import us_prep_contract_path, us_signals_latest_prep_contract_path
+        pinned_path = us_prep_contract_path(trade_date)
+        if pinned_path.exists():
+            payload = json.loads(pinned_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                pinned_contract = payload
+        latest_path = us_signals_latest_prep_contract_path()
+        if latest_path.exists():
+            payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and str(payload.get("trade_date") or "") == str(trade_date):
+                latest_contract = payload
+    except Exception as exc:
+        logger.warning("[US_DAILY_REPORT][CONTRACT_SNAPSHOT][WARN] %s", exc)
+
+    pinned_status = str(pinned_contract.get("status") or "") if pinned_contract else None
+    latest_status = str(latest_contract.get("status") or "") if latest_contract else None
+    effective = pinned_contract or latest_contract
+    return {
+        "pinned_contract_status": pinned_status,
+        "latest_contract_status": latest_status,
+        "effective_contract_status": str(effective.get("status") or "") if effective else None,
+        "pinned_entry_can_proceed": int(effective.get("entry_can_proceed", 0) or 0) if effective else None,
+        "pinned_trade_block_reason": str(effective.get("trade_block_reason") or "") if effective else None,
+    }
+
 def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int) -> dict:
     sources = {
         "db_orders": int(db_orders or 0),
@@ -480,7 +510,17 @@ def run_daily_report(
         "broker_orders_filled": 0, "broker_orders_rejected": 0, "broker_orders_unresolved": 0,
         "kis_fill_order_count": 0, "kis_fill_execution_count": 0,
         "balance_delta_confirmed_order_count": 0, "synthetic_fill_order_count": 0,
+        "first_failed_dirty_code": "",
+        "pinned_contract_status": None,
+        "latest_prep_attempt_status": None,
+        "effective_contract_status_used_by_session": None,
+        "entry_block_source": "",
+        "entry_block_root_cause": "",
     }
+
+    contract_snapshot = _load_contract_status_snapshot(trade_date)
+    report["pinned_contract_status"] = contract_snapshot.get("pinned_contract_status")
+    report["effective_contract_status_used_by_session"] = contract_snapshot.get("effective_contract_status")
     
     # DRY_RUN
     try:
@@ -533,6 +573,7 @@ def run_daily_report(
                 prep_status_result = load_us_prep_status(trade_date)
                 if prep_status_result:
                     report["prep_status"] = prep_status_result.get("status")
+                    report["latest_prep_attempt_status"] = prep_status_result.get("status")
                     # Check_if prep allows trade to proceed
                     result_data = prep_status_result.get("result") or {}
                     if isinstance(result_data, str):
@@ -885,6 +926,42 @@ def run_daily_report(
     session_summary = _load_json_if_exists(session_summary_json_path)
     if session_summary:
         _apply_regime_session_summary(report, session_summary)
+        prep_contract_meta = session_summary.get("prep_contract") if isinstance(session_summary.get("prep_contract"), dict) else {}
+        report["effective_contract_status_used_by_session"] = (
+            session_summary.get("prep_status")
+            or report.get("effective_contract_status_used_by_session")
+        )
+        report["entry_block_source"] = (
+            session_summary.get("contract_block_reason")
+            or prep_contract_meta.get("reason")
+            or session_summary.get("trade_block_reason")
+            or report.get("trade_block_reason")
+            or ""
+        )
+
+    if not report.get("latest_prep_attempt_status"):
+        report["latest_prep_attempt_status"] = report.get("prep_status") or contract_snapshot.get("latest_contract_status")
+    if not report.get("effective_contract_status_used_by_session"):
+        report["effective_contract_status_used_by_session"] = report.get("pinned_contract_status") or contract_snapshot.get("latest_contract_status")
+
+    schedule_health_payload = _load_json_if_exists(os.path.join("reports", "us_schedule_health", f"{trade_date}.json"))
+    sessions_payload = schedule_health_payload.get("sessions") if isinstance(schedule_health_payload.get("sessions"), dict) else {}
+    failed_dirty_code = ""
+    for _name in ("am", "afternoon", "close"):
+        row = sessions_payload.get(_name) if isinstance(sessions_payload, dict) else None
+        if not isinstance(row, dict):
+            continue
+        attempts = row.get("attempts") if isinstance(row.get("attempts"), list) else []
+        for att in attempts:
+            if not isinstance(att, dict):
+                continue
+            reason_text = str(att.get("reason") or "")
+            if "dirty" in reason_text.lower() and "code" in reason_text.lower():
+                failed_dirty_code = reason_text
+                break
+        if failed_dirty_code:
+            break
+    report["first_failed_dirty_code"] = failed_dirty_code
 
     # Dated report (for history)
     dated_dir = f"{report_base}/{trade_date}"
@@ -948,6 +1025,19 @@ def run_daily_report(
         or report.get("status") == "WARNING_RECONCILE_MISMATCH"
         or report.get("report_consistency") == "REPORT_INCONSISTENT"
     )
+
+    if not report.get("entry_block_source"):
+        report["entry_block_source"] = str(report.get("trade_block_reason") or "")
+
+    no_new_buy = int(report.get("buy_order_count", 0) or 0) == 0 and int(report.get("orders_sent_total", 0) or 0) == 0
+    pinned_status = str(report.get("pinned_contract_status") or "")
+    latest_attempt_status = str(report.get("latest_prep_attempt_status") or "")
+    stale_pinned_like = pinned_status in {"DEFENSE_CRASH_ENTRY_BLOCKED", "ERROR", "DEGRADED"}
+    latest_recovered_like = latest_attempt_status in {"OK", "OK_WITH_WARNINGS"}
+    if no_new_buy and stale_pinned_like and latest_recovered_like:
+        report["entry_block_root_cause"] = "NO_BUY_DUE_TO_STALE_PINNED_PREP_CONTRACT"
+    elif no_new_buy and report.get("entry_block_source"):
+        report["entry_block_root_cause"] = str(report.get("entry_block_source") or "")
 
     if report.get("report_consistency") == "SOURCE_MISMATCH":
         md_lines.extend(["# ⚠️ SOURCE_MISMATCH", "", f"source_counts={(report.get('canonical_sources') or {}).get('source_counts', {})}", ""])
@@ -1074,6 +1164,12 @@ def run_daily_report(
         "|---|---|",
         f"| prep_status | {report['prep_status'] or 'N/A'} |",
         f"| prep_trade_can_proceed | {report['prep_trade_can_proceed']} |",
+        f"| first_failed_dirty_code | {report.get('first_failed_dirty_code') or 'N/A'} |",
+        f"| pinned_contract_status | {report.get('pinned_contract_status') or 'N/A'} |",
+        f"| latest_prep_attempt_status | {report.get('latest_prep_attempt_status') or 'N/A'} |",
+        f"| effective_contract_status_used_by_session | {report.get('effective_contract_status_used_by_session') or 'N/A'} |",
+        f"| entry_block_source | {report.get('entry_block_source') or 'N/A'} |",
+        f"| entry_block_root_cause | {report.get('entry_block_root_cause') or 'N/A'} |",
         "",
         "## Cluster Exposure & Rotation",
         "",

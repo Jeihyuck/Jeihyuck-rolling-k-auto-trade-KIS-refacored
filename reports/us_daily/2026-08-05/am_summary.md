@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-02
+# US Daily Report - 2026-08-05
 
 ## Required Fields
 
-- trade_date: 2026-05-02
+- trade_date: 2026-08-05
 - branch: dual-agent
 - commit_sha: test-sha
 - run_id: 25718405741
@@ -16,13 +16,13 @@
 - actor: codespace
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-08-06T01:48:47.519160Z
-- started_at_et: 2026-08-05T21:48:47.508201-04:00
-- started_at_kst: 2026-08-06T10:48:47.519160+09:00
-- ended_at_utc: 2026-08-06T01:48:47.519160Z
-- ended_at_et: 2026-08-05T21:48:47.519121-04:00
-- ended_at_kst: 2026-08-06T10:48:47.519160+09:00
-- wall_elapsed_sec: 0.0
+- started_at_utc: 2026-08-06T01:48:47.568664Z
+- started_at_et: 2026-08-05T21:48:47.549576-04:00
+- started_at_kst: 2026-08-06T10:48:47.568664+09:00
+- ended_at_utc: 2026-08-06T01:48:47.568664Z
+- ended_at_et: 2026-08-05T21:48:47.568646-04:00
+- ended_at_kst: 2026-08-06T10:48:47.568664+09:00
+- wall_elapsed_sec: 0.01
 - code_version_source: github_actions
 - dry_run: True
 - kis_order_allowed: 0
@@ -38,9 +38,9 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_1
-- final_status: SKIP
-- reason: not_trading_day
+- last_stage: tick_2
+- final_status: OK
+- reason: max_ticks
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 
@@ -72,7 +72,7 @@
 - market_regime: NEUTRAL
 - capital_scale: 1.0
 - sector_cap_enforced: False
-- trade_block_reason: not_trading_day
+- trade_block_reason: 
 - blocked_entry_reason_counts: {}
 
 ## Broker/Reconcile Classification
