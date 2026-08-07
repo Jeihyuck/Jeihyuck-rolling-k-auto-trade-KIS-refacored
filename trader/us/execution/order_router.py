@@ -237,6 +237,11 @@ def canonical_order_risk_check(intent: dict, projected_state: dict, *, allowed_s
     assert_order_allowed(
         intent,
         current_daily_notional_usd=float(projected_state.get("daily_notional_usd") or 0),
+        current_filled_notional=float(projected_state.get("filled_notional_usd") or 0.0),
+        current_acknowledged_notional=float(projected_state.get("acknowledged_notional_usd") or 0.0),
+        current_pending_notional=float(projected_state.get("pending_notional_usd") or 0.0),
+        current_reserved_notional=float(projected_state.get("reserved_notional_usd") or 0.0),
+        current_risk_total_notional=float(projected_state.get("risk_total_notional_usd") or projected_state.get("daily_notional_usd") or 0.0),
         current_position_count=int(projected_state.get("position_count") or 0),
         total_portfolio_usd=float(projected_state.get("portfolio_usd") or 0),
         available_cash_usd=float(projected_state.get("available_cash_usd") or 0),
@@ -516,6 +521,11 @@ def route_order(
     intent: dict,
     *,
     current_daily_notional_usd: float = 0.0,
+    current_filled_notional_usd: float = 0.0,
+    current_acknowledged_notional_usd: float = 0.0,
+    current_pending_notional_usd: float = 0.0,
+    current_reserved_notional_usd: float = 0.0,
+    current_risk_total_notional_usd: float = 0.0,
     current_position_count: int = 0,
     total_portfolio_usd: float = 1000.0,
     available_cash_usd: float = 1000.0,
@@ -696,6 +706,11 @@ def route_order(
     gate_intent = {**intent, "exchange": exchange, "client_order_key": order_key, "position_action": position_action}
     gate_state = {
         "daily_notional_usd": current_daily_notional_usd,
+        "filled_notional_usd": current_filled_notional_usd,
+        "acknowledged_notional_usd": current_acknowledged_notional_usd,
+        "pending_notional_usd": current_pending_notional_usd,
+        "reserved_notional_usd": current_reserved_notional_usd,
+        "risk_total_notional_usd": current_risk_total_notional_usd or current_daily_notional_usd,
         "position_count": current_position_count,
         "portfolio_usd": total_portfolio_usd,
         "available_cash_usd": available_cash_usd,
@@ -720,6 +735,17 @@ def route_order(
         )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
+        logger.warning(
+            "[US_ENTRY_BLOCKED] symbol=%s reason=%s current_filled_notional=%.4f current_acknowledged_notional=%.4f current_pending_notional=%.4f current_reserved_notional=%.4f current_risk_total_notional=%.4f new_notional=%.4f",
+            symbol,
+            _risk_reason(exc),
+            float(gate_state.get("filled_notional_usd") or 0.0),
+            float(gate_state.get("acknowledged_notional_usd") or 0.0),
+            float(gate_state.get("pending_notional_usd") or 0.0),
+            float(gate_state.get("reserved_notional_usd") or 0.0),
+            float(gate_state.get("risk_total_notional_usd") or 0.0),
+            float(intent.get("notional_usd") or 0.0),
+        )
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # A안: notional_exceeds_order_limit이면 qty 축소 후 1회 재시도
@@ -1111,6 +1137,14 @@ def route_order(
         logger.critical("[US_ORDER][JOURNAL_FAILED] broker_submit=blocked error=%s", exc)
         return {"status": "ORDER_DISABLED_DURABLE_LEDGER_UNAVAILABLE", "reason": "durable_journal_write_failed", "broker_submit": False, "retry_order": False, "intent": intent}
     logger.info("[US_ORDER][SUBMIT] symbol=%s side=%s qty=%s price=%.4f", symbol, side, qty, price)
+    logger.info(
+        "[US_ORDER_SUBMIT_ATTEMPT] symbol=%s side=%s qty=%s limit_price=%.4f notional=%.4f",
+        symbol,
+        side,
+        qty,
+        price,
+        float(intent.get("notional_usd") or (float(qty) * float(price) if price else 0.0)),
+    )
 
     # ── KIS 주문 호출 (KIS ACK) ───────────────────────────────────────────
     # 중요: KIS ACK과 DB ACK을 반드시 분리한다.
@@ -1202,6 +1236,7 @@ def route_order(
                 "broker_submit": True, "retry_order": False, "requires_reconcile": True,
                 "order_no": order_no, "intent": intent}
     logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
+    logger.info("[US_ORDER_ACK] symbol=%s side=%s qty=%s order_no=%s", symbol, side, qty, order_no)
 
 
     # ── DB ACK 저장 (KIS 성공 이후 별도 try) ─────────────────────────────

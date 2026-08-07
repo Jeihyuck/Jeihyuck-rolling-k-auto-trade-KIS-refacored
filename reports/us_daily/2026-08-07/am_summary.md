@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-01
+# US Daily Report - 2026-08-07
 
 ## Required Fields
 
-- trade_date: 2026-05-01
+- trade_date: 2026-08-07
 - branch: dual-agent
 - commit_sha: test-sha
 - run_id: 25718405741
@@ -10,18 +10,18 @@
 - github_run_attempt: 0
 - sha: test-sha
 - workflow: US Trade AM
-- session: afternoon
-- session_id: afternoon-25718405741
+- session: am
+- session_id: am-25718405741
 - event_name: workflow_dispatch
 - actor: codespace
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-08-07T04:47:20.210533Z
-- started_at_et: 2026-08-07T00:47:20.185080-04:00
-- started_at_kst: 2026-08-07T13:47:20.210533+09:00
-- ended_at_utc: 2026-08-07T04:47:20.210533Z
-- ended_at_et: 2026-08-07T00:47:20.210513-04:00
-- ended_at_kst: 2026-08-07T13:47:20.210533+09:00
+- started_at_utc: 2026-08-07T04:47:20.388972Z
+- started_at_et: 2026-08-07T00:47:20.365736-04:00
+- started_at_kst: 2026-08-07T13:47:20.388972+09:00
+- ended_at_utc: 2026-08-07T04:47:20.388972Z
+- ended_at_et: 2026-08-07T00:47:20.388957-04:00
+- ended_at_kst: 2026-08-07T13:47:20.388972+09:00
 - wall_elapsed_sec: 0.01
 - code_version_source: github_actions
 - dry_run: True
@@ -38,7 +38,7 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_3
+- last_stage: tick_2
 - final_status: OK
 - reason: max_ticks
 - temp_error_count: 0

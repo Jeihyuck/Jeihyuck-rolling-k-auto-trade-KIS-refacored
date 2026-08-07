@@ -135,6 +135,88 @@ def build_monitoring_universe(final30_symbols: Any, current_position_symbols: An
     return norm(final30_symbols) | norm(current_position_symbols)
 
 
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_kis_endpoint_name(name: str) -> str:
+    text = str(name or "").strip()
+    if text == "GET_inquire_balance":
+        return "GET_inquire-balance"
+    return text
+
+
+def _fill_is_synthetic(fill: dict) -> bool:
+    meta = fill.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
+    source = str(fill.get("source") or fill.get("reconcile_source") or meta.get("source") or "").lower()
+    return bool(
+        meta.get("is_synthetic")
+        or meta.get("synthetic")
+        or meta.get("synthetic_fill")
+        or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
+        or "balance_reconcile" in source
+        or "synthetic" in source
+    )
+
+
+def _fill_notional_usd(fill: dict) -> float:
+    meta = fill.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    direct = (
+        fill.get("notional_usd")
+        or fill.get("fill_notional_usd")
+        or meta.get("notional_usd")
+        or meta.get("fill_notional_usd")
+        or meta.get("actual_fill_notional_usd")
+    )
+    if direct not in (None, ""):
+        return _safe_float(direct)
+    qty = _safe_float(
+        fill.get("qty")
+        or fill.get("filled_qty")
+        or fill.get("cumulative_filled_qty")
+        or fill.get("ft_ccld_qty")
+        or meta.get("qty")
+    )
+    price = _safe_float(
+        fill.get("fill_price")
+        or fill.get("avg_price_usd")
+        or fill.get("avg_price")
+        or fill.get("ft_ccld_unpr3")
+        or meta.get("fill_price")
+        or meta.get("avg_price_usd")
+    )
+    return qty * price if qty > 0 and price > 0 else 0.0
+
+
+def _aggregate_fill_notionals(fills: list[dict]) -> tuple[float, float]:
+    buy_total = 0.0
+    sell_total = 0.0
+    for fill in fills or []:
+        if _fill_is_synthetic(fill):
+            continue
+        side = str(fill.get("side") or "").upper()
+        notional = _fill_notional_usd(fill)
+        if side == "BUY":
+            buy_total += notional
+        elif side == "SELL":
+            sell_total += notional
+    return buy_total, sell_total
+
+
 def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
     return any(pattern in text for pattern in _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS)
@@ -911,6 +993,10 @@ def run_trade_tick(
     fills_temp_error = False
     temp_error_count = 0
     temp_recovered_count = 0
+    temp_error_raw_log_count = 0
+    temp_error_sequence_count = 0
+    temp_error_recovered_sequence_count = 0
+    temp_error_unrecovered_sequence_count = 0
     balance_fetch_failed = False
     skip_zero_snapshot_count = 0
     kis_temp_errors_by_api: dict[str, dict] = {}
@@ -1191,24 +1277,31 @@ def run_trade_tick(
     # temp_error_count, temp_recovered_count, kis_temp_errors_by_api는 함수 시작부에서 사전 초기화됨
     if fills_temp_error:
         temp_error_count += 1
-        kis_temp_errors_by_api.setdefault("GET_inquire_balance", {"temp_error": 0, "recovered": 0, "unrecovered": 0})
-        kis_temp_errors_by_api["GET_inquire_balance"]["temp_error"] += 1
+        temp_error_raw_log_count += 1
+        temp_error_sequence_count += 1
+        kis_temp_errors_by_api.setdefault("GET_inquire-balance", {"temp_error": 0, "recovered": 0, "unrecovered": 0})
+        kis_temp_errors_by_api["GET_inquire-balance"]["temp_error"] += 1
 
     if not offline:
         try:
             client = provider._get_client()
             stats = getattr(client, "stats", {}) or {}
-            temp_error_count += int(stats.get("temp_error_count", 0) or 0)
+            temp_error_count += int(stats.get("temp_error_sequence_count", stats.get("temp_error_count", 0)) or 0)
             temp_recovered_count += int(stats.get("temp_recovered_count", 0) or 0)
+            temp_error_raw_log_count += int(stats.get("temp_error_raw_log_count", stats.get("temp_error_count", 0)) or 0)
+            temp_error_sequence_count += int(stats.get("temp_error_sequence_count", 0) or 0)
+            temp_error_recovered_sequence_count += int(stats.get("temp_recovered_sequence_count", stats.get("temp_recovered_count", 0)) or 0)
+            temp_error_unrecovered_sequence_count += int(stats.get("temp_unrecovered_sequence_count", stats.get("temp_unrecovered_count", 0)) or 0)
             # API별 에러 집계 — client.stats에 by_api 구조가 있으면 사용
             by_api = stats.get("by_api") or {}
             for api_name, api_stats in by_api.items():
+                endpoint = _normalize_kis_endpoint_name(api_name)
                 t = int(api_stats.get("temp_error", 0) or 0)
                 r = int(api_stats.get("recovered", 0) or 0)
                 u = int(api_stats.get("unrecovered", 0) or 0)
                 if t > 0:
                     existing = kis_temp_errors_by_api.setdefault(
-                        api_name, {"temp_error": 0, "recovered": 0, "unrecovered": 0}
+                        endpoint, {"temp_error": 0, "recovered": 0, "unrecovered": 0}
                     )
                     existing["temp_error"] += t
                     existing["recovered"] += r
@@ -2448,17 +2541,32 @@ def run_trade_tick(
         )
         global_stop_reason = preflight_diagnostics["global_stop_reason"]
         system_invariant_failure = preflight_diagnostics["system_invariant_failure"]
+    entry_intents_before_risk = list(entry_intents)
     if system_invariant_failure:
         accepted_preflight_candidates = []
         entry_intents = []
         entry_degraded = True
         entry_degraded_reason = system_invariant_failure
     entry_intents = accepted_preflight_candidates
+    entry_candidate_notional_evaluated = sum(
+        float(i.get("notional_usd") or 0.0)
+        for i in entry_intents_before_risk
+        if str(i.get("side") or "BUY").upper() == "BUY"
+    )
+    entry_intent_notional_before_risk = entry_candidate_notional_evaluated
+    entry_intent_notional_after_risk = sum(
+        float(i.get("notional_usd") or 0.0)
+        for i in entry_intents
+        if str(i.get("side") or "BUY").upper() == "BUY"
+    )
     all_intents = entry_intents
     router_blocked_after_preflight = []
     routing_cluster_exposure = dict(projected_state.get("cluster_exposure_start") or {})
     routing_available_cash = max(effective_budget, 0.0)
     ack_db_failed_buy_stop = False
+    orders_submitted_notional = 0.0
+    orders_acknowledged_notional = 0.0
+    fills_confirmed_buy_notional, fills_confirmed_sell_notional = _aggregate_fill_notionals(fills_today)
     if not routing_cluster_exposure:
         for _position in current_positions or []:
             from trader.us.rotation import theme_cluster_for
@@ -2489,6 +2597,11 @@ def run_trade_tick(
             result = route_order(
                 intent,
                 current_daily_notional_usd=_router_risk_state["daily_notional_usd"],
+                current_filled_notional_usd=fills_confirmed_buy_notional,
+                current_acknowledged_notional_usd=max(fills_confirmed_buy_notional, _router_risk_state["daily_notional_usd"]),
+                current_pending_notional_usd=max(0.0, _router_risk_state["daily_notional_usd"] - fills_confirmed_buy_notional),
+                current_reserved_notional_usd=max(0.0, _router_risk_state["daily_notional_usd"] - fills_confirmed_buy_notional),
+                current_risk_total_notional_usd=max(_router_risk_state["daily_notional_usd"], fills_confirmed_buy_notional),
                 current_position_count=_router_risk_state["position_count"],
                 total_portfolio_usd=_router_risk_state["portfolio_usd"],
                 available_cash_usd=_router_risk_state["available_cash_usd"],
@@ -2505,6 +2618,14 @@ def run_trade_tick(
                 projected_order_keys=_router_risk_state["order_keys"],
             )
             orders.append(result)
+            if str(intent.get("side") or "").upper() == "BUY":
+                submitted_statuses = {"ACK", "ACK_DB_FAILED", "BROKER_SUBMIT_RESULT_UNKNOWN", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "REJECT"}
+                ack_statuses = {"ACK", "ACK_DB_FAILED", "ACK_DB_FAILED_RECONCILE_REQUIRED", "ACK_JOURNAL_FAILED_RECONCILE_REQUIRED", "DB_ACK_JOURNAL_FAILED_RECONCILE_REQUIRED"}
+                intent_notional = float(intent.get("notional_usd") or 0.0)
+                if str(result.get("status") or "").upper() in submitted_statuses:
+                    orders_submitted_notional += intent_notional
+                if str(result.get("status") or "").upper() in ack_statuses or bool(result.get("kis_ack")):
+                    orders_acknowledged_notional += intent_notional
             if (
                 str(intent.get("side") or "BUY").upper() == "BUY"
                 and result.get("status") == "ACK_DB_FAILED"
@@ -2579,7 +2700,7 @@ def run_trade_tick(
                         )
                     except Exception as _trend_ack_exc:
                         logger.warning("[US_POSITION][TREND_STATE][ACK_MARK_WARN] symbol=%s err=%s", intent.get("symbol"), _trend_ack_exc)
-                if str(intent.get("side", "")).upper() == "BUY":
+                if str(intent.get("side", "")).upper() == "BUY" and result["status"] == "ACK":
                     _accepted_notional = float(intent.get("notional_usd", 0) or 0)
                     buy_daily_notional += _accepted_notional
                     routing_available_cash = max(0.0, routing_available_cash - _accepted_notional)
@@ -2865,8 +2986,46 @@ def run_trade_tick(
         {"symbol": str((i or {}).get("symbol", "")).upper(), **(((i or {}).get("meta") or {}) if isinstance((i or {}).get("meta"), dict) else {})}
         for i in exit_intents if str((i or {}).get("side") or "").upper() == "SELL"
     ]
-    buy_notional_routed = buy_daily_notional
+    buy_notional_routed = float(orders_submitted_notional)
     total_order_notional_routed = buy_notional_routed + sell_notional_routed
+    daily_buy_limit_usd = float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", "500") or 500.0)
+    daily_buy_notional_filled_usd = float(fills_confirmed_buy_notional)
+    daily_buy_budget_remaining_usd = max(0.0, daily_buy_limit_usd - daily_buy_notional_filled_usd)
+    blocked_reason_counts = _blocked_entry_reason_counts(
+        locals().get("preblocked_rows", []) + locals().get("entry_generation_diagnostics", {}).get("blocked", []),
+        locals().get("postfilter_blocked_candidates", []),
+        entry_degraded_reason,
+    )
+    daily_notional_exceeded_block_count = int(blocked_reason_counts.get("daily_notional_exceeded", 0) or 0)
+    no_new_orders_reason = ""
+    if orders_sent == 0 and daily_notional_exceeded_block_count > 0:
+        no_new_orders_reason = "daily_notional_limit_nearly_exhausted"
+    elif orders_sent == 0 and blocked_cnt > 0:
+        no_new_orders_reason = "risk_gate_blocked"
+
+    daily_notional_exceeded_block_symbols: dict[str, int] = {}
+    for row in (locals().get("preflight_rejected_candidates", []) or []):
+        if str(row.get("reason") or "") != "daily_notional_exceeded":
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        daily_notional_exceeded_block_symbols[symbol] = daily_notional_exceeded_block_symbols.get(symbol, 0) + 1
+    largest_blocked_candidates = sorted(
+        [{"symbol": s, "count": c} for s, c in daily_notional_exceeded_block_symbols.items()],
+        key=lambda item: item.get("count", 0),
+        reverse=True,
+    )[:5]
+
+    kis_temp_error_by_endpoint = {
+        _normalize_kis_endpoint_name(api_name): int((api_stats or {}).get("temp_error", 0) or 0)
+        for api_name, api_stats in (kis_temp_errors_by_api or {}).items()
+        if int((api_stats or {}).get("temp_error", 0) or 0) > 0
+    }
+    order_submit_temp_error_count = int(kis_temp_error_by_endpoint.get("POST_order", 0) or 0)
+    price_temp_error_count = int(kis_temp_error_by_endpoint.get("GET_price", 0) or 0)
+    balance_temp_error_count = int(kis_temp_error_by_endpoint.get("GET_inquire-balance", 0) or 0)
+    fill_temp_error_count = int(kis_temp_error_by_endpoint.get("GET_inquire-ccnl", 0) or 0)
     after_symbols_by_status = ack_recon_after_route.get("symbols_by_status", {}) if isinstance(ack_recon_after_route, dict) else {}
     ack_pending_reconcile_count = len(after_symbols_by_status.get("ack_pending_reconcile", [])) if isinstance(after_symbols_by_status, dict) else 0
     broker_ack_only_unresolved = int(ack_recon_after_route.get("unresolved_count", 0) or 0)
@@ -3082,11 +3241,26 @@ def run_trade_tick(
         "synthetic_reconcile_fills_count": int(ack_recon_after_route.get("balance_reconcile_count", ack_recon.get("balance_reconcile_count", 0)) or 0),
         "balance_confirmed_count": int(ack_recon_after_route.get("balance_reconcile_count", ack_recon.get("balance_reconcile_count", 0)) or 0),
         "unresolved_ack_count": int(ack_recon_after_route.get("unresolved_count", ack_recon.get("unresolved_count", 0)) or 0),
+        "entry_candidate_notional_evaluated": round(entry_candidate_notional_evaluated, 4),
+        "entry_intent_notional_before_risk": round(entry_intent_notional_before_risk, 4),
+        "entry_intent_notional_after_risk": round(entry_intent_notional_after_risk, 4),
+        "orders_submitted_notional": round(orders_submitted_notional, 4),
+        "orders_acknowledged_notional": round(orders_acknowledged_notional, 4),
+        "fills_confirmed_notional": round(fills_confirmed_buy_notional, 4),
+        "order_audit_buy_notional": round(fills_confirmed_buy_notional, 4),
+        "order_audit_sell_notional": round(fills_confirmed_sell_notional, 4),
         "buy_notional_routed": round(buy_notional_routed, 4),
         "sell_notional_routed": round(sell_notional_routed, 4),
         "exit_notional_routed": round(sell_notional_routed, 4),
         "total_order_notional_routed": round(total_order_notional_routed, 4),
         "buy_daily_notional_after_routing": round(buy_daily_notional, 4),
+        "no_new_orders_reason": no_new_orders_reason,
+        "daily_buy_limit_usd": round(daily_buy_limit_usd, 4),
+        "daily_buy_notional_filled_usd": round(daily_buy_notional_filled_usd, 4),
+        "daily_buy_budget_remaining_usd": round(daily_buy_budget_remaining_usd, 4),
+        "daily_notional_exceeded_block_count": daily_notional_exceeded_block_count,
+        "daily_notional_exceeded_block_symbols": daily_notional_exceeded_block_symbols,
+        "largest_blocked_candidates": largest_blocked_candidates,
         "sell_notional_does_not_consume_buy_budget": int(sell_notional_routed > 0 and buy_daily_notional == buy_notional_routed),
         "broker_ack_only_unresolved": broker_ack_only_unresolved,
         "ack_pending_reconcile_count": ack_pending_reconcile_count,
@@ -3098,7 +3272,22 @@ def run_trade_tick(
         "buy_orders": sum(1 for o in orders if str(o.get("side") or "").upper() == "BUY") if 'orders' in locals() else 0,
         "monitoring_universe_count": len(monitoring_universe) if 'monitoring_universe' in locals() else 0,
         "temp_error_count": temp_error_count,
+        "temp_error_sequence_count": temp_error_sequence_count,
         "temp_recovered_count": temp_recovered_count,
+        "temp_recovered_sequence_count": temp_error_recovered_sequence_count,
+        "temp_unrecovered_sequence_count": temp_error_unrecovered_sequence_count,
+        "kis_temp_error_raw_log_count": temp_error_raw_log_count,
+        "kis_temp_error_sequence_count": temp_error_sequence_count,
+        "kis_temp_error_recovered_sequence_count": temp_error_recovered_sequence_count,
+        "kis_temp_error_unrecovered_sequence_count": temp_error_unrecovered_sequence_count,
+        "kis_temp_error_by_endpoint": kis_temp_error_by_endpoint,
+        "kis_temp_error_order_endpoint_count": order_submit_temp_error_count,
+        "kis_temp_error_price_endpoint_count": price_temp_error_count,
+        "kis_temp_error_balance_endpoint_count": balance_temp_error_count,
+        "kis_temp_error_fill_endpoint_count": fill_temp_error_count,
+        "order_submit_temp_error_count": order_submit_temp_error_count,
+        "order_submit_temp_error_recovered_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("recovered", 0) or 0),
+        "order_submit_temp_error_unrecovered_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("unrecovered", 0) or 0),
         "balance_fetch_failed": balance_fetch_failed,
         "skip_zero_snapshot_count": skip_zero_snapshot_count,
         "balance_circuit": balance_circuit,

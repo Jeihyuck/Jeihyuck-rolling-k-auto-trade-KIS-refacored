@@ -26,6 +26,13 @@ from trader.us.execution.kis_us_registry import (
 logger = logging.getLogger(__name__)
 
 
+def _endpoint_label(method: str, path: str) -> str:
+    tail = str(path or "").strip().split("/")[-1]
+    if tail == "order":
+        return "POST_order" if method.upper() == "POST" else "GET_order"
+    return f"{method.upper()}_{tail}"
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -178,6 +185,11 @@ class KisUSClient:
             "temp_error_count": 0,
             "temp_recovered_count": 0,
             "temp_unrecovered_count": 0,
+            "temp_error_raw_log_count": 0,
+            "temp_error_sequence_count": 0,
+            "temp_recovered_sequence_count": 0,
+            "temp_unrecovered_sequence_count": 0,
+            "by_api": {},
             "stale_price_fallback_count": 0,
         }
         masked_cano = (self._cano[:4] + "****") if self._cano else ""
@@ -1085,6 +1097,8 @@ class KisUSClient:
         max_attempts = 5
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
         last_error: Exception | None = None
+        had_temp_error = False
+        endpoint = _endpoint_label("GET", path)
         
         for attempt in range(1, max_attempts + 1):
             try:
@@ -1100,6 +1114,12 @@ class KisUSClient:
                 # Success after retry
                 if attempt > 1 and last_error:
                     self.stats["temp_recovered_count"] += 1
+                    self.stats["temp_recovered_sequence_count"] += 1
+                    api_stats = self.stats.setdefault("by_api", {}).setdefault(
+                        endpoint,
+                        {"temp_error": 0, "recovered": 0, "unrecovered": 0, "sequence": 0},
+                    )
+                    api_stats["recovered"] += 1
                     logger.info(
                         f"[US_KIS][TEMP_RECOVERED] endpoint={path.split('/')[-1]} attempt={attempt}/{max_attempts} "
                         f"last_error={last_error!r}"
@@ -1114,6 +1134,16 @@ class KisUSClient:
                 if is_temp and attempt < max_attempts:
                     self.stats["get_retry_count"] += 1
                     self.stats["temp_error_count"] += 1
+                    self.stats["temp_error_raw_log_count"] += 1
+                    api_stats = self.stats.setdefault("by_api", {}).setdefault(
+                        endpoint,
+                        {"temp_error": 0, "recovered": 0, "unrecovered": 0, "sequence": 0},
+                    )
+                    api_stats["temp_error"] += 1
+                    if not had_temp_error:
+                        had_temp_error = True
+                        self.stats["temp_error_sequence_count"] += 1
+                        api_stats["sequence"] += 1
                     backoff_sec = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
                     jitter = random.uniform(0, 0.3 * backoff_sec)
                     sleep_time = backoff_sec + jitter
@@ -1134,6 +1164,12 @@ class KisUSClient:
                     )
                 if is_temp:
                     self.stats["temp_unrecovered_count"] += 1
+                    self.stats["temp_unrecovered_sequence_count"] += 1
+                    api_stats = self.stats.setdefault("by_api", {}).setdefault(
+                        endpoint,
+                        {"temp_error": 0, "recovered": 0, "unrecovered": 0, "sequence": 0},
+                    )
+                    api_stats["unrecovered"] += 1
                     raise KisUSTemporaryError(f"GET {path} failed after {attempt} attempts: {err}") from err
                 else:
                     raise
@@ -1148,6 +1184,8 @@ class KisUSClient:
         max_attempts = 5
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
         last_error: Exception | None = None
+        had_temp_error = False
+        endpoint = _endpoint_label("POST", path)
         
         for attempt in range(1, max_attempts + 1):
             try:
@@ -1163,6 +1201,12 @@ class KisUSClient:
                 # Success after retry
                 if attempt > 1 and last_error:
                     self.stats["temp_recovered_count"] += 1
+                    self.stats["temp_recovered_sequence_count"] += 1
+                    api_stats = self.stats.setdefault("by_api", {}).setdefault(
+                        endpoint,
+                        {"temp_error": 0, "recovered": 0, "unrecovered": 0, "sequence": 0},
+                    )
+                    api_stats["recovered"] += 1
                     logger.info(
                         f"[US_KIS][TEMP_RECOVERED] endpoint={path.split('/')[-1]} attempt={attempt}/{max_attempts} "
                         f"last_error={last_error!r}"
@@ -1177,6 +1221,16 @@ class KisUSClient:
                 if is_temp and attempt < max_attempts:
                     self.stats["post_retry_count"] += 1
                     self.stats["temp_error_count"] += 1
+                    self.stats["temp_error_raw_log_count"] += 1
+                    api_stats = self.stats.setdefault("by_api", {}).setdefault(
+                        endpoint,
+                        {"temp_error": 0, "recovered": 0, "unrecovered": 0, "sequence": 0},
+                    )
+                    api_stats["temp_error"] += 1
+                    if not had_temp_error:
+                        had_temp_error = True
+                        self.stats["temp_error_sequence_count"] += 1
+                        api_stats["sequence"] += 1
                     backoff_sec = backoff_schedule[min(attempt - 1, len(backoff_schedule) - 1)]
                     jitter = random.uniform(0, 0.3 * backoff_sec)
                     sleep_time = backoff_sec + jitter
@@ -1195,6 +1249,13 @@ class KisUSClient:
                     f"endpoint={path.split('/')[-1]} attempts={max_attempts} error={err!r} temporary={is_temp}"
                 )
                 if is_temp:
+                    self.stats["temp_unrecovered_count"] += 1
+                    self.stats["temp_unrecovered_sequence_count"] += 1
+                    api_stats = self.stats.setdefault("by_api", {}).setdefault(
+                        endpoint,
+                        {"temp_error": 0, "recovered": 0, "unrecovered": 0, "sequence": 0},
+                    )
+                    api_stats["unrecovered"] += 1
                     raise KisUSTemporaryError(f"POST {path} failed after {attempt} attempts: {err}") from err
                 else:
                     raise

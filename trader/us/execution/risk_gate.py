@@ -109,15 +109,35 @@ def check_daily_notional(
     new_notional_usd: float,
     current_daily_notional_usd: float,
     symbol: str = "",
+    *,
+    current_filled_notional: float | None = None,
+    current_acknowledged_notional: float | None = None,
+    current_pending_notional: float | None = None,
+    current_reserved_notional: float | None = None,
+    current_risk_total_notional: float | None = None,
 ) -> None:
-    total = current_daily_notional_usd + new_notional_usd
+    filled = float(current_filled_notional if current_filled_notional is not None else current_daily_notional_usd)
+    acknowledged = float(current_acknowledged_notional if current_acknowledged_notional is not None else filled)
+    pending = float(current_pending_notional if current_pending_notional is not None else 0.0)
+    reserved = float(current_reserved_notional if current_reserved_notional is not None else max(0.0, acknowledged - filled))
+    risk_total = float(
+        current_risk_total_notional
+        if current_risk_total_notional is not None
+        else max(current_daily_notional_usd, filled + pending + reserved)
+    )
+    total = risk_total + new_notional_usd
     limit = float(os.getenv("US_MAX_DAILY_NOTIONAL_USD", "500"))
     if total > limit:
         _block(
             "daily_notional_exceeded",
             symbol=symbol,
             new_notional=new_notional_usd,
-            current_total=current_daily_notional_usd,
+            current_total=risk_total,
+            current_filled_notional=round(filled, 4),
+            current_acknowledged_notional=round(acknowledged, 4),
+            current_pending_notional=round(pending, 4),
+            current_reserved_notional=round(reserved, 4),
+            current_risk_total_notional=round(risk_total, 4),
             limit=limit,
         )
 
@@ -387,6 +407,11 @@ def assert_order_allowed(
     current_position_symbols: "set[str] | None" = None,
     trade_date: str | None = None,
     is_existing_position_buy: bool = False,
+    current_filled_notional: float | None = None,
+    current_acknowledged_notional: float | None = None,
+    current_pending_notional: float | None = None,
+    current_reserved_notional: float | None = None,
+    current_risk_total_notional: float | None = None,
 ) -> None:
     """Order intent의 전체 위험 점검.
 
@@ -434,7 +459,16 @@ def assert_order_allowed(
         check_us_capital_budget(notional_usd, available_cash_usd, symbol=symbol)
 
         check_notional(notional_usd, symbol=symbol)
-        check_daily_notional(notional_usd, current_daily_notional_usd, symbol=symbol)
+        check_daily_notional(
+            notional_usd,
+            current_daily_notional_usd,
+            symbol=symbol,
+            current_filled_notional=current_filled_notional,
+            current_acknowledged_notional=current_acknowledged_notional,
+            current_pending_notional=current_pending_notional,
+            current_reserved_notional=current_reserved_notional,
+            current_risk_total_notional=current_risk_total_notional,
+        )
         if is_existing_position_buy:
             logger.info(
                 "[US_RISK][POSITION_COUNT_SKIP] symbol=%s reason=existing_position_add_buy count=%s limit=%s",

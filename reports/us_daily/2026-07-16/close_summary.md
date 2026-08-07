@@ -11,7 +11,7 @@
 |---|---|
 | trade_date | 2026-07-16 |
 | branch | dual-agent |
-| commit_sha | 20aeca22a24eb1bf0235be330b3ef29fa1021bbe |
+| commit_sha | dbbf119be00e48e1472a62f31ee3961ca63462c5 |
 | workflow | local |
 | run_id | local |
 | session | close |

@@ -509,6 +509,43 @@ def _write_us_session_report(payload: dict, session: str) -> None:
         dated_md.write_text("\n".join(md_lines) + "\n")
 
 
+def _load_prior_cumulative_metrics(trade_date: str, session: str) -> dict[str, float]:
+    order = ["am", "afternoon", "close"]
+    if session not in order:
+        return {
+            "orders_sent": 0.0,
+            "orders_ack": 0.0,
+            "fills_count": 0.0,
+            "fills_notional": 0.0,
+            "buy_notional_routed": 0.0,
+        }
+    idx = order.index(session)
+    metrics = {
+        "orders_sent": 0.0,
+        "orders_ack": 0.0,
+        "fills_count": 0.0,
+        "fills_notional": 0.0,
+        "buy_notional_routed": 0.0,
+    }
+    base = Path("reports/us_daily") / trade_date
+    for prior in order[:idx]:
+        path = base / f"{prior}_summary.json"
+        if not path.exists():
+            continue
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(row, dict):
+                continue
+            metrics["orders_sent"] += float(row.get("session_orders_sent", row.get("orders_sent_total", 0)) or 0)
+            metrics["orders_ack"] += float(row.get("session_orders_ack", row.get("orders_ack_total", 0)) or 0)
+            metrics["buy_notional_routed"] += float(row.get("session_buy_notional_routed", row.get("buy_notional_routed", 0.0)) or 0.0)
+            metrics["fills_notional"] += float(row.get("session_fills_confirmed_notional", 0.0) or 0.0)
+            metrics["fills_count"] += float(row.get("session_fills_count", 0) or 0)
+        except Exception as exc:
+            logger.warning("[US_SESSION][PRIOR_CUMULATIVE][WARN] session=%s path=%s err=%s", prior, path, exc)
+    return metrics
+
+
 
 def _count_trade_date_order_activity(trade_date: str) -> int:
     """Best-effort count of DB order rows used to classify timeout-after-order as non-fatal."""
@@ -1498,6 +1535,25 @@ def run_trade_session(
         synthetic_reconcile_buys = synthetic_reconcile_sells = 0
         broker_ack_only = broker_rejects = duplicate_exit_blocked = 0
         buy_notional_routed = sell_notional_routed = total_order_notional_routed = 0.0
+        entry_candidate_notional_evaluated = 0.0
+        entry_intent_notional_before_risk = 0.0
+        entry_intent_notional_after_risk = 0.0
+        orders_submitted_notional = 0.0
+        orders_acknowledged_notional = 0.0
+        cumulative_fills_confirmed_notional = 0.0
+        cumulative_order_audit_buy_notional = 0.0
+        cumulative_order_audit_sell_notional = 0.0
+        daily_notional_exceeded_block_count = 0
+        daily_notional_exceeded_block_symbols: dict[str, int] = {}
+        largest_blocked_candidates: list[dict] = []
+        no_new_orders_reason = ""
+        daily_buy_limit_usd = 0.0
+        daily_buy_notional_filled_usd = 0.0
+        daily_buy_budget_remaining_usd = 0.0
+        kis_temp_error_raw_log_count = 0
+        kis_temp_error_sequence_count = 0
+        kis_temp_error_recovered_sequence_count = 0
+        kis_temp_error_unrecovered_sequence_count = 0
         ack_pending_reconcile_count = broker_ack_only_unresolved = 0
         all_sold_today_symbols: list[str] = []
         all_pending_order_symbols: list[str] = []
@@ -1550,6 +1606,28 @@ def run_trade_session(
             buy_notional_routed += float(tick_result.get("buy_notional_routed", 0.0) or 0.0)
             sell_notional_routed += float(tick_result.get("sell_notional_routed", 0.0) or 0.0)
             total_order_notional_routed += float(tick_result.get("total_order_notional_routed", 0.0) or 0.0)
+            entry_candidate_notional_evaluated += float(tick_result.get("entry_candidate_notional_evaluated", 0.0) or 0.0)
+            entry_intent_notional_before_risk += float(tick_result.get("entry_intent_notional_before_risk", 0.0) or 0.0)
+            entry_intent_notional_after_risk += float(tick_result.get("entry_intent_notional_after_risk", 0.0) or 0.0)
+            orders_submitted_notional += float(tick_result.get("orders_submitted_notional", 0.0) or 0.0)
+            orders_acknowledged_notional += float(tick_result.get("orders_acknowledged_notional", 0.0) or 0.0)
+            cumulative_fills_confirmed_notional = max(cumulative_fills_confirmed_notional, float(tick_result.get("fills_confirmed_notional", 0.0) or 0.0))
+            cumulative_order_audit_buy_notional = max(cumulative_order_audit_buy_notional, float(tick_result.get("order_audit_buy_notional", 0.0) or 0.0))
+            cumulative_order_audit_sell_notional = max(cumulative_order_audit_sell_notional, float(tick_result.get("order_audit_sell_notional", 0.0) or 0.0))
+            daily_notional_exceeded_block_count += int(tick_result.get("daily_notional_exceeded_block_count", 0) or 0)
+            for sym, cnt in (tick_result.get("daily_notional_exceeded_block_symbols", {}) or {}).items():
+                daily_notional_exceeded_block_symbols[str(sym)] = daily_notional_exceeded_block_symbols.get(str(sym), 0) + int(cnt or 0)
+            if tick_result.get("largest_blocked_candidates"):
+                largest_blocked_candidates = tick_result.get("largest_blocked_candidates") or largest_blocked_candidates
+            if tick_result.get("no_new_orders_reason"):
+                no_new_orders_reason = str(tick_result.get("no_new_orders_reason") or "")
+            daily_buy_limit_usd = float(tick_result.get("daily_buy_limit_usd", daily_buy_limit_usd) or daily_buy_limit_usd)
+            daily_buy_notional_filled_usd = max(daily_buy_notional_filled_usd, float(tick_result.get("daily_buy_notional_filled_usd", 0.0) or 0.0))
+            daily_buy_budget_remaining_usd = float(tick_result.get("daily_buy_budget_remaining_usd", daily_buy_budget_remaining_usd) or daily_buy_budget_remaining_usd)
+            kis_temp_error_raw_log_count += int(tick_result.get("kis_temp_error_raw_log_count", 0) or 0)
+            kis_temp_error_sequence_count += int(tick_result.get("kis_temp_error_sequence_count", tick_result.get("temp_error_sequence_count", 0)) or 0)
+            kis_temp_error_recovered_sequence_count += int(tick_result.get("kis_temp_error_recovered_sequence_count", tick_result.get("temp_recovered_sequence_count", 0)) or 0)
+            kis_temp_error_unrecovered_sequence_count += int(tick_result.get("kis_temp_error_unrecovered_sequence_count", 0) or 0)
             ack_pending_reconcile_count = int(tick_result.get("ack_pending_reconcile_count", 0) or 0)
             broker_ack_only_unresolved = int(tick_result.get("broker_ack_only_unresolved", 0) or 0)
 
@@ -1590,8 +1668,9 @@ def run_trade_session(
         kis_temp_errors_by_api: dict[str, dict] = {}
         for tick_result in results:
             for api_name, api_stats in (tick_result.get("kis_temp_errors_by_api") or {}).items():
+                normalized_name = "GET_inquire-balance" if str(api_name) == "GET_inquire_balance" else str(api_name)
                 e = kis_temp_errors_by_api.setdefault(
-                    api_name, {"temp_error": 0, "recovered": 0, "unrecovered": 0}
+                    normalized_name, {"temp_error": 0, "recovered": 0, "unrecovered": 0}
                 )
                 e["temp_error"] += int(api_stats.get("temp_error", 0) or 0)
                 e["recovered"] += int(api_stats.get("recovered", 0) or 0)
@@ -1601,6 +1680,16 @@ def run_trade_session(
             real_broker_buys = len(distinct_real_broker_buy_orders)
         if distinct_real_broker_sell_orders:
             real_broker_sells = len(distinct_real_broker_sell_orders)
+
+        prior_cumulative = _load_prior_cumulative_metrics(trade_date, session)
+        cumulative_fills_count = int(total_fills)
+        session_fills_count = max(0, cumulative_fills_count - int(prior_cumulative.get("fills_count", 0)))
+        daily_cumulative_orders_sent = int(prior_cumulative.get("orders_sent", 0)) + int(total_orders_sent)
+        daily_cumulative_orders_ack = int(prior_cumulative.get("orders_ack", 0)) + int(total_orders_ack)
+        daily_cumulative_fills_count = int(prior_cumulative.get("fills_count", 0)) + int(session_fills_count)
+        session_fills_confirmed_notional = max(0.0, float(cumulative_fills_confirmed_notional) - float(prior_cumulative.get("fills_notional", 0.0)))
+        daily_cumulative_fills_notional = float(prior_cumulative.get("fills_notional", 0.0)) + float(session_fills_confirmed_notional)
+        daily_cumulative_buy_notional_routed = float(prior_cumulative.get("buy_notional_routed", 0.0)) + float(buy_notional_routed)
 
         # pending_order_count is supplied by ACK/balance reconcile; do not derive it as ack - fills.
 
@@ -1697,6 +1786,13 @@ def run_trade_session(
             "orders_sent_total": total_orders_sent if total_orders_sent else int(final_tick.get("orders_sent", 0) or 0),
             "orders_ack": total_orders_ack,
             "orders_ack_total": total_orders_ack,
+            "session_orders_sent": int(total_orders_sent),
+            "session_orders_ack": int(total_orders_ack),
+            "session_orders_rejected": int(total_orders_rejected),
+            "daily_cumulative_orders_sent": int(daily_cumulative_orders_sent),
+            "daily_cumulative_orders_ack": int(daily_cumulative_orders_ack),
+            "daily_orders_sent_total": int(daily_cumulative_orders_sent),
+            "daily_orders_ack_total": int(daily_cumulative_orders_ack),
             "fill_persistence_failed": int("fill_persistence_failed" in str(final_reason)),
             "prior_failed_orders_reconcile_required": int(final_tick.get("prior_failed_orders_reconcile_required", 0) or 0),
             "reconcile_only_until_clean": int(final_tick.get("reconcile_only_until_clean", 0) or 0),
@@ -1735,9 +1831,13 @@ def run_trade_session(
             "new_buy_blocked_by_max_positions_count": int(block_reasons_total.get("max_positions_reached_new_symbol", 0) or 0),
             "duplicate_session_detected": int(any(str(r.get("detail_status") or "") == "SKIP_DUPLICATE_RUNNING" for r in results)),
             "tokenP_403_detected": int("403" in json.dumps(kis_temp_errors_by_api, ensure_ascii=False)),
-            "fills_count": total_fills,
-            "fills": total_fills,
-            "unique_fills_count": total_fills,
+            "fills_count": cumulative_fills_count,
+            "fills": cumulative_fills_count,
+            "unique_fills_count": cumulative_fills_count,
+            "session_fills_count": session_fills_count,
+            "cumulative_fills_count": cumulative_fills_count,
+            "daily_cumulative_fills_count": daily_cumulative_fills_count,
+            "daily_fills_confirmed_total": daily_cumulative_fills_count,
             "pending_order_count": total_pending_orders,
             "sold_today_count": total_sold_today,
             "open_position_count": total_open_positions,
@@ -1752,10 +1852,40 @@ def run_trade_session(
             "broker_ack_only": broker_ack_only,
             "broker_rejects": broker_rejects,
             "duplicate_exit_blocked": duplicate_exit_blocked,
+            "entry_candidate_notional_evaluated": round(entry_candidate_notional_evaluated, 4),
+            "entry_intent_notional_before_risk": round(entry_intent_notional_before_risk, 4),
+            "entry_intent_notional_after_risk": round(entry_intent_notional_after_risk, 4),
+            "orders_submitted_notional": round(orders_submitted_notional, 4),
+            "orders_acknowledged_notional": round(orders_acknowledged_notional, 4),
+            "fills_confirmed_notional": round(cumulative_fills_confirmed_notional, 4),
+            "session_fills_confirmed_notional": round(session_fills_confirmed_notional, 4),
+            "daily_cumulative_buy_notional_filled": round(daily_cumulative_fills_notional, 4),
+            "daily_buy_notional_filled": round(daily_cumulative_fills_notional, 4),
+            "daily_sell_notional_filled": round(cumulative_order_audit_sell_notional, 4),
+            "daily_net_notional_filled": round(daily_cumulative_fills_notional - cumulative_order_audit_sell_notional, 4),
+            "order_audit_buy_notional": round(cumulative_order_audit_buy_notional, 4),
+            "order_audit_sell_notional": round(cumulative_order_audit_sell_notional, 4),
+            "daily_order_audit_buy_notional": round(cumulative_order_audit_buy_notional, 4),
+            "daily_order_audit_sell_notional": round(cumulative_order_audit_sell_notional, 4),
             "buy_notional_routed": round(buy_notional_routed, 4),
             "sell_notional_routed": round(sell_notional_routed, 4),
             "total_order_notional_routed": round(total_order_notional_routed, 4),
+            "session_buy_notional_routed": round(buy_notional_routed, 4),
+            "session_fills_confirmed_buy_notional": round(session_fills_confirmed_notional, 4),
+            "session_fills_confirmed_sell_notional": round(cumulative_order_audit_sell_notional, 4),
+            "session_orders_submitted_notional": round(orders_submitted_notional, 4),
+            "session_orders_acknowledged_notional": round(orders_acknowledged_notional, 4),
+            "daily_cumulative_buy_notional_routed": round(daily_cumulative_buy_notional_routed, 4),
+            "close_session_orders_sent": int(total_orders_sent if session == "close" else 0),
+            "close_session_buy_notional_routed": round(buy_notional_routed if session == "close" else 0.0, 4),
             "buy_daily_notional_after_routing": round(buy_notional_routed, 4),
+            "no_new_orders_reason": no_new_orders_reason,
+            "daily_buy_limit_usd": round(daily_buy_limit_usd, 4),
+            "daily_buy_notional_filled_usd": round(daily_buy_notional_filled_usd, 4),
+            "daily_buy_budget_remaining_usd": round(daily_buy_budget_remaining_usd, 4),
+            "daily_notional_exceeded_block_count": int(daily_notional_exceeded_block_count),
+            "daily_notional_exceeded_block_symbols": daily_notional_exceeded_block_symbols,
+            "largest_blocked_candidates": largest_blocked_candidates,
             "sell_notional_does_not_consume_buy_budget": int(sell_notional_routed > 0),
             "ack_reconcile_before_route_status": final_tick.get("ack_reconcile_before_route_status", ""),
             "ack_reconcile_after_route_status": final_tick.get("ack_reconcile_after_route_status", ""),
@@ -1775,9 +1905,14 @@ def run_trade_session(
             "trade_block_reason": session_trade_block_reason,
             "final_status": final_status,
             "reason": final_reason,
-            "temp_error_count": temp_error_count,
+            "temp_error_count": kis_temp_error_sequence_count or temp_error_count,
             "temp_recovered_count": temp_recovered_count,
-            "kis_balance_temp_error_count": temp_error_count,
+            "temp_error_sequence_count": kis_temp_error_sequence_count or temp_error_count,
+            "kis_temp_error_raw_log_count": kis_temp_error_raw_log_count,
+            "kis_temp_error_sequence_count": kis_temp_error_sequence_count or temp_error_count,
+            "kis_temp_error_recovered_sequence_count": kis_temp_error_recovered_sequence_count,
+            "kis_temp_error_unrecovered_sequence_count": kis_temp_error_unrecovered_sequence_count,
+            "kis_balance_temp_error_count": kis_temp_error_sequence_count or temp_error_count,
             "kis_balance_temp_recovered_count": temp_recovered_count,
             "skip_zero_snapshot_count": skip_zero_snapshot_count,
             "balance_reconcile_degraded": balance_circuit["balance_reconcile_degraded"],
@@ -1791,11 +1926,20 @@ def run_trade_session(
             "recovery_run": _safe_int_env("US_RECOVERY_RUN", 0),
             "missed_trade_window": os.getenv("US_MISSED_TRADE_WINDOW", "0") in {"1", "true", "True"},
             "kis_temp_errors": {
-                "total": sum(v.get("temp_error", 0) for v in kis_temp_errors_by_api.values()),
-                "recovered": sum(v.get("recovered", 0) for v in kis_temp_errors_by_api.values()),
-                "unrecovered": sum(v.get("unrecovered", 0) for v in kis_temp_errors_by_api.values()),
+                "total": kis_temp_error_raw_log_count,
+                "recovered": kis_temp_error_recovered_sequence_count,
+                "unrecovered": kis_temp_error_unrecovered_sequence_count,
                 "by_api": kis_temp_errors_by_api,
             },
+            "kis_temp_error_by_endpoint": {k: int(v.get("temp_error", 0) or 0) for k, v in kis_temp_errors_by_api.items()},
+            "kis_temp_error_by_session": {session: kis_temp_error_raw_log_count},
+            "kis_temp_error_order_endpoint_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("temp_error", 0) or 0),
+            "kis_temp_error_price_endpoint_count": int((kis_temp_errors_by_api.get("GET_price") or {}).get("temp_error", 0) or 0),
+            "kis_temp_error_balance_endpoint_count": int((kis_temp_errors_by_api.get("GET_inquire-balance") or {}).get("temp_error", 0) or 0),
+            "kis_temp_error_fill_endpoint_count": int((kis_temp_errors_by_api.get("GET_inquire-ccnl") or {}).get("temp_error", 0) or 0),
+            "order_submit_temp_error_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("temp_error", 0) or 0),
+            "order_submit_temp_error_recovered_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("recovered", 0) or 0),
+            "order_submit_temp_error_unrecovered_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("unrecovered", 0) or 0),
             # 추가 필드
             "expected_min_ticks": expected_min_ticks,
             "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),

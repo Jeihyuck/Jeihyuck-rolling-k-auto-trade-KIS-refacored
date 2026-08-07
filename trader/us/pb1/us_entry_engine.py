@@ -606,12 +606,12 @@ def generate_entry_intents(
             if has_pending_order_for_symbol_side(symbol=symbol, side="BUY", trade_date=_resolve_us_trade_date(now)):
                 position_state = "PENDING_BUY"
                 track_skip(symbol, "pending_order")
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=%s action=SKIP_PENDING_BUY", symbol, position_state)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=%s candidate_action=SKIP_PENDING_BUY", symbol, position_state)
                 continue
             if has_pending_order_for_symbol_side(symbol=symbol, side="SELL", trade_date=_resolve_us_trade_date(now)):
                 position_state = "PENDING_SELL"
                 track_skip(symbol, "pending_order")
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=%s action=SKIP_PENDING_SELL", symbol, position_state)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=%s candidate_action=SKIP_PENDING_SELL", symbol, position_state)
                 continue
             if position_state == "NOT_HELD" and has_position(symbol):
                 position_state = "HELD"
@@ -876,21 +876,21 @@ def generate_entry_intents(
             min_add_pnl = float(os.getenv("US_ADD_MIN_PNL_PCT", "0.0") or 0.0)
             if not allow_add:
                 track_skip(symbol, "add_to_existing_disabled")
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_DISABLED", symbol)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_ADD_DISABLED", symbol)
                 continue
             held_snapshot = _load_held_position_snapshot(symbol, provider=provider)
             pnl_pct = _held_pnl_pct(held_snapshot, current_price=price)
             if pnl_pct is None:
                 track_skip(symbol, "add_pnl_unknown")
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_PNL_UNKNOWN", symbol)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_ADD_PNL_UNKNOWN", symbol)
                 continue
             if pnl_pct < 0 and not allow_avg_down:
                 track_skip(symbol, "no_averaging_down")
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_NO_AVERAGING_DOWN", symbol)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_NO_AVERAGING_DOWN", symbol)
                 continue
             if pnl_pct < min_add_pnl:
                 track_skip(symbol, "add_min_pnl_not_met")
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_MIN_PNL pnl_pct=%.4f", symbol, pnl_pct)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_ADD_MIN_PNL pnl_pct=%.4f", symbol, pnl_pct)
                 continue
             max_add_count = int(os.getenv("US_MAX_ADD_COUNT_PER_SYMBOL", "2") or 2)
             add_count = int(
@@ -902,7 +902,7 @@ def generate_entry_intents(
             if add_count >= max_add_count:
                 track_skip(symbol, "max_add_count_reached")
                 logger.info(
-                    "[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_MAX_ADD_COUNT add_count=%d max_add_count=%d",
+                    "[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_MAX_ADD_COUNT add_count=%d max_add_count=%d",
                     symbol, add_count, max_add_count,
                 )
                 continue
@@ -918,10 +918,10 @@ def generate_entry_intents(
                 if reason in {"full_weight", "weight_unknown", "max_symbol_weight_reached"}:
                     action = "SKIP_FULL_WEIGHT" if reason in {"full_weight", "max_symbol_weight_reached"} else "SKIP_ADD_WEIGHT_UNKNOWN"
                     track_skip(symbol, reason)
-                    logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=%s current_weight=%s", symbol, action, sizing.get("current_weight"))
+                    logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=%s current_weight=%s", symbol, action, sizing.get("current_weight"))
                     continue
                 track_skip(symbol, reason)
-                logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=SKIP_ADD_SIZING reason=%s", symbol, reason)
+                logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=SKIP_ADD_SIZING reason=%s", symbol, reason)
                 continue
             qty = sizing["qty"]
             notional = sizing["notional_usd"]
@@ -932,7 +932,7 @@ def generate_entry_intents(
                 or _as_float_or_none(held_snapshot.get("eval_amount_usd"))
                 or (qty_held * price)
             )
-            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=HELD action=ADD_BUY reason=pyramid_allowed position_action=%s pnl_pct=%.4f current_weight=%.4f projected_weight=%.4f", symbol, position_action, pnl_pct, sizing.get("current_weight", 0.0), sizing.get("projected_weight", 0.0))
+            logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=HELD candidate_action=ADD_BUY reason=pyramid_allowed position_action=%s pnl_pct=%.4f current_weight=%.4f projected_weight=%.4f", symbol, position_action, pnl_pct, sizing.get("current_weight", 0.0), sizing.get("projected_weight", 0.0))
         else:
             sizing = calc_position_size(
                 price=price,
@@ -967,7 +967,7 @@ def generate_entry_intents(
             sizing["projected_weight"] = risk_clamp.get("projected_weight", 0.0)
             sizing["max_symbol_weight"] = risk_clamp.get("max_position_weight")
             sizing["allowed_notional"] = risk_clamp.get("allowed_notional")
-            logger.info("[US_ENTRY_DECISION] symbol=%s position_state=NOT_HELD action=NEW_BUY position_action=%s", symbol, position_action)
+            logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=NOT_HELD candidate_action=NEW_BUY position_action=%s", symbol, position_action)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
 
@@ -1187,6 +1187,13 @@ def generate_entry_intents(
                     break
                 continue
             intent = getattr(decision, "resized_intent", None) or intent
+        logger.info(
+            "[US_ENTRY_INTENT_CREATED] symbol=%s side=BUY qty=%s estimated_notional=%.4f position_action=%s",
+            symbol,
+            qty,
+            float(notional or 0.0),
+            position_action,
+        )
         intents.append(intent)
         added_count += 1
         if diagnostics is not None:
