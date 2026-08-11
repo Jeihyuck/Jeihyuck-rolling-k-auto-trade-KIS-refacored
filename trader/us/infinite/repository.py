@@ -100,6 +100,16 @@ class InfiniteRepository:
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
 
+    def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
+        with self.engine.connect() as conn:
+            return bool(conn.execute(text("""
+                SELECT 1 FROM us_orders
+                WHERE symbol=:symbol
+                  AND status IN ('INTENT','SUBMITTED','ACK','PENDING','PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
+                  AND client_order_key LIKE 'TQQQ_INF_V3:%'
+                LIMIT 1
+            """), {"symbol": symbol}).first())
+
     def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
         start = state.cycle_start_date or trading_date

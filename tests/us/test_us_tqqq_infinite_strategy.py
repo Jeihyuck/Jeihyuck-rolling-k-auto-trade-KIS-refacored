@@ -129,3 +129,24 @@ def test_corrupt_state_fails_closed(state):
 def test_orphan_broker_position_fails_closed():
     result = decide(None, PositionSnapshot(qty=1, average_price=50, price=50))
     assert (result.action, result.reason) == (Action.BLOCK, "orphan_position")
+
+
+def test_pause_blocks_buy_but_keeps_take_profit_sell():
+    paused = InfiniteConfig(enabled=True, real_order=True, allow_buy=False, allow_sell=True)
+    state = InfiniteState(cycle_id="c", status=Status.ACTIVE)
+    buy = evaluate(config=paused, state=state,
+                   position=PositionSnapshot(qty=1, average_price=50, price=50),
+                   trading_date=TODAY, overlay=NORMAL)
+    sell = evaluate(config=paused, state=state,
+                    position=PositionSnapshot(qty=3, average_price=50, price=55),
+                    trading_date=TODAY, overlay=NORMAL)
+    assert (buy.action, buy.reason) == (Action.BLOCK, "buy_permission_paused")
+    assert (sell.action, sell.qty) == (Action.SELL, 3)
+
+
+def test_sell_permission_can_be_independently_disabled():
+    config = InfiniteConfig(enabled=True, allow_buy=False, allow_sell=False)
+    result = evaluate(config=config, state=InfiniteState(cycle_id="c", status=Status.ACTIVE),
+                      position=PositionSnapshot(qty=3, average_price=50, price=55),
+                      trading_date=TODAY, overlay=NORMAL)
+    assert (result.action, result.reason) == (Action.BLOCK, "sell_permission_disabled")

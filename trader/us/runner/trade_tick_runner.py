@@ -1811,13 +1811,15 @@ def run_trade_tick(
     except Exception as _cluster_guard_exc:
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
 
-    # When enabled, TQQQ belongs exclusively to the isolated Infinite sleeve.
-    # OFF is a strict no-op: no filtering, evaluation, DB access, or order path.
+    # Infinite evaluation/mutation is a strict no-op while disabled. Ownership
+    # evidence is still read so an open/pending Infinite position cannot leak
+    # into the legacy strategy after the kill switch is used.
     from trader.us.infinite.config import InfiniteConfig as _InfiniteConfig
-    from trader.us.infinite.integration import owns_symbol as _infinite_owns_symbol
+    from trader.us.infinite.integration import legacy_ownership_reserved as _legacy_tqqq_reserved
     _infinite_config = _InfiniteConfig.from_env()
-    if _infinite_config.enabled:
-        exit_intents = [i for i in exit_intents if not _infinite_owns_symbol(i.get("symbol"), _infinite_config)]
+    _infinite_reserved = _legacy_tqqq_reserved(positions=current_positions, config=_infinite_config)
+    if _infinite_reserved:
+        exit_intents = [i for i in exit_intents if str(i.get("symbol") or "").upper() != _infinite_config.symbol]
 
     # Suppress at intent generation (rather than only in the router) so all
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
@@ -2192,9 +2194,11 @@ def run_trade_tick(
                     raw_watchlist_count = len(watchlist_rows)
                     # symbol별 best row로 dedupe
                     watchlist_rows = _dedupe_watchlist_best_by_symbol(watchlist_rows)
-                    if _infinite_config.enabled:
+                    if _infinite_reserved:
                         from trader.us.infinite.integration import exclude_owned
-                        watchlist_rows = exclude_owned(watchlist_rows, _infinite_config)
+                        watchlist_rows = exclude_owned(
+                            watchlist_rows, _infinite_config, reserved=_infinite_reserved,
+                        )
                     
                     # ── Quality Contract 검증 (hard gate) ──────────────────────
                     from trader.us.watchlist_quality import validate_us_locked_watchlist_quality, format_us_watchlist_error_message

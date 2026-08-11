@@ -20,11 +20,41 @@ def owns_symbol(symbol: str, config: InfiniteConfig | None = None) -> bool:
     return bool(config.enabled and str(symbol or "").upper().strip() == config.symbol)
 
 
-def exclude_owned(rows: list[dict], config: InfiniteConfig | None = None) -> list[dict]:
+def legacy_ownership_reserved(*, positions: list[dict], config: InfiniteConfig | None = None,
+                              repository: InfiniteRepository | None = None) -> bool:
+    """Keep open/pending Infinite TQQQ out of legacy even after the kill switch."""
     config = config or InfiniteConfig.from_env()
-    if not config.enabled:
+    if config.enabled:
+        return True
+    broker_has_tqqq = any(
+        str(p.get("symbol") or p.get("code") or "").upper() == config.symbol
+        and _position(p, 0).qty > 0 for p in positions or []
+    )
+    try:
+        repository = repository or InfiniteRepository()
+        if repository.has_pending_infinite_order(config.symbol):
+            return True
+        if not broker_has_tqqq:
+            return False
+        repository.ensure_schema()
+        state = repository.load_state(symbol=config.symbol)
+        return bool(state and state.cycle_id and state.total_filled_notional > 0)
+    except Exception as exc:
+        # With an open broker position and uncertain ownership, never transfer it.
+        if broker_has_tqqq:
+            logger.warning("[TQQQ_INF][OWNERSHIP][RESERVED] reason=ownership_uncertain error=%s", exc)
+        return True
+
+
+def exclude_owned(rows: list[dict], config: InfiniteConfig | None = None,
+                  *, reserved: bool | None = None) -> list[dict]:
+    config = config or InfiniteConfig.from_env()
+    if not (config.enabled if reserved is None else reserved):
         return rows
-    return [row for row in rows if not owns_symbol(row.get("symbol") or row.get("code"), config)]
+    return [
+        row for row in rows
+        if str(row.get("symbol") or row.get("code") or "").upper().strip() != config.symbol
+    ]
 
 
 def _position(raw: dict | None, price: float) -> PositionSnapshot:

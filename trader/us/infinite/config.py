@@ -24,8 +24,10 @@ def _int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class InfiniteConfig:
-    enabled: bool = False
-    real_order: bool = False
+    enabled: bool = True
+    real_order: bool = True
+    allow_buy: bool = True
+    allow_sell: bool = True
     symbol: str = "TQQQ"
     total_capital_usd: float = 10_000.0
     core_capital_usd: float = 7_500.0
@@ -42,7 +44,8 @@ class InfiniteConfig:
     def from_env(cls) -> "InfiniteConfig":
         prefix = "US_TQQQ_INFINITE_"
         return cls(
-            enabled=_bool(prefix + "ENABLED"), real_order=_bool(prefix + "REAL_ORDER"),
+            enabled=_bool(prefix + "ENABLED", True), real_order=_bool(prefix + "REAL_ORDER", True),
+            allow_buy=_bool(prefix + "ALLOW_BUY", True), allow_sell=_bool(prefix + "ALLOW_SELL", True),
             symbol=os.getenv(prefix + "SYMBOL", "TQQQ").upper().strip() or "TQQQ",
             total_capital_usd=_float(prefix + "TOTAL_CAPITAL_USD", 10_000),
             core_capital_usd=_float(prefix + "CORE_CAPITAL_USD", 7_500),

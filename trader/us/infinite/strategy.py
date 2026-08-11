@@ -28,6 +28,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     # EXIT is evaluated before every BUY pause and remains active during age/DD pauses.
     target = position.average_price * (1 + config.take_profit_pct)
     if position.qty > 0 and position.average_price > 0 and position.price + 1e-9 >= target:
+        if not config.allow_sell:
+            return Decision(Action.BLOCK, "sell_permission_disabled")
         if pending_sell:
             return Decision(Action.BLOCK, "pending_sell", next_status=Status.EXIT_PENDING)
         return Decision(Action.SELL, "take_profit", qty=position.qty,
@@ -42,6 +44,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "pending_sell")
     if pending_buy:
         return Decision(Action.BLOCK, "pending_buy")
+    if not config.allow_buy:
+        return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
         return Decision(Action.BLOCK, "daily_buy_limit")
     if state.cycle_age_trading_days > config.max_cycle_age_trading_days:

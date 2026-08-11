@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
-from trader.us.infinite.integration import exclude_owned, run_sleeve
+from trader.us.infinite.config import InfiniteConfig
+from trader.us.infinite.integration import exclude_owned, legacy_ownership_reserved, run_sleeve
 from trader.us.infinite.models import InfiniteState
 from trader.us.infinite.repository import InfiniteRepository
 
@@ -16,12 +17,13 @@ class FakeRepository:
     def load_state(self, **_): self.loads += 1; return self.state
     def save_state(self, state): self.saves += 1; self.state = state
     def pending_sides(self, *_): return False, False
+    def has_pending_infinite_order(self, *_): return False
     def fill_accounting(self, *_): return 0, 0, 0, None, None
     def reconcile_metadata(self, state, **_): return state
 
 
-def test_off_is_strict_no_db_no_router(monkeypatch):
-    monkeypatch.delenv("US_TQQQ_INFINITE_ENABLED", raising=False)
+def test_explicit_kill_is_strict_no_db_no_router(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")
     repo = FakeRepository()
     routed = []
     result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11), overlay={},
@@ -103,3 +105,69 @@ def test_reserved_cycle_does_not_adopt_unattributed_broker_position(monkeypatch)
     )
     assert result["decision"].reason == "orphan_position"
     assert result["orders"] == []
+
+
+def test_production_defaults_are_normal_mode(monkeypatch):
+    for suffix in ("ENABLED", "REAL_ORDER", "ALLOW_BUY", "ALLOW_SELL"):
+        monkeypatch.delenv(f"US_TQQQ_INFINITE_{suffix}", raising=False)
+    config = InfiniteConfig.from_env()
+    assert config.enabled and config.real_order and config.allow_buy and config.allow_sell
+
+
+def test_explicit_environment_zero_overrides_default_on(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "0")
+    config = InfiniteConfig.from_env()
+    assert not config.enabled and not config.real_order
+
+
+def test_disabled_open_infinite_position_remains_reserved_from_legacy(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")
+    state = InfiniteState(cycle_id="owned", core_filled_notional=250)
+    reserved = legacy_ownership_reserved(
+        positions=[{"symbol": "TQQQ", "qty": 2}], repository=FakeRepository(state)
+    )
+    assert reserved
+    assert exclude_owned([{"symbol": "TQQQ"}, {"symbol": "AAPL"}], reserved=reserved) == [{"symbol": "AAPL"}]
+
+
+def test_disabled_pending_infinite_order_remains_reserved_from_legacy(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")
+    repo = FakeRepository()
+    repo.has_pending_infinite_order = lambda *_: True
+    assert legacy_ownership_reserved(positions=[], repository=repo)
+
+
+def test_default_on_missing_table_blocks_only_sleeve(monkeypatch):
+    for suffix in ("ENABLED", "REAL_ORDER"):
+        monkeypatch.delenv(f"US_TQQQ_INFINITE_{suffix}", raising=False)
+    repo = FakeRepository()
+    repo.ensure_schema = lambda: (_ for _ in ()).throw(RuntimeError("state table missing"))
+    routed = []
+    result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
+                        overlay={"market_state": "NORMAL"}, repository=repo, route=routed.append)
+    assert result["status"] == "BLOCK" and routed == []
+
+
+def test_pause_reconciles_blocks_buy_and_routes_existing_exit(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_ALLOW_BUY", "0")
+    monkeypatch.setenv("US_TQQQ_INFINITE_ALLOW_SELL", "1")
+    buy_repo = FakeRepository(InfiniteState())
+    buy = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
+                     overlay={"market_state": "NORMAL"}, repository=buy_repo)
+    assert buy["decision"].reason == "buy_permission_paused"
+    assert buy_repo.saves > 0  # state/reconcile lifecycle remains active
+
+    owned = InfiniteState(cycle_id="owned", cycle_start_date=date(2026, 8, 1),
+                          core_filled_notional=250)
+    routed = []
+    def route(intent): routed.append(intent); return {"status": "ACK", "intent": intent}
+    sell = run_sleeve(
+        positions=[{"symbol": "TQQQ", "qty": 3, "avg_price": 50, "current_price": 55}],
+        price=55, trading_date=date(2026, 8, 11), overlay={"market_state": "NORMAL"},
+        repository=FakeRepository(owned), route=route,
+    )
+    assert sell["decision"].action.value == "SELL"
+    assert len(routed) == 1
