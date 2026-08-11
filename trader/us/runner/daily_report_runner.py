@@ -240,6 +240,7 @@ def _apply_regime_session_summary(report: dict, session_summary: dict | None) ->
         "kis_temp_error_balance_endpoint_count", "kis_temp_error_fill_endpoint_count",
         "order_submit_temp_error_count", "order_submit_temp_error_recovered_count",
         "order_submit_temp_error_unrecovered_count",
+        "temporary_error_count", "recovered_count", "unrecovered_count", "endpoint_breakdown",
     ):
         if key in session_summary:
             report[key] = session_summary.get(key)
@@ -413,6 +414,8 @@ def run_daily_report(
         "session_orders_ack": 0,
         "session_orders_rejected": 0,
         "orders_submitted_total": 0,
+        "session_orders_submitted": 0,
+        "daily_orders_submitted_total": 0,
         "orders_sent_total": 0,
         "orders_ack_total": 0,
         "orders_balance_confirmed_total": 0,
@@ -434,6 +437,11 @@ def run_daily_report(
         "cash_exhausted": False,
         "buy_notional_total": 0.0,
         "sell_notional_total": 0.0,
+        "session_buy_notional": 0.0,
+        "session_sell_notional": 0.0,
+        "daily_buy_notional_total": 0.0,
+        "daily_sell_notional_total": 0.0,
+        "daily_fills_total": 0,
         "actual_new_positions": 0,
         "open_position_count": 0,
         "account_equity_krw": 0.0,
@@ -504,6 +512,10 @@ def run_daily_report(
         "order_submit_temp_error_count": 0,
         "order_submit_temp_error_recovered_count": 0,
         "order_submit_temp_error_unrecovered_count": 0,
+        "temporary_error_count": 0,
+        "recovered_count": 0,
+        "unrecovered_count": 0,
+        "endpoint_breakdown": {},
         "real_broker_buys": 0,
         "real_broker_sells": 0,
         "synthetic_reconcile_buys": 0,
@@ -794,6 +806,11 @@ def run_daily_report(
                 fill_breakdown = load_us_fills_breakdown(trade_date)
                 report.update(fill_breakdown)
                 report["fills"] = fill_breakdown["fills_count"]
+                # A close-session report is daily-cumulative.  Authoritative
+                # fills outrank a zero-order close tick for counts/notional.
+                report["daily_fills_total"] = fill_breakdown["fills_count"]
+                report["daily_buy_notional_total"] = fill_breakdown["real_broker_buy_notional"]
+                report["daily_sell_notional_total"] = fill_breakdown["real_broker_sell_notional"]
                 logger.info(
                     "[US_DAILY_REPORT][ORDER_COUNTS] submitted=%d ack=%d balance_confirmed=%d sent_total=%d fills=%d",
                     report["orders_submitted_total"], report["orders_ack_total"],
@@ -909,6 +926,18 @@ def run_daily_report(
             # Canonical daily counts come from US order rows for submitted/ACK and unique fills for executions.
             report["orders_ack"] = db_ack
             report["orders_ack_total"] = db_ack
+            report["daily_orders_submitted_total"] = max(
+                int(report.get("orders_sent_total") or 0),
+                int(report.get("orders_ack_total") or 0),
+                int(report.get("daily_fills_total") or 0),
+            )
+            report["session_orders_submitted"] = int(report.get("session_orders_sent") or 0)
+            report["session_buy_notional"] = float(report.get("session_buy_notional_routed") or 0.0)
+            report["session_sell_notional"] = float(report.get("session_sell_notional_routed") or 0.0)
+            # Backward-compatible totals now carry the authoritative daily value.
+            report["orders_submitted_total"] = report["daily_orders_submitted_total"]
+            report["buy_notional_total"] = report["daily_buy_notional_total"]
+            report["sell_notional_total"] = report["daily_sell_notional_total"]
             report["fill_api_count"] = reconciled["fill_api_count"]
             report["balance_confirmed_count"] = reconciled["balance_confirmed_count"]
             logger.info("[US_DAILY_REPORT][ORDER_SOURCES] db_orders=%s fills=%s balance_confirmed=%s router_summary=%s", db_ack, fill_count, balance_confirmed, router_summary)
@@ -1153,11 +1182,18 @@ def run_daily_report(
         f"| canonical_order_source | {(report.get('canonical_sources') or {}).get('canonical_order_source', '')} |",
         f"| canonical_position_source | {(report.get('canonical_sources') or {}).get('canonical_position_source', '')} |",
         f"| orders_submitted_total | {report.get('orders_submitted_total', 0)} |",
+        f"| session_orders_submitted | {report.get('session_orders_submitted', 0)} |",
+        f"| daily_orders_submitted_total | {report.get('daily_orders_submitted_total', 0)} |",
         f"| orders_ack_total | {report.get('orders_ack_total', 0)} |",
         f"| orders_rejected_total | {report.get('orders_rejected_total', 0)} |",
         f"| orders_unresolved_total | {report.get('orders_unresolved_total', 0)} |",
         f"| buy_notional_total | {report.get('buy_notional_total', 0)} |",
         f"| sell_notional_total | {report.get('sell_notional_total', 0)} |",
+        f"| session_buy_notional | {report.get('session_buy_notional', 0)} |",
+        f"| session_sell_notional | {report.get('session_sell_notional', 0)} |",
+        f"| daily_buy_notional_total | {report.get('daily_buy_notional_total', 0)} |",
+        f"| daily_sell_notional_total | {report.get('daily_sell_notional_total', 0)} |",
+        f"| daily_fills_total | {report.get('daily_fills_total', 0)} |",
         f"| actual_new_positions | {report.get('actual_new_positions', 0)} |",
         f"| open_position_count | {report.get('open_position_count', 0)} |",
         f"| account_equity_krw | {report.get('account_equity_krw', 0)} |",
@@ -1385,6 +1421,8 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         "accounting_confirmed_order_count": 0,
         "physical_fill_row_count": 0,
         "accounting_active_fill_count": 0,
+        "real_broker_buy_notional": 0.0,
+        "real_broker_sell_notional": 0.0,
         "superseded_synthetic_row_count": 0,
     }
     engine = _get_engine_or_none()
@@ -1395,21 +1433,27 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         rows = _read_autocommit(
             engine,
             """
-            SELECT side, order_no, COALESCE(meta->>'fill_evidence_type','') AS evidence_type,
+            SELECT side, symbol, order_no, client_order_key, fill_idempotency_key,
+              qty, price_usd, COALESCE(meta->>'fill_evidence_type','') AS evidence_type,
               COALESCE((meta->>'is_synthetic')::boolean,(meta->>'synthetic')::boolean,
                        (meta->>'synthetic_fill')::boolean,false) AS is_synthetic,
               COALESCE((meta->>'accounting_active')::boolean,true) AS accounting_active,
-              COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source, COUNT(*) AS n
+              COALESCE(meta->>'fill_source', meta->>'source', '') AS fill_source
             FROM us_fills
             WHERE trade_date = :td
-            GROUP BY side, order_no, evidence_type, is_synthetic, accounting_active, COALESCE(meta->>'fill_source', meta->>'source', '')
             """,
             {"td": trade_date},
         )
+        unique_rows = {}
         for row in rows:
+            identity = str(row.get("fill_idempotency_key") or "").strip()
+            if not identity:
+                identity = "|".join(str(row.get(k) or "").strip().upper() for k in ("order_no", "client_order_key", "symbol", "side"))
+            unique_rows.setdefault(identity, row)
+        for row in unique_rows.values():
             side = str(row.get("side") or "").upper()
             source = str(row.get("fill_source") or "").lower()
-            n = int(row.get("n") or 0)
+            n = 1
             result["physical_fill_row_count"] += n
             evidence = str(row.get("evidence_type") or "")
             is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
@@ -1428,11 +1472,15 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
                 result["legacy_synthetic_fill_count"] += n
             if side == "BUY":
                 result["synthetic_reconcile_buys" if is_synthetic else "real_broker_buys"] += n
+                if not is_synthetic:
+                    result["real_broker_buy_notional"] += float(row.get("qty") or 0) * float(row.get("price_usd") or 0)
             elif side == "SELL":
                 result["synthetic_reconcile_sells" if is_synthetic else "real_broker_sells"] += n
+                if not is_synthetic:
+                    result["real_broker_sell_notional"] += float(row.get("qty") or 0) * float(row.get("price_usd") or 0)
         actual_orders = set()
         synthetic_orders = set()
-        for row in rows:
+        for row in unique_rows.values():
             evidence = str(row.get("evidence_type") or "")
             accounting_active = row.get("accounting_active") is not False
             is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
