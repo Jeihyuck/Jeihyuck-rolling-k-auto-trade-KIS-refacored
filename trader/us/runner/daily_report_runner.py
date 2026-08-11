@@ -1446,15 +1446,25 @@ def load_us_fills_breakdown(trade_date: str) -> dict:
         )
         unique_rows = {}
         for row in rows:
+            # Physical rows are a storage diagnostic, not an accounting count:
+            # retain every persisted/grouped row even when execution identity
+            # deduplication below collapses it for fills_count.
+            result["physical_fill_row_count"] += int(row.get("n") or 1)
+            evidence = str(row.get("evidence_type") or "")
+            is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
             identity = str(row.get("fill_idempotency_key") or "").strip()
             if not identity:
+                # Synthetic balance evidence and an actual KIS execution can
+                # legitimately share one broker order number.  They are
+                # different evidence rows; only repeated evidence of the same
+                # class is a duplicate.
                 identity = "|".join(str(row.get(k) or "").strip().upper() for k in ("order_no", "client_order_key", "symbol", "side"))
+                identity += "|SYNTHETIC" if is_synthetic else "|ACTUAL"
             unique_rows.setdefault(identity, row)
         for row in unique_rows.values():
             side = str(row.get("side") or "").upper()
             source = str(row.get("fill_source") or "").lower()
-            n = 1
-            result["physical_fill_row_count"] += n
+            n = int(row.get("n") or 1)
             evidence = str(row.get("evidence_type") or "")
             is_synthetic = (bool(row.get("is_synthetic")) or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
             accounting_active = row.get("accounting_active") is not False
