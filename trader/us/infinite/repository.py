@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, replace
+from datetime import date, datetime, timezone
+from typing import Any
+
+from sqlalchemy import text
+
+from trader.db.engine import get_engine
+
+from .models import InfiniteState, Status
+
+logger = logging.getLogger(__name__)
+
+_PENDING = {"INTENT", "SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING", "ACK_DB_FAILED"}
+
+
+class StateCorruptionError(RuntimeError):
+    pass
+
+
+class InfiniteRepository:
+    """TQQQ metadata access using the shared PostgreSQL engine only."""
+
+    def __init__(self, engine=None):
+        self.engine = engine or get_engine()
+
+    def ensure_schema(self) -> None:
+        """Lightweight runtime readiness probe; migrations never run in a tick."""
+        with self.engine.connect() as conn:
+            exists = conn.execute(text("SELECT to_regclass('public.us_tqqq_infinite_state')")).scalar()
+        if not exists:
+            raise RuntimeError("TQQQ Infinite state table unavailable")
+        logger.info("[TQQQ_INF][DB] status=READY table=us_tqqq_infinite_state")
+
+    def load_state(self, strategy_id: str = "TQQQ_INFINITE_V3", symbol: str = "TQQQ") -> InfiniteState | None:
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT * FROM us_tqqq_infinite_state
+                    WHERE strategy_id=:strategy_id AND symbol=:symbol
+                """), {"strategy_id": strategy_id, "symbol": symbol}).mappings().first()
+            if row is None:
+                return None
+            metadata = row.get("metadata") or {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            state = InfiniteState(
+                strategy_id=row["strategy_id"], symbol=row["symbol"], cycle_id=row.get("cycle_id"),
+                cycle_start_date=row.get("cycle_start_date"), cycle_complete_date=row.get("cycle_complete_date"),
+                anchor_price=float(row["anchor_price"]) if row.get("anchor_price") is not None else None,
+                core_filled_notional=float(row.get("core_filled_notional") or 0),
+                reserve_filled_notional=float(row.get("reserve_filled_notional") or 0),
+                last_buy_date=row.get("last_buy_date"), last_exit_date=row.get("last_exit_date"),
+                market_crash_streak=int(row.get("market_crash_streak") or 0),
+                material_market_crash=bool(row.get("material_market_crash")),
+                reserve_unlocked=bool(row.get("reserve_unlocked")),
+                cycle_age_trading_days=int(row.get("cycle_age_trading_days") or 0),
+                status=Status(str(row.get("status"))), metadata=metadata, version=int(row.get("version") or 1),
+            )
+            return state.validate()
+        except Exception as exc:
+            raise StateCorruptionError(str(exc)) from exc
+
+    def save_state(self, state: InfiniteState) -> None:
+        state.validate()
+        payload = asdict(state)
+        payload["status"] = state.status.value
+        payload["metadata"] = json.dumps(state.metadata, default=str)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO us_tqqq_infinite_state (
+                    strategy_id,symbol,cycle_id,cycle_start_date,cycle_complete_date,anchor_price,
+                    core_filled_notional,reserve_filled_notional,last_buy_date,last_exit_date,
+                    market_crash_streak,material_market_crash,reserve_unlocked,cycle_age_trading_days,
+                    status,metadata,version,updated_at
+                ) VALUES (
+                    :strategy_id,:symbol,:cycle_id,:cycle_start_date,:cycle_complete_date,:anchor_price,
+                    :core_filled_notional,:reserve_filled_notional,:last_buy_date,:last_exit_date,
+                    :market_crash_streak,:material_market_crash,:reserve_unlocked,:cycle_age_trading_days,
+                    :status,CAST(:metadata AS jsonb),:version,NOW()
+                ) ON CONFLICT (strategy_id,symbol) DO UPDATE SET
+                    cycle_id=EXCLUDED.cycle_id,cycle_start_date=EXCLUDED.cycle_start_date,
+                    cycle_complete_date=EXCLUDED.cycle_complete_date,anchor_price=EXCLUDED.anchor_price,
+                    core_filled_notional=EXCLUDED.core_filled_notional,
+                    reserve_filled_notional=EXCLUDED.reserve_filled_notional,last_buy_date=EXCLUDED.last_buy_date,
+                    last_exit_date=EXCLUDED.last_exit_date,market_crash_streak=EXCLUDED.market_crash_streak,
+                    material_market_crash=EXCLUDED.material_market_crash,reserve_unlocked=EXCLUDED.reserve_unlocked,
+                    cycle_age_trading_days=EXCLUDED.cycle_age_trading_days,status=EXCLUDED.status,
+                    metadata=EXCLUDED.metadata,version=us_tqqq_infinite_state.version+1,updated_at=NOW()
+            """), payload)
+
+    def pending_sides(self, trade_date: date, symbol: str = "TQQQ") -> tuple[bool, bool]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT side,status FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol
+            """), {"trade_date": trade_date, "symbol": symbol}).mappings()
+            sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
+        return "BUY" in sides, "SELL" in sides
+
+    def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
+        with self.engine.connect() as conn:
+            return bool(conn.execute(text("""
+                SELECT 1 FROM us_orders
+                WHERE symbol=:symbol
+                  AND status IN ('INTENT','SUBMITTED','ACK','PENDING','PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
+                  AND client_order_key LIKE 'TQQQ_INF_V3:%'
+                LIMIT 1
+            """), {"symbol": symbol}).first())
+
+    def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
+        """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
+        start = state.cycle_start_date or trading_date
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
+                       f.client_order_key,f.order_no,
+                       i.strategy AS intent_strategy,i.meta AS intent_meta,
+                       o.meta AS order_meta
+                FROM us_fills f
+                LEFT JOIN us_order_intents i
+                  ON i.client_order_key=f.client_order_key
+                LEFT JOIN us_orders o
+                  ON o.client_order_key=f.client_order_key
+                WHERE f.symbol=:symbol AND f.trade_date>=:start
+                ORDER BY f.trade_date,f.filled_at,f.created_at
+            """), {"symbol": state.symbol, "start": start}).mappings().all()
+        return self._summarize_fill_rows(rows, state, trading_date)
+
+    @classmethod
+    def _summarize_fill_rows(cls, rows: list[Any], state: InfiniteState,
+                             trading_date: date) -> tuple[float, float, float, date | None, float | None]:
+        buys = daily = sells = 0.0
+        last_buy = None
+        anchor = None
+        for row in rows:
+            if not cls._belongs_to_cycle(row, state):
+                continue
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try: meta = json.loads(meta)
+                except ValueError: meta = {}
+            if meta.get("accounting_active") is False:
+                continue
+            notional = float(row.get("qty") or 0) * float(row.get("price_usd") or 0)
+            side = str(row.get("side") or "").upper()
+            if side == "BUY":
+                buys += notional
+                last_buy = row["trade_date"]
+                anchor = anchor or float(row.get("price_usd") or 0) or None
+                if row["trade_date"] == trading_date:
+                    daily += notional
+            elif side == "SELL":
+                sells += notional
+        return buys, daily, sells, last_buy, anchor
+
+    @staticmethod
+    def _json_object(value: Any) -> dict:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                return {}
+        return {}
+
+    @classmethod
+    def _belongs_to_cycle(cls, row: Any, state: InfiniteState) -> bool:
+        """Strict attribution: identity plus persisted strategy/book/cycle evidence."""
+        if not state.cycle_id:
+            return False
+        key = str(row.get("client_order_key") or "")
+        expected_prefix = f"TQQQ_INF_V3:{state.cycle_id}:"
+        if not key.startswith(expected_prefix):
+            return False
+        fill_meta = cls._json_object(row.get("meta"))
+        intent_meta = cls._json_object(row.get("intent_meta"))
+        order_meta = cls._json_object(row.get("order_meta"))
+        metadata = (fill_meta, intent_meta, order_meta)
+        strategy_ok = str(row.get("intent_strategy") or "") == "TQQQ_INFINITE_V3" or any(
+            str(meta.get("strategy") or "") == "TQQQ_INFINITE_V3" for meta in metadata
+        )
+        book_ok = any(str(meta.get("book") or "") == "TQQQ_INFINITE" for meta in metadata)
+        cycle_ok = any(str(meta.get("cycle_id") or "") == state.cycle_id for meta in metadata)
+        return strategy_ok and book_ok and cycle_ok
+
+    def reconcile_metadata(self, state: InfiniteState, *, trading_date: date, broker_qty: int,
+                           broker_average_price: float, core_cap: float) -> InfiniteState:
+        buys, _daily, _sells, last_buy, first_price = self.fill_accounting(state, trading_date)
+        core = min(buys, core_cap)
+        reserve = max(0.0, buys - core)
+        anchor = state.anchor_price or first_price or (broker_average_price if broker_qty > 0 else None)
+        age = state.cycle_age_trading_days
+        if state.cycle_start_date:
+            from datetime import timedelta
+            from trader.us.market_calendar import is_us_trading_day
+            cursor = state.cycle_start_date
+            age = 0
+            while cursor < trading_date:
+                cursor += timedelta(days=1)
+                age += int(is_us_trading_day(cursor))
+        if state.status == Status.EXIT_PENDING and broker_qty == 0:
+            return replace(state, status=Status.COMPLETE, cycle_complete_date=trading_date,
+                           last_exit_date=trading_date, anchor_price=None, core_filled_notional=0,
+                           reserve_filled_notional=0, reserve_unlocked=False, market_crash_streak=0,
+                           cycle_age_trading_days=age)
+        return replace(state, core_filled_notional=core, reserve_filled_notional=reserve,
+                       last_buy_date=last_buy or state.last_buy_date, anchor_price=anchor,
+                       cycle_age_trading_days=age)

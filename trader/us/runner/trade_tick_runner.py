@@ -1811,6 +1811,16 @@ def run_trade_tick(
     except Exception as _cluster_guard_exc:
         logger.warning("[US_CLUSTER_GUARD][PORTFOLIO][WARN] error=%s", _cluster_guard_exc)
 
+    # Infinite evaluation/mutation is a strict no-op while disabled. Ownership
+    # evidence is still read so an open/pending Infinite position cannot leak
+    # into the legacy strategy after the kill switch is used.
+    from trader.us.infinite.config import InfiniteConfig as _InfiniteConfig
+    from trader.us.infinite.integration import legacy_ownership_reserved as _legacy_tqqq_reserved
+    _infinite_config = _InfiniteConfig.from_env()
+    _infinite_reserved = _legacy_tqqq_reserved(positions=current_positions, config=_infinite_config)
+    if _infinite_reserved:
+        exit_intents = [i for i in exit_intents if str(i.get("symbol") or "").upper() != _infinite_config.symbol]
+
     # Suppress at intent generation (rather than only in the router) so all
     # exit types -- profit, trailing, cluster, and defense trims -- stay quiet.
     exit_intents = _suppress_pending_sell_exit_intents(exit_intents, trade_date)
@@ -1830,6 +1840,36 @@ def run_trade_tick(
         buy_daily_notional = 0.0
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
+
+    infinite_result = {"status": "OFF", "orders": []}
+    if _infinite_config.enabled:
+        try:
+            from trader.us.infinite.integration import run_sleeve
+            from trader.us.execution.order_router import route_order as _route_infinite_order
+
+            def _route_infinite(intent: dict) -> dict:
+                return _route_infinite_order(
+                    intent,
+                    current_daily_notional_usd=buy_daily_notional,
+                    current_position_count=position_count,
+                    total_portfolio_usd=max(float(portfolio_equity_usd or effective_budget), 1000.0),
+                    available_cash_usd=float(available_cash_usd or 0.0),
+                    signal_only=False,
+                    kis_order_allowed=kis_order_allowed,
+                    allowed_symbols={_infinite_config.symbol},
+                    current_position_symbols=current_position_symbols,
+                    context=tick_context,
+                    now=now,
+                )
+
+            infinite_result = run_sleeve(
+                positions=current_positions, price=0.0, trading_date=now.date(),
+                overlay=market_state_overlay, route=_route_infinite,
+            )
+        except Exception as _infinite_exc:
+            # Defensive second boundary: sleeve failures never stop legacy US.
+            logger.exception("[TQQQ_INF][BLOCK] reason=runner_boundary_exception error=%s", _infinite_exc)
+            infinite_result = {"status": "BLOCK", "reason": "runner_boundary_exception", "orders": []}
     try:
         _final30_symbols_for_monitor = [r.get("symbol") for r in (locked_watchlist_cache or []) if isinstance(r, dict)]
         monitoring_universe = build_monitoring_universe(_final30_symbols_for_monitor, current_position_symbols)
@@ -1846,7 +1886,7 @@ def run_trade_tick(
         current_position_symbols=current_position_symbols,
         context=tick_context,
     )
-    orders = list(exit_route_result.get("orders", []))
+    orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1
 
@@ -2154,6 +2194,11 @@ def run_trade_tick(
                     raw_watchlist_count = len(watchlist_rows)
                     # symbol별 best row로 dedupe
                     watchlist_rows = _dedupe_watchlist_best_by_symbol(watchlist_rows)
+                    if _infinite_reserved:
+                        from trader.us.infinite.integration import exclude_owned
+                        watchlist_rows = exclude_owned(
+                            watchlist_rows, _infinite_config, reserved=_infinite_reserved,
+                        )
                     
                     # ── Quality Contract 검증 (hard gate) ──────────────────────
                     from trader.us.watchlist_quality import validate_us_locked_watchlist_quality, format_us_watchlist_error_message
