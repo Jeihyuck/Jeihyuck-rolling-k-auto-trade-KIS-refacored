@@ -84,7 +84,14 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         daily = 0.0
         if state is not None:
             _cycle, daily, _sells, _last, _anchor = repository.fill_accounting(state, trading_date)
-        decision = evaluate(config=config, state=state, position=broker, trading_date=trading_date,
+        # A reserved metadata row is not ownership evidence. If broker TQQQ
+        # exists without an attributed Infinite fill, treat it as an orphan.
+        decision_state = state
+        if broker.qty > 0 and (
+            state is None or state.total_filled_notional <= 0
+        ):
+            decision_state = None
+        decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay)
         logger.info("[TQQQ_INF][STATE] cycle_id=%s status=%s price=%s broker_qty=%s broker_avg=%s anchor=%s drawdown=%s cycle_age=%s core_filled=%s reserve_filled=%s market_state=%s market_reason=%s crash_streak=%s reserve_unlocked=%s pending_buy=%s pending_sell=%s",
@@ -95,8 +102,24 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     getattr(state, "reserve_unlocked", None), pending_buy, pending_sell)
         logger.info("[TQQQ_INF][DECISION] action=%s qty=%s notional=%.2f reason=%s shadow=%s",
                     decision.action.value, decision.qty, decision.notional, decision.reason, int(not config.real_order))
-        if state and decision.next_status and state.status != decision.next_status:
+        needs_new_cycle = bool(
+            decision.action == Action.BUY and state
+            and (not state.cycle_id or state.status == Status.COMPLETE)
+        )
+        if state and decision.next_status and state.status != decision.next_status and not needs_new_cycle:
             state = replace(state, status=decision.next_status)
+            repository.save_state(state)
+        if needs_new_cycle and state:
+            # Reserving a cycle identity is metadata only. Capital and ACTIVE
+            # state still require later broker/fill evidence.
+            state = replace(
+                state, cycle_id=str(uuid.uuid4()), cycle_start_date=trading_date,
+                cycle_complete_date=None, last_exit_date=state.last_exit_date,
+                anchor_price=None, core_filled_notional=0, reserve_filled_notional=0,
+                last_buy_date=None, market_crash_streak=0, material_market_crash=False,
+                reserve_unlocked=False, cycle_age_trading_days=0, status=Status.READY,
+                metadata={},
+            )
             repository.save_state(state)
         if not config.real_order or decision.action not in {Action.BUY, Action.SELL}:
             return {"status": "SHADOW" if not config.real_order else decision.action.value,
@@ -107,12 +130,13 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "symbol": config.symbol, "exchange": broker.exchange or "NASDAQ", "side": decision.action.value,
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,
             "trade_date": trading_date.isoformat(),
-            "client_order_key": f"TQQQ_INF_V3:{trading_date.isoformat()}:{decision.action.value}",
+            "client_order_key": f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{decision.action.value}",
             "strategy": "TQQQ_INFINITE_V3", "position_action": "ADD_TO_EXISTING_BUY" if broker.qty else "NEW_POSITION_BUY",
             "reason": "TAKE_PROFIT_TQQQ_INFINITE" if decision.action == Action.SELL else decision.reason,
             "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason,
                      "position_action": "ADD_TO_EXISTING_BUY" if broker.qty else "NEW_POSITION_BUY",
-                     "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE"},
+                     "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE",
+                     "cycle_id": state.cycle_id},
         }
         result = route(intent)
         return {"status": result.get("status", "UNKNOWN"), "decision": decision, "orders": [result]}

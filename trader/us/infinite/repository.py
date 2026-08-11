@@ -28,8 +28,7 @@ class InfiniteRepository:
         self.engine = engine or get_engine()
 
     def ensure_schema(self) -> None:
-        from trader.db.migrate import run_migrations
-        run_migrations(self.engine)
+        """Lightweight runtime readiness probe; migrations never run in a tick."""
         with self.engine.connect() as conn:
             exists = conn.execute(text("SELECT to_regclass('public.us_tqqq_infinite_state')")).scalar()
         if not exists:
@@ -106,14 +105,29 @@ class InfiniteRepository:
         start = state.cycle_start_date or trading_date
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT trade_date,side,qty,price_usd,meta FROM us_fills
-                WHERE symbol=:symbol AND trade_date>=:start
-                ORDER BY trade_date,filled_at,created_at
+                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,
+                       f.client_order_key,f.order_no,
+                       i.strategy AS intent_strategy,i.meta AS intent_meta,
+                       o.meta AS order_meta
+                FROM us_fills f
+                LEFT JOIN us_order_intents i
+                  ON i.client_order_key=f.client_order_key
+                LEFT JOIN us_orders o
+                  ON o.client_order_key=f.client_order_key
+                WHERE f.symbol=:symbol AND f.trade_date>=:start
+                ORDER BY f.trade_date,f.filled_at,f.created_at
             """), {"symbol": state.symbol, "start": start}).mappings().all()
+        return self._summarize_fill_rows(rows, state, trading_date)
+
+    @classmethod
+    def _summarize_fill_rows(cls, rows: list[Any], state: InfiniteState,
+                             trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         buys = daily = sells = 0.0
         last_buy = None
         anchor = None
         for row in rows:
+            if not cls._belongs_to_cycle(row, state):
+                continue
             meta = row.get("meta") or {}
             if isinstance(meta, str):
                 try: meta = json.loads(meta)
@@ -131,6 +145,38 @@ class InfiniteRepository:
             elif side == "SELL":
                 sells += notional
         return buys, daily, sells, last_buy, anchor
+
+    @staticmethod
+    def _json_object(value: Any) -> dict:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                return {}
+        return {}
+
+    @classmethod
+    def _belongs_to_cycle(cls, row: Any, state: InfiniteState) -> bool:
+        """Strict attribution: identity plus persisted strategy/book/cycle evidence."""
+        if not state.cycle_id:
+            return False
+        key = str(row.get("client_order_key") or "")
+        expected_prefix = f"TQQQ_INF_V3:{state.cycle_id}:"
+        if not key.startswith(expected_prefix):
+            return False
+        fill_meta = cls._json_object(row.get("meta"))
+        intent_meta = cls._json_object(row.get("intent_meta"))
+        order_meta = cls._json_object(row.get("order_meta"))
+        metadata = (fill_meta, intent_meta, order_meta)
+        strategy_ok = str(row.get("intent_strategy") or "") == "TQQQ_INFINITE_V3" or any(
+            str(meta.get("strategy") or "") == "TQQQ_INFINITE_V3" for meta in metadata
+        )
+        book_ok = any(str(meta.get("book") or "") == "TQQQ_INFINITE" for meta in metadata)
+        cycle_ok = any(str(meta.get("cycle_id") or "") == state.cycle_id for meta in metadata)
+        return strategy_ok and book_ok and cycle_ok
 
     def reconcile_metadata(self, state: InfiniteState, *, trading_date: date, broker_qty: int,
                            broker_average_price: float, core_cap: float) -> InfiniteState:
