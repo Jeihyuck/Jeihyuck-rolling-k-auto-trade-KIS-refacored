@@ -1949,6 +1949,13 @@ def run_trade_session(
             "order_submit_temp_error_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("temp_error", 0) or 0),
             "order_submit_temp_error_recovered_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("recovered", 0) or 0),
             "order_submit_temp_error_unrecovered_count": int((kis_temp_errors_by_api.get("POST_order") or {}).get("unrecovered", 0) or 0),
+            # Stable report contract. Endpoint details retain the retry
+            # subsystem's sequence-level accounting; only an unrecovered order
+            # endpoint error is escalated by existing safety classification.
+            "temporary_error_count": kis_temp_error_sequence_count,
+            "recovered_count": kis_temp_error_recovered_sequence_count,
+            "unrecovered_count": kis_temp_error_unrecovered_sequence_count,
+            "endpoint_breakdown": kis_temp_errors_by_api,
             # 추가 필드
             "expected_min_ticks": expected_min_ticks,
             "liveness_status": "FAILED" if (session in {"am", "afternoon"} and actual_is_trading_day and tick_count == 0) else ("FAILED_EARLY_TERMINATION" if (expected_min_ticks and tick_count < expected_min_ticks and final_status == "FAILED") else "OK"),
