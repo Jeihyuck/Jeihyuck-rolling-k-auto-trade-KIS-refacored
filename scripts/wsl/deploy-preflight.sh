@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Shared production deployment contract. Source this after changing to APP_DIR.
-# It deliberately does not fetch: code synchronization is an explicit, locked
-# deployment operation (sync-market-code.sh), never a trading-job side effect.
+# The first real entry into each market/day invokes the locked synchronizer.
+# Existing scheduler entries therefore remain unchanged; later sessions only
+# verify the pin and never fetch/reset the source tree.
 
 deploy_preflight() {
   local expected actual branch head origin_head status dirty_code dirty_generated severity result=OK reason=none
-  local log_dir log_file wrapper market session trade_date pin_dir pin_file pinned_sha diff_status
+  local log_dir log_file wrapper market session trade_date pin_dir pin_file pinned_sha diff_status pre_sync_sha post_sync_sha
   expected="${NULLIM_RESOLVED_REPO_ROOT:-}"
   actual="$(pwd -P)"
   wrapper="${NULLIM_WRAPPER:-${BASH_SOURCE[1]:-unknown}}"
@@ -27,12 +28,32 @@ deploy_preflight() {
     result=FAIL; reason=PATH_MISMATCH; echo "[DEPLOY][PATH_MISMATCH][FAIL] expected=${expected} actual=${actual}"; _preflight_log; return 1
   fi
   echo "[DEPLOY][GIT] branch=${branch} head=${head} origin_dual_agent=${origin_head}"
-  if [[ "$branch" != "dual-agent" && "${ALLOW_STALE_CODE:-0}" != "1" ]]; then
-    result=FAIL; reason=branch; echo "[DEPLOY][STALE_CODE][FAIL] reason=branch branch=${branch} expected=dual-agent"; _preflight_log; return 1
-  fi
   pin_dir="$actual/runtime/code-pins"
   pin_file="$pin_dir/${market^^}-${trade_date}.sha"
   mkdir -p "$pin_dir" || { result=FAIL; reason=pin_dir_unwritable; _preflight_log; return 1; }
+  # PREP is normally the first entry, but recovery or AM can safely bootstrap
+  # a missed cycle too. PREFLIGHT_ONLY is intentionally read-only for schedule
+  # verification and CI; every real wrapper invocation takes this path.
+  if [[ ! -s "$pin_file" && "${NULLIM_PREFLIGHT_ONLY:-0}" != "1" ]]; then
+    pre_sync_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "[DEPLOY][SYNC][AUTO] market=${market^^} session=$session trade_date=$trade_date source=existing_scheduler_chain"
+    if ! bash scripts/wsl/sync-market-code.sh "${market^^}" "$trade_date"; then
+      result=FAIL; reason=code_sync_failed; _preflight_log; return 1
+    fi
+    # reset --hard may have advanced the checkout; refresh every git fact.
+    branch="$(git branch --show-current 2>/dev/null || echo detached)"
+    head="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    origin_head="$(git rev-parse --short origin/dual-agent 2>/dev/null || echo unavailable)"
+    post_sync_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [[ "$pre_sync_sha" != "$post_sync_sha" && "${NULLIM_CODE_SYNC_REEXEC:-0}" != "1" && -f "$wrapper" ]]; then
+      echo "[DEPLOY][SYNC][REEXEC] wrapper=$wrapper from=$pre_sync_sha to=$post_sync_sha"
+      export NULLIM_CODE_SYNC_REEXEC=1
+      exec bash "$wrapper"
+    fi
+  fi
+  if [[ "$branch" != "dual-agent" && "${ALLOW_STALE_CODE:-0}" != "1" ]]; then
+    result=FAIL; reason=branch; echo "[DEPLOY][STALE_CODE][FAIL] reason=branch branch=${branch} expected=dual-agent"; _preflight_log; return 1
+  fi
   if [[ -s "$pin_file" ]]; then
     pinned_sha="$(tr -d '[:space:]' < "$pin_file")"
     if [[ "$pinned_sha" != "$(git rev-parse HEAD)" ]]; then
@@ -40,6 +61,9 @@ deploy_preflight() {
       echo "[SESSION][CODE_VERSION][FAIL] market=${market^^} trade_date=$trade_date branch=dual-agent commit=$head pinned=$pinned_sha reason=PINNED_SHA_MISMATCH"
       _preflight_log; return 1
     fi
+  elif [[ "${NULLIM_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+    pinned_sha="$(git rev-parse HEAD)"
+    echo "[SESSION][CODE_VERSION][CHECK_ONLY] market=${market^^} trade_date=$trade_date branch=dual-agent commit=$pinned_sha"
   else
     git rev-parse HEAD > "$pin_file" || { result=FAIL; reason=pin_write_failed; _preflight_log; return 1; }
     pinned_sha="$(git rev-parse HEAD)"

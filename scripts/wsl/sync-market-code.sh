@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Internal implementation of deploy-preflight; it is not a scheduled job.
 # Controlled once-per-market-cycle synchronization. Runtime artifacts are never cleaned.
 set -euo pipefail
 market="${1^^}"; trade_date="${2:-$(date +%F)}"
@@ -20,7 +21,9 @@ if [[ -s "$pin" ]]; then
   exit 0
 fi
 git fetch origin dual-agent
-git checkout dual-agent
+# Tracked local residue is deliberately discarded here: GitHub is the source
+# of truth. -f never removes untracked runtime data (unlike forbidden clean).
+git checkout -f -B dual-agent origin/dual-agent
 git reset --hard origin/dual-agent
 sha="$(git rev-parse HEAD)"; printf '%s\n' "$sha" > "$pin"
 echo "[SESSION][CODE_VERSION] market=$market trade_date=$trade_date branch=dual-agent commit=$sha"
