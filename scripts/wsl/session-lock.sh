@@ -27,24 +27,8 @@ PY
       printf '[SESSION][DUPLICATE][SKIP] market=%s session=%s\n' "$market" "$session" >>"$log_file"
       return 75
     fi
-    printf '[LOCK][STALE][DETECTED] reason=HELD_BY_UNEXPECTED_PROCESS lock=%s\n' "$lock_file" >>"$log_file"
-    # The unexpected holder owns the old inode. Replacing its directory entry
-    # lets trading recover without signalling or terminating that process.
-    if rm -f -- "$lock_file"; then
-      printf '[LOCK][STALE][REMOVED] lock=%s\n' "$lock_file" >>"$log_file"
-      flock -u "$NULLIM_SESSION_LOCK_FD" 2>/dev/null || true
-      eval "exec ${NULLIM_SESSION_LOCK_FD}>&-"
-      unset NULLIM_SESSION_LOCK_FD
-      nullim_session_lock_acquire "$lock_file" "$market" "$session" "$trade_date" "$log_file"
-      return $?
-    fi
-    printf '[LOCK][STALE][REMOVE_FAILED][WARN] lock=%s action=CONTINUE_WITH_RECOVERY_LOCK\n' "$lock_file" >>"$log_file"
-    lock_file="${lock_file}.recovery-${market}-${session}"
-    flock -u "$NULLIM_SESSION_LOCK_FD" 2>/dev/null || true
-    eval "exec ${NULLIM_SESSION_LOCK_FD}>&-"
-    unset NULLIM_SESSION_LOCK_FD
-    nullim_session_lock_acquire "$lock_file" "$market" "$session" "$trade_date" "$log_file"
-    return $?
+    printf '[LOCK][HELD][OWNER_UNVERIFIED][WARN] market=%s session=%s lock=%s action=SAFE_SKIP\n' "$market" "$session" "$lock_file" >>"$log_file"
+    return 76
   fi
 
   # Once flock is held no live owner exists. Classify any prior contents before replacing them.
@@ -78,7 +62,7 @@ PY
   fi
   NULLIM_SESSION_LOCK_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4())')"
   export NULLIM_SESSION_LOCK_FD NULLIM_SESSION_LOCK_TOKEN NULLIM_SESSION_LOCK_FILE="$lock_file"
-  python3 - "$NULLIM_SESSION_LOCK_FD" "$$" "$NULLIM_SESSION_LOCK_TOKEN" "$market" "$session" "$trade_date" "${0}" <<'PY'
+  python3 - "$NULLIM_SESSION_LOCK_FD" "$$" "$NULLIM_SESSION_LOCK_TOKEN" "$market" "$session" "$trade_date" "${0}" <<'PY' || {
 import json, os, sys
 fd,pid,token,market,session,day,command=sys.argv[1:]
 data={'pid':int(pid),'owner_token':token,'market':market,'session':session,'trade_date':day,
@@ -87,6 +71,12 @@ data={'pid':int(pid),'owner_token':token,'market':market,'session':session,'trad
 os.lseek(int(fd),0,os.SEEK_SET); os.ftruncate(int(fd),0)
 os.write(int(fd),(json.dumps(data,separators=(',',':'))+'\n').encode()); os.fsync(int(fd))
 PY
+    local metadata_rc=$?
+    flock -u "$NULLIM_SESSION_LOCK_FD" 2>/dev/null || true
+    eval "exec ${NULLIM_SESSION_LOCK_FD}>&-" 2>/dev/null || true
+    unset NULLIM_SESSION_LOCK_FD NULLIM_SESSION_LOCK_TOKEN NULLIM_SESSION_LOCK_FILE
+    return "$metadata_rc"
+  }
   [[ "$had_file" == 0 ]] || printf '[LOCK][STALE][REMOVED] lock=%s action=METADATA_REPLACED\n' "$lock_file" >>"$log_file"
   printf '[LOCK][ACQUIRED] market=%s session=%s lock=%s\n' "$market" "$session" "$lock_file" >>"$log_file"
 }

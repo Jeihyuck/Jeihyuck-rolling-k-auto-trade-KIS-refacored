@@ -31,6 +31,8 @@ idempotency remain hard protections and are not replaced by file locks.
 | session manifest `*.lock` | Manifest writer / kernel releases flock | Atomic manifest update only | Unlocked file is harmless | No trading preflight effect |
 
 Legacy empty/plain-PID/owner-sidecar files are accepted as inputs but classified
-as stale. Cleanup never signals another PID and never removes metadata whose
+as stale only after their flock is acquired. A held flock is never unlinked or
+bypassed: verified same-session owners return 75 and unverified owners safely
+skip with return 76. Cleanup never signals another PID and never removes metadata whose
 owner token has changed. `SIGINT`, `SIGTERM`, errors, and normal exits flow
 through the session finalizer; `SIGKILL` is recovered on the next acquisition.

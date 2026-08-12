@@ -34,12 +34,21 @@ if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
   echo "[KR_CLOSE][LOCK_DELEGATED] external caller owns duplicate prevention lock=${lock_file}"
 else
   source scripts/wsl/session-lock.sh
-  if ! nullim_session_lock_acquire "${lock_file}" KR "close" "$NULLIM_TRADE_DATE" "$NULLIM_SESSION_LOG"; then
+  set +e
+nullim_session_lock_acquire "${lock_file}" KR "close" "$NULLIM_TRADE_DATE" "$NULLIM_SESSION_LOG"
+lock_rc=$?
+set -e
+case "$lock_rc" in
+  0) ;;
+  75|76)
     export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
-    kr_duplicate_result "${lock_file}" "close"
     exit 0
-  fi
-fi
+    ;;
+  *)
+    echo "[LOCK][ACQUIRE][FAIL] rc=$lock_rc lock=${LOCK_FILE:-${lock_file:-unknown}}" >&2
+    exit "$lock_rc"
+    ;;
+esac
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 nullim_reassert_repo_root "${BASH_SOURCE[0]}"
 APP_DIR="$NULLIM_RESOLVED_REPO_ROOT"
