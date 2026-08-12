@@ -9,7 +9,9 @@ long-position SELL trims/profit-capture intents.
 from __future__ import annotations
 
 import logging
+import math
 import os
+import statistics
 from datetime import datetime, timezone
 from typing import Any
 
@@ -152,8 +154,38 @@ def _ret_from_rows(rows: Any, days: int) -> float | None:
     return (latest / past) - 1.0 if past else None
 
 
+def calculate_qqq_long_context(closes: list[float]) -> dict[str, Any]:
+    """Pure completed-close context shared by production overlay and replay."""
+    out = {
+        "qqq_completed_close": closes[-1] if closes else None,
+        "qqq_20d_return": closes[-1] / closes[-21] - 1 if len(closes) >= 21 else None,
+        "qqq_ma50": sum(closes[-50:]) / 50 if len(closes) >= 50 else None,
+        "qqq_ma200": sum(closes[-200:]) / 200 if len(closes) >= 200 else None,
+        "qqq_ma200_slope": None, "qqq_252d_high": None, "qqq_drawdown_252": None,
+        "qqq_realized_vol_20d": None, "qqq_trend_efficiency_20d": None,
+        "tqqq_context_quality": "insufficient",
+    }
+    if len(closes) >= 220:
+        out["qqq_ma200_slope"] = out["qqq_ma200"] - sum(closes[-220:-20]) / 200
+    if len(closes) >= 252:
+        high = max(closes[-252:]); out["qqq_252d_high"] = high
+        out["qqq_drawdown_252"] = closes[-1] / high - 1 if high else None
+    if len(closes) >= 21:
+        window = closes[-21:]
+        returns = [window[i] / window[i - 1] - 1 for i in range(1, len(window))]
+        out["qqq_realized_vol_20d"] = statistics.stdev(returns) * math.sqrt(252)
+        travel = sum(abs(window[i] - window[i - 1]) for i in range(1, len(window)))
+        out["qqq_trend_efficiency_20d"] = abs(window[-1] - window[0]) / travel if travel else 0.0
+    if all(out[k] is not None for k in ("qqq_ma50", "qqq_ma200", "qqq_ma200_slope",
+                                         "qqq_drawdown_252", "qqq_realized_vol_20d",
+                                         "qqq_trend_efficiency_20d")):
+        out["tqqq_context_quality"] = "ok"
+    return out
+
+
 def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict[str, float | None]:
     out: dict[str, float | None] = {}
+    qqq_closes: list[float] = []
     for sym, exchange in _MARKET_RETURN_EXCHANGE_MAP.items():
         rows = None
         try:
@@ -176,6 +208,8 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
         if any(_row_date_value(r) for r in clean_rows):
             clean_rows.sort(key=lambda r: _row_date_value(r) or "00000000")
         out[f"{sym.lower()}_previous_close"] = _row_close_value(clean_rows[-1]) if clean_rows else None
+        if sym == "QQQ":
+            qqq_closes = [v for v in (_row_close_value(row) for row in clean_rows) if v is not None]
 
     spy3 = out.get("spy_3d_return")
     spy20 = out.get("spy_20d_return")
@@ -202,6 +236,9 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
     out["cyclical_relative_strength_20d"] = (sum(x for x in cyc20 if x is not None) / max(1, sum(x is not None for x in cyc20)) - (spy20 or 0)) if any(x is not None for x in cyc20) else None
     out["cyclical_vs_spy_20d"] = out["cyclical_relative_strength_20d"]
     out["ai_relative_strength"] = out["smh_vs_spy_3d"]
+    # Additive Infinite context.  These values use the same completed QQQ rows
+    # already fetched above and therefore perform no extra provider/HTTP call.
+    out.update(calculate_qqq_long_context(qqq_closes))
     return out
 
 

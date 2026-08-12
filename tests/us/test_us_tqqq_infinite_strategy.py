@@ -25,7 +25,7 @@ def test_no_position_first_buy_is_one_unit_or_less():
     assert (result.action, result.qty, result.notional) == (Action.BUY, 5, 250)
 
 
-@pytest.mark.parametrize(("price", "action"), [(51.5, Action.BUY), (51.51, Action.WAIT)])
+@pytest.mark.parametrize(("price", "action"), [(50, Action.BUY), (50.01, Action.WAIT)])
 def test_average_buy_premium(price, action):
     result = decide(InfiniteState(cycle_id="c", status=Status.ACTIVE),
                     PositionSnapshot(qty=10, average_price=50, price=price))
@@ -72,7 +72,7 @@ def test_same_day_restart_after_exit_blocks_but_next_day_can_start():
 def test_cap_that_cannot_fit_whole_share_blocks():
     state = InfiniteState(cycle_id="c", status=Status.ACTIVE, core_filled_notional=7_500,
                           reserve_filled_notional=2_480, reserve_unlocked=True,
-                          material_market_crash=True)
+                          material_market_crash=True, metadata={"long_trend": "RECOVERY"})
     result = decide(state, PositionSnapshot(qty=1, average_price=50, price=50))
     assert result.reason == "unit_cannot_buy_whole_share"
 
@@ -83,13 +83,13 @@ def test_core_exhaustion_does_not_automatically_unlock_reserve():
 
 
 def test_partial_fill_accounting_leaves_actual_cap_available():
-    state = InfiniteState(cycle_id="c", status=Status.ACTIVE, core_filled_notional=7_400)
+    state = InfiniteState(cycle_id="c", status=Status.ACTIVE, core_filled_notional=4_900)
     result = decide(state, PositionSnapshot(qty=1, average_price=50, price=50))
-    assert result.notional == 100  # actual fills, not the prior requested $250
+    assert result.notional == 250  # accounting uses fills and never exceeds one unit
 
 
 @pytest.mark.parametrize(("overlay", "allow", "reason"), [
-    ({"market_state": "MARKET_CRASH"}, True, "market_crash_limited"),
+    ({"market_state": "DEFENSE_CRASH_CONFIRMED"}, False, "crash_confirmed_buy_block"),
     ({"market_state": "ACCOUNT_CRASH"}, False, "account_crash"),
     ({"market_state": "DEGRADED_DATA"}, False, "data_or_system_risk"),
     ({"market_state": "ALIEN"}, False, "unknown_market_risk"),
@@ -100,20 +100,20 @@ def test_market_risk_classification(overlay, allow, reason):
     assert (result.allow_buy, result.reason) == (allow, reason)
 
 
-@pytest.mark.parametrize(("streak", "action"), [(0, Action.BUY), (1, Action.BUY), (2, Action.BLOCK)])
-def test_market_crash_only_allows_two_trading_days(streak, action):
+@pytest.mark.parametrize("streak", [0, 1, 2])
+def test_market_crash_always_blocks_buy(streak):
     state = InfiniteState(cycle_id="c", status=Status.ACTIVE, market_crash_streak=streak,
                           material_market_crash=bool(streak))
     result = evaluate(config=CFG, state=state, position=PositionSnapshot(qty=1, average_price=50, price=50),
-                      trading_date=TODAY, overlay={"market_state": "MARKET_CRASH"})
-    assert result.action == action
+                      trading_date=TODAY, overlay={"market_state": "DEFENSE_CRASH_CONFIRMED"})
+    assert result.action == Action.BLOCK
 
 
-def test_drawdown_and_age_pause_buy_but_not_sell():
+def test_drawdown_and_age_hard_pauses_removed_but_sell_stays_first():
     dd = InfiniteState(cycle_id="c", status=Status.ACTIVE, anchor_price=100)
-    assert decide(dd, PositionSnapshot(qty=1, average_price=100, price=70)).reason == "drawdown_pause"
+    assert decide(dd, PositionSnapshot(qty=1, average_price=100, price=70)).reason != "drawdown_pause"
     aged = replace(dd, anchor_price=50, cycle_age_trading_days=121)
-    assert decide(aged, PositionSnapshot(qty=1, average_price=50, price=50)).reason == "cycle_age_pause"
+    assert decide(aged, PositionSnapshot(qty=1, average_price=50, price=50)).reason != "cycle_age_pause"
     assert decide(aged, PositionSnapshot(qty=1, average_price=50, price=55)).action == Action.SELL
 
 
