@@ -24,6 +24,7 @@ def _int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class InfiniteConfig:
+    policy_version: str = "ADAPTIVE_RUNWAY_V2"
     enabled: bool = True
     real_order: bool = True
     allow_buy: bool = True
@@ -39,6 +40,21 @@ class InfiniteConfig:
     take_profit_pct: float = 0.10
     drawdown_pause_pct: float = -0.30
     max_cycle_age_trading_days: int = 120
+    routine_core_usd: float = 5_000.0
+    deep_bear_unlock_drawdown: float = -0.15
+    capital_preservation_drawdown: float = -0.30
+    capital_preservation_core_used: float = 7_000.0
+    chop_rv20_min: float = 0.35
+    chop_efficiency_max: float = 0.25
+    bear_step: float = 0.05
+    chop_step: float = 0.075
+    capital_preservation_step: float = 0.10
+    bear_gap: int = 7
+    bear_fallback_gap: int = 10
+    chop_gap: int = 7
+    capital_preservation_gap: int = 15
+    rebound_cooldown: int = 3
+    recovery_confirmation_days: int = 2
 
     @classmethod
     def from_env(cls) -> "InfiniteConfig":
@@ -57,6 +73,20 @@ class InfiniteConfig:
             take_profit_pct=_float(prefix + "TAKE_PROFIT_PCT", .10),
             drawdown_pause_pct=_float(prefix + "DRAWDOWN_PAUSE_PCT", -.30),
             max_cycle_age_trading_days=_int(prefix + "MAX_CYCLE_AGE_TRADING_DAYS", 120),
+            policy_version=os.getenv(prefix + "POLICY_VERSION", "ADAPTIVE_RUNWAY_V2"),
+            routine_core_usd=_float(prefix + "ROUTINE_CORE_USD", 5_000),
+            deep_bear_unlock_drawdown=_float(prefix + "DEEP_BEAR_UNLOCK_DRAWDOWN", -.15),
+            capital_preservation_drawdown=_float(prefix + "CAPITAL_PRESERVATION_DRAWDOWN", -.30),
+            capital_preservation_core_used=_float(prefix + "CAPITAL_PRESERVATION_CORE_USED", 7_000),
+            chop_rv20_min=_float(prefix + "CHOP_RV20_MIN", .35),
+            chop_efficiency_max=_float(prefix + "CHOP_EFFICIENCY_MAX", .25),
+            bear_step=_float(prefix + "BEAR_STEP", .05), chop_step=_float(prefix + "CHOP_STEP", .075),
+            capital_preservation_step=_float(prefix + "CAPITAL_PRESERVATION_STEP", .10),
+            bear_gap=_int(prefix + "BEAR_GAP", 7), bear_fallback_gap=_int(prefix + "BEAR_FALLBACK_GAP", 10),
+            chop_gap=_int(prefix + "CHOP_GAP", 7),
+            capital_preservation_gap=_int(prefix + "CAPITAL_PRESERVATION_GAP", 15),
+            rebound_cooldown=_int(prefix + "REBOUND_COOLDOWN", 3),
+            recovery_confirmation_days=_int(prefix + "RECOVERY_CONFIRMATION_DAYS", 2),
         )
 
     def validate(self) -> None:

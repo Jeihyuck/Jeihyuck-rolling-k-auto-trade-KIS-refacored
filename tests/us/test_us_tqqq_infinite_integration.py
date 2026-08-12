@@ -59,6 +59,18 @@ def test_order_mode_uses_injected_existing_router_once(monkeypatch):
     assert routed[0]["meta"]["cycle_id"]
 
 
+def test_invalid_or_stale_quote_never_reaches_router(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    for price, extra in ((0, {}), (float("nan"), {}), (50, {"tqqq_quote_stale": True})):
+        routed = []
+        result = run_sleeve(positions=[], price=price, trading_date=date(2026, 8, 11),
+                            overlay={"market_state": "NORMAL", **extra},
+                            repository=FakeRepository(InfiniteState()), route=routed.append)
+        assert result["reason"] == "tqqq_price_unavailable"
+        assert routed == []
+
+
 def test_enabled_ownership_filter_is_central_and_off_preserves_identity(monkeypatch):
     rows = [{"symbol": "AAPL"}, {"symbol": "TQQQ"}]
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")

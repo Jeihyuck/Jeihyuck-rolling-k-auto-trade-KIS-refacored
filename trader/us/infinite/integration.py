@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import replace
 from datetime import date
@@ -11,6 +12,7 @@ from .models import Action, InfiniteState, PositionSnapshot, Status
 from .repository import InfiniteRepository
 from .risk_adapter import assess_market_risk
 from .strategy import evaluate
+from .strategy import classify_long_trend
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,13 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
     if not config.enabled:
         return {"status": "OFF", "orders": []}
     try:
+        valid_quote = isinstance(price, (int, float)) and math.isfinite(float(price)) and float(price) > 0
+        quote_stale = bool(overlay.get("tqqq_quote_stale") or overlay.get("tqqq_quote_suspect"))
+        valid_quote = valid_quote and not quote_stale
+        logger.info("[TQQQ_INF][QUOTE] price=%s source=%s stale=%s valid=%s", price,
+                    overlay.get("tqqq_quote_source", "provider"), int(quote_stale), int(valid_quote))
+        if not valid_quote:
+            return {"status": "BLOCK", "reason": "tqqq_price_unavailable", "orders": []}
         repository = repository or InfiniteRepository()
         repository.ensure_schema()
         raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
@@ -93,6 +102,42 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
                                                   broker_average_price=broker.average_price,
                                                   core_cap=config.core_capital_usd)
+            metadata = dict(state.metadata or {})
+            today = trading_date.isoformat()
+            previous = str(metadata.get("long_trend") or "TRANSITION")
+            long_trend = classify_long_trend(overlay, bool(metadata.get("structural_bear_seen")))
+            if metadata.get("last_policy_eval_date") != today:
+                streak = int(metadata.get("recovery_streak") or 0)
+                if str(overlay.get("market_state")) in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"}:
+                    streak = 0
+                elif long_trend == "RECOVERY":
+                    streak += 1
+                else:
+                    streak = 0
+                metadata.update(previous_long_trend=previous, recovery_streak=streak,
+                                last_policy_eval_date=today)
+            structural = bool(metadata.get("structural_bear_seen")) or long_trend == "BEAR"
+            try:
+                dd = float(overlay.get("qqq_drawdown_252"))
+                rv, efficiency = float(overlay.get("qqq_realized_vol_20d")), float(overlay.get("qqq_trend_efficiency_20d"))
+            except (TypeError, ValueError):
+                dd, rv, efficiency = 0.0, 0.0, 1.0
+            chop = rv >= config.chop_rv20_min and efficiency <= config.chop_efficiency_max
+            cp = long_trend == "BEAR" and (dd <= config.capital_preservation_drawdown
+                 or state.cycle_age_trading_days >= config.max_cycle_age_trading_days
+                 or state.core_filled_notional >= config.capital_preservation_core_used)
+            remaining = max(0, int((config.max_total_capital_usd - state.total_filled_notional) // config.unit_usd))
+            gap = config.capital_preservation_gap if cp else (config.chop_gap if chop else config.bear_gap if long_trend == "BEAR" else 2)
+            metadata.update(policy_version=config.policy_version, long_trend=long_trend,
+                            structural_bear_seen=structural,
+                            deep_bear_unlocked=bool(metadata.get("deep_bear_unlocked")) or (long_trend == "BEAR" and dd <= config.deep_bear_unlock_drawdown),
+                            chop_high_vol=chop, capital_preservation=cp,
+                            remaining_units=remaining, estimated_runway_days=remaining * gap)
+            unlock = (state.core_filled_notional >= config.core_capital_usd and
+                      (state.material_market_crash or structural) and
+                      int(metadata.get("recovery_streak") or 0) >= config.recovery_confirmation_days and
+                      str(overlay.get("market_state")) not in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"})
+            state = replace(state, metadata=metadata, reserve_unlocked=state.reserve_unlocked or unlock)
             # A cycle becomes ACTIVE only from broker/fill evidence, never from
             # an order request or ACK (PostgreSQL and KIS are not one transaction).
             if broker.qty > 0 and state.core_filled_notional + state.reserve_filled_notional > 0 and not state.cycle_id:
@@ -124,6 +169,21 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay)
+        if state and decision.action == Action.BUY and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND":
+            state = replace(state, metadata={**state.metadata,
+                            "rebound_probe_date": trading_date.isoformat(),
+                            "rebound_cooldown_until": f"{config.rebound_cooldown}_trading_days"})
+            repository.save_state(state)
+        if decision.reason == "unknown_market_risk":
+            logger.warning("[TQQQ_INF][MARKET_STATE_CONTRACT_MISMATCH] market_state=%s", overlay.get("market_state"))
+        md = getattr(state, "metadata", {}) or {}
+        logger.info("[TQQQ_INF][POLICY] policy_version=%s market_state=%s market_regime=%s long_trend=%s qqq_drawdown_252=%s qqq_rv20=%s qqq_efficiency20=%s chop_high_vol=%s capital_preservation=%s broker_qty=%s broker_avg=%s tqqq_price=%s last_buy_fill_price=%s days_since_buy=%s core_filled=%s reserve_filled=%s remaining_units=%s reserve_unlocked=%s action=%s reason=%s",
+                    config.policy_version, overlay.get("market_state"), overlay.get("market_regime"), md.get("long_trend"),
+                    overlay.get("qqq_drawdown_252"), overlay.get("qqq_realized_vol_20d"), overlay.get("qqq_trend_efficiency_20d"),
+                    md.get("chop_high_vol"), md.get("capital_preservation"), broker.qty, broker.average_price, broker.price,
+                    md.get("last_buy_fill_price"), getattr(state, "cycle_age_trading_days", None), getattr(state, "core_filled_notional", None),
+                    getattr(state, "reserve_filled_notional", None), md.get("remaining_units"), getattr(state, "reserve_unlocked", None),
+                    decision.action.value, decision.reason)
         logger.info("[TQQQ_INF][STATE] cycle_id=%s status=%s price=%s broker_qty=%s broker_avg=%s anchor=%s drawdown=%s cycle_age=%s core_filled=%s reserve_filled=%s market_state=%s market_reason=%s crash_streak=%s reserve_unlocked=%s pending_buy=%s pending_sell=%s",
                     getattr(state, "cycle_id", None), getattr(getattr(state, "status", None), "value", None), broker.price, broker.qty, broker.average_price,
                     getattr(state, "anchor_price", None), (broker.price / state.anchor_price - 1 if state and state.anchor_price else None),
@@ -156,6 +216,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     "decision": decision, "orders": []}
         if route is None:
             return {"status": "BLOCK", "reason": "router_unavailable", "decision": decision, "orders": []}
+        if not math.isfinite(broker.price) or broker.price <= 0:
+            return {"status": "BLOCK", "reason": "tqqq_price_unavailable", "decision": decision, "orders": []}
         intent = {
             "symbol": config.symbol, "exchange": broker.exchange or "NASDAQ", "side": decision.action.value,
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,

@@ -58,7 +58,7 @@ class InfiniteState:
             raise ValueError("filled notional exceeds hard cap")
         if self.status not in {Status.READY, Status.COMPLETE} and not self.cycle_id:
             raise ValueError("active status without cycle")
-        if self.reserve_unlocked and not self.material_market_crash:
+        if self.reserve_unlocked and not (self.material_market_crash or self.metadata.get("structural_bear_seen")):
             raise ValueError("reserve unlocked without market crash")
         return self
 

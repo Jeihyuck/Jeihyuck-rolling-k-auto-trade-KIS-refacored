@@ -129,6 +129,31 @@ class InfiniteRepository:
             """), {"symbol": state.symbol, "start": start}).mappings().all()
         return self._summarize_fill_rows(rows, state, trading_date)
 
+    def cycle_fill_stats(self, state: InfiniteState, trading_date: date) -> dict[str, Any]:
+        """Extended fill diagnostics without changing ``fill_accounting``'s tuple contract."""
+        start = state.cycle_start_date or trading_date
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
+                       i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
+                FROM us_fills f LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
+                LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
+                WHERE f.symbol=:symbol AND f.trade_date>=:start
+                ORDER BY f.trade_date,f.filled_at,f.created_at
+            """), {"symbol": state.symbol, "start": start}).mappings().all()
+        summary = self._summarize_fill_rows(rows, state, trading_date)
+        last_price = None
+        for row in rows:
+            if self._belongs_to_cycle(row, state) and str(row.get("side") or "").upper() == "BUY":
+                meta = self._json_object(row.get("meta"))
+                if meta.get("accounting_active") is not False:
+                    value = float(row.get("price_usd") or 0)
+                    if value > 0:
+                        last_price = value
+        return {"total_buy_notional": summary[0], "daily_buy_notional": summary[1],
+                "total_sell_notional": summary[2], "last_buy_date": summary[3],
+                "first_fill_price": summary[4], "last_buy_fill_price": last_price}
+
     @classmethod
     def _summarize_fill_rows(cls, rows: list[Any], state: InfiniteState,
                              trading_date: date) -> tuple[float, float, float, date | None, float | None]:
@@ -190,7 +215,8 @@ class InfiniteRepository:
 
     def reconcile_metadata(self, state: InfiniteState, *, trading_date: date, broker_qty: int,
                            broker_average_price: float, core_cap: float) -> InfiniteState:
-        buys, _daily, _sells, last_buy, first_price = self.fill_accounting(state, trading_date)
+        stats = self.cycle_fill_stats(state, trading_date)
+        buys, last_buy, first_price = stats["total_buy_notional"], stats["last_buy_date"], stats["first_fill_price"]
         core = min(buys, core_cap)
         reserve = max(0.0, buys - core)
         anchor = state.anchor_price or first_price or (broker_average_price if broker_qty > 0 else None)
@@ -210,4 +236,5 @@ class InfiniteRepository:
                            cycle_age_trading_days=age)
         return replace(state, core_filled_notional=core, reserve_filled_notional=reserve,
                        last_buy_date=last_buy or state.last_buy_date, anchor_price=anchor,
-                       cycle_age_trading_days=age)
+                       cycle_age_trading_days=age,
+                       metadata={**state.metadata, "last_buy_fill_price": stats["last_buy_fill_price"]})

@@ -16,6 +16,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -27,6 +28,26 @@ logger = logging.getLogger(__name__)
 
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
+
+
+def _get_tqqq_tick_quote(provider: Any) -> tuple[float, str, bool]:
+    """Use the tick's shared provider exactly once and normalize its quote."""
+    quote = provider.get_current_price("TQQQ", "NASDAQ")
+    if isinstance(quote, dict):
+        raw = next((quote.get(k) for k in ("last", "price", "current_price", "ovrs_nmix_prpr")
+                    if quote.get(k) not in (None, "")), None)
+        stale = bool(quote.get("stale") or quote.get("suspect") or
+                     str(quote.get("quality") or "").lower() in {"stale", "suspect", "degraded"})
+        source = str(quote.get("source") or "USDataProvider")
+    else:
+        raw, stale, source = quote, False, "USDataProvider"
+    try:
+        price = float(str(raw).replace(",", ""))
+    except (TypeError, ValueError):
+        price = float("nan")
+    if not math.isfinite(price) or price <= 0:
+        price = 0.0
+    return price, source, stale
 
 def evaluate_balance_error_circuit(temp_error_count: int, recovered_count: int = 0,
                                    skip_zero_snapshot_count: int = 0,
@@ -1862,9 +1883,16 @@ def run_trade_tick(
                     now=now,
                 )
 
+            try:
+                _tqqq_price, _quote_source, _quote_stale = _get_tqqq_tick_quote(provider)
+            except Exception as _quote_exc:
+                logger.warning("[TQQQ_INF][QUOTE] price=0 source=USDataProvider stale=1 valid=0 error=%s", _quote_exc)
+                _tqqq_price, _quote_source, _quote_stale = 0.0, "USDataProvider", True
+            _infinite_overlay = {**market_state_overlay, "tqqq_quote_source": _quote_source,
+                                 "tqqq_quote_stale": _quote_stale}
             infinite_result = run_sleeve(
-                positions=current_positions, price=0.0, trading_date=now.date(),
-                overlay=market_state_overlay, route=_route_infinite,
+                positions=current_positions, price=_tqqq_price, trading_date=now.date(),
+                overlay=_infinite_overlay, route=_route_infinite,
             )
         except Exception as _infinite_exc:
             # Defensive second boundary: sleeve failures never stop legacy US.
