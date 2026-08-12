@@ -11,8 +11,7 @@ from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
 from .repository import InfiniteRepository
 from .risk_adapter import assess_market_risk
-from .strategy import evaluate
-from .strategy import classify_long_trend
+from .strategy import _trading_days_since, classify_long_trend, evaluate
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +100,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         if state is not None:
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
                                                   broker_average_price=broker.average_price,
-                                                  core_cap=config.core_capital_usd)
+                                                  core_cap=config.core_capital_usd,
+                                                  rebound_cooldown=config.rebound_cooldown)
             metadata = dict(state.metadata or {})
             today = trading_date.isoformat()
             previous = str(metadata.get("long_trend") or "TRANSITION")
@@ -151,9 +151,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                     material_market_crash=True,
                                     metadata={**state.metadata, "last_market_crash_date": trading_date.isoformat()})
             elif risk.verified_rebound:
-                unlock = state.core_filled_notional >= config.core_capital_usd and state.material_market_crash
-                state = replace(state, market_crash_streak=0, reserve_unlocked=state.reserve_unlocked or unlock,
-                                status=Status.RESERVE if unlock else (Status.ACTIVE if broker.qty else state.status))
+                # A rebound tick may permit one Core probe, but never unlocks
+                # Reserve. Reserve requires the completed-day recovery streak.
+                state = replace(state, market_crash_streak=0,
+                                status=Status.ACTIVE if broker.qty else state.status)
             repository.save_state(state)
         pending_buy, pending_sell = repository.pending_sides(trading_date, config.symbol)
         daily = 0.0
@@ -169,19 +170,15 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay)
-        if state and decision.action == Action.BUY and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND":
-            state = replace(state, metadata={**state.metadata,
-                            "rebound_probe_date": trading_date.isoformat(),
-                            "rebound_cooldown_until": f"{config.rebound_cooldown}_trading_days"})
-            repository.save_state(state)
         if decision.reason == "unknown_market_risk":
             logger.warning("[TQQQ_INF][MARKET_STATE_CONTRACT_MISMATCH] market_state=%s", overlay.get("market_state"))
         md = getattr(state, "metadata", {}) or {}
-        logger.info("[TQQQ_INF][POLICY] policy_version=%s market_state=%s market_regime=%s long_trend=%s qqq_drawdown_252=%s qqq_rv20=%s qqq_efficiency20=%s chop_high_vol=%s capital_preservation=%s broker_qty=%s broker_avg=%s tqqq_price=%s last_buy_fill_price=%s days_since_buy=%s core_filled=%s reserve_filled=%s remaining_units=%s reserve_unlocked=%s action=%s reason=%s",
+        days_since_buy = _trading_days_since(getattr(state, "last_buy_date", None), trading_date)
+        logger.info("[TQQQ_INF][POLICY] policy_version=%s market_state=%s market_regime=%s long_trend=%s qqq_drawdown_252=%s qqq_rv20=%s qqq_efficiency20=%s chop_high_vol=%s capital_preservation=%s broker_qty=%s broker_avg=%s tqqq_price=%s last_buy_fill_price=%s days_since_buy=%s cycle_age=%s core_filled=%s reserve_filled=%s remaining_units=%s reserve_unlocked=%s action=%s reason=%s",
                     config.policy_version, overlay.get("market_state"), overlay.get("market_regime"), md.get("long_trend"),
                     overlay.get("qqq_drawdown_252"), overlay.get("qqq_realized_vol_20d"), overlay.get("qqq_trend_efficiency_20d"),
                     md.get("chop_high_vol"), md.get("capital_preservation"), broker.qty, broker.average_price, broker.price,
-                    md.get("last_buy_fill_price"), getattr(state, "cycle_age_trading_days", None), getattr(state, "core_filled_notional", None),
+                    md.get("last_buy_fill_price"), days_since_buy, getattr(state, "cycle_age_trading_days", None), getattr(state, "core_filled_notional", None),
                     getattr(state, "reserve_filled_notional", None), md.get("remaining_units"), getattr(state, "reserve_unlocked", None),
                     decision.action.value, decision.reason)
         logger.info("[TQQQ_INF][STATE] cycle_id=%s status=%s price=%s broker_qty=%s broker_avg=%s anchor=%s drawdown=%s cycle_age=%s core_filled=%s reserve_filled=%s market_state=%s market_reason=%s crash_streak=%s reserve_unlocked=%s pending_buy=%s pending_sell=%s",
@@ -218,15 +215,25 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             return {"status": "BLOCK", "reason": "router_unavailable", "decision": decision, "orders": []}
         if not math.isfinite(broker.price) or broker.price <= 0:
             return {"status": "BLOCK", "reason": "tqqq_price_unavailable", "decision": decision, "orders": []}
+        theme_cluster = "ETF_INDEX"
+        classification_source = "TQQQ_INFINITE_POLICY"
+        position_state = "HELD" if broker.qty > 0 else "NOT_HELD"
+        position_action = "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY"
+        policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
+                         and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND" else None)
         intent = {
             "symbol": config.symbol, "exchange": broker.exchange or "NASDAQ", "side": decision.action.value,
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,
             "trade_date": trading_date.isoformat(),
             "client_order_key": f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{decision.action.value}",
-            "strategy": "TQQQ_INFINITE_V3", "position_action": "ADD_TO_EXISTING_BUY" if broker.qty else "NEW_POSITION_BUY",
+            "strategy": "TQQQ_INFINITE_V3", "theme_cluster": theme_cluster,
+            "classification_source": classification_source, "position_state": position_state,
+            "position_action": position_action,
             "reason": "TAKE_PROFIT_TQQQ_INFINITE" if decision.action == Action.SELL else decision.reason,
             "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason,
-                     "position_action": "ADD_TO_EXISTING_BUY" if broker.qty else "NEW_POSITION_BUY",
+                     "theme_cluster": theme_cluster, "classification_source": classification_source,
+                     "position_state": position_state, "position_action": position_action,
+                     "policy_action": policy_action,
                      "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE",
                      "cycle_id": state.cycle_id},
         }

@@ -84,6 +84,15 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     risk = assess_market_risk(overlay)
     if not risk.allow_buy:
         return Decision(Action.BLOCK, risk.reason)
+    overlay = overlay or {}
+    if overlay.get("force_entry_block") is True:
+        return Decision(Action.BLOCK, "overlay_force_entry_block")
+    if position.qty <= 0 and overlay.get("allow_new_buy") is False:
+        return Decision(Action.BLOCK, "overlay_new_buy_block")
+    if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
+        return Decision(Action.BLOCK, "overlay_add_buy_block")
+    if "tqqq_context_quality" in overlay and overlay.get("tqqq_context_quality") != "ok":
+        return Decision(Action.BLOCK, "tqqq_context_unavailable")
 
     metadata = state.metadata or {}
     long_trend = str(metadata.get("long_trend") or classify_long_trend(
@@ -161,7 +170,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     core_left = max(0.0, config.core_capital_usd - state.core_filled_notional)
     reserve_left = max(0.0, config.reserve_capital_usd - state.reserve_filled_notional)
     if state.core_filled_notional >= config.routine_core_usd and state.core_filled_notional < config.core_capital_usd:
-        deep_bear = long_trend == "BEAR" and drawdown <= config.deep_bear_unlock_drawdown
+        deep_bear = bool(metadata.get("deep_bear_unlocked")) or (
+            long_trend == "BEAR" and drawdown <= config.deep_bear_unlock_drawdown
+        )
         if not deep_bear:
             return Decision(Action.BLOCK, "deep_bear_core_locked")
     if core_left <= 0 and not state.reserve_unlocked:

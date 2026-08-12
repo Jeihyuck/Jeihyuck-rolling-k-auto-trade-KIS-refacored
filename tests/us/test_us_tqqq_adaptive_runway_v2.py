@@ -94,3 +94,38 @@ def test_age_alone_only_enables_capital_preservation_during_bear():
     aged_bear = replace(owned(long_trend="BEAR"), cycle_age_trading_days=121)
     assert decide(aged_bull, PositionSnapshot(qty=5, average_price=100, price=100), overlay()).reason != "capital_preservation_wait"
     assert decide(aged_bear, PositionSnapshot(qty=5, average_price=100, price=95), overlay()).reason == "capital_preservation_wait"
+
+
+@pytest.mark.parametrize(("context", "qty", "reason"), [
+    ({"force_entry_block": True}, 0, "overlay_force_entry_block"),
+    ({"allow_new_buy": False}, 0, "overlay_new_buy_block"),
+    ({"allow_new_buy": True, "allow_add_to_existing": False}, 5, "overlay_add_buy_block"),
+])
+def test_production_overlay_buy_gates_are_enforced_but_sell_remains_first(context, qty, reason):
+    state = owned() if qty else InfiniteState()
+    position = PositionSnapshot(qty=qty, average_price=50 if qty else 0, price=50)
+    assert decide(state, position, overlay(**context)).reason == reason
+    if qty:
+        sell = decide(state, replace(position, price=55), overlay(**context))
+        assert sell.action == Action.SELL and sell.qty == qty
+
+
+def test_context_quality_fails_closed_for_buys_but_not_take_profit_sell():
+    context = overlay(tqqq_context_quality="insufficient")
+    assert decide(InfiniteState(), PositionSnapshot(price=50), context).reason == "tqqq_context_unavailable"
+    result = decide(owned(), PositionSnapshot(qty=2, average_price=50, price=55), context)
+    assert result.action == Action.SELL
+
+
+@pytest.mark.parametrize(("sticky", "drawdown", "expected"), [
+    (True, -.10, Action.BUY),
+    (False, -.10, Action.BLOCK),
+    (False, -.20, Action.BUY),
+])
+def test_deep_bear_unlock_is_sticky_within_cycle(sticky, drawdown, expected):
+    state = replace(owned(long_trend="BEAR", deep_bear_unlocked=sticky), core_filled_notional=5_500)
+    result = decide(state, PositionSnapshot(qty=5, average_price=100, price=90),
+                    overlay(qqq_drawdown_252=drawdown))
+    assert result.action == expected
+    if sticky:
+        assert result.reason != "deep_bear_core_locked"

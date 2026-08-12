@@ -36,7 +36,7 @@ def _get_tqqq_tick_quote(provider: Any) -> tuple[float, str, bool]:
     if isinstance(quote, dict):
         raw = next((quote.get(k) for k in ("last", "price", "current_price", "ovrs_nmix_prpr")
                     if quote.get(k) not in (None, "")), None)
-        stale = bool(quote.get("stale") or quote.get("suspect") or
+        stale = bool(quote.get("stale") or quote.get("suspect") or quote.get("_stale_date") or
                      str(quote.get("quality") or "").lower() in {"stale", "suspect", "degraded"})
         source = str(quote.get("source") or "USDataProvider")
     else:

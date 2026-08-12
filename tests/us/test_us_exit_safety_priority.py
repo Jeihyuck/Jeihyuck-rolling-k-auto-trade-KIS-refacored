@@ -69,10 +69,10 @@ def test_run_trade_tick_soft_stop_state_and_price_once(monkeypatch):
     monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda d: True)
     monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda now: "REGULAR_MID")
     monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": 5000.0})
-    calls = {"price":0, "risk":0, "hwm":0}
+    calls = {"AMD":0, "TQQQ":0, "risk":0, "hwm":0}
     class Provider:
         stats = {"daily_http_call_count": 0}
-        def get_current_price(self, symbol, exchange): calls["price"] += 1; return {"last": "94.9"}
+        def get_current_price(self, symbol, exchange): calls[symbol] += 1; return {"last": "94.9"}
         def get_orderable_cash(self, symbol, exchange, price): return 10000.0
         def get_client_stats(self): return self.stats
     monkeypatch.setattr("trader.us.data_provider.USDataProvider", lambda offline=False: Provider())
@@ -92,7 +92,7 @@ def test_run_trade_tick_soft_stop_state_and_price_once(monkeypatch):
     monkeypatch.setattr("trader.us.position_lifecycle_state.update_us_position_high_watermark", hwm)
     monkeypatch.setattr("trader.us.db.price_daily_repo.load_recent_us_daily_bars", lambda *a, **k: [])
     result = run_trade_tick(session="am", env="practice", offline=False, force_now="2026-07-10T10:00:00-04:00", kis_order_allowed=False, locked_watchlist_cache=[], watchlist_cache_source="test")
-    assert calls == {"price":1, "risk":1, "hwm":1}
+    assert calls == {"AMD":1, "TQQQ":1, "risk":1, "hwm":1}
     assert result["daily_http_call_count"] == 0
 
 

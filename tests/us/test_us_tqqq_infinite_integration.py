@@ -6,6 +6,7 @@ from trader.us.infinite.config import InfiniteConfig
 from trader.us.infinite.integration import exclude_owned, legacy_ownership_reserved, run_sleeve
 from trader.us.infinite.models import InfiniteState
 from trader.us.infinite.repository import InfiniteRepository
+from trader.us.execution.order_router import resolve_entry_metadata_contract_reason
 
 
 class FakeRepository:
@@ -69,6 +70,79 @@ def test_invalid_or_stale_quote_never_reaches_router(monkeypatch):
                             repository=FakeRepository(InfiniteState()), route=routed.append)
         assert result["reason"] == "tqqq_price_unavailable"
         assert routed == []
+
+
+def test_runner_marks_db_fallback_stale_date_and_degraded_quotes_unusable():
+    from trader.us.runner.trade_tick_runner import _get_tqqq_tick_quote
+
+    class Provider:
+        def __init__(self, quote): self.quote = quote
+        def get_current_price(self, symbol, exchange):
+            assert (symbol, exchange) == ("TQQQ", "NASDAQ")
+            return self.quote
+
+    assert _get_tqqq_tick_quote(Provider({"last": "50.00"})) == (50.0, "USDataProvider", False)
+    for quote in (
+        {"last": "50.00", "_stale_date": "2026-08-08"},
+        {"last": "50.00", "stale": True},
+        {"last": "50.00", "suspect": True},
+        {"last": "50.00", "quality": "degraded"},
+    ):
+        price, _source, stale = _get_tqqq_tick_quote(Provider(quote))
+        assert price == 50.0 and stale is True
+
+
+def test_production_router_metadata_contract_for_new_add_and_sell(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+
+    def capture(positions, price, state):
+        intents = []
+        result = run_sleeve(positions=positions, price=price, trading_date=date(2026, 8, 11),
+                            overlay={"market_state": "NORMAL"}, repository=FakeRepository(state),
+                            route=lambda intent: (intents.append(intent) or {"status": "ACK"}))
+        assert result["orders"]
+        assert resolve_entry_metadata_contract_reason(intents[0], required=True) is None
+        for key in ("theme_cluster", "classification_source", "position_state", "position_action"):
+            assert intents[0][key] == intents[0]["meta"][key]
+        return intents[0]
+
+    new = capture([], 50, InfiniteState())
+    assert new["position_action"] == "NEW_POSITION_BUY" and new["position_state"] == "NOT_HELD"
+    owned = InfiniteState(cycle_id="owned", cycle_start_date=date(2026, 8, 1),
+                          core_filled_notional=250)
+    add = capture([{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], 50, owned)
+    assert add["position_action"] == "ADD_TO_EXISTING_BUY" and add["position_state"] == "HELD"
+    sell = capture([{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], 55, owned)
+    assert sell["side"] == "SELL" and sell["theme_cluster"] == "ETF_INDEX"
+
+
+def test_rebound_decision_block_reject_or_ack_does_not_consume_probe(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    for router_status in ("BLOCK", "REJECT", "ACK"):
+        state = InfiniteState(cycle_id="owned", cycle_start_date=date(2026, 8, 1),
+                              core_filled_notional=250)
+        repo = FakeRepository(state)
+        result = run_sleeve(
+            positions=[{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], price=50,
+            trading_date=date(2026, 8, 11), overlay={"market_state": "DEFENSE_CRASH_REBOUND"},
+            repository=repo, route=lambda _intent: {"status": router_status},
+        )
+        assert result["decision"].action.value == "BUY"
+        assert "rebound_probe_date" not in repo.state.metadata
+
+
+def test_rebound_tick_alone_never_unlocks_recovery_reserve(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "0")
+    state = InfiniteState(cycle_id="owned", cycle_start_date=date(2026, 8, 1),
+                          core_filled_notional=7_500, material_market_crash=True)
+    repo = FakeRepository(state)
+    run_sleeve(positions=[{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], price=50,
+               trading_date=date(2026, 8, 11), overlay={"market_state": "DEFENSE_CRASH_REBOUND"},
+               repository=repo)
+    assert not repo.state.reserve_unlocked
 
 
 def test_enabled_ownership_filter_is_central_and_off_preserves_identity(monkeypatch):

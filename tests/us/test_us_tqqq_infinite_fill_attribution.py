@@ -14,12 +14,13 @@ STATE = InfiniteState(cycle_id=CYCLE, cycle_start_date=date(2026, 8, 1), status=
 
 
 def fill(*, side="BUY", qty=1, price=100, key=None, strategy="TQQQ_INFINITE_V3",
-         book="TQQQ_INFINITE", cycle=CYCLE, trade_date=TODAY):
+         book="TQQQ_INFINITE", cycle=CYCLE, trade_date=TODAY, policy_action=None):
     return {
         "trade_date": trade_date, "side": side, "qty": qty, "price_usd": price,
         "client_order_key": key or f"TQQQ_INF_V3:{cycle}:{trade_date}:BUY",
         "intent_strategy": strategy,
-        "intent_meta": {"strategy": strategy, "book": book, "cycle_id": cycle},
+        "intent_meta": {"strategy": strategy, "book": book, "cycle_id": cycle,
+                        "policy_action": policy_action},
         "order_meta": {}, "meta": {},
     }
 
@@ -76,3 +77,29 @@ def test_attribution_requires_key_strategy_book_and_cycle():
         fill(key="TQQQ_INF_V3:wrong:2026-08-11:BUY"),
     ]
     assert InfiniteRepository._summarize_fill_rows(rows, STATE, TODAY)[0] == 0
+
+
+def test_rebound_probe_is_consumed_only_by_attributed_actual_fill():
+    ack_or_intent_only = []  # no us_fills row exists
+    ordinary_fill = fill(policy_action=None)
+    rebound_fill = fill(policy_action="REBOUND_PROBE", trade_date=date(2026, 8, 8))
+    unrelated = fill(policy_action="REBOUND_PROBE", cycle="other")
+    assert InfiniteRepository._last_rebound_probe_fill_date(ack_or_intent_only, STATE) is None
+    assert InfiniteRepository._last_rebound_probe_fill_date([ordinary_fill, unrelated], STATE) is None
+    assert InfiniteRepository._last_rebound_probe_fill_date([ordinary_fill, rebound_fill], STATE) == date(2026, 8, 8)
+
+
+def test_reconcile_records_actual_probe_fill_and_cooldown_date(monkeypatch):
+    repo = InfiniteRepository.__new__(InfiniteRepository)
+    repo.cycle_fill_stats = lambda *_: {
+        "total_buy_notional": 250, "daily_buy_notional": 0, "total_sell_notional": 0,
+        "last_buy_date": date(2026, 8, 8), "first_fill_price": 50,
+        "last_buy_fill_price": 50, "last_rebound_probe_fill_date": date(2026, 8, 8),
+    }
+    monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda day: day.weekday() < 5)
+    result = repo.reconcile_metadata(
+        STATE, trading_date=TODAY, broker_qty=5, broker_average_price=50,
+        core_cap=7_500, rebound_cooldown=3,
+    )
+    assert result.metadata["rebound_probe_date"] == "2026-08-08"
+    assert result.metadata["rebound_cooldown_until"] == "2026-08-12"
