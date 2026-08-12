@@ -7,7 +7,7 @@ import pytest
 from trader.us.infinite.config import InfiniteConfig
 from trader.us.infinite.models import Action, InfiniteState, PositionSnapshot, Status
 from trader.us.infinite.risk_adapter import CANONICAL_MARKET_STATES, assess_market_risk
-from trader.us.infinite.strategy import evaluate
+from trader.us.infinite.strategy import _trading_days_since, evaluate
 from trader.us.market_state_overlay import _market_returns
 
 
@@ -129,3 +129,25 @@ def test_deep_bear_unlock_is_sticky_within_cycle(sticky, drawdown, expected):
     assert result.action == expected
     if sticky:
         assert result.reason != "deep_bear_core_locked"
+
+
+def test_trading_days_since_excludes_independence_day_observed():
+    # Fri 2026-07-03 is the observed NYSE Independence Day holiday.  Only
+    # Jul 2 and Jul 6 are sessions in this interval.
+    assert _trading_days_since(date(2026, 7, 1), date(2026, 7, 6)) == 2
+    assert _trading_days_since(date(2026, 7, 2), date(2026, 7, 3)) == 0
+
+
+def test_bear_seven_session_gap_does_not_open_early_across_us_holiday():
+    state = InfiniteState(
+        cycle_id="cycle", status=Status.ACTIVE, core_filled_notional=250,
+        last_buy_date=date(2026, 6, 25),
+        metadata={"long_trend": "BEAR", "last_buy_fill_price": 100},
+    )
+    position = PositionSnapshot(qty=5, average_price=100, price=94)
+    before = evaluate(config=CFG, state=state, position=position,
+                      trading_date=date(2026, 7, 6), overlay=overlay())
+    on_seventh_session = evaluate(config=CFG, state=state, position=position,
+                                  trading_date=date(2026, 7, 7), overlay=overlay())
+    assert (before.action, before.reason) == (Action.BLOCK, "bear_runway_wait")
+    assert on_seventh_session.action == Action.BUY

@@ -103,3 +103,23 @@ def test_reconcile_records_actual_probe_fill_and_cooldown_date(monkeypatch):
     )
     assert result.metadata["rebound_probe_date"] == "2026-08-08"
     assert result.metadata["rebound_cooldown_until"] == "2026-08-12"
+
+
+def test_rebound_repository_cooldown_matches_strategy_us_session_count():
+    from trader.us.infinite.strategy import _trading_days_since
+
+    repo = InfiniteRepository.__new__(InfiniteRepository)
+    repo.cycle_fill_stats = lambda *_: {
+        "total_buy_notional": 250, "daily_buy_notional": 0, "total_sell_notional": 0,
+        "last_buy_date": date(2026, 7, 2), "first_fill_price": 50,
+        "last_buy_fill_price": 50, "last_rebound_probe_fill_date": date(2026, 7, 2),
+    }
+    state = replace(STATE, cycle_start_date=date(2026, 7, 1))
+    result = repo.reconcile_metadata(
+        state, trading_date=date(2026, 7, 8), broker_qty=5,
+        broker_average_price=50, core_cap=7_500, rebound_cooldown=3,
+    )
+    cooldown_until = date.fromisoformat(result.metadata["rebound_cooldown_until"])
+    assert cooldown_until == date(2026, 7, 8)
+    assert _trading_days_since(date(2026, 7, 2), cooldown_until) == 3
+    assert _trading_days_since(date(2026, 7, 2), date(2026, 7, 7)) == 2

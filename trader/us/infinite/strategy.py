@@ -12,10 +12,11 @@ def _trading_days_since(start: date | None, end: date) -> int:
     if not start or start >= end:
         return 0
     from datetime import timedelta
+    from trader.us.market_calendar import is_us_trading_day
     cursor, count = start, 0
     while cursor < end:
         cursor += timedelta(days=1)
-        count += int(cursor.weekday() < 5)
+        count += int(is_us_trading_day(cursor))
     return count
 
 
