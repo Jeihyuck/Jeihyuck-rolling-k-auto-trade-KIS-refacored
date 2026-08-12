@@ -158,6 +158,7 @@ def calculate_qqq_long_context(closes: list[float]) -> dict[str, Any]:
     """Pure completed-close context shared by production overlay and replay."""
     out = {
         "qqq_completed_close": closes[-1] if closes else None,
+        "qqq_20d_return": closes[-1] / closes[-21] - 1 if len(closes) >= 21 else None,
         "qqq_ma50": sum(closes[-50:]) / 50 if len(closes) >= 50 else None,
         "qqq_ma200": sum(closes[-200:]) / 200 if len(closes) >= 200 else None,
         "qqq_ma200_slope": None, "qqq_252d_high": None, "qqq_drawdown_252": None,

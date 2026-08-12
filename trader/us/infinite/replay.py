@@ -12,7 +12,7 @@ from typing import Iterable
 
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
-from .policy_state import ActualFillEvidence, update_adaptive_policy_state
+from .policy_state import ActualFillEvidence, reserve_new_cycle, update_adaptive_policy_state
 from .strategy import evaluate
 from trader.us.market_state_overlay import calculate_qqq_long_context
 
@@ -56,7 +56,8 @@ def session_dates(bars: Iterable[ReplayBar]) -> tuple[date, ...]:
     return dates
 
 
-def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) -> dict:
+def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
+               *, initial_state: InfiniteState | None = None) -> dict:
     """Replay fills at completed TQQQ closes and return audit metrics.
 
     This is an approval/invariant harness, not an execution-price simulator:
@@ -66,7 +67,7 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) 
     dates = session_dates(bars)
     sessions = frozenset(dates)
     config = config or InfiniteConfig()
-    state = InfiniteState()
+    state = initial_state or InfiniteState()
     qty = 0
     cash = config.max_total_capital_usd
     cost = 0.0
@@ -104,8 +105,8 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) 
                 hard_cap_violations += 1
             if not state.cycle_id:
                 cycle_count += 1; cycle_start = index
-                state = replace(state, cycle_id=f"replay-{cycle_count}", cycle_start_date=bar.trading_date,
-                                status=Status.ACTIVE)
+                state = reserve_new_cycle(state, bar.trading_date, cycle_id=f"replay-{cycle_count}")
+                state = replace(state, status=Status.ACTIVE)
             qty += decision.qty; cost += decision.notional; cash -= decision.notional
             core = min(config.core_capital_usd, state.core_filled_notional + decision.notional)
             reserve = max(0.0, state.core_filled_notional + state.reserve_filled_notional + decision.notional - core)
@@ -158,4 +159,5 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) 
         "invalid_quote_order_count": invalid_orders,
         "duplicate_same_day_buy_count": duplicate_buys,
         "session_count": len(dates), "session_dates": dates,
+        "final_state": state,
     }

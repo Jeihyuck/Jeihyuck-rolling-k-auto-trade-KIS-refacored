@@ -4,6 +4,8 @@ from trader.us.infinite.replay import ReplayBar, build_replay_bars, run_replay, 
 from trader.us.infinite.config import InfiniteConfig
 from trader.us.infinite.models import InfiniteState, Status
 from trader.us.infinite.policy_state import update_adaptive_policy_state
+from trader.us.infinite.strategy import classify_long_trend
+from trader.us.market_state_overlay import _market_returns, calculate_qqq_long_context
 
 
 def bar(day, price=50, state="NORMAL", **context):
@@ -59,6 +61,27 @@ def test_real_bar_builder_uses_intersection_and_production_indicator_helper():
     assert bars[-1].overlay["market_state_replay_mode"] == "neutral_normal"
     bounded = build_replay_bars(qqq, tqqq, start=start + timedelta(days=252))
     assert bounded[0].overlay["tqqq_context_quality"] == "ok"  # warmup retained, capital starts here
+    assert "qqq_20d_return" in bars[-1].overlay
+
+
+def test_long_context_classifies_rising_falling_and_recovery_histories():
+    rising = calculate_qqq_long_context([100 + i for i in range(260)])
+    falling = calculate_qqq_long_context([400 - i for i in range(260)])
+    assert classify_long_trend({"market_state": "NORMAL", **rising}) == "BULL"
+    assert classify_long_trend({"market_state": "NORMAL", **falling}) == "BEAR"
+    recovery = {**falling, "qqq_completed_close": falling["qqq_ma50"] + 1,
+                "qqq_20d_return": .01, "market_state": "NORMAL"}
+    assert classify_long_trend(recovery, structural_bear_seen=True) == "RECOVERY"
+
+
+def test_production_market_returns_and_pure_context_have_same_20d_return():
+    closes = [100 + i for i in range(260)]
+    rows = [{"date": f"{i:04d}", "close": close}
+            for i, close in enumerate(closes)]
+    provider = {symbol: rows for symbol in ("SPY", "QQQ", "SMH", "DIA", "IWM", "RSP",
+                                             "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")}
+    assert _market_returns(provider, "2021-01-01", [])["qqq_20d_return"] == \
+        calculate_qqq_long_context(closes)["qqq_20d_return"]
 
 
 def test_shared_policy_transition_is_daily_idempotent_and_unlocks_recovery_reserve():
@@ -92,3 +115,18 @@ def test_completed_cycle_resets_age_and_metadata_before_next_cycle():
     assert result["cycle_count"] == result["take_profit_cycle_count"] == 2
     assert result["take_profit_completion_sessions"] == [1, 1]
     assert result["maximum_cycle_completion_sessions"] == 1
+
+
+def test_first_buy_resets_precycle_policy_metadata_before_fill_is_applied():
+    polluted = InfiniteState(
+        metadata={"structural_bear_seen": True, "deep_bear_unlocked": True,
+                  "recovery_streak": 2}, material_market_crash=True,
+        reserve_unlocked=True,
+    )
+    result = run_replay([bar(date(2023, 1, 3), 50)], initial_state=polluted)
+    state = result["final_state"]
+    assert state.cycle_id == "replay-1" and state.cycle_start_date == date(2023, 1, 3)
+    assert state.core_filled_notional == 250 and state.reserve_filled_notional == 0
+    assert not state.material_market_crash and not state.reserve_unlocked
+    assert state.market_crash_streak == state.cycle_age_trading_days == 0
+    assert state.metadata == {"last_buy_fill_price": 50, "long_trend": None}

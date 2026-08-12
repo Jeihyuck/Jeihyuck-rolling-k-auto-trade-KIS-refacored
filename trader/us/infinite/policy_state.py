@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import uuid
 from datetime import date
 
 from .config import InfiniteConfig
@@ -13,6 +14,19 @@ from .strategy import classify_long_trend
 @dataclass(frozen=True)
 class ActualFillEvidence:
     rebound_probe_fill_date: date | None = None
+
+
+def reserve_new_cycle(state: InfiniteState, trading_date: date,
+                      *, cycle_id: str | None = None) -> InfiniteState:
+    """Apply the one canonical production/replay new-cycle reservation reset."""
+    return replace(
+        state, cycle_id=cycle_id or str(uuid.uuid4()), cycle_start_date=trading_date,
+        cycle_complete_date=None, anchor_price=None, core_filled_notional=0,
+        reserve_filled_notional=0, last_buy_date=None,
+        market_crash_streak=0, material_market_crash=False,
+        reserve_unlocked=False, cycle_age_trading_days=0, status=Status.READY,
+        metadata={},
+    )
 
 
 def update_adaptive_policy_state(*, state: InfiniteState, trading_date: date,

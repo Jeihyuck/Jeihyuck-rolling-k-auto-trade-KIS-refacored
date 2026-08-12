@@ -10,7 +10,7 @@ from typing import Any, Callable
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
 from .repository import InfiniteRepository
-from .policy_state import update_adaptive_policy_state
+from .policy_state import reserve_new_cycle, update_adaptive_policy_state
 from .strategy import _trading_days_since, evaluate
 
 logger = logging.getLogger(__name__)
@@ -153,14 +153,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         if needs_new_cycle and state:
             # Reserving a cycle identity is metadata only. Capital and ACTIVE
             # state still require later broker/fill evidence.
-            state = replace(
-                state, cycle_id=str(uuid.uuid4()), cycle_start_date=trading_date,
-                cycle_complete_date=None, last_exit_date=state.last_exit_date,
-                anchor_price=None, core_filled_notional=0, reserve_filled_notional=0,
-                last_buy_date=None, market_crash_streak=0, material_market_crash=False,
-                reserve_unlocked=False, cycle_age_trading_days=0, status=Status.READY,
-                metadata={},
-            )
+            state = reserve_new_cycle(state, trading_date)
             repository.save_state(state)
         if not config.real_order or decision.action not in {Action.BUY, Action.SELL}:
             return {"status": "SHADOW" if not config.real_order else decision.action.value,
