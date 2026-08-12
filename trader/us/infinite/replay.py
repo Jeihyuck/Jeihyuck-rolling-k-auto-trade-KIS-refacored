@@ -12,7 +12,9 @@ from typing import Iterable
 
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
+from .policy_state import ActualFillEvidence, update_adaptive_policy_state
 from .strategy import evaluate
+from trader.us.market_state_overlay import calculate_qqq_long_context
 
 
 @dataclass(frozen=True)
@@ -22,6 +24,29 @@ class ReplayBar:
     tqqq_close: float
     overlay: dict
     quote_valid: bool = True
+
+
+def build_replay_bars(qqq_rows: Iterable[dict], tqqq_rows: Iterable[dict],
+                      *, market_states: dict[date, str] | None = None,
+                      start: date | None = None, end: date | None = None) -> tuple[ReplayBar, ...]:
+    """Build neutral/reconstructed replay input from the actual date intersection."""
+    def normalize(rows):
+        result = {}
+        for row in rows:
+            raw_date = row.get("date") or row.get("trade_date")
+            day = raw_date if isinstance(raw_date, date) else date.fromisoformat(str(raw_date))
+            result[day] = float(row.get("close"))
+        return result
+    qqq, tqqq = normalize(qqq_rows), normalize(tqqq_rows)
+    dates = sorted(set(qqq) & set(tqqq)); closes: list[float] = []; bars = []
+    for day in dates:
+        closes.append(qqq[day])
+        context = calculate_qqq_long_context(closes)
+        context["market_state"] = (market_states or {}).get(day, "NORMAL")
+        context["market_state_replay_mode"] = "reconstructed" if market_states else "neutral_normal"
+        if (start is None or day >= start) and (end is None or day <= end):
+            bars.append(ReplayBar(day, qqq[day], tqqq[day], context))
+    return tuple(bars)
 
 
 def session_dates(bars: Iterable[ReplayBar]) -> tuple[date, ...]:
@@ -49,18 +74,21 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) 
     mdd = 0.0
     lowest_cash = cash
     lowest_units = int(cash // config.unit_usd)
-    cycle_count = crash_buys = chop_buys = cp_buys = invalid_orders = duplicate_buys = 0
+    cycle_count = pending_buys = confirmed_buys = rebound_buys = chop_buys = cp_buys = invalid_orders = duplicate_buys = 0
     hard_cap_violations = daily_cap_violations = 0
     core_exhaustion_date = reserve_unlock_date = None
     cycle_start = None
     completion_durations: list[int] = []
     last_buy_price = None
     bought_dates: set[date] = set()
+    reserve_used_notional = 0.0
 
     for index, bar in enumerate(bars):
         overlay = dict(bar.overlay)
         if cycle_start is not None:
             state = replace(state, cycle_age_trading_days=index - cycle_start)
+        state = update_adaptive_policy_state(state=state, trading_date=bar.trading_date,
+                                             overlay=overlay, config=config)
         price = bar.tqqq_close if bar.quote_valid else 0.0
         position = PositionSnapshot(qty=qty, average_price=(cost / qty if qty else 0), price=price)
         decision = evaluate(config=config, state=state, position=position,
@@ -86,14 +114,24 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) 
                             last_buy_date=bar.trading_date,
                             metadata={**state.metadata, "last_buy_fill_price": last_buy_price,
                                       "long_trend": overlay.get("long_trend", state.metadata.get("long_trend"))})
-            crash_buys += int(str(overlay.get("market_state", "")).startswith("DEFENSE_CRASH_"))
-            chop_buys += int(bool(overlay.get("chop_high_vol")))
-            cp_buys += int(bool(overlay.get("capital_preservation")))
+            market_state = str(overlay.get("market_state", ""))
+            pending_buys += int(market_state == "DEFENSE_CRASH_PENDING")
+            confirmed_buys += int(market_state == "DEFENSE_CRASH_CONFIRMED")
+            is_probe = market_state == "DEFENSE_CRASH_REBOUND"
+            rebound_buys += int(is_probe)
+            chop_buys += int(bool(state.metadata.get("chop_high_vol")))
+            cp_buys += int(bool(state.metadata.get("capital_preservation")))
+            reserve_used_notional = max(reserve_used_notional, reserve)
+            if is_probe:
+                state = update_adaptive_policy_state(
+                    state=state, trading_date=bar.trading_date, overlay=overlay, config=config,
+                    actual_fill_evidence=ActualFillEvidence(bar.trading_date))
             if core >= config.core_capital_usd and core_exhaustion_date is None: core_exhaustion_date = bar.trading_date
         elif decision.action == Action.SELL:
             cash += decision.notional; qty = 0; cost = 0
             if cycle_start is not None: completion_durations.append(index - cycle_start)
             state = InfiniteState(status=Status.COMPLETE, last_exit_date=bar.trading_date)
+            cycle_start = None
         if state.reserve_unlocked and reserve_unlock_date is None: reserve_unlock_date = bar.trading_date
         equity = cash + qty * (bar.tqqq_close if bar.tqqq_close > 0 else 0)
         peak_equity = max(peak_equity, equity)
@@ -106,9 +144,15 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None) 
         "total_return": final_equity / config.max_total_capital_usd - 1,
         "mdd": mdd, "lowest_cash": lowest_cash, "lowest_remaining_units": lowest_units,
         "core_exhaustion_date": core_exhaustion_date, "reserve_unlock_date": reserve_unlock_date,
-        "cycle_count": cycle_count, "take_profit_completion_sessions": completion_durations,
-        "crash_buy_count": crash_buys, "chop_buy_count": chop_buys,
+        "cycle_count": cycle_count, "take_profit_cycle_count": len(completion_durations),
+        "take_profit_completion_sessions": completion_durations,
+        "average_cycle_completion_sessions": (sum(completion_durations) / len(completion_durations)
+                                                if completion_durations else None),
+        "maximum_cycle_completion_sessions": max(completion_durations) if completion_durations else None,
+        "crash_pending_buy_count": pending_buys, "crash_confirmed_buy_count": confirmed_buys,
+        "rebound_probe_buy_count": rebound_buys, "chop_buy_count": chop_buys,
         "capital_preservation_buy_count": cp_buys,
+        "reserve_used_notional": reserve_used_notional,
         "hard_cap_violation_count": hard_cap_violations,
         "daily_cap_violation_count": daily_cap_violations,
         "invalid_quote_order_count": invalid_orders,

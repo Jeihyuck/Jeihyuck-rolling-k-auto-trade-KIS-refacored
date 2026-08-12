@@ -10,8 +10,8 @@ from typing import Any, Callable
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
 from .repository import InfiniteRepository
-from .risk_adapter import assess_market_risk
-from .strategy import _trading_days_since, classify_long_trend, evaluate
+from .policy_state import update_adaptive_policy_state
+from .strategy import _trading_days_since, evaluate
 
 logger = logging.getLogger(__name__)
 
@@ -102,59 +102,13 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                                   broker_average_price=broker.average_price,
                                                   core_cap=config.core_capital_usd,
                                                   rebound_cooldown=config.rebound_cooldown)
-            metadata = dict(state.metadata or {})
-            today = trading_date.isoformat()
-            previous = str(metadata.get("long_trend") or "TRANSITION")
-            long_trend = classify_long_trend(overlay, bool(metadata.get("structural_bear_seen")))
-            if metadata.get("last_policy_eval_date") != today:
-                streak = int(metadata.get("recovery_streak") or 0)
-                if str(overlay.get("market_state")) in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"}:
-                    streak = 0
-                elif long_trend == "RECOVERY":
-                    streak += 1
-                else:
-                    streak = 0
-                metadata.update(previous_long_trend=previous, recovery_streak=streak,
-                                last_policy_eval_date=today)
-            structural = bool(metadata.get("structural_bear_seen")) or long_trend == "BEAR"
-            try:
-                dd = float(overlay.get("qqq_drawdown_252"))
-                rv, efficiency = float(overlay.get("qqq_realized_vol_20d")), float(overlay.get("qqq_trend_efficiency_20d"))
-            except (TypeError, ValueError):
-                dd, rv, efficiency = 0.0, 0.0, 1.0
-            chop = rv >= config.chop_rv20_min and efficiency <= config.chop_efficiency_max
-            cp = long_trend == "BEAR" and (dd <= config.capital_preservation_drawdown
-                 or state.cycle_age_trading_days >= config.max_cycle_age_trading_days
-                 or state.core_filled_notional >= config.capital_preservation_core_used)
-            remaining = max(0, int((config.max_total_capital_usd - state.total_filled_notional) // config.unit_usd))
-            gap = config.capital_preservation_gap if cp else (config.chop_gap if chop else config.bear_gap if long_trend == "BEAR" else 2)
-            metadata.update(policy_version=config.policy_version, long_trend=long_trend,
-                            structural_bear_seen=structural,
-                            deep_bear_unlocked=bool(metadata.get("deep_bear_unlocked")) or (long_trend == "BEAR" and dd <= config.deep_bear_unlock_drawdown),
-                            chop_high_vol=chop, capital_preservation=cp,
-                            remaining_units=remaining, estimated_runway_days=remaining * gap)
-            unlock = (state.core_filled_notional >= config.core_capital_usd and
-                      (state.material_market_crash or structural) and
-                      int(metadata.get("recovery_streak") or 0) >= config.recovery_confirmation_days and
-                      str(overlay.get("market_state")) not in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"})
-            state = replace(state, metadata=metadata, reserve_unlocked=state.reserve_unlocked or unlock)
+            state = update_adaptive_policy_state(state=state, trading_date=trading_date,
+                                                 overlay=overlay, config=config)
             # A cycle becomes ACTIVE only from broker/fill evidence, never from
             # an order request or ACK (PostgreSQL and KIS are not one transaction).
             if broker.qty > 0 and state.core_filled_notional + state.reserve_filled_notional > 0 and not state.cycle_id:
                 state = replace(state, cycle_id=str(uuid.uuid4()), cycle_start_date=state.last_buy_date or trading_date,
                                 status=Status.ACTIVE)
-            risk = assess_market_risk(overlay)
-            if risk.market_crash:
-                crash_date = state.metadata.get("last_market_crash_date")
-                if crash_date != trading_date.isoformat():
-                    state = replace(state, market_crash_streak=state.market_crash_streak + 1,
-                                    material_market_crash=True,
-                                    metadata={**state.metadata, "last_market_crash_date": trading_date.isoformat()})
-            elif risk.verified_rebound:
-                # A rebound tick may permit one Core probe, but never unlocks
-                # Reserve. Reserve requires the completed-day recovery streak.
-                state = replace(state, market_crash_streak=0,
-                                status=Status.ACTIVE if broker.qty else state.status)
             repository.save_state(state)
         pending_buy, pending_sell = repository.pending_sides(trading_date, config.symbol)
         daily = 0.0

@@ -1,6 +1,9 @@
 from datetime import date, timedelta
 
-from trader.us.infinite.replay import ReplayBar, run_replay, session_dates
+from trader.us.infinite.replay import ReplayBar, build_replay_bars, run_replay, session_dates
+from trader.us.infinite.config import InfiniteConfig
+from trader.us.infinite.models import InfiniteState, Status
+from trader.us.infinite.policy_state import update_adaptive_policy_state
 
 
 def bar(day, price=50, state="NORMAL", **context):
@@ -37,7 +40,8 @@ def test_synthetic_chop_and_crash_replay_invariants():
         bars.append(bar(day, 50 if i % 2 else 52, state,
                         qqq_realized_vol_20d=.50, qqq_trend_efficiency_20d=.05))
     result = run_replay(bars)
-    assert result["crash_buy_count"] == 0
+    assert result["crash_pending_buy_count"] == 0
+    assert result["crash_confirmed_buy_count"] == 0
     assert result["chop_buy_count"] == 0
     assert result["daily_cap_violation_count"] == 0
     assert result["hard_cap_violation_count"] == 0
@@ -45,7 +49,46 @@ def test_synthetic_chop_and_crash_replay_invariants():
     assert result["duplicate_same_day_buy_count"] == 0
 
 
+def test_real_bar_builder_uses_intersection_and_production_indicator_helper():
+    start = date(2021, 1, 4)
+    qqq = [{"date": start + timedelta(days=i), "close": 100 + i} for i in range(260)]
+    tqqq = [{"date": start + timedelta(days=i), "close": 50 + i} for i in range(260) if i != 10]
+    bars = build_replay_bars(qqq, tqqq)
+    assert len(bars) == 259 and start + timedelta(days=10) not in session_dates(bars)
+    assert bars[-1].overlay["tqqq_context_quality"] == "ok"
+    assert bars[-1].overlay["market_state_replay_mode"] == "neutral_normal"
+    bounded = build_replay_bars(qqq, tqqq, start=start + timedelta(days=252))
+    assert bounded[0].overlay["tqqq_context_quality"] == "ok"  # warmup retained, capital starts here
+
+
+def test_shared_policy_transition_is_daily_idempotent_and_unlocks_recovery_reserve():
+    config = InfiniteConfig()
+    state = InfiniteState(cycle_id="c", status=Status.ACTIVE, core_filled_notional=7_500,
+                          material_market_crash=True, metadata={"structural_bear_seen": True})
+    def recovery(day, current):
+        overlay = {"market_state": "NORMAL", "qqq_completed_close": 110,
+                   "qqq_ma50": 100, "qqq_ma200": 105, "qqq_ma200_slope": -1,
+                   "qqq_20d_return": .05, "qqq_drawdown_252": -.15,
+                   "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5}
+        return update_adaptive_policy_state(state=current, trading_date=day,
+                                            overlay=overlay, config=config)
+    day1 = recovery(date(2023, 1, 3), state)
+    same_day = recovery(date(2023, 1, 3), day1)
+    day2 = recovery(date(2023, 1, 4), same_day)
+    assert day1.metadata["recovery_streak"] == same_day.metadata["recovery_streak"] == 1
+    assert day2.metadata["recovery_streak"] == 2 and day2.reserve_unlocked
+
+
 def test_invalid_quote_never_creates_replay_order():
     result = run_replay([ReplayBar(date(2022, 1, 3), 100, 50,
                                    {"market_state": "NORMAL"}, quote_valid=False)])
     assert result["invalid_quote_order_count"] == 0
+
+
+def test_completed_cycle_resets_age_and_metadata_before_next_cycle():
+    bars = [bar(date(2023, 1, 3), 50), bar(date(2023, 1, 4), 55),
+            bar(date(2023, 1, 5), 50), bar(date(2023, 1, 6), 55)]
+    result = run_replay(bars)
+    assert result["cycle_count"] == result["take_profit_cycle_count"] == 2
+    assert result["take_profit_completion_sessions"] == [1, 1]
+    assert result["maximum_cycle_completion_sessions"] == 1
