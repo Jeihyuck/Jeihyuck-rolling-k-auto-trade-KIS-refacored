@@ -38,7 +38,8 @@ deploy_preflight() {
     pre_sync_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "[DEPLOY][SYNC][AUTO] market=${market^^} session=$session trade_date=$trade_date source=existing_scheduler_chain"
     if ! bash scripts/wsl/sync-market-code.sh "${market^^}" "$trade_date"; then
-      result=FAIL; reason=code_sync_failed; _preflight_log; return 1
+      echo "[DEPLOY][SYNC][WARN] reason=code_sync_deferred action=CONTINUE_CURRENT_VERIFIED_CODE"
+      git rev-parse HEAD > "$pin_file" || { result=FAIL; reason=pin_write_failed; _preflight_log; return 1; }
     fi
     # reset --hard may have advanced the checkout; refresh every git fact.
     branch="$(git branch --show-current 2>/dev/null || echo detached)"

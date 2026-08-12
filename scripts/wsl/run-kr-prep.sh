@@ -42,14 +42,12 @@ LOCK_FILE="runtime/locks/kr-prep.lock"
 if [[ "${LOCK_DELEGATED:-0}" == "1" ]]; then
   echo "[KR_PREP][LOCK_DELEGATED] external caller owns duplicate prevention lock=${LOCK_FILE}"
 else
-  exec 9>"${LOCK_FILE}"
-  if ! flock -n 9; then
+  source scripts/wsl/session-lock.sh
+  if ! nullim_session_lock_acquire "${LOCK_FILE}" KR "prep" "$NULLIM_TRADE_DATE" "$NULLIM_SESSION_LOG"; then
     export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
-    kr_duplicate_result "${lock_file:-$LOCK_FILE}" "prep"
+    kr_duplicate_result "${LOCK_FILE}" "prep"
     exit 0
   fi
-  kr_lock_owner "$LOCK_FILE" "prep"
-  echo "[KR_PREP][LOCK_ACQUIRED] lock=${LOCK_FILE}"
 fi
 if [[ -f .env ]]; then set -a; source .env; set +a; fi
 nullim_reassert_repo_root "${BASH_SOURCE[0]}"

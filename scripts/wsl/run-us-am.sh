@@ -62,24 +62,18 @@ if [[ "${LOCK_RESULT}" == *'"reason": "stale_lock_removed"'* ]]; then
   stale_pid="$(printf '%s' "${LOCK_RESULT}" | sed -n 's/.*"stale_pid": \([0-9][0-9]*\).*/\1/p')"
   echo "[$(date -Is)] [US_SCHEDULER][STALE_LOCK_REMOVED] session=${SESSION_NAME} trade_date=${TRADE_DATE} path=runtime/locks/us-${SESSION_NAME}-${TRADE_DATE}.json pid=${stale_pid:-0}" >> "${LOG_FILE}"
 fi
-exec 9>"${LOCK_FILE}"
-if ! flock -n 9; then
+source scripts/wsl/session-lock.sh
+if ! nullim_session_lock_acquire "$LOCK_FILE" US "$SESSION_NAME" "$NULLIM_TRADE_DATE" "$LOG_FILE"; then
   export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
-  echo "[$(date -Is)] [US_SCHEDULER][DUPLICATE_BLOCKED] reason=already_running [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
-  exit 0
-fi
-echo "[$(date -Is)] [US_WSL_LOCK][ACQUIRED] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
-if [[ "${US_LOCK_ONLY:-0}" == "1" ]]; then
-  echo "[$(date -Is)] [US_SCHEDULER][LOCK_ONLY_DONE] session=${SESSION_NAME} trade_date=${TRADE_DATE}" >> "${LOG_FILE}"
   exit 0
 fi
 cleanup() {
   exit_code=$?
-  trap - EXIT
+  trap - EXIT INT TERM
   nullim_finish_session_log "$exit_code" || true
-  echo "[$(date -Is)] [US_WSL_LOCK][RELEASED] session=${SESSION_NAME} lock=${LOCK_FILE} exit_code=${exit_code}" >> "${LOG_FILE}"
+  exit "$exit_code"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 export STRATEGY_ENV="${STRATEGY_ENV:-practice}"
 export KIS_ENV="${KIS_ENV:-practice}"

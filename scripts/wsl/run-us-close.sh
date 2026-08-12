@@ -46,20 +46,18 @@ export DISABLE_KR_IMPORTS_IN_US="1"
 SESSION_NAME="close"
 LOCK_FILE="runtime/locks/us-${SESSION_NAME}.lock"
 LOG_FILE="$NULLIM_SESSION_LOG"
-exec 9>"${LOCK_FILE}"
-if ! flock -n 9; then
+source scripts/wsl/session-lock.sh
+if ! nullim_session_lock_acquire "$LOCK_FILE" US "$SESSION_NAME" "$NULLIM_TRADE_DATE" "$LOG_FILE"; then
   export NULLIM_SESSION_FINAL_STATUS=SKIP_DUPLICATE NULLIM_SESSION_FINAL_REASON=SESSION_LOCK_HELD
-  echo "[$(date -Is)] [US_WSL_LOCK][SKIP_DUPLICATE] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
   exit 0
 fi
-echo "[$(date -Is)] [US_WSL_LOCK][ACQUIRED] session=${SESSION_NAME} lock=${LOCK_FILE}" >> "${LOG_FILE}"
 cleanup() {
   exit_code=$?
-  trap - EXIT
+  trap - EXIT INT TERM
   nullim_finish_session_log "$exit_code" || true
-  echo "[$(date -Is)] [US_WSL_LOCK][RELEASED] session=${SESSION_NAME} lock=${LOCK_FILE} exit_code=${exit_code}" >> "${LOG_FILE}"
+  exit "$exit_code"
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 export STRATEGY_ENV="${STRATEGY_ENV:-practice}"
 export KIS_ENV="${KIS_ENV:-practice}"
