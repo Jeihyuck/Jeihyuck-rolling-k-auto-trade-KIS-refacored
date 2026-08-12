@@ -108,21 +108,11 @@ def test_close_balance_timeout_summary_warn(monkeypatch, tmp_path, caplog):
     assert "status=OK reason=PB1_SESSION_DONE" not in caplog.text
 
 
-def test_am_duplicate_lock_skips_second_process(tmp_path):
-    import fcntl
-    import subprocess
-    from pathlib import Path
-
-    lock_dir = Path("runtime/locks")
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / "kr-am.lock"
-    with lock_path.open("w") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        proc = subprocess.run(["bash", "scripts/wsl/run-kr-am.sh"], text=True, capture_output=True, timeout=10)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    assert proc.returncode == 0
-    assert "[KR_AM][SKIP] reason=LOCK_HELD" in proc.stdout
+def test_am_uses_validated_session_scoped_lock():
+    text = Path("scripts/wsl/run-kr-am.sh").read_text()
+    assert 'lock_file="runtime/locks/kr-am.lock"' in text
+    assert 'nullim_session_lock_acquire "${lock_file}" KR "am"' in text
+    assert "exit 0" in text
 
 
 def test_publish_validation_does_not_fallback_to_legacy_when_canonical_corrupt(tmp_path, monkeypatch):

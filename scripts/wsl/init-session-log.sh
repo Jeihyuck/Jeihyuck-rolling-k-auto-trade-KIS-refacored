@@ -52,6 +52,7 @@ PY
 
 nullim_finish_session_log() {
   local rc="${1:-0}" status reason lock
+  if declare -F nullim_session_lock_release >/dev/null; then nullim_session_lock_release || true; fi
   [[ -n "${NULLIM_SESSION_MANIFEST:-}" && -f "$NULLIM_SESSION_MANIFEST" ]] || return "$rc"
   status="${NULLIM_SESSION_FINAL_STATUS:-}"; reason="${NULLIM_SESSION_FINAL_REASON:-}"
   [[ -n "$status" ]] || { if [[ "$rc" == 0 ]]; then status=OK; reason="${reason:-SESSION_END}"; elif [[ "$rc" == 124 || "$rc" == 137 ]]; then status=TIMEOUT; reason="${reason:-SESSION_TIMEOUT}"; else status=FAILED; reason="${reason:-EXIT_CODE_${rc}}"; fi; }

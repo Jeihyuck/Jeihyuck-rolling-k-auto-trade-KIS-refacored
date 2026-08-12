@@ -4,6 +4,10 @@
 # Existing scheduler entries therefore remain unchanged; later sessions only
 # verify the pin and never fetch/reset the source tree.
 
+_deploy_sync_market_code() {
+  bash scripts/wsl/sync-market-code.sh "$@"
+}
+
 deploy_preflight() {
   local expected actual branch head origin_head status dirty_code dirty_generated severity result=OK reason=none
   local log_dir log_file wrapper market session trade_date pin_dir pin_file pinned_sha diff_status pre_sync_sha post_sync_sha
@@ -37,9 +41,23 @@ deploy_preflight() {
   if [[ ! -s "$pin_file" && "${NULLIM_PREFLIGHT_ONLY:-0}" != "1" ]]; then
     pre_sync_sha="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     echo "[DEPLOY][SYNC][AUTO] market=${market^^} session=$session trade_date=$trade_date source=existing_scheduler_chain"
-    if ! bash scripts/wsl/sync-market-code.sh "${market^^}" "$trade_date"; then
-      result=FAIL; reason=code_sync_failed; _preflight_log; return 1
-    fi
+    set +e
+    _deploy_sync_market_code "${market^^}" "$trade_date"
+    sync_rc=$?
+    set -e
+    case "$sync_rc" in
+      0) ;;
+      75)
+        echo "[DEPLOY][SYNC][WARN] reason=code_sync_deferred action=CONTINUE_CURRENT_VERIFIED_CODE"
+        git rev-parse HEAD > "$pin_file" || { result=FAIL; reason=pin_write_failed; _preflight_log; return 1; }
+        ;;
+      *)
+        result=FAIL; reason=code_sync_failed
+        echo "[DEPLOY][SYNC][FAIL] rc=$sync_rc"
+        _preflight_log
+        return "$sync_rc"
+        ;;
+    esac
     # reset --hard may have advanced the checkout; refresh every git fact.
     branch="$(git branch --show-current 2>/dev/null || echo detached)"
     head="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"

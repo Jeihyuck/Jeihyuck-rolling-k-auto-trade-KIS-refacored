@@ -64,7 +64,12 @@ blob = text(logs)
 mail_marker = root/'runtime/health'/f'{market}-mail-{day}.json'
 duplicate_skips=len(re.findall(r'SKIP_DUPLICATE|DUPLICATE_BLOCKED', blob, re.I))
 advisory_unavailable=len(re.findall(r'PB1_ADVISORY_LOCK_UNAVAILABLE', blob))
-result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'advisory_lock_unavailable_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs]}
+stale_detected=len(re.findall(r'\[LOCK\]\[STALE\]\[DETECTED\]', blob))
+stale_removed=len(re.findall(r'\[LOCK\]\[STALE\]\[REMOVED\]|\[LOCK\]\[RELEASED\]', blob))
+lock_warnings=len(re.findall(r'\[LOCK\].*\[WARN\]', blob))
+active_same_session=len(re.findall(r'\[LOCK\]\[ACTIVE\]\[SAME_SESSION\]\[SKIP\]', blob))
+order_idempotency=len(re.findall(r'ORDER_(?:IDEMPOTENCY|SKIP_ALREADY_SUBMITTED)|ALREADY_SUBMITTED_THIS_SESSION', blob, re.I))
+result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'active_same_session_count':active_same_session, 'stale_lock_detected_count':stale_detected, 'stale_lock_removed_count':stale_removed, 'lock_warning_count':lock_warnings, 'order_idempotency_skips':order_idempotency, 'advisory_lock_unavailable_count':advisory_unavailable, 'advisory_lock_failure_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs]}
 if mail_marker.exists():
     try:
         marker=json.loads(mail_marker.read_text())
@@ -102,9 +107,9 @@ if not result.get('scheduler_sha_matches'):
 if not result['mail_ok']:
     result['ok']=False
     result.setdefault('failure_reason','FAILED_MAIL_VALIDATION')
-if forbidden or duplicate_skips or advisory_unavailable:
+if forbidden or advisory_unavailable:
     result['ok']=False
-    result['failure_reason']='SCHEDULER_POLICY_VIOLATION' if forbidden else 'DUPLICATE_SESSION_START'
+    result['failure_reason']='SCHEDULER_POLICY_VIOLATION' if forbidden else 'PB1_ADVISORY_LOCK_UNAVAILABLE'
 Path(out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 lines=[f"NULLIM {market.upper()} health {day}"]+[f"- {k}: {v}" for k,v in result.items() if k!='logs_checked']
 Path(summary).write_text('\n'.join(lines)+'\n', encoding='utf-8')

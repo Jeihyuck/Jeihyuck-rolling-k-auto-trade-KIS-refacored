@@ -14,6 +14,21 @@ jobs:
         run: python -m pip install --upgrade pip pytest PyYAML
       - name: Validate shell syntax
         run: |
+          # Keep every session-lock integration in one syntax gate so a missing
+          # fi/esac in any market wrapper cannot pass CI unnoticed.
+          bash -n \
+            scripts/wsl/session-lock.sh \
+            scripts/wsl/run-kr-prep.sh \
+            scripts/wsl/run-kr-am.sh \
+            scripts/wsl/run-kr-afternoon.sh \
+            scripts/wsl/run-kr-close.sh \
+            scripts/wsl/run-us-prep.sh \
+            scripts/wsl/run-us-am.sh \
+            scripts/wsl/run-us-afternoon.sh \
+            scripts/wsl/run-us-close.sh \
+            scripts/wsl/run-us-trader.sh \
+            scripts/wsl/deploy-preflight.sh \
+            scripts/wsl/sync-market-code.sh
           bash -n scripts/wsl/nullim-repo-root.sh
           bash -n run_pb1_kr.sh scripts/wsl/run-kr-trader.sh scripts/wsl/run-us-trader.sh
           bash -n scripts/wsl/install-nullim-cron.sh

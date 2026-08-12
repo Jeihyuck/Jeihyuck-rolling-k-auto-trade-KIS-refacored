@@ -21,7 +21,8 @@ def test_controlled_sync_never_cleans_runtime_and_honors_active_locks():
 
 def test_existing_scheduler_chain_automatically_enters_sync():
     preflight = Path("scripts/wsl/deploy-preflight.sh").read_text()
-    assert 'bash scripts/wsl/sync-market-code.sh "${market^^}" "$trade_date"' in preflight
+    assert '_deploy_sync_market_code "${market^^}" "$trade_date"' in preflight
+    assert 'bash scripts/wsl/sync-market-code.sh "$@"' in preflight
     assert "source=existing_scheduler_chain" in preflight
     assert "[DEPLOY][SYNC][REEXEC]" in preflight
     for market in ("kr", "us"):

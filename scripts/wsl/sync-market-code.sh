@@ -11,8 +11,12 @@ exec 8>runtime/locks/deploy-global.lock
 flock -n 8 || { echo "[DEPLOY][SYNC][FAIL] reason=DEPLOY_LOCK_HELD"; exit 1; }
 for lock in runtime/locks/kr-*.lock runtime/locks/us-*.lock; do
   [[ -e "$lock" ]] || continue
+  [[ "$lock" == *-mail-snapshot.lock ]] && { echo "[LOCK][IGNORED][OUT_OF_SCOPE] scope=deploy lock=$lock"; continue; }
   exec {fd}>"$lock"
-  if ! flock -n "$fd"; then echo "[DEPLOY][SYNC][FAIL] reason=ACTIVE_TRADING_PROCESS lock=$lock"; exit 1; fi
+  if ! flock -n "$fd"; then
+    echo "[DEPLOY][SYNC][WARN] reason=ACTIVE_TRADING_PROCESS lock=$lock action=USE_CURRENT_VERIFIED_CODE"
+    exit 75
+  fi
 done
 pin="runtime/code-pins/${market}-${trade_date}.sha"
 if [[ -s "$pin" ]]; then
