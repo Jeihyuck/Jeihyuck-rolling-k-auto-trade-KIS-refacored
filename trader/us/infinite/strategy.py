@@ -8,7 +8,8 @@ from .models import Action, Decision, InfiniteState, PositionSnapshot, Status
 from .risk_adapter import assess_market_risk
 
 
-def _trading_days_since(start: date | None, end: date) -> int:
+def _trading_days_since(start: date | None, end: date,
+                        trading_sessions: frozenset[date] | None = None) -> int:
     if not start or start >= end:
         return 0
     from datetime import timedelta
@@ -16,7 +17,7 @@ def _trading_days_since(start: date | None, end: date) -> int:
     cursor, count = start, 0
     while cursor < end:
         cursor += timedelta(days=1)
-        count += int(is_us_trading_day(cursor))
+        count += int(cursor in trading_sessions if trading_sessions is not None else is_us_trading_day(cursor))
     return count
 
 
@@ -41,7 +42,8 @@ def classify_long_trend(overlay: dict | None, structural_bear_seen: bool = False
 
 def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: PositionSnapshot,
              trading_date: date, pending_buy: bool = False, pending_sell: bool = False,
-             daily_filled_buy_notional: float = 0.0, overlay: dict | None = None) -> Decision:
+             daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
+             trading_sessions: frozenset[date] | None = None) -> Decision:
     """Pure exit-first strategy decision; broker position is always authoritative."""
     if not config.enabled:
         return Decision(Action.WAIT, "feature_disabled")
@@ -116,7 +118,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     last_price = metadata.get("last_buy_fill_price")
     try: last_price = float(last_price) if last_price is not None else None
     except (TypeError, ValueError): last_price = None
-    days_since = _trading_days_since(state.last_buy_date, trading_date) if state.last_buy_date else 10_000
+    days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
+                  if state.last_buy_date else 10_000)
 
     if risk.verified_rebound:
         probe_date = metadata.get("rebound_probe_date")
@@ -125,7 +128,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         except ValueError:
             probe_date = trading_date
         if position.qty <= 0 or state.core_filled_notional >= config.core_capital_usd or (
-            probe_date and _trading_days_since(probe_date, trading_date) < config.rebound_cooldown
+            probe_date and _trading_days_since(probe_date, trading_date, trading_sessions) < config.rebound_cooldown
         ):
             return Decision(Action.BLOCK, "rebound_cooldown")
     elif capital_preservation:
