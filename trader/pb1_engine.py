@@ -9966,6 +9966,9 @@ class PB1Engine:
         FORCE_BUY 스모크 모드: 주문 endpoint까지 도달하는지 검증용.
         모의투자 전용. 시장가 또는 최우선 매수호가로 1주 강제 주문.
         """
+        if os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and str(code).zfill(6) == "122630":
+            logger.info("[KR_INF][PB1_OWNERSHIP_EXCLUDED] side=BUY path=force_buy symbol=122630")
+            return
         try:
             # 가격 조회
             quote = self._get_price_snapshot_cached(code, market="J")
@@ -10000,7 +10003,9 @@ class PB1Engine:
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
         if os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and str(cf.code).zfill(6) == "122630":
             logger.info("[KR_INF][PB1_OWNERSHIP_EXCLUDED] side=BUY path=entry symbol=122630")
-            return {"api_submitted": 0, "api_accepted": 0, "skip_reason": "KR_INFINITE_OWNERSHIP"}
+            status = self._empty_order_status()
+            status["skipped_reason"] = "KR_INFINITE_OWNERSHIP"
+            return status
         status: dict[str, Any] = self._empty_order_status()
         stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
@@ -10944,6 +10949,9 @@ class PB1Engine:
             )
 
     def _place_entry_close(self, cf: CandidateFeature) -> dict[str, int | str]:
+        if os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and str(cf.code).zfill(6) == "122630":
+            logger.info("[KR_INF][PB1_OWNERSHIP_EXCLUDED] side=BUY path=close_entry symbol=122630")
+            return self._empty_order_status()
         status: dict[str, Any] = self._empty_order_status()
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"

@@ -40,13 +40,13 @@ def load_price_history(*, engine=None, kis_provider=None, csv_path=None, start="
             return validate_frame(pd.DataFrame(rows),source="price_daily",adjusted_status=adjusted_status,
                                   corporate_action_status=corporate_action_status)
     if kis_provider is not None:
-        collected=[]; cursor=None
-        while True:
-            page=kis_provider.fetch_daily(symbol="122630",start=start,end=end,cursor=cursor)
-            collected.extend(page.get("rows") or []); cursor=page.get("next_cursor")
-            if not cursor: break
-        if collected:
-            return validate_frame(pd.DataFrame(collected),source="KIS_paginated",adjusted_status=adjusted_status,
+        # Reuse the repository's OHLCVProvider contract. KISOHLCVProvider itself
+        # performs DB-first loading and KIS period backfill; do not invent a cursor API.
+        result=kis_provider.get_ohlcv("122630",6000,purpose="kr_infinite_replay",
+                                      usage_context="validation",allow_long_fetch=True)
+        frame=getattr(result,"df",result)
+        if isinstance(frame,pd.DataFrame) and not frame.empty:
+            return validate_frame(frame,source=str((getattr(result,"meta",{}) or {}).get("source") or "KIS_OHLCVProvider"),adjusted_status=adjusted_status,
                                   corporate_action_status=corporate_action_status)
     if csv_path:
         return load_and_validate_csv(csv_path,source="verified_user_csv",adjusted_status=adjusted_status,

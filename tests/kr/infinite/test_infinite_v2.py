@@ -122,11 +122,19 @@ def test_cycle_return_includes_partial_sell(realized,remaining,price):
 def test_fill_ingestion_requires_sleeve_attribution():
     fills=Mock(); orders=Mock(); stamp=NOW
     meta={"strategy_id":"kr_kodex_infinite_v2","book":"KR_INFINITE","cycle_id":"c","client_order_key":"k","symbol":"122630"}
-    order={"order_id":"o","kis_odno":"123","client_order_key":"k","request_json":meta}
+    order={"order_id":"o","kis_odno":"123","client_order_key":"k","qty":2,"request_json":meta}
     evidence=[{"odno":"123","symbol":"122630","trade_id":"f1","side":"BUY","qty":2,"price":100,"filled_at":stamp}]
     assert ingest_fills(fills_repo=fills,orders_repo=orders,order=order,broker_fills=evidence,env="practice")==1
     fills.upsert_fill.assert_called_once(); orders.mark_filled.assert_called_once()
     assert ingest_fills(fills_repo=fills,orders_repo=orders,order={**order,"request_json":meta|{"book":"PB1"}},broker_fills=evidence,env="practice")==0
+
+
+def test_partial_fill_does_not_terminally_fill_order():
+    fills=Mock(); orders=Mock(); meta={"strategy_id":"kr_kodex_infinite_v2","book":"KR_INFINITE","cycle_id":"c","client_order_key":"k","symbol":"122630"}
+    order={"order_id":"o","kis_odno":"123","client_order_key":"k","qty":3,"request_json":meta}
+    evidence=[{"odno":"123","symbol":"122630","side":"BUY","qty":1,"price":100,"filled_at":NOW}]
+    assert ingest_fills(fills_repo=fills,orders_repo=orders,order=order,broker_fills=evidence,env="practice")==1
+    orders.mark_filled.assert_not_called()
 
 
 def test_ownership_adapter_is_narrow_and_exception_isolated():

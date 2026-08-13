@@ -6050,6 +6050,19 @@ def run_once(
             balance_state,
             balance_source,
         )
+        # The sleeve is independent of Final30/PREP candidates but reuses this
+        # session's authoritative DB, KIS, balance, trade date and regime artifact.
+        # It runs exactly once, before PB1 order evaluation, behind an exception
+        # boundary so its failure cannot change PB1's return contract.
+        if (os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+                and kis is not None and isinstance(balance_snapshot_raw, dict)):
+            from trader.kr.infinite.integration import run_isolated, run_production_sleeve
+            run_isolated(lambda: run_production_sleeve(
+                engine=engine, kis=kis, trade_date=trade_date, run_id=run_id,
+                balance_snapshot=balance_snapshot_raw, now=now,
+            ))
+        elif os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+            logger.warning("[KR_INF][BUY_BLOCKED] reason=AUTHORITATIVE_SESSION_EVIDENCE_UNAVAILABLE")
         account_sanity = _practice_account_sanity_check(
             env=env_effective,
             kis=kis,

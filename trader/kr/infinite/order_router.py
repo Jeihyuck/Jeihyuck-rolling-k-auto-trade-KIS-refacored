@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
 import hashlib, os
 from typing import Any, Callable
 from trader.kis_wrapper import extract_order_no, is_order_accepted, mask_order_response
@@ -81,17 +82,21 @@ def ingest_fills(*, fills_repo: Any, orders_repo: Any, order: dict, broker_fills
             and meta.get("cycle_id") and meta.get("client_order_key") == order.get("client_order_key")
             and str(meta.get("symbol")) == "122630"):
         return 0
-    count = 0
+    count = 0; total_qty = 0
     odno = str(order.get("kis_odno") or "")
     for fill in broker_fills:
         if str(fill.get("odno") or fill.get("ODNO") or "") != odno or str(fill.get("symbol") or fill.get("pdno") or "").zfill(6) != "122630":
             continue
+        stable_id=str(fill.get("trade_id") or fill.get("fill_id") or fill.get("odno_dvsn_no") or "")
+        if not stable_id:
+            identity=f"{env}|{odno}|{fill.get('filled_at')}|{fill.get('qty')}|{fill.get('price')}"
+            stable_id="kr-inf-"+sha256(identity.encode()).hexdigest()[:32]
         fills_repo.upsert_fill(env=env, run_id=run_id, order_id=str(order["order_id"]), kis_odno=odno,
-            trade_id=str(fill.get("trade_id") or fill.get("fill_id") or fill.get("odno_dvsn_no") or "") or None,
+            trade_id=stable_id,
             code="122630", market="KOSPI", side=str(fill["side"]).upper(), qty=int(fill["qty"]),
             price=float(fill["price"]), fee=float(fill.get("fee") or 0), tax=float(fill.get("tax") or 0),
             filled_at=fill["filled_at"], raw_json=fill, fill_meta_json=meta)
-        count += 1
-    if count:
+        count += 1; total_qty += int(fill["qty"])
+    if total_qty >= int(order.get("qty") or 0) > 0:
         orders_repo.mark_filled(env, kis_odno=odno)
     return count
