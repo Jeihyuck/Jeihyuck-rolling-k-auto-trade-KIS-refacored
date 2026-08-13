@@ -39,6 +39,35 @@ def test_partial_order_remains_pending_and_cancel_reject_clear_it():
         assert got.pending_order_key is None
 
 
+def test_duplicate_fill_is_idempotent_and_fees_are_inside_buy_cap():
+    state = InfiniteState(cycle_id="fee-cycle")
+    owner = {"strategy_id": state.strategy_id, "book": state.book, "cycle_id": state.cycle_id}
+    fill = {**owner, "fill_id": "unique-fill", "side": "BUY", "qty": 2,
+            "price": 100_000, "fee": 30, "trade_date": date(2026, 8, 13)}
+    got = InfiniteRepository.reconcile_evidence(state, broker_quantity=2,
+        broker_average_price=100_000, fills=[fill, dict(fill)], orders=[])
+    assert got.authoritative_buy_notional == 200_030
+    assert got.used_unit_fraction == 200_030 / 375_000
+
+
+def test_full_exit_completes_cycle_and_preserves_cycle_pnl_inputs():
+    state = InfiniteState(cycle_id="forty-unit-cycle", cycle_status="ACTIVE")
+    owner = {"strategy_id": state.strategy_id, "book": state.book, "cycle_id": state.cycle_id}
+    fills = [
+        {**owner, "fill_id": "buy", "side": "BUY", "qty": 1500,
+         "price": 9_998, "fee": 3_000, "trade_date": date(2026, 8, 12)},
+        {**owner, "fill_id": "sell", "side": "SELL", "qty": 1500,
+         "price": 10_800, "fee": 3_000, "tax": 29_160, "trade_date": date(2026, 8, 13)},
+    ]
+    got = InfiniteRepository.reconcile_evidence(state, broker_quantity=0,
+        broker_average_price=0, fills=fills, orders=[], trading_date=date(2026, 8, 13))
+    assert got.cycle_status == "COMPLETE" and got.filled_quantity == 0
+    assert got.authoritative_buy_notional == 15_000_000
+    assert got.authoritative_sell_notional == 16_167_840
+    assert got.used_unit_fraction == 40
+    assert got.metadata["cycle_completed_trade_date"] == "2026-08-13"
+
+
 class Scalar:
     def __init__(self, value): self.value = value
     def scalar(self): return self.value

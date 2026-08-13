@@ -85,16 +85,25 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
             state = repository.load_state(config.symbol)
             ownership = qty > 0 and (state is None or not state.cycle_id)
             if state and evidence_fills is not None and evidence_orders is not None:
+                previous_status = state.cycle_status
                 state = repository.reconcile_evidence(state, broker_quantity=qty, broker_average_price=avg,
-                    fills=evidence_fills, orders=evidence_orders, unit_krw=config.unit_krw)
+                    fills=evidence_fills, orders=evidence_orders, unit_krw=config.unit_krw,
+                    trading_date=trading_date)
                 repository.save_state(state)
                 logger.info("[KR_INF][RECONCILE] symbol=%s filled_quantity=%s buy_notional=%s sell_notional=%s used_units=%s pending=%s",
                     config.symbol, state.filled_quantity, state.authoritative_buy_notional,
                     state.authoritative_sell_notional, state.used_unit_fraction, state.pending_order_key)
+                if state.cycle_status == "COMPLETE" and previous_status != "COMPLETE":
+                    repository.archive_cycle(state)
             if ownership: logger.error("[KR_INF][OWNERSHIP_CONFLICT] symbol=%s quantity=%s", config.symbol, qty)
             snap = snapshot or _snapshot(Path("artifacts/kr_regime_snapshot.json"), trading_date)
             risk = assess(snap, trading_date, account_loss_kill_switch=account_loss_kill_switch)
             local = getattr(snap, "market_states", {}).get("KOSPI") if snap else None
+            completed_on = (state.metadata or {}).get("cycle_completed_trade_date") if state else None
+            if state and state.cycle_status == "COMPLETE" and completed_on != str(trading_date) and qty == 0:
+                state = InfiniteState(cycle_id=str(uuid.uuid4()), cycle_status="READY",
+                    symbol=config.symbol, policy_version=config.policy_version)
+                repository.save_state(state)
             logger.info("[KR_INF][REGIME] trade_date=%s symbol=%s global_state=%s kospi_state=%s kospi_score=%s kospi_data_quality=%s infinite_action=%s reason=%s",
                         trading_date, config.symbol, getattr(snap, "global_state", None), getattr(local, "state", None),
                         getattr(local, "score", None), getattr(local, "data_quality", None), risk.decision, risk.decision)
@@ -102,6 +111,17 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
                 quote=Quote(float(price), quote_at or datetime.now(timezone.utc)), trade_date=trading_date,
                 regime=risk, pending=pending, daily_filled_buy_notional=daily_filled_buy_notional,
                 ownership_conflict=ownership, reconciled=not (state and state.filled_quantity != qty))
+            # COMPLETE starts a clean cycle only on the next trade date. READY
+            # receives its UUID before the first intent/key is constructed.
+            if decision.action == Action.BUY and (state is None or not state.cycle_id):
+                active = InfiniteState(cycle_id=str(uuid.uuid4()), cycle_status="READY",
+                    symbol=config.symbol, policy_version=config.policy_version)
+                decision = evaluate(config=config, state=active,
+                    broker=BrokerPosition(qty, avg, orderable_cash), quote=Quote(float(price), quote_at),
+                    trade_date=trading_date, regime=risk, pending=pending,
+                    daily_filled_buy_notional=daily_filled_buy_notional,
+                    ownership_conflict=ownership, reconciled=True)
+                state = active
             logger.info("[KR_INF][DECISION] trade_date=%s symbol=%s decision=%s block_reason=%s quantity=%s client_order_key=%s effective_order_mode=%s",
                     trading_date, config.symbol, decision.action.value, decision.reason, decision.quantity, decision.client_order_key, mode)
             if decision.action == Action.BLOCK: logger.info("[KR_INF][BUY_BLOCKED] reason=%s", decision.reason)
@@ -109,16 +129,43 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
                 return {"status": "BLOCKED" if not gate else "SHADOW", "reason": gate_reason or decision.reason, "decision": decision, "orders": []}
             if decision.action == Action.BUY and not config.allow_buy or decision.action == Action.SELL and not config.allow_sell:
                 return {"status": "BLOCKED", "reason": "SIDE_DISABLED", "orders": []}
-            active = state or InfiniteState(cycle_id=str(uuid.uuid4()), cycle_status="RESERVED")
+            active = state
+            if active is None or not active.cycle_id:
+                return {"status": "BLOCKED", "reason": "CYCLE_ID_UNAVAILABLE", "orders": []}
             intent = {"side": decision.action.value, "symbol": config.symbol, "quantity": decision.quantity,
             "strategy_id": active.strategy_id, "book": active.book, "cycle_id": active.cycle_id,
             "policy_version": config.policy_version, "client_order_key": decision.client_order_key,
             "trade_date": str(trading_date), "unit_intent": min(1.0, decision.estimated_cost / config.unit_krw),
             "market_state_at_decision": getattr(local, "state", None), "authoritative_average_price": avg,
             "decision_price": price}
-            repository.save_state(replace(active, pending_order_key=decision.client_order_key))
+            pending_state = replace(active, pending_order_key=decision.client_order_key,
+                cycle_status="EXIT_PENDING" if decision.action == Action.SELL else active.cycle_status,
+                metadata={**active.metadata, "last_order_status": "INTENT"})
+            repository.save_state(pending_state)
             logger.info("[KR_INF][ORDER_INTENT] %s", json.dumps(intent, ensure_ascii=False))
-            return {"status": "SUBMITTED", "orders": [route(intent)], "decision": decision}
+            try:
+                response = route(intent)
+            except Exception as exc:
+                repository.save_state(replace(pending_state, cycle_status="RECONCILE_PENDING",
+                    metadata={**pending_state.metadata, "last_order_status": "UNKNOWN_EXCEPTION", "route_error": str(exc)}))
+                logger.exception("[KR_INF][ERROR] order_result=UNKNOWN client_order_key=%s", decision.client_order_key)
+                return {"status": "ERROR_ISOLATED", "reason": "ORDER_RESULT_UNKNOWN", "orders": [], "decision": decision}
+            response = response if isinstance(response, dict) else {}
+            broker_code = str(response.get("rt_cd") or response.get("status") or "").upper()
+            order_no = response.get("odno") or (response.get("output") or {}).get("ODNO") or response.get("order_no")
+            rejected = broker_code in {"1", "REJECTED", "REJECT", "FAILED", "ERROR"}
+            if rejected:
+                repository.save_state(replace(pending_state, pending_order_key=None,
+                    cycle_status="ACTIVE" if qty else "READY",
+                    metadata={**pending_state.metadata, "last_order_status": "REJECTED", "broker_response": response}))
+                return {"status": "REJECTED", "orders": [response], "decision": decision}
+            if order_no and broker_code in {"0", "ACK", "ACCEPTED", "SUBMITTED", ""}:
+                repository.save_state(replace(pending_state,
+                    metadata={**pending_state.metadata, "last_order_status": "ACK_PENDING", "broker_order_no": str(order_no)}))
+                return {"status": "ACK_PENDING", "orders": [response], "decision": decision}
+            repository.save_state(replace(pending_state, cycle_status="RECONCILE_PENDING",
+                metadata={**pending_state.metadata, "last_order_status": "RESULT_UNKNOWN", "broker_response": response}))
+            return {"status": "RECONCILE_PENDING", "orders": [response], "decision": decision}
     except Exception as exc:
         logger.exception("[KR_INF][ERROR] trade_date=%s symbol=%s error=%s", trading_date, config.symbol, exc)
         return {"status": "ERROR_ISOLATED", "reason": str(exc), "orders": []}

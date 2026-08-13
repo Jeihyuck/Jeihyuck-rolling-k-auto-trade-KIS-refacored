@@ -65,7 +65,7 @@ Replay 엔진은 수정 OHLC, 실제 입력 행의 거래일, 전일까지의 20
 
 ## 테스트 및 남은 위험
 
-신규 39개 테스트는 기본 설정, exact 8-state mapping/행동, KOSPI 독립성, stale/unknown/kill
+신규 41개 테스트는 기본 설정, exact 8-state mapping/행동, KOSPI 독립성, stale/unknown/kill
 switch, fee-aware cap, partial fill, pending/restart/idempotency, reconcile/ownership conflict,
 sell-first, live gate, replay 비용/look-ahead 경계를 검증한다. DB/KIS 운영 integration은 실제 계좌와
 PostgreSQL 없이는 end-to-end 검증할 수 없다. 실제 장기 replay가 성공하여 deployable policy를
@@ -79,3 +79,9 @@ orderable cash와 router를 직접 주입하도록 변경했다. 동일 PostgreS
 실제 DB/KIS credentials와 장기 수정 OHLCV가 없으므로 실제 broker ACK→fill E2E 및 실제 replay는
 여전히 완료하지 못했다. 따라서 `deployable_buy_policy=False`, PR Draft 유지, Ready 전환 금지가
 올바른 상태다.
+
+추가로 주문 route 결과를 ACK_PENDING/REJECTED/RECONCILE_PENDING으로 구분하고, 결과 불명
+예외는 pending을 보존한다. 실제 fill만 수수료 포함 buy notional과 unit을 증가시키며 fill identity로
+중복을 제거한다. 전량매도와 broker 잔고 0이 함께 확인된 cycle은 별도 history table에 보존하고,
+완료 다음 거래일 새 UUID와 0원 cap으로 시작한다. 검증 명령 결과는 `tests/kr/infinite` 41 passed,
+`tests/kr` 148 passed, runner/order/reconcile 선택 회귀 27 passed이다.

@@ -11,13 +11,14 @@ from trader.kr.regime import (KRExecutionPolicy, KRMarketExecutionPolicy, KRMark
 
 
 class Repo:
-    def __init__(self): self.state = InfiniteState(); self.saved = []
+    def __init__(self): self.state = InfiniteState(); self.saved = []; self.archived = []
     def ensure_schema(self): pass
     @contextmanager
     def critical_section(self): yield True
     def load_state(self, symbol): return self.state
     def save_state(self, state): self.state = state; self.saved.append(state)
     def reconcile_evidence(self, state, **kwargs): return state
+    def archive_cycle(self, state): self.archived.append(state)
 
 
 def snap(state):
