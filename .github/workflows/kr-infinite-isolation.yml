@@ -16,5 +16,10 @@ jobs:
           if rg -n '^(trader/us/|tests/us/|scripts/wsl/run-us-)|^migrations/.*us_|scheduler' /tmp/changed; then
             echo 'Forbidden isolation path changed'; exit 1
           fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install pytest -r requirements.txt
       - name: Canonical mapping and tests
         run: pytest -q tests/kr/infinite
