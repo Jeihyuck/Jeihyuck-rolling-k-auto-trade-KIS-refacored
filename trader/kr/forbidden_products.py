@@ -20,14 +20,17 @@ def is_forbidden_kr_product(symbol: str | None = None, name: str | None = None, 
     sym = str(symbol or row.get("symbol") or row.get("code") or "").strip()
     if sym.isdigit(): sym = sym.zfill(6)
     nm = str(name or row.get("name") or row.get("code_name") or "")
-    # Ownership boundary only: when the isolated sleeve is enabled, legacy KR
-    # candidate/entry paths must not originate a 122630 BUY. The sleeve itself
-    # does not call this legacy product gate.
-    infinite_reserved = os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and sym == "122630"
-    return bool(infinite_reserved or (sym and sym in forbidden_symbols()) or any(k and k.lower() in nm.lower().replace(" ", "") for k in forbidden_keywords()))
+    return bool((sym and sym in forbidden_symbols()) or any(k and k.lower() in nm.lower().replace(" ", "") for k in forbidden_keywords()))
 
 def block_buy_if_forbidden(intent: dict[str, Any]) -> dict[str, Any]:
     side = str(intent.get("side") or intent.get("action") or "").upper()
+    symbol = str(intent.get("symbol") or intent.get("code") or "").zfill(6)
+    if side == "BUY" and symbol == "122630" and os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        owner = (str(intent.get("strategy_id") or ""), str(intent.get("book") or ""))
+        if owner == ("KR_KODEX_LEVERAGE_INFINITE_V1", "KR_INFINITE_BOOK"):
+            return dict(intent)
+        out = dict(intent); out.update({"status": "BLOCKED", "reason": "KR_INFINITE_OWNERSHIP_RESERVED", "blocked_reason": "KR_INFINITE_OWNERSHIP_RESERVED"})
+        return out
     if side == "BUY" and is_forbidden_kr_product(row=intent):
         out = dict(intent); out.update({"status": "BLOCKED", "reason": BLOCK_REASON, "blocked_reason": BLOCK_REASON})
         return out

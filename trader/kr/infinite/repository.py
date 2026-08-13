@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import asdict
+from dataclasses import replace
 from datetime import date
 
 from sqlalchemy import text
@@ -52,10 +54,81 @@ class InfiniteRepository:
                current_regime_score=EXCLUDED.current_regime_score,data_quality=EXCLUDED.data_quality,
                metadata=EXCLUDED.metadata,updated_at=NOW()"""), p)
 
-    def try_lock(self) -> bool:
+    def load_evidence(self, state: InfiniteState, trading_date: date) -> tuple[list[dict], list[dict]]:
+        """Read only rows whose persisted intent metadata proves sleeve ownership."""
+        params = {"symbol": state.symbol, "strategy": state.strategy_id,
+                  "book": state.book, "cycle": state.cycle_id or ""}
         with self.engine.connect() as conn:
-            return bool(conn.execute(text("SELECT pg_try_advisory_lock(hashtext('KR_INF:122630'))")).scalar())
+            orders = conn.execute(text("""SELECT side,status,client_order_key,request_json,kis_odno
+              FROM orders WHERE code=:symbol AND strategy=:strategy"""), params).mappings().all()
+            fills = conn.execute(text("""SELECT f.side,f.qty,f.price,f.filled_at,f.raw_json,
+                     o.request_json,o.client_order_key
+              FROM fills f JOIN orders o ON o.order_id=f.order_id
+              WHERE f.code=:symbol AND o.strategy=:strategy"""), params).mappings().all()
+        def metadata(row, key):
+            raw = row.get(key) or {}
+            try: return json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except (ValueError, TypeError): return {}
+        owned_orders = []
+        for row in orders:
+            md = metadata(row, "request_json")
+            if md.get("book") == state.book and str(md.get("cycle_id") or "") == params["cycle"]:
+                owned_orders.append({**dict(row), **md, "strategy_id": state.strategy_id})
+        owned_fills = []
+        for row in fills:
+            md = metadata(row, "request_json"); raw = metadata(row, "raw_json")
+            if md.get("book") == state.book and str(md.get("cycle_id") or "") == params["cycle"]:
+                owned_fills.append({**dict(row), **md, **raw, "strategy_id": state.strategy_id,
+                    "trade_date": str(row.get("filled_at") or "")[:10]})
+        return owned_fills, owned_orders
 
-    def unlock(self) -> None:
-        with self.engine.connect() as conn:
-            conn.execute(text("SELECT pg_advisory_unlock(hashtext('KR_INF:122630'))"))
+    @contextmanager
+    def critical_section(self):
+        """Hold one PostgreSQL session for lock, work and unlock.
+
+        Session advisory locks are connection-owned; acquiring and releasing on
+        separate pooled connections can leak a lock indefinitely.
+        """
+        conn = self.engine.connect()
+        acquired = False
+        try:
+            acquired = bool(conn.execute(text("SELECT pg_try_advisory_lock(hashtext('KR_INF:122630'))")).scalar())
+            yield acquired
+        finally:
+            if acquired:
+                conn.execute(text("SELECT pg_advisory_unlock(hashtext('KR_INF:122630'))"))
+            conn.close()
+
+    @staticmethod
+    def reconcile_evidence(state: InfiniteState, *, broker_quantity: int,
+                           broker_average_price: float, fills: list[dict],
+                           orders: list[dict], unit_krw: float = 375_000) -> InfiniteState:
+        """Rebuild accounting from attributed authoritative fills and orders."""
+        def owned(row):
+            return (str(row.get("strategy_id") or row.get("strategy") or "") == state.strategy_id
+                    and str(row.get("book") or "") == state.book
+                    and str(row.get("cycle_id") or "") == str(state.cycle_id or ""))
+        buys = sells = 0.0; last_buy = None
+        for row in fills:
+            if not owned(row): continue
+            qty = max(0, int(row.get("filled_quantity") or row.get("qty") or 0))
+            price = max(0.0, float(row.get("fill_price") or row.get("price") or 0))
+            notional = qty * price
+            if str(row.get("side") or "").upper() == "BUY":
+                buys += notional
+                td = row.get("trade_date")
+                if td: last_buy = max(filter(None, (last_buy, td)))
+            elif str(row.get("side") or "").upper() == "SELL": sells += notional
+        pending_states = {"INTENT", "SUBMITTED", "ACK", "OPEN", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING"}
+        pending = next((str(o.get("client_order_key")) for o in reversed(orders)
+                        if owned(o) and str(o.get("status") or "").upper() in pending_states), None)
+        if broker_quantity != 0 and broker_average_price <= 0:
+            raise ValueError("broker average price missing for open position")
+        if broker_quantity > 0 and buys <= 0:
+            raise ValueError("broker position has no attributed cycle fills")
+        status = "ACTIVE" if broker_quantity > 0 else ("EXIT_PENDING" if pending else "COMPLETE" if sells else "READY")
+        return replace(state, filled_quantity=broker_quantity,
+            authoritative_buy_notional=buys, authoritative_sell_notional=sells,
+            authoritative_average_price=broker_average_price if broker_quantity else 0.0,
+            used_unit_fraction=buys / unit_krw, last_buy_trade_date=last_buy,
+            pending_order_key=pending, cycle_status=status)

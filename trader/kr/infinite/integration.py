@@ -63,7 +63,10 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
                repository: InfiniteRepository | None = None,
                route: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
                orderable_cash: float = 0, pending: bool = False,
-               daily_filled_buy_notional: float = 0) -> dict[str, Any]:
+               daily_filled_buy_notional: float = 0,
+               account_loss_kill_switch: bool = False,
+               evidence_fills: list[dict] | None = None,
+               evidence_orders: list[dict] | None = None) -> dict[str, Any]:
     config = InfiniteConfig.from_env(); config.validate()
     gate, gate_reason = global_order_gate()
     mode = "LIVE" if gate and config.real_order else "SHADOW" if config.real_order else "BLOCKED"
@@ -72,53 +75,70 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
                 config.capital_krw, config.units, config.unit_krw, int(gate), mode, gate_reason)
     if not config.enabled: return {"status": "OFF", "orders": []}
     repository = repository or InfiniteRepository()
-    locked = False
     try:
         repository.ensure_schema()
-        locked = repository.try_lock()
-        if not locked: return {"status": "BLOCK", "reason": "CONCURRENT_RUN", "orders": []}
-        raw = next((p for p in positions or [] if str(p.get("symbol") or p.get("code") or "").zfill(6) == config.symbol), {})
-        qty = int(float(raw.get("quantity") or raw.get("qty") or raw.get("hldg_qty") or 0))
-        avg = float(raw.get("average_price") or raw.get("avg_price") or raw.get("pchs_avg_pric") or 0)
-        state = repository.load_state(config.symbol)
-        ownership = qty > 0 and (state is None or not state.cycle_id)
-        if ownership: logger.error("[KR_INF][OWNERSHIP_CONFLICT] symbol=%s quantity=%s", config.symbol, qty)
-        snap = snapshot or _snapshot(Path("artifacts/kr_regime_snapshot.json"), trading_date)
-        risk = assess(snap, trading_date)
-        local = getattr(snap, "market_states", {}).get("KOSPI") if snap else None
-        logger.info("[KR_INF][REGIME] trade_date=%s symbol=%s global_state=%s kospi_state=%s kospi_score=%s kospi_data_quality=%s infinite_action=%s reason=%s",
-                    trading_date, config.symbol, getattr(snap, "global_state", None), getattr(local, "state", None),
-                    getattr(local, "score", None), getattr(local, "data_quality", None), risk.decision, risk.decision)
-        decision = evaluate(config=config, state=state, broker=BrokerPosition(qty, avg, orderable_cash),
-            quote=Quote(float(price), quote_at or datetime.now(timezone.utc)), trade_date=trading_date,
-            regime=risk, pending=pending, daily_filled_buy_notional=daily_filled_buy_notional,
-            ownership_conflict=ownership, reconciled=not (state and state.filled_quantity != qty))
-        logger.info("[KR_INF][DECISION] trade_date=%s symbol=%s decision=%s block_reason=%s quantity=%s client_order_key=%s effective_order_mode=%s",
+        with repository.critical_section() as locked:
+            if not locked: return {"status": "BLOCK", "reason": "CONCURRENT_RUN", "orders": []}
+            raw = next((p for p in positions or [] if str(p.get("symbol") or p.get("code") or p.get("pdno") or "").zfill(6) == config.symbol), {})
+            qty = int(float(raw.get("quantity") or raw.get("qty") or raw.get("hldg_qty") or 0))
+            avg = float(raw.get("average_price") or raw.get("avg_price") or raw.get("pchs_avg_pric") or 0)
+            state = repository.load_state(config.symbol)
+            ownership = qty > 0 and (state is None or not state.cycle_id)
+            if state and evidence_fills is not None and evidence_orders is not None:
+                state = repository.reconcile_evidence(state, broker_quantity=qty, broker_average_price=avg,
+                    fills=evidence_fills, orders=evidence_orders, unit_krw=config.unit_krw)
+                repository.save_state(state)
+                logger.info("[KR_INF][RECONCILE] symbol=%s filled_quantity=%s buy_notional=%s sell_notional=%s used_units=%s pending=%s",
+                    config.symbol, state.filled_quantity, state.authoritative_buy_notional,
+                    state.authoritative_sell_notional, state.used_unit_fraction, state.pending_order_key)
+            if ownership: logger.error("[KR_INF][OWNERSHIP_CONFLICT] symbol=%s quantity=%s", config.symbol, qty)
+            snap = snapshot or _snapshot(Path("artifacts/kr_regime_snapshot.json"), trading_date)
+            risk = assess(snap, trading_date, account_loss_kill_switch=account_loss_kill_switch)
+            local = getattr(snap, "market_states", {}).get("KOSPI") if snap else None
+            logger.info("[KR_INF][REGIME] trade_date=%s symbol=%s global_state=%s kospi_state=%s kospi_score=%s kospi_data_quality=%s infinite_action=%s reason=%s",
+                        trading_date, config.symbol, getattr(snap, "global_state", None), getattr(local, "state", None),
+                        getattr(local, "score", None), getattr(local, "data_quality", None), risk.decision, risk.decision)
+            decision = evaluate(config=config, state=state, broker=BrokerPosition(qty, avg, orderable_cash),
+                quote=Quote(float(price), quote_at or datetime.now(timezone.utc)), trade_date=trading_date,
+                regime=risk, pending=pending, daily_filled_buy_notional=daily_filled_buy_notional,
+                ownership_conflict=ownership, reconciled=not (state and state.filled_quantity != qty))
+            logger.info("[KR_INF][DECISION] trade_date=%s symbol=%s decision=%s block_reason=%s quantity=%s client_order_key=%s effective_order_mode=%s",
                     trading_date, config.symbol, decision.action.value, decision.reason, decision.quantity, decision.client_order_key, mode)
-        if decision.action == Action.BLOCK: logger.info("[KR_INF][BUY_BLOCKED] reason=%s", decision.reason)
-        if decision.action not in {Action.BUY, Action.SELL} or not gate or not config.real_order or route is None:
-            return {"status": "BLOCKED" if not gate else "SHADOW", "reason": gate_reason or decision.reason, "decision": decision, "orders": []}
-        if decision.action == Action.BUY and not config.allow_buy or decision.action == Action.SELL and not config.allow_sell:
-            return {"status": "BLOCKED", "reason": "SIDE_DISABLED", "orders": []}
-        active = state or InfiniteState(cycle_id=str(uuid.uuid4()), cycle_status="RESERVED")
-        intent = {"side": decision.action.value, "symbol": config.symbol, "quantity": decision.quantity,
+            if decision.action == Action.BLOCK: logger.info("[KR_INF][BUY_BLOCKED] reason=%s", decision.reason)
+            if decision.action not in {Action.BUY, Action.SELL} or not gate or not config.real_order or route is None:
+                return {"status": "BLOCKED" if not gate else "SHADOW", "reason": gate_reason or decision.reason, "decision": decision, "orders": []}
+            if decision.action == Action.BUY and not config.allow_buy or decision.action == Action.SELL and not config.allow_sell:
+                return {"status": "BLOCKED", "reason": "SIDE_DISABLED", "orders": []}
+            active = state or InfiniteState(cycle_id=str(uuid.uuid4()), cycle_status="RESERVED")
+            intent = {"side": decision.action.value, "symbol": config.symbol, "quantity": decision.quantity,
             "strategy_id": active.strategy_id, "book": active.book, "cycle_id": active.cycle_id,
             "policy_version": config.policy_version, "client_order_key": decision.client_order_key,
             "trade_date": str(trading_date), "unit_intent": min(1.0, decision.estimated_cost / config.unit_krw),
             "market_state_at_decision": getattr(local, "state", None), "authoritative_average_price": avg,
             "decision_price": price}
-        repository.save_state(replace(active, pending_order_key=decision.client_order_key))
-        logger.info("[KR_INF][ORDER_INTENT] %s", json.dumps(intent, ensure_ascii=False))
-        return {"status": "SUBMITTED", "orders": [route(intent)], "decision": decision}
+            repository.save_state(replace(active, pending_order_key=decision.client_order_key))
+            logger.info("[KR_INF][ORDER_INTENT] %s", json.dumps(intent, ensure_ascii=False))
+            return {"status": "SUBMITTED", "orders": [route(intent)], "decision": decision}
     except Exception as exc:
         logger.exception("[KR_INF][ERROR] trade_date=%s symbol=%s error=%s", trading_date, config.symbol, exc)
         return {"status": "ERROR_ISOLATED", "reason": str(exc), "orders": []}
-    finally:
-        if locked:
-            try: repository.unlock()
-            except Exception: logger.exception("[KR_INF][ERROR] advisory_unlock_failed")
-
-
-def run_session_hook(trading_date: date) -> dict[str, Any]:
-    """Minimal session hook. Missing authoritative inputs deliberately produce zero orders."""
-    return run_sleeve(trading_date=trading_date)
+def run_session_hook(*, trading_date: date, positions: list[dict], price: float,
+                     quote_at: datetime, snapshot: KRRegimeSnapshot,
+                     orderable_cash: float, pending: bool,
+                     daily_filled_buy_notional: float, route: Callable[[dict], dict],
+                     account_loss_kill_switch: bool, repository: InfiniteRepository | None = None,
+                     evidence_fills: list[dict] | None = None,
+                     evidence_orders: list[dict] | None = None) -> dict[str, Any]:
+    """Required-input session seam; callers cannot silently invoke empty defaults."""
+    missing = [name for name, value in (("positions", positions), ("quote", price),
+        ("quote_at", quote_at), ("snapshot", snapshot), ("route", route)) if value is None]
+    if missing:
+        reason = "MISSING_AUTHORITATIVE_INPUT:" + ",".join(missing)
+        logger.error("[KR_INF][BUY_BLOCKED] reason=%s", reason)
+        return {"status": "BLOCKED", "reason": reason, "orders": []}
+    return run_sleeve(trading_date=trading_date, positions=positions, price=price,
+        quote_at=quote_at, snapshot=snapshot, repository=repository, route=route,
+        orderable_cash=orderable_cash, pending=pending,
+        daily_filled_buy_notional=daily_filled_buy_notional,
+        account_loss_kill_switch=account_loss_kill_switch,
+        evidence_fills=evidence_fills, evidence_orders=evidence_orders)

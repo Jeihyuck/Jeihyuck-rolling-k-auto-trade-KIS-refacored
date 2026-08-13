@@ -65,8 +65,17 @@ Replay 엔진은 수정 OHLC, 실제 입력 행의 거래일, 전일까지의 20
 
 ## 테스트 및 남은 위험
 
-신규 24개 테스트는 기본 설정, exact 8-state mapping/행동, KOSPI 독립성, stale/unknown/kill
+신규 39개 테스트는 기본 설정, exact 8-state mapping/행동, KOSPI 독립성, stale/unknown/kill
 switch, fee-aware cap, partial fill, pending/restart/idempotency, reconcile/ownership conflict,
 sell-first, live gate, replay 비용/look-ahead 경계를 검증한다. DB/KIS 운영 integration은 실제 계좌와
 PostgreSQL 없이는 end-to-end 검증할 수 없다. 실제 장기 replay가 성공하여 deployable policy를
 고정하기 전에는 주문 운영 승인을 해서는 안 된다. Scheduler 변경은 없다.
+
+## PR97 재검토 상태
+
+세션 hook의 빈 기본값 호출은 제거하고 PB1 tick이 사용하는 snapshot, KIS balance/quote,
+orderable cash와 router를 직접 주입하도록 변경했다. 동일 PostgreSQL connection에서 advisory lock을
+획득·해제하고, 귀속된 부분체결/terminal order evidence 기반 reconcile을 추가했다. 다만 이 환경에는
+실제 DB/KIS credentials와 장기 수정 OHLCV가 없으므로 실제 broker ACK→fill E2E 및 실제 replay는
+여전히 완료하지 못했다. 따라서 `deployable_buy_policy=False`, PR Draft 유지, Ready 전환 금지가
+올바른 상태다.
