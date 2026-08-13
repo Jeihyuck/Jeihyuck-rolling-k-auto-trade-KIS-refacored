@@ -23,6 +23,7 @@ def test_defaults_are_enabled_and_real(monkeypatch):
         monkeypatch.delenv("KR_INFINITE_" + key, raising=False)
     c = InfiniteConfig.from_env(); c.validate()
     assert c.enabled and c.real_order and c.allow_buy and c.allow_sell
+    assert c.deployable_buy_policy is False  # actual replay has not selected a production policy
     assert (c.symbol, c.capital_krw, c.units, c.unit_krw) == ("122630", 15_000_000, 40, 375_000)
 
 

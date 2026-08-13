@@ -58,14 +58,18 @@ Replay 엔진은 수정 OHLC, 실제 입력 행의 거래일, 전일까지의 20
 
 ## 실제 replay 시도 및 2022
 
-- 요청: Yahoo Finance `122630.KS`, 가능한 최초일부터 2026-12-31 이전 일봉.
-- 결과: outbound tunnel 403. 실제 기간, 전체/OOS/work-forward, 2018/2020/2022/회복,
+- 요청: `price_daily → 기존 KIS OHLCV provider → 사용자 CSV` auto loader로 2010-01-01부터 최신 완료 일봉.
+- 결과: 신규 auto loader가 `price_daily`를 먼저 조회했으나 DB URL이 없었고, 기존 KIS OHLCV
+  provider fallback은 KIS credentials/network가 없어 실패했으며 사용자 CSV도 제공되지 않았다.
+  Loader exit code는 2, row count는 0, empty checksum은
+  `4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945`이다. 실제 기간,
+  전체/OOS/work-forward, 2018/2020/2022/회복,
   buy-and-hold, ±20% sensitivity 지표는 모두 `null`이다.
 - 2022 손익/MDD/자금 조기 소진: **검증 불가**, 조작하지 않음.
 
 ## 테스트 및 남은 위험
 
-신규 41개 테스트는 기본 설정, exact 8-state mapping/행동, KOSPI 독립성, stale/unknown/kill
+신규 43개 테스트는 기본 설정, exact 8-state mapping/행동, KOSPI 독립성, stale/unknown/kill
 switch, fee-aware cap, partial fill, pending/restart/idempotency, reconcile/ownership conflict,
 sell-first, live gate, replay 비용/look-ahead 경계를 검증한다. DB/KIS 운영 integration은 실제 계좌와
 PostgreSQL 없이는 end-to-end 검증할 수 없다. 실제 장기 replay가 성공하여 deployable policy를
@@ -83,5 +87,10 @@ orderable cash와 router를 직접 주입하도록 변경했다. 동일 PostgreS
 추가로 주문 route 결과를 ACK_PENDING/REJECTED/RECONCILE_PENDING으로 구분하고, 결과 불명
 예외는 pending을 보존한다. 실제 fill만 수수료 포함 buy notional과 unit을 증가시키며 fill identity로
 중복을 제거한다. 전량매도와 broker 잔고 0이 함께 확인된 cycle은 별도 history table에 보존하고,
-완료 다음 거래일 새 UUID와 0원 cap으로 시작한다. 검증 명령 결과는 `tests/kr/infinite` 41 passed,
-`tests/kr` 148 passed, runner/order/reconcile 선택 회귀 27 passed이다.
+완료 다음 거래일 새 UUID와 0원 cap으로 시작한다. 검증 명령 결과는 `tests/kr/infinite` 43 passed,
+`tests/kr` 149 passed, runner/order/reconcile/regime 선택 회귀 59 passed이다.
+
+Practice는 더 이상 `KIS_NOT_LIVE`로 차단하지 않고 기존 KIS wrapper의 선택된 practice endpoint로
+전달된다. 실전/모의 모두 공통 DRY_RUN, DISABLE_LIVE_TRADING, FORCE_BLOCK_LIVE,
+LIVE_TRADING_ENABLED, STRATEGY_MODE gate를 통과해야 한다. 다만 실제 replay 미완료 때문에
+`deployable_buy_policy=False`가 최종 BUY를 차단하므로 기본 practice BUY 1건 증거는 아직 없다.

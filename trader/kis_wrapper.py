@@ -4748,6 +4748,14 @@ class KisAPI:
             return self.sell_stock_market(code, qty)
         return self.sell_stock_limit(code, qty, price)
 
+    def sell_stock_attributed(self, code: str, qty: int, *, metadata: dict, price: Optional[int] = None):
+        """Additive KR sleeve adapter; ordinary sell behavior is unchanged."""
+        response = self.sell_stock(code, qty, price)
+        if isinstance(response, dict):
+            response = dict(response)
+            response["_kr_order_metadata"] = dict(metadata)
+        return response
+
     # ===== [NEW] 주문 후 확인/보조: 체결 후 잔고 동기화 =====
     def refresh_after_order(self, wait_sec: float = 3.0, max_tries: int = 5) -> dict:
         """

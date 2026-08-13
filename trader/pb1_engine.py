@@ -14704,8 +14704,11 @@ class PB1Engine:
             validated = block_buy_if_forbidden(intent)
             if validated.get("status") == "BLOCKED": return validated
             side, qty = str(intent["side"]).upper(), int(intent["quantity"])
-            if side == "BUY": return self.kis.buy_stock_market_guarded("122630", qty, metadata=intent)
-            return self.kis.sell_stock("122630", qty)
+            if side == "BUY":
+                response = self.kis.buy_stock_market_guarded("122630", qty, metadata=intent)
+                if isinstance(response, dict): response["_kr_order_metadata"] = dict(intent)
+                return response
+            return self.kis.sell_stock_attributed("122630", qty, metadata=intent)
 
         return run_session_hook(trading_date=self._today, positions=positions, price=price,
             quote_at=quote_at, snapshot=snapshot, orderable_cash=available_cash_krw,
@@ -14714,7 +14717,11 @@ class PB1Engine:
             repository=repo, evidence_fills=fills, evidence_orders=orders)
 
     def _evaluate_kr_market_state_overlay_for_tick(self, *, tick_budget_krw: float, positions: list[dict], available_cash_krw: float, final30_rows: list[dict] | None = None) -> tuple[dict | None, float]:
-        if not (self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True)):
+        if not self._is_kr_equity_context():
+            return None, float(tick_budget_krw or 0.0)
+        if not env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
+            logger.warning("[KR_INF][BUY_BLOCKED] reason=REGIME_SNAPSHOT_UNAVAILABLE overlay_enabled=0 broker_calls=0")
+            self._kr_infinite_health = {"status": "BLOCKED", "reason": "REGIME_SNAPSHOT_UNAVAILABLE"}
             return None, float(tick_budget_krw or 0.0)
         try:
             overlay_positions = self._kr_positions_for_overlay(positions)

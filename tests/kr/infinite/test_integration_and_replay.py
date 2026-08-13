@@ -31,6 +31,12 @@ def test_global_live_gate_never_bypassed():
         assert not global_order_gate(blocked)[0]
 
 
+def test_practice_is_an_ordering_mode_not_a_live_account_failure():
+    env = {"STRATEGY_MODE": "LIVE", "KIS_ENV": "practice", "LIVE_TRADING_ENABLED": "1",
+           "DRY_RUN": "0", "DISABLE_LIVE_TRADING": "0", "FORCE_BLOCK_LIVE": "0"}
+    assert global_order_gate(env) == (True, "", "PRACTICE")
+
+
 def test_replay_is_next_day_and_cost_aware():
     start = datetime(2020, 1, 1)
     rows = []

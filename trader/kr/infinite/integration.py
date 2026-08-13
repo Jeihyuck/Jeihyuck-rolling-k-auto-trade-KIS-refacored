@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from trader.kr.regime import KRExecutionPolicy, KRMarketExecutionPolicy, KRMarketState, KRRegimeSnapshot
+from trader.kis_wrapper import extract_order_no, is_order_accepted, mask_order_response
 
 from .config import InfiniteConfig
 from .models import Action, BrokerPosition, InfiniteState, Quote
@@ -33,17 +34,19 @@ def exclude_owned(rows: list[dict], config: InfiniteConfig | None = None) -> lis
     return [row for row in rows if str(row.get("symbol") or row.get("code") or "").zfill(6) != config.symbol]
 
 
-def global_order_gate(env: dict[str, str] | None = None) -> tuple[bool, str]:
+def global_order_gate(env: dict[str, str] | None = None) -> tuple[bool, str, str]:
     e = env or os.environ
     required_true = ("LIVE_TRADING_ENABLED",)
     required_false = ("DRY_RUN", "DISABLE_LIVE_TRADING", "FORCE_BLOCK_LIVE")
-    if str(e.get("STRATEGY_MODE", "")).upper() != "LIVE": return False, "STRATEGY_MODE_NOT_LIVE"
-    if str(e.get("KIS_ENV") or e.get("STRATEGY_ENV") or "").lower() not in {"prod", "production", "live", "real"}: return False, "KIS_NOT_LIVE"
+    kis_env = str(e.get("KIS_ENV") or e.get("STRATEGY_ENV") or "practice").lower()
+    if str(e.get("STRATEGY_MODE", "")).upper() != "LIVE": return False, "STRATEGY_MODE_NOT_LIVE", "BLOCKED"
     for key in required_true:
-        if str(e.get(key, "0")).lower() not in {"1", "true", "yes", "on"}: return False, f"{key}_OFF"
+        if str(e.get(key, "0")).lower() not in {"1", "true", "yes", "on"}: return False, f"{key}_OFF", "BLOCKED"
     for key in required_false:
-        if str(e.get(key, "0")).lower() in {"1", "true", "yes", "on"}: return False, key
-    return True, ""
+        if str(e.get(key, "0")).lower() in {"1", "true", "yes", "on"}: return False, key, "BLOCKED"
+    if kis_env == "practice": return True, "", "PRACTICE"
+    if kis_env in {"prod", "production", "live", "real"}: return True, "", "LIVE"
+    return False, "KIS_ENV_UNSUPPORTED", "BLOCKED"
 
 
 def _snapshot(path: Path, trade_date: date) -> KRRegimeSnapshot | None:
@@ -68,8 +71,8 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
                evidence_fills: list[dict] | None = None,
                evidence_orders: list[dict] | None = None) -> dict[str, Any]:
     config = InfiniteConfig.from_env(); config.validate()
-    gate, gate_reason = global_order_gate()
-    mode = "LIVE" if gate and config.real_order else "SHADOW" if config.real_order else "BLOCKED"
+    gate, gate_reason, selected_mode = global_order_gate()
+    mode = selected_mode if gate and config.real_order else "SHADOW" if not config.real_order else "BLOCKED"
     logger.info("[KR_INF][CONFIG] enabled=%s real_order=%s allow_buy=%s allow_sell=%s symbol=%s capital_krw=%s units=%s unit_krw=%s global_live_gate=%s effective_order_mode=%s block_reason=%s",
                 int(config.enabled), int(config.real_order), int(config.allow_buy), int(config.allow_sell), config.symbol,
                 config.capital_krw, config.units, config.unit_krw, int(gate), mode, gate_reason)
@@ -152,19 +155,21 @@ def run_sleeve(*, trading_date: date, positions: list[dict] | None = None, price
                 return {"status": "ERROR_ISOLATED", "reason": "ORDER_RESULT_UNKNOWN", "orders": [], "decision": decision}
             response = response if isinstance(response, dict) else {}
             broker_code = str(response.get("rt_cd") or response.get("status") or "").upper()
-            order_no = response.get("odno") or (response.get("output") or {}).get("ODNO") or response.get("order_no")
-            rejected = broker_code in {"1", "REJECTED", "REJECT", "FAILED", "ERROR"}
+            order_no = extract_order_no(response)
+            accepted = is_order_accepted(response, kis_env=os.getenv("KIS_ENV"))
+            masked = mask_order_response(response)
+            rejected = not accepted and broker_code in {"1", "REJECTED", "REJECT", "FAILED", "ERROR"}
             if rejected:
                 repository.save_state(replace(pending_state, pending_order_key=None,
                     cycle_status="ACTIVE" if qty else "READY",
-                    metadata={**pending_state.metadata, "last_order_status": "REJECTED", "broker_response": response}))
+                    metadata={**pending_state.metadata, "last_order_status": "REJECTED", "broker_response": masked}))
                 return {"status": "REJECTED", "orders": [response], "decision": decision}
-            if order_no and broker_code in {"0", "ACK", "ACCEPTED", "SUBMITTED", ""}:
+            if accepted:
                 repository.save_state(replace(pending_state,
                     metadata={**pending_state.metadata, "last_order_status": "ACK_PENDING", "broker_order_no": str(order_no)}))
                 return {"status": "ACK_PENDING", "orders": [response], "decision": decision}
             repository.save_state(replace(pending_state, cycle_status="RECONCILE_PENDING",
-                metadata={**pending_state.metadata, "last_order_status": "RESULT_UNKNOWN", "broker_response": response}))
+                metadata={**pending_state.metadata, "last_order_status": "RESULT_UNKNOWN", "broker_response": masked}))
             return {"status": "RECONCILE_PENDING", "orders": [response], "decision": decision}
     except Exception as exc:
         logger.exception("[KR_INF][ERROR] trade_date=%s symbol=%s error=%s", trading_date, config.symbol, exc)
