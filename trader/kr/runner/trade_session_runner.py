@@ -751,6 +751,14 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     if balance_state is not None and balance_state.get("status") == "WARN":
         result["balance_fail_soft"] = balance_state
         result["balance_state"] = "TIMEOUT"
+    # Additive isolated sleeve: it runs after PB1, and can never alter PB1's
+    # result or terminate the KR session. Missing inputs fail closed internally.
+    try:
+        from trader.kr.infinite.integration import run_session_hook
+        result["kr_infinite"] = run_session_hook(ctx.trade_date)
+    except Exception as exc:
+        logger.exception("[KR_INF][ERROR] session=%s error=%s", session, exc)
+        result["kr_infinite"] = {"status": "ERROR_ISOLATED", "orders": []}
     return result
 
 

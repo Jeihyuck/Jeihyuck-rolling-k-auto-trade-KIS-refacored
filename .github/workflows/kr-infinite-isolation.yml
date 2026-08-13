@@ -1,0 +1,20 @@
+name: KR Infinite isolation
+on:
+  pull_request:
+    branches: [dual-agent]
+jobs:
+  forbidden-paths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Reject forbidden US and scheduler changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --name-only "${{ github.event.pull_request.base.sha }}"...HEAD > /tmp/changed
+          if rg -n '^(trader/us/|tests/us/|scripts/wsl/run-us-)|^migrations/.*us_|scheduler' /tmp/changed; then
+            echo 'Forbidden isolation path changed'; exit 1
+          fi
+      - name: Canonical mapping and tests
+        run: pytest -q tests/kr/infinite

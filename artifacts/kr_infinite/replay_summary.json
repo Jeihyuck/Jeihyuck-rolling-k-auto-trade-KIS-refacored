@@ -1,0 +1,17 @@
+{
+  "status": "NO_DEPLOYABLE_POLICY",
+  "data_source": "Yahoo Finance chart API (122630.KS adjusted OHLC)",
+  "data_period": null,
+  "actual_long_horizon_replay_completed": false,
+  "block_reason": "The execution environment's outbound HTTPS proxy returned 403 before any market data was received.",
+  "fixture_results_are_not_actual_results": true,
+  "production_buy_policy": "FAIL_CLOSED",
+  "policy_version": "KR_INF_REGIME_GUARD_V1",
+  "2022": null,
+  "cost_assumptions": {
+    "buy_fee": 0.00015,
+    "sell_fee": 0.00015,
+    "sell_tax": 0.0018,
+    "slippage_each_side": 0.001
+  }
+}
