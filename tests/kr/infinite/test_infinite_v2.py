@@ -7,8 +7,8 @@ import pytest
 from trader.kr.infinite.config import InfiniteConfig
 from trader.kr.infinite.integration import exclude_owned_symbol, run_isolated
 from trader.kr.infinite.models import CycleStatus, Decision, MarketInput, SleeveState
-from trader.kr.infinite.order_router import CanonicalOrderRouter, client_order_key, order_gates
-from trader.kr.infinite.policy import integer_buy_quantity, policy_checksum
+from trader.kr.infinite.order_router import CanonicalOrderRouter, client_order_key, ingest_fills, order_gates
+from trader.kr.infinite.policy import integer_buy_quantity, net_liquidation_return, policy_checksum
 from trader.kr.infinite.reconcile import ownership_check, rebuild_from_fills
 from trader.kr.infinite.risk_adapter import REGIME_POLICY
 from trader.kr.infinite.strategy import decide
@@ -90,7 +90,7 @@ def test_gates_and_canonical_router_idempotency(monkeypatch):
         assert order_gates(enabled|{key:"1"})[0] is False
     for k,v in enabled.items(): monkeypatch.setenv(k,v)
     repo=Mock(); repo.create_intent_idempotent.return_value=("oid",True)
-    broker=Mock(return_value={"rt_cd":"0","odno":"123"})
+    broker=Mock(return_value={"rt_cd":"0","output":{"ODNO":"123"}})
     router=CanonicalOrderRouter(repo,broker,InfiniteConfig())
     out=router.route(Decision("BUY","x",3,Decimal(1)),SleeveState("c"),DAY,env="practice",run_id="r",price=10,regime="KR_NORMAL")
     assert out["status"]=="ACKED" and broker.call_count==1
@@ -98,6 +98,35 @@ def test_gates_and_canonical_router_idempotency(monkeypatch):
     assert router.route(Decision("BUY","x",3),SleeveState("c"),DAY,env="practice",run_id="r",price=10,regime="KR_NORMAL")["reason"]=="DUPLICATE_INTENT"
     assert broker.call_count==1
     assert client_order_key("c",DAY,"BUY")==client_order_key("c",DAY,"BUY")
+
+
+def test_missing_order_number_reconciles_and_reject_is_terminal(monkeypatch):
+    for k,v in {"LIVE_TRADING_ENABLED":"1","KR_LIVE_TRADING_ENABLED":"1","KR_ORDER_ARMED":"1",
+                "STRATEGY_MODE":"LIVE","DRY_RUN":"0","DISABLE_LIVE_TRADING":"0","FORCE_BLOCK_LIVE":"0"}.items(): monkeypatch.setenv(k,v)
+    repo=Mock(); repo.create_intent_idempotent.return_value=("oid",True)
+    router=CanonicalOrderRouter(repo,Mock(return_value={"rt_cd":"0","msg_cd":"OK"}),InfiniteConfig())
+    assert router.route(Decision("BUY","x",1),SleeveState("c"),DAY,env="practice",run_id="r",price=1,regime="KR_NORMAL")["status"]=="RECONCILE_PENDING"
+    repo.mark_acked.assert_not_called()
+    router.broker_submit=Mock(return_value={"rt_cd":"1","msg1":"rejected"})
+    assert router.route(Decision("SELL","x",1),SleeveState("d"),DAY,env="practice",run_id="r",price=1,regime="KR_NORMAL")["status"]=="REJECTED"
+    repo.mark_error.assert_called_once()
+
+
+@pytest.mark.parametrize("realized,remaining,price", [(0,10,"110.25"),("27500",7,"110.25"),("55000",5,"110.25"),("33000",7,"110.25")])
+def test_cycle_return_includes_partial_sell(realized,remaining,price):
+    cfg=InfiniteConfig(buy_fee_rate=Decimal("0"),sell_fee_rate=Decimal("0"),sell_tax_rate=Decimal("0"),slippage_rate=Decimal("0"))
+    expected=(Decimal(str(realized))+Decimal(price)*remaining-Decimal("1000"))/Decimal("1000")
+    assert net_liquidation_return(Decimal(price),remaining,Decimal("1000"),cfg,Decimal(str(realized)))==expected
+
+
+def test_fill_ingestion_requires_sleeve_attribution():
+    fills=Mock(); orders=Mock(); stamp=NOW
+    meta={"strategy_id":"kr_kodex_infinite_v2","book":"KR_INFINITE","cycle_id":"c","client_order_key":"k","symbol":"122630"}
+    order={"order_id":"o","kis_odno":"123","client_order_key":"k","request_json":meta}
+    evidence=[{"odno":"123","symbol":"122630","trade_id":"f1","side":"BUY","qty":2,"price":100,"filled_at":stamp}]
+    assert ingest_fills(fills_repo=fills,orders_repo=orders,order=order,broker_fills=evidence,env="practice")==1
+    fills.upsert_fill.assert_called_once(); orders.mark_filled.assert_called_once()
+    assert ingest_fills(fills_repo=fills,orders_repo=orders,order={**order,"request_json":meta|{"book":"PB1"}},broker_fills=evidence,env="practice")==0
 
 
 def test_ownership_adapter_is_narrow_and_exception_isolated():

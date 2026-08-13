@@ -5,7 +5,7 @@ import pytest
 from trader.kr.infinite.config import InfiniteConfig
 from trader.kr.infinite.data_loader import load_and_validate_csv
 from trader.kr.infinite.models import SleeveState
-from trader.kr.infinite.replay import replay_decision, validate_policy_identity
+from trader.kr.infinite.replay import replay_decision, run_replay, validate_policy_identity
 
 
 def test_data_quality_and_checksum(tmp_path):
@@ -22,3 +22,12 @@ def test_runtime_replay_identity_and_point_in_time():
     assert replay_decision(cfg,SleeveState("c"),signal,Decimal("20000")).action=="BUY"
     signal["as_of"]=signal["execution_date"]
     with pytest.raises(ValueError): replay_decision(cfg,SleeveState("c"),signal,Decimal("20000"))
+
+
+def test_multi_day_replay_uses_prior_signal_and_completes_cycle():
+    rows=[]
+    for day,price in [(2,10000),(3,10000),(4,13000),(5,10000)]:
+        rows.append({"signal_date":date(2026,1,day-1),"trade_date":date(2026,1,day),"open":price,
+                     "regime_state":"KR_NORMAL","data_quality":"OK"})
+    result=run_replay(rows)
+    assert result.completed_cycles==1 and len(result.equity_curve)==4 and result.maximum_used_units<=40

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import date
 import hashlib, os
 from typing import Any, Callable
+from trader.kis_wrapper import extract_order_no, is_order_accepted, mask_order_response
 from .config import InfiniteConfig
 from .models import Decision, SleeveState
 
@@ -50,13 +51,47 @@ class CanonicalOrderRouter:
         if not created: return {"sent": False, "reason": "DUPLICATE_INTENT", "order_id": order_id}
         try:
             response = self.broker_submit(env=effective_env, symbol="122630", side=decision.action, qty=decision.quantity)
-        except TimeoutError:
+        except Exception as exc:
+            # KIS transports use requests/urllib timeout classes and project-specific
+            # temporary network errors.  All ambiguous transport failures are kept
+            # non-terminal and are never resent under the same deterministic key.
+            ambiguous = isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower() or \
+                type(exc).__name__ in {"NetTemporaryError", "ConnectionError", "ReadTimeout"}
+            if not ambiguous:
+                self.orders_repo.mark_error(effective_env, key, {"error_type": type(exc).__name__})
+                raise
             return {"sent": True, "status": "RECONCILE_PENDING", "order_id": order_id}
-        odno = str(response.get("odno") or "")
-        self.orders_repo.mark_submitted(effective_env, key, odno or None, response)
-        if str(response.get("rt_cd")) == "0":
-            self.orders_repo.mark_acked(effective_env, odno, response)
+        odno = extract_order_no(response)
+        masked = mask_order_response(response)
+        self.orders_repo.mark_submitted(effective_env, key, odno, masked)
+        if is_order_accepted(response, kis_env=effective_env) and odno:
+            self.orders_repo.mark_acked(effective_env, odno, masked)
             return {"sent": True, "status": "ACKED", "order_id": order_id, "metadata": metadata}
-        marker = getattr(self.orders_repo, "mark_rejected", None)
-        if marker: marker(effective_env, key, response)
+        if is_order_accepted(response, kis_env=effective_env) and not odno:
+            return {"sent": True, "status": "RECONCILE_PENDING", "order_id": order_id}
+        self.orders_repo.mark_error(effective_env, key, masked)
         return {"sent": True, "status": "REJECTED", "order_id": order_id}
+
+
+def ingest_fills(*, fills_repo: Any, orders_repo: Any, order: dict, broker_fills: list[dict], env: str,
+                 run_id: str | None = None) -> int:
+    """Persist only fills attributed to a canonical sleeve order."""
+    meta = order.get("request_json") or {}
+    if not (meta.get("strategy_id") == "kr_kodex_infinite_v2" and meta.get("book") == "KR_INFINITE"
+            and meta.get("cycle_id") and meta.get("client_order_key") == order.get("client_order_key")
+            and str(meta.get("symbol")) == "122630"):
+        return 0
+    count = 0
+    odno = str(order.get("kis_odno") or "")
+    for fill in broker_fills:
+        if str(fill.get("odno") or fill.get("ODNO") or "") != odno or str(fill.get("symbol") or fill.get("pdno") or "").zfill(6) != "122630":
+            continue
+        fills_repo.upsert_fill(env=env, run_id=run_id, order_id=str(order["order_id"]), kis_odno=odno,
+            trade_id=str(fill.get("trade_id") or fill.get("fill_id") or fill.get("odno_dvsn_no") or "") or None,
+            code="122630", market="KOSPI", side=str(fill["side"]).upper(), qty=int(fill["qty"]),
+            price=float(fill["price"]), fee=float(fill.get("fee") or 0), tax=float(fill.get("tax") or 0),
+            filled_at=fill["filled_at"], raw_json=fill, fill_meta_json=meta)
+        count += 1
+    if count:
+        orders_repo.mark_filled(env, kis_odno=odno)
+    return count

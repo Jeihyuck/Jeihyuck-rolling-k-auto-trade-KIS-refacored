@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 import pandas as pd
+from sqlalchemy import text
 
 
 @dataclass(frozen=True)
@@ -25,3 +26,44 @@ def load_and_validate_csv(path: str | Path, *, source: str, adjusted_status: str
     report = DataQualityReport(source, str(frame.date.iloc[0].date()), str(frame.date.iloc[-1].date()), len(frame),
                                hashlib.sha256(raw).hexdigest(), adjusted_status, corporate_action_status)
     return frame, report
+
+
+def load_price_history(*, engine=None, kis_provider=None, csv_path=None, start="2010-02-22", end=None,
+                       adjusted_status="UNVERIFIED", corporate_action_status="UNVERIFIED"):
+    """Load 122630 in the mandated source order, paginating the KIS fallback."""
+    if engine is not None:
+        with engine.connect() as conn:
+            rows=conn.execute(text("""SELECT date, open, high, low, close, volume FROM price_daily
+              WHERE code='122630' AND date>=:start AND (:end IS NULL OR date<=CAST(:end AS DATE)) ORDER BY date"""),
+              {"start":start,"end":end}).mappings().all()
+        if rows:
+            return validate_frame(pd.DataFrame(rows),source="price_daily",adjusted_status=adjusted_status,
+                                  corporate_action_status=corporate_action_status)
+    if kis_provider is not None:
+        collected=[]; cursor=None
+        while True:
+            page=kis_provider.fetch_daily(symbol="122630",start=start,end=end,cursor=cursor)
+            collected.extend(page.get("rows") or []); cursor=page.get("next_cursor")
+            if not cursor: break
+        if collected:
+            return validate_frame(pd.DataFrame(collected),source="KIS_paginated",adjusted_status=adjusted_status,
+                                  corporate_action_status=corporate_action_status)
+    if csv_path:
+        return load_and_validate_csv(csv_path,source="verified_user_csv",adjusted_status=adjusted_status,
+                                     corporate_action_status=corporate_action_status)
+    raise RuntimeError("no authoritative 122630 price source available")
+
+
+def validate_frame(frame: pd.DataFrame, *, source: str, adjusted_status: str,
+                   corporate_action_status: str):
+    temp=frame.copy(); temp["date"]=pd.to_datetime(temp["date"])
+    required={"date","open","high","low","close","volume"}
+    if not required.issubset(temp): raise ValueError("missing OHLCV columns")
+    if not temp.date.is_monotonic_increasing or temp.date.duplicated().any(): raise ValueError("dates invalid")
+    if ((temp[["open","high","low","close"]]<=0).any().any() or (temp.volume<0).any()
+        or (temp.high<temp[["open","low","close"]].max(axis=1)).any()
+        or (temp.low>temp[["open","high","close"]].min(axis=1)).any()): raise ValueError("OHLCV logic invalid")
+    canonical=temp[list(sorted(required))].to_csv(index=False).encode()
+    report=DataQualityReport(source,str(temp.date.iloc[0].date()),str(temp.date.iloc[-1].date()),len(temp),
+        hashlib.sha256(canonical).hexdigest(),adjusted_status,corporate_action_status)
+    return temp,report

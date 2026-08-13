@@ -18,7 +18,9 @@ def decide(config: InfiniteConfig, state: SleeveState, market: MarketInput, now:
     if qtime > current or current - qtime > timedelta(minutes=2): return Decision("BLOCK", "QUOTE_STALE")
     # Safety/target exits precede pending-order and entry evaluation.
     if state.filled_quantity and config.allow_sell:
-        pnl = net_liquidation_return(market.quote_price, state.filled_quantity, state.buy_notional, config)
+        pnl = net_liquidation_return(
+            market.quote_price, state.filled_quantity, state.buy_notional, config, state.sell_notional
+        )
         if market.kill_switch: return Decision("SELL", "CATASTROPHIC_SAFETY_EXIT", state.filled_quantity, sell_kind="SAFETY")
         if pnl >= config.target_net_return: return Decision("SELL", "TARGET_NET_RETURN", state.filled_quantity, sell_kind="PROFIT_FULL")
         if market.long_trend_broken and market.regime_state in REGIME_POLICY and REGIME_POLICY[market.regime_state][0] == 0:

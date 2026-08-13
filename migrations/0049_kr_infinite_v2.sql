@@ -14,7 +14,10 @@ CREATE TABLE IF NOT EXISTS kr_infinite_state (
  PRIMARY KEY(strategy_id,symbol), CHECK(authoritative_buy_notional>=0 AND authoritative_buy_notional<=15000000),
  CHECK(used_unit_fraction>=0 AND used_unit_fraction<=40));
 CREATE TABLE IF NOT EXISTS kr_infinite_cycle_history (
- cycle_id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, symbol TEXT NOT NULL CHECK(symbol='122630'),
- policy_version TEXT NOT NULL, completed_trade_date DATE NOT NULL, filled_quantity INTEGER NOT NULL DEFAULT 0,
+ cycle_id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, symbol TEXT NOT NULL CHECK(symbol='122630'), book TEXT NOT NULL,
+ cycle_status TEXT NOT NULL CHECK(cycle_status='COMPLETE'), policy_version TEXT NOT NULL,
+ policy_checksum TEXT NOT NULL, cycle_start_date DATE NOT NULL, cycle_end_date DATE NOT NULL,
+ used_unit_fraction NUMERIC(10,4) NOT NULL, authoritative_average_price NUMERIC(20,8) NOT NULL,
+ last_buy_trade_date DATE, complete_reason TEXT NOT NULL, filled_quantity INTEGER NOT NULL DEFAULT 0,
  authoritative_buy_notional NUMERIC(20,4) NOT NULL, authoritative_sell_notional NUMERIC(20,4) NOT NULL,
  metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());

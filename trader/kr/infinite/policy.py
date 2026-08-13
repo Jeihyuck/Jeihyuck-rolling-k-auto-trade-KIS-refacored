@@ -20,7 +20,9 @@ def integer_buy_quantity(price: Decimal, fraction: Decimal, remaining: Decimal,
 
 
 def net_liquidation_return(price: Decimal, state_qty: int, buy_notional: Decimal,
-                           config: InfiniteConfig) -> Decimal:
+                           config: InfiniteConfig, sell_notional: Decimal = Decimal(0)) -> Decimal:
     if buy_notional <= 0: return Decimal("-1")
-    proceeds = price * state_qty * (Decimal(1) - config.sell_fee_rate - config.sell_tax_rate - config.slippage_rate)
+    proceeds = sell_notional + price * state_qty * (
+        Decimal(1) - config.sell_fee_rate - config.sell_tax_rate - config.slippage_rate
+    )
     return (proceeds - buy_notional) / buy_notional

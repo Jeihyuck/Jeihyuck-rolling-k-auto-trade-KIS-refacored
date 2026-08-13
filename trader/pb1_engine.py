@@ -9998,6 +9998,9 @@ class PB1Engine:
             logger.exception("[FORCE_BUY][ERROR] code=%s error=%s", code, exc)
 
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
+        if os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and str(cf.code).zfill(6) == "122630":
+            logger.info("[KR_INF][PB1_OWNERSHIP_EXCLUDED] side=BUY path=entry symbol=122630")
+            return {"api_submitted": 0, "api_accepted": 0, "skip_reason": "KR_INFINITE_OWNERSHIP"}
         status: dict[str, Any] = self._empty_order_status()
         stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
@@ -10714,6 +10717,9 @@ class PB1Engine:
         return status
 
     def _place_add_on(self, pos: dict, *, qty: int, price: float) -> None:
+        if os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and str(pos.get("code") or "").zfill(6) == "122630":
+            logger.info("[KR_INF][PB1_OWNERSHIP_EXCLUDED] side=BUY path=add_on symbol=122630")
+            return
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
         if self.intended_live and self.dry_run:
             raise RuntimeError(
@@ -11446,6 +11452,9 @@ class PB1Engine:
         return status
 
     def _plan_exit_event(self, pos: Dict, features: Dict[str, float], df: pd.DataFrame, window_tag: str) -> dict[str, Any] | None:
+        if os.getenv("KR_INFINITE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"} and str(pos.get("code") or "").zfill(6) == "122630":
+            logger.info("[KR_INF][PB1_OWNERSHIP_EXCLUDED] side=SELL path=exit symbol=122630")
+            return None
         avg = self._to_float(pos.get("avg_buy_price"))
         if not avg:
             return None

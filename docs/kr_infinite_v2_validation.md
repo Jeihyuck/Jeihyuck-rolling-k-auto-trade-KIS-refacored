@@ -26,3 +26,30 @@ pytest -q tests/kr/infinite
 Before readiness, record source, adjustment/corporate-action status, period, rows,
 SHA-256, all requested matrix metrics, practice endpoint order/fill reconciliation,
 and PostgreSQL two-process advisory-lock evidence. Keep the PR in Draft meanwhile.
+
+## Runtime configuration
+
+```dotenv
+KR_INFINITE_ENABLED=1
+KR_INFINITE_SYMBOL=122630
+KR_INFINITE_CAPITAL_KRW=15000000
+KR_INFINITE_UNITS=40
+KR_INFINITE_UNIT_KRW=375000
+KR_INFINITE_ALLOW_BUY=1
+KR_INFINITE_ALLOW_SELL=1
+KR_INFINITE_ORDER_MODE=INHERIT
+```
+
+Orders additionally require `LIVE_TRADING_ENABLED=1`,
+`KR_LIVE_TRADING_ENABLED=1`, `KR_ORDER_ARMED=1`, `STRATEGY_MODE=LIVE`, and
+all of `DRY_RUN`, `DISABLE_LIVE_TRADING`, and `FORCE_BLOCK_LIVE` to be zero.
+
+## Remaining integration blockers
+
+The canonical response parser, fill attribution, durable repository operations,
+PB1 ownership boundaries, and multi-day replay core are implemented. A fully
+authoritative runner invocation still requires exposing the already-open PB1 KIS,
+database, balance, quote, and regime objects through a stable runner context; the
+current runner does not return those objects. No empty/default evidence adapter is
+used as a substitute. Staged/trailing matrix policies and PostgreSQL/KIS integration
+evidence also remain incomplete, so this change must remain Draft.
