@@ -14681,13 +14681,59 @@ class PB1Engine:
         save_runtime_state(str(self._today), now, runtime_markets)
         return snapshot
 
+    def _run_kr_infinite_sleeve(self, *, snapshot: Any, positions: list[dict],
+                                available_cash_krw: float, account_snapshot: dict) -> dict:
+        from trader.kr.forbidden_products import block_buy_if_forbidden
+        from trader.kr.infinite.integration import run_session_hook
+        from trader.kr.infinite.repository import InfiniteRepository
+
+        quote = self.kis.get_quote_snapshot("122630") if self.kis else {}
+        price = float(quote.get("tp") or quote.get("close") or 0)
+        quote_at = getattr(self, "_now_kst", None) or now_kst()
+        repo = InfiniteRepository()
+        repo.ensure_schema()
+        state = repo.load_state("122630")
+        fills, orders = repo.load_evidence(state, self._today) if state else ([], [])
+        pending_states = {"INTENT", "SUBMITTED", "ACK", "OPEN", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING"}
+        pending = any(str(row.get("status") or "").upper() in pending_states for row in orders)
+        daily = sum(float(row.get("qty") or 0) * float(row.get("price") or 0)
+                    for row in fills if str(row.get("side") or "").upper() == "BUY"
+                    and str(row.get("trade_date")) == str(self._today))
+
+        def common_kr_router(intent: dict) -> dict:
+            validated = block_buy_if_forbidden(intent)
+            if validated.get("status") == "BLOCKED": return validated
+            side, qty = str(intent["side"]).upper(), int(intent["quantity"])
+            if side == "BUY":
+                response = self.kis.buy_stock_market_guarded("122630", qty, metadata=intent)
+                if isinstance(response, dict): response["_kr_order_metadata"] = dict(intent)
+                return response
+            return self.kis.sell_stock_attributed("122630", qty, metadata=intent)
+
+        return run_session_hook(trading_date=self._today, positions=positions, price=price,
+            quote_at=quote_at, snapshot=snapshot, orderable_cash=available_cash_krw,
+            pending=pending, daily_filled_buy_notional=daily, route=common_kr_router,
+            account_loss_kill_switch=bool(evaluate_kr_account_risk(account_snapshot).get("account_loss_kill_switch_triggered")),
+            repository=repo, evidence_fills=fills, evidence_orders=orders)
+
     def _evaluate_kr_market_state_overlay_for_tick(self, *, tick_budget_krw: float, positions: list[dict], available_cash_krw: float, final30_rows: list[dict] | None = None) -> tuple[dict | None, float]:
-        if not (self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True)):
+        if not self._is_kr_equity_context():
+            return None, float(tick_budget_krw or 0.0)
+        if not env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True):
+            logger.warning("[KR_INF][BUY_BLOCKED] reason=REGIME_SNAPSHOT_UNAVAILABLE overlay_enabled=0 broker_calls=0")
+            self._kr_infinite_health = {"status": "BLOCKED", "reason": "REGIME_SNAPSHOT_UNAVAILABLE"}
             return None, float(tick_budget_krw or 0.0)
         try:
             overlay_positions = self._kr_positions_for_overlay(positions)
             account_snapshot = self._kr_account_snapshot_for_overlay(overlay_positions, available_cash_krw)
             snapshot = self._build_kr_regime_snapshot_for_tick(final30_rows, account_snapshot)
+            # The sleeve consumes the exact authoritative objects used by this
+            # tick; it never reconstructs a session from empty defaults.
+            try:
+                self._run_kr_infinite_sleeve(snapshot=snapshot, positions=positions,
+                    available_cash_krw=available_cash_krw, account_snapshot=account_snapshot)
+            except Exception as infinite_exc:
+                logger.exception("[KR_INF][ERROR] boundary=pb1_tick error=%s", infinite_exc)
             policy = snapshot.execution_policy
             overlay = {"market_state": snapshot.global_state, "market_states": snapshot.market_states,
                        "market_policies": snapshot.market_policies,
@@ -18271,6 +18317,10 @@ class PB1Engine:
                     failed_count = 0
                     rejected_count = 0
                     skipped_count = 0
+                    # 122630 BUY ownership is reserved at the legacy candidate
+                    # boundary, not by the generic forbidden-product router.
+                    from trader.kr.infinite.integration import owns_symbol as _kr_inf_owns_symbol
+                    orderable_candidates = [cf for cf in orderable_candidates if not _kr_inf_owns_symbol(cf.code)]
                     submit_attempt_count = len(orderable_candidates)
                     if not entry_allowed:
                         logger.info(
