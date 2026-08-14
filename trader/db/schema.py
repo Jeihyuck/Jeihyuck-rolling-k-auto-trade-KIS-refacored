@@ -220,6 +220,12 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("reason", sa.String),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
+    sa.Index(
+        "uq_portfolio_epochs_active", portfolio_epochs.c.env, portfolio_epochs.c.account_id,
+        portfolio_epochs.c.sid, portfolio_epochs.c.mode, portfolio_epochs.c.strategy,
+        unique=True, postgresql_where=portfolio_epochs.c.status == "ACTIVE",
+        sqlite_where=portfolio_epochs.c.status == "ACTIVE",
+    )
 
     positions = sa.Table(
         "positions",

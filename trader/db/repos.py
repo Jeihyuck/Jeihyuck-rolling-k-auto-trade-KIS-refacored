@@ -2608,6 +2608,73 @@ class UniverseRepo:
             )
 
 
+def _ensure_active_epoch(conn, db_schema, *, env: str, account_id: str, sid: int, mode: int, strategy: str) -> str:
+    identity = and_(
+        db_schema.portfolio_epochs.c.env == env,
+        db_schema.portfolio_epochs.c.account_id == account_id,
+        db_schema.portfolio_epochs.c.sid == sid,
+        db_schema.portfolio_epochs.c.mode == mode,
+        db_schema.portfolio_epochs.c.strategy == strategy,
+        db_schema.portfolio_epochs.c.status == "ACTIVE",
+    )
+    active = conn.execute(select(db_schema.portfolio_epochs.c.portfolio_epoch_id).where(identity)).scalar()
+    if active:
+        return str(active)
+    epoch_id = _coerce_uuid(None, uses_native_uuid=db_schema.uses_native_uuid, database_url=db_schema.database_url)
+    conn.execute(sa.insert(db_schema.portfolio_epochs).values(
+        portfolio_epoch_id=epoch_id, env=env, account_id=account_id, sid=sid,
+        mode=mode, strategy=strategy, status="ACTIVE", reason="AUTO_INITIAL_EPOCH",
+    ))
+    return str(epoch_id)
+
+
+class PortfolioEpochsRepo:
+    """Owns the account/strategy epoch identity shared by every position cycle."""
+
+    def __init__(self, engine: Engine):
+        self.engine = engine
+        self._schema = schema_for_engine(engine)
+
+    def get_or_create_active(self, *, env: str, account_id: str, sid: int, mode: int, strategy: str) -> str:
+        with self.engine.begin() as conn:
+            return _ensure_active_epoch(conn, self._schema, env=env, account_id=account_id,
+                                        sid=sid, mode=mode, strategy=strategy)
+
+    def start_new_epoch(self, *, env: str, account_id: str, sid: int, mode: int,
+                        strategy: str, reason: str) -> str:
+        """Explicit boundary operation; normal reconciliation must never call this."""
+        epoch_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url))
+        with self.engine.begin() as conn:
+            identity = and_(
+                self._schema.portfolio_epochs.c.env == env,
+                self._schema.portfolio_epochs.c.account_id == account_id,
+                self._schema.portfolio_epochs.c.sid == sid,
+                self._schema.portfolio_epochs.c.mode == mode,
+                self._schema.portfolio_epochs.c.strategy == strategy,
+                self._schema.portfolio_epochs.c.status == "ACTIVE",
+            )
+            conn.execute(sa.update(self._schema.portfolio_epochs).where(identity).values(
+                status="ENDED", ended_at=func.now(), reason=reason,
+            ))
+            old_epoch_ids = select(self._schema.portfolio_epochs.c.portfolio_epoch_id).where(and_(
+                self._schema.portfolio_epochs.c.env == env,
+                self._schema.portfolio_epochs.c.account_id == account_id,
+                self._schema.portfolio_epochs.c.sid == sid,
+                self._schema.portfolio_epochs.c.mode == mode,
+                self._schema.portfolio_epochs.c.strategy == strategy,
+                self._schema.portfolio_epochs.c.status == "ENDED",
+            ))
+            conn.execute(sa.update(self._schema.positions).where(and_(
+                self._schema.positions.c.portfolio_epoch_id.in_(old_epoch_ids),
+                self._schema.positions.c.status == "OPEN",
+            )).values(status="CLOSED", closed_ts=func.now(), closed_reason="PORTFOLIO_EPOCH_ENDED"))
+            conn.execute(sa.insert(self._schema.portfolio_epochs).values(
+                portfolio_epoch_id=epoch_id, env=env, account_id=account_id, sid=sid,
+                mode=mode, strategy=strategy, status="ACTIVE", reason=reason,
+            ))
+        return str(epoch_id)
+
+
 class OrdersRepo:
     def __init__(self, engine: Engine):
         self.engine = engine
@@ -2694,14 +2761,37 @@ class OrdersRepo:
         *,
         status: str = "CREATED",
         entry_meta_json: dict | None = None,
+        account_id: str | None = None,
+        portfolio_epoch_id: str | None = None,
+        position_cycle_id: str | None = None,
     ) -> tuple[str, bool]:
         db_url = str(self.engine.url)
         original_request_json = request_json
         if run_id:
             self.ensure_run_exists(run_id)
+        account_id = account_id or f"sid:{sid}:mode:{mode}"
+        with self.engine.begin() as conn:
+            portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
+                conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
+            )
+            if position_cycle_id is None:
+                position_cycle_id = conn.execute(
+                    select(self._schema.positions.c.position_cycle_id).where(and_(
+                        self._schema.positions.c.env == env,
+                        self._schema.positions.c.strategy == strategy,
+                        self._schema.positions.c.sid == sid,
+                        self._schema.positions.c.mode == mode,
+                        self._schema.positions.c.code == code,
+                        self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
+                        self._schema.positions.c.status == "OPEN",
+                    ))
+                ).scalar()
+        position_cycle_id = str(position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url))
         payload = {
             "order_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
+            "position_cycle_id": position_cycle_id,
+            "portfolio_epoch_id": portfolio_epoch_id,
             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
             "strategy": strategy,
             "sid": sid,
@@ -3895,15 +3985,28 @@ class FillsRepo:
         filled_at: datetime,
         raw_json: dict | None,
         fill_meta_json: dict | None = None,
+        position_cycle_id: str | None = None,
+        portfolio_epoch_id: str | None = None,
     ) -> str:
         db_url = str(self.engine.url)
         broker_fill_id = trade_id or None
         safe_raw_json = json_sanitize(raw_json or {})
         if run_id:
             self.ensure_run_exists(run_id)
+        if order_id is not None and (position_cycle_id is None or portfolio_epoch_id is None):
+            with self.engine.begin() as conn:
+                provenance = conn.execute(select(
+                    self._schema.orders.c.position_cycle_id,
+                    self._schema.orders.c.portfolio_epoch_id,
+                ).where(self._schema.orders.c.order_id == uuid_value_for_url(db_url, order_id))).mappings().first()
+            if provenance:
+                position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
+                portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
         payload = {
             "fill_id": _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url),
             "env": env,
+            "position_cycle_id": position_cycle_id,
+            "portfolio_epoch_id": portfolio_epoch_id,
             "run_id": uuid_value_for_url(db_url, run_id) if run_id is not None else None,
             "order_id": uuid_value_for_url(db_url, order_id) if order_id is not None else None,
             "kis_odno": kis_odno,
@@ -3932,6 +4035,8 @@ class FillsRepo:
         update_cols = {
             "raw_json": safe_raw_json,
             "broker_fill_id": broker_fill_id,
+            "position_cycle_id": position_cycle_id,
+            "portfolio_epoch_id": portfolio_epoch_id,
             **_entry_meta_columns(fill_meta_json, json_field="fill_meta_json"),
         }
         with self.engine.begin() as conn:
@@ -5100,6 +5205,10 @@ class PositionsRepo:
         entry_meta_json: dict | None = None,
         entry_exit_plan: dict | None = None,
         entry_meta: dict | None = None,
+        account_id: str | None = None,
+        portfolio_epoch_id: str | None = None,
+        position_cycle_id: str | None = None,
+        order_id: str | None = None,
     ) -> None:
         if entry_meta and not entry_meta_json:
             entry_meta_json = entry_meta
@@ -5121,6 +5230,18 @@ class PositionsRepo:
             }
             entry_meta_json = _merge_json_dict(entry_meta_json, {k: v for k, v in plan_meta.items() if v is not None})
         with self.engine.begin() as conn:
+            if order_id and (position_cycle_id is None or portfolio_epoch_id is None):
+                provenance = conn.execute(select(
+                    self._schema.orders.c.position_cycle_id,
+                    self._schema.orders.c.portfolio_epoch_id,
+                ).where(self._schema.orders.c.order_id == uuid_value_for_url(str(self.engine.url), order_id))).mappings().first()
+                if provenance:
+                    position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
+                    portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
+            account_id = account_id or f"sid:{sid}:mode:{mode}"
+            portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
+                conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
+            )
             stmt = select(self._schema.positions).where(
                 and_(
                     self._schema.positions.c.env == env,
@@ -5128,6 +5249,7 @@ class PositionsRepo:
                     self._schema.positions.c.sid == sid,
                     self._schema.positions.c.mode == mode,
                     self._schema.positions.c.code == code,
+                    self._schema.positions.c.portfolio_epoch_id == portfolio_epoch_id,
                     self._schema.positions.c.status == "OPEN",
                 )
             )
@@ -5151,6 +5273,13 @@ class PositionsRepo:
                 logger.error(
                     "[RECONCILE][POSITION_STATE_MISMATCH] code=%s kis_qty=unknown cycle_id=none "
                     "reason=STALE_OR_UNPROVEN_CYCLE action=EXIT_BLOCKED", code,
+                )
+                return
+            if row and position_cycle_id and str(row.get("position_cycle_id")) != str(position_cycle_id):
+                logger.error(
+                    "[RECONCILE][POSITION_STATE_MISMATCH] code=%s active_cycle=%s fill_cycle=%s "
+                    "reason=CYCLE_PROVENANCE_MISMATCH action=EXIT_BLOCKED",
+                    code, row.get("position_cycle_id"), position_cycle_id,
                 )
                 return
 
@@ -5225,8 +5354,8 @@ class PositionsRepo:
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                        position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                        portfolio_epoch_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        position_cycle_id=position_cycle_id or _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        portfolio_epoch_id=portfolio_epoch_id,
                         opened_at=filled_at,
                         position_origin="SYSTEM",
                         env=env,
@@ -5263,10 +5392,12 @@ class PositionsRepo:
                 )
 
     def bootstrap_from_kis_holdings(
-        self, env: str, strategy: str, sid: int, mode: int, holdings: Iterable[dict]
+        self, env: str, strategy: str, sid: int, mode: int, holdings: Iterable[dict], *, account_id: str | None = None
     ) -> int:
         count = 0
         with self.engine.begin() as conn:
+            epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
+                account_id=account_id or f"sid:{sid}:mode:{mode}", sid=sid, mode=mode, strategy=strategy)
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
@@ -5286,6 +5417,7 @@ class PositionsRepo:
                             self._schema.positions.c.sid == sid,
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.portfolio_epoch_id == epoch_id,
                             self._schema.positions.c.status == "OPEN",
                         )
                     )
@@ -5296,7 +5428,7 @@ class PositionsRepo:
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                        portfolio_epoch_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        portfolio_epoch_id=epoch_id,
                         opened_at=func.now(),
                         position_origin="IMPORTED",
                         env=env,
@@ -5327,9 +5459,12 @@ class PositionsRepo:
         holdings: Iterable[dict],
         fills_repo: Any | None = None,
         orders_repo: Any | None = None,
+        account_id: str | None = None,
     ) -> int:
         restored = 0
         with self.engine.begin() as conn:
+            epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
+                account_id=account_id or f"sid:{sid}:mode:{mode}", sid=sid, mode=mode, strategy=strategy)
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
@@ -5349,6 +5484,7 @@ class PositionsRepo:
                             self._schema.positions.c.sid == sid,
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.portfolio_epoch_id == epoch_id,
                             self._schema.positions.c.status == "OPEN",
                         )
                     )
@@ -5367,7 +5503,7 @@ class PositionsRepo:
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
                         position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
-                        portfolio_epoch_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        portfolio_epoch_id=epoch_id,
                         opened_at=func.now(),
                         position_origin="IMPORTED",
                         env=env,
@@ -5407,6 +5543,8 @@ class PositionsRepo:
         skipped = 0
         env_n = _norm_env(env)
         with self.engine.begin() as conn:
+            epoch_id = _ensure_active_epoch(conn, self._schema, env=env_n,
+                account_id=account_key, sid=1, mode=1, strategy="pb1")
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
@@ -5445,6 +5583,8 @@ class PositionsRepo:
                         and_(
                             self._schema.positions.c.env == env_n,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                            self._schema.positions.c.status == "OPEN",
                         )
                     )
                 ).scalar()
@@ -5456,6 +5596,8 @@ class PositionsRepo:
                             and_(
                                 self._schema.positions.c.env == env_n,
                                 self._schema.positions.c.code == code,
+                                self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                                self._schema.positions.c.status == "OPEN",
                             )
                         )
                         .values(
@@ -5475,6 +5617,10 @@ class PositionsRepo:
                                 uses_native_uuid=self._schema.uses_native_uuid,
                                 database_url=str(self.engine.url),
                             ),
+                            position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                            portfolio_epoch_id=epoch_id,
+                            opened_at=func.now(),
+                            position_origin="IMPORTED",
                             env=env_n,
                             strategy="pb1",
                             sid=1,
