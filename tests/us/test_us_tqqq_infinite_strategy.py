@@ -33,8 +33,8 @@ def test_average_buy_premium(price, action):
 
 
 @pytest.mark.parametrize(("flags", "reason"), [
-    ({"pending_buy": True}, "pending_buy"),
-    ({"pending_sell": True}, "pending_sell"),
+    ({"pending_buy": True}, "tqqq_pending_order_exists"),
+    ({"pending_sell": True}, "tqqq_pending_order_exists"),
     ({"daily_filled_buy_notional": 250}, "daily_buy_limit"),
 ])
 def test_duplicate_and_pending_protection(flags, reason):

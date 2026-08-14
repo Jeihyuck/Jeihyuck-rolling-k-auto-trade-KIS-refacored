@@ -99,7 +99,8 @@ def test_age_alone_only_enables_capital_preservation_during_bear():
 @pytest.mark.parametrize(("context", "qty", "reason"), [
     ({"force_entry_block": True}, 0, "overlay_force_entry_block"),
     ({"allow_new_buy": False}, 0, "overlay_new_buy_block"),
-    ({"allow_new_buy": True, "allow_add_to_existing": False}, 5, "overlay_add_buy_block"),
+    # Standard add/gross overlay does not own the Infinite sleeve.
+    ({"allow_new_buy": True, "allow_add_to_existing": False}, 5, "average_buy"),
 ])
 def test_production_overlay_buy_gates_are_enforced_but_sell_remains_first(context, qty, reason):
     state = owned() if qty else InfiniteState()
@@ -112,7 +113,7 @@ def test_production_overlay_buy_gates_are_enforced_but_sell_remains_first(contex
 
 def test_context_quality_fails_closed_for_buys_but_not_take_profit_sell():
     context = overlay(tqqq_context_quality="insufficient")
-    assert decide(InfiniteState(), PositionSnapshot(price=50), context).reason == "tqqq_context_unavailable"
+    assert decide(InfiniteState(), PositionSnapshot(price=50), context).reason == "tqqq_required_market_data_missing"
     result = decide(owned(), PositionSnapshot(qty=2, average_price=50, price=55), context)
     assert result.action == Action.SELL
 

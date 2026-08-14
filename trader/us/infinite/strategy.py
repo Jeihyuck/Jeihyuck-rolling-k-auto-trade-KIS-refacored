@@ -77,9 +77,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if position.qty == 0 and state.status == Status.COMPLETE and state.last_exit_date == trading_date:
         return Decision(Action.BLOCK, "same_day_cycle_restart")
     if pending_sell:
-        return Decision(Action.BLOCK, "pending_sell")
+        return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
-        return Decision(Action.BLOCK, "pending_buy")
+        return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
@@ -93,9 +93,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if position.qty <= 0 and overlay.get("allow_new_buy") is False:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
-        return Decision(Action.BLOCK, "overlay_add_buy_block")
+        # Standard gross/cluster overlays do not own this sleeve. Only an
+        # explicitly TQQQ-scoped capital flag may pause its adds.
+        if overlay.get("tqqq_capital_preservation"):
+            return Decision(Action.BLOCK, "tqqq_capital_preservation")
     if "tqqq_context_quality" in overlay and overlay.get("tqqq_context_quality") != "ok":
-        return Decision(Action.BLOCK, "tqqq_context_unavailable")
+        return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
 
     metadata = state.metadata or {}
     long_trend = str(metadata.get("long_trend") or classify_long_trend(

@@ -136,6 +136,7 @@ def choose_trend_time_exit(position: dict, trend: dict, *, pnl_pct: float, order
 
 
 def filter_add_to_existing_by_trend_state(entry_intents: list[dict], current_positions: list[dict]) -> tuple[list[dict], list[dict]]:
+    from trader.us.strategy_ownership import is_standard_symbol
     pos = {str(p.get("symbol") or "").upper(): p for p in current_positions or []}
     kept=[]; blocked=[]
     reason_by_state = {
@@ -146,6 +147,8 @@ def filter_add_to_existing_by_trend_state(entry_intents: list[dict], current_pos
     }
     for it in entry_intents or []:
         sym = str(it.get("symbol") or "").upper()
+        if not is_standard_symbol(sym, log=True):
+            continue
         p = pos.get(sym)
         trend_state = (p or {}).get("trend_state") or ((p or {}).get("trend") or {}).get("trend_state")
         if str(it.get("side", "BUY")).upper() == "BUY" and p and trend_state != "HEALTHY":

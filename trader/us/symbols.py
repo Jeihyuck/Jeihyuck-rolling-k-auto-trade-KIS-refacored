@@ -37,6 +37,8 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     # Core ETF
     "SPY": "NYSE",
     "QQQ": "NASDAQ",
+    # Dedicated Infinite sleeve instrument (canonical NASDAQ, KIS order NASD).
+    "TQQQ": "NASDAQ",
     "QQQM": "NASDAQ",
     "SMH": "NASDAQ",
     "SOXX": "NASDAQ",

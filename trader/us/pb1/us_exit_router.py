@@ -386,6 +386,9 @@ def route_exit_by_book_horizon(
     Returns:
         exit intent dict 또는 None
     """
+    from trader.us.strategy_ownership import is_standard_symbol
+    if not is_standard_symbol(position.get("symbol"), log=True):
+        return None
     meta = position.get("meta") if isinstance(position.get("meta"), dict) else {}
     raw_book = position.get("book") or meta.get("book")
     raw_horizon = position.get("horizon") or meta.get("horizon")

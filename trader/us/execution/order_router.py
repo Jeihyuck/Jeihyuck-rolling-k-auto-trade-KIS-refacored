@@ -552,6 +552,17 @@ def route_order(
     Returns:
         {"status": "DRY_RUN"|"ACK"|"BLOCKED"|"REJECT"|"SIGNAL_ONLY"|"ORDER_DISABLED", ...}
     """
+    # This check deliberately precedes identity normalization, persistence and
+    # every KIS call: malformed legacy intents cannot bypass symbol ownership.
+    from trader.us.strategy_ownership import is_valid_tqqq_intent, owner_for_symbol, TQQQ_OWNER
+    if owner_for_symbol(intent.get("symbol")) == TQQQ_OWNER and not is_valid_tqqq_intent(intent):
+        logger.error(
+            "[TQQQ_INF][OWNERSHIP_REJECT] symbol=TQQQ strategy_owner=%s sleeve_id=%s",
+            intent.get("strategy_owner"), intent.get("sleeve_id"),
+        )
+        return {"status": "BLOCKED", "reason": "tqqq_ownership_rejected",
+                "broker_submit": False, "intent": intent}
+
     from trader.us.db.repos import (
         save_order_intent, save_dry_run_order, save_order_ack, save_order_reject,
         mark_order_intent_sent, mark_order_intent_blocked, mark_order_intent_rejected,
@@ -566,6 +577,13 @@ def route_order(
     except InvalidOrderIdentity as exc:
         logger.critical("[US_ORDER][INVALID_ORDER_IDENTITY] error=%s", exc)
         return {"status": "INVALID_ORDER_IDENTITY", "reason": str(exc), "broker_submit": False, "intent": intent}
+    # Persist an explicit attribution envelope for every routed intent. Legacy
+    # callers are standard-owned; dedicated symbols were already validated.
+    intent = dict(intent)
+    intent.setdefault("strategy_owner", "US_STANDARD")
+    intent.setdefault("strategy_name", str(intent.get("strategy") or "US_STANDARD"))
+    intent.setdefault("strategy_version", str((intent.get("meta") or {}).get("strategy_version") or "LEGACY"))
+    intent.setdefault("sleeve_id", intent["strategy_owner"])
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
     symbol_upper = str(symbol or "").upper().strip()

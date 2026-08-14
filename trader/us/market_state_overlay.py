@@ -712,6 +712,8 @@ def is_strong_holding(pos: dict, row: dict | None = None) -> bool:
 def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None, now=None, trade_date: str | None = None, profit_capture_state: dict[str, dict] | None = None) -> list[dict]:
     from decimal import Decimal
     from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
+    from trader.us.strategy_ownership import exclude_non_standard
+    positions = exclude_non_standard(positions)
     if not overlay.get("profit_capture_enabled", True):
         return []
     existing_sell_symbols = existing_sell_symbols or set()
@@ -775,6 +777,8 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
 def build_defense_trim_intents(positions: list[dict], overlay: dict, existing_sell_symbols: set[str] | None = None,
                                trade_date: str | None = None, context=None) -> list[dict]:
     from trader.us.execution.order_identity import InvalidOrderIdentity
+    from trader.us.strategy_ownership import exclude_non_standard
+    positions = exclude_non_standard(positions)
     trade_date = trade_date or getattr(context, "trade_date", None)
     if not trade_date:
         raise InvalidOrderIdentity("defense trim requires trade_date")

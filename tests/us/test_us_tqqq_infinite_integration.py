@@ -68,7 +68,7 @@ def test_invalid_or_stale_quote_never_reaches_router(monkeypatch):
         result = run_sleeve(positions=[], price=price, trading_date=date(2026, 8, 11),
                             overlay={"market_state": "NORMAL", **extra},
                             repository=FakeRepository(InfiniteState()), route=routed.append)
-        assert result["reason"] == "tqqq_price_unavailable"
+        assert result["reason"] == "tqqq_quote_invalid"
         assert routed == []
 
 
@@ -145,10 +145,10 @@ def test_rebound_tick_alone_never_unlocks_recovery_reserve(monkeypatch):
     assert not repo.state.reserve_unlocked
 
 
-def test_enabled_ownership_filter_is_central_and_off_preserves_identity(monkeypatch):
+def test_ownership_filter_is_invariant_even_when_sleeve_is_off(monkeypatch):
     rows = [{"symbol": "AAPL"}, {"symbol": "TQQQ"}]
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")
-    assert exclude_owned(rows) is rows
+    assert exclude_owned(rows) == [{"symbol": "AAPL"}]
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     assert exclude_owned(rows) == [{"symbol": "AAPL"}]
 

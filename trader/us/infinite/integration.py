@@ -12,6 +12,7 @@ from .models import Action, InfiniteState, PositionSnapshot, Status
 from .repository import InfiniteRepository
 from .policy_state import reserve_new_cycle, update_adaptive_policy_state
 from .strategy import _trading_days_since, evaluate
+from .risk_adapter import effective_regime
 
 logger = logging.getLogger(__name__)
 
@@ -49,13 +50,14 @@ def legacy_ownership_reserved(*, positions: list[dict], config: InfiniteConfig |
 
 def exclude_owned(rows: list[dict], config: InfiniteConfig | None = None,
                   *, reserved: bool | None = None) -> list[dict]:
+    """Exclude the dedicated symbol from standard strategy inputs.
+
+    Ownership is invariant and intentionally independent of feature/real-order
+    switches. Disabling the sleeve must never hand TQQQ back to US_STANDARD.
+    """
     config = config or InfiniteConfig.from_env()
-    if not (config.enabled if reserved is None else reserved):
-        return rows
-    return [
-        row for row in rows
-        if str(row.get("symbol") or row.get("code") or "").upper().strip() != config.symbol
-    ]
+    from trader.us.strategy_ownership import exclude_non_standard
+    return exclude_non_standard(rows)
 
 
 def _position(raw: dict | None, price: float) -> PositionSnapshot:
@@ -89,7 +91,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         logger.info("[TQQQ_INF][QUOTE] price=%s source=%s stale=%s valid=%s", price,
                     overlay.get("tqqq_quote_source", "provider"), int(quote_stale), int(valid_quote))
         if not valid_quote:
-            return {"status": "BLOCK", "reason": "tqqq_price_unavailable", "orders": []}
+            return {"status": "BLOCK", "reason": "tqqq_quote_invalid", "orders": []}
         repository = repository or InfiniteRepository()
         repository.ensure_schema()
         raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
@@ -121,6 +123,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             state is None or state.total_filled_notional <= 0
         ):
             decision_state = None
+        regime, multiplier, reserve_policy, entry_allowed, regime_reason = effective_regime(overlay)
+        logger.info("[TQQQ_INF][REGIME_DECISION] raw_market_state=%s raw_standard_regime=%s tqqq_effective_regime=%s buy_multiplier=%s reserve_unlocked=%s entry_allowed=%s reason=%s",
+                    overlay.get("market_state"), overlay.get("market_regime"), regime, multiplier,
+                    int(reserve_policy), int(entry_allowed), regime_reason)
         decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay)
@@ -173,7 +179,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,
             "trade_date": trading_date.isoformat(),
             "client_order_key": f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{decision.action.value}",
-            "strategy": "TQQQ_INFINITE_V3", "theme_cluster": theme_cluster,
+            "strategy": "TQQQ_INFINITE_V3", "strategy_owner": "TQQQ_INFINITE",
+            "strategy_name": "TQQQ_INFINITE", "strategy_version": config.policy_version,
+            "sleeve_id": "TQQQ_INFINITE", "theme_cluster": theme_cluster,
             "classification_source": classification_source, "position_state": position_state,
             "position_action": position_action,
             "reason": "TAKE_PROFIT_TQQQ_INFINITE" if decision.action == Action.SELL else decision.reason,
