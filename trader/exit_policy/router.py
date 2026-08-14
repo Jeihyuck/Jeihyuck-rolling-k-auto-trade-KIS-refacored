@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from trader.position_lifecycle import validate_long_stop
 
 logger = logging.getLogger(__name__)
 
@@ -467,6 +468,26 @@ def apply_swing_exit_decision(
     orderable_qty = int(pos.get("orderable_qty") or pos.get("qty") or 0)
     code_for_log = str(pos.get("code") or pos.get("stock_code") or "UNKNOWN")
     avg = float(pos.get("avg_buy_price") or pos.get("avg") or pos.get("entry_price") or 0.0)
+
+    if effective_stop > 0:
+        stop_valid, validation_reason, computed_r = validate_long_stop(avg, effective_stop)
+        if not stop_valid:
+            logger.error(
+                "[EXIT][POSITION_STATE] code=%s cycle_id=%s epoch_id=%s origin=%s "
+                "kis_qty=%s kis_avg=%s cycle_qty=%s cycle_fill_avg=%s entry_date=%s "
+                "trading_days_held=%s holding_bars=%s reference_entry=%s raw_stop=%s "
+                "effective_stop=%s effective_r=%s highest_return_pct=%s exit_reason=%s "
+                "state_validation=%s exit_blocked=1",
+                code_for_log, pos.get("position_cycle_id"), pos.get("portfolio_epoch_id"),
+                pos.get("position_origin"), pos.get("kis_qty", orderable_qty),
+                pos.get("kis_avg", avg), pos.get("qty"), pos.get("cycle_fill_avg"),
+                pos.get("entry_date"), trading_days_held, holding_bars, avg,
+                (risk_ctx or {}).get("raw_stop_price"), effective_stop, computed_r,
+                highest_ret_pct, validation_reason, validation_reason,
+            )
+            return {"exit_ok": False, "reason": validation_reason, "qty": 0,
+                    "sell_pct": None, "exit_blocked": True,
+                    "state_validation": validation_reason, "update_meta": {}}
 
     drawdown_from_peak = max(0.0, highest_ret_pct - ret_pct)
     trend_strong = bool(policy.get("trend_strong", False))

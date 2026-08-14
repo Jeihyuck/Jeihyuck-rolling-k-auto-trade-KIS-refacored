@@ -4941,6 +4941,7 @@ class PositionsRepo:
                 self._schema.positions.c.sid == sid,
                 self._schema.positions.c.mode == mode,
                 self._schema.positions.c.code == code,
+                self._schema.positions.c.status == "OPEN",
             )
         )
         rows = _safe_repo_read(
@@ -4970,6 +4971,7 @@ class PositionsRepo:
                 self._schema.positions.c.sid == sid,
                 self._schema.positions.c.mode == mode,
                 self._schema.positions.c.code == code,
+                self._schema.positions.c.status == "OPEN",
             )
         )
         rows = _safe_repo_read(
@@ -4988,6 +4990,7 @@ class PositionsRepo:
                 self._schema.positions.c.env == env,
                 self._schema.positions.c.strategy == strategy,
                 self._schema.positions.c.code.in_(codes),
+                self._schema.positions.c.status == "OPEN",
             )
         )
         return _safe_repo_read(
@@ -5010,7 +5013,7 @@ class PositionsRepo:
                     self._schema.positions.c.qty > 0,
                 )
             )
-            .values(qty=0, avg_buy_price=None, total_cost=0.0, updated_at=func.now())
+            .values(qty=0, avg_buy_price=None, total_cost=0.0, status="CLOSED", closed_ts=func.now(), closed_reason="RECONCILED_ZERO", updated_at=func.now())
         )
         with self.engine.begin() as conn:
             result = conn.execute(stmt)
@@ -5040,6 +5043,7 @@ class PositionsRepo:
                             self._schema.positions.c.sid == sid,
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.status == "OPEN",
                         )
                     )
                 ).mappings().first()
@@ -5059,6 +5063,7 @@ class PositionsRepo:
                             self._schema.positions.c.sid == sid,
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.status == "OPEN",
                         )
                     )
                     .values(**values, updated_at=func.now())
@@ -5123,6 +5128,7 @@ class PositionsRepo:
                     self._schema.positions.c.sid == sid,
                     self._schema.positions.c.mode == mode,
                     self._schema.positions.c.code == code,
+                    self._schema.positions.c.status == "OPEN",
                 )
             )
             row = conn.execute(stmt).mappings().first()
@@ -5141,6 +5147,13 @@ class PositionsRepo:
                 total_cost = 0.0
                 realized_pnl = 0.0
 
+            if side.upper() != "BUY" and not row:
+                logger.error(
+                    "[RECONCILE][POSITION_STATE_MISMATCH] code=%s kis_qty=unknown cycle_id=none "
+                    "reason=STALE_OR_UNPROVEN_CYCLE action=EXIT_BLOCKED", code,
+                )
+                return
+
             if side.upper() == "BUY":
                 new_qty = current_qty + qty
                 new_total_cost = total_cost + cost_delta
@@ -5152,6 +5165,7 @@ class PositionsRepo:
                     "realized_pnl": realized_pnl,
                     "market": market,
                     "last_trade_at": filled_at,
+                    "status": "OPEN",
                 }
                 if entry_meta_json:
                     merged_entry_meta = _merge_json_dict(row.get("entry_meta_json") if row else None, entry_meta_json)
@@ -5193,6 +5207,8 @@ class PositionsRepo:
                     "market": market,
                     "last_trade_at": filled_at,
                 }
+                if remaining_qty <= 0:
+                    values.update(status="CLOSED", closed_ts=filled_at, closed_reason="FULL_SELL")
                 if entry_meta_json:
                     values["last_exit_plan_eval_json"] = json_sanitize(entry_meta_json)
                     if remaining_qty <= 0:
@@ -5209,6 +5225,10 @@ class PositionsRepo:
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        portfolio_epoch_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        opened_at=filled_at,
+                        position_origin="SYSTEM",
                         env=env,
                         strategy=strategy,
                         sid=sid,
@@ -5220,6 +5240,7 @@ class PositionsRepo:
                         total_cost=values["total_cost"],
                         realized_pnl=values["realized_pnl"],
                         last_trade_at=filled_at,
+                        status="OPEN",
                         entry_reason=values.get("entry_reason"),
                         entry_style_selected=values.get("entry_style_selected"),
                         entry_decision_family=values.get("entry_decision_family"),
@@ -5265,6 +5286,7 @@ class PositionsRepo:
                             self._schema.positions.c.sid == sid,
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.status == "OPEN",
                         )
                     )
                 ).scalar()
@@ -5273,6 +5295,10 @@ class PositionsRepo:
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        portfolio_epoch_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        opened_at=func.now(),
+                        position_origin="IMPORTED",
                         env=env,
                         strategy=strategy,
                         sid=sid,
@@ -5323,35 +5349,27 @@ class PositionsRepo:
                             self._schema.positions.c.sid == sid,
                             self._schema.positions.c.mode == mode,
                             self._schema.positions.c.code == code,
+                            self._schema.positions.c.status == "OPEN",
                         )
                     )
                 ).scalar()
                 if existing:
                     continue
-                plan_record = None
-                source = "missing"
-                if fills_repo is not None and hasattr(fills_repo, "find_latest_buy_entry_exit_plan"):
-                    plan_record = fills_repo.find_latest_buy_entry_exit_plan(env, code)
-                    if plan_record:
-                        source = "restored_from_fill"
-                if not plan_record and orders_repo is not None and hasattr(orders_repo, "find_latest_buy_entry_exit_plan"):
-                    plan_record = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code)
-                    if plan_record:
-                        source = "restored_from_order"
-                plan_values = _plan_position_values(plan_record, missing=not bool(plan_record))
-                if plan_record:
-                    logger.info(
-                        "[RECONCILE][ENTRY_EXIT_PLAN_RESTORE] code=%s source=%s thesis=%s horizon=%s exit_family=%s eod_action=%s",
-                        code, source, plan_values.get("entry_thesis"), plan_values.get("trade_horizon"), plan_values.get("exit_policy_family"), plan_values.get("eod_action"),
-                    )
-                else:
-                    logger.warning(
-                        "[RECONCILE][ENTRY_EXIT_PLAN_MISSING] code=%s action=restore_position_as_policy_missing_no_force_sell",
-                        code,
-                    )
+                # A symbol-only historical lookup cannot prove lifecycle ownership.
+                # Bootstrap a clean imported cycle and deliberately disable age/trail exits.
+                plan_values = _plan_position_values(None, missing=True)
+                logger.warning(
+                    "[RECONCILE][POSITION_STATE_MISMATCH] code=%s reason=STALE_OR_UNPROVEN_CYCLE "
+                    "action=CREATE_IMPORTED_CYCLE_EXIT_BLOCKED",
+                    code,
+                )
                 conn.execute(
                     sa.insert(self._schema.positions).values(
                         position_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        position_cycle_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        portfolio_epoch_id=_coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=str(self.engine.url)),
+                        opened_at=func.now(),
+                        position_origin="IMPORTED",
                         env=env,
                         strategy=strategy,
                         sid=sid,
@@ -5365,6 +5383,7 @@ class PositionsRepo:
                         last_trade_at=None,
                         status="OPEN",
                         last_reconciled_at=func.now(),
+                        position_meta={"holding_age_unknown": True, "holding_bars": 0, "tp1_done": False, "tp2_done": False},
                         **plan_values,
                     )
                 )

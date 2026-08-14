@@ -81,6 +81,6 @@ def test_daily_ccld_reconcile_merges_order_plan_and_restores_position():
     assert restored == 1
     with engine.connect() as conn:
         row = conn.execute(select(schema.positions)).mappings().first()
-    assert row["entry_exit_plan_json"]["policy_version"] == "pb1_entry_exit_plan_v1"
-    assert row["trade_horizon"] == "SWING"
-    assert row["exit_policy_family"] == "SWING_STAGED_EXIT"
+    assert row["entry_exit_plan_json"] == {}
+    assert row["position_origin"] == "IMPORTED"
+    assert row["position_meta"]["holding_age_unknown"] is True
