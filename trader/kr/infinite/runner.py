@@ -56,7 +56,8 @@ def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: S
 
 def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
              regime_provider: Callable[[], tuple[str | None, str]] = load_regime,
-             trade_date: date | None = None, kis_env: str | None = None) -> RunResult:
+             trade_date: date | None = None, kis_env: str | None = None,
+             allow_entry: bool = True) -> RunResult:
     """Execute one exit-first tick. Every dependency is injectable for integration tests."""
     day = trade_date or date.today()
     env = (kis_env or os.getenv("KIS_ENV") or "practice").lower()
@@ -106,7 +107,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
         pending_sell = any(item.side == "SELL_ALL" for item in pending)
 
-        if position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
+        if allow_entry and position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
             same_day = state is not None and state.last_exit_date == day and not config.same_day_restart
             if not same_day and (state is None or state.status in {Status.READY, Status.COMPLETE}):
                 state = _new_cycle(state, executor, config, day)
@@ -117,7 +118,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             market_state=market_state, orderable_cash=cash, pending_buy=pending_buy,
                             pending_sell=pending_sell, existing_intent_keys=existing_keys,
                             regime_data_quality=quality,
-                            trading_days_since_last_buy=trading_days_since(state.last_buy_date if state else None, day))
+                            trading_days_since_last_buy=trading_days_since(state.last_buy_date if state else None, day),
+                            allow_entry=allow_entry)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
                      symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
                      idempotency_key=decision.idempotency_key)
@@ -163,11 +165,13 @@ def main() -> int:
     return 0 if result.decision.action != Action.BLOCK else 2
 
 
-def run_canonical_session(*, session: str, env: str) -> RunResult:
+def run_canonical_session(*, session: str, env: str, allow_entry: bool = True) -> RunResult:
     """Auxiliary-sleeve hook called by the existing KR session owner."""
-    logger.info("[KR_INFINITE][SESSION_HOOK] session=%s env=%s", session, env)
+    effective_allow_entry = bool(allow_entry and session in {"am", "afternoon"})
+    logger.info("[KR_INFINITE][SESSION_HOOK] session=%s env=%s allow_entry=%s",
+                session, env, int(effective_allow_entry))
     return run_once(config=InfiniteConfig.from_env(), kis=KisAPI(kis_env=env),
-                    repository=InfiniteRepository(), kis_env=env)
+                    repository=InfiniteRepository(), kis_env=env, allow_entry=effective_allow_entry)
 
 
 if __name__ == "__main__":

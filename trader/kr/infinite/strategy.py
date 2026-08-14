@@ -18,7 +18,8 @@ def trading_days_since(start: date|None, end: date) -> int:
 
 def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosition, trade_date: date, market_state: str|None,
              trading_days_since_last_buy: int=10000, orderable_cash: float=0, pending_buy: bool=False, pending_sell: bool=False,
-             existing_intent_keys: frozenset[str]=frozenset(), regime_data_quality: str="OK") -> Decision:
+             existing_intent_keys: frozenset[str]=frozenset(), regime_data_quality: str="OK",
+             allow_entry: bool=True) -> Decision:
     try: config.validate()
     except ValueError as e: return Decision(Action.BLOCK,str(e),next_status=Status.FROZEN)
     if not config.enabled: return Decision(Action.WAIT,"KR_INF_FEATURE_DISABLED")
@@ -37,6 +38,7 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
         if key in existing_intent_keys: return Decision(Action.WAIT,"DUPLICATE_INTENT",next_status=Status.EXIT_PENDING)
         return Decision(Action.SELL_ALL,"TAKE_PROFIT",position.orderable_qty,position.orderable_qty*position.current_price,key,Status.EXIT_PENDING)
     if state.status == Status.EXIT_PENDING or pending_sell: return Decision(Action.WAIT,"EXIT_PENDING",next_status=Status.EXIT_PENDING)
+    if not allow_entry:return Decision(Action.WAIT,"KR_INF_ENTRY_DISABLED_BY_SESSION")
     regime_pause=buy_pause_reason(market_state,regime_data_quality)
     if regime_pause:return Decision(Action.WAIT,regime_pause)
     if state.status == Status.COMPLETE and state.last_exit_date == trade_date and not config.same_day_restart: return Decision(Action.BLOCK,"SAME_DAY_CYCLE_RESTART_BLOCK")

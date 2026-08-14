@@ -52,4 +52,15 @@ def test_session_hook_is_fail_soft(monkeypatch):
     from trader.kr.runner import trade_session_runner
     import trader.kr.infinite.runner as infinite_runner
     monkeypatch.setattr(infinite_runner, "run_canonical_session", lambda **_: (_ for _ in ()).throw(RuntimeError("isolated")))
-    trade_session_runner._run_infinite_session_hook(session="am", env="practice", checkpoint="test")
+    trade_session_runner._run_infinite_session_hook(session="am", env="practice", checkpoint="test", allow_entry=True)
+
+
+def test_session_hook_propagates_exit_only_capability(monkeypatch):
+    from trader.kr.runner import trade_session_runner
+    import trader.kr.infinite.runner as infinite_runner
+    calls=[]
+    class Result:
+        decision=type("Decision",(),{"action":type("Action",(),{"value":"WAIT"})(),"reason":"test"})()
+    monkeypatch.setattr(infinite_runner,"run_canonical_session",lambda **kwargs:(calls.append(kwargs) or Result()))
+    trade_session_runner._run_infinite_session_hook(session="close",env="practice",checkpoint="test",allow_entry=False)
+    assert calls == [{"session":"close","env":"practice","allow_entry":False}]

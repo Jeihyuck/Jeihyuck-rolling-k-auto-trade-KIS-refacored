@@ -619,9 +619,9 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     )
     guarded = _guard_trade_session(session, ctx)
     if guarded is not None:
-        _run_infinite_session_hook(session=session, env=env, checkpoint="precheck_blocked_exit_only")
+        _run_infinite_session_hook(session=session, env=env, checkpoint="precheck_blocked_exit_only", allow_entry=False)
         return guarded
-    _run_infinite_session_hook(session=session, env=env, checkpoint="session_start")
+    infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
     balance_state = _assert_balance_available(session)
     if balance_state is not None:
         if balance_state.get("status") == "WARN" and int(balance_state.get("exit_allowed", 0)) == 1:
@@ -629,9 +629,12 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             os.environ["EXIT_ALLOWED"] = str(int(balance_state.get("exit_allowed", 0)))
             os.environ["ORDER_ALLOWED"] = str(int(balance_state.get("order_allowed", 0)))
             os.environ["KR_BALANCE_FAIL_SOFT_ACTIVE"] = "1"
+            infinite_allow_entry = infinite_allow_entry and bool(int(balance_state.get("entry_allowed", 0)))
             logger.warning("[KR_SESSION][CONTINUE_AFTER_BALANCE_FAIL_SOFT] session=%s entry_allowed=%s exit_allowed=%s order_allowed=%s", session, os.environ["ENTRY_ALLOWED"], os.environ["EXIT_ALLOWED"], os.environ["ORDER_ALLOWED"])
         else:
+            _run_infinite_session_hook(session=session, env=env, checkpoint="balance_blocked_exit_only", allow_entry=False)
             return balance_state
+    _run_infinite_session_hook(session=session, env=env, checkpoint="session_start", allow_entry=infinite_allow_entry)
 
     window = {"am": "morning", "afternoon": "day", "close": "close"}[session]
     pb1_runner = sys.modules.get("trader.pb1_runner")
@@ -650,7 +653,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         exit_code = int(pb1_runner.main() or 0)
     finally:
         sys.argv = old_argv
-    _run_infinite_session_hook(session=session, env=env, checkpoint="session_end")
+    session_end_entry_allowed = infinite_allow_entry and str(os.getenv("ENTRY_ALLOWED", "1")) == "1" and str(os.getenv("ORDER_ALLOWED", "1")) == "1"
+    _run_infinite_session_hook(session=session, env=env, checkpoint="session_end", allow_entry=session_end_entry_allowed)
     pb1_result_present = pb1_result_path.exists()
     if pb1_result_present:
         pb1_result = load_pb1_session_result(pb1_result_path)
@@ -757,13 +761,13 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     return result
 
 
-def _run_infinite_session_hook(*, session: str, env: str, checkpoint: str) -> None:
+def _run_infinite_session_hook(*, session: str, env: str, checkpoint: str, allow_entry: bool) -> None:
     """Fail-soft orchestration hook; all sleeve policy remains isolated."""
     try:
         from trader.kr.infinite.runner import run_canonical_session
-        result = run_canonical_session(session=session, env=env)
-        logger.info("[KR_SESSION][INFINITE] session=%s checkpoint=%s decision=%s reason=%s",
-                    session, checkpoint, result.decision.action.value, result.decision.reason)
+        result = run_canonical_session(session=session, env=env, allow_entry=allow_entry)
+        logger.info("[KR_SESSION][INFINITE] session=%s checkpoint=%s allow_entry=%s decision=%s reason=%s",
+                    session, checkpoint, int(allow_entry), result.decision.action.value, result.decision.reason)
     except Exception as exc:
         logger.exception("[KR_SESSION][INFINITE][FAIL_SOFT] session=%s checkpoint=%s err=%s",
                          session, checkpoint, exc)

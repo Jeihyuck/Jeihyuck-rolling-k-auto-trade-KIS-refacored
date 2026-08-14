@@ -215,3 +215,45 @@ def test_dry_run_blocks_sell_submission(monkeypatch):
     kis, repo = FakeKIS(qty=100, average=100, price=110), FakeRepository(active())
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert result.decision.reason == "KR_INF_CANONICAL_ORDER_GATE_CLOSED" and not kis.orders and not repo.intents
+
+
+def test_precheck_blocked_no_position_is_exit_only(armed_practice_env):
+    kis, repo = FakeKIS(), FakeRepository()
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.reason == "KR_INF_ENTRY_DISABLED_BY_SESSION" and not kis.orders and repo.state is None
+
+
+def test_precheck_blocked_active_below_tp_cannot_add(armed_practice_env):
+    kis, repo = FakeKIS(qty=100, average=100, price=99), FakeRepository(active())
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.reason == "KR_INF_ENTRY_DISABLED_BY_SESSION" and not kis.orders
+
+
+def test_precheck_blocked_take_profit_still_sells(armed_practice_env):
+    kis, repo = FakeKIS(qty=100, average=100, price=110), FakeRepository(active())
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.action == Action.SELL_ALL and result.submitted and kis.orders == [("SELL", 100)]
+
+
+def test_close_no_position_cannot_create_cycle(armed_practice_env):
+    kis, repo = FakeKIS(), FakeRepository()
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.action == Action.WAIT and repo.state is None and not kis.orders
+
+
+def test_close_adaptive_add_is_disabled(armed_practice_env):
+    kis, repo = FakeKIS(qty=100, average=100, price=99), FakeRepository(active())
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.reason == "KR_INF_ENTRY_DISABLED_BY_SESSION" and not kis.orders
+
+
+def test_close_take_profit_still_sells(armed_practice_env):
+    kis, repo = FakeKIS(qty=100, average=100, price=110), FakeRepository(active())
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.action == Action.SELL_ALL and kis.orders == [("SELL", 100)]
