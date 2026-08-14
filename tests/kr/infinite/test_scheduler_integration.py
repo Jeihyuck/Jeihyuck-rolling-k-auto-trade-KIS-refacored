@@ -34,6 +34,9 @@ def test_no_infinite_workflow_cron_task_or_wsl_cron():
 
 
 def test_canonical_regime_and_migration_paths_are_reused():
+    import inspect
+    from trader.kr.regime import write_snapshot
+    from trader.kr.infinite.regime_adapter import load_canonical_snapshot
     pb1_engine = Path("trader/pb1_engine.py").read_text()
     pb1_runner = Path("trader/pb1_runner.py").read_text()
     adapter = Path("trader/kr/infinite/regime_adapter.py").read_text()
@@ -41,6 +44,8 @@ def test_canonical_regime_and_migration_paths_are_reused():
     assert "run_migrations(engine)" in pb1_runner
     assert "calculate_market_state" not in adapter
     assert Path("migrations/0049_add_kr_infinite_state.sql").exists()
+    assert inspect.signature(write_snapshot).parameters["path"].default == "artifacts/kr_regime_snapshot.json"
+    assert inspect.signature(load_canonical_snapshot).parameters["path"].default == "artifacts/kr_regime_snapshot.json"
 
 
 def test_session_hook_is_fail_soft(monkeypatch):

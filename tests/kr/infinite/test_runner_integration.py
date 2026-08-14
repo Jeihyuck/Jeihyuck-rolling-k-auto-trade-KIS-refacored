@@ -1,12 +1,21 @@
 from dataclasses import replace
 from datetime import date
 
+import pytest
+
 from trader.kr.infinite.config import InfiniteConfig
 from trader.kr.infinite.models import Action, OrderIntent, State, Status
 from trader.kr.infinite.runner import run_once
 
 DAY = date(2026, 8, 14)
 REGIME = lambda: ("KR_NORMAL", "OK")
+
+
+@pytest.fixture
+def armed_practice_env(monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "practice")
+    monkeypatch.setenv("DRY_RUN", "0")
+    monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
 
 
 class FakeKIS:
@@ -82,7 +91,7 @@ def active(**changes):
     return replace(base, **changes)
 
 
-def test_practice_submits_by_default():
+def test_practice_submits_by_default(armed_practice_env):
     kis, repo = FakeKIS(fill_qty=300), FakeRepository()
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert result.decision.action == Action.BUY and result.submitted and len(kis.orders) == 1
@@ -102,7 +111,7 @@ def test_real_inherits_armed_gate(monkeypatch):
     assert result.submitted and len(kis.orders)==1
 
 
-def test_intent_is_persisted_before_submit():
+def test_intent_is_persisted_before_submit(armed_practice_env):
     kis, repo = FakeKIS(), FakeRepository()
     original = kis.buy_stock_limit
     def checked(*args):
@@ -112,7 +121,7 @@ def test_intent_is_persisted_before_submit():
     run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
 
 
-def test_accepted_unfilled_and_restart_do_not_consume_or_retry():
+def test_accepted_unfilled_and_restart_do_not_consume_or_retry(armed_practice_env):
     kis, repo = FakeKIS(fill_qty=0), FakeRepository()
     first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert first.state.units_used == 0 and len(kis.orders) == 1
@@ -120,14 +129,14 @@ def test_accepted_unfilled_and_restart_do_not_consume_or_retry():
     assert len(kis.orders) == 1 and second.decision.action == Action.WAIT
 
 
-def test_confirmed_buy_updates_only_confirmed_fill():
+def test_confirmed_buy_updates_only_confirmed_fill(armed_practice_env):
     kis, repo = FakeKIS(fill_qty=100), FakeRepository()
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert result.state.units_used == 1 and result.state.core_units_used == 1
     assert result.state.core_filled_notional == 10_000 and result.state.last_buy_price == 100
 
 
-def test_sell_acceptance_partial_and_final_completion():
+def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
     kis = FakeKIS(qty=150, average=100, price=110, fill_qty=110)
     repo = FakeRepository(active())
     partial = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
@@ -146,7 +155,7 @@ def test_unowned_existing_position_freezes_without_order():
     assert result.decision.reason == "KR_INF_UNOWNED_EXISTING_POSITION" and not kis.orders
 
 
-def test_practice_with_and_without_odno_reconciles_without_duplicate():
+def test_practice_with_and_without_odno_reconciles_without_duplicate(armed_practice_env):
     for with_odno in (True, False):
         kis, repo = FakeKIS(fill_qty=100, with_odno=with_odno), FakeRepository()
         first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
@@ -157,7 +166,7 @@ def test_practice_with_and_without_odno_reconciles_without_duplicate():
         assert len(kis.orders) == 1 and restarted.decision.action == Action.WAIT
 
 
-def test_no_odno_restart_correlates_later_fill_without_resubmit():
+def test_no_odno_restart_correlates_later_fill_without_resubmit(armed_practice_env):
     kis, repo = FakeKIS(fill_qty=0, with_odno=False), FakeRepository()
     accepted = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert accepted.submitted and repo.intents[0].broker_order_id is None and accepted.state.units_used == 0
@@ -168,7 +177,7 @@ def test_no_odno_restart_correlates_later_fill_without_resubmit():
     assert reconciled.state.units_used == 1 and len(kis.orders) == 1
 
 
-def test_fill_before_balance_uses_bounded_grace_then_activates():
+def test_fill_before_balance_uses_bounded_grace_then_activates(armed_practice_env):
     kis, repo = FakeKIS(fill_qty=100, reported_qty=0), FakeRepository()
     first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert first.state.status == Status.ACTIVE and first.state.metadata["fill_balance_pending"]
@@ -178,10 +187,31 @@ def test_fill_before_balance_uses_bounded_grace_then_activates():
     assert len(kis.orders) == 1
 
 
-def test_fill_balance_mismatch_beyond_grace_freezes():
+def test_fill_balance_mismatch_beyond_grace_freezes(armed_practice_env):
     kis, repo = FakeKIS(fill_qty=100, reported_qty=0), FakeRepository()
     run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     result = None
     for _ in range(4):
         result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert result.state.status == Status.FROZEN and len(kis.orders) == 1
+
+
+def test_am_buy_then_afternoon_hook_does_not_buy_second_unit(armed_practice_env):
+    kis, repo = FakeKIS(fill_qty=100), FakeRepository()
+    am = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    afternoon = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert am.submitted and afternoon.decision.action == Action.WAIT and len(kis.orders) == 1
+
+
+def test_dry_run_blocks_buy_submission(monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "practice");monkeypatch.setenv("DRY_RUN", "1");monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    kis, repo = FakeKIS(), FakeRepository()
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert result.decision.reason == "KR_INF_CANONICAL_ORDER_GATE_CLOSED" and not kis.orders and not repo.intents
+
+
+def test_dry_run_blocks_sell_submission(monkeypatch):
+    monkeypatch.setenv("KIS_ENV", "practice");monkeypatch.setenv("DRY_RUN", "1");monkeypatch.setenv("DISABLE_LIVE_TRADING", "0")
+    kis, repo = FakeKIS(qty=100, average=100, price=110), FakeRepository(active())
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert result.decision.reason == "KR_INF_CANONICAL_ORDER_GATE_CLOSED" and not kis.orders and not repo.intents
