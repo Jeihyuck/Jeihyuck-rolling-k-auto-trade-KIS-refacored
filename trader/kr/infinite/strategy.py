@@ -4,7 +4,7 @@ from .accounting import buy_quantity, validate_invariants
 from .config import InfiniteConfig
 from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import idempotency_key
-from .risk_adapter import allows_new_cycle, validate_regime
+from .risk_adapter import allows_new_cycle, buy_pause_reason
 
 def trading_days_since(start: date|None, end: date) -> int:
     if start is None or start >= end: return 0
@@ -16,10 +16,10 @@ def trading_days_since(start: date|None, end: date) -> int:
         count += int(is_krx_trading_day(cursor))
     return count
 
-def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosition, trade_date: date, market_state: str,
+def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosition, trade_date: date, market_state: str|None,
              trading_days_since_last_buy: int=10000, orderable_cash: float=0, pending_buy: bool=False, pending_sell: bool=False,
              existing_intent_keys: frozenset[str]=frozenset(), regime_data_quality: str="OK") -> Decision:
-    try: config.validate(); validate_regime(market_state, regime_data_quality)
+    try: config.validate()
     except ValueError as e: return Decision(Action.BLOCK,str(e),next_status=Status.FROZEN)
     if not config.enabled: return Decision(Action.WAIT,"KR_INF_FEATURE_DISABLED")
     if position.current_price <= 0: return Decision(Action.BLOCK,"KR_INF_MARKET_DATA_UNAVAILABLE",next_status=Status.FROZEN)
@@ -37,6 +37,8 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
         if key in existing_intent_keys: return Decision(Action.WAIT,"DUPLICATE_INTENT",next_status=Status.EXIT_PENDING)
         return Decision(Action.SELL_ALL,"TAKE_PROFIT",position.orderable_qty,position.orderable_qty*position.current_price,key,Status.EXIT_PENDING)
     if state.status == Status.EXIT_PENDING or pending_sell: return Decision(Action.WAIT,"EXIT_PENDING",next_status=Status.EXIT_PENDING)
+    regime_pause=buy_pause_reason(market_state,regime_data_quality)
+    if regime_pause:return Decision(Action.WAIT,regime_pause)
     if state.status == Status.COMPLETE and state.last_exit_date == trade_date and not config.same_day_restart: return Decision(Action.BLOCK,"SAME_DAY_CYCLE_RESTART_BLOCK")
     if pending_buy or state.last_buy_date == trade_date: return Decision(Action.WAIT,"DAILY_BUY_LIMIT")
     new=position.qty==0

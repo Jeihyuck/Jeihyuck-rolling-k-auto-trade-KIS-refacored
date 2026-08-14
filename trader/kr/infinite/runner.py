@@ -1,12 +1,10 @@
 """Standalone KR Infinite runtime orchestration."""
 from __future__ import annotations
 
-import json
 import logging
 import os
 from dataclasses import dataclass, replace
 from datetime import date
-from pathlib import Path
 from typing import Callable
 
 from trader.kis_wrapper import KisAPI
@@ -19,7 +17,7 @@ from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import cycle_id
 from .reconciliation import reconcile
 from .repository import InfiniteRepository
-from .regime_source import produce_current_regime
+from .regime_adapter import load_canonical_snapshot
 from .risk_adapter import allows_new_cycle
 from .strategy import evaluate, trading_days_since
 
@@ -33,14 +31,9 @@ class RunResult:
     submitted: bool = False
 
 
-def load_regime() -> tuple[str, str]:
-    path = Path(os.getenv("KR_INFINITE_REGIME_PATH", "artifacts/kr_regime_snapshot.json"))
-    try:
-        payload = json.loads(path.read_text())
-        market = (payload.get("market_states") or {}).get("KOSPI") or {}
-        return str(market.get("state") or payload.get("global_state") or ""), str(market.get("data_quality") or payload.get("data_quality") or "BLOCKED")
-    except (OSError, ValueError, TypeError):
-        return "", "BLOCKED"
+def load_regime() -> tuple[str | None, str]:
+    view = load_canonical_snapshot(os.getenv("KR_INFINITE_REGIME_PATH", "artifacts/kr_regime_snapshot.json"))
+    return view.state, view.data_quality
 
 
 def _new_cycle(state: State | None, executor: KISExecutor, config: InfiniteConfig, trade_date: date) -> State:
@@ -62,7 +55,7 @@ def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: S
 
 
 def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
-             regime_provider: Callable[[], tuple[str, str]] = load_regime,
+             regime_provider: Callable[[], tuple[str | None, str]] = load_regime,
              trade_date: date | None = None, kis_env: str | None = None) -> RunResult:
     """Execute one exit-first tick. Every dependency is injectable for integration tests."""
     day = trade_date or date.today()
@@ -131,7 +124,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         if decision.action not in {Action.BUY, Action.RECOVERY, Action.SELL_ALL}:
             return RunResult(decision, state)
         if not config.orders_allowed(env):
-            return RunResult(Decision(Action.BLOCK, "KR_INF_LIVE_GATE_CLOSED"), state)
+            return RunResult(Decision(Action.BLOCK, "KR_INF_CANONICAL_ORDER_GATE_CLOSED"), state)
         if state is None or not state.cycle_id:
             return RunResult(Decision(Action.BLOCK, "KR_INF_CYCLE_ID_MISSING", next_status=Status.FROZEN), state)
         if not repository.create_intent(state, decision, day, market_state):
@@ -165,15 +158,16 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO)
     config = InfiniteConfig.from_env()
     kis = KisAPI(kis_env=os.getenv("KIS_ENV", "practice"))
-    if os.getenv("KR_INFINITE_USE_PREBUILT_REGIME", "0") != "1":
-        try:
-            produce_current_regime(kis)
-        except Exception as exc:
-            logger.error("[KR_INFINITE][BLOCK] reason=KR_INF_REGIME_DATA_BLOCKED detail=%s", exc)
-            return 2
     result = run_once(config=config, kis=kis,
                       repository=InfiniteRepository(), kis_env=os.getenv("KIS_ENV", "practice"))
     return 0 if result.decision.action != Action.BLOCK else 2
+
+
+def run_canonical_session(*, session: str, env: str) -> RunResult:
+    """Auxiliary-sleeve hook called by the existing KR session owner."""
+    logger.info("[KR_INFINITE][SESSION_HOOK] session=%s env=%s", session, env)
+    return run_once(config=InfiniteConfig.from_env(), kis=KisAPI(kis_env=env),
+                    repository=InfiniteRepository(), kis_env=env)
 
 
 if __name__ == "__main__":

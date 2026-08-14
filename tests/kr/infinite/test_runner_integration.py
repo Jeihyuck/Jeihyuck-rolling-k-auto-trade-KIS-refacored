@@ -72,7 +72,7 @@ class FakeRepository:
                         if item.id in by_id else item for item in self.intents]
 
 
-def config(live=False): return InfiniteConfig(enabled=True, live=live)
+def config(): return InfiniteConfig(enabled=True)
 
 def active(**changes):
     base = State(cycle_id="KRINF-20260801-owned", cycle_start_date=date(2026, 8, 1),
@@ -82,19 +82,24 @@ def active(**changes):
     return replace(base, **changes)
 
 
-def test_practice_and_real_live_submit_same_buy_path():
-    for env, live in (("practice", False), ("real", True)):
-        kis, repo = FakeKIS(fill_qty=300), FakeRepository()
-        result = run_once(config=config(live), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env=env)
-        assert result.decision.action == Action.BUY and result.submitted and len(kis.orders) == 1
-        assert repo.events.index("intent") < kis.events.index("submit") if "submit" in repo.events else True
-        assert repo.state.cycle_id.startswith("KRINF-20260814-") and repo.state.cycle_id != "NEW"
+def test_practice_submits_by_default():
+    kis, repo = FakeKIS(fill_qty=300), FakeRepository()
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert result.decision.action == Action.BUY and result.submitted and len(kis.orders) == 1
+    assert repo.state.cycle_id.startswith("KRINF-20260814-") and repo.state.cycle_id != "NEW"
 
 
-def test_real_live_gate_off_never_submits():
+def test_real_inherits_disarmed_gate(monkeypatch):
+    monkeypatch.setenv("STRATEGY_MODE","LIVE");monkeypatch.setenv("DRY_RUN","0");monkeypatch.setenv("DISABLE_LIVE_TRADING","0")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED","1");monkeypatch.setenv("KR_LIVE_TRADING_ENABLED","1");monkeypatch.setenv("KR_ORDER_ARMED","0")
     kis, repo = FakeKIS(), FakeRepository()
-    result = run_once(config=config(False), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="real")
-    assert result.decision.reason == "KR_INF_LIVE_GATE_CLOSED" and not kis.orders
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="real")
+    assert result.decision.reason == "KR_INF_CANONICAL_ORDER_GATE_CLOSED" and not kis.orders
+
+def test_real_inherits_armed_gate(monkeypatch):
+    for key,value in {"STRATEGY_MODE":"LIVE","DRY_RUN":"0","DISABLE_LIVE_TRADING":"0","LIVE_TRADING_ENABLED":"1","KR_LIVE_TRADING_ENABLED":"1","KR_ORDER_ARMED":"1"}.items():monkeypatch.setenv(key,value)
+    kis,repo=FakeKIS(fill_qty=100),FakeRepository();result=run_once(config=config(),kis=kis,repository=repo,regime_provider=REGIME,trade_date=DAY,kis_env="real")
+    assert result.submitted and len(kis.orders)==1
 
 
 def test_intent_is_persisted_before_submit():

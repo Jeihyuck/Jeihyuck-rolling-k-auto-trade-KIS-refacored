@@ -10,8 +10,7 @@ def _bool(name: str, default: bool = False) -> bool:
 
 @dataclass(frozen=True)
 class InfiniteConfig:
-    enabled: bool = False
-    live: bool = False
+    enabled: bool = True
     symbol: str = "122630"
     account_exposure_pct: float = .30
     safe_max_exposure_pct: float = .30
@@ -38,7 +37,7 @@ class InfiniteConfig:
         p = "KR_INFINITE_"
         f = lambda n, d: float(os.getenv(p + n, str(d)))
         i = lambda n, d: int(os.getenv(p + n, str(d)))
-        return cls(enabled=_bool(p+"ENABLED"), live=_bool(p+"LIVE"), symbol=os.getenv(p+"SYMBOL", "122630").strip(),
+        return cls(enabled=_bool(p+"ENABLED", True), symbol=os.getenv(p+"SYMBOL", "122630").strip(),
                    account_exposure_pct=f("ACCOUNT_EXPOSURE_PCT", .30), safe_max_exposure_pct=f("SAFE_MAX_EXPOSURE_PCT", .30),
                    total_units=i("TOTAL_UNITS", 40), core_units=i("CORE_UNITS", 30), reserve_units=i("RESERVE_UNITS", 10),
                    take_profit_pct=f("TAKE_PROFIT_PCT", .10), risk_on_premium_pct=f("RISK_ON_PREMIUM_PCT", .02),
@@ -58,7 +57,19 @@ class InfiniteConfig:
         if self.take_profit_pct <= 0: raise ValueError("INVALID_TAKE_PROFIT")
         if self.balance_reconcile_grace_attempts < 1: raise ValueError("INVALID_BALANCE_RECONCILE_GRACE")
 
-    def orders_allowed(self, kis_env: str) -> bool:
-        """Practice orders need only ENABLED; real orders require the second gate."""
-        env = kis_env.strip().lower()
-        return self.enabled and (env not in {"real", "live"} or self.live)
+    def orders_allowed(self, kis_env: str, environ: dict[str, str] | None = None) -> bool:
+        """Inherit the canonical KR session gates; no second Infinite live switch."""
+        envvars = environ if environ is not None else os.environ
+        if not self.enabled or _bool_value(envvars.get("DRY_RUN"), False) or _bool_value(envvars.get("DISABLE_LIVE_TRADING"), False):
+            return False
+        if kis_env.strip().lower() not in {"real", "live"}:
+            return True
+        return all(_bool_value(envvars.get(key), False) for key in (
+            "LIVE_TRADING_ENABLED", "KR_LIVE_TRADING_ENABLED", "KR_ORDER_ARMED"
+        )) and str(envvars.get("STRATEGY_MODE") or "").upper() == "LIVE"
+
+
+def _bool_value(value: str | None, default: bool) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
