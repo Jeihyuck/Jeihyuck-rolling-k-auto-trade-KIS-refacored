@@ -347,7 +347,7 @@ def _restore_entry_meta_for_promoted_positions(
         with engine.connect() as _conn:
             rows = _conn.execute(
                 _sa.text(
-                    "SELECT code, position_meta, entry_meta_json FROM positions "
+                    "SELECT code, position_meta, entry_meta_json, position_cycle_id, portfolio_epoch_id, position_origin FROM positions "
                     "WHERE env = :env AND status = 'OPEN' AND qty > 0"
                 ),
                 {"env": env},
@@ -362,6 +362,9 @@ def _restore_entry_meta_for_promoted_positions(
         code = _normalize_code(row[0] if isinstance(row, tuple) else _row.get("code"))
         existing_meta = row[1] if isinstance(row, tuple) else _row.get("position_meta")
         existing_entry_meta = row[2] if isinstance(row, tuple) else _row.get("entry_meta_json")
+        position_cycle_id = row[3] if isinstance(row, tuple) else _row.get("position_cycle_id")
+        portfolio_epoch_id = row[4] if isinstance(row, tuple) else _row.get("portfolio_epoch_id")
+        position_origin = row[5] if isinstance(row, tuple) else _row.get("position_origin")
 
         if isinstance(existing_meta, str):
             try:
@@ -381,7 +384,12 @@ def _restore_entry_meta_for_promoted_positions(
         if existing_entry_meta.get("book") or existing_entry_meta.get("trade_horizon"):
             continue
 
-        # 1. orders.entry_meta_json 조회
+        # Imported/recovery cycles intentionally have no historical policy
+        # provenance.  Never attach symbol-level legacy order/ledger metadata.
+        if position_origin in {"IMPORTED", "RECOVERY"}:
+            continue
+
+        # 1. 동일 cycle/epoch의 orders.entry_meta_json만 조회
         entry_meta_from_order = None
         try:
             import sqlalchemy as _sa
@@ -390,10 +398,11 @@ def _restore_entry_meta_for_promoted_positions(
                     _sa.text(
                         "SELECT entry_meta_json FROM orders "
                         "WHERE env = :env AND code = :code AND side = 'BUY' "
+                        "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
                         "AND entry_meta_json IS NOT NULL "
                         "ORDER BY created_at DESC LIMIT 1"
                     ),
-                    {"env": env, "code": code},
+                    {"env": env, "code": code, "cycle_id": position_cycle_id, "epoch_id": portfolio_epoch_id},
                 ).fetchone()
             if order_row:
                 raw = order_row[0]
@@ -409,36 +418,9 @@ def _restore_entry_meta_for_promoted_positions(
                 "[RECONCILE][META_RESTORE] code=%s step=orders err=%s", code, exc
             )
 
-        # 2. ledger ORDER_INTENT payload 조회
+        # Ledger rows have no cycle/epoch columns and cannot prove current-cycle
+        # ownership; they are diagnostic only, never a restoration source.
         entry_meta_from_ledger = None
-        if entry_meta_from_order is None:
-            try:
-                import sqlalchemy as _sa
-                with engine.connect() as _conn:
-                    ledger_row = _conn.execute(
-                        _sa.text(
-                            "SELECT payload FROM ledger_events "
-                            "WHERE env = :env AND code = :code "
-                            "AND event_type IN ('ORDER_INTENT','ORDER_SUBMIT_ACCEPTED','ORDER_SUBMIT_ATTEMPT') "
-                            "ORDER BY ts DESC LIMIT 1"
-                        ),
-                        {"env": env, "code": code},
-                    ).fetchone()
-                if ledger_row:
-                    raw = ledger_row[0]
-                    if isinstance(raw, str):
-                        try:
-                            raw = _json.loads(raw)
-                        except Exception:
-                            raw = {}
-                    if isinstance(raw, dict):
-                        nested = raw.get("entry_meta") or raw.get("entry_meta_json") or raw
-                        if isinstance(nested, dict) and (nested.get("book") or nested.get("trade_horizon")):
-                            entry_meta_from_ledger = nested
-            except Exception as exc:
-                logger.warning(
-                    "[RECONCILE][META_RESTORE] code=%s step=ledger err=%s", code, exc
-                )
 
         resolved_meta = entry_meta_from_order or entry_meta_from_ledger
         if not resolved_meta:
@@ -756,6 +738,7 @@ def reconcile_kis(
             holdings=holdings_rows,
             fills_repo=fills_repo,
             orders_repo=orders_repo,
+            account_id=account_key,
         )
 
         # KIS holdings가 있고 DB positions가 0이면 upsert 복구

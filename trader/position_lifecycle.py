@@ -69,7 +69,15 @@ def validate_active_cycle(position: Mapping[str, Any], *, epoch_id: str, kis_qty
         if str(position.get("position_origin")) in {"IMPORTED", "RECOVERY"}:
             return StateValidation(True, "IMPORTED_COST_BASIS", float(kis_avg), 0.0)
         return StateValidation(False, "POSITION_STATE_MISMATCH")
-    diff = abs(float(kis_avg) - fill_avg) / fill_avg * 100 if fill_avg > 0 else float("inf")
+    # KIS average price represents the remaining holding.  After partial sells,
+    # positions.total_cost / qty is therefore the primary comparable basis;
+    # the all-BUY weighted average remains provenance/audit evidence only.
+    cycle_qty = int(position.get("qty") or 0)
+    remaining_basis = (
+        float(position.get("total_cost") or 0) / cycle_qty
+        if cycle_qty > 0 and float(position.get("total_cost") or 0) > 0 else fill_avg
+    )
+    diff = abs(float(kis_avg) - remaining_basis) / remaining_basis * 100 if remaining_basis > 0 else float("inf")
     if diff > float(tolerance_pct):
         return StateValidation(False, "POSITION_COST_BASIS_MISMATCH", fill_avg, diff)
     return StateValidation(True, "OK", fill_avg, diff)

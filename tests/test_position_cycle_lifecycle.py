@@ -1,8 +1,9 @@
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 
-from trader.db.repos import FillsRepo, OrdersRepo, PortfolioEpochsRepo, PositionsRepo
+from trader.db.repos import FillsRepo, OrdersRepo, PortfolioEpochsRepo, PositionsRepo, _ensure_active_epoch
 from trader.db.schema import schema_for_engine
 from trader.exit_policy.router import apply_swing_exit_decision
 from trader.position_lifecycle import new_cycle_state, validate_active_cycle, validate_long_stop
@@ -70,6 +71,16 @@ def test_invalid_long_stop_blocks_router_sell():
     assert result["exit_ok"] is False and result["reason"] == "INVALID_STOP" and result["qty"] == 0
 
 
+def test_valid_long_stop_hit_remains_sellable():
+    result = apply_swing_exit_decision(
+        {"code": "000001", "avg_buy_price": 100, "qty": 1}, 92,
+        {"max_hold_days": 10, "partial_sell_rules": [], "full_exit_rules": []},
+        ret_pct=-8, current_r=-1, highest_ret_pct=0, days_held=0,
+        stop_hit=True, effective_stop=93, effective_r=7,
+    )
+    assert result["exit_ok"] is True and result["reason"] == "STOP_HIT_EFFECTIVE" and result["qty"] == 1
+
+
 def test_zero_r_is_invalid_r():
     assert validate_long_stop(100, 100) == (False, "INVALID_R", 0.0)
 
@@ -90,6 +101,30 @@ def test_active_epoch_is_shared_and_only_explicit_reset_changes_it():
     assert position_epochs == {first}
     second = epochs.start_new_epoch(**identity, reason="NEW_PRACTICE_EPOCH")
     assert second != first and epochs.get_or_create_active(**identity) == second
+
+
+def test_concurrent_active_epoch_unique_conflict_reselects_winner():
+    class Result:
+        def __init__(self, value): self.value = value
+        def scalar(self): return self.value
+
+    class Savepoint:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+
+    class RacingConnection:
+        def __init__(self): self.selects = 0
+        def begin_nested(self): return Savepoint()
+        def execute(self, statement):
+            if getattr(statement, "is_select", False):
+                self.selects += 1
+                return Result(None if self.selects == 1 else "winning-epoch")
+            raise IntegrityError("concurrent insert", {}, Exception("unique violation"))
+
+    schema = schema_for_engine(sa.create_engine("sqlite:///:memory:"))
+    result = _ensure_active_epoch(RacingConnection(), schema, env="practice", account_id="acct",
+                                  sid=1, mode=1, strategy="pb1")
+    assert result == "winning-epoch"
 
 
 def test_order_fill_position_share_cycle_and_epoch_provenance():
@@ -116,3 +151,36 @@ def test_order_fill_position_share_cycle_and_epoch_provenance():
         position = conn.execute(sa.select(schema.positions).where(schema.positions.c.code == "000003")).mappings().one()
     assert fill["position_cycle_id"] == position["position_cycle_id"] == order["position_cycle_id"]
     assert fill["portfolio_epoch_id"] == position["portfolio_epoch_id"] == order["portfolio_epoch_id"]
+
+
+def test_legacy_closed_position_bootstraps_clean_imported_cycle():
+    engine, positions = _repo()
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.positions).values(
+            position_id="legacy-pos", position_cycle_id="legacy-cycle",
+            portfolio_epoch_id="legacy-epoch", opened_at=datetime.now(timezone.utc),
+            position_origin="RECOVERY", env="real", strategy="pb1", sid=1, mode=1,
+            code="000004", qty=0, total_cost=0, realized_pnl=0, status="CLOSED",
+            closed_reason="LEGACY_MIGRATION_0050", position_meta={"tp1_done": True, "holding_bars": 50},
+        ))
+    assert positions.restore_missing_from_holdings(
+        env="real", strategy="pb1", sid=1, mode=1,
+        holdings=[{"code": "000004", "qty": 2, "avg_price": 400}], account_id="real:acct:01",
+    ) == 1
+    current = positions.get_position(env="real", strategy="pb1", sid=1, mode=1, code="000004")
+    assert current["position_cycle_id"] != "legacy-cycle"
+    assert current["position_origin"] == "IMPORTED"
+    assert current["position_meta"] == {"holding_age_unknown": True, "holding_bars": 0, "tp1_done": False, "tp2_done": False}
+
+
+def test_legacy_null_provenance_fills_are_excluded_and_remaining_basis_is_primary():
+    pos = {"status": "OPEN", "portfolio_epoch_id": "e", "position_cycle_id": "c",
+           "position_origin": "SYSTEM", "qty": 10, "total_cost": 1100}
+    fills = [
+        {"side": "BUY", "qty": 10, "price": 100, "position_cycle_id": None, "portfolio_epoch_id": None},
+        {"side": "BUY", "qty": 1, "price": 100, "position_cycle_id": "c", "portfolio_epoch_id": "e"},
+    ]
+    result = validate_active_cycle(pos, epoch_id="e", kis_qty=10, kis_avg=110, fills=fills)
+    assert result.ok and result.reason == "OK"
+    assert result.cycle_fill_avg == 100 and result.difference_pct == 0

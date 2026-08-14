@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import inspect
+from trader.account_state import get_account_key
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.path_contract import resolve_repo_root
@@ -5783,6 +5784,7 @@ class PB1Engine:
                         sid=1,
                         mode=1,
                         holdings=[row],
+                        account_id=get_account_key(env=self.env, kis=self.kis),
                     )
                 corrected_count += 1
         refreshed = self.positions_repo.list_positions(self.env, self.STRATEGY_NAME)
@@ -12263,12 +12265,6 @@ class PB1Engine:
                 display_code, int(_router_qty or 0), qty, exit_eval.primary_reason,
             )
 
-        if orderable_qty <= 0:
-            exit_eval_payload["order_skip_reasons"] = ["orderable_qty_zero"]
-            exit_eval_payload["order_result"] = "ORDER_SKIPPED_ROUTER_QTY_ZERO"
-            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
-            return exit_eval_payload
-
         holding_qty = max(0, int(qty or 0))
         db_qty = holding_qty
         strategy_qty = max(0, int(orderable_qty or 0))
@@ -12353,6 +12349,16 @@ class PB1Engine:
                 kis_qty,
                 kis_sellable_qty,
             )
+            return exit_eval_payload
+
+        # Execution/session and broker-position gates above have higher safety
+        # precedence than router input validation.  Only report a zero router
+        # quantity after those stronger blocks have had a chance to preserve
+        # their established ORDER_SKIPPED_* contract.
+        if orderable_qty <= 0:
+            exit_eval_payload["order_skip_reasons"] = ["orderable_qty_zero"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_ROUTER_QTY_ZERO"
+            logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
         orderable_balance_qty = kis_sellable_qty
@@ -15497,6 +15503,7 @@ class PB1Engine:
                 sid=1,
                 mode=1,
                 holdings=holdings_rows,
+                account_id=get_account_key(env=self.env, kis=self.kis),
             )
             logger.info("[PB1][BOOTSTRAP] holdings_count=%s inserted=%s", len(holdings_rows), bootstrapped)
             with self._stage_timer("exit.positions_lookup"):

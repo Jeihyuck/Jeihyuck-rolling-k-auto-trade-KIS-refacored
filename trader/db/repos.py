@@ -46,6 +46,7 @@ from trader.time_utils import now_kst
 from trader.time_coerce import to_date
 from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
+from trader.account_state import get_account_key
 
 logger = logging.getLogger(__name__)
 
@@ -2621,11 +2622,20 @@ def _ensure_active_epoch(conn, db_schema, *, env: str, account_id: str, sid: int
     if active:
         return str(active)
     epoch_id = _coerce_uuid(None, uses_native_uuid=db_schema.uses_native_uuid, database_url=db_schema.database_url)
-    conn.execute(sa.insert(db_schema.portfolio_epochs).values(
-        portfolio_epoch_id=epoch_id, env=env, account_id=account_id, sid=sid,
-        mode=mode, strategy=strategy, status="ACTIVE", reason="AUTO_INITIAL_EPOCH",
-    ))
-    return str(epoch_id)
+    try:
+        # SAVEPOINT keeps the outer runner transaction usable after the
+        # partial-unique-index race between AM/PM/CLOSE processes.
+        with conn.begin_nested():
+            conn.execute(sa.insert(db_schema.portfolio_epochs).values(
+                portfolio_epoch_id=epoch_id, env=env, account_id=account_id, sid=sid,
+                mode=mode, strategy=strategy, status="ACTIVE", reason="AUTO_INITIAL_EPOCH",
+            ))
+        return str(epoch_id)
+    except IntegrityError:
+        active = conn.execute(select(db_schema.portfolio_epochs.c.portfolio_epoch_id).where(identity)).scalar()
+        if active:
+            return str(active)
+        raise
 
 
 class PortfolioEpochsRepo:
@@ -2769,7 +2779,7 @@ class OrdersRepo:
         original_request_json = request_json
         if run_id:
             self.ensure_run_exists(run_id)
-        account_id = account_id or f"sid:{sid}:mode:{mode}"
+        account_id = account_id or get_account_key(env=env)
         with self.engine.begin() as conn:
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
@@ -5238,7 +5248,7 @@ class PositionsRepo:
                 if provenance:
                     position_cycle_id = position_cycle_id or provenance.get("position_cycle_id")
                     portfolio_epoch_id = portfolio_epoch_id or provenance.get("portfolio_epoch_id")
-            account_id = account_id or f"sid:{sid}:mode:{mode}"
+            account_id = account_id or get_account_key(env=env)
             portfolio_epoch_id = portfolio_epoch_id or _ensure_active_epoch(
                 conn, self._schema, env=env, account_id=account_id, sid=sid, mode=mode, strategy=strategy
             )
@@ -5397,7 +5407,7 @@ class PositionsRepo:
         count = 0
         with self.engine.begin() as conn:
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
-                account_id=account_id or f"sid:{sid}:mode:{mode}", sid=sid, mode=mode, strategy=strategy)
+                account_id=account_id or get_account_key(env=env), sid=sid, mode=mode, strategy=strategy)
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
@@ -5464,7 +5474,7 @@ class PositionsRepo:
         restored = 0
         with self.engine.begin() as conn:
             epoch_id = _ensure_active_epoch(conn, self._schema, env=env,
-                account_id=account_id or f"sid:{sid}:mode:{mode}", sid=sid, mode=mode, strategy=strategy)
+                account_id=account_id or get_account_key(env=env), sid=sid, mode=mode, strategy=strategy)
             for row in holdings or []:
                 try:
                     code = str(row.get("pdno") or row.get("code") or "").zfill(6)
