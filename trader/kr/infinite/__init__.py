@@ -1,0 +1,5 @@
+"""Isolated KODEX Leverage infinite-buy sleeve."""
+
+STRATEGY_ID = "KR_INFINITE_V1"
+POLICY_VERSION = "KR_INFINITE_ADAPTIVE_V1"
+SYMBOL = "122630"

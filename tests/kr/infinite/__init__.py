@@ -1,0 +1,1 @@
+"""KR Infinite tests."""
