@@ -10,7 +10,8 @@ from uuid import uuid4
 from trader.core_utils import _round_to_tick
 from trader.db.engine import make_engine
 from trader.db.migrate import run_migrations
-from trader.db.repos import FillsRepo, KrInfiniteCampaignsRepo, LedgerEventsRepo, OrdersRepo, RunsRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, RunsRepo
+from trader.kr_infinite_state import KrInfiniteCampaignsRepo
 from trader.kis_wrapper import KisAPI
 from trader.strategies.kr_infinite import CampaignState, KrInfiniteConfig, MarketState, evaluate_trade
 from trader.time_utils import now_kst
@@ -278,6 +279,10 @@ def run_once(*, env: str, dry_run: bool) -> int:
                     cycle_id=f"{now_kst().date().isoformat()}-{code}-new",
                     started_on=now_kst().date(),
                 )
+            elif state.qty <= 0 and not buy_fill_seen:
+                logger.info("[KR_INF][HOLD] code=%s cycle=%s reason=await_initial_fill", code, state.cycle_id)
+                runs.finish_run(run_id, "OK", notes="await_initial_fill")
+                return 0
 
         quote = kis.get_price_quote(code, diag_mode=False, attempts=1)
         price = float(quote.get("ask") or quote.get("last") or quote.get("prpr") or 0.0)
@@ -318,16 +323,8 @@ def run_once(*, env: str, dry_run: bool) -> int:
         order_price = _round_to_tick(price * (1.002 if side == "BUY" else 0.998), mode="up" if side == "BUY" else "down")
         date_tag = now_kst().strftime("%Y%m%d")
         cycle_id = state.cycle_id if active_cycle else f"{date_tag}-{code}-{uuid4().hex[:8]}"
-        if plan.action == "BUY" and not active_cycle:
-            campaigns.start_cycle(
-                env=env,
-                strategy=STRATEGY,
-                code=code,
-                cycle_id=cycle_id,
-                started_on=now_kst().date(),
-            )
         key = f"{date_tag}|{STRATEGY}|{code}|{side}|cycle={cycle_id}|n={state.deployed_tranches}|reason={plan.reason}"
-        order_id, created = orders.create_intent_idempotent(
+        _, created = orders.create_intent_idempotent(
             env=env,
             run_id=run_id,
             strategy=STRATEGY,
@@ -362,6 +359,14 @@ def run_once(*, env: str, dry_run: bool) -> int:
         if ok:
             orders.mark_submitted(env, key, kis_odno, resp)
             orders.mark_acked(env, kis_odno, resp)
+            if side == "BUY" and not active_cycle:
+                campaigns.start_cycle(
+                    env=env,
+                    strategy=STRATEGY,
+                    code=code,
+                    cycle_id=cycle_id,
+                    started_on=now_kst().date(),
+                )
             logger.info("[KR_INF][ORDER][ACK] side=%s code=%s qty=%s limit=%s odno=%s fill_assumed=0", side, code, plan.qty, order_price, kis_odno)
             _append_event(ledger, env=env, run_id=run_id, code=code, side=side, qty=plan.qty, price=order_price, ok=True, reasons=["broker_acked_not_filled", plan.reason], payload={"response": resp, "cycle_id": cycle_id, "tranche_count": plan.tranche_count})
             runs.finish_run(run_id, "OK", notes="broker_acked_not_filled")
