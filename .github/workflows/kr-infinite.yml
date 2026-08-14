@@ -1,0 +1,19 @@
+name: KR Infinite V1
+on:
+  workflow_dispatch:
+concurrency:
+  group: kr-infinite-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  decision:
+    runs-on: ubuntu-latest
+    env:
+      KR_INFINITE_ENABLED: ${{ vars.KR_INFINITE_ENABLED || '0' }}
+      KR_INFINITE_LIVE: ${{ vars.KR_INFINITE_LIVE || '0' }}
+      KIS_ENV: ${{ vars.KIS_ENV || 'practice' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install -r requirements.txt
+      - run: python -m trader.kr.infinite.runner
