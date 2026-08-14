@@ -54,3 +54,8 @@ class InfiniteConfig:
             raise ValueError("INVALID_UNIT_CONFIGURATION")
         if not 0 < self.account_exposure_pct <= self.safe_max_exposure_pct <= 1: raise ValueError("INVALID_ACCOUNT_EXPOSURE")
         if self.take_profit_pct <= 0: raise ValueError("INVALID_TAKE_PROFIT")
+
+    def orders_allowed(self, kis_env: str) -> bool:
+        """Practice orders need only ENABLED; real orders require the second gate."""
+        env = kis_env.strip().lower()
+        return self.enabled and (env not in {"real", "live"} or self.live)

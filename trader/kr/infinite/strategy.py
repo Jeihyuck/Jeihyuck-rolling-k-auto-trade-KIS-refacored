@@ -6,12 +6,22 @@ from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import idempotency_key
 from .risk_adapter import allows_new_cycle, validate_regime
 
+def trading_days_since(start: date|None, end: date) -> int:
+    if start is None or start >= end: return 0
+    from datetime import timedelta
+    from trader.time_utils import is_krx_trading_day
+    cursor, count = start, 0
+    while cursor < end:
+        cursor += timedelta(days=1)
+        count += int(is_krx_trading_day(cursor))
+    return count
+
 def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosition, trade_date: date, market_state: str,
              trading_days_since_last_buy: int=10000, orderable_cash: float=0, pending_buy: bool=False, pending_sell: bool=False,
              existing_intent_keys: frozenset[str]=frozenset(), regime_data_quality: str="OK") -> Decision:
     try: config.validate(); validate_regime(market_state, regime_data_quality)
     except ValueError as e: return Decision(Action.BLOCK,str(e),next_status=Status.FROZEN)
-    if not config.enabled or not config.live: return Decision(Action.WAIT,"KR_INF_SAFETY_GATE_CLOSED")
+    if not config.enabled: return Decision(Action.WAIT,"KR_INF_FEATURE_DISABLED")
     if position.current_price <= 0: return Decision(Action.BLOCK,"KR_INF_MARKET_DATA_UNAVAILABLE",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price <= 0: return Decision(Action.BLOCK,"KR_INF_AVG_PRICE_INVALID",next_status=Status.FROZEN)
     if state is None and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_UNOWNED_EXISTING_POSITION",next_status=Status.FROZEN)

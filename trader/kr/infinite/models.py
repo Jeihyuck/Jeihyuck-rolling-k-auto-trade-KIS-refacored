@@ -29,3 +29,24 @@ class BrokerPosition:
 @dataclass(frozen=True)
 class Decision:
     action: Action; reason: str; qty: int=0; notional: float=0; idempotency_key: str|None=None; next_status: Status|None=None
+
+@dataclass(frozen=True)
+class OrderIntent:
+    id: int
+    cycle_id: str
+    trade_date: date
+    side: str
+    idempotency_key: str
+    requested_qty: int
+    broker_order_id: str|None = None
+    status: str = "INTENT_CREATED"
+    filled_qty: int = 0
+    filled_notional_krw: float = 0
+    unit_sequence: int|None = None
+
+@dataclass(frozen=True)
+class BrokerOrderState:
+    status: str
+    filled_qty: int = 0
+    filled_notional_krw: float = 0
+    filled_avg_price: float|None = None
