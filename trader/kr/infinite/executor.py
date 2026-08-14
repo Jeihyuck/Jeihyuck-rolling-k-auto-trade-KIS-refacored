@@ -44,7 +44,7 @@ class KISExecutor:
     def orderable_cash(self, symbol: str, price: float) -> float:
         return float(self.kis.get_orderable_cash(symbol, price)[0])
 
-    def submit(self, decision: Decision, symbol: str) -> tuple[str, dict]:
+    def submit(self, decision: Decision, symbol: str) -> tuple[str | None, dict]:
         if decision.action in {Action.BUY, Action.RECOVERY}:
             response = self.kis.buy_stock_limit(symbol, decision.qty, int(decision.notional / decision.qty))
         elif decision.action == Action.SELL_ALL:
@@ -56,14 +56,27 @@ class KISExecutor:
         order_id = extract_order_no(response)
         if not order_id and self.kis_env.lower() in {"real", "live"}:
             raise RuntimeError("KR_INF_BROKER_ORDER_ID_MISSING")
-        return order_id or f"PRACTICE-{decision.idempotency_key}", response
+        return order_id, response
 
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
-        if not intent.broker_order_id:
-            return BrokerOrderState("INTENT_CREATED")
+        # With no ODNO, every pending status is correlated against observable
+        # broker data, including crash-before-persistence and later restarts.
         raw = self.kis.inquire_daily_ccld(start_date=trade_date.strftime("%Y%m%d"), end_date=trade_date.strftime("%Y%m%d"))
-        rows = raw.get("output1") or raw.get("output") or [] if isinstance(raw, dict) else []
-        row = next((item for item in rows if str(item.get("odno") or item.get("ODNO") or item.get("ord_no") or "") == intent.broker_order_id), None)
+        rows = (raw.get("output1") or raw.get("output") or []) if isinstance(raw, dict) else []
+        if intent.broker_order_id:
+            matches = [item for item in rows if str(item.get("odno") or item.get("ODNO") or item.get("ord_no") or "") == intent.broker_order_id]
+        else:
+            expected_side = "BUY" if intent.side in {"BUY", "RECOVERY"} else "SELL"
+            def correlated(item) -> bool:
+                symbol = str(item.get("pdno") or item.get("code") or item.get("symbol") or "").lstrip("A")
+                side_raw = str(item.get("sll_buy_dvsn_cd") or item.get("side") or item.get("sll_buy_dvsn_name") or "").upper()
+                side = "BUY" if side_raw in {"02", "BUY", "매수"} or "BUY" in side_raw else "SELL" if side_raw in {"01", "SELL", "매도"} or "SELL" in side_raw else ""
+                requested = int(float(item.get("ord_qty") or item.get("requested_qty") or item.get("tot_ord_qty") or 0))
+                return symbol == "122630" and side == expected_side and requested == intent.requested_qty
+            matches = [item for item in rows if correlated(item)]
+            if len(matches) > 1:
+                raise RuntimeError("KR_INF_PENDING_ORDER_AMBIGUOUS")
+        row = matches[0] if len(matches) == 1 else None
         if row is None:
             return BrokerOrderState("RECONCILE_PENDING")
         qty = int(float(row.get("tot_ccld_qty") or row.get("ccld_qty") or row.get("filled_qty") or 0))

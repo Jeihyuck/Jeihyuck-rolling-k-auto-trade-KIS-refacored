@@ -10,12 +10,14 @@ REGIME = lambda: ("KR_NORMAL", "OK")
 
 
 class FakeKIS:
-    def __init__(self, *, qty=0, average=0, price=100, fill_qty=0):
+    def __init__(self, *, qty=0, average=0, price=100, fill_qty=0, with_odno=True, reported_qty=None):
         self.qty, self.average, self.price, self.fill_qty = qty, average, price, fill_qty
+        self.with_odno, self.reported_qty = with_odno, reported_qty
         self.orders, self.events, self.last_side = [], [], None
 
     def get_balance(self, force=True):
-        holdings = [] if self.qty == 0 else [{"pdno": "122630", "hldg_qty": str(self.qty), "ord_psbl_qty": str(self.qty), "pchs_avg_pric": str(self.average)}]
+        visible = self.qty if self.reported_qty is None else self.reported_qty
+        holdings = [] if visible == 0 else [{"pdno": "122630", "hldg_qty": str(visible), "ord_psbl_qty": str(visible), "pchs_avg_pric": str(self.average)}]
         return {"output1": holdings, "output2": {"tot_evlu_amt": "4000000"}}
 
     def get_current_price(self, symbol): return self.price
@@ -26,15 +28,17 @@ class FakeKIS:
         filled = min(qty, self.fill_qty)
         if filled:
             self.qty += filled; self.average = price
-        return {"rt_cd": "0", "output": {"ODNO": "O1"}}
+        return {"rt_cd": "0", "output": {"ODNO": "O1"} if self.with_odno else {}}
 
     def sell_stock(self, symbol, qty):
         self.events.append("submit"); self.orders.append(("SELL", qty)); self.last_side = "SELL"
         self.qty -= min(qty, self.fill_qty)
-        return {"rt_cd": "0", "output": {"ODNO": "O1"}}
+        return {"rt_cd": "0", "output": {"ODNO": "O1"} if self.with_odno else {}}
 
     def inquire_daily_ccld(self, **kwargs):
-        return {"output1": [{"odno": "O1", "tot_ccld_qty": str(self.fill_qty), "avg_prvs": str(self.price)}]}
+        return {"output1": [{"odno": "O1", "pdno": "122630", "side": self.last_side or "BUY",
+                              "ord_qty": str(self.orders[-1][1] if self.orders else 0),
+                              "tot_ccld_qty": str(self.fill_qty), "avg_prvs": str(self.price)}]}
 
 
 class FakeRepository:
@@ -135,3 +139,44 @@ def test_unowned_existing_position_freezes_without_order():
     kis, repo = FakeKIS(qty=10, average=100), FakeRepository()
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert result.decision.reason == "KR_INF_UNOWNED_EXISTING_POSITION" and not kis.orders
+
+
+def test_practice_with_and_without_odno_reconciles_without_duplicate():
+    for with_odno in (True, False):
+        kis, repo = FakeKIS(fill_qty=100, with_odno=with_odno), FakeRepository()
+        first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+        assert first.submitted and first.state.units_used == 1
+        if not with_odno:
+            assert repo.intents[0].broker_order_id is None
+        restarted = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+        assert len(kis.orders) == 1 and restarted.decision.action == Action.WAIT
+
+
+def test_no_odno_restart_correlates_later_fill_without_resubmit():
+    kis, repo = FakeKIS(fill_qty=0, with_odno=False), FakeRepository()
+    accepted = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert accepted.submitted and repo.intents[0].broker_order_id is None and accepted.state.units_used == 0
+    kis.fill_qty = 100
+    kis.qty = 100
+    kis.average = 100
+    reconciled = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert reconciled.state.units_used == 1 and len(kis.orders) == 1
+
+
+def test_fill_before_balance_uses_bounded_grace_then_activates():
+    kis, repo = FakeKIS(fill_qty=100, reported_qty=0), FakeRepository()
+    first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert first.state.status == Status.ACTIVE and first.state.metadata["fill_balance_pending"]
+    kis.reported_qty = kis.qty
+    confirmed = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert confirmed.state.status == Status.ACTIVE and "fill_balance_pending" not in confirmed.state.metadata
+    assert len(kis.orders) == 1
+
+
+def test_fill_balance_mismatch_beyond_grace_freezes():
+    kis, repo = FakeKIS(fill_qty=100, reported_qty=0), FakeRepository()
+    run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    result = None
+    for _ in range(4):
+        result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
+    assert result.state.status == Status.FROZEN and len(kis.orders) == 1

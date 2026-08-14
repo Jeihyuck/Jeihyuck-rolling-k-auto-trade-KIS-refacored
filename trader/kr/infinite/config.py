@@ -31,6 +31,7 @@ class InfiniteConfig:
     long_cycle_step_pct: float = .07
     long_cycle_gap_days: int = 10
     same_day_restart: bool = False
+    balance_reconcile_grace_attempts: int = 3
 
     @classmethod
     def from_env(cls) -> "InfiniteConfig":
@@ -46,7 +47,8 @@ class InfiniteConfig:
                    risk_off_step_pct=f("RISK_OFF_STEP_PCT", .05), risk_off_gap_days=i("RISK_OFF_GAP_DAYS", 7),
                    recovery_probe_cooldown_days=i("RECOVERY_PROBE_COOLDOWN_DAYS", 2), long_cycle_days=i("LONG_CYCLE_DAYS", 120),
                    long_cycle_step_pct=f("LONG_CYCLE_STEP_PCT", .07), long_cycle_gap_days=i("LONG_CYCLE_GAP_DAYS", 10),
-                   same_day_restart=_bool(p+"SAME_DAY_RESTART"))
+                   same_day_restart=_bool(p+"SAME_DAY_RESTART"),
+                   balance_reconcile_grace_attempts=i("BALANCE_RECONCILE_GRACE_ATTEMPTS", 3))
 
     def validate(self) -> None:
         if self.symbol != "122630": raise ValueError("BLOCK_UNSUPPORTED_SYMBOL")
@@ -54,6 +56,7 @@ class InfiniteConfig:
             raise ValueError("INVALID_UNIT_CONFIGURATION")
         if not 0 < self.account_exposure_pct <= self.safe_max_exposure_pct <= 1: raise ValueError("INVALID_ACCOUNT_EXPOSURE")
         if self.take_profit_pct <= 0: raise ValueError("INVALID_TAKE_PROFIT")
+        if self.balance_reconcile_grace_attempts < 1: raise ValueError("INVALID_BALANCE_RECONCILE_GRACE")
 
     def orders_allowed(self, kis_env: str) -> bool:
         """Practice orders need only ENABLED; real orders require the second gate."""

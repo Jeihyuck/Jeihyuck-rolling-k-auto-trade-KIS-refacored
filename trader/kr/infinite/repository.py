@@ -61,7 +61,7 @@ class InfiniteRepository:
             }).first()
         return row is not None
 
-    def mark_submitted(self, key: str, broker_order_id: str) -> None:
+    def mark_submitted(self, key: str, broker_order_id: str | None) -> None:
         with self.engine.begin() as conn:
             conn.execute(text("""UPDATE kr_infinite_order_intents SET broker_order_id=:order_id,
                 status='SUBMITTED',updated_at=NOW() WHERE idempotency_key=:key"""), {"order_id": broker_order_id, "key": key})

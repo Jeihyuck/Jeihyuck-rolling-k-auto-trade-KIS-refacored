@@ -28,6 +28,7 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     state=state or State()
     try: validate_invariants(state,position.qty)
     except ValueError as e: return Decision(Action.BLOCK,str(e),next_status=Status.FROZEN)
+    if state.status == Status.FROZEN: return Decision(Action.BLOCK,"KR_INF_STATE_FROZEN",next_status=Status.FROZEN)
     if state.status == Status.COMPLETE and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if state.status == Status.ACTIVE and (not state.cycle_id or position.qty == 0): return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if position.qty > 0 and position.current_price + 1e-9 >= position.average_price*(1+config.take_profit_pct):

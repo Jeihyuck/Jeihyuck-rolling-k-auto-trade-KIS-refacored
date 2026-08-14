@@ -19,6 +19,7 @@ from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import cycle_id
 from .reconciliation import reconcile
 from .repository import InfiniteRepository
+from .regime_source import produce_current_regime
 from .risk_adapter import allows_new_cycle
 from .strategy import evaluate, trading_days_since
 
@@ -83,7 +84,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         position = executor.position(config.symbol)
         unresolved_sell = any(i.side == "SELL_ALL" and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
                               for i, broker in updates)
-        state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell)
+        state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell,
+                                             balance_grace_attempts=config.balance_reconcile_grace_attempts)
         if state is not None and updates:
             repository.persist_reconciliation(state, updates)
         if reconcile_reason.startswith("KR_INF_"):
@@ -92,6 +94,9 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             decision = Decision(Action.BLOCK, reconcile_reason, next_status=Status.FROZEN)
             log_decision(decision=decision.action.value, reason=decision.reason, symbol=config.symbol)
             return RunResult(decision, state)
+        if reconcile_reason == "FILL_CONFIRMED_BALANCE_PENDING":
+            repository.save_state(state)
+            return RunResult(Decision(Action.WAIT, reconcile_reason), state)
 
         market_state, quality = regime_provider()
         if state is not None:
@@ -146,7 +151,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         state, post_updates = _reconcile_pending(repository, executor, state, day)
         post_position = executor.position(config.symbol)
         state, _ = reconcile(state, post_position, day,
-                             pending_sell=decision.action == Action.SELL_ALL and post_position.qty > 0)
+                             pending_sell=decision.action == Action.SELL_ALL and post_position.qty > 0,
+                             balance_grace_attempts=config.balance_reconcile_grace_attempts)
         if state is not None:
             repository.persist_reconciliation(state, post_updates)
         return RunResult(decision, state, submitted=True)
@@ -158,7 +164,14 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
 def main() -> int:
     logging.basicConfig(level=logging.INFO)
     config = InfiniteConfig.from_env()
-    result = run_once(config=config, kis=KisAPI(kis_env=os.getenv("KIS_ENV", "practice")),
+    kis = KisAPI(kis_env=os.getenv("KIS_ENV", "practice"))
+    if os.getenv("KR_INFINITE_USE_PREBUILT_REGIME", "0") != "1":
+        try:
+            produce_current_regime(kis)
+        except Exception as exc:
+            logger.error("[KR_INFINITE][BLOCK] reason=KR_INF_REGIME_DATA_BLOCKED detail=%s", exc)
+            return 2
+    result = run_once(config=config, kis=kis,
                       repository=InfiniteRepository(), kis_env=os.getenv("KIS_ENV", "practice"))
     return 0 if result.decision.action != Action.BLOCK else 2
 
