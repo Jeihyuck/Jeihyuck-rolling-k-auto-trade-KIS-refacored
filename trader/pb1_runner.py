@@ -7601,11 +7601,14 @@ def _run_loop(*, args: argparse.Namespace) -> None:
                 session_metrics["ticks_total"] += 1
                 session_metrics["buy_orders"] += int(last_tick_metrics.get("buy_orders", 0) or 0)
                 session_metrics["sell_orders"] += int(last_tick_metrics.get("sell_orders", 0) or 0)
-                session_metrics["buy_orders_ack"] += int(last_tick_metrics.get("accepted", 0) or 0)
+                tick_buy_ack = int(last_tick_metrics.get("buy_orders_ack", last_tick_metrics.get("accepted", 0)) or 0)
+                session_metrics["buy_orders_ack"] += tick_buy_ack
                 session_metrics["sell_orders_ack"] += int(last_tick_metrics.get("sell_orders_ack", last_tick_metrics.get("sell_orders", 0)) or 0)
                 session_metrics["order_candidates"] += int(last_tick_metrics.get("order_candidates", last_tick_metrics.get("order_candidate_count", 0)) or 0)
                 session_metrics["api_submitted"] += int(last_tick_metrics.get("api_submitted", last_tick_metrics.get("submitted", last_tick_metrics.get("submit_success_count", 0))) or 0)
-                session_metrics["accepted"] += int(last_tick_metrics.get("accepted", 0) or 0)
+                # Broker ACK is not a fill confirmation; fills use the separate
+                # reconciled ``filled`` counter below.
+                session_metrics["accepted"] += int(last_tick_metrics.get("accepted", tick_buy_ack) or 0)
                 session_metrics["rejected"] += int(last_tick_metrics.get("rejected", 0) or 0)
                 session_metrics["skipped"] += int(last_tick_metrics.get("skipped", last_tick_metrics.get("skipped_count", 0)) or 0)
                 session_metrics["filled_confirmed"] += int(last_tick_metrics.get("filled", 0) or 0)

@@ -3,6 +3,7 @@ import os
 import time
 from pathlib import Path
 import subprocess
+from datetime import datetime, timezone
 import sqlalchemy as sa
 from sqlalchemy.exc import OperationalError, DBAPIError
 
@@ -288,7 +289,7 @@ def acquire_advisory_xact_lock(conn, key: int = LOCK_KEY, *, context: str = "", 
             logger.warning("[LOCK][ACQUIRE][FAIL] key=%s context=%s attempt=%s/%s err=%s", key, context, attempt, retries, exc)
             ok = False
         if ok:
-            logger.info("[LOCK][ACQUIRE][OK] key=%s context=%s attempt=%s/%s scope=xact idle_timeout=%s statement_timeout=%s", key, context, attempt, retries, idle_timeout_ms, statement_timeout_ms)
+            logger.info("[LOCK][ACQUIRE][OK] key=%s context=%s attempt=%s/%s scope=xact idle_timeout=%s statement_timeout=%s owner_run_id=%s pid=%s acquired_at=%s", key, context, attempt, retries, idle_timeout_ms, statement_timeout_ms, os.getenv("PB1_RUN_ID", "unknown"), os.getpid(), datetime.now(timezone.utc).isoformat())
             return True
         logger.warning("[LOCK][ACQUIRE][BUSY] key=%s context=%s attempt=%s/%s sleep_sec=%.2f", key, context, attempt, retries, sleep_sec if attempt < retries else 0)
         if attempt < retries:
@@ -335,7 +336,7 @@ def release_advisory_xact_lock(conn, key: int = LOCK_KEY, *, context: str = "") 
     try:
         if getattr(conn, "in_transaction", lambda: False)():
             conn.rollback()
-        logger.info("[LOCK][RELEASE][OK] key=%s scope=xact action=rollback context=%s", key, context)
+        logger.info("[LOCK][RELEASE][OK] key=%s scope=xact action=rollback context=%s owner_run_id=%s pid=%s release_at=%s", key, context, os.getenv("PB1_RUN_ID", "unknown"), os.getpid(), datetime.now(timezone.utc).isoformat())
     except Exception as exc:
         logger.error("[LOCK][RELEASE][MISSING_OR_FAILED] key=%s scope=xact context=%s err=%s", key, context, exc)
         raise

@@ -39,6 +39,7 @@ class SchemaTables:
     orders: sa.Table
     fills: sa.Table
     positions: sa.Table
+    portfolio_epochs: sa.Table
     ledger_events: sa.Table
     reconcile_log: sa.Table
     price_daily: sa.Table
@@ -126,6 +127,8 @@ def _build_schema(database_url: str) -> SchemaTables:
         "orders",
         metadata,
         uuid_col("order_id", primary_key=True),
+        uuid_col("position_cycle_id", nullable=True),
+        uuid_col("portfolio_epoch_id", nullable=True),
         sa.Column("env", sa.String, nullable=False),
         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
         sa.Column("strategy", sa.String, nullable=False),
@@ -163,6 +166,8 @@ def _build_schema(database_url: str) -> SchemaTables:
         "fills",
         metadata,
         uuid_col("fill_id", primary_key=True),
+        uuid_col("position_cycle_id", nullable=True),
+        uuid_col("portfolio_epoch_id", nullable=True),
         sa.Column("env", sa.String, nullable=False),
         sa.Column("run_id", uuid_type, sa.ForeignKey("runs.run_id")),
         sa.Column("order_id", uuid_type, sa.ForeignKey("orders.order_id")),
@@ -200,10 +205,36 @@ def _build_schema(database_url: str) -> SchemaTables:
         ),
     )
 
+    portfolio_epochs = sa.Table(
+        "portfolio_epochs",
+        metadata,
+        uuid_col("portfolio_epoch_id", primary_key=True),
+        sa.Column("env", sa.String, nullable=False),
+        sa.Column("account_id", sa.String, nullable=False),
+        sa.Column("sid", sa.Integer, nullable=False),
+        sa.Column("mode", sa.Integer, nullable=False),
+        sa.Column("strategy", sa.String, nullable=False),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("ended_at", sa.DateTime(timezone=True)),
+        sa.Column("status", sa.String, nullable=False, server_default="ACTIVE"),
+        sa.Column("reason", sa.String),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
+    )
+    sa.Index(
+        "uq_portfolio_epochs_active", portfolio_epochs.c.env, portfolio_epochs.c.account_id,
+        portfolio_epochs.c.sid, portfolio_epochs.c.mode, portfolio_epochs.c.strategy,
+        unique=True, postgresql_where=portfolio_epochs.c.status == "ACTIVE",
+        sqlite_where=portfolio_epochs.c.status == "ACTIVE",
+    )
+
     positions = sa.Table(
         "positions",
         metadata,
         uuid_col("position_id", primary_key=True),
+        uuid_col("position_cycle_id", nullable=False),
+        uuid_col("portfolio_epoch_id", nullable=False),
+        sa.Column("opened_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("position_origin", sa.String, nullable=False, server_default="SYSTEM"),
         sa.Column("env", sa.String, nullable=False),
         sa.Column("strategy", sa.String, nullable=False),
         sa.Column("sid", sa.Integer, nullable=False),
@@ -251,7 +282,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("regime_at_entry", sa.Text, nullable=True),
         sa.Column("risk_mult_at_entry", sa.Float, nullable=True),
         sa.Column("last_trade_at", sa.DateTime(timezone=True)),
-        sa.Column("status", sa.String, nullable=True),
+        sa.Column("status", sa.String, nullable=False, server_default="OPEN"),
         sa.Column("closed_reason", sa.String, nullable=True),
         sa.Column("closed_ts", sa.DateTime(timezone=True)),
         sa.Column("exit_policy_family", sa.String, nullable=True),
@@ -263,7 +294,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         sa.Column("position_meta", jsonb_type, nullable=False, default=dict),
         sa.Column("last_reconciled_at", sa.DateTime(timezone=True)),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), onupdate=sa.func.now()),
-        sa.UniqueConstraint("env", "strategy", "sid", "mode", "code", name="uq_positions_identity"),
+        sa.UniqueConstraint("position_cycle_id", name="uq_positions_cycle_id"),
     )
 
     ledger_events = sa.Table(
@@ -404,6 +435,7 @@ def _build_schema(database_url: str) -> SchemaTables:
         orders=orders,
         fills=fills,
         positions=positions,
+        portfolio_epochs=portfolio_epochs,
         ledger_events=ledger_events,
         reconcile_log=reconcile_log,
         price_daily=price_daily,
