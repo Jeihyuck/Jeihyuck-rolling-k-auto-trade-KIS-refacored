@@ -123,19 +123,19 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             state is None or state.total_filled_notional <= 0
         ):
             decision_state = None
-        regime, multiplier, reserve_policy, entry_allowed, regime_reason = effective_regime(overlay)
-        logger.info("[TQQQ_INF][REGIME_DECISION] raw_market_state=%s raw_standard_regime=%s tqqq_effective_regime=%s buy_multiplier=%s reserve_unlocked=%s entry_allowed=%s reason=%s",
+        regime, multiplier, regime_reserve_permission, entry_allowed, regime_reason = effective_regime(overlay)
+        effective_reserve_available = bool(
+            state is not None and state.reserve_unlocked and regime_reserve_permission
+        )
+        logger.info("[TQQQ_INF][REGIME_DECISION] raw_market_state=%s raw_standard_regime=%s tqqq_effective_regime=%s buy_multiplier=%s regime_reserve_permission=%s reserve_unlocked=%s effective_reserve_available=%s entry_allowed=%s reason=%s",
                     overlay.get("market_state"), overlay.get("market_regime"), regime, multiplier,
-                    int(reserve_policy), int(entry_allowed), regime_reason)
-        if state is not None and state.reserve_unlocked != reserve_policy:
-            state = replace(state, reserve_unlocked=reserve_policy)
-            repository.save_state(state)
-            if decision_state is not None:
-                decision_state = state
+                    int(regime_reserve_permission), int(bool(state and state.reserve_unlocked)),
+                    int(effective_reserve_available), int(entry_allowed), regime_reason)
         decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay,
-                            entry_allowed=entry_allowed, buy_multiplier=multiplier)
+                            entry_allowed=entry_allowed, buy_multiplier=multiplier,
+                            regime_reserve_permission=regime_reserve_permission)
         if decision.reason == "unknown_market_risk":
             logger.warning("[TQQQ_INF][MARKET_STATE_CONTRACT_MISMATCH] market_state=%s", overlay.get("market_state"))
         md = getattr(state, "metadata", {}) or {}

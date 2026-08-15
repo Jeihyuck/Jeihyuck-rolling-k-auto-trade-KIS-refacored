@@ -6,6 +6,7 @@ import pytest
 from trader.us.infinite.config import InfiniteConfig
 from trader.us.infinite.integration import exclude_owned
 from trader.us.infinite.models import Action, InfiniteState, PositionSnapshot
+from trader.us.infinite.policy_state import update_adaptive_policy_state
 from trader.us.infinite.risk_adapter import effective_regime
 from trader.us.infinite.strategy import evaluate
 from trader.us.market_state_overlay import build_profit_capture_intents
@@ -118,3 +119,107 @@ def test_owner_attribution_is_mirrored_to_meta_and_survives_intent_store(monkeyp
     stored_order = repos._MEM_ORDERS[0]
     for field in ("strategy_owner", "strategy_name", "strategy_version", "sleeve_id"):
         assert stored_order["meta"][field] == routed["intent"][field]
+    assert repos.save_fills([{
+        "symbol": "TQQQ", "side": "BUY", "qty": 1, "price_usd": 100,
+        "order_no": "TQQQ-ACK-1", "client_order_key": "TQQQ_INF:test:BUY",
+        "meta": {"fill_evidence_type": "KIS_ACTUAL"},
+    }], trade_date="2026-08-14") == 1
+    stored_fill = repos._MEM_FILLS[0]
+    for field in ("strategy_owner", "strategy_name", "strategy_version", "sleeve_id"):
+        assert stored_fill["meta"][field] == routed["intent"][field]
+
+
+def _recovery_overlay(state="DEFENSE_CRASH_REBOUND"):
+    return {"market_state": state, "market_regime": "RISK_ON", "qqq_completed_close": 110,
+            "qqq_ma50": 100, "qqq_ma200": 105, "qqq_ma200_slope": -1,
+            "qqq_20d_return": .05, "qqq_drawdown_252": -.2,
+            "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5}
+
+
+def test_regime_does_not_mutate_persistent_reserve_unlock():
+    cfg = InfiniteConfig(core_capital_usd=100, reserve_capital_usd=100,
+                         total_capital_usd=200, max_total_capital_usd=200)
+    locked = InfiniteState(core_filled_notional=100)
+    strong = update_adaptive_policy_state(
+        state=locked, trading_date=date(2026, 8, 13),
+        overlay=_recovery_overlay("STRONG_RISK_ON"), config=cfg,
+    )
+    assert strong.reserve_unlocked is False
+
+    crashed = InfiniteState(core_filled_notional=100, material_market_crash=True,
+                            metadata={"structural_bear_seen": True})
+    first = update_adaptive_policy_state(
+        state=crashed, trading_date=date(2026, 8, 13), overlay=_recovery_overlay(), config=cfg,
+    )
+    assert first.reserve_unlocked is False
+    confirmed = update_adaptive_policy_state(
+        state=first, trading_date=date(2026, 8, 14), overlay=_recovery_overlay(), config=cfg,
+    )
+    assert confirmed.reserve_unlocked is True
+    for index, regime in enumerate(("RISK_ON", "NORMAL", "DEFENSE_CAUTION"), start=15):
+        confirmed = update_adaptive_policy_state(
+            state=confirmed, trading_date=date(2026, 8, index),
+            overlay=_recovery_overlay(regime), config=cfg,
+        )
+        assert confirmed.reserve_unlocked is True
+
+
+def test_reserve_buy_needs_state_unlock_and_regime_permission_but_sell_is_first():
+    cfg = InfiniteConfig(core_capital_usd=100, reserve_capital_usd=500,
+                         total_capital_usd=600, max_total_capital_usd=600,
+                         unit_usd=100, max_daily_buy_usd=100)
+    locked = InfiniteState(cycle_id="c", core_filled_notional=100)
+    common = dict(config=cfg, position=PositionSnapshot(price=50), trading_date=date(2026, 8, 14),
+                  overlay={"market_state": "STRONG_RISK_ON"})
+    assert evaluate(state=locked, regime_reserve_permission=True, **common).reason == "reserve_locked"
+    unlocked = InfiniteState(cycle_id="c", core_filled_notional=100, reserve_unlocked=True,
+                             material_market_crash=True)
+    assert evaluate(state=unlocked, regime_reserve_permission=False, **common).reason == "reserve_locked"
+    assert evaluate(state=unlocked, regime_reserve_permission=True, **common).action == Action.BUY
+    sell = evaluate(
+        config=cfg, state=unlocked, position=PositionSnapshot(qty=1, average_price=100, price=110),
+        trading_date=date(2026, 8, 14), overlay={"market_state": "DEFENSE_CRASH_CONFIRMED"},
+        entry_allowed=False, regime_reserve_permission=False,
+    )
+    assert sell.action == Action.SELL
+
+
+def test_postgres_intent_and_ack_sql_meta_preserve_owner(monkeypatch):
+    import json
+    from trader.us.db import repos
+
+    calls = []
+
+    class Result:
+        def fetchone(self):
+            return None
+
+    class Connection:
+        def execute(self, statement, params):
+            calls.append((str(statement), dict(params)))
+            return Result()
+
+    class Begin:
+        def __enter__(self):
+            return Connection()
+        def __exit__(self, *_args):
+            return False
+
+    class Engine:
+        def begin(self):
+            return Begin()
+
+    monkeypatch.setattr(repos, "_get_engine_or_none", lambda: Engine())
+    attribution = {"strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+                   "strategy_version": "ADAPTIVE_RUNWAY_V2", "sleeve_id": "TQQQ_INFINITE"}
+    intent = {"client_order_key": "TQQQ_INF:sql:BUY", "symbol": "TQQQ", "side": "BUY",
+              "qty": 1, "limit_price": 100, "notional_usd": 100,
+              "strategy": "TQQQ_INFINITE_V3", "meta": attribution, **attribution}
+    assert repos.save_order_intent(intent, "2026-08-14")
+    assert repos.save_order_ack({**intent, "qty_requested": 1, "order_no": "SQL-ACK", "status": "ACK"},
+                                "2026-08-14")
+    persisted = [json.loads(params["meta"]) for sql, params in calls
+                 if "INSERT INTO us_order_intents" in sql or "INSERT INTO us_orders" in sql]
+    assert len(persisted) == 2
+    for meta in persisted:
+        assert all(meta[field] == value for field, value in attribution.items())

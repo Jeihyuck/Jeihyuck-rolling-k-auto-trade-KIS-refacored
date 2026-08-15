@@ -44,7 +44,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
              trading_date: date, pending_buy: bool = False, pending_sell: bool = False,
              daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
              trading_sessions: frozenset[date] | None = None,
-             entry_allowed: bool = True, buy_multiplier: float = 1.0) -> Decision:
+             entry_allowed: bool = True, buy_multiplier: float = 1.0,
+             regime_reserve_permission: bool = True) -> Decision:
     """Pure exit-first strategy decision; broker position is always authoritative."""
     if not config.enabled:
         return Decision(Action.WAIT, "feature_disabled")
@@ -104,6 +105,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
 
     metadata = state.metadata or {}
+    effective_reserve_available = bool(state.reserve_unlocked and regime_reserve_permission)
     long_trend = str(metadata.get("long_trend") or classify_long_trend(
         overlay, bool(metadata.get("structural_bear_seen"))))
     try:
@@ -168,12 +170,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         gap = 3 if risk.market_state == "DEFENSE_CAUTION" else (1 if long_trend == "BULL" and risk.market_state in {"STRONG_RISK_ON", "RISK_ON"} else 2)
         if days_since < gap:
             return Decision(Action.BLOCK, "routine_gap_wait")
-        premium = (0.02 if state.reserve_unlocked and long_trend == "RECOVERY" else
+        premium = (0.02 if effective_reserve_available and long_trend == "RECOVERY" else
                    config.buy_premium_pct if long_trend == "BULL" and risk.market_state in {"STRONG_RISK_ON", "RISK_ON"} else 0.0)
         if position.average_price <= 0 or position.price > position.average_price * (1 + premium):
             return Decision(Action.WAIT, "price_above_buy_premium")
 
-    if state.reserve_unlocked and state.core_filled_notional >= config.core_capital_usd and position.qty > 0:
+    if effective_reserve_available and state.core_filled_notional >= config.core_capital_usd and position.qty > 0:
         if long_trend != "RECOVERY" or days_since < 2 or position.price > position.average_price * 1.02:
             return Decision(Action.BLOCK, "recovery_reserve_wait")
 
@@ -185,7 +187,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         )
         if not deep_bear:
             return Decision(Action.BLOCK, "deep_bear_core_locked")
-    if core_left <= 0 and not state.reserve_unlocked:
+    if core_left <= 0 and not effective_reserve_available:
         return Decision(Action.BLOCK, "reserve_locked")
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional

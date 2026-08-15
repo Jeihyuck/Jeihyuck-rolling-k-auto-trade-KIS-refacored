@@ -12,7 +12,7 @@ class RiskDecision:
     market_state: str = ""
     market_regime: str = ""
     buy_multiplier: float = 1.0
-    reserve_unlocked: bool = False
+    regime_reserve_permission: bool = False
 
 
 CANONICAL_MARKET_STATES = {
@@ -23,7 +23,11 @@ CANONICAL_MARKET_STATES = {
 
 
 def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]:
-    """Resolve conflicting standard/market labels into one TQQQ policy."""
+    """Resolve labels into (regime, multiplier, reserve permission, entry, reason).
+
+    The third value is a per-tick permission, never persistent unlock state.
+    Only the policy-state machine may mutate ``InfiniteState.reserve_unlocked``.
+    """
     o = overlay or {}
     raw_state = str(o.get("market_state") or "").upper()
     raw_regime = str(o.get("market_regime") or "").upper()
@@ -31,7 +35,7 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     if any("CAPITAL_PRESERVATION" in value for value in combined):
         return "CAPITAL_PRESERVATION", 0.0, False, False, "capital_preservation"
     if "DEFENSE_CRASH_REBOUND" in combined:
-        return "RISK_ON", 0.5, False, True, "verified_crash_rebound"
+        return "RISK_ON", 0.5, True, True, "verified_crash_rebound"
     if any("CRASH" in value for value in combined):
         name = "DEFENSE_CRASH" if any("DEFENSE" in value for value in combined) else "CRASH"
         return name, 0.0, False, False, "crash_policy"
@@ -44,7 +48,7 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     if "STRONG_RISK_ON" in combined:
         return "STRONG_RISK_ON", 1.25, True, True, "strong_risk_on"
     if "RISK_ON" in combined:
-        return "RISK_ON", 1.0, False, True, "risk_on"
+        return "RISK_ON", 1.0, True, True, "risk_on"
     return "UNKNOWN", 0.0, False, False, "unknown_regime"
 
 
