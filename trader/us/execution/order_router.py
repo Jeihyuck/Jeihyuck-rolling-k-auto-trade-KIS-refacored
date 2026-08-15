@@ -584,6 +584,10 @@ def route_order(
     intent.setdefault("strategy_name", str(intent.get("strategy") or "US_STANDARD"))
     intent.setdefault("strategy_version", str((intent.get("meta") or {}).get("strategy_version") or "LEGACY"))
     intent.setdefault("sleeve_id", intent["strategy_owner"])
+    meta = dict(intent.get("meta") or {})
+    for attribution_field in ("strategy_owner", "strategy_name", "strategy_version", "sleeve_id"):
+        meta[attribution_field] = intent[attribution_field]
+    intent["meta"] = meta
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
     symbol_upper = str(symbol or "").upper().strip()

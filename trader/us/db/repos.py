@@ -359,6 +359,9 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "status": "PENDING",
                     "meta": _json_param({
                         **_parse_json_meta(intent.get("meta")),
+                        **{field: intent.get(field) for field in (
+                            "strategy_owner", "strategy_name", "strategy_version", "sleeve_id"
+                        ) if intent.get(field) is not None},
                         "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
                     }),
                 },

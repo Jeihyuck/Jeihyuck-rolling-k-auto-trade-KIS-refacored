@@ -43,7 +43,8 @@ def classify_long_trend(overlay: dict | None, structural_bear_seen: bool = False
 def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: PositionSnapshot,
              trading_date: date, pending_buy: bool = False, pending_sell: bool = False,
              daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
-             trading_sessions: frozenset[date] | None = None) -> Decision:
+             trading_sessions: frozenset[date] | None = None,
+             entry_allowed: bool = True, buy_multiplier: float = 1.0) -> Decision:
     """Pure exit-first strategy decision; broker position is always authoritative."""
     if not config.enabled:
         return Decision(Action.WAIT, "feature_disabled")
@@ -80,6 +81,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
+    if not entry_allowed:
+        return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
@@ -187,7 +190,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
-    budget = min(config.unit_usd, available, total_left, daily_left)
+    budget = min(config.unit_usd * max(0.0, buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)
     notional = qty * position.price
     if qty < 1:

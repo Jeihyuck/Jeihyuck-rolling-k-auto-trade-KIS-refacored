@@ -127,9 +127,15 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         logger.info("[TQQQ_INF][REGIME_DECISION] raw_market_state=%s raw_standard_regime=%s tqqq_effective_regime=%s buy_multiplier=%s reserve_unlocked=%s entry_allowed=%s reason=%s",
                     overlay.get("market_state"), overlay.get("market_regime"), regime, multiplier,
                     int(reserve_policy), int(entry_allowed), regime_reason)
+        if state is not None and state.reserve_unlocked != reserve_policy:
+            state = replace(state, reserve_unlocked=reserve_policy)
+            repository.save_state(state)
+            if decision_state is not None:
+                decision_state = state
         decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
-                            daily_filled_buy_notional=daily, overlay=overlay)
+                            daily_filled_buy_notional=daily, overlay=overlay,
+                            entry_allowed=entry_allowed, buy_multiplier=multiplier)
         if decision.reason == "unknown_market_risk":
             logger.warning("[TQQQ_INF][MARKET_STATE_CONTRACT_MISMATCH] market_state=%s", overlay.get("market_state"))
         md = getattr(state, "metadata", {}) or {}
@@ -186,6 +192,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "position_action": position_action,
             "reason": "TAKE_PROFIT_TQQQ_INFINITE" if decision.action == Action.SELL else decision.reason,
             "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason,
+                     "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+                     "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
                      "theme_cluster": theme_cluster, "classification_source": classification_source,
                      "position_state": position_state, "position_action": position_action,
                      "policy_action": policy_action,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from trader.us.strategy_ownership import TQQQ_SYMBOL
+
 
 def _bool(name: str, default: bool = False) -> bool:
     return str(os.getenv(name, "1" if default else "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -29,7 +31,7 @@ class InfiniteConfig:
     real_order: bool = True
     allow_buy: bool = True
     allow_sell: bool = True
-    symbol: str = "TQQQ"
+    symbol: str = TQQQ_SYMBOL
     total_capital_usd: float = 10_000.0
     core_capital_usd: float = 7_500.0
     reserve_capital_usd: float = 2_500.0
@@ -59,10 +61,15 @@ class InfiniteConfig:
     @classmethod
     def from_env(cls) -> "InfiniteConfig":
         prefix = "US_TQQQ_INFINITE_"
-        return cls(
+        configured_symbol = os.getenv(prefix + "SYMBOL", TQQQ_SYMBOL).upper().strip() or TQQQ_SYMBOL
+        if configured_symbol != TQQQ_SYMBOL:
+            raise ValueError(
+                f"US_TQQQ_INFINITE_SYMBOL must be {TQQQ_SYMBOL}; got {configured_symbol}"
+            )
+        config = cls(
             enabled=_bool(prefix + "ENABLED", True), real_order=_bool(prefix + "REAL_ORDER", True),
             allow_buy=_bool(prefix + "ALLOW_BUY", True), allow_sell=_bool(prefix + "ALLOW_SELL", True),
-            symbol=os.getenv(prefix + "SYMBOL", "TQQQ").upper().strip() or "TQQQ",
+            symbol=TQQQ_SYMBOL,
             total_capital_usd=_float(prefix + "TOTAL_CAPITAL_USD", 10_000),
             core_capital_usd=_float(prefix + "CORE_CAPITAL_USD", 7_500),
             reserve_capital_usd=_float(prefix + "RESERVE_CAPITAL_USD", 2_500),
@@ -88,8 +95,12 @@ class InfiniteConfig:
             rebound_cooldown=_int(prefix + "REBOUND_COOLDOWN", 3),
             recovery_confirmation_days=_int(prefix + "RECOVERY_CONFIRMATION_DAYS", 2),
         )
+        config.validate()
+        return config
 
     def validate(self) -> None:
+        if self.symbol != TQQQ_SYMBOL:
+            raise ValueError(f"InfiniteConfig.symbol must be {TQQQ_SYMBOL}; got {self.symbol}")
         values = (self.total_capital_usd, self.core_capital_usd, self.reserve_capital_usd,
                   self.unit_usd, self.max_daily_buy_usd, self.max_total_capital_usd)
         if any(v <= 0 for v in values):

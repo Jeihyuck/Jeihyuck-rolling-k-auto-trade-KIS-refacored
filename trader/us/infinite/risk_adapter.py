@@ -30,6 +30,8 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     combined = {raw_state, raw_regime}
     if any("CAPITAL_PRESERVATION" in value for value in combined):
         return "CAPITAL_PRESERVATION", 0.0, False, False, "capital_preservation"
+    if "DEFENSE_CRASH_REBOUND" in combined:
+        return "RISK_ON", 0.5, False, True, "verified_crash_rebound"
     if any("CRASH" in value for value in combined):
         name = "DEFENSE_CRASH" if any("DEFENSE" in value for value in combined) else "CRASH"
         return name, 0.0, False, False, "crash_policy"
