@@ -33,20 +33,22 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     raw_regime = str(o.get("market_regime") or "").upper()
     combined = {raw_state, raw_regime}
     if any("CAPITAL_PRESERVATION" in value for value in combined):
-        return "CAPITAL_PRESERVATION", 0.0, False, False, "capital_preservation"
+        return "CAPITAL_PRESERVATION", 0.5, False, True, "capital_preservation_sparse_evaluation"
     if "DEFENSE_CRASH_REBOUND" in combined:
-        return "RISK_ON", 0.5, True, True, "verified_crash_rebound"
+        return "DEFENSE_CRASH_REBOUND", 0.5, True, True, "verified_crash_rebound"
     if any("CRASH" in value for value in combined):
         name = "DEFENSE_CRASH" if any("DEFENSE" in value for value in combined) else "CRASH"
         return name, 0.0, False, False, "crash_policy"
     if "CHOP_HIGH_VOL" in combined:
-        return "CHOP_HIGH_VOL", 0.0, False, False, "high_volatility_chop"
+        return "CHOP_HIGH_VOL", 0.5, False, True, "high_volatility_chop_sparse_evaluation"
     if any(value in {"RISK_OFF", "DEFENSIVE", "DEFENSE_RISK_OFF"} for value in combined):
-        return "RISK_OFF" if "RISK_OFF" in combined else "DEFENSIVE", 0.0, False, False, "defensive_policy"
+        return "RISK_OFF" if any("RISK_OFF" in value for value in combined) else "DEFENSIVE", 0.5, False, True, "defensive_sparse_evaluation"
+    if "DEFENSE_CAUTION" in combined:
+        return "DEFENSE_CAUTION", 0.5, False, True, "defense_caution"
     if "NEUTRAL" in combined or "NORMAL" in combined:
         return "NEUTRAL", 0.75, False, True, "neutral_policy"
     if "STRONG_RISK_ON" in combined:
-        return "STRONG_RISK_ON", 1.25, True, True, "strong_risk_on"
+        return "STRONG_RISK_ON", 1.0, True, True, "strong_risk_on"
     if "RISK_ON" in combined:
         return "RISK_ON", 1.0, True, True, "risk_on"
     return "UNKNOWN", 0.0, False, False, "unknown_regime"

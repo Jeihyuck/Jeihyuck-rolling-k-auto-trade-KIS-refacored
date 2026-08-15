@@ -4,7 +4,7 @@ import logging
 import math
 import uuid
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 from .config import InfiniteConfig
@@ -69,9 +69,17 @@ def _position(raw: dict | None, price: float) -> PositionSnapshot:
                 if value > 0: return value
             except (TypeError, ValueError): pass
         return 0.0
+    orderable = None
+    for key in ("orderable_qty", "sellable_qty", "ord_psbl_qty", "ovrs_ord_psbl_qty"):
+        if key in raw and raw.get(key) not in (None, ""):
+            try:
+                orderable = max(0, int(float(str(raw.get(key)).replace(",", ""))))
+            except (TypeError, ValueError):
+                orderable = None
+            break
     return PositionSnapshot(
         qty=int(number("qty", "quantity", "holding_qty")),
-        orderable_qty=int(number("sellable_qty", "orderable_qty")),
+        orderable_qty=orderable,
         average_price=number("avg_price_usd", "avg_price", "avg_cost", "pchs_avg_pric"),
         price=price or number("current_price", "last_price", "price", "ovrs_now_pric"),
         exchange=str(raw.get("exchange") or "NASDAQ"),
@@ -107,7 +115,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         return {"status": "OFF", "orders": []}
     try:
         valid_quote = isinstance(price, (int, float)) and math.isfinite(float(price)) and float(price) > 0
-        quote_stale = bool(overlay.get("tqqq_quote_stale") or overlay.get("tqqq_quote_suspect"))
+        quote_stale = bool(overlay.get("tqqq_quote_stale") or overlay.get("tqqq_quote_suspect")
+                           or overlay.get("tqqq_quote_degraded"))
         valid_quote = valid_quote and not quote_stale
         logger.info("[TQQQ_INF][QUOTE] price=%s source=%s stale=%s valid=%s", price,
                     overlay.get("tqqq_quote_source", "provider"), int(quote_stale), int(valid_quote))
@@ -147,19 +156,23 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             )
             repository.save_state(state)
         if state is not None and broker.qty > 0:
+            needs_attribution_backfill = (
+                state.metadata.get("strategy_owner") != "TQQQ_INFINITE"
+                or state.metadata.get("sleeve_id") != "TQQQ_INFINITE"
+            )
             ownership = {
                 "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
                 "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
                 "broker_qty": broker.qty, "broker_orderable_qty": broker.orderable_qty,
                 "broker_average_price": broker.average_price,
             }
-            if not state.metadata.get("strategy_owner"):
+            if needs_attribution_backfill:
                 ownership["ownership_source"] = "SYMBOL_INVARIANT_RECOVERY"
             merged_metadata = {**state.metadata, **ownership}
             if merged_metadata != state.metadata:
                 state = replace(state, metadata=merged_metadata)
                 repository.save_state(state)
-            if hasattr(repository, "backfill_tqqq_attribution"):
+            if needs_attribution_backfill and hasattr(repository, "backfill_tqqq_attribution"):
                 repository.backfill_tqqq_attribution(config.policy_version)
         if state is not None:
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
@@ -175,6 +188,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                 status=Status.ACTIVE)
             repository.save_state(state)
         pending_buy, pending_sell = repository.pending_sides(trading_date, config.symbol)
+        pending_buy_notional = (repository.pending_buy_notional(trading_date, config.symbol)
+                                if hasattr(repository, "pending_buy_notional") else 0.0)
         daily = 0.0
         if state is not None:
             _cycle, daily, _sells, _last, _anchor = repository.fill_accounting(state, trading_date)
@@ -191,7 +206,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay,
                             entry_allowed=entry_allowed, buy_multiplier=multiplier,
-                            regime_reserve_permission=regime_reserve_permission)
+                            regime_reserve_permission=regime_reserve_permission,
+                            effective_regime_name=regime)
         if decision.reason == "unknown_market_risk":
             logger.warning("[TQQQ_INF][MARKET_STATE_CONTRACT_MISMATCH] market_state=%s", overlay.get("market_state"))
         md = getattr(state, "metadata", {}) or {}
@@ -233,9 +249,22 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         theme_cluster = "ETF_INDEX"
         classification_source = "TQQQ_INFINITE_POLICY"
         position_state = "HELD" if broker.qty > 0 else "NOT_HELD"
-        position_action = "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY"
+        position_action = ("FULL_EXIT_SELL" if decision.action == Action.SELL else
+                           "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY")
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
                          and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND" else None)
+        lifecycle_id = str((state.metadata or {}).get("position_lifecycle_id") or state.cycle_id)
+        avg_asof = str(raw.get("broker_avg_price_asof") or raw.get("balance_asof") or datetime.now(timezone.utc).isoformat()) if raw else ""
+        sell_contract = {
+            "broker_avg_price": broker.average_price,
+            "broker_avg_price_source": str((raw or {}).get("broker_avg_price_source") or "kis_pchs_avg_pric"),
+            "broker_avg_price_currency": "USD", "broker_avg_price_asof": avg_asof,
+            "balance_source": "kis_balance_authoritative", "authoritative_positions": True,
+            "position_lifecycle_id": lifecycle_id, "tp_threshold_fraction": str(config.take_profit_pct),
+            "holding_qty": broker.qty, "orderable_qty": broker.orderable_qty,
+            "sellable_qty": broker.orderable_qty, "available_qty": broker.orderable_qty,
+            "partial_exit_allowed": False,
+        } if decision.action == Action.SELL else {}
         intent = {
             "symbol": config.symbol, "exchange": broker.exchange or "NASDAQ", "side": decision.action.value,
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,
@@ -246,15 +275,20 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "sleeve_id": "TQQQ_INFINITE", "theme_cluster": theme_cluster,
             "classification_source": classification_source, "position_state": position_state,
             "position_action": position_action,
+            **sell_contract,
             "reason": "TAKE_PROFIT_TQQQ_INFINITE" if decision.action == Action.SELL else decision.reason,
-            "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason,
+            "meta": {"strategy": "TQQQ_INFINITE_V3", "reason": decision.reason, **sell_contract,
                      "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
                      "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
                      "theme_cluster": theme_cluster, "classification_source": classification_source,
                      "position_state": position_state, "position_action": position_action,
                      "policy_action": policy_action,
                      "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE",
-                     "cycle_id": state.cycle_id},
+                     "cycle_id": state.cycle_id,
+                     "tqqq_daily_committed_before_usd": daily + pending_buy_notional,
+                     "tqqq_cycle_committed_before_usd": state.total_filled_notional + pending_buy_notional,
+                     "tqqq_max_daily_buy_usd": config.max_daily_buy_usd,
+                     "tqqq_max_total_capital_usd": config.max_total_capital_usd},
         }
         result = route(intent)
         return {"status": result.get("status", "UNKNOWN"), "decision": decision, "orders": [result]}

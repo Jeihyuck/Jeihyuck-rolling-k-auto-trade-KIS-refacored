@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import date
 from typing import Iterable
+from collections import Counter
 
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
@@ -83,6 +84,10 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
     last_buy_price = None
     bought_dates: set[date] = set()
     reserve_used_notional = 0.0
+    total_buy_count = 0
+    block_reason_counts: Counter[str] = Counter()
+    maximum_deployed_notional = 0.0
+    maximum_core_used_notional = 0.0
 
     for index, bar in enumerate(bars):
         overlay = dict(bar.overlay)
@@ -91,13 +96,17 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         state = update_adaptive_policy_state(state=state, trading_date=bar.trading_date,
                                              overlay=overlay, config=config)
         price = bar.tqqq_close if bar.quote_valid else 0.0
-        position = PositionSnapshot(qty=qty, average_price=(cost / qty if qty else 0), price=price)
+        position = PositionSnapshot(qty=qty, orderable_qty=qty,
+                                    average_price=(cost / qty if qty else 0), price=price)
         decision = evaluate(config=config, state=state, position=position,
                             trading_date=bar.trading_date, overlay=overlay,
                             trading_sessions=sessions)
+        if decision.action in {Action.BLOCK, Action.WAIT}:
+            block_reason_counts[decision.reason] += 1
         if decision.action in {Action.BUY, Action.SELL} and not bar.quote_valid:
             invalid_orders += 1
         if decision.action == Action.BUY:
+            total_buy_count += 1
             if bar.trading_date in bought_dates: duplicate_buys += 1
             bought_dates.add(bar.trading_date)
             if decision.notional > config.max_daily_buy_usd + 1e-6: daily_cap_violations += 1
@@ -123,6 +132,8 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
             chop_buys += int(bool(state.metadata.get("chop_high_vol")))
             cp_buys += int(bool(state.metadata.get("capital_preservation")))
             reserve_used_notional = max(reserve_used_notional, reserve)
+            maximum_deployed_notional = max(maximum_deployed_notional, core + reserve)
+            maximum_core_used_notional = max(maximum_core_used_notional, core)
             if is_probe:
                 state = update_adaptive_policy_state(
                     state=state, trading_date=bar.trading_date, overlay=overlay, config=config,
@@ -158,6 +169,13 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         "daily_cap_violation_count": daily_cap_violations,
         "invalid_quote_order_count": invalid_orders,
         "duplicate_same_day_buy_count": duplicate_buys,
+        "total_buy_count": total_buy_count,
+        "core_used_notional": maximum_core_used_notional,
+        "maximum_deployed_notional": maximum_deployed_notional,
+        "block_reason_counts": dict(sorted(block_reason_counts.items())),
+        "take_profit_exit_occurred": bool(completion_durations),
+        "capital_cap_violated": bool(hard_cap_violations),
+        "duplicate_order_detected": bool(duplicate_buys),
         "session_count": len(dates), "session_dates": dates,
         "final_state": state,
     }

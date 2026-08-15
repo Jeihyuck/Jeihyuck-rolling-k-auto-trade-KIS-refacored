@@ -45,7 +45,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
              daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
              trading_sessions: frozenset[date] | None = None,
              entry_allowed: bool = True, buy_multiplier: float = 1.0,
-             regime_reserve_permission: bool = True) -> Decision:
+             regime_reserve_permission: bool = True,
+             effective_regime_name: str = "") -> Decision:
     """Pure exit-first strategy decision; broker position is always authoritative."""
     if not config.enabled:
         return Decision(Action.WAIT, "feature_disabled")
@@ -79,8 +80,11 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "sell_permission_disabled")
         if pending_sell:
             return Decision(Action.BLOCK, "pending_sell", next_status=Status.EXIT_PENDING)
-        sell_qty = position.orderable_qty if position.orderable_qty > 0 else position.qty
-        sell_qty = min(position.qty, sell_qty)
+        if position.orderable_qty is None:
+            return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
+        if position.orderable_qty <= 0:
+            return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
+        sell_qty = min(position.qty, position.orderable_qty)
         return Decision(Action.SELL, "take_profit", qty=sell_qty,
                         notional=sell_qty * position.price, next_status=Status.EXIT_PENDING)
     if state.status == Status.EXIT_PENDING:
@@ -103,6 +107,30 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if not risk.allow_buy:
         return Decision(Action.BLOCK, risk.reason)
     overlay = overlay or {}
+    required = {
+        "qqq_completed_close": True, "qqq_ma50": True, "qqq_ma200": True,
+        "qqq_ma200_slope": False, "qqq_20d_return": False, "qqq_drawdown_252": False,
+        "qqq_realized_vol_20d": False, "qqq_trend_efficiency_20d": False,
+    }
+    valid_context = overlay.get("tqqq_context_quality") == "ok"
+    valid_context = valid_context and not any(bool(overlay.get(flag)) for flag in (
+        "qqq_stale", "qqq_suspect", "qqq_degraded", "tqqq_context_stale",
+        "tqqq_context_suspect", "tqqq_context_degraded",
+    ))
+    for field, positive in required.items():
+        try:
+            value = float(overlay[field])
+            valid_context = valid_context and math.isfinite(value) and (value > 0 if positive else True)
+            if field == "qqq_realized_vol_20d":
+                valid_context = valid_context and value >= 0
+        except (KeyError, TypeError, ValueError):
+            valid_context = False
+    if not valid_context:
+        return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
+    if position.qty <= 0 and effective_regime_name in {
+        "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
+    }:
+        return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
     if overlay.get("force_entry_block") is True:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
     if position.qty <= 0 and overlay.get("allow_new_buy") is False:
@@ -112,8 +140,6 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         # explicitly TQQQ-scoped capital flag may pause its adds.
         if overlay.get("tqqq_capital_preservation"):
             return Decision(Action.BLOCK, "tqqq_capital_preservation")
-    if "tqqq_context_quality" in overlay and overlay.get("tqqq_context_quality") != "ok":
-        return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
 
     metadata = state.metadata or {}
     effective_reserve_available = bool(state.reserve_unlocked and regime_reserve_permission)

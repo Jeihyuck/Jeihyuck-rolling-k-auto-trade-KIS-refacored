@@ -521,3 +521,44 @@ def assert_order_allowed(
         check_entry_cutoff(side, now=now)
 
     _pass(symbol, notional_usd)
+
+
+def assert_tqqq_infinite_order_allowed(
+    intent: dict, *, available_cash_usd: float, existing_order_keys: set[str] | None,
+    now: Any = None,
+) -> None:
+    """Dedicated sleeve scope: common safety checks without US_STANDARD caps."""
+    symbol = str(intent.get("symbol") or "").upper()
+    side = str(intent.get("side") or "").upper()
+    qty = int(intent.get("qty") or 0)
+    notional = float(intent.get("notional_usd") or 0)
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    check_env_flags(symbol=symbol)
+    check_exchange(str(intent.get("exchange") or ""))
+    check_qty(qty)
+    if notional <= 0:
+        _block("invalid_tqqq_notional", symbol=symbol)
+    if existing_order_keys is not None and intent.get("client_order_key"):
+        check_duplicate(str(intent["client_order_key"]), existing_order_keys)
+    if side == "SELL":
+        available = intent.get("available_qty")
+        if available is None:
+            _block("tqqq_orderable_qty_missing", symbol=symbol)
+        if int(available) <= 0:
+            _block("tqqq_no_orderable_qty", symbol=symbol)
+        if qty > int(available):
+            _block("sell_qty_exceeds_position", symbol=symbol, qty=qty, available_qty=available)
+        check_pending_sell_order_hard(symbol, trade_date=intent.get("trade_date"))
+    else:
+        daily_before = float(meta.get("tqqq_daily_committed_before_usd") or 0)
+        cycle_before = float(meta.get("tqqq_cycle_committed_before_usd") or 0)
+        daily_cap = float(meta.get("tqqq_max_daily_buy_usd") or 250)
+        total_cap = float(meta.get("tqqq_max_total_capital_usd") or 10_000)
+        if daily_before + notional > daily_cap + 1e-6:
+            _block("tqqq_daily_cap_exceeded", symbol=symbol)
+        if cycle_before + notional > total_cap + 1e-6:
+            _block("tqqq_total_cap_exceeded", symbol=symbol)
+        check_cash_buffer(available_cash_usd, notional, symbol=symbol)
+        check_pending_order(symbol, side, trade_date=intent.get("trade_date"))
+        check_entry_cutoff(side, now=now)
+    _pass(symbol, notional)

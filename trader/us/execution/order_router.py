@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from trader.us import config as us_cfg
-from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed
+from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed, assert_tqqq_infinite_order_allowed
 from trader.us.runner.status_contract import is_no_balance_sell_reject
 from trader.us.market_state_overlay import FORBIDDEN_HEDGE_SYMBOLS
 from trader.us.db.repos import (  # test patch surface
@@ -554,7 +554,7 @@ def route_order(
     """
     # This check deliberately precedes identity normalization, persistence and
     # every KIS call: malformed legacy intents cannot bypass symbol ownership.
-    from trader.us.strategy_ownership import is_valid_tqqq_intent, owner_for_symbol, TQQQ_OWNER
+    from trader.us.strategy_ownership import is_valid_tqqq_intent, owner_for_symbol, TQQQ_OWNER, TQQQ_SYMBOL
     if owner_for_symbol(intent.get("symbol")) == TQQQ_OWNER and not is_valid_tqqq_intent(intent):
         logger.error(
             "[TQQQ_INF][OWNERSHIP_REJECT] symbol=TQQQ strategy_owner=%s sleeve_id=%s",
@@ -591,6 +591,11 @@ def route_order(
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
     symbol_upper = str(symbol or "").upper().strip()
+    is_tqqq_infinite = (
+        symbol_upper == TQQQ_SYMBOL
+        and intent.get("strategy_owner") == TQQQ_OWNER
+        and intent.get("sleeve_id") == TQQQ_OWNER
+    )
     position_action = (
         intent.get("position_action")
         or (intent.get("meta") or {}).get("position_action")
@@ -749,12 +754,18 @@ def route_order(
         current_position_symbols=current_position_symbols,
     )
     try:
-        canonical_order_risk_check(
-            gate_intent,
-            gate_state,
-            allowed_symbols=allowed_symbols,
-            current_position_symbols=current_position_symbols,
-        )
+        if is_tqqq_infinite:
+            assert_tqqq_infinite_order_allowed(
+                gate_intent, available_cash_usd=available_cash_usd,
+                existing_order_keys=existing_keys, now=now,
+            )
+        else:
+            canonical_order_risk_check(
+                gate_intent,
+                gate_state,
+                allowed_symbols=allowed_symbols,
+                current_position_symbols=current_position_symbols,
+            )
     except RiskGateBlocked as exc:
         logger.warning("[US_ORDER][BLOCKED] %s", exc)
         logger.warning(
@@ -980,6 +991,9 @@ def route_order(
         broker_orderable_qty = int(broker_pos.get("orderable_qty") or 0) if broker_pos else 0
         if broker_pos is None:
             logger.warning("[US_ORDER][BROKER_QTY_CHECK][SKIP] env=%s symbol=%s reason=broker_balance_method_missing", account_env, symbol)
+            if is_tqqq_infinite:
+                return {"status": "BLOCKED", "reason": "tqqq_orderable_qty_missing",
+                        "broker_submit": False, "intent": intent}
         else:
             logger.info("[US_ORDER][BROKER_QTY_CHECK] env=%s symbol=%s exchange=%s holding_qty=%s orderable_qty=%s currency=%s account_env=%s", account_env, symbol, exchange, broker_holding_qty, broker_orderable_qty, broker_pos.get("currency", "USD") if broker_pos else "USD", account_env)
         if broker_pos is not None and broker_orderable_qty <= 0:
@@ -991,8 +1005,8 @@ def route_order(
             if recent_ack:
                 return {"status": "OK_EXIT_POSITION_CLOSED", "reason": "broker_orderable_qty_zero_after_recent_sell_ack", "symbol": symbol, "side": side, "requires_reconcile": False, "reconciled": True, "intent": intent, "recent_sell_ack": recent_ack}
             if order_key:
-                mark_order_intent_blocked(order_key, reason="broker_orderable_qty_zero")
-            return {"status": "BLOCKED", "reason": "broker_orderable_qty_zero", "symbol": symbol, "side": side, "qty": qty, "intent": intent, "broker_position": broker_pos}
+                mark_order_intent_blocked(order_key, reason="tqqq_no_orderable_qty" if is_tqqq_infinite else "broker_orderable_qty_zero")
+            return {"status": "BLOCKED", "reason": "tqqq_no_orderable_qty" if is_tqqq_infinite else "broker_orderable_qty_zero", "symbol": symbol, "side": side, "qty": qty, "intent": intent, "broker_position": broker_pos}
         if broker_pos and broker_orderable_qty < qty:
             qty = broker_orderable_qty
             intent = {**intent, "qty": qty, "notional_usd": qty * price}

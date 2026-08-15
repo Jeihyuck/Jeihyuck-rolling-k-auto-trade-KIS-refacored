@@ -16,7 +16,10 @@ CFG = InfiniteConfig()
 
 
 def overlay(state="NORMAL", **values):
-    return {"market_state": state, **values}
+    return {"market_state": state, "tqqq_context_quality": "ok",
+            "qqq_completed_close": 100, "qqq_ma50": 99, "qqq_ma200": 98,
+            "qqq_ma200_slope": .1, "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+            "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5, **values}
 
 
 def owned(**metadata):
@@ -26,6 +29,8 @@ def owned(**metadata):
 
 
 def decide(state, position, context):
+    if position.qty > 0 and position.orderable_qty is None:
+        position = replace(position, orderable_qty=position.qty)
     return evaluate(config=CFG, state=state, position=position,
                     trading_date=TODAY, overlay=context)
 

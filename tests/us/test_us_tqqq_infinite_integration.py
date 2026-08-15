@@ -9,6 +9,13 @@ from trader.us.infinite.repository import InfiniteRepository
 from trader.us.execution.order_router import resolve_entry_metadata_contract_reason
 
 
+def market(state="NORMAL", **extra):
+    return {"market_state": state, "tqqq_context_quality": "ok",
+            "qqq_completed_close": 100, "qqq_ma50": 99, "qqq_ma200": 98,
+            "qqq_ma200_slope": .1, "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+            "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5, **extra}
+
+
 class FakeRepository:
     def __init__(self, state=None):
         self.state = state
@@ -40,7 +47,7 @@ def test_shadow_computes_but_submits_zero_orders(monkeypatch):
     repo = FakeRepository(InfiniteState())
     routed = []
     result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
-                        overlay={"market_state": "NORMAL"}, repository=repo, route=routed.append)
+                        overlay=market("NORMAL"), repository=repo, route=routed.append)
     assert result["status"] == "SHADOW"
     assert result["decision"].action.value == "BUY"
     assert routed == []
@@ -52,7 +59,7 @@ def test_order_mode_uses_injected_existing_router_once(monkeypatch):
     routed = []
     def route(intent): routed.append(intent); return {"status": "ACK", "intent": intent}
     result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
-                        overlay={"market_state": "NORMAL"}, repository=FakeRepository(InfiniteState()), route=route)
+                        overlay=market("NORMAL"), repository=FakeRepository(InfiniteState()), route=route)
     assert result["status"] == "ACK"
     assert len(routed) == 1
     assert routed[0]["client_order_key"].startswith("TQQQ_INF_V3:")
@@ -66,7 +73,7 @@ def test_invalid_or_stale_quote_never_reaches_router(monkeypatch):
     for price, extra in ((0, {}), (float("nan"), {}), (50, {"tqqq_quote_stale": True})):
         routed = []
         result = run_sleeve(positions=[], price=price, trading_date=date(2026, 8, 11),
-                            overlay={"market_state": "NORMAL", **extra},
+                            overlay=market("NORMAL", **extra),
                             repository=FakeRepository(InfiniteState()), route=routed.append)
         assert result["reason"] == "tqqq_quote_invalid"
         assert routed == []
@@ -99,7 +106,7 @@ def test_production_router_metadata_contract_for_new_add_and_sell(monkeypatch):
     def capture(positions, price, state):
         intents = []
         result = run_sleeve(positions=positions, price=price, trading_date=date(2026, 8, 11),
-                            overlay={"market_state": "NORMAL"}, repository=FakeRepository(state),
+                            overlay=market("NORMAL"), repository=FakeRepository(state),
                             route=lambda intent: (intents.append(intent) or {"status": "ACK"}))
         assert result["orders"]
         assert resolve_entry_metadata_contract_reason(intents[0], required=True) is None
@@ -113,7 +120,7 @@ def test_production_router_metadata_contract_for_new_add_and_sell(monkeypatch):
                           core_filled_notional=250)
     add = capture([{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], 50, owned)
     assert add["position_action"] == "ADD_TO_EXISTING_BUY" and add["position_state"] == "HELD"
-    sell = capture([{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], 55, owned)
+    sell = capture([{"symbol": "TQQQ", "qty": 2, "orderable_qty": 2, "avg_price": 50}], 55, owned)
     assert sell["side"] == "SELL" and sell["theme_cluster"] == "ETF_INDEX"
 
 
@@ -126,7 +133,7 @@ def test_rebound_decision_block_reject_or_ack_does_not_consume_probe(monkeypatch
         repo = FakeRepository(state)
         result = run_sleeve(
             positions=[{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], price=50,
-            trading_date=date(2026, 8, 11), overlay={"market_state": "DEFENSE_CRASH_REBOUND"},
+            trading_date=date(2026, 8, 11), overlay=market("DEFENSE_CRASH_REBOUND"),
             repository=repo, route=lambda _intent: {"status": router_status},
         )
         assert result["decision"].action.value == "BUY"
@@ -140,7 +147,7 @@ def test_rebound_tick_alone_never_unlocks_recovery_reserve(monkeypatch):
                           core_filled_notional=7_500, material_market_crash=True)
     repo = FakeRepository(state)
     run_sleeve(positions=[{"symbol": "TQQQ", "qty": 2, "avg_price": 50}], price=50,
-               trading_date=date(2026, 8, 11), overlay={"market_state": "DEFENSE_CRASH_REBOUND"},
+               trading_date=date(2026, 8, 11), overlay=market("DEFENSE_CRASH_REBOUND"),
                repository=repo)
     assert not repo.state.reserve_unlocked
 
@@ -186,7 +193,7 @@ def test_reserved_cycle_recovers_unattributed_broker_position_by_symbol_invarian
     state = InfiniteState(cycle_id="reserved", cycle_start_date=date(2026, 8, 11))
     result = run_sleeve(
         positions=[{"symbol": "TQQQ", "qty": 2, "avg_price": 50, "current_price": 50}],
-        price=50, trading_date=date(2026, 8, 11), overlay={"market_state": "NORMAL"},
+        price=50, trading_date=date(2026, 8, 11), overlay=market("NORMAL"),
         repository=FakeRepository(state),
     )
     assert result["decision"].reason != "orphan_position"
@@ -231,7 +238,7 @@ def test_default_on_missing_table_blocks_only_sleeve(monkeypatch):
     repo.ensure_schema = lambda: (_ for _ in ()).throw(RuntimeError("state table missing"))
     routed = []
     result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
-                        overlay={"market_state": "NORMAL"}, repository=repo, route=routed.append)
+                        overlay=market("NORMAL"), repository=repo, route=routed.append)
     assert result["status"] == "BLOCK" and routed == []
 
 
@@ -242,7 +249,7 @@ def test_pause_reconciles_blocks_buy_and_routes_existing_exit(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_ALLOW_SELL", "1")
     buy_repo = FakeRepository(InfiniteState())
     buy = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
-                     overlay={"market_state": "NORMAL"}, repository=buy_repo)
+                     overlay=market("NORMAL"), repository=buy_repo)
     assert buy["decision"].reason == "buy_permission_paused"
     assert buy_repo.saves > 0  # state/reconcile lifecycle remains active
 
@@ -251,8 +258,8 @@ def test_pause_reconciles_blocks_buy_and_routes_existing_exit(monkeypatch):
     routed = []
     def route(intent): routed.append(intent); return {"status": "ACK", "intent": intent}
     sell = run_sleeve(
-        positions=[{"symbol": "TQQQ", "qty": 3, "avg_price": 50, "current_price": 55}],
-        price=55, trading_date=date(2026, 8, 11), overlay={"market_state": "NORMAL"},
+        positions=[{"symbol": "TQQQ", "qty": 3, "orderable_qty": 3, "avg_price": 50, "current_price": 55}],
+        price=55, trading_date=date(2026, 8, 11), overlay=market("NORMAL"),
         repository=FakeRepository(owned), route=route,
     )
     assert sell["decision"].action.value == "SELL"

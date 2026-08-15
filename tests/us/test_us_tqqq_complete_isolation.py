@@ -13,6 +13,13 @@ from trader.us.market_state_overlay import build_profit_capture_intents
 from trader.us.pb1.us_exit_router import route_exit_by_book_horizon
 
 
+def context(state="NORMAL", **extra):
+    return {"market_state": state, "tqqq_context_quality": "ok",
+            "qqq_completed_close": 100, "qqq_ma50": 99, "qqq_ma200": 98,
+            "qqq_ma200_slope": .1, "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+            "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5, **extra}
+
+
 def test_standard_profit_and_swing_exit_never_create_tqqq_intent():
     position = {"symbol": "TQQQ", "qty": 10, "orderable_qty": 10,
                 "avg_price": 100, "current_price": 110, "exchange": "NASDAQ"}
@@ -46,15 +53,16 @@ def test_conflicting_defensive_regime_blocks_buy_but_never_safe_sell():
     effective, multiplier, reserve, allowed, _ = effective_regime(
         {"market_state": "STRONG_RISK_ON", "market_regime": "DEFENSIVE"}
     )
-    assert (effective, multiplier, reserve, allowed) == ("DEFENSIVE", 0.0, False, False)
+    assert (effective, multiplier, reserve, allowed) == ("DEFENSIVE", 0.5, False, True)
     config = InfiniteConfig(unit_usd=1000, max_daily_buy_usd=1000)
     blocked = evaluate(config=config, state=InfiniteState(), position=PositionSnapshot(price=100),
-                       trading_date=date(2026, 8, 14), overlay={"market_state": "STRONG_RISK_ON"},
-                       entry_allowed=allowed, buy_multiplier=multiplier)
-    assert (blocked.action, blocked.reason) == (Action.BLOCK, "tqqq_effective_regime_entry_block")
+                       trading_date=date(2026, 8, 14), overlay=context("STRONG_RISK_ON"),
+                       entry_allowed=allowed, buy_multiplier=multiplier,
+                       effective_regime_name=effective)
+    assert (blocked.action, blocked.reason) == (Action.BLOCK, "tqqq_regime_new_cycle_block")
     sold = evaluate(config=config, state=InfiniteState(cycle_id="c", core_filled_notional=100),
-                    position=PositionSnapshot(qty=1, average_price=100, price=110),
-                    trading_date=date(2026, 8, 14), overlay={"market_state": "STRONG_RISK_ON"},
+                    position=PositionSnapshot(qty=1, orderable_qty=1, average_price=100, price=110),
+                    trading_date=date(2026, 8, 14), overlay=context("STRONG_RISK_ON"),
                     entry_allowed=False, buy_multiplier=0)
     assert sold.action == Action.SELL
 
@@ -63,25 +71,25 @@ def test_strong_risk_on_multiplier_changes_real_order_size():
     regime, multiplier, _reserve, allowed, _ = effective_regime(
         {"market_state": "STRONG_RISK_ON", "market_regime": "STRONG_RISK_ON"}
     )
-    assert (regime, multiplier, allowed) == ("STRONG_RISK_ON", 1.25, True)
+    assert (regime, multiplier, allowed) == ("STRONG_RISK_ON", 1.0, True)
     decision = evaluate(
         config=InfiniteConfig(unit_usd=400, max_daily_buy_usd=1000), state=InfiniteState(),
         position=PositionSnapshot(price=100), trading_date=date(2026, 8, 14),
-        overlay={"market_state": "STRONG_RISK_ON"}, entry_allowed=allowed,
+        overlay=context("STRONG_RISK_ON"), entry_allowed=allowed,
         buy_multiplier=multiplier,
     )
-    assert (decision.action, decision.qty, decision.notional) == (Action.BUY, 5, 500)
+    assert (decision.action, decision.qty, decision.notional) == (Action.BUY, 4, 400)
 
 
 @pytest.mark.parametrize("regime", ["CRASH", "DEFENSE_CRASH", "CAPITAL_PRESERVATION"])
 def test_fail_closed_effective_regimes_block_new_buy(regime):
-    _effective, multiplier, _reserve, allowed, _reason = effective_regime(
+    effective, multiplier, _reserve, allowed, _reason = effective_regime(
         {"market_state": regime, "market_regime": regime}
     )
     decision = evaluate(
         config=InfiniteConfig(), state=InfiniteState(), position=PositionSnapshot(price=100),
-        trading_date=date(2026, 8, 14), overlay={"market_state": "STRONG_RISK_ON"},
-        entry_allowed=allowed, buy_multiplier=multiplier,
+        trading_date=date(2026, 8, 14), overlay=context("STRONG_RISK_ON"),
+        entry_allowed=allowed, buy_multiplier=multiplier, effective_regime_name=effective,
     )
     assert decision.action == Action.BLOCK
 
@@ -170,14 +178,14 @@ def test_reserve_buy_needs_state_unlock_and_regime_permission_but_sell_is_first(
                          unit_usd=100, max_daily_buy_usd=100)
     locked = InfiniteState(cycle_id="c", core_filled_notional=100)
     common = dict(config=cfg, position=PositionSnapshot(price=50), trading_date=date(2026, 8, 14),
-                  overlay={"market_state": "STRONG_RISK_ON"})
+                  overlay=context("STRONG_RISK_ON"))
     assert evaluate(state=locked, regime_reserve_permission=True, **common).reason == "reserve_locked"
     unlocked = InfiniteState(cycle_id="c", core_filled_notional=100, reserve_unlocked=True,
                              material_market_crash=True)
     assert evaluate(state=unlocked, regime_reserve_permission=False, **common).reason == "reserve_locked"
     assert evaluate(state=unlocked, regime_reserve_permission=True, **common).action == Action.BUY
     sell = evaluate(
-        config=cfg, state=unlocked, position=PositionSnapshot(qty=1, average_price=100, price=110),
+        config=cfg, state=unlocked, position=PositionSnapshot(qty=1, orderable_qty=1, average_price=100, price=110),
         trading_date=date(2026, 8, 14), overlay={"market_state": "DEFENSE_CRASH_CONFIRMED"},
         entry_allowed=False, regime_reserve_permission=False,
     )
@@ -253,3 +261,117 @@ def test_recovered_tqqq_uses_ten_percent_take_profit_and_orderable_qty():
         entry_allowed=False, regime_reserve_permission=False,
     )
     assert (decision.action, decision.qty, decision.notional) == (Action.SELL, 6, 330)
+
+
+@pytest.mark.parametrize(("orderable", "reason"), [
+    (None, "tqqq_orderable_qty_missing"), (0, "tqqq_no_orderable_qty"),
+])
+def test_tqqq_take_profit_fails_closed_without_sellable_quantity(orderable, reason):
+    decision = evaluate(
+        config=InfiniteConfig(), state=InfiniteState(cycle_id="c"),
+        position=PositionSnapshot(qty=10, orderable_qty=orderable, average_price=50, price=55),
+        trading_date=date(2026, 8, 14), overlay={}, entry_allowed=False,
+    )
+    assert (decision.action, decision.reason) == (Action.BLOCK, reason)
+
+
+def test_tqqq_dedicated_router_scope_keeps_250_unit_and_real_ack(monkeypatch):
+    from unittest.mock import patch
+    from trader.us.execution import order_router
+
+    for key, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice", "DRY_RUN": "0",
+        "TRADING_REGION": "US", "US_AGENT_ENABLED": "1", "US_PAPER_TRADING_ENABLED": "1",
+        "US_MAX_ORDER_USD": "100", "US_MAX_DAILY_NOTIONAL_USD": "100",
+        "US_SESSION_WINDOW_VALID": "1", "US_PREP_CONTRACT_OK": "1", "US_BALANCE_AVAILABLE": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    order_router._SENT_ORDER_KEYS.clear()
+
+    class Kis:
+        calls = []
+        def get_orderable_cash(self, **_kwargs): return 1000
+        def place_us_buy_order(self, symbol, exchange, qty, price):
+            self.calls.append((symbol, exchange, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "TQQQ-BUY-ACK"}}
+
+    intent = {
+        "symbol": "TQQQ", "exchange": "NASDAQ", "side": "BUY", "qty": 5,
+        "limit_price": 50, "notional_usd": 250, "trade_date": "2026-08-14",
+        "client_order_key": "TQQQ_INF_V3:e2e:2026-08-14:BUY",
+        "strategy": "TQQQ_INFINITE_V3", "strategy_owner": "TQQQ_INFINITE",
+        "strategy_name": "TQQQ_INFINITE", "strategy_version": "ADAPTIVE_RUNWAY_V2",
+        "sleeve_id": "TQQQ_INFINITE", "meta": {
+            "strategy_owner": "TQQQ_INFINITE", "sleeve_id": "TQQQ_INFINITE",
+            "tqqq_daily_committed_before_usd": 0, "tqqq_cycle_committed_before_usd": 0,
+            "tqqq_max_daily_buy_usd": 250, "tqqq_max_total_capital_usd": 10_000,
+        },
+    }
+    client = Kis()
+    with (patch("trader.us.db.repos.save_order_intent", return_value=True),
+          patch("trader.us.db.repos.load_today_order_keys", return_value=set()),
+          patch("trader.us.db.repos.save_order_ack", return_value=True),
+          patch("trader.us.db.repos.mark_order_intent_sent"),
+          patch("trader.us.execution.order_journal.append_order_event", return_value=True),
+          patch("trader.us.execution.kis_us_response_parser.extract_order_no", return_value="TQQQ-BUY-ACK"),
+          patch("trader.us.execution.risk_gate.check_pending_order"),
+          patch("trader.us.execution.risk_gate.check_entry_cutoff")):
+        result = route_order(intent, available_cash_usd=1000, kis_client=client)
+    assert result["status"] == "ACK"
+    assert client.calls == [("TQQQ", "NASDAQ", 5, 50.0)]
+
+
+def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch):
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    from trader.us.infinite.integration import run_sleeve
+
+    for key, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice", "DRY_RUN": "0",
+        "TRADING_REGION": "US", "US_AGENT_ENABLED": "1", "US_PAPER_TRADING_ENABLED": "1",
+        "US_SESSION_WINDOW_VALID": "1", "US_PREP_CONTRACT_OK": "1", "US_BALANCE_AVAILABLE": "1",
+        "US_TQQQ_INFINITE_ENABLED": "1", "US_TQQQ_INFINITE_REAL_ORDER": "1",
+    }.items(): monkeypatch.setenv(key, value)
+
+    state = InfiniteState(cycle_id="e2e-sell", core_filled_notional=500)
+    class Repo:
+        def ensure_schema(self): pass
+        def load_state(self, **_kwargs): return state
+        def save_state(self, _state): pass
+        def pending_sides(self, *_args): return False, False
+        def pending_buy_notional(self, *_args): return 0
+        def fill_accounting(self, *_args): return 500, 0, 0, None, 50
+        def reconcile_metadata(self, value, **_kwargs): return value
+
+    class Kis:
+        calls = []
+        def get_balance(self, force_refresh=False):
+            return {"positions": [{"symbol": "TQQQ", "qty": 10, "orderable_qty": 6,
+                                    "avg_price": 50, "currency": "USD"}]}
+        def place_us_sell_order(self, symbol, exchange, qty, price):
+            self.calls.append((symbol, exchange, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "TQQQ-SELL-ACK"}}
+
+    client = Kis()
+    asof = datetime.now(timezone.utc).isoformat()
+    positions = [{"symbol": "TQQQ", "qty": 10, "orderable_qty": 6, "avg_price": 50,
+                  "broker_avg_price_source": "kis_pchs_avg_pric", "broker_avg_price_asof": asof}]
+    routed = []
+    def real_route(intent):
+        routed.append(intent)
+        return route_order(intent, available_cash_usd=1000, current_position_symbols={"TQQQ"},
+                           kis_client=client)
+    with (patch("trader.us.db.repos.save_order_intent", return_value=True),
+          patch("trader.us.db.repos.load_today_order_keys", return_value=set()),
+          patch("trader.us.db.repos.save_order_ack", return_value=True),
+          patch("trader.us.db.repos.mark_order_intent_sent"),
+          patch("trader.us.execution.order_journal.append_order_event", return_value=True),
+          patch("trader.us.execution.kis_us_response_parser.extract_order_no", return_value="TQQQ-SELL-ACK"),
+          patch("trader.us.execution.risk_gate.check_pending_sell_order_hard")):
+        result = run_sleeve(positions=positions, price=55, trading_date=date(2026, 8, 14),
+                            overlay={}, repository=Repo(), route=real_route)
+    assert result["status"] == "ACK"
+    assert client.calls == [("TQQQ", "NASDAQ", 6, 55.0)]
+    assert routed[0]["reason"] == "TAKE_PROFIT_TQQQ_INFINITE"
+    assert routed[0]["position_action"] == "FULL_EXIT_SELL"
+    assert routed[0]["meta"]["tp_threshold_fraction"] == "0.1"

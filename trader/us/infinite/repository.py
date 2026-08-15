@@ -100,6 +100,21 @@ class InfiniteRepository:
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
 
+    def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
+        """Capital reserved by unresolved BUY ACK/pending quantities."""
+        with self.engine.connect() as conn:
+            value = conn.execute(text("""
+                SELECT COALESCE(SUM(
+                    CASE WHEN qty_requested > 0 THEN
+                        committed_notional_usd * GREATEST(qty_requested-qty_filled,0) / qty_requested
+                    ELSE committed_notional_usd END
+                ),0)
+                FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol AND side='BUY'
+                  AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING','PARTIALLY_FILLED',
+                                 'RECONCILE_PENDING','ACK_DB_FAILED')
+            """), {"trade_date": trade_date, "symbol": symbol}).scalar()
+        return max(0.0, float(value or 0))
+
     def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
         with self.engine.connect() as conn:
             return bool(conn.execute(text("""

@@ -9,7 +9,11 @@ from trader.us.market_state_overlay import _market_returns, calculate_qqq_long_c
 
 
 def bar(day, price=50, state="NORMAL", **context):
-    return ReplayBar(day, 100, price, {"market_state": state, **context})
+    defaults = {"tqqq_context_quality": "ok", "qqq_completed_close": 100,
+                "qqq_ma50": 99, "qqq_ma200": 98, "qqq_ma200_slope": .1,
+                "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+                "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5}
+    return ReplayBar(day, 100, price, {"market_state": state, **defaults, **context})
 
 
 def test_replay_calendar_is_exactly_completed_bar_dates_not_weekdays():

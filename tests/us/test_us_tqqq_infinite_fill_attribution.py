@@ -65,7 +65,11 @@ def test_non_infinite_fills_do_not_affect_10k_cap_or_250_daily_limit():
     decision = evaluate(
         config=InfiniteConfig(enabled=True), state=accounted,
         position=PositionSnapshot(qty=1, average_price=100, price=100), trading_date=TODAY,
-        daily_filled_buy_notional=daily, overlay={"market_state": "NORMAL"},
+        daily_filled_buy_notional=daily, overlay={"market_state": "NORMAL",
+            "tqqq_context_quality": "ok", "qqq_completed_close": 100,
+            "qqq_ma50": 99, "qqq_ma200": 98, "qqq_ma200_slope": .1,
+            "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+            "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5},
     )
     assert cycle == daily == 100
     assert decision.action == Action.BUY and decision.notional == 100
