@@ -4,7 +4,7 @@ from trader.us.execution.order_router import route_order
 import pytest
 
 from trader.us.infinite.config import InfiniteConfig
-from trader.us.infinite.integration import exclude_owned
+from trader.us.infinite.integration import exclude_owned, recover_state_from_broker
 from trader.us.infinite.models import Action, InfiniteState, PositionSnapshot
 from trader.us.infinite.policy_state import update_adaptive_policy_state
 from trader.us.infinite.risk_adapter import effective_regime
@@ -223,3 +223,33 @@ def test_postgres_intent_and_ack_sql_meta_preserve_owner(monkeypatch):
     assert len(persisted) == 2
     for meta in persisted:
         assert all(meta[field] == value for field, value in attribution.items())
+
+
+def test_kis_balance_recovers_exact_tqqq_state_without_orphan_classification():
+    broker = PositionSnapshot(qty=7, orderable_qty=6, average_price=51.25, price=52)
+    recovered = recover_state_from_broker(
+        config=InfiniteConfig(), broker=broker, trading_date=date(2026, 8, 14),
+        cycle_id="existing-cycle",
+    )
+    assert recovered.cycle_id == "existing-cycle"
+    assert recovered.anchor_price == 51.25
+    assert recovered.metadata["broker_qty"] == 7
+    assert recovered.metadata["broker_orderable_qty"] == 6
+    assert recovered.metadata["broker_average_price"] == 51.25
+    assert recovered.metadata["ownership_source"] == "SYMBOL_INVARIANT_RECOVERY"
+    assert recovered.metadata["strategy_owner"] == "TQQQ_INFINITE"
+    decision = evaluate(
+        config=InfiniteConfig(), state=None, position=broker,
+        trading_date=date(2026, 8, 14), overlay={"market_state": "NORMAL"},
+    )
+    assert decision.reason != "orphan_position"
+
+
+def test_recovered_tqqq_uses_ten_percent_take_profit_and_orderable_qty():
+    broker = PositionSnapshot(qty=7, orderable_qty=6, average_price=50, price=55)
+    decision = evaluate(
+        config=InfiniteConfig(), state=None, position=broker,
+        trading_date=date(2026, 8, 14), overlay={"market_state": "DEFENSE_CRASH_CONFIRMED"},
+        entry_allowed=False, regime_reserve_permission=False,
+    )
+    assert (decision.action, decision.qty, decision.notional) == (Action.SELL, 6, 330)

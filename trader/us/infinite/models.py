@@ -69,6 +69,7 @@ class InfiniteState:
 @dataclass(frozen=True)
 class PositionSnapshot:
     qty: int = 0
+    orderable_qty: int = 0
     average_price: float = 0.0
     price: float = 0.0
     exchange: str = "NASDAQ"

@@ -56,7 +56,16 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     except (TypeError, ValueError) as exc:
         return Decision(Action.BLOCK, f"state_or_config_corrupt:{exc}")
     if position.qty > 0 and state is None:
-        return Decision(Action.BLOCK, "orphan_position")
+        recovered_notional = position.qty * position.average_price
+        state = InfiniteState(
+            symbol=config.symbol, cycle_id="SYMBOL_INVARIANT_RECOVERY", status=Status.ACTIVE,
+            anchor_price=position.average_price or None,
+            core_filled_notional=min(recovered_notional, config.core_capital_usd),
+            reserve_filled_notional=max(0.0, recovered_notional - config.core_capital_usd),
+            metadata={"strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+                      "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
+                      "ownership_source": "SYMBOL_INVARIANT_RECOVERY"},
+        )
     if state is None:
         state = InfiniteState(symbol=config.symbol)
 
@@ -70,8 +79,10 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "sell_permission_disabled")
         if pending_sell:
             return Decision(Action.BLOCK, "pending_sell", next_status=Status.EXIT_PENDING)
-        return Decision(Action.SELL, "take_profit", qty=position.qty,
-                        notional=position.qty * position.price, next_status=Status.EXIT_PENDING)
+        sell_qty = position.orderable_qty if position.orderable_qty > 0 else position.qty
+        sell_qty = min(position.qty, sell_qty)
+        return Decision(Action.SELL, "take_profit", qty=sell_qty,
+                        notional=sell_qty * position.price, next_status=Status.EXIT_PENDING)
     if state.status == Status.EXIT_PENDING:
         if position.qty == 0:
             return Decision(Action.WAIT, "confirmed_exit_complete", next_status=Status.COMPLETE)

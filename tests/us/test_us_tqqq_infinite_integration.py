@@ -180,7 +180,7 @@ def test_runtime_schema_probe_never_runs_migrations(monkeypatch):
     assert calls == []
 
 
-def test_reserved_cycle_does_not_adopt_unattributed_broker_position(monkeypatch):
+def test_reserved_cycle_recovers_unattributed_broker_position_by_symbol_invariant(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "0")
     state = InfiniteState(cycle_id="reserved", cycle_start_date=date(2026, 8, 11))
@@ -189,7 +189,7 @@ def test_reserved_cycle_does_not_adopt_unattributed_broker_position(monkeypatch)
         price=50, trading_date=date(2026, 8, 11), overlay={"market_state": "NORMAL"},
         repository=FakeRepository(state),
     )
-    assert result["decision"].reason == "orphan_position"
+    assert result["decision"].reason != "orphan_position"
     assert result["orders"] == []
 
 

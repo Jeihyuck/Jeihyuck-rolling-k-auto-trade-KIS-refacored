@@ -110,6 +110,39 @@ class InfiniteRepository:
                 LIMIT 1
             """), {"symbol": symbol}).first())
 
+    def find_recovery_cycle_id(self, symbol: str = "TQQQ") -> str | None:
+        """Reuse the newest durable Infinite key without rewriting its identity."""
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT client_order_key FROM (
+                    SELECT client_order_key, created_at FROM us_orders WHERE symbol=:symbol
+                    UNION ALL
+                    SELECT client_order_key, created_at FROM us_order_intents WHERE symbol=:symbol
+                ) history
+                WHERE client_order_key LIKE 'TQQQ_INF_V3:%'
+                ORDER BY created_at DESC NULLS LAST LIMIT 1
+            """), {"symbol": symbol}).first()
+        key = str(row[0] if row else "")
+        parts = key.split(":")
+        return parts[1] if len(parts) >= 3 and parts[1] else None
+
+    def backfill_tqqq_attribution(self, strategy_version: str) -> None:
+        """Add ownership JSON only; quantities, prices, fills and keys are untouched."""
+        attribution = json.dumps({
+            "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+            "strategy_version": strategy_version, "sleeve_id": "TQQQ_INFINITE",
+            "ownership_source": "SYMBOL_INVARIANT_RECOVERY",
+        })
+        with self.engine.begin() as conn:
+            for table in ("us_order_intents", "us_orders", "us_fills"):
+                conn.execute(text(f"""
+                    UPDATE {table} SET meta=COALESCE(meta, '{{}}'::jsonb) || CAST(:attribution AS jsonb)
+                    WHERE symbol='TQQQ' AND (
+                        COALESCE(meta->>'strategy_owner','') <> 'TQQQ_INFINITE'
+                        OR COALESCE(meta->>'sleeve_id','') <> 'TQQQ_INFINITE'
+                    )
+                """), {"attribution": attribution})
+
     def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
         start = state.cycle_start_date or trading_date
@@ -236,6 +269,11 @@ class InfiniteRepository:
                            rebound_cooldown: int = 3) -> InfiniteState:
         stats = self.cycle_fill_stats(state, trading_date)
         buys, last_buy, first_price = stats["total_buy_notional"], stats["last_buy_date"], stats["first_fill_price"]
+        if broker_qty > 0 and buys <= 0:
+            # Missing historical attribution must not erase a real KIS holding.
+            # The broker balance is the recovery notional authority; no qty,
+            # average price, fill or client key is synthesized or rewritten.
+            buys = broker_qty * broker_average_price
         core = min(buys, core_cap)
         reserve = max(0.0, buys - core)
         anchor = state.anchor_price or first_price or (broker_average_price if broker_qty > 0 else None)
@@ -253,7 +291,8 @@ class InfiniteRepository:
                            last_exit_date=trading_date, anchor_price=None, core_filled_notional=0,
                            reserve_filled_notional=0, reserve_unlocked=False, market_crash_streak=0,
                            cycle_age_trading_days=age)
-        metadata = {**state.metadata, "last_buy_fill_price": stats["last_buy_fill_price"]}
+        metadata = {**state.metadata, "last_buy_fill_price": stats["last_buy_fill_price"],
+                    "broker_qty": broker_qty, "broker_average_price": broker_average_price}
         probe_fill_date = stats.get("last_rebound_probe_fill_date")
         if probe_fill_date:
             from datetime import timedelta

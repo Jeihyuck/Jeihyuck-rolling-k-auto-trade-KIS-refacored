@@ -70,10 +70,31 @@ def _position(raw: dict | None, price: float) -> PositionSnapshot:
             except (TypeError, ValueError): pass
         return 0.0
     return PositionSnapshot(
-        qty=int(number("sellable_qty", "orderable_qty", "qty", "quantity")),
+        qty=int(number("qty", "quantity", "holding_qty")),
+        orderable_qty=int(number("sellable_qty", "orderable_qty")),
         average_price=number("avg_price_usd", "avg_price", "avg_cost", "pchs_avg_pric"),
         price=price or number("current_price", "last_price", "price", "ovrs_now_pric"),
         exchange=str(raw.get("exchange") or "NASDAQ"),
+    )
+
+
+def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapshot,
+                              trading_date: date, cycle_id: str | None = None) -> InfiniteState:
+    """Recover ownership/state from authoritative KIS balance facts only."""
+    notional = broker.qty * broker.average_price
+    return InfiniteState(
+        symbol=config.symbol, cycle_id=cycle_id or str(uuid.uuid4()),
+        cycle_start_date=trading_date, anchor_price=broker.average_price or None,
+        core_filled_notional=min(notional, config.core_capital_usd),
+        reserve_filled_notional=max(0.0, notional - config.core_capital_usd),
+        status=Status.ACTIVE,
+        metadata={
+            "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+            "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
+            "ownership_source": "SYMBOL_INVARIANT_RECOVERY",
+            "broker_qty": broker.qty, "broker_orderable_qty": broker.orderable_qty,
+            "broker_average_price": broker.average_price,
+        },
     )
 
 
@@ -97,8 +118,49 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
         broker = _position(raw, price)
         state = repository.load_state(symbol=config.symbol)
-        if state is None and broker.qty == 0:
-            state = InfiniteState(symbol=config.symbol)
+        if state is None:
+            if broker.qty > 0:
+                cycle_id = repository.find_recovery_cycle_id(config.symbol) if hasattr(repository, "find_recovery_cycle_id") else None
+                state = recover_state_from_broker(config=config, broker=broker,
+                                                  trading_date=trading_date, cycle_id=cycle_id)
+                repository.save_state(state)
+                logger.warning("[TQQQ_INF][OWNERSHIP_RECOVERY] symbol=TQQQ qty=%s orderable_qty=%s average_price=%s cycle_id=%s ownership_source=SYMBOL_INVARIANT_RECOVERY",
+                               broker.qty, broker.orderable_qty, broker.average_price, state.cycle_id)
+            else:
+                state = InfiniteState(symbol=config.symbol)
+        elif broker.qty > 0 and (not state.cycle_id or state.total_filled_notional <= 0):
+            recovered = recover_state_from_broker(
+                config=config, broker=broker, trading_date=trading_date,
+                cycle_id=state.cycle_id or (
+                    repository.find_recovery_cycle_id(config.symbol)
+                    if hasattr(repository, "find_recovery_cycle_id") else None
+                ),
+            )
+            state = replace(
+                state, cycle_id=recovered.cycle_id,
+                cycle_start_date=state.cycle_start_date or recovered.cycle_start_date,
+                anchor_price=state.anchor_price or recovered.anchor_price,
+                core_filled_notional=recovered.core_filled_notional,
+                reserve_filled_notional=recovered.reserve_filled_notional,
+                status=Status.ACTIVE,
+                metadata={**state.metadata, **recovered.metadata},
+            )
+            repository.save_state(state)
+        if state is not None and broker.qty > 0:
+            ownership = {
+                "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+                "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
+                "broker_qty": broker.qty, "broker_orderable_qty": broker.orderable_qty,
+                "broker_average_price": broker.average_price,
+            }
+            if not state.metadata.get("strategy_owner"):
+                ownership["ownership_source"] = "SYMBOL_INVARIANT_RECOVERY"
+            merged_metadata = {**state.metadata, **ownership}
+            if merged_metadata != state.metadata:
+                state = replace(state, metadata=merged_metadata)
+                repository.save_state(state)
+            if hasattr(repository, "backfill_tqqq_attribution"):
+                repository.backfill_tqqq_attribution(config.policy_version)
         if state is not None:
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
                                                   broker_average_price=broker.average_price,
@@ -116,13 +178,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         daily = 0.0
         if state is not None:
             _cycle, daily, _sells, _last, _anchor = repository.fill_accounting(state, trading_date)
-        # A reserved metadata row is not ownership evidence. If broker TQQQ
-        # exists without an attributed Infinite fill, treat it as an orphan.
         decision_state = state
-        if broker.qty > 0 and (
-            state is None or state.total_filled_notional <= 0
-        ):
-            decision_state = None
         regime, multiplier, regime_reserve_permission, entry_allowed, regime_reason = effective_regime(overlay)
         effective_reserve_available = bool(
             state is not None and state.reserve_unlocked and regime_reserve_permission

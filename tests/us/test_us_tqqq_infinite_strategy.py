@@ -126,9 +126,9 @@ def test_corrupt_state_fails_closed(state):
     assert decide(state).action == Action.BLOCK
 
 
-def test_orphan_broker_position_fails_closed():
+def test_tqqq_broker_position_recovers_by_symbol_invariant():
     result = decide(None, PositionSnapshot(qty=1, average_price=50, price=50))
-    assert (result.action, result.reason) == (Action.BLOCK, "orphan_position")
+    assert result.reason != "orphan_position"
 
 
 def test_pause_blocks_buy_but_keeps_take_profit_sell():
