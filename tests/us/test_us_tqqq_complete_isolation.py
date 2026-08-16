@@ -429,6 +429,86 @@ def test_run_sleeve_buy_crosses_router_ack_and_fill_persistence(monkeypatch):
     assert repos._MEM_FILLS[0]["meta"]["strategy_owner"] == "TQQQ_INFINITE"
 
 
+def test_recovered_kis_balance_crosses_run_sleeve_router_and_ack(monkeypatch):
+    from unittest.mock import patch
+    from trader.us.db import repos
+    from trader.us.infinite.integration import run_sleeve
+
+    for key, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice", "DRY_RUN": "0",
+        "TRADING_REGION": "US", "US_AGENT_ENABLED": "1", "US_PAPER_TRADING_ENABLED": "1",
+        "US_SESSION_WINDOW_VALID": "1", "US_PREP_CONTRACT_OK": "1", "US_BALANCE_AVAILABLE": "1",
+        "US_TQQQ_INFINITE_ENABLED": "1", "US_TQQQ_INFINITE_REAL_ORDER": "1",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("PBCORE_DB_URL", raising=False)
+    repos.reset_memory_stores()
+
+    class Repo:
+        state = None
+        def ensure_schema(self): pass
+        def load_state(self, **_kwargs): return self.state
+        def save_state(self, value): self.state = value
+        def find_recovery_cycle_id(self, *_args): return None
+        def backfill_tqqq_attribution(self, *_args): pass
+        def pending_sides(self, *_args): return False, False
+        def pending_buy_notional(self, *_args): return 0
+        def fill_accounting(self, *_args): return 250, 0, 0, None, None
+        def reconcile_metadata(self, value, **_kwargs): return value
+
+    class Kis:
+        calls = []
+        def get_orderable_cash(self, **_kwargs): return 1_000
+        def place_us_buy_order(self, symbol, exchange, qty, price):
+            self.calls.append((symbol, exchange, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "RECOVERED-BUY-ACK"}}
+
+    repository, client = Repo(), Kis()
+    with (patch("trader.us.execution.order_journal.append_order_event", return_value=True),
+          patch("trader.us.execution.kis_us_response_parser.extract_order_no",
+                return_value="RECOVERED-BUY-ACK"),
+          patch("trader.us.execution.risk_gate.check_pending_order"),
+          patch("trader.us.execution.risk_gate.check_entry_cutoff")):
+        result = run_sleeve(
+            positions=[{"symbol": "TQQQ", "qty": 5, "orderable_qty": 5, "avg_price": 50}],
+            price=49, trading_date=date(2026, 8, 14), overlay=context(),
+            repository=repository,
+            route=lambda intent: route_order(intent, available_cash_usd=1_000, kis_client=client),
+        )
+    assert result["status"] == "ACK"
+    assert client.calls == [("TQQQ", "NASDAQ", 3, 49.0)]
+    assert repository.state.metadata["buy_reference_price"] == 50
+    assert repository.state.metadata["buy_reference_source"] == "KIS_BROKER_AVG_FALLBACK"
+    assert repository.state.metadata.get("last_buy_fill_price") is None
+    assert repos._MEM_ORDERS[-1]["meta"]["strategy_owner"] == "TQQQ_INFINITE"
+
+
+def test_attributed_fill_replaces_broker_fallback_and_clears_uncertainty():
+    from trader.us.infinite.repository import InfiniteRepository
+
+    repository = object.__new__(InfiniteRepository)
+    repository.cycle_fill_stats = lambda *_args, **_kwargs: {
+        "total_buy_notional": 397, "daily_buy_notional": 147,
+        "total_sell_notional": 0, "last_buy_date": date(2026, 8, 14),
+        "first_fill_price": 50, "last_buy_fill_price": 49,
+        "last_rebound_probe_fill_date": None,
+    }
+    recovered = InfiniteState(
+        cycle_id="recovered", cycle_start_date=date(2026, 8, 1), status=Status.ACTIVE,
+        core_filled_notional=250,
+        metadata={"recovery_accounting_uncertain": True, "buy_reference_price": 50,
+                  "buy_reference_source": "KIS_BROKER_AVG_FALLBACK"},
+    )
+    reconciled = repository.reconcile_metadata(
+        recovered, trading_date=date(2026, 8, 14), broker_qty=8,
+        broker_average_price=49.625, core_cap=7_500,
+    )
+    assert reconciled.metadata["last_buy_fill_price"] == 49
+    assert reconciled.metadata["buy_reference_price"] == 49
+    assert reconciled.metadata["buy_reference_source"] == "ATTRIBUTED_BUY_FILL"
+    assert reconciled.metadata["recovery_accounting_uncertain"] is False
+
+
 def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch):
     from datetime import datetime, timezone
     from unittest.mock import patch

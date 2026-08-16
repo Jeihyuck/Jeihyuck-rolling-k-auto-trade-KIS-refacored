@@ -323,7 +323,8 @@ class InfiniteRepository:
                     "broker_qty": broker_qty, "broker_average_price": broker_average_price}
         if actual_last_buy_price:
             metadata.update(buy_reference_price=actual_last_buy_price,
-                            buy_reference_source="ATTRIBUTED_BUY_FILL")
+                            buy_reference_source="ATTRIBUTED_BUY_FILL",
+                            recovery_accounting_uncertain=False)
         elif broker_qty > 0 and broker_average_price > 0:
             # This is explicitly a conservative decision reference, not a
             # fabricated fill.  Keep last_buy_fill_price empty so accounting

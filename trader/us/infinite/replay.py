@@ -88,6 +88,7 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
     reserve_used_notional = 0.0
     total_buy_count = 0
     block_reason_counts: Counter[str] = Counter()
+    regime_buy_counts: Counter[str] = Counter()
     maximum_deployed_notional = 0.0
     maximum_core_used_notional = 0.0
 
@@ -112,6 +113,7 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         if decision.action in {Action.BUY, Action.SELL} and not bar.quote_valid:
             invalid_orders += 1
         if decision.action == Action.BUY:
+            regime_buy_counts[regime] += 1
             total_buy_count += 1
             if bar.trading_date in bought_dates: duplicate_buys += 1
             bought_dates.add(bar.trading_date)
@@ -186,11 +188,13 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         "core_used_notional": maximum_core_used_notional,
         "maximum_deployed_notional": maximum_deployed_notional,
         "block_reason_counts": dict(sorted(block_reason_counts.items())),
+        "regime_buy_counts": dict(sorted(regime_buy_counts.items())),
         "take_profit_exit_occurred": bool(completion_durations),
         "capital_cap_violated": bool(hard_cap_violations),
         "duplicate_order_detected": bool(duplicate_buys),
         "incomplete_cycle_count": int(qty > 0),
         "final_qty": qty,
+        "final_evaluation_amount": final_equity,
         "session_count": len(dates), "session_dates": dates,
         "final_state": state,
     }
