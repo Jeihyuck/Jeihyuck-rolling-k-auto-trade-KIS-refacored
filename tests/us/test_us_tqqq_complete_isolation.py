@@ -328,6 +328,59 @@ def test_tqqq_dedicated_router_scope_keeps_250_unit_and_real_ack(monkeypatch):
     assert client.calls == [("TQQQ", "NASDAQ", 5, 50.0)]
 
 
+def test_run_sleeve_buy_crosses_router_ack_and_fill_persistence(monkeypatch):
+    from unittest.mock import patch
+    from trader.us.db import repos
+    from trader.us.infinite.integration import run_sleeve
+
+    for key, value in {
+        "KIS_ENV": "practice", "STRATEGY_ENV": "practice", "DRY_RUN": "0",
+        "TRADING_REGION": "US", "US_AGENT_ENABLED": "1", "US_PAPER_TRADING_ENABLED": "1",
+        "US_MAX_ORDER_USD": "100", "US_MAX_DAILY_NOTIONAL_USD": "100",
+        "US_SESSION_WINDOW_VALID": "1", "US_PREP_CONTRACT_OK": "1", "US_BALANCE_AVAILABLE": "1",
+        "US_TQQQ_INFINITE_ENABLED": "1", "US_TQQQ_INFINITE_REAL_ORDER": "1",
+    }.items(): monkeypatch.setenv(key, value)
+    monkeypatch.delenv("PBCORE_DB_URL", raising=False)
+    repos.reset_memory_stores()
+
+    class Repo:
+        state = InfiniteState()
+        def ensure_schema(self): pass
+        def load_state(self, **_kwargs): return self.state
+        def save_state(self, value): self.state = value
+        def pending_sides(self, *_args): return False, False
+        def pending_buy_notional(self, *_args): return 0
+        def fill_accounting(self, *_args): return 0, 0, 0, None, None
+        def reconcile_metadata(self, value, **_kwargs): return value
+
+    class Kis:
+        calls = []
+        def get_orderable_cash(self, **_kwargs): return 1_000
+        def place_us_buy_order(self, symbol, exchange, qty, price):
+            self.calls.append((symbol, exchange, qty, price))
+            return {"rt_cd": "0", "output": {"ODNO": "RUN-SLEEVE-BUY"}}
+
+    repository, client = Repo(), Kis()
+    def real_route(intent):
+        return route_order(intent, available_cash_usd=1_000, kis_client=client)
+    with (patch("trader.us.execution.order_journal.append_order_event", return_value=True),
+          patch("trader.us.execution.kis_us_response_parser.extract_order_no", return_value="RUN-SLEEVE-BUY"),
+          patch("trader.us.execution.risk_gate.check_pending_order"),
+          patch("trader.us.execution.risk_gate.check_entry_cutoff")):
+        result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 14),
+                            overlay=context(), repository=repository, route=real_route)
+    assert result["status"] == "ACK"
+    assert client.calls == [("TQQQ", "NASDAQ", 3, 50.0)]  # NORMAL 0.75 × $250, whole shares
+    order = repos._MEM_ORDERS[0]
+    assert order["status"] == "ACK" and order["meta"]["strategy_owner"] == "TQQQ_INFINITE"
+    assert repos.save_fills([{
+        "symbol": "TQQQ", "side": "BUY", "qty": 3, "price_usd": 50,
+        "order_no": "RUN-SLEEVE-BUY", "client_order_key": order["client_order_key"],
+        "meta": {"fill_evidence_type": "KIS_ACTUAL"},
+    }], trade_date="2026-08-14") == 1
+    assert repos._MEM_FILLS[0]["meta"]["strategy_owner"] == "TQQQ_INFINITE"
+
+
 def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch):
     from datetime import datetime, timezone
     from unittest.mock import patch
@@ -415,3 +468,88 @@ def test_full_exit_threshold_and_pending_contract():
     assert (pending.action, pending.reason, pending.next_status) == (
         Action.BLOCK, "tqqq_full_exit_pending", Status.EXIT_PENDING,
     )
+
+
+def test_full_exit_partial_cancel_retry_and_completion_state_machine():
+    state = InfiniteState(cycle_id="full-exit", status=Status.EXIT_PENDING)
+    partial_open = evaluate(
+        config=InfiniteConfig(), state=state,
+        position=PositionSnapshot(qty=4, orderable_qty=0, average_price=50, price=55),
+        trading_date=date(2026, 8, 14), overlay={}, pending_sell=True,
+    )
+    assert (partial_open.action, partial_open.reason, partial_open.next_status) == (
+        Action.BLOCK, "tqqq_full_exit_pending", Status.EXIT_PENDING,
+    )
+    cancelled_below_target = evaluate(
+        config=InfiniteConfig(), state=state,
+        position=PositionSnapshot(qty=4, orderable_qty=4, average_price=50, price=54),
+        trading_date=date(2026, 8, 14), overlay={}, pending_sell=False,
+    )
+    assert (cancelled_below_target.action, cancelled_below_target.next_status) == (
+        Action.WAIT, Status.EXIT_PENDING,
+    )
+    cancelled_reached_target = evaluate(
+        config=InfiniteConfig(), state=state,
+        position=PositionSnapshot(qty=4, orderable_qty=4, average_price=50, price=55),
+        trading_date=date(2026, 8, 14), overlay={}, pending_sell=False,
+    )
+    assert (cancelled_reached_target.action, cancelled_reached_target.qty,
+            cancelled_reached_target.next_status) == (Action.SELL, 4, Status.EXIT_PENDING)
+    complete = evaluate(
+        config=InfiniteConfig(), state=state, position=PositionSnapshot(qty=0, orderable_qty=0, price=55),
+        trading_date=date(2026, 8, 14), overlay={}, pending_sell=False,
+    )
+    assert (complete.action, complete.next_status) == (Action.WAIT, Status.COMPLETE)
+
+
+def _conflict_decision(market_state, market_regime, *, state, position, trading_date=date(2026, 8, 14)):
+    overlay = context(market_state, market_regime=market_regime)
+    effective, multiplier, reserve_permission, entry_allowed, _reason = effective_regime(overlay)
+    decision = evaluate(
+        config=InfiniteConfig(), state=state, position=position, trading_date=trading_date,
+        overlay=overlay, effective_regime_name=effective, buy_multiplier=multiplier,
+        regime_reserve_permission=reserve_permission, entry_allowed=entry_allowed,
+    )
+    return effective, reserve_permission, decision
+
+
+def test_conflicting_regimes_change_actual_buy_decisions_not_only_labels():
+    defensive_state = InfiniteState(
+        cycle_id="c", status=Status.ACTIVE, core_filled_notional=250,
+        last_buy_date=date(2026, 8, 13),
+        metadata={"long_trend": "BEAR", "last_buy_fill_price": 100},
+    )
+    effective, reserve, decision = _conflict_decision(
+        "STRONG_RISK_ON", "DEFENSIVE", state=defensive_state,
+        position=PositionSnapshot(qty=5, orderable_qty=5, average_price=100, price=94),
+    )
+    assert (effective, reserve, decision.reason) == ("DEFENSIVE", False, "defense_risk_off_wait")
+
+    for market_state, market_regime, expected in (
+        ("NORMAL", "RISK_OFF", "RISK_OFF"),
+        ("RISK_ON", "CHOP_HIGH_VOL", "CHOP_HIGH_VOL"),
+    ):
+        effective, _reserve, decision = _conflict_decision(
+            market_state, market_regime, state=InfiniteState(), position=PositionSnapshot(price=50),
+        )
+        assert effective == expected and decision.action == Action.BLOCK
+
+    caution_state = InfiniteState(cycle_id="c", status=Status.ACTIVE,
+                                   last_buy_date=date(2026, 8, 13), core_filled_notional=250)
+    effective, _reserve, decision = _conflict_decision(
+        "DEFENSE_CAUTION", "RISK_ON", state=caution_state,
+        position=PositionSnapshot(qty=5, orderable_qty=5, average_price=100, price=100),
+    )
+    assert effective == "DEFENSE_CAUTION" and decision.reason == "routine_gap_wait"
+
+    effective, _reserve, decision = _conflict_decision(
+        "DEFENSE_CRASH_CONFIRMED", "RISK_ON", state=InfiniteState(),
+        position=PositionSnapshot(price=50),
+    )
+    assert effective == "DEFENSE_CRASH_CONFIRMED" and decision.action == Action.BLOCK
+
+    effective, reserve, decision = _conflict_decision(
+        "DEFENSE_CRASH_REBOUND", "DEFENSIVE", state=defensive_state,
+        position=PositionSnapshot(qty=5, orderable_qty=5, average_price=100, price=94),
+    )
+    assert (effective, reserve, decision.reason) == ("DEFENSIVE", False, "defense_risk_off_wait")

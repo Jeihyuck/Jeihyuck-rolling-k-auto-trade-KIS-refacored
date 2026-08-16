@@ -202,6 +202,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         if state is not None:
             _cycle, daily, _sells, _last, _anchor = repository.fill_accounting(state, trading_date)
         decision_state = state
+        was_full_exit_pending = bool(state and state.status == Status.EXIT_PENDING)
         regime, multiplier, regime_reserve_permission, entry_allowed, regime_reason = effective_regime(overlay)
         effective_reserve_available = bool(
             state is not None and state.reserve_unlocked and regime_reserve_permission
@@ -284,11 +285,16 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "sellable_qty": broker.orderable_qty, "available_qty": broker.orderable_qty,
             "partial_exit_allowed": False,
         } if decision.action == Action.SELL else {}
+        client_order_key = f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{decision.action.value}"
+        if decision.action == Action.SELL and was_full_exit_pending:
+            sequence = (repository.next_full_exit_sequence(trading_date, state.cycle_id)
+                        if hasattr(repository, "next_full_exit_sequence") else 1)
+            client_order_key += f":RETRY:{sequence}"
         intent = {
             "symbol": config.symbol, "exchange": broker.exchange or "NASDAQ", "side": decision.action.value,
             "qty": decision.qty, "limit_price": broker.price, "notional_usd": decision.notional,
             "trade_date": trading_date.isoformat(),
-            "client_order_key": f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{decision.action.value}",
+            "client_order_key": client_order_key,
             "strategy": "TQQQ_INFINITE_V3", "strategy_owner": "TQQQ_INFINITE",
             "strategy_name": "TQQQ_INFINITE", "strategy_version": config.policy_version,
             "sleeve_id": "TQQQ_INFINITE", "theme_cluster": theme_cluster,

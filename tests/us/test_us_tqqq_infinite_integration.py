@@ -4,7 +4,7 @@ from datetime import date
 
 from trader.us.infinite.config import InfiniteConfig
 from trader.us.infinite.integration import exclude_owned, legacy_ownership_reserved, run_sleeve
-from trader.us.infinite.models import InfiniteState
+from trader.us.infinite.models import InfiniteState, Status
 from trader.us.infinite.repository import InfiniteRepository
 from trader.us.execution.order_router import resolve_entry_metadata_contract_reason
 
@@ -263,4 +263,20 @@ def test_pause_reconciles_blocks_buy_and_routes_existing_exit(monkeypatch):
         repository=FakeRepository(owned), route=route,
     )
     assert sell["decision"].action.value == "SELL"
+
+
+def test_cancelled_full_exit_uses_deterministic_retry_key(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")
+    state = InfiniteState(cycle_id="exit-cycle", status=Status.EXIT_PENDING,
+                          core_filled_notional=500)
+    routed = []
+    result = run_sleeve(
+        positions=[{"symbol": "TQQQ", "qty": 4, "orderable_qty": 4, "avg_price": 50}],
+        price=55, trading_date=date(2026, 8, 11), overlay={},
+        repository=FakeRepository(state),
+        route=lambda intent: (routed.append(intent) or {"status": "ACK"}),
+    )
+    assert result["decision"].action.value == "SELL"
+    assert routed[0]["client_order_key"] == "TQQQ_INF_V3:exit-cycle:2026-08-11:SELL:RETRY:1"
     assert len(routed) == 1

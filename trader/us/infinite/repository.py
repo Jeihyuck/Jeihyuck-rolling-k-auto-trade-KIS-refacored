@@ -115,6 +115,17 @@ class InfiniteRepository:
             """), {"trade_date": trade_date, "symbol": symbol}).scalar()
         return max(0.0, float(value or 0))
 
+    def next_full_exit_sequence(self, trade_date: date, cycle_id: str) -> int:
+        """Return a deterministic retry sequence after terminal full-exit orders."""
+        prefix = f"TQQQ_INF_V3:{cycle_id}:{trade_date.isoformat()}:SELL%"
+        with self.engine.connect() as conn:
+            value = conn.execute(text("""
+                SELECT COUNT(*) FROM us_orders
+                WHERE symbol='TQQQ' AND side='SELL' AND client_order_key LIKE :prefix
+                  AND status IN ('CANCELLED','REJECTED','EXPIRED')
+            """), {"prefix": prefix}).scalar()
+        return int(value or 0) + 1
+
     def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
         with self.engine.connect() as conn:
             return bool(conn.execute(text("""
