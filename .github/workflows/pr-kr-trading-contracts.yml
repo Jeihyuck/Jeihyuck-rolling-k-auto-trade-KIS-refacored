@@ -12,6 +12,20 @@ jobs:
   kr-contract-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       STRATEGY_ENV: practice
       KIS_ENV: practice
@@ -30,6 +44,7 @@ jobs:
       KR_PREP_AUX_WATCHLIST_TIMEOUT_SEC: "20"
       KR_PREP_AUX_REPORT_TIMEOUT_SEC: "30"
       KR_PREP_AUX_DEFAULT_TIMEOUT_SEC: "20"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,7 +62,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          pip install pytest ruff
+          pip install pytest ruff psycopg2-binary
 
       - name: Byte compile
         run: python -m compileall trader
@@ -58,6 +73,10 @@ jobs:
       - name: KR contract tests
         run: |
           pytest tests/test_kr_final30_contract.py -q
+
+      - name: Migration 0050 legacy schema hotfix tests
+        run: |
+          pytest tests/test_migration_0050_legacy_schema.py -q
           pytest tests/test_pm_completed_marker_retryable.py -q
           pytest tests/test_prep_core_marker.py -q
           pytest tests/test_prep_aux_timeout.py -q

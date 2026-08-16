@@ -24,15 +24,37 @@ ALTER TABLE positions ADD COLUMN IF NOT EXISTS portfolio_epoch_id TEXT;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ;
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS position_origin TEXT;
 
+-- Legacy production schemas store last_trade_at/updated_at as TEXT (see 0001_pbcore.sql),
+-- while newer schemas (trader/db/schema.py) use TIMESTAMPTZ. Casting both to ::text first
+-- normalizes the input type before parsing, so the COALESCE below never mixes TIMESTAMPTZ
+-- and TEXT arguments regardless of which legacy schema is present.
+CREATE OR REPLACE FUNCTION migration_0050_safe_timestamptz(v TEXT)
+RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN NULLIF(v, '')::timestamptz;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
+END;
+$$;
+
 -- Deterministic IDs make this migration idempotent and preserve every row.
 UPDATE positions
 SET position_cycle_id = COALESCE(position_cycle_id, 'legacy-cycle-' || position_id::text),
     portfolio_epoch_id = COALESCE(portfolio_epoch_id, 'legacy-epoch-' || env || '-' || strategy || '-' || sid || '-' || mode),
-    opened_at = COALESCE(opened_at, last_trade_at, updated_at, NOW()),
+    opened_at = COALESCE(
+        opened_at,
+        migration_0050_safe_timestamptz(last_trade_at::text),
+        migration_0050_safe_timestamptz(updated_at::text),
+        NOW()
+    ),
     position_origin = COALESCE(position_origin, 'RECOVERY'),
     status = 'CLOSED',
     closed_ts = COALESCE(closed_ts, NOW()),
     closed_reason = COALESCE(closed_reason, 'LEGACY_MIGRATION_0050');
+
+DROP FUNCTION IF EXISTS migration_0050_safe_timestamptz(TEXT);
 
 ALTER TABLE positions ALTER COLUMN position_cycle_id SET NOT NULL;
 ALTER TABLE positions ALTER COLUMN portfolio_epoch_id SET NOT NULL;
