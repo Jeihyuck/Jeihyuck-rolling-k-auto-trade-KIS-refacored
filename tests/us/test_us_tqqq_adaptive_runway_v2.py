@@ -16,7 +16,10 @@ CFG = InfiniteConfig()
 
 
 def overlay(state="NORMAL", **values):
-    return {"market_state": state, **values}
+    return {"market_state": state, "tqqq_context_quality": "ok",
+            "qqq_completed_close": 100, "qqq_ma50": 99, "qqq_ma200": 98,
+            "qqq_ma200_slope": .1, "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+            "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5, **values}
 
 
 def owned(**metadata):
@@ -26,6 +29,8 @@ def owned(**metadata):
 
 
 def decide(state, position, context):
+    if position.qty > 0 and position.orderable_qty is None:
+        position = replace(position, orderable_qty=position.qty)
     return evaluate(config=CFG, state=state, position=position,
                     trading_date=TODAY, overlay=context)
 
@@ -86,7 +91,7 @@ def test_capital_preservation_requires_bear_gap_and_ten_percent_step():
     assert decide(state, PositionSnapshot(qty=5, average_price=100, price=91), cp).reason == "capital_preservation_wait"
     assert decide(state, PositionSnapshot(qty=5, average_price=100, price=90), cp).action == Action.BUY
     assert decide(state, PositionSnapshot(qty=5, average_price=100, price=90),
-                  overlay("DEFENSE_RISK_OFF", qqq_drawdown_252=-.31)).reason == "capital_preservation_wait"
+                  overlay("DEFENSE_RISK_OFF", qqq_drawdown_252=-.31)).action == Action.BUY
 
 
 def test_age_alone_only_enables_capital_preservation_during_bear():
@@ -99,7 +104,8 @@ def test_age_alone_only_enables_capital_preservation_during_bear():
 @pytest.mark.parametrize(("context", "qty", "reason"), [
     ({"force_entry_block": True}, 0, "overlay_force_entry_block"),
     ({"allow_new_buy": False}, 0, "overlay_new_buy_block"),
-    ({"allow_new_buy": True, "allow_add_to_existing": False}, 5, "overlay_add_buy_block"),
+    # Standard add/gross overlay does not own the Infinite sleeve.
+    ({"allow_new_buy": True, "allow_add_to_existing": False}, 5, "average_buy"),
 ])
 def test_production_overlay_buy_gates_are_enforced_but_sell_remains_first(context, qty, reason):
     state = owned() if qty else InfiniteState()
@@ -112,7 +118,7 @@ def test_production_overlay_buy_gates_are_enforced_but_sell_remains_first(contex
 
 def test_context_quality_fails_closed_for_buys_but_not_take_profit_sell():
     context = overlay(tqqq_context_quality="insufficient")
-    assert decide(InfiniteState(), PositionSnapshot(price=50), context).reason == "tqqq_context_unavailable"
+    assert decide(InfiniteState(), PositionSnapshot(price=50), context).reason == "tqqq_required_market_data_missing"
     result = decide(owned(), PositionSnapshot(qty=2, average_price=50, price=55), context)
     assert result.action == Action.SELL
 

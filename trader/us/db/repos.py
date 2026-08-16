@@ -359,6 +359,9 @@ def save_order_intent(intent: dict, trade_date: str | None = None) -> bool:
                     "status": "PENDING",
                     "meta": _json_param({
                         **_parse_json_meta(intent.get("meta")),
+                        **{field: intent.get(field) for field in (
+                            "strategy_owner", "strategy_name", "strategy_version", "sleeve_id"
+                        ) if intent.get(field) is not None},
                         "env": str(intent.get("env") or os.getenv("KIS_ENV") or os.getenv("STRATEGY_ENV") or "unknown").lower(),
                     }),
                 },
@@ -1289,7 +1292,10 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                 f["client_order_key"] = order.get("client_order_key")
             order_meta = _parse_json_meta(order.get("meta"))
             fill_meta = dict(f.get("meta") or {}) if isinstance(f.get("meta"), dict) else {}
-            for field in ("session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source"):
+            for field in (
+                "session", "session_run_id", "session_generation", "tick_id", "prep_run_id", "run_source",
+                "strategy_owner", "strategy_name", "strategy_version", "sleeve_id",
+            ):
                 if order_meta.get(field) is not None:
                     fill_meta.setdefault(field, order_meta[field])
             if str(fill_meta.get("fill_evidence_type") or f.get("fill_evidence_type") or "") in {"KIS_ACTUAL", "KIS_EXECUTION_ACTUAL", "KIS_ORDER_DETAIL_ACTUAL", "KIS_ORDER_CUMULATIVE_ACTUAL"}:

@@ -100,6 +100,32 @@ class InfiniteRepository:
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
 
+    def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
+        """Capital reserved by unresolved BUY ACK/pending quantities."""
+        with self.engine.connect() as conn:
+            value = conn.execute(text("""
+                SELECT COALESCE(SUM(
+                    CASE WHEN qty_requested > 0 THEN
+                        committed_notional_usd * GREATEST(qty_requested-qty_filled,0) / qty_requested
+                    ELSE committed_notional_usd END
+                ),0)
+                FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol AND side='BUY'
+                  AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING','PARTIALLY_FILLED',
+                                 'RECONCILE_PENDING','ACK_DB_FAILED')
+            """), {"trade_date": trade_date, "symbol": symbol}).scalar()
+        return max(0.0, float(value or 0))
+
+    def next_full_exit_sequence(self, trade_date: date, cycle_id: str) -> int:
+        """Return a deterministic retry sequence after terminal full-exit orders."""
+        prefix = f"TQQQ_INF_V3:{cycle_id}:{trade_date.isoformat()}:SELL%"
+        with self.engine.connect() as conn:
+            value = conn.execute(text("""
+                SELECT COUNT(*) FROM us_orders
+                WHERE symbol='TQQQ' AND side='SELL' AND client_order_key LIKE :prefix
+                  AND status IN ('CANCELLED','REJECTED','EXPIRED')
+            """), {"prefix": prefix}).scalar()
+        return int(value or 0) + 1
+
     def has_pending_infinite_order(self, symbol: str = "TQQQ") -> bool:
         with self.engine.connect() as conn:
             return bool(conn.execute(text("""
@@ -109,6 +135,39 @@ class InfiniteRepository:
                   AND client_order_key LIKE 'TQQQ_INF_V3:%'
                 LIMIT 1
             """), {"symbol": symbol}).first())
+
+    def find_recovery_cycle_id(self, symbol: str = "TQQQ") -> str | None:
+        """Reuse the newest durable Infinite key without rewriting its identity."""
+        with self.engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT client_order_key FROM (
+                    SELECT client_order_key, created_at FROM us_orders WHERE symbol=:symbol
+                    UNION ALL
+                    SELECT client_order_key, created_at FROM us_order_intents WHERE symbol=:symbol
+                ) history
+                WHERE client_order_key LIKE 'TQQQ_INF_V3:%'
+                ORDER BY created_at DESC NULLS LAST LIMIT 1
+            """), {"symbol": symbol}).first()
+        key = str(row[0] if row else "")
+        parts = key.split(":")
+        return parts[1] if len(parts) >= 3 and parts[1] else None
+
+    def backfill_tqqq_attribution(self, strategy_version: str) -> None:
+        """Add ownership JSON only; quantities, prices, fills and keys are untouched."""
+        attribution = json.dumps({
+            "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+            "strategy_version": strategy_version, "sleeve_id": "TQQQ_INFINITE",
+            "ownership_source": "SYMBOL_INVARIANT_RECOVERY",
+        })
+        with self.engine.begin() as conn:
+            for table in ("us_order_intents", "us_orders", "us_fills"):
+                conn.execute(text(f"""
+                    UPDATE {table} SET meta=COALESCE(meta, '{{}}'::jsonb) || CAST(:attribution AS jsonb)
+                    WHERE symbol='TQQQ' AND (
+                        COALESCE(meta->>'strategy_owner','') <> 'TQQQ_INFINITE'
+                        OR COALESCE(meta->>'sleeve_id','') <> 'TQQQ_INFINITE'
+                    )
+                """), {"attribution": attribution})
 
     def fill_accounting(self, state: InfiniteState, trading_date: date) -> tuple[float, float, float, date | None, float | None]:
         """Return cycle BUY total, today's BUY total, cycle SELL total, last BUY date and first fill price."""
@@ -236,6 +295,11 @@ class InfiniteRepository:
                            rebound_cooldown: int = 3) -> InfiniteState:
         stats = self.cycle_fill_stats(state, trading_date)
         buys, last_buy, first_price = stats["total_buy_notional"], stats["last_buy_date"], stats["first_fill_price"]
+        if broker_qty > 0 and buys <= 0:
+            # Missing historical attribution must not erase a real KIS holding.
+            # The broker balance is the recovery notional authority; no qty,
+            # average price, fill or client key is synthesized or rewritten.
+            buys = broker_qty * broker_average_price
         core = min(buys, core_cap)
         reserve = max(0.0, buys - core)
         anchor = state.anchor_price or first_price or (broker_average_price if broker_qty > 0 else None)
@@ -253,7 +317,20 @@ class InfiniteRepository:
                            last_exit_date=trading_date, anchor_price=None, core_filled_notional=0,
                            reserve_filled_notional=0, reserve_unlocked=False, market_crash_streak=0,
                            cycle_age_trading_days=age)
-        metadata = {**state.metadata, "last_buy_fill_price": stats["last_buy_fill_price"]}
+        actual_last_buy_price = (stats["last_buy_fill_price"]
+                                 or state.metadata.get("last_buy_fill_price"))
+        metadata = {**state.metadata, "last_buy_fill_price": actual_last_buy_price,
+                    "broker_qty": broker_qty, "broker_average_price": broker_average_price}
+        if actual_last_buy_price:
+            metadata.update(buy_reference_price=actual_last_buy_price,
+                            buy_reference_source="ATTRIBUTED_BUY_FILL",
+                            recovery_accounting_uncertain=False)
+        elif broker_qty > 0 and broker_average_price > 0:
+            # This is explicitly a conservative decision reference, not a
+            # fabricated fill.  Keep last_buy_fill_price empty so accounting
+            # and rebound confirmation cannot mistake the fallback for a fill.
+            metadata.update(buy_reference_price=broker_average_price,
+                            buy_reference_source="KIS_BROKER_AVG_FALLBACK")
         probe_fill_date = stats.get("last_rebound_probe_fill_date")
         if probe_fill_date:
             from datetime import timedelta

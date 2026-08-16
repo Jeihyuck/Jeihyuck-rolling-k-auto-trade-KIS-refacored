@@ -12,11 +12,17 @@ from trader.us.infinite.strategy import evaluate
 
 TODAY = date(2026, 8, 11)
 CFG = InfiniteConfig(enabled=True)
-NORMAL = {"market_state": "NORMAL"}
+NORMAL = {"market_state": "NORMAL", "tqqq_context_quality": "ok",
+          "qqq_completed_close": 100, "qqq_ma50": 99, "qqq_ma200": 98,
+          "qqq_ma200_slope": .1, "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+          "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5}
 
 
 def decide(state=None, position=None, **kwargs):
-    return evaluate(config=CFG, state=state, position=position or PositionSnapshot(price=50),
+    position = position or PositionSnapshot(price=50)
+    if position.qty > 0 and position.orderable_qty is None:
+        position = replace(position, orderable_qty=position.qty)
+    return evaluate(config=CFG, state=state, position=position,
                     trading_date=TODAY, overlay=NORMAL, **kwargs)
 
 
@@ -33,8 +39,8 @@ def test_average_buy_premium(price, action):
 
 
 @pytest.mark.parametrize(("flags", "reason"), [
-    ({"pending_buy": True}, "pending_buy"),
-    ({"pending_sell": True}, "pending_sell"),
+    ({"pending_buy": True}, "tqqq_pending_order_exists"),
+    ({"pending_sell": True}, "tqqq_pending_order_exists"),
     ({"daily_filled_buy_notional": 250}, "daily_buy_limit"),
 ])
 def test_duplicate_and_pending_protection(flags, reason):
@@ -126,19 +132,19 @@ def test_corrupt_state_fails_closed(state):
     assert decide(state).action == Action.BLOCK
 
 
-def test_orphan_broker_position_fails_closed():
+def test_tqqq_broker_position_recovers_by_symbol_invariant():
     result = decide(None, PositionSnapshot(qty=1, average_price=50, price=50))
-    assert (result.action, result.reason) == (Action.BLOCK, "orphan_position")
+    assert result.reason != "orphan_position"
 
 
 def test_pause_blocks_buy_but_keeps_take_profit_sell():
     paused = InfiniteConfig(enabled=True, real_order=True, allow_buy=False, allow_sell=True)
     state = InfiniteState(cycle_id="c", status=Status.ACTIVE)
     buy = evaluate(config=paused, state=state,
-                   position=PositionSnapshot(qty=1, average_price=50, price=50),
+                   position=PositionSnapshot(qty=1, orderable_qty=1, average_price=50, price=50),
                    trading_date=TODAY, overlay=NORMAL)
     sell = evaluate(config=paused, state=state,
-                    position=PositionSnapshot(qty=3, average_price=50, price=55),
+                    position=PositionSnapshot(qty=3, orderable_qty=3, average_price=50, price=55),
                     trading_date=TODAY, overlay=NORMAL)
     assert (buy.action, buy.reason) == (Action.BLOCK, "buy_permission_paused")
     assert (sell.action, sell.qty) == (Action.SELL, 3)
@@ -147,6 +153,6 @@ def test_pause_blocks_buy_but_keeps_take_profit_sell():
 def test_sell_permission_can_be_independently_disabled():
     config = InfiniteConfig(enabled=True, allow_buy=False, allow_sell=False)
     result = evaluate(config=config, state=InfiniteState(cycle_id="c", status=Status.ACTIVE),
-                      position=PositionSnapshot(qty=3, average_price=50, price=55),
+                      position=PositionSnapshot(qty=3, orderable_qty=3, average_price=50, price=55),
                       trading_date=TODAY, overlay=NORMAL)
     assert (result.action, result.reason) == (Action.BLOCK, "sell_permission_disabled")

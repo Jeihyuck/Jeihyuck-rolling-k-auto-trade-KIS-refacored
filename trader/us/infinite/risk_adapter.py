@@ -11,6 +11,8 @@ class RiskDecision:
     verified_rebound: bool = False
     market_state: str = ""
     market_regime: str = ""
+    buy_multiplier: float = 1.0
+    regime_reserve_permission: bool = False
 
 
 CANONICAL_MARKET_STATES = {
@@ -18,6 +20,39 @@ CANONICAL_MARKET_STATES = {
     "DEFENSE_RISK_OFF", "DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED",
     "DEFENSE_CRASH_REBOUND",
 }
+
+
+def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]:
+    """Resolve labels into (regime, multiplier, reserve permission, entry, reason).
+
+    The third value is a per-tick permission, never persistent unlock state.
+    Only the policy-state machine may mutate ``InfiniteState.reserve_unlocked``.
+    """
+    o = overlay or {}
+    raw_state = str(o.get("market_state") or "").upper()
+    raw_regime = str(o.get("market_regime") or "").upper()
+    combined = {raw_state, raw_regime}
+    crash = next((value for value in combined if "CRASH" in value and "REBOUND" not in value), "")
+    if crash:
+        name = "DEFENSE_CRASH_CONFIRMED" if "CONFIRMED" in crash else "DEFENSE_CRASH_PENDING"
+        return name, 0.0, False, False, "crash_policy"
+    if any("CAPITAL_PRESERVATION" in value for value in combined):
+        return "CAPITAL_PRESERVATION", 0.5, False, True, "capital_preservation_sparse_evaluation"
+    if any(value in {"RISK_OFF", "DEFENSIVE", "DEFENSE_RISK_OFF"} for value in combined):
+        return "RISK_OFF" if any("RISK_OFF" in value for value in combined) else "DEFENSIVE", 0.5, False, True, "defensive_sparse_evaluation"
+    if "CHOP_HIGH_VOL" in combined:
+        return "CHOP_HIGH_VOL", 0.5, False, True, "high_volatility_chop_sparse_evaluation"
+    if "DEFENSE_CRASH_REBOUND" in combined:
+        return "DEFENSE_CRASH_REBOUND", 0.5, True, True, "verified_crash_rebound"
+    if "DEFENSE_CAUTION" in combined:
+        return "DEFENSE_CAUTION", 0.5, False, True, "defense_caution"
+    if "NEUTRAL" in combined or "NORMAL" in combined:
+        return "NEUTRAL", 0.75, False, True, "neutral_policy"
+    if "STRONG_RISK_ON" in combined:
+        return "STRONG_RISK_ON", 1.0, True, True, "strong_risk_on"
+    if "RISK_ON" in combined:
+        return "RISK_ON", 1.0, True, True, "risk_on"
+    return "UNKNOWN", 0.0, False, False, "unknown_regime"
 
 
 def assess_market_risk(overlay: dict | None) -> RiskDecision:

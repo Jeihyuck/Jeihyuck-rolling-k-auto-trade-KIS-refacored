@@ -43,7 +43,10 @@ def classify_long_trend(overlay: dict | None, structural_bear_seen: bool = False
 def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: PositionSnapshot,
              trading_date: date, pending_buy: bool = False, pending_sell: bool = False,
              daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
-             trading_sessions: frozenset[date] | None = None) -> Decision:
+             trading_sessions: frozenset[date] | None = None,
+             entry_allowed: bool = True, buy_multiplier: float = 1.0,
+             regime_reserve_permission: bool = True,
+             effective_regime_name: str = "") -> Decision:
     """Pure exit-first strategy decision; broker position is always authoritative."""
     if not config.enabled:
         return Decision(Action.WAIT, "feature_disabled")
@@ -54,7 +57,16 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     except (TypeError, ValueError) as exc:
         return Decision(Action.BLOCK, f"state_or_config_corrupt:{exc}")
     if position.qty > 0 and state is None:
-        return Decision(Action.BLOCK, "orphan_position")
+        recovered_notional = position.qty * position.average_price
+        state = InfiniteState(
+            symbol=config.symbol, cycle_id="SYMBOL_INVARIANT_RECOVERY", status=Status.ACTIVE,
+            anchor_price=position.average_price or None,
+            core_filled_notional=min(recovered_notional, config.core_capital_usd),
+            reserve_filled_notional=max(0.0, recovered_notional - config.core_capital_usd),
+            metadata={"strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
+                      "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
+                      "ownership_source": "SYMBOL_INVARIANT_RECOVERY"},
+        )
     if state is None:
         state = InfiniteState(symbol=config.symbol)
 
@@ -67,9 +79,16 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         if not config.allow_sell:
             return Decision(Action.BLOCK, "sell_permission_disabled")
         if pending_sell:
-            return Decision(Action.BLOCK, "pending_sell", next_status=Status.EXIT_PENDING)
-        return Decision(Action.SELL, "take_profit", qty=position.qty,
-                        notional=position.qty * position.price, next_status=Status.EXIT_PENDING)
+            return Decision(Action.BLOCK, "tqqq_full_exit_pending", next_status=Status.EXIT_PENDING)
+        if position.orderable_qty is None:
+            return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
+        if position.orderable_qty <= 0:
+            return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
+        if position.orderable_qty != position.qty:
+            return Decision(Action.BLOCK, "tqqq_full_exit_qty_not_ready")
+        sell_qty = position.qty
+        return Decision(Action.SELL, "take_profit", qty=sell_qty,
+                        notional=sell_qty * position.price, next_status=Status.EXIT_PENDING)
     if state.status == Status.EXIT_PENDING:
         if position.qty == 0:
             return Decision(Action.WAIT, "confirmed_exit_complete", next_status=Status.COMPLETE)
@@ -77,9 +96,11 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if position.qty == 0 and state.status == Status.COMPLETE and state.last_exit_date == trading_date:
         return Decision(Action.BLOCK, "same_day_cycle_restart")
     if pending_sell:
-        return Decision(Action.BLOCK, "pending_sell")
+        return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
-        return Decision(Action.BLOCK, "pending_buy")
+        return Decision(Action.BLOCK, "tqqq_pending_order_exists")
+    if not entry_allowed:
+        return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
@@ -88,18 +109,52 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if not risk.allow_buy:
         return Decision(Action.BLOCK, risk.reason)
     overlay = overlay or {}
+    required = {
+        "qqq_completed_close": True, "qqq_ma50": True, "qqq_ma200": True,
+        "qqq_ma200_slope": False, "qqq_20d_return": False, "qqq_drawdown_252": False,
+        "qqq_realized_vol_20d": False, "qqq_trend_efficiency_20d": False,
+    }
+    valid_context = overlay.get("tqqq_context_quality") == "ok"
+    valid_context = valid_context and not any(bool(overlay.get(flag)) for flag in (
+        "qqq_stale", "qqq_suspect", "qqq_degraded", "tqqq_context_stale",
+        "tqqq_context_suspect", "tqqq_context_degraded",
+    ))
+    for field, positive in required.items():
+        try:
+            value = float(overlay[field])
+            valid_context = valid_context and math.isfinite(value) and (value > 0 if positive else True)
+            if field == "qqq_realized_vol_20d":
+                valid_context = valid_context and value >= 0
+        except (KeyError, TypeError, ValueError):
+            valid_context = False
+    if not valid_context:
+        return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
+    if position.qty <= 0 and effective_regime_name in {
+        "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
+    }:
+        return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
     if overlay.get("force_entry_block") is True:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
     if position.qty <= 0 and overlay.get("allow_new_buy") is False:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
-        return Decision(Action.BLOCK, "overlay_add_buy_block")
-    if "tqqq_context_quality" in overlay and overlay.get("tqqq_context_quality") != "ok":
-        return Decision(Action.BLOCK, "tqqq_context_unavailable")
+        # Standard gross/cluster overlays do not own this sleeve. Only an
+        # explicitly TQQQ-scoped capital flag may pause its adds.
+        if overlay.get("tqqq_capital_preservation"):
+            return Decision(Action.BLOCK, "tqqq_capital_preservation")
 
     metadata = state.metadata or {}
+    policy_regime = effective_regime_name or risk.market_state
+    recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
+                              and not metadata.get("last_buy_fill_price"))
+    # Uncertain recovery may resume conservative core buys, but can never use
+    # reserve or a bullish/recovery premium until attributed fill evidence is
+    # found.  The broker average remains a decision reference, never a fill.
+    effective_reserve_available = bool(state.reserve_unlocked and regime_reserve_permission
+                                       and not recovery_uncertain)
+    policy_overlay = {**overlay, "market_state": policy_regime}
     long_trend = str(metadata.get("long_trend") or classify_long_trend(
-        overlay, bool(metadata.get("structural_bear_seen"))))
+        policy_overlay, bool(metadata.get("structural_bear_seen"))))
     try:
         drawdown = float((overlay or {}).get("qqq_drawdown_252"))
     except (TypeError, ValueError):
@@ -107,21 +162,31 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     try:
         rv20 = float((overlay or {}).get("qqq_realized_vol_20d"))
         efficiency = float((overlay or {}).get("qqq_trend_efficiency_20d"))
-        chop = rv20 >= config.chop_rv20_min and efficiency <= config.chop_efficiency_max
+        chop = policy_regime == "CHOP_HIGH_VOL" or (
+            rv20 >= config.chop_rv20_min and efficiency <= config.chop_efficiency_max)
     except (TypeError, ValueError):
         chop = False
-    capital_preservation = long_trend == "BEAR" and (
+    capital_preservation = policy_regime == "CAPITAL_PRESERVATION" or (long_trend == "BEAR" and (
         drawdown <= config.capital_preservation_drawdown
         or state.cycle_age_trading_days >= config.max_cycle_age_trading_days
         or state.core_filled_notional >= config.capital_preservation_core_used
-    )
-    last_price = metadata.get("last_buy_fill_price")
+    ))
+    last_price = metadata.get("last_buy_fill_price") or metadata.get("buy_reference_price")
     try: last_price = float(last_price) if last_price is not None else None
     except (TypeError, ValueError): last_price = None
+    if recovery_uncertain:
+        try:
+            conservative_reference = float(metadata.get("buy_reference_price") or position.average_price)
+        except (TypeError, ValueError):
+            conservative_reference = 0.0
+        if conservative_reference <= 0:
+            return Decision(Action.BLOCK, "tqqq_recovery_reconcile_required")
+        if position.price > conservative_reference:
+            return Decision(Action.WAIT, "tqqq_recovery_price_above_broker_average")
     days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
                   if state.last_buy_date else 10_000)
 
-    if risk.verified_rebound:
+    if policy_regime == "DEFENSE_CRASH_REBOUND":
         probe_date = metadata.get("rebound_probe_date")
         try:
             probe_date = date.fromisoformat(str(probe_date)) if probe_date else None
@@ -132,7 +197,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         ):
             return Decision(Action.BLOCK, "rebound_cooldown")
     elif capital_preservation:
-        allowed = (position.qty > 0 and risk.market_state in {"NORMAL", "DEFENSE_CAUTION"}
+        allowed = (position.qty > 0
                    and days_since >= config.capital_preservation_gap and last_price
                    and position.price <= last_price * (1 - config.capital_preservation_step)
                    and position.average_price > 0 and position.price <= position.average_price
@@ -142,12 +207,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     elif chop:
         if position.qty <= 0:
             return Decision(Action.BLOCK, "chop_high_vol_new_cycle_block")
-        allowed = (risk.market_state != "DEFENSE_RISK_OFF" and days_since >= config.chop_gap and last_price
+        allowed = (days_since >= config.chop_gap and last_price
                    and position.price <= last_price * (1 - config.chop_step)
                    and position.average_price > 0 and position.price <= position.average_price)
         if not allowed:
             return Decision(Action.BLOCK, "chop_high_vol_wait")
-    elif risk.market_state == "DEFENSE_RISK_OFF":
+    elif policy_regime in {"RISK_OFF", "DEFENSIVE"}:
         allowed = (position.qty > 0 and long_trend == "BEAR" and days_since >= config.bear_fallback_gap
                    and last_price and position.price <= last_price * (1 - config.bear_step)
                    and position.average_price > 0 and position.price <= position.average_price)
@@ -159,15 +224,17 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         if not (step or fallback):
             return Decision(Action.BLOCK, "bear_runway_wait")
     elif position.qty > 0:
-        gap = 3 if risk.market_state == "DEFENSE_CAUTION" else (1 if long_trend == "BULL" and risk.market_state in {"STRONG_RISK_ON", "RISK_ON"} else 2)
+        gap = 3 if policy_regime == "DEFENSE_CAUTION" else (1 if policy_regime in {"STRONG_RISK_ON", "RISK_ON"} else 2)
         if days_since < gap:
             return Decision(Action.BLOCK, "routine_gap_wait")
-        premium = (0.02 if state.reserve_unlocked and long_trend == "RECOVERY" else
-                   config.buy_premium_pct if long_trend == "BULL" and risk.market_state in {"STRONG_RISK_ON", "RISK_ON"} else 0.0)
+        premium = (0.02 if effective_reserve_available and long_trend == "RECOVERY" else
+                   config.buy_premium_pct if long_trend == "BULL" and policy_regime in {"STRONG_RISK_ON", "RISK_ON"} else 0.0)
+        if recovery_uncertain:
+            premium = 0.0
         if position.average_price <= 0 or position.price > position.average_price * (1 + premium):
             return Decision(Action.WAIT, "price_above_buy_premium")
 
-    if state.reserve_unlocked and state.core_filled_notional >= config.core_capital_usd and position.qty > 0:
+    if effective_reserve_available and state.core_filled_notional >= config.core_capital_usd and position.qty > 0:
         if long_trend != "RECOVERY" or days_since < 2 or position.price > position.average_price * 1.02:
             return Decision(Action.BLOCK, "recovery_reserve_wait")
 
@@ -179,12 +246,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         )
         if not deep_bear:
             return Decision(Action.BLOCK, "deep_bear_core_locked")
-    if core_left <= 0 and not state.reserve_unlocked:
+    if core_left <= 0 and not effective_reserve_available:
         return Decision(Action.BLOCK, "reserve_locked")
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
-    budget = min(config.unit_usd, available, total_left, daily_left)
+    budget = min(config.unit_usd * max(0.0, buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)
     notional = qty * position.price
     if qty < 1:

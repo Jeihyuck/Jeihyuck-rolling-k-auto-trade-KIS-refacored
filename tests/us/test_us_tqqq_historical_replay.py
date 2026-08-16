@@ -9,7 +9,11 @@ from trader.us.market_state_overlay import _market_returns, calculate_qqq_long_c
 
 
 def bar(day, price=50, state="NORMAL", **context):
-    return ReplayBar(day, 100, price, {"market_state": state, **context})
+    defaults = {"tqqq_context_quality": "ok", "qqq_completed_close": 100,
+                "qqq_ma50": 99, "qqq_ma200": 98, "qqq_ma200_slope": .1,
+                "qqq_20d_return": .02, "qqq_drawdown_252": -.05,
+                "qqq_realized_vol_20d": .2, "qqq_trend_efficiency_20d": .5}
+    return ReplayBar(day, 100, price, {"market_state": state, **defaults, **context})
 
 
 def test_replay_calendar_is_exactly_completed_bar_dates_not_weekdays():
@@ -126,7 +130,35 @@ def test_first_buy_resets_precycle_policy_metadata_before_fill_is_applied():
     result = run_replay([bar(date(2023, 1, 3), 50)], initial_state=polluted)
     state = result["final_state"]
     assert state.cycle_id == "replay-1" and state.cycle_start_date == date(2023, 1, 3)
-    assert state.core_filled_notional == 250 and state.reserve_filled_notional == 0
+    # NORMAL resolves to the production NEUTRAL 0.75 multiplier; whole shares
+    # at $50 therefore deploy $150 rather than the old replay-only $250.
+    assert state.core_filled_notional == 150 and state.reserve_filled_notional == 0
     assert not state.material_market_crash and not state.reserve_unlocked
     assert state.market_crash_streak == state.cycle_age_trading_days == 0
     assert state.metadata == {"last_buy_fill_price": 50, "long_trend": None}
+
+
+def test_replay_reports_open_cycle_and_risk_off_audit_metrics():
+    bars = [
+        bar(date(2022, 1, 3), 50),
+        bar(date(2022, 1, 4), 49, "DEFENSE_RISK_OFF"),
+        bar(date(2022, 1, 14), 44, "DEFENSE_RISK_OFF"),
+    ]
+    result = run_replay(bars)
+    assert result["incomplete_cycle_count"] == 1
+    assert result["final_qty"] > 0
+    assert result["maximum_cycle_duration_sessions"] == 2
+    assert result["risk_off_buy_count"] == 0
+    assert result["regime_buy_counts"] == {"NEUTRAL": 1}
+    assert result["maximum_deployed_notional"] <= 10_000
+    assert result["daily_cap_violation_count"] == 0
+    assert result["final_evaluation_amount"] == result["lowest_cash"] + result["final_qty"] * 44
+
+
+def test_replay_uses_production_effective_regime_for_conflicts():
+    bars = [bar(date(2022, 1, 3), 50, "STRONG_RISK_ON",
+                market_regime="DEFENSIVE")]
+    result = run_replay(bars)
+    assert result["total_buy_count"] == 0
+    assert result["final_qty"] == 0
+    assert result["block_reason_counts"] == {"tqqq_regime_new_cycle_block": 1}
