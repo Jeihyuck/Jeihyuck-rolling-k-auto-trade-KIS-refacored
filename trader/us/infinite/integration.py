@@ -100,6 +100,7 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
             "strategy_owner": "TQQQ_INFINITE", "strategy_name": "TQQQ_INFINITE",
             "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
             "ownership_source": "SYMBOL_INVARIANT_RECOVERY",
+            "recovery_accounting_uncertain": True,
             "broker_qty": broker.qty, "broker_orderable_qty": broker.orderable_qty,
             "broker_average_price": broker.average_price,
         },
@@ -126,6 +127,11 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         repository.ensure_schema()
         raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
         broker = _position(raw, price)
+        logger.info("[TQQQ_INF][OWNERSHIP] symbol=TQQQ owner=TQQQ_INFINITE holding_qty=%s orderable_qty=%s",
+                    broker.qty, broker.orderable_qty)
+        logger.info("[TQQQ_INF][MARKET_DATA] context_quality=%s quote_stale=%s qqq_close=%s qqq_ma50=%s qqq_ma200=%s",
+                    overlay.get("tqqq_context_quality"), int(quote_stale), overlay.get("qqq_completed_close"),
+                    overlay.get("qqq_ma50"), overlay.get("qqq_ma200"))
         state = repository.load_state(symbol=config.symbol)
         if state is None:
             if broker.qty > 0:
@@ -179,6 +185,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                                   broker_average_price=broker.average_price,
                                                   core_cap=config.core_capital_usd,
                                                   rebound_cooldown=config.rebound_cooldown)
+            if state.metadata.get("last_buy_fill_price"):
+                state = replace(state, metadata={**state.metadata, "recovery_accounting_uncertain": False})
             state = update_adaptive_policy_state(state=state, trading_date=trading_date,
                                                  overlay=overlay, config=config)
             # A cycle becomes ACTIVE only from broker/fill evidence, never from
@@ -208,6 +216,17 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             entry_allowed=entry_allowed, buy_multiplier=multiplier,
                             regime_reserve_permission=regime_reserve_permission,
                             effective_regime_name=regime)
+        logger.info("[TQQQ_INF][BUY_POLICY] effective_regime=%s multiplier=%s entry_evaluation_allowed=%s final_notional=%s reason=%s",
+                    regime, multiplier, int(entry_allowed), decision.notional, decision.reason)
+        calculated_return = ((broker.price / broker.average_price) - 1
+                             if broker.average_price > 0 and broker.price > 0 else None)
+        logger.info("[TQQQ_INF][FULL_EXIT] holding_qty=%s orderable_qty=%s pending_sell=%s broker_avg=%s executable_price=%s calculated_return=%s target_return=%s requested_full_exit_qty=%s cycle_id=%s action=%s block_reason=%s",
+                    broker.qty, broker.orderable_qty, int(pending_sell), broker.average_price, broker.price,
+                    calculated_return, config.take_profit_pct, decision.qty, getattr(state, "cycle_id", None),
+                    decision.action.value, decision.reason if decision.action != Action.SELL else "")
+        logger.info("[TQQQ_INF][RECONCILE] broker_qty=%s state_deployed=%s ownership_source=%s",
+                    broker.qty, getattr(state, "total_filled_notional", None),
+                    (getattr(state, "metadata", {}) or {}).get("ownership_source"))
         if decision.reason == "unknown_market_risk":
             logger.warning("[TQQQ_INF][MARKET_STATE_CONTRACT_MISMATCH] market_state=%s", overlay.get("market_state"))
         md = getattr(state, "metadata", {}) or {}
@@ -291,6 +310,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "tqqq_max_total_capital_usd": config.max_total_capital_usd},
         }
         result = route(intent)
+        logger.info("[TQQQ_INF][ORDER_STATUS] side=%s requested_qty=%s status=%s cycle_id=%s",
+                    decision.action.value, decision.qty, result.get("status", "UNKNOWN"), state.cycle_id)
         return {"status": result.get("status", "UNKNOWN"), "decision": decision, "orders": [result]}
     except Exception as exc:
         logger.exception("[TQQQ_INF][BLOCK] reason=isolated_exception error=%s", exc)

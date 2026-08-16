@@ -91,7 +91,7 @@ def test_capital_preservation_requires_bear_gap_and_ten_percent_step():
     assert decide(state, PositionSnapshot(qty=5, average_price=100, price=91), cp).reason == "capital_preservation_wait"
     assert decide(state, PositionSnapshot(qty=5, average_price=100, price=90), cp).action == Action.BUY
     assert decide(state, PositionSnapshot(qty=5, average_price=100, price=90),
-                  overlay("DEFENSE_RISK_OFF", qqq_drawdown_252=-.31)).reason == "capital_preservation_wait"
+                  overlay("DEFENSE_RISK_OFF", qqq_drawdown_252=-.31)).action == Action.BUY
 
 
 def test_age_alone_only_enables_capital_preservation_during_bear():

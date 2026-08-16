@@ -32,17 +32,18 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
     raw_state = str(o.get("market_state") or "").upper()
     raw_regime = str(o.get("market_regime") or "").upper()
     combined = {raw_state, raw_regime}
+    crash = next((value for value in combined if "CRASH" in value and "REBOUND" not in value), "")
+    if crash:
+        name = "DEFENSE_CRASH_CONFIRMED" if "CONFIRMED" in crash else "DEFENSE_CRASH_PENDING"
+        return name, 0.0, False, False, "crash_policy"
     if any("CAPITAL_PRESERVATION" in value for value in combined):
         return "CAPITAL_PRESERVATION", 0.5, False, True, "capital_preservation_sparse_evaluation"
-    if "DEFENSE_CRASH_REBOUND" in combined:
-        return "DEFENSE_CRASH_REBOUND", 0.5, True, True, "verified_crash_rebound"
-    if any("CRASH" in value for value in combined):
-        name = "DEFENSE_CRASH" if any("DEFENSE" in value for value in combined) else "CRASH"
-        return name, 0.0, False, False, "crash_policy"
-    if "CHOP_HIGH_VOL" in combined:
-        return "CHOP_HIGH_VOL", 0.5, False, True, "high_volatility_chop_sparse_evaluation"
     if any(value in {"RISK_OFF", "DEFENSIVE", "DEFENSE_RISK_OFF"} for value in combined):
         return "RISK_OFF" if any("RISK_OFF" in value for value in combined) else "DEFENSIVE", 0.5, False, True, "defensive_sparse_evaluation"
+    if "CHOP_HIGH_VOL" in combined:
+        return "CHOP_HIGH_VOL", 0.5, False, True, "high_volatility_chop_sparse_evaluation"
+    if "DEFENSE_CRASH_REBOUND" in combined:
+        return "DEFENSE_CRASH_REBOUND", 0.5, True, True, "verified_crash_rebound"
     if "DEFENSE_CAUTION" in combined:
         return "DEFENSE_CAUTION", 0.5, False, True, "defense_caution"
     if "NEUTRAL" in combined or "NORMAL" in combined:

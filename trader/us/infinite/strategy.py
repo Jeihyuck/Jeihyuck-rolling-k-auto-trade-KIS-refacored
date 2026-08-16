@@ -79,12 +79,14 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         if not config.allow_sell:
             return Decision(Action.BLOCK, "sell_permission_disabled")
         if pending_sell:
-            return Decision(Action.BLOCK, "pending_sell", next_status=Status.EXIT_PENDING)
+            return Decision(Action.BLOCK, "tqqq_full_exit_pending", next_status=Status.EXIT_PENDING)
         if position.orderable_qty is None:
             return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
         if position.orderable_qty <= 0:
             return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
-        sell_qty = min(position.qty, position.orderable_qty)
+        if position.orderable_qty != position.qty:
+            return Decision(Action.BLOCK, "tqqq_full_exit_qty_not_ready")
+        sell_qty = position.qty
         return Decision(Action.SELL, "take_profit", qty=sell_qty,
                         notional=sell_qty * position.price, next_status=Status.EXIT_PENDING)
     if state.status == Status.EXIT_PENDING:
@@ -142,9 +144,14 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "tqqq_capital_preservation")
 
     metadata = state.metadata or {}
+    policy_regime = effective_regime_name or risk.market_state
+    if position.qty > 0 and metadata.get("recovery_accounting_uncertain") \
+            and not metadata.get("last_buy_fill_price"):
+        return Decision(Action.BLOCK, "tqqq_recovery_reconcile_required")
     effective_reserve_available = bool(state.reserve_unlocked and regime_reserve_permission)
+    policy_overlay = {**overlay, "market_state": policy_regime}
     long_trend = str(metadata.get("long_trend") or classify_long_trend(
-        overlay, bool(metadata.get("structural_bear_seen"))))
+        policy_overlay, bool(metadata.get("structural_bear_seen"))))
     try:
         drawdown = float((overlay or {}).get("qqq_drawdown_252"))
     except (TypeError, ValueError):
@@ -152,21 +159,22 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     try:
         rv20 = float((overlay or {}).get("qqq_realized_vol_20d"))
         efficiency = float((overlay or {}).get("qqq_trend_efficiency_20d"))
-        chop = rv20 >= config.chop_rv20_min and efficiency <= config.chop_efficiency_max
+        chop = policy_regime == "CHOP_HIGH_VOL" or (
+            rv20 >= config.chop_rv20_min and efficiency <= config.chop_efficiency_max)
     except (TypeError, ValueError):
         chop = False
-    capital_preservation = long_trend == "BEAR" and (
+    capital_preservation = policy_regime == "CAPITAL_PRESERVATION" or (long_trend == "BEAR" and (
         drawdown <= config.capital_preservation_drawdown
         or state.cycle_age_trading_days >= config.max_cycle_age_trading_days
         or state.core_filled_notional >= config.capital_preservation_core_used
-    )
+    ))
     last_price = metadata.get("last_buy_fill_price")
     try: last_price = float(last_price) if last_price is not None else None
     except (TypeError, ValueError): last_price = None
     days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
                   if state.last_buy_date else 10_000)
 
-    if risk.verified_rebound:
+    if policy_regime == "DEFENSE_CRASH_REBOUND":
         probe_date = metadata.get("rebound_probe_date")
         try:
             probe_date = date.fromisoformat(str(probe_date)) if probe_date else None
@@ -177,7 +185,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         ):
             return Decision(Action.BLOCK, "rebound_cooldown")
     elif capital_preservation:
-        allowed = (position.qty > 0 and risk.market_state in {"NORMAL", "DEFENSE_CAUTION"}
+        allowed = (position.qty > 0
                    and days_since >= config.capital_preservation_gap and last_price
                    and position.price <= last_price * (1 - config.capital_preservation_step)
                    and position.average_price > 0 and position.price <= position.average_price
@@ -187,12 +195,12 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     elif chop:
         if position.qty <= 0:
             return Decision(Action.BLOCK, "chop_high_vol_new_cycle_block")
-        allowed = (risk.market_state != "DEFENSE_RISK_OFF" and days_since >= config.chop_gap and last_price
+        allowed = (days_since >= config.chop_gap and last_price
                    and position.price <= last_price * (1 - config.chop_step)
                    and position.average_price > 0 and position.price <= position.average_price)
         if not allowed:
             return Decision(Action.BLOCK, "chop_high_vol_wait")
-    elif risk.market_state == "DEFENSE_RISK_OFF":
+    elif policy_regime in {"RISK_OFF", "DEFENSIVE"}:
         allowed = (position.qty > 0 and long_trend == "BEAR" and days_since >= config.bear_fallback_gap
                    and last_price and position.price <= last_price * (1 - config.bear_step)
                    and position.average_price > 0 and position.price <= position.average_price)
@@ -204,11 +212,11 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         if not (step or fallback):
             return Decision(Action.BLOCK, "bear_runway_wait")
     elif position.qty > 0:
-        gap = 3 if risk.market_state == "DEFENSE_CAUTION" else (1 if long_trend == "BULL" and risk.market_state in {"STRONG_RISK_ON", "RISK_ON"} else 2)
+        gap = 3 if policy_regime == "DEFENSE_CAUTION" else (1 if policy_regime in {"STRONG_RISK_ON", "RISK_ON"} else 2)
         if days_since < gap:
             return Decision(Action.BLOCK, "routine_gap_wait")
         premium = (0.02 if effective_reserve_available and long_trend == "RECOVERY" else
-                   config.buy_premium_pct if long_trend == "BULL" and risk.market_state in {"STRONG_RISK_ON", "RISK_ON"} else 0.0)
+                   config.buy_premium_pct if long_trend == "BULL" and policy_regime in {"STRONG_RISK_ON", "RISK_ON"} else 0.0)
         if position.average_price <= 0 or position.price > position.average_price * (1 + premium):
             return Decision(Action.WAIT, "price_above_buy_premium")
 

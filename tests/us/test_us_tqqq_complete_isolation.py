@@ -5,7 +5,7 @@ import pytest
 
 from trader.us.infinite.config import InfiniteConfig
 from trader.us.infinite.integration import exclude_owned, recover_state_from_broker
-from trader.us.infinite.models import Action, InfiniteState, PositionSnapshot
+from trader.us.infinite.models import Action, InfiniteState, PositionSnapshot, Status
 from trader.us.infinite.policy_state import update_adaptive_policy_state
 from trader.us.infinite.risk_adapter import effective_regime
 from trader.us.infinite.strategy import evaluate
@@ -253,14 +253,21 @@ def test_kis_balance_recovers_exact_tqqq_state_without_orphan_classification():
     assert decision.reason != "orphan_position"
 
 
-def test_recovered_tqqq_uses_ten_percent_take_profit_and_orderable_qty():
+def test_recovered_tqqq_blocks_partial_strategy_exit():
     broker = PositionSnapshot(qty=7, orderable_qty=6, average_price=50, price=55)
     decision = evaluate(
         config=InfiniteConfig(), state=None, position=broker,
         trading_date=date(2026, 8, 14), overlay={"market_state": "DEFENSE_CRASH_CONFIRMED"},
         entry_allowed=False, regime_reserve_permission=False,
     )
-    assert (decision.action, decision.qty, decision.notional) == (Action.SELL, 6, 330)
+    assert (decision.action, decision.reason) == (Action.BLOCK, "tqqq_full_exit_qty_not_ready")
+
+
+def test_recovered_tqqq_uses_ten_percent_full_exit():
+    broker = PositionSnapshot(qty=10, orderable_qty=10, average_price=50, price=55)
+    decision = evaluate(config=InfiniteConfig(), state=None, position=broker,
+                        trading_date=date(2026, 8, 14), overlay={})
+    assert (decision.action, decision.qty, decision.notional) == (Action.SELL, 10, 550)
 
 
 @pytest.mark.parametrize(("orderable", "reason"), [
@@ -346,7 +353,7 @@ def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch)
     class Kis:
         calls = []
         def get_balance(self, force_refresh=False):
-            return {"positions": [{"symbol": "TQQQ", "qty": 10, "orderable_qty": 6,
+            return {"positions": [{"symbol": "TQQQ", "qty": 10, "orderable_qty": 10,
                                     "avg_price": 50, "currency": "USD"}]}
         def place_us_sell_order(self, symbol, exchange, qty, price):
             self.calls.append((symbol, exchange, qty, price))
@@ -354,7 +361,7 @@ def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch)
 
     client = Kis()
     asof = datetime.now(timezone.utc).isoformat()
-    positions = [{"symbol": "TQQQ", "qty": 10, "orderable_qty": 6, "avg_price": 50,
+    positions = [{"symbol": "TQQQ", "qty": 10, "orderable_qty": 10, "avg_price": 50,
                   "broker_avg_price_source": "kis_pchs_avg_pric", "broker_avg_price_asof": asof}]
     routed = []
     def real_route(intent):
@@ -371,7 +378,40 @@ def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch)
         result = run_sleeve(positions=positions, price=55, trading_date=date(2026, 8, 14),
                             overlay={}, repository=Repo(), route=real_route)
     assert result["status"] == "ACK"
-    assert client.calls == [("TQQQ", "NASDAQ", 6, 55.0)]
+    assert client.calls == [("TQQQ", "NASDAQ", 10, 55.0)]
     assert routed[0]["reason"] == "TAKE_PROFIT_TQQQ_INFINITE"
     assert routed[0]["position_action"] == "FULL_EXIT_SELL"
     assert routed[0]["meta"]["tp_threshold_fraction"] == "0.1"
+
+
+@pytest.mark.parametrize(("market_state", "market_regime", "expected"), [
+    ("STRONG_RISK_ON", "DEFENSIVE", "DEFENSIVE"),
+    ("NORMAL", "RISK_OFF", "RISK_OFF"),
+    ("RISK_ON", "CHOP_HIGH_VOL", "CHOP_HIGH_VOL"),
+    ("DEFENSE_CAUTION", "RISK_ON", "DEFENSE_CAUTION"),
+    ("DEFENSE_CRASH_CONFIRMED", "RISK_ON", "DEFENSE_CRASH_CONFIRMED"),
+    ("DEFENSE_CRASH_REBOUND", "DEFENSIVE", "DEFENSIVE"),
+])
+def test_regime_conflicts_choose_the_more_conservative_policy(market_state, market_regime, expected):
+    effective, _multiplier, _reserve, _entry, _reason = effective_regime(
+        {"market_state": market_state, "market_regime": market_regime}
+    )
+    assert effective == expected
+
+
+def test_full_exit_threshold_and_pending_contract():
+    state = InfiniteState(cycle_id="full-exit")
+    below = evaluate(config=InfiniteConfig(), state=state,
+                     position=PositionSnapshot(qty=10, orderable_qty=10, average_price=50, price=54.995),
+                     trading_date=date(2026, 8, 14), overlay=context())
+    assert below.action != Action.SELL
+    above = evaluate(config=InfiniteConfig(), state=state,
+                     position=PositionSnapshot(qty=10, orderable_qty=10, average_price=50, price=56),
+                     trading_date=date(2026, 8, 14), overlay={})
+    assert (above.action, above.qty) == (Action.SELL, 10)
+    pending = evaluate(config=InfiniteConfig(), state=state,
+                       position=PositionSnapshot(qty=10, orderable_qty=6, average_price=50, price=55),
+                       trading_date=date(2026, 8, 14), overlay={}, pending_sell=True)
+    assert (pending.action, pending.reason, pending.next_status) == (
+        Action.BLOCK, "tqqq_full_exit_pending", Status.EXIT_PENDING,
+    )
