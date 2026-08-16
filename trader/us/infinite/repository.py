@@ -317,8 +317,19 @@ class InfiniteRepository:
                            last_exit_date=trading_date, anchor_price=None, core_filled_notional=0,
                            reserve_filled_notional=0, reserve_unlocked=False, market_crash_streak=0,
                            cycle_age_trading_days=age)
-        metadata = {**state.metadata, "last_buy_fill_price": stats["last_buy_fill_price"],
+        actual_last_buy_price = (stats["last_buy_fill_price"]
+                                 or state.metadata.get("last_buy_fill_price"))
+        metadata = {**state.metadata, "last_buy_fill_price": actual_last_buy_price,
                     "broker_qty": broker_qty, "broker_average_price": broker_average_price}
+        if actual_last_buy_price:
+            metadata.update(buy_reference_price=actual_last_buy_price,
+                            buy_reference_source="ATTRIBUTED_BUY_FILL")
+        elif broker_qty > 0 and broker_average_price > 0:
+            # This is explicitly a conservative decision reference, not a
+            # fabricated fill.  Keep last_buy_fill_price empty so accounting
+            # and rebound confirmation cannot mistake the fallback for a fill.
+            metadata.update(buy_reference_price=broker_average_price,
+                            buy_reference_source="KIS_BROKER_AVG_FALLBACK")
         probe_fill_date = stats.get("last_rebound_probe_fill_date")
         if probe_fill_date:
             from datetime import timedelta

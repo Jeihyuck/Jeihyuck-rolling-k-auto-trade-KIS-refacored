@@ -145,10 +145,13 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
 
     metadata = state.metadata or {}
     policy_regime = effective_regime_name or risk.market_state
-    if position.qty > 0 and metadata.get("recovery_accounting_uncertain") \
-            and not metadata.get("last_buy_fill_price"):
-        return Decision(Action.BLOCK, "tqqq_recovery_reconcile_required")
-    effective_reserve_available = bool(state.reserve_unlocked and regime_reserve_permission)
+    recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
+                              and not metadata.get("last_buy_fill_price"))
+    # Uncertain recovery may resume conservative core buys, but can never use
+    # reserve or a bullish/recovery premium until attributed fill evidence is
+    # found.  The broker average remains a decision reference, never a fill.
+    effective_reserve_available = bool(state.reserve_unlocked and regime_reserve_permission
+                                       and not recovery_uncertain)
     policy_overlay = {**overlay, "market_state": policy_regime}
     long_trend = str(metadata.get("long_trend") or classify_long_trend(
         policy_overlay, bool(metadata.get("structural_bear_seen"))))
@@ -168,9 +171,18 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         or state.cycle_age_trading_days >= config.max_cycle_age_trading_days
         or state.core_filled_notional >= config.capital_preservation_core_used
     ))
-    last_price = metadata.get("last_buy_fill_price")
+    last_price = metadata.get("last_buy_fill_price") or metadata.get("buy_reference_price")
     try: last_price = float(last_price) if last_price is not None else None
     except (TypeError, ValueError): last_price = None
+    if recovery_uncertain:
+        try:
+            conservative_reference = float(metadata.get("buy_reference_price") or position.average_price)
+        except (TypeError, ValueError):
+            conservative_reference = 0.0
+        if conservative_reference <= 0:
+            return Decision(Action.BLOCK, "tqqq_recovery_reconcile_required")
+        if position.price > conservative_reference:
+            return Decision(Action.WAIT, "tqqq_recovery_price_above_broker_average")
     days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
                   if state.last_buy_date else 10_000)
 
@@ -217,6 +229,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "routine_gap_wait")
         premium = (0.02 if effective_reserve_available and long_trend == "RECOVERY" else
                    config.buy_premium_pct if long_trend == "BULL" and policy_regime in {"STRONG_RISK_ON", "RISK_ON"} else 0.0)
+        if recovery_uncertain:
+            premium = 0.0
         if position.average_price <= 0 or position.price > position.average_price * (1 + premium):
             return Decision(Action.WAIT, "price_above_buy_premium")
 

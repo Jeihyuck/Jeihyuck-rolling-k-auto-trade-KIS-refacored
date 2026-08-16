@@ -14,6 +14,7 @@ from collections import Counter
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
 from .policy_state import ActualFillEvidence, reserve_new_cycle, update_adaptive_policy_state
+from .risk_adapter import effective_regime
 from .strategy import evaluate
 from trader.us.market_state_overlay import calculate_qqq_long_context
 
@@ -99,9 +100,13 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         price = bar.tqqq_close if bar.quote_valid else 0.0
         position = PositionSnapshot(qty=qty, orderable_qty=qty,
                                     average_price=(cost / qty if qty else 0), price=price)
+        regime, multiplier, reserve_permission, entry_allowed, _reason = effective_regime(overlay)
         decision = evaluate(config=config, state=state, position=position,
                             trading_date=bar.trading_date, overlay=overlay,
-                            trading_sessions=sessions)
+                            trading_sessions=sessions, entry_allowed=entry_allowed,
+                            buy_multiplier=multiplier,
+                            regime_reserve_permission=reserve_permission,
+                            effective_regime_name=regime)
         if decision.action in {Action.BLOCK, Action.WAIT}:
             block_reason_counts[decision.reason] += 1
         if decision.action in {Action.BUY, Action.SELL} and not bar.quote_valid:

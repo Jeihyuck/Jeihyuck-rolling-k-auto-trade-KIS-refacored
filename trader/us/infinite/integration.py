@@ -101,6 +101,8 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
             "strategy_version": config.policy_version, "sleeve_id": "TQQQ_INFINITE",
             "ownership_source": "SYMBOL_INVARIANT_RECOVERY",
             "recovery_accounting_uncertain": True,
+            "buy_reference_price": broker.average_price or None,
+            "buy_reference_source": "KIS_BROKER_AVG_FALLBACK",
             "broker_qty": broker.qty, "broker_orderable_qty": broker.orderable_qty,
             "broker_average_price": broker.average_price,
         },

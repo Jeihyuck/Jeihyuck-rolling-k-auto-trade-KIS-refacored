@@ -244,6 +244,9 @@ def test_kis_balance_recovers_exact_tqqq_state_without_orphan_classification():
     assert recovered.metadata["broker_qty"] == 7
     assert recovered.metadata["broker_orderable_qty"] == 6
     assert recovered.metadata["broker_average_price"] == 51.25
+    assert "last_buy_fill_price" not in recovered.metadata
+    assert recovered.metadata["buy_reference_price"] == 51.25
+    assert recovered.metadata["buy_reference_source"] == "KIS_BROKER_AVG_FALLBACK"
     assert recovered.metadata["ownership_source"] == "SYMBOL_INVARIANT_RECOVERY"
     assert recovered.metadata["strategy_owner"] == "TQQQ_INFINITE"
     decision = evaluate(
@@ -251,6 +254,51 @@ def test_kis_balance_recovers_exact_tqqq_state_without_orphan_classification():
         trading_date=date(2026, 8, 14), overlay={"market_state": "NORMAL"},
     )
     assert decision.reason != "orphan_position"
+
+
+def test_uncertain_broker_recovery_allows_only_conservative_core_buy():
+    broker = PositionSnapshot(qty=5, orderable_qty=5, average_price=50, price=49)
+    recovered = recover_state_from_broker(
+        config=InfiniteConfig(), broker=broker, trading_date=date(2026, 8, 1),
+        cycle_id="recovered-cycle",
+    )
+    decision = evaluate(
+        config=InfiniteConfig(), state=recovered, position=broker,
+        trading_date=date(2026, 8, 14), overlay=context("NORMAL"),
+        effective_regime_name="NEUTRAL", buy_multiplier=.75,
+        regime_reserve_permission=False,
+    )
+    assert decision.action == Action.BUY
+    assert recovered.metadata.get("last_buy_fill_price") is None
+
+    premium = evaluate(
+        config=InfiniteConfig(), state=recovered,
+        position=PositionSnapshot(qty=5, orderable_qty=5, average_price=50, price=50.01),
+        trading_date=date(2026, 8, 14), overlay=context("STRONG_RISK_ON"),
+        effective_regime_name="STRONG_RISK_ON", buy_multiplier=1,
+        regime_reserve_permission=True,
+    )
+    assert (premium.action, premium.reason) == (
+        Action.WAIT, "tqqq_recovery_price_above_broker_average",
+    )
+
+
+def test_uncertain_broker_recovery_never_uses_reserve():
+    state = InfiniteState(
+        cycle_id="recovered-cycle", status=Status.ACTIVE,
+        core_filled_notional=7_500, reserve_unlocked=True,
+        material_market_crash=True,
+        metadata={"recovery_accounting_uncertain": True,
+                  "buy_reference_price": 50,
+                  "buy_reference_source": "KIS_BROKER_AVG_FALLBACK"},
+    )
+    decision = evaluate(
+        config=InfiniteConfig(), state=state,
+        position=PositionSnapshot(qty=150, orderable_qty=150, average_price=50, price=49),
+        trading_date=date(2026, 8, 14), overlay=context("STRONG_RISK_ON"),
+        effective_regime_name="STRONG_RISK_ON", regime_reserve_permission=True,
+    )
+    assert (decision.action, decision.reason) == (Action.BLOCK, "reserve_locked")
 
 
 def test_recovered_tqqq_blocks_partial_strategy_exit():
