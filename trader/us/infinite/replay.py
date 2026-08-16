@@ -77,6 +77,7 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
     lowest_cash = cash
     lowest_units = int(cash // config.unit_usd)
     cycle_count = pending_buys = confirmed_buys = rebound_buys = chop_buys = cp_buys = invalid_orders = duplicate_buys = 0
+    risk_off_buys = 0
     hard_cap_violations = daily_cap_violations = 0
     core_exhaustion_date = reserve_unlock_date = None
     cycle_start = None
@@ -131,6 +132,7 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
             rebound_buys += int(is_probe)
             chop_buys += int(bool(state.metadata.get("chop_high_vol")))
             cp_buys += int(bool(state.metadata.get("capital_preservation")))
+            risk_off_buys += int(market_state in {"DEFENSIVE", "RISK_OFF", "DEFENSE_RISK_OFF"})
             reserve_used_notional = max(reserve_used_notional, reserve)
             maximum_deployed_notional = max(maximum_deployed_notional, core + reserve)
             maximum_core_used_notional = max(maximum_core_used_notional, core)
@@ -152,6 +154,10 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         lowest_units = min(lowest_units, int(max(0, cash) // config.unit_usd))
 
     final_equity = cash + qty * (bars[-1].tqqq_close if bars else 0)
+    ongoing_cycle_sessions = ((len(bars) - 1 - cycle_start)
+                              if cycle_start is not None and bars else None)
+    all_cycle_durations = completion_durations + ([ongoing_cycle_sessions]
+                                                   if ongoing_cycle_sessions is not None else [])
     return {
         "total_return": final_equity / config.max_total_capital_usd - 1,
         "mdd": mdd, "lowest_cash": lowest_cash, "lowest_remaining_units": lowest_units,
@@ -161,9 +167,11 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         "average_cycle_completion_sessions": (sum(completion_durations) / len(completion_durations)
                                                 if completion_durations else None),
         "maximum_cycle_completion_sessions": max(completion_durations) if completion_durations else None,
+        "maximum_cycle_duration_sessions": max(all_cycle_durations) if all_cycle_durations else None,
         "crash_pending_buy_count": pending_buys, "crash_confirmed_buy_count": confirmed_buys,
         "rebound_probe_buy_count": rebound_buys, "chop_buy_count": chop_buys,
         "capital_preservation_buy_count": cp_buys,
+        "risk_off_buy_count": risk_off_buys,
         "reserve_used_notional": reserve_used_notional,
         "hard_cap_violation_count": hard_cap_violations,
         "daily_cap_violation_count": daily_cap_violations,
@@ -176,6 +184,8 @@ def run_replay(bars: Iterable[ReplayBar], config: InfiniteConfig | None = None,
         "take_profit_exit_occurred": bool(completion_durations),
         "capital_cap_violated": bool(hard_cap_violations),
         "duplicate_order_detected": bool(duplicate_buys),
+        "incomplete_cycle_count": int(qty > 0),
+        "final_qty": qty,
         "session_count": len(dates), "session_dates": dates,
         "final_state": state,
     }

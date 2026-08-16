@@ -134,3 +134,18 @@ def test_first_buy_resets_precycle_policy_metadata_before_fill_is_applied():
     assert not state.material_market_crash and not state.reserve_unlocked
     assert state.market_crash_streak == state.cycle_age_trading_days == 0
     assert state.metadata == {"last_buy_fill_price": 50, "long_trend": None}
+
+
+def test_replay_reports_open_cycle_and_risk_off_audit_metrics():
+    bars = [
+        bar(date(2022, 1, 3), 50),
+        bar(date(2022, 1, 4), 49, "DEFENSE_RISK_OFF"),
+        bar(date(2022, 1, 14), 44, "DEFENSE_RISK_OFF"),
+    ]
+    result = run_replay(bars)
+    assert result["incomplete_cycle_count"] == 1
+    assert result["final_qty"] > 0
+    assert result["maximum_cycle_duration_sessions"] == 2
+    assert result["risk_off_buy_count"] >= 0
+    assert result["maximum_deployed_notional"] <= 10_000
+    assert result["daily_cap_violation_count"] == 0
