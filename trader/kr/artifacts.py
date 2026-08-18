@@ -488,6 +488,37 @@ def validate_kr_prep_artifact(*, trade_date: date, expected_as_of: date, env: st
 def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, actual_as_of: date, env: str, final30_rows: list[dict], db_exact_rows: int, metadata: dict | None = None, contract_hash: str | None = None) -> None:
     logger.info("[KR_ARTIFACT][PUBLISH_START] trade_date=%s expected_as_of=%s", trade_date, expected_as_of)
     metadata = dict(metadata or {})
+    market_state = str(metadata.get("market_state") or metadata.get("market_regime") or "").strip()
+    if not market_state:
+        if os.getenv("KR_REGIME_FALLBACK_ENABLED", "1") in {"1", "true", "True", "yes"}:
+            market_state = os.getenv("KR_REGIME_FALLBACK_STATE", "KR_NORMAL")
+            metadata.update({
+                "market_state": market_state,
+                "market_regime": market_state,
+                "regime_source": "prep_ok_default",
+                "regime_quality": "OK",
+                "regime_reasons": ["PREP_OK_DEFAULT"],
+                "regime_fallback_used": True,
+            })
+            logger.warning("[KR_REGIME][FALLBACK] state=%s source=prep_ok_default", market_state)
+        else:
+            metadata.update({
+                "market_state": None,
+                "market_regime": None,
+                "regime_source": None,
+                "regime_quality": "BLOCKED",
+                "regime_reasons": ["MISSING_KR_MARKET_REGIME"],
+                "regime_fallback_used": False,
+                "warning": "WARNING_MISSING_KR_REGIME",
+            })
+            logger.error("[KR_REGIME][MISSING] warning=WARNING_MISSING_KR_REGIME")
+    else:
+        metadata.setdefault("market_state", market_state)
+        metadata.setdefault("market_regime", market_state)
+        metadata.setdefault("regime_source", "kr_prep_market_regime_v1")
+        metadata.setdefault("regime_quality", "OK")
+        metadata.setdefault("regime_reasons", [])
+        metadata.setdefault("regime_fallback_used", False)
     final30_rows, info = assert_final30_contract(final30_rows, as_of=expected_as_of.isoformat(), env=env, source="artifact.publish", require_count=30)
     contract_hash = contract_hash or str(info.get("contract_hash"))
     if len(final30_rows) != 30: raise RuntimeError("FINAL30_NOT_READY")

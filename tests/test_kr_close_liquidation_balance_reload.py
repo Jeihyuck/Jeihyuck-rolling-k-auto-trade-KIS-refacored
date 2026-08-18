@@ -1,6 +1,13 @@
 import logging
+import pytest
 
 from trader import pb1_runner
+
+
+@pytest.fixture(autouse=True)
+def explicit_close_confirmation(monkeypatch):
+    monkeypatch.setenv("KR_CLOSE_LIQUIDATION_ALL_ENABLED", "1")
+    monkeypatch.setenv("KR_CLOSE_LIQUIDATION_ALL_CONFIRM", "RUN_KR_CLOSE_LIQUIDATION_ALL")
 
 
 class FakeKis:

@@ -105,7 +105,9 @@ class KisCallGate:
                 self.endpoint_buckets[endpoint_key] = endpoint_bucket
 
             wait_global = global_bucket.consume(1)
-            wait_endpoint = 0.0 if bool(priority) else endpoint_bucket.consume(1)
+            # Priority changes ordering semantics, not quota ownership. Balance and
+            # order traffic must still consume their endpoint-specific bucket.
+            wait_endpoint = endpoint_bucket.consume(1)
             return max(wait_global, wait_endpoint)
 
     def allow(self, endpoint: str) -> bool:

@@ -45,7 +45,7 @@ def test_canonical_regime_and_migration_paths_are_reused():
     assert "calculate_market_state" not in adapter
     assert Path("migrations/0049_add_kr_infinite_state.sql").exists()
     assert inspect.signature(write_snapshot).parameters["path"].default == "artifacts/kr_regime_snapshot.json"
-    assert inspect.signature(load_canonical_snapshot).parameters["path"].default == "artifacts/kr_regime_snapshot.json"
+    assert inspect.signature(load_canonical_snapshot).parameters["path"].default is None
 
 
 def test_session_hook_is_fail_soft(monkeypatch):

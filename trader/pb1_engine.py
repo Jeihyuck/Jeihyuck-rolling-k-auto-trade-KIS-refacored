@@ -10573,14 +10573,53 @@ class PB1Engine:
         if isinstance(resp, dict):
             execution_meta = resp.get("_order_execution") if isinstance(resp.get("_order_execution"), dict) else {}
             submitted_qty = int(execution_meta.get("submitted_qty") or submitted_qty)
-        self.orders_repo.mark_submitted(
-            self.env,
-            effective_client_order_key or "",
-            kis_odno,
-            resp if isinstance(resp, dict) else {"resp": resp},
-            entry_meta_json=entry_meta,
-            submitted_qty=submitted_qty,
-        )
+        broker_ack = bool(is_order_accepted(resp, kis_env=self.env))
+        if broker_ack:
+            self._append_ledger_event(
+                event_type="BROKER_ACK_RECEIVED",
+                code=cf.code,
+                market=cf.market,
+                mode=cf.mode,
+                side="BUY",
+                qty=submitted_qty,
+                price=record_price,
+                client_order_key=effective_client_order_key,
+                ok=True,
+                reasons=["kis_ack"],
+                stage=stage,
+                payload_json={"kis_odno": kis_odno, "response": resp if isinstance(resp, dict) else {"resp": resp}},
+            )
+        try:
+            ack_persist_status = self.orders_repo.mark_submitted(
+                self.env,
+                effective_client_order_key or "",
+                kis_odno,
+                resp if isinstance(resp, dict) else {"resp": resp},
+                entry_meta_json=entry_meta,
+                submitted_qty=submitted_qty,
+            )
+        except Exception as ack_exc:
+            ack_persist_status = "ACK_DB_FAILED_RECONCILE_REQUIRED"
+            status["reconcile_required"] = 1
+            status["submit_terminal_status"] = ack_persist_status
+            logger.exception("[ORDER][ACK_DB_FAILED] code=%s kis_odno=%s action=RECONCILE_ONLY", cf.code, kis_odno)
+            self._append_ledger_event(
+                event_type="ORDER_ACK_DB_FAILED",
+                code=cf.code, market=cf.market, mode=cf.mode, side="BUY", qty=submitted_qty,
+                price=record_price, client_order_key=effective_client_order_key, ok=False,
+                reasons=["ORDER_ACK_DB_FAILED", "RECONCILE_REQUIRED"], stage=stage,
+                payload_json={"kis_odno": kis_odno, "error": str(ack_exc)},
+            )
+        if ack_persist_status == "AMBIGUOUS_BROKER_ORDER_ID":
+            status["reconcile_required"] = 1
+            status["submit_terminal_status"] = "ACK_DB_FAILED_RECONCILE_REQUIRED"
+            self._append_ledger_event(
+                event_type="ORDER_ACK_DB_FAILED",
+                code=cf.code, market=cf.market, mode=cf.mode, side="BUY", qty=submitted_qty,
+                price=record_price, client_order_key=effective_client_order_key, ok=False,
+                reasons=["AMBIGUOUS_BROKER_ORDER_ID", "RECONCILE_REQUIRED"], stage=stage,
+                payload_json={"kis_odno": kis_odno},
+            )
         status["submitted"] = int(status.get("api_submitted", 0) or 0)
         status["broker_order_no"] = kis_odno
         self._append_ledger_event(
@@ -10671,19 +10710,22 @@ class PB1Engine:
             # accepted=1은 먼저 설정 (KIS 주문은 이미 완료)
             status["accepted"] = 1
             status["submit_terminal_status"] = "ACCEPTED_PENDING_FILL"
-            try:
-                self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
-                logger.info("[ORDER][DB_ACK][OK] code=%s kis_odno=%s", cf.code, kis_odno)
-            except Exception as _ack_exc:
-                _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
-                logger.warning(
-                    "[ORDER][DB_ACK][TIMEOUT] code=%s kis_odno=%s err=%s action=ACK_PENDING_RECONCILE",
-                    cf.code, kis_odno, _ack_exc,
-                )
-                status["db_ack_timeout"] = 1
-                status["submit_terminal_status"] = "ACK_PENDING_RECONCILE"
-                if not _soft_ack:
-                    raise
+            if status.get("reconcile_required"):
+                logger.warning("[ORDER][DB_ACK][SKIP] code=%s kis_odno=%s reason=RECONCILE_REQUIRED", cf.code, kis_odno)
+            else:
+                try:
+                    self.orders_repo.mark_acked(self.env, kis_odno, resp, entry_meta_json=entry_meta)
+                    logger.info("[ORDER][DB_ACK][OK] code=%s kis_odno=%s", cf.code, kis_odno)
+                except Exception as _ack_exc:
+                    _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
+                    logger.warning(
+                        "[ORDER][DB_ACK][TIMEOUT] code=%s kis_odno=%s err=%s action=ACK_PENDING_RECONCILE",
+                        cf.code, kis_odno, _ack_exc,
+                    )
+                    status["db_ack_timeout"] = 1
+                    status["submit_terminal_status"] = "ACK_PENDING_RECONCILE"
+                    if not _soft_ack:
+                        raise
             # [2026-04-30] ORDER_SUBMIT_ACCEPTED 직후 BUY_FILL/positions update 금지.
             # 실제 체결은 reconcile_kis.py에서 KIS balance 확인 후 BUY_FILL_CONFIRMED로 생성한다.
             logger.info(

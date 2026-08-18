@@ -46,7 +46,7 @@ def test_missing_blocked_regime_pauses_buy_but_preserves_exit(default_config, qt
                         market_state=None, regime_data_quality="BLOCKED", orderable_cash=1_000_000)
     assert decision.action == expected
     if expected == Action.WAIT:
-        assert decision.reason == "KR_INF_REGIME_UNAVAILABLE_BUY_PAUSED"
+        assert decision.reason == "MISSING_KR_MARKET_REGIME_BUY_PAUSED"
 
 
 def test_pending_sell_reconciles_without_regime(default_config):

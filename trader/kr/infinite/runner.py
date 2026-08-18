@@ -32,7 +32,8 @@ class RunResult:
 
 
 def load_regime() -> tuple[str | None, str]:
-    view = load_canonical_snapshot(os.getenv("KR_INFINITE_REGIME_PATH", "artifacts/kr_regime_snapshot.json"))
+    configured_path = os.getenv("KR_INFINITE_REGIME_PATH")
+    view = load_canonical_snapshot(configured_path or None)
     return view.state, view.data_quality
 
 

@@ -116,9 +116,16 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
         position.get("entry_time")
         or position.get("created_at")
         or position.get("entry_at")
+        or position.get("opened_at")
+        or position.get("opened_trade_date")
     )
     if not entry_time_raw:
-        return True, 0, required  # 시간 모르면 허용
+        logger.warning(
+            "[US_EXIT][SWING_GUARD][BLOCK_UNKNOWN_ENTRY_TIME] "
+            "symbol=%s reason=UNKNOWN_ENTRY_TIME_BLOCKS_SWING_SOFT_EXIT required_minutes=%d",
+            position.get("symbol"), required,
+        )
+        return False, 0, required
 
     if now is None:
         now = datetime.now(timezone.utc)
@@ -129,7 +136,8 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
         elif isinstance(entry_time_raw, datetime):
             et = entry_time_raw
         else:
-            return True, 0, required
+            logger.warning("[US_EXIT][SWING_GUARD][BLOCK_UNKNOWN_ENTRY_TIME] symbol=%s reason=UNKNOWN_ENTRY_TIME_BLOCKS_SWING_SOFT_EXIT required_minutes=%d", position.get("symbol"), required)
+            return False, 0, required
 
         if et.tzinfo is None:
             et = et.replace(tzinfo=timezone.utc)
@@ -139,8 +147,8 @@ def _min_hold_elapsed(position: dict, now: datetime | None) -> tuple[bool, int, 
         held = int((now - et).total_seconds() / 60)
         return held >= required, held, required
     except Exception as exc:
-        logger.warning("[US_EXIT_ROUTER][MIN_HOLD_CALC][WARN] %s", exc)
-        return True, 0, required
+        logger.warning("[US_EXIT_ROUTER][MIN_HOLD_CALC][BLOCK] symbol=%s reason=UNKNOWN_ENTRY_TIME_BLOCKS_SWING_SOFT_EXIT err=%s", position.get("symbol"), exc)
+        return False, 0, required
 
 
 # ── SWING exit ─────────────────────────────────────────────────────────────

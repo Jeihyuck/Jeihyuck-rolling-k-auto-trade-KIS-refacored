@@ -11,6 +11,18 @@ from pathlib import Path
 import pytest
 
 
+def test_filled_sell_pnl_falls_back_to_fill_and_avg_cost():
+    from trader.us.runner.daily_report_runner import _sell_audit_pnl
+
+    audit = _sell_audit_pnl(
+        {"qty_filled": 5}, {"avg_cost": 494.91},
+        {"fill_price": 483.669, "filled_qty": 5}, "FILLED",
+    )
+
+    assert audit["gross_realized_pnl"] == -56.205
+    assert audit["return_rate_at_fill"] < -0.02
+
+
 class TestSessionReportBlockedAccumulation:
     """orders_blocked_total이 세션 전체에 걸쳐 누적되어야 한다."""
 

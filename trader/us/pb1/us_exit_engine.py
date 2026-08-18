@@ -544,6 +544,7 @@ def _make_exit_intent(
         "leg_no": leg_no,
         "trade_date": trade_date,
         "meta": {
+            "reason": reason,
             "holding_qty": _holding,
             "orderable_qty": _orderable,
             "sellable_qty": _orderable,
@@ -558,6 +559,10 @@ def _make_exit_intent(
             "exit_policy": "US_SWING_DEFAULT",
             "entry_price": entry_price,
             "avg_cost": entry_price,
+            "broker_avg_price": entry_price,
+            "broker_avg_price_source": "exit_position_entry_price",
+            "decision_price": current_price,
+            "return_rate_at_decision": round(pnl_pct, 6),
             "current_price": current_price,
             "pnl_pct_from_avg_cost": round(pnl_pct, 6),
             "hard_stop_threshold_pct": cfg["hard_stop"],

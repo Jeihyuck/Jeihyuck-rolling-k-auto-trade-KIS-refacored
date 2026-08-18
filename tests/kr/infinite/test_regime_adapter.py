@@ -26,3 +26,16 @@ def test_stale_canonical_snapshot_is_buy_unavailable(tmp_path, monkeypatch):
     path=tmp_path/"snapshot.json";path.write_text(json.dumps({"as_of":"2026-08-13T10:00:00+09:00","data_quality":"OK","market_states":{"KOSPI":{"state":"KR_NORMAL","data_quality":"OK"}}}))
     monkeypatch.setenv("KR_TRADE_DATE","2026-08-14")
     assert not load_canonical_snapshot(path).available
+
+
+def test_prep_contract_market_state_is_available_to_infinite(tmp_path, monkeypatch):
+    path = tmp_path / "prep_contract.json"
+    path.write_text(json.dumps({
+        "trade_date": "2026-08-18", "market_state": "KR_NORMAL",
+        "regime_quality": "OK", "regime_source": "prep_ok_default",
+    }))
+    monkeypatch.setenv("KR_TRADE_DATE", "2026-08-18")
+
+    view = load_canonical_snapshot(path)
+
+    assert (view.state, view.data_quality, view.available) == ("KR_NORMAL", "OK", True)

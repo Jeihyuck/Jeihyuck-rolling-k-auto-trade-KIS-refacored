@@ -214,6 +214,20 @@ def test_swing_soft_exit_blocked_same_day(monkeypatch):
         )
 
 
+def test_swing_soft_exit_blocks_without_entry_time(monkeypatch):
+    """Unknown entry time must fail closed for SWING soft exits."""
+    from trader.us.pb1.us_exit_router import evaluate_swing_exit
+
+    position = _swing_position("TEST")
+    with patch.dict(os.environ, {
+        "US_SWING_BLOCK_SAME_DAY_SOFT_EXIT": "1",
+        "US_PROFIT_PROTECT_PCT": "0.01",
+    }):
+        intent = evaluate_swing_exit(position, 69.36)
+
+    assert intent is None
+
+
 def test_day_profit_take_triggers():
     """DAY_BOOK은 day_profit_take가 작동해야 함."""
     from trader.us.pb1.us_exit_router import evaluate_day_exit

@@ -2862,7 +2862,7 @@ class OrdersRepo:
         *,
         entry_meta_json: dict | None = None,
         submitted_qty: int | None = None,
-    ) -> None:
+    ) -> str:
         safe_response_json = json_sanitize(response_json or {})
         values = {
             "status": "SUBMITTED",
@@ -2877,11 +2877,52 @@ class OrdersRepo:
         if entry_meta_json:
             values.update(_entry_meta_columns(entry_meta_json, json_field="entry_meta_json"))
         with self.engine.begin() as conn:
-            conn.execute(
+            stmt = (
                 sa.update(self._schema.orders)
                 .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
                 .values(**values)
             )
+            try:
+                with conn.begin_nested():
+                    conn.execute(stmt)
+                return "SUBMITTED"
+            except IntegrityError as exc:
+                if not kis_odno:
+                    raise
+                existing = conn.execute(
+                    select(self._schema.orders).where(
+                        and_(self._schema.orders.c.env == env, self._schema.orders.c.broker_order_id == kis_odno)
+                    )
+                ).mappings().first()
+                current = conn.execute(
+                    select(self._schema.orders).where(
+                        and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key)
+                    )
+                ).mappings().first()
+                same_identity = bool(existing and current and (
+                    str(existing.get("client_order_key") or "") == client_order_key or
+                    (str(existing.get("code") or "") == str(current.get("code") or "") and
+                     str(existing.get("side") or "") == str(current.get("side") or "") and
+                     int(existing.get("qty") or 0) == int(current.get("qty") or 0))
+                ))
+                if same_identity:
+                    recovered_values = dict(values)
+                    recovered_values.pop("broker_order_id", None)
+                    recovered_values["status"] = "ACKED_IDEMPOTENT_RECOVERED"
+                    conn.execute(
+                        sa.update(self._schema.orders)
+                        .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                        .values(**recovered_values)
+                    )
+                    logger.warning("[ORDER_ACK_IDEMPOTENT_RECOVERED] env=%s key=%s broker_order_id=%s", env, client_order_key, kis_odno)
+                    return "ORDER_ACK_IDEMPOTENT_RECOVERED"
+                conn.execute(
+                    sa.update(self._schema.orders)
+                    .where(and_(self._schema.orders.c.env == env, self._schema.orders.c.client_order_key == client_order_key))
+                    .values(status="ACK_DB_FAILED_RECONCILE_REQUIRED", response_json=safe_response_json, updated_at=func.now())
+                )
+                logger.error("[AMBIGUOUS_BROKER_ORDER_ID] env=%s key=%s broker_order_id=%s err=%s", env, client_order_key, kis_odno, exc)
+                return "AMBIGUOUS_BROKER_ORDER_ID"
 
     def mark_acked(
         self,

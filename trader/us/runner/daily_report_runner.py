@@ -40,6 +40,38 @@ def _fill_is_synthetic(fill: dict) -> bool:
     return bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")
                 or meta.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
 
+def _positive_float(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dict:
+    """Calculate reportable filled-SELL PnL when journal metadata is incomplete."""
+    fill_price = _positive_float(timeline.get("fill_price"))
+    if fill_price is None and status in {"FILLED", "PARTIALLY_FILLED"}:
+        fill_price = _positive_float(order.get("fill_price")) or _positive_float(order.get("avg_price_usd"))
+    filled_qty = _positive_float(timeline.get("filled_qty")) or _positive_float(order.get("qty_filled"))
+    cost_basis = next((value for value in (
+        _positive_float(meta.get("broker_avg_price")), _positive_float(meta.get("avg_cost")),
+        _positive_float(meta.get("entry_price")), _positive_float(order.get("avg_price_usd")),
+        _positive_float(order.get("reconciled_avg_price")), _positive_float(order.get("kis_avg_price")),
+    ) if value is not None), None)
+    try:
+        gross = float(meta["gross_realized_pnl"]) if meta.get("gross_realized_pnl") is not None else None
+    except (TypeError, ValueError):
+        gross = None
+    if gross is None and fill_price is not None and filled_qty is not None and cost_basis is not None:
+        gross = round((fill_price - cost_basis) * filled_qty, 6)
+    return_rate = (fill_price / cost_basis) - 1 if fill_price is not None and cost_basis is not None else None
+    missing_metadata = status in {"FILLED", "PARTIALLY_FILLED"} and not any((
+        meta.get("reason"), meta.get("exit_reason"), meta.get("profit_capture_stage"),
+        meta.get("position_lifecycle_id"), meta.get("broker_avg_price"), meta.get("entry_price"), meta.get("avg_cost"),
+    ))
+    return {"fill_price": fill_price, "filled_qty": filled_qty, "gross_realized_pnl": gross,
+            "return_rate_at_fill": return_rate, "missing_metadata": missing_metadata}
 
 
 def _position_market_value_usd(position: dict) -> float:
@@ -692,8 +724,18 @@ def run_daily_report(
                         elif status in submitted_statuses and side == "SELL":
                             report["sell_order_count"] += 1
                         meta = order.get("meta") or {}
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except ValueError:
+                                meta = {}
                         timeline = audit_timelines.get(str(order.get("client_order_key") or ""), {})
                         fees = timeline.get("fees") if timeline.get("fees") is not None else order.get("fees") if order.get("fees") is not None else meta.get("fees")
+                        sell_pnl = _sell_audit_pnl(order, meta, timeline, status) if side == "SELL" else {}
+                        if sell_pnl.get("missing_metadata"):
+                            warning = f"ERROR_MISSING_SELL_METADATA symbol={order.get('symbol') or ''} client_order_key={order.get('client_order_key') or ''}"
+                            report["warnings"].append(warning)
+                            logger.error("[US_DAILY_REPORT][%s]", warning)
                         report.setdefault("order_audit", []).append({
                             "symbol": order.get("symbol"), "side": side,
                             "strategy_reason": meta.get("reason") or order.get("reason"),
@@ -703,13 +745,13 @@ def run_daily_report(
                             "broker_avg_price_source": meta.get("broker_avg_price_source"),
                             "decision_price": meta.get("decision_price") or meta.get("executable_price"),
                             "limit_price": order.get("limit_price") or order.get("avg_price_usd"),
-                            "fill_price": timeline.get("fill_price") or ((order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None),
-                            "filled_qty": timeline.get("filled_qty") if timeline.get("filled_qty") is not None else order.get("qty_filled"),
-                            "gross_realized_pnl": meta.get("gross_realized_pnl"), "fees": fees,
+                            "fill_price": sell_pnl.get("fill_price") if side == "SELL" else timeline.get("fill_price") or ((order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None),
+                            "filled_qty": sell_pnl.get("filled_qty") if side == "SELL" else timeline.get("filled_qty") if timeline.get("filled_qty") is not None else order.get("qty_filled"),
+                            "gross_realized_pnl": sell_pnl.get("gross_realized_pnl") if side == "SELL" else meta.get("gross_realized_pnl"), "fees": fees,
                             "fees_status": "AVAILABLE" if fees is not None else "UNAVAILABLE",
                             "net_realized_pnl": meta.get("net_realized_pnl") if fees is not None else None,
                             "return_rate_at_decision": meta.get("return_rate_at_decision"),
-                            "return_rate_at_fill": meta.get("return_rate_at_fill"),
+                            "return_rate_at_fill": meta.get("return_rate_at_fill") or sell_pnl.get("return_rate_at_fill"),
                             "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
                             "canonical_order_no": meta.get("order_no_norm"),
                             "client_order_key": order.get("client_order_key"),

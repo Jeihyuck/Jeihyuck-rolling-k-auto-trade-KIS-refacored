@@ -40,6 +40,7 @@ def test_exit_normalizes_nasd_to_nasdaq():
             "qty": 10,
             "entry_price": 100.0,
             "entry_date": "2024-01-01",
+            "entry_time": "2024-01-01T14:30:00+00:00",
             "max_price": 160.0,
         }
     ]

@@ -285,6 +285,23 @@ def test_profit_capture_rejected_stage_can_retry(monkeypatch):
     repos.mark_us_profit_capture_stage("2026-07-11", "RETRY", "tp1", status="DONE", position_lifecycle_id="life-RETRY")
     assert build_profit_capture_intents([pos], overlay, trade_date="2026-07-11") == []
 
+
+def test_profit_capture_uses_position_cost_fallback_with_provenance():
+    overlay = {"market_state": "NORMAL", "profit_capture_enabled": True}
+    position = {
+        "symbol": "TEST", "qty": 5, "orderable_qty": 5,
+        "current_price_usd": 103.26, "entry_price": 100.0,
+        "position_lifecycle_id": "lifecycle-test",
+    }
+
+    intents = build_profit_capture_intents([position], overlay, trade_date="2026-08-18")
+
+    assert len(intents) == 1
+    assert intents[0]["reason"] == "TAKE_PROFIT_TP1"
+    assert intents[0]["qty"] == 1
+    assert float(intents[0]["meta"]["return_rate_at_decision"]) >= 0.03
+    assert intents[0]["meta"]["broker_avg_price_source"] == "fallback_entry_price"
+
 def test_defense_trim_current_px_alias_partial_and_no_duplicate_existing_sell():
     overlay = {"market_state": "DEFENSE_RISK_OFF"}
     positions = [

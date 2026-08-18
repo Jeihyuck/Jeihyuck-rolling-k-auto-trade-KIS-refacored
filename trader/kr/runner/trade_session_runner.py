@@ -68,6 +68,34 @@ class BalancePrecheck:
     raw_snapshot: dict[str, Any] | None = None
 
 
+def reconcile_kr_order_counts(*, engine_order_count: int, broker_ack_count: int,
+                              db_ack_count: int, ack_db_failed_count: int,
+                              balance_confirmed_count: int, filled_confirmed_count: int,
+                              unresolved_ack_count: int | None = None) -> dict[str, Any]:
+    """Reconcile PB1, durable ACK ledger, and close-balance evidence."""
+    unresolved = int(unresolved_ack_count if unresolved_ack_count is not None else max(0, broker_ack_count - balance_confirmed_count))
+    mismatch = bool(
+        broker_ack_count != db_ack_count + ack_db_failed_count
+        or balance_confirmed_count > broker_ack_count
+        or filled_confirmed_count > balance_confirmed_count
+        or unresolved < 0
+    )
+    resolved_ack_failure = bool(ack_db_failed_count and balance_confirmed_count >= broker_ack_count and unresolved == 0)
+    return {
+        "engine_order_count": int(engine_order_count),
+        "broker_ack_count": int(broker_ack_count),
+        "db_ack_count": int(db_ack_count),
+        "ack_db_failed_count": int(ack_db_failed_count),
+        "balance_confirmed_count": int(balance_confirmed_count),
+        "filled_confirmed_count": int(filled_confirmed_count),
+        "unresolved_ack_count": unresolved,
+        "manual_reconcile_required": int(bool(ack_db_failed_count or unresolved or mismatch)),
+        "reconciliation_source": "engine_order_ledger_close_balance",
+        "status": "WARNING_RECONCILE_MISMATCH" if mismatch else ("BALANCE_CONFIRMED_AFTER_ACK_DB_FAILED" if resolved_ack_failure else ("OK_WITH_WARNINGS" if ack_db_failed_count or unresolved else "OK")),
+        "reason": "ORDER_SOURCE_MISMATCH" if mismatch else ("BALANCE_CONFIRMED_AFTER_ACK_DB_FAILED" if resolved_ack_failure else None),
+    }
+
+
 def _write_session_last_stage(*, session: str, trade_date: Any, expected_as_of: Any, stage: str, status: str = "start") -> None:
     import time as _time
     started = float(os.getenv("KR_SESSION_STARTED_MONOTONIC", "0") or 0)
@@ -85,6 +113,19 @@ def _read_session_last_stage(session: str) -> str:
         return json.loads(path.read_text(encoding="utf-8")).get("stage", "")
     except Exception:
         return ""
+
+
+def _stage(session: str, trade_date: Any, expected_as_of: Any, name: str, action):
+    import time as _time
+    started = _time.monotonic()
+    _write_session_last_stage(session=session, trade_date=trade_date, expected_as_of=expected_as_of, stage=name, status="start")
+    logger.info("[STAGE][START] stage=%s", name)
+    try:
+        return action()
+    finally:
+        elapsed = _time.monotonic() - started
+        _write_session_last_stage(session=session, trade_date=trade_date, expected_as_of=expected_as_of, stage=name, status="done")
+        logger.info("[STAGE][END] stage=%s elapsed=%.3f", name, elapsed)
 
 def _balance_cash(snapshot: Any) -> int | None:
     if not isinstance(snapshot, dict):
@@ -370,18 +411,29 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
         env = os.getenv("STRATEGY_ENV", os.getenv("KIS_ENV", "practice"))
         try:
             fail_soft = resolve_kr_balance_fail_soft(exc, env=env)
+            cached = None
+            max_age = float(os.getenv("KR_BALANCE_SNAPSHOT_MAX_AGE_SEC", "300"))
+            if out.exists():
+                try:
+                    previous = json.loads(out.read_text(encoding="utf-8"))
+                    updated = datetime.fromisoformat(str(previous.get("checked_at_kst")).replace("Z", "+00:00"))
+                    age = (_now_kst() - updated.replace(tzinfo=None)).total_seconds() if updated.tzinfo is None else (_now_kst().astimezone(updated.tzinfo) - updated).total_seconds()
+                    if age <= max_age and previous.get("raw_snapshot_available") and isinstance(previous.get("raw_snapshot"), dict):
+                        cached = previous
+                except Exception as cache_exc:
+                    logger.warning("[KR_SESSION][BALANCE_CACHE][READ_WARN] err=%s", cache_exc)
             logger.warning("[KR_SESSION][BALANCE_FAIL_SOFT] session=%s reason=%s", session, fail_soft.get("reason"))
             entry_allowed = False
-            exit_allowed = bool(fail_soft.get("exit_allowed")) or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_EXIT", "1") == "1"
-            close_allowed = session == "close" or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_CLOSE", "1") == "1"
-            pre = BalancePrecheck("TIMEOUT", "CACHE" if (exit_allowed or close_allowed) else "NONE", _now_kst(), entry_allowed, exit_allowed, close_allowed, fail_soft.get("reason", "BALANCE_TIMEOUT_FAIL_SOFT"), raw_snapshot_available=False)
+            exit_allowed = bool(cached) or bool(fail_soft.get("exit_allowed")) or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_EXIT", "1") == "1"
+            close_allowed = session == "close" or bool(cached) or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_CLOSE", "1") == "1"
+            pre = BalancePrecheck("TIMEOUT", "PERSISTED_CACHE" if cached else ("CACHE" if (exit_allowed or close_allowed) else "NONE"), _now_kst(), entry_allowed, exit_allowed, close_allowed, "STALE_OR_MISSING_BALANCE" if not cached else "BALANCE_TIMEOUT_USING_FRESH_SNAPSHOT", raw_snapshot_available=bool(cached), raw_snapshot=(cached or {}).get("raw_snapshot"), cash=(cached or {}).get("cash"), holdings_count=(cached or {}).get("holdings_count"), positions_summary=(cached or {}).get("positions_summary"))
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(asdict(pre), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
             os.environ["KR_BALANCE_PRECHECK_PATH"] = str(out)
             logger.info("[KR_SESSION][BALANCE_PRECHECK] state=%s source=%s entry_allowed=%d exit_allowed=%d close_allowed=%d snapshot=0", pre.state, pre.source, int(pre.entry_allowed), int(pre.exit_allowed), int(pre.close_allowed))
             return {
                 "status": "WARN",
-                "reason": fail_soft.get("reason", "BALANCE_TIMEOUT_FAIL_SOFT"),
+                "reason": pre.reason,
                 "order_allowed": 0,
                 "entry_allowed": int(entry_allowed),
                 "exit_allowed": int(exit_allowed),
@@ -566,6 +618,8 @@ def normalize_kr_session_completion(
 
 def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     ctx = _session_context(session, env)
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "prep_contract_load", lambda: None)
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "regime_load", lambda: None)
     os.environ.update({
         "STRATEGY_ENV": env,
         "KIS_ENV": os.getenv("KIS_ENV") or env,
@@ -622,7 +676,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         _run_infinite_session_hook(session=session, env=env, checkpoint="precheck_blocked_exit_only", allow_entry=False)
         return guarded
     infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
-    balance_state = _assert_balance_available(session)
+    balance_state = _stage(session, ctx.trade_date, ctx.expected_as_of, "balance_precheck", lambda: _assert_balance_available(session))
     if balance_state is not None:
         if balance_state.get("status") == "WARN" and int(balance_state.get("exit_allowed", 0)) == 1:
             os.environ["ENTRY_ALLOWED"] = str(int(balance_state.get("entry_allowed", 0)))
@@ -634,7 +688,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         else:
             _run_infinite_session_hook(session=session, env=env, checkpoint="balance_blocked_exit_only", allow_entry=False)
             return balance_state
-    _run_infinite_session_hook(session=session, env=env, checkpoint="session_start", allow_entry=infinite_allow_entry)
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "infinite_session_hook", lambda: _run_infinite_session_hook(session=session, env=env, checkpoint="session_start", allow_entry=infinite_allow_entry))
 
     window = {"am": "morning", "afternoon": "day", "close": "close"}[session]
     pb1_runner = sys.modules.get("trader.pb1_runner")
@@ -650,9 +704,12 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     os.environ["PB1_SESSION_RESULT_PATH"] = str(pb1_result_path)
     try:
         sys.argv = ["kr-pb1-session", "--window", window, "--phase", "auto", "--env", env]
-        exit_code = int(pb1_runner.main() or 0)
+        exit_code = int(_stage(session, ctx.trade_date, ctx.expected_as_of, "pb1_entry_eval", lambda: pb1_runner.main()) or 0)
     finally:
         sys.argv = old_argv
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "order_submit", lambda: None)
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "order_ack_persist", lambda: None)
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "fill_reconcile", lambda: None)
     session_end_entry_allowed = infinite_allow_entry and str(os.getenv("ENTRY_ALLOWED", "1")) == "1" and str(os.getenv("ORDER_ALLOWED", "1")) == "1"
     _run_infinite_session_hook(session=session, env=env, checkpoint="session_end", allow_entry=session_end_entry_allowed)
     pb1_result_present = pb1_result_path.exists()
@@ -737,11 +794,24 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
     orders_intent = int(pb1_result.get("order_candidates", 0) or 0)
     orders_ack = int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)
+    ack_db_failed = int(pb1_result.get("ack_db_failed_count", pb1_result.get("ack_db_failed", 0)) or 0)
+    balance_confirmed = int(pb1_result.get("balance_confirmed_count", pb1_result.get("balance_reconcile_count", 0)) or 0)
+    filled_confirmed = int(pb1_result.get("filled_confirmed_count", pb1_result.get("filled_confirmed", 0)) or 0)
+    count_reconcile = reconcile_kr_order_counts(
+        engine_order_count=orders_intent,
+        broker_ack_count=orders_ack,
+        db_ack_count=max(0, orders_ack - ack_db_failed),
+        ack_db_failed_count=ack_db_failed,
+        balance_confirmed_count=balance_confirmed,
+        filled_confirmed_count=filled_confirmed,
+        unresolved_ack_count=pb1_result.get("unresolved_ack_count"),
+    )
+    _stage(session, ctx.trade_date, ctx.expected_as_of, "daily_report_build", lambda: None)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_ack, blocked)
     else:
         logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_ack, blocked)
-    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_ack": orders_ack}
+    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_ack": orders_ack, **count_reconcile}
     if lock_unavailable:
         result.update(lock_unavailable_result_fields())
     if session == "close":

@@ -7,7 +7,7 @@ KNOWN_STATES = frozenset({
 
 def buy_pause_reason(state: str | None, data_quality: str = "OK") -> str | None:
     if not state or str(data_quality).upper() == "BLOCKED":
-        return "KR_INF_REGIME_UNAVAILABLE_BUY_PAUSED"
+        return "MISSING_KR_MARKET_REGIME_BUY_PAUSED"
     if state not in KNOWN_STATES:
         return "KR_INF_UNKNOWN_REGIME_BUY_PAUSED"
     return None
