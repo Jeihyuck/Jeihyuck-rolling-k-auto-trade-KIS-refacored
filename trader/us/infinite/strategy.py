@@ -100,15 +100,21 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if pending_buy:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if not entry_allowed:
-        return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
+        if config.symbol != "TQQQ" or not (overlay and (overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay"))):
+            return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
         return Decision(Action.BLOCK, "daily_buy_limit")
+    overlay = dict(overlay or {})
+    infinite_overlay_bypass = config.symbol == "TQQQ" and bool(
+        overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay")
+    )
+    if infinite_overlay_bypass:
+        overlay["strategy_owner"] = "TQQQ_INFINITE"
     risk = assess_market_risk(overlay)
-    if not risk.allow_buy:
+    if not risk.allow_buy and not infinite_overlay_bypass:
         return Decision(Action.BLOCK, risk.reason)
-    overlay = overlay or {}
     required = {
         "qqq_completed_close": True, "qqq_ma50": True, "qqq_ma200": True,
         "qqq_ma200_slope": False, "qqq_20d_return": False, "qqq_drawdown_252": False,
@@ -129,13 +135,13 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             valid_context = False
     if not valid_context:
         return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
-    if position.qty <= 0 and effective_regime_name in {
+    if not infinite_overlay_bypass and position.qty <= 0 and effective_regime_name in {
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
-    if overlay.get("force_entry_block") is True:
+    if not infinite_overlay_bypass and overlay.get("force_entry_block") is True:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
-    if position.qty <= 0 and overlay.get("allow_new_buy") is False:
+    if not infinite_overlay_bypass and position.qty <= 0 and overlay.get("allow_new_buy") is False:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
         # Standard gross/cluster overlays do not own this sleeve. Only an
@@ -145,6 +151,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
 
     metadata = state.metadata or {}
     policy_regime = effective_regime_name or risk.market_state
+    if infinite_overlay_bypass and (overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay")):
+        policy_regime = str(overlay.get("base_market_state") or "NORMAL")
     recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
                               and not metadata.get("last_buy_fill_price"))
     # Uncertain recovery may resume conservative core buys, but can never use
@@ -251,7 +259,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
-    budget = min(config.unit_usd * max(0.0, buy_multiplier), available, total_left, daily_left)
+    effective_buy_multiplier = 1.0 if infinite_overlay_bypass else buy_multiplier
+    budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)
     notional = qty * position.price
     if qty < 1:

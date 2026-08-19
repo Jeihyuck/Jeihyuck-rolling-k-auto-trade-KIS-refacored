@@ -499,6 +499,8 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
                 "regime_quality": "OK",
                 "regime_reasons": ["PREP_OK_DEFAULT"],
                 "regime_fallback_used": True,
+                "intraday_overlay_available": False,
+                "fallback_reason": "prep_default",
             })
             logger.warning("[KR_REGIME][FALLBACK] state=%s source=prep_ok_default", market_state)
         else:
@@ -509,6 +511,8 @@ def publish_kr_prep_artifacts_atomic(*, trade_date: date, expected_as_of: date, 
                 "regime_quality": "BLOCKED",
                 "regime_reasons": ["MISSING_KR_MARKET_REGIME"],
                 "regime_fallback_used": False,
+                "intraday_overlay_available": False,
+                "fallback_reason": "missing_observations",
                 "warning": "WARNING_MISSING_KR_REGIME",
             })
             logger.error("[KR_REGIME][MISSING] warning=WARNING_MISSING_KR_REGIME")

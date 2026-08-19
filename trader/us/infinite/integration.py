@@ -213,6 +213,12 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     overlay.get("market_state"), overlay.get("market_regime"), regime, multiplier,
                     int(regime_reserve_permission), int(bool(state and state.reserve_unlocked)),
                     int(effective_reserve_available), int(entry_allowed), regime_reason)
+        # TQQQ_INFINITE never consumes the new intraday overlay (INTRADAY_CAUTION/RISK_OFF/
+        # SEMI_CRASH/MARKET_CRASH); those keys are additive to `overlay` and unread here.
+        intraday_overlay_label = overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay")
+        if intraday_overlay_label and intraday_overlay_label != "NORMAL":
+            logger.info("[TQQQ_INF][OVERLAY_BYPASS] symbol=TQQQ overlay=%s action=BUY_ALLOWED reason=infinite_strategy_buy_dip",
+                        intraday_overlay_label)
         decision = evaluate(config=config, state=decision_state, position=broker, trading_date=trading_date,
                             pending_buy=pending_buy, pending_sell=pending_sell,
                             daily_filled_buy_notional=daily, overlay=overlay,
@@ -312,6 +318,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "policy_action": policy_action,
                      "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE",
                      "cycle_id": state.cycle_id,
+                     "owner_strategy": "TQQQ_INFINITE",
+                     "remaining_units": md.get("remaining_units"),
+                     "overlay_bypass": True,
+                     "overlay_ignored_reason": "infinite_strategy_buy_dip",
                      "tqqq_daily_committed_before_usd": daily + pending_buy_notional,
                      "tqqq_cycle_committed_before_usd": state.total_filled_notional + pending_buy_notional,
                      "tqqq_max_daily_buy_usd": config.max_daily_buy_usd,

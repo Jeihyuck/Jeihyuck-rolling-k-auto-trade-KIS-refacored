@@ -1,4 +1,5 @@
 import math
+from decimal import Decimal
 from dataclasses import replace
 from datetime import date
 from .models import BrokerOrderState, OrderIntent, State, Status
@@ -8,13 +9,16 @@ def validate_invariants(state: State, broker_qty: int) -> None:
     if not (0 <= state.units_used <= 40 and 0 <= state.core_units_used <= 30 and 0 <= state.reserve_units_used <= 10):
         raise ValueError("KR_INF_UNIT_INVARIANT")
     if state.core_units_used + state.reserve_units_used != state.units_used: raise ValueError("KR_INF_UNIT_SUM_INVARIANT")
-    if min(state.core_filled_notional, state.reserve_filled_notional) < 0 or state.filled_notional > state.allocated_capital_krw + .01:
+    filled = Decimal(str(state.filled_notional))
+    allocated = Decimal(str(state.allocated_capital_krw))
+    if min(Decimal(str(state.core_filled_notional)), Decimal(str(state.reserve_filled_notional))) < 0 or filled > allocated + Decimal("0.01"):
         raise ValueError("KR_INF_CAPITAL_INVARIANT")
 
 def buy_quantity(state: State, orderable_cash: float, price: float) -> tuple[int,float]:
-    available=max(0.0,min(orderable_cash,state.allocated_capital_krw-state.filled_notional))
-    budget=min(state.unit_krw,available)
-    qty=math.floor(budget/price) if price > 0 else 0
+    available=max(Decimal("0"), min(Decimal(str(orderable_cash)), Decimal(str(state.allocated_capital_krw))-Decimal(str(state.filled_notional))))
+    budget=min(Decimal(str(state.unit_krw)),available)
+    price_decimal = Decimal(str(price))
+    qty=int(budget / price_decimal) if price_decimal > 0 else 0
     return qty, qty*price
 
 def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderState,

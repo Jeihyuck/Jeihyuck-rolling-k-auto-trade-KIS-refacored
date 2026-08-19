@@ -289,6 +289,73 @@ def _intraday_rebound(provider: Any, rets: dict[str, float | None], warnings: li
     data_ok = all(snapshot["valid"] for snapshot in snapshots.values())
     return {"snapshots": snapshots, "signals": signals, "confirmation_count": sum(signals.values()), "data_ok": data_ok, "hard_down": hard_down, "smh_recovered": bool(signals["smh_return"] or signals["smh_price_strength"])}
 
+def compute_us_intraday_overlay(spy_1d_return: float | None, qqq_1d_return: float | None,
+                                smh_1d_return: float | None) -> dict[str, Any]:
+    """Pure SPY/QQQ/SMH intraday risk overlay for general PB1 risk control only.
+
+    TQQQ_INFINITE must never consume these fields. Only general PB1 entry sizing
+    and soft-stop repeat control read intraday_market_overlay/intraday_rotation_overlay.
+    """
+    market_order = ["NORMAL", "INTRADAY_CAUTION", "INTRADAY_RISK_OFF", "INTRADAY_MARKET_CRASH"]
+    market_overlay = "NORMAL"
+    rotation_overlay = "NORMAL"
+    reasons: list[str] = []
+
+    def worse(candidate: str) -> None:
+        nonlocal market_overlay
+        if market_order.index(candidate) > market_order.index(market_overlay):
+            market_overlay = candidate
+
+    if (qqq_1d_return is not None and qqq_1d_return <= -0.010) or (smh_1d_return is not None and smh_1d_return <= -0.015):
+        worse("INTRADAY_CAUTION")
+        reasons.append("QQQ_1D_LE_-1.0PCT_OR_SMH_1D_LE_-1.5PCT")
+    if (qqq_1d_return is not None and qqq_1d_return <= -0.018) or (smh_1d_return is not None and smh_1d_return <= -0.025):
+        worse("INTRADAY_RISK_OFF")
+        reasons.append("QQQ_1D_LE_-1.8PCT_OR_SMH_1D_LE_-2.5PCT")
+    if (spy_1d_return is not None and spy_1d_return <= -0.020) or (qqq_1d_return is not None and qqq_1d_return <= -0.028):
+        worse("INTRADAY_MARKET_CRASH")
+        reasons.append("SPY_1D_LE_-2.0PCT_OR_QQQ_1D_LE_-2.8PCT")
+    if smh_1d_return is not None and smh_1d_return <= -0.040:
+        rotation_overlay = "INTRADAY_SEMI_CRASH"
+        reasons.append("SMH_1D_LE_-4.0PCT")
+
+    return {
+        "intraday_market_overlay": market_overlay,
+        "intraday_rotation_overlay": rotation_overlay,
+        "overlay_reasons": reasons,
+        "overlay_source_symbols": ["SPY", "QQQ", "SMH"],
+    }
+
+
+def apply_intraday_overlay_to_qty(qty: int, cluster: str, overlay: dict,
+                                  owner_strategy: str = "US_STANDARD") -> tuple[int, bool, str | None]:
+    """Scale/block a general PB1 BUY qty per intraday overlay.
+
+    TQQQ_INFINITE bypasses this entirely: its buy sizing/timing/unit count
+    must never change from intraday overlay state.
+    """
+    if owner_strategy == "TQQQ_INFINITE":
+        return qty, False, None
+    market = str(overlay.get("intraday_market_overlay") or "NORMAL")
+    rotation = str(overlay.get("intraday_rotation_overlay") or "NORMAL")
+    cluster = str(cluster or "").upper()
+    if market == "INTRADAY_MARKET_CRASH":
+        return 0, True, "INTRADAY_MARKET_CRASH_ENTRY_BLOCK"
+    if rotation == "INTRADAY_SEMI_CRASH" and cluster == "AI_SEMI":
+        return 0, True, "INTRADAY_SEMI_CRASH_AI_SEMI_BLOCK"
+    scale = 1.0
+    if market == "INTRADAY_RISK_OFF":
+        scale = 0.50
+    elif market == "INTRADAY_CAUTION":
+        scale = 0.75
+    if rotation == "INTRADAY_SEMI_CRASH" and cluster in {"MEGA_TECH", "TECH", "XLK"}:
+        scale = min(scale, 0.50)
+    if scale >= 1.0 or qty <= 0:
+        return qty, False, None
+    adjusted = max(1, int(qty * scale))
+    return adjusted, False, None
+
+
 def regime_constraints(market_regime: str) -> dict[str, Any]:
     r = str(market_regime or "NEUTRAL").upper()
     base = {"market_regime": r, "sector_cap_enforced": True, "force_entry_block": False}
@@ -545,6 +612,12 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
         "allow_add_to_existing": False if state == "DEFENSE_CRASH_REBOUND" else market_regime in {"NEUTRAL", "GROWTH_LEADERSHIP", "RISK_ON"},
         "trim_required": state in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED", "DEFENSE_RISK_OFF"},
         "intraday_rebound": rebound,
+        "base_market_state": state,
+        "base_rotation_regime": rotation_regime,
+        "effective_market_state": state,
+        "effective_rotation_regime": rotation_regime,
+        "intraday_overlay_available": bool(spy1 is not None and qqq1 is not None and smh1 is not None),
+        "overlay_source_symbols": ["SPY", "QQQ", "SMH"],
         "profit_capture_enabled": os.getenv("US_PROFIT_CAPTURE_ENABLE", "1") not in {"0", "false", "False"},
         "trailing_stop_mode": constraints.get("trailing_stop_mode", modes[state]),
         "trailing_stop_pct": trails[state],
@@ -561,7 +634,17 @@ def evaluate_us_market_state(*, trade_date: str, provider, rotation_context: dic
     if state == "DEFENSE_CRASH_REBOUND":
         out["effective_capital_scale"] = mults[state]
         out["effective_max_new_positions"] = constraints["max_new_positions"]
+
+    # Additive intraday overlay for general PB1 only; TQQQ_INFINITE never reads these keys.
+    intraday = compute_us_intraday_overlay(spy1, qqq1, smh1)
+    out["base_market_state"] = state
+    out["base_rotation_regime"] = rotation_regime
+    out.update(intraday)
+    out["effective_market_state"] = intraday["intraday_market_overlay"] if intraday["intraday_market_overlay"] != "NORMAL" else state
+    out["effective_rotation_regime"] = intraday["intraday_rotation_overlay"] if intraday["intraday_rotation_overlay"] != "NORMAL" else rotation_regime
+
     logger.info("[US_MARKET_STATE][REGIME] market_state=%s defense_regime=%s risk_on_regime=%s reasons=%s rotation_regime=%s spy_1d=%s qqq_1d=%s smh_1d=%s exposure_multiplier=%.2f allow_new_buy=%s allow_add_to_existing=%s allow_ai_tech_buy=%s", out["market_state"], out["defense_regime"], out["risk_on_regime"], out["market_state_reasons"], rotation_regime, spy1, qqq1, smh1, out["exposure_multiplier"], out["allow_new_buy"], out["allow_add_to_existing"], out["allow_ai_tech_buy"])
+    logger.info("[US_MARKET_STATE][INTRADAY_OVERLAY] intraday_market_overlay=%s intraday_rotation_overlay=%s overlay_reasons=%s overlay_source_symbols=%s", intraday["intraday_market_overlay"], intraday["intraday_rotation_overlay"], intraday["overlay_reasons"], intraday["overlay_source_symbols"])
     return out
 
 
@@ -663,6 +746,16 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
             continue
         sym = str(intent.get("symbol") or "").upper().strip()
         meta = intent.setdefault("meta", {}) if isinstance(intent.setdefault("meta", {}), dict) else {}
+        owner_strategy = str(intent.get("strategy_owner") or meta.get("strategy_owner") or intent.get("sleeve_id") or ("TQQQ_INFINITE" if sym == "TQQQ" else "US_STANDARD")).upper()
+        if owner_strategy == "TQQQ_INFINITE":
+            meta.update({
+                "strategy_owner": "TQQQ_INFINITE",
+                "overlay_bypass": True,
+                "overlay_ignored_reason": "infinite_strategy_buy_dip",
+            })
+            logger.info("[TQQQ_INF][OVERLAY_BYPASS] symbol=%s overlay=%s action=BUY_ALLOWED reason=infinite_strategy_buy_dip", sym, overlay.get("intraday_market_overlay"))
+            kept.append(intent)
+            continue
         metadata_mismatch = next(
             (
                 key for key in (
@@ -693,8 +786,22 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
             meta["block_stage"] = "metadata" if metadata_mismatch else "market_state"
             blocked.append({"symbol": sym, "cluster": cluster, "reason": reason, "block_stage": meta["block_stage"], "metadata_field": metadata_mismatch, "market_state": state})
             logger.warning("[US_MARKET_STATE][ENTRY_BLOCK] symbol=%s cluster=%s reason=%s market_state=%s", sym, cluster, reason, state)
-        else:
-            kept.append(intent)
+            continue
+        qty = int(intent.get("qty") or intent.get("quantity") or 0)
+        adjusted_qty, intraday_blocked, intraday_reason = apply_intraday_overlay_to_qty(qty, cluster, overlay, owner_strategy)
+        if intraday_blocked:
+            meta["blocked_reason"] = intraday_reason
+            meta["block_stage"] = "intraday_overlay"
+            blocked.append({"symbol": sym, "cluster": cluster, "reason": intraday_reason, "block_stage": "intraday_overlay", "metadata_field": None, "market_state": state})
+            logger.warning("[US_MARKET_STATE][INTRADAY_OVERLAY][ENTRY_BLOCK] symbol=%s cluster=%s reason=%s", sym, cluster, intraday_reason)
+            continue
+        if adjusted_qty != qty and qty > 0:
+            intent["qty"] = adjusted_qty
+            intent["quantity"] = adjusted_qty
+            meta["intraday_overlay_qty_scaled"] = True
+            meta["intraday_overlay_original_qty"] = qty
+            logger.info("[US_MARKET_STATE][INTRADAY_OVERLAY][QTY_SCALED] symbol=%s original_qty=%s adjusted_qty=%s", sym, qty, adjusted_qty)
+        kept.append(intent)
     return kept, blocked
 
 

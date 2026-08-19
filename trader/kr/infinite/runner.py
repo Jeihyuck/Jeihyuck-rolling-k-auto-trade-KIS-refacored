@@ -4,7 +4,8 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Callable
 
 from trader.kis_wrapper import KisAPI
@@ -16,6 +17,7 @@ from .executor import KISExecutor
 from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import cycle_id
 from .reconciliation import reconcile
+from .reconciliation import reconcile_order_fill_prices
 from .repository import InfiniteRepository
 from .regime_adapter import load_canonical_snapshot
 from .risk_adapter import allows_new_cycle
@@ -115,12 +117,16 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                 repository.save_state(state)
 
         cash = executor.orderable_cash(config.symbol, position.current_price)
+        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        minutes_since_open = (now_kst.hour * 60 + now_kst.minute + now_kst.second / 60) - (9 * 60)
         decision = evaluate(config=config, state=state, position=position, trade_date=day,
                             market_state=market_state, orderable_cash=cash, pending_buy=pending_buy,
                             pending_sell=pending_sell, existing_intent_keys=existing_keys,
                             regime_data_quality=quality,
                             trading_days_since_last_buy=trading_days_since(state.last_buy_date if state else None, day),
-                            allow_entry=allow_entry)
+                            allow_entry=allow_entry,
+                            best_ask=position.current_price,
+                            minutes_since_open=minutes_since_open)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
                      symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
                      idempotency_key=decision.idempotency_key)
@@ -146,6 +152,19 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # One immediate reconciliation is safe; absence of a fill consumes no unit.
         state, post_updates = _reconcile_pending(repository, executor, state, day)
         post_position = executor.position(config.symbol)
+        for intent, broker_state in post_updates:
+            reconciliation = reconcile_order_fill_prices(
+                order_price=position.current_price,
+                order_qty=int(getattr(intent, "requested_qty", 0) or 0),
+                broker_order_no=getattr(intent, "broker_order_id", None),
+                fill_price=getattr(broker_state, "filled_avg_price", None),
+                fill_qty=getattr(broker_state, "filled_qty", None),
+                broker_avg_after=post_position.average_price,
+                close_avg_price=post_position.average_price,
+            )
+            logger.info("[KR_INF][ORDER_RECONCILIATION] %s", reconciliation)
+            if state is not None:
+                state = replace(state, metadata={**state.metadata, "last_order_reconciliation": reconciliation})
         state, _ = reconcile(state, post_position, day,
                              pending_sell=decision.action == Action.SELL_ALL and post_position.qty > 0,
                              balance_grace_attempts=config.balance_reconcile_grace_attempts)

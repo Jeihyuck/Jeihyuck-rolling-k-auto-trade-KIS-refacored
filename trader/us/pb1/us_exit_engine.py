@@ -80,6 +80,25 @@ def _soft_stop_confirmed(position: dict, default_required: int = 2) -> tuple[boo
     return count >= required, count, required
 
 
+def soft_stop_repeat_allowed(position: dict, *, intraday_market_overlay: str = "NORMAL",
+                             close_session: bool = False) -> tuple[bool, str]:
+    """Allow one general-PB1 soft stop per lifecycle/day; infinite sleeves bypass."""
+    owner = str(position.get("owner_strategy") or position.get("strategy_owner") or position.get("sleeve_id") or "").upper()
+    if owner == "TQQQ_INFINITE" or str(position.get("symbol") or "").upper() == "TQQQ":
+        return True, "TQQQ_INFINITE_OVERLAY_BYPASS"
+    if not bool(position.get("soft_stop_triggered_today") or position.get("first_soft_stop_at")):
+        return True, "FIRST_SOFT_STOP"
+    current = float(position.get("current_price") or position.get("current_price_usd") or 0)
+    first = float(position.get("first_soft_stop_price") or 0)
+    entry = float(position.get("entry_price") or position.get("avg_cost") or 0)
+    hard_near = bool(entry > 0 and current <= entry * (1 - float(os.getenv("US_HARD_STOP_PCT", "0.08")) * 0.9))
+    extra_drop = bool(first > 0 and current <= first * 0.98)
+    crash = str(intraday_market_overlay).upper() == "INTRADAY_MARKET_CRASH"
+    if hard_near or extra_drop or close_session or crash:
+        return True, "SOFT_STOP_REPEAT_ALLOWED_BY_RISK_ESCALATION"
+    return False, "SOFT_STOP_REPEAT_BLOCKED"
+
+
 def _apply_sell_ratio(qty: int, ratio: float) -> int:
     return max(1, min(qty, int(qty * ratio)))
 
@@ -750,6 +769,12 @@ def _evaluate_exit_intents_from_snapshots(
             continue
 
         intent = route_exit_by_book_horizon(position=pos, current_price=current_price, now=now, include_trend_time=include_trend_time)
+        if intent is not None and intent.get("exit_type") in {"soft_stop_loss", "persistent_soft_stop_full_exit"}:
+            allowed, repeat_reason = soft_stop_repeat_allowed(pos, intraday_market_overlay=str(pos.get("intraday_market_overlay") or "NORMAL"), close_session=bool(pos.get("close_session")))
+            if not allowed:
+                pos["soft_stop_repeat_blocked_count"] = int(pos.get("soft_stop_repeat_blocked_count") or 0) + 1
+                logger.info("[US_EXIT][SOFT_STOP_REPEAT_BLOCKED] symbol=%s reason=%s", symbol, repeat_reason)
+                intent = None
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # Build exit explanation

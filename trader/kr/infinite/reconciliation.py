@@ -3,6 +3,30 @@ from datetime import date
 from .accounting import validate_invariants
 from .models import BrokerPosition, State, Status
 
+
+def reconcile_order_fill_prices(*, order_price: float, order_qty: int,
+                                broker_order_no: str|None = None,
+                                fill_price: float|None = None,
+                                fill_qty: int|None = None,
+                                broker_avg_after: float|None = None,
+                                close_avg_price: float|None = None) -> dict:
+    """Join KR infinite order, fill, and balance-average evidence."""
+    base = float(order_price or 0)
+    after = float(broker_avg_after or 0)
+    mismatch = bool(base > 0 and after > 0 and abs(base - after) / base >= 0.01)
+    return {
+        "order_price": base,
+        "order_qty": int(order_qty or 0),
+        "broker_order_no": broker_order_no,
+        "fill_price": fill_price,
+        "fill_qty": fill_qty,
+        "broker_avg_after": broker_avg_after,
+        "close_avg_price": close_avg_price,
+        "reconciliation_status": "KR_INF_ORDER_FILL_PRICE_MISMATCH" if mismatch else "OK",
+        "price_mismatch_pct": abs(base - after) / base if mismatch else 0.0,
+        "warning": "KR_INF_ORDER_FILL_PRICE_MISMATCH" if mismatch else None,
+    }
+
 def reconcile(state:State|None,position:BrokerPosition,trade_date:date,pending_sell:bool=False,
               balance_grace_attempts:int=3)->tuple[State|None,str]:
     if state is None and position.qty>0:return None,"KR_INF_UNOWNED_EXISTING_POSITION"

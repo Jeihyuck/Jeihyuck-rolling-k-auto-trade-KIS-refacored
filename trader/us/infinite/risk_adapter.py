@@ -58,6 +58,9 @@ def effective_regime(overlay: dict | None) -> tuple[str, float, bool, bool, str]
 def assess_market_risk(overlay: dict | None) -> RiskDecision:
     """Interpret the existing overlay conservatively; unknowns fail closed."""
     overlay = overlay or {}
+    if (str(overlay.get("strategy_owner") or overlay.get("owner_strategy") or overlay.get("sleeve_id") or "").upper() == "TQQQ_INFINITE"
+            and (overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay"))):
+        return RiskDecision(True, "infinite_overlay_bypass", market_state=str(overlay.get("market_state") or ""), market_regime=str(overlay.get("market_regime") or ""))
     state = str(overlay.get("market_state") or "").upper()
     regime = str(overlay.get("market_regime") or "").upper()
     reason = " ".join(str(x) for x in (
