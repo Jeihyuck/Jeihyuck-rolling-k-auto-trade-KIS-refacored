@@ -24,6 +24,7 @@ from .risk_adapter import allows_new_cycle
 from .strategy import evaluate, trading_days_since
 
 logger = logging.getLogger(__name__)
+_LAST_GOOD_BALANCE: tuple[dict, datetime] | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,19 @@ def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: S
         if state is not None:
             state, _, _ = apply_confirmed_fill(state, intent, broker, trade_date)
     return state, updates
+
+
+def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
+                       position: BrokerPosition, trade_date: date,
+                       market_state: str | None = None,
+                       orderable_cash: float = 0) -> Decision:
+    """Evaluate KR_INFINITE exits only; BUY/RECOVERY/NEW_CYCLE are impossible."""
+    decision = evaluate(config=config, state=state, position=position, trade_date=trade_date,
+                        market_state=market_state or "KR_NORMAL", orderable_cash=orderable_cash,
+                        allow_entry=False, best_ask=position.current_price)
+    if decision.action != Action.SELL_ALL:
+        return Decision(Action.WAIT, "KR_INF_EXIT_ONLY_NO_SELL")
+    return decision
 
 
 def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
@@ -127,6 +141,9 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             allow_entry=allow_entry,
                             best_ask=position.current_price,
                             minutes_since_open=minutes_since_open)
+        if decision.metadata and state is not None:
+            state = replace(state, metadata={**state.metadata, **decision.metadata})
+            repository.save_state(state)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
                      symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
                      idempotency_key=decision.idempotency_key)

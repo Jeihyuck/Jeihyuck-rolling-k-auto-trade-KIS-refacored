@@ -225,6 +225,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             entry_allowed=entry_allowed, buy_multiplier=multiplier,
                             regime_reserve_permission=regime_reserve_permission,
                             effective_regime_name=regime)
+        if decision.metadata and state is not None:
+            state = replace(state, metadata={**state.metadata, **decision.metadata})
+            repository.save_state(state)
         logger.info("[TQQQ_INF][BUY_POLICY] effective_regime=%s multiplier=%s entry_evaluation_allowed=%s final_notional=%s reason=%s",
                     regime, multiplier, int(entry_allowed), decision.notional, decision.reason)
         calculated_return = ((broker.price / broker.average_price) - 1
@@ -277,7 +280,9 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         theme_cluster = "ETF_INDEX"
         classification_source = "TQQQ_INFINITE_POLICY"
         position_state = "HELD" if broker.qty > 0 else "NOT_HELD"
-        position_action = ("FULL_EXIT_SELL" if decision.action == Action.SELL else
+        profit_stage = str(decision.metadata.get("profit_stage") or "")
+        position_action = ("PARTIAL_EXIT_SELL" if decision.action == Action.SELL and profit_stage == "TP1" else
+                   "FULL_EXIT_SELL" if decision.action == Action.SELL else
                            "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY")
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
                          and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND" else None)
@@ -291,9 +296,11 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "position_lifecycle_id": lifecycle_id, "tp_threshold_fraction": str(config.take_profit_pct),
             "holding_qty": broker.qty, "orderable_qty": broker.orderable_qty,
             "sellable_qty": broker.orderable_qty, "available_qty": broker.orderable_qty,
-            "partial_exit_allowed": False,
+            "partial_exit_allowed": profit_stage == "TP1",
+            "profit_stage": profit_stage or None,
         } if decision.action == Action.SELL else {}
-        client_order_key = f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{decision.action.value}"
+        stage_key = profit_stage or ("BUY" if decision.action == Action.BUY else decision.action.value)
+        client_order_key = f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{stage_key}"
         if decision.action == Action.SELL and was_full_exit_pending:
             sequence = (repository.next_full_exit_sequence(trading_date, state.cycle_id)
                         if hasattr(repository, "next_full_exit_sequence") else 1)
@@ -318,6 +325,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "policy_action": policy_action,
                      "book": "TQQQ_INFINITE", "horizon": "INFINITE_CYCLE",
                      "cycle_id": state.cycle_id,
+                     "profit_stage": decision.metadata.get("profit_stage"),
+                     "tp1_sold_qty": decision.metadata.get("tp1_sold_qty"),
+                     "remaining_qty": decision.metadata.get("remaining_qty"),
+                     "return_rate_at_decision": decision.metadata.get("return_rate_at_decision"),
                      "owner_strategy": "TQQQ_INFINITE",
                      "remaining_units": md.get("remaining_units"),
                      "overlay_bypass": True,

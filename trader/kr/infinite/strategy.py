@@ -7,6 +7,24 @@ from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import idempotency_key
 from .risk_adapter import allows_new_cycle, buy_pause_reason
 
+
+def adaptive_tp_stage(*, market_state: str | None, units_used: int, cycle_age_trading_days: int) -> tuple[float, float, str]:
+    """Return (threshold_pct, sell_fraction, stage) for the current adaptive TP tier.
+
+    Capital-recovery mode (deep cycle / stale age) takes priority: a small
+    +3~5% recovery exit rather than waiting for the full +10% target.
+    """
+    if units_used >= 30 or cycle_age_trading_days >= 30:
+        return 0.04, 1.0, "CAPITAL_RECOVERY"
+    state = str(market_state or "").upper()
+    if state == "KR_NORMAL":
+        return 0.06, 0.5, "TP1"
+    if state in {"KR_STRONG_RISK_ON", "KR_RISK_ON"}:
+        return 0.07, 0.5, "TP1"
+    if state in {"KR_DEFENSE_CAUTION", "KR_DEFENSE_RISK_OFF", "KR_DEFENSE_CRASH"}:
+        return 0.05, 0.85, "TP1_DEFENSE"
+    return 0.05, 0.5, "TP1"
+
 def trading_days_since(start: date|None, end: date) -> int:
     if start is None or start >= end: return 0
     from datetime import timedelta
@@ -36,6 +54,40 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     if state.status == Status.FROZEN: return Decision(Action.BLOCK,"KR_INF_STATE_FROZEN",next_status=Status.FROZEN)
     if state.status == Status.COMPLETE and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if state.status == Status.ACTIVE and (not state.cycle_id or position.qty == 0): return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
+    if position.qty > 0 and position.average_price > 0:
+        profit_pct = position.current_price / position.average_price - 1.0
+        metadata = dict(state.metadata or {})
+        stage = str(metadata.get("profit_stage") or "NONE").upper()
+        state_name = str(market_state or "KR_NORMAL").upper()
+        adaptive_enabled = state.units_used >= 5 and state_name in {
+            "KR_NORMAL", "KR_RISK_ON", "KR_STRONG_RISK_ON",
+            "KR_DEFENSE_CAUTION", "KR_DEFENSE_RISK_OFF",
+        }
+        if adaptive_enabled and stage in {"NONE", "TP1_PENDING"}:
+            threshold, fraction, next_stage = adaptive_tp_stage(
+                market_state=state_name,
+                units_used=state.units_used,
+                cycle_age_trading_days=state.cycle_age_trading_days,
+            )
+        elif adaptive_enabled and stage == "TP1":
+            threshold = 0.10 if state_name in {"KR_RISK_ON", "KR_STRONG_RISK_ON"} else 0.07
+            fraction, next_stage = 1.0, "TP2"
+        else:
+            threshold, fraction, next_stage = 999.0, 0.0, "NONE"
+        if profit_pct >= threshold and next_stage != "NONE":
+            if pending_sell:
+                return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+            orderable = int(position.orderable_qty or 0)
+            if orderable <= 0:
+                return Decision(Action.WAIT, "KR_INF_PROFIT_NO_ORDERABLE_QTY")
+            sell_qty = min(orderable, max(1, int(orderable * fraction)))
+            if next_stage == "TP2" or fraction >= 0.99:
+                sell_qty = orderable
+            key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}")
+            return Decision(Action.SELL_ALL, f"TAKE_PROFIT_{next_stage}", sell_qty,
+                            sell_qty * position.current_price, key, Status.EXIT_PENDING,
+                            {"profit_stage": next_stage, "tp1_sold_qty": sell_qty if next_stage != "TP2" else metadata.get("tp1_sold_qty", 0),
+                             "remaining_qty": max(0, position.qty - sell_qty), "return_rate_at_decision": profit_pct})
     if position.qty > 0 and position.current_price + 1e-9 >= position.average_price*(1+config.take_profit_pct):
         if pending_sell: return Decision(Action.WAIT,"PENDING_SELL",next_status=Status.EXIT_PENDING)
         key=idempotency_key(state.cycle_id or "MISSING",trade_date,"SELL_ALL")

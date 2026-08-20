@@ -11501,6 +11501,25 @@ class PB1Engine:
         qty = int(pos.get("qty") or 0)
         if sid != 1 or qty <= 0:
             return None
+        _pos_meta = pos.get("position_meta") or {}
+        if isinstance(_pos_meta, str):
+            try:
+                import json as _json
+                _pos_meta = _json.loads(_pos_meta)
+            except Exception:
+                _pos_meta = {}
+        _owner_strategy = str(
+            pos.get("owner_strategy")
+            or _pos_meta.get("owner_strategy")
+            or (pos.get("entry_meta_json") or {}).get("owner_strategy")
+            or ""
+        ).upper()
+        if code == "122630" and _owner_strategy == "KR_INFINITE":
+            logger.info(
+                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s reason=KR_INFINITE_OWNED action=KR_INFINITE_EXIT_ONLY",
+                display_code,
+            )
+            return None
 
         mark, _source = self._resolve_price_with_fallback(
             code,

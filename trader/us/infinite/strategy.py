@@ -40,6 +40,17 @@ def classify_long_trend(overlay: dict | None, structural_bear_seen: bool = False
     return "TRANSITION"
 
 
+def adaptive_tp_stage(*, market_state: str, cycle_age: int, units_used: int) -> tuple[float, float, str]:
+    state = str(market_state or "NORMAL").upper()
+    if state in {"RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL"}:
+        return 0.05, 0.70, "TP1"
+    if state in {"RISK_ON", "STRONG_RISK_ON"}:
+        return 0.07, 0.50, "TP1"
+    if state == "CAPITAL_PRESERVATION" or units_used >= 30 or cycle_age >= 30:
+        return 0.04, 1.0, "CAPITAL_RECOVERY"
+    return 0.07, 0.50, "TP1"
+
+
 def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: PositionSnapshot,
              trading_date: date, pending_buy: bool = False, pending_sell: bool = False,
              daily_filled_buy_notional: float = 0.0, overlay: dict | None = None,
@@ -74,42 +85,99 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.BLOCK, "tqqq_price_unavailable")
 
     # EXIT is evaluated before every BUY pause and remains active during age/DD pauses.
+    profit_pct = position.price / position.average_price - 1 if position.average_price > 0 else 0.0
+    state_metadata = dict(state.metadata or {})
+    profit_stage = str(state_metadata.get("profit_stage") or "NONE").upper()
+    overlay_state = str(overlay.get("market_state") or effective_regime_name or "NORMAL").upper() if overlay else str(effective_regime_name or "NORMAL").upper()
     target = position.average_price * (1 + config.take_profit_pct)
-    if position.qty > 0 and position.average_price > 0 and position.price + 1e-9 >= target:
-        if not config.allow_sell:
-            return Decision(Action.BLOCK, "sell_permission_disabled")
+    if state.status == Status.EXIT_PENDING and position.qty > 0 and position.price + 1e-9 < target:
         if pending_sell:
             return Decision(Action.BLOCK, "tqqq_full_exit_pending", next_status=Status.EXIT_PENDING)
-        if position.orderable_qty is None:
-            return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
-        if position.orderable_qty <= 0:
-            return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
-        if position.orderable_qty != position.qty:
-            return Decision(Action.BLOCK, "tqqq_full_exit_qty_not_ready")
-        sell_qty = position.qty
-        return Decision(Action.SELL, "take_profit", qty=sell_qty,
-                        notional=sell_qty * position.price, next_status=Status.EXIT_PENDING)
+        return Decision(Action.WAIT, "exit_pending", next_status=Status.EXIT_PENDING)
+    if position.qty > 0 and position.average_price > 0 and config.allow_sell:
+        if profit_stage in {"TP1", "TP2", "CAPITAL_RECOVERY"}:
+            threshold, fraction, next_stage = (0.10, 1.0, "TP2") if profit_stage == "TP1" else (999.0, 0.0, "NONE")
+            if profit_stage == "TP1" and profit_pct >= threshold and next_stage != "NONE":
+                if pending_sell:
+                    return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+                orderable = int(position.orderable_qty or 0)
+                if orderable <= 0:
+                    return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
+                sell_qty = min(orderable, max(1, int(orderable * fraction)))
+                if fraction >= 0.99:
+                    sell_qty = orderable
+                key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
+                return Decision(Action.SELL, f"TAKE_PROFIT_{next_stage}", sell_qty,
+                                sell_qty * position.price, Status.EXIT_PENDING,
+                                {"profit_stage": next_stage, "tp1_sold_qty": sell_qty if next_stage != "TP2" else state_metadata.get("tp1_sold_qty", 0),
+                                 "remaining_qty": max(0, position.qty - sell_qty), "return_rate_at_decision": profit_pct,
+                                 "tp_threshold_fraction": threshold})
+        elif profit_stage in {"NONE", "TP1_PENDING"} and position.price + 1e-9 >= target:
+            if not config.allow_sell:
+                return Decision(Action.BLOCK, "sell_permission_disabled")
+            if pending_sell:
+                return Decision(Action.BLOCK, "tqqq_full_exit_pending", next_status=Status.EXIT_PENDING)
+            if position.orderable_qty is None:
+                return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
+            if position.orderable_qty <= 0:
+                return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
+            if position.orderable_qty != position.qty:
+                return Decision(Action.BLOCK, "tqqq_full_exit_qty_not_ready")
+            sell_qty = position.qty
+            return Decision(Action.SELL, "take_profit", qty=sell_qty,
+                            notional=sell_qty * position.price, next_status=Status.EXIT_PENDING)
+        elif profit_stage in {"NONE", "TP1_PENDING"}:
+            if position.price < target and target - position.price <= 0.01:
+                return Decision(Action.WAIT, "tqqq_full_exit_threshold_not_reached",
+                                next_status=Status.EXIT_PENDING if state.status == Status.EXIT_PENDING else Status.ACTIVE)
+            threshold, fraction, next_stage = adaptive_tp_stage(
+                market_state=overlay_state,
+                cycle_age=state.cycle_age_trading_days,
+                units_used=int(state_metadata.get("units_used") or round(state.total_filled_notional / config.unit_usd)),
+            )
+            if profit_pct >= threshold and next_stage != "NONE":
+                if pending_sell:
+                    return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+                orderable = int(position.orderable_qty or 0)
+                if orderable <= 0:
+                    return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
+                sell_qty = min(orderable, max(1, int(orderable * fraction)))
+                if fraction >= 0.99:
+                    sell_qty = orderable
+                key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
+                return Decision(Action.SELL, f"TAKE_PROFIT_{next_stage}", sell_qty,
+                                sell_qty * position.price, Status.EXIT_PENDING,
+                                {"profit_stage": next_stage, "tp1_sold_qty": sell_qty if next_stage != "TP2" else state_metadata.get("tp1_sold_qty", 0),
+                                 "remaining_qty": max(0, position.qty - sell_qty), "return_rate_at_decision": profit_pct,
+                                 "tp_threshold_fraction": threshold})
+    if position.qty == 0 and state.status == Status.COMPLETE and state.last_exit_date == trading_date:
+        return Decision(Action.BLOCK, "same_day_cycle_restart")
     if state.status == Status.EXIT_PENDING:
         if position.qty == 0:
             return Decision(Action.WAIT, "confirmed_exit_complete", next_status=Status.COMPLETE)
+        if pending_sell:
+            return Decision(Action.BLOCK, "tqqq_full_exit_pending", next_status=Status.EXIT_PENDING)
         return Decision(Action.WAIT, "exit_pending", next_status=Status.EXIT_PENDING)
-    if position.qty == 0 and state.status == Status.COMPLETE and state.last_exit_date == trading_date:
-        return Decision(Action.BLOCK, "same_day_cycle_restart")
     if pending_sell:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if pending_buy:
         return Decision(Action.BLOCK, "tqqq_pending_order_exists")
     if not entry_allowed:
-        if config.symbol != "TQQQ" or not (overlay and (overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay"))):
+        if config.symbol != "TQQQ":
             return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
+    if position.qty > 0 and not config.allow_sell:
+        return Decision(Action.BLOCK, "sell_permission_disabled")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
         return Decision(Action.BLOCK, "daily_buy_limit")
     overlay = dict(overlay or {})
-    infinite_overlay_bypass = config.symbol == "TQQQ" and bool(
-        overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay")
-    )
+    infinite_overlay_bypass = config.symbol == "TQQQ"
+    explicit_intraday_bypass = bool(overlay.get("intraday_market_overlay") or
+                                    overlay.get("intraday_rotation_overlay"))
+    metadata = state.metadata or {}
+    recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
+                              and not metadata.get("last_buy_fill_price"))
     if infinite_overlay_bypass:
         overlay["strategy_owner"] = "TQQQ_INFINITE"
     risk = assess_market_risk(overlay)
@@ -135,13 +203,34 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             valid_context = False
     if not valid_context:
         return Decision(Action.BLOCK, "tqqq_required_market_data_missing")
-    if not infinite_overlay_bypass and position.qty <= 0 and effective_regime_name in {
+    days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
+                  if state.last_buy_date else 10_000)
+    fast_dip_add_eligible = False
+    if position.qty > 0 and "last_buy_fill_price" in state_metadata and not recovery_uncertain:
+        last_fill = state_metadata.get("last_buy_fill_price")
+        try:
+            last_fill = float(last_fill) if last_fill is not None else None
+        except (TypeError, ValueError):
+            last_fill = None
+        if last_fill is not None and position.price <= last_fill * 0.99 and days_since >= 1:
+            fast_dip_add_eligible = True
+    if (fast_dip_add_eligible and position.qty > 0 and not pending_buy and
+            (explicit_intraday_bypass or overlay.get("force_entry_block") is True or
+             overlay.get("allow_new_buy") is False)):
+        budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
+                     config.max_total_capital_usd - state.total_filled_notional)
+        qty = math.floor(budget / position.price)
+        if qty > 0:
+            return Decision(Action.BUY, "FAST_DIP_ADD_BUY", qty=qty,
+                            notional=qty * position.price, next_status=Status.ACTIVE,
+                            metadata={"fast_dip": True, "overlay_bypass": True})
+    if position.qty <= 0 and effective_regime_name in {
         "RISK_OFF", "DEFENSIVE", "CHOP_HIGH_VOL", "CAPITAL_PRESERVATION"
     }:
         return Decision(Action.BLOCK, "tqqq_regime_new_cycle_block")
-    if not infinite_overlay_bypass and overlay.get("force_entry_block") is True:
+    if overlay.get("force_entry_block") is True and not fast_dip_add_eligible and not explicit_intraday_bypass:
         return Decision(Action.BLOCK, "overlay_force_entry_block")
-    if not infinite_overlay_bypass and position.qty <= 0 and overlay.get("allow_new_buy") is False:
+    if position.qty <= 0 and overlay.get("allow_new_buy") is False and not explicit_intraday_bypass:
         return Decision(Action.BLOCK, "overlay_new_buy_block")
     if position.qty > 0 and overlay.get("allow_add_to_existing") is False:
         # Standard gross/cluster overlays do not own this sleeve. Only an
@@ -149,12 +238,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         if overlay.get("tqqq_capital_preservation"):
             return Decision(Action.BLOCK, "tqqq_capital_preservation")
 
-    metadata = state.metadata or {}
     policy_regime = effective_regime_name or risk.market_state
-    if infinite_overlay_bypass and (overlay.get("intraday_market_overlay") or overlay.get("intraday_rotation_overlay")):
-        policy_regime = str(overlay.get("base_market_state") or "NORMAL")
-    recovery_uncertain = bool(position.qty > 0 and metadata.get("recovery_accounting_uncertain")
-                              and not metadata.get("last_buy_fill_price"))
     # Uncertain recovery may resume conservative core buys, but can never use
     # reserve or a bullish/recovery premium until attributed fill evidence is
     # found.  The broker average remains a decision reference, never a fill.
@@ -194,6 +278,11 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     days_since = (_trading_days_since(state.last_buy_date, trading_date, trading_sessions)
                   if state.last_buy_date else 10_000)
 
+    last_fill = state_metadata.get("last_buy_fill_price")
+    try:
+        last_fill = float(last_fill) if last_fill is not None else None
+    except (TypeError, ValueError):
+        last_fill = None
     if policy_regime == "DEFENSE_CRASH_REBOUND":
         probe_date = metadata.get("rebound_probe_date")
         try:
@@ -254,12 +343,22 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         )
         if not deep_bear:
             return Decision(Action.BLOCK, "deep_bear_core_locked")
+    if (position.qty > 0 and overlay.get("allow_add_to_existing") is not False and days_since >= 1
+            and last_fill and position.price <= last_fill * 0.99 and not pending_buy
+            and daily_filled_buy_notional < config.max_daily_buy_usd - 1e-6):
+        budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
+                     config.max_total_capital_usd - state.total_filled_notional)
+        qty = math.floor(budget / position.price)
+        if qty > 0:
+            return Decision(Action.BUY, "FAST_DIP_ADD_BUY", qty=qty,
+                            notional=qty * position.price, next_status=Status.ACTIVE,
+                            metadata={"fast_dip": True, "overlay_bypass": True})
     if core_left <= 0 and not effective_reserve_available:
         return Decision(Action.BLOCK, "reserve_locked")
     available = core_left if core_left > 0 else reserve_left
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
-    effective_buy_multiplier = 1.0 if infinite_overlay_bypass else buy_multiplier
+    effective_buy_multiplier = 1.0 if explicit_intraday_bypass else buy_multiplier
     budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)
     notional = qty * position.price

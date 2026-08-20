@@ -82,3 +82,4 @@ class Decision:
     qty: int = 0
     notional: float = 0.0
     next_status: Status | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)

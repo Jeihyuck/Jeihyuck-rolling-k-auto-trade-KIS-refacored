@@ -16,7 +16,7 @@ class KISExecutor:
         self.kis_env = kis_env
 
     def _balance(self) -> dict:
-        raw = self.kis.get_balance(force=True)
+        raw = self.kis.get_balance()
         if not isinstance(raw, dict) or raw.get("_stub"):
             raise RuntimeError("KR_INF_RECONCILE_BROKER_UNAVAILABLE")
         return raw

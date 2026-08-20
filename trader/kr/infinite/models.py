@@ -29,6 +29,7 @@ class BrokerPosition:
 @dataclass(frozen=True)
 class Decision:
     action: Action; reason: str; qty: int=0; notional: float=0; idempotency_key: str|None=None; next_status: Status|None=None
+    metadata: dict[str, Any]=field(default_factory=dict)
 
 @dataclass(frozen=True)
 class OrderIntent:

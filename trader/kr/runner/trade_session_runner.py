@@ -34,6 +34,7 @@ from trader.kr.diagnostics import write_kr_diagnostics_manifest
 from trader.kr.runner.session_policy import exit_code_for_result, kr_prep_schedule_guard, now_kst, wait_until_kr_am_target
 
 logger = logging.getLogger(__name__)
+_LAST_GOOD_BALANCE: tuple[dict[str, Any], datetime] | None = None
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -382,12 +383,15 @@ def _guard_trade_session(session: str, ctx: KrSessionContext) -> dict[str, Any] 
             pass
 
 def _assert_balance_available(session: str) -> dict[str, Any] | None:
+    global _LAST_GOOD_BALANCE
     td = os.getenv("KR_TRADE_DATE") or _now_kst().strftime("%Y-%m-%d")
     out = ROOT / "runtime/kr/session" / td / session / "balance_precheck.json"
     try:
         raw = KisAPI().get_balance_cached()
         snapshot = raw[0] if isinstance(raw, tuple) else raw
         snapshot = snapshot if isinstance(snapshot, dict) else None
+        if snapshot:
+            _LAST_GOOD_BALANCE = (snapshot, _now_kst())
         pre = BalancePrecheck(
             "OK",
             "KIS",
@@ -412,6 +416,12 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
         try:
             fail_soft = resolve_kr_balance_fail_soft(exc, env=env)
             cached = None
+            if _LAST_GOOD_BALANCE:
+                candidate, saved_at = _LAST_GOOD_BALANCE
+                if (_now_kst() - saved_at).total_seconds() <= float(os.getenv("KR_BALANCE_SNAPSHOT_MAX_AGE_SEC", "300")):
+                    cached = {"raw_snapshot": candidate, "raw_snapshot_available": True,
+                              "cash": _balance_cash(candidate), "holdings_count": _balance_holdings_count(candidate),
+                              "positions_summary": {"holdings_count": _balance_holdings_count(candidate)}}
             max_age = float(os.getenv("KR_BALANCE_SNAPSHOT_MAX_AGE_SEC", "300"))
             if out.exists():
                 try:
@@ -424,8 +434,8 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
                     logger.warning("[KR_SESSION][BALANCE_CACHE][READ_WARN] err=%s", cache_exc)
             logger.warning("[KR_SESSION][BALANCE_FAIL_SOFT] session=%s reason=%s", session, fail_soft.get("reason"))
             entry_allowed = False
-            exit_allowed = bool(cached) or bool(fail_soft.get("exit_allowed")) or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_EXIT", "1") == "1"
-            close_allowed = session == "close" or bool(cached) or os.getenv("KR_ALLOW_BALANCE_CACHE_FOR_CLOSE", "1") == "1"
+            exit_allowed = bool(cached)
+            close_allowed = bool(cached)
             pre = BalancePrecheck("TIMEOUT", "PERSISTED_CACHE" if cached else ("CACHE" if (exit_allowed or close_allowed) else "NONE"), _now_kst(), entry_allowed, exit_allowed, close_allowed, "STALE_OR_MISSING_BALANCE" if not cached else "BALANCE_TIMEOUT_USING_FRESH_SNAPSHOT", raw_snapshot_available=bool(cached), raw_snapshot=(cached or {}).get("raw_snapshot"), cash=(cached or {}).get("cash"), holdings_count=(cached or {}).get("holdings_count"), positions_summary=(cached or {}).get("positions_summary"))
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(asdict(pre), ensure_ascii=False, default=str, indent=2), encoding="utf-8")
@@ -578,6 +588,8 @@ def normalize_kr_session_completion(
     }
     pb1_status_u = str(pb1_status or "").upper()
     pb1_exit_reason_s = str(pb1_exit_reason or "")
+    if "FATAL_RUNTIME_REPEAT" in f"{pb1_status_u} {pb1_exit_reason_s.upper()}":
+        return "FAILED", "FATAL_RUNTIME_REPEAT", 0, 1
     if pb1_status_u == "SKIP_LOCKED" or pb1_exit_reason_s == "PB1_ADVISORY_LOCK_UNAVAILABLE":
         return "FAILED", "PB1_ADVISORY_LOCK_UNAVAILABLE", 0, 1
     if pb1_exit_reason_s == "PB1_RESULT_MISSING":
@@ -778,7 +790,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     if session == "close":
         raw_balance = None
         try:
-            raw_balance = KisAPI().get_balance(force=True)
+            raw_balance = KisAPI().get_balance()
         except Exception as exc:
             logger.warning("[KR_CLOSE][BALANCE_INCONSISTENT][RELOAD_WARN] err=%s", exc)
         guard = close_balance_guard(
