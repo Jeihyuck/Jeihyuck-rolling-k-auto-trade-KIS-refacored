@@ -5307,14 +5307,12 @@ class PB1Engine:
             )
         if bool(gate_context.get("open_order_exists")):
             reason_codes.append("BUYABLE_OPEN_ORDER")
-        if bool(gate_context.get("today_submit_exists")):
-            reason_codes.append("BUYABLE_TODAY_SUBMIT")
-        if bool(gate_context.get("today_fill_exists")):
-            reason_codes.append("BUYABLE_TODAY_FILL")
-        if bool(gate_context.get("today_buy_exists")):
-            reason_codes.append("BUYABLE_TODAY_BUY_EXISTS")
-        # [2026-04-30] 당일 매도 후 재매수 차단
-        if bool(gate_context.get("today_sell_exists")):
+        same_day_sell = bool(gate_context.get("today_sell_exists"))
+        reentry_allowed = False
+        # Evaluate the explicit re-entry contract before generic same-day
+        # submit/fill gates.  A confirmed SELL is itself both a submit and a
+        # fill; those facts must not make the recovery allow path impossible.
+        if same_day_sell:
             block_rebuy = os.getenv("PB1_BLOCK_REBUY_AFTER_SELL_SAME_DAY", "1") not in {"0", "false", "False"}
             reentry = evaluate_same_day_reentry(
                 sell_exists=True, sell_confirmed=bool(gate_context.get("sell_confirmed")),
@@ -5333,9 +5331,17 @@ class PB1Engine:
                             self._display_code(code), reentry.reason, gate_context.get("prior_sell_reason_family"),
                             int(bool(gate_context.get("pending_sell"))), int(bool(gate_context.get("sell_confirmed"))))
             elif block_rebuy and reentry.allowed:
+                reentry_allowed = True
                 logger.info("[PB1][REBUY][ALLOW] symbol=%s prior_sell_reason_family=%s prior_sell_confirmed=1 cooldown_min=%s market_state=%s reason=%s",
                             self._display_code(code), gate_context.get("prior_sell_reason_family"),
                             gate_context.get("sell_cooldown_elapsed_min"), gate_context.get("market_state"), reentry.reason)
+        if not reentry_allowed:
+            if bool(gate_context.get("today_submit_exists")):
+                reason_codes.append("BUYABLE_TODAY_SUBMIT")
+            if bool(gate_context.get("today_fill_exists")):
+                reason_codes.append("BUYABLE_TODAY_FILL")
+            if bool(gate_context.get("today_buy_exists")):
+                reason_codes.append("BUYABLE_TODAY_BUY_EXISTS")
         if bool(gate_context.get("cooldown_active")):
             reason_codes.append("BUYABLE_COOLDOWN")
         if bool(gate_context.get("blocking_duplicate_exists")):
