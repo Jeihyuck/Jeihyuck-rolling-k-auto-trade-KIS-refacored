@@ -138,7 +138,11 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                 state = _new_cycle(state, executor, config, day)
                 repository.save_state(state)
 
-        cash = executor.orderable_cash(config.symbol, position.current_price)
+        # Exit-only and already-held ticks never need buying-power data.  This
+        # avoids a second KIS transaction endpoint call (EGW00215) on the hot
+        # sell/reconcile path; cash is fetched only for a possible new cycle.
+        cash = (executor.orderable_cash(config.symbol, position.current_price)
+                if allow_entry and position.qty == 0 else 0.0)
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
         minutes_since_open = (now_kst.hour * 60 + now_kst.minute + now_kst.second / 60) - (9 * 60)
         decision = evaluate(config=config, state=state, position=position, trade_date=day,

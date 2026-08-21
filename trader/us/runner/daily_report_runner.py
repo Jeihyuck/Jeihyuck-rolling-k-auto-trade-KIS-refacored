@@ -320,9 +320,12 @@ def _load_contract_status_snapshot(trade_date: str) -> dict:
         "pinned_trade_block_reason": str(effective.get("trade_block_reason") or "") if effective else None,
     }
 
-def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int) -> dict:
+def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: int, router_summary: int,
+                            canceled_orders: int = 0, broker_pending: int = 0,
+                            fills_query_ok: bool = True, balance_snapshot_ok: bool = True) -> dict:
+    active_db_orders = max(0, int(db_orders or 0) - int(canceled_orders or 0))
     sources = {
-        "db_orders": int(db_orders or 0),
+        "db_orders": active_db_orders,
         "fills": int(fills or 0),
         "balance_confirmed": int(balance_confirmed or 0),
         "router_summary": int(router_summary or 0),
@@ -336,6 +339,7 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
     broker_reconciled = sources["fills"] > 0 and sources["fills"] == sources["db_orders"] and (
         sources["router_summary"] in {0, sources["db_orders"]} or sources["router_summary"] <= sources["fills"]
     )
+    broker_clean = int(broker_pending or 0) == 0 and fills_query_ok and balance_snapshot_ok
     if nonzero and len(set(sources.values())) > 1 and not broker_reconciled:
         warnings.append("SOURCE_MISMATCH")
         if sources["db_orders"] > 0 and sources["router_summary"] == 0:
@@ -348,13 +352,15 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
             warnings.append("SOURCE_MISMATCH_SESSION_SUMMARY_OVERWRITTEN_OR_MISSING")
     if sources["fills"] < orders_ack:
         warnings.append("FILL_API_LESS_THAN_ACK")
+    consistency = "BROKER_RECONCILED" if broker_reconciled else ("OK_WITH_WARNINGS" if broker_clean and warnings else "OK")
     return {
         **sources,
         "orders_ack": orders_ack,
         "fill_api_count": sources["fills"],
         "balance_confirmed_count": sources["balance_confirmed"],
         "warnings": warnings,
-        "consistency": "BROKER_RECONCILED" if broker_reconciled else "OK",
+        "canceled_orders": int(canceled_orders or 0),
+        "consistency": consistency,
         "broker_reconciled": broker_reconciled,
     }
 

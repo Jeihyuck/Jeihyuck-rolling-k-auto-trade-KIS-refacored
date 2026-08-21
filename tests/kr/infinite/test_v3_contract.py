@@ -47,3 +47,19 @@ def test_pb1_tick_owns_sleeve_and_standard_engine_reserves_symbol():
     assert "balance_snapshot=balance_snapshot_raw" in runner
     assert 'if code == "122630":' in engine
     assert "KR_INF_OWNERSHIP_RESERVED" in engine
+
+
+def test_partial_sell_fill_keeps_submitted_stage_pending():
+    state = replace(active(), metadata={"pending_profit_stage": "TP1_SUBMITTED"})
+    intent = OrderIntent(2, state.cycle_id, DAY, "SELL_ALL", "partial", 10)
+    partial, qty, _ = apply_confirmed_fill(state, intent, BrokerOrderState("PARTIALLY_FILLED", 4, 420, 105), DAY)
+    assert qty == 4
+    assert partial.metadata["pending_profit_stage"] == "TP1_SUBMITTED"
+    assert partial.metadata["partial_profit_stage"] == "TP1_PARTIAL"
+    assert not str(partial.metadata.get("profit_stage") or "").endswith("_FILLED")
+
+
+def test_pb1_route_final_fence_rejects_reserved_symbol():
+    from trader.pb1_engine import enforce_kr_order_ownership
+    assert enforce_kr_order_ownership("122630", "KR_STANDARD") == (False, "KR_INF_OWNERSHIP_RESERVED")
+    assert enforce_kr_order_ownership("122630", "KR_INFINITE") == (True, None)

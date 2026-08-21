@@ -228,6 +228,15 @@ from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst
 from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
+
+
+def enforce_kr_order_ownership(symbol: str, strategy_owner: str | None) -> tuple[bool, str | None]:
+    """Final routing fence for the KR Infinite reserved symbol."""
+    code = str(symbol or "").lstrip("A").zfill(6)
+    owner = str(strategy_owner or "").upper()
+    if code == "122630" and owner != "KR_INFINITE":
+        return False, "KR_INF_OWNERSHIP_RESERVED"
+    return True, None
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
     build_kr_regime_snapshot, build_market_local_overlay, calculate_global_market_state, calculate_market_budgets, candidate_allows_buy, execution_policy, market_allows_buy, market_execution_policies, normalize_kr_market, write_snapshot,
@@ -9975,6 +9984,10 @@ class PB1Engine:
         FORCE_BUY 스모크 모드: 주문 endpoint까지 도달하는지 검증용.
         모의투자 전용. 시장가 또는 최우선 매수호가로 1주 강제 주문.
         """
+        ownership_ok, ownership_reason = enforce_kr_order_ownership(code, "KR_STANDARD")
+        if not ownership_ok:
+            logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", code, ownership_reason)
+            return
         try:
             # 가격 조회
             quote = self._get_price_snapshot_cached(code, market="J")
@@ -10007,6 +10020,10 @@ class PB1Engine:
             logger.exception("[FORCE_BUY][ERROR] code=%s error=%s", code, exc)
 
     def _place_entry(self, cf: CandidateFeature) -> dict[str, int | str]:
+        ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
+        if not ownership_ok:
+            logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", cf.code, ownership_reason)
+            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved"}
         status: dict[str, Any] = self._empty_order_status()
         stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
@@ -10775,6 +10792,10 @@ class PB1Engine:
         code = pos.get("code")
         if not code or qty <= 0:
             return
+        ownership_ok, ownership_reason = enforce_kr_order_ownership(code, pos.get("strategy_owner") or pos.get("owner_strategy"))
+        if not ownership_ok:
+            logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", code, ownership_reason)
+            return
         display_code = self._display_code(code)
         stock_name = str(self._name_for_code(code) or pos.get("name") or code)
         logger.info(
@@ -10989,6 +11010,10 @@ class PB1Engine:
             )
 
     def _place_entry_close(self, cf: CandidateFeature) -> dict[str, int | str]:
+        ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
+        if not ownership_ok:
+            logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", cf.code, ownership_reason)
+            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved"}
         status: dict[str, Any] = self._empty_order_status()
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"

@@ -22,6 +22,20 @@ _FILL_CONTRACT_ERROR_STATUSES = {
     "ERROR",
 }
 
+_BROKER_CANCEL_STATUSES = frozenset({
+    "CANCELED", "CANCELLED", "CANCEL_COMPLETE", "CANCELLED_COMPLETE",
+    "EXPIRED", "REJECTED", "취소", "취소완료", "거부",
+})
+
+
+def is_terminal_zero_fill_cancel(observation: dict | None) -> bool:
+    """Recognize manual/broker terminal cancellations without inventing a fill."""
+    row = observation or {}
+    status = str(row.get("status") or row.get("order_status") or row.get("ord_status") or "").strip().upper()
+    filled = int(float(row.get("filled_qty") or row.get("tot_ccld_qty") or 0))
+    remaining = int(float(row.get("remaining_qty") or row.get("rmn_qty") or row.get("ord_remn_qty") or 0))
+    return filled == 0 and remaining == 0 and status in _BROKER_CANCEL_STATUSES
+
 
 def _safe_float(value: Any) -> float:
     try:
@@ -425,6 +439,7 @@ def reconcile_ack_orders_with_balance(
 ) -> dict:
     """ACK 상태이나 qty_filled=0인 주문의 체결 여부를 KIS fills + 잔고로 확인."""
     from trader.us.db.repos import load_pending_ack_orders, mark_order_filled_by_reconcile, apply_broker_order_observation
+    from trader.us.utils.order_no import normalize_us_order_no
 
     if provider is None:
         from trader.us.data_provider import USDataProvider
@@ -467,6 +482,7 @@ def reconcile_ack_orders_with_balance(
     balance_reconcile_count = 0
     unresolved_count = 0
     failed_count = 0
+    canceled_count = 0
     symbols_by_status: dict[str, list[str]] = {"fill_api_confirmed": [], "balance_confirmed": [], "unresolved": []}
 
     for order in pending_orders:
@@ -506,6 +522,22 @@ def reconcile_ack_orders_with_balance(
         try:
             fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
             if fills_resp and isinstance(fills_resp, dict):
+                if is_terminal_zero_fill_cancel(fills_resp):
+                    terminal_status = str(fills_resp.get("status") or "CANCELLED").upper()
+                    broker_status = "REJECTED" if terminal_status in {"REJECTED", "거부"} else "CANCELLED"
+                    mark_result = apply_broker_order_observation(
+                        trade_date=trade_date, client_order_key=client_order_key,
+                        raw_order_no=order_no, canonical_order_no=normalize_us_order_no(order_no),
+                        symbol=symbol, side=side, requested_qty=qty, filled_qty=0,
+                        remaining_qty=0, broker_status=broker_status,
+                        evidence_type="KIS_TERMINAL_ZERO_FILL", observed_at=fills_resp.get("observed_at"),
+                        raw_row=fills_resp,
+                    )
+                    if mark_result.get("status") in {"OK", "ORDER_NOT_FOUND", "ORDER_IDENTITY_NOT_UNIQUE"}:
+                        canceled_count += 1
+                        logger.info("[US_RECONCILE][MANUAL_CANCEL] symbol=%s order_no=%s status=%s",
+                                    symbol, order_no, broker_status)
+                        continue
                 fill_contract_status = str(
                     fills_resp.get("evidence_status") or fills_resp.get("status") or "OK"
                 ).upper()
@@ -522,7 +554,6 @@ def reconcile_ack_orders_with_balance(
                     fill_symbol = str(fills_resp.get("symbol") or symbol).upper()
                     fill_side = str(fills_resp.get("side") or side).upper()
                     fill_order_no = str(fills_resp.get("order_no") or order_no)
-                    from trader.us.utils.order_no import normalize_us_order_no
                     if fill_symbol != symbol or fill_side != side or normalize_us_order_no(fill_order_no) != normalize_us_order_no(order_no):
                         logger.error("[US_RECONCILE][IDENTITY_MISMATCH] order_no=%s symbol=%s/%s side=%s/%s", order_no, symbol, fill_symbol, side, fill_side)
                         failed_count += 1
@@ -705,6 +736,7 @@ def reconcile_ack_orders_with_balance(
         "balance_reconcile_count": balance_reconcile_count,
         "unresolved_count": unresolved_count,
         "failed_count": failed_count,
+        "canceled_count": canceled_count,
         "symbols_by_status": symbols_by_status,
     }
 

@@ -257,3 +257,13 @@ def test_close_take_profit_still_sells(armed_practice_env):
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice", allow_entry=False)
     assert result.decision.action == Action.SELL_ALL and kis.orders == [("SELL", 50)]
+
+
+def test_sell_only_tick_never_queries_orderable_cash(armed_practice_env):
+    kis, repo = FakeKIS(qty=10, average=100, price=106), FakeRepository(active())
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("get_orderable_cash must not run for a held/sell-only tick")
+    kis.get_orderable_cash = forbidden
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice", allow_entry=False)
+    assert result.decision.action == Action.SELL_ALL

@@ -40,13 +40,13 @@ def test_average_buy_premium(price, action):
 
 @pytest.mark.parametrize(("flags", "reason"), [
     ({"pending_buy": True}, "tqqq_pending_order_exists"),
-    ({"pending_sell": True}, "tqqq_pending_order_exists"),
+    ({"pending_sell": True}, "tqqq_profit_sell_pending"),
     ({"daily_filled_buy_notional": 250}, "daily_buy_limit"),
 ])
 def test_duplicate_and_pending_protection(flags, reason):
     result = decide(InfiniteState(cycle_id="c", status=Status.ACTIVE),
                     PositionSnapshot(qty=1, average_price=50, price=50), **flags)
-    assert (result.action, result.reason) == (Action.BLOCK, reason)
+    assert (result.action, result.reason) == ((Action.WAIT if flags.get("pending_sell") else Action.BLOCK), reason)
 
 
 def test_same_trading_day_second_buy_blocks_from_persisted_fill_date():
@@ -147,7 +147,7 @@ def test_pause_blocks_buy_but_keeps_take_profit_sell():
                     position=PositionSnapshot(qty=3, orderable_qty=3, average_price=50, price=55),
                     trading_date=TODAY, overlay=NORMAL)
     assert (buy.action, buy.reason) == (Action.BLOCK, "buy_permission_paused")
-    assert (sell.action, sell.qty) == (Action.SELL, 3)
+    assert (sell.action, sell.qty) == (Action.SELL, 1)
 
 
 def test_sell_permission_can_be_independently_disabled():
