@@ -226,7 +226,11 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             regime_reserve_permission=regime_reserve_permission,
                             effective_regime_name=regime)
         if decision.metadata and state is not None:
-            state = replace(state, metadata={**state.metadata, **decision.metadata})
+            # A decision is not a fill.  Reconciliation alone may promote the
+            # desired stage to *_FILLED; submission records only pending state.
+            durable = {key: value for key, value in decision.metadata.items()
+                       if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
+            state = replace(state, metadata={**state.metadata, **durable})
             repository.save_state(state)
         logger.info("[TQQQ_INF][BUY_POLICY] effective_regime=%s multiplier=%s entry_evaluation_allowed=%s final_notional=%s reason=%s",
                     regime, multiplier, int(entry_allowed), decision.notional, decision.reason)
@@ -293,7 +297,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "broker_avg_price_source": str((raw or {}).get("broker_avg_price_source") or "kis_pchs_avg_pric"),
             "broker_avg_price_currency": "USD", "broker_avg_price_asof": avg_asof,
             "balance_source": "kis_balance_authoritative", "authoritative_positions": True,
-            "position_lifecycle_id": lifecycle_id, "tp_threshold_fraction": str(config.take_profit_pct),
+            "position_lifecycle_id": lifecycle_id,
+            "tp_threshold_fraction": str(decision.metadata.get("tp_threshold_fraction", config.take_profit_pct)),
             "holding_qty": broker.qty, "orderable_qty": broker.orderable_qty,
             "sellable_qty": broker.orderable_qty, "available_qty": broker.orderable_qty,
             "partial_exit_allowed": profit_stage == "TP1",

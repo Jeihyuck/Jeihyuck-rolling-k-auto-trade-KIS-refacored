@@ -142,7 +142,9 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             best_ask=position.current_price,
                             minutes_since_open=minutes_since_open)
         if decision.metadata and state is not None:
-            state = replace(state, metadata={**state.metadata, **decision.metadata})
+            durable = {key: value for key, value in decision.metadata.items()
+                       if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
+            state = replace(state, metadata={**state.metadata, **durable})
             repository.save_state(state)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
                      symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
@@ -157,7 +159,10 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
 
         if decision.action == Action.SELL_ALL:
-            state = replace(state, status=Status.EXIT_PENDING)
+            desired = str(decision.metadata.get("desired_profit_stage") or "")
+            pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
+            state = replace(state, status=Status.EXIT_PENDING,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
             repository.save_state(state)
         try:
             order_id, _ = executor.submit(decision, config.symbol)
