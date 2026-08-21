@@ -5714,7 +5714,14 @@ class PB1Engine:
         """
         # Determine action type from side and stage
         action = "EXIT" if side.upper() == "SELL" else "ENTRY"
-        return f"{self.env}:{self.STRATEGY_NAME}:{self._today}:{code}:{action}:{side.upper()}:{stage}:{window_tag}:{mode}"
+        session = str(os.getenv("PB1_SESSION_KIND") or window_tag or "day").lower()
+        if session in {"am", "morning", "preopen"}:
+            strategy_name, effective_window = "pb1_pullback_am", "morning"
+        elif session in {"afternoon", "pm", "day"}:
+            strategy_name, effective_window = "pb1_pullback_afternoon", "afternoon"
+        else:
+            strategy_name, effective_window = "pb1_pullback_close", "close"
+        return f"{self.env}:{strategy_name}:{self._today}:{code}:{action}:{side.upper()}:{stage}:{effective_window}:{mode}"
 
     def _name_for_code(self, code: str | None) -> str | None:
         if not code:
@@ -11514,9 +11521,9 @@ class PB1Engine:
             or (pos.get("entry_meta_json") or {}).get("owner_strategy")
             or ""
         ).upper()
-        if code == "122630" and _owner_strategy == "KR_INFINITE":
+        if code == "122630":
             logger.info(
-                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s reason=KR_INFINITE_OWNED action=KR_INFINITE_EXIT_ONLY",
+                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s reason=KR_INF_OWNERSHIP_RESERVED action=KR_INFINITE_EXIT_ONLY",
                 display_code,
             )
             return None
@@ -13015,6 +13022,9 @@ class PB1Engine:
         else:
             members = self.universe_repo.get_current_universe_members(self.env, self.UNIVERSE_STRATEGY)
             self._universe_as_of = members[0].get("as_of_date") if members else None
+        if any(str(m.get("code") or "").zfill(6) == "122630" for m in members):
+            logger.warning("[PB1][OWNERSHIP][EXCLUDE] symbol=122630 reason=KR_INF_OWNERSHIP_RESERVED")
+        members = [m for m in members if str(m.get("code") or "").zfill(6) != "122630"]
         self._code_name_map = {
             str(m.get("code") or "").zfill(6): (m.get("name") or (m.get("meta_json") or {}).get("name"))
             for m in members or []

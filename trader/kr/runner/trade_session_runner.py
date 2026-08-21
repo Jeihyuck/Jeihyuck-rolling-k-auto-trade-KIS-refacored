@@ -685,7 +685,6 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     )
     guarded = _guard_trade_session(session, ctx)
     if guarded is not None:
-        _run_infinite_session_hook(session=session, env=env, checkpoint="precheck_blocked_exit_only", allow_entry=False)
         return guarded
     infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
     balance_state = _stage(session, ctx.trade_date, ctx.expected_as_of, "balance_precheck", lambda: _assert_balance_available(session))
@@ -698,9 +697,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             infinite_allow_entry = infinite_allow_entry and bool(int(balance_state.get("entry_allowed", 0)))
             logger.warning("[KR_SESSION][CONTINUE_AFTER_BALANCE_FAIL_SOFT] session=%s entry_allowed=%s exit_allowed=%s order_allowed=%s", session, os.environ["ENTRY_ALLOWED"], os.environ["EXIT_ALLOWED"], os.environ["ORDER_ALLOWED"])
         else:
-            _run_infinite_session_hook(session=session, env=env, checkpoint="balance_blocked_exit_only", allow_entry=False)
             return balance_state
-    _stage(session, ctx.trade_date, ctx.expected_as_of, "infinite_session_hook", lambda: _run_infinite_session_hook(session=session, env=env, checkpoint="session_start", allow_entry=infinite_allow_entry))
 
     window = {"am": "morning", "afternoon": "day", "close": "close"}[session]
     pb1_runner = sys.modules.get("trader.pb1_runner")
@@ -723,7 +720,6 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     _stage(session, ctx.trade_date, ctx.expected_as_of, "order_ack_persist", lambda: None)
     _stage(session, ctx.trade_date, ctx.expected_as_of, "fill_reconcile", lambda: None)
     session_end_entry_allowed = infinite_allow_entry and str(os.getenv("ENTRY_ALLOWED", "1")) == "1" and str(os.getenv("ORDER_ALLOWED", "1")) == "1"
-    _run_infinite_session_hook(session=session, env=env, checkpoint="session_end", allow_entry=session_end_entry_allowed)
     pb1_result_present = pb1_result_path.exists()
     if pb1_result_present:
         pb1_result = load_pb1_session_result(pb1_result_path)

@@ -61,7 +61,9 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     if not config.enabled: return Decision(Action.WAIT,"KR_INF_FEATURE_DISABLED")
     if position.current_price <= 0: return Decision(Action.BLOCK,"KR_INF_MARKET_DATA_UNAVAILABLE",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price <= 0: return Decision(Action.BLOCK,"KR_INF_AVG_PRICE_INVALID",next_status=Status.FROZEN)
-    adopted = state is None and position.qty > 0
+    adopted = ((state is None and position.qty > 0)
+               or str(((state.metadata if state else {}) or {}).get("ownership_source") or "")
+               == "KR_INF_EXIT_ONLY_BROKER_ADOPTION")
     state=state or State(
         status=Status.ACTIVE if adopted else Status.READY,
         cycle_id=f"BROKER_ADOPTION-{trade_date.isoformat()}" if adopted else None,
@@ -75,13 +77,20 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     if state.status == Status.COMPLETE and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if state.status == Status.ACTIVE and (not state.cycle_id or position.qty == 0): return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price > 0:
+        if pending_sell:
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
         profit_pct = position.current_price / position.average_price - 1.0
         metadata = dict(state.metadata or {})
         stage = str(metadata.get("profit_stage") or "NONE").upper()
+        pending_stage = str(metadata.get("pending_profit_stage") or "").upper()
+        if pending_stage in {"TP1_SUBMITTED", "TP1_DEFENSE_SUBMITTED", "TP1_REBOUND_PENDING_SUBMITTED",
+                             "TP1_REBOUND_CONFIRMED_SUBMITTED", "TP2_SUBMITTED",
+                             "CAPITAL_RECOVERY_SUBMITTED"}:
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
         state_name = str(market_state or "").upper()
         if state_name not in KR_ADAPTIVE_TP_MAP:
             return Decision(Action.BLOCK, "KR_INF_UNMAPPED_REGIME")
-        if stage in {"NONE", "TP1_PENDING", "TP1_SUBMITTED"}:
+        if stage in {"NONE", "TP1_PENDING"}:
             threshold, fraction, next_stage = adaptive_tp_stage(
                 market_state=state_name,
                 units_used=state.units_used,

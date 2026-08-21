@@ -285,7 +285,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         classification_source = "TQQQ_INFINITE_POLICY"
         position_state = "HELD" if broker.qty > 0 else "NOT_HELD"
         profit_stage = str(decision.metadata.get("profit_stage") or "")
-        position_action = ("PARTIAL_EXIT_SELL" if decision.action == Action.SELL and profit_stage == "TP1" else
+        is_partial_tp = profit_stage.startswith("TP1")
+        position_action = ("PARTIAL_EXIT_SELL" if decision.action == Action.SELL and is_partial_tp else
                    "FULL_EXIT_SELL" if decision.action == Action.SELL else
                            "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY")
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
@@ -301,7 +302,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "tp_threshold_fraction": str(decision.metadata.get("tp_threshold_fraction", config.take_profit_pct)),
             "holding_qty": broker.qty, "orderable_qty": broker.orderable_qty,
             "sellable_qty": broker.orderable_qty, "available_qty": broker.orderable_qty,
-            "partial_exit_allowed": profit_stage == "TP1",
+            "partial_exit_allowed": is_partial_tp,
             "profit_stage": profit_stage or None,
         } if decision.action == Action.SELL else {}
         stage_key = profit_stage or ("BUY" if decision.action == Action.BUY else decision.action.value)
@@ -344,6 +345,13 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "tqqq_max_total_capital_usd": config.max_total_capital_usd},
         }
         result = route(intent)
+        if (decision.action == Action.SELL and state is not None
+                and str(result.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED", "PENDING"}):
+            desired = str(decision.metadata.get("desired_profit_stage") or profit_stage or "").upper()
+            pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
+            state = replace(state, status=Status.EXIT_PENDING,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
+            repository.save_state(state)
         logger.info("[TQQQ_INF][ORDER_STATUS] side=%s requested_qty=%s status=%s cycle_id=%s",
                     decision.action.value, decision.qty, result.get("status", "UNKNOWN"), state.cycle_id)
         return {"status": result.get("status", "UNKNOWN"), "decision": decision, "orders": [result]}

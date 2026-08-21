@@ -11,12 +11,13 @@ from .models import Action, BrokerOrderState, BrokerPosition, Decision, OrderInt
 class KISExecutor:
     """Narrow adapter over existing public domestic KIS methods."""
 
-    def __init__(self, kis: Any, kis_env: str):
+    def __init__(self, kis: Any, kis_env: str, balance_snapshot: dict | None = None):
         self.kis = kis
         self.kis_env = kis_env
+        self.balance_snapshot = balance_snapshot
 
     def _balance(self) -> dict:
-        raw = self.kis.get_balance()
+        raw = self.balance_snapshot if self.balance_snapshot is not None else self.kis.get_balance()
         if not isinstance(raw, dict) or raw.get("_stub"):
             raise RuntimeError("KR_INF_RECONCILE_BROKER_UNAVAILABLE")
         return raw

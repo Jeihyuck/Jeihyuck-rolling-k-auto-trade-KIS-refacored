@@ -119,6 +119,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     profit_pct = position.price / position.average_price - 1 if position.average_price > 0 else 0.0
     state_metadata = dict(state.metadata or {})
     profit_stage = str(state_metadata.get("profit_stage") or "NONE").upper()
+    pending_profit_stage = str(state_metadata.get("pending_profit_stage") or "").upper()
+    if pending_profit_stage.endswith("_SUBMITTED") or profit_stage.endswith("_SUBMITTED"):
+        return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
     overlay_state = normalize_tqqq_adaptive_state(overlay, effective_regime_name)
     target = position.average_price * (1 + config.take_profit_pct)
     if state.status == Status.EXIT_PENDING and position.qty > 0 and position.price + 1e-9 < target:
@@ -126,9 +129,13 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "tqqq_full_exit_pending", next_status=Status.EXIT_PENDING)
         return Decision(Action.WAIT, "exit_pending", next_status=Status.EXIT_PENDING)
     if position.qty > 0 and position.average_price > 0 and config.allow_sell:
-        if profit_stage in {"TP1", "TP2", "CAPITAL_RECOVERY"}:
-            threshold, fraction, next_stage = (0.10, 1.0, "TP2") if profit_stage == "TP1" else (999.0, 0.0, "NONE")
-            if profit_stage == "TP1" and profit_pct >= threshold and next_stage != "NONE":
+        if pending_sell:
+            return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+        if profit_stage in {"TP1", "TP1_FILLED", "TP1_DEFENSE_FILLED", "TP1_REBOUND_FILLED",
+                            "TP2", "TP2_FILLED", "CAPITAL_RECOVERY", "CAPITAL_RECOVERY_FILLED"}:
+            first_filled = profit_stage.startswith("TP1")
+            threshold, fraction, next_stage = (0.10, 1.0, "TP2") if first_filled else (999.0, 0.0, "NONE")
+            if first_filled and profit_pct >= threshold and next_stage != "NONE":
                 if pending_sell:
                     return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
                 orderable = int(position.orderable_qty or 0)
@@ -143,7 +150,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                                 {"profit_stage": next_stage, "tp1_sold_qty": sell_qty if next_stage != "TP2" else state_metadata.get("tp1_sold_qty", 0),
                                  "remaining_qty": max(0, position.qty - sell_qty), "return_rate_at_decision": profit_pct,
                                  "tp_threshold_fraction": threshold})
-        elif profit_stage in {"NONE", "TP1_PENDING", "TP1_SUBMITTED"}:
+        elif profit_stage in {"NONE", "TP1_PENDING"}:
             try:
                 threshold, fraction, next_stage = adaptive_tp_stage(
                     market_state=overlay_state, cycle_age=state.cycle_age_trading_days,
@@ -153,6 +160,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             if profit_pct >= threshold and next_stage != "NONE":
                 if pending_sell:
                     return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+                if position.orderable_qty is None:
+                    return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
                 orderable = int(position.orderable_qty or 0)
                 if orderable <= 0:
                     return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
