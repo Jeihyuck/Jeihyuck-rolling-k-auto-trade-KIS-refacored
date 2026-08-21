@@ -228,6 +228,8 @@ from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst
 from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
+from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
+                                     normalize_sell_reason_family, same_day_semantic_sell_exists)
 
 
 def enforce_kr_order_ownership(symbol: str, strategy_owner: str | None) -> tuple[bool, str | None]:
@@ -5265,6 +5267,15 @@ class PB1Engine:
             "today_submit_exists": bool(snapshot.get("today_submit_exists")),
             "today_fill_exists": bool(snapshot.get("today_fill_exists")),
             "today_sell_exists": bool(snapshot.get("today_sell_exists")),
+            "sell_confirmed": bool(snapshot.get("sell_confirmed", snapshot.get("today_sell_exists"))),
+            "pending_sell": bool(snapshot.get("pending_sell")),
+            "no_sellable_sticky": bool(snapshot.get("no_sellable_sticky")),
+            "prior_sell_reason_family": snapshot.get("prior_sell_reason_family"),
+            "sell_cooldown_elapsed_min": float(snapshot.get("sell_cooldown_elapsed_min") or 0),
+            "market_state": snapshot.get("market_state"),
+            "entry_score_strong": bool(snapshot.get("entry_score_strong")),
+            "fresh_entry_signal": bool(snapshot.get("fresh_entry_signal")),
+            "same_day_reentry_count": int(snapshot.get("same_day_reentry_count") or 0),
             "open_order_exists": bool(open_order_exists or snapshot.get("open_order_exists")),
             "cooldown_active": bool(snapshot.get("cooldown_active")),
             "duplicate_intent_exists": bool(duplicate_intent_exists),
@@ -5305,14 +5316,26 @@ class PB1Engine:
         # [2026-04-30] 당일 매도 후 재매수 차단
         if bool(gate_context.get("today_sell_exists")):
             block_rebuy = os.getenv("PB1_BLOCK_REBUY_AFTER_SELL_SAME_DAY", "1") not in {"0", "false", "False"}
-            allow_override = os.getenv("PB1_ALLOW_SAME_DAY_REBUY_AFTER_SELL", "0") in {"1", "true", "True"}
-            if block_rebuy and not allow_override:
+            reentry = evaluate_same_day_reentry(
+                sell_exists=True, sell_confirmed=bool(gate_context.get("sell_confirmed")),
+                pending_sell=bool(gate_context.get("pending_sell")),
+                no_sellable_sticky=bool(gate_context.get("no_sellable_sticky")),
+                prior_reason_family=str(gate_context.get("prior_sell_reason_family") or ""),
+                cooldown_elapsed_min=float(gate_context.get("sell_cooldown_elapsed_min") or 0),
+                market_state=str(gate_context.get("market_state") or ""),
+                entry_score_strong=bool(gate_context.get("entry_score_strong")),
+                fresh_entry_signal=bool(gate_context.get("fresh_entry_signal")),
+                reentry_count=int(gate_context.get("same_day_reentry_count") or 0),
+            )
+            if block_rebuy and not reentry.allowed:
                 reason_codes.append("BUYABLE_TODAY_SELL_REBUY_BLOCKED")
-                logger.info(
-                    "[PB1][BUYABLE_GATE][TODAY_SELL_SRC] code=%s today_sell_exists=1 last_sell_at=%s",
-                    self._display_code(code),
-                    gate_context.get("last_sell_event_at"),
-                )
+                logger.info("[PB1][REBUY][BLOCK] symbol=%s reason=%s prior_sell_reason_family=%s pending_sell=%d confirmed_sell=%d",
+                            self._display_code(code), reentry.reason, gate_context.get("prior_sell_reason_family"),
+                            int(bool(gate_context.get("pending_sell"))), int(bool(gate_context.get("sell_confirmed"))))
+            elif block_rebuy and reentry.allowed:
+                logger.info("[PB1][REBUY][ALLOW] symbol=%s prior_sell_reason_family=%s prior_sell_confirmed=1 cooldown_min=%s market_state=%s reason=%s",
+                            self._display_code(code), gate_context.get("prior_sell_reason_family"),
+                            gate_context.get("sell_cooldown_elapsed_min"), gate_context.get("market_state"), reentry.reason)
         if bool(gate_context.get("cooldown_active")):
             reason_codes.append("BUYABLE_COOLDOWN")
         if bool(gate_context.get("blocking_duplicate_exists")):
@@ -6165,9 +6188,17 @@ class PB1Engine:
             # [2026-04-30] 당일 매도 정보
             today_sell_rows = today_sell_fills_by_code.get(code_key, [])
             today_sell_exists = bool(today_sell_rows)
+            last_sell = today_sell_rows[0] if today_sell_rows else {}
             last_sell_event_at = self._format_kst_datetime(
-                today_sell_rows[0].get("filled_at") if today_sell_rows else None
+                last_sell.get("filled_at") if last_sell else None
             )
+            last_sell_dt = self._coerce_kst_datetime(last_sell.get("filled_at")) if last_sell else None
+            cooldown_elapsed_min = ((self._now_kst - last_sell_dt).total_seconds() / 60
+                                    if last_sell_dt else 0.0)
+            last_sell_meta = last_sell.get("meta") if isinstance(last_sell.get("meta"), dict) else {}
+            pending_sell = any(str(row.get("side") or "").upper() == "SELL" and
+                               str(row.get("status") or "").upper() in {"CREATED", "SUBMITTED", "ACK", "ACCEPTED", "PARTIALLY_FILLED"}
+                               for row in recent_order_events)
             snapshot = {
                 "holding_qty": int(pos.get("qty") or 0),
                 "kis_holding_qty": int(kis_holding_qty_by_code.get(code_key) or pos.get("qty") or 0),
@@ -6175,6 +6206,12 @@ class PB1Engine:
                 "today_submit_exists": bool(recent_order_events),
                 "today_fill_exists": bool(recent_fill_events),
                 "today_sell_exists": today_sell_exists,
+                "sell_confirmed": today_sell_exists,
+                "pending_sell": pending_sell,
+                "prior_sell_reason_family": normalize_sell_reason_family(
+                    last_sell.get("reason_family") or last_sell.get("stage") or last_sell_meta.get("reason_family")),
+                "sell_cooldown_elapsed_min": cooldown_elapsed_min,
+                "same_day_reentry_count": len(today_buy_events),
                 "last_sell_event_at": last_sell_event_at,
                 "open_order_exists": False,
                 "cooldown_active": cooldown_active,
@@ -12393,6 +12430,13 @@ class PB1Engine:
             )
 
         code_key = str(code or "").zfill(6)
+        snapshot_version = f"qty:{kis_qty}:sellable:{kis_sellable_qty}"
+        if NO_SELLABLE_STICKY.blocked(trade_date=str(self._today), symbol=code,
+                                      snapshot_version=snapshot_version, orderable_qty=kis_sellable_qty):
+            exit_eval_payload["order_skip_reasons"] = ["KR_SELL_BLOCKED_NO_SELLABLE_QTY_STICKY"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY_STICKY"
+            logger.info("[EXIT][RETRY_BLOCK] code=%s reason=KR_SELL_BLOCKED_NO_SELLABLE_QTY_STICKY", display_code)
+            return exit_eval_payload
         if code_key in self._session_sell_blocked_codes:
             block_reason = str((self._session_sell_blocked_codes.get(code_key) or {}).get("reason") or "SESSION_SELL_BLOCKED")
             exit_eval_payload["order_skip_reasons"] = [block_reason]
@@ -12431,9 +12475,10 @@ class PB1Engine:
             return exit_eval_payload
 
         if kis_sellable_qty <= 0:
+            NO_SELLABLE_STICKY.mark(trade_date=str(self._today), symbol=code, snapshot_version=snapshot_version)
             self._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
             self.no_sellable_qty_terminal_codes.add(display_code)
-            exit_eval_payload["order_skip_reasons"] = ["KIS_NO_SELLABLE_QTY"]
+            exit_eval_payload["order_skip_reasons"] = ["KR_SELL_BLOCKED_NO_SELLABLE_QTY_STICKY"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_NO_SELLABLE_QTY"
             logger.info(
                 "[EXIT][SELLABLE_GATE] code=%s db_qty=%s kis_qty=%s kis_sellable_qty=%s ok=0 reason=KIS_NO_SELLABLE_QTY action=session_block",
@@ -12481,6 +12526,22 @@ class PB1Engine:
         orderable_qty = sell_qty
 
         stage = exit_eval.primary_reason
+        reason_family = normalize_sell_reason_family(stage)
+        position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
+        lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
+                           or f"sid:{sid}:mode:{mode}")
+        try:
+            today_sell_rows = self.orders_repo.list_today_orders(self.env, side="SELL", code=code, status_exclude=())
+        except Exception as exc:
+            logger.warning("[PB1][SEMANTIC_SELL_FENCE][LOOKUP_WARN] code=%s err=%s", display_code, exc)
+            today_sell_rows = []
+        if same_day_semantic_sell_exists(rows=today_sell_rows, symbol=code, strategy_owner="KR_STANDARD",
+                                         reason_family=reason_family, lifecycle_id=lifecycle_id):
+            exit_eval_payload["order_skip_reasons"] = ["KR_SAME_DAY_SEMANTIC_SELL_DUPLICATE"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_SEMANTIC_DUPLICATE"
+            logger.warning("[PB1][SEMANTIC_SELL_FENCE] code=%s family=%s lifecycle=%s reason=KR_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
+                           display_code, reason_family, lifecycle_id)
+            return exit_eval_payload
         simulated_client_key = None
         if forced_simulation is not None:
             stage = str(forced_simulation["stage"])
@@ -12582,7 +12643,10 @@ class PB1Engine:
                 limit_price=mark,
                 stage=stage,
                 client_order_key=client_key,
-                request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons), "ret_pct": ret_pct, "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
+                request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
+                              "reason_family": reason_family, "position_lifecycle_id": lifecycle_id,
+                              "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
+                              "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
                 status="CREATED",
             )
         except Exception:
@@ -17206,6 +17270,12 @@ class PB1Engine:
                                 existing_order = self.orders_repo.get_order_by_client_order_key(self.env, cf.client_order_key)
                                 duplicate_intent_exists = bool(existing_order)
                                 duplicate_intent_status = str((existing_order or {}).get("status") or "")
+                            gate_snapshot = {**(gate_snapshot or {}),
+                                "market_state": (cf.features or {}).get("market_state") or getattr(self, "_kr_market_state", ""),
+                                "entry_score_strong": bool((cf.features or {}).get("entry_score_strong")
+                                                           or float((cf.features or {}).get("score_final") or 0) >= 80),
+                                "fresh_entry_signal": bool((cf.features or {}).get("fresh_entry_signal", True)),
+                            }
                             unified_context = self._build_unified_gate_context(
                                 code=cf.code,
                                 qty=int(cf.planned_qty or 0),
