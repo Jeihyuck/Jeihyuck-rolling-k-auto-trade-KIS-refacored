@@ -308,14 +308,14 @@ def test_recovered_tqqq_blocks_partial_strategy_exit():
         trading_date=date(2026, 8, 14), overlay={"market_state": "DEFENSE_CRASH_CONFIRMED"},
         entry_allowed=False, regime_reserve_permission=False,
     )
-    assert (decision.action, decision.reason) == (Action.BLOCK, "tqqq_full_exit_qty_not_ready")
+    assert (decision.action, decision.reason, decision.qty) == (Action.SELL, "TAKE_PROFIT_CAPITAL_RECOVERY", 6)
 
 
-def test_recovered_tqqq_uses_ten_percent_full_exit():
+def test_recovered_tqqq_unknown_regime_fails_closed():
     broker = PositionSnapshot(qty=10, orderable_qty=10, average_price=50, price=55)
     decision = evaluate(config=InfiniteConfig(), state=None, position=broker,
                         trading_date=date(2026, 8, 14), overlay={})
-    assert (decision.action, decision.qty, decision.notional) == (Action.SELL, 10, 550)
+    assert (decision.action, decision.reason) == (Action.BLOCK, "TQQQ_INF_UNMAPPED_REGIME")
 
 
 @pytest.mark.parametrize(("orderable", "reason"), [
@@ -325,7 +325,7 @@ def test_tqqq_take_profit_fails_closed_without_sellable_quantity(orderable, reas
     decision = evaluate(
         config=InfiniteConfig(), state=InfiniteState(cycle_id="c"),
         position=PositionSnapshot(qty=10, orderable_qty=orderable, average_price=50, price=55),
-        trading_date=date(2026, 8, 14), overlay={}, entry_allowed=False,
+        trading_date=date(2026, 8, 14), overlay={"market_state": "NORMAL"}, entry_allowed=False,
     )
     assert (decision.action, decision.reason) == (Action.BLOCK, reason)
 
@@ -557,12 +557,12 @@ def test_run_sleeve_ten_percent_sell_crosses_real_router_to_kis_ack(monkeypatch)
           patch("trader.us.execution.kis_us_response_parser.extract_order_no", return_value="TQQQ-SELL-ACK"),
           patch("trader.us.execution.risk_gate.check_pending_sell_order_hard")):
         result = run_sleeve(positions=positions, price=55, trading_date=date(2026, 8, 14),
-                            overlay={}, repository=Repo(), route=real_route)
+                            overlay={"market_state": "NORMAL"}, repository=Repo(), route=real_route)
     assert result["status"] == "ACK"
-    assert client.calls == [("TQQQ", "NASDAQ", 10, 55.0)]
+    assert client.calls == [("TQQQ", "NASDAQ", 5, 55.0)]
     assert routed[0]["reason"] == "TAKE_PROFIT_TQQQ_INFINITE"
-    assert routed[0]["position_action"] == "FULL_EXIT_SELL"
-    assert routed[0]["meta"]["tp_threshold_fraction"] == "0.1"
+    assert routed[0]["position_action"] == "PARTIAL_EXIT_SELL"
+    assert routed[0]["meta"]["tp_threshold_fraction"] == "0.07"
 
 
 @pytest.mark.parametrize(("market_state", "market_regime", "expected"), [
@@ -585,16 +585,16 @@ def test_full_exit_threshold_and_pending_contract():
     below = evaluate(config=InfiniteConfig(), state=state,
                      position=PositionSnapshot(qty=10, orderable_qty=10, average_price=50, price=54.995),
                      trading_date=date(2026, 8, 14), overlay=context())
-    assert below.action != Action.SELL
+    assert (below.action, below.qty) == (Action.SELL, 5)
     above = evaluate(config=InfiniteConfig(), state=state,
                      position=PositionSnapshot(qty=10, orderable_qty=10, average_price=50, price=56),
-                     trading_date=date(2026, 8, 14), overlay={})
-    assert (above.action, above.qty) == (Action.SELL, 10)
+                     trading_date=date(2026, 8, 14), overlay={"market_state": "NORMAL"})
+    assert (above.action, above.qty) == (Action.SELL, 5)
     pending = evaluate(config=InfiniteConfig(), state=state,
                        position=PositionSnapshot(qty=10, orderable_qty=6, average_price=50, price=55),
-                       trading_date=date(2026, 8, 14), overlay={}, pending_sell=True)
+                       trading_date=date(2026, 8, 14), overlay={"market_state": "NORMAL"}, pending_sell=True)
     assert (pending.action, pending.reason, pending.next_status) == (
-        Action.BLOCK, "tqqq_full_exit_pending", Status.EXIT_PENDING,
+        Action.WAIT, "tqqq_profit_sell_pending", Status.EXIT_PENDING,
     )
 
 
@@ -606,7 +606,7 @@ def test_full_exit_partial_cancel_retry_and_completion_state_machine():
         trading_date=date(2026, 8, 14), overlay={}, pending_sell=True,
     )
     assert (partial_open.action, partial_open.reason, partial_open.next_status) == (
-        Action.BLOCK, "tqqq_full_exit_pending", Status.EXIT_PENDING,
+        Action.WAIT, "tqqq_profit_sell_pending", Status.EXIT_PENDING,
     )
     cancelled_below_target = evaluate(
         config=InfiniteConfig(), state=state,
@@ -619,10 +619,10 @@ def test_full_exit_partial_cancel_retry_and_completion_state_machine():
     cancelled_reached_target = evaluate(
         config=InfiniteConfig(), state=state,
         position=PositionSnapshot(qty=4, orderable_qty=4, average_price=50, price=55),
-        trading_date=date(2026, 8, 14), overlay={}, pending_sell=False,
+        trading_date=date(2026, 8, 14), overlay={"market_state": "NORMAL"}, pending_sell=False,
     )
     assert (cancelled_reached_target.action, cancelled_reached_target.qty,
-            cancelled_reached_target.next_status) == (Action.SELL, 4, Status.EXIT_PENDING)
+            cancelled_reached_target.next_status) == (Action.SELL, 2, Status.EXIT_PENDING)
     complete = evaluate(
         config=InfiniteConfig(), state=state, position=PositionSnapshot(qty=0, orderable_qty=0, price=55),
         trading_date=date(2026, 8, 14), overlay={}, pending_sell=False,

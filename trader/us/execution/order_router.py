@@ -517,6 +517,38 @@ def _pending_sell_qty_for_symbol(symbol: str, trade_date: str | None) -> int:
         logger.warning("[US_ORDER][PENDING_SELL_QTY][WARN] symbol=%s trade_date=%s err=%s", symbol, trade_date, exc)
         return 0
 
+
+_SEMANTIC_SELL_FAMILIES = frozenset({"DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM",
+    "CLUSTER_EXPOSURE_TRIM", "PROFIT_CAPTURE", "TREND_EXIT", "TQQQ_INFINITE_TP"})
+
+
+def same_day_semantic_sell_exists(intent: dict) -> bool:
+    """Fence an economic SELL attempt independently of client-order-key retries."""
+    if os.getenv("US_ALLOW_REPEAT_SEMANTIC_SELL", "0") == "1" or str(intent.get("side") or "").upper() != "SELL":
+        return False
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    reason = str(intent.get("reason") or meta.get("reason") or "").upper()
+    family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in reason), reason)
+    if family not in _SEMANTIC_SELL_FAMILIES:
+        return False
+    wanted = (str(intent.get("symbol") or "").upper(), "SELL",
+              str(intent.get("strategy_owner") or meta.get("strategy_owner") or meta.get("book") or "").upper(),
+              family, str(intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or meta.get("cycle_id") or ""))
+    try:
+        from trader.us.db.repos import load_us_daily_orders_for_report
+        for row in load_us_daily_orders_for_report(str(intent.get("trade_date") or "")) or []:
+            row_meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+            row_reason = str(row.get("reason") or row_meta.get("reason") or "").upper()
+            row_family = next((item for item in _SEMANTIC_SELL_FAMILIES if item in row_reason), row_reason)
+            actual = (str(row.get("symbol") or "").upper(), str(row.get("side") or "").upper(),
+                      str(row.get("strategy_owner") or row_meta.get("strategy_owner") or row_meta.get("book") or "").upper(),
+                      row_family, str(row.get("position_lifecycle_id") or row_meta.get("position_lifecycle_id") or row_meta.get("cycle_id") or ""))
+            if actual == wanted:
+                return True
+    except Exception as exc:
+        logger.warning("[US_ORDER][SEMANTIC_FENCE][WARN] symbol=%s err=%s", wanted[0], exc)
+    return False
+
 def route_order(
     intent: dict,
     *,
@@ -590,6 +622,10 @@ def route_order(
     intent["meta"] = meta
     symbol = intent.get("symbol", "")
     side = str(intent.get("side", "BUY")).upper()
+    if same_day_semantic_sell_exists(intent):
+        logger.warning("[US_ORDER][SEMANTIC_FENCE] symbol=%s reason=US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", symbol)
+        return {"status": "BLOCKED", "reason": "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
+                "broker_submit": False, "intent": intent}
     symbol_upper = str(symbol or "").upper().strip()
     is_tqqq_infinite = (
         symbol_upper == TQQQ_SYMBOL

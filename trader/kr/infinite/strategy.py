@@ -6,6 +6,24 @@ from .config import InfiniteConfig
 from .models import Action, BrokerPosition, Decision, State, Status
 from .policy_state import idempotency_key
 from .risk_adapter import allows_new_cycle, buy_pause_reason
+from trader.kr.regime import STATE_ORDER
+
+
+KR_ADAPTIVE_TP_MAP: dict[str, tuple[float, float, str]] = {
+    "KR_DEFENSE_CRASH": (0.05, 0.85, "TP1_DEFENSE"),
+    "KR_DEFENSE_RISK_OFF": (0.05, 0.85, "TP1_DEFENSE"),
+    "KR_DEFENSE_CAUTION": (0.05, 0.85, "TP1_DEFENSE"),
+    "KR_SHOCK_REBOUND_PENDING": (0.05, 0.70, "TP1_REBOUND_PENDING"),
+    "KR_SHOCK_REBOUND_CONFIRMED": (0.06, 0.50, "TP1_REBOUND_CONFIRMED"),
+    "KR_NORMAL": (0.06, 0.50, "TP1"),
+    "KR_RISK_ON": (0.07, 0.50, "TP1"),
+    "KR_STRONG_RISK_ON": (0.07, 0.50, "TP1"),
+}
+
+# Import-time failure makes STATE_ORDER the enforceable source of truth in every
+# runtime and CI entry point, rather than relying only on a dedicated test.
+if set(KR_ADAPTIVE_TP_MAP) != set(STATE_ORDER):
+    raise RuntimeError("KR adaptive TP map must exactly cover trader.kr.regime.STATE_ORDER")
 
 
 def adaptive_tp_stage(*, market_state: str | None, units_used: int, cycle_age_trading_days: int) -> tuple[float, float, str]:
@@ -17,13 +35,9 @@ def adaptive_tp_stage(*, market_state: str | None, units_used: int, cycle_age_tr
     if units_used >= 30 or cycle_age_trading_days >= 30:
         return 0.04, 1.0, "CAPITAL_RECOVERY"
     state = str(market_state or "").upper()
-    if state == "KR_NORMAL":
-        return 0.06, 0.5, "TP1"
-    if state in {"KR_STRONG_RISK_ON", "KR_RISK_ON"}:
-        return 0.07, 0.5, "TP1"
-    if state in {"KR_DEFENSE_CAUTION", "KR_DEFENSE_RISK_OFF", "KR_DEFENSE_CRASH"}:
-        return 0.05, 0.85, "TP1_DEFENSE"
-    return 0.05, 0.5, "TP1"
+    if state not in KR_ADAPTIVE_TP_MAP:
+        raise KeyError(f"KR_INF_UNMAPPED_REGIME:{state or '<empty>'}")
+    return KR_ADAPTIVE_TP_MAP[state]
 
 def trading_days_since(start: date|None, end: date) -> int:
     if start is None or start >= end: return 0
@@ -47,29 +61,42 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     if not config.enabled: return Decision(Action.WAIT,"KR_INF_FEATURE_DISABLED")
     if position.current_price <= 0: return Decision(Action.BLOCK,"KR_INF_MARKET_DATA_UNAVAILABLE",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price <= 0: return Decision(Action.BLOCK,"KR_INF_AVG_PRICE_INVALID",next_status=Status.FROZEN)
-    if state is None and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_UNOWNED_EXISTING_POSITION",next_status=Status.FROZEN)
-    state=state or State()
+    adopted = ((state is None and position.qty > 0)
+               or str(((state.metadata if state else {}) or {}).get("ownership_source") or "")
+               == "KR_INF_EXIT_ONLY_BROKER_ADOPTION")
+    state=state or State(
+        status=Status.ACTIVE if adopted else Status.READY,
+        cycle_id=f"BROKER_ADOPTION-{trade_date.isoformat()}" if adopted else None,
+        metadata={"ownership_source": "KR_INF_EXIT_ONLY_BROKER_ADOPTION",
+                  "broker_qty": position.qty, "broker_average_price": position.average_price,
+                  "broker_orderable_qty": position.orderable_qty} if adopted else {},
+    )
     try: validate_invariants(state,position.qty)
     except ValueError as e: return Decision(Action.BLOCK,str(e),next_status=Status.FROZEN)
     if state.status == Status.FROZEN: return Decision(Action.BLOCK,"KR_INF_STATE_FROZEN",next_status=Status.FROZEN)
     if state.status == Status.COMPLETE and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if state.status == Status.ACTIVE and (not state.cycle_id or position.qty == 0): return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price > 0:
+        if pending_sell:
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
         profit_pct = position.current_price / position.average_price - 1.0
         metadata = dict(state.metadata or {})
         stage = str(metadata.get("profit_stage") or "NONE").upper()
-        state_name = str(market_state or "KR_NORMAL").upper()
-        adaptive_enabled = state.units_used >= 5 and state_name in {
-            "KR_NORMAL", "KR_RISK_ON", "KR_STRONG_RISK_ON",
-            "KR_DEFENSE_CAUTION", "KR_DEFENSE_RISK_OFF",
-        }
-        if adaptive_enabled and stage in {"NONE", "TP1_PENDING"}:
+        pending_stage = str(metadata.get("pending_profit_stage") or "").upper()
+        if pending_stage in {"TP1_SUBMITTED", "TP1_DEFENSE_SUBMITTED", "TP1_REBOUND_PENDING_SUBMITTED",
+                             "TP1_REBOUND_CONFIRMED_SUBMITTED", "TP2_SUBMITTED",
+                             "CAPITAL_RECOVERY_SUBMITTED"}:
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+        state_name = str(market_state or "").upper()
+        if state_name not in KR_ADAPTIVE_TP_MAP:
+            return Decision(Action.BLOCK, "KR_INF_UNMAPPED_REGIME")
+        if stage in {"NONE", "TP1_PENDING"}:
             threshold, fraction, next_stage = adaptive_tp_stage(
                 market_state=state_name,
                 units_used=state.units_used,
                 cycle_age_trading_days=state.cycle_age_trading_days,
             )
-        elif adaptive_enabled and stage == "TP1":
+        elif stage in {"TP1", "TP1_FILLED"}:
             threshold = 0.10 if state_name in {"KR_RISK_ON", "KR_STRONG_RISK_ON"} else 0.07
             fraction, next_stage = 1.0, "TP2"
         else:
@@ -86,13 +113,23 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
             key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}")
             return Decision(Action.SELL_ALL, f"TAKE_PROFIT_{next_stage}", sell_qty,
                             sell_qty * position.current_price, key, Status.EXIT_PENDING,
-                            {"profit_stage": next_stage, "tp1_sold_qty": sell_qty if next_stage != "TP2" else metadata.get("tp1_sold_qty", 0),
-                             "remaining_qty": max(0, position.qty - sell_qty), "return_rate_at_decision": profit_pct})
+                            {"desired_profit_stage": next_stage, "profit_stage": next_stage,
+                             "tp_threshold_fraction": threshold, "tp_sell_fraction": fraction,
+                             "adaptive_mapping_source": "capital_recovery_override" if next_stage == "CAPITAL_RECOVERY" else "explicit",
+                             "raw_market_state": market_state, "normalized_state": state_name,
+                             "fallback_10pct_used": 0,
+                             "tp1_sold_qty": sell_qty if next_stage != "TP2" else metadata.get("tp1_sold_qty", 0),
+                             "remaining_qty": max(0, position.qty - sell_qty), "return_rate_at_decision": profit_pct,
+                             **({"ownership_source": "KR_INF_EXIT_ONLY_BROKER_ADOPTION",
+                                 "broker_qty": position.qty, "broker_average_price": position.average_price,
+                                 "broker_orderable_qty": position.orderable_qty} if adopted else {})})
     if position.qty > 0 and position.current_price + 1e-9 >= position.average_price*(1+config.take_profit_pct):
         if pending_sell: return Decision(Action.WAIT,"PENDING_SELL",next_status=Status.EXIT_PENDING)
         key=idempotency_key(state.cycle_id or "MISSING",trade_date,"SELL_ALL")
         if key in existing_intent_keys: return Decision(Action.WAIT,"DUPLICATE_INTENT",next_status=Status.EXIT_PENDING)
         return Decision(Action.SELL_ALL,"TAKE_PROFIT",position.orderable_qty,position.orderable_qty*position.current_price,key,Status.EXIT_PENDING)
+    if adopted:
+        return Decision(Action.WAIT, "KR_INF_EXIT_ONLY_ADOPTION_NO_ENTRY")
     if state.status == Status.EXIT_PENDING or pending_sell: return Decision(Action.WAIT,"EXIT_PENDING",next_status=Status.EXIT_PENDING)
     if not allow_entry:return Decision(Action.WAIT,"KR_INF_ENTRY_DISABLED_BY_SESSION")
     infinite_overlay_bypass = config.symbol == "122630"

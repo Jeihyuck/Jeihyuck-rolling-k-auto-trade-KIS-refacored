@@ -226,7 +226,11 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                             regime_reserve_permission=regime_reserve_permission,
                             effective_regime_name=regime)
         if decision.metadata and state is not None:
-            state = replace(state, metadata={**state.metadata, **decision.metadata})
+            # A decision is not a fill.  Reconciliation alone may promote the
+            # desired stage to *_FILLED; submission records only pending state.
+            durable = {key: value for key, value in decision.metadata.items()
+                       if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
+            state = replace(state, metadata={**state.metadata, **durable})
             repository.save_state(state)
         logger.info("[TQQQ_INF][BUY_POLICY] effective_regime=%s multiplier=%s entry_evaluation_allowed=%s final_notional=%s reason=%s",
                     regime, multiplier, int(entry_allowed), decision.notional, decision.reason)
@@ -281,7 +285,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         classification_source = "TQQQ_INFINITE_POLICY"
         position_state = "HELD" if broker.qty > 0 else "NOT_HELD"
         profit_stage = str(decision.metadata.get("profit_stage") or "")
-        position_action = ("PARTIAL_EXIT_SELL" if decision.action == Action.SELL and profit_stage == "TP1" else
+        is_partial_tp = profit_stage.startswith("TP1")
+        position_action = ("PARTIAL_EXIT_SELL" if decision.action == Action.SELL and is_partial_tp else
                    "FULL_EXIT_SELL" if decision.action == Action.SELL else
                            "ADD_TO_EXISTING_BUY" if broker.qty > 0 else "NEW_POSITION_BUY")
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
@@ -293,10 +298,11 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "broker_avg_price_source": str((raw or {}).get("broker_avg_price_source") or "kis_pchs_avg_pric"),
             "broker_avg_price_currency": "USD", "broker_avg_price_asof": avg_asof,
             "balance_source": "kis_balance_authoritative", "authoritative_positions": True,
-            "position_lifecycle_id": lifecycle_id, "tp_threshold_fraction": str(config.take_profit_pct),
+            "position_lifecycle_id": lifecycle_id,
+            "tp_threshold_fraction": str(decision.metadata.get("tp_threshold_fraction", config.take_profit_pct)),
             "holding_qty": broker.qty, "orderable_qty": broker.orderable_qty,
             "sellable_qty": broker.orderable_qty, "available_qty": broker.orderable_qty,
-            "partial_exit_allowed": profit_stage == "TP1",
+            "partial_exit_allowed": is_partial_tp,
             "profit_stage": profit_stage or None,
         } if decision.action == Action.SELL else {}
         stage_key = profit_stage or ("BUY" if decision.action == Action.BUY else decision.action.value)
@@ -339,6 +345,13 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                      "tqqq_max_total_capital_usd": config.max_total_capital_usd},
         }
         result = route(intent)
+        if (decision.action == Action.SELL and state is not None
+                and str(result.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED", "PENDING"}):
+            desired = str(decision.metadata.get("desired_profit_stage") or profit_stage or "").upper()
+            pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
+            state = replace(state, status=Status.EXIT_PENDING,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
+            repository.save_state(state)
         logger.info("[TQQQ_INF][ORDER_STATUS] side=%s requested_qty=%s status=%s cycle_id=%s",
                     decision.action.value, decision.qty, result.get("status", "UNKNOWN"), state.cycle_id)
         return {"status": result.get("status", "UNKNOWN"), "decision": decision, "orders": [result]}

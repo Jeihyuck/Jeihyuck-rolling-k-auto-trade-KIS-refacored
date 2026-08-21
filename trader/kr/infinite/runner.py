@@ -74,7 +74,7 @@ def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
 def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
              regime_provider: Callable[[], tuple[str | None, str]] = load_regime,
              trade_date: date | None = None, kis_env: str | None = None,
-             allow_entry: bool = True) -> RunResult:
+             allow_entry: bool = True, balance_snapshot: dict | None = None) -> RunResult:
     """Execute one exit-first tick. Every dependency is injectable for integration tests."""
     day = trade_date or date.today()
     env = (kis_env or os.getenv("KIS_ENV") or "practice").lower()
@@ -85,7 +85,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
     if not config.enabled:
         return RunResult(Decision(Action.WAIT, "KR_INF_FEATURE_DISABLED"), None)
 
-    executor = KISExecutor(kis, env)
+    executor = KISExecutor(kis, env, balance_snapshot=balance_snapshot)
     try:
         repository.ensure_schema()
         state = repository.load_state()
@@ -93,6 +93,14 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # without a broker id is deliberately retained and never blindly retried.
         state, updates = _reconcile_pending(repository, executor, state, day)
         position = executor.position(config.symbol)
+        if state is None and position.qty > 0:
+            state = State(status=Status.ACTIVE, cycle_id=f"BROKER_ADOPTION-{day.isoformat()}",
+                          cycle_start_date=day,
+                          metadata={"ownership_source": "KR_INF_EXIT_ONLY_BROKER_ADOPTION",
+                                    "broker_qty": position.qty,
+                                    "broker_average_price": position.average_price,
+                                    "broker_orderable_qty": position.orderable_qty})
+            repository.save_state(state)
         unresolved_sell = any(i.side == "SELL_ALL" and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
                               for i, broker in updates)
         state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell,
@@ -130,7 +138,11 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                 state = _new_cycle(state, executor, config, day)
                 repository.save_state(state)
 
-        cash = executor.orderable_cash(config.symbol, position.current_price)
+        # Exit-only and already-held ticks never need buying-power data.  This
+        # avoids a second KIS transaction endpoint call (EGW00215) on the hot
+        # sell/reconcile path; cash is fetched only for a possible new cycle.
+        cash = (executor.orderable_cash(config.symbol, position.current_price)
+                if allow_entry and position.qty == 0 else 0.0)
         now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
         minutes_since_open = (now_kst.hour * 60 + now_kst.minute + now_kst.second / 60) - (9 * 60)
         decision = evaluate(config=config, state=state, position=position, trade_date=day,
@@ -142,7 +154,9 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             best_ask=position.current_price,
                             minutes_since_open=minutes_since_open)
         if decision.metadata and state is not None:
-            state = replace(state, metadata={**state.metadata, **decision.metadata})
+            durable = {key: value for key, value in decision.metadata.items()
+                       if key not in {"profit_stage", "desired_profit_stage", "tp1_sold_qty", "remaining_qty"}}
+            state = replace(state, metadata={**state.metadata, **durable})
             repository.save_state(state)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
                      symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
@@ -157,7 +171,10 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
 
         if decision.action == Action.SELL_ALL:
-            state = replace(state, status=Status.EXIT_PENDING)
+            desired = str(decision.metadata.get("desired_profit_stage") or "")
+            pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
+            state = replace(state, status=Status.EXIT_PENDING,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
             repository.save_state(state)
         try:
             order_id, _ = executor.submit(decision, config.symbol)
@@ -209,6 +226,18 @@ def run_canonical_session(*, session: str, env: str, allow_entry: bool = True) -
                 session, env, int(effective_allow_entry))
     return run_once(config=InfiniteConfig.from_env(), kis=KisAPI(kis_env=env),
                     repository=InfiniteRepository(), kis_env=env, allow_entry=effective_allow_entry)
+
+
+def run_kr_infinite_sleeve_tick(*, kis, balance_snapshot: dict, env: str,
+                                trade_date: date, allow_entry: bool) -> RunResult:
+    """Run the isolated 122630 sleeve from its owning PB1 tick.
+
+    The authoritative balance obtained by PB1 is injected, so the sleeve never
+    performs a second balance request in the same tick.
+    """
+    return run_once(config=InfiniteConfig.from_env(), kis=kis, repository=InfiniteRepository(),
+                    kis_env=env, trade_date=trade_date, allow_entry=allow_entry,
+                    balance_snapshot=balance_snapshot)
 
 
 if __name__ == "__main__":

@@ -202,6 +202,7 @@ class InfiniteRepository:
             """), {"symbol": state.symbol, "start": start}).mappings().all()
         summary = self._summarize_fill_rows(rows, state, trading_date)
         last_price = None
+        last_profit_stage = None
         for row in rows:
             if self._belongs_to_cycle(row, state) and str(row.get("side") or "").upper() == "BUY":
                 meta = self._json_object(row.get("meta"))
@@ -209,10 +210,18 @@ class InfiniteRepository:
                     value = float(row.get("price_usd") or 0)
                     if value > 0:
                         last_price = value
+            if self._belongs_to_cycle(row, state) and str(row.get("side") or "").upper() == "SELL":
+                metas = (self._json_object(row.get("meta")), self._json_object(row.get("intent_meta")),
+                         self._json_object(row.get("order_meta")))
+                stage = next((str(meta.get("desired_profit_stage") or meta.get("profit_stage") or "").upper()
+                              for meta in metas if meta.get("desired_profit_stage") or meta.get("profit_stage")), "")
+                if stage:
+                    last_profit_stage = stage.removesuffix("_SUBMITTED").removesuffix("_FILLED") + "_FILLED"
         return {"total_buy_notional": summary[0], "daily_buy_notional": summary[1],
                 "total_sell_notional": summary[2], "last_buy_date": summary[3],
                 "first_fill_price": summary[4], "last_buy_fill_price": last_price,
-                "last_rebound_probe_fill_date": self._last_rebound_probe_fill_date(rows, state)}
+                "last_rebound_probe_fill_date": self._last_rebound_probe_fill_date(rows, state),
+                "last_profit_stage": last_profit_stage}
 
     @classmethod
     def _last_rebound_probe_fill_date(cls, rows: list[Any], state: InfiniteState) -> date | None:
@@ -321,6 +330,8 @@ class InfiniteRepository:
                                  or state.metadata.get("last_buy_fill_price"))
         metadata = {**state.metadata, "last_buy_fill_price": actual_last_buy_price,
                     "broker_qty": broker_qty, "broker_average_price": broker_average_price}
+        if stats.get("last_profit_stage"):
+            metadata.update(profit_stage=stats["last_profit_stage"], pending_profit_stage=None)
         if actual_last_buy_price:
             metadata.update(buy_reference_price=actual_last_buy_price,
                             buy_reference_source="ATTRIBUTED_BUY_FILL",

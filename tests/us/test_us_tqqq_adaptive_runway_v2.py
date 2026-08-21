@@ -55,7 +55,8 @@ def test_invalid_executable_quote_blocks_every_order(price):
 def test_take_profit_is_exit_first_in_every_market_state(market_state):
     result = decide(owned(long_trend="BEAR", chop_high_vol=True, capital_preservation=True),
                     PositionSnapshot(qty=4, average_price=50, price=55), overlay(market_state))
-    assert result.action == Action.SELL and result.qty == 4
+    expected = 4 if market_state in {"DEFENSE_CRASH_PENDING", "DEFENSE_CRASH_CONFIRMED"} else 2
+    assert result.action == Action.SELL and result.qty == expected
 
 
 def test_completed_qqq_rows_detect_high_vol_chop_without_extra_fetch():
@@ -113,7 +114,7 @@ def test_production_overlay_buy_gates_are_enforced_but_sell_remains_first(contex
     assert decide(state, position, overlay(**context)).reason == reason
     if qty:
         sell = decide(state, replace(position, price=55), overlay(**context))
-        assert sell.action == Action.SELL and sell.qty == qty
+        assert sell.action == Action.SELL and sell.qty == max(1, int(qty * 0.5))
 
 
 def test_context_quality_fails_closed_for_buys_but_not_take_profit_sell():

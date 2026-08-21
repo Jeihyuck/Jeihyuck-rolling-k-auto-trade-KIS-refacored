@@ -7211,6 +7211,21 @@ def run_once(
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
+    # The PB1 tick owns reconciliation and the single authoritative balance
+    # snapshot.  Invoke the KR Infinite sleeve here (not from a scheduler or a
+    # session boundary) and isolate failures from standard PB1 processing.
+    try:
+        from trader.kr.infinite.runner import run_kr_infinite_sleeve_tick
+        inf = run_kr_infinite_sleeve_tick(
+            kis=kis, balance_snapshot=balance_snapshot_raw or {}, env=env_effective,
+            trade_date=trade_date, allow_entry=bool(order_allowed and calc_allowed),
+        )
+        metrics["kr_infinite_decision"] = inf.decision.action.value
+        logger.info("[KR_INF][TICK] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
+                    inf.decision.action.value, inf.decision.reason)
+    except Exception as exc:
+        metrics["kr_infinite_decision"] = "BLOCK"
+        logger.exception("[KR_INF][BLOCK] reason=isolated_exception error=%s", exc)
     result_status = result.status if result else "UNKNOWN"
     
     # ✅ DIAG 모드 실행 요약 로그
@@ -7543,6 +7558,17 @@ def _run_loop(*, args: argparse.Namespace) -> None:
 
             window = decide_window(now=now, override=args.window)
             if window is None:
+                active_end_raw = (os.getenv("PB1_AM_EXPECTED_END", "10:30")
+                                  if session_kind == "am" else os.getenv("PB1_PM_EXPECTED_END", "15:10"))
+                try:
+                    active_end = _parse_hhmm_to_time(active_end_raw)
+                except Exception:
+                    active_end = session_end_dt.time()
+                if now.time() >= active_end:
+                    logger.info("[PB1][LOOP][SESSION_END_RELEASE] kind=%s reason=no_future_active_tick now=%s active_end=%s",
+                                session_kind, now.isoformat(), active_end)
+                    exit_reason = "session_end"
+                    break
                 sleep_for = _sleep_until_next_tick_or_session_end(now, session_end_dt, loop_interval)
                 if sleep_for <= 0:
                     exit_reason = "session_end"

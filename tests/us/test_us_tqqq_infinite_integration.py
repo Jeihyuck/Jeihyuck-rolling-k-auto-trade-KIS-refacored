@@ -273,10 +273,10 @@ def test_cancelled_full_exit_uses_deterministic_retry_key(monkeypatch):
     routed = []
     result = run_sleeve(
         positions=[{"symbol": "TQQQ", "qty": 4, "orderable_qty": 4, "avg_price": 50}],
-        price=55, trading_date=date(2026, 8, 11), overlay={},
+        price=55, trading_date=date(2026, 8, 11), overlay={"market_state": "NORMAL"},
         repository=FakeRepository(state),
         route=lambda intent: (routed.append(intent) or {"status": "ACK"}),
     )
     assert result["decision"].action.value == "SELL"
-    assert routed[0]["client_order_key"] == "TQQQ_INF_V3:exit-cycle:2026-08-11:SELL:RETRY:1"
+    assert routed[0]["client_order_key"] == "TQQQ_INF_V3:exit-cycle:2026-08-11:TP1:RETRY:1"
     assert len(routed) == 1

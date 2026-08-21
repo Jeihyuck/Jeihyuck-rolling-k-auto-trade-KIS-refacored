@@ -15,11 +15,12 @@ def test_windows_scheduler_remains_single_owner_and_times_unchanged():
     assert "-MultipleInstances IgnoreNew" in scheduler
 
 
-def test_existing_kr_sessions_own_infinite_hook_without_new_scheduler():
-    runner = Path("trader/kr/runner/trade_session_runner.py").read_text()
+def test_existing_kr_tick_loop_owns_infinite_sleeve_without_new_scheduler():
+    runner = Path("trader/pb1_runner.py").read_text()
     for session in ('"am"', '"afternoon"', '"close"'):
         assert session in runner
-    assert "_run_infinite_session_hook(session=session" in runner
+    assert "run_kr_infinite_sleeve_tick(" in runner
+    assert "[KR_INF][TICK]" in runner
     for script in ("run-kr-am.sh", "run-kr-afternoon.sh", "run-kr-close.sh"):
         text = Path("scripts/wsl", script).read_text()
         assert "trader.kr.runner.trade_session_runner" in text
