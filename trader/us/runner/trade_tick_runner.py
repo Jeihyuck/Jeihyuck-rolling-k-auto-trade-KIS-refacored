@@ -855,6 +855,49 @@ def _dedupe_watchlist_best_by_symbol(rows: list[dict]) -> list[dict]:
     return deduped
 
 
+def _exit_family(intent: dict) -> str:
+    meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
+    reason = str(intent.get("exit_family") or meta.get("exit_family") or intent.get("reason") or meta.get("reason") or "").upper()
+    if "HARD" in reason or "FULL_EXIT" in reason: return "HARD_STOP"
+    if "SOFT" in reason or "STOP_LOSS" in reason: return "SOFT_STOP"
+    if "DEFENSE" in reason: return "DEFENSE_TRIM"
+    if "TREND" in reason: return "TREND_TRIM"
+    if "TAKE_PROFIT" in reason or reason.startswith("TP"): return "TAKE_PROFIT"
+    return reason or "OTHER_EXIT"
+
+
+def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
+    """Select one deterministic SELL per symbol while retaining absorbed reasons."""
+    priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TREND_TRIM": 3, "TAKE_PROFIT": 4}
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    passthrough: list[dict] = []
+    for index, intent in enumerate(exit_intents or []):
+        if str(intent.get("side") or "").upper() != "SELL":
+            passthrough.append(intent)
+            continue
+        grouped.setdefault(str(intent.get("symbol") or "").upper(), []).append((index, intent))
+    merged: list[dict] = []
+    for symbol, rows in grouped.items():
+        rows.sort(key=lambda row: (priority.get(_exit_family(row[1]), 99), row[0]))
+        selected = dict(rows[0][1])
+        selected_meta = dict(selected.get("meta") or {})
+        selected_reason = str(selected.get("reason") or selected_meta.get("reason") or _exit_family(selected))
+        absorbed = [str(row.get("reason") or (row.get("meta") or {}).get("reason") or _exit_family(row))
+                    for _, row in rows[1:]]
+        merge_fields = {
+            "merged_exit_intent": len(rows) > 1, "absorbed_exit_reasons": absorbed,
+            "selected_exit_reason": selected_reason, "selected_exit_family": _exit_family(selected),
+            "original_intent_count": len(rows), "final_qty": int(selected.get("qty") or selected.get("quantity") or 0),
+            "merge_policy_version": "US_EXIT_MERGE_V1",
+        }
+        selected.update(merge_fields)
+        selected_meta.update(merge_fields)
+        selected_meta.setdefault("exit_family", _exit_family(selected))
+        selected["meta"] = selected_meta
+        merged.append(selected)
+    return passthrough + merged
+
+
 def route_exit_orders_immediately(
     exit_intents: list[dict],
     *,
@@ -872,7 +915,7 @@ def route_exit_orders_immediately(
     """
     from trader.us.execution.order_router import route_order
 
-    sell_intents = [i for i in exit_intents if str(i.get("side") or "").upper() == "SELL"]
+    sell_intents = [i for i in merge_exit_intents_by_symbol(exit_intents) if str(i.get("side") or "").upper() == "SELL"]
     logger.info("[US_EXIT][ROUTE_IMMEDIATE][START] exit_intents=%d", len(sell_intents))
     orders: list[dict] = []
     decisions: list[dict] = []
