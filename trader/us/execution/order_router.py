@@ -930,6 +930,10 @@ def route_order(
             "expected_realized_pnl", "pre_order_position_qty", "pre_order_holding_qty",
             "pre_order_orderable_qty", "position_lifecycle_id", "market_state",
             "absorbed_exit_reasons", "same_day_exit_cooldown_applied",
+            "rank_final30", "score_final", "trend_score", "theme_cluster", "sector", "industry",
+            "market_regime", "rotation_regime", "capital_scale", "effective_capital_scale",
+            "entry_style", "selected_reason", "risk_gate_result", "risk_gate_reason",
+            "blocked_peer_count", "candidate_pool_rank", "watchlist_source", "price_source",
         ):
             if audit_meta.get(key) is None and intent.get(key) is not None:
                 audit_meta[key] = intent.get(key)

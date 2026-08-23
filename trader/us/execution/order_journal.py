@@ -37,6 +37,15 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
     if broker_order_no:
         from trader.us.utils.order_no import normalize_us_order_no
         canonical_no = normalize_us_order_no(broker_order_no)
+    is_sell = str(intent.get("side") or "").upper() == "SELL"
+    sell_audit = {
+        key: (intent.get(key) if intent.get(key) is not None else meta.get(key)) if is_sell else None
+        for key in (
+            "exit_family", "broker_avg_price", "broker_avg_price_source", "entry_price",
+            "decision_price", "executable_price", "return_rate_at_decision", "pnl_pct",
+            "expected_realized_pnl",
+        )
+    }
     event = {
         "event_id": str(uuid.uuid4()), "event_type": event_type, "trade_date": td,
         "session": intent.get("session") or getattr(context, "session", ""),
@@ -55,12 +64,13 @@ def append_order_event(event_type: str, intent: dict, *, context: Any | None = N
         "pre_order_position_qty": pre_order_position_qty,
         "pre_order_holding_qty": intent.get("pre_order_holding_qty", meta.get("pre_order_holding_qty", pre_order_position_qty)),
         "pre_order_orderable_qty": intent.get("pre_order_orderable_qty", meta.get("pre_order_orderable_qty")),
-        "requested_sell_qty": meta.get("requested_sell_qty") if str(intent.get("side") or "").upper() == "SELL" else None,
+        "requested_sell_qty": meta.get("requested_sell_qty") if is_sell else None,
         "expected_post_order_qty": meta.get("expected_post_order_qty"),
         "pre_order_position_source": intent.get("pre_order_position_source") or meta.get("pre_order_position_source"),
         "position_lifecycle_id": position_lifecycle_id,
         "limit_price": limit_price, "order_price": intent.get("order_price") or meta.get("order_price"),
         "notional_usd": intent.get("notional_usd") or meta.get("notional_usd"),
+        **sell_audit,
         "meta": meta,
         "cumulative_filled_qty": (raw_response or {}).get("cumulative_filled_qty") if isinstance(raw_response, dict) else None,
         "fill_price": (raw_response or {}).get("fill_price") if isinstance(raw_response, dict) else None,

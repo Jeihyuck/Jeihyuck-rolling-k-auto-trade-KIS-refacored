@@ -857,18 +857,36 @@ def _dedupe_watchlist_best_by_symbol(rows: list[dict]) -> list[dict]:
 
 def _exit_family(intent: dict) -> str:
     meta = intent.get("meta") if isinstance(intent.get("meta"), dict) else {}
-    reason = str(intent.get("exit_family") or meta.get("exit_family") or intent.get("reason") or meta.get("reason") or "").upper()
-    if "HARD" in reason or "FULL_EXIT" in reason: return "HARD_STOP"
-    if "SOFT" in reason or "STOP_LOSS" in reason: return "SOFT_STOP"
-    if "DEFENSE" in reason: return "DEFENSE_TRIM"
-    if "TREND" in reason: return "TREND_TRIM"
-    if "TAKE_PROFIT" in reason or reason.startswith("TP"): return "TAKE_PROFIT"
-    return reason or "OTHER_EXIT"
+    values = (
+        intent.get("exit_family"), meta.get("exit_family"), intent.get("exit_type"),
+        intent.get("exit_reason"), intent.get("exit_reason_detail"), meta.get("stop_type"),
+        meta.get("exit_reason"), meta.get("exit_reason_detail"), intent.get("reason"), meta.get("reason"),
+    )
+    fallback = ""
+    for value in values:
+        token = str(value or "").strip().upper()
+        if not token:
+            continue
+        fallback = fallback or token
+        if token in {"HARD_STOP_LOSS", "HARD_STOP", "HARD_STOP_FULL_EXIT", "PERSISTENT_SOFT_STOP_FULL_EXIT"}:
+            return "HARD_STOP"
+        if token == "SOFT_STOP_LOSS" or token.startswith("SOFT_STOP"):
+            return "SOFT_STOP"
+        if token in {"DEFENSE_RISK_OFF_TRIM", "DEFENSE_CRASH_TRIM", "DEFENSE_TRIM"}:
+            return "DEFENSE_TRIM"
+        if token.startswith("TIME_STOP"):
+            return "TIME_STOP"
+        if token in {"TREND_TRIM", "TREND_DETERIORATION"} or token.startswith("TREND_"):
+            return "TREND_TRIM"
+        if token.startswith("TAKE_PROFIT_TP") or token == "TAKE_PROFIT" or token.startswith("TP"):
+            return "TAKE_PROFIT"
+    return fallback or "OTHER_EXIT"
 
 
 def merge_exit_intents_by_symbol(exit_intents: list[dict]) -> list[dict]:
     """Select one deterministic SELL per symbol while retaining absorbed reasons."""
-    priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TREND_TRIM": 3, "TAKE_PROFIT": 4}
+    priority = {"HARD_STOP": 0, "SOFT_STOP": 1, "DEFENSE_TRIM": 2, "TIME_STOP": 3,
+                "TREND_TRIM": 3, "TAKE_PROFIT": 4}
     grouped: dict[str, list[tuple[int, dict]]] = {}
     passthrough: list[dict] = []
     for index, intent in enumerate(exit_intents or []):
