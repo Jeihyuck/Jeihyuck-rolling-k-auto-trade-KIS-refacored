@@ -325,6 +325,8 @@ def _nested_get(row: dict, dotted_key: str):
 def _extract_pre_order_position_qty(order: dict) -> tuple[int | None, str]:
     meta = _order_meta(order)
     candidates = [
+        (order, "pre_order_holding_qty", "order_pre_order_holding_qty"),
+        (meta, "pre_order_holding_qty", "meta_pre_order_holding_qty"),
         (order, "pre_order_position_qty", "order_pre_order_position_qty"),
         (meta, "pre_order_position_qty", "meta_pre_order_position_qty"),
         (meta, "pre_order_position_snapshot.qty", "meta_pre_order_position_snapshot_qty"),
@@ -793,7 +795,7 @@ def classify_ack_orders_with_final_balance(
             final_status = "broker_fill_confirmed"
         elif side == "BUY" and pre_qty is not None and qty > 0 and final_qty - pre_qty >= qty:
             final_status = "balance_delta_confirmed"
-        elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty >= qty:
+        elif side == "SELL" and pre_qty is not None and qty > 0 and pre_qty - final_qty == qty:
             final_status = "balance_delta_confirmed"
         elif (
             side == "SELL" and qty > 0 and final_qty == 0
@@ -821,9 +823,14 @@ def classify_ack_orders_with_final_balance(
             "fill_api_status": "broker_fill_confirmed" if final_status == "broker_fill_confirmed" else "NOT_CONFIRMED_BY_FILL_API",
             "balance_delta_status": ("balance_delta_confirmed_" + side.lower()) if final_status == "balance_delta_confirmed" else ("position_absent_confirmed_sell" if final_status == "position_absent_confirmed_sell" else "NOT_CONFIRMED_BY_BALANCE_DELTA"),
             "final_status": final_status,
+            "order_final_classification": "BALANCE_DELTA_CONFIRMED" if final_status == "balance_delta_confirmed" else final_status.upper(),
+            "balance_delta_confirmed": final_status == "balance_delta_confirmed",
             "price_source": str((order.get("meta") or {}).get("price_source") or order.get("price_source") or ""),
             "pnl_if_sell": (order.get("meta") or {}).get("pnl_if_sell") if isinstance(order.get("meta") or {}, dict) else None,
             "pre_order_position_qty": pre_qty,
+            "pre_order_holding_qty": pre_qty,
+            "requested_sell_qty": qty if side == "SELL" else None,
+            "expected_post_order_qty": (pre_qty - qty) if side == "SELL" and pre_qty is not None else None,
             "final_position_qty": final_qty,
         })
     return {

@@ -30,6 +30,11 @@ NO_BALANCE_PATTERNS = (
     "no balance", "insufficient position",
 )
 
+DUPLICATE_EXIT_BLOCK_REASONS = {
+    "US_SAME_DAY_SEMANTIC_SELL_DUPLICATE", "duplicate_sell_client_order_key",
+    "same_day_sell_duplicate", "semantic_sell_duplicate", "already_sold_today", "same_day_exit_done",
+}
+
 
 def is_no_balance_sell_reject(message: str) -> bool:
     text = str(message or "").lower()
@@ -60,6 +65,11 @@ def classify_tick_status(tick_result: dict | str | None) -> str:
             absent_symbols = {str(s).upper() for s in (tick_result.get("position_absent_symbols") or [])}
             closed_symbols = qty_zero_symbols | orderable_zero_symbols | absent_symbols
             if duplicate_exit_blocked:
+                return "warning"
+            if block_reason_set and all(
+                reason in DUPLICATE_EXIT_BLOCK_REASONS or "duplicate" in reason.lower()
+                for reason in block_reason_set
+            ):
                 return "warning"
             if "pending_sell_order_exists" in block_reason_set:
                 return "warning"

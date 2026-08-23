@@ -66,12 +66,16 @@ def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dic
     if gross is None and fill_price is not None and filled_qty is not None and cost_basis is not None:
         gross = round((fill_price - cost_basis) * filled_qty, 6)
     return_rate = (fill_price / cost_basis) - 1 if fill_price is not None and cost_basis is not None else None
-    missing_metadata = status in {"FILLED", "PARTIALLY_FILLED"} and not any((
+    filled_status = status in {"FILLED", "PARTIALLY_FILLED"}
+    missing_cost_basis = filled_status and fill_price is not None and filled_qty is not None and cost_basis is None
+    missing_metadata = filled_status and not any((
         meta.get("reason"), meta.get("exit_reason"), meta.get("profit_capture_stage"),
         meta.get("position_lifecycle_id"), meta.get("broker_avg_price"), meta.get("entry_price"), meta.get("avg_cost"),
     ))
     return {"fill_price": fill_price, "filled_qty": filled_qty, "gross_realized_pnl": gross,
-            "return_rate_at_fill": return_rate, "missing_metadata": missing_metadata}
+            "return_rate_at_fill": return_rate, "missing_metadata": missing_metadata,
+            "missing_cost_basis": missing_cost_basis,
+            "error": "ERROR_MISSING_SELL_COST_BASIS" if missing_cost_basis else None}
 
 
 def _position_market_value_usd(position: dict) -> float:
@@ -742,14 +746,26 @@ def run_daily_report(
                             warning = f"ERROR_MISSING_SELL_METADATA symbol={order.get('symbol') or ''} client_order_key={order.get('client_order_key') or ''}"
                             report["warnings"].append(warning)
                             logger.error("[US_DAILY_REPORT][%s]", warning)
+                        if sell_pnl.get("missing_cost_basis"):
+                            warning = f"ERROR_MISSING_SELL_COST_BASIS symbol={order.get('symbol') or ''} client_order_key={order.get('client_order_key') or ''}"
+                            report["warnings"].append(warning)
+                            report.setdefault("errors", []).append(warning)
+                            report["report_consistency"] = worsen_consistency(
+                                report.get("report_consistency", "OK"), "REPORT_INCONSISTENT"
+                            )
+                            logger.error("[US_DAILY_REPORT][%s]", warning)
                         report.setdefault("order_audit", []).append({
                             "symbol": order.get("symbol"), "side": side,
                             "strategy_reason": meta.get("reason") or order.get("reason"),
+                            "reason": meta.get("reason") or order.get("reason"),
+                            "exit_family": meta.get("exit_family"),
                             "tp_stage": meta.get("profit_capture_stage"),
                             "position_lifecycle_id": meta.get("position_lifecycle_id"),
                             "broker_avg_price": meta.get("broker_avg_price"),
                             "broker_avg_price_source": meta.get("broker_avg_price_source"),
+                            "entry_price": meta.get("entry_price"),
                             "decision_price": meta.get("decision_price") or meta.get("executable_price"),
+                            "expected_realized_pnl": meta.get("expected_realized_pnl"),
                             "limit_price": order.get("limit_price") or order.get("avg_price_usd"),
                             "fill_price": sell_pnl.get("fill_price") if side == "SELL" else timeline.get("fill_price") or ((order.get("fill_price") or order.get("avg_price_usd")) if status in {"FILLED", "PARTIALLY_FILLED"} else None),
                             "filled_qty": sell_pnl.get("filled_qty") if side == "SELL" else timeline.get("filled_qty") if timeline.get("filled_qty") is not None else order.get("qty_filled"),
@@ -758,6 +774,17 @@ def run_daily_report(
                             "net_realized_pnl": meta.get("net_realized_pnl") if fees is not None else None,
                             "return_rate_at_decision": meta.get("return_rate_at_decision"),
                             "return_rate_at_fill": meta.get("return_rate_at_fill") or sell_pnl.get("return_rate_at_fill"),
+                            "pre_order_holding_qty": meta.get("pre_order_holding_qty") or meta.get("pre_order_position_qty"),
+                            "post_order_expected_qty": meta.get("post_order_expected_qty") or meta.get("expected_post_order_qty"),
+                            "absorbed_exit_reasons": meta.get("absorbed_exit_reasons", []),
+                            "same_day_exit_cooldown_applied": bool(meta.get("same_day_exit_cooldown_applied", False)),
+                            **{key: meta.get(key) for key in (
+                                "rank_final30", "score_final", "trend_score", "theme_cluster", "sector", "industry",
+                                "market_state", "market_regime", "rotation_regime", "capital_scale",
+                                "effective_capital_scale", "entry_style", "selected_reason", "risk_gate_result",
+                                "risk_gate_reason", "blocked_peer_count", "candidate_pool_rank", "watchlist_source",
+                                "price_source", "trend_state", "pnl_pct",
+                            )},
                             "raw_order_no": meta.get("order_no_raw") or order.get("order_no"),
                             "canonical_order_no": meta.get("order_no_norm"),
                             "client_order_key": order.get("client_order_key"),

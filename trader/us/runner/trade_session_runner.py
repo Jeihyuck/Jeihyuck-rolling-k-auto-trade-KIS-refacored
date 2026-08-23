@@ -555,6 +555,32 @@ def _load_prior_cumulative_metrics(trade_date: str, session: str) -> dict[str, f
     return metrics
 
 
+def resolve_session_order_counts(*, tick_results: list[dict], prior_cumulative: dict,
+                                 journal_session: dict | None, journal_daily: dict | None) -> dict:
+    """Resolve session/daily order totals with the durable journal as authority."""
+    tick_sent = sum(int(row.get("orders_sent", 0) or 0) for row in tick_results)
+    tick_ack = sum(int(row.get("orders_ack", 0) or 0) for row in tick_results)
+    tick_rejected = sum(int(row.get("orders_rejected", 0) or 0) for row in tick_results)
+    session_ledger = journal_session or {}
+    daily_ledger = journal_daily or {}
+    if int(session_ledger.get("orders_sent_total") or 0) > 0:
+        session_sent = int(session_ledger.get("orders_sent_total") or 0)
+        session_ack = int(session_ledger.get("orders_ack_total") or 0)
+        session_rejected = int(session_ledger.get("orders_reject_total") or 0)
+        source = "order_journal"
+    else:
+        session_sent, session_ack, session_rejected = tick_sent, tick_ack, tick_rejected
+        source = "tick_accumulator"
+    daily_sent = int(prior_cumulative.get("orders_sent", 0) or 0) + session_sent
+    daily_ack = int(prior_cumulative.get("orders_ack", 0) or 0) + session_ack
+    if int(daily_ledger.get("orders_sent_total") or 0) > 0:
+        daily_sent = int(daily_ledger.get("orders_sent_total") or 0)
+        daily_ack = int(daily_ledger.get("orders_ack_total") or 0)
+    return {"session_orders_sent": session_sent, "session_orders_ack": session_ack,
+            "session_orders_rejected": session_rejected, "daily_cumulative_orders_sent": daily_sent,
+            "daily_cumulative_orders_ack": daily_ack, "order_count_source": source}
+
+
 
 def _count_trade_date_order_activity(trade_date: str) -> int:
     """Best-effort count of DB order rows used to classify timeout-after-order as non-fatal."""
@@ -1690,11 +1716,29 @@ def run_trade_session(
         if distinct_real_broker_sell_orders:
             real_broker_sells = len(distinct_real_broker_sell_orders)
 
+        # The durable ledger is authoritative.  Tick payloads are retained only
+        # as a fallback because a final tick may contain a snapshot rather than
+        # the whole session (the 2026-08-21 AM 5-vs-16 discrepancy).
+        try:
+            from trader.us.execution.order_journal import aggregate_order_events
+            journal_session = aggregate_order_events(trade_date, session_run_id=session_run_id)
+            journal_daily = aggregate_order_events(trade_date)
+        except Exception as exc:
+            journal_session, journal_daily = {}, {}
+            logger.warning("[US_SESSION][SUMMARY_COUNTS][JOURNAL_FALLBACK] error=%s", exc)
+
         prior_cumulative = _load_prior_cumulative_metrics(trade_date, session)
+        resolved_order_counts = resolve_session_order_counts(
+            tick_results=results, prior_cumulative=prior_cumulative,
+            journal_session=journal_session, journal_daily=journal_daily,
+        )
+        total_orders_sent = resolved_order_counts["session_orders_sent"]
+        total_orders_ack = resolved_order_counts["session_orders_ack"]
+        total_orders_rejected = resolved_order_counts["session_orders_rejected"]
         cumulative_fills_count = int(total_fills)
         session_fills_count = max(0, cumulative_fills_count - int(prior_cumulative.get("fills_count", 0)))
-        daily_cumulative_orders_sent = int(prior_cumulative.get("orders_sent", 0)) + int(total_orders_sent)
-        daily_cumulative_orders_ack = int(prior_cumulative.get("orders_ack", 0)) + int(total_orders_ack)
+        daily_cumulative_orders_sent = resolved_order_counts["daily_cumulative_orders_sent"]
+        daily_cumulative_orders_ack = resolved_order_counts["daily_cumulative_orders_ack"]
         daily_cumulative_fills_count = int(prior_cumulative.get("fills_count", 0)) + int(session_fills_count)
         session_fills_confirmed_notional = max(0.0, float(cumulative_fills_confirmed_notional) - float(prior_cumulative.get("fills_notional", 0.0)))
         daily_cumulative_fills_notional = float(prior_cumulative.get("fills_notional", 0.0)) + float(session_fills_confirmed_notional)

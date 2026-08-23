@@ -919,6 +919,34 @@ def route_order(
             blocked_status = "WARN_DUPLICATE_EXIT_BLOCKED" if (side == "SELL" and duplicate_blocked) else "BLOCKED"
             return {"status": blocked_status, "reason": reason_text, "duplicate_blocked": duplicate_blocked, "intent": intent, "canonical_risk_state": gate_snapshot}
 
+    # Normalize audit evidence before any journal/DB persistence.  SELL policies
+    # must not lose their cost basis merely because they use different reason names.
+    intent.setdefault("meta", {})
+    if isinstance(intent.get("meta"), dict):
+        audit_meta = intent["meta"]
+        for key in (
+            "reason", "exit_family", "broker_avg_price", "broker_avg_price_source", "entry_price",
+            "decision_price", "executable_price", "return_rate_at_decision", "pnl_pct",
+            "expected_realized_pnl", "pre_order_position_qty", "pre_order_holding_qty",
+            "pre_order_orderable_qty", "position_lifecycle_id", "market_state",
+            "absorbed_exit_reasons", "same_day_exit_cooldown_applied",
+            "rank_final30", "score_final", "trend_score", "theme_cluster", "sector", "industry",
+            "market_regime", "rotation_regime", "capital_scale", "effective_capital_scale",
+            "entry_style", "selected_reason", "risk_gate_result", "risk_gate_reason",
+            "blocked_peer_count", "candidate_pool_rank", "watchlist_source", "price_source",
+        ):
+            if audit_meta.get(key) is None and intent.get(key) is not None:
+                audit_meta[key] = intent.get(key)
+        if side == "SELL":
+            holding = audit_meta.get("pre_order_holding_qty", audit_meta.get("pre_order_position_qty"))
+            if holding not in (None, ""):
+                holding = int(float(holding))
+                audit_meta["pre_order_holding_qty"] = holding
+                audit_meta["pre_order_position_qty"] = holding
+                audit_meta["requested_sell_qty"] = int(qty)
+                audit_meta["expected_post_order_qty"] = holding - int(qty)
+                audit_meta["post_order_expected_qty"] = holding - int(qty)
+
     # 4. DRY_RUN resolve with runtime guard
     dry_run_resolved = resolve_dry_run_for_us_order()
     

@@ -916,18 +916,50 @@ def build_defense_trim_intents(positions: list[dict], overlay: dict, existing_se
         reason = "DEFENSE_CRASH_TRIM" if state == "DEFENSE_CRASH" else "DEFENSE_RISK_OFF_TRIM"
         lifecycle = p.get("position_lifecycle_id") or (p.get("meta") or {}).get("position_lifecycle_id") or "NA"
         td = trade_date
+        try:
+            from trader.us.db.repos import has_same_day_exit
+            already_exited = has_same_day_exit(sym, td, reason, lifecycle_id=str(lifecycle))
+        except Exception as exc:
+            already_exited = False
+            logger.warning("[US_DEFENSE][COOLDOWN_CHECK_WARN] symbol=%s reason=%s error=%s", sym, reason, exc)
+        if already_exited:
+            overlay["same_day_exit_cooldown_blocked_count"] = int(overlay.get("same_day_exit_cooldown_blocked_count") or 0) + 1
+            overlay.setdefault("same_day_exit_cooldown_blocked_symbols", []).append(sym)
+            overlay.setdefault("same_day_exit_cooldown_blocked_reasons", []).append(reason)
+            logger.info("[US_DEFENSE][COOLDOWN] symbol=%s exit_family=%s action=skip", sym, reason)
+            continue
+        broker_avg_price = _entry_price(p)
+        pnl_pct = _pnl_pct(p)
+        return_rate = ((price / broker_avg_price) - 1.0) if broker_avg_price and price else None
+        expected_realized_pnl = ((price - broker_avg_price) * qty) if broker_avg_price else None
+        orderable_qty = int(p.get("orderable_qty") or p.get("ord_psbl_qty") or q)
         order_key = f"US_DEF_{td}_{sym}_{lifecycle}_{state}_{q}_{qty}"
         intents.append({
             "symbol": sym, "exchange": p.get("exchange") or p.get("raw_exchange") or "",
             "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price,
             "notional_usd": qty * price, "reason": reason, "client_order_key": order_key,
             "trade_date": td, "position_lifecycle_id": lifecycle, "pre_order_position_qty": q,
+            "pre_order_holding_qty": q, "pre_order_orderable_qty": orderable_qty,
+            "broker_avg_price": broker_avg_price, "broker_avg_price_source": "broker_position",
+            "entry_price": broker_avg_price, "decision_price": price, "executable_price": price,
+            "return_rate_at_decision": return_rate, "pnl_pct": pnl_pct,
+            "expected_realized_pnl": expected_realized_pnl, "market_state": state,
+            "exit_family": reason,
             "session": getattr(context, "session", ""),
             "session_run_id": getattr(context, "session_run_id", ""),
             "session_generation": getattr(context, "session_generation", 1),
             "tick_id": getattr(context, "tick_id", ""), "prep_run_id": getattr(context, "prep_run_id", ""),
-            "meta": {"reason": reason, "market_state": state, "position_lifecycle_id": lifecycle,
-                     "pre_order_position_qty": q},
+            "meta": {"reason": reason, "exit_family": reason, "market_state": state,
+                     "position_lifecycle_id": lifecycle, "pre_order_position_qty": q,
+                     "pre_order_holding_qty": q, "pre_order_orderable_qty": orderable_qty,
+                     "requested_sell_qty": qty, "expected_post_order_qty": q - qty,
+                     "post_order_expected_qty": q - qty,
+                     "broker_avg_price": broker_avg_price,
+                     "broker_avg_price_source": "broker_position", "entry_price": broker_avg_price,
+                     "decision_price": price, "executable_price": price,
+                     "return_rate_at_decision": return_rate, "pnl_pct": pnl_pct,
+                     "expected_realized_pnl": expected_realized_pnl,
+                     "absorbed_exit_reasons": [], "same_day_exit_cooldown_applied": False},
         })
         logger.warning("[US_DEFENSE][TRIM] symbol=%s qty=%d notional=%.2f reason=%s market_state=%s", sym, qty, qty * price, reason, state)
     return intents

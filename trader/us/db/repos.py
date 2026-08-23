@@ -108,6 +108,30 @@ _MEM_PROFIT_CAPTURE_STATE: dict[tuple[str, str], dict] = {}
 _LAST_SAVE_FILLS_ERROR: str | None = None
 
 
+def has_same_day_exit(symbol: str, trade_date: str, exit_family: str,
+                      lifecycle_id: str | None = None) -> bool:
+    """Return whether durable journal evidence contains an ACK/fill for this exit family."""
+    from trader.us.execution.order_journal import load_order_events
+    wanted_symbol = str(symbol or "").upper()
+    wanted_family = str(exit_family or "").upper()
+    for event in load_order_events(str(trade_date)):
+        if str(event.get("event_type") or "") not in {
+            "BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED", "ORDER_PARTIALLY_FILLED", "ORDER_FILLED"
+        }:
+            continue
+        if str(event.get("side") or "").upper() != "SELL" or str(event.get("symbol") or "").upper() != wanted_symbol:
+            continue
+        meta = event.get("meta") if isinstance(event.get("meta"), dict) else {}
+        family = str(meta.get("exit_family") or meta.get("reason") or "").upper()
+        if family != wanted_family:
+            continue
+        event_lifecycle = str(event.get("position_lifecycle_id") or meta.get("position_lifecycle_id") or "")
+        if lifecycle_id and event_lifecycle and event_lifecycle != str(lifecycle_id):
+            continue
+        return True
+    return False
+
+
 
 _US_DAILY_METRIC_FIELDS = (
     "ma20", "ma50", "ma150", "ma200", "ma200_slope",
