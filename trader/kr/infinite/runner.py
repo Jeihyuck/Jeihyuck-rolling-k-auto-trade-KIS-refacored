@@ -66,7 +66,7 @@ def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
     decision = evaluate(config=config, state=state, position=position, trade_date=trade_date,
                         market_state=market_state or "KR_NORMAL", orderable_cash=orderable_cash,
                         allow_entry=False, best_ask=position.current_price)
-    if decision.action != Action.SELL_ALL:
+    if decision.action not in {Action.SELL_PARTIAL, Action.SELL_ALL}:
         return Decision(Action.WAIT, "KR_INF_EXIT_ONLY_NO_SELL")
     return decision
 
@@ -101,7 +101,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                                     "broker_average_price": position.average_price,
                                     "broker_orderable_qty": position.orderable_qty})
             repository.save_state(state)
-        unresolved_sell = any(i.side == "SELL_ALL" and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
+        unresolved_sell = any(i.side in {"SELL_PARTIAL", "SELL_ALL"} and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
                               for i, broker in updates)
         state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell,
                                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
@@ -130,7 +130,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         existing_keys = repository.intent_keys()
         pending = repository.pending_intents()
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
-        pending_sell = any(item.side == "SELL_ALL" for item in pending)
+        pending_sell = any(item.side in {"SELL_PARTIAL", "SELL_ALL"} for item in pending)
 
         if allow_entry and position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
             same_day = state is not None and state.last_exit_date == day and not config.same_day_restart
@@ -159,9 +159,10 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             state = replace(state, metadata={**state.metadata, **durable})
             repository.save_state(state)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
-                     symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
+                     symbol=config.symbol, broker_qty_before=position.qty, sell_qty=decision.qty if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL} else 0,
+                     expected_qty_after=max(0, position.qty - decision.qty) if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL} else position.qty, market_state=market_state,
                      idempotency_key=decision.idempotency_key)
-        if decision.action not in {Action.BUY, Action.RECOVERY, Action.SELL_ALL}:
+        if decision.action not in {Action.BUY, Action.RECOVERY, Action.SELL_PARTIAL, Action.SELL_ALL}:
             return RunResult(decision, state)
         if not config.orders_allowed(env):
             return RunResult(Decision(Action.BLOCK, "KR_INF_CANONICAL_ORDER_GATE_CLOSED"), state)
@@ -170,7 +171,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         if not repository.create_intent(state, decision, day, market_state):
             return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
 
-        if decision.action == Action.SELL_ALL:
+        if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             desired = str(decision.metadata.get("desired_profit_stage") or "")
             pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
             state = replace(state, status=Status.EXIT_PENDING,
@@ -200,7 +201,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             if state is not None:
                 state = replace(state, metadata={**state.metadata, "last_order_reconciliation": reconciliation})
         state, _ = reconcile(state, post_position, day,
-                             pending_sell=decision.action == Action.SELL_ALL and post_position.qty > 0,
+                             pending_sell=decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL} and post_position.qty > 0,
                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
         if state is not None:
             repository.persist_reconciliation(state, post_updates)

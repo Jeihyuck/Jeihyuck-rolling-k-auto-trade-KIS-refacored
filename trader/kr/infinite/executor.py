@@ -48,7 +48,7 @@ class KISExecutor:
     def submit(self, decision: Decision, symbol: str) -> tuple[str | None, dict]:
         if decision.action in {Action.BUY, Action.RECOVERY}:
             response = self.kis.buy_stock_limit(symbol, decision.qty, int(decision.notional / decision.qty))
-        elif decision.action == Action.SELL_ALL:
+        elif decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             response = self.kis.sell_stock(symbol, decision.qty)
         else:
             raise ValueError("NON_ORDER_DECISION")

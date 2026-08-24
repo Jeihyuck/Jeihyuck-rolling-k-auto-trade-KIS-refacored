@@ -20,7 +20,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
+
+
+def _is_us_opening_buy_blocked(now_ny: datetime) -> tuple[bool, str]:
+    """Return the entry-only opening gate; exits are intentionally unaffected."""
+    if os.getenv("US_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False, ""
+    hour, minute = (int(part) for part in os.getenv("US_MARKET_OPEN_ET", "09:30").split(":"))
+    market_open = now_ny.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    buy_start = market_open + timedelta(minutes=max(0, int(os.getenv("US_OPENING_BUY_BLOCK_MINUTES", "30"))))
+    return (market_open <= now_ny < buy_start, buy_start.strftime("%H:%M:%S"))
 
 
 def _get_tqqq_tick_quote(provider: Any) -> tuple[float, str, bool]:
@@ -1097,6 +1107,14 @@ def run_trade_tick(
         now = datetime.fromisoformat(force_now).astimezone(NY_TZ)
     else:
         now = now_ny()
+    opening_buy_blocked, opening_buy_start_et = _is_us_opening_buy_blocked(now)
+    if opening_buy_blocked:
+        entry_can_proceed = False
+        logger.info(
+            "[OPENING_BUY_BLOCK][US] now_et=%s buy_start_et=%s action=SKIP_BUY "
+            "reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1",
+            now.strftime("%H:%M:%S"), opening_buy_start_et,
+        )
     trade_date = now.strftime("%Y-%m-%d")
     session_run_id = session_run_id or os.getenv("US_RUN_ID") or os.getenv("GITHUB_RUN_ID", "local")
     tick_id = tick_id or f"{session_run_id}:{tick_index}"
@@ -2710,6 +2728,14 @@ def run_trade_tick(
 
     for intent in all_intents:
         try:
+            if str(intent.get("side") or "BUY").upper() == "BUY":
+                logger.info(
+                    "[US_PB1][BUY][WHY] symbol=%s entry_style=%s setup_ok=1 risk_ok=1 sized_ok=1 "
+                    "buyable_ok=1 planned_qty=%s order_price=%s reason=US_PB1_ENTRY_AFTER_OPENING_BLOCK",
+                    intent.get("symbol"), intent.get("entry_style") or intent.get("entry_book") or "unknown",
+                    intent.get("qty") or intent.get("quantity") or 0,
+                    intent.get("limit_price") or intent.get("price") or 0,
+                )
             _route_identity = str(intent.get("client_order_key") or intent.get("order_key") or intent.get("symbol") or "")
             _route_preflight_snapshot = getattr(locals().get("incremental_preflight_session"), "accepted_states", {}).get(
                 _route_identity, locals().get("preflight_diagnostics", {}).get("accepted_states", {}).get(_route_identity, {})

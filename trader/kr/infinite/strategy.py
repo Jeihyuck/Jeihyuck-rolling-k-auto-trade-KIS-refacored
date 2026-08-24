@@ -111,7 +111,10 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
             if next_stage == "TP2" or fraction >= 0.99:
                 sell_qty = orderable
             key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}")
-            return Decision(Action.SELL_ALL, f"TAKE_PROFIT_{next_stage}", sell_qty,
+            sell_action = Action.SELL_PARTIAL if sell_qty < position.qty else Action.SELL_ALL
+            assert (sell_action != Action.SELL_ALL or sell_qty == position.qty)
+            assert (sell_action != Action.SELL_PARTIAL or position.qty - sell_qty > 0)
+            return Decision(sell_action, f"TAKE_PROFIT_{next_stage}", sell_qty,
                             sell_qty * position.current_price, key, Status.EXIT_PENDING,
                             {"desired_profit_stage": next_stage, "profit_stage": next_stage,
                              "tp_threshold_fraction": threshold, "tp_sell_fraction": fraction,

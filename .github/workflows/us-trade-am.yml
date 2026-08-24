@@ -118,6 +118,10 @@ jobs:
       US_STRATEGY_ENGINE: "pb1"
       US_ENTRY_ENABLED: "1"
       US_EXIT_ENABLED: "1"
+      US_OPENING_BUY_BLOCK_ENABLED: "1"
+      US_OPENING_BUY_BLOCK_MINUTES: "30"
+      US_MARKET_OPEN_ET: "09:30"
+      US_BUY_START_ET: "10:00"
 
       # [Phase 17] entry book / exit routing / partial exit policy
       US_DEFAULT_ENTRY_BOOK: "SWING_BOOK"

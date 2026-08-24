@@ -14,7 +14,7 @@ def test_kr_normal_tp1_partial_then_tp2():
 
     first = evaluate(config=InfiniteConfig(), state=_state(), position=BrokerPosition(10, 10, 100, 106),
                      trade_date=date(2026, 8, 20), market_state="KR_NORMAL")
-    assert first.action == Action.SELL_ALL
+    assert first.action == Action.SELL_PARTIAL
     assert first.reason == "TAKE_PROFIT_TP1"
     assert first.qty == 5
     second = evaluate(config=InfiniteConfig(), state=_state(profit_stage="TP1"),

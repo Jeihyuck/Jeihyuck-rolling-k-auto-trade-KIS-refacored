@@ -7320,6 +7320,16 @@ class PB1Engine:
         }
 
     @staticmethod
+    def _is_kr_opening_buy_blocked(at: datetime) -> tuple[bool, str]:
+        """Apply the opening delay to BUY submission only, never exit evaluation."""
+        if os.getenv("KR_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False, ""
+        hour, minute = (int(part) for part in os.getenv("KR_MARKET_OPEN_HHMM", "09:00").split(":"))
+        market_open = at.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        buy_start = market_open + timedelta(minutes=max(0, int(os.getenv("KR_OPENING_BUY_BLOCK_MINUTES", "30"))))
+        return market_open <= at < buy_start, buy_start.strftime("%H:%M:%S")
+
+    @staticmethod
     def _classify_submit_terminal_status(
         *,
         api_submitted: int,
@@ -7350,6 +7360,7 @@ class PB1Engine:
             "reason": "SELL_ACCEPTED",
             "blocked_until": "SESSION_END",
         }
+        logger.info("[SELL_SESSION_BLOCK][REGISTER] code=%s reason=SELL_ACCEPTED order_id=%s", self._display_code(code_key), order_id or "")
 
     def _register_session_no_sellable(self, *, code: str, reason: str = "KIS_NO_SELLABLE_QTY") -> int:
         code_key = str(code or "").zfill(6)
@@ -7366,6 +7377,7 @@ class PB1Engine:
             "reason": reason,
             "blocked_until": "SESSION_END",
         }
+        logger.info("[SELL_SESSION_BLOCK][REGISTER] code=%s reason=%s", self._display_code(code_key), reason)
         if count >= 2:
             logger.error(
                 "[EXIT][RETRY_BLOCK][ERROR] code=%s reason=NO_SELLABLE_QTY count=%s action=block_for_session",
@@ -12272,6 +12284,22 @@ class PB1Engine:
                 "condition_details": conds,
             }
         )
+        from trader.kr.exit_guards import same_day_soft_exit_block
+        soft_blocked, holding_minutes, min_hold_minutes = same_day_soft_exit_block(
+            now_kst=self._now_kst, bought_at=entry_ts, exit_reason=eval_reason,
+        )
+        if soft_blocked:
+            exit_eval = replace(exit_eval, exit_ok=False)
+            exit_eval_payload.update({
+                "exit_ok": False,
+                "order_result": "ORDER_SKIPPED_SAME_DAY_SOFT_EXIT",
+                "order_skip_reasons": ["SAME_DAY_SOFT_EXIT_MIN_HOLD"],
+            })
+            logger.info(
+                "[KR_EXIT][SOFT_EXIT_BLOCK] code=%s reason=%s bought_today=1 holding_minutes=%s "
+                "min_hold=%s action=skip_soft_exit hard_exit_allowed=1",
+                display_code, eval_reason, holding_minutes, min_hold_minutes,
+            )
         # [2026-04-30] last_exit_eval_json은 non-critical: 남은 tick budget이 부족하면 skip
         _noncritical_timeout = int(os.getenv("PB1_NONCRITICAL_DB_UPDATE_TIMEOUT_SEC", "2"))
         _skip_threshold = int(os.getenv("PB1_SKIP_NONCRITICAL_DB_UPDATE_WHEN_REMAINING_SEC_LT", "5"))
@@ -12775,6 +12803,10 @@ class PB1Engine:
                 price=float(mark or 0.0),
                 order_id=str(kis_odno or order_id or ""),
             )
+            if hasattr(self.kis, "invalidate_balance_cache"):
+                self.kis.invalidate_balance_cache(reason=f"sell_ack:{code}", codes=[display_code])
+            self._balance_snapshot = None
+            self._balance_snapshot_source = None
             try:
                 self.orders_repo.mark_acked(self.env, kis_odno, resp)
                 logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
@@ -12961,7 +12993,8 @@ class PB1Engine:
         submit_attempt_count = len([evaluation for evaluation in exit_evaluations if int(evaluation.get("submit_attempted") or 0) > 0])
         submitted_count = len([evaluation for evaluation in exit_evaluations if int(evaluation.get("submitted") or 0) > 0])
         accepted_sell_count = submitted_count
-        fill_confirmed_sell_count = submitted_count
+        fill_confirmed_sell_count = len([evaluation for evaluation in exit_evaluations if int(evaluation.get("filled") or 0) > 0])
+        balance_confirmed_sell_count = len([evaluation for evaluation in exit_evaluations if int(evaluation.get("balance_confirmed") or 0) > 0])
         no_exit_count = len([evaluation for evaluation in exit_evaluations if not bool(evaluation.get("exit_ok"))])
         blocked_count = len([
             evaluation
@@ -12990,6 +13023,10 @@ class PB1Engine:
             "accepted_sells": accepted_sell_count,
             "fill_confirmed_sells": fill_confirmed_sell_count,
             "sell_orders_ack": accepted_sell_count,
+            "sell_orders_requested": submit_attempt_count,
+            "sell_fills_confirmed": fill_confirmed_sell_count,
+            "sell_balance_confirmed": balance_confirmed_sell_count,
+            "sell_unresolved": max(0, accepted_sell_count - max(fill_confirmed_sell_count, balance_confirmed_sell_count)),
             "sell_orders_filled": fill_confirmed_sell_count,
             "no_exit_count": no_exit_count,
             "blocked_count": blocked_count,
@@ -15496,6 +15533,11 @@ class PB1Engine:
                 "attempted": int(attempted),
                 "accepted": int(accepted),
                 "filled": int(filled),
+                "buy_orders_requested": int(attempted),
+                "buy_orders_ack": int(accepted),
+                "buy_fills_confirmed": int(filled),
+                "buy_balance_confirmed": 0,
+                "buy_unresolved": max(0, int(accepted) - int(filled)),
                 "skipped": int(skipped),
                 "failed": int(failed),
                 "rejected": int(rejected),
@@ -18459,12 +18501,26 @@ class PB1Engine:
                         skipped_count = len(orderable_candidates)
                     else:
                         def _pre_submit_gate(cf: CandidateFeature) -> bool:
+                            opening_blocked, buy_start = self._is_kr_opening_buy_blocked(self._now_kst)
+                            if opening_blocked:
+                                logger.info(
+                                    "[OPENING_BUY_BLOCK][KR] now=%s buy_start=%s code=%s pb1_candidate=1 "
+                                    "action=SKIP_BUY reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1",
+                                    self._now_kst.strftime("%H:%M:%S"), buy_start, cf.code,
+                                )
+                                return False
                             buy_allowed, buy_block_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(now_kst())
                             if not buy_allowed:
                                 logger.warning("[ORDER][PRE_SUBMIT][BLOCK] side=BUY code=%s reason=%s now=%s cutoff=%s", cf.code, buy_block_reason, now_kst().isoformat(), runtime_cutoff_dt.isoformat())
                             return buy_allowed
 
                         def _submit_candidate(cf: CandidateFeature) -> dict[str, Any]:
+                            logger.info(
+                                "[PB1][BUY][WHY] code=%s entry_style=%s setup_ok=1 risk_ok=1 sized_ok=1 "
+                                "buyable_ok=1 planned_qty=%s order_price=%s reason=PB1_ENTRY_AFTER_OPENING_BLOCK",
+                                cf.code, (cf.features or {}).get("entry_style_selected") or (cf.features or {}).get("entry_style") or "unknown",
+                                cf.planned_qty, (cf.features or {}).get("entry_price") or (cf.features or {}).get("close") or 0,
+                            )
                             logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
                             status = self._place_entry_close(cf) if self.window_internal == "close" else self._place_entry(cf)
                             terminal_event = str(status.get("terminal_event") or "")

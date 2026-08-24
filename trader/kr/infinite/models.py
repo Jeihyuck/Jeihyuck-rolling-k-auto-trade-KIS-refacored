@@ -7,7 +7,7 @@ from typing import Any
 class Status(str, Enum):
     READY="READY"; ACTIVE="ACTIVE"; EXIT_PENDING="EXIT_PENDING"; COMPLETE="COMPLETE"; FROZEN="FROZEN"
 class Action(str, Enum):
-    BUY="BUY"; RECOVERY="RECOVERY"; SELL_ALL="SELL_ALL"; WAIT="WAIT"; BLOCK="BLOCK"
+    BUY="BUY"; RECOVERY="RECOVERY"; SELL_PARTIAL="SELL_PARTIAL"; SELL_ALL="SELL_ALL"; WAIT="WAIT"; BLOCK="BLOCK"
 
 @dataclass(frozen=True)
 class State:

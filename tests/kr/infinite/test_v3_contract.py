@@ -19,7 +19,7 @@ def test_normal_eleven_percent_is_adaptive_half_not_full(default_config):
     decision = evaluate(config=default_config, state=active(),
                         position=BrokerPosition(10, 10, 100, 111), trade_date=DAY,
                         market_state="KR_NORMAL")
-    assert (decision.action, decision.reason, decision.qty) == (Action.SELL_ALL, "TAKE_PROFIT_TP1", 5)
+    assert (decision.action, decision.reason, decision.qty) == (Action.SELL_PARTIAL, "TAKE_PROFIT_TP1", 5)
     assert decision.metadata["fallback_10pct_used"] == 0
 
 
