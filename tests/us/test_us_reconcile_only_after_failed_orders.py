@@ -113,4 +113,4 @@ def test_close_balance_absent_unaccepted_sell_remains_unresolved(monkeypatch):
     monkeypatch.setattr(reconcile, "validate_reconcile_identity", lambda **kwargs: {"status": "OK"})
     result = reconcile.classify_ack_orders_with_final_balance(provider=object(), trade_date="2026-07-21", orders=orders)
     assert result["pending_order_count"] == 1
-    assert result["orders"][0]["final_status"] == "ack_only_unresolved"
+    assert result["orders"][0]["final_status"] == "ack_unresolved_error"

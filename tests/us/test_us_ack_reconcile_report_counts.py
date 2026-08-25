@@ -77,5 +77,5 @@ def test_close_final_balance_delta_classifies_pending_out_of_report():
     by_symbol = {row["symbol"]: row for row in result["orders"]}
     assert by_symbol["B1"]["final_status"] == "balance_delta_confirmed"
     assert by_symbol["S1"]["final_status"] == "balance_delta_confirmed"
-    assert by_symbol["U1"]["final_status"] == "ack_only_unresolved"
+    assert by_symbol["U1"]["final_status"] == "ack_unresolved_error"
     assert result["pending_order_count"] == 1

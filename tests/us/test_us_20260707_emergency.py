@@ -113,7 +113,7 @@ def test_ack_only_not_counted_as_fill_balance_delta_confirmed():
     out = classify_ack_orders_with_final_balance(provider=Provider(), trade_date="2026-07-07", env="practice", orders=orders)
     by_symbol = {o["symbol"]: o for o in out["orders"]}
     assert by_symbol["APH"]["final_status"] == "balance_delta_confirmed"
-    assert by_symbol["U1"]["final_status"] == "ack_only_unresolved"
+    assert by_symbol["U1"]["final_status"] == "ack_unresolved_error"
     assert out["counts"].get("broker_fill_confirmed", 0) == 0
 
 

@@ -272,11 +272,16 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         reconcile_status = str(reconcile_result.get("status") or "UNKNOWN").upper()
         ack_reconcile_status = str(ack_reconcile_result.get("status") or "UNKNOWN").upper()
         ack_reconcile_failed = bool(
-            ack_reconcile_status not in {"OK", "SKIP"}
+            ack_reconcile_status not in {"OK", "SKIP", "WARN"}
             or int(ack_reconcile_result.get("failed_count") or 0) > 0
+            or int(ack_reconcile_result.get("unresolved_error_count", ack_reconcile_result.get("unresolved_count", 0)) or 0) > 0
         )
         ack_unresolved_count = int(ack_reconcile_result.get("unresolved_count") or 0)
         pending_count = max(pending_count, ack_unresolved_count)
+        open_order_pending_count = max(
+            int(close_order_classification.get("open_order_pending_count") or 0),
+            int(ack_reconcile_result.get("open_order_pending_count") or 0),
+        )
         reconcile_error_statuses = {
             "CONTRACT_ERROR",
             "FATAL_ERROR",
@@ -295,7 +300,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
         ):
             report_consistency = "FAILED"
         report_failed = (
-            daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS"}
+            daily_report_result.get("status") not in {"OK", "OK_WITH_WARNINGS", "WARNING_OPEN_ORDER_PENDING"}
             or bool((daily_report_result.get("report") or {}).get("errors"))
             or report_consistency != "OK"
         )
@@ -313,6 +318,16 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             status = "ERROR"
         elif pending_count > 0:
             status = "DEGRADED_ACK_UNRESOLVED"
+        elif open_order_pending_count > 0:
+            status = "OK_WITH_WARNINGS"
+            logger.warning(
+                "[US_CLOSE][ORDER_RECONCILE][SUMMARY] ack_total=%s fill_confirmed=%s balance_confirmed=%s "
+                "open_order_pending=%s cancelled=%s expired=%s unresolved_error=0 "
+                "status=WARNING_OPEN_ORDER_PENDING exit_code=0",
+                ack_reconcile_result.get("pending_count", 0), ack_reconcile_result.get("confirmed_count", 0),
+                ack_reconcile_result.get("balance_reconcile_count", 0), open_order_pending_count,
+                ack_reconcile_result.get("cancelled_count", 0), ack_reconcile_result.get("expired_count", 0),
+            )
         elif fills_status not in ("OK", "SKIP") or reconcile_status not in ("OK", "SKIP"):
             status = "OK_WITH_WARNINGS"
 
@@ -348,6 +363,7 @@ def run_trade_close(env: str = "practice", offline: bool = False, force_now: str
             "order_final_classification": close_order_classification.get("orders", []),
             "order_final_classification_counts": close_order_classification.get("counts", {}),
             "pending_order_count": close_order_classification.get("pending_order_count", 0),
+            "open_order_pending_count": open_order_pending_count,
             "daily_report_status": daily_report_result.get("status"),
             "report_consistency": report_consistency,
             "position_snapshot_error": position_snapshot_error,

@@ -30,6 +30,30 @@ logger = logging.getLogger(__name__)
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
 
 
+def classify_ack_reconcile_gate(ack_recon: dict, *, reconcile_only_until_clean: bool = False) -> dict[str, Any]:
+    """Translate ACK evidence into split routing and manual-reconcile policy."""
+    pending = int(ack_recon.get("pending_count", 0) or 0)
+    open_pending = int(ack_recon.get("open_order_pending_count", 0) or 0)
+    unresolved = int(ack_recon.get("unresolved_error_count", ack_recon.get("unresolved_count", 0)) or 0)
+    blocked = bool(reconcile_only_until_clean or pending > 0 or open_pending > 0 or unresolved > 0)
+    if open_pending > 0 and unresolved == 0:
+        reason = "open_order_pending"
+    elif unresolved > 0:
+        reason = "unresolved_ack_error"
+    elif reconcile_only_until_clean:
+        reason = "prior_failed_orders_reconcile_required"
+    else:
+        reason = "ok"
+    symbols = ack_recon.get("symbols_by_status") or {}
+    return {
+        "allow_new_orders": not blocked, "reason": reason,
+        "open_order_pending_count": open_pending, "unresolved_error_count": unresolved,
+        "last_open_order_pending_symbols": symbols.get("open_order_pending", []),
+        "last_unresolved_error_symbols": symbols.get("unresolved_error", []),
+        "manual_reconcile_required": int(unresolved > 0),
+    }
+
+
 def _is_us_opening_buy_blocked(now_ny: datetime) -> tuple[bool, str]:
     """Return the entry-only opening gate; exits are intentionally unaffected."""
     if os.getenv("US_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
@@ -1555,6 +1579,11 @@ def run_trade_tick(
     # intent generation and route_exit_orders_immediately().
     pending_ack_count = int(ack_recon.get("pending_count", 0) or 0)
     unresolved_ack_count = int(ack_recon.get("unresolved_count", 0) or 0)
+    open_order_pending_count = int(ack_recon.get("open_order_pending_count", 0) or 0)
+    unresolved_error_count = int(ack_recon.get("unresolved_error_count", unresolved_ack_count) or 0)
+    ack_gate = classify_ack_reconcile_gate(
+        ack_recon, reconcile_only_until_clean=reconcile_only_until_clean,
+    )
     ack_reconcile_ok = str(ack_recon.get("status") or "").upper() == "OK"
     reconcile_only_clean = bool(
         reconcile_only_until_clean
@@ -1572,7 +1601,7 @@ def run_trade_tick(
     if ack_order_block:
         logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
     if reconcile_only_until_clean or ack_order_block:
-        reason = "prior_failed_orders_reconcile_required" if reconcile_only_until_clean else "unresolved_ack_exists"
+        reason = str(ack_gate["reason"] or "unresolved_ack_exists")
         logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
         reconcile_only_clean_at = (
             _write_reconcile_only_clean_marker(trade_date=trade_date, session=session, tick_index=tick_index)
@@ -1596,10 +1625,14 @@ def run_trade_tick(
             "reconcile_only_clean_tick": int(tick_index) if reconcile_only_clean else 0,
             "pending_ack_count": pending_ack_count,
             "unresolved_ack_count": unresolved_ack_count,
+            "open_order_pending_count": open_order_pending_count,
+            "unresolved_error_count": unresolved_error_count,
             "blocked_new_orders_due_to_reconcile": 1,
             "last_unresolved_symbols": (ack_recon.get("symbols_by_status") or {}).get("unresolved", []),
+            "last_open_order_pending_symbols": ack_gate["last_open_order_pending_symbols"],
+            "last_unresolved_error_symbols": ack_gate["last_unresolved_error_symbols"],
             "last_unresolved_order_nos": ack_recon.get("unresolved_order_nos", []),
-            "manual_reconcile_required": int(not reconcile_only_clean),
+            "manual_reconcile_required": ack_gate["manual_reconcile_required"],
             "ack_reconcile_before_route_status": ack_recon.get("status"),
             "ack_pending_reconcile_count": pending_ack_count,
         }
