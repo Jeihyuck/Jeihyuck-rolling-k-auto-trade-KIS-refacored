@@ -13,10 +13,14 @@ from trader.window_router import WindowDecision
 class FakeKis:
     def __init__(self) -> None:
         self.sell_calls = 0
+        self.balance_invalidations: list[tuple[str, list[str]]] = []
 
     def sell_stock_market(self, code: str, qty: int) -> dict:
         self.sell_calls += 1
         return {"rt_cd": "0", "msg_cd": "0", "msg1": "accepted", "output": {"ODNO": f"S-{code}-{qty}"}}
+
+    def invalidate_balance_cache(self, *, reason: str, codes: list[str] | None = None) -> None:
+        self.balance_invalidations.append((reason, list(codes or [])))
 
 
 class _NoopUniverseRepo:
@@ -119,3 +123,32 @@ def test_db_kis_mismatch_pending_close_status_blocks_sell(monkeypatch) -> None:
     assert payload is not None
     assert payload["order_result"] in {"ORDER_SKIPPED_POSITION_MISMATCH", "ORDER_SKIPPED_SESSION_BLOCKED"}
     assert kis.sell_calls == 0
+
+
+def test_sell_ack_invalidates_balance_and_blocks_resubmit(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    engine, kis = _make_engine()
+    code = "005830"
+
+    sell_position = _pos(code=code, qty=1, kis_qty=1, orderable_qty=1)
+    sell_position["stop_price"] = 9500.0
+    first = engine._plan_exit_event(
+        sell_position,
+        {"close": 9000.0},
+        pd.DataFrame(),
+        "day",
+    )
+
+    assert first is not None and first["submitted"] == 1
+    assert first["order_result"] == "ORDER_OK"
+    assert kis.sell_calls == 1
+    assert kis.balance_invalidations == [(f"sell_ack:{code}", [code])]
+    assert engine._balance_snapshot is None
+    second = engine._plan_exit_event(
+        sell_position,
+        {"close": 9000.0},
+        pd.DataFrame(),
+        "day",
+    )
+    assert second["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
+    assert kis.sell_calls == 1

@@ -26,7 +26,7 @@ def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderS
     """Apply only the newly confirmed portion of a broker fill."""
     delta_qty = max(0, broker.filled_qty - intent.filled_qty)
     delta_notional = max(0.0, broker.filled_notional_krw - intent.filled_notional_krw)
-    if delta_qty > 0 and intent.side == "SELL_ALL":
+    if delta_qty > 0 and intent.side in {"SELL_PARTIAL", "SELL_ALL"}:
         pending = str((state.metadata or {}).get("pending_profit_stage") or "").upper()
         fully_filled = broker.filled_qty >= intent.requested_qty > 0
         metadata = {**state.metadata, "last_profit_fill_qty": broker.filled_qty,

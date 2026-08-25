@@ -7,8 +7,13 @@ from __future__ import annotations
 
 import os
 import pytest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from trader.us.execution.order_router import route_order, clear_sent_order_keys
+
+
+DAYTIME_ET = datetime(2026, 8, 24, 10, 30, tzinfo=ZoneInfo("America/New_York"))
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +65,7 @@ class TestOrderIntentFormat:
             make_intent(),
             available_cash_usd=500.0,
             total_portfolio_usd=1000.0,
+            now=DAYTIME_ET,
         )
         assert result["status"] == "DRY_RUN"
         assert result["symbol"] == "NVDA"
@@ -68,6 +74,7 @@ class TestOrderIntentFormat:
         result = route_order(
             make_intent(symbol="ZZZZZ"),
             available_cash_usd=500.0,
+            now=DAYTIME_ET,
         )
         assert result["status"] == "BLOCKED"
 
@@ -76,6 +83,7 @@ class TestOrderIntentFormat:
             make_intent(side="SELL"),
             available_cash_usd=500.0,
             total_portfolio_usd=1000.0,
+            now=DAYTIME_ET,
         )
         assert result["status"] == "DRY_RUN"
         assert result["side"] == "SELL"
@@ -88,6 +96,7 @@ class TestDryRunBehavior:
             make_intent(),
             available_cash_usd=500.0,
             total_portfolio_usd=1000.0,
+            now=DAYTIME_ET,
         )
         assert result["status"] == "DRY_RUN"
 
@@ -97,6 +106,7 @@ class TestDryRunBehavior:
             intent,
             available_cash_usd=500.0,
             total_portfolio_usd=1000.0,
+            now=DAYTIME_ET,
         )
         assert result["intent"]["client_order_key"] == "test-preserve-key"
 
@@ -106,6 +116,7 @@ class TestEdgeCases:
         result = route_order(
             make_intent(qty=0),
             available_cash_usd=500.0,
+            now=DAYTIME_ET,
         )
         assert result["status"] == "BLOCKED"
 
@@ -113,5 +124,6 @@ class TestEdgeCases:
         result = route_order(
             make_intent(notional_usd=150.0),
             available_cash_usd=500.0,
+            now=DAYTIME_ET,
         )
         assert result["status"] == "BLOCKED"

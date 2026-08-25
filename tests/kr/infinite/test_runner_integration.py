@@ -140,7 +140,7 @@ def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
     kis = FakeKIS(qty=150, average=100, price=110, fill_qty=110)
     repo = FakeRepository(active())
     partial = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
-    assert partial.decision.action == Action.SELL_ALL and partial.state.status == Status.EXIT_PENDING and kis.qty == 75
+    assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.EXIT_PENDING and kis.qty == 75
     # A subsequent tick reconciles the pending sell and cannot buy.
     again = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert again.decision.action == Action.SELL_ALL and again.decision.reason == "TAKE_PROFIT_TP2" and len(kis.orders) == 2
@@ -235,7 +235,7 @@ def test_precheck_blocked_take_profit_still_sells(armed_practice_env):
     kis, repo = FakeKIS(qty=100, average=100, price=110), FakeRepository(active())
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice", allow_entry=False)
-    assert result.decision.action == Action.SELL_ALL and result.submitted and kis.orders == [("SELL", 50)]
+    assert result.decision.action == Action.SELL_PARTIAL and result.submitted and kis.orders == [("SELL", 50)]
 
 
 def test_close_no_position_cannot_create_cycle(armed_practice_env):
@@ -256,7 +256,7 @@ def test_close_take_profit_still_sells(armed_practice_env):
     kis, repo = FakeKIS(qty=100, average=100, price=110), FakeRepository(active())
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice", allow_entry=False)
-    assert result.decision.action == Action.SELL_ALL and kis.orders == [("SELL", 50)]
+    assert result.decision.action == Action.SELL_PARTIAL and kis.orders == [("SELL", 50)]
 
 
 def test_sell_only_tick_never_queries_orderable_cash(armed_practice_env):
@@ -266,4 +266,4 @@ def test_sell_only_tick_never_queries_orderable_cash(armed_practice_env):
     kis.get_orderable_cash = forbidden
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice", allow_entry=False)
-    assert result.decision.action == Action.SELL_ALL
+    assert result.decision.action == Action.SELL_PARTIAL

@@ -291,6 +291,7 @@ def _build_kis_position_by_symbol(positions: list[dict]) -> dict[str, dict]:
         last_price = _safe_float(_first_present(pos, ["last_price", "current_price", "current_price_usd", "ovrs_now_pric", "ovrs_prpr", "current_px"], 0.0))
         by_symbol[symbol] = {
             "qty": qty,
+            "orderable_qty": _safe_int(_first_present(pos, ["orderable_qty", "sellable_qty", "ord_psbl_qty", "ovrs_ord_psbl_qty"], qty)),
             "avg_price": avg_price,
             "last_price": last_price,
             "raw": pos,
@@ -464,8 +465,13 @@ def reconcile_ack_orders_with_balance(
             "confirmed_count": 0,
             "balance_reconcile_count": 0,
             "unresolved_count": 0,
+            "open_order_pending_count": 0,
+            "cancelled_count": 0,
+            "expired_count": 0,
+            "unresolved_error_count": 0,
             "failed_count": 0,
-            "symbols_by_status": {},
+            "symbols_by_status": {"confirmed": [], "balance_confirmed": [], "open_order_pending": [], "cancelled": [], "expired": [], "unresolved_error": []},
+            "order_nos_by_status": {"open_order_pending": [], "unresolved_error": []},
         }
 
     logger.info(
@@ -483,9 +489,16 @@ def reconcile_ack_orders_with_balance(
     confirmed_count = 0
     balance_reconcile_count = 0
     unresolved_count = 0
+    open_order_pending_count = 0
+    expired_count = 0
     failed_count = 0
     canceled_count = 0
-    symbols_by_status: dict[str, list[str]] = {"fill_api_confirmed": [], "balance_confirmed": [], "unresolved": []}
+    symbols_by_status: dict[str, list[str]] = {
+        "confirmed": [], "fill_api_confirmed": [], "balance_confirmed": [],
+        "open_order_pending": [], "cancelled": [], "expired": [],
+        "unresolved_error": [], "unresolved": [],
+    }
+    order_nos_by_status: dict[str, list[str]] = {"open_order_pending": [], "unresolved_error": []}
 
     for order in pending_orders:
         symbol = str(order.get("symbol", "")).strip().upper()
@@ -521,9 +534,16 @@ def reconcile_ack_orders_with_balance(
         fill_price_source = fallback_price_source or "unavailable"
         fill_qty = qty
 
+        fills_resp: dict = {}
         try:
             fills_resp = provider.get_fills_by_order_no(order_no=order_no, symbol=symbol, trade_date=trade_date)
             if fills_resp and isinstance(fills_resp, dict):
+                terminal_status = str(fills_resp.get("status") or "").upper()
+                if terminal_status in {"EXPIRED", "LAPSED", "DAY_ORDER_LAPSED", "만료"}:
+                    expired_count += 1
+                    symbols_by_status["expired"].append(symbol)
+                    logger.info("[US_RECONCILE][ACK_EXPIRED] symbol=%s order_no=%s", symbol, order_no)
+                    continue
                 if is_terminal_zero_fill_cancel(fills_resp):
                     terminal_status = str(fills_resp.get("status") or "CANCELLED").upper()
                     broker_status = "REJECTED" if terminal_status in {"REJECTED", "거부"} else "CANCELLED"
@@ -537,6 +557,7 @@ def reconcile_ack_orders_with_balance(
                     )
                     if mark_result.get("status") in {"OK", "ORDER_NOT_FOUND", "ORDER_IDENTITY_NOT_UNIQUE"}:
                         canceled_count += 1
+                        symbols_by_status["cancelled"].append(symbol)
                         logger.info("[US_RECONCILE][MANUAL_CANCEL] symbol=%s order_no=%s status=%s",
                                     symbol, order_no, broker_status)
                         continue
@@ -608,6 +629,7 @@ def reconcile_ack_orders_with_balance(
                 if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
                     confirmed_count += 1
                     symbols_by_status["fill_api_confirmed"].append(symbol)
+                    symbols_by_status["confirmed"].append(symbol)
                 else:
                     _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
                     failed_count += 1
@@ -719,27 +741,66 @@ def reconcile_ack_orders_with_balance(
                 buy_reason if fill_price_candidate > 0 else "missing_fill_price",
             )
 
-        logger.warning(
-            "[US_RECONCILE][ACK_RECONCILE][UNRESOLVED] symbol=%s order_no=%s side=%s",
-            symbol, order_no, side,
+        position = kis_position_by_symbol.get(symbol) or {}
+        current_qty = int(position.get("qty") or 0)
+        current_orderable = int(position.get("orderable_qty") if position.get("orderable_qty") is not None else current_qty)
+        remaining_qty = int((fills_resp or {}).get("remaining_qty") or order.get("remaining_qty") or qty or 0)
+        broker_status = str((fills_resp or {}).get("status") or order.get("broker_status") or "").upper()
+        explicit_open = bool(
+            (fills_resp or {}).get("open_order") or (fills_resp or {}).get("is_open")
+            or order.get("open_order") or order.get("open_order_pending")
+            or broker_status in {"OPEN", "PENDING", "ACK_OPEN", "WORKING", "PARTIALLY_FILLED"}
+        )
+        reservation = bool(
+            side == "SELL" and pre_qty_for_delta is not None and current_qty == pre_qty_for_delta
+            and qty > 0 and current_orderable <= max(0, pre_qty_for_delta - qty)
+        )
+        if remaining_qty > 0 and (explicit_open or reservation):
+            open_order_pending_count += 1
+            symbols_by_status["open_order_pending"].append(symbol)
+            order_nos_by_status["open_order_pending"].append(order_no)
+            logger.info(
+                "[US_RECONCILE][ACK_OPEN_ORDER_PENDING] symbol=%s order_no=%s requested_qty=%s "
+                "filled_qty=0 remaining_qty=%s orderable_delta=%s action=mark_open_order_pending",
+                symbol, order_no, qty, remaining_qty,
+                max(0, int(pre_qty_for_delta or 0) - current_orderable),
+            )
+            continue
+        logger.error(
+            "[US_RECONCILE][ACK_UNRESOLVED_ERROR] symbol=%s order_no=%s requested_qty=%s "
+            "filled_qty=0 remaining_qty=%s reason=no_fill_no_open_order_no_balance_delta manual_reconcile_required=1",
+            symbol, order_no, qty, remaining_qty or "unknown",
         )
         unresolved_count += 1
         symbols_by_status["unresolved"].append(symbol)
+        symbols_by_status["unresolved_error"].append(symbol)
+        order_nos_by_status["unresolved_error"].append(order_no)
 
+    # Compatibility `unresolved` includes every true error path; mirror it to
+    # the explicit contract even when failure occurred before broker lookup.
+    symbols_by_status["unresolved_error"] = list(dict.fromkeys(
+        [*symbols_by_status["unresolved_error"], *symbols_by_status["unresolved"]]
+    ))
     logger.info(
-        "[US_RECONCILE][ACK_RECONCILE][DONE] pending=%d confirmed=%d balance_reconcile=%d unresolved=%d failed=%d",
-        len(pending_orders), confirmed_count, balance_reconcile_count, unresolved_count, failed_count,
+        "[US_RECONCILE][ACK_RECONCILE][DONE] pending=%d confirmed=%d balance_reconcile=%d open_order_pending=%d unresolved_error=%d failed=%d",
+        len(pending_orders), confirmed_count, balance_reconcile_count, open_order_pending_count, unresolved_count, failed_count,
     )
 
     return {
-        "status": "ERROR" if failed_count > 0 else ("OK" if unresolved_count == 0 else "WARN"),
+        "status": "ERROR" if failed_count > 0 else ("WARN" if unresolved_count > 0 or open_order_pending_count > 0 else "OK"),
         "pending_count": len(pending_orders),
         "confirmed_count": confirmed_count,
         "balance_reconcile_count": balance_reconcile_count,
         "unresolved_count": unresolved_count,
+        "open_order_pending_count": open_order_pending_count,
+        "cancelled_count": canceled_count,
+        "expired_count": expired_count,
+        "unresolved_error_count": unresolved_count,
         "failed_count": failed_count,
         "canceled_count": canceled_count,
         "symbols_by_status": symbols_by_status,
+        "order_nos_by_status": order_nos_by_status,
+        "manual_reconcile_required": int(unresolved_count > 0),
     }
 
 
@@ -767,6 +828,7 @@ def classify_ack_orders_with_final_balance(
 
     classified: list[dict] = []
     pending = 0
+    open_order_pending = 0
     counts: dict[str, int] = {}
     for order in orders or []:
         symbol = str(order.get("symbol") or "").upper().strip()
@@ -774,6 +836,7 @@ def classify_ack_orders_with_final_balance(
         qty = int(order.get("qty_requested") or order.get("qty") or order.get("filled_qty") or order.get("qty_filled") or 0)
         pre_qty, _source = _extract_pre_order_position_qty(order)
         final_qty = int((final_positions.get(symbol) or {}).get("qty") or 0)
+        final_orderable = int((final_positions.get(symbol) or {}).get("orderable_qty") or 0)
         raw_status = str(order.get("status") or "").upper()
         fill_qty = int(order.get("qty_filled") or order.get("filled_qty") or 0)
         identity = validate_reconcile_identity(
@@ -807,10 +870,27 @@ def classify_ack_orders_with_final_balance(
             # A final authoritative balance with no symbol is sufficient SELL
             # evidence even when the pre-order snapshot was unavailable.
             final_status = "position_absent_confirmed_sell"
+        elif (
+            qty > 0
+            and (
+                bool(order.get("open_order") or order.get("open_order_pending"))
+                or raw_status in {"OPEN", "PENDING", "WORKING", "ACK_OPEN"}
+                or (side == "SELL" and pre_qty is not None and final_qty == pre_qty
+                    and final_orderable <= max(0, pre_qty - qty))
+            )
+        ):
+            final_status = "ack_open_order_pending"
         else:
-            final_status = "ack_only_unresolved"
-        if final_status == "ack_only_unresolved":
+            final_status = "ack_unresolved_error"
+        if final_status == "ack_unresolved_error":
             pending += 1
+        elif final_status == "ack_open_order_pending":
+            open_order_pending += 1
+            logger.warning(
+                "[US_CLOSE][ORDER_RECONCILE][OPEN_ORDER_PENDING] symbol=%s order_no=%s requested_qty=%s "
+                "filled_qty=0 remaining_qty=%s action=warn_not_fail",
+                symbol, order.get("order_no") or order.get("ack_no") or "", qty, qty,
+            )
         counts[final_status] = counts.get(final_status, 0) + 1
         classified.append({
             "time": str(order.get("created_at") or order.get("time") or ""),
@@ -834,9 +914,12 @@ def classify_ack_orders_with_final_balance(
             "final_position_qty": final_qty,
         })
     return {
-        "status": "OK" if pending == 0 else "DEGRADED_ACK_UNRESOLVED",
+        "status": "DEGRADED_ACK_UNRESOLVED" if pending > 0 else ("WARNING_OPEN_ORDER_PENDING" if open_order_pending > 0 else "OK"),
         "orders": classified,
         "counts": counts,
         "pending_order_count": pending,
-        "reason": "" if pending == 0 else "ACK_ONLY_UNRESOLVED",
+        "open_order_pending_count": open_order_pending,
+        "unresolved_error_count": pending,
+        "manual_reconcile_required": int(pending > 0),
+        "reason": "ACK_UNRESOLVED_ERROR" if pending > 0 else ("OPEN_ORDER_PENDING_AT_CLOSE" if open_order_pending > 0 else ""),
     }

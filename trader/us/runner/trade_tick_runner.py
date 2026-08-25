@@ -20,7 +20,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,45 @@ logger = logging.getLogger(__name__)
 
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
+
+
+def classify_ack_reconcile_gate(ack_recon: dict, *, reconcile_only_until_clean: bool = False) -> dict[str, Any]:
+    """Translate ACK evidence into split routing and manual-reconcile policy."""
+    pending = int(ack_recon.get("pending_count", 0) or 0)
+    open_pending = int(ack_recon.get("open_order_pending_count", 0) or 0)
+    unresolved = int(ack_recon.get("unresolved_error_count", ack_recon.get("unresolved_count", 0)) or 0)
+    blocked = bool(reconcile_only_until_clean or pending > 0 or open_pending > 0 or unresolved > 0)
+    if open_pending > 0 and unresolved == 0:
+        reason = "open_order_pending"
+    elif unresolved > 0:
+        reason = "unresolved_ack_error"
+    elif reconcile_only_until_clean:
+        reason = "prior_failed_orders_reconcile_required"
+    else:
+        reason = "ok"
+    symbols = ack_recon.get("symbols_by_status") or {}
+    return {
+        "allow_new_orders": not blocked, "reason": reason,
+        "open_order_pending_count": open_pending, "unresolved_error_count": unresolved,
+        "last_open_order_pending_symbols": symbols.get("open_order_pending", []),
+        "last_unresolved_error_symbols": symbols.get("unresolved_error", []),
+        "manual_reconcile_required": int(unresolved > 0),
+    }
+
+
+def _is_us_opening_buy_blocked(now_ny: datetime) -> tuple[bool, str]:
+    """Return the entry-only opening gate; exits are intentionally unaffected."""
+    if os.getenv("US_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False, ""
+    hour, minute = (int(part) for part in os.getenv("US_MARKET_OPEN_ET", "09:30").split(":"))
+    market_open = now_ny.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    buy_start_raw = os.getenv("US_BUY_START_ET", "").strip()
+    if buy_start_raw:
+        buy_hour, buy_minute = (int(part) for part in buy_start_raw.split(":"))
+        buy_start = now_ny.replace(hour=buy_hour, minute=buy_minute, second=0, microsecond=0)
+    else:
+        buy_start = market_open + timedelta(minutes=max(0, int(os.getenv("US_OPENING_BUY_BLOCK_MINUTES", "30"))))
+    return (market_open <= now_ny < buy_start, buy_start.strftime("%H:%M:%S"))
 
 
 def _get_tqqq_tick_quote(provider: Any) -> tuple[float, str, bool]:
@@ -1097,6 +1136,14 @@ def run_trade_tick(
         now = datetime.fromisoformat(force_now).astimezone(NY_TZ)
     else:
         now = now_ny()
+    opening_buy_blocked, opening_buy_start_et = _is_us_opening_buy_blocked(now)
+    if opening_buy_blocked:
+        entry_can_proceed = False
+        logger.info(
+            "[OPENING_BUY_BLOCK][US] now_et=%s buy_start_et=%s action=SKIP_BUY "
+            "reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1",
+            now.strftime("%H:%M:%S"), opening_buy_start_et,
+        )
     trade_date = now.strftime("%Y-%m-%d")
     session_run_id = session_run_id or os.getenv("US_RUN_ID") or os.getenv("GITHUB_RUN_ID", "local")
     tick_id = tick_id or f"{session_run_id}:{tick_index}"
@@ -1532,6 +1579,11 @@ def run_trade_tick(
     # intent generation and route_exit_orders_immediately().
     pending_ack_count = int(ack_recon.get("pending_count", 0) or 0)
     unresolved_ack_count = int(ack_recon.get("unresolved_count", 0) or 0)
+    open_order_pending_count = int(ack_recon.get("open_order_pending_count", 0) or 0)
+    unresolved_error_count = int(ack_recon.get("unresolved_error_count", unresolved_ack_count) or 0)
+    ack_gate = classify_ack_reconcile_gate(
+        ack_recon, reconcile_only_until_clean=reconcile_only_until_clean,
+    )
     ack_reconcile_ok = str(ack_recon.get("status") or "").upper() == "OK"
     reconcile_only_clean = bool(
         reconcile_only_until_clean
@@ -1549,7 +1601,7 @@ def run_trade_tick(
     if ack_order_block:
         logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
     if reconcile_only_until_clean or ack_order_block:
-        reason = "prior_failed_orders_reconcile_required" if reconcile_only_until_clean else "unresolved_ack_exists"
+        reason = str(ack_gate["reason"] or "unresolved_ack_exists")
         logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
         reconcile_only_clean_at = (
             _write_reconcile_only_clean_marker(trade_date=trade_date, session=session, tick_index=tick_index)
@@ -1573,10 +1625,14 @@ def run_trade_tick(
             "reconcile_only_clean_tick": int(tick_index) if reconcile_only_clean else 0,
             "pending_ack_count": pending_ack_count,
             "unresolved_ack_count": unresolved_ack_count,
+            "open_order_pending_count": open_order_pending_count,
+            "unresolved_error_count": unresolved_error_count,
             "blocked_new_orders_due_to_reconcile": 1,
             "last_unresolved_symbols": (ack_recon.get("symbols_by_status") or {}).get("unresolved", []),
+            "last_open_order_pending_symbols": ack_gate["last_open_order_pending_symbols"],
+            "last_unresolved_error_symbols": ack_gate["last_unresolved_error_symbols"],
             "last_unresolved_order_nos": ack_recon.get("unresolved_order_nos", []),
-            "manual_reconcile_required": int(not reconcile_only_clean),
+            "manual_reconcile_required": ack_gate["manual_reconcile_required"],
             "ack_reconcile_before_route_status": ack_recon.get("status"),
             "ack_pending_reconcile_count": pending_ack_count,
         }
@@ -1949,8 +2005,18 @@ def run_trade_tick(
             except Exception as _quote_exc:
                 logger.warning("[TQQQ_INF][QUOTE] price=0 source=USDataProvider stale=1 valid=0 error=%s", _quote_exc)
                 _tqqq_price, _quote_source, _quote_stale = 0.0, "USDataProvider", True
-            _infinite_overlay = {**market_state_overlay, "tqqq_quote_source": _quote_source,
-                                 "tqqq_quote_stale": _quote_stale}
+            _infinite_overlay = {
+                **market_state_overlay,
+                "tqqq_quote_source": _quote_source,
+                "tqqq_quote_stale": _quote_stale,
+                # The Infinite sleeve runs before standard entry evaluation,
+                # so it needs the split opening permissions explicitly.
+                "opening_buy_blocked": bool(opening_buy_blocked),
+                "opening_buy_start_et": opening_buy_start_et,
+                "entry_can_proceed": bool(entry_can_proceed),
+                "exit_can_proceed": bool(exit_can_proceed),
+                "now_et": now.isoformat(),
+            }
             infinite_result = run_sleeve(
                 positions=current_positions, price=_tqqq_price, trading_date=now.date(),
                 overlay=_infinite_overlay, route=_route_infinite,
@@ -2710,6 +2776,18 @@ def run_trade_tick(
 
     for intent in all_intents:
         try:
+            if str(intent.get("side") or "BUY").upper() == "BUY":
+                logger.info(
+                    "[US_PB1][BUY][WHY] symbol=%s entry_style=%s setup_ok=%s risk_ok=%s sized_ok=%s "
+                    "buyable_ok=%s planned_qty=%s order_price=%s reason=US_PB1_ENTRY_AFTER_OPENING_BLOCK",
+                    intent.get("symbol"), intent.get("entry_style") or intent.get("entry_book") or "unknown",
+                    int(bool(intent.get("setup_ok") or intent.get("setup_passed"))),
+                    int(bool(intent.get("risk_ok") or intent.get("risk_passed"))),
+                    int(bool(intent.get("sizing_ok") or intent.get("sizing_passed"))),
+                    int(bool(intent.get("buyable_ok") or intent.get("buyable_passed"))),
+                    intent.get("qty") or intent.get("quantity") or 0,
+                    intent.get("limit_price") or intent.get("price") or 0,
+                )
             _route_identity = str(intent.get("client_order_key") or intent.get("order_key") or intent.get("symbol") or "")
             _route_preflight_snapshot = getattr(locals().get("incremental_preflight_session"), "accepted_states", {}).get(
                 _route_identity, locals().get("preflight_diagnostics", {}).get("accepted_states", {}).get(_route_identity, {})
@@ -3229,6 +3307,10 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
+        "opening_buy_blocked": bool(opening_buy_blocked),
+        "opening_buy_start_et": opening_buy_start_et,
+        "entry_can_proceed": bool(entry_can_proceed),
+        "exit_can_proceed": bool(exit_can_proceed),
         "trend_healthy_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("HEALTHY", 0)),
         "trend_warning_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("WARNING", 0)),
         "trend_trim_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("TRIM", 0)),

@@ -334,6 +334,8 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
         "balance_confirmed": int(balance_confirmed or 0),
         "router_summary": int(router_summary or 0),
     }
+
+
     orders_ack = max(sources.values())
     warnings = []
     nonzero = [v for v in sources.values() if v > 0]
@@ -368,6 +370,32 @@ def reconcile_order_sources(*, db_orders: int, fills: int, balance_confirmed: in
         "broker_reconciled": broker_reconciled,
     }
 
+def classify_close_order_reconcile_summary(
+    *, ack_total: int, fill_confirmed_total: int, balance_confirmed_total: int = 0,
+    open_order_pending_total: int = 0, cancelled_total: int = 0,
+    expired_total: int = 0, unresolved_error_total: int = 0,
+) -> dict:
+    """Classify close reconciliation without treating known open orders as errors."""
+    accounted = sum(max(0, int(value or 0)) for value in (
+        fill_confirmed_total, balance_confirmed_total, open_order_pending_total,
+        cancelled_total, expired_total, unresolved_error_total,
+    ))
+    consistent = int(ack_total or 0) == accounted
+    if int(unresolved_error_total or 0) > 0 or not consistent:
+        status, exit_code, manual = "ERROR_RECONCILE_UNRESOLVED", 1, 1
+    elif int(open_order_pending_total or 0) > 0:
+        status, exit_code, manual = "WARNING_OPEN_ORDER_PENDING", 0, 0
+    else:
+        status, exit_code, manual = "OK", 0, 0
+    return {
+        "status": status, "consistent": consistent, "exit_code": exit_code,
+        "manual_reconcile_required": manual, "ack_total": int(ack_total or 0),
+        "fill_confirmed_total": int(fill_confirmed_total or 0),
+        "balance_confirmed_total": int(balance_confirmed_total or 0),
+        "open_order_pending_total": int(open_order_pending_total or 0),
+        "cancelled_total": int(cancelled_total or 0), "expired_total": int(expired_total or 0),
+        "unresolved_error_total": int(unresolved_error_total or 0),
+    }
 
 
 
@@ -1082,6 +1110,23 @@ def run_daily_report(
         # Do not retain an earlier DB-only ACK count after a balance-confirmed sell.
         report["orders_unresolved_total"] = report["pending_order_count"]
         report["ack_only_unresolved"] = report["pending_order_count"]
+        report["open_order_pending_total"] = int(close_order_classification.get("open_order_pending_count") or 0)
+        report["unresolved_error_total"] = int(close_order_classification.get("unresolved_error_count", report["pending_order_count"]) or 0)
+        if report["open_order_pending_total"] > 0 and report["unresolved_error_total"] == 0:
+            report["warnings"] = [
+                warning for warning in report.get("warnings", [])
+                if warning not in {"SOURCE_MISMATCH_ACK_EXISTS_FILL_MISSING", "FILL_API_LESS_THAN_ACK"}
+                and not str(warning).startswith("REPORT_INCONSISTENT:db_orders_fills_mismatch")
+            ]
+            canonical = report.get("canonical_sources") or {}
+            canonical["inconsistencies"] = [
+                item for item in canonical.get("inconsistencies", []) if item != "db_orders_fills_mismatch"
+            ]
+            if not canonical.get("inconsistencies"):
+                canonical["report_consistency"] = "OK"
+                if report.get("report_consistency") == "REPORT_INCONSISTENT":
+                    report["report_consistency"] = "OK"
+            report["warnings"].append("OPEN_ORDER_PENDING_AT_CLOSE")
 
     # Budget cap
     try:
@@ -1190,13 +1235,15 @@ def run_daily_report(
         report["status"] = "FAILED_RECONCILE"
     elif int(report.get("orders_unresolved_total", 0) or 0) > 0:
         report["status"] = "WARNING_RECONCILE_MISMATCH"
+    elif int(report.get("open_order_pending_total", 0) or 0) > 0:
+        report["status"] = "WARNING_OPEN_ORDER_PENDING"
     else:
         report["status"] = "OK"
     if report.get("report_consistency") == "FAILED" and report.get("status") != "FAILED_RECONCILE":
         report["status"] = "FAILED_RECONCILE"
     report["manual_reconcile_required"] = int(
         bool(report.get("manual_reconcile_required"))
-        or int(report.get("pending_order_count", 0) or 0) > 0
+        or int(report.get("unresolved_error_total", report.get("pending_order_count", 0)) or 0) > 0
         or int(report.get("broker_orders_unresolved", 0) or 0) > 0
         or report.get("status") == "WARNING_RECONCILE_MISMATCH"
         or report.get("report_consistency") == "REPORT_INCONSISTENT"

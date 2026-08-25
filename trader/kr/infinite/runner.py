@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Callable
 
@@ -25,6 +25,16 @@ from .strategy import evaluate, trading_days_since
 
 logger = logging.getLogger(__name__)
 _LAST_GOOD_BALANCE: tuple[dict, datetime] | None = None
+
+
+def _is_kr_infinite_opening_buy_blocked(at: datetime) -> tuple[bool, str]:
+    """Return the KR Infinite entry-only gate; sell actions never call this gate."""
+    if os.getenv("KR_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False, ""
+    hour, minute = (int(part) for part in os.getenv("KR_MARKET_OPEN_HHMM", "09:00").split(":"))
+    market_open = at.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    buy_start = market_open + timedelta(minutes=max(0, int(os.getenv("KR_OPENING_BUY_BLOCK_MINUTES", "30"))))
+    return market_open <= at < buy_start, buy_start.strftime("%H:%M:%S")
 
 
 @dataclass(frozen=True)
@@ -66,7 +76,7 @@ def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
     decision = evaluate(config=config, state=state, position=position, trade_date=trade_date,
                         market_state=market_state or "KR_NORMAL", orderable_cash=orderable_cash,
                         allow_entry=False, best_ask=position.current_price)
-    if decision.action != Action.SELL_ALL:
+    if decision.action not in {Action.SELL_PARTIAL, Action.SELL_ALL}:
         return Decision(Action.WAIT, "KR_INF_EXIT_ONLY_NO_SELL")
     return decision
 
@@ -74,7 +84,8 @@ def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
 def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
              regime_provider: Callable[[], tuple[str | None, str]] = load_regime,
              trade_date: date | None = None, kis_env: str | None = None,
-             allow_entry: bool = True, balance_snapshot: dict | None = None) -> RunResult:
+             allow_entry: bool = True, balance_snapshot: dict | None = None,
+             now_kst_value: datetime | None = None) -> RunResult:
     """Execute one exit-first tick. Every dependency is injectable for integration tests."""
     day = trade_date or date.today()
     env = (kis_env or os.getenv("KIS_ENV") or "practice").lower()
@@ -101,7 +112,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                                     "broker_average_price": position.average_price,
                                     "broker_orderable_qty": position.orderable_qty})
             repository.save_state(state)
-        unresolved_sell = any(i.side == "SELL_ALL" and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
+        unresolved_sell = any(i.side in {"SELL_PARTIAL", "SELL_ALL"} and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
                               for i, broker in updates)
         state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell,
                                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
@@ -130,7 +141,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         existing_keys = repository.intent_keys()
         pending = repository.pending_intents()
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
-        pending_sell = any(item.side == "SELL_ALL" for item in pending)
+        pending_sell = any(item.side in {"SELL_PARTIAL", "SELL_ALL"} for item in pending)
 
         if allow_entry and position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
             same_day = state is not None and state.last_exit_date == day and not config.same_day_restart
@@ -143,7 +154,9 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # sell/reconcile path; cash is fetched only for a possible new cycle.
         cash = (executor.orderable_cash(config.symbol, position.current_price)
                 if allow_entry and position.qty == 0 else 0.0)
-        now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        now_kst = now_kst_value or datetime.now(ZoneInfo("Asia/Seoul"))
+        if now_kst.tzinfo is None:
+            now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
         minutes_since_open = (now_kst.hour * 60 + now_kst.minute + now_kst.second / 60) - (9 * 60)
         decision = evaluate(config=config, state=state, position=position, trade_date=day,
                             market_state=market_state, orderable_cash=cash, pending_buy=pending_buy,
@@ -159,10 +172,24 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             state = replace(state, metadata={**state.metadata, **durable})
             repository.save_state(state)
         log_decision(decision=decision.action.value, reason=decision.reason, cycle_id=state.cycle_id if state else None,
-                     symbol=config.symbol, broker_qty=position.qty, market_state=market_state,
+                     symbol=config.symbol, broker_qty_before=position.qty, sell_qty=decision.qty if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL} else 0,
+                     expected_qty_after=max(0, position.qty - decision.qty) if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL} else position.qty, market_state=market_state,
                      idempotency_key=decision.idempotency_key)
-        if decision.action not in {Action.BUY, Action.RECOVERY, Action.SELL_ALL}:
+        if decision.action not in {Action.BUY, Action.RECOVERY, Action.SELL_PARTIAL, Action.SELL_ALL}:
             return RunResult(decision, state)
+        if decision.action in {Action.BUY, Action.RECOVERY}:
+            opening_blocked, buy_start = _is_kr_infinite_opening_buy_blocked(now_kst)
+            if opening_blocked:
+                logger.info(
+                    "[OPENING_BUY_BLOCK][KR_INF] now=%s buy_start=%s symbol=%s decision=%s "
+                    "action=SKIP_BUY reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1",
+                    now_kst.strftime("%H:%M:%S"), buy_start, config.symbol, decision.action.value,
+                )
+                return RunResult(
+                    Decision(Action.WAIT, "OPENING_30MIN_BUY_BLOCK",
+                             next_status=state.status if state else Status.READY),
+                    state,
+                )
         if not config.orders_allowed(env):
             return RunResult(Decision(Action.BLOCK, "KR_INF_CANONICAL_ORDER_GATE_CLOSED"), state)
         if state is None or not state.cycle_id:
@@ -170,7 +197,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         if not repository.create_intent(state, decision, day, market_state):
             return RunResult(Decision(Action.WAIT, "DUPLICATE_INTENT"), state)
 
-        if decision.action == Action.SELL_ALL:
+        if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             desired = str(decision.metadata.get("desired_profit_stage") or "")
             pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
             state = replace(state, status=Status.EXIT_PENDING,
@@ -200,7 +227,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             if state is not None:
                 state = replace(state, metadata={**state.metadata, "last_order_reconciliation": reconciliation})
         state, _ = reconcile(state, post_position, day,
-                             pending_sell=decision.action == Action.SELL_ALL and post_position.qty > 0,
+                             pending_sell=decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL} and post_position.qty > 0,
                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
         if state is not None:
             repository.persist_reconciliation(state, post_updates)

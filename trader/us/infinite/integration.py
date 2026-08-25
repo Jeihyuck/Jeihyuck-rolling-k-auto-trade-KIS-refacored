@@ -262,6 +262,26 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     getattr(state, "reserve_unlocked", None), pending_buy, pending_sell)
         logger.info("[TQQQ_INF][DECISION] action=%s qty=%s notional=%.2f reason=%s shadow=%s",
                     decision.action.value, decision.qty, decision.notional, decision.reason, int(not config.real_order))
+        opening_buy_blocked = bool(overlay.get("opening_buy_blocked"))
+        opening_buy_start_et = str(overlay.get("opening_buy_start_et") or "")
+        now_et = str(overlay.get("now_et") or "")
+        # Entry-only safety gate. TQQQ exits remain routable from 09:30 ET.
+        if decision.action == Action.BUY and opening_buy_blocked:
+            logger.info(
+                "[OPENING_BUY_BLOCK][US_TQQQ_INF] now_et=%s buy_start_et=%s symbol=%s "
+                "action=SKIP_BUY reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1 "
+                "decision=%s original_reason=%s",
+                now_et, opening_buy_start_et, config.symbol,
+                decision.action.value, decision.reason,
+            )
+            return {
+                "status": "WAIT",
+                "reason": "OPENING_30MIN_BUY_BLOCK",
+                "decision": decision,
+                "orders": [],
+                "opening_buy_blocked": True,
+                "opening_buy_start_et": opening_buy_start_et,
+            }
         needs_new_cycle = bool(
             decision.action == Action.BUY and state
             and (not state.cycle_id or state.status == Status.COMPLETE)
