@@ -17,3 +17,25 @@ def test_us_opening_gate_does_not_change_exit_permission():
     )
     entry_can_proceed, exit_can_proceed = not blocked, True
     assert entry_can_proceed is False and exit_can_proceed is True
+
+
+def test_us_tick_opening_gate_prevents_entry_routing_but_keeps_exit_enabled():
+    from tests.us.test_us_trade_tick_runner import _setup_env
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+
+    _setup_env()
+    result = run_trade_tick(
+        session="am", env="practice", offline=True,
+        force_now="2026-01-02T09:45:00-05:00",
+    )
+
+    assert result["opening_buy_blocked"] is True
+    assert result["entry_can_proceed"] is False
+    assert result["entry_intents"] == 0
+    assert result["exit_can_proceed"] is True
+
+
+def test_us_buy_start_env_takes_precedence(monkeypatch):
+    tz = ZoneInfo("America/New_York")
+    monkeypatch.setenv("US_BUY_START_ET", "10:15")
+    assert _is_us_opening_buy_blocked(datetime(2026, 8, 24, 10, 5, tzinfo=tz)) == (True, "10:15:00")

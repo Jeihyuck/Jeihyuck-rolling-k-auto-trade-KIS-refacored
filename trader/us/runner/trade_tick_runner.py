@@ -36,7 +36,12 @@ def _is_us_opening_buy_blocked(now_ny: datetime) -> tuple[bool, str]:
         return False, ""
     hour, minute = (int(part) for part in os.getenv("US_MARKET_OPEN_ET", "09:30").split(":"))
     market_open = now_ny.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    buy_start = market_open + timedelta(minutes=max(0, int(os.getenv("US_OPENING_BUY_BLOCK_MINUTES", "30"))))
+    buy_start_raw = os.getenv("US_BUY_START_ET", "").strip()
+    if buy_start_raw:
+        buy_hour, buy_minute = (int(part) for part in buy_start_raw.split(":"))
+        buy_start = now_ny.replace(hour=buy_hour, minute=buy_minute, second=0, microsecond=0)
+    else:
+        buy_start = market_open + timedelta(minutes=max(0, int(os.getenv("US_OPENING_BUY_BLOCK_MINUTES", "30"))))
     return (market_open <= now_ny < buy_start, buy_start.strftime("%H:%M:%S"))
 
 
@@ -2730,9 +2735,13 @@ def run_trade_tick(
         try:
             if str(intent.get("side") or "BUY").upper() == "BUY":
                 logger.info(
-                    "[US_PB1][BUY][WHY] symbol=%s entry_style=%s setup_ok=1 risk_ok=1 sized_ok=1 "
-                    "buyable_ok=1 planned_qty=%s order_price=%s reason=US_PB1_ENTRY_AFTER_OPENING_BLOCK",
+                    "[US_PB1][BUY][WHY] symbol=%s entry_style=%s setup_ok=%s risk_ok=%s sized_ok=%s "
+                    "buyable_ok=%s planned_qty=%s order_price=%s reason=US_PB1_ENTRY_AFTER_OPENING_BLOCK",
                     intent.get("symbol"), intent.get("entry_style") or intent.get("entry_book") or "unknown",
+                    int(bool(intent.get("setup_ok") or intent.get("setup_passed"))),
+                    int(bool(intent.get("risk_ok") or intent.get("risk_passed"))),
+                    int(bool(intent.get("sizing_ok") or intent.get("sizing_passed"))),
+                    int(bool(intent.get("buyable_ok") or intent.get("buyable_passed"))),
                     intent.get("qty") or intent.get("quantity") or 0,
                     intent.get("limit_price") or intent.get("price") or 0,
                 )
@@ -3255,6 +3264,10 @@ def run_trade_tick(
         "orders_sent": orders_sent,
         "exit_intents": exit_intents_count,
         "entry_intents": entry_intents_count,
+        "opening_buy_blocked": bool(opening_buy_blocked),
+        "opening_buy_start_et": opening_buy_start_et,
+        "entry_can_proceed": bool(entry_can_proceed),
+        "exit_can_proceed": bool(exit_can_proceed),
         "trend_healthy_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("HEALTHY", 0)),
         "trend_warning_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("WARNING", 0)),
         "trend_trim_count": int((trend_state_counts if 'trend_state_counts' in locals() else {}).get("TRIM", 0)),

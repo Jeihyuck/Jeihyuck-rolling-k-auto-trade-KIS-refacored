@@ -5387,6 +5387,20 @@ class PB1Engine:
         order_type: str,
         allow_add_to_existing: bool = False,
     ) -> UnifiedGateDecision:
+        opening_blocked, buy_start = self._is_kr_opening_buy_blocked(self._now_kst)
+        if opening_blocked:
+            display_code = self._display_code(cf.code)
+            logger.info(
+                "[OPENING_BUY_BLOCK][KR] now=%s buy_start=%s code=%s pb1_candidate=1 "
+                "action=SKIP_BUY reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1 stage=%s",
+                self._now_kst.strftime("%H:%M:%S"), buy_start, display_code, stage,
+            )
+            return UnifiedGateDecision(
+                ok=False,
+                reason_codes=["OPENING_30MIN_BUY_BLOCK"],
+                blocking_stage="submit",
+                context={"code": display_code, "buy_start": buy_start, "stage": stage},
+            )
         gate_snapshot = getattr(self, "_buyable_gate_context", {}).get(str(cf.code or "").zfill(6), {}) if hasattr(self, "_buyable_gate_context") else {}
         existing_order = None
         if hasattr(self.orders_repo, "get_order_by_client_order_key") and cf.client_order_key:
@@ -7385,6 +7399,11 @@ class PB1Engine:
                 count,
             )
         return count
+
+    def _is_session_sell_blocked(self, code: str) -> tuple[bool, str]:
+        block = self._session_sell_blocked_codes.get(str(code or "").zfill(6)) or {}
+        reason = str(block.get("reason") or "")
+        return bool(block), reason
 
     def _has_sell_accepted_today(self, code: str) -> bool:
         code_key = str(code or "").zfill(6)
@@ -11588,6 +11607,24 @@ class PB1Engine:
         qty = int(pos.get("qty") or 0)
         if sid != 1 or qty <= 0:
             return None
+        session_blocked, session_block_reason = self._is_session_sell_blocked(code)
+        if session_blocked:
+            logger.info(
+                "[SELL_SESSION_BLOCK][SKIP] code=%s reason=%s action=skip_resubmit",
+                display_code, session_block_reason or "SESSION_SELL_BLOCKED",
+            )
+            logger.info(
+                "[PB1][SELL][SKIP] code=%s reason=SESSION_SELL_BLOCKED block_reason=%s action=skip_resubmit",
+                display_code, session_block_reason or "SESSION_SELL_BLOCKED",
+            )
+            return {
+                "code": code,
+                "exit_ok": False,
+                "submitted": 0,
+                "submit_attempted": 0,
+                "order_result": "ORDER_SKIPPED_SESSION_BLOCKED",
+                "order_skip_reasons": [session_block_reason or "SESSION_SELL_BLOCKED"],
+            }
         _pos_meta = pos.get("position_meta") or {}
         if isinstance(_pos_meta, str):
             try:
@@ -18501,25 +18538,22 @@ class PB1Engine:
                         skipped_count = len(orderable_candidates)
                     else:
                         def _pre_submit_gate(cf: CandidateFeature) -> bool:
-                            opening_blocked, buy_start = self._is_kr_opening_buy_blocked(self._now_kst)
-                            if opening_blocked:
-                                logger.info(
-                                    "[OPENING_BUY_BLOCK][KR] now=%s buy_start=%s code=%s pb1_candidate=1 "
-                                    "action=SKIP_BUY reason=OPENING_30MIN_BUY_BLOCK exit_allowed=1",
-                                    self._now_kst.strftime("%H:%M:%S"), buy_start, cf.code,
-                                )
-                                return False
                             buy_allowed, buy_block_reason, runtime_cutoff_dt, _market_close_dt = self._is_buy_allowed_now(now_kst())
                             if not buy_allowed:
                                 logger.warning("[ORDER][PRE_SUBMIT][BLOCK] side=BUY code=%s reason=%s now=%s cutoff=%s", cf.code, buy_block_reason, now_kst().isoformat(), runtime_cutoff_dt.isoformat())
                             return buy_allowed
 
                         def _submit_candidate(cf: CandidateFeature) -> dict[str, Any]:
+                            candidate_features = cf.features or {}
                             logger.info(
-                                "[PB1][BUY][WHY] code=%s entry_style=%s setup_ok=1 risk_ok=1 sized_ok=1 "
-                                "buyable_ok=1 planned_qty=%s order_price=%s reason=PB1_ENTRY_AFTER_OPENING_BLOCK",
-                                cf.code, (cf.features or {}).get("entry_style_selected") or (cf.features or {}).get("entry_style") or "unknown",
-                                cf.planned_qty, (cf.features or {}).get("entry_price") or (cf.features or {}).get("close") or 0,
+                                "[PB1][BUY][WHY] code=%s entry_style=%s setup_ok=%s risk_ok=%s sized_ok=%s "
+                                "buyable_ok=%s planned_qty=%s order_price=%s reason=PB1_ENTRY_AFTER_OPENING_BLOCK",
+                                cf.code, candidate_features.get("entry_style_selected") or candidate_features.get("entry_style") or "unknown",
+                                int(bool(getattr(cf, "setup_ok", False) or candidate_features.get("setup_ok") or candidate_features.get("setup_passed"))),
+                                int(bool(candidate_features.get("risk_ok") or candidate_features.get("risk_passed"))),
+                                int(bool(candidate_features.get("sizing_ok") or candidate_features.get("sizing_passed"))),
+                                int(bool(candidate_features.get("buyable_ok") or candidate_features.get("buyable_passed"))),
+                                cf.planned_qty, candidate_features.get("entry_price") or candidate_features.get("close") or 0,
                             )
                             logger.info("[ORDER_SUBMIT][ATTEMPT] code=%s qty=%s", cf.code, cf.planned_qty)
                             status = self._place_entry_close(cf) if self.window_internal == "close" else self._place_entry(cf)
