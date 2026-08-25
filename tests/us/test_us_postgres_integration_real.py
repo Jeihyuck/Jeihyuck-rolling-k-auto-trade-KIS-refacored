@@ -1,8 +1,12 @@
 import os
 import pytest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # PR68 final accounting integration tests use the real PostgreSQL service in CI.
 pytestmark = pytest.mark.skipif(not os.getenv("PBCORE_TEST_POSTGRES_URL"), reason="real PostgreSQL integration URL not configured")
+
+DAYTIME_ET = datetime(2026, 8, 24, 10, 30, tzinfo=ZoneInfo("America/New_York"))
 
 @pytest.fixture()
 def pg_engine(monkeypatch):
@@ -225,6 +229,7 @@ def test_real_postgres_strict_committed_buy_notional_distinguishes_zero_rows_and
     state = {
             "available_cash_usd": 10000, "daily_notional_usd": committed.notional_usd,
             "position_count": 0, "portfolio_usd": 100000, "order_keys": set(),
+            "now": DAYTIME_ET,
     }
     candidates = [
             {"symbol": "COST", "exchange": "NASDAQ", "side": "BUY", "qty": 1,

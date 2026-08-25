@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import pytest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from trader.us.execution.risk_gate import (
     RiskGateBlocked,
@@ -22,6 +24,9 @@ from trader.us.execution.risk_gate import (
     assert_order_allowed,
     check_symbol_contract,
 )
+
+
+DAYTIME_ET = datetime(2026, 8, 24, 10, 30, tzinfo=ZoneInfo("America/New_York"))
 
 
 @pytest.fixture(autouse=True)
@@ -152,15 +157,16 @@ class TestAssertOrderAllowed:
             self._make_intent(),
             available_cash_usd=500.0,
             total_portfolio_usd=1000.0,
+            now=DAYTIME_ET,
         )
 
     def test_unknown_symbol_blocked(self):
         with pytest.raises(RiskGateBlocked):
-            assert_order_allowed(self._make_intent(symbol="ZZZZZ"))
+            assert_order_allowed(self._make_intent(symbol="ZZZZZ"), now=DAYTIME_ET)
 
     def test_excessive_notional_blocked(self):
         with pytest.raises(RiskGateBlocked):
-            assert_order_allowed(self._make_intent(notional_usd=200.0))
+            assert_order_allowed(self._make_intent(notional_usd=200.0), now=DAYTIME_ET)
 
 
 class TestCheckSymbolContract:
@@ -211,6 +217,7 @@ class TestCheckSymbolContract:
             available_cash_usd=500.0,
             total_portfolio_usd=1000.0,
             allowed_symbols=allowed,
+            now=DAYTIME_ET,
         )
 
     def test_sell_allows_current_position_even_if_not_locked(self):
@@ -233,6 +240,7 @@ class TestCheckSymbolContract:
             total_portfolio_usd=1000.0,
             allowed_symbols={"AAAA"},  # sym이 없는 watchlist
             current_position_symbols=positions,
+            now=DAYTIME_ET,
         )
 
 
@@ -256,6 +264,7 @@ def test_add_to_existing_buy_skips_max_positions(monkeypatch, caplog):
         allowed_symbols={"DELL"},
         current_position_symbols={"DELL", "AMD"},
         is_existing_position_buy=True,
+        now=DAYTIME_ET,
     )
     assert "[US_RISK][POSITION_COUNT_SKIP]" in caplog.text
 
@@ -280,4 +289,5 @@ def test_new_position_buy_blocks_at_max_positions(monkeypatch):
             allowed_symbols={"FLEX"},
             current_position_symbols={"DELL", "AMD"},
             is_existing_position_buy=False,
+            now=DAYTIME_ET,
         )
