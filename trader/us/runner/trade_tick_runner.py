@@ -1972,8 +1972,18 @@ def run_trade_tick(
             except Exception as _quote_exc:
                 logger.warning("[TQQQ_INF][QUOTE] price=0 source=USDataProvider stale=1 valid=0 error=%s", _quote_exc)
                 _tqqq_price, _quote_source, _quote_stale = 0.0, "USDataProvider", True
-            _infinite_overlay = {**market_state_overlay, "tqqq_quote_source": _quote_source,
-                                 "tqqq_quote_stale": _quote_stale}
+            _infinite_overlay = {
+                **market_state_overlay,
+                "tqqq_quote_source": _quote_source,
+                "tqqq_quote_stale": _quote_stale,
+                # The Infinite sleeve runs before standard entry evaluation,
+                # so it needs the split opening permissions explicitly.
+                "opening_buy_blocked": bool(opening_buy_blocked),
+                "opening_buy_start_et": opening_buy_start_et,
+                "entry_can_proceed": bool(entry_can_proceed),
+                "exit_can_proceed": bool(exit_can_proceed),
+                "now_et": now.isoformat(),
+            }
             infinite_result = run_sleeve(
                 positions=current_positions, price=_tqqq_price, trading_date=now.date(),
                 overlay=_infinite_overlay, route=_route_infinite,

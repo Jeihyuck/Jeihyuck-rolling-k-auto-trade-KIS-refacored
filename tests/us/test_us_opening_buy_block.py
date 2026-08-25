@@ -39,3 +39,28 @@ def test_us_buy_start_env_takes_precedence(monkeypatch):
     tz = ZoneInfo("America/New_York")
     monkeypatch.setenv("US_BUY_START_ET", "10:15")
     assert _is_us_opening_buy_blocked(datetime(2026, 8, 24, 10, 5, tzinfo=tz)) == (True, "10:15:00")
+
+
+def test_us_tick_passes_opening_permissions_to_tqqq_sleeve(monkeypatch):
+    from tests.us.test_us_trade_tick_runner import _setup_env
+    from trader.us.runner.trade_tick_runner import run_trade_tick
+
+    _setup_env()
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    captured: dict = {}
+
+    def fake_run_sleeve(**kwargs):
+        captured.update(kwargs["overlay"])
+        return {"status": "WAIT", "orders": []}
+
+    monkeypatch.setattr("trader.us.infinite.integration.run_sleeve", fake_run_sleeve)
+    run_trade_tick(
+        session="am", env="practice", offline=True,
+        force_now="2026-08-24T09:45:00-04:00",
+    )
+
+    assert captured["opening_buy_blocked"] is True
+    assert captured["opening_buy_start_et"] == "10:00:00"
+    assert captured["entry_can_proceed"] is False
+    assert captured["exit_can_proceed"] is True
+    assert captured["now_et"] == "2026-08-24T09:45:00-04:00"
