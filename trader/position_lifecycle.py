@@ -19,6 +19,41 @@ STALE_META_KEYS = frozenset({
     "max_pnl_pct_since_entry", "trail_stop_price",
 })
 
+LEGACY_CYCLE_PREFIX = "legacy-cycle-"
+LEGACY_EPOCH_PREFIX = "legacy-epoch-"
+
+
+def lifecycle_is_authoritative(position: Mapping[str, Any]) -> bool:
+    """Return whether *position* may drive live exit decisions.
+
+    Recovery rows are authoritative only when they carry an explicit provenance
+    marker written by the current-cycle reconciler.  This intentionally fails
+    closed for rows created by the pre-0050 code-only recovery path.
+    """
+    cycle = str(position.get("position_cycle_id") or "")
+    epoch = str(position.get("portfolio_epoch_id") or "")
+    if not cycle or not epoch or cycle.startswith(LEGACY_CYCLE_PREFIX) or epoch.startswith(LEGACY_EPOCH_PREFIX):
+        return False
+    if str(position.get("position_origin") or "").upper() == "RECOVERY":
+        meta = position.get("position_meta") if isinstance(position.get("position_meta"), Mapping) else {}
+        return bool(meta.get("provenance_verified"))
+    return True
+
+
+def imported_runtime_state(*, epoch_id: str, price: float) -> dict[str, Any]:
+    """Bootstrap a broker holding without inheriting historical lifecycle data."""
+    state = new_cycle_state(epoch_id=epoch_id, price=price, origin="IMPORTED", opened_at=None)
+    state.update({"opened_at": None, "entry_ts": None, "max_price": float(price), "last_trail_stop": None})
+    state["position_meta"].update({
+        "holding_age_unknown": True,
+        "holding_bars": 0,
+        "trading_days_held": 0,
+        "calendar_days_held": 0,
+        "trail_eligible": False,
+        "lifecycle_reason": "LEGACY_OR_UNPROVEN_CYCLE",
+    })
+    return state
+
 
 def new_cycle_state(*, epoch_id: str, price: float, origin: str = "SYSTEM", opened_at: datetime | None = None) -> dict[str, Any]:
     """Return clean state for a 0 -> positive transition; never copy old metadata."""

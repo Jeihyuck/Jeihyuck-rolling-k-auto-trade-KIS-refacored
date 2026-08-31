@@ -4018,6 +4018,63 @@ class FillsRepo:
                 latest[code] = item
         return latest
 
+    def list_latest_buy_fills_by_cycles(
+        self,
+        env: str,
+        cycles: Iterable[dict],
+        *,
+        strategy: str,
+        account_id: str | None = None,
+    ) -> dict[str, dict]:
+        """Return BUY provenance only when order and position lifecycle match.
+
+        ``fills`` deliberately does not duplicate strategy/account columns, so
+        those dimensions are proven through the originating order and active
+        epoch.  There is no code-only fallback.
+        """
+        requested = {
+            (str(c.get("code") or "").zfill(6), str(c.get("portfolio_epoch_id") or ""),
+             str(c.get("position_cycle_id") or ""), int(c.get("sid") or 1), int(c.get("mode") or 1))
+            for c in cycles or []
+        }
+        requested = {item for item in requested if item[0] and item[1] and item[2]}
+        if not requested:
+            return {}
+        conditions = []
+        for code, epoch, cycle, sid, mode in requested:
+            conditions.append(and_(
+                self._schema.fills.c.code == code,
+                self._schema.fills.c.portfolio_epoch_id == epoch,
+                self._schema.fills.c.position_cycle_id == cycle,
+                self._schema.orders.c.strategy == strategy,
+                self._schema.orders.c.sid == sid,
+                self._schema.orders.c.mode == mode,
+            ))
+        stmt = (
+            select(self._schema.fills)
+            .join(self._schema.orders, self._schema.orders.c.order_id == self._schema.fills.c.order_id)
+            .join(self._schema.portfolio_epochs,
+                  self._schema.portfolio_epochs.c.portfolio_epoch_id == self._schema.fills.c.portfolio_epoch_id)
+            .where(and_(
+                self._schema.fills.c.env == _norm_env(env),
+                self._schema.fills.c.side == "BUY",
+                self._schema.orders.c.env == _norm_env(env),
+                self._schema.portfolio_epochs.c.env == _norm_env(env),
+                self._schema.portfolio_epochs.c.status == "ACTIVE",
+                self._schema.portfolio_epochs.c.account_id == (account_id or get_account_key(env=env)),
+                sa.or_(*conditions),
+            ))
+            .order_by(self._window_expr(self._schema.fills.c.filled_at).desc())
+        )
+        latest: dict[str, dict] = {}
+        for row in self._read_mappings_with_guard(stmt, op_name="fills.list_latest_buy_fills_by_cycles",
+                                                   fail_open=_resolve_fill_fail_open()):
+            item = dict(row)
+            code = str(item.get("code") or "").zfill(6)
+            if code not in latest:
+                latest[code] = item
+        return latest
+
     def upsert_fill(
         self,
         *,

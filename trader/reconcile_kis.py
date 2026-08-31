@@ -131,13 +131,13 @@ def _promote_open_buy_orders_from_holdings(
     for order in orders_repo.get_open_orders(env) or []:
         side = str(order.get("side") or "").upper()
         status = str(order.get("status") or "").upper()
-        if side != "BUY" or status not in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"}:
+        if side not in {"BUY", "SELL"} or status not in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}:
             continue
         code = _normalize_code(order.get("code"))
         if not code:
             continue
         holding_qty = int(qty_by_code.get(code) or 0)
-        if holding_qty <= 0:
+        if side == "BUY" and holding_qty <= 0:
             continue
 
         request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
@@ -163,7 +163,7 @@ def _promote_open_buy_orders_from_holdings(
                 mode=int(order.get("mode") or 1),
                 code=code,
                 market=order.get("market"),
-                side="BUY",
+                side=side,
                 ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
                 qty=max(0, submitted_qty),
                 limit_price=_to_float(order.get("limit_price")) or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0),
@@ -195,8 +195,9 @@ def _promote_open_buy_orders_from_holdings(
             )
             continue
 
-        delta = int(holding_qty - int(pre_order_holding_qty or 0))
-        confirmed_fill_qty = max(0, min(delta, int(submitted_qty or 0)))
+        delta = (int(holding_qty - int(pre_order_holding_qty or 0)) if side == "BUY"
+                 else int(int(pre_order_holding_qty or 0) - holding_qty))
+        confirmed_fill_qty = max(0, delta)
         if delta <= 0:
             next_status = "ACKED"
         elif confirmed_fill_qty < int(submitted_qty or 0):
@@ -204,7 +205,7 @@ def _promote_open_buy_orders_from_holdings(
         else:
             next_status = "FILLED"
 
-        if confirmed_fill_qty > int(submitted_qty or 0):
+        if delta < 0 or confirmed_fill_qty > int(submitted_qty or 0):
             next_status = "RECONCILE_ERROR"
             confirmed_fill_qty = 0
 
@@ -226,7 +227,7 @@ def _promote_open_buy_orders_from_holdings(
             mode=int(order.get("mode") or 1),
             code=code,
             market=order.get("market"),
-            side="BUY",
+            side=side,
             ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
             qty=max(0, int(submitted_qty or 0)),
             limit_price=fill_price,
@@ -257,10 +258,10 @@ def _promote_open_buy_orders_from_holdings(
                 run_id=ctx_run_id,
                 order_id=str(order.get("order_id") or "") or None,
                 kis_odno=kis_odno,
-                trade_id=f"PROMOTE:{kis_odno or client_order_key}",
+                trade_id=f"PROMOTE:{side}:{kis_odno or client_order_key}",
                 code=code,
                 market=order.get("market"),
-                side="BUY",
+                side=side,
                 qty=confirmed_fill_qty,
                 price=float(fill_price or 0.0),
                 fee=0.0,

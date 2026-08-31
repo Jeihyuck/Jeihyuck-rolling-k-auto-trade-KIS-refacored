@@ -19,6 +19,8 @@ import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import inspect
 from trader.account_state import get_account_key
+from trader.position_lifecycle import imported_runtime_state, lifecycle_is_authoritative
+from trader.execution_state import BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.path_contract import resolve_repo_root
@@ -2735,6 +2737,10 @@ class PB1Engine:
         self._balance_cost: float | None = None
         self._balance_snapshot: dict | None = balance_snapshot
         self._balance_snapshot_source: str | None = balance_source
+        self._authoritative_balance = (
+            BrokerBalanceSnapshot.from_kis(balance_snapshot, source=balance_source or "runner")
+            if isinstance(balance_snapshot, dict) else None
+        )
         if balance_snapshot is not None:
             if balance_source == "api":
                 self.balance_api_calls += 1
@@ -4691,7 +4697,13 @@ class PB1Engine:
             for row in (balance_rows or [])
             if str((row or {}).get("pdno") or (row or {}).get("code") or "").strip()
         ]
-        latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_codes(self.env, codes)
+        cycle_rows = list(positions_by_code.values())
+        latest_buy_fills = {}
+        if hasattr(self.fills_repo, "list_latest_buy_fills_by_cycles"):
+            latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_cycles(
+                self.env, cycle_rows, strategy=self.STRATEGY_NAME,
+                account_id=get_account_key(env=self.env, kis=self.kis),
+            )
         today_kst = self._now_kst.date()
         holdings: list[HoldingContext] = []
         for row in balance_rows or []:
@@ -4720,8 +4732,16 @@ class PB1Engine:
                 or ((((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0)
             )
             pos_meta = dict(positions_by_code.get(code) or {})
+            if pos_meta and not lifecycle_is_authoritative(pos_meta):
+                stale_cycle = str(pos_meta.get("position_cycle_id") or "")
+                epoch = str(getattr(self, "portfolio_epoch_id", "") or pos_meta.get("portfolio_epoch_id") or "runtime-import")
+                pos_meta = imported_runtime_state(epoch_id=epoch, price=avg_price or last_price)
+                logger.warning("[LIFECYCLE][REJECT_STALE] code=%s stale_cycle=%s action=BOOTSTRAP_IMPORTED_CURRENT_CYCLE",
+                               code, stale_cycle)
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at") or pos_meta.get("entry_ts") or pos_meta.get("last_trade_at")
+            entry_ts_raw = latest_buy_fill.get("filled_at")
+            if entry_ts_raw is None:
+                pos_meta.setdefault("position_meta", {})["holding_age_unknown"] = True
             pos_age = calc_position_age(entry_ts_raw, today_kst)
             entry_date = pos_age.entry_date_kst
             trading_days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("trading_days_held") or pos_meta.get("holding_days") or 0)
@@ -4745,7 +4765,7 @@ class PB1Engine:
                     days_held=trading_days_held,
                     calendar_days_held=calendar_days_held,
                     trading_days_held=trading_days_held,
-                    holding_bars=pos_age.holding_bars,
+                    holding_bars=pos_age.holding_bars if entry_ts_raw else 0,
                     last_fill_at=str(entry_ts_raw) if entry_ts_raw else None,
                     position_meta=pos_meta,
                 )
@@ -4757,11 +4777,13 @@ class PB1Engine:
         ledger_positions: Iterable[dict] | None = None,
     ) -> list[HoldingContext]:
         positions = [dict(row or {}) for row in (ledger_positions or [])]
-        codes = [str((row or {}).get("code") or "").zfill(6) for row in positions if str((row or {}).get("code") or "").strip()]
         latest_buy_fills = {}
-        if codes and hasattr(self.fills_repo, "list_latest_buy_fills_by_codes"):
+        if positions and hasattr(self.fills_repo, "list_latest_buy_fills_by_cycles"):
             try:
-                latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_codes(self.env, codes)
+                latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_cycles(
+                    self.env, positions, strategy=self.STRATEGY_NAME,
+                    account_id=get_account_key(env=self.env, kis=self.kis),
+                )
             except Exception:
                 latest_buy_fills = {}
         today_kst = self._now_kst.date()
@@ -4775,10 +4797,18 @@ class PB1Engine:
                 continue
             avg_price = float(row.get("avg_buy_price") or row.get("entry_price") or 0.0)
             last_price = float(row.get("last_price") or self._balance_price_map.get(code) or avg_price or 0.0)
+            if not lifecycle_is_authoritative(row):
+                stale_cycle = str(row.get("position_cycle_id") or "")
+                row = {**row, **imported_runtime_state(
+                    epoch_id=str(getattr(self, "portfolio_epoch_id", "") or row.get("portfolio_epoch_id") or "runtime-import"),
+                    price=avg_price or last_price,
+                )}
+                logger.warning("[LIFECYCLE][REJECT_STALE] code=%s stale_cycle=%s action=BOOTSTRAP_IMPORTED_CURRENT_CYCLE",
+                               code, stale_cycle)
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at") or row.get("entry_ts") or row.get("last_trade_at")
+            entry_ts_raw = latest_buy_fill.get("filled_at")
             entry_date = None
-            days_held = int(row.get("holding_days") or 0)
+            days_held = 0
             if entry_ts_raw:
                 try:
                     entry_dt = pd.Timestamp(entry_ts_raw)
@@ -4791,6 +4821,7 @@ class PB1Engine:
             unrealized_pnl = ((last_price - avg_price) * qty) if avg_price > 0 else 0.0
             unrealized_pct = (((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0
             pos_meta = dict(row)
+            pos_meta.setdefault("position_meta", {})["holding_age_unknown"] = entry_ts_raw is None
             pos_meta.update(
                 {
                     "avg_buy_price": avg_price,
@@ -5753,6 +5784,11 @@ class PB1Engine:
                 source,
             )
         self._balance_snapshot = snap
+        self._authoritative_balance = BrokerBalanceSnapshot.from_kis(snap, source=source)
+        logger.info("[BALANCE][SNAPSHOT] snapshot_id=%s fetched_at=%s holdings_count=%s",
+                    self._authoritative_balance.snapshot_id,
+                    self._authoritative_balance.fetched_at.isoformat(),
+                    len(self._authoritative_balance.holdings_by_code))
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
@@ -7375,6 +7411,36 @@ class PB1Engine:
             "blocked_until": "SESSION_END",
         }
         logger.info("[SELL_SESSION_BLOCK][REGISTER] code=%s reason=SELL_ACCEPTED order_id=%s", self._display_code(code_key), order_id or "")
+
+    def _durable_sell_block(self, *, code: str, position_cycle_id: str | None = None,
+                            exit_stage: str | None = None) -> tuple[bool, dict[str, Any] | None]:
+        """Read the order ledger; instance dictionaries are only a fast cache."""
+        try:
+            rows = self.orders_repo.list_today_orders(self.env, side="SELL", code=str(code).zfill(6), status_exclude=())
+        except Exception:
+            logger.exception("[SELL_SESSION_BLOCK][DURABLE_LOOKUP_FAIL] code=%s action=fail_closed", code)
+            return True, {"status": "LOOKUP_FAILED"}
+        session = str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower()
+        for row in rows or []:
+            if str(row.get("strategy") or "") != self.STRATEGY_NAME:
+                continue
+            if str(row.get("status") or "").upper() not in SELL_GUARD_STATES:
+                continue
+            row_cycle = str(row.get("position_cycle_id") or "")
+            if position_cycle_id and row_cycle and row_cycle != str(position_cycle_id):
+                continue
+            request = row.get("request_json") if isinstance(row.get("request_json"), dict) else {}
+            row_session = str(request.get("trade_session") or "").lower()
+            if row_session and row_session != session:
+                continue
+            # A different explicit stage is a legal strategy-defined partial exit.
+            prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
+            if exit_stage and prior_stage and prior_stage != str(exit_stage):
+                continue
+            logger.info("[SELL_SESSION_BLOCK][DURABLE_SKIP] code=%s cycle=%s prior_order_id=%s",
+                        str(code).zfill(6), row_cycle, row.get("kis_odno") or row.get("order_id"))
+            return True, dict(row)
+        return False, None
 
     def _register_session_no_sellable(self, *, code: str, reason: str = "KIS_NO_SELLABLE_QTY") -> int:
         code_key = str(code or "").zfill(6)
@@ -10430,7 +10496,17 @@ class PB1Engine:
             "current_stop_price": _eh_stop_px,
         })
         # ─────────────────────────────────────────────────────────────────────
-        pre_order_holding_qty = int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        broker_position = self._authoritative_balance.position(cf.code) if self._authoritative_balance else None
+        pre_order_holding_qty = broker_position.qty if broker_position else int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        if broker_position and broker_position.qty > 0:
+            logger.warning("[PB1][BUY][BLOCK] code=%s reason=BUYABLE_EXISTING_BROKER_HOLDING snapshot_id=%s qty=%s",
+                           display_code, self._authoritative_balance.snapshot_id, broker_position.qty)
+            status["skipped"] = 1
+            status["skipped_reason"] = "BUYABLE_EXISTING_BROKER_HOLDING"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            return status
+        baseline = (OrderBaseline.capture(self._authoritative_balance, cf.code, qty)
+                    if self._authoritative_balance else None)
         request_payload = {
             "entry_plan": plan,
             "features": cf.features,
@@ -10440,7 +10516,15 @@ class PB1Engine:
             "pre_order_holding_qty": pre_order_holding_qty,
             "requested_qty": int(qty or 0),
             "submitted_qty": int(qty or 0),
+            **(baseline.__dict__ if baseline else {
+                "balance_snapshot_id": None,
+                "pre_order_orderable_qty": int(gate_snapshot.get("orderable_qty") or 0),
+                "pre_order_avg_price": float(gate_snapshot.get("avg_price") or 0),
+                "order_intent_ts": self._now_kst.isoformat(),
+            }),
         }
+        logger.info("[ORDER][BASELINE] code=%s side=BUY snapshot_id=%s pre_qty=%s requested_qty=%s",
+                    cf.code, request_payload.get("balance_snapshot_id"), pre_order_holding_qty, qty)
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()
@@ -12501,6 +12585,17 @@ class PB1Engine:
             )
 
         code_key = str(code or "").zfill(6)
+        _position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
+        _cycle_id = str(pos.get("position_cycle_id") or _position_meta.get("position_cycle_id") or "") or None
+        durable_blocked, _prior_sell = self._durable_sell_block(
+            code=code_key,
+            position_cycle_id=_cycle_id,
+            exit_stage=str(exit_eval.primary_reason or "") or None,
+        )
+        if durable_blocked:
+            exit_eval_payload["order_skip_reasons"] = ["SELL_ALREADY_ACCEPTED_THIS_SESSION"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+            return exit_eval_payload
         snapshot_version = f"qty:{kis_qty}:sellable:{kis_sellable_qty}"
         if NO_SELLABLE_STICKY.blocked(trade_date=str(self._today), symbol=code,
                                       snapshot_version=snapshot_version, orderable_qty=kis_sellable_qty):
@@ -12699,6 +12794,8 @@ class PB1Engine:
             "position_eod_action": pos.get("eod_action") or exit_eval_payload.get("eod_action"),
             "policy_version": pos.get("policy_version") or (exit_eval_payload.get("entry_exit_plan") or {}).get("policy_version"),
         }
+        sell_baseline = (OrderBaseline.capture(self._authoritative_balance, code, orderable_qty)
+                         if self._authoritative_balance else None)
         try:
             order_id, _created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -12716,8 +12813,19 @@ class PB1Engine:
                 client_order_key=client_key,
                 request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
                               "reason_family": reason_family, "position_lifecycle_id": lifecycle_id,
+                              "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
+                              "exit_stage": stage,
                               "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
-                              "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
+                              "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {},
+                              **(sell_baseline.__dict__ if sell_baseline else {
+                                  "balance_snapshot_id": None,
+                                  "pre_order_holding_qty": kis_qty,
+                                  "pre_order_orderable_qty": kis_sellable_qty,
+                                  "pre_order_avg_price": avg,
+                                  "requested_qty": orderable_qty,
+                                  "submitted_qty": orderable_qty,
+                                  "order_intent_ts": self._now_kst.isoformat(),
+                              })},
                 status="CREATED",
             )
         except Exception:
@@ -12725,6 +12833,9 @@ class PB1Engine:
             if not self.dry_run:
                 raise
             return exit_eval_payload
+
+        logger.info("[ORDER][BASELINE] code=%s side=SELL snapshot_id=%s pre_qty=%s requested_qty=%s",
+                    code, sell_baseline.balance_snapshot_id if sell_baseline else None, kis_qty, orderable_qty)
 
         logger.info(
             "[EXIT][SUBMIT] code=%s name=%s qty=%s order_type=market family=%s reason=%s",
@@ -12840,10 +12951,13 @@ class PB1Engine:
                 price=float(mark or 0.0),
                 order_id=str(kis_odno or order_id or ""),
             )
+            logger.info("[SELL_SESSION_BLOCK][DURABLE_REGISTER] code=%s cycle=%s order_id=%s session=%s",
+                        code, _cycle_id or "", kis_odno or order_id,
+                        str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower())
             if hasattr(self.kis, "invalidate_balance_cache"):
                 self.kis.invalidate_balance_cache(reason=f"sell_ack:{code}", codes=[display_code])
-            self._balance_snapshot = None
-            self._balance_snapshot_source = None
+            # The snapshot is immutable for the lifetime of this engine/tick.
+            # The next engine obtains a fresh snapshot and reconciles the ACK.
             try:
                 self.orders_repo.mark_acked(self.env, kis_odno, resp)
                 logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
