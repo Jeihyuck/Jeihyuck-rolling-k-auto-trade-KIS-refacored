@@ -21,7 +21,8 @@ from sqlalchemy import inspect
 from trader.account_state import get_account_key
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES,
-                                    PENDING_SELL_STATES, exit_stage_for_reason, legal_next_exit_stage)
+                                    PENDING_SELL_STATES, BalanceFreshness, balance_freshness_for_source,
+                                    exit_stage_for_reason, legal_next_exit_stage)
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.path_contract import resolve_repo_root
@@ -2740,7 +2741,9 @@ class PB1Engine:
         self._balance_snapshot_source: str | None = None
         self._authoritative_balance: BrokerBalanceSnapshot | None = None
         if isinstance(balance_snapshot, dict):
-            self._set_authoritative_balance(balance_snapshot, source=balance_source or "runner")
+            initial_source = balance_source or "runner"
+            self._set_authoritative_balance(balance_snapshot, source=initial_source,
+                                            freshness=balance_freshness_for_source(initial_source))
         if balance_snapshot is not None:
             if balance_source == "api":
                 self.balance_api_calls += 1
@@ -4466,7 +4469,8 @@ class PB1Engine:
             )
             try:
                 snapshot = self.kis.get_balance_cached(force=True)
-                self._set_authoritative_balance(snapshot, source="forced_refresh_output2_none")
+                self._set_authoritative_balance(snapshot, source="forced_refresh_output2_none",
+                                                freshness=BalanceFreshness.FRESH)
             except Exception as exc:
                 raise RuntimeError("Balance refetch failed after output2 None") from exc
         _log_balance_snapshot_shape(snapshot, label="input")
@@ -4476,7 +4480,8 @@ class PB1Engine:
                 try:
                     refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
                     snapshot = refreshed_snapshot
-                    self._set_authoritative_balance(snapshot, source=_source or "forced_refresh_sanitized")
+                    self._set_authoritative_balance(snapshot, source="forced_refresh_sanitized",
+                                                    freshness=BalanceFreshness.FRESH)
                 except Exception as exc:
                     raise RuntimeError("Balance refresh failed after sanitized snapshot") from exc
 
@@ -4499,7 +4504,8 @@ class PB1Engine:
         if self.kis:
             try:
                 balance_resp = self.kis.get_balance_cached(force=True)
-                self._set_authoritative_balance(balance_resp, source="forced_refresh_cash")
+                self._set_authoritative_balance(balance_resp, source="forced_refresh_cash",
+                                                freshness=BalanceFreshness.FRESH)
                 _log_balance_snapshot_shape(balance_resp, label="force_refresh")
                 cash, meta = self._parse_available_cash_snapshot(balance_resp)
             except Exception:
@@ -5745,14 +5751,16 @@ class PB1Engine:
             )
 
     def _set_authoritative_balance(self, snapshot: dict, *, source: str,
+                                   freshness: BalanceFreshness,
                                    fetched_at: datetime | None = None) -> None:
         old_id = self._authoritative_balance.snapshot_id if self._authoritative_balance else "none"
-        authoritative = BrokerBalanceSnapshot.from_kis(snapshot, source=source, fetched_at=fetched_at)
+        authoritative = BrokerBalanceSnapshot.from_kis(
+            snapshot, source=source, freshness=freshness, fetched_at=fetched_at)
         self._balance_snapshot = snapshot
         self._balance_snapshot_source = source
         self._authoritative_balance = authoritative
-        logger.info("[BALANCE][AUTHORITATIVE_REPLACE] old_snapshot_id=%s new_snapshot_id=%s source=%s holdings_count=%s",
-                    old_id, authoritative.snapshot_id, source, len(authoritative.holdings_by_code))
+        logger.info("[BALANCE][AUTHORITATIVE_REPLACE] old_snapshot_id=%s new_snapshot_id=%s source=%s freshness=%s holdings_count=%s",
+                    old_id, authoritative.snapshot_id, source, freshness.value, len(authoritative.holdings_by_code))
 
     def _fetch_holdings_snapshot(self) -> dict:
         # ✅ DIAG bypass: skip balance check when account params invalid
@@ -5788,7 +5796,7 @@ class PB1Engine:
                 "output2": [{"dnca_tot_amt": "0", "ord_psbl_cash": "0"}],
                 "_source": "engine_fail_soft_empty",
                 "_fail_soft": True,
-            }, source="engine_fail_soft_empty")
+            }, source="engine_fail_soft_empty", freshness=BalanceFreshness.INVALID)
             return self._balance_snapshot
         if not self.kis:
             return {}
@@ -5803,7 +5811,8 @@ class PB1Engine:
                 "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
                 source,
             )
-        self._set_authoritative_balance(snap, source=source)
+        self._set_authoritative_balance(
+            snap, source=source, freshness=balance_freshness_for_source(source))
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
@@ -7451,7 +7460,8 @@ class PB1Engine:
             prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
             prior_status = str(row.get("status") or "").upper()
             if prior_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
-                fresh = bool(self._authoritative_balance and self._authoritative_balance.source == "api")
+                fresh = bool(self._authoritative_balance
+                             and self._authoritative_balance.freshness is BalanceFreshness.FRESH)
                 remaining = self._authoritative_balance.holding_qty(code) if self._authoritative_balance else 0
                 prior_submitted = int(request.get("submitted_qty") or row.get("qty") or 0)
                 prior_pre_qty = int(request.get("pre_order_holding_qty") or 0)
@@ -15781,6 +15791,8 @@ class PB1Engine:
             self._set_authoritative_balance(
                 holdings_snapshot,
                 source=str(self._balance_snapshot_source or cash_meta.get("source") or "resolved_balance"),
+                freshness=(self._authoritative_balance.freshness
+                           if self._authoritative_balance else BalanceFreshness.CACHED),
             )
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary_raw = holdings_snapshot.get("output2")

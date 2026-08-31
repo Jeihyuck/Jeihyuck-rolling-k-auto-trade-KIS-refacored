@@ -24,6 +24,24 @@ class OrderState(str, Enum):
     RECONCILE_ERROR = "RECONCILE_ERROR"
 
 
+class BalanceFreshness(str, Enum):
+    FRESH = "FRESH"
+    CACHED = "CACHED"
+    STALE = "STALE"
+    INVALID = "INVALID"
+
+
+def balance_freshness_for_source(source: str | None) -> BalanceFreshness:
+    value = str(source or "").strip().lower()
+    if value in {"api", "forced_refresh_output2_none", "forced_refresh_sanitized", "forced_refresh_cash"}:
+        return BalanceFreshness.FRESH
+    if value in {"persisted_cache", "stale_cache", "expired_cache", "stale"}:
+        return BalanceFreshness.STALE
+    if value in {"engine_fail_soft_empty", "invalid", "none"}:
+        return BalanceFreshness.INVALID
+    return BalanceFreshness.CACHED
+
+
 SELL_GUARD_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED",
                                "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
                                "ACKED_IDEMPOTENT_RECOVERED", "NO_SELLABLE_QTY"})
@@ -80,9 +98,11 @@ class BrokerBalanceSnapshot:
     cash: int
     holdings_by_code: Mapping[str, BrokerPosition]
     source: str = "api"
+    freshness: BalanceFreshness = BalanceFreshness.FRESH
 
     @classmethod
     def from_kis(cls, payload: Mapping[str, Any], *, source: str = "api",
+                 freshness: BalanceFreshness | None = None,
                  fetched_at: datetime | None = None) -> "BrokerBalanceSnapshot":
         holdings: dict[str, BrokerPosition] = {}
         for row in payload.get("output1", []) or []:
@@ -97,7 +117,8 @@ class BrokerBalanceSnapshot:
         summary = payload.get("output2") or [{}]
         summary = summary[0] if isinstance(summary, list) and summary else summary
         cash = int(float((summary or {}).get("ord_psbl_cash") or (summary or {}).get("dnca_tot_amt") or 0))
-        return cls(str(uuid4()), fetched_at or datetime.now(timezone.utc), cash, holdings, source)
+        return cls(str(uuid4()), fetched_at or datetime.now(timezone.utc), cash, holdings, source,
+                   freshness or balance_freshness_for_source(source))
 
     def position(self, code: str) -> BrokerPosition:
         return self.holdings_by_code.get(str(code).zfill(6), BrokerPosition())
