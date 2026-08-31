@@ -27,6 +27,28 @@ def test_metrics_come_from_durable_orders_not_local_candidate_counts():
     assert metrics["by_side"]["BUY"]["broker_acked"] == 3
     assert metrics["by_side"]["SELL"]["broker_acked"] == 4
     assert metrics["fills_confirmed"] == 0
+    assert metrics["ack_without_confirmed_fill"] == 0  # synthetic rows intentionally lack durable order ids
+
+
+def test_ack_without_fill_is_reported_by_order_identity():
+    orders = [{"order_id": f"buy-{idx}", "side": "BUY", "status": "ACKED"} for idx in range(3)]
+    metrics = durable_order_metrics(orders, [])
+    assert metrics["broker_acked"] == 3
+    assert metrics["fills_confirmed"] == 0
+    assert metrics["unresolved_acks"] == 0
+    assert metrics["ack_without_confirmed_fill"] == 3
+    assert metrics["by_side"]["BUY"]["ack_without_confirmed_fill"] == 3
+
+
+def test_ack_without_fill_is_split_by_side_and_dedupes_multiple_fill_rows():
+    orders = ([{"order_id": f"buy-{idx}", "side": "BUY", "status": "ACKED"} for idx in range(3)]
+              + [{"order_id": f"sell-{idx}", "side": "SELL", "status": "ACKED"} for idx in range(4)])
+    fills = ([{"order_id": "buy-0", "side": "BUY"}, {"order_id": "buy-0", "side": "BUY"}]
+             + [{"order_id": f"sell-{idx}", "side": "SELL"} for idx in range(4)])
+    metrics = durable_order_metrics(orders, fills)
+    assert metrics["ack_without_confirmed_fill"] == 2
+    assert metrics["by_side"]["BUY"]["ack_without_confirmed_fill"] == 2
+    assert metrics["by_side"]["SELL"]["ack_without_confirmed_fill"] == 0
 
 
 def test_pb1_result_file_rebuilds_ack_metrics_from_durable_db(tmp_path, monkeypatch):

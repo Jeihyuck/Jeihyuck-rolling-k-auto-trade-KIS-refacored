@@ -2748,9 +2748,12 @@ def _write_session_result_file(payload: dict[str, Any], *, engine=None, env: str
             payload["filled_confirmed"] = int(durable["fills_confirmed"])
             payload["filled_confirmed_count"] = int(durable["fills_confirmed"])
             payload["unresolved_ack_count"] = int(durable["unresolved_acks"])
-            logger.info("[PB1][SESSION_METRICS][DURABLE] intents=%s submitted=%s acked=%s fills=%s unresolved=%s",
+            payload["ack_without_confirmed_fill"] = int(durable["ack_without_confirmed_fill"])
+            for warning in durable.get("consistency_warnings", []):
+                logger.warning("[SESSION_METRICS][CONSISTENCY_WARN] detail=%s", warning)
+            logger.info("[PB1][SESSION_METRICS][DURABLE] intents=%s submitted=%s acked=%s fills=%s ack_without_fill=%s unresolved=%s",
                         durable["order_intents_created"], durable["broker_submitted"], durable["broker_acked"],
-                        durable["fills_confirmed"], durable["unresolved_acks"])
+                        durable["fills_confirmed"], durable["ack_without_confirmed_fill"], durable["unresolved_acks"])
         buy_orders = int(payload.get("buy_orders", 0) or 0)
         sell_orders = int(payload.get("sell_orders", 0) or 0)
         buy_orders_ack = int(payload.get("buy_orders_ack", payload.get("accepted", buy_orders)) or 0)

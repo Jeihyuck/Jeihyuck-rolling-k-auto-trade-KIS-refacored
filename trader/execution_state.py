@@ -59,6 +59,8 @@ def exit_stage_for_reason(reason: str | None, *, requested_sell_qty: int | None 
 def legal_next_exit_stage(previous: str, current: str) -> bool:
     return (str(previous).upper(), str(current).upper()) in {
         ("TP1", "TP2"),
+        ("TP1", "FULL_EXIT"),
+        ("TP2", "FULL_EXIT"),
         ("PROFIT_PROTECT_PARTIAL_1", "FULL_EXIT"),
         ("DEFENSE_TRIM_1", "FULL_EXIT"),
     }
@@ -144,9 +146,27 @@ def reconcile_balance_delta(*, side: str, pre_qty: int, post_qty: int,
 def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     rows, fill_rows = list(orders), list(fills)
     states = [str(row.get("status") or "").upper() for row in rows]
-    ack_states = {"ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED", "ACKED_IDEMPOTENT_RECOVERED"}
+    ack_states = {"ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED",
+                  "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED", "ACKED_IDEMPOTENT_RECOVERED"}
     submitted_states = ack_states | {"SUBMITTED", "REJECTED", "FAILED", "UNRESOLVED_ACK",
                                      "RECONCILE_ERROR", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}
+    filled_order_ids = {str(row.get("order_id")) for row in fill_rows if row.get("order_id")}
+    ack_without_fill_ids = {
+        str(row.get("order_id")) for row in rows
+        if row.get("order_id") and str(row.get("status") or "").upper() in {"ACKED", "ACCEPTED"}
+    } - filled_order_ids
+    order_status_by_id = {str(row.get("order_id")): str(row.get("status") or "").upper()
+                          for row in rows if row.get("order_id")}
+    consistency_warnings = [
+        f"FILLED_WITHOUT_LEDGER_FILL:{order_id}"
+        for order_id, status in order_status_by_id.items()
+        if status in {"FILLED", "PARTIAL_FILLED"} and order_id not in filled_order_ids
+    ]
+    consistency_warnings.extend(
+        f"FILL_WITH_NONEXECUTED_ORDER:{order_id}"
+        for order_id in filled_order_ids
+        if order_status_by_id.get(order_id) in {"CREATED", "INTENT"}
+    )
     result: dict[str, Any] = {
         "order_intents_created": len(rows),
         "broker_submitted": sum(s in submitted_states for s in states),
@@ -156,12 +176,19 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
         "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in states),
         "cancelled": sum(s == "CANCELLED" for s in states),
         "unresolved_acks": sum(s == "UNRESOLVED_ACK" for s in states),
+        "ack_without_confirmed_fill": len(ack_without_fill_ids),
+        "consistency_warnings": consistency_warnings,
     }
     result["by_side"] = {}
     for side in ("BUY", "SELL"):
         side_rows = [r for r in rows if str(r.get("side") or "").upper() == side]
         side_states = [str(r.get("status") or "").upper() for r in side_rows]
         side_fills = [f for f in fill_rows if str(f.get("side") or "").upper() == side]
+        side_filled_order_ids = {str(f.get("order_id")) for f in side_fills if f.get("order_id")}
+        side_ack_without_fill = {
+            str(row.get("order_id")) for row in side_rows
+            if row.get("order_id") and str(row.get("status") or "").upper() in {"ACKED", "ACCEPTED"}
+        } - side_filled_order_ids
         result["by_side"][side] = {
             "order_intents_created": len(side_rows),
             "broker_submitted": sum(s in submitted_states for s in side_states),
@@ -171,6 +198,7 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
             "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in side_states),
             "cancelled": sum(s == "CANCELLED" for s in side_states),
             "unresolved_acks": sum(s == "UNRESOLVED_ACK" for s in side_states),
+            "ack_without_confirmed_fill": len(side_ack_without_fill),
         }
     return result
 

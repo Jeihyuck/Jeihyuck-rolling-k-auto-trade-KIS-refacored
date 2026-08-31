@@ -842,6 +842,7 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     ack_db_failed = int(pb1_result.get("ack_db_failed_count", pb1_result.get("ack_db_failed", 0)) or 0)
     balance_confirmed = int(pb1_result.get("balance_confirmed_count", pb1_result.get("balance_reconcile_count", 0)) or 0)
     filled_confirmed = int(pb1_result.get("fills_confirmed", pb1_result.get("filled_confirmed_count", pb1_result.get("filled_confirmed", 0))) or 0)
+    ack_without_fill = int(pb1_result.get("ack_without_confirmed_fill", 0) or 0)
     count_reconcile = reconcile_kr_order_counts(
         engine_order_count=orders_intent,
         broker_ack_count=orders_ack,
@@ -853,10 +854,10 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
     )
     _stage(session, ctx.trade_date, ctx.expected_as_of, "daily_report_build", lambda: None)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s unresolved_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, pb1_result.get("unresolved_acks", 0), blocked)
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s ack_without_fill=%s unresolved_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, ack_without_fill, pb1_result.get("unresolved_acks", 0), blocked)
     else:
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s unresolved_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, pb1_result.get("unresolved_acks", 0), blocked)
-    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_submitted": orders_submitted, "orders_ack": orders_ack, "fills_confirmed": filled_confirmed, "unresolved_ack": int(pb1_result.get("unresolved_acks", 0) or 0), **count_reconcile}
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s ack_without_fill=%s unresolved_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, ack_without_fill, pb1_result.get("unresolved_acks", 0), blocked)
+    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_submitted": orders_submitted, "orders_ack": orders_ack, "fills_confirmed": filled_confirmed, "ack_without_confirmed_fill": ack_without_fill, "unresolved_ack": int(pb1_result.get("unresolved_acks", 0) or 0), **count_reconcile}
     if lock_unavailable:
         result.update(lock_unavailable_result_fields())
     if session == "close":

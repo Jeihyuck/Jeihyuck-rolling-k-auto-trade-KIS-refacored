@@ -7453,6 +7453,15 @@ class PB1Engine:
             if prior_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
                 fresh = bool(self._authoritative_balance and self._authoritative_balance.source == "api")
                 remaining = self._authoritative_balance.holding_qty(code) if self._authoritative_balance else 0
+                prior_submitted = int(request.get("submitted_qty") or row.get("qty") or 0)
+                prior_pre_qty = int(request.get("pre_order_holding_qty") or 0)
+                prior_was_partial = (
+                    prior_stage in {"TP1", "TP2", "PROFIT_PROTECT_PARTIAL_1", "DEFENSE_TRIM_1"}
+                    or (prior_pre_qty > 0 and 0 < prior_submitted < prior_pre_qty)
+                )
+                if (fresh and remaining > 0 and prior_was_partial
+                        and str(exit_stage or "").upper() == "FULL_EXIT"):
+                    continue
                 if (fresh and remaining > 0 and prior_stage and exit_stage
                         and legal_next_exit_stage(prior_stage, exit_stage)):
                     continue

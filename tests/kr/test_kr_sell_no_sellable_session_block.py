@@ -15,10 +15,12 @@ from trader.kr.pb1_stability import normalize_sell_reason_family
 class FakeKis:
     def __init__(self) -> None:
         self.sell_calls = 0
+        self.sell_quantities: list[int] = []
         self.balance_invalidations: list[tuple[str, list[str]]] = []
 
     def sell_stock_market(self, code: str, qty: int) -> dict:
         self.sell_calls += 1
+        self.sell_quantities.append(qty)
         return {"rt_cd": "0", "msg_cd": "0", "msg1": "accepted", "output": {"ODNO": f"S-{code}-{qty}"}}
 
     def invalidate_balance_cache(self, *, reason: str, codes: list[str] | None = None) -> None:
@@ -140,7 +142,7 @@ def test_changing_full_exit_reason_cannot_bypass_durable_guard():
     assert blocked
 
 
-def test_filled_tp1_allows_tp2_only_with_fresh_remaining_balance():
+def test_filled_tp1_allows_tp2_or_emergency_full_exit_with_fresh_remaining_balance():
     db = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(db).metadata.create_all(db)
     OrdersRepo(db).create_intent_idempotent(
@@ -156,7 +158,7 @@ def test_filled_tp1_allows_tp2_only_with_fresh_remaining_balance():
     blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="TP2")
     assert not blocked
     blocked_full, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="FULL_EXIT")
-    assert blocked_full
+    assert not blocked_full
 
 
 def test_production_partial_reason_stage_mapping_and_reason_family():
@@ -185,6 +187,54 @@ def test_profit_protect_fill_allows_later_emergency_full_exit():
     blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x",
                                              exit_stage=exit_stage_for_reason("EXIT_HARD_STOP"))
     assert not blocked
+
+
+def _hard_stop_after_prior_partial(monkeypatch, *, prior_stage: str, prior_status: str):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    OrdersRepo(db).create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=None, stage=prior_stage, client_order_key=f"prior-{prior_stage}-{prior_status}",
+        request_json={"exit_stage": prior_stage, "trade_session": "day",
+                      "pre_order_holding_qty": 14, "requested_qty": 7, "submitted_qty": 7},
+        status=prior_status, position_cycle_id="cycle-x",
+    )
+    balance = {"output1": [{"pdno": "010060", "hldg_qty": "7", "ord_psbl_qty": "7",
+                             "pchs_avg_pric": "271660"}], "output2": [{}]}
+    kis = FakeKis()
+    kis.sell_calls = 1
+    kis.sell_quantities = [7]
+    engine, _ = _make_engine(db, kis, balance)
+    pos = _pos(code="010060", qty=7, kis_qty=7, orderable_qty=7)
+    pos.update(avg_buy_price=271660.0, last_price=260000.0, stop_price=265000.0,
+               position_cycle_id="cycle-x", position_meta={"position_cycle_id": "cycle-x"})
+    result = engine._plan_exit_event(pos, {"close": 260000.0}, pd.DataFrame(), "day")
+    return result, kis
+
+
+def test_tp1_filled_then_hard_stop_allows_remaining_full_exit(monkeypatch):
+    result, kis = _hard_stop_after_prior_partial(monkeypatch, prior_stage="TP1", prior_status="FILLED")
+    assert result["submitted"] == 1
+    assert kis.sell_calls == 2 and kis.sell_quantities == [7, 7]
+
+
+def test_pending_tp1_then_hard_stop_still_blocks_duplicate_sell(monkeypatch):
+    result, kis = _hard_stop_after_prior_partial(monkeypatch, prior_stage="TP1", prior_status="ACKED")
+    assert result["order_result"] == "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+    assert kis.sell_calls == 1
+
+
+def test_tp1_qty_confirmed_price_unresolved_then_full_exit(monkeypatch):
+    result, kis = _hard_stop_after_prior_partial(
+        monkeypatch, prior_stage="TP1", prior_status="FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED")
+    assert result["submitted"] == 1 and kis.sell_calls == 2
+
+
+def test_tp2_filled_then_hard_stop_allows_remaining_full_exit(monkeypatch):
+    result, kis = _hard_stop_after_prior_partial(monkeypatch, prior_stage="TP2", prior_status="FILLED")
+    assert result["submitted"] == 1 and kis.sell_calls == 2
 
 
 def _pos(*, code: str, qty: int, kis_qty: int, orderable_qty: int) -> dict:
