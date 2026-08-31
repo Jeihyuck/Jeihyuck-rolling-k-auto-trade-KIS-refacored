@@ -25,7 +25,32 @@ class OrderState(str, Enum):
 
 
 SELL_GUARD_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED",
+                               "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED",
                                "ACKED_IDEMPOTENT_RECOVERED", "NO_SELLABLE_QTY"})
+PENDING_SELL_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_ACK",
+                                 "PARTIAL_FILLED", "ACKED_IDEMPOTENT_RECOVERED"})
+
+
+def exit_stage_for_reason(reason: str | None) -> str:
+    """Map decision reasons to policy stages; reasons never define dedupe identity."""
+    value = str(reason or "").upper()
+    if value in {"TP1", "TAKE_PROFIT_1", "ABS_TP1"}:
+        return "TP1"
+    if value in {"TP2", "TAKE_PROFIT_2", "ABS_TP2"}:
+        return "TP2"
+    if value.startswith("PROFIT_PROTECT_PARTIAL_1"):
+        return "PROFIT_PROTECT_PARTIAL_1"
+    if value.startswith("DEFENSE_TRIM_1"):
+        return "DEFENSE_TRIM_1"
+    return "FULL_EXIT"
+
+
+def legal_next_exit_stage(previous: str, current: str) -> bool:
+    return (str(previous).upper(), str(current).upper()) in {
+        ("TP1", "TP2"),
+        ("PROFIT_PROTECT_PARTIAL_1", "FULL_EXIT"),
+        ("DEFENSE_TRIM_1", "FULL_EXIT"),
+    }
 
 
 @dataclass(frozen=True)
@@ -109,9 +134,11 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
     rows, fill_rows = list(orders), list(fills)
     states = [str(row.get("status") or "").upper() for row in rows]
     ack_states = {"ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED", "ACKED_IDEMPOTENT_RECOVERED"}
+    submitted_states = ack_states | {"SUBMITTED", "REJECTED", "FAILED", "UNRESOLVED_ACK",
+                                     "RECONCILE_ERROR", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}
     result: dict[str, Any] = {
         "order_intents_created": len(rows),
-        "broker_submitted": sum(s in SELL_GUARD_STATES for s in states),
+        "broker_submitted": sum(s in submitted_states for s in states),
         "broker_acked": sum(s in ack_states for s in states),
         "fills_confirmed": len(fill_rows),
         "partial_fills": sum(s == "PARTIAL_FILLED" for s in states),
@@ -119,11 +146,21 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
         "cancelled": sum(s == "CANCELLED" for s in states),
         "unresolved_acks": sum(s in {"ACKED", "ACCEPTED", "UNRESOLVED_ACK"} for s in states),
     }
-    result["by_side"] = {
-        side: {"broker_acked": sum(str(r.get("side") or "").upper() == side and
-                                    str(r.get("status") or "").upper() in ack_states for r in rows)}
-        for side in ("BUY", "SELL")
-    }
+    result["by_side"] = {}
+    for side in ("BUY", "SELL"):
+        side_rows = [r for r in rows if str(r.get("side") or "").upper() == side]
+        side_states = [str(r.get("status") or "").upper() for r in side_rows]
+        side_fills = [f for f in fill_rows if str(f.get("side") or "").upper() == side]
+        result["by_side"][side] = {
+            "order_intents_created": len(side_rows),
+            "broker_submitted": sum(s in submitted_states for s in side_states),
+            "broker_acked": sum(s in ack_states for s in side_states),
+            "fills_confirmed": len(side_fills),
+            "partial_fills": sum(s == "PARTIAL_FILLED" for s in side_states),
+            "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in side_states),
+            "cancelled": sum(s == "CANCELLED" for s in side_states),
+            "unresolved_acks": sum(s in {"ACKED", "ACCEPTED", "UNRESOLVED_ACK"} for s in side_states),
+        }
     return result
 
 

@@ -19,8 +19,9 @@ import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import inspect
 from trader.account_state import get_account_key
-from trader.position_lifecycle import imported_runtime_state, lifecycle_is_authoritative
-from trader.execution_state import BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES
+from trader.position_lifecycle import lifecycle_is_authoritative
+from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES,
+                                    PENDING_SELL_STATES, exit_stage_for_reason, legal_next_exit_stage)
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.path_contract import resolve_repo_root
@@ -4692,11 +4693,28 @@ class PB1Engine:
             for row in (ledger_positions or [])
             if str((row or {}).get("code") or "").strip()
         }
-        codes = [
-            str((row or {}).get("pdno") or (row or {}).get("code") or "").zfill(6)
-            for row in (balance_rows or [])
-            if str((row or {}).get("pdno") or (row or {}).get("code") or "").strip()
-        ]
+        for balance_row in balance_rows or []:
+            code_key = str(balance_row.get("pdno") or balance_row.get("code") or "").zfill(6)
+            current = positions_by_code.get(code_key)
+            if current and lifecycle_is_authoritative(current):
+                continue
+            if not hasattr(self.positions_repo, "get_or_create_imported_cycle_for_kis_holding"):
+                logger.error("[LIFECYCLE][BLOCK] code=%s reason=PERSISTENCE_API_UNAVAILABLE action=BLOCK_EXIT", code_key)
+                positions_by_code[code_key] = {"code": code_key, "position_meta": {"holding_age_unknown": True,
+                    "trail_eligible": False, "lifecycle_blocked": True}}
+                continue
+            persisted, created = self.positions_repo.get_or_create_imported_cycle_for_kis_holding(
+                env=self.env, strategy=self.STRATEGY_NAME,
+                account_id=get_account_key(env=self.env, kis=self.kis), sid=int((current or {}).get("sid") or 1),
+                mode=int((current or {}).get("mode") or 1), code=code_key,
+                market=(current or {}).get("market") or balance_row.get("prdt_type_cd") or balance_row.get("market"),
+                qty=int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0)),
+                avg_price=float(balance_row.get("pchs_avg_pric") or balance_row.get("avg_price") or 0),
+            )
+            positions_by_code[code_key] = persisted
+            log_tag = "IMPORT_PERSIST" if created else "IMPORT_REUSE"
+            logger.info("[LIFECYCLE][%s] code=%s active_epoch_id=%s position_cycle_id=%s source=KIS_HOLDING reason=LEGACY_OR_UNPROVEN_CYCLE created=%s",
+                        log_tag, code_key, persisted.get("portfolio_epoch_id"), persisted.get("position_cycle_id"), int(created))
         cycle_rows = list(positions_by_code.values())
         latest_buy_fills = {}
         if hasattr(self.fills_repo, "list_latest_buy_fills_by_cycles"):
@@ -4732,12 +4750,6 @@ class PB1Engine:
                 or ((((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0)
             )
             pos_meta = dict(positions_by_code.get(code) or {})
-            if pos_meta and not lifecycle_is_authoritative(pos_meta):
-                stale_cycle = str(pos_meta.get("position_cycle_id") or "")
-                epoch = str(getattr(self, "portfolio_epoch_id", "") or pos_meta.get("portfolio_epoch_id") or "runtime-import")
-                pos_meta = imported_runtime_state(epoch_id=epoch, price=avg_price or last_price)
-                logger.warning("[LIFECYCLE][REJECT_STALE] code=%s stale_cycle=%s action=BOOTSTRAP_IMPORTED_CURRENT_CYCLE",
-                               code, stale_cycle)
             latest_buy_fill = latest_buy_fills.get(code) or {}
             entry_ts_raw = latest_buy_fill.get("filled_at")
             if entry_ts_raw is None:
@@ -4798,13 +4810,11 @@ class PB1Engine:
             avg_price = float(row.get("avg_buy_price") or row.get("entry_price") or 0.0)
             last_price = float(row.get("last_price") or self._balance_price_map.get(code) or avg_price or 0.0)
             if not lifecycle_is_authoritative(row):
-                stale_cycle = str(row.get("position_cycle_id") or "")
-                row = {**row, **imported_runtime_state(
-                    epoch_id=str(getattr(self, "portfolio_epoch_id", "") or row.get("portfolio_epoch_id") or "runtime-import"),
-                    price=avg_price or last_price,
-                )}
-                logger.warning("[LIFECYCLE][REJECT_STALE] code=%s stale_cycle=%s action=BOOTSTRAP_IMPORTED_CURRENT_CYCLE",
-                               code, stale_cycle)
+                logger.error("[LIFECYCLE][BLOCK] code=%s stale_cycle=%s reason=LEGACY_CYCLE_NOT_AUTHORITATIVE",
+                             code, row.get("position_cycle_id"))
+                row = {"code": code, "qty": qty, "avg_buy_price": avg_price, "market": row.get("market"),
+                       "position_meta": {"holding_age_unknown": True, "trail_eligible": False,
+                                         "lifecycle_blocked": True}}
             latest_buy_fill = latest_buy_fills.get(code) or {}
             entry_ts_raw = latest_buy_fill.get("filled_at")
             entry_date = None
@@ -7433,10 +7443,15 @@ class PB1Engine:
             row_session = str(request.get("trade_session") or "").lower()
             if row_session and row_session != session:
                 continue
-            # A different explicit stage is a legal strategy-defined partial exit.
             prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
-            if exit_stage and prior_stage and prior_stage != str(exit_stage):
-                continue
+            prior_status = str(row.get("status") or "").upper()
+            if prior_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
+                fresh = bool(self._authoritative_balance and self._authoritative_balance.source == "api")
+                remaining = self._authoritative_balance.holding_qty(code) if self._authoritative_balance else 0
+                if (fresh and remaining > 0 and prior_stage and exit_stage
+                        and legal_next_exit_stage(prior_stage, exit_stage)):
+                    continue
+            # Pending/full-exit orders block regardless of a changing reason.
             logger.info("[SELL_SESSION_BLOCK][DURABLE_SKIP] code=%s cycle=%s prior_order_id=%s",
                         str(code).zfill(6), row_cycle, row.get("kis_odno") or row.get("order_id"))
             return True, dict(row)
@@ -12587,10 +12602,12 @@ class PB1Engine:
         code_key = str(code or "").zfill(6)
         _position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         _cycle_id = str(pos.get("position_cycle_id") or _position_meta.get("position_cycle_id") or "") or None
+        exit_reason = str(exit_eval.primary_reason or "")
+        policy_exit_stage = exit_stage_for_reason(exit_reason)
         durable_blocked, _prior_sell = self._durable_sell_block(
             code=code_key,
             position_cycle_id=_cycle_id,
-            exit_stage=str(exit_eval.primary_reason or "") or None,
+            exit_stage=policy_exit_stage,
         )
         if durable_blocked:
             exit_eval_payload["order_skip_reasons"] = ["SELL_ALREADY_ACCEPTED_THIS_SESSION"]
@@ -12691,7 +12708,7 @@ class PB1Engine:
             return exit_eval_payload
         orderable_qty = sell_qty
 
-        stage = exit_eval.primary_reason
+        stage = policy_exit_stage
         reason_family = normalize_sell_reason_family(stage)
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
@@ -12784,7 +12801,7 @@ class PB1Engine:
             return exit_eval_payload
 
         exit_meta = {
-            "exit_reason": exit_eval.primary_reason,
+            "exit_reason": exit_reason,
             "exit_stage": stage,
             "close_action": exit_eval_payload.get("close_action"),
             "close_reason": exit_eval_payload.get("close_reason"),
@@ -12827,6 +12844,9 @@ class PB1Engine:
                                   "order_intent_ts": self._now_kst.isoformat(),
                               })},
                 status="CREATED",
+                account_id=get_account_key(env=self.env, kis=self.kis),
+                portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or position_meta.get("portfolio_epoch_id") or "") or None,
+                position_cycle_id=_cycle_id,
             )
         except Exception:
             logger.exception("[PB1][EXIT][DB_FAIL] code=%s", display_code)
@@ -13082,9 +13102,13 @@ class PB1Engine:
         holdings_raw = list(holdings_for_exit or [])
         holdings_source = str((self._exit_holdings_meta or {}).get("source") or "unknown")
         logger.info("[EXIT][LOAD] holdings_raw=%s codes=%s source=%s", len(holdings_raw), [holding.code for holding in holdings_raw], holdings_source)
-        holdings_exit_scope = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
-        logger.info("[EXIT][SCOPE] holdings_exit_scope=%s codes=%s", len(holdings_exit_scope), [holding.code for holding in holdings_exit_scope])
-        existing_positions_count = len([holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0])
+        all_broker_holdings = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
+        kr_infinite_holdings = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) == "122630"]
+        holdings_exit_scope = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) != "122630"]
+        logger.info("[EXIT][SCOPE] broker_total=%s kr_inf_reserved=%s pb1_scope=%s codes=%s",
+                    len(all_broker_holdings), len(kr_infinite_holdings), len(holdings_exit_scope),
+                    [holding.code for holding in holdings_exit_scope])
+        existing_positions_count = len(holdings_exit_scope)
         if existing_positions_count > 0 and len(holdings_exit_scope) == 0:
             logger.error(
                 "[EXIT][INCONSISTENT_HOLDINGS] existing_positions=%s holdings_exit_scope=%s",

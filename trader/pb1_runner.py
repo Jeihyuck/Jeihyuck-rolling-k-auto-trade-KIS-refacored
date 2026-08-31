@@ -111,6 +111,7 @@ from trader.db.repos import (
     load_job_checkpoint,
     save_job_checkpoint,
 )
+from trader.execution_state import durable_order_metrics
 from trader.diagnostics.nontrading_smoke import (
     nontrading_smoke_flag_path,
     run_nontrading_smoke_once,
@@ -1088,8 +1089,10 @@ def _load_kr_close_tagged_metadata(
             code_set = set(codes)
             db_positions = [dict(row) for row in all_positions if str((row or {}).get("code") or "").zfill(6) in code_set]
     latest_by_code: dict[str, dict[str, Any]] = {}
-    if fills_repo is not None and hasattr(fills_repo, "list_latest_buy_fills_by_codes"):
-        raw_latest = fills_repo.list_latest_buy_fills_by_codes(env, codes) or {}
+    if fills_repo is not None and hasattr(fills_repo, "list_latest_buy_fills_by_cycles"):
+        raw_latest = fills_repo.list_latest_buy_fills_by_cycles(
+            env, db_positions, strategy=strategy, account_id=get_account_key(env=env),
+        ) or {}
         if isinstance(raw_latest, dict):
             latest_by_code = {str(code).zfill(6): dict(row or {}) for code, row in raw_latest.items()}
     elif fills_repo is not None and hasattr(fills_repo, "list_today_fills"):
@@ -1097,21 +1100,8 @@ def _load_kr_close_tagged_metadata(
             rows = fills_repo.list_today_fills(env, side="BUY", code=code) or []
             if rows:
                 latest_by_code[code] = dict(rows[0] or {})
-    if orders_repo is not None:
-        for code in codes:
-            if latest_by_code.get(code) and _parse_meta_json(latest_by_code[code].get("fill_meta_json")):
-                continue
-            entry_meta: dict[str, Any] = {}
-            if hasattr(orders_repo, "list_today_buy_orders"):
-                buy_orders = orders_repo.list_today_buy_orders(env, code=code) or []
-                if buy_orders:
-                    entry_meta = _parse_meta_json((buy_orders[0] or {}).get("entry_meta_json"))
-            if not entry_meta and hasattr(orders_repo, "find_latest_buy_entry_exit_plan"):
-                plan_row = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code) or {}
-                entry_meta = _parse_meta_json(plan_row.get("entry_meta"))
-            if entry_meta:
-                latest_by_code.setdefault(code, {"code": code})
-                latest_by_code[code]["entry_meta_json"] = entry_meta
+    # Missing cycle-proven metadata remains POLICY_MISSING.  A code-only order
+    # or fill from a prior lifecycle is never restored onto a current holding.
     latest_buy_fills = list(latest_by_code.values())
     logger.info(
         "[KR_CLOSE][POLICY][DB_METADATA] holdings=%s db_positions=%s latest_buy_fills=%s codes=%s",
@@ -2726,11 +2716,37 @@ def _pm_tick_bucket(now_kst: datetime) -> str:
     minute = 0 if int(now_kst.minute) < 30 else 30
     return f"{int(now_kst.hour):02d}{minute:02d}"
 
-def _write_session_result_file(payload: dict[str, Any]) -> None:
+def _write_session_result_file(payload: dict[str, Any], *, engine=None, env: str | None = None,
+                               start_at: datetime | None = None, end_at: datetime | None = None) -> None:
     path = os.getenv("PB1_SESSION_RESULT_PATH")
     if not path:
         return
     try:
+        reason_value = str(payload.get("reason") or payload.get("exit_reason") or "")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", reason_value):
+            payload["derived_as_of"] = reason_value
+            payload["reason"] = "ORDERS_SUBMITTED" if int(payload.get("api_submitted", 0) or 0) else "NO_ORDERS"
+            if payload.get("exit_reason") == reason_value:
+                payload["exit_reason"] = payload["reason"]
+        if engine is not None and env:
+            end_at = end_at or _get_now_kst()
+            start_at = start_at or end_at.replace(hour=0, minute=0, second=0, microsecond=0)
+            orders = OrdersRepo(engine).list_orders_in_window(
+                env, strategy="pb1_pullback_close", start_at=start_at, end_at=end_at,
+            )
+            fills = FillsRepo(engine).list_fills_in_window(
+                env, start_at=start_at, end_at=end_at,
+            )
+            durable_order_ids = {str(row.get("order_id")) for row in orders if row.get("order_id")}
+            fills = [row for row in fills if str(row.get("order_id") or "") in durable_order_ids]
+            durable = durable_order_metrics(orders, fills)
+            payload.update(durable)
+            payload["buy_orders_ack"] = int(durable["by_side"]["BUY"]["broker_acked"])
+            payload["sell_orders_ack"] = int(durable["by_side"]["SELL"]["broker_acked"])
+            payload["api_submitted"] = int(durable["broker_submitted"])
+            logger.info("[PB1][SESSION_METRICS][DURABLE] intents=%s submitted=%s acked=%s fills=%s unresolved=%s",
+                        durable["order_intents_created"], durable["broker_submitted"], durable["broker_acked"],
+                        durable["fills_confirmed"], durable["unresolved_acks"])
         buy_orders = int(payload.get("buy_orders", 0) or 0)
         sell_orders = int(payload.get("sell_orders", 0) or 0)
         buy_orders_ack = int(payload.get("buy_orders_ack", payload.get("accepted", buy_orders)) or 0)
@@ -7964,7 +7980,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "filled_confirmed": int(session_metrics.get("filled_confirmed", 0) or 0),
             "rejected": int(session_metrics.get("rejected", 0) or 0),
             "skipped": int(session_metrics.get("skipped", 0) or 0),
-        })
+        }, engine=engine, env=ctx.env, start_at=now)
     finally:
         _finish_session_guard(
             runs_repo=runs_repo,
@@ -8688,7 +8704,7 @@ def main() -> int:
             "exit_submitted_codes": list(metrics.get("exit_submitted_codes", []) or []),
             "no_sellable_qty_terminal_codes": list(metrics.get("no_sellable_qty_terminal_codes", []) or []),
             "buy_orders": int(metrics.get("buy_orders", 0) or 0),
-        })
+        }, engine=engine, env=ctx.env)
     return _exit_code_for_status(result_status)
 
 

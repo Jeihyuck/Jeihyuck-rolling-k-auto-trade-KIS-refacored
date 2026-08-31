@@ -1,6 +1,11 @@
 from datetime import datetime, timezone
 
 from trader.execution_state import SELL_GUARD_STATES, durable_order_metrics
+import json
+import sqlalchemy as sa
+from trader.db.repos import OrdersRepo
+from trader.db.schema import schema_for_engine
+from trader.pb1_runner import _write_session_result_file
 
 
 def test_new_engine_tick_observes_durable_sell_ack():
@@ -22,3 +27,27 @@ def test_metrics_come_from_durable_orders_not_local_candidate_counts():
     assert metrics["by_side"]["BUY"]["broker_acked"] == 3
     assert metrics["by_side"]["SELL"]["broker_acked"] == 4
     assert metrics["fills_confirmed"] == 0
+
+
+def test_pb1_result_file_rebuilds_ack_metrics_from_durable_db(tmp_path, monkeypatch):
+    engine = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(engine).metadata.create_all(engine)
+    repo = OrdersRepo(engine)
+    for side, count in (("BUY", 3), ("SELL", 4)):
+        for idx in range(count):
+            key = f"metric-{side}-{idx}"
+            repo.create_intent_idempotent(
+                env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+                code=f"{idx + 1:06d}", market="J", side=side, ord_type="MARKET", qty=1,
+                limit_price=None, stage="FULL_EXIT" if side == "SELL" else "ENTRY",
+                client_order_key=key, request_json={}, status="ACKED",
+            )
+    path = tmp_path / "pb1_result.json"
+    monkeypatch.setenv("PB1_SESSION_RESULT_PATH", str(path))
+    _write_session_result_file({"status": "OK", "accepted": 999, "order_candidates": 999},
+                               engine=engine, env="practice")
+    result = json.loads(path.read_text())
+    assert result["broker_acked"] == 7
+    assert result["by_side"]["BUY"]["broker_acked"] == 3
+    assert result["by_side"]["SELL"]["broker_acked"] == 4
+    assert result["fills_confirmed"] == 0
