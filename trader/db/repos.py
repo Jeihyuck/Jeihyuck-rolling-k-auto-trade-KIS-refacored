@@ -3497,6 +3497,7 @@ class OrdersRepo:
         codes: Iterable[str] | None = None,
         status_include: Iterable[str] | None = None,
         status_exclude: Iterable[str] | None = None,
+        strategy: str | None = None,
     ) -> list[dict]:
         env_n = _norm_env(env)
         code_list = [str(item).zfill(6) for item in (codes or []) if str(item or "").strip()]
@@ -3512,6 +3513,8 @@ class OrdersRepo:
             conditions.append(self._schema.orders.c.code == str(code).zfill(6))
         elif code_list:
             conditions.append(self._schema.orders.c.code.in_(code_list))
+        if strategy:
+            conditions.append(self._schema.orders.c.strategy == strategy)
         if status_include:
             conditions.append(self._schema.orders.c.status.in_([str(item).upper() for item in status_include]))
         if status_exclude:
@@ -4015,6 +4018,65 @@ class FillsRepo:
             item = dict(row)
             code = str(item.get("code") or "").zfill(6)
             if code and code not in latest:
+                latest[code] = item
+        return latest
+
+    def list_latest_buy_fills_by_cycles(
+        self,
+        env: str,
+        cycles: Iterable[dict],
+        *,
+        strategy: str,
+        account_id: str | None = None,
+    ) -> dict[str, dict]:
+        """Return BUY provenance only when order and position lifecycle match.
+
+        ``fills`` deliberately does not duplicate strategy/account columns, so
+        those dimensions are proven through the originating order and active
+        epoch.  There is no code-only fallback.
+        """
+        requested = {
+            (str(c.get("code") or "").zfill(6), str(c.get("portfolio_epoch_id") or ""),
+             str(c.get("position_cycle_id") or ""), int(c.get("sid") or 1), int(c.get("mode") or 1))
+            for c in cycles or []
+        }
+        requested = {item for item in requested if item[0] and item[1] and item[2]}
+        if not requested:
+            return {}
+        conditions = []
+        for code, epoch, cycle, sid, mode in requested:
+            conditions.append(and_(
+                self._schema.fills.c.code == code,
+                self._schema.fills.c.portfolio_epoch_id == epoch,
+                self._schema.fills.c.position_cycle_id == cycle,
+                self._schema.orders.c.position_cycle_id == self._schema.fills.c.position_cycle_id,
+                self._schema.orders.c.portfolio_epoch_id == self._schema.fills.c.portfolio_epoch_id,
+                self._schema.orders.c.strategy == strategy,
+                self._schema.orders.c.sid == sid,
+                self._schema.orders.c.mode == mode,
+            ))
+        stmt = (
+            select(self._schema.fills)
+            .join(self._schema.orders, self._schema.orders.c.order_id == self._schema.fills.c.order_id)
+            .join(self._schema.portfolio_epochs,
+                  self._schema.portfolio_epochs.c.portfolio_epoch_id == self._schema.fills.c.portfolio_epoch_id)
+            .where(and_(
+                self._schema.fills.c.env == _norm_env(env),
+                self._schema.fills.c.side == "BUY",
+                self._schema.orders.c.env == _norm_env(env),
+                self._schema.portfolio_epochs.c.env == _norm_env(env),
+                self._schema.portfolio_epochs.c.status == "ACTIVE",
+                self._schema.portfolio_epochs.c.account_id == (account_id or get_account_key(env=env)),
+                sa.or_(*conditions),
+            ))
+            .order_by(self._window_expr(self._schema.fills.c.filled_at).desc())
+        )
+        latest: dict[str, dict] = {}
+        for row in self._read_mappings_with_guard(stmt, op_name="fills.list_latest_buy_fills_by_cycles",
+                                                   fail_open=_resolve_fill_fail_open()):
+            item = dict(row)
+            code = str(item.get("code") or "").zfill(6)
+            if code not in latest:
                 latest[code] = item
         return latest
 
@@ -5137,6 +5199,87 @@ class PositionsRepo:
             fail_open=_resolve_position_fail_open(),
         )
         return rows[0] if rows else None
+
+    def get_or_create_imported_cycle_for_kis_holding(
+        self, *, env: str, strategy: str, account_id: str, sid: int, mode: int,
+        code: str, market: str | None, qty: int, avg_price: float,
+    ) -> tuple[dict, bool]:
+        """Atomically persist/reuse the one authoritative imported OPEN cycle.
+
+        Legacy/unproven rows are retained as audit history but closed before a
+        clean current-epoch cycle is inserted.  No lifecycle metadata is copied.
+        """
+        env_n, code_n = _norm_env(env), str(code).zfill(6)
+        db_url = str(self.engine.url)
+        with self.engine.begin() as conn:
+            epoch_id = _ensure_active_epoch(
+                conn, self._schema, env=env_n, account_id=account_id,
+                sid=sid, mode=mode, strategy=strategy,
+            )
+            identity = and_(
+                self._schema.positions.c.env == env_n,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code_n,
+                self._schema.positions.c.portfolio_epoch_id == epoch_id,
+                self._schema.positions.c.status == "OPEN",
+            )
+            rows = list(conn.execute(select(self._schema.positions).where(identity)
+                                     .order_by(self._schema.positions.c.updated_at.desc())).mappings())
+            for candidate in rows:
+                cycle = str(candidate.get("position_cycle_id") or "")
+                epoch = str(candidate.get("portfolio_epoch_id") or "")
+                origin = str(candidate.get("position_origin") or "").upper()
+                meta = candidate.get("position_meta") if isinstance(candidate.get("position_meta"), dict) else {}
+                authoritative = bool(cycle and epoch and not cycle.startswith("legacy-cycle-")
+                                     and not epoch.startswith("legacy-epoch-")
+                                     and (origin != "RECOVERY" or meta.get("provenance_verified")))
+                if authoritative:
+                    conn.execute(sa.update(self._schema.positions)
+                                 .where(self._schema.positions.c.position_id == candidate["position_id"])
+                                 .values(qty=int(qty), avg_buy_price=float(avg_price) or None,
+                                         total_cost=float(avg_price) * int(qty), last_reconciled_at=func.now(),
+                                         updated_at=func.now()))
+                    return dict(candidate) | {"qty": int(qty), "avg_buy_price": float(avg_price)}, False
+
+            # Close every stale OPEN identity, including legacy epochs, without deleting history.
+            stale_identity = and_(
+                self._schema.positions.c.env == env_n,
+                self._schema.positions.c.strategy == strategy,
+                self._schema.positions.c.sid == sid,
+                self._schema.positions.c.mode == mode,
+                self._schema.positions.c.code == code_n,
+                self._schema.positions.c.status == "OPEN",
+            )
+            conn.execute(sa.update(self._schema.positions).where(stale_identity).values(
+                status="CLOSED", closed_reason="SUPERSEDED_BY_IMPORTED_CURRENT_CYCLE",
+                closed_ts=func.now(), updated_at=func.now(),
+            ))
+            cycle_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+            position_id = _coerce_uuid(None, uses_native_uuid=self._schema.uses_native_uuid, database_url=db_url)
+            clean_meta = {
+                "holding_age_unknown": True, "holding_bars": 0,
+                "trading_days_held": 0, "calendar_days_held": 0,
+                "tp1_done": False, "tp2_done": False, "trail_eligible": False,
+                "provenance_verified": True, "import_source": "KIS_HOLDING",
+            }
+            values = dict(
+                position_id=position_id, position_cycle_id=cycle_id,
+                portfolio_epoch_id=epoch_id, opened_at=func.now(), position_origin="IMPORTED",
+                env=env_n, strategy=strategy, sid=sid, mode=mode, code=code_n, market=market,
+                qty=int(qty), avg_buy_price=float(avg_price) or None,
+                total_cost=float(avg_price) * int(qty), realized_pnl=0.0,
+                entry_ts=None, max_price=float(avg_price) or None,
+                tp1_done=False, tp2_done=False, partial_exit_level=0,
+                pyramid_level=0, last_trail_stop=None, status="OPEN",
+                position_meta=clean_meta, last_reconciled_at=func.now(),
+                **_plan_position_values(None, missing=True),
+            )
+            conn.execute(sa.insert(self._schema.positions).values(**values))
+            row = conn.execute(select(self._schema.positions).where(
+                self._schema.positions.c.position_id == position_id)).mappings().one()
+            return dict(row), True
 
     def list_positions_by_codes(self, *, env: str, strategy: str, codes: list[str]) -> list[dict]:
         if not codes:

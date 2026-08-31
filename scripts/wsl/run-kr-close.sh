@@ -2,6 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 source "$SCRIPT_DIR/init-session-log.sh"
+source "$SCRIPT_DIR/kr-close-failure-classifier.sh"
 nullim_init_session_log KR close "close" "${BASH_SOURCE[0]}"
 # The KR calendar is advisory only; Windows Task Scheduler owns execution timing.
 set +e
@@ -126,13 +127,24 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
     export NULLIM_SESSION_FINAL_STATUS=TIMEOUT NULLIM_SESSION_FINAL_REASON=SESSION_TIMEOUT
     echo "[KR_CLOSE][TIMEOUT] timeout_sec=${KR_CLOSE_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
     echo "[RUN_SUMMARY][RESULT] market=KR session=close status=FAIL reason=SESSION_TIMEOUT orders_intent=unknown orders_ack=unknown blocked=0"
-  elif [[ "$rc" -ne 0 ]] && tail -n 300 "$LOG_FILE" 2>/dev/null | grep -Eiq 'Kis(Auth|Temporary|TokenRateLimit)Error|EGW00133|1분당 1회|tokenP|AUTH_REFRESH|HTTP 403'; then
+  elif [[ "$rc" -ne 0 ]]; then
     HEALTH_DIR="runtime/health"
     mkdir -p "$HEALTH_DIR"
-    printf '{"status":"RETRYABLE_DEGRADED","market":"KR","session":"close","date":"%s","reason":"kis_auth_or_token_temporary","exit_code":%s,"ts":"%s"}\n' "${TODAY_KST}" "$rc" "$(date -Is)" > "${HEALTH_DIR}/kr-close-${TODAY_KST}.json"
-    echo "[KR_CLOSE][DEGRADED] reason=kis_auth_or_token_temporary original_exit_code=${rc} marker=${HEALTH_DIR}/kr-close-${TODAY_KST}.json"
-    echo "[RUN_SUMMARY][RESULT] market=KR session=close status=RETRYABLE_DEGRADED reason=kis_auth_or_token_temporary orders_intent=0 orders_ack=0 blocked=0"
-    rc=0
+    recent_log="$(tail -n 300 "$LOG_FILE" 2>/dev/null || true)"
+    original_rc="$rc"
+    IFS=$'\t' read -r reason is_retryable_kis classified_rc classified_status < <(classify_kr_close_failure "$recent_log" "$original_rc")
+    if [[ "$is_retryable_kis" -eq 1 ]]; then
+      printf '{"status":"RETRYABLE_DEGRADED","completed":0,"retryable":1,"market":"KR","session":"close","date":"%s","reason":"%s","original_exit_code":%s,"exit_code":75,"ts":"%s"}\n' "${TODAY_KST}" "$reason" "$original_rc" "$(date -Is)" > "${HEALTH_DIR}/kr-close-${TODAY_KST}.json"
+      echo "[SESSION][TERMINAL] status=RETRYABLE_DEGRADED completed=0 retryable=1 reason=${reason}"
+      echo "[RUN_SUMMARY][RESULT] market=KR session=close status=RETRYABLE_DEGRADED reason=${reason} orders_intent=0 orders_ack=0 blocked=0"
+      rc="$classified_rc"
+    else
+      reason="NON_KIS_RUNTIME_FAILURE"
+      printf '{"status":"FAIL","completed":0,"retryable":0,"market":"KR","session":"close","date":"%s","reason":"%s","exit_code":%s,"ts":"%s"}\n' "${TODAY_KST}" "$reason" "$original_rc" "$(date -Is)" > "${HEALTH_DIR}/kr-close-${TODAY_KST}.json"
+      echo "[SESSION][TERMINAL] status=FAIL completed=0 retryable=0 reason=${reason}"
+      echo "[RUN_SUMMARY][RESULT] market=KR session=close status=FAIL reason=${reason} orders_intent=0 orders_ack=0 blocked=0"
+      rc="$original_rc"
+    fi
   fi
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc

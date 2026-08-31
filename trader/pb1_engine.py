@@ -19,6 +19,10 @@ import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import inspect
 from trader.account_state import get_account_key
+from trader.position_lifecycle import lifecycle_is_authoritative
+from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES,
+                                    PENDING_SELL_STATES, BalanceFreshness, balance_freshness_for_source,
+                                    exit_stage_for_reason, legal_next_exit_stage)
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.path_contract import resolve_repo_root
@@ -2733,8 +2737,13 @@ class PB1Engine:
         self._warned_keys: set[str] = set()
         self._balance_price_map: Dict[str, float] = {}
         self._balance_cost: float | None = None
-        self._balance_snapshot: dict | None = balance_snapshot
-        self._balance_snapshot_source: str | None = balance_source
+        self._balance_snapshot: dict | None = None
+        self._balance_snapshot_source: str | None = None
+        self._authoritative_balance: BrokerBalanceSnapshot | None = None
+        if isinstance(balance_snapshot, dict):
+            initial_source = balance_source or "runner"
+            self._set_authoritative_balance(balance_snapshot, source=initial_source,
+                                            freshness=balance_freshness_for_source(initial_source))
         if balance_snapshot is not None:
             if balance_source == "api":
                 self.balance_api_calls += 1
@@ -4460,6 +4469,8 @@ class PB1Engine:
             )
             try:
                 snapshot = self.kis.get_balance_cached(force=True)
+                self._set_authoritative_balance(snapshot, source="forced_refresh_output2_none",
+                                                freshness=BalanceFreshness.FRESH)
             except Exception as exc:
                 raise RuntimeError("Balance refetch failed after output2 None") from exc
         _log_balance_snapshot_shape(snapshot, label="input")
@@ -4469,6 +4480,8 @@ class PB1Engine:
                 try:
                     refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
                     snapshot = refreshed_snapshot
+                    self._set_authoritative_balance(snapshot, source="forced_refresh_sanitized",
+                                                    freshness=BalanceFreshness.FRESH)
                 except Exception as exc:
                     raise RuntimeError("Balance refresh failed after sanitized snapshot") from exc
 
@@ -4491,6 +4504,8 @@ class PB1Engine:
         if self.kis:
             try:
                 balance_resp = self.kis.get_balance_cached(force=True)
+                self._set_authoritative_balance(balance_resp, source="forced_refresh_cash",
+                                                freshness=BalanceFreshness.FRESH)
                 _log_balance_snapshot_shape(balance_resp, label="force_refresh")
                 cash, meta = self._parse_available_cash_snapshot(balance_resp)
             except Exception:
@@ -4686,12 +4701,35 @@ class PB1Engine:
             for row in (ledger_positions or [])
             if str((row or {}).get("code") or "").strip()
         }
-        codes = [
-            str((row or {}).get("pdno") or (row or {}).get("code") or "").zfill(6)
-            for row in (balance_rows or [])
-            if str((row or {}).get("pdno") or (row or {}).get("code") or "").strip()
-        ]
-        latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_codes(self.env, codes)
+        for balance_row in balance_rows or []:
+            code_key = str(balance_row.get("pdno") or balance_row.get("code") or "").zfill(6)
+            current = positions_by_code.get(code_key)
+            if current and lifecycle_is_authoritative(current):
+                continue
+            if not hasattr(self.positions_repo, "get_or_create_imported_cycle_for_kis_holding"):
+                logger.error("[LIFECYCLE][BLOCK] code=%s reason=PERSISTENCE_API_UNAVAILABLE action=BLOCK_EXIT", code_key)
+                positions_by_code[code_key] = {"code": code_key, "position_meta": {"holding_age_unknown": True,
+                    "trail_eligible": False, "lifecycle_blocked": True}}
+                continue
+            persisted, created = self.positions_repo.get_or_create_imported_cycle_for_kis_holding(
+                env=self.env, strategy=self.STRATEGY_NAME,
+                account_id=get_account_key(env=self.env, kis=self.kis), sid=int((current or {}).get("sid") or 1),
+                mode=int((current or {}).get("mode") or 1), code=code_key,
+                market=(current or {}).get("market") or balance_row.get("prdt_type_cd") or balance_row.get("market"),
+                qty=int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0)),
+                avg_price=float(balance_row.get("pchs_avg_pric") or balance_row.get("avg_price") or 0),
+            )
+            positions_by_code[code_key] = persisted
+            log_tag = "IMPORT_PERSIST" if created else "IMPORT_REUSE"
+            logger.info("[LIFECYCLE][%s] code=%s active_epoch_id=%s position_cycle_id=%s source=KIS_HOLDING reason=LEGACY_OR_UNPROVEN_CYCLE created=%s",
+                        log_tag, code_key, persisted.get("portfolio_epoch_id"), persisted.get("position_cycle_id"), int(created))
+        cycle_rows = list(positions_by_code.values())
+        latest_buy_fills = {}
+        if hasattr(self.fills_repo, "list_latest_buy_fills_by_cycles"):
+            latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_cycles(
+                self.env, cycle_rows, strategy=self.STRATEGY_NAME,
+                account_id=get_account_key(env=self.env, kis=self.kis),
+            )
         today_kst = self._now_kst.date()
         holdings: list[HoldingContext] = []
         for row in balance_rows or []:
@@ -4721,7 +4759,9 @@ class PB1Engine:
             )
             pos_meta = dict(positions_by_code.get(code) or {})
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at") or pos_meta.get("entry_ts") or pos_meta.get("last_trade_at")
+            entry_ts_raw = latest_buy_fill.get("filled_at")
+            if entry_ts_raw is None:
+                pos_meta.setdefault("position_meta", {})["holding_age_unknown"] = True
             pos_age = calc_position_age(entry_ts_raw, today_kst)
             entry_date = pos_age.entry_date_kst
             trading_days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("trading_days_held") or pos_meta.get("holding_days") or 0)
@@ -4745,7 +4785,7 @@ class PB1Engine:
                     days_held=trading_days_held,
                     calendar_days_held=calendar_days_held,
                     trading_days_held=trading_days_held,
-                    holding_bars=pos_age.holding_bars,
+                    holding_bars=pos_age.holding_bars if entry_ts_raw else 0,
                     last_fill_at=str(entry_ts_raw) if entry_ts_raw else None,
                     position_meta=pos_meta,
                 )
@@ -4757,11 +4797,13 @@ class PB1Engine:
         ledger_positions: Iterable[dict] | None = None,
     ) -> list[HoldingContext]:
         positions = [dict(row or {}) for row in (ledger_positions or [])]
-        codes = [str((row or {}).get("code") or "").zfill(6) for row in positions if str((row or {}).get("code") or "").strip()]
         latest_buy_fills = {}
-        if codes and hasattr(self.fills_repo, "list_latest_buy_fills_by_codes"):
+        if positions and hasattr(self.fills_repo, "list_latest_buy_fills_by_cycles"):
             try:
-                latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_codes(self.env, codes)
+                latest_buy_fills = self.fills_repo.list_latest_buy_fills_by_cycles(
+                    self.env, positions, strategy=self.STRATEGY_NAME,
+                    account_id=get_account_key(env=self.env, kis=self.kis),
+                )
             except Exception:
                 latest_buy_fills = {}
         today_kst = self._now_kst.date()
@@ -4775,10 +4817,16 @@ class PB1Engine:
                 continue
             avg_price = float(row.get("avg_buy_price") or row.get("entry_price") or 0.0)
             last_price = float(row.get("last_price") or self._balance_price_map.get(code) or avg_price or 0.0)
+            if not lifecycle_is_authoritative(row):
+                logger.error("[LIFECYCLE][BLOCK] code=%s stale_cycle=%s reason=LEGACY_CYCLE_NOT_AUTHORITATIVE",
+                             code, row.get("position_cycle_id"))
+                row = {"code": code, "qty": qty, "avg_buy_price": avg_price, "market": row.get("market"),
+                       "position_meta": {"holding_age_unknown": True, "trail_eligible": False,
+                                         "lifecycle_blocked": True}}
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at") or row.get("entry_ts") or row.get("last_trade_at")
+            entry_ts_raw = latest_buy_fill.get("filled_at")
             entry_date = None
-            days_held = int(row.get("holding_days") or 0)
+            days_held = 0
             if entry_ts_raw:
                 try:
                     entry_dt = pd.Timestamp(entry_ts_raw)
@@ -4791,6 +4839,7 @@ class PB1Engine:
             unrealized_pnl = ((last_price - avg_price) * qty) if avg_price > 0 else 0.0
             unrealized_pct = (((last_price - avg_price) / avg_price) * 100.0) if avg_price > 0 else 0.0
             pos_meta = dict(row)
+            pos_meta.setdefault("position_meta", {})["holding_age_unknown"] = entry_ts_raw is None
             pos_meta.update(
                 {
                     "avg_buy_price": avg_price,
@@ -5701,6 +5750,18 @@ class PB1Engine:
                 stage or build_stage_label(session_kind=os.getenv("PB1_SESSION_KIND"), phase="entry"),
             )
 
+    def _set_authoritative_balance(self, snapshot: dict, *, source: str,
+                                   freshness: BalanceFreshness,
+                                   fetched_at: datetime | None = None) -> None:
+        old_id = self._authoritative_balance.snapshot_id if self._authoritative_balance else "none"
+        authoritative = BrokerBalanceSnapshot.from_kis(
+            snapshot, source=source, freshness=freshness, fetched_at=fetched_at)
+        self._balance_snapshot = snapshot
+        self._balance_snapshot_source = source
+        self._authoritative_balance = authoritative
+        logger.info("[BALANCE][AUTHORITATIVE_REPLACE] old_snapshot_id=%s new_snapshot_id=%s source=%s freshness=%s holdings_count=%s",
+                    old_id, authoritative.snapshot_id, source, freshness.value, len(authoritative.holdings_by_code))
+
     def _fetch_holdings_snapshot(self) -> dict:
         # ✅ DIAG bypass: skip balance check when account params invalid
         skip_balance = os.getenv("SKIP_BALANCE_CHECK", "0") == "1"
@@ -5720,7 +5781,6 @@ class PB1Engine:
                     "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
                     source,
                 )
-            self._balance_snapshot_source = "tick_cache"
             return self._balance_snapshot
         fail_soft = (
             os.getenv("PB1_BALANCE_FAIL_SOFT", "0") == "1"
@@ -5731,13 +5791,12 @@ class PB1Engine:
                 "[BALANCE][FAIL_SOFT][ENGINE_NO_REQUERY] reason=%s action=return_empty_snapshot",
                 getattr(self, "entry_block_reason", None),
             )
-            self._balance_snapshot = {
+            self._set_authoritative_balance({
                 "output1": [],
                 "output2": [{"dnca_tot_amt": "0", "ord_psbl_cash": "0"}],
                 "_source": "engine_fail_soft_empty",
                 "_fail_soft": True,
-            }
-            self._balance_snapshot_source = "engine_fail_soft_empty"
+            }, source="engine_fail_soft_empty", freshness=BalanceFreshness.INVALID)
             return self._balance_snapshot
         if not self.kis:
             return {}
@@ -5752,7 +5811,8 @@ class PB1Engine:
                 "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
                 source,
             )
-        self._balance_snapshot = snap
+        self._set_authoritative_balance(
+            snap, source=source, freshness=balance_freshness_for_source(source))
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
@@ -7375,6 +7435,51 @@ class PB1Engine:
             "blocked_until": "SESSION_END",
         }
         logger.info("[SELL_SESSION_BLOCK][REGISTER] code=%s reason=SELL_ACCEPTED order_id=%s", self._display_code(code_key), order_id or "")
+
+    def _durable_sell_block(self, *, code: str, position_cycle_id: str | None = None,
+                            exit_stage: str | None = None) -> tuple[bool, dict[str, Any] | None]:
+        """Read the order ledger; instance dictionaries are only a fast cache."""
+        try:
+            rows = self.orders_repo.list_today_orders(self.env, side="SELL", code=str(code).zfill(6), status_exclude=())
+        except Exception:
+            logger.exception("[SELL_SESSION_BLOCK][DURABLE_LOOKUP_FAIL] code=%s action=fail_closed", code)
+            return True, {"status": "LOOKUP_FAILED"}
+        session = str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower()
+        for row in rows or []:
+            if str(row.get("strategy") or "") != self.STRATEGY_NAME:
+                continue
+            if str(row.get("status") or "").upper() not in SELL_GUARD_STATES:
+                continue
+            row_cycle = str(row.get("position_cycle_id") or "")
+            if position_cycle_id and row_cycle and row_cycle != str(position_cycle_id):
+                continue
+            request = row.get("request_json") if isinstance(row.get("request_json"), dict) else {}
+            row_session = str(request.get("trade_session") or "").lower()
+            if row_session and row_session != session:
+                continue
+            prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
+            prior_status = str(row.get("status") or "").upper()
+            if prior_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
+                fresh = bool(self._authoritative_balance
+                             and self._authoritative_balance.freshness is BalanceFreshness.FRESH)
+                remaining = self._authoritative_balance.holding_qty(code) if self._authoritative_balance else 0
+                prior_submitted = int(request.get("submitted_qty") or row.get("qty") or 0)
+                prior_pre_qty = int(request.get("pre_order_holding_qty") or 0)
+                prior_was_partial = (
+                    prior_stage in {"TP1", "TP2", "PROFIT_PROTECT_PARTIAL_1", "DEFENSE_TRIM_1"}
+                    or (prior_pre_qty > 0 and 0 < prior_submitted < prior_pre_qty)
+                )
+                if (fresh and remaining > 0 and prior_was_partial
+                        and str(exit_stage or "").upper() == "FULL_EXIT"):
+                    continue
+                if (fresh and remaining > 0 and prior_stage and exit_stage
+                        and legal_next_exit_stage(prior_stage, exit_stage)):
+                    continue
+            # Pending/full-exit orders block regardless of a changing reason.
+            logger.info("[SELL_SESSION_BLOCK][DURABLE_SKIP] code=%s cycle=%s prior_order_id=%s",
+                        str(code).zfill(6), row_cycle, row.get("kis_odno") or row.get("order_id"))
+            return True, dict(row)
+        return False, None
 
     def _register_session_no_sellable(self, *, code: str, reason: str = "KIS_NO_SELLABLE_QTY") -> int:
         code_key = str(code or "").zfill(6)
@@ -10430,7 +10535,17 @@ class PB1Engine:
             "current_stop_price": _eh_stop_px,
         })
         # ─────────────────────────────────────────────────────────────────────
-        pre_order_holding_qty = int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        broker_position = self._authoritative_balance.position(cf.code) if self._authoritative_balance else None
+        pre_order_holding_qty = broker_position.qty if broker_position else int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        if broker_position and broker_position.qty > 0:
+            logger.warning("[PB1][BUY][BLOCK] code=%s reason=BUYABLE_EXISTING_BROKER_HOLDING snapshot_id=%s qty=%s",
+                           display_code, self._authoritative_balance.snapshot_id, broker_position.qty)
+            status["skipped"] = 1
+            status["skipped_reason"] = "BUYABLE_EXISTING_BROKER_HOLDING"
+            status["submit_terminal_status"] = "SKIPPED_BY_POLICY"
+            return status
+        baseline = (OrderBaseline.capture(self._authoritative_balance, cf.code, qty)
+                    if self._authoritative_balance else None)
         request_payload = {
             "entry_plan": plan,
             "features": cf.features,
@@ -10440,7 +10555,15 @@ class PB1Engine:
             "pre_order_holding_qty": pre_order_holding_qty,
             "requested_qty": int(qty or 0),
             "submitted_qty": int(qty or 0),
+            **(baseline.__dict__ if baseline else {
+                "balance_snapshot_id": None,
+                "pre_order_orderable_qty": int(gate_snapshot.get("orderable_qty") or 0),
+                "pre_order_avg_price": float(gate_snapshot.get("avg_price") or 0),
+                "order_intent_ts": self._now_kst.isoformat(),
+            }),
         }
+        logger.info("[ORDER][BASELINE] code=%s side=BUY snapshot_id=%s pre_qty=%s requested_qty=%s",
+                    cf.code, request_payload.get("balance_snapshot_id"), pre_order_holding_qty, qty)
         effective_client_order_key = cf.client_order_key or ""
         existing_order = self.orders_repo.get_order_by_client_order_key(self.env, effective_client_order_key) if hasattr(self.orders_repo, "get_order_by_client_order_key") and effective_client_order_key else None
         existing_status = str((existing_order or {}).get("status") or "").upper()
@@ -12501,6 +12624,24 @@ class PB1Engine:
             )
 
         code_key = str(code or "").zfill(6)
+        _position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
+        _cycle_id = str(pos.get("position_cycle_id") or _position_meta.get("position_cycle_id") or "") or None
+        exit_reason = str(exit_eval.primary_reason or "")
+        policy_exit_stage = exit_stage_for_reason(
+            exit_reason,
+            requested_sell_qty=int(strategy_qty or 0),
+            broker_qty_before=int(kis_qty or holding_qty or 0),
+            sell_pct=exit_eval_payload.get("router_sell_pct"),
+        )
+        durable_blocked, _prior_sell = self._durable_sell_block(
+            code=code_key,
+            position_cycle_id=_cycle_id,
+            exit_stage=policy_exit_stage,
+        )
+        if durable_blocked:
+            exit_eval_payload["order_skip_reasons"] = ["SELL_ALREADY_ACCEPTED_THIS_SESSION"]
+            exit_eval_payload["order_result"] = "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+            return exit_eval_payload
         snapshot_version = f"qty:{kis_qty}:sellable:{kis_sellable_qty}"
         if NO_SELLABLE_STICKY.blocked(trade_date=str(self._today), symbol=code,
                                       snapshot_version=snapshot_version, orderable_qty=kis_sellable_qty):
@@ -12596,8 +12737,8 @@ class PB1Engine:
             return exit_eval_payload
         orderable_qty = sell_qty
 
-        stage = exit_eval.primary_reason
-        reason_family = normalize_sell_reason_family(stage)
+        stage = policy_exit_stage
+        reason_family = normalize_sell_reason_family(exit_reason)
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
                            or f"sid:{sid}:mode:{mode}")
@@ -12689,7 +12830,7 @@ class PB1Engine:
             return exit_eval_payload
 
         exit_meta = {
-            "exit_reason": exit_eval.primary_reason,
+            "exit_reason": exit_reason,
             "exit_stage": stage,
             "close_action": exit_eval_payload.get("close_action"),
             "close_reason": exit_eval_payload.get("close_reason"),
@@ -12699,6 +12840,8 @@ class PB1Engine:
             "position_eod_action": pos.get("eod_action") or exit_eval_payload.get("eod_action"),
             "policy_version": pos.get("policy_version") or (exit_eval_payload.get("entry_exit_plan") or {}).get("policy_version"),
         }
+        sell_baseline = (OrderBaseline.capture(self._authoritative_balance, code, orderable_qty)
+                         if self._authoritative_balance else None)
         try:
             order_id, _created = self.orders_repo.create_intent_idempotent(
                 env=self.env,
@@ -12715,16 +12858,34 @@ class PB1Engine:
                 stage=stage,
                 client_order_key=client_key,
                 request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
+                              "exit_reason": exit_reason,
                               "reason_family": reason_family, "position_lifecycle_id": lifecycle_id,
+                              "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
+                              "exit_stage": stage,
                               "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
-                              "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {}},
+                              "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {},
+                              **(sell_baseline.__dict__ if sell_baseline else {
+                                  "balance_snapshot_id": None,
+                                  "pre_order_holding_qty": kis_qty,
+                                  "pre_order_orderable_qty": kis_sellable_qty,
+                                  "pre_order_avg_price": avg,
+                                  "requested_qty": orderable_qty,
+                                  "submitted_qty": orderable_qty,
+                                  "order_intent_ts": self._now_kst.isoformat(),
+                              })},
                 status="CREATED",
+                account_id=get_account_key(env=self.env, kis=self.kis),
+                portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or position_meta.get("portfolio_epoch_id") or "") or None,
+                position_cycle_id=_cycle_id,
             )
         except Exception:
             logger.exception("[PB1][EXIT][DB_FAIL] code=%s", display_code)
             if not self.dry_run:
                 raise
             return exit_eval_payload
+
+        logger.info("[ORDER][BASELINE] code=%s side=SELL snapshot_id=%s pre_qty=%s requested_qty=%s",
+                    code, sell_baseline.balance_snapshot_id if sell_baseline else None, kis_qty, orderable_qty)
 
         logger.info(
             "[EXIT][SUBMIT] code=%s name=%s qty=%s order_type=market family=%s reason=%s",
@@ -12840,10 +13001,13 @@ class PB1Engine:
                 price=float(mark or 0.0),
                 order_id=str(kis_odno or order_id or ""),
             )
+            logger.info("[SELL_SESSION_BLOCK][DURABLE_REGISTER] code=%s cycle=%s order_id=%s session=%s",
+                        code, _cycle_id or "", kis_odno or order_id,
+                        str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower())
             if hasattr(self.kis, "invalidate_balance_cache"):
                 self.kis.invalidate_balance_cache(reason=f"sell_ack:{code}", codes=[display_code])
-            self._balance_snapshot = None
-            self._balance_snapshot_source = None
+            # The snapshot is immutable for the lifetime of this engine/tick.
+            # The next engine obtains a fresh snapshot and reconciles the ACK.
             try:
                 self.orders_repo.mark_acked(self.env, kis_odno, resp)
                 logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
@@ -12968,9 +13132,13 @@ class PB1Engine:
         holdings_raw = list(holdings_for_exit or [])
         holdings_source = str((self._exit_holdings_meta or {}).get("source") or "unknown")
         logger.info("[EXIT][LOAD] holdings_raw=%s codes=%s source=%s", len(holdings_raw), [holding.code for holding in holdings_raw], holdings_source)
-        holdings_exit_scope = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
-        logger.info("[EXIT][SCOPE] holdings_exit_scope=%s codes=%s", len(holdings_exit_scope), [holding.code for holding in holdings_exit_scope])
-        existing_positions_count = len([holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0])
+        all_broker_holdings = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
+        kr_infinite_holdings = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) == "122630"]
+        holdings_exit_scope = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) != "122630"]
+        logger.info("[EXIT][SCOPE] broker_total=%s kr_inf_reserved=%s pb1_scope=%s codes=%s",
+                    len(all_broker_holdings), len(kr_infinite_holdings), len(holdings_exit_scope),
+                    [holding.code for holding in holdings_exit_scope])
+        existing_positions_count = len(holdings_exit_scope)
         if existing_positions_count > 0 and len(holdings_exit_scope) == 0:
             logger.error(
                 "[EXIT][INCONSISTENT_HOLDINGS] existing_positions=%s holdings_exit_scope=%s",
@@ -15619,7 +15787,13 @@ class PB1Engine:
 
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
-        self._balance_snapshot = holdings_snapshot
+        if holdings_snapshot is not self._balance_snapshot:
+            self._set_authoritative_balance(
+                holdings_snapshot,
+                source=str(self._balance_snapshot_source or cash_meta.get("source") or "resolved_balance"),
+                freshness=(self._authoritative_balance.freshness
+                           if self._authoritative_balance else BalanceFreshness.CACHED),
+            )
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary_raw = holdings_snapshot.get("output2")
         holdings_summary = _as_first_dict(holdings_summary_raw)

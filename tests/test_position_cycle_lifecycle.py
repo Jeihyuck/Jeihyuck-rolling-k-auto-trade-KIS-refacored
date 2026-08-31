@@ -184,3 +184,67 @@ def test_legacy_null_provenance_fills_are_excluded_and_remaining_basis_is_primar
     result = validate_active_cycle(pos, epoch_id="e", kis_qty=10, kis_avg=110, fills=fills)
     assert result.ok and result.reason == "OK"
     assert result.cycle_fill_avg == 100 and result.difference_pct == 0
+
+
+def test_imported_cycle_is_persisted_once_and_reused_across_ticks():
+    engine, positions = _repo()
+    schema = schema_for_engine(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.positions).values(
+            position_id="legacy-pos-oci", position_cycle_id="legacy-cycle-oci",
+            portfolio_epoch_id="legacy-epoch-oci", opened_at=datetime.now(timezone.utc),
+            position_origin="RECOVERY", env="practice", strategy="pb1_pullback_close",
+            sid=1, mode=1, code="010060", qty=14, avg_buy_price=271660,
+            total_cost=3803240, realized_pnl=0, status="OPEN",
+            max_price=397500, last_trail_stop=334107,
+            position_meta={"holding_bars": 68, "trading_days_held": 68},
+        ))
+    cycles = []
+    for _ in range(3):
+        row, created = positions.get_or_create_imported_cycle_for_kis_holding(
+            env="practice", strategy="pb1_pullback_close", account_id="acct-practice",
+            sid=1, mode=1, code="010060", market="J", qty=14, avg_price=271660,
+        )
+        cycles.append(str(row["position_cycle_id"]))
+    assert len(set(cycles)) == 1
+    with engine.begin() as conn:
+        open_rows = list(conn.execute(sa.select(schema.positions).where(
+            sa.and_(schema.positions.c.code == "010060", schema.positions.c.status == "OPEN"))).mappings())
+    assert len(open_rows) == 1
+    assert open_rows[0]["position_origin"] == "IMPORTED"
+    assert not str(open_rows[0]["position_cycle_id"]).startswith("legacy-cycle-")
+    assert open_rows[0]["entry_ts"] is None
+    assert open_rows[0]["last_trail_stop"] is None
+    assert open_rows[0]["position_meta"]["trail_eligible"] is False
+
+
+def test_cross_cycle_order_fill_cannot_supply_current_entry_timestamp():
+    engine, _ = _repo()
+    schema = schema_for_engine(engine)
+    epochs = PortfolioEpochsRepo(engine)
+    orders = OrdersRepo(engine)
+    identity = dict(env="practice", account_id="acct-corruption", sid=1, mode=1,
+                    strategy="pb1_pullback_close")
+    epoch_a = epochs.get_or_create_active(**identity)
+    order_id, _ = orders.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="BUY", ord_type="MARKET", qty=14,
+        limit_price=None, stage="ENTRY", client_order_key="corrupt-origin",
+        request_json={}, account_id="acct-corruption", portfolio_epoch_id=epoch_a,
+    )
+    epoch_b = epochs.start_new_epoch(**identity, reason="TEST_CURRENT_EPOCH")
+    cycle_b = str(__import__("uuid").uuid4())
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.fills).values(
+            fill_id=str(__import__("uuid").uuid4()), env="practice", order_id=order_id,
+            position_cycle_id=cycle_b, portfolio_epoch_id=epoch_b,
+            trade_id="corrupt-fill", broker_fill_id="corrupt-fill", code="010060",
+            market="J", side="BUY", qty=14, price=271660, fee=0, tax=0,
+            filled_at=datetime(2026, 5, 27, tzinfo=timezone.utc), raw_json={}, fill_meta_json={},
+        ))
+    latest = FillsRepo(engine).list_latest_buy_fills_by_cycles(
+        "practice", [{"code": "010060", "portfolio_epoch_id": epoch_b,
+                       "position_cycle_id": cycle_b, "sid": 1, "mode": 1}],
+        strategy="pb1_pullback_close", account_id="acct-corruption",
+    )
+    assert latest == {}

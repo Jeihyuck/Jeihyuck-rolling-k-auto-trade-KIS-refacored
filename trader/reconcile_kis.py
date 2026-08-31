@@ -114,6 +114,21 @@ def _holdings_index(rows: list[dict]) -> tuple[dict[str, int], dict[str, float]]
     return qty_by_code, avg_price_by_code
 
 
+def _broker_execution_price(response_json: dict) -> float | None:
+    """Return only a broker-reported execution price, never a position basis."""
+    candidates = [response_json]
+    for key in ("execution", "execution_detail", "ccld", "output", "_execution_detail"):
+        nested = response_json.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for payload in candidates:
+        for key in ("ccld_unpr", "exec_price", "execution_price", "fill_price", "avg_ccld_unpr"):
+            value = _to_float(payload.get(key))
+            if value is not None and value > 0:
+                return value
+    return None
+
+
 def _promote_open_buy_orders_from_holdings(
     *,
     env: str,
@@ -131,13 +146,13 @@ def _promote_open_buy_orders_from_holdings(
     for order in orders_repo.get_open_orders(env) or []:
         side = str(order.get("side") or "").upper()
         status = str(order.get("status") or "").upper()
-        if side != "BUY" or status not in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"}:
+        if side not in {"BUY", "SELL"} or status not in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "UNRESOLVED_ACK"}:
             continue
         code = _normalize_code(order.get("code"))
         if not code:
             continue
         holding_qty = int(qty_by_code.get(code) or 0)
-        if holding_qty <= 0:
+        if side == "BUY" and holding_qty <= 0:
             continue
 
         request_json = order.get("request_json") if isinstance(order.get("request_json"), dict) else {}
@@ -163,10 +178,11 @@ def _promote_open_buy_orders_from_holdings(
                 mode=int(order.get("mode") or 1),
                 code=code,
                 market=order.get("market"),
-                side="BUY",
+                side=side,
                 ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
                 qty=max(0, submitted_qty),
-                limit_price=_to_float(order.get("limit_price")) or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0),
+                limit_price=(None if side == "SELL" else (_to_float(order.get("limit_price"))
+                            or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0))),
                 stage=str(order.get("stage") or "RECONCILE"),
                 client_order_key=str(order.get("client_order_key") or f"{env}:{strategy}:{code}:promote").strip(),
                 kis_odno=str(order.get("kis_odno") or order.get("broker_order_id") or "").strip() or None,
@@ -195,8 +211,9 @@ def _promote_open_buy_orders_from_holdings(
             )
             continue
 
-        delta = int(holding_qty - int(pre_order_holding_qty or 0))
-        confirmed_fill_qty = max(0, min(delta, int(submitted_qty or 0)))
+        delta = (int(holding_qty - int(pre_order_holding_qty or 0)) if side == "BUY"
+                 else int(int(pre_order_holding_qty or 0) - holding_qty))
+        confirmed_fill_qty = max(0, delta)
         if delta <= 0:
             next_status = "ACKED"
         elif confirmed_fill_qty < int(submitted_qty or 0):
@@ -204,16 +221,17 @@ def _promote_open_buy_orders_from_holdings(
         else:
             next_status = "FILLED"
 
-        if confirmed_fill_qty > int(submitted_qty or 0):
+        if delta < 0 or confirmed_fill_qty > int(submitted_qty or 0):
             next_status = "RECONCILE_ERROR"
             confirmed_fill_qty = 0
 
-        fill_price = (
-            _to_float(order.get("limit_price"))
-            or _to_float(request_json.get("ORD_UNPR"))
-            or _to_float(response_json.get("avg_prvs"))
-            or float(avg_price_by_code.get(code) or 0.0)
+        broker_fill_price = _broker_execution_price(response_json)
+        fill_price = broker_fill_price if side == "SELL" else (
+            broker_fill_price or _to_float(order.get("limit_price"))
+            or _to_float(request_json.get("ORD_UNPR")) or float(avg_price_by_code.get(code) or 0.0)
         )
+        if side == "SELL" and confirmed_fill_qty > 0 and broker_fill_price is None:
+            next_status = "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"
         kis_odno = str(order.get("kis_odno") or order.get("broker_order_id") or "").strip() or None
         client_order_key = str(order.get("client_order_key") or f"{env}:{strategy}:{code}:promote").strip()
         order_time = order.get("acked_at") or order.get("submitted_at") or tick_ts
@@ -226,10 +244,10 @@ def _promote_open_buy_orders_from_holdings(
             mode=int(order.get("mode") or 1),
             code=code,
             market=order.get("market"),
-            side="BUY",
+            side=side,
             ord_type=str(order.get("ord_type") or "RECONCILE_PROMOTED"),
             qty=max(0, int(submitted_qty or 0)),
-            limit_price=fill_price,
+            limit_price=_to_float(order.get("limit_price")),
             stage=str(order.get("stage") or "RECONCILE"),
             client_order_key=client_order_key,
             kis_odno=kis_odno,
@@ -245,22 +263,25 @@ def _promote_open_buy_orders_from_holdings(
                 "submitted_qty": submitted_qty,
                 "requested_qty": requested_qty,
                 "confirmed_fill_qty": confirmed_fill_qty,
+                "confirmed_fill_price": broker_fill_price,
+                "fill_price_source": "BROKER_EXECUTION" if broker_fill_price is not None else "UNRESOLVED",
+                "realized_pnl_status": "CONFIRMED" if broker_fill_price is not None else "REALIZED_PNL_UNRESOLVED",
             },
             submitted_at=order.get("submitted_at") or order_time,
             acked_at=order_time,
         )
         promoted_orders += 1
 
-        if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"}:
+        if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
             fills_repo.upsert_fill(
                 env=env,
                 run_id=ctx_run_id,
                 order_id=str(order.get("order_id") or "") or None,
                 kis_odno=kis_odno,
-                trade_id=f"PROMOTE:{kis_odno or client_order_key}",
+                trade_id=f"PROMOTE:{side}:{kis_odno or client_order_key}",
                 code=code,
                 market=order.get("market"),
-                side="BUY",
+                side=side,
                 qty=confirmed_fill_qty,
                 price=float(fill_price or 0.0),
                 fee=0.0,
@@ -281,7 +302,8 @@ def _promote_open_buy_orders_from_holdings(
                     "entry_exit_plan": (request_json or {}).get("entry_exit_plan") or {},
                 },
                 fill_meta_json={
-                    "fill_source": "kis_holdings_fallback",
+                    "fill_source": "BROKER_EXECUTION" if broker_fill_price is not None else "kis_holdings_fallback",
+                    "price_confirmed": broker_fill_price is not None,
                     "promoted_from_status": status,
                     "ccld_status": "timeout",
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),

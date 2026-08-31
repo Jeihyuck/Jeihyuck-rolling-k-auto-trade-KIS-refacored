@@ -18,12 +18,14 @@ import json
 import logging
 import os
 import sys
+import time as time_mod
 from dataclasses import dataclass, asdict
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
 from trader.kis_wrapper import KisAPI, KisBalanceUnavailable, resolve_kr_balance_fail_soft
+from trader.execution_state import BalanceRecoveryState
 from trader.kr.calendar import resolve_kr_expected_as_of, resolve_kr_trade_date
 from trader.kr.artifacts import (
     validate_kr_prep_artifact,
@@ -462,6 +464,38 @@ def _assert_balance_available(session: str) -> dict[str, Any] | None:
             }
 
 
+def recover_temporary_balance(
+    session: str, initial: dict[str, Any], *, probe=None, sleep_fn=None,
+    now_fn=None, max_attempts: int | None = None,
+) -> dict[str, Any] | None:
+    """Keep PM alive in fail-closed recovery until a fresh balance succeeds."""
+    if session != "afternoon" or str(initial.get("status") or "").upper() not in {"WARN", "SAFE_STOP"}:
+        return initial
+    probe = probe or (lambda: _assert_balance_available(session))
+    sleep_fn = sleep_fn or time_mod.sleep
+    now_fn = now_fn or _now_kst
+    interval = max(1, int(os.getenv("KR_BALANCE_RECOVERY_INTERVAL_SEC", "60")))
+    max_attempts = max_attempts or max(1, int(os.getenv("KR_BALANCE_RECOVERY_MAX_ATTEMPTS", "120")))
+    recovery = BalanceRecoveryState(retry_interval_seconds=interval)
+    recovery.failed(now_fn())
+    os.environ.update(ENTRY_ALLOWED="0", ORDER_ALLOWED="0", EXIT_ALLOWED="0",
+                      KR_BALANCE_RECOVERY_ONLY="1")
+    for attempt in range(1, max_attempts + 1):
+        logger.warning("[SESSION][BALANCE_RECOVERY] state=%s retry=%s next_retry=%s entry_allowed=0 new_order_allowed=0",
+                       recovery.state, attempt, recovery.next_retry_at)
+        sleep_fn(interval)
+        result = probe()
+        if result is None:
+            recovery.recovered()
+            os.environ.update(ENTRY_ALLOWED="1", ORDER_ALLOWED="1", EXIT_ALLOWED="1",
+                              KR_BALANCE_RECOVERY_ONLY="0")
+            logger.info("[SESSION][BALANCE_RECOVERY] state=NORMAL retry=%s next_retry=none action=RESUME_FRESH_SNAPSHOT", attempt)
+            return None
+        recovery.failed(now_fn())
+    return {**initial, "status": "RETRYABLE_DEGRADED", "reason": "KIS_BALANCE_TIMEOUT",
+            "completed": False, "retryable": True, "exit_code": 75}
+
+
 
 
 
@@ -688,6 +722,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         return guarded
     infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
     balance_state = _stage(session, ctx.trade_date, ctx.expected_as_of, "balance_precheck", lambda: _assert_balance_available(session))
+    if balance_state is not None and session == "afternoon" and int(balance_state.get("exit_allowed", 0)) == 0:
+        balance_state = recover_temporary_balance(session, balance_state)
     if balance_state is not None:
         if balance_state.get("status") == "WARN" and int(balance_state.get("exit_allowed", 0)) == 1:
             os.environ["ENTRY_ALLOWED"] = str(int(balance_state.get("entry_allowed", 0)))
@@ -800,11 +836,13 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             completed = guard.completed
             retryable = guard.retryable
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
-    orders_intent = int(pb1_result.get("order_candidates", 0) or 0)
-    orders_ack = int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)
+    orders_intent = int(pb1_result.get("order_intents_created", pb1_result.get("order_candidates", 0)) or 0)
+    orders_submitted = int(pb1_result.get("broker_submitted", pb1_result.get("api_submitted", 0)) or 0)
+    orders_ack = int(pb1_result.get("broker_acked", pb1_result.get("accepted", 0)) or 0)
     ack_db_failed = int(pb1_result.get("ack_db_failed_count", pb1_result.get("ack_db_failed", 0)) or 0)
     balance_confirmed = int(pb1_result.get("balance_confirmed_count", pb1_result.get("balance_reconcile_count", 0)) or 0)
-    filled_confirmed = int(pb1_result.get("filled_confirmed_count", pb1_result.get("filled_confirmed", 0)) or 0)
+    filled_confirmed = int(pb1_result.get("fills_confirmed", pb1_result.get("filled_confirmed_count", pb1_result.get("filled_confirmed", 0))) or 0)
+    ack_without_fill = int(pb1_result.get("ack_without_confirmed_fill", 0) or 0)
     count_reconcile = reconcile_kr_order_counts(
         engine_order_count=orders_intent,
         broker_ack_count=orders_ack,
@@ -812,14 +850,14 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         ack_db_failed_count=ack_db_failed,
         balance_confirmed_count=balance_confirmed,
         filled_confirmed_count=filled_confirmed,
-        unresolved_ack_count=pb1_result.get("unresolved_ack_count"),
+        unresolved_ack_count=pb1_result.get("unresolved_acks", pb1_result.get("unresolved_ack_count")),
     )
     _stage(session, ctx.trade_date, ctx.expected_as_of, "daily_report_build", lambda: None)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_ack, blocked)
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s ack_without_fill=%s unresolved_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, ack_without_fill, pb1_result.get("unresolved_acks", 0), blocked)
     else:
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_ack, blocked)
-    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_ack": orders_ack, **count_reconcile}
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s ack_without_fill=%s unresolved_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, ack_without_fill, pb1_result.get("unresolved_acks", 0), blocked)
+    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_submitted": orders_submitted, "orders_ack": orders_ack, "fills_confirmed": filled_confirmed, "ack_without_confirmed_fill": ack_without_fill, "unresolved_ack": int(pb1_result.get("unresolved_acks", 0) or 0), **count_reconcile}
     if lock_unavailable:
         result.update(lock_unavailable_result_fields())
     if session == "close":
