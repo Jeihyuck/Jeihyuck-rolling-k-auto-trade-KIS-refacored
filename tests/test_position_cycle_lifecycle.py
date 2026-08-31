@@ -216,3 +216,35 @@ def test_imported_cycle_is_persisted_once_and_reused_across_ticks():
     assert open_rows[0]["entry_ts"] is None
     assert open_rows[0]["last_trail_stop"] is None
     assert open_rows[0]["position_meta"]["trail_eligible"] is False
+
+
+def test_cross_cycle_order_fill_cannot_supply_current_entry_timestamp():
+    engine, _ = _repo()
+    schema = schema_for_engine(engine)
+    epochs = PortfolioEpochsRepo(engine)
+    orders = OrdersRepo(engine)
+    identity = dict(env="practice", account_id="acct-corruption", sid=1, mode=1,
+                    strategy="pb1_pullback_close")
+    epoch_a = epochs.get_or_create_active(**identity)
+    order_id, _ = orders.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="BUY", ord_type="MARKET", qty=14,
+        limit_price=None, stage="ENTRY", client_order_key="corrupt-origin",
+        request_json={}, account_id="acct-corruption", portfolio_epoch_id=epoch_a,
+    )
+    epoch_b = epochs.start_new_epoch(**identity, reason="TEST_CURRENT_EPOCH")
+    cycle_b = str(__import__("uuid").uuid4())
+    with engine.begin() as conn:
+        conn.execute(sa.insert(schema.fills).values(
+            fill_id=str(__import__("uuid").uuid4()), env="practice", order_id=order_id,
+            position_cycle_id=cycle_b, portfolio_epoch_id=epoch_b,
+            trade_id="corrupt-fill", broker_fill_id="corrupt-fill", code="010060",
+            market="J", side="BUY", qty=14, price=271660, fee=0, tax=0,
+            filled_at=datetime(2026, 5, 27, tzinfo=timezone.utc), raw_json={}, fill_meta_json={},
+        ))
+    latest = FillsRepo(engine).list_latest_buy_fills_by_cycles(
+        "practice", [{"code": "010060", "portfolio_epoch_id": epoch_b,
+                       "position_cycle_id": cycle_b, "sid": 1, "mode": 1}],
+        strategy="pb1_pullback_close", account_id="acct-corruption",
+    )
+    assert latest == {}

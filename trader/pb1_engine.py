@@ -2736,12 +2736,11 @@ class PB1Engine:
         self._warned_keys: set[str] = set()
         self._balance_price_map: Dict[str, float] = {}
         self._balance_cost: float | None = None
-        self._balance_snapshot: dict | None = balance_snapshot
-        self._balance_snapshot_source: str | None = balance_source
-        self._authoritative_balance = (
-            BrokerBalanceSnapshot.from_kis(balance_snapshot, source=balance_source or "runner")
-            if isinstance(balance_snapshot, dict) else None
-        )
+        self._balance_snapshot: dict | None = None
+        self._balance_snapshot_source: str | None = None
+        self._authoritative_balance: BrokerBalanceSnapshot | None = None
+        if isinstance(balance_snapshot, dict):
+            self._set_authoritative_balance(balance_snapshot, source=balance_source or "runner")
         if balance_snapshot is not None:
             if balance_source == "api":
                 self.balance_api_calls += 1
@@ -4467,6 +4466,7 @@ class PB1Engine:
             )
             try:
                 snapshot = self.kis.get_balance_cached(force=True)
+                self._set_authoritative_balance(snapshot, source="forced_refresh_output2_none")
             except Exception as exc:
                 raise RuntimeError("Balance refetch failed after output2 None") from exc
         _log_balance_snapshot_shape(snapshot, label="input")
@@ -4476,6 +4476,7 @@ class PB1Engine:
                 try:
                     refreshed_snapshot, _source = self.kis.get_balance_cached(force=True, return_source=True)
                     snapshot = refreshed_snapshot
+                    self._set_authoritative_balance(snapshot, source=_source or "forced_refresh_sanitized")
                 except Exception as exc:
                     raise RuntimeError("Balance refresh failed after sanitized snapshot") from exc
 
@@ -4498,6 +4499,7 @@ class PB1Engine:
         if self.kis:
             try:
                 balance_resp = self.kis.get_balance_cached(force=True)
+                self._set_authoritative_balance(balance_resp, source="forced_refresh_cash")
                 _log_balance_snapshot_shape(balance_resp, label="force_refresh")
                 cash, meta = self._parse_available_cash_snapshot(balance_resp)
             except Exception:
@@ -5742,6 +5744,16 @@ class PB1Engine:
                 stage or build_stage_label(session_kind=os.getenv("PB1_SESSION_KIND"), phase="entry"),
             )
 
+    def _set_authoritative_balance(self, snapshot: dict, *, source: str,
+                                   fetched_at: datetime | None = None) -> None:
+        old_id = self._authoritative_balance.snapshot_id if self._authoritative_balance else "none"
+        authoritative = BrokerBalanceSnapshot.from_kis(snapshot, source=source, fetched_at=fetched_at)
+        self._balance_snapshot = snapshot
+        self._balance_snapshot_source = source
+        self._authoritative_balance = authoritative
+        logger.info("[BALANCE][AUTHORITATIVE_REPLACE] old_snapshot_id=%s new_snapshot_id=%s source=%s holdings_count=%s",
+                    old_id, authoritative.snapshot_id, source, len(authoritative.holdings_by_code))
+
     def _fetch_holdings_snapshot(self) -> dict:
         # ✅ DIAG bypass: skip balance check when account params invalid
         skip_balance = os.getenv("SKIP_BALANCE_CHECK", "0") == "1"
@@ -5761,7 +5773,6 @@ class PB1Engine:
                     "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
                     source,
                 )
-            self._balance_snapshot_source = "tick_cache"
             return self._balance_snapshot
         fail_soft = (
             os.getenv("PB1_BALANCE_FAIL_SOFT", "0") == "1"
@@ -5772,13 +5783,12 @@ class PB1Engine:
                 "[BALANCE][FAIL_SOFT][ENGINE_NO_REQUERY] reason=%s action=return_empty_snapshot",
                 getattr(self, "entry_block_reason", None),
             )
-            self._balance_snapshot = {
+            self._set_authoritative_balance({
                 "output1": [],
                 "output2": [{"dnca_tot_amt": "0", "ord_psbl_cash": "0"}],
                 "_source": "engine_fail_soft_empty",
                 "_fail_soft": True,
-            }
-            self._balance_snapshot_source = "engine_fail_soft_empty"
+            }, source="engine_fail_soft_empty")
             return self._balance_snapshot
         if not self.kis:
             return {}
@@ -5793,12 +5803,7 @@ class PB1Engine:
                 "[CLOSE][BALANCE_SOURCE] source=cached_kis_balance stale=1 reason=kis_timeout_or_cache source_detail=%s",
                 source,
             )
-        self._balance_snapshot = snap
-        self._authoritative_balance = BrokerBalanceSnapshot.from_kis(snap, source=source)
-        logger.info("[BALANCE][SNAPSHOT] snapshot_id=%s fetched_at=%s holdings_count=%s",
-                    self._authoritative_balance.snapshot_id,
-                    self._authoritative_balance.fetched_at.isoformat(),
-                    len(self._authoritative_balance.holdings_by_code))
+        self._set_authoritative_balance(snap, source=source)
         return self._balance_snapshot
 
     def _client_order_key(self, code: str, mode: int, side: str, window_tag: str, stage: str) -> str:
@@ -12603,7 +12608,12 @@ class PB1Engine:
         _position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         _cycle_id = str(pos.get("position_cycle_id") or _position_meta.get("position_cycle_id") or "") or None
         exit_reason = str(exit_eval.primary_reason or "")
-        policy_exit_stage = exit_stage_for_reason(exit_reason)
+        policy_exit_stage = exit_stage_for_reason(
+            exit_reason,
+            requested_sell_qty=int(strategy_qty or 0),
+            broker_qty_before=int(kis_qty or holding_qty or 0),
+            sell_pct=exit_eval_payload.get("router_sell_pct"),
+        )
         durable_blocked, _prior_sell = self._durable_sell_block(
             code=code_key,
             position_cycle_id=_cycle_id,
@@ -12709,7 +12719,7 @@ class PB1Engine:
         orderable_qty = sell_qty
 
         stage = policy_exit_stage
-        reason_family = normalize_sell_reason_family(stage)
+        reason_family = normalize_sell_reason_family(exit_reason)
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
                            or f"sid:{sid}:mode:{mode}")
@@ -12829,6 +12839,7 @@ class PB1Engine:
                 stage=stage,
                 client_order_key=client_key,
                 request_json={"reasons": [exit_eval.primary_reason] + list(exit_eval.secondary_reasons),
+                              "exit_reason": exit_reason,
                               "reason_family": reason_family, "position_lifecycle_id": lifecycle_id,
                               "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
                               "exit_stage": stage,
@@ -15757,7 +15768,11 @@ class PB1Engine:
 
         holdings_snapshot = self._fetch_holdings_snapshot()
         holdings_snapshot, available_cash_krw, cash_meta = self._resolve_holdings_snapshot_with_cash(holdings_snapshot)
-        self._balance_snapshot = holdings_snapshot
+        if holdings_snapshot is not self._balance_snapshot:
+            self._set_authoritative_balance(
+                holdings_snapshot,
+                source=str(self._balance_snapshot_source or cash_meta.get("source") or "resolved_balance"),
+            )
         holdings_rows = holdings_snapshot.get("output1") or []
         holdings_summary_raw = holdings_snapshot.get("output2")
         holdings_summary = _as_first_dict(holdings_summary_raw)

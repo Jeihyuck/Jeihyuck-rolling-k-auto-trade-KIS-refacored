@@ -4049,6 +4049,8 @@ class FillsRepo:
                 self._schema.fills.c.code == code,
                 self._schema.fills.c.portfolio_epoch_id == epoch,
                 self._schema.fills.c.position_cycle_id == cycle,
+                self._schema.orders.c.position_cycle_id == self._schema.fills.c.position_cycle_id,
+                self._schema.orders.c.portfolio_epoch_id == self._schema.fills.c.portfolio_epoch_id,
                 self._schema.orders.c.strategy == strategy,
                 self._schema.orders.c.sid == sid,
                 self._schema.orders.c.mode == mode,

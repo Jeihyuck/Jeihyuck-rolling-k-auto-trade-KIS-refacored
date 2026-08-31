@@ -9,6 +9,7 @@ from trader.db.schema import schema_for_engine
 from trader.pb1_engine import PB1Engine
 from trader.window_router import WindowDecision
 from trader.execution_state import exit_stage_for_reason
+from trader.kr.pb1_stability import normalize_sell_reason_family
 
 
 class FakeKis:
@@ -156,6 +157,34 @@ def test_filled_tp1_allows_tp2_only_with_fresh_remaining_balance():
     assert not blocked
     blocked_full, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="FULL_EXIT")
     assert blocked_full
+
+
+def test_production_partial_reason_stage_mapping_and_reason_family():
+    assert exit_stage_for_reason("ABS_TP1_10PCT") == "TP1"
+    assert exit_stage_for_reason("PROFIT_PROTECT_8PCT") == "PROFIT_PROTECT_PARTIAL_1"
+    assert exit_stage_for_reason("DEFENSE_RISK_OFF_TRIM") == "DEFENSE_TRIM_1"
+    assert exit_stage_for_reason("EXIT_HARD_STOP") == "FULL_EXIT"
+    assert normalize_sell_reason_family("EXIT_HARD_STOP") == "HARD_STOP"
+    assert normalize_sell_reason_family("TRAIL_STOP_HIT") == "TRAIL_STOP_HIT"
+    assert normalize_sell_reason_family("PROFIT_PROTECT_8PCT") == "PROFIT_CAPTURE"
+
+
+def test_profit_protect_fill_allows_later_emergency_full_exit():
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    OrdersRepo(db).create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=None, stage="PROFIT_PROTECT_PARTIAL_1", client_order_key="profit-filled",
+        request_json={"exit_reason": "PROFIT_PROTECT_8PCT", "trade_session": "day"},
+        status="FILLED", position_cycle_id="cycle-x",
+    )
+    balance = {"output1": [{"pdno": "010060", "hldg_qty": "7", "ord_psbl_qty": "7",
+                             "pchs_avg_pric": "271660"}], "output2": [{}]}
+    engine, _ = _make_engine(db, FakeKis(), balance)
+    blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x",
+                                             exit_stage=exit_stage_for_reason("EXIT_HARD_STOP"))
+    assert not blocked
 
 
 def _pos(*, code: str, qty: int, kis_qty: int, orderable_qty: int) -> dict:

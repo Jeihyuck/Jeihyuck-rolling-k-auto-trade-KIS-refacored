@@ -31,17 +31,28 @@ PENDING_SELL_STATES = frozenset({"SUBMITTED", "ACKED", "ACCEPTED", "UNRESOLVED_A
                                  "PARTIAL_FILLED", "ACKED_IDEMPOTENT_RECOVERED"})
 
 
-def exit_stage_for_reason(reason: str | None) -> str:
+def exit_stage_for_reason(reason: str | None, *, requested_sell_qty: int | None = None,
+                          broker_qty_before: int | None = None,
+                          sell_pct: float | None = None) -> str:
     """Map decision reasons to policy stages; reasons never define dedupe identity."""
     value = str(reason or "").upper()
-    if value in {"TP1", "TAKE_PROFIT_1", "ABS_TP1"}:
+    if requested_sell_qty is not None and broker_qty_before is not None:
+        if int(requested_sell_qty) >= int(broker_qty_before) > 0:
+            return "FULL_EXIT"
+    partial = ((sell_pct is not None and 0 < float(sell_pct) < 1)
+               or (requested_sell_qty is not None and broker_qty_before is not None
+                   and 0 < int(requested_sell_qty) < int(broker_qty_before)))
+    if value in {"TP1", "TAKE_PROFIT_1", "ABS_TP1", "ABS_TP1_10PCT",
+                 "SWING_TP1_R", "SWING_TP1_PCT", "CORE_TP1_R"}:
         return "TP1"
-    if value in {"TP2", "TAKE_PROFIT_2", "ABS_TP2"}:
+    if value in {"TP2", "TAKE_PROFIT_2", "ABS_TP2", "SWING_TP2_R",
+                 "SWING_TP2_PCT", "CORE_TP2_R"}:
         return "TP2"
-    if value.startswith("PROFIT_PROTECT_PARTIAL_1"):
-        return "PROFIT_PROTECT_PARTIAL_1"
-    if value.startswith("DEFENSE_TRIM_1"):
-        return "DEFENSE_TRIM_1"
+    if value in {"PROFIT_PROTECT_8PCT", "SWING_PROFIT_PROTECT_GIVEBACK",
+                 "MOMENTUM_PROFIT_PROTECT_GIVEBACK"} or value.startswith("PROFIT_PROTECT_PARTIAL_1"):
+        return "PROFIT_PROTECT_PARTIAL_1" if partial or requested_sell_qty is None else "FULL_EXIT"
+    if value in {"DEFENSE_RISK_OFF_TRIM", "CLUSTER_EXPOSURE_TRIM"} or value.startswith("DEFENSE_TRIM_1"):
+        return "DEFENSE_TRIM_1" if partial or requested_sell_qty is None else "FULL_EXIT"
     return "FULL_EXIT"
 
 
@@ -144,7 +155,7 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
         "partial_fills": sum(s == "PARTIAL_FILLED" for s in states),
         "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in states),
         "cancelled": sum(s == "CANCELLED" for s in states),
-        "unresolved_acks": sum(s in {"ACKED", "ACCEPTED", "UNRESOLVED_ACK"} for s in states),
+        "unresolved_acks": sum(s == "UNRESOLVED_ACK" for s in states),
     }
     result["by_side"] = {}
     for side in ("BUY", "SELL"):
@@ -159,7 +170,7 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
             "partial_fills": sum(s == "PARTIAL_FILLED" for s in side_states),
             "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in side_states),
             "cancelled": sum(s == "CANCELLED" for s in side_states),
-            "unresolved_acks": sum(s in {"ACKED", "ACCEPTED", "UNRESOLVED_ACK"} for s in side_states),
+            "unresolved_acks": sum(s == "UNRESOLVED_ACK" for s in side_states),
         }
     return result
 

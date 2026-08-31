@@ -836,11 +836,12 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
             completed = guard.completed
             retryable = guard.retryable
     logger.info("[KR_SESSION][DONE] session=%s status=%s exit_code=%s reason=%s completed=%s retryable=%s sell_orders_ack=%s entry_status=%s entry_reason=%s", session, status, exit_code, summary_reason, completed, retryable, sell_orders_ack, entry_status, entry_reason)
-    orders_intent = int(pb1_result.get("order_candidates", 0) or 0)
-    orders_ack = int(pb1_result.get("api_submitted", pb1_result.get("sell_orders_ack", 0)) or 0)
+    orders_intent = int(pb1_result.get("order_intents_created", pb1_result.get("order_candidates", 0)) or 0)
+    orders_submitted = int(pb1_result.get("broker_submitted", pb1_result.get("api_submitted", 0)) or 0)
+    orders_ack = int(pb1_result.get("broker_acked", pb1_result.get("accepted", 0)) or 0)
     ack_db_failed = int(pb1_result.get("ack_db_failed_count", pb1_result.get("ack_db_failed", 0)) or 0)
     balance_confirmed = int(pb1_result.get("balance_confirmed_count", pb1_result.get("balance_reconcile_count", 0)) or 0)
-    filled_confirmed = int(pb1_result.get("filled_confirmed_count", pb1_result.get("filled_confirmed", 0)) or 0)
+    filled_confirmed = int(pb1_result.get("fills_confirmed", pb1_result.get("filled_confirmed_count", pb1_result.get("filled_confirmed", 0))) or 0)
     count_reconcile = reconcile_kr_order_counts(
         engine_order_count=orders_intent,
         broker_ack_count=orders_ack,
@@ -848,14 +849,14 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         ack_db_failed_count=ack_db_failed,
         balance_confirmed_count=balance_confirmed,
         filled_confirmed_count=filled_confirmed,
-        unresolved_ack_count=pb1_result.get("unresolved_ack_count"),
+        unresolved_ack_count=pb1_result.get("unresolved_acks", pb1_result.get("unresolved_ack_count")),
     )
     _stage(session, ctx.trade_date, ctx.expected_as_of, "daily_report_build", lambda: None)
     if summary_reason == "CLOSE_BALANCE_UNCONFIRMED":
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_ack, blocked)
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s unresolved_ack=%s blocked=%s balance_state=TIMEOUT", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, pb1_result.get("unresolved_acks", 0), blocked)
     else:
-        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_ack, blocked)
-    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_ack": orders_ack, **count_reconcile}
+        logger.info("[RUN_SUMMARY][RESULT] market=KR session=%s status=%s reason=%s orders_intent=%s orders_submitted=%s orders_ack=%s fills_confirmed=%s unresolved_ack=%s blocked=%s", session, status, summary_reason, orders_intent, orders_submitted, orders_ack, filled_confirmed, pb1_result.get("unresolved_acks", 0), blocked)
+    result = {"status": status, "final_status": status, "reason": summary_reason, "exit_code": exit_code, "completed": bool(completed), "retryable": bool(retryable), "engine_started": bool(pb1_result_present and not lock_unavailable), "pb1_result_present": bool(pb1_result_present), "orders_intent": orders_intent, "orders_submitted": orders_submitted, "orders_ack": orders_ack, "fills_confirmed": filled_confirmed, "unresolved_ack": int(pb1_result.get("unresolved_acks", 0) or 0), **count_reconcile}
     if lock_unavailable:
         result.update(lock_unavailable_result_fields())
     if session == "close":

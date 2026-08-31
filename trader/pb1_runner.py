@@ -2744,6 +2744,10 @@ def _write_session_result_file(payload: dict[str, Any], *, engine=None, env: str
             payload["buy_orders_ack"] = int(durable["by_side"]["BUY"]["broker_acked"])
             payload["sell_orders_ack"] = int(durable["by_side"]["SELL"]["broker_acked"])
             payload["api_submitted"] = int(durable["broker_submitted"])
+            payload["accepted"] = int(durable["broker_acked"])
+            payload["filled_confirmed"] = int(durable["fills_confirmed"])
+            payload["filled_confirmed_count"] = int(durable["fills_confirmed"])
+            payload["unresolved_ack_count"] = int(durable["unresolved_acks"])
             logger.info("[PB1][SESSION_METRICS][DURABLE] intents=%s submitted=%s acked=%s fills=%s unresolved=%s",
                         durable["order_intents_created"], durable["broker_submitted"], durable["broker_acked"],
                         durable["fills_confirmed"], durable["unresolved_acks"])
@@ -6785,7 +6789,7 @@ def run_once(
                             "momentum_pass": len(entry_signals_result.get("momentum", [])),
                         }
                         logger.info(
-                            "[ENTRY_SCAN][KR_CONTEXT_UPDATED] scanner_passed=%s pullback=%s breakout=%s momentum=%s",
+                            "[ENTRY_SCAN][DIAGNOSTIC_ONLY] authoritative=0 scanner_passed=%s pullback=%s breakout=%s momentum=%s",
                             len(_all_scan_codes),
                             len(entry_signals_result.get("pullback", [])),
                             len(entry_signals_result.get("breakout", [])),
@@ -7318,6 +7322,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
     loop_interval = _parse_int_env("PB1_LOOP_INTERVAL_SEC", 60)
     _run_loop_minutes, _loop_max_minutes, max_seconds, _ = _resolve_loop_limits()
     now = _get_now_kst()
+    session_started_at = now
     session_kind = _resolve_session_kind()
     session_end_dt = _resolve_session_end_dt(now)
     loop_deadline = session_end_dt
@@ -7980,7 +7985,7 @@ def _run_loop(*, args: argparse.Namespace) -> None:
             "filled_confirmed": int(session_metrics.get("filled_confirmed", 0) or 0),
             "rejected": int(session_metrics.get("rejected", 0) or 0),
             "skipped": int(session_metrics.get("skipped", 0) or 0),
-        }, engine=engine, env=ctx.env, start_at=now)
+        }, engine=engine, env=ctx.env, start_at=session_started_at, end_at=_get_now_kst())
     finally:
         _finish_session_guard(
             runs_repo=runs_repo,
