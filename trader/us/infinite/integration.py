@@ -236,7 +236,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     regime, multiplier, int(entry_allowed), decision.notional, decision.reason)
         calculated_return = ((broker.price / broker.average_price) - 1
                              if broker.average_price > 0 and broker.price > 0 else None)
-        logger.info("[TQQQ_INF][FULL_EXIT] holding_qty=%s orderable_qty=%s pending_sell=%s broker_avg=%s executable_price=%s calculated_return=%s target_return=%s requested_full_exit_qty=%s cycle_id=%s action=%s block_reason=%s",
+        decision_marker = "FULL_EXIT" if decision.action == Action.SELL and int(decision.qty or 0) >= int(broker.qty or 0) else "DECISION_CONTEXT"
+        logger.info("[TQQQ_INF][%s] holding_qty=%s orderable_qty=%s pending_sell=%s broker_avg=%s executable_price=%s calculated_return=%s target_return=%s requested_full_exit_qty=%s cycle_id=%s action=%s block_reason=%s", decision_marker,
                     broker.qty, broker.orderable_qty, int(pending_sell), broker.average_price, broker.price,
                     calculated_return, config.take_profit_pct, decision.qty, getattr(state, "cycle_id", None),
                     decision.action.value, decision.reason if decision.action != Action.SELL else "")

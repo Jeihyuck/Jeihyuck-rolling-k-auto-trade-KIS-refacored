@@ -651,6 +651,21 @@ def route_order(
     )
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
+    from trader.us.execution.order_economics import normalize_order_intent_economics
+    old_notional = intent.get("notional_usd")
+    expected_notional = qty * price if price > 0 else float(old_notional or 0)
+    normalization_provenance = (intent.get("meta") or {}).get("economics_normalizations") or []
+    if price > 0 and old_notional is not None and abs(float(old_notional) - expected_notional) > 0.01 and not normalization_provenance:
+        logger.error("[US_ORDER][ECONOMICS_INVARIANT_FAIL] qty=%s price=%s notional=%s expected=%s action=fail_closed",
+                     qty, price, old_notional, expected_notional)
+        return {"status": "BLOCKED", "reason": "order_economics_invariant_mismatch", "broker_submit": False, "intent": intent}
+    normalize_order_intent_economics(intent, executable_price=price, reason="pre_risk_gate")
+    if old_notional is None or abs(float(old_notional or 0) - float(intent["notional_usd"])) > 0.01:
+        logger.warning(
+            "[US_ORDER][ECONOMICS_NORMALIZED] old_qty=%s new_qty=%s old_notional=%s new_notional=%s reason=pre_risk_gate",
+            qty, intent["qty"], old_notional, intent["notional_usd"],
+        )
+    qty = int(intent["qty"])
     exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
     if side == "SELL":
         exchange = enrich_sell_exchange(intent, kis_client, context)

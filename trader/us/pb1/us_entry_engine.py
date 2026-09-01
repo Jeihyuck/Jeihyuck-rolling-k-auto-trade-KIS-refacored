@@ -210,6 +210,16 @@ def score_symbol(symbol: str, daily_prices: list[dict], current_price: dict) -> 
 
 
 def _resolve_entry_signal_type(entry_meta: dict | None) -> str:
+    from trader.us.pb1.us_explain import normalize_us_entry_style
+    canonical = normalize_us_entry_style(
+        (entry_meta or {}).get("entry_style_selected") or (entry_meta or {}).get("entry_style")
+    )
+    canonical_signal = {
+        "ENTRY_PULLBACK": "pullback", "ENTRY_BREAKOUT": "breakout",
+        "ENTRY_MOMENTUM": "momentum", "ENTRY_VCP": "vcp",
+    }.get(canonical)
+    if canonical_signal:
+        return canonical_signal
     """entry_meta에서 entry_signal_type을 추론한다.
 
     중요: entry_signal_type (pullback/breakout/momentum)은

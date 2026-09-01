@@ -1094,6 +1094,7 @@ def run_trade_tick(
     Returns:
         {"status": "OK"|"SKIP"|"ERROR"|"OK_WITH_WARNINGS", ...}
     """
+    tick_started_at = time.monotonic()
     logger.info(
         "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s entry_can_proceed=%d exit_can_proceed=%d",
         session, env, offline, run_mode, signal_only, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)),
@@ -1712,6 +1713,9 @@ def run_trade_tick(
         active_tick_id=tick_id, active_session_run_id=session_run_id,
         active_session_generation=int(session_generation), active_session_state_path=active_session_state_path,
         blocked_symbol_sides={(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2},
+        prep_status=dict(prep_status_cache) if prep_status_cache is not None else None,
+        locked_watchlist=list(locked_watchlist_cache) if locked_watchlist_cache is not None else None,
+        deadline=tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0),
     )
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
@@ -3274,7 +3278,38 @@ def run_trade_tick(
     )
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
+    tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
+    latency_metrics = {
+        "tick_total_ms": tick_total_ms,
+        "balance_snapshot_ms": float(tick_context.metrics.get("balance_snapshot_ms", 0)),
+        "balance_snapshot_logical_calls": 1 if should_reconcile_balance else 0,
+        "balance_http_calls": int((kis_temp_errors_by_api.get("GET_inquire-balance") or {}).get("normal_call_count", 0) or 0),
+        "fill_fetch_ms": float(tick_context.metrics.get("fill_fetch_ms", 0)),
+        "fill_fetch_logical_calls": 0 if offline else 1,
+        "fill_http_calls": int((kis_temp_errors_by_api.get("GET_inquire-ccnl") or {}).get("normal_call_count", 0) or 0),
+        "price_fetch_ms": float(tick_context.metrics.get("price_fetch_ms", 0)),
+        "price_http_calls": int(locals().get("entry_generation_diagnostics", {}).get("price_lookup_used", 0)),
+        "psamount_ms": float(tick_context.metrics.get("psamount_ms", 0)),
+        "psamount_http_calls": int(tick_context.counters.get("psamount_http_calls", 0)),
+        "prep_status_ms": float(tick_context.metrics.get("prep_status_ms", 0)),
+        "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
+        "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
+        "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
+        "fill_rows_received": len(fills_today),
+        "fill_rows_changed": int(fill_save_result.get("changed", fill_save_result.get("inserted", 0)) or 0),
+        "fill_rows_persisted": int(fill_save_result.get("inserted", fill_save_result.get("saved", 0)) or 0),
+        "exit_engine_ms": float(tick_context.metrics.get("exit_engine_ms", 0)),
+        "market_state_ms": float(tick_context.metrics.get("market_state_ms", 0)),
+        "tqqq_infinite_ms": float(tick_context.metrics.get("tqqq_infinite_ms", 0)),
+        "entry_engine_ms": float(tick_context.metrics.get("entry_engine_ms", 0)),
+        "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
+        "order_route_ms": float(tick_context.metrics.get("order_route_ms", 0)),
+    }
+    logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
+                tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
     return {
+        **latency_metrics,
         "status": status,
         "reason": primary_reject_reason or ("entry_degraded_exit_routed" if exit_routed_after_entry_degraded else ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none")),
         "primary_reject_reason": primary_reject_reason,

@@ -29,6 +29,17 @@ datetime = dt  # backward-compatible module-level name; avoid function-local imp
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def attribute_session_fills(orders: list[dict], broker_fills: list[dict], *, session: str, session_run_id: str) -> dict:
+    """Attribute cumulative broker evidence only to orders submitted by this session."""
+    session_orders = [row for row in orders or [] if str(row.get("session") or "").lower() == session.lower()
+                      and str(row.get("session_run_id") or "") == str(session_run_id)]
+    fill_ids = {str(row.get("canonical_order_no") or row.get("order_no") or "") for row in broker_fills or []
+                if int(row.get("filled_qty") or row.get("qty") or 0) > 0}
+    order_ids = [str(row.get("canonical_order_no") or row.get("order_no") or "") for row in session_orders]
+    return {"session_fills_count": sum(1 for value in order_ids if value and value in fill_ids),
+            "unresolved_order_count": sum(1 for value in order_ids if not value or value not in fill_ids)}
 _received_signal: int | None = None
 _last_liveness_event = ""
 _exit_code: int | None = None
@@ -1362,6 +1373,14 @@ def run_trade_session(
                         "timeout_sec": tick_timeout_sec,
                         "tick": tick_count,
                         "timeout_reconcile": timeout_reconcile,
+                        # A failed tick/session and a broker-confirmed fill are
+                        # independent facts.  Never turn confirmed evidence
+                        # into an authoritative zero merely because the worker
+                        # timed out.
+                        "fills_count": int(timeout_reconcile.get("broker_confirmed_count", 0) or 0),
+                        "session_fills_count": int(timeout_reconcile.get("broker_confirmed_count", 0) or 0),
+                        "fill_source_status": "OK" if timeout_reconcile.get("status") != "ERROR" else "TEMP_ERROR",
+                        "report_consistency": "OK" if timeout_reconcile.get("status") != "ERROR" else "DEGRADED",
                     })
                     final_tick = results[-1]
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_WARN_TIMEOUT", status=timeout_status, timeout_sec=tick_timeout_sec, consecutive_tick_timeouts=consecutive_tick_timeouts)

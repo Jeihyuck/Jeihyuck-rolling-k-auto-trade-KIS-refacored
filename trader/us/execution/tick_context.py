@@ -6,6 +6,7 @@ from threading import Event
 from typing import Any
 import json
 from pathlib import Path
+import time
 
 
 @dataclass
@@ -31,12 +32,39 @@ class TickExecutionContext:
     counters: dict[str, int] = field(default_factory=dict)
     active_session_state_path: str | None = None
     blocked_symbol_sides: set[tuple[str, str]] = field(default_factory=set)
+    balance_snapshot_at: float | None = None
+    fills_snapshot_at: float | None = None
+    price_cache: dict[tuple[str, str], Any] = field(default_factory=dict)
+    psamount_cache: dict[tuple[str, str, float], Any] = field(default_factory=dict)
+    prep_status: dict | None = None
+    locked_watchlist: list[dict] | None = None
+    invalidated_symbols: set[str] = field(default_factory=set)
+    deadline: float | None = None
+    metrics: dict[str, float | int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.active_tick_id = self.active_tick_id or self.tick_id
         self.active_session_run_id = self.active_session_run_id or self.session_run_id
         if self.active_session_generation is None:
             self.active_session_generation = self.session_generation
+        self.balance_snapshot_at = self.balance_snapshot_at or time.monotonic()
+        self.fills_snapshot_at = self.fills_snapshot_at or time.monotonic()
+
+    def remaining_sec(self) -> float:
+        return float("inf") if self.deadline is None else max(0.0, self.deadline - time.monotonic())
+
+    def has_budget(self, minimum_safe_sec: float) -> bool:
+        return self.remaining_sec() >= max(0.0, minimum_safe_sec)
+
+    def invalidate_after_order(self, symbol: str) -> None:
+        """Invalidate only order-sensitive state; unrelated quotes remain reusable."""
+        symbol = str(symbol or "").upper().strip()
+        if symbol:
+            self.invalidated_symbols.add(symbol)
+            for key in list(self.price_cache):
+                if key[0] == symbol:
+                    self.price_cache.pop(key, None)
+        self.fills_snapshot_at = None
 
     def is_cancelled(self) -> bool:
         token = self.cancellation_token
