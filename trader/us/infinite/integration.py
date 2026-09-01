@@ -283,6 +283,23 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 "opening_buy_blocked": True,
                 "opening_buy_start_et": opening_buy_start_et,
             }
+        # Infrastructure health is an execution boundary, not an Infinite
+        # strategy input.  Continue evaluating the strategy for auditability,
+        # but never route a BUY/ADD while the parent session is SAFE_DEGRADED.
+        # SELL/TP decisions intentionally bypass this entry-only fence.
+        if decision.action == Action.BUY and not bool(overlay.get("entry_can_proceed", True)):
+            logger.warning(
+                "[TQQQ_INF][RUNTIME_BUY_BLOCK] reason=SESSION_SAFE_DEGRADED "
+                "strategy_decision=%s original_reason=%s",
+                decision.action.value, decision.reason,
+            )
+            return {
+                "status": "WAIT",
+                "reason": "SESSION_SAFE_DEGRADED",
+                "decision": decision,
+                "orders": [],
+                "runtime_buy_blocked": True,
+            }
         needs_new_cycle = bool(
             decision.action == Action.BUY and state
             and (not state.cycle_id or state.status == Status.COMPLETE)
