@@ -35,11 +35,47 @@ def attribute_session_fills(orders: list[dict], broker_fills: list[dict], *, ses
     """Attribute cumulative broker evidence only to orders submitted by this session."""
     session_orders = [row for row in orders or [] if str(row.get("session") or "").lower() == session.lower()
                       and str(row.get("session_run_id") or "") == str(session_run_id)]
-    fill_ids = {str(row.get("canonical_order_no") or row.get("order_no") or "") for row in broker_fills or []
-                if int(row.get("filled_qty") or row.get("qty") or 0) > 0}
-    order_ids = [str(row.get("canonical_order_no") or row.get("order_no") or "") for row in session_orders]
-    return {"session_fills_count": sum(1 for value in order_ids if value and value in fill_ids),
-            "unresolved_order_count": sum(1 for value in order_ids if not value or value not in fill_ids)}
+    def identities(row: dict) -> tuple[str, str, str]:
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        return (
+            str(row.get("canonical_order_no") or row.get("canonical_broker_order_no") or row.get("order_no") or ""),
+            str(row.get("submit_attempt_id") or meta.get("submit_attempt_id") or ""),
+            str(row.get("client_order_key") or meta.get("client_order_key") or ""),
+        )
+    fill_ids = [identities(row) for row in broker_fills or [] if int(row.get("filled_qty") or row.get("qty") or 0) > 0]
+    matched = 0
+    unresolved = 0
+    seen_orders: set[tuple[str, str, str]] = set()
+    for order in session_orders:
+        wanted = identities(order)
+        dedupe_key = next(((value, "", "") for value in wanted if value), wanted)
+        if dedupe_key in seen_orders:
+            continue
+        seen_orders.add(dedupe_key)
+        found = any(any(value and value == evidence[index] for index, value in enumerate(wanted)) for evidence in fill_ids)
+        matched += int(found)
+        unresolved += int(not found)
+    return {"session_fills_count": matched, "unresolved_order_count": unresolved}
+
+
+def tick_has_authoritative_execution_health(tick: dict) -> bool:
+    """Recovery requires all broker state, not merely a successful quote."""
+    return bool(
+        not tick.get("balance_fetch_failed")
+        and str(tick.get("ack_reconcile_after_route_status") or tick.get("ack_reconcile_status") or "OK").upper() == "OK"
+        and int(tick.get("unresolved_ack_count", 0) or 0) == 0
+        and str(tick.get("fill_source_status") or "OK").upper() == "OK"
+        and str(tick.get("durable_fence_status") or "ACTIVE").upper() == "ACTIVE"
+    )
+
+
+def advance_timeout_execution_mode(mode: str, consecutive: int, *, threshold: int, healthy_tick: dict | None = None) -> tuple[str, bool]:
+    """Pure session-liveness transition used by the runner and regressions."""
+    if healthy_tick is not None and tick_has_authoritative_execution_health(healthy_tick):
+        return "NORMAL", True
+    if consecutive >= threshold:
+        return "SAFE_DEGRADED", False
+    return mode, mode == "NORMAL"
 _received_signal: int | None = None
 _last_liveness_event = ""
 _exit_code: int | None = None
@@ -689,7 +725,10 @@ def run_trade_session(
             "[US_SESSION][CONFIG][TICK_TIMEOUT_LOW] interval_sec=%d timeout_sec=%d recommendation=>=80%%_interval",
             interval_sec, tick_timeout_sec,
         )
-    tick_timeout_fatal_consecutive = int(os.getenv("US_TICK_TIMEOUT_FATAL_CONSECUTIVE", "3"))
+    tick_timeout_degraded_consecutive = int(os.getenv(
+        "US_TICK_TIMEOUT_DEGRADED_CONSECUTIVE",
+        os.getenv("US_TICK_TIMEOUT_FATAL_CONSECUTIVE", "3"),
+    ))
     now_for_date = _now_ny(force_now)
     trade_date = now_for_date.strftime("%Y-%m-%d")
     try:
@@ -1107,6 +1146,11 @@ def run_trade_session(
         warn_count = 0
         consecutive_errors = 0
         consecutive_tick_timeouts = 0
+        session_execution_mode = "NORMAL"
+        safe_degraded_entries = safe_degraded_recoveries = fatal_timeout_count = 0
+        timeout_no_order_count = timeout_after_order_count = 0
+        tick_completed = tick_timed_out = 0
+        degraded_started_at: float | None = None
         root_cause = ""
         surface_reason = ""
         results: list[dict] = []
@@ -1200,7 +1244,7 @@ def run_trade_session(
                             locked_watchlist_cache=locked_watchlist_cache,
                             prep_cache_source=prep_cache_source,
                             watchlist_cache_source=watchlist_cache_source,
-                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)) and not timeout_entry_block,
+                            entry_can_proceed=bool(prep_guard_result.get("entry_can_proceed", False)) and not timeout_entry_block and session_execution_mode == "NORMAL",
                             exit_can_proceed=bool(prep_guard_result.get("exit_can_proceed", True)),
                             session_run_id=session_run_id,
                             session_generation=session_generation,
@@ -1229,7 +1273,17 @@ def run_trade_session(
                         tick_result.setdefault("total_tick_sec", process_result.duration_sec)
                     results.append(tick_result)
                     final_tick = tick_result
-                    consecutive_tick_timeouts = 0
+                    tick_completed += 1
+                    if session_execution_mode == "SAFE_DEGRADED" and tick_has_authoritative_execution_health(tick_result):
+                        logger.info("[US_SESSION][RECOVERED] from=SAFE_DEGRADED to=NORMAL balance_authoritative=1 fills_authoritative=1 orders_resolved=1")
+                        session_execution_mode = "NORMAL"
+                        timeout_entry_block = False
+                        safe_degraded_recoveries += 1
+                        consecutive_tick_timeouts = 0
+                        if degraded_started_at is not None:
+                            degraded_started_at = None
+                    elif session_execution_mode == "NORMAL":
+                        consecutive_tick_timeouts = 0
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_DONE", status=tick_result.get("status"), reason=tick_result.get("reason", ""))
                     temp_error_count += int(tick_result.get("temp_error_count", 0) or 0)
                     temp_recovered_count += int(tick_result.get("temp_recovered_count", 0) or 0)
@@ -1312,6 +1366,7 @@ def run_trade_session(
                     last_stage = f"tick_{tick_count}_timeout"
                     root_cause = root_cause or "tick_timeout"
                     warn_count += 1
+                    tick_timed_out += 1
                     _write_active_session_state(
                         session_state_path, state="RECONCILING", session=session,
                         session_run_id=session_run_id, session_generation=session_generation,
@@ -1339,10 +1394,12 @@ def run_trade_session(
                         timeout_status = "TICK_TIMEOUT_PROCESS_STUCK"
                         final_status = "FAILED"
                         final_reason = "TICK_TIMEOUT_PROCESS_STUCK"
-                    elif timeout_reconcile.get("status") == "ERROR":
+                    elif timeout_reconcile.get("status") == "ERROR" and order_activity_after > locals().get("order_activity_before", 0):
                         timeout_status = "TICK_TIMEOUT_RECONCILE_FAILED"
                         final_status = "FAILED"
                         final_reason = "TICK_TIMEOUT_RECONCILE_FAILED"
+                    elif timeout_reconcile.get("status") == "ERROR":
+                        timeout_status = "TICK_TIMEOUT_TERMINATED_NO_ORDER"
                     elif timeout_reconcile.get("unresolved_count"):
                         timeout_status = "TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED"
                         timeout_entry_block = True
@@ -1357,12 +1414,15 @@ def run_trade_session(
                     has_order_activity = timeout_status in {"TICK_TIMEOUT_TERMINATED_ORDER_UNRESOLVED", "TICK_TIMEOUT_TERMINATED_ORDER_RECONCILED"}
                     if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
                         consecutive_tick_timeouts += 1
+                        fatal_timeout_count += 1
                     elif has_order_activity:
                         consecutive_tick_timeouts = 0
+                        timeout_after_order_count += 1
                         final_status = "DEGRADED_WITH_ORDER_ACK"
                         final_reason = "WARN_TICK_LATENCY_AFTER_ORDER"
                     else:
                         consecutive_tick_timeouts += 1
+                        timeout_no_order_count += 1
                     results.append({
                         **timeout_process, "status": timeout_status,
                         "reason": "WARN_TICK_LATENCY_AFTER_ORDER" if has_order_activity else "tick_timeout",
@@ -1386,7 +1446,7 @@ def run_trade_session(
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_WARN_TIMEOUT", status=timeout_status, timeout_sec=tick_timeout_sec, consecutive_tick_timeouts=consecutive_tick_timeouts)
                     logger.warning(
                         "[US_TICK][TIMEOUT][WARN] status=%s reason=%s timeout_sec=%d consecutive=%d fatal_after=%d order_activity=%d",
-                        timeout_status, final_tick.get("reason", "tick_timeout"), tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_fatal_consecutive, int(has_order_activity),
+                        timeout_status, final_tick.get("reason", "tick_timeout"), tick_timeout_sec, consecutive_tick_timeouts, tick_timeout_degraded_consecutive, int(has_order_activity),
                     )
                     if timeout_status in {"TICK_TIMEOUT_PROCESS_STUCK", "TICK_TIMEOUT_RECONCILE_FAILED"}:
                         final_status, final_reason = "FAILED", timeout_status
@@ -1397,17 +1457,29 @@ def run_trade_session(
                             session_run_id=session_run_id, session_generation=session_generation,
                             active_tick_id="", run_source=run_source,
                         )
+                        if max_ticks > 0 and tick_count >= max_ticks:
+                            final_reason = "max_ticks"
+                            break
                         continue
-                    if consecutive_tick_timeouts >= tick_timeout_fatal_consecutive:
-                        final_status = "FAILED"
-                        final_reason = "FAILED_CONSECUTIVE_TICK_TIMEOUT"
-                        logger.error("[US_SESSION][END] session=%s reason=FAILED_CONSECUTIVE_TICK_TIMEOUT consecutive=%d", session, consecutive_tick_timeouts)
-                        break
+                    if consecutive_tick_timeouts >= tick_timeout_degraded_consecutive:
+                        if session_execution_mode != "SAFE_DEGRADED":
+                            session_execution_mode = "SAFE_DEGRADED"
+                            safe_degraded_entries += 1
+                            degraded_started_at = time_mod.monotonic()
+                        timeout_entry_block = True
+                        final_status = "COMPLETED_DEGRADED"
+                        final_reason = "SAFE_DEGRADED_CONSECUTIVE_TICK_TIMEOUT"
+                        logger.warning("[US_SESSION][SAFE_DEGRADED] reason=CONSECUTIVE_TICK_TIMEOUT new_buy=BLOCK exit=ALLOW reconcile=ALLOW continue_session=1 consecutive=%d", consecutive_tick_timeouts)
+                    else:
+                        logger.warning("[US_SESSION][TICK_TIMEOUT] tick=%d classification=TRANSIENT action=CONTINUE execution_mode=%s", tick_count, session_execution_mode)
                     _write_active_session_state(
                         session_state_path, state="ACTIVE", session=session,
                         session_run_id=session_run_id, session_generation=session_generation,
                         active_tick_id="", run_source=run_source,
                     )
+                    if max_ticks > 0 and tick_count >= max_ticks:
+                        final_reason = "max_ticks"
+                        break
                     continue
                 except Exception as exc:
                     consecutive_errors += 1
@@ -1498,6 +1570,13 @@ def run_trade_session(
 
         # ── Tick loop 종료 후 최종 처리 ────────────────────────────────────────────
         session_wall_elapsed_sec = time_mod.time() - session_start_time
+        if session_execution_mode == "SAFE_DEGRADED" and final_status not in {"FAILED", "SKIP"}:
+            final_status = "COMPLETED_DEGRADED"
+            final_reason = "scheduled_end_safe_degraded"
+        degraded_duration_sec = (
+            max(0.0, time_mod.monotonic() - degraded_started_at)
+            if degraded_started_at is not None else 0.0
+        )
         
         logger.info(
             "[US_SESSION][END] session=%s reason=%s ticks=%d warns=%d wall_elapsed_sec=%.2f",
@@ -1739,11 +1818,12 @@ def run_trade_session(
         # as a fallback because a final tick may contain a snapshot rather than
         # the whole session (the 2026-08-21 AM 5-vs-16 discrepancy).
         try:
-            from trader.us.execution.order_journal import aggregate_order_events
+            from trader.us.execution.order_journal import aggregate_order_events, load_order_events
             journal_session = aggregate_order_events(trade_date, session_run_id=session_run_id)
             journal_daily = aggregate_order_events(trade_date)
+            session_order_events = load_order_events(trade_date, session_run_id=session_run_id)
         except Exception as exc:
-            journal_session, journal_daily = {}, {}
+            journal_session, journal_daily, session_order_events = {}, {}, []
             logger.warning("[US_SESSION][SUMMARY_COUNTS][JOURNAL_FALLBACK] error=%s", exc)
 
         prior_cumulative = _load_prior_cumulative_metrics(trade_date, session)
@@ -1755,10 +1835,21 @@ def run_trade_session(
         total_orders_ack = resolved_order_counts["session_orders_ack"]
         total_orders_rejected = resolved_order_counts["session_orders_rejected"]
         cumulative_fills_count = int(total_fills)
-        session_fills_count = max(0, cumulative_fills_count - int(prior_cumulative.get("fills_count", 0)))
+        fill_source_status = "OK"
+        try:
+            from trader.us.db.repos import load_today_fills
+            finalizer_fills = load_today_fills(trade_date=trade_date)
+            attribution = attribute_session_fills(session_order_events, finalizer_fills, session=session, session_run_id=session_run_id)
+            session_fills_count = int(attribution["session_fills_count"])
+            total_pending_orders = int(attribution["unresolved_order_count"])
+            cumulative_fills_count = max(cumulative_fills_count, int(prior_cumulative.get("fills_count", 0)) + session_fills_count)
+        except Exception as final_fill_exc:
+            session_fills_count = None
+            fill_source_status = "TEMP_ERROR"
+            logger.warning("[US_SESSION][FINAL_FILL_RECONCILE][DEGRADED] error=%s", final_fill_exc)
         daily_cumulative_orders_sent = resolved_order_counts["daily_cumulative_orders_sent"]
         daily_cumulative_orders_ack = resolved_order_counts["daily_cumulative_orders_ack"]
-        daily_cumulative_fills_count = int(prior_cumulative.get("fills_count", 0)) + int(session_fills_count)
+        daily_cumulative_fills_count = (int(prior_cumulative.get("fills_count", 0)) + int(session_fills_count)) if session_fills_count is not None else None
         session_fills_confirmed_notional = max(0.0, float(cumulative_fills_confirmed_notional) - float(prior_cumulative.get("fills_notional", 0.0)))
         daily_cumulative_fills_notional = float(prior_cumulative.get("fills_notional", 0.0)) + float(session_fills_confirmed_notional)
         daily_cumulative_buy_notional_routed = float(prior_cumulative.get("buy_notional_routed", 0.0)) + float(buy_notional_routed)
@@ -1907,6 +1998,18 @@ def run_trade_session(
             "fills": cumulative_fills_count,
             "unique_fills_count": cumulative_fills_count,
             "session_fills_count": session_fills_count,
+            "fill_source_status": fill_source_status,
+            "report_consistency": "DEGRADED" if fill_source_status != "OK" else "OK",
+            "session_execution_mode": session_execution_mode,
+            "tick_attempted": tick_count,
+            "tick_completed": tick_completed,
+            "tick_timed_out": tick_timed_out,
+            "timeout_no_order_count": timeout_no_order_count,
+            "timeout_after_order_count": timeout_after_order_count,
+            "safe_degraded_entries": safe_degraded_entries,
+            "safe_degraded_recoveries": safe_degraded_recoveries,
+            "fatal_timeout_count": fatal_timeout_count,
+            "degraded_duration_sec": round(degraded_duration_sec, 3),
             "cumulative_fills_count": cumulative_fills_count,
             "daily_cumulative_fills_count": daily_cumulative_fills_count,
             "daily_fills_confirmed_total": daily_cumulative_fills_count,

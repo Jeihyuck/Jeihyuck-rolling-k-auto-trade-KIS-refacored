@@ -88,6 +88,15 @@ def get_fills_today(
         return {"status": "OK", "fills": [], "error": None, "error_type": None}
 
     try:
+        ctx = getattr(provider, "_tick_context", None)
+        if ctx is not None and ctx.fills_snapshot_at is not None:
+            ctx.count("fill_logical_calls")
+            ctx.count("fill_cache_hits")
+            return {"status": "OK", "fills": list(ctx.fills_snapshot), "error": None, "error_type": None}
+        started = __import__("time").monotonic()
+        if ctx is not None:
+            ctx.count("fill_logical_calls")
+            ctx.count("fill_http_calls")
         client = provider._get_client()
         raw = client.get_us_fills_today(trade_date=trade_date)
         observed_at = datetime.now(timezone.utc).isoformat()
@@ -142,6 +151,10 @@ def get_fills_today(
                 "raw": row,
             })
         logger.info("[US_FILLS][OK] count=%d", len(fills))
+        if ctx is not None:
+            ctx.fills_snapshot = list(fills)
+            ctx.fills_snapshot_at = __import__("time").monotonic()
+            ctx.metrics["fill_fetch_ms"] = float(ctx.metrics.get("fill_fetch_ms", 0.0)) + (__import__("time").monotonic() - started) * 1000.0
         return {"status": "OK", "fills": fills, "error": None, "error_type": None}
     except Exception as exc:
         from trader.us.execution.kis_us_client import (
@@ -162,6 +175,8 @@ def get_fills_today(
             }
         # Temporary error 처리
         elif isinstance(exc, KisUSTemporaryError):
+            if getattr(provider, "_tick_context", None) is not None:
+                provider._tick_context.count("fill_retry_calls")
             logger.warning("[US_FILLS][ERROR][TEMP] type=RATE_LIMIT msg=%s", error_msg)
             return {
                 "status": "TEMP_ERROR",
