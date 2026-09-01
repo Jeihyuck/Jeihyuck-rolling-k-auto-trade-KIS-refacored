@@ -802,7 +802,11 @@ def run_daily_report(
                             "net_realized_pnl": meta.get("net_realized_pnl") if fees is not None else None,
                             "return_rate_at_decision": meta.get("return_rate_at_decision"),
                             "return_rate_at_fill": meta.get("return_rate_at_fill") or sell_pnl.get("return_rate_at_fill"),
-                            "pre_order_holding_qty": meta.get("pre_order_holding_qty") or meta.get("pre_order_position_qty"),
+                            "pre_order_holding_qty": (
+                                meta.get("pre_order_holding_qty")
+                                if meta.get("pre_order_holding_qty") is not None
+                                else meta.get("pre_order_position_qty")
+                            ),
                             "post_order_expected_qty": meta.get("post_order_expected_qty") or meta.get("expected_post_order_qty"),
                             "absorbed_exit_reasons": meta.get("absorbed_exit_reasons", []),
                             "same_day_exit_cooldown_applied": bool(meta.get("same_day_exit_cooldown_applied", False)),

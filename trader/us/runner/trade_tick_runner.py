@@ -1094,6 +1094,7 @@ def run_trade_tick(
     Returns:
         {"status": "OK"|"SKIP"|"ERROR"|"OK_WITH_WARNINGS", ...}
     """
+    tick_started_at = time.monotonic()
     logger.info(
         "[US_TICK][START] session=%s env=%s offline=%s run_mode=%s signal_only=%s entry_can_proceed=%d exit_can_proceed=%d",
         session, env, offline, run_mode, signal_only, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)),
@@ -1218,8 +1219,24 @@ def run_trade_tick(
     # ── 예산 계산 ─────────────────────────────────────────────────────────────
     from trader.us.budget import resolve_us_order_budget
     from trader.us.data_provider import USDataProvider
+    from trader.us.execution.tick_context import TickExecutionContext
 
     provider = USDataProvider(offline=offline)
+    tick_context = TickExecutionContext(
+        trade_date=trade_date, session=session, session_run_id=session_run_id,
+        session_generation=int(session_generation), tick_id=tick_id, prep_run_id=prep_run_id,
+        prep_status=dict(prep_status_cache) if prep_status_cache is not None else None,
+        locked_watchlist=list(locked_watchlist_cache) if locked_watchlist_cache is not None else None,
+        cancellation_token=tick_cancellation_event,
+        active_session_state_path=active_session_state_path,
+        deadline=tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0),
+    )
+    if hasattr(provider, "bind_tick_context"):
+        provider.bind_tick_context(tick_context)
+    else:
+        # Test/custom providers participate without having to inherit the
+        # concrete provider class.
+        setattr(provider, "_tick_context", tick_context)
     real_order_mode = (
         os.getenv("DRY_RUN", "0") == "0"
         and os.getenv("US_KIS_ORDER_ALLOWED", "1") == "1"
@@ -1277,6 +1294,7 @@ def run_trade_tick(
         or (int(balance_reconcile_interval or 0) > 0 and int(tick_index or 1) % int(balance_reconcile_interval or 1) == 0)
     )
     logger.info("[US_RECONCILE][START] session=%s tick_index=%s should_reconcile_balance=%d interval=%s", session, tick_index, int(should_reconcile_balance), balance_reconcile_interval)
+    _position_reconcile_started = time.monotonic()
     try:
         if should_reconcile_balance:
             from trader.us.execution.reconcile import reconcile_positions
@@ -1323,6 +1341,8 @@ def run_trade_tick(
             "positions": [],
             "position_count": 0,
         }
+    finally:
+        tick_context.metrics["position_reconcile_ms"] = (time.monotonic() - _position_reconcile_started) * 1000.0
     
     # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
     if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
@@ -1372,6 +1392,7 @@ def run_trade_tick(
     # (fills_today 등은 함수 시작부에서 사전 초기화됨)
     
     if not offline:
+        _fill_fetch_started = time.monotonic()
         try:
             last_stage = "fills_fetch"
             from trader.us.execution.fills import get_fills_today
@@ -1402,6 +1423,11 @@ def run_trade_tick(
         except Exception as exc:
             logger.error("[US_TICK][ERROR] fills exception: %s", exc)
             fills_error_count += 1
+        finally:
+            tick_context.metrics["fill_fetch_ms"] = max(
+                float(tick_context.metrics.get("fill_fetch_ms", 0.0)),
+                (time.monotonic() - _fill_fetch_started) * 1000.0,
+            )
 
     # temp_error_count, temp_recovered_count, kis_temp_errors_by_api는 함수 시작부에서 사전 초기화됨
     if fills_temp_error:
@@ -1459,12 +1485,17 @@ def run_trade_tick(
 
     # fills DB 저장
     if fills_today:
+        _fill_persist_started = time.monotonic()
         try:
             from trader.us.db.repos import save_fills_with_result
             fill_save_result = save_fills_with_result(fills_today, trade_date=trade_date)
         except Exception as exc:
             logger.error("[US_TICK][FILL_SAVE_ERROR] %s", exc)
             fill_save_result = {"status": "DB_ERROR", "error": str(exc)}
+        finally:
+            tick_context.metrics["fill_persist_ms"] = (time.monotonic() - _fill_persist_started) * 1000.0
+            if int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0) > 0:
+                tick_context.count("db_fill_write_calls")
         if fill_save_result.get("status") != "OK":
             logger.error("[US_TICK][FAILED] reason=fill_persistence_failed result=%s", fill_save_result)
             return {
@@ -1490,6 +1521,7 @@ def run_trade_tick(
 
     # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
     if not offline:
+        _order_reconcile_started = time.monotonic()
         try:
             from trader.us.execution.reconcile import reconcile_ack_orders_with_balance
             ack_recon = reconcile_ack_orders_with_balance(
@@ -1512,6 +1544,8 @@ def run_trade_tick(
                 logger.warning("[US_POSITION][TREND_STAGE][ACK_RECON_MARK_WARN] err=%s", exc)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
+        finally:
+            tick_context.metrics["order_reconcile_ms"] = (time.monotonic() - _order_reconcile_started) * 1000.0
 
     # reconcile 결과 positions DB 저장
     recon_positions = recon.get("positions", [])
@@ -1683,7 +1717,6 @@ def run_trade_tick(
                 _p["high_watermark_source"] = _lc.get("high_watermark_source")
     except Exception as _lc_exc:
         logger.warning("[US_POSITION][LIFECYCLE][WARN] err=%s", _lc_exc)
-    from trader.us.execution.tick_context import TickExecutionContext
     from trader.us.symbols import normalize_us_exchange
     positions_by_symbol = {str(p.get("symbol") or "").upper(): p for p in current_positions if p.get("symbol")}
     exchange_by_symbol: dict[str, str] = {}
@@ -1701,18 +1734,14 @@ def run_trade_tick(
     except Exception as _ctx_exc:
         logger.warning("[US_TICK][CONTEXT_LOAD_WARN] err=%s", _ctx_exc)
         pending_ack_orders, today_order_keys = [], set()
-    tick_context = TickExecutionContext(
-        trade_date=trade_date, session=session, session_run_id=session_run_id,
-        session_generation=int(session_generation), tick_id=tick_id, prep_run_id=prep_run_id,
-        run_source=os.getenv("US_RUN_SOURCE", ""),
-        balance_snapshot=recon, positions_by_symbol=positions_by_symbol,
-        exchange_by_symbol=exchange_by_symbol, fills_snapshot=fills_today,
-        pending_ack_orders=pending_ack_orders, today_order_keys=set(today_order_keys or set()),
-        cancellation_token=tick_cancellation_event, session_state="ACTIVE",
-        active_tick_id=tick_id, active_session_run_id=session_run_id,
-        active_session_generation=int(session_generation), active_session_state_path=active_session_state_path,
-        blocked_symbol_sides={(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2},
-    )
+    tick_context.run_source = os.getenv("US_RUN_SOURCE", "")
+    tick_context.balance_snapshot = recon
+    tick_context.positions_by_symbol = positions_by_symbol
+    tick_context.exchange_by_symbol = exchange_by_symbol
+    tick_context.fills_snapshot = fills_today
+    tick_context.pending_ack_orders = pending_ack_orders
+    tick_context.today_order_keys = set(today_order_keys or set())
+    tick_context.blocked_symbol_sides = {(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2}
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -1768,6 +1797,7 @@ def run_trade_tick(
     # 모든 보유 종목에 대해 exit 평가 전 entry_price를 resolve한다.
     # entry_price가 없으면 fail-closed SELL intent 생성 (US_EXIT_FAIL_CLOSED_ON_PNL_MISSING 기본값=1)
     _exit_trade_date = trade_date if isinstance(trade_date, str) else str(trade_date)
+    _exit_engine_started = time.monotonic()
     try:
         from trader.us.pb1.us_exit_position_resolver import enrich_us_positions_for_exit
         current_positions, exit_position_meta = enrich_us_positions_for_exit(
@@ -1860,12 +1890,20 @@ def run_trade_tick(
             logger.warning("[US_EXIT][EVAL][WARN] %s", exc)
     logger.info("[US_EXIT_EVAL][SUMMARY] session=%s tick=%s positions_evaluated=%d sell_candidates=%d sell_orders=%d", session, tick_index, len(current_positions), len([i for i in exit_intents if str(i.get("side") or "").upper()=="SELL"]), 0)
     logger.info("[US_EXIT][EVAL][DONE] exit_intents=%d", len(exit_intents))
+    tick_context.metrics["exit_engine_ms"] = (time.monotonic() - _exit_engine_started) * 1000.0
 
     market_state_overlay = {"market_state": "NORMAL", "exposure_multiplier": 1.0, "allow_new_buy": True, "allow_add_to_existing": allow_add_to_existing, "force_entry_block": False, "trailing_stop_mode": "normal"}
     prep_result_for_overlay = {}
+    _market_state_started = time.monotonic()
     try:
-        from trader.us.db.repos import load_latest_us_prep_status as _load_prep_for_overlay
-        _prep_overlay_info = _load_prep_for_overlay(trade_date) or {}
+        if prep_status_cache is not None:
+            _prep_overlay_info = prep_status_cache
+        elif tick_context.has_budget(float(os.getenv("US_TICK_NONCRITICAL_MIN_REMAINING_SEC", "30"))):
+            from trader.us.db.repos import load_latest_us_prep_status as _load_prep_for_overlay
+            _prep_overlay_info = _load_prep_for_overlay(trade_date) or {}
+        else:
+            _prep_overlay_info = {}
+            logger.warning("[US_TICK][DEADLINE_DEGRADE] stage=prep_overlay_refresh remaining_sec=%.3f", tick_context.remaining_sec())
         prep_result_for_overlay = _prep_overlay_info.get("result") if isinstance(_prep_overlay_info.get("result"), dict) else _prep_overlay_info
         from trader.us.market_state_overlay import evaluate_us_market_state, build_profit_capture_intents
         account_snapshot = {
@@ -1899,6 +1937,8 @@ def run_trade_tick(
             exit_intents.extend(profit_capture_intents)
     except Exception as _market_state_exc:
         logger.warning("[US_MARKET_STATE][WARN] error=%s", _market_state_exc)
+    finally:
+        tick_context.metrics["market_state_ms"] = (time.monotonic() - _market_state_started) * 1000.0
     effective_budget_before_overlay = effective_budget
     exposure_multiplier = float(market_state_overlay.get(
         "effective_capital_scale",
@@ -1914,9 +1954,8 @@ def run_trade_tick(
 
     cluster_guard_result = {"portfolio_cluster_guard_status": "NOT_EVALUATED", "portfolio_ai_tech_weight": 0.0, "portfolio_cluster_cap_violations": [], "cluster_guard_trim_intents": [], "cluster_guard_trim_notional": 0.0}
     try:
-        from trader.us.db.repos import load_latest_us_prep_status
         from trader.us.portfolio_cluster_guard import evaluate_portfolio_cluster_guard
-        _prep_for_cluster = load_latest_us_prep_status(trade_date) or {}
+        _prep_for_cluster = prep_status_cache or _prep_overlay_info or {}
         _prep_cluster_result = _prep_for_cluster.get("result") if isinstance(_prep_for_cluster.get("result"), dict) else {}
         _rotation_context = (
             _prep_cluster_result.get("rotation_context")
@@ -1980,6 +2019,7 @@ def run_trade_tick(
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
 
     infinite_result = {"status": "OFF", "orders": []}
+    _tqqq_infinite_started = time.monotonic()
     if _infinite_config.enabled:
         try:
             from trader.us.infinite.integration import run_sleeve
@@ -2025,6 +2065,7 @@ def run_trade_tick(
             # Defensive second boundary: sleeve failures never stop legacy US.
             logger.exception("[TQQQ_INF][BLOCK] reason=runner_boundary_exception error=%s", _infinite_exc)
             infinite_result = {"status": "BLOCK", "reason": "runner_boundary_exception", "orders": []}
+    tick_context.metrics["tqqq_infinite_ms"] = (time.monotonic() - _tqqq_infinite_started) * 1000.0 if _infinite_config.enabled else 0.0
     try:
         _final30_symbols_for_monitor = [r.get("symbol") for r in (locked_watchlist_cache or []) if isinstance(r, dict)]
         monitoring_universe = build_monitoring_universe(_final30_symbols_for_monitor, current_position_symbols)
@@ -2047,6 +2088,7 @@ def run_trade_tick(
 
     # ── ENTRY 평가 ────────────────────────────────────────────────────────────
     logger.info("[US_ENTRY][EVAL][START] session=%s budget=%.2f", session, effective_budget)
+    _entry_engine_started = time.monotonic()
     entry_intents: list[dict] = []
     entry_eval_error_count = 0
     entry_degraded = False
@@ -2618,6 +2660,7 @@ def run_trade_tick(
 
     # ── Order routing ─────────────────────────────────────────────────────────
     all_intents = entry_intents
+    tick_context.metrics["entry_engine_ms"] = (time.monotonic() - _entry_engine_started) * 1000.0
     if entry_degraded and exit_intents:
         exit_routed_after_entry_degraded = True
         logger.warning(
@@ -2774,6 +2817,7 @@ def run_trade_tick(
             _cluster = theme_cluster_for(str(_position.get("symbol") or _position.get("code") or ""), _position)
             routing_cluster_exposure[_cluster] = routing_cluster_exposure.get(_cluster, 0.0) + resolve_position_market_value_usd(_position)
 
+    _order_route_started = time.monotonic()
     for intent in all_intents:
         try:
             if str(intent.get("side") or "BUY").upper() == "BUY":
@@ -2940,6 +2984,7 @@ def run_trade_tick(
         except Exception as exc:
             logger.warning("[US_ORDER][ROUTE][WARN] intent=%s error=%s", intent.get("symbol"), exc)
             orders.append({"status": "ERROR", "error": str(exc), "intent": intent})
+    tick_context.metrics["order_route_ms"] = (time.monotonic() - _order_route_started) * 1000.0 if all_intents else 0.0
 
     ack_cnt = sum(1 for o in orders if o["status"] == "ACK")
     dry_cnt = sum(1 for o in orders if o["status"] == "DRY_RUN")
@@ -3274,7 +3319,46 @@ def run_trade_tick(
     )
     logger.info("[US_TICK][DONE] session=%s status=%s", session, status)
 
+    tick_total_ms = round((time.monotonic() - tick_started_at) * 1000, 3)
+    latency_metrics = {
+        "tick_total_ms": tick_total_ms,
+        "balance_snapshot_ms": float(tick_context.metrics.get("balance_snapshot_ms", 0)),
+        "balance_snapshot_logical_calls": int(tick_context.counters.get("balance_logical_calls", 0)),
+        "balance_http_calls": int(tick_context.counters.get("balance_http_calls", 0)),
+        "balance_retry_calls": int(tick_context.counters.get("balance_retry_calls", 0)),
+        "fill_fetch_ms": float(tick_context.metrics.get("fill_fetch_ms", 0)),
+        "fill_fetch_logical_calls": int(tick_context.counters.get("fill_logical_calls", 0)),
+        "fill_http_calls": int(tick_context.counters.get("fill_http_calls", 0)),
+        "fill_retry_calls": int(tick_context.counters.get("fill_retry_calls", 0)),
+        "price_fetch_ms": float(tick_context.metrics.get("price_fetch_ms", 0)),
+        "price_http_calls": int(tick_context.counters.get("quote_http_calls", 0)),
+        "quote_logical_calls": int(tick_context.counters.get("quote_logical_calls", 0)),
+        "quote_http_calls": int(tick_context.counters.get("quote_http_calls", 0)),
+        "quote_retry_calls": int(tick_context.counters.get("quote_retry_calls", 0)),
+        "psamount_ms": float(tick_context.metrics.get("psamount_ms", 0)),
+        "psamount_http_calls": int(tick_context.counters.get("psamount_http_calls", 0)),
+        "psamount_logical_calls": int(tick_context.counters.get("psamount_logical_calls", 0)),
+        "psamount_retry_calls": int(tick_context.counters.get("psamount_retry_calls", 0)),
+        "db_fill_write_calls": int(tick_context.counters.get("db_fill_write_calls", 0)),
+        "prep_status_ms": float(tick_context.metrics.get("prep_status_ms", 0)),
+        "watchlist_load_ms": float(tick_context.metrics.get("watchlist_load_ms", 0)),
+        "position_reconcile_ms": float(tick_context.metrics.get("position_reconcile_ms", 0)),
+        "order_reconcile_ms": float(tick_context.metrics.get("order_reconcile_ms", 0)),
+        "fill_persist_ms": float(tick_context.metrics.get("fill_persist_ms", 0)),
+        "fill_rows_received": len(fills_today),
+        "fill_rows_changed": int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0),
+        "fill_rows_persisted": int(fill_save_result.get("inserted_count", 0) or 0) + int(fill_save_result.get("updated_count", 0) or 0),
+        "exit_engine_ms": float(tick_context.metrics.get("exit_engine_ms", 0)),
+        "market_state_ms": float(tick_context.metrics.get("market_state_ms", 0)),
+        "tqqq_infinite_ms": float(tick_context.metrics.get("tqqq_infinite_ms", 0)),
+        "entry_engine_ms": float(tick_context.metrics.get("entry_engine_ms", 0)),
+        "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
+        "order_route_ms": float(tick_context.metrics.get("order_route_ms", 0)),
+    }
+    logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
+                tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
     return {
+        **latency_metrics,
         "status": status,
         "reason": primary_reject_reason or ("entry_degraded_exit_routed" if exit_routed_after_entry_degraded else ("duplicate_exit_blocked" if duplicate_blocked_cnt else "none")),
         "primary_reject_reason": primary_reject_reason,

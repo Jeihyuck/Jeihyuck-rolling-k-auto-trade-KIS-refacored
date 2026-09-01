@@ -93,6 +93,8 @@ def normalize_us_entry_style(value: Any) -> str:
         정규화된 entry_style: ENTRY_BREAKOUT, ENTRY_PULLBACK, ENTRY_MOMENTUM, ENTRY_VCP, ENTRY_GENERIC, SKIP
     """
     raw = str(value or "").strip().upper()
+    if raw.startswith("PB1_"):
+        raw = raw[4:]
     
     # Breakout 계열
     if raw in {"ENTRY_BREAKOUT", "BREAKOUT", "ENTRY_BREAKOUT_CONFIRMED", "BREAKOUT_PIVOT"}:

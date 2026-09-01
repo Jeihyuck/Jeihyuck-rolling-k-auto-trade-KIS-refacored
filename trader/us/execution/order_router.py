@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -366,19 +367,38 @@ def _has_broker_orderable_cash_method(kis_client: Any) -> bool:
     return _client_method(kis_client, "get_orderable_cash") is not None or _client_method(kis_client, "get_us_orderable_cash") is not None
 
 
-def _get_broker_orderable_cash(kis_client: Any, symbol: str, exchange: str, price: float, account_env: str = "") -> float | None:
+def _get_broker_orderable_cash(kis_client: Any, symbol: str, exchange: str, price: float, account_env: str = "", context: Any | None = None) -> float | None:
+    cache_key = (str(symbol).upper(), str(exchange).upper(), round(float(price), 6), "BUY")
+    if context is not None:
+        context.count("psamount_logical_calls")
+        if cache_key in context.psamount_cache:
+            context.count("psamount_cache_hits")
+            return context.psamount_cache[cache_key]
+    started = time.monotonic()
     method = _client_method(kis_client, "get_orderable_cash")
     if method is not None:
         try:
-            return float(method(symbol=symbol, exchange=exchange, price=price) or 0.0)
+            if context is not None:
+                context.count("psamount_http_calls")
+            value = float(method(symbol=symbol, exchange=exchange, price=price) or 0.0)
+            if context is not None:
+                context.psamount_cache[cache_key] = value
+                context.metrics["psamount_ms"] = float(context.metrics.get("psamount_ms", 0.0)) + (time.monotonic() - started) * 1000.0
+            return value
         except (TypeError, ValueError) as exc:
             logger.warning("[US_ORDER][BROKER_CASH_PARSE_WARN] env=%s symbol=%s reason=data_provider_value_invalid err=%s", account_env, symbol, exc)
             return None
     method = _client_method(kis_client, "get_us_orderable_cash")
     if method is not None:
+        if context is not None:
+            context.count("psamount_http_calls")
         raw = method(symbol=symbol, exchange=exchange, price=price)
         output = raw.get("output", raw) if isinstance(raw, dict) else {}
-        return _parse_orderable_cash_output(output, symbol=symbol, account_env=account_env)
+        value = _parse_orderable_cash_output(output, symbol=symbol, account_env=account_env)
+        if context is not None:
+            context.psamount_cache[cache_key] = value
+            context.metrics["psamount_ms"] = float(context.metrics.get("psamount_ms", 0.0)) + (time.monotonic() - started) * 1000.0
+        return value
     logger.warning("[US_ORDER][BROKER_CASH_PARSE_WARN] env=%s symbol=%s reason=orderable_cash_method_missing", account_env, symbol)
     return None
 
@@ -651,6 +671,21 @@ def route_order(
     )
     qty = int(intent.get("qty", 0))
     price = float(intent.get("limit_price", 0.0))
+    from trader.us.execution.order_economics import normalize_order_intent_economics
+    old_notional = intent.get("notional_usd")
+    expected_notional = qty * price if price > 0 else float(old_notional or 0)
+    normalization_provenance = (intent.get("meta") or {}).get("economics_normalizations") or []
+    if price > 0 and old_notional is not None and abs(float(old_notional) - expected_notional) > 0.01 and not normalization_provenance:
+        logger.error("[US_ORDER][ECONOMICS_INVARIANT_FAIL] qty=%s price=%s notional=%s expected=%s action=fail_closed",
+                     qty, price, old_notional, expected_notional)
+        return {"status": "BLOCKED", "reason": "order_economics_invariant_mismatch", "broker_submit": False, "intent": intent}
+    normalize_order_intent_economics(intent, executable_price=price, reason="pre_risk_gate")
+    if old_notional is None or abs(float(old_notional or 0) - float(intent["notional_usd"])) > 0.01:
+        logger.warning(
+            "[US_ORDER][ECONOMICS_NORMALIZED] old_qty=%s new_qty=%s old_notional=%s new_notional=%s reason=pre_risk_gate",
+            qty, intent["qty"], old_notional, intent["notional_usd"],
+        )
+    qty = int(intent["qty"])
     exchange = intent.get("exchange") or ("NASDAQ" if side == "BUY" else "")
     if side == "SELL":
         exchange = enrich_sell_exchange(intent, kis_client, context)
@@ -1020,7 +1055,7 @@ def route_order(
                 mark_order_intent_blocked(order_key, reason="broker_orderable_cash_unavailable")
             return {"status": "BLOCKED", "reason": "broker_orderable_cash_unavailable", "cash_exhausted": False, "symbol": symbol, "side": side, "qty": qty, "intent": intent}
         safety_buffer = float(os.getenv("US_BROKER_ORDERABLE_CASH_SAFETY_BUFFER", "1.01") or 1.01)
-        broker_cash = _get_broker_orderable_cash(kis_client, symbol, exchange, price, account_env=account_env)
+        broker_cash = _get_broker_orderable_cash(kis_client, symbol, exchange, price, account_env=account_env, context=context)
         required_cash = float(qty) * float(price) * safety_buffer
         if broker_cash is None:
             logger.warning("[US_ORDER][BROKER_CASH_CHECK][SKIP] env=%s symbol=%s reason=broker_orderable_cash_unavailable", account_env, symbol)
@@ -1336,6 +1371,8 @@ def route_order(
                 "broker_submit": True, "retry_order": False, "requires_reconcile": True,
                 "order_no": order_no, "intent": intent}
     logger.info("[US_ORDER][KIS_ACK] symbol=%s side=%s order_no=%s", symbol, side, order_no)
+    if context is not None:
+        context.invalidate_after_order(symbol)
     logger.info("[US_ORDER_ACK] symbol=%s side=%s qty=%s order_no=%s", symbol, side, qty, order_no)
 
 

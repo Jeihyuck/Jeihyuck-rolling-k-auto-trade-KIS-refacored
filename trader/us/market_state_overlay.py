@@ -798,6 +798,8 @@ def filter_entry_intents_for_market_state(entry_intents: list[dict], overlay: di
         if adjusted_qty != qty and qty > 0:
             intent["qty"] = adjusted_qty
             intent["quantity"] = adjusted_qty
+            from trader.us.execution.order_economics import normalize_order_intent_economics
+            normalize_order_intent_economics(intent, reason="intraday_market_overlay_qty_scale")
             meta["intraday_overlay_qty_scaled"] = True
             meta["intraday_overlay_original_qty"] = qty
             logger.info("[US_MARKET_STATE][INTRADAY_OVERLAY][QTY_SCALED] symbol=%s original_qty=%s adjusted_qty=%s", sym, qty, adjusted_qty)

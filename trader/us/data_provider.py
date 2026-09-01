@@ -569,6 +569,7 @@ class USDataProvider:
         self._client = None
         self._daily_cache: dict = {}
         self._price_cache: dict = {}
+        self._tick_context = None
         self.stats = {
             "daily_hit": 0,
             "daily_miss": 0,
@@ -581,6 +582,10 @@ class USDataProvider:
             "fail_reasons": {},
             "daily_http_call_count": 0,
         }
+
+    def bind_tick_context(self, context: Any) -> "USDataProvider":
+        self._tick_context = context
+        return self
 
     def _get_client(self):
         if self._client is None:
@@ -674,6 +679,13 @@ class USDataProvider:
     def get_current_price(self, symbol: str, exchange: str) -> dict:
         """현재가 조회 (KIS → DB stale fallback)."""
         cache_key = (symbol.upper(), exchange.upper())
+        ctx = self._tick_context
+        if ctx is not None:
+            ctx.count("quote_logical_calls")
+            if cache_key in ctx.price_cache:
+                ctx.count("quote_cache_hits")
+                return ctx.price_cache[cache_key]
+        started = __import__("time").monotonic()
         
         # Cache hit
         if self._cache_enabled and cache_key in self._price_cache:
@@ -692,9 +704,13 @@ class USDataProvider:
             if self._cache_enabled:
                 self._price_cache[cache_key] = result
                 self.stats["price_ok_symbols"].add(symbol.upper())
+            if ctx is not None:
+                ctx.price_cache[cache_key] = result
             return result
         
         try:
+            if ctx is not None:
+                ctx.count("quote_http_calls")
             result = self._get_client().get_us_price(symbol, exchange)
             output = result.get("output", {})
             data = {
@@ -708,6 +724,8 @@ class USDataProvider:
             if self._cache_enabled:
                 self._price_cache[cache_key] = data
                 self.stats["price_ok_symbols"].add(symbol.upper())
+            if ctx is not None:
+                ctx.price_cache[cache_key] = data
             return data
         except Exception as exc:
             from trader.us.execution.kis_us_client import KisUSTemporaryError
@@ -740,7 +758,12 @@ class USDataProvider:
                     self.stats["price_fail_symbols"].add(symbol.upper())
                     self.stats["fail_reasons"][symbol.upper()] = str(type(exc).__name__)
             # Re-raise original exception if not temporary or no DB fallback
+            if ctx is not None:
+                ctx.count("quote_retry_calls")
             raise
+        finally:
+            if ctx is not None:
+                ctx.metrics["price_fetch_ms"] = float(ctx.metrics.get("price_fetch_ms", 0.0)) + (__import__("time").monotonic() - started) * 1000.0
 
 
     def get_completed_daily_prices_result(
@@ -916,6 +939,13 @@ class USDataProvider:
 
     def get_balance(self, force_refresh: bool = False) -> dict:
         """잔고 조회."""
+        ctx = self._tick_context
+        if ctx is not None:
+            ctx.count("balance_logical_calls")
+            if ctx.balance_snapshot_at is not None and ctx.balance_snapshot:
+                ctx.count("balance_cache_hits")
+                return ctx.balance_snapshot
+        started = __import__("time").monotonic()
         if self._offline:
             return {
                 "total_pvs": "10000.00",
@@ -933,8 +963,22 @@ class USDataProvider:
                 "queried_exchanges": [],
                 "exchange_result_counts": {},
             }
-        raw = self._get_client().get_us_balance(force_refresh=force_refresh)
-        return normalize_us_balance(raw)
+        try:
+            if ctx is not None:
+                ctx.count("balance_http_calls")
+            raw = self._get_client().get_us_balance(force_refresh=force_refresh)
+            result = normalize_us_balance(raw)
+            if ctx is not None:
+                ctx.balance_snapshot = result
+                ctx.balance_snapshot_at = __import__("time").monotonic()
+            return result
+        except Exception:
+            if ctx is not None:
+                ctx.count("balance_retry_calls")
+            raise
+        finally:
+            if ctx is not None:
+                ctx.metrics["balance_snapshot_ms"] = float(ctx.metrics.get("balance_snapshot_ms", 0.0)) + (__import__("time").monotonic() - started) * 1000.0
 
     def get_orderable_cash(
         self,
@@ -953,13 +997,25 @@ class USDataProvider:
         frcr_ord_psbl_amt1, ord_psbl_cash, ovrs_ord_psbl_amt,
         orderable_cash, cash, psbl_amt
         """
+        ctx = self._tick_context
+        cache_key = (symbol.upper(), exchange.upper(), round(float(price), 6), "BUY")
+        if ctx is not None:
+            ctx.count("psamount_logical_calls")
+            if cache_key in ctx.psamount_cache:
+                ctx.count("psamount_cache_hits")
+                return float(ctx.psamount_cache[cache_key])
+        started = __import__("time").monotonic()
         if self._offline:
             return 1000.0
         try:
+            if ctx is not None:
+                ctx.count("psamount_http_calls")
             raw = self._get_client().get_us_orderable_cash(
                 symbol=symbol, exchange=exchange, price=price
             )
         except Exception as exc:
+            if ctx is not None:
+                ctx.count("psamount_retry_calls")
             logger.warning("[US_DATA][WARN] get_orderable_cash API failed: %s", exc)
             return 0.0
         output = raw.get("output", raw)  # output 없으면 raw 자체 시도
@@ -971,7 +1027,11 @@ class USDataProvider:
             val = output.get(key)
             if val is not None:
                 try:
-                    return float(val)
+                    result = float(val)
+                    if ctx is not None:
+                        ctx.psamount_cache[cache_key] = result
+                        ctx.metrics["psamount_ms"] = float(ctx.metrics.get("psamount_ms", 0.0)) + (__import__("time").monotonic() - started) * 1000.0
+                    return result
                 except (ValueError, TypeError):
                     logger.warning("[US_DATA][WARN] orderable_cash field %s not numeric: %s", key, val)
         logger.warning("[US_DATA][WARN] orderable_cash not found in response, returning 0.0")

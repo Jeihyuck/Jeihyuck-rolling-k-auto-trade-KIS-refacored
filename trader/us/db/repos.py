@@ -1493,7 +1493,7 @@ def save_fills(fills: list[dict], trade_date: str | None = None) -> int:
                             client_order_key = EXCLUDED.client_order_key,
                             meta = us_fills.meta || EXCLUDED.meta
                         WHERE COALESCE((EXCLUDED.meta->>'cumulative_filled_qty')::integer, EXCLUDED.qty)
-                              >= COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
+                              > COALESCE((us_fills.meta->>'cumulative_filled_qty')::integer, us_fills.qty)
                     """),
                     {
                         "td": td,
