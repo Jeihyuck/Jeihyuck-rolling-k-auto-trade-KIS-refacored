@@ -247,7 +247,13 @@ class KisUSClient:
         import fcntl
         _, lock_path = _token_cache_paths(self._env)
         with lock_path.open("w", encoding="utf-8") as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if not self._sleep_with_budget(0.05):
+                        raise KisUSTemporaryError("tick deadline exhausted waiting for token lock") from exc
             file_cached = _read_token_file(self._env)
             if file_cached:
                 _TOKEN_CACHE.update(file_cached)
@@ -259,7 +265,10 @@ class KisUSClient:
                 text = str(exc)
                 if "EGW00133" in text or "1분당 1회" in text or "1분 1회" in text or "1 minute" in text or "timeout" in text.lower():
                     logger.warning("[US_AUTH][TOKENP_UNKNOWN_OR_RATE_LIMIT] wait=65 err=%s", exc)
-                    time.sleep(65)
+                    if not self._sleep_with_budget(65.0):
+                        raise KisUSTemporaryError(
+                            "tick deadline exhausted before token refresh wait"
+                        ) from exc
                 fallback = _read_token_file(self._env)
                 if fallback:
                     _TOKEN_CACHE.update(fallback)
@@ -282,7 +291,7 @@ class KisUSClient:
             "appkey": self._app_key,
             "appsecret": self._app_secret,
         }
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=self._request_budget())
         resp.raise_for_status()
         data = resp.json()
         token = data.get("access_token")
@@ -1071,7 +1080,10 @@ class KisUSClient:
         if elapsed < interval:
             sleep_time = interval - elapsed
             logger.debug(f"[US_KIS][RATE_LIMIT] path={path!r} sleep={sleep_time:.3f}s")
-            time.sleep(sleep_time)
+            if not self._sleep_with_budget(sleep_time):
+                raise KisUSTemporaryError(
+                    f"rate-limit wait exceeds tick deadline path={path}"
+                )
         
         self._last_request_time[endpoint_key] = time.time()
 
@@ -1204,7 +1216,12 @@ class KisUSClient:
         """POST 요청 with retry/backoff."""
         import requests
         
-        max_attempts = 5
+        # Broker order submission is non-idempotent at the HTTP boundary.  A
+        # timeout/connection loss/5xx may mean KIS accepted the order, so never
+        # blind-replay an order POST; the router journals the unknown outcome
+        # and reconciliation establishes broker truth.
+        is_order_submit = "order" in path.lower()
+        max_attempts = 1 if is_order_submit else 5
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
         last_error: Exception | None = None
         had_temp_error = False

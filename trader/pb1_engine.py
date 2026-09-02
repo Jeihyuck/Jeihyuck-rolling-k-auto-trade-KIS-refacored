@@ -7448,8 +7448,6 @@ class PB1Engine:
         for row in rows or []:
             if str(row.get("strategy") or "") != self.STRATEGY_NAME:
                 continue
-            if str(row.get("status") or "").upper() not in SELL_GUARD_STATES:
-                continue
             row_cycle = str(row.get("position_cycle_id") or "")
             if position_cycle_id and row_cycle and row_cycle != str(position_cycle_id):
                 continue
@@ -7459,6 +7457,14 @@ class PB1Engine:
                 continue
             prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
             prior_status = str(row.get("status") or "").upper()
+            if (prior_stage == "TP1" and str(exit_stage or "").upper() == "TP2"
+                    and prior_status not in {"FILLED", "PARTIAL_FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}):
+                logger.info("[SELL_STAGE_BLOCK] code=%s prior_stage=TP1 prior_status=%s requested_stage=TP2 reason=execution_unconfirmed",
+                            str(code).zfill(6), prior_status)
+                return True, dict(row)
+            if prior_status not in SELL_GUARD_STATES:
+                # Failed TP orders do not block independent protective FULL_EXIT.
+                continue
             # Stage progression is unlocked only by confirmed execution.  ACK,
             # SUBMITTED and UNRESOLVED_ACK never prove TP1 execution; a durable
             # PARTIAL_FILLED row does.
