@@ -461,96 +461,98 @@ class KisUSClient:
         self._stage_max_attempts = 2
         logger.info("[US_BALANCE] querying exchanges=%s budget_sec=%.3f", exchanges, balance_budget)
         
-        merged_output1: list[dict] = []
-        exchange_result_counts: dict[str, int] = {}
-        raw_by_exchange: dict[str, Any] = {}
-        failed_exchanges: dict[str, str] = {}
-        merged_output2: dict = {}
+        try:
+            merged_output1: list[dict] = []
+            exchange_result_counts: dict[str, int] = {}
+            raw_by_exchange: dict[str, Any] = {}
+            failed_exchanges: dict[str, str] = {}
+            merged_output2: dict = {}
         
-        for index, exchange_code in enumerate(exchanges):
-            if time.monotonic() >= self._stage_deadline:
-                for skipped in exchanges[index:]:
-                    exchange_result_counts[skipped] = 0
-                    failed_exchanges[skipped] = "BALANCE_STAGE_BUDGET_EXHAUSTED"
-                break
-            try:
-                exchange_data = self._get_us_balance_single_exchange(exchange_code)
-                raw_by_exchange[exchange_code] = exchange_data
+            for index, exchange_code in enumerate(exchanges):
+                if time.monotonic() >= self._stage_deadline:
+                    for skipped in exchanges[index:]:
+                        exchange_result_counts[skipped] = 0
+                        failed_exchanges[skipped] = "BALANCE_STAGE_BUDGET_EXHAUSTED"
+                    break
+                try:
+                    exchange_data = self._get_us_balance_single_exchange(exchange_code)
+                    raw_by_exchange[exchange_code] = exchange_data
                 
-                # output1 병합
-                ex_output1 = exchange_data.get("output1", [])
-                if isinstance(ex_output1, dict):
-                    ex_output1 = [ex_output1]
-                elif not isinstance(ex_output1, list):
-                    ex_output1 = []
+                    # output1 병합
+                    ex_output1 = exchange_data.get("output1", [])
+                    if isinstance(ex_output1, dict):
+                        ex_output1 = [ex_output1]
+                    elif not isinstance(ex_output1, list):
+                        ex_output1 = []
                 
-                # 각 row에 exchange 태깅
-                for row in ex_output1:
-                    if isinstance(row, dict):
-                        if "ovrs_excg_cd" not in row:
-                            row["ovrs_excg_cd"] = exchange_code
-                        merged_output1.append(row)
+                    # 각 row에 exchange 태깅
+                    for row in ex_output1:
+                        if isinstance(row, dict):
+                            if "ovrs_excg_cd" not in row:
+                                row["ovrs_excg_cd"] = exchange_code
+                            merged_output1.append(row)
                 
-                exchange_result_counts[exchange_code] = len(ex_output1)
+                    exchange_result_counts[exchange_code] = len(ex_output1)
                 
-                # output2 병합 (첫 번째 유효한 것 사용)
-                if not merged_output2:
-                    ex_output2 = exchange_data.get("output2")
-                    if isinstance(ex_output2, list) and ex_output2:
-                        merged_output2 = ex_output2[0] if isinstance(ex_output2[0], dict) else {}
-                    elif isinstance(ex_output2, dict):
-                        merged_output2 = ex_output2
+                    # output2 병합 (첫 번째 유효한 것 사용)
+                    if not merged_output2:
+                        ex_output2 = exchange_data.get("output2")
+                        if isinstance(ex_output2, list) and ex_output2:
+                            merged_output2 = ex_output2[0] if isinstance(ex_output2[0], dict) else {}
+                        elif isinstance(ex_output2, dict):
+                            merged_output2 = ex_output2
                 
-                logger.info(
-                    "[US_BALANCE][EXCHANGE][DONE] exchange=%s count=%d",
-                    exchange_code,
-                    len(ex_output1),
-                )
+                    logger.info(
+                        "[US_BALANCE][EXCHANGE][DONE] exchange=%s count=%d",
+                        exchange_code,
+                        len(ex_output1),
+                    )
             
-            except Exception as exc:
-                logger.warning(
-                    "[US_BALANCE][EXCHANGE][ERROR] exchange=%s error=%s",
-                    exchange_code,
-                    exc,
-                )
-                exchange_result_counts[exchange_code] = 0
-                failed_exchanges[exchange_code] = str(exc)
-                # 일부 거래소 실패 시 계속 진행 (다른 거래소 결과가 있으면 OK)
-                continue
+                except Exception as exc:
+                    logger.warning(
+                        "[US_BALANCE][EXCHANGE][ERROR] exchange=%s error=%s",
+                        exchange_code,
+                        exc,
+                    )
+                    exchange_result_counts[exchange_code] = 0
+                    failed_exchanges[exchange_code] = str(exc)
+                    # 일부 거래소 실패 시 계속 진행 (다른 거래소 결과가 있으면 OK)
+                    continue
         
-        # symbol 중복 병합
-        raw_count = sum(exchange_result_counts.values())
-        merged_output1 = self._merge_duplicate_symbols(merged_output1)
-        duplicate_skipped = max(0, raw_count - len(merged_output1))
+            # symbol 중복 병합
+            raw_count = sum(exchange_result_counts.values())
+            merged_output1 = self._merge_duplicate_symbols(merged_output1)
+            duplicate_skipped = max(0, raw_count - len(merged_output1))
         
-        logger.info(
-            "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
-            raw_count,
-            len(merged_output1),
-            duplicate_skipped,
-            ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
-        )
+            logger.info(
+                "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
+                raw_count,
+                len(merged_output1),
+                duplicate_skipped,
+                ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
+            )
         
-        balance_complete = not failed_exchanges and len(exchange_result_counts) == len(exchanges)
-        result_payload = {
-            "rt_cd": "0",
-            "output1": merged_output1,
-            "output2": merged_output2,
-            "queried_exchanges": exchanges,
-            "exchange_result_counts": exchange_result_counts,
-            "raw_by_exchange": raw_by_exchange,
-            "failed_exchanges": failed_exchanges,
-            "balance_complete": balance_complete,
-            "balance_authoritative": balance_complete,
-            "raw_count": raw_count,
-            "duplicate_skipped": duplicate_skipped,
-        }
-        # Never replace the last-good full snapshot with partial/uncertain data.
-        if balance_complete:
-            self._response_cache[cache_key] = (time.time(), result_payload)
-        self._stage_deadline = prior_stage_deadline
-        self._stage_max_attempts = prior_stage_max_attempts
-        return result_payload
+            balance_complete = not failed_exchanges and len(exchange_result_counts) == len(exchanges)
+            result_payload = {
+                "rt_cd": "0",
+                "output1": merged_output1,
+                "output2": merged_output2,
+                "queried_exchanges": exchanges,
+                "exchange_result_counts": exchange_result_counts,
+                "raw_by_exchange": raw_by_exchange,
+                "failed_exchanges": failed_exchanges,
+                "balance_complete": balance_complete,
+                "balance_authoritative": balance_complete,
+                "raw_count": raw_count,
+                "duplicate_skipped": duplicate_skipped,
+            }
+            # Never replace the last-good full snapshot with partial/uncertain data.
+            if balance_complete:
+                self._response_cache[cache_key] = (time.time(), result_payload)
+            return result_payload
+        finally:
+            self._stage_deadline = prior_stage_deadline
+            self._stage_max_attempts = prior_stage_max_attempts
     
     def _get_us_balance_single_exchange(
         self,

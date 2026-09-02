@@ -167,3 +167,34 @@ def test_partial_exchange_balance_is_not_cached_or_authoritative(monkeypatch):
     assert reconciled["preserve_previous_positions"] is True
     assert reconciled["authoritative_positions"] is False
     assert reconciled["positions"] == []
+
+
+def test_balance_stage_overrides_restore_after_unexpected_processing_error(monkeypatch):
+    client = KisUSClient(offline=False)
+    original_deadline = time.monotonic() + 300
+    client._stage_deadline = original_deadline
+    client._stage_max_attempts = 5
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "1")
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", lambda _exchange: {
+        "output1": [], "output2": {},
+    })
+    monkeypatch.setattr(client, "_merge_duplicate_symbols", lambda _rows: (_ for _ in ()).throw(RuntimeError("fixture")))
+
+    with pytest.raises(RuntimeError, match="fixture"):
+        client.get_us_balance(force_refresh=True)
+
+    assert client._stage_deadline == original_deadline
+    assert client._stage_max_attempts == 5
+
+
+def test_production_balance_budget_default_is_thirty_seconds(monkeypatch):
+    monkeypatch.delenv("US_BALANCE_FETCH_BUDGET_SEC", raising=False)
+    client = KisUSClient(offline=False)
+    observed = []
+    client._stage_deadline = None
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", lambda _exchange: (
+        observed.append(client._stage_deadline - time.monotonic()) or {"output1": [], "output2": {}}
+    ))
+    result = client.get_us_balance(force_refresh=True)
+    assert result["balance_complete"] is True
+    assert observed and 29.5 <= observed[0] <= 30.0

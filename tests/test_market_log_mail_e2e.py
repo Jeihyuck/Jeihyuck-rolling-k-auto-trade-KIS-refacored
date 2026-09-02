@@ -184,21 +184,23 @@ def test_us_cross_midnight_partition_collects_every_purpose(tmp_path):
 
 
 def test_stable_source_digest_skips_second_smtp_send(tmp_path):
-    root=fixture_repo(tmp_path,"kr",smtp_mode="success")
-    first,_=run_mail(root,"kr",dry=False); second,_=run_mail(root,"kr",dry=False)
+    trade_date = "2026-05-26"
+    root=fixture_repo(tmp_path,"kr",smtp_mode="success",trade_date=trade_date)
+    first,_=run_mail(root,"kr",dry=False,trade_date=trade_date); second,_=run_mail(root,"kr",dry=False,trade_date=trade_date)
     assert first.returncode == 0 and "attempt_count=1" in first.stdout
     assert second.returncode == 0 and "IDEMPOTENT_SKIP" in second.stdout
     assert (root/"smtp-count").read_text().strip() == "1"
-    marker=json.loads((root/f"runtime/health/kr-mail-{DATE}.json").read_text())
+    marker=json.loads((root/f"runtime/health/kr-mail-{trade_date}.json").read_text())
     assert marker["source_evidence_sha256"] and marker["archive_sha256"]
 
 
 def test_smtp_retries_twice_then_succeeds(tmp_path):
-    root=fixture_repo(tmp_path,"kr",smtp_mode="retry")
-    result,_=run_mail(root,"kr",dry=False)
+    trade_date = "2026-05-26"
+    root=fixture_repo(tmp_path,"kr",smtp_mode="retry",trade_date=trade_date)
+    result,_=run_mail(root,"kr",dry=False,trade_date=trade_date)
     assert result.returncode == 0, result.stderr+result.stdout
     assert (root/"smtp-count").read_text().strip() == "3"
-    marker=json.loads((root/f"runtime/health/kr-mail-{DATE}.json").read_text())
+    marker=json.loads((root/f"runtime/health/kr-mail-{trade_date}.json").read_text())
     assert marker["attempt_count"] == 3 and marker["status"] == "OK"
 
 
