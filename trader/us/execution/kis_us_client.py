@@ -205,6 +205,26 @@ class KisUSClient:
             self._acnt_prdt_cd,
             str(self._env == "practice").lower(),
         )
+        self._tick_context = None
+
+    def bind_tick_context(self, context: Any) -> "KisUSClient":
+        self._tick_context = context
+        return self
+
+    def _request_budget(self, configured_timeout: float = 10.0, reserve: float = 0.05) -> float:
+        """Return a request timeout bounded by the authoritative tick deadline."""
+        if self._tick_context is None:
+            return configured_timeout
+        remaining = float(self._tick_context.remaining_sec())
+        if remaining <= reserve:
+            raise KisUSTemporaryError("tick deadline budget exhausted before KIS request")
+        return max(0.001, min(configured_timeout, remaining - reserve))
+
+    def _sleep_with_budget(self, delay: float, reserve: float = 0.05) -> bool:
+        if self._tick_context is not None and not self._tick_context.has_budget(delay + reserve):
+            return False
+        time.sleep(delay)
+        return True
 
     # ------------------------------------------------------------------
     # Auth
@@ -1106,7 +1126,7 @@ class KisUSClient:
                 
                 url = self._base_url + path
                 record_kis_http_call("GET", path)
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp = requests.get(url, headers=headers, params=params, timeout=self._request_budget())
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
@@ -1152,7 +1172,10 @@ class KisUSClient:
                         f"[US_KIS][TEMP_ERROR] endpoint=GET_{path.split('/')[-1]} "
                         f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
-                    time.sleep(sleep_time)
+                    if not self._sleep_with_budget(sleep_time):
+                        raise KisUSTemporaryError(
+                            f"GET {path} retry aborted: tick deadline budget exhausted"
+                        ) from err
                     continue
                 
                 # 최종 실패
@@ -1193,7 +1216,7 @@ class KisUSClient:
                 
                 url = self._base_url + path
                 record_kis_http_call("POST", path)
-                resp = requests.post(url, headers=headers, json=body, timeout=10)
+                resp = requests.post(url, headers=headers, json=body, timeout=self._request_budget())
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
@@ -1239,7 +1262,10 @@ class KisUSClient:
                         f"[US_KIS][TEMP_ERROR] endpoint=POST_{path.split('/')[-1]} "
                         f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
-                    time.sleep(sleep_time)
+                    if not self._sleep_with_budget(sleep_time):
+                        raise KisUSTemporaryError(
+                            f"POST {path} retry aborted: tick deadline budget exhausted"
+                        ) from err
                     continue
                 
                 # 최종 실패

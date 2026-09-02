@@ -585,12 +585,16 @@ class USDataProvider:
 
     def bind_tick_context(self, context: Any) -> "USDataProvider":
         self._tick_context = context
+        if self._client is not None and hasattr(self._client, "bind_tick_context"):
+            self._client.bind_tick_context(context)
         return self
 
     def _get_client(self):
         if self._client is None:
             from trader.us.execution.kis_us_client import KisUSClient
             self._client = KisUSClient(env="practice", offline=self._offline)
+        if self._tick_context is not None and hasattr(self._client, "bind_tick_context"):
+            self._client.bind_tick_context(self._tick_context)
         return self._client
 
     def _load_daily_prices_from_db(

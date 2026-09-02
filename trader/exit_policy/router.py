@@ -118,12 +118,31 @@ def resolve_exit_policy_for_position(
         or features.get("exit_policy_family")
         or ""
     ).strip()
+    normalized_exit_family = exit_family.upper()
 
     trade_horizon = str(
         pos.get("trade_horizon")
         or features.get("trade_horizon")
         or ""
     ).strip()
+
+    # POLICY_MISSING is an explicit reconciler sentinel, not an unknown family
+    # eligible for the legacy SWING default below.
+    if normalized_exit_family == "POLICY_MISSING":
+        code_for_log = str(pos.get("code") or pos.get("pdno") or "UNKNOWN")
+        logger.warning(
+            "[EXIT][ROUTER][POLICY_MISSING] code=%s action=hard_stop_only_no_swing_fallback",
+            code_for_log,
+        )
+        return {
+            "exit_family": "POLICY_MISSING", "policy_missing": True,
+            "entry_style": entry_style, "trade_horizon": trade_horizon,
+            "hard_stop_enabled": True, "r_take_profit_enabled": False,
+            "percent_take_profit_enabled": False, "profit_protect_enabled": False,
+            "trend_follow_enabled": False, "time_stop_enabled": False,
+            "max_hold_days": 0, "partial_sell_rules": [], "full_exit_rules": [],
+            "router_enabled": enabled,
+        }
 
     if not exit_family:
         if entry_style in {"ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_OPEN_PUSH", "ENTRY_MOMENTUM_CONTINUATION"}:

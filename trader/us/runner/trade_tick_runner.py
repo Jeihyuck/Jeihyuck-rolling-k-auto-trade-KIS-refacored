@@ -1074,6 +1074,7 @@ def run_trade_tick(
     blocked_symbol_sides: list[list[str]] | None = None,
     session_balance_temp_error_count: int = 0,
     balance_consecutive_failed_ticks: int = 0,
+    tick_deadline_monotonic: float | None = None,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -1229,7 +1230,8 @@ def run_trade_tick(
         locked_watchlist=list(locked_watchlist_cache) if locked_watchlist_cache is not None else None,
         cancellation_token=tick_cancellation_event,
         active_session_state_path=active_session_state_path,
-        deadline=tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0),
+        deadline=(tick_deadline_monotonic if tick_deadline_monotonic is not None else
+                  tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0)),
     )
     if hasattr(provider, "bind_tick_context"):
         provider.bind_tick_context(tick_context)
@@ -3355,6 +3357,18 @@ def run_trade_tick(
         "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
         "order_route_ms": float(tick_context.metrics.get("order_route_ms", 0)),
     }
+    accounted_stage_ms = round(sum(
+        float(value) for key, value in latency_metrics.items()
+        if key.endswith("_ms") and key != "tick_total_ms"
+    ), 3)
+    unaccounted_ms = round(tick_total_ms - accounted_stage_ms, 3)
+    latency_metrics["accounted_stage_ms"] = accounted_stage_ms
+    latency_metrics["unaccounted_ms"] = unaccounted_ms
+    latency_log = logger.warning if unaccounted_ms > 2000 else logger.info
+    latency_log(
+        "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
+        tick_total_ms, accounted_stage_ms, unaccounted_ms,
+    )
     logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
                 tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
     return {

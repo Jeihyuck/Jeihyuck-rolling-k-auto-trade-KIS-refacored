@@ -542,14 +542,17 @@ def _make_exit_intent(
         symbol, stop_type, entry_price, current_price, pnl_pct, trail_high, trail_drawdown_pct, threshold,
     )
 
+    # Decision price remains the strategy/PnL input.  Broker economics must be
+    # derived from the final executable (marketable-limit) price.
+    limit_price = round(current_price * 0.998, 4)
     return {
         "symbol": symbol,
         "exchange": exchange,
         "side": "SELL",
         "qty": qty,
         "available_qty": qty,   # risk gate SELL qty <= available_qty 확인용
-        "limit_price": round(current_price * 0.998, 4),  # 0.2% 슬리피지 허용
-        "notional_usd": round(current_price * qty, 4),
+        "limit_price": limit_price,  # 0.2% 슬리피지 허용
+        "notional_usd": round(limit_price * qty, 4),
         "exit_type": exit_type,
         "exit_reason": exit_reason,
         "exit_reason_detail": exit_reason_detail,
@@ -563,6 +566,7 @@ def _make_exit_intent(
         "leg_no": leg_no,
         "trade_date": trade_date,
         "meta": {
+            "decision_price": current_price,
             "reason": reason,
             "holding_qty": _holding,
             "orderable_qty": _orderable,

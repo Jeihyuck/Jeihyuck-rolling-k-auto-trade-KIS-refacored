@@ -7459,7 +7459,10 @@ class PB1Engine:
                 continue
             prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
             prior_status = str(row.get("status") or "").upper()
-            if prior_status in {"FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
+            # Stage progression is unlocked only by confirmed execution.  ACK,
+            # SUBMITTED and UNRESOLVED_ACK never prove TP1 execution; a durable
+            # PARTIAL_FILLED row does.
+            if prior_status in {"FILLED", "PARTIAL_FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
                 fresh = bool(self._authoritative_balance
                              and self._authoritative_balance.freshness is BalanceFreshness.FRESH)
                 remaining = self._authoritative_balance.holding_qty(code) if self._authoritative_balance else 0

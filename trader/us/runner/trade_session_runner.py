@@ -1254,6 +1254,9 @@ def run_trade_session(
                             blocked_symbol_sides=[list(x) for x in sorted(timeout_blocked_symbol_sides)],
                             session_balance_temp_error_count=temp_error_count,
                             balance_consecutive_failed_ticks=consecutive_balance_failed_ticks,
+                            # One authoritative absolute monotonic deadline is
+                            # shared by the watchdog, child and all KIS I/O.
+                            tick_deadline_monotonic=time_mod.monotonic() + tick_timeout_sec,
                         )
                     # Legacy marker retained for deploy-diff scanners; hard timeout
                     # no longer uses: pool.shutdown(wait=False, cancel_futures=True)
