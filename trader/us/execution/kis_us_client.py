@@ -206,6 +206,8 @@ class KisUSClient:
             str(self._env == "practice").lower(),
         )
         self._tick_context = None
+        self._stage_deadline: float | None = None
+        self._stage_max_attempts: int | None = None
 
     def bind_tick_context(self, context: Any) -> "KisUSClient":
         self._tick_context = context
@@ -213,15 +215,21 @@ class KisUSClient:
 
     def _request_budget(self, configured_timeout: float = 10.0, reserve: float = 0.05) -> float:
         """Return a request timeout bounded by the authoritative tick deadline."""
-        if self._tick_context is None:
+        remaining = float("inf") if self._tick_context is None else float(self._tick_context.remaining_sec())
+        stage_deadline = getattr(self, "_stage_deadline", None)
+        if stage_deadline is not None:
+            remaining = min(remaining, max(0.0, stage_deadline - time.monotonic()))
+        if remaining == float("inf"):
             return configured_timeout
-        remaining = float(self._tick_context.remaining_sec())
         if remaining <= reserve:
             raise KisUSTemporaryError("tick deadline budget exhausted before KIS request")
         return max(0.001, min(configured_timeout, remaining - reserve))
 
     def _sleep_with_budget(self, delay: float, reserve: float = 0.05) -> bool:
         if self._tick_context is not None and not self._tick_context.has_budget(delay + reserve):
+            return False
+        stage_deadline = getattr(self, "_stage_deadline", None)
+        if stage_deadline is not None and time.monotonic() + delay + reserve > stage_deadline:
             return False
         time.sleep(delay)
         return True
@@ -441,7 +449,17 @@ class KisUSClient:
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
             return cached[1]
 
-        logger.info("[US_BALANCE] querying exchanges=%s", exchanges)
+        configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
+        tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
+        reserve = max(0.05, float(os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1")))
+        balance_budget = min(configured_budget, max(0.0, tick_remaining - reserve))
+        if balance_budget <= 0:
+            raise KisUSTemporaryError("balance stage budget exhausted before fetch")
+        prior_stage_deadline = self._stage_deadline
+        prior_stage_max_attempts = self._stage_max_attempts
+        self._stage_deadline = time.monotonic() + balance_budget
+        self._stage_max_attempts = 2
+        logger.info("[US_BALANCE] querying exchanges=%s budget_sec=%.3f", exchanges, balance_budget)
         
         merged_output1: list[dict] = []
         exchange_result_counts: dict[str, int] = {}
@@ -449,7 +467,12 @@ class KisUSClient:
         failed_exchanges: dict[str, str] = {}
         merged_output2: dict = {}
         
-        for exchange_code in exchanges:
+        for index, exchange_code in enumerate(exchanges):
+            if time.monotonic() >= self._stage_deadline:
+                for skipped in exchanges[index:]:
+                    exchange_result_counts[skipped] = 0
+                    failed_exchanges[skipped] = "BALANCE_STAGE_BUDGET_EXHAUSTED"
+                break
             try:
                 exchange_data = self._get_us_balance_single_exchange(exchange_code)
                 raw_by_exchange[exchange_code] = exchange_data
@@ -508,6 +531,7 @@ class KisUSClient:
             ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
         )
         
+        balance_complete = not failed_exchanges and len(exchange_result_counts) == len(exchanges)
         result_payload = {
             "rt_cd": "0",
             "output1": merged_output1,
@@ -516,10 +540,16 @@ class KisUSClient:
             "exchange_result_counts": exchange_result_counts,
             "raw_by_exchange": raw_by_exchange,
             "failed_exchanges": failed_exchanges,
+            "balance_complete": balance_complete,
+            "balance_authoritative": balance_complete,
             "raw_count": raw_count,
             "duplicate_skipped": duplicate_skipped,
         }
-        self._response_cache[cache_key] = (time.time(), result_payload)
+        # Never replace the last-good full snapshot with partial/uncertain data.
+        if balance_complete:
+            self._response_cache[cache_key] = (time.time(), result_payload)
+        self._stage_deadline = prior_stage_deadline
+        self._stage_max_attempts = prior_stage_max_attempts
         return result_payload
     
     def _get_us_balance_single_exchange(
@@ -565,12 +595,7 @@ class KisUSClient:
                     page,
                     exc,
                 )
-                # 첫 페이지 실패 시 빈 결과 반환
-                if page == 1:
-                    return {"rt_cd": "0", "output1": [], "output2": {}}
-                else:
-                    # 2페이지 이상 실패 시 지금까지 수집한 데이터 반환
-                    break
+                raise
             
             # output1
             page_output1 = result.get("output1", [])
@@ -1114,7 +1139,8 @@ class KisUSClient:
         
         return False
 
-    def _get(self, path: str, headers: dict, params: dict, *, suppress_final_log: bool = False) -> dict:
+    def _get(self, path: str, headers: dict, params: dict, *, suppress_final_log: bool = False,
+             max_attempts_override: int | None = None) -> dict:
         self._assert_not_offline(f"GET {path}")
         """GET 요청 with retry/backoff.
         
@@ -1126,7 +1152,7 @@ class KisUSClient:
         """
         import requests
         
-        max_attempts = 5
+        max_attempts = max(1, int(max_attempts_override or getattr(self, "_stage_max_attempts", None) or 5))
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
         last_error: Exception | None = None
         had_temp_error = False

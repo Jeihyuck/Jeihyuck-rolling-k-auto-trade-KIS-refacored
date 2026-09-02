@@ -240,6 +240,9 @@ def normalize_us_balance(raw: dict) -> dict:
         "balance_parse_error": None,
         "queried_exchanges": raw.get("queried_exchanges", []),
         "exchange_result_counts": raw.get("exchange_result_counts", {}),
+        "failed_exchanges": raw.get("failed_exchanges", {}),
+        "balance_complete": raw.get("balance_complete", True),
+        "balance_authoritative": raw.get("balance_authoritative", True),
     }
     
     # raw validation
@@ -972,7 +975,7 @@ class USDataProvider:
                 ctx.count("balance_http_calls")
             raw = self._get_client().get_us_balance(force_refresh=force_refresh)
             result = normalize_us_balance(raw)
-            if ctx is not None:
+            if ctx is not None and result.get("balance_complete", True):
                 ctx.balance_snapshot = result
                 ctx.balance_snapshot_at = __import__("time").monotonic()
             return result

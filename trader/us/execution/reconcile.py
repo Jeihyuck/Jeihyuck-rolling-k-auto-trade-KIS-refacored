@@ -136,6 +136,17 @@ def reconcile_positions(provider: Any | None = None, *, trade_date: str | None =
     balance_parse_status = balance.get("balance_parse_status", "UNKNOWN")
     balance_parse_error = balance.get("balance_parse_error")
 
+    if balance.get("balance_complete") is False or balance.get("balance_authoritative") is False:
+        logger.warning("[US_RECONCILE][BALANCE_INCOMPLETE] failed_exchanges=%s action=preserve_last_good_block_buy",
+                       balance.get("failed_exchanges"))
+        return {
+            "status": "TEMP_ERROR", "reason": "balance_incomplete",
+            "balance_fetch_status": "INCOMPLETE", "authoritative_positions": False,
+            "preserve_previous_positions": True, "block_new_entry": True,
+            "positions": [], "position_count": 0,
+            "failed_exchanges": balance.get("failed_exchanges") or {},
+        }
+
     logger.info("[US_RECONCILE][BALANCE_RAW] output1_count=%d", raw_output1_count)
 
     if positions:

@@ -121,3 +121,49 @@ def test_latency_accounting_ignores_nested_child_timers_and_is_bounded():
     assert accounted == 80
     assert unaccounted == 20
     assert 0 <= unaccounted <= 100
+
+
+def test_three_exchange_balance_timeouts_share_one_stage_budget(monkeypatch):
+    requests = pytest.importorskip("requests")
+    client = KisUSClient(offline=False)
+    client._build_headers = lambda _tr: {}
+    client._apply_rate_limit = lambda _path: None
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "0.1")
+    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.Timeout("slow exchange")))
+    started = time.monotonic()
+    result = client.get_us_balance(force_refresh=True)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.2
+    assert result["balance_complete"] is False
+    assert set(result["failed_exchanges"]) == {"NASD", "NYSE", "AMEX"}
+
+
+def test_partial_exchange_balance_is_not_cached_or_authoritative(monkeypatch):
+    from trader.us.execution.reconcile import reconcile_positions
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "1")
+
+    def exchange(exchange_code):
+        if exchange_code == "NYSE":
+            raise KisUSTemporaryError("NYSE timeout")
+        return {"output1": [{"ovrs_pdno": exchange_code, "ovrs_excg_cd": exchange_code,
+                              "ovrs_cblc_qty": "1", "ord_psbl_qty": "1"}], "output2": {}}
+
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", exchange)
+    raw = client.get_us_balance(force_refresh=True)
+    assert raw["balance_complete"] is False
+    assert raw["balance_authoritative"] is False
+    assert set(raw["failed_exchanges"]) == {"NYSE"}
+    assert ("balance", ("NASD", "NYSE", "AMEX")) not in client._response_cache
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {"positions": [{"symbol": "LAST_GOOD", "qty": 3}],
+                    "balance_complete": False, "balance_authoritative": False,
+                    "failed_exchanges": raw["failed_exchanges"]}
+
+    reconciled = reconcile_positions(provider=Provider(), trade_date="2026-09-01")
+    assert reconciled["block_new_entry"] is True
+    assert reconciled["preserve_previous_positions"] is True
+    assert reconciled["authoritative_positions"] is False
+    assert reconciled["positions"] == []
