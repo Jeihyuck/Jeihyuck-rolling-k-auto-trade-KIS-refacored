@@ -1040,6 +1040,8 @@ def route_order(
     if kis_client is None:
         from trader.us.execution.kis_us_client import KisUSClient
         kis_client = KisUSClient(env=_kis_env())
+    if context is not None and hasattr(kis_client, "bind_tick_context"):
+        kis_client.bind_tick_context(context)
 
     account_env = _kis_env()
     logger.info("[US_ORDER][BROKER_ENV] env=%s symbol=%s side=%s", account_env, symbol, side)

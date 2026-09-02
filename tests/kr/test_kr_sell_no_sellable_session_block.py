@@ -2,6 +2,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 import sqlalchemy as sa
 
 from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
@@ -159,6 +160,54 @@ def test_filled_tp1_allows_tp2_or_emergency_full_exit_with_fresh_remaining_balan
     assert not blocked
     blocked_full, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="FULL_EXIT")
     assert not blocked_full
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "ACKED", "UNRESOLVED_ACK"])
+def test_unconfirmed_tp1_never_unlocks_tp2(status):
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    OrdersRepo(db).create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=None, stage="TP1", client_order_key=f"tp1-{status}",
+        request_json={"trade_session": "day", "submitted_qty": 7, "pre_order_holding_qty": 14},
+        status=status, position_cycle_id="cycle-x",
+    )
+    balance = {"output1": [{"pdno": "010060", "hldg_qty": "7", "ord_psbl_qty": "7"}], "output2": [{}]}
+    engine, _ = _make_engine(db, FakeKis(), balance)
+    blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="TP2")
+    assert blocked
+
+
+@pytest.mark.parametrize("status", ["PARTIAL_FILLED", "FILLED"])
+def test_confirmed_tp1_with_fresh_remaining_balance_unlocks_tp2(status):
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    OrdersRepo(db).create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=None, stage="TP1", client_order_key=f"confirmed-{status}",
+        request_json={"trade_session": "day", "submitted_qty": 7, "pre_order_holding_qty": 14},
+        status=status, position_cycle_id="cycle-x",
+    )
+    balance = {"output1": [{"pdno": "010060", "hldg_qty": "7", "ord_psbl_qty": "7"}], "output2": [{}]}
+    engine, _ = _make_engine(db, FakeKis(), balance)
+    blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="TP2")
+    assert not blocked
+
+
+def test_failed_tp1_does_not_block_protective_full_exit():
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    OrdersRepo(db).create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code="010060", market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=None, stage="TP1", client_order_key="failed-protective",
+        request_json={"trade_session": "day"}, status="REJECTED", position_cycle_id="cycle-x",
+    )
+    engine, _ = _make_engine(db, FakeKis(), {"output1": [{"pdno": "010060", "hldg_qty": "14", "ord_psbl_qty": "14"}], "output2": [{}]})
+    blocked, _ = engine._durable_sell_block(code="010060", position_cycle_id="cycle-x", exit_stage="FULL_EXIT")
+    assert not blocked
 
 
 def test_production_partial_reason_stage_mapping_and_reason_family():

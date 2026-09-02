@@ -255,6 +255,13 @@ def calc_expected_min_ticks(*, session: str, start_dt: datetime, graceful_deadli
     return max(1, int((graceful_deadline - start_dt).total_seconds() // interval_sec))
 
 
+def effective_child_tick_budget(*, watchdog_sec: float, configured_deadline_sec: float,
+                                cleanup_reserve_sec: float) -> float:
+    """Budget the child strictly inside the parent process watchdog."""
+    reserve = max(5.0, float(cleanup_reserve_sec))
+    return max(0.001, min(float(configured_deadline_sec), float(watchdog_sec) - reserve))
+
+
 def _signal_name(signum: int | None) -> str:
     if signum is None:
         return ""
@@ -1228,6 +1235,13 @@ def run_trade_session(
                 try:
                     write_heartbeat_file(session, run_id, tick_count, phase="TICK_START", last_stage=last_stage)
                     order_activity_before = _count_trade_date_order_activity(trade_date)
+                    configured_deadline_sec = float(os.getenv("US_TICK_DEADLINE_SEC", str(tick_timeout_sec)))
+                    cleanup_reserve_sec = float(os.getenv("US_TICK_CLEANUP_RESERVE_SEC", "5"))
+                    child_budget_sec = effective_child_tick_budget(
+                        watchdog_sec=tick_timeout_sec,
+                        configured_deadline_sec=configured_deadline_sec,
+                        cleanup_reserve_sec=cleanup_reserve_sec,
+                    )
                     tick_kwargs = dict(
                             session=session,
                             env=env,
@@ -1254,6 +1268,9 @@ def run_trade_session(
                             blocked_symbol_sides=[list(x) for x in sorted(timeout_blocked_symbol_sides)],
                             session_balance_temp_error_count=temp_error_count,
                             balance_consecutive_failed_ticks=consecutive_balance_failed_ticks,
+                            # One authoritative absolute monotonic deadline is
+                            # shared by the watchdog, child and all KIS I/O.
+                            tick_deadline_monotonic=time_mod.monotonic() + child_budget_sec,
                         )
                     # Legacy marker retained for deploy-diff scanners; hard timeout
                     # no longer uses: pool.shutdown(wait=False, cancel_futures=True)

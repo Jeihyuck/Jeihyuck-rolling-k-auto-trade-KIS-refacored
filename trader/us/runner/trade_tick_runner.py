@@ -26,6 +26,20 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_ACCOUNTED_TOP_LEVEL_STAGES = (
+    "prep_status_ms", "watchlist_load_ms", "position_reconcile_ms",
+    "exit_engine_ms", "market_state_ms", "tqqq_infinite_ms",
+    "entry_engine_ms", "risk_gate_ms", "order_route_ms",
+)
+
+
+def calculate_latency_accounting(total_ms: float, stage_metrics: dict[str, float]) -> tuple[float, float]:
+    """Account only non-nested stage timers and keep the remainder bounded."""
+    total = max(0.0, float(total_ms))
+    accounted = min(total, sum(max(0.0, float(stage_metrics.get(key, 0.0)))
+                               for key in _ACCOUNTED_TOP_LEVEL_STAGES))
+    return round(accounted, 3), round(total - accounted, 3)
+
 # Contract marker: raw universe fallback is disabled in US trade tick path.
 RAW_UNIVERSE_FALLBACK = "raw_universe_fallback_disabled"
 
@@ -965,6 +979,7 @@ def route_exit_orders_immediately(
     kis_order_allowed: bool,
     current_position_symbols: set[str],
     context=None,
+    kis_client=None,
 ) -> dict:
     """Route SELL intents before any entry watchlist/evaluation work.
 
@@ -989,6 +1004,7 @@ def route_exit_orders_immediately(
                 allowed_symbols=None,
                 current_position_symbols=current_position_symbols if current_position_symbols else None,
                 context=context,
+                kis_client=kis_client,
             )
             orders.append(result)
             status = str(result.get("status") or "ERROR")
@@ -1074,6 +1090,7 @@ def run_trade_tick(
     blocked_symbol_sides: list[list[str]] | None = None,
     session_balance_temp_error_count: int = 0,
     balance_consecutive_failed_ticks: int = 0,
+    tick_deadline_monotonic: float | None = None,
 ) -> dict:
     """미국장 단일 tick 실행.
 
@@ -1229,7 +1246,8 @@ def run_trade_tick(
         locked_watchlist=list(locked_watchlist_cache) if locked_watchlist_cache is not None else None,
         cancellation_token=tick_cancellation_event,
         active_session_state_path=active_session_state_path,
-        deadline=tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0),
+        deadline=(tick_deadline_monotonic if tick_deadline_monotonic is not None else
+                  tick_started_at + max(1.0, float(os.getenv("US_TICK_DEADLINE_SEC", os.getenv("US_TICK_TIMEOUT_SEC", "270"))) - 5.0)),
     )
     if hasattr(provider, "bind_tick_context"):
         provider.bind_tick_context(tick_context)
@@ -1237,6 +1255,10 @@ def run_trade_tick(
         # Test/custom providers participate without having to inherit the
         # concrete provider class.
         setattr(provider, "_tick_context", tick_context)
+    # Production provider exposes its already context-bound client.  Lightweight
+    # test/custom providers may intentionally omit a broker client, in which
+    # case route_order retains its own context-binding fallback.
+    routing_kis_client = provider._get_client() if hasattr(provider, "_get_client") else None
     real_order_mode = (
         os.getenv("DRY_RUN", "0") == "0"
         and os.getenv("US_KIS_ORDER_ALLOWED", "1") == "1"
@@ -2081,6 +2103,7 @@ def run_trade_tick(
         kis_order_allowed=kis_order_allowed,
         current_position_symbols=current_position_symbols,
         context=tick_context,
+        kis_client=routing_kis_client,
     )
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
@@ -2866,6 +2889,7 @@ def run_trade_tick(
                 allowed_symbols=_router_allowed_symbols,
                 current_position_symbols=_router_position_symbols,
                 context=tick_context,
+                kis_client=routing_kis_client,
                 now=now,
                 projected_cluster_exposure=_router_risk_state["cluster_exposure"],
                 cluster_caps_usd=_router_risk_state["cluster_caps_usd"],
@@ -3355,6 +3379,14 @@ def run_trade_tick(
         "risk_gate_ms": float(tick_context.metrics.get("risk_gate_ms", 0)),
         "order_route_ms": float(tick_context.metrics.get("order_route_ms", 0)),
     }
+    accounted_stage_ms, unaccounted_ms = calculate_latency_accounting(tick_total_ms, latency_metrics)
+    latency_metrics["accounted_stage_ms"] = accounted_stage_ms
+    latency_metrics["unaccounted_ms"] = unaccounted_ms
+    latency_log = logger.warning if unaccounted_ms > 2000 else logger.info
+    latency_log(
+        "[US_TICK][LATENCY_ACCOUNTING] total_ms=%s accounted_ms=%s unaccounted_ms=%s",
+        tick_total_ms, accounted_stage_ms, unaccounted_ms,
+    )
     logger.info("[US_TICK][LATENCY] tick=%s total_ms=%s balance_ms=%s fills_ms=%s prices_ms=%s db_fill_persist_ms=%s balance_logical_calls=%s balance_http_calls=%s fill_logical_calls=%s",
                 tick_index, tick_total_ms, latency_metrics["balance_snapshot_ms"], latency_metrics["fill_fetch_ms"], latency_metrics["price_fetch_ms"], latency_metrics["fill_persist_ms"], latency_metrics["balance_snapshot_logical_calls"], latency_metrics["balance_http_calls"], latency_metrics["fill_fetch_logical_calls"])
     return {

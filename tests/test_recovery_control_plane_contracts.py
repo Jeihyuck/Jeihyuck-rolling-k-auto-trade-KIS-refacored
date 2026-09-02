@@ -54,6 +54,7 @@ def test_kr_us_token_refresh_locks_prevent_reissue_storm():
     kr = Path('trader/kis_wrapper.py').read_text()
     us = Path('trader/us/execution/kis_us_client.py').read_text()
     assert 'fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)' in kr
-    assert 'fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)' in us
+    assert 'fcntl.LOCK_EX | fcntl.LOCK_NB' in us
+    assert 'tick deadline exhausted waiting for token lock' in us
     assert 'cache_after_lock' in kr
     assert 'CACHE_AFTER_LOCK' in us

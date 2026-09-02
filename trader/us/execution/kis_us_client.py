@@ -205,6 +205,34 @@ class KisUSClient:
             self._acnt_prdt_cd,
             str(self._env == "practice").lower(),
         )
+        self._tick_context = None
+        self._stage_deadline: float | None = None
+        self._stage_max_attempts: int | None = None
+
+    def bind_tick_context(self, context: Any) -> "KisUSClient":
+        self._tick_context = context
+        return self
+
+    def _request_budget(self, configured_timeout: float = 10.0, reserve: float = 0.05) -> float:
+        """Return a request timeout bounded by the authoritative tick deadline."""
+        remaining = float("inf") if self._tick_context is None else float(self._tick_context.remaining_sec())
+        stage_deadline = getattr(self, "_stage_deadline", None)
+        if stage_deadline is not None:
+            remaining = min(remaining, max(0.0, stage_deadline - time.monotonic()))
+        if remaining == float("inf"):
+            return configured_timeout
+        if remaining <= reserve:
+            raise KisUSTemporaryError("tick deadline budget exhausted before KIS request")
+        return max(0.001, min(configured_timeout, remaining - reserve))
+
+    def _sleep_with_budget(self, delay: float, reserve: float = 0.05) -> bool:
+        if self._tick_context is not None and not self._tick_context.has_budget(delay + reserve):
+            return False
+        stage_deadline = getattr(self, "_stage_deadline", None)
+        if stage_deadline is not None and time.monotonic() + delay + reserve > stage_deadline:
+            return False
+        time.sleep(delay)
+        return True
 
     # ------------------------------------------------------------------
     # Auth
@@ -227,7 +255,13 @@ class KisUSClient:
         import fcntl
         _, lock_path = _token_cache_paths(self._env)
         with lock_path.open("w", encoding="utf-8") as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if not self._sleep_with_budget(0.05):
+                        raise KisUSTemporaryError("tick deadline exhausted waiting for token lock") from exc
             file_cached = _read_token_file(self._env)
             if file_cached:
                 _TOKEN_CACHE.update(file_cached)
@@ -239,7 +273,10 @@ class KisUSClient:
                 text = str(exc)
                 if "EGW00133" in text or "1분당 1회" in text or "1분 1회" in text or "1 minute" in text or "timeout" in text.lower():
                     logger.warning("[US_AUTH][TOKENP_UNKNOWN_OR_RATE_LIMIT] wait=65 err=%s", exc)
-                    time.sleep(65)
+                    if not self._sleep_with_budget(65.0):
+                        raise KisUSTemporaryError(
+                            "tick deadline exhausted before token refresh wait"
+                        ) from exc
                 fallback = _read_token_file(self._env)
                 if fallback:
                     _TOKEN_CACHE.update(fallback)
@@ -262,7 +299,7 @@ class KisUSClient:
             "appkey": self._app_key,
             "appsecret": self._app_secret,
         }
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload, timeout=self._request_budget())
         resp.raise_for_status()
         data = resp.json()
         token = data.get("access_token")
@@ -412,86 +449,110 @@ class KisUSClient:
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
             return cached[1]
 
-        logger.info("[US_BALANCE] querying exchanges=%s", exchanges)
+        configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
+        tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
+        reserve = max(0.05, float(os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1")))
+        balance_budget = min(configured_budget, max(0.0, tick_remaining - reserve))
+        if balance_budget <= 0:
+            raise KisUSTemporaryError("balance stage budget exhausted before fetch")
+        prior_stage_deadline = self._stage_deadline
+        prior_stage_max_attempts = self._stage_max_attempts
+        self._stage_deadline = time.monotonic() + balance_budget
+        self._stage_max_attempts = 2
+        logger.info("[US_BALANCE] querying exchanges=%s budget_sec=%.3f", exchanges, balance_budget)
         
-        merged_output1: list[dict] = []
-        exchange_result_counts: dict[str, int] = {}
-        raw_by_exchange: dict[str, Any] = {}
-        failed_exchanges: dict[str, str] = {}
-        merged_output2: dict = {}
+        try:
+            merged_output1: list[dict] = []
+            exchange_result_counts: dict[str, int] = {}
+            raw_by_exchange: dict[str, Any] = {}
+            failed_exchanges: dict[str, str] = {}
+            merged_output2: dict = {}
         
-        for exchange_code in exchanges:
-            try:
-                exchange_data = self._get_us_balance_single_exchange(exchange_code)
-                raw_by_exchange[exchange_code] = exchange_data
+            for index, exchange_code in enumerate(exchanges):
+                if time.monotonic() >= self._stage_deadline:
+                    for skipped in exchanges[index:]:
+                        exchange_result_counts[skipped] = 0
+                        failed_exchanges[skipped] = "BALANCE_STAGE_BUDGET_EXHAUSTED"
+                    break
+                try:
+                    exchange_data = self._get_us_balance_single_exchange(exchange_code)
+                    raw_by_exchange[exchange_code] = exchange_data
                 
-                # output1 병합
-                ex_output1 = exchange_data.get("output1", [])
-                if isinstance(ex_output1, dict):
-                    ex_output1 = [ex_output1]
-                elif not isinstance(ex_output1, list):
-                    ex_output1 = []
+                    # output1 병합
+                    ex_output1 = exchange_data.get("output1", [])
+                    if isinstance(ex_output1, dict):
+                        ex_output1 = [ex_output1]
+                    elif not isinstance(ex_output1, list):
+                        ex_output1 = []
                 
-                # 각 row에 exchange 태깅
-                for row in ex_output1:
-                    if isinstance(row, dict):
-                        if "ovrs_excg_cd" not in row:
-                            row["ovrs_excg_cd"] = exchange_code
-                        merged_output1.append(row)
+                    # 각 row에 exchange 태깅
+                    for row in ex_output1:
+                        if isinstance(row, dict):
+                            if "ovrs_excg_cd" not in row:
+                                row["ovrs_excg_cd"] = exchange_code
+                            merged_output1.append(row)
                 
-                exchange_result_counts[exchange_code] = len(ex_output1)
+                    exchange_result_counts[exchange_code] = len(ex_output1)
                 
-                # output2 병합 (첫 번째 유효한 것 사용)
-                if not merged_output2:
-                    ex_output2 = exchange_data.get("output2")
-                    if isinstance(ex_output2, list) and ex_output2:
-                        merged_output2 = ex_output2[0] if isinstance(ex_output2[0], dict) else {}
-                    elif isinstance(ex_output2, dict):
-                        merged_output2 = ex_output2
+                    # output2 병합 (첫 번째 유효한 것 사용)
+                    if not merged_output2:
+                        ex_output2 = exchange_data.get("output2")
+                        if isinstance(ex_output2, list) and ex_output2:
+                            merged_output2 = ex_output2[0] if isinstance(ex_output2[0], dict) else {}
+                        elif isinstance(ex_output2, dict):
+                            merged_output2 = ex_output2
                 
-                logger.info(
-                    "[US_BALANCE][EXCHANGE][DONE] exchange=%s count=%d",
-                    exchange_code,
-                    len(ex_output1),
-                )
+                    logger.info(
+                        "[US_BALANCE][EXCHANGE][DONE] exchange=%s count=%d",
+                        exchange_code,
+                        len(ex_output1),
+                    )
             
-            except Exception as exc:
-                logger.warning(
-                    "[US_BALANCE][EXCHANGE][ERROR] exchange=%s error=%s",
-                    exchange_code,
-                    exc,
-                )
-                exchange_result_counts[exchange_code] = 0
-                failed_exchanges[exchange_code] = str(exc)
-                # 일부 거래소 실패 시 계속 진행 (다른 거래소 결과가 있으면 OK)
-                continue
+                except Exception as exc:
+                    logger.warning(
+                        "[US_BALANCE][EXCHANGE][ERROR] exchange=%s error=%s",
+                        exchange_code,
+                        exc,
+                    )
+                    exchange_result_counts[exchange_code] = 0
+                    failed_exchanges[exchange_code] = str(exc)
+                    # 일부 거래소 실패 시 계속 진행 (다른 거래소 결과가 있으면 OK)
+                    continue
         
-        # symbol 중복 병합
-        raw_count = sum(exchange_result_counts.values())
-        merged_output1 = self._merge_duplicate_symbols(merged_output1)
-        duplicate_skipped = max(0, raw_count - len(merged_output1))
+            # symbol 중복 병합
+            raw_count = sum(exchange_result_counts.values())
+            merged_output1 = self._merge_duplicate_symbols(merged_output1)
+            duplicate_skipped = max(0, raw_count - len(merged_output1))
         
-        logger.info(
-            "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
-            raw_count,
-            len(merged_output1),
-            duplicate_skipped,
-            ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
-        )
+            logger.info(
+                "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
+                raw_count,
+                len(merged_output1),
+                duplicate_skipped,
+                ",".join([row.get("ovrs_pdno", row.get("pdno", "?")) for row in merged_output1 if isinstance(row, dict)]),
+            )
         
-        result_payload = {
-            "rt_cd": "0",
-            "output1": merged_output1,
-            "output2": merged_output2,
-            "queried_exchanges": exchanges,
-            "exchange_result_counts": exchange_result_counts,
-            "raw_by_exchange": raw_by_exchange,
-            "failed_exchanges": failed_exchanges,
-            "raw_count": raw_count,
-            "duplicate_skipped": duplicate_skipped,
-        }
-        self._response_cache[cache_key] = (time.time(), result_payload)
-        return result_payload
+            balance_complete = not failed_exchanges and len(exchange_result_counts) == len(exchanges)
+            result_payload = {
+                "rt_cd": "0",
+                "output1": merged_output1,
+                "output2": merged_output2,
+                "queried_exchanges": exchanges,
+                "exchange_result_counts": exchange_result_counts,
+                "raw_by_exchange": raw_by_exchange,
+                "failed_exchanges": failed_exchanges,
+                "balance_complete": balance_complete,
+                "balance_authoritative": balance_complete,
+                "raw_count": raw_count,
+                "duplicate_skipped": duplicate_skipped,
+            }
+            # Never replace the last-good full snapshot with partial/uncertain data.
+            if balance_complete:
+                self._response_cache[cache_key] = (time.time(), result_payload)
+            return result_payload
+        finally:
+            self._stage_deadline = prior_stage_deadline
+            self._stage_max_attempts = prior_stage_max_attempts
     
     def _get_us_balance_single_exchange(
         self,
@@ -536,12 +597,7 @@ class KisUSClient:
                     page,
                     exc,
                 )
-                # 첫 페이지 실패 시 빈 결과 반환
-                if page == 1:
-                    return {"rt_cd": "0", "output1": [], "output2": {}}
-                else:
-                    # 2페이지 이상 실패 시 지금까지 수집한 데이터 반환
-                    break
+                raise
             
             # output1
             page_output1 = result.get("output1", [])
@@ -1051,7 +1107,10 @@ class KisUSClient:
         if elapsed < interval:
             sleep_time = interval - elapsed
             logger.debug(f"[US_KIS][RATE_LIMIT] path={path!r} sleep={sleep_time:.3f}s")
-            time.sleep(sleep_time)
+            if not self._sleep_with_budget(sleep_time):
+                raise KisUSTemporaryError(
+                    f"rate-limit wait exceeds tick deadline path={path}"
+                )
         
         self._last_request_time[endpoint_key] = time.time()
 
@@ -1082,7 +1141,8 @@ class KisUSClient:
         
         return False
 
-    def _get(self, path: str, headers: dict, params: dict, *, suppress_final_log: bool = False) -> dict:
+    def _get(self, path: str, headers: dict, params: dict, *, suppress_final_log: bool = False,
+             max_attempts_override: int | None = None) -> dict:
         self._assert_not_offline(f"GET {path}")
         """GET 요청 with retry/backoff.
         
@@ -1094,7 +1154,7 @@ class KisUSClient:
         """
         import requests
         
-        max_attempts = 5
+        max_attempts = max(1, int(max_attempts_override or getattr(self, "_stage_max_attempts", None) or 5))
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
         last_error: Exception | None = None
         had_temp_error = False
@@ -1106,7 +1166,7 @@ class KisUSClient:
                 
                 url = self._base_url + path
                 record_kis_http_call("GET", path)
-                resp = requests.get(url, headers=headers, params=params, timeout=10)
+                resp = requests.get(url, headers=headers, params=params, timeout=self._request_budget())
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
@@ -1152,7 +1212,10 @@ class KisUSClient:
                         f"[US_KIS][TEMP_ERROR] endpoint=GET_{path.split('/')[-1]} "
                         f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
-                    time.sleep(sleep_time)
+                    if not self._sleep_with_budget(sleep_time):
+                        raise KisUSTemporaryError(
+                            f"GET {path} retry aborted: tick deadline budget exhausted"
+                        ) from err
                     continue
                 
                 # 최종 실패
@@ -1181,7 +1244,12 @@ class KisUSClient:
         """POST 요청 with retry/backoff."""
         import requests
         
-        max_attempts = 5
+        # Broker order submission is non-idempotent at the HTTP boundary.  A
+        # timeout/connection loss/5xx may mean KIS accepted the order, so never
+        # blind-replay an order POST; the router journals the unknown outcome
+        # and reconciliation establishes broker truth.
+        is_order_submit = "order" in path.lower()
+        max_attempts = 1 if is_order_submit else 5
         backoff_schedule = [0.7, 1.5, 3.0, 5.0]  # seconds
         last_error: Exception | None = None
         had_temp_error = False
@@ -1193,7 +1261,7 @@ class KisUSClient:
                 
                 url = self._base_url + path
                 record_kis_http_call("POST", path)
-                resp = requests.post(url, headers=headers, json=body, timeout=10)
+                resp = requests.post(url, headers=headers, json=body, timeout=self._request_budget())
                 resp.raise_for_status()
                 data = resp.json()
                 self._check_rt_cd(data)
@@ -1239,7 +1307,10 @@ class KisUSClient:
                         f"[US_KIS][TEMP_ERROR] endpoint=POST_{path.split('/')[-1]} "
                         f"attempt={attempt}/{max_attempts} error={err!r} backoff={sleep_time:.2f}s"
                     )
-                    time.sleep(sleep_time)
+                    if not self._sleep_with_budget(sleep_time):
+                        raise KisUSTemporaryError(
+                            f"POST {path} retry aborted: tick deadline budget exhausted"
+                        ) from err
                     continue
                 
                 # 최종 실패
