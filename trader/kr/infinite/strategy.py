@@ -20,6 +20,11 @@ KR_ADAPTIVE_TP_MAP: dict[str, tuple[float, float, str]] = {
     "KR_STRONG_RISK_ON": (0.07, 0.50, "TP1"),
 }
 
+
+def _is_tp1_filled_stage(stage: str) -> bool:
+    normalized = str(stage or "").upper()
+    return normalized.startswith("TP1") and normalized.endswith("_FILLED")
+
 # Import-time failure makes STATE_ORDER the enforceable source of truth in every
 # runtime and CI entry point, rather than relying only on a dedicated test.
 if set(KR_ADAPTIVE_TP_MAP) != set(STATE_ORDER):
@@ -77,8 +82,10 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     if state.status == Status.COMPLETE and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if state.status == Status.ACTIVE and (not state.cycle_id or position.qty == 0): return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price > 0:
+        partial_exit_pending = bool((state.metadata or {}).get("partial_exit_pending"))
+        pending_status = Status.ACTIVE if partial_exit_pending else Status.EXIT_PENDING
         if pending_sell:
-            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=pending_status)
         profit_pct = position.current_price / position.average_price - 1.0
         metadata = dict(state.metadata or {})
         stage = str(metadata.get("profit_stage") or "NONE").upper()
@@ -86,7 +93,7 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
         if pending_stage in {"TP1_SUBMITTED", "TP1_DEFENSE_SUBMITTED", "TP1_REBOUND_PENDING_SUBMITTED",
                              "TP1_REBOUND_CONFIRMED_SUBMITTED", "TP2_SUBMITTED",
                              "CAPITAL_RECOVERY_SUBMITTED"}:
-            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=pending_status)
         state_name = str(market_state or "").upper()
         if state_name not in KR_ADAPTIVE_TP_MAP:
             return Decision(Action.BLOCK, "KR_INF_UNMAPPED_REGIME")
@@ -96,21 +103,29 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
                 units_used=state.units_used,
                 cycle_age_trading_days=state.cycle_age_trading_days,
             )
-        elif stage in {"TP1", "TP1_FILLED"}:
+        elif stage == "TP1" or _is_tp1_filled_stage(stage):
             threshold = 0.10 if state_name in {"KR_RISK_ON", "KR_STRONG_RISK_ON"} else 0.07
             fraction, next_stage = 1.0, "TP2"
         else:
             threshold, fraction, next_stage = 999.0, 0.0, "NONE"
         if profit_pct >= threshold and next_stage != "NONE":
             if pending_sell:
-                return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+                return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=pending_status)
             orderable = int(position.orderable_qty or 0)
             if orderable <= 0:
                 return Decision(Action.WAIT, "KR_INF_PROFIT_NO_ORDERABLE_QTY")
-            sell_qty = min(orderable, max(1, int(orderable * fraction)))
+            remaining_target = int(metadata.get("tp1_remaining_target_qty") or 0)
+            if next_stage.startswith("TP1") and remaining_target > 0:
+                sell_qty = min(orderable, remaining_target)
+            else:
+                sell_qty = min(orderable, max(1, int(orderable * fraction)))
             if next_stage == "TP2" or fraction >= 0.99:
                 sell_qty = orderable
-            key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}")
+            retry = int(metadata.get("tp1_retry_sequence") or 0)
+            key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}",
+                                  retry or None)
+            if retry:
+                key = f"{key}:RETRY:{retry}"
             sell_action = Action.SELL_PARTIAL if sell_qty < position.qty else Action.SELL_ALL
             assert (sell_action != Action.SELL_ALL or sell_qty == position.qty)
             assert (sell_action != Action.SELL_PARTIAL or position.qty - sell_qty > 0)

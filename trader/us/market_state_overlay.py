@@ -870,14 +870,10 @@ def build_profit_capture_intents(positions: list[dict], overlay: dict, existing_
                     lifecycle = str(p.get("position_lifecycle_id"))
                     order_key = f"US_PC_{trade_date or 'NA'}_{sym}_{lifecycle}_{reason}"
                     intents.append({"symbol": sym, "side": "SELL", "qty": qty, "quantity": qty, "limit_price": price, "notional_usd": qty * price, "reason": reason, "client_order_key": order_key, "position_lifecycle_id": lifecycle, "meta": {"reason": reason, "profit_capture_stage": flag.replace("_done", ""), "position_lifecycle_id": lifecycle, "broker_avg_price": str(broker_avg), **avg_provenance, "return_rate_at_decision": str(return_rate), "tp_threshold_fraction": str(threshold), "runner_remaining_pct": (q - qty) / q, "market_state": overlay.get("market_state"), "last_profit_capture_at": (now or datetime.now(timezone.utc)).isoformat()}})
-                    if trade_date:
-                        try:
-                            from trader.us.db.repos import mark_us_profit_capture_stage
-                            mark_us_profit_capture_stage(trade_date, sym, flag.replace("_done", ""), position_lifecycle_id=lifecycle, order_key=order_key, qty=qty, notional_usd=qty * price, status="PENDING")
-                            state[pending_flag] = True
-                            profit_capture_state[sym] = state
-                        except Exception as exc:
-                            logger.warning("[US_PROFIT_CAPTURE][STATE_MARK_WARN] symbol=%s stage=%s err=%s", sym, flag, exc)
+                    # Intent construction is pure. Durable *_pending starts
+                    # only after the router records broker ACK/open evidence.
+                    logger.info("[US_PROFIT_CAPTURE][INTENT_CREATED] strategy_owner=US_STANDARD symbol=%s side=SELL lifecycle_id=%s client_order_key=%s",
+                                sym, lifecycle, order_key)
                     logger.info("[US_PROFIT_CAPTURE][DECISION] symbol=%s broker_avg_price=%s executable_price=%s return_rate=%s threshold_unit=fraction threshold=%s decision=SUBMIT stage=%s", sym, broker_avg, executable, return_rate, threshold, reason)
                 break
     return intents

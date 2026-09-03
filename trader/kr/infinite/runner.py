@@ -15,6 +15,7 @@ from .config import InfiniteConfig
 from .diagnostics import log_decision
 from .executor import KISExecutor
 from .models import Action, BrokerPosition, Decision, State, Status
+from .lifecycle import settle_partial_exit
 from .policy_state import cycle_id
 from .reconciliation import reconcile
 from .reconciliation import reconcile_order_fill_prices
@@ -61,11 +62,34 @@ def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: S
                        trade_date: date) -> tuple[State | None, list]:
     updates = []
     for intent in repo.pending_intents():
-        broker = executor.order_state(intent, trade_date)
+        # Broker inquiry is date-partitioned.  Using today's date for an older
+        # intent makes valid terminal evidence invisible forever.
+        broker = executor.order_state(intent, intent.trade_date)
+        logger.info("[KR_INF][PENDING_SOURCE] strategy_owner=KR_INFINITE symbol=122630 side=%s cycle_id=%s client_order_key=%s trade_date=%s broker_status=%s",
+                    intent.side, intent.cycle_id, intent.idempotency_key, intent.trade_date, broker.status)
         updates.append((intent, broker))
-        if state is not None:
+        if state is not None and intent.cycle_id == state.cycle_id:
             state, _, _ = apply_confirmed_fill(state, intent, broker, trade_date)
+    old_cycle_updates = [(intent, broker) for intent, broker in updates
+                         if state is None or intent.cycle_id != state.cycle_id]
+    if old_cycle_updates and hasattr(repo, "persist_intent_reconciliation"):
+        repo.persist_intent_reconciliation(old_cycle_updates)
     return state, updates
+
+
+def _settle_terminal_partial_exits(*, state: State | None, updates: list,
+                                   position: BrokerPosition, trade_date: date,
+                                   allocated_capital_krw: float, total_units: int) -> State | None:
+    """Use one settlement path for delayed and immediate broker evidence."""
+    if state is None:
+        return None
+    for intent, broker_state in updates:
+        if intent.side == "SELL_PARTIAL" and intent.cycle_id == state.cycle_id:
+            state = settle_partial_exit(
+                state, intent, broker_state, position, trade_date,
+                allocated_capital_krw=allocated_capital_krw, total_units=total_units,
+            )
+    return state
 
 
 def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
@@ -104,6 +128,19 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # without a broker id is deliberately retained and never blindly retried.
         state, updates = _reconcile_pending(repository, executor, state, day)
         position = executor.position(config.symbol)
+        # Apply a buy-round rollover only after both terminal fill evidence and
+        # the fresh authoritative broker position are available.
+        if state is not None:
+            allocated = state.allocated_capital_krw
+            if allocated <= 0 and balance_snapshot:
+                equity = float(balance_snapshot.get("account_equity") or balance_snapshot.get("total_evaluation") or 0)
+                allocated = equity * config.account_exposure_pct
+            if allocated <= 0:
+                allocated = executor.account_equity() * config.account_exposure_pct
+            state = _settle_terminal_partial_exits(
+                state=state, updates=updates, position=position, trade_date=day,
+                allocated_capital_krw=allocated, total_units=config.total_units,
+            )
         if state is None and position.qty > 0:
             state = State(status=Status.ACTIVE, cycle_id=f"BROKER_ADOPTION-{day.isoformat()}",
                           cycle_start_date=day,
@@ -112,7 +149,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                                     "broker_average_price": position.average_price,
                                     "broker_orderable_qty": position.orderable_qty})
             repository.save_state(state)
-        unresolved_sell = any(i.side in {"SELL_PARTIAL", "SELL_ALL"} and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
+        unresolved_sell = any(i.cycle_id == (state.cycle_id if state else None)
+                              and i.side in {"SELL_PARTIAL", "SELL_ALL"} and broker.status not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
                               for i, broker in updates)
         state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell,
                                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
@@ -139,7 +177,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             capital_preservation=age >= config.long_cycle_days)
             repository.save_state(state)
         existing_keys = repository.intent_keys()
-        pending = repository.pending_intents()
+        pending = [item for item in repository.pending_intents()
+                   if state is None or item.cycle_id == state.cycle_id]
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
         pending_sell = any(item.side in {"SELL_PARTIAL", "SELL_ALL"} for item in pending)
 
@@ -200,8 +239,12 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             desired = str(decision.metadata.get("desired_profit_stage") or "")
             pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
-            state = replace(state, status=Status.EXIT_PENDING,
-                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
+            # Partial profit-taking is a sleeve-local fence, never the global
+            # full-liquidation state.
+            next_status = Status.ACTIVE if decision.action == Action.SELL_PARTIAL else Status.EXIT_PENDING
+            state = replace(state, status=next_status,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage,
+                                      "partial_exit_pending": decision.action == Action.SELL_PARTIAL})
             repository.save_state(state)
         try:
             order_id, _ = executor.submit(decision, config.symbol)
@@ -213,6 +256,11 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # One immediate reconciliation is safe; absence of a fill consumes no unit.
         state, post_updates = _reconcile_pending(repository, executor, state, day)
         post_position = executor.position(config.symbol)
+        state = _settle_terminal_partial_exits(
+            state=state, updates=post_updates, position=post_position, trade_date=day,
+            allocated_capital_krw=state.allocated_capital_krw if state else 0,
+            total_units=config.total_units,
+        )
         for intent, broker_state in post_updates:
             reconciliation = reconcile_order_fill_prices(
                 order_price=position.current_price,

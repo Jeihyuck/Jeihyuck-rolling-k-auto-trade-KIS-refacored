@@ -30,6 +30,15 @@ class FakeRepository:
     def reconcile_metadata(self, state, **_): return state
 
 
+class TwoTickRolloverRepository(FakeRepository):
+    def __init__(self, state, fill):
+        super().__init__(state)
+        self.fill = fill
+
+    def cycle_fill_stats(self, *_):
+        return {"last_profit_fill": self.fill}
+
+
 def test_explicit_kill_is_strict_no_db_no_router(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "0")
     repo = FakeRepository()
@@ -65,6 +74,62 @@ def test_order_mode_uses_injected_existing_router_once(monkeypatch):
     assert routed[0]["client_order_key"].startswith("TQQQ_INF_V3:")
     assert routed[0]["client_order_key"].endswith(":2026-08-11:BUY")
     assert routed[0]["meta"]["cycle_id"]
+
+
+def test_partial_rollover_waits_for_authoritative_residual_across_production_ticks(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "0")
+    state = InfiniteState(
+        cycle_id="CYCLE-A", cycle_start_date=date(2026, 8, 1),
+        status=Status.ACTIVE, core_filled_notional=2_000,
+        metadata={"profit_stage": "TP1_FILLED", "buy_round": 3,
+                  "buy_round_units_used": 17},
+    )
+    fill = {"order_status": "FILLED", "filled_qty": 10, "requested_qty": 10,
+            "filled_notional": 1_200, "order_key": "tp-1"}
+    repo = TwoTickRolloverRepository(state, fill)
+
+    unavailable = run_sleeve(
+        positions=[{"symbol": "TQQQ", "qty": 20, "avg_price": 100, "orderable_qty": 20}],
+        price=120, trading_date=date(2026, 9, 3),
+        overlay={**market("NORMAL"), "broker_position_authoritative": False},
+        repository=repo,
+    )
+
+    assert unavailable["decision"].action.value == "SELL"
+    assert repo.state.cycle_id == "CYCLE-A"
+    assert repo.state.metadata["buy_round"] == 3
+    assert repo.state.metadata["buy_round_units_used"] == 17
+    assert repo.state.metadata["partial_rollover_pending"] is True
+    assert repo.state.metadata["partial_rollover_wait_reason"] == "authoritative_residual_required"
+    assert "rollover_seed_qty" not in repo.state.metadata
+    assert repo.state.metadata.get("ownership_source") != "KIS_BALANCE_AUTHORITATIVE"
+
+    available = run_sleeve(
+        positions=[{"symbol": "TQQQ", "qty": 12, "avg_price": 110, "orderable_qty": 12}],
+        price=132, trading_date=date(2026, 9, 4),
+        overlay={**market("NORMAL"), "broker_position_authoritative": True},
+        repository=repo,
+    )
+
+    assert available["decision"].action.value == "SELL"
+    assert repo.state.cycle_id == "CYCLE-A"
+    assert repo.state.metadata["rollover_seed_qty"] == 12
+    assert repo.state.metadata["rollover_seed_avg"] == 110
+    assert repo.state.metadata["rollover_seed_capital_usd"] == 1320
+    assert repo.state.metadata["buy_round"] == 4
+    assert repo.state.metadata["buy_round_units_used"] == 0
+    assert repo.state.metadata["ownership_source"] == "KIS_BALANCE_AUTHORITATIVE"
+    assert repo.state.metadata["partial_rollover_pending"] is False
+
+    run_sleeve(
+        positions=[{"symbol": "TQQQ", "qty": 12, "avg_price": 110, "orderable_qty": 12}],
+        price=132, trading_date=date(2026, 9, 4),
+        overlay={**market("NORMAL"), "broker_position_authoritative": True},
+        repository=repo,
+    )
+    assert repo.state.metadata["buy_round"] == 4
+    assert repo.state.metadata["last_partial_rollover_order_key"] == "tp-1"
 
 
 def test_invalid_or_stale_quote_never_reaches_router(monkeypatch):

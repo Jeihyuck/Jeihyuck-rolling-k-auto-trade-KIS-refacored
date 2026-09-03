@@ -31,7 +31,9 @@ def test_below_three_percent_is_blocked_and_valid_tp1_is_single():
     state = {}
     first = build_profit_capture_intents([_position("OK", 100, 103)], OVERLAY, trade_date="2026-08-04", profit_capture_state=state)
     second = build_profit_capture_intents([_position("OK", 100, 103)], OVERLAY, trade_date="2026-08-04", profit_capture_state=state)
-    assert len(first) == 1 and second == []
+    assert len(first) == len(second) == 1
+    assert first[0]["client_order_key"] == second[0]["client_order_key"]
+    assert state == {}
     assert first[0]["meta"]["return_rate_at_decision"] == "0.03"
 
 

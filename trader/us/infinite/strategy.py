@@ -118,10 +118,13 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     # EXIT is evaluated before every BUY pause and remains active during age/DD pauses.
     profit_pct = position.price / position.average_price - 1 if position.average_price > 0 else 0.0
     state_metadata = dict(state.metadata or {})
+    effective_unit_usd = float(state_metadata.get("buy_round_effective_unit_usd", config.unit_usd))
     profit_stage = str(state_metadata.get("profit_stage") or "NONE").upper()
     pending_profit_stage = str(state_metadata.get("pending_profit_stage") or "").upper()
+    partial_exit_pending = bool(state_metadata.get("partial_exit_pending"))
+    pending_status = Status.ACTIVE if partial_exit_pending else Status.EXIT_PENDING
     if pending_profit_stage.endswith("_SUBMITTED") or profit_stage.endswith("_SUBMITTED"):
-        return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+        return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=pending_status)
     overlay_state = normalize_tqqq_adaptive_state(overlay, effective_regime_name)
     target = position.average_price * (1 + config.take_profit_pct)
     if state.status == Status.EXIT_PENDING and position.qty > 0 and position.price + 1e-9 < target:
@@ -130,18 +133,20 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
         return Decision(Action.WAIT, "exit_pending", next_status=Status.EXIT_PENDING)
     if position.qty > 0 and position.average_price > 0 and config.allow_sell:
         if pending_sell:
-            return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+            return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=pending_status)
         if profit_stage in {"TP1", "TP1_FILLED", "TP1_DEFENSE_FILLED", "TP1_REBOUND_FILLED",
                             "TP2", "TP2_FILLED", "CAPITAL_RECOVERY", "CAPITAL_RECOVERY_FILLED"}:
             first_filled = profit_stage.startswith("TP1")
             threshold, fraction, next_stage = (0.10, 1.0, "TP2") if first_filled else (999.0, 0.0, "NONE")
             if first_filled and profit_pct >= threshold and next_stage != "NONE":
                 if pending_sell:
-                    return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+                    return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=pending_status)
                 orderable = int(position.orderable_qty or 0)
                 if orderable <= 0:
                     return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
-                sell_qty = min(orderable, max(1, int(orderable * fraction)))
+                remaining_target = int(state_metadata.get("profit_target_remaining_qty") or 0)
+                sell_qty = (min(orderable, remaining_target) if remaining_target > 0
+                            else min(orderable, max(1, int(orderable * fraction))))
                 if fraction >= 0.99:
                     sell_qty = orderable
                 key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
@@ -154,18 +159,24 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             try:
                 threshold, fraction, next_stage = adaptive_tp_stage(
                     market_state=overlay_state, cycle_age=state.cycle_age_trading_days,
-                    units_used=int(state_metadata.get("units_used") or round(state.total_filled_notional / config.unit_usd)))
+                    units_used=(int(state_metadata["buy_round_units_used"])
+                                if "buy_round_units_used" in state_metadata else
+                                int(state_metadata["units_used"])
+                                if "units_used" in state_metadata else
+                                round(state.total_filled_notional / config.unit_usd)))
             except KeyError:
                 return Decision(Action.BLOCK, "TQQQ_INF_UNMAPPED_REGIME")
             if profit_pct >= threshold and next_stage != "NONE":
                 if pending_sell:
-                    return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=Status.EXIT_PENDING)
+                    return Decision(Action.WAIT, "tqqq_profit_sell_pending", next_status=pending_status)
                 if position.orderable_qty is None:
                     return Decision(Action.BLOCK, "tqqq_orderable_qty_missing")
                 orderable = int(position.orderable_qty or 0)
                 if orderable <= 0:
                     return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
-                sell_qty = min(orderable, max(1, int(orderable * fraction)))
+                remaining_target = int(state_metadata.get("profit_target_remaining_qty") or 0)
+                sell_qty = (min(orderable, remaining_target) if remaining_target > 0
+                            else min(orderable, max(1, int(orderable * fraction))))
                 if fraction >= 0.99:
                     sell_qty = orderable
                 key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
@@ -194,6 +205,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if position.qty > 0 and not config.allow_sell:
         return Decision(Action.BLOCK, "sell_permission_disabled")
+    if position.qty > 0 and bool(state_metadata.get("hard_cap_exceeded")):
+        return Decision(Action.BLOCK, "TQQQ_INF_BROKER_DEPLOYED_EXCEEDS_HARD_CAP")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
@@ -244,7 +257,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if (fast_dip_add_eligible and position.qty > 0 and not pending_buy and
             (explicit_intraday_bypass or overlay.get("force_entry_block") is True or
              overlay.get("allow_new_buy") is False)):
-        budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
+        budget = min(effective_unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
                      config.max_total_capital_usd - state.total_filled_notional)
         qty = math.floor(budget / position.price)
         if qty > 0:
@@ -373,7 +386,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     if (position.qty > 0 and overlay.get("allow_add_to_existing") is not False and days_since >= 1
             and last_fill and position.price <= last_fill * 0.99 and not pending_buy
             and daily_filled_buy_notional < config.max_daily_buy_usd - 1e-6):
-        budget = min(config.unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
+        budget = min(effective_unit_usd, config.max_daily_buy_usd - daily_filled_buy_notional,
                      config.max_total_capital_usd - state.total_filled_notional)
         qty = math.floor(budget / position.price)
         if qty > 0:
@@ -386,7 +399,7 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
     total_left = config.max_total_capital_usd - state.total_filled_notional
     daily_left = config.max_daily_buy_usd - daily_filled_buy_notional
     effective_buy_multiplier = 1.0 if explicit_intraday_bypass else buy_multiplier
-    budget = min(config.unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
+    budget = min(effective_unit_usd * max(0.0, effective_buy_multiplier), available, total_left, daily_left)
     qty = math.floor(budget / position.price)
     notional = qty * position.price
     if qty < 1:

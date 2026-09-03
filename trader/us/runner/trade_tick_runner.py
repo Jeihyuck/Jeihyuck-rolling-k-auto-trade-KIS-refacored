@@ -68,6 +68,26 @@ def classify_ack_reconcile_gate(ack_recon: dict, *, reconcile_only_until_clean: 
     }
 
 
+def apply_crash_rebound_entry_recovery(
+    entry_can_proceed: bool,
+    allow_new_symbols: bool,
+    *,
+    market_state: str,
+    prep_reason: str,
+    execution_buy_fenced: bool,
+    prep_status: str = "",
+) -> tuple[bool, bool]:
+    """Unlock policy entry only when broker execution safety is clean."""
+    recovery_reason = prep_reason in {
+        "risk_off_entry_block", "force_entry_block", "DEFENSE_CRASH_ENTRY_BLOCKED",
+    }
+    if market_state == "DEFENSE_CRASH_REBOUND" and (
+        recovery_reason or prep_status == "DEFENSE_CRASH_ENTRY_BLOCKED"
+    ) and not execution_buy_fenced:
+        return True, True
+    return entry_can_proceed, allow_new_symbols
+
+
 def _is_us_opening_buy_blocked(now_ny: datetime) -> tuple[bool, str]:
     """Return the entry-only opening gate; exits are intentionally unaffected."""
     if os.getenv("US_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
@@ -1366,8 +1386,9 @@ def run_trade_tick(
     finally:
         tick_context.metrics["position_reconcile_ms"] = (time.monotonic() - _position_reconcile_started) * 1000.0
     
-    # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
-    if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
+    # Structural corruption is fatal. A transient/incomplete balance only
+    # degrades BUY; last-good positions continue through exit evaluation.
+    if recon.get("status") == "CONTRACT_ERROR":
         last_stage = "reconcile"
         reconcile_reason = recon.get("reason", "balance_position_parse_error")
         logger.error(
@@ -1406,6 +1427,10 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
+    if recon.get("block_new_entry", False):
+        entry_can_proceed = False
+        logger.warning("[US_BALANCE][TEMP_DEGRADED] status=%s reason=%s buy=BLOCK sell=CONTINUE",
+                       recon.get("status"), recon.get("reason"))
     
     # Extract position_symbols from reconcile result
     current_position_symbols: set[str] = set(recon.get("position_symbols", []))
@@ -1654,44 +1679,23 @@ def run_trade_tick(
         or pending_ack_count > 0
         or unresolved_ack_count > 0
     )
+    execution_buy_fenced = bool(reconcile_only_until_clean or ack_order_block)
     if ack_order_block:
         logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
     if reconcile_only_until_clean or ack_order_block:
         reason = str(ack_gate["reason"] or "unresolved_ack_exists")
-        logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
+        # Never return before exit generation.  Ambiguous acknowledgement may
+        # globally fence new BUYs, but the safety SELL lane stays available;
+        # known OPEN orders are subsequently scoped by owner/symbol/side.
+        entry_can_proceed_before_ack_gate = entry_can_proceed
+        entry_can_proceed = False
+        entry_degraded = True
+        entry_degraded_reason = reason
+        logger.warning("[US_ORDER_GATE][SCOPED_BLOCK] strategy_owner=* symbol=* side=BUY reason=%s sell_lane=OPEN", reason)
         reconcile_only_clean_at = (
             _write_reconcile_only_clean_marker(trade_date=trade_date, session=session, tick_index=tick_index)
             if reconcile_only_clean else ""
         )
-        return {
-            "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
-            "severity": "OK" if reconcile_only_clean else "DEGRADED",
-            "allow_new_orders": False,
-            "session_should_continue": True,
-            "reason": reason,
-            "session": session,
-            "orders": [], "ack": 0, "dry_run": 0, "blocked": 0, "signal_only": 0,
-            "errors": 0, "trade_date": trade_date, "fills": len(fills_today),
-            "positions": len(recon_positions), "orders_sent": 0,
-            "prior_failed_orders_reconcile_required": int(prior_failed_orders_reconcile_required),
-            "reconcile_only_until_clean": int(reconcile_only_until_clean),
-            "reconcile_only_clean": int(reconcile_only_clean),
-            "reconcile_only_clean_at": reconcile_only_clean_at,
-            "reconcile_only_clean_session": session if reconcile_only_clean else "",
-            "reconcile_only_clean_tick": int(tick_index) if reconcile_only_clean else 0,
-            "pending_ack_count": pending_ack_count,
-            "unresolved_ack_count": unresolved_ack_count,
-            "open_order_pending_count": open_order_pending_count,
-            "unresolved_error_count": unresolved_error_count,
-            "blocked_new_orders_due_to_reconcile": 1,
-            "last_unresolved_symbols": (ack_recon.get("symbols_by_status") or {}).get("unresolved", []),
-            "last_open_order_pending_symbols": ack_gate["last_open_order_pending_symbols"],
-            "last_unresolved_error_symbols": ack_gate["last_unresolved_error_symbols"],
-            "last_unresolved_order_nos": ack_recon.get("unresolved_order_nos", []),
-            "manual_reconcile_required": ack_gate["manual_reconcile_required"],
-            "ack_reconcile_before_route_status": ack_recon.get("status"),
-            "ack_pending_reconcile_count": pending_ack_count,
-        }
 
     # reconcile log DB 저장
     try:
@@ -1762,8 +1766,28 @@ def run_trade_tick(
     tick_context.exchange_by_symbol = exchange_by_symbol
     tick_context.fills_snapshot = fills_today
     tick_context.pending_ack_orders = pending_ack_orders
+    known_scopes = []
+    ambiguous_pending = []
+    for pending_order in pending_ack_orders:
+        meta = pending_order.get("meta") if isinstance(pending_order.get("meta"), dict) else {}
+        owner = pending_order.get("strategy_owner") or meta.get("strategy_owner")
+        symbol = str(pending_order.get("symbol") or "").upper()
+        side = str(pending_order.get("side") or "").upper()
+        cycle = pending_order.get("cycle_id") or meta.get("cycle_id")
+        if owner and symbol and side and cycle:
+            tick_context.blocked_symbol_sides.add((symbol, side))
+            known_scopes.append((owner, symbol, side, cycle))
+            logger.info("[US_ORDER_GATE][SCOPED_BLOCK] strategy_owner=%s symbol=%s side=%s cycle_id=%s reason=known_open_order",
+                        owner, symbol, side, cycle)
+        else:
+            ambiguous_pending.append(pending_order)
+    if known_scopes and not ambiguous_pending and unresolved_error_count == 0:
+        entry_can_proceed = locals().get("entry_can_proceed_before_ack_gate", entry_can_proceed)
     tick_context.today_order_keys = set(today_order_keys or set())
-    tick_context.blocked_symbol_sides = {(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2}
+    tick_context.blocked_symbol_sides.update(
+        (str(x[0]).upper(), str(x[1]).upper())
+        for x in (blocked_symbol_sides or []) if len(x) >= 2
+    )
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -1949,9 +1973,14 @@ def run_trade_tick(
         )
         if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
             prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
-            if prep_reason in {"risk_off_entry_block", "force_entry_block", "DEFENSE_CRASH_ENTRY_BLOCKED"} or (prep_result_for_overlay or {}).get("status") == "DEFENSE_CRASH_ENTRY_BLOCKED":
-                entry_can_proceed = True
-                allow_new_symbols = True
+            entry_can_proceed, allow_new_symbols = apply_crash_rebound_entry_recovery(
+                entry_can_proceed, allow_new_symbols,
+                market_state=str(market_state_overlay.get("market_state") or ""),
+                prep_reason=prep_reason,
+                execution_buy_fenced=execution_buy_fenced,
+                prep_status=str((prep_result_for_overlay or {}).get("status") or ""),
+            )
+            if entry_can_proceed and allow_new_symbols:
                 logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
         profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
@@ -2040,6 +2069,16 @@ def run_trade_tick(
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
 
+    # Standard position risk exits own the first broker-submit lane. TQQQ
+    # quote/reconcile work must not consume their deadline budget.
+    exit_route_result = route_exit_orders_immediately(
+        exit_intents, buy_daily_notional=buy_daily_notional,
+        position_count=position_count, effective_budget=effective_budget,
+        signal_only=signal_only, kis_order_allowed=kis_order_allowed,
+        current_position_symbols=current_position_symbols,
+        context=tick_context, kis_client=routing_kis_client,
+    ) or {"orders": []}
+
     infinite_result = {"status": "OFF", "orders": []}
     _tqqq_infinite_started = time.monotonic()
     if _infinite_config.enabled:
@@ -2062,6 +2101,70 @@ def run_trade_tick(
                     now=now,
                 )
 
+            def _cancel_tqqq_open_buy(open_order: dict) -> dict:
+                order_no = str(open_order.get("order_no") or open_order.get("original_order_no") or "").strip()
+                requested = int(open_order.get("qty_requested") or open_order.get("qty") or 0)
+                filled = int(open_order.get("qty_filled") or 0)
+                remaining = max(0, requested - filled)
+                if not order_no:
+                    return {"status": "UNKNOWN", "reason": "TQQQ_CANCEL_ORIGINAL_ORDER_NO_MISSING"}
+                if routing_kis_client is None:
+                    return {"status": "UNKNOWN", "reason": "routing_kis_client_unavailable"}
+                try:
+                    result = routing_kis_client.cancel_us_order(
+                        symbol=str(open_order.get("symbol") or _infinite_config.symbol),
+                        exchange=str(open_order.get("exchange") or "NASDAQ"),
+                        original_order_no=order_no,
+                        remaining_qty=remaining,
+                    )
+                    if str(result.get("status") or "").upper() == "ACK":
+                        trade_day = str(open_order.get("trade_date") or trade_date)
+                        rows = routing_kis_client.get_us_today_orders(trade_date=trade_day)
+                        from trader.us.data_provider import normalize_us_order_status_row
+                        from trader.us.utils.order_no import normalize_us_order_no
+                        target_symbol = str(open_order.get("symbol") or _infinite_config.symbol).upper()
+                        target_side = str(open_order.get("side") or "BUY").upper()
+                        target_order_no = normalize_us_order_no(order_no)
+                        for raw_row in rows:
+                            row = normalize_us_order_status_row(raw_row)
+                            if (
+                                row.get("normalization_result") == "normalized"
+                                and row.get("canonical_order_no") == target_order_no
+                                and row.get("symbol") == target_symbol
+                                and row.get("side") == target_side
+                            ):
+                                status = str(row.get("status") or "").upper()
+                                if status in {"CANCELLED", "FILLED", "REJECTED", "EXPIRED"}:
+                                    from trader.us.db.repos import apply_broker_order_observation
+                                    apply_result = apply_broker_order_observation(
+                                        trade_date=trade_day,
+                                        client_order_key=str(open_order.get("client_order_key") or ""),
+                                        raw_order_no=str(row.get("raw_order_no") or order_no),
+                                        canonical_order_no=str(row.get("canonical_order_no") or target_order_no),
+                                        symbol=target_symbol,
+                                        side=target_side,
+                                        requested_qty=requested,
+                                        filled_qty=int(row.get("filled_qty") or filled),
+                                        remaining_qty=int(row.get("remaining_qty") or max(0, requested - filled)),
+                                        broker_status=status,
+                                        evidence_type="tqqq_cancel_terminal_inquiry",
+                                        raw_row=raw_row,
+                                    )
+                                    if str(apply_result.get("status") or "").upper() == "OK":
+                                        return {"status": status, "order_no": order_no}
+                                    return {
+                                        "status": "UNKNOWN",
+                                        "reason": "journal_terminalization_failed",
+                                        "broker_status": status,
+                                        "order_no": order_no,
+                                        "apply_result": apply_result,
+                                    }
+                        return {"status": "UNKNOWN", "order_no": order_no}
+                    return result
+                except Exception as exc:
+                    logger.warning("[TQQQ_INF][CANCEL_REQUEST_FAILED] order_no=%s error=%s", order_no, exc)
+                    return {"status": "UNKNOWN", "order_no": order_no, "error": str(exc)}
+
             try:
                 _tqqq_price, _quote_source, _quote_stale = _get_tqqq_tick_quote(provider)
             except Exception as _quote_exc:
@@ -2077,11 +2180,14 @@ def run_trade_tick(
                 "opening_buy_start_et": opening_buy_start_et,
                 "entry_can_proceed": bool(entry_can_proceed),
                 "exit_can_proceed": bool(exit_can_proceed),
+                "broker_position_authoritative": bool(authoritative_recon),
                 "now_et": now.isoformat(),
             }
             infinite_result = run_sleeve(
                 positions=current_positions, price=_tqqq_price, trading_date=now.date(),
                 overlay=_infinite_overlay, route=_route_infinite,
+                cancel_open_buy=_cancel_tqqq_open_buy,
+                force_cancel_open_buys=str(session).lower() == "close",
             )
         except Exception as _infinite_exc:
             # Defensive second boundary: sleeve failures never stop legacy US.
@@ -2094,17 +2200,6 @@ def run_trade_tick(
         logger.info("[US_TICK_LOOP][TICK] session=%s tick=%s entry_can_proceed=%d exit_can_proceed=%d positions=%d monitoring_universe=%d", session, tick_index, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)), len(current_positions), len(monitoring_universe))
     except Exception:
         monitoring_universe = set(current_position_symbols or [])
-    exit_route_result = route_exit_orders_immediately(
-        exit_intents,
-        buy_daily_notional=buy_daily_notional,
-        position_count=position_count,
-        effective_budget=effective_budget,
-        signal_only=signal_only,
-        kis_order_allowed=kis_order_allowed,
-        current_position_symbols=current_position_symbols,
-        context=tick_context,
-        kis_client=routing_kis_client,
-    )
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1
@@ -3311,6 +3406,9 @@ def run_trade_tick(
     ack_pending_reconcile_count = len(after_symbols_by_status.get("ack_pending_reconcile", [])) if isinstance(after_symbols_by_status, dict) else 0
     broker_ack_only_unresolved = int(ack_recon_after_route.get("unresolved_count", 0) or 0)
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    actual_buy_order_ids: set[str] = set()
+    actual_sell_order_ids: set[str] = set()
+    actual_buy_filled_qty = actual_sell_filled_qty = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
     for f in (fills_today if 'fills_today' in locals() else []):
@@ -3323,9 +3421,13 @@ def run_trade_tick(
         elif is_synth and side_f == "SELL":
             synthetic_reconcile_sells += 1
         elif side_f == "BUY":
-            real_broker_buys += 1
+            actual_buy_order_ids.add(str(f.get("client_order_key") or f.get("order_no") or f.get("id")))
+            actual_buy_filled_qty += int(f.get("qty") or f.get("filled_qty") or 0)
         elif side_f == "SELL":
-            real_broker_sells += 1
+            actual_sell_order_ids.add(str(f.get("client_order_key") or f.get("order_no") or f.get("id")))
+            actual_sell_filled_qty += int(f.get("qty") or f.get("filled_qty") or 0)
+    real_broker_buys = len(actual_buy_order_ids)
+    real_broker_sells = len(actual_sell_order_ids)
 
     held_skip = locals().get("held_skip_count")
     held_skip_unknown = 0 if isinstance(held_skip, int) else 1
@@ -3626,6 +3728,17 @@ def run_trade_tick(
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
         "real_broker_buys": real_broker_buys,
         "real_broker_sells": real_broker_sells,
+        "broker_buy_acks": sum(1 for o in orders if str(o.get("side") or "").upper() == "BUY" and str(o.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED"}),
+        "broker_sell_acks": sum(1 for o in orders if str(o.get("side") or "").upper() == "SELL" and str(o.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED"}),
+        "actual_buy_fill_orders": real_broker_buys,
+        "actual_sell_fill_orders": real_broker_sells,
+        "actual_buy_filled_qty": actual_buy_filled_qty,
+        "actual_sell_filled_qty": actual_sell_filled_qty,
+        "open_buy_orders": sum(1 for o in orders if str(o.get("side") or "").upper() == "BUY" and str(o.get("status") or "").upper() in {"ACK", "OPEN", "PENDING", "PARTIALLY_FILLED"}),
+        "open_sell_orders": sum(1 for o in orders if str(o.get("side") or "").upper() == "SELL" and str(o.get("status") or "").upper() in {"ACK", "OPEN", "PENDING", "PARTIALLY_FILLED"}),
+        "cancelled_orders": sum(1 for o in orders if str(o.get("status") or "").upper() == "CANCELLED"),
+        "rejected_orders": sum(1 for o in orders if str(o.get("status") or "").upper() in {"REJECTED", "REJECT"}),
+        "expired_orders": sum(1 for o in orders if str(o.get("status") or "").upper() == "EXPIRED"),
         "synthetic_reconcile_buys": synthetic_reconcile_buys,
         "synthetic_reconcile_sells": synthetic_reconcile_sells,
         "broker_ack_only": broker_ack_only,

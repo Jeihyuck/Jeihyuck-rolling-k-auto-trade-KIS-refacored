@@ -2736,7 +2736,9 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
                     WHERE trade_date = :trade_date
                       AND agent_name IN ('us_prep', 'us_prep_dual_agent')
                       AND mode = 'prep'
-                    ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC
+                      AND finished_at IS NOT NULL AND result IS NOT NULL
+                      AND status IN ('OK','OK_WITH_WARNINGS','DEGRADED','ERROR')
+                    ORDER BY finished_at DESC, started_at DESC
                     LIMIT 1
                 """),
                 {"trade_date": trade_date},
@@ -2775,6 +2777,11 @@ def load_latest_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
 def load_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
     """Backward-compatible alias for daily report prep status loading."""
     return load_latest_us_prep_status(trade_date=trade_date, timeout_sec=timeout_sec)
+
+
+def load_latest_completed_us_prep_status(trade_date: str, timeout_sec: int = 20) -> dict:
+    """Explicit semantic alias for the canonical completed-only loader."""
+    return load_latest_us_prep_status(trade_date, timeout_sec=timeout_sec)
 
 
 def clear_and_save_locked_us_watchlist(

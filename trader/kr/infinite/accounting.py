@@ -24,6 +24,8 @@ def buy_quantity(state: State, orderable_cash: float, price: float) -> tuple[int
 def apply_confirmed_fill(state: State, intent: OrderIntent, broker: BrokerOrderState,
                          trade_date: date) -> tuple[State, int, float]:
     """Apply only the newly confirmed portion of a broker fill."""
+    if not state.cycle_id or intent.cycle_id != state.cycle_id:
+        raise ValueError("KR_INF_CYCLE_INTENT_MISMATCH")
     delta_qty = max(0, broker.filled_qty - intent.filled_qty)
     delta_notional = max(0.0, broker.filled_notional_krw - intent.filled_notional_krw)
     if delta_qty > 0 and intent.side in {"SELL_PARTIAL", "SELL_ALL"}:

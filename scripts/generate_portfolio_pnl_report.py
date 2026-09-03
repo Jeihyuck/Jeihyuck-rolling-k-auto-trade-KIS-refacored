@@ -31,7 +31,7 @@ logger = logging.getLogger("generate_portfolio_pnl_report")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from trader.trade_plan import classify_close_action_from_plan, parse_plan_bool
+from trader.trade_plan import classify_close_action_from_position_contract, parse_plan_bool
 
 KST = timezone(timedelta(hours=9))
 REPORT_DIR = REPO_ROOT / "reports" / "portfolio_pnl"
@@ -310,10 +310,10 @@ def _build_holdings_pnl(
                 plan = {}
         if not isinstance(plan, dict):
             plan = {}
-        close_action, close_reason = classify_close_action_from_plan(plan)
-        entry_exit_plan_status = "OK" if plan else "POLICY_MISSING"
+        contract_position = {**pos, "entry_exit_plan_json": plan}
+        close_action, close_reason, entry_exit_plan_status = classify_close_action_from_position_contract(contract_position)
         if entry_exit_plan_status == "POLICY_MISSING":
-            warnings.append(f"POLICY_MISSING:{code}:this position will not be force-sold in close phase because no EntryExitPlan was found")
+            warnings.append(f"POLICY_MISSING:{code}:this position will not be force-sold in close phase because no verified policy contract was found")
 
         holdings.append({
             "rank": rank,

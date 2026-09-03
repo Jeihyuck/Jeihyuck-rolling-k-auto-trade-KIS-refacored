@@ -27,11 +27,12 @@ def test_repos_load_prep_status_includes_dual_agent_name():
     assert "us_prep" in src
 
 
-def test_repos_load_prep_status_uses_coalesce_order():
-    """load_latest_us_prep_status()의 ORDER BY에 COALESCE가 있어야 한다."""
+def test_repos_load_prep_status_requires_finished_contract():
+    """A newer STARTED row must not replace the last completed contract."""
     import trader.us.db.repos as mod
     src = inspect.getsource(mod.load_latest_us_prep_status)
-    assert "COALESCE" in src.upper(), "ORDER BY COALESCE가 없다"
+    assert "FINISHED_AT IS NOT NULL" in src.upper()
+    assert "ORDER BY FINISHED_AT DESC" in src.upper()
 
 
 def test_save_us_prep_run_default_agent_name():

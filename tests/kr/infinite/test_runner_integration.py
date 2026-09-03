@@ -140,7 +140,11 @@ def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
     kis = FakeKIS(qty=150, average=100, price=110, fill_qty=110)
     repo = FakeRepository(active())
     partial = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
-    assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.EXIT_PENDING and kis.qty == 75
+    assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.ACTIVE and kis.qty == 75
+    assert partial.state.metadata["partial_exit_pending"] is False
+    assert partial.state.units_used == partial.state.core_units_used == partial.state.reserve_units_used == 0
+    assert partial.state.metadata["buy_round_units_used"] == 0
+    assert str(partial.state.metadata["profit_stage"]).endswith("_FILLED")
     # A subsequent tick reconciles the pending sell and cannot buy.
     again = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert again.decision.action == Action.SELL_ALL and again.decision.reason == "TAKE_PROFIT_TP2" and len(kis.orders) == 2

@@ -163,7 +163,9 @@ def test_order_router_no_balance_recent_ack_qty_zero_returns_closed(monkeypatch)
         allowed_symbols={"AAOI"},
         current_position_symbols={"AAOI"},
     )
-    assert result["status"] == "OK_EXIT_POSITION_CLOSED"
+    assert result["status"] == "RETRYABLE"
+    assert result["reason"] == "BROKER_POSITION_UNKNOWN_RETRYABLE"
+    assert result["broker_position_state"] == "UNKNOWN"
 
 
 def _risk_env(monkeypatch):
@@ -264,7 +266,8 @@ def test_sell_no_orderable_qty_after_recent_ack_returns_position_closed(monkeypa
         {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 0, "limit_price": 10, "notional_usd": 10, "client_order_key": "no-orderable", "trade_date": "2026-06-18"},
         allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=object(),
     )
-    assert result["status"] == "OK_EXIT_POSITION_CLOSED"
+    assert result["status"] == "RETRYABLE"
+    assert result["reason"] == "BROKER_POSITION_UNKNOWN_RETRYABLE"
 
 
 def test_sell_no_orderable_qty_without_recent_ack_remains_blocked(monkeypatch):
@@ -280,8 +283,8 @@ def test_sell_no_orderable_qty_without_recent_ack_remains_blocked(monkeypatch):
         {"symbol": "AAOI", "exchange": "NASDAQ", "side": "SELL", "qty": 1, "available_qty": 1, "orderable_qty": 0, "limit_price": 10, "notional_usd": 10, "client_order_key": "no-orderable-2", "trade_date": "2026-06-18"},
         allowed_symbols={"AAOI"}, current_position_symbols={"AAOI"}, kis_client=object(),
     )
-    assert result["status"] == "BLOCKED"
-    assert result["reason"] == "no_orderable_qty"
+    assert result["status"] == "RETRYABLE"
+    assert result["reason"] == "BROKER_POSITION_UNKNOWN_RETRYABLE"
 
 
 def test_duplicate_sell_precheck_skips_before_save_intent(monkeypatch):
@@ -391,6 +394,8 @@ def test_route_order_ack_db_failed_when_save_order_ack_returns_false(monkeypatch
     monkeypatch.setattr("trader.us.db.repos.save_order_ack", lambda _ack: False)
 
     class _Kis:
+        def get_balance(self, force_refresh=False):
+            return {"positions": [{"symbol": "AAOI", "qty": 1, "orderable_qty": 1}]}
         def place_us_sell_order(self, *args, **kwargs):
             return {"output": {"ODNO": "ACK1"}}
 

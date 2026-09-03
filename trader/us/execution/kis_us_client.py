@@ -964,6 +964,46 @@ class KisUSClient:
         )
         return self._post(tr["path"], headers=headers, body=body)
 
+    def cancel_us_order(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        original_order_no: str,
+        remaining_qty: int,
+    ) -> dict:
+        """Request cancellation of an open practice overseas-stock order.
+
+        The response is only a cancellation acknowledgement.  Terminal order
+        state must still be established by the order/fill inquiry.
+        """
+        self._assert_not_offline("cancel_us_order")
+        order_no = str(original_order_no or "").strip()
+        qty = max(0, int(remaining_qty or 0))
+        if not order_no:
+            raise ValueError("TQQQ_CANCEL_ORIGINAL_ORDER_NO_MISSING")
+        if qty == 0:
+            return {"status": "NO_REMAINING_QTY", "order_no": order_no}
+        tr = get_tr_info("us_order_rvsecncl")
+        body = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "OVRS_EXCG_CD": get_order_exchange_code_for_api(exchange),
+            "PDNO": str(symbol),
+            "ORGN_ODNO": order_no,
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(qty),
+            "OVRS_ORD_UNPR": "0",
+            "MGCO_APTM_ODNO": "",
+            "ORD_SVR_DVSN_CD": "0",
+        }
+        logger.info(
+            "[US_CANCEL][REQUEST_SAFE] symbol=%s exchange=%s order_no=%s qty=%s tr_id=%s",
+            symbol, exchange, order_no, qty, tr["tr_id"],
+        )
+        response = self._post(tr["path"], headers=self._build_headers(tr["tr_id"]), body=body)
+        return {**response, "status": "ACK", "order_no": order_no}
+
     # ------------------------------------------------------------------
     # Fills
     # ------------------------------------------------------------------
