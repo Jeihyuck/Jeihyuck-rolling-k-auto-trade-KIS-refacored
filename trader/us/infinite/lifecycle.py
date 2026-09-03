@@ -22,8 +22,6 @@ def rollover_partial_fill(state: InfiniteState, *, order_status: str, filled_qty
     if state.metadata.get("last_partial_rollover_order_key") == order_key:
         return state
     seed = max(0.0, position.qty * position.average_price)
-    if seed > hard_cap + 1e-6:
-        raise ValueError("TQQQ_INF_ROLLOVER_CAPITAL_EXCEEDED")
     remaining = max(0.0, hard_cap - seed)
     buy_round = int(state.metadata.get("buy_round") or 0) + 1
     stage = str(state.metadata.get("profit_stage") or "TP1_FILLED").upper()
@@ -33,9 +31,16 @@ def rollover_partial_fill(state: InfiniteState, *, order_status: str, filled_qty
                 "partial_exit_pending": False, "buy_round": buy_round,
                 "buy_round_id": f"{state.cycle_id}:R{buy_round}", "buy_round_units_used": 0,
                 "buy_round_started_trade_date": trading_date.isoformat(),
-                "buy_round_effective_unit_usd": remaining / 40,
+                "buy_round_effective_unit_usd": remaining / 40 if remaining > 0 else 0.0,
                 "rollover_seed_qty": position.qty, "rollover_seed_avg": position.average_price,
                 "rollover_seed_capital_usd": seed, "remaining_deployable_capital_usd": remaining,
+                "hard_cap_exceeded": seed > hard_cap + 1e-6,
+                "hard_cap_exceeded_reason": (
+                    "TQQQ_INF_BROKER_DEPLOYED_EXCEEDS_HARD_CAP"
+                    if seed > hard_cap + 1e-6 else None
+                ),
+                "broker_deployed_notional_usd": seed,
+                "ownership_source": "KIS_BALANCE_AUTHORITATIVE",
                 "last_partial_rollover_order_key": order_key,
                 "last_partial_rollover_filled_qty": filled_qty,
                 "last_partial_rollover_notional": filled_notional}

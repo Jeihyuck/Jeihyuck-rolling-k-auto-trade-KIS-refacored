@@ -68,6 +68,26 @@ def classify_ack_reconcile_gate(ack_recon: dict, *, reconcile_only_until_clean: 
     }
 
 
+def apply_crash_rebound_entry_recovery(
+    entry_can_proceed: bool,
+    allow_new_symbols: bool,
+    *,
+    market_state: str,
+    prep_reason: str,
+    execution_buy_fenced: bool,
+    prep_status: str = "",
+) -> tuple[bool, bool]:
+    """Unlock policy entry only when broker execution safety is clean."""
+    recovery_reason = prep_reason in {
+        "risk_off_entry_block", "force_entry_block", "DEFENSE_CRASH_ENTRY_BLOCKED",
+    }
+    if market_state == "DEFENSE_CRASH_REBOUND" and (
+        recovery_reason or prep_status == "DEFENSE_CRASH_ENTRY_BLOCKED"
+    ) and not execution_buy_fenced:
+        return True, True
+    return entry_can_proceed, allow_new_symbols
+
+
 def _is_us_opening_buy_blocked(now_ny: datetime) -> tuple[bool, str]:
     """Return the entry-only opening gate; exits are intentionally unaffected."""
     if os.getenv("US_OPENING_BUY_BLOCK_ENABLED", "1").strip().lower() not in {"1", "true", "yes", "on"}:
@@ -1659,6 +1679,7 @@ def run_trade_tick(
         or pending_ack_count > 0
         or unresolved_ack_count > 0
     )
+    execution_buy_fenced = bool(reconcile_only_until_clean or ack_order_block)
     if ack_order_block:
         logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
     if reconcile_only_until_clean or ack_order_block:
@@ -1952,9 +1973,14 @@ def run_trade_tick(
         )
         if market_state_overlay.get("market_state") == "DEFENSE_CRASH_REBOUND":
             prep_reason = str((prep_result_for_overlay or {}).get("trade_block_reason") or (prep_result_for_overlay or {}).get("degraded_reason") or "")
-            if prep_reason in {"risk_off_entry_block", "force_entry_block", "DEFENSE_CRASH_ENTRY_BLOCKED"} or (prep_result_for_overlay or {}).get("status") == "DEFENSE_CRASH_ENTRY_BLOCKED":
-                entry_can_proceed = True
-                allow_new_symbols = True
+            entry_can_proceed, allow_new_symbols = apply_crash_rebound_entry_recovery(
+                entry_can_proceed, allow_new_symbols,
+                market_state=str(market_state_overlay.get("market_state") or ""),
+                prep_reason=prep_reason,
+                execution_buy_fenced=execution_buy_fenced,
+                prep_status=str((prep_result_for_overlay or {}).get("status") or ""),
+            )
+            if entry_can_proceed and allow_new_symbols:
                 logger.warning("[US_ENTRY][CRASH_REBOUND_LIMIT] exposure_multiplier=%s max_new_positions=%s prep_reason=%s", market_state_overlay.get("exposure_multiplier"), market_state_overlay.get("effective_max_new_positions"), prep_reason)
         existing_sell_symbols = {str(i.get("symbol") or "").upper().strip() for i in exit_intents if str(i.get("side") or "").upper() == "SELL"}
         profit_capture_intents = build_profit_capture_intents(current_positions, market_state_overlay, existing_sell_symbols, now=now, trade_date=trade_date)
@@ -2110,7 +2136,7 @@ def run_trade_tick(
                                 status = str(row.get("status") or "").upper()
                                 if status in {"CANCELLED", "FILLED", "REJECTED", "EXPIRED"}:
                                     from trader.us.db.repos import apply_broker_order_observation
-                                    apply_broker_order_observation(
+                                    apply_result = apply_broker_order_observation(
                                         trade_date=trade_day,
                                         client_order_key=str(open_order.get("client_order_key") or ""),
                                         raw_order_no=str(row.get("raw_order_no") or order_no),
@@ -2124,7 +2150,15 @@ def run_trade_tick(
                                         evidence_type="tqqq_cancel_terminal_inquiry",
                                         raw_row=raw_row,
                                     )
-                                    return {"status": status, "order_no": order_no}
+                                    if str(apply_result.get("status") or "").upper() == "OK":
+                                        return {"status": status, "order_no": order_no}
+                                    return {
+                                        "status": "UNKNOWN",
+                                        "reason": "journal_terminalization_failed",
+                                        "broker_status": status,
+                                        "order_no": order_no,
+                                        "apply_result": apply_result,
+                                    }
                         return {"status": "UNKNOWN", "order_no": order_no}
                     return result
                 except Exception as exc:
