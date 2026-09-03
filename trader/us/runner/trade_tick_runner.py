@@ -2043,6 +2043,16 @@ def run_trade_tick(
     if not current_position_symbols and current_positions:
         current_position_symbols = {str(p.get("symbol", "")).upper().strip() for p in current_positions if p.get("symbol")}
 
+    # Standard position risk exits own the first broker-submit lane. TQQQ
+    # quote/reconcile work must not consume their deadline budget.
+    exit_route_result = route_exit_orders_immediately(
+        exit_intents, buy_daily_notional=buy_daily_notional,
+        position_count=position_count, effective_budget=effective_budget,
+        signal_only=signal_only, kis_order_allowed=kis_order_allowed,
+        current_position_symbols=current_position_symbols,
+        context=tick_context, kis_client=routing_kis_client,
+    ) or {"orders": []}
+
     infinite_result = {"status": "OFF", "orders": []}
     _tqqq_infinite_started = time.monotonic()
     if _infinite_config.enabled:
@@ -2097,17 +2107,6 @@ def run_trade_tick(
         logger.info("[US_TICK_LOOP][TICK] session=%s tick=%s entry_can_proceed=%d exit_can_proceed=%d positions=%d monitoring_universe=%d", session, tick_index, int(bool(entry_can_proceed)), int(bool(exit_can_proceed)), len(current_positions), len(monitoring_universe))
     except Exception:
         monitoring_universe = set(current_position_symbols or [])
-    exit_route_result = route_exit_orders_immediately(
-        exit_intents,
-        buy_daily_notional=buy_daily_notional,
-        position_count=position_count,
-        effective_budget=effective_budget,
-        signal_only=signal_only,
-        kis_order_allowed=kis_order_allowed,
-        current_position_symbols=current_position_symbols,
-        context=tick_context,
-        kis_client=routing_kis_client,
-    ) or {"orders": []}
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1
@@ -3314,6 +3313,8 @@ def run_trade_tick(
     ack_pending_reconcile_count = len(after_symbols_by_status.get("ack_pending_reconcile", [])) if isinstance(after_symbols_by_status, dict) else 0
     broker_ack_only_unresolved = int(ack_recon_after_route.get("unresolved_count", 0) or 0)
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    actual_buy_order_ids: set[str] = set()
+    actual_sell_order_ids: set[str] = set()
     actual_buy_filled_qty = actual_sell_filled_qty = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
@@ -3327,11 +3328,13 @@ def run_trade_tick(
         elif is_synth and side_f == "SELL":
             synthetic_reconcile_sells += 1
         elif side_f == "BUY":
-            real_broker_buys += 1
+            actual_buy_order_ids.add(str(f.get("client_order_key") or f.get("order_no") or f.get("id")))
             actual_buy_filled_qty += int(f.get("qty") or f.get("filled_qty") or 0)
         elif side_f == "SELL":
-            real_broker_sells += 1
+            actual_sell_order_ids.add(str(f.get("client_order_key") or f.get("order_no") or f.get("id")))
             actual_sell_filled_qty += int(f.get("qty") or f.get("filled_qty") or 0)
+    real_broker_buys = len(actual_buy_order_ids)
+    real_broker_sells = len(actual_sell_order_ids)
 
     held_skip = locals().get("held_skip_count")
     held_skip_unknown = 0 if isinstance(held_skip, int) else 1

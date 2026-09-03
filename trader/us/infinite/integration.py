@@ -206,6 +206,19 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             if needs_attribution_backfill and hasattr(repository, "backfill_tqqq_attribution"):
                 repository.backfill_tqqq_attribution(config.policy_version)
         if state is not None:
+            profit_orders = (repository.load_profit_sell_orders(cycle_id=state.cycle_id, include_terminal=True)
+                             if state.cycle_id and hasattr(repository, "load_profit_sell_orders") else [])
+            for profit_order in profit_orders:
+                status = str(profit_order.get("status") or "").upper()
+                requested = int(profit_order.get("qty_requested") or 0)
+                filled = int(profit_order.get("qty_filled") or 0)
+                if status in {"CANCELLED", "REJECTED", "EXPIRED"} and filled < requested:
+                    pending = str(state.metadata.get("pending_profit_stage") or "TP1_SUBMITTED")
+                    metadata = {**state.metadata, "pending_profit_stage": None, "partial_exit_pending": False}
+                    if filled > 0:
+                        metadata.update(partial_profit_stage=f"{pending.removesuffix('_SUBMITTED')}_PARTIAL",
+                                        partial_profit_filled_qty=filled)
+                    state = replace(state, status=Status.ACTIVE, metadata=metadata)
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
                                                   broker_average_price=broker.average_price,
                                                   core_cap=config.core_capital_usd,

@@ -20,6 +20,11 @@ KR_ADAPTIVE_TP_MAP: dict[str, tuple[float, float, str]] = {
     "KR_STRONG_RISK_ON": (0.07, 0.50, "TP1"),
 }
 
+
+def _is_tp1_filled_stage(stage: str) -> bool:
+    normalized = str(stage or "").upper()
+    return normalized.startswith("TP1") and normalized.endswith("_FILLED")
+
 # Import-time failure makes STATE_ORDER the enforceable source of truth in every
 # runtime and CI entry point, rather than relying only on a dedicated test.
 if set(KR_ADAPTIVE_TP_MAP) != set(STATE_ORDER):
@@ -98,7 +103,7 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
                 units_used=state.units_used,
                 cycle_age_trading_days=state.cycle_age_trading_days,
             )
-        elif stage in {"TP1", "TP1_FILLED"}:
+        elif stage == "TP1" or _is_tp1_filled_stage(stage):
             threshold = 0.10 if state_name in {"KR_RISK_ON", "KR_STRONG_RISK_ON"} else 0.07
             fraction, next_stage = 1.0, "TP2"
         else:

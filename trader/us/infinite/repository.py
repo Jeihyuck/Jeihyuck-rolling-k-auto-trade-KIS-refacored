@@ -113,8 +113,23 @@ class InfiniteRepository:
             """), {"symbol": symbol, "prefix": prefix, "side": side}).mappings().all()
         return [dict(row) for row in rows]
 
+    def load_profit_sell_orders(self, *, cycle_id: str, include_terminal: bool = True) -> list[dict[str, Any]]:
+        statuses = "('ACK','OPEN','PENDING','PARTIALLY_FILLED','SUBMITTED','FILLED','CANCELLED','REJECTED','EXPIRED')" if include_terminal else "('ACK','OPEN','PENDING','PARTIALLY_FILLED','SUBMITTED')"
+        with self.engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT client_order_key,status,qty_requested,qty_filled,avg_price_usd,
+                       COALESCE(meta->>'desired_profit_stage',meta->>'profit_stage') AS profit_stage,
+                       created_at,updated_at
+                FROM us_orders WHERE symbol='TQQQ'
+                  AND client_order_key LIKE :prefix AND side='SELL' AND status IN {statuses}
+                ORDER BY updated_at,created_at
+            """), {"prefix": f"TQQQ_INF_V3:{cycle_id}:%"}).mappings().all()
+        return [dict(row) for row in rows]
+
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
         """Capital reserved by unresolved BUY ACK/pending quantities."""
+        state = self.load_state(symbol=symbol)
+        prefix = f"TQQQ_INF_V3:{state.cycle_id}:%" if state and state.cycle_id else "TQQQ_INF_V3:%"
         with self.engine.connect() as conn:
             value = conn.execute(text("""
                 SELECT COALESCE(SUM(
@@ -122,10 +137,10 @@ class InfiniteRepository:
                         committed_notional_usd * GREATEST(qty_requested-qty_filled,0) / qty_requested
                     ELSE committed_notional_usd END
                 ),0)
-                FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol AND side='BUY'
+                FROM us_orders WHERE symbol=:symbol AND side='BUY' AND client_order_key LIKE :prefix
                   AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING','PARTIALLY_FILLED',
                                  'RECONCILE_PENDING','ACK_DB_FAILED')
-            """), {"trade_date": trade_date, "symbol": symbol}).scalar()
+            """), {"symbol": symbol, "prefix": prefix}).scalar()
         return max(0.0, float(value or 0))
 
     def next_full_exit_sequence(self, trade_date: date, cycle_id: str) -> int:
@@ -208,7 +223,7 @@ class InfiniteRepository:
             rows = conn.execute(text("""
                 SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
                        i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta,
-                       o.status AS order_status,o.qty_requested
+                       o.status AS order_status,o.qty_requested,o.qty_filled AS order_qty_filled
                 FROM us_fills f LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
                 LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
                 WHERE f.symbol=:symbol AND f.trade_date>=:start
@@ -230,13 +245,16 @@ class InfiniteRepository:
                          self._json_object(row.get("order_meta")))
                 stage = next((str(meta.get("desired_profit_stage") or meta.get("profit_stage") or "").upper()
                               for meta in metas if meta.get("desired_profit_stage") or meta.get("profit_stage")), "")
-                if stage:
+                fully_filled = (str(row.get("order_status") or "").upper() == "FILLED"
+                                and int(row.get("qty_requested") or 0) > 0
+                                and int(row.get("order_qty_filled") or 0) >= int(row.get("qty_requested") or 0))
+                if stage and fully_filled:
                     last_profit_stage = stage.removesuffix("_SUBMITTED").removesuffix("_FILLED") + "_FILLED"
                     last_profit_fill = {"order_key": row.get("client_order_key"),
                                         "order_status": row.get("order_status"),
                                         "requested_qty": int(row.get("qty_requested") or 0),
-                                        "filled_qty": int(row.get("qty") or 0),
-                                        "filled_notional": float(row.get("qty") or 0) * float(row.get("price_usd") or 0)}
+                                        "filled_qty": int(row.get("order_qty_filled") or 0),
+                                        "filled_notional": int(row.get("order_qty_filled") or 0) * float(row.get("price_usd") or 0)}
         return {"total_buy_notional": summary[0], "daily_buy_notional": summary[1],
                 "total_sell_notional": summary[2], "last_buy_date": summary[3],
                 "first_fill_price": summary[4], "last_buy_fill_price": last_price,
@@ -324,13 +342,16 @@ class InfiniteRepository:
                            rebound_cooldown: int = 3) -> InfiniteState:
         stats = self.cycle_fill_stats(state, trading_date)
         buys, last_buy, first_price = stats["total_buy_notional"], stats["last_buy_date"], stats["first_fill_price"]
-        if broker_qty > 0 and buys <= 0:
+        deployed = buys
+        if broker_qty > 0 and broker_average_price > 0:
+            deployed = broker_qty * broker_average_price
+        elif broker_qty > 0 and buys <= 0:
             # Missing historical attribution must not erase a real KIS holding.
             # The broker balance is the recovery notional authority; no qty,
             # average price, fill or client key is synthesized or rewritten.
-            buys = broker_qty * broker_average_price
-        core = min(buys, core_cap)
-        reserve = max(0.0, buys - core)
+            deployed = broker_qty * broker_average_price
+        core = min(deployed, core_cap)
+        reserve = max(0.0, deployed - core)
         anchor = state.anchor_price or first_price or (broker_average_price if broker_qty > 0 else None)
         age = state.cycle_age_trading_days
         if state.cycle_start_date:

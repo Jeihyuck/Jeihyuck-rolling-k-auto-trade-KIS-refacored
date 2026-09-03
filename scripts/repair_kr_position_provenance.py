@@ -38,7 +38,8 @@ def main() -> int:
                               "env": source.get("env"), "strategy": source.get("strategy") or "PB1",
                               "sid": source.get("sid", 1), "mode": source.get("mode", 1),
                               "current_qty": result.current_qty, "current_avg": result.current_avg,
-                              "original_buy_id": result.original_buy_id, "updates": result.updates})
+                              "original_buy_id": result.original_buy_id, "updates": result.updates,
+                              **(result.identity or {})})
     if args.apply:
         if not args.output:
             parser.error("--apply requires --output; direct live DB writes are intentionally unsupported")
@@ -52,8 +53,11 @@ def main() -> int:
         fresh_by_symbol = {str(p.get("symbol") or p.get("code")): p for p in fresh.get("positions", [])}
         for repair in confirmed:
             current = fresh_by_symbol.get(repair["symbol"])
+            fresh_avg = float((current or {}).get("average_price") or (current or {}).get("avg_price") or 0)
+            avg_diff = (abs(fresh_avg - repair["current_avg"]) / repair["current_avg"]
+                        if repair["current_avg"] > 0 else float("inf"))
             if (not current or int(current.get("qty") or 0) != repair["current_qty"]
-                    or float(current.get("average_price") or current.get("avg_price") or 0) != repair["current_avg"]
+                    or avg_diff > 0.01
                     or str(current.get("env") or "") != str(repair["env"] or "")):
                 raise SystemExit(f"STALE_AUDIT_POSITION_CHANGED:{repair['symbol']}")
         from trader.db.engine import get_engine

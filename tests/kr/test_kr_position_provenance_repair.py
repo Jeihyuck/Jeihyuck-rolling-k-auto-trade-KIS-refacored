@@ -31,3 +31,18 @@ def test_mismatch_missing_metadata_and_owner_exclusion_fail_closed():
     assert audit_position(position(qty=10, avg=120), rows).confidence is Confidence.AMBIGUOUS
     assert audit_position(position(qty=10), rows).confidence is Confidence.PARTIAL
     assert audit_position(position(symbol="122630"), []).confidence is Confidence.UNRECOVERABLE
+
+
+def test_running_cost_basis_replay_after_partial_sell():
+    rows = [fill("BUY", 10, 100, "2026-08-20", entry_reason="ENTRY_PULLBACK"),
+            fill("SELL", 5, 999, "2026-08-21"),
+            fill("BUY", 5, 200, "2026-08-22")]
+    result = audit_position(position(qty=10, avg=150), rows)
+    assert result.confidence is Confidence.CONFIRMED
+    assert result.reconstructed_avg == 150
+
+
+def test_mixed_owner_fill_chain_is_never_confirmed():
+    rows = [fill("BUY", 15, 100, "2026-08-20", entry_reason="ENTRY_PULLBACK",
+                 strategy_owner="KR_INFINITE")]
+    assert audit_position(position(), rows).confidence is Confidence.AMBIGUOUS

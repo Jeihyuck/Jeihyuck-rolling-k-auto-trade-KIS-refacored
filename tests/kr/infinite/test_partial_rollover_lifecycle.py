@@ -68,3 +68,23 @@ def test_partial_cancel_keeps_partial_stage_without_buy_round_reset():
     assert result.metadata.get("profit_stage") != "TP1_FILLED"
     assert result.metadata["partial_profit_stage"] == "TP1_PARTIAL"
     assert result.metadata["partial_profit_filled_qty"] == 4
+
+
+def test_rollover_is_idempotent_and_excess_seed_fails_closed():
+    state = State(cycle_id="A", allocated_capital_krw=1_000, status=Status.ACTIVE,
+                  metadata={"pending_profit_stage": "TP1_DEFENSE_SUBMITTED"})
+    intent = OrderIntent(1, "A", date(2026, 9, 2), "SELL_PARTIAL", "once", 1)
+    evidence = BrokerOrderState("FILLED", 1, 100)
+    rolled = settle_partial_exit(state, intent, evidence, BrokerPosition(2, 2, 100, 110),
+                                  date(2026, 9, 2), allocated_capital_krw=1_000)
+    repeated = settle_partial_exit(rolled, intent, evidence, BrokerPosition(2, 2, 100, 110),
+                                    date(2026, 9, 2), allocated_capital_krw=1_000)
+    assert repeated.metadata["buy_round"] == 1
+    assert repeated.metadata["profit_stage"] == "TP1_DEFENSE_FILLED"
+    try:
+        settle_partial_exit(state, intent, evidence, BrokerPosition(20, 20, 100, 110),
+                            date(2026, 9, 2), allocated_capital_krw=1_000)
+    except ValueError as exc:
+        assert str(exc) == "KR_INF_ROLLOVER_CAPITAL_EXCEEDED"
+    else:
+        raise AssertionError("excess residual capital must fail closed")

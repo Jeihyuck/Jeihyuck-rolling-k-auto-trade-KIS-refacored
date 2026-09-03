@@ -33,6 +33,7 @@ class ProvenanceAudit:
     reconstructed_avg: float | None = None
     original_buy_id: str | int | None = None
     updates: dict[str, Any] | None = None
+    identity: dict[str, Any] | None = None
 
 
 def _side(row: Mapping[str, Any]) -> str:
@@ -60,6 +61,10 @@ def audit_position(position: Mapping[str, Any], fills: Iterable[Mapping[str, Any
     rows = [r for r in fills if str(r.get("symbol") or r.get("code") or "").strip() == symbol
             and str(r.get("account") or "") == str(position.get("account") or "")
             and str(r.get("env") or "") == str(position.get("env") or "")]
+    expected_strategy = str(position.get("strategy") or "PB1").upper()
+    if any(str((r.get("strategy_owner") or (r.get("meta") or {}).get("strategy_owner") or expected_strategy)).upper()
+           not in {"PB1", "KR_PB1", expected_strategy} for r in rows):
+        return ProvenanceAudit(symbol, Confidence.AMBIGUOUS, "MIXED_STRATEGY_OWNER", qty, avg)
     rows.sort(key=lambda r: str(r.get("filled_at") or r.get("created_at") or r.get("trade_date") or ""))
     net, start = 0, 0
     for index, row in enumerate(rows):
@@ -70,9 +75,21 @@ def audit_position(position: Mapping[str, Any], fills: Iterable[Mapping[str, Any
             start = index + 1
     active = rows[start:]
     buys = [r for r in active if _side(r) == "BUY" and _qty(r) > 0 and _price(r) > 0]
-    reconstructed_qty = sum(_qty(r) if _side(r) == "BUY" else -_qty(r) if _side(r) == "SELL" else 0 for r in active)
-    buy_qty = sum(_qty(r) for r in buys)
-    reconstructed_avg = sum(_qty(r) * _price(r) for r in buys) / buy_qty if buy_qty else None
+    reconstructed_qty, cost_basis = 0, 0.0
+    for row in active:
+        row_qty = _qty(row)
+        if _side(row) == "BUY":
+            cost_basis += row_qty * _price(row)
+            reconstructed_qty += row_qty
+        elif _side(row) == "SELL":
+            if row_qty > reconstructed_qty:
+                return ProvenanceAudit(symbol, Confidence.AMBIGUOUS, "NEGATIVE_FILL_CHAIN", qty, avg)
+            running_avg = cost_basis / reconstructed_qty if reconstructed_qty else 0.0
+            cost_basis -= row_qty * running_avg
+            reconstructed_qty -= row_qty
+            if reconstructed_qty == 0:
+                cost_basis = 0.0
+    reconstructed_avg = cost_basis / reconstructed_qty if reconstructed_qty else None
     if not buys:
         return ProvenanceAudit(symbol, Confidence.UNRECOVERABLE, "NO_CURRENT_LIFECYCLE_BUY", qty, avg, reconstructed_qty)
     if reconstructed_qty != qty:
@@ -105,6 +122,9 @@ def audit_position(position: Mapping[str, Any], fills: Iterable[Mapping[str, Any
     if trade_date:
         age = calc_position_age(opened, trade_date)
         updates.update(holding_days=age.days_held, same_day=age.days_held == 0)
+    identity = {key: position.get(key) for key in (
+        "position_cycle_id", "portfolio_epoch_id", "position_origin", "strategy_owner",
+        "account_id", "account", "env", "strategy", "code")}
     return ProvenanceAudit(symbol, Confidence.CONFIRMED, "EXACT_FILL_CHAIN", qty, avg,
                            reconstructed_qty, reconstructed_avg,
-                           first.get("id") or first.get("fill_id") or first.get("order_id"), updates)
+                           first.get("id") or first.get("fill_id") or first.get("order_id"), updates, identity)

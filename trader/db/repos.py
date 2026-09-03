@@ -5344,6 +5344,9 @@ class PositionsRepo:
                 row = conn.execute(select(self._schema.positions).where(identity).with_for_update()).mappings().first()
                 if not row or int(row.get("qty") or 0) != int(repair["current_qty"]):
                     raise ValueError("STALE_AUDIT_POSITION_CHANGED")
+                for key in ("position_cycle_id", "portfolio_epoch_id", "position_origin"):
+                    if str(row.get(key) or "") != str(repair.get(key) or ""):
+                        raise ValueError("STALE_AUDIT_POSITION_CHANGED")
                 expected_avg = float(repair["current_avg"])
                 actual_avg = float(row.get("avg_buy_price") or 0)
                 if expected_avg <= 0 or abs(actual_avg - expected_avg) / expected_avg > float(repair.get("avg_tolerance_pct", .01)):

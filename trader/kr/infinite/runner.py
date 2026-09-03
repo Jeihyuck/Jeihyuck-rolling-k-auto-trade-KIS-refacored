@@ -77,6 +77,21 @@ def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: S
     return state, updates
 
 
+def _settle_terminal_partial_exits(*, state: State | None, updates: list,
+                                   position: BrokerPosition, trade_date: date,
+                                   allocated_capital_krw: float, total_units: int) -> State | None:
+    """Use one settlement path for delayed and immediate broker evidence."""
+    if state is None:
+        return None
+    for intent, broker_state in updates:
+        if intent.side == "SELL_PARTIAL" and intent.cycle_id == state.cycle_id:
+            state = settle_partial_exit(
+                state, intent, broker_state, position, trade_date,
+                allocated_capital_krw=allocated_capital_krw, total_units=total_units,
+            )
+    return state
+
+
 def evaluate_exit_only(*, config: InfiniteConfig, state: State | None,
                        position: BrokerPosition, trade_date: date,
                        market_state: str | None = None,
@@ -116,13 +131,16 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # Apply a buy-round rollover only after both terminal fill evidence and
         # the fresh authoritative broker position are available.
         if state is not None:
-            for intent, broker_state in updates:
-                if intent.cycle_id == state.cycle_id and intent.side == "SELL_PARTIAL":
-                    state = settle_partial_exit(
-                        state, intent, broker_state, position, day,
-                        allocated_capital_krw=executor.account_equity() * config.account_exposure_pct,
-                        total_units=config.total_units,
-                    )
+            allocated = state.allocated_capital_krw
+            if allocated <= 0 and balance_snapshot:
+                equity = float(balance_snapshot.get("account_equity") or balance_snapshot.get("total_evaluation") or 0)
+                allocated = equity * config.account_exposure_pct
+            if allocated <= 0:
+                allocated = executor.account_equity() * config.account_exposure_pct
+            state = _settle_terminal_partial_exits(
+                state=state, updates=updates, position=position, trade_date=day,
+                allocated_capital_krw=allocated, total_units=config.total_units,
+            )
         if state is None and position.qty > 0:
             state = State(status=Status.ACTIVE, cycle_id=f"BROKER_ADOPTION-{day.isoformat()}",
                           cycle_start_date=day,
@@ -238,6 +256,11 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # One immediate reconciliation is safe; absence of a fill consumes no unit.
         state, post_updates = _reconcile_pending(repository, executor, state, day)
         post_position = executor.position(config.symbol)
+        state = _settle_terminal_partial_exits(
+            state=state, updates=post_updates, position=post_position, trade_date=day,
+            allocated_capital_krw=state.allocated_capital_krw if state else 0,
+            total_units=config.total_units,
+        )
         for intent, broker_state in post_updates:
             reconciliation = reconcile_order_fill_prices(
                 order_price=position.current_price,

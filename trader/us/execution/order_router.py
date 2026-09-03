@@ -713,18 +713,6 @@ def route_order(
     intent["submit_attempt_id"] = str(intent.get("submit_attempt_id") or uuid.uuid4())
     meta["submit_attempt_id"] = intent["submit_attempt_id"]
     intent["meta"] = meta
-    if side == "SELL" and str(intent.get("reason") or meta.get("reason") or "").startswith("TAKE_PROFIT"):
-        from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
-        try:
-            broker_avg, _ = authoritative_broker_avg({**meta, "qty": qty, "orderable_qty": intent.get("available_qty", qty), "position_lifecycle_id": intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id")})
-            executable = as_decimal(intent.get("limit_price"), name="executable_price")
-            threshold = as_decimal(meta.get("tp_threshold_fraction"), name="tp_threshold")
-            actual_return = calc_return_rate(executable, broker_avg)
-            if actual_return <= 0 or actual_return < threshold:
-                raise ValueError("threshold_not_met" if actual_return > 0 else "non_positive_return")
-        except ValueError as exc:
-            logger.warning("[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=%s", symbol_upper, exc)
-            return {"status": "BLOCKED", "reason": "take_profit_pre_submit_guard_failed", "guard_reason": str(exc), "broker_submit": False, "intent": intent}
     hard_block_reasons = {
         "FORBIDDEN_HEDGE_OR_INVERSE_ETF",
         "DEFENSE_CRASH_ENTRY_BLOCK",
@@ -1120,6 +1108,27 @@ def route_order(
         if broker_pos and broker_orderable_qty < qty:
             qty = broker_orderable_qty
             intent = {**intent, "qty": qty, "notional_usd": qty * price}
+        if str(intent.get("reason") or meta.get("reason") or "").startswith("TAKE_PROFIT"):
+            from datetime import datetime, timezone
+            from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
+            fresh_asof = (broker_pos.get("broker_avg_price_asof") or broker_pos.get("balance_asof")
+                          or datetime.now(timezone.utc).isoformat())
+            fresh = {**broker_pos, "symbol": symbol_upper, "qty": broker_holding_qty,
+                     "orderable_qty": broker_orderable_qty,
+                     "broker_avg_price": broker_pos.get("broker_avg_price") or broker_pos.get("average_price") or broker_pos.get("avg_price") or broker_pos.get("avg_price_usd") or broker_pos.get("pchs_avg_pric"),
+                     "broker_avg_price_source": broker_pos.get("broker_avg_price_source") or "kis_balance",
+                     "broker_avg_price_currency": "USD", "broker_avg_price_asof": fresh_asof,
+                     "balance_source": "kis_balance_authoritative", "authoritative_positions": True,
+                     "position_lifecycle_id": intent.get("position_lifecycle_id") or meta.get("position_lifecycle_id")}
+            try:
+                broker_avg, _ = authoritative_broker_avg(fresh)
+                actual_return = calc_return_rate(as_decimal(intent.get("limit_price"), name="executable_price"), broker_avg)
+                threshold = as_decimal(meta.get("tp_threshold_fraction"), name="tp_threshold")
+                if actual_return <= 0 or actual_return < threshold:
+                    raise ValueError("threshold_not_met" if actual_return > 0 else "non_positive_return")
+            except ValueError as exc:
+                logger.warning("[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=%s", symbol_upper, exc)
+                return {"status": "BLOCKED", "reason": "take_profit_pre_submit_guard_failed", "guard_reason": str(exc), "broker_submit": False, "intent": intent}
         if broker_pos is None and int(intent.get("orderable_qty") or 0) > 0:
             logger.warning("[US_ORDER][BROKER_QTY_CHECK][INTENT_FALLBACK] env=%s symbol=%s reason=broker_balance_unavailable", account_env, symbol)
         from trader.us.execution.us_sell_qty_guard import resolve_sell_qty
