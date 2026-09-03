@@ -131,6 +131,22 @@ def test_unresolved_ack_crash_rebound_keeps_buy_fenced():
     ) == (False, False)
 
 
+def test_unresolved_ack_crash_rebound_blocks_standard_buy():
+    entry, symbols = apply_crash_rebound_entry_recovery(
+        False, False, market_state="DEFENSE_CRASH_REBOUND",
+        prep_reason="risk_off_entry_block", execution_buy_fenced=True,
+    )
+    assert entry is False
+    assert symbols is False
+
+
+def test_unresolved_ack_crash_rebound_blocks_tqqq_buy():
+    assert apply_crash_rebound_entry_recovery(
+        False, False, market_state="DEFENSE_CRASH_REBOUND",
+        prep_reason="force_entry_block", execution_buy_fenced=True,
+    ) == (False, False)
+
+
 def test_clean_crash_rebound_restores_policy_buy_permission():
     assert apply_crash_rebound_entry_recovery(
         False, False, market_state="DEFENSE_CRASH_REBOUND",
