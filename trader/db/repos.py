@@ -5318,6 +5318,51 @@ class PositionsRepo:
             result = conn.execute(stmt)
             return int(result.rowcount or 0)
 
+    def apply_confirmed_provenance_repairs(self, repairs: list[dict]) -> int:
+        """Atomically apply reviewed repairs after rechecking the locked row.
+
+        ``repairs`` must contain the audited identity and broker quantity/cost
+        basis.  Only columns in the canonical positions table are written;
+        age/audit fields live in ``position_meta``.
+        """
+        applied = 0
+        allowed = {"opened_at", "entry_ts", "entry_reason", "entry_style_selected",
+                   "entry_thesis", "trade_horizon", "exit_policy_family", "initial_stop",
+                   "stop_price_at_entry", "pivot_price_at_entry", "entry_exit_plan_json"}
+        with self.engine.begin() as conn:
+            for repair in repairs:
+                if str(repair.get("code") or repair.get("symbol")) == "122630":
+                    raise ValueError("KR_POSITION_PROVENANCE_OWNER_EXCLUDED")
+                identity = and_(
+                    self._schema.positions.c.env == repair["env"],
+                    self._schema.positions.c.strategy == repair["strategy"],
+                    self._schema.positions.c.sid == int(repair["sid"]),
+                    self._schema.positions.c.mode == int(repair["mode"]),
+                    self._schema.positions.c.code == str(repair.get("code") or repair["symbol"]),
+                    self._schema.positions.c.status == "OPEN",
+                )
+                row = conn.execute(select(self._schema.positions).where(identity).with_for_update()).mappings().first()
+                if not row or int(row.get("qty") or 0) != int(repair["current_qty"]):
+                    raise ValueError("STALE_AUDIT_POSITION_CHANGED")
+                expected_avg = float(repair["current_avg"])
+                actual_avg = float(row.get("avg_buy_price") or 0)
+                if expected_avg <= 0 or abs(actual_avg - expected_avg) / expected_avg > float(repair.get("avg_tolerance_pct", .01)):
+                    raise ValueError("STALE_AUDIT_POSITION_CHANGED")
+                updates = dict(repair.get("updates") or {})
+                values = {key: value for key, value in updates.items() if key in allowed and key in self._schema.positions.c}
+                if "entry_exit_plan" in updates and "entry_exit_plan_json" in self._schema.positions.c:
+                    values["entry_exit_plan_json"] = updates["entry_exit_plan"]
+                meta = dict(row.get("position_meta") or {})
+                meta.update({key: updates[key] for key in ("opened_trade_date", "holding_days", "same_day", "provenance_verified") if key in updates})
+                meta.update({"provenance_source": "HISTORICAL_CURRENT_LIFECYCLE_FILL_CHAIN",
+                             "provenance_original_buy_id": repair.get("original_buy_id")})
+                values["position_meta"] = meta
+                conn.execute(sa.update(self._schema.positions).where(
+                    self._schema.positions.c.position_id == row["position_id"]
+                ).values(**values, updated_at=func.now()))
+                applied += 1
+        return applied
+
     def update_position_fields(
         self,
         *,

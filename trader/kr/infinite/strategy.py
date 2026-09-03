@@ -77,8 +77,10 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
     if state.status == Status.COMPLETE and position.qty > 0: return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if state.status == Status.ACTIVE and (not state.cycle_id or position.qty == 0): return Decision(Action.BLOCK,"KR_INF_STATE_POSITION_MISMATCH",next_status=Status.FROZEN)
     if position.qty > 0 and position.average_price > 0:
+        partial_exit_pending = bool((state.metadata or {}).get("partial_exit_pending"))
+        pending_status = Status.ACTIVE if partial_exit_pending else Status.EXIT_PENDING
         if pending_sell:
-            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=pending_status)
         profit_pct = position.current_price / position.average_price - 1.0
         metadata = dict(state.metadata or {})
         stage = str(metadata.get("profit_stage") or "NONE").upper()
@@ -86,7 +88,7 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
         if pending_stage in {"TP1_SUBMITTED", "TP1_DEFENSE_SUBMITTED", "TP1_REBOUND_PENDING_SUBMITTED",
                              "TP1_REBOUND_CONFIRMED_SUBMITTED", "TP2_SUBMITTED",
                              "CAPITAL_RECOVERY_SUBMITTED"}:
-            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+            return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=pending_status)
         state_name = str(market_state or "").upper()
         if state_name not in KR_ADAPTIVE_TP_MAP:
             return Decision(Action.BLOCK, "KR_INF_UNMAPPED_REGIME")
@@ -103,7 +105,7 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
             threshold, fraction, next_stage = 999.0, 0.0, "NONE"
         if profit_pct >= threshold and next_stage != "NONE":
             if pending_sell:
-                return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+                return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=pending_status)
             orderable = int(position.orderable_qty or 0)
             if orderable <= 0:
                 return Decision(Action.WAIT, "KR_INF_PROFIT_NO_ORDERABLE_QTY")

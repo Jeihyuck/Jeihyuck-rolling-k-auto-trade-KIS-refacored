@@ -67,8 +67,8 @@ def test_reconcile_only_tick_does_not_route_and_clean_marker_releases_next_tick(
     monkeypatch.setattr("trader.us.runner.trade_tick_runner.route_exit_orders_immediately", lambda *_args, **_kwargs: route_calls.append(1))
 
     result = run_trade_tick(session="afternoon", force_now="2026-07-21T10:00:00-04:00", tick_index=2)
-    assert result["status"] == "OK_RECONCILE_ONLY_CLEAN"
-    assert route_calls == []
+    assert result["status"] == "OK_NO_TRADE_ENTRY_DEGRADED"
+    assert route_calls == [1]  # safety SELL lane remains routable
     assert _prior_failed_orders_require_reconcile_only("2026-07-21", "afternoon") is False
 
 

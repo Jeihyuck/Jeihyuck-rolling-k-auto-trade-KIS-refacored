@@ -93,12 +93,25 @@ class InfiniteRepository:
             """), payload)
 
     def pending_sides(self, trade_date: date, symbol: str = "TQQQ") -> tuple[bool, bool]:
+        state = self.load_state(symbol=symbol)
+        rows = self.load_open_orders(symbol=symbol, cycle_id=state.cycle_id if state else None)
+        sides = {str(row.get("side") or "").upper() for row in rows}
+        return "BUY" in sides, "SELL" in sides
+
+    def load_open_orders(self, *, symbol: str = "TQQQ", cycle_id: str | None,
+                         side: str | None = None) -> list[dict[str, Any]]:
+        """Load nonterminal TQQQ Infinite orders across trade dates."""
+        prefix = f"TQQQ_INF_V3:{cycle_id}:%" if cycle_id else "TQQQ_INF_V3:%"
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT side,status FROM us_orders WHERE trade_date=:trade_date AND symbol=:symbol
-            """), {"trade_date": trade_date, "symbol": symbol}).mappings()
-            sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
-        return "BUY" in sides, "SELL" in sides
+                SELECT *, COALESCE(meta->>'strategy_owner','TQQQ_INFINITE') AS strategy_owner
+                FROM us_orders WHERE symbol=:symbol AND client_order_key LIKE :prefix
+                  AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING','PARTIALLY_FILLED',
+                                 'RECONCILE_PENDING','ACK_DB_FAILED')
+                  AND (:side IS NULL OR side=:side)
+                ORDER BY created_at
+            """), {"symbol": symbol, "prefix": prefix, "side": side}).mappings().all()
+        return [dict(row) for row in rows]
 
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
         """Capital reserved by unresolved BUY ACK/pending quantities."""
@@ -194,7 +207,8 @@ class InfiniteRepository:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""
                 SELECT f.trade_date,f.side,f.qty,f.price_usd,f.meta,f.client_order_key,
-                       i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta
+                       i.strategy AS intent_strategy,i.meta AS intent_meta,o.meta AS order_meta,
+                       o.status AS order_status,o.qty_requested
                 FROM us_fills f LEFT JOIN us_order_intents i ON i.client_order_key=f.client_order_key
                 LEFT JOIN us_orders o ON o.client_order_key=f.client_order_key
                 WHERE f.symbol=:symbol AND f.trade_date>=:start
@@ -203,6 +217,7 @@ class InfiniteRepository:
         summary = self._summarize_fill_rows(rows, state, trading_date)
         last_price = None
         last_profit_stage = None
+        last_profit_fill = None
         for row in rows:
             if self._belongs_to_cycle(row, state) and str(row.get("side") or "").upper() == "BUY":
                 meta = self._json_object(row.get("meta"))
@@ -217,11 +232,16 @@ class InfiniteRepository:
                               for meta in metas if meta.get("desired_profit_stage") or meta.get("profit_stage")), "")
                 if stage:
                     last_profit_stage = stage.removesuffix("_SUBMITTED").removesuffix("_FILLED") + "_FILLED"
+                    last_profit_fill = {"order_key": row.get("client_order_key"),
+                                        "order_status": row.get("order_status"),
+                                        "requested_qty": int(row.get("qty_requested") or 0),
+                                        "filled_qty": int(row.get("qty") or 0),
+                                        "filled_notional": float(row.get("qty") or 0) * float(row.get("price_usd") or 0)}
         return {"total_buy_notional": summary[0], "daily_buy_notional": summary[1],
                 "total_sell_notional": summary[2], "last_buy_date": summary[3],
                 "first_fill_price": summary[4], "last_buy_fill_price": last_price,
                 "last_rebound_probe_fill_date": self._last_rebound_probe_fill_date(rows, state),
-                "last_profit_stage": last_profit_stage}
+                "last_profit_stage": last_profit_stage, "last_profit_fill": last_profit_fill}
 
     @classmethod
     def _last_rebound_probe_fill_date(cls, rows: list[Any], state: InfiniteState) -> date | None:

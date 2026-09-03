@@ -1366,8 +1366,9 @@ def run_trade_tick(
     finally:
         tick_context.metrics["position_reconcile_ms"] = (time.monotonic() - _position_reconcile_started) * 1000.0
     
-    # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
-    if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
+    # Structural corruption is fatal. A transient/incomplete balance only
+    # degrades BUY; last-good positions continue through exit evaluation.
+    if recon.get("status") == "CONTRACT_ERROR":
         last_stage = "reconcile"
         reconcile_reason = recon.get("reason", "balance_position_parse_error")
         logger.error(
@@ -1406,6 +1407,10 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
+    if recon.get("block_new_entry", False):
+        entry_can_proceed = False
+        logger.warning("[US_BALANCE][TEMP_DEGRADED] status=%s reason=%s buy=BLOCK sell=CONTINUE",
+                       recon.get("status"), recon.get("reason"))
     
     # Extract position_symbols from reconcile result
     current_position_symbols: set[str] = set(recon.get("position_symbols", []))
@@ -1661,6 +1666,7 @@ def run_trade_tick(
         # Never return before exit generation.  Ambiguous acknowledgement may
         # globally fence new BUYs, but the safety SELL lane stays available;
         # known OPEN orders are subsequently scoped by owner/symbol/side.
+        entry_can_proceed_before_ack_gate = entry_can_proceed
         entry_can_proceed = False
         entry_degraded = True
         entry_degraded_reason = reason
@@ -1739,8 +1745,28 @@ def run_trade_tick(
     tick_context.exchange_by_symbol = exchange_by_symbol
     tick_context.fills_snapshot = fills_today
     tick_context.pending_ack_orders = pending_ack_orders
+    known_scopes = []
+    ambiguous_pending = []
+    for pending_order in pending_ack_orders:
+        meta = pending_order.get("meta") if isinstance(pending_order.get("meta"), dict) else {}
+        owner = pending_order.get("strategy_owner") or meta.get("strategy_owner")
+        symbol = str(pending_order.get("symbol") or "").upper()
+        side = str(pending_order.get("side") or "").upper()
+        cycle = pending_order.get("cycle_id") or meta.get("cycle_id")
+        if owner and symbol and side and cycle:
+            tick_context.blocked_symbol_sides.add((symbol, side))
+            known_scopes.append((owner, symbol, side, cycle))
+            logger.info("[US_ORDER_GATE][SCOPED_BLOCK] strategy_owner=%s symbol=%s side=%s cycle_id=%s reason=known_open_order",
+                        owner, symbol, side, cycle)
+        else:
+            ambiguous_pending.append(pending_order)
+    if known_scopes and not ambiguous_pending and unresolved_error_count == 0:
+        entry_can_proceed = locals().get("entry_can_proceed_before_ack_gate", entry_can_proceed)
     tick_context.today_order_keys = set(today_order_keys or set())
-    tick_context.blocked_symbol_sides = {(str(x[0]).upper(), str(x[1]).upper()) for x in (blocked_symbol_sides or []) if len(x) >= 2}
+    tick_context.blocked_symbol_sides.update(
+        (str(x[0]).upper(), str(x[1]).upper())
+        for x in (blocked_symbol_sides or []) if len(x) >= 2
+    )
     position_count = len(current_positions)
     max_positions = int(os.getenv("US_MAX_POSITIONS", "35") or "35")
     available_new_slots = max(0, max_positions - position_count)
@@ -2081,7 +2107,7 @@ def run_trade_tick(
         current_position_symbols=current_position_symbols,
         context=tick_context,
         kis_client=routing_kis_client,
-    )
+    ) or {"orders": []}
     orders = list(infinite_result.get("orders", [])) + list(exit_route_result.get("orders", []))
     sell_notional_routed = float(exit_route_result.get("sell_notional_routed", 0.0) or 0.0)
     exit_routed_before_entry = 1

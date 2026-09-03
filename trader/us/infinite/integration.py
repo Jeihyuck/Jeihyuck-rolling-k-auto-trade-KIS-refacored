@@ -10,6 +10,7 @@ from typing import Any, Callable
 from .config import InfiniteConfig
 from .models import Action, InfiniteState, PositionSnapshot, Status
 from .repository import InfiniteRepository
+from .lifecycle import buy_ttl_expired, rollover_partial_fill
 from .policy_state import reserve_new_cycle, update_adaptive_policy_state
 from .strategy import _trading_days_since, evaluate
 from .risk_adapter import effective_regime
@@ -111,7 +112,8 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
 
 def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overlay: dict,
                repository: InfiniteRepository | None = None,
-               route: Callable[[dict], dict] | None = None) -> dict[str, Any]:
+               route: Callable[[dict], dict] | None = None,
+               cancel_open_buy: Callable[[dict], dict] | None = None) -> dict[str, Any]:
     """Exception-isolated boundary. OFF returns before any DB access."""
     config = InfiniteConfig.from_env()
     if not config.enabled:
@@ -163,6 +165,27 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 metadata={**state.metadata, **recovered.metadata},
             )
             repository.save_state(state)
+        open_orders = (repository.load_open_orders(symbol=config.symbol,
+                                                   cycle_id=state.cycle_id if state else None,
+                                                   side="BUY")
+                       if hasattr(repository, "load_open_orders") else [])
+        for open_order in open_orders:
+            if not buy_ttl_expired(open_order, ttl_seconds=config.open_buy_ttl_sec):
+                continue
+            logger.warning("[TQQQ_INF][OPEN_BUY_TTL] client_order_key=%s trade_date=%s status=%s",
+                           open_order.get("client_order_key"), open_order.get("trade_date"), open_order.get("status"))
+            if cancel_open_buy is None:
+                logger.warning("[TQQQ_INF][CANCEL_REQUEST] status=UNKNOWN reason=broker_cancel_unavailable pending_retained=1")
+                continue
+            cancel_result = cancel_open_buy(open_order) or {}
+            terminal = str(cancel_result.get("status") or "").upper()
+            logger.info("[TQQQ_INF][CANCEL_REQUEST] client_order_key=%s broker_status=%s",
+                        open_order.get("client_order_key"), terminal or "UNKNOWN")
+            # The callback owns journal terminalization and must return only
+            # broker-confirmed terminal evidence; UNKNOWN remains pending.
+            if terminal in {"CANCELLED", "FILLED", "REJECTED", "EXPIRED"}:
+                logger.info("[TQQQ_INF][CANCEL_CONFIRMED] client_order_key=%s broker_status=%s",
+                            open_order.get("client_order_key"), terminal)
         if state is not None and broker.qty > 0:
             needs_attribution_backfill = (
                 state.metadata.get("strategy_owner") != "TQQQ_INFINITE"
@@ -187,6 +210,18 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                                   broker_average_price=broker.average_price,
                                                   core_cap=config.core_capital_usd,
                                                   rebound_cooldown=config.rebound_cooldown)
+            stats = repository.cycle_fill_stats(state, trading_date) if hasattr(repository, "cycle_fill_stats") else {}
+            partial_fill = stats.get("last_profit_fill") or {}
+            if partial_fill and broker.qty > 0:
+                state = rollover_partial_fill(
+                    state, order_status=str(partial_fill.get("order_status") or ""),
+                    filled_qty=int(partial_fill.get("filled_qty") or 0),
+                    requested_qty=int(partial_fill.get("requested_qty") or 0),
+                    filled_notional=float(partial_fill.get("filled_notional") or 0),
+                    position=broker, trading_date=trading_date,
+                    order_key=str(partial_fill.get("order_key") or ""),
+                    hard_cap=config.max_total_capital_usd,
+                )
             if state.metadata.get("last_buy_fill_price"):
                 state = replace(state, metadata={**state.metadata, "recovery_accounting_uncertain": False})
             state = update_adaptive_policy_state(state=state, trading_date=trading_date,

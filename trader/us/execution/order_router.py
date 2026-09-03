@@ -1087,16 +1087,25 @@ def route_order(
 
     # SELL 직전 broker balance hard guard: DB/cache가 아닌 KIS 최신 잔고 기준
     if side == "SELL":
-        broker_pos = _get_broker_position(kis_client, symbol)
-        broker_holding_qty = int(broker_pos.get("qty") or broker_pos.get("holding_qty") or 0) if broker_pos else 0
-        broker_orderable_qty = int(broker_pos.get("orderable_qty") or 0) if broker_pos else 0
-        if broker_pos is None:
-            logger.warning("[US_ORDER][BROKER_QTY_CHECK][SKIP] env=%s symbol=%s reason=broker_balance_method_missing", account_env, symbol)
-            if is_tqqq_infinite:
-                return {"status": "BLOCKED", "reason": "tqqq_orderable_qty_missing",
-                        "broker_submit": False, "intent": intent}
-        else:
-            logger.info("[US_ORDER][BROKER_QTY_CHECK] env=%s symbol=%s exchange=%s holding_qty=%s orderable_qty=%s currency=%s account_env=%s", account_env, symbol, exchange, broker_holding_qty, broker_orderable_qty, broker_pos.get("currency", "USD") if broker_pos else "USD", account_env)
+        context_pos = ((context.positions_by_symbol or {}).get(symbol) if context is not None else None)
+        fetched_from_broker = context_pos is None
+        broker_pos = context_pos or _get_broker_position(kis_client, symbol)
+        context_balance = getattr(context, "balance_snapshot", {}) if context is not None else {}
+        authoritative = bool(broker_pos is not None and (fetched_from_broker or (
+            broker_pos.get("authoritative_positions") is True
+            or broker_pos.get("balance_source") in {"kis_balance_authoritative", "KIS_BALANCE"}
+            or context_balance.get("authoritative_positions") is True
+        )))
+        qty_present = bool(broker_pos and any(k in broker_pos for k in ("qty", "holding_qty")))
+        orderable_present = bool(broker_pos and "orderable_qty" in broker_pos)
+        if not (authoritative and qty_present and orderable_present):
+            logger.warning("[US_BALANCE][QTY_UNKNOWN] symbol=%s side=SELL reason=missing_fresh_authoritative_fields", symbol)
+            return {"status": "RETRYABLE", "reason": "BROKER_POSITION_UNKNOWN_RETRYABLE",
+                    "broker_position_state": "UNKNOWN", "session_should_continue": True,
+                    "broker_submit": False, "intent": intent}
+        broker_holding_qty = int(broker_pos.get("qty") if "qty" in broker_pos else broker_pos.get("holding_qty"))
+        broker_orderable_qty = int(broker_pos.get("orderable_qty"))
+        logger.info("[US_ORDER][BROKER_QTY_CHECK] env=%s symbol=%s exchange=%s holding_qty=%s orderable_qty=%s currency=%s account_env=%s state=%s", account_env, symbol, exchange, broker_holding_qty, broker_orderable_qty, broker_pos.get("currency", "USD"), account_env, "KNOWN_POSITIVE" if broker_holding_qty > 0 else "KNOWN_ZERO")
         if broker_pos is not None and broker_orderable_qty <= 0:
             try:
                 from trader.us.db.repos import find_recent_sell_ack

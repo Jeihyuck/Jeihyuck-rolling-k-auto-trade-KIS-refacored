@@ -77,12 +77,23 @@ class InfiniteRepository:
 
     def persist_reconciliation(self, state: State, updates: list[tuple[OrderIntent, BrokerOrderState]]) -> None:
         with self.engine.begin() as conn:
-            for intent, broker in updates:
-                conn.execute(text("""UPDATE kr_infinite_order_intents SET status=:status,filled_qty=:qty,
-                    filled_notional_krw=:notional,filled_avg_price=:average,updated_at=NOW() WHERE id=:id"""),
-                    {"status": broker.status, "qty": broker.filled_qty, "notional": broker.filled_notional_krw,
-                     "average": broker.filled_avg_price, "id": intent.id})
+            self._persist_intent_updates(conn, updates)
             self._save_state(conn, state)
+
+    def persist_intent_reconciliation(self, updates: list[tuple[OrderIntent, BrokerOrderState]]) -> None:
+        """Persist broker evidence without ever touching the active state row."""
+        if not updates:
+            return
+        with self.engine.begin() as conn:
+            self._persist_intent_updates(conn, updates)
+
+    @staticmethod
+    def _persist_intent_updates(conn, updates: list[tuple[OrderIntent, BrokerOrderState]]) -> None:
+        for intent, broker in updates:
+            conn.execute(text("""UPDATE kr_infinite_order_intents SET status=:status,filled_qty=:qty,
+                filled_notional_krw=:notional,filled_avg_price=:average,updated_at=NOW() WHERE id=:id"""),
+                {"status": broker.status, "qty": broker.filled_qty, "notional": broker.filled_notional_krw,
+                 "average": broker.filled_avg_price, "id": intent.id})
 
     def save_state(self, state: State) -> None:
         with self.engine.begin() as conn:
