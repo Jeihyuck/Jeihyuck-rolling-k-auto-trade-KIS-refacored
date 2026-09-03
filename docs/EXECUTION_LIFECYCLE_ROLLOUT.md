@@ -32,3 +32,14 @@ intent dates and cycle identifiers. Classify every row as `FILLED`, `OPEN`,
 lookup must use the intent's own `trade_date`; an unknown result requires manual
 reconciliation. For TQQQ, cancel an expired live BUY at the broker and record it
 terminal only after cancellation evidence is returned.
+
+## Partial-profit rollover semantics
+
+An Infinite partial-profit fill does not create a new macro cycle. The existing
+macro `cycle_id` is preserved, while the completed profit sleeve starts a new
+nested buy round with `buy_round_units_used=0` and the existing 40-unit policy.
+That reset is performed exactly once, only after terminal fill evidence and a
+fresh authoritative broker residual quantity and average are both available.
+Until the residual is authoritative, the rollover remains pending and the
+SELL/TP lane stays available; a cached or fallback position must never seed the
+round or be labeled `KIS_BALANCE_AUTHORITATIVE`.

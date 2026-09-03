@@ -30,7 +30,8 @@ def rollover_partial_fill(state: InfiniteState, *, order_status: str, filled_qty
     if not stage.endswith("_FILLED"):
         stage = f"{stage.removesuffix('_SUBMITTED')}_FILLED"
     metadata = {**state.metadata, "profit_stage": stage, "pending_profit_stage": None,
-                "partial_exit_pending": False, "buy_round": buy_round,
+                "partial_exit_pending": False, "partial_rollover_pending": False,
+                "partial_rollover_wait_reason": None, "buy_round": buy_round,
                 "buy_round_id": f"{state.cycle_id}:R{buy_round}", "buy_round_units_used": 0,
                 "buy_round_started_trade_date": trading_date.isoformat(),
                 "buy_round_effective_unit_usd": remaining / 40 if remaining > 0 else 0.0,
