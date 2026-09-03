@@ -2099,6 +2099,21 @@ def run_trade_tick(
                             if row_no == order_no:
                                 status = str(row.get("status") or row.get("order_status") or "").upper()
                                 if status in {"CANCELLED", "FILLED", "REJECTED", "EXPIRED"}:
+                                    from trader.us.db.repos import apply_broker_order_observation
+                                    apply_broker_order_observation(
+                                        trade_date=trade_day,
+                                        client_order_key=str(open_order.get("client_order_key") or ""),
+                                        raw_order_no=order_no,
+                                        canonical_order_no=order_no,
+                                        symbol=str(open_order.get("symbol") or _infinite_config.symbol),
+                                        side=str(open_order.get("side") or "BUY"),
+                                        requested_qty=requested,
+                                        filled_qty=int(row.get("qty_filled") or row.get("filled_qty") or filled),
+                                        remaining_qty=max(0, requested - int(row.get("qty_filled") or row.get("filled_qty") or filled)),
+                                        broker_status=status,
+                                        evidence_type="tqqq_cancel_terminal_inquiry",
+                                        raw_row=row,
+                                    )
                                     return {"status": status, "order_no": order_no}
                         return {"status": "UNKNOWN", "order_no": order_no}
                     return result

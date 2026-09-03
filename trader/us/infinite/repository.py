@@ -350,6 +350,7 @@ class InfiniteRepository:
 
     def reconcile_metadata(self, state: InfiniteState, *, trading_date: date, broker_qty: int,
                            broker_average_price: float, core_cap: float,
+                           hard_cap: float = 10_000.0,
                            rebound_cooldown: int = 3) -> InfiniteState:
         stats = self.cycle_fill_stats(state, trading_date)
         buys, last_buy, first_price = stats["total_buy_notional"], stats["last_buy_date"], stats["first_fill_price"]
@@ -381,7 +382,13 @@ class InfiniteRepository:
         actual_last_buy_price = (stats["last_buy_fill_price"]
                                  or state.metadata.get("last_buy_fill_price"))
         metadata = {**state.metadata, "last_buy_fill_price": actual_last_buy_price,
-                    "broker_qty": broker_qty, "broker_average_price": broker_average_price}
+                    "broker_qty": broker_qty, "broker_average_price": broker_average_price,
+                    "broker_deployed_notional_usd": deployed,
+                    "hard_cap_exceeded": deployed > hard_cap + 1e-6,
+                    "hard_cap_exceeded_reason": (
+                        "TQQQ_INF_BROKER_DEPLOYED_EXCEEDS_HARD_CAP"
+                        if deployed > hard_cap + 1e-6 else None
+                    )}
         if stats.get("last_profit_stage"):
             metadata.update(profit_stage=stats["last_profit_stage"], pending_profit_stage=None)
         if actual_last_buy_price:

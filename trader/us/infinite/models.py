@@ -54,7 +54,12 @@ class InfiniteState:
         if min(self.core_filled_notional, self.reserve_filled_notional, self.market_crash_streak,
                self.cycle_age_trading_days) < 0:
             raise ValueError("negative state value")
-        if self.total_filled_notional > hard_cap + 1e-6:
+        if (self.total_filled_notional > hard_cap + 1e-6
+                and not (
+                    self.metadata.get("hard_cap_exceeded") is True
+                    and abs(float(self.metadata.get("broker_deployed_notional_usd") or 0) - self.total_filled_notional) <= 1e-6
+                    and self.metadata.get("ownership_source") in {"SYMBOL_INVARIANT_RECOVERY", "KIS_BALANCE_AUTHORITATIVE"}
+                )):
             raise ValueError("filled notional exceeds hard cap")
         if self.status not in {Status.READY, Status.COMPLETE} and not self.cycle_id:
             raise ValueError("active status without cycle")

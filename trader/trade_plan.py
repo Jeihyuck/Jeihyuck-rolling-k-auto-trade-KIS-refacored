@@ -296,7 +296,17 @@ def classify_close_action_from_position_contract(
     if isinstance(plan, Mapping) and plan:
         action, reason = classify_close_action_from_plan(plan)
         return action, reason, "OK_FULL_PLAN"
-    if position.get("provenance_verified") and all(
+    meta = position.get("position_meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            meta = {}
+    verified = position.get("provenance_verified") or (
+        isinstance(meta, Mapping) and meta.get("provenance_verified")
+    )
+    if verified and all(
         position.get(key) is not None
         for key in ("trade_horizon", "eod_action", "force_eod_close")
     ):

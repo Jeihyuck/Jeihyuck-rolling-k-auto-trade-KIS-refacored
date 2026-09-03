@@ -228,7 +228,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     ):
                         continue
                     pending = str(state.metadata.get("pending_profit_stage") or "TP1_SUBMITTED")
-                    metadata = {**state.metadata, "pending_profit_stage": None, "partial_exit_pending": False}
+                    metadata = {**state.metadata, "pending_profit_stage": None,
+                                "pending_profit_order_key": None, "partial_exit_pending": False}
                     if filled > 0 and state.metadata.get("profit_target_last_accounted_order_key") != profit_order.get("client_order_key"):
                         target = int(state.metadata.get("profit_target_qty") or requested)
                         cumulative = int(state.metadata.get("profit_target_cumulative_filled_qty") or 0) + filled
@@ -237,11 +238,21 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                         profit_target_qty=target,
                                         profit_target_cumulative_filled_qty=cumulative,
                                         profit_target_remaining_qty=max(0, target - cumulative),
-                                        profit_target_last_accounted_order_key=profit_order.get("client_order_key"))
+                                        profit_target_last_accounted_order_key=profit_order.get("client_order_key"),
+                                        profit_target_retry_sequence=int(state.metadata.get("profit_target_retry_sequence") or 0) + 1,
+                                        profit_target_original_order_key=state.metadata.get("profit_target_original_order_key") or profit_order.get("client_order_key"))
+                    elif filled == 0:
+                        metadata.update(profit_target_qty=None,
+                                        profit_target_cumulative_filled_qty=0,
+                                        profit_target_remaining_qty=0,
+                                        profit_target_retry_sequence=0,
+                                        profit_target_original_order_key=None,
+                                        partial_profit_stage=None)
                     state = replace(state, status=Status.ACTIVE, metadata=metadata)
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
                                                   broker_average_price=broker.average_price,
                                                   core_cap=config.core_capital_usd,
+                                                  hard_cap=config.max_total_capital_usd,
                                                   rebound_cooldown=config.rebound_cooldown)
             stats = repository.cycle_fill_stats(state, trading_date) if hasattr(repository, "cycle_fill_stats") else {}
             partial_fill = stats.get("last_profit_fill") or {}
@@ -412,7 +423,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             "profit_stage": profit_stage or None,
         } if decision.action == Action.SELL else {}
         stage_key = profit_stage or ("BUY" if decision.action == Action.BUY else decision.action.value)
+        retry_sequence = int(state.metadata.get("profit_target_retry_sequence") or 0) if is_partial_tp else 0
         client_order_key = f"TQQQ_INF_V3:{state.cycle_id}:{trading_date.isoformat()}:{stage_key}"
+        if retry_sequence:
+            client_order_key += f":RETRY:{retry_sequence}"
         if decision.action == Action.SELL and was_full_exit_pending:
             sequence = (repository.next_full_exit_sequence(trading_date, state.cycle_id)
                         if hasattr(repository, "next_full_exit_sequence") else 1)

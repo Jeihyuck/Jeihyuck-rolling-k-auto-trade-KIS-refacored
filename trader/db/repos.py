@@ -5327,7 +5327,8 @@ class PositionsRepo:
         """
         applied = 0
         allowed = {"opened_at", "entry_ts", "entry_reason", "entry_style_selected",
-                   "entry_thesis", "trade_horizon", "exit_policy_family", "initial_stop",
+                   "entry_thesis", "trade_horizon", "exit_policy_family", "eod_action",
+                   "force_eod_close", "initial_stop",
                    "stop_price_at_entry", "pivot_price_at_entry", "entry_exit_plan_json"}
         with self.engine.begin() as conn:
             for repair in repairs:

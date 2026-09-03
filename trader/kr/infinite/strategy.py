@@ -121,7 +121,11 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
                 sell_qty = min(orderable, max(1, int(orderable * fraction)))
             if next_stage == "TP2" or fraction >= 0.99:
                 sell_qty = orderable
-            key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}")
+            retry = int(metadata.get("tp1_retry_sequence") or 0)
+            key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}",
+                                  retry or None)
+            if retry:
+                key = f"{key}:RETRY:{retry}"
             sell_action = Action.SELL_PARTIAL if sell_qty < position.qty else Action.SELL_ALL
             assert (sell_action != Action.SELL_ALL or sell_qty == position.qty)
             assert (sell_action != Action.SELL_PARTIAL or position.qty - sell_qty > 0)

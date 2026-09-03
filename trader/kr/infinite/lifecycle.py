@@ -33,7 +33,11 @@ def settle_partial_exit(state: State, intent: OrderIntent, order: BrokerOrderSta
                             tp1_target_qty_at_first_decision=target,
                             tp1_cumulative_filled_qty=cumulative,
                             tp1_remaining_target_qty=max(0, target - cumulative),
-                            tp1_last_accounted_terminal_order_key=intent.idempotency_key)
+                            tp1_last_accounted_terminal_order_key=intent.idempotency_key,
+                            tp1_original_target_order_key=state.metadata.get(
+                                "tp1_original_target_order_key"
+                            ) or intent.idempotency_key,
+                            tp1_retry_sequence=int(state.metadata.get("tp1_retry_sequence") or 0) + 1)
         return replace(state, status=Status.ACTIVE, metadata=metadata)
     # Rollover requires a fresh authoritative positive residual balance.
     if position.qty <= 0 or position.average_price <= 0:
