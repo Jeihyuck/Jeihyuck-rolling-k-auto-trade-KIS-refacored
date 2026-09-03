@@ -225,7 +225,7 @@ def test_profit_capture_price_aliases_and_pnl_rate_resolver(monkeypatch):
     assert build_profit_capture_intents([{"symbol": "LOSS", "qty": 100, "current_price_usd": 95, "entry_price": 100}], overlay, trade_date=td) == []
 
 
-def test_profit_capture_persistent_duplicate_prevention(monkeypatch):
+def test_profit_capture_intent_generation_is_pure_and_idempotently_keyed(monkeypatch):
     monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     overlay = {"market_state": "STRONG_RISK_ON", "profit_capture_enabled": True}
@@ -233,7 +233,9 @@ def test_profit_capture_persistent_duplicate_prevention(monkeypatch):
     first = build_profit_capture_intents([pos], overlay, trade_date="2026-07-09")
     second = build_profit_capture_intents([pos], overlay, trade_date="2026-07-09")
     assert len(first) == 1
-    assert second == []
+    assert len(second) == 1
+    assert second[0]["client_order_key"] == first[0]["client_order_key"]
+    assert repos._MEM_PROFIT_CAPTURE_STATE == {}
     repos._MEM_PROFIT_CAPTURE_STATE.clear()
     repos.mark_us_profit_capture_stage("2026-07-09", "AAPL", "tp1", status="ACK", position_lifecycle_id="life-AAPL")
     assert build_profit_capture_intents([{**pos, "current_price_usd": 105}], overlay, trade_date="2026-07-09") == []

@@ -61,7 +61,11 @@ def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: S
                        trade_date: date) -> tuple[State | None, list]:
     updates = []
     for intent in repo.pending_intents():
-        broker = executor.order_state(intent, trade_date)
+        # Broker inquiry is date-partitioned.  Using today's date for an older
+        # intent makes valid terminal evidence invisible forever.
+        broker = executor.order_state(intent, intent.trade_date)
+        logger.info("[KR_INF][PENDING_SOURCE] strategy_owner=KR_INFINITE symbol=122630 side=%s cycle_id=%s client_order_key=%s trade_date=%s broker_status=%s",
+                    intent.side, intent.cycle_id, intent.idempotency_key, intent.trade_date, broker.status)
         updates.append((intent, broker))
         if state is not None:
             state, _, _ = apply_confirmed_fill(state, intent, broker, trade_date)
@@ -139,7 +143,8 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             capital_preservation=age >= config.long_cycle_days)
             repository.save_state(state)
         existing_keys = repository.intent_keys()
-        pending = repository.pending_intents()
+        pending = [item for item in repository.pending_intents()
+                   if state is None or item.cycle_id == state.cycle_id]
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
         pending_sell = any(item.side in {"SELL_PARTIAL", "SELL_ALL"} for item in pending)
 
@@ -200,8 +205,12 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         if decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}:
             desired = str(decision.metadata.get("desired_profit_stage") or "")
             pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
-            state = replace(state, status=Status.EXIT_PENDING,
-                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
+            # Partial profit-taking is a sleeve-local fence, never the global
+            # full-liquidation state.
+            next_status = Status.ACTIVE if decision.action == Action.SELL_PARTIAL else Status.EXIT_PENDING
+            state = replace(state, status=next_status,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage,
+                                      "partial_exit_pending": decision.action == Action.SELL_PARTIAL})
             repository.save_state(state)
         try:
             order_id, _ = executor.submit(decision, config.symbol)

@@ -387,8 +387,10 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 and str(result.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED", "PENDING"}):
             desired = str(decision.metadata.get("desired_profit_stage") or profit_stage or "").upper()
             pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
-            state = replace(state, status=Status.EXIT_PENDING,
-                            metadata={**state.metadata, "pending_profit_stage": pending_stage})
+            next_status = Status.ACTIVE if is_partial_tp else Status.EXIT_PENDING
+            state = replace(state, status=next_status,
+                            metadata={**state.metadata, "pending_profit_stage": pending_stage,
+                                      "partial_exit_pending": is_partial_tp})
             repository.save_state(state)
         logger.info("[TQQQ_INF][ORDER_STATUS] side=%s requested_qty=%s status=%s cycle_id=%s",
                     decision.action.value, decision.qty, result.get("status", "UNKNOWN"), state.cycle_id)

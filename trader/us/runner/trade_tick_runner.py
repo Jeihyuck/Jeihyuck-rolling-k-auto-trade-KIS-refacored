@@ -1658,40 +1658,17 @@ def run_trade_tick(
         logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
     if reconcile_only_until_clean or ack_order_block:
         reason = str(ack_gate["reason"] or "unresolved_ack_exists")
-        logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
+        # Never return before exit generation.  Ambiguous acknowledgement may
+        # globally fence new BUYs, but the safety SELL lane stays available;
+        # known OPEN orders are subsequently scoped by owner/symbol/side.
+        entry_can_proceed = False
+        entry_degraded = True
+        entry_degraded_reason = reason
+        logger.warning("[US_ORDER_GATE][SCOPED_BLOCK] strategy_owner=* symbol=* side=BUY reason=%s sell_lane=OPEN", reason)
         reconcile_only_clean_at = (
             _write_reconcile_only_clean_marker(trade_date=trade_date, session=session, tick_index=tick_index)
             if reconcile_only_clean else ""
         )
-        return {
-            "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
-            "severity": "OK" if reconcile_only_clean else "DEGRADED",
-            "allow_new_orders": False,
-            "session_should_continue": True,
-            "reason": reason,
-            "session": session,
-            "orders": [], "ack": 0, "dry_run": 0, "blocked": 0, "signal_only": 0,
-            "errors": 0, "trade_date": trade_date, "fills": len(fills_today),
-            "positions": len(recon_positions), "orders_sent": 0,
-            "prior_failed_orders_reconcile_required": int(prior_failed_orders_reconcile_required),
-            "reconcile_only_until_clean": int(reconcile_only_until_clean),
-            "reconcile_only_clean": int(reconcile_only_clean),
-            "reconcile_only_clean_at": reconcile_only_clean_at,
-            "reconcile_only_clean_session": session if reconcile_only_clean else "",
-            "reconcile_only_clean_tick": int(tick_index) if reconcile_only_clean else 0,
-            "pending_ack_count": pending_ack_count,
-            "unresolved_ack_count": unresolved_ack_count,
-            "open_order_pending_count": open_order_pending_count,
-            "unresolved_error_count": unresolved_error_count,
-            "blocked_new_orders_due_to_reconcile": 1,
-            "last_unresolved_symbols": (ack_recon.get("symbols_by_status") or {}).get("unresolved", []),
-            "last_open_order_pending_symbols": ack_gate["last_open_order_pending_symbols"],
-            "last_unresolved_error_symbols": ack_gate["last_unresolved_error_symbols"],
-            "last_unresolved_order_nos": ack_recon.get("unresolved_order_nos", []),
-            "manual_reconcile_required": ack_gate["manual_reconcile_required"],
-            "ack_reconcile_before_route_status": ack_recon.get("status"),
-            "ack_pending_reconcile_count": pending_ack_count,
-        }
 
     # reconcile log DB 저장
     try:
@@ -3311,6 +3288,7 @@ def run_trade_tick(
     ack_pending_reconcile_count = len(after_symbols_by_status.get("ack_pending_reconcile", [])) if isinstance(after_symbols_by_status, dict) else 0
     broker_ack_only_unresolved = int(ack_recon_after_route.get("unresolved_count", 0) or 0)
     real_broker_buys = real_broker_sells = synthetic_reconcile_buys = synthetic_reconcile_sells = 0
+    actual_buy_filled_qty = actual_sell_filled_qty = 0
     broker_ack_only = ack_cnt + dry_cnt
     broker_rejects = reject_cnt
     for f in (fills_today if 'fills_today' in locals() else []):
@@ -3324,8 +3302,10 @@ def run_trade_tick(
             synthetic_reconcile_sells += 1
         elif side_f == "BUY":
             real_broker_buys += 1
+            actual_buy_filled_qty += int(f.get("qty") or f.get("filled_qty") or 0)
         elif side_f == "SELL":
             real_broker_sells += 1
+            actual_sell_filled_qty += int(f.get("qty") or f.get("filled_qty") or 0)
 
     held_skip = locals().get("held_skip_count")
     held_skip_unknown = 0 if isinstance(held_skip, int) else 1
@@ -3626,6 +3606,17 @@ def run_trade_tick(
         "kis_temp_errors_by_api": kis_temp_errors_by_api,
         "real_broker_buys": real_broker_buys,
         "real_broker_sells": real_broker_sells,
+        "broker_buy_acks": sum(1 for o in orders if str(o.get("side") or "").upper() == "BUY" and str(o.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED"}),
+        "broker_sell_acks": sum(1 for o in orders if str(o.get("side") or "").upper() == "SELL" and str(o.get("status") or "").upper() in {"ACK", "ACCEPTED", "SUBMITTED"}),
+        "actual_buy_fill_orders": real_broker_buys,
+        "actual_sell_fill_orders": real_broker_sells,
+        "actual_buy_filled_qty": actual_buy_filled_qty,
+        "actual_sell_filled_qty": actual_sell_filled_qty,
+        "open_buy_orders": sum(1 for o in orders if str(o.get("side") or "").upper() == "BUY" and str(o.get("status") or "").upper() in {"ACK", "OPEN", "PENDING", "PARTIALLY_FILLED"}),
+        "open_sell_orders": sum(1 for o in orders if str(o.get("side") or "").upper() == "SELL" and str(o.get("status") or "").upper() in {"ACK", "OPEN", "PENDING", "PARTIALLY_FILLED"}),
+        "cancelled_orders": sum(1 for o in orders if str(o.get("status") or "").upper() == "CANCELLED"),
+        "rejected_orders": sum(1 for o in orders if str(o.get("status") or "").upper() in {"REJECTED", "REJECT"}),
+        "expired_orders": sum(1 for o in orders if str(o.get("status") or "").upper() == "EXPIRED"),
         "synthetic_reconcile_buys": synthetic_reconcile_buys,
         "synthetic_reconcile_sells": synthetic_reconcile_sells,
         "broker_ack_only": broker_ack_only,

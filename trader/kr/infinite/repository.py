@@ -38,12 +38,15 @@ class InfiniteRepository:
             rows = conn.execute(text("SELECT idempotency_key FROM kr_infinite_order_intents")).all()
         return frozenset(row[0] for row in rows)
 
-    def pending_intents(self) -> list[OrderIntent]:
+    def pending_intents(self, *, cycle_id: str | None = None, side: str | None = None) -> list[OrderIntent]:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
                 broker_order_id,status,filled_qty,filled_notional_krw FROM kr_infinite_order_intents
                 WHERE status=ANY(:statuses) ORDER BY id"""), {"statuses": list(PENDING)}).mappings().all()
-        return [OrderIntent(**dict(row)) for row in rows]
+        result = [OrderIntent(**dict(row)) for row in rows]
+        return [item for item in result
+                if (cycle_id is None or item.cycle_id == cycle_id)
+                and (side is None or item.side == side)]
 
     def create_intent(self, state: State, decision: Decision, trade_date: date, market_state: str) -> bool:
         """Persist first. A uniqueness loss means the caller must not submit."""

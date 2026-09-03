@@ -57,6 +57,7 @@ class InfiniteConfig:
     capital_preservation_gap: int = 15
     rebound_cooldown: int = 3
     recovery_confirmation_days: int = 2
+    open_buy_ttl_sec: int = 1800
 
     @classmethod
     def from_env(cls) -> "InfiniteConfig":
@@ -94,6 +95,7 @@ class InfiniteConfig:
             capital_preservation_gap=_int(prefix + "CAPITAL_PRESERVATION_GAP", 15),
             rebound_cooldown=_int(prefix + "REBOUND_COOLDOWN", 3),
             recovery_confirmation_days=_int(prefix + "RECOVERY_CONFIRMATION_DAYS", 2),
+            open_buy_ttl_sec=_int(prefix + "OPEN_BUY_TTL_SEC", 1800),
         )
         config.validate()
         return config
@@ -109,3 +111,5 @@ class InfiniteConfig:
             raise ValueError("core plus reserve exceeds hard cap")
         if self.total_capital_usd > self.max_total_capital_usd:
             raise ValueError("total capital exceeds hard cap")
+        if self.open_buy_ttl_sec <= 0:
+            raise ValueError("open BUY TTL must be positive")
