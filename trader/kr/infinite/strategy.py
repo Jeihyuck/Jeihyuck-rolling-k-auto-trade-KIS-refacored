@@ -114,7 +114,11 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
             orderable = int(position.orderable_qty or 0)
             if orderable <= 0:
                 return Decision(Action.WAIT, "KR_INF_PROFIT_NO_ORDERABLE_QTY")
-            sell_qty = min(orderable, max(1, int(orderable * fraction)))
+            remaining_target = int(metadata.get("tp1_remaining_target_qty") or 0)
+            if next_stage.startswith("TP1") and remaining_target > 0:
+                sell_qty = min(orderable, remaining_target)
+            else:
+                sell_qty = min(orderable, max(1, int(orderable * fraction)))
             if next_stage == "TP2" or fraction >= 0.99:
                 sell_qty = orderable
             key = idempotency_key(state.cycle_id or "MISSING", trade_date, f"SELL_{next_stage}")

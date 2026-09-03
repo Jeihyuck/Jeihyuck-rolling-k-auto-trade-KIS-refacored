@@ -21,7 +21,9 @@ def rollover_partial_fill(state: InfiniteState, *, order_status: str, filled_qty
         return state
     if state.metadata.get("last_partial_rollover_order_key") == order_key:
         return state
-    seed = min(hard_cap, max(0.0, position.qty * position.average_price))
+    seed = max(0.0, position.qty * position.average_price)
+    if seed > hard_cap + 1e-6:
+        raise ValueError("TQQQ_INF_ROLLOVER_CAPITAL_EXCEEDED")
     remaining = max(0.0, hard_cap - seed)
     buy_round = int(state.metadata.get("buy_round") or 0) + 1
     stage = str(state.metadata.get("profit_stage") or "TP1_FILLED").upper()

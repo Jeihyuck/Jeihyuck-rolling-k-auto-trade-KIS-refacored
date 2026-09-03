@@ -1112,7 +1112,10 @@ def route_order(
             from datetime import datetime, timezone
             from trader.us.profit_capture import authoritative_broker_avg, as_decimal, calc_return_rate
             fresh_asof = (broker_pos.get("broker_avg_price_asof") or broker_pos.get("balance_asof")
-                          or datetime.now(timezone.utc).isoformat())
+                          or (datetime.now(timezone.utc).isoformat() if fetched_from_broker else None))
+            if not fresh_asof:
+                logger.warning("[US_PROFIT_CAPTURE][PRE_SUBMIT_GUARD] symbol=%s decision=BLOCK reason=BROKER_AVG_ASOF_UNKNOWN", symbol_upper)
+                return {"status": "BLOCKED", "reason": "broker_avg_asof_unknown", "broker_submit": False, "intent": intent}
             fresh = {**broker_pos, "symbol": symbol_upper, "qty": broker_holding_qty,
                      "orderable_qty": broker_orderable_qty,
                      "broker_avg_price": broker_pos.get("broker_avg_price") or broker_pos.get("average_price") or broker_pos.get("avg_price") or broker_pos.get("avg_price_usd") or broker_pos.get("pchs_avg_pric"),

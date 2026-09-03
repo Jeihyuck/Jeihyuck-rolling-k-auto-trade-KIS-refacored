@@ -286,3 +286,24 @@ def classify_close_action_from_plan(plan: Any) -> tuple[str, str]:
     if horizon == "CORE":
         return "CARRY", "CORE_CARRY"
     return "SKIP", f"UNHANDLED_OR_INVALID_PLAN:horizon={horizon or 'missing'} eod_action={eod or 'missing'} force_eod_close={int(force)}"
+
+
+def classify_close_action_from_position_contract(
+    position: Mapping[str, Any],
+) -> tuple[str, str, str]:
+    """Classify close behavior without inventing a missing historical plan."""
+    plan = position.get("entry_exit_plan_json")
+    if isinstance(plan, Mapping) and plan:
+        action, reason = classify_close_action_from_plan(plan)
+        return action, reason, "OK_FULL_PLAN"
+    if position.get("provenance_verified") and all(
+        position.get(key) is not None
+        for key in ("trade_horizon", "eod_action", "force_eod_close")
+    ):
+        action, reason = classify_close_action_from_plan({
+            "trade_horizon": position.get("trade_horizon"),
+            "eod_action": position.get("eod_action"),
+            "force_eod_close": position.get("force_eod_close"),
+        })
+        return action, reason, "RECOVERED_VERIFIED_CONTRACT"
+    return "SKIP", "POLICY_MISSING", "POLICY_MISSING"

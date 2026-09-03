@@ -21,16 +21,19 @@ def settle_partial_exit(state: State, intent: OrderIntent, order: BrokerOrderSta
     if status not in TERMINAL:
         return state
     pending = str(state.metadata.get("pending_profit_stage") or "").upper()
+    target = int(state.metadata.get("tp1_target_qty_at_first_decision") or intent.requested_qty)
     if not (order.filled_qty >= intent.requested_qty > 0):
         metadata = {**state.metadata, "pending_profit_stage": None, "partial_exit_pending": False,
                     "terminal_order_status": status}
-        if order.filled_qty > 0:
+        if order.filled_qty > 0 and state.metadata.get("tp1_last_accounted_terminal_order_key") != intent.idempotency_key:
             stage = pending.removesuffix("_SUBMITTED") or "TP1"
+            cumulative = int(state.metadata.get("tp1_cumulative_filled_qty") or 0) + order.filled_qty
             metadata.update(partial_profit_stage=f"{stage}_PARTIAL",
                             partial_profit_filled_qty=order.filled_qty,
-                            tp1_target_qty_at_first_decision=int(state.metadata.get("tp1_target_qty_at_first_decision") or intent.requested_qty),
-                            tp1_cumulative_filled_qty=int(state.metadata.get("tp1_cumulative_filled_qty") or 0) + order.filled_qty,
-                            tp1_remaining_target_qty=max(0, intent.requested_qty - order.filled_qty))
+                            tp1_target_qty_at_first_decision=target,
+                            tp1_cumulative_filled_qty=cumulative,
+                            tp1_remaining_target_qty=max(0, target - cumulative),
+                            tp1_last_accounted_terminal_order_key=intent.idempotency_key)
         return replace(state, status=Status.ACTIVE, metadata=metadata)
     # Rollover requires a fresh authoritative positive residual balance.
     if position.qty <= 0 or position.average_price <= 0:

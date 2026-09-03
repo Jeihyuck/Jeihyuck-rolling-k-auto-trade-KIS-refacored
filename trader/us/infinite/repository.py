@@ -233,6 +233,7 @@ class InfiniteRepository:
         last_price = None
         last_profit_stage = None
         last_profit_fill = None
+        profit_orders: dict[str, dict[str, Any]] = {}
         for row in rows:
             if self._belongs_to_cycle(row, state) and str(row.get("side") or "").upper() == "BUY":
                 meta = self._json_object(row.get("meta"))
@@ -245,16 +246,26 @@ class InfiniteRepository:
                          self._json_object(row.get("order_meta")))
                 stage = next((str(meta.get("desired_profit_stage") or meta.get("profit_stage") or "").upper()
                               for meta in metas if meta.get("desired_profit_stage") or meta.get("profit_stage")), "")
-                fully_filled = (str(row.get("order_status") or "").upper() == "FILLED"
-                                and int(row.get("qty_requested") or 0) > 0
-                                and int(row.get("order_qty_filled") or 0) >= int(row.get("qty_requested") or 0))
+                key = str(row.get("client_order_key") or "")
+                aggregate = profit_orders.setdefault(key, {"qty": 0, "notional": 0.0, "row": row})
+                qty = int(row.get("qty") or 0)
+                aggregate["qty"] += qty
+                aggregate["notional"] += qty * float(row.get("price_usd") or 0)
+                order_row = aggregate["row"]
+                requested_qty = int(order_row.get("qty_requested") or 0)
+                durable_filled = int(order_row.get("order_qty_filled") or 0)
+                actual_qty = int(aggregate["qty"])
+                fully_filled = (str(order_row.get("order_status") or "").upper() == "FILLED"
+                                and requested_qty > 0
+                                and actual_qty >= requested_qty
+                                and durable_filled >= requested_qty)
                 if stage and fully_filled:
                     last_profit_stage = stage.removesuffix("_SUBMITTED").removesuffix("_FILLED") + "_FILLED"
-                    last_profit_fill = {"order_key": row.get("client_order_key"),
-                                        "order_status": row.get("order_status"),
-                                        "requested_qty": int(row.get("qty_requested") or 0),
-                                        "filled_qty": int(row.get("order_qty_filled") or 0),
-                                        "filled_notional": int(row.get("order_qty_filled") or 0) * float(row.get("price_usd") or 0)}
+                    last_profit_fill = {"order_key": key,
+                                        "order_status": order_row.get("order_status"),
+                                        "requested_qty": requested_qty,
+                                        "filled_qty": actual_qty,
+                                        "filled_notional": aggregate["notional"]}
         return {"total_buy_notional": summary[0], "daily_buy_notional": summary[1],
                 "total_sell_notional": summary[2], "last_buy_date": summary[3],
                 "first_fill_price": summary[4], "last_buy_fill_price": last_price,

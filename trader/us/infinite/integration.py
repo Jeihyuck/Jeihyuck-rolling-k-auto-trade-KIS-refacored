@@ -91,6 +91,10 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
                               trading_date: date, cycle_id: str | None = None) -> InfiniteState:
     """Recover ownership/state from authoritative KIS balance facts only."""
     notional = broker.qty * broker.average_price
+    if notional > config.max_total_capital_usd + 1e-6:
+        hard_cap_exceeded = True
+    else:
+        hard_cap_exceeded = False
     return InfiniteState(
         symbol=config.symbol, cycle_id=cycle_id or str(uuid.uuid4()),
         cycle_start_date=trading_date, anchor_price=broker.average_price or None,
@@ -106,6 +110,11 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
             "buy_reference_source": "KIS_BROKER_AVG_FALLBACK",
             "broker_qty": broker.qty, "broker_orderable_qty": broker.orderable_qty,
             "broker_average_price": broker.average_price,
+            "broker_deployed_notional_usd": notional,
+            "hard_cap_exceeded": hard_cap_exceeded,
+            "hard_cap_exceeded_reason": (
+                "TQQQ_INF_BROKER_DEPLOYED_EXCEEDS_HARD_CAP" if hard_cap_exceeded else None
+            ),
         },
     )
 
@@ -113,7 +122,8 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
 def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overlay: dict,
                repository: InfiniteRepository | None = None,
                route: Callable[[dict], dict] | None = None,
-               cancel_open_buy: Callable[[dict], dict] | None = None) -> dict[str, Any]:
+               cancel_open_buy: Callable[[dict], dict] | None = None,
+               force_cancel_open_buys: bool = False) -> dict[str, Any]:
     """Exception-isolated boundary. OFF returns before any DB access."""
     config = InfiniteConfig.from_env()
     if not config.enabled:
@@ -170,7 +180,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                                    side="BUY")
                        if hasattr(repository, "load_open_orders") else [])
         for open_order in open_orders:
-            if not buy_ttl_expired(open_order, ttl_seconds=config.open_buy_ttl_sec):
+            if not force_cancel_open_buys and not buy_ttl_expired(open_order, ttl_seconds=config.open_buy_ttl_sec):
                 continue
             logger.warning("[TQQQ_INF][OPEN_BUY_TTL] client_order_key=%s trade_date=%s status=%s",
                            open_order.get("client_order_key"), open_order.get("trade_date"), open_order.get("status"))
@@ -213,11 +223,21 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 requested = int(profit_order.get("qty_requested") or 0)
                 filled = int(profit_order.get("qty_filled") or 0)
                 if status in {"CANCELLED", "REJECTED", "EXPIRED"} and filled < requested:
+                    if str(profit_order.get("client_order_key") or "") != str(
+                        state.metadata.get("pending_profit_order_key") or ""
+                    ):
+                        continue
                     pending = str(state.metadata.get("pending_profit_stage") or "TP1_SUBMITTED")
                     metadata = {**state.metadata, "pending_profit_stage": None, "partial_exit_pending": False}
-                    if filled > 0:
+                    if filled > 0 and state.metadata.get("profit_target_last_accounted_order_key") != profit_order.get("client_order_key"):
+                        target = int(state.metadata.get("profit_target_qty") or requested)
+                        cumulative = int(state.metadata.get("profit_target_cumulative_filled_qty") or 0) + filled
                         metadata.update(partial_profit_stage=f"{pending.removesuffix('_SUBMITTED')}_PARTIAL",
-                                        partial_profit_filled_qty=filled)
+                                        partial_profit_filled_qty=filled,
+                                        profit_target_qty=target,
+                                        profit_target_cumulative_filled_qty=cumulative,
+                                        profit_target_remaining_qty=max(0, target - cumulative),
+                                        profit_target_last_accounted_order_key=profit_order.get("client_order_key"))
                     state = replace(state, status=Status.ACTIVE, metadata=metadata)
             state = repository.reconcile_metadata(state, trading_date=trading_date, broker_qty=broker.qty,
                                                   broker_average_price=broker.average_price,
@@ -378,7 +398,7 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
         policy_action = ("REBOUND_PROBE" if decision.action == Action.BUY
                          and str(overlay.get("market_state")) == "DEFENSE_CRASH_REBOUND" else None)
         lifecycle_id = str((state.metadata or {}).get("position_lifecycle_id") or state.cycle_id)
-        avg_asof = str(raw.get("broker_avg_price_asof") or raw.get("balance_asof") or datetime.now(timezone.utc).isoformat()) if raw else ""
+        avg_asof = str(raw.get("broker_avg_price_asof") or raw.get("balance_asof") or "") if raw else ""
         sell_contract = {
             "broker_avg_price": broker.average_price,
             "broker_avg_price_source": str((raw or {}).get("broker_avg_price_source") or "kis_pchs_avg_pric"),
@@ -436,9 +456,15 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             desired = str(decision.metadata.get("desired_profit_stage") or profit_stage or "").upper()
             pending_stage = f"{desired}_SUBMITTED" if desired and not desired.endswith("_SUBMITTED") else desired
             next_status = Status.ACTIVE if is_partial_tp else Status.EXIT_PENDING
+            target_qty = int(state.metadata.get("profit_target_qty") or decision.qty) if is_partial_tp else 0
             state = replace(state, status=next_status,
                             metadata={**state.metadata, "pending_profit_stage": pending_stage,
-                                      "partial_exit_pending": is_partial_tp})
+                                  "pending_profit_order_key": client_order_key,
+                                  **({"profit_target_qty": target_qty,
+                                      "profit_target_cumulative_filled_qty": int(state.metadata.get("profit_target_cumulative_filled_qty") or 0),
+                                      "profit_target_remaining_qty": target_qty}
+                                     if is_partial_tp and not state.metadata.get("profit_target_qty") else {}),
+                                  "partial_exit_pending": is_partial_tp})
             repository.save_state(state)
         logger.info("[TQQQ_INF][ORDER_STATUS] side=%s requested_qty=%s status=%s cycle_id=%s",
                     decision.action.value, decision.qty, result.get("status", "UNKNOWN"), state.cycle_id)

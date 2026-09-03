@@ -2075,6 +2075,37 @@ def run_trade_tick(
                     now=now,
                 )
 
+            def _cancel_tqqq_open_buy(open_order: dict) -> dict:
+                order_no = str(open_order.get("order_no") or open_order.get("original_order_no") or "").strip()
+                requested = int(open_order.get("qty_requested") or open_order.get("qty") or 0)
+                filled = int(open_order.get("qty_filled") or 0)
+                remaining = max(0, requested - filled)
+                if not order_no:
+                    return {"status": "UNKNOWN", "reason": "TQQQ_CANCEL_ORIGINAL_ORDER_NO_MISSING"}
+                if routing_kis_client is None:
+                    return {"status": "UNKNOWN", "reason": "routing_kis_client_unavailable"}
+                try:
+                    result = routing_kis_client.cancel_us_order(
+                        symbol=str(open_order.get("symbol") or _infinite_config.symbol),
+                        exchange=str(open_order.get("exchange") or "NASDAQ"),
+                        original_order_no=order_no,
+                        remaining_qty=remaining,
+                    )
+                    if str(result.get("status") or "").upper() == "ACK":
+                        trade_day = str(open_order.get("trade_date") or trade_date)
+                        rows = routing_kis_client.get_us_today_orders(trade_date=trade_day)
+                        for row in rows:
+                            row_no = str(row.get("order_no") or row.get("odno") or row.get("ODNO") or "")
+                            if row_no == order_no:
+                                status = str(row.get("status") or row.get("order_status") or "").upper()
+                                if status in {"CANCELLED", "FILLED", "REJECTED", "EXPIRED"}:
+                                    return {"status": status, "order_no": order_no}
+                        return {"status": "UNKNOWN", "order_no": order_no}
+                    return result
+                except Exception as exc:
+                    logger.warning("[TQQQ_INF][CANCEL_REQUEST_FAILED] order_no=%s error=%s", order_no, exc)
+                    return {"status": "UNKNOWN", "order_no": order_no, "error": str(exc)}
+
             try:
                 _tqqq_price, _quote_source, _quote_stale = _get_tqqq_tick_quote(provider)
             except Exception as _quote_exc:
@@ -2095,6 +2126,8 @@ def run_trade_tick(
             infinite_result = run_sleeve(
                 positions=current_positions, price=_tqqq_price, trading_date=now.date(),
                 overlay=_infinite_overlay, route=_route_infinite,
+                cancel_open_buy=_cancel_tqqq_open_buy,
+                force_cancel_open_buys=str(session).lower() == "close",
             )
         except Exception as _infinite_exc:
             # Defensive second boundary: sleeve failures never stop legacy US.

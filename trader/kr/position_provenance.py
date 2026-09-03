@@ -113,9 +113,10 @@ def audit_position(position: Mapping[str, Any], fills: Iterable[Mapping[str, Any
     opened_date = str(opened)[:10]
     updates = {key: meta.get(key) for key in (
         "entry_reason", "entry_style_selected", "entry_style", "entry_thesis", "trade_horizon",
-        "exit_policy_family", "entry_exit_plan", "initial_stop", "stop_price_at_entry", "pivot_price_at_entry")
+        "exit_policy_family", "eod_action", "force_eod_close", "entry_exit_plan",
+        "initial_stop", "stop_price_at_entry", "pivot_price_at_entry")
         if meta.get(key) is not None}
-    for key in ("entry_thesis", "trade_horizon", "exit_policy_family"):
+    for key in ("entry_thesis", "trade_horizon", "exit_policy_family", "eod_action", "force_eod_close"):
         updates.setdefault(key, plan_dict.get(key))
     updates.update(opened_at=opened, entry_ts=opened, opened_trade_date=opened_date,
                    provenance_verified=True)

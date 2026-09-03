@@ -144,7 +144,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                 orderable = int(position.orderable_qty or 0)
                 if orderable <= 0:
                     return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
-                sell_qty = min(orderable, max(1, int(orderable * fraction)))
+                remaining_target = int(state_metadata.get("profit_target_remaining_qty") or 0)
+                sell_qty = (min(orderable, remaining_target) if remaining_target > 0
+                            else min(orderable, max(1, int(orderable * fraction))))
                 if fraction >= 0.99:
                     sell_qty = orderable
                 key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
@@ -172,7 +174,9 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
                 orderable = int(position.orderable_qty or 0)
                 if orderable <= 0:
                     return Decision(Action.BLOCK, "tqqq_no_orderable_qty")
-                sell_qty = min(orderable, max(1, int(orderable * fraction)))
+                remaining_target = int(state_metadata.get("profit_target_remaining_qty") or 0)
+                sell_qty = (min(orderable, remaining_target) if remaining_target > 0
+                            else min(orderable, max(1, int(orderable * fraction))))
                 if fraction >= 0.99:
                     sell_qty = orderable
                 key = f"TQQQ_INF:{state.cycle_id or 'MISSING'}:{trading_date.isoformat()}:SELL_{next_stage}"
@@ -201,6 +205,8 @@ def evaluate(*, config: InfiniteConfig, state: InfiniteState | None, position: P
             return Decision(Action.BLOCK, "tqqq_effective_regime_entry_block")
     if position.qty > 0 and not config.allow_sell:
         return Decision(Action.BLOCK, "sell_permission_disabled")
+    if position.qty > 0 and bool(state_metadata.get("hard_cap_exceeded")):
+        return Decision(Action.BLOCK, "TQQQ_INF_BROKER_DEPLOYED_EXCEEDS_HARD_CAP")
     if not config.allow_buy:
         return Decision(Action.BLOCK, "buy_permission_paused")
     if state.last_buy_date == trading_date or daily_filled_buy_notional >= config.max_daily_buy_usd - 1e-6:
