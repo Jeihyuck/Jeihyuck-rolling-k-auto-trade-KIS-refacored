@@ -2180,6 +2180,7 @@ def run_trade_tick(
                 "opening_buy_start_et": opening_buy_start_et,
                 "entry_can_proceed": bool(entry_can_proceed),
                 "exit_can_proceed": bool(exit_can_proceed),
+                "broker_position_authoritative": bool(authoritative_recon),
                 "now_et": now.isoformat(),
             }
             infinite_result = run_sleeve(

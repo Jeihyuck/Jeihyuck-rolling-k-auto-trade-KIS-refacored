@@ -256,7 +256,8 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                                                   rebound_cooldown=config.rebound_cooldown)
             stats = repository.cycle_fill_stats(state, trading_date) if hasattr(repository, "cycle_fill_stats") else {}
             partial_fill = stats.get("last_profit_fill") or {}
-            if partial_fill and broker.qty > 0:
+            broker_position_authoritative = bool(overlay.get("broker_position_authoritative"))
+            if partial_fill and broker.qty > 0 and broker_position_authoritative:
                 state = rollover_partial_fill(
                     state, order_status=str(partial_fill.get("order_status") or ""),
                     filled_qty=int(partial_fill.get("filled_qty") or 0),
@@ -265,6 +266,17 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                     position=broker, trading_date=trading_date,
                     order_key=str(partial_fill.get("order_key") or ""),
                     hard_cap=config.max_total_capital_usd,
+                    core_cap=config.core_capital_usd,
+                    broker_position_authoritative=True,
+                )
+            elif partial_fill and broker.qty > 0:
+                state = replace(
+                    state,
+                    metadata={
+                        **state.metadata,
+                        "partial_rollover_pending": True,
+                        "partial_rollover_wait_reason": "authoritative_residual_required",
+                    },
                 )
             if state.metadata.get("last_buy_fill_price"):
                 state = replace(state, metadata={**state.metadata, "recovery_accounting_uncertain": False})

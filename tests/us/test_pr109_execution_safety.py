@@ -76,6 +76,7 @@ def test_overcap_partial_rollover_preserves_sell_lane():
         state, order_status="FILLED", filled_qty=10, requested_qty=10,
         filled_notional=1000, position=PositionSnapshot(qty=10, average_price=1080, price=1200),
         trading_date=date(2026, 9, 3), order_key="sell-1", hard_cap=10000,
+        broker_position_authoritative=True,
     )
     assert result.metadata["rollover_seed_capital_usd"] == 10800
     assert result.metadata["hard_cap_exceeded"] is True
@@ -88,6 +89,54 @@ def test_overcap_partial_rollover_preserves_sell_lane():
         pending_buy=False, pending_sell=False, entry_allowed=True,
     )
     assert decision.action.value == "SELL"
+
+
+def test_non_authoritative_residual_does_not_rollover():
+    state = InfiniteState(cycle_id="cycle", status=Status.ACTIVE,
+                          metadata={"buy_round": 2})
+    result = rollover_partial_fill(
+        state, order_status="FILLED", filled_qty=10, requested_qty=10,
+        filled_notional=1000, position=PositionSnapshot(qty=20, average_price=100, price=120),
+        trading_date=date(2026, 9, 3), order_key="stale", hard_cap=10000,
+    )
+    assert result == state
+
+
+def test_authoritative_terminal_fill_rollover_is_idempotent():
+    state = InfiniteState(cycle_id="cycle", status=Status.ACTIVE)
+    kwargs = dict(
+        order_status="FILLED", filled_qty=10, requested_qty=10,
+        filled_notional=1000, position=PositionSnapshot(qty=10, average_price=80, price=100),
+        trading_date=date(2026, 9, 3), order_key="once", broker_position_authoritative=True,
+    )
+    first = rollover_partial_fill(state, **kwargs)
+    second = rollover_partial_fill(first, **kwargs)
+    assert first == second
+    assert first.metadata["rollover_seed_capital_usd"] == 800
+
+
+def test_rollover_uses_configured_core_cap():
+    result = rollover_partial_fill(
+        InfiniteState(cycle_id="cycle", status=Status.ACTIVE),
+        order_status="FILLED", filled_qty=10, requested_qty=10,
+        filled_notional=1000, position=PositionSnapshot(qty=10, average_price=900, price=1000),
+        trading_date=date(2026, 9, 3), order_key="core-cap", hard_cap=10000, core_cap=8000,
+        broker_position_authoritative=True,
+    )
+    assert result.core_filled_notional == 8000
+    assert result.reserve_filled_notional == 1000
+
+
+def test_rollover_below_configured_core_has_no_reserve():
+    result = rollover_partial_fill(
+        InfiniteState(cycle_id="cycle", status=Status.ACTIVE),
+        order_status="FILLED", filled_qty=10, requested_qty=10,
+        filled_notional=1000, position=PositionSnapshot(qty=10, average_price=600, price=1000),
+        trading_date=date(2026, 9, 3), order_key="core-cap-low", hard_cap=10000, core_cap=8000,
+        broker_position_authoritative=True,
+    )
+    assert result.core_filled_notional == 6000
+    assert result.reserve_filled_notional == 0
 
 
 def test_overcap_state_blocks_buy_after_sell_evaluation():
@@ -118,6 +167,7 @@ def test_below_cap_rollover_clears_overcap_flag():
         state, order_status="FILLED", filled_qty=10, requested_qty=10,
         filled_notional=1000, position=PositionSnapshot(qty=10, average_price=950, price=1000),
         trading_date=date(2026, 9, 3), order_key="sell-2", hard_cap=10000,
+        broker_position_authoritative=True,
     )
     assert result.metadata["rollover_seed_capital_usd"] == 9500
     assert result.metadata["hard_cap_exceeded"] is False

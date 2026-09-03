@@ -13,11 +13,13 @@ TERMINAL = frozenset({"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "STALE_RECON
 def rollover_partial_fill(state: InfiniteState, *, order_status: str, filled_qty: int,
                           requested_qty: int, filled_notional: float,
                           position: PositionSnapshot, trading_date: date,
-                          order_key: str, hard_cap: float = 10_000.0) -> InfiniteState:
+                          order_key: str, hard_cap: float = 10_000.0,
+                          core_cap: float = 7_500.0,
+                          broker_position_authoritative: bool = False) -> InfiniteState:
     """Idempotently reset the buy round, never the macro position cycle."""
     if str(order_status).upper() not in TERMINAL or filled_qty < requested_qty or requested_qty <= 0:
         return state
-    if position.qty <= 0 or position.average_price <= 0:
+    if not broker_position_authoritative or position.qty <= 0 or position.average_price <= 0:
         return state
     if state.metadata.get("last_partial_rollover_order_key") == order_key:
         return state
@@ -45,8 +47,8 @@ def rollover_partial_fill(state: InfiniteState, *, order_status: str, filled_qty
                 "last_partial_rollover_filled_qty": filled_qty,
                 "last_partial_rollover_notional": filled_notional}
     return replace(state, status=Status.ACTIVE,
-                   core_filled_notional=min(seed, hard_cap * .75),
-                   reserve_filled_notional=max(0.0, seed - hard_cap * .75), metadata=metadata)
+                   core_filled_notional=min(seed, core_cap),
+                   reserve_filled_notional=max(0.0, seed - core_cap), metadata=metadata)
 
 
 def buy_ttl_expired(order: Mapping[str, Any], *, ttl_seconds: int, now: datetime | None = None) -> bool:
