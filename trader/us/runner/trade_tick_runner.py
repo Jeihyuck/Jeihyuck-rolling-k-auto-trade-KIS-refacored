@@ -2094,25 +2094,35 @@ def run_trade_tick(
                     if str(result.get("status") or "").upper() == "ACK":
                         trade_day = str(open_order.get("trade_date") or trade_date)
                         rows = routing_kis_client.get_us_today_orders(trade_date=trade_day)
-                        for row in rows:
-                            row_no = str(row.get("order_no") or row.get("odno") or row.get("ODNO") or "")
-                            if row_no == order_no:
-                                status = str(row.get("status") or row.get("order_status") or "").upper()
+                        from trader.us.data_provider import normalize_us_order_status_row
+                        from trader.us.utils.order_no import normalize_us_order_no
+                        target_symbol = str(open_order.get("symbol") or _infinite_config.symbol).upper()
+                        target_side = str(open_order.get("side") or "BUY").upper()
+                        target_order_no = normalize_us_order_no(order_no)
+                        for raw_row in rows:
+                            row = normalize_us_order_status_row(raw_row)
+                            if (
+                                row.get("normalization_result") == "normalized"
+                                and row.get("canonical_order_no") == target_order_no
+                                and row.get("symbol") == target_symbol
+                                and row.get("side") == target_side
+                            ):
+                                status = str(row.get("status") or "").upper()
                                 if status in {"CANCELLED", "FILLED", "REJECTED", "EXPIRED"}:
                                     from trader.us.db.repos import apply_broker_order_observation
                                     apply_broker_order_observation(
                                         trade_date=trade_day,
                                         client_order_key=str(open_order.get("client_order_key") or ""),
-                                        raw_order_no=order_no,
-                                        canonical_order_no=order_no,
-                                        symbol=str(open_order.get("symbol") or _infinite_config.symbol),
-                                        side=str(open_order.get("side") or "BUY"),
+                                        raw_order_no=str(row.get("raw_order_no") or order_no),
+                                        canonical_order_no=str(row.get("canonical_order_no") or target_order_no),
+                                        symbol=target_symbol,
+                                        side=target_side,
                                         requested_qty=requested,
-                                        filled_qty=int(row.get("qty_filled") or row.get("filled_qty") or filled),
-                                        remaining_qty=max(0, requested - int(row.get("qty_filled") or row.get("filled_qty") or filled)),
+                                        filled_qty=int(row.get("filled_qty") or filled),
+                                        remaining_qty=int(row.get("remaining_qty") or max(0, requested - filled)),
                                         broker_status=status,
                                         evidence_type="tqqq_cancel_terminal_inquiry",
-                                        raw_row=row,
+                                        raw_row=raw_row,
                                     )
                                     return {"status": status, "order_no": order_no}
                         return {"status": "UNKNOWN", "order_no": order_no}
