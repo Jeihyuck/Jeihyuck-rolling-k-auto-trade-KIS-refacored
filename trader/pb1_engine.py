@@ -21,6 +21,7 @@ from sqlalchemy import inspect
 from trader.account_state import get_account_key
 from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
+from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
                                     BalanceFreshness, balance_freshness_for_source,
@@ -12717,134 +12718,31 @@ class PB1Engine:
                 logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
 
-        exit_eval_payload["submit_attempted"] = 1
-        emit_event(
-            as_of=self._today,
-            event="ORDER_SUBMIT",
-            side="SELL",
+        return submit_exit_sell_order(
+            engine=self,
+            exit_eval_payload=exit_eval_payload,
+            exit_eval=exit_eval,
             code=code,
-            qty=orderable_qty,
-            price=float(mark),
-            order_type="MARKET",
-            client_order_key=client_key,
-        )
-        resp = None
-        kis_odno = None
-        requested_qty = int(orderable_qty or 0)
-        try:
-            resp = self.kis.sell_stock_market(code, requested_qty)
-            kis_odno = (resp.get("output") or {}).get("ODNO") if isinstance(resp, dict) else None
-        except Exception:
-            logger.exception("[PB1][EXIT][FAIL] code=%s", display_code)
-        execution_meta = (resp.get("_order_execution") if isinstance(resp, dict) and isinstance(resp.get("_order_execution"), dict) else {})
-        submitted_qty = int(execution_meta.get("submitted_qty") or requested_qty)
-        self.orders_repo.mark_submitted(
-            self.env,
-            client_key,
-            kis_odno,
-            resp if isinstance(resp, dict) else {"resp": resp},
-            submitted_qty=submitted_qty,
-        )
-        ok = bool(resp and isinstance(resp, dict) and resp.get("rt_cd") == "0")
-        rt_cd = resp.get("rt_cd") if isinstance(resp, dict) else None
-        msg_cd = resp.get("msg_cd") if isinstance(resp, dict) else None
-        msg1 = resp.get("msg1") if isinstance(resp, dict) else None
-        emit_event(
-            as_of=self._today,
-            event="ORDER_RESULT",
-            side="SELL",
-            code=code,
-            ok=ok,
-            rt_cd=rt_cd,
-            msg_cd=msg_cd,
-            msg1=msg1,
-            kis_odno=kis_odno,
-        )
-        logger.info(
-            "[PB1][ORDER][RESULT] side=SELL code=%s name=%s ok=%s reason=%s rt_cd=%s msg_cd=%s msg1=%s",
-            code,
-            stock_name,
-            int(ok),
-            self._format_order_result_reason(resp if isinstance(resp, dict) else None),
-            rt_cd,
-            msg_cd,
-            msg1,
-        )
-        exit_eval_payload["order_result"] = self._format_order_result_reason(resp if isinstance(resp, dict) else None)
-        logger.info(
-            "[TRADE][ORDER][SELL] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
-            code,
-            stock_name,
-            kis_odno or order_id,
-            submitted_qty,
-            float(mark or 0.0),
-            "ACCEPTED" if ok else "REJECTED",
-        )
-        if ok:
-            exit_eval_payload["submitted"] = 1
-            self.session_exit_submitted_codes.add(display_code)
-            self._register_session_sell_accepted(
-                code=code,
-                qty=submitted_qty,
-                price=float(mark or 0.0),
-                order_id=str(kis_odno or order_id or ""),
-            )
-            logger.info("[SELL_SESSION_BLOCK][DURABLE_REGISTER] code=%s cycle=%s order_id=%s session=%s",
-                        code, _cycle_id or "", kis_odno or order_id,
-                        str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower())
-            if hasattr(self.kis, "invalidate_balance_cache"):
-                self.kis.invalidate_balance_cache(reason=f"sell_ack:{code}", codes=[display_code])
-            # The snapshot is immutable for the lifetime of this engine/tick.
-            # The next engine obtains a fresh snapshot and reconciles the ACK.
-            try:
-                self.orders_repo.mark_acked(self.env, kis_odno, resp)
-                logger.info("[ORDER][DB_ACK][OK][SELL] code=%s kis_odno=%s", code, kis_odno)
-            except Exception as _sell_ack_exc:
-                _soft_ack = os.getenv("PB1_ORDER_DB_ACK_FAIL_SOFT", "1") == "1"
-                logger.warning(
-                    "[ORDER][DB_ACK][TIMEOUT][SELL] code=%s kis_odno=%s err=%s",
-                    code, kis_odno, _sell_ack_exc,
-                )
-                if not _soft_ack:
-                    raise
-            logger.info(
-                "[ORDER][ACCEPTED] side=SELL code=%s name=%s odno=%s fill_status=pending submitted_qty=%s requested_qty=%s",
-                code,
-                stock_name,
-                kis_odno or order_id,
-                submitted_qty,
-                requested_qty,
-            )
-            if cooldown_until:
-                self.positions_repo.update_position_fields(
-                    env=self.env,
-                    strategy=self.STRATEGY_NAME,
-                    sid=sid,
-                    mode=mode,
-                    code=code,
-                    fields={"cooldown_until": cooldown_until},
-                )
-        else:
-            reject_reason = str(self._format_order_result_reason(resp if isinstance(resp, dict) else None) or "")
-            msg_cd_norm = str(msg_cd or "").upper()
-            msg1_norm = str(msg1 or "").lower()
-            if (
-                msg_cd_norm == "NO_SELLABLE_QTY"
-                or "ORDER_SKIP_NO_SELLABLE_QTY" in reject_reason
-                or "sellable quantity is zero" in msg1_norm
-            ):
-                self._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
-                self.no_sellable_qty_terminal_codes.add(display_code)
-            self.orders_repo.mark_error(self.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
-        self.positions_repo.update_position_fields(
-            env=self.env,
-            strategy=self.STRATEGY_NAME,
-            sid=sid,
+            display_code=display_code,
+            stock_name=stock_name,
+            market=market,
             mode=mode,
-            code=code,
-            fields={"last_exit_eval_json": exit_eval_payload, "last_exit_plan_eval_json": exit_meta if 'exit_meta' in locals() else exit_eval_payload},
+            orderable_qty=orderable_qty,
+            mark=mark,
+            stage=stage,
+            client_key=client_key,
+            exit_policy_family=exit_policy_family,
+            reason_family=reason_family,
+            lifecycle_id=lifecycle_id,
+            ret_pct=ret_pct,
+            avg=avg,
+            kis_qty=kis_qty,
+            kis_sellable_qty=kis_sellable_qty,
+            position_meta=position_meta,
+            cycle_id=_cycle_id,
+            sell_baseline=sell_baseline,
+            days_held=days_held,
         )
-        return exit_eval_payload
 
     def _positions_with_meta(self, positions: Iterable[Dict]) -> List[Dict]:
         enriched: List[Dict] = []
