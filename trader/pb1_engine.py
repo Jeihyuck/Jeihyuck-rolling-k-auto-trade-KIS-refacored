@@ -23,6 +23,7 @@ from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
 from trader.kr.pb1.exit_family import resolve_exit_family
 from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
+from trader.kr.pb1.exit_policy import resolve_exit_policy
 from trader.kr.pb1.exit_updates import build_exit_position_update_fields
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
@@ -1930,53 +1931,17 @@ def _resolve_exit_policy(
     time_stop_hit: bool,
     risk_off_signal: bool,
 ) -> dict[str, Any]:
-    same_day_entry = int(days_held or 0) == 0
-    trail_eligible = int(days_held or 0) >= 1 and int(holding_bars or 0) >= int(MIN_TRAIL_BARS)
-    soft_exit_eligible = int(days_held or 0) >= 1 and int(holding_bars or 0) >= int(MIN_EXIT_BARS)
-    trail_hit = bool(trail_eligible and trail_stop_price is not None and mark <= float(trail_stop_price))
-    ma20_break = bool(soft_exit_eligible and ma20 is not None and mark < ma20)
-    ma50_break = bool(soft_exit_eligible and ma50 is not None and mark < ma50)
-    soft_exit_hit = bool(soft_exit_eligible and (risk_off_signal or ma50_break or ma20_break))
-
-    triggered: list[str] = []
-    final_reason = "NO_EXIT_SIGNAL"
-    family = "SKIP"
-    exit_ok = False
-    if stop_hit:
-        triggered.append("EXIT_HARD_STOP")
-        final_reason = "EXIT_HARD_STOP"
-        family = "EXIT_STOP"
-        exit_ok = True
-    elif trail_hit:
-        triggered.append("EXIT_TRAIL")
-        final_reason = "EXIT_TRAIL"
-        family = "EXIT_TRAIL"
-        exit_ok = True
-    elif soft_exit_hit:
-        triggered.append("EXIT_SOFT_RISK_OFF")
-        final_reason = "EXIT_SOFT_RISK_OFF"
-        family = "EXIT_RISK_OFF"
-        exit_ok = True
-    elif time_stop_hit:
-        triggered.append("EXIT_TIME_BASED")
-        final_reason = "EXIT_TIME_BASED"
-        family = "EXIT_TIME"
-        exit_ok = True
-
-    return {
-        "same_day_entry": same_day_entry,
-        "trail_eligible": trail_eligible,
-        "soft_exit_eligible": soft_exit_eligible,
-        "trail_hit": trail_hit,
-        "ma20_break": ma20_break,
-        "ma50_break": ma50_break,
-        "risk_off_hit": bool(soft_exit_eligible and risk_off_signal),
-        "soft_exit_hit": soft_exit_hit,
-        "triggered": triggered,
-        "final_reason": final_reason,
-        "family": family,
-        "exit_ok": exit_ok,
-    }
+    return resolve_exit_policy(
+        days_held=days_held,
+        holding_bars=holding_bars,
+        stop_hit=stop_hit,
+        trail_stop_price=trail_stop_price,
+        mark=mark,
+        ma20=ma20,
+        ma50=ma50,
+        time_stop_hit=time_stop_hit,
+        risk_off_signal=risk_off_signal,
+    )
 
 
 def _compute_affordable_buy_qty(
