@@ -451,7 +451,13 @@ class KisUSClient:
 
         configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
         tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
-        reserve = max(0.05, float(os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1")))
+        # Balance is a pre-routing stage.  Preserve a dedicated portion of the
+        # shared tick deadline for exit routing instead of allowing the three
+        # exchange sweep to consume it all.
+        reserve = max(0.05, float(os.getenv(
+            "US_SELL_ROUTING_RESERVE_SEC",
+            os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1"),
+        )))
         balance_budget = min(configured_budget, max(0.0, tick_remaining - reserve))
         if balance_budget <= 0:
             raise KisUSTemporaryError("balance stage budget exhausted before fetch")

@@ -138,6 +138,33 @@ def test_three_exchange_balance_timeouts_share_one_stage_budget(monkeypatch):
     assert set(result["failed_exchanges"]) == {"NASD", "NYSE", "AMEX"}
 
 
+def test_us_three_exchange_balance_respects_shared_stage_budget(monkeypatch):
+    """The three-exchange sweep must leave the dedicated exit-routing reserve."""
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "10")
+    monkeypatch.setenv("US_SELL_ROUTING_RESERVE_SEC", "3")
+    client._tick_context = type("Tick", (), {"remaining_sec": lambda self: 4})()
+    observed = []
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", lambda exchange: (
+        observed.append(client._stage_deadline - time.monotonic()) or {"output1": [], "output2": {}}
+    ))
+
+    result = client.get_us_balance(force_refresh=True)
+
+    assert result["balance_complete"] is True
+    assert observed and 0.8 <= observed[0] <= 1.1
+
+
+def test_us_sell_routing_has_reserved_deadline_budget(monkeypatch):
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "30")
+    monkeypatch.setenv("US_SELL_ROUTING_RESERVE_SEC", "2")
+    client._tick_context = type("Tick", (), {"remaining_sec": lambda self: 2})()
+
+    with pytest.raises(KisUSTemporaryError, match="budget exhausted"):
+        client.get_us_balance(force_refresh=True)
+
+
 def test_partial_exchange_balance_is_not_cached_or_authoritative(monkeypatch):
     from trader.us.execution.reconcile import reconcile_positions
     client = KisUSClient(offline=False)
