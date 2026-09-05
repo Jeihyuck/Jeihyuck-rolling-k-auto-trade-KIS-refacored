@@ -1366,8 +1366,10 @@ def run_trade_tick(
     finally:
         tick_context.metrics["position_reconcile_ms"] = (time.monotonic() - _position_reconcile_started) * 1000.0
     
-    # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
-    if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
+    # A malformed reconcile result cannot safely identify holdings.  A normal
+    # balance degradation, however, only fences entries: persisted holdings
+    # must remain eligible for exit monitoring.
+    if recon.get("status") == "CONTRACT_ERROR":
         last_stage = "reconcile"
         reconcile_reason = recon.get("reason", "balance_position_parse_error")
         logger.error(
@@ -1406,6 +1408,13 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
+    if recon.get("block_new_entry", False):
+        entry_can_proceed = False
+        logger.warning(
+            "[US_RECONCILE][BLOCK_NEW_ENTRY] reason=%s status=%s action=entry_block_exit_allowed",
+            recon.get("reason", "balance_position_parse_error"),
+            recon.get("status", "UNKNOWN"),
+        )
     
     # Extract position_symbols from reconcile result
     current_position_symbols: set[str] = set(recon.get("position_symbols", []))

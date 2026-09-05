@@ -320,6 +320,7 @@ def test_no_sellable_qty_blocks_session_and_skips_sell_api() -> None:
     assert payload is not None
     assert payload["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
     assert "KIS_NO_SELLABLE_QTY" in payload.get("order_skip_reasons", [])
+    assert payload["terminal_event"] == "FINAL_SKIP"
     assert kis.sell_calls == 0
     assert code in engine._session_sell_blocked_codes
 
@@ -339,6 +340,7 @@ def test_sell_accepted_in_session_prevents_resubmit() -> None:
     assert payload is not None
     assert payload["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
     assert "SELL_ACCEPTED" in payload.get("order_skip_reasons", [])
+    assert payload["terminal_event"] == "FINAL_SKIP"
     assert kis.sell_calls == 0
 
 

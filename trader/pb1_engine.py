@@ -11768,6 +11768,7 @@ class PB1Engine:
                 "exit_ok": False,
                 "submitted": 0,
                 "submit_attempted": 0,
+                "terminal_event": "FINAL_SKIP",
                 "order_result": "ORDER_SKIPPED_SESSION_BLOCKED",
                 "order_skip_reasons": [session_block_reason or "SESSION_SELL_BLOCKED"],
             }
@@ -12416,6 +12417,7 @@ class PB1Engine:
         )
         exit_eval_payload.update(
             {
+                "terminal_event": "FINAL_SKIP",
                 "signal_hit": signal_hit,
                 "eval_reason": eval_reason,
                 "router_reason": _router_reason,
