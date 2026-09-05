@@ -21,6 +21,7 @@ from sqlalchemy import inspect
 from trader.account_state import get_account_key
 from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
+from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
@@ -12605,12 +12606,11 @@ class PB1Engine:
             logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, submit_block_reasons)
             return exit_eval_payload
 
-        cooldown_until: str | None = None
-        if exit_eval.primary_reason in {"EXIT_HARD_STOP", "EXIT_SOFT_RISK_OFF"}:
-            if REENTRY_COOLDOWN_DAYS <= 0:
-                cooldown_until = self._now_kst.date().isoformat()
-            else:
-                cooldown_until = (self._now_kst + pd.Timedelta(days=REENTRY_COOLDOWN_DAYS)).date().isoformat()
+        cooldown_until = resolve_exit_cooldown_until(
+            now_kst=self._now_kst,
+            exit_primary_reason=exit_eval.primary_reason,
+            reentry_cooldown_days=REENTRY_COOLDOWN_DAYS,
+        )
 
         if self._should_block_order(client_key, code=code, side="SELL", stage="PB1-EXIT")[0]:
             exit_eval_payload["submit_attempted"] = 1
