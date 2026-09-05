@@ -19,7 +19,7 @@ from trader.us.rotation import (
     classify_rotation_regime, cluster_caps_for_regime, compute_cluster_exposure,
     period_return, select_bucket_champions, theme_cluster_for,
 )
-from trader.us.symbols import resolve_exchange
+from trader.us.symbols import resolve_quote_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -574,7 +574,7 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     missing_symbols: list[str] = []
     symbol_quality: dict[str, str] = {}
     for sym in symbols:
-        exchange = resolve_exchange(sym)
+        exchange = resolve_quote_exchange(sym)
         closes: list[float] = []
         try:
             if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
@@ -624,7 +624,7 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     elif rotation_context_suspect and policy == "conservative":
         ctx["rotation_regime"] = "CONSERVATIVE_ROTATION"
     ctx["benchmark_returns"] = returns
-    ctx["benchmark_exchange_map"] = {sym: resolve_exchange(sym) for sym in symbols}
+    ctx["benchmark_exchange_map"] = {sym: resolve_quote_exchange(sym) for sym in symbols}
     ctx["benchmark_data_quality"] = "ok" if not missing_symbols else "degraded"
     ctx["benchmark_symbol_quality"] = symbol_quality
     ctx["missing_symbols"] = missing_symbols
