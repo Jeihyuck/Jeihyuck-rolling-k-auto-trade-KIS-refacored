@@ -149,6 +149,40 @@ def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
     assert done.state.status == Status.COMPLETE and done.state.last_exit_date == DAY
 
 
+def test_kr_infinite_invalid_price_blocks_without_exception(armed_practice_env):
+    kis, repo = FakeKIS(qty=100, average=100, price=0), FakeRepository(active())
+
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice")
+
+    assert (result.decision.action, result.decision.reason) == (Action.BLOCK, "KR_INF_QUOTE_INVALID")
+    assert not kis.orders
+
+
+def test_kr_infinite_invalid_price_preserves_cycle_state(armed_practice_env):
+    state = active()
+    kis, repo = FakeKIS(qty=100, average=100, price=0), FakeRepository(state)
+
+    run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+             trade_date=DAY, kis_env="practice")
+
+    assert repo.state == state
+
+
+def test_kr_infinite_recovers_on_next_valid_quote(armed_practice_env):
+    state = active()
+    kis, repo = FakeKIS(qty=100, average=100, price=0), FakeRepository(state)
+
+    run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+             trade_date=DAY, kis_env="practice")
+    kis.price = 110
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice")
+
+    assert result.decision.action == Action.SELL_PARTIAL
+    assert kis.orders == [("SELL", 50)]
+
+
 def test_unowned_existing_position_freezes_without_order():
     kis, repo = FakeKIS(qty=10, average=100), FakeRepository()
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
