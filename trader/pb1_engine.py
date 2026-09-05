@@ -20,10 +20,11 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 from trader.account_state import get_account_key
 from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
+from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
 from trader.position_lifecycle import lifecycle_is_authoritative
-from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES,
-                                    PENDING_SELL_STATES, BalanceFreshness, balance_freshness_for_source,
-                                    exit_stage_for_reason, legal_next_exit_stage)
+from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
+                                    BalanceFreshness, balance_freshness_for_source,
+                                    exit_stage_for_reason)
 
 from trader.runtime_paths import close_entry_orders_path, runtime_path
 from trader.path_contract import resolve_repo_root
@@ -7239,56 +7240,17 @@ class PB1Engine:
     def _durable_sell_block(self, *, code: str, position_cycle_id: str | None = None,
                             exit_stage: str | None = None) -> tuple[bool, dict[str, Any] | None]:
         """Read the order ledger; instance dictionaries are only a fast cache."""
-        try:
-            rows = self.orders_repo.list_today_orders(self.env, side="SELL", code=str(code).zfill(6), status_exclude=())
-        except Exception:
-            logger.exception("[SELL_SESSION_BLOCK][DURABLE_LOOKUP_FAIL] code=%s action=fail_closed", code)
-            return True, {"status": "LOOKUP_FAILED"}
-        session = str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower()
-        for row in rows or []:
-            if str(row.get("strategy") or "") != self.STRATEGY_NAME:
-                continue
-            row_cycle = str(row.get("position_cycle_id") or "")
-            if position_cycle_id and row_cycle and row_cycle != str(position_cycle_id):
-                continue
-            request = row.get("request_json") if isinstance(row.get("request_json"), dict) else {}
-            row_session = str(request.get("trade_session") or "").lower()
-            if row_session and row_session != session:
-                continue
-            prior_stage = str(row.get("stage") or request.get("exit_stage") or "")
-            prior_status = str(row.get("status") or "").upper()
-            if (prior_stage == "TP1" and str(exit_stage or "").upper() == "TP2"
-                    and prior_status not in {"FILLED", "PARTIAL_FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}):
-                logger.info("[SELL_STAGE_BLOCK] code=%s prior_stage=TP1 prior_status=%s requested_stage=TP2 reason=execution_unconfirmed",
-                            str(code).zfill(6), prior_status)
-                return True, dict(row)
-            if prior_status not in SELL_GUARD_STATES:
-                # Failed TP orders do not block independent protective FULL_EXIT.
-                continue
-            # Stage progression is unlocked only by confirmed execution.  ACK,
-            # SUBMITTED and UNRESOLVED_ACK never prove TP1 execution; a durable
-            # PARTIAL_FILLED row does.
-            if prior_status in {"FILLED", "PARTIAL_FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"}:
-                fresh = bool(self._authoritative_balance
-                             and self._authoritative_balance.freshness is BalanceFreshness.FRESH)
-                remaining = self._authoritative_balance.holding_qty(code) if self._authoritative_balance else 0
-                prior_submitted = int(request.get("submitted_qty") or row.get("qty") or 0)
-                prior_pre_qty = int(request.get("pre_order_holding_qty") or 0)
-                prior_was_partial = (
-                    prior_stage in {"TP1", "TP2", "PROFIT_PROTECT_PARTIAL_1", "DEFENSE_TRIM_1"}
-                    or (prior_pre_qty > 0 and 0 < prior_submitted < prior_pre_qty)
-                )
-                if (fresh and remaining > 0 and prior_was_partial
-                        and str(exit_stage or "").upper() == "FULL_EXIT"):
-                    continue
-                if (fresh and remaining > 0 and prior_stage and exit_stage
-                        and legal_next_exit_stage(prior_stage, exit_stage)):
-                    continue
-            # Pending/full-exit orders block regardless of a changing reason.
-            logger.info("[SELL_SESSION_BLOCK][DURABLE_SKIP] code=%s cycle=%s prior_order_id=%s",
-                        str(code).zfill(6), row_cycle, row.get("kis_odno") or row.get("order_id"))
-            return True, dict(row)
-        return False, None
+        return _durable_sell_block_impl(
+            orders_repo=self.orders_repo,
+            env=self.env,
+            code=code,
+            strategy_name=self.STRATEGY_NAME,
+            authoritative_balance=self._authoritative_balance,
+            window_internal=str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
+            position_cycle_id=position_cycle_id,
+            exit_stage=exit_stage,
+            logger=logger,
+        )
 
     def _register_session_no_sellable(self, *, code: str, reason: str = "KIS_NO_SELLABLE_QTY") -> int:
         code_key = str(code or "").zfill(6)
