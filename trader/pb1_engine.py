@@ -21,6 +21,7 @@ from sqlalchemy import inspect
 from trader.account_state import get_account_key
 from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
+from trader.kr.pb1.exit_family import resolve_exit_family
 from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
 from trader.kr.pb1.exit_updates import build_exit_position_update_fields
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
@@ -6645,14 +6646,7 @@ class PB1Engine:
 
     @classmethod
     def _resolve_exit_family(cls, entry_reason: Any, entry_style_selected: Any) -> tuple[str, str]:
-        normalized_reason = cls._normalize_entry_reason(entry_reason or entry_style_selected)
-        if normalized_reason == "ENTRY_BREAKOUT":
-            return normalized_reason, "BREAKOUT_EXIT"
-        if normalized_reason == "ENTRY_PULLBACK":
-            return normalized_reason, "PULLBACK_EXIT"
-        if normalized_reason == "ENTRY_MOMENTUM":
-            return normalized_reason, "MOMENTUM_EXIT"
-        return normalized_reason, "GENERIC_EXIT"
+        return resolve_exit_family(entry_reason, entry_style_selected)
 
     def _build_entry_metadata(
         self,
@@ -11598,7 +11592,7 @@ class PB1Engine:
 
         entry_reason_value = pos.get("entry_reason") or (pos.get("entry_meta_json") or {}).get("entry_reason")
         entry_style_selected = pos.get("entry_style_selected") or (pos.get("entry_meta_json") or {}).get("entry_style_selected")
-        entry_reason_normalized, resolved_exit_family = self._resolve_exit_family(entry_reason_value, entry_style_selected)
+        entry_reason_normalized, resolved_exit_family = resolve_exit_family(entry_reason_value, entry_style_selected)
         exit_policy_family = str(
             pos.get("exit_policy_family")
             or (pos.get("entry_meta_json") or {}).get("exit_policy_family")
