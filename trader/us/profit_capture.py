@@ -52,6 +52,8 @@ def authoritative_broker_avg(position: dict, *, now: datetime | None = None,
         raise ValueError("position_lifecycle_id_required")
     if position.get("orderable_qty") is None or int(position.get("qty") or 0) <= 0:
         raise ValueError("ambiguous_position_quantity")
+    if value not in (None, "", 0, "0") and currency == "USD" and not asof_raw:
+        raise ValueError("BROKER_AVG_ASOF_UNKNOWN")
 
     candidates = []
     if value not in (None, "", 0, "0") and currency == "USD" and asof_raw:
