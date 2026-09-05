@@ -441,14 +441,6 @@ class KisUSClient:
         exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
-        
-        cache_key = ("balance", tuple(exchanges))
-        ttl = float(os.getenv("US_KIS_BALANCE_CACHE_TTL_SEC", "30") or 30)
-        cached = self._response_cache.get(cache_key)
-        if cached and not force_refresh and time.time() - cached[0] <= ttl and os.getenv("US_KIS_FORCE_BALANCE_REFRESH", "0") not in {"1", "true", "True"}:
-            logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
-            return cached[1]
-
         configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
         tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
         # Balance is a pre-routing stage.  Preserve a dedicated portion of the
@@ -458,6 +450,24 @@ class KisUSClient:
             "US_SELL_ROUTING_RESERVE_SEC",
             os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1"),
         )))
+        exchange_by_symbol = getattr(self._tick_context, "exchange_by_symbol", {})
+        if tick_remaining < configured_budget + reserve and exchange_by_symbol:
+            exchange_map = {"NASDAQ": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}
+            targeted = {
+                exchange_map.get(str(exchange).upper(), str(exchange).upper())
+                for exchange in exchange_by_symbol.values()
+            }
+            targeted &= set(exchanges)
+            if targeted:
+                exchanges = [exchange for exchange in exchanges if exchange in targeted]
+                logger.info("[US_BALANCE][TARGETED_EXIT_REFRESH] exchanges=%s", exchanges)
+
+        cache_key = ("balance", tuple(exchanges))
+        ttl = float(os.getenv("US_KIS_BALANCE_CACHE_TTL_SEC", "30") or 30)
+        cached = self._response_cache.get(cache_key)
+        if cached and not force_refresh and time.time() - cached[0] <= ttl and os.getenv("US_KIS_FORCE_BALANCE_REFRESH", "0") not in {"1", "true", "True"}:
+            logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
+            return cached[1]
         balance_budget = min(configured_budget, max(0.0, tick_remaining - reserve))
         if balance_budget <= 0:
             raise KisUSTemporaryError("balance stage budget exhausted before fetch")
