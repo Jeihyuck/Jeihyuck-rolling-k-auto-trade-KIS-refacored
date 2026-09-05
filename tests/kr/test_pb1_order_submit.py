@@ -56,6 +56,7 @@ def _engine(resp):
     engine = SimpleNamespace(
         _today="2026-09-05",
         env="practice",
+        STRATEGY_NAME="PB1",
         window_internal="day",
         kis=kis,
         orders_repo=repo,
@@ -64,6 +65,10 @@ def _engine(resp):
         no_sellable_qty_terminal_codes=set(),
         _register_session_sell_accepted=lambda **kwargs: submitted.append(kwargs),
         _register_session_no_sellable=no_sellable,
+        _classify_submit_terminal_status=lambda **kwargs: (
+            "BROKER_REJECTED" if kwargs.get("response") and kwargs["response"].get("rt_cd") != "0"
+            else "ACCEPTED_PENDING_FILL"
+        ),
         _format_order_result_reason=lambda value: (
             "ORDER_OK" if value and value.get("rt_cd") == "0"
             else f"ORDER_FAIL_BIZ_{value.get('msg_cd')}" if value else "ORDER_FAIL_API(no_response)"
@@ -113,7 +118,7 @@ def test_submit_exit_sell_order_success_persists_cooldown_and_last_exit(monkeypa
 
     assert result["submitted"] == 1
     assert result["order_result"] == "ORDER_OK"
-    assert "terminal_event" not in result
+    assert result["terminal_event"] == "API_RESULT"
     assert "rejected" not in result
     assert "submit_terminal_status" not in result
     assert kis.calls == [("010060", 7)]
@@ -167,9 +172,10 @@ def test_submit_exit_sell_order_reject_registers_no_sellable_and_persists_last_e
     )
 
     assert result["order_result"] == "ORDER_FAIL_BIZ_NO_SELLABLE_QTY"
-    assert "terminal_event" not in result
-    assert "rejected" not in result
-    assert "submit_terminal_status" not in result
+    assert result["terminal_event"] == "API_RESULT"
+    assert result["rejected"] == 1
+    assert result["failed"] == 1
+    assert result["submit_terminal_status"] == "BROKER_REJECTED"
     assert kis.calls == [("010060", 7)]
     assert repo.submitted and repo.errors and not repo.acked
     assert no_sellable.calls and no_sellable.calls[0]["reason"] == "KIS_NO_SELLABLE_QTY"
