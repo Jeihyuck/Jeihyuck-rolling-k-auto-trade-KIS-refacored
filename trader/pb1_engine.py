@@ -234,6 +234,7 @@ from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_orde
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
 from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
                                      normalize_sell_reason_family, same_day_semantic_sell_exists)
+from trader.kr.pb1.stage_label import _resolve_session_window_name, build_stage_label
 from trader.kr.pb1.ownership import enforce_kr_order_ownership
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
@@ -2215,41 +2216,6 @@ def _should_allow_single_share_position_cap_override(
     if float(order_possible_cash or 0.0) > 0 and float(order_possible_cash or 0.0) < one_share_cost:
         return False
     return True
-
-
-def _resolve_session_window_name(*, session_kind: str | None, raw_window_name: str | None) -> str:
-    normalized_session = str(session_kind or "").strip().lower()
-    normalized_window = str(raw_window_name or "").strip().lower()
-    if normalized_session == "am" and normalized_window in {"am", "morning", "intraday", "day", "preopen", "session", "open"}:
-        return "morning"
-    if normalized_window in {"morning", "preopen", "close", "intraday"}:
-        return "intraday"
-    if normalized_window == "after":
-        return "after"
-    return "day"
-
-
-def build_stage_label(*, session_kind: str | None, window: str | None = None, phase: str | None = None) -> str:
-    """[2026-04-30] 올바른 stage 레이블 생성 (AM entry ≠ PB1-CLOSE).
-
-    Rules:
-        session_kind=am, phase=entry  → PB1-AM-ENTRY
-        session_kind=afternoon/pm, phase=entry → PB1-AFTERNOON-ENTRY
-        phase=exit or close           → PB1-CLOSE-EXIT
-        fallback                      → PB1-{SESSION}-{PHASE}
-    """
-    sess = str(session_kind or "").strip().lower()
-    ph = str(phase or "").strip().lower()
-    if ph in {"exit", "close"}:
-        return "PB1-CLOSE-EXIT"
-    if ph == "entry":
-        if sess == "am":
-            return "PB1-AM-ENTRY"
-        if sess in {"pm", "afternoon"}:
-            return "PB1-AFTERNOON-ENTRY"
-    sess_label = (sess or "unknown").upper()
-    ph_label = (ph or "unknown").upper()
-    return f"PB1-{sess_label}-{ph_label}"
 
 
 def _extract_cooldown_source_details(ledger_rows: Iterable[dict[str, Any]] | None) -> dict[str, Any]:
