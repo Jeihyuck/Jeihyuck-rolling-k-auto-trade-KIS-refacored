@@ -232,6 +232,22 @@ def test_us_unknown_balance_is_not_zero_position():
     assert result["positions"] == []
 
 
+def test_us_balance_timeout_blocks_buy_but_preserves_exit_monitoring():
+    from trader.us.execution.reconcile import reconcile_positions
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {
+                "positions": [{"symbol": "HELD", "qty": 1}],
+                "balance_complete": False,
+                "balance_authoritative": False,
+            }
+
+    result = reconcile_positions(provider=Provider(), trade_date="2026-09-01")
+    assert result["block_new_entry"] is True
+    assert result["preserve_previous_positions"] is True
+
+
 def test_us_low_budget_exit_does_not_require_full_three_exchange_scan(monkeypatch):
     client = KisUSClient(offline=False)
     monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "30")

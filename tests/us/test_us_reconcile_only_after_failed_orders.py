@@ -94,6 +94,30 @@ def test_pending_sell_suppresses_all_exit_intent_types(monkeypatch):
     assert _suppress_pending_sell_exit_intents(intents, "2026-07-21") == []
 
 
+def test_us_unresolved_sell_ack_blocks_duplicate_same_symbol_sell(monkeypatch):
+    monkeypatch.setattr(
+        "trader.us.db.repos.has_pending_order_for_symbol_side",
+        lambda **kwargs: kwargs["symbol"] == "HELD",
+    )
+    intents = [
+        {"symbol": "HELD", "side": "SELL", "reason": "profit_capture"},
+        {"symbol": "OTHER", "side": "SELL", "reason": "stop_loss"},
+    ]
+    assert _suppress_pending_sell_exit_intents(intents, "2026-07-21") == [intents[1]]
+
+
+def test_us_unresolved_ack_fences_new_buy_but_preserves_unrelated_sell(monkeypatch):
+    monkeypatch.setattr(
+        "trader.us.db.repos.has_pending_order_for_symbol_side",
+        lambda **kwargs: kwargs["symbol"] == "PENDING",
+    )
+    exits = _suppress_pending_sell_exit_intents(
+        [{"symbol": "HELD", "side": "SELL", "qty": 1}], "2026-07-21",
+    )
+    assert exits == [{"symbol": "HELD", "side": "SELL", "qty": 1}]
+    assert _journal_has_unrecovered_buy_ack("2099-01-01") is False
+
+
 def test_close_balance_absent_sell_is_not_unresolved(monkeypatch):
     orders = [{
         "symbol": "AAPL", "side": "SELL", "qty_requested": 1, "status": "ACK",
