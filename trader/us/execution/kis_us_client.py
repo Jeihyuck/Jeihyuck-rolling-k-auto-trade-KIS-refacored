@@ -537,8 +537,12 @@ class KisUSClient:
         
             # symbol 중복 병합
             raw_count = sum(exchange_result_counts.values())
+            self._balance_conflicts = []
             merged_output1 = self._merge_duplicate_symbols(merged_output1)
             duplicate_skipped = max(0, raw_count - len(merged_output1))
+            balance_conflicts = list(self._balance_conflicts)
+            if balance_conflicts:
+                failed_exchanges["BALANCE_CONFLICT"] = ",".join(balance_conflicts)
         
             logger.info(
                 "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
@@ -561,6 +565,7 @@ class KisUSClient:
                 "balance_authoritative": balance_complete,
                 "raw_count": raw_count,
                 "duplicate_skipped": duplicate_skipped,
+                "balance_conflicts": balance_conflicts,
             }
             # Never replace the last-good full snapshot with partial/uncertain data.
             if balance_complete:
@@ -783,6 +788,13 @@ class KisUSClient:
             )
 
             if existing_exchange == exchange and exchange:
+                if str(existing_qty_raw).strip() != str(qty_raw).strip() or (
+                    str(existing.get("pchs_avg_pric") or existing.get("pchs_avg_price") or "0").strip()
+                    != str(avg_price_raw).strip()
+                ):
+                    conflicts = getattr(self, "_balance_conflicts", None)
+                    if isinstance(conflicts, list):
+                        conflicts.append(symbol)
                 logger.warning(
                     "[US_BALANCE][DUPLICATE_SYMBOL_SAME_EXCHANGE_SKIP]"
                     " symbol=%s exchange=%s existing_qty=%s duplicate_qty=%s",

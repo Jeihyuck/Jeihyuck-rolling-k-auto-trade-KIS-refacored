@@ -58,7 +58,7 @@ def authoritative_broker_avg(position: dict, *, now: datetime | None = None,
     candidates.extend((
         (position.get("reconciled_avg_price") or position.get("reconciled_position_avg_price"), "fallback_reconciled_position_avg", position.get("reconciled_at") or position.get("updated_at"), True),
         (position.get("db_avg_price") or position.get("fresh_db_position_avg_price"), "fallback_fresh_db_position_avg", position.get("db_position_asof") or position.get("updated_at"), True),
-        (position.get("avg_price_usd"), "fallback_avg_price_usd", position.get("updated_at") or position.get("as_of"), False),
+        (position.get("avg_price_usd"), "fallback_avg_price_usd", position.get("updated_at") or position.get("as_of"), is_kis),
         (position.get("avg_cost"), "fallback_avg_cost", position.get("updated_at") or position.get("as_of"), False),
         (position.get("entry_price"), "fallback_entry_price", position.get("entry_at") or position.get("entry_time") or position.get("created_at"), False),
     ))

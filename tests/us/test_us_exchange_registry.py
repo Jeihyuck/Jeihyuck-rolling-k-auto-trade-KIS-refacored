@@ -174,3 +174,24 @@ def test_all_prep_benchmarks_resolve():
 
     benchmarks = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
     assert {resolve_exchange(symbol) for symbol in benchmarks} <= {"NASDAQ", "NYSE", "AMEX"}
+
+
+def test_us_etf_exchange_registry_single_source_of_truth():
+    from trader.us.symbols import get_order_exchange_code, get_quote_exchange_code, resolve_exchange
+
+    for symbol in ("SPY", "QQQ", "QQQM", "DIA", "IWM", "RSP", "SMH", "SOXX",
+                   "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"):
+        exchange = resolve_exchange(symbol)
+        assert get_quote_exchange_code(exchange)
+        assert get_order_exchange_code(exchange)
+
+
+def test_us_spy_resolves_correct_kis_quote_code():
+    from trader.us.symbols import get_quote_exchange_code, resolve_exchange
+    assert get_quote_exchange_code(resolve_exchange("SPY")) == "NYS"
+
+
+def test_us_sector_etfs_resolve_correct_kis_quote_codes():
+    from trader.us.symbols import get_quote_exchange_code, resolve_exchange
+    assert {get_quote_exchange_code(resolve_exchange(symbol)) for symbol in
+            ("XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")} == {"NYS"}
