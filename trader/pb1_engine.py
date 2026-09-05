@@ -22,6 +22,7 @@ from trader.account_state import get_account_key
 from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
 from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
+from trader.kr.pb1.exit_updates import build_exit_position_update_fields
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.position_lifecycle import lifecycle_is_authoritative
@@ -11579,10 +11580,12 @@ class PB1Engine:
             stop_price = _eff_stop
 
         max_price = self._to_float(pos.get("max_price")) or 0.0
-        new_max = max(max_price, float(mark or 0.0))
-        update_fields: dict[str, Any] = {"max_price": new_max}
-        if stop_price is not None and pos.get("stop_price") is None:
-            update_fields["stop_price"] = stop_price
+        update_fields = build_exit_position_update_fields(
+            current_max_price=max_price,
+            mark=mark,
+            stop_price=stop_price,
+            stop_price_missing=pos.get("stop_price") is None,
+        )
         if update_fields:
             self.positions_repo.update_position_fields(
                 env=self.env,
