@@ -1,7 +1,5 @@
 from datetime import datetime, timezone
 
-import pytest
-
 from trader.us.profit_capture import authoritative_broker_avg
 from trader.us.runner import daily_report_runner as report_runner
 
@@ -38,11 +36,13 @@ def test_kis_balance_raw_average_is_resolved_at_profit_capture_boundary():
     assert meta["broker_avg_price_source"] == "kis_pchs_avg_pric"
 
 
-def test_broker_average_without_asof_is_unknown():
+def test_broker_average_without_asof_uses_position_fallback():
     position = {
         "symbol": "HELD", "qty": 1, "orderable_qty": 1,
         "position_lifecycle_id": "position-1",
         "broker_avg_price": "100", "broker_avg_price_currency": "USD",
+        "avg_price_usd": "101",
     }
-    with pytest.raises(ValueError, match="BROKER_AVG_ASOF_UNKNOWN"):
-        authoritative_broker_avg(position)
+    value, meta = authoritative_broker_avg(position)
+    assert str(value) == "101"
+    assert meta["broker_avg_price_source"] == "fallback_avg_price_usd"
