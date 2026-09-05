@@ -140,13 +140,27 @@ def test_sell_acceptance_partial_and_final_completion(armed_practice_env):
     kis = FakeKIS(qty=150, average=100, price=110, fill_qty=110)
     repo = FakeRepository(active())
     partial = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
-    assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.EXIT_PENDING and kis.qty == 75
+    assert partial.decision.action == Action.SELL_PARTIAL and partial.state.status == Status.ACTIVE and kis.qty == 75
     # A subsequent tick reconciles the pending sell and cannot buy.
     again = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert again.decision.action == Action.SELL_ALL and again.decision.reason == "TAKE_PROFIT_TP2" and len(kis.orders) == 2
     kis.fill_qty = 75; kis.qty = 0
     done = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME, trade_date=DAY, kis_env="practice")
     assert done.state.status == Status.COMPLETE and done.state.last_exit_date == DAY
+
+
+def test_kr_infinite_terminal_partial_profit_sell_with_residual_rearms_cycle(armed_practice_env):
+    kis = FakeKIS(qty=100, average=100, price=110, fill_qty=50)
+    repo = FakeRepository(active())
+
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice")
+
+    assert result.decision.action == Action.SELL_PARTIAL
+    assert result.state.status == Status.ACTIVE
+    assert result.state.metadata["pending_profit_stage"] is None
+    assert result.state.metadata["profit_stage"].endswith("_FILLED")
+    assert kis.qty == 50
 
 
 def test_kr_infinite_invalid_price_blocks_without_exception(armed_practice_env):

@@ -47,7 +47,14 @@ def reconcile(state:State|None,position:BrokerPosition,trade_date:date,pending_s
         metadata=dict(state.metadata);metadata.pop("fill_balance_pending",None);metadata.pop("fill_balance_pending_attempts",None)
         state=replace(state,metadata=metadata)
     if state.status==Status.EXIT_PENDING:
-        if position.qty>0:return state,"EXIT_PENDING"
+        if position.qty>0:
+            # A terminal partial-profit fill leaves the macro cycle open when
+            # the freshly fetched broker balance still has a residual holding.
+            # ACK/PENDING and intermediate partial fills retain EXIT_PENDING.
+            if (not state.metadata.get("pending_profit_stage")
+                    and str(state.metadata.get("profit_stage") or "").upper().endswith("_FILLED")):
+                return replace(state,status=Status.ACTIVE),"PARTIAL_PROFIT_FILLED_RESIDUAL"
+            return state,"EXIT_PENDING"
         if pending_sell:return state,"SELL_RECONCILE_PENDING"
         return replace(state,status=Status.COMPLETE,cycle_complete_date=trade_date,last_exit_date=trade_date),"CYCLE_COMPLETE"
     return state,"OK"
