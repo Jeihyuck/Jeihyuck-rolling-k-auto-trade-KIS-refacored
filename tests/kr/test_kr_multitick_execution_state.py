@@ -1,11 +1,35 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
+import pytest
 from trader.execution_state import SELL_GUARD_STATES, durable_order_metrics
 import json
 import sqlalchemy as sa
 from trader.db.repos import OrdersRepo
 from trader.db.schema import schema_for_engine
 from trader.pb1_runner import _write_session_result_file
+
+KST_NOW = datetime(2026, 8, 31, 13, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+
+@pytest.fixture(autouse=True)
+def _fixed_today_orders(monkeypatch):
+    monkeypatch.setattr("trader.db.repos.now_kst", lambda: KST_NOW)
+    monkeypatch.setattr("trader.pb1_runner._get_now_kst", lambda: KST_NOW)
+    original = OrdersRepo.create_intent_idempotent
+
+    def wrapped(self, *args, **kwargs):
+        order_id, created = original(self, *args, **kwargs)
+        if created:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    sa.update(self._schema.orders)
+                    .where(self._schema.orders.c.order_id == order_id)
+                    .values(created_at=KST_NOW)
+                )
+        return order_id, created
+
+    monkeypatch.setattr(OrdersRepo, "create_intent_idempotent", wrapped)
 
 
 def test_new_engine_tick_observes_durable_sell_ack():
@@ -67,7 +91,9 @@ def test_pb1_result_file_rebuilds_ack_metrics_from_durable_db(tmp_path, monkeypa
     path = tmp_path / "pb1_result.json"
     monkeypatch.setenv("PB1_SESSION_RESULT_PATH", str(path))
     _write_session_result_file({"status": "OK", "accepted": 999, "order_candidates": 999},
-                               engine=engine, env="practice")
+                               engine=engine, env="practice",
+                               start_at=KST_NOW.replace(hour=0, minute=0, second=0, microsecond=0),
+                               end_at=KST_NOW.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
     result = json.loads(path.read_text())
     assert result["broker_acked"] == 7
     assert result["by_side"]["BUY"]["broker_acked"] == 3

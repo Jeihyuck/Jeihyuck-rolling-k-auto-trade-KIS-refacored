@@ -1,3 +1,7 @@
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pytest
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, BalanceFreshness,
                                     balance_freshness_for_source)
 import pandas as pd
@@ -5,6 +9,27 @@ import sqlalchemy as sa
 from trader.db.repos import OrdersRepo
 from trader.db.schema import schema_for_engine
 from tests.kr.test_kr_sell_no_sellable_session_block import FakeKis, _make_engine
+
+KST_NOW = datetime(2026, 8, 6, 13, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+
+@pytest.fixture(autouse=True)
+def _fixed_today_orders(monkeypatch):
+    monkeypatch.setattr("trader.db.repos.now_kst", lambda: KST_NOW)
+    original = OrdersRepo.create_intent_idempotent
+
+    def wrapped(self, *args, **kwargs):
+        order_id, created = original(self, *args, **kwargs)
+        if created:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    sa.update(self._schema.orders)
+                    .where(self._schema.orders.c.order_id == order_id)
+                    .values(created_at=KST_NOW)
+                )
+        return order_id, created
+
+    monkeypatch.setattr(OrdersRepo, "create_intent_idempotent", wrapped)
 
 
 BALANCE = {
