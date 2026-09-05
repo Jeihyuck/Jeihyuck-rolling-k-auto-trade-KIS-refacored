@@ -235,6 +235,7 @@ from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_
 from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
                                      normalize_sell_reason_family, same_day_semantic_sell_exists)
 from trader.kr.pb1.stage_label import _resolve_session_window_name, build_stage_label
+from trader.kr.pb1.code_utils import _is_kr_stock_code, _is_kis_balance_authoritative_empty
 from trader.kr.pb1.ownership import enforce_kr_order_ownership
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
@@ -797,59 +798,6 @@ def _calendar_days_held(entry_ts: Any, trade_date: date) -> int:
     if entry_date is None:
         return 0
     return max(0, (trade_date - entry_date).days)
-
-
-def _is_kr_stock_code(code: str | None) -> bool:
-    """한국장 6자리 숫자 종목 코드 판별"""
-    text = str(code or "").strip()
-    return len(text) == 6 and text.isdigit()
-
-
-def _is_kis_balance_authoritative_empty(balance_snapshot: dict | None) -> bool:
-    """
-    KIS balance가 정상 조회되었고 output1=[]이면 한국장 보유는 0개.
-    이 경우 ledger_reconstruct 등 fallback을 금지한다.
-    """
-    if not isinstance(balance_snapshot, dict):
-        return False
-
-    rt_cd = str(balance_snapshot.get("rt_cd") or "0").strip()
-    if rt_cd not in {"", "0"}:
-        return False
-
-    output1 = balance_snapshot.get("output1")
-    output2 = balance_snapshot.get("output2")
-
-    if isinstance(output1, dict):
-        output1_rows = [output1] if output1 else []
-    elif isinstance(output1, list):
-        output1_rows = output1
-    else:
-        output1_rows = []
-
-    if output1_rows:
-        return False
-
-    def _to_int(v):
-        try:
-            return int(float(str(v or "0").replace(",", "")))
-        except Exception:
-            return 0
-
-    out2 = output2
-    if isinstance(out2, list):
-        out2 = out2[0] if out2 and isinstance(out2[0], dict) else {}
-    if not isinstance(out2, dict):
-        out2 = {}
-
-    scts_evlu_amt = _to_int(out2.get("scts_evlu_amt"))
-    pchs_amt_smtl_amt = _to_int(out2.get("pchs_amt_smtl_amt"))
-    evlu_amt_smtl_amt = _to_int(out2.get("evlu_amt_smtl_amt"))
-
-    if scts_evlu_amt == 0 and pchs_amt_smtl_amt == 0 and evlu_amt_smtl_amt == 0:
-        return True
-
-    return False
 
 
 def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: float) -> tuple[float, int]:
