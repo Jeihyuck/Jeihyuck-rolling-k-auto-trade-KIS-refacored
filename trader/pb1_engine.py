@@ -12727,6 +12727,7 @@ class PB1Engine:
             stock_name=stock_name,
             market=market,
             mode=mode,
+            sid=sid,
             orderable_qty=orderable_qty,
             mark=mark,
             stage=stage,
@@ -12742,6 +12743,9 @@ class PB1Engine:
             cycle_id=_cycle_id,
             sell_baseline=sell_baseline,
             days_held=days_held,
+            cooldown_until=cooldown_until,
+            exit_meta=exit_meta,
+            order_id=str(order_id),
         )
 
     def _positions_with_meta(self, positions: Iterable[Dict]) -> List[Dict]:

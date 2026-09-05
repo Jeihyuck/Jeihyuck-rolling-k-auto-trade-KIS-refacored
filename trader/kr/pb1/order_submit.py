@@ -19,6 +19,7 @@ def submit_exit_sell_order(
     stock_name: str,
     market: str | None,
     mode: int,
+    sid: int,
     orderable_qty: int,
     mark: float,
     stage: str,
@@ -34,6 +35,9 @@ def submit_exit_sell_order(
     cycle_id: str | None,
     sell_baseline: Any | None,
     days_held: int,
+    cooldown_until: str | None,
+    exit_meta: dict[str, Any],
+    order_id: str,
 ) -> dict[str, Any]:
     exit_eval_payload["submit_attempted"] = 1
     emit_event(
@@ -97,7 +101,7 @@ def submit_exit_sell_order(
         "[TRADE][ORDER][SELL] code=%s name=%s oid=%s qty=%s price=%.2f result=%s",
         code,
         stock_name,
-        kis_odno or exit_eval_payload.get("order_id"),
+        kis_odno or order_id,
         submitted_qty,
         float(mark or 0.0),
         "ACCEPTED" if ok else "REJECTED",
@@ -109,13 +113,13 @@ def submit_exit_sell_order(
             code=code,
             qty=submitted_qty,
             price=float(mark or 0.0),
-            order_id=str(kis_odno or exit_eval_payload.get("order_id") or ""),
+            order_id=str(kis_odno or order_id or ""),
         )
         logger.info(
             "[SELL_SESSION_BLOCK][DURABLE_REGISTER] code=%s cycle=%s order_id=%s session=%s",
             code,
             cycle_id or "",
-            kis_odno or exit_eval_payload.get("order_id"),
+            kis_odno or order_id,
             str(os.getenv("PB1_SESSION_KIND") or engine.window_internal or "day").lower(),
         )
         if hasattr(engine.kis, "invalidate_balance_cache"):
@@ -133,17 +137,44 @@ def submit_exit_sell_order(
             )
             if not _soft_ack:
                 raise
-        exit_eval_payload["terminal_event"] = "API_RESULT"
-        return exit_eval_payload
-
-    engine.orders_repo.mark_error(engine.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
-    exit_eval_payload["rejected"] = 1
-    exit_eval_payload["failed"] = int(exit_eval_payload.get("failed", 0) or 0) + 1
-    exit_eval_payload["submit_terminal_status"] = engine._classify_submit_terminal_status(
-        api_submitted=int(exit_eval_payload.get("api_submitted", 0) or 0),
-        accepted=int(exit_eval_payload.get("accepted", 0) or 0),
-        skipped_reason=str(exit_eval_payload.get("skipped_reason") or ""),
-        response=resp if isinstance(resp, dict) else None,
+        logger.info(
+            "[ORDER][ACCEPTED] side=SELL code=%s name=%s odno=%s fill_status=pending submitted_qty=%s requested_qty=%s",
+            code,
+            stock_name,
+            kis_odno or order_id,
+            submitted_qty,
+            requested_qty,
+        )
+        if cooldown_until:
+            engine.positions_repo.update_position_fields(
+                env=engine.env,
+                strategy=engine.STRATEGY_NAME,
+                sid=sid,
+                mode=mode,
+                code=code,
+                fields={"cooldown_until": cooldown_until},
+            )
+    else:
+        reject_reason = str(engine._format_order_result_reason(resp if isinstance(resp, dict) else None) or "")
+        msg_cd_norm = str(msg_cd or "").upper()
+        msg1_norm = str(msg1 or "").lower()
+        if (
+            msg_cd_norm == "NO_SELLABLE_QTY"
+            or "ORDER_SKIP_NO_SELLABLE_QTY" in reject_reason
+            or "sellable quantity is zero" in msg1_norm
+        ):
+            engine._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
+            engine.no_sellable_qty_terminal_codes.add(display_code)
+        engine.orders_repo.mark_error(engine.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
+    engine.positions_repo.update_position_fields(
+        env=engine.env,
+        strategy=engine.STRATEGY_NAME,
+        sid=sid,
+        mode=mode,
+        code=code,
+        fields={
+            "last_exit_eval_json": exit_eval_payload,
+            "last_exit_plan_eval_json": exit_meta,
+        },
     )
-    exit_eval_payload["terminal_event"] = "API_RESULT"
     return exit_eval_payload
