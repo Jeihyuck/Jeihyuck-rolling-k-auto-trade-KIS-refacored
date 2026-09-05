@@ -19,6 +19,7 @@ import pandas as pd
 import sqlalchemy as sa
 from sqlalchemy import inspect
 from trader.account_state import get_account_key
+from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, SELL_GUARD_STATES,
                                     PENDING_SELL_STATES, BalanceFreshness, balance_freshness_for_source,
@@ -571,25 +572,6 @@ def _is_sanitized_balance_snapshot(snapshot: dict) -> bool:
     if not values:
         return False
     return all(isinstance(value, str) and value == "****" for value in values)
-
-
-def _extract_dnca_tot_amt(balance_resp: dict) -> int | None:
-    if not isinstance(balance_resp, dict):
-        return None
-    out2 = balance_resp.get("output2")
-    if isinstance(out2, list) and out2:
-        row = out2[0]
-        if isinstance(row, dict) and row:
-            value = row.get("dnca_tot_amt")
-            if value is not None and str(value).strip() != "":
-                return int(float(str(value).replace(",", "")))
-        if isinstance(row, dict) and not row:
-            return None
-    if isinstance(out2, dict) and out2:
-        value = out2.get("dnca_tot_amt")
-        if value is not None and str(value).strip() != "":
-            return int(float(str(value).replace(",", "")))
-    return None
 
 
 @dataclass

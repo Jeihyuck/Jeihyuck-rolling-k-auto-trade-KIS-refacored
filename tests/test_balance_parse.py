@@ -1,10 +1,11 @@
-from trader.balance_utils import sanitize_balance_snapshot
+from trader.balance_utils import extract_dnca_tot_amt, sanitize_balance_snapshot
 from trader.pb1_engine import _extract_dnca_tot_amt
 
 
 def test_extract_dnca_tot_amt_from_output2_list():
     snapshot = {"output2": [{"dnca_tot_amt": "1,234"}]}
 
+    assert extract_dnca_tot_amt(snapshot) == 1234
     assert _extract_dnca_tot_amt(snapshot) == 1234
 
 
