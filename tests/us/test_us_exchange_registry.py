@@ -184,6 +184,11 @@ def test_us_etf_exchange_registry_single_source_of_truth():
         exchange = resolve_exchange(symbol)
         assert get_quote_exchange_code(exchange)
         assert get_order_exchange_code(exchange)
+    from trader.us import market_state_overlay, watchlist_builder
+    from trader.us.execution import order_router
+    assert not hasattr(watchlist_builder, "ETF_EXCHANGE_MAP")
+    assert not hasattr(market_state_overlay, "_MARKET_RETURN_EXCHANGE_MAP")
+    assert "static_map" not in order_router.enrich_sell_exchange.__code__.co_names
 
 
 def test_us_spy_resolves_correct_kis_quote_code():

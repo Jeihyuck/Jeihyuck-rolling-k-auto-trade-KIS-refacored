@@ -467,8 +467,6 @@ def enrich_sell_exchange(intent: dict, kis_client: Any = None, context: Any = No
         candidates.append(resolve_exchange(symbol))
     except Exception:
         pass
-    static_map = {"SPY": "NYSE", "DIA": "NYSE", "IWM": "NYSE", "QQQ": "NASDAQ", "QQQM": "NASDAQ", "SMH": "NASDAQ", "SOXX": "NASDAQ"}
-    candidates.append(static_map.get(symbol, ""))
     for ex in candidates:
         ex = _normalize_exchange_code(ex)
         if ex:

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from trader.us.rotation import AI_CLUSTERS, theme_cluster_for
+from trader.us.symbols import resolve_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -28,24 +29,8 @@ AI_TECH_CLUSTERS = set(AI_CLUSTERS) | {"AI_SEMI", "AI_SOFTWARE", "DATA_CENTER_PO
 DEFENSIVE_CLUSTERS = {"HEALTHCARE", "CONSUMER_STAPLES", "DEFENSIVE_UTILITY", "UTILITIES", "XLV", "XLP", "XLU"}
 CORE_INDEX_ETFS = {"SPY", "VOO", "IVV", "QQQ", "DIA", "RSP", "IWM"}
 
-# Quote lookup exchange map for the market-state ETF basket.  Keep this in sync
-# with watchlist_builder.  Without it, AMEX sector ETFs were queried as NASDAQ,
-# producing false market_return_missing warnings and distorted breadth scores.
-_MARKET_RETURN_EXCHANGE_MAP: dict[str, str] = {
-    "SPY": "AMEX",
-    "DIA": "AMEX",
-    "IWM": "AMEX",
-    "RSP": "AMEX",
-    "XLK": "AMEX",
-    "XLI": "AMEX",
-    "XLF": "AMEX",
-    "XLV": "AMEX",
-    "XLP": "AMEX",
-    "XLU": "AMEX",
-    "XLE": "AMEX",
-    "QQQ": "NASDAQ",
-    "SMH": "NASDAQ",
-}
+_MARKET_RETURN_SYMBOLS = ("SPY", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF",
+                          "XLV", "XLP", "XLU", "XLE", "QQQ", "SMH")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -186,7 +171,8 @@ def calculate_qqq_long_context(closes: list[float]) -> dict[str, Any]:
 def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict[str, float | None]:
     out: dict[str, float | None] = {}
     qqq_closes: list[float] = []
-    for sym, exchange in _MARKET_RETURN_EXCHANGE_MAP.items():
+    for sym in _MARKET_RETURN_SYMBOLS:
+        exchange = resolve_exchange(sym)
         rows = None
         try:
             if isinstance(provider, dict):
@@ -252,7 +238,7 @@ def _intraday_rebound(provider: Any, rets: dict[str, float | None], warnings: li
                 quotes = provider.get("intraday_quotes") or provider.get("quotes") or {}
                 quote = quotes.get(sym) or quotes.get(sym.lower())
             elif callable(getattr(provider, "get_current_price", None)):
-                quote = provider.get_current_price(sym, _MARKET_RETURN_EXCHANGE_MAP[sym])
+                quote = provider.get_current_price(sym, resolve_exchange(sym))
         except Exception as exc:
             warnings.append(f"intraday_rebound_fetch_failed:{sym}:{exc}")
         quote = quote if isinstance(quote, dict) else {}
