@@ -177,13 +177,21 @@ def test_all_prep_benchmarks_resolve():
 
 
 def test_us_etf_exchange_registry_single_source_of_truth():
-    from trader.us.symbols import get_order_exchange_code, get_quote_exchange_code, resolve_exchange
+    from trader.us.symbols import (
+        ETF_EXCHANGE_METADATA, get_symbol_exchange_metadata,
+        resolve_exchange, resolve_order_exchange, resolve_quote_exchange,
+    )
 
-    for symbol in ("SPY", "QQQ", "QQQM", "DIA", "IWM", "RSP", "SMH", "SOXX",
-                   "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"):
-        exchange = resolve_exchange(symbol)
-        assert get_quote_exchange_code(exchange)
-        assert get_order_exchange_code(exchange)
+    symbols = ("SPY", "QQQ", "QQQM", "DIA", "IWM", "RSP", "SMH", "SOXX",
+               "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")
+    for symbol in symbols:
+        meta = get_symbol_exchange_metadata(symbol)
+        assert symbol in ETF_EXCHANGE_METADATA
+        assert set(meta) == {"canonical_exchange", "quote_exchange", "order_exchange"}
+        assert resolve_exchange(symbol) == meta["canonical_exchange"]
+        assert resolve_quote_exchange(symbol) == meta["quote_exchange"]
+        assert resolve_order_exchange(symbol) == meta["order_exchange"]
+
     from trader.us import market_state_overlay, watchlist_builder
     from trader.us.execution import order_router
     assert not hasattr(watchlist_builder, "ETF_EXCHANGE_MAP")
@@ -192,14 +200,30 @@ def test_us_etf_exchange_registry_single_source_of_truth():
 
 
 def test_us_spy_resolves_correct_kis_quote_code():
-    from trader.us.symbols import get_quote_exchange_code, resolve_exchange
-    assert get_quote_exchange_code(resolve_exchange("SPY")) == "NYS"
+    from trader.us.symbols import (
+        resolve_exchange, resolve_order_exchange, resolve_order_exchange_code,
+        resolve_quote_exchange, resolve_quote_exchange_code,
+    )
+    assert resolve_exchange("SPY") == "NYSE"
+    assert resolve_quote_exchange("SPY") == "AMEX"
+    assert resolve_quote_exchange_code("SPY") == "AMS"
+    assert resolve_order_exchange("SPY") == "NYSE"
+    assert resolve_order_exchange_code("SPY") == "NYSE"
 
 
 def test_us_sector_etfs_resolve_correct_kis_quote_codes():
-    from trader.us.symbols import get_quote_exchange_code, resolve_exchange
-    assert {get_quote_exchange_code(resolve_exchange(symbol)) for symbol in
-            ("XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")} == {"NYS"}
+    from trader.us.symbols import resolve_exchange, resolve_order_exchange, resolve_quote_exchange_code
+    symbols = ("XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")
+    assert {resolve_exchange(symbol) for symbol in symbols} == {"NYSE"}
+    assert {resolve_order_exchange(symbol) for symbol in symbols} == {"NYSE"}
+    assert {resolve_quote_exchange_code(symbol) for symbol in symbols} == {"AMS"}
+
+
+def test_us_spy_sell_order_uses_order_exchange_not_quote_exchange():
+    from trader.us.execution.order_router import enrich_sell_exchange
+    intent = {"symbol": "SPY", "side": "SELL"}
+    assert enrich_sell_exchange(intent) == "NYSE"
+    assert intent["exchange"] == "NYSE"
 
 
 def test_us_benchmark_failure_degrades_entry_not_exit():
