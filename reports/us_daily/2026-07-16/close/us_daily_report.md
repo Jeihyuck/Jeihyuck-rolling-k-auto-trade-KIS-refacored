@@ -10,10 +10,10 @@
 | Field | Value |
 |---|---|
 | trade_date | 2026-07-16 |
-| branch | dual-agent |
-| commit_sha | dbbf119be00e48e1472a62f31ee3961ca63462c5 |
-| workflow | local |
-| run_id | local |
+| branch | copilot/dual-agent-fix-infinite-deadlocks |
+| commit_sha | 8efa6c5b9a982c98f92abe362bc08ff5520c0e65 |
+| workflow | dynamic/copilot-swe-agent/copilot |
+| run_id | 33943983676 |
 | session | close |
 | env | practice |
 | KIS_ENV | practice |
@@ -43,11 +43,18 @@
 | canonical_order_source | router_session_summary |
 | canonical_position_source | kis_final_balance |
 | orders_submitted_total | 0 |
+| session_orders_submitted | 0 |
+| daily_orders_submitted_total | 0 |
 | orders_ack_total | 0 |
 | orders_rejected_total | 0 |
 | orders_unresolved_total | 0 |
 | buy_notional_total | 0.0 |
 | sell_notional_total | 0.0 |
+| session_buy_notional | 0.0 |
+| session_sell_notional | 0.0 |
+| daily_buy_notional_total | 0.0 |
+| daily_sell_notional_total | 0.0 |
+| daily_fills_total | 0 |
 | actual_new_positions | 0 |
 | open_position_count | 1 |
 | account_equity_krw | 49999999.99999999 |

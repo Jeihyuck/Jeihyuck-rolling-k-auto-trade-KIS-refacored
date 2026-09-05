@@ -1,8 +1,8 @@
-# US Daily Report - 2026-05-02
+# US Daily Report - 2026-09-05
 
 ## Required Fields
 
-- trade_date: 2026-05-02
+- trade_date: 2026-09-05
 - branch: copilot/dual-agent-fix-infinite-deadlocks
 - commit_sha: test-sha
 - run_id: 25718405741
@@ -16,12 +16,12 @@
 - actor: copilot-swe-agent[bot]
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-09-05T04:19:59.990342Z
-- started_at_et: 2026-09-05T00:19:59.983381-04:00
-- started_at_kst: 2026-09-05T13:19:59.990342+09:00
-- ended_at_utc: 2026-09-05T04:19:59.990342Z
-- ended_at_et: 2026-09-05T00:19:59.990331-04:00
-- ended_at_kst: 2026-09-05T13:19:59.990342+09:00
+- started_at_utc: 2026-09-05T04:20:00.005269Z
+- started_at_et: 2026-09-05T00:19:59.997460-04:00
+- started_at_kst: 2026-09-05T13:20:00.005269+09:00
+- ended_at_utc: 2026-09-05T04:20:00.005269Z
+- ended_at_et: 2026-09-05T00:20:00.005248-04:00
+- ended_at_kst: 2026-09-05T13:20:00.005269+09:00
 - wall_elapsed_sec: 0.0
 - code_version_source: github_actions
 - dry_run: True
@@ -38,9 +38,9 @@
 - orders_sent: 0
 - fills: 0
 - positions: 0
-- last_stage: tick_1
-- final_status: SKIP
-- reason: not_trading_day
+- last_stage: tick_2
+- final_status: OK
+- reason: max_ticks
 - session_orders_sent: 0
 - session_orders_ack: 0
 - session_orders_rejected: 0
@@ -97,7 +97,7 @@
 - market_regime: NEUTRAL
 - capital_scale: 1.0
 - sector_cap_enforced: False
-- trade_block_reason: not_trading_day
+- trade_block_reason: 
 - blocked_entry_reason_counts: {}
 
 ## Broker/Reconcile Classification

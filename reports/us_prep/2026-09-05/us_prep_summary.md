@@ -1,4 +1,4 @@
-# US Prep Summary — 2026-06-02
+# US Prep Summary — 2026-09-05
 
 **status**: DEFENSE_CRASH_ENTRY_BLOCKED
 **trade_can_proceed**: 1
@@ -16,7 +16,7 @@
 
 ## Contract
 - contract_ok: True
-- trade_block_reason: BENCHMARK_DAILY_DATA_UNAVAILABLE
+- trade_block_reason: risk_off_entry_block
 - final30_complete: True
 - final30_trade_ready: True
 - underfilled_final30: False
