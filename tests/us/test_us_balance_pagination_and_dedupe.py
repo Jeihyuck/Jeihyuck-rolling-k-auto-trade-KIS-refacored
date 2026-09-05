@@ -115,6 +115,27 @@ class TestPaginationStop:
 # ---------------------------------------------------------------------------
 
 class TestDuplicateRowDedup:
+    def test_us_balance_identical_duplicate_is_deduped(self):
+        from trader.us.execution.kis_us_client import KisUSClient
+
+        client = KisUSClient.__new__(KisUSClient)
+        row = _make_row("HELD", "NASD", 12)
+        assert client._merge_duplicate_symbols([row, dict(row)]) == [row]
+
+    def test_us_balance_conflicting_duplicate_is_not_silently_dropped(self, monkeypatch):
+        from trader.us.execution.kis_us_client import KisUSClient
+
+        client = KisUSClient(offline=False)
+        monkeypatch.setenv("US_BALANCE_EXCHANGES", "NASD")
+        client._get_us_balance_single_exchange = lambda _exchange: {
+            "output1": [_make_row("HELD", "NASD", 1), _make_row("HELD", "NASD", 2)],
+            "output2": {},
+        }
+        result = client.get_us_balance(force_refresh=True)
+        assert result["balance_authoritative"] is False
+        assert result["failed_exchanges"]["BALANCE_CONFLICT"] == "HELD"
+        assert int(result["output1"][0]["ovrs_cblc_qty"]) == 1
+
     def test_exact_duplicate_rows_skipped(self):
         """Two identical rows for the same symbol must result in qty=12 (not 24)."""
         from trader.us.execution.kis_us_client import KisUSClient

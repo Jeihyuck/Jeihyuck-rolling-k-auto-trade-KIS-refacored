@@ -320,6 +320,7 @@ def test_no_sellable_qty_blocks_session_and_skips_sell_api() -> None:
     assert payload is not None
     assert payload["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
     assert "KIS_NO_SELLABLE_QTY" in payload.get("order_skip_reasons", [])
+    assert payload["terminal_event"] == "FINAL_SKIP"
     assert kis.sell_calls == 0
     assert code in engine._session_sell_blocked_codes
 
@@ -339,6 +340,82 @@ def test_sell_accepted_in_session_prevents_resubmit() -> None:
     assert payload is not None
     assert payload["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
     assert "SELL_ACCEPTED" in payload.get("order_skip_reasons", [])
+    assert payload["terminal_event"] == "FINAL_SKIP"
+    assert kis.sell_calls == 0
+
+
+def test_kr_pb1_sell_accepted_blocks_same_cycle_resubmit(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    kis = FakeKis()
+    balance = {"output1": [{"pdno": "010060", "hldg_qty": "14", "ord_psbl_qty": "14",
+                             "pchs_avg_pric": "271660"}], "output2": [{"ord_psbl_cash": "0"}]}
+    positions = PositionsRepo(db)
+    persisted, _ = positions.get_or_create_imported_cycle_for_kis_holding(
+        env="practice", strategy="pb1_pullback_close", account_id="practice:unknown",
+        sid=1, mode=1, code="010060", market="J", qty=14, avg_price=271660,
+    )
+    pos = _pos(code="010060", qty=14, kis_qty=14, orderable_qty=14)
+    pos.update(avg_buy_price=271660.0, last_price=260000.0, stop_price=265000.0,
+               position_cycle_id=str(persisted["position_cycle_id"]),
+               portfolio_epoch_id=str(persisted["portfolio_epoch_id"]),
+               position_meta={"position_cycle_id": str(persisted["position_cycle_id"])})
+
+    engine1, _ = _make_engine(db, kis, balance)
+    first = engine1._plan_exit_event(pos, {"close": 260000.0}, pd.DataFrame(), "day")
+    assert first["submitted"] == 1
+    assert kis.sell_calls == 1
+
+    engine2, _ = _make_engine(db, kis, balance)
+    second = engine2._plan_exit_event(pos, {"close": 260000.0}, pd.DataFrame(), "day")
+    assert second["order_result"] == "ORDER_SKIPPED_DURABLE_SESSION_BLOCK"
+    assert kis.sell_calls == 1
+
+
+def test_kr_pb1_no_sellable_qty_creates_durable_submit_fence() -> None:
+    engine, kis = _make_engine()
+    code = "005830"
+    engine._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
+    first = engine._plan_exit_event(
+        _pos(code=code, qty=1, kis_qty=0, orderable_qty=0),
+        {"close": 9000.0}, pd.DataFrame(), "day",
+    )
+    second = engine._plan_exit_event(
+        _pos(code=code, qty=1, kis_qty=0, orderable_qty=0),
+        {"close": 9000.0}, pd.DataFrame(), "day",
+    )
+    assert first["submitted"] == second["submitted"] == 0
+    assert first["terminal_event"] == second["terminal_event"] == "FINAL_SKIP"
+    assert "KIS_NO_SELLABLE_QTY" in first["order_skip_reasons"]
+    assert code in engine._session_sell_blocked_codes
+    assert kis.sell_calls == 0
+
+
+def test_kr_pb1_no_sellable_qty_does_not_repeat_broker_submit() -> None:
+    engine, kis = _make_engine()
+    code = "005830"
+    engine._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
+    for _ in range(3):
+        payload = engine._plan_exit_event(
+            _pos(code=code, qty=1, kis_qty=0, orderable_qty=0),
+            {"close": 9000.0}, pd.DataFrame(), "day",
+        )
+        assert payload["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
+    assert kis.sell_calls == 0
+
+
+def test_kr_pb1_fresh_sellable_positive_allows_retry(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    engine, kis = _make_engine()
+    code = "005830"
+    engine._register_session_no_sellable(code=code)
+    payload = engine._plan_exit_event(
+        _pos(code=code, qty=1, kis_qty=1, orderable_qty=1),
+        {"close": 9000.0}, pd.DataFrame(), "day",
+    )
+    assert payload["order_result"] != "ORDER_SKIPPED_SESSION_BLOCKED"
+    assert code not in engine._session_sell_blocked_codes
     assert kis.sell_calls == 0
 
 

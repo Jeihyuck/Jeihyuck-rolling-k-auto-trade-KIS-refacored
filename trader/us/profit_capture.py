@@ -52,14 +52,13 @@ def authoritative_broker_avg(position: dict, *, now: datetime | None = None,
         raise ValueError("position_lifecycle_id_required")
     if position.get("orderable_qty") is None or int(position.get("qty") or 0) <= 0:
         raise ValueError("ambiguous_position_quantity")
-
     candidates = []
     if value not in (None, "", 0, "0") and currency == "USD" and asof_raw:
         candidates.append((value, source or "broker_avg_price", asof_raw, is_kis or source in RECONCILED_AVG_SOURCES | DB_AVG_SOURCES))
     candidates.extend((
         (position.get("reconciled_avg_price") or position.get("reconciled_position_avg_price"), "fallback_reconciled_position_avg", position.get("reconciled_at") or position.get("updated_at"), True),
         (position.get("db_avg_price") or position.get("fresh_db_position_avg_price"), "fallback_fresh_db_position_avg", position.get("db_position_asof") or position.get("updated_at"), True),
-        (position.get("avg_price_usd"), "fallback_avg_price_usd", position.get("updated_at") or position.get("as_of"), False),
+        (position.get("avg_price_usd"), "fallback_avg_price_usd", position.get("updated_at") or position.get("as_of"), is_kis),
         (position.get("avg_cost"), "fallback_avg_cost", position.get("updated_at") or position.get("as_of"), False),
         (position.get("entry_price"), "fallback_entry_price", position.get("entry_at") or position.get("entry_time") or position.get("created_at"), False),
     ))

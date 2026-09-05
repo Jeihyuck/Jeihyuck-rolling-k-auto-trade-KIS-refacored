@@ -19,6 +19,7 @@ from trader.us.rotation import (
     classify_rotation_regime, cluster_caps_for_regime, compute_cluster_exposure,
     period_return, select_bucket_champions, theme_cluster_for,
 )
+from trader.us.symbols import resolve_quote_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +28,6 @@ _MAX_ETF_IN_FINAL30 = 5
 
 # 핵심 ETF 집합
 _CORE_ETFS: set[str] = {"SPY", "QQQ", "QQQM", "SMH", "SOXX"}
-
-# KIS US dailyprice exchange hints for benchmark/sector ETFs.
-ETF_EXCHANGE_MAP: dict[str, str] = {
-    "QQQ": "NASDAQ", "QQQM": "NASDAQ",
-    "SPY": "AMEX", "DIA": "AMEX", "IWM": "AMEX", "RSP": "AMEX",
-    "SMH": "NASDAQ", "SOXX": "NASDAQ",
-    "XLK": "AMEX", "XLI": "AMEX", "XLF": "AMEX", "XLV": "AMEX",
-    "XLP": "AMEX", "XLU": "AMEX", "XLE": "AMEX",
-}
 
 AI_BASKET_SYMBOLS: tuple[str, ...] = (
     "NVDA", "AMD", "AVGO", "ARM", "MU", "TSM", "ASML", "AMAT", "LRCX", "PLTR", "MSFT", "META",
@@ -582,7 +574,7 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     missing_symbols: list[str] = []
     symbol_quality: dict[str, str] = {}
     for sym in symbols:
-        exchange = ETF_EXCHANGE_MAP.get(sym, "NYSE")
+        exchange = resolve_quote_exchange(sym)
         closes: list[float] = []
         try:
             if callable(getattr(provider, "get_completed_daily_prices", None)) and getattr(getattr(provider, "get_completed_daily_prices", None), "__module__", "") != "unittest.mock":
@@ -632,7 +624,7 @@ def _build_rotation_context(provider: Any, candidate_pool: list[dict], as_of_dat
     elif rotation_context_suspect and policy == "conservative":
         ctx["rotation_regime"] = "CONSERVATIVE_ROTATION"
     ctx["benchmark_returns"] = returns
-    ctx["benchmark_exchange_map"] = {sym: ETF_EXCHANGE_MAP.get(sym, "NYSE") for sym in symbols}
+    ctx["benchmark_exchange_map"] = {sym: resolve_quote_exchange(sym) for sym in symbols}
     ctx["benchmark_data_quality"] = "ok" if not missing_symbols else "degraded"
     ctx["benchmark_symbol_quality"] = symbol_quality
     ctx["missing_symbols"] = missing_symbols

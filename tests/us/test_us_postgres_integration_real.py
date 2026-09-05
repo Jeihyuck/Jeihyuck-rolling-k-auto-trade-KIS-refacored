@@ -101,6 +101,25 @@ def test_real_postgres_reconcile_updates_actual_fill_with_typed_jsonb_binds(pg_e
     assert row["meta"]["requested_qty"] == 1
     assert row["meta"]["observed_at"]
 
+
+def test_tqqq_load_open_orders_side_filter_has_no_postgres_ambiguous_parameter(pg_engine):
+    """TQQQ's side-filtered us_orders path must bind a concrete side type."""
+    from sqlalchemy import text
+    from trader.us.infinite.repository import InfiniteRepository
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_orders
+            (trade_date,client_order_key,symbol,exchange,side,qty_requested,qty_filled,order_no,status,meta)
+            VALUES ('2026-09-04','TQQQ_INF_V3:cycle-1:2026-09-04:BUY',
+                    'TQQQ','NASDAQ','BUY',1,0,'tqqq-open','OPEN','{}'::jsonb)"""))
+
+    repo = InfiniteRepository(pg_engine)
+    assert [order["order_no"] for order in repo.load_open_orders(
+        symbol="TQQQ", cycle_id="cycle-1", side="BUY",
+    )] == ["tqqq-open"]
+    assert repo.load_open_orders(symbol="TQQQ", cycle_id="cycle-1", side="SELL") == []
+
+
 def test_real_postgres_promotion_regression_and_rollback(pg_engine):
     from sqlalchemy import text
     import trader.us.db.repos as repos

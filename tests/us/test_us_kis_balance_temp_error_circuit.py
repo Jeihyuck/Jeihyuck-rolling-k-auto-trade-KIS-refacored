@@ -72,3 +72,54 @@ def test_current_reconcile_failure_blocks_buy_on_third_consecutive_tick(monkeypa
     assert circuit["close_can_proceed"] is True
     assert result["entry_skipped"] is True
     assert result["buy_orders"] == 0
+
+
+def test_us_balance_incomplete_continues_exit_monitoring(monkeypatch):
+    """A non-authoritative balance fences BUYs but still routes a held SELL."""
+    import trader.us.runner.trade_tick_runner as mod
+
+    held = {"symbol": "HELD", "exchange": "NASDAQ", "qty": 1, "orderable_qty": 1, "entry_price": 100.0}
+    provider = MagicMock()
+    provider._get_client.return_value = MagicMock(stats={})
+    provider.get_orderable_cash.return_value = 10_000.0
+    monkeypatch.setattr("trader.us.data_provider.USDataProvider", lambda offline=False: provider)
+    monkeypatch.setattr("trader.us.market_calendar.is_us_trading_day", lambda _d: True)
+    monkeypatch.setattr("trader.us.market_calendar.market_phase", lambda _now: "REGULAR_MID")
+    monkeypatch.setattr("trader.us.budget.resolve_us_order_budget", lambda cash: {"effective_order_budget_usd": cash})
+    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_positions", lambda **_kwargs: {
+        "status": "WARN", "reason": "balance_incomplete", "balance_fetch_status": "TEMP_ERROR",
+        "preserve_previous_positions": True, "authoritative_positions": False, "positions": [],
+        "position_count": 0, "position_symbols": [], "block_new_entry": True,
+    })
+    monkeypatch.setattr("trader.us.execution.fills.get_fills_today", lambda **_kwargs: {"status": "OK", "fills": []})
+    monkeypatch.setattr("trader.us.execution.reconcile.reconcile_ack_orders_with_balance", lambda **_kwargs: {
+        "status": "OK", "pending_count": 0, "unresolved_count": 0, "symbols_by_status": {},
+    })
+    monkeypatch.setattr("trader.us.db.repos.load_positions", lambda *_args, **_kwargs: [held])
+    monkeypatch.setattr("trader.us.db.repos.load_today_symbols_sold", lambda **_kwargs: set())
+    monkeypatch.setattr("trader.us.db.repos.load_today_committed_buy_notional", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr("trader.us.db.repos.save_reconcile_log", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("trader.us.db.repos.has_pending_order_for_symbol_side", lambda **_kwargs: False)
+    monkeypatch.setattr("trader.us.pb1.us_exit_position_resolver.enrich_us_positions_for_exit", lambda positions, **_kwargs: (positions, {"total": 1, "ok": 1, "missing": 0}))
+
+    class Engine:
+        def evaluate_exits(self, positions, provider, now):
+            assert positions == [held]
+            return [{"symbol": "HELD", "exchange": "NASDAQ", "side": "SELL", "qty": 1,
+                     "notional_usd": 100.0, "client_order_key": "held-exit"}]
+        def evaluate_entries(self, *_args, **_kwargs):
+            raise AssertionError("incomplete balance must fence entry evaluation")
+    monkeypatch.setattr("trader.us.runner.trade_tick_runner._get_strategy_engine", lambda **_kwargs: Engine())
+    routed = []
+    monkeypatch.setattr("trader.us.execution.order_router.route_order", lambda intent, **kwargs: (
+        routed.append((intent, kwargs)) or {"status": "ACK", "side": "SELL", "symbol": intent["symbol"], "intent": intent}
+    ))
+
+    result = mod.run_trade_tick(session="am", env="practice", offline=False,
+                                force_now="2026-06-02T10:00:00-04:00")
+
+    assert result["balance_fetch_failed"] is True
+    assert result["entry_skipped"] is True
+    assert result["entry_intents"] == 0
+    assert [intent["symbol"] for intent, _kwargs in routed] == ["HELD"]
+    assert routed[0][1]["allowed_symbols"] is None

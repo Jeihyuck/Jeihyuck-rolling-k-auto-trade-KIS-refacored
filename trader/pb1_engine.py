@@ -7391,6 +7391,7 @@ class PB1Engine:
             "broker_response_code": None,
             "broker_message": None,
             "submitted": 0,
+            "terminal_event": "FINAL_SKIP",
         }
 
     @staticmethod
@@ -10211,7 +10212,8 @@ class PB1Engine:
         ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
         if not ownership_ok:
             logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", cf.code, ownership_reason)
-            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved"}
+            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved",
+                    "terminal_event": "FINAL_SKIP"}
         status: dict[str, Any] = self._empty_order_status()
         stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # ✅ 최종 방어선: intended_live=True인데 dry_run=True면 Fatal
@@ -11219,7 +11221,8 @@ class PB1Engine:
         ownership_ok, ownership_reason = enforce_kr_order_ownership(cf.code, "KR_STANDARD")
         if not ownership_ok:
             logger.error("[PB1][ORDER_ROUTE][REJECT] symbol=%s reason=%s", cf.code, ownership_reason)
-            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved"}
+            return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved",
+                    "terminal_event": "FINAL_SKIP"}
         status: dict[str, Any] = self._empty_order_status()
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"
@@ -11740,6 +11743,17 @@ class PB1Engine:
         if sid != 1 or qty <= 0:
             return None
         session_blocked, session_block_reason = self._is_session_sell_blocked(code)
+        if (
+            session_block_reason == "KIS_NO_SELLABLE_QTY"
+            and int(pos.get("orderable_qty") or 0) > 0
+            and int(pos.get("kis_qty") or 0) > 0
+        ):
+            # A subsequent fresh holding context permits a retry; a prior
+            # pre-submit zero is not evidence of a live broker SELL.
+            self._session_sell_blocked_codes.pop(code, None)
+            self._session_no_sellable_codes.pop(code, None)
+            self.no_sellable_qty_terminal_codes.discard(display_code)
+            session_blocked, session_block_reason = False, ""
         if session_blocked:
             logger.info(
                 "[SELL_SESSION_BLOCK][SKIP] code=%s reason=%s action=skip_resubmit",
@@ -11754,6 +11768,7 @@ class PB1Engine:
                 "exit_ok": False,
                 "submitted": 0,
                 "submit_attempted": 0,
+                "terminal_event": "FINAL_SKIP",
                 "order_result": "ORDER_SKIPPED_SESSION_BLOCKED",
                 "order_skip_reasons": [session_block_reason or "SESSION_SELL_BLOCKED"],
             }
@@ -12402,6 +12417,7 @@ class PB1Engine:
         )
         exit_eval_payload.update(
             {
+                "terminal_event": "FINAL_SKIP",
                 "signal_hit": signal_hit,
                 "eval_reason": eval_reason,
                 "router_reason": _router_reason,

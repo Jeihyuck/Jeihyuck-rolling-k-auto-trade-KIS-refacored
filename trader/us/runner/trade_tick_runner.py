@@ -1366,8 +1366,10 @@ def run_trade_tick(
     finally:
         tick_context.metrics["position_reconcile_ms"] = (time.monotonic() - _position_reconcile_started) * 1000.0
     
-    # reconcile CONTRACT_ERROR 또는 block_new_entry=True이면 신규 BUY 차단
-    if recon.get("block_new_entry", False) or recon.get("status") == "CONTRACT_ERROR":
+    # A malformed reconcile result cannot safely identify holdings.  A normal
+    # balance degradation, however, only fences entries: persisted holdings
+    # must remain eligible for exit monitoring.
+    if recon.get("status") == "CONTRACT_ERROR":
         last_stage = "reconcile"
         reconcile_reason = recon.get("reason", "balance_position_parse_error")
         logger.error(
@@ -1406,6 +1408,13 @@ def run_trade_tick(
             "temp_error_count": temp_error_count,
             "temp_recovered_count": temp_recovered_count,
         }
+    if recon.get("block_new_entry", False):
+        entry_can_proceed = False
+        logger.warning(
+            "[US_RECONCILE][BLOCK_NEW_ENTRY] reason=%s status=%s action=entry_block_exit_allowed",
+            recon.get("reason", "balance_position_parse_error"),
+            recon.get("status", "UNKNOWN"),
+        )
     
     # Extract position_symbols from reconcile result
     current_position_symbols: set[str] = set(recon.get("position_symbols", []))
@@ -1656,41 +1665,22 @@ def run_trade_tick(
     )
     if ack_order_block:
         logger.warning("[US_SAFETY][ORDER_BLOCK] reason=unresolved_ack_exists pending=%d unresolved=%d", pending_ack_count, unresolved_ack_count)
-    if reconcile_only_until_clean or ack_order_block:
-        reason = str(ack_gate["reason"] or "unresolved_ack_exists")
-        logger.warning("[US_ORDER][ROUTE][SKIP] reason=reconcile_only_until_clean")
-        reconcile_only_clean_at = (
-            _write_reconcile_only_clean_marker(trade_date=trade_date, session=session, tick_index=tick_index)
-            if reconcile_only_clean else ""
+    reconcile_entry_block = bool(reconcile_only_until_clean or ack_order_block)
+    if reconcile_entry_block:
+        entry_can_proceed = False
+        logger.warning("[US_ORDER][ENTRY_SKIP] reason=%s; exits remain routable",
+                       ack_gate["reason"] or "unresolved_ack_exists")
+    if reconcile_only_clean and not recon_positions:
+        _write_reconcile_only_clean_marker(
+            trade_date=trade_date, session=session, tick_index=tick_index,
         )
         return {
-            "status": "OK_RECONCILE_ONLY_CLEAN" if reconcile_only_clean else "OK_RECONCILE_ONLY_PENDING",
-            "severity": "OK" if reconcile_only_clean else "DEGRADED",
-            "allow_new_orders": False,
-            "session_should_continue": True,
-            "reason": reason,
-            "session": session,
-            "orders": [], "ack": 0, "dry_run": 0, "blocked": 0, "signal_only": 0,
-            "errors": 0, "trade_date": trade_date, "fills": len(fills_today),
-            "positions": len(recon_positions), "orders_sent": 0,
-            "prior_failed_orders_reconcile_required": int(prior_failed_orders_reconcile_required),
-            "reconcile_only_until_clean": int(reconcile_only_until_clean),
-            "reconcile_only_clean": int(reconcile_only_clean),
-            "reconcile_only_clean_at": reconcile_only_clean_at,
-            "reconcile_only_clean_session": session if reconcile_only_clean else "",
-            "reconcile_only_clean_tick": int(tick_index) if reconcile_only_clean else 0,
-            "pending_ack_count": pending_ack_count,
-            "unresolved_ack_count": unresolved_ack_count,
-            "open_order_pending_count": open_order_pending_count,
-            "unresolved_error_count": unresolved_error_count,
-            "blocked_new_orders_due_to_reconcile": 1,
-            "last_unresolved_symbols": (ack_recon.get("symbols_by_status") or {}).get("unresolved", []),
-            "last_open_order_pending_symbols": ack_gate["last_open_order_pending_symbols"],
-            "last_unresolved_error_symbols": ack_gate["last_unresolved_error_symbols"],
-            "last_unresolved_order_nos": ack_recon.get("unresolved_order_nos", []),
-            "manual_reconcile_required": ack_gate["manual_reconcile_required"],
-            "ack_reconcile_before_route_status": ack_recon.get("status"),
-            "ack_pending_reconcile_count": pending_ack_count,
+            "status": "OK_RECONCILE_ONLY_CLEAN", "severity": "OK",
+            "allow_new_orders": False, "session_should_continue": True,
+            "reason": str(ack_gate["reason"] or "reconcile_only_until_clean"),
+            "orders": [], "orders_sent": 0, "session": session,
+            "trade_date": trade_date, "reconcile_only_until_clean": 1,
+            "reconcile_only_clean": 1,
         }
 
     # reconcile log DB 저장
@@ -2197,10 +2187,10 @@ def run_trade_tick(
         entry_degraded = True
         entry_degraded_reason = "DAILY_NOTIONAL_UNAVAILABLE"
         logger.error("[US_ENTRY][BLOCK] reason=DAILY_NOTIONAL_UNAVAILABLE error=%s", daily_notional_load_error)
-    elif not entry_can_proceed:
+    elif reconcile_entry_block or not entry_can_proceed:
         entry_degraded = True
-        entry_degraded_reason = "entry_can_proceed_false"
-        logger.info("[US_ENTRY][SKIP] session=%s tick=%s reason=entry_can_proceed_false", session, tick_index)
+        entry_degraded_reason = str(ack_gate["reason"] or "entry_can_proceed_false") if reconcile_entry_block else "entry_can_proceed_false"
+        logger.info("[US_ENTRY][SKIP] session=%s tick=%s reason=%s", session, tick_index, entry_degraded_reason)
     elif after_cutoff:
         last_stage = "entry_cutoff_guard"
         logger.info(

@@ -48,6 +48,18 @@ def _positive_float(value: object) -> float | None:
     return number if number > 0 else None
 
 
+def _order_lifecycle_truth(status: str, timeline: dict) -> dict[str, bool]:
+    """Report only broker-confirmed terminal lifecycle facts."""
+    normalized = str(status or "").upper()
+    return {
+        "acknowledged": normalized in {"ACK", "ACKED", "ACCEPTED", "FILLED", "PARTIALLY_FILLED"},
+        "open": normalized in {"OPEN", "PENDING", "PARTIALLY_FILLED"},
+        "partially_filled": normalized == "PARTIALLY_FILLED",
+        "filled": normalized == "FILLED",
+        "cancelled": normalized == "CANCELLED" or str(timeline.get("broker_status") or "").upper() == "CANCELLED",
+    }
+
+
 def _sell_audit_pnl(order: dict, meta: dict, timeline: dict, status: str) -> dict:
     """Calculate reportable filled-SELL PnL when journal metadata is incomplete."""
     fill_price = _positive_float(timeline.get("fill_price"))
@@ -824,6 +836,7 @@ def run_daily_report(
                             "submitted_at": timeline.get("submitted_at"),
                             "acknowledged_at": timeline.get("acknowledged_at"), "filled_at": timeline.get("filled_at"),
                             "session_revision": meta.get("session_revision") or report.get("commit_sha"),
+                            "lifecycle": _order_lifecycle_truth(status, timeline),
                         })
                         reason = str((meta.get("reason") if isinstance(meta, dict) else "") or order.get("reason") or "")
                         reason_counts = report.setdefault("blocked_entry_reason_counts", {})

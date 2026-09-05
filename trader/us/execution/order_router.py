@@ -463,12 +463,10 @@ def enrich_sell_exchange(intent: dict, kis_client: Any = None, context: Any = No
         except Exception as exc:
             logger.warning("[US_EXIT_INTENT][EXCHANGE_LOOKUP_WARN] symbol=%s err=%s", symbol, exc)
     try:
-        from trader.us.symbols import resolve_exchange
-        candidates.append(resolve_exchange(symbol))
+        from trader.us.symbols import resolve_order_exchange
+        candidates.append(resolve_order_exchange(symbol))
     except Exception:
         pass
-    static_map = {"SPY": "NYSE", "DIA": "NYSE", "IWM": "NYSE", "QQQ": "NASDAQ", "QQQM": "NASDAQ", "SMH": "NASDAQ", "SOXX": "NASDAQ"}
-    candidates.append(static_map.get(symbol, ""))
     for ex in candidates:
         ex = _normalize_exchange_code(ex)
         if ex:

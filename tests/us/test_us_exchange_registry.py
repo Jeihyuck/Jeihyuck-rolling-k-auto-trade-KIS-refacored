@@ -174,3 +174,66 @@ def test_all_prep_benchmarks_resolve():
 
     benchmarks = {"SPY", "QQQ", "QQQM", "SMH", "SOXX", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"}
     assert {resolve_exchange(symbol) for symbol in benchmarks} <= {"NASDAQ", "NYSE", "AMEX"}
+
+
+def test_us_etf_exchange_registry_single_source_of_truth():
+    from trader.us.symbols import (
+        ETF_EXCHANGE_METADATA, get_symbol_exchange_metadata,
+        resolve_exchange, resolve_order_exchange, resolve_quote_exchange,
+    )
+
+    symbols = ("SPY", "QQQ", "QQQM", "DIA", "IWM", "RSP", "SMH", "SOXX",
+               "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")
+    for symbol in symbols:
+        meta = get_symbol_exchange_metadata(symbol)
+        assert symbol in ETF_EXCHANGE_METADATA
+        assert set(meta) == {"canonical_exchange", "quote_exchange", "order_exchange"}
+        assert resolve_exchange(symbol) == meta["canonical_exchange"]
+        assert resolve_quote_exchange(symbol) == meta["quote_exchange"]
+        assert resolve_order_exchange(symbol) == meta["order_exchange"]
+
+    from trader.us import market_state_overlay, watchlist_builder
+    from trader.us.execution import order_router
+    assert not hasattr(watchlist_builder, "ETF_EXCHANGE_MAP")
+    assert not hasattr(market_state_overlay, "_MARKET_RETURN_EXCHANGE_MAP")
+    assert "static_map" not in order_router.enrich_sell_exchange.__code__.co_names
+
+
+def test_us_spy_resolves_correct_kis_quote_code():
+    from trader.us.symbols import (
+        resolve_exchange, resolve_order_exchange, resolve_order_exchange_code,
+        resolve_quote_exchange, resolve_quote_exchange_code,
+    )
+    assert resolve_exchange("SPY") == "NYSE"
+    assert resolve_quote_exchange("SPY") == "AMEX"
+    assert resolve_quote_exchange_code("SPY") == "AMS"
+    assert resolve_order_exchange("SPY") == "NYSE"
+    assert resolve_order_exchange_code("SPY") == "NYSE"
+
+
+def test_us_sector_etfs_resolve_correct_kis_quote_codes():
+    from trader.us.symbols import resolve_exchange, resolve_order_exchange, resolve_quote_exchange_code
+    symbols = ("XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")
+    assert {resolve_exchange(symbol) for symbol in symbols} == {"NYSE"}
+    assert {resolve_order_exchange(symbol) for symbol in symbols} == {"NYSE"}
+    assert {resolve_quote_exchange_code(symbol) for symbol in symbols} == {"AMS"}
+
+
+def test_us_spy_sell_order_uses_order_exchange_not_quote_exchange():
+    from trader.us.execution.order_router import enrich_sell_exchange
+    intent = {"symbol": "SPY", "side": "SELL"}
+    assert enrich_sell_exchange(intent) == "NYSE"
+    assert intent["exchange"] == "NYSE"
+
+
+def test_us_benchmark_failure_degrades_entry_not_exit():
+    from trader.us.runner.trade_tick_runner import evaluate_balance_error_circuit
+    from trader.us.watchlist_builder import _build_rotation_context
+
+    class Provider:
+        def get_daily_prices(self, _symbol, _exchange, **_kwargs):
+            raise RuntimeError("quote unavailable")
+
+    context = _build_rotation_context(Provider(), [], "2026-09-05")
+    assert context["benchmark_data_quality"] == "degraded"
+    assert evaluate_balance_error_circuit(20)["exit_can_proceed"] is True

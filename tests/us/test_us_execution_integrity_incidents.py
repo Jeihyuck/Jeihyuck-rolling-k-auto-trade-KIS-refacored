@@ -138,6 +138,33 @@ def test_three_exchange_balance_timeouts_share_one_stage_budget(monkeypatch):
     assert set(result["failed_exchanges"]) == {"NASD", "NYSE", "AMEX"}
 
 
+def test_us_three_exchange_balance_respects_shared_stage_budget(monkeypatch):
+    """The three-exchange sweep must leave the dedicated exit-routing reserve."""
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "10")
+    monkeypatch.setenv("US_SELL_ROUTING_RESERVE_SEC", "3")
+    client._tick_context = type("Tick", (), {"remaining_sec": lambda self: 4})()
+    observed = []
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", lambda exchange: (
+        observed.append(client._stage_deadline - time.monotonic()) or {"output1": [], "output2": {}}
+    ))
+
+    result = client.get_us_balance(force_refresh=True)
+
+    assert result["balance_complete"] is True
+    assert observed and 0.8 <= observed[0] <= 1.1
+
+
+def test_us_sell_routing_has_reserved_deadline_budget(monkeypatch):
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "30")
+    monkeypatch.setenv("US_SELL_ROUTING_RESERVE_SEC", "2")
+    client._tick_context = type("Tick", (), {"remaining_sec": lambda self: 2})()
+
+    with pytest.raises(KisUSTemporaryError, match="budget exhausted"):
+        client.get_us_balance(force_refresh=True)
+
+
 def test_partial_exchange_balance_is_not_cached_or_authoritative(monkeypatch):
     from trader.us.execution.reconcile import reconcile_positions
     client = KisUSClient(offline=False)
@@ -167,6 +194,76 @@ def test_partial_exchange_balance_is_not_cached_or_authoritative(monkeypatch):
     assert reconciled["preserve_previous_positions"] is True
     assert reconciled["authoritative_positions"] is False
     assert reconciled["positions"] == []
+
+
+def test_us_partial_balance_never_overwrites_last_good_authoritative_snapshot(monkeypatch):
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "1")
+    responses = iter([
+        {"output1": [{"ovrs_pdno": "HELD", "ovrs_cblc_qty": "1"}], "output2": {}},
+        KisUSTemporaryError("exchange timeout"),
+    ])
+    def exchange(_exchange):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", exchange)
+    monkeypatch.setenv("US_BALANCE_EXCHANGES", "NASD")
+    full = client.get_us_balance(force_refresh=True)
+    monkeypatch.setenv("US_BALANCE_EXCHANGES", "NASD,NYSE")
+    partial = client.get_us_balance(force_refresh=True)
+
+    assert full["balance_authoritative"] is True
+    assert partial["balance_authoritative"] is False
+    assert client._response_cache[("balance", ("NASD",))][1] is full
+
+
+def test_us_unknown_balance_is_not_zero_position():
+    from trader.us.execution.reconcile import reconcile_positions
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {"positions": [], "balance_complete": False, "balance_authoritative": False}
+
+    result = reconcile_positions(provider=Provider(), trade_date="2026-09-01")
+    assert result["authoritative_positions"] is False
+    assert result["preserve_previous_positions"] is True
+    assert result["positions"] == []
+
+
+def test_us_balance_timeout_blocks_buy_but_preserves_exit_monitoring():
+    from trader.us.execution.reconcile import reconcile_positions
+
+    class Provider:
+        def get_balance(self, force_refresh=False):
+            return {
+                "positions": [{"symbol": "HELD", "qty": 1}],
+                "balance_complete": False,
+                "balance_authoritative": False,
+            }
+
+    result = reconcile_positions(provider=Provider(), trade_date="2026-09-01")
+    assert result["block_new_entry"] is True
+    assert result["preserve_previous_positions"] is True
+
+
+def test_us_low_budget_exit_does_not_require_full_three_exchange_scan(monkeypatch):
+    client = KisUSClient(offline=False)
+    monkeypatch.setenv("US_BALANCE_FETCH_BUDGET_SEC", "30")
+    monkeypatch.setenv("US_SELL_ROUTING_RESERVE_SEC", "1")
+    client._tick_context = type("Tick", (), {
+        "remaining_sec": lambda self: 2,
+        "exchange_by_symbol": {"HELD": "NYSE"},
+    })()
+    queried = []
+    monkeypatch.setattr(client, "_get_us_balance_single_exchange", lambda exchange: (
+        queried.append(exchange) or {"output1": [], "output2": {}}
+    ))
+
+    client.get_us_balance(force_refresh=True)
+
+    assert queried == ["NYSE"]
 
 
 def test_balance_stage_overrides_restore_after_unexpected_processing_error(monkeypatch):

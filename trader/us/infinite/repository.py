@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -99,6 +99,90 @@ class InfiniteRepository:
             """), {"trade_date": trade_date, "symbol": symbol}).mappings()
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
+
+    def load_open_orders(self, *, symbol: str, cycle_id: str, side: str | None = None) -> list[dict]:
+        """Load unresolved orders only for this Infinite cycle.
+
+        PostgreSQL cannot infer a type from a nullable optional filter reliably,
+        so the unfiltered and side-filtered queries deliberately have separate
+        bind sets.
+        """
+        params = {
+            "symbol": symbol,
+            "cycle_prefix": f"TQQQ_INF_V3:{cycle_id}:%",
+        }
+        sql = """
+            SELECT * FROM us_orders
+            WHERE symbol=:symbol AND client_order_key LIKE :cycle_prefix
+              AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
+                             'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
+        """
+        if side is not None:
+            sql += " AND side=:side"
+            params["side"] = str(side).upper()
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+
+    def load_expired_open_buy_orders(self, *, now: datetime, ttl_seconds: int,
+                                     symbol: str = "TQQQ") -> list[dict]:
+        """Return only this sleeve's unresolved BUYs whose broker TTL elapsed."""
+        cutoff = now - timedelta(seconds=max(0, int(ttl_seconds)))
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT * FROM us_orders
+                WHERE symbol=:symbol AND side='BUY'
+                  AND client_order_key LIKE 'TQQQ_INF_V3:%'
+                  AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
+                                 'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
+                  AND created_at <= :cutoff
+                ORDER BY created_at ASC
+            """), {"symbol": symbol, "cutoff": cutoff}).mappings().all()
+        return [dict(row) for row in rows]
+
+    def mark_ttl_cancel_requested(self, order: dict, *, requested_at: datetime,
+                                   cancel_result: dict | None = None) -> None:
+        """Journal a cancel request without treating its acknowledgement as terminal."""
+        key = str(order.get("client_order_key") or "")
+        trade_date = str(order.get("trade_date") or "")
+        if not key or not trade_date:
+            raise ValueError("TTL cancel request requires original order identity")
+        patch = json.dumps({
+            "tqqq_ttl_cancel_requested_at": requested_at.isoformat(),
+            "tqqq_ttl_cancel_order_no": str(order.get("order_no") or ""),
+            "tqqq_ttl_cancel_result": cancel_result or {},
+        }, default=str)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE us_orders
+                SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
+                WHERE trade_date=:trade_date AND client_order_key=:key
+            """), {"patch": patch, "trade_date": trade_date, "key": key})
+
+    def apply_ttl_terminal_observation(self, order: dict, observation: dict) -> dict:
+        """Persist only broker-confirmed terminal truth for the original order."""
+        from trader.us.db.repos import apply_broker_order_observation
+        from trader.us.utils.order_no import normalize_us_order_no
+
+        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if status not in {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}:
+            return {"status": "PENDING"}
+        requested = int(order.get("qty_requested") or order.get("qty") or 0)
+        filled = int(observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0)
+        return apply_broker_order_observation(
+            trade_date=str(order["trade_date"]),
+            client_order_key=str(order["client_order_key"]),
+            raw_order_no=str(order["order_no"]),
+            canonical_order_no=normalize_us_order_no(str(order["order_no"])),
+            symbol=str(order["symbol"]),
+            side="BUY",
+            requested_qty=requested,
+            filled_qty=filled,
+            remaining_qty=max(0, requested - filled),
+            broker_status=status,
+            evidence_type="TQQQ_TTL_BROKER_REQUERY",
+            observed_at=observation.get("observed_at"),
+            raw_row=observation,
+        )
 
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
         """Capital reserved by unresolved BUY ACK/pending quantities."""
@@ -330,7 +414,14 @@ class InfiniteRepository:
                                  or state.metadata.get("last_buy_fill_price"))
         metadata = {**state.metadata, "last_buy_fill_price": actual_last_buy_price,
                     "broker_qty": broker_qty, "broker_average_price": broker_average_price}
-        if stats.get("last_profit_stage"):
+        pending_stage = str(state.metadata.get("pending_profit_stage") or "").upper()
+        filled_stage = str(stats.get("last_profit_stage") or "").upper()
+        terminal_pending_profit = (
+            pending_stage.endswith("_SUBMITTED")
+            and filled_stage.endswith("_FILLED")
+            and pending_stage.removesuffix("_SUBMITTED") == filled_stage.removesuffix("_FILLED")
+        )
+        if terminal_pending_profit:
             metadata.update(profit_stage=stats["last_profit_stage"], pending_profit_stage=None)
         if actual_last_buy_price:
             metadata.update(buy_reference_price=actual_last_buy_price,
@@ -353,6 +444,10 @@ class InfiniteRepository:
                 remaining -= int(is_us_trading_day(cooldown_until))
             metadata.update(rebound_probe_date=probe_fill_date.isoformat(),
                             rebound_cooldown_until=cooldown_until.isoformat())
+        status = (
+            Status.ACTIVE if state.status == Status.EXIT_PENDING and broker_qty > 0
+            and terminal_pending_profit else state.status
+        )
         return replace(state, core_filled_notional=core, reserve_filled_notional=reserve,
                        last_buy_date=last_buy or state.last_buy_date, anchor_price=anchor,
-                       cycle_age_trading_days=age, metadata=metadata)
+                       cycle_age_trading_days=age, status=status, metadata=metadata)

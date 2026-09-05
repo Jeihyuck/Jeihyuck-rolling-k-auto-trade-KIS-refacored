@@ -441,17 +441,33 @@ class KisUSClient:
         exchanges = [e.strip().upper() for e in exchanges_env.split(",") if e.strip()]
         if not exchanges:
             exchanges = ["NASD", "NYSE", "AMEX"]
-        
+        configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
+        tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
+        # Balance is a pre-routing stage.  Preserve a dedicated portion of the
+        # shared tick deadline for exit routing instead of allowing the three
+        # exchange sweep to consume it all.
+        reserve = max(0.05, float(os.getenv(
+            "US_SELL_ROUTING_RESERVE_SEC",
+            os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1"),
+        )))
+        exchange_by_symbol = getattr(self._tick_context, "exchange_by_symbol", {})
+        if tick_remaining < configured_budget + reserve and exchange_by_symbol:
+            exchange_map = {"NASDAQ": "NASD", "NYSE": "NYSE", "AMEX": "AMEX"}
+            targeted = {
+                exchange_map.get(str(exchange).upper(), str(exchange).upper())
+                for exchange in exchange_by_symbol.values()
+            }
+            targeted &= set(exchanges)
+            if targeted:
+                exchanges = [exchange for exchange in exchanges if exchange in targeted]
+                logger.info("[US_BALANCE][TARGETED_EXIT_REFRESH] exchanges=%s", exchanges)
+
         cache_key = ("balance", tuple(exchanges))
         ttl = float(os.getenv("US_KIS_BALANCE_CACHE_TTL_SEC", "30") or 30)
         cached = self._response_cache.get(cache_key)
         if cached and not force_refresh and time.time() - cached[0] <= ttl and os.getenv("US_KIS_FORCE_BALANCE_REFRESH", "0") not in {"1", "true", "True"}:
             logger.debug("[US_KIS][CACHE_HIT] endpoint=GET_inquire-balance ttl=%.1f", ttl)
             return cached[1]
-
-        configured_budget = max(0.1, float(os.getenv("US_BALANCE_FETCH_BUDGET_SEC", "30")))
-        tick_remaining = float("inf") if self._tick_context is None else self._tick_context.remaining_sec()
-        reserve = max(0.05, float(os.getenv("US_BALANCE_FETCH_RESERVE_SEC", "1")))
         balance_budget = min(configured_budget, max(0.0, tick_remaining - reserve))
         if balance_budget <= 0:
             raise KisUSTemporaryError("balance stage budget exhausted before fetch")
@@ -521,8 +537,12 @@ class KisUSClient:
         
             # symbol 중복 병합
             raw_count = sum(exchange_result_counts.values())
+            self._balance_conflicts = []
             merged_output1 = self._merge_duplicate_symbols(merged_output1)
             duplicate_skipped = max(0, raw_count - len(merged_output1))
+            balance_conflicts = list(self._balance_conflicts)
+            if balance_conflicts:
+                failed_exchanges["BALANCE_CONFLICT"] = ",".join(balance_conflicts)
         
             logger.info(
                 "[US_BALANCE][MERGED] raw_count=%d unique_symbols=%d duplicate_skipped=%d symbols=%s",
@@ -545,6 +565,7 @@ class KisUSClient:
                 "balance_authoritative": balance_complete,
                 "raw_count": raw_count,
                 "duplicate_skipped": duplicate_skipped,
+                "balance_conflicts": balance_conflicts,
             }
             # Never replace the last-good full snapshot with partial/uncertain data.
             if balance_complete:
@@ -767,6 +788,13 @@ class KisUSClient:
             )
 
             if existing_exchange == exchange and exchange:
+                if str(existing_qty_raw).strip() != str(qty_raw).strip() or (
+                    str(existing.get("pchs_avg_pric") or existing.get("pchs_avg_price") or "0").strip()
+                    != str(avg_price_raw).strip()
+                ):
+                    conflicts = getattr(self, "_balance_conflicts", None)
+                    if isinstance(conflicts, list):
+                        conflicts.append(symbol)
                 logger.warning(
                     "[US_BALANCE][DUPLICATE_SYMBOL_SAME_EXCHANGE_SKIP]"
                     " symbol=%s exchange=%s existing_qty=%s duplicate_qty=%s",

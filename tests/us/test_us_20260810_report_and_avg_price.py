@@ -34,3 +34,41 @@ def test_kis_balance_raw_average_is_resolved_at_profit_capture_boundary():
     }, now=now)
     assert str(value) == "81.25"
     assert meta["broker_avg_price_source"] == "kis_pchs_avg_pric"
+
+
+def test_broker_average_without_asof_uses_position_fallback():
+    position = {
+        "symbol": "HELD", "qty": 1, "orderable_qty": 1,
+        "position_lifecycle_id": "position-1",
+        "broker_avg_price": "100", "broker_avg_price_currency": "USD",
+        "avg_price_usd": "101",
+    }
+    value, meta = authoritative_broker_avg(position)
+    assert str(value) == "101"
+    assert meta["broker_avg_price_source"] == "fallback_avg_price_usd"
+
+
+def test_us_profit_capture_authoritative_broker_avg_contract():
+    now = datetime.now(timezone.utc)
+    value, meta = authoritative_broker_avg({
+        "symbol": "HELD", "qty": 1, "orderable_qty": 1, "position_lifecycle_id": "life",
+        "avg_price_usd": "100", "balance_source": "kis_balance_authoritative",
+        "authoritative_positions": True,
+    }, now=now)
+    assert str(value) == "100"
+    assert meta["authoritative_positions"] is True
+
+
+def test_us_profit_capture_unknown_avg_blocks_symbol_not_session():
+    from trader.us.market_state_overlay import build_profit_capture_intents
+
+    now = datetime.now(timezone.utc)
+    positions = [
+        {"symbol": "BAD", "qty": 5, "orderable_qty": 5, "current_price": 110,
+         "position_lifecycle_id": "bad-life"},
+        {"symbol": "GOOD", "qty": 5, "orderable_qty": 5, "current_price": 110,
+         "avg_price_usd": 100, "position_lifecycle_id": "good-life",
+         "broker_avg_price_asof": now.isoformat(), "broker_avg_price_currency": "USD"},
+    ]
+    intents = build_profit_capture_intents(positions, {"profit_capture_enabled": True}, now=now)
+    assert all(intent["symbol"] != "BAD" for intent in intents)

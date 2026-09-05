@@ -53,6 +53,32 @@ def test_shadow_computes_but_submits_zero_orders(monkeypatch):
     assert routed == []
 
 
+def test_tqqq_run_sleeve_reaches_strategy_evaluate_after_open_order_check(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    repo = FakeRepository(InfiniteState(cycle_id="cycle-1"))
+    seen = []
+    repo.load_open_orders = lambda **kwargs: (seen.append(kwargs) or [])
+    monkeypatch.setattr(
+        "trader.us.infinite.integration.evaluate",
+        lambda **kwargs: (seen.append("evaluate") or type("Decision", (), {
+            "action": type("Action", (), {"value": "HOLD"})(), "metadata": {},
+            "notional": 0, "reason": "test", "qty": 0,
+        })()),
+    )
+    run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
+               overlay=market(), repository=repo, route=lambda _intent: None)
+    assert seen == [{"symbol": "TQQQ", "cycle_id": "cycle-1"}, "evaluate"]
+
+
+def test_tqqq_open_order_check_does_not_isolated_exception(monkeypatch):
+    monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
+    repo = FakeRepository(InfiniteState(cycle_id="cycle-1"))
+    repo.load_open_orders = lambda **kwargs: []
+    result = run_sleeve(positions=[], price=50, trading_date=date(2026, 8, 11),
+                        overlay=market(), repository=repo, route=lambda _intent: {"status": "ACK"})
+    assert result["decision"] is not None
+
+
 def test_order_mode_uses_injected_existing_router_once(monkeypatch):
     monkeypatch.setenv("US_TQQQ_INFINITE_ENABLED", "1")
     monkeypatch.setenv("US_TQQQ_INFINITE_REAL_ORDER", "1")

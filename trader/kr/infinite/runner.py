@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
@@ -104,6 +105,13 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # without a broker id is deliberately retained and never blindly retried.
         state, updates = _reconcile_pending(repository, executor, state, day)
         position = executor.position(config.symbol)
+        if not math.isfinite(position.current_price) or position.current_price <= 0:
+            if state is not None and updates:
+                repository.persist_reconciliation(state, updates)
+            decision = Decision(Action.BLOCK, "KR_INF_QUOTE_INVALID",
+                                next_status=state.status if state else Status.READY)
+            log_decision(decision=decision.action.value, reason=decision.reason, symbol=config.symbol)
+            return RunResult(decision, state)
         if state is None and position.qty > 0:
             state = State(status=Status.ACTIVE, cycle_id=f"BROKER_ADOPTION-{day.isoformat()}",
                           cycle_start_date=day,
