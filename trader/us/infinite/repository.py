@@ -100,6 +100,29 @@ class InfiniteRepository:
             sides = {str(r["side"]).upper() for r in rows if str(r["status"]).upper() in _PENDING}
         return "BUY" in sides, "SELL" in sides
 
+    def load_open_orders(self, *, symbol: str, cycle_id: str, side: str | None = None) -> list[dict]:
+        """Load unresolved orders only for this Infinite cycle.
+
+        PostgreSQL cannot infer a type from a nullable optional filter reliably,
+        so the unfiltered and side-filtered queries deliberately have separate
+        bind sets.
+        """
+        params = {
+            "symbol": symbol,
+            "cycle_prefix": f"TQQQ_INF_V3:{cycle_id}:%",
+        }
+        sql = """
+            SELECT * FROM us_orders
+            WHERE symbol=:symbol AND client_order_key LIKE :cycle_prefix
+              AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
+                             'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
+        """
+        if side is not None:
+            sql += " AND side=:side"
+            params["side"] = str(side).upper()
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
         """Capital reserved by unresolved BUY ACK/pending quantities."""
         with self.engine.connect() as conn:

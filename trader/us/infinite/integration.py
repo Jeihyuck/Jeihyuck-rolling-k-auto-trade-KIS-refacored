@@ -197,7 +197,12 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
                 state = replace(state, cycle_id=str(uuid.uuid4()), cycle_start_date=state.last_buy_date or trading_date,
                                 status=Status.ACTIVE)
             repository.save_state(state)
-        pending_buy, pending_sell = repository.pending_sides(trading_date, config.symbol)
+        if state.cycle_id and hasattr(repository, "load_open_orders"):
+            open_orders = repository.load_open_orders(symbol=config.symbol, cycle_id=state.cycle_id)
+            open_sides = {str(order.get("side") or "").upper() for order in open_orders}
+            pending_buy, pending_sell = "BUY" in open_sides, "SELL" in open_sides
+        else:
+            pending_buy, pending_sell = repository.pending_sides(trading_date, config.symbol)
         pending_buy_notional = (repository.pending_buy_notional(trading_date, config.symbol)
                                 if hasattr(repository, "pending_buy_notional") else 0.0)
         daily = 0.0

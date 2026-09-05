@@ -163,6 +163,29 @@ def test_kr_infinite_terminal_partial_profit_sell_with_residual_rearms_cycle(arm
     assert kis.qty == 50
 
 
+def test_kr_infinite_profit_sell_ack_or_intermediate_fill_stays_pending(armed_practice_env):
+    for fill_qty in (0, 25):
+        kis = FakeKIS(qty=100, average=100, price=110, fill_qty=fill_qty)
+        repo = FakeRepository(active())
+        result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                          trade_date=DAY, kis_env="practice")
+        assert result.state.status == Status.EXIT_PENDING
+        assert result.state.metadata["pending_profit_stage"].endswith("_SUBMITTED")
+
+
+def test_kr_infinite_terminal_profit_fill_rearms_exactly_once(armed_practice_env):
+    kis = FakeKIS(qty=100, average=100, price=110, fill_qty=50)
+    repo = FakeRepository(active())
+    first = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                     trade_date=DAY, kis_env="practice")
+    kis.price = 100
+    second = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice")
+
+    assert first.state.status == second.state.status == Status.ACTIVE
+    assert len(kis.orders) == 1
+
+
 def test_kr_infinite_invalid_price_blocks_without_exception(armed_practice_env):
     kis, repo = FakeKIS(qty=100, average=100, price=0), FakeRepository(active())
 
@@ -195,6 +218,25 @@ def test_kr_infinite_recovers_on_next_valid_quote(armed_practice_env):
 
     assert result.decision.action == Action.SELL_PARTIAL
     assert kis.orders == [("SELL", 50)]
+
+
+def test_kr_infinite_invalid_price_reconciles_pending_without_new_order(armed_practice_env):
+    intent = OrderIntent(1, "KRINF-20260801-owned", DAY, "BUY", "pending-buy", 10,
+                         broker_order_id="O1", status="SUBMITTED", unit_sequence=2)
+    kis = FakeKIS(qty=10, average=100, price=0, fill_qty=10)
+    kis.inquire_daily_ccld = lambda **_kwargs: {"output1": [{
+        "odno": "O1", "pdno": "122630", "side": "BUY", "ord_qty": "10",
+        "tot_ccld_qty": "10", "avg_prvs": "100",
+    }]}
+    repo = FakeRepository(active(), [intent])
+
+    result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+                      trade_date=DAY, kis_env="practice")
+
+    assert result.decision.reason == "KR_INF_QUOTE_INVALID"
+    assert repo.intents[0].status == "FILLED"
+    assert result.state.units_used == 2
+    assert not kis.orders
 
 
 def test_unowned_existing_position_freezes_without_order():
