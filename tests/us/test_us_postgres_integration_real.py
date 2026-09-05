@@ -101,6 +101,24 @@ def test_real_postgres_reconcile_updates_actual_fill_with_typed_jsonb_binds(pg_e
     assert row["meta"]["requested_qty"] == 1
     assert row["meta"]["observed_at"]
 
+
+def test_tqqq_load_open_orders_side_filter_has_no_postgres_ambiguous_parameter(pg_engine):
+    """Optional fill identity filters must not rely on nullable SQL binds."""
+    from sqlalchemy import text
+    from trader.us.db import repos
+
+    with pg_engine.begin() as conn:
+        conn.execute(text("""INSERT INTO us_fills
+            (trade_date,symbol,exchange,side,qty,price_usd,order_no,client_order_key,filled_at,meta,fill_idempotency_key)
+            VALUES ('2026-09-04','TQQQ','NASDAQ','BUY',1,50,'tqqq-open','tqqq-key',now(),'{}'::jsonb,'tqqq-open-fill')"""))
+        result = repos._active_fill_cumulatives_for_order(
+            trade_date="2026-09-04", order_no="tqqq-open", client_order_key="",
+            symbol="TQQQ", side="", conn=conn,
+        )
+
+    assert result["actual"] == 1
+
+
 def test_real_postgres_promotion_regression_and_rollback(pg_engine):
     from sqlalchemy import text
     import trader.us.db.repos as repos

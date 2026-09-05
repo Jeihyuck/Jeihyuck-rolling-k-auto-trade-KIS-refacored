@@ -2071,12 +2071,21 @@ def _active_fill_cumulatives_for_order(*, trade_date: str, order_no: str, client
                     result["actual_individual"] += int(f.get("qty") or 0)
         return result
     if order_no:
-        rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
-            AND order_no=:order_no
-            AND (:symbol='' OR symbol=:symbol)
-            AND (:side='' OR side=:side)
-            AND COALESCE((meta->>'accounting_active')::boolean,true)"""),
-            {"td": trade_date, "order_no": order_no, "symbol": str(symbol).upper(), "side": str(side).upper()}).mappings().all()
+        clauses = [
+            "trade_date=:td", "order_no=:order_no",
+            "COALESCE((meta->>'accounting_active')::boolean,true)",
+        ]
+        params = {"td": trade_date, "order_no": order_no}
+        if symbol:
+            clauses.append("symbol=:symbol")
+            params["symbol"] = str(symbol).upper()
+        if side:
+            clauses.append("side=:side")
+            params["side"] = str(side).upper()
+        rows = conn.execute(
+            text(f"SELECT qty, meta FROM us_fills WHERE {' AND '.join(clauses)}"),
+            params,
+        ).mappings().all()
     else:
         rows = conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td
             AND client_order_key=:cok
