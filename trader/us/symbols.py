@@ -31,17 +31,33 @@ US_EXCHANGE_REGISTRY: dict[str, dict[str, str]] = {
     },
 }
 
+# ETF symbol-level exchange metadata.
+# Keep canonical/listing, KIS quote routing, and KIS order routing distinct.
+# Production benchmark data uses AMEX/AMS for NYSE/Arca-listed benchmark and
+# sector ETFs, while order routing remains on the canonical NYSE venue.
+ETF_EXCHANGE_METADATA: dict[str, dict[str, str]] = {
+    "SPY": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "DIA": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "IWM": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "RSP": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLK": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLI": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLF": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLV": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLP": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLU": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "XLE": {"canonical_exchange": "NYSE", "quote_exchange": "AMEX", "order_exchange": "NYSE"},
+    "QQQ": {"canonical_exchange": "NASDAQ", "quote_exchange": "NASDAQ", "order_exchange": "NASDAQ"},
+    "QQQM": {"canonical_exchange": "NASDAQ", "quote_exchange": "NASDAQ", "order_exchange": "NASDAQ"},
+    "SMH": {"canonical_exchange": "NASDAQ", "quote_exchange": "NASDAQ", "order_exchange": "NASDAQ"},
+    "SOXX": {"canonical_exchange": "NASDAQ", "quote_exchange": "NASDAQ", "order_exchange": "NASDAQ"},
+    "TQQQ": {"canonical_exchange": "NASDAQ", "quote_exchange": "NASDAQ", "order_exchange": "NASDAQ"},
+}
+
 # symbol → 기본 거래소 매핑 (known symbols)
 # 신규 심볼은 us_universe.yaml 로드 후 보완
 _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
-    # Core ETF
-    "SPY": "NYSE",
-    "QQQ": "NASDAQ",
-    # Dedicated Infinite sleeve instrument (canonical NASDAQ, KIS order NASD).
-    "TQQQ": "NASDAQ",
-    "QQQM": "NASDAQ",
-    "SMH": "NASDAQ",
-    "SOXX": "NASDAQ",
+    # Core ETF metadata lives in ETF_EXCHANGE_METADATA above.
     # Mega AI
     "NVDA": "NASDAQ",
     "MSFT": "NASDAQ",
@@ -98,9 +114,6 @@ _SYMBOL_EXCHANGE_MAP: dict[str, str] = {
     "DDOG": "NASDAQ", "INTC": "NASDAQ", "MDB": "NASDAQ", "MU": "NASDAQ",
     "PANW": "NASDAQ", "TXN": "NASDAQ",
     "PLTR": "NASDAQ",
-    "DIA": "NYSE", "IWM": "NYSE", "RSP": "NYSE",
-    "XLK": "NYSE", "XLI": "NYSE", "XLF": "NYSE", "XLV": "NYSE",
-    "XLP": "NYSE", "XLU": "NYSE", "XLE": "NYSE",
     # Verified listings used by the dynamic universe.  This is intentionally
     # explicit: an unknown US ticker must never silently become NASDAQ.
     "ADI": "NASDAQ", "APP": "NASDAQ", "ARM": "NASDAQ", "ASML": "NASDAQ",
@@ -207,17 +220,51 @@ def normalize_symbol(symbol: str) -> str:
     return normalized
 
 
-def resolve_exchange(symbol: str) -> str:
-    """심볼의 거래소를 반환. 미등록 심볼이면 ValueError."""
+def get_symbol_exchange_metadata(symbol: str) -> dict[str, str]:
+    """Return canonical, quote, and order exchange metadata for one symbol."""
     sym = normalize_symbol(symbol)
+    meta = ETF_EXCHANGE_METADATA.get(sym)
+    if meta is not None:
+        return dict(meta)
     exchange = _SYMBOL_EXCHANGE_MAP.get(sym)
     if exchange is None:
         raise ValueError(f"resolve_exchange: unknown symbol={sym!r}")
+    return {
+        "canonical_exchange": exchange,
+        "quote_exchange": exchange,
+        "order_exchange": exchange,
+    }
+
+
+def resolve_exchange(symbol: str) -> str:
+    """Return the canonical/listing exchange for a symbol."""
+    sym = normalize_symbol(symbol)
+    exchange = get_symbol_exchange_metadata(sym)["canonical_exchange"]
     import logging as _logging
     _logging.getLogger(__name__).debug(
         "[US_SYMBOLS][EXCHANGE_RESOLVE] symbol=%s exchange=%s", sym, exchange
     )
     return exchange
+
+
+def resolve_quote_exchange(symbol: str) -> str:
+    """Return the KIS quote-routing exchange for a symbol."""
+    return get_symbol_exchange_metadata(symbol)["quote_exchange"]
+
+
+def resolve_order_exchange(symbol: str) -> str:
+    """Return the KIS order-routing exchange for a symbol."""
+    return get_symbol_exchange_metadata(symbol)["order_exchange"]
+
+
+def resolve_quote_exchange_code(symbol: str) -> str:
+    """Return the KIS quote EXCD for a symbol."""
+    return get_quote_exchange_code(resolve_quote_exchange(symbol))
+
+
+def resolve_order_exchange_code(symbol: str) -> str:
+    """Return the KIS order exchange code for a symbol."""
+    return get_order_exchange_code(resolve_order_exchange(symbol))
 
 
 def get_quote_exchange_code(exchange: str) -> str:
@@ -241,7 +288,7 @@ def get_order_exchange_code(exchange: str) -> str:
 def reject_unknown_symbol(symbol: str) -> None:
     """심볼이 레지스트리에 없으면 ValueError 발생."""
     sym = normalize_symbol(symbol)
-    if sym not in _SYMBOL_EXCHANGE_MAP:
+    if sym not in ETF_EXCHANGE_METADATA and sym not in _SYMBOL_EXCHANGE_MAP:
         raise ValueError(f"reject_unknown_symbol: not in registry symbol={sym!r}")
 
 
@@ -256,7 +303,7 @@ def register_symbol(symbol: str, exchange: str) -> None:
 
 def list_known_symbols() -> list[str]:
     """등록된 모든 심볼 목록."""
-    return sorted(_SYMBOL_EXCHANGE_MAP.keys())
+    return sorted(set(_SYMBOL_EXCHANGE_MAP) | set(ETF_EXCHANGE_METADATA))
 
 
 def is_known_symbol(symbol: str) -> bool:
@@ -265,4 +312,4 @@ def is_known_symbol(symbol: str) -> bool:
         sym = normalize_symbol(symbol)
     except ValueError:
         return False
-    return sym in _SYMBOL_EXCHANGE_MAP
+    return sym in ETF_EXCHANGE_METADATA or sym in _SYMBOL_EXCHANGE_MAP
