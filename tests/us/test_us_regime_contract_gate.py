@@ -178,7 +178,7 @@ def test_degraded_benchmark_with_mild_weakness_not_crash():
     assert "DEGRADED_BENCHMARK_WITH_WEAK_INDEX" not in result["market_state_reasons"]
 
 
-def test_market_state_uses_canonical_exchange_registry_for_breadth_and_sector_etfs():
+def test_market_state_uses_symbol_quote_exchange_registry_for_breadth_and_sector_etfs():
     from trader.us.market_state_overlay import _market_returns
 
     calls = []
@@ -193,7 +193,7 @@ def test_market_state_uses_canonical_exchange_registry_for_breadth_and_sector_et
     call_map = dict(calls)
 
     for symbol in ("SPY", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"):
-        assert call_map[symbol] == "NYSE"
+        assert call_map[symbol] == "AMEX"
     for symbol in ("QQQ", "SMH"):
         assert call_map[symbol] == "NASDAQ"
 
