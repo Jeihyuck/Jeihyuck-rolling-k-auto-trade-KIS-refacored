@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from trader.us.rotation import AI_CLUSTERS, theme_cluster_for
-from trader.us.symbols import resolve_exchange
+from trader.us.symbols import resolve_quote_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +172,7 @@ def _market_returns(provider: Any, trade_date: str, warnings: list[str]) -> dict
     out: dict[str, float | None] = {}
     qqq_closes: list[float] = []
     for sym in _MARKET_RETURN_SYMBOLS:
-        exchange = resolve_exchange(sym)
+        exchange = resolve_quote_exchange(sym)
         rows = None
         try:
             if isinstance(provider, dict):
@@ -238,7 +238,7 @@ def _intraday_rebound(provider: Any, rets: dict[str, float | None], warnings: li
                 quotes = provider.get("intraday_quotes") or provider.get("quotes") or {}
                 quote = quotes.get(sym) or quotes.get(sym.lower())
             elif callable(getattr(provider, "get_current_price", None)):
-                quote = provider.get_current_price(sym, resolve_exchange(sym))
+                quote = provider.get_current_price(sym, resolve_quote_exchange(sym))
         except Exception as exc:
             warnings.append(f"intraday_rebound_fetch_failed:{sym}:{exc}")
         quote = quote if isinstance(quote, dict) else {}
