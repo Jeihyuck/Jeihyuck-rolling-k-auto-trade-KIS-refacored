@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from trader.pb1_engine import PB1Engine
 from trader.kr.pb1.exit_family import normalize_entry_reason, resolve_exit_family
 
 
@@ -27,3 +28,17 @@ def test_resolve_exit_family_maps_breakout_pullback_momentum():
 def test_resolve_exit_family_falls_back_to_generic_exit():
     assert resolve_exit_family("other", None) == ("ENTRY_GENERIC", "GENERIC_EXIT")
     assert resolve_exit_family(None, None) == ("ENTRY_GENERIC", "GENERIC_EXIT")
+
+
+def test_pb1engine_resolve_exit_family_preserves_baseline_aliases():
+    assert PB1Engine._resolve_exit_family("BREAKOUT", None) == ("ENTRY_BREAKOUT", "BREAKOUT_EXIT")
+    assert PB1Engine._resolve_exit_family("ENTRY_BREAKOUT", None) == ("ENTRY_BREAKOUT", "BREAKOUT_EXIT")
+    assert PB1Engine._resolve_exit_family("ENTRY_BREAKOUT_CONFIRMED", None) == ("ENTRY_BREAKOUT", "BREAKOUT_EXIT")
+    assert PB1Engine._resolve_exit_family("PULLBACK", None) == ("ENTRY_PULLBACK", "PULLBACK_EXIT")
+    assert PB1Engine._resolve_exit_family("ENTRY_PULLBACK", None) == ("ENTRY_PULLBACK", "PULLBACK_EXIT")
+    assert PB1Engine._resolve_exit_family("ENTRY_PULLBACK_OVERRIDE", None) == ("ENTRY_PULLBACK", "PULLBACK_EXIT")
+    assert PB1Engine._resolve_exit_family("MOMENTUM", None) == ("ENTRY_MOMENTUM", "MOMENTUM_EXIT")
+    assert PB1Engine._resolve_exit_family("ENTRY_MOMENTUM", None) == ("ENTRY_MOMENTUM", "MOMENTUM_EXIT")
+    assert PB1Engine._resolve_exit_family("ENTRY_MOMENTUM_CONTINUATION", None) == ("ENTRY_MOMENTUM", "MOMENTUM_EXIT")
+    assert PB1Engine._resolve_exit_family("other", None) == ("ENTRY_GENERIC", "GENERIC_EXIT")
+    assert PB1Engine._resolve_exit_family(None, None) == ("ENTRY_GENERIC", "GENERIC_EXIT")
