@@ -234,15 +234,7 @@ from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_orde
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
 from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
                                      normalize_sell_reason_family, same_day_semantic_sell_exists)
-
-
-def enforce_kr_order_ownership(symbol: str, strategy_owner: str | None) -> tuple[bool, str | None]:
-    """Final routing fence for the KR Infinite reserved symbol."""
-    code = str(symbol or "").lstrip("A").zfill(6)
-    owner = str(strategy_owner or "").upper()
-    if code == "122630" and owner != "KR_INFINITE":
-        return False, "KR_INF_OWNERSHIP_RESERVED"
-    return True, None
+from trader.kr.pb1.ownership import enforce_kr_order_ownership
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
     build_kr_regime_snapshot, build_market_local_overlay, calculate_global_market_state, calculate_market_budgets, candidate_allows_buy, execution_policy, market_allows_buy, market_execution_policies, normalize_kr_market, write_snapshot,
