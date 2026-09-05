@@ -200,3 +200,16 @@ def test_us_sector_etfs_resolve_correct_kis_quote_codes():
     from trader.us.symbols import get_quote_exchange_code, resolve_exchange
     assert {get_quote_exchange_code(resolve_exchange(symbol)) for symbol in
             ("XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE")} == {"NYS"}
+
+
+def test_us_benchmark_failure_degrades_entry_not_exit():
+    from trader.us.runner.trade_tick_runner import evaluate_balance_error_circuit
+    from trader.us.watchlist_builder import _build_rotation_context
+
+    class Provider:
+        def get_daily_prices(self, _symbol, _exchange, **_kwargs):
+            raise RuntimeError("quote unavailable")
+
+    context = _build_rotation_context(Provider(), [], "2026-09-05")
+    assert context["benchmark_data_quality"] == "degraded"
+    assert evaluate_balance_error_circuit(20)["exit_can_proceed"] is True
