@@ -57,6 +57,7 @@ class InfiniteConfig:
     capital_preservation_gap: int = 15
     rebound_cooldown: int = 3
     recovery_confirmation_days: int = 2
+    open_buy_ttl_seconds: int = 120
 
     @classmethod
     def from_env(cls) -> "InfiniteConfig":
@@ -94,6 +95,7 @@ class InfiniteConfig:
             capital_preservation_gap=_int(prefix + "CAPITAL_PRESERVATION_GAP", 15),
             rebound_cooldown=_int(prefix + "REBOUND_COOLDOWN", 3),
             recovery_confirmation_days=_int(prefix + "RECOVERY_CONFIRMATION_DAYS", 2),
+            open_buy_ttl_seconds=_int(prefix + "OPEN_BUY_TTL_SECONDS", 120),
         )
         config.validate()
         return config

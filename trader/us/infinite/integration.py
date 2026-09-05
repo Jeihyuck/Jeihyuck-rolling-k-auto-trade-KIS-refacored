@@ -16,6 +16,54 @@ from .risk_adapter import effective_regime
 
 logger = logging.getLogger(__name__)
 
+_TQQQ_TTL_TERMINAL_STATUSES = {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}
+
+
+def reconcile_tqqq_open_buy_ttl(*, repository: Any, now: datetime, ttl_seconds: int,
+                                cancel_order: Callable[..., dict],
+                                query_order: Callable[..., dict]) -> dict[str, int]:
+    """Cancel only elapsed Infinite BUYs, retaining pending state until re-query confirms it.
+
+    The original order number and client key are passed unchanged to both broker
+    operations.  A cancel transport acknowledgement is deliberately not broker
+    terminal evidence.
+    """
+    expired = repository.load_expired_open_buy_orders(
+        now=now, ttl_seconds=ttl_seconds, symbol="TQQQ"
+    )
+    result = {"expired": len(expired), "cancel_requested": 0, "terminal": 0, "pending": 0}
+    for order in expired:
+        order_no = str(order.get("order_no") or "")
+        client_order_key = str(order.get("client_order_key") or "")
+        if not order_no or not client_order_key:
+            result["pending"] += 1
+            continue
+        metadata = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+        if not metadata.get("tqqq_ttl_cancel_requested_at"):
+            cancel_result = cancel_order(
+                order_no=order_no, client_order_key=client_order_key,
+                symbol="TQQQ", side="BUY",
+            ) or {}
+            repository.mark_ttl_cancel_requested(
+                order, requested_at=now, cancel_result=cancel_result
+            )
+            result["cancel_requested"] += 1
+        observation = query_order(
+            order_no=order_no, client_order_key=client_order_key,
+            symbol="TQQQ", side="BUY",
+        ) or {}
+        observed_order_no = str(observation.get("order_no") or order_no)
+        observed_symbol = str(observation.get("symbol") or "TQQQ").upper()
+        observed_side = str(observation.get("side") or "BUY").upper()
+        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if (observed_order_no != order_no or observed_symbol != "TQQQ" or observed_side != "BUY"
+                or status not in _TQQQ_TTL_TERMINAL_STATUSES):
+            result["pending"] += 1
+            continue
+        repository.apply_ttl_terminal_observation(order, observation)
+        result["terminal"] += 1
+    return result
+
 
 def owns_symbol(symbol: str, config: InfiniteConfig | None = None) -> bool:
     config = config or InfiniteConfig.from_env()
@@ -111,7 +159,9 @@ def recover_state_from_broker(*, config: InfiniteConfig, broker: PositionSnapsho
 
 def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overlay: dict,
                repository: InfiniteRepository | None = None,
-               route: Callable[[dict], dict] | None = None) -> dict[str, Any]:
+               route: Callable[[dict], dict] | None = None,
+               cancel_order: Callable[..., dict] | None = None,
+               query_order: Callable[..., dict] | None = None) -> dict[str, Any]:
     """Exception-isolated boundary. OFF returns before any DB access."""
     config = InfiniteConfig.from_env()
     if not config.enabled:
@@ -127,6 +177,12 @@ def run_sleeve(*, positions: list[dict], price: float, trading_date: date, overl
             return {"status": "BLOCK", "reason": "tqqq_quote_invalid", "orders": []}
         repository = repository or InfiniteRepository()
         repository.ensure_schema()
+        if cancel_order is not None and query_order is not None:
+            reconcile_tqqq_open_buy_ttl(
+                repository=repository, now=datetime.now(timezone.utc),
+                ttl_seconds=config.open_buy_ttl_seconds,
+                cancel_order=cancel_order, query_order=query_order,
+            )
         raw = next((p for p in positions if str(p.get("symbol") or p.get("code") or "").upper() == config.symbol), None)
         broker = _position(raw, price)
         logger.info("[TQQQ_INF][OWNERSHIP] symbol=TQQQ owner=TQQQ_INFINITE holding_qty=%s orderable_qty=%s",

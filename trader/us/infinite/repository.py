@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text
@@ -122,6 +122,67 @@ class InfiniteRepository:
             params["side"] = str(side).upper()
         with self.engine.connect() as conn:
             return [dict(row) for row in conn.execute(text(sql), params).mappings().all()]
+
+    def load_expired_open_buy_orders(self, *, now: datetime, ttl_seconds: int,
+                                     symbol: str = "TQQQ") -> list[dict]:
+        """Return only this sleeve's unresolved BUYs whose broker TTL elapsed."""
+        cutoff = now - timedelta(seconds=max(0, int(ttl_seconds)))
+        with self.engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT * FROM us_orders
+                WHERE symbol=:symbol AND side='BUY'
+                  AND client_order_key LIKE 'TQQQ_INF_V3:%'
+                  AND status IN ('INTENT','SUBMITTED','ACK','OPEN','PENDING',
+                                 'PARTIALLY_FILLED','RECONCILE_PENDING','ACK_DB_FAILED')
+                  AND created_at <= :cutoff
+                ORDER BY created_at ASC
+            """), {"symbol": symbol, "cutoff": cutoff}).mappings().all()
+        return [dict(row) for row in rows]
+
+    def mark_ttl_cancel_requested(self, order: dict, *, requested_at: datetime,
+                                   cancel_result: dict | None = None) -> None:
+        """Journal a cancel request without treating its acknowledgement as terminal."""
+        key = str(order.get("client_order_key") or "")
+        trade_date = str(order.get("trade_date") or "")
+        if not key or not trade_date:
+            raise ValueError("TTL cancel request requires original order identity")
+        patch = json.dumps({
+            "tqqq_ttl_cancel_requested_at": requested_at.isoformat(),
+            "tqqq_ttl_cancel_order_no": str(order.get("order_no") or ""),
+            "tqqq_ttl_cancel_result": cancel_result or {},
+        }, default=str)
+        with self.engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE us_orders
+                SET meta=COALESCE(meta, '{}'::jsonb) || CAST(:patch AS jsonb), updated_at=NOW()
+                WHERE trade_date=:trade_date AND client_order_key=:key
+            """), {"patch": patch, "trade_date": trade_date, "key": key})
+
+    def apply_ttl_terminal_observation(self, order: dict, observation: dict) -> dict:
+        """Persist only broker-confirmed terminal truth for the original order."""
+        from trader.us.db.repos import apply_broker_order_observation
+        from trader.us.utils.order_no import normalize_us_order_no
+
+        status = str(observation.get("status") or "").upper().replace("CANCELED", "CANCELLED")
+        if status not in {"CANCELLED", "REJECTED", "EXPIRED", "FILLED"}:
+            return {"status": "PENDING"}
+        requested = int(order.get("qty_requested") or order.get("qty") or 0)
+        filled = int(observation.get("filled_qty") or observation.get("cumulative_filled_qty") or 0)
+        return apply_broker_order_observation(
+            trade_date=str(order["trade_date"]),
+            client_order_key=str(order["client_order_key"]),
+            raw_order_no=str(order["order_no"]),
+            canonical_order_no=normalize_us_order_no(str(order["order_no"])),
+            symbol=str(order["symbol"]),
+            side="BUY",
+            requested_qty=requested,
+            filled_qty=filled,
+            remaining_qty=max(0, requested - filled),
+            broker_status=status,
+            evidence_type="TQQQ_TTL_BROKER_REQUERY",
+            observed_at=observation.get("observed_at"),
+            raw_row=observation,
+        )
 
     def pending_buy_notional(self, trade_date: date, symbol: str = "TQQQ") -> float:
         """Capital reserved by unresolved BUY ACK/pending quantities."""
