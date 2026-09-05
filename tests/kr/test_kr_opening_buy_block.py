@@ -44,3 +44,16 @@ def test_central_pre_submit_allows_actual_buy_call_at_0930(monkeypatch):
 
     assert status["api_submitted"] == 1
     assert engine.kis.buy_calls == 1
+
+
+def test_kr_order_candidate_always_has_terminal_submit_event(monkeypatch):
+    monkeypatch.setattr(
+        "trader.pb1_engine.enforce_kr_order_ownership",
+        lambda *_args: (False, "ownership_reserved"),
+    )
+    engine = _make_engine()
+
+    regular = engine._place_entry(_build_candidate("018260"))
+    close = engine._place_entry_close(_build_candidate("018260"))
+
+    assert regular["terminal_event"] == close["terminal_event"] == "FINAL_SKIP"
