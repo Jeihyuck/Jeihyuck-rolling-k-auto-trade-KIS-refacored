@@ -22,6 +22,7 @@ from trader.account_state import get_account_key
 from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
 from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
+from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
@@ -9486,27 +9487,27 @@ class PB1Engine:
 
     def _order_precheck_gate_reasons(self, *, side: str, stage: str) -> list[str]:
         del stage
-        reasons: list[str] = []
-        if not self.trading_day:
-            reasons.append("nontrading_day")
         fail_soft_active = bool(getattr(self, "balance_fail_soft_active", False))
         if side.upper() == "BUY" and fail_soft_active and not bool(getattr(self, "balance_fail_soft_entry_allowed", False)):
             logger.info("[PB1][ENTRY][BLOCKED] reason=BALANCE_FAIL_SOFT_ENTRY_DISABLED")
-            reasons.append("balance_fail_soft_entry_disabled")
         elif side.upper() == "SELL" and fail_soft_active and bool(getattr(self, "balance_fail_soft_exit_allowed", False)):
             logger.info("[PB1][EXIT][ALLOW] reason=BALANCE_FAIL_SOFT_EXIT_ALLOWED")
-        elif not bool(self.order_allowed):
-            reasons.append("order_blocked")
         session_recovery_continue = bool(getattr(self, "session_recovery_continue", False) or getattr(self, "am_recovery_continue", False))
-        if self.market_window_name == "after" and not (self.force_entry_window_override or session_recovery_continue):
-            reasons.append("window_blocked")
-        if self.force_block_live or not self.intended_live or self.strategy_mode == "DIAG":
-            reasons.append("live_gate_blocked")
-        deduped: list[str] = []
-        for reason in reasons:
-            if reason not in deduped:
-                deduped.append(reason)
-        return deduped
+        return resolve_order_precheck_gate_reasons(
+            trading_day=bool(self.trading_day),
+            order_allowed=bool(self.order_allowed),
+            side=side,
+            market_window_name=str(self.market_window_name or ""),
+            force_entry_window_override=bool(self.force_entry_window_override),
+            session_recovery_continue=session_recovery_continue,
+            am_recovery_continue=bool(getattr(self, "am_recovery_continue", False)),
+            force_block_live=bool(self.force_block_live),
+            intended_live=bool(self.intended_live),
+            strategy_mode=str(self.strategy_mode or ""),
+            balance_fail_soft_active=fail_soft_active,
+            balance_fail_soft_entry_allowed=bool(getattr(self, "balance_fail_soft_entry_allowed", False)),
+            balance_fail_soft_exit_allowed=bool(getattr(self, "balance_fail_soft_exit_allowed", False)),
+        )
 
     def _resolve_exit_submit_gate_reasons(self, *, code: str) -> list[str]:
         reasons = self._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT")
