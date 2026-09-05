@@ -330,7 +330,14 @@ class InfiniteRepository:
                                  or state.metadata.get("last_buy_fill_price"))
         metadata = {**state.metadata, "last_buy_fill_price": actual_last_buy_price,
                     "broker_qty": broker_qty, "broker_average_price": broker_average_price}
-        if stats.get("last_profit_stage"):
+        pending_stage = str(state.metadata.get("pending_profit_stage") or "").upper()
+        filled_stage = str(stats.get("last_profit_stage") or "").upper()
+        terminal_pending_profit = (
+            pending_stage.endswith("_SUBMITTED")
+            and filled_stage.endswith("_FILLED")
+            and pending_stage.removesuffix("_SUBMITTED") == filled_stage.removesuffix("_FILLED")
+        )
+        if terminal_pending_profit:
             metadata.update(profit_stage=stats["last_profit_stage"], pending_profit_stage=None)
         if actual_last_buy_price:
             metadata.update(buy_reference_price=actual_last_buy_price,
@@ -353,6 +360,10 @@ class InfiniteRepository:
                 remaining -= int(is_us_trading_day(cooldown_until))
             metadata.update(rebound_probe_date=probe_fill_date.isoformat(),
                             rebound_cooldown_until=cooldown_until.isoformat())
+        status = (
+            Status.ACTIVE if state.status == Status.EXIT_PENDING and broker_qty > 0
+            and terminal_pending_profit else state.status
+        )
         return replace(state, core_filled_notional=core, reserve_filled_notional=reserve,
                        last_buy_date=last_buy or state.last_buy_date, anchor_price=anchor,
-                       cycle_age_trading_days=age, metadata=metadata)
+                       cycle_age_trading_days=age, status=status, metadata=metadata)

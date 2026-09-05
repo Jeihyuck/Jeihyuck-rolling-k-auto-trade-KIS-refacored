@@ -109,6 +109,27 @@ def test_reconcile_records_actual_probe_fill_and_cooldown_date(monkeypatch):
     assert result.metadata["rebound_cooldown_until"] == "2026-08-12"
 
 
+def test_tqqq_terminal_partial_profit_fill_with_residual_rearms_cycle():
+    repo = InfiniteRepository.__new__(InfiniteRepository)
+    repo.cycle_fill_stats = lambda *_: {
+        "total_buy_notional": 250, "daily_buy_notional": 0, "total_sell_notional": 125,
+        "last_buy_date": date(2026, 8, 8), "first_fill_price": 50,
+        "last_buy_fill_price": 50, "last_rebound_probe_fill_date": None,
+        "last_profit_stage": "TP1_FILLED",
+    }
+    state = replace(STATE, status=Status.EXIT_PENDING,
+                    metadata={"pending_profit_stage": "TP1_SUBMITTED"})
+
+    result = repo.reconcile_metadata(
+        state, trading_date=TODAY, broker_qty=3, broker_average_price=50, core_cap=7_500,
+    )
+
+    assert result.status == Status.ACTIVE
+    assert result.cycle_id == state.cycle_id
+    assert result.metadata["pending_profit_stage"] is None
+    assert result.metadata["profit_stage"] == "TP1_FILLED"
+
+
 def test_rebound_repository_cooldown_matches_strategy_us_session_count():
     from trader.us.infinite.strategy import _trading_days_since
 
