@@ -236,6 +236,12 @@ from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reent
                                      normalize_sell_reason_family, same_day_semantic_sell_exists)
 from trader.kr.pb1.stage_label import _resolve_session_window_name, build_stage_label
 from trader.kr.pb1.code_utils import _is_kr_stock_code, _is_kis_balance_authoritative_empty
+from trader.kr.pb1.reason_counts import (
+    _format_reason_counts,
+    _normalize_entry_block_counts,
+    _normalize_entry_block_reasons,
+    _summarize_blocked_reasons,
+)
 from trader.kr.pb1.ownership import enforce_kr_order_ownership
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
@@ -446,74 +452,6 @@ CASH_KEYS = (
     "evlu_amt_sbst_amt",
 )
 
-_ENTRY_BLOCK_REASON_MAP = {
-    "SIZING_CAP_BELOW_ONE_SHARE": "SIZING_CAP_BELOW_ONE_SHARE",
-    "SIZING_MIN_ORDER_NOTIONAL_FAIL": "SIZING_MIN_ORDER_NOTIONAL_FAIL",
-    "SIZING_QTY_ZERO": "SIZING_QTY_ZERO",
-    "cap_below_min_order": "MIN_ORDER_KRW",
-    "min_order_krw": "MIN_ORDER_KRW",
-    "cap_below_one_share": "MIN_ORDER_KRW",
-    "planned_qty_zero_or_min_order": "MIN_ORDER_KRW",
-    "unaffordable_min1share": "MIN_ORDER_KRW",
-    "order_price_missing": "PRICE_MISSING",
-    "entry_cutoff": "CUTOFF",
-    "entry_disabled": "ENTRY_DISABLED",
-    "available_cash_zero": "NO_CASH",
-    "insufficient_cash": "NO_CASH",
-    "entry_capital_zero": "NO_CASH",
-    "tick_budget_zero": "NO_CASH",
-    "entry_cap_exceeded": "ENTRY_CAP_LIMIT",
-    "tick_budget_below_min_order": "MIN_ORDER_KRW",
-    "max_positions": "MAX_POSITIONS",
-    "target_new_positions_limit": "MAX_POSITIONS",
-    "target_new_positions_zero": "TARGET_NEW_POSITIONS_ZERO",
-    "BUYABLE_EXISTING_HOLDING": "BUYABLE_EXISTING_HOLDING",
-    "BUYABLE_OPEN_ORDER": "BUYABLE_OPEN_ORDER",
-    "BUYABLE_TODAY_BUY_EXISTS": "BUYABLE_TODAY_BUY_EXISTS",
-    "BUYABLE_TODAY_SELL_REBUY_BLOCKED": "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
-    "BUYABLE_COOLDOWN": "BUYABLE_COOLDOWN",
-    "BUYABLE_DUPLICATE": "BUYABLE_DUPLICATE",
-    "BUYABLE_WINDOW_BLOCK": "BUYABLE_WINDOW_BLOCK",
-    "open_order": "RATE_LIMIT",
-    "today_buy_exists": "RATE_LIMIT",
-    "duplicate_order": "DUPLICATE",
-    "rate_limit": "RATE_LIMIT",
-    "holding_position": "EXISTING_POSITION",
-    "order_value_zero": "ORDER_VALUE_ZERO",
-    "qty_zero": "QTY_ZERO",
-    "universe_empty": "UNIVERSE_EMPTY",
-}
-
-_ORDER_SKIP_REASON_MAP = {
-    "SIZING_CAP_BELOW_ONE_SHARE": "ORDER_SKIP_SIZING_CAP_BELOW_ONE_SHARE",
-    "SIZING_MIN_ORDER_NOTIONAL_FAIL": "ORDER_SKIP_SIZING_MIN_ORDER_NOTIONAL_FAIL",
-    "SIZING_QTY_ZERO": "ORDER_SKIP_SIZING_QTY_ZERO",
-    "cap_below_min_order": "ORDER_SKIP_MIN_ORDER",
-    "min_order_krw": "ORDER_SKIP_MIN_ORDER",
-    "cap_below_one_share": "ORDER_SKIP_MIN_ORDER",
-    "planned_qty_zero_or_min_order": "ORDER_SKIP_MIN_ORDER",
-    "unaffordable_min1share": "ORDER_SKIP_MIN_ORDER",
-    "order_price_missing": "ORDER_SKIP_PRICE_MISSING",
-    "available_cash_zero": "ORDER_SKIP_NO_CASH",
-    "insufficient_cash": "ORDER_SKIP_NO_CASH",
-    "entry_capital_zero": "ORDER_SKIP_NO_CASH",
-    "tick_budget_zero": "ORDER_SKIP_NO_CASH",
-    "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
-    "BUYABLE_EXISTING_HOLDING": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING",
-    "BUYABLE_OPEN_ORDER": "ORDER_SKIP_BUYABLE_OPEN_ORDER",
-    "BUYABLE_TODAY_BUY_EXISTS": "ORDER_SKIP_BUYABLE_TODAY_BUY_EXISTS",
-    "BUYABLE_TODAY_SELL_REBUY_BLOCKED": "ORDER_SKIP_BUYABLE_TODAY_SELL_REBUY_BLOCKED",
-    "BUYABLE_COOLDOWN": "ORDER_SKIP_BUYABLE_COOLDOWN",
-    "BUYABLE_DUPLICATE": "ORDER_SKIP_BUYABLE_DUPLICATE",
-    "BUYABLE_WINDOW_BLOCK": "ORDER_SKIP_BUYABLE_WINDOW_BLOCK",
-    "open_order": "ORDER_SKIP_RATE_LIMIT",
-    "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
-    "duplicate_order": "ORDER_SKIP_DUPLICATE",
-    "rate_limit": "ORDER_SKIP_RATE_LIMIT",
-    "entry_cutoff": "ORDER_SKIP_CUTOFF",
-    "entry_disabled": "ORDER_SKIP_DISABLED",
-}
-
 
 def _as_first_dict(v: Any) -> Dict[str, Any]:
     """
@@ -554,29 +492,6 @@ def _extract_output2_keys(summary_raw: Any) -> list[str]:
     return [f"type:{type(summary_raw).__name__}"]
 
 
-def _normalize_entry_block_reasons(reasons: Iterable[str] | None) -> Counter[str]:
-    counter: Counter[str] = Counter()
-    for reason in reasons or []:
-        mapped = _ENTRY_BLOCK_REASON_MAP.get(reason, reason.upper())
-        counter[mapped] += 1
-    return counter
-
-
-def _normalize_entry_block_counts(reason_counts: Counter[str]) -> Counter[str]:
-    counter: Counter[str] = Counter()
-    for reason, count in reason_counts.items():
-        mapped = _ENTRY_BLOCK_REASON_MAP.get(reason, reason.upper())
-        counter[mapped] += count
-    return counter
-
-
-def _format_reason_counts(counter: Counter[str]) -> str:
-    if not counter:
-        return "none"
-    parts = [f"{key}:{count}" for key, count in counter.most_common()]
-    return ",".join(parts)
-
-
 NO_TRADE_REASON_PRIORITY = (
     "BUYABLE_TODAY_BUY_EXISTS",
     "BUYABLE_TODAY_SELL_REBUY_BLOCKED",
@@ -586,11 +501,6 @@ NO_TRADE_REASON_PRIORITY = (
     "SIZING_CAP_BELOW_ONE_SHARE",
     "MIN_ORDER_KRW",
 )
-
-
-def _summarize_blocked_reasons(counter: Counter[str] | dict[str, int] | None) -> Counter[str]:
-    normalized_input = Counter(counter or {})
-    return _normalize_entry_block_counts(normalized_input)
 
 
 def _primary_no_trade_reason(
