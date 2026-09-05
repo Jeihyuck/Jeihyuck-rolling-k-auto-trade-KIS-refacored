@@ -7391,6 +7391,7 @@ class PB1Engine:
             "broker_response_code": None,
             "broker_message": None,
             "submitted": 0,
+            "terminal_event": "FINAL_SKIP",
         }
 
     @staticmethod

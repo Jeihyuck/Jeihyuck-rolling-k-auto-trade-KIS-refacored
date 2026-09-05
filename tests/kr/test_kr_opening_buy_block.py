@@ -32,6 +32,7 @@ def test_central_pre_submit_blocks_actual_buy_call_at_0910(monkeypatch, caplog):
     assert status["api_submitted"] == 0
     assert engine.kis.buy_calls == 0
     assert status["skipped_reason"] == "OPENING_30MIN_BUY_BLOCK"
+    assert status["terminal_event"] == "FINAL_SKIP"
     assert "[OPENING_BUY_BLOCK][KR]" in caplog.text
 
 
@@ -57,3 +58,13 @@ def test_kr_order_candidate_always_has_terminal_submit_event(monkeypatch):
     close = engine._place_entry_close(_build_candidate("018260"))
 
     assert regular["terminal_event"] == close["terminal_event"] == "FINAL_SKIP"
+
+
+def test_kr_price_gate_block_is_terminal_event_not_exception(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (False, "price_gate_blocked"))
+    engine = _make_engine()
+    engine._now_kst = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+
+    status = engine._place_entry(_build_candidate("018260"))
+
+    assert status["terminal_event"] == "FINAL_SKIP"
