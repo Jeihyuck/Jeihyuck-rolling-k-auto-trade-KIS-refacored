@@ -193,7 +193,7 @@ def test_market_state_uses_canonical_exchange_registry_for_breadth_and_sector_et
     call_map = dict(calls)
 
     for symbol in ("SPY", "DIA", "IWM", "RSP", "XLK", "XLI", "XLF", "XLV", "XLP", "XLU", "XLE"):
-        assert call_map[symbol] == "AMEX"
+        assert call_map[symbol] == "NYSE"
     for symbol in ("QQQ", "SMH"):
         assert call_map[symbol] == "NASDAQ"
 
