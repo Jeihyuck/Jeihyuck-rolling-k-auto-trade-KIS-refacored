@@ -233,8 +233,9 @@ from trader.position_age import calc_position_age, normalize_ohlcv_dates, to_kst
 from trader.core_utils import _round_to_tick
 from trader.kr_price_utils import normalize_kr_order_price as _normalize_kr_order_price_shared
 from trader.kr.market_state_overlay import filter_kr_entry_intent, calculate_kr_sector_exposure, generate_kr_profit_capture_intents, generate_kr_defense_trim_intents
+from trader.kr.pb1.semantic_sell_fence import same_day_semantic_sell_blocked
 from trader.kr.pb1_stability import (NO_SELLABLE_STICKY, evaluate_same_day_reentry,
-                                     normalize_sell_reason_family, same_day_semantic_sell_exists)
+                                     normalize_sell_reason_family)
 from trader.kr.pb1.stage_label import _resolve_session_window_name, build_stage_label
 from trader.kr.pb1.code_utils import _is_kr_stock_code, _is_kis_balance_authoritative_empty
 from trader.kr.pb1.reason_counts import (
@@ -12565,13 +12566,15 @@ class PB1Engine:
         position_meta = pos.get("position_meta") if isinstance(pos.get("position_meta"), dict) else {}
         lifecycle_id = str(pos.get("position_lifecycle_id") or position_meta.get("position_lifecycle_id")
                            or f"sid:{sid}:mode:{mode}")
-        try:
-            today_sell_rows = self.orders_repo.list_today_orders(self.env, side="SELL", code=code, status_exclude=())
-        except Exception as exc:
-            logger.warning("[PB1][SEMANTIC_SELL_FENCE][LOOKUP_WARN] code=%s err=%s", display_code, exc)
-            today_sell_rows = []
-        if same_day_semantic_sell_exists(rows=today_sell_rows, symbol=code, strategy_owner="KR_STANDARD",
-                                         reason_family=reason_family, lifecycle_id=lifecycle_id):
+        if same_day_semantic_sell_blocked(
+            orders_repo=self.orders_repo,
+            env=self.env,
+            code=code,
+            strategy_owner="KR_STANDARD",
+            reason_family=reason_family,
+            lifecycle_id=lifecycle_id,
+            logger=logger,
+        ):
             exit_eval_payload["order_skip_reasons"] = ["KR_SAME_DAY_SEMANTIC_SELL_DUPLICATE"]
             exit_eval_payload["order_result"] = "ORDER_SKIPPED_SEMANTIC_DUPLICATE"
             logger.warning("[PB1][SEMANTIC_SELL_FENCE] code=%s family=%s lifecycle=%s reason=KR_SAME_DAY_SEMANTIC_SELL_DUPLICATE",
