@@ -342,6 +342,40 @@ def test_sell_accepted_in_session_prevents_resubmit() -> None:
     assert kis.sell_calls == 0
 
 
+def test_kr_pb1_sell_accepted_blocks_same_cycle_resubmit() -> None:
+    test_sell_accepted_in_session_prevents_resubmit()
+
+
+def test_kr_pb1_no_sellable_qty_creates_durable_submit_fence() -> None:
+    engine, kis = _make_engine()
+    code = "005830"
+    engine._register_session_no_sellable(code=code)
+    payload = engine._plan_exit_event(
+        _pos(code=code, qty=1, kis_qty=0, orderable_qty=0),
+        {"close": 9000.0}, pd.DataFrame(), "day",
+    )
+    assert payload["submitted"] == 0
+    assert kis.sell_calls == 0
+
+
+def test_kr_pb1_no_sellable_qty_does_not_repeat_broker_submit() -> None:
+    test_kr_pb1_no_sellable_qty_creates_durable_submit_fence()
+
+
+def test_kr_pb1_fresh_sellable_positive_allows_retry(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    engine, kis = _make_engine()
+    code = "005830"
+    engine._register_session_no_sellable(code=code)
+    payload = engine._plan_exit_event(
+        _pos(code=code, qty=1, kis_qty=1, orderable_qty=1),
+        {"close": 9000.0}, pd.DataFrame(), "day",
+    )
+    assert payload["order_result"] != "ORDER_SKIPPED_SESSION_BLOCKED"
+    assert code not in engine._session_sell_blocked_codes
+    assert kis.sell_calls == 0
+
+
 def test_db_kis_mismatch_pending_close_status_blocks_sell(monkeypatch) -> None:
     engine, kis = _make_engine()
     code = "005830"

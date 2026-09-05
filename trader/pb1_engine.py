@@ -11743,6 +11743,17 @@ class PB1Engine:
         if sid != 1 or qty <= 0:
             return None
         session_blocked, session_block_reason = self._is_session_sell_blocked(code)
+        if (
+            session_block_reason == "KIS_NO_SELLABLE_QTY"
+            and int(pos.get("orderable_qty") or 0) > 0
+            and int(pos.get("kis_qty") or 0) > 0
+        ):
+            # A subsequent fresh holding context permits a retry; a prior
+            # pre-submit zero is not evidence of a live broker SELL.
+            self._session_sell_blocked_codes.pop(code, None)
+            self._session_no_sellable_codes.pop(code, None)
+            self.no_sellable_qty_terminal_codes.discard(display_code)
+            session_blocked, session_block_reason = False, ""
         if session_blocked:
             logger.info(
                 "[SELL_SESSION_BLOCK][SKIP] code=%s reason=%s action=skip_resubmit",
