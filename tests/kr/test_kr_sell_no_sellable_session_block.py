@@ -344,7 +344,8 @@ def test_sell_accepted_in_session_prevents_resubmit() -> None:
     assert kis.sell_calls == 0
 
 
-def test_kr_pb1_sell_accepted_blocks_same_cycle_resubmit() -> None:
+def test_kr_pb1_sell_accepted_blocks_same_cycle_resubmit(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
     db = sa.create_engine("sqlite:///:memory:")
     schema_for_engine(db).metadata.create_all(db)
     kis = FakeKis()
