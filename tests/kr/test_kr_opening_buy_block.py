@@ -45,6 +45,7 @@ def test_central_pre_submit_allows_actual_buy_call_at_0930(monkeypatch):
 
     assert status["api_submitted"] == 1
     assert engine.kis.buy_calls == 1
+    assert status["terminal_event"] == "API_RESULT"
 
 
 def test_kr_order_candidate_always_has_terminal_submit_event(monkeypatch):
@@ -68,3 +69,15 @@ def test_kr_price_gate_block_is_terminal_event_not_exception(monkeypatch):
     status = engine._place_entry(_build_candidate("018260"))
 
     assert status["terminal_event"] == "FINAL_SKIP"
+
+
+def test_kr_duplicate_block_is_terminal_event_not_exception(monkeypatch):
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda *_args: (True, "ok"))
+    engine = _make_engine()
+    engine._now_kst = datetime(2026, 8, 24, 9, 30, tzinfo=ZoneInfo("Asia/Seoul"))
+    candidate = _build_candidate("018260")
+
+    engine._place_entry(candidate)
+    duplicate = engine._place_entry(candidate)
+
+    assert duplicate["terminal_event"] == "FINAL_SKIP"
