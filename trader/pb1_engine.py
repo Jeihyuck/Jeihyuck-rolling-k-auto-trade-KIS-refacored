@@ -33,6 +33,7 @@ from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
 from trader.kr.pb1.buy_timing import is_buy_allowed_now
 from trader.kr.pb1.entry_family import resolve_entry_setup_family, resolve_entry_decision_family
+from trader.kr.pb1.entry_thresholds import is_intraday_threshold_window, resolve_entry_thresholds
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.kr.pb1.market_close import resolve_market_close
@@ -3625,27 +3626,30 @@ class PB1Engine:
         logger.warning(message, *args)
 
     def _is_intraday_threshold_window(self) -> bool:
-        if self.phase not in {"prep", "entry", "pm_entry"}:
-            return False
-        if self.window_internal not in {"morning", "day"}:
-            return False
-        try:
-            entry_end = datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time()
-            return self._now_kst.time() <= entry_end
-        except ValueError:
-            return False
+        return is_intraday_threshold_window(
+            phase=self.phase,
+            window_internal=self.window_internal,
+            now_kst=self._now_kst,
+            entry_window_end=PB1_ENTRY_WINDOW_END,
+        )
 
     def _resolve_filter_thresholds(self) -> FilterThresholds:
-        intraday = self._is_intraday_threshold_window()
-        filters = getattr(self, "effective_entry_filters", {}) or {}
-        volu_max = float(filters.get("volu_max_intraday" if intraday else "volu_max", PB1_VOLU_MAX_INTRADAY if intraday else PB1_VOLU_MAX))
-        thresholds = FilterThresholds(
-            vol_contraction_max=float(filters.get("vol_max", PB1_VOL_MAX)),
-            volu_contraction_max=volu_max,
-            pullback_min=float(filters.get("pullback_min", PB1_PULLBACK_MIN)),
-            pullback_max=float(filters.get("pullback_max", PB1_PULLBACK_MAX)),
-            require_both_contractions=bool(filters.get("require_both_contractions", PB1_REQUIRE_BOTH_CONTRACTIONS)),
+        intraday, threshold_values = resolve_entry_thresholds(
+            phase=self.phase,
+            window_internal=self.window_internal,
+            now_kst=self._now_kst,
+            entry_window_end=PB1_ENTRY_WINDOW_END,
+            effective_entry_filters=getattr(self, "effective_entry_filters", {}) or {},
+            defaults={
+                "vol_max": PB1_VOL_MAX,
+                "volu_max": PB1_VOLU_MAX,
+                "volu_max_intraday": PB1_VOLU_MAX_INTRADAY,
+                "pullback_min": PB1_PULLBACK_MIN,
+                "pullback_max": PB1_PULLBACK_MAX,
+                "require_both_contractions": PB1_REQUIRE_BOTH_CONTRACTIONS,
+            },
         )
+        thresholds = FilterThresholds(**threshold_values)
         logger.info(
             "[PB1][THRESHOLDS] intraday=%s phase=%s window=%s thresholds={vol_max:%.2f volu_max:%.2f pullback_min:%.3f pullback_max:%.3f require_both:%s}",
             int(intraday),
