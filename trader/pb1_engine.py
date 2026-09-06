@@ -30,8 +30,11 @@ from trader.kr.pb1.exit_policy import resolve_exit_policy
 from trader.kr.pb1.exit_updates import build_exit_position_update_fields
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
+from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
+from trader.kr.pb1.buy_timing import is_buy_allowed_now
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
+from trader.kr.pb1.market_close import resolve_market_close
 from trader.kr.pb1.terminal_state import resolve_terminal_state
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
@@ -3591,67 +3594,17 @@ class PB1Engine:
         )
 
     def _resolve_market_close(self) -> tuple[datetime, str]:
-        fallback_raw = "15:30"
-        source = "default"
-        raw = ""
-        try:
-            market_close_env = str(os.getenv("MARKET_CLOSE_TIME") or "").strip()
-            close_auction_env = str(os.getenv("CLOSE_AUCTION_END") or "").strip()
-            if market_close_env:
-                raw = market_close_env
-                source = "MARKET_CLOSE_TIME"
-            elif close_auction_env:
-                raw = close_auction_env
-                source = "CLOSE_AUCTION_END"
-            else:
-                raw = fallback_raw
-            try:
-                close_time = datetime.strptime(raw, "%H:%M").time()
-            except ValueError:
-                logger.warning(
-                    "[PB1][MARKET_CLOSE][INVALID] raw=%s source=%s fallback=%s",
-                    raw,
-                    source,
-                    fallback_raw,
-                )
-                raw = fallback_raw
-                source = "default"
-                close_time = datetime.strptime(fallback_raw, "%H:%M").time()
-            close_dt = datetime.combine(self._now_kst.date(), close_time, tzinfo=self._now_kst.tzinfo)
-            logger.info(
-                "[PB1][MARKET_CLOSE][RESOLVE] raw=%s source=%s close=%s",
-                raw,
-                source,
-                close_dt.isoformat(),
-            )
-            return close_dt, raw
-        except Exception as exc:
-            close_time = datetime.strptime(fallback_raw, "%H:%M").time()
-            close_dt = datetime.combine(self._now_kst.date(), close_time, tzinfo=self._now_kst.tzinfo)
-            logger.warning(
-                "[PB1][MARKET_CLOSE][RESOLVE_FAIL] raw=%s source=%s err=%s fallback=%s",
-                raw,
-                source,
-                exc,
-                fallback_raw,
-            )
-            logger.info(
-                "[PB1][MARKET_CLOSE][RESOLVE] raw=%s source=%s close=%s",
-                fallback_raw,
-                "default",
-                close_dt.isoformat(),
-            )
-            return close_dt, fallback_raw
+        return resolve_market_close(
+            now_kst=self._now_kst,
+            market_close_time=os.getenv("MARKET_CLOSE_TIME"),
+            close_auction_end=os.getenv("CLOSE_AUCTION_END"),
+        )
 
     def _is_buy_allowed_now(self, now: datetime | None = None) -> tuple[bool, str, datetime, datetime]:
         current_now = now or now_kst()
         entry_cutoff_dt, _ = self._resolve_entry_cutoff()
         market_close_dt, _ = self._resolve_market_close()
-        if current_now >= market_close_dt:
-            return False, "MARKET_CLOSED", entry_cutoff_dt, market_close_dt
-        if current_now >= entry_cutoff_dt:
-            return False, "ENTRY_CUTOFF_PASSED", entry_cutoff_dt, market_close_dt
-        return True, "TIME_WINDOW_OK", entry_cutoff_dt, market_close_dt
+        return is_buy_allowed_now(now=current_now, entry_cutoff_dt=entry_cutoff_dt, market_close_dt=market_close_dt)
 
     def _should_block_entry_after_exit(self) -> tuple[bool, dict]:
         """SELL 제출 이후 신규 BUY를 차단할지 판단한다.
@@ -3659,17 +3612,10 @@ class PB1Engine:
         PB1_BLOCK_ENTRY_AFTER_EXIT=1 (default 0)이고 이번 tick에 SELL 제출이 있었을 때만 True.
         """
         enabled = str(os.getenv("PB1_BLOCK_ENTRY_AFTER_EXIT", "0")).strip() == "1"
-        if not enabled:
-            return False, {"exit_submit_attempt_count": 0, "accepted_sell_count": 0}
-        payload = dict(getattr(self, "_exit_summary_payload", {}) or {})
-        submit_attempt_count = int(payload.get("submit_attempt_count") or 0)
-        accepted_sell_count = int(payload.get("accepted_sell_count") or 0)
-        metrics = {
-            "exit_submit_attempt_count": submit_attempt_count,
-            "accepted_sell_count": accepted_sell_count,
-        }
-        blocked = submit_attempt_count > 0 or accepted_sell_count > 0
-        return blocked, metrics
+        return should_block_entry_after_exit(
+            enabled=enabled,
+            exit_summary_payload=getattr(self, "_exit_summary_payload", {}) or {},
+        )
 
     def _warn_once(self, key: str, message: str, *args: object) -> None:
         if key in self._warned_keys:
