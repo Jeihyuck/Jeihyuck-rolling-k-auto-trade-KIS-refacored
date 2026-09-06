@@ -42,6 +42,14 @@ from trader.kr.pb1.entry_thresholds import is_intraday_threshold_window, resolve
 from trader.kr.pb1.entry_trigger_policy import resolve_entry_trigger_policy
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
+from trader.kr.pb1.horizon_utils import (
+    calculate_exit_qty as calculate_exit_qty_impl,
+    calendar_days_held as calendar_days_held_impl,
+    classify_trade_horizon as classify_trade_horizon_impl,
+    horizon_to_exit_family as horizon_to_exit_family_impl,
+    resolve_position_book as resolve_position_book_impl,
+    resolve_position_horizon as resolve_position_horizon_impl,
+)
 from trader.kr.pb1.market_close import resolve_market_close
 from trader.kr.pb1.exit_submit_gate import resolve_exit_submit_gate_reasons as resolve_exit_submit_gate_reasons_impl
 from trader.kr.pb1.terminal_state import resolve_terminal_state
@@ -712,10 +720,7 @@ def _coerce_timestamp(value: Any) -> pd.Timestamp | None:
 
 
 def _calendar_days_held(entry_ts: Any, trade_date: date) -> int:
-    entry_date = to_kst_date(entry_ts)
-    if entry_date is None:
-        return 0
-    return max(0, (trade_date - entry_date).days)
+    return calendar_days_held_impl(entry_ts, trade_date)
 
 
 def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: float) -> tuple[float, int]:
@@ -752,132 +757,19 @@ def _compute_highest_since_entry(df: pd.DataFrame, entry_ts: Any, entry_price: f
 # ============================================================
 
 def _classify_trade_horizon(features: dict[str, Any]) -> str:
-    """매수 후보의 특성으로 trade_horizon을 결정한다.
-
-    Returns: "DAY_PROTECT" | "SWING_CARRY" | "CORE_CARRY"
-    """
-    entry_style = str(
-        features.get("entry_style_selected") or features.get("entry_reason") or ""
-    ).upper()
-    score_final = float(features.get("score_final") or features.get("score") or 0)
-    atr_pct = float(features.get("atr_pct") or 0)
-    breakout = bool(features.get("breakout_signal") or features.get("pivot_breakout"))
-    vcp_score = float(features.get("vcp_score") or 0)
-    trend_ok = bool(features.get("trend_template_ok") or features.get("minervini_ok"))
-
-    # 1. 당일 보호형
-    if entry_style in {"ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_OPEN_PUSH"}:
-        return "DAY_PROTECT"
-    if breakout and atr_pct >= 5.0:
-        return "DAY_PROTECT"
-
-    # 2. 핵심 중기형 (스윙보다 먼저 체크)
-    if score_final >= 85 and trend_ok and atr_pct <= 4.0:
-        return "CORE_CARRY"
-
-    # 3. 스윙형
-    if entry_style in {"ENTRY_PULLBACK", "ENTRY_VCP", "ENTRY_MINERVINI"}:
-        return "SWING_CARRY"
-    if trend_ok and vcp_score >= 45:
-        return "SWING_CARRY"
-
-    return "SWING_CARRY"
+    return classify_trade_horizon_impl(features)
 
 
 def _horizon_to_exit_family(horizon: str) -> str:
-    return {
-        "DAY_PROTECT": "INTRADAY_PROFIT_PROTECT",
-        "SWING_CARRY": "SWING_STAGED_EXIT",
-        "CORE_CARRY": "CORE_TREND_FOLLOW",
-    }.get(horizon, "SWING_STAGED_EXIT")
+    return horizon_to_exit_family_impl(horizon)
 
 
 def _resolve_position_horizon(pos: dict[str, Any], now_kst_date: Any | None = None) -> str:
-    """포지션 dict에서 trade_horizon을 결정한다.
-
-    우선순위:
-    1. position_meta.trade_horizon
-    2. entry_meta_json.trade_horizon
-    3. entry_date == today -> DAY_PROTECT
-    4. SWING_CARRY
-    """
-    meta = pos.get("position_meta") or {}
-    if isinstance(meta, str):
-        try:
-            import json as _json
-            meta = _json.loads(meta)
-        except Exception:
-            meta = {}
-    horizon = str(meta.get("trade_horizon") or "").strip()
-    if horizon in {"DAY_PROTECT", "SWING_CARRY", "CORE_CARRY"}:
-        return horizon
-
-    entry_meta = pos.get("entry_meta_json") or {}
-    if isinstance(entry_meta, str):
-        try:
-            import json as _json
-            entry_meta = _json.loads(entry_meta)
-        except Exception:
-            entry_meta = {}
-    horizon = str(entry_meta.get("trade_horizon") or "").strip()
-    if horizon in {"DAY_PROTECT", "SWING_CARRY", "CORE_CARRY"}:
-        return horizon
-
-    # entry_date 기반 fallback
-    if now_kst_date is not None:
-        entry_date_raw = pos.get("entry_date") or pos.get("last_fill_at") or pos.get("entry_ts")
-        if entry_date_raw:
-            try:
-                entry_d = pd.Timestamp(entry_date_raw).date()
-                if entry_d == now_kst_date:
-                    return "DAY_PROTECT"
-            except Exception:
-                pass
-
-    return "SWING_CARRY"
+    return resolve_position_horizon_impl(pos, now_kst_date=now_kst_date)
 
 
 def _resolve_position_book(pos: dict[str, Any]) -> str:
-    """포지션 dict에서 book(SWING_BOOK / DAY_BOOK / CORE_BOOK)을 결정한다.
-
-    우선순위:
-    1. entry_meta_json.book
-    2. position_meta.book
-    3. trade_horizon → 매핑
-    4. fallback: SWING_BOOK
-    """
-    import json as _json
-    entry_meta = pos.get("entry_meta_json") or {}
-    if isinstance(entry_meta, str):
-        try:
-            entry_meta = _json.loads(entry_meta)
-        except Exception:
-            entry_meta = {}
-    book = str(entry_meta.get("book") or "").strip()
-    if book in {"SWING_BOOK", "DAY_BOOK", "CORE_BOOK"}:
-        return book
-
-    meta = pos.get("position_meta") or {}
-    if isinstance(meta, str):
-        try:
-            meta = _json.loads(meta)
-        except Exception:
-            meta = {}
-    book = str(meta.get("book") or "").strip()
-    if book in {"SWING_BOOK", "DAY_BOOK", "CORE_BOOK"}:
-        return book
-
-    # trade_horizon 기반 매핑
-    horizon = str(entry_meta.get("trade_horizon") or meta.get("trade_horizon") or "").strip()
-    _horizon_to_book = {
-        "DAY_PROTECT": "DAY_BOOK",
-        "SWING_CARRY": "SWING_BOOK",
-        "CORE_CARRY": "CORE_BOOK",
-    }
-    if horizon in _horizon_to_book:
-        return _horizon_to_book[horizon]
-
-    return "SWING_BOOK"
+    return resolve_position_book_impl(pos)
 
 
 def _apply_swing_same_day_guard(
@@ -1356,17 +1248,7 @@ def _submit_finalized_order_candidates(
 
 
 def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | None) -> int:
-    """exit 수량을 계산한다.
-
-    sell_pct=None -> 전량 매도
-    """
-    orderable = max(0, int(orderable_qty or 0))
-    if sell_pct is None:
-        return orderable
-    qty = int(orderable * float(sell_pct))
-    if qty < 1 and orderable > 0:
-        qty = 1
-    return min(qty, orderable)
+    return calculate_exit_qty_impl(holding_qty, orderable_qty, sell_pct)
 
 
 def _resolve_effective_exit_risk_for_pos(pos: dict[str, Any]) -> dict[str, Any]:
