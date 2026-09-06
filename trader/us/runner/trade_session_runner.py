@@ -28,6 +28,8 @@ from datetime import datetime as dt, timedelta
 datetime = dt  # backward-compatible module-level name; avoid function-local import shadowing
 from pathlib import Path
 
+from trader.us.runner.session_timeout_utils import advance_timeout_execution_mode, tick_has_authoritative_execution_health
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,26 +58,6 @@ def attribute_session_fills(orders: list[dict], broker_fills: list[dict], *, ses
         matched += int(found)
         unresolved += int(not found)
     return {"session_fills_count": matched, "unresolved_order_count": unresolved}
-
-
-def tick_has_authoritative_execution_health(tick: dict) -> bool:
-    """Recovery requires all broker state, not merely a successful quote."""
-    return bool(
-        not tick.get("balance_fetch_failed")
-        and str(tick.get("ack_reconcile_after_route_status") or tick.get("ack_reconcile_status") or "OK").upper() == "OK"
-        and int(tick.get("unresolved_ack_count", 0) or 0) == 0
-        and str(tick.get("fill_source_status") or "OK").upper() == "OK"
-        and str(tick.get("durable_fence_status") or "ACTIVE").upper() == "ACTIVE"
-    )
-
-
-def advance_timeout_execution_mode(mode: str, consecutive: int, *, threshold: int, healthy_tick: dict | None = None) -> tuple[str, bool]:
-    """Pure session-liveness transition used by the runner and regressions."""
-    if healthy_tick is not None and tick_has_authoritative_execution_health(healthy_tick):
-        return "NORMAL", True
-    if consecutive >= threshold:
-        return "SAFE_DEGRADED", False
-    return mode, mode == "NORMAL"
 _received_signal: int | None = None
 _last_liveness_event = ""
 _exit_code: int | None = None
