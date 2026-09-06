@@ -28,6 +28,7 @@ from trader.kr.pb1.exit_family import resolve_exit_family
 from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
 from trader.kr.pb1.exit_policy import resolve_exit_policy
 from trader.kr.pb1.exit_updates import build_exit_position_update_fields
+from trader.kr.pb1.exit_simulation import resolve_force_exit_simulation
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
@@ -6833,31 +6834,7 @@ class PB1Engine:
         )
 
     def _resolve_force_exit_simulation(self, *, code: str, orderable_qty: int, exit_policy_family: str) -> dict[str, Any] | None:
-        if not env_bool("FORCE_EXIT_SIMULATION", False):
-            return None
-        requested_code = str(os.getenv("FORCE_EXIT_CODE") or "").strip().zfill(6)
-        if requested_code and requested_code != str(code or "").zfill(6):
-            return None
-        requested_reason = str(os.getenv("FORCE_EXIT_REASON") or "STOP_HIT").strip().upper() or "STOP_HIT"
-        valid_reasons = {"STOP_HIT", "FAILED_BREAKOUT", "TP1", "TP2", "TRAIL_STOP"}
-        if requested_reason not in valid_reasons:
-            requested_reason = "STOP_HIT"
-        qty = int(orderable_qty or 0)
-        if requested_reason == "TP1":
-            qty = max(1, int(np.ceil(float(orderable_qty or 0) * float(TP1_SELL_PCT))))
-        elif requested_reason == "TP2":
-            qty = max(1, int(np.ceil(float(orderable_qty or 0) * float(TP2_SELL_PCT))))
-        family_hint = exit_policy_family or "GENERIC_EXIT"
-        if requested_reason == "FAILED_BREAKOUT":
-            family_hint = "PULLBACK_EXIT"
-        elif requested_reason in {"TP1", "TP2", "TRAIL_STOP"}:
-            family_hint = "MOMENTUM_EXIT"
-        return {
-            "reason": requested_reason,
-            "qty": min(max(1, qty), max(1, int(orderable_qty or 0))),
-            "stage": requested_reason,
-            "exit_policy_family": family_hint,
-        }
+        return resolve_force_exit_simulation(code=code, orderable_qty=orderable_qty, exit_policy_family=exit_policy_family)
 
     @staticmethod
     def _entry_meta_position_fields(entry_meta: dict[str, Any]) -> dict[str, Any]:
