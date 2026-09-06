@@ -29,6 +29,7 @@ from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
 from trader.kr.pb1.exit_policy import resolve_exit_policy
 from trader.kr.pb1.exit_updates import build_exit_position_update_fields
 from trader.kr.pb1.exit_simulation import resolve_force_exit_simulation
+from trader.kr.pb1.exit_stop_price import resolve_exit_stop_price
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
@@ -9303,77 +9304,18 @@ class PB1Engine:
             pivot_val = features.get("pivot")
         tight_low = features.get("tight_low")
         entry_style_selected = str(features.get("entry_style_selected") or "").strip().upper()
-
-        if stop_price_at_entry is not None and stop_price_at_entry > 0 and stop_price_at_entry < order_px:
-            logger.info(
-                "[STOP][BUILD] code=%s source=entry_metadata close=%s atr=%s stop=%s degraded=0",
-                cf.code,
-                close_px,
-                atr_val,
-                float(stop_price_at_entry),
-            )
-            return float(stop_price_at_entry), "entry_metadata", 0, None
-
-        if pivot_val is not None or tight_low is not None:
-            calc_stop = calc_initial_stop(
-                pivot=float(pivot_val) if pivot_val is not None else float("nan"),
-                tight_low=float(tight_low) if tight_low is not None else None,
-                atr=float(atr_val) if atr_val is not None else None,
-                mode=INITIAL_STOP_MODE,
-                entry=order_px,
-                atr_mult=ATR_MULT,
-            )
-            if calc_stop is not None and pd.notna(calc_stop) and float(calc_stop) > 0 and float(calc_stop) < order_px:
-                logger.info(
-                    "[STOP][BUILD] code=%s source=calc_initial_stop close=%s atr=%s stop=%s degraded=0",
-                    cf.code,
-                    close_px,
-                    atr_val,
-                    float(calc_stop),
-                )
-                return float(calc_stop), "calc_initial_stop", 0, None
-
-        if close_px is not None and atr_val is not None and atr_val > 0:
-            atr_mult = max(ATR_MULT, 2.2) if entry_style_selected == "MOMENTUM" else ATR_MULT
-            stop_price = min(float(close_px - (atr_val * atr_mult)), order_px * 0.99)
-            if stop_price > 0:
-                logger.info(
-                    "[STOP][BUILD] code=%s source=atr_fallback close=%s atr=%s stop=%s degraded=0",
-                    cf.code,
-                    close_px,
-                    atr_val,
-                    stop_price,
-                )
-                return stop_price, "atr_fallback", 0, None
-
-        ma_candidates = [value for value in (ma20, ma50) if value is not None and value > 0]
-        if close_px is not None and close_px > 0 and ma_candidates:
-            stop_price = min(min(ma_candidates), float(close_px) * 0.97, order_px * 0.99)
-            if stop_price > 0:
-                logger.info(
-                    "[STOP][BUILD] code=%s source=ma_fallback close=%s atr=%s stop=%s degraded=0",
-                    cf.code,
-                    close_px,
-                    atr_val,
-                    stop_price,
-                )
-                return stop_price, "ma_fallback", 0, None
-
-        if close_px is not None and close_px > 0:
-            stop_price = min(float(close_px) * 0.90, order_px * 0.99)
-            if stop_price > 0:
-                logger.info(
-                    "[STOP][BUILD] code=%s source=hard_fallback close=%s atr=%s ma20=%s ma50=%s stop=%s degraded=1 reason=missing_all_primary_inputs",
-                    cf.code,
-                    close_px,
-                    atr_val,
-                    ma20,
-                    ma50,
-                    stop_price,
-                )
-                return stop_price, "hard_fallback", 1, "missing_all_primary_inputs"
-
-        return None, None, 1, "missing_all_primary_inputs"
+        return resolve_exit_stop_price(
+            code=cf.code,
+            close_px=close_px,
+            atr_val=atr_val,
+            ma20=ma20,
+            ma50=ma50,
+            stop_price_at_entry=stop_price_at_entry,
+            pivot_val=pivot_val,
+            tight_low=tight_low,
+            entry_style_selected=entry_style_selected,
+            order_px=order_px,
+        )
 
 
     def _apply_candidate_width_backfill_and_concentration_guard(
