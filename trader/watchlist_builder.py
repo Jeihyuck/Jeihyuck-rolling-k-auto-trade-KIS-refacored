@@ -64,6 +64,7 @@ from trader.watchlist_column_utils import (
     ma20_candidate_priority as ma20_candidate_priority_impl,
     normalize_column_token as normalize_column_token_impl,
 )
+from trader.watchlist_ohlcv_utils import normalize_ohlcv_columns as normalize_ohlcv_columns_impl
 
 logger = logging.getLogger(__name__)
 
@@ -234,25 +235,7 @@ def _as_dataframe(value: Any) -> pd.DataFrame:
 
 
 def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df
-
-    normalized = df.copy()
-    normalized.columns = [str(col).strip().lower().replace(" ", "_") for col in normalized.columns]
-
-    def _map_if_missing(target: str, candidates: List[str]) -> None:
-        if target in normalized.columns:
-            return
-        for candidate in candidates:
-            if candidate in normalized.columns:
-                normalized.rename(columns={candidate: target}, inplace=True)
-                return
-
-    _map_if_missing("close", ["adj_close", "adjusted_close", "close_price", "stck_clpr"])
-    _map_if_missing("high", ["high_price", "stck_hgpr"])
-    _map_if_missing("low", ["low_price", "stck_lwpr"])
-    _map_if_missing("volume", ["vol", "trade_volume", "acml_vol", "acml_volm"])
-    return normalized
+    return normalize_ohlcv_columns_impl(df)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
