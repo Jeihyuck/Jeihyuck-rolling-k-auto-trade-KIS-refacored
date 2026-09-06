@@ -5,10 +5,12 @@ an economic order attempt and explicit same-day re-entry evidence.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import os
 from typing import Any, Iterable
+
+from trader.kr.pb1.sell_fence import NO_SELLABLE_STICKY, NoSellableStickyFence
 
 SEMANTIC_SELL_FAMILIES = (
     "SWING_STAGED_EXIT", "TRAIL_STOP_HIT", "TIME_STOP", "HARD_STOP",
@@ -85,23 +87,3 @@ def evaluate_same_day_reentry(*, sell_exists: bool, sell_confirmed: bool, pendin
     if cooldown_elapsed_min < required_cooldown or not recovered or not fresh_entry_signal or reentry_count >= max_count:
         return ReentryDecision(False, "BUYABLE_TODAY_SELL_REBUY_BLOCKED")
     return ReentryDecision(True, "BUYABLE_TODAY_REBUY_ALLOWED_BY_RECOVERY")
-
-
-class NoSellableStickyFence:
-    def __init__(self) -> None:
-        self._blocked: dict[tuple[str, str, str], str] = {}
-
-    def mark(self, *, trade_date: str, symbol: str, snapshot_version: str) -> None:
-        self._blocked[(trade_date, str(symbol).zfill(6), "SELL")] = str(snapshot_version)
-
-    def blocked(self, *, trade_date: str, symbol: str, snapshot_version: str,
-                orderable_qty: int) -> bool:
-        key = (trade_date, str(symbol).zfill(6), "SELL")
-        old_version = self._blocked.get(key)
-        if orderable_qty > 0 and old_version != str(snapshot_version):
-            self._blocked.pop(key, None)
-            return False
-        return old_version == str(snapshot_version)
-
-
-NO_SELLABLE_STICKY = NoSellableStickyFence()

@@ -24,6 +24,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from trader.us.runner.trade_tick_utils import (
+    aggregate_fill_notionals,
+    fill_is_synthetic,
+    fill_notional_usd,
+    is_transient_watchlist_db_error,
+    normalize_kis_endpoint_name,
+    safe_float,
+)
+
 logger = logging.getLogger(__name__)
 
 _ACCOUNTED_TOP_LEVEL_STAGES = (
@@ -126,21 +135,6 @@ def evaluate_balance_error_circuit(temp_error_count: int, recovered_count: int =
             "entry_block_reasons": reasons}
 
 
-_TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS = (
-    "edbhandlerexited",
-    "connection to database closed",
-    "server closed the connection",
-    "statement timeout",
-    "canceling statement due to statement timeout",
-    "operationalerror",
-    "internalerror",
-    "connection already closed",
-    "ssl syscall error",
-    "terminating connection",
-)
-
-
-
 def validate_us_regime_contract_for_entry(prep_result: dict | None, *, real_order_mode: bool, kis_order_allowed: bool) -> dict[str, Any]:
     prep_result = prep_result or {}
     required_contract_version = "us_sector_rotation_v3"
@@ -210,90 +204,27 @@ def build_monitoring_universe(final30_symbols: Any, current_position_symbols: An
 
 
 def _safe_float(value: Any) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    return safe_float(value)
 
 
 def _normalize_kis_endpoint_name(name: str) -> str:
-    text = str(name or "").strip()
-    if text == "GET_inquire_balance":
-        return "GET_inquire-balance"
-    return text
+    return normalize_kis_endpoint_name(name)
 
 
 def _fill_is_synthetic(fill: dict) -> bool:
-    meta = fill.get("meta") or {}
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except Exception:
-            meta = {}
-    evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
-    source = str(fill.get("source") or fill.get("reconcile_source") or meta.get("source") or "").lower()
-    return bool(
-        meta.get("is_synthetic")
-        or meta.get("synthetic")
-        or meta.get("synthetic_fill")
-        or evidence in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"}
-        or "balance_reconcile" in source
-        or "synthetic" in source
-    )
+    return fill_is_synthetic(fill)
 
 
 def _fill_notional_usd(fill: dict) -> float:
-    meta = fill.get("meta") or {}
-    if isinstance(meta, str):
-        try:
-            meta = json.loads(meta)
-        except Exception:
-            meta = {}
-    direct = (
-        fill.get("notional_usd")
-        or fill.get("fill_notional_usd")
-        or meta.get("notional_usd")
-        or meta.get("fill_notional_usd")
-        or meta.get("actual_fill_notional_usd")
-    )
-    if direct not in (None, ""):
-        return _safe_float(direct)
-    qty = _safe_float(
-        fill.get("qty")
-        or fill.get("filled_qty")
-        or fill.get("cumulative_filled_qty")
-        or fill.get("ft_ccld_qty")
-        or meta.get("qty")
-    )
-    price = _safe_float(
-        fill.get("fill_price")
-        or fill.get("avg_price_usd")
-        or fill.get("avg_price")
-        or fill.get("ft_ccld_unpr3")
-        or meta.get("fill_price")
-        or meta.get("avg_price_usd")
-    )
-    return qty * price if qty > 0 and price > 0 else 0.0
+    return fill_notional_usd(fill)
 
 
 def _aggregate_fill_notionals(fills: list[dict]) -> tuple[float, float]:
-    buy_total = 0.0
-    sell_total = 0.0
-    for fill in fills or []:
-        if _fill_is_synthetic(fill):
-            continue
-        side = str(fill.get("side") or "").upper()
-        notional = _fill_notional_usd(fill)
-        if side == "BUY":
-            buy_total += notional
-        elif side == "SELL":
-            sell_total += notional
-    return buy_total, sell_total
+    return aggregate_fill_notionals(fills)
 
 
 def _is_transient_watchlist_db_error(exc: BaseException) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return any(pattern in text for pattern in _TRANSIENT_WATCHLIST_DB_ERROR_PATTERNS)
+    return is_transient_watchlist_db_error(exc)
 
 
 def _prior_failed_orders_require_reconcile_only(trade_date: str, session: str) -> bool:

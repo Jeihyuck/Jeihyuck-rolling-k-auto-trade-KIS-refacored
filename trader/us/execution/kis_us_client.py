@@ -16,6 +16,11 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from trader.us import config as us_cfg
+from trader.us.execution.kis_us_utils import (
+    endpoint_label,
+    extract_input_field_name,
+    resolve_us_dailyprice_bymd as resolve_us_dailyprice_bymd_helper,
+)
 from trader.us.execution.kis_us_registry import (
     KIS_VTS_BASE_URL,
     TOKEN_PATH,
@@ -27,10 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 def _endpoint_label(method: str, path: str) -> str:
-    tail = str(path or "").strip().split("/")[-1]
-    if tail == "order":
-        return "POST_order" if method.upper() == "POST" else "GET_order"
-    return f"{method.upper()}_{tail}"
+    return endpoint_label(method, path)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -76,37 +78,11 @@ def record_kis_http_call(method: str, path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def resolve_us_dailyprice_bymd(as_of_date: str | None = None) -> str:
-    """KIS dailyprice BYMD 파라미터를 결정한다.
-
-    as_of_date가 있으면 해당 날짜의 YYYYMMDD 문자열을 반환한다.
-    없으면 현재 NY 시간 기준 오늘 날짜를 반환한다.
-
-    Examples:
-        resolve_us_dailyprice_bymd("2026-05-29") == "20260529"
-        resolve_us_dailyprice_bymd(None) == "20260531"  # 오늘 기준
-    """
-    if as_of_date:
-        return str(as_of_date).replace("-", "")[:8]
-    from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+    return resolve_us_dailyprice_bymd_helper(as_of_date)
 
 
 def _extract_input_field_name(error_msg: str) -> str:
-    """Extract missing field name from KIS INPUT_FIELD_NAME error.
-    
-    Args:
-        error_msg: KIS error message
-        
-    Returns:
-        Extracted field name or empty string
-    """
-    marker = "INPUT_FIELD_NAME"
-    if marker not in error_msg:
-        return ""
-    tail = error_msg.split(marker, 1)[-1]
-    cleaned = tail.replace("'", "").replace('"', "").replace(":", "").strip()
-    tokens = cleaned.split()
-    return tokens[0] if tokens else ""
+    return extract_input_field_name(error_msg)
 
 
 # ---------------------------------------------------------------------------

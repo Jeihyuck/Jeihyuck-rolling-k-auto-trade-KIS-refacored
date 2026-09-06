@@ -1,0 +1,60 @@
+# AI Code Map
+
+This document maps the main execution ownership boundaries for safe maintenance.
+
+## Shared rules
+
+- Preserve behavior first.
+- Treat ACK, FILL, cancel, and balance state transitions as contract-sensitive.
+- Keep KR and US implementations separate unless tests prove identical semantics.
+
+## KR PB1
+
+- Primary runtime surfaces: `trader/pb1_engine.py`, `trader/pb1_runner.py`
+- Responsibilities: KR entry/exit planning, sell fencing, order submission, lifecycle state, balance handling
+- Refactor guidance: extract helpers under `trader/kr/pb1/` with thin wrappers
+
+### PB1 facade remainder
+
+- Intentionally retained in `trader/pb1_engine.py`: KR adaptive candidate filtering, market-stress detection, rescue-candidate selection, and session/result aggregation.
+- Reason: these paths still coordinate shared engine state, warning counters, and logging order across several helper boundaries, so moving them now would risk changing side-effect sequencing.
+- Extracted Phase 2 helpers now include exit planning, entry planning, run-context state, window resolution, as-of backfill, lifecycle init, and earlier sell/exit helpers.
+- Audit snapshot (2026-09-06): `trader/pb1_engine.py` remains ~865kB because the retained orchestration still owns the stateful KR candidate pipeline above; it is intentionally not peeled further for line-count reduction alone.
+
+## KR Infinite / 122630
+
+- Primary runtime surfaces: KR infinite strategy and lifecycle modules
+- Responsibilities: cycle state, quote handling, pending reconciliation, durable fencing
+- Refactor guidance: preserve invalid-quote and reconciliation behavior exactly
+
+## US PB1 / standard US
+
+- Primary runtime surfaces: `trader/us/runner/*`, `trader/us/execution/*`, `trader/us/db/*`
+- Responsibilities: prep, trade-am, trade-pm, trade-close, reporting, routing, ACK/FILL reconciliation
+- Boundary: use `us_` tables only; do not read KR orders/positions/signals directly
+- Audit snapshot (2026-09-06): remaining US hot paths stay in their runner/router/repo facades because they still coordinate order sequencing, transaction boundaries, or report assembly; extracted helpers now live in `session_timeout_utils.py`, `kis_us_utils.py`, `exchange_utils.py`, `daily_report_utils.py`, `trade_tick_utils.py`, `trade_session_utils.py`, and `db/fill_accounting_utils.py`.
+
+## TQQQ Infinite
+
+- Primary runtime surfaces: US infinite-style strategy and lifecycle modules
+- Responsibilities: open/TTL cancel identity, lifecycle separation between open BUY and other SELL flow
+
+## Shared execution / reconciliation
+
+- Primary runtime surfaces: broker adapter and order routing layers
+- Responsibilities: submit mechanics, response interpretation, fill reconciliation, durable state updates
+- Rule: preserve broker parameters and event ordering
+
+## Reporting
+
+- Primary runtime surfaces: daily/summary report runners and report generators
+- Responsibilities: read-only aggregation, formatting, and delivery
+- Rule: reporting must not mutate trading state
+
+## Recommended maintenance order
+
+1. Add characterization tests.
+2. Identify owner boundary.
+3. Move pure helpers first.
+4. Extract submission and lifecycle logic next.
+5. Keep compatibility wrappers until callers are migrated.

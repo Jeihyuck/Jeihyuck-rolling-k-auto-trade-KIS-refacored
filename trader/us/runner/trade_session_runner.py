@@ -28,54 +28,15 @@ from datetime import datetime as dt, timedelta
 datetime = dt  # backward-compatible module-level name; avoid function-local import shadowing
 from pathlib import Path
 
+from trader.us.runner.trade_session_utils import attribute_session_fills as attribute_session_fills_helper
+from trader.us.runner.session_timeout_utils import advance_timeout_execution_mode, tick_has_authoritative_execution_health
+
 logger = logging.getLogger(__name__)
 
 
 def attribute_session_fills(orders: list[dict], broker_fills: list[dict], *, session: str, session_run_id: str) -> dict:
-    """Attribute cumulative broker evidence only to orders submitted by this session."""
-    session_orders = [row for row in orders or [] if str(row.get("session") or "").lower() == session.lower()
-                      and str(row.get("session_run_id") or "") == str(session_run_id)]
-    def identities(row: dict) -> tuple[str, str, str]:
-        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-        return (
-            str(row.get("canonical_order_no") or row.get("canonical_broker_order_no") or row.get("order_no") or ""),
-            str(row.get("submit_attempt_id") or meta.get("submit_attempt_id") or ""),
-            str(row.get("client_order_key") or meta.get("client_order_key") or ""),
-        )
-    fill_ids = [identities(row) for row in broker_fills or [] if int(row.get("filled_qty") or row.get("qty") or 0) > 0]
-    matched = 0
-    unresolved = 0
-    seen_orders: set[tuple[str, str, str]] = set()
-    for order in session_orders:
-        wanted = identities(order)
-        dedupe_key = next(((value, "", "") for value in wanted if value), wanted)
-        if dedupe_key in seen_orders:
-            continue
-        seen_orders.add(dedupe_key)
-        found = any(any(value and value == evidence[index] for index, value in enumerate(wanted)) for evidence in fill_ids)
-        matched += int(found)
-        unresolved += int(not found)
-    return {"session_fills_count": matched, "unresolved_order_count": unresolved}
+    return attribute_session_fills_helper(orders, broker_fills, session=session, session_run_id=session_run_id)
 
-
-def tick_has_authoritative_execution_health(tick: dict) -> bool:
-    """Recovery requires all broker state, not merely a successful quote."""
-    return bool(
-        not tick.get("balance_fetch_failed")
-        and str(tick.get("ack_reconcile_after_route_status") or tick.get("ack_reconcile_status") or "OK").upper() == "OK"
-        and int(tick.get("unresolved_ack_count", 0) or 0) == 0
-        and str(tick.get("fill_source_status") or "OK").upper() == "OK"
-        and str(tick.get("durable_fence_status") or "ACTIVE").upper() == "ACTIVE"
-    )
-
-
-def advance_timeout_execution_mode(mode: str, consecutive: int, *, threshold: int, healthy_tick: dict | None = None) -> tuple[str, bool]:
-    """Pure session-liveness transition used by the runner and regressions."""
-    if healthy_tick is not None and tick_has_authoritative_execution_health(healthy_tick):
-        return "NORMAL", True
-    if consecutive >= threshold:
-        return "SAFE_DEGRADED", False
-    return mode, mode == "NORMAL"
 _received_signal: int | None = None
 _last_liveness_event = ""
 _exit_code: int | None = None

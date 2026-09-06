@@ -54,6 +54,23 @@ from trader.indicators import compute_atr_pct_from_ohlcv, compute_ma20_from_ohlc
 from trader.kr.regime import normalize_kr_market
 from trader.score_columns import resolve_score_column
 from trader.time_coerce import to_date
+from trader.watchlist_entry_style import (
+    infer_entry_style_from_scores as infer_entry_style_from_scores_impl,
+    normalize_entry_style_value as normalize_entry_style_value_impl,
+)
+from trader.watchlist_column_utils import (
+    MA20_NORMALIZE_PRIORITY,
+    is_ma20_candidate_column as is_ma20_candidate_column_impl,
+    ma20_candidate_priority as ma20_candidate_priority_impl,
+    normalize_column_token as normalize_column_token_impl,
+)
+from trader.watchlist_dataframe_utils import as_dataframe as as_dataframe_impl
+from trader.watchlist_ohlcv_utils import normalize_ohlcv_columns as normalize_ohlcv_columns_impl
+from trader.watchlist_short_feature_utils import (
+    short_feature_null_count as short_feature_null_count_impl,
+    short_feature_sample_rows as short_feature_sample_rows_impl,
+    should_backfill_short_horizon_features as should_backfill_short_horizon_features_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,42 +224,11 @@ def _log_final30_scored_df_ready(final30_scored_df: pd.DataFrame) -> None:
 
 
 def _as_dataframe(value: Any) -> pd.DataFrame:
-    if value is None:
-        return pd.DataFrame()
-    if isinstance(value, pd.DataFrame):
-        return value
-    if isinstance(value, list):
-        return pd.DataFrame(value)
-    if isinstance(value, tuple):
-        return pd.DataFrame(list(value))
-    if isinstance(value, dict):
-        return pd.DataFrame([value])
-    try:
-        return pd.DataFrame(value)
-    except Exception:
-        return pd.DataFrame()
+    return as_dataframe_impl(value)
 
 
 def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame() if df is None else df
-
-    normalized = df.copy()
-    normalized.columns = [str(col).strip().lower().replace(" ", "_") for col in normalized.columns]
-
-    def _map_if_missing(target: str, candidates: List[str]) -> None:
-        if target in normalized.columns:
-            return
-        for candidate in candidates:
-            if candidate in normalized.columns:
-                normalized.rename(columns={candidate: target}, inplace=True)
-                return
-
-    _map_if_missing("close", ["adj_close", "adjusted_close", "close_price", "stck_clpr"])
-    _map_if_missing("high", ["high_price", "stck_hgpr"])
-    _map_if_missing("low", ["low_price", "stck_lwpr"])
-    _map_if_missing("volume", ["vol", "trade_volume", "acml_vol", "acml_volm"])
-    return normalized
+    return normalize_ohlcv_columns_impl(df)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -361,36 +347,15 @@ def _prefer_numeric_candidates(values: List[Any], *, zero_invalid: bool = False)
 
 
 def _normalize_column_token(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    return normalize_column_token_impl(value)
 
 
 def _ma20_candidate_priority(column: Any) -> int:
-    normalized = _normalize_column_token(column)
-    for idx, candidate in enumerate(MA20_NORMALIZE_PRIORITY):
-        candidate_token = _normalize_column_token(candidate)
-        if normalized == candidate_token:
-            return idx
-        if normalized in {f"{candidate_token}x", f"{candidate_token}y"}:
-            return idx + len(MA20_NORMALIZE_PRIORITY)
-    if normalized in {"ma20x", "ma20y"}:
-        return len(MA20_NORMALIZE_PRIORITY)
-    return 10_000
+    return ma20_candidate_priority_impl(column)
 
 
 def _is_ma20_candidate_column(column: Any) -> bool:
-    normalized = _normalize_column_token(column)
-    candidate_tokens = {_normalize_column_token(name) for name in MA20_NORMALIZE_PRIORITY}
-    if normalized in candidate_tokens:
-        return True
-    if normalized in {f"{token}x" for token in candidate_tokens}:
-        return True
-    if normalized in {f"{token}y" for token in candidate_tokens}:
-        return True
-    if "ma20" in normalized:
-        return True
-    if "ma" in normalized and "20" in normalized:
-        return True
-    return False
+    return is_ma20_candidate_column_impl(column)
 
 
 def _build_numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
@@ -463,19 +428,11 @@ def log_final30_ma_diagnostics(df: pd.DataFrame, stage: str) -> None:
 
 
 def _short_feature_sample_rows(df: pd.DataFrame, limit: int = 5) -> List[Dict[str, Any]]:
-    if df is None or df.empty:
-        return []
-
-    sample_columns = [column for column in ("code", "ma20", "volume_avg20", "ma50", "close") if column in df.columns]
-    if not sample_columns:
-        return []
-    return df.loc[:, sample_columns].head(limit).to_dict(orient="records")
+    return short_feature_sample_rows_impl(df, limit=limit)
 
 
 def _short_feature_null_count(df: pd.DataFrame, column: str) -> int:
-    if df is None or column not in df.columns:
-        return -1
-    return int(_build_numeric_series(df, column).isna().sum())
+    return short_feature_null_count_impl(df, column)
 
 
 def log_short_horizon_feature_diag(df: pd.DataFrame, stage: str) -> None:
@@ -503,21 +460,7 @@ def log_short_horizon_feature_diag(df: pd.DataFrame, stage: str) -> None:
 
 
 def _should_backfill_short_horizon_features(df: pd.DataFrame, *, require_all_null: bool) -> bool:
-    if df is None or df.empty:
-        return False
-
-    rows = len(df)
-    if rows <= 0:
-        return False
-
-    ma20_missing = "ma20" not in df.columns
-    vol20_missing = "volume_avg20" not in df.columns
-    ma20_null = _short_feature_null_count(df, "ma20")
-    vol20_null = _short_feature_null_count(df, "volume_avg20")
-
-    if require_all_null:
-        return bool(ma20_missing or vol20_missing or ma20_null == rows or vol20_null == rows)
-    return bool(ma20_missing or vol20_missing or ma20_null > 0 or vol20_null > 0)
+    return should_backfill_short_horizon_features_impl(df, require_all_null=require_all_null)
 
 
 def load_recent_ohlcv_for_codes(
@@ -765,41 +708,12 @@ def _to_float_safe(value: Any, default: float = 0.0) -> float:
 
 def _normalize_entry_style_value(value: Any) -> str:
     """raw entry_style_selected 값을 BREAKOUT/PULLBACK/MOMENTUM 중 하나로 정규화."""
-    raw = str(value or "").strip().upper()
-    aliases = {
-        "BREAK": "BREAKOUT",
-        "BO": "BREAKOUT",
-        "ENTRY_BREAKOUT": "BREAKOUT",
-        "PULL": "PULLBACK",
-        "PB": "PULLBACK",
-        "ENTRY_PULLBACK": "PULLBACK",
-        "MOMO": "MOMENTUM",
-        "MOM": "MOMENTUM",
-        "ENTRY_MOMENTUM": "MOMENTUM",
-        "MOMENTUM_CONTINUATION": "MOMENTUM",
-    }
-    return aliases.get(raw, raw)
+    return normalize_entry_style_value_impl(value)
 
 
 def _infer_entry_style_from_scores(row: dict) -> str:
     """breakout_score/pullback_score/momentum_score 중 최대값으로 entry_style을 추론."""
-    breakout = _to_float_safe(row.get("breakout_score"))
-    pullback = _to_float_safe(row.get("pullback_score"))
-    momentum = _to_float_safe(row.get("momentum_score"))
-
-    scores = {
-        "BREAKOUT": breakout,
-        "PULLBACK": pullback,
-        "MOMENTUM": momentum,
-    }
-
-    # 모두 0이면 MOMENTUM 기본값 (score가 없어도 PREP 전체가 죽으면 안 됨)
-    if max(scores.values()) <= 0:
-        return "MOMENTUM"
-
-    # 동점이면 MOMENTUM > PULLBACK > BREAKOUT 우선
-    priority = {"MOMENTUM": 3, "PULLBACK": 2, "BREAKOUT": 1}
-    return sorted(scores.items(), key=lambda kv: (kv[1], priority[kv[0]]), reverse=True)[0][0]
+    return infer_entry_style_from_scores_impl(row)
 
 
 def sanitize_final30_entry_styles(rows: List[Dict[str, Any]], *, stage: str, hard: bool = False) -> List[Dict[str, Any]]:
