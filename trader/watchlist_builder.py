@@ -65,6 +65,11 @@ from trader.watchlist_column_utils import (
     normalize_column_token as normalize_column_token_impl,
 )
 from trader.watchlist_ohlcv_utils import normalize_ohlcv_columns as normalize_ohlcv_columns_impl
+from trader.watchlist_short_feature_utils import (
+    short_feature_null_count as short_feature_null_count_impl,
+    short_feature_sample_rows as short_feature_sample_rows_impl,
+    should_backfill_short_horizon_features as should_backfill_short_horizon_features_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -435,19 +440,11 @@ def log_final30_ma_diagnostics(df: pd.DataFrame, stage: str) -> None:
 
 
 def _short_feature_sample_rows(df: pd.DataFrame, limit: int = 5) -> List[Dict[str, Any]]:
-    if df is None or df.empty:
-        return []
-
-    sample_columns = [column for column in ("code", "ma20", "volume_avg20", "ma50", "close") if column in df.columns]
-    if not sample_columns:
-        return []
-    return df.loc[:, sample_columns].head(limit).to_dict(orient="records")
+    return short_feature_sample_rows_impl(df, limit=limit)
 
 
 def _short_feature_null_count(df: pd.DataFrame, column: str) -> int:
-    if df is None or column not in df.columns:
-        return -1
-    return int(_build_numeric_series(df, column).isna().sum())
+    return short_feature_null_count_impl(df, column)
 
 
 def log_short_horizon_feature_diag(df: pd.DataFrame, stage: str) -> None:
@@ -475,21 +472,7 @@ def log_short_horizon_feature_diag(df: pd.DataFrame, stage: str) -> None:
 
 
 def _should_backfill_short_horizon_features(df: pd.DataFrame, *, require_all_null: bool) -> bool:
-    if df is None or df.empty:
-        return False
-
-    rows = len(df)
-    if rows <= 0:
-        return False
-
-    ma20_missing = "ma20" not in df.columns
-    vol20_missing = "volume_avg20" not in df.columns
-    ma20_null = _short_feature_null_count(df, "ma20")
-    vol20_null = _short_feature_null_count(df, "volume_avg20")
-
-    if require_all_null:
-        return bool(ma20_missing or vol20_missing or ma20_null == rows or vol20_null == rows)
-    return bool(ma20_missing or vol20_missing or ma20_null > 0 or vol20_null > 0)
+    return should_backfill_short_horizon_features_impl(df, require_all_null=require_all_null)
 
 
 def load_recent_ohlcv_for_codes(
