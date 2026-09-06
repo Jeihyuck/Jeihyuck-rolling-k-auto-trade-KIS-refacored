@@ -18,7 +18,7 @@ This document maps the main execution ownership boundaries for safe maintenance.
 
 - Intentionally retained in `trader/pb1_engine.py`: KR adaptive candidate filtering, market-stress detection, rescue-candidate selection, and session/result aggregation.
 - Reason: these paths still coordinate shared engine state, warning counters, and logging order across several helper boundaries, so moving them now would risk changing side-effect sequencing.
-- Extracted Phase 2 helpers now include entry planning, run-context state, window resolution, as-of backfill, lifecycle init, and earlier sell/exit helpers.
+- Extracted Phase 2 helpers now include exit planning, entry planning, run-context state, window resolution, as-of backfill, lifecycle init, and earlier sell/exit helpers.
 
 ## KR Infinite / 122630
 
