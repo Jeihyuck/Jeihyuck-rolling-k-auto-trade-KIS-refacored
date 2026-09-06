@@ -54,6 +54,10 @@ from trader.indicators import compute_atr_pct_from_ohlcv, compute_ma20_from_ohlc
 from trader.kr.regime import normalize_kr_market
 from trader.score_columns import resolve_score_column
 from trader.time_coerce import to_date
+from trader.watchlist_entry_style import (
+    infer_entry_style_from_scores as infer_entry_style_from_scores_impl,
+    normalize_entry_style_value as normalize_entry_style_value_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -765,41 +769,12 @@ def _to_float_safe(value: Any, default: float = 0.0) -> float:
 
 def _normalize_entry_style_value(value: Any) -> str:
     """raw entry_style_selected 값을 BREAKOUT/PULLBACK/MOMENTUM 중 하나로 정규화."""
-    raw = str(value or "").strip().upper()
-    aliases = {
-        "BREAK": "BREAKOUT",
-        "BO": "BREAKOUT",
-        "ENTRY_BREAKOUT": "BREAKOUT",
-        "PULL": "PULLBACK",
-        "PB": "PULLBACK",
-        "ENTRY_PULLBACK": "PULLBACK",
-        "MOMO": "MOMENTUM",
-        "MOM": "MOMENTUM",
-        "ENTRY_MOMENTUM": "MOMENTUM",
-        "MOMENTUM_CONTINUATION": "MOMENTUM",
-    }
-    return aliases.get(raw, raw)
+    return normalize_entry_style_value_impl(value)
 
 
 def _infer_entry_style_from_scores(row: dict) -> str:
     """breakout_score/pullback_score/momentum_score 중 최대값으로 entry_style을 추론."""
-    breakout = _to_float_safe(row.get("breakout_score"))
-    pullback = _to_float_safe(row.get("pullback_score"))
-    momentum = _to_float_safe(row.get("momentum_score"))
-
-    scores = {
-        "BREAKOUT": breakout,
-        "PULLBACK": pullback,
-        "MOMENTUM": momentum,
-    }
-
-    # 모두 0이면 MOMENTUM 기본값 (score가 없어도 PREP 전체가 죽으면 안 됨)
-    if max(scores.values()) <= 0:
-        return "MOMENTUM"
-
-    # 동점이면 MOMENTUM > PULLBACK > BREAKOUT 우선
-    priority = {"MOMENTUM": 3, "PULLBACK": 2, "BREAKOUT": 1}
-    return sorted(scores.items(), key=lambda kv: (kv[1], priority[kv[0]]), reverse=True)[0][0]
+    return infer_entry_style_from_scores_impl(row)
 
 
 def sanitize_final30_entry_styles(rows: List[Dict[str, Any]], *, stage: str, hard: bool = False) -> List[Dict[str, Any]]:
