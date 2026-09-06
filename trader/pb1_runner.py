@@ -135,6 +135,10 @@ from trader.db.repos import WatchlistRepo
 from trader.data.ohlcv_provider import ChainOHLCVProvider, KISOHLCVProvider, KRXOHLCVProvider
 from trader.indicators import compute_ma20_from_ohlcv, safe_nullable_float
 from trader.strategies.pb1_minervini_v2 import MinerviniConfig
+from trader.pb1_runner_contract_utils import (
+    missing_scored_cols as missing_scored_cols_impl,
+    safe_flow_optional_missing as safe_flow_optional_missing_impl,
+)
 
 logger = logging.getLogger(__name__)
 log = logger
@@ -161,24 +165,11 @@ _FINAL30_LOAD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _missing_scored_cols(columns: list[str]) -> list[str]:
-    cols = {str(c) for c in (columns or [])}
-    missing = [c for c in REQUIRED_FINAL30_SCORED_COLS if c not in cols]
-    for primary, alternative in OPTIONAL_SCORING_ALTERNATIVE_COLS:
-        if primary in missing and alternative in cols:
-            missing.remove(primary)
-    return missing
+    return missing_scored_cols_impl(columns)
 
 
 def _safe_flow_optional_missing(columns: list[str]) -> list[str]:
-    try:
-        flow_optional_cols = globals().get("FLOW_OPTIONAL_COLS", [])
-        return [col for col in flow_optional_cols if col not in set(columns or [])]
-    except Exception as exc:
-        logger.warning(
-            "[FINAL30][FLOW_CHECK_GUARD] optional flow check failed err=%s",
-            exc,
-        )
-        return []
+    return safe_flow_optional_missing_impl(columns, flow_optional_cols=globals().get("FLOW_OPTIONAL_COLS", []))
 
 
 def _manual_test_route_reasons(*, mode: str) -> list[str]:
