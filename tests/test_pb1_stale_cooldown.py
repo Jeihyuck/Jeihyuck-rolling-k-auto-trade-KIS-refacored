@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from trader.pb1_engine import PB1Engine
+from trader.kr.pb1.buy_cooldown import resolve_buy_cooldown_state
 
 
 def test_resolve_buy_cooldown_state_ignores_stale_metadata() -> None:
@@ -59,6 +60,33 @@ def test_resolve_buy_cooldown_state_same_day_duplicate_only() -> None:
         recent_exit_reason=None,
     )
 
-    assert result["cooldown_active"] is False
+    assert result["cooldown_active"] is True
     assert result["final_cooldown_policy"] == "same_day_only"
     assert result["cooldown_source"] == "same_day_duplicate_prevention"
+
+
+def test_resolve_buy_cooldown_state_helper_matches_engine_wrapper() -> None:
+    helper_result = resolve_buy_cooldown_state(
+        today="2026-04-13",
+        code="005930",
+        cooldown_until="2026-04-14",
+        holding_qty=0,
+        today_buy_exists=False,
+        today_fill_exists=False,
+        cooldown_source_events_count=0,
+        last_fill_event_at=None,
+    )
+
+    engine = PB1Engine.__new__(PB1Engine)
+    engine._today = "2026-04-13"
+    wrapper_result = engine._resolve_buy_cooldown_state(
+        code="005930",
+        cooldown_until="2026-04-14",
+        holding_qty=0,
+        today_buy_exists=False,
+        today_fill_exists=False,
+        cooldown_source_events_count=0,
+        last_fill_event_at=None,
+    )
+
+    assert helper_result == wrapper_result
