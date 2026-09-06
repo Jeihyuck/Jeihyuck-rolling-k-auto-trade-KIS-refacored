@@ -47,6 +47,11 @@ from trader.time_coerce import to_date
 from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 from trader.account_state import get_account_key
+from trader.db.value_utils import (
+    merge_json_dict as merge_json_dict_impl,
+    restore_numeric_from_sources as restore_numeric_from_sources_impl,
+    safe_float_or_none as safe_float_or_none_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,34 +277,15 @@ class ScoredWatchlistInvalidError(ScoredWatchlistError):
 
 
 def _merge_json_dict(base: Any, incoming: Any) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    if isinstance(base, dict):
-        merged.update(base)
-    if isinstance(incoming, dict):
-        merged.update(incoming)
-    return json_sanitize(merged)
+    return merge_json_dict_impl(base, incoming)
 
 
 def _safe_float_or_none(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
+    return safe_float_or_none_impl(value)
 
 
 def _restore_numeric_from_sources(*sources: Any, aliases: tuple[str, ...]) -> float | None:
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        for alias in aliases:
-            if alias not in source:
-                continue
-            numeric = safe_nullable_float(source.get(alias))
-            if numeric is not None:
-                return float(numeric)
-    return None
+    return restore_numeric_from_sources_impl(*sources, aliases=aliases)
 
 
 def _field_null_counts(rows: List[Dict[str, Any]], fields: Iterable[str]) -> Dict[str, int]:
