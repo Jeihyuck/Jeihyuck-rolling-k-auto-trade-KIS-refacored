@@ -32,6 +32,7 @@ from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
 from trader.kr.pb1.buy_timing import is_buy_allowed_now
+from trader.kr.pb1.entry_family import resolve_entry_setup_family, resolve_entry_decision_family
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.kr.pb1.market_close import resolve_market_close
@@ -6408,18 +6409,13 @@ class PB1Engine:
         return evaluation
 
     def _resolve_entry_setup_family(self, cf: CandidateFeature) -> str:
-        selected_family = self._normalize_entry_reason(cf.features.get("entry_style_selected") or cf.features.get("entry_signal"))
-        score_lookup = {
-            "ENTRY_BREAKOUT": float(cf.features.get("breakout_score") or 0.0),
-            "ENTRY_PULLBACK": float(cf.features.get("pullback_score") or 0.0),
-            "ENTRY_MOMENTUM": float(cf.features.get("momentum_score") or 0.0),
-        }
-        if selected_family in score_lookup and score_lookup[selected_family] > 0:
-            return selected_family
-        strongest_family = max(score_lookup.items(), key=lambda item: item[1])[0]
-        if score_lookup[strongest_family] > 0:
-            return strongest_family
-        return "ENTRY_GENERIC"
+        return resolve_entry_setup_family(
+            entry_style_selected=cf.features.get("entry_style_selected"),
+            entry_signal=cf.features.get("entry_signal"),
+            breakout_score=float(cf.features.get("breakout_score") or 0.0),
+            pullback_score=float(cf.features.get("pullback_score") or 0.0),
+            momentum_score=float(cf.features.get("momentum_score") or 0.0),
+        )
 
     @staticmethod
     def _normalize_entry_reason(value: Any) -> str:
@@ -6441,21 +6437,12 @@ class PB1Engine:
         breakout_trigger_ok: bool,
         trigger_reason: Any = None,
     ) -> str:
-        normalized_reason = cls._normalize_entry_reason(entry_reason)
-        trigger_reason_s = str(trigger_reason or "").strip().lower()
-        if breakout_trigger_ok:
-            return "ENTRY_BREAKOUT_CONFIRMED"
-        if normalized_reason == "ENTRY_PULLBACK" and setup_filters_ok:
-            return "ENTRY_PULLBACK_OVERRIDE"
-        if normalized_reason == "ENTRY_MOMENTUM" and setup_filters_ok:
-            return "ENTRY_MOMENTUM_CONTINUATION"
-        if setup_filters_ok:
-            if "score" in trigger_reason_s:
-                return "ENTRY_SCORE_OVERRIDE"
-            return "ENTRY_SETUP_OVERRIDE"
-        if "score" in trigger_reason_s:
-            return "ENTRY_SCORE_OVERRIDE"
-        return "ENTRY_SETUP_OVERRIDE"
+        return resolve_entry_decision_family(
+            entry_reason=entry_reason,
+            setup_filters_ok=setup_filters_ok,
+            breakout_trigger_ok=breakout_trigger_ok,
+            trigger_reason=trigger_reason,
+        )
 
     @classmethod
     def _resolve_exit_family(cls, entry_reason: Any, entry_style_selected: Any) -> tuple[str, str]:
