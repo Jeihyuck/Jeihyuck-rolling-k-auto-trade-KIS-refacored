@@ -33,6 +33,11 @@ from trader.kr.pb1.exit_stop_price import resolve_exit_stop_price
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
+from trader.kr.pb1.effective_exit_risk import resolve_effective_exit_risk_for_pos as resolve_effective_exit_risk_for_pos_impl
+from trader.kr.pb1.reconcile_utils import (
+    extract_cooldown_source_details as extract_cooldown_source_details_impl,
+    fill_reconcile_warn_needed as fill_reconcile_warn_needed_impl,
+)
 from trader.kr.pb1.run_context_state import (
     initialize_run_context_state as initialize_run_context_state_impl,
     resolve_as_of_state, resolve_run_context_state,
@@ -1255,111 +1260,7 @@ def _calculate_exit_qty(holding_qty: int, orderable_qty: int, sell_pct: float | 
 
 
 def _resolve_effective_exit_risk_for_pos(pos: dict[str, Any]) -> dict[str, Any]:
-    """기존 보유 포지션 포함 모든 포지션의 exit 평가용 effective stop/R을 계산한다.
-
-    DB에 저장된 기존 stop_price_at_entry가 너무 깊어도 최신 정책 기준(7%/8% 캡)으로 보정한다.
-    수정 방향: effective_stop = max(raw_stop, entry_price * (1 - cap_pct))
-    long 기준으로 higher stop = tighter stop이므로 max()를 사용한다.
-
-    Note: os.getenv를 직접 사용하여 테스트 시 monkeypatch가 즉시 반영되도록 한다.
-    """
-    import os as _os
-
-    eff_exit_enabled = _os.getenv("PB1_EXISTING_POSITION_EFFECTIVE_EXIT_ENABLED", "1") != "0"
-    stop_cap_enabled = _os.getenv("PB1_EFFECTIVE_STOP_CAP_ENABLED", "1") != "0"
-
-    meta = pos.get("position_meta") or {}
-    if isinstance(meta, str):
-        try:
-            import json as _json
-            meta = _json.loads(meta)
-        except Exception:
-            meta = {}
-
-    entry_price = float(
-        pos.get("entry_price")
-        or pos.get("avg_buy_price")
-        or pos.get("avg")
-        or 0.0
-    )
-    raw_stop = float(
-        meta.get("initial_stop_price")
-        or pos.get("stop_price_at_entry")
-        or pos.get("stop_price")
-        or pos.get("initial_stop")
-        or 0.0
-    )
-
-    if entry_price <= 0:
-        return {
-            "entry_price": entry_price,
-            "raw_stop_price": raw_stop,
-            "effective_stop_price": raw_stop,
-            "raw_r_value": None,
-            "effective_r_value": None,
-            "stop_cap_price": None,
-            "stop_cap_pct": None,
-            "effective_applied": False,
-            "market": "",
-            "code": str(pos.get("code") or ""),
-            "reason": "invalid_entry_price",
-        }
-
-    raw_r = entry_price - raw_stop if raw_stop > 0 else None
-
-    market = str(pos.get("market") or pos.get("market_code") or "").upper()
-    code = str(pos.get("code") or pos.get("pdno") or "").zfill(6)
-
-    _kospi_cap = float(_os.getenv("PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT", str(PB1_EFFECTIVE_STOP_CAP_KOSPI_PCT)))
-    _kosdaq_cap = float(_os.getenv("PB1_EFFECTIVE_STOP_CAP_KOSDAQ_PCT", str(PB1_EFFECTIVE_STOP_CAP_KOSDAQ_PCT)))
-
-    stop_cap_pct = _kospi_cap
-    if market in {"KQ", "KOSDAQ", "Q"}:
-        stop_cap_pct = _kosdaq_cap
-
-    stop_cap_price = entry_price * (1.0 - stop_cap_pct / 100.0)
-    effective_stop = raw_stop
-    effective_applied = False
-
-    if eff_exit_enabled and stop_cap_enabled:
-        if raw_stop <= 0:
-            effective_stop = stop_cap_price
-            effective_applied = True
-        else:
-            # long 기준: 높은 stop이 더 타이트 → max()로 캡 적용
-            effective_stop = max(raw_stop, stop_cap_price)
-            effective_applied = effective_stop != raw_stop
-
-    effective_r = entry_price - effective_stop if effective_stop > 0 else None
-    if effective_r is not None and effective_r <= 0:
-        effective_r = raw_r
-
-    logger.info(
-        "[EXIT][EFFECTIVE_RISK] code=%s entry=%.2f raw_stop=%s effective_stop=%s "
-        "raw_r=%s effective_r=%s cap_pct=%s applied=%s",
-        code,
-        entry_price,
-        raw_stop,
-        round(effective_stop, 2) if effective_stop else None,
-        round(raw_r, 2) if raw_r is not None else None,
-        round(effective_r, 2) if effective_r is not None else None,
-        stop_cap_pct,
-        int(effective_applied),
-    )
-
-    return {
-        "entry_price": entry_price,
-        "raw_stop_price": raw_stop,
-        "effective_stop_price": effective_stop,
-        "raw_r_value": raw_r,
-        "effective_r_value": effective_r,
-        "stop_cap_price": stop_cap_price,
-        "stop_cap_pct": stop_cap_pct,
-        "effective_applied": effective_applied,
-        "market": market,
-        "code": code,
-        "reason": "ok",
-    }
+    return resolve_effective_exit_risk_for_pos_impl(pos)
 
 
 
@@ -1934,41 +1835,10 @@ def _should_allow_single_share_position_cap_override(
 
 
 def _extract_cooldown_source_details(ledger_rows: Iterable[dict[str, Any]] | None) -> dict[str, Any]:
-    risk_off_exit_reasons = {"EXIT_RISK_OFF", "EXIT_SOFT_RISK_OFF", "BUG_RECOVERY_EXIT"}
-    for row in ledger_rows or []:
-        event_type = str((row or {}).get("event_type") or "").strip().upper()
-        side = str((row or {}).get("side") or "").strip().upper()
-        reasons = [str(item).strip().upper() for item in ((row or {}).get("reasons") or []) if str(item).strip()]
-        payload = (row or {}).get("payload_json") if isinstance((row or {}).get("payload_json"), dict) else {}
-        exit_reason = str(payload.get("exit_reason") or payload.get("reason") or (reasons[0] if reasons else "")).strip().upper()
-        if not exit_reason:
-            continue
-        if side != "SELL" and not event_type.startswith("EXIT"):
-            continue
-        if exit_reason in risk_off_exit_reasons:
-            return {
-                "source": "risk_off_same_day_only",
-                "recent_valid_exit_event": False,
-                "recent_exit_reason": exit_reason,
-                "evidence_count": 1,
-            }
-        return {
-            "source": "completed_trade_cooldown",
-            "recent_valid_exit_event": True,
-            "recent_exit_reason": exit_reason,
-            "evidence_count": 1,
-        }
-    return {
-        "source": "none",
-        "recent_valid_exit_event": False,
-        "recent_exit_reason": None,
-        "evidence_count": 0,
-    }
+    return extract_cooldown_source_details_impl(ledger_rows)
 
 def _fill_reconcile_warn_needed(filled_price: float, avg_price_from_balance: float) -> bool:
-    if filled_price <= 0 or avg_price_from_balance <= 0:
-        return False
-    return abs(filled_price - avg_price_from_balance) / avg_price_from_balance > 0.01
+    return fill_reconcile_warn_needed_impl(filled_price, avg_price_from_balance)
 
 
 @dataclass
