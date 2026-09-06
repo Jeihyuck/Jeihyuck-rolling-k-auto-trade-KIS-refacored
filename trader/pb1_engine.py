@@ -23,6 +23,7 @@ from trader.balance_utils import extract_dnca_tot_amt as _extract_dnca_tot_amt
 from trader.kr.pb1.durable_sell_block import durable_sell_block as _durable_sell_block_impl
 from trader.kr.pb1.buy_cooldown import resolve_buy_cooldown_state
 from trader.kr.pb1.entry_capital import resolve_entry_capital
+from trader.kr.pb1.entry_cutoff import resolve_entry_cutoff
 from trader.kr.pb1.exit_family import resolve_exit_family
 from trader.kr.pb1.exit_cooldown import resolve_exit_cooldown_until
 from trader.kr.pb1.exit_policy import resolve_exit_policy
@@ -3594,17 +3595,11 @@ class PB1Engine:
             logger.warning("[SIM_ORDER][DB_FAIL] code=%s err=%s", code, exc)
 
     def _resolve_entry_cutoff(self) -> tuple[datetime, str]:
-        raw = (os.getenv("ENTRY_CUTOFF_TIME") or PB1_ENTRY_WINDOW_END or "").strip()
-        if not raw:
-            raw = "15:15"
-        try:
-            cutoff_time = datetime.strptime(raw, "%H:%M").time()
-        except ValueError:
-            logger.warning("[PB1][ENV] invalid ENTRY_CUTOFF_TIME=%s fallback=%s", raw, PB1_ENTRY_WINDOW_END)
-            cutoff_time = datetime.strptime(PB1_ENTRY_WINDOW_END, "%H:%M").time()
-            raw = PB1_ENTRY_WINDOW_END
-        cutoff = datetime.combine(self._now_kst.date(), cutoff_time, tzinfo=self._now_kst.tzinfo)
-        return cutoff, raw
+        return resolve_entry_cutoff(
+            now_kst=self._now_kst,
+            entry_window_end=PB1_ENTRY_WINDOW_END,
+            entry_cutoff_time=os.getenv("ENTRY_CUTOFF_TIME"),
+        )
 
     def _resolve_market_close(self) -> tuple[datetime, str]:
         fallback_raw = "15:30"
