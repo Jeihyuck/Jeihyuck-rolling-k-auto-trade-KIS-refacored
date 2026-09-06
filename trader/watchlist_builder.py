@@ -58,6 +58,12 @@ from trader.watchlist_entry_style import (
     infer_entry_style_from_scores as infer_entry_style_from_scores_impl,
     normalize_entry_style_value as normalize_entry_style_value_impl,
 )
+from trader.watchlist_column_utils import (
+    MA20_NORMALIZE_PRIORITY,
+    is_ma20_candidate_column as is_ma20_candidate_column_impl,
+    ma20_candidate_priority as ma20_candidate_priority_impl,
+    normalize_column_token as normalize_column_token_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -365,36 +371,15 @@ def _prefer_numeric_candidates(values: List[Any], *, zero_invalid: bool = False)
 
 
 def _normalize_column_token(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    return normalize_column_token_impl(value)
 
 
 def _ma20_candidate_priority(column: Any) -> int:
-    normalized = _normalize_column_token(column)
-    for idx, candidate in enumerate(MA20_NORMALIZE_PRIORITY):
-        candidate_token = _normalize_column_token(candidate)
-        if normalized == candidate_token:
-            return idx
-        if normalized in {f"{candidate_token}x", f"{candidate_token}y"}:
-            return idx + len(MA20_NORMALIZE_PRIORITY)
-    if normalized in {"ma20x", "ma20y"}:
-        return len(MA20_NORMALIZE_PRIORITY)
-    return 10_000
+    return ma20_candidate_priority_impl(column)
 
 
 def _is_ma20_candidate_column(column: Any) -> bool:
-    normalized = _normalize_column_token(column)
-    candidate_tokens = {_normalize_column_token(name) for name in MA20_NORMALIZE_PRIORITY}
-    if normalized in candidate_tokens:
-        return True
-    if normalized in {f"{token}x" for token in candidate_tokens}:
-        return True
-    if normalized in {f"{token}y" for token in candidate_tokens}:
-        return True
-    if "ma20" in normalized:
-        return True
-    if "ma" in normalized and "20" in normalized:
-        return True
-    return False
+    return is_ma20_candidate_column_impl(column)
 
 
 def _build_numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
