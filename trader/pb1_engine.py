@@ -34,6 +34,7 @@ from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
 from trader.kr.pb1.buy_timing import is_buy_allowed_now
 from trader.kr.pb1.entry_family import resolve_entry_setup_family, resolve_entry_decision_family
 from trader.kr.pb1.entry_thresholds import is_intraday_threshold_window, resolve_entry_thresholds
+from trader.kr.pb1.entry_trigger_policy import resolve_entry_trigger_policy
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.kr.pb1.market_close import resolve_market_close
@@ -6058,18 +6059,12 @@ class PB1Engine:
         setup_filters_ok: bool,
         decision_family: str | None,
     ) -> str:
-        if trigger_ok:
-            return "BREAKOUT_CONFIRMED"
-        if entry_ok and setup_filters_ok:
-            family = str(decision_family or "").strip().upper()
-            if family.endswith("PULLBACK_OVERRIDE"):
-                return "PULLBACK_OVERRIDE"
-            if family.endswith("MOMENTUM_CONTINUATION"):
-                return "MOMENTUM_CONTINUATION"
-            if family.endswith("SCORE_OVERRIDE"):
-                return "SCORE_OVERRIDE"
-            return "SETUP_OVERRIDE"
-        return "NONE"
+        return resolve_entry_trigger_policy(
+            trigger_ok=trigger_ok,
+            entry_ok=entry_ok,
+            setup_filters_ok=setup_filters_ok,
+            decision_family=decision_family,
+        )
 
     @staticmethod
     def _enforce_explicit_trigger_bypass(
