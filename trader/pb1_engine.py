@@ -30,6 +30,7 @@ from trader.kr.pb1.exit_policy import resolve_exit_policy
 from trader.kr.pb1.exit_updates import build_exit_position_update_fields
 from trader.kr.pb1.exit_simulation import resolve_force_exit_simulation
 from trader.kr.pb1.exit_stop_price import resolve_exit_stop_price
+from trader.kr.pb1.exit_reason_code import resolve_exit_reason_code as resolve_exit_reason_code_impl
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
@@ -7397,22 +7398,7 @@ class PB1Engine:
 
     @staticmethod
     def _exit_reason_code(reason: str) -> str:
-        mapping = {
-            "EXIT_STOP_LOSS": ReasonCode.EXIT_STOP_LOSS,
-            "EXIT_TRAILING_STOP": ReasonCode.EXIT_TRAIL,
-            "EXIT_MA50_BREAK": ReasonCode.EXIT_REGIME,
-            "EXIT_MA20_BREAK": ReasonCode.EXIT_TRAIL,
-            "EXIT_TIME_STOP": ReasonCode.EXIT_TIME,
-            "EXIT_RISK_OFF": ReasonCode.EXIT_REGIME,
-            "STOP_HIT": ReasonCode.EXIT_STOP_LOSS,
-            "FAILED_BREAKOUT": ReasonCode.EXIT_STOP_LOSS,
-            "TP1": ReasonCode.EXIT_TP_PARTIAL,
-            "TP2": ReasonCode.EXIT_TP_PARTIAL,
-            "climax_partial": ReasonCode.EXIT_TP_PARTIAL,
-            "time_stop": ReasonCode.EXIT_TIME,
-            "ma50_break_heavy_volume": ReasonCode.EXIT_REGIME,
-        }
-        return mapping.get(reason, ReasonCode.EXIT_TRAIL)
+        return resolve_exit_reason_code_impl(reason)
 
 
     @staticmethod
