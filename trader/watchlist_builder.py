@@ -64,6 +64,7 @@ from trader.watchlist_column_utils import (
     ma20_candidate_priority as ma20_candidate_priority_impl,
     normalize_column_token as normalize_column_token_impl,
 )
+from trader.watchlist_dataframe_utils import as_dataframe as as_dataframe_impl
 from trader.watchlist_ohlcv_utils import normalize_ohlcv_columns as normalize_ohlcv_columns_impl
 from trader.watchlist_short_feature_utils import (
     short_feature_null_count as short_feature_null_count_impl,
@@ -223,20 +224,7 @@ def _log_final30_scored_df_ready(final30_scored_df: pd.DataFrame) -> None:
 
 
 def _as_dataframe(value: Any) -> pd.DataFrame:
-    if value is None:
-        return pd.DataFrame()
-    if isinstance(value, pd.DataFrame):
-        return value
-    if isinstance(value, list):
-        return pd.DataFrame(value)
-    if isinstance(value, tuple):
-        return pd.DataFrame(list(value))
-    if isinstance(value, dict):
-        return pd.DataFrame([value])
-    try:
-        return pd.DataFrame(value)
-    except Exception:
-        return pd.DataFrame()
+    return as_dataframe_impl(value)
 
 
 def _normalize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
