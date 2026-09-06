@@ -38,6 +38,7 @@ from trader.kr.pb1.entry_trigger_policy import resolve_entry_trigger_policy
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
 from trader.kr.pb1.market_close import resolve_market_close
+from trader.kr.pb1.exit_submit_gate import resolve_exit_submit_gate_reasons as resolve_exit_submit_gate_reasons_impl
 from trader.kr.pb1.terminal_state import resolve_terminal_state
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
@@ -9304,17 +9305,14 @@ class PB1Engine:
         )
 
     def _resolve_exit_submit_gate_reasons(self, *, code: str) -> list[str]:
-        reasons = self._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT")
-        logger.info(
-            "[EXIT][SUBMIT_GATE] code=%s order_allowed=%s trading_day=%s force_block_live=%s source=%s action=%s",
-            self._display_code(code),
-            int(bool(self.order_allowed)),
-            int(bool(self.trading_day)),
-            int(bool(self.force_block_live)),
-            str((self._exit_holdings_meta or {}).get("source") or "unknown"),
-            "skip_before_precheck" if reasons else "allow",
+        return resolve_exit_submit_gate_reasons_impl(
+            order_precheck_gate_reasons=self._order_precheck_gate_reasons(side="SELL", stage="PB1-EXIT"),
+            display_code=self._display_code(code),
+            order_allowed=self.order_allowed,
+            trading_day=self.trading_day,
+            force_block_live=self.force_block_live,
+            exit_holdings_source=str((self._exit_holdings_meta or {}).get("source") or "unknown"),
         )
-        return reasons
 
     def _build_stop_price(self, cf: CandidateFeature, order_px: float) -> tuple[float | None, str | None, int, str | None]:
         features = cf.features or {}
