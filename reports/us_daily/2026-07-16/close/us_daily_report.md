@@ -10,10 +10,10 @@
 | Field | Value |
 |---|---|
 | trade_date | 2026-07-16 |
-| branch | copilot/refactordual-agent-modularization-gpt54mini |
-| commit_sha | 55b5f6a7d0455297130dd39a84b51cecfa8a3c18 |
-| workflow | dynamic/copilot-swe-agent/copilot |
-| run_id | 34026600948 |
+| branch | dual-agent |
+| commit_sha | dbbf119be00e48e1472a62f31ee3961ca63462c5 |
+| workflow | local |
+| run_id | local |
 | session | close |
 | env | practice |
 | KIS_ENV | practice |
@@ -43,18 +43,11 @@
 | canonical_order_source | router_session_summary |
 | canonical_position_source | kis_final_balance |
 | orders_submitted_total | 0 |
-| session_orders_submitted | 0 |
-| daily_orders_submitted_total | 0 |
 | orders_ack_total | 0 |
 | orders_rejected_total | 0 |
 | orders_unresolved_total | 0 |
 | buy_notional_total | 0.0 |
 | sell_notional_total | 0.0 |
-| session_buy_notional | 0.0 |
-| session_sell_notional | 0.0 |
-| daily_buy_notional_total | 0.0 |
-| daily_sell_notional_total | 0.0 |
-| daily_fills_total | 0 |
 | actual_new_positions | 0 |
 | open_position_count | 1 |
 | account_equity_krw | 49999999.99999999 |
