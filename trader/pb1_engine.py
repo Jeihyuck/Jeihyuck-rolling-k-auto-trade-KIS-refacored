@@ -32,6 +32,7 @@ from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.order_gate import resolve_order_precheck_gate_reasons
 from trader.kr.pb1.order_submit import submit_exit_sell_order
+from trader.kr.pb1.terminal_state import resolve_terminal_state
 from trader.position_lifecycle import lifecycle_is_authoritative
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
                                     BalanceFreshness, balance_freshness_for_source,
@@ -2713,19 +2714,7 @@ class PB1Engine:
         )
 
     def _resolve_terminal_state(self, *, status: str, notes: str | None = None) -> str:
-        normalized_status = str(status or "UNKNOWN").strip().upper()
-        normalized_notes = str(notes or "").strip().lower()
-        warning_counts = self._warning_counts_dict()
-        warnings_total = sum(int(value) for value in warning_counts.values())
-        if normalized_status in {"FATAL_RUNTIME", "FATAL_POSTPROCESS"}:
-            return "SESSION_END_FATAL"
-        if normalized_status.startswith("SKIP"):
-            return "SESSION_END_SKIPPED"
-        if normalized_status in {"OK_DEGRADED", "DEGRADED_POSTPROCESS"} or warning_counts.get("degraded_stage_count", 0) > 0:
-            return "SESSION_END_OK_DEGRADED"
-        if warnings_total > 0 or normalized_status in {"WARN_FAIL_OPEN", "OK_WITH_WARNINGS"} or "degraded" in normalized_notes:
-            return "SESSION_END_OK_WITH_WARNINGS"
-        return "SESSION_END_OK"
+        return resolve_terminal_state(status=status, notes=notes, warning_counts=self._warning_counts_dict())
 
     def _finalize_run_result(self, *, status: str, notes: str | None) -> RunResult:
         self._emit_tick_warning_summary()
