@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
-from trader.kr.pb1.run_context_state import resolve_run_context_state
+from trader.kr.pb1.run_context_state import resolve_as_of_state, resolve_run_context_state
 from trader.kr.pb1.window_state import resolve_window_internal
 from trader.pb1_engine import CandidateFeature, PB1Engine
 
@@ -183,3 +183,37 @@ def test_resolve_window_internal_matches_engine_wrapper() -> None:
 
     assert helper_window == engine._resolve_window_internal()
     assert warnings == []
+
+
+def test_resolve_as_of_state_backfills_like_engine_getter() -> None:
+    helper_state = resolve_as_of_state(
+        today="2026-07-02",
+        run_ctx={"derived_as_of": "2026-07-01", "trade_date": "2026-07-02"},
+        derived_as_of="2026-07-03",
+        current_as_of=None,
+        current_trade_date=None,
+        current_source=None,
+    )
+
+    engine = PB1Engine(
+        universe_repo=object(),
+        orders_repo=object(),
+        fills_repo=object(),
+        positions_repo=object(),
+        ledger_repo=object(),
+        kis=None,
+        dry_run=True,
+        env="practice",
+        run_id="test",
+        window_label="morning",
+        phase="entry",
+    )
+    engine._today = "2026-07-02"
+    engine._run_ctx = {"derived_as_of": "2026-07-01", "trade_date": "2026-07-02"}
+    engine._as_of = None
+    engine._trade_date = None
+    engine._as_of_source = None
+
+    assert engine.get_as_of() == helper_state["as_of"]
+    assert engine._trade_date == helper_state["trade_date"]
+    assert engine._as_of_source == helper_state["as_of_source"]

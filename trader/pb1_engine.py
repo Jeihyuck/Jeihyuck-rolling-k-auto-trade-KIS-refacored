@@ -33,7 +33,7 @@ from trader.kr.pb1.exit_stop_price import resolve_exit_stop_price
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
-from trader.kr.pb1.run_context_state import resolve_run_context_state
+from trader.kr.pb1.run_context_state import resolve_as_of_state, resolve_run_context_state
 from trader.kr.pb1.window_state import resolve_window_internal
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
 from trader.kr.pb1.buy_timing import is_buy_allowed_now
@@ -3362,28 +3362,25 @@ class PB1Engine:
         )
 
     def get_as_of(self) -> str:
-        if self._as_of:
-            return str(self._as_of)
-        run_ctx_as_of = None
-        if isinstance(self._run_ctx, dict):
-            run_ctx_as_of = self._run_ctx.get("derived_as_of") or self._run_ctx.get("as_of")
-        elif self._run_ctx is not None:
-            run_ctx_as_of = getattr(self._run_ctx, "derived_as_of", None) or getattr(self._run_ctx, "as_of", None)
-        backfill_value = str(run_ctx_as_of or getattr(self, "derived_as_of", None) or self._today or "")
-        if backfill_value:
-            self._as_of = backfill_value
-            if not self._trade_date:
-                self._trade_date = str(self._today)
-            if not self._as_of_source:
-                self._as_of_source = "backfill"
+        state = resolve_as_of_state(
+            today=self._today,
+            run_ctx=self._run_ctx,
+            derived_as_of=getattr(self, "derived_as_of", None),
+            current_as_of=self._as_of,
+            current_trade_date=self._trade_date,
+            current_source=self._as_of_source,
+        )
+        self._as_of = state["as_of"]
+        self._trade_date = state["trade_date"]
+        self._as_of_source = state["as_of_source"]
+        if state.get("backfill") == "1" and self._as_of:
             logger.warning(
                 "[PB1][ASOF][BACKFILL] as_of=%s trade_date=%s source=%s",
                 self._as_of,
                 self._trade_date,
                 self._as_of_source,
             )
-            return str(self._as_of)
-        raise RuntimeError("engine_as_of_missing")
+        return str(self._as_of)
 
     def _resolve_window_internal(self) -> str:
         return resolve_window_internal(
