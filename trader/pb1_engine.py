@@ -32,6 +32,9 @@ from trader.kr.pb1.exit_simulation import resolve_force_exit_simulation
 from trader.kr.pb1.exit_stop_price import resolve_exit_stop_price
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
+from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
+from trader.kr.pb1.run_context_state import resolve_run_context_state
+from trader.kr.pb1.window_state import resolve_window_internal
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
 from trader.kr.pb1.buy_timing import is_buy_allowed_now
 from trader.kr.pb1.entry_family import resolve_entry_setup_family, resolve_entry_decision_family
@@ -3341,28 +3344,16 @@ class PB1Engine:
         derived_as_of: str | None,
     ) -> None:
         self._run_ctx = run_ctx
-        run_ctx_as_of = None
-        if isinstance(run_ctx, dict):
-            run_ctx_as_of = run_ctx.get("derived_as_of") or run_ctx.get("as_of")
-        else:
-            run_ctx_as_of = getattr(run_ctx, "derived_as_of", None) or getattr(run_ctx, "as_of", None)
-        resolved_as_of = str(as_of or run_ctx_as_of or derived_as_of or self._today)
-        resolved_trade_date = trade_date
-        if resolved_trade_date is None:
-            if isinstance(run_ctx, dict):
-                resolved_trade_date = run_ctx.get("trade_date")
-            else:
-                resolved_trade_date = getattr(run_ctx, "trade_date", None)
-        self._as_of = resolved_as_of
-        self._trade_date = str(resolved_trade_date or self._today)
-        if as_of:
-            self._as_of_source = "explicit_as_of"
-        elif run_ctx_as_of:
-            self._as_of_source = "run_ctx"
-        elif derived_as_of:
-            self._as_of_source = "derived_as_of"
-        else:
-            self._as_of_source = "fallback_resolver"
+        resolved = resolve_run_context_state(
+            today=self._today,
+            as_of=as_of,
+            trade_date=trade_date,
+            run_ctx=run_ctx,
+            derived_as_of=derived_as_of,
+        )
+        self._as_of = resolved["as_of"]
+        self._trade_date = resolved["trade_date"]
+        self._as_of_source = resolved["as_of_source"]
         logger.info(
             "[PB1][ASOF][INIT] as_of=%s trade_date=%s source=%s",
             self._as_of,
@@ -3395,21 +3386,17 @@ class PB1Engine:
         raise RuntimeError("engine_as_of_missing")
 
     def _resolve_window_internal(self) -> str:
-        internal = compute_window(self._now_kst)
-        normalized = (self.window_label or "").strip().lower()
-        label_map = {"preopen": "morning", "morning": "morning", "day": "day", "close": "close"}
-        if normalized in label_map:
-            forced = label_map[normalized]
-            if internal != forced:
-                self._warn_once(
-                    "window_mismatch",
-                    "[PB1][WINDOW][WARN] market_window=%s mismatch window=%s -> forcing %s",
-                    normalized,
-                    internal,
-                    forced,
-                )
-            return forced
-        return internal
+        return resolve_window_internal(
+            internal=compute_window(self._now_kst),
+            window_label=self.window_label,
+            warn_on_mismatch=lambda normalized, internal: self._warn_once(
+                "window_mismatch",
+                "[PB1][WINDOW][WARN] market_window=%s mismatch window=%s -> forcing %s",
+                normalized,
+                internal,
+                {"preopen": "morning", "morning": "morning", "day": "day", "close": "close"}[normalized],
+            ),
+        )
 
     @staticmethod
     def _float_env(name: str, default: float) -> float:
@@ -9530,29 +9517,7 @@ class PB1Engine:
         trigger_ok: bool,
         trigger_info: dict | None = None,
     ) -> tuple[str, str, str]:
-        features = cf.features or {}
-        raw_style = features.get("entry_style_selected") or features.get("entry_style") or features.get("selected_style") or ""
-        raw_family = (
-            features.get("selected_family")
-            or features.get("decision_family")
-            or features.get("entry_family")
-            or features.get("entry_reason")
-            or ""
-        )
-        style = str(raw_style or "").upper()
-        family = str(raw_family or "").upper()
-        pullback_ok = bool(features.get("pullback_ok") or features.get("pullback_pass") or style == "PULLBACK" or family == "ENTRY_PULLBACK")
-        breakout_ok = bool(trigger_ok or features.get("breakout_ok") or features.get("breakout_pass") or style == "BREAKOUT" or family == "ENTRY_BREAKOUT")
-        momentum_ok = bool(features.get("momentum_ok") or features.get("momentum_pass") or style == "MOMENTUM" or family == "ENTRY_MOMENTUM")
-        if pullback_ok:
-            return "PULLBACK", "ENTRY_PULLBACK", "PULLBACK_OVERRIDE"
-        if breakout_ok:
-            return "BREAKOUT", "ENTRY_BREAKOUT", "BREAKOUT_TRIGGER"
-        if momentum_ok:
-            return "MOMENTUM", "ENTRY_MOMENTUM", "MOMENTUM_CONTINUATION"
-        if trigger_ok:
-            return "BREAKOUT", "ENTRY_BREAKOUT", "BREAKOUT_TRIGGER"
-        return "PULLBACK", "ENTRY_PULLBACK", "PULLBACK_OVERRIDE"
+        return infer_entry_family(cf.features or {}, trigger_ok=trigger_ok, trigger_info=trigger_info)
 
     def _build_entry_plan(
         self,
@@ -9567,81 +9532,22 @@ class PB1Engine:
         stage: str,
         price_source: str | None = None,
     ) -> dict:
-        features = cf.features or {}
         gate_state = self._ensure_candidate_authoritative_gate_state(cf)
-        entry_style, entry_family, trigger_policy = self._infer_entry_family(cf, trigger_ok=trigger_ok, trigger_info=trigger_info)
-        qty = int(cf.planned_qty or 0)
-        limit_price = float(features.get("limit_price") or features.get("order_price") or order_price or entry_price or 0.0)
-        plan = {
-            "version": 1, "code": str(cf.code).zfill(6), "market": cf.market, "side": "BUY", "stage": stage,
-            "entry_mode": entry_mode, "entry_style": entry_style, "entry_family": entry_family, "entry_reason": entry_family,
-            "trigger_policy": trigger_policy, "order_type": "LIMIT", "entry_price": float(entry_price or 0.0),
-            "order_price": float(order_price or entry_price or 0.0), "limit_price": float(limit_price or 0.0),
-            "stop_price": float(stop_price or 0.0), "initial_stop": float(stop_price or 0.0), "qty": qty,
-            "planned_value": float(qty * limit_price), "risk_pct": float(RISK_PER_TRADE_PCT),
-            "score": float(features.get("score") or cf.score or 0.0), "pivot": features.get("pivot"),
-            "trigger_ok": bool(trigger_ok), "trigger_info": trigger_info or {},
-            "price_source": price_source or features.get("price_source") or "unknown",
-            "price_gate_blocked": bool(features.get("price_gate_blocked")),
-            "created_at": now_kst().isoformat(),
-            "setup_passed": bool(gate_state.get("setup_passed")),
-            "risk_passed": bool(gate_state.get("risk_passed")),
-            "sizing_passed": bool(gate_state.get("sizing_passed")),
-            "buyable_passed": bool(gate_state.get("buyable_passed")),
-            "authoritative_gate_passed": bool(gate_state.get("authoritative_gate_passed")),
-            "sizing_reason": gate_state.get("sizing_reason"),
-            "gate_state": {
-                "setup_passed": bool(gate_state.get("setup_passed")),
-                "risk_passed": bool(gate_state.get("risk_passed")),
-                "sizing_passed": bool(gate_state.get("sizing_passed")),
-                "buyable_passed": bool(gate_state.get("buyable_passed")),
-                "authoritative_gate_passed": bool(gate_state.get("authoritative_gate_passed")),
-                "sizing_reason": gate_state.get("sizing_reason"),
-                "planned_qty": int(gate_state.get("planned_qty") or qty or 0),
-                "risk_reasons": list(gate_state.get("risk_reasons") or []),
-                "buyable_reasons": list(gate_state.get("buyable_reasons") or []),
-            },
-        }
-        features["entry_style_selected"] = entry_style
-        features["selected_family"] = entry_family
-        features["entry_reason"] = entry_family
-        features["trigger_policy"] = trigger_policy
-        features["entry_plan"] = plan
-        return plan
+        return build_entry_plan(
+            cf=cf,
+            gate_state=gate_state,
+            entry_price=entry_price,
+            order_price=order_price,
+            stop_price=stop_price,
+            trigger_ok=trigger_ok,
+            trigger_info=trigger_info,
+            entry_mode=entry_mode,
+            stage=stage,
+            price_source=price_source,
+        )
 
     def _validate_entry_plan(self, plan: dict | None) -> tuple[bool, list[str]]:
-        if not isinstance(plan, dict):
-            return False, ["entry_plan_missing"]
-        required = ["code", "side", "stage", "entry_style", "entry_family", "entry_reason", "trigger_policy", "entry_price", "order_price", "limit_price", "stop_price", "qty"]
-        missing = [k for k in required if k not in plan or plan.get(k) in (None, "")]
-        if missing:
-            return False, [f"missing:{k}" for k in missing]
-        reasons: list[str] = []
-        try:
-            qty = int(plan.get("qty") or 0)
-            entry_price = float(plan.get("entry_price") or 0.0)
-            order_price = float(plan.get("order_price") or 0.0)
-            limit_price = float(plan.get("limit_price") or 0.0)
-            stop_price = float(plan.get("stop_price") or 0.0)
-        except Exception as exc:
-            return False, [f"numeric_parse_error:{type(exc).__name__}"]
-        if qty <= 0: reasons.append("qty_invalid")
-        if entry_price <= 0: reasons.append("entry_price_invalid")
-        if order_price <= 0: reasons.append("order_price_invalid")
-        if limit_price <= 0: reasons.append("limit_price_invalid")
-        if stop_price <= 0: reasons.append("stop_price_invalid")
-        if stop_price >= entry_price: reasons.append("stop_not_below_entry")
-        entry_style = str(plan.get("entry_style") or "").upper()
-        entry_family = str(plan.get("entry_family") or "").upper()
-        trigger_policy = str(plan.get("trigger_policy") or "").upper()
-        stage = str(plan.get("stage") or "").upper()
-        if entry_style not in {"PULLBACK", "BREAKOUT", "MOMENTUM"}: reasons.append(f"entry_style_invalid:{entry_style}")
-        if entry_family not in {"ENTRY_PULLBACK", "ENTRY_BREAKOUT", "ENTRY_MOMENTUM"}: reasons.append(f"entry_family_invalid:{entry_family}")
-        if entry_style == "PULLBACK" and trigger_policy in {"", "NONE"}: reasons.append("pullback_trigger_policy_missing")
-        if stage == "PB1-CLOSE" and str(plan.get("side")).upper() == "BUY":
-            window = str(getattr(self, "window_internal", "") or "").lower()
-            if window in {"morning", "am", "afternoon", "pm"}: reasons.append("intraday_buy_stage_must_not_be_close")
-        return len(reasons) == 0, reasons
+        return validate_entry_plan_with_window(plan, window_internal=self.window_internal)
 
     def _submit_force_buy_order(self, code: str, qty: int) -> None:
         """
