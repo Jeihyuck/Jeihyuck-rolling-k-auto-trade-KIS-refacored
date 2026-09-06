@@ -19,6 +19,7 @@ This document maps the main execution ownership boundaries for safe maintenance.
 - Intentionally retained in `trader/pb1_engine.py`: KR adaptive candidate filtering, market-stress detection, rescue-candidate selection, and session/result aggregation.
 - Reason: these paths still coordinate shared engine state, warning counters, and logging order across several helper boundaries, so moving them now would risk changing side-effect sequencing.
 - Extracted Phase 2 helpers now include exit planning, entry planning, run-context state, window resolution, as-of backfill, lifecycle init, and earlier sell/exit helpers.
+- Audit snapshot (2026-09-06): `trader/pb1_engine.py` remains ~865kB because the retained orchestration still owns the stateful KR candidate pipeline above; it is intentionally not peeled further for line-count reduction alone.
 
 ## KR Infinite / 122630
 
@@ -31,6 +32,7 @@ This document maps the main execution ownership boundaries for safe maintenance.
 - Primary runtime surfaces: `trader/us/runner/*`, `trader/us/execution/*`, `trader/us/db/*`
 - Responsibilities: prep, trade-am, trade-pm, trade-close, reporting, routing, ACK/FILL reconciliation
 - Boundary: use `us_` tables only; do not read KR orders/positions/signals directly
+- Audit snapshot (2026-09-06): remaining US hot paths stay in their runner/router/repo facades because they still coordinate order sequencing, transaction boundaries, or report assembly; extracted helpers now live in `session_timeout_utils.py`, `kis_us_utils.py`, `exchange_utils.py`, `daily_report_utils.py`, `trade_tick_utils.py`, `trade_session_utils.py`, and `db/fill_accounting_utils.py`.
 
 ## TQQQ Infinite
 
