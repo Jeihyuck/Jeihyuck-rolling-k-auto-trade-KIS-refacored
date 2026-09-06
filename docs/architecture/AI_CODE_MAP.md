@@ -14,6 +14,12 @@ This document maps the main execution ownership boundaries for safe maintenance.
 - Responsibilities: KR entry/exit planning, sell fencing, order submission, lifecycle state, balance handling
 - Refactor guidance: extract helpers under `trader/kr/pb1/` with thin wrappers
 
+### PB1 facade remainder
+
+- Intentionally retained in `trader/pb1_engine.py`: KR adaptive candidate filtering, market-stress detection, rescue-candidate selection, and session/result aggregation.
+- Reason: these paths still coordinate shared engine state, warning counters, and logging order across several helper boundaries, so moving them now would risk changing side-effect sequencing.
+- Extracted Phase 2 helpers now include entry planning, run-context state, window resolution, as-of backfill, and earlier sell/exit helpers.
+
 ## KR Infinite / 122630
 
 - Primary runtime surfaces: KR infinite strategy and lifecycle modules
