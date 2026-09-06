@@ -3,25 +3,25 @@
 ## Required Fields
 
 - trade_date: 2026-05-02
-- branch: dual-agent
+- branch: copilot/refactordual-agent-modularization-gpt54mini
 - commit_sha: test-sha
 - run_id: 25718405741
 - github_run_id: 25718405741
-- github_run_attempt: 0
+- github_run_attempt: 1
 - sha: test-sha
 - workflow: US Trade AM
 - session: am
 - session_id: am-25718405741
 - event_name: workflow_dispatch
-- actor: codespace
+- actor: copilot-swe-agent[bot]
 - env: practice
 - source_log_file: 
-- started_at_utc: 2026-08-07T04:47:20.327311Z
-- started_at_et: 2026-08-07T00:47:20.307859-04:00
-- started_at_kst: 2026-08-07T13:47:20.327311+09:00
-- ended_at_utc: 2026-08-07T04:47:20.327311Z
-- ended_at_et: 2026-08-07T00:47:20.327292-04:00
-- ended_at_kst: 2026-08-07T13:47:20.327311+09:00
+- started_at_utc: 2026-09-06T10:11:31.083037Z
+- started_at_et: 2026-09-06T06:11:31.076438-04:00
+- started_at_kst: 2026-09-06T19:11:31.083037+09:00
+- ended_at_utc: 2026-09-06T10:11:31.083037Z
+- ended_at_et: 2026-09-06T06:11:31.083023-04:00
+- ended_at_kst: 2026-09-06T19:11:31.083037+09:00
 - wall_elapsed_sec: 0.0
 - code_version_source: github_actions
 - dry_run: True
@@ -41,6 +41,31 @@
 - last_stage: tick_1
 - final_status: SKIP
 - reason: not_trading_day
+- session_orders_sent: 0
+- session_orders_ack: 0
+- session_orders_rejected: 0
+- session_fills_count: 0
+- cumulative_fills_count: 0
+- daily_cumulative_fills_count: 0
+- session_buy_notional_routed: 0.0
+- daily_buy_notional_filled: 0.0
+- daily_order_audit_buy_notional: 0.0
+- entry_candidate_notional_evaluated: 0.0
+- entry_intent_notional_before_risk: 0.0
+- entry_intent_notional_after_risk: 0.0
+- orders_submitted_notional: 0.0
+- orders_acknowledged_notional: 0.0
+- fills_confirmed_notional: 0.0
+- no_new_orders_reason: 
+- daily_buy_limit_usd: 0.0
+- daily_buy_notional_filled_usd: 0.0
+- daily_buy_budget_remaining_usd: 0.0
+- daily_notional_exceeded_block_count: 0
+- daily_notional_exceeded_block_symbols: {}
+- kis_temp_error_raw_log_count: 0
+- kis_temp_error_sequence_count: 0
+- kis_temp_error_by_endpoint: {}
+- order_submit_temp_error_count: 0
 - temp_error_count: 0
 - temp_recovered_count: 0
 - schedule_expected_et: 
