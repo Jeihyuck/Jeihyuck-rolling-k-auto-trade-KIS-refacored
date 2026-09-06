@@ -33,7 +33,10 @@ from trader.kr.pb1.exit_stop_price import resolve_exit_stop_price
 from trader.kr.pb1.entry_submit import submit_entry_buy_order
 from trader.kr.pb1.entry_identity import resolve_entry_identity_from_mapping
 from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
-from trader.kr.pb1.run_context_state import resolve_as_of_state, resolve_run_context_state
+from trader.kr.pb1.run_context_state import (
+    initialize_run_context_state as initialize_run_context_state_impl,
+    resolve_as_of_state, resolve_run_context_state,
+)
 from trader.kr.pb1.window_state import resolve_window_internal
 from trader.kr.pb1.entry_after_exit_block import should_block_entry_after_exit
 from trader.kr.pb1.buy_timing import is_buy_allowed_now
@@ -3226,7 +3229,7 @@ class PB1Engine:
         derived_as_of: str | None,
     ) -> None:
         self._run_ctx = run_ctx
-        resolved = resolve_run_context_state(
+        resolved = initialize_run_context_state_impl(
             today=self._today,
             as_of=as_of,
             trade_date=trade_date,

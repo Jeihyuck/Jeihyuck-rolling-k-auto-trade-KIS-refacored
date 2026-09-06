@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from trader.kr.pb1.entry_plan import build_entry_plan, infer_entry_family, validate_entry_plan_with_window
-from trader.kr.pb1.run_context_state import resolve_as_of_state, resolve_run_context_state
+from trader.kr.pb1.run_context_state import (
+    initialize_run_context_state,
+    resolve_as_of_state,
+    resolve_run_context_state,
+)
 from trader.kr.pb1.window_state import resolve_window_internal
 from trader.pb1_engine import CandidateFeature, PB1Engine
 
@@ -143,6 +147,13 @@ def test_resolve_run_context_state_matches_engine_init() -> None:
         run_ctx={"as_of": "2026-07-01", "trade_date": "2026-07-02"},
         derived_as_of=None,
     )
+    init_state = initialize_run_context_state(
+        today="2026-07-02",
+        as_of=None,
+        trade_date=None,
+        run_ctx={"as_of": "2026-07-01", "trade_date": "2026-07-02"},
+        derived_as_of=None,
+    )
     engine._init_run_context_state(
         as_of=None,
         trade_date=None,
@@ -155,6 +166,7 @@ def test_resolve_run_context_state_matches_engine_init() -> None:
         "trade_date": engine._trade_date,
         "as_of_source": engine._as_of_source,
     }
+    assert init_state == helper_state
 
 
 def test_resolve_window_internal_matches_engine_wrapper() -> None:

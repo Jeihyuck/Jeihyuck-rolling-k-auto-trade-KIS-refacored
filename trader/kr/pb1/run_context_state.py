@@ -38,6 +38,23 @@ def resolve_run_context_state(
     }
 
 
+def initialize_run_context_state(
+    *,
+    today: str,
+    as_of: str | None,
+    trade_date: str | None | Any,
+    run_ctx: Any,
+    derived_as_of: str | None,
+) -> dict[str, str]:
+    return resolve_run_context_state(
+        today=today,
+        as_of=as_of,
+        trade_date=trade_date,
+        run_ctx=run_ctx,
+        derived_as_of=derived_as_of,
+    )
+
+
 def resolve_as_of_state(
     *,
     today: str,
