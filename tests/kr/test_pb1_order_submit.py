@@ -118,7 +118,7 @@ def test_submit_exit_sell_order_success_persists_cooldown_and_last_exit(monkeypa
 
     assert result["submitted"] == 1
     assert result["order_result"] == "ORDER_OK"
-    assert result["terminal_event"] == "API_RESULT"
+    assert "terminal_event" not in result
     assert "rejected" not in result
     assert "submit_terminal_status" not in result
     assert kis.calls == [("010060", 7)]
@@ -172,10 +172,10 @@ def test_submit_exit_sell_order_reject_registers_no_sellable_and_persists_last_e
     )
 
     assert result["order_result"] == "ORDER_FAIL_BIZ_NO_SELLABLE_QTY"
-    assert result["terminal_event"] == "API_RESULT"
-    assert result["rejected"] == 1
-    assert result["failed"] == 1
-    assert result["submit_terminal_status"] == "BROKER_REJECTED"
+    assert "terminal_event" not in result
+    assert "rejected" not in result
+    assert result["failed"] == 0
+    assert "submit_terminal_status" not in result
     assert kis.calls == [("010060", 7)]
     assert repo.submitted and repo.errors and not repo.acked
     assert no_sellable.calls and no_sellable.calls[0]["reason"] == "KIS_NO_SELLABLE_QTY"

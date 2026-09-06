@@ -154,7 +154,6 @@ def submit_exit_sell_order(
                 code=code,
                 fields={"cooldown_until": cooldown_until},
             )
-        exit_eval_payload["terminal_event"] = "API_RESULT"
     else:
         reject_reason = str(engine._format_order_result_reason(resp if isinstance(resp, dict) else None) or "")
         msg_cd_norm = str(msg_cd or "").upper()
@@ -167,15 +166,6 @@ def submit_exit_sell_order(
             engine._register_session_no_sellable(code=code, reason="KIS_NO_SELLABLE_QTY")
             engine.no_sellable_qty_terminal_codes.add(display_code)
         engine.orders_repo.mark_error(engine.env, client_key, resp if isinstance(resp, dict) else {"resp": resp})
-        exit_eval_payload["rejected"] = 1
-        exit_eval_payload["failed"] = int(exit_eval_payload.get("failed", 0) or 0) + 1
-        exit_eval_payload["submit_terminal_status"] = engine._classify_submit_terminal_status(
-            api_submitted=int(exit_eval_payload.get("api_submitted", 0) or 0),
-            accepted=int(exit_eval_payload.get("accepted", 0) or 0),
-            skipped_reason=str(exit_eval_payload.get("skipped_reason") or ""),
-            response=resp if isinstance(resp, dict) else None,
-        )
-        exit_eval_payload["terminal_event"] = "API_RESULT"
     engine.positions_repo.update_position_fields(
         env=engine.env,
         strategy=engine.STRATEGY_NAME,
