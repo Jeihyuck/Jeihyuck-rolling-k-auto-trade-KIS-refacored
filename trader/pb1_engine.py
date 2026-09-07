@@ -503,6 +503,58 @@ CASH_KEYS = (
 )
 
 
+
+_ORDER_SKIP_REASON_MAP = {
+    "SIZING_CAP_BELOW_ONE_SHARE": "ORDER_SKIP_SIZING_CAP_BELOW_ONE_SHARE",
+    "SIZING_MIN_ORDER_NOTIONAL_FAIL": "ORDER_SKIP_SIZING_MIN_ORDER_NOTIONAL_FAIL",
+    "SIZING_QTY_ZERO": "ORDER_SKIP_SIZING_QTY_ZERO",
+    "cap_below_min_order": "ORDER_SKIP_MIN_ORDER",
+    "min_order_krw": "ORDER_SKIP_MIN_ORDER",
+    "cap_below_one_share": "ORDER_SKIP_MIN_ORDER",
+    "planned_qty_zero_or_min_order": "ORDER_SKIP_MIN_ORDER",
+    "unaffordable_min1share": "ORDER_SKIP_MIN_ORDER",
+    "order_price_missing": "ORDER_SKIP_PRICE_MISSING",
+    "available_cash_zero": "ORDER_SKIP_NO_CASH",
+    "insufficient_cash": "ORDER_SKIP_NO_CASH",
+    "entry_capital_zero": "ORDER_SKIP_NO_CASH",
+    "tick_budget_zero": "ORDER_SKIP_NO_CASH",
+    "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
+    "BUYABLE_EXISTING_HOLDING": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING",
+    "BUYABLE_EXISTING_HOLDING_KIS": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING_KIS",
+    "BUYABLE_OPEN_ORDER": "ORDER_SKIP_BUYABLE_OPEN_ORDER",
+    "BUYABLE_TODAY_BUY_EXISTS": "ORDER_SKIP_BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_TODAY_SUBMIT": "ORDER_SKIP_BUYABLE_TODAY_SUBMIT",
+    "BUYABLE_TODAY_FILL": "ORDER_SKIP_BUYABLE_TODAY_FILL",
+    "BUYABLE_TODAY_SELL_REBUY_BLOCKED": "ORDER_SKIP_BUYABLE_TODAY_SELL_REBUY_BLOCKED",
+    "BUYABLE_COOLDOWN": "ORDER_SKIP_BUYABLE_COOLDOWN",
+    "BUYABLE_DUPLICATE": "ORDER_SKIP_BUYABLE_DUPLICATE",
+    "BUYABLE_WINDOW_BLOCK": "ORDER_SKIP_BUYABLE_WINDOW_BLOCK",
+    "open_order": "ORDER_SKIP_RATE_LIMIT",
+    "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
+    "duplicate_order": "ORDER_SKIP_DUPLICATE",
+    "rate_limit": "ORDER_SKIP_RATE_LIMIT",
+    "entry_cutoff": "ORDER_SKIP_CUTOFF",
+    "entry_disabled": "ORDER_SKIP_DISABLED",
+}
+
+
+def _authoritative_holding_qty(snapshot: dict[str, Any] | None) -> int:
+    """Prefer an explicit broker quantity, including zero, over stale DB state."""
+    state = snapshot or {}
+    if "kis_holding_qty" in state and state.get("kis_holding_qty") is not None:
+        try:
+            return max(0, int(float(state.get("kis_holding_qty") or 0)))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[BUYABLE_GATE][KIS_QTY_INVALID] raw=%r action=db_fallback_unavailable_only",
+                state.get("kis_holding_qty"),
+            )
+            return 0
+    try:
+        return max(0, int(float(state.get("holding_qty") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
 def _as_first_dict(v: Any) -> Dict[str, Any]:
     """
     KIS 응답에서 output2가 list([dict])로 오는 케이스가 많음.
@@ -4243,13 +4295,30 @@ class PB1Engine:
             sample_list.append(code)
 
     def _log_order_skip(self, cf: CandidateFeature, reasons: list[str], stage: str) -> None:
-        reason_codes = [_ORDER_SKIP_REASON_MAP.get(reason, f"ORDER_SKIP_{reason.upper()}") for reason in reasons]
-        logger.info(
-            "[PB1][ORDER][SKIP] code=%s reason_code=%s reasons=%s",
-            self._display_code(cf.code),
-            reason_codes,
-            reasons,
-        )
+        try:
+            reason_codes = [
+                _ORDER_SKIP_REASON_MAP.get(
+                    str(reason),
+                    f"ORDER_SKIP_{str(reason).upper() if reason is not None else 'UNKNOWN'}",
+                )
+                for reason in (reasons or ["UNKNOWN"])
+            ]
+            logger.info(
+                "[PB1][ORDER][SKIP] code=%s reason_code=%s reasons=%s",
+                self._display_code(cf.code),
+                reason_codes,
+                reasons,
+            )
+        except Exception as exc:
+            # Logging/telemetry must never turn a candidate-local skip into a
+            # session-wide fatal error.
+            reason_codes = ["ORDER_SKIP_UNKNOWN"]
+            logger.warning(
+                "[PB1][ORDER][SKIP_LOG_FAIL_SOFT] code=%s err=%s reasons=%r",
+                self._display_code(cf.code),
+                exc,
+                reasons,
+            )
         try:
             self._append_ledger_event(
                 event_type="ORDER_SKIP",
@@ -4295,7 +4364,7 @@ class PB1Engine:
             "order_allowed": bool(self.order_allowed),
             "qty": int(qty or 0),
             "holding_qty": int(snapshot.get("holding_qty") or 0),
-            "kis_holding_qty": int(snapshot.get("kis_holding_qty") or snapshot.get("holding_qty") or 0),
+            "kis_holding_qty": _authoritative_holding_qty(snapshot),
             "today_buy_exists": bool(snapshot.get("today_buy_exists")),
             "today_submit_exists": bool(snapshot.get("today_submit_exists")),
             "today_fill_exists": bool(snapshot.get("today_fill_exists")),
@@ -9283,7 +9352,7 @@ class PB1Engine:
         })
         # ─────────────────────────────────────────────────────────────────────
         broker_position = self._authoritative_balance.position(cf.code) if self._authoritative_balance else None
-        pre_order_holding_qty = broker_position.qty if broker_position else int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        pre_order_holding_qty = broker_position.qty if broker_position else _authoritative_holding_qty(gate_snapshot)
         if broker_position and broker_position.qty > 0:
             logger.warning("[PB1][BUY][BLOCK] code=%s reason=BUYABLE_EXISTING_BROKER_HOLDING snapshot_id=%s qty=%s",
                            display_code, self._authoritative_balance.snapshot_id, broker_position.qty)
@@ -10402,7 +10471,11 @@ class PB1Engine:
             )
 
         stop_hit = bool(stop_price is not None and mark <= float(stop_price))
-        time_stop_hit = bool(trading_days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
+        time_stop_hit = bool(
+            entry_ts is not None
+            and trading_days_held >= int(PB1_TIME_STOP_DAYS)
+            and ret_pct < 2.0
+        )
         logger.info(
             "[EXIT][TIME_STOP][BASIS] code=%s basis=trading_days calendar_days=%s trading_days=%s max_hold=%s hit=%s",
             display_code,
@@ -10425,6 +10498,10 @@ class PB1Engine:
             time_stop_hit=time_stop_hit,
             risk_off_signal=risk_off_signal,
         )
+        if entry_ts is None:
+            # Zero/unknown age is not proof of a same-day entry.
+            exit_policy["same_day_entry"] = False
+            exit_policy["holding_age_unknown"] = True
         trail_hit = bool(exit_policy["trail_hit"])
         ma20_break = bool(exit_policy["ma20_break"])
         ma50_break = bool(exit_policy["ma50_break"])
@@ -11537,11 +11614,10 @@ class PB1Engine:
                 int(pos.get("qty") or 0),
                 int(pos.get("holding_days") or 0),
             )
-            if int(pos.get("holding_days") or 0) <= 0:
-                df = pd.DataFrame()
-                meta = {"source": "same_day_holdings_skip"}
-            else:
-                df, meta = self._fetch_exit_ohlcv(pos["code"])
+            # Exit technical context is required regardless of holding age.
+            # Unknown age must not be treated as same-day and must not suppress
+            # MA/volume/momentum features.
+            df, meta = self._fetch_exit_ohlcv(pos["code"])
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
