@@ -2738,6 +2738,10 @@ def _write_session_result_file(payload: dict[str, Any], *, engine=None, env: str
             payload["accepted"] = int(durable["broker_acked"])
             payload["filled_confirmed"] = int(durable["fills_confirmed"])
             payload["filled_confirmed_count"] = int(durable["fills_confirmed"])
+            payload["quantity_confirmed_fills"] = int(durable.get("quantity_confirmed_fills", durable["fills_confirmed"]))
+            payload["price_unresolved_quantity_confirmed"] = int(
+                durable.get("price_unresolved_quantity_confirmed", 0)
+            )
             payload["unresolved_ack_count"] = int(durable["unresolved_acks"])
             payload["ack_without_confirmed_fill"] = int(durable["ack_without_confirmed_fill"])
             for warning in durable.get("consistency_warnings", []):
@@ -7959,7 +7963,31 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
         marker_metrics = session_metrics
         status_for_marker = str(last_result_status or "")
-        if int(session_metrics.get("api_submitted", 0) or 0) > 0 and status_for_marker.upper() == "OK_NO_TRADE":
+        fatal_exit_reasons = {
+            "FATAL_RUNTIME_REPEAT",
+            "STRUCTURAL_FATAL",
+            "PRECHECK_FATAL_STICKY",
+        }
+        if exit_reason in fatal_exit_reasons:
+            submitted_any = int(
+                session_metrics.get(
+                    "api_submitted",
+                    session_metrics.get("submitted", 0),
+                )
+                or 0
+            ) > 0 or int(buy_orders or 0) > 0 or int(sell_orders or 0) > 0
+            status_for_marker = (
+                "PARTIAL_SUCCESS_RETRYABLE" if submitted_any else "ERROR"
+            )
+            logger.error(
+                "[PB1][SESSION_STATUS][FATAL] exit_reason=%s submitted_any=%s "
+                "status=%s prior_status=%s",
+                exit_reason,
+                int(submitted_any),
+                status_for_marker,
+                last_result_status,
+            )
+        elif int(session_metrics.get("api_submitted", 0) or 0) > 0 and status_for_marker.upper() == "OK_NO_TRADE":
             status_for_marker = "OK_WITH_ORDERS"
         normalized = normalize_session_result(
             status=status_for_marker,
