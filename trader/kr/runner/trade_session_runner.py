@@ -685,6 +685,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         os.environ["PB1_EXIT_ENABLED"] = "1"
         os.environ["PB1_CLOSE_ENABLED"] = "1"
         os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] = os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", "0")
+        os.environ["PB1_CLOSE_EXIT_SAFETY_ENGINE"] = os.getenv("PB1_CLOSE_EXIT_SAFETY_ENGINE", "1")
+        os.environ["PB1_EXIT_ONLY_MODE"] = "1"
         os.environ["KR_CLOSE_SESSION"] = "1"
         phase_marker = ROOT / "runtime/kr/session" / ctx.trade_date.isoformat() / "close" / "phase.json"
         phase_marker.parent.mkdir(parents=True, exist_ok=True)
