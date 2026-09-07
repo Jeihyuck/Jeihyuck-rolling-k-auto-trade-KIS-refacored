@@ -1,0 +1,105 @@
+name: TEMP KR 20260907 Repair CI
+
+on:
+  push:
+    branches:
+      - repair/kr-20260907-runtime-recovery
+  workflow_dispatch:
+
+jobs:
+  kr-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kr_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      STRATEGY_ENV: practice
+      KIS_ENV: practice
+      MARKET: KR
+      REGION: KR
+      PB1_MARKET_SCOPE: KRX
+      DRY_RUN: "1"
+      STRATEGY_MODE: LIVE
+      KR_PB1_VOL_MAX: "1.25"
+      KR_PB1_VOLU_MAX: "1.25"
+      KR_PB1_VOLU_MAX_INTRADAY: "1.25"
+      DB_LOCK_TIMEOUT_MS: "5000"
+      DB_STATEMENT_TIMEOUT_MS: "15000"
+      DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+      PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+      KR_PREP_AUX_WATCHLIST_TIMEOUT_SEC: "20"
+      KR_PREP_AUX_REPORT_TIMEOUT_SEC: "30"
+      KR_PREP_AUX_DEFAULT_TIMEOUT_SEC: "20"
+      PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pytest ruff psycopg2-binary PyYAML
+      - name: Byte compile
+        run: python -m compileall trader
+      - name: Undefined-name guard
+        run: ruff check trader/prep_runner.py trader/pb1_engine.py trader/pb1_runner.py trader/reconcile_kis.py trader/reconcile_db.py trader/kr/position_provenance.py --select F821
+      - name: Shell syntax
+        run: |
+          bash -n scripts/wsl/kr-infinite-sidecar.sh
+          bash -n scripts/wsl/run-kr-am.sh
+          bash -n scripts/wsl/run-kr-afternoon.sh
+          bash -n scripts/wsl/run-kr-close.sh
+      - name: Sep 7 incident regression
+        run: |
+          pytest -q tests/kr/test_kr_20260907_runtime_recovery.py
+          pytest -q tests/test_reconcile_db_soft_close_guard.py
+          pytest -q tests/test_reconcile_fill_promotion.py
+          pytest -q tests/test_reconcile_promotes_kis_balance_fill.py
+          pytest -q tests/kr/test_kr_reconcile_holding_delta.py
+          pytest -q tests/kr/test_kr_order_fill_reconciliation.py
+          pytest -q tests/test_kis_holding_authoritative_buyable_gate.py
+          pytest -q tests/test_pb1_buyable_backfill_guard.py
+          pytest -q tests/kr/test_kr_entry_authoritative_gate_state.py
+          pytest -q tests/test_entry_exit_metadata_contract.py
+          pytest -q tests/test_position_cycle_lifecycle.py
+          pytest -q tests/kr/test_kr_lifecycle_provenance_regression.py
+      - name: Infinite independent runtime
+        run: pytest -q tests/kr/infinite
+      - name: Full KR suite
+        run: pytest -q tests/kr
+      - name: PR KR contract coverage
+        run: |
+          pytest -q tests/test_kr_final30_contract.py
+          pytest -q tests/test_migration_0050_legacy_schema.py
+          pytest -q tests/test_pm_completed_marker_retryable.py
+          pytest -q tests/test_prep_core_marker.py
+          pytest -q tests/test_prep_aux_timeout.py
+          pytest -q tests/test_kr_session_result_file.py
+          pytest -q tests/test_live_gate_refresh_order.py
+          pytest -q tests/test_pb1_volume_config_unified.py
+          pytest -q tests/test_watchlist_scored_roundtrip.py
+          pytest -q tests/test_kr_prep_market_benchmark_runtime.py
+          pytest -q tests/test_entry_guard_final30.py tests/test_final30_load_required.py
+          pytest -q tests/test_pb1_exit_signature.py
+      - name: Scheduler policy regression
+        run: |
+          pytest -q tests/test_scheduler_single_owner_policy.py tests/test_recovery_control_plane_contracts.py tests/test_wsl_scripts_syntax.py tests/test_kr_runner_env_contract.py tests/test_scheduler_pr76_followup.py tests/test_nullim_wrapper_repo_root.py tests/test_nullim_wrapper_execution.py tests/test_market_log_mail_hardening.py
+          pytest -q tests/test_scheduler_days_and_holidays.py
+          pytest -q tests/test_trading_day_strict.py tests/test_krx_calendar.py
