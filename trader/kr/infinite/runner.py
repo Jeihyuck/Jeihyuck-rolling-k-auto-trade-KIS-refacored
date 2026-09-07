@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import Callable
 
 from trader.kis_wrapper import KisAPI
+from trader.kr.calendar import resolve_kr_trade_date
 
 from .accounting import apply_confirmed_fill
 from .config import InfiniteConfig
@@ -285,10 +286,14 @@ def main() -> int:
 def run_canonical_session(*, session: str, env: str, allow_entry: bool = True) -> RunResult:
     """Run one standalone Infinite tick with its own KIS/DB dependencies."""
     effective_allow_entry = bool(allow_entry and session in {"am", "afternoon"})
-    logger.info("[KR_INFINITE][SESSION_HOOK] session=%s env=%s allow_entry=%s",
-                session, env, int(effective_allow_entry))
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    trade_date = resolve_kr_trade_date(now_kst)
+    os.environ["KR_TRADE_DATE"] = trade_date.isoformat()
+    logger.info("[KR_INFINITE][SESSION_TICK] session=%s env=%s trade_date=%s allow_entry=%s",
+                session, env, trade_date, int(effective_allow_entry))
     return run_once(config=InfiniteConfig.from_env(), kis=KisAPI(kis_env=env),
-                    repository=InfiniteRepository(), kis_env=env, allow_entry=effective_allow_entry)
+                    repository=InfiniteRepository(), kis_env=env, trade_date=trade_date,
+                    allow_entry=effective_allow_entry, now_kst_value=now_kst)
 
 
 def run_kr_infinite_sleeve_tick(*, kis, balance_snapshot: dict, env: str,
