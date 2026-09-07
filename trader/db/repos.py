@@ -3939,6 +3939,104 @@ class FillsRepo:
             fail_open=_resolve_fill_fail_open(),
         )
 
+    def list_provenance_fills_by_codes(
+        self,
+        env: str,
+        codes: Iterable[str],
+        *,
+        strategy: str,
+        account_id: str,
+    ) -> dict[str, list[dict]]:
+        """Return fill history proven to belong to one account/strategy.
+
+        This is intentionally stricter than a symbol-only fill lookup.  Rows
+        without an originating order/portfolio epoch are omitted so provenance
+        reconstruction fails closed instead of borrowing stale history.
+        """
+        normalized_codes = [
+            str(code or "").zfill(6)
+            for code in (codes or [])
+            if str(code or "").strip()
+        ]
+        if not normalized_codes:
+            return {}
+        filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
+        stmt = (
+            select(
+                self._schema.fills,
+                self._schema.orders.c.strategy.label("order_strategy"),
+                self._schema.orders.c.sid.label("order_sid"),
+                self._schema.orders.c.mode.label("order_mode"),
+                self._schema.orders.c.entry_reason.label("order_entry_reason"),
+                self._schema.orders.c.entry_style_selected.label("order_entry_style_selected"),
+                self._schema.orders.c.entry_decision_family.label("order_entry_decision_family"),
+                self._schema.orders.c.entry_meta_json.label("order_entry_meta_json"),
+                self._schema.orders.c.stop_price_at_entry.label("order_stop_price_at_entry"),
+                self._schema.orders.c.pivot_price_at_entry.label("order_pivot_price_at_entry"),
+                self._schema.orders.c.entry_rule_version.label("order_entry_rule_version"),
+                self._schema.orders.c.request_json.label("request_json"),
+                self._schema.portfolio_epochs.c.account_id.label("account_id"),
+            )
+            .join(
+                self._schema.orders,
+                self._schema.orders.c.order_id == self._schema.fills.c.order_id,
+            )
+            .join(
+                self._schema.portfolio_epochs,
+                self._schema.portfolio_epochs.c.portfolio_epoch_id
+                == self._schema.fills.c.portfolio_epoch_id,
+            )
+            .where(
+                and_(
+                    self._schema.fills.c.env == _norm_env(env),
+                    self._schema.orders.c.env == _norm_env(env),
+                    self._schema.orders.c.strategy == strategy,
+                    self._schema.portfolio_epochs.c.env == _norm_env(env),
+                    self._schema.portfolio_epochs.c.account_id == str(account_id),
+                    self._schema.fills.c.code.in_(normalized_codes),
+                    self._schema.fills.c.side.in_(["BUY", "SELL"]),
+                )
+            )
+            .order_by(filled_at_expr.asc(), self._schema.fills.c.created_at.asc())
+        )
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="fills.list_provenance_fills_by_codes",
+            fail_open=_resolve_fill_fail_open(),
+        )
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            item = dict(row)
+            # Prefer fill-side canonical entry fields, then the originating
+            # order fields.  Keep original request_json for EntryExitPlan proof.
+            item["entry_reason"] = (
+                item.get("entry_reason") or item.get("order_entry_reason")
+            )
+            item["entry_style_selected"] = (
+                item.get("entry_style_selected")
+                or item.get("order_entry_style_selected")
+            )
+            item["entry_decision_family"] = (
+                item.get("entry_decision_family")
+                or item.get("order_entry_decision_family")
+            )
+            item["stop_price_at_entry"] = (
+                item.get("stop_price_at_entry")
+                or item.get("order_stop_price_at_entry")
+            )
+            item["pivot_price_at_entry"] = (
+                item.get("pivot_price_at_entry")
+                or item.get("order_pivot_price_at_entry")
+            )
+            item["entry_rule_version"] = (
+                item.get("entry_rule_version")
+                or item.get("order_entry_rule_version")
+            )
+            code = str(item.get("code") or "").zfill(6)
+            if code:
+                grouped.setdefault(code, []).append(item)
+        return grouped
+
     def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
         normalized_codes = [str(code or "").zfill(6) for code in (codes or []) if str(code or "").strip()]
         if not normalized_codes:
