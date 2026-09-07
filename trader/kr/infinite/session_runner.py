@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Callable, Iterator
 from zoneinfo import ZoneInfo
 
+from trader.kr.calendar import resolve_kr_trade_date
+
 from .models import Action
 from .repository import InfiniteRepository
 from .runner import RunResult, run_canonical_session
@@ -207,7 +209,21 @@ def run_session_loop(
     if session not in {"am", "afternoon", "close"}:
         raise ValueError(f"unsupported Infinite session={session!r}")
 
-    _ensure_infinite_schema()
+    now_for_trade_date = now_fn()
+    trade_date = resolve_kr_trade_date(now_for_trade_date)
+    os.environ["KR_TRADE_DATE"] = trade_date.isoformat()
+
+    try:
+        _ensure_infinite_schema()
+    except Exception as exc:
+        logger.exception("[KR_INF][SCHEMA][FATAL] err=%s", exc)
+        _write_health(
+            session=session,
+            status="FAIL",
+            reason=f"KR_INF_SCHEMA_BOOTSTRAP:{type(exc).__name__}:{exc}",
+            now=now_for_trade_date,
+        )
+        return 2
 
     interval = max(5, int(interval_sec or os.getenv("KR_INFINITE_LOOP_INTERVAL_SEC", "60")))
     allow_entry = session in {"am", "afternoon"} and os.getenv(
