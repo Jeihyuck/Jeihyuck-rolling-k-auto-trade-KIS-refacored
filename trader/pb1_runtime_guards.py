@@ -87,6 +87,13 @@ def _is_kr_code(code: str) -> bool:
     return len(str(code or "")) == 6 and str(code).isdigit()
 
 
+def _authoritative_holding_qty(snapshot: dict[str, Any]) -> int:
+    """Use explicit broker quantity, including zero; DB is fallback only if unavailable."""
+    if "kis_holding_qty" in snapshot and snapshot.get("kis_holding_qty") is not None:
+        return _safe_int(snapshot.get("kis_holding_qty"))
+    return _safe_int(snapshot.get("holding_qty"))
+
+
 def _collect_buyable_backfill_blocked_codes(engine: Any) -> set[str]:
     blocked: set[str] = set()
     for attr in (
@@ -108,8 +115,7 @@ def _collect_buyable_backfill_blocked_codes(engine: Any) -> set[str]:
             if not code_key:
                 continue
             if (
-                _safe_int(snapshot.get("kis_holding_qty")) > 0
-                or _safe_int(snapshot.get("holding_qty")) > 0
+                _authoritative_holding_qty(snapshot) > 0
                 or bool(snapshot.get("today_buy_exists"))
                 or bool(snapshot.get("today_fill_exists"))
                 or bool(snapshot.get("today_sell_exists"))
@@ -146,9 +152,7 @@ def _buyable_backfill_block_reason(
 
     gate_snapshot = (getattr(engine, "_buyable_gate_context", {}) or {}).get(code, {})
     if isinstance(gate_snapshot, dict):
-        if _safe_int(gate_snapshot.get("kis_holding_qty")) > 0 or _safe_int(
-            gate_snapshot.get("holding_qty")
-        ) > 0:
+        if _authoritative_holding_qty(gate_snapshot) > 0:
             return "blocked_existing_holding_or_duplicate"
         for key, reason in (
             ("open_order_exists", "blocked_open_order"),
