@@ -27,25 +27,31 @@ def test_all_canonical_states_are_supported(default_config, regime, price, gap, 
     assert decision.action == expected and decision.next_status != "FROZEN"
 
 
-@pytest.mark.parametrize("qty,price,expected", [(0, 100, Action.WAIT), (100, 105, Action.BLOCK), (100, 110, Action.BLOCK)])
+@pytest.mark.parametrize("qty,price,expected", [(0, 100, Action.WAIT), (100, 105, Action.BLOCK), (100, 110, Action.SELL_ALL)])
 def test_unknown_future_state_pauses_buy_but_preserves_exit(default_config, qty, price, expected):
     state = None if qty == 0 else active()
     position = BrokerPosition(qty, qty, 100 if qty else 0, price)
     decision = evaluate(config=default_config, state=state, position=position, trade_date=DAY,
                         market_state="KR_FUTURE_NEW_STATE", orderable_cash=1_000_000)
     assert decision.action == expected
-    if qty > 0:
+    if expected == Action.SELL_ALL:
+        assert decision.reason == "TAKE_PROFIT_REGIME_UNAVAILABLE_FALLBACK"
+        assert decision.metadata["fallback_10pct_used"] == 1
+    elif qty > 0:
         assert decision.reason == "KR_INF_UNMAPPED_REGIME"
 
 
-@pytest.mark.parametrize("qty,price,expected", [(0, 100, Action.WAIT), (100, 105, Action.BLOCK), (100, 110, Action.BLOCK)])
+@pytest.mark.parametrize("qty,price,expected", [(0, 100, Action.WAIT), (100, 105, Action.BLOCK), (100, 110, Action.SELL_ALL)])
 def test_missing_blocked_regime_pauses_buy_but_preserves_exit(default_config, qty, price, expected):
     state = None if qty == 0 else active()
     position = BrokerPosition(qty, qty, 100 if qty else 0, price)
     decision = evaluate(config=default_config, state=state, position=position, trade_date=DAY,
                         market_state=None, regime_data_quality="BLOCKED", orderable_cash=1_000_000)
     assert decision.action == expected
-    if qty > 0:
+    if expected == Action.SELL_ALL:
+        assert decision.reason == "TAKE_PROFIT_REGIME_UNAVAILABLE_FALLBACK"
+        assert decision.metadata["fallback_10pct_used"] == 1
+    elif qty > 0:
         assert decision.reason == "KR_INF_UNMAPPED_REGIME"
 
 
