@@ -5543,9 +5543,24 @@ def run_once(
 
     remaining_s = _remaining_seconds()
     close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "0"))).strip().lower() not in {"0", "false", "no"}
-    exit_short_circuit = (phase_for_log == "exit" or window_label == "close") and not close_liquidation_enabled
+    close_exit_safety_engine = (
+        str(os.getenv("PB1_CLOSE_EXIT_SAFETY_ENGINE", "0")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    exit_short_circuit = (
+        (phase_for_log == "exit" or window_label == "close")
+        and not close_liquidation_enabled
+        and not close_exit_safety_engine
+    )
     if (phase_for_log == "exit" or window_label == "close") and close_liquidation_enabled:
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled skip_exit_shortcircuit=1")
+    if (phase_for_log == "exit" or window_label == "close") and close_exit_safety_engine:
+        os.environ["PB1_ENTRY_ENABLED"] = "0"
+        os.environ["PB1_EXIT_ONLY_MODE"] = "1"
+        logger.info(
+            "[KR_CLOSE][EXIT_SAFETY_ENGINE] enabled=1 entry_enabled=0 "
+            "reason=final_standard_exit_evaluation"
+        )
 
     def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
         checkpoint_key = _close_reconcile_checkpoint_key(
@@ -6490,7 +6505,23 @@ def run_once(
             os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "0"))
         ).strip().lower() not in {"0", "false", "no"}
         if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
-            if close_liquidation_enabled_for_engine:
+            close_safety_for_engine = (
+                str(os.getenv("PB1_CLOSE_EXIT_SAFETY_ENGINE", "0")).strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+            if close_safety_for_engine:
+                # Do not return through legacy close-policy shortcuts.  The
+                # normal PB1Engine below receives the authoritative balance and
+                # executes exactly the same per-position exit router as AM/PM,
+                # with entry hard-disabled.  This is the final missed-exit
+                # safety evaluation, not an unconditional liquidation.
+                os.environ["PB1_ENTRY_ENABLED"] = "0"
+                os.environ["PB1_EXIT_ONLY_MODE"] = "1"
+                logger.info(
+                    "[KR_CLOSE][EXIT_SAFETY_ENGINE][CONTINUE] entry_enabled=0 "
+                    "liquidation_all=0 action=run_standard_exit_router"
+                )
+            elif close_liquidation_enabled_for_engine:
                 holdings_for_liquidation = None
                 if isinstance(balance_snapshot_raw, dict):
                     snapshot_holdings = balance_snapshot_raw.get("output1") or []
@@ -6509,34 +6540,35 @@ def run_once(
                 )
                 logger.info("[KR_CLOSE][LIQUIDATION][DONE] orders=%s", len(liquidation_results))
                 return [], bool(liquidation_results), {"buy_orders": 0, "sell_orders": len(liquidation_results), "warning_counts": {}}, phase_for_log, "OK_CLOSE_LIQUIDATION"
-            holdings_for_policy = []
-            if isinstance(balance_snapshot_raw, dict):
-                holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
-            close_policy_result = run_kr_close_policy_from_tagged_positions(
-                kis_holdings=holdings_for_policy,
-                positions_repo=positions_repo,
-                fills_repo=fills_repo,
-                orders_repo=orders_repo,
-                kis_client=kis,
-                env=env_effective,
-                strategy="pb1_pullback_close",
-                dry_run=dry_run_for_engine,
-            )
-            policy_orders = list(close_policy_result.get("policy_orders") or [])
-            policy_results = list(close_policy_result.get("policy_results") or [])
-            accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
-            logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
-            logger.info(
-                "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
-                len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
-            )
-            return [], True, {
-                "buy_orders": 0,
-                "sell_orders": accepted_policy_sells,
-                "sell_orders_ack": accepted_policy_sells,
-                "policy_sell_candidates": len(policy_orders),
-                "warning_counts": {},
-            }, phase_for_log, "OK_CLOSE_POLICY"
+            else:
+                holdings_for_policy = []
+                if isinstance(balance_snapshot_raw, dict):
+                    holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
+                close_policy_result = run_kr_close_policy_from_tagged_positions(
+                    kis_holdings=holdings_for_policy,
+                    positions_repo=positions_repo,
+                    fills_repo=fills_repo,
+                    orders_repo=orders_repo,
+                    kis_client=kis,
+                    env=env_effective,
+                    strategy="pb1_pullback_close",
+                    dry_run=dry_run_for_engine,
+                )
+                policy_orders = list(close_policy_result.get("policy_orders") or [])
+                policy_results = list(close_policy_result.get("policy_results") or [])
+                accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
+                logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
+                logger.info(
+                    "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
+                    len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
+                )
+                return [], True, {
+                    "buy_orders": 0,
+                    "sell_orders": accepted_policy_sells,
+                    "sell_orders_ack": accepted_policy_sells,
+                    "policy_sell_candidates": len(policy_orders),
+                    "warning_counts": {},
+                }, phase_for_log, "OK_CLOSE_POLICY"
 
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
