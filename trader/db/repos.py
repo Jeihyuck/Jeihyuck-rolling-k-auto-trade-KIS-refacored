@@ -2799,6 +2799,32 @@ class OrdersRepo:
                 execute_with_retry(conn, sa.insert(self._schema.orders).values(**payload))
                 return str(payload["order_id"]), True
 
+    def get_by_broker_order_id(self, env: str, broker_order_id: str | None) -> dict | None:
+        """Return the exact durable order for one broker order id."""
+        broker_id = str(broker_order_id or "").strip()
+        if not broker_id:
+            return None
+        stmt = (
+            select(self._schema.orders)
+            .where(
+                and_(
+                    self._schema.orders.c.env == _norm_env(env),
+                    sa.or_(
+                        self._schema.orders.c.broker_order_id == broker_id,
+                        self._schema.orders.c.kis_odno == broker_id,
+                    ),
+                )
+            )
+            .order_by(self._schema.orders.c.updated_at.desc())
+            .limit(1)
+        )
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.get_by_broker_order_id",
+            fail_open=True,
+        )
+        return dict(rows[0]) if rows else None
+
     def mark_submitted(
         self,
         env: str,
