@@ -10475,10 +10475,16 @@ class PB1Engine:
             or (pos.get("entry_meta_json") or {}).get("owner_strategy")
             or ""
         ).upper()
-        if code == "122630":
+        ownership_ok, ownership_reason = enforce_kr_order_ownership(
+            code,
+            "KR_STANDARD",
+        )
+        if _owner_strategy == "KR_INFINITE" or not ownership_ok:
             logger.info(
-                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s reason=KR_INF_OWNERSHIP_RESERVED action=KR_INFINITE_EXIT_ONLY",
+                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s owner=%s reason=%s action=KR_INFINITE_EXIT_ONLY",
                 display_code,
+                _owner_strategy or "KR_STANDARD",
+                ownership_reason or "KR_INF_OWNER_METADATA",
             )
             return None
 
