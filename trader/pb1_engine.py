@@ -69,6 +69,10 @@ from trader.kr.pb1.market_close import resolve_market_close
 from trader.kr.pb1.exit_submit_gate import resolve_exit_submit_gate_reasons as resolve_exit_submit_gate_reasons_impl
 from trader.kr.pb1.terminal_state import resolve_terminal_state
 from trader.position_lifecycle import lifecycle_is_authoritative
+from trader.kr.position_provenance import (
+    Confidence as PositionProvenanceConfidence,
+    audit_position as audit_position_provenance,
+)
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
                                     BalanceFreshness, balance_freshness_for_source,
                                     exit_stage_for_reason)
@@ -3738,16 +3742,133 @@ class PB1Engine:
         balance_rows: Iterable[dict],
         ledger_positions: Iterable[dict] | None = None,
     ) -> list[HoldingContext]:
+        # Materialize once: provenance audit, lifecycle repair, and final holding
+        # construction must all observe the exact same authoritative snapshot.
+        balance_rows = [dict(row or {}) for row in (balance_rows or [])]
         positions_by_code = {
             str((row or {}).get("code") or "").zfill(6): dict(row or {})
             for row in (ledger_positions or [])
             if str((row or {}).get("code") or "").strip()
         }
-        for balance_row in balance_rows or []:
+        account_id = get_account_key(env=self.env, kis=self.kis)
+        balance_codes = [
+            str(row.get("pdno") or row.get("code") or "").zfill(6)
+            for row in balance_rows
+            if str(row.get("pdno") or row.get("code") or "").strip()
+        ]
+        provenance_fills: dict[str, list[dict]] = {}
+        if balance_codes and hasattr(self.fills_repo, "list_provenance_fills_by_codes"):
+            try:
+                provenance_fills = self.fills_repo.list_provenance_fills_by_codes(
+                    self.env,
+                    balance_codes,
+                    strategy=self.STRATEGY_NAME,
+                    account_id=account_id,
+                )
+            except Exception as exc:
+                # Provenance is optional evidence.  Failure means do not repair;
+                # it must never cause a live exit to inherit guessed metadata.
+                logger.warning(
+                    "[KR_POSITION_PROVENANCE][LOAD_FAIL] action=fail_closed err=%s",
+                    exc,
+                )
+                provenance_fills = {}
+
+        for balance_row in balance_rows:
             code_key = str(balance_row.get("pdno") or balance_row.get("code") or "").zfill(6)
             current = positions_by_code.get(code_key)
-            if current and lifecycle_is_authoritative(current):
+            broker_qty = int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0))
+            broker_avg = float(
+                balance_row.get("pchs_avg_pric")
+                or balance_row.get("pchs_avg_price")
+                or balance_row.get("avg_price")
+                or 0
+            )
+            current_meta = (
+                dict((current or {}).get("position_meta") or {})
+                if isinstance((current or {}).get("position_meta"), dict)
+                else {}
+            )
+            current_plan = (
+                (current or {}).get("entry_exit_plan_json")
+                if isinstance((current or {}).get("entry_exit_plan_json"), dict)
+                else {}
+            )
+            needs_provenance = bool(
+                not current
+                or not lifecycle_is_authoritative(current)
+                or str((current or {}).get("position_origin") or "").upper() in {"IMPORTED", "RECOVERY"}
+                or current_meta.get("holding_age_unknown")
+                or not (current or {}).get("entry_ts")
+                or not current_plan
+                or str((current or {}).get("exit_policy_family") or "").upper() == "POLICY_MISSING"
+            )
+
+            audit = None
+            if needs_provenance:
+                audit = audit_position_provenance(
+                    code=code_key,
+                    broker_qty=broker_qty,
+                    broker_avg=broker_avg,
+                    fills=provenance_fills.get(code_key, []),
+                )
+                logger.info(
+                    "[KR_POSITION_PROVENANCE][AUDIT] code=%s confidence=%s reason=%s "
+                    "broker_qty=%s broker_avg=%s reconstructed_qty=%s reconstructed_avg=%s",
+                    code_key,
+                    audit.confidence.value,
+                    audit.reason,
+                    audit.broker_qty,
+                    audit.broker_avg,
+                    audit.reconstructed_qty,
+                    audit.reconstructed_avg,
+                )
+
+            # A complete authoritative current lifecycle needs no replacement.
+            if current and lifecycle_is_authoritative(current) and not needs_provenance:
                 continue
+
+            # Existing imported/recovery rows may be repaired in place only from
+            # CONFIRMED last-flat replay.  A partial/ambiguous audit keeps the
+            # original UNKNOWN/POLICY_MISSING contract intact.
+            if current and lifecycle_is_authoritative(current):
+                if audit and audit.confidence is PositionProvenanceConfidence.CONFIRMED and audit.updates:
+                    repaired_meta = {
+                        **current_meta,
+                        **dict(audit.updates.get("position_meta") or {}),
+                    }
+                    repair_fields = {
+                        **{k: v for k, v in audit.updates.items() if k != "position_meta"},
+                        "position_meta": repaired_meta,
+                        "position_origin": "RECOVERY",
+                    }
+                    self.positions_repo.update_position_fields(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=int(current.get("sid") or 1),
+                        mode=int(current.get("mode") or 1),
+                        code=code_key,
+                        fields=repair_fields,
+                    )
+                    current = {**current, **repair_fields}
+                    current["position_meta"] = repaired_meta
+                    positions_by_code[code_key] = current
+                    logger.info(
+                        "[KR_POSITION_PROVENANCE][CONFIRMED] code=%s action=repair_existing "
+                        "position_cycle_id=%s original_buy_id=%s",
+                        code_key,
+                        current.get("position_cycle_id"),
+                        audit.original_buy_id,
+                    )
+                elif audit:
+                    logger.warning(
+                        "[KR_POSITION_PROVENANCE][%s] code=%s action=keep_policy_missing reason=%s",
+                        audit.confidence.value,
+                        code_key,
+                        audit.reason,
+                    )
+                continue
+
             if not hasattr(self.positions_repo, "get_or_create_imported_cycle_for_kis_holding"):
                 logger.error("[LIFECYCLE][BLOCK] code=%s reason=PERSISTENCE_API_UNAVAILABLE action=BLOCK_EXIT", code_key)
                 positions_by_code[code_key] = {"code": code_key, "position_meta": {"holding_age_unknown": True,
@@ -3755,12 +3876,51 @@ class PB1Engine:
                 continue
             persisted, created = self.positions_repo.get_or_create_imported_cycle_for_kis_holding(
                 env=self.env, strategy=self.STRATEGY_NAME,
-                account_id=get_account_key(env=self.env, kis=self.kis), sid=int((current or {}).get("sid") or 1),
+                account_id=account_id, sid=int((current or {}).get("sid") or 1),
                 mode=int((current or {}).get("mode") or 1), code=code_key,
                 market=(current or {}).get("market") or balance_row.get("prdt_type_cd") or balance_row.get("market"),
-                qty=int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0)),
-                avg_price=float(balance_row.get("pchs_avg_pric") or balance_row.get("avg_price") or 0),
+                qty=broker_qty,
+                avg_price=broker_avg,
             )
+            if audit and audit.confidence is PositionProvenanceConfidence.CONFIRMED and audit.updates:
+                persisted_meta = (
+                    dict(persisted.get("position_meta") or {})
+                    if isinstance(persisted.get("position_meta"), dict)
+                    else {}
+                )
+                repaired_meta = {
+                    **persisted_meta,
+                    **dict(audit.updates.get("position_meta") or {}),
+                }
+                repair_fields = {
+                    **{k: v for k, v in audit.updates.items() if k != "position_meta"},
+                    "position_meta": repaired_meta,
+                    "position_origin": "RECOVERY",
+                }
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=int(persisted.get("sid") or 1),
+                    mode=int(persisted.get("mode") or 1),
+                    code=code_key,
+                    fields=repair_fields,
+                )
+                persisted = {**persisted, **repair_fields}
+                persisted["position_meta"] = repaired_meta
+                logger.info(
+                    "[KR_POSITION_PROVENANCE][CONFIRMED] code=%s action=repair_imported "
+                    "position_cycle_id=%s original_buy_id=%s",
+                    code_key,
+                    persisted.get("position_cycle_id"),
+                    audit.original_buy_id,
+                )
+            elif audit:
+                logger.warning(
+                    "[KR_POSITION_PROVENANCE][%s] code=%s action=import_without_provenance reason=%s",
+                    audit.confidence.value,
+                    code_key,
+                    audit.reason,
+                )
             positions_by_code[code_key] = persisted
             log_tag = "IMPORT_PERSIST" if created else "IMPORT_REUSE"
             logger.info("[LIFECYCLE][%s] code=%s active_epoch_id=%s position_cycle_id=%s source=KIS_HOLDING reason=LEGACY_OR_UNPROVEN_CYCLE created=%s",
@@ -3801,9 +3961,14 @@ class PB1Engine:
             )
             pos_meta = dict(positions_by_code.get(code) or {})
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at")
-            if entry_ts_raw is None:
-                pos_meta.setdefault("position_meta", {})["holding_age_unknown"] = True
+            entry_ts_raw = latest_buy_fill.get("filled_at") or pos_meta.get("entry_ts")
+            nested_position_meta = (
+                dict(pos_meta.get("position_meta") or {})
+                if isinstance(pos_meta.get("position_meta"), dict)
+                else {}
+            )
+            nested_position_meta["holding_age_unknown"] = entry_ts_raw is None
+            pos_meta["position_meta"] = nested_position_meta
             pos_age = calc_position_age(entry_ts_raw, today_kst)
             entry_date = pos_age.entry_date_kst
             trading_days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("trading_days_held") or pos_meta.get("holding_days") or 0)
@@ -3866,7 +4031,7 @@ class PB1Engine:
                        "position_meta": {"holding_age_unknown": True, "trail_eligible": False,
                                          "lifecycle_blocked": True}}
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at")
+            entry_ts_raw = latest_buy_fill.get("filled_at") or row.get("entry_ts")
             entry_date = None
             days_held = 0
             if entry_ts_raw:
