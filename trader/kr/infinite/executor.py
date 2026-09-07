@@ -5,16 +5,26 @@ from typing import Any
 
 from trader.kis_wrapper import extract_order_no, is_order_accepted
 
+from .config import InfiniteConfig
 from .models import Action, BrokerOrderState, BrokerPosition, Decision, OrderIntent
 
 
 class KISExecutor:
     """Narrow adapter over existing public domestic KIS methods."""
 
-    def __init__(self, kis: Any, kis_env: str, balance_snapshot: dict | None = None):
+    def __init__(
+        self,
+        kis: Any,
+        kis_env: str,
+        balance_snapshot: dict | None = None,
+        *,
+        symbol: str | None = None,
+    ):
         self.kis = kis
         self.kis_env = kis_env
         self.balance_snapshot = balance_snapshot
+        configured = symbol if symbol is not None else InfiniteConfig.from_env().symbol
+        self.symbol = str(configured or "").lstrip("A").zfill(6)
 
     def _balance(self) -> dict:
         raw = self.balance_snapshot if self.balance_snapshot is not None else self.kis.get_balance()
@@ -73,7 +83,7 @@ class KISExecutor:
                 side_raw = str(item.get("sll_buy_dvsn_cd") or item.get("side") or item.get("sll_buy_dvsn_name") or "").upper()
                 side = "BUY" if side_raw in {"02", "BUY", "매수"} or "BUY" in side_raw else "SELL" if side_raw in {"01", "SELL", "매도"} or "SELL" in side_raw else ""
                 requested = int(float(item.get("ord_qty") or item.get("requested_qty") or item.get("tot_ord_qty") or 0))
-                return symbol == "122630" and side == expected_side and requested == intent.requested_qty
+                return symbol == self.symbol and side == expected_side and requested == intent.requested_qty
             matches = [item for item in rows if correlated(item)]
             if len(matches) > 1:
                 raise RuntimeError("KR_INF_PENDING_ORDER_AMBIGUOUS")
