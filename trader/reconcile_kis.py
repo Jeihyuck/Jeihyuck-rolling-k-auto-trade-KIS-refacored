@@ -220,7 +220,7 @@ def _promote_open_buy_orders_from_holdings(
     holdings_rows: list[dict],
     orders_repo: OrdersRepo,
     fills_repo: FillsRepo,
-    positions_repo: PositionsRepo,
+    positions_repo: PositionsRepo | None = None,
 ) -> dict[str, int]:
     qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
     promoted_orders = 0
@@ -355,7 +355,7 @@ def _promote_open_buy_orders_from_holdings(
         )
         promoted_orders += 1
 
-        if side == "SELL" and confirmed_fill_qty > 0 and next_status in {
+        if positions_repo is not None and side == "SELL" and confirmed_fill_qty > 0 and next_status in {
             "PARTIAL_FILLED", "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"
         }:
             _commit_confirmed_sell_stage(
