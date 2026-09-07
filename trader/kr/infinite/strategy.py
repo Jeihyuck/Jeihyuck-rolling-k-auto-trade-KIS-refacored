@@ -161,7 +161,9 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
         return Decision(Action.WAIT, "KR_INF_EXIT_ONLY_ADOPTION_NO_ENTRY")
     if state.status == Status.EXIT_PENDING or pending_sell: return Decision(Action.WAIT,"EXIT_PENDING",next_status=Status.EXIT_PENDING)
     if not allow_entry:return Decision(Action.WAIT,"KR_INF_ENTRY_DISABLED_BY_SESSION")
-    infinite_overlay_bypass = config.symbol == "122630"
+    # This module is already the KR_INFINITE owner. Overlay bypass is a
+    # strategy-owner property, never a ticker comparison.
+    infinite_overlay_bypass = True
     regime_pause=buy_pause_reason(market_state,regime_data_quality)
     bypassable_states = {"KR_DEFENSE_CAUTION", "KR_DEFENSE_RISK_OFF", "KR_NORMAL", "KR_RISK_ON", "KR_STRONG_RISK_ON", "KR_SHOCK_REBOUND_CONFIRMED"}
     if regime_pause and (not infinite_overlay_bypass or market_state not in bypassable_states):return Decision(Action.WAIT,regime_pause)
