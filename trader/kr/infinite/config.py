@@ -50,7 +50,9 @@ class InfiniteConfig:
                    balance_reconcile_grace_attempts=i("BALANCE_RECONCILE_GRACE_ATTEMPTS", 3))
 
     def validate(self) -> None:
-        if self.symbol != "122630": raise ValueError("BLOCK_UNSUPPORTED_SYMBOL")
+        symbol = str(self.symbol or "").lstrip("A")
+        if len(symbol) != 6 or not symbol.isdigit():
+            raise ValueError("INVALID_SYMBOL")
         if self.total_units != 40 or self.core_units != 30 or self.reserve_units != 10 or self.total_units != self.core_units + self.reserve_units:
             raise ValueError("INVALID_UNIT_CONFIGURATION")
         if not 0 < self.account_exposure_pct <= self.safe_max_exposure_pct <= 1: raise ValueError("INVALID_ACCOUNT_EXPOSURE")
