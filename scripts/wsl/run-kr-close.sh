@@ -2,6 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 source "$SCRIPT_DIR/init-session-log.sh"
+source "$SCRIPT_DIR/kr-infinite-sidecar.sh"
 source "$SCRIPT_DIR/kr-close-failure-classifier.sh"
 nullim_init_session_log KR close "close" "${BASH_SOURCE[0]}"
 # The KR calendar is advisory only; Windows Task Scheduler owns execution timing.
@@ -116,6 +117,7 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
   echo "[KR_CLOSE][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
   KR_CLOSE_SESSION_TIMEOUT_SEC="${KR_CLOSE_SESSION_TIMEOUT_SEC:-1800}"
   echo "[KR_CLOSE][EFFECTIVE_ENV] timeout_sec=${KR_CLOSE_SESSION_TIMEOUT_SEC}"
+  nullim_start_kr_infinite_sidecar "$WSL_RUN_SESSION" "$STRATEGY_ENV"
   set +e
   timeout --kill-after=30s "${KR_CLOSE_SESSION_TIMEOUT_SEC}" python -m trader.kr.runner.trade_session_runner --session close --env "$STRATEGY_ENV"
   rc=$?
@@ -146,6 +148,7 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
       rc="$original_rc"
     fi
   fi
+  nullim_wait_kr_infinite_sidecar
   echo "[KR_CLOSE][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG_FILE" 2>&1
