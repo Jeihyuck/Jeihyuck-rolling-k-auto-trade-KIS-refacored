@@ -1350,6 +1350,9 @@ def _resolve_swing_staged_exit(
     mark: float,
     ma20: float | None,
     *,
+    ma50: float | None = None,
+    features: dict[str, Any] | None = None,
+    regime: str = "",
     ret_pct: float,
     days_held: int,
     stop_hit: bool,
@@ -1361,6 +1364,9 @@ def _resolve_swing_staged_exit(
         pos,
         mark,
         ma20,
+        ma50=ma50,
+        features=features,
+        regime=regime,
         ret_pct=ret_pct,
         days_held=days_held,
         stop_hit=stop_hit,
@@ -10746,6 +10752,9 @@ class PB1Engine:
                     _active_family = "SWING_STAGED_EXIT"
                     horizon_result = _resolve_swing_staged_exit(
                         pos, float(mark or 0.0), ma20,
+                        ma50=ma50,
+                        features=features,
+                        regime=regime_str,
                         ret_pct=ret_pct,
                         days_held=trading_days_held,
                         stop_hit=stop_hit,
@@ -10763,6 +10772,9 @@ class PB1Engine:
             elif _active_family == "SWING_STAGED_EXIT":
                 horizon_result = _resolve_swing_staged_exit(
                     pos, float(mark or 0.0), ma20,
+                    ma50=ma50,
+                    features=features,
+                    regime=regime_str,
                     ret_pct=ret_pct,
                     days_held=trading_days_held,
                     stop_hit=stop_hit,
