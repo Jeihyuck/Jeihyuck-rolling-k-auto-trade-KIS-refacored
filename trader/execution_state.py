@@ -60,11 +60,17 @@ def exit_stage_for_reason(reason: str | None, *, requested_sell_qty: int | None 
     partial = ((sell_pct is not None and 0 < float(sell_pct) < 1)
                or (requested_sell_qty is not None and broker_qty_before is not None
                    and 0 < int(requested_sell_qty) < int(broker_qty_before)))
-    if value in {"TP1", "TAKE_PROFIT_1", "ABS_TP1", "ABS_TP1_10PCT",
-                 "SWING_TP1_R", "SWING_TP1_PCT", "CORE_TP1_R"}:
+    if value in {
+        "TP1", "TAKE_PROFIT_1", "ABS_TP1", "ABS_TP1_10PCT",
+        "SWING_TP1_R", "SWING_TP1_PCT", "SWING_PCT_TP1",
+        "EXIT_SWING_TP1", "CORE_TP1_R", "EXIT_CORE_TP1",
+    }:
         return "TP1"
-    if value in {"TP2", "TAKE_PROFIT_2", "ABS_TP2", "SWING_TP2_R",
-                 "SWING_TP2_PCT", "CORE_TP2_R"}:
+    if value in {
+        "TP2", "TAKE_PROFIT_2", "ABS_TP2", "SWING_TP2_R",
+        "SWING_TP2_PCT", "SWING_PCT_TP2", "EXIT_SWING_TP2",
+        "CORE_TP2_R", "EXIT_CORE_TP2",
+    }:
         return "TP2"
     if value in {"PROFIT_PROTECT_8PCT", "SWING_PROFIT_PROTECT_GIVEBACK",
                  "MOMENTUM_PROFIT_PROTECT_GIVEBACK"} or value.startswith("PROFIT_PROTECT_PARTIAL_1"):
