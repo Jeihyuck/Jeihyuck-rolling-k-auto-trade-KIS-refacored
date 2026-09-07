@@ -298,7 +298,7 @@ from trader.kr.pb1.reason_counts import (
 )
 from trader.kr.pb1.ownership import enforce_kr_order_ownership
 from trader.kr.regime import (
-    KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
+    KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeSnapshot, KRRegimeStabilizer,
     build_kr_regime_snapshot, build_market_local_overlay, calculate_global_market_state, calculate_market_budgets, candidate_allows_buy, execution_policy, market_allows_buy, market_execution_policies, normalize_kr_market, write_snapshot,
 )
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
@@ -10200,6 +10200,7 @@ class PB1Engine:
             return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved",
                     "terminal_event": "FINAL_SKIP"}
         status: dict[str, Any] = self._empty_order_status()
+        stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
@@ -17124,8 +17125,8 @@ class PB1Engine:
                 len(self._debug_sizing_ok_codes),
                 len(orderable_candidates),
                 submit_success_count,
-                int(accepted_count) if 'accepted_count' in locals() else 0,
-                int(filled_count) if 'filled_count' in locals() else 0,
+                int(locals().get("accepted_count", 0) or 0),
+                int(locals().get("filled_count", 0) or 0),
             )
             orderable_code_set = {candidate.code for candidate in orderable_candidates}
             buyable_ok_set = set(buyable_ok_codes)
