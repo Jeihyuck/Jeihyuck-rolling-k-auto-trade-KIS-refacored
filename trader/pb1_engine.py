@@ -296,7 +296,7 @@ from trader.kr.pb1.reason_counts import (
     _normalize_entry_block_reasons,
     _summarize_blocked_reasons,
 )
-from trader.kr.pb1.ownership import enforce_kr_order_ownership
+from trader.kr.pb1.ownership import enforce_kr_order_ownership, reserved_kr_infinite_symbol
 from trader.kr.regime import (
     KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeSnapshot, KRRegimeStabilizer,
     build_kr_regime_snapshot, build_market_local_overlay, calculate_global_market_state, calculate_market_budgets, candidate_allows_buy, execution_policy, market_allows_buy, market_execution_policies, normalize_kr_market, write_snapshot,
@@ -11780,8 +11780,15 @@ class PB1Engine:
         holdings_source = str((self._exit_holdings_meta or {}).get("source") or "unknown")
         logger.info("[EXIT][LOAD] holdings_raw=%s codes=%s source=%s", len(holdings_raw), [holding.code for holding in holdings_raw], holdings_source)
         all_broker_holdings = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
-        kr_infinite_holdings = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) == "122630"]
-        holdings_exit_scope = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) != "122630"]
+        reserved_infinite_symbol = reserved_kr_infinite_symbol()
+        kr_infinite_holdings = [
+            holding for holding in all_broker_holdings
+            if str(holding.code).zfill(6) == reserved_infinite_symbol
+        ]
+        holdings_exit_scope = [
+            holding for holding in all_broker_holdings
+            if str(holding.code).zfill(6) != reserved_infinite_symbol
+        ]
         logger.info("[EXIT][SCOPE] broker_total=%s kr_inf_reserved=%s pb1_scope=%s codes=%s",
                     len(all_broker_holdings), len(kr_infinite_holdings), len(holdings_exit_scope),
                     [holding.code for holding in holdings_exit_scope])
@@ -12005,9 +12012,19 @@ class PB1Engine:
         else:
             members = self.universe_repo.get_current_universe_members(self.env, self.UNIVERSE_STRATEGY)
             self._universe_as_of = members[0].get("as_of_date") if members else None
-        if any(str(m.get("code") or "").zfill(6) == "122630" for m in members):
-            logger.warning("[PB1][OWNERSHIP][EXCLUDE] symbol=122630 reason=KR_INF_OWNERSHIP_RESERVED")
-        members = [m for m in members if str(m.get("code") or "").zfill(6) != "122630"]
+        reserved_infinite_symbol = reserved_kr_infinite_symbol()
+        if reserved_infinite_symbol and any(
+            str(m.get("code") or "").zfill(6) == reserved_infinite_symbol
+            for m in members
+        ):
+            logger.warning(
+                "[PB1][OWNERSHIP][EXCLUDE] symbol=%s reason=KR_INF_OWNERSHIP_RESERVED",
+                reserved_infinite_symbol,
+            )
+        members = [
+            m for m in members
+            if str(m.get("code") or "").zfill(6) != reserved_infinite_symbol
+        ]
         self._code_name_map = {
             str(m.get("code") or "").zfill(6): (m.get("name") or (m.get("meta_json") or {}).get("name"))
             for m in members or []
