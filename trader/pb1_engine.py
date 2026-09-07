@@ -10894,6 +10894,9 @@ class PB1Engine:
         _router_full_exit = False
         _router_sell_pct = None
         _router_reason = final_reason
+        # Stage-changing router metadata is only committed after a confirmed
+        # broker fill.  It is carried on the durable SELL intent until then.
+        _pending_position_meta_update: dict[str, Any] = {}
         if exit_policy_family in {
             "INTRADAY_PROFIT_PROTECT",
             "SWING_STAGED_EXIT",
@@ -10972,9 +10975,12 @@ class PB1Engine:
                     _router_sell_pct,
                     qty,
                 )
-                # position_meta 업데이트 (tp1_done 등)
-                _meta_update = horizon_result.get("update_meta") or {}
-                _meta_update["max_pnl_pct_since_entry"] = _max_pnl
+                # Observational state may be persisted immediately, but
+                # tp1_done/tp2_done/runner/stop changes must wait for a proven
+                # fill.  Otherwise an ACK/reject can falsely consume the stage.
+                _meta_update = dict(horizon_result.get("update_meta") or {})
+                if horizon_result.get("exit_ok", False):
+                    _pending_position_meta_update = dict(_meta_update)
                 self.positions_repo.update_position_fields(
                     env=self.env,
                     strategy=self.STRATEGY_NAME,
@@ -10983,7 +10989,7 @@ class PB1Engine:
                     code=code,
                     fields={"position_meta": {
                         **(pos.get("position_meta") or {}),
-                        **_meta_update,
+                        "max_pnl_pct_since_entry": _max_pnl,
                     }},
                 )
                 # 기존 exit_policy/final_reason 오버라이드
@@ -11570,6 +11576,7 @@ class PB1Engine:
             "position_exit_policy_family": pos.get("exit_policy_family") or exit_policy_family,
             "position_eod_action": pos.get("eod_action") or exit_eval_payload.get("eod_action"),
             "policy_version": pos.get("policy_version") or (exit_eval_payload.get("entry_exit_plan") or {}).get("policy_version"),
+            "pending_position_meta_update": dict(_pending_position_meta_update),
         }
         sell_baseline = (OrderBaseline.capture(self._authoritative_balance, code, orderable_qty)
                          if self._authoritative_balance else None)
@@ -11594,6 +11601,7 @@ class PB1Engine:
                               "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
                               "exit_stage": stage,
                               "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
+                              "pending_position_meta_update": dict(_pending_position_meta_update),
                               "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {},
                               **(sell_baseline.__dict__ if sell_baseline else {
                                   "balance_snapshot_id": None,
