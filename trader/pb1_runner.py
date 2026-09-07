@@ -4836,6 +4836,7 @@ def run_once(
     max_seconds: int = 0,
     runs_ledger_fail_open: bool = False,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
+    touched_files: list[Path] = []
     if (os.getenv("MODE") or "").strip().lower() == "trade" and not (os.getenv("PB1_UNIVERSE_STRATEGY") or "").strip():
         os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
 
@@ -5781,7 +5782,7 @@ def run_once(
     run_record_id = None
     engine_runner: PB1Engine | None = None
     did_work = False
-    touched_files: list[Path] = []
+    touched_files = []
     result = None
     db_write_reasons: list[str] = []
     universe_ctx: UniverseContext | None = None
