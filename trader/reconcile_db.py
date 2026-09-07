@@ -176,18 +176,19 @@ def close_stale_positions_guarded(
         ]
 
     open_order_codes: set[str] = set()
-    with engine.connect() as conn:
-        order_rows = conn.execute(
-            sa.select(schema.orders.c.code).where(
-                sa.and_(
-                    schema.orders.c.env == env,
-                    schema.orders.c.strategy == strategy,
-                    schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+    if inspector.has_table("orders"):
+        with engine.connect() as conn:
+            order_rows = conn.execute(
+                sa.select(schema.orders.c.code).where(
+                    sa.and_(
+                        schema.orders.c.env == env,
+                        schema.orders.c.strategy == strategy,
+                        schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+                    )
                 )
-            )
-        ).mappings().all()
-    for row in order_rows:
-        open_order_codes.add(str((row or {}).get("code") or "").zfill(6))
+            ).mappings().all()
+        for row in order_rows:
+            open_order_codes.add(str((row or {}).get("code") or "").zfill(6))
 
     if not open_rows:
         logger.info("[STALE_DB][SOFT_CLOSE][SKIP] reason=no_open_positions rows_kept=0")
@@ -285,6 +286,7 @@ def close_stale_positions_guarded(
         )
         continue
 
+    adjusted_to_zero_count = sum(1 for row in adjustable_rows if int(row[2]) == 0)
     if adjustable_rows:
         with engine.begin() as conn:
             for code, db_qty_before, kis_qty_after, avg_buy_price, reconcile_reason, pending_order in adjustable_rows:
@@ -330,14 +332,17 @@ def close_stale_positions_guarded(
 
     if not closable_codes:
         # A live KIS holding only protects its own row; never use it as a
-        # portfolio-wide reason to hide stale DB positions.
+        # portfolio-wide reason to hide stale DB positions.  Quantity
+        # reconciliations to zero are real broker-confirmed closes and retain
+        # the historical return contract of this function.
         skip_reason = "no_rowwise_soft_close_candidates" if rows_kept or adjustable_rows else "no_soft_close_candidates"
         logger.warning(
-            "[STALE_DB][SOFT_CLOSE][SKIP] reason=%s rows_kept=%s",
+            "[STALE_DB][SOFT_CLOSE][SKIP] reason=%s rows_kept=%s adjusted_to_zero=%s",
             skip_reason,
             rows_kept,
+            adjusted_to_zero_count,
         )
-        return 0
+        return int(adjusted_to_zero_count)
 
     with engine.begin() as conn:
         if has_status:
