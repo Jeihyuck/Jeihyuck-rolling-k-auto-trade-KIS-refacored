@@ -89,6 +89,32 @@ def evaluate(*, config: InfiniteConfig, state: State|None, position: BrokerPosit
             return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
         state_name = str(market_state or "").upper()
         if state_name not in KR_ADAPTIVE_TP_MAP:
+            # Regime loss must never strand an already-profitable holding.
+            # Keep the existing configured 10% fallback as exit-only safety;
+            # no BUY/RECOVERY is authorized by this path.
+            if profit_pct + 1e-12 >= config.take_profit_pct:
+                if pending_sell:
+                    return Decision(Action.WAIT, "KR_INF_PROFIT_SELL_PENDING", next_status=Status.EXIT_PENDING)
+                orderable = int(position.orderable_qty or 0)
+                if orderable <= 0:
+                    return Decision(Action.WAIT, "KR_INF_PROFIT_NO_ORDERABLE_QTY")
+                key = idempotency_key(state.cycle_id or "MISSING", trade_date, "SELL_ALL")
+                if key in existing_intent_keys:
+                    return Decision(Action.WAIT, "DUPLICATE_INTENT", next_status=Status.EXIT_PENDING)
+                return Decision(
+                    Action.SELL_ALL,
+                    "TAKE_PROFIT_REGIME_UNAVAILABLE_FALLBACK",
+                    orderable,
+                    orderable * position.current_price,
+                    key,
+                    Status.EXIT_PENDING,
+                    {
+                        "fallback_10pct_used": 1,
+                        "raw_market_state": market_state,
+                        "normalized_state": state_name,
+                        "return_rate_at_decision": profit_pct,
+                    },
+                )
             return Decision(Action.BLOCK, "KR_INF_UNMAPPED_REGIME")
         if stage in {"NONE", "TP1_PENDING"}:
             threshold, fraction, next_stage = adaptive_tp_stage(
