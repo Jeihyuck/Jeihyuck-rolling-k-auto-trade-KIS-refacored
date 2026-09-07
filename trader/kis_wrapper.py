@@ -1539,8 +1539,11 @@ class KisAPI:
                             msg_cd,
                             body.get("msg1"),
                         )
-                        # Circuit breaker pause (15s)
-                        _price_cache.open_circuit(rate_limited=True)
+                        # The price circuit belongs only to price endpoints.
+                        # Balance/investor rate limits have their own endpoint
+                        # breaker/global cooldown and must not suppress quotes.
+                        if "inquire-price" in _endpoint_path(url):
+                            _price_cache.open_circuit(rate_limited=True)
                         # Exponential backoff
                         _egw002_backoff_sleep(attempt=i)
                         if i < attempts:
@@ -2302,9 +2305,6 @@ class KisAPI:
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
 
-        elapsed_ms = (time.time() - start_time) * 1000
-        self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
-
         if raw_output is None:
             if diag_mode:
                 return {}
@@ -2382,12 +2382,25 @@ class KisAPI:
                 reasons.append("AFTER_HOURS")
         
         if prpr is not None:
-            price_only = self.get_price_only(code, attempts=attempts)
-            if price_only.get("prpr") is not None:
-                price_only["reasons"] = reasons
-                return price_only
-        
-        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": reasons}
+            # The same successful inquire-price response already supplied a
+            # usable last price.  Do not perform a second KIS call merely
+            # because ask/bid fields are absent.
+            logger.info(
+                "[KIS][QUOTE][PRPR_FALLBACK] code=%s prpr=%s reasons=%s",
+                code,
+                prpr,
+                reasons,
+            )
+            return {
+                "ask": None,
+                "bid": None,
+                "prpr": prpr,
+                "last": prpr,
+                "fallback_used": "same_response_prpr",
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+
+        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": list(dict.fromkeys(reasons))}
 
     def get_quote(self, code: str) -> dict:
         """
@@ -2871,12 +2884,44 @@ class KisAPI:
                 return {"ok": True, "inv": inv}
             except Exception as e:
                 err_text = str(e)
-                err_type = "HTTP500" if "500" in err_text else ("TIMEOUT" if "timeout" in err_text.lower() or "ReadTimeout" in err_text else type(e).__name__)
-                logger.warning("[KR_FLOW][KIS_INVESTOR][FAIL_SOFT] code=%s err_type=%s action=impute_and_continue", iscd, err_type)
-                if attempt >= attempts or os.getenv("KR_INVESTOR_FLOW_FAIL_SOFT", "1") == "1":
-                    reason = "kis_investor_http_500" if err_type == "HTTP500" else "kis_investor_timeout" if err_type == "TIMEOUT" else err_type
-                    return {"ok": False, "error": reason, "inv": None, "flow_data_available": 0, "flow_missing": 1, "flow_fail_reason": reason, "flow_score_imputed": 1, "foreign_20_ratio": 0.0, "inst_20_ratio": 0.0}
-                time.sleep(min(0.2 * (2 ** (attempt - 1)), 0.5))
+                err_lower = err_text.lower()
+                if any(token in err_text for token in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
+                    err_type = "HTTP5XX"
+                elif "timeout" in err_lower or "readtimeout" in err_lower:
+                    err_type = "TIMEOUT"
+                else:
+                    err_type = type(e).__name__
+                retryable = err_type in {"HTTP5XX", "TIMEOUT"}
+                logger.warning(
+                    "[KR_FLOW][KIS_INVESTOR][FAIL_SOFT] code=%s err_type=%s "
+                    "attempt=%s/%s retryable=%s",
+                    iscd,
+                    err_type,
+                    attempt,
+                    attempts,
+                    int(retryable),
+                )
+                if retryable and attempt < attempts:
+                    time.sleep(min(0.2 * (2 ** (attempt - 1)), 0.5))
+                    continue
+                reason = (
+                    "kis_investor_http_5xx"
+                    if err_type == "HTTP5XX"
+                    else "kis_investor_timeout"
+                    if err_type == "TIMEOUT"
+                    else err_type
+                )
+                return {
+                    "ok": False,
+                    "error": reason,
+                    "inv": None,
+                    "flow_data_available": 0,
+                    "flow_missing": 1,
+                    "flow_fail_reason": reason,
+                    "flow_score_imputed": 1,
+                    "foreign_20_ratio": 0.0,
+                    "inst_20_ratio": 0.0,
+                }
 
     def get_price_snapshot(self, code: str, market: str = "J") -> dict:
         """
@@ -3799,10 +3844,14 @@ class KisAPI:
             raise KisTemporaryError("forced_500_balance")
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
+            cache_ttl_s = max(
+                1.0,
+                float(os.getenv("KR_KIS_BALANCE_CACHE_TTL_SEC", "30") or "30"),
+            )
             cached = _deepcopy_json(self._balance_cache)
             normalized = _normalize_balance_snapshot(cached)
-            if normalized:
-                logger.info("[KIS][BALANCE_CACHE] hit=True age_s=%.1f", age_s)
+            if normalized and age_s <= cache_ttl_s:
+                logger.info("[KIS][BALANCE_CACHE] hit=True age_s=%.1f ttl_s=%.1f", age_s, cache_ttl_s)
                 self._balance_cache = _deepcopy_json(normalized)
                 source = "wrapper_cache"
                 if return_source and return_raw:
@@ -3810,6 +3859,14 @@ class KisAPI:
                 if return_source:
                     return normalized, source
                 return normalized
+            if normalized and age_s > cache_ttl_s:
+                logger.warning(
+                    "[KIS][BALANCE_CACHE][EXPIRED] age_s=%.1f ttl_s=%.1f "
+                    "action=refresh_not_fresh",
+                    age_s,
+                    cache_ttl_s,
+                )
+                force = True
             global _BALANCE_CACHE_INVALID_LOGGED
             if not _BALANCE_CACHE_INVALID_LOGGED:
                 if isinstance(cached, dict) and cached.get("rt_cd") not in (None, "0"):

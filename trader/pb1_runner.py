@@ -2738,6 +2738,10 @@ def _write_session_result_file(payload: dict[str, Any], *, engine=None, env: str
             payload["accepted"] = int(durable["broker_acked"])
             payload["filled_confirmed"] = int(durable["fills_confirmed"])
             payload["filled_confirmed_count"] = int(durable["fills_confirmed"])
+            payload["quantity_confirmed_fills"] = int(durable.get("quantity_confirmed_fills", durable["fills_confirmed"]))
+            payload["price_unresolved_quantity_confirmed"] = int(
+                durable.get("price_unresolved_quantity_confirmed", 0)
+            )
             payload["unresolved_ack_count"] = int(durable["unresolved_acks"])
             payload["ack_without_confirmed_fill"] = int(durable["ack_without_confirmed_fill"])
             for warning in durable.get("consistency_warnings", []):
@@ -4832,6 +4836,7 @@ def run_once(
     max_seconds: int = 0,
     runs_ledger_fail_open: bool = False,
 ) -> tuple[list[Path], bool, dict[str, int], str, str]:
+    touched_files: list[Path] = []
     if (os.getenv("MODE") or "").strip().lower() == "trade" and not (os.getenv("PB1_UNIVERSE_STRATEGY") or "").strip():
         os.environ["PB1_UNIVERSE_STRATEGY"] = "pb1_watchlist_final_scored"
 
@@ -5543,9 +5548,24 @@ def run_once(
 
     remaining_s = _remaining_seconds()
     close_liquidation_enabled = str(os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("KR_CLOSE_LIQUIDATION_ENABLED", "0"))).strip().lower() not in {"0", "false", "no"}
-    exit_short_circuit = (phase_for_log == "exit" or window_label == "close") and not close_liquidation_enabled
+    close_exit_safety_engine = (
+        str(os.getenv("PB1_CLOSE_EXIT_SAFETY_ENGINE", "0")).strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    exit_short_circuit = (
+        (phase_for_log == "exit" or window_label == "close")
+        and not close_liquidation_enabled
+        and not close_exit_safety_engine
+    )
     if (phase_for_log == "exit" or window_label == "close") and close_liquidation_enabled:
         logger.info("[KR_CLOSE][LIQUIDATION][ENGINE_PATH] reason=close_liquidation_enabled skip_exit_shortcircuit=1")
+    if (phase_for_log == "exit" or window_label == "close") and close_exit_safety_engine:
+        os.environ["PB1_ENTRY_ENABLED"] = "0"
+        os.environ["PB1_EXIT_ONLY_MODE"] = "1"
+        logger.info(
+            "[KR_CLOSE][EXIT_SAFETY_ENGINE] enabled=1 entry_enabled=0 "
+            "reason=final_standard_exit_evaluation"
+        )
 
     def _run_close_reconcile_once(*, reason_label: str, kis_obj: KisAPI | None) -> tuple[bool, bool]:
         checkpoint_key = _close_reconcile_checkpoint_key(
@@ -5762,7 +5782,7 @@ def run_once(
     run_record_id = None
     engine_runner: PB1Engine | None = None
     did_work = False
-    touched_files: list[Path] = []
+    touched_files = []
     result = None
     db_write_reasons: list[str] = []
     universe_ctx: UniverseContext | None = None
@@ -6490,7 +6510,23 @@ def run_once(
             os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", os.getenv("CLOSE_LIQUIDATION_ENABLED", "0"))
         ).strip().lower() not in {"0", "false", "no"}
         if _is_close_or_exit_only_session(phase_name=phase_name_for_engine, session_kind=session_kind_for_engine):
-            if close_liquidation_enabled_for_engine:
+            close_safety_for_engine = (
+                str(os.getenv("PB1_CLOSE_EXIT_SAFETY_ENGINE", "0")).strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+            if close_safety_for_engine:
+                # Do not return through legacy close-policy shortcuts.  The
+                # normal PB1Engine below receives the authoritative balance and
+                # executes exactly the same per-position exit router as AM/PM,
+                # with entry hard-disabled.  This is the final missed-exit
+                # safety evaluation, not an unconditional liquidation.
+                os.environ["PB1_ENTRY_ENABLED"] = "0"
+                os.environ["PB1_EXIT_ONLY_MODE"] = "1"
+                logger.info(
+                    "[KR_CLOSE][EXIT_SAFETY_ENGINE][CONTINUE] entry_enabled=0 "
+                    "liquidation_all=0 action=run_standard_exit_router"
+                )
+            elif close_liquidation_enabled_for_engine:
                 holdings_for_liquidation = None
                 if isinstance(balance_snapshot_raw, dict):
                     snapshot_holdings = balance_snapshot_raw.get("output1") or []
@@ -6509,34 +6545,35 @@ def run_once(
                 )
                 logger.info("[KR_CLOSE][LIQUIDATION][DONE] orders=%s", len(liquidation_results))
                 return [], bool(liquidation_results), {"buy_orders": 0, "sell_orders": len(liquidation_results), "warning_counts": {}}, phase_for_log, "OK_CLOSE_LIQUIDATION"
-            holdings_for_policy = []
-            if isinstance(balance_snapshot_raw, dict):
-                holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
-            close_policy_result = run_kr_close_policy_from_tagged_positions(
-                kis_holdings=holdings_for_policy,
-                positions_repo=positions_repo,
-                fills_repo=fills_repo,
-                orders_repo=orders_repo,
-                kis_client=kis,
-                env=env_effective,
-                strategy="pb1_pullback_close",
-                dry_run=dry_run_for_engine,
-            )
-            policy_orders = list(close_policy_result.get("policy_orders") or [])
-            policy_results = list(close_policy_result.get("policy_results") or [])
-            accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
-            logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
-            logger.info(
-                "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
-                len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
-            )
-            return [], True, {
-                "buy_orders": 0,
-                "sell_orders": accepted_policy_sells,
-                "sell_orders_ack": accepted_policy_sells,
-                "policy_sell_candidates": len(policy_orders),
-                "warning_counts": {},
-            }, phase_for_log, "OK_CLOSE_POLICY"
+            else:
+                holdings_for_policy = []
+                if isinstance(balance_snapshot_raw, dict):
+                    holdings_for_policy = list(balance_snapshot_raw.get("output1") or balance_snapshot_raw.get("holdings") or [])
+                close_policy_result = run_kr_close_policy_from_tagged_positions(
+                    kis_holdings=holdings_for_policy,
+                    positions_repo=positions_repo,
+                    fills_repo=fills_repo,
+                    orders_repo=orders_repo,
+                    kis_client=kis,
+                    env=env_effective,
+                    strategy="pb1_pullback_close",
+                    dry_run=dry_run_for_engine,
+                )
+                policy_orders = list(close_policy_result.get("policy_orders") or [])
+                policy_results = list(close_policy_result.get("policy_results") or [])
+                accepted_policy_sells = int(close_policy_result.get("accepted_policy_sells") or 0)
+                logger.info("[KR_CLOSE][LIQUIDATION][DISABLED]")
+                logger.info(
+                    "[KR_CLOSE][POLICY][DONE] policy_sell_candidates=%s submitted=%s accepted=%s holds=%s",
+                    len(policy_orders), len(policy_results), accepted_policy_sells, max(0, len(holdings_for_policy) - len(policy_orders)),
+                )
+                return [], True, {
+                    "buy_orders": 0,
+                    "sell_orders": accepted_policy_sells,
+                    "sell_orders_ack": accepted_policy_sells,
+                    "policy_sell_candidates": len(policy_orders),
+                    "warning_counts": {},
+                }, phase_for_log, "OK_CLOSE_POLICY"
 
         logger.info(
             "[RUN_ONCE][ENGINE_ARGS] phase_name=%s window_name=%s market_window=%s phase=%s intended_live=%s",
@@ -7225,21 +7262,8 @@ def run_once(
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
-    # The PB1 tick owns reconciliation and the single authoritative balance
-    # snapshot.  Invoke the KR Infinite sleeve here (not from a scheduler or a
-    # session boundary) and isolate failures from standard PB1 processing.
-    try:
-        from trader.kr.infinite.runner import run_kr_infinite_sleeve_tick
-        inf = run_kr_infinite_sleeve_tick(
-            kis=kis, balance_snapshot=balance_snapshot_raw or {}, env=env_effective,
-            trade_date=trade_date, allow_entry=bool(order_allowed and calc_allowed),
-        )
-        metrics["kr_infinite_decision"] = inf.decision.action.value
-        logger.info("[KR_INF][TICK] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
-                    inf.decision.action.value, inf.decision.reason)
-    except Exception as exc:
-        metrics["kr_infinite_decision"] = "BLOCK"
-        logger.exception("[KR_INF][BLOCK] reason=isolated_exception error=%s", exc)
+    # KR Infinite is an independently scheduled sibling runtime.  PB1 must not
+    # call, gate, retry, or report the Infinite strategy from this process.
     result_status = result.status if result else "UNKNOWN"
     
     # ✅ DIAG 모드 실행 요약 로그
@@ -7940,7 +7964,31 @@ def _run_loop(*, args: argparse.Namespace) -> None:
         os.environ["PB1_LAST_EXIT_REASON"] = str(exit_reason)
         marker_metrics = session_metrics
         status_for_marker = str(last_result_status or "")
-        if int(session_metrics.get("api_submitted", 0) or 0) > 0 and status_for_marker.upper() == "OK_NO_TRADE":
+        fatal_exit_reasons = {
+            "FATAL_RUNTIME_REPEAT",
+            "STRUCTURAL_FATAL",
+            "PRECHECK_FATAL_STICKY",
+        }
+        if exit_reason in fatal_exit_reasons:
+            submitted_any = int(
+                session_metrics.get(
+                    "api_submitted",
+                    session_metrics.get("submitted", 0),
+                )
+                or 0
+            ) > 0 or int(buy_orders or 0) > 0 or int(sell_orders or 0) > 0
+            status_for_marker = (
+                "PARTIAL_SUCCESS_RETRYABLE" if submitted_any else "ERROR"
+            )
+            logger.error(
+                "[PB1][SESSION_STATUS][FATAL] exit_reason=%s submitted_any=%s "
+                "status=%s prior_status=%s",
+                exit_reason,
+                int(submitted_any),
+                status_for_marker,
+                last_result_status,
+            )
+        elif int(session_metrics.get("api_submitted", 0) or 0) > 0 and status_for_marker.upper() == "OK_NO_TRADE":
             status_for_marker = "OK_WITH_ORDERS"
         normalized = normalize_session_result(
             status=status_for_marker,

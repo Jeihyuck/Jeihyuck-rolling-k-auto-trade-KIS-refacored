@@ -102,6 +102,9 @@ def resolve_swing_staged_exit(
     mark: float,
     ma20: float | None,
     *,
+    ma50: float | None = None,
+    features: dict[str, Any] | None = None,
+    regime: str = "",
     ret_pct: float,
     days_held: int,
     stop_hit: bool,
@@ -164,7 +167,7 @@ def resolve_swing_staged_exit(
         )
         policy = resolve_exit_policy_for_position(
             pos=pos,
-            features={},
+            features=features or {},
             holding_ctx={
                 "days_held": trading_days_held,
                 "calendar_days_held": calendar_days_held,
@@ -176,7 +179,7 @@ def resolve_swing_staged_exit(
                 "highest_return_pct": _highest_ret,
                 "mark": mark,
             },
-            market_ctx={"ma20": ma20},
+            market_ctx={"ma20": ma20, "ma50": ma50, "regime": regime},
         )
         return apply_swing_exit_decision(
             pos, mark, policy,

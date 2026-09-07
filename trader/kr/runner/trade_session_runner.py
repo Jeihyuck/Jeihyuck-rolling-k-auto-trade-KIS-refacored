@@ -685,6 +685,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         os.environ["PB1_EXIT_ENABLED"] = "1"
         os.environ["PB1_CLOSE_ENABLED"] = "1"
         os.environ["PB1_CLOSE_LIQUIDATION_ENABLED"] = os.getenv("PB1_CLOSE_LIQUIDATION_ENABLED", "0")
+        os.environ["PB1_CLOSE_EXIT_SAFETY_ENGINE"] = os.getenv("PB1_CLOSE_EXIT_SAFETY_ENGINE", "1")
+        os.environ["PB1_EXIT_ONLY_MODE"] = "1"
         os.environ["KR_CLOSE_SESSION"] = "1"
         phase_marker = ROOT / "runtime/kr/session" / ctx.trade_date.isoformat() / "close" / "phase.json"
         phase_marker.parent.mkdir(parents=True, exist_ok=True)
@@ -876,17 +878,6 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         result["balance_state"] = "TIMEOUT"
     return result
 
-
-def _run_infinite_session_hook(*, session: str, env: str, checkpoint: str, allow_entry: bool) -> None:
-    """Fail-soft orchestration hook; all sleeve policy remains isolated."""
-    try:
-        from trader.kr.infinite.runner import run_canonical_session
-        result = run_canonical_session(session=session, env=env, allow_entry=allow_entry)
-        logger.info("[KR_SESSION][INFINITE] session=%s checkpoint=%s allow_entry=%s decision=%s reason=%s",
-                    session, checkpoint, int(allow_entry), result.decision.action.value, result.decision.reason)
-    except Exception as exc:
-        logger.exception("[KR_SESSION][INFINITE][FAIL_SOFT] session=%s checkpoint=%s err=%s",
-                         session, checkpoint, exc)
 
 
 def run_session(session: str, env: str = "practice") -> dict[str, Any]:

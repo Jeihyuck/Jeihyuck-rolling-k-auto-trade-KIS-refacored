@@ -12,6 +12,18 @@ from trader.time_utils import now_kst
 logger = logging.getLogger(__name__)
 
 
+def _authoritative_holding_qty(snapshot: dict[str, Any]) -> int:
+    if "kis_holding_qty" in snapshot and snapshot.get("kis_holding_qty") is not None:
+        try:
+            return max(0, int(float(snapshot.get("kis_holding_qty") or 0)))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return max(0, int(float(snapshot.get("holding_qty") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def submit_entry_buy_order(
     *,
     engine: Any,
@@ -67,7 +79,7 @@ def submit_entry_buy_order(
                 "cap_buffer_pct": cap_buffer_pct,
                 "entry_meta": entry_meta,
                 "entry_exit_plan": entry_exit_plan_dict,
-                "pre_order_holding_qty": int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0),
+                "pre_order_holding_qty": _authoritative_holding_qty(gate_snapshot),
                 "requested_qty": int(cf.planned_qty or 0),
                 "submitted_qty": int(cf.planned_qty or 0),
             },

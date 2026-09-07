@@ -176,33 +176,41 @@ def close_stale_positions_guarded(
         ]
 
     open_order_codes: set[str] = set()
-    with engine.connect() as conn:
-        order_rows = conn.execute(
-            sa.select(schema.orders.c.code).where(
-                sa.and_(
-                    schema.orders.c.env == env,
-                    schema.orders.c.strategy == strategy,
-                    schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+    if inspector.has_table("orders"):
+        with engine.connect() as conn:
+            order_rows = conn.execute(
+                sa.select(schema.orders.c.code).where(
+                    sa.and_(
+                        schema.orders.c.env == env,
+                        schema.orders.c.strategy == strategy,
+                        schema.orders.c.status.in_(["INTENT", "SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED"]),
+                    )
                 )
-            )
-        ).mappings().all()
-    for row in order_rows:
-        open_order_codes.add(str((row or {}).get("code") or "").zfill(6))
+            ).mappings().all()
+        for row in order_rows:
+            open_order_codes.add(str((row or {}).get("code") or "").zfill(6))
 
     if not open_rows:
         logger.info("[STALE_DB][SOFT_CLOSE][SKIP] reason=no_open_positions rows_kept=0")
         return 0
 
     closable_codes: list[str] = []
-    adjustable_rows: list[tuple[str, int, int, float]] = []
+    # code, db_before, kis_after, avg_price, reconcile_reason, pending_order
+    adjustable_rows: list[tuple[str, int, int, float, str, bool]] = []
+    sell_fill_code_set = {
+        str(code or "").zfill(6)
+        for code in (sell_fill_codes or [])
+        if str(code or "").strip()
+    }
     rows_kept = 0
     for row in open_rows:
         code = str((row or {}).get("code") or "").zfill(6)
         db_qty = int((row or {}).get("qty") or 0)
+        kis_present = code in holdings_by_code
         kis_state = holdings_by_code.get(code) or {}
-        kis_qty = int(kis_state.get("hldg_qty") or 0)
-        ord_psbl_qty = int(kis_state.get("ord_psbl_qty") or 0)
-        canonical_kis_qty = max(kis_qty, ord_psbl_qty)
+        # hldg_qty is the broker position quantity. ord_psbl_qty is only the
+        # currently sellable subset and must never replace position quantity.
+        canonical_kis_qty = int(kis_state.get("hldg_qty") or 0)
         qty_diff = canonical_kis_qty - db_qty
         if qty_diff == 0:
             rows_kept += 1
@@ -213,46 +221,88 @@ def close_stale_positions_guarded(
                 canonical_kis_qty,
             )
             continue
-        if code in open_order_codes:
-            rows_kept += 1
+
+        pending_order = code in open_order_codes
+        if kis_present:
+            # A row that is actually present in a successful KIS balance is
+            # authoritative for live position quantity, even while an order is
+            # still ACKED.  Reconcile quantity only; TP/stage metadata remains
+            # fill-driven and is deliberately untouched here.
+            adjustable_rows.append((
+                code,
+                db_qty,
+                canonical_kis_qty,
+                float(kis_state.get("avg_buy_price") or 0.0),
+                "KIS_PRESENT_AUTHORITATIVE",
+                pending_order,
+            ))
             logger.warning(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s",
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=ADJUST "
+                "reason=KIS_PRESENT_AUTHORITATIVE qty_diff=%s pending_order=%s stage_update=0",
                 code,
                 db_qty,
                 canonical_kis_qty,
                 qty_diff,
+                int(pending_order),
+            )
+            continue
+
+        # Absence from output1 means zero only when corroborated.  A confirmed
+        # SELL fill is direct evidence; otherwise retain the existing empty
+        # streak guard to protect against truncated/failed balance responses.
+        if code in sell_fill_code_set:
+            adjustable_rows.append((
+                code, db_qty, 0, 0.0, "CONFIRMED_SELL_FILL_ZERO", pending_order
+            ))
+            logger.warning(
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=0 action=ADJUST "
+                "reason=CONFIRMED_SELL_FILL_ZERO pending_order=%s",
+                code,
+                db_qty,
+                int(pending_order),
             )
             continue
         if stale_confirmed:
-            adjustable_rows.append((code, db_qty, canonical_kis_qty, float(kis_state.get("avg_buy_price") or 0.0)))
+            adjustable_rows.append((
+                code, db_qty, 0, 0.0, "EMPTY_STREAK_CONFIRMED_ZERO", pending_order
+            ))
             logger.warning(
-                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=ADJUST reason=POSITION_QTY_MISMATCH qty_diff=%s",
+                "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=0 action=ADJUST "
+                "reason=EMPTY_STREAK_CONFIRMED_ZERO qty_diff=%s",
                 code,
                 db_qty,
-                canonical_kis_qty,
-                qty_diff,
+                -db_qty,
             )
             continue
+
         rows_kept += 1
         logger.warning(
-            "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=%s action=KEEP reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s",
+            "[STALE_DB][CHECK] code=%s db_qty=%s kis_qty=0 action=KEEP "
+            "reason=POSITION_QTY_MISMATCH_PENDING qty_diff=%s pending_order=%s",
             code,
             db_qty,
-            canonical_kis_qty,
-            qty_diff,
+            -db_qty,
+            int(pending_order),
         )
         continue
 
+    adjusted_to_zero_count = sum(1 for row in adjustable_rows if int(row[2]) == 0)
     if adjustable_rows:
         with engine.begin() as conn:
-            for code, db_qty_before, kis_qty_after, avg_buy_price in adjustable_rows:
+            for code, db_qty_before, kis_qty_after, avg_buy_price, reconcile_reason, pending_order in adjustable_rows:
                 next_status = "OPEN" if kis_qty_after > 0 else "BROKER_RECONCILED_CLOSED"
+                next_total_cost = (
+                    float(avg_buy_price or 0.0) * int(kis_qty_after)
+                    if int(kis_qty_after) > 0
+                    else 0.0
+                )
                 conn.execute(
                     sa.text(
                         """
                         UPDATE positions
                         SET qty = :qty,
                             avg_buy_price = :avg_buy_price,
+                            total_cost = :total_cost,
                             status = :status,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE env = :env AND strategy = :strategy AND code = :code
@@ -261,6 +311,7 @@ def close_stale_positions_guarded(
                     {
                         "qty": int(kis_qty_after),
                         "avg_buy_price": float(avg_buy_price or 0.0) if int(kis_qty_after) > 0 else None,
+                        "total_cost": next_total_cost,
                         "status": next_status,
                         "env": env,
                         "strategy": strategy,
@@ -268,24 +319,30 @@ def close_stale_positions_guarded(
                     },
                 )
                 logger.warning(
-                    "[POSITION_RECONCILE_ADJUST] code=%s db_qty_before=%s kis_qty=%s qty_after=%s source=KIS_CANONICAL_BALANCE snapshots_confirmed=%s",
+                    "[POSITION_RECONCILE_ADJUST] code=%s db_qty_before=%s kis_qty=%s "
+                    "qty_after=%s source=KIS_CANONICAL_BALANCE reason=%s pending_order=%s "
+                    "stage_update=0",
                     code,
                     db_qty_before,
                     kis_qty_after,
                     kis_qty_after,
-                    int(stale_confirmed),
+                    reconcile_reason,
+                    int(pending_order),
                 )
 
     if not closable_codes:
         # A live KIS holding only protects its own row; never use it as a
-        # portfolio-wide reason to hide stale DB positions.
+        # portfolio-wide reason to hide stale DB positions.  Quantity
+        # reconciliations to zero are real broker-confirmed closes and retain
+        # the historical return contract of this function.
         skip_reason = "no_rowwise_soft_close_candidates" if rows_kept or adjustable_rows else "no_soft_close_candidates"
         logger.warning(
-            "[STALE_DB][SOFT_CLOSE][SKIP] reason=%s rows_kept=%s",
+            "[STALE_DB][SOFT_CLOSE][SKIP] reason=%s rows_kept=%s adjusted_to_zero=%s",
             skip_reason,
             rows_kept,
+            adjusted_to_zero_count,
         )
-        return 0
+        return int(adjusted_to_zero_count)
 
     with engine.begin() as conn:
         if has_status:

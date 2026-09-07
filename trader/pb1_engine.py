@@ -69,6 +69,10 @@ from trader.kr.pb1.market_close import resolve_market_close
 from trader.kr.pb1.exit_submit_gate import resolve_exit_submit_gate_reasons as resolve_exit_submit_gate_reasons_impl
 from trader.kr.pb1.terminal_state import resolve_terminal_state
 from trader.position_lifecycle import lifecycle_is_authoritative
+from trader.kr.position_provenance import (
+    Confidence as PositionProvenanceConfidence,
+    audit_position as audit_position_provenance,
+)
 from trader.execution_state import (BrokerBalanceSnapshot, OrderBaseline, PENDING_SELL_STATES,
                                     BalanceFreshness, balance_freshness_for_source,
                                     exit_stage_for_reason)
@@ -292,9 +296,9 @@ from trader.kr.pb1.reason_counts import (
     _normalize_entry_block_reasons,
     _summarize_blocked_reasons,
 )
-from trader.kr.pb1.ownership import enforce_kr_order_ownership
+from trader.kr.pb1.ownership import enforce_kr_order_ownership, reserved_kr_infinite_symbol
 from trader.kr.regime import (
-    KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeStabilizer,
+    KR_MARKET_ETFS, KR_MARKET_LEADERS, KR_REGIME_REQUIRED_SYMBOLS, STATE_ORDER, KRRegimeSnapshot, KRRegimeStabilizer,
     build_kr_regime_snapshot, build_market_local_overlay, calculate_global_market_state, calculate_market_budgets, candidate_allows_buy, execution_policy, market_allows_buy, market_execution_policies, normalize_kr_market, write_snapshot,
 )
 from trader.kr.forbidden_products import is_forbidden_kr_product, BLOCK_REASON as KR_FORBIDDEN_PRODUCT_BLOCK_REASON
@@ -502,6 +506,58 @@ CASH_KEYS = (
     "evlu_amt_sbst_amt",
 )
 
+
+
+_ORDER_SKIP_REASON_MAP = {
+    "SIZING_CAP_BELOW_ONE_SHARE": "ORDER_SKIP_SIZING_CAP_BELOW_ONE_SHARE",
+    "SIZING_MIN_ORDER_NOTIONAL_FAIL": "ORDER_SKIP_SIZING_MIN_ORDER_NOTIONAL_FAIL",
+    "SIZING_QTY_ZERO": "ORDER_SKIP_SIZING_QTY_ZERO",
+    "cap_below_min_order": "ORDER_SKIP_MIN_ORDER",
+    "min_order_krw": "ORDER_SKIP_MIN_ORDER",
+    "cap_below_one_share": "ORDER_SKIP_MIN_ORDER",
+    "planned_qty_zero_or_min_order": "ORDER_SKIP_MIN_ORDER",
+    "unaffordable_min1share": "ORDER_SKIP_MIN_ORDER",
+    "order_price_missing": "ORDER_SKIP_PRICE_MISSING",
+    "available_cash_zero": "ORDER_SKIP_NO_CASH",
+    "insufficient_cash": "ORDER_SKIP_NO_CASH",
+    "entry_capital_zero": "ORDER_SKIP_NO_CASH",
+    "tick_budget_zero": "ORDER_SKIP_NO_CASH",
+    "entry_cap_exceeded": "ORDER_SKIP_NO_CASH",
+    "BUYABLE_EXISTING_HOLDING": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING",
+    "BUYABLE_EXISTING_HOLDING_KIS": "ORDER_SKIP_BUYABLE_EXISTING_HOLDING_KIS",
+    "BUYABLE_OPEN_ORDER": "ORDER_SKIP_BUYABLE_OPEN_ORDER",
+    "BUYABLE_TODAY_BUY_EXISTS": "ORDER_SKIP_BUYABLE_TODAY_BUY_EXISTS",
+    "BUYABLE_TODAY_SUBMIT": "ORDER_SKIP_BUYABLE_TODAY_SUBMIT",
+    "BUYABLE_TODAY_FILL": "ORDER_SKIP_BUYABLE_TODAY_FILL",
+    "BUYABLE_TODAY_SELL_REBUY_BLOCKED": "ORDER_SKIP_BUYABLE_TODAY_SELL_REBUY_BLOCKED",
+    "BUYABLE_COOLDOWN": "ORDER_SKIP_BUYABLE_COOLDOWN",
+    "BUYABLE_DUPLICATE": "ORDER_SKIP_BUYABLE_DUPLICATE",
+    "BUYABLE_WINDOW_BLOCK": "ORDER_SKIP_BUYABLE_WINDOW_BLOCK",
+    "open_order": "ORDER_SKIP_RATE_LIMIT",
+    "today_buy_exists": "ORDER_SKIP_RATE_LIMIT",
+    "duplicate_order": "ORDER_SKIP_DUPLICATE",
+    "rate_limit": "ORDER_SKIP_RATE_LIMIT",
+    "entry_cutoff": "ORDER_SKIP_CUTOFF",
+    "entry_disabled": "ORDER_SKIP_DISABLED",
+}
+
+
+def _authoritative_holding_qty(snapshot: dict[str, Any] | None) -> int:
+    """Prefer an explicit broker quantity, including zero, over stale DB state."""
+    state = snapshot or {}
+    if "kis_holding_qty" in state and state.get("kis_holding_qty") is not None:
+        try:
+            return max(0, int(float(state.get("kis_holding_qty") or 0)))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[BUYABLE_GATE][KIS_QTY_INVALID] raw=%r action=db_fallback_unavailable_only",
+                state.get("kis_holding_qty"),
+            )
+            return 0
+    try:
+        return max(0, int(float(state.get("holding_qty") or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 def _as_first_dict(v: Any) -> Dict[str, Any]:
     """
@@ -1298,6 +1354,9 @@ def _resolve_swing_staged_exit(
     mark: float,
     ma20: float | None,
     *,
+    ma50: float | None = None,
+    features: dict[str, Any] | None = None,
+    regime: str = "",
     ret_pct: float,
     days_held: int,
     stop_hit: bool,
@@ -1309,6 +1368,9 @@ def _resolve_swing_staged_exit(
         pos,
         mark,
         ma20,
+        ma50=ma50,
+        features=features,
+        regime=regime,
         ret_pct=ret_pct,
         days_held=days_held,
         stop_hit=stop_hit,
@@ -3680,16 +3742,133 @@ class PB1Engine:
         balance_rows: Iterable[dict],
         ledger_positions: Iterable[dict] | None = None,
     ) -> list[HoldingContext]:
+        # Materialize once: provenance audit, lifecycle repair, and final holding
+        # construction must all observe the exact same authoritative snapshot.
+        balance_rows = [dict(row or {}) for row in (balance_rows or [])]
         positions_by_code = {
             str((row or {}).get("code") or "").zfill(6): dict(row or {})
             for row in (ledger_positions or [])
             if str((row or {}).get("code") or "").strip()
         }
-        for balance_row in balance_rows or []:
+        account_id = get_account_key(env=self.env, kis=self.kis)
+        balance_codes = [
+            str(row.get("pdno") or row.get("code") or "").zfill(6)
+            for row in balance_rows
+            if str(row.get("pdno") or row.get("code") or "").strip()
+        ]
+        provenance_fills: dict[str, list[dict]] = {}
+        if balance_codes and hasattr(self.fills_repo, "list_provenance_fills_by_codes"):
+            try:
+                provenance_fills = self.fills_repo.list_provenance_fills_by_codes(
+                    self.env,
+                    balance_codes,
+                    strategy=self.STRATEGY_NAME,
+                    account_id=account_id,
+                )
+            except Exception as exc:
+                # Provenance is optional evidence.  Failure means do not repair;
+                # it must never cause a live exit to inherit guessed metadata.
+                logger.warning(
+                    "[KR_POSITION_PROVENANCE][LOAD_FAIL] action=fail_closed err=%s",
+                    exc,
+                )
+                provenance_fills = {}
+
+        for balance_row in balance_rows:
             code_key = str(balance_row.get("pdno") or balance_row.get("code") or "").zfill(6)
             current = positions_by_code.get(code_key)
-            if current and lifecycle_is_authoritative(current):
+            broker_qty = int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0))
+            broker_avg = float(
+                balance_row.get("pchs_avg_pric")
+                or balance_row.get("pchs_avg_price")
+                or balance_row.get("avg_price")
+                or 0
+            )
+            current_meta = (
+                dict((current or {}).get("position_meta") or {})
+                if isinstance((current or {}).get("position_meta"), dict)
+                else {}
+            )
+            current_plan = (
+                (current or {}).get("entry_exit_plan_json")
+                if isinstance((current or {}).get("entry_exit_plan_json"), dict)
+                else {}
+            )
+            needs_provenance = bool(
+                not current
+                or not lifecycle_is_authoritative(current)
+                or str((current or {}).get("position_origin") or "").upper() in {"IMPORTED", "RECOVERY"}
+                or current_meta.get("holding_age_unknown")
+                or not (current or {}).get("entry_ts")
+                or not current_plan
+                or str((current or {}).get("exit_policy_family") or "").upper() == "POLICY_MISSING"
+            )
+
+            audit = None
+            if needs_provenance:
+                audit = audit_position_provenance(
+                    code=code_key,
+                    broker_qty=broker_qty,
+                    broker_avg=broker_avg,
+                    fills=provenance_fills.get(code_key, []),
+                )
+                logger.info(
+                    "[KR_POSITION_PROVENANCE][AUDIT] code=%s confidence=%s reason=%s "
+                    "broker_qty=%s broker_avg=%s reconstructed_qty=%s reconstructed_avg=%s",
+                    code_key,
+                    audit.confidence.value,
+                    audit.reason,
+                    audit.broker_qty,
+                    audit.broker_avg,
+                    audit.reconstructed_qty,
+                    audit.reconstructed_avg,
+                )
+
+            # A complete authoritative current lifecycle needs no replacement.
+            if current and lifecycle_is_authoritative(current) and not needs_provenance:
                 continue
+
+            # Existing imported/recovery rows may be repaired in place only from
+            # CONFIRMED last-flat replay.  A partial/ambiguous audit keeps the
+            # original UNKNOWN/POLICY_MISSING contract intact.
+            if current and lifecycle_is_authoritative(current):
+                if audit and audit.confidence is PositionProvenanceConfidence.CONFIRMED and audit.updates:
+                    repaired_meta = {
+                        **current_meta,
+                        **dict(audit.updates.get("position_meta") or {}),
+                    }
+                    repair_fields = {
+                        **{k: v for k, v in audit.updates.items() if k != "position_meta"},
+                        "position_meta": repaired_meta,
+                        "position_origin": "RECOVERY",
+                    }
+                    self.positions_repo.update_position_fields(
+                        env=self.env,
+                        strategy=self.STRATEGY_NAME,
+                        sid=int(current.get("sid") or 1),
+                        mode=int(current.get("mode") or 1),
+                        code=code_key,
+                        fields=repair_fields,
+                    )
+                    current = {**current, **repair_fields}
+                    current["position_meta"] = repaired_meta
+                    positions_by_code[code_key] = current
+                    logger.info(
+                        "[KR_POSITION_PROVENANCE][CONFIRMED] code=%s action=repair_existing "
+                        "position_cycle_id=%s original_buy_id=%s",
+                        code_key,
+                        current.get("position_cycle_id"),
+                        audit.original_buy_id,
+                    )
+                elif audit:
+                    logger.warning(
+                        "[KR_POSITION_PROVENANCE][%s] code=%s action=keep_policy_missing reason=%s",
+                        audit.confidence.value,
+                        code_key,
+                        audit.reason,
+                    )
+                continue
+
             if not hasattr(self.positions_repo, "get_or_create_imported_cycle_for_kis_holding"):
                 logger.error("[LIFECYCLE][BLOCK] code=%s reason=PERSISTENCE_API_UNAVAILABLE action=BLOCK_EXIT", code_key)
                 positions_by_code[code_key] = {"code": code_key, "position_meta": {"holding_age_unknown": True,
@@ -3697,12 +3876,51 @@ class PB1Engine:
                 continue
             persisted, created = self.positions_repo.get_or_create_imported_cycle_for_kis_holding(
                 env=self.env, strategy=self.STRATEGY_NAME,
-                account_id=get_account_key(env=self.env, kis=self.kis), sid=int((current or {}).get("sid") or 1),
+                account_id=account_id, sid=int((current or {}).get("sid") or 1),
                 mode=int((current or {}).get("mode") or 1), code=code_key,
                 market=(current or {}).get("market") or balance_row.get("prdt_type_cd") or balance_row.get("market"),
-                qty=int(float(balance_row.get("hldg_qty") or balance_row.get("qty") or 0)),
-                avg_price=float(balance_row.get("pchs_avg_pric") or balance_row.get("avg_price") or 0),
+                qty=broker_qty,
+                avg_price=broker_avg,
             )
+            if audit and audit.confidence is PositionProvenanceConfidence.CONFIRMED and audit.updates:
+                persisted_meta = (
+                    dict(persisted.get("position_meta") or {})
+                    if isinstance(persisted.get("position_meta"), dict)
+                    else {}
+                )
+                repaired_meta = {
+                    **persisted_meta,
+                    **dict(audit.updates.get("position_meta") or {}),
+                }
+                repair_fields = {
+                    **{k: v for k, v in audit.updates.items() if k != "position_meta"},
+                    "position_meta": repaired_meta,
+                    "position_origin": "RECOVERY",
+                }
+                self.positions_repo.update_position_fields(
+                    env=self.env,
+                    strategy=self.STRATEGY_NAME,
+                    sid=int(persisted.get("sid") or 1),
+                    mode=int(persisted.get("mode") or 1),
+                    code=code_key,
+                    fields=repair_fields,
+                )
+                persisted = {**persisted, **repair_fields}
+                persisted["position_meta"] = repaired_meta
+                logger.info(
+                    "[KR_POSITION_PROVENANCE][CONFIRMED] code=%s action=repair_imported "
+                    "position_cycle_id=%s original_buy_id=%s",
+                    code_key,
+                    persisted.get("position_cycle_id"),
+                    audit.original_buy_id,
+                )
+            elif audit:
+                logger.warning(
+                    "[KR_POSITION_PROVENANCE][%s] code=%s action=import_without_provenance reason=%s",
+                    audit.confidence.value,
+                    code_key,
+                    audit.reason,
+                )
             positions_by_code[code_key] = persisted
             log_tag = "IMPORT_PERSIST" if created else "IMPORT_REUSE"
             logger.info("[LIFECYCLE][%s] code=%s active_epoch_id=%s position_cycle_id=%s source=KIS_HOLDING reason=LEGACY_OR_UNPROVEN_CYCLE created=%s",
@@ -3743,9 +3961,14 @@ class PB1Engine:
             )
             pos_meta = dict(positions_by_code.get(code) or {})
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at")
-            if entry_ts_raw is None:
-                pos_meta.setdefault("position_meta", {})["holding_age_unknown"] = True
+            entry_ts_raw = latest_buy_fill.get("filled_at") or pos_meta.get("entry_ts")
+            nested_position_meta = (
+                dict(pos_meta.get("position_meta") or {})
+                if isinstance(pos_meta.get("position_meta"), dict)
+                else {}
+            )
+            nested_position_meta["holding_age_unknown"] = entry_ts_raw is None
+            pos_meta["position_meta"] = nested_position_meta
             pos_age = calc_position_age(entry_ts_raw, today_kst)
             entry_date = pos_age.entry_date_kst
             trading_days_held = pos_age.days_held if entry_ts_raw else int(pos_meta.get("trading_days_held") or pos_meta.get("holding_days") or 0)
@@ -3808,7 +4031,7 @@ class PB1Engine:
                        "position_meta": {"holding_age_unknown": True, "trail_eligible": False,
                                          "lifecycle_blocked": True}}
             latest_buy_fill = latest_buy_fills.get(code) or {}
-            entry_ts_raw = latest_buy_fill.get("filled_at")
+            entry_ts_raw = latest_buy_fill.get("filled_at") or row.get("entry_ts")
             entry_date = None
             days_held = 0
             if entry_ts_raw:
@@ -4243,13 +4466,30 @@ class PB1Engine:
             sample_list.append(code)
 
     def _log_order_skip(self, cf: CandidateFeature, reasons: list[str], stage: str) -> None:
-        reason_codes = [_ORDER_SKIP_REASON_MAP.get(reason, f"ORDER_SKIP_{reason.upper()}") for reason in reasons]
-        logger.info(
-            "[PB1][ORDER][SKIP] code=%s reason_code=%s reasons=%s",
-            self._display_code(cf.code),
-            reason_codes,
-            reasons,
-        )
+        try:
+            reason_codes = [
+                _ORDER_SKIP_REASON_MAP.get(
+                    str(reason),
+                    f"ORDER_SKIP_{str(reason).upper() if reason is not None else 'UNKNOWN'}",
+                )
+                for reason in (reasons or ["UNKNOWN"])
+            ]
+            logger.info(
+                "[PB1][ORDER][SKIP] code=%s reason_code=%s reasons=%s",
+                self._display_code(cf.code),
+                reason_codes,
+                reasons,
+            )
+        except Exception as exc:
+            # Logging/telemetry must never turn a candidate-local skip into a
+            # session-wide fatal error.
+            reason_codes = ["ORDER_SKIP_UNKNOWN"]
+            logger.warning(
+                "[PB1][ORDER][SKIP_LOG_FAIL_SOFT] code=%s err=%s reasons=%r",
+                self._display_code(cf.code),
+                exc,
+                reasons,
+            )
         try:
             self._append_ledger_event(
                 event_type="ORDER_SKIP",
@@ -4295,7 +4535,7 @@ class PB1Engine:
             "order_allowed": bool(self.order_allowed),
             "qty": int(qty or 0),
             "holding_qty": int(snapshot.get("holding_qty") or 0),
-            "kis_holding_qty": int(snapshot.get("kis_holding_qty") or snapshot.get("holding_qty") or 0),
+            "kis_holding_qty": _authoritative_holding_qty(snapshot),
             "today_buy_exists": bool(snapshot.get("today_buy_exists")),
             "today_submit_exists": bool(snapshot.get("today_submit_exists")),
             "today_fill_exists": bool(snapshot.get("today_fill_exists")),
@@ -9283,7 +9523,7 @@ class PB1Engine:
         })
         # ─────────────────────────────────────────────────────────────────────
         broker_position = self._authoritative_balance.position(cf.code) if self._authoritative_balance else None
-        pre_order_holding_qty = broker_position.qty if broker_position else int(gate_snapshot.get("kis_holding_qty") or gate_snapshot.get("holding_qty") or 0)
+        pre_order_holding_qty = broker_position.qty if broker_position else _authoritative_holding_qty(gate_snapshot)
         if broker_position and broker_position.qty > 0:
             logger.warning("[PB1][BUY][BLOCK] code=%s reason=BUYABLE_EXISTING_BROKER_HOLDING snapshot_id=%s qty=%s",
                            display_code, self._authoritative_balance.snapshot_id, broker_position.qty)
@@ -9960,6 +10200,7 @@ class PB1Engine:
             return {"submitted": 0, "accepted": 0, "skipped_reason": ownership_reason or "ownership_reserved",
                     "terminal_event": "FINAL_SKIP"}
         status: dict[str, Any] = self._empty_order_status()
+        stock_name = str(self._name_for_code(cf.code) or cf.features.get("name") or cf.code)
         # NO_TRADE 모드: 주문 전송 스킵, 로그만 출력
         no_trade = os.getenv("NO_TRADE", "0") == "1"
         
@@ -10234,10 +10475,16 @@ class PB1Engine:
             or (pos.get("entry_meta_json") or {}).get("owner_strategy")
             or ""
         ).upper()
-        if code == "122630":
+        ownership_ok, ownership_reason = enforce_kr_order_ownership(
+            code,
+            "KR_STANDARD",
+        )
+        if _owner_strategy == "KR_INFINITE" or not ownership_ok:
             logger.info(
-                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s reason=KR_INF_OWNERSHIP_RESERVED action=KR_INFINITE_EXIT_ONLY",
+                "[EXIT][PB1_STANDARD_EXIT][SKIP] code=%s owner=%s reason=%s action=KR_INFINITE_EXIT_ONLY",
                 display_code,
+                _owner_strategy or "KR_STANDARD",
+                ownership_reason or "KR_INF_OWNER_METADATA",
             )
             return None
 
@@ -10402,7 +10649,11 @@ class PB1Engine:
             )
 
         stop_hit = bool(stop_price is not None and mark <= float(stop_price))
-        time_stop_hit = bool(trading_days_held >= int(PB1_TIME_STOP_DAYS) and ret_pct < 2.0)
+        time_stop_hit = bool(
+            entry_ts is not None
+            and trading_days_held >= int(PB1_TIME_STOP_DAYS)
+            and ret_pct < 2.0
+        )
         logger.info(
             "[EXIT][TIME_STOP][BASIS] code=%s basis=trading_days calendar_days=%s trading_days=%s max_hold=%s hit=%s",
             display_code,
@@ -10425,6 +10676,10 @@ class PB1Engine:
             time_stop_hit=time_stop_hit,
             risk_off_signal=risk_off_signal,
         )
+        if entry_ts is None:
+            # Zero/unknown age is not proof of a same-day entry.
+            exit_policy["same_day_entry"] = False
+            exit_policy["holding_age_unknown"] = True
         trail_hit = bool(exit_policy["trail_hit"])
         ma20_break = bool(exit_policy["ma20_break"])
         ma50_break = bool(exit_policy["ma50_break"])
@@ -10646,6 +10901,9 @@ class PB1Engine:
         _router_full_exit = False
         _router_sell_pct = None
         _router_reason = final_reason
+        # Stage-changing router metadata is only committed after a confirmed
+        # broker fill.  It is carried on the durable SELL intent until then.
+        _pending_position_meta_update: dict[str, Any] = {}
         if exit_policy_family in {
             "INTRADAY_PROFIT_PROTECT",
             "SWING_STAGED_EXIT",
@@ -10669,6 +10927,9 @@ class PB1Engine:
                     _active_family = "SWING_STAGED_EXIT"
                     horizon_result = _resolve_swing_staged_exit(
                         pos, float(mark or 0.0), ma20,
+                        ma50=ma50,
+                        features=features,
+                        regime=regime_str,
                         ret_pct=ret_pct,
                         days_held=trading_days_held,
                         stop_hit=stop_hit,
@@ -10686,6 +10947,9 @@ class PB1Engine:
             elif _active_family == "SWING_STAGED_EXIT":
                 horizon_result = _resolve_swing_staged_exit(
                     pos, float(mark or 0.0), ma20,
+                    ma50=ma50,
+                    features=features,
+                    regime=regime_str,
                     ret_pct=ret_pct,
                     days_held=trading_days_held,
                     stop_hit=stop_hit,
@@ -10718,9 +10982,12 @@ class PB1Engine:
                     _router_sell_pct,
                     qty,
                 )
-                # position_meta 업데이트 (tp1_done 등)
-                _meta_update = horizon_result.get("update_meta") or {}
-                _meta_update["max_pnl_pct_since_entry"] = _max_pnl
+                # Observational state may be persisted immediately, but
+                # tp1_done/tp2_done/runner/stop changes must wait for a proven
+                # fill.  Otherwise an ACK/reject can falsely consume the stage.
+                _meta_update = dict(horizon_result.get("update_meta") or {})
+                if horizon_result.get("exit_ok", False):
+                    _pending_position_meta_update = dict(_meta_update)
                 self.positions_repo.update_position_fields(
                     env=self.env,
                     strategy=self.STRATEGY_NAME,
@@ -10729,7 +10996,7 @@ class PB1Engine:
                     code=code,
                     fields={"position_meta": {
                         **(pos.get("position_meta") or {}),
-                        **_meta_update,
+                        "max_pnl_pct_since_entry": _max_pnl,
                     }},
                 )
                 # 기존 exit_policy/final_reason 오버라이드
@@ -11316,6 +11583,7 @@ class PB1Engine:
             "position_exit_policy_family": pos.get("exit_policy_family") or exit_policy_family,
             "position_eod_action": pos.get("eod_action") or exit_eval_payload.get("eod_action"),
             "policy_version": pos.get("policy_version") or (exit_eval_payload.get("entry_exit_plan") or {}).get("policy_version"),
+            "pending_position_meta_update": dict(_pending_position_meta_update),
         }
         sell_baseline = (OrderBaseline.capture(self._authoritative_balance, code, orderable_qty)
                          if self._authoritative_balance else None)
@@ -11340,6 +11608,7 @@ class PB1Engine:
                               "trade_session": str(os.getenv("PB1_SESSION_KIND") or self.window_internal or "day").lower(),
                               "exit_stage": stage,
                               "strategy_owner": "KR_STANDARD", "ret_pct": ret_pct,
+                              "pending_position_meta_update": dict(_pending_position_meta_update),
                               "exit_meta": exit_meta, "entry_exit_plan": exit_meta.get("entry_exit_plan") or {},
                               **(sell_baseline.__dict__ if sell_baseline else {
                                   "balance_snapshot_id": None,
@@ -11511,8 +11780,15 @@ class PB1Engine:
         holdings_source = str((self._exit_holdings_meta or {}).get("source") or "unknown")
         logger.info("[EXIT][LOAD] holdings_raw=%s codes=%s source=%s", len(holdings_raw), [holding.code for holding in holdings_raw], holdings_source)
         all_broker_holdings = [holding for holding in holdings_raw if int(holding.holding_qty or 0) > 0]
-        kr_infinite_holdings = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) == "122630"]
-        holdings_exit_scope = [holding for holding in all_broker_holdings if str(holding.code).zfill(6) != "122630"]
+        reserved_infinite_symbol = reserved_kr_infinite_symbol()
+        kr_infinite_holdings = [
+            holding for holding in all_broker_holdings
+            if str(holding.code).zfill(6) == reserved_infinite_symbol
+        ]
+        holdings_exit_scope = [
+            holding for holding in all_broker_holdings
+            if str(holding.code).zfill(6) != reserved_infinite_symbol
+        ]
         logger.info("[EXIT][SCOPE] broker_total=%s kr_inf_reserved=%s pb1_scope=%s codes=%s",
                     len(all_broker_holdings), len(kr_infinite_holdings), len(holdings_exit_scope),
                     [holding.code for holding in holdings_exit_scope])
@@ -11537,11 +11813,10 @@ class PB1Engine:
                 int(pos.get("qty") or 0),
                 int(pos.get("holding_days") or 0),
             )
-            if int(pos.get("holding_days") or 0) <= 0:
-                df = pd.DataFrame()
-                meta = {"source": "same_day_holdings_skip"}
-            else:
-                df, meta = self._fetch_exit_ohlcv(pos["code"])
+            # Exit technical context is required regardless of holding age.
+            # Unknown age must not be treated as same-day and must not suppress
+            # MA/volume/momentum features.
+            df, meta = self._fetch_exit_ohlcv(pos["code"])
             features: dict[str, Any] = {}
             if not df.empty:
                 try:
@@ -11737,9 +12012,19 @@ class PB1Engine:
         else:
             members = self.universe_repo.get_current_universe_members(self.env, self.UNIVERSE_STRATEGY)
             self._universe_as_of = members[0].get("as_of_date") if members else None
-        if any(str(m.get("code") or "").zfill(6) == "122630" for m in members):
-            logger.warning("[PB1][OWNERSHIP][EXCLUDE] symbol=122630 reason=KR_INF_OWNERSHIP_RESERVED")
-        members = [m for m in members if str(m.get("code") or "").zfill(6) != "122630"]
+        reserved_infinite_symbol = reserved_kr_infinite_symbol()
+        if reserved_infinite_symbol and any(
+            str(m.get("code") or "").zfill(6) == reserved_infinite_symbol
+            for m in members
+        ):
+            logger.warning(
+                "[PB1][OWNERSHIP][EXCLUDE] symbol=%s reason=KR_INF_OWNERSHIP_RESERVED",
+                reserved_infinite_symbol,
+            )
+        members = [
+            m for m in members
+            if str(m.get("code") or "").zfill(6) != reserved_infinite_symbol
+        ]
         self._code_name_map = {
             str(m.get("code") or "").zfill(6): (m.get("name") or (m.get("meta_json") or {}).get("name"))
             for m in members or []
@@ -16863,8 +17148,8 @@ class PB1Engine:
                 len(self._debug_sizing_ok_codes),
                 len(orderable_candidates),
                 submit_success_count,
-                int(accepted_count) if 'accepted_count' in locals() else 0,
-                int(filled_count) if 'filled_count' in locals() else 0,
+                int(locals().get("accepted_count", 0) or 0),
+                int(locals().get("filled_count", 0) or 0),
             )
             orderable_code_set = {candidate.code for candidate in orderable_candidates}
             buyable_ok_set = set(buyable_ok_codes)

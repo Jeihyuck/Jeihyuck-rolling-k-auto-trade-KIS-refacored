@@ -60,11 +60,17 @@ def exit_stage_for_reason(reason: str | None, *, requested_sell_qty: int | None 
     partial = ((sell_pct is not None and 0 < float(sell_pct) < 1)
                or (requested_sell_qty is not None and broker_qty_before is not None
                    and 0 < int(requested_sell_qty) < int(broker_qty_before)))
-    if value in {"TP1", "TAKE_PROFIT_1", "ABS_TP1", "ABS_TP1_10PCT",
-                 "SWING_TP1_R", "SWING_TP1_PCT", "CORE_TP1_R"}:
+    if value in {
+        "TP1", "TAKE_PROFIT_1", "ABS_TP1", "ABS_TP1_10PCT",
+        "SWING_TP1_R", "SWING_TP1_PCT", "SWING_PCT_TP1",
+        "EXIT_SWING_TP1", "CORE_TP1_R", "EXIT_CORE_TP1",
+    }:
         return "TP1"
-    if value in {"TP2", "TAKE_PROFIT_2", "ABS_TP2", "SWING_TP2_R",
-                 "SWING_TP2_PCT", "CORE_TP2_R"}:
+    if value in {
+        "TP2", "TAKE_PROFIT_2", "ABS_TP2", "SWING_TP2_R",
+        "SWING_TP2_PCT", "SWING_PCT_TP2", "EXIT_SWING_TP2",
+        "CORE_TP2_R", "EXIT_CORE_TP2",
+    }:
         return "TP2"
     if value in {"PROFIT_PROTECT_8PCT", "SWING_PROFIT_PROTECT_GIVEBACK",
                  "MOMENTUM_PROFIT_PROTECT_GIVEBACK"} or value.startswith("PROFIT_PROTECT_PARTIAL_1"):
@@ -188,11 +194,16 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
         for order_id in filled_order_ids
         if order_status_by_id.get(order_id) in {"CREATED", "INTENT"}
     )
+    qty_confirmed_unpriced = sum(
+        s == "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED" for s in states
+    )
     result: dict[str, Any] = {
         "order_intents_created": len(rows),
         "broker_submitted": sum(s in submitted_states for s in states),
         "broker_acked": sum(s in ack_states for s in states),
         "fills_confirmed": len(fill_rows),
+        "quantity_confirmed_fills": len(fill_rows) + qty_confirmed_unpriced,
+        "price_unresolved_quantity_confirmed": qty_confirmed_unpriced,
         "partial_fills": sum(s == "PARTIAL_FILLED" for s in states),
         "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in states),
         "cancelled": sum(s == "CANCELLED" for s in states),
@@ -210,11 +221,16 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
             str(row.get("order_id")) for row in side_rows
             if row.get("order_id") and str(row.get("status") or "").upper() in {"ACKED", "ACCEPTED"}
         } - side_filled_order_ids
+        side_qty_confirmed_unpriced = sum(
+            s == "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED" for s in side_states
+        )
         result["by_side"][side] = {
             "order_intents_created": len(side_rows),
             "broker_submitted": sum(s in submitted_states for s in side_states),
             "broker_acked": sum(s in ack_states for s in side_states),
             "fills_confirmed": len(side_fills),
+            "quantity_confirmed_fills": len(side_fills) + side_qty_confirmed_unpriced,
+            "price_unresolved_quantity_confirmed": side_qty_confirmed_unpriced,
             "partial_fills": sum(s == "PARTIAL_FILLED" for s in side_states),
             "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in side_states),
             "cancelled": sum(s == "CANCELLED" for s in side_states),

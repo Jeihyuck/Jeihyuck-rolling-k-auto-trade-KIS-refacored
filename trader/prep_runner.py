@@ -453,10 +453,33 @@ def _make_flow_provider(engine):
             try:
                 resp = kis_api.inquire_investor(code, "KOSDAQ")
             except Exception as exc:
-                reason = "breaker_open" if "breaker open" in str(exc).lower() else "unexpected_exception"
+                detail = str(exc).replace("\n", " ")[:200]
+                detail_lower = detail.lower()
+                if "breaker open" in detail_lower or "circuit_open" in detail_lower:
+                    reason = "breaker_open"
+                elif any(token in detail for token in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
+                    reason = "http_5xx"
+                elif "timeout" in detail_lower or "readtimeout" in detail_lower:
+                    reason = "timeout"
+                else:
+                    reason = "unexpected_exception"
+                if reason in {"http_5xx", "timeout"} and attempts < 3:
+                    logger.warning(
+                        "[FLOW][KIS][RETRY] code=%s reason=%s attempt=%s/3",
+                        code,
+                        reason,
+                        attempts,
+                    )
+                    time.sleep(min(0.2 * (2 ** (attempts - 1)), 0.5))
+                    continue
                 state["fail_count"] += 1
                 _record_provider_failure("kis", reason)
-                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": str(exc)[:200]}
+                return _empty_df(), _empty_df(), {
+                    "ok": False,
+                    "provider": "kis",
+                    "reason": reason,
+                    "detail": detail,
+                }
 
             if resp.get("ok"):
                 inv = resp.get("inv") or {}

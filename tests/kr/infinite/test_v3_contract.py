@@ -40,12 +40,14 @@ def test_sell_fill_alone_promotes_confirmed_profit_stage():
     assert filled.metadata["pending_profit_stage"] is None
 
 
-def test_pb1_tick_owns_sleeve_and_standard_engine_reserves_symbol():
+def test_pb1_does_not_own_sleeve_and_standard_engine_reserves_symbol():
     runner = Path("trader/pb1_runner.py").read_text()
     engine = Path("trader/pb1_engine.py").read_text()
-    assert "run_kr_infinite_sleeve_tick(" in runner
-    assert "balance_snapshot=balance_snapshot_raw" in runner
-    assert 'if code == "122630":' in engine
+    independent = Path("trader/kr/infinite/session_runner.py").read_text()
+    assert "run_kr_infinite_sleeve_tick(" not in runner
+    assert "run_canonical_session" in independent
+    assert 'if code == "122630":' not in engine
+    assert "enforce_kr_order_ownership" in engine
     assert "KR_INF_OWNERSHIP_RESERVED" in engine
 
 

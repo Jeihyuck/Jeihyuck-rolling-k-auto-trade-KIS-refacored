@@ -52,7 +52,13 @@ def filter_kr_entry_intent(intent: dict, overlay: dict, *, positions: list[dict]
     side=str(intent.get("side") or intent.get("action") or "").upper()
     out=dict(intent)
     if side != "BUY": return out
-    owner = str(out.get("owner_strategy") or out.get("strategy_owner") or out.get("sleeve_id") or ("KR_INFINITE" if str(out.get("code") or out.get("symbol") or "") == "122630" else "KR_STANDARD")).upper()
+    # Ownership is explicit metadata, never inferred from a ticker.
+    owner = str(
+        out.get("owner_strategy")
+        or out.get("strategy_owner")
+        or out.get("sleeve_id")
+        or "KR_STANDARD"
+    ).upper()
     if owner == "KR_INFINITE":
         out.setdefault("meta", {}).update({"owner_strategy": "KR_INFINITE", "overlay_bypass": True, "overlay_ignored_reason": "infinite_strategy_buy_dip"})
         logger.info("[KR_INF][OVERLAY_BYPASS] symbol=%s overlay=%s action=BUY_ALLOWED reason=infinite_strategy_buy_dip", out.get("code") or out.get("symbol"), overlay.get("market_state"))

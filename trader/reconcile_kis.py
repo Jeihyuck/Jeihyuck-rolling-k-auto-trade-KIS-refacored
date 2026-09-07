@@ -129,6 +129,88 @@ def _broker_execution_price(response_json: dict) -> float | None:
     return None
 
 
+def _pending_position_meta_update(request_json: dict[str, Any] | None) -> dict[str, Any]:
+    request = request_json if isinstance(request_json, dict) else {}
+    pending = request.get("pending_position_meta_update")
+    if not isinstance(pending, dict):
+        exit_meta = request.get("exit_meta")
+        pending = (
+            exit_meta.get("pending_position_meta_update")
+            if isinstance(exit_meta, dict)
+            else {}
+        )
+    return dict(pending) if isinstance(pending, dict) else {}
+
+
+def _commit_confirmed_sell_stage(
+    *,
+    env: str,
+    strategy: str,
+    code: str,
+    sid: int,
+    mode: int,
+    confirmed_qty: int,
+    request_json: dict[str, Any] | None,
+    positions_repo: PositionsRepo,
+    source: str,
+) -> bool:
+    """Commit TP/runner metadata only after broker-confirmed SELL quantity.
+
+    Quantity differences alone never invent a stage: the exact durable SELL
+    intent must already carry the pending router metadata.
+    """
+    if int(confirmed_qty or 0) <= 0:
+        return False
+    pending = _pending_position_meta_update(request_json)
+    if not pending:
+        logger.info(
+            "[RECONCILE][SELL_STAGE][SKIP] code=%s source=%s "
+            "reason=no_pending_stage_metadata confirmed_qty=%s",
+            code, source, confirmed_qty,
+        )
+        return False
+    current = positions_repo.get_position(
+        env=env,
+        strategy=strategy,
+        sid=int(sid or 1),
+        mode=int(mode or 1),
+        code=str(code).zfill(6),
+    )
+    if not current:
+        logger.warning(
+            "[RECONCILE][SELL_STAGE][SKIP] code=%s source=%s "
+            "reason=no_open_position confirmed_qty=%s pending=%s",
+            code, source, confirmed_qty, sorted(pending),
+        )
+        return False
+    current_meta = (
+        dict(current.get("position_meta") or {})
+        if isinstance(current.get("position_meta"), dict)
+        else {}
+    )
+    positions_repo.update_position_fields(
+        env=env,
+        strategy=strategy,
+        sid=int(current.get("sid") or sid or 1),
+        mode=int(current.get("mode") or mode or 1),
+        code=str(code).zfill(6),
+        fields={
+            "position_meta": {
+                **current_meta,
+                **pending,
+                "last_stage_fill_source": source,
+                "last_stage_confirmed_qty": int(confirmed_qty),
+            }
+        },
+    )
+    logger.warning(
+        "[RECONCILE][SELL_STAGE][CONFIRMED] code=%s source=%s confirmed_qty=%s "
+        "fields=%s",
+        code, source, confirmed_qty, sorted(pending),
+    )
+    return True
+
+
 def _promote_open_buy_orders_from_holdings(
     *,
     env: str,
@@ -138,6 +220,7 @@ def _promote_open_buy_orders_from_holdings(
     holdings_rows: list[dict],
     orders_repo: OrdersRepo,
     fills_repo: FillsRepo,
+    positions_repo: PositionsRepo | None = None,
 ) -> dict[str, int]:
     qty_by_code, avg_price_by_code = _holdings_index(holdings_rows)
     promoted_orders = 0
@@ -271,6 +354,21 @@ def _promote_open_buy_orders_from_holdings(
             acked_at=order_time,
         )
         promoted_orders += 1
+
+        if positions_repo is not None and side == "SELL" and confirmed_fill_qty > 0 and next_status in {
+            "PARTIAL_FILLED", "FILLED", "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED"
+        }:
+            _commit_confirmed_sell_stage(
+                env=env,
+                strategy=strategy,
+                code=code,
+                sid=int(order.get("sid") or 1),
+                mode=int(order.get("mode") or 1),
+                confirmed_qty=confirmed_fill_qty,
+                request_json=request_json,
+                positions_repo=positions_repo,
+                source="kis_holdings_delta",
+            )
 
         if confirmed_fill_qty > 0 and next_status in {"PARTIAL_FILLED", "FILLED"} and fill_price is not None:
             fills_repo.upsert_fill(
@@ -528,6 +626,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         rows = [rows]
     orders_repo = OrdersRepo(engine)
     fills_repo = FillsRepo(engine)
+    positions_repo = PositionsRepo(engine)
     ledger_repo = LedgerEventsRepo(engine)
     reconcile_repo = ReconcileLogRepo(engine)
 
@@ -545,9 +644,40 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
         status = str(_first_value(row, ["ord_stat_cd", "ord_stat", "status"]) or "RECONCILED").strip().upper()
         market = MARKET_MAP.get(code) or str(_first_value(row, ["excg_dvsn_cd", "market"]) or "").strip() or None
         order_time = _parse_date_time(row)
-        client_order_key = f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
+        existing_order = (
+            orders_repo.get_by_broker_order_id(env, kis_odno)
+            if kis_odno
+            else None
+        )
+        if existing_order and (
+            _normalize_code(existing_order.get("code")) != code
+            or str(existing_order.get("side") or "").upper() != side
+        ):
+            logger.error(
+                "[RECONCILE][DAILY_CCLD][ORDER_IDENTITY_MISMATCH] odno=%s "
+                "existing_code=%s row_code=%s existing_side=%s row_side=%s "
+                "action=ignore_existing_provenance",
+                kis_odno,
+                existing_order.get("code"),
+                code,
+                existing_order.get("side"),
+                side,
+            )
+            existing_order = None
+        original_request = (
+            dict(existing_order.get("request_json") or {})
+            if existing_order and isinstance(existing_order.get("request_json"), dict)
+            else {}
+        )
+        client_order_key = str(
+            (existing_order or {}).get("client_order_key")
+            or f"{env}:{strategy}:{today}:{code}:{side}:{kis_odno or 'reconcile'}"
+        )
         plan_record = None
-        request_json = dict(row or {}) if isinstance(row, dict) else {"kis_row": row}
+        request_json = {
+            **original_request,
+            "reconcile_kis_row": dict(row or {}) if isinstance(row, dict) else {"kis_row": row},
+        }
         if side == "BUY":
             try:
                 plan_record = orders_repo.find_latest_buy_entry_exit_plan(env, strategy, code)
@@ -565,26 +695,34 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     code,
                 )
 
-        orders_repo.upsert_reconciled_order(
+        reconciled_order_id = orders_repo.upsert_reconciled_order(
             env=env,
             run_id=ctx.run_id,
-            strategy=strategy,
-            sid=1,
-            mode=1,
+            strategy=str((existing_order or {}).get("strategy") or strategy),
+            sid=int((existing_order or {}).get("sid") or 1),
+            mode=int((existing_order or {}).get("mode") or 1),
             code=code,
-            market=market,
+            market=(existing_order or {}).get("market") or market,
             side=side,
-            ord_type=str(_first_value(row, ["ord_dvsn_cd", "ord_type"]) or "RECONCILED"),
-            qty=qty,
-            limit_price=price,
-            stage="RECONCILE",
+            ord_type=str(
+                (existing_order or {}).get("ord_type")
+                or _first_value(row, ["ord_dvsn_cd", "ord_type"])
+                or "RECONCILED"
+            ),
+            qty=int((existing_order or {}).get("qty") or qty),
+            limit_price=(
+                _to_float((existing_order or {}).get("limit_price"))
+                if existing_order
+                else price
+            ),
+            stage=str((existing_order or {}).get("stage") or "RECONCILE"),
             client_order_key=client_order_key,
             kis_odno=kis_odno,
             status=status,
             request_json=request_json,
             response_json=row,
-            submitted_at=order_time,
-            acked_at=order_time,
+            submitted_at=(existing_order or {}).get("submitted_at") or order_time,
+            acked_at=(existing_order or {}).get("acked_at") or order_time,
         )
         order_count += 1
 
@@ -594,7 +732,7 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
             fills_repo.upsert_fill(
                 env=env,
                 run_id=ctx.run_id,
-                order_id=None,
+                order_id=str(reconciled_order_id or "") or None,
                 kis_odno=kis_odno,
                 trade_id=str(_first_value(row, ["ccld_no", "trade_id", "exec_id"]) or "") or None,
                 code=code,
@@ -617,6 +755,18 @@ def reconcile_today(*, engine, kis: KisAPI, ctx: RunContext) -> dict[str, object
                     "entry_ts": order_time.isoformat() if hasattr(order_time, "isoformat") else str(order_time),
                 },
             )
+            if side == "SELL":
+                _commit_confirmed_sell_stage(
+                    env=env,
+                    strategy=str((existing_order or {}).get("strategy") or strategy),
+                    code=code,
+                    sid=int((existing_order or {}).get("sid") or 1),
+                    mode=int((existing_order or {}).get("mode") or 1),
+                    confirmed_qty=filled_qty,
+                    request_json=request_json,
+                    positions_repo=positions_repo,
+                    source="daily_ccld",
+                )
             fill_count += 1
             filled_codes.append(code)
 
@@ -707,6 +857,7 @@ def reconcile_kis(
         holdings_rows=holdings_rows,
         orders_repo=orders_repo,
         fills_repo=fills_repo,
+        positions_repo=positions_repo,
     )
     orders_count += int(promoted.get("orders") or 0)
     fills_count += int(promoted.get("fills") or 0)

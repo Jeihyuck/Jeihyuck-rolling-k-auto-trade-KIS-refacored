@@ -67,6 +67,134 @@ def _parse_meta(pos: dict[str, Any]) -> dict[str, Any]:
     return meta
 
 
+def _as_float_or_none(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _policy_missing_current_hold_reevaluation(
+    *,
+    pos: dict[str, Any],
+    features: dict[str, Any],
+    holding_ctx: dict[str, Any],
+    market_ctx: dict[str, Any],
+    enabled: bool,
+    entry_style: str,
+    trade_horizon: str,
+) -> dict[str, Any]:
+    """Evaluate an unresolved legacy holding without inventing its entry reason.
+
+    The original provenance remains UNKNOWN/POLICY_MISSING.  When current
+    technical context is available, reuse the existing SWING staged-exit
+    thresholds only as a *current-hold* risk policy.  Age-based time stops stay
+    disabled because the true entry timestamp is unproven.
+    """
+    code_for_log = str(pos.get("code") or pos.get("pdno") or "UNKNOWN")
+    mark = _as_float_or_none(
+        holding_ctx.get("mark") or holding_ctx.get("current_price")
+        or pos.get("last_price") or pos.get("current_price")
+    )
+    ma20 = _as_float_or_none(market_ctx.get("ma20"))
+    ma50 = _as_float_or_none(market_ctx.get("ma50"))
+    regime = str(market_ctx.get("regime") or "").upper()
+    ret_pct = float(holding_ctx.get("current_return_pct") or 0.0)
+
+    diag = {
+        "momentum_score": _as_float_or_none(features.get("momentum_score")),
+        "rs_percentile": _as_float_or_none(features.get("rs_percentile")),
+        "vcp_score": _as_float_or_none(features.get("vcp_score")),
+        "volume_ratio": _as_float_or_none(
+            features.get("volume_ratio") or features.get("vol_ratio")
+        ),
+    }
+
+    if mark is None or mark <= 0 or ma20 is None:
+        logger.warning(
+            "[EXIT][ROUTER][POLICY_MISSING] code=%s action=hard_stop_only "
+            "reason=current_context_incomplete mark=%s ma20=%s ma50=%s diag=%s",
+            code_for_log, mark, ma20, ma50, diag,
+        )
+        return {
+            "exit_family": "POLICY_MISSING",
+            "policy_missing": True,
+            "policy_source": "LEGACY_CURRENT_REEVALUATION_DEGRADED",
+            "original_entry_reason_unknown": True,
+            "current_hold_class": "CURRENT_UNKNOWN",
+            "current_hold_reason": "MA20_OR_MARK_MISSING",
+            "entry_style": entry_style,
+            "trade_horizon": trade_horizon,
+            "hard_stop_enabled": True,
+            "r_take_profit_enabled": False,
+            "percent_take_profit_enabled": False,
+            "profit_protect_enabled": False,
+            "trend_follow_enabled": False,
+            "time_stop_enabled": False,
+            "max_hold_days": 0,
+            "partial_sell_rules": [],
+            "full_exit_rules": [],
+            "trend_ok": False,
+            "trend_strong": False,
+            "trend_data_complete": False,
+            "router_enabled": enabled,
+        }
+
+    regime_ok = regime not in {"BEAR", "RISK_OFF", "DOWNTREND"}
+    trend_ok = bool(mark >= ma20 and regime_ok)
+    trend_data_complete = ma50 is not None
+    trend_strong = bool(trend_ok and trend_data_complete and mark >= float(ma50))
+
+    if trend_strong:
+        current_class = "CURRENT_SWING_STRONG"
+        current_reason = "ABOVE_MA20_MA50"
+    elif trend_ok:
+        current_class = "CURRENT_SWING_OK"
+        current_reason = "ABOVE_MA20"
+    elif ret_pct > 0:
+        current_class = "CURRENT_PROFIT_PROTECT"
+        current_reason = "PROFIT_WITH_TREND_WEAKENING"
+    else:
+        current_class = "CURRENT_TREND_BROKEN"
+        current_reason = "BELOW_MA20_OR_RISK_OFF"
+
+    policy = _policy_swing(
+        entry_style="ENTRY_UNKNOWN",
+        trend_ok=trend_ok,
+        trend_strong=trend_strong,
+        days_held=0,
+    )
+    # Entry age is unknown: never synthesize a time stop from zero/DB age.
+    policy["time_stop_enabled"] = False
+    policy["max_hold_days"] = 0
+    policy.update({
+        "exit_family": "SWING_STAGED_EXIT",
+        "policy_missing": True,
+        "policy_source": "LEGACY_CURRENT_REEVALUATION",
+        "original_entry_reason_unknown": True,
+        "current_hold_class": current_class,
+        "current_hold_reason": current_reason,
+        "current_hold_diagnostics": diag,
+        "entry_style": entry_style,
+        "trade_horizon": trade_horizon,
+        "trend_ok": trend_ok,
+        "trend_strong": trend_strong,
+        "trend_data_complete": trend_data_complete,
+        "router_enabled": enabled,
+        "time_stop_basis": "unknown_entry_age_disabled",
+    })
+    logger.warning(
+        "[EXIT][ROUTER][POLICY_MISSING] code=%s action=current_hold_reevaluation "
+        "class=%s reason=%s ret_pct=%.2f ma20=%s ma50=%s regime=%s "
+        "trend_ok=%s trend_strong=%s diag=%s",
+        code_for_log, current_class, current_reason, ret_pct, ma20, ma50, regime,
+        int(trend_ok), int(trend_strong), diag,
+    )
+    return policy
+
+
 # ─────────────────────────────────────────────────────────────────────
 # 공개 API 1: Policy 결정
 # ─────────────────────────────────────────────────────────────────────
@@ -126,23 +254,19 @@ def resolve_exit_policy_for_position(
         or ""
     ).strip()
 
-    # POLICY_MISSING is an explicit reconciler sentinel, not an unknown family
-    # eligible for the legacy SWING default below.
+    # POLICY_MISSING remains the original provenance sentinel.  Do not invent
+    # an entry reason; evaluate the *current holding* separately when enough
+    # technical context exists.
     if normalized_exit_family == "POLICY_MISSING":
-        code_for_log = str(pos.get("code") or pos.get("pdno") or "UNKNOWN")
-        logger.warning(
-            "[EXIT][ROUTER][POLICY_MISSING] code=%s action=hard_stop_only_no_swing_fallback",
-            code_for_log,
+        return _policy_missing_current_hold_reevaluation(
+            pos=pos,
+            features=features,
+            holding_ctx=holding_ctx,
+            market_ctx=market_ctx,
+            enabled=enabled,
+            entry_style=entry_style,
+            trade_horizon=trade_horizon,
         )
-        return {
-            "exit_family": "POLICY_MISSING", "policy_missing": True,
-            "entry_style": entry_style, "trade_horizon": trade_horizon,
-            "hard_stop_enabled": True, "r_take_profit_enabled": False,
-            "percent_take_profit_enabled": False, "profit_protect_enabled": False,
-            "trend_follow_enabled": False, "time_stop_enabled": False,
-            "max_hold_days": 0, "partial_sell_rules": [], "full_exit_rules": [],
-            "router_enabled": enabled,
-        }
 
     if not exit_family:
         if entry_style in {"ENTRY_BREAKOUT", "ENTRY_MOMENTUM", "ENTRY_OPEN_PUSH", "ENTRY_MOMENTUM_CONTINUATION"}:
@@ -200,19 +324,23 @@ def resolve_exit_policy_for_position(
     )
 
     # ── 시장 컨텍스트 ────────────────────────────────────────────────
-    ma20 = market_ctx.get("ma20")
-    ma50 = market_ctx.get("ma50")
+    ma20 = _as_float_or_none(market_ctx.get("ma20"))
+    ma50 = _as_float_or_none(market_ctx.get("ma50"))
     regime = str(market_ctx.get("regime") or "").upper()
     atr_pct = float(
         market_ctx.get("atr_pct") or features.get("atr_pct") or 2.0
     )
 
     mark = float(holding_ctx.get("mark") or holding_ctx.get("current_price") or 0.0)
-    trend_ok = (
-        (ma20 is None or mark <= 0 or mark >= float(ma20))
+    trend_data_complete = bool(mark > 0 and ma20 is not None and ma50 is not None)
+    trend_ok = bool(
+        mark > 0
+        and ma20 is not None
+        and mark >= float(ma20)
         and regime not in {"BEAR", "RISK_OFF", "DOWNTREND"}
     )
-    trend_strong = trend_ok and (ma50 is None or mark <= 0 or mark >= float(ma50))
+    # Missing MA50 is UNKNOWN, never STRONG.
+    trend_strong = bool(trend_ok and ma50 is not None and mark >= float(ma50))
 
     score_final = float(features.get("score_final") or features.get("score") or 0.0)
 
@@ -276,6 +404,7 @@ def resolve_exit_policy_for_position(
         "trade_horizon": trade_horizon,
         "trend_ok": trend_ok,
         "trend_strong": trend_strong,
+        "trend_data_complete": trend_data_complete,
         "router_enabled": True,
         "time_stop_basis": "trading_days",
     })
