@@ -7225,21 +7225,8 @@ def run_once(
         "warning_counts": _normalize_warning_counts(getattr(result, "warning_counts", None)),
         "terminal_state": getattr(result, "terminal_state", None),
     }
-    # The PB1 tick owns reconciliation and the single authoritative balance
-    # snapshot.  Invoke the KR Infinite sleeve here (not from a scheduler or a
-    # session boundary) and isolate failures from standard PB1 processing.
-    try:
-        from trader.kr.infinite.runner import run_kr_infinite_sleeve_tick
-        inf = run_kr_infinite_sleeve_tick(
-            kis=kis, balance_snapshot=balance_snapshot_raw or {}, env=env_effective,
-            trade_date=trade_date, allow_entry=bool(order_allowed and calc_allowed),
-        )
-        metrics["kr_infinite_decision"] = inf.decision.action.value
-        logger.info("[KR_INF][TICK] symbol=122630 owner=KR_INFINITE decision=%s reason=%s shared_balance=1",
-                    inf.decision.action.value, inf.decision.reason)
-    except Exception as exc:
-        metrics["kr_infinite_decision"] = "BLOCK"
-        logger.exception("[KR_INF][BLOCK] reason=isolated_exception error=%s", exc)
+    # KR Infinite is an independently scheduled sibling runtime.  PB1 must not
+    # call, gate, retry, or report the Infinite strategy from this process.
     result_status = result.status if result else "UNKNOWN"
     
     # ✅ DIAG 모드 실행 요약 로그
