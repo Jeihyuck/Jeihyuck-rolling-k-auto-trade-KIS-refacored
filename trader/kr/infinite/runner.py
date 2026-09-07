@@ -54,7 +54,7 @@ def load_regime() -> tuple[str | None, str]:
 
 def _new_cycle(state: State | None, executor: KISExecutor, config: InfiniteConfig, trade_date: date) -> State:
     allocated = executor.account_equity() * config.account_exposure_pct
-    return State(cycle_id=cycle_id(trade_date), cycle_start_date=trade_date,
+    return State(symbol=config.symbol, cycle_id=cycle_id(trade_date), cycle_start_date=trade_date,
                  allocated_capital_krw=allocated, unit_krw=allocated / config.total_units,
                  status=Status.READY, last_exit_date=state.last_exit_date if state else None)
 
@@ -98,7 +98,14 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
     if not config.enabled:
         return RunResult(Decision(Action.WAIT, "KR_INF_FEATURE_DISABLED"), None)
 
-    executor = KISExecutor(kis, env, balance_snapshot=balance_snapshot)
+    executor = KISExecutor(kis, env, balance_snapshot=balance_snapshot, symbol=config.symbol)
+    repo_symbol = str(getattr(repository, "symbol", config.symbol) or "").lstrip("A").zfill(6)
+    config_symbol = str(config.symbol or "").lstrip("A").zfill(6)
+    if repo_symbol and repo_symbol != config_symbol:
+        return RunResult(
+            Decision(Action.BLOCK, "KR_INF_REPOSITORY_IDENTITY_MISMATCH", next_status=Status.FROZEN),
+            None,
+        )
     try:
         repository.ensure_schema()
         state = repository.load_state()
@@ -114,7 +121,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             log_decision(decision=decision.action.value, reason=decision.reason, symbol=config.symbol)
             return RunResult(decision, state)
         if state is None and position.qty > 0:
-            state = State(status=Status.ACTIVE, cycle_id=f"BROKER_ADOPTION-{day.isoformat()}",
+            state = State(symbol=config.symbol, status=Status.ACTIVE, cycle_id=f"BROKER_ADOPTION-{day.isoformat()}",
                           cycle_start_date=day,
                           metadata={"ownership_source": "KR_INF_EXIT_ONLY_BROKER_ADOPTION",
                                     "broker_qty": position.qty,
@@ -279,7 +286,7 @@ def main() -> int:
     config = InfiniteConfig.from_env()
     kis = KisAPI(kis_env=os.getenv("KIS_ENV", "practice"))
     result = run_once(config=config, kis=kis,
-                      repository=InfiniteRepository(), kis_env=os.getenv("KIS_ENV", "practice"))
+                      repository=InfiniteRepository(symbol=config.symbol), kis_env=os.getenv("KIS_ENV", "practice"))
     return 0 if result.decision.action != Action.BLOCK else 2
 
 
@@ -291,8 +298,9 @@ def run_canonical_session(*, session: str, env: str, allow_entry: bool = True) -
     os.environ["KR_TRADE_DATE"] = trade_date.isoformat()
     logger.info("[KR_INFINITE][SESSION_TICK] session=%s env=%s trade_date=%s allow_entry=%s",
                 session, env, trade_date, int(effective_allow_entry))
-    return run_once(config=InfiniteConfig.from_env(), kis=KisAPI(kis_env=env),
-                    repository=InfiniteRepository(), kis_env=env, trade_date=trade_date,
+    config = InfiniteConfig.from_env()
+    return run_once(config=config, kis=KisAPI(kis_env=env),
+                    repository=InfiniteRepository(symbol=config.symbol), kis_env=env, trade_date=trade_date,
                     allow_entry=effective_allow_entry, now_kst_value=now_kst)
 
 
@@ -303,7 +311,8 @@ def run_kr_infinite_sleeve_tick(*, kis, balance_snapshot: dict, env: str,
     Production session orchestration is owned by the independent Infinite
     session runner and is never called from PB1.
     """
-    return run_once(config=InfiniteConfig.from_env(), kis=kis, repository=InfiniteRepository(),
+    config = InfiniteConfig.from_env()
+    return run_once(config=config, kis=kis, repository=InfiniteRepository(symbol=config.symbol),
                     kis_env=env, trade_date=trade_date, allow_entry=allow_entry,
                     balance_snapshot=balance_snapshot)
 
