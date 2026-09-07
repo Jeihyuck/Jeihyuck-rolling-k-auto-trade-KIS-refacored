@@ -46,7 +46,8 @@ def test_pb1_does_not_own_sleeve_and_standard_engine_reserves_symbol():
     independent = Path("trader/kr/infinite/session_runner.py").read_text()
     assert "run_kr_infinite_sleeve_tick(" not in runner
     assert "run_canonical_session" in independent
-    assert 'if code == "122630":' in engine
+    assert 'if code == "122630":' not in engine
+    assert "enforce_kr_order_ownership" in engine
     assert "KR_INF_OWNERSHIP_RESERVED" in engine
 
 
