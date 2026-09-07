@@ -194,11 +194,16 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
         for order_id in filled_order_ids
         if order_status_by_id.get(order_id) in {"CREATED", "INTENT"}
     )
+    qty_confirmed_unpriced = sum(
+        s == "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED" for s in states
+    )
     result: dict[str, Any] = {
         "order_intents_created": len(rows),
         "broker_submitted": sum(s in submitted_states for s in states),
         "broker_acked": sum(s in ack_states for s in states),
         "fills_confirmed": len(fill_rows),
+        "quantity_confirmed_fills": len(fill_rows) + qty_confirmed_unpriced,
+        "price_unresolved_quantity_confirmed": qty_confirmed_unpriced,
         "partial_fills": sum(s == "PARTIAL_FILLED" for s in states),
         "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in states),
         "cancelled": sum(s == "CANCELLED" for s in states),
@@ -216,11 +221,16 @@ def durable_order_metrics(orders: Iterable[Mapping[str, Any]], fills: Iterable[M
             str(row.get("order_id")) for row in side_rows
             if row.get("order_id") and str(row.get("status") or "").upper() in {"ACKED", "ACCEPTED"}
         } - side_filled_order_ids
+        side_qty_confirmed_unpriced = sum(
+            s == "FILLED_QTY_CONFIRMED_PRICE_UNRESOLVED" for s in side_states
+        )
         result["by_side"][side] = {
             "order_intents_created": len(side_rows),
             "broker_submitted": sum(s in submitted_states for s in side_states),
             "broker_acked": sum(s in ack_states for s in side_states),
             "fills_confirmed": len(side_fills),
+            "quantity_confirmed_fills": len(side_fills) + side_qty_confirmed_unpriced,
+            "price_unresolved_quantity_confirmed": side_qty_confirmed_unpriced,
             "partial_fills": sum(s == "PARTIAL_FILLED" for s in side_states),
             "broker_rejected": sum(s in {"REJECTED", "ERROR", "FAILED"} for s in side_states),
             "cancelled": sum(s == "CANCELLED" for s in side_states),
