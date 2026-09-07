@@ -7,14 +7,18 @@ from datetime import date
 from sqlalchemy import text
 from trader.db.engine import get_engine
 
+from .config import InfiniteConfig
 from .models import BrokerOrderState, Decision, OrderIntent, State, Status
 
 PENDING = frozenset({"INTENT_CREATED", "SUBMITTED", "ACK", "PENDING", "PARTIALLY_FILLED", "RECONCILE_PENDING"})
 
 
 class InfiniteRepository:
-    def __init__(self, engine=None):
+    def __init__(self, engine=None, *, strategy_id: str = "KR_INFINITE_V1", symbol: str | None = None):
         self.engine = engine or get_engine()
+        self.strategy_id = str(strategy_id or "KR_INFINITE_V1")
+        configured = symbol if symbol is not None else InfiniteConfig.from_env().symbol
+        self.symbol = str(configured or "").lstrip("A").zfill(6)
 
     def ensure_schema(self) -> None:
         with self.engine.connect() as conn:
@@ -25,7 +29,10 @@ class InfiniteRepository:
 
     def load_state(self) -> State | None:
         with self.engine.connect() as conn:
-            row = conn.execute(text("SELECT * FROM kr_infinite_state WHERE strategy_id='KR_INFINITE_V1' AND symbol='122630'")).mappings().first()
+            row = conn.execute(
+                text("SELECT * FROM kr_infinite_state WHERE strategy_id=:strategy_id AND symbol=:symbol"),
+                {"strategy_id": self.strategy_id, "symbol": self.symbol},
+            ).mappings().first()
         if row is None:
             return None
         values = {key: row[key] for key in State.__dataclass_fields__ if key in row}
@@ -35,14 +42,22 @@ class InfiniteRepository:
 
     def intent_keys(self) -> frozenset[str]:
         with self.engine.connect() as conn:
-            rows = conn.execute(text("SELECT idempotency_key FROM kr_infinite_order_intents")).all()
+            rows = conn.execute(
+                text("SELECT idempotency_key FROM kr_infinite_order_intents WHERE strategy_id=:strategy_id AND symbol=:symbol"),
+                {"strategy_id": self.strategy_id, "symbol": self.symbol},
+            ).all()
         return frozenset(row[0] for row in rows)
 
     def pending_intents(self) -> list[OrderIntent]:
         with self.engine.connect() as conn:
             rows = conn.execute(text("""SELECT id,cycle_id,trade_date,side,idempotency_key,requested_qty,unit_sequence,
                 broker_order_id,status,filled_qty,filled_notional_krw FROM kr_infinite_order_intents
-                WHERE status=ANY(:statuses) ORDER BY id"""), {"statuses": list(PENDING)}).mappings().all()
+                WHERE strategy_id=:strategy_id AND symbol=:symbol
+                  AND status=ANY(:statuses) ORDER BY id"""), {
+                    "strategy_id": self.strategy_id,
+                    "symbol": self.symbol,
+                    "statuses": list(PENDING),
+                }).mappings().all()
         return [OrderIntent(**dict(row)) for row in rows]
 
     def create_intent(self, state: State, decision: Decision, trade_date: date, market_state: str) -> bool:
@@ -51,8 +66,9 @@ class InfiniteRepository:
             row = conn.execute(text("""INSERT INTO kr_infinite_order_intents(
                 strategy_id,symbol,cycle_id,trade_date,side,reason,unit_sequence,requested_notional_krw,
                 requested_qty,limit_price,idempotency_key,market_state)
-                VALUES('KR_INFINITE_V1','122630',:cycle,:day,:side,:reason,:seq,:notional,:qty,:price,:key,:market)
+                VALUES(:strategy_id,:symbol,:cycle,:day,:side,:reason,:seq,:notional,:qty,:price,:key,:market)
                 ON CONFLICT(idempotency_key) DO NOTHING RETURNING id"""), {
+                "strategy_id": self.strategy_id, "symbol": self.symbol,
                 "cycle": state.cycle_id, "day": trade_date, "side": decision.action.value,
                 "reason": decision.reason, "seq": state.units_used + 1 if decision.action.value in {"BUY", "RECOVERY"} else None,
                 "notional": decision.notional, "qty": decision.qty,
