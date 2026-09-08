@@ -47,6 +47,17 @@ from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 from trader.eventlog import emit_event
 from trader.kr_price_utils import krx_tick, normalize_kr_order_price
+from trader.kis_http_policy import (
+    endpoint_name as endpoint_name_impl,
+    endpoint_path as endpoint_path_impl,
+    is_data_endpoint as is_data_endpoint_impl,
+    is_order_endpoint as is_order_endpoint_impl,
+    is_trading_endpoint as is_trading_endpoint_impl,
+    kis_data_http_allowed_in_diag as kis_data_http_allowed_in_diag_impl,
+    kis_explicit_offline_mode as kis_explicit_offline_mode_impl,
+    kis_http_allowed as kis_http_allowed_impl,
+    resolve_kis_http_caller_route as resolve_kis_http_caller_route_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,94 +117,35 @@ def kis_http_enabled() -> bool:
 
 
 def _endpoint_path(endpoint: str) -> str:
-    parsed = urlparse(str(endpoint or ""))
-    return (parsed.path or str(endpoint or "")).lower()
+    return endpoint_path_impl(endpoint)
 
 
 def _endpoint_name(endpoint: str) -> str:
-    path = _endpoint_path(endpoint).rstrip("/")
-    if not path:
-        return "unknown"
-    return path.split("/")[-1] or "unknown"
+    return endpoint_name_impl(endpoint)
 
 
 def is_order_endpoint(endpoint: str) -> bool:
-    path = _endpoint_path(endpoint)
-    return any(
-        token in path
-        for token in (
-            "/trading/order-cash",
-            "/trading/order-rvsecncl",
-            "/trading/order-resv",
-            "/order-cash",
-            "/order-rvsecncl",
-            "/order/",
-        )
-    )
+    return is_order_endpoint_impl(endpoint)
 
 
 def is_data_endpoint(endpoint: str) -> bool:
-    path = _endpoint_path(endpoint)
-    if "/oauth2/token" in path:
-        return True
-    return any(
-        token in path
-        for token in (
-            "/quotations/",
-            "inquire-price",
-            "inquire-daily-itemchartprice",
-            "inquire-asking-price-exp-ccn",
-            "inquire-investor",
-            "program-trade",
-            "market-cap",
-            "search-stock-info",
-            "inquire-daily-ccld",
-            "inquire-balance",
-            "inquire-psbl-order",
-        )
-    )
+    return is_data_endpoint_impl(endpoint)
 
 
 def _resolve_kis_http_caller_route(default: str = "live") -> str:
-    raw = (os.getenv("KIS_HTTP_CALLER_ROUTE") or "").strip().lower()
-    if raw:
-        return raw
-    mode = (os.getenv("MODE") or "").strip().lower()
-    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
-    if mode == "prep":
-        return "prep"
-    if strategy_mode == "DIAG" and (
-        os.getenv("PB1_DIAG_FULL_EXEC", "0").strip() == "1"
-        or os.getenv("FORCE_RUN", "0").strip() == "1"
-        or os.getenv("WATCHLIST_MODE", "0").strip() == "1"
-    ):
-        return "manual_test"
-    return default
+    return resolve_kis_http_caller_route_impl(default=default, env=os.environ)
 
 
 def kis_http_allowed(endpoint: str, strategy_mode: str, allow_data_http_in_diag: bool, caller_route: str | None = None) -> bool:
-    normalized_mode = str(strategy_mode or "").strip().upper()
-    route = (caller_route or _resolve_kis_http_caller_route(default="live")).strip().lower() or "live"
-    if normalized_mode == "DIAG":
-        if is_order_endpoint(endpoint):
-            return False
-        if is_data_endpoint(endpoint):
-            if route == "smoke":
-                return False
-            return bool(allow_data_http_in_diag)
-    return True
+    return kis_http_allowed_impl(endpoint, strategy_mode, allow_data_http_in_diag, caller_route, env=os.environ)
 
 
 def is_trading_endpoint(url: str) -> bool:
-    return is_order_endpoint(url)
+    return is_order_endpoint_impl(url)
 
 
 def kis_explicit_offline_mode() -> bool:
-    if os.getenv("KIS_EXPLICIT_OFFLINE", "0").strip() == "1":
-        return True
-    if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
-        return True
-    return False
+    return kis_explicit_offline_mode_impl(env=os.environ)
 
 
 def kis_data_http_allowed_in_diag() -> bool:
@@ -201,7 +153,7 @@ def kis_data_http_allowed_in_diag() -> bool:
     DIAG 모드에서 KIS 데이터 HTTP 허용 여부.
     ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 데이터 조회 허용.
     """
-    return os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip() == "1"
+    return kis_data_http_allowed_in_diag_impl(env=os.environ)
 
 
 # ✅ Export public exceptions
@@ -1587,8 +1539,11 @@ class KisAPI:
                             msg_cd,
                             body.get("msg1"),
                         )
-                        # Circuit breaker pause (15s)
-                        _price_cache.open_circuit(rate_limited=True)
+                        # The price circuit belongs only to price endpoints.
+                        # Balance/investor rate limits have their own endpoint
+                        # breaker/global cooldown and must not suppress quotes.
+                        if "inquire-price" in _endpoint_path(url):
+                            _price_cache.open_circuit(rate_limited=True)
                         # Exponential backoff
                         _egw002_backoff_sleep(attempt=i)
                         if i < attempts:
@@ -2350,9 +2305,6 @@ class KisAPI:
         elapsed_ms = (time.time() - start_time) * 1000
         self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
 
-        elapsed_ms = (time.time() - start_time) * 1000
-        self._log_kis_resp("QUOTE", code, {"attempts": attempts}, raw_output and {"rt_cd": "0", "output": raw_output} or None, elapsed_ms)
-
         if raw_output is None:
             if diag_mode:
                 return {}
@@ -2430,12 +2382,25 @@ class KisAPI:
                 reasons.append("AFTER_HOURS")
         
         if prpr is not None:
-            price_only = self.get_price_only(code, attempts=attempts)
-            if price_only.get("prpr") is not None:
-                price_only["reasons"] = reasons
-                return price_only
-        
-        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": reasons}
+            # The same successful inquire-price response already supplied a
+            # usable last price.  Do not perform a second KIS call merely
+            # because ask/bid fields are absent.
+            logger.info(
+                "[KIS][QUOTE][PRPR_FALLBACK] code=%s prpr=%s reasons=%s",
+                code,
+                prpr,
+                reasons,
+            )
+            return {
+                "ask": None,
+                "bid": None,
+                "prpr": prpr,
+                "last": prpr,
+                "fallback_used": "same_response_prpr",
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+
+        return {"ask": None, "bid": None, "prpr": None, "fallback_used": "none", "reasons": list(dict.fromkeys(reasons))}
 
     def get_quote(self, code: str) -> dict:
         """
@@ -2919,12 +2884,44 @@ class KisAPI:
                 return {"ok": True, "inv": inv}
             except Exception as e:
                 err_text = str(e)
-                err_type = "HTTP500" if "500" in err_text else ("TIMEOUT" if "timeout" in err_text.lower() or "ReadTimeout" in err_text else type(e).__name__)
-                logger.warning("[KR_FLOW][KIS_INVESTOR][FAIL_SOFT] code=%s err_type=%s action=impute_and_continue", iscd, err_type)
-                if attempt >= attempts or os.getenv("KR_INVESTOR_FLOW_FAIL_SOFT", "1") == "1":
-                    reason = "kis_investor_http_500" if err_type == "HTTP500" else "kis_investor_timeout" if err_type == "TIMEOUT" else err_type
-                    return {"ok": False, "error": reason, "inv": None, "flow_data_available": 0, "flow_missing": 1, "flow_fail_reason": reason, "flow_score_imputed": 1, "foreign_20_ratio": 0.0, "inst_20_ratio": 0.0}
-                time.sleep(min(0.2 * (2 ** (attempt - 1)), 0.5))
+                err_lower = err_text.lower()
+                if any(token in err_text for token in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
+                    err_type = "HTTP5XX"
+                elif "timeout" in err_lower or "readtimeout" in err_lower:
+                    err_type = "TIMEOUT"
+                else:
+                    err_type = type(e).__name__
+                retryable = err_type in {"HTTP5XX", "TIMEOUT"}
+                logger.warning(
+                    "[KR_FLOW][KIS_INVESTOR][FAIL_SOFT] code=%s err_type=%s "
+                    "attempt=%s/%s retryable=%s",
+                    iscd,
+                    err_type,
+                    attempt,
+                    attempts,
+                    int(retryable),
+                )
+                if retryable and attempt < attempts:
+                    time.sleep(min(0.2 * (2 ** (attempt - 1)), 0.5))
+                    continue
+                reason = (
+                    "kis_investor_http_5xx"
+                    if err_type == "HTTP5XX"
+                    else "kis_investor_timeout"
+                    if err_type == "TIMEOUT"
+                    else err_type
+                )
+                return {
+                    "ok": False,
+                    "error": reason,
+                    "inv": None,
+                    "flow_data_available": 0,
+                    "flow_missing": 1,
+                    "flow_fail_reason": reason,
+                    "flow_score_imputed": 1,
+                    "foreign_20_ratio": 0.0,
+                    "inst_20_ratio": 0.0,
+                }
 
     def get_price_snapshot(self, code: str, market: str = "J") -> dict:
         """
@@ -3847,10 +3844,14 @@ class KisAPI:
             raise KisTemporaryError("forced_500_balance")
         if not force and self._balance_cache is not None:
             age_s = (now_kst() - self._balance_cache_at).total_seconds() if self._balance_cache_at else 0.0
+            cache_ttl_s = max(
+                1.0,
+                float(os.getenv("KR_KIS_BALANCE_CACHE_TTL_SEC", "30") or "30"),
+            )
             cached = _deepcopy_json(self._balance_cache)
             normalized = _normalize_balance_snapshot(cached)
-            if normalized:
-                logger.info("[KIS][BALANCE_CACHE] hit=True age_s=%.1f", age_s)
+            if normalized and age_s <= cache_ttl_s:
+                logger.info("[KIS][BALANCE_CACHE] hit=True age_s=%.1f ttl_s=%.1f", age_s, cache_ttl_s)
                 self._balance_cache = _deepcopy_json(normalized)
                 source = "wrapper_cache"
                 if return_source and return_raw:
@@ -3858,6 +3859,14 @@ class KisAPI:
                 if return_source:
                     return normalized, source
                 return normalized
+            if normalized and age_s > cache_ttl_s:
+                logger.warning(
+                    "[KIS][BALANCE_CACHE][EXPIRED] age_s=%.1f ttl_s=%.1f "
+                    "action=refresh_not_fresh",
+                    age_s,
+                    cache_ttl_s,
+                )
+                force = True
             global _BALANCE_CACHE_INVALID_LOGGED
             if not _BALANCE_CACHE_INVALID_LOGGED:
                 if isinstance(cached, dict) and cached.get("rt_cd") not in (None, "0"):

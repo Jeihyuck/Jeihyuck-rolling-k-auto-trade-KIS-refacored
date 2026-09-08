@@ -16,15 +16,20 @@ class KISMarketcapTopProvider:
         "practice": os.getenv("KIS_TR_ID_MARKETCAP_TOP", "FHPST01700000"),
         "real": os.getenv("KIS_TR_ID_MARKETCAP_TOP_REAL", "FHPST01700000"),
     }
+    # KIS official market_cap request contract. Keep required empty-string
+    # filters explicit so the endpoint receives the full price/volume range.
     DEFAULT_PARAMS = {
-        # 조건 스크린 코드/정렬 기준은 KIS 포털의 "국내주식 시가총액 상위" 기본값을 사용한다.
-        # 필요 시 환경 변수 혹은 코드 한 곳만 수정하면 되도록 상수로 모아둔다.
-        "FID_RANK_SORT_CLS_CODE": os.getenv("KIS_MKTCAP_SORT_CODE", "1"),
-        "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20171"),
-        "FID_INPUT_ISCD": os.getenv("KIS_MKTCAP_INPUT_ISCD", "0000"),
-        "FID_PRC_CLS_CODE": os.getenv("KIS_MKTCAP_PRC_CLS_CODE", "0"),
+        "FID_COND_MRKT_DIV_CODE": os.getenv("KIS_MKTCAP_MRKT_DIV_CODE", "J"),
+        "FID_COND_SCR_DIV_CODE": os.getenv("KIS_MKTCAP_SCREEN_CODE", "20174"),
+        "FID_DIV_CLS_CODE": os.getenv("KIS_MKTCAP_DIV_CLS_CODE", "0"),
+        "FID_TRGT_CLS_CODE": os.getenv("KIS_MKTCAP_TRGT_CLS_CODE", "0"),
+        "FID_TRGT_EXLS_CLS_CODE": os.getenv("KIS_MKTCAP_TRGT_EXLS_CLS_CODE", "0"),
+        "FID_INPUT_PRICE_1": os.getenv("KIS_MKTCAP_INPUT_PRICE_1", ""),
+        "FID_INPUT_PRICE_2": os.getenv("KIS_MKTCAP_INPUT_PRICE_2", ""),
+        "FID_VOL_CNT": os.getenv("KIS_MKTCAP_VOL_CNT", ""),
     }
-    MARKET_CODE_MAP = {"KOSPI": "J", "KOSDAQ": "Q"}
+    # market-cap uses J=KRX and separates KOSPI/KOSDAQ through FID_INPUT_ISCD.
+    INPUT_ISCD_MAP = {"KOSPI": "0001", "KOSDAQ": "1001"}
 
     def __init__(
         self,
@@ -43,18 +48,17 @@ class KISMarketcapTopProvider:
     def _pick_tr_id(self) -> str | None:
         return self.tr_ids.get(self.env) or self.tr_ids.get("practice")
 
-    def _market_code(self, market: str) -> str:
-        return self.MARKET_CODE_MAP.get(market.upper(), "J")
-
     def _build_params(self, market: str, n: int) -> dict:
+        # n is a caller-side target size. KIS market-cap itself does not accept
+        # FID_INPUT_CNT_1, so slice normalized output after the request.
+        del n
         return {
             **self.params,
-            "FID_COND_MRKT_DIV_CODE": self._market_code(market),
-            "FID_INPUT_CNT_1": str(n),
+            "FID_INPUT_ISCD": self.INPUT_ISCD_MAP[market.upper()],
         }
 
     def validate_params(self, market: str, n: int) -> None:
-        if market.upper() not in self.MARKET_CODE_MAP:
+        if market.upper() not in self.INPUT_ISCD_MAP:
             raise ValueError(f"unsupported market: {market}")
         if n <= 0:
             raise ValueError(f"n must be positive: {n}")
@@ -74,7 +78,6 @@ class KISMarketcapTopProvider:
                 continue
             name = row.get("hts_kor_isnm") or row.get("mksc_kor_isnm") or row.get("hname") or row.get("prdt_name") or row.get("name")
             normalized.append({"code": code.zfill(6), "name": str(name).strip() if name else None})
-        # preserve order while removing duplicates
         seen: set[str] = set()
         uniq: list[dict] = []
         for row in normalized:
@@ -97,7 +100,6 @@ class KISMarketcapTopProvider:
             if not code:
                 continue
             codes.append(code.zfill(6))
-        # preserve order while removing duplicates
         seen: set[str] = set()
         uniq: list[str] = []
         for c in codes:
@@ -117,10 +119,7 @@ class KISMarketcapTopProvider:
         return buckets
 
     def get_marketcap_top(self, market: str, n: int) -> list[str]:
-        """
-        KIS "국내주식 시가총액 상위" 호출로 시장별 TopN 종목코드 반환.
-        실패 시 예외 대신 빈 리스트를 반환하고 WARN 로그만 남긴다.
-        """
+        """Return KIS market-cap ranking codes; fail-soft to an empty list."""
         try:
             self.validate_params(market, n)
         except Exception as exc:
@@ -154,10 +153,7 @@ class KISMarketcapTopProvider:
         return codes[: max(0, int(n))]
 
     def get_marketcap_top_with_meta(self, market: str, n: int) -> list[dict]:
-        """
-        get_marketcap_top과 동일하지만 이름 메타를 포함한다.
-        실패/빈 응답 시 예외를 던져 상위 호출자가 사유를 명확히 기록하도록 한다.
-        """
+        """Return KIS market-cap ranking codes and names for the requested market."""
         self.validate_params(market, n)
         tr_id = self._pick_tr_id()
         params = self._build_params(market, n)

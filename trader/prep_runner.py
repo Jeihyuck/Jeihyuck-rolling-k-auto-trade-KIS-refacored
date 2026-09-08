@@ -83,6 +83,7 @@ from trader.runtime_paths import build_final30_scored_paths, get_final30_artifac
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
+from trader.prep_status_utils import resolve_prep_final_status as resolve_prep_final_status_impl
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +178,7 @@ def _run_prep_aux_with_timeout(
         executor.shutdown(wait=False, cancel_futures=True)
 
 def _resolve_prep_final_status(*, prep_core: dict[str, Any], aux_failures: list[dict[str, Any]]) -> tuple[str, int]:
-    if int((prep_core or {}).get("core_ok") or 0) and not aux_failures:
-        return "OK", 0
-    if int((prep_core or {}).get("core_ok") or 0) and aux_failures:
-        return "OK_CORE_AUX_DEGRADED", 0
-    if "quality_not_ok" in list((prep_core or {}).get("reasons") or []):
-        return "FAIL_CORE_QUALITY", 2
-    return "FAIL_CORE_CONTRACT", 2
+    return resolve_prep_final_status_impl(prep_core=prep_core, aux_failures=aux_failures)
 
 def compute_prep_core_status(
     *,
@@ -458,10 +453,33 @@ def _make_flow_provider(engine):
             try:
                 resp = kis_api.inquire_investor(code, "KOSDAQ")
             except Exception as exc:
-                reason = "breaker_open" if "breaker open" in str(exc).lower() else "unexpected_exception"
+                detail = str(exc).replace("\n", " ")[:200]
+                detail_lower = detail.lower()
+                if "breaker open" in detail_lower or "circuit_open" in detail_lower:
+                    reason = "breaker_open"
+                elif any(token in detail for token in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
+                    reason = "http_5xx"
+                elif "timeout" in detail_lower or "readtimeout" in detail_lower:
+                    reason = "timeout"
+                else:
+                    reason = "unexpected_exception"
+                if reason in {"http_5xx", "timeout"} and attempts < 3:
+                    logger.warning(
+                        "[FLOW][KIS][RETRY] code=%s reason=%s attempt=%s/3",
+                        code,
+                        reason,
+                        attempts,
+                    )
+                    time.sleep(min(0.2 * (2 ** (attempts - 1)), 0.5))
+                    continue
                 state["fail_count"] += 1
                 _record_provider_failure("kis", reason)
-                return _empty_df(), _empty_df(), {"ok": False, "provider": "kis", "reason": reason, "detail": str(exc)[:200]}
+                return _empty_df(), _empty_df(), {
+                    "ok": False,
+                    "provider": "kis",
+                    "reason": reason,
+                    "detail": detail,
+                }
 
             if resp.get("ok"):
                 inv = resp.get("inv") or {}

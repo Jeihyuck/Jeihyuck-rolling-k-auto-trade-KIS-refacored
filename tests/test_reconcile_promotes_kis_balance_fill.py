@@ -37,6 +37,9 @@ def test_promote_order_creates_fill_and_position() -> None:
         "stop_price_at_entry": 10000.0,
         "pivot_price_at_entry": 11500.0,
         "trade_horizon": "swing",
+        "pre_order_holding_qty": 0,
+        "requested_qty": 5,
+        "submitted_qty": 5,
     }
 
     orders_repo.get_open_orders.return_value = [
@@ -228,6 +231,17 @@ def test_promote_partial_filled_order() -> None:
             "qty": 10,
             "limit_price": 120000.0,
             "kis_odno": "4001",
+            "request_json": {
+                "pre_order_holding_qty": 0,
+                "requested_qty": 10,
+                "submitted_qty": 10,
+            },
+            "response_json": {
+                "_order_execution": {
+                    "requested_qty": 10,
+                    "submitted_qty": 10,
+                }
+            },
         }
     ]
 

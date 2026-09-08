@@ -47,6 +47,17 @@ from trader.time_coerce import to_date
 from trader.run_context import RunContext
 from trader.utils.ids import assert_uuid
 from trader.account_state import get_account_key
+from trader.db.value_utils import (
+    merge_json_dict as merge_json_dict_impl,
+    restore_numeric_from_sources as restore_numeric_from_sources_impl,
+    safe_float_or_none as safe_float_or_none_impl,
+)
+from trader.db.final30_contract_utils import (
+    field_null_counts as field_null_counts_impl,
+    normalize_final30_score_fields as normalize_final30_score_fields_impl,
+    roundtrip_mismatch_counts as roundtrip_mismatch_counts_impl,
+    roundtrip_value_matches as roundtrip_value_matches_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,71 +283,27 @@ class ScoredWatchlistInvalidError(ScoredWatchlistError):
 
 
 def _merge_json_dict(base: Any, incoming: Any) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    if isinstance(base, dict):
-        merged.update(base)
-    if isinstance(incoming, dict):
-        merged.update(incoming)
-    return json_sanitize(merged)
+    return merge_json_dict_impl(base, incoming)
 
 
 def _safe_float_or_none(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
+    return safe_float_or_none_impl(value)
 
 
 def _restore_numeric_from_sources(*sources: Any, aliases: tuple[str, ...]) -> float | None:
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        for alias in aliases:
-            if alias not in source:
-                continue
-            numeric = safe_nullable_float(source.get(alias))
-            if numeric is not None:
-                return float(numeric)
-    return None
+    return restore_numeric_from_sources_impl(*sources, aliases=aliases)
 
 
 def _field_null_counts(rows: List[Dict[str, Any]], fields: Iterable[str]) -> Dict[str, int]:
-    counts: Dict[str, int] = {}
-    for field in fields:
-        counts[str(field)] = sum(1 for row in (rows or []) if _contract_value_missing((row or {}).get(str(field))))
-    return counts
+    return field_null_counts_impl(rows, fields)
 
 
 def _normalize_final30_score_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    canonical = safe_nullable_float(row.get("score_final"))
-    if canonical is None:
-        canonical = safe_nullable_float(row.get("final_score"))
-    if canonical is None:
-        canonical = safe_nullable_float(row.get("score"))
-    canonical_value = float(canonical) if canonical is not None else None
-    row["score"] = canonical_value
-    row["score_final"] = canonical_value
-    row["final_score"] = canonical_value
-    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-    meta["score"] = canonical_value
-    meta["score_final"] = canonical_value
-    meta["final_score"] = canonical_value
-    row["meta"] = meta
-    return row
+    return normalize_final30_score_fields_impl(row)
 
 
 def _roundtrip_value_matches(lhs: Any, rhs: Any) -> bool:
-    lhs_num = safe_nullable_float(lhs)
-    rhs_num = safe_nullable_float(rhs)
-    if lhs_num is not None or rhs_num is not None:
-        if lhs_num is None or rhs_num is None:
-            return False
-        return abs(float(lhs_num) - float(rhs_num)) < 1e-9
-    if _contract_value_missing(lhs) and _contract_value_missing(rhs):
-        return True
-    return lhs == rhs
+    return roundtrip_value_matches_impl(lhs, rhs)
 
 
 def _roundtrip_mismatch_counts(
@@ -345,28 +312,7 @@ def _roundtrip_mismatch_counts(
     *,
     fields: Iterable[str],
 ) -> Dict[str, int]:
-    source_by_code = {
-        str((row or {}).get("code") or "").zfill(6): normalize_final30_contract_row(row)
-        for row in (source_rows or [])
-        if (row or {}).get("code")
-    }
-    loaded_by_code = {
-        str((row or {}).get("code") or "").zfill(6): normalize_final30_contract_row(row)
-        for row in (loaded_rows or [])
-        if (row or {}).get("code")
-    }
-    codes = sorted(set(source_by_code) | set(loaded_by_code))
-    mismatch_counts: Dict[str, int] = {}
-    for field in fields:
-        mismatch_counts[str(field)] = sum(
-            1
-            for code in codes
-            if not _roundtrip_value_matches(
-                (source_by_code.get(code) or {}).get(str(field)),
-                (loaded_by_code.get(code) or {}).get(str(field)),
-            )
-        )
-    return mismatch_counts
+    return roundtrip_mismatch_counts_impl(source_rows, loaded_rows, fields=fields)
 
 
 def _log_scored_sample(prefix: str, rows: List[Dict[str, Any]], *, limit: int = 5) -> None:
@@ -2853,6 +2799,32 @@ class OrdersRepo:
                 execute_with_retry(conn, sa.insert(self._schema.orders).values(**payload))
                 return str(payload["order_id"]), True
 
+    def get_by_broker_order_id(self, env: str, broker_order_id: str | None) -> dict | None:
+        """Return the exact durable order for one broker order id."""
+        broker_id = str(broker_order_id or "").strip()
+        if not broker_id:
+            return None
+        stmt = (
+            select(self._schema.orders)
+            .where(
+                and_(
+                    self._schema.orders.c.env == _norm_env(env),
+                    sa.or_(
+                        self._schema.orders.c.broker_order_id == broker_id,
+                        self._schema.orders.c.kis_odno == broker_id,
+                    ),
+                )
+            )
+            .order_by(self._schema.orders.c.updated_at.desc())
+            .limit(1)
+        )
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="orders.get_by_broker_order_id",
+            fail_open=True,
+        )
+        return dict(rows[0]) if rows else None
+
     def mark_submitted(
         self,
         env: str,
@@ -3992,6 +3964,104 @@ class FillsRepo:
             op_name="fills.list_fills_in_window",
             fail_open=_resolve_fill_fail_open(),
         )
+
+    def list_provenance_fills_by_codes(
+        self,
+        env: str,
+        codes: Iterable[str],
+        *,
+        strategy: str,
+        account_id: str,
+    ) -> dict[str, list[dict]]:
+        """Return fill history proven to belong to one account/strategy.
+
+        This is intentionally stricter than a symbol-only fill lookup.  Rows
+        without an originating order/portfolio epoch are omitted so provenance
+        reconstruction fails closed instead of borrowing stale history.
+        """
+        normalized_codes = [
+            str(code or "").zfill(6)
+            for code in (codes or [])
+            if str(code or "").strip()
+        ]
+        if not normalized_codes:
+            return {}
+        filled_at_expr = self._window_expr(self._schema.fills.c.filled_at)
+        stmt = (
+            select(
+                self._schema.fills,
+                self._schema.orders.c.strategy.label("order_strategy"),
+                self._schema.orders.c.sid.label("order_sid"),
+                self._schema.orders.c.mode.label("order_mode"),
+                self._schema.orders.c.entry_reason.label("order_entry_reason"),
+                self._schema.orders.c.entry_style_selected.label("order_entry_style_selected"),
+                self._schema.orders.c.entry_decision_family.label("order_entry_decision_family"),
+                self._schema.orders.c.entry_meta_json.label("order_entry_meta_json"),
+                self._schema.orders.c.stop_price_at_entry.label("order_stop_price_at_entry"),
+                self._schema.orders.c.pivot_price_at_entry.label("order_pivot_price_at_entry"),
+                self._schema.orders.c.entry_rule_version.label("order_entry_rule_version"),
+                self._schema.orders.c.request_json.label("request_json"),
+                self._schema.portfolio_epochs.c.account_id.label("account_id"),
+            )
+            .join(
+                self._schema.orders,
+                self._schema.orders.c.order_id == self._schema.fills.c.order_id,
+            )
+            .join(
+                self._schema.portfolio_epochs,
+                self._schema.portfolio_epochs.c.portfolio_epoch_id
+                == self._schema.fills.c.portfolio_epoch_id,
+            )
+            .where(
+                and_(
+                    self._schema.fills.c.env == _norm_env(env),
+                    self._schema.orders.c.env == _norm_env(env),
+                    self._schema.orders.c.strategy == strategy,
+                    self._schema.portfolio_epochs.c.env == _norm_env(env),
+                    self._schema.portfolio_epochs.c.account_id == str(account_id),
+                    self._schema.fills.c.code.in_(normalized_codes),
+                    self._schema.fills.c.side.in_(["BUY", "SELL"]),
+                )
+            )
+            .order_by(filled_at_expr.asc(), self._schema.fills.c.created_at.asc())
+        )
+        rows = self._read_mappings_with_guard(
+            stmt,
+            op_name="fills.list_provenance_fills_by_codes",
+            fail_open=_resolve_fill_fail_open(),
+        )
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            item = dict(row)
+            # Prefer fill-side canonical entry fields, then the originating
+            # order fields.  Keep original request_json for EntryExitPlan proof.
+            item["entry_reason"] = (
+                item.get("entry_reason") or item.get("order_entry_reason")
+            )
+            item["entry_style_selected"] = (
+                item.get("entry_style_selected")
+                or item.get("order_entry_style_selected")
+            )
+            item["entry_decision_family"] = (
+                item.get("entry_decision_family")
+                or item.get("order_entry_decision_family")
+            )
+            item["stop_price_at_entry"] = (
+                item.get("stop_price_at_entry")
+                or item.get("order_stop_price_at_entry")
+            )
+            item["pivot_price_at_entry"] = (
+                item.get("pivot_price_at_entry")
+                or item.get("order_pivot_price_at_entry")
+            )
+            item["entry_rule_version"] = (
+                item.get("entry_rule_version")
+                or item.get("order_entry_rule_version")
+            )
+            code = str(item.get("code") or "").zfill(6)
+            if code:
+                grouped.setdefault(code, []).append(item)
+        return grouped
 
     def list_latest_buy_fills_by_codes(self, env: str, codes: Iterable[str]) -> dict[str, dict]:
         normalized_codes = [str(code or "").zfill(6) for code in (codes or []) if str(code or "").strip()]

@@ -4,6 +4,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch, call
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clear_dispatcher_env(monkeypatch):
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    monkeypatch.delenv("GITHUB_WORKFLOW", raising=False)
+
 
 # ---------------------------------------------------------------------------
 # Test 1: dispatcher trade-am force_now + max_ticks=2

@@ -26,6 +26,17 @@ def test_promote_open_buy_order_from_kis_holdings() -> None:
             "stage": "PB1-CLOSE",
             "client_order_key": "practice:pb1:067310:BUY:1",
             "kis_odno": "1001",
+            "request_json": {
+                "pre_order_holding_qty": 0,
+                "requested_qty": 3,
+                "submitted_qty": 3,
+            },
+            "response_json": {
+                "_order_execution": {
+                    "requested_qty": 3,
+                    "submitted_qty": 3,
+                }
+            },
             "submitted_at": datetime(2026, 5, 1, 9, 1, 0),
             "acked_at": datetime(2026, 5, 1, 9, 1, 1),
         }
@@ -53,7 +64,7 @@ def test_promote_open_buy_order_from_kis_holdings() -> None:
     fill_kwargs = fills_repo.upsert_fill.call_args.kwargs
     assert order_kwargs["status"] == "FILLED"
     assert order_kwargs["code"] == "067310"
-    assert fill_kwargs["trade_id"] == "PROMOTE:1001"
+    assert fill_kwargs["trade_id"] == "PROMOTE:BUY:1001"
     assert fill_kwargs["qty"] == 3
 
 

@@ -2,6 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)"
 source "$SCRIPT_DIR/init-session-log.sh"
+source "$SCRIPT_DIR/kr-infinite-sidecar.sh"
 nullim_init_session_log KR am "am" "${BASH_SOURCE[0]}"
 # The KR calendar is advisory only; Windows Task Scheduler owns execution timing.
 set +e
@@ -121,6 +122,7 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
   echo "[KR_AM][START] ts=$(date -Is) env=$STRATEGY_ENV kis_env=$KIS_ENV session=$PB1_SESSION"
   KR_AM_SESSION_TIMEOUT_SEC="${KR_AM_SESSION_TIMEOUT_SEC:-3600}"
   echo "[KR_AM][EFFECTIVE_ENV] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC}"
+  nullim_start_kr_infinite_sidecar "$WSL_RUN_SESSION" "$STRATEGY_ENV"
   set +e
   timeout --kill-after=30s "${KR_AM_SESSION_TIMEOUT_SEC}" python -m trader.kr.runner.trade_session_runner --session am --env "$STRATEGY_ENV"
   rc=$?
@@ -133,6 +135,7 @@ ln -sfn "$(realpath --relative-to="$(dirname "$LATEST_LINK")" "$NULLIM_SESSION_L
     echo "[KR_AM][TIMEOUT] timeout_sec=${KR_AM_SESSION_TIMEOUT_SEC} last_stage=${LAST_STAGE}"
     echo "[RUN_SUMMARY][RESULT] market=KR session=am status=FAIL reason=SESSION_TIMEOUT orders_intent=unknown orders_ack=unknown blocked=0"
   fi
+  nullim_wait_kr_infinite_sidecar
   echo "[KR_AM][EXIT] ts=$(date -Is) exit_code=$rc"
   exit $rc
 } >> "$LOG_FILE" 2>&1
