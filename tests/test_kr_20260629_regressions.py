@@ -41,7 +41,7 @@ def test_kr_prep_outside_window_does_not_quarantine_artifacts(monkeypatch):
     assert called["quarantine"] == 0
 
 
-def test_marketcap_provider_includes_fid_prc_cls_code():
+def test_marketcap_provider_matches_official_kis_required_contract():
     from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
 
     captured = {}
@@ -67,9 +67,33 @@ def test_marketcap_provider_includes_fid_prc_cls_code():
 
     provider = KISMarketcapTopProvider(kis=FakeKis())
     assert provider.get_marketcap_top("KOSPI", 30) == ["005930"]
-    assert "FID_PRC_CLS_CODE" in captured
     assert captured["FID_COND_MRKT_DIV_CODE"] == "J"
-    assert captured["FID_INPUT_CNT_1"] == "30"
+    assert captured["FID_COND_SCR_DIV_CODE"] == "20174"
+    assert captured["FID_INPUT_ISCD"] == "0001"
+    assert captured["FID_DIV_CLS_CODE"] == "0"
+    assert captured["FID_TRGT_CLS_CODE"] == "0"
+    assert captured["FID_TRGT_EXLS_CLS_CODE"] == "0"
+    assert "FID_INPUT_PRICE_1" in captured
+    assert "FID_INPUT_PRICE_2" in captured
+    assert "FID_VOL_CNT" in captured
+    assert "FID_INPUT_CNT_1" not in captured
+    assert "FID_RANK_SORT_CLS_CODE" not in captured
+    assert "FID_PRC_CLS_CODE" not in captured
+
+
+def test_marketcap_provider_uses_input_iscd_to_split_kospi_kosdaq():
+    from trader.universe.providers.kis_marketcap_top import KISMarketcapTopProvider
+
+    class FakeKis:
+        env = "practice"
+
+    provider = KISMarketcapTopProvider(kis=FakeKis())
+    kospi = provider._build_params("KOSPI", 100)
+    kosdaq = provider._build_params("KOSDAQ", 100)
+    assert kospi["FID_COND_MRKT_DIV_CODE"] == "J"
+    assert kosdaq["FID_COND_MRKT_DIV_CODE"] == "J"
+    assert kospi["FID_INPUT_ISCD"] == "0001"
+    assert kosdaq["FID_INPUT_ISCD"] == "1001"
 
 
 def test_balance_fail_soft_engine_does_not_requery_kis(monkeypatch):
