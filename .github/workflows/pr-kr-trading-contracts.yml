@@ -70,6 +70,14 @@ jobs:
       - name: Check KR prep undefined names
         run: ruff check trader/prep_runner.py --select F821
 
+      - name: Sep 7 incident and provider resilience
+        run: |
+          pytest tests/kr/test_kr_20260907_runtime_recovery.py -q
+          pytest tests/test_kr_20260907_aux_resilience.py -q
+          pytest tests/test_kr_20260629_regressions.py -q
+          pytest tests/test_intraday_price_provider.py -q
+          pytest trader/tests/test_flow_provider_stability.py -q
+
       - name: KR contract tests
         run: |
           pytest tests/test_kr_final30_contract.py -q
