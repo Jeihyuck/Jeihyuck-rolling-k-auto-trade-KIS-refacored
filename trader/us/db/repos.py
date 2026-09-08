@@ -20,6 +20,7 @@ from datetime import date, datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 from trader.us.utils.order_no import normalize_us_order_no
+from trader.us.db.fill_accounting_utils import qty_from_accounting_rows
 
 logger = logging.getLogger(__name__)
 
@@ -2327,30 +2328,6 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
     if not td or not on:
         return {"status": "FILL_ACCOUNTING_IDENTITY_REQUIRED", "retry_order": False, "entry_fence": True}
 
-    def _qty_from_rows(rows: list[dict]) -> tuple[int, int, int]:
-        execution_qty = 0
-        cumulative_qty = 0
-        synthetic_qty = 0
-        for fill in rows:
-            meta = fill.get("meta") if isinstance(fill.get("meta"), dict) else _parse_json_meta(fill.get("meta"))
-            if meta.get("accounting_active") is False:
-                continue
-            qty = int(fill.get("qty") or 0)
-            evidence = str(meta.get("fill_evidence_type") or fill.get("fill_evidence_type") or "")
-            if is_synthetic_fill_meta(meta):
-                synthetic_qty = max(synthetic_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
-            elif _is_kis_execution_evidence(evidence):
-                execution_qty += qty
-            elif _is_kis_order_cumulative_evidence(evidence):
-                cumulative_qty = max(cumulative_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
-            else:
-                cumulative_qty = max(cumulative_qty, int(meta.get("cumulative_filled_qty") or qty or 0))
-        if execution_qty > 0:
-            return execution_qty, 0, execution_qty
-        if cumulative_qty > 0:
-            return cumulative_qty, 0, cumulative_qty
-        return 0, synthetic_qty, synthetic_qty
-
     engine = _get_engine_or_none()
     if engine is None:
         orders = [o for o in _MEM_ORDERS if str(o.get("trade_date") or "") == td and str(o.get("order_no") or "") == on]
@@ -2358,7 +2335,7 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
             return {"status": "ORDER_NOT_FOUND", "retry_order": False, "entry_fence": True}
         order_qty = int(orders[-1].get("qty_filled") or 0)
         rows = [f for f in _MEM_FILLS if str(f.get("trade_date") or "") == td and str(f.get("order_no") or "") == on]
-        actual_qty, synthetic_qty, total = _qty_from_rows(rows)
+        actual_qty, synthetic_qty, total = qty_from_accounting_rows(rows)
     else:
         with engine.begin() as conn:
             row = conn.execute(text("SELECT qty_filled FROM us_orders WHERE trade_date=:td AND order_no=:on"), {"td": td, "on": on}).first()
@@ -2367,7 +2344,7 @@ def verify_order_fill_accounting(*, trade_date: str, order_no: str) -> dict:
             order_qty = int(row[0] if not isinstance(row, dict) else row.get("qty_filled") or 0)
             rows = [dict(r) for r in conn.execute(text("""SELECT qty, meta FROM us_fills WHERE trade_date=:td AND order_no=:on
                 AND COALESCE((meta->>'accounting_active')::boolean,true)"""), {"td": td, "on": on}).mappings().all()]
-            actual_qty, synthetic_qty, total = _qty_from_rows(rows)
+            actual_qty, synthetic_qty, total = qty_from_accounting_rows(rows)
     if order_qty != total:
         return {"status": "FILL_ACCOUNTING_INVARIANT_FAILED", "retry_order": False, "entry_fence": True,
                 "report_consistency": "FAILED", "order_qty_filled": order_qty, "active_fill_qty": total,

@@ -83,6 +83,7 @@ from trader.runtime_paths import build_final30_scored_paths, get_final30_artifac
 from trader.path_contract import read_final30_file_rows, write_final30_mirrors, verify_final30_mirrors
 from trader.utils.json_sanitize import to_jsonable
 from trader.universe.build import build_universe
+from trader.prep_status_utils import resolve_prep_final_status as resolve_prep_final_status_impl
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +178,7 @@ def _run_prep_aux_with_timeout(
         executor.shutdown(wait=False, cancel_futures=True)
 
 def _resolve_prep_final_status(*, prep_core: dict[str, Any], aux_failures: list[dict[str, Any]]) -> tuple[str, int]:
-    if int((prep_core or {}).get("core_ok") or 0) and not aux_failures:
-        return "OK", 0
-    if int((prep_core or {}).get("core_ok") or 0) and aux_failures:
-        return "OK_CORE_AUX_DEGRADED", 0
-    if "quality_not_ok" in list((prep_core or {}).get("reasons") or []):
-        return "FAIL_CORE_QUALITY", 2
-    return "FAIL_CORE_CONTRACT", 2
+    return resolve_prep_final_status_impl(prep_core=prep_core, aux_failures=aux_failures)
 
 def compute_prep_core_status(
     *,

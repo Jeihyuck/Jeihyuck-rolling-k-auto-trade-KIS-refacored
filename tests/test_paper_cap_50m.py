@@ -201,3 +201,33 @@ def test_real_env_no_cap(monkeypatch):
     # real 환경: clamp 없음 → usable = 100M * 0.90 = 90M
     assert entry_cap == 90_000_000
     assert meta["clamp"] == {}
+
+
+def test_entry_capital_helper_matches_pb1engine_wrapper(monkeypatch):
+    monkeypatch.setenv("PAPER_MAX_CAPITAL_KRW", "50000000")
+    monkeypatch.setenv("CAP_CAP", "0")
+
+    import trader.config as cfg
+    importlib.reload(cfg)
+    import trader.pb1_engine as eng
+    importlib.reload(eng)
+    from trader.kr.pb1.entry_capital import resolve_entry_capital
+
+    fake_engine = _FakeEngine(env="practice", intended_live=False)
+    helper_result = resolve_entry_capital(
+        env=fake_engine.env,
+        intended_live=fake_engine.intended_live,
+        base_cash_krw=100_000_000,
+        override_capital=None,
+        reserve_pct=0.10,
+        paper_max_capital_krw=cfg.PAPER_MAX_CAPITAL_KRW,
+        cap_cap=cfg.CAP_CAP,
+    )
+    wrapper_result = eng.PB1Engine._resolve_entry_capital(
+        fake_engine,
+        base_cash_krw=100_000_000,
+        override_capital=None,
+        reserve_pct=0.10,
+    )
+
+    assert helper_result == wrapper_result

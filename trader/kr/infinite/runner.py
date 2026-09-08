@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import Callable
 
 from trader.kis_wrapper import KisAPI
+from trader.kr.calendar import resolve_kr_trade_date
 
 from .accounting import apply_confirmed_fill
 from .config import InfiniteConfig
@@ -22,7 +23,7 @@ from .reconciliation import reconcile_order_fill_prices
 from .repository import InfiniteRepository
 from .regime_adapter import load_canonical_snapshot
 from .risk_adapter import allows_new_cycle
-from .strategy import evaluate, trading_days_since
+from .strategy import KR_ADAPTIVE_TP_MAP, evaluate, trading_days_since
 
 logger = logging.getLogger(__name__)
 _LAST_GOOD_BALANCE: tuple[dict, datetime] | None = None
@@ -136,7 +137,35 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
             repository.save_state(state)
             return RunResult(Decision(Action.WAIT, reconcile_reason), state)
 
-        market_state, quality = regime_provider()
+        raw_market_state, quality = regime_provider()
+        market_state = raw_market_state
+        decision_allow_entry = bool(allow_entry)
+
+        # Persist the last verified regime for exit continuity only. Missing
+        # regime data can never authorize BUY/RECOVERY, but it must not make a
+        # profitable existing Infinite position unmanageable because PB1 died.
+        if state is not None and raw_market_state in KR_ADAPTIVE_TP_MAP:
+            state = replace(
+                state,
+                metadata={
+                    **(state.metadata or {}),
+                    "last_market_state": raw_market_state,
+                    "last_market_state_trade_date": day.isoformat(),
+                    "last_market_state_quality": quality,
+                },
+            )
+        elif position.qty > 0:
+            last_market_state = str(
+                ((state.metadata if state else {}) or {}).get("last_market_state") or ""
+            ).upper()
+            if last_market_state in KR_ADAPTIVE_TP_MAP:
+                logger.warning(
+                    "[KR_INF][REGIME][EXIT_ONLY_FALLBACK] raw=%s last=%s quality=%s action=disable_entry",
+                    raw_market_state, last_market_state, quality,
+                )
+                market_state = last_market_state
+                decision_allow_entry = False
+
         if state is not None:
             age = trading_days_since(state.cycle_start_date, day)
             crash_seen = state.crash_seen or market_state == "KR_DEFENSE_CRASH"
@@ -151,7 +180,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         pending_buy = any(item.side in {"BUY", "RECOVERY"} for item in pending)
         pending_sell = any(item.side in {"SELL_PARTIAL", "SELL_ALL"} for item in pending)
 
-        if allow_entry and position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
+        if decision_allow_entry and position.qty == 0 and not pending_buy and allows_new_cycle(market_state):
             same_day = state is not None and state.last_exit_date == day and not config.same_day_restart
             if not same_day and (state is None or state.status in {Status.READY, Status.COMPLETE}):
                 state = _new_cycle(state, executor, config, day)
@@ -161,7 +190,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
         # avoids a second KIS transaction endpoint call (EGW00215) on the hot
         # sell/reconcile path; cash is fetched only for a possible new cycle.
         cash = (executor.orderable_cash(config.symbol, position.current_price)
-                if allow_entry and position.qty == 0 else 0.0)
+                if decision_allow_entry and position.qty == 0 else 0.0)
         now_kst = now_kst_value or datetime.now(ZoneInfo("Asia/Seoul"))
         if now_kst.tzinfo is None:
             now_kst = now_kst.replace(tzinfo=ZoneInfo("Asia/Seoul"))
@@ -171,7 +200,7 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                             pending_sell=pending_sell, existing_intent_keys=existing_keys,
                             regime_data_quality=quality,
                             trading_days_since_last_buy=trading_days_since(state.last_buy_date if state else None, day),
-                            allow_entry=allow_entry,
+                            allow_entry=decision_allow_entry,
                             best_ask=position.current_price,
                             minutes_since_open=minutes_since_open)
         if decision.metadata and state is not None:
@@ -255,20 +284,24 @@ def main() -> int:
 
 
 def run_canonical_session(*, session: str, env: str, allow_entry: bool = True) -> RunResult:
-    """Auxiliary-sleeve hook called by the existing KR session owner."""
+    """Run one standalone Infinite tick with its own KIS/DB dependencies."""
     effective_allow_entry = bool(allow_entry and session in {"am", "afternoon"})
-    logger.info("[KR_INFINITE][SESSION_HOOK] session=%s env=%s allow_entry=%s",
-                session, env, int(effective_allow_entry))
+    now_kst = datetime.now(ZoneInfo("Asia/Seoul"))
+    trade_date = resolve_kr_trade_date(now_kst)
+    os.environ["KR_TRADE_DATE"] = trade_date.isoformat()
+    logger.info("[KR_INFINITE][SESSION_TICK] session=%s env=%s trade_date=%s allow_entry=%s",
+                session, env, trade_date, int(effective_allow_entry))
     return run_once(config=InfiniteConfig.from_env(), kis=KisAPI(kis_env=env),
-                    repository=InfiniteRepository(), kis_env=env, allow_entry=effective_allow_entry)
+                    repository=InfiniteRepository(), kis_env=env, trade_date=trade_date,
+                    allow_entry=effective_allow_entry, now_kst_value=now_kst)
 
 
 def run_kr_infinite_sleeve_tick(*, kis, balance_snapshot: dict, env: str,
                                 trade_date: date, allow_entry: bool) -> RunResult:
-    """Run the isolated 122630 sleeve from its owning PB1 tick.
+    """Compatibility adapter for callers that already hold a balance snapshot.
 
-    The authoritative balance obtained by PB1 is injected, so the sleeve never
-    performs a second balance request in the same tick.
+    Production session orchestration is owned by the independent Infinite
+    session runner and is never called from PB1.
     """
     return run_once(config=InfiniteConfig.from_env(), kis=kis, repository=InfiniteRepository(),
                     kis_env=env, trade_date=trade_date, allow_entry=allow_entry,

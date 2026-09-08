@@ -25,6 +25,7 @@ from typing import Any
 
 from trader.us import config as us_cfg
 from trader.us.execution.risk_gate import RiskGateBlocked, assert_order_allowed, assert_tqqq_infinite_order_allowed
+from trader.us.execution.exchange_utils import lookup_nested_exchange, normalize_exchange_code
 from trader.us.runner.status_contract import is_no_balance_sell_reject
 from trader.us.market_state_overlay import FORBIDDEN_HEDGE_SYMBOLS
 from trader.us.db.repos import (  # test patch surface
@@ -420,28 +421,11 @@ def _get_broker_position(kis_client: Any, symbol: str) -> dict | None:
 
 
 def _normalize_exchange_code(exchange: str) -> str:
-    ex = str(exchange or "").upper().strip()
-    aliases = {
-        "NAS": "NASDAQ",
-        "NASD": "NASDAQ",
-        "NASDAQ": "NASDAQ",
-        "NYS": "NYSE",
-        "NYSE": "NYSE",
-        "AMS": "AMEX",
-        "AMEX": "AMEX",
-        "ASE": "AMEX",
-    }
-    return aliases.get(ex, ex)
+    return normalize_exchange_code(exchange)
 
 
 def _lookup_nested_exchange(obj: Any) -> str:
-    if not isinstance(obj, dict):
-        return ""
-    for key in ("exchange", "exch", "market", "ovrs_excg_cd", "tr_mket_name"):
-        val = _normalize_exchange_code(obj.get(key))
-        if val:
-            return val
-    return ""
+    return lookup_nested_exchange(obj)
 
 
 def enrich_sell_exchange(intent: dict, kis_client: Any = None, context: Any = None) -> str:

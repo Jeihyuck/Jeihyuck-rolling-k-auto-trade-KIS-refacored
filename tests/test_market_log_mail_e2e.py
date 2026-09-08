@@ -6,7 +6,7 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-DATE = "2099-01-02"
+DATE = "2026-05-26"
 
 
 def fixture_repo(tmp_path: Path, market: str, *, smtp_mode: str = "dry", trade_date: str = DATE) -> Path:
@@ -88,20 +88,20 @@ def test_kr_end_to_end_uses_canonical_paths_and_dry_run_isolated(tmp_path):
 def test_kr_mail_accepts_previous_business_day_final30(tmp_path):
     root=fixture_repo(tmp_path,"kr")
     shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
-    previous=root/"bot_state/trader_ledger/final30/practice/2099-01-01"
+    previous=root/"bot_state/trader_ledger/final30/practice/2026-05-22"
     previous.mkdir(parents=True)
-    (previous/"final30_scored.json").write_text('{"as_of":"2099-01-01","rows":[]}')
+    (previous/"final30_scored.json").write_text('{"as_of":"2026-05-22","rows":[]}')
     result,archive=run_mail(root,"kr")
     assert result.returncode == 0, result.stderr+result.stdout
     assert "[LOG_MAIL][DRY_RUN]" in result.stdout
     with tarfile.open(archive,"r:gz") as tf:
-        assert any("final30/practice/2099-01-01/final30_scored.json" in name for name in tf.getnames())
+        assert any("final30/practice/2026-05-22/final30_scored.json" in name for name in tf.getnames())
 
 
 def test_kr_mail_accepts_runtime_watchlist_final30_without_ledger(tmp_path):
     root=fixture_repo(tmp_path,"kr")
     shutil.rmtree(root/f"bot_state/trader_ledger/final30/practice/{DATE}")
-    (root/f"runtime/kr/watchlist/{DATE}/final30_scored.json").write_text('{"as_of":"2099-01-01","rows":[]}')
+    (root/f"runtime/kr/watchlist/{DATE}/final30_scored.json").write_text('{"as_of":"2026-05-22","rows":[]}')
     result,_=run_mail(root,"kr")
     assert result.returncode == 0, result.stderr+result.stdout
     assert "[LOG_MAIL][DRY_RUN]" in result.stdout
@@ -167,7 +167,7 @@ def test_kr_mail_failure_reports_searched_paths(tmp_path):
     searched=marker["searched_paths"]
     assert f"bot_state/trader_ledger/final30/practice/{DATE}" in searched
     assert f"runtime/kr/watchlist/{DATE}/final30_scored.json" in searched
-    assert "bot_state/trader_ledger/final30/practice/2099-01-01" in searched
+    assert "bot_state/trader_ledger/final30/practice/2026-05-22" in searched
     assert "searched_paths=" in result.stderr
 
 

@@ -46,3 +46,39 @@ def test_kr_zero_orderable_qty_never_sells():
                         trade_date=date(2026, 8, 20), market_state="KR_NORMAL")
     assert decision.action == Action.WAIT
     assert decision.reason == "KR_INF_PROFIT_NO_ORDERABLE_QTY"
+
+
+def test_profitable_holding_uses_existing_10pct_fallback_when_regime_missing():
+    from trader.kr.infinite.config import InfiniteConfig
+    from trader.kr.infinite.models import Action, BrokerPosition
+    from trader.kr.infinite.strategy import evaluate
+
+    decision = evaluate(
+        config=InfiniteConfig(),
+        state=_state(),
+        position=BrokerPosition(10, 10, 100, 115),
+        trade_date=date(2026, 9, 7),
+        market_state=None,
+    )
+    assert decision.action == Action.SELL_ALL
+    assert decision.reason == "TAKE_PROFIT_REGIME_UNAVAILABLE_FALLBACK"
+    assert decision.qty == 10
+    assert decision.metadata["fallback_10pct_used"] == 1
+
+
+def test_missing_regime_never_authorizes_a_buy():
+    from trader.kr.infinite.config import InfiniteConfig
+    from trader.kr.infinite.models import Action, BrokerPosition
+    from trader.kr.infinite.strategy import evaluate
+
+    decision = evaluate(
+        config=InfiniteConfig(),
+        state=_state(),
+        position=BrokerPosition(10, 10, 100, 95),
+        trade_date=date(2026, 9, 7),
+        market_state=None,
+        allow_entry=True,
+    )
+    assert decision.action in {Action.BLOCK, Action.WAIT}
+    assert decision.action != Action.BUY
+    assert decision.action != Action.RECOVERY

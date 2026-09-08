@@ -12,6 +12,27 @@ from trader.window_router import WindowDecision
 from trader.execution_state import exit_stage_for_reason
 from trader.kr.pb1_stability import normalize_sell_reason_family
 
+KST_NOW = datetime(2026, 8, 6, 13, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+
+
+@pytest.fixture(autouse=True)
+def _fixed_today_orders(monkeypatch):
+    monkeypatch.setattr("trader.db.repos.now_kst", lambda: KST_NOW)
+    original = OrdersRepo.create_intent_idempotent
+
+    def wrapped(self, *args, **kwargs):
+        order_id, created = original(self, *args, **kwargs)
+        if created:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    sa.update(self._schema.orders)
+                    .where(self._schema.orders.c.order_id == order_id)
+                    .values(created_at=KST_NOW)
+                )
+        return order_id, created
+
+    monkeypatch.setattr(OrdersRepo, "create_intent_idempotent", wrapped)
+
 
 class FakeKis:
     def __init__(self) -> None:

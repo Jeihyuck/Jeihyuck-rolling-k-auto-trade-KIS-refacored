@@ -22,6 +22,8 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from trader.us.runner.daily_report_utils import fill_is_synthetic, positive_float
+
 logger = logging.getLogger(__name__)
 
 _CONSISTENCY_SEVERITY = {"OK": 0, "DEGRADED_DB_FALLBACK_TO_KIS": 1, "SOURCE_MISMATCH": 2,
@@ -33,19 +35,10 @@ def worsen_consistency(current: str, new: str) -> str:
 
 
 def _fill_is_synthetic(fill: dict) -> bool:
-    meta = fill.get("meta") or {}
-    if isinstance(meta, str):
-        try: meta = json.loads(meta)
-        except Exception: meta = {}
-    return bool(meta.get("is_synthetic") or meta.get("synthetic") or meta.get("synthetic_fill")
-                or meta.get("fill_evidence_type") in {"BALANCE_DELTA_SYNTHETIC", "LEGACY_SYNTHETIC"})
+    return fill_is_synthetic(fill)
 
 def _positive_float(value: object) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number > 0 else None
+    return positive_float(value)
 
 
 def _order_lifecycle_truth(status: str, timeline: dict) -> dict[str, bool]:

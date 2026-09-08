@@ -47,6 +47,17 @@ from trader.rate_limit import get_kis_gate
 from trader.cache_ttl import price_cache, PRICE_SNAPSHOT_TTL_SEC
 from trader.eventlog import emit_event
 from trader.kr_price_utils import krx_tick, normalize_kr_order_price
+from trader.kis_http_policy import (
+    endpoint_name as endpoint_name_impl,
+    endpoint_path as endpoint_path_impl,
+    is_data_endpoint as is_data_endpoint_impl,
+    is_order_endpoint as is_order_endpoint_impl,
+    is_trading_endpoint as is_trading_endpoint_impl,
+    kis_data_http_allowed_in_diag as kis_data_http_allowed_in_diag_impl,
+    kis_explicit_offline_mode as kis_explicit_offline_mode_impl,
+    kis_http_allowed as kis_http_allowed_impl,
+    resolve_kis_http_caller_route as resolve_kis_http_caller_route_impl,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,94 +117,35 @@ def kis_http_enabled() -> bool:
 
 
 def _endpoint_path(endpoint: str) -> str:
-    parsed = urlparse(str(endpoint or ""))
-    return (parsed.path or str(endpoint or "")).lower()
+    return endpoint_path_impl(endpoint)
 
 
 def _endpoint_name(endpoint: str) -> str:
-    path = _endpoint_path(endpoint).rstrip("/")
-    if not path:
-        return "unknown"
-    return path.split("/")[-1] or "unknown"
+    return endpoint_name_impl(endpoint)
 
 
 def is_order_endpoint(endpoint: str) -> bool:
-    path = _endpoint_path(endpoint)
-    return any(
-        token in path
-        for token in (
-            "/trading/order-cash",
-            "/trading/order-rvsecncl",
-            "/trading/order-resv",
-            "/order-cash",
-            "/order-rvsecncl",
-            "/order/",
-        )
-    )
+    return is_order_endpoint_impl(endpoint)
 
 
 def is_data_endpoint(endpoint: str) -> bool:
-    path = _endpoint_path(endpoint)
-    if "/oauth2/token" in path:
-        return True
-    return any(
-        token in path
-        for token in (
-            "/quotations/",
-            "inquire-price",
-            "inquire-daily-itemchartprice",
-            "inquire-asking-price-exp-ccn",
-            "inquire-investor",
-            "program-trade",
-            "market-cap",
-            "search-stock-info",
-            "inquire-daily-ccld",
-            "inquire-balance",
-            "inquire-psbl-order",
-        )
-    )
+    return is_data_endpoint_impl(endpoint)
 
 
 def _resolve_kis_http_caller_route(default: str = "live") -> str:
-    raw = (os.getenv("KIS_HTTP_CALLER_ROUTE") or "").strip().lower()
-    if raw:
-        return raw
-    mode = (os.getenv("MODE") or "").strip().lower()
-    strategy_mode = (os.getenv("STRATEGY_MODE") or "").strip().upper()
-    if mode == "prep":
-        return "prep"
-    if strategy_mode == "DIAG" and (
-        os.getenv("PB1_DIAG_FULL_EXEC", "0").strip() == "1"
-        or os.getenv("FORCE_RUN", "0").strip() == "1"
-        or os.getenv("WATCHLIST_MODE", "0").strip() == "1"
-    ):
-        return "manual_test"
-    return default
+    return resolve_kis_http_caller_route_impl(default=default, env=os.environ)
 
 
 def kis_http_allowed(endpoint: str, strategy_mode: str, allow_data_http_in_diag: bool, caller_route: str | None = None) -> bool:
-    normalized_mode = str(strategy_mode or "").strip().upper()
-    route = (caller_route or _resolve_kis_http_caller_route(default="live")).strip().lower() or "live"
-    if normalized_mode == "DIAG":
-        if is_order_endpoint(endpoint):
-            return False
-        if is_data_endpoint(endpoint):
-            if route == "smoke":
-                return False
-            return bool(allow_data_http_in_diag)
-    return True
+    return kis_http_allowed_impl(endpoint, strategy_mode, allow_data_http_in_diag, caller_route, env=os.environ)
 
 
 def is_trading_endpoint(url: str) -> bool:
-    return is_order_endpoint(url)
+    return is_order_endpoint_impl(url)
 
 
 def kis_explicit_offline_mode() -> bool:
-    if os.getenv("KIS_EXPLICIT_OFFLINE", "0").strip() == "1":
-        return True
-    if (os.getenv("DIAG_KIS_CALLS_ENABLED") or "").strip() == "0":
-        return True
-    return False
+    return kis_explicit_offline_mode_impl(env=os.environ)
 
 
 def kis_data_http_allowed_in_diag() -> bool:
@@ -201,7 +153,7 @@ def kis_data_http_allowed_in_diag() -> bool:
     DIAG 모드에서 KIS 데이터 HTTP 허용 여부.
     ALLOW_KIS_DATA_HTTP_IN_DIAG=1이면 데이터 조회 허용.
     """
-    return os.getenv("ALLOW_KIS_DATA_HTTP_IN_DIAG", "0").strip() == "1"
+    return kis_data_http_allowed_in_diag_impl(env=os.environ)
 
 
 # ✅ Export public exceptions
