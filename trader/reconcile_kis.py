@@ -370,9 +370,9 @@ def _restore_entry_meta_for_promoted_positions(
             rows = _conn.execute(
                 _sa.text(
                     "SELECT code, position_meta, entry_meta_json, position_cycle_id, portfolio_epoch_id, position_origin FROM positions "
-                    "WHERE env = :env AND status = 'OPEN' AND qty > 0"
+                    "WHERE env = :env AND strategy = :strategy AND status = 'OPEN' AND qty > 0"
                 ),
-                {"env": env},
+                {"env": env, "strategy": strategy},
             ).fetchall()
     except Exception as exc:
         logger.warning("[RECONCILE][META_RESTORE][ERROR] step=load_positions err=%s", exc)
@@ -402,14 +402,18 @@ def _restore_entry_meta_for_promoted_positions(
                 existing_entry_meta = {}
         existing_entry_meta = existing_entry_meta or {}
 
-        # 이미 book/trade_horizon이 있으면 스킵
-        if existing_entry_meta.get("book") or existing_entry_meta.get("trade_horizon"):
-            continue
-
         # Imported/recovery cycles intentionally have no historical policy
         # provenance.  Never attach symbol-level legacy order/ledger metadata.
         if position_origin in {"IMPORTED", "RECOVERY"}:
             continue
+
+        # A SYSTEM position can already contain same-lifecycle entry metadata
+        # from an earlier reconcile/fill.  Do not skip it merely because
+        # book/horizon exists: older code may have restored JSON metadata while
+        # leaving top-level POLICY_MISSING sentinels behind.
+        entry_meta_from_position = None
+        if existing_entry_meta.get("book") or existing_entry_meta.get("trade_horizon"):
+            entry_meta_from_position = existing_entry_meta
 
         # 1. 동일 cycle/epoch의 orders.entry_meta_json만 조회
         entry_meta_from_order = None
@@ -419,12 +423,12 @@ def _restore_entry_meta_for_promoted_positions(
                 order_row = _conn.execute(
                     _sa.text(
                         "SELECT entry_meta_json FROM orders "
-                        "WHERE env = :env AND code = :code AND side = 'BUY' "
+                        "WHERE env = :env AND strategy = :strategy AND code = :code AND side = 'BUY' "
                         "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
                         "AND entry_meta_json IS NOT NULL "
                         "ORDER BY created_at DESC LIMIT 1"
                     ),
-                    {"env": env, "code": code, "cycle_id": position_cycle_id, "epoch_id": portfolio_epoch_id},
+                    {"env": env, "strategy": strategy, "code": code, "cycle_id": position_cycle_id, "epoch_id": portfolio_epoch_id},
                 ).fetchone()
             if order_row:
                 raw = order_row[0]
@@ -444,7 +448,7 @@ def _restore_entry_meta_for_promoted_positions(
         # ownership; they are diagnostic only, never a restoration source.
         entry_meta_from_ledger = None
 
-        resolved_meta = entry_meta_from_order or entry_meta_from_ledger
+        resolved_meta = entry_meta_from_position or entry_meta_from_order or entry_meta_from_ledger
         if not resolved_meta:
             logger.warning(
                 "[RECONCILE][META_RESTORE][POLICY_MISSING] code=%s action=keep_policy_missing_no_swing_safe_fallback",
@@ -458,9 +462,17 @@ def _restore_entry_meta_for_promoted_positions(
                             "UPDATE positions SET entry_thesis = COALESCE(entry_thesis, 'POLICY_MISSING'), "
                             "exit_policy_family = COALESCE(exit_policy_family, 'POLICY_MISSING'), "
                             "force_eod_close = FALSE, policy_source = COALESCE(policy_source, 'missing') "
-                            "WHERE env = :env AND code = :code AND status = 'OPEN' AND qty > 0"
+                            "WHERE env = :env AND strategy = :strategy AND code = :code "
+                            "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
+                            "AND status = 'OPEN' AND qty > 0"
                         ),
-                        {"env": env, "code": code},
+                        {
+                            "env": env,
+                            "strategy": strategy,
+                            "code": code,
+                            "cycle_id": position_cycle_id,
+                            "epoch_id": portfolio_epoch_id,
+                        },
                     )
             except Exception as exc:
                 logger.warning("[RECONCILE][META_RESTORE][POLICY_MISSING_UPDATE_FAIL] code=%s err=%s", code, exc)
@@ -475,19 +487,65 @@ def _restore_entry_meta_for_promoted_positions(
             }
             if resolved_meta.get("exit_policy_family"):
                 update_payload["exit_policy_family"] = resolved_meta["exit_policy_family"]
-            source = resolved_meta.get("meta_source", "order_meta")
+            source = resolved_meta.get("meta_source") or (
+                "position_entry_meta" if entry_meta_from_position is not None else "order_meta"
+            )
             update_payload["meta_source"] = source
+
+            # Same-cycle/epoch BUY metadata is authoritative enough to clear a
+            # stale POLICY_MISSING sentinel.  Keep the two horizon vocabularies
+            # explicit: entry_meta uses DAY_PROTECT/SWING_CARRY/CORE_CARRY,
+            # while the EntryExitPlan top-level contract uses DAY_TRADE/SWING/CORE.
+            recovered_horizon_raw = str(resolved_meta.get("trade_horizon") or "").strip().upper()
+            recovered_horizon = {
+                "DAY_PROTECT": "DAY_TRADE",
+                "SWING_CARRY": "SWING",
+                "CORE_CARRY": "CORE",
+            }.get(recovered_horizon_raw, recovered_horizon_raw or None)
+            recovered_exit_family = str(resolved_meta.get("exit_policy_family") or "").strip() or None
+            recovered_policy_source = str(resolved_meta.get("policy_source") or "").strip() or "recovered_order_meta"
+
             with engine.begin() as _conn:
                 _conn.execute(
                     _sa.text(
-                        "UPDATE positions SET position_meta = :meta, entry_meta_json = :emeta "
-                        "WHERE env = :env AND code = :code AND status = 'OPEN'"
+                        "UPDATE positions SET "
+                        "position_meta = :meta, entry_meta_json = :emeta, "
+                        "entry_thesis = CASE "
+                        "  WHEN :entry_thesis IS NOT NULL THEN :entry_thesis "
+                        "  WHEN entry_thesis = 'POLICY_MISSING' THEN NULL "
+                        "  ELSE entry_thesis END, "
+                        "trade_horizon = COALESCE(:trade_horizon, trade_horizon), "
+                        "exit_policy_family = CASE "
+                        "  WHEN :exit_policy_family IS NOT NULL THEN :exit_policy_family "
+                        "  WHEN exit_policy_family = 'POLICY_MISSING' THEN NULL "
+                        "  ELSE exit_policy_family END, "
+                        "eod_action = COALESCE(:eod_action, eod_action), "
+                        "force_eod_close = COALESCE(:force_eod_close, force_eod_close), "
+                        "policy_source = :policy_source, "
+                        "policy_version = COALESCE(:policy_version, policy_version), "
+                        "entry_reason = COALESCE(:entry_reason, entry_reason), "
+                        "entry_style_selected = COALESCE(:entry_style_selected, entry_style_selected) "
+                        "WHERE env = :env AND strategy = :strategy AND code = :code "
+                        "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
+                        "AND status = 'OPEN'"
                     ),
                     {
                         "meta": _json.dumps(update_payload),
                         "emeta": _json.dumps(resolved_meta),
+                        "entry_thesis": resolved_meta.get("entry_thesis"),
+                        "trade_horizon": recovered_horizon,
+                        "exit_policy_family": recovered_exit_family,
+                        "eod_action": resolved_meta.get("eod_action"),
+                        "force_eod_close": resolved_meta.get("force_eod_close"),
+                        "policy_source": recovered_policy_source,
+                        "policy_version": resolved_meta.get("policy_version"),
+                        "entry_reason": resolved_meta.get("entry_reason"),
+                        "entry_style_selected": resolved_meta.get("entry_style_selected"),
                         "env": env,
+                        "strategy": strategy,
                         "code": code,
+                        "cycle_id": position_cycle_id,
+                        "epoch_id": portfolio_epoch_id,
                     },
                 )
             restored_count += 1

@@ -20,6 +20,7 @@ from trader.pb1_engine import (
     _classify_trade_horizon,
     _horizon_to_exit_family,
     _resolve_position_horizon,
+    _resolve_position_book,
     _calculate_exit_qty,
 )
 
@@ -191,3 +192,16 @@ class TestCalculateExitQty:
         # holding=100, orderable=5, 100% -> capped at 5
         qty = _calculate_exit_qty(100, 5, 1.0)
         assert qty == 5
+
+
+def test_explicit_policy_missing_never_falls_back_to_swing_horizon_or_book():
+    pos = {
+        "entry_thesis": "POLICY_MISSING",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+        "policy_source": "missing",
+        "position_meta": {},
+        "entry_meta_json": {},
+    }
+    assert _resolve_position_horizon(pos) == "POLICY_MISSING"
+    assert _resolve_position_book(pos) == "POLICY_MISSING"
+    assert _horizon_to_exit_family(_resolve_position_horizon(pos)) == "POLICY_MISSING"

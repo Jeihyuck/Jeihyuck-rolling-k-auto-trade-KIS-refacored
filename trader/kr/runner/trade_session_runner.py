@@ -468,21 +468,24 @@ def recover_temporary_balance(
     session: str, initial: dict[str, Any], *, probe=None, sleep_fn=None,
     now_fn=None, max_attempts: int | None = None,
 ) -> dict[str, Any] | None:
-    """Keep PM alive in fail-closed recovery until a fresh balance succeeds."""
-    if session != "afternoon" or str(initial.get("status") or "").upper() not in {"WARN", "SAFE_STOP"}:
+    """Keep PM/Close alive fail-closed until a fresh broker balance succeeds."""
+    if session not in {"afternoon", "close"} or str(initial.get("status") or "").upper() not in {"WARN", "SAFE_STOP"}:
         return initial
     probe = probe or (lambda: _assert_balance_available(session))
     sleep_fn = sleep_fn or time_mod.sleep
     now_fn = now_fn or _now_kst
     interval = max(1, int(os.getenv("KR_BALANCE_RECOVERY_INTERVAL_SEC", "60")))
-    max_attempts = max_attempts or max(1, int(os.getenv("KR_BALANCE_RECOVERY_MAX_ATTEMPTS", "120")))
+    if max_attempts is None:
+        default_attempts = "12" if session == "close" else "120"
+        env_key = "KR_CLOSE_BALANCE_RECOVERY_MAX_ATTEMPTS" if session == "close" else "KR_BALANCE_RECOVERY_MAX_ATTEMPTS"
+        max_attempts = max(1, int(os.getenv(env_key, default_attempts)))
     recovery = BalanceRecoveryState(retry_interval_seconds=interval)
     recovery.failed(now_fn())
     os.environ.update(ENTRY_ALLOWED="0", ORDER_ALLOWED="0", EXIT_ALLOWED="0",
                       KR_BALANCE_RECOVERY_ONLY="1")
     for attempt in range(1, max_attempts + 1):
-        logger.warning("[SESSION][BALANCE_RECOVERY] state=%s retry=%s next_retry=%s entry_allowed=0 new_order_allowed=0",
-                       recovery.state, attempt, recovery.next_retry_at)
+        logger.warning("[SESSION][BALANCE_RECOVERY] session=%s state=%s retry=%s next_retry=%s entry_allowed=0 new_order_allowed=0",
+                       session, recovery.state, attempt, recovery.next_retry_at)
         sleep_fn(interval)
         result = probe()
         if result is None:
@@ -722,7 +725,8 @@ def _run_pb1_session(session: str, env: str) -> dict[str, Any]:
         return guarded
     infinite_allow_entry = session in {"am", "afternoon"} and kr_entry_can_proceed
     balance_state = _stage(session, ctx.trade_date, ctx.expected_as_of, "balance_precheck", lambda: _assert_balance_available(session))
-    if balance_state is not None and session == "afternoon" and int(balance_state.get("exit_allowed", 0)) == 0:
+    if (balance_state is not None and session in {"afternoon", "close"}
+            and int(balance_state.get("exit_allowed", 0)) == 0):
         balance_state = recover_temporary_balance(session, balance_state)
     if balance_state is not None:
         if balance_state.get("status") == "WARN" and int(balance_state.get("exit_allowed", 0)) == 1:

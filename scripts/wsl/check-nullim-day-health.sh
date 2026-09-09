@@ -69,7 +69,25 @@ stale_removed=len(re.findall(r'\[LOCK\]\[STALE\]\[REMOVED\]|\[LOCK\]\[RELEASED\]
 lock_warnings=len(re.findall(r'\[LOCK\].*\[WARN\]', blob))
 active_same_session=len(re.findall(r'\[LOCK\]\[ACTIVE\]\[SAME_SESSION\]\[SKIP\]', blob))
 order_idempotency=len(re.findall(r'ORDER_(?:IDEMPOTENCY|SKIP_ALREADY_SUBMITTED)|ALREADY_SUBMITTED_THIS_SESSION', blob, re.I))
-result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'active_same_session_count':active_same_session, 'stale_lock_detected_count':stale_detected, 'stale_lock_removed_count':stale_removed, 'lock_warning_count':lock_warnings, 'order_idempotency_skips':order_idempotency, 'advisory_lock_unavailable_count':advisory_unavailable, 'advisory_lock_failure_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs]}
+kr_inf_stale_pending=len(re.findall(r'\[EXIT_STARVATION\]\[KR_INF_STALE_PENDING\]', blob))
+policy_missing_starvation=len(re.findall(r'\[EXIT_STARVATION\]\[POLICY_MISSING\]', blob))
+policy_authority_conflicts=len(re.findall(r'\[EXIT\]\[POLICY_AUTHORITY\]\[CONFLICT_BLOCKED\]', blob))
+accepted_sell_count=len(re.findall(r'\[TRADE\]\[ORDER\]\[SELL\].*result=ACCEPTED', blob, re.I))
+execution_truth_mismatch=0
+for log_path in logs:
+    try:
+        session_blob=log_path.read_text(encoding='utf-8', errors='ignore')[-200000:]
+    except Exception:
+        continue
+    if (re.search(r'\[TRADE\]\[ORDER\]\[SELL\].*result=ACCEPTED', session_blob, re.I)
+            and re.search(r'\[RUN_SUMMARY\]\[RESULT\].*orders_ack=0', session_blob, re.I)):
+        execution_truth_mismatch += 1
+result = {'market': market.upper(), 'date': day, 'trade_date': trade_date, 'automatic_scheduler_owner':'WINDOWS_TASK_SCHEDULER', 'scheduler_policy_status':policy_status, 'forbidden_wsl_scheduler_sources':forbidden, 'duplicate_session_skips':duplicate_skips, 'active_same_session_count':active_same_session, 'stale_lock_detected_count':stale_detected, 'stale_lock_removed_count':stale_removed, 'lock_warning_count':lock_warnings, 'order_idempotency_skips':order_idempotency, 'advisory_lock_unavailable_count':advisory_unavailable, 'advisory_lock_failure_count':advisory_unavailable, 'tick_count': ticks(blob), 'mail_ok': False, 'logs_checked': [str(p) for p in logs],
+          'kr_inf_stale_pending_count': kr_inf_stale_pending,
+          'policy_missing_exit_starvation_count': policy_missing_starvation,
+          'policy_authority_conflict_count': policy_authority_conflicts,
+          'accepted_sell_count': accepted_sell_count,
+          'execution_truth_mismatch_count': execution_truth_mismatch}
 if mail_marker.exists():
     try:
         marker=json.loads(mail_marker.read_text())
@@ -110,6 +128,18 @@ if not result['mail_ok']:
 if forbidden or advisory_unavailable:
     result['ok']=False
     result['failure_reason']='SCHEDULER_POLICY_VIOLATION' if forbidden else 'PB1_ADVISORY_LOCK_UNAVAILABLE'
+if market == 'kr' and kr_inf_stale_pending:
+    result['ok']=False
+    result['failure_reason']='KR_INF_EXIT_STARVATION'
+elif market == 'kr' and policy_authority_conflicts:
+    result['ok']=False
+    result['failure_reason']='KR_POLICY_AUTHORITY_CONFLICT'
+elif market == 'kr' and policy_missing_starvation:
+    result['ok']=False
+    result['failure_reason']='KR_POLICY_MISSING_EXIT_STARVATION'
+elif market == 'kr' and execution_truth_mismatch:
+    result['ok']=False
+    result['failure_reason']='KR_EXECUTION_TRUTH_MISMATCH'
 Path(out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 lines=[f"NULLIM {market.upper()} health {day}"]+[f"- {k}: {v}" for k,v in result.items() if k!='logs_checked']
 Path(summary).write_text('\n'.join(lines)+'\n', encoding='utf-8')
