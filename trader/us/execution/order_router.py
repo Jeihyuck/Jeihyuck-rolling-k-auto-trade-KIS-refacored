@@ -1225,6 +1225,25 @@ def route_order(
             if isinstance(intent.get("meta"), dict):
                 intent["meta"]["sell_qty_clamped"] = True
 
+    if side == "SELL" and broker_pos is not None:
+        # The broker snapshot immediately before submit is authoritative.
+        # Never infer pre-order holding from available_qty: for partial exits
+        # available_qty is the requested leg size, not the account holding.
+        intent.setdefault("meta", {})
+        intent["pre_order_holding_qty"] = int(broker_holding_qty)
+        intent["pre_order_position_qty"] = int(broker_holding_qty)
+        intent["pre_order_orderable_qty"] = int(broker_orderable_qty)
+        if isinstance(intent.get("meta"), dict):
+            intent["meta"].update({
+                "pre_order_holding_qty": int(broker_holding_qty),
+                "pre_order_position_qty": int(broker_holding_qty),
+                "pre_order_orderable_qty": int(broker_orderable_qty),
+                "requested_sell_qty": int(qty),
+                "expected_post_order_qty": max(0, int(broker_holding_qty) - int(qty)),
+                "post_order_expected_qty": max(0, int(broker_holding_qty) - int(qty)),
+                "pre_order_position_source": "kis_broker_balance_pre_submit",
+            })
+
     if side == "SELL":
         intent.setdefault("meta", {})
         if isinstance(intent.get("meta"), dict):
