@@ -992,6 +992,47 @@ class KisUSClient:
         )
         return self._post(tr["path"], headers=headers, body=body)
 
+    def cancel_us_order(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        order_no: str,
+    ) -> dict:
+        """Cancel the remaining quantity of one US paper order.
+
+        A successful POST is only a cancel acknowledgement.  Callers must
+        re-query broker order/fill state before treating the order as terminal.
+        """
+        self._assert_not_offline("cancel_us_order")
+        us_cfg.assert_us_paper_order_allowed()
+        if os.getenv("US_KIS_ORDER_ALLOWED") == "0":
+            raise RuntimeError(
+                "[US_KIS_ORDER_BLOCKED] US_KIS_ORDER_ALLOWED=0 — KIS cancel API disabled in signal-only mode"
+            )
+        raw_order_no = str(order_no or "").strip()
+        if not raw_order_no:
+            raise ValueError("cancel_us_order requires order_no")
+        tr = get_tr_info("us_order_cancel")
+        headers = self._build_headers(tr["tr_id"])
+        body = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "OVRS_EXCG_CD": get_order_exchange_code_for_api(exchange),
+            "PDNO": str(symbol or "").strip().upper(),
+            "ORGN_ODNO": raw_order_no,
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": "0",
+            "OVRS_ORD_UNPR": "0",
+            "MGCO_APTM_ODNO": "",
+            "ORD_SVR_DVSN_CD": "0",
+        }
+        logger.info(
+            "[US_ORDER][CANCEL_REQUEST_SAFE] symbol=%s exchange=%s order_no=%s tr_id=%s",
+            body["PDNO"], body["OVRS_EXCG_CD"], raw_order_no, tr["tr_id"],
+        )
+        return self._post(tr["path"], headers=headers, body=body)
+
     # ------------------------------------------------------------------
     # Fills
     # ------------------------------------------------------------------
