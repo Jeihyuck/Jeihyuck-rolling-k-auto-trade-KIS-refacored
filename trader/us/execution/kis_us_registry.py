@@ -64,6 +64,13 @@ TR_REGISTRY: dict[str, dict] = {
         "description": "해외주식 매도 주문 (모의)",
         "order_side": "SELL",
     },
+    # 해외주식 미국 정정/취소 주문 (모의투자)
+    "us_order_cancel": {
+        "tr_id": "VTTT1004U",
+        "path": "/uapi/overseas-stock/v1/trading/order-rvsecncl",
+        "method": "POST",
+        "description": "해외주식 미국 주문 취소 (모의)",
+    },
     # 해외주식 당일 체결 내역 (모의투자)
     "us_fills_today": {
         "tr_id": "VTTS3035R",
