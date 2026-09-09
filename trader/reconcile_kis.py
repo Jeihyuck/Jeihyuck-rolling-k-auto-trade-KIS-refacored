@@ -477,15 +477,54 @@ def _restore_entry_meta_for_promoted_positions(
                 update_payload["exit_policy_family"] = resolved_meta["exit_policy_family"]
             source = resolved_meta.get("meta_source", "order_meta")
             update_payload["meta_source"] = source
+
+            # Same-cycle/epoch BUY metadata is authoritative enough to clear a
+            # stale POLICY_MISSING sentinel.  Keep the two horizon vocabularies
+            # explicit: entry_meta uses DAY_PROTECT/SWING_CARRY/CORE_CARRY,
+            # while the EntryExitPlan top-level contract uses DAY_TRADE/SWING/CORE.
+            recovered_horizon_raw = str(resolved_meta.get("trade_horizon") or "").strip().upper()
+            recovered_horizon = {
+                "DAY_PROTECT": "DAY_TRADE",
+                "SWING_CARRY": "SWING",
+                "CORE_CARRY": "CORE",
+            }.get(recovered_horizon_raw, recovered_horizon_raw or None)
+            recovered_exit_family = str(resolved_meta.get("exit_policy_family") or "").strip() or None
+            recovered_policy_source = str(resolved_meta.get("policy_source") or "").strip() or "recovered_order_meta"
+
             with engine.begin() as _conn:
                 _conn.execute(
                     _sa.text(
-                        "UPDATE positions SET position_meta = :meta, entry_meta_json = :emeta "
+                        "UPDATE positions SET "
+                        "position_meta = :meta, entry_meta_json = :emeta, "
+                        "entry_thesis = CASE "
+                        "  WHEN :entry_thesis IS NOT NULL THEN :entry_thesis "
+                        "  WHEN entry_thesis = 'POLICY_MISSING' THEN NULL "
+                        "  ELSE entry_thesis END, "
+                        "trade_horizon = COALESCE(:trade_horizon, trade_horizon), "
+                        "exit_policy_family = CASE "
+                        "  WHEN :exit_policy_family IS NOT NULL THEN :exit_policy_family "
+                        "  WHEN exit_policy_family = 'POLICY_MISSING' THEN NULL "
+                        "  ELSE exit_policy_family END, "
+                        "eod_action = COALESCE(:eod_action, eod_action), "
+                        "force_eod_close = COALESCE(:force_eod_close, force_eod_close), "
+                        "policy_source = :policy_source, "
+                        "policy_version = COALESCE(:policy_version, policy_version), "
+                        "entry_reason = COALESCE(:entry_reason, entry_reason), "
+                        "entry_style_selected = COALESCE(:entry_style_selected, entry_style_selected) "
                         "WHERE env = :env AND code = :code AND status = 'OPEN'"
                     ),
                     {
                         "meta": _json.dumps(update_payload),
                         "emeta": _json.dumps(resolved_meta),
+                        "entry_thesis": resolved_meta.get("entry_thesis"),
+                        "trade_horizon": recovered_horizon,
+                        "exit_policy_family": recovered_exit_family,
+                        "eod_action": resolved_meta.get("eod_action"),
+                        "force_eod_close": resolved_meta.get("force_eod_close"),
+                        "policy_source": recovered_policy_source,
+                        "policy_version": resolved_meta.get("policy_version"),
+                        "entry_reason": resolved_meta.get("entry_reason"),
+                        "entry_style_selected": resolved_meta.get("entry_style_selected"),
                         "env": env,
                         "code": code,
                     },
