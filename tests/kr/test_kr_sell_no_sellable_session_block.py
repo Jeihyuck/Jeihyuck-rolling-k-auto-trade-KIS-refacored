@@ -640,3 +640,103 @@ def test_policy_missing_close_ignores_stale_day_force_exit_without_hard_stop(mon
     assert payload["submitted"] == 0
     assert kis.sell_calls == 0
     assert payload["decision_reason"] == "POLICY_MISSING_HARD_STOP_ONLY"
+
+
+def test_created_sell_intent_retries_with_new_key_and_fresh_baseline(monkeypatch) -> None:
+    """A pre-submit CREATED row must not starve a later protective SELL."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    balance = {"output1": [{"pdno": "003550", "hldg_qty": "11", "ord_psbl_qty": "11",
+                             "pchs_avg_pric": "111400"}], "output2": [{}]}
+    engine, kis = _make_engine(db, FakeKis(), balance)
+    code = "003550"
+    base_key = engine._client_order_key(code, 1, "SELL", "day", "exit")
+    engine.orders_repo.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code=code, market="J", side="SELL", ord_type="MARKET", qty=3,
+        limit_price=120000.0, stage="FULL_EXIT", client_order_key=base_key,
+        request_json={"pre_order_holding_qty": 99, "requested_qty": 3},
+        status="CREATED", position_cycle_id="cycle-retry-created",
+    )
+
+    pos = _pos(code=code, qty=11, kis_qty=11, orderable_qty=11)
+    pos.update(
+        avg_buy_price=111400.0, last_price=100000.0, stop_price=105000.0,
+        position_cycle_id="cycle-retry-created",
+        position_meta={"position_cycle_id": "cycle-retry-created"},
+    )
+    payload = engine._plan_exit_event(pos, {"close": 100000.0}, pd.DataFrame(), "day")
+
+    assert payload is not None
+    assert payload["submitted"] == 1
+    assert kis.sell_calls == 1
+    retry_key = payload["client_order_key"]
+    assert retry_key != base_key and retry_key.startswith(base_key + ":retry")
+    old_row = engine.orders_repo.get_order_by_client_order_key("practice", base_key)
+    retry_row = engine.orders_repo.get_order_by_client_order_key("practice", retry_key)
+    assert old_row["status"] == "CREATED"
+    assert retry_row["status"] == "ACKED"
+    assert int((retry_row["request_json"] or {}).get("pre_order_holding_qty") or 0) == 11
+
+
+def test_explicit_broker_rejection_can_retry_sell_with_new_key(monkeypatch) -> None:
+    """Confirmed rejection is terminal evidence, so a later SELL may retry safely."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    balance = {"output1": [{"pdno": "005830", "hldg_qty": "7", "ord_psbl_qty": "7",
+                             "pchs_avg_pric": "10000"}], "output2": [{}]}
+    engine, kis = _make_engine(db, FakeKis(), balance)
+    code = "005830"
+    base_key = engine._client_order_key(code, 1, "SELL", "day", "exit")
+    engine.orders_repo.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code=code, market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=9000.0, stage="FULL_EXIT", client_order_key=base_key,
+        request_json={}, status="CREATED", position_cycle_id="cycle-retry-reject",
+    )
+    engine.orders_repo.mark_error(
+        "practice", base_key,
+        {"rt_cd": "1", "msg_cd": "TEMP_REJECT", "msg1": "confirmed broker rejection"},
+    )
+
+    pos = _pos(code=code, qty=7, kis_qty=7, orderable_qty=7)
+    pos.update(position_cycle_id="cycle-retry-reject",
+               position_meta={"position_cycle_id": "cycle-retry-reject"})
+    payload = engine._plan_exit_event(pos, {"close": 9000.0}, pd.DataFrame(), "day")
+
+    assert payload is not None
+    assert payload["submitted"] == 1
+    assert kis.sell_calls == 1
+    assert payload["client_order_key"] != base_key
+
+
+def test_ambiguous_sell_error_remains_fenced_against_duplicate_submit(monkeypatch) -> None:
+    """Lost/unknown broker ACK must never be retried just because status is ERROR."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    db = sa.create_engine("sqlite:///:memory:")
+    schema_for_engine(db).metadata.create_all(db)
+    balance = {"output1": [{"pdno": "005830", "hldg_qty": "7", "ord_psbl_qty": "7",
+                             "pchs_avg_pric": "10000"}], "output2": [{}]}
+    engine, kis = _make_engine(db, FakeKis(), balance)
+    code = "005830"
+    base_key = engine._client_order_key(code, 1, "SELL", "day", "exit")
+    engine.orders_repo.create_intent_idempotent(
+        env="practice", run_id=None, strategy="pb1_pullback_close", sid=1, mode=1,
+        code=code, market="J", side="SELL", ord_type="MARKET", qty=7,
+        limit_price=9000.0, stage="FULL_EXIT", client_order_key=base_key,
+        request_json={}, status="CREATED", position_cycle_id="cycle-ambiguous",
+    )
+    engine.orders_repo.mark_submitted("practice", base_key, None, {"resp": None}, submitted_qty=7)
+    engine.orders_repo.mark_error("practice", base_key, {"resp": None})
+
+    pos = _pos(code=code, qty=7, kis_qty=7, orderable_qty=7)
+    pos.update(position_cycle_id="cycle-ambiguous",
+               position_meta={"position_cycle_id": "cycle-ambiguous"})
+    payload = engine._plan_exit_event(pos, {"close": 9000.0}, pd.DataFrame(), "day")
+
+    assert payload is not None
+    assert payload["submitted"] == 0
+    assert "DUPLICATE_INTENT_ROW_REUSED" in payload["order_skip_reasons"]
+    assert kis.sell_calls == 0
