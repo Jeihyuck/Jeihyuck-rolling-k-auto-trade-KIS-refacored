@@ -32,7 +32,7 @@ from datetime import date
 
 from sqlalchemy import create_engine, select
 
-from trader.db.repos import FillsRepo, OrdersRepo, PositionsRepo
+from trader.db.repos import FillsRepo, LedgerEventsRepo, OrdersRepo, PositionsRepo
 from trader.db.schema import schema_for_engine
 from trader.reconcile_kis import reconcile_today, _restore_entry_meta_for_promoted_positions
 from trader.run_context import RunContext
@@ -164,7 +164,7 @@ def test_same_cycle_meta_restore_clears_stale_policy_missing_top_level():
         engine=engine,
         orders_repo=orders_repo,
         positions_repo=PositionsRepo(engine),
-        ledger_repo=__import__("trader.db.repos", fromlist=["LedgerEventsRepo"]).LedgerEventsRepo(engine),
+        ledger_repo=LedgerEventsRepo(engine),
     )
 
     assert restored == 1
