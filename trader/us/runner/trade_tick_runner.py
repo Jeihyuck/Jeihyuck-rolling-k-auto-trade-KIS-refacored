@@ -102,6 +102,30 @@ def _get_tqqq_tick_quote(provider: Any) -> tuple[float, str, bool]:
         price = 0.0
     return price, source, stale
 
+def _build_tqqq_ttl_callbacks(provider: Any, kis_client: Any, *, trade_date: str, symbol: str):
+    """Return broker-truth callbacks used only by the TQQQ Infinite TTL reconciler."""
+    from trader.us.symbols import resolve_order_exchange
+
+    order_exchange = resolve_order_exchange(symbol)
+
+    def cancel_order(**identity):
+        return kis_client.cancel_us_order(
+            symbol=symbol,
+            exchange=order_exchange,
+            order_no=str(identity.get("order_no") or ""),
+        )
+
+    def query_order(**identity):
+        detail = provider.get_fills_by_order_no(
+            order_no=str(identity.get("order_no") or ""),
+            symbol=symbol,
+            trade_date=trade_date,
+        )
+        return detail or {}
+
+    return cancel_order, query_order
+
+
 def evaluate_balance_error_circuit(temp_error_count: int, recovered_count: int = 0,
                                    skip_zero_snapshot_count: int = 0,
                                    consecutive_failed_ticks: int = 0,
@@ -2069,9 +2093,15 @@ def run_trade_tick(
                 "exit_can_proceed": bool(exit_can_proceed),
                 "now_et": now.isoformat(),
             }
+            _ttl_cancel = _ttl_query = None
+            if not offline and kis_order_allowed and not signal_only and routing_kis_client is not None:
+                _ttl_cancel, _ttl_query = _build_tqqq_ttl_callbacks(
+                    provider, routing_kis_client, trade_date=trade_date, symbol=_infinite_config.symbol,
+                )
             infinite_result = run_sleeve(
                 positions=current_positions, price=_tqqq_price, trading_date=now.date(),
                 overlay=_infinite_overlay, route=_route_infinite,
+                cancel_order=_ttl_cancel, query_order=_ttl_query,
             )
         except Exception as _infinite_exc:
             # Defensive second boundary: sleeve failures never stop legacy US.
