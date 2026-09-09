@@ -714,6 +714,18 @@ def prepare_exit_position_snapshots(
                 )
                 pos["risk_state"] = risk_state
                 pos["soft_stop_breach_count"] = int(risk_state.get("soft_stop_breach_count") or 0)
+                soft_exec = ((risk_state.get("state") or {}).get("soft_stop_execution") or {})
+                current_lifecycle = str(
+                    pos.get("position_lifecycle_id")
+                    or ((risk_state.get("state") or {}).get("lifecycle") or {}).get("lifecycle_id")
+                    or ""
+                )
+                soft_lifecycle = str(soft_exec.get("position_lifecycle_id") or "")
+                if not soft_lifecycle or not current_lifecycle or soft_lifecycle == current_lifecycle:
+                    pos["soft_stop_triggered_today"] = bool(soft_exec.get("soft_stop_triggered_today"))
+                    pos["soft_stop_partial_done"] = bool(soft_exec.get("soft_stop_partial_done"))
+                    pos["first_soft_stop_at"] = soft_exec.get("first_soft_stop_at")
+                    pos["first_soft_stop_price"] = soft_exec.get("first_soft_stop_price")
             except Exception as exc:
                 logger.warning("[US_RISK_STATE][UPDATE_WARN] symbol=%s err=%s", symbol, exc)
 
