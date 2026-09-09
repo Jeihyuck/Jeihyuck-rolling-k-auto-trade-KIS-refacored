@@ -12384,7 +12384,17 @@ class PB1Engine:
             (entry_exit_plan or {}).get("eod_action") or pos.get("eod_action"),
             int(parse_plan_bool((entry_exit_plan or {}).get("force_eod_close"), default=parse_plan_bool(pos.get("force_eod_close"), default=False))),
         )
-        if str(window_tag).lower() == "close":
+        if str(window_tag).lower() == "close" and _policy_missing_contract:
+            # PR108/111 single authority: an explicit POLICY_MISSING position
+            # is hard-stop-only even at Close.  Neither an empty plan (SKIP)
+            # nor stale DAY_TRADE/FORCE_EXIT metadata may override the result
+            # already computed above.
+            logger.info(
+                "[PB1][CLOSE_PLAN][POLICY_MISSING] code=%s close_action=%s reason=%s "
+                "action=preserve_hard_stop_only hard_stop_hit=%s",
+                code, close_action, close_reason, int(bool(stop_hit)),
+            )
+        elif str(window_tag).lower() == "close":
             if close_action == "FORCE_SELL":
                 final_reason = close_reason
                 ordered_reasons = [final_reason]
