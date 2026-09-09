@@ -787,6 +787,109 @@ def _mark_trend_stages_from_records(records: Any, *, trade_date: str, status: st
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STAGE][MARK_WARN] symbol=%s stage=%s status=%s err=%s", symbol, stage, status, exc)
 
+def _mark_soft_stop_stages_from_records(records: Any, *, trade_date: str, status: str) -> None:
+    """Persist the first confirmed general-PB1 soft-stop execution for same-day idempotency."""
+    if str(status or "").upper() != "FILLED":
+        return
+    if isinstance(records, dict):
+        iterable = []
+        for key in ("fills", "orders", "confirmed_orders", "confirmed", "results", "items"):
+            val = records.get(key)
+            if isinstance(val, list):
+                iterable.extend(val)
+        if not iterable:
+            iterable = [records]
+    else:
+        iterable = list(records or [])
+
+    for rec in iterable:
+        if not isinstance(rec, dict):
+            continue
+        meta = rec.get("meta") or rec.get("intent", {}).get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        symbol = str(rec.get("symbol") or meta.get("symbol") or rec.get("pdno") or "").upper()
+        order_key = rec.get("client_order_key") or rec.get("order_key") or meta.get("client_order_key")
+        order_no = rec.get("order_no")
+        if not symbol:
+            continue
+
+        tokens = [
+            rec.get("exit_type"), rec.get("exit_reason"), rec.get("reason"),
+            meta.get("exit_type"), meta.get("exit_reason"), meta.get("stop_type"), meta.get("reason"),
+        ]
+        normalized = {str(v or "").strip().upper() for v in tokens if v not in (None, "")}
+        if not ({"SOFT_STOP_LOSS", "SOFT_STOP"} & normalized):
+            try:
+                from trader.us.db.repos import load_us_order_for_fill
+                order = load_us_order_for_fill(
+                    order_no=order_no, client_order_key=order_key,
+                    symbol=symbol, trade_date=trade_date,
+                )
+                order_meta = order.get("meta") or {}
+                if isinstance(order_meta, str):
+                    import json as _json
+                    order_meta = _json.loads(order_meta or "{}")
+                if isinstance(order_meta, dict):
+                    meta = {**order_meta, **meta}
+                tokens = [
+                    order.get("exit_type"), order.get("exit_reason"), order.get("reason"),
+                    meta.get("exit_type"), meta.get("exit_reason"), meta.get("stop_type"), meta.get("reason"),
+                ]
+                normalized = {str(v or "").strip().upper() for v in tokens if v not in (None, "")}
+                order_key = order.get("client_order_key") or order_key
+                order_no = order.get("order_no") or order_no
+                symbol = str(order.get("symbol") or symbol).upper()
+            except Exception as exc:
+                logger.warning(
+                    "[US_EXIT][SOFT_STOP_STATE][ORDER_LOOKUP_WARN] symbol=%s order_no=%s err=%s",
+                    symbol, order_no, exc,
+                )
+        if not ({"SOFT_STOP_LOSS", "SOFT_STOP"} & normalized):
+            continue
+
+        lifecycle_id = str(meta.get("position_lifecycle_id") or rec.get("position_lifecycle_id") or "")
+        fill_price = float(
+            rec.get("avg_price_usd") or rec.get("avg_price") or rec.get("price_usd") or rec.get("price")
+            or meta.get("fill_price") or meta.get("decision_price") or 0.0
+        )
+        filled_qty = int(
+            rec.get("filled_qty") or rec.get("cumulative_filled_qty") or rec.get("qty")
+            or meta.get("filled_qty") or 0
+        )
+        try:
+            from datetime import datetime, timezone
+            from trader.us.db.repos import load_us_position_risk_state, save_us_position_risk_state
+
+            risk = load_us_position_risk_state(symbol, trade_date) or {}
+            nested = dict(risk.get("state") or {})
+            prior = dict(nested.get("soft_stop_execution") or {})
+            if prior.get("position_lifecycle_id") and lifecycle_id and prior.get("position_lifecycle_id") != lifecycle_id:
+                prior = {}
+            if prior.get("soft_stop_triggered_today"):
+                continue
+            now_iso = datetime.now(timezone.utc).isoformat()
+            nested["soft_stop_execution"] = {
+                **prior,
+                "soft_stop_triggered_today": True,
+                "soft_stop_partial_done": True,
+                "first_soft_stop_at": prior.get("first_soft_stop_at") or now_iso,
+                "first_soft_stop_price": prior.get("first_soft_stop_price") or fill_price,
+                "first_soft_stop_filled_qty": prior.get("first_soft_stop_filled_qty") or filled_qty,
+                "position_lifecycle_id": lifecycle_id,
+                "client_order_key": str(order_key or ""),
+                "order_no": str(order_no or ""),
+            }
+            risk["state"] = nested
+            save_us_position_risk_state(symbol, trade_date, risk)
+            logger.info(
+                "[US_EXIT][SOFT_STOP_STATE][FILLED] symbol=%s lifecycle_id=%s qty=%s price=%.4f order_no=%s",
+                symbol, lifecycle_id or "NA", filled_qty, fill_price, order_no or "",
+            )
+        except Exception as exc:
+            logger.warning("[US_EXIT][SOFT_STOP_STATE][SAVE_WARN] symbol=%s err=%s", symbol, exc)
+
+
 def _select_watchlist_rows_from_payload(payload: Any, *, path: Path, trade_date: str, source: str, require_trade_date_match: bool) -> list[dict]:
     if require_trade_date_match:
         payload_trade_date = _payload_trade_date(payload)
@@ -1573,6 +1676,10 @@ def run_trade_tick(
             _mark_trend_stages_from_records(fills_today, trade_date=trade_date, status="FILLED")
         except Exception as exc:
             logger.warning("[US_POSITION][TREND_STAGE][FILL_MARK_WARN] err=%s", exc)
+        try:
+            _mark_soft_stop_stages_from_records(fills_today, trade_date=trade_date, status="FILLED")
+        except Exception as exc:
+            logger.warning("[US_EXIT][SOFT_STOP_STATE][FILL_MARK_WARN] err=%s", exc)
 
     # ACK reconcile: fills 저장 직후 미체결 ACK 주문 재확인
     if not offline:
@@ -1597,6 +1704,10 @@ def run_trade_tick(
                 _mark_trend_stages_from_records(ack_recon, trade_date=trade_date, status="FILLED")
             except Exception as exc:
                 logger.warning("[US_POSITION][TREND_STAGE][ACK_RECON_MARK_WARN] err=%s", exc)
+            try:
+                _mark_soft_stop_stages_from_records(ack_recon, trade_date=trade_date, status="FILLED")
+            except Exception as exc:
+                logger.warning("[US_EXIT][SOFT_STOP_STATE][ACK_RECON_MARK_WARN] err=%s", exc)
         except Exception as exc:
             logger.warning("[US_TICK][WARN] reconcile_ack_orders_with_balance failed: %s", exc)
         finally:
