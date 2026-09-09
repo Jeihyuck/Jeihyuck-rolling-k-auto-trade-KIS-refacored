@@ -370,9 +370,9 @@ def _restore_entry_meta_for_promoted_positions(
             rows = _conn.execute(
                 _sa.text(
                     "SELECT code, position_meta, entry_meta_json, position_cycle_id, portfolio_epoch_id, position_origin FROM positions "
-                    "WHERE env = :env AND status = 'OPEN' AND qty > 0"
+                    "WHERE env = :env AND strategy = :strategy AND status = 'OPEN' AND qty > 0"
                 ),
-                {"env": env},
+                {"env": env, "strategy": strategy},
             ).fetchall()
     except Exception as exc:
         logger.warning("[RECONCILE][META_RESTORE][ERROR] step=load_positions err=%s", exc)
@@ -419,12 +419,12 @@ def _restore_entry_meta_for_promoted_positions(
                 order_row = _conn.execute(
                     _sa.text(
                         "SELECT entry_meta_json FROM orders "
-                        "WHERE env = :env AND code = :code AND side = 'BUY' "
+                        "WHERE env = :env AND strategy = :strategy AND code = :code AND side = 'BUY' "
                         "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
                         "AND entry_meta_json IS NOT NULL "
                         "ORDER BY created_at DESC LIMIT 1"
                     ),
-                    {"env": env, "code": code, "cycle_id": position_cycle_id, "epoch_id": portfolio_epoch_id},
+                    {"env": env, "strategy": strategy, "code": code, "cycle_id": position_cycle_id, "epoch_id": portfolio_epoch_id},
                 ).fetchone()
             if order_row:
                 raw = order_row[0]
@@ -458,9 +458,17 @@ def _restore_entry_meta_for_promoted_positions(
                             "UPDATE positions SET entry_thesis = COALESCE(entry_thesis, 'POLICY_MISSING'), "
                             "exit_policy_family = COALESCE(exit_policy_family, 'POLICY_MISSING'), "
                             "force_eod_close = FALSE, policy_source = COALESCE(policy_source, 'missing') "
-                            "WHERE env = :env AND code = :code AND status = 'OPEN' AND qty > 0"
+                            "WHERE env = :env AND strategy = :strategy AND code = :code "
+                            "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
+                            "AND status = 'OPEN' AND qty > 0"
                         ),
-                        {"env": env, "code": code},
+                        {
+                            "env": env,
+                            "strategy": strategy,
+                            "code": code,
+                            "cycle_id": position_cycle_id,
+                            "epoch_id": portfolio_epoch_id,
+                        },
                     )
             except Exception as exc:
                 logger.warning("[RECONCILE][META_RESTORE][POLICY_MISSING_UPDATE_FAIL] code=%s err=%s", code, exc)
@@ -511,7 +519,9 @@ def _restore_entry_meta_for_promoted_positions(
                         "policy_version = COALESCE(:policy_version, policy_version), "
                         "entry_reason = COALESCE(:entry_reason, entry_reason), "
                         "entry_style_selected = COALESCE(:entry_style_selected, entry_style_selected) "
-                        "WHERE env = :env AND code = :code AND status = 'OPEN'"
+                        "WHERE env = :env AND strategy = :strategy AND code = :code "
+                        "AND position_cycle_id = :cycle_id AND portfolio_epoch_id = :epoch_id "
+                        "AND status = 'OPEN'"
                     ),
                     {
                         "meta": _json.dumps(update_payload),
@@ -526,7 +536,10 @@ def _restore_entry_meta_for_promoted_positions(
                         "entry_reason": resolved_meta.get("entry_reason"),
                         "entry_style_selected": resolved_meta.get("entry_style_selected"),
                         "env": env,
+                        "strategy": strategy,
                         "code": code,
+                        "cycle_id": position_cycle_id,
+                        "epoch_id": portfolio_epoch_id,
                     },
                 )
             restored_count += 1
