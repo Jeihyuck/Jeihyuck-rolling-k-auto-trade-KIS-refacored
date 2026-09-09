@@ -95,6 +95,8 @@ def test_same_cycle_meta_restore_clears_stale_policy_missing_top_level():
     schema.metadata.create_all(engine)
     cycle_id = str(uuid.uuid4())
     epoch_id = str(uuid.uuid4())
+    other_cycle_id = str(uuid.uuid4())
+    other_epoch_id = str(uuid.uuid4())
 
     recovered_entry_meta = {
         "entry_thesis": "PULLBACK_CONTINUATION",
@@ -125,6 +127,31 @@ def test_same_cycle_meta_restore_clears_stale_policy_missing_top_level():
                 qty=1,
                 avg_buy_price=10000.0,
                 total_cost=10000.0,
+                realized_pnl=0.0,
+                status="OPEN",
+                entry_thesis="POLICY_MISSING",
+                exit_policy_family="POLICY_MISSING",
+                policy_source="missing",
+                entry_meta_json={},
+                entry_exit_plan_json={},
+                position_meta={},
+            )
+        )
+        conn.execute(
+            schema.positions.insert().values(
+                position_id=str(uuid.uuid4()),
+                position_cycle_id=other_cycle_id,
+                portfolio_epoch_id=other_epoch_id,
+                position_origin="SYSTEM",
+                env="practice",
+                strategy="kr_infinite",
+                sid=1,
+                mode=1,
+                code="005930",
+                market="KOSPI",
+                qty=2,
+                avg_buy_price=9000.0,
+                total_cost=18000.0,
                 realized_pnl=0.0,
                 status="OPEN",
                 entry_thesis="POLICY_MISSING",
@@ -169,7 +196,16 @@ def test_same_cycle_meta_restore_clears_stale_policy_missing_top_level():
 
     assert restored == 1
     with engine.connect() as conn:
-        row = dict(conn.execute(select(schema.positions)).mappings().one())
+        row = dict(
+            conn.execute(
+                select(schema.positions).where(schema.positions.c.strategy == "pb1_pullback_close")
+            ).mappings().one()
+        )
+        other = dict(
+            conn.execute(
+                select(schema.positions).where(schema.positions.c.strategy == "kr_infinite")
+            ).mappings().one()
+        )
 
     assert row["entry_thesis"] == "PULLBACK_CONTINUATION"
     assert row["trade_horizon"] == "SWING"
@@ -179,3 +215,6 @@ def test_same_cycle_meta_restore_clears_stale_policy_missing_top_level():
     assert row["position_meta"]["trade_horizon"] == "SWING_CARRY"
     assert _position_policy_missing_contract(row) is False
     assert _resolve_position_horizon(row) == "SWING_CARRY"
+    assert other["entry_thesis"] == "POLICY_MISSING"
+    assert other["exit_policy_family"] == "POLICY_MISSING"
+    assert other["policy_source"] == "missing"
