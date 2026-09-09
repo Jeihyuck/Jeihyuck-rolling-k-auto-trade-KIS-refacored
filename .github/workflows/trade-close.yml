@@ -111,7 +111,6 @@ env:
   PB1_CORE_TP2_SELL_PCT: "0.25"
   PB1_CORE_TIME_STOP_DAYS: "20"
   # [2026-04-29] Multi-Layer Exit Router (trade-close: exit only, same policy)
-  PB1_EXIT_ROUTER_ENABLED: "1"
   PB1_PERCENT_EXIT_ENABLED: "1"
   PB1_EXIT_POLICY_MODE: "HYBRID_BY_ENTRY_STYLE"
   PB1_EXIT_POLICY_PATH: "trader/exit_policy/optimized_exit_router_policy.json"

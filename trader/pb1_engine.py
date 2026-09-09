@@ -925,8 +925,44 @@ def _classify_trade_horizon(features: dict[str, Any]) -> str:
     return "SWING_CARRY"
 
 
+def _position_policy_missing_contract(pos: dict[str, Any]) -> bool:
+    """Return True when PR108/111 requires hard-stop-only handling.
+
+    A stale top-level SWING family must never override an explicitly missing
+    EntryExitPlan/provenance contract.
+    """
+    import json as _json
+
+    def _mapping(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = _json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    plan = _mapping(pos.get("entry_exit_plan_json"))
+    meta = _mapping(pos.get("position_meta"))
+    if not plan:
+        plan = _mapping(meta.get("entry_exit_plan"))
+
+    explicit_missing = (
+        str(pos.get("entry_thesis") or "").upper() == "POLICY_MISSING"
+        or str(pos.get("exit_policy_family") or "").upper() == "POLICY_MISSING"
+        or str(pos.get("policy_source") or "").lower() == "missing"
+        or str(plan.get("entry_thesis") or "").upper() == "POLICY_MISSING"
+        or str(plan.get("exit_policy_family") or "").upper() == "POLICY_MISSING"
+        or str(plan.get("policy_source") or "").lower() == "missing"
+    )
+    return bool(explicit_missing)
+
+
 def _horizon_to_exit_family(horizon: str) -> str:
     return {
+        "POLICY_MISSING": "POLICY_MISSING",
         "DAY_PROTECT": "INTRADAY_PROFIT_PROTECT",
         "SWING_CARRY": "SWING_STAGED_EXIT",
         "CORE_CARRY": "CORE_TREND_FOLLOW",
@@ -934,14 +970,9 @@ def _horizon_to_exit_family(horizon: str) -> str:
 
 
 def _resolve_position_horizon(pos: dict[str, Any], now_kst_date: Any | None = None) -> str:
-    """포지션 dict에서 trade_horizon을 결정한다.
-
-    우선순위:
-    1. position_meta.trade_horizon
-    2. entry_meta_json.trade_horizon
-    3. entry_date == today -> DAY_PROTECT
-    4. SWING_CARRY
-    """
+    """Resolve only proven horizons; POLICY_MISSING never falls back to SWING."""
+    if _position_policy_missing_contract(pos):
+        return "POLICY_MISSING"
     meta = pos.get("position_meta") or {}
     if isinstance(meta, str):
         try:
@@ -979,14 +1010,9 @@ def _resolve_position_horizon(pos: dict[str, Any], now_kst_date: Any | None = No
 
 
 def _resolve_position_book(pos: dict[str, Any]) -> str:
-    """포지션 dict에서 book(SWING_BOOK / DAY_BOOK / CORE_BOOK)을 결정한다.
-
-    우선순위:
-    1. entry_meta_json.book
-    2. position_meta.book
-    3. trade_horizon → 매핑
-    4. fallback: SWING_BOOK
-    """
+    """Resolve only a proven book; missing policy is an explicit sentinel."""
+    if _position_policy_missing_contract(pos):
+        return "POLICY_MISSING"
     import json as _json
     entry_meta = pos.get("entry_meta_json") or {}
     if isinstance(entry_meta, str):
@@ -6281,7 +6307,8 @@ class PB1Engine:
                                for row in recent_order_events)
             snapshot = {
                 "holding_qty": int(pos.get("qty") or 0),
-                "kis_holding_qty": int(kis_holding_qty_by_code.get(code_key) or pos.get("qty") or 0),
+                "kis_holding_qty": int(kis_holding_qty_by_code.get(code_key, 0)),
+                "db_position_qty": int(pos.get("qty") or 0),
                 "today_buy_exists": bool(today_buy_events),
                 "today_submit_exists": bool(recent_order_events),
                 "today_fill_exists": bool(recent_fill_events),
@@ -11837,6 +11864,22 @@ class PB1Engine:
             or (pos.get("entry_meta_json") or {}).get("exit_policy_family")
             or resolved_exit_family
         )
+        _policy_missing_contract = _position_policy_missing_contract(pos)
+        if _policy_missing_contract:
+            if str(exit_policy_family or "").upper() not in {"", "POLICY_MISSING"}:
+                logger.error(
+                    "[EXIT][POLICY_AUTHORITY][CONFLICT_BLOCKED] code=%s stale_exit_family=%s "
+                    "canonical=POLICY_MISSING action=hard_stop_only",
+                    display_code, exit_policy_family,
+                )
+            exit_policy_family = "POLICY_MISSING"
+            warn_pct = float(os.getenv("PB1_POLICY_MISSING_EXIT_STARVATION_WARN_PCT", "8.0"))
+            if ret_pct >= warn_pct:
+                logger.error(
+                    "[EXIT_STARVATION][POLICY_MISSING] code=%s pnl_pct=%.2f threshold=%.2f "
+                    "action=operator_recovery_required",
+                    display_code, ret_pct, warn_pct,
+                )
         logger.info(
             "[EXIT][POSITION_META] code=%s entry_reason=%s entry_style_selected=%s stop_price_at_entry=%s pivot_price_at_entry=%s meta_ok=%s",
             display_code,
@@ -12128,8 +12171,29 @@ class PB1Engine:
             final_reason,
         )
 
+        # PR108/111 single-authority contract: POLICY_MISSING is hard-stop-only.
+        # Disable every secondary legacy/horizon/overlay exit before routing.
+        if _policy_missing_contract:
+            trail_hit = False
+            ma20_break = False
+            ma50_break = False
+            time_stop_hit = False
+            risk_off_hit = False
+            take_profit_hit = False
+            if stop_hit:
+                final_reason = "EXIT_HARD_STOP"
+                ordered_reasons = [final_reason]
+                exit_policy = {**exit_policy, "exit_ok": True, "family": "POLICY_MISSING", "final_reason": final_reason}
+            else:
+                final_reason = "POLICY_MISSING_HARD_STOP_ONLY"
+                ordered_reasons = [final_reason]
+                exit_policy = {**exit_policy, "exit_ok": False, "family": "POLICY_MISSING", "final_reason": final_reason}
+            # Keep durable evaluation/reporting aligned with the single exit
+            # authority.  "NO_EXIT_SIGNAL" must not hide POLICY_MISSING.
+            eval_reason = final_reason
+
         # ------------------------------------------------------------------
-        # [2026-05-21] Book/Horizon 기반 exit router + same-day guard
+        # [2026-05-21] Book/Horizon based router; no fallback when policy is missing.
         # ------------------------------------------------------------------
         trade_horizon = _resolve_position_horizon(pos, now_kst_date=self._now_kst.date())
         position_book = _resolve_position_book(pos)
@@ -12294,7 +12358,7 @@ class PB1Engine:
                 _router_sell_pct = None
 
         signal_hit = bool(stop_hit or trail_hit or ma20_break or ma50_break or time_stop_hit or risk_off_hit)
-        eval_reason = final_reason if signal_hit else "NO_EXIT_SIGNAL"
+        eval_reason = final_reason if (signal_hit or _policy_missing_contract) else "NO_EXIT_SIGNAL"
 
         entry_exit_plan = pos.get("entry_exit_plan_json")
         if isinstance(entry_exit_plan, str):
@@ -12341,11 +12405,13 @@ class PB1Engine:
                 exit_policy = {**exit_policy, "exit_ok": False, "final_reason": close_reason}
                 final_reason = close_reason
                 ordered_reasons = [close_reason]
-                eval_reason = "NO_EXIT_SIGNAL"
+                eval_reason = close_reason if _policy_missing_contract else "NO_EXIT_SIGNAL"
 
         # PR49 overlay exits: hard stops/close liquidation keep priority; defense trim and profit capture can create partial SELLs when no stronger exit is active.
         overlay = getattr(self, "_kr_market_state_overlay", None) or {}
-        if self._is_kr_equity_context() and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True) and str(window_tag).lower() != "close":
+        if (not _policy_missing_contract and self._is_kr_equity_context()
+                and env_bool("KR_MARKET_STATE_OVERLAY_ENABLE", True)
+                and str(window_tag).lower() != "close"):
             pos_for_overlay = {**pos, "code": code, "qty": qty, "orderable_qty": int(pos.get("orderable_qty") or qty), "unrealized_pnl_pct": ret_pct / 100.0, "market_value_krw": float(mark or 0.0) * qty}
             strong_exit_active = bool(exit_policy.get("exit_ok")) and final_reason in {"EXIT_HARD_STOP", "EXIT_TRAIL", "EXIT_MA20_BREAK", "EXIT_MA50_BREAK", "EXIT_DAY_STOP_LOSS", "EXIT_CORE_HARD_STOP"}
             if not strong_exit_active:
@@ -12903,6 +12969,17 @@ class PB1Engine:
                 portfolio_epoch_id=str(pos.get("portfolio_epoch_id") or position_meta.get("portfolio_epoch_id") or "") or None,
                 position_cycle_id=_cycle_id,
             )
+            if not _created:
+                exit_eval_payload["submit_attempted"] = 0
+                exit_eval_payload["submitted"] = 0
+                exit_eval_payload["api_called"] = 0
+                exit_eval_payload["order_skip_reasons"] = ["DUPLICATE_INTENT_ROW_REUSED"]
+                logger.error(
+                    "[EXIT][ORDER_SKIP] code=%s reason=DUPLICATE_INTENT_ROW_REUSED "
+                    "action=block_broker_submit_preserve_durable_baseline",
+                    display_code,
+                )
+                return exit_eval_payload
         except Exception:
             logger.exception("[PB1][EXIT][DB_FAIL] code=%s", display_code)
             if not self.dry_run:

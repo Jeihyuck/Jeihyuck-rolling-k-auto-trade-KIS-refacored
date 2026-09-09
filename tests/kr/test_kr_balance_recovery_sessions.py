@@ -40,3 +40,42 @@ def test_production_runner_retries_two_timeouts_then_resumes(monkeypatch):
     assert slept == [1, 1]
     assert __import__("os").environ["KR_BALANCE_RECOVERY_ONLY"] == "0"
     assert __import__("os").environ["ORDER_ALLOWED"] == "1"
+
+
+def test_close_temporary_outage_retries_then_resumes_exit_lane(monkeypatch):
+    monkeypatch.setenv("KR_BALANCE_RECOVERY_INTERVAL_SEC", "1")
+    calls = []
+    results = [
+        {"status": "WARN", "exit_allowed": 0, "reason": "KIS_BALANCE_TIMEOUT"},
+        None,
+    ]
+
+    def probe():
+        calls.append(len(calls) + 1)
+        return results.pop(0)
+
+    slept = []
+    result = recover_temporary_balance(
+        "close", {"status": "WARN", "exit_allowed": 0, "reason": "KIS_BALANCE_TIMEOUT"},
+        probe=probe, sleep_fn=slept.append, max_attempts=3,
+    )
+    assert result is None
+    assert calls == [1, 2]
+    assert slept == [1, 1]
+    assert __import__("os").environ["ENTRY_ALLOWED"] == "1"
+    assert __import__("os").environ["EXIT_ALLOWED"] == "1"
+    assert __import__("os").environ["ORDER_ALLOWED"] == "1"
+
+
+def test_close_balance_recovery_exhaustion_is_retryable_degraded(monkeypatch):
+    monkeypatch.setenv("KR_BALANCE_RECOVERY_INTERVAL_SEC", "1")
+    initial = {"status": "WARN", "exit_allowed": 0, "reason": "KIS_BALANCE_TIMEOUT"}
+    result = recover_temporary_balance(
+        "close", initial,
+        probe=lambda: dict(initial),
+        sleep_fn=lambda _seconds: None,
+        max_attempts=2,
+    )
+    assert result["status"] == "RETRYABLE_DEGRADED"
+    assert result["exit_code"] == 75
+    assert result["retryable"] is True

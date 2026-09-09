@@ -60,9 +60,14 @@ class KISExecutor:
         return order_id, response
 
     def order_state(self, intent: OrderIntent, trade_date: date) -> BrokerOrderState:
-        # With no ODNO, every pending status is correlated against observable
-        # broker data, including crash-before-persistence and later restarts.
-        raw = self.kis.inquire_daily_ccld(start_date=trade_date.strftime("%Y%m%d"), end_date=trade_date.strftime("%Y%m%d"))
+        # Reconcile against the order's original trading day, not the current
+        # session day. Domestic day orders do not migrate to a later trade date;
+        # using today's date can make an old SELL stay RECONCILE_PENDING forever.
+        lookup_date = intent.trade_date or trade_date
+        raw = self.kis.inquire_daily_ccld(
+            start_date=lookup_date.strftime("%Y%m%d"),
+            end_date=lookup_date.strftime("%Y%m%d"),
+        )
         rows = (raw.get("output1") or raw.get("output") or []) if isinstance(raw, dict) else []
         if intent.broker_order_id:
             matches = [item for item in rows if str(item.get("odno") or item.get("ODNO") or item.get("ord_no") or "") == intent.broker_order_id]
@@ -79,8 +84,25 @@ class KISExecutor:
                 raise RuntimeError("KR_INF_PENDING_ORDER_AMBIGUOUS")
         row = matches[0] if len(matches) == 1 else None
         if row is None:
+            # A successful historical inquiry with no matching row can only
+            # close a zero-fill day order.  Durable partial-fill evidence stays
+            # fenced because re-sizing a replacement from current holdings
+            # could overshoot the intended TP stage.
+            inquiry_ok = isinstance(raw, dict) and str(raw.get("rt_cd") or "0").strip() in {"", "0"}
+            if lookup_date < trade_date and inquiry_ok and int(intent.filled_qty or 0) == 0:
+                return BrokerOrderState("EXPIRED")
             return BrokerOrderState("RECONCILE_PENDING")
         qty = int(float(row.get("tot_ccld_qty") or row.get("ccld_qty") or row.get("filled_qty") or 0))
         avg = float(row.get("avg_prvs") or row.get("avg_price") or row.get("ccld_unpr") or 0)
-        status = "FILLED" if qty >= intent.requested_qty else ("PARTIALLY_FILLED" if qty > 0 else "PENDING")
+        if qty >= intent.requested_qty:
+            status = "FILLED"
+        elif qty > 0:
+            # A historical partial fill needs explicit lifecycle review; do not
+            # silently advance TP stage or create a replacement SELL.
+            status = "PARTIALLY_FILLED"
+        elif lookup_date < trade_date:
+            # A zero-fill domestic day order cannot remain live overnight.
+            status = "EXPIRED"
+        else:
+            status = "PENDING"
         return BrokerOrderState(status, qty, qty * avg, avg or None)

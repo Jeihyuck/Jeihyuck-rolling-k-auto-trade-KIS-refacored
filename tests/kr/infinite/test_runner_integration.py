@@ -357,3 +357,111 @@ def test_sell_only_tick_never_queries_orderable_cash(armed_practice_env):
     result = run_once(config=config(), kis=kis, repository=repo, regime_provider=REGIME,
                       trade_date=DAY, kis_env="practice", allow_entry=False)
     assert result.decision.action == Action.SELL_PARTIAL
+
+
+def test_stale_pending_sell_reconciles_on_original_trade_date_and_unblocks_tp2(armed_practice_env):
+    old_day = date(2026, 8, 13)
+    intent = OrderIntent(
+        1, "KRINF-20260801-owned", old_day, "SELL_PARTIAL", "old-tp1", 50,
+        broker_order_id="OLD1", status="SUBMITTED", filled_qty=0, filled_notional_krw=0.0,
+    )
+    state = replace(active(), status=Status.EXIT_PENDING,
+                    metadata={"pending_profit_stage": "TP1_SUBMITTED"})
+    kis = FakeKIS(qty=50, average=100, price=110, fill_qty=50)
+    seen = []
+
+    def inquire_daily_ccld(**kwargs):
+        seen.append((kwargs["start_date"], kwargs["end_date"]))
+        return {"output1": [{
+            "odno": "OLD1", "pdno": "122630", "side": "SELL",
+            "ord_qty": "50", "tot_ccld_qty": "50", "avg_prvs": "105",
+        }]}
+
+    kis.inquire_daily_ccld = inquire_daily_ccld
+    repo = FakeRepository(state, [intent])
+
+    result = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+
+    assert seen[0] == ("20260813", "20260813")
+    assert repo.intents[0].status == "FILLED"
+    assert result.state.metadata.get("profit_stage") == "TP1_FILLED"
+    # The stale TP1 fence is gone; current-day economics are immediately
+    # re-evaluated and may legitimately arm TP2 at the current price.
+    assert result.decision.reason == "TAKE_PROFIT_TP2"
+    assert result.state.metadata.get("pending_profit_stage") == "TP2_SUBMITTED"
+    assert any(i.trade_date == DAY and i.side in {"SELL_PARTIAL", "SELL_ALL"} for i in repo.intents[1:])
+
+
+def test_old_zero_fill_day_order_expires_and_does_not_fence_new_decision(armed_practice_env):
+    old_day = date(2026, 8, 13)
+    intent = OrderIntent(
+        1, "KRINF-20260801-owned", old_day, "SELL_PARTIAL", "old-tp1", 50,
+        broker_order_id="OLD2", status="SUBMITTED", filled_qty=0, filled_notional_krw=0.0,
+    )
+    state = replace(active(), status=Status.EXIT_PENDING,
+                    metadata={"pending_profit_stage": "TP1_SUBMITTED"})
+    kis = FakeKIS(qty=100, average=100, price=110, fill_qty=0)
+    kis.inquire_daily_ccld = lambda **kwargs: {"output1": [{
+        "odno": "OLD2", "pdno": "122630", "side": "SELL",
+        "ord_qty": "50", "tot_ccld_qty": "0", "avg_prvs": "0",
+    }]}
+    repo = FakeRepository(state, [intent])
+
+    result = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+
+    assert repo.intents[0].status == "EXPIRED"
+    # EXPIRED removes only the historical fence.  A fresh current-day TP
+    # decision may immediately create a new submitted stage.
+    assert result.decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}
+    assert result.state.metadata.get("pending_profit_stage") in {"TP1_SUBMITTED", "TP2_SUBMITTED"}
+    assert any(i.trade_date == DAY and i.id != intent.id for i in repo.intents[1:])
+
+
+def test_old_zero_fill_day_order_missing_from_successful_broker_history_expires(armed_practice_env):
+    old_day = date(2026, 8, 13)
+    intent = OrderIntent(
+        1, "KRINF-20260801-owned", old_day, "SELL_PARTIAL", "old-missing", 50,
+        broker_order_id="OLD-MISSING", status="SUBMITTED", filled_qty=0, filled_notional_krw=0.0,
+    )
+    state = replace(active(), status=Status.EXIT_PENDING,
+                    metadata={"pending_profit_stage": "TP1_SUBMITTED"})
+    kis = FakeKIS(qty=100, average=100, price=110, fill_qty=0)
+    kis.inquire_daily_ccld = lambda **kwargs: {"rt_cd": "0", "output1": []}
+    repo = FakeRepository(state, [intent])
+
+    result = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+
+    assert repo.intents[0].status == "EXPIRED"
+    assert result.decision.action in {Action.SELL_PARTIAL, Action.SELL_ALL}
+
+
+def test_old_partial_fill_missing_from_history_stays_fenced_for_manual_reconcile(armed_practice_env):
+    old_day = date(2026, 8, 13)
+    intent = OrderIntent(
+        1, "KRINF-20260801-owned", old_day, "SELL_PARTIAL", "old-partial-missing", 50,
+        broker_order_id="OLD-PARTIAL", status="PARTIALLY_FILLED",
+        filled_qty=20, filled_notional_krw=2100.0,
+    )
+    state = replace(active(), status=Status.EXIT_PENDING,
+                    metadata={"pending_profit_stage": "TP1_SUBMITTED"})
+    kis = FakeKIS(qty=80, average=100, price=110, fill_qty=0)
+    kis.inquire_daily_ccld = lambda **kwargs: {"rt_cd": "0", "output1": []}
+    repo = FakeRepository(state, [intent])
+
+    result = run_once(
+        config=config(), kis=kis, repository=repo, regime_provider=REGIME,
+        trade_date=DAY, kis_env="practice",
+    )
+
+    assert repo.intents[0].status == "RECONCILE_PENDING"
+    assert result.decision.action == Action.WAIT
+    assert result.decision.reason == "KR_INF_PROFIT_SELL_PENDING"

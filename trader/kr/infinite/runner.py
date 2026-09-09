@@ -61,11 +61,31 @@ def _new_cycle(state: State | None, executor: KISExecutor, config: InfiniteConfi
 def _reconcile_pending(repo: InfiniteRepository, executor: KISExecutor, state: State | None,
                        trade_date: date) -> tuple[State | None, list]:
     updates = []
+    terminal = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
     for intent in repo.pending_intents():
         broker = executor.order_state(intent, trade_date)
         updates.append((intent, broker))
         if state is not None:
             state, _, _ = apply_confirmed_fill(state, intent, broker, trade_date)
+            if intent.side in {"SELL_PARTIAL", "SELL_ALL"} and broker.status in terminal:
+                pending_stage = str((state.metadata or {}).get("pending_profit_stage") or "")
+                if pending_stage:
+                    state = replace(
+                        state,
+                        metadata={
+                            **state.metadata,
+                            "pending_profit_stage": None,
+                            "last_terminal_sell_status": broker.status,
+                            "last_terminal_sell_trade_date": intent.trade_date.isoformat(),
+                        },
+                    )
+        if intent.trade_date < trade_date and broker.status not in terminal:
+            logger.error(
+                "[EXIT_STARVATION][KR_INF_STALE_PENDING] intent_id=%s order_trade_date=%s current_trade_date=%s "
+                "side=%s broker_order_id=%s status=%s action=block_duplicate_and_require_reconcile",
+                intent.id, intent.trade_date, trade_date, intent.side,
+                intent.broker_order_id or "NONE", broker.status,
+            )
     return state, updates
 
 
@@ -120,8 +140,11 @@ def run_once(*, config: InfiniteConfig, kis, repository: InfiniteRepository,
                                     "broker_average_price": position.average_price,
                                     "broker_orderable_qty": position.orderable_qty})
             repository.save_state(state)
-        unresolved_sell = any(i.side in {"SELL_PARTIAL", "SELL_ALL"} and broker.status not in {"FILLED", "CANCELLED", "REJECTED"}
-                              for i, broker in updates)
+        unresolved_sell = any(
+            i.side in {"SELL_PARTIAL", "SELL_ALL"}
+            and broker.status not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+            for i, broker in updates
+        )
         state, reconcile_reason = reconcile(state, position, day, pending_sell=unresolved_sell,
                                              balance_grace_attempts=config.balance_reconcile_grace_attempts)
         if state is not None and updates:

@@ -463,3 +463,107 @@ def test_sell_ack_invalidates_balance_and_blocks_resubmit(monkeypatch) -> None:
     )
     assert second["order_result"] == "ORDER_SKIPPED_SESSION_BLOCKED"
     assert kis.sell_calls == 1
+
+
+def test_duplicate_durable_sell_row_never_reuses_old_baseline_for_new_broker_submit(monkeypatch) -> None:
+    """2026-09-09 LG regression: created=False must be terminal before KIS submit."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    balance = {"output1": [{"pdno": "003550", "hldg_qty": "11", "ord_psbl_qty": "11",
+                             "pchs_avg_pric": "111400"}], "output2": [{}]}
+    engine, kis = _make_engine(balance_snapshot=balance)
+    monkeypatch.setattr(engine, "_should_block_order", lambda *args, **kwargs: (False, None))
+    monkeypatch.setattr(
+        engine.orders_repo,
+        "create_intent_idempotent",
+        lambda **kwargs: ("existing-old-order-row", False),
+    )
+
+    pos = _pos(code="003550", qty=11, kis_qty=11, orderable_qty=11)
+    pos.update(
+        avg_buy_price=111400.0,
+        last_price=100000.0,
+        stop_price=105000.0,
+        holding_source="kis_balance",
+        position_cycle_id="lg-cycle",
+        portfolio_epoch_id="lg-epoch",
+        position_meta={"position_cycle_id": "lg-cycle"},
+    )
+
+    payload = engine._plan_exit_event(pos, {"close": 100000.0}, pd.DataFrame(), "day")
+
+    assert payload is not None
+    assert payload["submitted"] == 0
+    assert payload["submit_attempted"] == 0
+    assert "DUPLICATE_INTENT_ROW_REUSED" in payload["order_skip_reasons"]
+    assert kis.sell_calls == 0
+
+
+def test_explicit_policy_missing_high_profit_cannot_use_stale_swing_family(monkeypatch, caplog) -> None:
+    """PR108/111 contract: high profit alone cannot bypass POLICY_MISSING hard-stop-only."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    balance = {"output1": [{"pdno": "067290", "hldg_qty": "10", "ord_psbl_qty": "10",
+                             "pchs_avg_pric": "10000"}], "output2": [{}]}
+    engine, kis = _make_engine(balance_snapshot=balance)
+    monkeypatch.setattr(engine, "_resolve_price_with_fallback", lambda code, ohlcv_close=None: (16000.0, "test"))
+
+    pos = _pos(code="067290", qty=10, kis_qty=10, orderable_qty=10)
+    pos.update(
+        avg_buy_price=10000.0,
+        last_price=16000.0,
+        stop_price=9000.0,
+        entry_thesis="POLICY_MISSING",
+        exit_policy_family="SWING_STAGED_EXIT",
+        policy_source="missing",
+        entry_exit_plan_json={},
+        entry_meta_json={},
+        position_meta={},
+        holding_source="kis_balance",
+    )
+
+    caplog.set_level("INFO")
+    payload = engine._plan_exit_event(
+        pos,
+        {"close": 16000.0, "ma20": 12000.0, "ma50": 11000.0},
+        pd.DataFrame(),
+        "day",
+    )
+
+    assert payload is not None
+    assert payload["submitted"] == 0
+    assert kis.sell_calls == 0
+    assert "POLICY_MISSING_HARD_STOP_ONLY" in str(payload.get("decision_reason") or payload.get("reasons"))
+    assert "[EXIT][POLICY_AUTHORITY][CONFLICT_BLOCKED]" in caplog.text
+
+
+def test_explicit_policy_missing_still_allows_hard_stop(monkeypatch) -> None:
+    """Single-authority fix must never disable the PR108/111 hard-stop lane."""
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    balance = {"output1": [{"pdno": "067290", "hldg_qty": "10", "ord_psbl_qty": "10",
+                             "pchs_avg_pric": "10000"}], "output2": [{}]}
+    engine, kis = _make_engine(balance_snapshot=balance)
+    monkeypatch.setattr(engine, "_resolve_price_with_fallback", lambda code, ohlcv_close=None: (8500.0, "test"))
+
+    pos = _pos(code="067290", qty=10, kis_qty=10, orderable_qty=10)
+    pos.update(
+        avg_buy_price=10000.0,
+        last_price=8500.0,
+        stop_price=9000.0,
+        entry_thesis="POLICY_MISSING",
+        exit_policy_family="SWING_STAGED_EXIT",
+        policy_source="missing",
+        entry_exit_plan_json={},
+        entry_meta_json={},
+        position_meta={},
+        holding_source="kis_balance",
+    )
+
+    payload = engine._plan_exit_event(
+        pos,
+        {"close": 8500.0, "ma20": 10000.0, "ma50": 9800.0},
+        pd.DataFrame(),
+        "day",
+    )
+
+    assert payload is not None
+    assert payload["submitted"] == 1
+    assert kis.sell_calls == 1

@@ -181,3 +181,7 @@ def test_trap_cleanup_hook_and_health_warning_policy_are_present():
     assert "nullim_session_lock_release" in init
     assert "if forbidden or advisory_unavailable:" in health
     assert "stale_lock_detected_count" in health
+    assert "kr_inf_stale_pending_count" in health
+    assert "policy_missing_exit_starvation_count" in health
+    assert "policy_authority_conflict_count" in health
+    assert "execution_truth_mismatch_count" in health

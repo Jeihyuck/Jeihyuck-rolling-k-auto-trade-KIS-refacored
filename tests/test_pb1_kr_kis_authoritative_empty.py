@@ -180,3 +180,23 @@ def test_us_ticker_not_affected_by_kr_stale_position_guard():
     assert _is_kr_stock_code("TSLA") is False
     assert _is_kr_stock_code("NVDA") is False
     assert _is_kr_stock_code("028050") is True
+
+
+def test_buyable_gate_does_not_disguise_db_position_as_kis_holding(mock_engine):
+    """2026-09-09: authoritative KIS absence must remain qty=0."""
+    mock_engine._balance_snapshot = {
+        "rt_cd": "0",
+        "output1": [{"pdno": "005930", "hldg_qty": "22", "ord_psbl_qty": "22"}],
+        "output2": {"scts_evlu_amt": "1000000"},
+    }
+    mock_engine.fills_repo.list_fills_in_window.return_value = []
+    mock_engine.orders_repo.list_orders_in_window.return_value = []
+    mock_engine.ledger_repo.list_events_in_window.return_value = []
+
+    ctx = mock_engine._build_buyable_gate_context(
+        codes=["066570"],
+        positions=[{"code": "066570", "qty": 1}],
+    )
+
+    assert ctx["066570"]["db_position_qty"] == 1
+    assert ctx["066570"]["kis_holding_qty"] == 0

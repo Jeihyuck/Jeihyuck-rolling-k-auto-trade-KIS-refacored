@@ -1,0 +1,106 @@
+name: PR118 KR Hotfix Validation
+
+on:
+  push:
+    branches:
+      - fix/kr-pr111-pr117-live-exit-integrity-20260909
+  workflow_dispatch:
+
+env:
+  STRATEGY_ENV: practice
+  KIS_ENV: practice
+  MARKET: KR
+  REGION: KR
+  PB1_MARKET_SCOPE: KRX
+  DRY_RUN: "1"
+  STRATEGY_MODE: LIVE
+  KR_PB1_VOL_MAX: "1.25"
+  KR_PB1_VOLU_MAX: "1.25"
+  KR_PB1_VOLU_MAX_INTRADAY: "1.25"
+  DB_LOCK_TIMEOUT_MS: "5000"
+  DB_STATEMENT_TIMEOUT_MS: "15000"
+  DB_IDLE_IN_TX_SESSION_TIMEOUT_MS: "15000"
+  PB1_FAIL_OPEN_ON_ORDER_LOOKUP_TIMEOUT: "1"
+  KR_PREP_AUX_WATCHLIST_TIMEOUT_SEC: "20"
+  KR_PREP_AUX_REPORT_TIMEOUT_SEC: "30"
+  KR_PREP_AUX_DEFAULT_TIMEOUT_SEC: "20"
+  PBCORE_TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/kr_ci
+
+jobs:
+  focused-hotfix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: kr_ci}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff psycopg2-binary
+      - name: Syntax gates
+        run: |
+          python -m py_compile trader/pb1_engine.py trader/kr/infinite/executor.py trader/kr/infinite/runner.py trader/kr/runner/trade_session_runner.py
+          bash -n scripts/wsl/check-nullim-day-health.sh
+          ruff check trader/kr/infinite/executor.py trader/kr/infinite/runner.py trader/kr/runner/trade_session_runner.py --select F821,F822,F823,E9
+      - name: Focused incident regressions
+        run: |
+          pytest -q tests/kr/infinite/test_runner_integration.py tests/kr/test_kr_balance_recovery_sessions.py tests/kr/test_kr_sell_no_sellable_session_block.py tests/kr/test_kr_policy_missing_incidents.py tests/test_entry_horizon_classification.py tests/test_pb1_kr_kis_authoritative_empty.py tests/test_session_lock_policy.py tests/test_trade_close_workflow_yaml_contract.py
+
+  full-kr-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: kr_ci}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install psycopg2-binary
+      - run: python -m compileall -q trader
+      - name: Full KR tests
+        run: pytest tests/kr -q
+
+  pb1-cross-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env: {POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres, POSTGRES_DB: kr_ci}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kr_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install psycopg2-binary
+      - name: Cross regression matrix
+        run: |
+          pytest -q tests/test_position_cycle_lifecycle.py tests/test_reconcile_entry_exit_plan_restore.py tests/test_pb1_entry_plan_persistence.py tests/test_kr_session_result_file.py tests/test_market_log_mail_e2e.py tests/test_scheduler_single_owner_policy.py tests/test_recovery_control_plane_contracts.py tests/test_trade_submit_and_exit_contract.py::test_run_exit_always_logs_ma_values_for_holdings tests/test_trade_submit_and_exit_contract.py::test_resolve_market_close_falls_back_to_default tests/test_trade_submit_and_exit_contract.py::test_format_order_result_reason_preserves_business_code
+          pytest -q tests/test_exit_router_policy.py -k "not existing_position_exit_router_applied and not existing_position_fallback_entry_unknown"
