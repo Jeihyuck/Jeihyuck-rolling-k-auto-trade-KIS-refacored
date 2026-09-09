@@ -218,3 +218,77 @@ def test_same_cycle_meta_restore_clears_stale_policy_missing_top_level():
     assert other["entry_thesis"] == "POLICY_MISSING"
     assert other["exit_policy_family"] == "POLICY_MISSING"
     assert other["policy_source"] == "missing"
+
+
+def test_already_restored_system_entry_meta_repairs_stale_top_level_without_order_lookup():
+    import uuid
+
+    engine = create_engine("sqlite:///:memory:")
+    schema = schema_for_engine(engine)
+    schema.metadata.create_all(engine)
+    cycle_id = str(uuid.uuid4())
+    epoch_id = str(uuid.uuid4())
+    existing_entry_meta = {
+        "entry_thesis": "PULLBACK_CONTINUATION",
+        "entry_reason": "ENTRY_PULLBACK",
+        "entry_style_selected": "ENTRY_PULLBACK",
+        "book": "SWING_BOOK",
+        "trade_horizon": "SWING_CARRY",
+        "exit_policy_family": "SWING_STAGED_EXIT",
+        "eod_action": "CARRY_IF_NO_EXIT_SIGNAL",
+        "force_eod_close": False,
+        "policy_source": "style_mapping",
+        "policy_version": "pb1_entry_exit_plan_v1",
+    }
+
+    with engine.begin() as conn:
+        conn.execute(
+            schema.positions.insert().values(
+                position_id=str(uuid.uuid4()),
+                position_cycle_id=cycle_id,
+                portfolio_epoch_id=epoch_id,
+                position_origin="SYSTEM",
+                env="practice",
+                strategy="pb1_pullback_close",
+                sid=1,
+                mode=1,
+                code="000660",
+                market="KOSPI",
+                qty=1,
+                avg_buy_price=10000.0,
+                total_cost=10000.0,
+                realized_pnl=0.0,
+                status="OPEN",
+                entry_thesis="POLICY_MISSING",
+                exit_policy_family="POLICY_MISSING",
+                policy_source="missing",
+                entry_meta_json=existing_entry_meta,
+                entry_exit_plan_json={},
+                position_meta={
+                    "book": "SWING_BOOK",
+                    "trade_horizon": "SWING_CARRY",
+                    "exit_policy_family": "SWING_STAGED_EXIT",
+                    "meta_source": "order_meta",
+                },
+            )
+        )
+
+    restored = _restore_entry_meta_for_promoted_positions(
+        env="practice",
+        strategy="pb1_pullback_close",
+        engine=engine,
+        orders_repo=OrdersRepo(engine),
+        positions_repo=PositionsRepo(engine),
+        ledger_repo=LedgerEventsRepo(engine),
+    )
+
+    assert restored == 1
+    with engine.connect() as conn:
+        row = dict(conn.execute(select(schema.positions)).mappings().one())
+
+    assert row["entry_thesis"] == "PULLBACK_CONTINUATION"
+    assert row["trade_horizon"] == "SWING"
+    assert row["exit_policy_family"] == "SWING_STAGED_EXIT"
+    assert row["policy_source"] == "style_mapping"
+    assert _position_policy_missing_contract(row) is False
+    assert _resolve_position_horizon(row) == "SWING_CARRY"
