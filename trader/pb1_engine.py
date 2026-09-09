@@ -5318,6 +5318,30 @@ class PB1Engine:
     def _is_open_entry_order_status(status: Any) -> bool:
         return str(status or "").upper() in {"SUBMITTED", "ACKED", "ACCEPTED", "PARTIAL_FILLED", "FILLED"}
 
+    @staticmethod
+    def _is_retryable_sell_order_row(order: dict[str, Any] | None) -> bool:
+        """Retry only when prior durable evidence proves no live broker SELL exists."""
+        row = order if isinstance(order, dict) else {}
+        status = str(row.get("status") or "").upper()
+        if status in {"CREATED", "INTENT", "SKIP"}:
+            # These states are retryable only if the prior row never crossed
+            # the broker-submit boundary. A synthetic broker_order_id or a
+            # submitted timestamp means the outcome is ambiguous and must stay fenced.
+            return not any((
+                row.get("submitted_at"),
+                row.get("acked_at"),
+                row.get("kis_odno"),
+                row.get("broker_order_id"),
+            ))
+        if status in {"ERROR", "REJECTED"}:
+            # ERROR is safe to retry only for an explicit broker rejection.
+            # Network/timeout exceptions are stored without a non-zero rt_cd
+            # and remain fenced to avoid duplicate SELLs after lost ACKs.
+            response = row.get("response_json") if isinstance(row.get("response_json"), dict) else {}
+            rt_cd = str(response.get("rt_cd") or "").strip()
+            return bool(rt_cd and rt_cd != "0")
+        return False
+
     def _build_unified_gate_context(
         self,
         *,
@@ -12929,6 +12953,24 @@ class PB1Engine:
             exit_eval_payload["order_skip_reasons"] = ["duplicate_order"]
             logger.info("[EXIT][ORDER_SKIP] code=%s reasons=%s", display_code, exit_eval_payload["order_skip_reasons"])
             return exit_eval_payload
+
+        effective_client_key = client_key
+        existing_order = (
+            self.orders_repo.get_order_by_client_order_key(self.env, client_key)
+            if hasattr(self.orders_repo, "get_order_by_client_order_key") and client_key
+            else None
+        )
+        if existing_order and self._is_retryable_sell_order_row(existing_order):
+            effective_client_key = self._next_retry_client_order_key(client_key)
+            logger.info(
+                "[EXIT][PRE_SUBMIT][RETRY_KEY] code=%s old_key=%s new_key=%s prior_status=%s",
+                display_code,
+                client_key,
+                effective_client_key,
+                str(existing_order.get("status") or "").upper(),
+            )
+        client_key = effective_client_key
+        exit_eval_payload["client_order_key"] = client_key
 
         exit_meta = {
             "exit_reason": exit_reason,
