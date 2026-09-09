@@ -103,3 +103,4 @@ jobs:
         run: |
           pytest tests/test_entry_guard_final30.py tests/test_final30_load_required.py -q
           pytest tests/test_pb1_exit_signature.py -q
+          pytest tests/test_reconcile_entry_exit_plan_restore.py tests/test_entry_horizon_classification.py tests/test_pb1_kr_kis_authoritative_empty.py tests/test_pb1_entry_plan_persistence.py tests/test_position_cycle_lifecycle.py -q
