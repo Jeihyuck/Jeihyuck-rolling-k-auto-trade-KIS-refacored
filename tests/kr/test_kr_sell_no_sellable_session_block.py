@@ -567,3 +567,76 @@ def test_explicit_policy_missing_still_allows_hard_stop(monkeypatch) -> None:
     assert payload is not None
     assert payload["submitted"] == 1
     assert kis.sell_calls == 1
+
+
+def test_policy_missing_close_preserves_hard_stop_with_empty_plan(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    balance = {"output1": [{"pdno": "067290", "hldg_qty": "10", "ord_psbl_qty": "10",
+                             "pchs_avg_pric": "10000"}], "output2": [{}]}
+    engine, kis = _make_engine(balance_snapshot=balance)
+    monkeypatch.setattr(engine, "_resolve_price_with_fallback", lambda code, ohlcv_close=None: (8000.0, "test"))
+    pos = _pos(code="067290", qty=10, kis_qty=10, orderable_qty=10)
+    pos.update(
+        avg_buy_price=10000.0,
+        last_price=8000.0,
+        stop_price=9000.0,
+        entry_thesis="POLICY_MISSING",
+        exit_policy_family="POLICY_MISSING",
+        policy_source="missing",
+        entry_exit_plan_json={},
+        entry_meta_json={},
+        position_meta={},
+        holding_source="kis_balance",
+    )
+
+    payload = engine._plan_exit_event(
+        pos,
+        {"close": 8000.0, "ma20": 9000.0, "ma50": 9500.0},
+        pd.DataFrame(),
+        "close",
+    )
+
+    assert payload is not None
+    assert payload["submitted"] == 1
+    assert kis.sell_calls == 1
+    assert payload["decision_reason"] == "EXIT_HARD_STOP"
+
+
+def test_policy_missing_close_ignores_stale_day_force_exit_without_hard_stop(monkeypatch) -> None:
+    monkeypatch.setattr("trader.pb1_engine.validate_tradeable", lambda kis, code: (True, "ok"))
+    balance = {"output1": [{"pdno": "095340", "hldg_qty": "10", "ord_psbl_qty": "10",
+                             "pchs_avg_pric": "10000"}], "output2": [{}]}
+    engine, kis = _make_engine(balance_snapshot=balance)
+    monkeypatch.setattr(engine, "_resolve_price_with_fallback", lambda code, ohlcv_close=None: (12000.0, "test"))
+    stale_day_plan = {
+        "entry_thesis": "BREAKOUT_DAYTRADE",
+        "trade_horizon": "DAY_TRADE",
+        "exit_policy_family": "INTRADAY_PROFIT_PROTECT",
+        "eod_action": "FORCE_EXIT",
+        "force_eod_close": True,
+    }
+    pos = _pos(code="095340", qty=10, kis_qty=10, orderable_qty=10)
+    pos.update(
+        avg_buy_price=10000.0,
+        last_price=12000.0,
+        stop_price=9000.0,
+        entry_thesis="POLICY_MISSING",
+        exit_policy_family="POLICY_MISSING",
+        policy_source="missing",
+        entry_exit_plan_json=stale_day_plan,
+        entry_meta_json={},
+        position_meta={},
+        holding_source="kis_balance",
+    )
+
+    payload = engine._plan_exit_event(
+        pos,
+        {"close": 12000.0, "ma20": 11000.0, "ma50": 10500.0},
+        pd.DataFrame(),
+        "close",
+    )
+
+    assert payload is not None
+    assert payload["submitted"] == 0
+    assert kis.sell_calls == 0
+    assert payload["decision_reason"] == "POLICY_MISSING_HARD_STOP_ONLY"
