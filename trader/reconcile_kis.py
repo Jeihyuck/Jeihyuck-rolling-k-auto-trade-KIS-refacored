@@ -402,14 +402,18 @@ def _restore_entry_meta_for_promoted_positions(
                 existing_entry_meta = {}
         existing_entry_meta = existing_entry_meta or {}
 
-        # 이미 book/trade_horizon이 있으면 스킵
-        if existing_entry_meta.get("book") or existing_entry_meta.get("trade_horizon"):
-            continue
-
         # Imported/recovery cycles intentionally have no historical policy
         # provenance.  Never attach symbol-level legacy order/ledger metadata.
         if position_origin in {"IMPORTED", "RECOVERY"}:
             continue
+
+        # A SYSTEM position can already contain same-lifecycle entry metadata
+        # from an earlier reconcile/fill.  Do not skip it merely because
+        # book/horizon exists: older code may have restored JSON metadata while
+        # leaving top-level POLICY_MISSING sentinels behind.
+        entry_meta_from_position = None
+        if existing_entry_meta.get("book") or existing_entry_meta.get("trade_horizon"):
+            entry_meta_from_position = existing_entry_meta
 
         # 1. 동일 cycle/epoch의 orders.entry_meta_json만 조회
         entry_meta_from_order = None
@@ -444,7 +448,7 @@ def _restore_entry_meta_for_promoted_positions(
         # ownership; they are diagnostic only, never a restoration source.
         entry_meta_from_ledger = None
 
-        resolved_meta = entry_meta_from_order or entry_meta_from_ledger
+        resolved_meta = entry_meta_from_position or entry_meta_from_order or entry_meta_from_ledger
         if not resolved_meta:
             logger.warning(
                 "[RECONCILE][META_RESTORE][POLICY_MISSING] code=%s action=keep_policy_missing_no_swing_safe_fallback",
@@ -483,7 +487,9 @@ def _restore_entry_meta_for_promoted_positions(
             }
             if resolved_meta.get("exit_policy_family"):
                 update_payload["exit_policy_family"] = resolved_meta["exit_policy_family"]
-            source = resolved_meta.get("meta_source", "order_meta")
+            source = resolved_meta.get("meta_source") or (
+                "position_entry_meta" if entry_meta_from_position is not None else "order_meta"
+            )
             update_payload["meta_source"] = source
 
             # Same-cycle/epoch BUY metadata is authoritative enough to clear a
