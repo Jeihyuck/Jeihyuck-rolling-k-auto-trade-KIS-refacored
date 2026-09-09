@@ -980,6 +980,9 @@ def generate_entry_intents(
             logger.info("[US_ENTRY_CANDIDATE] symbol=%s position_state=NOT_HELD candidate_action=NEW_BUY position_action=%s", symbol, position_action)
 
         limit_price = round(price * (1 + float(os.getenv("US_LIMIT_PRICE_BAND_PCT", "0.005"))), 4)
+        # Broker/risk economics must use the final executable price, not the decision quote.
+        # The router intentionally fail-closes when qty * limit_price != notional_usd.
+        notional = round(qty * limit_price, 4)
 
         import hashlib
         trade_date_for_key = _resolve_us_trade_date(now)
@@ -1017,7 +1020,7 @@ def generate_entry_intents(
             # qty를 줄여서 order_cap 이하로 맞춤
             old_qty = qty
             old_notional = notional
-            new_qty = int(order_cap_usd // price)
+            new_qty = int(order_cap_usd // limit_price)
             
             if new_qty <= 0:
                 # 가격이 너무 높아서 1주도 못 사는 경우 skip
@@ -1035,7 +1038,7 @@ def generate_entry_intents(
             
             # qty를 축소하고 notional 재계산
             qty = new_qty
-            notional = qty * price
+            notional = round(qty * limit_price, 4)
             
             # 축소 후에도 여전히 cap 초과인지 재검증 (안전망)
             if notional > order_cap_usd:
