@@ -31,24 +31,36 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _order_identities(row: dict) -> tuple[str, str, str]:
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    return (
+        str(row.get("canonical_order_no") or row.get("canonical_broker_order_no") or row.get("order_no") or ""),
+        str(row.get("submit_attempt_id") or meta.get("submit_attempt_id") or ""),
+        str(row.get("client_order_key") or meta.get("client_order_key") or ""),
+    )
+
+
+def _logical_order_key(row: dict) -> tuple[str, str]:
+    """Use identities that exist before and after broker ACK in stable priority order."""
+    broker, attempt, client = _order_identities(row)
+    if attempt:
+        return ("submit_attempt_id", attempt)
+    if client:
+        return ("client_order_key", client)
+    return ("broker_order_no", broker)
+
+
 def attribute_session_fills(orders: list[dict], broker_fills: list[dict], *, session: str, session_run_id: str) -> dict:
-    """Attribute cumulative broker evidence only to orders submitted by this session."""
+    """Attribute cumulative broker evidence only to unique logical orders from this session."""
     session_orders = [row for row in orders or [] if str(row.get("session") or "").lower() == session.lower()
                       and str(row.get("session_run_id") or "") == str(session_run_id)]
-    def identities(row: dict) -> tuple[str, str, str]:
-        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
-        return (
-            str(row.get("canonical_order_no") or row.get("canonical_broker_order_no") or row.get("order_no") or ""),
-            str(row.get("submit_attempt_id") or meta.get("submit_attempt_id") or ""),
-            str(row.get("client_order_key") or meta.get("client_order_key") or ""),
-        )
-    fill_ids = [identities(row) for row in broker_fills or [] if int(row.get("filled_qty") or row.get("qty") or 0) > 0]
+    fill_ids = [_order_identities(row) for row in broker_fills or [] if int(row.get("filled_qty") or row.get("qty") or 0) > 0]
     matched = 0
     unresolved = 0
-    seen_orders: set[tuple[str, str, str]] = set()
+    seen_orders: set[tuple[str, str]] = set()
     for order in session_orders:
-        wanted = identities(order)
-        dedupe_key = next(((value, "", "") for value in wanted if value), wanted)
+        wanted = _order_identities(order)
+        dedupe_key = _logical_order_key(order)
         if dedupe_key in seen_orders:
             continue
         seen_orders.add(dedupe_key)
@@ -56,6 +68,28 @@ def attribute_session_fills(orders: list[dict], broker_fills: list[dict], *, ses
         matched += int(found)
         unresolved += int(not found)
     return {"session_fills_count": matched, "unresolved_order_count": unresolved}
+
+
+def count_confirmed_broker_orders(events: list[dict]) -> tuple[int, int]:
+    """Count unique session broker orders with ACK/fill evidence, not cumulative tick snapshots."""
+    lifecycle: dict[str, dict] = {}
+    terminal_events = {"BROKER_ACK_RECEIVED", "BROKER_ACK_RECOVERED", "ORDER_PARTIALLY_FILLED", "ORDER_FILLED"}
+    for event in events or []:
+        key_type, key = _logical_order_key(event)
+        if not key:
+            continue
+        row = lifecycle.setdefault(f"{key_type}:{key}", {"side": "", "types": set()})
+        row["side"] = str(event.get("side") or row["side"] or "").upper()
+        row["types"].add(str(event.get("event_type") or ""))
+    buy = sell = 0
+    for row in lifecycle.values():
+        if not (row["types"] & terminal_events):
+            continue
+        if row["side"] == "BUY":
+            buy += 1
+        elif row["side"] == "SELL":
+            sell += 1
+    return buy, sell
 
 
 def tick_has_authoritative_execution_health(tick: dict) -> bool:
@@ -1746,8 +1780,9 @@ def run_trade_session(
                         distinct_real_broker_buy_orders.add(order_no)
                     elif side_o == "SELL":
                         distinct_real_broker_sell_orders.add(order_no)
-            real_broker_buys += int(tick_result.get("real_broker_buys", 0) or 0)
-            real_broker_sells += int(tick_result.get("real_broker_sells", 0) or 0)
+            # Tick fields are same-day cumulative broker-fill snapshots.
+            # Never sum them across ticks; session broker counts are derived
+            # from immutable order-journal lifecycle evidence below.
             synthetic_reconcile_buys += int(tick_result.get("synthetic_reconcile_buys", 0) or 0)
             synthetic_reconcile_sells += int(tick_result.get("synthetic_reconcile_sells", 0) or 0)
             broker_ack_only += int(tick_result.get("broker_ack_only", 0) or 0)
@@ -1839,6 +1874,9 @@ def run_trade_session(
             journal_session = aggregate_order_events(trade_date, session_run_id=session_run_id)
             journal_daily = aggregate_order_events(trade_date)
             session_order_events = load_order_events(trade_date, session_run_id=session_run_id)
+            journal_real_broker_buys, journal_real_broker_sells = count_confirmed_broker_orders(session_order_events)
+            real_broker_buys = journal_real_broker_buys
+            real_broker_sells = journal_real_broker_sells
         except Exception as exc:
             journal_session, journal_daily, session_order_events = {}, {}, []
             logger.warning("[US_SESSION][SUMMARY_COUNTS][JOURNAL_FALLBACK] error=%s", exc)

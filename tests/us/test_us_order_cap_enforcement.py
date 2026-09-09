@@ -151,6 +151,49 @@ class TestUSEntryIntentOrderCap:
                 f"Intent for {intent['symbol']} has notional_usd={intent['notional_usd']} > 2500"
 
 
+    @patch("trader.us.pb1.us_entry_engine.USDataProvider")
+    def test_entry_intent_economics_use_executable_limit_price(self, mock_provider_cls, monkeypatch):
+        """2026-09-08 live regression: qty * limit_price must equal notional_usd."""
+        monkeypatch.setenv("US_MAX_ORDER_USD", "10000")
+        monkeypatch.setenv("US_MAX_POSITION_WEIGHT", "1")
+        monkeypatch.setenv("US_MAX_NEW_ENTRIES_PER_TICK", "1")
+        monkeypatch.setenv("US_MIN_ENTRY_SCORE", "0")
+        monkeypatch.setenv("US_MIN_CASH_BUFFER_USD", "0")
+        monkeypatch.setenv("US_LIMIT_PRICE_BAND_PCT", "0.005")
+
+        from trader.us.db import repos
+        from trader.us.pb1.us_entry_engine import generate_entry_intents
+
+        monkeypatch.setattr(repos, "_get_engine_or_none", lambda: None)
+        monkeypatch.setattr(repos, "has_pending_order_for_symbol_side", lambda **kwargs: False)
+        monkeypatch.setattr(repos, "has_position", lambda symbol: False)
+        monkeypatch.setattr(repos, "load_today_order_keys", lambda trade_date: set())
+
+        class Provider:
+            def get_current_price(self, symbol, exchange):
+                return {"last": 334.09}
+
+        rows = [{
+            "symbol": "SNOW", "exchange": "NYSE", "score": 1.0, "rank": 1,
+            "entry_style": "momentum", "momentum_score": 1.0,
+        }]
+        intents = generate_entry_intents(
+            tickers=None,
+            provider=Provider(),
+            sold_today=set(),
+            available_cash_usd=10000.0,
+            position_count=0,
+            capital_usd_cap=10000.0,
+            max_new_entries=1,
+            watchlist_entries=rows,
+            current_position_symbols=set(),
+        )
+        assert len(intents) == 1
+        intent = intents[0]
+        assert intent["limit_price"] == pytest.approx(335.7604)
+        assert intent["notional_usd"] == pytest.approx(intent["qty"] * intent["limit_price"])
+
+
 class TestUSOrderRouterResizeRetry:
     """US order router의 resize retry 로직 검증."""
 

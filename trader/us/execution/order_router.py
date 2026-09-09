@@ -1115,17 +1115,23 @@ def route_order(
 
         # intent 또는 us_positions에서 holding_qty/orderable_qty 확보
         _pos_for_guard = {
-            "holding_qty": intent.get("holding_qty")
-                           or intent.get("available_qty")
-                           or (intent.get("meta") or {}).get("holding_qty")
-                           or broker_holding_qty,
-            "orderable_qty": intent.get("orderable_qty")
-                             or (intent.get("meta") or {}).get("orderable_qty")
-                             or broker_orderable_qty,
-            "sellable_qty": intent.get("sellable_qty")
-                            or (intent.get("meta") or {}).get("sellable_qty")
-                            or broker_orderable_qty,
-            "position_source": "kis_broker_balance",
+            "holding_qty": (
+                broker_holding_qty if broker_pos is not None
+                else intent.get("holding_qty")
+                or intent.get("available_qty")
+                or (intent.get("meta") or {}).get("holding_qty")
+            ),
+            "orderable_qty": (
+                broker_orderable_qty if broker_pos is not None
+                else intent.get("orderable_qty")
+                or (intent.get("meta") or {}).get("orderable_qty")
+            ),
+            "sellable_qty": (
+                broker_orderable_qty if broker_pos is not None
+                else intent.get("sellable_qty")
+                or (intent.get("meta") or {}).get("sellable_qty")
+            ),
+            "position_source": "kis_broker_balance" if broker_pos is not None else "intent_or_db_fallback",
         }
         # DB fallback: intent에 orderable_qty가 없으면 us_positions 조회
         if not _pos_for_guard["orderable_qty"] and symbol:
@@ -1224,6 +1230,25 @@ def route_order(
             intent.setdefault("meta", {})
             if isinstance(intent.get("meta"), dict):
                 intent["meta"]["sell_qty_clamped"] = True
+
+    if side == "SELL" and broker_pos is not None:
+        # The broker snapshot immediately before submit is authoritative.
+        # Never infer pre-order holding from available_qty: for partial exits
+        # available_qty is the requested leg size, not the account holding.
+        intent.setdefault("meta", {})
+        intent["pre_order_holding_qty"] = int(broker_holding_qty)
+        intent["pre_order_position_qty"] = int(broker_holding_qty)
+        intent["pre_order_orderable_qty"] = int(broker_orderable_qty)
+        if isinstance(intent.get("meta"), dict):
+            intent["meta"].update({
+                "pre_order_holding_qty": int(broker_holding_qty),
+                "pre_order_position_qty": int(broker_holding_qty),
+                "pre_order_orderable_qty": int(broker_orderable_qty),
+                "requested_sell_qty": int(qty),
+                "expected_post_order_qty": max(0, int(broker_holding_qty) - int(qty)),
+                "post_order_expected_qty": max(0, int(broker_holding_qty) - int(qty)),
+                "pre_order_position_source": "kis_broker_balance_pre_submit",
+            })
 
     if side == "SELL":
         intent.setdefault("meta", {})

@@ -129,3 +129,41 @@ def test_get_us_fills_today_source_has_ccld_nccs():
     assert "CCLD_NCCS_DVSN" in source, (
         "kis_us_client.py must set CCLD_NCCS_DVSN in get_us_fills_today"
     )
+
+
+def test_cancel_us_order_uses_paper_rvsecncl_contract(monkeypatch):
+    from trader.us.execution import kis_us_client as mod
+
+    client = object.__new__(mod.KisUSClient)
+    client._cano = "12345678"
+    client._acnt_prdt_cd = "01"
+    client._assert_not_offline = lambda *_args, **_kwargs: None
+    client._build_headers = lambda tr_id: {"tr_id": tr_id}
+    captured = {}
+
+    def fake_post(path, headers, body):
+        captured.update({"path": path, "headers": headers, "body": body})
+        return {"rt_cd": "0", "output": {"ODNO": "cancel-ack"}}
+
+    client._post = fake_post
+    monkeypatch.setenv("US_KIS_ORDER_ALLOWED", "1")
+    monkeypatch.setattr(mod.us_cfg, "assert_us_paper_order_allowed", lambda: None)
+
+    result = client.cancel_us_order(
+        symbol="TQQQ", exchange="NASDAQ", order_no="original-broker-order"
+    )
+    assert result["rt_cd"] == "0"
+    assert captured["headers"]["tr_id"] == "VTTT1004U"
+    assert captured["path"] == "/uapi/overseas-stock/v1/trading/order-rvsecncl"
+    assert captured["body"] == {
+        "CANO": "12345678",
+        "ACNT_PRDT_CD": "01",
+        "OVRS_EXCG_CD": "NASD",
+        "PDNO": "TQQQ",
+        "ORGN_ODNO": "original-broker-order",
+        "RVSE_CNCL_DVSN_CD": "02",
+        "ORD_QTY": "0",
+        "OVRS_ORD_UNPR": "0",
+        "MGCO_APTM_ODNO": "",
+        "ORD_SVR_DVSN_CD": "0",
+    }

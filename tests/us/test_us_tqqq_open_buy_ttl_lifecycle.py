@@ -112,3 +112,40 @@ def test_tqqq_unknown_cancel_result_keeps_pending():
     assert result["cancel_requested"] == 1
     assert result["pending"] == 1
     assert repo.orders[0]["status"] == "OPEN"
+
+
+def test_tqqq_production_callbacks_cancel_and_requery_same_broker_identity():
+    from trader.us.runner.trade_tick_runner import _build_tqqq_ttl_callbacks
+
+    calls = {"cancel": [], "query": []}
+
+    class Client:
+        def cancel_us_order(self, **kwargs):
+            calls["cancel"].append(kwargs)
+            return {"status": "ACK"}
+
+    class Provider:
+        def get_fills_by_order_no(self, **kwargs):
+            calls["query"].append(kwargs)
+            return {
+                "order_no": kwargs["order_no"], "symbol": kwargs["symbol"],
+                "side": "BUY", "status": "CANCELLED", "filled_qty": 0,
+            }
+
+    cancel, query = _build_tqqq_ttl_callbacks(
+        Provider(), Client(), trade_date="2026-09-08", symbol="TQQQ"
+    )
+    identity = {
+        "order_no": "original-broker-order",
+        "client_order_key": "TQQQ_INF_V3:cycle-a:2026-09-08:BUY",
+        "symbol": "TQQQ", "side": "BUY",
+    }
+    assert cancel(**identity)["status"] == "ACK"
+    observed = query(**identity)
+    assert observed["status"] == "CANCELLED"
+    assert calls["cancel"] == [{
+        "symbol": "TQQQ", "exchange": "NASDAQ", "order_no": "original-broker-order",
+    }]
+    assert calls["query"] == [{
+        "order_no": "original-broker-order", "symbol": "TQQQ", "trade_date": "2026-09-08",
+    }]
