@@ -702,8 +702,13 @@ def test_explicit_broker_rejection_can_retry_sell_with_new_key(monkeypatch) -> N
     )
 
     pos = _pos(code=code, qty=7, kis_qty=7, orderable_qty=7)
-    pos.update(position_cycle_id="cycle-retry-reject",
-               position_meta={"position_cycle_id": "cycle-retry-reject"})
+    pos.update(
+        avg_buy_price=10000.0,
+        last_price=9000.0,
+        stop_price=9500.0,
+        position_cycle_id="cycle-retry-reject",
+        position_meta={"position_cycle_id": "cycle-retry-reject"},
+    )
     payload = engine._plan_exit_event(pos, {"close": 9000.0}, pd.DataFrame(), "day")
 
     assert payload is not None
@@ -732,8 +737,13 @@ def test_ambiguous_sell_error_remains_fenced_against_duplicate_submit(monkeypatc
     engine.orders_repo.mark_error("practice", base_key, {"resp": None})
 
     pos = _pos(code=code, qty=7, kis_qty=7, orderable_qty=7)
-    pos.update(position_cycle_id="cycle-ambiguous",
-               position_meta={"position_cycle_id": "cycle-ambiguous"})
+    pos.update(
+        avg_buy_price=10000.0,
+        last_price=9000.0,
+        stop_price=9500.0,
+        position_cycle_id="cycle-ambiguous",
+        position_meta={"position_cycle_id": "cycle-ambiguous"},
+    )
     payload = engine._plan_exit_event(pos, {"close": 9000.0}, pd.DataFrame(), "day")
 
     assert payload is not None
