@@ -481,6 +481,7 @@ def reconcile_ack_orders_with_balance(
             "expired_count": 0,
             "unresolved_error_count": 0,
             "failed_count": 0,
+            "confirmed_orders": [],
             "symbols_by_status": {"confirmed": [], "balance_confirmed": [], "open_order_pending": [], "cancelled": [], "expired": [], "unresolved_error": []},
             "order_nos_by_status": {"open_order_pending": [], "unresolved_error": []},
         }
@@ -504,6 +505,7 @@ def reconcile_ack_orders_with_balance(
     expired_count = 0
     failed_count = 0
     canceled_count = 0
+    confirmed_orders: list[dict] = []
     symbols_by_status: dict[str, list[str]] = {
         "confirmed": [], "fill_api_confirmed": [], "balance_confirmed": [],
         "open_order_pending": [], "cancelled": [], "expired": [],
@@ -641,6 +643,14 @@ def reconcile_ack_orders_with_balance(
                     confirmed_count += 1
                     symbols_by_status["fill_api_confirmed"].append(symbol)
                     symbols_by_status["confirmed"].append(symbol)
+                    confirmed_orders.append({
+                        **order,
+                        "symbol": symbol, "side": side, "order_no": order_no,
+                        "client_order_key": client_order_key,
+                        "filled_qty": fill_qty, "cumulative_filled_qty": fill_qty,
+                        "avg_price_usd": fill_price, "reconcile_source": "fills_reconcile",
+                        "meta": _order_meta(order),
+                    })
                 else:
                     _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
                     failed_count += 1
@@ -680,6 +690,15 @@ def reconcile_ack_orders_with_balance(
                 if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
                     balance_reconcile_count += 1
                     symbols_by_status["balance_confirmed"].append(symbol)
+                    confirmed_orders.append({
+                        **order,
+                        "symbol": symbol, "side": side, "order_no": order_no,
+                        "client_order_key": client_order_key,
+                        "filled_qty": filled_by_balance, "cumulative_filled_qty": filled_by_balance,
+                        "avg_price_usd": fallback_fill_price,
+                        "reconcile_source": source_name,
+                        "meta": _order_meta(order),
+                    })
                 else:
                     _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
                     failed_count += 1
@@ -729,6 +748,15 @@ def reconcile_ack_orders_with_balance(
                     if isinstance(mark_result, dict) and mark_result.get("status") == "OK":
                         balance_reconcile_count += 1
                         symbols_by_status["balance_confirmed"].append(symbol)
+                        confirmed_orders.append({
+                            **order,
+                            "symbol": symbol, "side": "BUY", "order_no": order_no,
+                            "client_order_key": client_order_key,
+                            "filled_qty": qty, "cumulative_filled_qty": qty,
+                            "avg_price_usd": fill_price_candidate,
+                            "reconcile_source": "balance_reconcile_buy",
+                            "meta": _order_meta(order),
+                        })
                     else:
                         _record_reconcile_failure(symbol=symbol, mark_result=mark_result, symbols_by_status=symbols_by_status)
                         failed_count += 1
@@ -809,6 +837,7 @@ def reconcile_ack_orders_with_balance(
         "unresolved_error_count": unresolved_count,
         "failed_count": failed_count,
         "canceled_count": canceled_count,
+        "confirmed_orders": confirmed_orders,
         "symbols_by_status": symbols_by_status,
         "order_nos_by_status": order_nos_by_status,
         "manual_reconcile_required": int(unresolved_count > 0),
