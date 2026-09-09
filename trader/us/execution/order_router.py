@@ -1115,17 +1115,23 @@ def route_order(
 
         # intent 또는 us_positions에서 holding_qty/orderable_qty 확보
         _pos_for_guard = {
-            "holding_qty": intent.get("holding_qty")
-                           or intent.get("available_qty")
-                           or (intent.get("meta") or {}).get("holding_qty")
-                           or broker_holding_qty,
-            "orderable_qty": intent.get("orderable_qty")
-                             or (intent.get("meta") or {}).get("orderable_qty")
-                             or broker_orderable_qty,
-            "sellable_qty": intent.get("sellable_qty")
-                            or (intent.get("meta") or {}).get("sellable_qty")
-                            or broker_orderable_qty,
-            "position_source": "kis_broker_balance",
+            "holding_qty": (
+                broker_holding_qty if broker_pos is not None
+                else intent.get("holding_qty")
+                or intent.get("available_qty")
+                or (intent.get("meta") or {}).get("holding_qty")
+            ),
+            "orderable_qty": (
+                broker_orderable_qty if broker_pos is not None
+                else intent.get("orderable_qty")
+                or (intent.get("meta") or {}).get("orderable_qty")
+            ),
+            "sellable_qty": (
+                broker_orderable_qty if broker_pos is not None
+                else intent.get("sellable_qty")
+                or (intent.get("meta") or {}).get("sellable_qty")
+            ),
+            "position_source": "kis_broker_balance" if broker_pos is not None else "intent_or_db_fallback",
         }
         # DB fallback: intent에 orderable_qty가 없으면 us_positions 조회
         if not _pos_for_guard["orderable_qty"] and symbol:
