@@ -526,10 +526,19 @@ def run_daily_report(
         "daily_fills_total": 0,
         "actual_new_positions": 0,
         "open_position_count": 0,
-        "account_equity_krw": 0.0,
-        "account_equity_usd": 0.0,
+        "account_equity_krw": None,
+        "account_equity_usd": None,
+        "account_equity_source": "unknown",
+        "risk_capital_krw": 0.0,
+        "risk_capital_usd": 0.0,
+        "risk_capital_source": "unknown",
+        "deployment_capital_krw": 0.0,
+        "deployment_capital_usd": 0.0,
         "invested_market_value_usd": 0.0,
-        "cash_usd": 0.0,
+        "holdings_market_value_usd": 0.0,
+        "cash_usd": None,
+        "cash_source": "unknown",
+        "deployment_cash_headroom_usd": 0.0,
         "gross_exposure_pct": 0.0,
         "target_exposure_pct": 0.0,
         "max_exposure_pct": 0.0,
@@ -984,14 +993,27 @@ def run_daily_report(
                 except Exception as exc:
                     logger.warning("[US_DAILY_REPORT][CLUSTER][WARN] %s", exc)
                 try:
+                    from trader.accounting import resolve_us_accounting
                     from trader.us.capital_deployment import compute_deployment_metrics, decide_deployment_action
-                    account_equity_usd = float(os.getenv("US_ACCOUNT_EQUITY_USD", "0") or 0)
-                    cash_usd = None
-                    if account_equity_usd > 0 and invested > 0:
-                        cash_usd = max(0.0, account_equity_usd - invested)
-                        report["cash_usd_estimated"] = True
-                    metrics = compute_deployment_metrics(account_equity_usd=account_equity_usd, invested_market_value_usd=invested, cash_usd=cash_usd)
+                    accounting = resolve_us_accounting(
+                        reconcile={
+                            "account_equity_usd": report.get("account_equity_usd"),
+                            "account_equity_source": report.get("account_equity_source"),
+                        },
+                        invested_market_value_usd=invested,
+                        broker_orderable_cash_usd=None,
+                    )
+                    metrics = compute_deployment_metrics(
+                        account_equity_usd=accounting.get("account_equity_usd"),
+                        risk_capital_usd=accounting.get("risk_capital_usd"),
+                        risk_capital_source=str(accounting.get("risk_capital_source") or ""),
+                        invested_market_value_usd=invested,
+                        cash_usd=None,
+                    )
                     report.update(metrics)
+                    report["account_equity_source"] = accounting.get("account_equity_source")
+                    report["cash_usd"] = None
+                    report["cash_source"] = "unavailable_in_daily_report"
                     report["capital_deployment_action"] = decide_deployment_action(metrics, position_count=len(canonical_positions), max_positions=int(report.get("max_positions", 35) or 35))
                     report["avg_position_value_usd"] = invested / len(canonical_positions) if canonical_positions else 0.0
                     if report["full_position"] and metrics.get("underdeployed"):
@@ -1107,7 +1129,21 @@ def run_daily_report(
                        "open_position_symbols": sorted({str(p.get("symbol") or p.get("pdno") or "").upper() for p in canonical}),
                        "invested_market_value_usd": invested, "canonical_position_source": "close_direct_kis_balance"})
         if final_balance:
-            report["account_equity_usd"] = float(final_balance.get("total_pvs") or final_balance.get("total_pvs_usd") or final_balance.get("evaluation_amount") or 0)
+            from trader.accounting import resolve_us_accounting
+            accounting = resolve_us_accounting(
+                reconcile=final_balance,
+                invested_market_value_usd=invested,
+                broker_orderable_cash_usd=None,
+            )
+            report["account_equity_usd"] = accounting.get("account_equity_usd")
+            report["account_equity_source"] = accounting.get("account_equity_source")
+            report["risk_capital_usd"] = float(accounting.get("risk_capital_usd") or 0.0)
+            report["risk_capital_source"] = accounting.get("risk_capital_source")
+            report["deployment_capital_usd"] = float(accounting.get("deployment_capital_usd") or 0.0)
+            report["deployment_capital_krw"] = float(accounting.get("deployment_capital_krw") or 0.0)
+            report["holdings_market_value_usd"] = float(accounting.get("holdings_market_value_usd") or invested)
+            if accounting.get("account_equity_usd") is None:
+                report["warnings"].append("ACCOUNT_EQUITY_UNAVAILABLE_HOLDINGS_ONLY_BALANCE")
         if canonical and invested <= 0:
             report["report_consistency"] = worsen_consistency(report.get("report_consistency", "OK"), "REPORT_INCONSISTENT_POSITION_VALUE")
             report["errors"].append("REPORT_INCONSISTENT_POSITION_VALUE")
