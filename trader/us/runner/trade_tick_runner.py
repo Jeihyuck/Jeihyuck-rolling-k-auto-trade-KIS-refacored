@@ -1824,8 +1824,13 @@ def run_trade_tick(
             "status": recon.get("status", "OK"),
             "message": recon.get("error", ""),
             "position_count": len(recon_positions),
-            "total_pvs": recon.get("total_pvs_usd", 0),
-            "detail": {"session": session},
+            "total_pvs": recon.get("total_pvs", 0),
+            "detail": {
+                "session": session,
+                "total_pvs_semantics": recon.get("total_pvs_semantics", "holdings_market_value_usd"),
+                "total_pvs_source": recon.get("total_pvs_source", "unknown"),
+                "account_equity_source": recon.get("account_equity_source", "unknown"),
+            },
         }
         save_reconcile_log(payload, trade_date=trade_date)
     except Exception as exc:
