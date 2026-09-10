@@ -15273,7 +15273,13 @@ class PB1Engine:
                        "exposure_multiplier": policy.budget_multiplier,
                        "max_new_positions": policy.max_new_positions,
                        "portfolio_equity_krw": account_snapshot.get("portfolio_equity_krw"),
+                       "portfolio_equity_source": account_snapshot.get("portfolio_equity_source"),
+                       "portfolio_equity_authoritative": account_snapshot.get("portfolio_equity_authoritative"),
                        "gross_exposure_pct": account_snapshot.get("gross_exposure_pct"),
+                       "account_intraday_pnl_pct": account_snapshot.get("account_intraday_pnl_pct"),
+                       "account_intraday_pnl_source": account_snapshot.get("account_intraday_pnl_source"),
+                       "account_5d_pnl_pct": account_snapshot.get("account_5d_pnl_pct"),
+                       "account_5d_pnl_source": account_snapshot.get("account_5d_pnl_source"),
                        "sector_exposure_pct": account_snapshot.get("sector_exposure_pct") or {},
                        "high_beta_exposure_pct": account_snapshot.get("high_beta_exposure_pct") or 0.0}
             overlay["account_loss_kill_switch_triggered"] = bool(evaluate_kr_account_risk(account_snapshot).get("account_loss_kill_switch_triggered"))
